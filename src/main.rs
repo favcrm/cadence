@@ -837,10 +837,11 @@ enum Commands {
     },
     /// Reconstruct every merge on the default branch from stored
     /// data — verdict notes, commit statuses, tracker folders, daemon
-    /// events, operator approval records — and flag `reviewer==merger`,
-    /// merges with no passing verdict on the exact landed head, and
-    /// human-class merges with no operator approval for that head.
-    /// Read-only; exits non-zero when any row is flagged. `audit approve`/`audit revoke` record operator
+    /// events, operator approval records — and flag merges with no
+    /// passing verdict on the exact landed head, human-class merges with
+    /// no operator approval for that head, and `reviewer==merger` where
+    /// the fleet's identities differ. Read-only; exits non-zero when any
+    /// row is flagged. `audit approve`/`audit revoke` record operator
     /// approval evidence (operator connection only). See docs/AUDIT.md.
     #[command(args_conflicts_with_subcommands = true)]
     Audit {

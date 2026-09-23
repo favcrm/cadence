@@ -5,7 +5,9 @@
 //! - `reviewer==merger` — the same *GitHub* identity reviewed and
 //!   merged (`qa-verdict` status `creator.login` vs `mergedBy.login`;
 //!   note `From:` is an agent alias — a different namespace, rendered
-//!   but never compared).
+//!   but never compared). When every GitHub identity in the run is ONE
+//!   account (a shared token), the match is structural, not a finding:
+//!   it is reported once in the summary and never flags a row (CAD-207).
 //! - `no-passing-verdict` — no `pass` verdict bound to the exact head
 //!   that landed (`qa-verdict` status plus the verdict note must agree
 //!   on the squash-merged `headRefOid`).
@@ -144,6 +146,10 @@ struct Row {
     is_root: bool,
     /// Flag codes that fired on this row.
     flags: Vec<String>,
+    /// Matches that hold on this row but cannot discriminate in this
+    /// run (CAD-207) — e.g. `reviewer==merger` under one shared GitHub
+    /// identity. Reported once in the summary, never flagged.
+    structural: Vec<String>,
     /// Operator approval evidence bound to the landed head (CAD-217).
     approval: ApprovalView,
     /// `(field, reason)` pairs for every `unknown` rendered.
@@ -251,12 +257,33 @@ pub fn run(opts: &AuditOptions) -> Result<i32> {
         finalize_unknowns(row);
         flag_row(row);
     }
+    // Fleet-level pass (CAD-207): a match every row shares is a fact
+    // about the fleet, reported once — not a per-row finding.
+    let structural = apply_structural(&mut rows);
 
     let flagged = rows.iter().filter(|r| !r.flags.is_empty()).count();
     if opts.json {
-        print_json(&repo, &default_ref, &rows, flagged, opts, since);
+        print_json(
+            &repo,
+            &default_ref,
+            &rows,
+            flagged,
+            structural.as_ref(),
+            opts,
+            since,
+        );
     } else {
-        print!("{}", render_text(&repo, &default_ref, &rows, flagged, opts));
+        print!(
+            "{}",
+            render_text(
+                &repo,
+                &default_ref,
+                &rows,
+                flagged,
+                structural.as_ref(),
+                opts
+            )
+        );
     }
     Ok(if flagged > 0 { 1 } else { 0 })
 }
@@ -1770,6 +1797,55 @@ fn flag_row(row: &mut Row) {
     }
 }
 
+/// The fleet-level fact behind a structural match (CAD-207).
+#[derive(Debug)]
+struct Structural {
+    /// The one GitHub login every merge and every qa-verdict status in
+    /// the run was made with.
+    identity: String,
+    /// Rows whose `reviewer==merger` match it explains.
+    rows: usize,
+}
+
+const SHARED_IDENTITY_EXPLANATION: &str = "the qa-verdict status and the merge were made \
+     by the same GitHub account on every row that has both — the whole fleet pushes \
+     through one token, so reviewer==merger cannot tell rows apart here; reported \
+     once, not flagged (docs/AUDIT.md)";
+
+/// When every GitHub identity the rows name (mergers and qa-verdict
+/// creators) is ONE account, `reviewer==merger` holds by construction
+/// on every row that has both — a property of the fleet's token, not
+/// of any merge. Those matches move from `flags` to `structural` and
+/// are summarized once. When the run shows more than one identity, a
+/// row whose status creator is its merger deviates from the fleet and
+/// keeps its flag.
+fn apply_structural(rows: &mut [Row]) -> Option<Structural> {
+    let mut logins: Vec<&str> = rows
+        .iter()
+        .flat_map(|r| [r.merger.as_deref(), r.qa_verdict_creator.as_deref()])
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .collect();
+    logins.sort_by_key(|s| s.to_ascii_lowercase());
+    logins.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    let [identity] = logins.as_slice() else {
+        return None;
+    };
+    let identity = identity.to_string();
+    let mut matched = 0;
+    for row in rows.iter_mut() {
+        if let Some(i) = row.flags.iter().position(|f| f == "reviewer==merger") {
+            row.flags.remove(i);
+            row.structural.push("reviewer==merger".into());
+            matched += 1;
+        }
+    }
+    (matched > 0).then_some(Structural {
+        identity,
+        rows: matched,
+    })
+}
+
 // ---------- rendering -------------------------------------------------
 
 fn approval_rec_json(a: &ApprovalRec) -> Value {
@@ -1880,6 +1956,7 @@ fn row_json(row: &Row) -> Value {
             "revert": row.revert,
         },
         "flags": row.flags,
+        "structural": row.structural,
         "approval": approval_json(row),
         "evidence_unavailable": if row.evidence_gaps.is_empty() {
             Value::Null
@@ -1895,9 +1972,22 @@ fn print_json(
     default_ref: &str,
     rows: &[Row],
     flagged: usize,
+    structural: Option<&Structural>,
     opts: &AuditOptions,
     since: f64,
 ) {
+    let structural: Vec<Value> = structural
+        .map(|st| {
+            json!({
+                "code": "shared-github-identity",
+                "match": "reviewer==merger",
+                "identity": st.identity,
+                "rows": st.rows,
+                "explanation": SHARED_IDENTITY_EXPLANATION,
+            })
+        })
+        .into_iter()
+        .collect();
     let merges: Vec<Value> = rows.iter().map(row_json).collect();
     let mut by_class = json!({});
     for r in rows {
@@ -1918,6 +2008,7 @@ fn print_json(
                 "rows": rows.len(),
                 "flagged": flagged,
                 "flags": rows.iter().flat_map(|r| r.flags.clone()).collect::<Vec<_>>(),
+                "structural": structural,
                 "by_class": by_class,
             },
         }))
@@ -1930,6 +2021,7 @@ fn render_text(
     default_ref: &str,
     rows: &[Row],
     flagged: usize,
+    structural: Option<&Structural>,
     opts: &AuditOptions,
 ) -> String {
     use std::fmt::Write;
@@ -2043,6 +2135,13 @@ fn render_text(
         for (field, reason) in &row.unknowns {
             let _ = writeln!(out, "    unknown[{field}] {reason}");
         }
+    }
+    if let Some(st) = structural {
+        let _ = writeln!(
+            out,
+            "structural: {} merge(s) share GitHub identity {} — {}",
+            st.rows, st.identity, SHARED_IDENTITY_EXPLANATION
+        );
     }
     let _ = writeln!(
         out,
@@ -2300,6 +2399,96 @@ mod tests {
         r.status_post_hoc = true;
         flag_row(&mut r);
         assert!(r.flags.iter().any(|f| f == "no-passing-verdict"));
+    }
+
+    fn opts() -> AuditOptions {
+        AuditOptions {
+            since: None,
+            class: None,
+            project: None,
+            json: false,
+            limit: None,
+            repo: None,
+            notes_dir: None,
+            merge_report: None,
+            cwd: PathBuf::from("/"),
+            state_dir: PathBuf::from("/"),
+        }
+    }
+
+    /// A merged row with a qa-verdict status by `creator` (or none).
+    fn fleet_row(pr: u64, merger: &str, creator: Option<&str>) -> Row {
+        let mut r = flagged_row();
+        r.pr = Some(pr);
+        r.title = format!("work {pr}");
+        r.merger = Some(merger.into());
+        if let Some(c) = creator {
+            r.qa_verdict_status = Some("SUCCESS".into());
+            r.qa_verdict_creator = Some(c.into());
+        }
+        r
+    }
+
+    #[test]
+    fn digest_reports_shared_identity_once_and_flags_only_real_findings() {
+        // CAD-207's live run: 34 merges whose status and merge share the
+        // fleet's one GitHub account, 2 with no passing verdict.
+        let mut rows: Vec<Row> = (15..=50)
+            .map(|n| {
+                let creator = (n != 43 && n != 50).then_some("cc-syntax");
+                fleet_row(n, "cc-syntax", creator)
+            })
+            .collect();
+        for r in &mut rows {
+            flag_row(r);
+        }
+        let st = apply_structural(&mut rows).expect("one shared identity");
+        assert_eq!((st.identity.as_str(), st.rows), ("cc-syntax", 34));
+        let flagged: Vec<(u64, Vec<String>)> = rows
+            .iter()
+            .filter(|r| !r.flags.is_empty())
+            .map(|r| (r.pr.unwrap(), r.flags.clone()))
+            .collect();
+        assert_eq!(
+            flagged,
+            vec![
+                (43, vec!["no-passing-verdict".to_string()]),
+                (50, vec!["no-passing-verdict".to_string()])
+            ]
+        );
+        let text = render_text(Path::new("/r"), "origin/main", &rows, 2, Some(&st), &opts());
+        assert_eq!(text.matches("FLAG[").count(), 2, "{text}");
+        assert_eq!(text.matches("structural:").count(), 1, "{text}");
+        assert_eq!(text.matches("reviewer==merger").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn digest_keeps_reviewer_eq_merger_when_identities_differ() {
+        // The fleet has a separate QA identity: the row whose status was
+        // posted by its own merger deviates and keeps its flag.
+        let mut rows = vec![
+            fleet_row(1, "ops-bot", Some("qa-bot")),
+            fleet_row(2, "ops-bot", Some("ops-bot")),
+        ];
+        for r in &mut rows {
+            flag_row(r);
+        }
+        assert!(apply_structural(&mut rows).is_none());
+        assert!(rows[0].flags.is_empty(), "{:?}", rows[0].flags);
+        assert_eq!(rows[1].flags, vec!["reviewer==merger".to_string()]);
+        assert!(rows[1].structural.is_empty());
+        // Login case does not split one identity in two.
+        let mut rows = vec![
+            fleet_row(1, "CC-Syntax", Some("cc-syntax")),
+            fleet_row(2, "cc-syntax", None),
+        ];
+        for r in &mut rows {
+            flag_row(r);
+        }
+        assert_eq!(apply_structural(&mut rows).map(|s| s.rows), Some(1));
+        assert!(rows[0].flags.is_empty(), "{:?}", rows[0].flags);
+        // #2 has no status at all — its real finding still flags.
+        assert_eq!(rows[1].flags, vec!["no-passing-verdict".to_string()]);
     }
 
     const HEAD: &str = "7896dd2735035c0c67e246039cb495231702941c";

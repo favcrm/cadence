@@ -115,9 +115,41 @@ is true of this merge and not of the fleet as a whole.
 - **`approval-revoked`** — a human-class merge whose approval for the
   landed head was explicitly revoked before the merge.
 - **`reviewer==merger`** — the `qa-verdict` status's `creator.login`
-  equals `mergedBy.login` (case-insensitive). Self-merges are never
-  legal. The note `From:` never feeds this flag — it is an agent
-  alias, a different identity namespace.
+  equals `mergedBy.login` (case-insensitive), **in a run where the
+  fleet's GitHub identities differ**. Self-merges are never legal. The
+  note `From:` never feeds this flag — it is an agent alias, a
+  different identity namespace. When every identity is one account,
+  the match is structural — see the digest below.
+
+## The digest: structural facts are reported once (CAD-207)
+
+When every GitHub login the rendered rows name — every `mergedBy`
+and every `qa-verdict` status creator — is **one account**, the
+fleet pushes everything through a shared token, and
+`reviewer==merger` holds on every row that has a status by
+construction. A flag that fires on 100% of rows discriminates nothing
+and buries the real findings, so in that case the match is:
+
+- **not** a per-row flag — the row lists it under `structural` in
+  JSON, and prints nothing extra in text;
+- reported **once**, as a summary line:
+
+  ```
+  structural: 34 merge(s) share GitHub identity cc-syntax — the qa-verdict status and the merge were made by the same GitHub account on every row that has both — …; reported once, not flagged (docs/AUDIT.md)
+  summary: 36 row(s), 2 flagged — no-passing-verdict, no-passing-verdict
+  ```
+
+- excluded from the exit code — a clean run against a shared-token
+  fleet exits 0.
+
+As soon as the run shows a second identity (a QA bot token posting
+some statuses, say), a row whose status creator is its own merger
+deviates from the fleet and keeps `FLAG[reviewer==merger]`. The
+determination is made over the rows the run renders (after
+`--since`/`--class`/`--project`/`--limit`). The structural fact is
+still a real limitation — attestation and merge cannot be told apart
+under one token (see the trust model) — it is just not a per-merge
+finding.
 
 ## Operator approval evidence (the human-class gate)
 
@@ -222,9 +254,9 @@ a `From:` alias and even a `pass` verdict are forgeable, so a bound
 note satisfies `no-passing-verdict` but its alias never feeds
 `reviewer==merger`. A commit status is only as strong as its token:
 if QA posts `qa-verdict` and merges through the *same* GitHub account
-(a shared bot token), `reviewer==merger` fires on every such merge —
-correctly, and that is the finding: the attestation and the merge
-share one identity.
+(a shared bot token), the attestation and the merge share one
+identity on every such merge. That is a fleet-wide fact, reported
+once as the `structural:` summary line rather than flagged per row.
 
 An approval record is as strong as the operator rule that admitted
 its writer (above) and the store file it lives in: the daemon refuses
@@ -275,6 +307,7 @@ was down".
       "outcome": {"tree_match": "…", "smoke": "…",
                   "daemon_restart": "…", "revert": "…"},
       "flags": [],
+      "structural": [],
       "approval": {
         "required": false, "state": "not-required", "reason": null,
         "record": null, "before_merge": null, "revocation": null,
@@ -285,7 +318,7 @@ was down".
     }
   ],
   "summary": {"rows": 18, "flagged": 0,
-              "flags": [], "by_class": {"auto": 1}}
+              "flags": [], "structural": [], "by_class": {"auto": 1}}
 }
 ```
 
@@ -293,7 +326,12 @@ was down".
 `{id, source, action, head_sha, scope: {repo, pr}, recorded_via,
 recorded_at}`; `approval.revocation` is `{source, reason, revoked_at,
 before_merge}`; `approval.required` is `true` for human rows, `false`
-for other classes and `null` when no class is recorded.
+for other classes and `null` when no class is recorded. A row's
+`structural` lists matches the digest moved out of `flags`
+(`["reviewer==merger"]`); `summary.structural` holds one entry per
+fleet-level fact:
+`{code: "shared-github-identity", match: "reviewer==merger",
+identity, rows, explanation}`.
 
 Stability contract for CAD-87's digest and the Overview tile: field
 names, nesting and the `schema` tag do not change; new fields may be

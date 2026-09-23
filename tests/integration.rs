@@ -24710,14 +24710,34 @@ fn audit_flags_reviewer_equals_merger() {
         "note From: alias must not feed the flag:\n{text}"
     );
 
-    // Same GitHub identity posted qa-verdict and merged: flag.
+    // Same GitHub identity posted qa-verdict and merged, while the run
+    // shows the fleet has a separate QA identity (`qa-bot` on #1): the
+    // row deviates from the norm — flag.
     report_json["statuses"] = status("ops-1");
+    report_json["statuses"][heads[0].clone()] = json!({"statuses":[{
+        "context":"qa-verdict","state":"SUCCESS",
+        "created_at":"2026-09-20T11:59:30Z",
+        "creator":{"login":"qa-bot"}
+    }]});
     std::fs::write(&report, report_json.to_string()).unwrap();
     let out = run_audit(&state, &pm, &repo, &notes, &report, &[]);
     let text = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(1), "flag must exit 1:\n{text}");
     assert!(text.contains("FLAG[reviewer==merger]"), "{text}");
     assert!(text.contains("reviewer@gh ops-1"), "{text}");
+    assert!(!text.contains("structural:"), "{text}");
+
+    // CAD-207: when ops-1 is the ONLY GitHub identity in the run, the
+    // match is structural — one summary line, no per-row flag.
+    report_json["statuses"] = status("ops-1");
+    std::fs::write(&report, report_json.to_string()).unwrap();
+    let out = run_audit(&state, &pm, &repo, &notes, &report, &[]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(!text.contains("FLAG[reviewer==merger]"), "{text}");
+    assert!(
+        text.contains("structural: 1 merge(s) share GitHub identity ops-1"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -25387,6 +25407,115 @@ fn audit_approval_record_is_operator_only() {
     assert_eq!(
         kinds,
         ["approval_recorded", "approval_revoked", "approval_recorded"]
+    );
+}
+
+// ---------- CAD-207: the digest discriminates -------------------------
+
+/// The live CAD-207 run: 36 merges all pushed through ONE GitHub
+/// account (`cc-syntax`), 34 of them with a `qa-verdict` status that
+/// same account posted, and 2 (#43, #50) with no passing verdict on
+/// the landed head. The shared identity is reported once as a summary
+/// line; only the two real findings flag.
+#[test]
+fn audit_digest_reports_shared_identity_once() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path().join("repo");
+    git_repo(&repo);
+    let mut prs = Vec::new();
+    let mut statuses = serde_json::Map::new();
+    for n in 15..=50u64 {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q"])
+            .args(["--allow-empty", "-m", &format!("work {n} (#{n})")])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let head = format!("{n:040x}");
+        prs.push(
+            json!({"number": n, "title": format!("work {n}"), "headRefOid": head,
+                        "mergedBy": {"login": "cc-syntax"},
+                        "mergedAt": "2026-09-20T12:00:00Z"}),
+        );
+        if n != 43 && n != 50 {
+            statuses.insert(
+                head,
+                json!({"statuses": [{"context": "qa-verdict", "state": "success",
+                                     "created_at": "2026-09-20T11:00:00Z",
+                                     "creator": {"login": "cc-syntax"}}]}),
+            );
+        }
+    }
+    let report = dir.path().join("report.json");
+    let write_report = |statuses: &serde_json::Map<String, Value>| {
+        std::fs::write(
+            &report,
+            json!({"prs": prs, "statuses": statuses}).to_string(),
+        )
+        .unwrap();
+    };
+    write_report(&statuses);
+    let notes = dir.path().join("notes");
+    let state = dir.path().join("state");
+    let pm = dir.path().join("pm");
+    for d in [&notes, &state, &pm] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+
+    let out = run_audit(&state, &pm, &repo, &notes, &report, &[]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    let flagged: Vec<&str> = text.lines().filter(|l| l.contains("FLAG[")).collect();
+    assert_eq!(
+        flagged,
+        [
+            "#50 work 50  FLAG[no-passing-verdict]",
+            "#43 work 43  FLAG[no-passing-verdict]"
+        ],
+        "{text}"
+    );
+    assert_eq!(text.matches("reviewer==merger").count(), 1, "{text}");
+    assert!(
+        text.contains("structural: 34 merge(s) share GitHub identity cc-syntax"),
+        "{text}"
+    );
+
+    let out = run_audit(&state, &pm, &repo, &notes, &report, &["--json"]);
+    let j: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert_eq!(j["summary"]["flagged"], 2, "{j}");
+    let st = &j["summary"]["structural"];
+    assert_eq!(st.as_array().unwrap().len(), 1, "{j}");
+    assert_eq!(st[0]["code"], "shared-github-identity", "{j}");
+    assert_eq!(st[0]["identity"], "cc-syntax", "{j}");
+    assert_eq!(st[0]["rows"], 34, "{j}");
+    let structural_rows = j["merges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["structural"] == json!(["reviewer==merger"]))
+        .count();
+    assert_eq!(structural_rows, 34, "{j}");
+
+    // A clean run against the shared-token fleet exits 0: pass the
+    // two real findings and nothing is left to flag.
+    for n in [43u64, 50] {
+        statuses.insert(
+            format!("{n:040x}"),
+            json!({"statuses": [{"context": "qa-verdict", "state": "success",
+                                 "created_at": "2026-09-20T11:00:00Z",
+                                 "creator": {"login": "cc-syntax"}}]}),
+        );
+    }
+    write_report(&statuses);
+    let out = run_audit(&state, &pm, &repo, &notes, &report, &[]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(!text.contains("FLAG["), "{text}");
+    assert!(
+        text.contains("structural: 36 merge(s) share GitHub identity cc-syntax"),
+        "{text}"
     );
 }
 
