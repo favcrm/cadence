@@ -595,6 +595,9 @@ pub struct Store {
     /// consumed exactly once by the agent's actor at open
     /// (`take_adoption`).
     adoptions: Mutex<std::collections::HashMap<String, Vec<AdoptEntry>>>,
+    /// Provider text the turn result may carry, held per running message
+    /// until it finishes ([`Store::thread_hold_running`], CAD-320).
+    thread_held: Mutex<std::collections::HashMap<String, Vec<threads::HeldText>>>,
 }
 
 fn row_message(row: &rusqlite::Row) -> rusqlite::Result<Message> {
@@ -1457,6 +1460,7 @@ impl Store {
         let store = Self {
             conn: Mutex::new(conn),
             adoptions: Mutex::new(std::collections::HashMap::new()),
+            thread_held: Mutex::new(std::collections::HashMap::new()),
         };
         store.recover(marker.as_ref())?;
         Ok(store)
@@ -2977,7 +2981,7 @@ impl Store {
             "turn_finished",
             json!({"message": message.id, "result": result}),
         )?;
-        Self::thread_note_finished(tx, message, status, result, error)?;
+        self.thread_note_finished(tx, message, status, result, error)?;
         // Preserve the uncertain provider outcome on the work axis.  The
         // compatibility `turn_finished` row above stays unscoped, while
         // this explicit unknown row is scoped only when the message carries

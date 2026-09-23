@@ -3372,19 +3372,37 @@ for line in sys.stdin:
             emit({"id": mid, "result": {"turn": {"id": "t-1"}}})
         else:
             emit({"id": mid, "result": {"turn": {"id": "t-1"}}})
-            if mode == "items":
+            def item(iid, text, phase=None):
+                it = {"id": iid, "type": "agentMessage", "text": text}
+                if phase:
+                    it["phase"] = phase
+                emit({"method": "item/completed",
+                      "params": {"turnId": "t-1", "item": it}})
+                return it
+            if mode in ("items", "items-mixed"):
                 # A commentary agentMessage persisted mid-turn (CAD-319).
-                emit({"method": "item/completed", "params": {
-                    "turnId": "t-1", "item": {
-                        "id": "i0", "type": "agentMessage",
-                        "text": "looking", "phase": "commentary"}}})
+                item("i0", "looking", "commentary")
+            if mode == "items-mixed":
+                # Unphased beside a final: Codex's result is the final
+                # only, so the thread keeps this one (CAD-320).
+                item("i0b", "an aside")
+            if mode in ("items", "items-mixed"):
                 # The final answer persists as an item too; the turn
                 # result carries it, so the thread must not repeat it
                 # (CAD-320).
-                emit({"method": "item/completed", "params": {
-                    "turnId": "t-1", "item": {
-                        "id": "i1", "type": "agentMessage",
-                        "text": "MOCK_OK", "phase": "final_answer"}}})
+                item("i1", "MOCK_OK", "final_answer")
+            if mode == "items-unphased":
+                # An older Codex: no phases, the result joins them all.
+                done = [item("i0", "first"), item("i1", "second")]
+                emit({"method": "turn/completed", "params": {"turn": {
+                    "id": "t-1", "status": "completed", "items": done}}})
+                continue
+            if mode == "items-die":
+                # Items persist, then the process dies: the turn is
+                # unknown and its result empty — the thread keeps both.
+                item("i0", "partial")
+                item("i1", "almost there", "final_answer")
+                os._exit(0)
             if mode == "heartbeat":
                 # ~3.6s of streamed activity, never silent for long.
                 for _ in range(12):
@@ -10243,6 +10261,7 @@ fn agent_set_opts_live_agent_into_auto_ready() {
 ///   deny             — result success carrying a non-empty
 ///                      permission_denials array
 ///   die              — exits on the first user message (mid-turn death)
+///   text-die         — init and one "working" text block, then exits
 ///   bad-session      — init reports a session id that is not argv's
 ///   await-interrupt  — no result until SIGINT, then an interrupted one
 ///   replay           — replays the `<pidfile>.fixture` events verbatim,
@@ -10425,6 +10444,8 @@ for line in sys.stdin:
           "message": {"role": "assistant",
                       "content": [{"type": "text", "text": "working"}]},
           "session_id": sid})
+    if mode_now == "text-die":
+        os._exit(0)  # dies mid-turn, after a text block (CAD-320)
     if mode_now == "await-interrupt":
         continue  # the SIGINT handler emits the result
     if mode_now == "hold":
@@ -38599,5 +38620,116 @@ fn cad320_thread_records_claude_text_and_tool_results_redacted() {
             assert!(!body.contains(secret.as_str()), "{surface} leaked a token");
         }
         assert!(!body.contains(tail), "{surface} kept raw tool output");
+    }
+}
+
+/// Codex text the turn result would repeat is held until the finish,
+/// which keeps exactly what the result does not carry: an older Codex's
+/// unphased items are the joined result (stored once); an unphased item
+/// beside a final answer is not in the result (kept, in order).
+#[test]
+fn cad320_codex_final_and_unphased_items_are_stored_once() {
+    for (mode, want) in [
+        (
+            "items-unphased",
+            vec![
+                triple("operator", "message", "go"),
+                triple("agent", "turn_result", "first\nsecond"),
+            ],
+        ),
+        (
+            "items-mixed",
+            vec![
+                triple("operator", "message", "go"),
+                triple("agent", "assistant_text", "looking"),
+                triple("agent", "assistant_text", "an aside"),
+                triple("agent", "turn_result", "MOCK_OK"),
+            ],
+        ),
+    ] {
+        let d = TestDaemon::start();
+        let _mock = d.mock_codex(mode);
+        d.register_codex("master");
+        d.wait_agent("master", "idle", 15);
+        d.rpc(
+            "thread_send",
+            json!({"alias": "master", "text": "go", "message": "x1"}),
+        )
+        .unwrap();
+        d.wait_message("master", "x1", &["completed"], 20);
+        assert_eq!(thread_shape(&d, "master"), want, "{mode}");
+        let page = d.rpc("thread_read", json!({"alias": "master"})).unwrap();
+        for entry in page["entries"].as_array().unwrap().iter().skip(1) {
+            assert_eq!(entry["message"], "x1", "{mode}: {entry}");
+        }
+    }
+}
+
+/// A Codex turn whose process dies after persisting an unphased and a
+/// final item ends `unknown` with an empty result: both texts are kept,
+/// linked to the message, ahead of the turn result.
+#[test]
+fn cad320_codex_items_survive_an_unknown_turn() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_codex("items-die");
+    d.register_codex("master");
+    d.wait_agent("master", "idle", 15);
+    d.rpc(
+        "thread_send",
+        json!({"alias": "master", "text": "go", "message": "x1"}),
+    )
+    .unwrap();
+    d.wait_message("master", "x1", &["unknown"], 30);
+    assert_eq!(
+        thread_shape(&d, "master"),
+        vec![
+            triple("operator", "message", "go"),
+            triple("agent", "assistant_text", "partial"),
+            triple("agent", "assistant_text", "almost there"),
+            triple("agent", "turn_result", ""),
+        ]
+    );
+    let page = d.rpc("thread_read", json!({"alias": "master"})).unwrap();
+    assert_eq!(page["entries"][2]["payload"]["phase"], "final_answer");
+    assert_eq!(page["entries"][3]["payload"]["status"], "unknown");
+    for entry in page["entries"].as_array().unwrap().iter().skip(1) {
+        assert_eq!(entry["message"], "x1", "{entry}");
+    }
+}
+
+/// A managed Claude turn that ends without a result — the process dies,
+/// or the idle fence trips while it is still alive — keeps its held text
+/// block: linked to the message and ahead of the turn result, never
+/// flushed late by the adapter's close.
+#[test]
+fn cad320_claude_held_text_lands_before_an_unknown_turn_result() {
+    for (mode, params) in [
+        ("text-die", Value::Null),
+        ("silent", json!({"turn_idle_secs": 2})),
+    ] {
+        let d = TestDaemon::start();
+        let _mock = d.mock_claude(mode, None);
+        d.register_claude("master", params);
+        d.wait_agent("master", "idle", 15);
+        d.rpc(
+            "thread_send",
+            json!({"alias": "master", "text": "go", "message": "c1"}),
+        )
+        .unwrap();
+        d.wait_message("master", "c1", &["unknown"], 30);
+        d.wait_agent("master", "attention", 15);
+        // The late-flush bug landed ~3 s after the fence: give it room.
+        std::thread::sleep(Duration::from_secs(4));
+        assert_eq!(
+            thread_shape(&d, "master"),
+            vec![
+                triple("operator", "message", "go"),
+                triple("agent", "assistant_text", "working"),
+                triple("agent", "turn_result", ""),
+            ],
+            "{mode}"
+        );
+        let page = d.rpc("thread_read", json!({"alias": "master"})).unwrap();
+        assert_eq!(page["entries"][1]["message"], "c1", "{mode}: {page}");
     }
 }

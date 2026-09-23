@@ -770,8 +770,9 @@ impl Shared {
     /// tool uses (name + redacted summary) and tool results (redacted
     /// summary + `is_error`, CAD-320). The turn result lands with the
     /// message's finish, in the store — so the final answer is never
-    /// recorded here too: Codex `final_answer` items (and unphased ones,
-    /// which Codex joins into the result) are skipped, and the Claude
+    /// recorded twice: Codex `final_answer` items (and unphased ones,
+    /// which Codex joins into the result) are held until the finish,
+    /// which keeps only those the result does not carry, and the Claude
     /// adapter drops the text block its `result` repeats. A lost append
     /// is logged, never fatal to the turn — the provider transcript
     /// still has it.
@@ -782,16 +783,18 @@ impl Shared {
                 if item.get("type").and_then(Value::as_str) != Some("agentMessage") {
                     return;
                 }
+                let text = item.get("text").and_then(Value::as_str).unwrap_or("");
+                let payload = json!({"provider_item": item.get("id"), "phase": item.get("phase")});
                 let phase = item.get("phase").and_then(Value::as_str);
                 if matches!(phase, None | Some("final_answer")) {
+                    // Codex builds the turn result from these; the
+                    // finish keeps whichever the result does not carry.
+                    if let Err(e) = self.store.thread_hold_running(alias, text, payload) {
+                        eprintln!("thread hold for '{alias}' failed: {e}");
+                    }
                     return;
                 }
-                let text = item.get("text").and_then(Value::as_str).unwrap_or("");
-                (
-                    store::KIND_ASSISTANT_TEXT,
-                    text.to_string(),
-                    json!({"provider_item": item.get("id"), "phase": item.get("phase")}),
-                )
+                (store::KIND_ASSISTANT_TEXT, text.to_string(), payload)
             }
             "cadence/tool_use" => {
                 let tool = params.get("tool").and_then(Value::as_str).unwrap_or("tool");

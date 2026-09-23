@@ -128,6 +128,14 @@ impl ThreadEntry {
     }
 }
 
+/// Provider text held back until its message finishes: kept only if
+/// the turn result does not carry it (CAD-320).
+#[derive(Debug, Clone)]
+pub struct HeldText {
+    text: String,
+    payload: Value,
+}
+
 /// One entry to append. `text` and every string in `payload` are
 /// redacted and bounded on the way in.
 #[derive(Debug, Clone)]
@@ -414,14 +422,7 @@ impl Store {
         if Self::thread_in(&tx, alias)?.is_none() {
             return Ok(None);
         }
-        let running: Option<String> = tx
-            .query_row(
-                "SELECT id FROM messages WHERE alias=? AND state='running'
-                 ORDER BY seq DESC LIMIT 1",
-                [alias],
-                |r| r.get(0),
-            )
-            .optional()?;
+        let running = Self::running_message_in(&tx, alias)?;
         let seq = Self::thread_append_in(
             &tx,
             alias,
@@ -435,6 +436,60 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(seq)
+    }
+
+    /// Agent text that the turn result may repeat — Codex `final_answer`
+    /// and unphased `agentMessage` items (CAD-320). Held in memory
+    /// against the alias's running message; its finish appends each
+    /// held text the result does not contain as `assistant_text`, ahead
+    /// of the `turn_result` and in the same transaction. So an `unknown`
+    /// or failed turn, or a result built from other items, loses none of
+    /// it, and a result that carries it never shows it twice. With no
+    /// running message there is nothing to dedupe against: it is
+    /// appended now. A daemon restart drops what is held — the provider
+    /// transcript still has it.
+    pub fn thread_hold_running(&self, alias: &str, text: &str, payload: Value) -> Result<()> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        if Self::thread_in(&tx, alias)?.is_none() {
+            return Ok(());
+        }
+        let Some(running) = Self::running_message_in(&tx, alias)? else {
+            Self::thread_append_in(
+                &tx,
+                alias,
+                NewEntry {
+                    role: ROLE_AGENT,
+                    kind: KIND_ASSISTANT_TEXT,
+                    text,
+                    payload: Some(payload),
+                    message_id: None,
+                },
+            )?;
+            tx.commit()?;
+            return Ok(());
+        };
+        self.thread_held
+            .lock()
+            .unwrap()
+            .entry(running)
+            .or_default()
+            .push(HeldText {
+                text: text.to_string(),
+                payload,
+            });
+        Ok(())
+    }
+
+    fn running_message_in(tx: &Connection, alias: &str) -> Result<Option<String>> {
+        Ok(tx
+            .query_row(
+                "SELECT id FROM messages WHERE alias=? AND state='running'
+                 ORDER BY seq DESC LIMIT 1",
+                [alias],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     /// Transactional append — used inside enqueue and finish so an entry
@@ -501,8 +556,11 @@ impl Store {
 
     /// The `turn_result` entry for a finished message. The payload is
     /// built from named fields only — the stored result carries the
-    /// turn token, which must never be copied here.
+    /// turn token, which must never be copied here. Text held for the
+    /// message ([`Self::thread_hold_running`]) that the result does not
+    /// carry lands first, as `assistant_text`.
     pub(super) fn thread_note_finished(
+        &self,
         tx: &Connection,
         message: &super::Message,
         status: &str,
@@ -510,6 +568,29 @@ impl Store {
         error: Option<&str>,
     ) -> Result<()> {
         let text = result.get("text").and_then(Value::as_str).unwrap_or("");
+        let held = self
+            .thread_held
+            .lock()
+            .unwrap()
+            .remove(&message.id)
+            .unwrap_or_default();
+        for item in held {
+            let body = item.text.trim();
+            if body.is_empty() || text.contains(body) {
+                continue;
+            }
+            Self::thread_append_in(
+                tx,
+                &message.alias,
+                NewEntry {
+                    role: ROLE_AGENT,
+                    kind: KIND_ASSISTANT_TEXT,
+                    text: &item.text,
+                    payload: Some(item.payload),
+                    message_id: Some(&message.id),
+                },
+            )?;
+        }
         let mut payload = json!({"status": status});
         if let Some(error) = error.filter(|e| !e.is_empty()) {
             payload["error"] = json!(error);

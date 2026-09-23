@@ -33,7 +33,8 @@
 //!   assistant text block an `assistant_text` event for a threaded
 //!   agent's chat (CAD-320). The last text block is held until the next
 //!   event: the one the `result` repeats is dropped, so the chat never
-//!   shows the final answer twice.
+//!   shows the final answer twice; a turn that ends without a result
+//!   flushes it before `run_turn` returns.
 //! - `--permission-mode` (default `manual`) and `--allowedTools`
 //!   (always `Bash(cadence *)` plus `params.allowed_tools`) are fixed at
 //!   launch and replayed on resume. Denials surface as
@@ -232,7 +233,8 @@ struct Shared {
     /// none). Set at `open`.
     max_turn: Mutex<Option<Duration>>,
     /// The latest assistant text block, not yet emitted — flushed by
-    /// the next event, dropped when the `result` repeats it (CAD-320).
+    /// the next event or by a turn ending without a result, dropped when
+    /// the `result` repeats it (CAD-320).
     pending_text: Mutex<Option<String>>,
     dead: AtomicBool,
 }
@@ -479,8 +481,6 @@ impl Shared {
     /// Transport EOF: wake any turn wait so it can re-check `dead`
     /// instead of sleeping out the turn deadline.
     fn on_disconnect(&self) {
-        // Text the provider printed before dying is still the agent's.
-        self.flush_text(None);
         self.dead.store(true, Ordering::SeqCst);
         let _guard = self.results.lock().unwrap();
         self.result_cv.notify_all();
@@ -594,14 +594,14 @@ impl ProviderAdapter for ClaudeAdapter {
         *self.shared.last_activity.lock().unwrap() = start;
         let idle_window = *self.shared.idle_window.lock().unwrap();
         let max_turn = *self.shared.max_turn.lock().unwrap();
-        let result = {
+        let waited = (|| -> Result<Value> {
             let mut queue = self.shared.results.lock().unwrap();
             loop {
                 if let Some(mismatch) = self.shared.session_mismatch.lock().unwrap().clone() {
                     return Err(Error::provider(mismatch));
                 }
                 if let Some(result) = queue.pop_front() {
-                    break result;
+                    return Ok(result);
                 }
                 if self.shared.dead.load(Ordering::SeqCst) {
                     return Err(Error::unknown(
@@ -651,7 +651,12 @@ impl ProviderAdapter for ClaudeAdapter {
                     .unwrap();
                 queue = guard;
             }
-        };
+        })();
+        // No result is coming (death, idle fence, cap, interrupt grace,
+        // session mismatch): the held text block is the agent's, and it
+        // must land now — linked to the running message, ahead of the
+        // turn result the daemon records next (CAD-320).
+        let result = waited.inspect_err(|_| self.shared.flush_text(None))?;
         *self.shared.interrupt_at.lock().unwrap() = None;
         let is_error = result
             .get("is_error")
