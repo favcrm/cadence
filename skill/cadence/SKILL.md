@@ -176,7 +176,9 @@ During implementation and handoff:
   that can act, with PM visibility of exceptions and progress.
 - Follow configured resource/admission rules for **focused tests as well as
   full suites**. If required build-slot admission is refused or unavailable,
-  report the blocker and use an authorized runner/CI. A direct local command,
+  report the blocker and use an authorized runner (`cadence build-slot
+  launch <recipe>` runs a project-declared recipe under a daemon-owned slot)
+  or CI. A direct local command,
   an advisory alias or an unused slot is not admission. Never label such a run
   as an admitted gate. Reuse eligible evidence and avoid duplicate full suites.
 - Self-check before handoff; independent QA still reviews the exact change

@@ -1167,3 +1167,273 @@ fn reconcile_required_only_where_reconcile_can_act() {
         "{dead}"
     );
 }
+
+// ---------- CAD-230 phase b: exec-bound holds and runners ----------
+
+/// Mark `pid` as exited but not yet reaped by its parent (a zombie)
+/// with `threads` threads still in its group.
+fn zombify(p: &FakeProc, pid: u32, threads: u32) {
+    let dir = p.root().join(pid.to_string());
+    let text = std::fs::read_to_string(dir.join("stat")).unwrap();
+    std::fs::write(dir.join("stat"), text.replacen(") S ", ") Z ", 1)).unwrap();
+    let status = std::fs::read_to_string(dir.join("status")).unwrap();
+    std::fs::write(dir.join("status"), format!("{status}Threads:\t{threads}\n")).unwrap();
+}
+
+fn acquire_exec(s: &mut Slots, peer: u32, pid: u32, req: &str, now: f64) -> Result<Value> {
+    let caller = s.strict_caller(peer, 200)?;
+    s.acquire_strict_bound(SlotKind::Build, &caller, pid, req, false, clk(now), true)
+        .map(|(v, _)| v)
+}
+
+/// ACCEPTANCE (b1): `build-slot run`'s hold names exactly the requesting
+/// process — the one that execs into the command — as (pid, starttime,
+/// uid): an ancestor is refused. The daemon's watcher frees it once
+/// that process exits (gone, or a zombie its parent has not reaped),
+/// with no release call from anyone.
+#[test]
+fn exec_bound_hold_names_the_peer_and_ends_with_its_exit() {
+    for (how, reason) in [("gone", "holder died"), ("zombie", "holder exited")] {
+        let p = tree();
+        let mut s = strict_slots(&p, 1);
+        enroll(&mut s, "wk", "g1", 200);
+        // The shell (an ancestor of the CLI) is not the exec'ing peer.
+        let err = acquire_exec(&mut s, 400, 300, "r0", 0.0).unwrap_err();
+        assert!(err.to_string().contains("exec-bound"), "{how}: {err}");
+        let g = acquire_exec(&mut s, 400, 400, "r1", 0.0).unwrap();
+        assert_eq!(g["granted"], true, "{how}: {g}");
+        let h = held_json(&mut s, 1.0)[0].clone();
+        assert_eq!(h["pid"], 400);
+        assert_eq!(h["exec_bound"], true);
+        assert_eq!(
+            s.held[0].strict.as_ref().unwrap().holder,
+            ProcIdentity {
+                pid: 400,
+                starttime: 70,
+                uid: UID,
+            }
+        );
+        // Alive: the watcher keeps it.
+        assert!(s.reap_strict_holds(2.0).is_empty());
+        assert_eq!(s.held.len(), 1);
+        match how {
+            "gone" => p.kill(400),
+            _ => {
+                // A zombie leader whose other threads still run is not
+                // proof of death: kept, as unknown.
+                zombify(&p, 400, 3);
+                assert!(s.reap_strict_holds(2.5).is_empty(), "{how}");
+                assert_eq!(held_json(&mut s, 2.5)[0]["liveness"], "unknown");
+                p.spawn(400, 300, 70);
+                zombify(&p, 400, 1);
+            }
+        }
+        let events = s.reap_strict_holds(3.0);
+        assert!(s.held.is_empty(), "{how}: freed without a release");
+        assert!(
+            events
+                .iter()
+                .any(|e| e.1 == "slot_released" && e.2["pid"] == 400 && e.2["reason"] == reason),
+            "{how}: {events:?}"
+        );
+        // A trap-style release from the lane afterwards stays soft.
+        p.spawn(400, 300, 70);
+        let caller = s.strict_caller(300, 200).unwrap();
+        let token = g["token"].as_str().unwrap();
+        let (r, _) = s.release_strict(token, &caller, 300, 4.0).unwrap();
+        assert_eq!(r["released"], false, "{how}: {r}");
+    }
+}
+
+/// ACCEPTANCE (b1): no other process can release or re-bind an
+/// exec-bound hold — not a sibling, not the invoking shell, not the
+/// legacy path, and not a process that recycled the holder's pid (new
+/// starttime): that one reads as the holder's death, frees the hold
+/// and gets a fresh grant of its own, never the old token.
+#[test]
+fn exec_bound_hold_refuses_forged_release_and_pid_reuse() {
+    let p = tree();
+    let mut s = strict_slots(&p, 2);
+    enroll(&mut s, "wk", "g1", 200);
+    let g = acquire_exec(&mut s, 400, 400, "run-1", 0.0).unwrap();
+    let token = g["token"].as_str().unwrap().to_string();
+    for (peer, claim) in [(310, 310), (300, 300)] {
+        let caller = s.strict_caller(peer, 200).unwrap();
+        let err = s.release_strict(&token, &caller, claim, 1.0).unwrap_err();
+        assert!(err.to_string().contains("another caller"), "{peer}: {err}");
+    }
+    let err = s.release(&token, "wk", 400, 1.0).unwrap_err();
+    assert!(err.to_string().contains("another caller"), "{err}");
+    assert_eq!(s.held.len(), 1, "no forged release freed it");
+    // PID reuse: 400 exits and a new process takes the pid.
+    p.kill(400);
+    p.spawn(400, 300, 99);
+    let again = acquire_exec(&mut s, 400, 400, "run-1", 2.0).unwrap();
+    assert_eq!(again["granted"], true, "{again}");
+    assert_ne!(
+        again["token"],
+        token.as_str(),
+        "never re-binds the old hold"
+    );
+    assert_eq!(s.held.len(), 1);
+    assert_eq!(s.held[0].strict.as_ref().unwrap().holder.starttime, 99);
+    let caller = s.strict_caller(400, 200).unwrap();
+    assert!(s
+        .release_strict(&token, &caller, 400, 3.0)
+        .is_err_and(|e| e.to_string().contains("Unknown slot token")));
+    // Re-poll adoption itself compares the exact holder: a request from
+    // the same pid, lane, kind, enrollment and request id but another
+    // starttime never matches the hold — even one the reaper could not
+    // prove dead yet.
+    let h = s.held[0].clone();
+    let b = h.strict.clone().unwrap();
+    let req = |starttime: u64| SlotReq {
+        kind: h.kind,
+        lane: &h.lane,
+        pid: h.pid,
+        request_id: &h.request_id,
+        strict: Some(StrictBind {
+            holder: ProcIdentity {
+                starttime,
+                ..b.holder
+            },
+            ..b.clone()
+        }),
+    };
+    assert!(s.find_hold(&req(b.holder.starttime)).is_some());
+    assert!(s.find_hold(&req(b.holder.starttime + 1)).is_none());
+}
+
+/// ACCEPTANCE (b2): a runner enrollment is the daemon's own — root =
+/// worker = the exact spawned process, its generation binding the
+/// launch digest to the runner id. Owner revalidation and endpoint
+/// supersession never touch it; its one hold is exec-bound; its process
+/// tree can neither acquire, release nor launch; a recycled root is
+/// refused; and its end frees the hold and prunes the enrollment.
+#[test]
+fn runner_enrollment_is_daemon_owned_and_holds_one_exec_bound_slot() {
+    let p = tree();
+    p.spawn(600, 100, 90).spawn(610, 600, 91);
+    let mut s = strict_slots(&p, 1);
+    enroll(&mut s, "wk", "g1", 200);
+    let (id, root, events) = s.enroll_runner("wk", "run-a", "d1", 600, clk(0.0)).unwrap();
+    assert_eq!(root.pid, 600);
+    assert!(events.iter().any(|e| e.1 == "slot_runner_enrolled"));
+    let e = s.enrollments.iter().find(|e| e.id == id).unwrap().clone();
+    assert_eq!(e.owner_generation, "runner:run-a:d1");
+    assert_eq!((e.root, e.worker), (root, root));
+    assert_eq!(e.to_json()["runner_id"], "run-a");
+    // Never enrolled twice: not the same process, not the same id.
+    assert!(s.enroll_runner("wk", "run-b", "d1", 600, clk(0.0)).is_err());
+    assert!(s.enroll_runner("wk", "run-a", "d1", 500, clk(0.0)).is_err());
+    assert!(s.enroll_runner("wk", "run-c", "d1", 200, clk(0.0)).is_err());
+    // Revalidation against agent rows skips it; the endpoint's own
+    // supersession and close leave it alone.
+    assert_eq!(s.enrolled_owners(), vec!["wk".to_string()]);
+    let same = HashMap::from([("wk".to_string(), Some("g1".to_string()))]);
+    assert!(s.revalidate_owners(&same).is_empty());
+    enroll(&mut s, "wk", "g2", 200);
+    s.revoke_owner("wk", "endpoint closed");
+    let e = s.enrollments.iter().find(|e| e.id == id).unwrap();
+    assert_eq!(e.auth, AuthState::Active);
+    // Its one hold: strict, exec-bound, the runner's exact root.
+    let (g, _) = s.acquire_runner(&id, SlotKind::Build, clk(1.0)).unwrap();
+    assert_eq!(g["granted"], true, "{g}");
+    let h = held_json(&mut s, 1.0)[0].clone();
+    assert_eq!(
+        (
+            h["pid"].as_u64(),
+            h["lane"].as_str(),
+            h["exec_bound"].as_bool()
+        ),
+        (Some(600), Some("wk"), Some(true))
+    );
+    // Its process tree is admitted as the runner — and refused work.
+    assert_eq!(s.nearest_enrolled_root(&[610, 600, 100]), Some(1));
+    let caller = s.strict_caller(610, 600).unwrap();
+    for err in [
+        s.acquire_strict(SlotKind::Build, &caller, 610, "nested", false, clk(1.0))
+            .unwrap_err(),
+        s.release_strict(g["token"].as_str().unwrap(), &caller, 600, 1.0)
+            .unwrap_err(),
+        s.launch_lane(&caller, 1.0).unwrap_err(),
+    ] {
+        assert!(err.to_string().contains("run-a"), "{err}");
+    }
+    // A managed endpoint that is revoked launches nothing either.
+    let wk = s.strict_caller(400, 200).unwrap();
+    assert!(s.launch_lane(&wk, 1.0).is_err());
+    // The end: the process is gone — the hold frees on proof of death,
+    // the enrollment is revoked and, holding nothing, pruned.
+    p.kill(610);
+    p.kill(600);
+    let events = s.end_runner(&id, "runner run-a exited", 2.0);
+    assert!(events
+        .iter()
+        .any(|e| e.1 == "slot_released" && e.2["pid"] == 600));
+    assert!(s.held.is_empty());
+    assert!(s.enrollments.iter().all(|e| e.id != id));
+}
+
+/// ACCEPTANCE (b2): a runner whose root pid was recycled before its
+/// grant is refused, never queued or granted; a live runner that ends
+/// without a grant drops its waiter.
+#[test]
+fn runner_grant_requires_the_exact_enrolled_process() {
+    let p = tree();
+    p.spawn(600, 100, 90).spawn(700, 100, 95);
+    let mut s = strict_slots(&p, 1);
+    let (a, _, _) = s.enroll_runner("x", "run-a", "d", 600, clk(0.0)).unwrap();
+    let (b, _, _) = s.enroll_runner("y", "run-b", "d", 700, clk(0.0)).unwrap();
+    let (g, _) = s.acquire_runner(&a, SlotKind::Build, clk(0.0)).unwrap();
+    assert_eq!(g["granted"], true);
+    let (q, _) = s.acquire_runner(&b, SlotKind::Test, clk(0.0)).unwrap();
+    assert_eq!(q["granted"], false, "one build slot, held by run-a");
+    assert_eq!(s.waiting.len(), 1);
+    p.spawn(700, 100, 96);
+    let err = s.acquire_runner(&b, SlotKind::Test, clk(1.0)).unwrap_err();
+    assert!(err.to_string().contains("no longer the enrolled"), "{err}");
+    s.end_runner(&b, "runner run-b refused", 1.0);
+    assert!(s.waiting.is_empty());
+    assert_eq!(s.held.len(), 1, "run-a's hold is untouched");
+}
+
+/// ACCEPTANCE (b2 restart): a runner in flight at daemon restart keeps
+/// its hold accounted under the tri-state rule, but its enrollment is
+/// revoked — the runner record that owned it died with the old daemon —
+/// so nothing is admitted or relaunched under it.
+#[test]
+fn restart_revokes_runner_enrollments_but_keeps_their_holds() {
+    let p = tree();
+    p.spawn(600, 100, 90);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("slots.json");
+    let mut s = strict_slots(&p, 1);
+    s.persist_to(path.clone());
+    let (id, _, _) = s.enroll_runner("wk", "run-a", "d", 600, clk(0.0)).unwrap();
+    s.acquire_runner(&id, SlotKind::Build, clk(0.0)).unwrap();
+    drop(s);
+    let doc: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(doc["holds"][0]["exec_bound"], true);
+    assert_eq!(doc["enrollments"][0]["runner_id"], "run-a");
+    let mut s = strict_slots(&p, 1);
+    s.persist_to(path.clone());
+    s.restore(clk(0.0));
+    assert!(s.strict_available());
+    let e = &s.enrollments[0];
+    assert!(
+        matches!(&e.auth, AuthState::Revoked(why) if why.contains("daemon restarted")),
+        "{:?}",
+        e.auth
+    );
+    let h = held_json(&mut s, 1.0)[0].clone();
+    assert_eq!(
+        (h["exec_bound"].as_bool(), h["liveness"].as_str()),
+        (Some(true), Some("alive"))
+    );
+    assert!(s.acquire_runner(&id, SlotKind::Build, clk(1.0)).is_err());
+    // Proven death still frees it.
+    p.kill(600);
+    s.reap_strict_holds(2.0);
+    assert!(s.held.is_empty());
+}

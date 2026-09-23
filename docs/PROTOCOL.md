@@ -93,10 +93,12 @@ Error kinds:
 | `agent_resume` | `alias` | `{alias,state:"starting"|"attention"}` |
 | `agent_remove` | `alias` | deletes the agent + its history; refuses live endpoints |
 | `agent_gc` | `older_than?` | sweeps dead agents; `{removed:[alias]}` |
-| `slot_acquire` | `kind: build|test|suite, request_id, lane?, pid?, probe?` | `{granted:true,token,kind,wait_secs}` or `{granted:false,position,wait_secs?,held,capacity}` — non-blocking; callers poll with a stable `request_id` (queue identity only — the daemon mints the `slot-*` token on grant). Caller identity is connection-derived (below): `lane` is advisory, `pid` must be the socket peer or its ancestor. A re-poll adopts a hold only on an exact `(request_id, pid, lane, kind)` match; any other caller sharing the id queues. `probe:true` answers without joining the queue (the CLI's `--wait-secs 0` path). `pid` is the holder whose death frees the slot |
+| `slot_acquire` | `kind: build|test|suite, request_id, lane?, pid?, probe?, exec?` | `{granted:true,token,kind,wait_secs}` or `{granted:false,position,wait_secs?,held,capacity}` — non-blocking; callers poll with a stable `request_id` (queue identity only — the daemon mints the `slot-*` token on grant). Caller identity is connection-derived (below): `lane` is advisory, `pid` must be the socket peer or its ancestor. A re-poll adopts a hold only on an exact `(request_id, pid, lane, kind)` match — for a strict hold also the exact recorded holder `(pid, starttime, uid)`; any other caller sharing the id queues. `probe:true` answers without joining the queue (the CLI's `--wait-secs 0` path). `pid` is the holder whose death frees the slot. `exec:true` (`build-slot run`, CAD-230b): `pid` must be the socket peer itself — the process that execs into the command — and a strict caller's hold is *exec-bound* |
 | `slot_release` | `token, lane?, pid?` | `{released:true,token,kind}` — the release must name the holding `(lane, pid)`, both derived from the connection (`lane` advisory, `pid` must be the peer or its ancestor); a foreign token is a named refusal, a never-held token a named rejection, and a token just reaped this call answers `{released:false, reason}` to its own lane (a `trap`-style cleanup never hard-fails) — foreign lanes get the same never-held rejection, so a token's existence is never probed across lanes |
 | `slot_status` | `lane?` | `{pools:{build,suite}:{capacity,held[]}, waiting[], config, enrollments[], strict:{available,reason?,reconcile_required?,state_generation}}` — also a reap pass: dead holders/waiters drop on the read. A hold's `token` shows only to the connection whose derived lane owns the hold and whose ancestry includes the hold's pid; everyone else sees identity only. Each hold names its `binding` (`legacy`/`strict`); a strict hold adds `enrollment_id, owner_generation, auth_state, liveness, accounting, reconcile_required` and, when something must be done that reconcile cannot do, a `remedy` (see Managed endpoints below) |
-| `slot_reconcile` | `enrollment_id, token, evidence:{owner_generation,pid,starttime,uid,observed_at,process_read,command_outcome,side_effect_review}` | `{reconciled:true,token,kind,observed}` — the one operator path over a strict hold. Operator authority needs positive proof (CAD-276): refused from any connection that derives a slot identity (a pane or an enrolled endpoint is an agent), and from one that is not provably the operator — the peer must run as the daemon's uid with a fully readable ancestry on which no hop is a registered pane, an enrolled or tombstoned root, a descendant of the daemon, or a same-uid process carrying `CADENCE_ALIAS`, hold no pane pty, and have its session leader on that ancestry (a `setsid` + double-fork orphan does not); refused too when the request carries `by`/`operator`/`actor`/`alias`/`lane`/`pid`. The evidence must name the recorded hold exactly; the daemon then reads `/proc` itself and frees only on proven death — a live or unknown holder is refused whatever the evidence says. `cadence build-slot reconcile <enrollment_id> <token> --evidence <json>` |
+| `slot_launch` | `recipe, project, worktree?, wait_secs?` | `{runner_id,state:"queued",project,recipe,kind,digest,head_sha,log_path,lane,requester}` — CAD-230b: the daemon runs one of the project's `build.recipes` as a *runner* under an exec-bound strict slot (see Daemon-launched runners below). Only these four fields are accepted — `argv`, `cmd`, `env`, `cwd`, `lane`, `alias`, `pid` or anything else is refused by name. The requester must derive a pane (legacy), an active enrolled managed endpoint, or pass operator proof; the runner's attached process tree never launches (a detached, env-scrubbed descendant passing operator proof is the known residual, CAD-308). Answers at once; poll `slot_runner`. `cadence build-slot launch <recipe> [--project] [--worktree] [--wait-secs] [--detach]` |
+| `slot_runner` | `runner_id` | the runner's receipt `{runner_id,project,recipe,kind,digest,head_sha,dirty,worktree,cwd,argv,env,requester,state,complete,last_state?,pid,starttime,enrollment_id,created,started,ended,exit_code,signal,reason,log_path}` — readable by any connection with a slot identity or operator proof; carries no token. `cadence build-slot runner <id>` |
+| `slot_reconcile` | `enrollment_id, token, evidence:{owner_generation,pid,starttime,uid,observed_at,process_read,command_outcome,side_effect_review}` | `{reconciled:true,token,kind,observed}` — the one operator path over a strict hold. Operator authority needs positive proof (CAD-276): refused from any connection that derives a slot identity (a pane or an enrolled endpoint is an agent), and from one that is not provably the operator — the peer must run as the daemon's uid with a fully readable ancestry on which no hop is a registered pane, an enrolled or tombstoned root, a descendant of the daemon, or a same-uid process carrying `CADENCE_ALIAS` or `CADENCE_RUNNER_ID` (a daemon-launched runner's tree, CAD-230b), hold no pane pty, and have its session leader on that ancestry (a `setsid` + double-fork orphan does not); refused too when the request carries `by`/`operator`/`actor`/`alias`/`lane`/`pid`. The evidence must name the recorded hold exactly; the daemon then reads `/proc` itself and frees only on proven death — a live or unknown holder is refused whatever the evidence says. `cadence build-slot reconcile <enrollment_id> <token> --evidence <json>` |
 
 `alias`, `provider`, `message` ids: `^[a-z0-9][a-z0-9-]{0,63}$`.
 `text`: 1–48000 chars. `reply_to` may not equal `alias`.
@@ -1502,6 +1504,145 @@ Residual: an orphan of a dead provider re-parented under a pane — only
 possible with a subreaper below that pane — has no enrolled root left
 on its chain, so it falls to the pane's legacy binding.
 
+### Exec-bound holds (CAD-230 phase b1)
+
+`build-slot run` sends `exec:true`: the daemon then requires the
+claimed `pid` to be the socket peer itself (an ancestor is refused) —
+the `cadence build-slot run` process, which execs into the command
+once granted. `exec` keeps the pid and the `/proc` starttime, so for a
+strict caller the recorded holder `(pid, starttime, uid)` *is* the
+running build; `slot_status` flags the hold `exec_bound`. A pane
+caller's `run` keeps its legacy hold (the pid check is the only
+difference — `run` always claimed its own pid).
+
+A strict hold ends with its holder without anyone's cooperation: the
+daemon re-reads every strict holder once a second and frees a hold
+whose holder is proven dead — gone, a recycled pid (new starttime), or
+a zombie its parent has not reaped yet whose thread group is down to
+itself (`holder exited`; a zombie leader with live threads is
+`unknown`) — through the
+same fail-closed writer (an unwritable file keeps it accounted).
+`unknown` still never frees. A holder's `release` of a hold the watcher
+already freed answers `released:false` with the reason, as a same-call
+reap does. Only the holder or a verified descendant can release it
+(unchanged); a recycled pid is a different process — it reads as the
+holder's death, and its own request gets a fresh hold, never the old
+token. `exec_bound` describes how the hold was taken (the daemon
+verified the claimed pid was the peer); it grants nothing by itself.
+A process the command leaves running in the background is not the
+holder — the hold ends with the exec'd process. Legacy holds keep the
+reap-on-call rule above.
+
+### Daemon-launched runners (CAD-230 phase b2)
+
+A caller with no pane and no managed endpoint (a subagent, an external
+worker, a CI-like run) has no slot identity, so it cannot queue. It can
+ask the daemon to run one of its project's **recipes** instead, declared
+only in the tracker's `project.yaml`:
+
+```yaml
+build:
+  recipes:
+    check:
+      argv: [cargo, clippy, --all-targets, --locked, --, -D, warnings]
+      cwd: .                  # repo-relative (default: checkout root)
+      env: [PATH, HOME, CARGO_BUILD_JOBS]  # names passed from the daemon's env
+      kind: build             # slot pool: build (default) | test | suite
+```
+
+`cadence build-slot launch check [--project p] [--worktree <path>]`
+names a recipe, a project and optionally a checkout; nothing about the
+command. The daemon:
+
+1. authorizes the requester from the connection — a pane agent, an
+   *active* enrolled managed endpoint, or operator proof (the same
+   positive proof `slot_reconcile` needs); otherwise it refuses naming
+   the rule. A runner's attached process tree is refused (a recipe must
+   not nest `build-slot`), and so is a detached descendant that keeps
+   the runner's environment; a revoked or expired endpoint is refused
+   too. A detached descendant that scrubs that environment is the known
+   residual below (CAD-308);
+2. resolves the launch **intent** from config: the recipe (unknown →
+   refused, naming the recipes the project defines; `argv` non-empty,
+   `env` POSIX names and never `CADENCE_*`, `cwd` repo-relative with no
+   `..` and still inside the checkout once resolved), the checkout (the
+   `--worktree` path, or the cwd when the CLI resolved the project from
+   it, else the project's first repo) — whose git common-dir root must
+   be one of the project's registered repo paths — and its `HEAD`. The
+   **digest** is sha256 over project, recipe, kind, argv, checkout, cwd,
+   env names and `HEAD` at resolution — an *intent record* of what was
+   asked for, not an attestation of the working tree's content; a tree
+   with uncommitted changes (tracked edits
+   or untracked, non-ignored files) is recorded as `dirty` — read at
+   launch and again at gate-open — and is not part of the digest. The
+   daemon runs git (`rev-parse`, `status`) inside the requester-chosen
+   checkout; those reads run with `core.fsmonitor=false`,
+   `GIT_OPTIONAL_LOCKS=0` and only `PATH`/`HOME`, so a checkout's config
+   cannot make the daemon run a program;
+3. writes the receipt `pending`, digest bound to a fresh `run-<hex>` id,
+   **before** anything is spawned;
+4. spawns `/bin/sh` running a gate in its own process group, in the
+   recipe's cwd, with ONLY the allowlisted names (values from the
+   daemon's environment) plus `CADENCE_RUNNER_ID`/`CADENCE_RUNNER_DIGEST`,
+   stdout and stderr appended to `<state>/runners/<id>.log`. The gate
+   blocks on its stdin;
+5. enrolls that exact process as root = worker (`runner_id`, owner
+   generation `runner:<id>:<digest>`, accounted to the requester's
+   lane — never revalidated against an agent row, never superseded by
+   the requester's endpoint) and queues it for the recipe's pool as a
+   strict, exec-bound request;
+6. on grant re-reads the checkout's `HEAD` (moved → refused, the gate
+   never opens), records `running`, then writes `go <runner_id>`: the
+   gate `exec`s the recipe with stdin from `/dev/null`, keeping the
+   enrolled pid and starttime. A refusal, a queue timeout
+   (`wait_secs`, default 600) or a closing daemon closes the gate
+   instead — it exits 125 and the recipe never starts;
+7. waits for the exit (the daemon is the parent). Once the recipe's
+   process has exited — observed before it is reaped, so its pid (the
+   group id) cannot be reused — whatever it left in its process group is
+   SIGKILLed: nothing keeps building outside the slot. It then records
+   `exited` with `exit_code`/`signal`, frees the hold on proof of death and revokes
+   the enrollment (pruned once nothing holds under it), and emits
+   `runner_finished` on the requester's lane.
+
+The CLI streams the log and exits with the recipe's code (128+signal
+when killed); a runner that never ran exits with the refusal. Receipt
+states: `pending`, `queued`, `running` (in flight), then `exited`,
+`timed_out`, `refused`, `cancelled` or `unknown`. **Restart:** a runner
+in flight when its daemon stopped is `unknown` with `complete:false`
+and its `last_state` at the next boot (`runner_unknown` event) — never
+relaunched (resumption is CAD-236's). Its enrollment is revoked; its
+hold stays accounted under the tri-state rule until the process is
+proven dead. A closing daemon opens no gate and writes no further
+runner state. An operator-launched runner is accounted to the lane
+`(operator)`, which no agent alias can take.
+
+Not yet provided: a cancel verb (stop the runner's process to end it)
+and a run-time cap — a hung recipe holds its slot until it exits, like
+any strict hold; and receipts and logs under `<state>/runners/` are
+kept without a size cap or expiry (a recipe's output lands in the state
+dir's filesystem).
+
+Threat model: same-uid processes are not a hostile boundary (as above).
+What a runner authorizes is "this admitted requester may run this
+project's operator-declared recipe against a checkout of one of its
+registered repos" — the checkout's content (build scripts, tests) is
+the requester's code, as with any build. The daemon never takes argv,
+cwd, env, a pid, a lane or an alias from a request, and the slot holder
+is always the process the daemon itself spawned and verified. A
+runner's tree carries `CADENCE_RUNNER_ID`, so a descendant that detaches
+from it (`setsid -f`) but keeps that environment is still refused as
+the operator.
+
+**Known residual (CAD-308, same class as CAD-276):** a descendant
+that detaches AND scrubs the runner's environment — `env -u
+CADENCE_RUNNER_ID -u CADENCE_RUNNER_DIGEST setsid -f …` with stdio
+redirected — re-parents to init, carries no marker and passes operator
+proof: it can launch runners as `(operator)` and record
+operator-claimed approvals. The daemon child-subreaper follow-up
+(CAD-308) closes it; `build_slot_launch_detached_scrubbed_descendant_passes_as_operator`
+pins today's behaviour until then.
+
 *Deviation from design v3:* v3 admits only the exact root/worker
 process. A managed provider's builds run in its tools' subprocesses
 (the provider's shell running `cadence build-slot run … cargo …`), so
@@ -1559,8 +1700,9 @@ caller can never free another's hold. A re-poll whose `request_id`
 matches a hold adopts it only on an exact `(request_id, pid, lane,
 kind)` match — a second process sharing a natural request id queues
 like everyone else. A holder whose process dies or whose pid is
-recycled is reaped on the next acquire/status — a killed agent frees
-its slot, nothing is ever killed for one — and a hold past
+recycled is reaped on the next acquire/status (a strict hold also by
+the daemon's own once-a-second watcher, CAD-230b) — a killed agent
+frees its slot, nothing is ever killed for one — and a hold past
 `max_hold_secs` (default 7200) is reaped as `hold expired` so a
 forgotten hold cannot wedge a pool. Waiting is client-side:
 `slot_acquire` answers instantly with granted-or-position, and a
