@@ -22051,6 +22051,164 @@ stress_pattern = ["wait_"]
     // The scratch HOME is removed with the review.
     assert!(!Path::new(gate_home).exists(), "{gate_home} left behind");
 }
+
+/// CAD-264: `vite build` strips TypeScript types without checking them,
+/// so the repo's own `cadence-review.toml` must type-check ui/src as a
+/// gate. The gate command is taken from that file and run by
+/// `cadence review` against the real `tsc` in ui/node_modules: a ui/src
+/// type error fails the gate with tsc's message, a clean tree passes.
+#[test]
+fn review_verb_ui_typecheck_gate_catches_a_ui_type_error() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let real: toml::Value =
+        toml::from_str(&std::fs::read_to_string(root.join("cadence-review.toml")).unwrap())
+            .unwrap();
+    let typecheck = "cd ui && node_modules/.bin/tsc --noEmit";
+    let gates: Vec<&str> = real["gates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| g.as_str().unwrap())
+        .collect();
+    assert!(gates.contains(&typecheck), "{gates:?}");
+    let node_modules = root.join("ui/node_modules");
+    assert!(
+        node_modules.join(".bin/tsc").exists(),
+        "{} has no tsc — run `pnpm install` in ui/ (or link the main \
+         checkout's ui/node_modules, as the review's prepare does)",
+        node_modules.display()
+    );
+
+    let base = TempDir::new().unwrap();
+    let f = review_fixture(base.path());
+    // Base config: link the real node_modules, then gate with the
+    // repo's own typecheck command and nothing else.
+    std::fs::write(
+        f.repo.join("cadence-review.toml"),
+        format!(
+            r#"prepare = ["cd ui && ln -sfn '{}' node_modules"]
+gates = ["{typecheck}"]
+full_suite = "sh suite.sh"
+test_globs = ["tests/**"]
+test_command = "sh one_test.sh {{test}}"
+stress_pattern = ["wait_"]
+"#,
+            node_modules.display()
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(f.repo.join("ui/src")).unwrap();
+    std::fs::copy(
+        root.join("ui/tsconfig.json"),
+        f.repo.join("ui/tsconfig.json"),
+    )
+    .unwrap();
+    std::fs::write(f.repo.join(".gitignore"), "/ui/node_modules\n").unwrap();
+    std::fs::write(
+        f.repo.join("ui/src/count.ts"),
+        "export const count: number = 1;\n",
+    )
+    .unwrap();
+    review_git(&f.repo, &["add", "-A"]);
+    review_git(&f.repo, &["commit", "-qm", "base: a typed ui"]);
+    review_git(&f.repo, &["push", "-q", "origin", "main"]);
+
+    let open_pr = |n: i64, file: &str, text: &str| {
+        review_git(&f.repo, &["checkout", "-qb", &format!("pr-{n}"), "main"]);
+        std::fs::write(f.repo.join(file), text).unwrap();
+        review_git(&f.repo, &["add", "-A"]);
+        review_git(&f.repo, &["commit", "-qm", &format!("pr{n}")]);
+        let head = review_git_sha(&f.repo, &["rev-parse", "HEAD"]);
+        review_git(
+            &f.repo,
+            &["push", "-q", "origin", &format!("HEAD:refs/pull/{n}/head")],
+        );
+        std::fs::write(
+            f.fakedir.join(format!("pr-view-{n}.json")),
+            serde_json::to_string(&json!({
+                "number": n, "title": format!("PR {n}"),
+                "url": format!("https://example/{n}"),
+                "headRefName": format!("pr-{n}"), "headRefOid": head,
+                "baseRefName": "main",
+                "files": [{"path": file}],
+                "state": "OPEN",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        review_git(&f.repo, &["checkout", "-q", "main"]);
+    };
+    // PR 12 assigns a string to a number — vite would build it.
+    open_pr(
+        12,
+        "ui/src/label.ts",
+        "export const label: number = \"not a number\";\n",
+    );
+    // PR 13 is the same file, well typed.
+    open_pr(
+        13,
+        "ui/src/label.ts",
+        "export const label: string = \"ok\";\n",
+    );
+
+    let typecheck_gate = |pr: i64| {
+        let out = review_cmd(&f)
+            .args([&pr.to_string(), "--no-full"])
+            .output()
+            .unwrap();
+        let r = review_report(&f, pr);
+        assert!(
+            r["prepare"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|s| s["outcome"] == json!("ok")),
+            "{:?}\nstderr: {}",
+            r["prepare"],
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let gates = r["gates"].as_array().unwrap().clone();
+        assert_eq!(gates.len(), 1, "{gates:?}");
+        assert_eq!(gates[0]["cmd"], json!(typecheck));
+        (out, r, gates[0].clone())
+    };
+
+    let (out, r, gate) = typecheck_gate(12);
+    assert_eq!(out.status.code(), Some(2), "{r}");
+    assert_eq!(gate["outcome"], json!("fail"), "{gate:?}");
+    let tail: Vec<&str> = gate["tail"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l.as_str().unwrap_or(""))
+        .collect();
+    assert!(
+        tail.iter()
+            .any(|l| l.contains("src/label.ts") && l.contains("error TS2322")),
+        "{tail:?}"
+    );
+    assert_eq!(r["suggested_verdict"], json!("blocked"));
+    assert!(
+        r["verdict_reasons"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(format!("gate `{typecheck}` fail"))),
+        "{:?}",
+        r["verdict_reasons"]
+    );
+
+    let (_, r, gate) = typecheck_gate(13);
+    assert_eq!(gate["outcome"], json!("ok"), "{gate:?}");
+    assert!(
+        !r["verdict_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s.as_str().unwrap_or("").contains("gate `")),
+        "{:?}",
+        r["verdict_reasons"]
+    );
+}
 // ==== CAD-83: `cadence overview` — daemon-dependent rows ====
 
 /// `cadence overview --json` against a scratch daemon's state dir;
