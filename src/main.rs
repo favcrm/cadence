@@ -61,6 +61,13 @@ enum Commands {
         #[command(subcommand)]
         action: DaemonAction,
     },
+    /// One durable rollout claim. `daemon restart` and a schema crossing
+    /// both require it. Inside a cadence pane the holder is
+    /// `$CADENCE_ALIAS`; outside a pane pass `--as <identity>`.
+    Rollout {
+        #[command(subcommand)]
+        action: RolloutAction,
+    },
     /// Manage registered agents.
     Agent {
         #[command(subcommand)]
@@ -1232,6 +1239,11 @@ enum DaemonAction {
         /// agent with no live endpoint.
         #[arg(long)]
         resume: bool,
+        /// Identity when this shell is not a cadence pane. Required to
+        /// start a binary whose commit differs from the one the daemon
+        /// last recorded, and only if that identity holds the lease.
+        #[arg(long = "as")]
+        as_identity: Option<String>,
     },
     /// Report daemon health, including `agent_gc_timer`: whether the
     /// opt-in agent-gc timer is on (pm.yaml `[host]
@@ -1256,6 +1268,64 @@ enum DaemonAction {
         /// running for this state dir.
         #[arg(long)]
         ui: bool,
+        /// Identity when this shell is not a cadence pane. The restart
+        /// is refused unless this identity holds the rollout lease.
+        #[arg(long = "as")]
+        as_identity: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum RolloutAction {
+    /// Take the rollout lease. Refused while another unexpired lease is
+    /// held; the error names that holder, target, and expiry.
+    /// `--takeover` is allowed only after the current lease has expired.
+    Claim {
+        /// Why this rollout is happening.
+        #[arg(long)]
+        reason: String,
+        /// Build commit this rollout intends to run.
+        #[arg(long)]
+        target: Option<String>,
+        /// How long the lease lasts: 90s, 30m, 12h, 1d, or bare seconds
+        /// [default: 12h].
+        #[arg(long, default_value = "12h")]
+        ttl: String,
+        /// Identity outside a cadence pane, for example `operator:ada`.
+        #[arg(long = "as")]
+        as_identity: Option<String>,
+        /// Replace an expired lease. Recorded with the previous holder.
+        #[arg(long)]
+        takeover: bool,
+    },
+    /// Show the active lease, or report that none is held.
+    Status,
+    /// Drop the lease. The holder only.
+    Release {
+        /// Identity outside a cadence pane.
+        #[arg(long = "as")]
+        as_identity: Option<String>,
+    },
+    /// Pass the lease to another identity. The holder only. The backup
+    /// receipt stays with the lease.
+    Handoff {
+        /// Identity that should hold the lease next.
+        #[arg(long)]
+        to: String,
+        /// Identity outside a cadence pane.
+        #[arg(long = "as")]
+        as_identity: Option<String>,
+    },
+    /// Record a backup receipt on the lease. The holder only. The file
+    /// must already exist and be a readable SQLite database; this
+    /// command does not take the backup.
+    Backup {
+        /// Path of the SQLite backup to hash and record.
+        #[arg(long)]
+        path: PathBuf,
+        /// Identity outside a cadence pane.
+        #[arg(long = "as")]
+        as_identity: Option<String>,
     },
 }
 
@@ -2025,7 +2095,18 @@ fn ui_run_args(pid: i32) -> (String, u16, Option<std::path::PathBuf>, Vec<String
 /// was live before settles out of `starting`/`offline`, then print a
 /// before/after table. `--when-idle` gates the whole thing on a
 /// quiet fleet first; `--ui` bounces the detached board server too.
-fn daemon_restart(state_dir: &Path, when_idle: bool, timeout: u64, ui: bool) -> Result<i32> {
+fn daemon_restart(
+    state_dir: &Path,
+    when_idle: bool,
+    timeout: u64,
+    ui: bool,
+    as_identity: Option<String>,
+) -> Result<i32> {
+    let caller =
+        cadence_agent::rollout::resolve_caller(as_identity.as_deref()).map_err(|error| {
+            Error::rejected(format!("daemon restart refused before shutdown: {error}"))
+        })?;
+    let ticket = cadence_agent::rollout::begin_restart(state_dir, &caller)?;
     let before = client::rpc(state_dir, "agent_list", json!({}))?["agents"]
         .as_array()
         .cloned()
@@ -2084,6 +2165,11 @@ fn daemon_restart(state_dir: &Path, when_idle: bool, timeout: u64, ui: bool) -> 
             .map(|v| (alias, v["cursor"].as_i64().unwrap_or(0)))
         })
         .collect();
+    // The lease can be released, handed off, or expire while --when-idle
+    // waits. Re-check immediately before shutdown and do not restart
+    // when this caller no longer holds it.
+    cadence_agent::rollout::recheck_restart(state_dir, &ticket)?;
+    cadence_agent::rollout::note_restart_proceeded(state_dir, &ticket)?;
     let was_running = client::rpc(state_dir, "shutdown", json!({})).is_ok();
     if was_running && !wait_daemon_exit(state_dir, 30) {
         return Err(Error::rejected(
@@ -2097,7 +2183,7 @@ fn daemon_restart(state_dir: &Path, when_idle: bool, timeout: u64, ui: bool) -> 
              socket — inspect daemon.log before restarting",
         ));
     }
-    client::daemon_start(state_dir)?;
+    client::daemon_start_as(state_dir, Some(&caller.identity))?;
     // Wait until every agent that was live before leaves the
     // transitional states — `starting` (actor up, endpoint not open)
     // and `offline` (actor exited under shutdown). Stopped and fenced
@@ -3596,9 +3682,12 @@ fn run() -> Result<i32> {
                 cadence_agent::daemon::serve(&state_dir)?;
                 Ok(0)
             }
-            DaemonAction::Start { resume } => {
+            DaemonAction::Start {
+                resume,
+                as_identity,
+            } => {
                 std::fs::create_dir_all(&state_dir)?;
-                let mut result = client::daemon_start(&state_dir)?;
+                let mut result = client::daemon_start_as(&state_dir, as_identity.as_deref())?;
                 // --resume: once the daemon answers, sweep every agent
                 // with a stored thread and no live endpoint.
                 if resume {
@@ -3628,8 +3717,54 @@ fn run() -> Result<i32> {
                 when_idle,
                 timeout,
                 ui,
-            } => daemon_restart(&state_dir, when_idle, timeout, ui),
+                as_identity,
+            } => daemon_restart(&state_dir, when_idle, timeout, ui, as_identity),
         },
+        Commands::Rollout { action } => {
+            use cadence_agent::rollout::{Caller, ClaimRequest};
+            let caller = |as_identity: &Option<String>| -> Result<Caller> {
+                cadence_agent::rollout::resolve_caller(as_identity.as_deref())
+            };
+            let result = match action {
+                RolloutAction::Claim {
+                    reason,
+                    target,
+                    ttl,
+                    as_identity,
+                    takeover,
+                } => {
+                    let caller = caller(&as_identity)?;
+                    let ttl = cadence_agent::rollout::parse_ttl(&ttl)?;
+                    cadence_agent::rollout::claim(
+                        &state_dir,
+                        &ClaimRequest {
+                            caller: &caller,
+                            reason: &reason,
+                            target: target.as_deref(),
+                            ttl,
+                            takeover,
+                            now: cadence_agent::rollout::unix_now(),
+                        },
+                    )?
+                }
+                RolloutAction::Status => cadence_agent::rollout::status(&state_dir)?,
+                RolloutAction::Release { as_identity } => {
+                    cadence_agent::rollout::release(&state_dir, &caller(&as_identity)?)?
+                }
+                RolloutAction::Handoff { to, as_identity } => {
+                    cadence_agent::rollout::handoff(&state_dir, &caller(&as_identity)?, &to)?
+                }
+                RolloutAction::Backup { path, as_identity } => {
+                    cadence_agent::rollout::record_backup(
+                        &state_dir,
+                        &caller(&as_identity)?,
+                        &path,
+                    )?
+                }
+            };
+            print_json(&result);
+            Ok(0)
+        }
         Commands::Agent { action } => {
             let result = match action {
                 AgentAction::Register {
@@ -7240,7 +7375,10 @@ mod tests {
         assert!(matches!(
             cli.command,
             Commands::Daemon {
-                action: DaemonAction::Start { resume: true }
+                action: DaemonAction::Start {
+                    resume: true,
+                    as_identity: None,
+                }
             }
         ));
     }

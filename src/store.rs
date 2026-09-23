@@ -860,10 +860,24 @@ impl Store {
     /// caller passes `None` and gets the historical fence-everything
     /// recovery.
     pub fn open_adopting(path: &Path, marker: Option<ConsumedMarker>) -> Result<Self> {
-        Self::open_inner(path, marker)
+        Self::open_inner(path, marker, true)
     }
 
-    fn open_inner(path: &Path, marker: Option<ConsumedMarker>) -> Result<Self> {
+    /// Migrate an older database without the rollout lease gate.
+    ///
+    /// Schema-migration tests use this to replay a downgraded file.
+    /// `open` and `open_adopting` — the daemon and doctor paths — never
+    /// call it, so a lower-schema production database still refuses.
+    pub fn open_for_schema_tests(path: &Path) -> Result<Self> {
+        Self::open_inner(path, None, false)
+    }
+
+    fn open_inner(path: &Path, marker: Option<ConsumedMarker>, gate: bool) -> Result<Self> {
+        let permit = if gate {
+            crate::rollout::authorize_migration(path)?
+        } else {
+            crate::rollout::MigrationPermit { crossing: None }
+        };
         let conn = Connection::open(path)?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -1191,6 +1205,32 @@ impl Store {
                  UPDATE schema_version SET version=11;",
             )?;
             tx.commit()?;
+        }
+        if version < 12 {
+            // v12: rollout lease + the build commit the daemon last
+            // recorded. The lease gate runs before this function opens
+            // the file; reaching here means the crossing was allowed
+            // (fresh database, current schema, matching backup receipt,
+            // or the one-time CADENCE_ROLLOUT_BOOTSTRAP introduction).
+            let tx = conn.unchecked_transaction()?;
+            crate::rollout::ensure_lease_tables(&tx)?;
+            tx.execute(
+                "UPDATE schema_version SET version=?1",
+                [crate::rollout::SCHEMA_VERSION],
+            )?;
+            tx.commit()?;
+        }
+        if let Some(crossing) = permit.crossing {
+            Self::event(
+                &conn,
+                Self::DAEMON_STREAM,
+                "rollout_migration_allowed",
+                json!({
+                    "from": crossing.from,
+                    "to": crate::rollout::SCHEMA_VERSION,
+                    "reason": crossing.reason,
+                }),
+            )?;
         }
         let store = Self {
             conn: Mutex::new(conn),
@@ -1588,6 +1628,27 @@ impl Store {
     ) -> Result<()> {
         let conn = self.conn();
         Self::event_scoped(&conn, alias, kind, payload, job_id, task_id)
+    }
+
+    /// Record the build commit this daemon process is running.
+    pub fn record_running_build(&self, commit: &str) -> Result<()> {
+        let conn = self.conn();
+        crate::rollout::upsert_daemon_build(&conn, commit, crate::rollout::unix_now())
+    }
+
+    /// Refuse to keep running when this binary's commit is not the one
+    /// the daemon last recorded, unless the caller holds the lease.
+    pub fn enforce_running_build(&self) -> Result<()> {
+        let conn = self.conn();
+        crate::rollout::enforce_running_build(&conn)
+    }
+
+    /// Fold a refused migration's side log into the daemon event stream.
+    /// The refusal itself cannot be inserted into the database it is
+    /// refusing to modify.
+    pub fn ingest_rollout_gate(&self, state_dir: &Path) -> Result<()> {
+        let conn = self.conn();
+        crate::rollout::ingest_gate_log(state_dir, &conn)
     }
 
     pub fn agent(&self, alias: &str) -> Result<Agent> {
@@ -6304,7 +6365,7 @@ mod tests {
         drop(conn);
         {
             // Upgrade preserves v1 rows and restores the column.
-            let s = Store::open(&db).unwrap();
+            let s = Store::open_for_schema_tests(&db).unwrap();
             let agent = s.agent("a1").unwrap();
             assert_eq!(agent.endpoint, None);
             assert_eq!(s.message("m1").unwrap().unwrap().body, "keep me");
@@ -6333,7 +6394,7 @@ mod tests {
         {
             // `recover` clears runtime endpoint/pid on every open; the
             // persisted thread identity proves the row survived.
-            let s = Store::open(&db).unwrap();
+            let s = Store::open_for_schema_tests(&db).unwrap();
             let agent = s.agent("a1").unwrap();
             assert_eq!(agent.thread_id.as_deref(), Some("th"));
             assert_eq!(agent.endpoint, None);
@@ -6344,7 +6405,7 @@ mod tests {
             conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0))
                 .unwrap()
         };
-        assert_eq!(version, 11);
+        assert_eq!(version, crate::rollout::SCHEMA_VERSION);
         Store::open(&db).unwrap();
     }
 
@@ -6379,7 +6440,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = v3_db(&dir);
         {
-            let s = Store::open(&db).unwrap();
+            let s = Store::open_for_schema_tests(&db).unwrap();
             // Old rows read cleanly: the pre-v4 message is unattached.
             let m = s.message("m1").unwrap().unwrap();
             assert_eq!(m.task_id, None);
@@ -6407,7 +6468,7 @@ mod tests {
                 .conn()
                 .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(v, 11);
+            assert_eq!(v, crate::rollout::SCHEMA_VERSION);
         }
         // Half-applied: v4 objects present but version rolled back —
         // reopening must converge, not fail on duplicates.
@@ -6416,7 +6477,7 @@ mod tests {
             .unwrap();
         drop(conn);
         {
-            let s = Store::open(&db).unwrap();
+            let s = Store::open_for_schema_tests(&db).unwrap();
             assert_eq!(s.job("j1").unwrap().id, "j1");
             assert_eq!(s.message("m1").unwrap().unwrap().task_id, None);
         }
@@ -6430,7 +6491,7 @@ mod tests {
         .unwrap();
         drop(conn);
         {
-            let s = Store::open(&db).unwrap();
+            let s = Store::open_for_schema_tests(&db).unwrap();
             // Scoped events work again → the column was re-added.
             s.create_task("j1", "j1-t9", None, None, None, None, None, None, None)
                 .unwrap();
@@ -6440,7 +6501,7 @@ mod tests {
                 .conn()
                 .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(v, 11);
+            assert_eq!(v, crate::rollout::SCHEMA_VERSION);
         }
     }
 

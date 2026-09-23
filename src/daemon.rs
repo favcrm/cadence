@@ -416,6 +416,12 @@ impl Shared {
     pub fn new_hot(state_dir: &Path, opts: &ServeOptions, hot: HotStart) -> Result<Arc<Self>> {
         let HotStart { instance, marker } = hot;
         let store = Store::open_adopting(&state_dir.join("cadence.sqlite3"), marker)?;
+        // Same-build crash restart is allowed with no lease. A different
+        // build must already hold one — `daemon start` checks before
+        // spawn, and this is the backstop for a direct `daemon run`.
+        store.enforce_running_build()?;
+        store.record_running_build(crate::overview::BUILD_COMMIT)?;
+        store.ingest_rollout_gate(state_dir)?;
         let provider_log_dir = state_dir.join("agents");
         std::fs::create_dir_all(&provider_log_dir)?;
         // CAD-113: slot holds persist under the state dir; restore
