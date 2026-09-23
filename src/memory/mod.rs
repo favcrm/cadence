@@ -8,9 +8,10 @@
 //! Unix peer through its one caller-identity verifier (CAD-381) to exactly
 //! one live agent endpoint — an owned pty pane or a managed endpoint's
 //! CAD-230 enrollment — and supplies the authenticated proposer/reviewer
-//! proof; a caller outside every agent tree is "not an agent" and refused. Two distinct non-author PM/worker
-//! endpoint identities review the same semantic digest; an authenticated PM
-//! endpoint finalizes. Legacy records remain readable but are blocked from
+//! proof; a caller with no agent identity is refused (and is not thereby
+//! the operator). Two distinct non-author PM/worker endpoint identities
+//! review the same semantic digest; an authenticated PM endpoint
+//! finalizes. Legacy records remain readable but are blocked from
 //! retrieval until a corrected native proposal is reviewed.
 //!
 //! Only accepted memories with a valid quorum match a dispatch:

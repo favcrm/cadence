@@ -1869,13 +1869,17 @@ impl Slots {
     }
 
     /// The enrollment `id` while it still vouches for a live agent
-    /// endpoint: active (not expired, not revoked) and owned by an
-    /// agent row — a build runner's enrollment (CAD-230b) is the
-    /// daemon's own command, never an agent identity.
-    pub fn active_endpoint_enrollment(&self, id: &str) -> Option<&Enrollment> {
+    /// endpoint: never revoked, and owned by an agent row — a build
+    /// runner's enrollment (CAD-230b) is the daemon's own command,
+    /// never an agent identity. `expired` still vouches: the TTL caps
+    /// build-slot admission, not who the endpoint is, and a long-lived
+    /// endpoint renews only at its next open. Identity rests on the
+    /// per-call checks — owner-row revalidation (revocation), verified
+    /// descent to the exact root (pid + starttime + uid).
+    pub fn endpoint_enrollment(&self, id: &str) -> Option<&Enrollment> {
         self.enrollments
             .iter()
-            .find(|e| e.id == id && e.auth == AuthState::Active && e.runner.is_none())
+            .find(|e| e.id == id && !matches!(e.auth, AuthState::Revoked(_)) && e.runner.is_none())
     }
 
     /// Every enrollment rooted at `root_pid`, in the one order a caller

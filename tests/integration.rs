@@ -19411,8 +19411,8 @@ fn memory_native_socket_identity_requires_distinct_reviewers() {
     assert_eq!(before_repeat, read_memory());
 
     // A detached integration-test RPC has no pane or enrolled-endpoint
-    // ancestor: it is classified "not an agent" (the operator path,
-    // CAD-381) and cannot borrow an alias from its params.
+    // ancestor: it has no agent identity (CAD-381) and cannot borrow an
+    // alias from its params.
     let err = d
         .rpc(
             "memory_review",
@@ -19426,7 +19426,7 @@ fn memory_native_socket_identity_requires_distinct_reviewers() {
             }),
         )
         .unwrap_err();
-    assert!(err.to_string().contains("is not an agent"), "{err}");
+    assert!(err.to_string().contains("has no agent identity"), "{err}");
 
     let before_missing_quorum = read_memory();
     let err = d
@@ -29207,8 +29207,8 @@ impl ManagedWorker {
 /// reviewed by two others and finalized by a managed pm to `accepted`;
 /// the author still cannot review its own proposal; a spoofed identity
 /// param is refused; the test process and a managed tool's detached
-/// grandchild are "not an agent" (the operator path), never the
-/// endpoint; and an owner-generation drift revokes the enrollment for
+/// grandchild have no agent identity (never the endpoint's); and an
+/// owner-generation drift revokes the enrollment for
 /// good — restoring the generation does not revive it.
 #[test]
 fn memory_managed_endpoints_authenticate_through_daemon_enrollment() {
@@ -29292,14 +29292,14 @@ fn memory_managed_endpoints_authenticate_through_daemon_enrollment() {
     let r = reviewer_a.rpc("self", "memory_review", spoof);
     refused(&r, "connection-bound", "spoofed reviewer");
 
-    // Not an agent: the test process itself, and a managed tool's
+    // No agent identity: the test process itself, and a managed tool's
     // setsid double-forked grandchild (off the provider's ancestry).
     let err = d
         .rpc("memory_review", review("outside every agent tree"))
         .unwrap_err();
-    assert!(err.to_string().contains("is not an agent"), "{err}");
+    assert!(err.to_string().contains("has no agent identity"), "{err}");
     let r = reviewer_a.rpc("detached", "memory_review", review("detached"));
-    refused(&r, "is not an agent", "detached grandchild");
+    refused(&r, "has no agent identity", "detached grandchild");
     assert_eq!(before, read_memory());
 
     let a = ok(
@@ -29348,7 +29348,7 @@ fn memory_managed_endpoints_authenticate_through_daemon_enrollment() {
 
     // Owner generation drift revokes the author's enrollment: the old
     // enrollment no longer authenticates — and never falls through to
-    // "not an agent" — even once the row's generation is restored.
+    // "no agent identity" — even once the row's generation is restored.
     let original = agent["generation"].as_str().map(str::to_string);
     let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
     conn.execute(
@@ -29366,7 +29366,7 @@ fn memory_managed_endpoints_authenticate_through_daemon_enrollment() {
         "id": "stale-rule"
     });
     let r = author.rpc("self", "memory_propose", second.clone());
-    refused(&r, "not active", "drifted enrollment");
+    refused(&r, "is revoked", "drifted enrollment");
     conn.execute(
         "UPDATE agents SET generation=?1 WHERE alias='author'",
         [original],
@@ -29374,8 +29374,92 @@ fn memory_managed_endpoints_authenticate_through_daemon_enrollment() {
     .unwrap();
     drop(conn);
     let r = author.rpc("child", "memory_propose", second);
-    refused(&r, "not active", "revoked enrollment after restore");
+    refused(&r, "is revoked", "revoked enrollment after restore");
     assert!(!pm_dir.join("demo/memory/stale-rule.md").exists());
+}
+
+/// CAD-381 review: a managed endpoint's identity outlives the build-slot
+/// TTL (an `expired` enrollment still vouches — renewal is only at the
+/// next open); and the ambiguous branches fail closed — two agent endpoints on one
+/// ancestry, and one pid that is both a pane and an enrolled root.
+#[test]
+fn memory_managed_identity_survives_ttl_and_refuses_ambiguity() {
+    let tmp = TempDir::new().unwrap();
+    let pm_dir = tmp.path().join("pm");
+    let pm = cadence_agent::issue::Pm::init(&pm_dir).unwrap();
+    std::fs::create_dir_all(pm_dir.join("demo")).unwrap();
+    std::fs::write(
+        pm_dir.join("demo/project.yaml"),
+        "key: demo\nprefix: D\ncomponents: []\n",
+    )
+    .unwrap();
+    pm.commit("project fixture\n\nActor: test\n").unwrap();
+    test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
+    let clock = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1_000));
+    let d = TestDaemon::start_opts(slot_opts_clock(
+        2,
+        1,
+        900,
+        &[],
+        Some(std::sync::Arc::clone(&clock)),
+    ));
+    let mut wk = ManagedWorker::start(&d, "wk");
+    let mut twin = ManagedWorker::start(&d, "twin");
+    for alias in ["wk", "twin"] {
+        d.wait_agent(alias, "idle", 25);
+    }
+    let proposal = |id: &str| {
+        json!({
+            "project": "demo",
+            "kind": "rule",
+            "scope": {"project": true},
+            "source": "CAD-381",
+            "confidence": "high",
+            "text": "identity is not a build lease\n\n**Why:** the TTL caps slots.\n\n**How to apply:** revalidate per call.\n",
+            "id": id
+        })
+    };
+    let refused = |r: &Value, needle: &str, what: &str| {
+        assert_eq!(r["ok"], false, "{what}: {r}");
+        let msg = r["error"]["message"].as_str().unwrap_or_default();
+        assert!(msg.contains(needle), "{what}: want '{needle}' in {r}");
+    };
+
+    // Past the enrollment TTL: no new build work, identity intact.
+    clock.store(
+        1_000 + cadence_agent::slots::ENROLLMENT_TTL_SECS as u64 + 1,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    let s = wk.rpc("self", "slot_status", json!({}));
+    let mine = s["result"]["enrollments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["owner_actor"] == "wk")
+        .cloned()
+        .unwrap();
+    assert_eq!(mine["auth_state"], "expired", "{s}");
+    let r = wk.rpc("child", "memory_propose", proposal("after-ttl"));
+    assert_eq!(r["ok"], true, "expired enrollment still vouches: {r}");
+    assert_eq!(r["result"]["status"], "proposed", "{r}");
+
+    // One pid both a registered pane and an enrolled root: ambiguous.
+    plant_pane(&d, "twin-pane", twin.pid);
+    let r = twin.rpc("self", "memory_propose", proposal("twin-rule"));
+    refused(
+        &r,
+        "both a registered pane and an enrolled endpoint",
+        "pane==root",
+    );
+
+    // Two agent endpoints on one ancestry (the test process planted as
+    // a pane above the provider): ambiguous, never nearest-wins.
+    plant_self(&d);
+    let r = wk.rpc("self", "memory_propose", proposal("nested-rule"));
+    refused(&r, "caller identity ambiguous", "nested endpoints");
+    for id in ["twin-rule", "nested-rule"] {
+        assert!(!pm_dir.join(format!("demo/memory/{id}.md")).exists());
+    }
 }
 
 /// CAD-230 phase a ACCEPTANCE: the daemon enrolls a managed provider

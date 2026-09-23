@@ -2076,8 +2076,8 @@ impl Shared {
     ///   so headless claude/codex authenticate exactly like panes.
     ///
     /// Exactly one node on the peer's ancestry is the agent. None is
-    /// [`Caller::NotAgent`] — the operator path, which never takes an
-    /// agent's identity. Two or more (or one pid that is both a pane and
+    /// [`Caller::NoAgentIdentity`] — which never takes an agent's
+    /// identity and is NOT operator proof (see that variant). Two or more (or one pid that is both a pane and
     /// an enrolled root) is ambiguous and refused, as is any node whose
     /// proof fails: fail closed, never fall through to another node.
     fn caller_identity(&self, peer_pid: u32) -> Result<Caller> {
@@ -2116,7 +2116,7 @@ impl Shared {
             nodes.push(format!("enrolled root pid {}", chain[r]));
         }
         match nodes.len() {
-            0 => return Ok(Caller::NotAgent),
+            0 => return Ok(Caller::NoAgentIdentity),
             1 => {}
             n => {
                 return Err(Error::rejected(format!(
@@ -2129,12 +2129,12 @@ impl Shared {
         if let Some(&r) = roots.first() {
             let strict = slots.strict_caller(peer_pid, chain[r])?;
             let enrollment = slots
-                .active_endpoint_enrollment(&strict.enrollment_id)
+                .endpoint_enrollment(&strict.enrollment_id)
                 .cloned()
                 .ok_or_else(|| {
                     Error::rejected(format!(
-                        "Caller pid {peer_pid}: enrollment {} of '{}' is not active \
-                         (revoked, expired or a build runner) — it vouches for no agent",
+                        "Caller pid {peer_pid}: enrollment {} of '{}' is revoked (or a \
+                         build runner's) — it vouches for no agent",
                         strict.enrollment_id, strict.lane
                     ))
                 })?;
@@ -2221,12 +2221,12 @@ impl Shared {
     fn memory_actor(&self, peer_pid: u32) -> Result<NativeIdentity> {
         let verified = match self.caller_identity(peer_pid)? {
             Caller::Agent(v) => *v,
-            Caller::NotAgent => {
+            Caller::NoAgentIdentity => {
                 return Err(Error::rejected(format!(
-                    "Memory caller pid {peer_pid} is not an agent — it descends from \
-                     no registered pane and no enrolled managed endpoint (the operator \
-                     path); memory actions are agent-authenticated and a non-agent \
-                     caller is never given an agent's identity"
+                    "Memory caller pid {peer_pid} has no agent identity — it descends \
+                     from no registered pane and no enrolled managed endpoint; memory \
+                     actions are agent-authenticated and such a caller is never given \
+                     an agent's identity"
                 )))
             }
         };
@@ -6297,9 +6297,13 @@ fn optional_i64(params: &Value, field: &str) -> Option<i64> {
 /// Who is on the other end of a connection — see
 /// [`Shared::caller_identity`] (CAD-381).
 enum Caller {
-    /// Outside every agent tree: the operator path. It never resolves
-    /// to, or borrows, an agent's identity.
-    NotAgent,
+    /// No agent endpoint on the caller's ancestry: it never resolves
+    /// to, or borrows, an agent's identity. This is NOT operator proof —
+    /// an agent's own process escapes every agent tree by `setsid` +
+    /// double fork, `systemd-run` or a new tmux session. Operator
+    /// authority needs its own positive proof
+    /// ([`Shared::proven_operator`], CAD-276; web operator auth CAD-313).
+    NoAgentIdentity,
     /// Exactly one live agent endpoint, proven from the daemon's record.
     Agent(Box<VerifiedAgent>),
 }

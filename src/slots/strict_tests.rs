@@ -1440,10 +1440,10 @@ fn restart_revokes_runner_enrollments_but_keeps_their_holds() {
 
 /// CAD-381: the caller identity verifier sees EVERY enrolled root on a
 /// chain (nested endpoints are an ambiguous caller), and only an
-/// active endpoint enrollment vouches for an agent — a revoked one or
-/// a recycled root pid never does.
+/// unrevoked endpoint enrollment vouches for an agent — an expired one
+/// still does, a revoked one or a recycled root pid never does.
 #[test]
-fn enrolled_roots_on_counts_every_root_and_only_active_vouches() {
+fn enrolled_roots_on_counts_every_root_and_only_unrevoked_vouches() {
     let p = tree();
     // A second provider nested under the first one's shell.
     p.spawn(600, 300, 90).spawn(610, 600, 91);
@@ -1455,15 +1455,20 @@ fn enrolled_roots_on_counts_every_root_and_only_active_vouches() {
     assert_eq!(s.enrolled_roots_on(&[610, 600, 300, 200, 100]), vec![1, 3]);
     assert_eq!(s.nearest_enrolled_root(&[610, 600, 300, 200, 100]), Some(1));
 
+    // Past the TTL the enrollment is `expired` — no new build work —
+    // but it still vouches for the endpoint's identity.
+    held_json(&mut s, ENROLLMENT_TTL_SECS + 1.0);
+    assert_eq!(s.enrollments[0].auth, AuthState::Expired);
     assert_eq!(
-        s.active_endpoint_enrollment(&outer)
+        s.endpoint_enrollment(&outer)
             .map(|e| e.owner_actor.as_str()),
         Some("wk")
     );
+    // Revoked never vouches.
     s.revoke_owner("wk", "endpoint closed");
-    assert!(s.active_endpoint_enrollment(&outer).is_none());
-    assert!(s.active_endpoint_enrollment(&inner).is_some());
-    assert!(s.active_endpoint_enrollment("enr-unknown").is_none());
+    assert!(s.endpoint_enrollment(&outer).is_none());
+    assert!(s.endpoint_enrollment(&inner).is_some());
+    assert!(s.endpoint_enrollment("enr-unknown").is_none());
 
     // The root pid recycled into another process: no longer a root.
     p.kill(600);
