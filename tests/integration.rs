@@ -19737,11 +19737,28 @@ fn review_verb_end_to_end() {
     assert_eq!(bp[0]["outcome"], json!("ok"));
 
     // Pairwise open-PR conflicts: PR 8 conflicts on shared.txt; PR 9
-    // and PR 10 merge clean.
+    // merges clean. PR 10 does not merge into main, so its overlap is
+    // not assessed — and that is a verdict reason (CAD-295).
     let conflicts = r["open_pr_conflicts"].as_array().unwrap();
     assert_eq!(conflicts.len(), 1, "{conflicts:?}");
     assert_eq!(conflicts[0]["pr"], 8);
     assert_eq!(conflicts[0]["files"], json!(["shared.txt"]));
+    assert_eq!(
+        r["open_pr_not_assessed"],
+        json!([{"pr": 10, "title": "PR 10",
+                "reason": "it does not merge into the current base"}])
+    );
+    let reasons: Vec<&str> = r["verdict_reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap())
+        .collect();
+    assert!(
+        reasons
+            .contains(&"overlap not assessed with #10 — it does not merge into the current base"),
+        "{reasons:?}"
+    );
 
     assert_eq!(r["schema_migration"], false);
     // PR 7 leaves cadence-review.toml alone; the config came from the
@@ -19887,6 +19904,14 @@ fn review_verb_ignores_base_drift_between_pr_cut_points() {
                 .contains("does not merge")),
         "{skipped:?}"
     );
+    // ...and named in the verdict, so the unknown overlap is not
+    // missed (CAD-295).
+    assert!(
+        r["verdict_reasons"].as_array().unwrap().iter().any(|s| s
+            == "overlap not assessed with #10 — it does not merge into the current base"),
+        "{:?}",
+        r["verdict_reasons"]
+    );
     assert_eq!(r["open_pr_conflicts_base"], json!(main_sha));
     let md = std::fs::read_to_string(r["report_md"].as_str().unwrap()).unwrap();
     assert!(md.contains("would land on base"), "{md}");
@@ -20001,6 +20026,26 @@ fn review_verb_merge_conflict_blocks() {
             .unwrap()
             .iter()
             .any(|s| s.as_str().unwrap_or("").contains("does not merge")),
+        "{:?}",
+        r["verdict_reasons"]
+    );
+    // Every other PR is not assessed because PR 10 itself does not
+    // merge; that is already the blocking reason above, so no
+    // "overlap not assessed" reason is added (CAD-295).
+    let skipped = r["open_pr_not_assessed"].as_array().unwrap();
+    assert_eq!(skipped.len(), 3, "{skipped:?}");
+    assert!(
+        skipped
+            .iter()
+            .all(|c| c["reason"] == "this PR does not merge into the current base"),
+        "{skipped:?}"
+    );
+    assert!(
+        !r["verdict_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s.as_str().unwrap_or("").contains("overlap not assessed")),
         "{:?}",
         r["verdict_reasons"]
     );
