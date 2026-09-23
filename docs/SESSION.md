@@ -566,6 +566,17 @@ a time, oldest first. Pull requests keep cancel-stale behaviour. The
 |-------|-------|-------------|--------------|
 | `pull_request` | `ci-<PR number>` | cancelled by a newer head | at most one; a newer head replaces it (`queue: single`) |
 | `push` to `main` or `feat/**` | `ci-<ref>` | never cancelled | up to 100 wait, oldest first (`queue: max`); only a 101st is cancelled |
+| `merge_group` (merge queue) | `ci-<gh-readonly-queue ref>`, one per queue entry | never cancelled | `queue: max` |
+
+**Merging through the queue (CAD-290).** When the merge queue is enabled on
+`main`, do not `gh pr update-branch` and rerun by hand each time main moves.
+Enqueue the PR once it is green and reviewed — `gh pr merge <n> --squash
+--auto` (or "Merge when ready" in the UI) — and GitHub builds a
+`gh-readonly-queue/main/*` ref with the PR on top of main and the PRs ahead
+of it, runs the required `test` check there, and merges only if it passes.
+A failing entry is removed and the rest re-test without it. An admin
+bypass merge (`--admin`) skips the queue and its combined test; reserve it
+for emergencies.
 
 Before this, pushes used GitHub's default single pending slot, even though
 `cancel-in-progress` was false. When three merges landed inside one run,
