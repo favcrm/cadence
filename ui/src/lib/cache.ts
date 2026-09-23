@@ -17,6 +17,15 @@
  * schedules exactly one trailing request, because the in-flight one may
  * have been answered from before the change.
  *
+ * Stale-while-revalidate: `revalidate()` is what a screen calls when it
+ * comes on screen. Loaded data stays visible while the refetch runs, and
+ * data younger than `freshMs` is not refetched at all — so returning to a
+ * slow screen (`/api/overview` takes seconds) paints at once.
+ *
+ * `QueryCache` keys the stores: `cache.resource(key, fetcher)` hands every
+ * caller of one key the same store, so two components asking for the same
+ * key share one request and one state.
+ *
  * No React here — `useResource` adapts a store to a component — so the
  * state machine is unit-tested in plain node (see tests/cache.test.ts).
  */
@@ -37,6 +46,8 @@ export interface ResourceState<T> {
 export interface ResourceOptions<T> {
   /** A successful payload with nothing to show — status `empty`. */
   isEmpty?: (data: T) => boolean;
+  /** How long a successful load counts as fresh for `revalidate()`. */
+  freshMs?: number;
   now?: () => number;
 }
 
@@ -60,11 +71,13 @@ export class Resource<T> {
   private readonly listeners = new Set<() => void>();
   private readonly fetcher: () => Promise<T>;
   private readonly isEmpty: (data: T) => boolean;
+  private readonly freshMs: number;
   private readonly now: () => number;
 
   constructor(fetcher: () => Promise<T>, opts: ResourceOptions<T> = {}) {
     this.fetcher = fetcher;
     this.isEmpty = opts.isEmpty ?? (() => false);
+    this.freshMs = opts.freshMs ?? 0;
     this.now = opts.now ?? Date.now;
   }
 
@@ -129,6 +142,34 @@ export class Resource<T> {
   };
 
   /**
+   * Stale-while-revalidate: fetch unless the last success is younger than
+   * `freshMs`. Joins a request in flight; never blanks loaded data.
+   */
+  revalidate = (): Promise<void> => {
+    if (this.inflight) return this.inflight;
+    const { asOf } = this.state;
+    if (asOf !== null && this.state.status !== "stale" && this.now() - asOf < this.freshMs) {
+      return Promise.resolve();
+    }
+    return this.refresh();
+  };
+
+  /**
+   * Replace the data from outside a fetch — a stream frame or a write
+   * response that carries the whole value. Unlike `mutate` it also works
+   * before the first load, and it counts as a fresh success.
+   */
+  write = (fn: (data: T | null) => T): void => {
+    const data = fn(this.state.data);
+    this.set({
+      data,
+      status: this.isEmpty(data) ? "empty" : "ok",
+      error: null,
+      asOf: this.now(),
+    });
+  };
+
+  /**
    * Apply an authoritative local change (a write response) to loaded data.
    * A no-op before the first load — the next fetch brings it.
    */
@@ -147,6 +188,50 @@ export class Resource<T> {
   private set(patch: Partial<ResourceState<T>>): void {
     this.state = { ...this.state, ...patch };
     for (const listener of this.listeners) listener();
+  }
+}
+
+/**
+ * Keyed stores: one `Resource` per key, created on first use and shared by
+ * every later caller. The fetcher and options of the first call win — a key
+ * names one server resource, so later callers would pass the same ones.
+ */
+export class QueryCache {
+  private readonly entries = new Map<string, Resource<unknown>>();
+
+  resource<T>(key: string, fetcher: () => Promise<T>, opts?: ResourceOptions<T>): Resource<T> {
+    let entry = this.entries.get(key) as Resource<T> | undefined;
+    if (!entry) {
+      entry = new Resource(fetcher, opts);
+      this.entries.set(key, entry as Resource<unknown>);
+    }
+    return entry;
+  }
+
+  /** A family of keys under one prefix: `family("issue", api.issue)("CAD-1")`. */
+  family<A extends string, T>(
+    prefix: string,
+    fetcher: (arg: A) => Promise<T>,
+    opts?: ResourceOptions<T>,
+  ): (arg: A) => Resource<T> {
+    return (arg) => this.resource(`${prefix}:${arg}`, () => fetcher(arg), opts);
+  }
+
+  /** The store for `key` if anything created it, else null. */
+  peek<T>(key: string): Resource<T> | null {
+    return (this.entries.get(key) as Resource<T> | undefined) ?? null;
+  }
+
+  /**
+   * Invalidate every loaded store whose key is `key` or starts with
+   * `key:`. Stores nothing has loaded stay idle until a screen asks.
+   */
+  invalidate(key: string): void {
+    for (const [k, entry] of this.entries) {
+      if ((k === key || k.startsWith(`${key}:`)) && entry.get().asOf !== null) {
+        void entry.invalidate();
+      }
+    }
   }
 }
 
