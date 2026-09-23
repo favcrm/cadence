@@ -1417,9 +1417,7 @@ impl Shared {
             .into_iter()
             .map(|(alias, (_, pane_pid, _))| (pane_pid, alias))
             .collect();
-        let lane = chain
-            .iter()
-            .find_map(|p| panes.get(p))
+        let lane = adapter::pty::nearest_pane(&chain, &panes)
             .cloned()
             .ok_or_else(|| {
                 Error::rejected(format!(

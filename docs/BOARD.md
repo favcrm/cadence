@@ -608,7 +608,9 @@ tailnet name, `Tailscale-User-Login` resolves the actor to
 `<login> (tailscale)` — the tracker commit's `Actor:` trailer names the
 person who wrote. The same headers on a direct loopback request
 (non-tailnet `Host`) are ignored; the default actor stays
-`operator (ui)`. `GET /api/meta` reports `{read_only, actor,
+`operator (ui)` — unless the peer descends from a registered pane, in
+which case the write is that agent's (see [Write identity](#write-identity)).
+`GET /api/meta` reports `{read_only, actor,
 tailnet_url, version, build_commit, build_time, daemon}` so the SPA
 renders the right controls and the serving binary's build identity.
 
@@ -666,7 +668,7 @@ exactly one git commit whose subject carries the actor:
 | `POST /api/issues/:id/links` | `{type: blocked_by\|relates\|parent\|duplicate_of, target, if_rev?}` | `200` |
 | `DELETE /api/issues/:id/links` | same shape | `200` |
 | `POST /api/issues/:id/refs` | `{kind, url\|path, label?, if_rev?}` — exactly one of url/path | `200` |
-| `POST /api/issues/:id/comments` | `{body, if_rev?}` — author `operator`, kind `ui`, markdown stored verbatim | `200` |
+| `POST /api/issues/:id/comments` | `{body, if_rev?}` — author is the derived caller (`operator`, or a pane's alias), kind `ui`, markdown stored verbatim | `200` |
 | `POST /api/issues/:id/artifacts?name=<base>` | raw bytes, create-only | `200` |
 | `POST /api/memories/:project/:slug/accept` | `{body?}` — guarded route shape, then refused because HTTP cannot prove a native agent endpoint; body edits are never accepted | `400` with an actionable refusal |
 | `POST /api/memories/:project/:slug/reject` | `{}` — refused for the same missing native endpoint proof | `400` with an actionable refusal |
@@ -682,6 +684,40 @@ the current rev. Unknown JSON fields are rejected
 (`deny_unknown_fields`); JSON bodies cap at 256 KiB, artifact uploads at
 `artifact_max_bytes` (1 MiB) enforced while reading — the body is never
 fully buffered first.
+
+### Write identity
+
+The cross-site guards below stop browsers, not local processes: any
+process with a shell can send `X-Cadence-Board: 1` and a board Origin.
+So every write — issue routes, monitor acks and model defaults —
+derives its caller the way the daemon does for slot and answer verbs
+(CAD-254), never from anything the request says:
+
+1. The TCP peer's process: the connection's client-side socket in
+   `/proc/net/tcp{,6}` gives an inode; the process holding
+   `socket:[inode]` in `/proc/<pid>/fd` is the peer.
+2. Its `/proc` ancestry, matched against the daemon's live registered
+   panes (`agent_list`: `pty` endpoints with a pid and generation) —
+   the nearest pane wins.
+
+| Peer | Writes as |
+|---|---|
+| descends from a registered pane | that agent's alias — commit subject, `Actor:` trailer, comment author, ack `by`, settings attribution; never `operator` |
+| resolves, but descends from no pane (the operator's browser, an ssh tunnel, the loopback gateway) | `operator (ui)` |
+| tailnet-shaped request (see Remote access) not on a pane's lineage | `<login> (tailscale)` as before |
+| cannot be attributed — socket owned by another user's process, ancestry unreadable, several panes, or a store exists but the daemon cannot list panes | refused: `403`, `check: "caller_identity"`, naming why |
+
+No `cadence.sqlite3` in the state dir means no agent was ever
+registered, so there is provably no pane and writes are the operator's.
+A different host (non-loopback peer with no local client socket) is
+never a pane here. Reads are unchanged.
+
+The limit: identity follows the process that holds the TCP connection.
+A same-user relay a pane can reach — a detached (`setsid`) child, the
+nginx gateway, an ssh tunnel — writes as the relay's lineage, as it
+would to the daemon's socket. Same-user is not a hostile isolation
+boundary; this closes the direct path (a pane's `curl` approving its
+own work as `operator`), not every indirect one.
 
 ### Security posture
 
@@ -728,7 +764,8 @@ Then the I1 containment still holds:
 
 The honest limit: anyone who can open `http://127.0.0.1:3010` from this
 machine — a local process, or a browser tab on an allowed origin — can
-write the tracker. That is the threat model: a private repo on a
+write the tracker; a process on a pane's lineage writes as that agent
+(see [Write identity](#write-identity)). That is the threat model: a private repo on a
 single-operator host, loopback plus the guards above. Auth is deferred
 to I3+.
 
