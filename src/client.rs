@@ -44,20 +44,107 @@ pub fn briefing_path(state_dir: &Path, params: &Value, alias: &str) -> PathBuf {
 
 /// `cadence daemon start`: spawn `<this binary> --state-dir <dir>
 /// daemon run` detached (own session, output to `daemon.log`) and wait
-/// for the socket to answer. Reports `already_running` when the socket
-/// belonged to a pre-existing daemon — our child exited instead.
+/// for the socket to answer. Reports `already_running` when another
+/// process holds the singleton lock, `started` only when the process
+/// this call spawned became the daemon.
 pub fn daemon_start(state_dir: &Path) -> Result<Value> {
     daemon_start_as(state_dir, None)
 }
 
+/// Read bound for one `health` probe while starting — a wedged
+/// daemon must not hang `daemon start` for the full rpc timeout.
+const START_HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// `daemon_start`, forwarding a rollout identity to the child so
 /// `daemon run` can prove the caller holds the lease when the binary
 /// commit differs from the one last recorded.
+///
+/// The verdict comes from the singleton lock, never from "the socket
+/// answered": only the process holding `cadence.lock` binds the socket,
+/// and `health` reports that process's pid. So:
+/// - a daemon already answers before we spawn → `already_running`,
+///   nothing spawned;
+/// - we spawned, and `health` reports our child's pid → `started`;
+/// - we spawned, and `health` reports another pid → our child lost the
+///   lock (a concurrent start won the race between our check and our
+///   spawn). We wait for the child to exit on the lock, then report
+///   `already_running`. If the other daemon exits first and our child
+///   takes the lock after all, its pid answers and we report `started`.
+///
+/// The pre-spawn check is a `health` call, not a lock probe: a
+/// try-lock-and-release would itself hold the lock for an instant and
+/// can make a concurrent start's child fail its non-blocking lock with
+/// no daemon left running.
 pub fn daemon_start_as(state_dir: &Path, as_identity: Option<&str>) -> Result<Value> {
-    use std::os::unix::process::CommandExt;
-    use std::process::Stdio;
     use std::time::Instant;
     let forward = crate::rollout::authorize_daemon_spawn(state_dir, as_identity)?;
+    if let Ok(health) = rpc_timeout(
+        state_dir,
+        "health",
+        serde_json::json!({}),
+        START_HEALTH_TIMEOUT,
+    ) {
+        return Ok(already_running(state_dir, health));
+    }
+    let mut child = spawn_daemon_run(state_dir, forward.as_deref().or(as_identity))?;
+    let child_pid = u64::from(child.id());
+    let mut last_error = None;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        // This round's `health` answer, when it came from a daemon that
+        // is not our child.
+        let foreign = match rpc_timeout(
+            state_dir,
+            "health",
+            serde_json::json!({}),
+            START_HEALTH_TIMEOUT,
+        ) {
+            Ok(health) if health["pid"].as_u64() == Some(child_pid) => {
+                return Ok(serde_json::json!({
+                    "state": "started",
+                    "pid": child.id(),
+                    "socket": socket_path(state_dir),
+                    "health": health,
+                }));
+            }
+            Ok(health) => Some(health),
+            Err(e) => {
+                last_error = Some(e);
+                None
+            }
+        };
+        // Our child exiting means it never became the daemon; the
+        // lock holder that answered is the one running. Until one
+        // answers, the holder may still be binding the socket.
+        let child_exited = child.try_wait()?.is_some();
+        let timed_out = Instant::now() >= deadline;
+        if child_exited || timed_out {
+            if let Some(health) = foreign {
+                return Ok(already_running(state_dir, health));
+            }
+        }
+        if timed_out {
+            return Err(
+                last_error.unwrap_or_else(|| Error::internal("daemon did not answer within 10s"))
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn already_running(state_dir: &Path, health: Value) -> Value {
+    serde_json::json!({
+        "state": "already_running",
+        "socket": socket_path(state_dir),
+        "health": health,
+    })
+}
+
+/// Spawn `daemon run` detached: its own session, output to
+/// `daemon.log`, and the rollout identity only as an argument.
+fn spawn_daemon_run(state_dir: &Path, identity: Option<&str>) -> Result<std::process::Child> {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
     let exe = std::env::current_exe()?;
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -69,7 +156,7 @@ pub fn daemon_start_as(state_dir: &Path, as_identity: Option<&str>) -> Result<Va
         .args(["--state-dir"])
         .arg(state_dir)
         .args(["daemon", "run"]);
-    if let Some(identity) = forward.as_deref().or(as_identity) {
+    if let Some(identity) = identity {
         command.arg("--rollout-as").arg(identity);
     }
     command
@@ -84,32 +171,7 @@ pub fn daemon_start_as(state_dir: &Path, as_identity: Option<&str>) -> Result<Va
             Ok(())
         });
     }
-    let mut child = command.spawn()?;
-    // Wait until the socket answers or the child exits.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        match rpc(state_dir, "health", serde_json::json!({})) {
-            Ok(health) => {
-                // If our child already exited, the socket belongs to a
-                // pre-existing daemon — report that honestly.
-                if child.try_wait().ok().flatten().is_some() {
-                    return Ok(serde_json::json!({
-                        "state": "already_running",
-                        "socket": socket_path(state_dir),
-                        "health": health,
-                    }));
-                }
-                return Ok(serde_json::json!({
-                    "state": "started",
-                    "pid": child.id(),
-                    "socket": socket_path(state_dir),
-                    "health": health,
-                }));
-            }
-            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
-            Err(e) => return Err(e),
-        }
-    }
+    Ok(command.spawn()?)
 }
 
 /// Send one request, return the result value or the wire error.

@@ -30765,6 +30765,122 @@ fn daemon_start_drops_the_forwarded_rollout_identity() {
     );
 }
 
+/// Live `daemon run` processes serving `state` — read from /proc, so a
+/// child that lost the singleton lock and exited is not counted.
+fn daemon_run_pids(state: &Path) -> Vec<u64> {
+    let state = state.to_str().unwrap();
+    let mut pids = Vec::new();
+    for entry in std::fs::read_dir("/proc").unwrap().flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u64>() else {
+            continue;
+        };
+        let Ok(bytes) = std::fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        let args: Vec<String> = bytes
+            .split(|b| *b == 0)
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect();
+        let serves = args
+            .windows(4)
+            .any(|w| w[0] == "--state-dir" && w[1] == state && w[2] == "daemon" && w[3] == "run");
+        if serves {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
+/// CAD-302: `started` means the process this call spawned holds the
+/// singleton lock (health reports its pid); a second start against the
+/// live daemon reports `already_running` and leaves no second daemon.
+#[test]
+fn daemon_start_reports_started_for_its_child_and_already_running_after() {
+    let home = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let start = cadence_at(home.path(), state.path(), &["daemon", "start"]);
+    assert!(
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let v: Value = serde_json::from_slice(&start.stdout).unwrap();
+    assert_eq!(v["state"], "started", "{v}");
+    let pid = v["pid"].as_u64().unwrap();
+    assert_eq!(v["health"]["pid"].as_u64(), Some(pid), "{v}");
+    assert_eq!(daemon_run_pids(state.path()), vec![pid]);
+
+    let again = cadence_at(home.path(), state.path(), &["daemon", "start"]);
+    assert!(
+        again.status.success(),
+        "{}",
+        String::from_utf8_lossy(&again.stderr)
+    );
+    let v: Value = serde_json::from_slice(&again.stdout).unwrap();
+    assert_eq!(v["state"], "already_running", "{v}");
+    assert!(v["pid"].is_null(), "{v}");
+    assert_eq!(v["health"]["pid"].as_u64(), Some(pid), "{v}");
+    assert_eq!(daemon_run_pids(state.path()), vec![pid]);
+
+    let stop = cadence_at(home.path(), state.path(), &["daemon", "stop"]);
+    assert!(
+        stop.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+}
+
+/// CAD-302: two starts racing on an empty state dir both spawn a child;
+/// exactly one child takes the lock. Its starter reports `started`, the
+/// other waits for its own child to lose the lock and reports
+/// `already_running` — never two `started`.
+#[test]
+fn concurrent_daemon_starts_report_one_started_one_already_running() {
+    let home = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let starts: Vec<_> = (0..2)
+        .map(|_| {
+            let barrier = barrier.clone();
+            let home = home.path().to_path_buf();
+            let state = state.path().to_path_buf();
+            thread::spawn(move || {
+                barrier.wait();
+                cadence_at(&home, &state, &["daemon", "start"])
+            })
+        })
+        .collect();
+    let mut results: Vec<Value> = starts
+        .into_iter()
+        .map(|t| {
+            let out = t.join().unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            serde_json::from_slice(&out.stdout).unwrap()
+        })
+        .collect();
+    results.sort_by_key(|v| v["state"].as_str().unwrap_or_default().to_string());
+    let states: Vec<&str> = results
+        .iter()
+        .map(|v| v["state"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(states, ["already_running", "started"], "{results:?}");
+    let pid = results[1]["pid"].as_u64().unwrap();
+    for v in &results {
+        assert_eq!(v["health"]["pid"].as_u64(), Some(pid), "{v}");
+    }
+    assert_eq!(daemon_run_pids(state.path()), vec![pid]);
+    let stop = cadence_at(home.path(), state.path(), &["daemon", "stop"]);
+    assert!(
+        stop.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+}
+
 #[test]
 fn restart_and_rollout_help_say_same_build_restart_is_lease_free() {
     let home = TempDir::new().unwrap();
