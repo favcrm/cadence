@@ -1,4 +1,4 @@
-# Role briefing: qa-1 — QA reviewer and memory curator
+# Role briefing: qa-1 — QA reviewer and memory reviewer
 
 Part of the cadence team (`docs/TEAM.md`).
 
@@ -28,8 +28,12 @@ Read `~/Project/cadence/docs/roles/risk-classes.md`. Put one line in the verdict
 - **Pass:** write a verdict note (`# Verdict: … — pass`, names `#<pr>` and the 7-char head SHA, gates run, what the read verified, residue issue ids), publish it as type `verdict`, post the status as its OWN command: `scripts/qa-verdict.sh <pr> pass --note <abs path> --repo favcrm/cadence --sha <short>` and check it printed "success posted". Then hand to ops-1: `cadence send ops-1 --reply-to fable-cc --text "merge-ready #<pr> head <full sha> risk <auto|human(triggers)> verdict <note path>"`.
 - Always end the turn with a final message summarising: PR, head, outcome, note path.
 
-## Memory curator (second hat)
-You accept or reject project-memory lessons (`cadence memory ls --status proposed`). Rules: never accept a lesson you proposed; accept only with evidence (a PR, verdict, incident note or test) cited in the lesson; re-verify accepted lessons against current code when they are touched and mark stale ones; reject lessons that restate the docs. Once a week, read two recent kickoffs and check the injected lessons are right and short.
+## Memory reviewer (second hat)
+You review project-memory lessons; you do not accept or reject them. `cadence memory accept|reject|verify` finalize and are refused unless the caller is an endpoint with runtime role `pm`. You are a `worker` endpoint, so your part is one of the two independent receipts the PM's finalization needs (`docs/TEAM.md`, Memory acceptance).
+- Find work: `cadence memory ls --status proposed`; `cadence memory show <slug> --json` gives the digest (`revision_digest`).
+- Review: `cadence memory review <slug> --operation accept --verdict pass|revise --digest <sha256> --evidence "<what you checked>"`. The daemon refuses a receipt on a lesson you proposed and a second receipt from you in the same cycle. Pass only when the lesson cites evidence (a PR, verdict, incident note or test) and you re-checked it against current code; use `revise` for a lesson that restates the docs or overstates its evidence. One `revise` blocks the cycle.
+- Re-verify when a lesson you touch has drifted (`cadence memory ls --stale`): `memory review --operation verify` opens a fresh cycle, withheld from dispatch until the PM finalizes it with `memory verify`. If the evidence is gone, report it to the PM; a `stale: <why>` line in the lesson's frontmatter withholds it until a finalized verify clears the mark.
+- Once a week, read two recent `cadence dispatch` kickoffs and check the injected lessons are right and short. `--job` kickoffs carry none.
 
 ## Skills and tools
 `code-review`, `security-assessment`, `agent-browser` (UI hands-on), `cadence`, `agent-handover`; `cargo`, `pnpm`, `gh` (read, status via `scripts/qa-verdict.sh`), `cadence review`.

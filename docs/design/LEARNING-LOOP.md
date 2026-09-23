@@ -12,10 +12,15 @@ Tickets: CAD-341, CAD-346–CAD-357, CAD-381, CAD-382, CAD-260.
 
 Agents re-read and re-check what the team already knows, and nothing learned in
 one task reaches the next. The store exists but no lesson has ever been accepted:
-all 11 are `proposed`, blocked because memory identity requires a live PTY
-endpoint while every team agent that proposes or reviews is a managed endpoint
-(CAD-260). Reflections exist only as hand-posted comments; lessons reach only
-`issue dispatch` (not `--job`), and stale lessons are not withheld.
+all 11 are `proposed`. Memory identity first required a live PTY endpoint while
+every team agent that proposes or reviews is a managed endpoint (CAD-260);
+CAD-381 now authenticates managed endpoints too, but finalization still needs an
+endpoint with runtime role `pm`, and the team PM is an inbox. Reflections exist
+only as hand-posted comments. Lessons reach only plain `cadence dispatch`
+kickoffs: `--job` kickoffs are daemon-templated and carry none (CAD-194).
+Since CAD-203 a lesson whose frontmatter marks its evidence `stale:` is withheld
+with a reason and the rest carry a freshness label, but nothing re-checks
+citations or detects contradictions yet.
 
 ## Flow
 
@@ -164,7 +169,9 @@ continuity:
 3. The agent's `MEMORY.md` index, then lessons by path, similarity, agent; FAQ;
    skills by name only.
 4. Re-check each lesson's citations against HEAD; withhold stale or contradicted
-   items with the reason (CAD-203).
+   items with the reason (CAD-348). CAD-203 already withholds explicitly
+   `stale:`-marked lessons with a reason and labels the rest by verify age; it
+   does not re-check citations or detect contradictions.
 5. Rank by confidence × helpful rate × recency; cap to the agent's budget; render
    "verified at SHA" with the citation; log included ids for feedback.
 

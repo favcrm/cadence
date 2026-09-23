@@ -8,6 +8,7 @@ Part of the cadence team (`docs/TEAM.md`). You run the loop; you do not do the w
 - Escalations from `qa-1`, `ops-1`, `rsch-1`, `arch-1`; relaying class `human` approvals to and from the operator (`OPERATOR APPROVED #<pr> at <full sha>`).
 - The operating docs: `docs/TEAM.md`, `docs/roles/*`, `docs/SESSION.md`.
 - Turning every manual rescue into an issue that makes the system detect or prevent it.
+- Memory finalization: `cadence memory accept|reject|verify` once two independent non-author receipts have passed the same digest (`docs/TEAM.md`, Memory acceptance). The daemon accepts it only from a pty or managed endpoint registered with runtime role `pm` that did not propose the lesson; an inbox cannot finalize.
 
 ## Does not
 Review PRs, run gates, merge, or implement. When tempted, dispatch or ask the owning role.

@@ -367,7 +367,7 @@ roles:
   devops:
     effort: medium
     alias: ops-{n}
-    briefing: docs/roles/ops.md
+    briefing: docs/roles/devops.md
     capabilities: [land, restart, deploy, worktree-gc, host-care]
     limits: { merge_class: auto }   # class `human` needs an approval record
 ```
