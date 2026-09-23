@@ -252,8 +252,9 @@ fn resolved(path: &Path) -> PathBuf {
 /// refusal: production's defaults (`CADENCE_STATE_DIR` and
 /// `CADENCE_PM_DIR` unset), plus whatever the caller exports now — a
 /// shell pointed at a live cadence — unless that shell is this very
-/// sandbox's (`eval "$(cadence sandbox env <name>)"`).
-fn production_dirs(sb: &Sandbox) -> Result<Vec<(&'static str, PathBuf)>> {
+/// sandbox's (`eval "$(cadence sandbox env <name>)"`). `exported: false`
+/// keeps the defaults only.
+fn production_dirs(sb: &Sandbox, exported: bool) -> Result<Vec<(&'static str, PathBuf)>> {
     let mut dirs = vec![
         ("the production state dir", client::default_state_dir()?),
         ("the production tracker", crate::issue::home_default_dir()?),
@@ -266,7 +267,7 @@ fn production_dirs(sb: &Sandbox) -> Result<Vec<(&'static str, PathBuf)>> {
             PathBuf::from(home).join(".local/state/cadence"),
         ));
     }
-    if profile().as_deref() != Some(sb.name.as_str()) {
+    if exported && profile().as_deref() != Some(sb.name.as_str()) {
         if let Some(d) = std::env::var_os("CADENCE_STATE_DIR") {
             dirs.push(("the exported CADENCE_STATE_DIR", PathBuf::from(d)));
         }
@@ -281,8 +282,12 @@ fn production_dirs(sb: &Sandbox) -> Result<Vec<(&'static str, PathBuf)>> {
 /// dir in either direction — equal (the socket lives in the state dir),
 /// nested inside it, or containing it (a `reset` would delete it).
 fn refuse_production(sb: &Sandbox) -> Result<()> {
+    refuse_overlap(sb, true)
+}
+
+fn refuse_overlap(sb: &Sandbox, exported: bool) -> Result<()> {
     let ours = [sb.root.clone(), sb.state_dir(), sb.pm_dir()].map(|p| resolved(&p));
-    for (label, dir) in production_dirs(sb)? {
+    for (label, dir) in production_dirs(sb, exported)? {
         let live = resolved(&dir);
         if ours
             .iter()
@@ -347,7 +352,11 @@ fn read_marker(sb: &Sandbox) -> Result<Option<Value>> {
 /// The sandbox `state_dir` belongs to: `<root>/state` beside a marker
 /// naming `<root>`. `None` for any other dir, production's included. A
 /// marker that is present but unusable refuses rather than let the dir
-/// run ungated.
+/// run ungated — and so does a layout that only looks like a sandbox:
+/// a symlinked `state`, one resolving anywhere but `<root>/state`, or
+/// a root overlapping production's defaults. The marker is a
+/// hand-writable file; it must never exempt a production database from
+/// the rollout gates.
 pub fn owner_of(state_dir: &Path) -> Result<Option<String>> {
     if state_dir.file_name().and_then(|n| n.to_str()) != Some("state") {
         return Ok(None);
@@ -368,8 +377,20 @@ pub fn owner_of(state_dir: &Path) -> Result<Option<String>> {
         root: root.to_path_buf(),
         name,
     };
-    let owned = validate_name(&sb.name).and_then(|()| require_marker(&sb));
-    owned.map(|_| Some(sb.name.clone())).map_err(|e| {
+    let owned = validate_name(&sb.name)
+        .and_then(|()| require_marker(&sb))
+        .and_then(|_| {
+            let linked =
+                std::fs::symlink_metadata(state_dir).is_ok_and(|m| m.file_type().is_symlink());
+            if linked || resolved(state_dir) != resolved(root).join("state") {
+                return Err(Error::rejected(format!(
+                    "{} is not the root's own `state` directory",
+                    state_dir.display()
+                )));
+            }
+            refuse_overlap(&sb, false)
+        });
+    owned.map(|()| Some(sb.name.clone())).map_err(|e| {
         Error::rejected(format!(
             "{} sits in a sandbox root whose marker is unusable ({e}) — \
              refusing to run it ungated",
@@ -892,6 +913,23 @@ mod tests {
         assert!(!persisted.contains("omit it"), "{persisted}");
         let typed = choose_port(&sb, Some(port)).unwrap_err().to_string();
         assert!(typed.contains("omit it"), "{typed}");
+    }
+
+    /// A forged marker beside a `state` symlink onto another dir is
+    /// refused, never adopted — it would exempt that dir's database from
+    /// the rollout gates.
+    #[test]
+    fn owner_of_refuses_a_symlinked_state_beside_a_forged_marker() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let root = dir.path().join("x");
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, root.join("state")).unwrap();
+        std::fs::write(root.join(MARKER), r#"{"name":"x"}"#).unwrap();
+        let err = owner_of(&root.join("state")).unwrap_err();
+        assert!(err.to_string().contains("not the root's own"), "{err}");
+        assert!(!crate::rollout::sandbox_exempt(&root.join("state")));
     }
 
     #[test]

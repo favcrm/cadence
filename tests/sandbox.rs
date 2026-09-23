@@ -582,3 +582,28 @@ fn sandbox_down_and_reset_kill_the_panes_the_daemon_left() {
     assert_eq!(reset["state"], "removed", "{reset}");
     assert!(!fake.join(&socket).exists());
 }
+
+/// The marker is a hand-writable file: `<x>/state` symlinked onto
+/// production's state dir beside a forged `<x>/.cadence-sandbox` must
+/// not run production's database as a lease-exempt sandbox.
+#[test]
+fn a_forged_marker_beside_a_symlink_onto_production_is_refused() {
+    let host = Host::new();
+    let prod = host.xdg().join("cadence");
+    std::fs::create_dir_all(&prod).unwrap();
+    let x = host.tmp.path().join("x");
+    std::fs::create_dir_all(&x).unwrap();
+    std::os::unix::fs::symlink(&prod, x.join("state")).unwrap();
+    std::fs::write(x.join(".cadence-sandbox"), r#"{"name":"x"}"#).unwrap();
+    let st = x.join("state");
+    let out = host.run(
+        &["--state-dir", st.to_str().unwrap(), "daemon", "start"],
+        &[],
+    );
+    refused(&out, "refusing to run it ungated");
+    assert_eq!(
+        std::fs::read_dir(&prod).unwrap().count(),
+        0,
+        "production touched"
+    );
+}
