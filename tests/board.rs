@@ -4815,6 +4815,252 @@ fn issue_finish_pairs_branch_when_dir_name_differs() {
     );
 }
 
+/// Rewrite `id`'s issue.md by hand and commit it — the tracker is plain
+/// markdown any agent can edit, bypassing every CLI write check.
+fn hand_edit(pm: &Path, id: &str, edit: impl Fn(String) -> String) {
+    let file = pm.join(format!("demo/{id}/issue.md"));
+    let before = std::fs::read_to_string(&file).unwrap();
+    let after = edit(before.clone());
+    assert_ne!(before, after, "hand edit changed nothing");
+    std::fs::write(&file, after).unwrap();
+    let committed = git(
+        pm,
+        &[
+            "-c",
+            "user.name=hand",
+            "-c",
+            "user.email=hand@h",
+            "commit",
+            "-qam",
+            &format!("{id}: hand edit"),
+        ],
+    );
+    assert!(committed.0, "{}", committed.1);
+}
+
+/// The recorded spelling of `path` in `id`'s issue.md — as given or
+/// canonicalized, whichever the writer stored.
+fn recorded_path(pm: &Path, id: &str, path: &Path) -> String {
+    let front = std::fs::read_to_string(pm.join(format!("demo/{id}/issue.md"))).unwrap();
+    let canon = path.canonicalize().unwrap_or(path.to_path_buf());
+    [path, canon.as_path()]
+        .iter()
+        .map(|p| p.to_str().unwrap().to_string())
+        .find(|p| front.contains(&format!("path: {p}\n")))
+        .unwrap_or_else(|| panic!("{} not recorded: {front}", path.display()))
+}
+
+/// CAD-144: a ref value beginning with `-` reads as a git option
+/// (`--upload-pack=<cmd>` executes over ssh/file remotes). `issue ref`
+/// and `issue start` refuse to write one, and nothing is committed.
+#[test]
+fn issue_ref_and_start_refuse_option_like_values() {
+    let (_tmp, pm, state, repo) = start_fx();
+    assert!(cli(&pm, &state, &["issue", "new", "Lane", "--project", "demo"]).0);
+    let (ok, out) = cli(&pm, &state, &["issue", "start", "D-1"]);
+    assert!(ok, "{out}");
+    let before = commits(&pm);
+    for value in ["-x", "--upload-pack=touch /tmp/cad144-never"] {
+        for kind in ["branch", "worktree", "note"] {
+            let (ok, err) = cli(&pm, &state, &["issue", "ref", "D-1", kind, "--", value]);
+            assert!(!ok, "{kind} {value} was written: {err}");
+            assert!(
+                err["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("begins with '-'"),
+                "{err}"
+            );
+        }
+    }
+    assert_eq!(commits(&pm), before, "a refused ref commits nothing");
+
+    // `issue start` re-records the lane's branch from the tracker and
+    // the checkout: a hand-recorded `-x` checked out in the lane must
+    // not be written back.
+    let wt = repo.join(".cadence/wt/d-1-lane");
+    assert!(git(&wt, &["update-ref", "refs/heads/-x", "HEAD"]).0);
+    assert!(git(&wt, &["symbolic-ref", "HEAD", "refs/heads/-x"]).0);
+    hand_edit(&pm, "D-1", |f| {
+        f.replace("path: cadence/d-1-lane\n", "path: '-x'\n")
+    });
+    let before = commits(&pm);
+    let (ok, err) = cli(&pm, &state, &["issue", "start", "D-1"]);
+    assert!(!ok, "start re-recorded '-x': {err}");
+    assert!(
+        err["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("begins with '-'"),
+        "{err}"
+    );
+    assert_eq!(commits(&pm), before, "a refused start commits nothing");
+}
+
+/// CAD-144: finish refuses an option-like ref it reads from a
+/// hand-edited tracker before any git command sees it — with a file
+/// remote, `fetch origin --upload-pack=<cmd>` would run the command.
+#[test]
+fn issue_finish_refuses_option_like_refs() {
+    let (tmp, pm, state, repo) = start_fx();
+    let bare = tmp.path().join("remote.git");
+    assert!(git(tmp.path(), &["init", "-q", "--bare", "remote.git"]).0);
+    assert!(git(&repo, &["remote", "add", "origin", bare.to_str().unwrap()]).0);
+    assert!(
+        cli(
+            &pm,
+            &state,
+            &["issue", "new", "Hostile", "--project", "demo"]
+        )
+        .0
+    );
+    let (ok, out) = cli(&pm, &state, &["issue", "start", "D-1"]);
+    assert!(ok, "{out}");
+    let wt = repo.join(".cadence/wt/d-1-hostile");
+    let wt_s = recorded_path(&pm, "D-1", &wt);
+    let marker = tmp.path().join("upload-pack-ran");
+    // The worktree ref closed, the branch ref rewritten: finish reads
+    // the lone open branch ref as its target.
+    let hostile = format!("--upload-pack=touch {}", marker.display());
+    hand_edit(&pm, "D-1", |f| {
+        f.replace(
+            "path: cadence/d-1-hostile\n",
+            &format!("path: '{hostile}'\n"),
+        )
+        .replace(
+            &format!("path: {wt_s}\n"),
+            &format!("path: {wt_s}\n  closed: true\n"),
+        )
+    });
+    let before = commits(&pm);
+    let (ok, err) = cli(
+        &pm,
+        &state,
+        &["issue", "finish", "D-1", "--remote", "--force"],
+    );
+    assert!(!ok, "finish ran with '{hostile}': {err}");
+    assert!(
+        err["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("begins with '-'"),
+        "{err}"
+    );
+    assert!(!marker.exists(), "--upload-pack reached git");
+    assert_eq!(commits(&pm), before, "a refused finish commits nothing");
+    // The same refusal for a plain `-x`, and for a worktree ref.
+    hand_edit(&pm, "D-1", |f| f.replace(&format!("'{hostile}'"), "'-x'"));
+    let (ok, err) = cli(&pm, &state, &["issue", "finish", "D-1", "--force"]);
+    assert!(
+        !ok && err["error"].as_str().unwrap_or_default().contains("'-x'"),
+        "{err}"
+    );
+    hand_edit(&pm, "D-1", |f| {
+        f.replace(&format!("path: {wt_s}\n  closed: true\n"), "path: '-wt'\n")
+    });
+    let (ok, err) = cli(&pm, &state, &["issue", "finish", "D-1", "--force"]);
+    assert!(
+        !ok && err["error"].as_str().unwrap_or_default().contains("'-wt'"),
+        "{err}"
+    );
+    assert!(wt.is_dir(), "nothing was removed");
+}
+
+/// CAD-145: a branch kept with `--keep-branch` keeps its branch ref
+/// open — the surviving work stays on the board and finishable — while
+/// the worktree ref closes. A later finish deletes the merged branch
+/// and closes the ref.
+#[test]
+fn issue_finish_keep_branch_leaves_its_ref_open() {
+    let (_tmp, pm, state, repo) = start_fx();
+    assert!(cli(&pm, &state, &["issue", "new", "Keep", "--project", "demo"]).0);
+    let (ok, out) = cli(&pm, &state, &["issue", "start", "D-1"]);
+    assert!(ok, "{out}");
+    let wt = repo.join(".cadence/wt/d-1-keep");
+    land(&repo, &wt, "keep.txt");
+    let (ok, out) = cli(&pm, &state, &["issue", "finish", "D-1", "--keep-branch"]);
+    assert!(ok, "{out}");
+    assert_eq!(out["removed_worktree"], true, "{out}");
+    assert_eq!(out["deleted_branch"], false, "{out}");
+    assert!(
+        git(
+            &repo,
+            &["rev-parse", "--verify", "--quiet", "cadence/d-1-keep"]
+        )
+        .0
+    );
+    let refs = refs_of(&pm, &state, "D-1");
+    let closed = |kind: &str| {
+        refs.iter()
+            .find(|r| r["kind"] == kind)
+            .map(|r| r["closed"] == true)
+            .unwrap_or_else(|| panic!("no {kind} ref: {refs:?}"))
+    };
+    assert!(closed("worktree"), "the worktree ref closes: {refs:?}");
+    assert!(
+        !closed("branch"),
+        "the kept branch's ref stays open: {refs:?}"
+    );
+
+    let (ok, out) = cli(&pm, &state, &["issue", "finish", "D-1"]);
+    assert!(ok, "{out}");
+    assert_eq!(out["finished"], true, "{out}");
+    assert_eq!(out["deleted_branch"], true, "{out}");
+    let refs = refs_of(&pm, &state, "D-1");
+    assert!(
+        refs.iter()
+            .filter(|r| r["kind"] == "branch" || r["kind"] == "worktree")
+            .all(|r| r["closed"] == true),
+        "{refs:?}"
+    );
+}
+
+/// CAD-265: the safety half of CAD-166's pairing — a worktree whose dir
+/// differs from its branch, with a checked-out branch that is NOT a
+/// recorded ref, finishes without deleting that branch, locally or on
+/// the remote. It is foreign work (an adopted checkout, ADR-0003).
+#[test]
+fn issue_finish_never_deletes_an_unrecorded_checked_out_branch() {
+    let (tmp, pm, state, repo) = start_fx();
+    let bare = tmp.path().join("remote.git");
+    assert!(git(tmp.path(), &["init", "-q", "--bare", "remote.git"]).0);
+    assert!(git(&repo, &["remote", "add", "origin", bare.to_str().unwrap()]).0);
+    assert!(cli(&pm, &state, &["issue", "new", "Moved", "--project", "demo"]).0);
+    let (ok, out) = cli(&pm, &state, &["issue", "start", "D-1"]);
+    assert!(ok, "{out}");
+    let old = repo.join(".cadence/wt/d-1-moved");
+    let new = repo.join(".cadence/wt/elsewhere");
+    let old_s = recorded_path(&pm, "D-1", &old);
+    let moved = git(&repo, &["worktree", "move", &old_s, new.to_str().unwrap()]);
+    assert!(moved.0, "{}", moved.1);
+    hand_edit(&pm, "D-1", |f| f.replace(&old_s, new.to_str().unwrap()));
+    // Foreign work: an unrecorded branch with a commit of its own,
+    // merged and pushed — every rule would call it deletable.
+    assert!(git(&new, &["checkout", "-q", "-b", "foreign"]).0);
+    land(&repo, &new, "foreign.txt");
+    assert!(git(&repo, &["push", "-q", "origin", "foreign"]).0);
+    let tip = git(&repo, &["rev-parse", "foreign"]).1;
+
+    let (ok, out) = cli(&pm, &state, &["issue", "finish", "D-1", "--remote"]);
+    assert!(ok, "{out}");
+    assert_eq!(out["branch"], "", "the foreign branch never pairs: {out}");
+    assert_eq!(out["deleted_branch"], false, "{out}");
+    assert_eq!(out["remote_deleted"], false, "{out}");
+    assert_eq!(
+        git(&repo, &["rev-parse", "--verify", "--quiet", "foreign"]).1,
+        tip
+    );
+    assert_eq!(
+        git(
+            &bare,
+            &["rev-parse", "--verify", "--quiet", "refs/heads/foreign"]
+        )
+        .1,
+        tip,
+        "the remote copy survives"
+    );
+}
+
 /// `issue finish` without a reachable daemon refuses rather than
 /// guesses; `--force` overrides and is recorded; a second finish is a
 /// no-op; an issue without refs has nothing to finish.
@@ -4895,7 +5141,7 @@ fn issue_finish_daemon_down_force_and_idempotent() {
     let (ok, err) = cli(&pm, &state, &["issue", "finish", "D-3"]);
     assert!(!ok && err["error"].as_str().unwrap().contains("nothing to finish"));
 
-    // --keep-branch leaves the local branch but still closes the refs.
+    // --keep-branch leaves the local branch; the worktree ref closes.
     assert!(cli(&pm, &state, &["issue", "new", "Keep", "--project", "demo"]).0);
     assert!(cli(&pm, &state, &["issue", "start", "D-4"]).0);
     let (ok, out) = cli(

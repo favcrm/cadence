@@ -1,0 +1,19 @@
+  ⎿      }
+
+         /// Register a pty devin agent with arbitrary endpoint params.
+     … +128 lines (ctrl+o to expand)
+
+● Bash(sed -n 15960,16010p tests/integration.rs; rtk proxy grep -n "fn register_stub" -A15 tests/integration.rs | head
+      -20)
+  ⎿      // The bound, lowered live: acc2 goes `unknown`, never completed.
+         d.rpc(
+             "agent_set",
+     … +63 lines (ctrl+o to expand)
+
+✻ Warping… (1m 35s · ↓ 6.5k tokens · thinking with high effort)
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  [Opus 5.5 (1M context)] 📁 cad-284-remove-keeps-history | [██████████████████████] 112.1% (174,893)
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← 3 agents
