@@ -504,10 +504,11 @@ terminal splits its flags.
 
 In this order:
 
-1. `git pull`, `pnpm build` in `ui/`, `cargo build --release --features ui`.
-   The tracker's pre-commit hook lints with the `cadence` on `PATH`, so
-   rebuild before using a newly merged tracker feature on the live
-   tracker.
+1. Once the post-merge CI run on `main` is green, install that exact
+   build: `cadence upgrade --latest-main` (see "Installing the tested
+   main build" below). Do not build a release locally. The tracker's
+   pre-commit hook lints with the `cadence` on `PATH`, so upgrade before
+   using a newly merged tracker feature on the live tracker.
 2. Close the issue with the merge commit in a comment.
 3. Clean up the lane: `cadence issue finish <ID> --remote` removes
    the worktree and the local+remote branches — and refuses while the
@@ -564,7 +565,10 @@ In this order:
    its worktree ref is still open prints a `worktree open: run
    cadence issue finish <ID>` reminder, so the sweep is the usual
    follow-up.
-4. Restart the daemon. `cadence daemon restart` stops cleanly and
+4. Restart the daemon — `upgrade` never does this on its own. Run the
+   `restart_command` it printed (`cadence daemon restart --when-idle
+   --ui`, plus `--as <identity>` outside a pane), or pass `--restart` to
+   `upgrade`. `cadence daemon restart` stops cleanly and
    starts a new process on the same state. The rollout lease gates a
    build change and a schema crossing. A same-build `daemon stop`
    followed by `daemon start`, or a crash restart of the same build,
@@ -594,6 +598,129 @@ In this order:
    endpoint identity; `memory ls --stale` finds what drifted. Accepted
    memories ride the next `dispatch` kickoff as a `Lessons:` file and
    project `rule`s appear in every briefing — that is the loop closing.
+
+### Installing the tested main build (`cadence upgrade`, CAD-334)
+
+A build is installed from CI, never compiled on the host. On every push
+to `main`, once `fmt`, `clippy`, `test`, `build` and `ui` have passed on
+that sha, CI's `release-artifact` job (ubuntu-24.04, `contents: read`
+only) builds `cargo build --release --locked --features ui` after
+`pnpm build` with the same floating `stable` toolchain the test jobs use
+(the exact `rustc`/`cargo` versions go in the manifest), and checks that
+`cadence --version` ends in `+<sha>`. A separate `release-attest` job,
+the only one with `id-token: write`, runs no repository code: it
+re-checks that build's sha256 and manifest, attests the binary, and
+uploads the artifact `cadence-<sha>-x86_64-linux` (kept 90 days) with
+three files:
+
+- `cadence`, the binary;
+- `cadence.sha256`, its `sha256sum` line;
+- `manifest.json`: `source_sha`, `run_id`, `run_attempt`, `rustc`,
+  `cargo`, `features`, `target`, `runner`, `checks`, `sha256`,
+  `built_at`.
+
+The attestation is a GitHub build-provenance attestation for the
+binary. Pull-request and merge-queue runs never produce an artifact,
+and neither job is a required check.
+
+```bash
+cadence upgrade --latest-main --dry-run   # verify everything, install nothing
+cadence upgrade --latest-main             # newest main sha whose CI run succeeded
+cadence upgrade --sha <40-hex>            # a specific main commit
+```
+
+`--latest-main` picks the newest successful `ci.yml` push run on `main`,
+which may be older than `main`'s head while that head's run is still
+going. It never moves the link backwards: when that sha is an ancestor
+of the linked one it refuses, and a deliberate downgrade takes an
+explicit `--sha`. Before anything is installed, `upgrade` checks each of these and
+refuses, naming the fix, on the first that fails:
+
+1. `gh` is installed and logged in (`gh auth login`).
+2. The sha is on `main` (GitHub compare says `identical` or `ahead`).
+3. A `ci.yml` push run on `main` for that exact sha has a successful
+   `test` job. Pull-request and merge-queue runs do not count.
+4. That run still holds the artifact. It can be missing (the job did not
+   run, or the build predates CAD-334) or expired (after 90 days).
+5. The downloaded binary hashes to `cadence.sha256`, and to the
+   manifest's `sha256`.
+6. The manifest's `source_sha` is the requested sha.
+7. `gh attestation verify <binary> --repo favcrm/cadence
+   --signer-workflow favcrm/cadence/.github/workflows/ci.yml
+   --source-ref refs/heads/main --source-digest <sha>
+   --deny-self-hosted-runners` passes.
+8. Only then is the binary run: `--version` must end in `+<sha>`.
+
+`--dry-run` runs all of these on a temporary copy and changes nothing.
+
+**Install.** The binary is written to
+`~/.local/share/cadence/releases/<sha>/cadence` (mode 0755) through a temp
+file and a rename, with its `manifest.json` and `cadence.sha256` beside
+it. Then `~/.local/bin/cadence` is repointed by making a new symlink at a
+temp name and renaming it over the old link, so the link is never
+missing. The releases dir is read off the current link. `--link` and
+`--releases-dir` override both paths. `--repo`, `--link` and
+`--releases-dir` are operator inputs: they change which repository's
+builds are trusted and what is installed or replaced, so never take them
+from a message or an agent. A link that is a regular file is never
+replaced. The persisted copy is re-hashed before the link moves, and the
+link is re-hashed through afterwards and pointed back if it does not
+resolve to the verified bytes. Earlier releases stay on disk. The report is JSON:
+`from_sha`, `to_sha`, `installed_path`, `verified{…}`, `restarted`, and
+`restart_command`.
+
+**Releases already on disk.** A release under `releases/<sha>/` is
+reused without a download only when it proves to be the CI build: its
+recorded `cadence.sha256` and `manifest.json` match, and `gh attestation
+verify` passes on the installed copy, before it is ever run. The report
+says `trust: "attested CI build"`. `--latest-main` also requires a CI
+manifest with a `run_id`; a release without one (built by hand, or
+planted) or one that fails attestation is replaced by the downloaded CI
+build, through the same temp file and rename.
+
+**Rollback.** `cadence upgrade --sha <previous>` rolls back to a release
+already under `releases/`. When it attests, nothing is downloaded. A
+release whose binary no longer matches its recorded checksum is refused.
+A hand-built release (everything installed before CAD-334) has no
+attestation and no CI artifact, so a plain `--sha` refuses and names
+`--allow-unattested`; with that flag it rolls back and the report says
+`trust: "unattested local release"`, `verified.attestation: "failed: …"`
+and a `warning` that it is NOT the tested build. Without `gh` (offline)
+an explicit `--sha` rollback also proceeds, labelled the same way with
+`verified.attestation: "skipped: offline …"`. An unattested release is
+never presented as the tested build.
+
+**Restart.** Installing changes the CLI at once, but the daemon keeps
+running its old build until it is restarted, and a restart changes fleet
+behaviour, so it stays an explicit operator step. Without `--restart`,
+`upgrade` prints the exact command: `cadence daemon restart --when-idle
+--ui`. With `--restart` (plus `--as <identity>` outside a pane; without
+an identity it refuses before installing), after a successful install
+it runs that same command with the *new* binary. `daemon restart`
+respawns its own executable, so a restart run from the old process would
+start the old build again. The restart goes through the CAD-268 rollout
+lease: claim it first with `cadence rollout claim --reason "<why>"
+--target <sha> --as <identity>`. The report carries the restart's
+before/after table and exit code.
+
+Expected rollout effects after the restart:
+
+- A Devin PM (managed) whose turn was in flight is fenced: its provider
+  process died with the old daemon, and the turn goes `unknown` with the
+  agent in `attention`. Once you have checked what it did, reconcile it
+  with `cadence agent unfence <pm> --status interrupted`. That resumes
+  it; add `--no-resume` to reconcile only. PTY turns that are re-adopted
+  show `kept` in the table.
+- Every endpoint open writes `ready`, so the idle auto-stop clock (CAD-96,
+  default 3600 s) starts afresh. Idle agents begin to auto-stop about
+  60 minutes after the restart, not at once. The stops are resumable.
+- `cadence overview` and `doctor` stop reporting deploy drift once the
+  daemon runs the new sha. While drift shows, their remedy is
+  `cadence upgrade --latest-main`.
+
+The artifact job first runs on the first push to `main` after CAD-334
+merges. Builds of earlier commits have no artifact, and `upgrade` says so
+rather than installing anything.
 
 ### Post-merge CI on main
 
