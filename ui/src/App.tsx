@@ -57,18 +57,9 @@ export default function App() {
   const [agentsError, setAgentsError] = useState<string | null>(null);
   const agentsLoaded = useRef(false);
   const [overview, setOverview] = useState<Overview | null>(null);
-  // A failed read keeps the last good payload; only a failure with
-  // nothing loaded yet reads as "unavailable" (CAD-249).
-  const [overviewFailed, setOverviewFailed] = useState(false);
-  const loadOverview = useCallback(() => {
-    api
-      .overview()
-      .then((next) => {
-        setOverview(next);
-        setOverviewFailed(false);
-      })
-      .catch(() => setOverviewFailed(true));
-  }, []);
+  const [overviewLoading, setOverviewLoading] = useState(false);
+  // Set when a refresh fails over cached rows — cleared on the next success.
+  const [overviewStale, setOverviewStale] = useState(false);
   const [health, setHealth] = useState<Health | null>(null);
   const [meta, setMeta] = useState<Meta | null>(null);
   const [openId, setOpenId] = useState<string | null>(initial.openId);
@@ -123,7 +114,8 @@ export default function App() {
     setProjectContext(null);
     setProjectContextError(null);
     setProjectContextErrorProject(null);
-    if (tab !== "plan" || project === "all") {
+    // Overview shows the same context compactly; Plan is the full view.
+    if ((tab !== "plan" && tab !== "overview") || project === "all") {
       setProjectContextLoading(false);
       return;
     }
@@ -149,6 +141,21 @@ export default function App() {
         }
       });
   }, [project, tab, projectContextRefresh]);
+
+  // The overview payload costs a daemon probe + gh cache read (~seconds).
+  // Track loading so the tab can say "building" instead of flashing
+  // "unavailable"; on failure keep the last good payload on screen.
+  const loadOverview = useCallback(() => {
+    setOverviewLoading(true);
+    return api
+      .overview()
+      .then((next) => {
+        setOverview(next);
+        setOverviewStale(false);
+      })
+      .catch(() => setOverviewStale(true))
+      .finally(() => setOverviewLoading(false));
+  }, []);
 
   const refresh = useCallback(() => {
     api.health().then(setHealth).catch(() => setHealth(null));
@@ -177,18 +184,22 @@ export default function App() {
       })
       .catch((e) => setAgentsError(String(e.message ?? e)))
       .finally(() => setAgentsLoading(false));
-    if (tabRef.current === "overview") loadOverview();
+    if (tabRef.current === "overview") {
+      loadOverview();
+    }
     if (openId) {
       api
         .issue(openId)
         .then(setOpenDetail)
         .catch(() => {});
     }
-  }, [openId]);
+  }, [openId, loadOverview]);
 
   // And whenever it becomes the visible tab.
   useEffect(() => {
-    if (tab === "overview") loadOverview();
+    if (tab === "overview") {
+      loadOverview();
+    }
   }, [tab, loadOverview]);
 
   useEffect(refresh, [refresh]);
@@ -239,7 +250,7 @@ export default function App() {
         .monitorAck(monitor, seq)
         .then(() => {
           say("ok", `${monitor} alert ${seq} acknowledged`);
-          return api.overview().then(setOverview);
+          return loadOverview();
         })
         .catch((e) =>
           say(
@@ -248,7 +259,7 @@ export default function App() {
           ),
         );
     },
-    [readOnly, say],
+    [readOnly, say, loadOverview],
   );
 
   /// A write response is authoritative: merge the fresh card into the
@@ -477,10 +488,15 @@ export default function App() {
         {tab === "overview" && (
           <OverviewView
             data={overview}
-            failed={overviewFailed}
+            loading={overviewLoading}
+            stale={overviewStale}
             project={project}
+            projects={projects}
+            context={visibleContext(project, projectContext)}
+            contextLoading={projectContextLoading}
             readOnly={readOnly}
             onAck={ackMonitor}
+            onOpenPlan={() => setTab("plan")}
           />
         )}
         {tab === "board" && (

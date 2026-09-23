@@ -1,4 +1,10 @@
-import type { MonitorAlert, Monitoring, Overview } from "../types";
+import type {
+  MonitorAlert,
+  Monitoring,
+  Overview,
+  Project,
+  ProjectContext,
+} from "../types";
 import { needGroupKey, needLabel } from "../uxCopy";
 
 const KIND_CHIP: Record<string, string> = {
@@ -307,25 +313,143 @@ function MonitorAlertView({
   );
 }
 
+const DOC_STATE_CHIP: Record<string, string> = {
+  ready: "bg-ok/15 text-ok",
+  current: "bg-ok/15 text-ok",
+  stale: "bg-warn/10 text-warn",
+  dirty: "bg-warn/10 text-warn",
+  uncompared: "bg-warn/10 text-warn",
+};
+
+/// Compact reading of the project's declared scope plus its tracked
+/// document manifest — the same `/api/projects/:key/context` payload the
+/// Plan tab renders in full. Only for a selected project.
+function ProjectScope({
+  project,
+  projects,
+  context,
+  contextLoading,
+  onOpenPlan,
+}: {
+  project: string;
+  projects: Project[];
+  context: ProjectContext | null;
+  contextLoading: boolean;
+  onOpenPlan: () => void;
+}) {
+  const meta = projects.find((p) => p.key === project);
+  const docs = context?.documents.filter((d) => d.selected) ?? [];
+  const shown = docs.slice(0, 6);
+  return (
+    <section>
+      <div className="slabel mb-2">project context</div>
+      <div className="card px-4 py-3.5 space-y-3">
+        {meta && (
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 text-micro">
+            {meta.repos.map((repo, i) => (
+              <span key={i} className="num text-ink-300">
+                {repo.remote ?? repo.path}
+              </span>
+            ))}
+            {meta.components.map((component) => (
+              <span
+                key={component}
+                className="chip bg-ink-800 text-ink-400 !py-[.15rem]"
+              >
+                {component}
+              </span>
+            ))}
+            {meta.default_owner && (
+              <span className="text-ink-500">
+                default owner {meta.default_owner}
+              </span>
+            )}
+          </div>
+        )}
+        {contextLoading && !context && (
+          <p className="text-label text-ink-500">
+            reading the project's tracked manifest…
+          </p>
+        )}
+        {docs.length > 0 && (
+          <div className="divide-y divide-ink-700/60">
+            {shown.map((doc) => (
+              <div
+                key={doc.id}
+                className="py-1.5 flex flex-wrap items-baseline gap-x-2 gap-y-0.5"
+              >
+                <span className="text-label text-ink-200">{doc.title}</span>
+                <span className="num text-micro text-ink-500">{doc.path}</span>
+                {doc.required && <span className="kicker">required</span>}
+                {!DOC_STATE_CHIP[doc.state] && (
+                  <span className="chip bg-fail/10 text-fail !py-[.15rem]">
+                    {doc.state}
+                  </span>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+        {context && docs.length > shown.length && (
+          <p className="text-micro text-ink-500">
+            {docs.length - shown.length} more documents on Plan
+          </p>
+        )}
+        <button
+          onClick={onOpenPlan}
+          className="lnk text-label"
+          title="full context — manifest, excerpts and verified memory"
+        >
+          open plan →
+        </button>
+      </div>
+    </section>
+  );
+}
+
 export default function OverviewView({
   data,
-  failed = false,
+  loading,
+  stale,
   project,
+  projects,
+  context,
+  contextLoading,
   readOnly,
   onAck,
+  onOpenPlan,
 }: {
   data: Overview | null;
-  failed?: boolean;
+  loading: boolean;
+  stale: boolean;
   project: string;
+  projects: Project[];
+  context: ProjectContext | null;
+  contextLoading: boolean;
   readOnly: boolean;
   onAck: (monitor: string, seq: number) => void;
+  onOpenPlan: () => void;
 }) {
   if (!data) {
     return (
-      <div className="px-4 lg:px-8 pt-4 text-label text-ink-500">
-        {failed
-          ? "overview unavailable — the board server could not build the view"
-          : "loading overview…"}
+      <div className="px-4 lg:px-8 pt-4 pb-10 space-y-5 max-w-[68rem]">
+        <div className="text-label text-ink-500">
+          {/* "unavailable" only once a request actually failed with
+              nothing ever loaded; before the first answer — or while a
+              retry is in flight — this is a load, not a failure. */}
+          {stale && !loading
+            ? "overview unavailable — the board server could not build the view"
+            : "building the overview — daemon and GitHub probes can take several seconds"}
+        </div>
+        {project !== "all" && (
+          <ProjectScope
+            project={project}
+            projects={projects}
+            context={context}
+            contextLoading={contextLoading}
+            onOpenPlan={onOpenPlan}
+          />
+        )}
       </div>
     );
   }
@@ -347,6 +471,11 @@ export default function OverviewView({
         <span className="kicker">
           exact project ownership · unresolved work stays visible
         </span>
+        {stale && (
+          <span className="chip bg-warn/10 text-warn" title="the last refresh failed — showing the previous payload">
+            refresh failed — stale
+          </span>
+        )}
       </header>
       {(data.github.state === "unavailable" ||
         !data.daemon.reachable ||
@@ -365,6 +494,16 @@ export default function OverviewView({
             </div>
           ))}
         </div>
+      )}
+
+      {project !== "all" && (
+        <ProjectScope
+          project={project}
+          projects={projects}
+          context={context}
+          contextLoading={contextLoading}
+          onOpenPlan={onOpenPlan}
+        />
       )}
 
       {data.monitoring && (

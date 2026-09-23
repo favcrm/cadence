@@ -70,7 +70,7 @@ export function readAppUrlState(search: string, storedView?: ProjectView): AppUr
   const explicitTab = parseTab(q.get("tab"));
   return {
     tab: explicitTab ?? (explicitView ? "board" : "overview"),
-    view: explicitView ?? storedView ?? "kanban",
+    view: explicitView ?? storedView ?? "list",
     project: q.get("project") ?? "all",
     openId: q.get("issue"),
     filters: readFilters(q),
