@@ -103,6 +103,27 @@ pub const PTY_TURN_TOKENS: TurnTokenScheme = TurnTokenScheme { prefix: "pty" };
 /// provider-process `open`.
 pub const CLAUDE_MANAGED_TURN_TOKENS: TurnTokenScheme = TurnTokenScheme { prefix: "claude" };
 
+/// Every scheme an adapter mints turn tokens under.
+pub const TURN_TOKEN_SCHEMES: [TurnTokenScheme; 2] = [PTY_TURN_TOKENS, CLAUDE_MANAGED_TURN_TOKENS];
+
+/// CAD-407: a regex for the generation a turn token is minted under — 32
+/// lowercase hex (pty: a simple uuid per pane `open`) or 12 (managed
+/// claude: a truncated one).
+pub const TURN_TOKEN_GENERATION: &str = "[0-9a-f]{32}|[0-9a-f]{12}";
+
+/// CAD-407: a regex for the shape of every turn token an adapter mints —
+/// `<prefix>-<generation>-<nonce>`, the nonce a simple uuid. Capture
+/// group 1 is the generation. Export redaction matches exactly this
+/// shape, so a value that merely sits under a `turn_id` key is not taken
+/// for a token.
+pub fn turn_token_pattern() -> String {
+    let prefixes: Vec<&str> = TURN_TOKEN_SCHEMES.iter().map(|s| s.prefix).collect();
+    format!(
+        "(?:{})-({TURN_TOKEN_GENERATION})-[0-9a-f]{{32}}",
+        prefixes.join("|")
+    )
+}
+
 impl TurnTokenScheme {
     /// A fresh token for one turn under `generation`.
     pub fn mint(&self, generation: &str) -> String {
@@ -1941,6 +1962,32 @@ mod tests {
             unknown.contains("unknown devin cloud launch param"),
             "{unknown}"
         );
+    }
+
+    /// CAD-407: the pattern matches what every scheme mints under both
+    /// generation shapes, and nothing that is merely not a token.
+    #[test]
+    fn turn_token_pattern_matches_every_minted_shape() {
+        let re = regex::Regex::new(&format!("^{}$", turn_token_pattern())).unwrap();
+        let hex32 = "0123456789abcdef0123456789abcdef";
+        let hex12 = "0123456789ab";
+        for scheme in TURN_TOKEN_SCHEMES {
+            for generation in [hex32, hex12] {
+                let token = scheme.mint(generation);
+                let caps = re.captures(&token).expect(&token);
+                assert_eq!(&caps[1], generation, "{token}");
+            }
+        }
+        for not_a_token in [
+            "workspace",
+            "turn-abc123",
+            "pty-workspace-0123456789abcdef0123456789abcdef",
+            "codex-0123456789ab-0123456789abcdef0123456789abcdef",
+            "pty-0123456789a-0123456789abcdef0123456789abcdef",
+            "pty-0123456789ab-0123456789abcdef",
+        ] {
+            assert!(!re.is_match(not_a_token), "{not_a_token}");
+        }
     }
 
     /// CAD-162: every endpoint kind that exists today, judged by its own

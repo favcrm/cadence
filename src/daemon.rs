@@ -7929,6 +7929,11 @@ pub fn serve_with(state_dir: &Path, opts: ServeOptions) -> Result<()> {
     // start` already refuses before spawn; this is the hand-run path.
     crate::rollout::authorize_direct_run(state_dir)?;
     let _singleton = acquire_singleton(state_dir)?;
+    // CAD-407: before the marker is consumed and before the store opens
+    // (which would create an empty one): an interrupted restore's aside
+    // files may be the only copy of the previous store. Every start path
+    // — `daemon start`, `run`, `restart` — comes through here.
+    crate::backup::refuse_interrupted_restore(state_dir)?;
     // Consume the shutdown marker and record this run's instance BEFORE
     // the store opens — recover() protects the candidate entries as it
     // sweeps, and a crash between here and open simply leaves nothing
@@ -8168,6 +8173,50 @@ mod pty_retry_tests {
 mod tests {
     use super::*;
     use crate::store::NewAgent;
+
+    /// CAD-407: `serve` — so `daemon start`, `run` and `restart` — refuses
+    /// while an interrupted restore's aside files exist, before the
+    /// shutdown marker is consumed or a store is created or opened. The
+    /// error names the leftover and the `mv` that puts it back.
+    #[test]
+    fn serve_refuses_after_an_interrupted_restore_without_touching_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path();
+        let aside = state.join("cadence.sqlite3.replaced-20260923T000000Z-deadbeef");
+        std::fs::write(&aside, b"previous store").unwrap();
+        let marker = state.join(SHUTDOWN_FILE);
+        std::fs::write(&marker, b"{}").unwrap();
+
+        // On a thread: a serve that wrongly starts must fail the test,
+        // not hang it.
+        let owned = state.to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(serve_with(&owned, ServeOptions::default()));
+        });
+        let err = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("serve started over an interrupted restore")
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("interrupted restore"), "{err}");
+        assert!(err.contains(&aside.display().to_string()), "{err}");
+        let put_back = format!(
+            "mv '{}' '{}'",
+            aside.display(),
+            state.join("cadence.sqlite3").display()
+        );
+        assert!(err.contains(&put_back), "{err}");
+        assert!(!state.join("cadence.sqlite3").exists());
+        assert!(!state.join("cadence.sock").exists());
+        assert_eq!(std::fs::read(&marker).unwrap(), b"{}");
+        assert_eq!(std::fs::read(&aside).unwrap(), b"previous store");
+
+        // Once it is moved away the check passes.
+        std::fs::remove_file(&aside).unwrap();
+        crate::backup::refuse_interrupted_restore(state).unwrap();
+    }
 
     fn shared() -> (tempfile::TempDir, Arc<Shared>) {
         let dir = tempfile::tempdir().unwrap();
