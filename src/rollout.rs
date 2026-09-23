@@ -950,10 +950,7 @@ fn gate_line(line: &str) -> Option<(&'static str, Value)> {
             let build = nonempty(payload.get("build")?.as_str()?)?;
             let recorded = payload.get("recorded")?.as_str()?;
             let reason = nonempty(payload.get("reason")?.as_str()?)?;
-            let holder = payload
-                .get("holder")
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let holder = payload.get("holder").and_then(Value::as_str).unwrap_or("");
             Some((
                 "rollout_start_refused",
                 json!({
@@ -970,7 +967,11 @@ fn gate_line(line: &str) -> Option<(&'static str, Value)> {
 }
 
 fn nonempty(text: &str) -> Option<&str> {
-    if text.is_empty() { None } else { Some(text) }
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 fn claim_in(conn: &Connection, req: &ClaimRequest<'_>) -> Result<TxResult<Value>> {
@@ -2296,8 +2297,13 @@ mod tests {
             !err.to_string().contains("release --force"),
             "a live lease must not advertise force-release: {err}"
         );
-        let released =
-            release_forced(&state, &caller("operator:ada"), "holder died", Some("alice")).unwrap();
+        let released = release_forced(
+            &state,
+            &caller("operator:ada"),
+            "holder died",
+            Some("alice"),
+        )
+        .unwrap();
         assert_eq!(released["holder"], "alice");
         assert_eq!(released["forced"], true);
         let events = events_of(&state);
@@ -2332,19 +2338,13 @@ mod tests {
         let link = dir.path().join("hardlink.sqlite3");
         std::fs::hard_link(&db, &link).unwrap();
         let err = record_backup(&state, &caller("alice"), &link).unwrap_err();
-        assert!(
-            err.to_string().contains("hard link or bind mount"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("hard link or bind mount"), "{err}");
         let wal = sidecar(&db, "-wal");
         std::fs::write(&wal, vec![0u8; 64]).unwrap();
         let wal_link = dir.path().join("wal-hardlink");
         std::fs::hard_link(&wal, &wal_link).unwrap();
         let err = record_backup(&state, &caller("alice"), &wal_link).unwrap_err();
-        assert!(
-            err.to_string().contains("hard link or bind mount"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("hard link or bind mount"), "{err}");
         let _ = std::fs::remove_file(&wal);
         let _ = std::fs::remove_file(sidecar(&db, "-shm"));
 
@@ -2415,7 +2415,11 @@ mod tests {
             .into_iter()
             .find(|event| event.0 == "rollout_start_refused")
             .unwrap();
-        assert!(refused.1.contains("\"source\":\"gate_log\""), "{}", refused.1);
+        assert!(
+            refused.1.contains("\"source\":\"gate_log\""),
+            "{}",
+            refused.1
+        );
         assert!(refused.1.contains("deadbeef"), "{}", refused.1);
     }
 
