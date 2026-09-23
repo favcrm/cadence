@@ -3012,6 +3012,26 @@ impl Shared {
                  — put a long body in a file and send its path",
             ));
         }
+        // `send --task` attaches the delivery to a task — ad-hoc
+        // PM↔worker follow-up inside a job's delivery record. CAD-160:
+        // an open task's message is composed to restate its objective
+        // and outstanding criteria, fitted to the endpoint's ceiling.
+        let task = optional_str(params, "task");
+        let composed = match task {
+            Some(task) => {
+                let ceiling = if pty {
+                    crate::adapter::pty::MAX_BODY
+                } else {
+                    store::ENQUEUE_BYTES
+                };
+                Some(
+                    self.store
+                        .compose_task_message(task, &alias, text, ceiling)?,
+                )
+            }
+            None => None,
+        };
+        let text = composed.as_deref().unwrap_or(text);
         // An explicit reply_to always wins; absent one, a worker joined
         // to a group (params.upstream) reports results to its PM by
         // default. `enqueue` still validates the target.
@@ -3032,9 +3052,6 @@ impl Shared {
             optional_str(params, "source").unwrap_or("user")
         };
         proto::identifier(source, "Message source")?;
-        // `send --task` attaches the delivery to a task — ad-hoc
-        // PM↔worker follow-up inside a job's delivery record.
-        let task = optional_str(params, "task");
         let (duplicate, state) =
             self.store
                 .enqueue_task(&alias, text, reply_to.as_deref(), &message, source, task)?;
@@ -8695,6 +8712,182 @@ mod tests {
         assert_eq!(stopped["state"], "stopped");
         let again = shared.rpc_stop(&json!({"alias": "w1"})).unwrap();
         assert_eq!(again["state"], "stopped");
+    }
+
+    // ---------- CAD-160: task-bound messages restate the task ----------
+
+    /// A pm, a pty worker in its group, and job `j1` whose default task
+    /// `j1-t1` carries a title, a spec and a CAD-300 acceptance listing.
+    fn task_bound_fixture(acceptance: &str) -> (tempfile::TempDir, Arc<Shared>) {
+        let (dir, shared) = shared();
+        register(&shared, dir.path(), "pm");
+        shared
+            .store
+            .register_agent(&NewAgent {
+                alias: "w1",
+                provider: "devin",
+                endpoint_kind: "pty",
+                role: "worker",
+                cwd: dir.path().to_str().unwrap(),
+                sandbox: "read-only",
+                instructions: None,
+                params: Some(&json!({"upstream": "pm"}).to_string()),
+                team_role: None,
+                model_policy: None,
+            })
+            .unwrap();
+        shared
+            .store
+            .create_job(
+                "j1",
+                None,
+                "/specs/j1.md",
+                &"0".repeat(64),
+                "pm",
+                None,
+                None,
+                None,
+                2,
+                None,
+                Some("Wire the email provider"),
+                None,
+                None,
+                None,
+                Some("w1"),
+                Some(acceptance),
+            )
+            .unwrap();
+        (dir, shared)
+    }
+
+    fn stored_body(shared: &Shared, id: &str) -> String {
+        shared.store.message(id).unwrap().unwrap().body
+    }
+
+    /// The body stored at enqueue is the exact text the pty adapter
+    /// pastes: the sender's text, then the objective, then every
+    /// still-unchecked criterion, in that order, on one line.
+    #[test]
+    fn task_bound_send_restates_objective_and_outstanding_criteria() {
+        let (_dir, shared) =
+            task_bound_fixture(r#"1) [ ] "sends via V2"; 2) [x] "tests green"; 3) [ ] "docs""#);
+        let text = "use the V1 email provider";
+        shared
+            .rpc_send(&json!({"alias": "w1", "text": text, "task": "j1-t1", "message": "m1"}))
+            .unwrap();
+        let body = stored_body(&shared, "m1");
+        assert_eq!(
+            body,
+            "use the V1 email provider — Task j1-t1 (job j1) is still open; this message \
+             amends it and does not replace it. Objective: Wire the email provider. Spec: \
+             /specs/j1.md. Outstanding criteria: 1) [ ] \"sends via V2\"; 2) [ ] \"docs\"."
+        );
+        let objective = body.find("Objective:").unwrap();
+        let criteria = body.find("Outstanding criteria:").unwrap();
+        assert!(body.starts_with(text) && objective < criteria, "{body}");
+        assert!(
+            !body.contains("tests green"),
+            "checked item restated: {body}"
+        );
+        assert!(!crate::adapter::pty::has_control_chars(&body), "{body}");
+        let message = shared.store.message("m1").unwrap().unwrap();
+        assert_eq!(message.task_id.as_deref(), Some("j1-t1"));
+        assert_eq!(message.reply_to.as_deref(), Some("pm"));
+    }
+
+    /// No task, or a terminal task: the body is the sender's text,
+    /// byte for byte.
+    #[test]
+    fn untasked_and_terminal_task_sends_are_byte_identical() {
+        let (_dir, shared) = task_bound_fixture(r#"1) [ ] "sends via V2""#);
+        let text = "  plain chat — no task. ";
+        shared
+            .rpc_send(&json!({"alias": "w1", "text": text, "message": "m1"}))
+            .unwrap();
+        assert_eq!(stored_body(&shared, "m1"), text);
+        shared.store.cancel_task("j1-t1", "test").unwrap();
+        shared
+            .rpc_send(&json!({"alias": "w1", "text": text, "task": "j1-t1", "message": "m2"}))
+            .unwrap();
+        assert_eq!(stored_body(&shared, "m2"), text);
+    }
+
+    /// QA N2: a worker's `--task` note to its PM is not steering —
+    /// the PM is not the one on the hook — so it goes out unchanged.
+    #[test]
+    fn task_bound_send_to_a_non_assignee_is_byte_identical() {
+        let (_dir, shared) = task_bound_fixture(r#"1) [ ] "sends via V2""#);
+        let text = "PR is up";
+        shared
+            .rpc_send(&json!({"alias": "pm", "text": text, "task": "j1-t1", "message": "r1"}))
+            .unwrap();
+        assert_eq!(stored_body(&shared, "r1"), text);
+    }
+
+    /// QA N3: blank text bound to an open task is refused before it
+    /// becomes a bare restatement; nothing is queued.
+    #[test]
+    fn blank_task_bound_send_is_refused() {
+        let (_dir, shared) = task_bound_fixture(r#"1) [ ] "sends via V2""#);
+        for (id, text) in [("e1", ""), ("e2", "   ")] {
+            let err = shared
+                .rpc_send(&json!({"alias": "w1", "text": text, "task": "j1-t1", "message": id}))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("Prompt must contain"), "{err}");
+            assert!(shared.store.message(id).unwrap().is_none());
+        }
+        assert_eq!(shared.store.queued_count("w1").unwrap(), 0);
+    }
+
+    /// Criteria past the pty ceiling refuse the send, naming the
+    /// ceiling and the spec file, and nothing is queued; long prose
+    /// beside fitting criteria is cut instead.
+    #[test]
+    fn task_bound_send_past_the_pty_ceiling_refuses_and_queues_nothing() {
+        let long = format!(r#"1) [ ] "{}""#, "c".repeat(4100));
+        let (_dir, shared) = task_bound_fixture(&long);
+        let err = shared
+            .rpc_send(&json!({"alias": "w1", "text": "steer", "task": "j1-t1", "message": "m1"}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("4000-char"), "{err}");
+        assert!(err.contains("spec file /specs/j1.md"), "{err}");
+        assert!(shared.store.message("m1").unwrap().is_none());
+        assert_eq!(shared.store.queued_count("w1").unwrap(), 0);
+
+        let criteria = "c".repeat(800);
+        let (_dir, shared) = task_bound_fixture(&format!(r#"1) [ ] "{criteria}""#));
+        shared
+            .store
+            .create_task(
+                "j1",
+                "j1-t2",
+                Some(&"T".repeat(3000)),
+                Some("w1"),
+                None,
+                Some(&format!(r#"1) [ ] "{criteria}""#)),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let text = "p".repeat(500);
+        shared
+            .rpc_send(&json!({"alias": "w1", "text": text, "task": "j1-t2", "message": "m2"}))
+            .unwrap();
+        let body = stored_body(&shared, "m2");
+        assert!(
+            body.len() <= crate::adapter::pty::MAX_BODY,
+            "{} bytes",
+            body.len()
+        );
+        assert!(body.starts_with(&text), "{body}");
+        assert!(body.contains("T…. Spec:"), "{body}");
+        assert!(
+            body.ends_with(&format!("Outstanding criteria: 1) [ ] \"{criteria}\".")),
+            "{body}"
+        );
     }
 
     // ---------- CAD-132: provider WAL watch ----------

@@ -406,6 +406,11 @@ pub(crate) fn caller_chain(mut pid: u32) -> Option<Vec<u32>> {
     Some(chain)
 }
 
+/// The pty paste ceiling in bytes: a body longer than this fails
+/// pre-write. Kickoffs and task-bound messages are composed to fit it —
+/// prose gives way, acceptance criteria never do (CAD-160).
+pub const MAX_BODY: usize = 4000;
+
 /// Whether `text` holds a character the literal paste refuses: any C0
 /// control (newline included) or DEL. Shared by the adapter's pre-write
 /// check and the send/dispatch paths that refuse before enqueue.
@@ -1017,7 +1022,7 @@ impl ProviderAdapter for PtyAdapter {
         // TUI could interpret as keys. These are `pre_write` rejections —
         // provably no bytes reached the pane, so the message fails
         // without fencing the endpoint.
-        if prompt.is_empty() || prompt.len() > 4000 {
+        if prompt.is_empty() || prompt.len() > MAX_BODY {
             return Err(Error::pre_write("PTY messages must be 1–4000 characters"));
         }
         if has_control_chars(prompt) {
