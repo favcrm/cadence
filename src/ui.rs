@@ -1997,6 +1997,25 @@ fn watch_changes(
     }
 }
 
+/// The board resources one stream event invalidates, sent as the frame's
+/// data (`{"resources":[...]}`) so the client refetches only those. The
+/// event name stays the change source, which older clients key on.
+/// - tracker files → the cards, the per-project list, the open issue
+///   and the overview's tracker rows;
+/// - jobs → card status (job outcomes) and agent task bindings;
+/// - agents → agent rows and their `by_issue` strip (cards read their
+///   agent chips from it), the open issue's agents, overview needs;
+/// - monitors → the overview's monitoring block only.
+fn event_resources(name: &str) -> &'static [&'static str] {
+    match name {
+        "issues" => &["issues", "projects", "issue", "overview"],
+        "jobs" => &["issues", "agents", "issue", "overview"],
+        "agents" => &["agents", "issue", "overview"],
+        "monitoring" => &["overview"],
+        _ => &["issues", "projects", "agents", "issue", "overview"],
+    }
+}
+
 /// `GET /api/stream` — server-sent events written straight onto the
 /// socket. tiny_http's chunked path buffers small writes inside
 /// `chunked_transfer::Encoder` (it flushes only on `flush()` or a full
@@ -2048,7 +2067,11 @@ fn stream_events(request: Request, state_dir: &Path, pm_dir: &Path) {
         match rx.recv_timeout(Duration::from_secs(15)) {
             Ok("__tick") => {}
             Ok(name) => {
-                if !frame(&mut w, format!("event: {name}\ndata: {{}}\n\n").as_bytes()) {
+                let data = json!({"resources": event_resources(name)});
+                if !frame(
+                    &mut w,
+                    format!("event: {name}\ndata: {data}\n\n").as_bytes(),
+                ) {
                     return;
                 }
                 ping_at = Instant::now() + Duration::from_secs(15);

@@ -2,8 +2,10 @@ import { useEffect, useState } from "react";
 import { api } from "../api";
 import { fmtTime } from "../fmt";
 import { provenanceDetail } from "../modelProvenance";
-import { agentIsUnassigned, agentMatchesProject, issueProjectMap } from "../scope";
+import type { ResourceState } from "../resource";
+import { agentIsUnassigned, agentMatchesProject, issueIndex, type IssueIndex } from "../scope";
 import { agentsEmptyCopy } from "../uxCopy";
+import { ResourceGate, StaleChip } from "./ResourceStatus";
 import type {
   Agent,
   AgentDetail,
@@ -286,6 +288,39 @@ function WorkBlock({
   if (agent.state === "idle") return <span className="text-ink-500">idle · no active work</span>;
   if (agent.state === "stopped") return <span className="text-ink-500">stopped · no active work</span>;
   return <span className="text-ink-500">{agent.state || "unknown"}</span>;
+}
+
+/** Issues the agent owns in doing/review with no job task on them — the
+ *  ownership half of the CLI ISSUES column (scope.ts). */
+function OwnedIssues({
+  agent,
+  index,
+  onOpenIssue,
+}: {
+  agent: Agent;
+  index: IssueIndex;
+  onOpenIssue: (id: string) => void;
+}) {
+  const viaTask = new Set((agent.tasks ?? []).map((task) => task.issue));
+  const ids = (index.ownedBy.get(agent.alias) ?? []).filter((id) => !viaTask.has(id));
+  if (ids.length === 0) return null;
+  return (
+    <div className="num text-micro text-ink-500 mt-1 flex flex-wrap gap-x-1.5" title="owner of these doing/review issues">
+      owns
+      {ids.map((id) => (
+        <button
+          key={id}
+          className="lnk"
+          onClick={(event) => {
+            event.stopPropagation();
+            onOpenIssue(id);
+          }}
+        >
+          {id}
+        </button>
+      ))}
+    </div>
+  );
 }
 
 function ProfileBlock({ agent }: { agent: Agent }) {
@@ -614,22 +649,23 @@ function AgentDrawer({
 }
 
 export default function Agents({
-  payload,
-  issues,
+  state,
+  issues: issuesState,
   project,
   onOpenIssue,
-  loading = false,
-  error = null,
+  onRetry,
 }: {
-  payload: AgentsPayload | null;
-  issues: IssueCard[];
+  state: ResourceState<AgentsPayload>;
+  /** Project binding joins agents to these cards (scope.ts). */
+  issues: ResourceState<IssueCard[]>;
   project: string;
   onOpenIssue: (id: string) => void;
-  loading?: boolean;
-  error?: string | null;
+  onRetry: () => void;
 }) {
   const [open, setOpen] = useState<string | null>(null);
-  const issueProjects = issueProjectMap(issues);
+  const payload = state.data;
+  const issues = issuesState.data ?? [];
+  const issueProjects = issueIndex(issues);
   const allAgents = payload?.agents ?? [];
   const agents = allAgents
     .filter((agent) => agentMatchesProject(agent, project, issueProjects))
@@ -649,9 +685,9 @@ export default function Agents({
     }),
     { running: 0, queued: 0, fenced: 0, parked: 0, inboxes: 0 },
   );
-  // A refresh error is an observation about the new request. It must not
-  // erase the last successful rows already held in `payload`.
-  const showRows = payload !== null || (!loading && !error);
+  // Rows show once anything loaded (ok, empty or stale); a failed
+  // refresh keeps them and says so in the header chip.
+  const showRows = payload !== null;
   const emptyCopy = agentsEmptyCopy(project);
 
   return (
@@ -667,11 +703,14 @@ export default function Agents({
           {agents.length} in {project === "all" ? "all projects" : project} · {totals?.fenced ?? 0} fenced ·{" "}
           {totals?.queued ?? 0} queued
         </span>
+        <StaleChip state={state} />
       </div>
 
       {project !== "all" && (globalAgents.length > 0 || otherProjectAgents.length > 0) && (
         <div className="card mb-4 px-4 py-3 text-label text-ink-400 border-ink-700">
-          <span className="text-ink-200">Scope is exact issue/job ownership.</span>{" "}
+          <span className="text-ink-200">
+            Scope is dispatch (a job task on an issue) or ownership (owner of a doing/review issue), the CLI ISSUES rule.
+          </span>{" "}
           {globalAgents.length > 0 && `${globalAgents.length} global or unassigned observation${globalAgents.length === 1 ? " remains" : "s remain"}. `}
           {otherProjectAgents.length > 0 && `${otherProjectAgents.length} other-project agent${otherProjectAgents.length === 1 ? " is" : "s are"} available in All projects.`}
         </div>
@@ -683,14 +722,17 @@ export default function Agents({
         </div>
       )}
 
-      {loading && (
-        <div className="card mb-4 px-4 py-5 text-secondary text-ink-400" role="status">
-          loading agent observations…
-        </div>
-      )}
-      {error && (
-        <div className="card mb-4 px-4 py-5 text-secondary text-fail border-fail/40" role="alert">
-          could not load agent observations — {error}
+      <ResourceGate
+        state={state}
+        loading="loading agent observations…"
+        failed="could not load agent observations"
+        onRetry={onRetry}
+      />
+      {showRows && project !== "all" && issuesState.data === null && (
+        <div className="card mb-4 px-4 py-3 text-label text-ink-400" role="status">
+          {issuesState.status === "failed"
+            ? "issues did not load — only job-bound agents can be matched to this project"
+            : "loading issues — owner bindings to this project appear once they load"}
         </div>
       )}
 
@@ -759,7 +801,10 @@ export default function Agents({
                 <span className="slabel">model</span>
                 <div><ProfileBlock agent={a} /></div>
                 <span className="slabel">current work</span>
-                <div className="min-w-0"><WorkBlock agent={a} onOpenIssue={onOpenIssue} /></div>
+                <div className="min-w-0">
+                  <WorkBlock agent={a} onOpenIssue={onOpenIssue} />
+                  <OwnedIssues agent={a} index={issueProjects} onOpenIssue={onOpenIssue} />
+                </div>
                 {a.on.length > 0 && (
                   <>
                     <span className="slabel">on issue</span>
@@ -879,6 +924,7 @@ export default function Agents({
                   </td>
                   <td className="px-3 py-2.5 align-top">
                     <WorkBlock agent={a} onOpenIssue={onOpenIssue} />
+                  <OwnedIssues agent={a} index={issueProjects} onOpenIssue={onOpenIssue} />
                   </td>
                   <td className="px-3 py-2.5 align-top">
                     <span className={`num ${a.unknown > 0 ? "text-fail" : "text-ink-200"}`}>
