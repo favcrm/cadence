@@ -986,6 +986,43 @@ enum Commands {
         #[arg(long)]
         releases_dir: Option<PathBuf>,
     },
+    /// Take a verified online backup of `cadence.sqlite3` (CAD-314):
+    /// SQLite `VACUUM INTO` a copy while the daemon runs, reopen it
+    /// read-only, require `PRAGMA integrity_check` = ok and the source's
+    /// schema, and write `<copy>.manifest.json` (schema, sha256, build
+    /// commit, created_at, source). Then prune our oldest copies beyond
+    /// `--keep`; files without our manifest are never deleted.
+    Backup {
+        /// Directory for the copy and its manifest [default: <state>/backups].
+        #[arg(long)]
+        dest: Option<PathBuf>,
+        /// How many of our backups to keep in --dest.
+        #[arg(long, default_value_t = cadence_agent::backup::DEFAULT_KEEP as u64,
+              value_parser = clap::value_parser!(u64).range(1..10_000))]
+        keep: u64,
+    },
+    /// Write a portable tar bundle: a verified database copy, its
+    /// manifest, `repo-map.json` (project -> remote + local path from the
+    /// tracker's project.yaml files) and the briefings dir. Every text
+    /// member is secret-scanned; a blocking finding refuses the export and
+    /// nothing is written. Provider logs are never included.
+    Export {
+        /// The bundle to create (refused if it exists).
+        #[arg(long)]
+        bundle: PathBuf,
+        /// Tracker directory for the repo map [default: $CADENCE_PM_DIR, else ~/pm].
+        #[arg(long)]
+        pm_dir: Option<PathBuf>,
+    },
+    /// Restore a bundle from `cadence export` or a backup manifest from
+    /// `cadence backup` into --state-dir. Refuses a running daemon, an
+    /// existing database, a checksum or integrity failure and a schema
+    /// newer than this binary; prints a repo remap plan. Never touches
+    /// the tracker repo.
+    Restore {
+        /// The bundle (.tar) or `cadence-backup-*.manifest.json`.
+        file: PathBuf,
+    },
     /// Stdio MCP server backing `--permission-prompt-tool` on a
     /// brokered managed claude — spawned by the provider CLI via the
     /// generated `--mcp-config`, never by hand.
@@ -1445,8 +1482,9 @@ enum RolloutAction {
         as_identity: Option<String>,
     },
     /// Record a backup receipt on the lease. The holder only. The file
-    /// must already exist and be a readable SQLite database; this
-    /// command does not take the backup.
+    /// must already exist and be a readable SQLite database outside the
+    /// state dir; take it with `cadence backup --dest <dir>` after the
+    /// claim.
     Backup {
         /// Path of the SQLite backup to hash and record.
         #[arg(long)]
@@ -5337,6 +5375,28 @@ fn run() -> Result<i32> {
                 releases_dir,
             },
         ),
+        Commands::Backup { dest, keep } => {
+            print_json(&cadence_agent::backup::backup(
+                &state_dir,
+                dest.as_deref(),
+                keep as usize,
+            )?);
+            Ok(0)
+        }
+        Commands::Export { bundle, pm_dir } => {
+            let pm_dir = match pm_dir {
+                Some(dir) => dir,
+                None => cadence_agent::issue::default_dir()?,
+            };
+            print_json(&cadence_agent::backup::export(
+                &state_dir, &bundle, &pm_dir,
+            )?);
+            Ok(0)
+        }
+        Commands::Restore { file } => {
+            print_json(&cadence_agent::backup::restore(&state_dir, &file)?);
+            Ok(0)
+        }
         Commands::McpPermission { timeout_secs } => cadence_agent::mcp::run(timeout_secs),
     }
 }
@@ -5378,6 +5438,13 @@ fn run_upgrade(state_dir: &Path, args: UpgradeArgs) -> Result<i32> {
     };
     let layout = upgrade::Layout::detect(args.link, args.releases_dir)?;
     let source = upgrade::Gh::new(&args.repo);
+    // CAD-314: every install is preceded by a verified `cadence backup`
+    // (default dest, keep 7). A failed backup refuses the upgrade.
+    let backup = if args.dry_run {
+        json!({"skipped": "dry run: a real upgrade takes `cadence backup` first"})
+    } else {
+        cadence_agent::backup::pre_update(state_dir)?
+    };
     let mut report = upgrade::run(
         &source,
         &layout,
@@ -5387,6 +5454,7 @@ fn run_upgrade(state_dir: &Path, args: UpgradeArgs) -> Result<i32> {
             allow_unattested: args.allow_unattested,
         },
     )?;
+    report["backup"] = backup;
     let command = upgrade::restart_command(args.as_identity.as_deref());
     if !args.restart {
         report["restart_command"] = json!(command);

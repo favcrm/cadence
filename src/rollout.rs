@@ -346,11 +346,11 @@ fn migration_refusal(version: i64, lease_table: bool) -> String {
     format!(
         "refusing to migrate schema {version} to {SCHEMA_VERSION}: no active \
          rollout lease holds a backup receipt taken after the claim whose \
-         schema_version is {version}. The database was not modified. Take a \
-         copy of the sqlite file, then run `cadence rollout claim --reason \
-         \"<why>\" --as <identity>` and `cadence rollout backup --path \
-         <backup-file>` with a binary that already has the lease commands, \
-         then retry.{bootstrap}"
+         schema_version is {version}. The database was not modified. Run \
+         `cadence rollout claim --reason \"<why>\" --as <identity>`, take a \
+         verified copy with `cadence backup --dest <dir outside the state dir>`, \
+         then `cadence rollout backup --path <that copy>` with a binary that \
+         already has the lease commands, then retry.{bootstrap}"
     )
 }
 
