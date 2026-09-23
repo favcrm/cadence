@@ -19155,7 +19155,7 @@ fn finish_merged_sweep() {
 /// Write an accepted memory fixture with the same authenticated evidence
 /// shape produced by the native daemon path. Dispatch/match tests use this
 /// fixture so they exercise retrieval eligibility without pretending that a
-/// CLI child outside a native PTY can author or review a memory.
+/// CLI child outside every agent endpoint can author or review a memory.
 fn write_reviewed_memory(
     pm_dir: &Path,
     project: &str,
@@ -19427,8 +19427,9 @@ fn memory_native_socket_identity_requires_distinct_reviewers() {
     assert!(err.contains("already reviewed"), "{err}");
     assert_eq!(before_repeat, read_memory());
 
-    // A detached integration-test RPC has no pane ancestor and cannot
-    // borrow an alias from its params to review or finalize.
+    // A detached integration-test RPC has no pane or enrolled-endpoint
+    // ancestor: it is classified "not an agent" (the operator path,
+    // CAD-381) and cannot borrow an alias from its params.
     let err = d
         .rpc(
             "memory_review",
@@ -19442,11 +19443,7 @@ fn memory_native_socket_identity_requires_distinct_reviewers() {
             }),
         )
         .unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("not owned by exactly one live native PTY"),
-        "{err}"
-    );
+    assert!(err.to_string().contains("is not an agent"), "{err}");
 
     let before_missing_quorum = read_memory();
     let err = d

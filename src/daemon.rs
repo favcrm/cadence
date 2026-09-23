@@ -2060,67 +2060,190 @@ impl Shared {
         self.emit_slot_events(events);
     }
 
-    /// Resolve a memory actor only from the Unix connection peer and a
-    /// currently owned native PTY endpoint. Request fields, CADENCE_ALIAS,
-    /// upstream grouping and operator defaults never participate.
-    fn memory_actor(&self, peer_pid: u32) -> Result<NativeIdentity> {
+    /// The one caller-identity verifier (CAD-381, decision #3): who is
+    /// on the other end of this Unix connection, answered only from the
+    /// daemon's own launch records — never from request fields, env
+    /// (`CADENCE_ALIAS`), upstream grouping or an operator default.
+    /// Memory resolves through here; reviews and reports are meant to.
+    ///
+    /// Every agent endpoint the daemon records is an identity node:
+    ///
+    /// - a pty endpoint's pane process (the agent row's pid), proven by
+    ///   the adapter's native ownership check ([`Self::verify_pane_agent`]);
+    /// - a managed endpoint's enrolled provider root (CAD-230: pid +
+    ///   starttime + uid, bound to the owner generation), proven by the
+    ///   strict enrollment verifier ([`Self::verify_enrolled_agent`]) —
+    ///   so headless claude/codex authenticate exactly like panes.
+    ///
+    /// Exactly one node on the peer's ancestry is the agent. None is
+    /// [`Caller::NotAgent`] — the operator path, which never takes an
+    /// agent's identity. Two or more (or one pid that is both a pane and
+    /// an enrolled root) is ambiguous and refused, as is any node whose
+    /// proof fails: fail closed, never fall through to another node.
+    fn caller_identity(&self, peer_pid: u32) -> Result<Caller> {
+        // Drifted or closed owners lose their enrollment before it can
+        // vouch for anyone.
+        self.revalidate_enrollments()?;
+        // /proc is still needed here, and only here: the peer's
+        // ancestry is how a tool subprocess reaches its endpoint's
+        // process. Linux-only; the macOS port is CAD-315.
         let chain = adapter::pty::caller_chain(peer_pid).ok_or_else(|| {
             Error::rejected(format!(
-                "Memory caller pid {peer_pid}: /proc ancestry unreadable — \
-                 native identity underivable"
+                "Caller pid {peer_pid}: /proc ancestry unreadable — caller \
+                 identity underivable"
             ))
         })?;
-        let agents = self.store.agents()?;
-        let mut found = Vec::new();
-        for agent in agents {
-            if agent.endpoint_kind != "pty"
-                || !matches!(agent.role.as_str(), "pm" | "worker")
-                || !matches!(
-                    agent.state.as_str(),
-                    "idle" | "busy" | "running" | "waiting_input"
-                )
-            {
-                continue;
+        let panes: HashMap<u32, String> = self
+            .store
+            .pty_endpoint_facts()?
+            .into_iter()
+            .map(|(alias, (_, pane_pid, _))| (pane_pid, alias))
+            .collect();
+        let slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        let roots = slots.enrolled_roots_on(&chain);
+        let mut nodes: Vec<String> = chain
+            .iter()
+            .filter_map(|pid| panes.get(pid).map(|alias| format!("pane '{alias}'")))
+            .collect();
+        for &r in &roots {
+            if panes.contains_key(&chain[r]) {
+                return Err(Error::rejected(format!(
+                    "Caller pid {peer_pid}: pid {} is both a registered pane and an \
+                     enrolled endpoint — caller identity ambiguous",
+                    chain[r]
+                )));
             }
-            let Some(pid) = agent.pid.and_then(|p| u32::try_from(p).ok()) else {
-                continue;
-            };
-            let Some(generation) = agent.generation.clone() else {
-                continue;
-            };
-            if generation.is_empty() || agent.endpoint.is_none() || !chain.contains(&pid) {
-                continue;
+            nodes.push(format!("enrolled root pid {}", chain[r]));
+        }
+        match nodes.len() {
+            0 => return Ok(Caller::NotAgent),
+            1 => {}
+            n => {
+                return Err(Error::rejected(format!(
+                    "Caller pid {peer_pid} descends from {n} agent endpoints ({}) — \
+                     caller identity ambiguous",
+                    nodes.join(", ")
+                )))
             }
-            let process_start = process_start_identity(pid)?;
-            found.push((agent, generation, process_start));
         }
-        if found.len() != 1 {
-            return Err(Error::rejected(format!(
-                "Memory caller pid {peer_pid} is not owned by exactly one live native \
-                 PTY endpoint (matched {}) — external, detached or ambiguous identity \
-                 is unsupported",
-                found.len()
-            )));
+        if let Some(&r) = roots.first() {
+            let strict = slots.strict_caller(peer_pid, chain[r])?;
+            let enrollment = slots
+                .active_endpoint_enrollment(&strict.enrollment_id)
+                .cloned()
+                .ok_or_else(|| {
+                    Error::rejected(format!(
+                        "Caller pid {peer_pid}: enrollment {} of '{}' is not active \
+                         (revoked, expired or a build runner) — it vouches for no agent",
+                        strict.enrollment_id, strict.lane
+                    ))
+                })?;
+            drop(slots);
+            return self
+                .verify_enrolled_agent(enrollment)
+                .map(|v| Caller::Agent(Box::new(v)));
         }
-        let (agent, generation, process_start) = found.pop().expect("one memory actor");
+        drop(slots);
+        let alias = adapter::pty::nearest_pane(&chain, &panes)
+            .cloned()
+            .expect("one pane node");
+        self.verify_pane_agent(&alias)
+            .map(|v| Caller::Agent(Box::new(v)))
+    }
+
+    /// A pty endpoint named by its pane: the row must be a live,
+    /// generation-stamped endpoint and the adapter must still own that
+    /// exact native session and pane process (unchanged CAD-191 proof).
+    fn verify_pane_agent(&self, alias: &str) -> Result<VerifiedAgent> {
+        let agent = self.store.agent(alias)?;
+        require_live_endpoint(&agent)?;
+        let generation = agent
+            .generation
+            .clone()
+            .filter(|g| !g.is_empty() && agent.endpoint.is_some())
+            .ok_or_else(|| {
+                Error::rejected(format!("pty endpoint '{alias}' has no live generation"))
+            })?;
         let pid = agent
             .pid
             .and_then(|p| u32::try_from(p).ok())
             .ok_or_else(|| Error::rejected("native endpoint pid disappeared"))?;
-        let adapter = self.adapter_for(&agent.alias)?;
+        // /proc: a pane's process start is read live — the pane record
+        // carries no start time of its own.
+        let process_start = process_start_identity(pid)?;
+        let adapter = self.adapter_for(alias)?;
         adapter.verify_owned_endpoint(pid, &generation, agent.session_id.as_deref())?;
         if process_start != process_start_identity(pid)? {
             return Err(Error::rejected(
-                "native endpoint process changed while resolving memory identity",
+                "native endpoint process changed while resolving caller identity",
             ));
+        }
+        Ok(VerifiedAgent {
+            agent,
+            generation,
+            process_start,
+        })
+    }
+
+    /// A managed endpoint named by its active enrollment: the owner
+    /// row, read now, must still be that endpoint — same owner
+    /// generation (registration + endpoint generation + pid), same
+    /// provider pid — and live. The process identity is the
+    /// enrollment's own record (already re-verified hop by hop by
+    /// [`crate::slots::Slots::strict_caller`]), so no further /proc
+    /// read is needed.
+    fn verify_enrolled_agent(&self, e: crate::slots::Enrollment) -> Result<VerifiedAgent> {
+        let agent = self.store.agent_opt(&e.owner_actor)?.ok_or_else(|| {
+            Error::rejected(format!(
+                "enrollment {} names '{}', which is no longer registered",
+                e.id, e.owner_actor
+            ))
+        })?;
+        if owner_generation(&agent).as_deref() != Some(e.owner_generation.as_str())
+            || agent.pid != Some(i64::from(e.root.pid))
+        {
+            return Err(Error::rejected(format!(
+                "enrollment {} of '{}' no longer matches its endpoint (owner \
+                 generation or provider pid changed)",
+                e.id, e.owner_actor
+            )));
+        }
+        require_live_endpoint(&agent)?;
+        Ok(VerifiedAgent {
+            agent,
+            generation: e.owner_generation,
+            process_start: e.root.starttime,
+        })
+    }
+
+    /// Resolve a memory actor through [`Self::caller_identity`]: only a
+    /// verified pm or worker endpoint may author, review or finalize.
+    fn memory_actor(&self, peer_pid: u32) -> Result<NativeIdentity> {
+        let verified = match self.caller_identity(peer_pid)? {
+            Caller::Agent(v) => *v,
+            Caller::NotAgent => {
+                return Err(Error::rejected(format!(
+                    "Memory caller pid {peer_pid} is not an agent — it descends from \
+                     no registered pane and no enrolled managed endpoint (the operator \
+                     path); memory actions are agent-authenticated and a non-agent \
+                     caller is never given an agent's identity"
+                )))
+            }
+        };
+        if !matches!(verified.agent.role.as_str(), "pm" | "worker") {
+            return Err(Error::rejected(format!(
+                "Memory caller '{}' has role '{}' — only pm and worker endpoints \
+                 author or review memory",
+                verified.agent.alias, verified.agent.role
+            )));
         }
         Ok(NativeIdentity {
             proof: IdentityProof {
-                alias: agent.alias,
-                registration: agent.created.to_bits(),
-                generation,
-                process_start,
-                role: agent.role,
+                alias: verified.agent.alias,
+                registration: verified.agent.created.to_bits(),
+                generation: verified.generation,
+                process_start: verified.process_start,
+                role: verified.agent.role,
             },
         })
     }
@@ -6162,6 +6285,41 @@ fn optional_u64(params: &Value, field: &str) -> Option<u64> {
 
 fn optional_i64(params: &Value, field: &str) -> Option<i64> {
     params.get(field).and_then(Value::as_i64)
+}
+
+/// Who is on the other end of a connection — see
+/// [`Shared::caller_identity`] (CAD-381).
+enum Caller {
+    /// Outside every agent tree: the operator path. It never resolves
+    /// to, or borrows, an agent's identity.
+    NotAgent,
+    /// Exactly one live agent endpoint, proven from the daemon's record.
+    Agent(Box<VerifiedAgent>),
+}
+
+/// An agent endpoint the daemon verified for this connection.
+struct VerifiedAgent {
+    agent: Agent,
+    /// The endpoint's proof generation: the pty adapter generation, or
+    /// a managed endpoint's enrolled owner generation.
+    generation: String,
+    /// The endpoint process's start time (`/proc` starttime).
+    process_start: u64,
+}
+
+/// A verified identity needs an endpoint that is up right now.
+fn require_live_endpoint(agent: &Agent) -> Result<()> {
+    if matches!(
+        agent.state.as_str(),
+        "idle" | "busy" | "running" | "waiting_input"
+    ) {
+        Ok(())
+    } else {
+        Err(Error::rejected(format!(
+            "agent '{}' is {} — only a live endpoint has a caller identity",
+            agent.alias, agent.state
+        )))
+    }
 }
 
 /// Who a slot call runs as — see [`Shared::slot_identity`].
