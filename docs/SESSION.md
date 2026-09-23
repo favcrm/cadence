@@ -656,6 +656,60 @@ queue past 100. Check it with
 `gh run list --workflow ci.yml --branch main --json databaseId,headSha,status,conclusion`,
 and look at the zero-job runs with `gh run view <id> --json jobs`.
 
+### Sandboxes: trying a build beside production
+
+Never start a second daemon or UI on the production state dir, `~/pm`
+or port 3010 to try a change. Use a sandbox. It is a separate instance
+with its own state dir, PM dir and UI port, run from the binary you
+invoke:
+
+```bash
+target/debug/cadence sandbox up dev        # create or reuse, start daemon + UI
+eval "$(target/debug/cadence sandbox env dev)"  # this shell now talks to the sandbox
+cadence status                             # the sandbox's fleet, not production's
+target/debug/cadence sandbox ls            # every sandbox: port, daemon, ui
+target/debug/cadence sandbox down dev      # stop its daemon and UI, keep its data
+target/debug/cadence sandbox reset dev     # stop it, then delete it
+```
+
+- **Where it lives.** `~/.local/share/cadence/sandboxes/<name>/`
+  (`$XDG_DATA_HOME` if set, or `$CADENCE_SANDBOX_ROOT` for the base). It
+  holds `state/` (socket, database, logs), `pm/` (a fresh tracker from
+  `issue init`), `notes/`, and the marker `cadence-sandbox.json`, which
+  records the name, the root and the UI port. It does not live under
+  `$TMPDIR`: a tmp reaper or a reboot would drop a sandbox while you
+  still use it, and the long macOS `$TMPDIR` pushes the socket path
+  toward the unix-socket length limit. Names are 1-32 characters from
+  `[a-z0-9-]`.
+- **Ports.** `up` takes the first port from 3110 that binds and that no
+  other sandbox has recorded, then records it. If another process wins
+  that port before the UI binds it, `up` notices (the UI on the port
+  does not serve this sandbox's PM dir) and picks the next one.
+  `--port <n>` pins a port. 3010 is always refused.
+- **Reuse.** `up` on an existing sandbox reuses its data and its
+  recorded port, and reports `already_running` for a daemon that is
+  still up. A rebuilt binary meets the same rollout gate as production
+  (`daemon start` refuses a new build without the lease). Use
+  `sandbox reset` for a fresh one, or claim the lease inside the
+  sandbox.
+- **Refusals.** `up`, `down` and `reset` refuse a sandbox whose root,
+  state dir, socket or PM dir is on, inside or above
+  `~/.local/state/cadence`, `$XDG_STATE_HOME/cadence` or `~/pm`, and a
+  root that is `/` or `$HOME`. `down`, `reset` and `env` act only on a
+  real directory, not a symlink, that holds a regular marker naming
+  that directory and that sandbox. `reset` checks the marker again just
+  before it deletes.
+- **The profile.** A sandbox's daemon and UI, and every pane they
+  start, run with `CADENCE_PROFILE=sandbox:<name>`. Under that profile,
+  every command refuses a state dir or PM dir that is a production
+  default, so an unset `CADENCE_PM_DIR` fails instead of reaching `~/pm`.
+  The UI refuses port 3010, which is also its default. The daemon skips
+  the skill sync into `$HOME`. `ui tailscale`, `--tailscale`,
+  `ui stop --tailscale-off` and `skill install` are refused. The
+  provider WAL watcher only reports: a sandbox daemon records
+  `wal_checkpoint_pending` and never checkpoints the provider databases
+  in `$HOME`, which production also uses.
+
 ## 8. When something goes wrong
 
 | Symptom | Meaning | Do |

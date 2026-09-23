@@ -126,6 +126,9 @@ pub enum TailscaleAction {
 
 /// `cadence ui …`
 pub fn run_cli(state_dir: &Path, action: &UiAction) -> Result<i32> {
+    if let UiAction::Tailscale { .. } = action {
+        crate::sandbox::refuse_global("`ui tailscale`")?;
+    }
     match action {
         UiAction::Run { flags } => run(state_dir, flags),
         UiAction::Start { flags, reset } => start(state_dir, flags, *reset),
@@ -2603,7 +2606,7 @@ fn read_pid(state_dir: &Path) -> Option<i32> {
 /// Tiny blocking GET — enough for health checks without an HTTP client
 /// dependency. `headers` are extra request lines (`Tailscale-User-Login`
 /// for the identity probe). Returns `(status, body)`.
-fn http_get(
+pub(crate) fn http_get(
     host: &str,
     port: u16,
     path: &str,
@@ -2640,9 +2643,23 @@ fn http_get(
 /// never rewrite them: `ui start` owns persistence.
 fn run(state_dir: &Path, flags: &UiFlags) -> Result<i32> {
     let persisted = load_opts(state_dir);
+    sandbox_guard(flags, &persisted)?;
     let (_eff, so) = resolve_opts(flags, &persisted)?;
     serve(state_dir, &crate::issue::default_dir()?, &so)?;
     Ok(0)
+}
+
+/// Under the sandbox profile: no tailscale sharing (it publishes a
+/// host-wide serve mapping) and never the production port 3010, which
+/// is also what an unset port defaults to.
+fn sandbox_guard(flags: &UiFlags, persisted: &UiOpts) -> Result<()> {
+    if !crate::sandbox::active() {
+        return Ok(());
+    }
+    if flags.tailscale.is_some() || persisted.tailscale.is_some() {
+        crate::sandbox::refuse_global("tailscale sharing (`--tailscale`)")?;
+    }
+    crate::sandbox::refuse_port(flags.port.or(persisted.port).unwrap_or(3010))
 }
 
 /// `ui start` — merge flags over `ui.json`, persist the effective
@@ -2667,6 +2684,7 @@ fn start_inner(state_dir: &Path, flags: &UiFlags, reset: bool, quiet: bool) -> R
         let _ = std::fs::remove_file(opts_file(state_dir));
     }
     let persisted = load_opts(state_dir);
+    sandbox_guard(flags, &persisted)?;
     let (eff, so) = resolve_opts(flags, &persisted)?;
     // Re-ensure a persisted mapping so `ui stop && ui start` keeps the
     // board shared — best effort when tailscaled itself is unreachable.
@@ -2779,6 +2797,9 @@ fn kill_detached(state_dir: &Path) -> Option<i32> {
 }
 
 fn stop(state_dir: &Path, tailscale_off: bool) -> Result<i32> {
+    if tailscale_off {
+        crate::sandbox::refuse_global("`ui stop --tailscale-off`")?;
+    }
     let pid = kill_detached(state_dir);
     if pid.is_none() {
         let _ = std::fs::remove_file(pid_file(state_dir));
@@ -3014,6 +3035,7 @@ pub(crate) fn ts_start_quiet(state_dir: &Path, https_port: u16, read_only: bool)
 }
 
 fn ts_start_inner(state_dir: &Path, https_port: u16, read_only: bool, quiet: bool) -> Result<i32> {
+    crate::sandbox::refuse_global("`ui tailscale start`")?;
     let me = ts_self()?;
     let mut opts = load_opts(state_dir);
     let ui_port = opts.port.unwrap_or(3010);

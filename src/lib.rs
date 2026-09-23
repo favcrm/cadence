@@ -21,6 +21,7 @@ pub mod proto;
 pub mod review;
 pub mod rollout;
 pub mod runner;
+pub mod sandbox;
 pub mod secret;
 pub mod session;
 pub mod skill;

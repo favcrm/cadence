@@ -61,6 +61,14 @@ enum Commands {
         #[command(subcommand)]
         action: DaemonAction,
     },
+    /// Isolated dev instances beside the production daemon: each
+    /// sandbox has its own state dir, PM dir and UI port (3110 up) and
+    /// runs under `CADENCE_PROFILE=sandbox:<name>`, which gates the
+    /// side effects outside it. `--state-dir` is ignored here.
+    Sandbox {
+        #[command(subcommand)]
+        action: cadence_agent::sandbox::SandboxAction,
+    },
     /// One durable rollout claim. The lease gates a build change and a
     /// schema crossing. A same-build `daemon stop` followed by
     /// `daemon start`, or a crash restart of the same build, stays
@@ -4044,6 +4052,9 @@ fn run() -> Result<i32> {
         Some(dir) => dir,
         None => client::state_dir()?,
     };
+    // Under CADENCE_PROFILE=sandbox:* no command may run against the
+    // production state dir or PM dir — a mis-set env fails closed.
+    cadence_agent::sandbox::guard_runtime(&state_dir)?;
     match cli.command {
         Commands::Doctor {
             host,
@@ -4075,12 +4086,17 @@ fn run() -> Result<i32> {
                 // Every daemon start re-syncs the vendored skill: a
                 // rebuilt binary propagates changes. stderr lands in
                 // daemon.log for the detached child — stdout stays silent.
-                match home_dir().map(|h| cadence_agent::skill::sync(&h, false)) {
-                    Ok(Ok(report)) if report["wrote"].as_bool().unwrap_or(false) => {
-                        eprintln!("skill: refreshed {}", report["installed"])
+                // A sandbox daemon never writes into $HOME's skill dirs.
+                if cadence_agent::sandbox::active() {
+                    eprintln!("skill: sync skipped under the sandbox profile");
+                } else {
+                    match home_dir().map(|h| cadence_agent::skill::sync(&h, false)) {
+                        Ok(Ok(report)) if report["wrote"].as_bool().unwrap_or(false) => {
+                            eprintln!("skill: refreshed {}", report["installed"])
+                        }
+                        Ok(Err(e)) => eprintln!("skill: refresh failed: {e}"),
+                        _ => {}
                     }
-                    Ok(Err(e)) => eprintln!("skill: refresh failed: {e}"),
-                    _ => {}
                 }
                 cadence_agent::daemon::serve(&state_dir)?;
                 Ok(0)
@@ -4805,6 +4821,9 @@ fn run() -> Result<i32> {
             let home = home_dir()?;
             match action {
                 SkillAction::Install => {
+                    cadence_agent::sandbox::refuse_global(
+                        "`skill install` (writes $HOME skill dirs)",
+                    )?;
                     let report = cadence_agent::skill::sync(&home, true)?;
                     print_json(&report);
                 }
@@ -5145,6 +5164,7 @@ fn run() -> Result<i32> {
             Ok(if blocking { 1 } else { 0 })
         }
         Commands::Ui { action } => cadence_agent::ui::run_cli(&state_dir, &action),
+        Commands::Sandbox { action } => cadence_agent::sandbox::run_cli(&action),
         Commands::Status { group, json, watch } => {
             run_status(&state_dir, group.as_deref(), json, watch)
         }

@@ -53,6 +53,7 @@ Three storage concerns stay distinct:
 | `src/review.rs`, `src/audit.rs` | Revision-bound review execution/evidence and merge/audit reconstruction. |
 | `src/slots.rs`, `src/doctor/host.rs` | Build/test admission and host/session ownership/resource observations. |
 | `src/session.rs`, `src/worktree.rs`, `src/proc.rs` | Session/worktree operations and process helpers. |
+| `src/sandbox.rs` | `cadence sandbox`: isolated dev instances (own state, PM dir, UI port) and the `CADENCE_PROFILE=sandbox:*` gates on side effects outside them. |
 | `src/ui.rs`, `src/overview.rs` | HTTP/API surface and aggregated project/agent/actionable observations. |
 | `ui/src/components/`, `ui/src/types.ts`, `ui/src/api.ts` | React views, frontend types and API access. |
 | `tests/` | Integration/board fixtures and the partial unattended-team acceptance harness. |

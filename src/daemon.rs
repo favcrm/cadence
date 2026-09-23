@@ -5238,12 +5238,15 @@ impl Shared {
         let Ok(busy) = self.store.busy_providers(&live, epoch_secs()) else {
             return;
         };
+        // CAD-310: a sandbox daemon shares $HOME's provider stores
+        // with production — it only ever reports, never checkpoints.
+        let observe_only = t.wal_dry_run || crate::sandbox::active();
         wal_pass(
             &roots,
             &busy,
             t.wal_max_bytes,
             WAL_QUIET_SECS,
-            t.wal_dry_run,
+            observe_only,
             &self.store,
             watch,
         );
