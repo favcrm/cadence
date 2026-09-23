@@ -236,6 +236,14 @@ cadence secret scan [--file f]     # credential scan: JSON findings
                                    # fingerprint}, never the value; exit 1
                                    # on a blocking finding (stdin without
                                    # --file)
+cadence backup [--reason nightly]  # online-backup copy + manifest into
+                                   # <state>/backups, keeps 7 per reason
+cadence export --out dir           # portable bundle: store only, tokens
+                                   # nulled, secret-scanned (fails closed)
+cadence restore <manifest|dir> [--repo path] [--force]
+                                   # refuses a running daemon, a newer
+                                   # schema or existing state; remaps repo
+                                   # paths by remote (docs/SESSION.md §10)
 ```
 
 **Secret scan (CAD-109).** `issue comment`, `report`, `memory propose`

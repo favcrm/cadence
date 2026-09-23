@@ -71,6 +71,51 @@ enum Commands {
         #[command(subcommand)]
         action: RolloutAction,
     },
+    /// Back up the store with SQLite's online backup API. The running
+    /// daemon is not blocked. The copy is integrity-checked, hashed and
+    /// described by a manifest (schema, sha256, versions, repo remotes),
+    /// then re-verified from disk. `--keep` prunes older backups with
+    /// the same `--reason` in that directory; files without a cadence
+    /// manifest are never touched. Schedule `--reason nightly` from cron
+    /// for the nightly week of copies. See docs/SESSION.md.
+    Backup {
+        /// Where the copy and manifest go [default: <state dir>/backups].
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Keep the newest N backups with this reason.
+        #[arg(long, default_value_t = 7, value_parser = clap::value_parser!(u64).range(1..=1000))]
+        keep: u64,
+        /// Label for the copy and its retention group: manual, nightly,
+        /// pre-update, … (a-z, 0-9, '-').
+        #[arg(long, default_value = "manual")]
+        reason: String,
+    },
+    /// Write a portable bundle (`cadence.sqlite3` + `manifest.json`) to
+    /// a new directory. Only the store goes in: endpoint tokens are
+    /// nulled, freed pages dropped, and every text cell secret-scanned.
+    /// One blocking finding refuses the export and writes nothing.
+    Export {
+        /// The bundle directory to create. It must not exist.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Restore a backup (its `.manifest.json`) or an export bundle (its
+    /// directory) into the state dir. Refuses while a daemon holds the
+    /// state dir, refuses a schema newer than this binary, and refuses to
+    /// replace an existing store without `--force`. Repo paths are
+    /// rewritten to the `--repo` checkout with the same origin remote.
+    Restore {
+        /// A backup manifest file, or an export bundle directory.
+        source: PathBuf,
+        /// A checkout on this host, matched to a recorded repo by its
+        /// origin remote. Repeat for each repo.
+        #[arg(long = "repo")]
+        repos: Vec<PathBuf>,
+        /// Replace an existing store. A verified `pre-restore` backup of
+        /// it is taken into <state dir>/backups first.
+        #[arg(long)]
+        force: bool,
+    },
     /// Manage registered agents.
     Agent {
         #[command(subcommand)]
@@ -4180,6 +4225,29 @@ fn run() -> Result<i32> {
                 as_identity,
             } => daemon_restart(&state_dir, when_idle, timeout, ui, as_identity),
         },
+        Commands::Backup { dir, keep, reason } => {
+            let dir = dir.unwrap_or_else(|| cadence_agent::backup::default_dir(&state_dir));
+            print_json(&cadence_agent::backup::backup(
+                &state_dir,
+                &dir,
+                keep as usize,
+                &reason,
+            )?);
+            Ok(0)
+        }
+        Commands::Export { out } => {
+            print_json(&cadence_agent::backup::export(&state_dir, &out)?);
+            Ok(0)
+        }
+        Commands::Restore {
+            source,
+            repos,
+            force,
+        } => {
+            let opts = cadence_agent::backup::RestoreOptions { force, repos };
+            print_json(&cadence_agent::backup::restore(&source, &state_dir, &opts)?);
+            Ok(0)
+        }
         Commands::Rollout { action } => {
             use cadence_agent::rollout::{Caller, ClaimRequest};
             let caller = |as_identity: &Option<String>| -> Result<Caller> {
@@ -5385,6 +5453,7 @@ fn run_upgrade(state_dir: &Path, args: UpgradeArgs) -> Result<i32> {
             target,
             dry_run: args.dry_run,
             allow_unattested: args.allow_unattested,
+            backup_state_dir: Some(state_dir.to_path_buf()),
         },
     )?;
     let command = upgrade::restart_command(args.as_identity.as_deref());
@@ -7572,6 +7641,39 @@ unsafe extern "C" fn cadence_raise_test_stack() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cad314_backup_export_restore_parse() {
+        let cli = Cli::try_parse_from(["cadence", "backup"]).unwrap();
+        match cli.command {
+            Commands::Backup { dir, keep, reason } => {
+                assert_eq!(dir, None);
+                assert_eq!(keep, 7, "the nightly default keeps a week");
+                assert_eq!(reason, "manual");
+            }
+            _ => panic!("expected backup"),
+        }
+        assert!(Cli::try_parse_from(["cadence", "backup", "--keep", "0"]).is_err());
+        let cli = Cli::try_parse_from(["cadence", "export", "--out", "/tmp/b"]).unwrap();
+        assert!(matches!(cli.command, Commands::Export { .. }));
+        assert!(Cli::try_parse_from(["cadence", "export"]).is_err());
+        let cli = Cli::try_parse_from([
+            "cadence", "restore", "/tmp/b", "--repo", "/a", "--repo", "/b", "--force",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Restore {
+                source,
+                repos,
+                force,
+            } => {
+                assert_eq!(source, PathBuf::from("/tmp/b"));
+                assert_eq!(repos, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
+                assert!(force);
+            }
+            _ => panic!("expected restore"),
+        }
+    }
 
     #[test]
     fn devin_resume_parses_like_native() {
