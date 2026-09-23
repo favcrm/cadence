@@ -14,7 +14,8 @@ use uuid::Uuid;
 use crate::adapter::pty;
 use crate::client;
 use crate::error::{Error, Result};
-use crate::issue::{board, start, write, Pm};
+use crate::issue::parse::AcceptanceItem;
+use crate::issue::{board, parse, start, write, Pm};
 use crate::memory;
 
 /// Message states that mean a dispatch is still in flight — a second
@@ -61,6 +62,71 @@ fn kickoff_body(
         note.display(),
         wt_dir.display()
     )
+}
+
+/// Most bytes a `--job` task's acceptance listing may take. The
+/// daemon's kickoff inlines the task's acceptance and truncates past
+/// its 4000-char ceiling; staying well under that keeps the listing
+/// whole, and a longer list becomes a pointer instead.
+pub(crate) const JOB_ACCEPTANCE_BUDGET: usize = 2000;
+
+/// CAD-159: an issue's acceptance items on one line — `[ ] a; [x] b`
+/// — when that fits `budget` bytes, else a pointer to the CAD-238
+/// section-scoped readback. `None` when there are no items. Control
+/// characters become spaces so the result can ride a single-line
+/// pty kickoff.
+pub(crate) fn acceptance_listing(
+    issue: &str,
+    items: &[AcceptanceItem],
+    budget: usize,
+) -> Option<String> {
+    if items.is_empty() {
+        return None;
+    }
+    let inline = items
+        .iter()
+        .map(|item| {
+            let text: String = item
+                .text
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect();
+            format!("[{}] {text}", if item.checked { 'x' } else { ' ' })
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(if inline.len() <= budget {
+        inline
+    } else {
+        format!(
+            "{} items, too long to inline — `cadence issue show {issue} --json` \
+             lists them under .acceptance",
+            items.len()
+        )
+    })
+}
+
+/// CAD-159: the warning for an issue with no acceptance items. The PM
+/// decided (2026-09-23, ADR-0002 §8.3) to warn and still dispatch
+/// until live issues are backfilled; refusal is a later ticket.
+fn acceptance_warning(issue: &str) -> String {
+    format!(
+        "{issue} has no acceptance criteria (its ## Acceptance section has no \
+         checklist items; a bare `- [ ]` does not count) — add them with \
+         `cadence issue acceptance {issue} --from <file>`. Dispatched anyway."
+    )
+}
+
+/// The plain-path kickoff with the issue's acceptance appended as
+/// ` Acceptance: <listing>.` — inline when it fits the 4000-char
+/// body limit, else the readback pointer.
+fn with_acceptance(body: String, issue: &str, items: &[AcceptanceItem]) -> String {
+    const FRAME: usize = " Acceptance: .".len();
+    let budget = 4000usize.saturating_sub(body.len() + FRAME);
+    match acceptance_listing(issue, items, budget) {
+        Some(listing) => format!("{body} Acceptance: {listing}."),
+        None => body,
+    }
 }
 
 /// The same rules the pty endpoint enforces pre-write: 1–4000 chars,
@@ -156,7 +222,16 @@ pub(crate) fn check_lane_cwd(
 /// `dispatch <ISSUE> --to <worker> --note <path> [--job --spec f]`.
 pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path) -> Result<Value> {
     let (project, dir) = write::issue_dir(pm, id)?;
-    let (front, _body) = write::load_front(&dir)?;
+    let (front, body) = write::load_front(&dir)?;
+    // CAD-159: the CAD-238 section-scoped readback. No items warns;
+    // it never refuses (PM decision, ADR-0002 §8.3).
+    let items = parse::acceptance_items(&body);
+    let acceptance_warning = items.is_empty().then(|| acceptance_warning(&front.id));
+    let acceptance = json!({
+        "items": items.len(),
+        "criteria": items.iter().map(AcceptanceItem::to_json).collect::<Vec<_>>(),
+        "warning": acceptance_warning,
+    });
     let reply_to = args
         .reply_to
         .clone()
@@ -211,8 +286,12 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
         let (wt_name, branch) = start::names(&front.id, &front.title, args.name.as_deref())?;
         let wt_dir = root.join(".cadence").join("wt").join(&wt_name);
         let summary = args.summary.as_deref().unwrap_or(&front.title);
-        let body = kickoff_body(
-            &front.id, summary, &note, &wt_dir, &branch, &base_sha, &reply_to,
+        let body = with_acceptance(
+            kickoff_body(
+                &front.id, summary, &note, &wt_dir, &branch, &base_sha, &reply_to,
+            ),
+            &front.id,
+            &items,
         );
         check_body(&body, &provider)?;
         Some(body)
@@ -242,14 +321,18 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
     let body = body
         .map(|_| {
             let summary = args.summary.as_deref().unwrap_or(&front.title);
-            let body = kickoff_body(
+            let body = with_acceptance(
+                kickoff_body(
+                    &front.id,
+                    summary,
+                    &note,
+                    Path::new(started["worktree"].as_str().unwrap_or_default()),
+                    started["branch"].as_str().unwrap_or_default(),
+                    started["base"]["sha"].as_str().unwrap_or_default(),
+                    &reply_to,
+                ),
                 &front.id,
-                summary,
-                &note,
-                Path::new(started["worktree"].as_str().unwrap_or_default()),
-                started["branch"].as_str().unwrap_or_default(),
-                started["base"]["sha"].as_str().unwrap_or_default(),
-                &reply_to,
+                &items,
             );
             check_body(&body, &provider).map(|_| body)
         })
@@ -305,6 +388,7 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
         "created": started["created"],
         "target_dir": started["target_dir"],
         "slot_env": started["slot_env"],
+        "acceptance": acceptance,
     });
     if let Some(msg) = live {
         out["dispatched"] = json!(false);
@@ -480,6 +564,11 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
     if let Some(note) = cwd_override.as_ref().filter(|_| args.job_spec.is_none()) {
         comment_text.push_str(&format!("\n{note}"));
     }
+    // CAD-159: the empty-acceptance warning is recorded once, on this
+    // dispatch's own comment — a duplicate run returns before here.
+    if let Some(warning) = &acceptance_warning {
+        comment_text.push_str(&format!("\nAcceptance warning: {warning}"));
+    }
     let comment = write::add_comment(pm, id, &comment_text, None, Some("dispatch"), None, actor)?;
 
     // The worker's current probe verdict — pty only; the operator
@@ -510,4 +599,84 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
     out["probe"] = probe.unwrap_or(Value::Null);
     out["cwd_override"] = cwd_override.map(Value::from).unwrap_or(Value::Null);
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kickoff() -> String {
+        kickoff_body(
+            "D-1",
+            "Title",
+            Path::new("/tmp/note.md"),
+            Path::new("/r/.cadence/wt/d-1-title"),
+            "cadence/d-1-title",
+            "0123456789abcdef",
+            "pm",
+        )
+    }
+
+    /// CAD-159: an empty section and a stub-only section both yield no
+    /// items — no listing, the kickoff is unchanged, and the warning
+    /// names the issue and the authoring command.
+    #[test]
+    fn empty_and_stub_only_acceptance_has_no_listing() {
+        for body in [
+            "Title\n\n## Acceptance\n\n",
+            "Title\n\n## Acceptance\n\n- [ ]\n- [x]   \n",
+        ] {
+            let items = parse::acceptance_items(body);
+            assert!(items.is_empty(), "{body:?}");
+            assert_eq!(acceptance_listing("D-1", &items, 4000), None);
+            assert_eq!(with_acceptance(kickoff(), "D-1", &items), kickoff());
+        }
+        let warning = acceptance_warning("D-1");
+        assert!(
+            warning.contains("D-1")
+                && warning.contains("cadence issue acceptance D-1 --from <file>"),
+            "{warning}"
+        );
+    }
+
+    /// Populated acceptance is listed inline, one line, checked state
+    /// kept, control characters flattened.
+    #[test]
+    fn populated_acceptance_is_listed_inline() {
+        let body = "T\n\n## Acceptance\n\n- [ ] first\tpart\n- [x] second\n\n## Notes\n- [ ] not acceptance\n";
+        let items = parse::acceptance_items(body);
+        assert_eq!(
+            acceptance_listing("D-1", &items, 4000).as_deref(),
+            Some("[ ] first part; [x] second")
+        );
+        let body = with_acceptance(kickoff(), "D-1", &items);
+        assert!(
+            body.ends_with(" Acceptance: [ ] first part; [x] second."),
+            "{body}"
+        );
+        check_body(&body, "fake").unwrap();
+    }
+
+    /// A list too long for the budget becomes a pointer to the
+    /// CAD-238 readback, and the kickoff stays within the pty limit.
+    #[test]
+    fn oversized_acceptance_points_at_the_readback() {
+        let items: Vec<AcceptanceItem> = (0..60)
+            .map(|i| AcceptanceItem {
+                text: format!("criterion {i} {}", "x".repeat(80)),
+                checked: false,
+            })
+            .collect();
+        let pointer = acceptance_listing("D-1", &items, JOB_ACCEPTANCE_BUDGET).unwrap();
+        assert!(
+            pointer.starts_with("60 items") && pointer.contains("cadence issue show D-1 --json"),
+            "{pointer}"
+        );
+        let body = with_acceptance(kickoff(), "D-1", &items);
+        assert!(
+            body.ends_with(&format!(" Acceptance: {pointer}.")),
+            "{body}"
+        );
+        check_body(&body, "fake").unwrap();
+    }
 }

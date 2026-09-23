@@ -171,8 +171,9 @@ replaces the issue's unique level-two Acceptance section, or inserts that
 section when it is absent. It refuses duplicate headings, malformed or empty
 input, missing issues and missing files before writing. issue show --json
 returns ordered acceptance items with text, checked and done fields; the
-existing global checks counter remains for compatibility. Dispatch enforcement
-for empty acceptance is CAD-159 work and is unchanged here.
+existing global checks counter remains for compatibility. `dispatch` reads the
+same section-scoped items: an issue with none is warned about, not refused
+(CAD-159 — see Dispatch and finish).
 
 Every write is exactly one git commit in the PM repo, made under a lock
 file (`~/pm/.lock`) with atomic `issue.md` replacement. Field values are
@@ -374,7 +375,10 @@ the `Issue: <ID>` trailer — as JSON.
   M3 job through `job_new`: the job carries `--issue`, `--repo` and
   `--base-ref <base sha>`, and the `task_worktree`/`task_branch`/
   `task_base_sha`/`task_assignee` params scope the default `<job>-t1`
-  task — exactly one task, already bound to the worktree. The daemon,
+  task — exactly one task, already bound to the worktree — and
+  `task_acceptance` carries the issue's acceptance items (the same
+  listing `dispatch` inlines, below), so the task's kickoff lists
+  them. The daemon,
   the PM alias and any assignee (the PM itself or a member of its
   group) are probed *before* anything is created, so a daemon-down,
   unknown-PM or bad-assignee run leaves no worktree, branch or
@@ -405,6 +409,26 @@ then adds a tracker comment `Dispatched to <worker>: <note>` and a
 <file>` instead opens the M3 job through `issue start --job --pm
 <reply-to> --assignee <worker>` and sends the kickoff through
 `job dispatch`, so the task and the message are bound.
+
+**Acceptance (CAD-159, ADR-0002 phase 1).** Dispatch reads the issue's
+`## Acceptance` items through the same section-scoped readback as
+`issue show --json` (a bare `- [ ]` stub is not an item). With at
+least one item the kickoff lists them on its single line —
+` Acceptance: [ ] first; [x] second.` appended to the plain template,
+or the `<job>-t1` task's acceptance on the `--job` path, which the
+daemon's kickoff inlines. A list too long to fit (the plain body's
+4000-char limit, or 2000 bytes for the task) is replaced by a pointer:
+`N items, too long to inline — cadence issue show <ID> --json lists
+them under .acceptance`. With **no** items, both paths **warn and
+still dispatch** (PM decision 2026-09-23, ADR-0002 §8.3 — refusal is a
+follow-up once live issues are backfilled): the warning names the
+issue and `cadence issue acceptance <ID> --from <file>`, prints on
+stderr as `warning: …`, and the JSON carries it as
+`acceptance: {items, criteria, warning}` (`warning` is `null` when
+items exist). It is recorded exactly once, as an `Acceptance warning:`
+line on that dispatch's `Dispatched to …` tracker comment — a
+duplicate run records nothing — so the PM counts unspecified
+dispatches with `grep -l 'Acceptance warning:' <pm>/*/*/comments/*`.
 
 Everything is checked before anything is created: the note is
 readable, the daemon is reachable, the worker exists and is not

@@ -701,14 +701,8 @@ fn link_ref(views_by_id: &HashMap<String, &View>, id: &str) -> Value {
 pub fn detail_json(pm_dir: &Path, view: &View, views_by_id: &HashMap<String, &View>) -> Value {
     let f = &view.issue.front;
     let acceptance: Vec<Value> = parse::acceptance_items(&view.issue.body)
-        .into_iter()
-        .map(|item| {
-            json!({
-                "text": item.text,
-                "checked": item.checked,
-                "done": item.checked,
-            })
-        })
+        .iter()
+        .map(parse::AcceptanceItem::to_json)
         .collect();
     let link_list = |ids: &[String]| {
         ids.iter()

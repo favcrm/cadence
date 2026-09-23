@@ -397,10 +397,11 @@ and a disciplined retry path, never a blind replay.
 `task` binding in `agent_list`/`self` output.
 
 `job_new` also accepts optional task-scope params — `task_worktree`,
-`task_branch`, `task_base_sha`, `task_assignee` — applied to the
-default `<job>-t1` it mints (assignee is validated against the job's
-group, same rule as `task_new`). Absent params keep the original
-behaviour: an unscoped draft `t1`.
+`task_branch`, `task_base_sha`, `task_assignee`, `task_acceptance`
+(CAD-159: `issue start --job` passes the issue's acceptance items) —
+applied to the default `<job>-t1` it mints (assignee is validated
+against the job's group, same rule as `task_new`). Absent params keep
+the original behaviour: an unscoped draft `t1`.
 
 `task_verdict` accepts `verify` — the CLI's worktree-verification
 result `{checked, skipped}` (§3), stored verbatim on the verdict row

@@ -526,10 +526,12 @@ cadence job task cancel <task> && cadence overview | grep -qv "continue <task>"
 2. **PM:** does `steer` become a new verb, or a flag on `send`
    (`send --task <t> --amend refine`)? A verb is clearer and greppable; a
    flag reuses the existing path and its idempotency. I lean verb.
-3. Should phase 1's dispatch refusal apply to **all** issues or only
-   job-backed dispatches? Refusing everything is simpler and stricter;
-   refusing only job dispatches limits blast radius while the 144 empty
-   sections get filled.
+3. ~~Should phase 1's dispatch refusal apply to **all** issues or only
+   job-backed dispatches?~~ **Answered** by the PM (2026-09-23, CAD-159):
+   neither yet — every dispatch path **warns** on empty acceptance and
+   still dispatches, recording the warning so unspecified dispatches can
+   be counted; switching to refusal is a follow-up once live issues are
+   backfilled. Until then the §7 refusal check does not hold.
 4. ~~Prior art for amendment-vs-replacement.~~ **Answered** by `rsch-1`
    (note in §10). It changed three things rather than confirming them:
    admission-time validation (Temporal update validators), per-state
