@@ -54,9 +54,10 @@ pub mod devin;
 pub mod lane;
 pub mod profile;
 mod render;
+pub mod sgr;
 pub mod stub;
 
-pub use claude::{analyze_claude, ClaudeProfile};
+pub use claude::{analyze_claude, analyze_claude_styled, ClaudeProfile};
 pub use cursor::{analyze_cursor, CursorProfile};
 pub use devin::{analyze_devin, DevinProfile};
 pub use profile::TuiProfile;
@@ -710,10 +711,20 @@ impl PtyAdapter {
         Ok(())
     }
 
-    /// Visible screen only (no scrollback) — what the TUI shows now.
+    /// Visible screen only (no scrollback) — what the TUI shows now,
+    /// as plain text.
     fn capture_visible(&self) -> Result<String> {
+        Ok(sgr::strip(&self.capture_visible_styled()?))
+    }
+
+    /// Visible screen with its SGR attributes kept (`-e`) — what every
+    /// screen probe reads. A plain capture cannot tell a TUI's dim
+    /// ghost text (Claude's prompt suggestion) from a typed draft; the
+    /// profile's [`TuiProfile::analyze_styled`] can. One capture feeds
+    /// both the probe and any plain-text use, so they see one frame.
+    fn capture_visible_styled(&self) -> Result<String> {
         let session = self.session();
-        self.tmux_ok(&["capture-pane", "-p", "-t", &session])
+        self.tmux_ok(&["capture-pane", "-p", "-e", "-t", &session])
     }
 
     /// CAD-201: record the pane root's process identity for this
@@ -1090,11 +1101,12 @@ impl ProviderAdapter for PtyAdapter {
         let render_started = Instant::now();
         let mut render_decision = RenderDecision::new(RENDER_DEADLINE);
         loop {
-            let screen = self.capture_visible()?;
+            let styled = self.capture_visible_styled()?;
+            let screen = sgr::strip(&styled);
             let observation = if normalize_screen(&screen).matches(&slice).count() > before_count {
                 let cursor = self.cursor_pos(&session);
                 RenderObservation::Visible {
-                    input_nonempty: self.profile.analyze(&screen, cursor).input_nonempty,
+                    input_nonempty: self.profile.analyze_styled(&styled, cursor).input_nonempty,
                 }
             } else {
                 RenderObservation::NotVisible
@@ -1221,7 +1233,9 @@ impl ProviderAdapter for PtyAdapter {
     fn probe(&self) -> Result<Probe> {
         let session = self.session();
         let cursor = self.cursor_pos(&session);
-        Ok(self.profile.analyze(&self.capture_visible()?, cursor))
+        Ok(self
+            .profile
+            .analyze_styled(&self.capture_visible_styled()?, cursor))
     }
 
     fn verify_owned_endpoint(
@@ -1274,8 +1288,11 @@ impl ProviderAdapter for PtyAdapter {
             return Err(Error::provider("cannot answer: pane is gone"));
         }
         self.verify_ownership(&session, &native)?;
-        let screen = self.capture_visible()?;
-        let probe = self.profile.analyze(&screen, self.cursor_pos(&session));
+        let styled = self.capture_visible_styled()?;
+        let screen = sgr::strip(&styled);
+        let probe = self
+            .profile
+            .analyze_styled(&styled, self.cursor_pos(&session));
         if !probe.approval_menu {
             return Err(Error::rejected(format!(
                 "refusing menu answer — the pane shows no approval menu \
@@ -1294,9 +1311,11 @@ impl ProviderAdapter for PtyAdapter {
 
     fn sample_screen(&self) -> Result<(String, Probe)> {
         let session = self.session();
-        let screen = self.capture_visible()?;
-        let probe = self.profile.analyze(&screen, self.cursor_pos(&session));
-        Ok((activity_hash(&screen), probe))
+        let styled = self.capture_visible_styled()?;
+        let probe = self
+            .profile
+            .analyze_styled(&styled, self.cursor_pos(&session));
+        Ok((activity_hash(&sgr::strip(&styled)), probe))
     }
 
     fn update_params(&self, params: &Value) {
