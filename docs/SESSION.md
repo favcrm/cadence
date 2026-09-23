@@ -457,6 +457,12 @@ processes at suite start.
 Then do one thing the tests do not: drive the feature by hand on a
 scratch daemon (`CADENCE_STATE_DIR=/tmp/short-path`), a temp repo or a
 temp tracker. Most real findings came from this step.
+`target/debug/cadence sandbox up <name>` builds all three at once from
+the PR binary — its own state dir, tracker and board port, with the
+skill sync, tailnet and provider WAL checkpoints gated off — and
+`sandbox reset <name>` removes it. It refuses production's dirs and
+port 3010, so it never stands in for a rollout; see the README's
+Sandbox section.
 
 Rules that were learned the hard way (now encoded in the command):
 
