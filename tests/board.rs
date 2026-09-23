@@ -7118,7 +7118,8 @@ fn memory_match_blocks_legacy_records() {
 #[test]
 fn memory_stale_flags_changed_paths() {
     let (_t, pm, state, repo) = mem_fx();
-    let verified = time::iso(time::now_epoch());
+    let verified_epoch = time::now_epoch();
+    let verified = time::iso(verified_epoch);
     legacy_memory(
         &pm,
         "src-watch",
@@ -7137,8 +7138,13 @@ fn memory_stale_flags_changed_paths() {
     );
     // verified_at == now; the change must land strictly after. Staleness is
     // an informational reader path and does not require trust in a legacy
-    // acceptance receipt.
-    std::thread::sleep(Duration::from_millis(1100));
+    // acceptance receipt. Both stamps are whole seconds: wait for the clock
+    // to pass the verified second (often already true after the CLI calls).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while time::now_epoch() <= verified_epoch {
+        assert!(Instant::now() < deadline, "clock never passed {verified}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
     std::fs::create_dir_all(repo.join("src")).unwrap();
     std::fs::write(repo.join("src/changed.rs"), "x").unwrap();
     git(&repo, &["add", "-A"]);

@@ -241,9 +241,14 @@ and appends its own tests.
 
 Two limits matter more than the issue graph:
 
-- **The integration suite is load sensitive.** Tell workers to run the
-  full suite once at the end, not in loops. Three to four workers is
-  comfortable on a 16-core host.
+- **The integration suite is load sensitive.** Workers run focused
+  groups only — the integration tests that call what they changed,
+  found by grepping for the RPC, verb or helper — plus their new tests
+  5× alone. CI runs the full suite on every push and the reviewer runs
+  it once per PR; a worker runs it only when `docs/roles/dev.md` step 4
+  names an exception (`src/daemon.rs`, `src/store.rs`, `src/adapter/`,
+  `src/main.rs`, the shared test harness) or the kickoff asks. Three to
+  four workers is comfortable on a 16-core host.
 - **Review is single threaded.** Each PR costs the reviewer a full-suite
   run plus a hands-on check. More lanes than the reviewer can drain only
   produces rebases.
@@ -377,8 +382,9 @@ gives up after `CADENCE_SUITE_LOCK_WAIT_SECS` (default 3600).
 `cadence review` refuses its full run while the variable is unset
 (`--no-suite-lock` overrides, `--no-full` skips the suite).
 
-CAD-173's nextest path is deliberately separate from that active cargo
-gate. `scripts/cadence-nextest` verifies the pinned `cargo-nextest
+Since CAD-173 (#93 for review, #94 for CI, both merged 2026-09-21 with
+operator approval) the full suite and the isolated reruns run under
+nextest. `scripts/cadence-nextest` verifies the pinned `cargo-nextest
 0.9.145` binary against `.config/cargo-nextest.sha256`, clears the
 `NEXTEST_RETRIES`/`NEXTEST_PROFILE` environment overrides, passes CLI
 `--retries 0`, uses `.config/nextest.toml` with `retries = 0`, and takes
@@ -396,13 +402,12 @@ When `cadence review` owns the slot, `src/review.rs` clears the child's
 lock path and sets an explicit held marker; the wrapper then runs without
 a nested flock. `scripts/nextest-inventory` compares non-empty cargo and
 nextest test-name manifests from the repository root before any runner
-switch, even when the command is invoked from another directory. The
-activation follow-up configures both the full and isolated review commands
-to use the same wrapper and reads its profile-resolved JUnit report. The
-review deletes the old report before each command; missing, malformed, or
-zero-test evidence is unknown/blocking rather than a pass. The config change
-remains human-class and must not be merged or activated until the installation,
-structured-result, and gate-activation approvals for CAD-173 are recorded.
+switch, even when the command is invoked from another directory.
+`cadence-review.toml` points both the full and isolated review commands at
+the same wrapper, and the review reads its profile-resolved JUnit report.
+The review deletes the old report before each command; missing, malformed,
+or zero-test evidence is unknown/blocking rather than a pass. A change to
+that config is still human-class (risk class 7).
 
 The CI follow-up uses the same reviewed wrapper for `--all-targets` after a
 non-empty Cargo/nextest inventory comparison covering the library, binary,

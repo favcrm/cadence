@@ -672,9 +672,14 @@ first and refuses with the reason when the pane is visibly busy —
 `agent ready --force` (or `send --ready --force`) claims anyway, and
 the `ready_claimed` event records `"forced": true` alongside the probe
 verdict it overrode. A refused send returns the message to `queued`
-(event `gate_wait`) and retries; it is never pasted blind and never
-dropped. Message text is a single line of 1–4000 chars with no
-control characters (`agent_send` to a pty agent refuses a body with
+(event `gate_wait`) and retries after a back-off (5 → 10 → 20 → 30s; a
+claim or inbox arrival wakes it early); it is never pasted blind and
+never dropped. `CADENCE_PTY_RETRY_SECS` sets the 5s base for both waits
+and scales the whole schedule, the 30s cap included (cap = 6 × base). It
+takes seconds in [0.1, 3600]; any other value (0, negative, NaN, inf,
+not a number) is refused with a stderr warning and the 5s default
+applies. Tests shrink it; production leaves it unset. Message text is a
+single line of 1–4000 chars with no control characters (`agent_send` to a pty agent refuses a body with
 control characters up front instead of answering `queued`), delivered
 literally via `load-buffer` + `paste-buffer -p` + `Enter` — no shell
 interpretation. A body whose first non-space character is in the
@@ -707,11 +712,11 @@ The `paste_not_rendered` event carries that evidence: the normalized
 screen tail before the paste and the tail after the deadline (12 rows
 each), plus the probe verdict that admitted the send.
 On that evidence a routed `worker_result` notification is requeued
-(bounded, then the delivery is `failed` with `via=pty_render_miss` and
-a `delivery_parked` event — a notification must never fence the
-recipient or kill its pane; the worker's result stays durable on the
-worker's own message). Any other message goes `unknown` and fences the
-actor — a possibly-pasted task is never replayed blind. Once the check
+(retried 5s later, bounded, then the delivery is `failed` with
+`via=pty_render_miss` and a `delivery_parked` event — a notification
+must never fence the recipient or kill its pane; the worker's result
+stays durable on the worker's own message). Any other message goes
+`unknown` and fences the actor — a possibly-pasted task is never replayed blind. Once the check
 passes the message is `running` with `turn_id =
 pty-<generation>-<uuid>` and completes only through an explicit
 `message_report` (`message ack` keeps it `running`; `message result`
