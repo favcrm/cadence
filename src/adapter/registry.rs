@@ -1166,10 +1166,10 @@ fn validate_devin_cloud(params: &Value) -> Result<()> {
     if let Some(value) = obj.get("session") {
         if !value.is_null() {
             match value.as_str() {
-                Some(id) if id.starts_with("devin-") && id.len() > "devin-".len() => {}
+                Some(id) if super::cloud::valid_session_id(id) => {}
                 Some(id) => {
                     return Err(Error::rejected(format!(
-                        "devin cloud session id must look like 'devin-…', got '{id}'"
+                        "devin cloud session id must look like 'devin-…' or 32 hex, got '{id}'"
                     )))
                 }
                 None => {
@@ -1782,6 +1782,24 @@ mod tests {
             validate_launch_params("devin", "cloud", &json!({"repos": ["not-a-repo"]})).is_err()
         );
         assert!(validate_launch_params("devin", "cloud", &json!({"session": "cookie"})).is_err());
+        assert!(validate_launch_params(
+            "devin",
+            "cloud",
+            &json!({"session": "0123456789abcdef0123456789abcdef"})
+        )
+        .is_ok());
+        assert!(validate_launch_params(
+            "devin",
+            "cloud",
+            &json!({"session": "0123456789abcdef0123456789abcde"})
+        )
+        .is_err());
+        assert!(validate_launch_params(
+            "devin",
+            "cloud",
+            &json!({"session": "gggggggggggggggggggggggggggggggg"})
+        )
+        .is_err());
         let unknown =
             validate_launch_params("devin", "cloud", &json!({"permission_mode": "smart"}))
                 .unwrap_err()

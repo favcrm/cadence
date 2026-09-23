@@ -38,6 +38,10 @@ const LOG_LIMIT: usize = 8192;
 const DEFAULT_POLL_INTERVAL_MS: u64 = 1000;
 const DEFAULT_POLL_BUDGET_MS: u64 = 30 * 60 * 1000;
 const DEFAULT_RECOVER_BUDGET_MS: u64 = 30 * 60 * 1000;
+const MESSAGES_PAGE: usize = 100;
+/// Pages read per poll. The cursor is kept, so a later poll continues
+/// instead of stopping forever at 2,000 messages.
+const MESSAGES_PAGES_PER_POLL: usize = 8;
 
 #[derive(Default)]
 struct Session {
@@ -50,11 +54,20 @@ struct Session {
     limit: Option<f64>,
     wait_sent: bool,
     terminated: bool,
-    /// `event_id`s from the messages endpoint at post time, plus the
-    /// page `total` when the API sent one. A Devin message whose
-    /// `event_id` is already here is not part of this turn.
+    /// Every `event_id` read from a successful messages page. The post
+    /// marker copies this set; a failed capture falls back to it so an
+    /// older Devin `SHA:` is not this turn's result.
+    seen_ids: Vec<String>,
+    /// Last non-empty messages `end_cursor`. The next fetch asks for
+    /// `after` this cursor. A live last page omits `end_cursor`, so a
+    /// missing cursor keeps the previous one.
+    messages_cursor: Option<String>,
+    /// Set once any messages page has been read. Until then a failed
+    /// capture must not post.
+    messages_fetched: bool,
+    /// `event_id`s copied from `seen_ids` at post time. A Devin message
+    /// whose `event_id` is already here is not part of this turn.
     marker_ids: Vec<String>,
-    marker_total: Option<i64>,
     /// Snapshot taken at post time. A terminal or waiting state that
     /// still matches this snapshot is leftover from before the post.
     post_marked: bool,
@@ -514,26 +527,31 @@ impl DevinCloudAdapter {
         st.turn_text = transcript_after(messages, &st.marker_ids, body);
     }
 
-    /// Follow `has_next_page` / `end_cursor` on the messages list.
-    /// `source == "devin"` is the assistant; the session GET has no
-    /// messages field.
+    /// Read the messages tail. Items are oldest-first. A live read on
+    /// 2026-09-23 (`first=2` through the last page) showed `end_cursor`
+    /// only while `has_next_page` is true; the last page omits it and
+    /// `total` is null. The cursor kept here is the last non-empty
+    /// `end_cursor`, and the next poll requests `after` that cursor, so
+    /// a caught-up session costs one tail page instead of the whole
+    /// history. A transcript that fits in one page has no cursor, and
+    /// that single page is read again. `source == "devin"` is the
+    /// assistant; the session GET has no messages field.
     fn fetch_messages(&self, org: &str, id: &str) -> std::result::Result<MessageList, CallErr> {
+        let mut after = self.session.lock().unwrap().messages_cursor.clone();
         let mut items = Vec::new();
-        let mut after: Option<String> = None;
-        let mut total = None;
-        for _ in 0..20 {
-            let mut rest = format!("/{}/messages?first=100", encode(id));
+        for _ in 0..MESSAGES_PAGES_PER_POLL {
+            let mut rest = format!("/{}/messages?first={MESSAGES_PAGE}", encode(id));
             if let Some(cursor) = &after {
                 rest.push_str("&after=");
                 rest.push_str(&encode(cursor));
             }
             let body = self.call("GET", &self.org_path(org, &rest), None)?;
-            if let Some(page) = body.get("items").and_then(Value::as_array) {
-                items.extend(page.iter().cloned());
-            }
-            if total.is_none() {
-                total = body.get("total").and_then(Value::as_i64);
-            }
+            let page = body
+                .get("items")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            items.extend(page.iter().cloned());
             let more = body
                 .get("has_next_page")
                 .and_then(Value::as_bool)
@@ -543,6 +561,10 @@ impl DevinCloudAdapter {
                 .and_then(Value::as_str)
                 .filter(|cursor| !cursor.is_empty())
                 .map(str::to_string);
+            // A terminal page often has no cursor. Keep the one that
+            // addressed this tail so the next poll does not start over.
+            let persist = cursor.clone().or_else(|| after.clone());
+            self.note_seen(&page, persist);
             if !more {
                 break;
             }
@@ -552,47 +574,107 @@ impl DevinCloudAdapter {
             }
             after = Some(cursor);
         }
-        Ok(MessageList { items, total })
+        Ok(MessageList { items })
     }
 
-    /// Freeze the session as it stands at post time, so a message or a
-    /// terminal state that already exists is not this turn's result.
-    /// The marker is the messages endpoint's `event_id`s and `total`,
-    /// not a count on the session body.
-    fn capture_post_marker(&self) {
-        let (org, id) = {
-            let st = self.session.lock().unwrap();
-            let Some(id) = st.id.clone() else {
-                return;
-            };
-            (st.org.clone(), id)
-        };
-        let path = self.org_path(&org, &format!("/{}", encode(&id)));
-        match (
-            self.call("GET", &path, None),
-            self.fetch_messages(&org, &id),
-        ) {
-            (Ok(body), Ok(list)) => {
-                let (status, detail) = status_of(&body);
-                let ids = event_ids(&list.items);
-                let mut st = self.session.lock().unwrap();
-                st.status = status.clone();
-                st.detail = detail.clone();
-                st.marker_ids = ids;
-                st.marker_total = list.total;
-                st.post_status = status;
-                st.post_detail = detail;
-                st.post_marked = true;
-                st.turn_text.clear();
-            }
-            _ => {
-                let mut st = self.session.lock().unwrap();
-                st.post_status = st.status.to_ascii_lowercase();
-                st.post_detail = st.detail.to_ascii_lowercase();
-                st.post_marked = true;
-                st.turn_text.clear();
+    fn note_seen(&self, page: &[Value], cursor: Option<String>) {
+        let mut st = self.session.lock().unwrap();
+        for id in event_ids(page) {
+            if !st.seen_ids.iter().any(|seen| seen == &id) {
+                st.seen_ids.push(id);
             }
         }
+        if let Some(cursor) = cursor.filter(|cursor| !cursor.is_empty()) {
+            st.messages_cursor = Some(cursor);
+        }
+        st.messages_fetched = true;
+    }
+
+    fn apply_marker(&self, status: String, detail: String) {
+        let mut st = self.session.lock().unwrap();
+        st.status = status.clone();
+        st.detail = detail.clone();
+        st.marker_ids = st.seen_ids.clone();
+        st.post_status = status;
+        st.post_detail = detail;
+        st.post_marked = true;
+        st.turn_text.clear();
+    }
+
+    fn apply_fallback_marker(&self) {
+        let mut st = self.session.lock().unwrap();
+        st.marker_ids = st.seen_ids.clone();
+        st.post_status = st.status.to_ascii_lowercase();
+        st.post_detail = st.detail.to_ascii_lowercase();
+        st.post_marked = true;
+        st.turn_text.clear();
+    }
+
+    /// One snapshot attempt. `Ok` means the post may proceed: either
+    /// this read succeeded, or a previous successful fetch supplied the
+    /// event ids. `Err` means nothing has been read yet.
+    fn try_capture(&self, org: &str, id: &str) -> std::result::Result<(), CallErr> {
+        let path = self.org_path(org, &format!("/{}", encode(id)));
+        let session = self.call("GET", &path, None);
+        let messages = self.fetch_messages(org, id);
+        let known = self.session.lock().unwrap().messages_fetched;
+        match (session, messages) {
+            (Ok(body), Ok(_)) => {
+                let (status, detail) = status_of(&body);
+                self.apply_marker(status, detail);
+                Ok(())
+            }
+            (Ok(body), Err(_)) if known => {
+                let (status, detail) = status_of(&body);
+                self.apply_marker(status, detail);
+                Ok(())
+            }
+            (Err(_), _) if known => {
+                self.apply_fallback_marker();
+                Ok(())
+            }
+            (Err(err), _) => Err(err),
+            (_, Err(err)) => Err(err),
+        }
+    }
+
+    /// Freeze the session as it stands at post time. When the capture
+    /// fails and no messages page has ever been read, retry inside the
+    /// turn budget and do not post. A later failure reuses the event
+    /// ids from the last successful fetch.
+    fn ensure_post_marker(&self, org: &str, id: &str) -> Result<()> {
+        let deadline = Instant::now() + self.budget;
+        let mut backoff = self.interval;
+        loop {
+            match self.try_capture(org, id) {
+                Ok(()) => return Ok(()),
+                Err(err) if transient_call(&err) => {
+                    if Instant::now() >= deadline || self.pause(backoff) {
+                        if self.released() {
+                            return Err(Error::rejected("devin cloud post interrupted"));
+                        }
+                        return Err(self.held_before_post(&err));
+                    }
+                    backoff = (backoff * 2).min(Duration::from_secs(5));
+                }
+                Err(err) => {
+                    let msg = call_text(&err);
+                    self.note(&msg);
+                    return Err(Error::provider(format!(
+                        "devin cloud message refused before post, nothing posted: {msg}"
+                    )));
+                }
+            }
+        }
+    }
+
+    fn held_before_post(&self, err: &CallErr) -> Error {
+        let msg = call_text(err);
+        self.note(&msg);
+        Error::unknown(format!(
+            "devin cloud poll held last state ({}): {msg}",
+            self.last_state()
+        ))
     }
 
     fn post_message(&self, text: &str) -> Result<()> {
@@ -604,7 +686,7 @@ impl DevinCloudAdapter {
                 .ok_or_else(|| Error::rejected("devin cloud has no session to message"))?;
             (st.org.clone(), id)
         };
-        self.capture_post_marker();
+        self.ensure_post_marker(&org, &id)?;
         let path = self.org_path(&org, &format!("/{}/messages", encode(&id)));
         let body = json!({"message": text});
         match self.call("POST", &path, Some(&body)) {
@@ -1084,6 +1166,13 @@ fn call_text(err: &CallErr) -> String {
     }
 }
 
+fn transient_call(err: &CallErr) -> bool {
+    match err {
+        CallErr::Transport(_) | CallErr::Status(429, _) => true,
+        CallErr::Status(code, _) => *code >= 500,
+    }
+}
+
 fn encode(segment: &str) -> String {
     let mut out = String::new();
     for b in segment.bytes() {
@@ -1144,7 +1233,7 @@ fn repo_enabled(body: &Value, owner: &str, name: &str) -> bool {
 
 /// Docs show a `devin-` path id. A live list on 2026-09-23 returned a
 /// 32-hex `session_id` with no prefix, and GET accepted that value.
-fn valid_session_id(id: &str) -> bool {
+pub(crate) fn valid_session_id(id: &str) -> bool {
     (id.starts_with("devin-") && id.len() > "devin-".len())
         || (id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
@@ -1390,7 +1479,6 @@ fn create_claim(alias: &str) -> String {
 
 struct MessageList {
     items: Vec<Value>,
-    total: Option<i64>,
 }
 
 fn is_devin(message: &Value) -> bool {
@@ -1510,6 +1598,9 @@ mod tests {
         StaleWait,
         ShaWait,
         Paged,
+        MarkerMiss,
+        CursorTail,
+        DeepTail,
     }
 
     struct Hit {
@@ -1747,6 +1838,34 @@ mod tests {
                     }
                 }
             }
+            Script::MarkerMiss => {
+                if posts == 0 {
+                    working("devin-created")
+                } else {
+                    Scene {
+                        id: "devin-created",
+                        status: "running",
+                        detail: "finished",
+                        items: vec![devin_msg("evt-old", &sha)],
+                        with_pr: false,
+                        split: None,
+                    }
+                }
+            }
+            Script::CursorTail => {
+                if posts == 0 {
+                    working("devin-created")
+                } else {
+                    Scene {
+                        id: "devin-created",
+                        status: "running",
+                        detail: "finished",
+                        items: vec![devin_msg("evt-old", "earlier"), devin_msg("evt-sha", &sha)],
+                        with_pr: false,
+                        split: None,
+                    }
+                }
+            }
             _ => {
                 if posts == 0 {
                     working("devin-created")
@@ -1778,6 +1897,82 @@ mod tests {
         hits.iter()
             .filter(|hit| hit.method == "POST" && hit.path.contains("/messages"))
             .count()
+    }
+
+    fn marker_miss_messages(hits: &[Hit]) -> (u16, String) {
+        let n = hits
+            .iter()
+            .filter(|hit| hit.method == "GET" && hit.path.contains("/messages"))
+            .count();
+        let posts = message_posts(hits);
+        // Turn 2's capture is the third messages GET, before its POST.
+        if posts == 1 && n == 3 {
+            return (429, json!({"error": KEY}).to_string());
+        }
+        if posts == 0 {
+            return (200, message_page(&[], false, None, 0));
+        }
+        let sha = format!("SHA: {SHA}");
+        (
+            200,
+            message_page(&[devin_msg("evt-old", &sha)], false, Some("cur-a"), 1),
+        )
+    }
+
+    fn cursor_tail_messages(path: &str, hits: &[Hit]) -> (u16, String) {
+        let sha = format!("SHA: {SHA}");
+        if message_posts(hits) == 0 {
+            return (200, message_page(&[], false, None, 0));
+        }
+        if path.contains("after=") {
+            return (
+                200,
+                message_page(&[devin_msg("evt-sha", &sha)], false, None, 2),
+            );
+        }
+        (
+            200,
+            message_page(
+                &[devin_msg("evt-old", "earlier")],
+                true,
+                Some("cur-stored"),
+                2,
+            ),
+        )
+    }
+
+    fn deep_page(path: &str) -> String {
+        let sha = format!("SHA: {SHA}");
+        let page = path
+            .split("after=p")
+            .nth(1)
+            .and_then(|rest| rest.split(['&', ' ']).next())
+            .and_then(|text| text.parse::<usize>().ok())
+            .unwrap_or(0);
+        if page >= 20 {
+            return message_page(&[devin_msg("evt-sha", &sha)], false, None, 2001);
+        }
+        let items: Vec<Value> = (0..100)
+            .map(|index| devin_msg(&format!("p{page}-{index}"), "older"))
+            .collect();
+        let cursor = format!("p{}", page + 1);
+        message_page(&items, true, Some(&cursor), 2001)
+    }
+
+    fn deep_tail_reply(path: &str, hits: &[Hit]) -> (u16, String) {
+        if path.contains("/messages") {
+            if message_posts(hits) == 0 {
+                return (200, message_page(&[], false, None, 0));
+            }
+            return (200, deep_page(path));
+        }
+        let tail = hits.iter().any(|hit| hit.path.contains("after=p20"));
+        let (status, detail) = if tail {
+            ("running", "finished")
+        } else {
+            ("running", "working")
+        };
+        (200, session_state("devin-created", status, detail, false))
     }
 
     fn reply(script: Script, method: &str, path: &str, hits: &[Hit]) -> Option<(u16, String)> {
@@ -1833,6 +2028,15 @@ mod tests {
             }
             if matches!(script, Script::Adopt404) {
                 return Some((404, json!({"error": "not found"}).to_string()));
+            }
+            if matches!(script, Script::DeepTail) {
+                return Some(deep_tail_reply(path, hits));
+            }
+            if matches!(script, Script::MarkerMiss) && path.contains("/messages") {
+                return Some(marker_miss_messages(hits));
+            }
+            if matches!(script, Script::CursorTail) && path.contains("/messages") {
+                return Some(cursor_tail_messages(path, hits));
             }
             let view = scene(script, hits);
             if path.contains("/messages") {
@@ -1969,10 +2173,17 @@ mod tests {
     }
 
     fn adapter_for(script: Script) -> Harness {
+        adapter_for_timed(script, "40", "400")
+    }
+
+    fn adapter_for_timed(script: Script, interval_ms: &str, budget_ms: &str) -> Harness {
         let (base, mock) = start_mock(script);
         let events = Arc::new(Mutex::new(Vec::new()));
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let adapter = DevinCloudAdapter::new(hooks(&events, &requests), &env_at(&base));
+        let env = env_at(&base);
+        env.set("CADENCE_DEVIN_POLL_INTERVAL_MS", interval_ms);
+        env.set("CADENCE_DEVIN_POLL_BUDGET_MS", budget_ms);
+        let adapter = DevinCloudAdapter::new(hooks(&events, &requests), &env);
         Harness {
             adapter,
             mock,
@@ -2259,6 +2470,71 @@ mod tests {
                 && hit.path.contains("/sessions/")
                 && !hit.path.contains("/messages")
         }));
+    }
+
+    #[test]
+    fn marker_capture_miss_does_not_bind_an_older_sha() {
+        let Harness { adapter, mock, .. } = adapter_for(Script::MarkerMiss);
+        adapter
+            .open(&agent(json!({"repos": ["favcrm/cadence"]})))
+            .unwrap();
+        let first = adapter.run_turn("revision one", "turn-1", &|_| {}).unwrap();
+        assert!(first.text.contains(SHA), "{}", first.text);
+        let second = adapter.run_turn("revision two", "turn-2", &|_| {});
+        match second {
+            Ok(turn) => panic!(
+                "turn 2 completed with revision 1's SHA (status {}): {}",
+                turn.status, turn.text
+            ),
+            Err(err) => assert!(!err.to_string().contains(SHA), "{err}"),
+        }
+        let posts = mock
+            .hits
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|hit| hit.method == "POST" && hit.path.contains("/messages"))
+            .count();
+        assert_eq!(posts, 2, "a known marker must still allow the post");
+    }
+
+    #[test]
+    fn poll_uses_the_stored_messages_cursor() {
+        let Harness { adapter, mock, .. } = adapter_for(Script::CursorTail);
+        adapter
+            .open(&agent(json!({"repos": ["favcrm/cadence"]})))
+            .unwrap();
+        let turn = adapter.run_turn("do the task", "turn-1", &|_| {}).unwrap();
+        assert!(turn.text.contains(SHA), "{}", turn.text);
+        let before = mock.hits.lock().unwrap().len();
+        adapter.poll_settled().unwrap();
+        let hits = mock.hits.lock().unwrap();
+        let messages: Vec<_> = hits[before..]
+            .iter()
+            .filter(|hit| hit.method == "GET" && hit.path.contains("/messages"))
+            .collect();
+        assert_eq!(messages.len(), 1, "poll refetched message history");
+        assert!(
+            messages[0].path.contains("after=cur-stored"),
+            "{}",
+            messages[0].path
+        );
+    }
+
+    #[test]
+    fn messages_past_two_thousand_are_seen() {
+        let Harness { adapter, mock, .. } = adapter_for_timed(Script::DeepTail, "10", "3000");
+        adapter
+            .open(&agent(json!({"repos": ["favcrm/cadence"]})))
+            .unwrap();
+        let turn = adapter.run_turn("do the task", "turn-1", &|_| {}).unwrap();
+        assert_eq!(turn.status, "completed");
+        assert!(turn.text.contains(SHA), "{}", turn.text);
+        let hits = hits_of(&mock);
+        assert!(
+            hits.iter().any(|hit| hit.path.contains("after=p20")),
+            "the page after 2,000 messages was never requested"
+        );
     }
 
     #[test]

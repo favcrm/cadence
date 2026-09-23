@@ -6456,9 +6456,28 @@ fn path_boundary(prev: Option<u8>) -> bool {
     )
 }
 
-/// Drop absolute host paths and `~/` paths so a cloud session is not
-/// pointed at a machine-local file. Paths after a space, newline,
-/// backtick, quote, or `(` are included. `https://` URLs are left intact.
+/// A path is machine-local when it is `~/...` or an absolute path whose
+/// first segment is not an API version (`/v3/...`, `/v3beta1/...`).
+/// That drops `/home`, `/tmp`, `/var`, `/etc`, and other host paths
+/// such as `/secret/...`, and keeps a backticked Devin API path.
+fn local_path(token: &str) -> bool {
+    if token.starts_with("~/") || token == "~" {
+        return true;
+    }
+    if !token.starts_with('/') {
+        return false;
+    }
+    let segment = token[1..].split(['/', '?', '#']).next().unwrap_or("");
+    let api = segment.len() >= 2
+        && segment.as_bytes()[0] == b'v'
+        && segment.as_bytes()[1].is_ascii_digit();
+    !api
+}
+
+/// Drop machine-local paths so a cloud session is not pointed at a host
+/// file. Paths after a space, newline, backtick, quote, or `(` are
+/// included. API paths (`/v3/organizations/...`) and `https://` URLs
+/// stay.
 pub fn omit_host_paths(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
@@ -6482,18 +6501,17 @@ pub fn omit_host_paths(text: &str) -> String {
                 None
             });
         let url = prev == Some(b':');
-        if tilde || (path_boundary(prev) && !url) {
-            let start = if tilde { index - 1 } else { index };
+        let start = if tilde { index - 1 } else { index };
+        let token = text[start..]
+            .split_whitespace()
+            .next()
+            .unwrap_or(&text[start..]);
+        if (tilde || (path_boundary(prev) && !url)) && local_path(token) {
             if tilde {
                 out.pop();
             }
             out.push_str("(omitted)");
-            let token = text[start..]
-                .split_whitespace()
-                .next()
-                .map(str::len)
-                .unwrap_or(text.len() - start);
-            index = start + token;
+            index = start + token.len();
         } else {
             out.push('/');
             index += 1;
@@ -6517,6 +6535,12 @@ fn take_bytes(text: &str, limit: usize) -> String {
     }
     text[..end].to_string()
 }
+
+/// The report contract. Reserved before any cut so a long acceptance
+/// or spec cannot chop this suffix.
+const SHA_TRAILER: &str = " Report when done: end your final answer with a one-line summary \
+followed by a last line `SHA: <40-hex>` naming the commit you produced — the daemon reads \
+that line as the reported revision. Do not report a SHA you have not committed.";
 
 /// Cloud sessions cannot read the host spec path or run `cadence self`.
 /// The spec text is inlined and the `SHA:` trailer stays the report contract.
@@ -6545,32 +6569,26 @@ fn cloud_kickoff_body(job: &Job, task: &Task, revision: i64) -> String {
         .as_deref()
         .map(|id| format!(" This job tracks issue {id}."))
         .unwrap_or_default();
-    let assemble = |spec_text: &str| {
-        format!(
-            "Cadence task {} (job {}, revision {}). You are a Devin cloud session and cannot \
-             read host paths or invoke the cadence CLI. Spec text follows. {spec_text}.{scope}{acceptance}{issue} \
-             Report when done: end your final answer with a one-line summary followed by a last \
-             line `SHA: <40-hex>` naming the commit you produced — the daemon reads that line as \
-             the reported revision. Do not report a SHA you have not committed.",
-            task.id, job.id, revision
-        )
-    };
-    let full = assemble(&cleaned);
-    if full.len() <= ENQUEUE_BYTES {
-        return full;
-    }
-    let bare = assemble("");
-    let room = ENQUEUE_BYTES
-        .saturating_sub(bare.len())
-        .saturating_sub(SPEC_NOTE.len());
-    let mut spec_text = take_bytes(&cleaned, room);
-    spec_text.push_str(SPEC_NOTE);
-    let body = assemble(&spec_text);
-    if body.len() <= ENQUEUE_BYTES {
-        body
+    let head = format!(
+        "Cadence task {} (job {}, revision {}). You are a Devin cloud session and cannot \
+         read host paths or invoke the cadence CLI. Spec text follows. ",
+        task.id, job.id, revision
+    );
+    let bridge = format!(".{scope}{issue}");
+    let fixed = head.len() + bridge.len() + SHA_TRAILER.len();
+    let budget = ENQUEUE_BYTES.saturating_sub(fixed);
+    let spec_len = cleaned.len();
+    let (spec_text, accept_text) = if spec_len + acceptance.len() <= budget {
+        (cleaned, acceptance)
+    } else if spec_len <= budget {
+        let accept_text = take_bytes(&acceptance, budget - spec_len);
+        (cleaned, accept_text)
     } else {
-        take_bytes(&body, ENQUEUE_BYTES)
-    }
+        let mut spec_text = take_bytes(&cleaned, budget.saturating_sub(SPEC_NOTE.len()));
+        spec_text.push_str(SPEC_NOTE);
+        (spec_text, String::new())
+    };
+    format!("{head}{spec_text}{bridge}{accept_text}{SHA_TRAILER}")
 }
 
 fn kickoff_correlation(message_id: &str) -> String {
@@ -8144,6 +8162,56 @@ mod tests {
     }
 
     #[test]
+    fn cloud_kickoff_keeps_the_sha_trailer_when_acceptance_is_long() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = dir.path().join("spec.md");
+        std::fs::write(&spec, "Keep this short spec sentence.").unwrap();
+        let job = Job {
+            id: "j1".into(),
+            title: None,
+            spec_path: spec.display().to_string(),
+            spec_sha256: None,
+            pm_alias: "pm".into(),
+            issue_id: None,
+            repo: None,
+            base_ref: None,
+            state: "open".into(),
+            max_revisions: 2,
+            stall_secs: None,
+            error: None,
+            created: 0.0,
+            updated: 0.0,
+        };
+        let task = Task {
+            id: "t1".into(),
+            job_id: "j1".into(),
+            title: None,
+            role: "worker".into(),
+            assignee: Some("cloud-1".into()),
+            spec_path: Some(spec.display().to_string()),
+            acceptance: Some("A".repeat(60_000)),
+            worktree: None,
+            branch: None,
+            base_sha: None,
+            head_sha: None,
+            state: "draft".into(),
+            revision: 0,
+            dispatch_message: None,
+            error: None,
+            created: 0.0,
+            updated: 0.0,
+        };
+        let body = cloud_kickoff_body(&job, &task, 1);
+        assert!(body.len() <= 48_000, "kickoff is {} bytes", body.len());
+        assert!(body.contains("Keep this short spec sentence."), "{body}");
+        assert!(
+            body.ends_with("Do not report a SHA you have not committed."),
+            "{body}"
+        );
+        assert!(body.contains("`SHA: <40-hex>`"), "{body}");
+    }
+
+    #[test]
     fn cloud_omit_host_paths_strips_a_backticked_path() {
         let text = "see `/home/ubuntu/secret` and \"/tmp/x\" and (~/notes/a) plus ~/bare and https://example.com/a";
         let out = omit_host_paths(text);
@@ -8153,6 +8221,19 @@ mod tests {
         assert!(!out.contains("~/bare"), "{out}");
         assert!(out.contains("https://example.com/a"), "{out}");
         assert!(out.contains("see"), "{out}");
+    }
+
+    #[test]
+    fn cloud_omit_host_paths_keeps_a_versioned_api_path() {
+        let text = "call `/v3/organizations/acme/sessions` and `/v3beta1/organizations/acme/repositories` but not `/var/www/notes` or `/etc/hosts`";
+        let out = omit_host_paths(text);
+        assert!(out.contains("/v3/organizations/acme/sessions"), "{out}");
+        assert!(
+            out.contains("/v3beta1/organizations/acme/repositories"),
+            "{out}"
+        );
+        assert!(!out.contains("/var/www/notes"), "{out}");
+        assert!(!out.contains("/etc/hosts"), "{out}");
     }
 
     #[test]

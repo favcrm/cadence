@@ -7222,9 +7222,10 @@ mod tests {
                     } else {
                         json!([{"event_id": "evt-1", "source": "devin", "message": format!("done\nSHA: {SHA}"), "created_at": 1}])
                     };
+                    let total = items.as_array().map(|rows| rows.len()).unwrap_or(0);
                     (
                         200,
-                        json!({"items": items, "has_next_page": false, "end_cursor": null, "total": 1})
+                        json!({"items": items, "has_next_page": false, "end_cursor": null, "total": total})
                             .to_string(),
                     )
                 } else if method == "GET" && path.contains("/sessions/") {
