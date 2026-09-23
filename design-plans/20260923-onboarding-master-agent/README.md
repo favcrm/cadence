@@ -34,7 +34,7 @@ Markdown files; when they disagree, the Markdown wins.
 |---|---|
 | Setup wizard (start, environment, platforms, master, workspace, team, launch) | `cadence setup --json`, `cadence restore` (CAD-312, CAD-314, CAD-327) |
 | Chat thread; plan, permission and effect cards | threads + payload events, broker, effect gate (CAD-319, CAD-328, CAD-366) |
-| Teams & roles: Org, Roles, Agents, Reports | `vault/agents/<slug>/` files, reports (CAD-338, CAD-341, CAD-343) |
+| Agents: definitions, sessions, reports | `agents/<slug>/` files, sessions, reports (CAD-338, CAD-341, CAD-343) |
 | Company vault: lessons, queue, context packs | vault writer, curator, pack builder (CAD-346, CAD-349, CAD-351, CAD-357) |
 | Platforms, access matrix, AgenticOS connect | platform proxy, AOS-49 (CAD-365–CAD-369) |
 | Settings → Data & backup, Sandbox | `cadence backup/export/restore`, `cadence sandbox` (CAD-314, CAD-310) |

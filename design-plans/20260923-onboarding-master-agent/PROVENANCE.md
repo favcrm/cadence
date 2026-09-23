@@ -33,6 +33,9 @@ Preview host path: `preview.simplebuild.site/20260923-091413/cadence-onboarding/
 | 2026-09-23 | Organization: one master; one PM per team; dev, QA, DevOps | operator | accepted | PLAN.md |
 | 2026-09-23 | Go: commit, file tickets, start P0 with the sandbox | operator | accepted | CAD-309..333 |
 | 2026-09-23 | #1 Agents as folders `agents/<slug>/` with SOUL.md, AGENT.md, MEMORY.md; all information in Markdown | operator direction | design record proposed | AGENT-FILESYSTEM.md, CAD-338 |
+| 2026-09-23 | No role layer: an agent is the definition and runs many sessions | operator direction | in the record | AGENT-FILESYSTEM.md |
+| 2026-09-23 | No teams for now: staffing (agents × sessions) lives in `PROJECT.md` | operator direction | in the record | AGENT-FILESYSTEM.md |
+| 2026-09-23 | Project artifacts in `projects/<slug>/` — `shared/` and `tickets/<ID>/`; migration of today's paths | advised | awaiting operator choice | AGENT-FILESYSTEM.md |
 | 2026-09-23 | #2 Memory policy: logic checks + cross-vendor curator (project/role), quorum (company), external quarantine | operator | approved; ADR text pending | LEARNING-LOOP.md, CAD-347 |
 | 2026-09-23 | #3 Unblock memory: one daemon identity check for all agents; trust matrix provenance × evidence; clear the 11 stuck proposals | operator | confirmed 2026-09-23 | LEARNING-LOOP.md, CAD-381, CAD-382, CAD-260 |
 

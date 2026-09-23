@@ -46,9 +46,9 @@ Install → wizard → chat with a master that remembers.
 | CAD-327 | Setup wizard: start (fresh/restore/tracker/import), environment, platforms, master, workspace, team, launch | backlog | P2 | new |
 | CAD-328 | Chat-first Home: thread, plan/permission/effect cards, Needs-you rail, since-you-left | backlog | P2 | new |
 
-## M2 · One governed team (Team)
+## M2 · One governed project (Team)
 
-Master → one team (PM, dev, QA, DevOps) from agent files; plans, dispatch gate, fresh-context reviews, typed reports, questions that climb.
+Master → one project staffed from agent files (PM, dev, QA, DevOps sessions); plans, dispatch gate, fresh-context reviews, typed reports, questions that climb.
 
 - **Exit test:** A 3-issue plan lands with verdicts pinned to each head, a report per job, and one question answered at the lowest level.
 - **Depends on:** M1 for the UI; daemon work can start now
@@ -118,9 +118,9 @@ Verified memory in a Markdown company vault; context packs; learning metrics.
 | CAD-381 | One identity verifier for every daemon-launched endpoint (pty and managed): reuse the CAD-230 enrollment for memory, reviews and reports | backlog | P1 | new |
 | CAD-382 | Clear the stuck memory backlog: the 11 proposed lessons become agent-claimed candidates and run checks → curator → operator queue | backlog | P1 | new |
 
-## M4 · Many teams (Team)
+## M4 · Many projects (Team)
 
-Several teams under one master: capacity, quota, isolation, digest.
+Several projects under one master: capacity, quota, isolation, digest.
 
 - **Exit test:** Two teams on different projects run concurrently with no cross-team leakage.
 - **Depends on:** M2

@@ -26,7 +26,7 @@ Date: 2026-09-23. Status: proposal; readable source of the Direction tab in
 
 > Cadence is the open-source control plane that turns the coding agents you
 > already pay for into a governed team that learns. One master plans with you,
-> team PMs run the work, workers from any vendor deliver, an independent reviewer
+> PM sessions run each project, workers from any vendor deliver, an independent reviewer
 > checks every commit, verified lessons make the next task cheaper, and nothing
 > merges, sends or deploys without your approval. It runs on your machine.
 
@@ -56,7 +56,7 @@ Category: "agent delivery control plane". Avoid leading with "parallel agents",
 |---|---|---|
 | Now | Governed team that learns, on one machine | M0–M3 |
 | Next | Ship and see cost | M5 platforms; vendor cloud agents as workers (Codex cloud, Jules, Cursor cloud agents, Devin cloud — CAD-243); cost per plan |
-| Later | Many teams and self-improvement | M4, M6; scorecards drive routing; hosted runtime inside AgenticOS |
+| Later | Many projects and self-improvement | M4, M6; scorecards drive routing; hosted runtime inside AgenticOS |
 
 Strategic move: treat vendor orchestrators as **workers**. When Claude Projects
 or Codex cloud run a sub-goal, Cadence still owns the plan, the independent

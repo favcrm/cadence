@@ -59,7 +59,7 @@ records [agent filesystem](../../docs/design/AGENT-FILESYSTEM.md) and
 | Layer | Holds | Where |
 |---|---|---|
 | Decisions and work | Projects, plans, issues, verdict refs | `~/pm` git (unchanged) |
-| Company brain | Agents, roles, teams, lessons, decisions, FAQ | `~/pm/vault` — Markdown in git |
+| Company brain | Agents, teams, lessons, decisions, FAQ, project artifacts | `~/pm` — Markdown in git |
 | Runtime | Agents, messages, jobs, monitors | `cadence.sqlite3` |
 | Threads | Conversations and payload events | store tables |
 | Read model | Issue index, overview aggregates | store, rebuilt from git |
@@ -74,7 +74,7 @@ every update), `cadence export --bundle` (no credentials, secret-scanned),
   frontmatter: issues, acceptance, dependencies, roles, risk class); plan card in
   the thread; approval is a tracker commit; the daemon refuses dispatch outside an
   approved plan with a named reason (CAD-360).
-- Staffing from agent files (CAD-361), write leases per code area (CAD-378),
+- Sessions started from agent files (CAD-361), write leases per code area (CAD-378),
   fresh-context reviewer routing (CAD-362), merges and effects in Needs-you
   (CAD-363), terminal view (CAD-364).
 
@@ -113,7 +113,7 @@ and that the profile must be anchored to the state dir; round 2 is in progress.
 | Overview | Home rail: Needs you, active work, since you left, learning |
 | Board | Projects → list / board / plans / context |
 | Plan (static docs) | Project context |
-| Agents | Teams & roles → Org, Roles (agent files), Agents, Reports |
+| Agents | Agents → definitions (SOUL, AGENT, MEMORY), sessions, reports |
 | Memory | Company vault → company, teams & projects, playbooks, lessons, decisions, FAQ, verification queue, context packs |
 | Settings | Models → agent files; Providers, Autonomy, Platforms, Data, Access, Sandbox |
 
