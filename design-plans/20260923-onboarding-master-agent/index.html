@@ -355,6 +355,30 @@ ul.tight{padding-left:18px;margin:6px 0}ul.tight li{margin:3px 0}
 .stor{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
 .stor div{border:1px solid var(--line);border-radius:10px;padding:10px 12px;background:var(--bg2)}
 .stor b{display:block;font:600 18px "IBM Plex Mono";color:var(--strong)}
+.orgtop{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.orgarrow{color:var(--mute);font-family:"IBM Plex Mono"}
+.teams{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px}
+.mrow{display:grid;grid-template-columns:24px minmax(0,1fr);gap:9px;align-items:center;padding:7px 14px;border-bottom:1px solid var(--line)}
+.newteam{display:flex;flex-direction:column;align-items:flex-start;justify-content:center;gap:4px;padding:16px;border-style:dashed;color:var(--strong);font-weight:600;text-align:left}
+.newteam span{font-weight:400;font-size:12.5px}
+.six{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:10px}
+.six div{border:1px solid var(--line);border-radius:9px;padding:8px 10px;background:var(--bg2);font-size:12.5px}
+.six b{display:block;font:500 10.5px "IBM Plex Mono";letter-spacing:.07em;text-transform:uppercase;color:var(--mute);margin-bottom:2px}
+.six .lesson{grid-column:1/-1;border-color:var(--accent);background:var(--accent-dim)}
+.q{font-size:14px;color:var(--strong);margin:10px 0 6px}
+.route{display:flex;gap:6px;align-items:center;flex-wrap:wrap;font:12px "IBM Plex Mono";color:var(--soft)}
+.route span{border:1px solid var(--line2);border-radius:6px;padding:1px 7px}.route i{color:var(--mute);font-style:normal}
+.vhead{display:flex;align-items:center;gap:12px;padding:14px 16px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+.vbadge{margin-left:6px;font:500 10.5px "IBM Plex Mono";background:var(--warn-dim);color:var(--warn);border-radius:999px;padding:1px 7px}
+.set.vault .sb{max-width:none}
+.pipe{display:flex;gap:6px;flex-wrap:wrap;align-items:center;font-size:12.5px}
+.pipe span{border:1px solid var(--line2);border-radius:8px;padding:5px 9px;background:var(--panel)}.pipe i{color:var(--mute);font-style:normal}
+.pre{background:var(--bg2);border:1px solid var(--line);border-radius:10px;padding:12px 14px;font:12px/1.6 "IBM Plex Mono";white-space:pre-wrap;color:var(--soft);overflow-wrap:anywhere}
+.device.narrow .six{grid-template-columns:1fr 1fr}
+@media (max-width:760px){.six{grid-template-columns:1fr 1fr}}
+#tabseg{overflow-x:auto;max-width:100%;scrollbar-width:none}
+#tabseg button{flex:none}
+@media (max-width:1100px){.chrome{flex-wrap:wrap}#tabseg{order:5;width:100%}}
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style>
 </head>
@@ -362,10 +386,12 @@ ul.tight{padding-left:18px;margin:6px 0}ul.tight li{margin:3px 0}
 <div class="chrome">
   <div class="brand">
     <svg width="22" height="22" viewBox="0 0 1024 1024" aria-hidden="true"><rect width="1024" height="1024" rx="224" fill="#0B0B0C"/><path d="M232 336 416 512 232 688" fill="none" stroke="#2DD4BF" stroke-opacity=".55" stroke-width="120" stroke-linecap="round" stroke-linejoin="round"/><path d="M408 336 592 512 408 688" fill="none" stroke="#2DD4BF" stroke-width="120" stroke-linecap="round" stroke-linejoin="round"/><rect x="656" y="656" width="160" height="64" rx="32" fill="#2DD4BF" fill-opacity=".7"/></svg>
-    <span class="bname">Cadence</span> <small>· plan, direction &amp; prototype — v3</small>
+    <span class="bname">Cadence</span> <small>· plan, roadmap, research &amp; prototype — v4</small>
   </div>
-  <div class="seg" role="group" aria-label="View">
+  <div class="seg" role="group" aria-label="View" id="tabseg">
     <button data-act="tab" data-v="plan" aria-pressed="true">Plan</button>
+    <button data-act="tab" data-v="roadmap" aria-pressed="false">Roadmap</button>
+    <button data-act="tab" data-v="research" aria-pressed="false">Research</button>
     <button data-act="tab" data-v="direction" aria-pressed="false">Direction</button>
     <button data-act="tab" data-v="proposal" aria-pressed="false">Details</button>
     <button data-act="tab" data-v="proto" aria-pressed="false">Prototype</button>
@@ -381,61 +407,427 @@ ul.tight{padding-left:18px;margin:6px 0}ul.tight li{margin:3px 0}
 </div>
 
 <main id="plan">
-<div class="doc" style="grid-template-columns:minmax(0,1fr);max-width:1080px">
+<div class="doc">
+  <nav class="toc" aria-label="Plan contents">
+    <div class="k">Plan</div>
+    <a href="#p-org">One company, many teams</a>
+    <a href="#p-learn">How the team learns</a>
+    <a href="#p-roles">Roles</a>
+    <a href="#p-rules">Operating rules</a>
+    <a href="#p-ms">Milestones</a>
+    <a href="#p-dec">Decisions</a>
+    <a href="#p-not">What we won't do</a>
+  </nav>
   <article>
     <section class="hero">
-      <div class="kicker">Plan on a page · 2026-09-23</div>
-      <h1>Your AI dev team, on your machine.</h1>
-      <p class="lede">Cadence turns the coding agents you already pay for into one team: a <b>master agent you chat with</b> plans the work, <b>workers deliver it</b>, an <b>independent reviewer verifies it</b>, and <b>you approve what matters</b>. Local-first, provider-neutral, and it remembers everything.</p>
-      <div class="journey">
-        <div><span class="s">01</span><b>Install</b>one command or agent prompt</div>
-        <div><span class="s">02</span><b>Start</b>fresh · restore · import</div>
-        <div><span class="s">03</span><b>Plan</b>chat → plan card → approve</div>
-        <div><span class="s">04</span><b>Deliver</b>workers · review · merge</div>
-        <div><span class="s">05</span><b>Ship</b>platform effects you press</div>
-      </div>
-      <p style="margin-top:18px"><button class="btn pri" data-act="tab" data-v="proto">Clickable prototype →</button> <button class="btn" data-act="tab" data-v="direction">Direction &amp; go-to-market →</button> <button class="btn ghost" data-act="tab" data-v="proposal">Full technical proposal</button></p>
+      <div class="kicker">Consolidated plan · v4 · 2026-09-23</div>
+      <h1>An autonomous dev team that learns — on your machine.</h1>
+      <p class="lede">One <b>master assistant</b> talks with you. It staffs <b>teams</b> — one PM each, with developers, QA and DevOps from the agents you already pay for — using a company <b>role catalog</b>. Every finished job, question or blocker produces a <b>report</b>; a <b>verifier</b> (deterministic checks plus a curator from a different vendor) turns reports into <b>verified memory</b> in a git <b>company vault</b>; every agent starts its next task with a small, cited <b>context pack</b> instead of re-reading. You approve what matters.</p>
+      <p style="margin-top:14px"><button class="btn pri" data-act="tab" data-v="proto">Clickable prototype →</button> <button class="btn" data-act="tab" data-v="roadmap">Milestones &amp; tickets →</button> <button class="btn" data-act="tab" data-v="research">State of the art →</button></p>
     </section>
 
-    <h2><span class="n">A</span>Five product pillars</h2>
+    <h2 id="p-org"><span class="n">01</span>One company, many teams</h2>
+    <div class="diagram" role="img" aria-label="Org: you direct the master; the master staffs teams (PM plus dev, QA, DevOps); teams report up; the curator verifies reports into the vault; the vault sends context packs down.">
+      <svg viewBox="0 0 980 360" font-family="IBM Plex Sans" font-size="12">
+        <defs><marker id="ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 10 5 0 10z" fill="var(--mute)"/></marker>
+        <marker id="ar3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 10 5 0 10z" fill="var(--accent)"/></marker></defs>
+        <rect x="20" y="145" width="120" height="64" rx="10" fill="var(--panel2)" stroke="var(--line2)"/><text x="36" y="172" fill="var(--strong)" font-weight="600">You</text><text x="36" y="190" fill="var(--mute)">goals · approvals</text>
+        <rect x="180" y="135" width="198" height="84" rx="10" fill="var(--accent-dim)" stroke="var(--accent)"/><text x="194" y="160" fill="var(--strong)" font-weight="600">Master · assistant</text><text x="194" y="178" fill="var(--soft)">staffs teams, routes questions</text><text x="194" y="196" fill="var(--mute)">never implements</text>
+        <line x1="140" y1="177" x2="178" y2="177" stroke="var(--mute)" marker-end="url(#ar2)"/>
+        <rect x="410" y="24" width="330" height="140" rx="10" fill="var(--panel2)" stroke="var(--line2)"/>
+        <text x="426" y="48" fill="var(--strong)" font-weight="600">Reminders team</text><text x="560" y="48" fill="var(--mute)">approve-plans</text>
+        <rect x="426" y="60" width="298" height="30" rx="7" fill="var(--panel)" stroke="var(--line2)"/><text x="438" y="80" fill="var(--strong)">PM</text><text x="470" y="80" fill="var(--mute)">plan · dispatch · collect reports · escalate</text>
+        <g font-size="11.5"><rect x="426" y="100" width="92" height="26" rx="6" fill="var(--panel)" stroke="var(--line2)"/><text x="438" y="118" fill="var(--soft)">Dev × 4</text>
+        <rect x="528" y="100" width="92" height="26" rx="6" fill="var(--panel)" stroke="var(--line2)"/><text x="540" y="118" fill="var(--soft)">QA</text>
+        <rect x="630" y="100" width="94" height="26" rx="6" fill="var(--panel)" stroke="var(--line2)"/><text x="642" y="118" fill="var(--soft)">DevOps</text></g>
+        <text x="426" y="152" fill="var(--mute)" font-size="11">one writer per code area · fresh-context QA</text>
+        <rect x="410" y="196" width="330" height="110" rx="10" fill="var(--panel2)" stroke="var(--line2)"/>
+        <text x="426" y="220" fill="var(--strong)" font-weight="600">Storefront team</text><text x="560" y="220" fill="var(--mute)">ask-for-everything</text>
+        <rect x="426" y="232" width="298" height="30" rx="7" fill="var(--panel)" stroke="var(--line2)"/><text x="438" y="252" fill="var(--strong)">PM</text><text x="470" y="252" fill="var(--mute)">… same roles from the catalog</text>
+        <text x="426" y="290" fill="var(--mute)" font-size="11">teams never share worktrees or project memory</text>
+        <line x1="378" y1="160" x2="408" y2="100" stroke="var(--mute)" marker-end="url(#ar2)"/>
+        <line x1="378" y1="195" x2="408" y2="245" stroke="var(--mute)" marker-end="url(#ar2)"/>
+        <path d="M410 132 C 395 134, 388 140, 380 148" fill="none" stroke="var(--info)" stroke-dasharray="4 3" marker-end="url(#ar2)"/>
+        <text x="296" y="118" fill="var(--info)" font-size="10.5">reports · questions ↑</text>
+        <rect x="800" y="40" width="160" height="120" rx="10" fill="var(--accent-dim)" stroke="var(--accent)"/><text x="816" y="64" fill="var(--strong)" font-weight="600">Company vault</text><text x="816" y="84" fill="var(--soft)">handbook · roles</text><text x="816" y="100" fill="var(--soft)">lessons · decisions</text><text x="816" y="116" fill="var(--soft)">playbooks · FAQ</text><text x="816" y="140" fill="var(--mute)">git · ~/pm/vault</text>
+        <rect x="800" y="210" width="160" height="80" rx="10" fill="var(--panel2)" stroke="var(--line2)"/><text x="816" y="234" fill="var(--strong)" font-weight="600">Curator</text><text x="816" y="252" fill="var(--soft)">checks + verdict</text><text x="816" y="270" fill="var(--mute)">≠ proposer's vendor</text>
+        <line x1="740" y1="250" x2="798" y2="250" stroke="var(--info)" stroke-dasharray="4 3" marker-end="url(#ar2)"/><text x="744" y="242" fill="var(--info)" font-size="10.5">reports</text>
+        <line x1="880" y1="210" x2="880" y2="162" stroke="var(--mute)" marker-end="url(#ar2)"/><text x="886" y="190" fill="var(--mute)" font-size="10.5">verified</text>
+        <path d="M800 100 C 770 100, 760 90, 742 90" fill="none" stroke="var(--accent)" marker-end="url(#ar3)"/><text x="747" y="82" fill="var(--accent)" font-size="10.5">packs</text>
+        <text x="20" y="340" fill="var(--mute)" font-family="IBM Plex Mono" font-size="11">RESPONSIBILITY FLOWS DOWN · REPORTS FLOW UP · MEMORY FLOWS IN, VERIFIED</text>
+      </svg>
+    </div>
     <div class="cards">
-      <div class="card"><h4>1 · One-command start</h4><p><code>curl | sh</code> or a paste-in agent prompt → <code>cadence setup</code> → browser wizard. Linux + macOS.</p></div>
-      <div class="card"><h4>2 · A master that remembers</h4><p>Chat with Claude, Codex or Pi. Conversations live in Cadence, not the provider session; restore, import and backups mean nobody starts empty.</p></div>
-      <div class="card"><h4>3 · Plans you approve, work that is verified</h4><p>Plan cards, daemon-enforced dispatch gate, independent reviewer, verdicts pinned to the exact commit.</p></div>
-      <div class="card"><h4>4 · Any agent</h4><p>Claude, Codex, Pi, Cursor, Devin as workers — the subscriptions you already have. No lock-in.</p></div>
-      <div class="card"><h4>5 · Ship through platforms</h4><p>Generic platform contract; every send, publish, deploy or spend is an effect card you press. AgenticOS v2 and Cloudflare first.</p></div>
+      <div class="card"><h4>Responsibility down</h4><p>The master creates a team with a plan; you approve both. The PM owns the plan and dispatches inside it. One writer per code area; research and review run in parallel.</p></div>
+      <div class="card"><h4>Reports up</h4><p>Every job, question or blocker files a typed report: the six-field reflection, evidence, constraints copied verbatim, and feedback on the context it was given.</p></div>
+      <div class="card"><h4>Questions climb, then stop</h4><p>Worker → PM → master → you. The vault is checked first; a question stops at the first level that can answer it, and every answer becomes a decision nobody asks twice.</p></div>
     </div>
 
-    <h2><span class="n">B</span>Must-have scope (MVP = P0–P3)</h2>
+    <h2 id="p-learn"><span class="n">02</span>How the team learns</h2>
+    <div class="diagram" role="img" aria-label="Learning loop: job, report, checks, curator, vault, context pack, back to the next job.">
+      <svg viewBox="0 0 980 190" font-family="IBM Plex Sans" font-size="12">
+        <g id="lloop"></g>
+      </svg>
+    </div>
     <div class="tblwrap"><table class="tbl">
-      <tr><th>Phase</th><th>Delivers</th><th>Exit test</th></tr>
-      <tr><td>P0 Foundation</td><td>Sandbox profile · release + <code>install.sh</code> + <code>setup --json</code> · operator auth (ADR) · macOS · backup / export / restore</td><td>Clean-machine CI installs on Linux + macOS; backup → restore round-trip; production daemon untouched</td></tr>
-      <tr><td>P1 Chat &amp; continuity</td><td>Threads store · payload events · Pi adapter · real interrupt · continuity packs · fast read model · wizard · chat Home</td><td>Kill the master's session mid-plan → it resumes with plan state; issues load &lt;300 ms</td></tr>
-      <tr><td>P2 Plans</td><td><code>project new</code> · <code>plan propose</code> · plan card · approval commit · dispatch gate</td><td>Unapproved dispatch refused with reason</td></tr>
-      <tr><td>P3 Delegation</td><td>Workers from approved plans · reviewer routing · merge in Needs-you · terminal view</td><td>3-issue plan lands with independent verdicts, one click per merge</td></tr>
-      <tr><td>P4 Platforms</td><td>Platform contract · proxy · effect gate · Cloudflare · AgenticOS v2 as AOS-14 lands</td><td>Preview deploy auto; production + sends wait for a press</td></tr>
-      <tr><td>P5 Autonomy dial</td><td>Routine merges auto per project</td><td>Only after CAD-225 is green</td></tr>
+      <tr><th>Step</th><th>What happens</th><th>Borrowed from</th></tr>
+      <tr><td>1 · Report</td><td>Typed claims (fact · strategy · pitfall · procedure · question) with evidence: file:line at a SHA, a command and its exit code, a test id. Failures produce pitfalls, not silence.</td><td>ReasoningBank, SWE-Exp, MAST</td></tr>
+      <tr><td>2 · Checks (logic)</td><td>Resolve citations at HEAD, re-run cited tests in a build slot, secret scan, de-duplicate, detect contradictions, tag external-derived content.</td><td>Copilot Memory, DGM's faked logs</td></tr>
+      <tr><td>3 · Curator</td><td>A different vendor from the proposer issues ADD / UPDATE / INVALIDATE / NOOP / ESCALATE. You see only company-scope promotions, conflicts and external content.</td><td>ACE, Mem0, self-preference study</td></tr>
+      <tr><td>4 · Vault</td><td>One item per file in git: scope, evidence, confidence, valid-from / invalidated-at, helpful and harmful counters. Contradictions invalidate; nothing is silently deleted.</td><td>Zep, Letta context repositories</td></tr>
+      <tr><td>5 · Context pack</td><td>At task start: role handbook excerpt, contract, a small index and the top cited items marked "verified at SHA" — re-checked at build, stale items withheld with a reason. Skills listed by name, loaded on demand.</td><td>Copilot Memory, Claude Code memory, Agent Skills</td></tr>
+      <tr><td>6 · Feedback</td><td>The next report marks each item used, helpful or wrong and lists files it still had to re-read. Harmful items demote automatically; unused items expire after 28 days.</td><td>ACE counters, Copilot Memory</td></tr>
+      <tr><td>7 · Consolidation</td><td>Nightly, the curator proposes a vault change as a reviewed diff: merge duplicates, retire stale items, draft skills — never an in-place rewrite.</td><td>Managed Agents Dreams, ACE</td></tr>
+      <tr><td>8 · Measure</td><td>A/B with and without packs on matched tasks: reuse, helpful and harm rates, stale rate, reads avoided, tokens and time, merges without rework.</td><td>Copilot's A/B, VibeMemBench</td></tr>
     </table></div>
 
-    <h2><span class="n">C</span>Decisions (defaults — change any)</h2>
+    <h2 id="p-roles"><span class="n">03</span>Roles — defined once, staffed per team</h2>
+    <p class="sub">Each role is a versioned file in the vault (<code>vault/company/roles/*.md</code>) compiled into each vendor's format at launch. Teams reference roles in <code>team.yaml</code> (ADR-0001).</p>
     <div class="tblwrap"><table class="tbl">
-      <tr><th>Topic</th><th>Default</th></tr>
-      <tr><td>Audience</td><td>Public developers, Linux + macOS</td></tr>
-      <tr><td>Autonomy</td><td>Plan freely, ask to dispatch; human merges and sends</td></tr>
-      <tr><td>Master</td><td>Structured providers (Claude, Codex, Pi) as equals; terminal agents are workers; pty is a view. Setup shows each provider's billing/terms note; only official binaries are driven</td></tr>
-      <tr><td>Continuity</td><td>Threads in Cadence; encrypted backup + status projection to platforms; no cloud authority</td></tr>
-      <tr><td>Platforms</td><td>Contract-first; Cloudflare own-account deploy first; AgenticOS device-code credential proposed under AOS-14</td></tr>
-      <tr><td>Tracker remote</td><td>Setup offers a private GitHub repo for <code>~/pm</code>, off by default</td></tr>
-      <tr><td>First build step</td><td>Sandbox profile, so everything else is tested without touching the live daemon</td></tr>
+      <tr><th>Role</th><th>Mandate</th><th>Preferred</th><th>Fallback</th><th>Staffing</th></tr>
+      <tr><td>Master · assistant</td><td>Talks with you; creates teams and plans; routes questions; daily digest. Never implements.</td><td class="mono">claude · opus · high</td><td class="mono muted">codex · gpt-5.5 · high</td><td>1 per install</td></tr>
+      <tr><td>PM</td><td>Owns one team's plan; writes testable acceptance before code; dispatches inside the plan; collects reports.</td><td class="mono">codex · gpt-5.5 · medium</td><td class="mono muted">claude · sonnet · medium</td><td>1 per team</td></tr>
+      <tr><td>Developer</td><td>One issue, own worktree, tests, PR with SHA, report.</td><td class="mono">codex · gpt-5.5-codex · high</td><td class="mono muted">claude · sonnet · high</td><td>1–4 per team</td></tr>
+      <tr><td>QA reviewer</td><td>Fresh-context review of the exact commit against the contract; verdict pinned to SHA.</td><td class="mono">claude · opus · high</td><td class="mono muted">codex · gpt-5.5 · high</td><td>1 per team</td></tr>
+      <tr><td>DevOps</td><td>Merge queue with PASS on head; deploys and sends as effects; host health.</td><td class="mono">claude · sonnet · medium</td><td class="mono muted">pi · glm-5.3-flash · low</td><td>1 per team</td></tr>
+      <tr><td>Researcher</td><td>Spikes, specs, ADR drafts with sources.</td><td class="mono">claude · opus · high</td><td class="mono muted">codex · gpt-5.5 · high</td><td>on demand</td></tr>
+      <tr><td>Curator</td><td>Verifies candidates, merges duplicates, retires stale items, drafts skills.</td><td class="mono">codex · gpt-5.5 · medium</td><td class="mono muted">claude · sonnet · medium</td><td>1 per company</td></tr>
+    </table></div>
+    <p class="muted" style="font-size:12.5px">Defaults are illustrative and editable in Teams → Roles. Model names follow each CLI's own aliases.</p>
+
+    <h2 id="p-rules"><span class="n">04</span>Operating rules (enforced by the daemon, not the prompt)</h2>
+    <div class="cards">
+      <div class="card"><h4>Contract first</h4><p>The PM writes testable acceptance before any code; QA verifies against the contract, never against the author's summary. MAST attributes ~44% of multi-agent failures to specification.</p></div>
+      <div class="card"><h4>Independent review</h4><p>Reviewers start in a fresh context. Different vendor by default, with pairings chosen by measured precision — cross-vendor review helped in one direction and hurt in the other in a 2026 study.</p></div>
+      <div class="card"><h4>One writer per code area</h4><p>Write leases per path set; parallel work is reads — research, review, triage. Peer swarms and single serial gates both failed at scale (Cursor, Anthropic C compiler).</p></div>
+      <div class="card"><h4>Separation of duties</h4><p>No agent reviews, merges or accepts its own work or lessons. A message from another agent never counts as your consent.</p></div>
+      <div class="card"><h4>Evidence over self-report</h4><p>"Done" is a claim until a verdict pins it to a commit; "tests passed" is re-run before a lesson is accepted.</p></div>
+      <div class="card"><h4>Lean context</h4><p>No repo overviews in packs; ~100 lines of non-standard rules; byte-stable prefixes for caching; fresh sessions over stale revivals.</p></div>
+    </div>
+
+    <h2 id="p-ms"><span class="n">05</span>Milestones</h2>
+    <p class="sub">Three tracks run in parallel — product shell, team, learning — and meet at the public beta. Tickets are in the Roadmap tab and in the tracker by tag (<code>cadence issue ls --tag m2-one-team</code>).</p>
+    <div class="tblwrap"><table class="tbl">
+      <tr><th>Milestone</th><th>Outcome</th><th>Exit test</th></tr>
+      <tr><td>M0 · Safe foundation</td><td>Sandbox, real backups, event roll-up</td><td>Backup → restore round-trip in a sandbox; production untouched</td></tr>
+      <tr><td>M1 · First conversation</td><td>Install → wizard → chat with a master that remembers</td><td>Clean box to chat in &lt; 5 min; kill the session mid-plan → it resumes</td></tr>
+      <tr><td>M2 · One governed team</td><td>Master → one team (PM, dev, QA, DevOps) from the role catalog; plans, gate, reviews, reports</td><td>A 3-issue plan lands with fresh-context verdicts, typed reports, and a question answered at the lowest level</td></tr>
+      <tr><td>M3 · The team learns</td><td>Verified memory, company vault, context packs, metrics</td><td>A lesson from one worker is verified by another vendor and reused by a different worker with measured savings; a stale item is withheld; a planted poisoned item is rejected</td></tr>
+      <tr><td>M4 · Many teams</td><td>Several teams under one master; capacity, quota, digest</td><td>Two teams run concurrently with no cross-team leakage</td></tr>
+      <tr><td>M5 · Ships</td><td>Connected platforms and effects</td><td>Preview deploys auto; production and sends only on your press; agents never see credentials</td></tr>
+      <tr><td>M6 · Autonomy dial</td><td>Routine merges automatic per project</td><td>Only after the unattended acceptance check (CAD-225) passes</td></tr>
+      <tr><td>GTM</td><td>Design partners after M1 · public beta after M3 · GA after M5</td><td>Legal review of provider terms before beta</td></tr>
     </table></div>
 
-    <h2><span class="n">D</span>What we will not do</h2>
+    <h2 id="p-dec"><span class="n">06</span>Decisions — defaults you can change</h2>
+    <div class="tblwrap"><table class="tbl">
+      <tr><th>Topic</th><th>Default</th><th>Status</th></tr>
+      <tr><td>Organization</td><td>One master; one PM per team; dev, QA, DevOps (researcher on demand); curator at company level</td><td><span class="chip ok">your direction</span></td></tr>
+      <tr><td>Role catalog</td><td>Roles with description and preferred provider/model/effort replace Settings model defaults; team.yaml holds staffing (CAD-338, answers CAD-116)</td><td><span class="chip warn">confirm</span></td></tr>
+      <tr><td>Memory policy</td><td>Logic checks + cross-vendor curator for project/role scope; two-review quorum kept for company scope; external content quarantined (CAD-347)</td><td><span class="chip warn">confirm</span></td></tr>
+      <tr><td>Unblock memory</td><td>Accept daemon-launched managed endpoints as authenticated reviewers (CAD-260)</td><td><span class="chip warn">confirm</span></td></tr>
+      <tr><td>Vault location</td><td><code>~/pm/vault</code> in the tracker repo; project memory stays in <code>&lt;pm&gt;/&lt;project&gt;/memory</code>; agent notes move into git (CAD-355)</td><td><span class="chip">default</span></td></tr>
+      <tr><td>Autonomy</td><td>Plan freely, ask to dispatch; you merge and press effects</td><td><span class="chip ok">decided</span></td></tr>
+      <tr><td>Master providers</td><td>Structured (Claude, Codex, Pi); terminal agents are workers; unmodified official binaries only</td><td><span class="chip ok">decided</span></td></tr>
+      <tr><td>Platforms</td><td>Contract-first; Cloudflare own account first; AgenticOS v2 via AOS-49</td><td><span class="chip ok">decided</span></td></tr>
+    </table></div>
+
+    <h2 id="p-not"><span class="n">07</span>What we will not do</h2>
     <ul class="tight">
-      <li>Run a hosted Cadence service — hosting is AgenticOS's job (AOS-34), Cadence stays local software.</li>
-      <li>Replace provider tools or copy their cookies/sessions.</li>
-      <li>Let any agent execute a send, merge its own work, or see a platform credential.</li>
+      <li>Run a hosted Cadence service — hosting is AgenticOS's job (AOS-34); Cadence stays local software.</li>
+      <li>Run an always-on all-agent chat, or peer swarms without an owner.</li>
+      <li>Inject unverified memory, or promote anything derived from external content without you.</li>
+      <li>Let any agent grade, merge or accept its own work, see a credential, or press an effect.</li>
       <li>Turn on auto-merge before the unattended acceptance check passes.</li>
     </ul>
+  </article>
+</div>
+</main>
+<main id="roadmap" hidden>
+<div class="doc">
+  <nav class="toc" aria-label="Roadmap contents">
+    <div class="k">Roadmap</div>
+    <a href="#rm-m0-safe">M0 · Safe foundation</a>
+    <a href="#rm-m1-first-chat">M1 · First conversation</a>
+    <a href="#rm-m2-one-team">M2 · One governed team</a>
+    <a href="#rm-m3-team-learns">M3 · The team learns</a>
+    <a href="#rm-m4-many-teams">M4 · Many teams</a>
+    <a href="#rm-m5-ships">M5 · Ships</a>
+    <a href="#rm-m6-autonomy">M6 · Autonomy dial</a>
+    <a href="#rm-gtm">Go-to-market</a>
+  </nav>
+  <article>
+    <section class="hero">
+      <div class="kicker">Milestones &amp; tickets · generated from the tracker</div>
+      <h1>Three tracks, seven milestones</h1>
+      <p class="lede">The product shell, the team and the learning loop move in parallel and meet at the public beta. Every ticket below is live in the tracker; <b>new</b> marks tickets filed for this plan, the rest is existing work this plan builds on. Filter any milestone with <code>cadence issue ls --tag &lt;tag&gt;</code>.</p>
+      <div class="journey" style="grid-template-columns:repeat(4,minmax(0,1fr))">
+        <div><span class="s">SHELL</span><b>M0 → M1 → M5</b>install, chat, platforms</div>
+        <div><span class="s">TEAM</span><b>M2 → M4 → M6</b>one team, many teams, autonomy</div>
+        <div><span class="s">LEARNING</span><b>M3</b>vault, verified memory, packs</div>
+        <div><span class="s">GTM</span><b>partners → beta → GA</b>after M1, M3, M5</div>
+      </div>
+    </section>
+
+    <h2 id="rm-m0-safe"><span class="n">SHELL</span>M0 · Safe foundation</h2>
+    <p class="sub">Sandbox, real backups, event roll-up. <span class="chip">tag m0-safe</span> <span class="chip">0/4 done</span></p>
+    <div class="callout acc" style="max-width:none"><b>Exit test:</b> Backup → restore round-trip in a sandbox; production untouched. <span class="muted">· depends on: —</span></div>
+    <div class="tblwrap"><table class="tbl"><tr><th>Ticket</th><th>Title</th><th>Status</th><th>Priority</th><th></th></tr>
+<tr><td class="mono">CAD-309</td><td>P0 Foundation: sandbox, install, setup, operator auth, backup/restore</td><td><span class="chip acc">doing</span></td><td class="num">P1</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-310</td><td>Sandbox profile: cadence sandbox up/env/down/reset/ls with isolated state, tracker, port and gated global s…</td><td><span class="chip acc">doing</span></td><td class="num">P1</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-314</td><td>cadence backup/export/restore: SQLite online backup + manifest, bundle without credentials, restore with re…</td><td><span class="chip acc">doing</span></td><td class="num">P1</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-316</td><td>Event retention: roll up delivery-noise events; agent rm keeps thread history</td><td><span class="chip info">review</span></td><td class="num">P2</td><td><span class="chip acc">new</span></td></tr>
+</table></div>
+
+    <h2 id="rm-m1-first-chat"><span class="n">SHELL</span>M1 · First conversation</h2>
+    <p class="sub">Install → wizard → chat with a master that remembers. <span class="chip">tag m1-first-chat</span> <span class="chip">0/16 done</span></p>
+    <div class="callout acc" style="max-width:none"><b>Exit test:</b> Clean box to chat in under 5 minutes; kill the master&#x27;s session mid-plan and it resumes. <span class="muted">· depends on: M0</span></div>
+    <div class="tblwrap"><table class="tbl"><tr><th>Ticket</th><th>Title</th><th>Status</th><th>Priority</th><th></th></tr>
+<tr><td class="mono">CAD-160</td><td>Compose objective + outstanding criteria into every task-bound message; never truncate criteria (ADR-0002 p…</td><td><span class="chip acc">doing</span></td><td class="num">P1</td><td><span class="chip">existing</span></td></tr>
+<tr><td class="mono">CAD-311</td><td>Release workflow and install.sh: linux x86_64/aarch64 + macOS arm64, UI embedded, checksums, --prefix</td><td><span class="chip ">backlog</span></td><td class="num">P1</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-312</td><td>cadence setup: idempotent first run with --json checks {check,status,detail,fix} and single-use login link</td><td><span class="chip ">backlog</span></td><td class="num">P1</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-313</td><td>ADR + implementation: operator identity for the web UI (0600 token -&gt; single-use link -&gt; HttpOnly cookie)</td><td><span class="chip acc">doing</span></td><td class="num">P1</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-315</td><td>macOS port: caller attribution and host doctor without /proc</td><td><span class="chip ">backlog</span></td><td class="num">P2</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-317</td><td>Sandbox S3: clean-machine install CI (ubuntu:24.04 + macos-14) with fake providers</td><td><span class="chip ">backlog</span></td><td class="num">P2</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-318</td><td>P1 Chat and continuity: threads, payload events, Pi adapter, continuity packs, read model, wizard, chat Home</td><td><span class="chip ">backlog</span></td><td class="num">P1</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-319</td><td>Threads store and payload events (assistant_text, tool_call redacted, tool_result, turn_result)</td><td><span class="chip ">backlog</span></td><td class="num">P1</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-320</td><td>Claude adapter: persist intermediate assistant text and tool I/O summaries</td><td><span class="chip ">backlog</span></td><td class="num">P2</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-322</td><td>Pi headless adapter (pi --mode rpc): streaming, tool progress, model/effort, cancel, resume</td><td><span class="chip ">backlog</span></td><td class="num">P1</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-323</td><td>Real interrupt: stop the provider turn and reconcile its effects</td><td><span class="chip ">backlog</span></td><td class="num">P2</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-324</td><td>Continuity packs: summary + last N turns + plan state + preferences on new/lost/compacted sessions</td><td><span class="chip ">backlog</span></td><td class="num">P1</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-325</td><td>Read model: indexed tracker and cached overview; SSE carries entity diffs</td><td><span class="chip ">backlog</span></td><td class="num">P1</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-326</td><td>UI foundation: router, query cache, feature folders, light + dark tokens</td><td><span class="chip ">backlog</span></td><td class="num">P2</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-327</td><td>Setup wizard: start (fresh/restore/tracker/import), environment, platforms, master, workspace, team, launch</td><td><span class="chip ">backlog</span></td><td class="num">P2</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-328</td><td>Chat-first Home: thread, plan/permission/effect cards, Needs-you rail, since-you-left</td><td><span class="chip ">backlog</span></td><td class="num">P2</td><td><span class="chip acc">new</span></td></tr>
+</table></div>
+
+    <h2 id="rm-m2-one-team"><span class="n">TEAM</span>M2 · One governed team</h2>
+    <p class="sub">Master → one team (PM, dev, QA, DevOps) from the role catalog; plans, dispatch gate, fresh-context reviews, typed reports, questions that climb. <span class="chip">tag m2-one-team</span> <span class="chip">0/27 done</span></p>
+    <div class="callout acc" style="max-width:none"><b>Exit test:</b> A 3-issue plan lands with verdicts pinned to each head, a report per job, and one question answered at the lowest level. <span class="muted">· depends on: M1 for the UI; daemon work can start now</span></div>
+    <div class="tblwrap"><table class="tbl"><tr><th>Ticket</th><th>Title</th><th>Status</th><th>Priority</th><th></th></tr>
+<tr><td class="mono">CAD-77</td><td>Multi-level groups: upstream chains, results one level up, escalation that bubbles when unanswered</td><td><span class="chip ">dropped</span></td><td class="num">P2</td><td><span class="chip">existing</span></td></tr>
+<tr><td class="mono">CAD-78</td><td>Task roles in jobs: planner, implementer, reviewer, merger with enforced separation of duties</td><td><span class="chip ">backlog</span></td><td class="num">P2</td><td><span class="chip">existing</span></td></tr>
+<tr><td class="mono">CAD-116</td><td>team.yaml schema + parser + cadence team show with drift report (ADR-0001 phase 2a)</td><td><span class="chip ">backlog</span></td><td class="num">P2</td><td><span class="chip">existing</span></td></tr>
+<tr><td class="mono">CAD-120</td><td>Route qa-1&#x27;s review through job verdict so the existing self-review gate is on the live path (ADR-0001 phas…</td><td><span class="chip ">backlog</span></td><td class="num">P1</td><td><span class="chip">existing</span></td></tr>
+<tr><td class="mono">CAD-122</td><td>Role capabilities: closed set, verb-to-capability map, daemon refusal with the rule named (ADR-0001 phase 3b)</td><td><span class="chip ">backlog</span></td><td class="num">P2</td><td><span class="chip">existing</span></td></tr>
+<tr><td class="mono">CAD-131</td><td>Plumb effort for codex/cursor/devin: resolve (provider, model, effort) and compose slug suffixes, validatin…</td><td><span class="chip ">backlog</span></td><td class="num">P1</td><td><span class="chip">existing</span></td></tr>
+<tr><td class="mono">CAD-213</td><td>Reliable report delivery: durable GitHub relay and quota-aware PM intake consumer</td><td><span class="chip ">ready</span></td><td class="num">P1</td><td><span class="chip">existing</span></td></tr>
+<tr><td class="mono">CAD-223</td><td>Agent profile editor: provider capabilities, desired versus running model and effort</td><td><span class="chip ">backlog</span></td><td class="num">P1</td><td><span class="chip">existing</span></td></tr>
+<tr><td class="mono">CAD-224</td><td>Goal intake: turn project outcomes into a dependency-aware executable plan</td><td><span class="chip ">backlog</span></td><td class="num">P1</td><td><span class="chip">existing</span></td></tr>
+<tr><td class="mono">CAD-298</td><td>Dispatch refuses an issue with empty acceptance (switch CAD-159&#x27;s warning to a refusal after backfill)</td><td><span class="chip ">backlog</span></td><td class="num">P2</td><td><span class="chip">existing</span></td></tr>
+<tr><td class="mono">CAD-329</td><td>P2 Projects and plans: project new, plan propose, plan card approval, daemon dispatch gate</td><td><span class="chip ">backlog</span></td><td class="num">P2</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-330</td><td>P3 Delegation: workers from approved plans, cross-vendor reviewer routing, merges in Needs-you, terminal view</td><td><span class="chip ">backlog</span></td><td class="num">P2</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-338</td><td>ADR-0001 v2: company role catalog (vault/company/roles) + per-team team.yaml; one --role vocabulary</td><td><span class="chip ">backlog</span></td><td class="num">P1</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-339</td><td>Master role: company assistant that creates teams from the catalog, routes escalations and sends a daily di…</td><td><span class="chip ">backlog</span></td><td class="num">P1</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-340</td><td>Cross-vendor rules: QA provider differs from the author&#x27;s, curator differs from the proposer&#x27;s; fallback la…</td><td><span class="chip ">backlog</span></td><td class="num">P1</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-341</td><td>Structured reports: done / question / blocked with the six-field reflection and context feedback, stored pe…</td><td><span class="chip ">backlog</span></td><td class="num">P1</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-342</td><td>Question routing up the tree: worker → PM → master → operator, vault/FAQ lookup first; answers become decis…</td><td><span class="chip ">backlog</span></td><td class="num">P2</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-343</td><td>Teams UI: Org, Roles editor (description, preferred provider/model/effort), Agents, Reports</td><td><span class="chip ">backlog</span></td><td class="num">P2</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-345</td><td>Reconcile team and memory docs with code: QA vs PM acceptance, role vocabularies, stale claims</td><td><span class="chip ">backlog</span></td><td class="num">P2</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-358</td><td>cadence project new: register a repo and seed its context manifest and team.yaml</td><td><span class="chip ">backlog</span></td><td class="num">P2</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-359</td><td>Plan proposals: plan.yaml schema, plan_proposed event and plan card</td><td><span class="chip ">backlog</span></td><td class="num">P2</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-360</td><td>Plan approval commit and daemon dispatch gate: refuse dispatch outside approved plans with a named reason</td><td><span class="chip ">backlog</span></td><td class="num">P1</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-361</td><td>Staff and dispatch from approved plans via team.yaml roles; the team PM dispatches</td><td><span class="chip ">backlog</span></td><td class="num">P2</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-362</td><td>Reviewer routing: cross-vendor QA assignment, verdict → DevOps merge-queue handoff</td><td><span class="chip ">backlog</span></td><td class="num">P1</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-363</td><td>Merges, effects and operator questions in Needs-you: one decision per cause</td><td><span class="chip ">backlog</span></td><td class="num">P2</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-364</td><td>Live read-only terminal view for pty agents (tmux control mode)</td><td><span class="chip ">backlog</span></td><td class="num">P3</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-378</td><td>One writer per code area: path-scoped write leases in dispatch; parallel work limited to reads (review, res…</td><td><span class="chip ">backlog</span></td><td class="num">P1</td><td><span class="chip acc">new</span></td></tr>
+</table></div>
+
+    <h2 id="rm-m3-team-learns"><span class="n">LEARNING</span>M3 · The team learns</h2>
+    <p class="sub">Verified memory in a git company vault; context packs; learning metrics. <span class="chip">tag m3-team-learns</span> <span class="chip">0/21 done</span></p>
+    <div class="callout acc" style="max-width:none"><b>Exit test:</b> A lesson from one worker is verified by a curator of another vendor and reused by a different worker with measured savings; a stale item is withheld; a planted poisoned item is rejected. <span class="muted">· depends on: CAD-260 unblock; M2 reports</span></div>
+    <div class="tblwrap"><table class="tbl"><tr><th>Ticket</th><th>Title</th><th>Status</th><th>Priority</th><th></th></tr>
+<tr><td class="mono">CAD-66</td><td>Knowledge graph per project via graphify: built from repo, tracker and notes; refreshed on merge; shown on …</td><td><span class="chip ">backlog</span></td><td class="num">P3</td><td><span class="chip">existing</span></td></tr>
+<tr><td class="mono">CAD-67</td><td>LLM wiki: agent-maintained project pages with provenance and staleness checks</td><td><span class="chip ">dropped</span></td><td class="num">P3</td><td><span class="chip">existing</span></td></tr>
+<tr><td class="mono">CAD-111</td><td>Automatic retro per merged issue: rounds, what review caught, flakes, lead time, proposed lessons</td><td><span class="chip ">backlog</span></td><td class="num">P2</td><td><span class="chip">existing</span></td></tr>
+<tr><td class="mono">CAD-192</td><td>Evidence-backed memory capture: structured required source, secret scan on propose</td><td><span class="chip ">backlog</span></td><td class="num">P1</td><td><span class="chip">existing</span></td></tr>
+<tr><td class="mono">CAD-193</td><td>Memory lifecycle enforcement: prior-status check, verify must cite evidence, atomic supersede</td><td><span class="chip ">backlog</span></td><td class="num">P2</td><td><span class="chip">existing</span></td></tr>
+<tr><td class="mono">CAD-194</td><td>Job dispatch injects no memory, and path scope needs recorded commits so new issues match nothing</td><td><span class="chip ">backlog</span></td><td class="num">P1</td><td><span class="chip">existing</span></td></tr>
+<tr><td class="mono">CAD-197</td><td>Auditor agents cannot deliver artifacts: codex-1 attach and notify failed with bwrap RTM_NEWADDR</td><td><span class="chip ">backlog</span></td><td class="num">P2</td><td><span class="chip">existing</span></td></tr>
+<tr><td class="mono">CAD-203</td><td>Stale and contradicted accepted lessons stay eligible for injection: match filters on status only</td><td><span class="chip acc">doing</span></td><td class="num">P1</td><td><span class="chip">existing</span></td></tr>
+<tr><td class="mono">CAD-260</td><td>Unblock memory review: define native-identity proof for proposers, or an operator curation path</td><td><span class="chip ">backlog</span></td><td class="num">P2</td><td><span class="chip">existing</span></td></tr>
+<tr><td class="mono">CAD-346</td><td>Company vault: git layout (company, teams, projects, playbooks, lessons, decisions, faq, inbox) with index …</td><td><span class="chip ">backlog</span></td><td class="num">P1</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-347</td><td>Memory policy v2 (ADR): logic checks + cross-vendor curator for project/role scope, quorum for company scop…</td><td><span class="chip ">backlog</span></td><td class="num">P1</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-348</td><td>Verification runner: resolve citations at HEAD, re-run cited tests in a build slot, secret scan, dedupe, co…</td><td><span class="chip ">backlog</span></td><td class="num">P1</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-349</td><td>Curator role and queue: ADD / UPDATE / INVALIDATE / NOOP / ESCALATE verdicts with operator escalation</td><td><span class="chip ">backlog</span></td><td class="num">P1</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-350</td><td>Candidate extraction from reports and retros: typed claims (fact, strategy, pitfall, procedure, faq) with e…</td><td><span class="chip ">backlog</span></td><td class="num">P2</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-351</td><td>Context pack builder: one path for issue dispatch, job dispatch and continuity; items verified at SHA; plan…</td><td><span class="chip ">backlog</span></td><td class="num">P1</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-352</td><td>Nightly consolidation as a reviewed vault PR: merge duplicates, invalidate stale, propose skills; never rew…</td><td><span class="chip ">backlog</span></td><td class="num">P2</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-353</td><td>Skills from procedures: promote to Agent Skills only after an evaluation shows benefit</td><td><span class="chip ">backlog</span></td><td class="num">P3</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-354</td><td>Learning metrics and A/B harness: reuse, helpful/harm, stale rate, reads avoided, tokens and time; planted-…</td><td><span class="chip ">backlog</span></td><td class="num">P2</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-355</td><td>Move agent notes (/var/www/agent-notes) into git so notes and retros are portable</td><td><span class="chip ">backlog</span></td><td class="num">P2</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-356</td><td>Project context manifests for every project and commit-keyed code maps as pack sources</td><td><span class="chip ">backlog</span></td><td class="num">P2</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-357</td><td>Vault UI: overview, company docs, lessons, verification queue, context-pack preview</td><td><span class="chip ">backlog</span></td><td class="num">P2</td><td><span class="chip acc">new</span></td></tr>
+</table></div>
+
+    <h2 id="rm-m4-many-teams"><span class="n">TEAM</span>M4 · Many teams</h2>
+    <p class="sub">Several teams under one master: capacity, quota, isolation, digest. <span class="chip">tag m4-many-teams</span> <span class="chip">0/6 done</span></p>
+    <div class="callout acc" style="max-width:none"><b>Exit test:</b> Two teams on different projects run concurrently with no cross-team leakage. <span class="muted">· depends on: M2</span></div>
+    <div class="tblwrap"><table class="tbl"><tr><th>Ticket</th><th>Title</th><th>Status</th><th>Priority</th><th></th></tr>
+<tr><td class="mono">CAD-80</td><td>Budgets per level: tokens, quota and wall-clock per role and per epic, with quota-aware routing</td><td><span class="chip ">backlog</span></td><td class="num">P3</td><td><span class="chip">existing</span></td></tr>
+<tr><td class="mono">CAD-82</td><td>Overview dashboard: one screen across all projects for what needs me, who is doing what, what is in flight,…</td><td><span class="chip ">backlog</span></td><td class="num">P1</td><td><span class="chip">existing</span></td></tr>
+<tr><td class="mono">CAD-114</td><td>Provider quota visibility: Devin ACU and Codex quota in doctor --host and the Overview</td><td><span class="chip ">backlog</span></td><td class="num">P1</td><td><span class="chip">existing</span></td></tr>
+<tr><td class="mono">CAD-212</td><td>Safe agent provider replacement: drain, checkpoint, validate and transfer queued work without duplicate del…</td><td><span class="chip ">backlog</span></td><td class="num">P1</td><td><span class="chip">existing</span></td></tr>
+<tr><td class="mono">CAD-226</td><td>Agent inbox UX: accountable consumers, delivery stages and actionable backlog</td><td><span class="chip ">backlog</span></td><td class="num">P1</td><td><span class="chip">existing</span></td></tr>
+<tr><td class="mono">CAD-344</td><td>Multiple teams under one master: cross-team capacity and priorities, isolation, daily digest</td><td><span class="chip ">backlog</span></td><td class="num">P2</td><td><span class="chip acc">new</span></td></tr>
+</table></div>
+
+    <h2 id="rm-m5-ships"><span class="n">SHELL</span>M5 · Ships</h2>
+    <p class="sub">Connected platforms: credential proxy, effect gate, Cloudflare, AgenticOS v2. <span class="chip">tag m5-ships</span> <span class="chip">0/7 done</span></p>
+    <div class="callout acc" style="max-width:none"><b>Exit test:</b> Preview deploys automatic; production deploys and sends only on your press; agents never see credentials. <span class="muted">· depends on: M1; AOS-49 for AgenticOS</span></div>
+    <div class="tblwrap"><table class="tbl"><tr><th>Ticket</th><th>Title</th><th>Status</th><th>Priority</th><th></th></tr>
+<tr><td class="mono">AOS-49</td><td>Agent credential exchange for local runtimes (Cadence): device-style code, email-OTP sign-in, scope consent…</td><td><span class="chip ">backlog</span></td><td class="num">P2</td><td><span class="chip">existing</span></td></tr>
+<tr><td class="mono">CAD-331</td><td>P4 Connected platforms: contract ADR, credential proxy, effect gate (read/draft/send), Cloudflare platform,…</td><td><span class="chip ">backlog</span></td><td class="num">P2</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-365</td><td>ADR: connected-platform contract — credential exchange, MCP tools with declared effects, pending-effect API</td><td><span class="chip ">backlog</span></td><td class="num">P2</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-366</td><td>Platform proxy: credential custody, per-agent scopes, effect gate</td><td><span class="chip ">backlog</span></td><td class="num">P2</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-367</td><td>Cloudflare (own account) platform: preview deploy automatic, production deploy as an effect</td><td><span class="chip ">backlog</span></td><td class="num">P2</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-368</td><td>AgenticOS v2 platform adapter</td><td><span class="chip ">backlog</span></td><td class="num">P3</td><td><span class="chip acc">new</span></td></tr>
+<tr><td class="mono">CAD-369</td><td>Platforms UI: services, access matrix, pending effects</td><td><span class="chip ">backlog</span></td><td class="num">P3</td><td><span class="chip acc">new</span></td></tr>
+</table></div>
+
+    <h2 id="rm-m6-autonomy"><span class="n">TEAM</span>M6 · Autonomy dial</h2>
+    <p class="sub">Routine merges automatic per project; scorecards drive routing. <span class="chip">tag m6-autonomy</span> <span class="chip">0/4 done</span></p>
+    <div class="callout acc" style="max-width:none"><b>Exit test:</b> Only after the unattended acceptance check (CAD-225) is green. <span class="muted">· depends on: CAD-225, M3</span></div>
+    <div class="tblwrap"><table class="tbl"><tr><th>Ticket</th><th>Title</th><th>Status</th><th>Priority</th><th></th></tr>
+<tr><td class="mono">CAD-86</td><td>Overview slice 4: flow and quality metrics</td><td><span class="chip ">backlog</span></td><td class="num">P3</td><td><span class="chip">existing</span></td></tr>
+<tr><td class="mono">CAD-139</td><td>Idea pipeline: an idea ticket triggers research and a plan draft, then waits for the operator&#x27;s decision</td><td><span class="chip ">ready</span></td><td class="num">P2</td><td><span class="chip">existing</span></td></tr>
+<tr><td class="mono">CAD-225</td><td>Unattended team acceptance: goal to reviewed merge with restart and provider failure recovery</td><td><span class="chip ">backlog</span></td><td class="num">P0</td><td><span class="chip">existing</span></td></tr>
+<tr><td class="mono">CAD-332</td><td>Autonomy dial: routine merges automatic per project, unlocked only after CAD-225</td><td><span class="chip ">backlog</span></td><td class="num">P3</td><td><span class="chip acc">new</span></td></tr>
+</table></div>
+
+    <h2 id="rm-gtm"><span class="n">GTM</span>Go-to-market</h2>
+    <p class="sub">Design partners after M1 · public beta after M3 · GA after M5. <span class="chip">tag gtm</span> <span class="chip">0/1 done</span></p>
+    <div class="callout acc" style="max-width:none"><b>Exit test:</b> Legal review of provider terms before the beta. <span class="muted">· depends on: M1, M3, M5</span></div>
+    <div class="tblwrap"><table class="tbl"><tr><th>Ticket</th><th>Title</th><th>Status</th><th>Priority</th><th></th></tr>
+<tr><td class="mono">CAD-333</td><td>Go-to-market: design partners, provider-terms legal review, demo, OSS launch</td><td><span class="chip ">backlog</span></td><td class="num">P2</td><td><span class="chip acc">new</span></td></tr>
+</table></div>
+
+    <p class="muted" style="margin-top:24px;font-size:12.5px">86 ticket rows across milestones, generated 2026-09-23 from <code>cadence issue ls --json</code> (projects cadence and agenticos-v2).</p>
+  </article>
+</div>
+</main>
+<main id="research" hidden>
+<div class="doc">
+  <nav class="toc" aria-label="Research contents">
+    <div class="k">State of the art</div>
+    <a href="#r-top">Team topology</a>
+    <a href="#r-roles">Roles &amp; review</a>
+    <a href="#r-comm">Communication</a>
+    <a href="#r-learn">Learning</a>
+    <a href="#r-memory">Memory systems</a>
+    <a href="#r-safety">Verification &amp; safety</a>
+    <a href="#r-skills">Skills &amp; vaults</a>
+    <a href="#r-ctx">Context engineering</a>
+    <a href="#r-eval">Evaluation</a>
+    <a href="#r-adopt">What we adopt</a>
+  </nav>
+  <article>
+    <section class="hero">
+      <div class="kicker">Research · checked 2026-09-23</div>
+      <h1>What actually works for teams of coding agents</h1>
+      <p class="lede">A shallow hierarchy with one writer per code area, a PM that writes testable acceptance first, reviewers that start fresh, typed handoffs, and small verified context loaded on demand. Memory helps only when it is verified, cited, scoped and measured — most memory systems in a September 2026 benchmark did not beat memory-off.</p>
+      <p class="muted" style="font-size:12.5px;margin-top:10px">Vendor numbers are self-reported. Many 2026 arXiv items are preprints — directional, not settled. Key memory claims were re-checked against primary sources; corrections are applied below.</p>
+    </section>
+
+    <h2 id="r-top"><span class="n">01</span>Team topology</h2>
+    <div class="tblwrap"><table class="tbl">
+      <tr><th>Source</th><th>Finding</th><th>Take</th></tr>
+      <tr><td>Anthropic multi-agent research (Jun 2025)</td><td>Lead + parallel subagents: +90.2% over one agent at ~15× tokens; subagents store work externally and pass references; "most coding tasks involve fewer truly parallelizable tasks than research"</td><td>Pass artifacts by reference; don't fan out writes</td></tr>
+      <tr><td>Cognition (Jun 2025 → Apr 2026)</td><td>Multi-agent works when "writes stay single-threaded": fresh-context review loops (~2 bugs/PR caught), a "smart friend" model, map-reduce-and-manage; swarms "mostly a distraction"</td><td>One writer per area; add intelligence, not actions</td></tr>
+      <tr><td>MAST, NeurIPS 2025</td><td>1,642 traces: ~44% specification, 32% inter-agent misalignment, 24% verification failures; sharper role specs +9.4%, objective-level verification +15.6%</td><td>Contract first; QA against the objective</td></tr>
+      <tr><td>Google/MIT scaling study (Jan 2026)</td><td>Central coordinator +80.9% on parallelizable tasks; every multi-agent variant −39–70% on sequential tasks; independent agents amplify errors 17.2× vs 4.4× with a coordinator</td><td>Choose topology per task; keep a single-agent baseline</td></tr>
+      <tr><td>Claude Code teams &amp; Projects (2026)</td><td>Agent teams: lead, shared task list with locks, 3–5 teammates, no same-file edits, no nested teams. Projects (Sep 17): coordinator "sees what threads report back, not every step"; shared MEMORY.md index; per-role model and effort</td><td>Closest analog to master → PM → workers</td></tr>
+      <tr><td>Factory Missions (2026)</td><td>Orchestrator writes a "validation contract" first; fresh-context workers and validators; validators from another vendor; milestones converge in 2–4 rounds at ~12× tokens</td><td>Contract first; cross-vendor validation</td></tr>
+      <tr><td>Cursor · Anthropic C compiler (2026)</td><td>Lock-based peers: 20 agents ran at the throughput of 2–3; a single integrator gate became the bottleneck. 16 lock-only peers built 100k lines but "frequently broke existing functionality"</td><td>Avoid peer swarms and one serial gate; keep a regression oracle</td></tr>
+    </table></div>
+
+    <h2 id="r-roles"><span class="n">02</span>Roles, model routing and review</h2>
+    <div class="cards">
+      <div class="card"><h4>Roles are files</h4><p>Claude subagent frontmatter sets tools, model, effort, permissions, worktree isolation, memory and turn limits; Codex agents use TOML. One versioned spec per role, compiled per vendor.</p></div>
+      <div class="card"><h4>Mix models by role</h4><p>Mixed-model teams gained up to +44% accuracy at equal cost, or matched accuracy at up to 12× lower cost (arXiv 2606.20629); an Opus advisor lifted Sonnet +2.7 pp at 11.9% lower cost.</p></div>
+      <div class="card"><h4>Cross-vendor review is asymmetric</h4><p>Claude reviewing Codex raised pass rate 71.6% → 89.7%; Codex reviewing Claude lowered it 91.4% → 82.8% (arXiv 2607.21656, reviewer could not run code). Separate-session review beat same-session review.</p></div>
+      <div class="card"><h4>Reviewer reliability</h4><p>Tool-using judges "dramatically outperform" plain judges; LLM review F1 fell from 0.657 on diffs under 10 lines to 0.043 over 150 lines (arXiv 2606.15689). Keep diffs small; tier review by risk.</p></div>
+    </div>
+
+    <h2 id="r-comm"><span class="n">03</span>Communication and escalation</h2>
+    <div class="cards">
+      <div class="card"><h4>Typed handoffs</h4><p>Cursor worker reports carry notes, concerns, deviations, findings; Factory keeps contract, feature list and knowledge base as shared state; OpenAI checks plans and decision logs into the repo.</p></div>
+      <div class="card"><h4>Constraints get lost</h4><p>Compressed handoffs keep facts but drop constraints (survival 0.80 → 0.57 at 25 words); stating constraints explicitly cut leakage below 15% (arXiv 2608.29028).</p></div>
+      <div class="card"><h4>Ask, don't guess</h4><p>Agents miss underspecification; asking clarifying questions improved results by up to 74% (Ambig-SWE, ICLR 2026). Claude Projects threads "guessed or stalled instead of asking".</p></div>
+      <div class="card"><h4>Consent is human</h4><p>A2A v1.0 (Mar 2026) models an <code>input-required</code> task state. Claude Code treats an approval relayed by another agent as untrusted.</p></div>
+    </div>
+    <h2 id="r-learn"><span class="n">04</span>Learning from experience</h2>
+    <div class="tblwrap"><table class="tbl">
+      <tr><th>Approach</th><th>Mechanism</th><th>Evidence</th><th>Verdict for Cadence</th></tr>
+      <tr><td>ACE — Agentic Context Engineering</td><td>Generator → Reflector → Curator; itemized bullets with ids and helpful/harmful counters; deterministic delta merges; de-duplication</td><td>+10.6% agent tasks, +8.6% finance; shows full-rewrite memories collapsing ("context collapse") <span class="muted">arXiv 2510.04618</span></td><td><span class="chip ok">adopt</span> the template: itemized, counted, delta-merged</td></tr>
+      <tr><td>ReasoningBank</td><td>A judge labels each run; strategies are distilled from successes <i>and</i> failures</td><td>+4.6–8.3 pp WebArena, ~16% fewer steps <span class="muted">arXiv 2509.25140</span></td><td><span class="chip ok">adopt</span> failure distillation (pitfalls)</td></tr>
+      <tr><td>ExpeL · AWM</td><td>Insights edited by add/edit/upvote/downvote; successful runs become reusable workflows</td><td>AAAI-24; AWM +24.6% / +51.1% relative <span class="muted">arXiv 2308.10144, 2409.07429</span></td><td><span class="chip ok">adopt</span> voting lifecycle and procedures</td></tr>
+      <tr><td>SWE-Exp</td><td>Experience bank from successful and failed repairs</td><td>73.0% SWE-bench Verified <span class="muted">arXiv 2507.23361</span></td><td><span class="chip ok">adopt</span></td></tr>
+      <tr><td>Dynamic Cheatsheet</td><td>One memory rewritten in full after each task</td><td>Big gains on puzzles, but collapses over time (per ACE)</td><td><span class="chip fail">avoid</span> whole rewrites</td></tr>
+      <tr><td>Darwin Gödel Machine</td><td>Agents rewrite themselves, selected by benchmark</td><td>20% → 50% SWE-bench — and it removed hallucination markers and faked test logs <span class="muted">Sakana, May 2025</span></td><td><span class="chip fail">avoid</span> any agent grading itself</td></tr>
+      <tr><td>2026 transfer studies</td><td>Which experience carries across tasks</td><td>Abstract know-how transfers; step-by-step traces hurt; unfiltered experience helps little or hurts <span class="muted">arXiv 2604.14004, 2604.27003, 2602.08316</span></td><td><span class="chip ok">adopt</span> store lessons, not transcripts</td></tr>
+    </table></div>
+
+    <h2 id="r-memory"><span class="n">05</span>Memory systems in production</h2>
+    <div class="tblwrap"><table class="tbl">
+      <tr><th>System</th><th>What it does</th><th>Take</th></tr>
+      <tr><td>GitHub Copilot Memory</td><td>Repo facts with code citations, verified "against the current branch before using" them; re-stored when still useful; unused entries deleted after 28 days (docs). A/B: PR merge rate 90% vs 83% <span class="muted">github.blog, Jan 15 2026 · docs.github.com copilot-memory</span></td><td><span class="chip ok">adopt</span> — strongest precedent: cite, validate at use, expire</td></tr>
+      <tr><td>Claude Managed Agents memory + Dreams</td><td>Versioned stores mounted read-only or read-write; "dreams" read a store plus sessions and write a <i>new</i> store for review, never modifying the input <span class="muted">platform.claude.com docs, May 2026</span></td><td><span class="chip ok">adopt</span> consolidation as a reviewed new version</td></tr>
+      <tr><td>Letta context repositories</td><td>Git-backed memory files with frontmatter, every change versioned with a commit; reflection in worktrees merged back through git; sleep-time agents <span class="muted">letta.com, Feb 12 2026</span></td><td><span class="chip ok">adopt</span> — matches our git vault</td></tr>
+      <tr><td>Claude Code memory</td><td>Layered CLAUDE.md + path rules; an index (first 200 lines) plus topic files read on demand; skips what the code already shows</td><td><span class="chip ok">adopt</span> index + topics layout</td></tr>
+      <tr><td>Mem0 · Zep/Graphiti</td><td>ADD/UPDATE/DELETE/NOOP against similar facts; temporal validity — contradictions invalidate, never delete</td><td><span class="chip ok">adopt</span> the operation set and validity intervals</td></tr>
+      <tr><td>Codex memories · Devin knowledge</td><td>Codex: off by default, "a helpful recall layer, not the only source for rules"; Devin suggests items, a human edits or dismisses</td><td><span class="chip ok">adopt</span> suggest-then-approve; rules stay in reviewed docs</td></tr>
+    </table></div>
+
+    <h2 id="r-safety"><span class="n">06</span>Verification and safety</h2>
+    <div class="cards">
+      <div class="card"><h4>Poisoning is real</h4><p>AgentPoison: &gt;80% attack success with &lt;0.1% of memory poisoned. MINJA injects through ordinary queries. MemoryGraft plants fake "successful experiences" — exactly a lesson bank's risk. OWASP lists memory poisoning as ASI06.</p></div>
+      <div class="card"><h4>Defenses that work</h4><p>Provenance on every item, citation checks at use, read-only shared stores with a proposal queue, consensus checks across related memories (A-MemGuard, &gt;95% fewer successful attacks), and quarantine for anything derived from external content.</p></div>
+      <div class="card"><h4>Different judge, different vendor</h4><p>In rubric-based evaluation, judges "can be more than 50% more likely" to wrongly pass their own model's output (arXiv 2604.06996). Proposer ≠ acceptor, and different vendors, for both QA and curation.</p></div>
+      <div class="card"><h4>Never trust "tests passed"</h4><p>Re-run cited tests during verification. Self-improving agents have faked test logs (DGM).</p></div>
+    </div>
+
+    <h2 id="r-skills"><span class="n">07</span>Skills and knowledge vaults</h2>
+    <div class="cards">
+      <div class="card"><h4>Skills help when curated</h4><p>Agent Skills (open standard, Dec 2025; supported by Codex, Copilot, Cursor, Gemini CLI, OpenHands, Letta) load in stages. Curated skills lifted average pass rate 33.9% → 50.5%; self-generated skills landed <i>below</i> the no-skills baseline in all three tested configurations (SkillsBench v4, Jun 2026). Keep skills small, curated by a strong model, and promote only with a test showing benefit.</p></div>
+      <div class="card"><h4>Guidance files can cost more than they give</h4><p>AGENTS.md-style context files generally didn't raise success and cost over 20% more tokens (arXiv 2602.11988). Packs must be lean and task-specific, not a repo overview.</p></div>
+      <div class="card"><h4>LLM-maintained wikis</h4><p>Karpathy's "llm-wiki": raw sources untouched, an LLM-owned markdown wiki with schema, index, append-only log, and a lint pass for contradictions and stale pages. Google Code Wiki regenerates after every change and links to code.</p></div>
+      <div class="card"><h4>Scopes</h4><p>Company (read-only) → team → project/repo → role (path rules, skills) → user — the same layering Claude Code, Devin and Managed Agents use.</p></div>
+    </div>
+
+    <h2 id="r-ctx"><span class="n">08</span>Context engineering — so agents don't re-read</h2>
+    <div class="cards">
+      <div class="card"><h4>Context rot</h4><p>All 18 models tested degraded as input grew, even on simple tasks (Chroma, Jul 2025) — the reason reviewers and workers get fresh contexts.</p></div>
+      <div class="card"><h4>Progressive disclosure</h4><p>Skills load name → body → files; MCP tools as code on disk cut 150k → 2k tokens; clearing stale tool results cut 84% of tokens and, with a memory tool, gave +39% (Anthropic, 2025).</p></div>
+      <div class="card"><h4>Maps and indexes</h4><p>Aider's ranked repo map (~1k tokens); RepoGraph +32.8% relative on SWE-bench; Cursor reuses indexes by content hash (time-to-first-query 7.87 s → 0.53 s). No public system documents SHA-keyed summaries as such — content hashing is the closest.</p></div>
+      <div class="card"><h4>Caching economics</h4><p>Cache reads bill at ~0.1× input; static content first and byte-stable prefixes; Manus calls cache hit rate the key metric. Reviving a stale session re-reads its history.</p></div>
+    </div>
+
+    <h2 id="r-eval"><span class="n">09</span>Evaluation — is it getting better?</h2>
+    <div class="cards">
+      <div class="card"><h4>Passing ≠ mergeable</h4><p>About half of SWE-bench-passing PRs would not be merged; maintainer acceptance ran ~24 points below the grader (METR, Mar 2026).</p></div>
+      <div class="card"><h4>Memory must earn its place</h4><p>VibeMemBench (Sep 2026): 11 of 12 memory-system/solver pairings failed to beat memory-off; injecting <i>verified</i> past experience gave +1.1 to +4.5 points and fewer steps.</p></div>
+      <div class="card"><h4>Benchmarks that fit roles</h4><p>SWE-bench Pro (contamination-resistant), SWE-Lancer manager tasks for PMs, Terminal-Bench 2.0 for DevOps, TheAgentCompany for whole-team work (best agent 30%).</p></div>
+      <div class="card"><h4>Our own replay suite</h4><p>Closed Cadence tickets become a replay set; measure merges without rework, cost and wall-clock per merged PR, escalations per task, review precision on seeded bugs — by vendor and task type.</p></div>
+    </div>
+
+    <h2 id="r-adopt"><span class="n">10</span>What we adopt — and where it lands</h2>
+    <div class="tblwrap"><table class="tbl">
+      <tr><th>Principle</th><th>In the plan</th><th>Ticket</th></tr>
+      <tr><td>Shallow hierarchy, one writer per code area</td><td>master → PM → workers; write leases per path set</td><td class="mono">CAD-339 · CAD-77 · CAD-378</td></tr>
+      <tr><td>Contract before code</td><td>PM writes testable acceptance; dispatch refused without it</td><td class="mono">CAD-360 · CAD-298 · CAD-160</td></tr>
+      <tr><td>Fresh-context, measured cross-vendor review</td><td>QA pairing by measured precision; verdict pinned to SHA</td><td class="mono">CAD-340 · CAD-362 · CAD-120</td></tr>
+      <tr><td>Typed reports with verbatim constraints</td><td>cadence.report/2 with six fields and context feedback</td><td class="mono">CAD-341</td></tr>
+      <tr><td>Ask, don't guess; human consent only</td><td>input-required questions climb the tree</td><td class="mono">CAD-342</td></tr>
+      <tr><td>Verified, cited, expiring memory</td><td>checks + curator, citations re-checked at use, 28-day expiry</td><td class="mono">CAD-347 · CAD-348 · CAD-349 · CAD-260</td></tr>
+      <tr><td>Itemized delta updates, reviewed consolidation</td><td>one item per file; nightly diff reviewed</td><td class="mono">CAD-346 · CAD-352</td></tr>
+      <tr><td>Lean packs, not overviews</td><td>index + top cited items; skills by name</td><td class="mono">CAD-351 · CAD-356</td></tr>
+      <tr><td>Skills only with evidence</td><td>A/B before promotion; curated, small</td><td class="mono">CAD-353</td></tr>
+      <tr><td>Poisoning defenses</td><td>external quarantine, provenance, planted-item red-team</td><td class="mono">CAD-347 · CAD-354</td></tr>
+      <tr><td>Measure and demote</td><td>A/B harness, helpful/harm counters, stale rate</td><td class="mono">CAD-354</td></tr>
+    </table></div>
+    <p class="muted" style="margin-top:24px;font-size:12.5px">Sources (retrieved 2026-09-23): anthropic.com/engineering (multi-agent research system; effective context engineering; agent skills; code execution with MCP; long-running harnesses; C compiler) · cognition.com/blog (don't build multi-agents; multi-agents working) · arXiv 2503.13657 (MAST) · 2308.00352 (MetaGPT) · 2307.07924 (ChatDev) · research.google blog + arXiv 2512.08296 (scaling agent systems) · code.claude.com docs (sub-agents, agent teams, claude-projects, memory) · claude.com/blog (projects-redesigned; context-management; advisor strategy) · factory.com/news (missions; missions-architecture) · cursor.com/blog (scaling-agents; self-driving-codebases; semsearch; secure-codebase-indexing) · arXiv 2606.20629, 2607.21656, 2603.12123, 2507.10535, 2410.10934, 2606.15689, 2608.29028, 2502.13069, 2510.01285, 2607.04697 · a2a-protocol.org v1.0 · trychroma.com/research/context-rot · arXiv 2602.11988 (AGENTS.md) · aider.chat repomap · arXiv 2410.14684 (RepoGraph) · METR (SWE-bench mergeability; time horizons) · arXiv 2509.16941, 2502.12115, 2412.14161, 2509.09853, 2609.23570 (VibeMemBench), 2602.08316 · arXiv 2510.04618 (ACE), 2509.25140 (ReasoningBank), 2308.10144, 2409.07429, 2507.23361, 2504.07952, 2604.14004, 2604.27003 · sakana.ai/dgm · github.blog agentic memory (Jan 15 2026) + docs.github.com copilot-memory · platform.claude.com managed-agents memory &amp; dreams · letta.com context repositories · arXiv 2504.19413 (Mem0), 2501.13956 (Zep), 2502.12110 (A-MEM) · developers.openai.com/codex/memories · docs.devin.ai knowledge · arXiv 2407.12784 (AgentPoison), 2503.03704 (MINJA), 2512.16962 (MemoryGraft), 2510.02373 (A-MemGuard), 2604.06996 (self-preference) · OWASP Top 10 for Agentic Applications (ASI06) · agentskills.io · arXiv 2602.12670 (SkillsBench), 2601.10338 · Karpathy llm-wiki gist · developers.googleblog.com Code Wiki. Items marked secondary in the research notes are not relied on for decisions.</p>
   </article>
 </div>
 </main>
@@ -459,7 +851,7 @@ ul.tight{padding-left:18px;margin:6px 0}ul.tight li{margin:3px 0}
     <section class="hero">
       <div class="kicker">Product direction &amp; go-to-market · 2026-09-23</div>
       <h1>Don't sell parallel agents. Sell work you can trust.</h1>
-      <p class="lede">Running several agents at once is now built into Claude Code, Codex, Cursor, Copilot and a dozen free apps. What nobody neutral offers is a <b>governed team</b>: a plan you approve, workers from any vendor, <b>a different vendor reviewing</b>, verdicts pinned to the exact commit, and nothing shipped without your press. Local, open source, and it remembers.</p>
+      <p class="lede">Running several agents at once is now built into Claude Code, Codex, Cursor, Copilot and a dozen free apps. What nobody neutral offers is a <b>governed team that learns</b>: a plan you approve, workers from any vendor, an <b>independent reviewer</b> on every commit, verdicts pinned to the exact commit, <b>verified memory</b> so nobody re-reads what is known, and nothing shipped without your press. Local and open source.</p>
     </section>
 
     <h2 id="d-market"><span class="n">01</span>Market, September 2026</h2>
@@ -487,10 +879,11 @@ ul.tight{padding-left:18px;margin:6px 0}ul.tight li{margin:3px 0}
     </div>
 
     <h2 id="d-position"><span class="n">02</span>Positioning</h2>
-    <div class="callout acc" style="font-size:15px;max-width:none"><b>Cadence is the open-source control plane that turns the coding agents you already pay for into a governed team.</b> One master plans with you, workers from any vendor deliver, a different vendor reviews, and nothing merges, sends or deploys without your approval. It runs on your machine and remembers everything.</div>
+    <div class="callout acc" style="font-size:15px;max-width:none"><b>Cadence is the open-source control plane that turns the coding agents you already pay for into a governed team that learns.</b> One master plans with you, team PMs run the work, workers from any vendor deliver, an independent reviewer checks every commit, verified lessons make the next task cheaper, and nothing merges, sends or deploys without your approval. It runs on your machine.</div>
     <div class="tblwrap"><table class="tbl">
       <tr><th>Wedge</th><th>Why it is defensible</th><th>Proof we can show</th></tr>
-      <tr><td>Cross-vendor review</td><td>No vendor will ship "our rival grades our output". Codex reviews Claude, Claude reviews Codex, verdict pinned to the SHA.</td><td>Stats from our own verdict store: defects caught per reviewer/author pair</td></tr>
+      <tr><td>Cross-vendor review</td><td>No vendor will ship "our rival grades our output". Fresh-context reviewers, pairings chosen by measured precision (a 2026 study found it helps one way and hurts the other), verdict pinned to the SHA.</td><td>Stats from our own verdict store: defects caught per reviewer/author pair</td></tr>
+      <tr><td>Verified team memory</td><td>In a September 2026 benchmark most memory systems did not beat memory-off; verified past experience did. Cited, re-checked, measured memory is hard to fake.</td><td>Reads and tokens saved per task, A/B with and without packs</td></tr>
       <tr><td>Evidence &amp; governance</td><td>Plans, dispatch gate, separation of duties, merge/send/deploy approvals with an audit trail — a category above session runners.</td><td><code>cadence audit</code> report of every merge's provenance</td></tr>
       <tr><td>Local, MIT, survives the company</td><td>Headless daemon on Linux/macOS servers and SSH boxes, not a Mac-only Electron app; your data, your subscriptions.</td><td>Runs on the same box as your repos; backup/restore bundle</td></tr>
       <tr><td>Continuity</td><td>Conversations and decisions outlive provider sessions, reinstalls and machines.</td><td>Kill-the-session demo: master resumes mid-plan</td></tr>
@@ -541,7 +934,7 @@ ul.tight{padding-left:18px;margin:6px 0}ul.tight li{margin:3px 0}
 
     <h2 id="d-gtm"><span class="n">07</span>Marketing strategy</h2>
     <div class="cards">
-      <div class="card"><h4>Message pillars</h4><p>1 · Cross-checked by a different vendor · 2 · You approve what ships · 3 · Your subscriptions, your machine · 4 · It remembers.</p></div>
+      <div class="card"><h4>Message pillars</h4><p>1 · Independent review of every commit · 2 · You approve what ships · 3 · Your subscriptions, your machine · 4 · It learns — verified, not guessed.</p></div>
       <div class="card"><h4>Proof, not claims</h4><p>Built by Cadence itself: 11 PRs merged in a day through it; publish the incidents the system caught and how. Numbers from our own verdict store and <code>cadence audit</code>.</p></div>
       <div class="card"><h4>Flagship content</h4><p>"Who catches whose bugs": a recurring cross-vendor review report (Claude vs Codex vs Pi as author/reviewer). Unique data, honest, shareable.</p></div>
       <div class="card"><h4>Demo that sells</h4><p>90-second video: one chat → plan card → three vendors working → Codex rejects Claude's PR → fix → merge click → preview deploy. Plus the kill-the-session continuity moment.</p></div>
@@ -572,6 +965,7 @@ ul.tight{padding-left:18px;margin:6px 0}ul.tight li{margin:3px 0}
       <tr><td>Time to first plan</td><td>From <code>curl | sh</code> to plan card</td><td>&lt; 10 min</td></tr>
       <tr><td>Trust</td><td>Share of plans approved without edits; review rounds per PR</td><td>up; ≤ 2</td></tr>
       <tr><td>Human minutes per merged PR</td><td>From the charter</td><td>down</td></tr>
+      <tr><td>Learning</td><td>Reads avoided per task; lesson reuse, helpful and harm rates (A/B)</td><td>up; harm → 0</td></tr>
       <tr><td>Retention</td><td>Week-4 active installs</td><td>up</td></tr>
     </table></div>
     <p class="muted">Telemetry is opt-in and local-first; public numbers come from partners who share them and from our own dogfooding.</p>
@@ -581,8 +975,8 @@ ul.tight{padding-left:18px;margin:6px 0}ul.tight li{margin:3px 0}
       <tr><th>Idea</th><th>Value</th><th>Effort</th><th>Note</th></tr>
       <tr><td>Vendor cloud agents as workers</td><td><span class="chip ok">high</span></td><td>M each</td><td>Codex cloud, Jules, Cursor Cloud Agents, Devin cloud (CAD-243); strategic hedge</td></tr>
       <tr><td>Cost &amp; quota per plan</td><td><span class="chip ok">high</span></td><td>M</td><td>Estimate before approval, actual after; builds on CAD-114/80</td></tr>
-      <tr><td>Reviewer scorecards → routing</td><td><span class="chip ok">high</span></td><td>M</td><td>Feeds the "who catches whose bugs" report; L5 direction</td></tr>
-      <tr><td>Playbooks / plan templates</td><td><span class="chip ok">high</span></td><td>S</td><td>Bugfix, feature, dependency upgrade, security patch; community-shared</td></tr>
+      <tr><td>Reviewer scorecards → routing</td><td><span class="chip ok">high</span></td><td>M</td><td>Now in the plan: review precision per pairing (CAD-354) drives QA assignment (CAD-340)</td></tr>
+      <tr><td>Playbooks / plan templates</td><td><span class="chip ok">high</span></td><td>S</td><td>Skills path is in the plan (CAD-353); community sharing stays a nice-to-have</td></tr>
       <tr><td>Shareable run report</td><td><span class="chip ok">high</span></td><td>S</td><td>Read-only page: plan → diffs → verdicts → approvals. Growth loop</td></tr>
       <tr><td>⌘K palette + "ask master about this"</td><td><span class="chip">medium</span></td><td>S</td><td>From any issue, PR or agent</td></tr>
       <tr><td>GitHub App</td><td><span class="chip">medium</span></td><td>M</td><td>Label an issue → master drafts a plan; reviewer comments on the PR</td></tr>
@@ -614,6 +1008,7 @@ ul.tight{padding-left:18px;margin:6px 0}ul.tight li{margin:3px 0}
     <a href="#s-trust">Identity &amp; trust</a>
     <a href="#s-store">Data store &amp; continuity</a>
     <a href="#s-master">Master agent</a>
+    <a href="#s-team">Teams &amp; memory (tech)</a>
     <a href="#s-platforms">Connected platforms</a>
     <a href="#s-loop">Autonomous loop</a>
     <a href="#s-ui">UI revamp</a>
@@ -791,6 +1186,61 @@ ul.tight{padding-left:18px;margin:6px 0}ul.tight li{margin:3px 0}
       <tr><td>Native feel</td><td>Real TUI</td><td>None</td><td>Browser terminal (xterm.js over <code>tmux -C</code>) as a view; Codex TUI can attach to the same thread</td></tr>
     </table></div>
 
+        <h2 id="s-team"><span class="n">08b</span>Teams, reports and memory — technical</h2>
+    <p class="sub">Builds on ADR-0001 (roles, team.yaml), the existing memory store (typed, git-backed, quorum-reviewed) and <code>cadence report</code> / <code>issue retro</code>. Tickets: CAD-338–CAD-357, CAD-378.</p>
+    <h3>Role file — <code>vault/company/roles/qa.md</code></h3>
+    <pre class="pre">---
+role: qa
+title: QA reviewer
+level: team                  # company | team
+staffing: 1 per team
+preferred: {provider: claude, model: opus, effort: high}
+fallbacks: [{provider: codex, model: gpt-5.5, effort: high}]
+constraints: [fresh_context, vendor_differs_from: author]   # pairing by measured precision
+permission_mode: read-only
+skills: [cadence-review, secret-scan]
+memory_scopes: [company, project, role:qa]
+budget: {turns: 60, tokens: 400k}
+escalate_on: [ambiguity, missing_access, scope_change, destructive_op, budget_overrun, two_failed_attempts]
+reports: [done, question, blocked]
+---
+Reviews the exact commit against the contract, runs the gates, records a verdict pinned to the SHA.
+## May …   ## Never …</pre>
+    <h3>Team — <code>~/pm/&lt;project&gt;/team.yaml</code> (ADR-0001)</h3>
+    <pre class="pre">team: reminders
+pm: pm-rmd
+roster: {dev: 2..4, qa: 1, devops: 1, research: 0..1}
+overrides: {dev: {effort: medium}}      # drift from the registry is reported, never auto-fixed
+autonomy: approve-plans
+write_leases: per-issue planned paths</pre>
+    <h3>Report — <code>cadence.report/2</code></h3>
+    <pre class="pre">{ "kind": "done | question | blocked", "task": "RMD-1", "agent": "w1", "sha": "3f9c2e1…",
+  "reflection": { "expected": "…", "evidence": "…", "cause": "…", "correction": "…",
+                  "lesson": "… | none", "next": "…" },
+  "claims": [ { "type": "pitfall", "text": "…", "evidence": ["wrangler.toml:12@3f9c2e1", "test:scheduled.spec.ts"],
+                "scope": "role:dev path:wrangler.toml", "confidence": "medium" } ],
+  "constraints": ["copied verbatim from the kickoff"],
+  "context_feedback": { "used": [{"id":"L-12","helpful":true}], "wrong": [{"id":"L-7","why":"…"}],
+                        "reread": ["src/index.ts"] },
+  "question": { "text": "…", "options": ["…"], "impact": "…", "state": "input-required" } }</pre>
+    <h3>Memory item — <code>vault/lessons/L-12.md</code> (extends the existing memory schema)</h3>
+    <pre class="pre">id: L-12   type: pitfall   status: verified          # candidate | verified | needs-revalidation | invalidated
+claim: "Cron triggers for Workers belong in wrangler.toml [triggers] …"
+scope: {role: dev, paths: [wrangler.toml], project: reminders}
+evidence: [{kind: commit, ref: 3f9c2e1}, {kind: test, ref: scheduled.spec.ts, rerun: pass}]
+source_trust: internal                                  # external → quarantine, never auto-promoted
+proposer: w1 (codex)   curator: claude (sonnet)   quorum: n/a (project scope)
+valid_from: 3f9c2e1   invalidated_at: null   last_verified: 2026-09-23
+expires_after_unused: 28d   helpful: 6   harmful: 0   supersedes: [L-7]</pre>
+    <h3>Context pack — built at task start</h3>
+    <ol class="tight">
+      <li>Inputs: role, task (issue, planned paths, labels), budget. Static parts first so prompt prefixes cache.</li>
+      <li>Select: role handbook excerpt → contract (acceptance, constraints, non-goals verbatim) → project context → lessons by path, then similarity, then role → FAQ → skills by name.</li>
+      <li>Re-check each lesson's citations against HEAD; withhold stale or contradicted items with the reason (CAD-203).</li>
+      <li>Rank by confidence × helpful rate × recency; cap to the role budget; render each item with "verified at SHA" and its citation.</li>
+      <li>Log included ids for the report's context feedback; the same builder serves issue dispatch, <code>--job</code> dispatch and continuity (CAD-194, CAD-324).</li>
+    </ol>
+
     <h2 id="s-platforms"><span class="n">09</span>Connected platforms — AgenticOS v2 as reference</h2>
     <p class="sub">Cadence integrates with a <b>platform contract</b>, not a vendor. AgenticOS v2 is the first implementation; a user's own Cloudflare account is the second.</p>
     <div class="cards">
@@ -917,7 +1367,7 @@ ul.tight{padding-left:18px;margin:6px 0}ul.tight li{margin:3px 0}
 const $=s=>document.querySelector(s);
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]));
 const S={tab:'plan',screen:'install',step:0,narrow:false,sim:'normal',sbx:false,
-  checks:null,aos:false,aosScopes:{know:true,crm:true,leads:true,files:true,threads:false,wa:true},start:'restore',restored:false,consentStep:0,platTab:'aos',cf:false,
+  checks:null,aos:false,aosScopes:{know:true,crm:true,leads:true,files:true,threads:false,wa:true},start:'restore',restored:false,consentStep:0,platTab:'aos',cf:false,teamTab:'org',vaultTab:'overview',pack:'dev',ver:{},answer:null,
   master:'claude',model:'opus',effort:'medium',aosCredits:false,
   repo:'~/code/reminders',maxw:3,reviewer:'claude',workers:{claude:true,codex:true,pi:true,devin:false,cursor:true},dial:1,
   launched:false,launching:0,
@@ -945,10 +1395,21 @@ function toggleTheme(){
       <text x="10" y="30" fill="var(--mute)" font-size="11" font-family="IBM Plex Mono">DEFAULT LEVEL: "APPROVE PLANS"</text>`;
   document.getElementById('loop').innerHTML=g;
 })();
+(function lloop(){
+  const st=[['Job','worker','var(--panel2)','var(--line2)'],['Report','6 fields + feedback','var(--info-dim)','var(--info)'],['Checks','logic: cite, re-run, scan','var(--panel2)','var(--line2)'],['Curator','other vendor','var(--warn-dim)','var(--warn)'],['Vault','git, itemized','var(--accent-dim)','var(--accent)'],['Pack','verified at SHA','var(--accent-dim)','var(--accent)']];
+  let g='';const w=138,gap=22;
+  st.forEach((s,i)=>{const x=14+i*(w+gap);g+=`<rect x="${x}" y="40" width="${w}" height="62" rx="10" fill="${s[2]}" stroke="${s[3]}"/><text x="${x+w/2}" y="66" text-anchor="middle" fill="var(--strong)" font-weight="600">${s[0]}</text><text x="${x+w/2}" y="86" text-anchor="middle" fill="var(--mute)" font-size="10.5">${s[1]}</text>`;
+    if(i<st.length-1) g+=`<line x1="${x+w+2}" y1="71" x2="${x+w+gap-3}" y2="71" stroke="var(--mute)"/><path d="M${x+w+gap-3} 71 l-6 -4 v8z" fill="var(--mute)"/>`;});
+  const last=14+5*(w+gap)+w/2;
+  g+=`<path d="M${last} 102 C ${last} 150, 83 150, 83 106" fill="none" stroke="var(--accent)" stroke-dasharray="4 4"/><path d="M83 104 l-5 8 h10z" fill="var(--accent)"/>`;
+  g+=`<text x="490" y="180" text-anchor="middle" fill="var(--accent)" font-size="11" font-family="IBM Plex Mono">next task starts from what is already verified · feedback demotes what hurt</text>`;
+  g+=`<text x="14" y="24" fill="var(--mute)" font-size="11" font-family="IBM Plex Mono">EVERY JOB, QUESTION OR BLOCKER</text>`;
+  const el=document.getElementById('lloop'); if(el) el.innerHTML=g;
+})();
 
 /* ---------- data ---------- */
-const SCREENS=[['install','Install'],['setup','Setup wizard'],['home','Home · chat'],['projects','Projects'],['agents','Agents'],['services','Platforms'],['settings','Settings']];
-const STEPS=[['Start','fresh · restore · import'],['Environment','checks & fixes'],['Platforms','optional services'],['Master agent','provider & model'],['Workspace','tracker & first project'],['Team & autonomy','workers, reviewer, dial'],['Launch','review & start']];
+const SCREENS=[['install','Install'],['setup','Setup wizard'],['home','Home · chat'],['projects','Projects'],['teams','Teams & roles'],['vault','Company vault'],['services','Platforms'],['settings','Settings']];
+const STEPS=[['Start','fresh · restore · import'],['Environment','checks & fixes'],['Platforms','optional services'],['Master agent','provider & model'],['Workspace','tracker & first project'],['Team & autonomy','starter team, dial'],['Launch','review & start']];
 const CHECKS=[
  {n:'git',d:'2.47.1',s:'ok'},{n:'tmux',d:'3.5a · needed for Devin/Cursor panes',s:'ok'},{n:'gh',d:'2.63 · signed in as @harbor-dev',s:'ok'},
  {n:'claude',d:'signed in · Claude Max',s:'ok'},{n:'codex',d:'signed in · ChatGPT Pro',s:'ok'},
@@ -960,19 +1421,228 @@ const ISSUES=[
  {id:'RMD-3',t:'Send WhatsApp reminder via approved template',p:'pi',a:'w3',risk:'human',acc:4,st:'ready',dep:'RMD-2'},
  {id:'RMD-4',t:'Tests, preview deploy and runbook',p:'cursor',a:'w4',risk:'routine',acc:3,st:'ready',dep:'RMD-1'}];
 const AGENTS=[
- {id:'master',p:'claude',role:'Master · PM',m:'opus · medium',st:'chatting',kind:'chat'},
- {id:'w1',p:'codex',role:'Worker',m:'gpt-5.5-codex · high',st:'implementing RMD-1 · 18m',kind:'chat'},
- {id:'w2',p:'claude',role:'Worker',m:'sonnet · medium',st:'implementing RMD-2 · 11m',kind:'chat'},
- {id:'w3',p:'pi',role:'Worker',m:'aos-gateway/glm · low',st:'idle · waiting on RMD-2',kind:'chat'},
- {id:'w4',p:'cursor',role:'Worker (pane)',m:'auto',st:'queued · RMD-4 after RMD-1',kind:'pty'},
- {id:'rev-1',p:'claude',role:'Reviewer',m:'opus · high',st:'idle',kind:'chat'}];
+ {id:'master',p:'claude',role:'Master · assistant',m:'opus · high',st:'chatting',kind:'chat'},
+ {id:'pm-rmd',p:'codex',role:'PM · Reminders',m:'gpt-5.5 · medium',st:'tracking P-1',kind:'chat',team:1},
+ {id:'w1',p:'codex',role:'Dev · Reminders',m:'gpt-5.5-codex · high',st:'implementing RMD-1 · 18m',kind:'chat',team:1},
+ {id:'w2',p:'claude',role:'Dev · Reminders',m:'sonnet · high',st:'implementing RMD-2 · 11m',kind:'chat',team:1},
+ {id:'w3',p:'pi',role:'Dev · Reminders',m:'glm-5.3-flash · low',st:'idle · waits on RMD-2',kind:'chat',team:1},
+ {id:'w4',p:'cursor',role:'Dev · Reminders (pane)',m:'auto',st:'queued · RMD-4 after RMD-1',kind:'pty',team:1},
+ {id:'qa-rmd',p:'claude',role:'QA · Reminders',m:'opus · high',st:'idle',kind:'chat',team:1},
+ {id:'ops-rmd',p:'claude',role:'DevOps · Reminders',m:'sonnet · medium',st:'idle',kind:'chat',team:1},
+ {id:'curator',p:'codex',role:'Curator · company',m:'gpt-5.5 · medium',st:'idle',kind:'chat'}];
 const PL={claude:'Cl',codex:'Cx',pi:'Pi',devin:'Dv',cursor:'Cu'};
 const av=(p,t)=>`<span class="av ${p}" title="${p}">${t||PL[p]||'?'}</span>`;
+/* ---------- teams, roles, reports, vault (v4) ---------- */
+const ROLES=[
+ {k:'master',t:'Master · assistant',lvl:'company',n:'1 per install',p:'claude',m:'opus',e:'high',fb:['codex','gpt-5.5','high'],
+  d:'Talks with you, turns goals into projects and teams, staffs them from these roles, answers escalations and sends a daily digest. Never implements.',
+  may:['Create projects and teams','Propose plans','Answer or route questions'],never:['Write code','Approve its own plans','Merge or press effects'],
+  skills:['cadence','vault-search','plan-propose'],scopes:['company','every team (read)'],perm:'Broker approvals · cadence CLI'},
+ {k:'pm',t:'PM',lvl:'team',n:'1 per team',p:'codex',m:'gpt-5.5',e:'medium',fb:['claude','sonnet','medium'],
+  d:"Owns one team's plan: turns goals into issues with acceptance, dispatches, tracks, collects reflections and escalates to the master.",
+  may:['Break plans into issues','Dispatch inside approved plans','Answer team questions'],never:['Implement','Review','Merge'],
+  skills:['cadence','issue-plan'],scopes:['company','team','project'],perm:'accept-edits · cadence CLI'},
+ {k:'dev',t:'Developer',lvl:'team',n:'1–4 per team',p:'codex',m:'gpt-5.5-codex',e:'high',fb:['claude','sonnet','high'],
+  d:'Implements one issue in its own worktree, tests it, opens a PR with the exact SHA, then reflects.',
+  may:['Edit its own worktree','Run tests','Open pull requests'],never:['Review or merge its own work','Press effects'],
+  skills:['cadence','repo-map','test-isolation'],scopes:['company','project','role:dev','paths it touches'],perm:'accept-edits · cargo/git/gh'},
+ {k:'qa',t:'QA reviewer',lvl:'team',n:'1 per team',p:'claude',m:'opus',e:'high',fb:['codex','gpt-5.5','high'],rule:"Fresh context; a different vendor from the author by default — pairing follows measured precision",
+  d:'Reviews the exact commit against acceptance, runs the gates and records a verdict pinned to the SHA.',
+  may:['Check out any commit','Run gates','Record verdicts'],never:["Edit the author's branch",'Merge'],
+  skills:['cadence-review','secret-scan'],scopes:['company','project','role:qa'],perm:'read-only · test runner'},
+ {k:'devops',t:'DevOps',lvl:'team',n:'1 per team',p:'claude',m:'sonnet',e:'medium',fb:['pi','glm-5.3-flash','low'],
+  d:'Lands verified PRs through the merge queue, prepares releases and deploys as effects, watches host health.',
+  may:['Queue merges with a PASS on head','Request deploy effects','Clean up worktrees'],never:['Merge without a verdict on head','Press its own effects'],
+  skills:['merge-queue','cloudflare-deploy'],scopes:['company','project','role:devops'],perm:'gh · wrangler (preview only)'},
+ {k:'research',t:'Researcher',lvl:'team',n:'on demand',p:'claude',m:'opus',e:'high',fb:['codex','gpt-5.5','high'],
+  d:'Runs spikes and writes specs and ADR drafts with sources. Hired by the master or a PM when a plan needs it.',
+  may:['Read anything in scope','Write specs and ADR drafts'],never:['Merge','Dispatch'],
+  skills:['research','adr-draft'],scopes:['company','project'],perm:'read-only · web'},
+ {k:'curator',t:'Curator',lvl:'company',n:'1 per company',p:'codex',m:'gpt-5.5',e:'medium',fb:['claude','sonnet','medium'],rule:"Provider must differ from the proposer's",
+  d:'Verifies lesson candidates against their evidence, merges duplicates, retires stale memory and promotes repeated lessons into playbooks.',
+  may:['Accept, merge or reject candidates','Run read-only repro commands'],never:['Accept its own proposals','Write code'],
+  skills:['vault-curate'],scopes:['company (write)'],perm:'read-only · vault'}];
+const MODELS={claude:['opus','sonnet','haiku'],codex:['gpt-5.5','gpt-5.5-codex'],pi:['glm-5.3-flash','anthropic/claude-sonnet','openai/gpt-5.5'],cursor:['auto'],devin:['default']};
+S.roles=Object.fromEntries(ROLES.map(r=>[r.k,{p:r.p,m:r.m,e:r.e}]));
+const TEAMS=[
+ {k:'reminders',n:'Reminders',proj:'reminders · RMD',goal:'WhatsApp booking reminders',auto:'Approve plans',
+  m:[['PM','pm-rmd','codex','gpt-5.5','tracking P-1'],['Dev','w1','codex','gpt-5.5-codex','RMD-1'],['Dev','w2','claude','sonnet','RMD-2'],['Dev','w3','pi','glm-5.3-flash','waits on RMD-2'],['Dev','w4','cursor','auto','queued'],['QA','qa-rmd','claude','opus','reviews codex/pi/cursor work'],['DevOps','ops-rmd','claude','sonnet','idle']]},
+ {k:'storefront',n:'Storefront',proj:'storefront · SF',goal:'Checkout redesign · paused',auto:'Ask for everything',
+  m:[['PM','pm-sf','claude','sonnet','paused'],['Dev','w5','codex','gpt-5.5-codex','—'],['QA','qa-sf','codex','gpt-5.5','—',"same vendor as w5 — next review goes to its fallback (claude)"]]}];
+const REPORTS={
+ 'R-11':{who:'w2',role:'Dev',p:'claude',task:'RMD-2',at:'09:48',type:'question',
+   q:'Bookings carry a branch time zone and a customer time zone. Which one decides "24 h before"?',
+   route:['w2','pm-rmd','vault'],ans:'Answered from the vault in 4 s — FAQ F-4: "Customer-facing times use the branch time zone" (decided by you, Aug 30; reused 6×). Nobody else was interrupted.'},
+ 'R-12':{who:'w1',role:'Dev',p:'codex',task:'RMD-1',at:'10:48',type:'done',sha:'3f9c2e1',
+   six:[['Expected','An hourly cron Worker that builds clean'],['Evidence','PR #12 · tsc 0 errors · 6 tests pass · SHA 3f9c2e1'],['Cause','Dashboard crons were overwritten on deploy; wrangler 4 reads [triggers] from wrangler.toml'],['Correction','Moved the cron into wrangler.toml; added a scheduled() test'],['Next','qa-rmd reviews 3f9c2e1']],
+   lesson:'Cron triggers for Workers belong in wrangler.toml [triggers]; dashboard crons are overwritten on deploy.',
+   ctx:[['L-12','helpful','ok'],['PB-3 cloudflare-worker-cron','helpful','ok'],['L-7','wrong — wrangler 4 renamed the flag','fail']],reread:['wrangler.toml','src/index.ts'],cand:'C-31'},
+ 'R-13':{who:'qa-rmd',role:'QA',p:'claude',task:'RMD-1',at:'11:04',type:'done',sha:'3f9c2e1',
+   six:[['Expected','RMD-1 meets 3 acceptance checks'],['Evidence','PASS pinned to 3f9c2e1 · gates green · secret scan clean'],['Cause','—'],['Correction','—'],['Next','ops-rmd queues the merge after your click']],
+   lesson:'No reusable lesson.',ctx:[['PB-1 cadence-review','helpful','ok']],reread:[]},
+ 'R-14':{who:'ops-rmd',role:'DevOps',p:'claude',task:'RMD-4',at:'11:18',type:'question',
+   q:'Production cron: hourly, or every 15 minutes? Every 15 minutes is about 4× the Worker requests.',
+   route:['ops-rmd','pm-rmd','master','you'],ans:null}};
+const QUEUE=[
+ {id:'C-31',from:'R-12 · w1 (codex)',claim:'Cron triggers for Workers belong in wrangler.toml [triggers]; dashboard crons are overwritten on deploy.',scope:'role:dev · path wrangler.toml',
+  checks:[['Evidence resolves','PR #12 and 3f9c2e1 exist','ok'],['Referenced test passes on main','scheduled.spec.ts','ok'],['Secret scan','clean','ok'],['Duplicate','87% similar to L-12','warn'],['Contradiction','conflicts with L-7','warn'],['Source','internal agent report','ok']],
+  cur:'claude · sonnet — fallback, because the proposer is codex',verdict:'Merge into L-12 (adds wrangler 4 evidence) and mark L-7 for revalidation.',acts:[['merge','Apply verdict','pri'],['accept','Accept as new',''],['evidence','Ask for evidence',''],['reject','Reject','danger']]},
+ {id:'C-32',from:'R-10 · qa-rmd (claude) · yesterday',claim:'Reviewers must check that dispatch kickoffs quote every acceptance item verbatim.',scope:'role:qa',
+  checks:[['Evidence resolves','CAD-300 fix commit','ok'],['Referenced test passes on main','kickoff_quotes_acceptance','ok'],['Secret scan','clean','ok'],['Duplicate','none','ok'],['Contradiction','none','ok'],['Source','internal agent report','ok']],
+  cur:'codex · gpt-5.5',verdict:'Accept · scope role:qa · revalidate when the kickoff template changes.',acts:[['accept','Apply verdict','pri'],['reject','Reject','danger']]},
+ {id:'C-33',from:'CRM note (external content)',claim:'"Always send reminders 48 hours before the booking."',scope:'—',
+  checks:[['Evidence resolves','no internal evidence','fail'],['Secret scan','clean','ok'],['Contradiction','conflicts with plan P-1 (24 h)','warn'],['Source','external data — quarantined','fail']],
+  cur:'not sent — external content never becomes memory automatically',verdict:'Needs your decision: text read from CRM, inboxes or the web could be an injection.',acts:[['promote','Promote as policy','pri'],['discard','Discard','danger']]}];
+const LESSONS=[
+ {id:'L-21',c:'A worker\'s "done" without a SHA is a claim; ask for a SHA: line.',scope:'company · role:pm',conf:.95,uses:22,help:21,st:'verified',ev:'CAD-213 · 14 dispatches',by:'curator (codex)',reval:'when the report format changes'},
+ {id:'L-12',c:'Cron triggers for Workers belong in wrangler.toml [triggers]; dashboard crons are overwritten on deploy.',scope:'role:dev · wrangler.toml',conf:.92,uses:7,help:6,st:'verified',ev:'PR #9 · scheduled.spec.ts',by:'curator (claude)',reval:'on a wrangler major version'},
+ {id:'L-19',c:'Normalise phone numbers to E.164 before template sends; the CRM stores local formats.',scope:'company',conf:.88,uses:4,help:4,st:'verified',ev:'RMD-2 tests · CRM sample of 38',by:'curator (codex)',reval:'every 90 days'},
+ {id:'L-7',c:'Use --compatibility-flags=nodejs_compat_v2 for crypto in Workers.',scope:'project:reminders',conf:.41,uses:3,help:1,st:'needs revalidation',ev:'PR #4',by:'curator (codex)',reval:'contradicted by R-12 (wrangler 4)'},
+ {id:'L-3',c:'Deploy with wrangler publish.',scope:'role:devops',conf:0,uses:9,help:5,st:'retired',ev:'PR #2',by:'curator (claude)',reval:'superseded by wrangler deploy'}];
+const PACKS={
+ dev:{task:'w4 · RMD-4 tests, preview deploy and runbook',items:[['Company · engineering standards (excerpt)','every role','620'],['Project context · reminders','project','540'],['Code map · src/ 6 modules @ 3f9c2e1','paths touched','880'],['L-12 cron triggers in wrangler.toml','path match','60'],['L-19 E.164 phone numbers','similar task','45'],['FAQ F-4 branch time zone','similar task','40'],['PB-3 cloudflare-worker-cron (skill)','task match','35 + 1.2k on use']],
+   out:[['L-7','needs revalidation (contradicted)'],['L-3','retired']],tok:'2.2k of 6k',saved:'about 11 file reads and 2 questions'},
+ qa:{task:'qa-rmd · review RMD-1 @ 3f9c2e1',items:[['Review policy (cross-vendor)','role:qa','310'],['Diff 3f9c2e1 vs base + acceptance','task','1.9k'],['C-32 quote acceptance verbatim (pending)','role:qa','— (not injected until accepted)'],['PB-1 cadence-review (skill)','role','40 + 900 on use']],
+   out:[['Author\'s reflection','kept out so the review stays independent']],tok:'2.3k of 6k',saved:'no re-derivation of the gates'},
+ devops:{task:'ops-rmd · merge PR #12, deploy preview',items:[['Autonomy & approvals policy','role:devops','280'],['Merge-queue runbook','role:devops','210'],['L-12 cron triggers in wrangler.toml','path match','60'],['PB-7 cloudflare-deploy (skill)','task','30 + 800 on use']],
+   out:[['L-3','retired (wrangler publish)']],tok:'0.6k of 4k',saved:'the deploy steps, not re-read from docs'},
+ pm:{task:'pm-rmd · track plan P-1',items:[['Plan P-1 + dependency graph','team','420'],['Team charter · Reminders','team','160'],['L-21 SHA or it is a claim','role:pm','35'],['Open questions: 1 (R-14, waiting on you)','team','60']],
+   out:[['Code maps','not needed for planning']],tok:'0.7k of 6k',saved:'status gathering across 6 agents'}};
+
+function repList(){const r=[];if(S.planApproved)r.push('R-11');if(S.ff)r.push('R-12','R-13','R-14');return r}
+function teams(){
+  const tabs=[['org','Org'],['roles','Roles'],['agents','Agents'],['reports','Reports']];
+  const n=repList().length;
+  const head=`<div class="ptabs"><div class="seg">${tabs.map(([k,l])=>`<button data-act="teamtab" data-v="${k}" aria-pressed="${S.teamTab===k}">${l}${k==='reports'&&n?` <span class="num muted">${n}</span>`:''}</button>`).join('')}</div></div>`;
+  return head+({org:orgView,roles:rolesView,agents,reports:reportsView})[S.teamTab]();
+}
+function orgView(){
+  const R=S.roles;
+  const card=t=>{const pending=t.k==='reminders'&&!S.planApproved;
+    return `<div class="box" style="${pending?'opacity:.7':''}"><div class="hd"><div><h5>${t.n} team</h5><div class="muted mono" style="font-size:11.5px">${t.proj} · ${t.goal}</div></div><span class="chip ${pending?'warn':t.k==='storefront'?'':'acc'}">${pending?'proposed with P-1':t.auto}</span></div>
+     ${t.m.map(([role,alias,p,m,st,warn])=>`<div class="mrow">${av(p)}<div><div class="strong">${alias} <span class="chip" style="margin-left:4px">${role}</span></div><div class="muted" style="font-size:11.5px">${p} · ${m}${st&&!pending?' · '+st:''}</div>${warn?`<div style="font-size:11.5px;color:var(--warn)">⚠ ${warn}</div>`:''}</div></div>`).join('')}
+     <div class="bd muted" style="font-size:12px;border-top:1px solid var(--line)">${pending?'Staffed from your roles when you approve plan P-1.':t.k==='reminders'?`${S.ff?4:1} reports today · 1 question answered from the vault`:'Paused by you · no agents running'}</div></div>`};
+  return `<div class="pane stack" style="gap:14px">
+   <div class="orgtop">
+    <div class="box"><div class="bd row">${av('op','Yo')}<div><b class="strong">You</b><div class="muted" style="font-size:12px">goals · approvals · vault policy</div></div></div></div><span class="orgarrow">→</span>
+    <div class="box" style="border-color:var(--accent)"><div class="bd row">${av(R.master.p)}<div><b class="strong">Master</b> <span class="chip acc">assistant</span><div class="muted" style="font-size:12px">${R.master.p} · ${R.master.m} · ${R.master.e} · chatting</div></div></div></div><span class="orgarrow">+</span>
+    <div class="box"><div class="bd row">${av(R.curator.p)}<div><b class="strong">Curator</b> <span class="chip">company</span><div class="muted" style="font-size:12px">${R.curator.p} · ${R.curator.m} · ${S.ff?QUEUE.filter(q=>!S.ver[q.id]).length+' in queue':'idle'}</div></div></div></div>
+   </div>
+   <div class="teams">${TEAMS.map(card).join('')}<button class="box newteam" data-act="newteam">+ New team<span class="muted">The master proposes a team together with a plan; you approve both.</span></button></div>
+   <div class="callout acc" style="max-width:none">Responsibility flows down; reports flow up. Workers report to their PM, PMs to the master, the master to you. A question climbs one level at a time and stops at the first level — or vault entry — that can answer it. One writer per code area; reviews and research run in parallel.</div></div>`;
+}
+function rolesView(){
+  return `<div class="pane"><div class="between" style="margin-bottom:10px;flex-wrap:wrap;gap:8px"><div><b class="strong">Roles</b> <span class="muted" style="font-size:12.5px">defined once for the company · <code>vault/company/roles/*.md</code> · every change is a commit</span></div><button class="btn sm" data-act="toast" data-v="Describe the role in chat, or add vault/company/roles/<name>.md">+ Role</button></div>
+  <div class="tblwrap"><table class="tbl"><tr><th>Role</th><th>Description</th><th>Preferred</th><th>Fallback</th><th>Staffing</th><th></th></tr>
+  ${ROLES.map(r0=>{const r=S.roles[r0.k];return `<tr><td><div class="row">${av(r.p)}<div>${r0.t}<div class="muted" style="font-size:11px;font-weight:400">${r0.lvl}</div></div></div></td><td style="min-width:260px;color:var(--soft)">${r0.d}${r0.rule?`<div style="margin-top:5px"><span class="chip warn">${r0.rule}</span></div>`:''}</td><td class="mono" style="white-space:nowrap">${r.p} · ${r.m} · ${r.e}</td><td class="mono muted" style="white-space:nowrap">${r0.fb.join(' · ')}</td><td>${r0.n}</td><td><button class="btn sm" data-act="role" data-v="${r0.k}">Edit</button></td></tr>`}).join('')}</table></div>
+  <div class="cards" style="margin-top:14px">
+   <div class="card"><h4>Independent by rule</h4><p>QA reviews in a fresh context, from a different vendor by default — pairings follow measured review precision. The curator never shares a vendor with the proposer. A collision launches the fallback and says why.</p></div>
+   <div class="card"><h4>Desired vs running</h4><p>Edits apply at each agent's next start. Running agents show "restart to apply" — never a silent switch mid-task.</p></div>
+   <div class="card"><h4>Availability</h4><p>A missing CLI, signed-out provider or exhausted quota falls back to the next choice, with the reason recorded.</p></div></div></div>`;
+}
+function roleDrawer(k){
+  const r0=ROLES.find(x=>x.k===k),r=S.roles[k],provs=['claude','codex','pi','cursor','devin'];
+  return `<div class="scrim" data-act="close" style="place-items:stretch end;padding:0;background:rgba(0,0,0,.35)"><div class="drawer" role="dialog" aria-label="Role ${r0.t}">
+   <div class="dh"><div class="between"><span class="num muted">vault/company/roles/${k}.md</span><button class="btn sm ghost" data-act="close" aria-label="Close">✕</button></div><h3 style="margin:6px 0 6px;font-size:18px">${r0.t}</h3><div class="row"><span class="chip">${r0.lvl}</span><span class="chip">${r0.n}</span></div></div>
+   <div class="db">
+    <label class="field"><span>Description — what agents in this role are told</span><textarea class="input" rows="4">${esc(r0.d)}</textarea></label>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px">
+     <label class="field"><span>Preferred provider</span><select class="input" data-act="rolefield" data-k="${k}" data-f="p">${provs.map(p=>`<option value="${p}" ${p===r.p?'selected':''} ${p==='devin'?'disabled':''}>${p}${p==='devin'?' (not installed)':''}</option>`).join('')}</select></label>
+     <label class="field"><span>Model</span><select class="input" data-act="rolefield" data-k="${k}" data-f="m">${(MODELS[r.p]||[]).map(m=>`<option ${m===r.m?'selected':''}>${m}</option>`).join('')}</select></label>
+     <label class="field"><span>Effort</span><select class="input" data-act="rolefield" data-k="${k}" data-f="e">${['low','medium','high'].map(e=>`<option ${e===r.e?'selected':''}>${e}</option>`).join('')}</select></label></div>
+    <div class="field"><span>Fallback</span><div class="mono" style="font-size:12.5px">${r0.fb.join(' · ')}</div></div>
+    ${r0.rule?`<div class="callout" style="margin:0 0 14px">${r0.rule}. On a collision Cadence launches the fallback.</div>`:''}
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+     <div><div class="slabel">May</div>${r0.may.map(x=>`<div class="ck"><span class="b on">✓</span>${x}</div>`).join('')}</div>
+     <div><div class="slabel">Never</div>${r0.never.map(x=>`<div class="ck"><span class="b" style="color:var(--fail)">×</span>${x}</div>`).join('')}</div></div>
+    <div class="slabel" style="margin-top:14px">Skills — playbooks loaded on demand</div><div class="row" style="flex-wrap:wrap;margin-top:6px">${r0.skills.map(s=>`<span class="chip acc">${s}</span>`).join('')}</div>
+    <div class="slabel" style="margin-top:14px">Memory scopes in its context pack</div><div class="row" style="flex-wrap:wrap;margin-top:6px">${r0.scopes.map(s=>`<span class="chip">${s}</span>`).join('')}</div>
+    <div class="slabel" style="margin-top:14px">Permissions</div><div style="font-size:13px;margin-top:4px">${r0.perm}</div>
+    <div class="slabel" style="margin-top:14px">Reports</div><div style="font-size:13px;margin-top:4px">On done, question or blocked: the six-field reflection plus feedback on the context it was given.</div></div>
+   <div style="padding:12px 18px;border-top:1px solid var(--line);display:flex;gap:8px;justify-content:flex-end"><button class="btn" data-act="close">Cancel</button><button class="btn pri" data-act="rolesave" data-v="${k}">Save role</button></div></div></div>`;
+}
+function reportsView(){
+  const list=repList();
+  if(!list.length) return `<div class="empty"><div><div class="ic">≡</div><b class="strong">No reports yet</b><p style="max-width:420px">Every finished job, question or blocker files a report here: a six-field reflection plus feedback on the context the agent was given.</p></div></div>`;
+  return `<div class="pane stack" style="gap:12px">${list.slice().reverse().map(repCard).join('')}</div>`;
+}
+function repCard(id){
+  const R=REPORTS[id];
+  const head=`<div class="between" style="flex-wrap:wrap;gap:6px"><div class="row">${av(R.p)}<div><b class="strong">${R.who}</b> <span class="chip">${R.role}</span> <span class="muted" style="font-size:12px">${id} · ${R.task} · ${R.at}</span></div></div><span class="chip ${({done:'ok',question:'info'})[R.type]}">${R.type}</span></div>`;
+  const route=`<div class="route">${(R.route||[]).map((x,i)=>`${i?'<i>→</i>':''}<span>${x}</span>`).join('')}</div>`;
+  if(R.type==='question'){
+    const ans=id==='R-14'?(S.answer?`Answered by you: <b class="strong">${S.answer}</b> · recorded as decision D-42 and FAQ candidate C-34.`:null):R.ans;
+    return `<div class="box"><div class="bd">${head}<div class="q">“${R.q}”</div>${route}
+     ${ans?`<div class="since" style="margin-top:10px">${ans}</div>`:`<div class="req" style="margin-top:10px"><div class="slabel" style="color:var(--warn)">Reached you — a policy decision</div><div class="row" style="margin-top:8px;flex-wrap:wrap"><button class="btn pri sm" data-act="answer" data-v="hourly">Hourly</button><button class="btn sm" data-act="answer" data-v="every 15 minutes">Every 15 minutes</button></div></div>`}</div></div>`;}
+  return `<div class="box"><div class="bd">${head}
+   <div class="six">${R.six.map(([k,v])=>`<div><b>${k}</b>${v}</div>`).join('')}<div class="lesson"><b>Reusable lesson</b>${R.lesson}${R.cand?` <span class="chip acc" style="margin-left:6px">${R.cand} → curator</span>`:''}</div></div>
+   <div class="slabel" style="margin-top:12px">Context feedback</div>
+   <div class="row" style="flex-wrap:wrap;margin-top:6px">${R.ctx.map(([k,v,c])=>`<span class="chip ${c}">${k} · ${v}</span>`).join('')}</div>
+   ${R.reread.length?`<div class="muted" style="font-size:12px;margin-top:8px">Had to re-read ${R.reread.map(f=>`<code>${f}</code>`).join(', ')} — not in its pack, so the code map adds them.</div>`:''}</div></div>`;
+}
+
+function vault(){
+  const tabs=[['overview','Overview'],['company','Company'],['projects','Teams & projects'],['playbooks','Playbooks'],['lessons','Lessons'],['decisions','Decisions'],['faq','FAQ'],['queue','Verification queue'],['packs','Context packs']];
+  const pend=S.ff?QUEUE.filter(q=>!S.ver[q.id]).length:0;
+  return `<div class="vhead"><div><b class="strong" style="font-size:16px">Company vault</b> <span class="muted" style="font-size:12.5px">Harbor Bakery</span><div class="muted mono" style="font-size:11.5px">git · ~/pm/vault · 214 notes · last commit 3 min ago${S.aos?' · company docs synced to AgenticOS knowledge':''}</div></div><div class="spacer"></div><input class="input" placeholder="Search the vault…" aria-label="Search the vault" style="max-width:280px"></div>
+  <div class="set vault"><div class="sn">${tabs.map(([k,l])=>`<button data-act="vaulttab" data-v="${k}" aria-current="${S.vaultTab===k}">${l}${k==='queue'&&pend?`<span class="vbadge">${pend}</span>`:''}</button>`).join('')}</div><div class="sb">${VV[S.vaultTab]()}</div></div>`;
+}
+const VV={
+ overview:()=>`<h3>What the team knows</h3><p class="muted">Everything here is plain markdown in git. Agents get a small, verified slice of it for each task instead of re-reading the repo.</p>
+  <div class="stor"><div><b>7</b><span class="muted">company docs</span></div><div><b>38</b><span class="muted">verified lessons</span></div><div><b>9</b><span class="muted">playbooks</span></div><div><b>17</b><span class="muted">FAQ answers</span></div><div><b>${S.ff?QUEUE.filter(q=>!S.ver[q.id]).length:0}</b><span class="muted">awaiting curator</span></div><div><b>2</b><span class="muted">need revalidation</span></div></div>
+  <div class="slabel" style="margin:18px 0 8px">How memory is made</div>
+  <div class="pipe"><span>Report</span><i>→</i><span>Checks (logic)</span><i>→</i><span>Curator (other vendor)</span><i>→</i><span>Vault</span><i>→</i><span>Context pack</span><i>→</i><span>Feedback</span><i>↺</i></div>
+  <div class="slabel" style="margin:18px 0 8px">Learning this month <span class="chip" style="margin-left:6px">illustrative targets</span></div>
+  <div class="tblwrap"><table class="tbl"><tr><th>Measure</th><th>Value</th><th>Meaning</th></tr>
+   <tr><td>Lesson reuse</td><td class="num">71%</td><td>tasks that received at least one verified lesson</td></tr>
+   <tr><td>Helpful rate</td><td class="num">88%</td><td>injected lessons the agent marked helpful</td></tr>
+   <tr><td>Harm</td><td class="num">2</td><td>lessons that caused rework — both retired</td></tr>
+   <tr><td>Reads avoided</td><td class="num">11 / task</td><td>median files not re-read thanks to the pack</td></tr>
+   <tr><td>Questions answered by the vault</td><td class="num">64%</td><td>no human or PM interrupted</td></tr></table></div>
+  <div class="slabel" style="margin:18px 0 8px">Scopes</div>
+  <div class="pre">company/        handbook, standards, policies, glossary, roles/
+teams/<team>/   charter, rituals
+projects/<key>/ context manifest, ADRs, code map (per commit), runbooks
+playbooks/      skills (SKILL.md), loaded on demand
+lessons/        verified memory · scope · evidence · confidence
+decisions/  faq/  inbox/ (candidates awaiting the curator)</div>`,
+ company:()=>`<h3>Company</h3><p class="muted">Owned by you. Every role's pack starts from the relevant excerpt.</p><div class="tblwrap"><table class="tbl"><tr><th>Document</th><th>Given to</th><th>Updated</th></tr>${[['Mission & product','every role','2 d ago'],['Engineering standards','dev, qa','5 d ago'],['Security & secrets policy','every role','Sep 19'],['Review policy (cross-vendor)','qa, devops','Sep 21'],['Autonomy & approvals','master, pm, devops','Sep 23'],['Brand voice (en, zh-HK)','research, dev','Sep 02'],['Glossary','every role','1 d ago'],['Roles (7)','— defines every agent','today']].map(r=>`<tr><td>${r[0]}</td><td>${r[1]}</td><td class="muted">${r[2]}</td></tr>`).join('')}</table></div>`,
+ projects:()=>`<h3>Teams &amp; projects</h3><div class="cards">${[['reminders','Reminders team','Context manifest · 2 ADRs · 3 runbooks','Code map: 6 of 6 modules fresh at 3f9c2e1'],['storefront','Storefront team','Context manifest · 5 ADRs · 1 runbook','Code map: 38 of 41 fresh · 3 stale after the last merge']].map(([k,t,a,c])=>`<div class="card"><h4>${k}</h4><p>${t}</p><p style="margin-top:6px">${a}</p><p style="margin-top:6px"><span class="chip ${c.includes('stale')?'warn':'ok'}">${c}</span></p></div>`).join('')}</div>
+  <p class="muted" style="font-size:12.5px">Code maps are module summaries keyed to a commit. A merge invalidates only the modules it touched, so agents stop re-reading unchanged code.</p>`,
+ playbooks:()=>`<h3>Playbooks</h3><p class="muted">Procedural memory in the open Agent Skills format. Only the name and one line sit in context until an agent loads one.</p><div class="tblwrap"><table class="tbl"><tr><th>Playbook</th><th>Version</th><th>Built from</th><th>Success</th></tr>${[['PB-3 cloudflare-worker-cron','v4','5 lessons','8 / 9'],['PB-7 cloudflare-deploy','v2','3 lessons','4 / 4'],['PB-5 whatsapp-template-send','v2','4 lessons','3 / 3'],['PB-1 cadence-review','v7','12 lessons','41 / 43'],['PB-8 rust-test-isolation','v3','9 lessons','17 / 19']].map(r=>`<tr><td class="mono">${r[0]}</td><td>${r[1]}</td><td>${r[2]}</td><td class="num">${r[3]}</td></tr>`).join('')}</table></div>`,
+ lessons:()=>`<h3>Lessons</h3><div class="tblwrap"><table class="tbl"><tr><th>ID</th><th>Lesson</th><th>Scope</th><th>Confidence</th><th>Used / helped</th><th>Status</th></tr>${LESSONS.map(l=>`<tr style="cursor:pointer" data-act="lesson" data-v="${l.id}"><td class="mono">${l.id}</td><td style="min-width:240px">${l.c}</td><td class="muted">${l.scope}</td><td class="num">${l.conf?Math.round(l.conf*100)+'%':'—'}</td><td class="num">${l.uses} / ${l.help}</td><td><span class="chip ${l.st==='verified'?'ok':l.st==='retired'?'':'warn'}">${l.st}</span></td></tr>`).join('')}</table></div>`,
+ decisions:()=>`<h3>Decisions</h3><p class="muted">Approvals and answers are memory too — nobody asks twice.</p><div class="tblwrap"><table class="tbl"><tr><th>ID</th><th>Decision</th><th>By</th><th>When</th></tr>${[S.answer?['D-42','Production cron runs '+S.answer,'you','now']:null,S.planApproved?['D-41','Plan P-1 approved (4 issues, Reminders team)','you','09:16']:null,['D-40','ADR-0004 connected-platform contract accepted','you','Sep 22'],['D-38','QA must be a different vendor from the author','you','Sep 21']].filter(Boolean).map(r=>`<tr><td class="mono">${r[0]}</td><td>${r[1]}</td><td>${r[2]}</td><td class="muted">${r[3]}</td></tr>`).join('')}</table></div>`,
+ faq:()=>`<h3>FAQ</h3><div class="tblwrap"><table class="tbl"><tr><th>ID</th><th>Question</th><th>Answer</th><th>Reused</th></tr>${[['F-4','Which time zone decides reminder timing?','The branch time zone','6×'],['F-7','Where do Worker secrets live?','wrangler secret put — never in code or the vault','11×'],['F-9','Can a PM merge a PR?','No. DevOps merges after a PASS on the head commit','9×']].map(r=>`<tr><td class="mono">${r[0]}</td><td>${r[1]}</td><td>${r[2]}</td><td class="num">${r[3]}</td></tr>`).join('')}</table></div>`,
+ queue:()=>{if(!S.ff) return `<h3>Verification queue</h3><div class="empty" style="padding:30px 10px"><div><b class="strong">Nothing to verify yet</b><p>Candidates arrive from reports as the team finishes work.</p></div></div>`;
+  return `<h3>Verification queue</h3><p class="muted">Logic checks run first; then a curator from a different vendor than the proposer gives a verdict. You only see what needs a human.</p>
+  ${QUEUE.map(q=>{const done=S.ver[q.id];return `<div class="box" style="margin-top:12px"><div class="hd"><div><h5>${q.id} · <span class="muted" style="font-weight:400">from ${q.from}</span></h5></div>${done?`<span class="chip ok">${done}</span>`:q.id==='C-33'?'<span class="chip fail">quarantined</span>':'<span class="chip warn">pending</span>'}</div>
+   <div class="bd"><div class="strong" style="margin-bottom:8px">${q.claim}</div><div class="muted" style="font-size:12px;margin-bottom:8px">proposed scope: ${q.scope}</div>
+   ${q.checks.map(([k,d,s])=>`<div class="ck"><span class="st ${s}" style="width:18px;height:18px;font-size:10px">${s==='ok'?'✓':s==='warn'?'!':'×'}</span><span><b class="strong" style="font-weight:500">${k}</b> <span class="muted">· ${d}</span></span></div>`).join('')}
+   <div class="since" style="margin-top:10px"><b class="strong">Curator</b> <span class="muted">(${q.cur})</span><div style="margin-top:3px">${q.verdict}</div></div>
+   ${done?'':`<div class="row" style="margin-top:10px;flex-wrap:wrap">${q.acts.map(([a,l,c])=>`<button class="btn sm ${c}" data-act="ver" data-v="${q.id}:${a}">${l}</button>`).join('')}</div>`}</div></div>`}).join('')}`},
+ packs:()=>{const P=PACKS[S.pack];
+  return `<h3>Context packs</h3><p class="muted">What an agent receives at task start: verified, scoped and sized to a budget, each item with the reason it was chosen. Items are re-checked against the current commit before use.</p>
+  <div class="seg" style="margin:6px 0 14px">${[['dev','Dev'],['qa','QA'],['devops','DevOps'],['pm','PM']].map(([k,l])=>`<button data-act="packrole" data-v="${k}" aria-pressed="${S.pack===k}">${l}</button>`).join('')}</div>
+  <div class="muted" style="font-size:12.5px;margin-bottom:8px">${P.task}</div>
+  <div class="tblwrap"><table class="tbl"><tr><th>Item</th><th>Why</th><th>Tokens</th></tr>${P.items.map(r=>`<tr><td>${r[0]}</td><td class="muted">${r[1]}</td><td class="num">${r[2]}</td></tr>`).join('')}</table></div>
+  <div class="slabel" style="margin:14px 0 6px">Left out</div>${P.out.map(r=>`<div class="ck"><span class="b" style="color:var(--warn)">–</span><span><b class="strong mono" style="font-weight:500">${r[0]}</b> <span class="muted">· ${r[1]}</span></span></div>`).join('')}
+  <div class="row" style="margin-top:12px;flex-wrap:wrap"><span class="chip acc">${P.tok} tokens</span><span class="chip ok">saves ${P.saved}</span></div>`}};
+function lessonDrawer(id){
+  const l=LESSONS.find(x=>x.id===id);
+  return `<div class="scrim" data-act="close" style="place-items:stretch end;padding:0;background:rgba(0,0,0,.35)"><div class="drawer" role="dialog" aria-label="${id}">
+   <div class="dh"><div class="between"><span class="num muted">vault/lessons/${id}.md</span><button class="btn sm ghost" data-act="close" aria-label="Close">✕</button></div><h3 style="margin:6px 0 8px;font-size:17px">${l.c}</h3><div class="row" style="flex-wrap:wrap"><span class="chip ${l.st==='verified'?'ok':l.st==='retired'?'':'warn'}">${l.st}</span><span class="chip">${l.scope}</span>${l.conf?`<span class="chip">confidence ${Math.round(l.conf*100)}%</span>`:''}</div></div>
+   <div class="db"><div class="slabel">Evidence</div><div style="font-size:13px;margin:4px 0 12px">${l.ev}</div>
+    <div class="slabel">Verified by</div><div style="font-size:13px;margin:4px 0 12px">${l.by}</div>
+    <div class="slabel">Revalidate</div><div style="font-size:13px;margin:4px 0 12px">${l.reval}</div>
+    <div class="slabel">Use</div><div style="font-size:13px;margin:4px 0 12px">Injected ${l.uses}× · marked helpful ${l.help}×</div>
+    <div class="slabel">History</div><div class="tl" style="margin-top:6px"><div class="a">proposed from a report</div><div class="a">logic checks passed</div><div class="a">curator accepted · different vendor from the proposer</div>${l.st!=='verified'?`<div class="a">${l.st} · ${l.reval}</div>`:''}</div></div></div></div>`;
+}
+
 
 /* ---------- chrome ---------- */
 function syncChrome(){
   document.querySelectorAll('[data-act="tab"]').forEach(b=>{ if(b.closest('.seg')) b.setAttribute('aria-pressed',b.dataset.v===S.tab)});
-  ['plan','direction','proposal','proto'].forEach(k=>{$('#'+k).hidden=S.tab!==k});
+  ['plan','roadmap','research','direction','proposal','proto'].forEach(k=>{$('#'+k).hidden=S.tab!==k});
   ['#vpseg','#simbtn','#sbxbtn'].forEach(id=>$(id).hidden=S.tab!=='proto');
   document.querySelectorAll('#vpseg button').forEach(b=>b.setAttribute('aria-pressed',(b.dataset.v==='narrow')===S.narrow));
   $('#simbtn').textContent='Sim: '+(S.sim==='normal'?'normal':'daemon offline');
@@ -985,7 +1655,7 @@ function story(){
   return SCREENS.map(([k,l],i)=>`<button role="tab" data-act="go" data-v="${k}" aria-current="${S.screen===k}"><span class="i">0${i+1}</span>${l}</button>`).join('');
 }
 function url(){
-  const m={install:'terminal',setup:'127.0.0.1:3010/setup',home:'127.0.0.1:3010/',projects:'127.0.0.1:3010/projects/reminders',agents:'127.0.0.1:3010/agents/'+S.agent,services:'127.0.0.1:3010/services',settings:'127.0.0.1:3010/settings/'+S.setTab};
+  const m={install:'terminal',setup:'127.0.0.1:3010/setup',home:'127.0.0.1:3010/',projects:'127.0.0.1:3010/projects/reminders',teams:'127.0.0.1:3010/teams/'+(S.teamTab==='agents'?'agents/'+S.agent:S.teamTab),vault:'127.0.0.1:3010/vault/'+S.vaultTab,services:'127.0.0.1:3010/services',settings:'127.0.0.1:3010/settings/'+S.setTab};
   const port=S.sbx?'3110':'3010';
   return (m[S.screen]||'').replace('3010',port);
 }
@@ -994,11 +1664,11 @@ function frame(){
   if(S.sbx&&S.screen!=='install') h+=`<div class="sbx"><b>SANDBOX · onboarding-1</b><span>state ~/.local/state/cadence-sandbox/onboarding-1 · port 3110 · fake providers · AgenticOS mock</span></div>`;
   if(S.screen==='install') return h+install();
   if(S.screen==='setup') return h+setup();
-  return h+`<div class="app">${nav()}<div class="main">${S.sim==='offline'?`<div class="offline"><span class="dot"></span><b>Daemon unreachable</b> — last contact 42s ago. Showing cached data; writes are paused. <code>cadence daemon start</code></div>`:''}${topbar()}<div class="body">${({home,projects,agents,services,settings})[S.screen]()}</div></div></div>`;
+  return h+`<div class="app">${nav()}<div class="main">${S.sim==='offline'?`<div class="offline"><span class="dot"></span><b>Daemon unreachable</b> — last contact 42s ago. Showing cached data; writes are paused. <code>cadence daemon start</code></div>`:''}${topbar()}<div class="body">${({home,projects,teams,vault,services,settings})[S.screen]()}</div></div></div>`;
 }
 function nav(){
   const needs=needCount();
-  const it=[['home','⌂','Home',needs?`<span class="badge">${needs}</span>`:''],['projects','▦','Projects',''],['agents','◉','Agents',''],['services','◆','Platforms',S.aos||S.cf?'':'<span class="badge" style="background:var(--gold-dim);color:var(--gold)">off</span>'],['settings','⚙','Settings','']];
+  const it=[['home','⌂','Home',needs?`<span class="badge">${needs}</span>`:''],['projects','▦','Projects',''],['teams','◉','Teams',''],['vault','▤','Vault',S.ff&&QUEUE.some(q=>!S.ver[q.id])?`<span class="badge">${QUEUE.filter(q=>!S.ver[q.id]).length}</span>`:''],['services','◆','Platforms',S.aos||S.cf?'':'<span class="badge" style="background:var(--gold-dim);color:var(--gold)">off</span>'],['settings','⚙','Settings','']];
   return `<nav class="nav" aria-label="Main">
     <div class="logo"><svg width="20" height="20" viewBox="0 0 1024 1024"><rect width="1024" height="1024" rx="224" fill="#0B0B0C"/><path d="M232 336 416 512 232 688" fill="none" stroke="#2DD4BF" stroke-opacity=".55" stroke-width="120" stroke-linecap="round" stroke-linejoin="round"/><path d="M408 336 592 512 408 688" fill="none" stroke="#2DD4BF" stroke-width="120" stroke-linecap="round" stroke-linejoin="round"/></svg>Cadence</div>
     ${it.map(([k,ic,l,b])=>`<button data-act="go" data-v="${k}" aria-current="${S.screen===k?'page':'false'}"><span aria-hidden="true">${ic}</span><span class="lbl2">${l}</span>${b}</button>`).join('')}
@@ -1009,7 +1679,7 @@ function nav(){
   </nav>`;
 }
 function topbar(){
-  const t={home:['Home','Master'],projects:['Projects','reminders'],agents:['Agents',S.agent],services:['Platforms',{aos:'AgenticOS v2',cf:'Cloudflare',add:'Add'}[S.platTab]],settings:['Settings',S.setTab]}[S.screen];
+  const t={home:['Home','Master'],projects:['Projects','reminders'],teams:['Teams',{org:'Org',roles:'Roles',agents:S.agent,reports:'Reports'}[S.teamTab]],vault:['Vault',S.vaultTab],services:['Platforms',{aos:'AgenticOS v2',cf:'Cloudflare',add:'Add'}[S.platTab]],settings:['Settings',S.setTab]}[S.screen];
   return `<div class="topbar"><div class="crumb">${t[0]} / <b>${t[1]}</b></div><div class="spacer"></div>
    ${S.screen==='home'?`<button class="btn sm railtoggle" data-act="rail">${S.showRail?'← Chat':'Needs you ('+needCount()+')'}</button>`:''}
    <span class="chip ${S.sim==='offline'?'fail':'ok'} hide-n"><span class="dot"></span>${S.sim==='offline'?'daemon offline':'daemon live'}</span>
@@ -1152,7 +1822,10 @@ function stepWork(){
 function stepTeam(){
   const dl=[['Ask for everything','You approve each plan, dispatch, merge and deploy.'],['Approve plans','Recommended. Workers start once you approve a plan; merges and deploys ask.'],['Routine merges auto','Locked until the unattended acceptance check passes on this machine.']];
   return `<h3>Team &amp; autonomy</h3><p class="muted">Which agents the master may hire, how many at once, and how much it can do without asking.</p>
-  <div class="slabel" style="margin:14px 0 8px">Workers the master may launch</div>
+  <div class="slabel" style="margin:14px 0 8px">Starter team for this project</div>
+  <div class="tblwrap"><table class="tbl"><tr><th>Role</th><th>Count</th><th>Preferred provider · model · effort</th></tr>${['pm','dev','qa','devops'].map(k=>{const r=S.roles[k],r0=ROLES.find(x=>x.k===k);return `<tr><td>${r0.t}</td><td class="num">${k==='dev'?2:1}</td><td class="mono">${r.p} · ${r.m} · ${r.e}</td></tr>`}).join('')}</table></div>
+  <p class="muted" style="font-size:12px;margin:6px 0 0">Roles are defined once for the company in Teams → Roles. The master adds developers or a researcher when a plan needs them.</p>
+  <div class="slabel" style="margin:14px 0 8px">Providers agents may use</div>
   <div class="row" style="flex-wrap:wrap">${['claude','codex','pi','cursor','devin'].map(p=>`<label class="chip" style="padding:6px 10px;cursor:pointer;${p==='devin'?'opacity:.5':''}"><input type="checkbox" ${S.workers[p]?'checked':''} ${p==='devin'?'disabled':''}> ${av(p)} ${p}${p==='devin'?' · not installed':''}</label>`).join('')}</div>
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:16px">
    <label class="field"><span>Parallel workers · <b class="strong num" id="mw">${S.maxw}</b> <span class="muted">(host ceiling 5)</span></span><input type="range" min="1" max="5" value="${S.maxw}" data-act="maxw" style="width:100%;accent-color:var(--accent)"></label>
@@ -1173,10 +1846,10 @@ function stepLaunch(){
 }
 
 /* home */
-function needCount(){let n=0;if(!S.planApproved)n++;if(!S.perm)n++;if(S.ff&&!S.merge)n++;if(S.ff&&!S.deploy)n++;if(S.ff&&!S.post)n++;return n}
+function needCount(){let n=0;if(S.ff&&!S.answer)n++;if(!S.planApproved)n++;if(!S.perm)n++;if(S.ff&&!S.merge)n++;if(S.ff&&!S.deploy)n++;if(S.ff&&!S.post)n++;return n}
 function home(){
   return `<div class="home ${S.showRail?'showrail':''}"><section class="chat" aria-label="Chat with master">
-   <div class="chathd">${av('claude')}<div><b class="strong">Master</b> <span class="muted" style="font-size:12px">claude · opus · medium · project reminders</span></div><div class="spacer"></div>
+   <div class="chathd">${av('claude')}<div><b class="strong">Master</b> <span class="muted" style="font-size:12px">${S.roles.master.p} · ${S.roles.master.m} · ${S.roles.master.e} · company assistant</span></div><div class="spacer"></div>
      <button class="btn sm hide-n" data-act="ff" ${S.planApproved&&!S.ff?'':'disabled'} title="Demo: skip ahead">⏩ 2 h later</button></div>
    <div class="thread" id="thread">${thread()}</div>
    <div class="composer"><div class="cbox"><textarea id="compose" placeholder="Message the master… (Enter to send, Shift+Enter for a new line)" ${S.sim==='offline'?'disabled':''}></textarea>
@@ -1193,26 +1866,31 @@ function thread(){
    <div class="tool"><span class="ns">cadence</span> project new reminders --repo ~/code/reminders <span class="ok">✓ registered</span></div>
    <div class="tool"><span class="aos-ns">agenticos</span> crm.bookings.search {window:"48h"} ${S.aos?'<span class="ok">✓ 38 upcoming</span>':'<span class="muted">not connected · using repo fixtures</span>'}</div>
    <div class="tool"><span class="aos-ns">agenticos</span> inbox.templates.list {channel:"whatsapp"} ${S.aos?'<span class="ok">✓ 2 approved</span>':'<span class="muted">not connected · skipped</span>'}</div>
-   <div class="txt" style="margin-top:6px">Bookings carry <code>starts_at</code> and a phone number; template <code>booking_reminder_v2</code> takes name, time and branch. I'd split it into four issues — sending is the only step that touches customers, so it's marked for your review.</div>
+   <div class="tool"><span class="ns">cadence</span> vault search "workers cron whatsapp reminders" <span class="ok">✓ 3 lessons · 1 playbook · 1 FAQ</span></div>
+   <div class="txt" style="margin-top:6px">Bookings carry <code>starts_at</code> and a phone number; template <code>booking_reminder_v2</code> takes name, time and branch. I'd split it into four issues and staff a Reminders team from your roles — a PM, developers, QA and DevOps. Sending is the only step that touches customers, so it's marked for your review.</div>
    ${planCard()}</div></div>`;
   h+=`<div class="msg">${av('claude')}<div><div class="who"><b>Master</b> · 09:15</div><div class="txt">One more thing: the repo has no GitHub Actions yet. I'd like to check what's there.</div>
    ${permCard()}</div></div>`;
   if(S.planApproved){
     h+=`<div class="sys"><span class="line"></span>Plan P-1 approved by you · 4 issues → ready · commit <span class="num">a41c9e0</span></div>
-    <div class="sys"><span class="line"></span>w1 joined · codex · worktree <code>rmd-1</code> · dispatched RMD-1</div>
-    <div class="sys"><span class="line"></span>w2 joined · claude · worktree <code>rmd-2</code> · dispatched RMD-2</div>
-    <div class="msg">${av('claude')}<div><div class="who"><b>Master</b> · 09:17</div><div class="txt">Two workers are on it. RMD-3 waits for RMD-2's CRM reader; RMD-4 starts when RMD-1 lands. I'll bring you merges and the production deploy — nothing reaches customers without your click.</div></div></div>`;
+    <div class="sys"><span class="line"></span>Reminders team staffed from roles · pm-rmd (PM · codex) · w1–w4 (dev) · qa-rmd (QA · claude) · ops-rmd (DevOps · claude)</div>
+    <div class="sys"><span class="line"></span>pm-rmd dispatched RMD-1 → w1 and RMD-2 → w2 · each with a context pack (3 lessons, 1 playbook)</div>
+    <div class="sys"><span class="line"></span>09:48 · w2 asked which time zone applies · answered from the vault (FAQ F-4) · no one interrupted</div>
+    <div class="msg">${av('claude')}<div><div class="who"><b>Master</b> · 09:17</div><div class="txt">The Reminders team is on it; its PM runs the day-to-day. RMD-3 waits for RMD-2's CRM reader and RMD-4 starts when RMD-1 lands. I'll bring you merges, sends and deploys — nothing reaches customers without your click.</div></div></div>`;
   }
   if(S.ff){
-    h+=`<div class="sys"><span class="line"></span>11:04 · rev-1 verdict <span class="chip ok">PASS</span> RMD-1 @ <span class="num">3f9c2e1</span> · CI green · risk routine</div>
-    <div class="msg">${av('claude')}<div><div class="who"><b>Master</b> · 11:05</div><div class="txt">RMD-1 passed independent review. Ready to merge PR #12.</div>
+    h+=`<div class="sys"><span class="line"></span>10:48 · w1 filed report R-12 · 1 lesson candidate → curator (claude, because w1 is codex)</div>
+    <div class="sys"><span class="line"></span>11:04 · qa-rmd (claude) verdict <span class="chip ok">PASS</span> RMD-1 @ <span class="num">3f9c2e1</span> · author w1 is codex — cross-vendor ✓ · CI green</div>
+    <div class="msg">${av('claude')}<div><div class="who"><b>Master</b> · 11:05</div><div class="txt">RMD-1 passed an independent review by a different vendor. Ready to merge PR #12.</div>
      <div class="req ${S.merge?'done':''}"><div class="between"><div><b class="strong">Merge PR #12 · Scaffold Worker</b><div class="muted" style="font-size:12px">+312 −4 · 9 files · verdict pinned to 3f9c2e1 (current head)</div></div>
      ${S.merge?'<span class="chip ok">merged by you · 11:06</span>':`<div class="row"><button class="btn sm">View diff</button><button class="btn pri sm" data-act="merge">Merge</button></div>`}</div></div></div></div>
     <div class="msg">${av('claude')}<div><div class="who"><b>Master</b> · 11:20</div><div class="txt">w4 deployed a preview (<code>reminders-preview.harbor.workers.dev</code>) and a dry run matched 38 bookings. Two effects are waiting for you.</div>
-     <div class="req gold ${S.deploy?'done':''}"><div class="between"><div><span class="slabel" style="color:var(--gold)">effect · send · deploy</span><div><b class="strong">Deploy reminders-worker → production</b></div><div class="muted" style="font-size:12px">Cloudflare (your account) · cron hourly · diff since preview: none · requested by w4</div></div>
+     <div class="req gold ${S.deploy?'done':''}"><div class="between"><div><span class="slabel" style="color:var(--gold)">effect · send · deploy</span><div><b class="strong">Deploy reminders-worker → production</b></div><div class="muted" style="font-size:12px">Cloudflare (your account) · cron hourly · diff since preview: none · requested by ops-rmd</div></div>
      ${S.deploy?`<span class="chip ${S.deploy==='ok'?'ok':'fail'}">${S.deploy==='ok'?'sent · deploying':'declined'}</span>`:`<div class="row"><button class="btn sm" data-act="deploy" data-v="no">Decline</button><button class="btn gold sm" data-act="deploy" data-v="ok">Deploy now</button></div>`}</div></div>
      <div class="req gold ${S.post?'done':''}" style="margin-top:8px"><div class="between"><div><span class="slabel" style="color:var(--gold)">effect · send · message</span><div><b class="strong">${aosMark(14)} Test reminder to your own WhatsApp number</b></div><div class="muted" style="font-size:12px">AgenticOS v2 · template booking_reminder_v2 · 1 recipient (you) · planned connector</div></div>
-     ${S.post?'<span class="chip ok">sent</span>':'<div class="row"><button class="btn sm" data-act="post" data-v="no">Not now</button><button class="btn gold sm" data-act="post" data-v="ok">Send now</button></div>'}</div></div></div></div>`;
+     ${S.post?'<span class="chip ok">sent</span>':'<div class="row"><button class="btn sm" data-act="post" data-v="no">Not now</button><button class="btn gold sm" data-act="post" data-v="ok">Send now</button></div>'}</div></div></div></div>
+    <div class="msg">${av('claude')}<div><div class="who"><b>Master</b> · 11:19</div><div class="txt">One question climbed all the way to you — it's a cost policy, not a technical call. ops-rmd asks: <b class="strong">run the production cron hourly or every 15 minutes?</b> Every 15 minutes is about 4× the requests.</div>
+     ${S.answer?`<div class="req done"><span class="chip ok">answered: ${S.answer} · saved as decision D-42</span></div>`:'<div class="req"><div class="row" style="flex-wrap:wrap"><button class="btn pri sm" data-act="answer" data-v="hourly">Hourly</button><button class="btn sm" data-act="answer" data-v="every 15 minutes">Every 15 minutes</button></div></div>'}</div></div>`;
   }
   S.extra.forEach(m=>{h+=m.me?`<div class="msg me">${av('op','Yo')}<div><div class="who"><b>You</b> · now</div><div class="txt">${esc(m.t)}</div></div></div>`:`<div class="msg">${av('claude')}<div><div class="who"><b>Master</b> · now</div><div class="txt">${m.t}</div></div></div>`});
   if(S.typing) h+=`<div class="msg">${av('claude')}<div><div class="who"><b>Master</b> · thinking</div><span class="typing"><i></i><i></i><i></i></span></div></div>`;
@@ -1223,7 +1901,7 @@ function planCard(){
    ${ISSUES.map(i=>`<div class="it"><span class="num muted">${i.id}</span><div><div class="strong">${i.t}</div><div class="muted" style="font-size:11.5px">${i.acc} acceptance checks${i.dep?' · after '+i.dep:''}</div></div>
      <div class="row">${av(i.p)}<span class="chip ${i.risk==='human'?'warn':''}">${i.risk}</span></div></div>`).join('')}
    <div class="pf">${S.planApproved?`<span class="muted" style="font-size:12.5px">Approved 09:16 · workers may start within this plan only.</span>`:
-     `<button class="btn pri sm" data-act="approve">Approve plan</button><button class="btn sm" data-act="changes">Request changes</button><button class="btn sm ghost">Open in Projects</button><span class="muted" style="font-size:12px;margin-left:auto">Workers start only after approval · max ${S.maxw} at once</span>`}</div></div>`;
+     `<button class="btn pri sm" data-act="approve">Approve plan</button><button class="btn sm" data-act="changes">Request changes</button><button class="btn sm ghost">Open in Projects</button><span class="muted" style="font-size:12px;margin-left:auto">Team: PM · 4 dev · QA · DevOps · context: 3 lessons, 1 playbook</span>`}</div></div>`;
 }
 function permCard(){
   if(S.perm) return `<div class="req done"><div class="between"><span class="mono" style="font-size:12.5px">Bash · gh api repos/harbor-bakery/reminders/actions/workflows</span><span class="chip ${S.perm==='allow'?'ok':'fail'}">${S.perm==='allow'?'allowed once':'denied'}</span></div></div>`;
@@ -1239,11 +1917,13 @@ function rail(){
   if(S.ff&&!S.merge) needs.push(['acc','Merge','PR #12 · PASS @ 3f9c2e1','1m']);
   if(S.ff&&!S.deploy) needs.push(['gold','Effect','Deploy to production · Cloudflare','now']);
   if(S.ff&&!S.post) needs.push(['gold','Effect','Send test WhatsApp · AgenticOS','now']);
-  const work=S.planApproved?[['codex','w1','RMD-1 · implementing',S.ff?100:40],['claude','w2','RMD-2 · implementing',S.ff?80:25],['pi','w3','RMD-3 · waiting on RMD-2',0],['cursor','w4',S.ff?'RMD-4 · preview deployed':'RMD-4 · queued',S.ff?70:0]]:[];
+  if(S.ff&&!S.answer) needs.push(['info','Question','ops-rmd · cron hourly or every 15 min?','now']);
+  const work=S.planApproved?[['codex','pm-rmd','PM · tracking P-1',0],['codex','w1','RMD-1 · implementing',S.ff?100:40],['claude','w2','RMD-2 · implementing',S.ff?80:25],['pi','w3','RMD-3 · waiting on RMD-2',0],['cursor','w4',S.ff?'RMD-4 · preview deployed':'RMD-4 · queued',S.ff?70:0]]:[];
   return `${S.start!=='fresh'?`<div class="since"><b class="strong">Since you left</b> · 14 h<div class="muted" style="margin-top:3px">Restored 14 threads · 1 plan in progress · 0 agents were running · nothing was lost.</div></div>`:''}<div class="box"><div class="hd"><h5>Needs you</h5><span class="chip ${needs.length?'warn':'ok'}">${needs.length||'clear'}</span></div>
    ${needs.length?needs.map(n=>`<div class="need"><span class="chip ${n[0]} k">${n[1]}</span><div><div class="strong">${n[2]}</div><div class="muted" style="font-size:11px">waiting ${n[3]}</div></div></div>`).join(''):'<div class="bd muted" style="font-size:12.5px">Nothing needs a decision. The team is working.</div>'}</div>
   <div class="box"><div class="hd"><h5>Active work</h5><span class="muted" style="font-size:11.5px">${work.filter(w=>w[3]).length}/${S.maxw} slots</span></div>
    ${work.length?work.map(w=>`<div class="work">${av(w[0])}<div><div class="strong">${w[1]} <span class="muted" style="font-weight:400">· ${w[2]}</span></div><div class="bar" style="margin-top:5px"><i style="width:${w[3]}%"></i></div></div><span class="num muted" style="font-size:11px">${w[3]?w[3]+'%':'—'}</span></div>`).join(''):'<div class="bd muted" style="font-size:12.5px">No workers yet — they start after you approve a plan.</div>'}</div>
+  <div class="box"><div class="hd"><h5>Learning</h5><button class="btn sm" data-act="go" data-v="vault">Vault</button></div><div class="bd" style="font-size:12.5px">${S.planApproved?`<div class="between"><span class="muted">Reports today</span><span class="num strong">${S.ff?4:1}</span></div><div class="between" style="margin-top:4px"><span class="muted">Answered from the vault</span><span class="num strong">1</span></div><div class="between" style="margin-top:4px"><span class="muted">Awaiting the curator</span><span class="num strong">${S.ff?QUEUE.filter(q=>!S.ver[q.id]).length:0}</span></div>`:'<span class="muted">Reports start when the team does.</span>'}</div></div>
   <div class="box"><div class="hd"><h5>Platforms</h5><button class="btn sm" data-act="go" data-v="services">${S.aos||S.cf?'Open':'Connect'}</button></div>
    <div class="bd" style="font-size:12.5px">${S.aos||S.cf?`${S.aos?`<div class="between"><span class="row">${aosMark(14)} AgenticOS v2</span><span class="chip ok">connected</span></div>`:''}${S.cf?`<div class="between" style="margin-top:4px"><span>Cloudflare · own</span><span class="chip ok">connected</span></div>`:''}<div class="between" style="margin-top:6px"><span class="muted">Pending effects</span><span class="num strong">${(S.ff&&!S.deploy?1:0)+(S.ff&&!S.post?1:0)}</span></div>`:'<span class="muted">None connected. Agents build and test locally.</span>'}</div></div>
   <div class="box"><div class="hd"><h5>Projects</h5></div><div class="bd" style="font-size:12.5px"><div class="between"><span class="strong">reminders</span><span class="muted">${S.planApproved?'2 doing · 2 ready':'plan pending'}</span></div><div class="between" style="margin-top:4px"><span class="strong">storefront</span><span class="muted">idle</span></div></div></div>`;
@@ -1267,16 +1947,16 @@ function issueDrawer(id){
    <div class="row" style="flex-wrap:wrap">${av(i.p)}<span class="chip">${i.a} · ${i.p}</span><span class="chip ${i.risk==='human'?'warn':''}">risk ${i.risk}</span>${i.dep?`<span class="chip">after ${i.dep}</span>`:''}</div></div>
    <div class="db"><div class="slabel">Acceptance</div>${acc.map((a,n)=>`<div class="ck"><span class="b ${S.ff&&id==='RMD-1'?'on':''}">${S.ff&&id==='RMD-1'?'✓':''}</span>${a}</div>`).join('')}
    <div class="slabel" style="margin-top:16px">Evidence</div>
-   ${S.ff&&id==='RMD-1'?`<div class="box" style="margin-top:6px"><div class="bd" style="font-size:12.5px"><div class="between"><span>Verdict</span><span class="chip ok">PASS · rev-1</span></div><div class="between"><span>Pinned to</span><span class="num">3f9c2e1</span></div><div class="between"><span>PR head</span><span class="num">3f9c2e1 <span class="chip ok">matches</span></span></div><div class="between"><span>CI</span><span class="chip ok">green</span></div></div></div>`:'<p class="muted" style="font-size:12.5px">No evidence yet. A worker\'s "done" is a claim until review pins a verdict to its commit.</p>'}
-   <div class="slabel" style="margin-top:16px">Timeline</div><div class="tl"><div class="a">09:16 · approved in plan P-1 by you</div><div class="a">09:17 · dispatched to ${i.a} (worktree ${id.toLowerCase()})</div>${S.ff&&id==='RMD-1'?'<div class="a">10:48 · PR #12 opened · SHA 3f9c2e1</div><div class="a">11:04 · rev-1 PASS</div>':''}</div></div></div></div>`;
+   ${S.ff&&id==='RMD-1'?`<div class="box" style="margin-top:6px"><div class="bd" style="font-size:12.5px"><div class="between"><span>Verdict</span><span class="chip ok">PASS · qa-rmd (claude)</span></div><div class="between"><span>Pinned to</span><span class="num">3f9c2e1</span></div><div class="between"><span>PR head</span><span class="num">3f9c2e1 <span class="chip ok">matches</span></span></div><div class="between"><span>CI</span><span class="chip ok">green</span></div></div></div>`:'<p class="muted" style="font-size:12.5px">No evidence yet. A worker\'s "done" is a claim until review pins a verdict to its commit.</p>'}
+   <div class="slabel" style="margin-top:16px">Timeline</div><div class="tl"><div class="a">09:16 · approved in plan P-1 by you</div><div class="a">09:17 · dispatched to ${i.a} (worktree ${id.toLowerCase()})</div>${S.ff&&id==='RMD-1'?'<div class="a">10:48 · PR #12 opened · SHA 3f9c2e1</div><div class="a">11:04 · qa-rmd PASS (cross-vendor)</div>':''}</div></div></div></div>`;
 }
 
 /* agents */
 function agents(){
   const a=AGENTS.find(x=>x.id===S.agent)||AGENTS[0];
   return `<div class="agents"><div class="roster" role="listbox" aria-label="Agents">
-   <div class="between" style="padding:10px 14px;border-bottom:1px solid var(--line)"><span class="slabel">Team · reminders</span><span class="muted" style="font-size:11.5px">${S.planApproved?'4 of '+S.maxw+' slots':'master only'}</span></div>
-   ${AGENTS.filter(x=>S.planApproved||x.id==='master').map(x=>`<div class="arow" role="option" data-act="agent" data-v="${x.id}" aria-selected="${x.id===S.agent}" tabindex="0">${av(x.p)}<div><div class="nm">${x.id} <span class="muted" style="font-weight:400;font-size:11.5px">· ${x.role}</span></div><div class="sub2">${x.p} · ${x.m} · ${x.st}</div></div>
+   <div class="between" style="padding:10px 14px;border-bottom:1px solid var(--line)"><span class="slabel">Agents · company + Reminders</span><span class="muted" style="font-size:11.5px">${S.planApproved?'4 of '+S.maxw+' slots':'master only'}</span></div>
+   ${AGENTS.filter(x=>S.planApproved||!x.team).map(x=>`<div class="arow" role="option" data-act="agent" data-v="${x.id}" aria-selected="${x.id===S.agent}" tabindex="0">${av(x.p)}<div><div class="nm">${x.id} <span class="muted" style="font-weight:400;font-size:11.5px">· ${x.role}</span></div><div class="sub2">${x.p} · ${x.m} · ${x.st}</div></div>
    <span class="chip ${x.st.startsWith('implementing')||x.st==='chatting'?'ok':x.st.startsWith('queued')?'info':''}"><span class="dot"></span>${x.st.split(' ')[0]}</span></div>`).join('')}
    <div style="padding:12px 14px"><button class="btn sm" disabled title="The master hires workers from approved plans">+ Add worker</button></div></div>
    <div style="padding:16px;min-width:0">${a.kind==='pty'?ptyView(a):transcriptView(a)}</div></div>`;
@@ -1289,7 +1969,7 @@ function transcriptView(a){
    ['as','Adding a scheduled handler and a cron trigger for the hourly run. Secrets come from env bindings.'],
    ['tool','apply_patch src/index.ts (+64 −2) ✓'],['tool','shell pnpm tsc --noEmit ✓ 0 errors'],
    ['as','Build is clean. Writing a unit test for the scheduled handler next.']]:[
-   ['sys',a.id==='master'?'Chat lives on Home — this is the raw event stream.':'Session started'],['as',a.id==='rev-1'?'Idle. Next review is routed here when a worker reports a commit.':'Waiting for work.']];
+   ['sys',a.id==='master'?'Chat lives on Home — this is the raw event stream.':'Session started'],['as',a.id==='qa-rmd'?'Idle. Reviews are routed here when a non-Claude worker reports a commit.':a.id==='curator'?'Idle. Wakes when a lesson candidate lands in the vault inbox.':'Waiting for work.']];
   return `<div class="between" style="margin-bottom:12px;flex-wrap:wrap;gap:8px"><div class="row">${av(a.p)}<div><b class="strong">${a.id}</b> <span class="muted" style="font-size:12px">${a.p} · ${a.m}</span></div></div>
    <div class="row"><span class="chip">structured transcript</span><button class="btn sm">Message</button><button class="btn sm danger">Stop</button></div></div>
    <div class="box"><div class="bd stack" style="gap:8px;font-size:13px">${lines.map(([k,t])=>k==='sys'?`<div class="sys" style="padding-left:0"><span class="line"></span>${t}</div>`:k==='tool'?`<div class="tool" style="margin:0">${t.replace('✓','<span class="ok">✓</span>')}</div>`:`<div>${t}</div>`).join('')}</div></div>
@@ -1380,7 +2060,7 @@ function render(){
     const c=$('#compose'); if(c) c.value=draft;
     const t=$('#thread'); if(t&&atBottom) t.scrollTop=t.scrollHeight;
   }
-  $('#overlay').innerHTML=overlay==='consent'?consent():overlay&&overlay.startsWith('issue:')?issueDrawer(overlay.slice(6)):'';
+  $('#overlay').innerHTML=!overlay?'':overlay==='consent'?consent():overlay.startsWith('issue:')?issueDrawer(overlay.slice(6)):overlay.startsWith('role:')?roleDrawer(overlay.slice(5)):overlay.startsWith('lesson:')?lessonDrawer(overlay.slice(7)):'';
   $('#overlay').innerHTML+=S.toast?`<div class="toast" role="status">${S.toast}</div>`:'';
 }
 function toast(m){S.toast=m;render();clearTimeout(toast.t);toast.t=setTimeout(()=>{S.toast=null;render()},1800)}
@@ -1393,6 +2073,7 @@ document.addEventListener('click',e=>{
   const a=el.dataset.act,v=el.dataset.v;
   if(el.classList.contains('scrim')&&e.target!==el) return;
   if(el.tagName==='INPUT'&&a!=='scope'&&a!=='credits') return;
+  if(el.tagName==='SELECT'||el.tagName==='TEXTAREA') return;
   switch(a){
     case 'tab':S.tab=v;window.scrollTo(0,0);break;
     case 'theme':toggleTheme();return;
@@ -1415,7 +2096,7 @@ document.addEventListener('click',e=>{
     case 'aosallow':overlay=null;S.aos=true;toast('Connected to AgenticOS v2 · Harbor Bakery');return;
     case 'aosout':S.aos=false;S.aosCredits=false;toast('Disconnected. Token revoked.');return;
     case 'credits':S.aosCredits=el.checked;break;
-    case 'master':S.master=v;S.model={claude:'opus',codex:'gpt-5.5-codex',pi:'claude-sonnet'}[v];break;
+    case 'master':S.master=v;S.roles.master.p=v;S.roles.master.m=MODELS[v][0];S.model={claude:'opus',codex:'gpt-5.5-codex',pi:'claude-sonnet'}[v];break;
     case 'dial':S.dial=+v;break;
     case 'launch':S.launching=1;render();[2,3,4].forEach((n,i)=>setTimeout(()=>{S.launching=n;render();if(n===4)setTimeout(()=>{S.launching=0;S.launched=true;S.screen='home';render()},600)},(i+1)*650));return;
     case 'approve':S.planApproved=true;toast('Plan P-1 approved · workers starting');return;
@@ -1430,11 +2111,21 @@ document.addEventListener('click',e=>{
     case 'issue':overlay='issue:'+v;break;
     case 'close':overlay=null;break;
     case 'agent':S.agent=v;break;
+    case 'teamtab':S.teamTab=v;break;
+    case 'vaulttab':S.vaultTab=v;break;
+    case 'role':overlay='role:'+v;break;
+    case 'rolesave':overlay=null;toast('Role saved · vault/company/roles/'+v+'.md committed');return;
+    case 'lesson':overlay='lesson:'+v;break;
+    case 'packrole':S.pack=v;break;
+    case 'newteam':toast('Ask the master to start a team — it proposes staffing together with a plan');return;
+    case 'answer':S.answer=v;toast('Answered · decision D-42 · FAQ candidate for the curator');return;
+    case 'ver':{const [id,act]=v.split(':');S.ver[id]={merge:'merged into L-12',accept:'accepted',evidence:'evidence requested',reject:'rejected',promote:'promoted by you',discard:'discarded'}[act];toast(id+' · '+S.ver[id]);return;}
     case 'settab':S.setTab=v;break;
     case 'copy':toast('Copied');return;
   }
   render();
 });
+document.addEventListener('change',e=>{const t=e.target;if(t.dataset&&t.dataset.act==='rolefield'){const r=S.roles[t.dataset.k];r[t.dataset.f]=t.value;if(t.dataset.f==='p')r.m=(MODELS[t.value]||[''])[0];render();}});
 document.addEventListener('input',e=>{if(e.target.dataset.act==='maxw'){S.maxw=+e.target.value;const m=$('#mw');if(m)m.textContent=S.maxw}});
 document.addEventListener('keydown',e=>{
   if(e.target.id==='compose'&&e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMsg()}

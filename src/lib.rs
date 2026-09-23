@@ -27,6 +27,7 @@ pub mod skill;
 pub mod slots;
 pub mod store;
 pub mod ui;
+pub mod upgrade;
 pub mod worktree;
 
 pub use error::{Error, Result};

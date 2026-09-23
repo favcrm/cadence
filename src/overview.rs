@@ -195,6 +195,11 @@ pub fn cmd_issue_set_ready(id: &str) -> String {
 
 pub const CMD_ISSUE_SYNC: &str = "cadence issue sync";
 pub const CMD_RESTART_WHEN_IDLE: &str = "cadence daemon restart --when-idle --ui";
+/// Deploy-drift remedy (CAD-334): install the newest tested main build.
+/// `upgrade` verifies the CI artifact, repoints the CLI, and prints the
+/// lease-gated restart ([`CMD_RESTART_WHEN_IDLE`]) as the explicit next
+/// step — it never restarts on its own.
+pub const CMD_UPGRADE_LATEST_MAIN: &str = "cadence upgrade --latest-main";
 
 /// The monitor daemon deliberately has no external delivery provider in this
 /// increment.  The board can still make its durable local inbox useful by
@@ -2702,7 +2707,7 @@ pub fn overview_with(state_dir: &Path, pm_dir: &Path, opts: &Options) -> Result<
                     0,
                     project,
                     None,
-                    CMD_RESTART_WHEN_IDLE,
+                    CMD_UPGRADE_LATEST_MAIN,
                 )
                 .about("deploy", project),
             );

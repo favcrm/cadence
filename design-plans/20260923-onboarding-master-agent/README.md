@@ -1,14 +1,29 @@
-# Cadence plan, direction and prototype — v3
+# Cadence plan, roadmap, research and prototype — v4
 
-Status: for review (2026-09-23). Not accepted; nothing here is implemented.
+Status: direction accepted by the operator on 2026-09-23 ("go"); tracked as CAD-309..333 and AOS-49. Implementation has started (CAD-310, PR #179). Designs here are still proposals until their ADRs/tickets land.
 
-- `index.html` — four tabs: Plan (one page), Direction (market, positioning,
-  business model, marketing, launch, metrics, nice-to-have), Details (full
-  technical proposal) and Prototype (clickable). Synthetic data, no live actions. Light/dark toggle,
+- `index.html` — six tabs: Plan (consolidated: org, learning loop, roles,
+  rules, milestones, decisions), Roadmap (generated from the tracker by
+  milestone tag), Research (state of the art, checked 2026-09-23), Direction
+  (market and go-to-market), Details (technical proposal) and Prototype. Synthetic data, no live actions. Light/dark toggle,
   390px viewport toggle, daemon-offline and sandbox-banner simulations.
 - Preview: `https://preview.simplebuild.site/20260923-091413/cadence-onboarding/`
   (signed link, 24h). Re-mint with
   `~/.agents/skills/preview-html/scripts/mint-url.sh /20260923-091413/cadence-onboarding/`.
+
+## v4 changes
+
+- Target org: one master assistant → one PM per team → dev, QA, DevOps (researcher
+  on demand) from a company role catalog (description + preferred provider/model/effort).
+- Learning loop: typed reports (six-field reflection + context feedback) → logic
+  checks → cross-vendor curator → git company vault → context packs verified at SHA →
+  feedback, consolidation and A/B measurement.
+- Prototype: Teams & roles screen (Org, Roles editor, Agents, Reports) and Company
+  vault screen (company docs, lessons, verification queue, context packs).
+- Breakdown filed: CAD-338–CAD-369 and CAD-378 under the existing epics CAD-75
+  (team hierarchy), CAD-65 (knowledge layer) and CAD-329/330/331; milestone tags
+  m0-safe … m6-autonomy and gtm on 86 issues; direction comments on CAD-77, CAD-67,
+  CAD-116, CAD-260.
 
 ## v3 changes
 
@@ -68,5 +83,11 @@ Status: for review (2026-09-23). Not accepted; nothing here is implemented.
 | P4 Platforms | CAD-331 | relates AOS-49 (AgenticOS credential exchange) |
 | P5 Autonomy dial | CAD-332 | blocked by CAD-225 |
 | Go-to-market | CAD-333 | |
+| Team org (under CAD-75) | — | CAD-338 role catalog ADR · CAD-339 master · CAD-340 independent review · CAD-341 reports · CAD-342 questions · CAD-343 Teams UI · CAD-344 many teams · CAD-345 doc reconciliation · CAD-378 write leases |
+| Learning + vault (under CAD-65) | — | CAD-346 vault · CAD-347 memory policy ADR · CAD-348 verification runner · CAD-349 curator · CAD-350 extraction · CAD-351 context packs · CAD-352 consolidation · CAD-353 skills · CAD-354 metrics · CAD-355 notes into git · CAD-356 manifests/code maps · CAD-357 Vault UI |
+| Plans / delegation / platforms children | CAD-329/330/331 | CAD-358–360 · CAD-361–364 · CAD-365–369 |
+
+Milestones are tags: `cadence issue ls --tag m2-one-team` (m0-safe, m1-first-chat,
+m2-one-team, m3-team-learns, m4-many-teams, m5-ships, m6-autonomy, gtm).
 
 Research verified against primary sources on 2026-09-23 (sources in the Direction tab footer).
