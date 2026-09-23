@@ -75,8 +75,10 @@ enum Commands {
     /// daemon is not blocked. The copy is integrity-checked, hashed and
     /// described by a manifest (schema, sha256, versions, repo remotes),
     /// then re-verified from disk. `--keep` prunes older backups with
-    /// the same `--reason` in that directory; files without a cadence
-    /// manifest are never touched. Schedule `--reason nightly` from cron
+    /// the same `--reason` in that directory, oldest by file-name stamp;
+    /// the copy just written is never pruned, and a file is deleted only
+    /// when it is `<manifest stem>.sqlite3` and matches its manifest's
+    /// sha256 and size. Schedule `--reason nightly` from cron
     /// for the nightly week of copies. See docs/SESSION.md.
     Backup {
         /// Where the copy and manifest go [default: <state dir>/backups].
@@ -91,9 +93,11 @@ enum Commands {
         reason: String,
     },
     /// Write a portable bundle (`cadence.sqlite3` + `manifest.json`) to
-    /// a new directory. Only the store goes in: endpoint tokens are
-    /// nulled, freed pages dropped, and every text cell secret-scanned.
-    /// One blocking finding refuses the export and writes nothing.
+    /// a new directory. Only the store goes in: endpoint and turn tokens
+    /// are nulled, freed pages dropped, and every text cell scanned for
+    /// credential patterns. One blocking finding refuses the export and
+    /// writes nothing; warnings pass. The bundle is not signed: its
+    /// sha256 detects corruption, not tampering.
     Export {
         /// The bundle directory to create. It must not exist.
         #[arg(long)]

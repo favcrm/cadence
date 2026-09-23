@@ -238,8 +238,12 @@ cadence secret scan [--file f]     # credential scan: JSON findings
                                    # --file)
 cadence backup [--reason nightly]  # online-backup copy + manifest into
                                    # <state>/backups, keeps 7 per reason
-cadence export --out dir           # portable bundle: store only, tokens
-                                   # nulled, secret-scanned (fails closed)
+                                   # (never prunes the fresh copy or a
+                                   # file its manifest does not match)
+cadence export --out dir           # portable bundle: store only, turn
+                                   # tokens nulled, credential patterns
+                                   # scanned (fails closed; warnings pass).
+                                   # Unsigned: restore only trusted bundles
 cadence restore <manifest|dir> [--repo path] [--force]
                                    # refuses a running daemon, a newer
                                    # schema or existing state; remaps repo
