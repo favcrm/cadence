@@ -34716,3 +34716,170 @@ fn ui_write_caller_keeps_the_operator_relay_with_a_managed_agent_live() {
     assert!(last.contains("Actor: operator"), "{last}");
     assert!(!last.contains("wk"), "{last}");
 }
+
+/// CAD-160 (ADR-0002 phase 1): criteria are never truncated, dropped or
+/// replaced by a pointer. A `dispatch` whose acceptance items cannot
+/// fit the 4000-char pty kickoff whole refuses — plain and `--job`
+/// alike — naming the ceiling and the note or spec file, and leaves no
+/// worktree, branch, job or queued message behind.
+#[test]
+fn dispatch_refuses_criteria_past_the_pty_ceiling() {
+    let seeded = TempDir::new().unwrap();
+    let state = seeded.path().to_path_buf();
+    {
+        let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
+        let cwd = state.to_str().unwrap().to_string();
+        let member = Some("{\"upstream\":\"pm\"}");
+        for (alias, params, kind) in [("pm", None, "fake"), ("w1", member, "inbox")] {
+            store
+                .register_agent(&NewAgent {
+                    alias,
+                    provider: "fake",
+                    endpoint_kind: kind,
+                    role: "worker",
+                    cwd: &cwd,
+                    sandbox: "read-only",
+                    instructions: None,
+                    params,
+                    team_role: None,
+                    model_policy: None,
+                })
+                .unwrap();
+        }
+    }
+    let d = TestDaemon::start_on(state);
+    let tmp = TempDir::new().unwrap();
+    let (pm_dir, repo, home) = (
+        tmp.path().join("pm"),
+        tmp.path().join("repo"),
+        tmp.path().join("home"),
+    );
+    for dir in [&pm_dir, &repo, &home] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let git = |dir: &Path, args: &[&str]| -> String {
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&o.stderr)
+        );
+        String::from_utf8_lossy(&o.stdout).to_string()
+    };
+    git(&repo, &["init", "-b", "main"]);
+    git(&repo, &["config", "user.email", "t@t"]);
+    git(&repo, &["config", "user.name", "t"]);
+    std::fs::write(repo.join("f"), "x").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "init"]);
+    let bin_dir = Path::new(env!("CARGO_BIN_EXE_cadence"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let cli = |args: &[&str]| -> (bool, String) {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+            .arg("--state-dir")
+            .arg(&d.state)
+            .args(args)
+            .env("CADENCE_PM_DIR", &pm_dir)
+            .env("HOME", &home)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin_dir.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env_remove("CADENCE_ALIAS")
+            .output()
+            .unwrap();
+        (
+            out.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )
+    };
+    assert!(cli(&["issue", "init"]).0);
+    let repo_s = repo.canonicalize().unwrap().to_str().unwrap().to_string();
+    assert!(cli(&["issue", "project", "add", "demo", "--prefix", "D", "--repo", &repo_s]).0);
+    // 60 items of ~95 bytes: the listing alone is well past 4000.
+    let criteria = tmp.path().join("acceptance.md");
+    let items: String = (0..60)
+        .map(|i| format!("- [ ] criterion {i} {}\n", "x".repeat(80)))
+        .collect();
+    std::fs::write(&criteria, items).unwrap();
+    let criteria_s = criteria.to_str().unwrap();
+    // QA N1 probe: 37 such items fit under 4000 alone but not beside
+    // the job kickoff's fixed fields.
+    let gap = tmp.path().join("gap.md");
+    let items: String = (0..37)
+        .map(|i| format!("- [ ] criterion {i} {}\n", "x".repeat(80)))
+        .collect();
+    std::fs::write(&gap, items).unwrap();
+    for title in ["Plain", "Job", "Gap"] {
+        assert!(cli(&["issue", "new", title, "--project", "demo"]).0);
+    }
+    for (id, file) in [
+        ("D-1", criteria_s),
+        ("D-2", criteria_s),
+        ("D-3", gap.to_str().unwrap()),
+    ] {
+        let (ok, out) = cli(&["issue", "acceptance", id, "--from", file]);
+        assert!(ok, "{out}");
+    }
+    let note = tmp.path().join("kickoff.md");
+    std::fs::write(&note, "# kickoff").unwrap();
+    let note_s = note.canonicalize().unwrap().to_str().unwrap().to_string();
+    let (spec, _sha) = d.spec_file("spec.md", "ceiling spec");
+
+    let (ok, out) = cli(&[
+        "dispatch",
+        "D-1",
+        "--to",
+        "w1",
+        "--note",
+        &note_s,
+        "--reply-to",
+        "pm",
+    ]);
+    assert!(!ok, "{out}");
+    assert!(out.contains("4000-char") && out.contains(&note_s), "{out}");
+    for id in ["D-2", "D-3"] {
+        let (ok, out) = cli(&[
+            "dispatch",
+            id,
+            "--to",
+            "w1",
+            "--note",
+            &note_s,
+            "--reply-to",
+            "pm",
+            "--job",
+            "--spec",
+            &spec,
+        ]);
+        assert!(!ok, "{id}: {out}");
+        assert!(
+            out.contains("4000-char") && out.contains(&spec),
+            "{id}: {out}"
+        );
+    }
+
+    // Nothing was created or queued.
+    assert!(!repo.join(".cadence").join("wt").exists());
+    assert_eq!(git(&repo, &["branch", "--list", "cadence/*"]), "");
+    let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
+    assert_eq!(show["messages"], json!([]), "{show}");
+    let jobs = d.rpc("job_list", json!({"all": true})).unwrap();
+    assert_eq!(jobs["jobs"], json!([]), "{jobs}");
+}

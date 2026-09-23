@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::adapter::registry;
+use crate::adapter::{pty, registry};
 use crate::error::{Error, Result};
 use crate::proto::identifier;
 
@@ -4806,7 +4806,7 @@ impl Store {
         )
         .simple()
         .to_string();
-        let body = kickoff_body(&job, &task, revision, &kickoff, &worker);
+        let body = kickoff_body(&job, &task, revision, &kickoff, &worker)?;
         let reply_to = (assignee != job.pm_alias).then_some(job.pm_alias.as_str());
         let (duplicate, _state) = self.enqueue_tx(
             &tx,
@@ -5294,6 +5294,79 @@ impl Store {
         self.task_in(&conn, id)
     }
 
+    /// CAD-160 (ADR-0002 phase 1): the body a task-bound message (`send
+    /// --task`, `ask --task`) is delivered as. For an open task it is
+    /// the sender's text, then the task's objective, then every
+    /// still-unchecked acceptance criterion — a steering message
+    /// restates what the worker is still on the hook for, so it cannot
+    /// read as a replacement. Only the task's assignee is on the hook:
+    /// a message to anyone else (a worker's note to its PM), or bound
+    /// to an unassigned or terminal task, is `text` unchanged. A
+    /// composed message needs non-blank text — the amendment comes
+    /// first. Criteria are never cut: the restated objective gives way
+    /// first, and a body that still exceeds `ceiling` refuses naming
+    /// the ceiling and the spec file.
+    pub fn compose_task_message(
+        &self,
+        task_id: &str,
+        recipient: &str,
+        text: &str,
+        ceiling: usize,
+    ) -> Result<String> {
+        let task = self.task(task_id)?;
+        if is_task_terminal(&task.state) || task.assignee.as_deref() != Some(recipient) {
+            return Ok(text.to_string());
+        }
+        if text.trim().is_empty() {
+            return Err(Error::rejected(
+                "Prompt must contain 1-48000 characters — a message to an open task \
+                 needs non-blank text before its restated objective and criteria",
+            ));
+        }
+        let job = self.job(&task.job_id)?;
+        let spec = task.spec_path.as_deref().unwrap_or(&job.spec_path);
+        let outstanding = crate::issue::dispatch::outstanding_items(task.acceptance.as_deref());
+        let criteria = if outstanding.is_empty() {
+            "none".to_string()
+        } else {
+            crate::issue::dispatch::inline_listing(&outstanding)
+        };
+        let objective = flatten_controls(
+            task.title
+                .as_deref()
+                .or(job.title.as_deref())
+                .unwrap_or("implement per spec"),
+        );
+        let build = |objective: &str| {
+            format!(
+                "{text} — Task {} (job {}) is still open; this message amends it and does \
+                 not replace it. Objective: {objective}. Spec: {}. Outstanding criteria: \
+                 {criteria}.",
+                task.id,
+                job.id,
+                flatten_controls(spec)
+            )
+        };
+        let full = build(&objective);
+        let over = full.len().saturating_sub(ceiling);
+        if over == 0 {
+            return Ok(full);
+        }
+        const CUT: &str = "…";
+        if let Some(keep) = objective.len().checked_sub(over + CUT.len()) {
+            return Ok(build(&format!("{}{CUT}", take_bytes(&objective, keep))));
+        }
+        let total = full.len() - objective.len();
+        Err(criteria_too_long(
+            &task.id,
+            "message",
+            total,
+            criteria.len(),
+            ceiling,
+            spec,
+        ))
+    }
+
     pub fn task_opt(&self, id: &str) -> Result<Option<Task>> {
         let conn = self.conn();
         match conn.query_row("SELECT * FROM tasks WHERE id=?", [id], row_task) {
@@ -5678,7 +5751,7 @@ impl Store {
             .simple()
             .to_string()
         });
-        let body = kickoff_body(&job, &task, revision, &kickoff, &worker);
+        let body = kickoff_body(&job, &task, revision, &kickoff, &worker)?;
         // PM self-task: the PM's own turn IS the report path — a
         // reply_to to itself would fail enqueue's self-reply rule.
         let reply_to = (assignee != job.pm_alias).then_some(job.pm_alias.as_str());
@@ -6685,7 +6758,7 @@ pub fn omit_host_paths(text: &str) -> String {
 
 /// Enqueue rejects a body over 48_000 bytes. The inlined spec is cut in
 /// bytes, on a char boundary, so a multibyte spec cannot blow that limit.
-const ENQUEUE_BYTES: usize = 48_000;
+pub const ENQUEUE_BYTES: usize = 48_000;
 const SPEC_NOTE: &str = "… (spec text truncated; the inlined copy is incomplete)";
 
 fn take_bytes(text: &str, limit: usize) -> String {
@@ -6724,7 +6797,7 @@ fn cloud_hold_exit(message: &str, alias: &str, session: &str) -> String {
     )
 }
 
-fn cloud_kickoff_body(job: &Job, task: &Task, revision: i64) -> String {
+fn cloud_kickoff_body(job: &Job, task: &Task, revision: i64) -> Result<String> {
     let spec = task.spec_path.as_deref().unwrap_or(job.spec_path.as_str());
     let raw = std::fs::read_to_string(spec)
         .unwrap_or_else(|_| "(spec text was not available to inline)".to_string());
@@ -6755,30 +6828,83 @@ fn cloud_kickoff_body(job: &Job, task: &Task, revision: i64) -> String {
         task.id, job.id, revision
     );
     let bridge = format!(".{scope}{issue}");
-    let fixed = head.len() + bridge.len() + SHA_TRAILER.len();
-    let budget = ENQUEUE_BYTES.saturating_sub(fixed);
-    let spec_len = cleaned.len();
-    let (spec_text, accept_text) = if spec_len + acceptance.len() <= budget {
-        (cleaned, acceptance)
-    } else if spec_len <= budget {
-        let accept_text = take_bytes(&acceptance, budget - spec_len);
-        (cleaned, accept_text)
+    // CAD-160: the acceptance clause and the report contract are never
+    // cut. Criteria that cannot fit whole beside the fixed head refuse
+    // the dispatch; everything else (the inlined spec first) gives way.
+    let kept = acceptance.len() + SHA_TRAILER.len();
+    if head.len() + kept > ENQUEUE_BYTES {
+        return Err(criteria_too_long(
+            &task.id,
+            "kickoff",
+            head.len() + kept,
+            acceptance.len(),
+            ENQUEUE_BYTES,
+            spec,
+        ));
+    }
+    let budget = ENQUEUE_BYTES - kept;
+    let fixed = head.len() + bridge.len();
+    let spec_text = if fixed + cleaned.len() <= budget {
+        cleaned
     } else {
-        let mut spec_text = take_bytes(&cleaned, budget.saturating_sub(SPEC_NOTE.len()));
-        spec_text.push_str(SPEC_NOTE);
-        (spec_text, String::new())
+        let room = budget.saturating_sub(fixed + SPEC_NOTE.len());
+        format!("{}{SPEC_NOTE}", take_bytes(&cleaned, room))
     };
-    let mut body = format!("{head}{spec_text}{bridge}{accept_text}{SHA_TRAILER}");
+    let mut body = format!("{head}{spec_text}{bridge}{acceptance}{SHA_TRAILER}");
     // Scope and issue text can already exceed the enqueue limit. Drop
-    // the spec, say so, and keep the SHA trailer inside 48_000 bytes.
+    // the spec, say so, and keep the criteria and SHA trailer inside
+    // 48_000 bytes.
     if body.len() > ENQUEUE_BYTES {
         const OMITTED: &str = "… (spec text omitted; the prompt was cut to fit)";
-        let tail = format!("{OMITTED}{SHA_TRAILER}");
+        let tail = format!("{OMITTED}{acceptance}{SHA_TRAILER}");
         let room = ENQUEUE_BYTES.saturating_sub(tail.len());
         let prefix = take_bytes(&format!("{head}{bridge}"), room);
         body = format!("{prefix}{tail}");
     }
-    body
+    Ok(body)
+}
+
+/// CAD-160: the refusal when a `kind` ("message" or "kickoff") cannot
+/// carry its acceptance criteria whole within `ceiling` — names the
+/// ceiling and the spec file, and says nothing was queued. A kickoff
+/// has no sender text, so its hint names only the criteria.
+fn criteria_too_long(
+    task: &str,
+    kind: &str,
+    total: usize,
+    criteria: usize,
+    ceiling: usize,
+    spec: &str,
+) -> Error {
+    let shorten = if kind == "message" {
+        "shorten your text or the criteria"
+    } else {
+        "shorten the criteria"
+    };
+    Error::rejected(format!(
+        "Task '{task}': the {kind} is {total} bytes with its acceptance criteria \
+         ({criteria} bytes) whole — over the {ceiling}-char delivery ceiling. Criteria are \
+         never truncated (CAD-160): {shorten}, and keep the detail in the spec file {}. \
+         Nothing was queued.",
+        flatten_controls(spec)
+    ))
+}
+
+/// A Devin cloud session: it cannot read host paths, so its kickoff
+/// inlines the spec text ([`cloud_kickoff_body`]).
+fn cloud_session(provider: &str, endpoint_kind: &str) -> bool {
+    provider == "devin" && endpoint_kind == "cloud"
+}
+
+/// CAD-160: the size a `job dispatch` kickoff must fit for an assignee
+/// on `provider`/`endpoint_kind` — the enqueue limit for a Devin cloud
+/// session (its kickoff inlines the spec), else the pty ceiling.
+pub fn kickoff_ceiling(provider: &str, endpoint_kind: &str) -> usize {
+    if cloud_session(provider, endpoint_kind) {
+        ENQUEUE_BYTES
+    } else {
+        pty::MAX_BODY
+    }
 }
 
 fn kickoff_correlation(message_id: &str) -> String {
@@ -6797,8 +6923,30 @@ fn kickoff_body(
     revision: i64,
     message_id: &str,
     assignee: &Agent,
-) -> String {
-    if assignee.provider == "devin" && assignee.endpoint_kind == "cloud" {
+) -> Result<String> {
+    job_kickoff(
+        job,
+        task,
+        revision,
+        message_id,
+        &assignee.provider,
+        &assignee.endpoint_kind,
+    )
+}
+
+/// The `job dispatch` kickoff for an assignee on `provider`/
+/// `endpoint_kind`. Public so `cadence dispatch --job` can build the
+/// same text before `issue start` and refuse a list that will not fit
+/// (CAD-160) instead of leaving a worktree and job behind.
+pub fn job_kickoff(
+    job: &Job,
+    task: &Task,
+    revision: i64,
+    message_id: &str,
+    provider: &str,
+    endpoint_kind: &str,
+) -> Result<String> {
+    if cloud_session(provider, endpoint_kind) {
         return cloud_kickoff_body(job, task, revision);
     }
     let spec = task.spec_path.as_deref().unwrap_or(&job.spec_path);
@@ -6836,7 +6984,12 @@ fn kickoff_body(
             )
         })
         .unwrap_or_default();
-    let managed = registry::reports_turn_result(&assignee.provider, &assignee.endpoint_kind);
+    let issue_short = job
+        .issue_id
+        .as_deref()
+        .map(|i| format!(" Issue: {i}."))
+        .unwrap_or_default();
+    let managed = registry::reports_turn_result(provider, endpoint_kind);
     let report = if managed {
         " Report when done: end your final answer with a one-line \
          summary followed by a last line `SHA: <40-hex>` naming the \
@@ -6850,17 +7003,12 @@ fn kickoff_body(
              HEAD)\"` — `cadence self` shows the turn_id."
         )
     };
-    let body = format!(
-        "Cadence task {} (job {}, revision {}): implement per spec at \
-         {}.{}{}{}{} Do not report a SHA you have not committed.",
+    let head = format!(
+        "Cadence task {} (job {}, revision {}): implement per spec at {}.",
         task.id,
         job.id,
         revision,
-        clean(spec),
-        scope,
-        acceptance,
-        issue,
-        report
+        clean(spec)
     );
     // Explicit envelopes end with the per-message correlation: the
     // screen probe slices the body's tail, and without it every
@@ -6871,27 +7019,29 @@ fn kickoff_body(
     } else {
         kickoff_correlation(message_id)
     };
-    // The pty body ceiling is 4000 chars; truncate the free-form middle
-    // (acceptance) rather than the contract tail. The truncation note,
-    // the report contract and the correlation must all fit inside the
-    // ceiling, so the correlation's length is reserved up front.
-    if body.len() + correlation.len() > 4000 {
-        let suffix = "… (truncated — full criteria in the spec file).";
-        let room = 4000usize.saturating_sub(suffix.len() + report.len() + correlation.len());
-        // Byte budget, not char count — spec text may be multibyte.
-        let mut cut = String::new();
-        for c in body.chars() {
-            if cut.len() + c.len_utf8() > room {
-                break;
-            }
-            cut.push(c);
-        }
-        cut += suffix;
-        cut += &report;
-        cut += &correlation;
-        return cut;
+    let full = format!(
+        "{head}{scope}{acceptance}{issue}{report} Do not report a SHA you have not \
+         committed.{correlation}"
+    );
+    if full.len() <= pty::MAX_BODY {
+        return Ok(full);
     }
-    format!("{body}{correlation}")
+    // CAD-160: over the pty ceiling, prose gives way — the issue note
+    // shrinks to its id and the closing reminder goes — while the
+    // pointers, every acceptance criterion, the report contract and
+    // the correlation stay whole. If that still cannot fit, refuse.
+    let compact = format!("{head}{scope}{acceptance}{issue_short}{report}{correlation}");
+    if compact.len() <= pty::MAX_BODY {
+        return Ok(compact);
+    }
+    Err(criteria_too_long(
+        &task.id,
+        "kickoff",
+        compact.len(),
+        acceptance.len(),
+        pty::MAX_BODY,
+        spec,
+    ))
 }
 
 #[cfg(test)]
@@ -8287,7 +8437,7 @@ mod tests {
             created: 0.0,
             updated: 0.0,
         };
-        let body = kickoff_body(&job, &task, 1, "m1", &assignee);
+        let body = kickoff_body(&job, &task, 1, "m1", &assignee).unwrap();
         assert!(
             body.contains("Implement the cloud task from this text."),
             "{body}"
@@ -8340,7 +8490,7 @@ mod tests {
             created: 0.0,
             updated: 0.0,
         };
-        let body = cloud_kickoff_body(&job, &task, 1);
+        let body = cloud_kickoff_body(&job, &task, 1).unwrap();
         assert!(
             body.contains("spec text truncated; the inlined copy is incomplete"),
             "{body}"
@@ -8351,8 +8501,10 @@ mod tests {
         assert!(!body.contains(&spec.display().to_string()), "{body}");
     }
 
+    /// CAD-160: replaces the old cut, which kept the SHA trailer by
+    /// truncating the acceptance criteria.
     #[test]
-    fn cloud_kickoff_keeps_the_sha_trailer_when_acceptance_is_long() {
+    fn cloud_kickoff_keeps_criteria_whole_and_refuses_what_cannot_fit() {
         let dir = tempfile::tempdir().unwrap();
         let spec = dir.path().join("spec.md");
         std::fs::write(&spec, "Keep this short spec sentence.").unwrap();
@@ -8391,9 +8543,21 @@ mod tests {
             created: 0.0,
             updated: 0.0,
         };
-        let body = cloud_kickoff_body(&job, &task, 1);
+        // CAD-160: criteria that cannot fit whole refuse, naming the
+        // ceiling and the spec file — they are never cut.
+        let err = cloud_kickoff_body(&job, &task, 1).unwrap_err().to_string();
+        assert!(err.contains("48000-char"), "{err}");
+        assert!(err.contains(&spec.display().to_string()), "{err}");
+        // Long criteria beside a long spec: the spec gives way, the
+        // criteria and the report contract stay whole.
+        let criteria = "A".repeat(40_000);
+        std::fs::write(&spec, "S".repeat(20_000)).unwrap();
+        let mut task = task;
+        task.acceptance = Some(criteria.clone());
+        let body = cloud_kickoff_body(&job, &task, 1).unwrap();
         assert!(body.len() <= 48_000, "kickoff is {} bytes", body.len());
-        assert!(body.contains("Keep this short spec sentence."), "{body}");
+        assert!(body.contains(&format!(" Acceptance: {criteria}.")));
+        assert!(body.contains("spec text truncated"), "{body}");
         assert!(
             body.ends_with("Do not report a SHA you have not committed."),
             "{body}"
@@ -8441,7 +8605,7 @@ mod tests {
             created: 0.0,
             updated: 0.0,
         };
-        let body = cloud_kickoff_body(&job, &task, 1);
+        let body = cloud_kickoff_body(&job, &task, 1).unwrap();
         assert!(body.len() <= 48_000, "kickoff is {} bytes", body.len());
         assert!(
             body.ends_with("Do not report a SHA you have not committed."),
@@ -9024,8 +9188,13 @@ mod tests {
         assert_eq!(normalized("→ draft placeholder").matches(&s2).count(), 0);
     }
 
+    /// CAD-160: criteria that cannot fit the pty ceiling whole refuse
+    /// the kickoff — the error names the ceiling and the spec file, and
+    /// nothing is queued or transitioned. (Replaces the old truncation,
+    /// which cut the criteria to "(truncated — full criteria in the
+    /// spec file).")
     #[test]
-    fn truncated_explicit_kickoff_keeps_report_and_correlation() {
+    fn oversized_criteria_refuse_the_kickoff_and_queue_nothing() {
         let (dir, s) = store();
         let cwd = dir.path().join("w");
         seeded_job(&s, &cwd);
@@ -9042,50 +9211,276 @@ mod tests {
             None,
         )
         .unwrap();
+        let err = s
+            .dispatch_task("t1", None, Some("k-long"), "test")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("4000-char"), "{err}");
+        assert!(err.contains("spec file /s.md"), "{err}");
+        assert!(err.contains("Nothing was queued"), "{err}");
+        // QA N1: a kickoff has no sender text — the hint names only
+        // the criteria.
+        assert!(err.contains("the kickoff is"), "{err}");
+        assert!(err.contains("shorten the criteria"), "{err}");
+        assert!(!err.contains("text"), "{err}");
+        assert!(s.message("k-long").unwrap().is_none());
+        assert_eq!(s.queued_count("w1").unwrap(), 0);
+        let task = s.task("t1").unwrap();
+        assert_eq!(task.state, "draft");
+        assert_eq!(task.revision, 0);
+        assert!(task.dispatch_message.is_none());
+    }
+
+    /// CAD-160: an open task's message is the sender's text, then the
+    /// objective, then only the still-unchecked criteria — CAD-300's
+    /// numbered, JSON-quoted form, renumbered — on one control-free line.
+    #[test]
+    fn task_message_restates_objective_then_outstanding_criteria() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        seeded_job(&s, &cwd);
+        reg_pty(&s, "w1", &cwd);
+        s.create_task(
+            "j1",
+            "t1",
+            Some("Ship the\nemail change"),
+            Some("w1"),
+            Some("/specs/t1.md"),
+            Some(r#"1) [x] "done already"; 2) [ ] "use V2; [x] keep tests"; 3) [ ] "tab\there""#),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let body = s
+            .compose_task_message("t1", "w1", "actually, use the V1 provider", 4000)
+            .unwrap();
+        assert_eq!(
+            body,
+            "actually, use the V1 provider — Task t1 (job j1) is still open; this message \
+             amends it and does not replace it. Objective: Ship the email change. Spec: \
+             /specs/t1.md. Outstanding criteria: 1) [ ] \"use V2; [x] keep tests\"; \
+             2) [ ] \"tab\\there\"."
+        );
+        assert!(!crate::adapter::pty::has_control_chars(&body), "{body}");
+        let (items, rest) = crate::issue::dispatch::parse_acceptance_listing(
+            body.split_once("Outstanding criteria: ").unwrap().1,
+        )
+        .unwrap();
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|i| !i.checked));
+        assert_eq!(items[1].text, "tab\there");
+        assert_eq!(rest, ".");
+        // Free-form criteria are one outstanding item; a task with every
+        // item checked still restates the objective, with none owed.
         s.create_task(
             "j1",
             "t2",
             None,
             Some("w1"),
             None,
-            Some(&"b".repeat(5000)),
+            Some("green; tests"),
             None,
             None,
             None,
         )
         .unwrap();
-        let (k1, b1) = dispatch_body(&s, "t1", None);
-        let (k2, b2) = dispatch_body(&s, "t2", None);
-        for (k, b) in [(&k1, &b1), (&k2, &b2)] {
-            assert!(b.len() <= 4000, "{} bytes", b.len());
-            assert!(
-                b.contains("(truncated — full criteria in the spec file)."),
-                "{b}"
-            );
-            // The truncated form still ends report-contract then
-            // correlation — the same tail the short form uses.
-            let tail = format!("shows the turn_id.{}", expected_correlation(k));
-            assert!(b.ends_with(&tail), "{b}");
-            assert!(b.contains(&format!("cadence message result {k}")), "{b}");
-            assert!(
-                !b.contains('\n') && !b.chars().any(|c| c.is_control()),
-                "{b}"
-            );
-        }
-        // Truncated envelopes collide today on the shared report ending;
-        // with the suffix their probed tails separate too.
-        assert_ne!(probe_slice(&b1), probe_slice(&b2));
+        let body = s.compose_task_message("t2", "w1", "ping", 4000).unwrap();
+        assert!(
+            body.ends_with(
+                "Objective: implement per spec. Spec: /s.md. Outstanding criteria: \
+                 1) [ ] \"green; tests\"."
+            ),
+            "{body}"
+        );
+        s.create_task(
+            "j1",
+            "t3",
+            None,
+            Some("w1"),
+            None,
+            Some(r#"1) [x] "a""#),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let body = s.compose_task_message("t3", "w1", "ping", 4000).unwrap();
+        assert!(body.ends_with("Outstanding criteria: none."), "{body}");
     }
 
+    /// CAD-160: a terminal task's message is delivered byte-identical.
     #[test]
-    fn kickoff_body_ceiling_holds_across_the_truncation_boundary() {
+    fn terminal_task_message_is_unchanged() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        seeded_job(&s, &cwd);
+        s.create_task(
+            "j1",
+            "t1",
+            None,
+            Some("pm"),
+            None,
+            Some("green"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        s.cancel_task("t1", "test").unwrap();
+        let text = "  exact\ttext, trailing space ";
+        assert_eq!(
+            s.compose_task_message("t1", "pm", text, 4000).unwrap(),
+            text
+        );
+    }
+
+    /// CAD-160 (QA N2): only the task's assignee is on the hook, so a
+    /// `--task` message to anyone else — a worker's note to its PM —
+    /// and one bound to an unassigned task go out byte-identical.
+    #[test]
+    fn task_message_to_a_non_assignee_is_unchanged() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        seeded_job(&s, &cwd);
+        reg_pty(&s, "w1", &cwd);
+        s.create_task(
+            "j1",
+            "t1",
+            None,
+            Some("w1"),
+            None,
+            Some("green"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        s.create_task(
+            "j1",
+            "t2",
+            None,
+            None,
+            None,
+            Some("green"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let text = "PR is up — see #1 ";
+        assert_eq!(
+            s.compose_task_message("t1", "pm", text, 4000).unwrap(),
+            text
+        );
+        assert_eq!(
+            s.compose_task_message("t2", "w1", text, 4000).unwrap(),
+            text
+        );
+        assert_ne!(
+            s.compose_task_message("t1", "w1", text, 4000).unwrap(),
+            text
+        );
+    }
+
+    /// CAD-160 (QA N3): a composed message needs an amendment — blank
+    /// text is refused rather than sent as a bare restatement.
+    #[test]
+    fn task_message_refuses_blank_text() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        seeded_job(&s, &cwd);
+        reg_pty(&s, "w1", &cwd);
+        s.create_task(
+            "j1",
+            "t1",
+            None,
+            Some("w1"),
+            None,
+            Some("green"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        for text in ["", "  \t "] {
+            let err = s
+                .compose_task_message("t1", "w1", text, 4000)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("Prompt must contain 1-48000 characters"),
+                "{err}"
+            );
+            assert!(err.contains("non-blank"), "{err}");
+        }
+    }
+
+    /// CAD-160: over the ceiling the restated objective gives way and
+    /// the criteria stay whole; criteria that cannot fit refuse, naming
+    /// the ceiling and the spec file.
+    #[test]
+    fn task_message_cuts_the_objective_never_the_criteria() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        seeded_job(&s, &cwd);
+        let criteria = "c".repeat(800);
+        s.create_task(
+            "j1",
+            "t1",
+            Some(&"T".repeat(3000)),
+            Some("pm"),
+            None,
+            Some(&criteria),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let text = "p".repeat(500);
+        let body = s.compose_task_message("t1", "pm", &text, 4000).unwrap();
+        assert!(body.len() <= 4000, "{} bytes", body.len());
+        assert!(body.starts_with(&format!("{text} — Task t1")), "{body}");
+        assert!(body.contains("T…. Spec: /s.md."), "{body}");
+        assert!(
+            body.ends_with(&format!("Outstanding criteria: 1) [ ] \"{criteria}\".")),
+            "{body}"
+        );
+        s.create_task(
+            "j1",
+            "t2",
+            None,
+            Some("pm"),
+            None,
+            Some(&"c".repeat(5000)),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let err = s
+            .compose_task_message("t2", "pm", "ping", 4000)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("4000-char"), "{err}");
+        assert!(err.contains("spec file /s.md"), "{err}");
+    }
+
+    /// CAD-160: sweep the criteria across the 4000-byte ceiling. Every
+    /// body that goes out carries the criteria whole, the report
+    /// contract and the correlation; near the ceiling the prose (the
+    /// closing reminder, the long issue note) gives way; past it the
+    /// kickoff refuses. The truncation note is gone.
+    #[test]
+    fn kickoff_prose_gives_way_and_criteria_stay_whole_at_the_ceiling() {
         let (dir, s) = store();
         let cwd = dir.path().join("w");
         seeded_job(&s, &cwd);
         reg_pty(&s, "w1", &cwd);
         s.create_task("j1", "t1", None, Some("w1"), None, None, None, None, None)
             .unwrap();
-        let job = s.job("j1").unwrap();
+        let mut job = s.job("j1").unwrap();
+        job.issue_id = Some("CAD-9".into());
         let mut task = s.task("t1").unwrap();
         let worker = s.agent("w1").unwrap();
         let mid = "mid-0123456789abcdef";
@@ -9093,35 +9488,52 @@ mod tests {
         // test pins the encoding instead of re-deriving it from the
         // function under test.
         let correlation = " Correlation: 51bb19c5d45a3b839228091e46563550.";
-        let mut saw_normal = false;
-        let mut saw_truncated = false;
-        // Sweep the free-form field across the 4000-byte boundary: with
-        // the suffix appended, a pre-correlation body near the ceiling
-        // must still leave the whole paste inside it.
-        for len in (3400..=4000).step_by(25) {
-            task.acceptance = Some("x".repeat(len));
-            let out = kickoff_body(&job, &task, 1, mid, &worker);
-            assert!(out.len() <= 4000, "len {len}: {} bytes", out.len());
-            assert!(out.ends_with(&correlation), "len {len}: {out}");
-            assert!(out.contains(&format!("cadence message result {mid}")));
-            assert!(!out.chars().any(|c| c.is_control()), "len {len}");
-            if out.contains("(truncated — full criteria in the spec file).") {
-                saw_truncated = true;
-            } else {
-                saw_normal = true;
-                assert!(out.contains("Do not report a SHA you have not committed."));
+        let (mut saw_full, mut saw_compact, mut saw_refused) = (false, false, false);
+        for len in 3300..=4000 {
+            let criteria = "x".repeat(len);
+            task.acceptance = Some(criteria.clone());
+            match kickoff_body(&job, &task, 1, mid, &worker) {
+                Ok(out) => {
+                    assert!(out.len() <= 4000, "len {len}: {} bytes", out.len());
+                    assert!(
+                        out.contains(&format!(" Acceptance: {criteria}.")),
+                        "len {len}"
+                    );
+                    assert!(out.ends_with(correlation), "len {len}: {out}");
+                    assert!(out.contains(&format!("cadence message result {mid}")));
+                    assert!(!out.chars().any(|c| c.is_control()), "len {len}");
+                    assert!(!out.contains("truncated"), "len {len}: {out}");
+                    if out.contains("Do not report a SHA you have not committed.") {
+                        assert!(out.contains("put the header line `Issue: CAD-9`"));
+                        saw_full = true;
+                    } else {
+                        assert!(out.contains(" Issue: CAD-9. Report when done"), "{out}");
+                        saw_compact = true;
+                    }
+                }
+                Err(e) => {
+                    let e = e.to_string();
+                    assert!(e.contains("4000-char") && e.contains("/s.md"), "{e}");
+                    saw_refused = true;
+                }
             }
         }
-        assert!(saw_normal && saw_truncated, "sweep must cross the boundary");
-        // Multibyte acceptance: the byte budget cuts between scalars,
-        // never mid-codepoint, and the suffix survives the cut.
+        assert!(
+            saw_full && saw_compact && saw_refused,
+            "sweep must cross both boundaries"
+        );
+        // Multibyte criteria are never cut mid-codepoint — they are
+        // never cut at all: whole, or refused.
+        task.acceptance = Some("界".repeat(1100));
+        let out = kickoff_body(&job, &task, 1, mid, &worker).unwrap();
+        assert!(out.contains(&"界".repeat(1100)), "{out}");
+        assert!(out.ends_with(correlation), "{out}");
         task.acceptance = Some("界".repeat(1400));
-        let out = kickoff_body(&job, &task, 1, mid, &worker);
-        assert!(out.len() <= 4000);
-        assert!(out.ends_with(&correlation), "{out}");
+        assert!(kickoff_body(&job, &task, 1, mid, &worker).is_err());
         // Same id ⇒ same body: the tail is a pure function of the
         // durable id, so a repaste of one message keeps one slice.
-        assert_eq!(out, kickoff_body(&job, &task, 1, mid, &worker));
+        task.acceptance = Some("界".repeat(1100));
+        assert_eq!(out, kickoff_body(&job, &task, 1, mid, &worker).unwrap());
     }
 
     #[test]
@@ -9141,7 +9553,7 @@ mod tests {
         // digest of `mid-0123456789abcdef`.
         task.acceptance = Some("line one\nline two\u{7}more\u{85}end".to_string());
         task.spec_path = Some("spec\tdir/file\nname.md".to_string());
-        let out = kickoff_body(&job, &task, 1, "mid-0123456789abcdef", &worker);
+        let out = kickoff_body(&job, &task, 1, "mid-0123456789abcdef", &worker).unwrap();
         assert!(!out.chars().any(|c| c.is_control()), "{out}");
         assert!(!out.contains('\n'), "{out}");
         assert!(out.len() <= 4000);
@@ -9171,7 +9583,7 @@ mod tests {
         let task = s.task("t1").unwrap();
         let worker = s.agent("w1").unwrap();
         let weird = "κickoff-任务-✓".repeat(15);
-        let out = kickoff_body(&job, &task, 1, &weird, &worker);
+        let out = kickoff_body(&job, &task, 1, &weird, &worker).unwrap();
         assert!(out.ends_with(&expected_correlation(&weird)), "{out}");
         assert!(!out.chars().any(|c| c.is_control()));
         assert_ne!(expected_correlation(&long_id), expected_correlation(&weird));
@@ -9218,24 +9630,23 @@ mod tests {
             b.ends_with("Do not report a SHA you have not committed."),
             "{b}"
         );
-        // The truncated managed form ends on the report contract
-        // exactly as before — no suffix reserved, no suffix appended.
-        s.create_task(
-            "j1",
-            "t2",
-            None,
-            Some("w1"),
-            None,
-            Some(&"a".repeat(5000)),
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        let (_, b2) = dispatch_body(&s, "t2", None);
+        // CAD-160: the compact managed form (prose dropped, criteria
+        // whole) ends on the report contract — no suffix reserved, no
+        // suffix appended — and criteria past the ceiling refuse.
+        let job = s.job("j1").unwrap();
+        let worker = s.agent("w1").unwrap();
+        let mut task = s.task("t1").unwrap();
+        task.acceptance = Some("a".into());
+        let base = kickoff_body(&job, &task, 1, "m", &worker).unwrap().len() - 1;
+        let criteria = "a".repeat(4000 - base + 10);
+        task.acceptance = Some(criteria.clone());
+        let b2 = kickoff_body(&job, &task, 1, "m", &worker).unwrap();
         assert!(b2.len() <= 4000);
         assert!(!b2.contains("Correlation"), "{b2}");
+        assert!(b2.contains(&format!(" Acceptance: {criteria}.")), "{b2}");
         assert!(b2.ends_with("reported revision."), "{b2}");
+        task.acceptance = Some("a".repeat(5000));
+        assert!(kickoff_body(&job, &task, 1, "m", &worker).is_err());
     }
 
     fn defaults_body(revision: i64, providers: &str) -> String {

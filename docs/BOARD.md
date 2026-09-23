@@ -423,13 +423,17 @@ so text such as `a; [x] b` stays one unchecked item —
 quoting escapes `"` and `\`, writes tab as `\t` and every other control
 character and U+2028/U+2029 as `\uXXXX`, so the kickoff stays one
 control-free line and the text is recoverable exactly
-(`dispatch::parse_acceptance_listing` reads it back). A list too long
-to fit (the plain body's 4000-char limit, or 2000 bytes for the task)
-is replaced by a pointer: `N items, too long to inline — cadence issue
-show <ID> --json lists them under .acceptance`. If even the pointer
-would push the plain kickoff past 4000 chars (a near-limit
-`--summary`), the kickoff is sent without the clause instead of being
-refused; the JSON still lists the items. With **no** items, both paths **warn and
+(`dispatch::parse_acceptance_listing` reads it back). Criteria are
+never truncated, dropped or replaced by a pointer (CAD-160): when the
+plain kickoff would pass the 4000-char pty ceiling, the title (or
+`--summary`) is shortened and ends in `…`; when the items cannot fit
+even so, the dispatch refuses before anything is created, naming the
+ceiling and the note. On the `--job` path the task stores the whole
+listing, and dispatch builds the kickoff `job dispatch` will send (same
+spec path, scope, criteria and report contract, at the assignee's own
+ceiling — 48000 bytes for a Devin cloud session) before `issue start`:
+a list that cannot fit refuses naming the ceiling and the spec file,
+leaving no worktree, branch or job (see JOBS.md). With **no** items, both paths **warn and
 still dispatch** (PM decision 2026-09-23, ADR-0002 §8.3 — refusal is a
 follow-up once live issues are backfilled): the warning names the
 issue and `cadence issue acceptance <ID> --from <file>`, prints on
