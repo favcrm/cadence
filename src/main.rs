@@ -468,6 +468,11 @@ enum Commands {
         /// kickoff.
         #[arg(long)]
         no_lessons: bool,
+        /// Dispatch even when the worker's pty pane cwd is outside
+        /// every repo of the issue's project (CAD-202). The override
+        /// is recorded on the issue. A deleted cwd still refuses.
+        #[arg(long)]
+        force: bool,
     },
     /// Join a new worker agent to a group. `<group>` is the PM agent —
     /// its alias or provider-native id — and `<provider>` is devin,
@@ -2386,6 +2391,8 @@ fn status_view(state_dir: &Path, group: Option<&str>) -> Result<Value> {
             "unknown": unknown,
             "pane": pane,
             "issues": issues,
+            // CAD-202: the pane's cwd was deleted — delivery refuses.
+            "cwd_deleted": show["agent"]["cwd_deleted"].as_bool().unwrap_or(false),
         }));
     }
     let mut states: serde_json::Map<String, Value> = serde_json::Map::new();
@@ -2439,6 +2446,9 @@ fn print_status_table(view: &Value) {
             }
             if a["resumable"].as_bool().unwrap_or(false) {
                 flags.push("resumable");
+            }
+            if a["cwd_deleted"].as_bool().unwrap_or(false) {
+                flags.push("cwd_deleted");
             }
             let pane = a["pane"]["verdict"].as_str().unwrap_or("-").to_string();
             let issues = a["issues"]
@@ -4331,6 +4341,7 @@ fn run() -> Result<i32> {
             job,
             spec,
             no_lessons,
+            force,
         } => {
             let pm = cadence_agent::issue::Pm::open_default()?;
             let args = cadence_agent::issue::dispatch::DispatchArgs {
@@ -4343,6 +4354,7 @@ fn run() -> Result<i32> {
                 summary: summary.clone(),
                 job_spec: job.then(|| spec.clone().unwrap_or_default()),
                 no_lessons,
+                force,
             };
             print_json(&cadence_agent::issue::dispatch::run(
                 &pm,
