@@ -975,6 +975,16 @@ enum Commands {
         #[arg(long)]
         releases_dir: Option<PathBuf>,
     },
+    /// A disposable Cadence beside production: its own state dir,
+    /// tracker and board port under `$CADENCE_SANDBOX_ROOT` (default
+    /// `$XDG_STATE_HOME/cadence-sandbox`), run from this binary with
+    /// `CADENCE_PROFILE=sandbox:<name>` — which skips the skill sync
+    /// into `$HOME`, refuses `ui tailscale`, and keeps the provider WAL
+    /// watcher observe-only. Refuses production's dirs and port 3010.
+    Sandbox {
+        #[command(subcommand)]
+        action: cadence_agent::sandbox::SandboxAction,
+    },
     /// Stdio MCP server backing `--permission-prompt-tool` on a
     /// brokered managed claude — spawned by the provider CLI via the
     /// generated `--mcp-config`, never by hand.
@@ -5191,6 +5201,7 @@ fn run() -> Result<i32> {
             Ok(if blocking { 1 } else { 0 })
         }
         Commands::Ui { action } => cadence_agent::ui::run_cli(&state_dir, &action),
+        Commands::Sandbox { action } => cadence_agent::sandbox::run_cli(&action),
         Commands::Status { group, json, watch } => {
             run_status(&state_dir, group.as_deref(), json, watch)
         }
