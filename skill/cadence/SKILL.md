@@ -164,7 +164,8 @@ Before dispatch or resuming changed scope:
   before push. Give each rule's intent, not only its mechanics, so edge cases
   resolve without guessing. For each acceptance item name the component that
   produces the output, mark every number measured or aspirational, and list
-  the existing tests and neighbouring verbs that consume the changed output.
+  the existing tests and neighbouring verbs that consume the changed output —
+  found by searching for callers of what changed, not for tests named after it.
 
 During implementation and handoff:
 
