@@ -34215,3 +34215,220 @@ fn dispatch_warns_on_empty_acceptance() {
         .count();
     assert_eq!(warned, 1, "{issue}");
 }
+
+// ---- CAD-335: board writes from a managed endpoint's processes ----
+
+/// Seed a tracker in `pm` for the board tests below: one project and
+/// one issue, `CAD-1`. Runs the real CLI against the daemon's state.
+fn seed_board(pm: &Path, state: &Path) {
+    for args in [
+        &["issue", "init"][..],
+        &["issue", "project", "add", "cadence", "--prefix", "CAD"],
+        &["issue", "new", "root task", "--project", "cadence"],
+    ] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+            .arg("--state-dir")
+            .arg(state)
+            .args(args)
+            .env("CADENCE_PM_DIR", pm)
+            .env_remove("CADENCE_ALIAS")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// Serve the board in-process over `pm` and the daemon's `state` on a
+/// free loopback port and wait for health. A lost bind race (another
+/// test took the port) retries on a fresh one; the probe's `Host`
+/// names the port, so only OUR server answers 200.
+fn start_board(pm: &Path, state: &Path) -> u16 {
+    use std::io::Read;
+    let overall = Instant::now() + Duration::from_secs(20);
+    loop {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let (sd, pd) = (state.to_path_buf(), pm.to_path_buf());
+        thread::spawn(move || {
+            let opts = cadence_agent::ui::ServeOpts {
+                host: "127.0.0.1".to_string(),
+                port,
+                ..Default::default()
+            };
+            let _ = cadence_agent::ui::serve(&sd, &pd, &opts);
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+                s.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let probe = format!("GET /api/health HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n");
+                let _ = s.write_all(probe.as_bytes());
+                let mut buf = String::new();
+                if s.read_to_string(&mut buf).is_ok() && buf.contains("200") {
+                    return port;
+                }
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            assert!(Instant::now() < overall, "board server did not start");
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+/// A raw board write — a comment `body` on CAD-1 — addressed to the
+/// board on `port`, with every cross-site guard satisfied.
+fn board_comment_request(port: u16, body: &str) -> String {
+    let body = format!(r#"{{"body":"{body}"}}"#);
+    format!(
+        "POST /api/issues/CAD-1/comments HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\
+         Content-Type: application/json\r\nX-Cadence-Board: 1\r\n\
+         Origin: http://127.0.0.1:{port}\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// The comment `body` in a board write's raw HTTP reply (asserting 200).
+/// A reply relayed through the mock provider's text-mode capture has
+/// its `\r\n` folded to `\n`, so either blank line ends the head.
+fn board_replied_comment(response: &str, body: &str) -> Value {
+    assert!(
+        response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.0 200"),
+        "{response}"
+    );
+    let (_, json_body) = response
+        .split_once("\r\n\r\n")
+        .or_else(|| response.split_once("\n\n"))
+        .unwrap_or_else(|| panic!("no header end in {response:?}"));
+    let v: Value = serde_json::from_str(json_body).unwrap();
+    v["issue"]["comments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["body"] == body)
+        .cloned()
+        .unwrap_or_else(|| panic!("no comment {body:?} in {v}"))
+}
+
+/// The tracker's newest commit message.
+fn board_last_commit(pm: &Path) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(pm)
+        .args(["log", "-1", "--format=%B"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// Plain HTTP over bash's `/dev/tcp`: `$1` is the port, `$2` the raw
+/// request; the reply goes to stdout.
+const DEV_TCP_CLIENT: &str = r#"exec 3<>"/dev/tcp/127.0.0.1/$1"; printf '%s' "$2" >&3; cat <&3"#;
+
+/// CAD-335 phase 1 ACCEPTANCE (item 2): a managed endpoint has no pane,
+/// so before this fix its tool subprocess — a headless `claude -p`
+/// running its Bash tool and curling the loopback board — was "tied to
+/// no pane" and wrote as `operator (ui)`, author `operator`. The
+/// daemon records the provider process it launched; a board write from
+/// a process that descends from it is that agent's, never the
+/// operator's.
+#[test]
+fn ui_write_caller_attributes_a_managed_endpoint_tool_process() {
+    let d = TestDaemon::start();
+    let pm = TempDir::new().unwrap();
+    seed_board(pm.path(), &d.state);
+    let port = start_board(pm.path(), &d.state);
+    let mut wk = ManagedWorker::start(&d, "wk");
+    let request = board_comment_request(port, "from a managed tool");
+    let r = wk.exec(&[
+        "bash",
+        "-c",
+        DEV_TCP_CLIENT,
+        "_",
+        &port.to_string(),
+        &request,
+    ]);
+    assert_eq!(r["rc"], 0, "{r}");
+    let comment = board_replied_comment(r["out"].as_str().unwrap(), "from a managed tool");
+    assert_eq!(comment["author"], "wk", "{comment}");
+    let last = board_last_commit(pm.path());
+    assert!(last.contains("Actor: wk"), "{last}");
+    assert!(!last.contains("operator"), "{last}");
+}
+
+/// Forwards ONE connection from a fresh loopback port (printed first)
+/// to 127.0.0.1:`argv[1]` — the shape of the operator's tailnet relay
+/// (`socat TCP-LISTEN:13010,fork TCP:127.0.0.1:3010`), whose forking
+/// child is the board's TCP peer.
+const RELAY_PY: &str = r#"
+import socket, sys, threading
+ls = socket.socket()
+ls.bind(("127.0.0.1", 0))
+ls.listen(1)
+print(ls.getsockname()[1], flush=True)
+c, _ = ls.accept()
+u = socket.create_connection(("127.0.0.1", int(sys.argv[1])))
+def pump(a, b):
+    while True:
+        data = a.recv(65536)
+        if not data:
+            break
+        b.sendall(data)
+    try:
+        b.shutdown(socket.SHUT_WR)
+    except OSError:
+        pass
+t = threading.Thread(target=pump, args=(u, c))
+t.start()
+pump(c, u)
+t.join()
+"#;
+
+/// CAD-335 phase 1 (item 4): attributing managed endpoints must not
+/// cost the operator the board. With a managed agent live, a write
+/// relayed by a process that is neither a pane nor a managed
+/// provider's descendant — the operator's `socat` relay shape — still
+/// writes as `operator (ui)`, exactly as before.
+#[test]
+fn ui_write_caller_keeps_the_operator_relay_with_a_managed_agent_live() {
+    use std::io::Read;
+    let d = TestDaemon::start();
+    let pm = TempDir::new().unwrap();
+    seed_board(pm.path(), &d.state);
+    let port = start_board(pm.path(), &d.state);
+    let _wk = ManagedWorker::start(&d, "wk");
+    let mut relay = std::process::Command::new("python3")
+        .args(["-c", RELAY_PY, &port.to_string()])
+        .env_remove("CADENCE_ALIAS")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut first = String::new();
+    BufReader::new(relay.stdout.take().unwrap())
+        .read_line(&mut first)
+        .unwrap();
+    let relay_port: u16 = first.trim().parse().unwrap();
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", relay_port)).unwrap();
+    s.write_all(board_comment_request(port, "via the relay").as_bytes())
+        .unwrap();
+    let mut response = String::new();
+    s.read_to_string(&mut response).unwrap();
+    // Closing our end lets the relay's client-side pump finish.
+    drop(s);
+    assert!(relay.wait().unwrap().success());
+    let comment = board_replied_comment(&response, "via the relay");
+    assert_eq!(comment["author"], "operator", "{comment}");
+    let last = board_last_commit(pm.path());
+    assert!(last.contains("(operator (ui))"), "{last}");
+    assert!(last.contains("Actor: operator"), "{last}");
+    assert!(!last.contains("wk"), "{last}");
+}

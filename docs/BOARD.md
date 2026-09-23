@@ -669,8 +669,9 @@ tailnet name, `Tailscale-User-Login` resolves the actor to
 `<login> (tailscale)` — the tracker commit's `Actor:` trailer names the
 person who wrote. The same headers on a direct loopback request
 (non-tailnet `Host`) are ignored; the default actor stays
-`operator (ui)` — unless the peer is tied to a registered pane, in
-which case the write is that agent's (see [Write identity](#write-identity)).
+`operator (ui)` — unless the peer is tied to a registered pane or
+descends from a managed endpoint's provider process, in which case the
+write is that agent's (see [Write identity](#write-identity)).
 `GET /api/meta` reports `{read_only, actor,
 tailnet_url, version, build_commit, build_time, daemon}` so the SPA
 renders the right controls and the serving binary's build identity.
@@ -770,6 +771,17 @@ CAD-263), never from anything the request says:
      any same-user process can open another pane's `/dev/pts/N` onto
      its stdio (see the residual below).
 
+3. Each peer is also matched against the daemon's live **managed
+   endpoints** (`agent_list`: a `claude` or `codex` `managed` /
+   `managed-ws` endpoint with a pid — the provider process the daemon
+   launched, CAD-335). A peer is that endpoint's agent when the
+   provider pid is on its `/proc` ancestry: a headless `claude -p`
+   running its Bash tool, or a codex app-server's shell, that curls the
+   board writes as that agent. Ancestry is the only managed signal —
+   the provider's stdio is pipes and log files the daemon holds, so
+   there is no pty to tie. The pid is the row's live pid: the daemon
+   clears it when the endpoint closes, stops or errors.
+
    The pane's `CADENCE_ALIAS` in the peer's environment is **not** a
    board signal on its own: any process can export it, so
    `CADENCE_ALIAS=B curl …` from a pane-less process writes as
@@ -779,10 +791,19 @@ CAD-263), never from anything the request says:
 
 | Peer | Writes as |
 |---|---|
-| tied to exactly one registered pane | that agent's alias — commit subject, `Actor:` trailer, comment author, ack `by`, settings attribution; never `operator` |
-| walks cleanly and is tied to no pane (the operator's browser, an ssh tunnel, the loopback gateway) | `operator (ui)` |
-| tailnet-shaped request (see Remote access) tied to no pane | `<login> (tailscale)` as before |
-| cannot be attributed — socket owned by another user's process, ancestry unreadable, tied to several panes, or a store exists but the daemon cannot list panes | refused: `403`, `check: "caller_identity"`, naming why |
+| tied to exactly one registered pane, or descends from exactly one live managed endpoint's provider | that agent's alias — commit subject, `Actor:` trailer, comment author, ack `by`, settings attribution; never `operator` |
+| walks cleanly and is tied to no agent (the operator's browser, an ssh tunnel, the loopback gateway, the tailnet `socat` relay) | `operator (ui)` |
+| tailnet-shaped request (see Remote access) tied to no agent | `<login> (tailscale)` as before |
+| cannot be attributed — socket owned by another user's process, ancestry unreadable, tied to several agents, or a store exists but the daemon cannot list its agents | refused: `403`, `check: "caller_identity"`, naming why |
+
+**"Tied to no agent" is not proof of the operator.** It is the absence
+of every signal above, and today it still defaults to `operator (ui)`
+because the operator's own peer (a browser behind the tailnet `socat`
+relay or an ssh tunnel) carries no signal either. Phase 1 of CAD-335
+(this rule) only stops a managed agent's *ordinary* processes from
+landing there. Phase 2 (CAD-335 items 1 and 3, with ADR 0004 /
+CAD-313's operator session) replaces the default with positive proof
+and refuses every unattributed write.
 
 The board and `agent answer` also differ in how they place a caller
 tied to no pane: `answer` requires positive terminal evidence (a pts
@@ -791,7 +812,8 @@ menu; the board writes as `operator (ui)`, because the operator's own
 peer is a browser or tunnel that holds no terminal at all.
 
 No `cadence.sqlite3` in the state dir means no agent was ever
-registered, so there is provably no pane and writes are the operator's.
+registered, so there is provably no pane or managed endpoint and writes
+are the operator's.
 A different host (non-loopback peer with no local client socket) is
 never a pane here. Reads are unchanged.
 
@@ -810,6 +832,16 @@ would to the daemon's socket:
 - **a detach with redirected stdio** (`setsid -f … </dev/null
   >/dev/null 2>&1`): no ancestry and no pane pty — `operator (ui)`,
   whatever `CADENCE_ALIAS` it still carries.
+- **a detached or orphaned managed-endpoint process** (phase-2
+  remainder, CAD-335): a managed provider's `setsid -f` or
+  double-forked descendant leaves the provider's ancestry, and a
+  managed endpoint has no pty to fall back on, so it is `operator
+  (ui)`. So is a tool process orphaned when its provider died — once
+  the provider is gone, nothing proves the orphan was ever its. A
+  managed endpoint whose pid is not recorded (the launch has not
+  finished) matches nothing either; a recycled provider pid could
+  attribute an unrelated process *to* that agent (a narrowing, never
+  operator).
 
 - **a borrowed pane pty** (accepted residual, CAD-276): a same-user
   process on no pane's ancestry that opens a registered pane's
@@ -823,9 +855,9 @@ would to the daemon's socket:
 Same-user is not a hostile isolation boundary; this closes the direct
 path (a pane's `curl` approving its own work as `operator`) and the
 casual detach, not every deliberate relay. The root weakness — a local
-caller tied to no pane defaults to `operator (ui)` — is tracked as a
-design note on CAD-276 (operator by positive proof, as
-`slot_reconcile` already requires).
+caller tied to no agent defaults to `operator (ui)` — is CAD-335 phase 2
+(operator by positive proof, as `slot_reconcile` already requires, and
+ADR 0004's operator session for the browser).
 
 ### Security posture
 
