@@ -1693,9 +1693,20 @@ enum AgentAction {
         next_launch: bool,
     },
     /// Remove a dead agent's registry row — and with it the message and
-    /// event history. Refuses while an endpoint is live (`agent stop`
-    /// first) or the actor still owns the alias.
-    Remove { alias: String },
+    /// event history no job references (job kickoffs, verdict messages
+    /// and job-scoped events stay). Refuses while an endpoint is live
+    /// (`agent stop` first), the actor still owns the alias, or the
+    /// alias has open messages or non-terminal assigned tasks.
+    Remove {
+        alias: String,
+        /// Remove despite open messages/tasks: queued messages are
+        /// cancelled, running ones interrupted; recorded as an
+        /// `agent_remove_forced` event on the daemon stream. Still
+        /// refused while a message is `unknown` — reconcile it first
+        /// (`message reconcile` or `agent unfence --no-resume`).
+        #[arg(long)]
+        force: bool,
+    },
     /// Write (or refresh) an agent's briefing file + AGENTS.md block and
     /// enqueue it as a durable message — the retrofit for agents
     /// launched before briefings existed. Refuses an unknown alias;
@@ -4405,9 +4416,11 @@ fn run() -> Result<i32> {
                     }
                     out
                 }
-                AgentAction::Remove { alias } => {
-                    client::rpc(&state_dir, "agent_remove", json!({"alias": alias}))?
-                }
+                AgentAction::Remove { alias, force } => client::rpc(
+                    &state_dir,
+                    "agent_remove",
+                    json!({"alias": alias, "force": force}),
+                )?,
                 AgentAction::Bootstrap { alias } => {
                     let file = brief_agent(&state_dir, &alias, true, None)?;
                     print_json(&json!({"alias": alias, "briefing": file,
@@ -7997,8 +8010,15 @@ mod tests {
         assert!(matches!(
             cli.command,
             Commands::Agent {
-                action: AgentAction::Remove { alias }
+                action: AgentAction::Remove { alias, force: false }
             } if alias == "w1"
+        ));
+        let cli = Cli::try_parse_from(["cadence", "agent", "remove", "w1", "--force"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Agent {
+                action: AgentAction::Remove { force: true, .. }
+            }
         ));
         let cli = Cli::try_parse_from(["cadence", "agent", "gc", "--older-than", "2d"]).unwrap();
         assert!(matches!(
