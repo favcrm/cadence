@@ -136,11 +136,19 @@ fn text(out: &Output) -> String {
     )
 }
 
-/// A free board port in 3110-3199 — never production's 3010.
+/// A free board port in 3110-3199 — never production's 3010. Each
+/// call hands out a port no earlier call in this process did, so tests
+/// running in parallel never pick the same one.
 fn test_port() -> u16 {
-    (3110..=3199)
-        .find(|p| TcpListener::bind(("127.0.0.1", *p)).is_ok())
-        .expect("a free port in 3110-3199")
+    use std::sync::atomic::{AtomicU16, Ordering};
+    static NEXT: AtomicU16 = AtomicU16::new(3110);
+    loop {
+        let port = NEXT.fetch_add(1, Ordering::SeqCst);
+        assert!(port <= 3199, "no free port in 3110-3199");
+        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
 }
 
 fn by_check(lines: &[Value]) -> BTreeMap<String, Value> {
@@ -156,7 +164,7 @@ fn status<'a>(checks: &'a BTreeMap<String, Value>, name: &str) -> &'a str {
 
 /// Every entry under `root`: kind, bytes (a symlink's target) and
 /// mtime in nanoseconds — the fingerprint two runs must share.
-fn snapshot(root: &Path, into: &mut BTreeMap<PathBuf, (String, Vec<u8>, i128)>) {
+fn snapshot(root: &Path, tmpdir: &Path, into: &mut BTreeMap<PathBuf, (String, Vec<u8>, i128)>) {
     let meta = std::fs::symlink_metadata(root).unwrap();
     let mtime = i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec());
     let (kind, bytes) = if meta.file_type().is_symlink() {
@@ -173,21 +181,26 @@ fn snapshot(root: &Path, into: &mut BTreeMap<PathBuf, (String, Vec<u8>, i128)>) 
     into.insert(root.to_path_buf(), (kind.to_string(), bytes, mtime));
     if meta.is_dir() {
         for entry in std::fs::read_dir(root).unwrap() {
-            snapshot(&entry.unwrap().path(), into);
+            let path = entry.unwrap().path();
+            if !excluded(&path, tmpdir) {
+                snapshot(&path, tmpdir, into);
+            }
         }
     }
 }
 
+/// The only paths the fingerprint skips: `tmp/` (TMPDIR — scratch the
+/// daemon and git may use) and `*.log` files (the daemon and board
+/// append to their own logs as they serve). Everything else under the
+/// root — HOME with every skill dir and the tracker, each XDG dir, the
+/// state dir and the fake CLIs — must be unchanged by a second run.
+fn excluded(path: &Path, tmpdir: &Path) -> bool {
+    path == tmpdir || path.extension().is_some_and(|e| e == "log")
+}
+
 fn install_snapshot(host: &Host) -> BTreeMap<PathBuf, (String, Vec<u8>, i128)> {
     let mut all = BTreeMap::new();
-    for root in [
-        host.state_dir(),
-        host.path("home/pm"),
-        host.path("home/.agents"),
-        host.path("home/.claude/skills"),
-    ] {
-        snapshot(&root, &mut all);
-    }
+    snapshot(host.tmp.path(), &host.path("tmp"), &mut all);
     all
 }
 
@@ -216,7 +229,11 @@ fn setup_creates_once_and_a_second_run_changes_nothing() {
                 .contains(&line["status"].as_str().unwrap()),
             "{line}"
         );
-        if !["ok", "created"].contains(&line["status"].as_str().unwrap()) {
+        // Only master may lack a fix: `master start` is not a verb of
+        // this binary until CAD-339 lands.
+        if !["ok", "created"].contains(&line["status"].as_str().unwrap())
+            && line["check"] != "master"
+        {
             assert!(line["fix"].is_string(), "no fix: {line}");
         }
     }
@@ -253,11 +270,13 @@ fn setup_creates_once_and_a_second_run_changes_nothing() {
         .contains("cursor.com/install"));
 
     // CAD-339 and CAD-313 are reported, never implemented here.
+    // `master start` is not a verb of this binary yet: no fix to paste.
     assert_eq!(status(&checks, "master"), "missing");
-    assert!(checks["master"]["fix"]
+    assert!(checks["master"]["fix"].is_null(), "{}", checks["master"]);
+    assert!(checks["master"]["detail"]
         .as_str()
         .unwrap()
-        .ends_with("master start"));
+        .contains("CAD-339"));
     assert!(!host.path("home/pm/agents").exists());
     assert_eq!(status(&checks, "login"), "unknown");
 
@@ -266,7 +285,18 @@ fn setup_creates_once_and_a_second_run_changes_nothing() {
     for rel in ["ui.json", "cadence.sqlite3"] {
         assert!(before.contains_key(&host.state_dir().join(rel)), "{rel}");
     }
-    assert!(before.contains_key(&host.path("home/pm/pm.yaml")));
+    for rel in [
+        "home/pm/pm.yaml",
+        "home/.agents/skills/cadence/SKILL.md",
+        "home/.claude/skills/cadence",
+        "home/.cursor/skills/cadence",
+        "home/.copilot/skills/cadence",
+        "config",
+        "data",
+        "cache",
+    ] {
+        assert!(before.contains_key(&host.path(rel)), "{rel}");
+    }
     let second = host.setup_json(port);
     let checks = by_check(&second);
     for name in ["state_dir", "tracker", "skill", "daemon", "ui"] {
@@ -299,6 +329,55 @@ fn setup_creates_once_and_a_second_run_changes_nothing() {
         install_snapshot(&host),
         "a second setup changed the install"
     );
+
+    // Another --port while the board runs: the running board's URL is
+    // reported, the difference named, nothing moved.
+    let other = test_port();
+    let moved = by_check(&host.setup_json(other));
+    let ui = moved["ui"]["detail"].as_str().unwrap();
+    assert!(ui.contains(&format!("http://127.0.0.1:{port}")), "{ui}");
+    assert!(ui.contains(&format!("--port {other} differs")), "{ui}");
+    assert_eq!(
+        before,
+        install_snapshot(&host),
+        "--port on a running board changed the install"
+    );
+
+    // Stopped daemon and board over existing state: `started`, not
+    // `created`.
+    assert!(host.run(&["ui", "stop"]).status.success());
+    assert!(host.run(&["daemon", "stop"]).status.success());
+    let restarted = by_check(&host.setup_json(port));
+    for name in ["daemon", "ui"] {
+        assert_eq!(status(&restarted, name), "started", "{}", restarted[name]);
+    }
+    for name in ["state_dir", "tracker", "skill"] {
+        assert_eq!(status(&restarted, name), "ok", "{}", restarted[name]);
+    }
+}
+
+/// A board ui.json shares on the tailnet is never restarted by setup —
+/// that would re-run `tailscale serve`.
+#[test]
+fn setup_never_restarts_a_tailnet_shared_board() {
+    let host = Host::new();
+    let port = test_port();
+    host.setup_json(port);
+    assert!(host.run(&["ui", "stop"]).status.success());
+    let ui_json = host.state_dir().join("ui.json");
+    let mut opts: Value = serde_json::from_slice(&std::fs::read(&ui_json).unwrap()).unwrap();
+    opts["tailscale"] = serde_json::json!({
+        "dns_name": "box.example.ts.net",
+        "https_port": 9450,
+        "target": format!("http://127.0.0.1:{port}"),
+    });
+    std::fs::write(&ui_json, serde_json::to_vec_pretty(&opts).unwrap()).unwrap();
+    let before = std::fs::read(&ui_json).unwrap();
+    let checks = by_check(&host.setup_json(port));
+    assert_eq!(status(&checks, "ui"), "missing", "{}", checks["ui"]);
+    assert!(checks["ui"]["fix"].as_str().unwrap().ends_with("ui start"));
+    assert!(!host.state_dir().join("ui.pid").exists());
+    assert_eq!(before, std::fs::read(&ui_json).unwrap());
 }
 
 /// A tracker dir that holds someone else's files is never initialised

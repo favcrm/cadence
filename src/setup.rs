@@ -7,9 +7,11 @@
 //!
 //! - present → `ok` ("already present"); `apply` is never called, so an
 //!   existing install is never re-initialised;
-//! - absent with an `apply` → run it, detect again → `created`, or
-//!   `failed` when the check still does not pass;
-//! - absent without an `apply` → `missing` plus the fix;
+//! - absent with an `apply` → run it, detect again → `created` (or
+//!   `started` when its state already existed — a stopped daemon or
+//!   board), or `failed` when the check still does not pass;
+//! - absent without an `apply`, or absent but the operator's to create
+//!   (`Found::Manual`) → `missing` plus the fix;
 //! - broken → `failed` plus the fix; unknown → `unknown` plus the fix.
 //!
 //! A check whose prerequisite (`needs`) is not `ok`/`created` is not
@@ -20,7 +22,10 @@
 //! `Pm::init` (`issue init`), `skill::sync`, `client::daemon_start_as`
 //! (`daemon start`, which reports `already_running` rather than start a
 //! second daemon on a state dir) and `ui start`. Under a CAD-310
-//! sandbox profile the skill is never written into `$HOME`.
+//! sandbox profile the skill is never written into `$HOME`; an
+//! installed skill that differs from this binary is reported, never
+//! rewritten; a tailnet-shared board is never restarted (that would
+//! re-run `tailscale serve`).
 //!
 //! Provider CLIs are detected with their version and a sign-in signal
 //! that is cheap and never a secret — see [`PROVIDERS`]. Setup never
@@ -35,7 +40,7 @@
 //! | `devin` | `devin --version` | `$XDG_DATA_HOME/devin/credentials.toml` exists (`devin auth status` exits 0 signed out) |
 //! | `pi` | `pi --version` | `$PI_CODING_AGENT_DIR/auth.json` (default `~/.pi/agent`) exists; `pi auth` can print or refresh credentials, so it is not run |
 //!
-//! A status command that does not answer within 15 s is `unknown`. A
+//! A probe that does not answer within 10 s is `unknown`. A
 //! login held only in an API-key environment variable is not inspected
 //! and reads as not signed in.
 //!
@@ -60,7 +65,7 @@ const SOCKET_PATH_MAX: usize = 107;
 /// The board port `ui start` takes when nothing else is persisted.
 const DEFAULT_UI_PORT: u16 = 3010;
 /// Bound on each provider probe (`--version`, a status subcommand).
-const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bound on the daemon `health` probe.
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -76,6 +81,12 @@ pub enum Found {
         detail: String,
         fix: Option<String>,
     },
+    /// Absent, but only the operator may create it — `missing`, never
+    /// applied. `fix` is exactly this one (`None`: no command exists).
+    Manual {
+        detail: String,
+        fix: Option<String>,
+    },
 }
 
 impl Found {
@@ -88,7 +99,7 @@ impl Found {
     fn detail(&self) -> &str {
         match self {
             Found::Present(d) | Found::Absent(d) | Found::Unknown(d) => d,
-            Found::Broken { detail, .. } => detail,
+            Found::Broken { detail, .. } | Found::Manual { detail, .. } => detail,
         }
     }
 }
@@ -98,6 +109,9 @@ impl Found {
 pub enum Status {
     Ok,
     Created,
+    /// Applied over state that already existed — a stopped daemon or
+    /// board started again, not a new install.
+    Started,
     Missing,
     Failed,
     Unknown,
@@ -105,12 +119,13 @@ pub enum Status {
 
 impl Status {
     fn ready(self) -> bool {
-        matches!(self, Status::Ok | Status::Created)
+        matches!(self, Status::Ok | Status::Created | Status::Started)
     }
     fn label(self) -> &'static str {
         match self {
             Status::Ok => "ok",
             Status::Created => "created",
+            Status::Started => "started",
             Status::Missing => "missing",
             Status::Failed => "failed",
             Status::Unknown => "unknown",
@@ -129,7 +144,16 @@ pub struct Outcome {
 }
 
 type Detect = Box<dyn Fn(&Ctx) -> Found>;
-type Apply = Box<dyn Fn(&Ctx) -> Result<String>>;
+type Apply = Box<dyn Fn(&Ctx) -> Result<Applied>>;
+
+/// What an `apply` did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Applied {
+    /// Made something that did not exist.
+    Created(String),
+    /// Started something whose state already existed.
+    Started(String),
+}
 type Fix = Box<dyn Fn(&Ctx) -> String>;
 
 /// One setup step: detect, an optional apply, and the fix command.
@@ -156,7 +180,7 @@ impl Check {
         }
     }
 
-    pub fn apply(mut self, apply: impl Fn(&Ctx) -> Result<String> + 'static) -> Self {
+    pub fn apply(mut self, apply: impl Fn(&Ctx) -> Result<Applied> + 'static) -> Self {
         self.apply = Some(Box::new(apply));
         self
     }
@@ -195,18 +219,25 @@ impl Check {
             Found::Broken { detail, fix: own } => {
                 self.outcome(Status::Failed, detail, own.or_else(fix))
             }
+            Found::Manual { detail, fix: own } => self.outcome(Status::Missing, detail, own),
             Found::Absent(d) => match &self.apply {
                 None => self.outcome(Status::Missing, d, fix()),
                 Some(apply) => match apply(ctx) {
                     Err(e) => self.outcome(Status::Failed, format!("{d}; {e}"), fix()),
-                    Ok(did) => match (self.detect)(ctx) {
-                        Found::Present(_) => self.outcome(Status::Created, did, None),
-                        after => self.outcome(
-                            Status::Failed,
-                            format!("{did}, but the check still fails: {}", after.detail()),
-                            fix(),
-                        ),
-                    },
+                    Ok(applied) => {
+                        let (status, did) = match applied {
+                            Applied::Created(d) => (Status::Created, d),
+                            Applied::Started(d) => (Status::Started, d),
+                        };
+                        match (self.detect)(ctx) {
+                            Found::Present(_) => self.outcome(status, did, None),
+                            after => self.outcome(
+                                Status::Failed,
+                                format!("{did}, but the check still fails: {}", after.detail()),
+                                fix(),
+                            ),
+                        }
+                    }
                 },
             },
         }
@@ -224,6 +255,10 @@ pub struct Ctx {
     pub sandbox: Option<String>,
     /// Environment lookups (tests pass a map; the CLI the process env).
     pub env: fn(&str) -> Option<String>,
+    /// Bound on each provider probe.
+    pub probe_timeout: Duration,
+    /// This binary's top-level verbs — a fix names only one that exists.
+    pub verbs: Vec<String>,
 }
 
 fn process_env(name: &str) -> Option<String> {
@@ -244,12 +279,19 @@ impl Ctx {
         }
     }
 
-    /// The board port: `--port`, else the persisted `ui.json`, else
-    /// `ui start`'s default.
+    /// The board port: the running board's own (`ui.json`); with none
+    /// running, `--port`, else the persisted port, else `ui start`'s
+    /// default.
     pub fn board_port(&self) -> u16 {
-        self.port
-            .or(crate::ui::persisted_opts(&self.state_dir).port)
-            .unwrap_or(DEFAULT_UI_PORT)
+        let persisted = crate::ui::persisted_opts(&self.state_dir).port;
+        if crate::ui::detached_pid(&self.state_dir).is_some() {
+            return persisted.unwrap_or(DEFAULT_UI_PORT);
+        }
+        self.port.or(persisted).unwrap_or(DEFAULT_UI_PORT)
+    }
+
+    fn has_verb(&self, verb: &str) -> bool {
+        self.verbs.iter().any(|v| v == verb)
     }
 
     pub fn board_url(&self) -> String {
@@ -323,7 +365,10 @@ fn state_dir_check() -> Check {
     .apply(|ctx| {
         std::fs::create_dir_all(&ctx.state_dir)?;
         std::fs::set_permissions(&ctx.state_dir, std::fs::Permissions::from_mode(0o700))?;
-        Ok(format!("created {} (0700)", ctx.state_dir.display()))
+        Ok(Applied::Created(format!(
+            "created {} (0700)",
+            ctx.state_dir.display()
+        )))
     })
 }
 
@@ -358,10 +403,10 @@ fn tracker_check() -> Check {
     )
     .apply(|ctx| {
         crate::issue::Pm::init(&ctx.pm_dir)?;
-        Ok(format!(
+        Ok(Applied::Created(format!(
             "initialised a git tracker at {}",
             ctx.pm_dir.display()
-        ))
+        )))
     })
 }
 
@@ -370,26 +415,36 @@ fn skill_check() -> Check {
         "skill",
         |ctx| {
             let status = crate::skill::status(&ctx.home);
-            let links_ok = status["links"]
-                .as_object()
-                .is_some_and(|m| m.values().all(|v| v == "ok" || v == "foreign"));
-            let current = status["installed"] == true && status["content_match"] == true;
-            if current && links_ok {
-                return Found::Present(status["path"].as_str().unwrap_or("").to_string());
+            let path = status["path"].as_str().unwrap_or("").to_string();
+            if status["installed"] != true {
+                return match &ctx.sandbox {
+                    Some(name) => Found::Unknown(format!(
+                        "not installed; the sandbox profile ({name}) never writes the \
+                         skill into $HOME"
+                    )),
+                    None => Found::Absent("not installed".into()),
+                };
             }
-            let what = if status["installed"] != true {
-                "not installed"
-            } else if !current {
-                "installed but older than this binary"
+            // Installed: setup never rewrites it. Another binary's copy —
+            // older or newer — and a link the operator removed stay as
+            // they are; `skill install` is the explicit refresh.
+            let mut differs = Vec::new();
+            if status["content_match"] != true {
+                differs.push("SKILL.md content".to_string());
+            }
+            for (dir, state) in status["links"].as_object().into_iter().flatten() {
+                if state != "ok" && state != "foreign" {
+                    differs.push(format!("{dir} link {}", state.as_str().unwrap_or("?")));
+                }
+            }
+            if differs.is_empty() {
+                Found::Present(path)
             } else {
-                "an agent skill dir lacks its `cadence` link"
-            };
-            if let Some(name) = &ctx.sandbox {
-                return Found::Unknown(format!(
-                    "{what}; the sandbox profile ({name}) never writes the skill into $HOME"
-                ));
+                Found::Unknown(format!(
+                    "{path} differs from this binary ({}) — left as is",
+                    differs.join(", ")
+                ))
             }
-            Found::Absent(what.into())
         },
         |ctx| {
             if ctx.sandbox.is_some() {
@@ -402,10 +457,10 @@ fn skill_check() -> Check {
     )
     .apply(|ctx| {
         let report = crate::skill::sync(&ctx.home, false)?;
-        Ok(format!(
+        Ok(Applied::Created(format!(
             "installed {}",
             report["installed"].as_str().unwrap_or("the skill")
-        ))
+        )))
     })
 }
 
@@ -426,12 +481,18 @@ fn daemon_check() -> Check {
     // `daemon start` answers `already_running` when any daemon owns
     // this state dir — setup never starts a second one.
     .apply(|ctx| {
+        let existed = crate::rollout::db_file(&ctx.state_dir).exists();
         let result = client::daemon_start_as(&ctx.state_dir, None)?;
-        Ok(format!(
-            "{} on {}",
-            result["state"].as_str().unwrap_or("started"),
+        let state = result["state"].as_str().unwrap_or("started");
+        let detail = format!(
+            "{state} on {}",
             client::socket_path(&ctx.state_dir).display()
-        ))
+        );
+        Ok(if existed || state != "started" {
+            Applied::Started(detail)
+        } else {
+            Applied::Created(detail)
+        })
     })
 }
 
@@ -442,7 +503,19 @@ fn ui_check() -> Check {
             let url = ctx.board_url();
             match crate::ui::detached_pid(&ctx.state_dir) {
                 Some(pid) => match crate::ui::health(&ctx.state_dir) {
-                    Some((200, _)) => Found::Present(format!("board at {url} (pid {pid})")),
+                    Some((200, _)) => {
+                        let running = ctx.board_port();
+                        let moved = match ctx.port {
+                            Some(p) if p != running => format!(
+                                "; --port {p} differs from the running board — `{}` then \
+                                 `{}` moves it",
+                                ctx.cadence("ui stop"),
+                                ctx.cadence(&format!("ui start --port {p}"))
+                            ),
+                            _ => String::new(),
+                        };
+                        Found::Present(format!("board at {url} (pid {pid}){moved}"))
+                    }
                     _ => Found::Broken {
                         detail: format!("board pid {pid} is alive but {url} does not answer"),
                         fix: Some(format!(
@@ -452,29 +525,56 @@ fn ui_check() -> Check {
                         )),
                     },
                 },
-                None if std::net::TcpListener::bind(("127.0.0.1", ctx.board_port())).is_err() => {
-                    Found::Broken {
-                        detail: format!(
-                            "port {} is taken by another process — not this state dir's board",
-                            ctx.board_port()
-                        ),
-                        fix: Some(ctx.cadence("setup --port 3110")),
+                // `tailscale serve` is the operator's to re-run: setup
+                // never touches the tailnet.
+                None if crate::ui::persisted_opts(&ctx.state_dir)
+                    .tailscale
+                    .is_some() =>
+                {
+                    Found::Manual {
+                        detail: "not running, and ui.json shares it on the tailnet — setup \
+                                 does not re-run `tailscale serve`"
+                            .into(),
+                        fix: Some(ctx.cadence("ui start")),
                     }
                 }
+                None if !bindable(ctx.board_port()) => Found::Broken {
+                    detail: format!(
+                        "port {} is taken by another process — not this state dir's board",
+                        ctx.board_port()
+                    ),
+                    fix: Some(ctx.cadence(&format!(
+                        "setup --port {}",
+                        FREE_PORTS.clone().find(|p| bindable(*p)).unwrap_or(3110)
+                    ))),
+                },
                 None => Found::Absent("not running".into()),
             }
         },
         |ctx| ctx.cadence("ui start"),
     )
-    .needs(&["state_dir", "tracker"])
+    .needs(&["state_dir", "tracker", "daemon"])
     .apply(|ctx| {
+        let existed = crate::ui::opts_present(&ctx.state_dir);
         let flags = crate::ui::UiFlags {
             port: ctx.port,
             ..Default::default()
         };
         crate::ui::start_quiet(&ctx.state_dir, &flags, false)?;
-        Ok(format!("board at {}", ctx.board_url()))
+        let detail = format!("board at {}", ctx.board_url());
+        Ok(if existed {
+            Applied::Started(detail)
+        } else {
+            Applied::Created(detail)
+        })
     })
+}
+
+/// Where a fix looks for a free board port — never production's 3010.
+const FREE_PORTS: std::ops::RangeInclusive<u16> = 3110..=3199;
+
+fn bindable(port: u16) -> bool {
+    std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
 }
 
 /// The cheap, non-secret signal a provider's sign-in is read from.
@@ -543,15 +643,43 @@ fn which(ctx: &Ctx, bin: &str) -> Option<PathBuf> {
         })
 }
 
-/// First line of `<bin> --version`, at most 80 characters.
-fn version(path: &Path) -> Option<String> {
-    let out = crate::proc::run_bounded(Command::new(path).arg("--version"), PROBE_TIMEOUT).ok()?;
+/// Output kept from one probe — enough for a version line.
+const PROBE_OUTPUT_CAP: usize = 4096;
+
+/// Run a probe bounded in time and output. `run_bounded_limited` kills
+/// the whole process group when a reader misses the deadline, so a CLI
+/// that leaves a background child holding its stdout cannot stall
+/// setup past `timeout`.
+fn probe(path: &Path, args: &[&str], timeout: Duration) -> Option<std::process::Output> {
+    crate::proc::run_bounded_limited(Command::new(path).args(args), timeout, PROBE_OUTPUT_CAP)
+        .ok()
+        .map(|(out, _)| out)
+}
+
+/// The version token from `<bin> --version`: the first word of its
+/// first line shaped like `[0-9][0-9A-Za-z.+-]*` with a dot, at most 40
+/// characters. Nothing else is printed, so a CLI that answers with
+/// something else — a token, a path — leaks nothing.
+fn version(path: &Path, timeout: Duration) -> Option<String> {
+    let out = probe(path, &["--version"], timeout)?;
     if !out.status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let line = text.lines().next()?.trim();
-    (!line.is_empty()).then(|| line.chars().take(80).collect())
+    version_token(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn version_token(text: &str) -> Option<String> {
+    text.lines()
+        .next()?
+        .split_whitespace()
+        .find(|w| {
+            w.len() <= 40
+                && w.contains('.')
+                && w.starts_with(|c: char| c.is_ascii_digit())
+                && w.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-'))
+        })
+        .map(str::to_string)
 }
 
 /// `Some(true)` signed in, `Some(false)` signed out, `None` unknown —
@@ -560,9 +688,9 @@ fn signed_in(ctx: &Ctx, path: &Path, provider: &Provider) -> (Option<bool>, Stri
     match provider.signin {
         SignIn::StatusExit(args) => {
             let signal = format!("signal: `{} {}` exit code", provider.bin, args.join(" "));
-            match crate::proc::run_bounded(Command::new(path).args(args), PROBE_TIMEOUT) {
-                Ok(out) => (Some(out.status.success()), signal),
-                Err(_) => (None, format!("{signal} (did not answer)")),
+            match probe(path, args, ctx.probe_timeout) {
+                Some(out) => (Some(out.status.success()), signal),
+                None => (None, format!("{signal} (did not answer)")),
             }
         }
         SignIn::FilePresent(var, fallback, file) => {
@@ -584,7 +712,9 @@ fn provider_check(provider: &'static Provider) -> Check {
             let Some(path) = which(ctx, provider.bin) else {
                 return Found::Absent("not on PATH".into());
             };
-            let version = version(&path).unwrap_or_else(|| "version unknown".into());
+            let version = version(&path, ctx.probe_timeout)
+                .map(|v| format!("{} {v}", provider.bin))
+                .unwrap_or_else(|| "version unknown".into());
             match signed_in(ctx, &path, provider) {
                 (Some(true), signal) => Found::Present(format!("{version}; signed in ({signal})")),
                 (Some(false), signal) => {
@@ -615,13 +745,22 @@ fn master_check() -> Check {
                 .filter(|f| !dir.join(f).is_file())
                 .collect();
             if missing.is_empty() {
-                Found::Present(format!("agent files in {}", dir.display()))
+                return Found::Present(format!("agent files in {}", dir.display()));
+            }
+            let missing = format!("no {} in {}", missing.join(", "), dir.display());
+            // Name the verb only when this binary has it.
+            if ctx.has_verb("master") {
+                Found::Manual {
+                    detail: format!("{missing} — `master start` installs them (CAD-339)"),
+                    fix: Some(ctx.cadence("master start")),
+                }
             } else {
-                Found::Absent(format!(
-                    "no {} in {} — the master agent is set up by `cadence master start` (CAD-339)",
-                    missing.join(", "),
-                    dir.display()
-                ))
+                Found::Manual {
+                    detail: format!(
+                        "{missing} — the master agent arrives with CAD-339, not in this build"
+                    ),
+                    fix: None,
+                }
             }
         },
         |ctx| ctx.cadence("master start"),
@@ -656,6 +795,9 @@ fn login_check() -> Check {
 
 /// Run `checks` in order, handing each outcome to `emit` as it lands.
 pub fn run_checks(ctx: &Ctx, checks: &[Check], mut emit: impl FnMut(&Outcome)) -> Vec<Outcome> {
+    if cfg!(debug_assertions) {
+        validate(checks);
+    }
     let mut done = Vec::with_capacity(checks.len());
     for check in checks {
         let outcome = check.run(ctx, &done);
@@ -665,9 +807,24 @@ pub fn run_checks(ctx: &Ctx, checks: &[Check], mut emit: impl FnMut(&Outcome)) -
     done
 }
 
+/// Every `needs` names a check that runs earlier — a dependency that is
+/// unknown or ordered later could never be ready, which is a bug in
+/// the list, not a state of the host.
+pub fn validate(checks: &[Check]) {
+    for (i, check) in checks.iter().enumerate() {
+        for dep in &check.needs {
+            assert!(
+                checks[..i].iter().any(|c| c.name == *dep),
+                "setup check `{}` needs `{dep}`, which is not an earlier check",
+                check.name
+            );
+        }
+    }
+}
+
 /// `cadence setup [--json] [--port <n>]`. Exit 1 when any check
 /// failed; `missing` and `unknown` are facts, not failures.
-pub fn cli(state_dir: &Path, port: Option<u16>, json: bool) -> Result<i32> {
+pub fn cli(state_dir: &Path, port: Option<u16>, json: bool, verbs: Vec<String>) -> Result<i32> {
     let home = process_env("HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
@@ -679,6 +836,8 @@ pub fn cli(state_dir: &Path, port: Option<u16>, json: bool) -> Result<i32> {
         port,
         sandbox: crate::sandbox::profile(),
         env: process_env,
+        probe_timeout: PROBE_TIMEOUT,
+        verbs,
     };
     let outcomes = run_checks(&ctx, &checks(), |o| {
         if json {
@@ -716,6 +875,8 @@ mod tests {
             port: Some(3111),
             sandbox: None,
             env: no_env,
+            probe_timeout: Duration::from_secs(1),
+            verbs: Vec::new(),
         }
     }
 
@@ -735,7 +896,7 @@ mod tests {
         )
         .apply(move |_| {
             applied.set(applied.get() + 1);
-            Ok("made it".into())
+            Ok(Applied::Created("made it".into()))
         })
     }
 
@@ -849,10 +1010,135 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ctx = ctx(dir.path());
         let tracker = Check::new("tracker", |_| Found::Present("t".into()), |_| String::new());
-        let out = run_checks(&ctx, &[tracker, master_check()], |_| {});
+        let checks = [tracker, master_check()];
+        // Without the verb in this binary: no fix to paste.
+        let out = run_checks(&ctx, &checks, |_| {});
+        assert_eq!(out[1].status, Status::Missing);
+        assert_eq!(out[1].fix, None);
+        assert!(
+            out[1].detail.contains("arrives with CAD-339"),
+            "{:?}",
+            out[1]
+        );
+        let with_verb = Ctx {
+            verbs: vec!["master".into()],
+            ..ctx
+        };
+        let out = run_checks(&with_verb, &checks, |_| {});
         assert_eq!(out[1].status, Status::Missing);
         assert!(out[1].fix.as_deref().unwrap().ends_with("master start"));
-        assert!(!ctx.pm_dir.join("agents").exists());
+        assert!(!with_verb.pm_dir.join("agents").exists());
+    }
+
+    #[test]
+    fn a_started_apply_reports_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let on = Rc::new(Cell::new(false));
+        let seen = on.clone();
+        let check = Check::new(
+            "svc",
+            move |_| {
+                if seen.get() {
+                    Found::Present("up".into())
+                } else {
+                    Found::Absent("down".into())
+                }
+            },
+            |_| "start svc".into(),
+        )
+        .apply(move |_| {
+            on.set(true);
+            Ok(Applied::Started("started again".into()))
+        });
+        let out = run_checks(&ctx(dir.path()), &[check], |_| {});
+        assert_eq!(out[0].status, Status::Started);
+        assert!(out[0].status.ready());
+    }
+
+    #[test]
+    fn the_shipped_check_list_orders_every_dependency() {
+        validate(&checks());
+    }
+
+    #[test]
+    #[should_panic(expected = "not an earlier check")]
+    fn a_dependency_on_a_later_check_is_a_bug() {
+        let late = Check::new("a", |_| Found::Present("x".into()), |_| String::new()).needs(&["b"]);
+        let b = Check::new("b", |_| Found::Present("x".into()), |_| String::new());
+        validate(&[late, b]);
+    }
+
+    /// `run_checks` validates the list in debug builds.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "not an earlier check")]
+    fn an_unknown_dependency_is_a_bug() {
+        let dir = tempfile::tempdir().unwrap();
+        let check =
+            Check::new("a", |_| Found::Present("x".into()), |_| String::new()).needs(&["nope"]);
+        run_checks(&ctx(dir.path()), &[check], |_| {});
+    }
+
+    #[test]
+    fn an_installed_skill_that_differs_is_reported_and_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx(dir.path());
+        let first = run_checks(&ctx, &[skill_check()], |_| {});
+        assert_eq!(first[0].status, Status::Created, "{:?}", first[0]);
+        let file = ctx.home.join(".agents/skills/cadence/SKILL.md");
+        let link = ctx.home.join(".cursor/skills/cadence");
+        // The operator edits the skill and removes one link.
+        std::fs::write(&file, "operator's own skill\n").unwrap();
+        std::fs::remove_file(&link).unwrap();
+        let out = run_checks(&ctx, &[skill_check()], |_| {});
+        assert_eq!(out[0].status, Status::Unknown, "{:?}", out[0]);
+        assert!(
+            out[0].detail.contains("differs from this binary"),
+            "{:?}",
+            out[0]
+        );
+        assert!(out[0]
+            .fix
+            .as_deref()
+            .unwrap()
+            .ends_with("cadence skill install"));
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "operator's own skill\n"
+        );
+        assert!(std::fs::symlink_metadata(&link).is_err(), "link re-created");
+    }
+
+    #[test]
+    fn a_probe_that_leaves_a_background_child_is_still_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("fake");
+        // Answers at once, but its background child keeps stdout open.
+        std::fs::write(&fake, "#!/bin/sh\necho 'fake 1.2.3'\n( sleep 40 ) &\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let started = std::time::Instant::now();
+        let _ = version(&fake, Duration::from_secs(1));
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_secs(10), "probe took {elapsed:?}");
+    }
+
+    #[test]
+    fn only_a_version_shaped_token_is_reported() {
+        assert_eq!(
+            version_token("2.1.280 (Claude Code)").as_deref(),
+            Some("2.1.280")
+        );
+        assert_eq!(
+            version_token("codex-cli 0.156.0").as_deref(),
+            Some("0.156.0")
+        );
+        assert_eq!(
+            version_token("2026.09.18-9a7762b").as_deref(),
+            Some("2026.09.18-9a7762b")
+        );
+        assert_eq!(version_token("sk-ant-api03-abcdef"), None);
+        assert_eq!(version_token("1234567890abcdef"), None);
+        assert_eq!(version_token(""), None);
     }
 
     #[test]

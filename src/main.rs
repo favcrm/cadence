@@ -4494,7 +4494,14 @@ fn run() -> Result<i32> {
             json,
             port,
             no_open: _,
-        } => cadence_agent::setup::cli(&state_dir, port, json),
+        } => {
+            use clap::CommandFactory;
+            let verbs = Cli::command()
+                .get_subcommands()
+                .map(|c| c.get_name().to_string())
+                .collect();
+            cadence_agent::setup::cli(&state_dir, port, json, verbs)
+        }
         Commands::Daemon { action } => match action {
             DaemonAction::Run { rollout_as } => {
                 // CAD-308: before anything is spawned, so every tree the
