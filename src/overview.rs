@@ -28,7 +28,7 @@ use serde_json::{json, Value};
 use crate::adapter::registry;
 use crate::client;
 use crate::inbox;
-use crate::issue::{self, board, project, report};
+use crate::issue::{self, board, history, project, report};
 use crate::proc::run_bounded;
 
 /// Git identity baked in by build.rs — `unknown` when git or a repo
@@ -633,6 +633,10 @@ struct Item {
     owner: Option<String>,
     /// Set by [`classify_needs`]; a merged row takes its most urgent cause's.
     audience: Audience,
+    /// Epoch seconds when the row's condition began — the unhandled
+    /// clock (CAD-253). `None` when the kind has no reliable start: the
+    /// row then escalates by owner only, never by age.
+    since: Option<i64>,
     json: Value,
 }
 
@@ -725,20 +729,23 @@ impl<'a> Owners<'a> {
 
 /// Resolve every row's `audience` + `audience_reason` (CAD-253). Kinds
 /// already operator-class stay operator; a team row escalates to the
-/// operator when its owner cannot act or it has waited past
-/// `escalate_after` seconds. Runs before [`merge_by_subject`] so each
-/// cause is judged on its own owner and age. The CLI and the board
-/// render this field — neither maps kinds to audiences.
-fn classify_needs(items: &mut [Item], owners: &Owners, escalate_after: i64) {
+/// operator when its owner cannot act or its condition has stood
+/// unhandled past `escalate_after` seconds — measured from `since`,
+/// never from the subject's age; a row without `since` escalates by
+/// owner only. Runs before [`merge_by_subject`] so each cause is judged
+/// on its own owner and clock. The CLI and the board render this
+/// field — neither maps kinds to audiences.
+fn classify_needs(items: &mut [Item], owners: &Owners, now: i64, escalate_after: i64) {
     for it in items {
         let kind = it.json["kind"].as_str().unwrap_or_default();
+        let unhandled = it.since.map(|s| (now - s).max(0));
         let (audience, reason) = match Audience::of_kind(kind) {
             Audience::Operator => (Audience::Operator, Some("operator decision".to_string())),
             Audience::Team => match owners.cannot_act(it.owner.as_deref()) {
                 Some(why) => (Audience::Operator, Some(why)),
-                None if it.age > escalate_after => (
+                None if unhandled.is_some_and(|u| u > escalate_after) => (
                     Audience::Operator,
-                    Some(format!("unhandled {}m", it.age / 60)),
+                    Some(format!("unhandled {}m", unhandled.unwrap_or(0) / 60)),
                 ),
                 None => (
                     Audience::Team,
@@ -774,12 +781,13 @@ fn item(
         json: json!({
             "kind": kind, "cause": kind, "title": title, "age": age,
             "project": project, "link": link, "command": command,
-            "subject": {"kind": "row", "id": id},
+            "subject": {"kind": "row", "id": id}, "since": null,
         }),
         subject: ("row", id),
         agents: Vec::new(),
         owner: None,
         audience: Audience::of_kind(kind),
+        since: None,
     }
 }
 
@@ -803,6 +811,17 @@ impl Item {
     fn owned_by(mut self, owner: Option<&str>) -> Self {
         self.owner = owner.filter(|o| !o.is_empty()).map(str::to_string);
         self
+    }
+
+    /// When the row's condition began (epoch secs), when known.
+    fn since(mut self, since: Option<i64>) -> Self {
+        self.set_since(since);
+        self
+    }
+
+    fn set_since(&mut self, since: Option<i64>) {
+        self.since = since;
+        self.json["since"] = json!(since);
     }
 }
 
@@ -837,7 +856,7 @@ fn merge_by_subject(items: Vec<Item>) -> Vec<Item> {
                     json!({
                         "cause": i.json["kind"], "title": i.json["title"],
                         "age": i.age, "command": i.json["command"],
-                        "audience": i.json["audience"],
+                        "audience": i.json["audience"], "since": i.since,
                     })
                 })
                 .collect();
@@ -1374,13 +1393,8 @@ fn main_ci_view(
     let shas = classify_main_ci(runs, &first_parent);
     let alerts = main_ci_alerts(&shas);
     let subject = format!("{slug}@{branch}");
-    let run_age = |s: &ShaCi| {
-        s.created_at
-            .as_deref()
-            .and_then(parse_iso)
-            .map(|t| now - t)
-            .unwrap_or(0)
-    };
+    let run_at = |s: &ShaCi| s.created_at.as_deref().and_then(parse_iso);
+    let run_age = |s: &ShaCi| run_at(s).map(|t| now - t).unwrap_or(0);
     let mut rows = Vec::new();
     if let Some(s) = alerts.red {
         let command = match s.run_id {
@@ -1397,7 +1411,8 @@ fn main_ci_view(
                 s.run_url.as_deref(),
                 &command,
             )
-            .about("ci", &subject),
+            .about("ci", &subject)
+            .since(run_at(s)),
         );
     }
     if let Some(newest) = alerts.unverified.first() {
@@ -1424,7 +1439,8 @@ fn main_ci_view(
                 newest.run_url.as_deref(),
                 &command,
             )
-            .about("ci", &subject),
+            .about("ci", &subject)
+            .since(run_at(newest)),
         );
     }
     let view = json!({
@@ -1928,6 +1944,61 @@ fn daemon_view(state_dir: &Path, opts: &Options) -> DaemonView {
     view
 }
 
+/// Total wall time the tracker status clocks may spend per build; rows
+/// past it get no clock (owner-only escalation) and one `degraded` note.
+const STATUS_CLOCK_BUDGET: Duration = Duration::from_secs(3);
+
+/// When each issue entered its current effective status (CAD-253), read
+/// once per issue per build under one time budget. A `file` status is
+/// the tracker's last `status:` change ([`history::status_changed_at`]);
+/// a `notes` status is the deriving note's time; a `rollup` or `job`
+/// status has no single change to point at, so no clock.
+struct StatusClock<'a> {
+    pm_dir: &'a Path,
+    deadline: Instant,
+    cache: HashMap<String, Option<i64>>,
+    /// Issues left without a clock because the budget ran out.
+    skipped: usize,
+}
+
+impl<'a> StatusClock<'a> {
+    fn new(pm_dir: &'a Path, budget: Duration) -> Self {
+        Self {
+            pm_dir,
+            deadline: Instant::now() + budget,
+            cache: HashMap::new(),
+            skipped: 0,
+        }
+    }
+
+    fn since(&mut self, v: &board::View) -> Option<i64> {
+        let id = &v.issue.front.id;
+        if let Some(hit) = self.cache.get(id) {
+            return *hit;
+        }
+        let at = match v.status_source {
+            "file" => {
+                let left = self.deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    self.skipped += 1;
+                    None
+                } else {
+                    history::status_changed_at(
+                        self.pm_dir,
+                        &v.issue.project,
+                        id,
+                        left.min(GIT_TIMEOUT),
+                    )
+                }
+            }
+            "notes" => v.chain.last().and_then(|n| parse_iso(&n.at)),
+            _ => None,
+        };
+        self.cache.insert(id.clone(), at);
+        at
+    }
+}
+
 /// The tracker project an agent works in: the longest declared repo
 /// path its cwd sits under (worktrees under `.cadence/wt/` included).
 /// "" — a global row — when nothing matches.
@@ -1959,23 +2030,32 @@ fn agent_items(a: &Value, probe: &AgentProbe, project: &str, now: i64) -> Vec<It
             .owned_by(pm)
     };
     let mut items = Vec::new();
+    // Condition clocks (CAD-253): a daemon-measured age is a start
+    // time; `updated` is not — any params/model write moves it.
+    let secs_ago = |key: &str| a[key].as_f64().map(|s| now - s as i64);
     if a["state"].as_str() == Some("attention") {
-        items.push(row(
-            30,
-            "fenced",
-            &format!("agent {alias} fenced — reconcile then resume"),
-            age,
-            &cmd_agent_unfence(alias),
-        ));
+        items.push(
+            row(
+                30,
+                "fenced",
+                &format!("agent {alias} fenced — reconcile then resume"),
+                age,
+                &cmd_agent_unfence(alias),
+            )
+            .since(fenced_since(a, probe)),
+        );
     }
     if a["stalled"].as_bool().unwrap_or(false) {
-        items.push(row(
-            40,
-            "stalled",
-            &format!("agent {alias} turn silent"),
-            a["silent_secs"].as_f64().unwrap_or(age as f64) as i64,
-            &cmd_agent_show(alias),
-        ));
+        items.push(
+            row(
+                40,
+                "stalled",
+                &format!("agent {alias} turn silent"),
+                a["silent_secs"].as_f64().unwrap_or(age as f64) as i64,
+                &cmd_agent_show(alias),
+            )
+            .since(secs_ago("silent_secs")),
+        );
     }
     // A sampled approval menu ranks with brokered approvals — the pane
     // is waiting on a human either way.
@@ -1989,13 +2069,16 @@ fn agent_items(a: &Value, probe: &AgentProbe, project: &str, now: i64) -> Vec<It
         ));
     }
     if a["silent_ended"].as_bool().unwrap_or(false) {
-        items.push(row(
-            40,
-            "silent_end",
-            &format!("agent {alias} turn ended at an idle pane — never reported"),
-            a["ended_secs"].as_f64().unwrap_or(age as f64) as i64,
-            &cmd_send_ready(alias),
-        ));
+        items.push(
+            row(
+                40,
+                "silent_end",
+                &format!("agent {alias} turn ended at an idle pane — never reported"),
+                a["ended_secs"].as_f64().unwrap_or(age as f64) as i64,
+                &cmd_send_ready(alias),
+            )
+            .since(secs_ago("ended_secs")),
+        );
     }
     let queued = a["inbox"]["queued"]
         .as_i64()
@@ -2028,7 +2111,12 @@ fn agent_items(a: &Value, probe: &AgentProbe, project: &str, now: i64) -> Vec<It
             &cmd_inbox(alias),
         )
         .for_agent(owner)
-        .owned_by(Some(owner));
+        .owned_by(Some(owner))
+        .since(
+            health["oldest_unread_age_secs"]
+                .as_i64()
+                .map(|secs| now - secs),
+        );
         stale.json["owner"] = json!(owner);
         items.push(stale);
     }
@@ -2049,6 +2137,41 @@ fn agent_items(a: &Value, probe: &AgentProbe, project: &str, now: i64) -> Vec<It
         ));
     }
     items
+}
+
+/// `(earliest start, latest finish)` over a PR head's rollup, epoch
+/// secs: a CheckRun contributes `startedAt` and `completedAt`, a status
+/// context its `startedAt` (when it was posted).
+fn rollup_span(rollup: &[Value]) -> (Option<i64>, Option<i64>) {
+    // gh reports a not-yet-started check as `0001-01-01T00:00:00Z`.
+    let at = |c: &Value, key: &str| c[key].as_str().and_then(parse_iso).filter(|t| *t > 0);
+    let starts = rollup.iter().filter_map(|c| at(c, "startedAt"));
+    let ends = rollup
+        .iter()
+        .filter_map(|c| at(c, "completedAt").or_else(|| at(c, "startedAt")));
+    (starts.min(), ends.max())
+}
+
+/// A fence began when its turn went `unknown`: the earliest `completed`
+/// among the agent's unknown messages (the probe's `agent_show`). A
+/// fence with no such message (a provider disconnect while idle, a
+/// restart mismatch) falls back to the row's `updated`: every write
+/// that enters `attention` stamps it and no unstamped write does, so an
+/// agent still in `attention` has held it at least since `updated` — a
+/// later params or model write only shortens the clock, never inflates it.
+fn fenced_since(a: &Value, probe: &AgentProbe) -> Option<i64> {
+    let unknown = probe
+        .show
+        .as_ref()
+        .and_then(|show| show["messages"].as_array())
+        .and_then(|ms| {
+            ms.iter()
+                .filter(|m| m["state"].as_str() == Some("unknown"))
+                .filter_map(|m| m["completed"].as_f64())
+                .map(|t| t as i64)
+                .min()
+        });
+    unknown.or_else(|| a["updated"].as_f64().map(|t| t as i64))
 }
 
 /// Scope the merged rows: `--project` keeps rows attributed to the key,
@@ -2219,6 +2342,11 @@ pub fn overview_with(state_dir: &Path, pm_dir: &Path, opts: &Options) -> Result<
                 v.issue.front.owner.clone(),
             ));
         }
+        let view_of: HashMap<&str, &board::View> = views
+            .iter()
+            .map(|v| (v.issue.front.id.as_str(), v))
+            .collect();
+        let mut clock = StatusClock::new(&pm.dir, STATUS_CLOCK_BUDGET);
         let mut intake: Vec<Item> = Vec::new();
         for v in views {
             let id = v.issue.front.id.as_str();
@@ -2250,7 +2378,8 @@ pub fn overview_with(state_dir: &Path, pm_dir: &Path, opts: &Options) -> Result<
                     )
                     .about("issue", id)
                     .for_agent(owner)
-                    .owned_by(Some(owner)),
+                    .owned_by(Some(owner))
+                    .since(clock.since(v)),
                 );
             }
             let unblocked = !v.issue.front.blocked_by.is_empty()
@@ -2260,6 +2389,16 @@ pub fn overview_with(state_dir: &Path, pm_dir: &Path, opts: &Options) -> Result<
                     .iter()
                     .all(|b| status_of.get(b).map(String::as_str) == Some("done"));
             if !matches!(v.status.as_str(), "done" | "dropped") && unblocked {
+                // Unblocked when the last blocker reached done; one
+                // blocker without a clock leaves the row without one.
+                let since = v
+                    .issue
+                    .front
+                    .blocked_by
+                    .iter()
+                    .map(|b| view_of.get(b.as_str()).and_then(|bv| clock.since(bv)))
+                    .collect::<Option<Vec<i64>>>()
+                    .and_then(|ts| ts.into_iter().max());
                 needs.push(
                     item(
                         80,
@@ -2272,7 +2411,8 @@ pub fn overview_with(state_dir: &Path, pm_dir: &Path, opts: &Options) -> Result<
                     )
                     .about("issue", id)
                     .for_agent(owner)
-                    .owned_by(Some(owner)),
+                    .owned_by(Some(owner))
+                    .since(since),
                 );
             }
             // `cadence report` intake: a backlog-tagged row surfaces
@@ -2312,9 +2452,21 @@ pub fn overview_with(state_dir: &Path, pm_dir: &Path, opts: &Options) -> Result<
         // Cap the intake block — hundreds of untriaged reports must not
         // bury real work. Oldest first, then one summary row.
         intake.sort_by_key(|i| std::cmp::Reverse(i.age));
-        if intake.len() > report::NEEDS_ME_CAP {
-            let extra = intake.len() - report::NEEDS_ME_CAP;
+        let intake_extra = intake
+            .len()
+            .checked_sub(report::NEEDS_ME_CAP)
+            .filter(|n| *n > 0);
+        if intake_extra.is_some() {
             intake.truncate(report::NEEDS_ME_CAP);
+        }
+        // Clocks only for the rows that surface — one read each.
+        for it in &mut intake {
+            let since = view_of
+                .get(it.subject.1.as_str())
+                .and_then(|v| clock.since(v));
+            it.set_since(since);
+        }
+        if let Some(extra) = intake_extra {
             intake.push(
                 item(
                     85,
@@ -2329,6 +2481,16 @@ pub fn overview_with(state_dir: &Path, pm_dir: &Path, opts: &Options) -> Result<
             );
         }
         needs.extend(intake);
+        if clock.skipped > 0 {
+            degraded_notes.push(degraded(
+                "tracker_status_time",
+                "",
+                format!(
+                    "{} issue(s) past the status-time budget — those rows escalate by owner only",
+                    clock.skipped
+                ),
+            ));
+        }
         for p in &projects {
             if opts.scope.project.as_deref().is_some_and(|k| k != p.key) {
                 continue;
@@ -2409,6 +2571,9 @@ pub fn overview_with(state_dir: &Path, pm_dir: &Path, opts: &Options) -> Result<
                 .and_then(|(_, _, owner)| owner.clone())
                 .unwrap_or_default();
             let subject = format!("{slug}#{n}");
+            // Rollup times for this head (CAD-253): a CheckRun's
+            // `completedAt`, a status context's `startedAt`.
+            let (first_check, last_check) = rollup_span(&rollup);
             match verdict_state(&rollup).as_deref() {
                 Some("SUCCESS") if checks_green(&rollup) => {
                     // The verdict binds this head — a push after it
@@ -2429,7 +2594,9 @@ pub fn overview_with(state_dir: &Path, pm_dir: &Path, opts: &Options) -> Result<
                         )
                         .about("pr", &subject)
                         .for_agent(&owner)
-                        .owned_by(Some(&owner)),
+                        .owned_by(Some(&owner))
+                        // Merge-ready once the last check or verdict landed.
+                        .since(last_check),
                     );
                 }
                 Some("SUCCESS") | Some("FAILURE") | Some("ERROR") => {}
@@ -2445,7 +2612,10 @@ pub fn overview_with(state_dir: &Path, pm_dir: &Path, opts: &Options) -> Result<
                     )
                     .about("pr", &subject)
                     .for_agent(&owner)
-                    .owned_by(Some(&owner)),
+                    .owned_by(Some(&owner))
+                    // Verdict-less since this head's first check started;
+                    // a head with no checks yet has no clock.
+                    .since(first_check),
                 ),
             }
         }
@@ -2521,6 +2691,7 @@ pub fn overview_with(state_dir: &Path, pm_dir: &Path, opts: &Options) -> Result<
     classify_needs(
         &mut needs,
         &Owners::new(daemon.reachable, &daemon.agents),
+        now,
         ESCALATE_AFTER_SECS,
     );
     let mut needs = scope_rows(
@@ -2728,16 +2899,28 @@ mod tests {
         assert_eq!(row.agents, ["obs", "pm"]);
     }
 
-    // ---- CAD-253: needs-me audience from owner liveness and age ----
+    // ---- CAD-253: needs-me audience from owner liveness and the
+    // unhandled clock ----
 
-    /// A fenced worker `w1` whose PM is `pm`, `age` seconds since its
-    /// last state write — the row is pre-aged, no clock involved.
-    fn fenced_worker(now: i64, age: i64) -> Value {
-        json!({
+    const NOW: i64 = 1_000_000;
+
+    /// A fenced worker `w1` whose PM is `pm`: its turn went `unknown`
+    /// `fenced_ago` seconds before [`NOW`]. Its last state write is two
+    /// days old — the clock must never read it.
+    fn fenced_worker(fenced_ago: i64) -> (Value, AgentProbe) {
+        let a = json!({
             "alias": "w1", "provider": "devin", "endpoint_kind": "pty",
-            "state": "attention", "updated": (now - age) as f64,
+            "state": "attention", "updated": (NOW - 2 * 86_400) as f64,
             "params": {"upstream": "pm"}, "dead": false,
-        })
+        });
+        let probe = AgentProbe {
+            show: Some(json!({"messages": [
+                {"id": "m0", "state": "completed", "completed": (NOW - 3 * 86_400) as f64},
+                {"id": "m1", "state": "unknown", "completed": (NOW - fenced_ago) as f64},
+            ]})),
+            ..AgentProbe::default()
+        };
+        (a, probe)
     }
 
     fn pm_row(dead: bool, state: &str) -> Value {
@@ -2747,51 +2930,142 @@ mod tests {
 
     /// Classify then merge, the way `overview_with` does.
     fn resolve(mut rows: Vec<Item>, agents: &[Value]) -> Vec<Value> {
-        classify_needs(&mut rows, &Owners::new(true, agents), ESCALATE_AFTER_SECS);
+        classify_needs(
+            &mut rows,
+            &Owners::new(true, agents),
+            NOW,
+            ESCALATE_AFTER_SECS,
+        );
         merge_by_subject(rows).into_iter().map(|i| i.json).collect()
+    }
+
+    fn fenced_rows(fenced_ago: i64, pm: Option<Value>) -> Vec<Value> {
+        let (w1, probe) = fenced_worker(fenced_ago);
+        let mut agents = vec![w1.clone()];
+        agents.extend(pm);
+        resolve(agent_items(&w1, &probe, "cadence", NOW), &agents)
     }
 
     #[test]
     fn fenced_agent_with_dead_pm_escalates_to_operator() {
-        let now = 1_000_000;
-        let w1 = fenced_worker(now, 120);
-        let rows = agent_items(&w1, &AgentProbe::default(), "cadence", now);
-        let out = resolve(rows, &[w1.clone(), pm_row(true, "idle")]);
+        let out = fenced_rows(120, Some(pm_row(true, "idle")));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["kind"], "fenced");
+        assert_eq!(out[0]["since"], NOW - 120, "{}", out[0]);
         assert_eq!(out[0]["audience"], "operator", "{}", out[0]);
         assert_eq!(out[0]["audience_reason"], "owner pm is dead");
     }
 
     #[test]
     fn fenced_agent_with_live_pm_stays_team_until_the_threshold() {
-        let now = 1_000_000;
-        let agents = |age| vec![fenced_worker(now, age), pm_row(false, "idle")];
-        let under = agents(ESCALATE_AFTER_SECS - 60);
-        let out = resolve(
-            agent_items(&under[0], &AgentProbe::default(), "cadence", now),
-            &under,
-        );
+        let live = || Some(pm_row(false, "idle"));
+        // Fenced 10 minutes ago, although the agent row is days old.
+        let out = fenced_rows(10 * 60, live());
         assert_eq!(out[0]["audience"], "team", "{}", out[0]);
         assert_eq!(out[0]["audience_reason"], "owner pm can act");
-        // The same row, pre-aged past the threshold.
-        let over = agents(ESCALATE_AFTER_SECS + 14 * 60);
-        let out = resolve(
-            agent_items(&over[0], &AgentProbe::default(), "cadence", now),
-            &over,
-        );
+        let out = fenced_rows(ESCALATE_AFTER_SECS - 60, live());
+        assert_eq!(out[0]["audience"], "team", "{}", out[0]);
+        // Fenced 74 minutes ago.
+        let out = fenced_rows(ESCALATE_AFTER_SECS + 14 * 60, live());
         assert_eq!(out[0]["audience"], "operator", "{}", out[0]);
         assert_eq!(out[0]["audience_reason"], "unhandled 74m");
+    }
+
+    /// The clock is when the issue entered its status, not its age: an
+    /// issue created 30 days ago that went to review 10 minutes ago is
+    /// fresh team work; 74 minutes in review escalates.
+    #[test]
+    fn tracker_row_clock_is_its_status_change_not_the_issue_age() {
+        let pm = pm_row(false, "idle");
+        let review = |in_status: i64| {
+            item(
+                70,
+                "review_no_pr",
+                "CAD-1 in review",
+                30 * 86_400,
+                "",
+                None,
+                "c",
+            )
+            .about("issue", "CAD-1")
+            .owned_by(Some("pm"))
+            .since(Some(NOW - in_status))
+        };
+        let out = resolve(vec![review(10 * 60)], std::slice::from_ref(&pm));
+        assert_eq!(out[0]["audience"], "team", "{}", out[0]);
+        assert_eq!(out[0]["audience_reason"], "owner pm can act");
+        let out = resolve(vec![review(74 * 60)], &[pm]);
+        assert_eq!(out[0]["audience"], "operator", "{}", out[0]);
+        assert_eq!(out[0]["audience_reason"], "unhandled 74m");
+    }
+
+    /// A row with no reliable start time never escalates by age, however
+    /// old its subject, and never claims "unhandled".
+    #[test]
+    fn row_without_a_start_time_never_escalates_by_age() {
+        let pm = pm_row(false, "idle");
+        let old = 30 * 86_400;
+        // An approval menu is a pane sample with no start, even on a
+        // days-old agent row.
+        let a = json!({
+            "alias": "w1", "provider": "devin", "endpoint_kind": "pty",
+            "state": "busy", "updated": (NOW - old) as f64,
+            "params": {"upstream": "pm"}, "pane_menu": "1. Yes",
+        });
+        let mut rows = agent_items(&a, &AgentProbe::default(), "", NOW);
+        // A tracker row whose status has no single change (a rollup),
+        // and a PR head with no checks yet.
+        rows.push(
+            item(70, "review_no_pr", "CAD-9", old, "", None, "c")
+                .about("issue", "CAD-9")
+                .owned_by(Some("pm")),
+        );
+        rows.push(
+            item(60, "pr_no_verdict", "PR #3", old, "", None, "c")
+                .about("pr", "a/b#3")
+                .owned_by(Some("pm"))
+                .since(rollup_span(&[]).0),
+        );
+        let out = resolve(rows, &[a.clone(), pm]);
+        assert_eq!(out.len(), 3);
+        for row in &out {
+            assert_eq!(row["since"], Value::Null, "{row}");
+            assert_eq!(row["audience"], "team", "{row}");
+            assert_eq!(row["audience_reason"], "owner pm can act", "{row}");
+        }
+    }
+
+    /// A fence with no unknown turn (a disconnect while idle) is timed
+    /// from the row's last write — a lower bound on time in `attention`.
+    #[test]
+    fn fence_without_an_unknown_turn_is_timed_from_its_last_write() {
+        let pm = pm_row(false, "idle");
+        let fenced = |written_ago: i64| {
+            let a = json!({
+                "alias": "w1", "provider": "devin", "endpoint_kind": "pty",
+                "state": "attention", "updated": (NOW - written_ago) as f64,
+                "params": {"upstream": "pm"},
+                "error": "Provider process disconnected while idle",
+            });
+            let probe = AgentProbe {
+                show: Some(json!({"messages": [
+                    {"id": "m0", "state": "completed", "completed": (NOW - 9 * 3_600) as f64},
+                ]})),
+                ..AgentProbe::default()
+            };
+            resolve(agent_items(&a, &probe, "", NOW), &[a.clone(), pm.clone()])
+        };
+        let out = fenced(74 * 60);
+        assert_eq!(out[0]["since"], NOW - 74 * 60, "{}", out[0]);
+        assert_eq!(out[0]["audience_reason"], "unhandled 74m");
+        // A later params write shortens the clock; it never inflates it.
+        assert_eq!(fenced(10 * 60)[0]["audience"], "team");
     }
 
     #[test]
     fn owner_that_cannot_act_escalates_with_the_reason() {
         let owners_of = |pm: Option<Value>| {
-            let now = 1_000_000;
-            let w1 = fenced_worker(now, 60);
-            let mut agents = vec![w1.clone()];
-            agents.extend(pm);
-            let out = resolve(agent_items(&w1, &AgentProbe::default(), "", now), &agents);
+            let out = fenced_rows(60, pm);
             (
                 out[0]["audience"].clone(),
                 out[0]["audience_reason"].clone(),
@@ -2817,25 +3091,42 @@ mod tests {
         );
         // An unreachable daemon cannot vouch for any owner.
         let mut rows = vec![item(30, "fenced", "t", 1, "", None, "c").owned_by(Some("pm"))];
-        classify_needs(&mut rows, &Owners::new(false, &[]), ESCALATE_AFTER_SECS);
+        classify_needs(
+            &mut rows,
+            &Owners::new(false, &[]),
+            NOW,
+            ESCALATE_AFTER_SECS,
+        );
         assert_eq!(rows[0].json["audience"], "operator");
     }
 
     #[test]
     fn merge_ready_pr_with_live_issue_owner_stays_team() {
         let owner = json!({"alias": "w9", "provider": "devin", "state": "busy", "dead": false});
+        // Merge-ready since the verdict landed 5 minutes ago.
+        let rollup = [
+            json!({"__typename": "CheckRun", "startedAt": "1970-01-12T13:16:40Z",
+                   "completedAt": "1970-01-12T13:40:00Z"}),
+            json!({"__typename": "StatusContext", "context": "qa-verdict",
+                   "startedAt": "1970-01-12T13:41:40Z"}),
+            json!({"__typename": "CheckRun", "startedAt": "0001-01-01T00:00:00Z",
+                   "completedAt": "0001-01-01T00:00:00Z"}),
+        ];
+        let (first, last) = rollup_span(&rollup);
+        assert_eq!((first, last), (Some(NOW - 1_800), Some(NOW - 300)));
         let pr = item(
             10,
             "merge",
             "PR #7 fix — verdict pass",
-            300,
+            3_600,
             "cadence",
             None,
             "c",
         )
         .about("pr", "acme/widgets#7")
         .for_agent("w9")
-        .owned_by(Some("w9"));
+        .owned_by(Some("w9"))
+        .since(last);
         let out = resolve(vec![pr], &[owner]);
         assert_eq!(out[0]["audience"], "team", "{}", out[0]);
         assert_eq!(out[0]["audience_reason"], "owner w9 can act");
@@ -2863,13 +3154,19 @@ mod tests {
 
     #[test]
     fn kind_class_holds_outside_team_rows() {
-        let old = ESCALATE_AFTER_SECS * 10;
+        let old = Some(NOW - ESCALATE_AFTER_SECS * 10);
         let out = resolve(
             vec![
                 item(20, "approval", "a", 1, "", None, "c").about("agent", "w1"),
-                item(50, "drift", "d", old, "", None, "c").about("deploy", "x"),
-                item(100, "inbox_unread", "i", old, "", None, "c").about("agent", "w2"),
-                item(110, "tracker_behind", "t", old, "", None, "c").about("tracker", "pm"),
+                item(50, "drift", "d", 1, "", None, "c")
+                    .about("deploy", "x")
+                    .since(old),
+                item(100, "inbox_unread", "i", 1, "", None, "c")
+                    .about("agent", "w2")
+                    .since(old),
+                item(110, "tracker_behind", "t", 1, "", None, "c")
+                    .about("tracker", "pm")
+                    .since(old),
             ],
             &[],
         );
@@ -2894,29 +3191,20 @@ mod tests {
     #[test]
     fn merged_row_takes_its_most_urgent_audience() {
         let pm = pm_row(false, "idle");
-        let rows = vec![
-            item(20, "approval_menu", "menu", 60, "", None, "c")
-                .about("agent", "w1")
-                .owned_by(Some("pm")),
-            item(
-                40,
-                "stalled",
-                "silent",
-                ESCALATE_AFTER_SECS + 60,
-                "",
-                None,
-                "c",
-            )
-            .about("agent", "w1")
-            .owned_by(Some("pm")),
-        ];
-        let out = resolve(rows, &[pm]);
+        let a = json!({
+            "alias": "w1", "provider": "devin", "endpoint_kind": "pty",
+            "state": "busy", "updated": (NOW - 60) as f64,
+            "params": {"upstream": "pm"}, "pane_menu": "1. Yes",
+            "stalled": true, "silent_secs": ESCALATE_AFTER_SECS + 60,
+        });
+        let out = resolve(agent_items(&a, &AgentProbe::default(), "", NOW), &[pm]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["kind"], "approval_menu", "primary stays by rank");
         assert_eq!(out[0]["audience"], "operator");
         assert_eq!(out[0]["audience_reason"], "unhandled 61m");
         assert_eq!(out[0]["causes"][0]["audience"], "team");
         assert_eq!(out[0]["causes"][1]["audience"], "operator");
+        assert_eq!(out[0]["causes"][1]["since"], NOW - ESCALATE_AFTER_SECS - 60);
     }
 
     #[test]

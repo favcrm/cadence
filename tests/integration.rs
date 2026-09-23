@@ -20560,6 +20560,127 @@ fn overview_needs_me_audience_follows_owner_liveness() {
     assert!(!text.contains("nothing needs your decision"), "{text}");
 }
 
+/// CAD-253: the unhandled clock is when the issue entered its status —
+/// the tracker's last `status:` change — never the issue's age. Two
+/// issues created 30 days ago, owned by a live PM mailbox: one went to
+/// review 10 minutes ago (team), the other 74 minutes ago (operator,
+/// `unhandled 74m`).
+#[test]
+fn overview_tracker_row_clock_is_the_status_change() {
+    let d = TestDaemon::start();
+    let home = TempDir::new().unwrap();
+    let pm = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    git_at(repo.path(), &["init", "-q"]);
+    let repo_s = repo.path().to_str().unwrap().to_string();
+    d.register_inbox("pm");
+    issue_cli(home.path(), &d.state, pm.path(), &["issue", "init"]);
+    issue_cli(
+        home.path(),
+        &d.state,
+        pm.path(),
+        &[
+            "issue", "project", "add", "cadence", "--prefix", "CAD", "--repo", &repo_s,
+        ],
+    );
+    for title in ["fresh review", "stale review"] {
+        issue_cli(
+            home.path(),
+            &d.state,
+            pm.path(),
+            &["issue", "new", title, "--project", "cadence"],
+        );
+    }
+    // Back-date both issues 30 days — a commit that never touches the
+    // `status:` line.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let old = cadence_agent::issue::time::iso(now - 30 * 86_400);
+    for id in ["CAD-1", "CAD-2"] {
+        let file = pm.path().join("cadence").join(id).join("issue.md");
+        let text = std::fs::read_to_string(&file).unwrap();
+        let text: String = text
+            .lines()
+            .map(|l| {
+                if l.starts_with("created:") {
+                    format!("created: {old}\n")
+                } else {
+                    format!("{l}\n")
+                }
+            })
+            .collect();
+        std::fs::write(&file, text).unwrap();
+    }
+    git_at(
+        pm.path(),
+        &[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "--no-verify",
+            "-am",
+            "backdate",
+        ],
+    );
+    // Each status change is committed `ago` seconds in the past.
+    let bin = env!("CARGO_BIN_EXE_cadence");
+    for (id, ago) in [("CAD-1", 10 * 60), ("CAD-2", 74 * 60 + 30)] {
+        let out = std::process::Command::new(bin)
+            .arg("--state-dir")
+            .arg(&d.state)
+            .args(["issue", "set", id, "owner=pm", "status=review"])
+            .env("HOME", home.path())
+            .env("CADENCE_PM_DIR", pm.path())
+            .env("GIT_AUTHOR_DATE", format!("@{} +0000", now - ago))
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    Path::new(bin).parent().unwrap().display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "issue set {id}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let out = overview_cmd(home.path(), &d.state, pm.path(), &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let view: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let row = |id: &str| -> Value {
+        view["needs_me"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["subject"]["id"] == id && n["kind"] == "review_no_pr")
+            .unwrap_or_else(|| panic!("no review row for {id}: {view}"))
+            .clone()
+    };
+    let (fresh, stale) = (row("CAD-1"), row("CAD-2"));
+    for r in [&fresh, &stale] {
+        assert!(r["age"].as_i64().unwrap() >= 29 * 86_400, "issue age: {r}");
+    }
+    assert_eq!(fresh["audience"], "team", "{fresh}");
+    assert_eq!(fresh["audience_reason"], "owner pm can act", "{fresh}");
+    let since = fresh["since"].as_i64().unwrap();
+    assert!((now - 10 * 60 - since).abs() <= 5, "{fresh}");
+    assert_eq!(stale["audience"], "operator", "{stale}");
+    assert_eq!(stale["audience_reason"], "unhandled 74m", "{stale}");
+}
+
 // ==== CAD-251: an inbox nobody drains warns, never refuses ====
 
 /// A mailbox with endpoint params (thresholds, upstream).

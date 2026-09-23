@@ -887,16 +887,35 @@ no live owner can act on it — `audience_reason` says why:
 | `owner <a> is dead` / `is fenced` / `is stopped` | `agent_list` says so (`dead`, state `attention`, state `stopped`) |
 | `owner <a> has no inbox consumer` | the owner is a mailbox with a stale inbox |
 | `owner <a> unknown — daemon unreachable` | liveness cannot be read |
-| `unhandled <n>m` | the owner is live but the row's `age` passed 60 minutes (`ESCALATE_AFTER_SECS`) |
+| `unhandled <n>m` | the owner is live but the row's condition has stood past 60 minutes (`ESCALATE_AFTER_SECS`), counted from `since` |
 
 A team row with a live owner inside the hour reads `owner <a> can act`;
 operator-class rows read `operator decision`; `dependency` and `info`
 rows never escalate and carry no reason. A merged row takes its most
-urgent cause's audience (each entry in `causes` keeps its own). The
-age is the row's own `age` — for tracker rows that is the issue's age,
-so an old issue escalates as soon as it surfaces. "Needs your decision"
-always shows, reading "Nothing needs your decision" when no row is the
-operator's.
+urgent cause's audience (each entry in `causes` keeps its own
+`audience` and `since`). "Needs your decision" always shows, reading
+"Nothing needs your decision" when no row is the operator's.
+
+The unhandled clock is `since` — epoch seconds when the row's
+*condition* began, never its subject's age (an issue created a month
+ago that entered review ten minutes ago has been unhandled ten
+minutes):
+
+| Kind | `since` |
+|---|---|
+| `review_no_pr`, `intake` | when the issue entered its effective status: a file status is the tracker's last commit changing the `status:` line (one bounded `git log -G` per issue, cached per build, 3 s budget per build — past it, rows get no clock and one `degraded` note); a notes status is the deriving note's time; a rollup or job status has none |
+| `blocked_ready` | the newest of its blockers' status clocks (when the last one reached done) |
+| `fenced` | the earliest `completed` of the agent's `unknown` messages; a fence without one (a disconnect while idle, a restart mismatch) uses the row's `updated` — every write that enters `attention` stamps it, so it is a lower bound on time fenced |
+| `stalled` / `silent_end` | `now − silent_secs` / `now − ended_secs` from the daemon's stall view |
+| `inbox_stale` | `now − oldest_unread_age_secs` |
+| `merge` | the latest check completion or status post on the head's rollup (merge-ready since) |
+| `pr_no_verdict` | the earliest check start on the head's rollup — a head with no checks has none |
+| `ci_red`, `ci_unverified` | the classified SHA's run `created_at` |
+| `approval_menu`, and anything else | none |
+
+A row whose `since` is null escalates only when its owner cannot act,
+and its reason never says `unhandled`. `age` is unchanged — it still
+orders rows inside a rank.
 
 Both CI rows share one subject, `ci:<slug>@<branch>`, so a red and
 unverified main is one row with two causes. They come from the

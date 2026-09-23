@@ -217,6 +217,7 @@ export interface NeedsMe {
     age: number;
     command: string;
     audience?: NeedAudience;
+    since?: number | null;
   }[];
   /** Who must act on a stale inbox: its group root, or `operator`. */
   owner?: string;
@@ -227,6 +228,9 @@ export interface NeedsMe {
   /** Why — e.g. `owner pm is dead`, `no owner`, `unhandled 74m`,
    *  `owner pm can act`; null for dependency/info rows. */
   audience_reason?: string | null;
+  /** Epoch secs when the row's condition began — the unhandled clock;
+   *  null when the kind has no reliable start (owner-only escalation). */
+  since?: number | null;
 }
 
 export type NeedAudience = "operator" | "team" | "dependency" | "info";
