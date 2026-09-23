@@ -7,8 +7,12 @@
 //!   `PRAGMA integrity_check`, hashed, and described by a manifest (format,
 //!   schema version, sha256, binary versions, repo remotes). The manifest
 //!   is written last, then the pair is re-verified from disk. `keep` prunes
-//!   the oldest backups *with the same reason* in that directory, and only
-//!   files that carry a cadence manifest. A hand-made copy is never pruned.
+//!   the oldest backups *with the same reason* in that directory. Age comes
+//!   from the stamp in the file name (then mtime), never from manifest
+//!   content; the pair just written is never pruned; a copy is deleted
+//!   only when it is the regular file named `<manifest stem>.sqlite3` and
+//!   its sha256 and size match the manifest. A hand-made copy is never
+//!   pruned.
 //! - [`export`] is the portable form: the same snapshot with endpoint
 //!   tokens nulled and freed pages dropped (`VACUUM`), then every text cell
 //!   is run through the CAD-109 secret scan. One blocking finding refuses
@@ -74,8 +78,13 @@ const PATH_COLUMNS: &[(&str, &str)] = &[
 
 /// Columns an export sets to NULL. `generation` is the live endpoint
 /// generation every turn token is bound to; without it no recorded token
-/// validates. `pid` is a process on the source host.
-const SCRUB_COLUMNS: &[(&str, &str)] = &[("agents", "generation"), ("agents", "pid")];
+/// validates. `messages.turn_id` is the turn token itself — the bearer a
+/// running turn reports with. `pid` is a process on the source host.
+const SCRUB_COLUMNS: &[(&str, &str)] = &[
+    ("agents", "generation"),
+    ("agents", "pid"),
+    ("messages", "turn_id"),
+];
 
 /// What an export bundle contains, recorded in its manifest.
 const EXPORT_CONTAINS: &[&str] = &[
@@ -90,7 +99,7 @@ const EXPORT_EXCLUDES: &[&str] = &[
     ".env files",
     "state-dir folders: private/, sessions/, briefings/, reviews/, agents/, roles/, backups/",
     "provider auth (Claude, Codex, Devin, Cursor sign-in state in their own dirs): never read",
-    "endpoint tokens: agents.generation (turn-token generation) and agents.pid are set to NULL",
+    "endpoint tokens: agents.generation (turn-token generation), messages.turn_id (turn tokens) and agents.pid are set to NULL",
     "freed database pages: VACUUM drops deleted rows",
     "the tracker (PM dir): a git repo with its own remote",
 ];
@@ -225,7 +234,24 @@ pub fn backup(state_dir: &Path, dir: &Path, keep: usize, reason: &str) -> Result
             return Err(error);
         }
     };
-    let pruned = prune(dir, reason, keep)?;
+    let pruned = prune(dir, reason, keep, &manifest_path).map_err(|e| {
+        Error::rejected(format!(
+            "backup {} was written and verified, but pruning old {reason:?} backups in {} \
+             failed: {e}",
+            manifest_path.display(),
+            dir.display()
+        ))
+    })?;
+    // The pair this call promises must still be on disk.
+    for path in [&db, &manifest_path] {
+        if !is_regular_file(path) {
+            return Err(Error::internal(format!(
+                "backup {} vanished after pruning {}; nothing is backed up",
+                path.display(),
+                dir.display()
+            )));
+        }
+    }
     Ok(json!({
         "backup": true,
         "manifest": manifest_path,
@@ -237,7 +263,8 @@ pub fn backup(state_dir: &Path, dir: &Path, keep: usize, reason: &str) -> Result
         "reason": manifest.reason,
         "repos": manifest.repos,
         "keep": keep,
-        "pruned": pruned,
+        "pruned": pruned.removed,
+        "prune_skipped": pruned.skipped,
     }))
 }
 
@@ -251,16 +278,64 @@ pub fn before_self_update(state_dir: &Path) -> Result<Value> {
     backup(state_dir, &default_dir(state_dir), DEFAULT_KEEP, PRE_UPDATE)
 }
 
-/// Remove the oldest backups with `reason` beyond `keep`. Only a pair a
-/// cadence manifest describes is touched.
-fn prune(dir: &Path, reason: &str, keep: usize) -> Result<Vec<PathBuf>> {
-    let mut found: Vec<(f64, PathBuf, PathBuf)> = Vec::new();
+struct Pruned {
+    removed: Vec<PathBuf>,
+    /// Old manifests whose copy is not the file they describe (a symlink,
+    /// another file, changed bytes): left alone.
+    skipped: Vec<Value>,
+}
+
+/// `(stamp, uuid)` of a file cadence names `cadence-<reason>-<stamp>-<uuid8>`
+/// — the name `backup` writes. Anything else is not ours.
+fn backup_stem_parts<'a>(stem: &'a str, reason: &str) -> Option<(&'a str, &'a str)> {
+    let rest = stem.strip_prefix("cadence-")?.strip_prefix(reason)?;
+    let rest = rest.strip_prefix('-')?;
+    let (stamp, id) = rest.split_once('-')?;
+    let stamp_ok = stamp.len() == 16
+        && stamp.as_bytes()[8] == b'T'
+        && stamp.ends_with('Z')
+        && stamp
+            .bytes()
+            .enumerate()
+            .all(|(i, b)| i == 8 || i == 15 || b.is_ascii_digit());
+    let id_ok = id.len() == 8 && id.bytes().all(|b| b.is_ascii_hexdigit());
+    (stamp_ok && id_ok).then_some((stamp, id))
+}
+
+/// An old backup pair of ours, ordered newest first by `age`
+/// (file-name stamp, manifest mtime, uuid).
+struct Candidate {
+    age: (String, SystemTime, String),
+    manifest_path: PathBuf,
+    db: PathBuf,
+    manifest: Manifest,
+}
+
+fn is_regular_file(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file())
+}
+
+/// Remove the oldest backups with `reason` beyond `keep`. `current` (the
+/// manifest just written) is never removed and counts as one of `keep`.
+/// Age is the stamp in the file name, then the manifest's mtime — never
+/// manifest content. A copy is deleted only when it is the regular file
+/// `<manifest stem>.sqlite3` next to its manifest and its sha256 and size
+/// match; otherwise the pair is reported under `skipped` and left alone.
+fn prune(dir: &Path, reason: &str, keep: usize, current: &Path) -> Result<Pruned> {
+    let mut found: Vec<Candidate> = Vec::new();
     for entry in fs::read_dir(dir)?.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.starts_with("cadence-") || !name.ends_with(".manifest.json") {
+        let Some(stem) = name.strip_suffix(".manifest.json") else {
+            continue;
+        };
+        let Some((stamp, id)) = backup_stem_parts(stem, reason) else {
+            continue;
+        };
+        let path = entry.path();
+        if path == current || !is_regular_file(&path) {
             continue;
         }
-        let Ok(bytes) = fs::read(entry.path()) else {
+        let Ok(bytes) = fs::read(&path) else {
             continue;
         };
         let Ok(manifest) = serde_json::from_slice::<Manifest>(&bytes) else {
@@ -269,30 +344,73 @@ fn prune(dir: &Path, reason: &str, keep: usize) -> Result<Vec<PathBuf>> {
         if manifest.format != FORMAT
             || manifest.kind != Kind::Backup
             || manifest.reason != reason
-            || !plain_file_name(&manifest.db_file)
+            || manifest.db_file != format!("{stem}.sqlite3")
         {
             continue;
         }
-        found.push((
-            manifest.created_epoch,
-            entry.path(),
-            dir.join(&manifest.db_file),
-        ));
+        let mtime = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(UNIX_EPOCH);
+        let db = dir.join(&manifest.db_file);
+        found.push(Candidate {
+            age: (stamp.to_string(), mtime, id.to_string()),
+            manifest_path: path,
+            db,
+            manifest,
+        });
     }
-    found.sort_by(|a, b| b.0.total_cmp(&a.0));
-    let mut pruned = Vec::new();
-    for (_, manifest, db) in found.into_iter().skip(keep) {
-        // The copy goes first: a manifest without its copy is inert,
-        // a copy without its manifest would never be pruned again.
-        for path in [db, manifest] {
-            match fs::remove_file(&path) {
-                Ok(()) => pruned.push(path),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(Error::internal(format!("pruning {}: {e}", path.display()))),
+    found.sort_by(|a, b| b.age.cmp(&a.age));
+    let mut out = Pruned {
+        removed: Vec::new(),
+        skipped: Vec::new(),
+    };
+    for Candidate {
+        manifest_path,
+        db,
+        manifest,
+        ..
+    } in found.into_iter().skip(keep.saturating_sub(1))
+    {
+        match fs::symlink_metadata(&db) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // A manifest without its copy is inert: drop it.
+            }
+            Ok(meta) if meta.file_type().is_file() => {
+                let matches = hash_file(&db)
+                    .is_ok_and(|(sha, size)| sha == manifest.sha256 && size == manifest.bytes);
+                if !matches {
+                    out.skipped.push(json!({"manifest": manifest_path, "db": db,
+                        "why": "the copy does not match its manifest (sha256/size)"}));
+                    continue;
+                }
+                // The copy goes first: a manifest without its copy is
+                // inert, a copy without its manifest is never pruned again.
+                fs::remove_file(&db)
+                    .map_err(|e| Error::internal(format!("pruning {}: {e}", db.display())))?;
+                out.removed.push(db);
+            }
+            Ok(_) => {
+                out.skipped.push(json!({"manifest": manifest_path, "db": db,
+                    "why": "the copy is not a regular file"}));
+                continue;
+            }
+            Err(e) => {
+                return Err(Error::internal(format!("pruning {}: {e}", db.display())));
+            }
+        }
+        match fs::remove_file(&manifest_path) {
+            Ok(()) => out.removed.push(manifest_path),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(Error::internal(format!(
+                    "pruning {}: {e}",
+                    manifest_path.display()
+                )))
             }
         }
     }
-    Ok(pruned)
+    Ok(out)
 }
 
 // ---------- verify ----------
@@ -626,16 +744,7 @@ pub fn restore(source: &Path, state_dir: &Path, opts: &RestoreOptions) -> Result
         let (integrity, _) = inspect(&partial)?;
         require_ok(&partial, &integrity)?;
         sync_file(&partial)?;
-        // Old sidecars belong to the replaced store; SQLite must never
-        // replay them onto the restored file.
-        for path in [&wal, &shm, &live] {
-            match fs::remove_file(path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
-            }
-        }
-        fs::rename(&partial, &live)?;
+        install_no_clobber(&partial, &live, &[&live, &wal, &shm])?;
         sync_dir(state_dir);
         Ok(rows)
     })();
@@ -784,17 +893,73 @@ fn under(path: &str, root: &str) -> bool {
         || (path.starts_with(root) && (root.ends_with('/') || path[root.len()..].starts_with('/')))
 }
 
+/// Put `partial` at `live` without ever deleting the store it replaces
+/// first. Each existing file in `old` (the store and its sidecars — a
+/// stale `-wal` must never be replayed onto the restored file) is renamed
+/// aside; the new file is then linked in with `hard_link`, which refuses
+/// an existing target. On failure every aside file is renamed back. On
+/// success the aside files are removed (`--force` took a verified
+/// pre-restore backup before this point).
+fn install_no_clobber(partial: &Path, live: &Path, old: &[&Path]) -> Result<()> {
+    let tag = format!(
+        ".replaced-{}-{}",
+        crate::issue::time::basic(epoch_now() as i64),
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    );
+    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let roll_back = |moved: &[(PathBuf, PathBuf)]| {
+        for (from, aside) in moved.iter().rev() {
+            let _ = fs::rename(aside, from);
+        }
+    };
+    for path in old {
+        if fs::symlink_metadata(path).is_err() {
+            continue;
+        }
+        let aside = sidecar(path, &tag);
+        if let Err(e) = fs::rename(path, &aside) {
+            roll_back(&moved);
+            return Err(Error::internal(format!(
+                "could not move {} aside ({e}); nothing was replaced",
+                path.display()
+            )));
+        }
+        moved.push((path.to_path_buf(), aside));
+    }
+    if let Err(e) = fs::hard_link(partial, live) {
+        roll_back(&moved);
+        return Err(Error::internal(format!(
+            "could not install {} ({e}); the previous store was put back",
+            live.display()
+        )));
+    }
+    let _ = fs::remove_file(partial);
+    for (_, aside) in &moved {
+        let _ = fs::remove_file(aside);
+    }
+    Ok(())
+}
+
 /// Hold the daemon singleton lock for the restore. A running daemon
 /// holds it for its whole life, so failing to take it means one is up;
 /// holding it means none can start mid-restore.
 fn lock_state_dir(state_dir: &Path) -> Result<File> {
     let path = state_dir.join("cadence.lock");
+    // O_NOFOLLOW: a planted symlink must not redirect the lock (or its
+    // creation) outside the state dir.
     let file = OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
         .mode(0o600)
-        .open(&path)?;
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .map_err(|e| {
+            Error::rejected(format!(
+                "cannot open {} ({e}); it must be a regular file, not a symlink",
+                path.display()
+            ))
+        })?;
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc != 0 {
         return Err(Error::rejected(format!(

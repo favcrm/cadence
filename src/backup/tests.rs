@@ -641,3 +641,233 @@ fn cad314_self_update_hook_takes_a_backup_first() {
     assert_eq!(manifest.parent(), Some(default_dir(&state).as_path()));
     assert_eq!(read_json(&manifest)["reason"], "pre-update");
 }
+
+// ---- CAD-396: retention never deletes the fresh copy or foreign files ----
+
+/// Re-home a real backup pair under `cadence-<reason>-<stamp>-<id>` with
+/// its manifest's `db_file` (and optionally `created_epoch`) rewritten, so
+/// sha256/bytes still match. Returns (db, manifest).
+fn plant_pair(
+    dir: &Path,
+    taken: &Value,
+    reason: &str,
+    stamp: &str,
+    id: &str,
+    epoch: Option<f64>,
+) -> (PathBuf, PathBuf) {
+    let stem = format!("cadence-{reason}-{stamp}-{id}");
+    let db = dir.join(format!("{stem}.sqlite3"));
+    let manifest = dir.join(format!("{stem}.manifest.json"));
+    std::fs::copy(taken["db"].as_str().unwrap(), &db).unwrap();
+    let mut m = read_json(Path::new(taken["manifest"].as_str().unwrap()));
+    m["db_file"] = json!(format!("{stem}.sqlite3"));
+    m["reason"] = json!(reason);
+    if let Some(epoch) = epoch {
+        m["created_epoch"] = json!(epoch);
+    }
+    std::fs::write(&manifest, serde_json::to_vec(&m).unwrap()).unwrap();
+    (db, manifest)
+}
+
+fn tomorrow_stamp(offset_secs: i64) -> String {
+    crate::issue::time::basic(crate::issue::time::now_epoch() + 86_400 + offset_secs)
+}
+
+#[test]
+fn cad396_planted_future_dated_manifest_never_prunes_the_fresh_copy() {
+    let root = TempDir::new().unwrap();
+    let state = fresh_state(root.path(), "state");
+    let seed_dir = root.path().join("seed");
+    let seed = backup(&state, &seed_dir, 7, "manual").unwrap();
+    let dir = root.path().join("b");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (old_db, old_m) = plant_pair(
+        &dir,
+        &seed,
+        "manual",
+        "20991231T235959Z",
+        "cafecafe",
+        Some(4.0e12),
+    );
+
+    let out = backup(&state, &dir, 1, "manual").unwrap();
+
+    let db = PathBuf::from(out["db"].as_str().unwrap());
+    let manifest = PathBuf::from(out["manifest"].as_str().unwrap());
+    assert!(
+        db.is_file() && manifest.is_file(),
+        "fresh pair pruned: {out}"
+    );
+    verify(&manifest).unwrap();
+    // keep 1 = the fresh copy only: the planted (matching) pair goes.
+    assert!(!old_db.exists() && !old_m.exists(), "{out}");
+}
+
+#[test]
+fn cad396_clock_skew_before_self_update_keeps_its_fresh_backup() {
+    let root = TempDir::new().unwrap();
+    let state = fresh_state(root.path(), "state");
+    let seed = backup(&state, &root.path().join("seed"), 7, "manual").unwrap();
+    let dir = default_dir(&state);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Seven honest pre-update backups, dated a day ahead (clock skew).
+    let mut planted = Vec::new();
+    for i in 0..7 {
+        planted.push(plant_pair(
+            &dir,
+            &seed,
+            PRE_UPDATE,
+            &tomorrow_stamp(i),
+            &format!("{i:08x}"),
+            Some(epoch_now() + 86_400.0 + i as f64),
+        ));
+    }
+
+    let out = before_self_update(&state).unwrap();
+
+    let db = PathBuf::from(out["db"].as_str().unwrap());
+    let manifest = PathBuf::from(out["manifest"].as_str().unwrap());
+    assert!(db.is_file() && manifest.is_file(), "{out}");
+    verify(&manifest).unwrap();
+    let kept = manifests(&dir)
+        .into_iter()
+        .filter(|m| m["reason"] == PRE_UPDATE)
+        .count();
+    assert_eq!(kept, DEFAULT_KEEP, "{out}");
+    // The oldest planted pair (smallest stamp) went, the newest stayed.
+    assert!(!planted[0].0.exists() && !planted[0].1.exists());
+    assert!(planted[6].0.exists() && planted[6].1.exists());
+}
+
+#[test]
+fn cad396_old_manifest_naming_a_hand_made_copy_never_deletes_it() {
+    let root = TempDir::new().unwrap();
+    let state = fresh_state(root.path(), "state");
+    let seed = backup(&state, &root.path().join("seed"), 7, "manual").unwrap();
+    let dir = root.path().join("b");
+    std::fs::create_dir_all(&dir).unwrap();
+    // A hand-made copy with the exact bytes, and an old manifest of ours
+    // (right name shape) whose db_file points at it.
+    let hand = dir.join("cadence-live-20260101.sqlite3");
+    std::fs::copy(seed["db"].as_str().unwrap(), &hand).unwrap();
+    let stem = "cadence-manual-20200101T000000Z-aaaaaaaa";
+    let mut m = read_json(Path::new(seed["manifest"].as_str().unwrap()));
+    m["db_file"] = json!("cadence-live-20260101.sqlite3");
+    let old_manifest = dir.join(format!("{stem}.manifest.json"));
+    std::fs::write(&old_manifest, serde_json::to_vec(&m).unwrap()).unwrap();
+
+    backup(&state, &dir, 1, "manual").unwrap();
+
+    assert!(hand.exists(), "a hand-made copy is never pruned");
+    assert!(
+        old_manifest.exists(),
+        "a manifest not naming its own stem is not ours"
+    );
+}
+
+#[test]
+fn cad396_prune_skips_a_copy_that_is_a_symlink_or_does_not_match() {
+    let root = TempDir::new().unwrap();
+    let state = fresh_state(root.path(), "state");
+    let seed = backup(&state, &root.path().join("seed"), 7, "manual").unwrap();
+    let dir = root.path().join("b");
+    std::fs::create_dir_all(&dir).unwrap();
+    // Changed bytes under a matching name.
+    let (changed, changed_m) =
+        plant_pair(&dir, &seed, "manual", "20200101T000000Z", "11111111", None);
+    std::fs::write(&changed, b"operator edited this").unwrap();
+    // A symlink to a file outside the dir.
+    let (linked, linked_m) =
+        plant_pair(&dir, &seed, "manual", "20200101T000001Z", "22222222", None);
+    let outside = root.path().join("precious.sqlite3");
+    std::fs::rename(&linked, &outside).unwrap();
+    std::os::unix::fs::symlink(&outside, &linked).unwrap();
+
+    let out = backup(&state, &dir, 1, "manual").unwrap();
+
+    assert!(changed.exists() && changed_m.exists(), "{out}");
+    assert!(linked_m.exists() && outside.exists(), "{out}");
+    assert!(std::fs::symlink_metadata(&linked).is_ok());
+    assert_eq!(out["prune_skipped"].as_array().unwrap().len(), 2, "{out}");
+}
+
+#[test]
+fn cad396_export_nulls_turn_tokens() {
+    let root = TempDir::new().unwrap();
+    let state = fresh_state(root.path(), "state");
+    let conn = writer(&state);
+    add_agent(&conn, "w1", "/nowhere");
+    add_message(&conn, "m1", "w1", "hello");
+    conn.execute(
+        "UPDATE messages SET state='running', turn_id='turn-abc123' WHERE id='m1'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    let out = export(&state, &root.path().join("bundle")).unwrap();
+    let db = root.path().join("bundle").join(BUNDLE_DB);
+    assert_eq!(
+        count(
+            &db,
+            "SELECT count(*) FROM messages WHERE turn_id IS NOT NULL"
+        ),
+        0
+    );
+    assert!(out["scrubbed"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("messages.turn_id")));
+    assert!(!contains(&std::fs::read(&db).unwrap(), "turn-abc123"));
+}
+
+#[test]
+fn cad396_restore_refuses_a_symlinked_lock() {
+    let root = TempDir::new().unwrap();
+    let source = fresh_state(root.path(), "source");
+    let taken = backup(&source, &root.path().join("b"), DEFAULT_KEEP, "manual").unwrap();
+    let target = root.path().join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    let elsewhere = root.path().join("elsewhere.lock");
+    std::os::unix::fs::symlink(&elsewhere, target.join("cadence.lock")).unwrap();
+    let err = restore(
+        Path::new(taken["manifest"].as_str().unwrap()),
+        &target,
+        &RestoreOptions::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("symlink"), "{err}");
+    assert!(!elsewhere.exists());
+    assert!(!live(&target).exists());
+}
+
+#[test]
+fn cad396_install_no_clobber_puts_the_old_store_back_on_failure() {
+    let root = TempDir::new().unwrap();
+    let dir = root.path();
+    let live_db = dir.join("cadence.sqlite3");
+    let wal = dir.join("cadence.sqlite3-wal");
+    std::fs::write(&live_db, b"old store").unwrap();
+    std::fs::write(&wal, b"old wal").unwrap();
+    // The partial does not exist: hard_link fails after the old files
+    // were moved aside.
+    let err = install_no_clobber(&dir.join("missing.partial"), &live_db, &[&live_db, &wal])
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("put back"), "{err}");
+    assert_eq!(std::fs::read(&live_db).unwrap(), b"old store");
+    assert_eq!(std::fs::read(&wal).unwrap(), b"old wal");
+    assert_eq!(
+        std::fs::read_dir(dir).unwrap().count(),
+        2,
+        "no aside files left"
+    );
+
+    // Success: new store in place, old store and sidecar gone.
+    let partial = dir.join("new.partial");
+    std::fs::write(&partial, b"new store").unwrap();
+    install_no_clobber(&partial, &live_db, &[&live_db, &wal]).unwrap();
+    assert_eq!(std::fs::read(&live_db).unwrap(), b"new store");
+    assert!(!wal.exists() && !partial.exists());
+    assert_eq!(std::fs::read_dir(dir).unwrap().count(), 1);
+}
