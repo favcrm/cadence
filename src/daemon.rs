@@ -1435,8 +1435,11 @@ impl Shared {
         peer_pid: u32,
     ) -> Result<Value> {
         match method {
+            // `pid` is the singleton-lock holder: `daemon start` tells
+            // the child it spawned from a daemon that already ran.
             "health" => Ok(json!({
                 "state": "ready",
+                "pid": std::process::id(),
                 "protocol": proto::PROTOCOL_VERSION,
                 "capabilities": proto::capabilities(),
                 "agent_gc_timer": self.agent_gc.status(),
