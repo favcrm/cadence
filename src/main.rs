@@ -2780,6 +2780,15 @@ fn print_slot_status(s: &Value) {
                         line.push(' ');
                         line.push_str(&f);
                     }
+                    // What acts on it (CAD-276): reconcile only where
+                    // it can free the hold, else the named remedy.
+                    if h["reconcile_required"] == true {
+                        line.push_str(" reconcile_required");
+                    }
+                    if let Some(remedy) = h["remedy"].as_str() {
+                        line.push_str(" remedy: ");
+                        line.push_str(remedy);
+                    }
                     line.push(']');
                 }
                 line
