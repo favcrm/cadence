@@ -1173,8 +1173,9 @@ fn issue_payloads(pm: &Pm, state_dir: &Path, id: &str) -> Result<(Value, Value)>
         .get(id)
         .ok_or_else(|| Error::rejected(format!("unknown issue '{id}'")))?;
     let by_issue = agents_payload(state_dir)["by_issue"].clone();
+    let ctx = crate::issue::work::Ctx::new(&pm.dir, &by_id, crate::issue::time::now_epoch());
     Ok((
-        with_agents(board::card_json(view), &by_issue, id),
+        with_agents(crate::issue::work::card_json(&ctx, view), &by_issue, id),
         with_agents(board::detail_json(&pm.dir, view, &by_id), &by_issue, id),
     ))
 }
@@ -2396,13 +2397,24 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
                 let jobs = board::fetch_job_outcomes(state_dir);
                 let views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
                 let by_issue = agents_payload(state_dir)["by_issue"].clone();
+                // CAD-405: each card carries its `work` block.
+                let by_id: HashMap<String, &board::View> = views
+                    .iter()
+                    .map(|v| (v.issue.front.id.clone(), v))
+                    .collect();
+                let ctx =
+                    crate::issue::work::Ctx::new(&pm.dir, &by_id, crate::issue::time::now_epoch());
                 send(
                     request,
                     json_response(json!({
                         "issues": views
                             .iter()
                             .filter(|v| slice.matches(v))
-                            .map(|v| with_agents(board::card_json(v), &by_issue, &v.issue.front.id))
+                            .map(|v| with_agents(
+                                crate::issue::work::card_json(&ctx, v),
+                                &by_issue,
+                                &v.issue.front.id,
+                            ))
                             .collect::<Vec<_>>(),
                     })),
                 );
@@ -2425,7 +2437,12 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
                 send(
                     request,
                     json_response(json!({
-                        "epics": board::epics_json(&views, filter.as_deref()),
+                        "epics": crate::issue::work::epics_json(
+                            &pm.dir,
+                            &views,
+                            filter.as_deref(),
+                            crate::issue::time::now_epoch(),
+                        ),
                     })),
                 );
             }

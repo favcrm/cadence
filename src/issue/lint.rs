@@ -42,6 +42,19 @@ pub fn run(pm: &Pm, only_project: Option<&str>) -> Result<Value> {
             }
         }
     }
+    // CAD-405: a malformed PROJECT.md is a warning — readers fall back
+    // to the default stages and stage moves refuse until it is fixed.
+    let mut work_configs: HashMap<String, crate::issue::work::WorkConfig> = HashMap::new();
+    for project in &projects {
+        let (cfg, err) = crate::issue::work::load_config_or_default(&pm.dir, &project.key);
+        if let Some(err) = err {
+            lint.warn(format!(
+                "{}/PROJECT.md: {err} — the default stages apply",
+                project.key
+            ));
+        }
+        work_configs.insert(project.key.clone(), cfg);
+    }
     let mut fronts: HashMap<String, (String, model::Front, String)> = HashMap::new();
     for project in &projects {
         if let Some(only) = only_project {
@@ -207,6 +220,46 @@ pub fn run(pm: &Pm, only_project: Option<&str>) -> Result<Value> {
                 lint.err(format!("{id}: unknown size '{size}' — S, M or L"));
             }
         }
+        // CAD-405 work-model fields. A bad `type` or milestone id is an
+        // error like a bad status; a mismatch with PROJECT.md (which can
+        // change under existing issues) only warns.
+        if let Some(t) = &front.item_type {
+            if !model::TYPES.contains(&t.as_str()) {
+                lint.err(format!(
+                    "{id}: unknown type '{t}' — one of {}",
+                    model::TYPES.join(" ")
+                ));
+            }
+        }
+        if let Some(m) = &front.milestone {
+            if !model::valid_tag(m) {
+                lint.err(format!("{id}: bad milestone grammar '{m}'"));
+            }
+        }
+        if let Some(cfg) = work_configs.get(project_key) {
+            if let Some(stage) = &front.stage {
+                if cfg.index(stage).is_none() {
+                    lint.warn(format!(
+                        "{id}: stage '{stage}' is not in {project_key}'s list ({})",
+                        cfg.stage_ids().join(" ")
+                    ));
+                }
+            }
+            if let Some((m, _)) = model::milestone_of(front) {
+                if !cfg.milestones.is_empty() && !cfg.milestones.iter().any(|d| d.id == m) {
+                    lint.warn(format!(
+                        "{id}: milestone '{m}' is not declared in {project_key}/PROJECT.md"
+                    ));
+                }
+            }
+        }
+        if let Some(at) = &front.stage_at {
+            if crate::issue::time::parse_iso(at).is_none() {
+                lint.warn(format!(
+                    "{id}: stage_at '{at}' is not RFC 3339 UTC — time in stage is unknown"
+                ));
+            }
+        }
         for r in &front.refs {
             if !model::REF_KINDS.contains(&r.kind.as_str()) {
                 lint.err(format!("{id}: unknown ref kind '{}'", r.kind));
@@ -279,6 +332,26 @@ pub fn run(pm: &Pm, only_project: Option<&str>) -> Result<Value> {
                     open.join(", ")
                 ));
             }
+        }
+    }
+
+    // CAD-405: a stage belongs to an epic; an explicit non-epic type on
+    // an issue with children contradicts the tree.
+    let parents: HashSet<&str> = fronts
+        .values()
+        .filter_map(|(_, f, _)| f.parent.as_deref())
+        .collect();
+    for (id, (_, front, _)) in &fronts {
+        let kind = model::item_type(front, parents.contains(id.as_str()));
+        if kind != "epic" && front.stage.is_some() {
+            lint.warn(format!(
+                "{id}: has a stage but is a {kind} — only epics have stages"
+            ));
+        }
+        if kind != "epic" && parents.contains(id.as_str()) {
+            lint.warn(format!(
+                "{id}: type '{kind}' but has children — epics hold tasks"
+            ));
         }
     }
 

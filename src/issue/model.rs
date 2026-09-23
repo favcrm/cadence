@@ -18,7 +18,20 @@ pub const REF_KINDS: &[&str] = &[
     "pr", "commit", "note", "preview", "message", "url", "branch", "worktree",
 ];
 /// Fields `issue set` may write.
-pub const SETTABLE: &[&str] = &["status", "priority", "owner", "component", "title", "tags"];
+pub const SETTABLE: &[&str] = &[
+    "status",
+    "priority",
+    "owner",
+    "component",
+    "title",
+    "tags",
+    "type",
+    "milestone",
+    "size",
+];
+/// CAD-405 work-item types. An issue without `type` is an `epic` when
+/// it has children (or carries a plan) and a `task` otherwise.
+pub const TYPES: &[&str] = &["epic", "task", "bug", "spike"];
 /// Most tags one issue may carry.
 pub const TAG_MAX: usize = 12;
 
@@ -105,10 +118,24 @@ pub struct Front {
     /// unlink) fails closed instead of ungating the ticket.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_epic: Option<String>,
-    /// Work-model item type (`epic` on plan epics; WORK-MODEL.md).
-    /// Absent elsewhere — the implicit "has children" rule still holds.
+    /// Work-model item type, one of [`TYPES`] (`epic` on plan epics;
+    /// WORK-MODEL.md). Absent: the implicit "has children" rule holds.
     #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
     pub item_type: Option<String>,
+    /// CAD-405: an epic's stage, from the project's stage list. Written
+    /// only by a stage move (`issue epic stage`), never by `issue set`.
+    /// An older binary rewriting the file drops it, and the epic then
+    /// reads as its plan-mapped or first stage — earlier, never later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    /// CAD-405: when the epic entered `stage` (RFC 3339 UTC) — the
+    /// time-in-stage health check reads it; absent, it is skipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_at: Option<String>,
+    /// CAD-405: the milestone id (`m2`). Absent: an `m<n>-…` tag names
+    /// it, so the tag convention keeps working.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub milestone: Option<String>,
     /// Optional task size `S|M|L` — plan progress weights it 1|3|8,
     /// unsized counts as M (docs/design/WORK-MODEL.md).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -141,6 +168,9 @@ impl Front {
             plan: None,
             plan_epic: None,
             item_type: None,
+            stage: None,
+            stage_at: None,
+            milestone: None,
             size: None,
             parent: None,
             blocked_by: vec![],
@@ -185,6 +215,48 @@ pub fn size_weight(size: Option<&str>) -> u64 {
         .iter()
         .find(|(s, _)| Some(*s) == size)
         .map_or(3, |(_, w)| *w)
+}
+
+/// An issue's effective type: its `type` when it is one of [`TYPES`],
+/// else `epic` for an issue with children or a plan, else `task`.
+pub fn item_type(front: &Front, has_children: bool) -> &str {
+    match front.item_type.as_deref() {
+        Some(t) if TYPES.contains(&t) => t,
+        _ if has_children || front.plan.is_some() => "epic",
+        _ => "task",
+    }
+}
+
+/// The milestone an issue belongs to and where that came from: the
+/// `milestone` field (`"field"`), else the first `m<n>` / `m<n>-…` tag
+/// mapped to `m<n>` (`"tag"`) — the pre-CAD-405 convention.
+pub fn milestone_of(front: &Front) -> Option<(String, &'static str)> {
+    if let Some(m) = front.milestone.as_deref().filter(|m| !m.is_empty()) {
+        return Some((m.to_string(), "field"));
+    }
+    front
+        .tags
+        .iter()
+        .find_map(|t| milestone_tag(t))
+        .map(|m| (m, "tag"))
+}
+
+/// `m2-one-team` or `m2` → `m2`; any other tag → None.
+pub fn milestone_tag(tag: &str) -> Option<String> {
+    let head = tag.split('-').next()?;
+    let digits = head.strip_prefix('m')?;
+    (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())).then(|| head.to_string())
+}
+
+pub fn check_type(value: &str) -> Result<()> {
+    if TYPES.contains(&value) {
+        Ok(())
+    } else {
+        Err(Error::rejected(format!(
+            "Unknown type '{value}' — one of {}",
+            TYPES.join(" ")
+        )))
+    }
 }
 
 /// Comment file frontmatter (`comments/<UTC-basic>-<author>.md`).
@@ -394,6 +466,28 @@ mod tests {
         assert!(normalize_tags(&tags(&["Bad"])).is_err());
         let many: Vec<String> = (0..13).map(|n| format!("t{n}")).collect();
         assert!(normalize_tags(&many).is_err());
+    }
+
+    #[test]
+    fn effective_type_and_milestone() {
+        let mut f = Front::new("CAD-1", "t", "2026-09-23T00:00:00Z");
+        assert_eq!(item_type(&f, false), "task");
+        assert_eq!(item_type(&f, true), "epic", "children imply an epic");
+        f.item_type = Some("spike".into());
+        assert_eq!(item_type(&f, true), "spike", "explicit type wins");
+        f.item_type = Some("story".into());
+        assert_eq!(item_type(&f, false), "task", "unknown type falls back");
+        assert!(check_type("bug").is_ok() && check_type("story").is_err());
+
+        assert_eq!(milestone_of(&f), None);
+        f.tags = vec!["mvp".into(), "m2-one-team".into()];
+        assert_eq!(milestone_of(&f), Some(("m2".into(), "tag")));
+        f.milestone = Some("m3".into());
+        assert_eq!(milestone_of(&f), Some(("m3".into(), "field")));
+        assert_eq!(milestone_tag("m0"), Some("m0".into()));
+        for tag in ["mvp", "m", "m-x", "mx-1", "ops"] {
+            assert_eq!(milestone_tag(tag), None, "{tag}");
+        }
     }
 
     #[test]

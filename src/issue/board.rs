@@ -772,6 +772,11 @@ pub fn detail_json(pm_dir: &Path, view: &View, views_by_id: &HashMap<String, &Vi
         // CAD-359/360: plan state, tickets and weighted progress — null
         // unless this issue is a plan epic.
         "plan": crate::issue::plan::plan_json(view, views_by_id),
+        // CAD-405: type, milestone, stage, weighted progress and health.
+        "work": crate::issue::work::item_json(
+            &crate::issue::work::Ctx::new(pm_dir, views_by_id, crate::issue::time::now_epoch()),
+            view,
+        ),
         "history": history,
         "activity": activity,
         "commits": commits,

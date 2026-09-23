@@ -27,6 +27,7 @@ pub mod start;
 pub mod sync;
 pub mod task_report;
 pub mod time;
+pub mod work;
 pub mod write;
 
 use std::path::{Path, PathBuf};

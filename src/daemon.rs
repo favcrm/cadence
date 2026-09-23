@@ -2138,6 +2138,7 @@ impl Shared {
             "plan_propose" => self.rpc_plan_propose(params, peer_pid),
             "plan_approve" => self.rpc_plan_decide(params, peer_pid, true),
             "plan_reject" => self.rpc_plan_decide(params, peer_pid, false),
+            "epic_stage" => self.rpc_epic_stage(params, peer_pid),
             other => Err(Error::rejected(format!("Unknown method '{other}'"))),
         }
     }
@@ -3498,6 +3499,61 @@ impl Shared {
             "plan_rejected"
         };
         let _ = self.store.event_public(DAEMON_ALIAS, kind, out.clone());
+        self.wake();
+        Ok(out)
+    }
+
+    /// CAD-405 `epic_stage` — move an epic's stage: a gate decision and
+    /// one tracker commit ([`crate::issue::write::move_stage`]). A
+    /// forward move into one of the project's `operator_stages`
+    /// (default `build`, `release`) is operator only, by the same
+    /// connection-bound rule as `plan approve`; any other move — the
+    /// routine forward ones and every move back — is attributed to the
+    /// caller's lane, or the proven operator, and an unattributable
+    /// caller is refused. Identity-shaped fields are never read.
+    fn rpc_epic_stage(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        for field in [
+            "by",
+            "actor",
+            "alias",
+            "lane",
+            "pane",
+            "pid",
+            "operator",
+            "recorded_via",
+        ] {
+            if params.get(field).is_some() {
+                return Err(Error::rejected(format!(
+                    "stage move attribution is connection-bound; request field \
+                     '{field}' is not accepted"
+                )));
+            }
+        }
+        let epic = required_str(params, "epic")?;
+        let stage = required_str(params, "stage")?;
+        let note = optional_str(params, "note");
+        let pm = crate::issue::Pm::at(&self.pm_dir()?)?;
+        let out = crate::issue::write::move_stage(&pm, epic, stage, note, |mv| {
+            if mv.needs_operator {
+                self.approval_operator(&format!("stage move into '{}'", mv.to), params, peer_pid)?;
+                return Ok("operator".to_string());
+            }
+            match self.slot_identity(peer_pid)? {
+                Some(who) => Ok(who.lane().to_string()),
+                None => self
+                    .operator_evidence(peer_pid)
+                    .map(|()| "operator".to_string())
+                    .map_err(|why| {
+                        Error::rejected(format!(
+                            "stage move needs an attributable caller — a pane agent, an \
+                             enrolled managed endpoint or the proven operator: {why}"
+                        ))
+                    }),
+            }
+        })?;
+        let _ = self
+            .store
+            .event_public(DAEMON_ALIAS, "epic_stage_moved", out.clone());
         self.wake();
         Ok(out)
     }
