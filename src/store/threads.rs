@@ -481,10 +481,14 @@ impl Store {
         Ok(())
     }
 
+    /// The alias's in-flight turn. `submitting` counts: a provider can
+    /// persist items before `on_started` marks the message `running`
+    /// (Codex emits them right behind the `turn/start` reply).
     fn running_message_in(tx: &Connection, alias: &str) -> Result<Option<String>> {
         Ok(tx
             .query_row(
-                "SELECT id FROM messages WHERE alias=? AND state='running'
+                "SELECT id FROM messages WHERE alias=?
+                 AND state IN ('submitting','running') AND source != 'nudge'
                  ORDER BY seq DESC LIMIT 1",
                 [alias],
                 |r| r.get(0),
