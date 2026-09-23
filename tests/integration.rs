@@ -311,9 +311,21 @@ fn upstream_param_defaults_reply_to() {
     )
     .unwrap();
     d.wait_message("w1", "u1", &["completed"], 15);
+    // CAD-271: routed in u1's completing transaction — durable now. Find
+    // it by source rather than position, and name a refused route.
     let show = d.rpc("agent_show", json!({"alias": "pm"})).unwrap();
-    let routed = &show["messages"].as_array().unwrap()[0];
-    assert_eq!(routed["source"], "worker_result");
+    let routed = show["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["source"] == "worker_result")
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "u1's result not routed to pm: {show} {:?}",
+                d.events("daemon")
+            )
+        });
     assert!(routed["body"].as_str().unwrap().contains("u1"));
     let routed_id = routed["id"].as_str().unwrap().to_string();
     d.wait_message("pm", &routed_id, &["completed"], 15);
@@ -7846,6 +7858,29 @@ fn inbox_read_receipt_keeps_history_without_waking_reviewer() {
     )
     .unwrap();
     d.wait_message("worker", "work-1", &["completed"], 15);
+    // CAD-271: the routed result is inserted in the SAME transaction that
+    // completes work-1, so it is already durable here — no wait needed.
+    // Pin that cause directly: when this fails, the route was refused
+    // (`handoff_unresolved`, e.g. the pre-merge CAD-176 head whose
+    // recipient identity compared a JSON-rounded `created` f64 and
+    // mismatched ~12% of timestamps), not raced by the drain below.
+    let obs = d.rpc("agent_show", json!({"alias": "obs"})).unwrap();
+    assert!(
+        obs["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["source"] == "worker_result" && m["state"] == "queued"),
+        "work-1's result must be queued on obs at completion: {obs} {:?}",
+        d.events("daemon")
+    );
+    assert!(
+        d.events("daemon")
+            .iter()
+            .all(|e| e["kind"] != "handoff_unresolved"),
+        "{:?}",
+        d.events("daemon")
+    );
 
     // This is the actual receipt path: a mailbox message has a return
     // address, then the consumer drains it. Completing the read must not
