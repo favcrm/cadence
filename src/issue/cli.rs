@@ -182,9 +182,10 @@ pub enum IssueAction {
     },
     /// Finish an issue's worktree: refuse while the worktree is in use
     /// (a live message recorded against it, a pane tree or any process
-    /// with cwd inside it), while the worktree is dirty, or while the
-    /// branch is neither merged nor pushed — `--force` overrides each
-    /// (recorded). Then `git worktree remove`, delete the branch
+    /// with cwd inside it, any file modified in the last 30 minutes),
+    /// while the worktree is dirty, while the branch has not started
+    /// (no commits beyond where it was cut) or while it is neither
+    /// merged nor pushed — `--force` overrides each (recorded). Then `git worktree remove`, delete the branch
     /// (`--keep-branch` keeps it, `--remote` deletes the remote one
     /// too) and mark both refs `closed: true` in one commit. The
     /// issue's status is untouched. `--merged` instead sweeps every
@@ -199,7 +200,7 @@ pub enum IssueAction {
         /// touched and the branch, if any, is kept.
         #[arg(long, conflicts_with = "merged")]
         worktree: Option<PathBuf>,
-        /// Override the in-use, dirty and unmerged refusals —
+        /// Override the in-use, dirty, not-started and unmerged refusals —
         /// recorded on the finish commit and in the output. A branch
         /// whose tip no merge/push evidence covers is still kept, and
         /// a probe made stale mid-finish refuses with "retry" — force

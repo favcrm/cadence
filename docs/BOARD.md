@@ -430,7 +430,17 @@ state is touched and a surviving branch is kept (`refs_only: true`,
   than guesses; an `inbox` owner is a durable mailbox, never busy),
 - the worktree has uncommitted changes — ignored paths like the
   `ui/node_modules` build symlink don't count (the refusal lists what
-  does), or
+  does),
+- any non-ignored file (tracked or untracked) in the worktree was
+  modified within the last 30 minutes (`ACTIVE_WINDOW` in
+  `src/issue/finish.rs`) — a worker cadence cannot see, such as a
+  subagent with no registered pane, still leaves fresh files; the
+  refusal names the newest file and its age. A fresh checkout counts:
+  a lane started minutes ago is in use (CAD-275),
+- the branch has not started — zero commits beyond the commit it was
+  cut from (the oldest entry of its reflog) — which is never "merged",
+  even though its tip sits on the default branch; `--force` finishes
+  an abandoned lane and reports `not_started: true` (CAD-275), or
 - the branch's work survives nowhere: not merged into the repo's
   default branch (`origin/HEAD`, else the checkout's current branch)
   and not pushed to a remote-tracking ref. "Merged" recognizes

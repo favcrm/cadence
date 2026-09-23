@@ -464,13 +464,16 @@ In this order:
    the worktree and the local+remote branches — and refuses while the
    worktree is in use (a live message recorded against it, an
    unreconciled `unknown` message bound to it or held by a registered
-   agent whose cwd is on it, or a process with cwd inside it), while
-   the tree is dirty, or while the branch is neither merged nor
-   pushed, so it is safe by default. An issue with several open
-   worktree refs needs `--worktree <path>`; naming a lane whose
-   directory is already gone just closes its refs. A reconciled agent
-   whose cwd is still this path, an owner busy in a DIFFERENT worktree, an unknown
-   owner, or a queued message on an inbox or dead owner does not block.
+   agent whose cwd is on it, a process with cwd inside it, or any
+   non-ignored file modified in the last 30 minutes — named with its
+   age), while the tree is dirty, while the branch has not started
+   (no commits beyond where it was cut — never "merged"), or while the
+   branch is neither merged nor pushed, so it is safe by default. An
+   issue with several open worktree refs needs `--worktree <path>`;
+   naming a lane whose directory is already gone just closes its refs.
+   A reconciled agent whose cwd is still this path, an owner busy in
+   a DIFFERENT worktree, an unknown owner, or a queued message on an
+   inbox or dead owner does not block.
    Deletion is
    commit-bound: the local `branch -D` fires only when the branch tip
    still equals the commit the merge/push evidence covered, and
@@ -494,11 +497,12 @@ In this order:
    finish --merged --remote` finishes every merged+idle worktree in
    the project — one row each: `finished | would-finish |
    skipped(reason) | refused(reason)` (`would-finish` is the dry-run
-   preview of a clean finish). A recorded worktree directory that is
-   already missing, or a branch checked out at a different live path,
-   is `skipped` on both the dry run and a real sweep — never
-   `would-finish`, and the sweep does not close the ref or delete the
-   branch. The reason is `reconcile: missing-worktree, branch-present`,
+   preview of a clean finish). A lane with no commits yet is
+   `skipped(not started)`, never finished as merged. A recorded
+   worktree directory that is already missing, or a branch checked
+   out at a different live path, is `skipped` on both the dry run and
+   a real sweep — never `would-finish`, and the sweep does not close
+   the ref or delete the branch. The reason is `reconcile: missing-worktree, branch-present`,
    `reconcile: missing-worktree, branch-missing`, or
    `reconcile: path-branch-mismatch`. Every candidate row also carries
    `path_state` (`present`|`missing`), `branch_state`

@@ -4729,6 +4729,7 @@ fn issue_finish_pairs_branch_when_dir_name_differs() {
         ],
     );
     assert!(committed.0, "{}", committed.1);
+    land(&repo, &new, "moved.txt");
 
     let (ok, out) = cli(&pm, &state, &["issue", "finish", "D-1"]);
     assert!(ok, "{out}");
@@ -4807,6 +4808,7 @@ fn issue_finish_daemon_down_force_and_idempotent() {
     std::fs::remove_file(state.join("cadence.sock")).unwrap();
     assert!(cli(&pm, &state, &["issue", "new", "Idle", "--project", "demo"]).0);
     assert!(cli(&pm, &state, &["issue", "start", "D-2"]).0);
+    land(&repo, &repo.join(".cadence/wt/d-2-idle"), "idle.txt");
     let (ok, out) = cli(&pm, &state, &["issue", "finish", "D-2"]);
     assert!(
         ok && out["finished"] == true && out["overrode"] == json!([]),
@@ -4901,6 +4903,7 @@ fn issue_finish_dirty_and_unmerged_refusals() {
     // Committed but unmerged and unpushed: the work would be lost.
     git(&wt, &["add", "-A"]);
     git(&wt, &["commit", "-qm", "wip"]);
+    idle(&wt);
     let (ok, err) = cli(&pm, &state, &["issue", "finish", "D-1"]);
     assert!(!ok, "{err}");
     assert!(
@@ -4936,6 +4939,7 @@ fn issue_finish_dirty_and_unmerged_refusals() {
     std::fs::write(wt2.join("p.txt"), "x").unwrap();
     git(&wt2, &["add", "-A"]);
     git(&wt2, &["commit", "-qm", "pushed work"]);
+    idle(&wt2);
     let tip = git(&repo, &["rev-parse", "cadence/d-2-pushd"]).1;
     git(
         &repo,
@@ -4975,6 +4979,33 @@ fn strip_owner(pm: &Path, id: &str) {
     );
 }
 
+/// CAD-275: age every file under `dir` past `issue finish`'s
+/// 30-minute active window — the state of a lane nobody has touched
+/// since. Without it a lane written seconds ago is "in use".
+fn idle(dir: &Path) {
+    let st = Command::new("find")
+        .arg(dir)
+        .args(["-exec", "touch", "-h", "-d", "2 hours ago", "{}", "+"])
+        .status()
+        .unwrap();
+    assert!(st.success(), "backdate {}", dir.display());
+}
+
+/// CAD-275: give a fresh lane real work — one commit, fast-forward
+/// merged into the repo's default branch — then idle it, so finish
+/// sees a started, merged, untouched lane.
+fn land(repo: &Path, wt: &Path, file: &str) {
+    std::fs::write(wt.join(file), format!("{file}\n")).unwrap();
+    assert!(git(wt, &["add", "-A"]).0);
+    assert!(git(wt, &["commit", "-qm", &format!("work {file}")]).0);
+    let branch = git(wt, &["symbolic-ref", "--short", "HEAD"]).1;
+    assert!(
+        git(repo, &["merge", "-q", "--ff-only", &branch]).0,
+        "merge {branch}"
+    );
+    idle(wt);
+}
+
 /// CAD-64: a branch is "merged" when its work is on the default
 /// branch however it got there — a squash merge (combined patch) or
 /// cherry-picked commits both count, while an extra unmerged commit
@@ -5005,6 +5036,7 @@ fn issue_finish_squash_cherry_and_ignored() {
     git(&wt, &["commit", "-qm", "part b"]);
     git(&repo, &["merge", "--squash", "-q", "cadence/d-1-sq"]);
     git(&repo, &["commit", "-qm", "D-1: sq (#1)"]);
+    idle(&wt);
     strip_owner(&pm, "D-1");
     let (ok, out) = cli(&pm, &state, &["issue", "finish", "D-1"]);
     assert!(ok, "{out}");
@@ -5024,6 +5056,7 @@ fn issue_finish_squash_cherry_and_ignored() {
     // -x records the source sha in the message — a different commit
     // object with the same patch-id, like a real cherry-pick merge.
     git(&repo, &["cherry-pick", "-x", "cadence/d-2-ch"]);
+    idle(&wt);
     strip_owner(&pm, "D-2");
     let (ok, out) = cli(&pm, &state, &["issue", "finish", "D-2"]);
     assert!(ok && out["merged_by"] == "cherry", "{out}");
@@ -5041,6 +5074,7 @@ fn issue_finish_squash_cherry_and_ignored() {
     std::fs::write(wt.join("late.txt"), "late\n").unwrap();
     git(&wt, &["add", "-A"]);
     git(&wt, &["commit", "-qm", "unmerged late work"]);
+    idle(&wt);
     strip_owner(&pm, "D-3");
     let (ok, err) = cli(&pm, &state, &["issue", "finish", "D-3"]);
     assert!(!ok, "{err}");
@@ -5054,13 +5088,17 @@ fn issue_finish_squash_cherry_and_ignored() {
     git(&repo, &["worktree", "remove", "--force", &wts]);
 
     // D-4: the ui/node_modules build symlink alone is ignored (`!!`)
-    // and never blocks — the branch tip is main's, so "ancestry".
+    // and never blocks — the branch was fast-forwarded into main, so
+    // "ancestry". (An unstarted lane is never merged — CAD-275 — so it
+    // lands one commit first.)
     assert!(cli(&pm, &state, &["issue", "new", "Sy", "--project", "demo"]).0);
     assert!(cli(&pm, &state, &["issue", "start", "D-4"]).0);
     let wt = repo.join(".cadence/wt/d-4-sy");
+    land(&repo, &wt, "sy.txt");
     std::fs::create_dir_all(wt.join("ui")).unwrap();
     std::fs::create_dir_all(wt.join("real_nm")).unwrap();
     std::os::unix::fs::symlink("../real_nm", wt.join("ui/node_modules")).unwrap();
+    idle(&wt);
     let status = git(&wt, &["status", "--porcelain", "--ignored"]).1;
     assert!(status.contains("!!"), "{status}");
     strip_owner(&pm, "D-4");
@@ -5074,6 +5112,7 @@ fn issue_finish_squash_cherry_and_ignored() {
     assert!(cli(&pm, &state, &["issue", "new", "Re", "--project", "demo"]).0);
     assert!(cli(&pm, &state, &["issue", "start", "D-5"]).0);
     let wt = repo.join(".cadence/wt/d-5-re");
+    land(&repo, &wt, "re.txt");
     std::fs::create_dir_all(wt.join("ui")).unwrap();
     std::fs::create_dir_all(wt.join("real_nm")).unwrap();
     std::os::unix::fs::symlink("../real_nm", wt.join("ui/node_modules")).unwrap();
@@ -5089,6 +5128,7 @@ fn issue_finish_squash_cherry_and_ignored() {
     );
     assert!(wt.is_dir());
     std::fs::remove_file(wt.join("real.txt")).unwrap();
+    idle(&wt);
     let (ok, out) = cli(&pm, &state, &["issue", "finish", "D-5"]);
     assert!(ok && out["finished"] == true, "{out}");
 
@@ -5119,6 +5159,7 @@ fn issue_finish_squash_cherry_and_ignored() {
         git(&wt, &["commit", "-qm", "second"]);
         git(&repo, &["merge", "--squash", "-q", &branch]);
         git(&repo, &["commit", "-qm", &format!("{id}: squash")]);
+        idle(&wt);
         strip_owner(&pm, id);
         let (ok, out) = cli(&pm, &state, &["issue", "finish", id]);
         assert!(ok, "{id}: {out}");
@@ -5164,6 +5205,7 @@ fn issue_finish_pr_merge_via_gh() {
     std::fs::write(wt.join("p.txt"), "p").unwrap();
     git(&wt, &["add", "-A"]);
     git(&wt, &["commit", "-qm", "pr work"]);
+    idle(&wt);
     let tip = git(&repo, &["rev-parse", "cadence/d-1-pr"]).1;
     strip_owner(&pm, "D-1");
     set_gh("[{\"number\":7,\"headRefOid\":\"0000000000000000000000000000000000000000\",\"baseRefName\":\"main\"}]");
@@ -5199,6 +5241,7 @@ fn issue_finish_pr_merge_via_gh() {
     std::fs::write(wt.join("n.txt"), "n").unwrap();
     git(&wt, &["add", "-A"]);
     git(&wt, &["commit", "-qm", "unmerged"]);
+    idle(&wt);
     strip_owner(&pm, "D-2");
     set_gh("[]");
     let (ok, err) = cli_env(
@@ -5491,6 +5534,133 @@ fn issue_several_open_lanes_refuse_and_finish_one_by_path() {
     let (ok, out) = cli(&pm, &state, &["issue", "start", "D-1"]);
     assert!(ok && out["created"] == false, "{out}");
     assert_eq!(out["worktree"].as_str().unwrap(), live);
+}
+
+// ---- CAD-275: an unstarted or active lane is never finished as merged ----
+
+/// A fresh `issue start` lane with no commits is `not started`, never
+/// merged: the `--merged` sweep skips it (dry run and real, the text
+/// output naming the reason), an explicit finish refuses — first as
+/// recently active (the checkout itself is fresh), then, once idle, as
+/// not started — and `--force` finishes an abandoned lane, recorded.
+#[test]
+fn issue_finish_unstarted_lane_is_never_merged() {
+    let (_tmp, pm, state, repo) = start_fx();
+    assert!(cli(&pm, &state, &["issue", "new", "Fresh", "--project", "demo"]).0);
+    assert!(cli(&pm, &state, &["issue", "start", "D-1"]).0);
+    let wt = repo.join(".cadence/wt/d-1-fresh");
+
+    let (ok, plan) = cli(
+        &pm,
+        &state,
+        &["issue", "finish", "--merged", "--dry-run", "--json"],
+    );
+    assert!(ok, "{plan}");
+    let row = &plan["rows"][0];
+    assert!(
+        row["outcome"] == "skipped" && row["reason"] == "not started" && row["merged_by"].is_null(),
+        "{plan}"
+    );
+    let (ok, text) = cli_raw(&pm, &state, &["issue", "finish", "--merged", "--dry-run"]);
+    assert!(ok, "{text}");
+    assert!(text.contains("D-1: skipped(not started)"), "{text}");
+
+    let before = commits(&pm);
+    let (ok, err) = cli(&pm, &state, &["issue", "finish", "D-1"]);
+    assert!(!ok, "{err}");
+    let msg = err["error"].as_str().unwrap();
+    assert!(
+        msg.contains("was modified") && msg.contains("s ago (") && msg.contains("idle 30m"),
+        "a fresh checkout is recent activity, named: {msg}"
+    );
+    idle(&wt);
+    let (ok, err) = cli(&pm, &state, &["issue", "finish", "D-1"]);
+    assert!(!ok, "{err}");
+    assert!(
+        err["error"].as_str().unwrap().contains("has not started"),
+        "{err}"
+    );
+    let (ok, out) = cli(&pm, &state, &["issue", "finish", "--merged", "--json"]);
+    assert!(ok, "{out}");
+    assert_eq!(out["rows"][0]["reason"], "not started", "{out}");
+    assert!(wt.is_dir());
+    assert!(
+        git(
+            &repo,
+            &["rev-parse", "--verify", "--quiet", "cadence/d-1-fresh"]
+        )
+        .0
+    );
+    assert_eq!(commits(&pm), before, "nothing finished");
+
+    let (ok, out) = cli(&pm, &state, &["issue", "finish", "D-1", "--force"]);
+    assert!(ok, "{out}");
+    assert!(
+        out["finished"] == true
+            && out["not_started"] == true
+            && out["merged_by"].is_null()
+            && out["deleted_branch"] == true,
+        "{out}"
+    );
+    assert!(
+        out["overrode"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o == "not-started"),
+        "{out}"
+    );
+    assert!(!wt.exists());
+}
+
+/// CAD-275: a merged, clean lane with a file modified inside the
+/// active window is refused as in use — the refusal and the dry-run
+/// row name the file and its age — and `--force` overrides, recorded.
+#[test]
+fn issue_finish_refuses_recent_activity() {
+    let (_tmp, pm, state, repo) = start_fx();
+    assert!(cli(&pm, &state, &["issue", "new", "Busy", "--project", "demo"]).0);
+    assert!(cli(&pm, &state, &["issue", "start", "D-1"]).0);
+    let wt = repo.join(".cadence/wt/d-1-busy");
+    land(&repo, &wt, "b.txt");
+    // Touched, not changed: the tree stays clean.
+    assert!(Command::new("touch")
+        .arg(wt.join("f"))
+        .status()
+        .unwrap()
+        .success());
+    assert_eq!(git(&wt, &["status", "--porcelain"]).1, "");
+
+    let (ok, text) = cli_raw(&pm, &state, &["issue", "finish", "--merged", "--dry-run"]);
+    assert!(!ok, "a refused row exits 1: {text}");
+    assert!(
+        text.contains("D-1: refused(Worktree")
+            && text.contains("was modified")
+            && text.contains("(f)"),
+        "{text}"
+    );
+    let (ok, err) = cli(&pm, &state, &["issue", "finish", "D-1"]);
+    assert!(!ok, "{err}");
+    let msg = err["error"].as_str().unwrap();
+    assert!(msg.contains("(f)") && msg.contains("s ago"), "{msg}");
+    assert!(wt.is_dir());
+
+    let (ok, out) = cli(&pm, &state, &["issue", "finish", "D-1", "--force"]);
+    assert!(ok, "{out}");
+    assert!(
+        out["merged_by"] == "ancestry" && out["not_started"] == false,
+        "a landed lane is merged, not unstarted: {out}"
+    );
+    assert!(
+        out["overrode"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o == "recent-activity"),
+        "{out}"
+    );
+    let (_, body) = git(&pm, &["log", "-1", "--format=%B"]);
+    assert!(body.contains("Forced: true"), "{body}");
 }
 
 /// Dispatch pre-flight refuses before anything is created: no return
