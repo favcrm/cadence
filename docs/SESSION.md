@@ -762,31 +762,54 @@ a `v<version>` tag runs every `ci.yml` gate on the tagged commit, then:
   --release --locked --features ui` natively for `x86_64-linux`
   (ubuntu-22.04), `aarch64-linux` (ubuntu-22.04-arm) and `aarch64-macos`
   (macos-14), and checks `--version` is `cadence <version>+<sha>`;
-- `release-publish` runs no repository code: it re-checks each tarball's
-  sha256 and listing, attests the tarballs, and creates the GitHub
-  Release (a re-run replaces its assets).
+- `release-publish` runs no repository code and waits in the `release`
+  environment: it re-checks each tarball's sha256 and listing, attests
+  the tarballs and `install.sh`, creates the GitHub Release as a draft
+  with every asset, and publishes it last. Published assets never change:
+  a re-run against a published release only passes when every asset is
+  byte-identical.
+
+A `v*` tag runs the `ci.yml` of the tagged commit, so the gate above is
+only as strong as who can push tags and approve the job. Applied repo
+settings: the "release tags" ruleset (id 23893821) makes creating,
+updating or deleting `v*` tags admin-only; the `release` environment
+requires reviewer cc-syntax and admits only `v*` tags; releases are
+immutable once published. `cross-build` builds aarch64-linux and
+aarch64-macos on every PR and merge-queue entry, so the platform cfg
+gates are proven before a tag.
 
 Assets per target: `cadence-<tag>-<target>.tar.gz` (the same
 `cadence`, `cadence.sha256` and `manifest.json` that `upgrade` keeps,
 manifest plus `version`) and `cadence-<tag>-<target>.tar.gz.sha256`, plus
-`install.sh`.
+`install.sh` (from `scripts/install.sh`).
 
 ```bash
-# cut a release: bump Cargo.toml's version on main first
+# cut a release (admin): bump Cargo.toml's version on main first
 git tag v0.2.0 origin/main && git push origin v0.2.0
 
 # install (or reinstall, or roll back) on a machine
-curl -fsSL https://raw.githubusercontent.com/favcrm/cadence/main/install.sh | sh
+curl -fsSL https://github.com/favcrm/cadence/releases/latest/download/install.sh | sh
 sh install.sh --version v0.2.0 --prefix /opt/cadence
+
+# authenticity: built by this repo's ci.yml from that tag
+gh attestation verify cadence-v0.2.0-x86_64-linux.tar.gz --repo favcrm/cadence \
+  --source-ref refs/tags/v0.2.0 \
+  --signer-workflow favcrm/cadence/.github/workflows/ci.yml
 ```
+
+The `.sha256` files are served next to the tarballs, so `install.sh`'s
+checksum checks catch corruption and truncation, not a forged release;
+the attestation is the authenticity check.
 
 `install.sh` installs into `<prefix>/releases/<tag>/` (default prefix
 `${XDG_DATA_HOME:-~/.local/share}/cadence`, the releases dir `upgrade`
 uses) and repoints `~/.local/bin/cadence` atomically. `upgrade` reads the
 releases dir off a link into `<dir>/v<version>/`, so a later `cadence
-upgrade --latest-main` lands next to the tagged release. A paste-in
-prompt for agents is in [INSTALL-AGENT.md](INSTALL-AGENT.md). The macOS
-binary's CLI works; its daemon refuses to start until CAD-315.
+upgrade --latest-main` lands next to the tagged release — on x86_64-linux
+only: `upgrade` installs main builds for `upgrade::TARGET` alone, so
+other targets update by rerunning `install.sh`. A paste-in prompt for
+agents is in [INSTALL-AGENT.md](INSTALL-AGENT.md). The macOS binary's CLI
+works; its daemon refuses to start until CAD-315.
 
 ### Post-merge CI on main
 

@@ -25,15 +25,24 @@ for creation, handover and cleanup instructions.
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/favcrm/cadence/main/install.sh | sh
+curl -fsSL https://github.com/favcrm/cadence/releases/latest/download/install.sh | sh
 ```
 
-Linux x86_64/aarch64 and macOS arm64. The installer verifies the release
-checksum, installs to `~/.local/share/cadence/releases/<tag>/` and links
+Linux x86_64/aarch64 and macOS arm64. The installer checks the release
+checksums, installs to `~/.local/share/cadence/releases/<tag>/` and links
 `~/.local/bin/cadence`; `--version <tag>` and `--prefix <dir>` change
-either. Installing through a coding agent: paste
+either. The checksums catch corruption, not forgery; to check authenticity,
+verify the build-provenance attestation before installing:
+
+```bash
+gh attestation verify <file> --repo favcrm/cadence --source-ref refs/tags/<tag> \
+  --signer-workflow favcrm/cadence/.github/workflows/ci.yml
+```
+
+Installing through a coding agent: paste
 [docs/INSTALL-AGENT.md](docs/INSTALL-AGENT.md). Releases and `cadence
-upgrade`: [docs/SESSION.md](docs/SESSION.md#tagged-releases-and-installsh-cad-311).
+upgrade` (x86_64-linux only for now):
+[docs/SESSION.md](docs/SESSION.md#tagged-releases-and-installsh-cad-311).
 
 ## Quick start
 
