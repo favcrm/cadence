@@ -29,7 +29,9 @@
 //! otherwise downloads and replaces it. `--latest-main` never moves the
 //! link backwards. An explicit `--sha` rollback to an unattested release
 //! works offline or with `allow_unattested`, and is labelled
-//! [`TRUST_UNATTESTED`].
+//! [`TRUST_UNATTESTED`]. A `<sha>` entry that is not a real directory, or
+//! a file in it that is not a regular file (a symlink out of the release
+//! tree, say), is refused rather than reused or installed through.
 //!
 //! Restarting the daemon is never automatic. GitHub access sits behind
 //! [`ReleaseSource`] so tests run against a fake and never call GitHub.
@@ -657,6 +659,7 @@ pub fn run(src: &dyn ReleaseSource, layout: &Layout, req: &Request) -> Result<Va
         }
     };
 
+    check_release_entries(layout, &sha)?;
     let installed_path = layout.binary(&sha);
     let mut trust = TRUST_ATTESTED;
     let mut digest = None;
@@ -1032,6 +1035,44 @@ fn local_records(
         false
     };
     Ok((digest, ci_manifest))
+}
+
+/// CAD-379: `<releases>/<sha>` must be a real directory and each file the
+/// upgrade reads or writes in it a regular file (`symlink_metadata`, not
+/// following links). Verified bytes reached through a symlink live outside
+/// the release tree, where the link would keep chasing whatever that path
+/// holds later; so such an entry is refused before it is attested, run,
+/// written through or linked, and left for the operator to remove.
+fn check_release_entries(layout: &Layout, sha: &str) -> Result<()> {
+    let dir = layout.release_dir(sha);
+    let entries = std::iter::once((dir.clone(), true))
+        .chain([BINARY, SHA_FILE, MANIFEST].map(|file| (dir.join(file), false)));
+    for (path, want_dir) in entries {
+        let kind = match fs::symlink_metadata(&path) {
+            // No release dir: nothing under it to check.
+            Err(e) if e.kind() == ErrorKind::NotFound && want_dir => return Ok(()),
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+            Ok(m) => m.file_type(),
+        };
+        let what = if kind.is_symlink() {
+            "is a symlink"
+        } else if want_dir && !kind.is_dir() {
+            "is not a directory"
+        } else if !want_dir && !kind.is_file() {
+            "is not a regular file"
+        } else {
+            continue;
+        };
+        return Err(Error::rejected(format!(
+            "release entry {} {what} — refusing to use or install through it; a release \
+             must be a real {}/<sha>/ directory holding the files themselves. Remove it and \
+             rerun",
+            path.display(),
+            layout.releases.display()
+        )));
+    }
+    Ok(())
 }
 
 /// After the swap, the link must resolve to the verified bytes. If it does

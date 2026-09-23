@@ -5813,6 +5813,11 @@ fn run_upgrade(state_dir: &Path, args: UpgradeArgs) -> Result<i32> {
             backup_state_dir: Some(state_dir.to_path_buf()),
         },
     )?;
+    // CAD-379: an unattested install is said on stderr too, where a human
+    // reads it; stdout stays the JSON report.
+    if let Some(warning) = report["warning"].as_str() {
+        eprintln!("warning: {warning}");
+    }
     let command = upgrade::restart_command(args.as_identity.as_deref());
     if !args.restart {
         report["restart_command"] = json!(command);
