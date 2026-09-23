@@ -2,21 +2,39 @@
 //! socket and the board's TCP writes share (CAD-102, CAD-254, CAD-263).
 //!
 //! A peer *process* is tied to a registered pane by three signals
-//! ([`PeerTies`]). Two are *process* signals a client cannot choose:
-//! the pane's pid on its `/proc` ancestry, and the pane's pty among its
-//! stdio fds (a `setsid` detach keeps stdio). The third — the pane's
-//! `CADENCE_ALIAS` in its environment (a detach keeps that too) — IS
-//! caller-choosable: any process can export `CADENCE_ALIAS=B`.
+//! ([`PeerTies`]), and only ONE of them is unforgeable:
+//!
+//! - the pane's pid on the peer's `/proc` ancestry — the kernel keeps
+//!   it; a process can leave a pane's ancestry (`setsid` + fork) but
+//!   never join another's;
+//! - the pane's pty among the peer's stdio fds (a `setsid` detach keeps
+//!   stdio) — caller-CHOOSABLE by any same-uid process: it can open
+//!   another pane's `/dev/pts/N` (the user owns it) onto its stdio;
+//! - the pane's `CADENCE_ALIAS` in the peer's environment (a detach
+//!   keeps that too) — caller-choosable: any process can export
+//!   `CADENCE_ALIAS=B`.
 //!
 //! - `agent answer` uses all three ([`PeerTies::tied_to`],
 //!   [`PeerTies::agents`]): a caller tied to the target pane by any of
 //!   them is refused, and the audit `by` names the first other pane it
-//!   is tied to. The alias can only narrow there — forging it refuses
+//!   is tied to. A forged signal can only narrow there — it refuses
 //!   its forger or mislabels an audit stamp; it authorizes nothing.
-//! - A board write is attributed to an agent on a process signal only
+//! - A board write is attributed to an agent on ancestry or the pty tie
 //!   ([`PeerTies::attributed_agents`]): an env alias alone attributes
 //!   nothing, so `CADENCE_ALIAS=B curl …` from a pane-less process
 //!   writes as `operator (ui)`, not as agent B.
+//!
+//! Accepted residual (CAD-276): the pty tie is kept because it is what
+//! attributes a `setsid` child of a pane to its agent instead of to
+//! `operator (ui)` — dropping it would be an escalation (operator >
+//! agent). The price is LATERAL authorship forgery: a same-uid off-pane
+//! process that opens another pane's `/dev/pts/N` onto its stdio is
+//! attributed as that pane's agent. It gains no privilege over what it
+//! already had as `operator (ui)`; it only chooses whose name a write
+//! carries. The root weakness — an unattributable local caller defaults
+//! to `operator` — is tracked as a design note on CAD-276
+//! (operator-by-positive-proof); `slot_reconcile` already requires
+//! positive proof ([`operator_proof`]).
 //!
 //! The daemon names its Unix peer through `SO_PEERCRED`; a TCP
 //! connection carries no credentials, so the board recovers the peer
@@ -60,8 +78,10 @@ impl PeerTies {
         self.chain.is_some()
     }
 
-    /// The process signals: the pane pid is on the peer's ancestry, or
-    /// the peer holds the pane's pty. Neither is caller-choosable.
+    /// The process signals: the pane pid is on the peer's ancestry
+    /// (unforgeable), or the peer holds the pane's pty on its stdio
+    /// (choosable by any same-uid process — the accepted lateral
+    /// residual in the module doc).
     fn process_tied(&self, pane_pid: u32) -> bool {
         self.chain.as_deref().is_some_and(|c| c.contains(&pane_pid))
             || holds_pane_tty(self.pid, pane_pid)
@@ -78,7 +98,8 @@ impl PeerTies {
     /// may be ATTRIBUTED as — process signals only, sorted by alias
     /// and deduplicated. `CADENCE_ALIAS` is caller-chosen, so an env
     /// tie never attributes by itself; when a process signal
-    /// corroborates it, the process signal already decides.
+    /// corroborates it, the process signal already decides. The pty
+    /// signal is choosable too (see the module doc's residual).
     pub(crate) fn attributed_agents<'a>(
         &self,
         panes: impl IntoIterator<Item = (&'a str, u32)>,
@@ -133,9 +154,11 @@ fn caller_env_alias(peer_pid: u32) -> Option<String> {
 
 /// Does `peer_pid` hold the pane's pty? A detached pane process loses
 /// its ancestry and controlling terminal but keeps stdio — the fd
-/// targets still name the pane's pts device. Redirected stdio is the
-/// documented residual (a maximal-effort detach), accepted because the
-/// same actor could `tmux send-keys` its own pane directly.
+/// targets still name the pane's pts device. Two residuals: redirected
+/// stdio escapes the tie (a maximal-effort detach, accepted because
+/// the same actor could `tmux send-keys` its own pane directly), and a
+/// same-uid process can open ANOTHER pane's pts onto its stdio and
+/// satisfy it (lateral attribution, accepted — see the module doc).
 fn holds_pane_tty(peer_pid: u32, pane_pid: u32) -> bool {
     let pane_tty = (0..=2)
         .filter_map(|fd| std::fs::read_link(format!("/proc/{pane_pid}/fd/{fd}")).ok())
@@ -174,6 +197,132 @@ pub(crate) fn unmatched_caller(
     } else {
         Ok(("unknown".to_string(), "unknown"))
     }
+}
+
+/// Positive proof that a local peer is the operator — the gate for
+/// `slot_reconcile` (CAD-276). Being tied to no agent is not proof: a
+/// `setsid` + double-fork detach of a pane or managed tool is tied to
+/// nothing. The peer is the operator only when each check reads
+/// cleanly and holds, in this order (`Err` names the first failure):
+///
+/// 1. it runs as `uid` (real and effective) — the daemon's uid;
+/// 2. its whole `/proc` ancestry can be walked, every hop's `status`
+///    readable;
+/// 3. no hop is a registered pane pid (`panes`), an enrolled or
+///    tombstoned managed-endpoint root (`enrolled_root`), or a strict
+///    descendant of `daemon_pid` (every process the daemon launched);
+/// 4. no hop of this uid carries `CADENCE_ALIAS` in its environment,
+///    and the peer's own environment is readable. An ancestor's
+///    unreadable environment is not a refusal: the kernel hides a
+///    privilege-separated process's (`sshd: user@pts/N` is non-
+///    dumpable), and the env is caller-choosable anyway — any agent
+///    can scrub it before `exec` — so it only ever narrows;
+/// 5. it holds no registered pane's pty on its stdio;
+/// 6. its session leader is on that ancestry. A detach that orphans
+///    (`setsid` then fork, the intermediate exits) leaves a session
+///    whose leader is gone, and an orphan's origin is unknowable. A
+///    session id of 0 (a leader outside this pid namespace) or 1
+///    (init) cannot come from a detach inside it and passes.
+///
+/// Residual: a same-uid process that leaves every agent's ancestry
+/// WITHOUT orphaning its session (`setsid -f` makes the reparented
+/// child its own session leader) and scrubs its env and stdio still
+/// passes — the "unattributable local caller is the operator" weakness
+/// tracked as a design note on CAD-276. Reconcile only frees holds
+/// the daemon itself proves dead, so that residual cannot free work.
+pub(crate) fn operator_proof(
+    peer_pid: u32,
+    uid: u32,
+    daemon_pid: u32,
+    panes: &HashMap<u32, String>,
+    enrolled_root: impl Fn(u32) -> bool,
+) -> Result<(), String> {
+    let (real, effective) = proc_uids(peer_pid)?;
+    if (real, effective) != (uid, uid) {
+        return Err(format!(
+            "pid {peer_pid} runs as uid {real}/{effective}, not the daemon's uid {uid}"
+        ));
+    }
+    let chain = caller_chain(peer_pid)
+        .ok_or_else(|| format!("pid {peer_pid}: /proc ancestry unreadable"))?;
+    for (i, &hop) in chain.iter().enumerate() {
+        if let Some(alias) = panes.get(&hop) {
+            return Err(format!(
+                "pid {hop} on its ancestry is registered pane '{alias}'"
+            ));
+        }
+        if enrolled_root(hop) {
+            return Err(format!(
+                "pid {hop} on its ancestry is an enrolled managed endpoint"
+            ));
+        }
+        if i > 0 && hop == daemon_pid {
+            return Err(format!(
+                "it descends from the daemon (pid {hop}) — a process the daemon launched"
+            ));
+        }
+        let (real, effective) = proc_uids(hop)?;
+        if real != uid && effective != uid {
+            continue;
+        }
+        match std::fs::read(format!("/proc/{hop}/environ")) {
+            Ok(env)
+                if env
+                    .split(|b| *b == 0)
+                    .any(|kv| kv.starts_with(b"CADENCE_ALIAS=")) =>
+            {
+                return Err(format!(
+                    "pid {hop} on its ancestry carries CADENCE_ALIAS — an agent's environment"
+                ));
+            }
+            Ok(_) => {}
+            Err(e) if i == 0 => {
+                return Err(format!("pid {peer_pid}: /proc/{peer_pid}/environ: {e}"));
+            }
+            Err(_) => {}
+        }
+    }
+    if let Some(alias) = panes
+        .iter()
+        .find(|(pane_pid, _)| holds_pane_tty(peer_pid, **pane_pid))
+        .map(|(_, alias)| alias)
+    {
+        return Err(format!(
+            "it holds registered pane '{alias}''s pty on its stdio"
+        ));
+    }
+    let sid = proc_session(peer_pid)?;
+    if sid > 1 && !chain.contains(&sid) {
+        return Err(format!(
+            "its session leader pid {sid} is not on its ancestry — a detached \
+             (setsid + fork) process, whose origin is unknowable"
+        ));
+    }
+    Ok(())
+}
+
+/// Real and effective uid from `/proc/<pid>/status`.
+fn proc_uids(pid: u32) -> Result<(u32, u32), String> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .map_err(|e| format!("/proc/{pid}/status: {e}"))?;
+    status
+        .lines()
+        .find_map(|l| {
+            let mut ids = l.strip_prefix("Uid:")?.split_whitespace();
+            Some((ids.next()?.parse().ok()?, ids.next()?.parse().ok()?))
+        })
+        .ok_or_else(|| format!("/proc/{pid}/status: no Uid line"))
+}
+
+/// The session id (`/proc/<pid>/stat` field 6).
+fn proc_session(pid: u32) -> Result<u32, String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .map_err(|e| format!("/proc/{pid}/stat: {e}"))?;
+    // comm (field 2) may hold spaces and parens — split after the last
+    // ')': state is then index 0, and session (field 6) index 3.
+    stat.rsplit_once(')')
+        .and_then(|(_, after)| after.split_whitespace().nth(3)?.parse().ok())
+        .ok_or_else(|| format!("/proc/{pid}/stat: malformed"))
 }
 
 /// Which registered agent the TCP peer `peer` of a connection to our
