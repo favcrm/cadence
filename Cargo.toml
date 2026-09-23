@@ -41,6 +41,8 @@ toml = "0.8"
 # CAD-109 secret scan: the vendored gitleaks rule pack is RE2 syntax, which
 # the regex crate accepts as-is (no lookarounds or backreferences).
 regex = "1"
+# CAD-396: redact every turn token/generation from an export in one pass.
+aho-corasick = "1"
 ureq = { version = "3.4.2", default-features = false, features = ["json", "rustls"] }
 
 [dev-dependencies]

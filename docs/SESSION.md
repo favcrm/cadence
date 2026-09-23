@@ -888,7 +888,7 @@ state that is not already in git. Three commands cover it (CAD-314):
 cadence backup                          # verified copy + manifest into <state>/backups
 cadence backup --reason nightly         # its own retention group, keeps 7 by default
 cadence backup --dir /srv/cadence-bak --keep 14
-cadence export --out ~/cadence-bundle   # portable bundle, no credentials
+cadence export --out ~/cadence-bundle   # portable bundle; credential patterns scanned
 cadence restore <copy>.manifest.json    # or: cadence restore ~/cadence-bundle
 cadence restore ~/cadence-bundle --repo ~/src/cadence --repo ~/src/app
 ```
@@ -908,13 +908,32 @@ is written next to it:
   userinfo stripped.
 
 The pair is then read back from disk and verified before the command
-reports success. The files are `0600` and the directory is `0700`.
+reports success. The files are `0600`. A backup directory that cadence
+creates is `0700`; an existing `--dir` keeps the mode it already has.
 
 `--keep N` (default 7) prunes the oldest backups that share the same
-`--reason` in that directory. Only a copy that has a cadence manifest is
-ever pruned. Hand-made files there, such as
-`cadence-live-<ts>.sqlite3`, are never touched, and a burst of
-`pre-restore` copies cannot push out the nightly ones.
+`--reason` in that directory (CAD-396):
+
+- The copy just written is never pruned; it counts as one of the N.
+- Age comes from the UTC stamp in the file name
+  (`cadence-<reason>-<stamp>-<id>`), then the manifest's mtime. Manifest
+  content never decides age, so clock skew or a planted future-dated
+  manifest cannot push out the fresh copy. The name is checked for its
+  shape (`YYYYMMDDTHHMMSSZ` digits and an 8-hex id), not for valid date
+  ranges. A backup written while the clock ran ahead carries that
+  future stamp and outranks newer copies until real time catches up;
+  the fresh copy still always survives.
+- A copy is deleted only when it is the regular file
+  `<manifest stem>.sqlite3` next to its manifest and its sha256 and size
+  match that manifest. A symlink, an edited file, or a manifest naming
+  some other file is left alone and listed under `prune_skipped`.
+- Hand-made files, such as `cadence-live-<ts>.sqlite3`, are never
+  touched, and a burst of `pre-restore` copies cannot push out the
+  nightly ones.
+
+`backup` re-checks after pruning that its own pair is still on disk and
+fails otherwise. A pruning error is reported as such ("was written and
+verified, but pruning … failed"), distinct from a failed backup.
 
 **Nightly.** Nightly backups are a schedule, not a daemon feature. Add a
 cron line:
@@ -943,6 +962,14 @@ inside the state dir. For a schema-crossing rollout, take the copy with
 Only the store goes in. It is changed in these ways:
 
 - `agents.generation`, the generation every turn token is bound to, is set to NULL.
+- `messages.turn_id`, the turn token itself, is set to NULL.
+- Every turn token and generation the store knows — `messages.turn_id`,
+  `agents.generation`, each `"turn_id": "…"` value in any text cell
+  (event payloads outlive their messages), and the generation inside
+  each `<prefix>-<generation>-<uuid>` token — is replaced with
+  `[redacted]` in every text cell, before the columns above are nulled.
+  The export refuses if any of those values is still present afterwards.
+  The result reports `redacted: {tokens, cells}`.
 - `agents.pid` is set to NULL.
 - The file is `VACUUM`ed, so deleted rows left in freed pages do not travel.
 
@@ -964,7 +991,25 @@ scan (`cadence secret scan`'s rules). A single blocking finding refuses
 the export and removes the directory. The refusal names each
 `table.column`, rowid, rule and fingerprint, never the value. A false
 positive is for the operator to allowlist by rule and fingerprint in
-`<state>/secret-allowlist.toml`. There is no bypass flag.
+`<state>/secret-allowlist.toml`. There is no bypass flag. Warn-level
+findings pass and are counted under `scan.warnings`: the scan catches
+credential *patterns*, it does not prove the store holds none.
+
+A stale turn token quoted in prose (a message body or event payload,
+rule `cadence-argv-secret`) blocks an export even though its generation
+is gone. The token is dead once the agent's generation changes; after
+checking that, allowlist it by fingerprint:
+
+```toml
+[[allow]]
+rule = "cadence-argv-secret"
+fingerprint = "<fingerprint from the refusal>"
+reason = "expired turn token quoted in history"
+```
+
+A bundle is not signed. The manifest sha256 detects corruption, not
+tampering: restore only bundles you made or received over a channel you
+trust.
 
 **Restore.** `restore` takes a backup manifest or a bundle directory and
 writes `--state-dir` (default: the usual state dir). It refuses in each
@@ -978,8 +1023,18 @@ of these cases:
   a failed integrity check, or a different recorded schema.
 - **The state dir already has a store**, unless `--force` is passed.
   `--force` first takes a verified `pre-restore` backup into
-  `<state>/backups`, then replaces the store and drops the old `-wal` and
-  `-shm`.
+  `<state>/backups`. It then renames the old store and its `-wal`/`-shm`
+  aside, links the verified copy in without overwriting (`hard_link`),
+  and removes the aside files only after that succeeded; on failure the
+  old files are renamed back. If that rollback itself fails, the error
+  says `ROLLBACK FAILED` and names where the previous store now is.
+  `cadence.lock` is opened with `O_NOFOLLOW`, so a symlinked lock is
+  refused.
+- **An earlier forced restore was interrupted**: a
+  `cadence.sqlite3*.replaced-*` file in the state dir may hold the
+  previous store. Every restore refuses until it is moved back or away,
+  and `cadence daemon start` prints a warning (and a `warning` field)
+  while one exists.
 
 Repo paths are rewritten by remote. The restore matches each recorded
 repo to the `--repo` checkout whose `origin` is the same remote.
@@ -1000,7 +1055,9 @@ runs after every verification and immediately before the release is
 installed and the link moves. It goes through `backup::before_self_update`,
 the same as `cadence backup --reason pre-update`, and writes a verified
 copy into `<state>/backups`, which keeps 7 `pre-update` copies. A failed
-backup refuses the upgrade, and nothing is installed. `--dry-run` and an
+backup refuses the upgrade, and nothing is installed. Before installing,
+`upgrade` also checks that the reported copy and manifest still exist
+and still verify; a missing or changed pair refuses the upgrade. `--dry-run` and an
 upgrade that is already current take no backup. The copy is reported
 under `backup`, and a state dir with no store yet reports `skipped`.
 This copy is inside the state dir, so it is not a rollout receipt for a

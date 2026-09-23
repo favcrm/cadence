@@ -1066,3 +1066,47 @@ fn cad314_upgrade_dry_run_takes_no_backup() {
     assert!(report["backup"].is_null(), "{report}");
     assert!(!state.join("backups").exists());
 }
+
+/// CAD-396: clock skew alone (seven honest pre-update backups dated a day
+/// ahead) must not let retention delete the backup the upgrade just took.
+#[test]
+fn cad396_upgrade_keeps_its_fresh_backup_under_clock_skew() {
+    let e = env();
+    let root = TempDir::new().unwrap();
+    let state = state_with_store(root.path());
+    let seed =
+        cadence_agent::backup::backup(&state, &root.path().join("seed"), 7, "manual").unwrap();
+    let dir = state.join("backups");
+    fs::create_dir_all(&dir).unwrap();
+    let tomorrow = cadence_agent::issue::time::now_epoch() + 86_400;
+    for i in 0..7i64 {
+        let stem = format!(
+            "cadence-pre-update-{}-{i:08x}",
+            cadence_agent::issue::time::basic(tomorrow + i)
+        );
+        fs::copy(
+            seed["db"].as_str().unwrap(),
+            dir.join(format!("{stem}.sqlite3")),
+        )
+        .unwrap();
+        let mut m: serde_json::Value =
+            serde_json::from_slice(&fs::read(seed["manifest"].as_str().unwrap()).unwrap()).unwrap();
+        m["db_file"] = serde_json::json!(format!("{stem}.sqlite3"));
+        m["reason"] = serde_json::json!("pre-update");
+        m["created_epoch"] = serde_json::json!((tomorrow + i) as f64);
+        fs::write(
+            dir.join(format!("{stem}.manifest.json")),
+            serde_json::to_vec(&m).unwrap(),
+        )
+        .unwrap();
+    }
+    let fake = Fake::new(&e.artifact);
+
+    let report = upgrade::run(&fake, &e.layout, &with_backup(&state, false)).unwrap();
+
+    assert_eq!(link_target(&e.layout), e.layout.binary(SHA));
+    let manifest = PathBuf::from(report["backup"]["manifest"].as_str().unwrap());
+    let db = PathBuf::from(report["backup"]["db"].as_str().unwrap());
+    assert!(manifest.is_file() && db.is_file(), "{report}");
+    cadence_agent::backup::verify(&manifest).unwrap();
+}
