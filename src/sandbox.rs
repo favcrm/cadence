@@ -112,9 +112,13 @@ fn global_gate(profile: Option<&str>, allowed: Option<bool>, what: &str) -> Resu
     };
     match allowed {
         Some(true) => Ok(()),
+        // The opt-in must reach the sandbox's daemon, which does the
+        // write — so it is a restart, not a variable in this shell.
         Some(false) => Err(Error::rejected(format!(
             "{what} is global to this host — refused under \
-             CADENCE_PROFILE={PROFILE_PREFIX}{name}; set {ALLOW_GLOBAL_ENV}=1 to allow it"
+             CADENCE_PROFILE={PROFILE_PREFIX}{name}; to allow it, restart the \
+             sandbox with the opt-in: `cadence sandbox down {name}` then \
+             `{ALLOW_GLOBAL_ENV}=1 cadence sandbox up {name}`"
         ))),
         None => Err(Error::rejected(format!(
             "{what} is global to this host — refused under \
@@ -715,7 +719,15 @@ mod tests {
         let hard = global_gate(Some("s"), None, "`ui tailscale`").unwrap_err();
         assert!(hard.to_string().contains("sandbox:s"), "{hard}");
         let soft = global_gate(Some("s"), Some(false), "merge").unwrap_err();
-        assert!(soft.to_string().contains(ALLOW_GLOBAL_ENV), "{soft}");
+        assert!(
+            soft.to_string().contains("`cadence sandbox down s`"),
+            "{soft}"
+        );
+        assert!(
+            soft.to_string()
+                .contains("`CADENCE_SANDBOX_ALLOW_GLOBAL=1 cadence sandbox up s`"),
+            "{soft}"
+        );
         assert!(global_gate(Some("s"), Some(true), "merge").is_ok());
     }
 
