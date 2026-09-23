@@ -618,6 +618,10 @@ impl ProviderAdapter for CodexAdapter {
         *self.shared.idle_window.lock().unwrap() =
             window("turn_idle_secs").unwrap_or(DEFAULT_TURN_IDLE);
         *self.shared.max_turn.lock().unwrap() = window("turn_max_secs");
+        // Registration already restricts the sandbox; validating again
+        // keeps a hand-edited store from reaching `thread/start`, and
+        // doing it before launch means a bad row spawns nothing.
+        registry::codex_sandbox(&agent.sandbox)?;
         let launched = self.transport.launch(&agent.cwd, &self.log_path)?;
         // Everything after launch is guarded: any failure closes the
         // transport so no owned provider process is left behind.
@@ -646,7 +650,7 @@ impl ProviderAdapter for CodexAdapter {
                     registry::codex_approval_policy(policy)?;
                     policy
                 }
-                None => "never",
+                None => registry::CODEX_DEFAULT_APPROVAL_POLICY,
             };
             let (configured_model, configured_effort) = configured_settings(agent)?;
             validate_settings(

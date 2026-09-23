@@ -192,14 +192,21 @@ as `model` and `config.model_reasoning_effort` on both `thread/start` and
 "<policy>"}` selects the
 `approvalPolicy` sent on `thread/start`/`thread/resume` — `never`,
 `on-request`, `on-failure` or `untrusted` — replayed verbatim on every
-open like the other launch params. `agent_register` and
+open like the other launch params (`cadence codex --approval-policy`,
+`cadence join --approval-policy`; the join flag is refused for other
+providers). `agent_register` and
 `agent set --next-launch` reject anything else with an error naming all
 four, and the adapter validates once more before the wire. When the key
 is absent a cadence-launched worker sends `never`: no approval
-round-trips to stall an unattended turn on. The worker's filesystem
+round-trips to stall an unattended turn on. `agent show` reports the
+effective `approval_policy` of a codex agent with
+`approval_policy_source` — `configured` or `cadence default` (both null
+for other providers). The worker's filesystem
 posture is `sandbox` — `read-only` or `workspace-write`
 (`agent register --sandbox`; `cadence join --sandbox`; `cadence codex
---sandbox`). A joined codex worker defaults to `workspace-write`
+--sandbox`). The adapter re-checks the stored sandbox before it
+launches the app-server, so a hand-edited value fences the agent with
+an error naming it and nothing is spawned. A joined codex worker defaults to `workspace-write`
 scoped to its worktree cwd, `read-only` only when explicitly asked —
 paired with `approval_policy=never` that is the same trust posture the
 other providers already run under, not a new one. Codex turn liveness
