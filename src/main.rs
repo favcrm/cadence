@@ -7707,6 +7707,7 @@ fn briefing_body(
         if rules.is_empty() {
             return None;
         }
+        let fresh = cadence_agent::memory::Freshness::for_project(Some(&proj));
         // ≤8 entries AND ≤LESSON_MAX_BYTES total — same bound the
         // dispatch lessons file carries. An over-budget rule is
         // skipped, not a stop: later smaller rules still list.
@@ -7714,8 +7715,9 @@ fn briefing_body(
         let mut omitted = 0usize;
         for m in rules.iter().take(8) {
             let line = format!(
-                "- `{}`: {} — {}",
+                "- `{}` ({}): {} — {}",
                 m.front.id,
+                cadence_agent::memory::evidence_label(m, &fresh),
                 cadence_agent::memory::fact_line(&m.body),
                 cadence_agent::memory::apply_line(&m.body)
             );

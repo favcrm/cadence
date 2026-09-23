@@ -74,6 +74,19 @@ pub struct Project {
     pub default_owner: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<Build>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemoryPolicy>,
+}
+
+/// `memory:` — project-memory retrieval policy (CAD-203).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryPolicy {
+    /// Days a verified lesson's evidence stays fresh. A lesson last
+    /// verified longer ago is withheld from dispatch until a new verify
+    /// cycle is finalized. Default: `memory::DEFAULT_STALE_DAYS` (30).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_days: Option<u64>,
 }
 
 /// `~` → `$HOME`, else the path unchanged.
