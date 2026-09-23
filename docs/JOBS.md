@@ -308,9 +308,43 @@ stays inside its quotes (CAD-300).
 Explicit envelopes end with ` Correlation: <32-hex sha256 of the
 dispatch id>.` — the pty render probe slices the body's tail, and the
 derived suffix keeps that tail unique per dispatch id (bounded even for
-`--message` overrides). Truncated bodies keep the same ending after the
-report contract. Managed envelopes take no screen probe and carry no
-correlation.
+`--message` overrides). Managed envelopes take no screen probe and
+carry no correlation.
+
+Criteria are never truncated (CAD-160, ADR-0002 phase 1). Over the
+4000-char ceiling the prose gives way — the issue note shrinks to
+` Issue: <ID>.` and the closing `Do not report a SHA…` reminder goes —
+while the spec path, scope, every criterion, the report contract and
+the correlation stay whole. If that still does not fit, `job dispatch`
+refuses with an error naming the ceiling and the spec file, and nothing
+is queued or transitioned. The Devin cloud kickoff applies the same
+rule at the 48000-byte enqueue limit: the inlined spec text is cut
+first, the criteria never.
+
+### Task-bound messages (`send --task`)
+
+`send`/`message send`/`ask --task <task>` to an **open** task (any state
+but `verified`, `done`, `cancelled`, `failed`) is delivered composed, so
+a steering message restates what the worker is still on the hook for
+and cannot read as a replacement (AOS-12):
+
+```
+<sender's text> — Task <task> (job <job>) is still open; this message
+amends it and does not replace it. Objective: <task title, else job
+title, else "implement per spec">. Spec: <spec-path>. Outstanding
+criteria: 1) [ ] "a"; 2) [ ] "b".
+```
+
+The outstanding criteria are the task acceptance's unchecked items in
+the CAD-300 form, renumbered (free-form acceptance is one item; none
+left reads `none`). The stored body — what `message show` prints and
+the adapter pastes — is the composed one. Over the endpoint's ceiling
+(4000 chars for pty, the 48000-byte enqueue limit otherwise) the
+restated objective is cut with `…`; the sender's text and the criteria
+are not, and a body that still cannot fit refuses naming the ceiling
+and the spec file, with nothing queued. No task, or a terminal task:
+the body is the sender's text, byte for byte. `--nudge` takes no
+`--task`, so nudges are never composed.
 
 Managed endpoints get the trailer form instead:
 

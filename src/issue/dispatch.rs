@@ -64,15 +64,10 @@ fn kickoff_body(
     )
 }
 
-/// Most bytes a `--job` task's acceptance listing may take. The
-/// daemon's kickoff inlines the task's acceptance and truncates past
-/// its 4000-char ceiling; staying well under that keeps the listing
-/// whole, and a longer list becomes a pointer instead.
-pub(crate) const JOB_ACCEPTANCE_BUDGET: usize = 2000;
-
 /// CAD-159: an issue's acceptance items on one line when that fits
 /// `budget` bytes, else a pointer to the CAD-238 section-scoped
-/// readback. `None` when there are no items.
+/// readback. `None` when there are no items. Every kickoff passes
+/// `usize::MAX`: CAD-160 never replaces criteria with the pointer.
 ///
 /// CAD-300: each item is numbered and its text is a JSON string
 /// literal — `1) [ ] "a"; 2) [x] "b"` — so text that looks like the
@@ -89,15 +84,7 @@ pub(crate) fn acceptance_listing(
     if items.is_empty() {
         return None;
     }
-    let inline = items
-        .iter()
-        .enumerate()
-        .map(|(i, item)| {
-            let mark = if item.checked { 'x' } else { ' ' };
-            format!("{}) [{mark}] {}", i + 1, quote_item(&item.text))
-        })
-        .collect::<Vec<_>>()
-        .join("; ");
+    let inline = inline_listing(items);
     Some(if inline.len() <= budget {
         inline
     } else {
@@ -107,6 +94,36 @@ pub(crate) fn acceptance_listing(
             items.len()
         )
     })
+}
+
+/// The CAD-300 listing of `items` at any length —
+/// `1) [ ] "a"; 2) [x] "b"`, numbered from 1.
+pub(crate) fn inline_listing(items: &[AcceptanceItem]) -> String {
+    items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let mark = if item.checked { 'x' } else { ' ' };
+            format!("{}) [{mark}] {}", i + 1, quote_item(&item.text))
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// CAD-160: the still-unchecked criteria in a task's stored
+/// acceptance. A whole CAD-300 listing yields its `[ ]` items; any
+/// other non-blank text (a free-form `--accept`) is one unchecked item.
+pub(crate) fn outstanding_items(acceptance: Option<&str>) -> Vec<AcceptanceItem> {
+    let Some(text) = acceptance.map(str::trim).filter(|t| !t.is_empty()) else {
+        return vec![];
+    };
+    match parse_acceptance_listing(text) {
+        Some((items, "")) => items.into_iter().filter(|i| !i.checked).collect(),
+        _ => vec![AcceptanceItem {
+            text: text.to_string(),
+            checked: false,
+        }],
+    }
 }
 
 /// `text` as a JSON string literal that is also safe on one pty line:
@@ -178,20 +195,84 @@ fn acceptance_warning(issue: &str, dispatched: bool) -> String {
     )
 }
 
-/// The plain-path kickoff with the issue's acceptance appended as
-/// ` Acceptance: <listing>.` — inline when it fits the 4000-char
-/// body limit, else the readback pointer. When even the pointer does
-/// not fit (CAD-300), the body goes out without the clause rather than
-/// being refused; the dispatch JSON still carries the items.
+/// The plain-path kickoff with every one of the issue's acceptance
+/// items appended as ` Acceptance: <listing>.` — never a pointer, never
+/// cut (CAD-160). [`plain_kickoff`] fits the result to the pty ceiling.
 fn with_acceptance(body: String, issue: &str, items: &[AcceptanceItem]) -> String {
-    const FRAME: usize = " Acceptance: .".len();
-    let budget = 4000usize.saturating_sub(body.len() + FRAME);
-    match acceptance_listing(issue, items, budget) {
-        Some(listing) if body.len() + FRAME + listing.len() <= 4000 => {
-            format!("{body} Acceptance: {listing}.")
-        }
-        _ => body,
+    match acceptance_listing(issue, items, usize::MAX) {
+        Some(listing) => format!("{body} Acceptance: {listing}."),
+        None => body,
     }
+}
+
+/// CAD-160: the plain kickoff fitted to the pty ceiling. Prose gives
+/// way — the title (or `--summary`) is shortened and ends in `…` — and
+/// the acceptance items never do. When they cannot fit even with the
+/// title cut to nothing, the dispatch refuses naming the ceiling and
+/// the note; it runs before `issue start`, so nothing is created.
+#[allow(clippy::too_many_arguments)]
+fn plain_kickoff(
+    issue: &str,
+    title: &str,
+    note: &Path,
+    wt_dir: &Path,
+    branch: &str,
+    base_sha: &str,
+    reply_to: &str,
+    items: &[AcceptanceItem],
+) -> Result<String> {
+    const CUT: &str = "…";
+    let build = |title: &str| {
+        with_acceptance(
+            kickoff_body(issue, title, note, wt_dir, branch, base_sha, reply_to),
+            issue,
+            items,
+        )
+    };
+    let full = build(title);
+    let over = full.len().saturating_sub(pty::MAX_BODY);
+    if over == 0 {
+        return Ok(full);
+    }
+    if let Some(keep) = title.len().checked_sub(over + CUT.len()) {
+        let mut end = keep;
+        while !title.is_char_boundary(end) {
+            end -= 1;
+        }
+        return Ok(build(&format!("{}{CUT}", &title[..end])));
+    }
+    let criteria = acceptance_listing(issue, items, usize::MAX).unwrap_or_default();
+    Err(Error::rejected(format!(
+        "{issue}'s acceptance criteria ({} bytes) do not fit the {}-char pty kickoff \
+         ceiling even with the title cut — criteria are never truncated or dropped \
+         (CAD-160). Shorten them (`cadence issue acceptance {issue} --from <file>`) \
+         and keep the detail in the note {}. Nothing was created or queued.",
+        criteria.len(),
+        pty::MAX_BODY,
+        note.display()
+    )))
+}
+
+/// CAD-160: a `--job` dispatch whose acceptance items alone exceed the
+/// pty ceiling can never be kicked off whole — refuse it before `issue
+/// start` creates anything. (A list that fits alone but not beside the
+/// kickoff's fixed fields is refused by `job dispatch`, nothing queued.)
+fn check_job_acceptance(issue: &str, items: &[AcceptanceItem], spec: &Path) -> Result<()> {
+    let Some(listing) = acceptance_listing(issue, items, usize::MAX) else {
+        return Ok(());
+    };
+    if listing.len() < pty::MAX_BODY {
+        return Ok(());
+    }
+    Err(Error::rejected(format!(
+        "{issue}'s acceptance criteria alone are {} bytes — over the {}-char pty kickoff \
+         ceiling; criteria are never truncated or dropped (CAD-160). Shorten them \
+         (`cadence issue acceptance {issue} --from <file>`) and keep the detail in the \
+         spec file {}. Nothing was created or queued.",
+        listing.len(),
+        pty::MAX_BODY,
+        spec.display()
+    )))
 }
 
 /// The same rules the pty endpoint enforces pre-write: 1–4000 chars,
@@ -199,7 +280,7 @@ fn with_acceptance(body: String, issue: &str, items: &[AcceptanceItem]) -> Strin
 /// provider's TUI treats as a command. Checked here so a bad body
 /// refuses before `issue start` creates anything.
 fn check_body(body: &str, provider: &str) -> Result<()> {
-    if body.is_empty() || body.len() > 4000 {
+    if body.is_empty() || body.len() > pty::MAX_BODY {
         return Err(Error::rejected("Dispatch body must be 1–4000 characters"));
     }
     if pty::has_control_chars(body) {
@@ -353,16 +434,15 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
         let (wt_name, branch) = start::names(&front.id, &front.title, args.name.as_deref())?;
         let wt_dir = root.join(".cadence").join("wt").join(&wt_name);
         let summary = args.summary.as_deref().unwrap_or(&front.title);
-        let body = with_acceptance(
-            kickoff_body(
-                &front.id, summary, &note, &wt_dir, &branch, &base_sha, &reply_to,
-            ),
-            &front.id,
-            &items,
-        );
+        let body = plain_kickoff(
+            &front.id, summary, &note, &wt_dir, &branch, &base_sha, &reply_to, &items,
+        )?;
         check_body(&body, &provider)?;
         Some(body)
     } else {
+        if let Some(spec) = &args.job_spec {
+            check_job_acceptance(&front.id, &items, spec)?;
+        }
         None
     };
 
@@ -388,19 +468,16 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
     let body = body
         .map(|_| {
             let summary = args.summary.as_deref().unwrap_or(&front.title);
-            let body = with_acceptance(
-                kickoff_body(
-                    &front.id,
-                    summary,
-                    &note,
-                    Path::new(started["worktree"].as_str().unwrap_or_default()),
-                    started["branch"].as_str().unwrap_or_default(),
-                    started["base"]["sha"].as_str().unwrap_or_default(),
-                    &reply_to,
-                ),
+            let body = plain_kickoff(
                 &front.id,
+                summary,
+                &note,
+                Path::new(started["worktree"].as_str().unwrap_or_default()),
+                started["branch"].as_str().unwrap_or_default(),
+                started["base"]["sha"].as_str().unwrap_or_default(),
+                &reply_to,
                 &items,
-            );
+            )?;
             check_body(&body, &provider).map(|_| body)
         })
         .transpose()?;
@@ -773,13 +850,17 @@ mod tests {
         assert_eq!(rest, ".", "{body}");
     }
 
-    /// CAD-300 (QA R3): when even the pointer would push the kickoff
-    /// past the pty limit, the kickoff is sent without the acceptance
-    /// clause rather than refused — the JSON still carries the items.
+    /// CAD-160 (replaces CAD-300 QA R3's "sent without the clause"):
+    /// a near-limit `--summary` is prose, so it gives way — shortened,
+    /// ending in `…` — and every acceptance item goes out whole.
     #[test]
-    fn pointer_that_does_not_fit_leaves_the_kickoff_unchanged() {
+    fn long_summary_gives_way_to_whole_criteria() {
         let summary = "s".repeat(3800);
-        let body = kickoff_body(
+        let items = vec![AcceptanceItem {
+            text: "y".repeat(200),
+            checked: false,
+        }];
+        let body = plain_kickoff(
             "D-1",
             &summary,
             Path::new("/tmp/note.md"),
@@ -787,13 +868,17 @@ mod tests {
             "cadence/d-1-title",
             "0123456789abcdef",
             "pm",
-        );
+            &items,
+        )
+        .unwrap();
         check_body(&body, "fake").unwrap();
-        let items = vec![AcceptanceItem {
-            text: "y".repeat(200),
-            checked: false,
-        }];
-        assert_eq!(with_acceptance(body.clone(), "D-1", &items), body);
+        assert!(body.len() <= pty::MAX_BODY, "{} bytes", body.len());
+        assert!(body.contains("D-1: sss"), "{body}");
+        assert!(body.contains("s…. Your worktree exists"), "{body}");
+        assert!(
+            body.ends_with(&format!(" Acceptance: 1) [ ] \"{}\".", "y".repeat(200))),
+            "{body}"
+        );
     }
 
     /// CAD-300 (QA R4): a duplicate run dispatched nothing, so its
@@ -812,26 +897,68 @@ mod tests {
         }
     }
 
-    /// A list too long for the budget becomes a pointer to the
-    /// CAD-238 readback, and the kickoff stays within the pty limit.
+    /// CAD-160 (replaces the CAD-159 readback pointer): a list that
+    /// cannot fit whole refuses — plain and `--job` alike — naming the
+    /// ceiling and the note or spec file; it is never replaced by a
+    /// pointer. Both checks run before `issue start`.
     #[test]
-    fn oversized_acceptance_points_at_the_readback() {
+    fn criteria_that_cannot_fit_refuse_naming_ceiling_and_file() {
         let items: Vec<AcceptanceItem> = (0..60)
             .map(|i| AcceptanceItem {
                 text: format!("criterion {i} {}", "x".repeat(80)),
                 checked: false,
             })
             .collect();
-        let pointer = acceptance_listing("D-1", &items, JOB_ACCEPTANCE_BUDGET).unwrap();
-        assert!(
-            pointer.starts_with("60 items") && pointer.contains("cadence issue show D-1 --json"),
-            "{pointer}"
-        );
-        let body = with_acceptance(kickoff(), "D-1", &items);
-        assert!(
-            body.ends_with(&format!(" Acceptance: {pointer}.")),
-            "{body}"
-        );
-        check_body(&body, "fake").unwrap();
+        let err = plain_kickoff(
+            "D-1",
+            "Title",
+            Path::new("/tmp/note.md"),
+            Path::new("/r/.cadence/wt/d-1-title"),
+            "cadence/d-1-title",
+            "0123456789abcdef",
+            "pm",
+            &items,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("4000-char"), "{err}");
+        assert!(err.contains("note /tmp/note.md"), "{err}");
+        assert!(err.contains("Nothing was created or queued"), "{err}");
+        let err = check_job_acceptance("D-1", &items, Path::new("/tmp/spec.md"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("4000-char"), "{err}");
+        assert!(err.contains("spec file /tmp/spec.md"), "{err}");
+        // A list that fits alone passes the `--job` pre-check.
+        check_job_acceptance("D-1", &items[..10], Path::new("/tmp/spec.md")).unwrap();
+    }
+
+    /// CAD-160: the outstanding criteria of a stored task acceptance.
+    #[test]
+    fn outstanding_items_keep_only_unchecked_criteria() {
+        let items = vec![
+            AcceptanceItem {
+                text: "a; 2) [ ] \"b\"".into(),
+                checked: false,
+            },
+            AcceptanceItem {
+                text: "done".into(),
+                checked: true,
+            },
+        ];
+        let listing = inline_listing(&items);
+        assert_eq!(outstanding_items(Some(&listing)), items[..1].to_vec());
+        // Free-form text, or a listing with trailing prose, is one item.
+        for text in ["green tests", &format!("{listing} and more")] {
+            assert_eq!(
+                outstanding_items(Some(text)),
+                vec![AcceptanceItem {
+                    text: text.to_string(),
+                    checked: false
+                }]
+            );
+        }
+        assert!(outstanding_items(None).is_empty());
+        assert!(outstanding_items(Some("  ")).is_empty());
     }
 }
