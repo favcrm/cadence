@@ -43,3 +43,10 @@ regex = "1"
 
 [dev-dependencies]
 shlex = "2.0.1"
+
+# Lanes build privately (CAD-174: a shared target let one lane overwrite
+# another's `libcadence_agent` mid-run), so every lane pays for its own
+# target dir. Incremental state is half of that — 1.3-2.3G a lane — and
+# is only worth it for repeated edit-rebuild cycles of this one crate.
+[profile.dev]
+incremental = false
