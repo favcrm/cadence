@@ -1804,6 +1804,44 @@ impl Store {
         Ok(())
     }
 
+    /// One alert after held-recovery gives up. The agent stays unfenced
+    /// and the held message is not replayed. A second call is a no-op.
+    pub fn escalate_cloud_hold(&self, message: &Message, reason: &str) -> Result<()> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let already: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM events WHERE alias=?1 AND kind='cloud_recover_escalated'",
+            [&message.alias],
+            |row| row.get(0),
+        )?;
+        if already == 0 {
+            Self::event(
+                &tx,
+                &message.alias,
+                "cloud_recover_escalated",
+                json!({
+                    "reason": reason,
+                    "fenced": false,
+                    "message": message.id,
+                }),
+            )?;
+            self.route_notice(
+                &tx,
+                message,
+                "cloud_recover_escalated",
+                &json!({
+                    "status": "unknown",
+                    "text": "",
+                    "held": true,
+                    "escalated": true,
+                    "error": reason,
+                }),
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Standalone event insert for runtime/daemon bookkeeping.
     pub fn event_public(&self, alias: &str, kind: &str, payload: Value) -> Result<()> {
         let conn = self.conn();
@@ -3043,6 +3081,12 @@ impl Store {
                 )
             } else {
                 match kind {
+                    "cloud_recover_escalated" => format!(
+                        "A Devin cloud worker stopped polling a held turn after repeated \
+                         failures. The worker is not fenced and the queued work was not \
+                         replayed. This is an informational notice, not a result; do not \
+                         treat it as worker output. {payload}"
+                    ),
                     "interrupted" => format!(
                 "An operator closed a managed worker's turn as interrupted — the outcome was \
                  never learned. This is an informational notice, not a result; do not treat it \
@@ -4669,6 +4713,7 @@ impl Store {
                 | "approval_menu"
                 | "draft_pending"
                 | "cloud_hold"
+                | "cloud_recover_escalated"
         )
     }
 
@@ -6402,7 +6447,7 @@ fn flatten_controls(text: &str) -> String {
 
 /// Drop absolute host paths so a cloud session is not pointed at a
 /// machine-local file. `https://` URLs are left intact.
-fn omit_host_paths(text: &str) -> String {
+pub fn omit_host_paths(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(index) = rest.find('/') {
@@ -6428,12 +6473,16 @@ fn omit_host_paths(text: &str) -> String {
     out
 }
 
-fn take_chars(text: &str, limit: usize) -> String {
-    if text.chars().count() <= limit {
+/// Inlined cloud spec text. Real dispatch specs run past 5k characters,
+/// so the cap sits above that. A cut spec says so in the prompt.
+const CLOUD_SPEC_CHARS: usize = 16_000;
+
+fn take_spec_chars(text: &str) -> String {
+    if text.chars().count() <= CLOUD_SPEC_CHARS {
         return text.to_string();
     }
-    let mut out: String = text.chars().take(limit).collect();
-    out.push('…');
+    let mut out: String = text.chars().take(CLOUD_SPEC_CHARS).collect();
+    out.push_str("… (spec text truncated; the inlined copy is incomplete)");
     out
 }
 
@@ -6443,7 +6492,7 @@ fn cloud_kickoff_body(job: &Job, task: &Task, revision: i64) -> String {
     let spec = task.spec_path.as_deref().unwrap_or(job.spec_path.as_str());
     let raw = std::fs::read_to_string(spec)
         .unwrap_or_else(|_| "(spec text was not available to inline)".to_string());
-    let spec_text = take_chars(&omit_host_paths(&flatten_controls(&raw)), 2400);
+    let spec_text = take_spec_chars(&omit_host_paths(&flatten_controls(&raw)));
     let mut scope = String::new();
     if let Some(branch) = &task.branch {
         scope.push_str(&format!(" branch {}", flatten_controls(branch)));
@@ -7911,6 +7960,7 @@ mod tests {
     #[test]
     fn cloud_hold_is_a_monitor_alert() {
         assert!(Store::monitor_alert_kind("cloud_hold"));
+        assert!(Store::monitor_alert_kind("cloud_recover_escalated"));
     }
 
     #[test]
@@ -7988,6 +8038,58 @@ mod tests {
         assert!(!body.contains(&spec.display().to_string()), "{body}");
         assert!(!body.contains(&worktree.display().to_string()), "{body}");
         assert!(!body.contains("cadence self"), "{body}");
+    }
+
+    #[test]
+    fn cloud_kickoff_states_when_the_spec_is_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = dir.path().join("spec.md");
+        let mut raw = "S".repeat(CLOUD_SPEC_CHARS);
+        raw.push_str("UNIQUE_TAIL_MARKER");
+        std::fs::write(&spec, &raw).unwrap();
+        let job = Job {
+            id: "j1".into(),
+            title: None,
+            spec_path: spec.display().to_string(),
+            spec_sha256: None,
+            pm_alias: "pm".into(),
+            issue_id: None,
+            repo: None,
+            base_ref: None,
+            state: "open".into(),
+            max_revisions: 2,
+            stall_secs: None,
+            error: None,
+            created: 0.0,
+            updated: 0.0,
+        };
+        let task = Task {
+            id: "t1".into(),
+            job_id: "j1".into(),
+            title: None,
+            role: "worker".into(),
+            assignee: Some("cloud-1".into()),
+            spec_path: Some(spec.display().to_string()),
+            acceptance: None,
+            worktree: None,
+            branch: None,
+            base_sha: None,
+            head_sha: None,
+            state: "draft".into(),
+            revision: 0,
+            dispatch_message: None,
+            error: None,
+            created: 0.0,
+            updated: 0.0,
+        };
+        let body = cloud_kickoff_body(&job, &task, 1);
+        assert!(
+            body.contains("spec text truncated; the inlined copy is incomplete"),
+            "{body}"
+        );
+        assert!(!body.contains("UNIQUE_TAIL_MARKER"), "{body}");
+        assert!(body.contains("SHA:"), "{body}");
+        assert!(!body.contains(&spec.display().to_string()), "{body}");
     }
 
     #[test]

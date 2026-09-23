@@ -18,6 +18,7 @@ pub const CLOUD_SECRET_ENV: &[&str] = &[
     "CADENCE_DEVIN_API_BASE",
     "CADENCE_DEVIN_POLL_INTERVAL_MS",
     "CADENCE_DEVIN_POLL_BUDGET_MS",
+    "CADENCE_DEVIN_RECOVER_BUDGET_MS",
 ];
 
 /// `env -u` arguments that drop [`CLOUD_SECRET_ENV`] before a pane command.
@@ -130,6 +131,15 @@ pub struct TurnResult {
     pub error: Option<String>,
 }
 
+/// Outcome of one held-recovery poll.
+pub enum SettledPoll {
+    /// The remote session reached a terminal outcome for this turn.
+    Ready(TurnResult),
+    /// Still working, or the poll could not be learned. `transient` is a
+    /// 429, 5xx, or transport error; the caller backs off.
+    Pending { transient: bool },
+}
+
 /// Screen-probe verdict for terminal endpoints: what the pane shows
 /// right now, reduced to the facts the gate needs. `reason` names the
 /// first condition that makes the pane not-idle (or "idle").
@@ -201,11 +211,20 @@ pub trait ProviderAdapter: Send + Sync {
         client_message_id: &str,
         on_started: &dyn Fn(&str),
     ) -> Result<TurnResult>;
-    /// One poll after a held cloud turn. `Ok(None)` means the session is
-    /// still working or the poll failed transiently. The default is no
-    /// recovery.
-    fn poll_settled(&self) -> Result<Option<TurnResult>> {
-        Ok(None)
+    /// One poll after a held cloud turn. `Pending` means keep waiting.
+    /// `transient` is a 429, 5xx, or transport error. The default never
+    /// settles.
+    fn poll_settled(&self) -> Result<SettledPoll> {
+        Ok(SettledPoll::Pending { transient: false })
+    }
+    /// Minimum gap between held-recovery polls. Cloud uses its poll interval.
+    fn poll_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(1)
+    }
+    /// How long held-recovery may keep polling before it escalates once
+    /// and stops. Cloud reads `CADENCE_DEVIN_RECOVER_BUDGET_MS`.
+    fn recover_budget(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(30 * 60)
     }
     /// Answer a pending provider request (approval/user input).
     fn respond(&self, request_id: &Value, result: Value) -> Result<()>;

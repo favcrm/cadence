@@ -26,7 +26,8 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::adapter::{
-    self, registry, AdapterHooks, Probe, ProviderAdapter, ProviderEnv, ProviderRequest, TurnResult,
+    self, registry, AdapterHooks, Probe, ProviderAdapter, ProviderEnv, ProviderRequest,
+    SettledPoll, TurnResult,
 };
 use crate::client;
 use crate::error::{Error, Result};
@@ -946,6 +947,10 @@ impl Shared {
         let mut unrendered: u32 = 0;
         let mut unrendered_message: Option<String> = None;
         let mut cloud_held: Option<Box<store::Message>> = None;
+        let mut recover_delay = Duration::from_secs(1);
+        let mut recover_started: Option<Instant> = None;
+        let mut recover_escalated = false;
+        let mut recover_failures: u32 = 0;
         loop {
             if self.closing.load(Ordering::SeqCst) {
                 return Ok(());
@@ -965,8 +970,17 @@ impl Shared {
                 if !self.store.agent(alias)?.enabled {
                     return Ok(());
                 }
-                match adapter.poll_settled() {
-                    Ok(Some(turn)) => {
+                // After the budget, one escalation and no further polls.
+                // The agent stays enabled and the held message is not replayed.
+                if recover_escalated {
+                    ctl.wake.wait_if_unchanged(
+                        ctl.wake.ticket(),
+                        Instant::now() + Duration::from_secs(3600),
+                    );
+                    continue;
+                }
+                let transient = match adapter.poll_settled() {
+                    Ok(SettledPoll::Ready(turn)) => {
                         let status = match turn.status.as_str() {
                             "failed" => "failed",
                             "interrupted" => "interrupted",
@@ -980,17 +994,42 @@ impl Shared {
                         self.store
                             .reconcile(&pending.id, status, note, "cloud_poll", None)?;
                         cloud_held = None;
+                        recover_started = None;
+                        recover_escalated = false;
+                        recover_failures = 0;
                         self.wake();
                         continue;
                     }
-                    Ok(None) | Err(_) => {
-                        ctl.wake.wait_if_unchanged(
-                            ctl.wake.ticket(),
-                            Instant::now() + Duration::from_millis(30),
-                        );
-                        continue;
-                    }
+                    Ok(SettledPoll::Pending { transient }) => transient,
+                    Err(_) => true,
+                };
+                let interval = adapter.poll_interval().max(Duration::from_millis(1));
+                if transient {
+                    recover_failures = recover_failures.saturating_add(1);
+                    recover_delay = recover_delay
+                        .saturating_mul(2)
+                        .clamp(interval, Duration::from_secs(60));
+                } else {
+                    recover_delay = interval;
                 }
+                let started = recover_started.get_or_insert_with(Instant::now);
+                if recover_failures >= 8 || started.elapsed() >= adapter.recover_budget() {
+                    self.store.escalate_cloud_hold(
+                        &pending,
+                        "devin cloud recovery stopped after repeated poll failures",
+                    )?;
+                    recover_escalated = true;
+                    self.wake();
+                    continue;
+                }
+                let ready_at = Instant::now() + recover_delay;
+                while Instant::now() < ready_at {
+                    if self.closing.load(Ordering::SeqCst) {
+                        return Ok(());
+                    }
+                    ctl.wake.wait_if_unchanged(ctl.wake.ticket(), ready_at);
+                }
+                continue;
             }
             // Sample before the empty check. `disconnected` probes the
             // pane before the wait; a `notify_agent` in that gap must
@@ -1194,6 +1233,11 @@ impl Shared {
                                     json!({"reason": error, "fenced": false}),
                                 );
                                 cloud_held = Some(message);
+                                recover_delay =
+                                    adapter.poll_interval().max(Duration::from_millis(1));
+                                recover_started = Some(Instant::now());
+                                recover_escalated = false;
+                                recover_failures = 0;
                                 self.wake();
                             } else {
                                 return self.unknown(alias, &message, &error);
@@ -7168,30 +7212,44 @@ mod tests {
                     }
                     (200, json!({"ok": true}).to_string())
                 } else if method == "GET" && path.contains("/sessions/") {
-                    let n = gets_t.fetch_add(1, Ordering::SeqCst);
-                    if n < 3 {
-                        (500, json!({"error": "transient"}).to_string())
-                    } else {
-                        finished_t.store(true, Ordering::SeqCst);
-                        let messages = if posts_t.load(Ordering::SeqCst) >= 2 {
-                            json!([
-                                {"role": "assistant", "message": format!("done\nSHA: {SHA}")},
-                                {"role": "assistant", "message": "follow-up done"}
-                            ])
-                        } else {
-                            json!([{"role": "assistant", "message": format!("done\nSHA: {SHA}")}])
-                        };
+                    if posts_t.load(Ordering::SeqCst) == 0 {
                         (
                             200,
                             json!({
                                 "session_id": "devin-created",
                                 "status": "running",
-                                "status_detail": "finished",
+                                "status_detail": "working",
                                 "url": "https://app.devin.ai/sessions/devin-created",
-                                "messages": messages,
+                                "messages": [],
                             })
                             .to_string(),
                         )
+                    } else {
+                        let n = gets_t.fetch_add(1, Ordering::SeqCst);
+                        if n < 3 {
+                            (500, json!({"error": "transient"}).to_string())
+                        } else {
+                            finished_t.store(true, Ordering::SeqCst);
+                            let messages = if posts_t.load(Ordering::SeqCst) >= 2 {
+                                json!([
+                                    {"role": "assistant", "message": format!("done\nSHA: {SHA}")},
+                                    {"role": "assistant", "message": "follow-up done"}
+                                ])
+                            } else {
+                                json!([{"role": "assistant", "message": format!("done\nSHA: {SHA}")}])
+                            };
+                            (
+                                200,
+                                json!({
+                                    "session_id": "devin-created",
+                                    "status": "running",
+                                    "status_detail": "finished",
+                                    "url": "https://app.devin.ai/sessions/devin-created",
+                                    "messages": messages,
+                                })
+                                .to_string(),
+                            )
+                        }
                     }
                 } else {
                     (200, json!({"ok": true}).to_string())
@@ -7341,6 +7399,220 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         assert!(!early_post.load(Ordering::SeqCst));
+        shared.store.set_enabled("cloud-1", false).unwrap();
+        shared.begin_closing();
+        let handle = {
+            let lc = shared.lifecycle.lock().unwrap();
+            lc.agents
+                .get("cloud-1")
+                .and_then(|ctl| ctl.thread.lock().unwrap().take())
+        };
+        if let Some(ctl) = shared.lifecycle.lock().unwrap().agents.get("cloud-1") {
+            ctl.wake.notify_all();
+        }
+        if let Some(handle) = handle {
+            let _ = handle.join();
+        }
+        stop.store(true, Ordering::SeqCst);
+        let _ = thread.join();
+    }
+
+    #[test]
+    fn cloud_hold_recovery_backs_off_and_escalates_once() {
+        use std::sync::atomic::AtomicUsize;
+
+        let gets = Arc::new(AtomicUsize::new(0));
+        let posts = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_ip().unwrap();
+        let gets_t = Arc::clone(&gets);
+        let posts_t = Arc::clone(&posts);
+        let stop_t = Arc::clone(&stop);
+        let thread = thread::spawn(move || {
+            while !stop_t.load(Ordering::SeqCst) {
+                let mut req = match server.recv_timeout(Duration::from_millis(50)) {
+                    Ok(Some(req)) => req,
+                    _ => continue,
+                };
+                let path = req.url().to_string();
+                let method = req.method().as_str().to_string();
+                let mut body = String::new();
+                let _ = req.as_reader().read_to_string(&mut body);
+                let (status, payload): (u16, String) = if path.contains("/repositories") {
+                    (
+                        200,
+                        json!({"repositories": [{"name": "cadence", "owner": "favcrm"}]})
+                            .to_string(),
+                    )
+                } else if method == "POST" && path.ends_with("/sessions") {
+                    (
+                        200,
+                        json!({
+                            "session_id": "devin-created",
+                            "status": "running",
+                            "status_detail": "working",
+                            "url": "https://app.devin.ai/sessions/devin-created"
+                        })
+                        .to_string(),
+                    )
+                } else if method == "POST" && path.contains("/messages") {
+                    posts_t.fetch_add(1, Ordering::SeqCst);
+                    (200, json!({"ok": true}).to_string())
+                } else if method == "GET" && path.contains("/sessions/") {
+                    gets_t.fetch_add(1, Ordering::SeqCst);
+                    if posts_t.load(Ordering::SeqCst) == 0 {
+                        (
+                            200,
+                            json!({
+                                "session_id": "devin-created",
+                                "status": "running",
+                                "status_detail": "working",
+                                "url": "https://app.devin.ai/sessions/devin-created",
+                                "messages": [],
+                            })
+                            .to_string(),
+                        )
+                    } else {
+                        (429, json!({"error": "slow down"}).to_string())
+                    }
+                } else {
+                    (200, json!({"ok": true}).to_string())
+                };
+                let _ =
+                    req.respond(tiny_http::Response::from_string(payload).with_status_code(status));
+            }
+        });
+        let (dir, shared) = shared();
+        let base = format!("http://{addr}");
+        shared.provider_env.set("CADENCE_DEVIN_API_BASE", &base);
+        shared
+            .provider_env
+            .set("CADENCE_DEVIN_API_KEY", "cog_test_secret_value");
+        shared.provider_env.set("CADENCE_DEVIN_ORG_ID", "org-test");
+        shared
+            .provider_env
+            .set("CADENCE_DEVIN_POLL_INTERVAL_MS", "20");
+        shared
+            .provider_env
+            .set("CADENCE_DEVIN_POLL_BUDGET_MS", "80");
+        shared
+            .provider_env
+            .set("CADENCE_DEVIN_RECOVER_BUDGET_MS", "80");
+        let cwd = dir.path().to_str().unwrap();
+        shared
+            .store
+            .register_agent(&NewAgent {
+                alias: "pm",
+                provider: "fake",
+                endpoint_kind: "managed",
+                role: "pm",
+                cwd,
+                sandbox: "read-only",
+                instructions: None,
+                params: None,
+                team_role: None,
+                model_policy: None,
+            })
+            .unwrap();
+        let params = r#"{"repos":["favcrm/cadence"],"upstream":"pm"}"#;
+        shared
+            .store
+            .register_agent(&NewAgent {
+                alias: "cloud-1",
+                provider: "devin",
+                endpoint_kind: "cloud",
+                role: "worker",
+                cwd,
+                sandbox: "read-only",
+                instructions: None,
+                params: Some(params),
+                team_role: None,
+                model_policy: None,
+            })
+            .unwrap();
+        shared
+            .store
+            .enqueue("cloud-1", "do the held task", Some("pm"), "turn-1", "user")
+            .unwrap();
+        shared
+            .store
+            .enqueue(
+                "cloud-1",
+                "follow-up while the session works",
+                Some("pm"),
+                "follow-up",
+                "user",
+            )
+            .unwrap();
+        shared.launch_actor("cloud-1").unwrap();
+        let started = Instant::now();
+        loop {
+            if started.elapsed() > Duration::from_secs(5) {
+                panic!(
+                    "recovery did not escalate: gets={} posts={} events={:?}",
+                    gets.load(Ordering::SeqCst),
+                    posts.load(Ordering::SeqCst),
+                    shared.store.events("cloud-1", 0, 40).ok()
+                );
+            }
+            let n = shared
+                .store
+                .events("cloud-1", 0, 40)
+                .unwrap()
+                .iter()
+                .filter(|event| event.kind == "cloud_recover_escalated")
+                .count();
+            if n >= 1 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let during = gets.load(Ordering::SeqCst);
+        assert!(
+            during <= 12,
+            "held recovery made {during} session GETs; expected at most 12"
+        );
+        thread::sleep(Duration::from_millis(300));
+        let after = gets.load(Ordering::SeqCst);
+        assert_eq!(
+            after, during,
+            "recovery kept polling after escalation ({during} -> {after})"
+        );
+        let escalations = shared
+            .store
+            .events("cloud-1", 0, 40)
+            .unwrap()
+            .iter()
+            .filter(|event| event.kind == "cloud_recover_escalated")
+            .count();
+        assert_eq!(escalations, 1, "expected one escalation, saw {escalations}");
+        let notices: Vec<_> = shared
+            .store
+            .messages("pm")
+            .unwrap()
+            .into_iter()
+            .filter(|message| message.body.contains("stopped polling"))
+            .collect();
+        assert_eq!(notices.len(), 1, "expected one escalation notice");
+        assert!(notices[0].body.contains("not fenced"));
+        assert!(notices[0].body.contains("not replayed"));
+        let agent = shared.store.agent("cloud-1").unwrap();
+        assert_ne!(agent.state, "attention");
+        assert!(agent.enabled);
+        assert_eq!(
+            shared.store.message("turn-1").unwrap().unwrap().state,
+            "unknown"
+        );
+        assert_eq!(
+            shared.store.message("follow-up").unwrap().unwrap().state,
+            "queued"
+        );
+        assert_eq!(
+            posts.load(Ordering::SeqCst),
+            1,
+            "replayed work into the session"
+        );
         shared.store.set_enabled("cloud-1", false).unwrap();
         shared.begin_closing();
         let handle = {

@@ -4525,7 +4525,12 @@ fn run() -> Result<i32> {
                     turn_idle_secs,
                     turn_max_secs,
                 },
+                // The shared --permission-mode/--bypass flags feed the
+                // devin worker too — its four-mode vocabulary is validated
+                // in provider_launch.
                 devin,
+                // …and the cursor worker — its two-mode vocabulary is
+                // validated in provider_launch the same way.
                 CursorOpts {
                     model: model.clone(),
                     permission_mode,
@@ -6724,7 +6729,13 @@ fn cloud_session_prompt(
     report_line: &str,
 ) -> String {
     let role = instructions
-        .map(|text| format!(" Role instructions: {}.", text.replace(['\n', '\r'], " ")))
+        .map(|text| {
+            let flat = text.replace(['\n', '\r'], " ");
+            format!(
+                " Role instructions: {}.",
+                cadence_agent::store::omit_host_paths(&flat)
+            )
+        })
         .unwrap_or_default();
     format!(
         "Cadence bootstrap: you are '{alias}', reporting to group root '{root}'. \
@@ -7263,13 +7274,12 @@ mod tests {
         let body = cloud_session_prompt(
             "w",
             "pm",
-            Some("Ship the widget from the role file."),
+            Some("Ship the widget. Read /secret/host/role.md before you start."),
             "do the work, then finish",
         );
-        assert!(
-            body.contains("Ship the widget from the role file."),
-            "{body}"
-        );
+        assert!(body.contains("Ship the widget."), "{body}");
+        assert!(body.contains("before you start."), "{body}");
+        assert!(!body.contains("/secret/host/role.md"), "{body}");
         assert!(body.contains("SHA:"), "{body}");
         assert!(!body.contains('/'), "{body}");
         assert!(!body.contains("cadence self"), "{body}");
