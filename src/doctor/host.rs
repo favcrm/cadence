@@ -31,6 +31,7 @@ use serde_json::{json, Value};
 
 use crate::error::Result;
 use crate::proc::run_bounded;
+use crate::worktree::layout;
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(15);
 const GIB: u64 = 1 << 30;
@@ -1743,7 +1744,7 @@ struct Orphan {
 fn deleted_worktree(target: &Path) -> Option<PathBuf> {
     let text = target.to_string_lossy();
     let stripped = text.strip_suffix(" (deleted)").unwrap_or(&text);
-    let in_wt = stripped.contains("/.cadence/wt/") || stripped.ends_with("/.cadence/wt");
+    let in_wt = layout::in_worktrees_dir(stripped);
     let path = PathBuf::from(stripped);
     (in_wt && !path.exists()).then_some(path)
 }
@@ -2534,7 +2535,11 @@ fn probe_pid(pid_dir: &Path, pid: u32, uptime: Option<f64>, scan: &Scan) -> Prob
         .flatten()
     {
         if deleted_worktree(target).is_some() {
-            reasons.push("cwd/exe under a deleted .cadence/wt worktree");
+            reasons.push(concat!(
+                "cwd/exe under a deleted ",
+                layout::worktrees_rel!(),
+                " worktree"
+            ));
             break;
         }
     }
@@ -2562,7 +2567,8 @@ fn probe_pid(pid_dir: &Path, pid: u32, uptime: Option<f64>, scan: &Scan) -> Prob
 fn check_orphans(scan: &Scan) -> Check {
     let name = "orphans";
     let threshold = json!(format!(
-        "warn: any process under a deleted .cadence/wt, or a test binary older than {}s",
+        "warn: any process under a deleted {}, or a test binary older than {}s",
+        layout::WORKTREES_REL,
         scan.thresholds.orphan_min_age_secs
     ));
     let mut orphans = Vec::new();
@@ -4908,14 +4914,14 @@ fn check_worktrees(scan: &Scan) -> Check {
             String::new(),
         );
     };
-    let wt_root = root.join(".cadence/wt");
+    let wt_root = layout::worktrees_dir(&root);
     if !wt_root.is_dir() {
         return check(
             name,
             Level::Ok,
             json!({"skipped": true}),
             threshold,
-            format!("no .cadence/wt under {}", root.display()),
+            format!("no {} under {}", layout::WORKTREES_REL, root.display()),
             String::new(),
         );
     }
@@ -5003,7 +5009,7 @@ pub fn reclaim_plan(scan: &Scan) -> Value {
         return json!({"rows": rows, "reclaimable_bytes": 0, "freed_with_lanes_bytes": 0,
                       "skipped": format!("{} is not inside a git repo", scan.cwd.display())});
     };
-    let wt_root = root.join(".cadence/wt");
+    let wt_root = layout::worktrees_dir(&root);
     // Stale scan first — a stale lane's whole dir is freed by its own
     // row's command, so it must not also emit an informational
     // worktree-target row.

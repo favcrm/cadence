@@ -39,6 +39,7 @@ use crate::error::{Error, Result};
 use crate::issue::model::{self, Front, Ref};
 use crate::issue::{board, project, start, write, Pm};
 use crate::proc::{run_bounded, BoundedError};
+use crate::worktree::layout;
 
 /// Every git/gh probe in this file runs through the bounded runner —
 /// user repos can be slow or locked and finish must not stall.
@@ -349,7 +350,7 @@ fn resolve(pm: &Pm, id: &str, pick: Option<&Path>) -> Result<Resolve> {
     // or adopted) pairs by the branch it actually has checked out, when
     // that value is recorded as an open branch ref (CAD-166).
     let branch = match &wt_name {
-        Some(n) => open_branch(Some(&format!("cadence/{n}")))
+        Some(n) => open_branch(Some(&layout::branch(n)))
             .or_else(|| {
                 let head = checked_out_branch(open_wt.as_deref()?)?;
                 open_branch(Some(&head))
@@ -377,7 +378,7 @@ fn resolve(pm: &Pm, id: &str, pick: Option<&Path>) -> Result<Resolve> {
     // the chosen `<root>/.cadence/wt/<name>` path walked upward, else
     // the first recorded one (closed refs still name the repo).
     let wt_dir = open_wt;
-    let walk = |d: &Path| d.parent()?.parent()?.parent()?.canonicalize().ok();
+    let walk = layout::assumed_root;
     let root = wt_dir
         .as_deref()
         .filter(|d| d.is_dir())

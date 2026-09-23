@@ -1,13 +1,16 @@
 //! `.cadence/wt/<name>` worktree helpers — `cadence devin --worktree`
 //! mints agent checkouts and `cadence issue start` mints issue-bound
 //! ones; both share the same layout (`<root>/.cadence/wt/<name>` on
-//! `cadence/<name>`) and the `.cadence/` ignore rule.
+//! `cadence/<name>`, owned by [`layout`]) and the `.cadence/` ignore
+//! rule.
 
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::issue::{git, project};
 use crate::proto;
+
+pub mod layout;
 
 /// Keep `.cadence/` out of a repo's index: append the entry to its
 /// `.gitignore` when nothing already covers it.
@@ -72,7 +75,7 @@ pub fn create_worktree(base: &Path, name: &str) -> Result<PathBuf> {
             )))
         }
     };
-    let dir = root.join(".cadence").join("wt").join(name);
+    let dir = layout::worktree_dir(&root, name);
     if dir.exists() {
         return Err(Error::rejected(format!(
             "Worktree '{name}' already exists at {} — reuse it with \
@@ -81,7 +84,7 @@ pub fn create_worktree(base: &Path, name: &str) -> Result<PathBuf> {
             dir.display()
         )));
     }
-    let branch = format!("cadence/{name}");
+    let branch = layout::branch(name);
     add(&root, &dir, Some(&branch), "HEAD").map_err(|e| {
         Error::rejected(format!(
             "{e} — if branch '{branch}' already exists, reuse the checkout \

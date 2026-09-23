@@ -472,18 +472,20 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
         }
     }
 
-    // The body is fully determined before `issue start`: `names` +
-    // `resolve_base` are the exact calls start makes — when they
-    // diverge from the recorded refs start refuses rather than
-    // silently reusing, so what is checked here is what would be
-    // sent. `--job` sends the daemon's own kickoff instead, so the
-    // template check is skipped.
+    // The body is fully determined before `issue start`:
+    // `resolve_repo`, `resolve_base` and `resolve_lane` are the calls
+    // start makes, so the lane checked here — the issue's open lane
+    // when it has one (CAD-274), else a fresh one named from
+    // `--name`/the title — is the lane start binds (CAD-388 R2-1). A
+    // lane start would refuse (a `--name` for another slug, several
+    // open lanes, another repo) refuses here, before anything is
+    // created. Plain dispatch checks the template body; `--job` checks
+    // the daemon's own kickoff (`check_job_kickoff`).
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let root = start::resolve_repo(&project, args.repo.as_deref(), &cwd)?;
     let (_base, base_sha) = start::resolve_base(&root, args.base.as_deref())?;
-    let (wt_name, branch) = start::names(&front.id, &front.title, args.name.as_deref())?;
+    let (wt_dir, branch) = start::resolve_lane(&front, args.name.as_deref(), &root)?;
     let body = if args.job_spec.is_none() {
-        let wt_dir = root.join(".cadence").join("wt").join(&wt_name);
         let summary = args.summary.as_deref().unwrap_or(&front.title);
         let body = plain_kickoff(
             &front.id, summary, &note, &wt_dir, &branch, &base_sha, &reply_to, &items,
@@ -492,6 +494,11 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
         Some(body)
     } else {
         if let Some(spec) = &args.job_spec {
+            // `issue start --job` scopes the task to the lane's dir name.
+            let wt_name = wt_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
             check_job_kickoff(&front.id, &items, spec, &wt_name, &branch, &base_sha, agent)?;
         }
         None

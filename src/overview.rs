@@ -2371,7 +2371,7 @@ pub fn overview_with(state_dir: &Path, pm_dir: &Path, opts: &Options) -> Result<
         for v in views {
             status_of.insert(v.issue.front.id.clone(), v.status.clone());
             branch_issue.push((
-                format!("cadence/{}-", v.issue.front.id.to_lowercase()),
+                crate::worktree::layout::issue_branch_prefix(&v.issue.front.id),
                 v.issue.front.id.clone(),
                 v.issue.front.owner.clone(),
             ));
@@ -2389,7 +2389,7 @@ pub fn overview_with(state_dir: &Path, pm_dir: &Path, opts: &Options) -> Result<
             let age = parse_iso(&v.issue.front.created)
                 .map(|c| now - c)
                 .unwrap_or(0);
-            let branch_prefix = format!("cadence/{}-", id.to_lowercase());
+            let branch_prefix = crate::worktree::layout::issue_branch_prefix(id);
             let open_pr = v
                 .issue
                 .front

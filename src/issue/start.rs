@@ -18,7 +18,7 @@ use crate::client;
 use crate::error::{Error, Result};
 use crate::issue::model::{self, Front, Ref};
 use crate::issue::{claim, git, parse, project, write, Pm};
-use crate::{proto, worktree};
+use crate::worktree::{self, layout};
 
 /// Optional M3 job creation: `--job --pm <alias> --spec <file>
 /// [--assignee <alias>]`.
@@ -44,44 +44,6 @@ pub struct StartArgs {
     /// CAD-383 `--take-over <reason>`: start an issue someone else holds
     /// in doing/review; recorded on the issue.
     pub take_over: Option<String>,
-}
-
-/// ASCII-lower `-`-separated slug, ≤32 chars — `New Login Form` →
-/// `new-login-form`. Non-ASCII titles fall back to `work`.
-pub(crate) fn slugify(title: &str) -> String {
-    let mut slug = String::new();
-    let mut dash = false;
-    for c in title.chars() {
-        if c.is_ascii_alphanumeric() {
-            if dash && !slug.is_empty() {
-                slug.push('-');
-            }
-            dash = false;
-            slug.push(c.to_ascii_lowercase());
-        } else {
-            dash = true;
-        }
-    }
-    let slug = slug.chars().take(32).collect::<String>();
-    let slug = slug.trim_end_matches('-');
-    if slug.is_empty() {
-        "work".to_string()
-    } else {
-        slug.to_string()
-    }
-}
-
-/// Derive the worktree name and branch for an issue start — shared by
-/// `dispatch`, which must know the names before anything is created.
-/// Returns `(wt_name, branch)`; the dir is `<root>/.cadence/wt/<wt_name>`.
-pub(crate) fn names(id: &str, title: &str, name: Option<&str>) -> Result<(String, String)> {
-    let slug = match name {
-        Some(name) => proto::identifier(name, "--name")?,
-        None => slugify(title),
-    };
-    let wt_name = format!("{}-{}", id.to_lowercase(), slug);
-    proto::identifier(&wt_name, "Worktree name")?;
-    Ok((wt_name.clone(), format!("cadence/{wt_name}")))
 }
 
 /// The project's declared repo roots, canonicalized.
@@ -195,18 +157,13 @@ pub(crate) fn open_worktrees(front: &Front) -> Vec<PathBuf> {
 }
 
 /// The repo a recorded lane belongs to: through the checkout when it
-/// exists, else the `<root>/.cadence/wt/<name>` layout walked upward.
+/// exists, else the worktree layout walked upward ([`layout::root_of`]).
 /// `None` when neither answers — the caller's resolved repo stands.
 fn lane_root(lane: &Path) -> Option<PathBuf> {
     if lane.is_dir() {
         return worktree::main_root(lane).ok();
     }
-    let wt = lane.parent()?;
-    let cadence = wt.parent()?;
-    if wt.file_name()? != "wt" || cadence.file_name()? != ".cadence" {
-        return None;
-    }
-    cadence.parent()?.canonicalize().ok()
+    layout::root_of(lane)
 }
 
 /// CAD-274: the one open lane an issue already has — `(dir, branch)`.
@@ -226,10 +183,9 @@ fn reuse_lane(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let prefix = format!("{}-", front.id.to_lowercase());
-    let slug = wt_name.strip_prefix(&prefix).unwrap_or(&wt_name);
+    let slug = layout::issue_slug(&front.id, &wt_name);
     if let Some(name) = name {
-        let (want, _) = names(&front.id, &front.title, Some(name))?;
+        let (want, _) = layout::issue_names(&front.id, &front.title, Some(name))?;
         if want != wt_name {
             return Err(Error::rejected(format!(
                 "{id} already has an open worktree '{slug}' at {path} — \
@@ -257,7 +213,7 @@ fn reuse_lane(
             .iter()
             .any(|r| r.kind == "branch" && r.closed != Some(true) && r.path.as_deref() == Some(b))
     };
-    let named = format!("cadence/{wt_name}");
+    let named = layout::branch(&wt_name);
     let branch = if open_branch(&named) {
         named
     } else {
@@ -266,6 +222,40 @@ fn reuse_lane(
             .unwrap_or(named)
     };
     Ok((lane.to_path_buf(), branch))
+}
+
+/// The lane `issue start` binds for `front` in repo `root` — `(dir,
+/// branch)`. The issue's one open worktree ref when it has one (CAD-274,
+/// [`reuse_lane`]), else a fresh [`layout::issue_names`] lane under
+/// `root`; several open refs are ambiguous and refuse, naming them
+/// instead of guessing. `dispatch` calls this same function to predict
+/// the kickoff before `issue start` runs (CAD-388 R2-1), so the two can
+/// never disagree about the names. Reads the tracker front and the
+/// lane's checkout; creates nothing.
+pub(crate) fn resolve_lane(
+    front: &Front,
+    name: Option<&str>,
+    root: &Path,
+) -> Result<(PathBuf, String)> {
+    match open_worktrees(front).as_slice() {
+        [] => {
+            let (wt_name, branch) = layout::issue_names(&front.id, &front.title, name)?;
+            Ok((layout::worktree_dir(root, wt_name), branch))
+        }
+        [lane] => reuse_lane(front, lane, name, root),
+        many => Err(Error::rejected(format!(
+            "{} has {} open worktree refs — refusing to guess which lane \
+             to start:\n  {}\nClose the stale ones with `cadence issue \
+             finish {} --worktree <path>`",
+            front.id,
+            many.len(),
+            many.iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join("\n  "),
+            front.id
+        ))),
+    }
 }
 
 /// `front` with the lane's branch and worktree refs recorded open —
@@ -416,30 +406,9 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
     }
     // CAD-274: an open worktree ref IS the issue's lane — a re-start
     // reuses it (re-applying the cargo target) rather than minting a
-    // second lane from the title. Several open refs are ambiguous:
-    // refuse and name them instead of guessing.
+    // second lane from the title.
     let open = open_worktrees(&front);
-    let (wt_dir, branch) = match open.as_slice() {
-        [] => {
-            let (wt_name, branch) = names(&front.id, &front.title, args.name.as_deref())?;
-            (root.join(".cadence").join("wt").join(wt_name), branch)
-        }
-        [lane] => reuse_lane(&front, lane, args.name.as_deref(), &root)?,
-        many => {
-            return Err(Error::rejected(format!(
-                "{} has {} open worktree refs — refusing to guess which lane \
-                 to start:\n  {}\nClose the stale ones with `cadence issue \
-                 finish {} --worktree <path>`",
-                front.id,
-                many.len(),
-                many.iter()
-                    .map(|p| p.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join("\n  "),
-                front.id
-            )))
-        }
-    };
+    let (wt_dir, branch) = resolve_lane(&front, args.name.as_deref(), &root)?;
     // A reused lane's values come from the tracker and the checkout —
     // never re-record one git would read as an option (CAD-144).
     model::check_ref_value(&branch)?;

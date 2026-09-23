@@ -442,9 +442,13 @@ even so, the dispatch refuses before anything is created, naming the
 ceiling and the note. On the `--job` path the task stores the whole
 listing, and dispatch builds the kickoff `job dispatch` will send (same
 spec path, scope, criteria and report contract, at the assignee's own
-ceiling — 48000 bytes for a Devin cloud session) before `issue start`:
-a list that cannot fit refuses naming the ceiling and the spec file,
-leaving no worktree, branch or job (see JOBS.md). With **no** items, both paths **warn and
+ceiling — 48000 bytes for a Devin cloud session) before `issue start`.
+Its scope is the lane `issue start` will bind, resolved by the same
+function start uses — the issue's open worktree when it has one
+(CAD-274), else one named from `--name` or the title — so a lane
+started earlier under another `--name` is measured as it is (CAD-388
+R2-1). A list that cannot fit refuses naming the ceiling and the spec
+file, leaving no worktree, branch or job (see JOBS.md). With **no** items, both paths **warn and
 still dispatch** (PM decision 2026-09-23, ADR-0002 §8.3 — refusal is a
 follow-up once live issues are backfilled): the warning names the
 issue and `cadence issue acceptance <ID> --from <file>`, prints on
