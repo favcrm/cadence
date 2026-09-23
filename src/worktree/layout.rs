@@ -185,26 +185,81 @@ mod tests {
         assert_eq!(assumed_root(&odd), Some(root));
     }
 
-    /// Non-comment lines of a source file, test modules cut off: a
-    /// `#[cfg(test)]` directly followed by `mod` ends the scan.
+    /// Non-comment lines of a source file with inline test modules
+    /// (`#[cfg(test)]` then `mod … {`, up to its closing brace at the
+    /// same indent — rustfmt's shape) left out. A `#[cfg(test)] mod x;`
+    /// declaration skips nothing: the rest of the file is still scanned.
     fn code_lines(text: &str) -> Vec<(usize, &str)> {
         let lines: Vec<&str> = text.lines().collect();
         let mut out = Vec::new();
-        for (i, line) in lines.iter().enumerate() {
-            let t = line.trim_start();
-            if t == "#[cfg(test)]"
-                && lines
-                    .get(i + 1)
-                    .is_some_and(|n| n.trim_start().starts_with("mod "))
-            {
-                break;
-            }
-            if t.starts_with("//") {
+        let mut skip_to: Option<String> = None;
+        let mut i = 0;
+        while i < lines.len() {
+            let line = lines[i];
+            if let Some(end) = &skip_to {
+                if line == end {
+                    skip_to = None;
+                }
+                i += 1;
                 continue;
             }
-            out.push((i + 1, *line));
+            let t = line.trim_start();
+            if t == "#[cfg(test)]" {
+                if let Some(next) = lines.get(i + 1) {
+                    let n = next.trim_start();
+                    if n.contains("mod ") && n.ends_with('{') {
+                        let indent = &next[..next.len() - n.len()];
+                        skip_to = Some(format!("{indent}}}"));
+                        i += 2;
+                        continue;
+                    }
+                }
+            }
+            if !t.starts_with("//") {
+                out.push((i + 1, line));
+            }
+            i += 1;
         }
+        assert!(skip_to.is_none(), "unterminated inline test module");
         out
+    }
+
+    /// The JSON-RPC notification namespace: `cadence/…` in these exact
+    /// expressions is a method name, not a branch. Only the expression
+    /// is exempt, never the rest of its line.
+    const RPC_METHOD_SITES: [&str; 3] = [
+        "method.strip_prefix(\"cadence/\")",
+        "method.starts_with(\"cadence/\")",
+        "method: format!(\"cadence/{kind}\")",
+    ];
+
+    /// Does a code line compute the layout itself? A `.cadence/wt` or
+    /// `wt` path piece, or a `"cadence/…"` literal that is a prefix to
+    /// build on (`"cadence/"`, however it is then joined) or a format
+    /// string (`"cadence/{n}"`). Whole names such as the RPC
+    /// notification `"cadence/tool_use"` are not layout.
+    fn offends(line: &str) -> bool {
+        let mut code = line.to_string();
+        for site in RPC_METHOD_SITES {
+            code = code.replace(site, "");
+        }
+        let path = code.contains(worktrees_rel!())
+            || ["\"wt\"", "/wt\"", "\"wt/", "/wt/"]
+                .iter()
+                .any(|p| code.contains(p));
+        let branch = code.match_indices("\"cadence/").any(|(at, m)| {
+            let lit = code[at + m.len()..].split('"').next().unwrap_or_default();
+            lit.is_empty() || lit.contains('{')
+        });
+        path || branch
+    }
+
+    fn offenders_in(name: &str, text: &str) -> Vec<String> {
+        code_lines(text)
+            .into_iter()
+            .filter(|(_, line)| offends(line))
+            .map(|(n, line)| format!("{name}:{n}: {}", line.trim()))
+            .collect()
     }
 
     fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -223,9 +278,7 @@ mod tests {
     }
 
     /// CAD-167 acceptance 1: outside this module and tests, no code
-    /// joins `.cadence/wt` or formats a `cadence/<name>` branch itself.
-    /// `cadence/…` strings on a `method` line are JSON-RPC notification
-    /// names (`cadence/tool_use`), not branches.
+    /// joins `.cadence/wt` or builds a `cadence/<name>` branch itself.
     #[test]
     fn no_consumer_computes_the_layout_itself() {
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -236,23 +289,45 @@ mod tests {
         let mut offenders = Vec::new();
         for file in files.iter().filter(|f| **f != me) {
             let text = std::fs::read_to_string(file).unwrap();
-            for (n, line) in code_lines(&text) {
-                let path_join = line.contains(worktrees_rel!()) || line.contains("\"wt\"");
-                let branch_fmt = (line.contains("\"cadence/{") || line.contains("\"cadence/\")"))
-                    && !line.contains("method");
-                if path_join || branch_fmt {
-                    offenders.push(format!(
-                        "{}:{n}: {}",
-                        file.strip_prefix(&src).unwrap().display(),
-                        line.trim()
-                    ));
-                }
-            }
+            let name = file.strip_prefix(&src).unwrap().display().to_string();
+            offenders.extend(offenders_in(&name, &text));
         }
         assert!(
             offenders.is_empty(),
             "call crate::worktree::layout instead:\n{}",
             offenders.join("\n")
         );
+    }
+
+    /// QA qa-pr204 N1–N3: the scan reads past a `#[cfg(test)] mod x;`
+    /// declaration and past an inline test module, the RPC exemption
+    /// covers only its expression, and a bare `"cadence/"` prefix is
+    /// caught however it is joined.
+    #[test]
+    fn layout_scan_has_no_known_holes() {
+        let declared = "#[cfg(test)]\nmod tests;\n\nfn f(n: &str) -> String {\n    \
+                        format!(\"cadence/{n}\")\n}\n";
+        assert_eq!(offenders_in("x.rs", declared).len(), 1, "{declared}");
+        let inline = "fn a() {}\n\n#[cfg(test)]\nmod tests {\n    fn t() {\n        \
+                      let _ = \".cadence/wt\";\n    }\n}\n\nfn b(r: &Path) -> PathBuf {\n    \
+                      r.join(\".cadence/wt\")\n}\n";
+        let found = offenders_in("x.rs", inline);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].starts_with("x.rs:11:"), "{found:?}");
+        for evasion in [
+            "let b = format!(\"cadence/{n}\") + \"\" /* method */;",
+            "let b = \"cadence/\".to_owned() + n;",
+            "let b = String::from(\"cadence/\");",
+            "b.push_str(\"cadence/\");",
+            "let b = concat!(\"cadence/\", \"x\");",
+            "let d = format!(\"{}/wt\", root.display());",
+            "let d = root.join(\".cadence\").join(\"wt\");",
+        ] {
+            assert!(offends(evasion), "{evasion}");
+        }
+        for site in RPC_METHOD_SITES {
+            assert!(!offends(&format!("if {site} {{")), "{site}");
+        }
+        assert!(!offends("self.emit(\"cadence/tool_use\", &json!({}));"));
     }
 }
