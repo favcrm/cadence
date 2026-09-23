@@ -36663,3 +36663,41 @@ fn plan_propose_caps_size() {
     assert!(err.contains("at most 262144 bytes"), "{err}");
     assert!(!f.pm_dir.join("demo/D-1").exists());
 }
+
+/// CAD-360 review round 3: `issue claim` moves backlog/ready into doing,
+/// so it obeys the plan status rule — a claim on a proposed plan's
+/// ticket is refused, the ticket stays in backlog and no commit is
+/// made; the same claim on an ordinary issue works as before, and on
+/// the ticket once the plan is approved.
+#[test]
+fn plan_claim_refused_on_unapproved_ticket() {
+    let f = PlanFixture::start();
+    assert!(f.cli(&["issue", "new", "Loose", "--project", "demo"]).0);
+    f.propose("---\ntitle: P\ngoal: g\n---\n## A\n### Acceptance\n- [ ] a\n")
+        .unwrap();
+    let before = f.commits();
+    let (ok, err) = f.cli(&["issue", "claim", "D-3", "--by", "pm"]);
+    assert!(
+        !ok && err.to_string().contains("plan D-2 is proposed"),
+        "{err}"
+    );
+    assert_eq!(f.front("D-3").status, "backlog");
+    assert!(f.front("D-3").claim.is_none());
+    assert_eq!(f.commits(), before, "a refused claim writes nothing");
+    assert!(!f
+        .pm_dir
+        .join("demo/D-3/comments")
+        .read_dir()
+        .unwrap()
+        .any(|_| true));
+
+    let (ok, out) = f.cli(&["issue", "claim", "D-1", "--by", "pm"]);
+    assert!(ok, "{out}");
+    assert_eq!(f.front("D-1").status, "doing");
+
+    f.d.operator_rpc("plan_approve", json!({"epic": "D-2"}))
+        .unwrap();
+    let (ok, out) = f.cli(&["issue", "claim", "D-3", "--by", "pm"]);
+    assert!(ok, "{out}");
+    assert_eq!(f.front("D-3").status, "doing");
+}
