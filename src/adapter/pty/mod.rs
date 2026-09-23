@@ -172,10 +172,21 @@ pub(crate) fn shlex_quote(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', "'\\''"))
 }
 
+/// Inline markdown markers a TUI may render away when it echoes a
+/// submitted prompt: Claude shows the raw body in its input box but
+/// renders the transcript copy as markdown, so `` `cadence self` ``
+/// comes back as `cadence self` (CAD-282).
+const MARKDOWN_MARKERS: [char; 4] = ['`', '*', '_', '~'];
+
 /// Strip all whitespace so a body wrapped/indented by the TUI still
-/// matches its source text contiguously.
+/// matches its source text contiguously, and the inline markdown
+/// markers so a raw input-box echo and a rendered transcript echo both
+/// match. Applied to the slice and the screen alike, so the count stays
+/// differential.
 fn normalize_screen(text: &str) -> String {
-    text.chars().filter(|c| !c.is_whitespace()).collect()
+    text.chars()
+        .filter(|c| !c.is_whitespace() && !MARKDOWN_MARKERS.contains(c))
+        .collect()
 }
 
 /// The last `n` characters of `text` (by char, not byte).
@@ -1001,9 +1012,10 @@ impl ProviderAdapter for PtyAdapter {
         let before = self.capture_visible()?;
         // The probe slice is the body's normalized tail — the end is
         // what stays visible on a horizontally-scrolled input line and
-        // what a wrapped transcript renders last. Whitespace is stripped
-        // on both sides so TUI line wrapping/indentation cannot hide a
-        // match. For routed `worker_result` bodies the tail covers the
+        // what a wrapped transcript renders last. Whitespace and inline
+        // markdown markers are stripped on both sides so TUI line
+        // wrapping/indentation and a markdown-rendered transcript echo
+        // cannot hide a match. For routed `worker_result` bodies the tail covers the
         // unique worker turn_id; for repeated plain text the
         // occurrence-count delta is still differential.
         let slice = normalize_screen(&tail_chars(prompt, PROBE_SLICE));
@@ -1280,5 +1292,32 @@ mod tests {
         let rendered = "alpha beta\n    gamma delta\n    omega";
         let slice = normalize_screen(&tail_chars(body, 12));
         assert!(normalize_screen(rendered).contains(&slice));
+    }
+
+    /// CAD-282: Claude echoes the raw body in its input box but renders
+    /// the submitted transcript copy as markdown, dropping backticks.
+    /// Both echoes must match the same probe slice, or every body with
+    /// inline code (the join bootstrap) reads as never submitted.
+    #[test]
+    fn markdown_rendered_echo_matches_raw_slice() {
+        let body = "Run `cadence self` for this message's id and turn_id, then report: \
+                    cadence message result <id> --token <turn_id> --text '<summary>'. \
+                    List peers with `cadence agent list`.";
+        let slice = normalize_screen(&tail_chars(body, super::PROBE_SLICE));
+        // Input box before Enter: raw text, backticks intact.
+        let input_box = format!("❯ {body}");
+        // Transcript after Enter (Claude Code 2.1.280 capture, 120 cols):
+        // wrapped, indented, inline code rendered without backticks.
+        let transcript = "❯ Run cadence self for this message's id and turn_id, then report: cadence message \
+                          result <id> --token\n  <turn_id> --text '<summary>'. List peers with cadence agent list.";
+        assert_eq!(normalize_screen(&input_box).matches(&slice).count(), 1);
+        assert_eq!(normalize_screen(transcript).matches(&slice).count(), 1);
+        // Still differential: a screen without the body does not match.
+        assert_eq!(
+            normalize_screen("❯ \n  List peers with cadence")
+                .matches(&slice)
+                .count(),
+            0
+        );
     }
 }
