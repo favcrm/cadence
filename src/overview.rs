@@ -627,7 +627,133 @@ struct Item {
     /// Aliases the row belongs to — `--group` keeps a row when one of
     /// them is a group member.
     agents: Vec<String>,
+    /// Who is responsible for acting on the row (CAD-253): an agent
+    /// row's upstream PM, an issue or PR row's issue owner, a stale
+    /// inbox's owner. `None` — nobody resolvable.
+    owner: Option<String>,
+    /// Set by [`classify_needs`]; a merged row takes its most urgent cause's.
+    audience: Audience,
     json: Value,
+}
+
+/// A team-class needs-me row unhandled this long is the operator's
+/// (CAD-253, operator decision 2026-09-23).
+pub(crate) const ESCALATE_AFTER_SECS: i64 = 60 * 60;
+
+/// Who a needs-me row is for, most urgent first — the derived `Ord`
+/// is the merge order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Audience {
+    /// "Needs your decision".
+    Operator,
+    /// A live owner can act on it.
+    Team,
+    /// Waiting on something outside the fleet (a restart when idle).
+    Dependency,
+    /// Nothing to decide.
+    Info,
+}
+
+impl Audience {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Operator => "operator",
+            Self::Team => "team",
+            Self::Dependency => "dependency",
+            Self::Info => "info",
+        }
+    }
+
+    /// The class a kind starts in. Only `team` rows escalate. An
+    /// unknown kind is team work, so it can still escalate.
+    fn of_kind(kind: &str) -> Self {
+        match kind {
+            "approval" => Self::Operator,
+            "drift" => Self::Dependency,
+            "inbox_unread" | "tracker_behind" => Self::Info,
+            _ => Self::Team,
+        }
+    }
+}
+
+/// Owner liveness from the `agent_list` rows the overview already read.
+struct Owners<'a> {
+    reachable: bool,
+    agents: HashMap<&'a str, &'a Value>,
+}
+
+impl<'a> Owners<'a> {
+    fn new(reachable: bool, agents: &'a [Value]) -> Self {
+        Self {
+            reachable,
+            agents: agents
+                .iter()
+                .filter_map(|a| a["alias"].as_str().map(|alias| (alias, a)))
+                .collect(),
+        }
+    }
+
+    /// Why `owner` cannot act on a row — `None` when a live owner can.
+    fn cannot_act(&self, owner: Option<&str>) -> Option<String> {
+        let Some(owner) = owner.filter(|o| !o.is_empty()) else {
+            return Some("no owner".into());
+        };
+        if owner == inbox::OPERATOR {
+            return Some("owner is the operator".into());
+        }
+        if !self.reachable {
+            return Some(format!("owner {owner} unknown — daemon unreachable"));
+        }
+        let Some(a) = self.agents.get(owner) else {
+            return Some(format!("owner {owner} is absent"));
+        };
+        if a["dead"].as_bool().unwrap_or(false) {
+            return Some(format!("owner {owner} is dead"));
+        }
+        match a["state"].as_str() {
+            Some("attention") => return Some(format!("owner {owner} is fenced")),
+            Some("stopped") => return Some(format!("owner {owner} is stopped")),
+            _ => {}
+        }
+        // A mailbox owner acts only through whoever drains it.
+        if a["inbox_health"]["stale"].as_bool().unwrap_or(false) {
+            return Some(format!("owner {owner} has no inbox consumer"));
+        }
+        None
+    }
+}
+
+/// Resolve every row's `audience` + `audience_reason` (CAD-253). Kinds
+/// already operator-class stay operator; a team row escalates to the
+/// operator when its owner cannot act or it has waited past
+/// `escalate_after` seconds. Runs before [`merge_by_subject`] so each
+/// cause is judged on its own owner and age. The CLI and the board
+/// render this field — neither maps kinds to audiences.
+fn classify_needs(items: &mut [Item], owners: &Owners, escalate_after: i64) {
+    for it in items {
+        let kind = it.json["kind"].as_str().unwrap_or_default();
+        let (audience, reason) = match Audience::of_kind(kind) {
+            Audience::Operator => (Audience::Operator, Some("operator decision".to_string())),
+            Audience::Team => match owners.cannot_act(it.owner.as_deref()) {
+                Some(why) => (Audience::Operator, Some(why)),
+                None if it.age > escalate_after => (
+                    Audience::Operator,
+                    Some(format!("unhandled {}m", it.age / 60)),
+                ),
+                None => (
+                    Audience::Team,
+                    Some(format!(
+                        "owner {} can act",
+                        it.owner.as_deref().unwrap_or("")
+                    )),
+                ),
+            },
+            other => (other, None),
+        };
+        it.audience = audience;
+        it.json["audience"] = json!(audience.as_str());
+        it.json["audience_reason"] = json!(reason);
+    }
 }
 
 fn item(
@@ -652,6 +778,8 @@ fn item(
         }),
         subject: ("row", id),
         agents: Vec::new(),
+        owner: None,
+        audience: Audience::of_kind(kind),
     }
 }
 
@@ -668,6 +796,12 @@ impl Item {
         if !alias.is_empty() && !self.agents.iter().any(|a| a == alias) {
             self.agents.push(alias.to_string());
         }
+        self
+    }
+
+    /// Name who must act on the row (CAD-253 escalation reads it).
+    fn owned_by(mut self, owner: Option<&str>) -> Self {
+        self.owner = owner.filter(|o| !o.is_empty()).map(str::to_string);
         self
     }
 }
@@ -703,15 +837,25 @@ fn merge_by_subject(items: Vec<Item>) -> Vec<Item> {
                     json!({
                         "cause": i.json["kind"], "title": i.json["title"],
                         "age": i.age, "command": i.json["command"],
+                        "audience": i.json["audience"],
                     })
                 })
                 .collect();
             let mut agents: Vec<String> = group.iter().flat_map(|i| i.agents.clone()).collect();
             agents.sort();
             agents.dedup();
+            // The row is for whoever its most urgent cause is for — a
+            // team primary with an escalated cause is the operator's.
+            let urgent = group.iter().min_by_key(|i| i.audience)?;
+            let (audience, reason) = (urgent.audience, urgent.json["audience_reason"].clone());
             let mut primary = group.into_iter().next()?;
             primary.json["causes"] = json!(causes);
             primary.agents = agents;
+            if primary.audience != audience {
+                primary.audience = audience;
+                primary.json["audience"] = json!(audience.as_str());
+                primary.json["audience_reason"] = reason;
+            }
             Some(primary)
         })
         .collect()
@@ -1806,10 +1950,13 @@ fn agent_project(a: &Value, repos: &[(PathBuf, String)]) -> String {
 fn agent_items(a: &Value, probe: &AgentProbe, project: &str, now: i64) -> Vec<Item> {
     let alias = a["alias"].as_str().unwrap_or_default();
     let age = now - a["updated"].as_f64().unwrap_or(now as f64) as i64;
+    // The agent's PM acts on its rows (CAD-253); a root agent has none.
+    let pm = a["params"]["upstream"].as_str();
     let row = |rank: u8, kind: &str, title: &str, age: i64, command: &str| {
         item(rank, kind, title, age, project, None, command)
             .about("agent", alias)
             .for_agent(alias)
+            .owned_by(pm)
     };
     let mut items = Vec::new();
     if a["state"].as_str() == Some("attention") {
@@ -1880,7 +2027,8 @@ fn agent_items(a: &Value, probe: &AgentProbe, project: &str, now: i64) -> Vec<It
             oldest,
             &cmd_inbox(alias),
         )
-        .for_agent(owner);
+        .for_agent(owner)
+        .owned_by(Some(owner));
         stale.json["owner"] = json!(owner);
         items.push(stale);
     }
@@ -2101,7 +2249,8 @@ pub fn overview_with(state_dir: &Path, pm_dir: &Path, opts: &Options) -> Result<
                         &cmd_issue_show(id),
                     )
                     .about("issue", id)
-                    .for_agent(owner),
+                    .for_agent(owner)
+                    .owned_by(Some(owner)),
                 );
             }
             let unblocked = !v.issue.front.blocked_by.is_empty()
@@ -2122,7 +2271,8 @@ pub fn overview_with(state_dir: &Path, pm_dir: &Path, opts: &Options) -> Result<
                         &cmd_issue_set_ready(id),
                     )
                     .about("issue", id)
-                    .for_agent(owner),
+                    .for_agent(owner)
+                    .owned_by(Some(owner)),
                 );
             }
             // `cadence report` intake: a backlog-tagged row surfaces
@@ -2154,7 +2304,8 @@ pub fn overview_with(state_dir: &Path, pm_dir: &Path, opts: &Options) -> Result<
                         &format!("cadence report show {id}"),
                     )
                     .about("issue", id)
-                    .for_agent(owner),
+                    .for_agent(owner)
+                    .owned_by(Some(owner)),
                 );
             }
         }
@@ -2277,7 +2428,8 @@ pub fn overview_with(state_dir: &Path, pm_dir: &Path, opts: &Options) -> Result<
                             ),
                         )
                         .about("pr", &subject)
-                        .for_agent(&owner),
+                        .for_agent(&owner)
+                        .owned_by(Some(&owner)),
                     );
                 }
                 Some("SUCCESS") | Some("FAILURE") | Some("ERROR") => {}
@@ -2292,7 +2444,8 @@ pub fn overview_with(state_dir: &Path, pm_dir: &Path, opts: &Options) -> Result<
                         &format!("gh pr view {n} --repo {slug}"),
                     )
                     .about("pr", &subject)
-                    .for_agent(&owner),
+                    .for_agent(&owner)
+                    .owned_by(Some(&owner)),
                 ),
             }
         }
@@ -2365,6 +2518,11 @@ pub fn overview_with(state_dir: &Path, pm_dir: &Path, opts: &Options) -> Result<
         }
     }
 
+    classify_needs(
+        &mut needs,
+        &Owners::new(daemon.reachable, &daemon.agents),
+        ESCALATE_AFTER_SECS,
+    );
     let mut needs = scope_rows(
         merge_by_subject(needs),
         opts.scope.project.as_deref(),
@@ -2568,6 +2726,197 @@ mod tests {
         assert_eq!(causes, ["inbox_stale", "inbox_unread"]);
         // Attributed to the owner for `--group pm`, and to the inbox.
         assert_eq!(row.agents, ["obs", "pm"]);
+    }
+
+    // ---- CAD-253: needs-me audience from owner liveness and age ----
+
+    /// A fenced worker `w1` whose PM is `pm`, `age` seconds since its
+    /// last state write — the row is pre-aged, no clock involved.
+    fn fenced_worker(now: i64, age: i64) -> Value {
+        json!({
+            "alias": "w1", "provider": "devin", "endpoint_kind": "pty",
+            "state": "attention", "updated": (now - age) as f64,
+            "params": {"upstream": "pm"}, "dead": false,
+        })
+    }
+
+    fn pm_row(dead: bool, state: &str) -> Value {
+        json!({"alias": "pm", "provider": "devin", "endpoint_kind": "pty",
+               "state": state, "dead": dead})
+    }
+
+    /// Classify then merge, the way `overview_with` does.
+    fn resolve(mut rows: Vec<Item>, agents: &[Value]) -> Vec<Value> {
+        classify_needs(&mut rows, &Owners::new(true, agents), ESCALATE_AFTER_SECS);
+        merge_by_subject(rows).into_iter().map(|i| i.json).collect()
+    }
+
+    #[test]
+    fn fenced_agent_with_dead_pm_escalates_to_operator() {
+        let now = 1_000_000;
+        let w1 = fenced_worker(now, 120);
+        let rows = agent_items(&w1, &AgentProbe::default(), "cadence", now);
+        let out = resolve(rows, &[w1.clone(), pm_row(true, "idle")]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["kind"], "fenced");
+        assert_eq!(out[0]["audience"], "operator", "{}", out[0]);
+        assert_eq!(out[0]["audience_reason"], "owner pm is dead");
+    }
+
+    #[test]
+    fn fenced_agent_with_live_pm_stays_team_until_the_threshold() {
+        let now = 1_000_000;
+        let agents = |age| vec![fenced_worker(now, age), pm_row(false, "idle")];
+        let under = agents(ESCALATE_AFTER_SECS - 60);
+        let out = resolve(
+            agent_items(&under[0], &AgentProbe::default(), "cadence", now),
+            &under,
+        );
+        assert_eq!(out[0]["audience"], "team", "{}", out[0]);
+        assert_eq!(out[0]["audience_reason"], "owner pm can act");
+        // The same row, pre-aged past the threshold.
+        let over = agents(ESCALATE_AFTER_SECS + 14 * 60);
+        let out = resolve(
+            agent_items(&over[0], &AgentProbe::default(), "cadence", now),
+            &over,
+        );
+        assert_eq!(out[0]["audience"], "operator", "{}", out[0]);
+        assert_eq!(out[0]["audience_reason"], "unhandled 74m");
+    }
+
+    #[test]
+    fn owner_that_cannot_act_escalates_with_the_reason() {
+        let owners_of = |pm: Option<Value>| {
+            let now = 1_000_000;
+            let w1 = fenced_worker(now, 60);
+            let mut agents = vec![w1.clone()];
+            agents.extend(pm);
+            let out = resolve(agent_items(&w1, &AgentProbe::default(), "", now), &agents);
+            (
+                out[0]["audience"].clone(),
+                out[0]["audience_reason"].clone(),
+            )
+        };
+        assert_eq!(
+            owners_of(Some(pm_row(false, "attention"))),
+            (json!("operator"), json!("owner pm is fenced"))
+        );
+        assert_eq!(
+            owners_of(Some(pm_row(false, "stopped"))),
+            (json!("operator"), json!("owner pm is stopped"))
+        );
+        assert_eq!(
+            owners_of(None),
+            (json!("operator"), json!("owner pm is absent"))
+        );
+        let drained = json!({"alias": "pm", "provider": "inbox", "state": "idle",
+                             "dead": false, "inbox_health": {"stale": true}});
+        assert_eq!(
+            owners_of(Some(drained)),
+            (json!("operator"), json!("owner pm has no inbox consumer"))
+        );
+        // An unreachable daemon cannot vouch for any owner.
+        let mut rows = vec![item(30, "fenced", "t", 1, "", None, "c").owned_by(Some("pm"))];
+        classify_needs(&mut rows, &Owners::new(false, &[]), ESCALATE_AFTER_SECS);
+        assert_eq!(rows[0].json["audience"], "operator");
+    }
+
+    #[test]
+    fn merge_ready_pr_with_live_issue_owner_stays_team() {
+        let owner = json!({"alias": "w9", "provider": "devin", "state": "busy", "dead": false});
+        let pr = item(
+            10,
+            "merge",
+            "PR #7 fix — verdict pass",
+            300,
+            "cadence",
+            None,
+            "c",
+        )
+        .about("pr", "acme/widgets#7")
+        .for_agent("w9")
+        .owned_by(Some("w9"));
+        let out = resolve(vec![pr], &[owner]);
+        assert_eq!(out[0]["audience"], "team", "{}", out[0]);
+        assert_eq!(out[0]["audience_reason"], "owner w9 can act");
+    }
+
+    #[test]
+    fn row_without_a_resolvable_owner_is_the_operators() {
+        let out = resolve(
+            vec![
+                item(90, "ci_red", "main CI failed", 60, "", None, "c").about("ci", "a/b@main"),
+                // An issue with no owner (`owned_by` drops the empty one).
+                item(70, "review_no_pr", "CAD-1", 60, "", None, "c")
+                    .about("issue", "CAD-1")
+                    .owned_by(Some("")),
+                // A root agent — no upstream PM.
+                item(40, "stalled", "w2", 60, "", None, "c").about("agent", "w2"),
+            ],
+            &[],
+        );
+        for row in &out {
+            assert_eq!(row["audience"], "operator", "{row}");
+            assert_eq!(row["audience_reason"], "no owner", "{row}");
+        }
+    }
+
+    #[test]
+    fn kind_class_holds_outside_team_rows() {
+        let old = ESCALATE_AFTER_SECS * 10;
+        let out = resolve(
+            vec![
+                item(20, "approval", "a", 1, "", None, "c").about("agent", "w1"),
+                item(50, "drift", "d", old, "", None, "c").about("deploy", "x"),
+                item(100, "inbox_unread", "i", old, "", None, "c").about("agent", "w2"),
+                item(110, "tracker_behind", "t", old, "", None, "c").about("tracker", "pm"),
+            ],
+            &[],
+        );
+        let got: Vec<(&str, &Value)> = out
+            .iter()
+            .map(|r| (r["audience"].as_str().unwrap(), &r["audience_reason"]))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("operator", &json!("operator decision")),
+                ("dependency", &Value::Null),
+                ("info", &Value::Null),
+                ("info", &Value::Null),
+            ]
+        );
+    }
+
+    /// A merged row is for whoever its most urgent cause is for: a
+    /// fresh approval menu (team) plus an old stall (escalated) on one
+    /// agent is the operator's, and each cause keeps its own audience.
+    #[test]
+    fn merged_row_takes_its_most_urgent_audience() {
+        let pm = pm_row(false, "idle");
+        let rows = vec![
+            item(20, "approval_menu", "menu", 60, "", None, "c")
+                .about("agent", "w1")
+                .owned_by(Some("pm")),
+            item(
+                40,
+                "stalled",
+                "silent",
+                ESCALATE_AFTER_SECS + 60,
+                "",
+                None,
+                "c",
+            )
+            .about("agent", "w1")
+            .owned_by(Some("pm")),
+        ];
+        let out = resolve(rows, &[pm]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["kind"], "approval_menu", "primary stays by rank");
+        assert_eq!(out[0]["audience"], "operator");
+        assert_eq!(out[0]["audience_reason"], "unhandled 61m");
+        assert_eq!(out[0]["causes"][0]["audience"], "team");
+        assert_eq!(out[0]["causes"][1]["audience"], "operator");
     }
 
     #[test]

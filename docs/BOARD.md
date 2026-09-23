@@ -850,23 +850,53 @@ we merged actually running*. `GET /api/overview` derives the whole
 payload at read time — nothing is stored; `cadence overview [--json]
 [--watch <secs>]` renders the same data as an aligned terminal list.
 
-**Needs me** — one row per item, ranked by urgency then age, each with
-`{kind, title, age, project, link, command}`:
+**Needs me** — one row per subject, ranked by urgency then age, each with
+`{kind, title, age, project, link, command, audience, audience_reason}`.
+*Class* is where a kind starts; *Owner* is who must act on it:
 
-| Rank | Kind | Command |
-|---|---|---|
-| 10 | `merge` — open PR with `qa-verdict=success` and green checks | `gh pr merge <n> --repo <slug> --squash --admin --match-head-commit <sha>` |
-| 20 | `approval` — a brokered permission request is open | `cadence agent respond <a> --request <h> --decision accept` (provider input requests: `--answers-file <f>`) |
-| 30 | `fenced` — agent in `attention` | `cadence agent unfence <a>` |
-| 40 | `stalled` — turn silent past the fence threshold | `cadence agent show <a>` |
-| 50 | `drift` — merged commits not running while every pane is idle | `cadence daemon restart --when-idle --ui` |
-| 60 | `pr_no_verdict` — open PR with no `qa-verdict` status | `gh pr view <n> --repo <slug>` |
-| 70 | `review_no_pr` — issue in `review` with no open `pr` ref and no `cadence/<id>-…` PR branch | `cadence issue show <id>` |
-| 80 | `blocked_ready` — every `blocked_by` target is `done` | `cadence issue set <id> status=ready` |
-| 90 | `ci_red` — the newest default-branch SHA with a `ci.yml` verdict failed (`failure`, `timed_out`, `startup_failure`); pending and cancelled SHAs neither raise nor clear it | `gh run view <run> --repo <slug>` |
-| 92 | `ci_unverified` — a default-branch SHA whose `ci.yml` push run was cancelled (or never ran) and no later SHA's own run has passed; clears once one does, while the SHA keeps its label | `gh run rerun <run> --repo <slug>` (cancelled), else `gh run list --repo <slug> --workflow ci.yml --branch <branch>` |
-| 100 | `inbox_unread` — unread messages on an `inbox` endpoint | `cadence inbox <a>` |
-| 110 | `tracker_behind` — tracker repo behind `@{upstream}` | `cadence issue sync` |
+| Rank | Kind | Class | Owner | Command |
+|---|---|---|---|---|
+| 10 | `merge` — open PR with `qa-verdict=success` and green checks | team | the issue owner (`cadence/<id>-…` head branch) | `gh pr merge <n> --repo <slug> --squash --admin --match-head-commit <sha>` |
+| 20 | `approval` — a brokered permission request is open | operator | — | `cadence agent respond <a> --request <h> --decision accept` (provider input requests: `--answers-file <f>`) |
+| 20 | `approval_menu` — a sampled pty approval menu | team | the agent's PM (`params.upstream`) | `cadence agent answer <a> <choice>` |
+| 30 | `fenced` — agent in `attention` | team | the agent's PM | `cadence agent unfence <a>` |
+| 40 | `stalled` — turn silent past the fence threshold | team | the agent's PM | `cadence agent show <a>` |
+| 40 | `silent_end` — turn ended at an idle pane, never reported | team | the agent's PM | `cadence send <a> --ready --text "continue …"` |
+| 50 | `drift` — merged commits not running while every pane is idle | dependency | — | `cadence daemon restart --when-idle --ui` |
+| 60 | `pr_no_verdict` — open PR with no `qa-verdict` status | team | the issue owner | `gh pr view <n> --repo <slug>` |
+| 70 | `review_no_pr` — issue in `review` with no open `pr` ref and no `cadence/<id>-…` PR branch | team | the issue owner | `cadence issue show <id>` |
+| 80 | `blocked_ready` — every `blocked_by` target is `done` | team | the issue owner | `cadence issue set <id> status=ready` |
+| 85 | `intake` — an untriaged `cadence report` | team | the issue owner | `cadence report show <id>` |
+| 90 | `ci_red` — the newest default-branch SHA with a `ci.yml` verdict failed (`failure`, `timed_out`, `startup_failure`); pending and cancelled SHAs neither raise nor clear it | team | none | `gh run view <run> --repo <slug>` |
+| 92 | `ci_unverified` — a default-branch SHA whose `ci.yml` push run was cancelled (or never ran) and no later SHA's own run has passed; clears once one does, while the SHA keeps its label | team | none | `gh run rerun <run> --repo <slug>` (cancelled), else `gh run list --repo <slug> --workflow ci.yml --branch <branch>` |
+| 95 | `inbox_stale` — a mailbox past its unread threshold with no recent read | team | the inbox owner (group root, else `operator`) | `cadence inbox <a>` |
+| 100 | `inbox_unread` — unread messages on an `inbox` endpoint | info | — | `cadence inbox <a>` |
+| 110 | `tracker_behind` — tracker repo behind `@{upstream}` | info | — | `cadence issue sync` |
+
+**Audience** (CAD-253) — `cadence overview` resolves who each row is
+for and both the CLI and the board only render it: "Needs your
+decision" is `audience: operator`, "Team handling" is `team`, then
+`dependency` and `info`. A team-class row escalates to `operator` when
+no live owner can act on it — `audience_reason` says why:
+
+| `audience_reason` | When |
+|---|---|
+| `no owner` | the row names no owner (a root agent, an unowned issue, CI) |
+| `owner is the operator` | the owner is `operator` |
+| `owner <a> is absent` | no registered agent has that alias |
+| `owner <a> is dead` / `is fenced` / `is stopped` | `agent_list` says so (`dead`, state `attention`, state `stopped`) |
+| `owner <a> has no inbox consumer` | the owner is a mailbox with a stale inbox |
+| `owner <a> unknown — daemon unreachable` | liveness cannot be read |
+| `unhandled <n>m` | the owner is live but the row's `age` passed 60 minutes (`ESCALATE_AFTER_SECS`) |
+
+A team row with a live owner inside the hour reads `owner <a> can act`;
+operator-class rows read `operator decision`; `dependency` and `info`
+rows never escalate and carry no reason. A merged row takes its most
+urgent cause's audience (each entry in `causes` keeps its own). The
+age is the row's own `age` — for tracker rows that is the issue's age,
+so an old issue escalates as soon as it surfaces. "Needs your decision"
+always shows, reading "Nothing needs your decision" when no row is the
+operator's.
 
 Both CI rows share one subject, `ci:<slug>@<branch>`, so a red and
 unverified main is one row with two causes. They come from the

@@ -20480,6 +20480,86 @@ fn overview_scope_flags_filter_rows_and_reject_unknown_keys() {
     }
 }
 
+/// CAD-253: `cadence overview --json` carries each needs-me row's
+/// server-resolved audience. A fenced worker whose PM is live stays
+/// team work; one whose PM is itself fenced, and a fenced root agent
+/// with no PM at all, are the operator's — and the plain render groups
+/// them the same way.
+#[test]
+fn overview_needs_me_audience_follows_owner_liveness() {
+    let d = TestDaemon::start();
+    let home = TempDir::new().unwrap();
+    let pm = TempDir::new().unwrap();
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    d.register_inbox("pm");
+    d.register("lead");
+    for (alias, upstream) in [("w1", "pm"), ("w2", "lead")] {
+        d.rpc(
+            "agent_register",
+            json!({"alias": alias, "provider": "fake", "endpoint_kind": "fake",
+                   "cwd": cwd, "params": json!({"upstream": upstream}).to_string()}),
+        )
+        .unwrap();
+    }
+    for w in ["lead", "w1", "w2"] {
+        d.wait_agent(w, "idle", 10);
+        fence_agent(&d, w, &format!("x-{w}"));
+    }
+    let out = overview_cmd(home.path(), &d.state, pm.path(), &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let view: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let row = |alias: &str| -> (String, String) {
+        let r = view["needs_me"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["subject"]["id"] == alias && n["kind"] == "fenced")
+            .unwrap_or_else(|| panic!("no fenced row for {alias}: {view}"));
+        (
+            r["audience"].as_str().unwrap().to_string(),
+            r["audience_reason"].as_str().unwrap().to_string(),
+        )
+    };
+    assert_eq!(row("w1"), ("team".into(), "owner pm can act".into()));
+    assert_eq!(
+        row("w2"),
+        ("operator".into(), "owner lead is fenced".into())
+    );
+    assert_eq!(row("lead"), ("operator".into(), "no owner".into()));
+
+    // The plain render reads the same field: w2 and lead under the
+    // decision, w1 under team handling.
+    let plain = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .arg("overview")
+        .env("HOME", home.path())
+        .env("CADENCE_PM_DIR", pm.path())
+        .env_remove("CADENCE_ALIAS")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&plain.stdout);
+    let decision = text.find("needs your decision").expect("decision section");
+    let team = text.find("team handling").expect("team section");
+    assert!(decision < team, "{text}");
+    let at = |needle: &str| {
+        text.find(needle)
+            .unwrap_or_else(|| panic!("{needle}: {text}"))
+    };
+    for op in ["agent lead fenced", "agent w2 fenced"] {
+        assert!(
+            (decision..team).contains(&at(op)),
+            "{op} not a decision: {text}"
+        );
+    }
+    assert!(at("agent w1 fenced") > team, "w1 is team work: {text}");
+    assert!(!text.contains("nothing needs your decision"), "{text}");
+}
+
 // ==== CAD-251: an inbox nobody drains warns, never refuses ====
 
 /// A mailbox with endpoint params (thresholds, upstream).
