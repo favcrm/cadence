@@ -5186,12 +5186,16 @@ fn pty_send_pastes_literal_and_completes_via_report() {
     assert!(!gen.is_empty());
 
     // A queued message without a readiness claim must not be pasted.
+    // Since CAD-245 the actor takes the send at once, so a fixed sleep
+    // can land while the gate still probes (`submitting`); wait for the
+    // recorded refusal of this message, after which it sits out the
+    // gate back-off as `queued` (CAD-278).
     d.rpc(
         "agent_send",
         json!({"alias": "dv1", "text": "first task", "message": "m1"}),
     )
     .unwrap();
-    thread::sleep(Duration::from_millis(700));
+    d.wait_event_where("dv1", "gate_wait", |e| e["payload"]["message"] == "m1", 20);
     assert_eq!(d.message_state("dv1", "m1"), "queued");
 
     // Operator claim: the head of the FIFO queue (m1) is pasted.
@@ -5207,7 +5211,9 @@ fn pty_send_pastes_literal_and_completes_via_report() {
         json!({"alias": "dv1", "text": tricky, "message": "m2"}),
     )
     .unwrap();
-    thread::sleep(Duration::from_millis(400));
+    // m1's success cleared the gate notice, so m2's refusal records its
+    // own `gate_wait` (CAD-278: this was the 400 ms sleep that failed).
+    d.wait_event_where("dv1", "gate_wait", |e| e["payload"]["message"] == "m2", 20);
     assert_eq!(d.message_state("dv1", "m2"), "queued");
     d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
     let token = pty_token(&d, "dv1", "m2");
