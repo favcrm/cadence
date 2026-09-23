@@ -949,7 +949,7 @@ pub fn propose_native(
         Some(s) => check_slug(s)?,
         None => {
             let base = fact_line(&body);
-            let derived: String = crate::issue::start::slugify(&base)
+            let derived: String = crate::worktree::layout::slugify(&base)
                 .split('-')
                 .filter(|p| !p.is_empty())
                 .collect::<Vec<_>>()

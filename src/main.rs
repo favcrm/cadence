@@ -6383,7 +6383,7 @@ fn verify_worktree(repo: &Path, task: &Value, sha: &str) -> Result<Value> {
         if p.is_absolute() {
             p
         } else {
-            repo.join(".cadence/wt").join(p)
+            cadence_agent::worktree::layout::worktree_dir(repo, p)
         }
     });
     match wt {

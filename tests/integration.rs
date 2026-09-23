@@ -38182,3 +38182,247 @@ fn cad319_refused_thread_send_leaves_no_thread() {
         1
     );
 }
+
+/// CAD-388 R2-1 (CAD-167): `dispatch --job`'s kickoff pre-check measures
+/// the lane `issue start` will actually bind. An issue whose open lane
+/// was started under a `--name` of another length than its title slug
+/// is measured with that lane's names: criteria that fit only beside
+/// the title-slug names refuse before `issue start` (no orphaned job),
+/// and criteria that fit only beside the shorter real names dispatch.
+#[test]
+fn dispatch_job_precheck_measures_the_issues_existing_lane() {
+    let seeded = TempDir::new().unwrap();
+    let state = seeded.path().to_path_buf();
+    {
+        let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
+        let cwd = state.to_str().unwrap().to_string();
+        let member = Some("{\"upstream\":\"pm\"}");
+        for (alias, params, kind) in [("pm", None, "fake"), ("w1", member, "inbox")] {
+            store
+                .register_agent(&NewAgent {
+                    alias,
+                    provider: "fake",
+                    endpoint_kind: kind,
+                    role: "worker",
+                    cwd: &cwd,
+                    sandbox: "read-only",
+                    instructions: None,
+                    params,
+                    team_role: None,
+                    model_policy: None,
+                })
+                .unwrap();
+        }
+    }
+    let d = TestDaemon::start_on(state);
+    let tmp = TempDir::new().unwrap();
+    let (pm_dir, repo, home) = (
+        tmp.path().join("pm"),
+        tmp.path().join("repo"),
+        tmp.path().join("home"),
+    );
+    for dir in [&pm_dir, &repo, &home] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let git = |dir: &Path, args: &[&str]| -> String {
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&o.stderr)
+        );
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    };
+    git(&repo, &["init", "-b", "main"]);
+    git(&repo, &["config", "user.email", "t@t"]);
+    git(&repo, &["config", "user.name", "t"]);
+    std::fs::write(repo.join("f"), "x").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "init"]);
+    let base_sha = git(&repo, &["rev-parse", "HEAD"]);
+    let bin_dir = Path::new(env!("CARGO_BIN_EXE_cadence"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let cli = |args: &[&str]| -> (bool, String) {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+            .arg("--state-dir")
+            .arg(&d.state)
+            .args(args)
+            .env("CADENCE_PM_DIR", &pm_dir)
+            .env("HOME", &home)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin_dir.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env_remove("CADENCE_ALIAS")
+            .output()
+            .unwrap();
+        (
+            out.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )
+    };
+    assert!(cli(&["issue", "init"]).0);
+    let repo_s = repo.canonicalize().unwrap().to_str().unwrap().to_string();
+    assert!(cli(&["issue", "project", "add", "demo", "--prefix", "D", "--repo", &repo_s]).0);
+    // D-1: short title, lane started under a long --name (QA's probe).
+    // D-2, the mirror: long title, lane started under a short --name.
+    let long_name = "l".repeat(58);
+    let long_title = "m".repeat(40);
+    for title in ["T", long_title.as_str()] {
+        assert!(cli(&["issue", "new", title, "--project", "demo"]).0);
+    }
+    for (id, name) in [("D-1", long_name.as_str()), ("D-2", "s")] {
+        let (ok, out) = cli(&[
+            "issue", "start", id, "--name", name, "--owner", "w1", "--by", "pm",
+        ]);
+        assert!(ok, "{out}");
+    }
+    let (spec, _sha) = d.spec_file("spec.md", "lane spec");
+    let spec_canon = Path::new(&spec)
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+
+    // The kickoff `job dispatch` would send for one criterion of `len`
+    // bytes on lane `wt` — the daemon's own builder; None past the
+    // ceiling.
+    let kickoff = |id: &str, wt: &str, len: usize| -> Option<usize> {
+        use cadence_agent::store::{job_kickoff, Job, Task};
+        let job = Job {
+            id: "job-00000000".into(),
+            title: None,
+            spec_path: spec_canon.clone(),
+            spec_sha256: None,
+            pm_alias: String::new(),
+            issue_id: Some(id.into()),
+            repo: None,
+            base_ref: None,
+            state: "open".into(),
+            max_revisions: 0,
+            stall_secs: None,
+            error: None,
+            created: 0.0,
+            updated: 0.0,
+        };
+        let task = Task {
+            id: "job-00000000-t1".into(),
+            job_id: job.id.clone(),
+            title: None,
+            role: "worker".into(),
+            assignee: None,
+            spec_path: None,
+            acceptance: Some(format!("1) [ ] \"{}\"", "x".repeat(len))),
+            worktree: Some(wt.into()),
+            branch: Some(format!("cadence/{wt}")),
+            base_sha: Some(base_sha.clone()),
+            head_sha: None,
+            state: "draft".into(),
+            revision: 0,
+            dispatch_message: None,
+            error: None,
+            created: 0.0,
+            updated: 0.0,
+        };
+        job_kickoff(&job, &task, 1, &"0".repeat(32), "fake", "inbox")
+            .ok()
+            .map(|k| k.len())
+    };
+    // The longest criterion lane `wt`'s kickoff fits (it is monotone
+    // in the criterion's length; the compact form kicks in near the
+    // ceiling, so search rather than extrapolate).
+    let fits_up_to = |id: &str, wt: &str| -> usize {
+        let (mut lo, mut hi) = (1, 8000);
+        assert!(kickoff(id, wt, lo).is_some() && kickoff(id, wt, hi).is_none());
+        while hi - lo > 1 {
+            let mid = (lo + hi) / 2;
+            if kickoff(id, wt, mid).is_some() {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    };
+    let real1 = format!("d-1-{long_name}");
+    let (title1, real2, title2) = ("d-1-t", "d-2-s", format!("d-2-{}", "m".repeat(32)));
+    // Each criterion sits mid-way between what the title-slug lane and
+    // the real lane fit, so the two land on opposite sides of the
+    // ceiling (the band is ~2× the name-length difference wide).
+    let (r1, t1) = (fits_up_to("D-1", &real1), fits_up_to("D-1", title1));
+    assert!(t1 > r1 + 20, "{r1} {t1}");
+    let len1 = (r1 + t1) / 2;
+    let (r2, t2) = (fits_up_to("D-2", real2), fits_up_to("D-2", &title2));
+    assert!(r2 > t2 + 20, "{r2} {t2}");
+    let len2 = (r2 + t2) / 2;
+    for (id, len) in [("D-1", len1), ("D-2", len2)] {
+        let file = tmp.path().join(format!("{id}.md"));
+        std::fs::write(&file, format!("- [ ] {}\n", "x".repeat(len))).unwrap();
+        let (ok, out) = cli(&["issue", "acceptance", id, "--from", file.to_str().unwrap()]);
+        assert!(ok, "{out}");
+    }
+    let note = tmp.path().join("kickoff.md");
+    std::fs::write(&note, "# kickoff").unwrap();
+    let note_s = note.canonicalize().unwrap().to_str().unwrap().to_string();
+    let dispatch = |id: &str| {
+        cli(&[
+            "dispatch",
+            id,
+            "--to",
+            "w1",
+            "--note",
+            &note_s,
+            "--reply-to",
+            "pm",
+            "--job",
+            "--spec",
+            &spec,
+        ])
+    };
+
+    // D-1 refuses before `issue start`: no job, no message, no new lane.
+    let (ok, out) = dispatch("D-1");
+    assert!(!ok, "{out}");
+    assert!(
+        out.contains("4000-char") && out.contains("Nothing was created"),
+        "{out}"
+    );
+    let jobs = d.rpc("job_list", json!({"all": true})).unwrap();
+    assert_eq!(jobs["jobs"], json!([]), "{jobs}");
+    let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
+    assert_eq!(show["messages"], json!([]), "{show}");
+    let lanes = git(
+        &repo,
+        &["branch", "--list", "cadence/*", "--format=%(refname:short)"],
+    );
+    assert_eq!(
+        lanes,
+        format!("cadence/{real1}\ncadence/{real2}"),
+        "no lane minted from the title"
+    );
+
+    // D-2 dispatches on its existing short lane.
+    let (ok, out) = dispatch("D-2");
+    assert!(ok, "{out}");
+    assert!(out.contains(&format!("cadence/{real2}")), "{out}");
+    let jobs = d.rpc("job_list", json!({"all": true})).unwrap();
+    let jobs = jobs["jobs"].as_array().unwrap();
+    assert_eq!(jobs.len(), 1, "{jobs:?}");
+    assert_eq!(jobs[0]["issue"], "D-2", "{jobs:?}");
+}

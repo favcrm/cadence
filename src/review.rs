@@ -1695,7 +1695,7 @@ impl ReviewTree {
     /// already exists (a `--keep` leftover counts — the operator
     /// clears it), then writes the ownership marker.
     fn checkout(root: &Path, name: &str, sha: &str, keep: bool, git_secs: u64) -> Result<Self> {
-        let dir = root.join(".cadence").join("wt").join(name);
+        let dir = worktree::layout::worktree_dir(root, name);
         if dir.exists() {
             return Err(Error::rejected(format!(
                 "review checkout {} already exists — refusing to touch a \
