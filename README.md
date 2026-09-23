@@ -151,6 +151,20 @@ cadence daemon restart          # stop (waits for exit), start, wait for live
 cadence daemon stop             # shutdown + wait for the process to release
                                 #  the state-dir lock — `stop && start` is safe
 
+cadence backup                  # verified online copy of cadence.sqlite3 (VACUUM
+                                #  INTO while the daemon runs, integrity_check,
+                                #  schema) + manifest in <state>/backups; keeps
+                                #  our newest 7 (--dest DIR, --keep N); `cadence
+                                #  upgrade` takes one before every install
+cadence export --bundle b.tar   # portable tar: verified copy + manifest +
+                                #  repo-map.json + briefings; secret-scanned,
+                                #  no provider logs (--pm-dir for the repo map)
+cadence restore b.tar --state-dir DIR  # into an empty state dir only (refuses
+                                #  a running daemon, an existing db, a bad
+                                #  checksum or a newer schema); prints the
+                                #  repo remap plan; also takes a backup's
+                                #  *.manifest.json
+
 cadence review <PR>             # the reviewer's mechanical routine: detached
                                 #  checkout (merge result when the base moved),
                                 #  gates from cadence-review.toml as committed

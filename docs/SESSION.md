@@ -471,8 +471,10 @@ Rules that were learned the hard way (now encoded in the command):
   being empty lets you re-issue the verdict for the new head (through
   `rtk proxy` — the filtered form can print nothing for a real diff,
   CAD-138).
-- **A schema migration gets a rehearsal**: `sqlite3 <live db> ".backup
-  copy.db"`, disable every agent in the copy (`update agents set
+- **A schema migration gets a rehearsal**: `cadence backup --dest
+  /tmp/rehearsal` (a verified online copy, safe while the daemon runs),
+  `cadence restore /tmp/rehearsal/<copy>.manifest.json --state-dir
+  /tmp/r1`, disable every agent in the restored copy (`update agents set
   enabled=0`), open it with the PR binary. The report flags it; the
   rehearsal stays manual.
 - Findings go back as a new kickoff under the same loop id, quoting the
@@ -702,6 +704,35 @@ start the old build again. The restart goes through the CAD-268 rollout
 lease: claim it first with `cadence rollout claim --reason "<why>"
 --target <sha> --as <identity>`. The report carries the restart's
 before/after table and exit code.
+
+**Backup first (CAD-314).** Every `upgrade` that is not `--dry-run`
+takes `cadence backup` before it installs anything (default dest
+`<state>/backups`, keep 7) and puts its manifest under `backup` in the
+report; a failed backup refuses the upgrade. The rollout backup receipt
+still wants a copy outside the state dir taken after the claim: `cadence
+backup --dest <dir outside the state dir>`, then `cadence rollout backup
+--path <that copy>` — the receipt then points at a verified copy instead
+of a hand-made `sqlite3 .backup`.
+
+**Backup, export, restore.** `cadence backup [--dest DIR] [--keep N]`
+snapshots the live database with SQLite `VACUUM INTO`, reopens the copy
+read-only, requires `PRAGMA integrity_check` = ok and the source schema,
+and writes `<copy>.manifest.json` (schema, sha256, build commit,
+created_at, source). Pruning removes only copies one of our manifests
+names. `cadence export --bundle FILE` writes one tar with a verified
+copy, `manifest.json`, `repo-map.json` (project → remote + local path
+from the tracker's project.yaml files) and `briefings/`; every text
+member goes through the secret scanner and a blocking finding refuses
+the export with nothing written. Provider logs are never bundled.
+`cadence restore FILE --state-dir DIR` takes a bundle or a backup
+manifest, refuses a running daemon or any existing `cadence.sqlite3`
+(-wal/-shm) there — there is no force flag; restore into an empty dir or
+move the old database aside — then checks sha256, schema (a newer schema
+than the binary refuses) and integrity, installs the database without
+clobbering, restores briefings that do not exist yet, and prints
+`repo_remap`: each remote with the recorded local path when that checkout
+still has the same origin, else `choose folder`. It never touches the
+tracker repo.
 
 Expected rollout effects after the restart:
 
