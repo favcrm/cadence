@@ -36048,3 +36048,656 @@ fn dispatch_refuses_criteria_past_the_pty_ceiling() {
     let jobs = d.rpc("job_list", json!({"all": true})).unwrap();
     assert_eq!(jobs["jobs"], json!([]), "{jobs}");
 }
+
+/// CAD-359/360 fixture: a tracker with project `demo` (one repo) bound
+/// to a fresh daemon through its own env, and a CLI runner over both.
+struct PlanFixture {
+    d: TestDaemon,
+    tmp: TempDir,
+    pm_dir: PathBuf,
+}
+
+impl PlanFixture {
+    fn start() -> PlanFixture {
+        let tmp = TempDir::new().unwrap();
+        let (pm_dir, repo) = (tmp.path().join("pm"), tmp.path().join("repo"));
+        for sub in ["home", "tmp"] {
+            std::fs::create_dir_all(tmp.path().join(sub)).unwrap();
+        }
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let o = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(o.status.success(), "git {args:?}: {o:?}");
+        };
+        git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("f"), "x").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "init",
+            ],
+        );
+        // The daemon's own env: never the host's ~/pm.
+        test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
+        let f = PlanFixture {
+            d: TestDaemon::start(),
+            tmp,
+            pm_dir,
+        };
+        assert!(f.cli(&["issue", "init"]).0);
+        let repo_s = repo.canonicalize().unwrap().to_str().unwrap().to_string();
+        let (ok, out) = f.cli(&[
+            "issue", "project", "add", "demo", "--prefix", "D", "--repo", &repo_s,
+        ]);
+        assert!(ok, "{out}");
+        f
+    }
+
+    /// `cadence <args>` against this tracker and daemon, outside any
+    /// pane: (success, stdout JSON or stderr text as a JSON string).
+    fn cli(&self, args: &[&str]) -> (bool, Value) {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+            .arg("--state-dir")
+            .arg(&self.d.state)
+            .args(args)
+            .env("CADENCE_PM_DIR", &self.pm_dir)
+            .env("HOME", self.tmp.path().join("home"))
+            .env("XDG_CONFIG_HOME", self.tmp.path().join("home/.config"))
+            .env("XDG_DATA_HOME", self.tmp.path().join("home/.local/share"))
+            .env("XDG_STATE_HOME", self.tmp.path().join("home/.local/state"))
+            .env("TMPDIR", self.tmp.path().join("tmp"))
+            .env_remove("CADENCE_ALIAS")
+            .output()
+            .unwrap();
+        let text = if out.stdout.is_empty() {
+            String::from_utf8_lossy(&out.stderr).to_string()
+        } else {
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+        let value = serde_json::from_str(text.trim()).unwrap_or(Value::String(text));
+        (out.status.success(), value)
+    }
+
+    fn commits(&self) -> usize {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&self.pm_dir)
+            .args(["rev-list", "--count", "HEAD"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+    }
+
+    fn last_commit(&self) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&self.pm_dir)
+            .args(["log", "-1", "--format=%B"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).to_string()
+    }
+
+    fn front(&self, id: &str) -> cadence_agent::issue::model::Front {
+        let text =
+            std::fs::read_to_string(self.pm_dir.join("demo").join(id).join("issue.md")).unwrap();
+        cadence_agent::issue::parse::parse_issue(&text).unwrap().0
+    }
+
+    /// Rewrite an issue file directly — a hand edit, or what an older
+    /// binary that does not know a field writes back.
+    fn write_front(&self, id: &str, front: &cadence_agent::issue::model::Front) {
+        let path = self.pm_dir.join("demo").join(id).join("issue.md");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let body = cadence_agent::issue::parse::parse_issue(&text).unwrap().1;
+        std::fs::write(
+            &path,
+            cadence_agent::issue::parse::render(front, &body).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Branches and worktrees `issue start` would have made in the repo.
+    fn lanes(&self) -> (String, bool) {
+        let repo = self.tmp.path().join("repo");
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["branch", "--list", "cadence/*"])
+            .output()
+            .unwrap();
+        (
+            String::from_utf8_lossy(&out.stdout).trim().to_string(),
+            repo.join(".cadence").join("wt").exists(),
+        )
+    }
+
+    fn propose(&self, text: &str) -> cadence_agent::Result<Value> {
+        self.d
+            .operator_rpc("plan_propose", json!({"project": "demo", "text": text}))
+    }
+
+    fn daemon_events(&self, kind: &str) -> Vec<Value> {
+        Store::open(&self.d.state.join("cadence.sqlite3"))
+            .unwrap()
+            .events(Store::DAEMON_STREAM, 0, 10_000)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == kind)
+            .map(|e| e.payload)
+            .collect()
+    }
+}
+
+const PLAN_MD: &str = "---\ntitle: Onboarding\ngoal: First chat in five minutes\n\
+non_goals: [billing]\n---\n\nWhy this plan.\n\n## Wizard\nsize: L\nagent: dev-1\n\n\
+The setup wizard.\n\n### Acceptance\n- [ ] wizard runs\n- [ ] chat opens\n\n\
+## Docs\nsize: S\ndepends_on: 1\n\n### Acceptance\n- [ ] README updated\n\n\
+## Polish\n\n### Acceptance\n- [ ] copy reviewed\n";
+
+/// CAD-359: `plan propose` creates the epic (plan: proposed) and every
+/// ticket in backlog — acceptance, size, agent and blocked_by links —
+/// in ONE tracker commit, and emits `plan_proposed`. A ticket without
+/// acceptance, or a credential in the text, is refused before anything
+/// is written. CAD-360: until the operator approves, no ticket starts
+/// (named reason); a non-plan issue starts exactly as before; approval
+/// moves tickets to ready and lets them start; `plan show` and the
+/// board's issue detail carry state and size-weighted progress.
+#[test]
+fn plan_propose_approve_gate_and_progress() {
+    let f = PlanFixture::start();
+    let (ok, out) = f.cli(&["issue", "new", "Loose issue", "--project", "demo"]);
+    assert!(ok, "{out}");
+    let before = f.commits();
+
+    // CAD-298: an empty-acceptance ticket refuses the whole plan.
+    let bad = PLAN_MD.replace("### Acceptance\n- [ ] copy reviewed\n", "no criteria\n");
+    let err = f.propose(&bad).unwrap_err().to_string();
+    assert!(
+        err.contains("Ticket 3 \"Polish\" has no acceptance criteria"),
+        "{err}"
+    );
+    // CAD-109: a credential in the plan text refuses it, unechoed.
+    let tok = cad109_token("figd_", "plan", 40);
+    let secret = PLAN_MD.replace("The setup wizard.", &format!("The setup wizard {tok}."));
+    let err = f.propose(&secret).unwrap_err().to_string();
+    assert!(err.contains("cadence-figma-token"), "{err}");
+    assert!(!err.contains(&tok[5..]), "{err}");
+    assert_eq!(f.commits(), before, "refusals write nothing");
+    assert!(!f.pm_dir.join("demo/D-2").exists());
+
+    // The plan: D-2 epic, D-3..D-5 tickets, one commit.
+    let out = f.propose(PLAN_MD).unwrap();
+    assert_eq!(out["epic"], "D-2", "{out}");
+    assert_eq!(out["tickets"], json!(["D-3", "D-4", "D-5"]), "{out}");
+    assert_eq!(out["proposed_by"], "operator", "{out}");
+    assert_eq!(f.commits(), before + 1, "one commit for the whole plan");
+    let msg = f.last_commit();
+    for id in ["D-2", "D-3", "D-4", "D-5"] {
+        assert!(msg.contains(&format!("Issue: {id}\n")), "{msg}");
+    }
+    let epic = f.front("D-2");
+    let plan = epic.plan.clone().unwrap();
+    assert_eq!(plan.state, "proposed");
+    assert_eq!(plan.proposed_by, "operator");
+    assert_eq!(plan.tickets, vec!["D-3", "D-4", "D-5"]);
+    assert_eq!(epic.item_type.as_deref(), Some("epic"));
+    let wizard = f.front("D-3");
+    assert_eq!(
+        (wizard.status.as_str(), wizard.parent.as_deref()),
+        ("backlog", Some("D-2"))
+    );
+    assert_eq!(wizard.size.as_deref(), Some("L"));
+    assert_eq!(wizard.owner.as_deref(), Some("dev-1"));
+    assert_eq!(wizard.plan_epic.as_deref(), Some("D-2"));
+    assert_eq!(f.front("D-4").blocked_by, vec!["D-3".to_string()]);
+    let (ok, show) = f.cli(&["issue", "show", "D-3", "--json"]);
+    assert!(ok, "{show}");
+    assert_eq!(show["acceptance"].as_array().unwrap().len(), 2, "{show}");
+    let events = f.daemon_events("plan_proposed");
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["epic"], "D-2");
+    assert_eq!(events[0]["ticket_count"], 3);
+
+    // Gate: a proposed plan's ticket does not start — named reason,
+    // nothing created. The loose issue starts as it always has.
+    let (ok, err) = f.cli(&["issue", "start", "D-3"]);
+    assert!(!ok);
+    let err = err.to_string();
+    assert!(
+        err.contains("plan D-2 is proposed — approve it with `cadence plan approve D-2`"),
+        "{err}"
+    );
+    assert_eq!(f.front("D-3").status, "backlog");
+    assert_eq!(
+        f.lanes(),
+        (String::new(), false),
+        "a refused start leaves no branch or worktree"
+    );
+    // The board never shows unapproved work as ready or in flight.
+    let (ok, err) = f.cli(&["issue", "set", "D-3", "status=ready"]);
+    assert!(
+        !ok && err.to_string().contains("plan D-2 is proposed"),
+        "{err}"
+    );
+    let (ok, out) = f.cli(&["issue", "set", "D-3", "status=backlog"]);
+    assert!(ok, "{out}");
+    // `dispatch` refuses at the same gate, before any other check.
+    let (ok, err) = f.cli(&[
+        "dispatch",
+        "D-4",
+        "--to",
+        "w1",
+        "--note",
+        "/nonexistent",
+        "--reply-to",
+        "pm",
+    ]);
+    assert!(
+        !ok && err.to_string().contains("plan D-2 is proposed"),
+        "{err}"
+    );
+    let (ok, out) = f.cli(&["issue", "start", "D-1"]);
+    assert!(ok, "non-plan issue must start as before: {out}");
+    // The epic itself is never started.
+    let (ok, err) = f.cli(&["issue", "start", "D-2"]);
+    assert!(!ok && err.to_string().contains("D-2 is a plan"), "{err}");
+
+    let (ok, show) = f.cli(&["plan", "show", "D-2"]);
+    assert!(ok, "{show}");
+    assert_eq!(show["plan"]["state"], "proposed", "{show}");
+    assert_eq!(show["plan"]["progress"]["total_weight"], 12, "{show}");
+
+    // Approve (operator): tickets backlog → ready, one commit.
+    let before = f.commits();
+    let out =
+        f.d.operator_rpc("plan_approve", json!({"epic": "D-2"}))
+            .unwrap();
+    assert_eq!(out["state"], "approved", "{out}");
+    assert_eq!(out["ready"], json!(["D-3", "D-4", "D-5"]), "{out}");
+    assert_eq!(f.commits(), before + 1);
+    let plan = f.front("D-2").plan.unwrap();
+    assert_eq!(
+        (plan.state.as_str(), plan.decided_by.as_deref()),
+        ("approved", Some("operator"))
+    );
+    assert!(plan.decided_at.is_some());
+    assert_eq!(f.front("D-5").status, "ready");
+    assert_eq!(f.daemon_events("plan_approved").len(), 1);
+    let err =
+        f.d.operator_rpc("plan_approve", json!({"epic": "D-2"}))
+            .unwrap_err()
+            .to_string();
+    assert!(err.contains("already approved"), "{err}");
+
+    let (ok, out) = f.cli(&["issue", "start", "D-3"]);
+    assert!(ok, "approved plan's ticket starts: {out}");
+
+    // Progress: S=1 M=3 L=8, unsized = M.
+    assert!(f.cli(&["issue", "set", "D-3", "status=done"]).0);
+    assert!(f.cli(&["issue", "set", "D-4", "status=dropped"]).0);
+    let (ok, show) = f.cli(&["issue", "show", "D-2", "--json"]);
+    assert!(ok, "{show}");
+    let progress = &show["plan"]["progress"];
+    assert_eq!(progress["done_weight"], 8, "{show}");
+    assert_eq!(progress["total_weight"], 11, "{show}");
+    assert_eq!(progress["ratio"], 0.73, "{show}");
+    assert_eq!(show["plan"]["tickets"][0]["weight"], 8, "{show}");
+    let (ok, loose) = f.cli(&["issue", "show", "D-1", "--json"]);
+    assert!(ok && loose["plan"].is_null(), "{loose}");
+
+    // Reject: recorded with its reason; its ticket never starts.
+    let out = f
+        .propose("---\ntitle: Later\ngoal: g\n---\n## Only\n### Acceptance\n- [ ] a\n")
+        .unwrap();
+    assert_eq!(out["epic"], "D-6", "{out}");
+    let err =
+        f.d.operator_rpc("plan_reject", json!({"epic": "D-6"}))
+            .unwrap_err()
+            .to_string();
+    assert!(err.contains("--reason"), "{err}");
+    let out =
+        f.d.operator_rpc("plan_reject", json!({"epic": "D-6", "reason": "not now"}))
+            .unwrap();
+    assert_eq!(out["state"], "rejected", "{out}");
+    assert_eq!(
+        f.front("D-6").plan.unwrap().reason.as_deref(),
+        Some("not now")
+    );
+    assert_eq!(f.front("D-7").status, "backlog");
+    let (ok, err) = f.cli(&["issue", "start", "D-7"]);
+    assert!(
+        !ok && err.to_string().contains("plan D-6 is rejected"),
+        "{err}"
+    );
+}
+
+/// CAD-360: approve and reject are operator decisions. A pane agent is
+/// refused (and its CLI), a caller with no agent identity that is not
+/// the proven operator (a detached, orphaned child of a managed tool)
+/// is refused, and nothing is written; the proven operator decides.
+/// An agent may propose — attributed to its own lane.
+#[test]
+fn plan_decisions_are_operator_only() {
+    let f = PlanFixture::start();
+    let home = TempDir::new().unwrap();
+    let mut pane = LaneShell::spawn(home.path());
+    plant_pane(&f.d, "pane-1", pane.pid());
+
+    let r = pane.rpc(
+        &f.d.state,
+        "plan_propose",
+        json!({"project": "demo", "text": PLAN_MD}),
+    );
+    assert_eq!(r["result"]["epic"], "D-1", "{r}");
+    assert_eq!(r["result"]["proposed_by"], "pane-1", "{r}");
+    let before = f.commits();
+
+    for method in ["plan_approve", "plan_reject"] {
+        let r = pane.rpc(
+            &f.d.state,
+            method,
+            json!({"epic": "D-1", "reason": "agent says"}),
+        );
+        let msg = r["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("operator action") && msg.contains("pane-1"),
+            "{method}: {r}"
+        );
+    }
+    let mut wk = ManagedWorker::start(&f.d, "wk");
+    let r = wk.rpc("detached-bare", "plan_approve", json!({"epic": "D-1"}));
+    let msg = r["error"]["message"].as_str().unwrap_or_default();
+    assert!(msg.contains("not provably the operator"), "{r}");
+    // An identity-shaped field is never read as authority.
+    let err =
+        f.d.operator_rpc("plan_approve", json!({"epic": "D-1", "by": "operator"}))
+            .unwrap_err()
+            .to_string();
+    assert!(err.contains("'by'"), "{err}");
+    assert_eq!(f.commits(), before, "refused decisions write nothing");
+    assert_eq!(f.front("D-1").plan.unwrap().state, "proposed");
+
+    let out =
+        f.d.operator_rpc("plan_approve", json!({"epic": "D-1"}))
+            .unwrap();
+    assert_eq!(out["state"], "approved", "{out}");
+}
+
+/// CAD-360: `job dispatch` of a task whose job is bound to a ticket of
+/// an unapproved plan is refused with the named reason and queues
+/// nothing; after approval it dispatches. A job bound to an issue in
+/// no plan dispatches as before.
+#[test]
+fn plan_gate_refuses_job_dispatch_until_approved() {
+    let f = PlanFixture::start();
+    let d = &f.d;
+    d.register("pm");
+    d.register_member("w1", "pm");
+    d.wait_agent("w1", "idle", 10);
+    assert!(f.cli(&["issue", "new", "Loose", "--project", "demo"]).0);
+    let out = f
+        .propose("---\ntitle: P\ngoal: g\n---\n## Only\n### Acceptance\n- [ ] a\n")
+        .unwrap();
+    assert_eq!(out["tickets"], json!(["D-3"]), "{out}");
+    let (spec, sha) = d.spec_file("spec.md", "plan job");
+    let project = d.dir.path().to_str().unwrap().to_string();
+    for (job, issue) in [("jp", "D-3"), ("jl", "D-1")] {
+        d.rpc(
+            "job_new",
+            json!({"pm": "pm", "job": job, "spec": spec, "spec_sha256": sha,
+                   "issue": issue, "repo": project}),
+        )
+        .unwrap();
+        d.rpc(
+            "task_new",
+            json!({"job": job, "task": format!("{job}-t"), "assignee": "w1",
+                   "acceptance": "the plan ticket's criterion"}),
+        )
+        .unwrap();
+    }
+    let err = d.job_dispatch("jp-t", json!({})).unwrap_err().to_string();
+    assert!(
+        err.contains("plan D-2 is proposed — approve it with `cadence plan approve D-2`"),
+        "{err}"
+    );
+    assert_eq!(d.task_state("jp-t"), "draft");
+
+    // Review C1: both monitor dispatch paths run the same gate.
+    d.rpc(
+        "monitor_register",
+        json!({"monitor": "manual", "project": project, "owner": "operator",
+               "tasks": ["jp-t"], "interval_secs": 1, "dispatch_enabled": true}),
+    )
+    .unwrap();
+    wait_monitor_state(d, "manual", "active", 5);
+    let err = d
+        .rpc(
+            "monitor_dispatch",
+            json!({"monitor": "manual", "task": "jp-t"}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("plan D-2 is proposed"), "{err}");
+    d.rpc(
+        "monitor_register",
+        json!({"monitor": "auto", "project": project, "owner": "operator",
+               "tasks": ["jp-t"], "interval_secs": 1, "dispatch_enabled": true,
+               "auto_dispatch_enabled": true}),
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let page = d.rpc("monitor_alerts", json!({"monitor": "auto"})).unwrap();
+        let blocked = page["alerts"].as_array().unwrap().iter().any(|a| {
+            a["kind"] == "dispatch_blocked"
+                && a["task"] == "jp-t"
+                && a.to_string().contains("plan D-2 is proposed")
+        });
+        if blocked {
+            break;
+        }
+        assert!(Instant::now() < deadline, "no plan block alert: {page}");
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        d.task_state("jp-t"),
+        "draft",
+        "the automatic path dispatched nothing"
+    );
+    for monitor in ["manual", "auto"] {
+        d.rpc("monitor_stop", json!({"monitor": monitor})).unwrap();
+    }
+
+    d.job_dispatch("jl-t", json!({})).unwrap();
+    d.operator_rpc("plan_approve", json!({"epic": "D-2"}))
+        .unwrap();
+    d.job_dispatch("jp-t", json!({})).unwrap();
+}
+
+/// CAD-360 review I1: membership is the plan's approved ticket list,
+/// not the `parent` link. While the plan is not rejected a ticket's
+/// parent cannot be unlinked, and a hand edit that drops it still
+/// leaves the ticket gated. Nothing joins a plan by `issue new
+/// --parent`, `issue link parent`, or a hand-edited parent — the last
+/// is refused at start.
+#[test]
+fn plan_membership_is_the_list_not_the_link() {
+    let f = PlanFixture::start();
+    let out = f
+        .propose("---\ntitle: P\ngoal: g\n---\n## A\n### Acceptance\n- [ ] a\n")
+        .unwrap();
+    assert_eq!(
+        (out["epic"].as_str(), out["tickets"][0].as_str()),
+        (Some("D-1"), Some("D-2"))
+    );
+
+    let (ok, err) = f.cli(&["issue", "unlink", "D-2", "parent", "D-1"]);
+    assert!(
+        !ok && err.to_string().contains("parent link cannot change"),
+        "{err}"
+    );
+    let (ok, err) = f.cli(&[
+        "issue",
+        "new",
+        "Sneak",
+        "--project",
+        "demo",
+        "--parent",
+        "D-1",
+    ]);
+    assert!(!ok && err.to_string().contains("D-1 is a plan"), "{err}");
+    assert!(f.cli(&["issue", "new", "Loose", "--project", "demo"]).0);
+    let (ok, err) = f.cli(&["issue", "link", "D-3", "parent", "D-1"]);
+    assert!(!ok && err.to_string().contains("D-1 is a plan"), "{err}");
+
+    // Hand edit: the ticket loses both parent and marker — the epic's
+    // list still holds it.
+    let mut t = f.front("D-2");
+    t.parent = None;
+    t.plan_epic = None;
+    f.write_front("D-2", &t);
+    let (ok, err) = f.cli(&["issue", "start", "D-2"]);
+    assert!(
+        !ok && err.to_string().contains("plan D-1 is proposed"),
+        "{err}"
+    );
+
+    f.d.operator_rpc("plan_approve", json!({"epic": "D-1"}))
+        .unwrap();
+    // After approval: a hand-parented issue is not an approved ticket.
+    let mut loose = f.front("D-3");
+    loose.parent = Some("D-1".into());
+    f.write_front("D-3", &loose);
+    let (ok, err) = f.cli(&["issue", "start", "D-3"]);
+    assert!(
+        !ok && err.to_string().contains("not one of its tickets"),
+        "{err}"
+    );
+    let (ok, out) = f.cli(&["issue", "start", "D-2"]);
+    assert!(ok, "the listed ticket starts: {out}");
+}
+
+/// CAD-360 review I2/I3: the gate fails closed. An epic that exists but
+/// does not parse refuses its tickets (`plan_unreadable`); an epic an
+/// older binary rewrote without `plan:` refuses the tickets that still
+/// carry `plan_epic` (`plan_missing`). An issue whose parent is truly
+/// absent is not in a plan and starts.
+#[test]
+fn plan_gate_fails_closed_on_unreadable_or_rewritten_epic() {
+    let f = PlanFixture::start();
+    f.propose("---\ntitle: P\ngoal: g\n---\n## A\n### Acceptance\n- [ ] a\n## B\n### Acceptance\n- [ ] b\n")
+        .unwrap();
+    f.d.operator_rpc("plan_approve", json!({"epic": "D-1"}))
+        .unwrap();
+
+    // An older binary drops the unknown `plan:` from the epic.
+    let mut epic = f.front("D-1");
+    epic.plan = None;
+    f.write_front("D-1", &epic);
+    let (ok, err) = f.cli(&["issue", "start", "D-2"]);
+    let err = err.to_string();
+    assert!(!ok && err.contains("carries no plan"), "{err}");
+
+    // An epic that no longer parses.
+    let path = f.pm_dir.join("demo/D-1/issue.md");
+    std::fs::write(&path, "---\nid: [unterminated\n---\n").unwrap();
+    let (ok, err) = f.cli(&["issue", "start", "D-3"]);
+    assert!(!ok && err.to_string().contains("cannot be read"), "{err}");
+    assert_eq!(f.lanes(), (String::new(), false));
+
+    // A truly absent parent is not a plan: the gate passes. (Checked on
+    // the gate itself — the tracker's lint hook refuses to commit a
+    // dangling parent, so `issue start` could not record it.)
+    let mut orphan =
+        cadence_agent::issue::model::Front::new("D-9", "Orphan", "2026-01-01T00:00:00Z");
+    orphan.parent = Some("D-99".into());
+    cadence_agent::issue::plan::gate(&f.pm_dir, &orphan, "").unwrap();
+    // …while the same shape under the unreadable epic refuses.
+    orphan.parent = Some("D-1".into());
+    let err = cadence_agent::issue::plan::gate(&f.pm_dir, &orphan, "").unwrap_err();
+    assert!(err.to_string().contains("cannot be read"), "{err}");
+}
+
+/// Proposals are capped: at most 50 tickets and 256 KiB of text.
+#[test]
+fn plan_propose_caps_size() {
+    let f = PlanFixture::start();
+    let mut many = String::from("---\ntitle: Big\ngoal: g\n---\n");
+    for n in 0..51 {
+        many.push_str(&format!("## T{n}\n### Acceptance\n- [ ] a\n"));
+    }
+    let err = f.propose(&many).unwrap_err().to_string();
+    assert!(
+        err.contains("51 tickets") && err.contains("at most 50"),
+        "{err}"
+    );
+    let huge = format!(
+        "---\ntitle: Huge\ngoal: g\n---\n{}\n## A\n### Acceptance\n- [ ] a\n",
+        "word ".repeat(60_000)
+    );
+    // Past the socket frame the CLI would carry: checked on the library
+    // entry the daemon calls.
+    let pm = cadence_agent::issue::Pm::at(&f.pm_dir).unwrap();
+    let err = cadence_agent::issue::plan::propose(
+        &pm,
+        "demo",
+        &huge,
+        &cadence_agent::secret::Allowlist::default(),
+        "operator",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("at most 262144 bytes"), "{err}");
+    assert!(!f.pm_dir.join("demo/D-1").exists());
+}
+
+/// CAD-360 review round 3: `issue claim` moves backlog/ready into doing,
+/// so it obeys the plan status rule — a claim on a proposed plan's
+/// ticket is refused, the ticket stays in backlog and no commit is
+/// made; the same claim on an ordinary issue works as before, and on
+/// the ticket once the plan is approved.
+#[test]
+fn plan_claim_refused_on_unapproved_ticket() {
+    let f = PlanFixture::start();
+    assert!(f.cli(&["issue", "new", "Loose", "--project", "demo"]).0);
+    f.propose("---\ntitle: P\ngoal: g\n---\n## A\n### Acceptance\n- [ ] a\n")
+        .unwrap();
+    let before = f.commits();
+    let (ok, err) = f.cli(&["issue", "claim", "D-3", "--by", "pm"]);
+    assert!(
+        !ok && err.to_string().contains("plan D-2 is proposed"),
+        "{err}"
+    );
+    assert_eq!(f.front("D-3").status, "backlog");
+    assert!(f.front("D-3").claim.is_none());
+    assert_eq!(f.commits(), before, "a refused claim writes nothing");
+    assert!(!f
+        .pm_dir
+        .join("demo/D-3/comments")
+        .read_dir()
+        .unwrap()
+        .any(|_| true));
+
+    let (ok, out) = f.cli(&["issue", "claim", "D-1", "--by", "pm"]);
+    assert!(ok, "{out}");
+    assert_eq!(f.front("D-1").status, "doing");
+
+    f.d.operator_rpc("plan_approve", json!({"epic": "D-2"}))
+        .unwrap();
+    let (ok, out) = f.cli(&["issue", "claim", "D-3", "--by", "pm"]);
+    assert!(ok, "{out}");
+    assert_eq!(f.front("D-3").status, "doing");
+}

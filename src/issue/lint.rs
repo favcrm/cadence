@@ -197,6 +197,16 @@ pub fn run(pm: &Pm, only_project: Option<&str>) -> Result<Value> {
         if !model::PRIORITIES.contains(&front.priority.as_str()) {
             lint.err(format!("{id}: unknown priority '{}'", front.priority));
         }
+        if let Some(plan) = &front.plan {
+            if !model::PLAN_STATES.contains(&plan.state.as_str()) {
+                lint.err(format!("{id}: unknown plan state '{}'", plan.state));
+            }
+        }
+        if let Some(size) = &front.size {
+            if !model::SIZES.iter().any(|(s, _)| s == size) {
+                lint.err(format!("{id}: unknown size '{size}' — S, M or L"));
+            }
+        }
         for r in &front.refs {
             if !model::REF_KINDS.contains(&r.kind.as_str()) {
                 lint.err(format!("{id}: unknown ref kind '{}'", r.kind));

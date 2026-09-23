@@ -94,6 +94,25 @@ pub struct Front {
     /// issues.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+    /// CAD-359/360: set on an epic that is a plan — see [`Plan`].
+    /// Absent on every other issue, so older binaries still read the
+    /// file (issue frontmatter is parsed leniently).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<Plan>,
+    /// CAD-360: on each ticket of a plan, the plan epic's id. With the
+    /// epic's `plan.tickets` list it makes membership two-sided, so a
+    /// rewrite that drops one side (an older binary, a hand edit, an
+    /// unlink) fails closed instead of ungating the ticket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_epic: Option<String>,
+    /// Work-model item type (`epic` on plan epics; WORK-MODEL.md).
+    /// Absent elsewhere — the implicit "has children" rule still holds.
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub item_type: Option<String>,
+    /// Optional task size `S|M|L` — plan progress weights it 1|3|8,
+    /// unsized counts as M (docs/design/WORK-MODEL.md).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -119,6 +138,10 @@ impl Front {
             component: None,
             tags: vec![],
             kind: None,
+            plan: None,
+            plan_epic: None,
+            item_type: None,
+            size: None,
             parent: None,
             blocked_by: vec![],
             relates: vec![],
@@ -127,6 +150,41 @@ impl Front {
             created: created.to_string(),
         }
     }
+}
+
+/// CAD-359/360: the plan an epic carries. `state` is `proposed` until
+/// the operator decides; only an `approved` plan's tickets dispatch.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Plan {
+    pub state: String,
+    pub proposed_by: String,
+    /// RFC 3339 UTC.
+    pub proposed_at: String,
+    /// The ticket ids created with the plan — the operator approves
+    /// exactly these; membership is decided by this list.
+    #[serde(default)]
+    pub tickets: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decided_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decided_at: Option<String>,
+    /// Why a plan was rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Plan states, in order.
+pub const PLAN_STATES: &[&str] = &["proposed", "approved", "rejected"];
+/// Task sizes and their progress weights; unsized counts as `M`.
+pub const SIZES: &[(&str, u64)] = &[("S", 1), ("M", 3), ("L", 8)];
+
+/// The progress weight of a size — `S`=1, `M`=3, `L`=8; unsized or
+/// unknown is `M`.
+pub fn size_weight(size: Option<&str>) -> u64 {
+    SIZES
+        .iter()
+        .find(|(s, _)| Some(*s) == size)
+        .map_or(3, |(_, w)| *w)
 }
 
 /// Comment file frontmatter (`comments/<UTC-basic>-<author>.md`).

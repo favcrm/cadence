@@ -18,6 +18,7 @@ pub mod lint;
 pub mod model;
 pub mod notes;
 pub mod parse;
+pub mod plan;
 pub mod project;
 pub mod relay;
 pub mod report;

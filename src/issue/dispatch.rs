@@ -405,6 +405,10 @@ pub(crate) fn check_lane_cwd(
 pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path) -> Result<Value> {
     let (project, dir) = write::issue_dir(pm, id)?;
     let (front, body) = write::load_front(&dir)?;
+    // CAD-360: a ticket of a plan dispatches only once the operator
+    // approved the plan, and only with acceptance. Issues in no plan
+    // pass unchanged.
+    crate::issue::plan::gate(&pm.dir, &front, &body)?;
     // CAD-159: the CAD-238 section-scoped readback. No items warns;
     // it never refuses (PM decision, ADR-0002 §8.3).
     let items = parse::acceptance_items(&body);

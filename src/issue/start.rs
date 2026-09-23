@@ -353,6 +353,12 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         None => None,
     };
     let (project, dir) = write::issue_dir(pm, id)?;
+    // CAD-360: the plan gate, before anything is created — `issue
+    // start`, `dispatch` and `dispatch --job` all come through here.
+    {
+        let (front, body) = write::load_front(&dir)?;
+        crate::issue::plan::gate(&pm.dir, &front, &body)?;
+    }
     // CAD-202: a pty assignee whose pane cwd is deleted or outside the
     // project's repos refuses here, before anything is created.
     let cwd_override = match &args.job {

@@ -320,6 +320,10 @@ pub fn claim(
         next.owner = Some(by.clone());
     }
     if matches!(next.status.as_str(), "backlog" | "ready") {
+        // CAD-360: claiming moves the issue into work — the same status
+        // write rule as `issue set`, so an unapproved plan's ticket is
+        // refused before anything is written.
+        crate::issue::plan::check_status_write(&pm.dir, &front, "doing")?;
         next.status = "doing".to_string();
     }
     let suffix = note
