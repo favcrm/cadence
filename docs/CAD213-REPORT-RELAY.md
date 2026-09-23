@@ -36,8 +36,13 @@ requeued on the next sync.
 `last_error` for each enabled project. `last_success_at` is only advanced when
 the GitHub read/publish/comment pass completed without a transport error; it is
 not a synthetic healthy value. Each report receipt separately records
-`pending`, `publishing`, `published`, or `retrying`, the GitHub number/URL when
-known, attempt count, and the next retry time.
+`pending`, `publishing`, `published`, `retrying`, or `blocked`, the GitHub
+number/URL when known, attempt count, and the next retry time.
+
+Before a summary is published, its title and body go through the CAD-109
+secret scan (`cadence secret scan`). A blocking finding keeps the report local
+in state `blocked`. The reason names the rule and line, never the value. The
+next sync re-checks it, so editing the value out of the report publishes it.
 
 The runtime input contract is the local issue-folder shape from CAD-136/PR73:
 an issue carries the `intake` tag and its title/body contains the report. This

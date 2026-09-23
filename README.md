@@ -225,7 +225,41 @@ cadence dispatch CAD-16 --to w1 --note kick.md
                                       # one templated kickoff + comment;
                                       # --job --spec f dispatches the job
 cadence ui run                     # 127.0.0.1:3010 — SPA + read/write API
+cadence secret scan [--file f]     # credential scan: JSON findings
+                                   # {rule,line,column,redacted,severity,
+                                   # fingerprint}, never the value; exit 1
+                                   # on a blocking finding (stdin without
+                                   # --file)
 ```
+
+**Secret scan (CAD-109).** `issue comment`, `report`, `memory propose`
+and the `intake` GitHub relay scan their text before they write. A
+blocking finding refuses the write with the rule id, line and a redacted
+prefix (never the value), and nothing is written; a relay report stays
+`blocked` locally until its text is clean. The rules are the vendored,
+version-pinned gitleaks pack (`src/secret/gitleaks.toml`, MIT) plus
+cadence's bare-token rules (`figd_`, `sk-ant-`, `sk-proj-`,
+`github_pat_`, `glpat-`, `npm_`, `dvn_`, `AIza`) and the CAD-108 argv
+rule. Every rule blocks except `generic-api-key`, which only warns for
+now; warnings come back as `secret_warnings` in the write's JSON. There
+is no bypass flag. The operator allowlist is `secret-allowlist.toml` in
+the state dir (`$CADENCE_STATE_DIR`, else `$XDG_STATE_HOME/cadence`, else
+`~/.local/state/cadence`; the directory that holds `intake-relay.yaml`),
+edited by hand:
+
+```toml
+[[allow]]
+rule = "generic-api-key"          # every finding of this rule
+reason = "why"
+
+[[allow]]
+rule = "cadence-argv-secret"
+fingerprint = "0123456789abcdef"  # one value, from `secret scan` output
+reason = "why"
+```
+
+A malformed allowlist refuses guarded writes until it is fixed. CI also
+runs pinned gitleaks 8.30.1 over each PR's commits (`secrets` job).
 
 A **job** is a PM-scoped unit of work: `job new` binds an existing PM +
 spec file, `job dispatch` sends a task's kickoff to a group worker, and
