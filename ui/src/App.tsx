@@ -10,6 +10,7 @@ import Plan from "./features/projects/Plan";
 import Sidebar from "./ui/Sidebar";
 import Link from "./ui/Link";
 import SectionTabs from "./ui/SectionTabs";
+import ThemeToggle from "./ui/ThemeToggle";
 import Setup from "./features/setup/Setup";
 import Toast, { type ToastMsg } from "./ui/Toast";
 import { Logo } from "./ui/Logo";
@@ -358,13 +359,13 @@ export default function App() {
               <path d="M2 3.5l3 3 3-3" />
             </svg>
           </button>
-          <div className="num text-label text-ink-500">
+          <div className="num text-label text-ink-500 min-w-0 truncate">
             <span className="hidden sm:inline text-ink-300">cadence</span>
             <span className="hidden sm:inline"> / </span>
             <span className="text-ink-100">{SCREEN_LABEL[screen]}</span>
           </div>
 
-          <div className="ml-auto flex items-center gap-2">
+          <div className="ml-auto flex items-center gap-2 shrink-0">
             {readOnly && (
               <span
                 className="chip bg-warn/10 text-warn"
@@ -386,7 +387,8 @@ export default function App() {
                     : "daemon socket unreachable — runtime strip is empty"
                 }
               >
-                daemon {health.daemon}
+                <span className="hidden sm:inline">daemon </span>
+                {health.daemon}
               </span>
             )}
             <button
@@ -396,6 +398,7 @@ export default function App() {
             >
               refresh
             </button>
+            <ThemeToggle />
             {!readOnly && (
               <span
                 className="hidden sm:inline-flex chip bg-ink-800 text-ink-400"

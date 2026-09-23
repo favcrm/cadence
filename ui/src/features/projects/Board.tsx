@@ -257,7 +257,7 @@ function QuickAdd({
         <button
           onClick={submit}
           disabled={!title.trim() || busy}
-          className="h-7 px-2.5 rounded bg-accent text-ink-950 text-label font-medium disabled:opacity-40"
+          className="h-7 px-2.5 rounded bg-accent text-on-accent text-label font-medium disabled:opacity-40"
         >
           add
         </button>

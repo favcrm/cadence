@@ -291,7 +291,7 @@ export default function Drawer({
   return (
     <>
       <div
-        className="fixed inset-0 bg-ink-950/70 z-20"
+        className="fixed inset-0 bg-scrim z-20"
         onClick={onClose}
       />
       <aside
@@ -1097,7 +1097,7 @@ export default function Drawer({
                 </button>
                 <button
                   onClick={saveEdit}
-                  className="h-9 px-3 rounded bg-accent text-ink-950 text-secondary font-medium"
+                  className="h-9 px-3 rounded bg-accent text-on-accent text-secondary font-medium"
                 >
                   Save
                 </button>
@@ -1115,7 +1115,7 @@ export default function Drawer({
                   <button
                     disabled
                     title="dispatch waits for a token — not in I2"
-                    className="h-9 px-3 rounded bg-accent text-ink-950 text-secondary font-medium opacity-40 cursor-not-allowed"
+                    className="h-9 px-3 rounded bg-accent text-on-accent text-secondary font-medium opacity-40 cursor-not-allowed"
                   >
                     Kick off
                   </button>

@@ -23,6 +23,12 @@
   --color-warn: #fbbf24;
   --color-info: #60a5fa;
 
+  /* Text on an accent fill; form field borders; the overlay behind drawers. */
+  --color-on-accent: #04201c;
+  --color-edge: #3a3d43;
+  --color-edge-hover: #50545c;
+  --color-scrim: rgb(7 7 8 / .7);
+
   --text-micro: .6875rem;
   --text-label: .75rem;
   --text-table: .78125rem;
@@ -33,13 +39,73 @@
   --text-drawer: 1.25rem;
 }
 
+/*
+ * Light and dark themes. The @theme values above are the dark theme; the
+ * light theme re-points the same variables, so every utility (bg-ink-900,
+ * text-accent, …) and every rule below follows the theme with no second
+ * class. The ink scale keeps its meaning — 900 is the page, 100 the
+ * strongest text — and flips its values. The system preference decides
+ * unless the header toggle stored a choice (`data-theme` on <html>, set by
+ * lib/theme.ts). The light block appears twice because a media query
+ * cannot share a selector list; keep the two in step.
+ */
 :root {
   color-scheme: dark;
 }
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    color-scheme: light;
+    --color-ink-950: #e6e8eb;
+    --color-ink-900: #f4f5f6;
+    --color-ink-875: #eceef0;
+    --color-ink-850: #ffffff;
+    --color-ink-800: #e9ebee;
+    --color-ink-700: #dfe2e6;
+    --color-ink-600: #cdd2d8;
+    --color-ink-500: #6b7280;
+    --color-ink-400: #4b5563;
+    --color-ink-300: #374151;
+    --color-ink-200: #1b1d21;
+    --color-ink-100: #0b0b0c;
+    --color-accent: #0d9488;
+    --color-ok: #15803d;
+    --color-fail: #dc2626;
+    --color-warn: #b45309;
+    --color-info: #2563eb;
+    --color-on-accent: #ffffff;
+    --color-edge: #c4c9d0;
+    --color-edge-hover: #9aa1a9;
+    --color-scrim: rgb(17 24 39 / .35);
+  }
+}
+:root[data-theme="light"] {
+  color-scheme: light;
+  --color-ink-950: #e6e8eb;
+  --color-ink-900: #f4f5f6;
+  --color-ink-875: #eceef0;
+  --color-ink-850: #ffffff;
+  --color-ink-800: #e9ebee;
+  --color-ink-700: #dfe2e6;
+  --color-ink-600: #cdd2d8;
+  --color-ink-500: #6b7280;
+  --color-ink-400: #4b5563;
+  --color-ink-300: #374151;
+  --color-ink-200: #1b1d21;
+  --color-ink-100: #0b0b0c;
+  --color-accent: #0d9488;
+  --color-ok: #15803d;
+  --color-fail: #dc2626;
+  --color-warn: #b45309;
+  --color-info: #2563eb;
+  --color-on-accent: #ffffff;
+  --color-edge: #c4c9d0;
+  --color-edge-hover: #9aa1a9;
+  --color-scrim: rgb(17 24 39 / .35);
+}
 
 body {
-  background: #070708;
-  color: #c3c8ce;
+  background: var(--color-ink-950);
+  color: var(--color-ink-300);
   font-family: "IBM Plex Sans", sans-serif;
   font-size: .875rem;
   line-height: 1.4;
@@ -53,18 +119,18 @@ body {
 }
 .kicker {
   font: 400 .75rem "IBM Plex Mono", monospace;
-  color: #858c96;
+  color: var(--color-ink-500);
   text-transform: lowercase;
 }
 .slabel {
   font: 500 .6875rem "IBM Plex Mono", monospace;
   letter-spacing: .08em;
   text-transform: uppercase;
-  color: #858c96;
+  color: var(--color-ink-500);
 }
 .card {
-  border: 1px solid #222428;
-  background: #141518;
+  border: 1px solid var(--color-ink-700);
+  background: var(--color-ink-850);
   border-radius: .5rem;
   transition: border-color .15s ease, background-color .15s ease;
 }
@@ -73,12 +139,12 @@ body {
 }
 .tcard:focus-visible {
   outline: none;
-  border-color: #2dd4bf;
-  box-shadow: 0 0 0 3px rgba(45, 212, 191, .1);
+  border-color: var(--color-accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-accent) 10%, transparent);
 }
 .tcard:hover {
-  border-color: #2e3136;
-  background: #191a1e;
+  border-color: var(--color-ink-600);
+  background: var(--color-ink-800);
 }
 .navlink {
   display: flex;
@@ -87,17 +153,17 @@ body {
   gap: 11px;
   padding: 0 11px;
   border-radius: 4px;
-  color: #9ba1a9;
+  color: var(--color-ink-400);
   font-size: 13px;
   transition: background-color .16s ease, color .16s ease;
 }
 .navlink:hover {
-  background: #191a1e;
-  color: #f6f7f8;
+  background: var(--color-ink-800);
+  color: var(--color-ink-100);
 }
 .navlink[aria-current="page"] {
-  background: color-mix(in srgb, #2dd4bf 13%, #0e0e10);
-  color: #2dd4bf;
+  background: color-mix(in srgb, var(--color-accent) 13%, var(--color-ink-875));
+  color: var(--color-accent);
 }
 .proj {
   display: grid;
@@ -106,33 +172,33 @@ body {
   width: 100%;
   padding: 7px 10px;
   border-radius: 4px;
-  color: #9ba1a9;
+  color: var(--color-ink-400);
   font-size: 12px;
   text-align: left;
 }
 .proj:hover, .proj.on {
-  background: #191a1e;
-  color: #f6f7f8;
+  background: var(--color-ink-800);
+  color: var(--color-ink-100);
 }
 .proj.on {
-  box-shadow: inset 2px 0 #2dd4bf;
+  box-shadow: inset 2px 0 var(--color-accent);
 }
 .field {
   height: 2.25rem;
-  border: 1px solid #3a3d43;
+  border: 1px solid var(--color-edge);
   border-radius: .25rem;
-  background: #0b0b0c;
-  color: #f6f7f8;
+  background: var(--color-ink-900);
+  color: var(--color-ink-100);
   padding: 0 .85rem;
   font-size: .8125rem;
 }
 .field:hover {
-  border-color: #50545c;
+  border-color: var(--color-edge-hover);
 }
 .field:focus {
   outline: none;
-  border-color: #2dd4bf;
-  box-shadow: 0 0 0 3px rgba(45, 212, 191, .1);
+  border-color: var(--color-accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-accent) 10%, transparent);
 }
 @layer components {
   .chip {
@@ -167,11 +233,11 @@ body {
   transform: rotate(90deg);
 }
 .closebtn:hover {
-  border-color: #2dd4bf;
-  color: #2dd4bf;
+  border-color: var(--color-accent);
+  color: var(--color-accent);
 }
 a.lnk, button.lnk {
-  color: #2dd4bf;
+  color: var(--color-accent);
 }
 a.lnk:hover, button.lnk:hover {
   text-decoration: underline;
@@ -190,7 +256,7 @@ pre {
   width: 10px;
 }
 ::-webkit-scrollbar-thumb {
-  background: #222428;
+  background: var(--color-ink-700);
   border-radius: 6px;
 }
 
@@ -211,7 +277,7 @@ pre {
 .issue-reader h2,
 .issue-reader h3,
 .issue-reader h4 {
-  color: #f6f7f8;
+  color: var(--color-ink-100);
   font-weight: 600;
   line-height: 1.25;
   margin: 1.15rem 0 .5rem;
@@ -237,13 +303,13 @@ pre {
 .issue-reader ol { list-style: decimal; }
 .issue-reader li + li { margin-top: .25rem; }
 .issue-reader blockquote {
-  border-inline-start: 2px solid #2e3136;
-  color: #9ba1a9;
+  border-inline-start: 2px solid var(--color-ink-600);
+  color: var(--color-ink-400);
   padding-inline-start: .8rem;
 }
 .issue-reader code {
   overflow-wrap: anywhere;
-  color: #e7e9ec;
+  color: var(--color-ink-200);
   font-family: "IBM Plex Mono", monospace;
   font-size: .85em;
 }
@@ -251,8 +317,8 @@ pre {
   max-inline-size: 100%;
   overflow: auto;
   padding: .75rem;
-  border: 1px solid #222428;
-  background: #0b0b0c;
+  border: 1px solid var(--color-ink-700);
+  background: var(--color-ink-900);
   scrollbar-gutter: stable;
   overscroll-behavior: contain;
 }

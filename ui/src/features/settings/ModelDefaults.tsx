@@ -300,7 +300,7 @@ export default function ModelDefaults() {
           <div className="flex flex-wrap gap-2">
             <button
               type="button"
-              className="h-9 px-3 rounded bg-accent text-ink-950 text-secondary font-medium disabled:opacity-40"
+              className="h-9 px-3 rounded bg-accent text-on-accent text-secondary font-medium disabled:opacity-40"
               disabled={frozen || !dirty || problems.length > 0}
               onClick={() => void save()}
             >

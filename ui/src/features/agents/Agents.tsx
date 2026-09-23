@@ -390,7 +390,7 @@ function AgentDrawer({
 
   return (
     <>
-      <div className="fixed inset-0 bg-ink-950/70 z-20" onClick={onClose} />
+      <div className="fixed inset-0 bg-scrim z-20" onClick={onClose} />
       <aside
         className="drawer fixed top-0 right-0 h-full w-full sm:w-[34rem] bg-ink-875 border-l border-ink-700 z-30 flex flex-col"
         aria-label="Agent detail"
