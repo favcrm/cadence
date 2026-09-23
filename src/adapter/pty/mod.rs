@@ -143,6 +143,9 @@ pub struct PtyAdapter {
     cwd: String,
     /// Cadence state dir, exported into the pane for `cadence self`.
     state_dir: PathBuf,
+    /// The daemon's tracker and profile, exported into the pane
+    /// ([`crate::adapter::DAEMON_CONTEXT_ENV`]).
+    context_env: Vec<(String, String)>,
     /// `params.auto_ready == "verified"`: the daemon probes the pane
     /// itself instead of requiring a human `agent ready` claim.
     /// Mutable — `agent set` refreshes it on the live adapter.
@@ -158,6 +161,18 @@ pub struct PtyAdapter {
     paste_lock: Mutex<()>,
     /// The provider TUI this pane runs.
     profile: Box<dyn TuiProfile>,
+}
+
+/// The pane's `-e` environment: the agent's alias and state dir for
+/// `cadence self`, then the daemon's tracker and profile — a sandbox
+/// worker's `cadence issue …` must stay in the sandbox (CAD-310).
+fn pane_env(alias: &str, state_dir: &Path, context: &[(String, String)]) -> Vec<String> {
+    let mut vars = vec![
+        format!("CADENCE_ALIAS={alias}"),
+        format!("CADENCE_STATE_DIR={}", state_dir.display()),
+    ];
+    vars.extend(context.iter().map(|(k, v)| format!("{k}={v}")));
+    vars
 }
 
 fn short_hash(text: &str) -> String {
@@ -504,6 +519,7 @@ impl PtyAdapter {
             desired_session,
             cwd: agent.cwd.clone(),
             state_dir,
+            context_env: crate::adapter::daemon_context_env(env),
             auto_ready: AtomicBool::new(
                 agent
                     .params
@@ -859,11 +875,11 @@ impl ProviderAdapter for PtyAdapter {
                 super::cloud_secret_env_prefix(),
                 self.profile.exit_banner()
             );
-            // Pane env identifies the agent to `cadence self`; -e args
-            // are tmux options, never shell-interpreted.
-            let env_alias = format!("CADENCE_ALIAS={session}");
-            let env_dir = format!("CADENCE_STATE_DIR={}", self.state_dir.display());
-            self.tmux_ok(&[
+            // Pane env identifies the agent to `cadence self` and carries
+            // the daemon's tracker and profile; -e args are tmux options,
+            // never shell-interpreted.
+            let pane_env = pane_env(&session, &self.state_dir, &self.context_env);
+            let mut args: Vec<&str> = vec![
                 "new-session",
                 "-d",
                 "-s",
@@ -874,12 +890,12 @@ impl ProviderAdapter for PtyAdapter {
                 "120",
                 "-y",
                 "40",
-                "-e",
-                &env_alias,
-                "-e",
-                &env_dir,
-                &command,
-            ])?;
+            ];
+            for var in &pane_env {
+                args.extend(["-e", var.as_str()]);
+            }
+            args.push(&command);
+            self.tmux_ok(&args)?;
             let pane_pid = self.pane_pid(&session)?;
             // Bound the wait for the TUI to acquire its native session.
             match self.wait_owned_session(&session, pane_pid) {
@@ -1333,7 +1349,7 @@ impl ProviderAdapter for PtyAdapter {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_screen, tail_chars};
+    use super::{normalize_screen, pane_env, tail_chars};
 
     #[test]
     fn normalize_and_tail_helpers() {
@@ -1371,6 +1387,25 @@ mod tests {
                 .matches(&slice)
                 .count(),
             0
+        );
+    }
+
+    /// CAD-310: the pane carries the agent's identity and then the
+    /// daemon's tracker and profile.
+    #[test]
+    fn pane_env_carries_identity_then_daemon_context() {
+        let context = [
+            ("CADENCE_PM_DIR".to_string(), "/sbx/pm".to_string()),
+            ("CADENCE_PROFILE".to_string(), "sandbox:x".to_string()),
+        ];
+        assert_eq!(
+            pane_env("w1", std::path::Path::new("/sbx/state"), &context),
+            [
+                "CADENCE_ALIAS=w1",
+                "CADENCE_STATE_DIR=/sbx/state",
+                "CADENCE_PM_DIR=/sbx/pm",
+                "CADENCE_PROFILE=sandbox:x",
+            ]
         );
     }
 }

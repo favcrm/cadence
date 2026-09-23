@@ -368,8 +368,12 @@ that overlaps production's state dir, socket or `~/pm`, or the
 `CADENCE_PROFILE=sandbox:<name>` the daemon skips the skill sync into
 `$HOME`, `ui tailscale` is refused, the provider WAL watcher only
 records intent, and the Cursor `cli-config.json` merge needs
-`CADENCE_SANDBOX_ALLOW_GLOBAL=1`. Provider CLIs still share `$HOME`, so
-agents launched in a sandbox use the host's provider logins and stores.
+`CADENCE_SANDBOX_ALLOW_GLOBAL=1`. Every agent the sandbox launches gets
+its state dir, tracker and profile, so its own `cadence` calls stay in
+the sandbox. A sandbox is not a container, though: its daemon, board
+and agents run as you with your `$HOME`, so everything else there is
+shared with the host — provider logins, sessions and config, git and
+build caches, and whatever an agent writes itself.
 
 ## Principles
 

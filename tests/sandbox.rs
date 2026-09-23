@@ -43,7 +43,7 @@ impl Host {
         self.tmp.path().join("sandboxes")
     }
 
-    fn run(&self, args: &[&str], env: &[(&str, &Path)]) -> Output {
+    fn run(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
         let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"));
         cmd.args(args)
             .env("HOME", self.home())
@@ -67,10 +67,15 @@ impl Host {
     }
 
     fn up(&mut self, name: &str, extra: &[&str]) -> Value {
+        self.up_with(name, extra, &[])
+    }
+
+    /// `up` with extra environment for the sandbox's daemon and board.
+    fn up_with(&mut self, name: &str, extra: &[&str], env: &[(&str, &str)]) -> Value {
         self.started.push(name.to_string());
         let mut args = vec!["sandbox", "up", name];
         args.extend_from_slice(extra);
-        let out = self.run(&args, &[]);
+        let out = self.run(&args, env);
         assert!(out.status.success(), "up {name}: {}", text(&out));
         serde_json::from_slice(&out.stdout).unwrap()
     }
@@ -121,6 +126,36 @@ fn free_port() -> u16 {
 fn daemon_answers(state: &Path) -> bool {
     client::rpc_timeout(state, "health", json!({}), Duration::from_secs(5)).is_ok()
 }
+
+/// Poll for a file another process writes, bounded.
+fn wait_file(path: &Path, secs: u64) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            return text;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} never appeared",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// A managed-claude stand-in: dumps every `CADENCE_*` variable it was
+/// started with, then idles until its stdin closes.
+const MOCK_CLAUDE_ENV_PY: &str = r#"
+import os, sys
+out = sys.argv[1]
+with open(out + ".tmp", "w") as f:
+    for k in sorted(os.environ):
+        if k.startswith("CADENCE_"):
+            f.write(k + "=" + os.environ[k] + "\n")
+os.rename(out + ".tmp", out)
+for _ in sys.stdin:
+    pass
+"#;
 
 /// `up` builds a marked root with its own state dir, tracker and a
 /// 3110+ port, starts a daemon and board under the sandbox profile —
@@ -220,11 +255,8 @@ fn sandbox_up_refuses_production_dirs_and_port_3010() {
     refused(&out, "must match");
 
     // Root == HOME, so the sandbox tracker would be HOME/pm.
-    let tmp = host.tmp.path().to_path_buf();
-    let out = host.run(
-        &["sandbox", "up", "home"],
-        &[("CADENCE_SANDBOX_ROOT", &tmp)],
-    );
+    let tmp = host.tmp.path().to_str().unwrap();
+    let out = host.run(&["sandbox", "up", "home"], &[("CADENCE_SANDBOX_ROOT", tmp)]);
     refused(&out, "overlaps the production tracker");
     assert!(!host.home().join("pm").exists());
 
@@ -246,7 +278,7 @@ fn sandbox_up_refuses_production_dirs_and_port_3010() {
     let deep = host.tmp.path().join("d".repeat(120));
     let out = host.run(
         &["sandbox", "up", "deep"],
-        &[("CADENCE_SANDBOX_ROOT", &deep)],
+        &[("CADENCE_SANDBOX_ROOT", deep.to_str().unwrap())],
     );
     refused(&out, "Unix socket limit");
     assert!(!deep.exists());
@@ -255,7 +287,7 @@ fn sandbox_up_refuses_production_dirs_and_port_3010() {
     let exported = host.base().join("exp/state");
     let out = host.run(
         &["sandbox", "up", "exp"],
-        &[("CADENCE_STATE_DIR", &exported)],
+        &[("CADENCE_STATE_DIR", exported.to_str().unwrap())],
     );
     refused(&out, "exported CADENCE_STATE_DIR");
     assert!(!host.base().join("exp").exists());
@@ -319,14 +351,51 @@ fn tailscale_is_refused_under_a_sandbox_profile() {
     let host = Host::new();
     let state = host.tmp.path().join("state");
     let state_arg = state.to_str().unwrap();
-    let profile = PathBuf::from("sandbox:x");
     for args in [
         vec!["--state-dir", state_arg, "ui", "tailscale", "start"],
         vec!["--state-dir", state_arg, "ui", "start", "--tailscale"],
     ] {
-        let out = host.run(&args, &[("CADENCE_PROFILE", &profile)]);
+        let out = host.run(&args, &[("CADENCE_PROFILE", "sandbox:x")]);
         refused(&out, "refused under CADENCE_PROFILE=sandbox:x");
         assert!(text(&out).contains("tailscale"), "{}", text(&out));
     }
     assert!(!state.join("ui.pid").exists(), "no board started");
+}
+
+/// A claude worker in a sandbox keeps the sandbox's tracker and
+/// profile — without them its `cadence issue …` reaches production's
+/// tracker, ungated. The mock records the env the daemon hands it;
+/// the test override itself is still scrubbed.
+#[test]
+fn a_sandbox_claude_worker_keeps_the_sandbox_tracker_and_profile() {
+    let mut host = Host::new();
+    let dump = host.tmp.path().join("claude.env");
+    let script = host.tmp.path().join("claude.py");
+    std::fs::write(&script, MOCK_CLAUDE_ENV_PY).unwrap();
+    let command = format!("python3 {} {}", script.display(), dump.display());
+    let v = host.up_with("cl", &[], &[("CADENCE_CLAUDE_COMMAND", &command)]);
+    let state = PathBuf::from(v["state_dir"].as_str().unwrap());
+    let pm = PathBuf::from(v["pm_dir"].as_str().unwrap());
+    client::rpc(
+        &state,
+        "agent_register",
+        json!({"alias": "w1", "provider": "claude", "endpoint_kind": "managed",
+               "cwd": host.tmp.path().to_str().unwrap()}),
+    )
+    .unwrap();
+    let env = wait_file(&dump, 20);
+    assert!(
+        env.contains(&format!("CADENCE_PM_DIR={}\n", pm.display())),
+        "{env}"
+    );
+    assert!(env.contains("CADENCE_PROFILE=sandbox:cl\n"), "{env}");
+    assert!(
+        env.contains(&format!("CADENCE_STATE_DIR={}\n", state.display())),
+        "{env}"
+    );
+    assert!(env.contains("CADENCE_ALIAS=w1\n"), "{env}");
+    assert!(
+        !env.contains("CADENCE_CLAUDE_COMMAND="),
+        "override leaked: {env}"
+    );
 }
