@@ -24,7 +24,7 @@ Run the merges exactly as listed, in order. After each: confirm `MERGED`, and af
 - Tracker: `cadence issue set <ID> status=done`; `cadence issue comment <ID> -m "Merged as <sha> (PR #<n>). Verdict: <note>"`; verify the comment file landed.
 - Worktrees: `cadence issue finish <ID> --remote` (never `--force` without approval).
 - Tell every author with an open PR that main moved: `cadence send <author> --reply-to qa-1 --text "main moved to <sha> (<files>): rebase before you report, keep main's code in conflicts, prove no net deletions"`; cancel their older superseded "main moved" notices.
-- When a merge touches `src/daemon.rs`, `src/store.rs` or `src/adapter/`, restart the live daemon onto it: `cadence daemon restart --when-idle --ui` (yours; adoption keeps pty turns), then report the TURN table.
+- When a merge touches `src/daemon.rs`, `src/store.rs` or `src/adapter/`, restart the live daemon onto it: `cadence daemon restart --when-idle --ui` (yours; adoption keeps pty turns), then report the TURN table. The rollout lease gates a build change and a schema crossing. A same-build `daemon stop` followed by `daemon start`, or a crash restart of the same build, stays lease-free; the lease check on that same-build restart is advisory.
 - Smoke check and one-line report, and the revert rule, exactly as in risk-classes.md.
 
 ## Host care, every session

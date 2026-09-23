@@ -14,7 +14,7 @@
 //! `CADENCE_ROLLOUT_BOOTSTRAP=1`, which allows only schema 11 → 12 when
 //! `rollout_leases` is absent. It does not authorize any later crossing.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -41,6 +41,25 @@ thread_local! {
     /// Test override so a bootstrap opt-in does not leak across threads
     /// through the process environment.
     static BOOTSTRAP_FORCE: Cell<Option<bool>> = const { Cell::new(None) };
+    /// Test override for the identity allowed to migrate. Unset in
+    /// production; the daemon reads `CADENCE_ROLLOUT_AS` then
+    /// `CADENCE_ALIAS`.
+    static MIGRATION_HOLDER: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// Identity passed on `daemon run --rollout-as`. Kept out of the
+    /// process environment so panes do not inherit it.
+    static FORWARDED_AS: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Remember the holder forwarded by `daemon start` for this process.
+pub fn set_forwarded_identity(identity: Option<String>) {
+    let identity = identity
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    FORWARDED_AS.with(|slot| *slot.borrow_mut() = identity);
+}
+
+fn forwarded_identity() -> Option<String> {
+    FORWARDED_AS.with(|slot| slot.borrow().clone())
 }
 
 pub fn default_ttl() -> Duration {
@@ -53,7 +72,41 @@ fn bootstrap_requested() -> bool {
     }
     std::env::var("CADENCE_ROLLOUT_BOOTSTRAP").ok().as_deref() == Some("1")
 }
-const MAX_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// Identity allowed to migrate: the test override, else the identity
+/// forwarded into this process, else the pane alias.
+fn caller_for_migration() -> Option<String> {
+    let forced = MIGRATION_HOLDER.with(|slot| slot.borrow().clone());
+    if forced.is_some() {
+        return forced;
+    }
+    forwarded_identity()
+        .or_else(|| env_nonempty("CADENCE_ROLLOUT_AS"))
+        .or_else(|| env_nonempty("CADENCE_ALIAS"))
+}
+
+/// Caller inside `daemon run`: the argv identity wins, so a pane alias
+/// inherited from the parent cannot veto the holder who started it.
+fn process_caller() -> Result<Caller> {
+    if let Some(identity) = forwarded_identity() {
+        validate_identity(&identity)?;
+        return Ok(Caller {
+            identity,
+            source: "as",
+        });
+    }
+    resolve_caller(None)
+}
+
+fn env_nonempty(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+const MAX_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const FORCE_RELEASE_HINT: &str = "A dead holder is cleared with \
+     `cadence rollout release --force --reason \"<why>\" --as operator:<name>`";
 const GATE_LOG: &str = "rollout-gate.jsonl";
 
 /// A crossing `authorize_migration` has allowed but not yet recorded.
@@ -150,16 +203,20 @@ pub fn parse_ttl(raw: &str) -> Result<Duration> {
         .ok_or_else(|| Error::rejected("ttl is too large"))?;
     let ttl = Duration::from_secs(secs);
     if ttl > MAX_TTL {
-        return Err(Error::rejected("ttl cannot exceed 30 days"));
+        return Err(Error::rejected("ttl cannot exceed 7 days"));
     }
     Ok(ttl)
 }
 
 pub fn resolve_caller(explicit_as: Option<&str>) -> Result<Caller> {
-    let alias = std::env::var("CADENCE_ALIAS").ok();
-    let rollout_as = std::env::var("CADENCE_ROLLOUT_AS").ok();
-    let explicit = explicit_as.or(rollout_as.as_deref());
-    resolve_caller_with(alias.as_deref(), explicit)
+    let alias = env_nonempty("CADENCE_ALIAS");
+    let forwarded = explicit_as
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(forwarded_identity)
+        .or_else(|| env_nonempty("CADENCE_ROLLOUT_AS"));
+    resolve_caller_with(alias.as_deref(), forwarded.as_deref())
 }
 
 pub fn resolve_caller_with(alias: Option<&str>, explicit_as: Option<&str>) -> Result<Caller> {
@@ -237,7 +294,7 @@ pub fn authorize_migration(path: &Path) -> Result<MigrationPermit> {
         });
     }
 
-    if !qualifying_receipt(path, version)? {
+    if !qualifying_receipt(path, version, caller_for_migration().as_deref())? {
         append_gate_log(
             path,
             "rollout_migration_refused",
@@ -335,14 +392,20 @@ pub fn authorize_spawn_for(state_dir: &Path, caller: Result<Caller>) -> Result<O
     if !path.exists() {
         return Ok(caller.ok().map(|c| c.identity));
     }
-    let conn = connect(&path)?;
-    let recorded = read_build(&conn)?;
+    // Read-only peek. A refused start must not open the live file
+    // read-write (that creates `-wal`/`-shm` and can checkpoint).
+    let peek = open_peek(&path)?;
+    let recorded = read_build(&peek.conn).map_err(|error| {
+        Error::rejected(format!(
+            "daemon start refused: could not read the recorded build ({error})"
+        ))
+    })?;
     let current = crate::overview::BUILD_COMMIT;
     if recorded.is_none() || recorded.as_deref() == Some(current) {
         return Ok(caller.ok().map(|c| c.identity));
     }
     let caller = caller?;
-    match holder_block(&conn, &caller, unix_now())? {
+    match holder_block(&peek.conn, &caller, unix_now())? {
         None => Ok(Some(caller.identity)),
         Some(block) => {
             let message = format!(
@@ -350,6 +413,7 @@ pub fn authorize_spawn_for(state_dir: &Path, caller: Result<Caller>) -> Result<O
                  recorded build {} and {block}",
                 recorded.clone().unwrap_or_default()
             );
+            let conn = connect(&path)?;
             let _ = insert_event(
                 &conn,
                 "rollout_start_refused",
@@ -368,16 +432,17 @@ pub fn authorize_spawn_for(state_dir: &Path, caller: Result<Caller>) -> Result<O
 
 /// Backstop inside `daemon run` for a binary started without `daemon start`.
 pub fn enforce_running_build(conn: &Connection) -> Result<()> {
-    let recorded = match read_build(conn) {
-        Ok(v) => v,
-        Err(_) => return Ok(()),
-    };
+    let recorded = read_build(conn).map_err(|error| {
+        Error::rejected(format!(
+            "daemon run refused: could not read the recorded build ({error})"
+        ))
+    })?;
     let current = crate::overview::BUILD_COMMIT;
     if recorded.is_none() || recorded.as_deref() == Some(current) {
         return Ok(());
     }
     let now = unix_now();
-    let caller = resolve_caller(None);
+    let caller = process_caller();
     let allowed = match &caller {
         Ok(caller) => holder_block(conn, caller, now)?.is_none(),
         Err(_) => false,
@@ -456,15 +521,10 @@ pub fn recheck_restart(state_dir: &Path, ticket: &RestartTicket) -> Result<()> {
             None
         }
         Some(lease) if lease.status == "active" && lease.expires_at <= now => {
-            mark_ended(&conn, lease.id, "expired", "expiry", now)?;
-            let _ = insert_event(
-                &conn,
-                "rollout_expiry",
-                json!({"holder": lease.holder, "expires_at": lease.expires_at}),
-                now,
-            );
+            // Leave the row active so a later `--takeover` still names
+            // this holder. Ending it here made the refusal's own advice fail.
             Some(format!(
-                "rollout lease expired while waiting for the idle gate (holder {}, expires_at {})",
+                "rollout lease expired while waiting for the idle gate (holder {}, expires_at {}); pass --takeover to claim it",
                 lease.holder,
                 fmt_epoch(lease.expires_at)
             ))
@@ -553,14 +613,11 @@ pub fn status(state_dir: &Path) -> Result<Value> {
     committed(immediate(&conn, |conn| {
         if let Some(lease) = active_lease(conn)? {
             if lease.expires_at <= now {
-                mark_ended(conn, lease.id, "expired", "expiry", now)?;
-                insert_event(
-                    conn,
-                    "rollout_expiry",
-                    json!({"holder": lease.holder, "expires_at": lease.expires_at}),
-                    now,
-                )?;
-                return Ok(TxResult::Done(expired_status(&lease, now)));
+                // Report the expiry without ending the row. Ending it
+                // here made the following `--takeover` find no lease.
+                let mut view = held_status(&lease, now);
+                view["expired"] = json!(true);
+                return Ok(TxResult::Done(view));
             }
             return Ok(TxResult::Done(held_status(&lease, now)));
         }
@@ -587,6 +644,78 @@ pub fn release(state_dir: &Path, caller: &Caller) -> Result<Value> {
             json!({"released": true, "holder": lease.holder, "lease_id": lease.id}),
         ))
     }))
+}
+
+/// Operator override for a holder who is gone. Does not require the
+/// caller to be the holder. Records the ousted holder.
+pub fn release_forced(state_dir: &Path, caller: &Caller, reason: &str) -> Result<Value> {
+    validate_reason(reason)?;
+    if caller.source != "as" {
+        return Err(Error::rejected(
+            "rollout release --force requires an operator identity outside a cadence pane \
+             (`--as operator:<name> --reason \"<why>\"`). A pane's $CADENCE_ALIAS cannot force-release.",
+        ));
+    }
+    reject_registered_alias(state_dir, caller)?;
+    let conn = connect_ensured(&db_file(state_dir))?;
+    let now = unix_now();
+    committed(immediate(&conn, |conn| {
+        let Some(lease) = active_lease(conn)? else {
+            return Ok(TxResult::Refuse("no rollout lease is held".into()));
+        };
+        mark_ended(conn, lease.id, "released", "force", now)?;
+        insert_event(
+            conn,
+            "rollout_release",
+            json!({
+                "holder": lease.holder,
+                "ousted_holder": lease.holder,
+                "lease_id": lease.id,
+                "forced": true,
+                "by": caller.identity,
+                "reason": reason,
+            }),
+            now,
+        )?;
+        Ok(TxResult::Done(json!({
+            "released": true,
+            "forced": true,
+            "holder": lease.holder,
+            "by": caller.identity,
+        })))
+    }))
+}
+
+/// `--as` must not name a registered pane. The pane's own
+/// `$CADENCE_ALIAS` (source `alias`) is still a valid holder.
+pub fn reject_registered_alias(state_dir: &Path, caller: &Caller) -> Result<()> {
+    if caller.source != "as" {
+        return Ok(());
+    }
+    let path = db_file(state_dir);
+    if !path.exists() {
+        return Ok(());
+    }
+    let peek = open_peek(&path)?;
+    if !table_exists(&peek.conn, "agents")? {
+        return Ok(());
+    }
+    let found: Option<i64> = peek
+        .conn
+        .query_row(
+            "SELECT 1 FROM agents WHERE alias=?1",
+            [&caller.identity],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if found.is_some() {
+        return Err(Error::rejected(format!(
+            "--as {} is a registered agent alias; pass an operator identity \
+             such as --as operator:name",
+            caller.identity
+        )));
+    }
+    Ok(())
 }
 
 pub fn handoff(state_dir: &Path, caller: &Caller, to: &str) -> Result<Value> {
@@ -639,7 +768,9 @@ pub fn handoff(state_dir: &Path, caller: &Caller, to: &str) -> Result<Value> {
 }
 
 pub fn record_backup(state_dir: &Path, caller: &Caller, backup: &Path) -> Result<Value> {
-    let (sha, schema) = inspect_backup(backup)?;
+    let canon = canonical_backup(state_dir, backup)?;
+    let (sha, schema) = inspect_backup(&canon)?;
+    let mtime = file_mtime(&canon)?;
     let conn = connect_ensured(&db_file(state_dir))?;
     let now = unix_now();
     committed(immediate(&conn, |conn| {
@@ -647,18 +778,27 @@ pub fn record_backup(state_dir: &Path, caller: &Caller, backup: &Path) -> Result
             TxResult::Done(lease) => lease,
             TxResult::Refuse(message) => return Ok(TxResult::Refuse(message)),
         };
+        // One second of slack: many filesystems store mtime in whole seconds.
+        if mtime + 1.0 < lease.claimed_at {
+            return Ok(TxResult::Refuse(format!(
+                "backup {} was last modified before this lease was claimed at {}; \
+                 take a new copy after `cadence rollout claim`",
+                canon.display(),
+                fmt_epoch(lease.claimed_at)
+            )));
+        }
         conn.execute(
             "UPDATE rollout_leases
              SET backup_path=?1, backup_sha256=?2, backup_schema=?3, backup_taken_at=?4
              WHERE id=?5",
-            params![backup.display().to_string(), sha, schema, now, lease.id],
+            params![canon.display().to_string(), sha, schema, now, lease.id],
         )?;
         insert_event(
             conn,
             "rollout_backup_recorded",
             json!({
                 "holder": lease.holder,
-                "path": backup,
+                "path": canon,
                 "sha256": sha,
                 "schema_version": schema,
                 "taken_at": now,
@@ -668,7 +808,7 @@ pub fn record_backup(state_dir: &Path, caller: &Caller, backup: &Path) -> Result
         Ok(TxResult::Done(json!({
             "recorded": true,
             "holder": lease.holder,
-            "path": backup,
+            "path": canon,
             "sha256": sha,
             "schema_version": schema,
             "taken_at": now,
@@ -676,21 +816,62 @@ pub fn record_backup(state_dir: &Path, caller: &Caller, backup: &Path) -> Result
     }))
 }
 
-pub fn ingest_gate_log(state_dir: &Path, conn: &Connection) -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GateIngest {
+    pub inserted: usize,
+    pub skipped: usize,
+}
+
+pub fn ingest_gate_log(state_dir: &Path, conn: &Connection) -> Result<GateIngest> {
     let path = state_dir.join(GATE_LOG);
     if !path.exists() {
-        return Ok(());
+        return Ok(GateIngest {
+            inserted: 0,
+            skipped: 0,
+        });
     }
     let text = std::fs::read_to_string(&path)?;
-    for line in text.lines().filter(|l| !l.trim().is_empty()) {
-        let v: Value = serde_json::from_str(line).unwrap_or(json!({"raw": line}));
-        let kind = v["kind"].as_str().unwrap_or("rollout_migration_refused");
-        let payload = v.get("payload").cloned().unwrap_or(v.clone());
-        let at = v["at"].as_f64().unwrap_or_else(unix_now);
-        insert_event(conn, kind, payload, at)?;
-    }
+    // Drop the file before inserting. A failure halfway through must
+    // not replay the lines that already landed.
     std::fs::remove_file(&path)?;
-    Ok(())
+    let mut inserted = 0;
+    let mut skipped = 0;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match gate_line_payload(line) {
+            Some(payload) => {
+                insert_event(conn, "rollout_migration_refused", payload, unix_now())?;
+                inserted += 1;
+            }
+            None => skipped += 1,
+        }
+    }
+    Ok(GateIngest { inserted, skipped })
+}
+
+/// Only the shape `append_gate_log` writes. The line's `at` is ignored;
+/// ingest stamps the time and `source` itself.
+fn gate_line_payload(line: &str) -> Option<Value> {
+    let value: Value = serde_json::from_str(line).ok()?;
+    if value.get("kind")?.as_str() != Some("rollout_migration_refused") {
+        return None;
+    }
+    let payload = value.get("payload")?.as_object()?;
+    let from = payload.get("from")?.as_i64()?;
+    let to = payload.get("to")?.as_i64()?;
+    let reason = payload.get("reason")?.as_str()?;
+    if reason.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "from": from,
+        "to": to,
+        "reason": reason,
+        "source": "gate_log",
+    }))
 }
 
 fn claim_in(conn: &Connection, req: &ClaimRequest<'_>) -> Result<TxResult<Value>> {
@@ -698,7 +879,6 @@ fn claim_in(conn: &Connection, req: &ClaimRequest<'_>) -> Result<TxResult<Value>
     if let Some(lease) = existing {
         if lease.expires_at <= req.now {
             if !req.takeover {
-                mark_ended(conn, lease.id, "expired", "expiry", req.now)?;
                 insert_event(
                     conn,
                     "rollout_expiry",
@@ -834,22 +1014,15 @@ fn require_holder(
     };
     if lease.holder != caller.identity {
         return Ok(TxResult::Refuse(format!(
-            "rollout lease is held by {} target {} expires_at {}; only the holder can do this",
+            "rollout lease is held by {} target {} expires_at {}; only the holder can do this. {FORCE_RELEASE_HINT}",
             lease.holder,
             target_of(&lease),
             fmt_epoch(lease.expires_at)
         )));
     }
     if lease.expires_at <= now && !allow_expired {
-        mark_ended(conn, lease.id, "expired", "expiry", now)?;
-        insert_event(
-            conn,
-            "rollout_expiry",
-            json!({"holder": lease.holder, "expires_at": lease.expires_at}),
-            now,
-        )?;
         return Ok(TxResult::Refuse(format!(
-            "rollout lease held by {} expired at {}; pass --takeover to claim it",
+            "rollout lease held by {} expired at {}; pass --takeover to claim it. {FORCE_RELEASE_HINT}",
             lease.holder,
             fmt_epoch(lease.expires_at)
         )));
@@ -868,7 +1041,7 @@ fn holder_block(conn: &Connection, caller: &Caller, now: f64) -> Result<Option<S
     };
     if lease.expires_at <= now {
         return Ok(Some(format!(
-            "rollout lease held by {} target {} expired at {}",
+            "rollout lease held by {} target {} expired at {}; pass --takeover to claim it",
             lease.holder,
             target_of(&lease),
             fmt_epoch(lease.expires_at)
@@ -876,7 +1049,7 @@ fn holder_block(conn: &Connection, caller: &Caller, now: f64) -> Result<Option<S
     }
     if lease.holder != caller.identity {
         return Ok(Some(format!(
-            "rollout lease held by {} target {} expires_at {}",
+            "rollout lease held by {} target {} expires_at {}; only the holder can do this. {FORCE_RELEASE_HINT}",
             lease.holder,
             target_of(&lease),
             fmt_epoch(lease.expires_at)
@@ -885,15 +1058,18 @@ fn holder_block(conn: &Connection, caller: &Caller, now: f64) -> Result<Option<S
     Ok(None)
 }
 
-fn qualifying_receipt(path: &Path, version: i64) -> Result<bool> {
+fn qualifying_receipt(path: &Path, version: i64, holder: Option<&str>) -> Result<bool> {
+    let Some(holder) = holder.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(false);
+    };
     if !lease_table_present(path)? {
         return Ok(false);
     }
-    let conn = connect(path)?;
-    let Some(lease) = active_lease(&conn)? else {
+    let peek = open_peek(path)?;
+    let Some(lease) = active_lease(&peek.conn)? else {
         return Ok(false);
     };
-    if lease.expires_at <= unix_now() {
+    if lease.holder != holder || lease.expires_at <= unix_now() {
         return Ok(false);
     }
     Ok(lease.backup_sha256.is_some()
@@ -917,17 +1093,6 @@ fn held_status(lease: &Lease, now: f64) -> Value {
         "age_secs": now - lease.claimed_at,
         "expires_in_secs": lease.expires_at - now,
         "previous_holder": lease.previous_holder,
-    })
-}
-
-fn expired_status(lease: &Lease, now: f64) -> Value {
-    json!({
-        "held": false,
-        "expired": true,
-        "holder": lease.holder,
-        "target": lease.target_commit,
-        "expires_at": lease.expires_at,
-        "age_secs": now - lease.claimed_at,
     })
 }
 
@@ -972,6 +1137,60 @@ fn host_note() -> String {
     let host =
         std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_else(|_| "unknown".into());
     format!("host={} pid={}", host.trim(), std::process::id())
+}
+
+fn canonical_backup(state_dir: &Path, backup: &Path) -> Result<PathBuf> {
+    let canon = std::fs::canonicalize(backup).map_err(|error| {
+        Error::rejected(format!(
+            "backup path {} is not a readable file: {error}",
+            backup.display()
+        ))
+    })?;
+    let live = db_file(state_dir);
+    if let Ok(live_canon) = std::fs::canonicalize(&live) {
+        let wal = sidecar(&live_canon, "-wal");
+        let shm = sidecar(&live_canon, "-shm");
+        if canon == live_canon || canon == wal || canon == shm {
+            return Err(Error::rejected(format!(
+                "refusing to record the live database {} as its own backup. \
+                 Copy it somewhere outside the state dir, then pass that copy \
+                 to `cadence rollout backup --path`",
+                canon.display()
+            )));
+        }
+    }
+    if let Ok(state) = std::fs::canonicalize(state_dir) {
+        if canon.starts_with(&state) {
+            return Err(Error::rejected(format!(
+                "refusing backup {}: it is inside the state dir. Copy the \
+                 database somewhere else, then pass that copy to \
+                 `cadence rollout backup --path`",
+                canon.display()
+            )));
+        }
+    }
+    Ok(canon)
+}
+
+fn file_mtime(path: &Path) -> Result<f64> {
+    let modified = std::fs::metadata(path)
+        .map_err(|error| {
+            Error::rejected(format!(
+                "backup path {} is not readable: {error}",
+                path.display()
+            ))
+        })?
+        .modified()
+        .map_err(|error| {
+            Error::rejected(format!(
+                "backup path {} has no mtime: {error}",
+                path.display()
+            ))
+        })?;
+    Ok(modified
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs_f64())
+        .unwrap_or(0.0))
 }
 
 fn inspect_backup(path: &Path) -> Result<(String, i64)> {
@@ -1178,29 +1397,62 @@ enum Peek {
     Version(i64),
 }
 
+struct PeekConn {
+    _tmp: Option<tempfile::TempDir>,
+    conn: Connection,
+}
+
 fn peek_schema(path: &Path) -> Result<Peek> {
     if !path.exists() {
         return Ok(Peek::Missing);
     }
-    match peek_user_schema(path) {
-        Ok(None) => Ok(Peek::Fresh),
-        Ok(Some(0)) => Ok(Peek::Fresh),
-        Ok(Some(v)) => Ok(Peek::Version(v)),
-        Err(_) => peek_schema_from_copy(path),
+    match peek_user_schema(path)? {
+        None | Some(0) => Ok(Peek::Fresh),
+        Some(version) => Ok(Peek::Version(version)),
     }
 }
 
 fn peek_user_schema(path: &Path) -> Result<Option<i64>> {
-    let conn = open_immutable(path)?;
-    if !table_exists(&conn, "schema_version")? {
+    let peek = open_peek(path)?;
+    if !table_exists(&peek.conn, "schema_version")? {
         return Ok(None);
     }
-    let version: i64 = conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0))?;
+    let version: i64 = peek
+        .conn
+        .query_row("SELECT version FROM schema_version", [], |r| r.get(0))?;
     Ok(Some(version))
 }
 
-fn peek_schema_from_copy(path: &Path) -> Result<Peek> {
-    let tmp = tempfile::tempdir().map_err(|e| Error::internal(format!("peek copy: {e}")))?;
+fn lease_table_present(path: &Path) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let peek = open_peek(path)?;
+    table_exists(&peek.conn, "rollout_leases")
+}
+
+/// Read the database without writing it. A non-empty `-wal` is copied
+/// with its sidecars so a lease that exists only in the WAL is visible;
+/// `immutable=1` would ignore that WAL.
+fn open_peek(path: &Path) -> Result<PeekConn> {
+    if wal_nonempty(path) {
+        return open_peek_copy(path);
+    }
+    match open_immutable(path) {
+        Ok(conn) => Ok(PeekConn { _tmp: None, conn }),
+        Err(_) => open_peek_copy(path),
+    }
+}
+
+fn wal_nonempty(path: &Path) -> bool {
+    std::fs::metadata(sidecar(path, "-wal"))
+        .map(|meta| meta.len() > 32)
+        .unwrap_or(false)
+}
+
+fn open_peek_copy(path: &Path) -> Result<PeekConn> {
+    let tmp =
+        tempfile::tempdir().map_err(|error| Error::internal(format!("peek copy: {error}")))?;
     let copy = tmp.path().join("peek.sqlite3");
     std::fs::copy(path, &copy)?;
     for suffix in ["-wal", "-shm"] {
@@ -1210,29 +1462,10 @@ fn peek_schema_from_copy(path: &Path) -> Result<Peek> {
         }
     }
     let conn = Connection::open(&copy)?;
-    if !table_exists(&conn, "schema_version")? {
-        return Ok(Peek::Fresh);
-    }
-    let version: i64 = conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0))?;
-    if version == 0 {
-        Ok(Peek::Fresh)
-    } else {
-        Ok(Peek::Version(version))
-    }
-}
-
-fn lease_table_present(path: &Path) -> Result<bool> {
-    if !path.exists() {
-        return Ok(false);
-    }
-    if let Ok(conn) = open_immutable(path) {
-        return table_exists(&conn, "rollout_leases");
-    }
-    let tmp = tempfile::tempdir().map_err(|e| Error::internal(format!("peek copy: {e}")))?;
-    let copy = tmp.path().join("peek.sqlite3");
-    std::fs::copy(path, &copy)?;
-    let conn = Connection::open(&copy)?;
-    table_exists(&conn, "rollout_leases")
+    Ok(PeekConn {
+        _tmp: Some(tmp),
+        conn,
+    })
 }
 
 fn open_immutable(path: &Path) -> Result<Connection> {
@@ -1405,19 +1638,20 @@ mod tests {
     }
 
     #[test]
-    fn expired_lease_requires_takeover_and_names_the_previous_holder() {
+    fn expired_claim_refusal_still_allows_takeover() {
         let dir = tempfile::tempdir().unwrap();
         let state = fresh(&dir);
         claim_as(&state, "alice", 1_000.0, Duration::from_secs(10), false).unwrap();
-        let err = claim_as(&state, "bob", 1_020.0, Duration::from_secs(10), false).unwrap_err();
-        assert!(err.to_string().contains("alice"), "{err}");
+        let err = claim_as(&state, "bob", 1_020.0, Duration::from_secs(30), false).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("alice"), "{text}");
+        assert!(text.contains("--takeover"), "{text}");
+        let view = super::status(&state).unwrap();
+        assert_eq!(view["expired"], true, "{view}");
+        assert_eq!(view["holder"], "alice");
+        let err = release(&state, &caller("alice")).unwrap_err();
         assert!(err.to_string().contains("--takeover"), "{err}");
-        let err = claim_as(&state, "bob", 1_020.0, Duration::from_secs(10), true);
-        // The first refused claim already marked it expired, so the row
-        // is no longer active. Re-seed an expired-but-still-active row.
-        let _ = err;
-        claim_as(&state, "alice", 2_000.0, Duration::from_secs(5), false).unwrap();
-        let ok = claim_as(&state, "bob", 2_010.0, Duration::from_secs(30), true).unwrap();
+        let ok = claim_as(&state, "bob", 1_020.0, Duration::from_secs(30), true).unwrap();
         assert_eq!(ok["holder"], "bob");
         assert_eq!(ok["previous_holder"], "alice");
         let events = events_of(&state);
@@ -1427,6 +1661,7 @@ mod tests {
             .map(|e| &e.1)
             .unwrap();
         assert!(takeover.contains("alice"), "{takeover}");
+        assert!(takeover.contains("previous_holder"), "{takeover}");
     }
 
     #[test]
@@ -1527,6 +1762,7 @@ mod tests {
         let backup = dir.path().join("backup.sqlite3");
         std::fs::copy(&db, &backup).unwrap();
         record_backup(&state, &caller("alice"), &backup).unwrap();
+        let _holder = hold_migration("alice");
         let permit = authorize_migration(&db).unwrap();
         assert_eq!(permit.crossing.unwrap().reason, "backup_receipt");
         let store = Store::open(&db).unwrap();
@@ -1638,6 +1874,18 @@ mod tests {
         };
         let err = recheck_restart(&state, &ticket).unwrap_err();
         assert!(err.to_string().contains("expired"), "{err}");
+        let status: String = Connection::open(db_file(&state))
+            .unwrap()
+            .query_row(
+                "SELECT status FROM rollout_leases WHERE id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            status, "active",
+            "an expired recheck must leave takeover possible"
+        );
     }
 
     #[test]
@@ -1651,6 +1899,256 @@ mod tests {
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
         assert_eq!(SCHEMA_VERSION, 12);
+    }
+
+    struct MigrationHolder;
+    impl Drop for MigrationHolder {
+        fn drop(&mut self) {
+            MIGRATION_HOLDER.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+    fn hold_migration(name: &str) -> MigrationHolder {
+        MIGRATION_HOLDER.with(|slot| *slot.borrow_mut() = Some(name.to_string()));
+        MigrationHolder
+    }
+
+    #[test]
+    fn gate_log_ingests_only_migration_refusals_and_does_not_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = fresh(&dir);
+        let log = state.join(GATE_LOG);
+        let valid = r#"{"kind":"rollout_migration_refused","payload":{"from":11,"to":12,"reason":"no matching backup receipt"},"at":1}"#;
+        std::fs::write(
+            &log,
+            format!(
+                "{valid}\n{{\"kind\":\"rollout_release\",\"payload\":{{\"holder\":\"operator:ada\"}},\"at\":1}}\nnot-json\n{{\"kind\":\"rollout_migration_refused\",\"payload\":{{\"from\":\"nope\"}},\"at\":1}}\n"
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open(db_file(&state)).unwrap();
+        let stats = ingest_gate_log(&state, &conn).unwrap();
+        assert_eq!(stats.inserted, 1);
+        assert_eq!(stats.skipped, 3);
+        assert!(!log.exists());
+        let events = events_of(&state);
+        let refused: Vec<_> = events
+            .iter()
+            .filter(|event| event.0 == "rollout_migration_refused")
+            .collect();
+        assert_eq!(refused.len(), 1, "{events:?}");
+        assert!(
+            refused[0].1.contains("\"source\":\"gate_log\""),
+            "{}",
+            refused[0].1
+        );
+        assert!(events.iter().all(|event| event.0 != "rollout_release"));
+        let at: f64 = conn
+            .query_row(
+                "SELECT at FROM events WHERE kind='rollout_migration_refused'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(at > 1_000_000.0, "line at=1 must not be trusted: {at}");
+        let again = ingest_gate_log(&state, &conn).unwrap();
+        assert_eq!(again.inserted, 0);
+
+        std::fs::write(&log, format!("{valid}\n{valid}\n")).unwrap();
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER fail_second BEFORE INSERT ON events \
+             WHEN (SELECT COUNT(*) FROM events) >= {} \
+             BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+            before + 1
+        ))
+        .unwrap();
+        assert!(ingest_gate_log(&state, &conn).is_err());
+        assert!(!log.exists());
+        let mid: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mid, before + 1);
+        let replay = ingest_gate_log(&state, &conn).unwrap();
+        assert_eq!(replay.inserted, 0);
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(after, mid);
+    }
+
+    #[test]
+    fn backup_refuses_the_live_database_a_symlink_and_an_old_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = fresh(&dir);
+        claim_as(
+            &state,
+            "alice",
+            unix_now(),
+            Duration::from_secs(3600),
+            false,
+        )
+        .unwrap();
+        let db = db_file(&state);
+        checkpoint(&db);
+        let err = record_backup(&state, &caller("alice"), &db).unwrap_err();
+        assert!(err.to_string().contains("live database"), "{err}");
+        let link = dir.path().join("link.sqlite3");
+        std::os::unix::fs::symlink(&db, &link).unwrap();
+        let err = record_backup(&state, &caller("alice"), &link).unwrap_err();
+        assert!(err.to_string().contains("live database"), "{err}");
+        let dotted = dir.path().join("nested");
+        std::fs::create_dir_all(&dotted).unwrap();
+        let via_dots = dotted.join("../state/cadence.sqlite3");
+        let err = record_backup(&state, &caller("alice"), &via_dots).unwrap_err();
+        assert!(err.to_string().contains("live database"), "{err}");
+        std::fs::write(sidecar(&db, "-wal"), b"wal-bytes-padding-over-32-bytes!!").unwrap();
+        let err = record_backup(&state, &caller("alice"), &sidecar(&db, "-wal")).unwrap_err();
+        assert!(err.to_string().contains("live database"), "{err}");
+        let old = dir.path().join("old.sqlite3");
+        std::fs::copy(&db, &old).unwrap();
+        let file = std::fs::File::options().write(true).open(&old).unwrap();
+        file.set_modified(SystemTime::UNIX_EPOCH).unwrap();
+        drop(file);
+        let err = record_backup(&state, &caller("alice"), &old).unwrap_err();
+        assert!(
+            err.to_string().contains("before this lease was claimed"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn non_holder_cannot_migrate_even_with_a_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = fresh(&dir);
+        let db = downgrade_to_v11(&state);
+        claim_as(
+            &state,
+            "alice",
+            unix_now(),
+            Duration::from_secs(3600),
+            false,
+        )
+        .unwrap();
+        checkpoint(&db);
+        let backup = dir.path().join("backup.sqlite3");
+        std::fs::copy(&db, &backup).unwrap();
+        record_backup(&state, &caller("alice"), &backup).unwrap();
+        checkpoint(&db);
+        let before = std::fs::read(&db).unwrap();
+        let _intruder = hold_migration("bob");
+        let err = authorize_migration(&db).unwrap_err();
+        drop(_intruder);
+        assert!(err.to_string().contains("backup"), "{err}");
+        assert_eq!(std::fs::read(&db).unwrap(), before);
+        assert!(!sidecar(&db, "-wal").exists());
+        let version: i64 = open_peek(&db)
+            .unwrap()
+            .conn
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 11);
+    }
+
+    #[test]
+    fn peek_sees_a_receipt_that_lives_only_in_the_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = fresh(&dir);
+        let db = downgrade_to_v11(&state);
+        checkpoint(&db);
+        let main_before = std::fs::read(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.pragma_update(None, "wal_autocheckpoint", 0i64)
+            .unwrap();
+        conn.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        )
+        .unwrap();
+        ensure_lease_tables(&conn).unwrap();
+        let now = unix_now();
+        conn.execute(
+            "INSERT INTO rollout_leases(
+                holder, holder_source, host_note, reason, schema_from, schema_to,
+                backup_path, backup_sha256, backup_schema, backup_taken_at,
+                claimed_at, expires_at, status)
+             VALUES('alice','as','','wal',11,12,'/tmp/b','abc',11,?1,?1,?2,'active')",
+            params![now, now + 3600.0],
+        )
+        .unwrap();
+        drop(conn);
+        assert_eq!(std::fs::read(&db).unwrap(), main_before);
+        assert!(wal_nonempty(&db));
+        let _holder = hold_migration("alice");
+        let permit = authorize_migration(&db).unwrap();
+        assert_eq!(permit.crossing.unwrap().reason, "backup_receipt");
+        assert_eq!(std::fs::read(&db).unwrap(), main_before);
+    }
+
+    #[test]
+    fn force_release_records_the_ousted_holder_and_rejects_agent_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = fresh(&dir);
+        claim_as(
+            &state,
+            "alice",
+            unix_now(),
+            Duration::from_secs(3600),
+            false,
+        )
+        .unwrap();
+        let err = release_forced(
+            &state,
+            &Caller {
+                identity: "pane".into(),
+                source: "alias",
+            },
+            "holder died",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("operator"), "{err}");
+        Connection::open(db_file(&state))
+            .unwrap()
+            .execute(
+                "INSERT INTO agents(alias, provider, endpoint_kind, role, cwd, sandbox, state, created, updated)
+                 VALUES('ada','fake','fake','worker','/','none','stopped',0,0)",
+                [],
+            )
+            .unwrap();
+        let err = reject_registered_alias(&state, &caller("ada")).unwrap_err();
+        assert!(err.to_string().contains("registered agent alias"), "{err}");
+        let err = release(&state, &caller("operator:ada")).unwrap_err();
+        assert!(err.to_string().contains("release --force"), "{err}");
+        let released = release_forced(&state, &caller("operator:ada"), "holder died").unwrap();
+        assert_eq!(released["holder"], "alice");
+        assert_eq!(released["forced"], true);
+        let events = events_of(&state);
+        let release = events
+            .iter()
+            .find(|event| event.0 == "rollout_release" && event.1.contains("ousted_holder"))
+            .map(|event| &event.1)
+            .unwrap();
+        assert!(release.contains("alice"), "{release}");
+        assert!(release.contains("holder died"), "{release}");
+        assert!(parse_ttl("8d").unwrap_err().to_string().contains("7 days"));
+        assert!(parse_ttl("7d").is_ok());
+    }
+
+    #[test]
+    fn enforce_running_build_fails_closed_when_the_record_cannot_be_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite3");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("CREATE TABLE daemon_build(id INTEGER PRIMARY KEY);")
+            .unwrap();
+        let err = enforce_running_build(&conn).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("could not read the recorded build"),
+            "{err}"
+        );
     }
 
     fn events_of(state: &Path) -> Vec<(String, String)> {

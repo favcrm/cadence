@@ -415,11 +415,20 @@ impl Shared {
     /// candidates the marker carried plus this run's instance id.
     pub fn new_hot(state_dir: &Path, opts: &ServeOptions, hot: HotStart) -> Result<Arc<Self>> {
         let HotStart { instance, marker } = hot;
-        let store = Store::open_adopting(&state_dir.join("cadence.sqlite3"), marker)?;
+        let db_path = state_dir.join("cadence.sqlite3");
+        // Authorise the holder before the store opens the file
+        // read-write and migrates. A direct `daemon run` whose identity
+        // does not hold the lease refuses here and leaves the database
+        // unchanged. `open_adopting` repeats the same check.
+        crate::rollout::authorize_migration(&db_path)?;
+        let store = Store::open_adopting(&db_path, marker)?;
         // Same-build crash restart is allowed with no lease. A different
         // build must already hold one — `daemon start` checks before
         // spawn, and this is the backstop for a direct `daemon run`.
         store.enforce_running_build()?;
+        // `daemon start` passes the holder on argv, not the environment.
+        // Drop a parent-exported copy too, so panes do not inherit it.
+        std::env::remove_var("CADENCE_ROLLOUT_AS");
         store.record_running_build(crate::overview::BUILD_COMMIT)?;
         store.ingest_rollout_gate(state_dir)?;
         let provider_log_dir = state_dir.join("agents");

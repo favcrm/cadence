@@ -61,9 +61,12 @@ enum Commands {
         #[command(subcommand)]
         action: DaemonAction,
     },
-    /// One durable rollout claim. `daemon restart` and a schema crossing
-    /// both require it. Inside a cadence pane the holder is
-    /// `$CADENCE_ALIAS`; outside a pane pass `--as <identity>`.
+    /// One durable rollout claim. The lease gates a build change and a
+    /// schema crossing. A same-build `daemon stop` followed by
+    /// `daemon start`, or a crash restart of the same build, stays
+    /// lease-free; requiring the lease for that same-build
+    /// `daemon restart` is advisory. Inside a cadence pane the holder
+    /// is `$CADENCE_ALIAS`; outside a pane pass `--as <identity>`.
     Rollout {
         #[command(subcommand)]
         action: RolloutAction,
@@ -1232,7 +1235,12 @@ enum TaskAction {
 #[derive(Subcommand)]
 enum DaemonAction {
     /// Run the daemon in the foreground.
-    Run,
+    Run {
+        /// Holder forwarded by `daemon start` / `daemon restart`.
+        /// Not an operator flag — the public switch is `daemon start --as`.
+        #[arg(long, hide = true)]
+        rollout_as: Option<String>,
+    },
     /// Start the daemon detached and print its state.
     Start {
         /// After the daemon is up, resume every resumable registered
@@ -1252,9 +1260,15 @@ enum DaemonAction {
     /// Ask the daemon to shut down gracefully, then wait until the
     /// process has actually exited and released the state-dir lock
     /// (bounded, 30s) — `stop && start` no longer races the drain.
+    /// `daemon stop` is lease-free. A following start of the same
+    /// build is also lease-free.
     Stop,
     /// Stop, wait for exit, start, and report a before/after table of
-    /// every agent's state (and pane pid for pty agents).
+    /// every agent's state (and pane pid for pty agents). The lease
+    /// gates a build change and a schema crossing. This command still
+    /// asks for the lease, but a same-build `daemon stop` followed by
+    /// `daemon start` (or a crash restart of the same build) stays
+    /// lease-free, so that same-build requirement is advisory.
     Restart {
         /// First wait until every pty pane probes idle and no managed
         /// agent has a running message; on timeout nothing is changed.
@@ -1300,11 +1314,19 @@ enum RolloutAction {
     },
     /// Show the active lease, or report that none is held.
     Status,
-    /// Drop the lease. The holder only.
+    /// Drop the lease. The holder only, unless `--force` with an
+    /// operator identity and a reason.
     Release {
         /// Identity outside a cadence pane.
         #[arg(long = "as")]
         as_identity: Option<String>,
+        /// Release a lease whose holder is gone. Requires `--reason`
+        /// and an operator `--as` that is not a registered agent alias.
+        #[arg(long)]
+        force: bool,
+        /// Why the holder is being ousted. Required with `--force`.
+        #[arg(long)]
+        reason: Option<String>,
     },
     /// Pass the lease to another identity. The holder only. The backup
     /// receipt stays with the lease.
@@ -3663,7 +3685,11 @@ fn run() -> Result<i32> {
             Ok(if ok { 0 } else { 1 })
         }
         Commands::Daemon { action } => match action {
-            DaemonAction::Run => {
+            DaemonAction::Run { rollout_as } => {
+                cadence_agent::rollout::set_forwarded_identity(rollout_as);
+                // Never keep the holder in the environment, even if the
+                // parent shell exported it. Panes inherit the daemon's env.
+                std::env::remove_var("CADENCE_ROLLOUT_AS");
                 std::fs::create_dir_all(&state_dir)?;
                 {
                     use std::os::unix::fs::PermissionsExt;
@@ -3723,7 +3749,9 @@ fn run() -> Result<i32> {
         Commands::Rollout { action } => {
             use cadence_agent::rollout::{Caller, ClaimRequest};
             let caller = |as_identity: &Option<String>| -> Result<Caller> {
-                cadence_agent::rollout::resolve_caller(as_identity.as_deref())
+                let caller = cadence_agent::rollout::resolve_caller(as_identity.as_deref())?;
+                cadence_agent::rollout::reject_registered_alias(&state_dir, &caller)?;
+                Ok(caller)
             };
             let result = match action {
                 RolloutAction::Claim {
@@ -3748,8 +3776,24 @@ fn run() -> Result<i32> {
                     )?
                 }
                 RolloutAction::Status => cadence_agent::rollout::status(&state_dir)?,
-                RolloutAction::Release { as_identity } => {
-                    cadence_agent::rollout::release(&state_dir, &caller(&as_identity)?)?
+                RolloutAction::Release {
+                    as_identity,
+                    force,
+                    reason,
+                } => {
+                    let caller = caller(&as_identity)?;
+                    if force {
+                        let reason = reason.ok_or_else(|| {
+                            Error::rejected("rollout release --force requires --reason \"<why>\"")
+                        })?;
+                        cadence_agent::rollout::release_forced(&state_dir, &caller, &reason)?
+                    } else if reason.is_some() {
+                        return Err(Error::rejected(
+                            "--reason is only used with `rollout release --force`",
+                        ));
+                    } else {
+                        cadence_agent::rollout::release(&state_dir, &caller)?
+                    }
                 }
                 RolloutAction::Handoff { to, as_identity } => {
                     cadence_agent::rollout::handoff(&state_dir, &caller(&as_identity)?, &to)?

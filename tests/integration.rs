@@ -28537,3 +28537,212 @@ fn restart_when_idle_aborts_when_the_lease_is_released() {
     let info = d.rpc("daemon_info", json!({})).unwrap();
     assert_eq!(info["started_at"], started, "daemon was restarted: {info}");
 }
+
+fn sqlite_family(state: &std::path::Path) -> Vec<(String, Option<Vec<u8>>)> {
+    let db = state.join("cadence.sqlite3");
+    ["", "-wal", "-shm"]
+        .into_iter()
+        .map(|suffix| {
+            let path = std::path::PathBuf::from(format!("{}{suffix}", db.display()));
+            let bytes = std::fs::read(&path).ok();
+            (suffix.to_string(), bytes)
+        })
+        .collect()
+}
+
+/// A refused schema crossing on the real `daemon start` path must not
+/// rewrite the database or create `-wal`/`-shm`.
+#[test]
+fn daemon_start_refuses_a_lower_schema_without_rewriting_the_file() {
+    let home = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let start = cadence_at(home.path(), state.path(), &["daemon", "start"]);
+    assert!(
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let stop = cadence_at(home.path(), state.path(), &["daemon", "stop"]);
+    assert!(
+        stop.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    let db = state.path().join("cadence.sqlite3");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS rollout_leases;
+         DROP TABLE IF EXISTS daemon_build;
+         UPDATE schema_version SET version=11;
+         PRAGMA wal_checkpoint(TRUNCATE);",
+    )
+    .unwrap();
+    drop(conn);
+    for suffix in ["-wal", "-shm"] {
+        let path = std::path::PathBuf::from(format!("{}{suffix}", db.display()));
+        let _ = std::fs::remove_file(path);
+    }
+    let before = sqlite_family(state.path());
+    let refused = cadence_at(home.path(), state.path(), &["daemon", "start"]);
+    assert!(
+        !refused.status.success(),
+        "{}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    let log = std::fs::read_to_string(state.path().join("daemon.log")).unwrap_or_default();
+    let err = format!("{} {}", String::from_utf8_lossy(&refused.stderr), log);
+    assert!(
+        err.contains("refusing to migrate") || err.contains("rollout"),
+        "{err}"
+    );
+    assert_eq!(sqlite_family(state.path()), before);
+    let version: i64 = rusqlite::Connection::open(&db)
+        .unwrap()
+        .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 11);
+}
+
+/// A receipt is not enough: the migrating process has to be the holder.
+#[test]
+fn daemon_start_by_a_non_holder_does_not_migrate() {
+    let home = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let start = cadence_at(home.path(), state.path(), &["daemon", "start"]);
+    assert!(
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let stop = cadence_at(home.path(), state.path(), &["daemon", "stop"]);
+    assert!(
+        stop.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    let db = state.path().join("cadence.sqlite3");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS rollout_leases;
+         DROP TABLE IF EXISTS daemon_build;
+         UPDATE schema_version SET version=11;
+         PRAGMA wal_checkpoint(TRUNCATE);",
+    )
+    .unwrap();
+    drop(conn);
+    for suffix in ["-wal", "-shm"] {
+        let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+            "{}{suffix}",
+            db.display()
+        )));
+    }
+    let claim = cadence_at(
+        home.path(),
+        state.path(),
+        &[
+            "rollout",
+            "claim",
+            "--reason",
+            "crossing",
+            "--as",
+            "operator:test",
+            "--ttl",
+            "2h",
+        ],
+    );
+    assert!(
+        claim.status.success(),
+        "{}",
+        String::from_utf8_lossy(&claim.stderr)
+    );
+    let backup = home.path().join("backup.sqlite3");
+    std::fs::copy(&db, &backup).unwrap();
+    let recorded = cadence_at(
+        home.path(),
+        state.path(),
+        &[
+            "rollout",
+            "backup",
+            "--path",
+            backup.to_str().unwrap(),
+            "--as",
+            "operator:test",
+        ],
+    );
+    assert!(
+        recorded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recorded.stderr)
+    );
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
+    drop(conn);
+    for suffix in ["-wal", "-shm"] {
+        let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+            "{}{suffix}",
+            db.display()
+        )));
+    }
+    let before = sqlite_family(state.path());
+    let refused = cadence_at(home.path(), state.path(), &["daemon", "start"]);
+    assert!(!refused.status.success());
+    assert_eq!(sqlite_family(state.path()), before);
+    let version: i64 = rusqlite::Connection::open(&db)
+        .unwrap()
+        .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 11);
+}
+
+#[test]
+fn daemon_start_drops_the_forwarded_rollout_identity() {
+    let home = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let start = cadence_at(
+        home.path(),
+        state.path(),
+        &["daemon", "start", "--as", "operator:test"],
+    );
+    assert!(
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let v: Value = serde_json::from_slice(&start.stdout).unwrap();
+    let pid = v["pid"].as_u64().unwrap();
+    let env = std::fs::read(format!("/proc/{pid}/environ")).unwrap();
+    let leaked = env
+        .split(|byte| *byte == 0)
+        .any(|entry| entry.starts_with(b"CADENCE_ROLLOUT_AS="));
+    let stop = cadence_at(home.path(), state.path(), &["daemon", "stop"]);
+    assert!(!leaked, "daemon environ still contains CADENCE_ROLLOUT_AS");
+    assert!(
+        stop.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+}
+
+#[test]
+fn restart_and_rollout_help_say_same_build_restart_is_lease_free() {
+    let home = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    for args in [
+        &["daemon", "restart", "--help"][..],
+        &["rollout", "--help"][..],
+        &["daemon", "stop", "--help"][..],
+    ] {
+        let out = cadence_at(home.path(), state.path(), args);
+        let text = format!(
+            "{} {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "{args:?}\n{text}");
+        assert!(
+            text.contains("lease-free"),
+            "help for {args:?} should say same-build restart is lease-free:\n{text}"
+        );
+    }
+}

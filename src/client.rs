@@ -64,15 +64,15 @@ pub fn daemon_start_as(state_dir: &Path, as_identity: Option<&str>) -> Result<Va
         .append(true)
         .open(state_dir.join("daemon.log"))?;
     let mut command = std::process::Command::new(exe);
-    if let Some(identity) = forward.as_deref().or(as_identity) {
-        command.env("CADENCE_ROLLOUT_AS", identity);
-    } else {
-        command.env_remove("CADENCE_ROLLOUT_AS");
-    }
+    command.env_remove("CADENCE_ROLLOUT_AS");
     command
         .args(["--state-dir"])
         .arg(state_dir)
-        .args(["daemon", "run"])
+        .args(["daemon", "run"]);
+    if let Some(identity) = forward.as_deref().or(as_identity) {
+        command.arg("--rollout-as").arg(identity);
+    }
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log));

@@ -1648,7 +1648,8 @@ impl Store {
     /// refusing to modify.
     pub fn ingest_rollout_gate(&self, state_dir: &Path) -> Result<()> {
         let conn = self.conn();
-        crate::rollout::ingest_gate_log(state_dir, &conn)
+        crate::rollout::ingest_gate_log(state_dir, &conn)?;
+        Ok(())
     }
 
     pub fn agent(&self, alias: &str) -> Result<Agent> {
