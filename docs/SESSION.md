@@ -360,6 +360,14 @@ gate. `scripts/cadence-nextest` verifies the pinned `cargo-nextest
 `--retries 0`, uses `.config/nextest.toml` with `retries = 0`, and takes
 the same `CADENCE_SUITE_LOCK` in an outer `flock` before launching direct
 runs.
+Install it once per host with `scripts/install-cadence-nextest`: both
+checksums are verified and the binary lands in
+`${XDG_DATA_HOME:-~/.local/share}/cadence/tools/cadence-nextest-0.9.145/`
+(operator-approved location, CAD-273), never on PATH, Cargo home or the
+repository. The wrapper finds it there without `CADENCE_NEXTTEST_BIN`,
+which still overrides; CI installs into its own `runner.temp`. A missing or
+untrusted runner shows in `cadence review` as "test runner refused to
+start", not as a failed suite.
 When `cadence review` owns the slot, `src/review.rs` clears the child's
 lock path and sets an explicit held marker; the wrapper then runs without
 a nested flock. `scripts/nextest-inventory` compares non-empty cargo and

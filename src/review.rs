@@ -2205,6 +2205,19 @@ fn push_reason(level: &mut u8, reasons: &mut Vec<String>, l: u8, r: String) {
     reasons.push(r);
 }
 
+/// The wrapper's own refusal line (`cadence-nextest: …`, its `die`
+/// prefix) when the full suite exited before running anything.
+fn runner_refusal(suite: &Value) -> Option<String> {
+    suite["tail"]
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .rfind(|l| !l.is_empty())
+        .filter(|l| l.starts_with("cadence-nextest: "))
+        .map(str::to_string)
+}
+
 /// `pass|needs-hands-on|blocked` with reasons — computed from the
 /// report so the logic is unit-testable.
 pub fn suggest(report: &Value, prepare_failed: bool) -> (&'static str, Vec<String>) {
@@ -2264,8 +2277,28 @@ pub fn suggest(report: &Value, prepare_failed: bool) -> (&'static str, Vec<Strin
         report["full_suite"]["outcome"].as_str(),
         Some("fail") | Some("timeout")
     );
+    // The pinned runner's wrapper refused before any test ran (missing or
+    // untrusted binary, a policy override): one named reason, not a
+    // failed suite plus stress runs that "matched nothing" (CAD-273).
+    let runner_refusal = suite_failed
+        .then(|| runner_refusal(&report["full_suite"]))
+        .flatten();
+    if let Some(line) = &runner_refusal {
+        push_reason(
+            &mut level,
+            &mut reasons,
+            2,
+            format!(
+                "test runner refused to start, so no suite or stress test ran — {line} \
+                 (install with scripts/install-cadence-nextest or set CADENCE_NEXTTEST_BIN)"
+            ),
+        );
+    }
     let comparisons = report["failures"].as_array().cloned().unwrap_or_default();
     for f in &comparisons {
+        if runner_refusal.is_some() && f["source"] == "full_suite" {
+            continue;
+        }
         if f["source"] == "full_suite" && f["result"] == "unknown" {
             push_reason(
                 &mut level,
@@ -2334,7 +2367,7 @@ pub fn suggest(report: &Value, prepare_failed: bool) -> (&'static str, Vec<Strin
             break;
         }
     }
-    if suite_failed && comparisons.is_empty() {
+    if suite_failed && comparisons.is_empty() && runner_refusal.is_none() {
         push_reason(
             &mut level,
             &mut reasons,
@@ -2356,7 +2389,7 @@ pub fn suggest(report: &Value, prepare_failed: bool) -> (&'static str, Vec<Strin
                 ),
             );
         }
-        if s["unknown"].as_u64().unwrap_or(0) > 0 {
+        if s["unknown"].as_u64().unwrap_or(0) > 0 && runner_refusal.is_none() {
             push_reason(
                 &mut level,
                 &mut reasons,
@@ -3166,6 +3199,41 @@ result_path = "target/nextest/cadence/junit.xml"
         r["open_pr_conflicts"] = json!([]);
         r["base_prepare"] = json!([{"outcome": "fail"}]);
         assert_eq!(suggest(&r, false).0, "blocked");
+    }
+
+    /// CAD-273: a missing or untrusted runner is named as such — one
+    /// blocking reason, not a failed suite plus zero-test stress noise.
+    #[test]
+    fn runner_refusal_is_its_own_blocked_reason() {
+        let r = json!({"merge": {}, "prepare": [], "gates": [], "open_pr_conflicts": [],
+            "full_suite": {"outcome": "fail", "tail": ["",
+                "cadence-nextest: pinned cargo-nextest 0.9.145 is not installed"]},
+            "failures": [{"source": "full_suite", "result": "unknown",
+                "reason": "JUnit report x unavailable"}],
+            "stress": [{"test": "t", "runs": 5, "failures": 0, "unknown": 5}]});
+        let (verdict, reasons) = suggest(&r, false);
+        assert_eq!(verdict, "blocked");
+        assert_eq!(reasons.len(), 1, "{reasons:?}");
+        assert!(
+            reasons[0].contains("test runner refused to start"),
+            "{reasons:?}"
+        );
+        assert!(reasons[0].contains("is not installed"), "{reasons:?}");
+        // A real suite failure whose tail merely mentions the wrapper
+        // earlier is still a suite failure.
+        let mut real = r.clone();
+        real["full_suite"]["tail"] = json!(["cadence-nextest: note", "test result: FAILED"]);
+        let (_, reasons) = suggest(&real, false);
+        assert!(
+            !reasons.iter().any(|m| m.contains("refused to start")),
+            "{reasons:?}"
+        );
+        assert!(
+            reasons
+                .iter()
+                .any(|m| m.contains("no executable testcase evidence")),
+            "{reasons:?}"
+        );
     }
 
     #[test]
