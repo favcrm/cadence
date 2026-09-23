@@ -3916,7 +3916,10 @@ impl Store {
     /// assigned to the alias (CAD-284). `force` overrides that check
     /// only: queued/submitting messages are cancelled, running ones
     /// interrupted, and one `agent_remove_forced` event on the daemon
-    /// stream names what was overridden. Callers must hold the lifecycle
+    /// stream names what was overridden. An `unknown` message refuses
+    /// even `force` until it is reconciled, so removal never deletes an
+    /// unknown row and never leaves one behind to fence a re-registered
+    /// alias. Callers must hold the lifecycle
     /// check (the daemon rejects removal of an owned alias before
     /// reaching here).
     pub fn remove_agent(&self, alias: &str, force: bool) -> Result<Agent> {
@@ -3966,6 +3969,24 @@ impl Store {
                     "Agent '{alias}' still has open work: {} — finish, cancel \
                      or reassign it, or pass --force to remove anyway",
                     work.join(", ")
+                )));
+            }
+            // An `unknown` outcome is never decided or discarded here:
+            // closing it would claim an outcome nobody learned, keeping
+            // it would fence a re-registered alias, deleting it would
+            // lose the evidence (CAD-284/CAD-304 S1). Reconcile first.
+            let unknown: Vec<&str> = open_messages
+                .iter()
+                .filter(|(_, state)| state == "unknown")
+                .map(|(id, _)| id.as_str())
+                .collect();
+            if let Some(first) = unknown.first() {
+                return Err(Error::rejected(format!(
+                    "--force cannot remove '{alias}' while message(s) {} are \
+                     unknown — reconcile the outcome first: `cadence message \
+                     reconcile {first} --status interrupted|completed|failed` \
+                     or `cadence agent unfence {alias} --no-resume`",
+                    unknown.join(", ")
                 )));
             }
             let error = format!("agent '{alias}' removed with --force");

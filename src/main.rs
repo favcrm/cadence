@@ -1667,7 +1667,9 @@ enum AgentAction {
         alias: String,
         /// Remove despite open messages/tasks: queued messages are
         /// cancelled, running ones interrupted; recorded as an
-        /// `agent_remove_forced` event on the daemon stream.
+        /// `agent_remove_forced` event on the daemon stream. Still
+        /// refused while a message is `unknown` — reconcile it first
+        /// (`message reconcile` or `agent unfence --no-resume`).
         #[arg(long)]
         force: bool,
     },

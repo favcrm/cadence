@@ -6922,6 +6922,94 @@ fn agent_remove_keeps_job_history() {
     );
 }
 
+/// CAD-284 train finding with CAD-250: a job kickoff whose pty turn
+/// was never reported ends `unknown`. `--force` refuses to decide or
+/// discard that outcome; once reconciled it removes the agent, and the
+/// same alias re-registered starts idle and unfenced while `job show`
+/// still resolves the old kickoff.
+#[test]
+fn agent_remove_force_refuses_unknown_kickoff_and_rejoin_is_unfenced() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_stub();
+    d.register("pm");
+    d.wait_agent("pm", "idle", 10);
+    let params = json!({"auto_ready": "verified", "upstream": "pm"});
+    d.register_stub("w1", params.clone());
+    d.wait_agent("w1", "idle", 20);
+    let (spec, sha) = d.spec_file("spec.md", "unknown kickoff");
+    d.job_new("pm", "j1", &spec, &sha);
+    d.rpc(
+        "task_new",
+        json!({"job": "j1", "task": "j1-fix", "assignee": "w1"}),
+    )
+    .unwrap();
+    let kickoff = d.job_dispatch("j1-fix", json!({})).unwrap()["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    pty_token(&d, "w1", &kickoff);
+    d.rpc(
+        "agent_set",
+        json!({"alias": "w1", "patch": {"report_timeout_secs": "1"}}),
+    )
+    .unwrap();
+    d.wait_message("w1", &kickoff, &["unknown"], 20);
+    d.wait_agent("w1", "attention", 20);
+
+    let err = d
+        .rpc("agent_remove", json!({"alias": "w1"}))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains(&format!("message {kickoff} (unknown)")),
+        "{err}"
+    );
+    let err = d
+        .rpc("agent_remove", json!({"alias": "w1", "force": true}))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains(&format!("message reconcile {kickoff}")),
+        "{err}"
+    );
+    assert_eq!(d.message_state("w1", &kickoff), "unknown");
+    assert!(forced_removals(&d).is_empty());
+
+    d.rpc(
+        "message_reconcile",
+        json!({"message": kickoff, "status": "interrupted"}),
+    )
+    .unwrap();
+    // The task is still open, so removal still needs --force.
+    d.rpc("agent_remove", json!({"alias": "w1", "force": true}))
+        .unwrap();
+    let forced = forced_removals(&d);
+    assert_eq!(forced.len(), 1, "{forced:?}");
+    assert_eq!(forced[0]["payload"]["messages"], json!([]), "{forced:?}");
+
+    d.register_stub("w1", params);
+    d.wait_agent("w1", "idle", 20);
+    let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
+    assert_eq!(show["unknown"], 0, "{show}");
+    assert_eq!(show["queued"], 0, "{show}");
+    let task = d.rpc("job_show", json!({"job": "j1"})).unwrap()["job"]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == "j1-fix")
+        .unwrap()
+        .clone();
+    assert_eq!(task["kickoff"]["id"], kickoff.as_str(), "{task}");
+    assert_eq!(task["kickoff"]["state"], "interrupted", "{task}");
+    // The new incarnation takes new work — nothing old fences it.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "fresh", "message": "fresh-1"}),
+    )
+    .unwrap();
+    pty_token(&d, "w1", "fresh-1");
+}
+
 #[test]
 fn fenced_agent_resume_hint() {
     let d = TestDaemon::start();
@@ -8928,17 +9016,26 @@ fn pty_stop_remove_gc_kill_surviving_panes() {
     // `agent stop` on a fenced agent is the explicit kill.
     d.rpc("agent_stop", json!({"alias": "dv-stop"})).unwrap();
     wait_pid_gone(&d.pane_file(&mock, "dv-stop", "pid"), 10);
-    // The fence's `unknown` message is open work (CAD-284): a plain
-    // `agent remove` refuses and leaves the pane alone; `--force`
-    // removes the row and kills the pane.
+    // The fence's `unknown` message is open work (CAD-284): `agent
+    // remove` — even `--force` — refuses and leaves the pane alone;
+    // once reconciled, remove drops the row and kills the pane.
     let err = d
         .rpc("agent_remove", json!({"alias": "dv-rm"}))
         .unwrap_err()
         .to_string();
     assert!(err.contains("message m-dv-rm (unknown)"), "{err}");
+    let err = d
+        .rpc("agent_remove", json!({"alias": "dv-rm", "force": true}))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("message reconcile m-dv-rm"), "{err}");
     assert!(pid_alive(&d.pane_file(&mock, "dv-rm", "pid")));
-    d.rpc("agent_remove", json!({"alias": "dv-rm", "force": true}))
-        .unwrap();
+    d.rpc(
+        "message_reconcile",
+        json!({"message": "m-dv-rm", "status": "interrupted"}),
+    )
+    .unwrap();
+    d.rpc("agent_remove", json!({"alias": "dv-rm"})).unwrap();
     wait_pid_gone(&d.pane_file(&mock, "dv-rm", "pid"), 10);
     assert!(d.rpc("agent_show", json!({"alias": "dv-rm"})).is_err());
     // `agent gc` never forces: it skips the fenced agent until its
