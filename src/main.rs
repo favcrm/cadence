@@ -6503,7 +6503,7 @@ fn provider_launch(
     let mut alias = alias.clone();
     if alias.is_none() {
         if let Some(name) = &resume {
-            if let Ok(show) = client::rpc(state_dir, "agent_show", json!({"alias": name})) {
+            if let Some(show) = lookup_agent(state_dir, name)? {
                 let found = &show["agent"];
                 let known_provider = found["provider"].as_str().unwrap_or_default();
                 if known_provider != provider {
@@ -6521,11 +6521,14 @@ fn provider_launch(
     let alias = alias
         .or_else(|| resume.clone())
         .unwrap_or_else(|| format!("{provider}-{}", &Uuid::new_v4().simple().to_string()[..6]));
-    // An alias keeps its provider — refuse before any worktree, register
-    // or resume rather than reopen the old agent under the new verb.
-    if let Ok(show) = client::rpc(state_dir, "agent_show", json!({"alias": alias})) {
+    // An alias keeps its provider and endpoint kind — refuse before any
+    // worktree, register or resume rather than reopen the old agent under
+    // the new verb or flags. The lookup fails closed: only the daemon's
+    // not-found answer means "not registered" (CAD-305).
+    let existing = lookup_agent(state_dir, &alias)?;
+    if let Some(show) = &existing {
         if show["agent"]["alias"].as_str() == Some(alias.as_str()) {
-            refuse_provider_mismatch(&alias, &show["agent"], provider)?;
+            refuse_endpoint_mismatch(&alias, &show["agent"], provider, endpoint_kind)?;
         }
     }
     let cwd = match cwd {
@@ -6535,7 +6538,7 @@ fn provider_launch(
     // `--worktree` creates an isolated checkout under the repo's
     // `.cadence/wt/` — refuse before creating anything when the
     // resolved agent already exists: a reopen keeps its stored cwd.
-    if worktree.is_some() && client::rpc(state_dir, "agent_show", json!({"alias": alias})).is_ok() {
+    if worktree.is_some() && existing.is_some() {
         return Err(Error::rejected(format!(
             "'{alias}' is already registered — --worktree only applies to a \
              new agent; reuse the existing checkout via --cwd"
@@ -6731,7 +6734,7 @@ fn provider_launch(
             // Already registered — reopen rather than fail. A stopped
             // agent is resumed; a live one is reused as-is.
             let show = client::rpc(state_dir, "agent_show", json!({"alias": alias}))?;
-            refuse_provider_mismatch(&alias, &show["agent"], provider)?;
+            refuse_endpoint_mismatch(&alias, &show["agent"], provider, endpoint_kind)?;
             let state = show["agent"]["state"].as_str().unwrap_or_default();
             if matches!(state, "stopped" | "offline") {
                 client::rpc(state_dir, "agent_resume", json!({"alias": alias}))?;
@@ -6915,18 +6918,55 @@ fn join_group(
     )
 }
 
-/// CAD-283: reopening a registered alias under a different provider
-/// would silently resume the old one — refuse, naming both providers and
-/// the remove-then-join path (there is no in-place provider swap).
-fn refuse_provider_mismatch(alias: &str, agent: &Value, provider: &str) -> Result<()> {
+/// The daemon's answer for a name that resolves to no agent, by alias or
+/// provider-native id.
+const UNKNOWN_AGENT: &str = "Unknown managed agent";
+
+/// `agent_show` for a launch's pre-create checks, failing closed: `None`
+/// only for the daemon's not-found answer. Any other error — an
+/// unreachable daemon, an ambiguous native id — is returned, never read
+/// as "not registered", so nothing is created on a guess (CAD-305).
+fn lookup_agent(state_dir: &Path, name: &str) -> Result<Option<Value>> {
+    found_or_absent(client::rpc(state_dir, "agent_show", json!({"alias": name})))
+}
+
+fn found_or_absent(shown: Result<Value>) -> Result<Option<Value>> {
+    match shown {
+        Ok(show) => Ok(Some(show)),
+        Err(Error::Rejected(message)) if message == UNKNOWN_AGENT => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// CAD-283 / CAD-305: reopening a registered alias under a different
+/// provider, or the same provider on a different endpoint kind (managed
+/// vs `--tui`, devin pty vs `--cloud`), would silently resume the old
+/// agent and drop what was asked for — refuse, naming both and the
+/// remove-then-launch path (there is no in-place swap).
+fn refuse_endpoint_mismatch(
+    alias: &str,
+    agent: &Value,
+    provider: &str,
+    endpoint_kind: &str,
+) -> Result<()> {
     let registered = agent["provider"].as_str().unwrap_or_default();
-    if registered == provider {
+    if registered != provider {
+        return Err(Error::rejected(format!(
+            "'{alias}' is already registered as a {registered} agent, not {provider} — \
+             an alias keeps its provider. To replace it, run `cadence agent remove \
+             {alias}`, then launch or join {provider} under that alias"
+        )));
+    }
+    let registered_kind = agent["endpoint_kind"].as_str().unwrap_or_default();
+    if registered_kind == endpoint_kind {
         return Ok(());
     }
     Err(Error::rejected(format!(
-        "'{alias}' is already registered as a {registered} agent, not {provider} — \
-         an alias keeps its provider. To replace it, run `cadence agent remove \
-         {alias}`, then launch or join {provider} under that alias"
+        "'{alias}' is already registered as a {provider} {registered_kind} agent, \
+         not {provider} {endpoint_kind} — an alias keeps its endpoint kind. To \
+         reopen it as registered, run `cadence agent resume {alias}`; to replace \
+         it, run `cadence agent remove {alias}`, then launch or join {provider} \
+         {endpoint_kind} under that alias"
     )))
 }
 
@@ -8522,6 +8562,58 @@ mod tests {
         );
         for cmd in emitted {
             assert_parses(&cmd);
+        }
+    }
+
+    /// CAD-305: only the daemon's not-found answer reads as "absent";
+    /// every other lookup error fails closed.
+    #[test]
+    fn alias_lookup_fails_closed_on_anything_but_not_found() {
+        let show = json!({"agent": {"alias": "a"}});
+        assert_eq!(found_or_absent(Ok(show.clone())).unwrap(), Some(show));
+        assert_eq!(
+            found_or_absent(Err(Error::rejected(UNKNOWN_AGENT))).unwrap(),
+            None
+        );
+        for err in [
+            Error::rejected("Native session id matches more than one agent — use the alias"),
+            Error::internal("Daemon is not reachable at /x — start it"),
+            Error::unknown("connection reset"),
+            Error::invalid("some_code", UNKNOWN_AGENT),
+        ] {
+            let text = err.to_string();
+            assert!(found_or_absent(Err(err)).is_err(), "{text} read as absent");
+        }
+    }
+
+    /// CAD-305: a reopen must match provider AND endpoint kind.
+    #[test]
+    fn endpoint_mismatch_compares_provider_and_kind() {
+        let agent = |p: &str, k: &str| json!({"provider": p, "endpoint_kind": k});
+        assert!(refuse_endpoint_mismatch("a", &agent("devin", "pty"), "devin", "pty").is_ok());
+        let err = refuse_endpoint_mismatch("a", &agent("fake", "fake"), "claude", "pty")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("'a' is already registered as a fake agent, not claude"),
+            "{err}"
+        );
+        for (have, want) in [
+            ("pty", "cloud"),
+            ("cloud", "pty"),
+            ("managed", "pty"),
+            ("pty", "managed"),
+        ] {
+            let err = refuse_endpoint_mismatch("dv", &agent("devin", have), "devin", want)
+                .unwrap_err()
+                .to_string();
+            for needle in [
+                format!("'dv' is already registered as a devin {have} agent, not devin {want}"),
+                "cadence agent remove dv".to_string(),
+                "cadence agent resume dv".to_string(),
+            ] {
+                assert!(err.contains(&needle), "missing {needle:?}: {err}");
+            }
         }
     }
 }
