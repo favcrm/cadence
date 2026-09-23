@@ -9,29 +9,39 @@
 //! 2. `tailscaled_socket` — tailscaled's LocalAPI socket is found and is
 //!    a socket, not a symlink; its owner is tailscaled's uid (only that
 //!    user can create it under `/run/tailscale`);
-//! 3. `localapi` — the LocalAPI answers `status` and `serve-config`;
+//! 3. `localapi` — the LocalAPI answers `status`, `prefs` and
+//!    `serve-config`;
 //! 4. `kernel_networking` — tailscaled uses a TUN device. Under
 //!    userspace networking it dials `127.0.0.1:<port>` itself for any
 //!    tailnet peer the ACL lets reach the port, carrying that peer's
 //!    bytes — tagged nodes included;
-//! 5. `no_tcp_forwarder` — no serve `TCPForward` handler (`serve
+//! 5. `not_operator_user` — the board's uid is not tailscaled's
+//!    `OperatorUser` (prefs; the name resolved to a uid). The operator
+//!    user may reconfigure serve without root, so it can make tailscaled
+//!    dial the board on its behalf at any time: add a TCP forwarder,
+//!    open a connection through it, remove the forwarder, and send the
+//!    request later — no config read can see that. While the board runs
+//!    as that user, every process of it (agents included) could mint any
+//!    identity, so none is trusted;
+//! 6. `no_tcp_forwarder` — no serve `TCPForward` handler (`serve
 //!    --tcp`, `tcp://`) anywhere in the serve config targets the
 //!    board's port: a raw forwarder passes the client's headers through
-//!    untouched, where the HTTPS proxy replaces them;
-//! 6. `client_socket` — the connection's client socket is listed in
+//!    untouched, where the HTTPS proxy replaces them. This catches a
+//!    standing or accidental forwarder; a deliberate one is check 5's;
+//! 7. `client_socket` — the connection's client socket is listed in
 //!    `/proc/net/tcp{,6}`;
-//! 7. `socket_owner` — that socket was created by tailscaled's uid (the
+//! 8. `socket_owner` — that socket was created by tailscaled's uid (the
 //!    table's uid column, readable for another user's socket);
-//! 8. `foreign_uid` — tailscaled's uid is not the board's: otherwise any
+//! 9. `foreign_uid` — tailscaled's uid is not the board's: otherwise any
 //!    same-uid process could pose as it.
 //!
-//! What stays unproven, and is documented in `docs/BOARD.md`: whoever
-//! can make tailscaled open a connection to the board port can still
-//! mint an identity. That is root, and tailscaled's operator user
-//! (`tailscale set --operator`), which can add a TCP forwarder between
-//! two reads — the LocalAPI facts are cached for [`CACHE_TTL`]. A local
-//! process may also browse the tailnet URL itself: the proxy then names
-//! this node's owner, as it would for any tailnet client on this node.
+//! What stays unproven, and is documented in `docs/BOARD.md`: root, and
+//! anyone who is tailscaled's operator user while the board is not (they
+//! can still make tailscaled dial the board). A request the proxy sends
+//! without a login — Funnel from the internet, a tagged node — is proven
+//! to come through serve but names nobody; the board refuses its writes.
+//! A local process may also browse the tailnet URL itself: the proxy then
+//! names this node's owner, as it would for any tailnet client here.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -65,6 +75,7 @@ pub enum Check {
     TailscaledSocket,
     Localapi,
     KernelNetworking,
+    NotOperatorUser,
     NoTcpForwarder,
     ClientSocket,
     SocketOwner,
@@ -78,6 +89,7 @@ impl Check {
             Check::TailscaledSocket => "tailscaled_socket",
             Check::Localapi => "localapi",
             Check::KernelNetworking => "kernel_networking",
+            Check::NotOperatorUser => "not_operator_user",
             Check::NoTcpForwarder => "no_tcp_forwarder",
             Check::ClientSocket => "client_socket",
             Check::SocketOwner => "socket_owner",
@@ -112,6 +124,9 @@ fn refuse(check: Check, why: impl Into<String>) -> Refusal {
 struct Facts {
     /// `status.TUN`: kernel networking. False is userspace networking.
     tun: bool,
+    /// `prefs.OperatorUser` resolved to a uid: `None` when no operator
+    /// is set, `Err` when the name resolves to no user.
+    operator_uid: Result<Option<u32>, String>,
     /// Every `TCPForward` target anywhere in the serve config —
     /// background, foreground sessions and services alike.
     tcp_forwards: Vec<String>,
@@ -144,7 +159,7 @@ pub fn prove(socket: Option<&Path>, board_port: u16, peer: SocketAddr) -> Result
     decide(&facts, board_port, tailscaled_uid, socket_uid, own_uid)
 }
 
-/// Checks 4, 5, 7 and 8 once everything is read.
+/// Checks 4, 5, 6, 8 and 9 once everything is read.
 fn decide(
     facts: &Facts,
     board_port: u16,
@@ -158,6 +173,20 @@ fn decide(
             "tailscaled runs with userspace networking — it dials loopback for any \
              tailnet peer, so its sockets carry that peer's bytes",
         ));
+    }
+    match &facts.operator_uid {
+        Err(why) => return Err(refuse(Check::NotOperatorUser, why.clone())),
+        Ok(Some(uid)) if *uid == own_uid => {
+            return Err(refuse(
+                Check::NotOperatorUser,
+                format!(
+                    "the board's uid {own_uid} is tailscaled's operator user — it can make \
+                     tailscaled dial the board with any headers (sudo tailscale set \
+                     --operator= clears it)"
+                ),
+            ));
+        }
+        Ok(_) => {}
     }
     if let Some(target) = facts
         .tcp_forwards
@@ -229,18 +258,27 @@ fn anchor(socket: Option<&Path>) -> Result<(PathBuf, u32), Refusal> {
 
 type Cached = (Instant, Result<Facts, String>);
 
-/// [`read_facts`] through a per-socket cache of [`CACHE_TTL`].
+/// [`read_facts`] through a per-socket cache of [`CACHE_TTL`]. The
+/// lock is not held across the LocalAPI reads: a slow tailscaled delays
+/// only the requests that need a fresh read.
 fn facts(socket: &Path) -> Result<Facts, String> {
     static CACHE: Mutex<Option<HashMap<PathBuf, Cached>>> = Mutex::new(None);
-    let mut guard = CACHE.lock().unwrap_or_else(|p| p.into_inner());
-    let cache = guard.get_or_insert_with(HashMap::new);
-    if let Some((at, facts)) = cache.get(socket) {
-        if at.elapsed() < CACHE_TTL {
-            return facts.clone();
-        }
+    let cached = CACHE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .get(socket)
+        .filter(|(at, _)| at.elapsed() < CACHE_TTL)
+        .map(|(_, facts)| facts.clone());
+    if let Some(facts) = cached {
+        return facts;
     }
     let facts = read_facts(socket);
-    cache.insert(socket.to_path_buf(), (Instant::now(), facts.clone()));
+    CACHE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(socket.to_path_buf(), (Instant::now(), facts.clone()));
     facts
 }
 
@@ -249,10 +287,54 @@ fn read_facts(socket: &Path) -> Result<Facts, String> {
     let tun = status["TUN"]
         .as_bool()
         .ok_or_else(|| "LocalAPI status carries no TUN field".to_string())?;
+    let prefs = localapi_get(socket, "/localapi/v0/prefs")?;
+    let operator = prefs["OperatorUser"]
+        .as_str()
+        .ok_or_else(|| "LocalAPI prefs carry no OperatorUser field".to_string())?;
+    let operator_uid = match operator {
+        "" => Ok(None),
+        name => uid_of(name).map(Some),
+    };
     let serve = localapi_get(socket, "/localapi/v0/serve-config")?;
     let mut tcp_forwards = Vec::new();
     collect_tcp_forwards(&serve, &mut tcp_forwards);
-    Ok(Facts { tun, tcp_forwards })
+    Ok(Facts {
+        tun,
+        operator_uid,
+        tcp_forwards,
+    })
+}
+
+/// The uid of user `name` (`getpwnam_r`, so NSS users resolve too).
+fn uid_of(name: &str) -> Result<u32, String> {
+    let c_name = std::ffi::CString::new(name)
+        .map_err(|_| format!("tailscaled's operator user {name:?} is not a valid name"))?;
+    // SAFETY: `passwd` is plain data; getpwnam_r fills it, pointing its
+    // strings into `buf`, which outlives every read of `pwd` below.
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0 as libc::c_char; 16 * 1024];
+    let mut found: *mut libc::passwd = std::ptr::null_mut();
+    let rc = unsafe {
+        libc::getpwnam_r(
+            c_name.as_ptr(),
+            &mut pwd,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut found,
+        )
+    };
+    if rc != 0 {
+        return Err(format!(
+            "cannot resolve tailscaled's operator user {name:?}: {}",
+            std::io::Error::from_raw_os_error(rc)
+        ));
+    }
+    if found.is_null() {
+        return Err(format!(
+            "tailscaled's operator user {name:?} is no user on this host"
+        ));
+    }
+    Ok(pwd.pw_uid)
 }
 
 /// Every non-empty `TCPForward` string at any depth — the serve config
@@ -322,6 +404,7 @@ mod tests {
     fn good() -> Facts {
         Facts {
             tun: true,
+            operator_uid: Ok(Some(1001)),
             tcp_forwards: vec!["127.0.0.1:22".into()],
         }
     }
@@ -342,6 +425,27 @@ mod tests {
         assert_eq!(
             check(decide(&userspace, 3010, 0, 0, 1000)),
             Some(Check::KernelNetworking)
+        );
+        let no_operator = Facts {
+            operator_uid: Ok(None),
+            ..good()
+        };
+        assert_eq!(decide(&no_operator, 3010, 0, 0, 1000), Ok(()));
+        let board_is_operator = Facts {
+            operator_uid: Ok(Some(1000)),
+            ..good()
+        };
+        assert_eq!(
+            check(decide(&board_is_operator, 3010, 0, 0, 1000)),
+            Some(Check::NotOperatorUser)
+        );
+        let unknown_operator = Facts {
+            operator_uid: Err("no such user".into()),
+            ..good()
+        };
+        assert_eq!(
+            check(decide(&unknown_operator, 3010, 0, 0, 1000)),
+            Some(Check::NotOperatorUser)
         );
         for target in ["127.0.0.1:3010", "localhost:3010", "[::1]:3010", "garbage"] {
             let fwd = Facts {
@@ -366,6 +470,13 @@ mod tests {
             check(decide(&good(), 3010, 1000, 1000, 1000)),
             Some(Check::ForeignUid)
         );
+    }
+
+    #[test]
+    fn operator_user_names_resolve_to_uids() {
+        assert_eq!(uid_of("root"), Ok(0));
+        assert!(uid_of("no-such-user-cad336").is_err());
+        assert!(uid_of("bad\0name").is_err());
     }
 
     #[test]

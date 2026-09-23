@@ -6541,9 +6541,10 @@ fn tailnet_opts(socket: &Path) -> impl Fn(&mut ui::ServeOpts) + Send + Sync + 's
 }
 
 /// A fake tailscaled LocalAPI (CAD-336): a unix socket, owned by this
-/// test's uid, answering `/localapi/v0/status` with `status.json` and
-/// `/localapi/v0/serve-config` with `serve.json` from its directory,
-/// read per request — a missing file answers `500`. Under `/tmp`: a
+/// test's uid, answering `/localapi/v0/status` with `status.json`,
+/// `/localapi/v0/prefs` with `prefs.json` and `/localapi/v0/serve-config`
+/// with `serve.json` from its directory, read per request — a missing
+/// file answers `500`. Under `/tmp`: a
 /// long TMPDIR would overflow `sun_path`.
 fn fake_localapi() -> (TempDir, PathBuf) {
     let dir = tempfile::Builder::new()
@@ -6568,6 +6569,8 @@ fn fake_localapi() -> (TempDir, PathBuf) {
             let path = req.split_whitespace().nth(1).unwrap_or_default();
             let file = if path.starts_with("/localapi/v0/status") {
                 Some("status.json")
+            } else if path == "/localapi/v0/prefs" {
+                Some("prefs.json")
             } else if path == "/localapi/v0/serve-config" {
                 Some("serve.json")
             } else {
@@ -6587,15 +6590,29 @@ fn fake_localapi() -> (TempDir, PathBuf) {
     (dir, sock)
 }
 
-/// Write the fake LocalAPI's answers: `TUN` (None omits the field) and
-/// the serve config.
+/// Write the fake LocalAPI's answers: `TUN` (None omits the field), no
+/// operator user, and the serve config.
 fn localapi_says(dir: &Path, tun: Option<bool>, serve: Value) {
     let status = match tun {
         Some(t) => json!({"TUN": t, "BackendState": "Running"}),
         None => json!({"BackendState": "Running"}),
     };
     std::fs::write(dir.join("status.json"), status.to_string()).unwrap();
+    localapi_operator(dir, "");
     std::fs::write(dir.join("serve.json"), serve.to_string()).unwrap();
+}
+
+/// The fake LocalAPI's `prefs.OperatorUser` (`""` is none).
+fn localapi_operator(dir: &Path, user: &str) {
+    let prefs = json!({"OperatorUser": user, "WantRunning": true});
+    std::fs::write(dir.join("prefs.json"), prefs.to_string()).unwrap();
+}
+
+/// This test process's user name — the board's user in board tests.
+fn own_user_name() -> String {
+    let out = Command::new("id").arg("-un").output().unwrap();
+    assert!(out.status.success());
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
 /// The serve config `ui tailscale start` makes: https:9450 proxied to
@@ -6688,7 +6705,7 @@ fn tailnet_proof_refusals_name_their_check() {
     let (pm, state) = (TempDir::new().unwrap(), TempDir::new().unwrap());
     seed(pm.path(), state.path());
     type Setup = fn(&Path, u16);
-    let cases: [(&str, Setup); 5] = [
+    let cases: [(&str, Setup); 8] = [
         ("localapi", |d, p| {
             // No TUN field: the status cannot be read as either mode.
             localapi_says(d, None, serve_https_only(p))
@@ -6698,8 +6715,24 @@ fn tailnet_proof_refusals_name_their_check() {
             localapi_says(d, Some(true), json!({}));
             std::fs::remove_file(d.join("serve.json")).unwrap();
         }),
+        ("localapi", |d, p| {
+            // The prefs do not answer: the operator user is unknown.
+            localapi_says(d, Some(true), serve_https_only(p));
+            std::fs::remove_file(d.join("prefs.json")).unwrap();
+        }),
         ("kernel_networking", |d, p| {
             localapi_says(d, Some(false), serve_https_only(p))
+        }),
+        ("not_operator_user", |d, p| {
+            // The board's user is tailscaled's operator: it could make
+            // tailscaled dial the board at will (qa-1 round 2).
+            localapi_says(d, Some(true), serve_https_only(p));
+            localapi_operator(d, &own_user_name());
+        }),
+        ("not_operator_user", |d, p| {
+            // An operator name that resolves to no user: fail closed.
+            localapi_says(d, Some(true), serve_https_only(p));
+            localapi_operator(d, "no-such-user-cad336");
         }),
         ("no_tcp_forwarder", |d, p| {
             // qa-1's attack: `tailscale serve --tcp=N tcp://127.0.0.1:<board>`
@@ -6711,7 +6744,10 @@ fn tailnet_proof_refusals_name_their_check() {
             localapi_says(d, Some(true), serve)
         }),
         ("foreign_uid", |d, p| {
-            localapi_says(d, Some(true), serve_https_only(p))
+            // Another user (root) is the operator: every config check
+            // passes, and the fake tailscaled's own uid refuses last.
+            localapi_says(d, Some(true), serve_https_only(p));
+            localapi_operator(d, "root");
         }),
     ];
     for (want, setup) in cases {

@@ -687,50 +687,75 @@ on the first that cannot be read or does not hold:
 |---|---|
 | `loopback` | the TCP peer is a loopback address |
 | `tailscaled_socket` | tailscaled's LocalAPI socket is at `/run/tailscale/tailscaled.sock` (or `/var/run/…`) and is a socket, not a symlink — its owner is tailscaled's uid |
-| `localapi` | the LocalAPI answers `status` and `serve-config` (read-only; cached 2 s) |
+| `localapi` | the LocalAPI answers `status`, `prefs` and `serve-config` (read-only, over that socket; cached 2 s) |
 | `kernel_networking` | `status.TUN` is true. Under userspace networking tailscaled itself dials `127.0.0.1:<port>` for any tailnet peer the ACL lets reach the port — tagged nodes too — so its sockets carry that peer's bytes |
+| `not_operator_user` | the board's uid is not tailscaled's `OperatorUser` (`prefs`, the name resolved to a uid; a name that resolves to no user refuses) |
 | `no_tcp_forwarder` | no `TCPForward` handler (`tailscale serve --tcp=N tcp://…`) anywhere in the serve config — background, foreground sessions, services — targets the board's port. A raw forwarder passes the client's headers through untouched |
 | `client_socket` | the connection's client socket is listed in `/proc/net/tcp{,6}` |
 | `socket_owner` | that socket was created by tailscaled's uid — the table's `uid` column, readable for another user's socket |
 | `foreign_uid` | tailscaled's uid is not the board's; otherwise any same-uid process could pose as it |
 
-Every request that fails is attributed to its own peer process —
+A request that fails is attributed to its own peer process —
 `operator (ui)`, or the agent it is tied to (see
 [Write identity](#write-identity)) — and its identity headers are never
-read. `GET /api/meta` reports `{read_only, actor, tailnet_proof,
-tailnet_url, version, build_commit, build_time, daemon}`: `actor` is
-the identity this request would write as, `tailnet_proof` is `null`
-for a request that is not tailnet-shaped, else `{"proven": true}` or
-`{"proven": false, "check", "why"}` naming the check that refused.
-`ui tailscale status` sends a local forged login and prints the check
-that ignored it (or `FORGEABLE` if it resolved).
+read. A request that is proven but carries **no** `Tailscale-User-Login`
+(a Funnel client from the internet, a tagged node) names nobody: its
+writes are refused (`403`, `check: "caller_identity"`), never written
+as `operator (ui)`. `GET /api/meta` reports `{read_only, actor,
+tailnet_proof, tailnet_url, version, build_commit, build_time,
+daemon}`: `actor` is the identity this request would write as,
+`tailnet_proof` is `null` for a request that is not tailnet-shaped,
+else `{"proven": true, "login": true|false}` or `{"proven": false,
+"check", "why"}` naming the check that refused. `ui tailscale status`
+sends a local forged login and prints the check that ignored it (or
+`FORGEABLE` if it resolved).
 
-**What is proven:** the connection was opened by tailscaled's uid, from
-a tailscaled in kernel-networking mode whose serve config, as read at
-most 2 s earlier, forwards no raw TCP to the board. Any process at
-the board's (the operator's) uid connecting directly is refused.
+**The boundary.** Tailnet logins are trusted only when the board's
+user is **not** tailscaled's operator user. That user may reconfigure
+`tailscale serve` without root, so it — and every process running as
+it, agents included — can make tailscaled dial the board at any time:
+add a TCP forwarder, open a connection through it, remove the
+forwarder, and send forged headers later. No read of the serve config
+can see a connection that is already open, so `no_tcp_forwarder` only
+catches a standing or accidental forwarder; `not_operator_user` is
+what shuts the deliberate case out.
 
-**What is not proven — the boundary is "whoever can make tailscaled
-open a connection to the board port":**
+**What is proven**, when every check holds: the connection was opened
+by tailscaled (its uid, not the board's), which runs in kernel
+networking mode, whose operator user is not the board's user, and whose
+serve config — as read at most 2 s earlier — forwards no raw TCP to the
+board. A process at the board's uid can neither open such a connection
+nor make tailscaled open one.
+
+**What is not proven:**
 
 - **root**, which can do anything here anyway;
-- **tailscaled's operator user.** `ui tailscale start` expects the
-  board's user to be tailscaled's `OperatorUser` (`tailscale set
-  --operator=$USER`), so that user — and any process running as it,
-  agents included — can reconfigure serve. It can add a TCP forwarder
-  to the board, and a request that arrives before the next LocalAPI
-  read (within the 2 s cache) is believed. The check narrows the
-  window; only running the board as a user that is not tailscaled's
-  operator closes it;
+- **tailscaled's operator user, if it is another account.** It can
+  still make tailscaled dial the board as above; set no operator, or
+  one you trust as much as root;
+- **Funnel and tagged nodes.** They reach the board through the real
+  HTTPS proxy without a login: proven to come through serve, but naming
+  nobody — so their writes are refused. Funnel on the board's port
+  needs root or the operator user; cadence never enables it;
 - **this node itself.** A local process can open the tailnet URL like
-  any tailnet client; the proxy then names this node's owner, which
-  is the operator's own login;
-- **the login is tailscaled's word.** Tagged nodes get no
-  `Tailscale-User-Login`, so their writes land as `operator (ui)`.
+  any tailnet client; the proxy then names this node's owner.
 
 The proof also fails closed on a tailscaled whose LocalAPI socket is
 elsewhere, that runs as the board's own uid, or whose LocalAPI refuses
 the board's user: tailnet logins are then never recorded.
+
+**Keeping tailnet attribution.** A host where `ui tailscale start` ran
+without sudo has made the board's user tailscaled's operator
+(`tailscale set --operator=$USER`), and every tailnet request is then
+refused at `not_operator_user`: no login is recorded, and a tailnet
+write falls to the peer-process rule — `403` wherever the daemon's
+agent store exists, because tailscaled's socket belongs to another
+user (reads still work). To keep tailnet attribution, clear the operator:
+`sudo tailscale set --operator=`. Serve edits then need root:
+`sudo tailscale serve --bg --https=<port> http://127.0.0.1:<ui port>`
+before `ui tailscale start` (which reuses an identical mapping), and
+`sudo tailscale serve --https=<port> off` in place of the removal
+`ui tailscale stop` would do.
 
 Threat model in four lines:
 
