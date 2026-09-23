@@ -32,7 +32,7 @@ use crate::adapter::{
 use crate::client;
 use crate::error::{Error, Result};
 use crate::memory::{self, IdentityProof, NativeIdentity};
-use crate::peer::{unmatched_caller, PeerTies};
+use crate::peer::{unmatched_caller, AgentCaller, AgentMutation, PeerTies};
 use crate::proto;
 use crate::slots::{SlotConfig, SlotKind, Slots};
 use crate::store::{self, Agent, Message, Store, Take};
@@ -1819,7 +1819,7 @@ impl Shared {
                 self.begin_closing();
                 Ok(json!({"state": "stopping"}))
             }
-            "agent_register" => self.rpc_register(params),
+            "agent_register" => self.rpc_register(params, peer_pid),
             "model_defaults_get" => self.rpc_model_defaults_get(),
             "model_defaults_set" => self.rpc_model_defaults_set(params, peer_pid),
             "agent_list" => {
@@ -1941,7 +1941,7 @@ impl Shared {
             "agent_capture" => self.rpc_capture(params),
             "agent_probe" => self.rpc_probe(params),
             "agent_answer" => self.rpc_answer(params, peer_pid),
-            "agent_set" => self.rpc_set(params),
+            "agent_set" => self.rpc_set(params, peer_pid),
             "agent_inbox" => self.rpc_inbox(params),
             "message_report" => self.rpc_message_report(params),
             "message_reconcile" => self.rpc_reconcile(params),
@@ -1977,6 +1977,17 @@ impl Shared {
             "agent_remove" => {
                 let alias = self.resolve_alias(required_str(params, "alias")?)?;
                 let agent = self.store.agent(&alias)?;
+                // CAD-304 S3: removal deletes the agent's history — the
+                // operator's or its own PM's call, never a peer's or its
+                // own (see `authorize_agent_mutation`). Checked before
+                // anything else so a refused caller learns nothing more.
+                let caller = self.authorize_agent_mutation(
+                    params,
+                    peer_pid,
+                    "agent remove",
+                    &agent,
+                    AgentMutation::Controlled,
+                )?;
                 // A live endpoint means an actor is serving it — the
                 // operator must stop it first. Endpoint is checked
                 // before ownership so the error suggests the remedy.
@@ -1990,7 +2001,7 @@ impl Shared {
                          run `cadence agent stop {alias}` first"
                     )));
                 }
-                {
+                let notify = {
                     let lc = self.lifecycle.lock().unwrap();
                     if lc.owned(&alias) {
                         return Err(Error::rejected(format!(
@@ -2005,7 +2016,9 @@ impl Shared {
                         .get("force")
                         .and_then(Value::as_bool)
                         .unwrap_or(false);
-                    self.store.remove_agent(&alias, force)?;
+                    let notify = self
+                        .store
+                        .remove_agent(&alias, force, &caller_audit(&caller))?;
                     // A fenced pty pane may still be alive — remove is
                     // the explicit kill; never leave an orphan session
                     // on the private socket behind a dropped row.
@@ -2013,13 +2026,25 @@ impl Shared {
                         adapter::pty::kill_pane(&self.state_dir, &alias, &self.provider_env);
                     }
                     self.open_attach.lock().unwrap().remove(&alias);
+                    notify
+                };
+                // A forced finish routed notices: wake their actors.
+                for target in &notify {
+                    self.notify_agent(target);
                 }
                 self.wake();
                 Ok(json!({"alias": alias, "state": "removed"}))
             }
             "agent_gc" => {
+                // CAD-304 S3: a sweep removes agents, so each candidate
+                // passes the same caller rule as `agent remove` — the
+                // operator sweeps everything, an agent only the agents
+                // it is PM of; the rest are listed as not permitted.
+                reject_identity_fields(params, "agent gc")?;
+                let caller = self.agent_caller(peer_pid, "agent gc")?;
+                let audit = caller_audit(&caller);
                 let older_than = params.get("older_than").and_then(Value::as_f64);
-                let candidates = self.store.gc_candidates(older_than)?;
+                let (candidates, not_permitted) = self.gc_partition(&caller, older_than)?;
                 let mut removed = Vec::new();
                 {
                     let lc = self.lifecycle.lock().unwrap();
@@ -2030,7 +2055,7 @@ impl Shared {
                             continue;
                         }
                         // Open work refuses (CAD-284): skip, never force.
-                        if self.store.remove_agent(&agent.alias, false).is_ok() {
+                        if self.store.remove_agent(&agent.alias, false, &audit).is_ok() {
                             // A fenced pty pane may still be alive — gc is
                             // the explicit kill; no orphan sessions behind
                             // dropped rows.
@@ -2047,7 +2072,22 @@ impl Shared {
                     }
                 }
                 self.wake();
-                Ok(json!({"removed": removed}))
+                let mut out = json!({"removed": removed});
+                if !not_permitted.is_empty() {
+                    out["not_permitted"] = json!(not_permitted);
+                }
+                Ok(out)
+            }
+            "agent_gc_plan" => {
+                // Read-only: what `agent gc` would sweep for THIS caller
+                // and what the caller rule keeps it from sweeping —
+                // `session end --dry-run` renders it.
+                reject_identity_fields(params, "agent gc")?;
+                let caller = self.agent_caller(peer_pid, "agent gc")?;
+                let older_than = params.get("older_than").and_then(Value::as_f64);
+                let (candidates, not_permitted) = self.gc_partition(&caller, older_than)?;
+                let candidates: Vec<String> = candidates.into_iter().map(|a| a.alias).collect();
+                Ok(json!({"candidates": candidates, "not_permitted": not_permitted}))
             }
             "agent_resume" => {
                 let alias = self.resolve_alias(required_str(params, "alias")?)?;
@@ -2658,6 +2698,177 @@ impl Shared {
         )
     }
 
+    /// The caller of an agent-mutating verb (CAD-149, CAD-304 S3), from
+    /// the connection alone — the slot derivation, then positive
+    /// operator proof:
+    ///
+    /// - the NEAREST registered pane or enrolled managed endpoint on
+    ///   the peer's `/proc` ancestry IS that agent
+    ///   ([`Self::slot_identity`]) — the unforgeable signal; a failed
+    ///   strict verification or an ambiguous node refuses;
+    /// - deriving none, the peer is the operator only on
+    ///   [`crate::peer::operator_proof`] (CAD-276): a `setsid` detach
+    ///   of a pane that keeps its env or pty, a process the daemon
+    ///   launched (an unenrolled managed worker's tools), an orphaned
+    ///   session — all refused, never defaulted to `operator`.
+    ///
+    /// `CADENCE_ALIAS`, `--reviewer`-style claims and request fields
+    /// never participate. Residual, as for `slot_reconcile`: a same-uid
+    /// process that leaves every pane's ancestry without orphaning its
+    /// session and scrubs its env and stdio passes operator proof —
+    /// CAD-280 (operator by positive proof) is where that tightens.
+    fn agent_caller(&self, peer_pid: u32, verb: &str) -> Result<AgentCaller> {
+        self.revalidate_enrollments()?;
+        if let Some(who) = self.slot_identity(peer_pid)? {
+            let lane = who.lane();
+            if lane.is_empty() {
+                return Err(Error::rejected(format!(
+                    "{verb} refused: caller pid {peer_pid} descends from a pane \
+                     whose agent cannot be named — caller identity underivable"
+                )));
+            }
+            return Ok(AgentCaller::Agent(lane.to_string()));
+        }
+        self.operator_evidence(peer_pid)
+            .map(|()| AgentCaller::Operator)
+            .map_err(|why| {
+                Error::rejected(format!(
+                    "{verb} refused: this connection derives no agent identity and \
+                     is not provably the operator: {why}. Run it from the calling \
+                     agent's own pane, or from an attached operator shell outside \
+                     every pane and managed endpoint (caller rule, CAD-149)"
+                ))
+            })
+    }
+
+    /// Authorize one agent-mutating request against `target` (CAD-149,
+    /// CAD-304 S3): identity-shaped request fields are refused, the
+    /// caller is derived ([`Self::agent_caller`]) and the one policy
+    /// ([`crate::peer::may_mutate_agent`]) decides with the target's own
+    /// PM (`params.upstream`). Returns the caller for the audit stamp.
+    fn authorize_agent_mutation(
+        &self,
+        params: &Value,
+        peer_pid: u32,
+        verb: &str,
+        target: &Agent,
+        mutation: AgentMutation,
+    ) -> Result<AgentCaller> {
+        reject_identity_fields(params, verb)?;
+        let caller = self.agent_caller(peer_pid, verb)?;
+        let pm = self.effective_pm(target)?;
+        crate::peer::may_mutate_agent(&caller, &target.alias, pm.as_deref(), mutation, verb)
+            .map_err(Error::rejected)?;
+        Ok(caller)
+    }
+
+    /// Registration is a mutation of the new agent by its caller
+    /// (CAD-149 review F3): an agent the daemon can attribute the
+    /// connection to may register only its OWN member — the new row's
+    /// `params.upstream` must name the caller — and only when the
+    /// caller is a group root (no upstream of its own; groups are one
+    /// level deep). So a worker can neither mint an agent that carries
+    /// trust-bearing params it may not set on itself, nor make itself
+    /// (or a peer) a PM, nor create a root only the operator controls;
+    /// a PM's `join` into its own group works unchanged, with any
+    /// params. An alias that already exists is left to the store's
+    /// duplicate refusal — registration changes nothing then, and the
+    /// launch verbs' reopen path keys off that error.
+    ///
+    /// A connection attributed to no agent is not required to prove
+    /// it is the operator here (unlike `agent set`/`remove`): every
+    /// operator script, launch verb and test harness registers that
+    /// way, including from a shell whose ancestry carries an agent's
+    /// environment. The price is the F1 residual in a wider form — a
+    /// detached worker process registers unchecked — which CAD-280
+    /// (operator by positive proof) closes for both.
+    fn authorize_register(&self, alias: &str, params: &Value, peer_pid: u32) -> Result<()> {
+        if self.store.agent_opt(alias)?.is_some() {
+            return Ok(());
+        }
+        self.revalidate_enrollments()?;
+        let Some(who) = self.slot_identity(peer_pid)? else {
+            return Ok(());
+        };
+        let caller = who.lane();
+        let upstream = params
+            .get("upstream")
+            .and_then(Value::as_str)
+            .filter(|u| !u.is_empty());
+        let caller_pm = match self.store.agent_opt(caller)? {
+            Some(row) => agent_upstream(&row).map(str::to_string),
+            None => {
+                return Err(Error::rejected(format!(
+                    "agent register refused: caller pid {peer_pid} descends from \
+                     pane '{caller}', which names no registered agent"
+                )))
+            }
+        };
+        if upstream == Some(caller) && caller_pm.is_none() {
+            return Ok(());
+        }
+        let why = match (&caller_pm, upstream) {
+            (Some(pm), _) => format!("'{caller}' is a worker in '{pm}''s group"),
+            (None, Some(u)) => format!("the new agent would answer to '{u}', not to '{caller}'"),
+            (None, None) => "the new agent would be a group root".to_string(),
+        };
+        Err(Error::rejected(format!(
+            "agent register refused: agent '{caller}' may register only its own \
+             members (params.upstream = '{caller}') and only as a group root — \
+             {why}. Ask your PM or the operator to register '{alias}' \
+             (caller rule, CAD-149)"
+        )))
+    }
+
+    /// The target's PM for the caller rule: its `params.upstream`, but
+    /// only while the agent registered under that alias predates the
+    /// target (CAD-149 review F2). PM authority is bound to the PM's
+    /// registration, never to the name: a PM that was removed and whose
+    /// alias was registered again — by anyone — gains nothing over the
+    /// members the old PM left behind; they answer to the operator
+    /// until re-homed. `join` resolves the PM before registering the
+    /// member, so a real PM is always older. Timestamps are the store's
+    /// sub-second wall clock; a backwards clock step between a PM's
+    /// removal and its alias's re-registration is the residual.
+    fn effective_pm(&self, target: &Agent) -> Result<Option<String>> {
+        let Some(pm) = agent_upstream(target) else {
+            return Ok(None);
+        };
+        Ok(self
+            .store
+            .agent_opt(pm)?
+            .filter(|row| row.created <= target.created)
+            .map(|row| row.alias))
+    }
+
+    /// The `agent gc` candidates split by the caller rule: `(permitted,
+    /// not_permitted)` — the same decision `agent remove` makes.
+    fn gc_partition(
+        &self,
+        caller: &AgentCaller,
+        older_than: Option<f64>,
+    ) -> Result<(Vec<Agent>, Vec<String>)> {
+        let mut permitted = Vec::new();
+        let mut not_permitted = Vec::new();
+        for agent in self.store.gc_candidates(older_than)? {
+            let pm = self.effective_pm(&agent)?;
+            let allowed = crate::peer::may_mutate_agent(
+                caller,
+                &agent.alias,
+                pm.as_deref(),
+                AgentMutation::Controlled,
+                "agent gc",
+            )
+            .is_ok();
+            if allowed {
+                permitted.push(agent);
+            } else {
+                not_permitted.push(agent.alias);
+            }
+        }
+        Ok((permitted, not_permitted))
+    }
+
     /// `slot_reconcile` — the one mutating operator path over a strict
     /// hold (CAD-230). Operator authority is the connection's: a caller
     /// that derives ANY slot identity (a pane or an enrolled endpoint)
@@ -3259,7 +3470,7 @@ impl Shared {
         Ok(out)
     }
 
-    fn rpc_register(self: &Arc<Self>, params: &Value) -> Result<Value> {
+    fn rpc_register(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
         let alias = required_str(params, "alias")?;
         let provider = required_str(params, "provider")?;
         let endpoint =
@@ -3287,11 +3498,16 @@ impl Shared {
         // Enumerated launch params are validated at the door — a bad
         // value rejected here never lands on the agent row to be
         // replayed into a provider argv on every resume.
-        if let Some(raw) = agent_params {
-            let parsed: Value = serde_json::from_str(raw)
-                .map_err(|_| Error::rejected("'params' must be a JSON object"))?;
-            registry::validate_launch_params(provider, endpoint, &parsed)?;
-        }
+        let parsed = match agent_params {
+            Some(raw) => {
+                let parsed: Value = serde_json::from_str(raw)
+                    .map_err(|_| Error::rejected("'params' must be a JSON object"))?;
+                registry::validate_launch_params(provider, endpoint, &parsed)?;
+                parsed
+            }
+            None => Value::Null,
+        };
+        self.authorize_register(alias, &parsed, peer_pid)?;
         self.store.register_agent(&crate::store::NewAgent {
             alias,
             provider,
@@ -4072,7 +4288,14 @@ impl Shared {
 
     /// Merge key=value pairs into an agent's stored params — how an
     /// existing agent opts into `auto_ready=verified` post-launch.
-    fn rpc_set(self: &Arc<Self>, params: &Value) -> Result<Value> {
+    ///
+    /// Caller rule (CAD-149, [`Self::authorize_agent_mutation`]): the
+    /// operator and the target's own PM may set any allowed key; the
+    /// agent itself only `--next-launch` model/effort
+    /// ([`registry::ParamClass::SelfService`]); anyone else nothing.
+    /// Every accepted change records `params_updated` with the derived
+    /// caller and each key's old and new value.
+    fn rpc_set(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
         let patch = params
             .get("patch")
@@ -4089,6 +4312,21 @@ impl Shared {
             .get("next_launch")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        // Who may change these keys — decided before any validation, so
+        // a refused caller learns nothing about the target's params.
+        let self_service = next_launch
+            && patch
+                .as_object()
+                .unwrap()
+                .keys()
+                .all(|k| registry::param_class(k) == registry::ParamClass::SelfService);
+        let mutation = if self_service {
+            AgentMutation::SelfService
+        } else {
+            AgentMutation::Controlled
+        };
+        let caller =
+            self.authorize_agent_mutation(params, peer_pid, "agent set", &agent, mutation)?;
         for (key, value) in patch.as_object().unwrap() {
             proto::param_key(key)?;
             if next_launch {
@@ -4102,8 +4340,12 @@ impl Shared {
                 registry::validate_live_param(&agent.provider, &agent.endpoint_kind, key, value)?;
             }
         }
-        self.store.set_params(&alias, &patch)?;
+        let mut audit = caller_audit(&caller);
+        audit["caller_pid"] = json!(peer_pid);
+        audit["next_launch"] = json!(next_launch);
+        self.store.set_params_by(&alias, &patch, &audit)?;
         if next_launch {
+            self.wake();
             return Ok(json!({"alias": alias, "state": "updated", "applies": "next launch"}));
         }
         // Push the merged params into the live adapter so cached
@@ -7625,6 +7867,31 @@ fn upstream_roots(agents: &[Agent]) -> HashSet<String> {
         .iter()
         .filter_map(|a| agent_upstream(a).map(str::to_string))
         .collect()
+}
+
+/// Request fields that claim an identity — refused on the
+/// agent-mutating verbs (CAD-149): the caller is the connection's,
+/// never a name the request carries.
+const IDENTITY_FIELDS: &[&str] = &[
+    "by", "as", "actor", "caller", "operator", "reviewer", "pane", "lane", "pid",
+];
+
+fn reject_identity_fields(params: &Value, verb: &str) -> Result<()> {
+    for field in IDENTITY_FIELDS {
+        if params.get(field).is_some() {
+            return Err(Error::rejected(format!(
+                "{verb}: caller identity is connection-bound; request field \
+                 '{field}' is not accepted"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `{"by", "by_kind"}` for an agent-mutation audit stamp.
+fn caller_audit(caller: &AgentCaller) -> Value {
+    let (by, by_kind) = caller.audit();
+    json!({"by": by, "by_kind": by_kind})
 }
 
 fn agent_upstream(agent: &Agent) -> Option<&str> {

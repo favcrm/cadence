@@ -830,7 +830,12 @@ mod tests {
         s.finish(&m, "completed", &json!({"text": "ok"}), None)
             .unwrap();
         s.set_agent_state("master", "stopped", None).unwrap();
-        s.remove_agent("master", false).unwrap();
+        s.remove_agent(
+            "master",
+            false,
+            &json!({"by": "operator", "by_kind": "operator"}),
+        )
+        .unwrap();
         assert!(s.thread("master").unwrap().is_none());
         assert!(s.thread_entries("master", 0, 10).unwrap().is_empty());
         // The archived rows stay under the old thread id.
@@ -886,7 +891,12 @@ mod tests {
                 .unwrap();
         }
         s.set_agent_state("master", "stopped", None).unwrap();
-        s.remove_agent("master", false).unwrap();
+        s.remove_agent(
+            "master",
+            false,
+            &json!({"by": "operator", "by_kind": "operator"}),
+        )
+        .unwrap();
         let archived: i64 = s
             .conn()
             .query_row(
