@@ -2250,6 +2250,62 @@ fn ui_write_caller_derives_from_pane_ancestry() {
     assert_eq!(commits(pm.path()), commits_before);
 }
 
+/// CAD-337: the board relays a model-defaults write to the daemon over
+/// its OWN connection, so the daemon's operator gate sees the board
+/// process, not the HTTP caller. A caller the board attributes to a
+/// pane is an agent and is refused here, before any relay, naming the
+/// rule — else an agent could launder the write through the board and
+/// land it as the operator's. Nothing changes.
+#[test]
+fn ui_model_defaults_refuses_pane_agent() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let d = UiDaemon::start_on(state.path().to_path_buf());
+    let port = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+    let host = format!("127.0.0.1:{port}");
+    let doc = r#"{"expected_revision":0,"config":{"schema":1,"providers":{"claude":{"default":{"mode":"model","model":"forged-model"},"roles":{}}}}}"#;
+    let request = format!(
+        "POST /api/settings/model-defaults HTTP/1.0\r\nHost: {host}\r\n\
+         Content-Type: application/json\r\nX-Cadence-Board: 1\r\n\
+         Origin: http://{host}\r\nContent-Length: {}\r\n\r\n{doc}",
+        doc.len()
+    );
+    let mut pane = Command::new("bash")
+        .args(["-c", r#"read -r _; bash -c "$CLIENT"; true"#])
+        .env(
+            "CLIENT",
+            r#"exec 3<>"/dev/tcp/127.0.0.1/$PORT"; printf '%s' "$REQ" >&3; cat <&3"#,
+        )
+        .env("PORT", port.to_string())
+        .env("REQ", &request)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    plant_pane(&d, "pane-m", pane.id());
+    pane.stdin.take().unwrap().write_all(b"go\n").unwrap();
+    let mut response = String::new();
+    pane.stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut response)
+        .unwrap();
+    assert!(pane.wait().unwrap().success());
+    assert!(
+        response.starts_with("HTTP/1.1 403") || response.starts_with("HTTP/1.0 403"),
+        "{response}"
+    );
+    let v: Value = serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(v["check"], "operator_only", "{v}");
+    let msg = v["error"].as_str().unwrap_or_default();
+    assert!(msg.contains("pane-m") && msg.contains("operator"), "{v}");
+    let (code, body) = http(port, "GET", "/api/settings/model-defaults", &host);
+    assert_eq!(code, 200, "{body}");
+    let current: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(current["revision"], 0, "{current}");
+}
+
 /// A POST of `body` as a comment on CAD-3 — the raw request a pane-side
 /// client writes over bash's /dev/tcp.
 fn comment_request(host: &str, body: &str) -> String {
