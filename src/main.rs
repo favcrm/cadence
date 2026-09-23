@@ -195,6 +195,11 @@ enum Commands {
         /// reasoning efforts are validated at open time.
         #[arg(long, value_parser = ["low", "medium", "high", "xhigh", "max", "ultra"])]
         effort: Option<String>,
+        /// Codex approval policy sent on `thread/start`, stored in
+        /// params and replayed on resume [default: never].
+        #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(
+            registry::CODEX_APPROVAL_POLICIES.iter().copied()))]
+        approval_policy: Option<String>,
         /// Seconds without any provider event before a turn is declared
         /// unknown [default: 900]. Liveness is activity-based — a turn
         /// that keeps streaming runs as long as it needs.
@@ -207,7 +212,8 @@ enum Commands {
         /// Codex filesystem sandbox sent on `thread/start` [default:
         /// workspace-write — a cadence-launched worker is writable;
         /// read-only only when asked].
-        #[arg(long, value_parser = ["read-only", "workspace-write"])]
+        #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(
+            registry::CODEX_SANDBOXES.iter().copied()))]
         sandbox: Option<String>,
         /// File with role instructions, sent natively as codex developer
         /// instructions and embedded in the agent's briefing under a
@@ -592,6 +598,11 @@ enum Commands {
         /// open time.
         #[arg(long, value_parser = ["low", "medium", "high", "xhigh", "max"])]
         effort: Option<String>,
+        /// Codex approval policy, stored in params and replayed on
+        /// resume [default: never]. Refused for other providers.
+        #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(
+            registry::CODEX_APPROVAL_POLICIES.iter().copied()))]
+        approval_policy: Option<String>,
         /// Permission mode, replayed on resume. Claude takes its own
         /// modes [default: manual]; devin takes auto, accept-edits,
         /// smart or dangerous; cursor takes auto-review or force.
@@ -4539,6 +4550,7 @@ fn run() -> Result<i32> {
             provider_default_model,
             team_role,
             effort,
+            approval_policy,
             turn_idle_secs,
             turn_max_secs,
             sandbox,
@@ -4570,6 +4582,7 @@ fn run() -> Result<i32> {
             &CodexOpts {
                 model,
                 effort,
+                approval_policy,
                 turn_idle_secs,
                 turn_max_secs,
             },
@@ -4696,6 +4709,7 @@ fn run() -> Result<i32> {
             provider_default_model,
             team_role,
             effort,
+            approval_policy,
             permission_mode,
             allow,
             bypass,
@@ -4754,6 +4768,7 @@ fn run() -> Result<i32> {
                 CodexOpts {
                     model,
                     effort,
+                    approval_policy,
                     turn_idle_secs,
                     turn_max_secs,
                 },
@@ -6391,6 +6406,8 @@ struct CursorOpts {
 struct CodexOpts {
     model: Option<String>,
     effort: Option<String>,
+    /// `params.approval_policy`, replayed on every open.
+    approval_policy: Option<String>,
     /// `params.turn_idle_secs` / `params.turn_max_secs` — the same
     /// activity-based turn liveness as managed claude (CAD-227).
     turn_idle_secs: Option<u64>,
@@ -6463,6 +6480,10 @@ fn provider_launch(
              them in the briefing, which --no-bootstrap skips. Drop \
              --no-bootstrap to deliver them in the briefing"
         )));
+    }
+    // A codex-only setting on another provider is refused, not dropped.
+    if provider != "codex" && codex.approval_policy.is_some() {
+        return Err(Error::rejected("--approval-policy only applies to codex"));
     }
     // `--tui` selects the provider's pty endpoint where one exists;
     // otherwise the launch kind comes from the registry's default.
@@ -6633,6 +6654,10 @@ fn provider_launch(
         if let Some(effort) = &codex.effort {
             registry::codex_effort(effort)?;
             params_obj.insert("effort".to_string(), json!(effort));
+        }
+        if let Some(policy) = &codex.approval_policy {
+            registry::codex_approval_policy(policy)?;
+            params_obj.insert("approval_policy".to_string(), json!(policy));
         }
         if let Some(secs) = codex.turn_idle_secs {
             params_obj.insert("turn_idle_secs".to_string(), json!(secs));

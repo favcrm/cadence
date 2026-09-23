@@ -961,6 +961,14 @@ pub fn devin_permission_mode(mode: &str) -> Result<()> {
 /// posture: no approval round-trips to stall an unattended turn on.
 pub const CODEX_APPROVAL_POLICIES: &[&str] = &["never", "on-request", "on-failure", "untrusted"];
 
+/// The policy a codex open sends when none is stored.
+pub const CODEX_DEFAULT_APPROVAL_POLICY: &str = "never";
+
+/// The Codex `sandbox` values cadence sends on `thread/start` /
+/// `thread/resume`. Codex also knows `danger-full-access`; cadence never
+/// sends it.
+pub const CODEX_SANDBOXES: &[&str] = &["read-only", "workspace-write"];
+
 /// The Codex app-server effort vocabulary. The model metadata queried at
 /// open time is authoritative for the pair: for example, Luna supports
 /// `max` but does not advertise `ultra`, while Astra does.
@@ -990,6 +998,20 @@ pub fn codex_approval_policy(policy: &str) -> Result<()> {
         Err(Error::rejected(format!(
             "unknown codex approval_policy '{policy}' — expected one of: {}",
             CODEX_APPROVAL_POLICIES.join(", ")
+        )))
+    }
+}
+
+/// Reject a Codex sandbox outside [`CODEX_SANDBOXES`] — the adapter's
+/// open runs it on the stored value, and the error names the refused
+/// value and every accepted one.
+pub fn codex_sandbox(sandbox: &str) -> Result<()> {
+    if CODEX_SANDBOXES.contains(&sandbox) {
+        Ok(())
+    } else {
+        Err(Error::rejected(format!(
+            "unknown codex sandbox '{sandbox}' — expected one of: {}",
+            CODEX_SANDBOXES.join(", ")
         )))
     }
 }
@@ -1636,6 +1658,26 @@ mod tests {
         for bad in ["auto", "always", "bypass", "", "NEVER", "on_request"] {
             let msg = codex_approval_policy(bad).unwrap_err().to_string();
             for accepted in CODEX_APPROVAL_POLICIES {
+                assert!(
+                    msg.contains(accepted),
+                    "'{bad}' error missing '{accepted}': {msg}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn codex_sandboxes_validated() {
+        for sandbox in CODEX_SANDBOXES {
+            assert!(codex_sandbox(sandbox).is_ok(), "{sandbox}");
+        }
+        // Everything else rejects — the error names the refused value
+        // and every accepted one. `danger-full-access` is codex vocabulary
+        // cadence never sends.
+        for bad in ["danger-full-access", "", "READ-ONLY", "workspace_write"] {
+            let msg = codex_sandbox(bad).unwrap_err().to_string();
+            assert!(msg.contains(&format!("'{bad}'")), "{msg}");
+            for accepted in CODEX_SANDBOXES {
                 assert!(
                     msg.contains(accepted),
                     "'{bad}' error missing '{accepted}': {msg}"

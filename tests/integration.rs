@@ -4071,6 +4071,210 @@ fn codex_approval_policy_rejected_at_open() {
 }
 
 #[test]
+fn codex_sandbox_rejected_at_open() {
+    // A sandbox hand-edited behind the daemon's back is refused before
+    // the provider process launches — on resume (thread id kept) and on
+    // a fresh open (thread id cleared) alike.
+    let d = TestDaemon::start();
+    let mock = d.mock_codex("ok");
+    d.register_codex("w1");
+    d.wait_agent("w1", "idle", 15);
+    for thread in ["thread_id", "NULL"] {
+        d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+        d.wait_agent("w1", "stopped", 15);
+        wait_pid_gone(&mock.pidfile, 15);
+        std::fs::remove_file(&mock.pidfile).unwrap();
+        let sent = mock_requests(&mock).len();
+        let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+        conn.execute(
+            &format!(
+                "UPDATE agents SET sandbox='danger-full-access', thread_id={thread} \
+                 WHERE alias='w1'"
+            ),
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
+        let agent = d.wait_agent("w1", "attention", 15);
+        let err = agent["error"].as_str().unwrap().to_string();
+        assert!(err.contains("'danger-full-access'"), "{thread}: {err}");
+        for accepted in ["read-only", "workspace-write"] {
+            assert!(
+                err.contains(accepted),
+                "{thread}: open error missing '{accepted}': {err}"
+            );
+        }
+        // Nothing launched: the mock writes its pidfile first thing, and
+        // no second thread/start or thread/resume reached the wire.
+        assert!(!mock.pidfile.exists(), "{thread}: provider was launched");
+        assert_eq!(mock_requests(&mock).len(), sent, "{thread}");
+        // Restore a valid row so the next round starts from idle.
+        let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+        conn.execute(
+            "UPDATE agents SET sandbox='read-only', state='stopped', error=NULL \
+             WHERE alias='w1'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
+        d.wait_agent("w1", "idle", 15);
+    }
+}
+
+#[test]
+fn codex_sandbox_values_reach_thread_start_and_are_reported() {
+    // Every allowed sandbox launches and rides `thread/start` verbatim;
+    // `agent show` reports it beside the effective approval policy and
+    // where that policy came from.
+    let d = TestDaemon::start();
+    let mock = d.mock_codex("ok");
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    for (i, sandbox) in ["read-only", "workspace-write"].iter().enumerate() {
+        let alias = format!("w{i}");
+        d.rpc(
+            "agent_register",
+            json!({"alias": alias, "provider": "codex",
+                   "endpoint_kind": "managed", "cwd": cwd,
+                   "sandbox": sandbox}),
+        )
+        .unwrap();
+        d.wait_agent(&alias, "idle", 15);
+        let reqs = mock_requests(&mock);
+        assert_eq!(reqs.len(), i + 1, "{reqs:?}");
+        assert_eq!(reqs[i]["method"], "thread/start");
+        assert_eq!(reqs[i]["params"]["sandbox"], *sandbox);
+        let agent = d.rpc("agent_show", json!({"alias": alias})).unwrap()["agent"].clone();
+        assert_eq!(agent["sandbox"], *sandbox, "{agent}");
+        assert_eq!(agent["approval_policy"], "never", "{agent}");
+        assert_eq!(
+            agent["approval_policy_source"], "cadence default",
+            "{agent}"
+        );
+    }
+    // A configured policy is reported as configured.
+    d.rpc(
+        "agent_register",
+        json!({"alias": "wc", "provider": "codex",
+               "endpoint_kind": "managed", "cwd": cwd,
+               "params": "{\"approval_policy\":\"on-request\"}"}),
+    )
+    .unwrap();
+    d.wait_agent("wc", "idle", 15);
+    let agent = d.rpc("agent_show", json!({"alias": "wc"})).unwrap()["agent"].clone();
+    assert_eq!(agent["approval_policy"], "on-request", "{agent}");
+    assert_eq!(agent["approval_policy_source"], "configured", "{agent}");
+    // Providers without the setting report neither field.
+    d.rpc(
+        "agent_register",
+        json!({"alias": "f", "provider": "fake", "endpoint_kind": "fake", "cwd": cwd}),
+    )
+    .unwrap();
+    let agent = d.rpc("agent_show", json!({"alias": "f"})).unwrap()["agent"].clone();
+    assert!(agent["approval_policy"].is_null(), "{agent}");
+    assert!(agent["approval_policy_source"].is_null(), "{agent}");
+}
+
+#[test]
+fn codex_cli_approval_policy_flag_roundtrips_through_resume() {
+    let d = TestDaemon::start();
+    let mock = d.mock_codex_ws("ok");
+    let pm_repo = d.dir.path().join("pmrepo");
+    git_repo(&pm_repo);
+    d.rpc(
+        "agent_register",
+        json!({"alias": "pm", "provider": "fake", "endpoint_kind": "fake",
+               "cwd": pm_repo}),
+    )
+    .unwrap();
+    d.wait_agent("pm", "idle", 10);
+    let bin = env!("CARGO_BIN_EXE_cadence");
+    let run = |args: &[&str]| {
+        std::process::Command::new(bin)
+            .arg("--state-dir")
+            .arg(&d.state)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let cwd = pm_repo.to_str().unwrap();
+    let launches: [(&str, &[&str], &str); 2] = [
+        (
+            "wc",
+            &["codex", "--alias", "wc", "--detach", "--cwd", cwd],
+            "on-failure",
+        ),
+        (
+            "wj",
+            &["join", "pm", "codex", "--alias", "wj", "--detach"],
+            "untrusted",
+        ),
+    ];
+    for (i, (alias, args, policy)) in launches.iter().enumerate() {
+        let mut argv = args.to_vec();
+        argv.extend(["--approval-policy", policy]);
+        let out = run(&argv);
+        assert!(
+            out.status.success(),
+            "{alias}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        d.wait_agent(alias, "idle", 20);
+        let agent = d.rpc("agent_show", json!({"alias": alias})).unwrap()["agent"].clone();
+        assert_eq!(agent["params"]["approval_policy"], *policy, "{agent}");
+        assert_eq!(agent["approval_policy"], *policy, "{agent}");
+        assert_eq!(agent["approval_policy_source"], "configured", "{agent}");
+        let reqs = mock_requests(&mock);
+        assert_eq!(reqs[reqs.len() - 1]["method"], "thread/start", "{reqs:?}");
+        assert_eq!(reqs[reqs.len() - 1]["params"]["approvalPolicy"], *policy);
+        // Stop + resume replays the stored policy on thread/resume.
+        d.rpc("agent_stop", json!({"alias": alias})).unwrap();
+        d.wait_agent(alias, "stopped", 15);
+        d.rpc("agent_resume", json!({"alias": alias})).unwrap();
+        d.wait_agent(alias, "idle", 15);
+        let reqs = mock_requests(&mock);
+        assert_eq!(reqs.len(), 2 * (i + 1), "{reqs:?}");
+        let last = reqs.last().unwrap();
+        assert_eq!(last["method"], "thread/resume");
+        assert_eq!(last["params"]["approvalPolicy"], *policy);
+    }
+    // A bogus value is a clap rejection naming every accepted value.
+    for args in [
+        &["codex", "--alias", "wb", "--detach", "--cwd", cwd][..],
+        &["join", "pm", "codex", "--alias", "wb", "--detach"][..],
+    ] {
+        let mut argv = args.to_vec();
+        argv.extend(["--approval-policy", "bogus"]);
+        let out = run(&argv);
+        assert!(!out.status.success());
+        let err = String::from_utf8_lossy(&out.stderr);
+        for accepted in ["never", "on-request", "on-failure", "untrusted"] {
+            assert!(err.contains(accepted), "missing '{accepted}': {err}");
+        }
+    }
+    // The flag is codex-only: another provider refuses it instead of
+    // silently dropping it.
+    let out = run(&[
+        "join",
+        "pm",
+        "fake",
+        "--alias",
+        "wf",
+        "--detach",
+        "--approval-policy",
+        "never",
+    ]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--approval-policy"), "{err}");
+    assert!(
+        d.rpc("agent_show", json!({"alias": "wf"})).is_err(),
+        "a refused join must not register the worker"
+    );
+}
+
+#[test]
 fn transport_eof_fences_turn_quickly() {
     let d = TestDaemon::start();
     let _mock = d.mock_codex("die-after-start");
