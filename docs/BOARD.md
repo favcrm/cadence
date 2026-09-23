@@ -595,7 +595,8 @@ list in the output and a `Forced: true` trailer on the commit.
 One reviewed fact per file at `<pm>/<project>/memory/<slug>.md`:
 YAML frontmatter (`id`, `type`, `status`, `confidence`, `scope`,
 `author`, authenticated `author_proof`, `source`, `created`,
-`verified_at`, review cycle/receipts and optional `supersedes`)
+`verified_at`, optional `stale`, review cycle/receipts and optional
+`supersedes`)
 plus a body contract — a fact, then `**Why:**` and `**How to apply:**`
 sections. Types are `rule | gotcha | decision | recipe`; statuses are
 `proposed | accepted | rejected | superseded`.
@@ -663,15 +664,42 @@ project), `--scope-component`, `--scope-path` (repo-relative globs
 matched against the issue's recorded-commit paths), `--scope-tag`
 (issue `tags:`), `--scope-provider` (the target worker's provider).
 `match --issue` prints the ranked list: `rule` > `gotcha` > `recipe` >
-`decision`, then confidence, then newest `verified_at`.
+`decision`, then confidence, then most recently verified (unverified
+and decayed last), each with its evidence label, followed by withheld
+entries and their reasons (`--json`: `matched[].evidence`,
+`withheld[]`).
+
+Evidence freshness (CAD-203) is separate from review status. Accepting
+a lesson records the review; it does not re-check the evidence, so only
+a PM-finalized `verify` cycle stamps `verified_at` and clears `stale`.
+Retrieval reads the verify finalization receipt itself, and every
+injected lesson carries an evidence label:
+
+- `verified <date>` — last finalized verify is inside the project's
+  freshness window: `memory: {stale_days: N}` in `project.yaml`,
+  default 30 days;
+- `unverified (last verified <date>)` — the verify has aged past the
+  window. Age alone never withholds: the lesson decays and is still
+  injected;
+- `unverified` — never verified. Older records whose `verified_at` was
+  stamped at accept time read the same way; the files are not rewritten.
+
+A lesson is **withheld** only when its evidence is explicitly stale —
+`stale: <why>` in its frontmatter (set by a curator today, by CAD-111's
+citation re-check later; the next finalized verify clears it). The
+withholding is recorded with its reason so "why did I not get this?" is
+answerable: in the lessons file (`## Withheld` section), the dispatch
+comment (`Lessons withheld: <slug> (<reason>)`), the dispatch JSON
+(`lessons_withheld`), `memory match` and the `issue context` memory
+manifest. Contradiction is not a withholding reason here.
 
 Injection happens in two places:
 
 - `dispatch` renders the matched accepted set to
   `<state>/dispatch/<message-id>-lessons.md` (≤ 12 entries, ≤ 4 KiB),
   appends `Lessons: <file>.` to the kickoff body, records the slugs in
-  the dispatch comment (`Lessons injected: …`) and returns `lessons`
-  and `lessons_file` in the JSON. `--no-lessons` skips it; `--job`
+  the dispatch comment (`Lessons injected: …`) and returns `lessons`,
+  `lessons_withheld` and `lessons_file` in the JSON. `--no-lessons` skips it; `--job`
   kickoffs are daemon-templated and never carry the file. Memory
   failures degrade, never sink the dispatch (the worktree already
   exists): a memory file that fails to load is excluded and named
@@ -682,9 +710,10 @@ Injection happens in two places:
   write never leaves a partial artifact.
 - `agent bootstrap`/`join` briefings gain a
   `## Project memory — accepted rules (<project>)` section listing the
-  project's accepted `rule`s for the worker's cwd — ≤ 8 entries and
-  ≤ 4 KiB, same bound as the dispatch lessons file. An over-budget
-  rule is skipped, not a stop; omitted rules are counted.
+  project's accepted `rule`s not marked stale (each with its evidence
+  label) for the worker's cwd — ≤ 8 entries and ≤ 4 KiB, same bound
+  as the dispatch lessons file. An over-budget rule is skipped, not a
+  stop; omitted rules are counted.
 
 Memory readers skip files that fail to load and report them: `ls`,
 `ls --stale` and `match` warn once on stderr and include `load_errors`
@@ -697,7 +726,7 @@ error before it can reach matching.
 Staleness: `ls --stale` flags an accepted memory not verified within
 the `--days` window (30 default), or whose path globs match files
 changed in a project repo after `verified_at` — informational only;
-`verify` is the refresh.
+`verify` is the refresh. Retrieval labels by its own window as above.
 
 ## `cadence ui` — the reader
 
