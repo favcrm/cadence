@@ -70,11 +70,17 @@ fn kickoff_body(
 /// whole, and a longer list becomes a pointer instead.
 pub(crate) const JOB_ACCEPTANCE_BUDGET: usize = 2000;
 
-/// CAD-159: an issue's acceptance items on one line — `[ ] a; [x] b`
-/// — when that fits `budget` bytes, else a pointer to the CAD-238
-/// section-scoped readback. `None` when there are no items. Control
-/// characters become spaces so the result can ride a single-line
-/// pty kickoff.
+/// CAD-159: an issue's acceptance items on one line when that fits
+/// `budget` bytes, else a pointer to the CAD-238 section-scoped
+/// readback. `None` when there are no items.
+///
+/// CAD-300: each item is numbered and its text is a JSON string
+/// literal — `1) [ ] "a"; 2) [x] "b"` — so text that looks like the
+/// listing's own syntax (`; `, `[x]`, `2)`) stays inside its quotes
+/// and cannot read as another item or a checked box.
+/// [`parse_acceptance_listing`] reads it back exactly. Quoting escapes
+/// every control character and U+2028/U+2029, so the result can ride a
+/// single-line pty kickoff without losing them.
 pub(crate) fn acceptance_listing(
     issue: &str,
     items: &[AcceptanceItem],
@@ -85,13 +91,10 @@ pub(crate) fn acceptance_listing(
     }
     let inline = items
         .iter()
-        .map(|item| {
-            let text: String = item
-                .text
-                .chars()
-                .map(|c| if c.is_control() { ' ' } else { c })
-                .collect();
-            format!("[{}] {text}", if item.checked { 'x' } else { ' ' })
+        .enumerate()
+        .map(|(i, item)| {
+            let mark = if item.checked { 'x' } else { ' ' };
+            format!("{}) [{mark}] {}", i + 1, quote_item(&item.text))
         })
         .collect::<Vec<_>>()
         .join("; ");
@@ -106,26 +109,88 @@ pub(crate) fn acceptance_listing(
     })
 }
 
+/// `text` as a JSON string literal that is also safe on one pty line:
+/// `"` and `\` are escaped as JSON requires, tab as `\t`, and every
+/// other control character (C0, DEL, C1) and the line/paragraph
+/// separators U+2028/U+2029 as `\uXXXX`. All of those are in the BMP,
+/// so four hex digits always suffice.
+fn quote_item(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') => {
+                out.push_str(&format!("\\u{:04x}", u32::from(c)));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// CAD-300: read an [`acceptance_listing`] back — the numbered,
+/// JSON-quoted items at the start of `s` — returning them and the rest
+/// of `s` (the kickoff's `.` onwards). `None` when `s` does not start
+/// with item `1)`, or an item is malformed: a numbering gap, a checkbox
+/// other than `[ ]`/`[x]`, or text that is not a JSON string literal.
+pub fn parse_acceptance_listing(s: &str) -> Option<(Vec<AcceptanceItem>, &str)> {
+    let mut items = vec![];
+    let mut rest = s;
+    loop {
+        rest = rest.strip_prefix(&format!("{}) ", items.len() + 1))?;
+        let checked = match rest.get(..4)? {
+            "[x] " => true,
+            "[ ] " => false,
+            _ => return None,
+        };
+        rest = &rest[4..];
+        if !rest.starts_with('"') {
+            return None;
+        }
+        let mut quoted = serde_json::Deserializer::from_str(rest).into_iter::<String>();
+        let text = quoted.next()?.ok()?;
+        rest = &rest[quoted.byte_offset()..];
+        items.push(AcceptanceItem { text, checked });
+        match rest.strip_prefix("; ") {
+            Some(next) if next.starts_with(&format!("{}) ", items.len() + 1)) => rest = next,
+            _ => return Some((items, rest)),
+        }
+    }
+}
+
 /// CAD-159: the warning for an issue with no acceptance items. The PM
 /// decided (2026-09-23, ADR-0002 §8.3) to warn and still dispatch
 /// until live issues are backfilled; refusal is a later ticket.
-fn acceptance_warning(issue: &str) -> String {
+fn acceptance_warning(issue: &str, dispatched: bool) -> String {
+    let outcome = if dispatched {
+        "Dispatched anyway."
+    } else {
+        "Not re-sent: this issue's kickoff is already in flight."
+    };
     format!(
         "{issue} has no acceptance criteria (its ## Acceptance section has no \
          checklist items; a bare `- [ ]` does not count) — add them with \
-         `cadence issue acceptance {issue} --from <file>`. Dispatched anyway."
+         `cadence issue acceptance {issue} --from <file>`. {outcome}"
     )
 }
 
 /// The plain-path kickoff with the issue's acceptance appended as
 /// ` Acceptance: <listing>.` — inline when it fits the 4000-char
-/// body limit, else the readback pointer.
+/// body limit, else the readback pointer. When even the pointer does
+/// not fit (CAD-300), the body goes out without the clause rather than
+/// being refused; the dispatch JSON still carries the items.
 fn with_acceptance(body: String, issue: &str, items: &[AcceptanceItem]) -> String {
     const FRAME: usize = " Acceptance: .".len();
     let budget = 4000usize.saturating_sub(body.len() + FRAME);
     match acceptance_listing(issue, items, budget) {
-        Some(listing) => format!("{body} Acceptance: {listing}."),
-        None => body,
+        Some(listing) if body.len() + FRAME + listing.len() <= 4000 => {
+            format!("{body} Acceptance: {listing}.")
+        }
+        _ => body,
     }
 }
 
@@ -226,7 +291,9 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
     // CAD-159: the CAD-238 section-scoped readback. No items warns;
     // it never refuses (PM decision, ADR-0002 §8.3).
     let items = parse::acceptance_items(&body);
-    let acceptance_warning = items.is_empty().then(|| acceptance_warning(&front.id));
+    let acceptance_warning = items
+        .is_empty()
+        .then(|| acceptance_warning(&front.id, true));
     let acceptance = json!({
         "items": items.len(),
         "criteria": items.iter().map(AcceptanceItem::to_json).collect::<Vec<_>>(),
@@ -393,6 +460,11 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
     if let Some(msg) = live {
         out["dispatched"] = json!(false);
         out["duplicate"] = json!(true);
+        // CAD-300 (QA R4): a duplicate sends nothing, so its warning
+        // must not say it dispatched.
+        if items.is_empty() {
+            out["acceptance"]["warning"] = json!(self::acceptance_warning(&front.id, false));
+        }
         out["message"] = msg["id"].clone();
         out["message_state"] = msg["state"].clone();
         return Ok(out);
@@ -631,7 +703,7 @@ mod tests {
             assert_eq!(acceptance_listing("D-1", &items, 4000), None);
             assert_eq!(with_acceptance(kickoff(), "D-1", &items), kickoff());
         }
-        let warning = acceptance_warning("D-1");
+        let warning = acceptance_warning("D-1", true);
         assert!(
             warning.contains("D-1")
                 && warning.contains("cadence issue acceptance D-1 --from <file>"),
@@ -639,22 +711,105 @@ mod tests {
         );
     }
 
-    /// Populated acceptance is listed inline, one line, checked state
-    /// kept, control characters flattened.
+    /// Populated acceptance is listed inline, one line, numbered and
+    /// quoted, checked state kept, control characters escaped.
     #[test]
     fn populated_acceptance_is_listed_inline() {
         let body = "T\n\n## Acceptance\n\n- [ ] first\tpart\n- [x] second\n\n## Notes\n- [ ] not acceptance\n";
         let items = parse::acceptance_items(body);
         assert_eq!(
             acceptance_listing("D-1", &items, 4000).as_deref(),
-            Some("[ ] first part; [x] second")
+            Some(r#"1) [ ] "first\tpart"; 2) [x] "second""#)
         );
         let body = with_acceptance(kickoff(), "D-1", &items);
         assert!(
-            body.ends_with(" Acceptance: [ ] first part; [x] second."),
+            body.ends_with(r#" Acceptance: 1) [ ] "first\tpart"; 2) [x] "second"."#),
             "{body}"
         );
         check_body(&body, "fake").unwrap();
+    }
+
+    /// CAD-300: item text a reader could mistake for the listing's own
+    /// syntax — `; `, `[x]`, a `2)` number, quotes, backslashes — and
+    /// characters a single-line pty body cannot carry (tab, ESC, DEL,
+    /// NEL, U+2028/U+2029) round-trip exactly through the kickoff, which
+    /// stays one line and control-character free.
+    #[test]
+    fn tricky_items_round_trip_through_the_kickoff() {
+        let items = vec![
+            AcceptanceItem {
+                text: "alpha; [x] beta".into(),
+                checked: false,
+            },
+            AcceptanceItem {
+                text: r#"done; 3) [ ] "fake" \ C:\path"#.into(),
+                checked: true,
+            },
+            AcceptanceItem {
+                text: "tab\there esc\u{1b}[31m del\u{7f} nel\u{85} ls\u{2028}ps\u{2029}end".into(),
+                checked: false,
+            },
+            AcceptanceItem {
+                text: "[x] looks checked but is not".into(),
+                checked: false,
+            },
+        ];
+        let listing = acceptance_listing("D-1", &items, 4000).unwrap();
+        let (back, rest) = parse_acceptance_listing(&listing)
+            .unwrap_or_else(|| panic!("listing does not parse: {listing}"));
+        assert_eq!(back, items, "{listing}");
+        assert_eq!(rest, "", "{listing}");
+        let body = with_acceptance(kickoff(), "D-1", &items);
+        check_body(&body, "fake").unwrap();
+        assert!(
+            !body
+                .chars()
+                .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')),
+            "{body:?}"
+        );
+        let tail = body.split_once(" Acceptance: ").unwrap().1;
+        let (back, rest) = parse_acceptance_listing(tail).unwrap();
+        assert_eq!(back, items, "{body}");
+        assert_eq!(rest, ".", "{body}");
+    }
+
+    /// CAD-300 (QA R3): when even the pointer would push the kickoff
+    /// past the pty limit, the kickoff is sent without the acceptance
+    /// clause rather than refused — the JSON still carries the items.
+    #[test]
+    fn pointer_that_does_not_fit_leaves_the_kickoff_unchanged() {
+        let summary = "s".repeat(3800);
+        let body = kickoff_body(
+            "D-1",
+            &summary,
+            Path::new("/tmp/note.md"),
+            Path::new("/r/.cadence/wt/d-1-title"),
+            "cadence/d-1-title",
+            "0123456789abcdef",
+            "pm",
+        );
+        check_body(&body, "fake").unwrap();
+        let items = vec![AcceptanceItem {
+            text: "y".repeat(200),
+            checked: false,
+        }];
+        assert_eq!(with_acceptance(body.clone(), "D-1", &items), body);
+    }
+
+    /// CAD-300 (QA R4): a duplicate run dispatched nothing, so its
+    /// warning must not say "Dispatched anyway".
+    #[test]
+    fn duplicate_warning_does_not_claim_a_dispatch() {
+        let sent = acceptance_warning("D-1", true);
+        let dup = acceptance_warning("D-1", false);
+        assert!(sent.ends_with("Dispatched anyway."), "{sent}");
+        assert!(!dup.contains("Dispatched anyway"), "{dup}");
+        for w in [&sent, &dup] {
+            assert!(
+                w.contains("cadence issue acceptance D-1 --from <file>"),
+                "{w}"
+            );
+        }
     }
 
     /// A list too long for the budget becomes a pointer to the

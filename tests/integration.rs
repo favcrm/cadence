@@ -31332,6 +31332,8 @@ fn auto_stop_keeps_pty_pane_with_attached_client_then_stops_it() {
 /// CAD-238 section-scoped readback).
 #[test]
 fn dispatch_warns_on_empty_acceptance() {
+    use cadence_agent::issue::dispatch::parse_acceptance_listing;
+    use cadence_agent::issue::parse::AcceptanceItem;
     let seeded = TempDir::new().unwrap();
     let state = seeded.path().to_path_buf();
     {
@@ -31454,7 +31456,14 @@ fn dispatch_warns_on_empty_acceptance() {
         ],
     );
     let criteria = tmp.path().join("acceptance.md");
-    std::fs::write(&criteria, "- [ ] first criterion\n- [x] second is done\n").unwrap();
+    // CAD-300: the first item's own text carries the listing's old
+    // delimiter and a checked box; it must still read as one unchecked
+    // item.
+    std::fs::write(
+        &criteria,
+        "- [ ] first criterion; [x] not a second item\n- [x] second is done\n",
+    )
+    .unwrap();
     let criteria_s = criteria.to_str().unwrap();
     for id in ["D-3", "D-6"] {
         let (ok, out, _) = cli(&["issue", "acceptance", id, "--from", criteria_s]);
@@ -31464,7 +31473,17 @@ fn dispatch_warns_on_empty_acceptance() {
     std::fs::write(&note, "# kickoff").unwrap();
     let note_s = note.canonicalize().unwrap().to_str().unwrap().to_string();
     let (spec, _sha) = d.spec_file("spec.md", "acceptance warning spec");
-    let listed = "[ ] first criterion; [x] second is done";
+    let listed = r#"1) [ ] "first criterion; [x] not a second item"; 2) [x] "second is done""#;
+    let expected = vec![
+        AcceptanceItem {
+            text: "first criterion; [x] not a second item".into(),
+            checked: false,
+        },
+        AcceptanceItem {
+            text: "second is done".into(),
+            checked: true,
+        },
+    ];
 
     for (id, worker, job, populated) in [
         ("D-1", "w1", false, false),
@@ -31515,7 +31534,10 @@ fn dispatch_warns_on_empty_acceptance() {
         if populated {
             assert_eq!(acc["items"], 2, "{id}: {out}");
             assert_eq!(acc["warning"], Value::Null, "{id}: {out}");
-            assert_eq!(acc["criteria"][0]["text"], "first criterion", "{id}: {out}");
+            assert_eq!(
+                acc["criteria"][0]["text"], "first criterion; [x] not a second item",
+                "{id}: {out}"
+            );
             assert_eq!(acc["criteria"][1]["done"], true, "{id}: {out}");
             assert!(!stderr.contains("warning"), "{id}: {stderr}");
             assert_eq!(warned, 0, "{id}: {comments:?}");
@@ -31523,6 +31545,13 @@ fn dispatch_warns_on_empty_acceptance() {
                 body.contains(&format!("Acceptance: {listed}.")),
                 "{id}: {body}"
             );
+            // Read back from the kickoff the worker receives: exactly
+            // the two items, checked state intact.
+            let tail = body.split_once(" Acceptance: ").unwrap().1;
+            let (back, rest) = parse_acceptance_listing(tail)
+                .unwrap_or_else(|| panic!("{id}: listing does not parse: {body}"));
+            assert_eq!(back, expected, "{id}: {body}");
+            assert!(rest.starts_with('.'), "{id}: {body}");
             if job {
                 let job = d.rpc("job_show", json!({"job": out["job"]})).unwrap();
                 assert_eq!(job["job"]["tasks"][0]["acceptance"], listed, "{id}: {job}");
@@ -31560,7 +31589,7 @@ fn dispatch_warns_on_empty_acceptance() {
 
     // A re-run while the kickoff is live is a duplicate: it still
     // reports the acceptance block but records nothing new.
-    let (ok, out, _) = cli(&[
+    let (ok, out, stderr) = cli(&[
         "dispatch",
         "D-1",
         "--to",
@@ -31572,6 +31601,17 @@ fn dispatch_warns_on_empty_acceptance() {
     ]);
     assert!(ok && out["duplicate"] == true, "{out}");
     assert_eq!(out["acceptance"]["items"], 0, "{out}");
+    // CAD-300 (QA R4): nothing was sent, so nothing says it was.
+    let warning = out["acceptance"]["warning"].as_str().unwrap_or_default();
+    assert!(
+        warning.contains("cadence issue acceptance D-1 --from <file>")
+            && !warning.contains("Dispatched anyway"),
+        "{out}"
+    );
+    assert!(
+        stderr.contains("warning") && !stderr.contains("Dispatched anyway"),
+        "{stderr}"
+    );
     let issue = cli(&["issue", "show", "D-1", "--json"]).1;
     let warned = issue["comments"]
         .as_array()
