@@ -70,6 +70,14 @@ impl Host {
         self.up_with(name, extra, &[])
     }
 
+    /// `up` on an ephemeral port: only the isolation test takes a port
+    /// from the shared 3110-3199 range, so parallel tests never race
+    /// for one.
+    fn up_free(&mut self, name: &str, env: &[(&str, &str)]) -> Value {
+        let port = free_port().to_string();
+        self.up_with(name, &["--port", &port], env)
+    }
+
     /// `up` with extra environment for the sandbox's daemon and board.
     fn up_with(&mut self, name: &str, extra: &[&str], env: &[(&str, &str)]) -> Value {
         self.started.push(name.to_string());
@@ -106,13 +114,19 @@ fn refused(out: &Output, needle: &str) {
     );
 }
 
-fn http_status(port: u16, path: &str) -> Option<u16> {
+fn http_get(port: u16, path: &str) -> Option<(u16, String)> {
     let mut s = TcpStream::connect(("127.0.0.1", port)).ok()?;
     s.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
     write!(s, "GET {path} HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n").ok()?;
     let mut buf = String::new();
     s.read_to_string(&mut buf).ok()?;
-    buf.split_whitespace().nth(1)?.parse().ok()
+    let status = buf.split_whitespace().nth(1)?.parse().ok()?;
+    let body = buf.split_once("\r\n\r\n").map(|(_, b)| b.to_string())?;
+    Some((status, body))
+}
+
+fn http_status(port: u16, path: &str) -> Option<u16> {
+    http_get(port, path).map(|(status, _)| status)
 }
 
 fn free_port() -> u16 {
@@ -330,8 +344,7 @@ fn sandbox_reset_requires_the_marker() {
     );
     assert!(outside.join(".cadence-sandbox").is_file());
 
-    let port = free_port().to_string();
-    let v = host.up("rst", &["--port", &port]);
+    let v = host.up_free("rst", &[]);
     let state = PathBuf::from(v["state_dir"].as_str().unwrap());
     assert!(daemon_answers(&state));
     let out = host.run(&["sandbox", "reset", "rst"], &[]);
@@ -373,7 +386,7 @@ fn a_sandbox_claude_worker_keeps_the_sandbox_tracker_and_profile() {
     let script = host.tmp.path().join("claude.py");
     std::fs::write(&script, MOCK_CLAUDE_ENV_PY).unwrap();
     let command = format!("python3 {} {}", script.display(), dump.display());
-    let v = host.up_with("cl", &[], &[("CADENCE_CLAUDE_COMMAND", &command)]);
+    let v = host.up_free("cl", &[("CADENCE_CLAUDE_COMMAND", &command)]);
     let state = PathBuf::from(v["state_dir"].as_str().unwrap());
     let pm = PathBuf::from(v["pm_dir"].as_str().unwrap());
     client::rpc(
@@ -397,5 +410,52 @@ fn a_sandbox_claude_worker_keeps_the_sandbox_tracker_and_profile() {
     assert!(
         !env.contains("CADENCE_CLAUDE_COMMAND="),
         "override leaked: {env}"
+    );
+}
+
+/// The state dir decides, not the caller's env: a sandbox restarted
+/// from a bare shell with only `--state-dir` still skips the skill
+/// sync, reports its profile, serves its own tracker and refuses the
+/// tailnet.
+#[test]
+fn a_bare_restart_of_a_sandbox_state_dir_stays_gated() {
+    let mut host = Host::new();
+    let v = host.up_free("bare", &[]);
+    let state = PathBuf::from(v["state_dir"].as_str().unwrap());
+    let pm = PathBuf::from(v["pm_dir"].as_str().unwrap());
+    let port = v["port"].as_u64().unwrap() as u16;
+    let down = host.run(&["sandbox", "down", "bare"], &[]);
+    assert!(down.status.success(), "{}", text(&down));
+
+    let st = state.to_str().unwrap();
+    let start = host.run(&["--state-dir", st, "daemon", "start"], &[]);
+    assert!(start.status.success(), "{}", text(&start));
+    let health = client::rpc(&state, "health", json!({})).unwrap();
+    assert_eq!(health["sandbox"], "bare", "{health}");
+    assert!(
+        !host.home().join(".agents").exists(),
+        "skill sync must skip"
+    );
+    let log = std::fs::read_to_string(state.join("daemon.log")).unwrap();
+    assert_eq!(
+        log.matches("skill: skipped (sandbox profile)").count(),
+        2,
+        "{log}"
+    );
+
+    let ui = host.run(&["--state-dir", st, "ui", "start"], &[]);
+    assert!(ui.status.success(), "{}", text(&ui));
+    let (code, body) = http_get(port, "/api/health").unwrap();
+    assert_eq!(code, 200, "{body}");
+    let body: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["pm_dir"], json!(pm), "{body}");
+    assert!(
+        !host.home().join("pm").exists(),
+        "production tracker untouched"
+    );
+
+    refused(
+        &host.run(&["--state-dir", st, "ui", "tailscale", "start"], &[]),
+        "refused under CADENCE_PROFILE=sandbox:bare",
     );
 }

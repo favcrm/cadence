@@ -4100,6 +4100,11 @@ fn run() -> Result<i32> {
         Some(dir) => dir,
         None => client::state_dir()?,
     };
+    // CAD-310: a sandbox's state dir decides its profile and tracker,
+    // not the caller's env. `sandbox` verbs resolve their own roots.
+    if !matches!(cli.command, Commands::Sandbox { .. }) {
+        cadence_agent::sandbox::adopt(&state_dir)?;
+    }
     match cli.command {
         Commands::Doctor {
             host,

@@ -307,6 +307,56 @@ fn read_marker(sb: &Sandbox) -> Result<Option<Value>> {
     Ok(Some(marker))
 }
 
+/// The sandbox `state_dir` belongs to: `<root>/state` beside a marker
+/// naming `<root>`. `None` for any other dir, production's included. A
+/// marker that is present but unusable refuses rather than let the dir
+/// run ungated.
+pub fn owner_of(state_dir: &Path) -> Result<Option<String>> {
+    if state_dir.file_name().and_then(|n| n.to_str()) != Some("state") {
+        return Ok(None);
+    }
+    let Some(root) = state_dir.parent() else {
+        return Ok(None);
+    };
+    if std::fs::symlink_metadata(root.join(MARKER)).is_err() {
+        return Ok(None);
+    }
+    let name = root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let sb = Sandbox {
+        base: root.parent().unwrap_or(root).to_path_buf(),
+        root: root.to_path_buf(),
+        name,
+    };
+    let owned = validate_name(&sb.name).and_then(|()| require_marker(&sb));
+    owned.map(|_| Some(sb.name.clone())).map_err(|e| {
+        Error::rejected(format!(
+            "{} sits in a sandbox root whose marker is unusable ({e}) — \
+             refusing to run it ungated",
+            state_dir.display()
+        ))
+    })
+}
+
+/// Run as the sandbox `state_dir` belongs to, whatever the caller's
+/// env says: its profile, tracker and state dir go into this process's
+/// env, so the daemon, the board and everything they spawn stay gated
+/// — a bare `cadence --state-dir <root>/state daemon start` is still
+/// the sandbox. Any other state dir is left alone.
+pub fn adopt(state_dir: &Path) -> Result<Option<String>> {
+    let Some(name) = owner_of(state_dir)? else {
+        return Ok(None);
+    };
+    let root = state_dir.parent().unwrap_or(state_dir);
+    std::env::set_var("CADENCE_PROFILE", format!("{PROFILE_PREFIX}{name}"));
+    std::env::set_var("CADENCE_PM_DIR", root.join("pm"));
+    std::env::set_var("CADENCE_STATE_DIR", state_dir);
+    Ok(Some(name))
+}
+
 fn require_marker(sb: &Sandbox) -> Result<Value> {
     read_marker(sb)?.ok_or_else(|| {
         Error::rejected(format!(
@@ -645,6 +695,28 @@ mod tests {
             resolved(&dir.path().join("link/missing/x")),
             std::fs::canonicalize(&real).unwrap().join("missing/x")
         );
+    }
+
+    #[test]
+    fn owner_of_needs_state_beside_a_marker_naming_its_root() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("sbx");
+        std::fs::create_dir_all(root.join("state")).unwrap();
+        // No marker: an ordinary state dir.
+        assert_eq!(owner_of(&root.join("state")).unwrap(), None);
+        std::fs::write(root.join(MARKER), r#"{"name":"sbx"}"#).unwrap();
+        assert_eq!(
+            owner_of(&root.join("state")).unwrap().as_deref(),
+            Some("sbx")
+        );
+        // Only `<root>/state` belongs to the sandbox.
+        assert_eq!(owner_of(&root.join("pm")).unwrap(), None);
+        // A marker naming another sandbox, or unreadable, refuses.
+        std::fs::write(root.join(MARKER), r#"{"name":"other"}"#).unwrap();
+        let err = owner_of(&root.join("state")).unwrap_err();
+        assert!(err.to_string().contains("ungated"), "{err}");
+        std::fs::write(root.join(MARKER), "not json").unwrap();
+        assert!(owner_of(&root.join("state")).is_err());
     }
 
     #[test]
