@@ -39,6 +39,12 @@ const ENV_SCRUB: &[&str] = &[
     "CLAUDE_CODE_SESSION_ID",
 ];
 
+pub(crate) fn scrub_names() -> Vec<&'static str> {
+    let mut names = ENV_SCRUB.to_vec();
+    names.extend_from_slice(super::CLOUD_SECRET_ENV);
+    names
+}
+
 /// The provider's model catalogue is queried only when a caller requests a
 /// model or effort. The app-server returns this metadata through
 /// `model/list`; keeping the parser local means an unknown/changed wire shape
@@ -352,17 +358,18 @@ impl CodexAdapter {
     fn build_transport(command: &[String], ws: bool, shared: &Arc<Shared>) -> Transport {
         let routed = Arc::clone(shared);
         let disconnected = Arc::clone(shared);
+        let names = scrub_names();
         if ws {
             Transport::Ws(WsAdapter::new(
                 command,
-                ENV_SCRUB,
+                &names,
                 Box::new(move |incoming| routed.dispatch(incoming)),
                 Box::new(move || disconnected.on_disconnect()),
             ))
         } else {
             Transport::Stdio(StdioAdapter::new(
                 command,
-                EnvScrub::names(ENV_SCRUB),
+                EnvScrub::names(&names),
                 Box::new(move |incoming| routed.dispatch(incoming)),
                 Box::new(move || disconnected.on_disconnect()),
             ))

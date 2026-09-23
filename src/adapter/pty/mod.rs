@@ -855,7 +855,8 @@ impl ProviderAdapter for PtyAdapter {
             // Keep a dead pane visible briefly instead of dropping to a
             // bare shell that would accept input meant for the TUI.
             let command = format!(
-                "{argv}; printf '\\n{}\\n'; sleep 3",
+                "env {} {argv}; printf '\\n{}\\n'; sleep 3",
+                super::cloud_secret_env_prefix(),
                 self.profile.exit_banner()
             );
             // Pane env identifies the agent to `cadence self`; -e args

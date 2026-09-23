@@ -81,12 +81,21 @@ enum Commands {
         #[command(subcommand)]
         action: MessageAction,
     },
-    /// Launch a Devin official terminal as a managed agent (pty endpoint).
+    /// Launch a Devin agent. The default is the official terminal in an
+    /// owned tmux pane (pty endpoint). `--cloud` instead opens a Devin
+    /// Cloud session over the v3 API.
     /// `-r <session-slug>` resumes an existing Devin session, mirroring
     /// `devin -r`; without it a fresh session is launched and becomes
     /// addressable by its discovered slug. Once the endpoint is open this
     /// terminal attaches to the owned pane by default (`--detach` opts
     /// out; a non-TTY or nested-tmux launch prints the command instead).
+    /// `--cloud` opens a Devin Cloud session instead of a pty. Launch
+    /// params are one `--cloud-params` string of `key=value` pairs
+    /// separated by `;` (repo, devin_mode, max_acu_limit, playbook_id,
+    /// knowledge_id, secret_id, platform, tag, bypass_approval,
+    /// attachment_url). Repeat a key to append it. Unset max_acu_limit
+    /// uses 10. `--permission-mode`, `--bypass` and `--auto-ready` are
+    /// refused with `--cloud`.
     Devin {
         /// Resume an existing Devin session by its native slug.
         #[arg(short = 'r', long)]
@@ -138,11 +147,19 @@ enum Commands {
         agents_md: bool,
         /// Devin permission mode: auto, accept-edits, smart or
         /// dangerous. Persisted and replayed on every launch/resume.
+        /// Pty only — refused with `--cloud`.
         #[arg(long)]
         permission_mode: Option<String>,
         /// Shortcut for --permission-mode dangerous.
         #[arg(long, conflicts_with = "permission_mode")]
         bypass: bool,
+        /// Open a Devin Cloud session instead of a local pty.
+        #[arg(long)]
+        cloud: bool,
+        /// Semicolon-separated cloud create params
+        /// (`repo=owner/name;devin_mode=fast`). Requires `--cloud`.
+        #[arg(long, value_name = "PARAMS", requires = "cloud")]
+        cloud_params: Option<String>,
     },
     /// Launch a Codex agent on a managed-ws endpoint, attachable by the
     /// official Codex TUI via `codex resume --remote`. This terminal
@@ -496,7 +513,9 @@ enum Commands {
     /// codex, claude, cursor or fake. The worker's results route back
     /// to the PM by default (its params gain `"upstream"`). This
     /// terminal attaches once the endpoint is open, same rules as
-    /// `cadence devin`.
+    /// `cadence devin`. `--cloud` (provider devin) opens a Devin Cloud
+    /// session; `--cloud-params` is the same semicolon-separated
+    /// `key=value` list as `cadence devin --cloud-params`.
     Join {
         /// Group handle — the PM agent's alias or native session id.
         group: String,
@@ -576,6 +595,7 @@ enum Commands {
         /// Permission mode, replayed on resume. Claude takes its own
         /// modes [default: manual]; devin takes auto, accept-edits,
         /// smart or dangerous; cursor takes auto-review or force.
+        /// Refused with `--cloud`.
         #[arg(long)]
         permission_mode: Option<String>,
         /// Extra auto-allowed tool patterns for provider `claude`;
@@ -604,6 +624,13 @@ enum Commands {
         /// before the tool call is denied [default: 900].
         #[arg(long, requires = "broker_approvals", value_parser = clap::value_parser!(u64).range(1..))]
         permission_timeout_secs: Option<u64>,
+        /// Open a Devin Cloud session instead of a local pty. Provider
+        /// must be `devin`.
+        #[arg(long)]
+        cloud: bool,
+        /// Semicolon-separated cloud create params. Requires `--cloud`.
+        #[arg(long, value_name = "PARAMS", requires = "cloud")]
+        cloud_params: Option<String>,
     },
     /// Attach this terminal to a live agent's native endpoint. `name`
     /// may be an alias, a provider-native id, or a provider name when
@@ -1480,7 +1507,8 @@ enum AgentAction {
         provider: String,
         /// Endpoint kind: managed (stdio), managed-ws (official-TUI
         /// attachable WebSocket app-server), pty (official TUI in an
-        /// owned tmux session; devin only) or fake (test double).
+        /// owned tmux session), cloud (Devin Cloud v3 API) or fake
+        /// (test double).
         #[arg(long, default_value = registry::DEFAULT_ENDPOINT_KIND)]
         endpoint: String,
         /// pm or worker.
@@ -4253,32 +4281,40 @@ fn run() -> Result<i32> {
             agents_md,
             permission_mode,
             bypass,
-        } => provider_launch(
-            &state_dir,
-            "devin",
-            cwd,
-            &role,
-            alias,
-            resume,
-            instructions_file,
-            detach,
-            None,
-            worktree.as_deref(),
-            BriefMode::standalone(no_bootstrap, bootstrap),
-            auto_ready,
-            agents_md,
-            false,
-            None,
-            &ClaudeOpts::default(),
-            &DevinOpts {
+            cloud,
+            cloud_params,
+        } => {
+            let mut devin = DevinOpts {
                 permission_mode,
                 bypass,
-            },
-            &CursorOpts::default(),
-            &CodexOpts::default(),
-            team_role.as_deref(),
-            false,
-        ),
+                cloud,
+                ..DevinOpts::default()
+            };
+            apply_cloud_params(&mut devin, &split_cloud_params(cloud_params.as_deref()))?;
+            provider_launch(
+                &state_dir,
+                "devin",
+                cwd,
+                &role,
+                alias,
+                resume,
+                instructions_file,
+                detach,
+                None,
+                worktree.as_deref(),
+                BriefMode::standalone(no_bootstrap, bootstrap),
+                auto_ready,
+                agents_md,
+                false,
+                None,
+                &ClaudeOpts::default(),
+                &devin,
+                &CursorOpts::default(),
+                &CodexOpts::default(),
+                team_role.as_deref(),
+                false,
+            )
+        }
         Commands::Codex {
             detach,
             cwd,
@@ -4452,56 +4488,64 @@ fn run() -> Result<i32> {
             permission_timeout_secs,
             turn_idle_secs,
             turn_max_secs,
-        } => join_group(
-            &state_dir,
-            &group,
-            &provider,
-            resume,
-            tui,
-            detach,
-            cwd,
-            alias,
-            &role,
-            sandbox,
-            instructions_file,
-            worktree,
-            no_bootstrap,
-            auto_ready,
-            agents_md,
-            ClaudeOpts {
-                model: model.clone(),
-                effort: effort.clone(),
-                permission_mode: permission_mode.clone(),
-                allow,
-                bypass,
-                broker_approvals,
-                permission_timeout_secs,
-                turn_idle_secs,
-                turn_max_secs,
-            },
-            // The shared --permission-mode/--bypass flags feed the
-            // devin worker too — its four-mode vocabulary is validated
-            // in provider_launch.
-            DevinOpts {
+            cloud,
+            cloud_params,
+        } => {
+            let mut devin = DevinOpts {
                 permission_mode: permission_mode.clone(),
                 bypass,
-            },
-            // …and the cursor worker — its two-mode vocabulary is
-            // validated in provider_launch the same way.
-            CursorOpts {
-                model: model.clone(),
-                permission_mode,
-                bypass,
-            },
-            CodexOpts {
-                model,
-                effort,
-                turn_idle_secs,
-                turn_max_secs,
-            },
-            team_role,
-            provider_default_model,
-        ),
+                cloud,
+                ..DevinOpts::default()
+            };
+            apply_cloud_params(&mut devin, &split_cloud_params(cloud_params.as_deref()))?;
+            join_group(
+                &state_dir,
+                &group,
+                &provider,
+                resume,
+                tui,
+                detach,
+                cwd,
+                alias,
+                &role,
+                sandbox,
+                instructions_file,
+                worktree,
+                no_bootstrap,
+                auto_ready,
+                agents_md,
+                ClaudeOpts {
+                    model: model.clone(),
+                    effort: effort.clone(),
+                    permission_mode: permission_mode.clone(),
+                    allow,
+                    bypass,
+                    broker_approvals,
+                    permission_timeout_secs,
+                    turn_idle_secs,
+                    turn_max_secs,
+                },
+                // The shared --permission-mode/--bypass flags feed the
+                // devin worker too — its four-mode vocabulary is validated
+                // in provider_launch.
+                devin,
+                // …and the cursor worker — its two-mode vocabulary is
+                // validated in provider_launch the same way.
+                CursorOpts {
+                    model: model.clone(),
+                    permission_mode,
+                    bypass,
+                },
+                CodexOpts {
+                    model,
+                    effort,
+                    turn_idle_secs,
+                    turn_max_secs,
+                },
+                team_role,
+                provider_default_model,
+            )
+        }
         Commands::Attach { name, print } => attach_command(&state_dir, name, print),
         Commands::Resume { group, all, detach } => resume_command(&state_dir, group, all, detach),
         Commands::Stop { group } => stop_group(&state_dir, &group),
@@ -5742,6 +5786,18 @@ fn attach_agent(state_dir: &Path, alias: &str, run: bool) -> Result<i32> {
         .map(|s| s.attach)
         .unwrap_or(Attach::None);
     if attach == Attach::Headless {
+        if provider == "devin" && kind == "cloud" {
+            let endpoint = agent["endpoint"].as_str().unwrap_or("");
+            print_json(&json!({
+                "alias": alias,
+                "endpoint_kind": kind,
+                "endpoint": endpoint,
+                "note": "devin cloud has no local terminal — open the session URL",
+                "observe": format!("cadence events --follow {alias}"),
+                "inspect": format!("cadence agent show {alias}"),
+            }));
+            return Ok(0);
+        }
         // A managed Claude endpoint is a headless stream-json process —
         // there is no terminal surface to attach. The explanation is
         // printed, never exec'd.
@@ -5859,14 +5915,133 @@ struct ClaudeOpts {
     turn_max_secs: Option<u64>,
 }
 
-/// Devin-specific launch options — `params.permission_mode` rides the
-/// profile so the same `--permission-mode` argv replays on every pane
-/// open, fresh and `-r` resume alike. `--bypass` is the `dangerous`
-/// shorthand.
+/// Devin-specific launch options. Pty stores `permission_mode` so the
+/// same argv replays on every pane open. `--cloud` stores the v3
+/// create params instead; `--bypass` is the pty `dangerous` shorthand
+/// and is refused for a cloud session.
 #[derive(Default)]
 struct DevinOpts {
     permission_mode: Option<String>,
     bypass: bool,
+    cloud: bool,
+    repos: Vec<String>,
+    devin_mode: Option<String>,
+    max_acu_limit: Option<u64>,
+    playbook_id: Option<String>,
+    knowledge_ids: Vec<String>,
+    secret_ids: Vec<String>,
+    platform: Option<String>,
+    tags: Vec<String>,
+    bypass_approval: bool,
+    attachment_urls: Vec<String>,
+}
+
+fn split_cloud_params(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or("")
+        .split(';')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn apply_cloud_params(opts: &mut DevinOpts, raw: &[String]) -> Result<()> {
+    for entry in raw {
+        let (key, value) = entry
+            .split_once('=')
+            .ok_or_else(|| Error::rejected("--cloud-params entries must be key=value"))?;
+        if value.is_empty() {
+            return Err(Error::rejected(format!(
+                "--cloud-params '{key}' needs a value"
+            )));
+        }
+        match key {
+            "repo" => opts.repos.push(value.to_string()),
+            "devin_mode" => {
+                if !registry::DEVIN_CLOUD_MODES.contains(&value) {
+                    return Err(Error::rejected(format!(
+                        "unknown devin_mode '{value}' — expected one of: {}",
+                        registry::DEVIN_CLOUD_MODES.join(", ")
+                    )));
+                }
+                opts.devin_mode = Some(value.to_string());
+            }
+            "max_acu_limit" => {
+                let limit: u64 = value
+                    .parse()
+                    .map_err(|_| Error::rejected("'max_acu_limit' must be a positive integer"))?;
+                if limit == 0 {
+                    return Err(Error::rejected(
+                        "'max_acu_limit' must be a positive integer",
+                    ));
+                }
+                opts.max_acu_limit = Some(limit);
+            }
+            "playbook_id" => opts.playbook_id = Some(value.to_string()),
+            "knowledge_id" => opts.knowledge_ids.push(value.to_string()),
+            "secret_id" => opts.secret_ids.push(value.to_string()),
+            "platform" => opts.platform = Some(value.to_string()),
+            "tag" => opts.tags.push(value.to_string()),
+            "bypass_approval" => {
+                opts.bypass_approval = match value {
+                    "true" => true,
+                    "false" => false,
+                    _ => return Err(Error::rejected("bypass_approval must be true or false")),
+                };
+            }
+            "attachment_url" => opts.attachment_urls.push(value.to_string()),
+            other => {
+                return Err(Error::rejected(format!(
+                    "unknown --cloud-params key '{other}' — expected repo, devin_mode, \
+                     max_acu_limit, playbook_id, knowledge_id, secret_id, platform, \
+                     tag, bypass_approval, or attachment_url"
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
+fn insert_devin_cloud_params(
+    params: &mut serde_json::Map<String, Value>,
+    devin: &DevinOpts,
+) -> Result<()> {
+    if devin.permission_mode.is_some() || devin.bypass {
+        return Err(Error::rejected(
+            "--permission-mode and --bypass do not apply to a Devin cloud session",
+        ));
+    }
+    if !devin.repos.is_empty() {
+        params.insert("repos".to_string(), json!(devin.repos));
+    }
+    if let Some(mode) = &devin.devin_mode {
+        params.insert("devin_mode".to_string(), json!(mode));
+    }
+    if let Some(limit) = devin.max_acu_limit {
+        params.insert("max_acu_limit".to_string(), json!(limit));
+    }
+    if let Some(id) = &devin.playbook_id {
+        params.insert("playbook_id".to_string(), json!(id));
+    }
+    if !devin.knowledge_ids.is_empty() {
+        params.insert("knowledge_ids".to_string(), json!(devin.knowledge_ids));
+    }
+    if !devin.secret_ids.is_empty() {
+        params.insert("secret_ids".to_string(), json!(devin.secret_ids));
+    }
+    if let Some(platform) = &devin.platform {
+        params.insert("platform".to_string(), json!(platform));
+    }
+    if !devin.tags.is_empty() {
+        params.insert("tags".to_string(), json!(devin.tags));
+    }
+    if devin.bypass_approval {
+        params.insert("bypass_approval".to_string(), json!(true));
+    }
+    if !devin.attachment_urls.is_empty() {
+        params.insert("attachment_urls".to_string(), json!(devin.attachment_urls));
+    }
+    Ok(())
 }
 
 /// Cursor-specific launch options — `params.model` and
@@ -5890,6 +6065,30 @@ struct CodexOpts {
     /// activity-based turn liveness as managed claude (CAD-227).
     turn_idle_secs: Option<u64>,
     turn_max_secs: Option<u64>,
+}
+
+fn launch_endpoint_kind(provider: &str, cloud: bool, tui: bool) -> Result<&'static str> {
+    if cloud {
+        if provider != "devin" {
+            return Err(Error::rejected(
+                "--cloud is only supported for provider devin",
+            ));
+        }
+        if tui {
+            return Err(Error::rejected("--cloud cannot be combined with --tui"));
+        }
+        return Ok("cloud");
+    }
+    if tui {
+        if registry::spec_opt(provider, "pty").is_some() {
+            return Ok("pty");
+        }
+        return Err(Error::rejected(format!(
+            "provider '{provider}' has no pty endpoint — `--tui` is only \
+             meaningful for claude (devin is already a TUI)"
+        )));
+    }
+    registry::default_kind(provider)
 }
 
 /// `cadence devin [-r slug]` / `cadence codex` / `cadence claude`:
@@ -5937,18 +6136,7 @@ fn provider_launch(
     }
     // `--tui` selects the provider's pty endpoint where one exists;
     // otherwise the launch kind comes from the registry's default.
-    let endpoint_kind = if tui {
-        if registry::spec_opt(provider, "pty").is_some() {
-            "pty"
-        } else {
-            return Err(Error::rejected(format!(
-                "provider '{provider}' has no pty endpoint — `--tui` is only \
-                 meaningful for claude (devin is already a TUI)"
-            )));
-        }
-    } else {
-        registry::default_kind(provider)?
-    };
+    let endpoint_kind = launch_endpoint_kind(provider, devin.cloud, tui)?;
     // `-r` on claude only makes sense on the pty endpoint — the managed
     // adapter reopens through `agent resume` and would silently drop a
     // session param it never reads.
@@ -6067,7 +6255,7 @@ fn provider_launch(
     // Devin's `permission_mode` persists the same way — the profile
     // replays it into the pane argv on every open, so a `--bypass`
     // worker never stalls on its first approval menu again.
-    if provider == "devin" {
+    if provider == "devin" && endpoint_kind == "pty" {
         let mode = if devin.bypass {
             Some("dangerous")
         } else {
@@ -6077,6 +6265,9 @@ fn provider_launch(
             registry::devin_permission_mode(mode)?;
             params_obj.insert("permission_mode".to_string(), json!(mode));
         }
+    }
+    if endpoint_kind == "cloud" {
+        insert_devin_cloud_params(&mut params_obj, devin)?;
     }
     // Cursor's model/permission params persist the same way — the
     // profile replays them into the pane argv on every open; `--bypass`
@@ -6135,6 +6326,13 @@ fn provider_launch(
                 format!("provider '{provider}' endpoint '{endpoint_kind}' does not accept a model"),
             ));
         }
+    }
+    if endpoint_kind == "cloud" {
+        registry::validate_launch_params(
+            provider,
+            endpoint_kind,
+            &Value::Object(params_obj.clone()),
+        )?;
     }
     let params = (!params_obj.is_empty()).then(|| Value::Object(params_obj).to_string());
     // The sandbox rides the agent record; codex sends it on
@@ -6497,13 +6695,19 @@ fn brief_agent(
         } else {
             ""
         };
-        let body = format!(
-            "Cadence bootstrap: you are '{alias}', reporting to group root \
-             '{root_alias}'. Your briefing is on disk at {}{role} — read it. Run \
-             `cadence self` for this message's id and turn_id, {report_line}. \
-             List peers with `cadence agent list`.",
-            file.display()
-        );
+        let cloud = agent["provider"].as_str() == Some("devin")
+            && agent["endpoint_kind"].as_str() == Some("cloud");
+        let body = if cloud {
+            cloud_session_prompt(alias, root_alias, instructions.as_deref(), report_line)
+        } else {
+            format!(
+                "Cadence bootstrap: you are '{alias}', reporting to group root \
+                 '{root_alias}'. Your briefing is on disk at {}{role} — read it. Run \
+                 `cadence self` for this message's id and turn_id, {report_line}. \
+                 List peers with `cadence agent list`.",
+                file.display()
+            )
+        };
         client::rpc(
             state_dir,
             "agent_send",
@@ -6513,6 +6717,33 @@ fn brief_agent(
         )?;
     }
     Ok(file)
+}
+
+/// Prompt posted into a Devin cloud session. The briefing file is still
+/// written for the operator; the session itself cannot read that path
+/// or run `cadence self`, so the role text is inlined here.
+fn cloud_session_prompt(
+    alias: &str,
+    root: &str,
+    instructions: Option<&str>,
+    report_line: &str,
+) -> String {
+    let role = instructions
+        .map(|text| {
+            let flat = text.replace(['\n', '\r'], " ");
+            format!(
+                " Role instructions: {}.",
+                cadence_agent::store::omit_host_paths(&flat)
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "Cadence bootstrap: you are '{alias}', reporting to group root '{root}'. \
+         You are a Devin cloud session and cannot read host paths or invoke the \
+         cadence CLI.{role} {report_line}. End your final answer with a one-line \
+         summary followed by a last line `SHA: <40-hex>` naming the commit you \
+         produced."
+    )
 }
 
 /// The briefing document: identity, protocol quickref, and the group
@@ -6969,6 +7200,137 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn devin_cloud_parses_repo_and_refuses_pty_permission_flags() {
+        parsed_cloud_repo();
+        cloud_permission_flags_are_refused();
+    }
+
+    #[inline(never)]
+    fn parsed_cloud_repo() {
+        let cli = Cli::try_parse_from([
+            "cadence",
+            "--state-dir",
+            "/tmp/cadence",
+            "devin",
+            "--cloud",
+            "--cloud-params",
+            "repo=favcrm/cadence;devin_mode=fast",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Devin {
+                cloud: true,
+                cloud_params: Some(params),
+                ..
+            } if params == "repo=favcrm/cadence;devin_mode=fast"
+        ));
+        assert!(Cli::try_parse_from(["cadence", "devin", "--cloud-params", "repo=x/y",]).is_err());
+        use clap::CommandFactory;
+        let mut cmd = Cli::command();
+        let help = cmd
+            .find_subcommand_mut("devin")
+            .unwrap()
+            .render_help()
+            .to_string();
+        assert!(help.contains("--cloud"), "{help}");
+        assert!(help.contains("--cloud-params"), "{help}");
+        assert!(Cli::try_parse_from(["cadence", "devin", "--", "--cloud"]).is_err());
+    }
+
+    #[inline(never)]
+    fn cloud_permission_flags_are_refused() {
+        let mut refused = DevinOpts {
+            permission_mode: Some("smart".into()),
+            cloud: true,
+            ..DevinOpts::default()
+        };
+        apply_cloud_params(&mut refused, &["repo=favcrm/cadence".into()]).unwrap();
+        assert!(insert_devin_cloud_params(&mut serde_json::Map::new(), &refused).is_err());
+        let bypassed = DevinOpts {
+            bypass: true,
+            cloud: true,
+            ..DevinOpts::default()
+        };
+        assert!(insert_devin_cloud_params(&mut serde_json::Map::new(), &bypassed).is_err());
+        let err = launch_endpoint_kind("devin", true, true).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("--cloud cannot be combined with --tui"));
+        assert!(launch_endpoint_kind("claude", true, false).is_err());
+    }
+
+    #[test]
+    fn join_devin_cloud_parses_repo() {
+        parsed_join_cloud_repo();
+    }
+
+    #[inline(never)]
+    #[test]
+    fn cloud_bootstrap_prompt_inlines_role_without_a_host_path() {
+        let body = cloud_session_prompt(
+            "w",
+            "pm",
+            Some("Ship the widget. Read /secret/host/role.md before you start."),
+            "do the work, then finish",
+        );
+        assert!(body.contains("Ship the widget."), "{body}");
+        assert!(body.contains("before you start."), "{body}");
+        assert!(!body.contains("/secret/host/role.md"), "{body}");
+        assert!(body.contains("SHA:"), "{body}");
+        assert!(!body.contains('/'), "{body}");
+        assert!(!body.contains("cadence self"), "{body}");
+        assert!(!body.contains("on disk"), "{body}");
+    }
+
+    fn parsed_join_cloud_repo() {
+        let cli = Cli::try_parse_from([
+            "cadence",
+            "join",
+            "pm",
+            "devin",
+            "--cloud",
+            "--cloud-params=repo=favcrm/cadence",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Join {
+                tui: false,
+                cloud: true,
+                cloud_params: Some(params),
+                ..
+            } if params == "repo=favcrm/cadence"
+        ));
+    }
+
+    #[test]
+    fn cloud_param_maps_launch_keys() {
+        let mut opts = DevinOpts::default();
+        assert!(apply_cloud_params(
+            &mut opts,
+            &[
+                "repo=favcrm/cadence".into(),
+                "devin_mode=fast".into(),
+                "max_acu_limit=4".into(),
+                "knowledge_id=k1".into(),
+                "tag=team".into(),
+                "bypass_approval=true".into(),
+            ],
+        )
+        .is_ok());
+        assert_eq!(opts.repos, vec!["favcrm/cadence".to_string()]);
+        assert_eq!(opts.devin_mode.as_deref(), Some("fast"));
+        assert_eq!(opts.max_acu_limit, Some(4));
+        assert_eq!(opts.knowledge_ids, vec!["k1".to_string()]);
+        assert_eq!(opts.tags, vec!["team".to_string()]);
+        assert!(opts.bypass_approval);
+        assert!(apply_cloud_params(&mut opts, &["devin_mode=turbo".into()]).is_err());
+        assert!(apply_cloud_params(&mut opts, &["nope=1".into()]).is_err());
+        assert!(apply_cloud_params(&mut opts, &["max_acu_limit=0".into()]).is_err());
     }
 
     #[test]
