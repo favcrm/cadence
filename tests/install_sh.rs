@@ -7,9 +7,10 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use cadence_agent::upgrade::Layout;
 use sha2::{Digest, Sha256};
@@ -40,7 +41,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn script() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/install.sh")
 }
 
 /// A temp root, a HOME inside it, and a release source at `dl/<tag>/`.
@@ -130,10 +131,27 @@ impl Fixture {
     }
 
     fn install(&self, args: &[&str]) -> Output {
-        Command::new("sh")
-            .arg(script())
-            .args(args)
-            .env("HOME", self.home())
+        let mut cmd = Command::new("sh");
+        cmd.arg(script()).args(args);
+        self.env(&mut cmd).output().unwrap()
+    }
+
+    /// `curl … | sh`: the script arrives on stdin.
+    fn install_piped(&self, script: &[u8]) -> Output {
+        let mut cmd = Command::new("sh");
+        let mut child = self
+            .env(&mut cmd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(script).unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    fn env<'a>(&self, cmd: &'a mut Command) -> &'a mut Command {
+        cmd.env("HOME", self.home())
             .env("TMPDIR", self.path("tmp"))
             .env_remove("XDG_DATA_HOME")
             .env(
@@ -144,8 +162,6 @@ impl Fixture {
                 "CADENCE_INSTALL_API_URL",
                 format!("file://{}", self.path("api").display()),
             )
-            .output()
-            .unwrap()
     }
 
     fn install_ok(&self, args: &[&str]) -> String {
@@ -332,5 +348,72 @@ fn upgrade_reads_a_releases_dir_only_off_a_version_or_sha_dir() {
         std::os::unix::fs::symlink(fx.path(dir).join("cadence"), &link).unwrap();
         let layout = Layout::detect(Some(link.clone()), None).unwrap();
         assert_eq!(layout.releases == fx.path("r"), found, "{dir}");
+    }
+}
+
+#[test]
+fn a_redirected_source_is_named_in_the_output() {
+    let fx = Fixture::new();
+    let text = fx.install_ok(&["--version", &tag()]);
+    assert!(text.contains("source: file://"), "{text}");
+    assert!(text.contains("not the default"), "{text}");
+}
+
+/// A `curl | sh` cut short must never install, link or say `ok`: every
+/// statement runs inside `main`, which is called on the last line and
+/// refuses to run without the `--end-of-script` marker that ends it.
+#[test]
+fn a_truncated_script_piped_into_sh_installs_nothing() {
+    let publish_latest = |fx: &Fixture| {
+        fs::write(
+            fx.path("api/releases/latest"),
+            format!("{{\"tag_name\": \"{}\"}}\n", tag()),
+        )
+        .unwrap();
+    };
+    let full = fs::read(script()).unwrap();
+    // Whole, the piped script installs and links — so every cut below
+    // is refused by the script's shape, not by a missing fixture.
+    let whole = Fixture::new();
+    publish_latest(&whole);
+    let out = whole.install_piped(&full);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(fs::symlink_metadata(whole.link()).is_ok());
+
+    let call = full.len() - b"main \"$@\" --end-of-script\n".len();
+    let mut cuts: Vec<usize> = (1..20).map(|i| full.len() * i / 20).collect();
+    // Around the call: before it, `main` alone, `main "$@"`, the marker
+    // half-sent, and all but the final newline (which still runs).
+    cuts.extend([
+        call - 1,
+        call,
+        call + 4,
+        call + 9,
+        call + 15,
+        full.len() - 2,
+    ]);
+    for cut in cuts {
+        let fx = Fixture::new();
+        publish_latest(&fx);
+        let out = fx.install_piped(&full[..cut]);
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!text.contains("cadence-install: ok"), "cut {cut}: {text}");
+        assert!(
+            !out.status.success() || text.is_empty(),
+            "cut {cut} exited 0 after doing something: {text}"
+        );
+        assert!(fs::symlink_metadata(fx.link()).is_err(), "cut {cut} linked");
+        assert!(
+            !fx.home().join(".local").exists(),
+            "cut {cut} wrote ~/.local"
+        );
     }
 }
