@@ -124,8 +124,8 @@ is true of this merge and not of the fleet as a whole.
 ## The digest: structural facts are reported once (CAD-207)
 
 When every GitHub login the fleet names — every `mergedBy` of every
-merged PR the run fetched, and every `qa-verdict` status creator it
-holds — is **one account**, the
+merged PR the run fetched, and the `qa-verdict` status creator on
+every one of their landed heads — is **one account**, the
 fleet pushes everything through a shared token, and
 `reviewer==merger` holds on every row that has a status by
 construction. A flag that fires on 100% of rows discriminates nothing
@@ -149,9 +149,15 @@ deviates from the fleet and keeps `FLAG[reviewer==merger]`. The
 determination is made over the whole fetch, not the rendered window:
 a narrow `--since`/`--class`/`--project`/`--limit` cannot turn a real
 self-review into a structural one. Mergers cover every merged PR
-`gh pr list` returned; status creators cover every status in hand —
-all of them with `--merge-report`, only the rendered rows' on a live
-run (fetching the rest would cost one API call per PR). The structural fact is
+`gh pr list` returned, and the fact is decided only once the status
+of every one of those PRs is in hand (CAD-287). A `--merge-report`
+fixture holds them all. A live run fetches statuses only for the
+rendered rows (fetching the rest would cost one API call per PR), so
+when any fetched PR is outside the window — or its status fetch
+failed — the fleet is undecided and each `reviewer==merger` match
+keeps its per-row flag: the unseen status could be a QA token's.
+Widen the window (`--limit 0`, no `--since`/`--class`/`--project`)
+to decide it live. The structural fact is
 still a real limitation — attestation and merge cannot be told apart
 under one token (see the trust model) — it is just not a per-merge
 finding.
@@ -227,6 +233,12 @@ approval line), and the summary line states how many approvals are
 operator-claimed. The gate still discriminates what it can — a
 missing or revoked approval is a real finding — but a claimed one is
 a claim.
+
+The exit code treats an `operator-claimed` approval as satisfied:
+text and JSON disclose the claim, the exit code cannot. A clean run
+whose human-class rows rest on claimed approvals exits 0 until
+CAD-280 lets the audit tell a claim from proof — read the summary's
+operator-claimed count, not only the exit status.
 
 **What is never an approval.** Queue and message state is context
 only: a message whose body says `OPERATOR APPROVED #84 at <sha>` —
