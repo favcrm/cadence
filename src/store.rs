@@ -243,6 +243,10 @@ pub const ROLLABLE_EVENT_KINDS: [&str; 2] = ["submitting", "submitted"];
 pub const DELIVERY_ROLLUP_EVENT: &str = "delivery_rolled_up";
 /// Delivery rows younger than this stay rows.
 pub const EVENT_ROLLUP_AGE_SECS: f64 = 7.0 * 86_400.0;
+/// Most delivery rows one rollup pass folds. A pass holds the store
+/// lock in one transaction, so a long-lived store's first backlog
+/// drains in bounded chunks, oldest first, never in one long hold.
+pub const EVENT_ROLLUP_BATCH: usize = 5_000;
 
 /// `events e` rows a rollup at cutoff `?1` may fold: an allowlisted
 /// kind, older than the cut, outside any job view, and not naming a
@@ -4396,22 +4400,26 @@ impl Store {
     /// per alias carrying per-kind counts and the folded time span. The
     /// first rollup reuses the alias's oldest folded row, so the summary
     /// keeps an old seq and never reads as new activity to a cursor or
-    /// the stall watch; later passes add into that row. Returns the
-    /// number of delivery rows folded.
-    pub fn roll_up_delivery_events(&self, cutoff: f64) -> Result<usize> {
+    /// the stall watch; later passes add into that row. One pass folds
+    /// at most `limit` rows, oldest first, so the lock hold stays
+    /// bounded; returns the number folded — `limit` means more may
+    /// remain.
+    pub fn roll_up_delivery_events(&self, cutoff: f64, limit: usize) -> Result<usize> {
         let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
-        let rows: Vec<(i64, String, String, f64)> = {
+        let mut rows: Vec<(i64, String, String, f64)> = {
             let mut st = tx.prepare(&format!(
                 "SELECT e.seq, e.alias, e.kind, e.at FROM events e WHERE {} \
-                 ORDER BY e.alias, e.seq",
+                 ORDER BY e.seq LIMIT ?2",
                 rollable_events_where()
             ))?;
-            let rows = st.query_map([cutoff], |r| {
+            let rows = st.query_map(params![cutoff, limit as i64], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
             })?;
             rows.collect::<rusqlite::Result<_>>()?
         };
+        // Per-alias runs, each in seq order, for the fold below.
+        rows.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
         let kinds_sql = ROLLABLE_EVENT_KINDS
             .iter()
             .map(|k| format!("'{k}'"))
@@ -9788,7 +9796,11 @@ mod tests {
         let cutoff = now() - EVENT_ROLLUP_AGE_SECS;
         assert_eq!(EVENT_ROLLUP_AGE_SECS, 7.0 * DAY);
 
-        assert_eq!(s.roll_up_delivery_events(cutoff).unwrap(), 4);
+        assert_eq!(
+            s.roll_up_delivery_events(cutoff, EVENT_ROLLUP_BATCH)
+                .unwrap(),
+            4
+        );
         let rollup = |alias: &str| -> Vec<Value> {
             event_rows(&s)
                 .into_iter()
@@ -9814,12 +9826,20 @@ mod tests {
 
         // Nothing new is old enough: a second pass is a no-op.
         let before = event_rows(&s);
-        assert_eq!(s.roll_up_delivery_events(cutoff).unwrap(), 0);
+        assert_eq!(
+            s.roll_up_delivery_events(cutoff, EVENT_ROLLUP_BATCH)
+                .unwrap(),
+            0
+        );
         assert_eq!(event_rows(&s), before);
 
         // A week later the six-day row ages out and folds into the same
         // row — still one rollup per alias, counts summed.
-        assert_eq!(s.roll_up_delivery_events(now() - DAY).unwrap(), 1);
+        assert_eq!(
+            s.roll_up_delivery_events(now() - DAY, EVENT_ROLLUP_BATCH)
+                .unwrap(),
+            1
+        );
         let a1 = rollup("a1");
         assert_eq!(a1.len(), 1, "{a1:?}");
         assert_eq!(a1[0]["counts"], json!({"submitting": 2, "submitted": 2}));
@@ -9883,7 +9903,68 @@ mod tests {
             );
         }
         let before = event_rows(&s);
-        assert_eq!(s.roll_up_delivery_events(now()).unwrap(), 0);
+        assert_eq!(
+            s.roll_up_delivery_events(now(), EVENT_ROLLUP_BATCH)
+                .unwrap(),
+            0
+        );
         assert_eq!(event_rows(&s), before);
+    }
+
+    /// QA revise (item 3): one pass folds at most `limit` rows, oldest
+    /// first, and the next pass continues into the same rollup rows —
+    /// a long-lived store's backlog drains in bounded lock holds.
+    #[test]
+    fn rollup_pass_is_capped_and_the_next_pass_continues() {
+        let (dir, s) = store();
+        reg(&s, "a1", &dir.path().join("w"));
+        reg(&s, "a2", &dir.path().join("w"));
+        for i in 0..4 {
+            let age = (20 - i) as f64 * DAY;
+            delivery(
+                &s,
+                "a1",
+                &format!("m1-{i}"),
+                "completed",
+                &[("submitting", age), ("submitted", age)],
+            );
+            delivery(
+                &s,
+                "a2",
+                &format!("m2-{i}"),
+                "completed",
+                &[("submitting", age)],
+            );
+        }
+        let cutoff = now() - EVENT_ROLLUP_AGE_SECS;
+        let delivery_left = |s: &Store| {
+            event_rows(s)
+                .into_iter()
+                .filter(|row| ROLLABLE_EVENT_KINDS.contains(&row.2.as_str()))
+                .count()
+        };
+        assert_eq!(delivery_left(&s), 12);
+        assert_eq!(s.roll_up_delivery_events(cutoff, 5).unwrap(), 5);
+        assert_eq!(delivery_left(&s), 7);
+        // Oldest first: the first pass took the 20- and 19-day rows.
+        let oldest_left = event_rows(&s)
+            .into_iter()
+            .filter(|row| ROLLABLE_EVENT_KINDS.contains(&row.2.as_str()))
+            .map(|row| row.4)
+            .fold(f64::INFINITY, f64::min);
+        assert!(oldest_left > now() - 19.0 * DAY - 60.0, "{oldest_left}");
+        assert_eq!(s.roll_up_delivery_events(cutoff, 5).unwrap(), 5);
+        assert_eq!(s.roll_up_delivery_events(cutoff, 5).unwrap(), 2);
+        assert_eq!(s.roll_up_delivery_events(cutoff, 5).unwrap(), 0);
+        assert_eq!(delivery_left(&s), 0);
+        let counts = |alias: &str| -> Vec<Value> {
+            event_rows(&s)
+                .into_iter()
+                .filter(|row| row.1 == alias && row.2 == DELIVERY_ROLLUP_EVENT)
+                .map(|row| serde_json::from_str::<Value>(&row.3).unwrap()["counts"].clone())
+                .collect()
+        };
+        assert_eq!(counts("a1"), vec![json!({"submitting": 4, "submitted": 4})]);
+        assert_eq!(counts("a2"), vec![json!({"submitting": 4, "submitted": 0})]);
     }
 }
