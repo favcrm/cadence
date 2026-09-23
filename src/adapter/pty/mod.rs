@@ -314,6 +314,39 @@ pub(crate) fn pane_alive(state_dir: &Path, alias: &str, env: &ProviderEnv) -> bo
         .map_or(true, |out| out.status.success())
 }
 
+/// CAD-96: how many terminal clients are attached to `alias`'s session
+/// on this state dir's private tmux socket (`cadence attach`, or a
+/// hand-run `tmux attach`). `None` when tmux cannot answer — the idle
+/// auto-stop timer then keeps the agent: fail closed.
+pub(crate) fn pane_clients(state_dir: &Path, alias: &str, env: &ProviderEnv) -> Option<usize> {
+    let tmux = env
+        .var("CADENCE_TMUX_COMMAND")
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "tmux".to_string());
+    let socket = format!("cadence-{}", short_hash(&state_dir.to_string_lossy()));
+    let out = Command::new(tmux)
+        .arg("-L")
+        .arg(&socket)
+        .args([
+            "list-clients",
+            "-t",
+            &format!("={alias}"),
+            "-F",
+            "#{client_tty}",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count(),
+    )
+}
+
 pub(crate) fn resolve_on_path(bin: &str) -> Result<String> {
     let path = std::env::var("PATH").unwrap_or_default();
     for dir in path.split(':') {

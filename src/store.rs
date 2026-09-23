@@ -5864,6 +5864,79 @@ impl Store {
         tx.commit()?;
         Ok(Some(agent))
     }
+
+    /// CAD-96: per alias, the newest durable activity and the count of
+    /// messages in any state but completed, failed, interrupted or
+    /// cancelled (queued, submitting, running, awaiting a report,
+    /// `unknown`, and any state added later all count as busy).
+    /// Activity is the newest of: a message's created/started/completed
+    /// stamp, and any event on the alias's stream whose kind is not in
+    /// `passive` (bookkeeping that is not delivery, report or turn work).
+    /// One grouped pass over each table — the idle auto-stop timer calls
+    /// this once per check, never per agent.
+    pub fn auto_stop_activity(
+        &self,
+        passive: &[&str],
+    ) -> Result<std::collections::HashMap<String, (Option<f64>, i64)>> {
+        let conn = self.conn();
+        let placeholders = passive.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT alias, MAX(at) FROM (
+                SELECT alias, at FROM events WHERE kind NOT IN ({placeholders})
+                UNION ALL
+                SELECT alias, MAX(created, COALESCE(started, 0), COALESCE(completed, 0))
+                  FROM messages
+             ) GROUP BY alias"
+        );
+        let args: Vec<&dyn rusqlite::ToSql> =
+            passive.iter().map(|k| k as &dyn rusqlite::ToSql).collect();
+        let mut out: std::collections::HashMap<String, (Option<f64>, i64)> =
+            std::collections::HashMap::new();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(args.as_slice(), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<f64>>(1)?))
+        })?;
+        for row in rows {
+            let (alias, at) = row?;
+            out.entry(alias).or_default().0 = at;
+        }
+        let mut stmt = conn.prepare(
+            "SELECT alias, COUNT(*) FROM messages WHERE state NOT IN
+             ('completed','failed','interrupted','cancelled') GROUP BY alias",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        for row in rows {
+            let (alias, open) = row?;
+            out.entry(alias).or_default().1 = open;
+        }
+        Ok(out)
+    }
+
+    /// CAD-96: per alias, the newest event of any of `kinds` — one
+    /// grouped pass, so `agent_list` can tell an auto-stopped agent from
+    /// a manually stopped one without a scan per row.
+    pub fn last_events_of_all(
+        &self,
+        kinds: &[&str],
+    ) -> Result<std::collections::HashMap<String, Event>> {
+        let conn = self.conn();
+        let placeholders = kinds.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT e.seq,e.alias,e.kind,e.payload,e.job_id,e.task_id,e.at FROM events e
+             JOIN (SELECT MAX(seq) AS seq FROM events WHERE kind IN ({placeholders})
+                   GROUP BY alias) m ON e.seq = m.seq"
+        );
+        let args: Vec<&dyn rusqlite::ToSql> =
+            kinds.iter().map(|k| k as &dyn rusqlite::ToSql).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(args.as_slice(), row_event)?;
+        let mut out = std::collections::HashMap::new();
+        for row in rows {
+            let event = row?;
+            out.insert(event.alias.clone(), event);
+        }
+        Ok(out)
+    }
 }
 
 const UNKNOWN_EVENT_REASON_CHARS: usize = 512;

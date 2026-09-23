@@ -860,6 +860,8 @@ fn agents_payload(state_dir: &Path) -> Value {
             "last_activity": last_activity,
             "silent_secs": agent["silent_secs"],
             "stalled": agent["stalled"],
+            // CAD-96: `stopped (auto, idle 72m)` — null unless auto-stopped.
+            "state_label": agent["state_label"],
             "event_cursor": cursor,
         }));
     }

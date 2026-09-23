@@ -134,7 +134,7 @@ pub static SPECS: &[EndpointSpec] = &[
         brokers_requests: true,
         resumable: true,
         resume_label: "codex resume --remote",
-        live_settable_params: &["stall_secs"],
+        live_settable_params: &["stall_secs", "auto_stop", "auto_stop_idle_secs"],
         launch_params: &[
             "model",
             "effort",
@@ -168,7 +168,7 @@ pub static SPECS: &[EndpointSpec] = &[
         brokers_requests: true,
         resumable: true,
         resume_label: "codex resume --remote",
-        live_settable_params: &["stall_secs"],
+        live_settable_params: &["stall_secs", "auto_stop", "auto_stop_idle_secs"],
         launch_params: &[
             "model",
             "effort",
@@ -202,7 +202,7 @@ pub static SPECS: &[EndpointSpec] = &[
         brokers_requests: true,
         resumable: true,
         resume_label: "claude --resume <session>",
-        live_settable_params: &["stall_secs"],
+        live_settable_params: &["stall_secs", "auto_stop", "auto_stop_idle_secs"],
         launch_params: &[
             "model",
             "effort",
@@ -246,7 +246,13 @@ pub static SPECS: &[EndpointSpec] = &[
         brokers_requests: false,
         resumable: true,
         resume_label: "claude --resume <session>",
-        live_settable_params: &["auto_ready", "stall_secs", "silent_end_secs"],
+        live_settable_params: &[
+            "auto_ready",
+            "stall_secs",
+            "silent_end_secs",
+            "auto_stop",
+            "auto_stop_idle_secs",
+        ],
         launch_params: &[
             "model",
             "effort",
@@ -282,7 +288,13 @@ pub static SPECS: &[EndpointSpec] = &[
         brokers_requests: false,
         resumable: true,
         resume_label: "devin -r <slug>",
-        live_settable_params: &["auto_ready", "stall_secs", "silent_end_secs"],
+        live_settable_params: &[
+            "auto_ready",
+            "stall_secs",
+            "silent_end_secs",
+            "auto_stop",
+            "auto_stop_idle_secs",
+        ],
         launch_params: &[
             "session",
             "upstream",
@@ -315,7 +327,13 @@ pub static SPECS: &[EndpointSpec] = &[
         brokers_requests: false,
         resumable: true,
         resume_label: "cursor-agent --resume <session>",
-        live_settable_params: &["auto_ready", "stall_secs", "silent_end_secs"],
+        live_settable_params: &[
+            "auto_ready",
+            "stall_secs",
+            "silent_end_secs",
+            "auto_stop",
+            "auto_stop_idle_secs",
+        ],
         launch_params: &[
             "model",
             "permission_mode",
@@ -349,7 +367,13 @@ pub static SPECS: &[EndpointSpec] = &[
         brokers_requests: false,
         resumable: true,
         resume_label: "stub -r <session>",
-        live_settable_params: &["auto_ready", "stall_secs", "silent_end_secs"],
+        live_settable_params: &[
+            "auto_ready",
+            "stall_secs",
+            "silent_end_secs",
+            "auto_stop",
+            "auto_stop_idle_secs",
+        ],
         launch_params: &[
             "session",
             "upstream",
@@ -404,7 +428,7 @@ pub static SPECS: &[EndpointSpec] = &[
         brokers_requests: true,
         resumable: true,
         resume_label: "in-process double",
-        live_settable_params: &["stall_secs"],
+        live_settable_params: &["stall_secs", "auto_stop", "auto_stop_idle_secs"],
         launch_params: &["session", "upstream", "agents_md", "stall_secs"],
         session_id_label: "Fake session",
         respond_rejection: None,
@@ -760,9 +784,34 @@ pub fn validate_live_param(provider: &str, kind: &str, key: &str, value: &Value)
             }
             Ok(())
         }
+        // CAD-96: idle auto-stop opt-out and per-agent bound.
+        "auto_stop" | "auto_stop_idle_secs" => {
+            if !has_actor(provider, kind) {
+                return Err(Error::rejected(format!(
+                    "'{key}' only applies to endpoints with an actor — an \
+                     inbox has no process to stop"
+                )));
+            }
+            let ok = if key == "auto_stop" {
+                value.is_null() || value.as_str() == Some("off")
+            } else {
+                check_stall_secs(value)
+            };
+            if !ok {
+                return Err(Error::rejected(if key == "auto_stop" {
+                    "'auto_stop' accepts \"off\" (opt this agent out of idle \
+                     auto-stop) or a bare key removal (back to the default)"
+                } else {
+                    "'auto_stop_idle_secs' must be a non-negative integer (0 \
+                     turns auto-stop off for this agent) or a bare key removal"
+                }));
+            }
+            Ok(())
+        }
         other => Err(Error::rejected(format!(
             "'{other}' is not live-settable — allowed keys: auto_ready \
              (pty only), stall_secs, silent_end_secs (pty only), \
+             auto_stop=off, auto_stop_idle_secs, \
              inbox_warn_unread, inbox_warn_idle_secs (inbox only). \
              Recreate the agent to change wiring params like upstream \
              or session"

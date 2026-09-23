@@ -1261,7 +1261,10 @@ enum DaemonAction {
     },
     /// Report daemon health, including `agent_gc_timer`: whether the
     /// opt-in agent-gc timer is on (pm.yaml `[host]
-    /// agent_gc_older_than_secs`), its effective age, and its last sweep.
+    /// agent_gc_older_than_secs`), its effective age, and its last sweep;
+    /// and `agent_auto_stop`: the idle auto-stop bound (default ON, 3600s;
+    /// `[host] auto_stop_idle_secs`, `auto_stop_idle_secs_by_provider`),
+    /// what it last stopped, and why each live agent was kept.
     Status,
     /// Ask the daemon to shut down gracefully, then wait until the
     /// process has actually exited and released the state-dir lock
@@ -1595,6 +1598,13 @@ enum AgentAction {
     /// Merge `key=value` pairs into an agent's endpoint params — e.g.
     /// `agent set <alias> auto_ready=verified` opts a live agent into
     /// daemon-verified readiness.
+    ///
+    /// `agent set <alias> auto_stop=off` opts an agent out of the
+    /// daemon's idle auto-stop (default ON: an agent with nothing queued,
+    /// running, awaiting a report or unknown for 60 minutes is stopped,
+    /// resumably); `auto_stop_idle_secs=<n>` sets this agent's own bound
+    /// (0 = off). A bare `auto_stop` / `auto_stop_idle_secs` removes the
+    /// override.
     ///
     /// `--next-launch` stores launch params (`model`, `effort`) for the
     /// agent's next open instead — the live process is untouched; `agent
@@ -2574,6 +2584,9 @@ fn status_view(state_dir: &Path, group: Option<&str>) -> Result<Value> {
             "provider": provider,
             "endpoint_kind": kind,
             "state": a["state"].as_str().unwrap_or_default(),
+            // CAD-96: `stopped (auto, idle 72m)` for an idle auto-stop.
+            "state_label": a["state_label"],
+            "auto_stopped": a["auto_stopped"],
             "dead": a["dead"].as_bool().unwrap_or(false),
             "resumable": a["resumable"].as_bool().unwrap_or(false),
             "running": running,
@@ -2657,7 +2670,11 @@ fn print_status_table(view: &Value) {
                     a["provider"].as_str().unwrap_or_default(),
                     a["endpoint_kind"].as_str().unwrap_or_default()
                 ),
-                a["state"].as_str().unwrap_or_default().to_string(),
+                a["state_label"]
+                    .as_str()
+                    .or(a["state"].as_str())
+                    .unwrap_or_default()
+                    .to_string(),
                 running,
                 a["queued"].as_i64().unwrap_or(0).to_string(),
                 a["unknown"].as_i64().unwrap_or(0).to_string(),
