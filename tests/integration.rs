@@ -2671,6 +2671,10 @@ fn daemon_opts() -> daemon::ServeOptions {
         release_shutdown_snapshot: None,
         // CAD-199: the agent-gc timer stays off unless a test pins it.
         agent_gc: Some(daemon::AgentGcSetting::default()),
+        // CAD-96: idle auto-stop is ON by default in production; test
+        // daemons pin it off so no test's agent is stopped mid-test.
+        auto_stop: Some(daemon::AutoStopSetting::off()),
+        auto_stop_clock: None,
     }
 }
 
@@ -4412,6 +4416,15 @@ if cmd == "kill-session":
     if pid:
         try: os.killpg(pid, signal.SIGKILL)
         except ProcessLookupError: pass
+    sys.exit(0)
+if cmd == "list-clients":
+    # Attached terminal clients: one tty per line of `<session>.clients`
+    # (absent = none attached). An unknown session fails like tmux.
+    name = rest[rest.index("-t") + 1].lstrip("=")
+    if not sess_pid(name):
+        die("can't find session: " + name)
+    try: sys.stdout.write(open(sess_path(name, "clients")).read())
+    except OSError: pass
     sys.exit(0)
 die("unhandled tmux cmd " + cmd)
 "##;
@@ -29699,4 +29712,343 @@ fn restart_and_rollout_help_say_same_build_restart_is_lease_free() {
             "help for {args:?} should say same-build restart is lease-free:\n{text}"
         );
     }
+}
+
+// ---- CAD-96: idle auto-stop (default ON in production, pinned here) ----
+
+/// A daemon with idle auto-stop pinned to `setting` and its clock at
+/// wall time plus the returned offset (seconds) — a test ages every
+/// agent by moving the offset, never by sleeping.
+fn auto_stop_daemon(
+    setting: daemon::AutoStopSetting,
+) -> (TestDaemon, std::sync::Arc<std::sync::atomic::AtomicI64>) {
+    let offset = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let o = std::sync::Arc::clone(&offset);
+    let d = TestDaemon::start_opts(daemon::ServeOptions {
+        auto_stop: Some(setting),
+        auto_stop_clock: Some(std::sync::Arc::new(move || {
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64()
+                + o.load(std::sync::atomic::Ordering::SeqCst) as f64
+        })),
+        ..daemon_opts()
+    });
+    (d, offset)
+}
+
+fn auto_stop_status(d: &TestDaemon) -> Value {
+    d.rpc("health", json!({})).unwrap()["agent_auto_stop"].clone()
+}
+
+/// Wait for the timer to finish a sweep whose clock reading falls in
+/// `window` (clock seconds) — `last_kept` is that sweep's.
+fn wait_auto_stop_check(d: &TestDaemon, window: std::ops::Range<f64>) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let status = auto_stop_status(d);
+        if status["last_sweep_at"]
+            .as_f64()
+            .is_some_and(|at| window.contains(&at))
+        {
+            return status;
+        }
+        assert!(Instant::now() < deadline, "no auto-stop check: {status}");
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Wait until `alias` is stopped AND its `agent_auto_stopped` record
+/// has landed — the stop path writes `stopped` first, the timer records
+/// the event once that path returns.
+fn wait_auto_stopped(d: &TestDaemon, alias: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let agent = d.rpc("agent_show", json!({"alias": alias})).unwrap()["agent"].clone();
+        if agent["state"] == "stopped" && agent["state_label"].is_string() {
+            return agent;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{alias} never auto-stopped: {agent}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The timer's status once its sweep has published a stop.
+fn wait_auto_stop_published(d: &TestDaemon) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let status = auto_stop_status(d);
+        if status["stopped_total"].as_u64().unwrap_or(0) > 0 {
+            return status;
+        }
+        assert!(Instant::now() < deadline, "no stop published: {status}");
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wall_secs() -> f64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64()
+}
+
+#[test]
+fn auto_stop_idle_agent_stops_with_event_label_and_resumes() {
+    let (d, offset) = auto_stop_daemon(daemon::AutoStopSetting::idle_after(3600));
+    d.register_inbox("pm");
+    register_fake_opts(&d, "w1", json!({"upstream": "pm"}));
+    d.wait_agent("w1", "idle", 20);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "hello", "message": "m1"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "m1", &["completed"], 20);
+    let status = auto_stop_status(&d);
+    assert_eq!(status["enabled"], true, "{status}");
+    assert_eq!(status["idle_secs"], 3600, "{status}");
+
+    // Two hours on the timer's clock: the next check stops w1.
+    offset.store(7200, std::sync::atomic::Ordering::SeqCst);
+    let agent = wait_auto_stopped(&d, "w1");
+    assert_eq!(agent["enabled"], false, "{agent}");
+    assert_eq!(agent["resumable"], true, "{agent}");
+    let label = agent["state_label"].as_str().unwrap();
+    assert!(label.starts_with("stopped (auto, idle "), "{label}");
+    assert_eq!(agent["auto_stopped"]["bound_secs"], 3600, "{agent}");
+    assert_eq!(
+        agent["auto_stopped"]["resume"], "cadence agent resume w1",
+        "{agent}"
+    );
+    // Recorded on w1's own stream, after the normal stop path's own
+    // `stop_requested`.
+    let events = d
+        .rpc("agent_events", json!({"alias": "w1", "after": 0}))
+        .unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let kinds: Vec<&str> = events.iter().filter_map(|e| e["kind"].as_str()).collect();
+    let stop_at = kinds.iter().position(|k| *k == "stop_requested").unwrap();
+    let auto_at = kinds
+        .iter()
+        .position(|k| *k == "agent_auto_stopped")
+        .unwrap();
+    assert!(stop_at < auto_at, "{kinds:?}");
+    let payload = &events[auto_at]["payload"];
+    assert!(
+        payload["idle_secs"].as_f64().unwrap() >= 7000.0,
+        "{payload}"
+    );
+    assert_eq!(payload["bound_secs"], 3600, "{payload}");
+    assert_eq!(payload["bound_source"], "[host] auto_stop_idle_secs");
+    assert!(payload["reason"]
+        .as_str()
+        .unwrap()
+        .contains("no queued, running, awaiting-report or unknown message"));
+    let status = wait_auto_stop_published(&d);
+    assert_eq!(status["last_stopped"], json!(["w1"]), "{status}");
+    assert_eq!(status["stopped_total"], 1, "{status}");
+    // agent list and `cadence status` both render it distinctly.
+    let list = d.rpc("agent_list", json!({})).unwrap();
+    let row = list["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["alias"] == "w1")
+        .unwrap()
+        .clone();
+    assert_eq!(row["state_label"], agent["state_label"], "{row}");
+    let pm_dir = TempDir::new().unwrap();
+    let envs = [("CADENCE_PM_DIR", pm_dir.path())];
+    let view = status_json(&d.state, &[], &envs);
+    let srow = view["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["alias"] == "w1")
+        .unwrap()
+        .clone();
+    assert_eq!(srow["state"], "stopped", "{srow}");
+    assert_eq!(srow["state_label"], agent["state_label"], "{srow}");
+    let table = status_table(&d.state, &envs);
+    assert!(table.contains(label), "{table}");
+
+    // Resume brings it back on its saved thread; the marker is gone.
+    let out = d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
+    assert_eq!(out["state"], "starting", "{out}");
+    let agent = d.wait_agent("w1", "idle", 20);
+    assert!(agent["auto_stopped"].is_null(), "{agent}");
+    assert!(agent["state_label"].is_null(), "{agent}");
+    assert_eq!(agent["thread_id"], "fake-thread-w1", "{agent}");
+    // The resume's `ready` restarted the idle clock: a check a minute
+    // after it (the clock stepped back from +2h re-arms it) keeps w1.
+    offset.store(60, std::sync::atomic::Ordering::SeqCst);
+    let now = wall_secs();
+    let status = wait_auto_stop_check(&d, now..now + 600.0);
+    let why = status["last_kept"]["w1"].as_str().unwrap();
+    assert!(why.starts_with("idle "), "{status}");
+    assert_eq!(d.wait_agent("w1", "idle", 5)["state"], "idle");
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "again", "message": "m2"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "m2", &["completed"], 20);
+}
+
+#[test]
+fn auto_stop_keeps_pm_inbox_opted_out_and_busy_agents() {
+    let (d, offset) = auto_stop_daemon(daemon::AutoStopSetting::idle_after(3600));
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    d.rpc(
+        "agent_register",
+        json!({"alias": "pm", "provider": "fake", "endpoint_kind": "fake",
+               "cwd": cwd, "role": "pm"}),
+    )
+    .unwrap();
+    register_inbox_with(&d, "box", json!({"upstream": "pm"}));
+    for alias in ["w-opt", "w-busy", "w-idle"] {
+        register_fake_opts(&d, alias, json!({"upstream": "pm"}));
+    }
+    for alias in ["pm", "w-opt", "w-busy", "w-idle"] {
+        d.wait_agent(alias, "idle", 20);
+    }
+    // Per-agent opt-out rides the ordinary `agent set` allowlist.
+    d.rpc(
+        "agent_set",
+        json!({"alias": "w-opt", "patch": {"auto_stop": "off"}}),
+    )
+    .unwrap();
+    let err = d
+        .rpc(
+            "agent_set",
+            json!({"alias": "w-opt", "patch": {"auto_stop": "on"}}),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("accepts \"off\""), "{err}");
+    let err = d
+        .rpc(
+            "agent_set",
+            json!({"alias": "w-opt", "patch": {"auto_stop_idle_secs": "1h"}}),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("non-negative integer"), "{err}");
+    let err = d
+        .rpc(
+            "agent_set",
+            json!({"alias": "box", "patch": {"auto_stop": "off"}}),
+        )
+        .unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("only applies to endpoints with an actor"));
+    // A turn held open: busy for the whole check.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w-busy", "text": "SLEEP:30", "message": "hold"}),
+    )
+    .unwrap();
+    d.wait_message("w-busy", "hold", &["running"], 20);
+
+    offset.store(7200, std::sync::atomic::Ordering::SeqCst);
+    // The control proves a check ran with everyone past the bound.
+    wait_auto_stopped(&d, "w-idle");
+    let status = wait_auto_stop_published(&d);
+    assert_eq!(status["last_stopped"], json!(["w-idle"]), "{status}");
+    let kept = &status["last_kept"];
+    assert_eq!(kept["pm"], "group root (role pm)", "{status}");
+    assert!(kept["box"].is_null(), "an inbox has no actor: {status}");
+    assert_eq!(
+        kept["w-opt"], "auto-stop off (agent auto_stop=off)",
+        "{status}"
+    );
+    assert!(
+        kept["w-busy"]
+            .as_str()
+            .is_some_and(|r| r.starts_with("state ") || r.starts_with("busy:")),
+        "{status}"
+    );
+    for alias in ["pm", "w-opt"] {
+        let agent = d.rpc("agent_show", json!({"alias": alias})).unwrap()["agent"].clone();
+        assert_eq!(agent["state"], "idle", "{alias}: {agent}");
+        assert!(agent["auto_stopped"].is_null(), "{alias}: {agent}");
+    }
+    assert_eq!(d.message_state("w-busy", "hold"), "running");
+    let inbox = d.rpc("agent_show", json!({"alias": "box"})).unwrap()["agent"].clone();
+    assert_eq!(inbox["state"], "idle", "{inbox}");
+    // No auto-stop event anywhere but on the control.
+    for alias in ["pm", "box", "w-opt", "w-busy"] {
+        let events = d
+            .rpc("agent_events", json!({"alias": alias, "after": 0}))
+            .unwrap()["events"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert!(
+            !events.iter().any(|e| e["kind"] == "agent_auto_stopped"),
+            "{alias}: {events:?}"
+        );
+    }
+}
+
+#[test]
+fn auto_stop_pinned_off_in_test_daemons_and_reported() {
+    let d = TestDaemon::start();
+    let status = auto_stop_status(&d);
+    assert_eq!(status["enabled"], false, "{status}");
+    assert_eq!(status["default_secs"], 3600, "{status}");
+    assert!(status["attach_detection"]
+        .as_str()
+        .unwrap()
+        .contains("not detectable"));
+}
+
+#[test]
+fn auto_stop_keeps_pty_pane_with_attached_client_then_stops_it() {
+    let (d, offset) = auto_stop_daemon(daemon::AutoStopSetting::idle_after(3600));
+    let mock = d.mock_stub();
+    d.register_inbox("pm");
+    d.register_stub("s1", json!({"auto_ready": "verified", "upstream": "pm"}));
+    let agent = d.wait_agent("s1", "idle", 20);
+    assert!(agent["thread_id"].is_string(), "{agent}");
+    let clients = d.stub_pane_file(&mock, "s1", "clients");
+    atomic_write(clients.clone(), "/dev/pts/7\n");
+
+    offset.store(7200, std::sync::atomic::Ordering::SeqCst);
+    let now = wall_secs();
+    let status = wait_auto_stop_check(&d, now + 7000.0..now + 8000.0);
+    assert_eq!(
+        status["last_kept"]["s1"], "1 terminal client(s) attached",
+        "{status}"
+    );
+    assert_eq!(d.wait_agent("s1", "idle", 5)["state"], "idle");
+
+    // Detached: the next check (a minute later on the timer's clock)
+    // stops it through the normal pty stop path.
+    std::fs::remove_file(&clients).unwrap();
+    offset.store(7300, std::sync::atomic::Ordering::SeqCst);
+    let agent = wait_auto_stopped(&d, "s1");
+    assert!(
+        agent["state_label"]
+            .as_str()
+            .unwrap()
+            .starts_with("stopped (auto, idle "),
+        "{agent}"
+    );
+    assert_eq!(agent["resumable"], true, "{agent}");
+    let calls = std::fs::read_to_string(
+        mock.dir
+            .join("tmux-state")
+            .join(socket_for(&d.state))
+            .join("calls.log"),
+    )
+    .unwrap();
+    assert!(calls.contains("list-clients -t =s1"), "{calls}");
+    assert!(calls.contains("kill-session -t s1"), "{calls}");
 }

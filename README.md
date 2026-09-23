@@ -99,6 +99,9 @@ cadence resume --all            # sweep every registered agent with a resumable
                                 #  thread/session and no live endpoint
 cadence daemon start --resume   # run the same sweep once the daemon is up
 cadence stop <group>            # stop PM + members (registered + resumable still)
+cadence agent set <slug> auto_stop=off  # opt out of idle auto-stop (the daemon
+                                #  stops non-PM agents idle 60m, resumably;
+                                #  pm.yaml [host] auto_stop_idle_secs)
 
 cadence agent remove <slug>     # delete a dead agent + its history
 cadence agent gc --older-than 1d  # sweep dead agent records — no disk or

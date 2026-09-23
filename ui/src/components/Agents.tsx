@@ -286,6 +286,8 @@ function WorkBlock({
   if (agent.unknown > 0) return <span className="text-fail">{agent.unknown} needs review</span>;
   if (agent.inbox) return <span className="text-ink-500">mailbox</span>;
   if (agent.state === "idle") return <span className="text-ink-500">idle · no active work</span>;
+  if (agent.state === "stopped" && agent.state_label)
+    return <span className="text-ink-500">{agent.state_label} · resumable</span>;
   if (agent.state === "stopped") return <span className="text-ink-500">stopped · no active work</span>;
   return <span className="text-ink-500">{agent.state || "unknown"}</span>;
 }

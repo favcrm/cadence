@@ -494,6 +494,8 @@ export interface Agent {
   silent_secs?: number;
   /** The daemon declared this running turn stalled. */
   stalled?: boolean;
+  /** CAD-96: `stopped (auto, idle 72m)` when the idle timer stopped it. */
+  state_label?: string | null;
   event_cursor?: number;
 }
 

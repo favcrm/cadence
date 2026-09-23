@@ -407,6 +407,8 @@ pub struct Shared {
     slot_clock: Arc<dyn Fn() -> f64 + Send + Sync>,
     /// CAD-199: the opt-in, records-only agent-gc timer.
     agent_gc: AgentGcTimer,
+    /// CAD-96: the idle auto-stop timer (default ON, resumable).
+    auto_stop: AutoStopTimer,
 }
 
 impl Shared {
@@ -464,6 +466,7 @@ impl Shared {
             slots: Mutex::new(slots),
             slot_clock,
             agent_gc: AgentGcTimer::new(opts.agent_gc.clone()),
+            auto_stop: AutoStopTimer::new(opts.auto_stop.clone(), opts.auto_stop_clock.clone()),
         });
         // Holds dropped by boot-time revalidation get their release
         // events now that the store-backed emitter exists.
@@ -1183,6 +1186,7 @@ impl Shared {
                 "protocol": proto::PROTOCOL_VERSION,
                 "capabilities": proto::capabilities(),
                 "agent_gc_timer": self.agent_gc.status(),
+                "agent_auto_stop": self.auto_stop.status(),
             })),
             // Build identity + process start — the deploy-drift check
             // measures merged commits against *this* binary's commit.
@@ -1200,6 +1204,11 @@ impl Shared {
             "model_defaults_set" => self.rpc_model_defaults_set(params),
             "agent_list" => {
                 let mut agents = Vec::new();
+                // CAD-96: one grouped read tells auto-stopped rows apart.
+                let markers = self
+                    .store
+                    .last_events_of_all(AUTO_STOP_MARKER_KINDS)
+                    .unwrap_or_default();
                 for agent in self.store.agents()? {
                     let mut j = agent.to_json();
                     // The alias's current non-terminal task assignments —
@@ -1224,6 +1233,7 @@ impl Shared {
                     if let Some(view) = self.stall_view(&agent.alias) {
                         view.apply(&mut j);
                     }
+                    apply_auto_stop_view(&mut j, &agent, markers.get(&agent.alias));
                     agents.push(j);
                 }
                 Ok(json!({"agents": agents}))
@@ -1241,6 +1251,8 @@ impl Shared {
                 if let Some(view) = self.stall_view(&alias) {
                     view.apply(&mut agent_json);
                 }
+                let marker = self.store.last_event_of(&alias, AUTO_STOP_MARKER_KINDS)?;
+                apply_auto_stop_view(&mut agent_json, &agent, marker.as_ref());
                 if agent.endpoint_kind == "pty" {
                     self.pty_lane_facts(&agent, &mut agent_json);
                 }
@@ -4125,6 +4137,8 @@ impl Shared {
             }
             // CAD-199: off unless configured; sweeps at most hourly.
             self.agent_gc_tick();
+            // CAD-96: idle auto-stop — checks at most once a minute.
+            self.auto_stop_tick();
             std::thread::sleep(STALL_TICK);
         }
     }
@@ -5552,6 +5566,552 @@ impl Shared {
     }
 }
 
+// ---- Idle auto-stop (CAD-96): default ON, resumable ----
+//
+// An agent whose actor has had nothing to do for the bound — no message
+// in any non-terminal state and no delivery, report or turn activity on
+// its durable streams — is stopped through the normal `agent stop` path
+// (pane-session reaping and slot-enrollment revocation included) and
+// stays resumable. PMs/group roots, inboxes, agents with an attached
+// terminal client and opted-out agents are never stopped.
+
+/// The idle bound when pm.yaml says nothing: one hour, every provider.
+pub const AUTO_STOP_DEFAULT_SECS: u64 = 3600;
+/// A configured bound below this is raised to it, with a warning — a
+/// typo'd `60` must not stop agents between two turns of one task.
+pub const AUTO_STOP_FLOOR_SECS: u64 = 600;
+/// The timer checks at most this often (seconds of its clock).
+const AUTO_STOP_EVERY_SECS: f64 = 60.0;
+/// The event an auto-stop records on the agent's own stream.
+pub const AUTO_STOP_EVENT: &str = "agent_auto_stopped";
+/// Event kinds that are bookkeeping, not delivery/report/turn work:
+/// they never reset an agent's idle clock. Everything else does — an
+/// unknown new kind errs toward keeping the agent.
+const AUTO_STOP_PASSIVE_KINDS: &[&str] = &[
+    AUTO_STOP_EVENT,
+    "stop_requested",
+    "params_updated",
+    "quota_updated",
+    "quota_update_ignored",
+    "inbox_unconsumed",
+    "pane_tree_reap_intent",
+    "pane_tree_reaped",
+    "pane_tree_reap_refused",
+    "pane_tree_unowned",
+];
+/// The newest of these decides whether a stopped agent was stopped by
+/// the timer: a later manual stop or a resume supersedes the marker.
+const AUTO_STOP_MARKER_KINDS: &[&str] = &[AUTO_STOP_EVENT, "stop_requested", "ready"];
+/// What the attached-client exemption can and cannot see.
+pub const AUTO_STOP_ATTACH_NOTE: &str = "attached-terminal exemption: pty panes via tmux \
+     list-clients; a managed-ws codex TUI client (`codex resume --remote`) is not \
+     detectable and does not exempt its agent";
+
+/// The idle auto-stop setting: `[host] auto_stop_idle_secs` and
+/// `auto_stop_idle_secs_by_provider` in pm.yaml. Per-agent params
+/// (`auto_stop=off`, `auto_stop_idle_secs`) override both.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AutoStopSetting {
+    /// `None` is the built-in [`AUTO_STOP_DEFAULT_SECS`]; `0` is off.
+    pub idle_secs: Option<u64>,
+    /// Provider → bound; `0` turns the timer off for that provider.
+    pub by_provider: std::collections::BTreeMap<String, u64>,
+    /// Why `[host]` could not be read — the timer then stops nothing.
+    pub config_error: Option<String>,
+}
+
+impl AutoStopSetting {
+    /// Off for every provider (per-agent `auto_stop_idle_secs` can still
+    /// turn one agent on). Test daemons pin this.
+    pub fn off() -> Self {
+        Self::idle_after(0)
+    }
+
+    /// On for every provider at `secs` (raised to the floor).
+    pub fn idle_after(secs: u64) -> Self {
+        Self {
+            idle_secs: Some(secs),
+            ..Self::default()
+        }
+    }
+
+    /// `[host]` in `<pm_dir>/pm.yaml`; no file or no key is the default
+    /// (ON, one hour). An unusable table stops nothing, with its error.
+    pub fn from_pm_dir(pm_dir: Option<&Path>) -> Self {
+        match pm_dir
+            .map(crate::doctor::host::read_host_overrides)
+            .transpose()
+        {
+            Ok(overrides) => {
+                let o = overrides.flatten();
+                Self {
+                    idle_secs: o.as_ref().and_then(|o| o.auto_stop_idle_secs),
+                    by_provider: o
+                        .and_then(|o| o.auto_stop_idle_secs_by_provider)
+                        .unwrap_or_default(),
+                    config_error: None,
+                }
+            }
+            Err(error) => Self {
+                config_error: Some(error),
+                ..Self::default()
+            },
+        }
+    }
+
+    fn floored(secs: u64) -> Option<u64> {
+        (secs > 0).then(|| secs.max(AUTO_STOP_FLOOR_SECS))
+    }
+
+    /// The host-wide bound (`None` = off).
+    pub fn default_bound(&self) -> Option<u64> {
+        if self.config_error.is_some() {
+            return None;
+        }
+        match self.idle_secs {
+            Some(secs) => Self::floored(secs),
+            None => Some(AUTO_STOP_DEFAULT_SECS),
+        }
+    }
+
+    /// `agent`'s idle bound and where it came from; `None` is off.
+    /// Precedence: agent `auto_stop=off`, agent `auto_stop_idle_secs`,
+    /// `[host]` by provider, `[host]` default, built-in default.
+    pub fn bound_for(&self, agent: &Agent) -> (Option<u64>, String) {
+        if self.config_error.is_some() {
+            return (None, "pm.yaml [host] unreadable".to_string());
+        }
+        let param = |key: &str| agent.params.as_ref().and_then(|p| p.get(key)).cloned();
+        if param("auto_stop").and_then(|v| v.as_str().map(str::to_string)) == Some("off".into()) {
+            return (None, "agent auto_stop=off".to_string());
+        }
+        let agent_secs = param("auto_stop_idle_secs").and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+        });
+        if let Some(secs) = agent_secs {
+            return (Self::floored(secs), "agent auto_stop_idle_secs".to_string());
+        }
+        if let Some(&secs) = self.by_provider.get(&agent.provider) {
+            return (
+                Self::floored(secs),
+                format!("[host] auto_stop_idle_secs_by_provider.{}", agent.provider),
+            );
+        }
+        match self.idle_secs {
+            Some(secs) => (
+                Self::floored(secs),
+                "[host] auto_stop_idle_secs".to_string(),
+            ),
+            None => (Some(AUTO_STOP_DEFAULT_SECS), "default".to_string()),
+        }
+    }
+
+    /// The operator-facing warning: an unreadable `[host]`, or a bound
+    /// below the floor that the timer raised.
+    pub fn warning(&self) -> Option<String> {
+        if let Some(error) = &self.config_error {
+            return Some(format!("idle auto-stop off: {error}"));
+        }
+        let mut low: Vec<String> = Vec::new();
+        if let Some(secs) = self
+            .idle_secs
+            .filter(|s| (1..AUTO_STOP_FLOOR_SECS).contains(s))
+        {
+            low.push(format!("auto_stop_idle_secs {secs}"));
+        }
+        for (provider, secs) in &self.by_provider {
+            if (1..AUTO_STOP_FLOOR_SECS).contains(secs) {
+                low.push(format!("auto_stop_idle_secs_by_provider.{provider} {secs}"));
+            }
+        }
+        (!low.is_empty()).then(|| {
+            format!(
+                "[host] {} below the {AUTO_STOP_FLOOR_SECS}s floor; the timer uses \
+                 {AUTO_STOP_FLOOR_SECS}s",
+                low.join(", ")
+            )
+        })
+    }
+}
+
+/// An idle duration as an operator reads it: `72m`, `3h`, `5h20m`.
+fn fmt_idle(idle_secs: f64) -> String {
+    let mins = (idle_secs.max(0.0) / 60.0).round() as u64;
+    if mins < 120 {
+        format!("{mins}m")
+    } else if mins.is_multiple_of(60) {
+        format!("{}h", mins / 60)
+    } else {
+        format!("{}h{}m", mins / 60, mins % 60)
+    }
+}
+
+/// `stopped (auto, idle 72m)` — how every surface names an auto-stop.
+pub fn auto_stop_label(idle_secs: f64) -> String {
+    format!("stopped (auto, idle {})", fmt_idle(idle_secs))
+}
+
+/// The `auto_stopped` view of a stopped agent whose newest marker is an
+/// auto-stop — `None` for a live, manually stopped or resumed agent.
+fn auto_stop_view(agent: &Agent, marker: Option<&store::Event>) -> Option<Value> {
+    let event = marker.filter(|e| e.kind == AUTO_STOP_EVENT)?;
+    if agent.state != "stopped" {
+        return None;
+    }
+    let idle = event.payload["idle_secs"].as_f64().unwrap_or(0.0);
+    Some(json!({
+        "at": event.at,
+        "idle_secs": idle,
+        "bound_secs": event.payload["bound_secs"],
+        "reason": event.payload["reason"],
+        "label": auto_stop_label(idle),
+        "resume": format!("cadence agent resume {}", agent.alias),
+    }))
+}
+
+/// Stamp `auto_stopped` + `state_label` onto an agent JSON row.
+fn apply_auto_stop_view(j: &mut Value, agent: &Agent, marker: Option<&store::Event>) {
+    if let Some(view) = auto_stop_view(agent, marker) {
+        j["state_label"] = view["label"].clone();
+        j["auto_stopped"] = view;
+    }
+}
+
+/// One agent's verdict on a timer check.
+#[derive(Debug, PartialEq)]
+enum AutoStopVerdict {
+    Keep(String),
+    Stop {
+        idle_secs: f64,
+        idle_since: f64,
+        bound_secs: u64,
+        source: String,
+    },
+}
+
+/// The daemon's idle auto-stop timer: its setting, its clock (epoch
+/// seconds; tests inject one) and what it last did — `health` (`cadence
+/// daemon status`) reports all of it.
+struct AutoStopTimer {
+    /// `Some` is verbatim (tests); `None` re-reads `[host]` each check.
+    pinned: Option<AutoStopSetting>,
+    clock: Arc<dyn Fn() -> f64 + Send + Sync>,
+    state: Mutex<AutoStopState>,
+}
+
+#[derive(Default)]
+struct AutoStopState {
+    setting: AutoStopSetting,
+    last_check_at: Option<f64>,
+    /// When the last sweep finished — `last_kept` belongs to it.
+    last_sweep_at: Option<f64>,
+    last_stop_at: Option<f64>,
+    last_stopped: Vec<String>,
+    stopped_total: u64,
+    /// Why each live agent was kept on the last check.
+    last_kept: std::collections::BTreeMap<String, String>,
+}
+
+impl AutoStopTimer {
+    fn new(
+        pinned: Option<AutoStopSetting>,
+        clock: Option<Arc<dyn Fn() -> f64 + Send + Sync>>,
+    ) -> Self {
+        let timer = Self {
+            pinned,
+            clock: clock.unwrap_or_else(|| Arc::new(epoch_secs)),
+            state: Mutex::new(AutoStopState::default()),
+        };
+        timer.state.lock().unwrap().setting = timer.resolve();
+        timer
+    }
+
+    fn resolve(&self) -> AutoStopSetting {
+        self.pinned.clone().unwrap_or_else(|| {
+            AutoStopSetting::from_pm_dir(crate::issue::default_dir().ok().as_deref())
+        })
+    }
+
+    fn status(&self) -> Value {
+        let st = self.state.lock().unwrap();
+        let bound = st.setting.default_bound();
+        json!({
+            "enabled": bound.is_some(),
+            "idle_secs": bound,
+            "configured_secs": st.setting.idle_secs,
+            "by_provider": st.setting.by_provider,
+            "default_secs": AUTO_STOP_DEFAULT_SECS,
+            "floor_secs": AUTO_STOP_FLOOR_SECS,
+            "every_secs": AUTO_STOP_EVERY_SECS as u64,
+            "setting": "pm.yaml [host] auto_stop_idle_secs (unset = 3600, 0 = off) and \
+                        auto_stop_idle_secs_by_provider; per agent: `cadence agent set \
+                        <alias> auto_stop=off` or `auto_stop_idle_secs=<n>`",
+            "exempt": "group roots (role pm, no upstream, or named as an upstream), \
+                       inboxes, agents with an attached terminal client, auto_stop=off",
+            "attach_detection": AUTO_STOP_ATTACH_NOTE,
+            "warning": st.setting.warning(),
+            "last_check_at": st.last_check_at,
+            "last_sweep_at": st.last_sweep_at,
+            "last_stop_at": st.last_stop_at,
+            "last_stopped": st.last_stopped,
+            "stopped_total": st.stopped_total,
+            "last_kept": st.last_kept,
+            "resume": "cadence agent resume <alias> (or `cadence resume <group>`)",
+        })
+    }
+}
+
+impl Shared {
+    /// One stall-watch tick of the idle auto-stop timer: a no-op until a
+    /// check is due (every [`AUTO_STOP_EVERY_SECS`] of its clock). Runs
+    /// on the stall-watch thread, never on an actor loop.
+    fn auto_stop_tick(self: &Arc<Self>) {
+        let now = (self.auto_stop.clock)();
+        let due = self
+            .auto_stop
+            .state
+            .lock()
+            .unwrap()
+            .last_check_at
+            // A clock stepped backwards re-arms rather than pausing.
+            .is_none_or(|at| now - at >= AUTO_STOP_EVERY_SECS || now < at);
+        if !due {
+            return;
+        }
+        // pm.yaml is read outside the lock `health` takes.
+        let setting = self.auto_stop.resolve();
+        {
+            let mut st = self.auto_stop.state.lock().unwrap();
+            if st.last_check_at.is_none() || st.setting != setting {
+                if let Some(warning) = setting.warning() {
+                    eprintln!("idle auto-stop: {warning}");
+                }
+            }
+            st.last_check_at = Some(now);
+            st.setting = setting.clone();
+        }
+        if setting.config_error.is_some() {
+            return;
+        }
+        let (stopped, kept) = self.auto_stop_sweep(&setting, now);
+        let mut st = self.auto_stop.state.lock().unwrap();
+        st.last_sweep_at = Some(now);
+        st.last_kept = kept;
+        if !stopped.is_empty() {
+            st.last_stop_at = Some(now);
+            st.stopped_total += stopped.len() as u64;
+            st.last_stopped = stopped;
+        }
+    }
+
+    /// Evaluate every agent with a live actor; stop the idle ones.
+    /// Returns (stopped aliases, kept alias → reason).
+    fn auto_stop_sweep(
+        self: &Arc<Self>,
+        setting: &AutoStopSetting,
+        now: f64,
+    ) -> (Vec<String>, std::collections::BTreeMap<String, String>) {
+        let mut kept = std::collections::BTreeMap::new();
+        let live: HashSet<String> = {
+            let lc = self.lifecycle.lock().unwrap();
+            lc.agents
+                .keys()
+                .filter(|a| !lc.stopping.contains(*a))
+                .cloned()
+                .collect()
+        };
+        if live.is_empty() {
+            return (Vec::new(), kept);
+        }
+        let (agents, activity) = match (
+            self.store.agents(),
+            self.store.auto_stop_activity(AUTO_STOP_PASSIVE_KINDS),
+        ) {
+            (Ok(agents), Ok(activity)) => (agents, activity),
+            (Err(error), _) | (_, Err(error)) => {
+                eprintln!("idle auto-stop: store read failed: {error}");
+                return (Vec::new(), kept);
+            }
+        };
+        let roots = upstream_roots(&agents);
+        let mut stopped = Vec::new();
+        for agent in agents.iter().filter(|a| live.contains(&a.alias)) {
+            match self.auto_stop_verdict(agent, setting, now, &roots, activity.get(&agent.alias)) {
+                AutoStopVerdict::Keep(reason) => {
+                    kept.insert(agent.alias.clone(), reason);
+                }
+                AutoStopVerdict::Stop {
+                    idle_secs,
+                    idle_since,
+                    bound_secs,
+                    source,
+                } => {
+                    match self.auto_stop_agent(agent, idle_secs, idle_since, bound_secs, &source) {
+                        Ok(()) => stopped.push(agent.alias.clone()),
+                        Err(reason) => {
+                            kept.insert(agent.alias.clone(), reason);
+                        }
+                    }
+                }
+            }
+        }
+        if !stopped.is_empty() {
+            eprintln!(
+                "idle auto-stop: stopped {} idle agent(s) ({}) — resumable with \
+                 `cadence agent resume <alias>`",
+                stopped.len(),
+                stopped.join(", ")
+            );
+        }
+        (stopped, kept)
+    }
+
+    /// Whether `agent` is due for an auto-stop at `now`, and if not why.
+    /// Cheap row checks first; tmux is only asked about an agent that
+    /// is otherwise due.
+    fn auto_stop_verdict(
+        &self,
+        agent: &Agent,
+        setting: &AutoStopSetting,
+        now: f64,
+        roots: &HashSet<String>,
+        activity: Option<&(Option<f64>, i64)>,
+    ) -> AutoStopVerdict {
+        use AutoStopVerdict::Keep;
+        if !registry::has_actor(&agent.provider, &agent.endpoint_kind) {
+            return Keep("inbox".to_string());
+        }
+        if let Some(why) = group_root_reason(agent, roots) {
+            return Keep(format!("group root ({why})"));
+        }
+        let (bound, source) = setting.bound_for(agent);
+        let Some(bound_secs) = bound else {
+            return Keep(format!("auto-stop off ({source})"));
+        };
+        if !agent.enabled || agent.state != "idle" {
+            return Keep(format!("state {}", agent.state));
+        }
+        if agent.thread_id.as_deref().unwrap_or_default().is_empty() {
+            return Keep("not resumable: no native thread/session recorded".to_string());
+        }
+        let (last, open) = activity.copied().unwrap_or((None, 0));
+        if open > 0 {
+            return Keep(format!("busy: {open} message(s) not in a terminal state"));
+        }
+        let Some(idle_since) = last else {
+            return Keep("no durable activity record".to_string());
+        };
+        let idle_secs = now - idle_since;
+        if idle_secs < bound_secs as f64 {
+            return Keep(format!(
+                "idle {:.0}s of {bound_secs}s ({source})",
+                idle_secs.max(0.0)
+            ));
+        }
+        if agent.endpoint_kind == "pty" {
+            match adapter::pty::pane_clients(&self.state_dir, &agent.alias, &self.provider_env) {
+                Some(0) => {}
+                Some(n) => return Keep(format!("{n} terminal client(s) attached")),
+                None => return Keep("attached clients unreadable (tmux)".to_string()),
+            }
+            match self.adapter_for(&agent.alias).and_then(|a| a.probe()) {
+                Ok(probe) if probe.idle => {}
+                Ok(probe) => return Keep(format!("pane not idle: {}", probe.reason)),
+                Err(error) => return Keep(format!("pane probe failed: {error}")),
+            }
+        }
+        AutoStopVerdict::Stop {
+            idle_secs,
+            idle_since,
+            bound_secs,
+            source,
+        }
+    }
+
+    /// Stop one idle agent through the normal `agent stop` path and
+    /// record `agent_auto_stopped` on its stream. The durable facts are
+    /// re-read first: a message queued or a turn begun since the sweep
+    /// read them keeps the agent.
+    fn auto_stop_agent(
+        self: &Arc<Self>,
+        agent: &Agent,
+        idle_secs: f64,
+        idle_since: f64,
+        bound_secs: u64,
+        source: &str,
+    ) -> std::result::Result<(), String> {
+        let alias = agent.alias.as_str();
+        let fresh = self
+            .store
+            .auto_stop_activity(AUTO_STOP_PASSIVE_KINDS)
+            .map_err(|e| format!("re-check failed: {e}"))?;
+        let (last, open) = fresh.get(alias).copied().unwrap_or((None, 0));
+        let state = self.store.agent(alias).map(|a| a.state).unwrap_or_default();
+        if open > 0 || last.is_some_and(|at| at > idle_since) || state != "idle" {
+            return Err("activity since the check read it".to_string());
+        }
+        let reason = format!(
+            "idle {} with no queued, running, awaiting-report or unknown message \
+             (bound {}s from {source})",
+            fmt_idle(idle_secs),
+            bound_secs
+        );
+        let out = self
+            .rpc_stop(&json!({"alias": alias}))
+            .map_err(|e| format!("stop failed: {e}"))?;
+        let _ = self.store.event_public(
+            alias,
+            AUTO_STOP_EVENT,
+            json!({
+                "idle_secs": idle_secs.floor(),
+                "idle_since": idle_since,
+                "bound_secs": bound_secs,
+                "bound_source": source,
+                "reason": reason,
+                "state": out["state"],
+                "resumable": true,
+                "resume": format!("cadence agent resume {alias}"),
+            }),
+        );
+        self.wake();
+        Ok(())
+    }
+}
+
+/// Every alias some agent names as its upstream — a group root even
+/// when it was registered as a worker.
+fn upstream_roots(agents: &[Agent]) -> HashSet<String> {
+    agents
+        .iter()
+        .filter_map(|a| agent_upstream(a).map(str::to_string))
+        .collect()
+}
+
+fn agent_upstream(agent: &Agent) -> Option<&str> {
+    agent
+        .params
+        .as_ref()
+        .and_then(|p| p.get("upstream"))
+        .and_then(Value::as_str)
+        .filter(|u| !u.is_empty())
+}
+
+/// Why `agent` is a group root, if it is one: role/team role `pm`, no
+/// upstream (the codebase's `group_root` rule), or named as another
+/// agent's upstream.
+fn group_root_reason(agent: &Agent, roots: &HashSet<String>) -> Option<&'static str> {
+    if agent.role == "pm" || agent.team_role.as_deref() == Some("pm") {
+        Some("role pm")
+    } else if roots.contains(&agent.alias) {
+        Some("has members")
+    } else if agent_upstream(agent).is_none() {
+        Some("no upstream")
+    } else {
+        None
+    }
+}
+
 /// Per-instance daemon configuration.
 #[derive(Clone, Default)]
 pub struct ServeOptions {
@@ -5579,6 +6139,13 @@ pub struct ServeOptions {
     /// hermetic this way); `None` reads `[host]
     /// agent_gc_older_than_secs` from pm.yaml each check — unset is off.
     pub agent_gc: Option<AgentGcSetting>,
+    /// CAD-96 idle auto-stop: `Some` is verbatim (test daemons pin
+    /// [`AutoStopSetting::off`]); `None` reads `[host]` from pm.yaml
+    /// each check — unset is ON at one hour.
+    pub auto_stop: Option<AutoStopSetting>,
+    /// The auto-stop clock (epoch seconds) — `None` is the wall clock;
+    /// tests inject one they advance instead of sleeping.
+    pub auto_stop_clock: Option<Arc<dyn Fn() -> f64 + Send + Sync>>,
 }
 
 /// Slot configuration precedence: explicit `ServeOptions.slots`, then
@@ -6868,5 +7435,445 @@ mod agent_gc_timer {
         shared.agent_gc_tick();
         assert!(shared.store.agent_opt("later").unwrap().is_none());
         assert_eq!(removed_events(&shared).len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod auto_stop_timer {
+    use super::*;
+    use crate::store::NewAgent;
+
+    const HOUR: f64 = 3600.0;
+
+    fn pinned(dir: &Path, setting: AutoStopSetting) -> Arc<Shared> {
+        let opts = ServeOptions {
+            auto_stop: Some(setting),
+            ..ServeOptions::default()
+        };
+        Shared::new(dir, &opts).unwrap()
+    }
+
+    /// Register `alias` and make its row look like a live, idle actor
+    /// with a saved thread — no actor runs; the verdict reads rows.
+    fn idle_row(
+        shared: &Shared,
+        dir: &Path,
+        alias: &str,
+        provider: &str,
+        kind: &str,
+        role: &str,
+        params: Value,
+    ) -> Agent {
+        let params = params.to_string();
+        shared
+            .store
+            .register_agent(&NewAgent {
+                alias,
+                provider,
+                endpoint_kind: kind,
+                role,
+                cwd: dir.to_str().unwrap(),
+                sandbox: "read-only",
+                instructions: None,
+                params: Some(&params),
+                team_role: None,
+                model_policy: None,
+            })
+            .unwrap();
+        rusqlite::Connection::open(dir.join("cadence.sqlite3"))
+            .unwrap()
+            .execute(
+                "UPDATE agents SET state='idle', enabled=1, thread_id=? WHERE alias=?",
+                rusqlite::params![format!("t-{alias}"), alias],
+            )
+            .unwrap();
+        shared.store.agent(alias).unwrap()
+    }
+
+    fn worker(shared: &Shared, dir: &Path, alias: &str, params: Value) -> Agent {
+        let mut p = json!({"upstream": "pm"});
+        if let (Some(p), Some(extra)) = (p.as_object_mut(), params.as_object()) {
+            p.extend(extra.clone());
+        }
+        idle_row(shared, dir, alias, "fake", "fake", "worker", p)
+    }
+
+    fn verdict(
+        shared: &Shared,
+        setting: &AutoStopSetting,
+        agent: &Agent,
+        at: f64,
+    ) -> AutoStopVerdict {
+        let agents = shared.store.agents().unwrap();
+        let activity = shared
+            .store
+            .auto_stop_activity(AUTO_STOP_PASSIVE_KINDS)
+            .unwrap();
+        let agent = shared.store.agent(&agent.alias).unwrap();
+        shared.auto_stop_verdict(
+            &agent,
+            setting,
+            at,
+            &upstream_roots(&agents),
+            activity.get(&agent.alias),
+        )
+    }
+
+    fn kept(v: &AutoStopVerdict) -> &str {
+        match v {
+            AutoStopVerdict::Keep(reason) => reason,
+            other => panic!("expected keep, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn setting_defaults_on_at_an_hour_with_provider_override_and_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let pm = dir.path();
+        // No pm.yaml / no key: ON at the built-in hour, no warning.
+        let on = AutoStopSetting::from_pm_dir(Some(pm));
+        assert_eq!(on, AutoStopSetting::default());
+        assert_eq!(on.default_bound(), Some(AUTO_STOP_DEFAULT_SECS));
+        assert_eq!(on.warning(), None);
+        assert_eq!(
+            AutoStopSetting::from_pm_dir(None).default_bound(),
+            Some(3600)
+        );
+        std::fs::write(
+            pm.join("pm.yaml"),
+            "schema: 1\nhost:\n  auto_stop_idle_secs: 0\n  \
+             auto_stop_idle_secs_by_provider:\n    claude: 7200\n    codex: 60\n",
+        )
+        .unwrap();
+        let s = AutoStopSetting::from_pm_dir(Some(pm));
+        assert_eq!(s.default_bound(), None, "0 turns the host default off");
+        assert_eq!(s.by_provider.get("claude"), Some(&7200));
+        let w = s.warning().unwrap();
+        assert!(
+            w.contains("auto_stop_idle_secs_by_provider.codex 60"),
+            "{w}"
+        );
+        assert!(w.contains("600s floor"), "{w}");
+        // An unusable [host] table stops nothing, and says why.
+        std::fs::write(
+            pm.join("pm.yaml"),
+            "schema: 1\nhost:\n  auto_stop_idle_secs: \"1h\"\n",
+        )
+        .unwrap();
+        let bad = AutoStopSetting::from_pm_dir(Some(pm));
+        assert_eq!(bad.default_bound(), None);
+        assert!(
+            bad.warning().unwrap().contains("idle auto-stop off"),
+            "{bad:?}"
+        );
+    }
+
+    #[test]
+    fn bound_precedence_agent_then_provider_then_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut setting = AutoStopSetting::idle_after(5400);
+        setting.by_provider.insert("fake".into(), 7200);
+        let shared = pinned(dir.path(), setting.clone());
+        let plain = worker(&shared, dir.path(), "plain", json!({}));
+        assert_eq!(
+            setting.bound_for(&plain),
+            (
+                Some(7200),
+                "[host] auto_stop_idle_secs_by_provider.fake".into()
+            )
+        );
+        let own = worker(
+            &shared,
+            dir.path(),
+            "own",
+            json!({"auto_stop_idle_secs": "900"}),
+        );
+        assert_eq!(setting.bound_for(&own).0, Some(900));
+        let low = worker(
+            &shared,
+            dir.path(),
+            "low",
+            json!({"auto_stop_idle_secs": 5}),
+        );
+        assert_eq!(setting.bound_for(&low).0, Some(AUTO_STOP_FLOOR_SECS));
+        let zero = worker(
+            &shared,
+            dir.path(),
+            "zero",
+            json!({"auto_stop_idle_secs": 0}),
+        );
+        assert_eq!(setting.bound_for(&zero).0, None);
+        let off = worker(
+            &shared,
+            dir.path(),
+            "off",
+            json!({"auto_stop": "off", "auto_stop_idle_secs": 900}),
+        );
+        assert_eq!(
+            setting.bound_for(&off),
+            (None, "agent auto_stop=off".into())
+        );
+        // Another provider falls through to the host default.
+        let host = idle_row(
+            &shared,
+            dir.path(),
+            "host",
+            "claude",
+            "managed",
+            "worker",
+            json!({"upstream": "pm"}),
+        );
+        assert_eq!(setting.bound_for(&host).0, Some(5400));
+        assert_eq!(AutoStopSetting::off().bound_for(&host).0, None);
+        assert_eq!(AutoStopSetting::default().bound_for(&host).0, Some(3600));
+    }
+
+    #[test]
+    fn idle_worker_is_due_only_after_the_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let setting = AutoStopSetting::default();
+        let shared = pinned(dir.path(), setting.clone());
+        let w = worker(&shared, dir.path(), "w1", json!({}));
+        let now = epoch_secs();
+        // Registration is its newest activity: 59 minutes on, kept.
+        let young = verdict(&shared, &setting, &w, now + 59.0 * 60.0);
+        assert!(kept(&young).contains("of 3600s"), "{young:?}");
+        // Pre-age its whole stream by 72 minutes: due now.
+        let age = |secs: f64| {
+            rusqlite::Connection::open(dir.path().join("cadence.sqlite3"))
+                .unwrap()
+                .execute(
+                    "UPDATE events SET at=at-? WHERE alias='w1'",
+                    rusqlite::params![secs],
+                )
+                .unwrap();
+        };
+        age(72.0 * 60.0);
+        match verdict(&shared, &setting, &w, epoch_secs()) {
+            AutoStopVerdict::Stop {
+                idle_secs,
+                bound_secs,
+                source,
+                ..
+            } => {
+                assert!(idle_secs >= 71.0 * 60.0, "{idle_secs}");
+                assert_eq!(bound_secs, 3600);
+                assert_eq!(source, "default");
+            }
+            other => panic!("expected stop, got {other:?}"),
+        }
+        // Bookkeeping events never reset the idle clock; turn work does.
+        for passive in ["quota_updated", "params_updated", "stop_requested"] {
+            shared.store.event_public("w1", passive, json!({})).unwrap();
+        }
+        assert!(matches!(
+            verdict(&shared, &setting, &w, epoch_secs()),
+            AutoStopVerdict::Stop { .. }
+        ));
+        shared
+            .store
+            .event_public("w1", "turn_finished", json!({}))
+            .unwrap();
+        let fresh = verdict(&shared, &setting, &w, epoch_secs());
+        assert!(kept(&fresh).starts_with("idle"), "{fresh:?}");
+        // A resume's `ready` restarts the clock the same way.
+        age(72.0 * 60.0);
+        shared.store.event_public("w1", "ready", json!({})).unwrap();
+        let resumed = verdict(&shared, &setting, &w, epoch_secs());
+        assert!(kept(&resumed).starts_with("idle"), "{resumed:?}");
+    }
+
+    #[test]
+    fn pm_roots_inbox_opted_out_and_unresumable_are_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let setting = AutoStopSetting::default();
+        let shared = pinned(dir.path(), setting.clone());
+        let at = epoch_secs() + 10.0 * HOUR;
+        let pm = idle_row(&shared, dir.path(), "pm", "fake", "fake", "pm", json!({}));
+        assert_eq!(
+            kept(&verdict(&shared, &setting, &pm, at)),
+            "group root (role pm)"
+        );
+        // No upstream: its own group root, like `group_root` everywhere.
+        let solo = idle_row(
+            &shared,
+            dir.path(),
+            "solo",
+            "fake",
+            "fake",
+            "worker",
+            json!({}),
+        );
+        assert_eq!(
+            kept(&verdict(&shared, &setting, &solo, at)),
+            "group root (no upstream)"
+        );
+        // A worker others report to is a sub-PM.
+        let lead = worker(&shared, dir.path(), "lead", json!({}));
+        worker(&shared, dir.path(), "member", json!({"upstream": "lead"}));
+        assert_eq!(
+            kept(&verdict(&shared, &setting, &lead, at)),
+            "group root (has members)"
+        );
+        let inbox = idle_row(
+            &shared,
+            dir.path(),
+            "box",
+            "inbox",
+            "inbox",
+            "worker",
+            json!({"upstream": "pm"}),
+        );
+        assert_eq!(kept(&verdict(&shared, &setting, &inbox, at)), "inbox");
+        let off = worker(&shared, dir.path(), "off", json!({"auto_stop": "off"}));
+        assert!(kept(&verdict(&shared, &setting, &off, at)).contains("auto_stop=off"));
+        let nothread = worker(&shared, dir.path(), "nothread", json!({}));
+        rusqlite::Connection::open(dir.path().join("cadence.sqlite3"))
+            .unwrap()
+            .execute(
+                "UPDATE agents SET thread_id=NULL WHERE alias='nothread'",
+                [],
+            )
+            .unwrap();
+        assert!(kept(&verdict(&shared, &setting, &nothread, at)).contains("not resumable"));
+        // The control: an ordinary member idle as long is due.
+        let member = shared.store.agent("member").unwrap();
+        assert!(matches!(
+            verdict(&shared, &setting, &member, at),
+            AutoStopVerdict::Stop { .. }
+        ));
+    }
+
+    #[test]
+    fn every_non_terminal_message_state_keeps_the_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let setting = AutoStopSetting::default();
+        let shared = pinned(dir.path(), setting.clone());
+        let at = epoch_secs() + 10.0 * HOUR;
+        let conn = rusqlite::Connection::open(dir.path().join("cadence.sqlite3")).unwrap();
+        for state in [
+            "queued",
+            "submitting",
+            "running",
+            "submitted",
+            "awaiting_report",
+            "unknown",
+            "some_future_state",
+        ] {
+            let alias = format!("busy-{}", state.replace('_', "-"));
+            let w = worker(&shared, dir.path(), &alias, json!({}));
+            let id = format!("m-{alias}");
+            shared
+                .store
+                .enqueue(&alias, "work", None, &id, "user")
+                .unwrap();
+            conn.execute(
+                "UPDATE messages SET state=?, created=created-36000 WHERE id=?",
+                rusqlite::params![state, id],
+            )
+            .unwrap();
+            let v = verdict(&shared, &setting, &w, at);
+            assert!(kept(&v).starts_with("busy: 1 message"), "{state}: {v:?}");
+        }
+        // Terminal states do not hold an agent.
+        for state in ["completed", "failed", "interrupted", "cancelled"] {
+            let alias = format!("done-{state}");
+            let w = worker(&shared, dir.path(), &alias, json!({}));
+            let id = format!("m-{state}");
+            shared
+                .store
+                .enqueue(&alias, "work", None, &id, "user")
+                .unwrap();
+            conn.execute(
+                "UPDATE messages SET state=? WHERE id=?",
+                rusqlite::params![state, id],
+            )
+            .unwrap();
+            assert!(
+                matches!(
+                    verdict(&shared, &setting, &w, at),
+                    AutoStopVerdict::Stop { .. }
+                ),
+                "{state}"
+            );
+        }
+    }
+
+    #[test]
+    fn per_provider_override_is_respected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut setting = AutoStopSetting::default();
+        setting.by_provider.insert("fake".into(), 3 * 3600);
+        setting.by_provider.insert("claude".into(), 0);
+        let shared = pinned(dir.path(), setting.clone());
+        let now = epoch_secs();
+        let w = worker(&shared, dir.path(), "w1", json!({}));
+        let early = verdict(&shared, &setting, &w, now + 2.0 * HOUR);
+        assert!(kept(&early).contains("by_provider.fake"), "{early:?}");
+        assert!(matches!(
+            verdict(&shared, &setting, &w, now + 3.5 * HOUR),
+            AutoStopVerdict::Stop {
+                bound_secs: 10800,
+                ..
+            }
+        ));
+        let c = idle_row(
+            &shared,
+            dir.path(),
+            "c1",
+            "claude",
+            "managed",
+            "worker",
+            json!({"upstream": "pm"}),
+        );
+        let off = verdict(&shared, &setting, &c, now + 30.0 * HOUR);
+        assert!(kept(&off).contains("auto-stop off"), "{off:?}");
+    }
+
+    #[test]
+    fn label_and_view_name_the_auto_stop_until_superseded() {
+        assert_eq!(auto_stop_label(72.0 * 60.0), "stopped (auto, idle 72m)");
+        assert_eq!(auto_stop_label(3.0 * HOUR), "stopped (auto, idle 3h)");
+        assert_eq!(
+            auto_stop_label(5.0 * HOUR + 1200.0),
+            "stopped (auto, idle 5h20m)"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let shared = pinned(dir.path(), AutoStopSetting::off());
+        worker(&shared, dir.path(), "w1", json!({}));
+        shared
+            .store
+            .set_state_detached("w1", "stopped", None)
+            .unwrap();
+        shared
+            .store
+            .event_public("w1", "stop_requested", json!({}))
+            .unwrap();
+        shared
+            .store
+            .event_public(
+                "w1",
+                AUTO_STOP_EVENT,
+                json!({"idle_secs": 4320.0, "bound_secs": 3600}),
+            )
+            .unwrap();
+        let agent = shared.store.agent("w1").unwrap();
+        let markers = shared
+            .store
+            .last_events_of_all(AUTO_STOP_MARKER_KINDS)
+            .unwrap();
+        let view = auto_stop_view(&agent, markers.get("w1")).unwrap();
+        assert_eq!(view["label"], "stopped (auto, idle 72m)");
+        assert_eq!(view["resume"], "cadence agent resume w1");
+        // A later manual stop supersedes the marker.
+        shared
+            .store
+            .event_public("w1", "stop_requested", json!({}))
+            .unwrap();
+        let marker = shared
+            .store
+            .last_event_of("w1", AUTO_STOP_MARKER_KINDS)
+            .unwrap();
+        assert!(auto_stop_view(&agent, marker.as_ref()).is_none());
     }
 }
