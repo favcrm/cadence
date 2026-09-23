@@ -751,6 +751,43 @@ The artifact job first runs on the first push to `main` after CAD-334
 merges. Builds of earlier commits have no artifact, and `upgrade` says so
 rather than installing anything.
 
+### Tagged releases and `install.sh` (CAD-311)
+
+A new machine installs a tagged release instead of a main build. Pushing
+a `v<version>` tag runs every `ci.yml` gate on the tagged commit, then:
+
+- `release-gate` refuses a tag that does not equal `v` + Cargo.toml's
+  version or whose commit is not on `main`;
+- `release-build` (`contents: read`) builds `pnpm build` + `cargo build
+  --release --locked --features ui` natively for `x86_64-linux`
+  (ubuntu-22.04), `aarch64-linux` (ubuntu-22.04-arm) and `aarch64-macos`
+  (macos-14), and checks `--version` is `cadence <version>+<sha>`;
+- `release-publish` runs no repository code: it re-checks each tarball's
+  sha256 and listing, attests the tarballs, and creates the GitHub
+  Release (a re-run replaces its assets).
+
+Assets per target: `cadence-<tag>-<target>.tar.gz` (the same
+`cadence`, `cadence.sha256` and `manifest.json` that `upgrade` keeps,
+manifest plus `version`) and `cadence-<tag>-<target>.tar.gz.sha256`, plus
+`install.sh`.
+
+```bash
+# cut a release: bump Cargo.toml's version on main first
+git tag v0.2.0 origin/main && git push origin v0.2.0
+
+# install (or reinstall, or roll back) on a machine
+curl -fsSL https://raw.githubusercontent.com/favcrm/cadence/main/install.sh | sh
+sh install.sh --version v0.2.0 --prefix /opt/cadence
+```
+
+`install.sh` installs into `<prefix>/releases/<tag>/` (default prefix
+`${XDG_DATA_HOME:-~/.local/share}/cadence`, the releases dir `upgrade`
+uses) and repoints `~/.local/bin/cadence` atomically. `upgrade` reads the
+releases dir off a link into `<dir>/v<version>/`, so a later `cadence
+upgrade --latest-main` lands next to the tagged release. A paste-in
+prompt for agents is in [INSTALL-AGENT.md](INSTALL-AGENT.md). The macOS
+binary's CLI works; its daemon refuses to start until CAD-315.
+
 ### Post-merge CI on main
 
 Policy (CAD-228): **every commit pushed to `main` is verified**, one run at

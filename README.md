@@ -22,6 +22,19 @@ itself taught us.
 Keep task checkouts under `.worktrees/`; see [workspace setup](docs/WORKSPACES.md)
 for creation, handover and cleanup instructions.
 
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/favcrm/cadence/main/install.sh | sh
+```
+
+Linux x86_64/aarch64 and macOS arm64. The installer verifies the release
+checksum, installs to `~/.local/share/cadence/releases/<tag>/` and links
+`~/.local/bin/cadence`; `--version <tag>` and `--prefix <dir>` change
+either. Installing through a coding agent: paste
+[docs/INSTALL-AGENT.md](docs/INSTALL-AGENT.md). Releases and `cadence
+upgrade`: [docs/SESSION.md](docs/SESSION.md#tagged-releases-and-installsh-cad-311).
+
 ## Quick start
 
 ```bash
