@@ -1204,6 +1204,19 @@ fn print_show(view: &board::View, by_id: &std::collections::HashMap<String, &boa
     if view.checks_total > 0 {
         println!("checks: {}/{}", view.checks_done, view.checks_total);
     }
+    for r in crate::issue::task_report::list(&view.issue.dir, &f.id) {
+        let s = |k: &str| r[k].as_str().unwrap_or("?").to_string();
+        match r["error"].as_str() {
+            Some(e) => println!("report {} (malformed: {e})", s("path")),
+            None => println!(
+                "report {} by {} [{}]: {}",
+                s("kind"),
+                s("agent"),
+                s("at"),
+                s("path")
+            ),
+        }
+    }
     for c in &view.issue.comments {
         println!("comment {} [{}]:", c.front.author, c.front.at);
         for line in c.body.trim().lines() {

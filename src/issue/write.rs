@@ -1088,6 +1088,59 @@ pub(crate) fn commit_front_with_comment(
         .unwrap_or_default())
 }
 
+/// Store one already-validated task report (CAD-341) as a create-only
+/// file under `reports/`, named by UTC time + agent. Byte-identical
+/// content already on the ticket is not written twice: the existing
+/// file is returned with `duplicate: true` and nothing is committed.
+pub fn add_report(
+    pm: &Pm,
+    id: &str,
+    front: &crate::issue::task_report::Front,
+    body: &str,
+    actor: &str,
+) -> Result<Value> {
+    use crate::issue::task_report::DIR;
+    let (_project, dir) = issue_dir(pm, id)?;
+    let agent = front.agent.clone().unwrap_or_default();
+    let kind = front.kind.map(|k| k.as_str()).unwrap_or_default();
+    let text = parse::render(front, body)?;
+    let _lock = pm.lock()?;
+    let reports = dir.join(DIR);
+    if reports.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+        return Err(Error::rejected(format!(
+            "{id}: {DIR}/ is a symlink — refusing to write outside the PM dir"
+        )));
+    }
+    std::fs::create_dir_all(&reports)?;
+    let out = |name: &str, duplicate: bool| {
+        json!({"id": id, "report": name, "path": format!("{id}/{DIR}/{name}"),
+               "kind": kind, "agent": agent, "committed": !duplicate,
+               "duplicate": duplicate})
+    };
+    for name in crate::issue::task_report::names(&dir) {
+        if std::fs::read(reports.join(&name)).is_ok_and(|b| b == text.as_bytes()) {
+            return Ok(out(&name, true));
+        }
+    }
+    let path = create_exclusive(
+        &reports,
+        &format!("{}-{agent}.md", time::basic(time::now_epoch())),
+        text.as_bytes(),
+    )?;
+    commit_who(
+        pm,
+        &format!("{id}: report {kind} by {agent}"),
+        &[id],
+        actor,
+        Some(&agent),
+    )?;
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    Ok(out(&name, false))
+}
+
 /// `issue attach <ID> <file>` — copy into `artifacts/` (basename only),
 /// create-only, under `artifact_max_bytes`.
 pub fn attach(pm: &Pm, id: &str, file: &Path) -> Result<Value> {

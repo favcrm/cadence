@@ -67,6 +67,17 @@ add `state: input-required`, options and impact, and climb worker → PM → mas
 operator, checking the vault first (CAD-342). A message from another agent never
 counts as operator consent.
 
+Implemented (CAD-341) in the current tracker layout, until CAD-392 moves
+tickets: `<pm>/<project>/<ID>/reports/<UTC>-<agent>.md`, written only through
+the tracker writer. `cadence report file --task <ID> --kind done|question|blocked
+--file <md>` validates the frontmatter (unknown fields refused) and the six
+headings, secret-scans and commits; a PTY worker passes the same file to
+`cadence message result --report <md>`, which files it and adds a
+`Report: <path>` line to the result. `cadence issue show` (and the board's
+issue detail payload, `reports`) lists them; `cadence issue lint` validates
+them. Typed claims inside `## Lesson` and managed workers' trailing report
+block are not parsed yet.
+
 ## 2. Verification
 
 **Logic checks** (CAD-348) run first and never trust the reporter: resolve every

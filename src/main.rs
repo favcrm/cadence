@@ -1878,6 +1878,25 @@ enum ReportAction {
     },
     /// Print one intake issue — status, tags, body with context.
     Show { id: String },
+    /// File a task report (CAD-341, `cadence.report/2`): a Markdown
+    /// file with frontmatter (kind, task, agent, sha, constraints,
+    /// context_feedback; a question adds options, impact and
+    /// `state: input-required`) and the six reflection headings
+    /// (Expected, Evidence, Cause, Correction, Lesson, Next). Stored
+    /// under the ticket's `reports/` through the tracker writer;
+    /// malformed or credential-bearing reports are refused before
+    /// anything is written. `cadence issue show` lists them.
+    File {
+        /// The ticket the report is about (must match `task:` if set).
+        #[arg(long)]
+        task: String,
+        /// done|question|blocked (must match `kind:` if set).
+        #[arg(long, value_enum)]
+        kind: cadence_agent::issue::task_report::Kind,
+        /// The report Markdown; else stdin.
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2071,6 +2090,13 @@ enum MessageAction {
         /// exact revision for `job verdict`.
         #[arg(long)]
         sha: Option<String>,
+        /// A task report file (`cadence.report/2`, see `cadence report
+        /// file`) whose frontmatter names kind and task. It is filed on
+        /// the ticket first — a malformed report refuses the result —
+        /// and the result text gains a `Report: <ID>/reports/<file>`
+        /// line. A retry with the same file reuses the stored report.
+        #[arg(long)]
+        report: Option<PathBuf>,
     },
     /// Operator reconcile of an `unknown` message — the exit that keeps
     /// history. No turn token: `unknown` means the submission token is
@@ -5108,15 +5134,30 @@ fn run() -> Result<i32> {
                     token,
                     text,
                     sha,
-                } => (
-                    client::rpc(
-                        &state_dir,
-                        "message_report",
-                        json!({"message": message, "token": token,
-                               "kind": "result", "text": text, "sha": sha}),
-                    )?,
-                    false,
-                ),
+                    report,
+                } => {
+                    let text = match report {
+                        Some(path) => {
+                            use cadence_agent::issue::task_report;
+                            let body =
+                                read_body_capped(None, Some(path), task_report::BODY_MAX as u64)?;
+                            let pm = cadence_agent::issue::Pm::open_default()?;
+                            let filed = task_report::file(&pm, &body, None, None, "")?;
+                            let at = filed["path"].as_str().unwrap_or_default();
+                            format!("{}\n\nReport: {at}", text.trim_end())
+                        }
+                        None => text,
+                    };
+                    (
+                        client::rpc(
+                            &state_dir,
+                            "message_report",
+                            json!({"message": message, "token": token,
+                                   "kind": "result", "text": text, "sha": sha}),
+                        )?,
+                        false,
+                    )
+                }
                 MessageAction::Reconcile {
                     message,
                     status,
@@ -5310,6 +5351,11 @@ fn run() -> Result<i32> {
                 }
                 Some(ReportAction::Show { id }) => {
                     print_json(&report::show(&pm, &id)?);
+                }
+                Some(ReportAction::File { task, kind, file }) => {
+                    use cadence_agent::issue::task_report;
+                    let text = read_body_capped(None, file, task_report::BODY_MAX as u64)?;
+                    print_json(&task_report::file(&pm, &text, Some(&task), Some(kind), "")?);
                 }
                 None => {
                     let body = read_body_capped(text, file, report::BODY_MAX as u64)?;

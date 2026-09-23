@@ -26284,6 +26284,332 @@ fn report_issue_conflicts_and_show_scope() {
     assert!(!ok, "{out}");
 }
 
+// ==================== task reports (CAD-341) ====================
+
+/// A `cadence.report/2` file with the six reflection headings.
+fn task_report_text(front: &str) -> String {
+    let body = [
+        "Expected",
+        "Evidence",
+        "Cause",
+        "Correction",
+        "Lesson",
+        "Next",
+    ]
+    .iter()
+    .map(|h| format!("## {h}\n\n{h} text.\n"))
+    .collect::<Vec<_>>()
+    .join("\n");
+    format!("---\n{front}---\n\n{body}")
+}
+
+/// Run the real binary with PATH led by the build dir (the tracker's
+/// pre-commit hook calls `cadence`); stdout+stderr, raw.
+fn task_report_cli(s: &ReportFx, state: &Path, args: &[&str]) -> (bool, String) {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(state)
+        .args(args)
+        .env("CADENCE_PM_DIR", &s.pm_dir)
+        .env("HOME", &s.home)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                s.bin_dir.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env_remove("CADENCE_ALIAS")
+        .current_dir(&s.product_repo)
+        .output()
+        .unwrap();
+    (
+        out.status.success(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    )
+}
+
+fn task_report_issue(s: &ReportFx) -> String {
+    let (ok, out) = s.cli(&["issue", "new", "Target", "--project", "product"]);
+    assert!(ok, "{out}");
+    out["id"].as_str().unwrap().to_string()
+}
+
+/// `report file` stores the normalised record under the ticket's
+/// `reports/`, commits it through the tracker writer, and `issue show`
+/// (text and JSON — the board's detail payload) lists it; lint passes;
+/// filing the same content again is a no-op duplicate.
+#[test]
+fn task_report_file_stores_and_show_lists() {
+    let s = ReportFx::new();
+    let id = task_report_issue(&s);
+    let src = s.home.join("done.md");
+    let sha = "a".repeat(40);
+    std::fs::write(
+        &src,
+        task_report_text(&format!(
+            "agent: dev-1\nsha: {sha}\nconstraints: [no UI work]\ncontext_feedback:\n  \
+             used: [{{id: L-1, helpful: true}}]\n  wrong: [{{id: L-2, why: stale flag}}]\n  \
+             reread: [src/issue/write.rs]\n"
+        )),
+    )
+    .unwrap();
+    let src_s = src.to_str().unwrap();
+    let (ok, out) = s.cli(&[
+        "report", "file", "--task", &id, "--kind", "done", "--file", src_s,
+    ]);
+    assert!(
+        ok && out["committed"] == true && out["kind"] == "done",
+        "{out}"
+    );
+    let path = out["path"].as_str().unwrap().to_string();
+    assert!(path.starts_with(&format!("{id}/reports/")) && path.ends_with("-dev-1.md"));
+    let stored = std::fs::read_to_string(s.pm_dir.join("product").join(&path)).unwrap();
+    for want in [
+        "schema: cadence.report/2",
+        "kind: done",
+        &format!("task: {id}"),
+        "agent: dev-1",
+        "## Lesson",
+    ] {
+        assert!(stored.contains(want), "{want}: {stored}");
+    }
+    let log = s.tracker_log(1);
+    assert!(
+        log.contains(&format!("{id}: report done by dev-1"))
+            && log.contains(&format!("Issue: {id}"))
+            && log.contains("Actor: dev-1"),
+        "{log}"
+    );
+
+    let (ok, show) = s.cli(&["issue", "show", &id, "--json"]);
+    assert!(ok, "{show}");
+    let r = &show["reports"][0];
+    assert_eq!(r["kind"], "done", "{show}");
+    assert_eq!(r["agent"], "dev-1");
+    assert_eq!(r["sha"], sha.as_str());
+    assert_eq!(r["context_feedback"]["wrong"][0]["why"], "stale flag");
+    assert_eq!(r["path"], path.as_str());
+    assert!(r["body"].as_str().unwrap().contains("## Evidence"), "{r}");
+    let (ok, text) = task_report_cli(&s, &s.state, &["issue", "show", &id]);
+    assert!(ok && text.contains("report done by dev-1"), "{text}");
+    assert!(text.contains(&path), "{text}");
+
+    let (ok, lint) = s.cli(&["issue", "lint"]);
+    assert!(ok && lint["ok"] == true, "{lint}");
+
+    // Retry with the same file: the stored report is reused.
+    let (ok, again) = s.cli(&[
+        "report", "file", "--task", &id, "--kind", "done", "--file", src_s,
+    ]);
+    assert!(
+        ok && again["duplicate"] == true && again["path"] == path.as_str(),
+        "{again}"
+    );
+    let (_, show) = s.cli(&["issue", "show", &id, "--json"]);
+    assert_eq!(show["reports"].as_array().unwrap().len(), 1, "{show}");
+}
+
+/// A question carries options/impact and is stored `input-required`;
+/// malformed reports and credential-shaped text are refused with
+/// nothing written; the intake kinds of `cadence report` are untouched.
+#[test]
+fn task_report_refuses_malformed_and_secrets() {
+    let s = ReportFx::new();
+    let id = task_report_issue(&s);
+    let file = |name: &str, text: &str| {
+        let p = s.home.join(name);
+        std::fs::write(&p, text).unwrap();
+        p.to_str().unwrap().to_string()
+    };
+    let q = file(
+        "q.md",
+        &task_report_text("options: [ship now, wait for CAD-392]\nimpact: blocks the merge\n"),
+    );
+    let (ok, out) = s.cli(&[
+        "report", "file", "--task", &id, "--kind", "question", "--file", &q,
+    ]);
+    assert!(ok, "{out}");
+    let (_, show) = s.cli(&["issue", "show", &id, "--json"]);
+    assert_eq!(show["reports"][0]["state"], "input-required", "{show}");
+    assert_eq!(show["reports"][0]["options"][1], "wait for CAD-392");
+
+    let reports = s.pm_dir.join("product").join(&id).join("reports");
+    let count = || std::fs::read_dir(&reports).unwrap().count();
+    let before = count();
+    let secret = cad109_token(&["gh", "p_"].concat(), "cad341", 36);
+    for (name, text, kind, want) in [
+        (
+            "missing.md",
+            task_report_text("").replace("## Lesson", "## Lessons"),
+            "done",
+            "## Lesson",
+        ),
+        (
+            "noopts.md",
+            task_report_text("impact: x\n"),
+            "question",
+            "options",
+        ),
+        (
+            "extra.md",
+            task_report_text("mood: fine\n"),
+            "blocked",
+            "unknown field",
+        ),
+        (
+            "mismatch.md",
+            task_report_text("kind: done\n"),
+            "blocked",
+            "disagrees",
+        ),
+        (
+            "secret.md",
+            task_report_text("").replace("Evidence text.", &format!("{secret}\n")),
+            "done",
+            "credential-shaped",
+        ),
+    ] {
+        let p = file(name, &text);
+        let (ok, text) = task_report_cli(
+            &s,
+            &s.state,
+            &[
+                "report", "file", "--task", &id, "--kind", kind, "--file", &p,
+            ],
+        );
+        assert!(!ok && text.contains(want), "{name}: {text}");
+        assert!(!text.contains(&secret), "{name}: {text}");
+    }
+    assert_eq!(count(), before, "a refused report wrote a file");
+    // Unknown ticket refuses too.
+    let (ok, _) = task_report_cli(
+        &s,
+        &s.state,
+        &[
+            "report", "file", "--task", "P-99", "--kind", "question", "--file", &q,
+        ],
+    );
+    assert!(!ok);
+
+    // Intake kinds keep working unchanged.
+    let (ok, out) = s.cli(&["report", "--kind", "question", "-m", "how?"]);
+    assert!(
+        ok && out["kind"] == "question" && out["status"] == "backlog",
+        "{out}"
+    );
+}
+
+/// `issue lint` validates report files a writer did not produce: a
+/// hand-dropped report missing headings or filed under another task
+/// fails the lint with the path named.
+#[test]
+fn task_report_lint_validates_files() {
+    let s = ReportFx::new();
+    let id = task_report_issue(&s);
+    let reports = s.pm_dir.join("product").join(&id).join("reports");
+    std::fs::create_dir_all(&reports).unwrap();
+    std::fs::write(
+        reports.join("20260923T000000Z-x.md"),
+        "---\nschema: cadence.report/2\nkind: done\ntask: P-77\nagent: x\n---\n\n## Expected\n",
+    )
+    .unwrap();
+    let (ok, lint) = s.cli(&["issue", "lint"]);
+    assert!(!ok && lint["ok"] == false, "{lint}");
+    let errors = lint["errors"].to_string();
+    assert!(
+        errors.contains(&format!("{id}/reports/20260923T000000Z-x.md"))
+            && errors.contains("does not match its ticket"),
+        "{errors}"
+    );
+    // The detail payload still lists it, flagged, instead of hiding it.
+    let (_, show) = s.cli(&["issue", "show", &id, "--json"]);
+    assert!(show["reports"][0]["error"].is_string(), "{show}");
+}
+
+/// A pty worker attaches a report to `message result --report`: the
+/// report is filed on its ticket and the result text carries the
+/// `Report:` line; a malformed report refuses the result, leaving the
+/// message running; a retry with the same file is idempotent.
+#[test]
+fn task_report_attaches_to_message_result() {
+    let s = ReportFx::new();
+    let id = task_report_issue(&s);
+    let d = TestDaemon::start();
+    let _mock = d.mock_stub();
+    d.register_stub("st", json!({"auto_ready": "verified"}));
+    d.wait_agent("st", "idle", 20);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "st", "text": "do the thing", "message": "m1"}),
+    )
+    .unwrap();
+    let token = pty_token(&d, "st", "m1");
+
+    let bad = s.home.join("bad.md");
+    std::fs::write(
+        &bad,
+        task_report_text(&format!("kind: done\ntask: {id}\n")).replace("## Next", ""),
+    )
+    .unwrap();
+    let (ok, text) = task_report_cli(
+        &s,
+        &d.state,
+        &[
+            "message",
+            "result",
+            "m1",
+            "--token",
+            &token,
+            "--text",
+            "done",
+            "--report",
+            bad.to_str().unwrap(),
+        ],
+    );
+    assert!(!ok && text.contains("## Next"), "{text}");
+    assert_eq!(d.message_state("st", "m1"), "running");
+
+    let good = s.home.join("good.md");
+    std::fs::write(
+        &good,
+        task_report_text(&format!("kind: done\ntask: {id}\nagent: st\n")),
+    )
+    .unwrap();
+    let args = [
+        "message",
+        "result",
+        "m1",
+        "--token",
+        &token,
+        "--text",
+        "done",
+        "--report",
+        good.to_str().unwrap(),
+    ];
+    let (ok, text) = task_report_cli(&s, &d.state, &args);
+    assert!(ok, "{text}");
+    let m = d.wait_message("st", "m1", &["completed"], 10);
+    let result = m["result"]["text"].as_str().unwrap_or_default().to_string();
+    assert!(
+        result.starts_with("done\n\nReport: ") && result.contains(&format!("{id}/reports/")),
+        "{m}"
+    );
+    let (_, show) = s.cli(&["issue", "show", &id, "--json"]);
+    assert_eq!(show["reports"][0]["agent"], "st", "{show}");
+    // Retry: same report, same text — the daemon sees an idempotent
+    // duplicate and no second report is filed.
+    let (ok, text) = task_report_cli(&s, &d.state, &args);
+    assert!(ok && text.contains("duplicate"), "{text}");
+    let (_, show) = s.cli(&["issue", "show", &id, "--json"]);
+    assert_eq!(show["reports"].as_array().unwrap().len(), 1, "{show}");
+}
+
 // ==================== persistent monitors (CAD-176) ====================
 
 #[test]
