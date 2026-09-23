@@ -1,7 +1,8 @@
 //! The write side — the only writer for issue folders. Every op takes
 //! the PM lock, mutates files (`issue.md` via temp+rename; comments and
 //! artifacts create-only), then makes one git commit. The HTTP API in
-//! `ui.rs` calls these same functions with `actor = "operator (ui)"`.
+//! `ui.rs` calls these same functions with the derived board caller —
+//! `actor = "operator (ui)"`, or a pane's alias (CAD-254).
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;

@@ -12,8 +12,8 @@
 
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
@@ -23,6 +23,19 @@ use uuid::Uuid;
 use crate::adapter::registry;
 use crate::error::{Error, Result};
 use crate::proto::identifier;
+
+/// How long a connection waits on another process's lock before
+/// SQLITE_BUSY (CAD-256). The daemon's writer and every out-of-process
+/// reader (`audit`, `issue retro`, `doctor host`) share one WAL store.
+pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Read-only open of the daemon store from another process, with the
+/// shared busy timeout — never creates or migrates the file.
+pub(crate) fn open_read_only(path: &Path) -> rusqlite::Result<Connection> {
+    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    Ok(conn)
+}
 
 fn now() -> f64 {
     SystemTime::now()
@@ -852,6 +865,7 @@ impl Store {
 
     fn open_inner(path: &Path, marker: Option<ConsumedMarker>) -> Result<Self> {
         let conn = Connection::open(path)?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL);
@@ -1201,7 +1215,7 @@ impl Store {
     /// again. Anything else falls back to the fence below, one
     /// `turn_adopt_refused` event per rejected entry.
     fn recover(&self, marker: Option<&ConsumedMarker>) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         // Store-level qualification of every recorded entry. A refused
         // entry still lands in the sweep below — the refusal only means
@@ -1388,7 +1402,7 @@ impl Store {
     pub fn pty_endpoint_facts(
         &self,
     ) -> Result<std::collections::HashMap<String, (String, u32, String)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT alias, generation, pid, session_id FROM agents
              WHERE endpoint_kind='pty'
@@ -1437,7 +1451,7 @@ impl Store {
         &self,
         facts: &std::collections::HashMap<String, (String, u32, String)>,
     ) -> Result<Vec<AdoptEntry>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         let mut stmt = tx.prepare(
             "SELECT alias, id, turn_id, state FROM messages
@@ -1498,6 +1512,40 @@ impl Store {
         Ok(entries)
     }
 
+    /// The only way to take the connection lock (CAD-256). A panic while
+    /// another caller held the guard poisons the mutex; `lock().unwrap()`
+    /// would then panic on every later call and take the daemon down
+    /// with it. The connection itself is still sound — an unwinding
+    /// `Transaction` rolls back on drop — so recover the guard, clear
+    /// the poison, roll back anything a raw `BEGIN` left open, and
+    /// record one `store_poisoned` event on the daemon stream.
+    fn conn(&self) -> MutexGuard<'_, Connection> {
+        match self.conn.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                let guard = poisoned.into_inner();
+                self.conn.clear_poison();
+                let rolled_back = !guard.is_autocommit();
+                if rolled_back {
+                    let _ = guard.execute_batch("ROLLBACK");
+                }
+                eprintln!(
+                    "store: connection lock was poisoned by a panic; recovered \
+                     (rolled_back={rolled_back})"
+                );
+                if let Err(e) = Self::event(
+                    &guard,
+                    Self::DAEMON_STREAM,
+                    "store_poisoned",
+                    json!({"rolled_back": rolled_back}),
+                ) {
+                    eprintln!("store: could not record store_poisoned: {e}");
+                }
+                guard
+            }
+        }
+    }
+
     fn event(conn: &Connection, alias: &str, kind: &str, payload: Value) -> Result<()> {
         Self::event_scoped(conn, alias, kind, payload, None, None)
     }
@@ -1523,7 +1571,7 @@ impl Store {
 
     /// Standalone event insert for runtime/daemon bookkeeping.
     pub fn event_public(&self, alias: &str, kind: &str, payload: Value) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         Self::event(&conn, alias, kind, payload)
     }
 
@@ -1538,7 +1586,7 @@ impl Store {
         job_id: Option<&str>,
         task_id: Option<&str>,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         Self::event_scoped(&conn, alias, kind, payload, job_id, task_id)
     }
 
@@ -1548,7 +1596,7 @@ impl Store {
     }
 
     pub fn agent_opt(&self, alias: &str) -> Result<Option<Agent>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         match conn.query_row("SELECT * FROM agents WHERE alias=?", [alias], row_agent) {
             Ok(agent) => Ok(Some(agent)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -1560,7 +1608,7 @@ impl Store {
     /// `session_id` (e.g. a Devin session slug). Exact aliases always win;
     /// callers should try [`Store::agent_opt`] first.
     pub fn agent_by_native(&self, native: &str) -> Result<Option<Agent>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt =
             conn.prepare("SELECT * FROM agents WHERE thread_id=?1 OR session_id=?1 LIMIT 2")?;
         let rows = stmt
@@ -1575,7 +1623,7 @@ impl Store {
     }
 
     pub fn agents(&self) -> Result<Vec<Agent>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn.prepare("SELECT * FROM agents ORDER BY alias")?;
         let rows = stmt.query_map([], row_agent)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -1615,7 +1663,7 @@ impl Store {
                 ));
             }
         }
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn();
         // IMMEDIATE so a concurrent register waits, then observes the
         // committed alias, instead of resolving against a stale snapshot
         // and returning `params_too_large`.
@@ -1725,7 +1773,7 @@ impl Store {
         source: &str,
         task_id: Option<&str>,
     ) -> Result<(bool, String)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         let out = self.enqueue_tx(&tx, alias, body, reply_to, id, source, task_id)?;
         tx.commit()?;
@@ -2047,7 +2095,7 @@ impl Store {
     /// `submitting`. The actor is the only caller; one actor per alias keeps
     /// turns serialized.
     pub fn take_queued(&self, alias: &str) -> Result<Take> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         let agent = self.agent_in(&tx, alias)?;
         if !agent.enabled {
@@ -2101,7 +2149,7 @@ impl Store {
 
     /// Record that the provider acknowledged a turn start.
     pub fn mark_running(&self, message_id: &str, turn_id: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         tx.execute(
             "UPDATE messages SET state='running',turn_id=? WHERE id=?",
@@ -2128,7 +2176,7 @@ impl Store {
     /// Return a `submitting` message to `queued` — the submission gate
     /// refused before any paste, so retry is safe.
     pub fn requeue(&self, message_id: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute(
             "UPDATE messages SET state='queued',started=NULL
              WHERE id=? AND state='submitting'",
@@ -2141,7 +2189,7 @@ impl Store {
     /// `running` (turn_id already recorded) with a durable `submitted`
     /// marker until an explicit ack/result report lands.
     pub fn mark_submitted(&self, message: &Message) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         tx.execute(
             "UPDATE messages SET result=? WHERE id=? AND state='running'",
@@ -2163,7 +2211,7 @@ impl Store {
     /// Explicit acknowledgement for a submitted PTY message; the
     /// message stays `running` until a result report completes it.
     pub fn mark_ack(&self, message: &Message, text: Option<&str>) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         let n = tx.execute(
             "UPDATE messages SET result=? WHERE id=? AND state='running'",
@@ -2193,7 +2241,7 @@ impl Store {
     /// Endpoint died while submitted PTY messages were in flight — each
     /// may have reached the provider, so they are `unknown`, never retried.
     pub fn orphan_running(&self, alias: &str, error: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute(
             "UPDATE messages SET state='unknown',error=?,completed=?
              WHERE alias=? AND state='running'",
@@ -2217,7 +2265,7 @@ impl Store {
                 "Unexpected provider completion status: {status}"
             )));
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         tx.execute(
             "UPDATE messages SET state=?,result=?,error=?,completed=? WHERE id=?",
@@ -2519,7 +2567,7 @@ impl Store {
     /// True when the alias has an `unknown` in-flight attempt that must be
     /// reconciled before it may run again.
     pub fn has_unknown(&self, alias: &str) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM messages WHERE alias=? AND state='unknown'",
             [alias],
@@ -2536,7 +2584,7 @@ impl Store {
     /// literals `recover` and `orphan_running` write; message rows are
     /// not rewritten here.
     pub fn preferred_unknown_error(&self, alias: &str) -> Result<Option<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         match conn.query_row(
             "SELECT error FROM messages
              WHERE alias=? AND state='unknown' AND error IS NOT NULL
@@ -2561,7 +2609,7 @@ impl Store {
     /// Ids of the alias's `unknown` messages, oldest first — what
     /// `agent unfence` reconciles in one call.
     pub fn unknown_messages(&self, alias: &str) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt =
             conn.prepare("SELECT id FROM messages WHERE alias=? AND state='unknown' ORDER BY seq")?;
         let ids = stmt
@@ -2602,7 +2650,7 @@ impl Store {
             )));
         }
         let sha = sha.map(check_commit_sha).transpose()?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         let message = self
             .message_in(&tx, message_id)?
@@ -2678,7 +2726,7 @@ impl Store {
     /// `worker_notice` so a waiter is never left hanging. A task-bound
     /// delivery is refused — `task cancel` owns that lifecycle.
     pub fn cancel(&self, message_id: &str, by: &str, reason: Option<&str>) -> Result<Message> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         let message = self
             .message_in(&tx, message_id)?
@@ -2730,7 +2778,7 @@ impl Store {
     /// `attention` / `stopped` can never be overwritten. `error` is
     /// untouched. Returns whether the row matched.
     pub fn set_agent_state_if(&self, alias: &str, to: &str, from: &str) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let n = conn.execute(
             "UPDATE agents SET state=?,updated=? WHERE alias=? AND state=?",
             params![to, now(), alias, from],
@@ -2743,7 +2791,7 @@ impl Store {
     /// terminal writes go through `set_state_detached` so the state
     /// never lands ahead of the cleared runtime fields.
     pub fn set_agent_state(&self, alias: &str, state: &str, error: Option<&str>) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute(
             "UPDATE agents SET state=?,error=?,updated=? WHERE alias=?",
             params![state, error, now(), alias],
@@ -2805,7 +2853,7 @@ impl Store {
         adopted: Option<&[AdoptEntry]>,
         quota: Option<&Value>,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         let agent = self.agent_in(&tx, alias)?;
         let quota = quota.map(|snapshot| {
@@ -2888,7 +2936,7 @@ impl Store {
         expected_thread_id: &str,
         snapshot: &Value,
     ) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         let agent = self.agent_in(&tx, alias)?;
         if agent.provider != provider || agent.thread_id.as_deref() != Some(expected_thread_id) {
@@ -2939,7 +2987,7 @@ impl Store {
     /// Record the model the provider reports it is running (claude's
     /// stream `system/init`) — the `model` column, never a launch param.
     pub fn set_model_reported(&self, alias: &str, model: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute(
             "UPDATE agents SET model=?,updated=? WHERE alias=?",
             params![model, now(), alias],
@@ -2948,7 +2996,7 @@ impl Store {
     }
 
     pub fn set_params(&self, alias: &str, patch: &Value) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         let agent = self.agent_in(&tx, alias)?;
         let mut merged = agent.params.clone().unwrap_or_else(|| json!({}));
@@ -3041,7 +3089,7 @@ impl Store {
     }
 
     pub fn model_defaults(&self) -> Result<ModelDefaultsSnapshot> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         let snapshot = Self::read_model_defaults_tx(&tx)?;
         tx.commit()?;
@@ -3058,7 +3106,7 @@ impl Store {
         let write = crate::model_defaults::parse_settings_document(document)?;
         let attribution = crate::model_defaults::normalize_attribution(attribution)?;
         let stored = serde_json::to_string(&write.config)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         let current = Self::read_model_defaults_tx(&tx)?;
         if current.revision != write.expected_revision {
@@ -3124,7 +3172,7 @@ impl Store {
     /// disposable-session endpoint proves its stored id can never
     /// resume; the next open mints a fresh session instead.
     pub fn clear_native_session(&self, alias: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         let agent = self.agent_in(&tx, alias)?;
         let old = agent
@@ -3156,7 +3204,7 @@ impl Store {
     /// transaction. The receipt is local mailbox history; `route_result`
     /// deliberately does not turn it into a synthetic worker notification.
     pub fn inbox_drain(&self, alias: &str, after: i64) -> Result<Vec<Message>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         let agent = self.agent_in(&tx, alias)?;
         if registry::has_actor(&agent.provider, &agent.endpoint_kind) {
@@ -3191,7 +3239,7 @@ impl Store {
     /// Count an agent's queued inbound messages (`cadence self` for an
     /// inbox reports this instead of a running turn).
     pub fn queued_count(&self, alias: &str) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         Ok(conn.query_row(
             "SELECT COUNT(*) FROM messages WHERE alias=? AND state='queued'",
             [alias],
@@ -3200,7 +3248,7 @@ impl Store {
     }
 
     pub fn set_enabled(&self, alias: &str, enabled: bool) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute(
             "UPDATE agents SET enabled=?,updated=? WHERE alias=?",
             params![enabled as i64, now(), alias],
@@ -3216,7 +3264,7 @@ impl Store {
     /// attachable endpoint belong to the dead process regardless, so
     /// leaving them would also point `agent attach` at a stale address.
     pub fn set_state_detached(&self, alias: &str, state: &str, error: Option<&str>) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute(
             "UPDATE agents SET state=?,error=?,pid=NULL,endpoint=NULL,
                 generation=NULL,updated=? WHERE alias=?",
@@ -3231,7 +3279,7 @@ impl Store {
     /// own or start a turn. Callers must hold the lifecycle check (the
     /// daemon rejects removal of an owned alias before reaching here).
     pub fn remove_agent(&self, alias: &str) -> Result<Agent> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         let agent = self.agent_in(&tx, alias)?;
         // Inbox rows own no process or pane — their pseudo-endpoint is
@@ -3264,7 +3312,7 @@ impl Store {
     /// explicit command — nothing calls this on a timer.
     pub fn gc_candidates(&self, older_than: Option<f64>) -> Result<Vec<Agent>> {
         let cutoff = older_than.map(|age| now() - age).unwrap_or(f64::MAX);
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT * FROM agents WHERE endpoint IS NULL
              AND state IN ('attention','stopped') AND updated < ?",
@@ -3275,7 +3323,7 @@ impl Store {
 
     /// Event log page for the `events` API; cursor is the last seq seen.
     pub fn events(&self, alias: &str, after: i64, limit: i64) -> Result<Vec<Event>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         self.events_alias_in(&conn, alias)?;
         let mut stmt = conn.prepare(
             "SELECT seq,alias,kind,payload,job_id,task_id,at FROM events
@@ -3300,7 +3348,7 @@ impl Store {
     /// The `job events` view: every scoped event for the job across
     /// alias rows, ordered. One indexed query — no separate stream.
     pub fn job_events(&self, job_id: &str, after: i64, limit: i64) -> Result<Vec<Event>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT seq,alias,kind,payload,job_id,task_id,at FROM events
              WHERE job_id=? AND seq>? ORDER BY seq LIMIT ?",
@@ -3313,7 +3361,7 @@ impl Store {
     /// default `cadence events` page. The DESC scan is what the seq
     /// index gives for free; reversing costs one Vec pass.
     pub fn events_tail(&self, alias: &str, limit: i64) -> Result<Vec<Event>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         self.events_alias_in(&conn, alias)?;
         let mut stmt = conn.prepare(
             "SELECT seq,alias,kind,payload,job_id,task_id,at FROM events
@@ -3328,7 +3376,7 @@ impl Store {
     /// The newest `limit` events in the job view, oldest first —
     /// `events_tail` for the `job events` stream.
     pub fn job_events_tail(&self, job_id: &str, limit: i64) -> Result<Vec<Event>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT seq,alias,kind,payload,job_id,task_id,at FROM events
              WHERE job_id=? ORDER BY seq DESC LIMIT ?",
@@ -3340,7 +3388,7 @@ impl Store {
     }
 
     pub fn messages(&self, alias: &str) -> Result<Vec<Message>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         self.agent_in(&conn, alias)?;
         let mut stmt = conn.prepare("SELECT * FROM messages WHERE alias=? ORDER BY seq")?;
         let rows = stmt.query_map([alias], row_message)?;
@@ -3352,7 +3400,7 @@ impl Store {
     /// explicit consumer receipt and therefore cannot be mistaken for a
     /// semantic PM decision.
     pub fn inbox_status(&self, alias: &str) -> Result<Option<Value>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let agent = self.agent_in(&conn, alias)?;
         if registry::has_actor(&agent.provider, &agent.endpoint_kind) {
             return Ok(None);
@@ -3402,7 +3450,7 @@ impl Store {
     }
 
     pub fn message(&self, id: &str) -> Result<Option<Message>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         self.message_in(&conn, id)
     }
 
@@ -3410,7 +3458,7 @@ impl Store {
     /// alias is `running` at a time (the actor loop is serial). The
     /// stall watch and the view surfaces both read this.
     pub fn running_message(&self, alias: &str) -> Result<Option<Message>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         match conn.query_row(
             "SELECT * FROM messages WHERE alias=? AND state='running'
              ORDER BY seq DESC LIMIT 1",
@@ -3426,7 +3474,7 @@ impl Store {
     /// Providers with at least one in-flight turn — the WAL watcher
     /// refuses to checkpoint a store whose provider is mid-turn.
     pub fn busy_providers(&self) -> Result<std::collections::HashSet<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT DISTINCT a.provider FROM agents a
              JOIN messages m ON m.alias = a.alias
@@ -3440,7 +3488,7 @@ impl Store {
     /// daemon's `wal_checkpointed` stream has no agents row, so the
     /// agent-removal `DELETE` never reaches it.
     pub fn prune_stream(&self, alias: &str, keep: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute(
             "DELETE FROM events WHERE alias=?1 AND seq NOT IN (
                  SELECT seq FROM events WHERE alias=?1
@@ -3454,7 +3502,7 @@ impl Store {
     /// mid-gate `submitting`. The stall watch tracks it so a pane menu
     /// blocking delivery is visible before any turn starts.
     pub fn queued_head(&self, alias: &str) -> Result<Option<Message>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         match conn.query_row(
             "SELECT * FROM messages WHERE alias=? AND state IN
              ('queued','submitting') ORDER BY seq LIMIT 1",
@@ -3469,7 +3517,7 @@ impl Store {
 
     /// Latest event seq for `agent_show`'s cursor.
     pub fn event_cursor(&self, alias: &str) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let cursor: i64 = conn.query_row(
             "SELECT COALESCE(MAX(seq),0) FROM events WHERE alias=?",
             [alias],
@@ -3526,7 +3574,7 @@ impl Store {
     }
 
     pub fn monitor_view(&self, id: &str) -> Result<(Monitor, Vec<String>, i64, i64)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let monitor = self.monitor_in(&conn, id)?;
         let coverage = self.monitor_coverage_in(&conn, id)?;
         let (open, total) = self.monitor_counts_in(&conn, id)?;
@@ -3534,7 +3582,7 @@ impl Store {
     }
 
     pub fn monitors(&self) -> Result<Vec<Monitor>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn.prepare("SELECT * FROM monitors ORDER BY id")?;
         let rows = stmt.query_map([], row_monitor)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -3583,7 +3631,7 @@ impl Store {
                 "Monitor coverage must not contain duplicate task ids",
             ));
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         for task_id in &unique {
             let task = self.task_in(&tx, task_id)?;
@@ -3656,12 +3704,12 @@ impl Store {
     }
 
     pub fn monitor(&self, id: &str) -> Result<Monitor> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         self.monitor_in(&conn, id)
     }
 
     pub fn monitor_is_covered(&self, id: &str, task_id: &str) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         self.monitor_in(&conn, id)?;
         Ok(conn
             .query_row(
@@ -3676,7 +3724,7 @@ impl Store {
     /// reconciliation; membership is always the stored task set and is
     /// never inferred from a project or job name.
     pub fn monitor_tasks(&self, id: &str) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         self.monitor_in(&conn, id)?;
         self.monitor_coverage_in(&conn, id)
     }
@@ -3688,7 +3736,7 @@ impl Store {
         &self,
         task_id: &str,
     ) -> Result<Option<(Task, String, bool, bool)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         let task = self.task_in(&tx, task_id)?;
         if !matches!(task.state.as_str(), "dispatched" | "running") {
@@ -3734,7 +3782,7 @@ impl Store {
         pending_aliases: &HashSet<String>,
         by: &str,
     ) -> Result<(Task, String, bool, bool)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         let monitor = self.monitor_in(&tx, monitor_id)?;
         if monitor.state != "active" {
@@ -3925,7 +3973,7 @@ impl Store {
     }
 
     pub fn monitor_heartbeat(&self, id: &str) -> Result<Monitor> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let t = now();
         conn.execute(
             "UPDATE monitors SET heartbeat_at=?,updated=? WHERE id=? AND state<>'off'",
@@ -3935,7 +3983,7 @@ impl Store {
     }
 
     pub fn due_monitors(&self, at: f64) -> Result<Vec<Monitor>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT * FROM monitors
              WHERE state IN ('active','degraded') AND next_check_at IS NOT NULL
@@ -3964,7 +4012,7 @@ impl Store {
     /// one SQLite transaction: a crash can repeat a read, never a durable
     /// alert, because `(monitor_id,fingerprint)` is unique.
     pub fn check_monitor(&self, id: &str, at: f64) -> Result<MonitorCheck> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         let monitor = self.monitor_in(&tx, id)?;
         if monitor.state == "off" {
@@ -4052,7 +4100,7 @@ impl Store {
     /// first occurrence of a reason emits one daemon event; repeated ticks
     /// update status and retry time without an event storm.
     pub fn fail_monitor_check(&self, id: &str, at: f64, error: &str) -> Result<Monitor> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         let monitor = self.monitor_in(&tx, id)?;
         let changed = monitor.state != "degraded" || monitor.error.as_deref() != Some(error);
@@ -4086,7 +4134,7 @@ impl Store {
         at: f64,
         reason: &str,
     ) -> Result<MonitorAlert> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         let monitor = self.monitor_in(&tx, id)?;
         let owner = monitor.owner.clone();
@@ -4255,7 +4303,7 @@ impl Store {
         at: f64,
         by: &str,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         self.monitor_in(&tx, id)?;
         self.resolve_monitor_dispatch_blocked_tx(&tx, id, task_id, at, by)?;
@@ -4264,7 +4312,7 @@ impl Store {
     }
 
     pub fn stop_monitor(&self, id: &str) -> Result<Monitor> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         self.monitor_in(&tx, id)?;
         let t = now();
@@ -4290,7 +4338,7 @@ impl Store {
         open_only: bool,
         limit: i64,
     ) -> Result<Vec<MonitorAlert>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         self.monitor_in(&conn, id)?;
         let sql = if open_only {
             "SELECT * FROM monitor_alerts WHERE monitor_id=? AND seq>? AND state='open'
@@ -4306,7 +4354,7 @@ impl Store {
 
     pub fn ack_monitor_alert(&self, id: &str, seq: i64, by: &str) -> Result<MonitorAlert> {
         identifier(by, "Alert acknowledger")?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         let alert = self.monitor_alert_in(&tx, seq)?;
         if alert.monitor_id != id {
@@ -4361,17 +4409,17 @@ impl Store {
     }
 
     pub fn job(&self, id: &str) -> Result<Job> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         self.job_in(&conn, id)
     }
 
     pub fn task(&self, id: &str) -> Result<Task> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         self.task_in(&conn, id)
     }
 
     pub fn task_opt(&self, id: &str) -> Result<Option<Task>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         match conn.query_row("SELECT * FROM tasks WHERE id=?", [id], row_task) {
             Ok(t) => Ok(Some(t)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -4382,7 +4430,7 @@ impl Store {
     /// Jobs for `job list` — non-terminal by default, `all` includes
     /// done/cancelled/failed; `state` filters exactly.
     pub fn jobs(&self, state: Option<&str>, all: bool) -> Result<Vec<Job>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let sql = if state.is_some() {
             "SELECT * FROM jobs WHERE state=? ORDER BY created"
         } else if all {
@@ -4401,7 +4449,7 @@ impl Store {
     }
 
     pub fn tasks_for_job(&self, job_id: &str) -> Result<Vec<Task>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn.prepare("SELECT * FROM tasks WHERE job_id=? ORDER BY created")?;
         let rows = stmt.query_map([job_id], row_task)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -4409,7 +4457,7 @@ impl Store {
 
     /// An alias's non-terminal task assignments — derived, never stored.
     pub fn tasks_for_assignee(&self, alias: &str) -> Result<Vec<Task>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT * FROM tasks WHERE assignee=?
              AND state NOT IN ('verified','done','cancelled','failed')
@@ -4420,7 +4468,7 @@ impl Store {
     }
 
     pub fn verdicts_for_task(&self, task_id: &str) -> Result<Vec<Verdict>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt =
             conn.prepare("SELECT * FROM verdicts WHERE task_id=? ORDER BY revision, seq")?;
         let rows = stmt.query_map([task_id], row_verdict)?;
@@ -4430,7 +4478,7 @@ impl Store {
     /// Every message attached to a task (kickoffs + `--task` sends),
     /// oldest first — `job task show`'s delivery view.
     pub fn messages_for_task(&self, task_id: &str) -> Result<Vec<Message>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let mut stmt = conn.prepare("SELECT * FROM messages WHERE task_id=? ORDER BY seq")?;
         let rows = stmt.query_map([task_id], row_message)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -4471,7 +4519,7 @@ impl Store {
         if stall_secs.is_some_and(|s| s < 0) {
             return Err(Error::rejected("--stall-secs must be >= 0"));
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         self.agent_in(&tx, pm_alias)?;
         if let Ok(existing) = self.job_in(&tx, id) {
@@ -4581,7 +4629,7 @@ impl Store {
         base_sha: Option<&str>,
     ) -> Result<Task> {
         identifier(id, "Task id")?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         let job = self.job_in(&tx, job_id)?;
         if job.state != "open" {
@@ -4668,7 +4716,7 @@ impl Store {
         message_id: Option<&str>,
         by: &str,
     ) -> Result<(Task, String, bool, bool)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         let task = self.task_in(&tx, task_id)?;
         let job = self.job_in(&tx, &task.job_id)?;
@@ -4822,7 +4870,7 @@ impl Store {
             )));
         }
         let sha = check_commit_sha(sha)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         let task = self.task_in(&tx, task_id)?;
         let job = self.job_in(&tx, &task.job_id)?;
@@ -4959,7 +5007,7 @@ impl Store {
         if let Some(s) = merged_sha {
             check_commit_sha(s)?;
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         let task = self.task_in(&tx, task_id)?;
         let job = self.job_in(&tx, &task.job_id)?;
@@ -5001,7 +5049,7 @@ impl Store {
     /// `job task reopen`: blocked/verified/failed → draft, revision
     /// resets to 0 — a re-scope, not a continuation. Operator intent.
     pub fn reopen_task(&self, task_id: &str, by: &str) -> Result<Task> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         let task = self.task_in(&tx, task_id)?;
         if !matches!(task.state.as_str(), "blocked" | "verified" | "failed") {
@@ -5030,7 +5078,7 @@ impl Store {
 
     /// `job task fail`: PM marks a task unrecoverable. Terminal.
     pub fn fail_task(&self, task_id: &str, reason: &str, by: &str) -> Result<Task> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         let task = self.task_in(&tx, task_id)?;
         if is_task_terminal(&task.state) {
@@ -5060,7 +5108,7 @@ impl Store {
     /// `running` kickoff cannot be unpasted and finishes on its own.
     /// Agents are never stopped by a job.
     pub fn cancel_task(&self, task_id: &str, by: &str) -> Result<Task> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         let task = self.task_in(&tx, task_id)?;
         if is_task_terminal(&task.state) {
@@ -5101,7 +5149,7 @@ impl Store {
     /// in one transaction (queued kickoffs included). Running kickoffs
     /// are left alone — agents are never stopped by a job.
     pub fn cancel_job(&self, job_id: &str, by: &str) -> Result<Job> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         let job = self.job_in(&tx, job_id)?;
         if matches!(job.state.as_str(), "done" | "cancelled" | "failed") {
@@ -5139,7 +5187,7 @@ impl Store {
 
     /// `job close`: legal only when every task is `done`.
     pub fn close_job(&self, job_id: &str, by: &str) -> Result<Job> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         let job = self.job_in(&tx, job_id)?;
         if job.state != "open" {
@@ -5182,7 +5230,7 @@ impl Store {
     /// event; overwriting a different SHA is rejected.
     pub fn set_task_sha(&self, task_id: &str, sha: &str, by: &str) -> Result<Task> {
         let sha = check_commit_sha(sha)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         let task = self.task_in(&tx, task_id)?;
         if task.state != "review" {
@@ -5300,7 +5348,7 @@ impl Store {
         dedupe: &str,
         note: &str,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         let task = self.task_in(&tx, task_id)?;
         let job = self.job_in(&tx, &task.job_id)?;
@@ -5763,7 +5811,7 @@ mod tests {
         // that harmless presentation drift in the queued binding; the exact
         // created_bits proof must still admit the original recipient.
         let (seq, payload): (i64, String) = {
-            let conn = s.conn.lock().unwrap();
+            let conn = s.conn();
             conn.query_row(
                 "SELECT seq,payload FROM events
                  WHERE alias='w1' AND kind='queued' ORDER BY seq DESC LIMIT 1",
@@ -5777,7 +5825,7 @@ mod tests {
         payload["recipient_identity"]["created"] =
             json!(f64::from_bits(created.to_bits().wrapping_add(1)));
         {
-            let conn = s.conn.lock().unwrap();
+            let conn = s.conn();
             conn.execute(
                 "UPDATE events SET payload=? WHERE seq=?",
                 rusqlite::params![payload.to_string(), seq],
@@ -6232,9 +6280,7 @@ mod tests {
             )
             .unwrap();
             let v: i64 = s
-                .conn
-                .lock()
-                .unwrap()
+                .conn()
                 .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
                 .unwrap();
             assert_eq!(v, 11);
@@ -6267,9 +6313,7 @@ mod tests {
             let evs = s.job_events("j1", 0, 50).unwrap();
             assert!(evs.iter().any(|e| e.task_id.as_deref() == Some("j1-t9")));
             let v: i64 = s
-                .conn
-                .lock()
-                .unwrap()
+                .conn()
                 .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
                 .unwrap();
             assert_eq!(v, 11);
@@ -7328,5 +7372,57 @@ mod tests {
         s.replace_model_defaults(&defaults_body(0, "{}"), None)
             .unwrap();
         assert_eq!(s.model_defaults().unwrap().revision, 1);
+    }
+
+    /// CAD-256: a panic while one caller holds the connection guard
+    /// poisons the mutex. The next store call must recover it — not
+    /// panic — and leave a `store_poisoned` event on the daemon stream.
+    #[test]
+    fn a_panic_holding_the_connection_does_not_poison_later_calls() {
+        let (_dir, s) = store();
+        std::thread::scope(|scope| {
+            let crashed = scope
+                .spawn(|| {
+                    let conn = s.conn();
+                    // A raw BEGIN the panic leaves open: recovery must
+                    // roll it back, not commit the next caller into it.
+                    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+                    panic!("store closure panicked while holding the lock");
+                })
+                .join();
+            assert!(crashed.is_err());
+        });
+        assert!(s.conn.is_poisoned());
+
+        let events = s.events(Store::DAEMON_STREAM, 0, 100).unwrap();
+        assert!(!s.conn.is_poisoned());
+        let poisoned: Vec<_> = events
+            .iter()
+            .filter(|e| e.kind == "store_poisoned")
+            .collect();
+        assert_eq!(poisoned.len(), 1, "{events:?}");
+        assert_eq!(poisoned[0].payload["rolled_back"], true);
+        // Later calls take the plain path and record nothing more.
+        s.event_public("daemon", "probe", json!({})).unwrap();
+        let events = s.events(Store::DAEMON_STREAM, 0, 100).unwrap();
+        assert_eq!(
+            events.iter().filter(|e| e.kind == "store_poisoned").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn store_connections_wait_on_a_busy_database() {
+        let (dir, s) = store();
+        let timeout: i64 = s
+            .conn()
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(timeout, 5000);
+        let reader = super::open_read_only(&dir.path().join("t.sqlite3")).unwrap();
+        let timeout: i64 = reader
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(timeout, 5000);
     }
 }

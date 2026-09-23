@@ -937,7 +937,8 @@ fn agent_detail(state_dir: &Path, alias: &str) -> std::result::Result<Value, Str
 /// `artifact_max_bytes` while reading.
 const JSON_CAP: u64 = 256 * 1024;
 
-/// The actor the write API commits as — visible in `git log` subjects.
+/// The actor an operator write commits as — visible in `git log`
+/// subjects. A pane's write commits as its alias (`write_caller`).
 const UI_ACTOR: &str = "operator (ui)";
 
 type HttpResp = Response<std::io::Cursor<Vec<u8>>>;
@@ -1179,25 +1180,120 @@ fn write_err(e: &Error) -> HttpResp {
 /// request forging the header under a different Host — writes as the
 /// plain operator and the header is never considered.
 fn request_actor(request: &Request, opts: &ServeOpts) -> String {
-    let Some((dns, _)) = &opts.tailnet else {
-        return UI_ACTOR.to_string();
-    };
-    let peer_ok = request
-        .remote_addr()
-        .map(|a| a.ip().is_loopback())
-        .unwrap_or(false);
-    if !peer_ok {
-        return UI_ACTOR.to_string();
-    }
-    let host = header_value(request, "Host").unwrap_or_default();
-    let name = host.split(':').next().unwrap_or_default();
-    if !name.eq_ignore_ascii_case(dns) {
+    if !tailnet_request(request, opts) {
         return UI_ACTOR.to_string();
     }
     header_value(request, "Tailscale-User-Login")
         .and_then(|l| sanitize_actor(&l))
         .map(|l| format!("{l} (tailscale)"))
         .unwrap_or_else(|| UI_ACTOR.to_string())
+}
+
+/// Tailscale mode armed, the TCP peer is loopback (the proxy connects
+/// locally), and the request's Host is the tailnet name — the shape
+/// under which `Tailscale-User-Login` is considered at all.
+fn tailnet_request(request: &Request, opts: &ServeOpts) -> bool {
+    let Some((dns, _)) = &opts.tailnet else {
+        return false;
+    };
+    let peer_ok = request
+        .remote_addr()
+        .map(|a| a.ip().is_loopback())
+        .unwrap_or(false);
+    let host = header_value(request, "Host").unwrap_or_default();
+    let name = host.split(':').next().unwrap_or_default();
+    peer_ok && name.eq_ignore_ascii_case(dns)
+}
+
+/// Who a board write commits as (CAD-254). The cross-site guards stop
+/// browsers, not local processes: an agent with a shell can send the
+/// same headers. So a write derives its caller the way the daemon
+/// does — the TCP peer's process, then its `/proc` ancestry to the
+/// nearest registered pane ([`crate::peer::tcp_peer_pane`]).
+enum WriteCaller {
+    /// The operator — `actor` is `operator (ui)` or a trusted tailnet
+    /// login; comment authors and monitor acks record `operator`.
+    Operator(String),
+    /// A process on a registered pane's lineage IS that agent: its
+    /// alias is the actor and author, never `operator`.
+    Agent(String),
+}
+
+impl WriteCaller {
+    fn actor(&self) -> &str {
+        match self {
+            WriteCaller::Operator(actor) => actor,
+            WriteCaller::Agent(alias) => alias,
+        }
+    }
+
+    fn author(&self) -> &str {
+        match self {
+            WriteCaller::Operator(_) => "operator",
+            WriteCaller::Agent(alias) => alias,
+        }
+    }
+}
+
+/// Derive the write caller, or refuse (`403`, `check:
+/// "caller_identity"`) when the peer cannot be attributed — fail
+/// closed, never `operator` by default. A tailnet-shaped request keeps
+/// its header-based identity unless its peer provably descends from a
+/// pane: the real proxy is another user's process this user cannot
+/// inspect, so an unattributable peer there is the expected case.
+fn write_caller(
+    request: &Request,
+    state_dir: &Path,
+    opts: &ServeOpts,
+) -> std::result::Result<WriteCaller, HttpResp> {
+    let pane = registered_panes(state_dir).and_then(|panes| {
+        if panes.is_empty() {
+            return Ok(None);
+        }
+        let peer = request
+            .remote_addr()
+            .ok_or_else(|| "the request has no peer address".to_string())?;
+        crate::peer::tcp_peer_pane(opts.port, *peer, &panes)
+    });
+    match pane {
+        Ok(Some(alias)) => Ok(WriteCaller::Agent(alias)),
+        Ok(None) => Ok(WriteCaller::Operator(request_actor(request, opts))),
+        Err(_) if tailnet_request(request, opts) => {
+            Ok(WriteCaller::Operator(request_actor(request, opts)))
+        }
+        Err(why) => Err(guard_fail(
+            "caller_identity",
+            &format!(
+                "board write refused: caller identity underivable — {why}. \
+                 Writes attribute the peer process to its registered pane, \
+                 or to the operator when it descends from none."
+            ),
+        )),
+    }
+}
+
+/// Live registered panes, pane pid → alias — the same rows the
+/// daemon's slot identity resolves against (`pty` endpoints with a pid
+/// and a generation), read over the daemon's `agent_list` RPC. No
+/// store file means no agent was ever registered here: provably no
+/// panes. A store the daemon cannot answer for is an error.
+fn registered_panes(state_dir: &Path) -> std::result::Result<HashMap<u32, String>, String> {
+    if !state_dir.join("cadence.sqlite3").exists() {
+        return Ok(HashMap::new());
+    }
+    let list = client::rpc(state_dir, "agent_list", json!({}))
+        .map_err(|e| format!("the daemon cannot list registered panes ({e})"))?;
+    let agents = list["agents"]
+        .as_array()
+        .ok_or_else(|| "the daemon's agent list is malformed".to_string())?;
+    Ok(agents
+        .iter()
+        .filter(|a| a["endpoint_kind"] == "pty" && !a["generation"].is_null())
+        .filter_map(|a| {
+            let pid = u32::try_from(a["pid"].as_u64()?).ok()?;
+            Some((pid, a["alias"].as_str()?.to_string()))
+        })
+        .collect())
 }
 
 /// The login lands in a commit `Actor:` trailer — take the first
@@ -1323,6 +1419,10 @@ fn model_defaults_post(request: &mut Request, state_dir: &Path, opts: &ServeOpts
     if let Err(resp) = require_model_defaults(state_dir) {
         return resp;
     }
+    let caller = match write_caller(request, state_dir, opts) {
+        Ok(caller) => caller,
+        Err(resp) => return resp,
+    };
     let bytes = match read_settings_body(request) {
         Ok(bytes) => bytes,
         Err(resp) => return resp,
@@ -1338,11 +1438,10 @@ fn model_defaults_post(request: &mut Request, state_dir: &Path, opts: &ServeOpts
             )
         }
     };
-    let actor = request_actor(request, opts);
     match client::rpc(
         state_dir,
         "model_defaults_set",
-        json!({"document": document, "attribution": actor}),
+        json!({"document": document, "attribution": caller.actor()}),
     ) {
         Ok(mut snapshot) => {
             if let Some(obj) = snapshot.as_object_mut() {
@@ -1408,15 +1507,22 @@ fn write_route(
             send(request, resp);
             return;
         }
+        let caller = match write_caller(&request, state_dir, opts) {
+            Ok(caller) => caller,
+            Err(resp) => {
+                send(request, resp);
+                return;
+            }
+        };
         // `MonitorAlert` uses the protocol identifier grammar for its audit
-        // actor.  The browser actor includes a display suffix, so retain a
-        // conservative operator identity here rather than passing an invalid
-        // or user-controlled value to the daemon.
+        // actor.  The browser actor includes a display suffix, so record
+        // the derived author — `operator`, or the pane's alias — rather
+        // than passing an invalid or user-controlled value to the daemon.
         let seq = seq.parse::<i64>().unwrap_or_default();
         match client::rpc(
             state_dir,
             "monitor_alert_ack",
-            json!({"monitor": monitor, "alert": seq, "by": "operator"}),
+            json!({"monitor": monitor, "alert": seq, "by": caller.author()}),
         ) {
             Ok(value) => send(
                 request,
@@ -1515,7 +1621,14 @@ fn write_route(
         send(request, resp);
         return;
     }
-    let actor = request_actor(&request, opts);
+    let caller = match write_caller(&request, state_dir, opts) {
+        Ok(caller) => caller,
+        Err(resp) => {
+            send(request, resp);
+            return;
+        }
+    };
+    let actor = caller.actor().to_string();
     let pm = match Pm::at(pm_dir) {
         Ok(pm) => pm,
         Err(e) => {
@@ -1677,7 +1790,7 @@ fn write_route(
                 &pm,
                 &id,
                 &req.body,
-                Some("operator"),
+                Some(caller.author()),
                 Some("ui"),
                 req.if_rev.as_deref(),
                 &actor,

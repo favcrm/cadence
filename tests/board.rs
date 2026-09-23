@@ -2132,6 +2132,120 @@ impl Drop for UiDaemon {
     }
 }
 
+/// Plant `pid` as `alias`'s live pty pane — the row shape the daemon's
+/// pane map resolves callers by (a `pty` endpoint with a pid and a
+/// generation). Registered as an actorless `inbox` pair first and kept
+/// `enabled=0`, so no actor ever opens it and overwrites the plant —
+/// the same recipe integration.rs's `plant_pane` uses.
+fn plant_pane(d: &UiDaemon, alias: &str, pid: u32) {
+    d.rpc(
+        "agent_register",
+        json!({"alias": alias, "provider": "inbox", "endpoint_kind": "inbox",
+               "cwd": d.state().to_str().unwrap()}),
+    );
+    let conn = rusqlite::Connection::open(d.state().join("cadence.sqlite3")).unwrap();
+    conn.execute(
+        "UPDATE agents SET endpoint_kind='pty', pid=?1, enabled=0, \
+            generation='planted', session_id='planted' WHERE alias=?2",
+        rusqlite::params![pid as i64, alias],
+    )
+    .unwrap();
+}
+
+/// CAD-254: the write guards stop browsers, not local processes. A
+/// board write from a process that descends from a registered pane is
+/// that agent's write — its alias lands in the commit and as the
+/// comment author, never `operator` — while a peer on no pane's lineage
+/// (this test process, standing in for the operator's browser) still
+/// writes as `operator (ui)`. With the store present but the daemon
+/// gone the panes are unknowable, so a write is refused, not guessed.
+#[test]
+fn ui_write_caller_derives_from_pane_ancestry() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let d = UiDaemon::start_on(state.path().to_path_buf());
+    let port = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+    let host = format!("127.0.0.1:{port}");
+
+    // The pane: a bash that waits for a go line, then runs the client
+    // as its CHILD — a plain HTTP write over bash's /dev/tcp, so the
+    // peer holding the socket descends from the planted pane pid.
+    let body = r#"{"body":"from the pane"}"#;
+    let request = format!(
+        "POST /api/issues/CAD-3/comments HTTP/1.0\r\nHost: {host}\r\n\
+         Content-Type: application/json\r\nX-Cadence-Board: 1\r\n\
+         Origin: http://{host}\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let mut pane = Command::new("bash")
+        .args(["-c", r#"read -r _; bash -c "$CLIENT"; true"#])
+        .env(
+            "CLIENT",
+            r#"exec 3<>"/dev/tcp/127.0.0.1/$PORT"; printf '%s' "$REQ" >&3; cat <&3"#,
+        )
+        .env("PORT", port.to_string())
+        .env("REQ", &request)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    plant_pane(&d, "pane-w", pane.id());
+    pane.stdin.take().unwrap().write_all(b"go\n").unwrap();
+    let mut response = String::new();
+    pane.stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut response)
+        .unwrap();
+    assert!(pane.wait().unwrap().success());
+    assert!(
+        response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.0 200"),
+        "{response}"
+    );
+    let json_body = response.split_once("\r\n\r\n").unwrap().1;
+    let v: Value = serde_json::from_str(json_body).unwrap();
+    let comment = v["issue"]["comments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["body"] == "from the pane")
+        .unwrap()
+        .clone();
+    assert_eq!(comment["author"], "pane-w", "{comment}");
+    let (_, last) = git(pm.path(), &["log", "-1", "--format=%B"]);
+    assert!(last.contains("(pane-w)"), "{last}");
+    assert!(last.contains("Actor: pane-w"), "{last}");
+    assert!(!last.contains("operator"), "{last}");
+
+    // The operator: this test process is on no pane's lineage.
+    let (code, _, _) = write_json(
+        port,
+        "PATCH",
+        "/api/issues/CAD-3",
+        &host,
+        r#"{"priority":"P1"}"#,
+    );
+    assert_eq!(code, 200);
+    let (_, last) = git(pm.path(), &["log", "-1", "--format=%B"]);
+    assert!(last.contains("Actor: operator (ui)"), "{last}");
+
+    // Fail closed: the store exists but no daemon can name the panes.
+    let commits_before = commits(pm.path());
+    drop(d);
+    let (code, _, body) = write_json(
+        port,
+        "PATCH",
+        "/api/issues/CAD-3",
+        &host,
+        r#"{"priority":"P2"}"#,
+    );
+    assert_eq!(code, 403, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["check"], "caller_identity", "{v}");
+    assert_eq!(commits(pm.path()), commits_before);
+}
+
 /// Seed the tracker and daemon-side world for the binding tests:
 /// pm + wk fake agents, a job bound to `issue`, one task for `wk`
 /// dispatched so the task is live. Returns (job_id, task_id).

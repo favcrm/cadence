@@ -2782,9 +2782,7 @@ fn registry_evidence(scan: &Scan) -> RegEvidence {
             agents: Vec::new(),
         };
     }
-    let Ok(conn) =
-        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-    else {
+    let Ok(conn) = crate::store::open_read_only(&path) else {
         return RegEvidence {
             store: RegStore::Unreadable,
             agents: Vec::new(),
