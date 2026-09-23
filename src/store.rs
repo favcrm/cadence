@@ -7313,13 +7313,16 @@ mod tests {
             .into_iter()
             .rev()
             .collect();
-        tail.chars().filter(|c| !c.is_whitespace()).collect()
+        normalized(&tail)
     }
 
     /// `normalize_screen` restated for the count model: the probe counts
-    /// `slice` occurrences inside the whitespace-stripped visible pane.
+    /// `slice` occurrences inside the visible pane stripped of whitespace
+    /// and inline markdown markers.
     fn normalized(text: &str) -> String {
-        text.chars().filter(|c| !c.is_whitespace()).collect()
+        text.chars()
+            .filter(|c| !c.is_whitespace() && !['`', '*', '_', '~'].contains(c))
+            .collect()
     }
 
     /// The contract restated independently of `kickoff_correlation`:
