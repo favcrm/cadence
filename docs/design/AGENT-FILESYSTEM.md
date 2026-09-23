@@ -156,6 +156,10 @@ source task); binaries over ~1 MB go to a content-addressed blob store
 (`.blobs/sha256/…`, syncable to R2 or AgenticOS files) with only the entry in git;
 all writes go through one writer (`cadence issue attach`, `cadence report`);
 code-coupled docs (ADRs, API specs) stay in the product repo and are linked.
+Produced HTML (previews, mockups, reports) is an artifact like any other: the
+source file lives in the project folder (`shared/designs/` or the ticket's
+`artifacts/`, or the product repo's `design-plans/` for design work) with its
+Markdown source beside it; a preview host holds only an expiring copy.
 Migration of today's `~/pm/<project>/<ID>/` to `projects/<slug>/tickets/<ID>/` is
 recommended while there are six projects (pending operator choice).
 
