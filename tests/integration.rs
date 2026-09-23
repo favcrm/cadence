@@ -31298,6 +31298,13 @@ impl ManagedWorkerMock {
                    "endpoint_kind": "managed", "cwd": cwd, "role": role}),
         )
         .unwrap();
+        ManagedWorkerMock { cmd_dir, mock }.enrolled(d, alias)
+    }
+
+    /// Wait for `d` to enroll the provider it launched for an `alias`
+    /// someone else registered (CAD-339: `master_start`).
+    fn enrolled(self, d: &TestDaemon, alias: &str) -> ManagedWorker {
+        let ManagedWorkerMock { cmd_dir, mock } = self;
         // The daemon's own record of the provider it launched — the
         // mock may not even have written its pidfile yet.
         let deadline = Instant::now() + Duration::from_secs(20);

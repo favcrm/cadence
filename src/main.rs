@@ -552,9 +552,10 @@ enum Commands {
         /// Worker agent to dispatch to.
         #[arg(long)]
         to: String,
-        /// Kickoff note the worker reads (`read <note> — …`).
+        /// Kickoff note the worker reads (`read <note> — …`) [default:
+        /// the ticket's own issue.md].
         #[arg(long)]
-        note: PathBuf,
+        note: Option<PathBuf>,
         /// Worktree slug — default: the slugified issue title.
         #[arg(long)]
         name: Option<String>,
@@ -855,6 +856,18 @@ enum Commands {
     Milestone {
         #[command(subcommand)]
         action: cadence_agent::issue::cli::MilestoneAction,
+    },
+    /// The master agent (CAD-339): one per install, alias `master` — the
+    /// operator's assistant that proposes plans, dispatches approved
+    /// tickets, routes questions and summarizes; it never implements.
+    /// `start` has the daemon launch it from `agents/master/` (SOUL.md +
+    /// AGENT.md under the PM dir, installed from defaults when missing);
+    /// chat with it through its thread. `edit` is the one writer of its
+    /// agent files. `summary` is the "since you left" digest. `start`
+    /// and `edit` are operator only.
+    Master {
+        #[command(subcommand)]
+        action: MasterAction,
     },
     /// File a report: a question, feedback, idea or bug becomes a
     /// tracker issue with context — instead of dying in a terminal
@@ -2233,7 +2246,7 @@ enum PlanAction {
         /// Plan Markdown: frontmatter `title`, `goal`, `non_goals`; one
         /// `## <ticket>` section each with optional `size: S|M|L`,
         /// `agent: <alias>`, `depends_on: 2, CAD-9` lines and a
-        /// `### Acceptance` checklist.
+        /// `### Acceptance` checklist. `-` reads stdin.
         #[arg(long)]
         file: PathBuf,
     },
@@ -2259,10 +2272,78 @@ enum PlanAction {
     },
 }
 
+#[derive(Subcommand)]
+enum MasterAction {
+    /// Start the master: install any missing default agent file, then
+    /// launch the managed session and queue its briefing. Provider,
+    /// model and effort default to AGENT.md's `preferred`.
+    Start {
+        /// claude or codex [default: AGENT.md `preferred.provider`].
+        #[arg(long)]
+        provider: Option<String>,
+        /// Model [default: AGENT.md's for that provider].
+        #[arg(long)]
+        model: Option<String>,
+        /// Reasoning effort [default: AGENT.md's for that provider].
+        #[arg(long)]
+        effort: Option<String>,
+    },
+    /// Replace the master's SOUL.md or AGENT.md (operator only; one
+    /// tracker commit). Takes effect at the next `master start`.
+    Edit {
+        /// SOUL.md or AGENT.md.
+        name: String,
+        /// The new content; `-` reads stdin.
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// "Since you left": plans proposed and decided, tickets moved,
+    /// reports filed and open questions since a time.
+    Summary {
+        /// Epoch seconds, YYYY-MM-DDTHH:MM:SSZ, or a look-back (30m, 24h, 7d).
+        #[arg(long, default_value = "24h")]
+        since: String,
+        /// Also post it into the master's thread.
+        #[arg(long)]
+        post: bool,
+    },
+}
+
+fn run_master(state_dir: &Path, action: MasterAction) -> Result<i32> {
+    let result = match action {
+        MasterAction::Start {
+            provider,
+            model,
+            effort,
+        } => client::rpc(
+            state_dir,
+            "master_start",
+            json!({"provider": provider, "model": model, "effort": effort}),
+        )?,
+        MasterAction::Edit { name, file } => {
+            let cap = (cadence_agent::master::AGENT_MAX_CHARS * 4) as u64;
+            let text = read_body_capped(None, Some(file), cap)?;
+            client::rpc(
+                state_dir,
+                "agent_file_write",
+                json!({"agent": cadence_agent::master::ALIAS, "file": name, "text": text}),
+            )?
+        }
+        MasterAction::Summary { since, post } => client::rpc(
+            state_dir,
+            "master_summary",
+            json!({"since": since, "post": post}),
+        )?,
+    };
+    print_json(&result);
+    Ok(0)
+}
+
 fn run_plan(state_dir: &Path, action: PlanAction) -> Result<i32> {
     let result = match action {
         PlanAction::Propose { project, file } => {
-            let text = std::fs::read_to_string(&file).map_err(|e| {
+            let cap = cadence_agent::issue::plan::MAX_PLAN_BYTES as u64;
+            let text = read_body_capped(None, Some(file.clone()), cap).map_err(|e| {
                 Error::rejected(format!("Cannot read plan {}: {e}", file.display()))
             })?;
             client::rpc(
@@ -2370,7 +2451,9 @@ fn read_body_capped(text: Option<String>, file: Option<PathBuf>, max: u64) -> Re
     if let Some(text) = text {
         return Ok(text);
     }
-    if let Some(file) = file {
+    // `--file -` is stdin, like no file at all (CAD-339: an agent whose
+    // only tool is `cadence` pipes a heredoc).
+    if let Some(file) = file.filter(|f| f.as_os_str() != "-") {
         let mut body = String::new();
         std::fs::File::open(&file)?
             .take(read_limit)
@@ -2437,6 +2520,12 @@ fn report_result_text(
         });
     }
     let filed = task_report::store(&pm, &prepared, "")?;
+    let _ = client::rpc_timeout(
+        state_dir,
+        "reports_changed",
+        json!({}),
+        std::time::Duration::from_secs(2),
+    );
     Ok(with_report(filed["path"].as_str().unwrap_or_default()))
 }
 
@@ -5564,6 +5653,7 @@ fn run() -> Result<i32> {
         Commands::Milestone { action } => {
             cadence_agent::issue::cli::run_milestone(&action, &state_dir)
         }
+        Commands::Master { action } => run_master(&state_dir, action),
         Commands::Report {
             kind,
             project,
@@ -5586,6 +5676,14 @@ fn run() -> Result<i32> {
                     use cadence_agent::issue::task_report;
                     let text = read_body_capped(None, file, task_report::BODY_MAX as u64)?;
                     print_json(&task_report::file(&pm, &text, Some(&task), Some(kind), "")?);
+                    // CAD-339: the daemon's report router routes it now
+                    // rather than at its next scan. Best effort.
+                    let _ = client::rpc_timeout(
+                        &state_dir,
+                        "reports_changed",
+                        json!({}),
+                        std::time::Duration::from_secs(2),
+                    );
                 }
                 None => {
                     let body = read_body_capped(text, file, report::BODY_MAX as u64)?;

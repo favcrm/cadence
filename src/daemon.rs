@@ -25,6 +25,8 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+mod master_rpc;
+
 use crate::adapter::{
     self, registry, AdapterHooks, Probe, ProviderAdapter, ProviderEnv, ProviderRequest,
     SettledPoll, TurnResult,
@@ -500,6 +502,8 @@ pub struct Shared {
     agent_gc: AgentGcTimer,
     /// CAD-96: the idle auto-stop timer (default ON, resumable).
     auto_stop: AutoStopTimer,
+    /// CAD-339: a report was filed — the report router scans at once.
+    reports_dirty: AtomicBool,
 }
 
 impl Shared {
@@ -561,6 +565,7 @@ impl Shared {
             slots: Mutex::new(slots),
             slot_clock,
             agent_gc: AgentGcTimer::new(opts.agent_gc.clone()),
+            reports_dirty: AtomicBool::new(false),
             auto_stop: AutoStopTimer::new(opts.auto_stop.clone(), opts.auto_stop_clock.clone()),
         });
         // Holds dropped by boot-time revalidation get their release
@@ -1814,6 +1819,9 @@ impl Shared {
         params: &Value,
         peer_pid: u32,
     ) -> Result<Value> {
+        // CAD-339: what the master may never do is refused here, before
+        // any method runs — a refusal leaves no write.
+        self.master_policy(method, params, peer_pid)?;
         let answer = self.dispatch_method(method, params, peer_pid)?;
         Ok(self.withhold_turn_tokens(answer, peer_pid))
     }
@@ -2209,6 +2217,11 @@ impl Shared {
             "project_work_approvals" => Ok(json!({
                 "approvals": self.store.work_approvals()?,
             })),
+            "plan_check" => self.rpc_plan_check(params, peer_pid),
+            "agent_file_write" => self.rpc_agent_file_write(params, peer_pid),
+            "master_start" => self.rpc_master_start(params, peer_pid),
+            "master_summary" => self.rpc_master_summary(params, peer_pid),
+            "reports_changed" => self.rpc_reports_changed(),
             other => Err(Error::rejected(format!("Unknown method '{other}'"))),
         }
     }
@@ -8647,6 +8660,12 @@ pub fn serve_with(state_dir: &Path, opts: ServeOptions) -> Result<()> {
     {
         let shared = Arc::clone(&shared);
         thread::spawn(move || shared.run_slot_watch());
+    }
+    // Report router (CAD-339): workers' reports and unanswered
+    // questions reach the master's thread. Idle without a master.
+    {
+        let shared = Arc::clone(&shared);
+        thread::spawn(move || shared.run_report_router());
     }
     while !shared.closing.load(Ordering::SeqCst) {
         match listener.accept() {

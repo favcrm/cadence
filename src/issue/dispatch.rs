@@ -26,7 +26,9 @@ const LIVE_MESSAGE_STATES: &[&str] = &["queued", "submitting", "running"];
 
 pub struct DispatchArgs {
     pub to: String,
-    pub note: PathBuf,
+    /// The kickoff note; `None` points the worker at the ticket's own
+    /// `issue.md` (CAD-339 — a plan ticket already carries its brief).
+    pub note: Option<PathBuf>,
     pub name: Option<String>,
     pub base: Option<String>,
     pub repo: Option<PathBuf>,
@@ -428,12 +430,21 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
         .ok_or_else(|| {
             Error::rejected("Dispatch needs a return address — pass --reply-to <alias>")
         })?;
-    let note = args
-        .note
+    let note_arg = args.note.clone().unwrap_or_else(|| dir.join("issue.md"));
+    let note = note_arg
         .canonicalize()
-        .map_err(|_| Error::rejected(format!("Note {} is unreadable", args.note.display())))?;
+        .map_err(|_| Error::rejected(format!("Note {} is unreadable", note_arg.display())))?;
     std::fs::metadata(&note)
-        .map_err(|_| Error::rejected(format!("Note {} is unreadable", args.note.display())))?;
+        .map_err(|_| Error::rejected(format!("Note {} is unreadable", note_arg.display())))?;
+    // CAD-339: the daemon's own check, by connection identity, before
+    // anything is written — the CAD-360 gate for everyone, and for the
+    // master "tickets of approved plans only".
+    // A daemon from before CAD-339 knows no master and no such check.
+    if let Err(e) = client::rpc(state_dir, "plan_check", json!({"issue": front.id})) {
+        if !e.to_string().contains("Unknown method 'plan_check'") {
+            return Err(e);
+        }
+    }
     // CAD-383: an issue someone else holds in doing/review refuses here,
     // before the daemon is asked anything. The requester is the PM
     // (`--reply-to`) and the worker; `issue start` re-checks under the
@@ -732,7 +743,8 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
         let sent = client::rpc(
             state_dir,
             "agent_send",
-            json!({"alias": args.to, "text": body, "reply_to": reply_to, "message": mid}),
+            json!({"alias": args.to, "text": body, "reply_to": reply_to, "message": mid,
+                   "issue": front.id}),
         )
         .map_err(&send_failed)?;
         (

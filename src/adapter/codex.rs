@@ -246,12 +246,27 @@ pub struct Launched {
 }
 
 impl Transport {
-    fn launch(&self, cwd: &str, log: &Path) -> Result<Launched> {
+    /// `master` (CAD-339) drops forge and platform credentials from the
+    /// provider's env and points `gh` at an empty config; the master
+    /// runs only on the stdio endpoint.
+    fn launch(&self, cwd: &str, log: &Path, master: Option<&Path>) -> Result<Launched> {
         match self {
-            Transport::Stdio(adapter) => Ok(Launched {
-                pid: adapter.launch(cwd, log, &[])?,
-                endpoint: None,
-            }),
+            Transport::Stdio(adapter) => {
+                let (env, remove) = match master {
+                    Some(state_dir) => (
+                        crate::master::env_overrides(state_dir),
+                        crate::master::DENIED_ENV,
+                    ),
+                    None => (vec![], &[][..]),
+                };
+                Ok(Launched {
+                    pid: adapter.launch_scrubbing(cwd, log, &env, remove)?,
+                    endpoint: None,
+                })
+            }
+            Transport::Ws(_) if master.is_some() => Err(Error::rejected(
+                "the master runs on the codex stdio endpoint (`managed`), not managed-ws",
+            )),
             Transport::Ws(adapter) => {
                 let launched = adapter.launch(cwd, log)?;
                 Ok(Launched {
@@ -622,7 +637,11 @@ impl ProviderAdapter for CodexAdapter {
         // keeps a hand-edited store from reaching `thread/start`, and
         // doing it before launch means a bad row spawns nothing.
         registry::codex_sandbox(&agent.sandbox)?;
-        let launched = self.transport.launch(&agent.cwd, &self.log_path)?;
+        // The state dir is the provider log dir's parent (`<state>/agents/`).
+        let state_dir = self.log_path.parent().and_then(Path::parent);
+        let master = crate::master::is_master(&agent.alias)
+            .then(|| state_dir.unwrap_or_else(|| Path::new(".")));
+        let launched = self.transport.launch(&agent.cwd, &self.log_path, master)?;
         // Everything after launch is guarded: any failure closes the
         // transport so no owned provider process is left behind.
         let opened = (|| -> Result<Identity> {
