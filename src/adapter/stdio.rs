@@ -57,6 +57,19 @@ impl EnvScrub {
             keep: keep.iter().map(|s| s.to_string()).collect(),
         }
     }
+
+    /// Exact names removed in addition to any prefix rule.
+    pub fn and_names(mut self, names: &[&str]) -> Self {
+        self.names
+            .extend(names.iter().map(|name| (*name).to_string()));
+        self
+    }
+
+    pub fn removes_name(&self, name: &str) -> bool {
+        self.names.iter().any(|have| have == name)
+            || (self.prefixes.iter().any(|prefix| name.starts_with(prefix.as_str()))
+                && !self.keep.iter().any(|keep| keep == name))
+    }
 }
 
 pub struct StdioAdapter {

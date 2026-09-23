@@ -153,6 +153,13 @@ enum Commands {
         /// Shortcut for --permission-mode dangerous.
         #[arg(long, conflicts_with = "permission_mode")]
         bypass: bool,
+        /// Open a Devin Cloud session instead of a local pty.
+        #[arg(long)]
+        cloud: bool,
+        /// Semicolon-separated cloud create params
+        /// (`repo=owner/name;devin_mode=fast`). Requires `--cloud`.
+        #[arg(long, value_name = "PARAMS", requires = "cloud")]
+        cloud_params: Option<String>,
     },
     /// Launch a Codex agent on a managed-ws endpoint, attachable by the
     /// official Codex TUI via `codex resume --remote`. This terminal
@@ -617,6 +624,13 @@ enum Commands {
         /// before the tool call is denied [default: 900].
         #[arg(long, requires = "broker_approvals", value_parser = clap::value_parser!(u64).range(1..))]
         permission_timeout_secs: Option<u64>,
+        /// Open a Devin Cloud session instead of a local pty. Provider
+        /// must be `devin`.
+        #[arg(long)]
+        cloud: bool,
+        /// Semicolon-separated cloud create params. Requires `--cloud`.
+        #[arg(long, value_name = "PARAMS", requires = "cloud")]
+        cloud_params: Option<String>,
     },
     /// Attach this terminal to a live agent's native endpoint. `name`
     /// may be an alias, a provider-native id, or a provider name when
@@ -3858,10 +3872,7 @@ fn email_flag_error(err: &clap::Error) -> Option<clap::Error> {
 }
 
 fn run() -> Result<i32> {
-    let raw: Vec<String> = std::env::args().collect();
-    let (args, cloud_on, cloud_params) = extract_devin_cloud_args(raw)?;
-    let cli =
-        Cli::try_parse_from(args).unwrap_or_else(|e| email_flag_error(&e).unwrap_or(e).exit());
+    let cli = Cli::try_parse().unwrap_or_else(|e| email_flag_error(&e).unwrap_or(e).exit());
     let state_dir = match cli.state_dir {
         Some(dir) => dir,
         None => client::state_dir()?,
@@ -4270,11 +4281,13 @@ fn run() -> Result<i32> {
             agents_md,
             permission_mode,
             bypass,
+            cloud,
+            cloud_params,
         } => {
             let mut devin = DevinOpts {
                 permission_mode,
                 bypass,
-                cloud: cloud_on,
+                cloud,
                 ..DevinOpts::default()
             };
             apply_cloud_params(&mut devin, &split_cloud_params(cloud_params.as_deref()))?;
@@ -4475,11 +4488,13 @@ fn run() -> Result<i32> {
             permission_timeout_secs,
             turn_idle_secs,
             turn_max_secs,
+            cloud,
+            cloud_params,
         } => {
             let mut devin = DevinOpts {
                 permission_mode: permission_mode.clone(),
                 bypass,
-                cloud: cloud_on,
+                cloud,
                 ..DevinOpts::default()
             };
             apply_cloud_params(&mut devin, &split_cloud_params(cloud_params.as_deref()))?;
@@ -5916,74 +5931,6 @@ struct DevinOpts {
     attachment_urls: Vec<String>,
 }
 
-/// `--cloud` and `--cloud-params` are accepted on `devin` and `join`
-/// but parsed here, ahead of clap. The derived parser is already at
-/// the debug-test stack limit; two more flags overflow it.
-fn extract_devin_cloud_args(args: Vec<String>) -> Result<(Vec<String>, bool, Option<String>)> {
-    let verb = devin_cloud_verb(&args);
-    if verb != Some("devin") && verb != Some("join") {
-        return Ok((args, false, None));
-    }
-    let mut kept = Vec::with_capacity(args.len());
-    let mut cloud = false;
-    let mut params = None;
-    let mut i = 0;
-    while i < args.len() {
-        let arg = &args[i];
-        if arg == "--cloud" {
-            cloud = true;
-            i += 1;
-            continue;
-        }
-        if arg == "--cloud-params" || arg == "--cloud-params=" {
-            let value = args.get(i + 1).filter(|value| !value.starts_with('-'));
-            let Some(value) = value else {
-                return Err(Error::rejected("--cloud-params needs a value"));
-            };
-            params = Some(value.clone());
-            i += 2;
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--cloud-params=") {
-            if value.is_empty() {
-                return Err(Error::rejected("--cloud-params needs a value"));
-            }
-            params = Some(value.to_string());
-            i += 1;
-            continue;
-        }
-        kept.push(arg.clone());
-        i += 1;
-    }
-    if params.is_some() && !cloud {
-        return Err(Error::rejected("--cloud-params requires --cloud"));
-    }
-    Ok((kept, cloud, params))
-}
-
-fn devin_cloud_verb(args: &[String]) -> Option<&str> {
-    let mut i = 1;
-    while i < args.len() {
-        let arg = &args[i];
-        if arg == "--" {
-            return None;
-        }
-        if arg == "--state-dir" {
-            i += 2;
-            continue;
-        }
-        if arg.starts_with("--state-dir=") {
-            i += 1;
-            continue;
-        }
-        if arg.starts_with('-') {
-            return None;
-        }
-        return Some(arg.as_str());
-    }
-    None
-}
-
 fn split_cloud_params(raw: Option<&str>) -> Vec<String> {
     raw.unwrap_or("")
         .split(';')
@@ -6743,13 +6690,19 @@ fn brief_agent(
         } else {
             ""
         };
-        let body = format!(
-            "Cadence bootstrap: you are '{alias}', reporting to group root \
-             '{root_alias}'. Your briefing is on disk at {}{role} — read it. Run \
-             `cadence self` for this message's id and turn_id, {report_line}. \
-             List peers with `cadence agent list`.",
-            file.display()
-        );
+        let cloud = agent["provider"].as_str() == Some("devin")
+            && agent["endpoint_kind"].as_str() == Some("cloud");
+        let body = if cloud {
+            cloud_session_prompt(alias, root_alias, instructions.as_deref(), report_line)
+        } else {
+            format!(
+                "Cadence bootstrap: you are '{alias}', reporting to group root \
+                 '{root_alias}'. Your briefing is on disk at {}{role} — read it. Run \
+                 `cadence self` for this message's id and turn_id, {report_line}. \
+                 List peers with `cadence agent list`.",
+                file.display()
+            )
+        };
         client::rpc(
             state_dir,
             "agent_send",
@@ -6759,6 +6712,32 @@ fn brief_agent(
         )?;
     }
     Ok(file)
+}
+
+/// Prompt posted into a Devin cloud session. The briefing file is still
+/// written for the operator; the session itself cannot read that path
+/// or run `cadence self`, so the role text is inlined here.
+fn cloud_session_prompt(
+    alias: &str,
+    root: &str,
+    instructions: Option<&str>,
+    report_line: &str,
+) -> String {
+    let role = instructions
+        .map(|text| {
+            format!(
+                " Role instructions: {}.",
+                text.replace(['\n', '\r'], " ")
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "Cadence bootstrap: you are '{alias}', reporting to group root '{root}'. \
+         You are a Devin cloud session and cannot read host paths or invoke the \
+         cadence CLI.{role} {report_line}. End your final answer with a one-line \
+         summary followed by a last line `SHA: <40-hex>` naming the commit you \
+         produced."
+    )
 }
 
 /// The briefing document: identity, protocol quickref, and the group
@@ -7225,30 +7204,41 @@ mod tests {
 
     #[inline(never)]
     fn parsed_cloud_repo() {
-        let (args, cloud, params) = extract_devin_cloud_args(vec![
-            "cadence".into(),
-            "--state-dir".into(),
-            "/tmp/cadence".into(),
-            "devin".into(),
-            "--cloud".into(),
-            "--cloud-params".into(),
-            "repo=favcrm/cadence;devin_mode=fast".into(),
+        let cli = Cli::try_parse_from([
+            "cadence",
+            "--state-dir",
+            "/tmp/cadence",
+            "devin",
+            "--cloud",
+            "--cloud-params",
+            "repo=favcrm/cadence;devin_mode=fast",
         ])
         .unwrap();
-        assert!(cloud);
-        assert_eq!(
-            params.as_deref(),
-            Some("repo=favcrm/cadence;devin_mode=fast")
-        );
-        let cli = Cli::try_parse_from(args).unwrap();
-        assert!(matches!(cli.command, Commands::Devin { .. }));
-        assert!(extract_devin_cloud_args(vec![
-            "cadence".into(),
-            "devin".into(),
-            "--cloud-params".into(),
-            "repo=x/y".into(),
+        assert!(matches!(
+            cli.command,
+            Commands::Devin {
+                cloud: true,
+                cloud_params: Some(params),
+                ..
+            } if params == "repo=favcrm/cadence;devin_mode=fast"
+        ));
+        assert!(Cli::try_parse_from([
+            "cadence",
+            "devin",
+            "--cloud-params",
+            "repo=x/y",
         ])
         .is_err());
+        use clap::CommandFactory;
+        let mut cmd = Cli::command();
+        let help = cmd
+            .find_subcommand_mut("devin")
+            .unwrap()
+            .render_help()
+            .to_string();
+        assert!(help.contains("--cloud"), "{help}");
+        assert!(help.contains("--cloud-params"), "{help}");
+        assert!(Cli::try_parse_from(["cadence", "devin", "--", "--cloud"]).is_err());
     }
 
     #[inline(never)]
@@ -7279,20 +7269,40 @@ mod tests {
     }
 
     #[inline(never)]
+    #[test]
+    fn cloud_bootstrap_prompt_inlines_role_without_a_host_path() {
+        let body = cloud_session_prompt(
+            "w",
+            "pm",
+            Some("Ship the widget from the role file."),
+            "do the work, then finish",
+        );
+        assert!(body.contains("Ship the widget from the role file."), "{body}");
+        assert!(body.contains("SHA:"), "{body}");
+        assert!(!body.contains('/'), "{body}");
+        assert!(!body.contains("cadence self"), "{body}");
+        assert!(!body.contains("on disk"), "{body}");
+    }
+
     fn parsed_join_cloud_repo() {
-        let (args, cloud, params) = extract_devin_cloud_args(vec![
-            "cadence".into(),
-            "join".into(),
-            "pm".into(),
-            "devin".into(),
-            "--cloud".into(),
-            "--cloud-params=repo=favcrm/cadence".into(),
+        let cli = Cli::try_parse_from([
+            "cadence",
+            "join",
+            "pm",
+            "devin",
+            "--cloud",
+            "--cloud-params=repo=favcrm/cadence",
         ])
         .unwrap();
-        assert!(cloud);
-        assert_eq!(params.as_deref(), Some("repo=favcrm/cadence"));
-        let cli = Cli::try_parse_from(args).unwrap();
-        assert!(matches!(cli.command, Commands::Join { tui: false, .. }));
+        assert!(matches!(
+            cli.command,
+            Commands::Join {
+                tui: false,
+                cloud: true,
+                cloud_params: Some(params),
+                ..
+            } if params == "repo=favcrm/cadence"
+        ));
     }
 
     #[test]

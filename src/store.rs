@@ -2873,13 +2873,10 @@ impl Store {
         // slot free for the operator's later verdict (completed/failed)
         // or the interrupted notice.
         if status == "unknown" {
-            // A held cloud poll keeps the live session. Routing the
-            // usual fence notice would tell the PM the worker is fenced
-            // when the actor is still attached.
-            let held = result.get("held").and_then(Value::as_bool) == Some(true);
-            if !held {
-                self.route_notice(tx, message, "unknown", result)?;
-            }
+            // A held cloud poll keeps the live session. The PM still
+            // hears about it, but the notice must not say the worker
+            // is fenced.
+            self.route_notice(tx, message, "unknown", result)?;
         } else {
             self.route_result(tx, message, result)?;
         }
@@ -3036,7 +3033,17 @@ impl Store {
             "message": message.id, "notice": kind,
             "result": routed, "worker": message.alias,
         });
-        let prompt = match kind {
+        let prompt = if kind == "unknown"
+            && result.get("held").and_then(Value::as_bool) == Some(true)
+        {
+            format!(
+                "A Devin cloud worker's turn is held — the poll outcome was not learned and \
+                 the session is still working. The worker is not fenced. A later poll can \
+                 still capture the result. This is an informational notice, not a result; \
+                 do not treat it as worker output. {payload}"
+            )
+        } else {
+            match kind {
             "interrupted" => format!(
                 "An operator closed a managed worker's turn as interrupted — the outcome was \
                  never learned. This is an informational notice, not a result; do not treat it \
@@ -3052,6 +3059,7 @@ impl Store {
                  operator reconcile is pending. This is an informational notice, not a result; \
                  do not treat it as worker output. {payload}"
             ),
+        }
         } + &pointer;
         tx.execute(
             "INSERT INTO messages(id,alias,body,reply_to,source,task_id,created)
@@ -4659,8 +4667,9 @@ impl Store {
                 | "paste_not_rendered"
                 | "delivery_parked"
                 | "turn_silent_end"
-                | "approval_menu"
+                |             "approval_menu"
                 | "draft_pending"
+                | "cloud_hold"
         )
     }
 
@@ -6386,6 +6395,86 @@ fn last_sha_line(text: &str) -> Option<String> {
 /// other field is shared boilerplate. A fixed 32-hex digest (not the
 /// raw id) keeps the suffix bounded for `--message` override ids of
 /// arbitrary length; the same id always mints the same suffix.
+fn flatten_controls(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
+/// Drop absolute host paths so a cloud session is not pointed at a
+/// machine-local file. `https://` URLs are left intact.
+fn omit_host_paths(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(index) = rest.find('/') {
+        let absolute = index == 0
+            || rest.as_bytes().get(index.wrapping_sub(1)).copied() == Some(b' ')
+            || rest.as_bytes().get(index.wrapping_sub(1)).copied() == Some(b'\n');
+        let url = index >= 1 && rest.as_bytes().get(index - 1) == Some(&b':');
+        if absolute && !url {
+            out.push_str(&rest[..index]);
+            out.push_str("(omitted)");
+            rest = rest[index..]
+                .split_whitespace()
+                .next()
+                .map(|token| &rest[index + token.len()..])
+                .unwrap_or("");
+        } else {
+            let end = index + 1;
+            out.push_str(&rest[..end]);
+            rest = &rest[end..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn take_chars(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(limit).collect();
+    out.push('…');
+    out
+}
+
+/// Cloud sessions cannot read the host spec path or run `cadence self`.
+/// The spec text is inlined and the `SHA:` trailer stays the report contract.
+fn cloud_kickoff_body(job: &Job, task: &Task, revision: i64) -> String {
+    let spec = task.spec_path.as_deref().unwrap_or(job.spec_path.as_str());
+    let raw = std::fs::read_to_string(spec)
+        .unwrap_or_else(|_| "(spec text was not available to inline)".to_string());
+    let spec_text = take_chars(&omit_host_paths(&flatten_controls(&raw)), 2400);
+    let mut scope = String::new();
+    if let Some(branch) = &task.branch {
+        scope.push_str(&format!(" branch {}", flatten_controls(branch)));
+    }
+    if let Some(base) = &task.base_sha {
+        scope.push_str(&format!(" base {}", flatten_controls(base)));
+    }
+    if !scope.is_empty() {
+        scope = format!(" Scope:{scope}.");
+    }
+    let acceptance = task
+        .acceptance
+        .as_deref()
+        .map(|text| format!(" Acceptance: {}.", flatten_controls(text)))
+        .unwrap_or_default();
+    let issue = job
+        .issue_id
+        .as_deref()
+        .map(|id| format!(" This job tracks issue {id}."))
+        .unwrap_or_default();
+    format!(
+        "Cadence task {} (job {}, revision {}). You are a Devin cloud session and cannot \
+         read host paths or invoke the cadence CLI. Spec text follows. {spec_text}.{scope}{acceptance}{issue} \
+         Report when done: end your final answer with a one-line summary followed by a last \
+         line `SHA: <40-hex>` naming the commit you produced — the daemon reads that line as \
+         the reported revision. Do not report a SHA you have not committed.",
+        task.id, job.id, revision
+    )
+}
+
 fn kickoff_correlation(message_id: &str) -> String {
     let digest = format!("{:x}", Sha256::digest(message_id.as_bytes()));
     format!(" Correlation: {}.", &digest[..32])
@@ -6403,6 +6492,9 @@ fn kickoff_body(
     message_id: &str,
     assignee: &Agent,
 ) -> String {
+    if assignee.provider == "devin" && assignee.endpoint_kind == "cloud" {
+        return cloud_kickoff_body(job, task, revision);
+    }
     let spec = task.spec_path.as_deref().unwrap_or(&job.spec_path);
     let clean = |s: &str| -> String {
         s.chars()
@@ -7770,7 +7862,7 @@ mod tests {
     }
 
     #[test]
-    fn held_unknown_does_not_route_a_fence_notice() {
+    fn held_unknown_routes_a_live_notice() {
         let (dir, s) = store();
         let cwd = dir.path().join("w");
         reg(&s, "w1", &cwd);
@@ -7789,7 +7881,17 @@ mod tests {
             .events("w1", 0, 40)
             .unwrap()
             .iter()
-            .all(|event| event.kind != "notice_routed"));
+            .any(|event| event.kind == "notice_routed"));
+        let notices = s.messages("pm").unwrap();
+        assert!(
+            notices.iter().any(|message| {
+                message.body.contains("held") && message.body.contains("not fenced")
+            }),
+            "{notices:?}"
+        );
+        assert!(notices
+            .iter()
+            .all(|message| !message.body.contains("the worker is fenced")));
         s.enqueue("w1", "again", Some("pm"), "m-fence", "user")
             .unwrap();
         let fenced = run_kickoff(&s, "m-fence");
@@ -7801,10 +7903,89 @@ mod tests {
         )
         .unwrap();
         assert!(s
-            .events("w1", 0, 80)
+            .messages("pm")
             .unwrap()
             .iter()
-            .any(|event| event.kind == "notice_routed"));
+            .any(|message| message.body.contains("the worker is fenced")));
+    }
+
+    #[test]
+    fn cloud_hold_is_a_monitor_alert() {
+        assert!(Store::monitor_alert_kind("cloud_hold"));
+    }
+
+    #[test]
+    fn cloud_kickoff_inlines_spec_without_a_host_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = dir.path().join("spec.md");
+        std::fs::write(&spec, "Implement the cloud task from this text.").unwrap();
+        let worktree = dir.path().join("wt");
+        let job = Job {
+            id: "j1".into(),
+            title: None,
+            spec_path: spec.display().to_string(),
+            spec_sha256: None,
+            pm_alias: "pm".into(),
+            issue_id: None,
+            repo: None,
+            base_ref: None,
+            state: "open".into(),
+            max_revisions: 2,
+            stall_secs: None,
+            error: None,
+            created: 0.0,
+            updated: 0.0,
+        };
+        let task = Task {
+            id: "t1".into(),
+            job_id: "j1".into(),
+            title: None,
+            role: "worker".into(),
+            assignee: Some("cloud-1".into()),
+            spec_path: Some(spec.display().to_string()),
+            acceptance: Some("the task is done".into()),
+            worktree: Some(worktree.display().to_string()),
+            branch: Some("cadence/cloud".into()),
+            base_sha: Some("abc".into()),
+            head_sha: None,
+            state: "draft".into(),
+            revision: 0,
+            dispatch_message: None,
+            error: None,
+            created: 0.0,
+            updated: 0.0,
+        };
+        let assignee = Agent {
+            alias: "cloud-1".into(),
+            provider: "devin".into(),
+            endpoint_kind: "cloud".into(),
+            role: "worker".into(),
+            team_role: None,
+            cwd: worktree.display().to_string(),
+            sandbox: "read-only".into(),
+            instructions: None,
+            thread_id: None,
+            session_id: None,
+            model: None,
+            effort: None,
+            pid: None,
+            endpoint: None,
+            params: None,
+            model_selection: None,
+            quota: None,
+            generation: None,
+            state: "starting".into(),
+            enabled: true,
+            error: None,
+            created: 0.0,
+            updated: 0.0,
+        };
+        let body = kickoff_body(&job, &task, 1, "m1", &assignee);
+        assert!(body.contains("Implement the cloud task from this text."), "{body}");
+        assert!(body.contains("SHA:"), "{body}");
+        assert!(!body.contains(&spec.display().to_string()), "{body}");
+        assert!(!body.contains(&worktree.display().to_string()), "{body}");
+        assert!(!body.contains("cadence self"), "{body}");
     }
 
     #[test]

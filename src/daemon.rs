@@ -945,6 +945,7 @@ impl Shared {
         // keeps dropping pastes must not be re-fed forever.
         let mut unrendered: u32 = 0;
         let mut unrendered_message: Option<String> = None;
+        let mut cloud_held: Option<Box<store::Message>> = None;
         loop {
             if self.closing.load(Ordering::SeqCst) {
                 return Ok(());
@@ -958,6 +959,37 @@ impl Shared {
             if let Some(awaiting) = self.report_overdue(alias) {
                 if self.report_timeout(alias, awaiting)? {
                     return Err(Error::unknown(UNKNOWN_GENERIC_REASON));
+                }
+            }
+            if let Some(pending) = cloud_held.clone() {
+                if !self.store.agent(alias)?.enabled {
+                    return Ok(());
+                }
+                match adapter.poll_settled() {
+                    Ok(Some(turn)) => {
+                        let status = match turn.status.as_str() {
+                            "failed" => "failed",
+                            "interrupted" => "interrupted",
+                            _ => "completed",
+                        };
+                        let note = if turn.text.is_empty() {
+                            None
+                        } else {
+                            Some(turn.text.as_str())
+                        };
+                        self.store
+                            .reconcile(&pending.id, status, note, "cloud_poll", None)?;
+                        cloud_held = None;
+                        self.wake();
+                        continue;
+                    }
+                    Ok(None) | Err(_) => {
+                        ctl.wake.wait_if_unchanged(
+                            ctl.wake.ticket(),
+                            Instant::now() + Duration::from_millis(30),
+                        );
+                        continue;
+                    }
                 }
             }
             // Sample before the empty check. `disconnected` probes the
@@ -1161,6 +1193,7 @@ impl Shared {
                                     "cloud_hold",
                                     json!({"reason": error, "fenced": false}),
                                 );
+                                cloud_held = Some(message);
                                 self.wake();
                             } else {
                                 return self.unknown(alias, &message, &error);
@@ -7082,6 +7115,218 @@ mod tests {
         if let Some(ctl) = lc.agents.get("w1") {
             ctl.wake.notify_all();
         }
+    }
+
+    #[test]
+    fn cloud_hold_notifies_then_a_later_poll_recovers_the_sha() {
+        use std::sync::atomic::AtomicUsize;
+
+        const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+        let gets = Arc::new(AtomicUsize::new(0));
+        let posts = Arc::new(AtomicUsize::new(0));
+        let finished = Arc::new(AtomicBool::new(false));
+        let early_post = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_ip().unwrap();
+        let gets_t = Arc::clone(&gets);
+        let posts_t = Arc::clone(&posts);
+        let finished_t = Arc::clone(&finished);
+        let early_t = Arc::clone(&early_post);
+        let stop_t = Arc::clone(&stop);
+        let thread = thread::spawn(move || {
+            while !stop_t.load(Ordering::SeqCst) {
+                let mut req = match server.recv_timeout(Duration::from_millis(50)) {
+                    Ok(Some(req)) => req,
+                    _ => continue,
+                };
+                let path = req.url().to_string();
+                let method = req.method().as_str().to_string();
+                let mut body = String::new();
+                let _ = req.as_reader().read_to_string(&mut body);
+                let (status, payload): (u16, String) = if path.contains("/repositories") {
+                    (
+                        200,
+                        json!({"repositories": [{"name": "cadence", "owner": "favcrm"}]}).to_string(),
+                    )
+                } else if method == "POST" && path.ends_with("/sessions") {
+                    (
+                        200,
+                        json!({
+                            "session_id": "devin-created",
+                            "status": "running",
+                            "status_detail": "working",
+                            "url": "https://app.devin.ai/sessions/devin-created"
+                        })
+                        .to_string(),
+                    )
+                } else if method == "POST" && path.contains("/messages") {
+                    let n = posts_t.fetch_add(1, Ordering::SeqCst);
+                    if n >= 1 && !finished_t.load(Ordering::SeqCst) {
+                        early_t.store(true, Ordering::SeqCst);
+                    }
+                    (200, json!({"ok": true}).to_string())
+                } else if method == "GET" && path.contains("/sessions/") {
+                    let n = gets_t.fetch_add(1, Ordering::SeqCst);
+                    if n < 3 {
+                        (500, json!({"error": "transient"}).to_string())
+                    } else {
+                        finished_t.store(true, Ordering::SeqCst);
+                        let messages = if posts_t.load(Ordering::SeqCst) >= 2 {
+                            json!([
+                                {"role": "assistant", "message": format!("done\nSHA: {SHA}")},
+                                {"role": "assistant", "message": "follow-up done"}
+                            ])
+                        } else {
+                            json!([{"role": "assistant", "message": format!("done\nSHA: {SHA}")}])
+                        };
+                        (
+                            200,
+                            json!({
+                                "session_id": "devin-created",
+                                "status": "running",
+                                "status_detail": "finished",
+                                "url": "https://app.devin.ai/sessions/devin-created",
+                                "messages": messages,
+                            })
+                            .to_string(),
+                        )
+                    }
+                } else {
+                    (200, json!({"ok": true}).to_string())
+                };
+                let _ = req.respond(tiny_http::Response::from_string(payload).with_status_code(status));
+            }
+        });
+        let (dir, shared) = shared();
+        let base = format!("http://{addr}");
+        shared.provider_env.set("CADENCE_DEVIN_API_BASE", &base);
+        shared.provider_env.set("CADENCE_DEVIN_API_KEY", "cog_test_secret_value");
+        shared.provider_env.set("CADENCE_DEVIN_ORG_ID", "org-test");
+        shared.provider_env.set("CADENCE_DEVIN_POLL_INTERVAL_MS", "20");
+        shared.provider_env.set("CADENCE_DEVIN_POLL_BUDGET_MS", "120");
+        let cwd = dir.path().to_str().unwrap();
+        let spec = dir.path().join("spec.md");
+        std::fs::write(&spec, "Do the cloud work.").unwrap();
+        shared
+            .store
+            .register_agent(&NewAgent {
+                alias: "pm",
+                provider: "fake",
+                endpoint_kind: "managed",
+                role: "pm",
+                cwd,
+                sandbox: "read-only",
+                instructions: None,
+                params: None,
+                team_role: None,
+                model_policy: None,
+            })
+            .unwrap();
+        let params = r#"{"repos":["favcrm/cadence"],"upstream":"pm"}"#;
+        shared
+            .store
+            .register_agent(&NewAgent {
+                alias: "cloud-1",
+                provider: "devin",
+                endpoint_kind: "cloud",
+                role: "worker",
+                cwd,
+                sandbox: "read-only",
+                instructions: None,
+                params: Some(params),
+                team_role: None,
+                model_policy: None,
+            })
+            .unwrap();
+        shared
+            .store
+            .create_job(
+                "j1",
+                None,
+                spec.to_str().unwrap(),
+                &"0".repeat(64),
+                "pm",
+                None,
+                None,
+                None,
+                2,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        shared
+            .store
+            .create_task("j1", "t1", None, Some("cloud-1"), None, None, None, None, None)
+            .unwrap();
+        let (_task, kickoff, dup, _) = shared.store.dispatch_task("t1", None, None, "test").unwrap();
+        assert!(!dup);
+        shared
+            .store
+            .enqueue("cloud-1", "follow-up while the session works", Some("pm"), "follow-up", "user")
+            .unwrap();
+        shared.launch_actor("cloud-1").unwrap();
+        let started = Instant::now();
+        loop {
+            if started.elapsed() > Duration::from_secs(8) {
+                panic!(
+                    "held poll did not recover: task={:?} kickoff={:?} events={:?}",
+                    shared.store.task("t1").ok(),
+                    shared.store.message(&kickoff).ok(),
+                    shared.store.events("cloud-1", 0, 40).ok()
+                );
+            }
+            if shared.store.task("t1").unwrap().head_sha.as_deref() == Some(SHA) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!early_post.load(Ordering::SeqCst), "posted the next message while the session was still held");
+        assert!(shared
+            .store
+            .events("cloud-1", 0, 40)
+            .unwrap()
+            .iter()
+            .any(|event| event.kind == "cloud_hold"));
+        assert!(shared.store.messages("pm").unwrap().iter().any(|message| {
+            message.body.contains("not fenced") && message.body.contains("held")
+        }));
+        let follow_started = Instant::now();
+        loop {
+            if follow_started.elapsed() > Duration::from_secs(8) {
+                panic!(
+                    "follow-up stayed {:?}",
+                    shared.store.message("follow-up").unwrap()
+                );
+            }
+            let state = shared.store.message("follow-up").unwrap().unwrap().state;
+            if state == "completed" || state == "failed" {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!early_post.load(Ordering::SeqCst));
+        shared.store.set_enabled("cloud-1", false).unwrap();
+        shared.begin_closing();
+        let handle = {
+            let lc = shared.lifecycle.lock().unwrap();
+            lc.agents
+                .get("cloud-1")
+                .and_then(|ctl| ctl.thread.lock().unwrap().take())
+        };
+        if let Some(ctl) = shared.lifecycle.lock().unwrap().agents.get("cloud-1") {
+            ctl.wake.notify_all();
+        }
+        if let Some(handle) = handle {
+            let _ = handle.join();
+        }
+        stop.store(true, Ordering::SeqCst);
+        let _ = thread.join();
     }
 
     /// A `session_minted` whose `set_params` fails must not vanish:

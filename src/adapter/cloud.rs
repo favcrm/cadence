@@ -2,10 +2,14 @@
 //!
 //! `open` creates or adopts a session, `run_turn` posts a message and
 //! polls `status_detail` inline, `close` archives (resumable), and
-//! `interrupt` terminates. A 429, timeout, or transport error during a
-//! poll returns [`Error::OutcomeUnknown`] and leaves the session in
+//! `interrupt` terminates. A 429, 5xx, timeout, or transport error
+//! during a poll is retried inside the turn budget. Only an exhausted
+//! budget returns [`Error::OutcomeUnknown`], and the session stays in
 //! place — the actor holds the last status instead of treating the
-//! provider as dead.
+//! provider as dead. A 429 at create or preflight means nothing was
+//! created and is retried, then reported as a provider error rather
+//! than an unknown outcome. A create timeout looks up this daemon's
+//! owner tag before a retry or an unknown report.
 //!
 //! When `max_acu_limit` is unset, create sends **10**. That is one
 //! focused task, not an open-ended session; operators override it with
@@ -26,7 +30,8 @@ use crate::store::Agent;
 pub const DEFAULT_MAX_ACU_LIMIT: u64 = 10;
 
 const DEFAULT_API_BASE: &str = "https://api.devin.ai";
-const HTTP_TIMEOUT: Duration = Duration::from_secs(2);
+const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const LOG_LIMIT: usize = 8192;
 const DEFAULT_POLL_INTERVAL_MS: u64 = 1000;
 const DEFAULT_POLL_BUDGET_MS: u64 = 30 * 60 * 1000;
 
@@ -39,11 +44,13 @@ struct Session {
     detail: String,
     acus: Option<f64>,
     limit: Option<f64>,
-    /// Last assistant transcript, including a trailing `SHA:` line when
-    /// the session produced one. Poll completion returns this text.
-    text: String,
     wait_sent: bool,
     terminated: bool,
+    /// Assistant messages already present before the current post.
+    seen: usize,
+    message_mark: usize,
+    /// Assistant text that arrived after `message_mark`.
+    turn_text: String,
 }
 
 enum CallErr {
@@ -73,10 +80,8 @@ pub struct DevinCloudAdapter {
     /// told to read a machine-local directory.
     cwd: Mutex<String>,
     session: Mutex<Session>,
-    /// Always empty: this endpoint never spawns a process. Tests assert
-    /// that; production code has nothing to read.
-    #[allow(dead_code)]
-    argv: Mutex<Vec<String>>,
+    /// Last scrubbed poll failure, included when the budget runs out.
+    hold_detail: Mutex<String>,
     log: Mutex<String>,
 }
 
@@ -106,7 +111,7 @@ impl DevinCloudAdapter {
             release: AtomicBool::new(false),
             cwd: Mutex::new(String::new()),
             session: Mutex::new(Session::default()),
-            argv: Mutex::new(Vec::new()),
+            hold_detail: Mutex::new(String::new()),
             log: Mutex::new(String::new()),
         }
     }
@@ -122,12 +127,39 @@ impl DevinCloudAdapter {
         }
     }
 
+    fn turn_text(&self) -> String {
+        self.session.lock().unwrap().turn_text.clone()
+    }
+
     fn note(&self, text: &str) {
         let key =
             configured(&self.env, "CADENCE_DEVIN_API_KEY", "DEVIN_API_KEY").unwrap_or_default();
         let mut log = self.log.lock().unwrap();
         log.push_str(&scrub(&key, text.to_string()));
         log.push('\n');
+        if log.len() > LOG_LIMIT {
+            let mut drop_to = log.len() - LOG_LIMIT;
+            while drop_to < log.len() && !log.is_char_boundary(drop_to) {
+                drop_to += 1;
+            }
+            log.drain(..drop_to);
+        }
+    }
+
+    /// Sleep in short slices so stop can set the release flag without
+    /// waiting out a full poll interval. Returns true when released.
+    fn pause(&self, delay: Duration) -> bool {
+        let step = Duration::from_millis(20);
+        let mut left = delay;
+        while !left.is_zero() {
+            if self.released() {
+                return true;
+            }
+            let slice = left.min(step);
+            thread::sleep(slice);
+            left = left.saturating_sub(slice);
+        }
+        self.released()
     }
 
     fn call(
@@ -189,7 +221,7 @@ impl DevinCloudAdapter {
                 encode(org),
                 encode(name)
             );
-            match self.call("GET", &path, None) {
+            match self.get_retry_429(&path) {
                 Ok(body) => {
                     if !repo_enabled(&body, owner, name) {
                         return Err(Error::rejected(format!(
@@ -197,9 +229,15 @@ impl DevinCloudAdapter {
                         )));
                     }
                 }
-                Err(CallErr::Status(code, _)) if code == 404 => {
+                Err(CallErr::Status(404, _)) => {
                     return Err(Error::rejected(format!(
                         "repo {repo} not enabled in Devin git connection"
+                    )));
+                }
+                Err(CallErr::Status(429, detail)) => {
+                    self.note(&detail);
+                    return Err(Error::provider(format!(
+                        "devin cloud git connection check rate limited for {repo}, nothing created: {detail}"
                     )));
                 }
                 Err(err) => {
@@ -256,18 +294,110 @@ impl DevinCloudAdapter {
             body.insert("bypass_approval".into(), json!(true));
         }
         let path = self.org_path(org, "");
-        match self.call("POST", &path, Some(&Value::Object(body))) {
-            Ok(reply) => self.bind_created(&reply),
-            Err(CallErr::Status(429, detail)) | Err(CallErr::Transport(detail)) => {
-                self.note(&detail);
-                Err(Error::unknown(format!(
-                    "devin cloud create outcome unknown ({detail})"
-                )))
+        let payload = Value::Object(body);
+        let mut delay = Duration::from_millis(40);
+        for attempt in 0..4 {
+            match self.call("POST", &path, Some(&payload)) {
+                Ok(reply) => return self.bind_created(&reply),
+                Err(CallErr::Status(429, detail)) => {
+                    self.note(&detail);
+                    if attempt == 3 {
+                        return Err(Error::provider(format!(
+                            "devin cloud create rate limited, nothing created: {detail}"
+                        )));
+                    }
+                    if self.pause(delay) {
+                        return Err(Error::rejected("devin cloud create interrupted"));
+                    }
+                    delay = (delay * 2).min(Duration::from_secs(2));
+                }
+                Err(CallErr::Transport(detail)) => {
+                    self.note(&detail);
+                    match self.find_owned(org) {
+                        Ok(Some(id)) => return self.bind_existing(org, &id),
+                        Ok(None) if attempt < 3 => {
+                            if self.pause(delay) {
+                                return Err(Error::rejected("devin cloud create interrupted"));
+                            }
+                            delay = (delay * 2).min(Duration::from_secs(2));
+                        }
+                        Ok(None) => {
+                            return Err(Error::provider(
+                                "devin cloud create timed out and no owned session was found",
+                            ));
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
+                Err(CallErr::Status(code, detail)) => {
+                    self.note(&detail);
+                    return Err(Error::provider(format!(
+                        "devin cloud create failed: HTTP {code} {detail}"
+                    )));
+                }
             }
-            Err(CallErr::Status(code, detail)) => {
-                self.note(&detail);
-                Err(Error::provider(format!(
-                    "devin cloud create failed: HTTP {code} {detail}"
+        }
+        Err(Error::provider(
+            "devin cloud create rate limited, nothing created",
+        ))
+    }
+
+    /// GET, retrying 429 inside a short budget. A 429 means the request
+    /// did not create a session.
+    fn get_retry_429(&self, path: &str) -> std::result::Result<Value, CallErr> {
+        let mut delay = Duration::from_millis(40);
+        for attempt in 0..4 {
+            match self.call("GET", path, None) {
+                Err(CallErr::Status(429, detail)) if attempt < 3 => {
+                    self.note(&detail);
+                    if self.pause(delay) {
+                        return Err(CallErr::Transport("interrupted".into()));
+                    }
+                    delay = (delay * 2).min(Duration::from_secs(2));
+                }
+                other => return other,
+            }
+        }
+        Err(CallErr::Status(429, "rate limited".into()))
+    }
+
+    /// Sessions this daemon already tagged, after a create that may have
+    /// landed despite a timeout.
+    fn find_owned(&self, org: &str) -> Result<Option<String>> {
+        let Some(tag) = configured(&self.env, "CADENCE_DAEMON_ID", "CADENCE_DAEMON_ID") else {
+            return Ok(None);
+        };
+        let tag = format!("cadence:{tag}");
+        let path = format!(
+            "/v3/organizations/{}/sessions?filter_tag={}",
+            encode(org),
+            encode(&tag)
+        );
+        match self.call("GET", &path, None) {
+            Ok(body) => {
+                let sessions = body
+                    .get("sessions")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                for item in sessions {
+                    let id = item.get("session_id").and_then(Value::as_str).unwrap_or("");
+                    let tagged = item
+                        .get("tags")
+                        .and_then(Value::as_array)
+                        .map(|tags| tags.iter().any(|t| t.as_str() == Some(tag.as_str())))
+                        .unwrap_or(false);
+                    if tagged && id.starts_with("devin-") {
+                        return Ok(Some(id.to_string()));
+                    }
+                }
+                Ok(None)
+            }
+            Err(err) => {
+                let msg = call_text(&err);
+                self.note(&msg);
+                Err(Error::unknown(format!(
+                    "devin cloud create timed out and the owner-tag lookup failed: {msg}"
                 )))
             }
         }
@@ -357,10 +487,8 @@ impl DevinCloudAdapter {
         if let Some(n) = body.get("max_acu_limit").and_then(Value::as_f64) {
             st.limit = Some(n);
         }
-        let text = transcript(body);
-        if !text.is_empty() {
-            st.text = text;
-        }
+        st.seen = assistant_count(body);
+        st.turn_text = transcript_after(body, st.message_mark);
     }
 
     fn post_message(&self, text: &str) -> Result<()> {
@@ -375,7 +503,12 @@ impl DevinCloudAdapter {
         let path = self.org_path(&org, &format!("/{}/messages", encode(&id)));
         let body = json!({"message": text});
         match self.call("POST", &path, Some(&body)) {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                let mut st = self.session.lock().unwrap();
+                st.message_mark = st.seen;
+                st.turn_text.clear();
+                Ok(())
+            }
             Err(CallErr::Status(429, detail)) | Err(CallErr::Transport(detail)) => {
                 self.note(&detail);
                 Err(Error::unknown(format!(
@@ -404,8 +537,10 @@ impl DevinCloudAdapter {
         let path = self.org_path(&org, &format!("/{}", encode(&id)));
         match self.call("GET", &path, None) {
             Ok(body) => {
+                let mark = self.session.lock().unwrap().message_mark;
+                let fresh = assistant_count(&body) > mark;
                 self.remember(&body, None, None);
-                let phase = phase_of(&body);
+                let phase = phase_of(&body, fresh);
                 if !matches!(phase, Phase::Wait) {
                     self.session.lock().unwrap().wait_sent = false;
                 }
@@ -420,6 +555,7 @@ impl DevinCloudAdapter {
                 }
                 let msg = call_text(&err);
                 self.note(&msg);
+                *self.hold_detail.lock().unwrap() = msg.clone();
                 let held = self.last_state();
                 match err {
                     CallErr::Status(429, _) | CallErr::Transport(_) => Err(Error::unknown(
@@ -608,30 +744,38 @@ impl ProviderAdapter for DevinCloudAdapter {
         }
         on_started(client_message_id);
         let deadline = Instant::now() + self.budget;
+        let mut backoff = self.interval;
         loop {
             if self.released() {
                 return Ok(self.interrupted(client_message_id));
             }
             if Instant::now() >= deadline {
+                let detail = self.hold_detail.lock().unwrap().clone();
+                let detail = if detail.is_empty() {
+                    "poll budget exhausted".to_string()
+                } else {
+                    detail
+                };
                 return Err(Error::unknown(format!(
-                    "devin cloud poll held last state ({}): poll budget exhausted",
+                    "devin cloud poll held last state ({}): {detail}",
                     self.last_state()
                 )));
             }
             match self.poll_once() {
-                Ok(Phase::Running) | Ok(Phase::Wait) => {}
+                Ok(Phase::Running) | Ok(Phase::Wait) => {
+                    backoff = self.interval;
+                }
                 Ok(Phase::Done) => {
-                    let text = self.session.lock().unwrap().text.clone();
                     return Ok(TurnResult {
                         turn_id: client_message_id.to_string(),
                         status: "completed".into(),
-                        text,
+                        text: self.turn_text(),
                         stop_reason: Some("finished".into()),
                         error: None,
                     });
                 }
                 Ok(Phase::Failed) => {
-                    let text = self.session.lock().unwrap().text.clone();
+                    let text = self.turn_text();
                     return Ok(TurnResult {
                         turn_id: client_message_id.to_string(),
                         status: "failed".into(),
@@ -642,11 +786,46 @@ impl ProviderAdapter for DevinCloudAdapter {
                 }
                 Ok(Phase::Interrupted) => return Ok(self.interrupted(client_message_id)),
                 Err(Error::Provider(msg)) => return Ok(self.failed_turn(client_message_id, msg)),
+                Err(Error::OutcomeUnknown(_)) => {
+                    let delay = backoff;
+                    backoff = (backoff * 2).min(Duration::from_secs(5));
+                    if self.pause(delay) {
+                        return Ok(self.interrupted(client_message_id));
+                    }
+                    continue;
+                }
                 Err(err) => return Err(err),
             }
             if self.wait_interval() {
                 return Ok(self.interrupted(client_message_id));
             }
+        }
+    }
+
+    fn poll_settled(&self) -> Result<Option<TurnResult>> {
+        if self.released() {
+            return Ok(Some(self.interrupted("cloud-recover")));
+        }
+        match self.poll_once() {
+            Ok(Phase::Done) => Ok(Some(TurnResult {
+                turn_id: "cloud-recover".into(),
+                status: "completed".into(),
+                text: self.turn_text(),
+                stop_reason: Some("finished".into()),
+                error: None,
+            })),
+            Ok(Phase::Failed) => Ok(Some(TurnResult {
+                turn_id: "cloud-recover".into(),
+                status: "failed".into(),
+                text: self.turn_text(),
+                stop_reason: Some("error".into()),
+                error: Some(self.last_state()),
+            })),
+            Ok(Phase::Interrupted) => Ok(Some(self.interrupted("cloud-recover"))),
+            Ok(Phase::Running) | Ok(Phase::Wait) => Ok(None),
+            Err(Error::OutcomeUnknown(_)) => Ok(None),
+            Err(Error::Provider(msg)) => Ok(Some(self.failed_turn("cloud-recover", msg))),
+            Err(err) => Err(err),
         }
     }
 
@@ -687,9 +866,7 @@ impl ProviderAdapter for DevinCloudAdapter {
 
     fn quota_snapshot(&self) -> Option<Value> {
         let st = self.session.lock().unwrap();
-        if st.id.is_none() {
-            return None;
-        }
+        st.id.as_ref()?;
         let mut data = Map::new();
         if !st.org.is_empty() {
             data.insert("accountId".into(), json!(st.org));
@@ -764,11 +941,13 @@ fn bounded(text: &str) -> String {
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
-    if flat.len() > 180 {
-        format!("{}…", &flat[..180])
-    } else {
-        flat
+    const LIMIT: usize = 180;
+    if flat.chars().count() <= LIMIT {
+        return flat;
     }
+    let mut out: String = flat.chars().take(LIMIT).collect();
+    out.push('…');
+    out
 }
 
 fn call_text(err: &CallErr) -> String {
@@ -953,7 +1132,7 @@ fn session_url(body: &Value, id: &str) -> String {
         .unwrap_or_else(|| format!("https://app.devin.ai/sessions/{id}"))
 }
 
-fn phase_of(body: &Value) -> Phase {
+fn phase_of(body: &Value, fresh: bool) -> Phase {
     let status = body
         .get("status")
         .and_then(Value::as_str)
@@ -964,6 +1143,16 @@ fn phase_of(body: &Value) -> Phase {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_ascii_lowercase();
+    let terminal = detail == "finished"
+        || status == "finished"
+        || status == "completed"
+        || matches!(detail.as_str(), "error" | "failed" | "expired" | "blocked")
+        || matches!(status.as_str(), "error" | "failed")
+        || detail == "interrupted"
+        || status == "interrupted";
+    if terminal && !fresh {
+        return Phase::Running;
+    }
     if detail == "finished" || status == "finished" || status == "completed" {
         Phase::Done
     } else if matches!(detail.as_str(), "error" | "failed" | "expired" | "blocked")
@@ -1002,17 +1191,24 @@ fn latest_assistant(body: &Value) -> String {
         .unwrap_or_default()
 }
 
-fn transcript(body: &Value) -> String {
+fn is_assistant(message: &Value) -> bool {
+    matches!(
+        message.get("role").and_then(Value::as_str),
+        Some("assistant") | Some("devin") | None
+    )
+}
+
+fn assistant_count(body: &Value) -> usize {
+    body.get("messages")
+        .and_then(Value::as_array)
+        .map(|messages| messages.iter().filter(|m| is_assistant(m)).count())
+        .unwrap_or(0)
+}
+
+fn transcript_after(body: &Value, mark: usize) -> String {
     let mut lines = Vec::new();
     if let Some(messages) = body.get("messages").and_then(Value::as_array) {
-        for message in messages {
-            let role = message
-                .get("role")
-                .and_then(Value::as_str)
-                .unwrap_or("assistant");
-            if !matches!(role, "assistant" | "devin") {
-                continue;
-            }
+        for message in messages.iter().filter(|m| is_assistant(m)).skip(mark) {
             if let Some(text) = message
                 .get("message")
                 .or_else(|| message.get("text"))
@@ -1090,6 +1286,10 @@ mod tests {
         AdoptOk,
         AdoptMismatch,
         Adopt404,
+        Preflight429,
+        Create429,
+        Create429Forever,
+        StaleSha,
     }
 
     struct Hit {
@@ -1138,8 +1338,34 @@ mod tests {
         .to_string()
     }
 
+    fn session_messages(id: &str, detail: &str, texts: &[&str]) -> String {
+        let messages: Vec<Value> = texts
+            .iter()
+            .map(|text| json!({"role": "assistant", "message": text}))
+            .collect();
+        json!({
+            "session_id": id,
+            "status": "running",
+            "status_detail": detail,
+            "url": format!("https://app.devin.ai/sessions/{id}"),
+            "messages": messages,
+            "acus_consumed": 1.25,
+            "max_acu_limit": 10,
+        })
+        .to_string()
+    }
+
     fn reply(script: Script, method: &str, path: &str, hits: &[Hit]) -> Option<(u16, String)> {
         if path.contains("/repositories") {
+            if matches!(script, Script::Preflight429) {
+                let checks = hits
+                    .iter()
+                    .filter(|hit| hit.path.contains("/repositories"))
+                    .count();
+                if checks <= 1 {
+                    return Some((429, json!({"error": KEY}).to_string()));
+                }
+            }
             let missing =
                 matches!(script, Script::MissingRepo) && path.contains("filter_name=missing");
             let body = if missing {
@@ -1152,6 +1378,15 @@ mod tests {
         if method == "POST" && path.ends_with("/sessions") {
             if matches!(script, Script::Create500) {
                 return Some((500, json!({"error": KEY}).to_string()));
+            }
+            if matches!(script, Script::Create429 | Script::Create429Forever) {
+                let posts = hits
+                    .iter()
+                    .filter(|hit| hit.method == "POST" && hit.path.ends_with("/sessions"))
+                    .count();
+                if matches!(script, Script::Create429Forever) || posts <= 2 {
+                    return Some((429, json!({"error": KEY}).to_string()));
+                }
             }
             return Some((200, created_body("devin-created")));
         }
@@ -1179,7 +1414,11 @@ mod tests {
                     if posts >= 2 {
                         (
                             200,
-                            session_body("devin-created", "finished", &format!("SHA: {SHA}")),
+                            session_messages(
+                                "devin-created",
+                                "finished",
+                                &["which approach?", &format!("SHA: {SHA}")],
+                            ),
                         )
                     } else {
                         (
@@ -1190,6 +1429,31 @@ mod tests {
                 }
                 Script::ErrorDetail => (200, session_body("devin-created", "error", "boom")),
                 Script::Interrupted => (200, session_body("devin-created", "interrupted", "")),
+                Script::StaleSha => {
+                    let posts = hits
+                        .iter()
+                        .filter(|hit| hit.method == "POST" && hit.path.contains("/messages"))
+                        .count();
+                    let gets = hits
+                        .iter()
+                        .filter(|hit| hit.method == "GET" && hit.path.contains("/sessions/"))
+                        .count();
+                    if posts >= 2 && gets >= 3 {
+                        (
+                            200,
+                            session_messages(
+                                "devin-created",
+                                "finished",
+                                &[&format!("SHA: {SHA}"), "revision two has no trailer"],
+                            ),
+                        )
+                    } else {
+                        (
+                            200,
+                            session_body("devin-created", "finished", &format!("SHA: {SHA}")),
+                        )
+                    }
+                }
                 _ => (
                     200,
                     session_body("devin-created", "finished", &format!("SHA: {SHA}")),
@@ -1256,7 +1520,7 @@ mod tests {
         env.set("CADENCE_DAEMON_ID", "daemon-1");
         env.set("CADENCE_DEVIN_API_BASE", base);
         env.set("CADENCE_DEVIN_POLL_INTERVAL_MS", "40");
-        env.set("CADENCE_DEVIN_POLL_BUDGET_MS", "4000");
+        env.set("CADENCE_DEVIN_POLL_BUDGET_MS", "400");
         env
     }
 
@@ -1300,30 +1564,30 @@ mod tests {
         }
     }
 
-    fn adapter_for(
-        script: Script,
-    ) -> (
-        DevinCloudAdapter,
-        Mock,
-        Arc<Mutex<Vec<Value>>>,
-        Arc<Mutex<Vec<ProviderRequest>>>,
-    ) {
+    struct Harness {
+        adapter: DevinCloudAdapter,
+        mock: Mock,
+        events: Arc<Mutex<Vec<Value>>>,
+        requests: Arc<Mutex<Vec<ProviderRequest>>>,
+    }
+
+    fn adapter_for(script: Script) -> Harness {
         let (base, mock) = start_mock(script);
         let events = Arc::new(Mutex::new(Vec::new()));
         let requests = Arc::new(Mutex::new(Vec::new()));
         let adapter = DevinCloudAdapter::new(hooks(&events, &requests), &env_at(&base));
-        (adapter, mock, events, requests)
+        Harness {
+            adapter,
+            mock,
+            events,
+            requests,
+        }
     }
 
     fn assert_hygiene(adapter: &DevinCloudAdapter, hits: &[Hit], events: &[Value], params: &Value) {
-        assert!(
-            adapter.argv.lock().unwrap().is_empty(),
-            "cloud must not spawn a process"
-        );
-        assert!(
-            !adapter.log.lock().unwrap().contains(KEY),
-            "provider log contained the api key"
-        );
+        let log = adapter.log.lock().unwrap().clone();
+        assert!(!log.contains(KEY), "provider log contained the api key");
+        assert!(log.len() <= LOG_LIMIT + 8, "provider log grew without a bound");
         assert!(
             !events.iter().any(|event| event.to_string().contains(KEY)),
             "event contained the api key"
@@ -1352,7 +1616,7 @@ mod tests {
 
     #[test]
     fn create_binds_identity_default_limit_and_scrubs_the_host_path() {
-        let (adapter, mock, events, _) = adapter_for(Script::Happy);
+        let Harness { adapter, mock, events, .. } = adapter_for(Script::Happy);
         let worker = agent(json!({
             "repos": ["favcrm/cadence"],
             "devin_mode": "fast",
@@ -1412,7 +1676,7 @@ mod tests {
 
     #[test]
     fn explicit_acu_limit_overrides_the_default() {
-        let (adapter, mock, _, _) = adapter_for(Script::Happy);
+        let Harness { adapter, mock, .. } = adapter_for(Script::Happy);
         let worker = agent(json!({"repos": ["favcrm/cadence"], "max_acu_limit": 4}));
         adapter.open(&worker).unwrap();
         let hits = hits_of(&mock);
@@ -1426,7 +1690,7 @@ mod tests {
 
     #[test]
     fn missing_repo_is_refused_before_create() {
-        let (adapter, mock, _, _) = adapter_for(Script::MissingRepo);
+        let Harness { adapter, mock, .. } = adapter_for(Script::MissingRepo);
         let worker = agent(json!({"repos": ["favcrm/cadence", "favcrm/missing"]}));
         let err = adapter.open(&worker).pipe_err();
         assert_eq!(err.kind(), "rejected");
@@ -1447,7 +1711,7 @@ mod tests {
 
     #[test]
     fn waiting_for_user_emits_one_request_and_respond_posts_the_answer() {
-        let (adapter, mock, _, requests) = adapter_for(Script::Wait);
+        let Harness { adapter, mock, requests, .. } = adapter_for(Script::Wait);
         let worker = agent(json!({"repos": ["favcrm/cadence"]}));
         adapter.open(&worker).unwrap();
         let turn = thread::scope(|scope| {
@@ -1479,7 +1743,7 @@ mod tests {
 
     #[test]
     fn error_detail_fails_the_turn_without_killing_the_session() {
-        let (adapter, mock, _, _) = adapter_for(Script::ErrorDetail);
+        let Harness { adapter, mock, .. } = adapter_for(Script::ErrorDetail);
         adapter
             .open(&agent(json!({"repos": ["favcrm/cadence"]})))
             .unwrap();
@@ -1492,7 +1756,7 @@ mod tests {
 
     #[test]
     fn interrupted_detail_returns_an_interrupted_turn() {
-        let (adapter, mock, _, _) = adapter_for(Script::Interrupted);
+        let Harness { adapter, mock, .. } = adapter_for(Script::Interrupted);
         adapter
             .open(&agent(json!({"repos": ["favcrm/cadence"]})))
             .unwrap();
@@ -1503,7 +1767,7 @@ mod tests {
 
     #[test]
     fn rate_limit_during_poll_holds_state_and_does_not_terminate() {
-        let (adapter, mock, _, _) = adapter_for(Script::RateLimit);
+        let Harness { adapter, mock, .. } = adapter_for(Script::RateLimit);
         adapter
             .open(&agent(json!({"repos": ["favcrm/cadence"]})))
             .unwrap();
@@ -1523,7 +1787,7 @@ mod tests {
 
     #[test]
     fn poll_server_error_is_held_and_scrubbed() {
-        let (adapter, mock, _, _) = adapter_for(Script::Poll500);
+        let Harness { adapter, mock, .. } = adapter_for(Script::Poll500);
         adapter
             .open(&agent(json!({"repos": ["favcrm/cadence"]})))
             .unwrap();
@@ -1539,7 +1803,7 @@ mod tests {
 
     #[test]
     fn create_server_error_is_scrubbed_and_does_not_bind_a_session() {
-        let (adapter, mock, events, _) = adapter_for(Script::Create500);
+        let Harness { adapter, mock, events, .. } = adapter_for(Script::Create500);
         let worker = agent(json!({"repos": ["favcrm/cadence"]}));
         let err = adapter.open(&worker).pipe_err();
         assert_eq!(err.kind(), "provider");
@@ -1585,7 +1849,7 @@ mod tests {
 
     #[test]
     fn adopt_gets_the_recorded_session_and_refuses_a_mismatch() {
-        let (adapter, mock, _, _) = adapter_for(Script::AdoptMismatch);
+        let Harness { adapter, mock, .. } = adapter_for(Script::AdoptMismatch);
         let err = adapter
             .open(&agent(json!({"session": "devin-want"})))
             .pipe_err();
@@ -1601,7 +1865,7 @@ mod tests {
 
     #[test]
     fn adopt_404_is_a_mismatch_not_a_new_session() {
-        let (adapter, mock, _, _) = adapter_for(Script::Adopt404);
+        let Harness { adapter, mock, .. } = adapter_for(Script::Adopt404);
         let err = adapter
             .open(&agent(json!({"session": "devin-gone"})))
             .pipe_err();
@@ -1612,7 +1876,7 @@ mod tests {
 
     #[test]
     fn adopt_match_reuses_the_session_without_creating() {
-        let (adapter, mock, _, _) = adapter_for(Script::AdoptOk);
+        let Harness { adapter, mock, .. } = adapter_for(Script::AdoptOk);
         let ident = adapter
             .open(&agent(json!({"session": "devin-keep"})))
             .unwrap();
@@ -1631,7 +1895,7 @@ mod tests {
 
     #[test]
     fn open_adopted_refuses_a_generation_mismatch_without_http() {
-        let (adapter, mock, _, _) = adapter_for(Script::AdoptOk);
+        let Harness { adapter, mock, .. } = adapter_for(Script::AdoptOk);
         let err = adapter
             .open_adopted(
                 &agent(json!({})),
@@ -1651,7 +1915,7 @@ mod tests {
 
     #[test]
     fn open_adopted_binds_the_recorded_session() {
-        let (adapter, mock, _, _) = adapter_for(Script::AdoptOk);
+        let Harness { adapter, mock, .. } = adapter_for(Script::AdoptOk);
         let ident = adapter
             .open_adopted(
                 &agent(json!({})),
@@ -1671,7 +1935,7 @@ mod tests {
 
     #[test]
     fn interrupt_deletes_close_archives_and_detach_is_silent() {
-        let (adapter, mock, _, _) = adapter_for(Script::Happy);
+        let Harness { adapter, mock, .. } = adapter_for(Script::Happy);
         adapter
             .open(&agent(json!({"repos": ["favcrm/cadence"]})))
             .unwrap();
@@ -1696,7 +1960,7 @@ mod tests {
 
     #[test]
     fn interrupt_terminates_the_remote_session() {
-        let (adapter, mock, _, _) = adapter_for(Script::Happy);
+        let Harness { adapter, mock, .. } = adapter_for(Script::Happy);
         adapter
             .open(&agent(json!({"repos": ["favcrm/cadence"]})))
             .unwrap();
@@ -1816,6 +2080,160 @@ mod tests {
         assert!(recorded
             .iter()
             .all(|hit| hit.auth == format!("Bearer {KEY}")));
+        drop(recorded);
+        stop.store(true, Ordering::SeqCst);
+        let _ = thread.join();
+    }
+
+    #[test]
+    fn bounded_cuts_on_a_char_boundary() {
+        let text = format!("{}你tail", "a".repeat(179));
+        let out = bounded(&text);
+        assert!(out.contains('你'), "{out}");
+        assert!(out.ends_with('…'), "{out}");
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+        assert!(out.chars().count() <= 181, "{}", out.chars().count());
+    }
+
+    #[test]
+    fn log_note_is_scrubbed_and_bounded() {
+        let Harness { adapter, mock: _mock, .. } = adapter_for(Script::Happy);
+        for _ in 0..400 {
+            adapter.note(&format!("provider said {KEY}"));
+        }
+        let log = adapter.log.lock().unwrap().clone();
+        assert!(log.contains("[redacted]"), "{log}");
+        assert!(!log.contains(KEY), "{log}");
+        assert!(log.len() <= LOG_LIMIT + 8, "{}", log.len());
+    }
+
+    #[test]
+    fn later_turn_does_not_bind_an_earlier_sha() {
+        let Harness { adapter, mock: _mock, .. } = adapter_for(Script::StaleSha);
+        adapter
+            .open(&agent(json!({"repos": ["favcrm/cadence"]})))
+            .unwrap();
+        let first = adapter.run_turn("revision one", "turn-1", &|_| {}).unwrap();
+        assert!(first.text.contains(SHA), "{}", first.text);
+        let second = adapter.run_turn("revision two", "turn-2", &|_| {}).unwrap();
+        assert!(
+            !second.text.contains(SHA),
+            "revision 2 bound revision 1's SHA: {}",
+            second.text
+        );
+        assert!(second.text.contains("revision two has no trailer"), "{}", second.text);
+    }
+
+    #[test]
+    fn preflight_429_retries_and_does_not_reject() {
+        let Harness { adapter, mock, .. } = adapter_for(Script::Preflight429);
+        let ident = adapter
+            .open(&agent(json!({"repos": ["favcrm/cadence"]})))
+            .unwrap();
+        assert_eq!(ident.session_id, "devin-created");
+        let checks = mock
+            .hits
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|hit| hit.path.contains("/repositories"))
+            .count();
+        assert!(checks >= 2, "expected a retried preflight, saw {checks}");
+    }
+
+    #[test]
+    fn create_429_is_not_unknown() {
+        let Harness { adapter, mock: _mock, .. } = adapter_for(Script::Create429);
+        let ident = adapter
+            .open(&agent(json!({"repos": ["favcrm/cadence"]})))
+            .unwrap();
+        assert_eq!(ident.session_id, "devin-created");
+        let Harness { adapter, mock: _mock, .. } = adapter_for(Script::Create429Forever);
+        let err = adapter
+            .open(&agent(json!({"repos": ["favcrm/cadence"]})))
+            .pipe_err();
+        assert_ne!(err.kind(), "unknown", "{err}");
+        let text = err.to_string();
+        assert!(text.contains("nothing created"), "{text}");
+        assert!(!text.contains(KEY), "{text}");
+    }
+
+    #[test]
+    fn create_timeout_adopts_the_owned_tag() {
+        let hits = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits_t = Arc::clone(&hits);
+        let stop_t = Arc::clone(&stop);
+        let thread = thread::spawn(move || {
+            while !stop_t.load(Ordering::SeqCst) {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let Ok((method, path, auth, body)) = read_http(&mut stream) else {
+                    continue;
+                };
+                let posts = {
+                    let mut guard = hits_t.lock().unwrap();
+                    guard.push(Hit {
+                        method: method.clone(),
+                        path: path.clone(),
+                        body,
+                        auth,
+                    });
+                    guard
+                        .iter()
+                        .filter(|hit| hit.method == "POST" && hit.path.ends_with("/sessions"))
+                        .count()
+                };
+                if method == "POST" && path.ends_with("/sessions") && posts == 1 {
+                    let _ = stream.shutdown(Shutdown::Both);
+                    continue;
+                }
+                let payload = if path.contains("/repositories") {
+                    json!({"repositories": [{"name": "cadence", "owner": "favcrm"}]}).to_string()
+                } else if path.contains("filter_tag=") {
+                    json!({"sessions": [{
+                        "session_id": "devin-recovered",
+                        "tags": ["cadence:daemon-1"]
+                    }]})
+                    .to_string()
+                } else if path.contains("/sessions/devin-recovered") {
+                    session_body("devin-recovered", "working", "")
+                } else {
+                    created_body("devin-created")
+                };
+                let _ = write_http(&mut stream, 200, "OK", &payload);
+            }
+        });
+        let adapter = DevinCloudAdapter::new(
+            hooks(
+                &Arc::new(Mutex::new(Vec::new())),
+                &Arc::new(Mutex::new(Vec::new())),
+            ),
+            &env_at(&format!("http://{addr}")),
+        );
+        let ident = adapter
+            .open(&agent(json!({"repos": ["favcrm/cadence"]})))
+            .unwrap();
+        assert_eq!(ident.session_id, "devin-recovered");
+        let recorded = hits.lock().unwrap();
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|hit| hit.method == "POST" && hit.path.ends_with("/sessions"))
+                .count(),
+            1,
+            "a timed-out create must not start a second session"
+        );
         drop(recorded);
         stop.store(true, Ordering::SeqCst);
         let _ = thread.join();

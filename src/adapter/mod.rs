@@ -7,6 +7,27 @@
 
 pub mod claude;
 pub mod cloud;
+
+/// Environment names a spawned worker must not inherit. Devin cloud
+/// credentials stay on the daemon.
+pub const CLOUD_SECRET_ENV: &[&str] = &[
+    "DEVIN_API_KEY",
+    "DEVIN_ORG_ID",
+    "CADENCE_DEVIN_API_KEY",
+    "CADENCE_DEVIN_ORG_ID",
+    "CADENCE_DEVIN_API_BASE",
+    "CADENCE_DEVIN_POLL_INTERVAL_MS",
+    "CADENCE_DEVIN_POLL_BUDGET_MS",
+];
+
+/// `env -u` arguments that drop [`CLOUD_SECRET_ENV`] before a pane command.
+pub fn cloud_secret_env_prefix() -> String {
+    CLOUD_SECRET_ENV
+        .iter()
+        .map(|name| format!("-u {name}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 pub mod codex;
 pub mod fake;
 pub mod link;
@@ -180,6 +201,12 @@ pub trait ProviderAdapter: Send + Sync {
         client_message_id: &str,
         on_started: &dyn Fn(&str),
     ) -> Result<TurnResult>;
+    /// One poll after a held cloud turn. `Ok(None)` means the session is
+    /// still working or the poll failed transiently. The default is no
+    /// recovery.
+    fn poll_settled(&self) -> Result<Option<TurnResult>> {
+        Ok(None)
+    }
     /// Answer a pending provider request (approval/user input).
     fn respond(&self, request_id: &Value, result: Value) -> Result<()>;
     /// Best-effort cancellation of an active turn.
@@ -375,5 +402,55 @@ pub fn build(
             "Endpoint kind '{other}' is not implemented \
              (implemented: managed, managed-ws, pty, cloud, fake)"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::process::Command;
+
+    use super::*;
+
+    fn assert_child_lacks_secrets(command: &mut Command) {
+        let output = command.output().expect("spawn env");
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !text.contains("cog_test_secret_value"),
+            "spawned env contained a devin cloud secret:\n{text}"
+        );
+        for name in CLOUD_SECRET_ENV {
+            assert!(
+                !text.lines().any(|line| line.starts_with(&format!("{name}="))),
+                "{name} leaked into a spawned worker:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn spawned_worker_env_drops_devin_cloud_secrets() {
+        let mut pane = Command::new("env");
+        for name in CLOUD_SECRET_ENV {
+            pane.env(name, "cog_test_secret_value");
+        }
+        pane.args(cloud_secret_env_prefix().split_whitespace());
+        assert_child_lacks_secrets(&mut pane);
+
+        let claude = claude::claude_env_scrub();
+        let mut managed = Command::new("env");
+        for name in CLOUD_SECRET_ENV {
+            assert!(claude.removes_name(name), "claude scrub missed {name}");
+            managed.env(name, "cog_test_secret_value");
+            managed.env_remove(name);
+        }
+        assert_child_lacks_secrets(&mut managed);
+
+        let codex = codex::scrub_names();
+        let mut app = Command::new("env");
+        for name in CLOUD_SECRET_ENV {
+            assert!(codex.contains(name), "codex scrub missed {name}");
+            app.env(name, "cog_test_secret_value");
+            app.env_remove(name);
+        }
+        assert_child_lacks_secrets(&mut app);
     }
 }
