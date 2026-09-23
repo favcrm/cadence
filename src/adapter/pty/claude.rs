@@ -12,11 +12,13 @@
 //! closed.
 //!
 //! One Claude-specific rendering fact shapes the analyzer: an idle
-//! input box shows a dim "ghost" suggestion (`❯  ls -l …`) that a
-//! plain-text capture cannot tell from a staged draft. The suggestion
-//! never moves the cursor — real input does — so `input_nonempty`
-//! consults the pane cursor position the adapter passes to
-//! [`TuiProfile::analyze`].
+//! input box shows dim (`ESC[2m`) "ghost" text — a prompt suggestion
+//! or a `Try "…"` placeholder — that a plain-text capture cannot tell
+//! from a staged draft. The adapter probes with a styled capture
+//! (`capture-pane -e`), so [`analyze_claude_styled`] reads the input
+//! line's undimmed text as the draft and ignores the dim cells (CAD-294).
+//! A plain capture ([`analyze_claude`]) falls back to the cursor: the
+//! suggestion never moves it off the prompt start, typed input does.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -298,6 +300,24 @@ fn menu_subject(screen: &str) -> Option<String> {
 /// a young session on a tall pane has blank rows below the real
 /// content.
 pub fn analyze_claude(screen: &str, cursor: Option<(u32, u32)>) -> Probe {
+    analyze_frame(screen, None, cursor)
+}
+
+/// [`analyze_claude`] over a styled capture (`capture-pane -e`) — what
+/// the adapter probes with. The attributes settle the input line: its
+/// SGR-dim cells are a prompt suggestion or placeholder, never input,
+/// and any undimmed text after the `❯` is a draft — typed text after a
+/// suggestion, a partially dim line, or a draft whose cursor was moved
+/// back to the start (where the plain-text cursor heuristic misreads
+/// it as ghost). The cursor is not consulted.
+pub fn analyze_claude_styled(styled: &str, cursor: Option<(u32, u32)>) -> Probe {
+    let frame = super::sgr::parse(styled);
+    analyze_frame(&frame.plain, Some(&frame.undimmed), cursor)
+}
+
+/// The shared reduction: `screen` is plain text; `undimmed` is the same
+/// frame minus its dim cells when the capture carried attributes.
+fn analyze_frame(screen: &str, undimmed: Option<&str>, cursor: Option<(u32, u32)>) -> Probe {
     let content = screen.trim_end();
     let tail: String = content
         .lines()
@@ -381,23 +401,25 @@ pub fn analyze_claude(screen: &str, cursor: Option<(u32, u32)>) -> Probe {
         }
     }
     let prompt_visible = prompt.is_some();
-    let draft = prompt
-        .map(|(_, l)| {
-            l.trim_start()
-                .trim_start_matches(claude_screen::PROMPT)
-                .trim()
-                .to_string()
-        })
-        .unwrap_or_default();
-    // Ghost suggestion: dim text in an empty box never moves the
-    // cursor off the prompt start — a real draft always does. Unknown
-    // cursor counts as a real draft (conservative).
-    let ghost = !draft.is_empty()
-        && match (cursor, prompt) {
-            (Some((x, y)), Some((row, _))) => y as usize == row && x <= 2,
-            _ => false,
-        };
-    let input_nonempty = !draft.is_empty() && !ghost;
+    let draft_of = |l: &str| {
+        l.trim_start()
+            .trim_start_matches(claude_screen::PROMPT)
+            .trim()
+            .to_string()
+    };
+    let input_nonempty = match (prompt, undimmed) {
+        // Attributes known: only undimmed text on the input row is a
+        // draft (row `i` of `undimmed` is row `i` of `screen`).
+        (Some((row, _)), Some(u)) => u.lines().nth(row).is_some_and(|l| !draft_of(l).is_empty()),
+        // Plain capture: dim ghost text in an empty box never moves the
+        // cursor off the prompt start — a typed draft normally does.
+        // Unknown cursor counts as a real draft (conservative).
+        (Some((row, l)), None) => {
+            let ghost = cursor.is_some_and(|(x, y)| y as usize == row && x <= 2);
+            !draft_of(l).is_empty() && !ghost
+        }
+        (None, _) => false,
+    };
     let (idle, reason) = if approval_menu {
         (
             false,
@@ -733,6 +755,10 @@ impl TuiProfile for ClaudeProfile {
         analyze_claude(screen, cursor)
     }
 
+    fn analyze_styled(&self, styled: &str, cursor: Option<(u32, u32)>) -> Probe {
+        analyze_claude_styled(styled, cursor)
+    }
+
     fn respond_rejection(&self) -> &'static str {
         "pty endpoints have no approval channel — answer Claude \
          permission prompts in the terminal itself"
@@ -851,7 +877,9 @@ impl TuiProfile for ClaudeProfile {
 
 #[cfg(test)]
 mod tests {
-    use super::{analyze_claude, proc_start_ticks, ClaudeProfile, STATUS_LINES};
+    use super::{
+        analyze_claude, analyze_claude_styled, proc_start_ticks, ClaudeProfile, STATUS_LINES,
+    };
     use crate::adapter::pty::profile::TuiProfile;
     use std::path::PathBuf;
 
@@ -919,6 +947,77 @@ mod tests {
         // A cursor sitting past the prompt start means real input.
         let typed = analyze_claude(&screen, Some((9, row)));
         assert!(!typed.idle && typed.input_nonempty);
+    }
+
+    /// Live `capture-pane -e` frames (Claude Code 2.1.280, CAD-294):
+    /// `suggestion.ansi` is a cadence lane's idle box showing a dim
+    /// prompt suggestion, `placeholder.ansi` a fresh session's dim
+    /// `Try "…"` placeholder (dim words, undimmed spaces between),
+    /// `typed.ansi` a typed draft, and `typed-home.ansi` the same draft
+    /// after Home — its cursor back at the prompt start.
+    #[test]
+    fn styled_dim_suggestion_probes_idle() {
+        for (name, row) in [("suggestion.ansi", 32), ("placeholder.ansi", 10)] {
+            let styled = fixture(name);
+            // The attributes decide — the verdict holds with the cursor
+            // at the prompt start, unknown, or anywhere else.
+            for cursor in [Some((2, row)), None, Some((40, row + 3))] {
+                let p = analyze_claude_styled(&styled, cursor);
+                assert!(p.idle, "{name} {cursor:?}: {p:?}");
+                assert!(
+                    p.prompt_visible && !p.input_nonempty,
+                    "{name} {cursor:?}: {p:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn styled_typed_draft_is_not_idle() {
+        for (name, cursor) in [("typed.ansi", (26, 10)), ("typed-home.ansi", (2, 10))] {
+            let p = analyze_claude_styled(&fixture(name), Some(cursor));
+            assert!(!p.idle && p.input_nonempty, "{name}: {p:?}");
+            assert_eq!(p.reason, "unsubmitted text in the input line", "{name}");
+        }
+    }
+
+    /// The live suggestion frame with its input row replaced by `line`.
+    fn suggestion_with_input(line: &str) -> String {
+        let frame = fixture("suggestion.ansi");
+        let mut rows: Vec<&str> = frame.lines().collect();
+        let row = rows.iter().rposition(|l| l.contains('❯')).unwrap();
+        rows[row] = line;
+        rows.join("\n")
+    }
+
+    #[test]
+    fn styled_input_line_edge_cases() {
+        let draft = [
+            // Typed text after a dim suggestion is still a draft.
+            "\x1b[39m❯\u{a0}\x1b[2mghost\x1b[0m typed",
+            // A partially dim line: typed text with a dim completion.
+            "\x1b[39m❯\u{a0}fix the \x1b[2mbug in foo\x1b[0m",
+            // Normal intensity (22) ends the dim run.
+            "\x1b[39m❯\u{a0}\x1b[2mghost\x1b[22mtyped",
+            // 256-colour / RGB arguments of 2 are colours, not dim.
+            "\x1b[39m❯\u{a0}\x1b[38;5;2mtyped\x1b[39m",
+            "\x1b[39m❯\u{a0}\x1b[38;2;2;2;2mtyped\x1b[39m",
+        ];
+        for line in draft {
+            let p = analyze_claude_styled(&suggestion_with_input(line), Some((2, 32)));
+            assert!(!p.idle && p.input_nonempty, "{line:?}: {p:?}");
+        }
+        let ghost = [
+            // Dim combined with a colour, in either order.
+            "\x1b[39m❯\u{a0}\x1b[2;38;5;246mghost\x1b[0m",
+            "\x1b[39m❯\u{a0}\x1b[38;5;246;2mghost\x1b[0m",
+            // Bold on top of dim is still dim.
+            "\x1b[39m❯\u{a0}\x1b[2m\x1b[1mghost\x1b[0m",
+        ];
+        for line in ghost {
+            let p = analyze_claude_styled(&suggestion_with_input(line), None);
+            assert!(p.idle && !p.input_nonempty, "{line:?}: {p:?}");
+        }
     }
 
     #[test]

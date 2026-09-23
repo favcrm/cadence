@@ -86,6 +86,15 @@ pub trait TuiProfile: Send + Sync {
     /// visible draft text as real (conservative).
     fn analyze(&self, screen: &str, cursor: Option<(u32, u32)>) -> Probe;
 
+    /// [`Self::analyze`] over a styled capture (`capture-pane -e`: SGR
+    /// attributes kept) — what the adapter actually probes with. The
+    /// default strips the attributes and analyzes the plain text; a
+    /// profile whose input line carries meaning in its attributes (the
+    /// Claude TUI's dim prompt suggestion) overrides it.
+    fn analyze_styled(&self, styled: &str, cursor: Option<(u32, u32)>) -> Probe {
+        self.analyze(&super::sgr::strip(styled), cursor)
+    }
+
     /// `agent respond` rejection text — approvals are answered in the
     /// terminal itself; the message names the provider's prompt.
     fn respond_rejection(&self) -> &'static str;
