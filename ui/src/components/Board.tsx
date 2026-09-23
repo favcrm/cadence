@@ -1,11 +1,14 @@
 import { useState } from "react";
 import { api, type WriteResp } from "../api";
+import { boardHeadline, boardScope, boardVisible, issueCounts } from "../counts";
 import { epicProgress, matches, type BoardFilters } from "../filters";
-import { agentIsUnassigned, agentMatchesProject, issueProjectMap } from "../scope";
+import type { ResourceState } from "../resource";
+import { agentIsUnassigned, agentMatchesProject, issueIndex } from "../scope";
 import type { AgentsPayload, Health, IssueCard, Project } from "../types";
 import type { ProjectView } from "../urlState";
 import Card, { noDragReason } from "./Card";
 import FilterBar from "./FilterBar";
+import { ResourceGate, StaleChip } from "./ResourceStatus";
 
 const COLS: [string, string, number?][] = [
   ["backlog", "Backlog"],
@@ -140,7 +143,8 @@ function IssueList({ issues, project, onOpen }: { issues: IssueCard[]; project: 
 }
 
 interface Props {
-  issues: IssueCard[];
+  issues: ResourceState<IssueCard[]>;
+  onRetry: () => void;
   projects: Project[];
   agents: AgentsPayload | null;
   health: Health | null;
@@ -263,7 +267,8 @@ function QuickAdd({
 }
 
 export default function Board({
-  issues,
+  issues: issuesState,
+  onRetry,
   projects,
   agents,
   health,
@@ -283,31 +288,26 @@ export default function Board({
   onAgents,
 }: Props) {
   const [over, setOver] = useState<string | null>(null);
+  const issues = issuesState.data ?? [];
+  const loaded = issuesState.data !== null;
   // `scope` is what the project and the search box leave; the filter
-  // bar counts over it and its chips narrow it to `visible`.
-  const scope = issues.filter(
-    (t) =>
-      !t.container &&
-      t.status !== "dropped" &&
-      (project === "all" || t.project === project) &&
-      (!query ||
-        (t.id + t.title + (t.owner ?? "") + (t.tags ?? []).join(" "))
-          .toLowerCase()
-          .includes(query.toLowerCase())),
-  );
-  // Finished work stays out of the default view; typing a search looks
-  // through it anyway since a query means "find this", not "browse".
-  const visible = scope.filter(
-    (t) =>
-      matches(filters, t) &&
-      (filters.showDone || t.status !== "done" || query !== ""),
-  );
+  // bar counts over it and its chips narrow it to `visible`. Both come
+  // from counts.ts, the same source as the sidebar and overview numbers.
+  const scope = boardScope(issues, project, query);
+  const visible = boardVisible(scope, filters, query);
+  const counts = issueCounts(issues, project);
   const title =
     project === "all"
       ? "All projects"
       : projects.find((p) => p.key === project)?.key ?? project;
 
-  const issueProjects = issueProjectMap(issues);
+  const issueProjects = issueIndex(issues);
+  // Card agent chips read the agents resource's `by_issue` — the same
+  // strip `/api/issues` embeds — so an agent event refreshes them
+  // without refetching every card.
+  const byIssue = agents?.by_issue;
+  const withAgents = (t: IssueCard): IssueCard =>
+    byIssue ? { ...t, agents: byIssue[t.id] ?? [] } : t;
   const scopedAgents = (agents?.agents ?? []).filter((agent) =>
     agentMatchesProject(agent, project, issueProjects),
   );
@@ -442,7 +442,7 @@ export default function Board({
                 cards.map((t) => (
                   <Card
                     key={t.id}
-                    issue={t}
+                    issue={withAgents(t)}
                     parentTitle={
                       t.parent ? titleOf.get(t.parent) : undefined
                     }
@@ -504,9 +504,12 @@ export default function Board({
         <h1 className="text-section font-semibold text-ink-100 leading-tight">
           {title}
         </h1>
-        <span className="kicker">
-          {visible.length} issues · {visible.filter((t) => ["doing", "review"].includes(t.status)).length} active · {visible.filter((t) => t.blocked).length} blocked
+        <span className="kicker" title="epics are excluded — their status rolls up from the issues counted">
+          {loaded
+            ? `${boardHeadline(counts, visible, filters, query)} · ${visible.filter((t) => ["doing", "review"].includes(t.status)).length} active · ${visible.filter((t) => t.blocked).length} blocked`
+            : "…"}
         </span>
+        <StaleChip state={issuesState} />
         <div className="ml-auto flex items-center gap-1 rounded border border-ink-700 p-0.5" role="group" aria-label="Project view">
           {(["kanban", "list"] as const).map((mode) => (
             <button
@@ -651,14 +654,28 @@ export default function Board({
         </div>
       </section>
 
-      <FilterBar
-        scope={scope}
-        issues={issues}
-        filters={filters}
-        onChange={onFilters}
+      <ResourceGate
+        state={issuesState}
+        loading="loading issues — reading the tracker can take several seconds"
+        failed="could not load issues"
+        onRetry={onRetry}
       />
+      {issuesState.status === "empty" && (
+        <p className="kicker mb-4" role="status">
+          the tracker has no issues yet{readOnly ? "" : " — + new issue in Backlog creates one"}
+        </p>
+      )}
 
-      {view === "list" ? (
+      {loaded && (
+        <FilterBar
+          scope={scope}
+          issues={issues}
+          filters={filters}
+          onChange={onFilters}
+        />
+      )}
+
+      {!loaded ? null : view === "list" ? (
         <IssueList issues={visible} project={project} onOpen={onOpen} />
       ) : !filters.groupByEpic ? (
         columns(visible, "", true)

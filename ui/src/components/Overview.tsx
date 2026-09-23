@@ -1,4 +1,7 @@
+import { exclusionLabel, issueCounts, statusBreakdown } from "../counts";
+import type { ResourceState } from "../resource";
 import type {
+  IssueCard,
   MainCi,
   MonitorAlert,
   Monitoring,
@@ -7,6 +10,7 @@ import type {
   ProjectContext,
 } from "../types";
 import { needGroupKey, needLabel, shaCiLabel } from "../uxCopy";
+import { StaleChip } from "./ResourceStatus";
 
 const KIND_CHIP: Record<string, string> = {
   merge: "bg-ok/15 text-ok",
@@ -485,9 +489,9 @@ function ProjectScope({
 }
 
 export default function OverviewView({
-  data,
-  loading,
-  stale,
+  state,
+  issues,
+  onRetry,
   project,
   projects,
   context,
@@ -496,9 +500,10 @@ export default function OverviewView({
   onAck,
   onOpenPlan,
 }: {
-  data: Overview | null;
-  loading: boolean;
-  stale: boolean;
+  state: ResourceState<Overview>;
+  /** The cards — project summary counts come from counts.ts, like the sidebar. */
+  issues: ResourceState<IssueCard[]>;
+  onRetry: () => void;
   project: string;
   projects: Project[];
   context: ProjectContext | null;
@@ -507,17 +512,31 @@ export default function OverviewView({
   onAck: (monitor: string, seq: number) => void;
   onOpenPlan: () => void;
 }) {
+  const data = state.data;
   if (!data) {
     return (
       <div className="px-4 lg:px-8 pt-4 pb-10 space-y-5 max-w-[68rem]">
-        <div className="text-label text-ink-500">
-          {/* "unavailable" only once a request actually failed with
-              nothing ever loaded; before the first answer — or while a
-              retry is in flight — this is a load, not a failure. */}
-          {stale && !loading
-            ? "overview unavailable — the board server could not build the view"
-            : "building the overview — daemon and GitHub probes can take several seconds"}
-        </div>
+        {/* "unavailable" only once a request actually failed with
+            nothing ever loaded; before the first answer — or while a
+            retry is in flight — this is a load, not a failure. */}
+        {state.status === "failed" ? (
+          <div className="text-label text-fail flex flex-wrap items-center gap-3" role="alert">
+            <span>
+              overview unavailable — the board server could not build the view
+              {state.error ? ` (${state.error})` : ""}
+            </span>
+            <button
+              onClick={onRetry}
+              className="chip bg-fail/10 text-fail hover:bg-fail/20 transition-colors"
+            >
+              retry
+            </button>
+          </div>
+        ) : (
+          <div className="text-label text-ink-500" role="status">
+            building the overview — daemon and GitHub probes can take several seconds
+          </div>
+        )}
         {project !== "all" && (
           <ProjectScope
             project={project}
@@ -549,11 +568,7 @@ export default function OverviewView({
         <span className="kicker">
           exact project ownership · unresolved work stays visible
         </span>
-        {stale && (
-          <span className="chip bg-warn/10 text-warn" title="the last refresh failed — showing the previous payload">
-            refresh failed — stale
-          </span>
-        )}
+        <StaleChip state={state} />
       </header>
       {(data.github.state === "unavailable" ||
         !data.daemon.reachable ||
@@ -664,17 +679,25 @@ export default function OverviewView({
           <div className="slabel mb-2">project summary</div>
           <div className="card divide-y divide-ink-700/60">
             {scopedProjects.map((p) => {
-              const counts = Object.entries(p.open_by_status)
-                .sort(([a], [b]) => a.localeCompare(b))
-                .map(([k, v]) => `${k}:${v}`)
-                .join("  ");
+              // The same derivation as the sidebar and board header
+              // (counts.ts over /api/issues), not the payload's
+              // `open_by_status`, so the three numbers agree.
+              const c = issues.data ? issueCounts(issues.data, p.key) : null;
+              const excluded = c ? exclusionLabel(c) : "";
               return (
                 <div key={p.key} className="px-4 py-2.5 flex items-baseline gap-3">
                   <span className="text-label font-semibold text-ink-100 w-28 shrink-0 truncate">
                     {p.key}
                   </span>
                   <span className="num text-label text-ink-400 min-w-0 flex-1">
-                    {counts || "no open issues"}
+                    {c === null
+                      ? issues.status === "failed"
+                        ? "issue counts unavailable"
+                        : "counting…"
+                      : `${c.open} open${c.open ? ` — ${statusBreakdown(c)}` : ""}`}
+                    {excluded && (
+                      <span className="text-micro text-ink-500"> · {excluded}</span>
+                    )}
                   </span>
                   {p.oldest_review_age != null && (
                     <span className="num text-micro text-warn shrink-0">
