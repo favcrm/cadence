@@ -1281,10 +1281,19 @@ panel. Memory curation is read-only in the browser: proposed entries show
 their native quorum/finalization state, while accept, reject, and supersede
 require an authenticated native agent endpoint.
 
+The SPA has real routes (CAD-326, `ui/src/lib/router.ts`): `/` Home (the
+overview), `/projects[/:slug[/context]]`, `/agents[/:alias]`, `/setup`
+and `/settings[/memory]`; the nav shows Home, Projects, Agents and
+Settings. The server answers any client route with `index.html` and a
+missing file (under `/assets/` or with an extension) with 404. Links from
+before the router (`/?tab=board&project=cadence`) redirect to their
+route. Colours are CSS variables with a light and a dark theme — system
+preference unless the header toggle stored a pick.
+
 A filter bar above the columns slices the board by tag, epic, owner and
 component — chips with counts, multi-select: tags narrow (all of them),
 the other three widen within themselves (any of them). The selection
-lives in the URL (`?project=cadence&tag=ui,api&epic=CAD-38&owner=ann&
+lives in the URL (`/projects/cadence?tag=ui,api&epic=CAD-38&owner=ann&
 component=adapter&group=epic`), so a filtered view is a link. "group by
 epic" renders one swimlane per epic with its progress bar (done ÷
 children, dropped excluded — over all children, not only the visible
