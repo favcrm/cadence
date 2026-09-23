@@ -459,3 +459,29 @@ fn a_bare_restart_of_a_sandbox_state_dir_stays_gated() {
         "refused under CADENCE_PROFILE=sandbox:bare",
     );
 }
+
+/// A rebuilt binary brings a sandbox back up: its own state dir takes
+/// no part in a rollout, so the build gate does not ask for a lease
+/// the sandbox's children could never name.
+#[test]
+fn a_sandbox_comes_back_up_after_a_rebuild() {
+    let mut host = Host::new();
+    let v = host.up_free("rb", &[]);
+    let state = PathBuf::from(v["state_dir"].as_str().unwrap());
+    let down = host.run(&["sandbox", "down", "rb"], &[]);
+    assert!(down.status.success(), "{}", text(&down));
+    // What a rebuild looks like to the gate: a different recorded build.
+    let conn = rusqlite::Connection::open(state.join("cadence.sqlite3")).unwrap();
+    let rows = conn
+        .execute(
+            "UPDATE daemon_build SET commit_sha='deadbeefdead' WHERE id=1",
+            [],
+        )
+        .unwrap();
+    assert_eq!(rows, 1);
+    drop(conn);
+    let again = host.up_free("rb", &[]);
+    assert_eq!(again["daemon"], "started", "{again}");
+    let health = client::rpc(&state, "health", json!({})).unwrap();
+    assert_eq!(health["sandbox"], "rb", "{health}");
+}

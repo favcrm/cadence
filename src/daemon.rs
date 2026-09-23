@@ -518,8 +518,11 @@ impl Shared {
         let store = Store::open_adopting(&db_path, marker)?;
         // Same-build crash restart is allowed with no lease. A different
         // build must already hold one — `daemon start` checks before
-        // spawn, and this is the backstop for a direct `daemon run`.
-        store.enforce_running_build()?;
+        // spawn, and this is the backstop for a direct `daemon run`. A
+        // sandbox's own state dir never needs it (CAD-310).
+        if !crate::rollout::sandbox_exempt(state_dir) {
+            store.enforce_running_build()?;
+        }
         // `daemon start` passes the holder on argv, not the environment.
         // Drop a parent-exported copy too, so panes do not inherit it.
         std::env::remove_var("CADENCE_ROLLOUT_AS");

@@ -476,12 +476,14 @@ fn run_child(sb: &Sandbox, exe: &Path, args: &[&str]) -> Result<Value> {
     let out = child(sb, exe, args).output()?;
     if !out.status.success() {
         return Err(Error::rejected(format!(
-            "`cadence {}` in sandbox '{}' failed: {} — see {}/*.log, then \
-             `cadence sandbox down {}`",
+            "`cadence {}` in sandbox '{}' failed: {} — see {}/*.log; \
+             `cadence sandbox down {}` stops what did start, \
+             `cadence sandbox reset {}` starts the sandbox over",
             args.join(" "),
             sb.name,
             String::from_utf8_lossy(&out.stderr).trim(),
             sb.state_dir().display(),
+            sb.name,
             sb.name
         )));
     }
