@@ -10,7 +10,11 @@ import Plan from "./components/Plan";
 import Sidebar from "./components/Sidebar";
 import Toast, { type ToastMsg } from "./components/Toast";
 import { Logo } from "./components/Logo";
+import { countLabel, issueCounts } from "./counts";
 import type { BoardFilters } from "./filters";
+import { invalidatedBy } from "./resource";
+import { resources } from "./resources";
+import { useResource } from "./useResource";
 import { requestIsCurrent, responseBelongsToRequest, visibleContext } from "./projectContextGuard";
 import {
   browserStoredProjectView,
@@ -22,13 +26,10 @@ import {
   type ProjectView,
 } from "./urlState";
 import type {
-  AgentsPayload,
   Health,
   IssueCard,
   IssueDetail,
   Meta,
-  Overview,
-  Project,
   ProjectContext,
 } from "./types";
 
@@ -50,21 +51,19 @@ export default function App() {
   const observedContextRevisions = useRef<Record<string, string>>({});
   const [query, setQuery] = useState("");
   const [filters, setFilters] = useState<BoardFilters>(initial.filters);
-  const [issues, setIssues] = useState<IssueCard[]>([]);
-  const [projects, setProjects] = useState<Project[]>([]);
-  const [agents, setAgents] = useState<AgentsPayload | null>(null);
-  const [agentsLoading, setAgentsLoading] = useState(true);
-  const [agentsError, setAgentsError] = useState<string | null>(null);
-  const agentsLoaded = useRef(false);
-  const [overview, setOverview] = useState<Overview | null>(null);
-  const [overviewLoading, setOverviewLoading] = useState(false);
-  // Set when a refresh fails over cached rows — cleared on the next success.
-  const [overviewStale, setOverviewStale] = useState(false);
+  // Per-resource state (resource.ts): loading, failed and empty stay
+  // distinct, and a failed refresh keeps the last good payload as stale.
+  const issuesState = useResource(resources.issues);
+  const projectsState = useResource(resources.projects);
+  const agentsState = useResource(resources.agents);
+  const overviewState = useResource(resources.overview);
+  const issues = issuesState.data ?? [];
+  const projects = projectsState.data ?? [];
+  const agents = agentsState.data;
   const [health, setHealth] = useState<Health | null>(null);
   const [meta, setMeta] = useState<Meta | null>(null);
   const [openId, setOpenId] = useState<string | null>(initial.openId);
   const [openDetail, setOpenDetail] = useState<IssueDetail | null>(null);
-  const [failed, setFailed] = useState<string | null>(null);
   const [toast, setToast] = useState<ToastMsg | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const toastTimer = useRef<number>(0);
@@ -142,80 +141,64 @@ export default function App() {
       });
   }, [project, tab, projectContextRefresh]);
 
-  // The overview payload costs a daemon probe + gh cache read (~seconds).
-  // Track loading so the tab can say "building" instead of flashing
-  // "unavailable"; on failure keep the last good payload on screen.
-  const loadOverview = useCallback(() => {
-    setOverviewLoading(true);
-    return api
-      .overview()
+  // The open drawer's detail. Read through a ref so the stream and poll
+  // handlers stay stable while the drawer changes.
+  const openIdRef = useRef(openId);
+  openIdRef.current = openId;
+  const loadDetail = useCallback(() => {
+    const id = openIdRef.current;
+    if (!id) return;
+    api
+      .issue(id)
       .then((next) => {
-        setOverview(next);
-        setOverviewStale(false);
+        if (openIdRef.current === id) setOpenDetail(next);
       })
-      .catch(() => setOverviewStale(true))
-      .finally(() => setOverviewLoading(false));
+      .catch(() => {});
   }, []);
+  useEffect(loadDetail, [openId, loadDetail]);
 
+  // The overview costs a daemon probe + gh cache read (~seconds), so it
+  // is fetched only while its tab is on screen — and whenever it becomes
+  // the visible tab. Requests coalesce inside the resource.
+  useEffect(() => {
+    if (tab === "overview") void resources.overview.refresh();
+  }, [tab]);
+
+  // Full re-read: first load, the refresh button, focus and the poll.
+  // Each resource joins a request already in flight instead of stacking.
   const refresh = useCallback(() => {
     api.health().then(setHealth).catch(() => setHealth(null));
     api.meta().then(setMeta).catch(() => setMeta(null));
-    api
-      .projects()
-      .then((r) => setProjects(r.projects))
-      .catch((e) => setFailed(String(e.message ?? e)));
-    api
-      .issues()
-      .then((r) => {
-        setIssues(r.issues);
-        setFailed(null);
-      })
-      .catch((e) => setFailed(String(e.message ?? e)));
-    // Keep the last good rows visible while stream/poll refreshes run. The
-    // loading state is for the first observation only; a failed refresh then
-    // becomes an explicit error over the cached rows instead of an empty UI.
-    if (!agentsLoaded.current) setAgentsLoading(true);
-    api
-      .agents()
-      .then((next) => {
-        setAgents(next);
-        agentsLoaded.current = true;
-        setAgentsError(null);
-      })
-      .catch((e) => setAgentsError(String(e.message ?? e)))
-      .finally(() => setAgentsLoading(false));
-    if (tabRef.current === "overview") {
-      loadOverview();
-    }
-    if (openId) {
-      api
-        .issue(openId)
-        .then(setOpenDetail)
-        .catch(() => {});
-    }
-  }, [openId, loadOverview]);
-
-  // And whenever it becomes the visible tab.
-  useEffect(() => {
-    if (tab === "overview") {
-      loadOverview();
-    }
-  }, [tab, loadOverview]);
+    void resources.projects.refresh();
+    void resources.issues.refresh();
+    void resources.agents.refresh();
+    if (tabRef.current === "overview") void resources.overview.refresh();
+    loadDetail();
+  }, [loadDetail]);
 
   useEffect(refresh, [refresh]);
 
-  // Live updates: /api/stream pushes `issues|agents|jobs|monitoring` event names —
-  // each one just triggers the normal refresh. EventSource reconnects
+  // Live updates: each /api/stream frame names the resources it
+  // invalidates (`{"resources":[...]}`, `event_resources` in src/ui.rs);
+  // only those refetch, coalesced per resource. EventSource reconnects
   // on its own; the 30 s poll below stays as the fallback while the
   // stream is down.
   useEffect(() => {
     const es = new EventSource("/api/stream");
-    es.addEventListener("issues", refresh);
-    es.addEventListener("agents", refresh);
-    es.addEventListener("jobs", refresh);
-    es.addEventListener("monitoring", refresh);
+    const onEvent = (e: MessageEvent<string>) => {
+      for (const name of invalidatedBy(e.data)) {
+        if (name === "issue") loadDetail();
+        else if (name === "overview") {
+          // Hidden overview: skip — it refetches when the tab opens.
+          if (tabRef.current === "overview") void resources.overview.invalidate();
+        } else void resources[name].invalidate();
+      }
+    };
+    for (const source of ["issues", "agents", "jobs", "monitoring"]) {
+      es.addEventListener(source, onEvent);
+    }
     return () => es.close();
-  }, [refresh]);
+  }, [loadDetail]);
 
   // Fallback poll — re-read on focus and every 30s while the tab is
   // visible, covering any gap while the stream reconnects.
@@ -250,7 +233,7 @@ export default function App() {
         .monitorAck(monitor, seq)
         .then(() => {
           say("ok", `${monitor} alert ${seq} acknowledged`);
-          return loadOverview();
+          return resources.overview.invalidate();
         })
         .catch((e) =>
           say(
@@ -259,14 +242,14 @@ export default function App() {
           ),
         );
     },
-    [readOnly, say, loadOverview],
+    [readOnly, say],
   );
 
   /// A write response is authoritative: merge the fresh card into the
   /// board and the fresh detail into the drawer — no second fetch.
   const applyWrite = useCallback(
     (resp: WriteResp, verb: string) => {
-      setIssues((prev) => {
+      resources.issues.mutate((prev) => {
         const i = prev.findIndex((c) => c.id === resp.card.id);
         if (i === -1) return [...prev, resp.card];
         const next = prev.slice();
@@ -290,7 +273,7 @@ export default function App() {
       // A conflict carries the fresh card — resync so the board shows
       // the state that won.
       if (err.card) {
-        setIssues((prev) => {
+        resources.issues.mutate((prev) => {
           const i = prev.findIndex((c) => c.id === err.card!.id);
           if (i === -1) return prev;
           const next = prev.slice();
@@ -314,14 +297,14 @@ export default function App() {
       if (issue.status === status) return;
       const prev = issue;
       // Optimistic: the card moves now, the write decides for real.
-      setIssues((all) =>
+      resources.issues.mutate((all) =>
         all.map((c) => (c.id === issue.id ? { ...c, status } : c)),
       );
       api
         .patch(issue.id, { status }, issue.rev)
         .then((resp) => applyWrite(resp, `${issue.id} → ${status}`))
         .catch((e) => {
-          setIssues((all) => all.map((c) => (c.id === issue.id ? prev : c)));
+          resources.issues.mutate((all) => all.map((c) => (c.id === issue.id ? prev : c)));
           writeError(e, `${issue.id} move`);
         });
     },
@@ -338,7 +321,8 @@ export default function App() {
         project={project}
         onProject={setProject}
         projects={projects}
-        total={issues.filter((i) => !i.container).length}
+        issues={issuesState}
+        projectsError={projectsState.status === "failed" ? projectsState.error : null}
       />
 
       <div className="min-w-0 flex flex-col">
@@ -449,8 +433,11 @@ export default function App() {
                 }`}
               >
                 All projects
-                <span className="num text-micro text-ink-500">
-                  {issues.filter((i) => !i.container).length}
+                <span
+                  className="num text-micro text-ink-500"
+                  title={issuesState.data ? countLabel(issueCounts(issues)) : undefined}
+                >
+                  {issuesState.data ? issueCounts(issues).open : "…"}
                 </span>
               </button>
               {projects.map((p) => (
@@ -468,8 +455,11 @@ export default function App() {
                   }`}
                 >
                   {p.key}
-                  <span className="num text-micro text-ink-500">
-                    {p.prefix} {p.issues}
+                  <span
+                    className="num text-micro text-ink-500"
+                    title={issuesState.data ? countLabel(issueCounts(issues, p.key)) : undefined}
+                  >
+                    {p.prefix} {issuesState.data ? issueCounts(issues, p.key).open : "…"}
                   </span>
                 </button>
               ))}
@@ -477,19 +467,11 @@ export default function App() {
           </nav>
         )}
 
-        {failed && (
-          <div className="px-4 lg:px-8 pt-4">
-            <div className="card border-fail/40 px-4 py-3 text-secondary text-fail">
-              api: {failed}
-            </div>
-          </div>
-        )}
-
         {tab === "overview" && (
           <OverviewView
-            data={overview}
-            loading={overviewLoading}
-            stale={overviewStale}
+            state={overviewState}
+            issues={issuesState}
+            onRetry={() => void resources.overview.refresh()}
             project={project}
             projects={projects}
             context={visibleContext(project, projectContext)}
@@ -501,7 +483,8 @@ export default function App() {
         )}
         {tab === "board" && (
           <Board
-            issues={issues}
+            issues={issuesState}
+            onRetry={() => void resources.issues.refresh()}
             projects={projects}
             agents={agents}
             health={health}
@@ -523,12 +506,11 @@ export default function App() {
         )}
         {tab === "agents" && (
           <Agents
-            payload={agents}
-            issues={issues}
+            state={agentsState}
+            issues={issuesState}
             project={project}
             onOpenIssue={openIssue}
-            loading={agentsLoading}
-            error={agentsError}
+            onRetry={() => void resources.agents.refresh()}
           />
         )}
         {tab === "plan" && (
@@ -551,7 +533,7 @@ export default function App() {
           agents={agents}
           projects={projects}
           pmDir={health?.pm_dir}
-          detail={openDetail}
+          detail={openDetail?.id === openId ? openDetail : null}
           readOnly={readOnly}
           actor={actor}
           onClose={() => setOpenId(null)}

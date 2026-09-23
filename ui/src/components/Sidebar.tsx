@@ -1,4 +1,6 @@
-import type { Project } from "../types";
+import { countLabel, issueCounts } from "../counts";
+import type { ResourceState } from "../resource";
+import type { IssueCard, Project } from "../types";
 import { Logo } from "./Logo";
 
 interface Props {
@@ -7,7 +9,10 @@ interface Props {
   project: string;
   onProject: (key: string) => void;
   projects: Project[];
-  total: number;
+  /** Counts derive from the cards (counts.ts), not `/api/projects`. */
+  issues: ResourceState<IssueCard[]>;
+  /** Set when the project list never loaded. */
+  projectsError?: string | null;
 }
 
 const boardIcon = (
@@ -56,7 +61,14 @@ const memoryIcon = (
   </svg>
 );
 
-export default function Sidebar({ tab, onTab, project, onProject, projects, total }: Props) {
+export default function Sidebar({ tab, onTab, project, onProject, projects, issues, projectsError }: Props) {
+  // "…" until the cards load; a stale list keeps its numbers.
+  const count = (key: string) => {
+    if (!issues.data) return { n: issues.status === "failed" ? "!" : "…", title: issues.error ?? "loading issues" };
+    const c = issueCounts(issues.data, key);
+    return { n: String(c.open), title: countLabel(c) };
+  };
+  const all = count("all");
   return (
     <aside className="hidden lg:flex sticky top-0 h-screen flex-col border-r border-ink-700 bg-ink-875 px-[14px] pt-[22px] pb-4 overflow-y-auto">
       <div className="px-[7px] pb-[23px]">
@@ -124,7 +136,7 @@ export default function Sidebar({ tab, onTab, project, onProject, projects, tota
           className={`proj ${project === "all" ? "on" : ""}`}
         >
           <span className="truncate">All projects</span>
-          <span className="num text-micro text-ink-500">{total}</span>
+          <span className="num text-micro text-ink-500" title={all.title}>{all.n}</span>
         </button>
         {projects.map((p) => (
           <button
@@ -133,11 +145,16 @@ export default function Sidebar({ tab, onTab, project, onProject, projects, tota
             className={`proj ${project === p.key ? "on" : ""}`}
           >
             <span className="truncate">{p.key}</span>
-            <span className="num text-micro text-ink-500">
-              {p.prefix} {p.issues}
+            <span className="num text-micro text-ink-500" title={count(p.key).title}>
+              {p.prefix} {count(p.key).n}
             </span>
           </button>
         ))}
+        {projectsError && (
+          <span className="mx-[11px] mt-1 text-micro text-fail" role="alert" title={projectsError}>
+            could not load projects
+          </span>
+        )}
       </div>
       <div className="mt-auto pt-4 border-t border-ink-700 mx-1 text-ink-500 text-label leading-relaxed">
         <div className="slabel mb-1">session</div>
