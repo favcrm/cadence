@@ -1,12 +1,28 @@
-//! Connection-bound caller identity for TCP peers (CAD-254).
+//! Connection-bound caller identity — the one rule the daemon's Unix
+//! socket and the board's TCP writes share (CAD-102, CAD-254, CAD-263).
 //!
-//! The daemon's Unix socket names its peer through `SO_PEERCRED`; a TCP
-//! connection carries no credentials. The board recovers the peer the
-//! way `ss -p` does: the connection's client-side socket in
+//! A peer *process* is tied to a registered pane by three signals
+//! ([`PeerTies`]). Two are *process* signals a client cannot choose:
+//! the pane's pid on its `/proc` ancestry, and the pane's pty among its
+//! stdio fds (a `setsid` detach keeps stdio). The third — the pane's
+//! `CADENCE_ALIAS` in its environment (a detach keeps that too) — IS
+//! caller-choosable: any process can export `CADENCE_ALIAS=B`.
+//!
+//! - `agent answer` uses all three ([`PeerTies::tied_to`],
+//!   [`PeerTies::agents`]): a caller tied to the target pane by any of
+//!   them is refused, and the audit `by` names the first other pane it
+//!   is tied to. The alias can only narrow there — forging it refuses
+//!   its forger or mislabels an audit stamp; it authorizes nothing.
+//! - A board write is attributed to an agent on a process signal only
+//!   ([`PeerTies::attributed_agents`]): an env alias alone attributes
+//!   nothing, so `CADENCE_ALIAS=B curl …` from a pane-less process
+//!   writes as `operator (ui)`, not as agent B.
+//!
+//! The daemon names its Unix peer through `SO_PEERCRED`; a TCP
+//! connection carries no credentials, so the board recovers the peer
+//! the way `ss -p` does: the connection's client-side socket in
 //! `/proc/net/tcp{,6}` gives its inode, and whichever process holds
-//! `socket:[inode]` in `/proc/<pid>/fd` is the peer. From there the
-//! daemon's own derivation applies — `/proc` ancestry to the nearest
-//! registered pane ([`crate::adapter::pty::nearest_pane`]).
+//! `socket:[inode]` in `/proc/<pid>/fd` is the peer.
 //!
 //! Only processes this user can inspect are visible: a socket held by
 //! another user's process (a root proxy) cannot be attributed, and the
@@ -15,14 +31,159 @@
 use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use crate::adapter::pty::{caller_chain, nearest_pane};
+use crate::adapter::pty::caller_chain;
+use crate::error::Error;
 
-/// Which registered pane the TCP peer `peer` of a connection to our
-/// `server_port` descends from. `Ok(None)` — the peer is a local
-/// process on no pane's lineage, or (non-loopback address, no local
-/// socket holds the connection's other end) a different host, which
-/// no pane here can be. `Err` — the peer could not be attributed at
-/// all: callers must fail closed, never read it as "no pane".
+/// What ties one peer process to registered panes — the three signals
+/// of the caller rule, read once per peer. `chain` is `None` when any
+/// `/proc` read failed mid-walk: an incomplete chain proves neither
+/// membership nor its absence, so callers must treat it as
+/// unverifiable rather than outside.
+pub(crate) struct PeerTies {
+    pid: u32,
+    chain: Option<Vec<u32>>,
+    env_alias: Option<String>,
+}
+
+impl PeerTies {
+    /// Read the peer's ancestry and `CADENCE_ALIAS` now.
+    pub(crate) fn probe(pid: u32) -> Self {
+        Self {
+            pid,
+            chain: caller_chain(pid),
+            env_alias: caller_env_alias(pid),
+        }
+    }
+
+    /// Whether the whole `/proc` ancestry could be walked.
+    pub(crate) fn walked(&self) -> bool {
+        self.chain.is_some()
+    }
+
+    /// The process signals: the pane pid is on the peer's ancestry, or
+    /// the peer holds the pane's pty. Neither is caller-choosable.
+    fn process_tied(&self, pane_pid: u32) -> bool {
+        self.chain.as_deref().is_some_and(|c| c.contains(&pane_pid))
+            || holds_pane_tty(self.pid, pane_pid)
+    }
+
+    /// The widest tie — a process signal OR the pane's `CADENCE_ALIAS`
+    /// in the peer's env. For narrowing authority only (a pane may not
+    /// answer its own menu): a forged alias can only refuse its forger.
+    pub(crate) fn tied_to(&self, alias: &str, pane_pid: u32) -> bool {
+        self.process_tied(pane_pid) || self.env_alias.as_deref() == Some(alias)
+    }
+
+    /// The registered panes (`(alias, pane_pid)`) whose agent the peer
+    /// may be ATTRIBUTED as — process signals only, sorted by alias
+    /// and deduplicated. `CADENCE_ALIAS` is caller-chosen, so an env
+    /// tie never attributes by itself; when a process signal
+    /// corroborates it, the process signal already decides.
+    pub(crate) fn attributed_agents<'a>(
+        &self,
+        panes: impl IntoIterator<Item = (&'a str, u32)>,
+    ) -> Vec<String> {
+        let tied: BTreeSet<&str> = panes
+            .into_iter()
+            .filter(|(_, pane_pid)| self.process_tied(*pane_pid))
+            .map(|(alias, _)| alias)
+            .collect();
+        tied.into_iter().map(str::to_string).collect()
+    }
+
+    /// Every registered pane (`(alias, pane_pid)`) the peer is tied to,
+    /// sorted by alias and deduplicated — deterministic, never map
+    /// order.
+    pub(crate) fn agents<'a>(
+        &self,
+        panes: impl IntoIterator<Item = (&'a str, u32)>,
+    ) -> Vec<String> {
+        let tied: BTreeSet<&str> = panes
+            .into_iter()
+            .filter(|(alias, pane_pid)| self.tied_to(alias, *pane_pid))
+            .map(|(alias, _)| alias)
+            .collect();
+        tied.into_iter().map(str::to_string).collect()
+    }
+
+    /// Does the peer hold a pty at all? Meaningful only after every
+    /// pane membership check failed, so any pts fd is foreign by
+    /// definition — positive evidence of an interactive terminal. A
+    /// detached caller (`setsid … </dev/null >&2`) holds none.
+    pub(crate) fn on_tty(&self) -> bool {
+        (0..=2).any(|fd| {
+            std::fs::read_link(format!("/proc/{}/fd/{fd}", self.pid))
+                .is_ok_and(|p| p.to_string_lossy().starts_with("/dev/pts/"))
+        })
+    }
+}
+
+/// The `CADENCE_ALIAS` the peer carries — pane env survives `setsid`,
+/// so a detached pane process still names its agent. An alias this
+/// daemon never registered means nothing (a stale or foreign daemon's
+/// env) — only registered panes match.
+fn caller_env_alias(peer_pid: u32) -> Option<String> {
+    let env = std::fs::read(format!("/proc/{peer_pid}/environ")).ok()?;
+    env.split(|b| *b == 0)
+        .filter_map(|kv| std::str::from_utf8(kv).ok())
+        .find_map(|kv| kv.strip_prefix("CADENCE_ALIAS="))
+        .filter(|a| !a.is_empty())
+        .map(str::to_string)
+}
+
+/// Does `peer_pid` hold the pane's pty? A detached pane process loses
+/// its ancestry and controlling terminal but keeps stdio — the fd
+/// targets still name the pane's pts device. Redirected stdio is the
+/// documented residual (a maximal-effort detach), accepted because the
+/// same actor could `tmux send-keys` its own pane directly.
+fn holds_pane_tty(peer_pid: u32, pane_pid: u32) -> bool {
+    let pane_tty = (0..=2)
+        .filter_map(|fd| std::fs::read_link(format!("/proc/{pane_pid}/fd/{fd}")).ok())
+        .find(|p| p.to_string_lossy().starts_with("/dev/pts/"));
+    let Some(tty) = pane_tty else {
+        return false;
+    };
+    (0..=2)
+        .any(|fd| std::fs::read_link(format!("/proc/{peer_pid}/fd/{fd}")).is_ok_and(|p| p == tty))
+}
+
+/// The caller matched no pane — place it honestly for a pane-attention
+/// verb. A broken `/proc` walk (`walked == false`) proves neither
+/// membership nor its absence: a refusal while the target pane is
+/// alive, `unknown` once it is gone. A clean walk with no match is
+/// `operator` only with positive terminal evidence (`foreign_tty`); a
+/// detached caller is `unknown`, never `operator`.
+pub(crate) fn unmatched_caller(
+    walked: bool,
+    target_alive: bool,
+    foreign_tty: bool,
+    verb: &str,
+) -> crate::Result<(String, &'static str)> {
+    if !walked {
+        if target_alive {
+            return Err(Error::rejected(format!(
+                "cannot derive the caller for `{verb}` — /proc could \
+                 not be walked while the target pane is alive; run it \
+                 from a shell attached to a pane or outside all panes",
+            )));
+        }
+        return Ok(("unknown".to_string(), "unknown"));
+    }
+    if foreign_tty {
+        Ok(("operator".to_string(), "operator"))
+    } else {
+        Ok(("unknown".to_string(), "unknown"))
+    }
+}
+
+/// Which registered agent the TCP peer `peer` of a connection to our
+/// `server_port` is attributed as — [`PeerTies::attributed_agents`]:
+/// the pane on its ancestry or whose pty it holds; `panes` maps pane
+/// pid to alias. `Ok(None)` — the peer is a local process tied to no pane,
+/// or (non-loopback address, no local socket holds the connection's
+/// other end) a different host, which no pane here can be. `Err` — the
+/// peer could not be attributed at all (unreadable ancestry, several
+/// agents): callers must fail closed, never read it as "no pane".
 pub(crate) fn tcp_peer_pane(
     server_port: u16,
     peer: SocketAddr,
@@ -46,15 +207,17 @@ pub(crate) fn tcp_peer_pane(
     }
     let mut agents = BTreeSet::new();
     for pid in pids {
-        let chain = caller_chain(pid)
-            .ok_or_else(|| format!("peer pid {pid}: /proc ancestry unreadable"))?;
-        if let Some(alias) = nearest_pane(&chain, panes) {
-            agents.insert(alias.clone());
+        let ties = PeerTies::probe(pid);
+        if !ties.walked() {
+            return Err(format!("peer pid {pid}: /proc ancestry unreadable"));
         }
+        agents.extend(
+            ties.attributed_agents(panes.iter().map(|(pid, alias)| (alias.as_str(), *pid))),
+        );
     }
     if agents.len() > 1 {
         return Err(format!(
-            "peer {peer} is held by processes of several panes ({})",
+            "peer {peer} is tied to several panes ({})",
             agents.into_iter().collect::<Vec<_>>().join(", ")
         ));
     }

@@ -608,7 +608,7 @@ tailnet name, `Tailscale-User-Login` resolves the actor to
 `<login> (tailscale)` — the tracker commit's `Actor:` trailer names the
 person who wrote. The same headers on a direct loopback request
 (non-tailnet `Host`) are ignored; the default actor stays
-`operator (ui)` — unless the peer descends from a registered pane, in
+`operator (ui)` — unless the peer is tied to a registered pane, in
 which case the write is that agent's (see [Write identity](#write-identity)).
 `GET /api/meta` reports `{read_only, actor,
 tailnet_url, version, build_commit, build_time, daemon}` so the SPA
@@ -690,34 +690,65 @@ fully buffered first.
 The cross-site guards below stop browsers, not local processes: any
 process with a shell can send `X-Cadence-Board: 1` and a board Origin.
 So every write — issue routes, monitor acks and model defaults —
-derives its caller the way the daemon does for slot and answer verbs
-(CAD-254), never from anything the request says:
+derives its caller from the same shared module as the daemon's
+pane-attention verbs (`agent answer`; `src/peer.rs`, CAD-254,
+CAD-263), never from anything the request says:
 
 1. The TCP peer's process: the connection's client-side socket in
-   `/proc/net/tcp{,6}` gives an inode; the process holding
-   `socket:[inode]` in `/proc/<pid>/fd` is the peer.
-2. Its `/proc` ancestry, matched against the daemon's live registered
-   panes (`agent_list`: `pty` endpoints with a pid and generation) —
-   the nearest pane wins.
+   `/proc/net/tcp{,6}` gives an inode; every process holding
+   `socket:[inode]` in `/proc/<pid>/fd` is a peer.
+2. Each peer is matched against the daemon's live registered panes
+   (`agent_list`: `pty` endpoints with a pid and generation). A peer
+   is that pane's agent when either **process signal** holds:
+   - the pane pid is on the peer's `/proc` ancestry;
+   - one of the peer's stdio fds (0–2) is the pane's pts — a `setsid`
+     or double-forked child of a pane keeps its stdio, so it stays
+     attributed after the detach.
+
+   The pane's `CADENCE_ALIAS` in the peer's environment is **not** a
+   board signal on its own: any process can export it, so
+   `CADENCE_ALIAS=B curl …` from a pane-less process writes as
+   `operator (ui)`, never as agent B. (`agent answer` does consult it,
+   only to *refuse* a caller tied to the target pane and to label its
+   audit stamp — there it can narrow, never authorize.)
 
 | Peer | Writes as |
 |---|---|
-| descends from a registered pane | that agent's alias — commit subject, `Actor:` trailer, comment author, ack `by`, settings attribution; never `operator` |
-| resolves, but descends from no pane (the operator's browser, an ssh tunnel, the loopback gateway) | `operator (ui)` |
-| tailnet-shaped request (see Remote access) not on a pane's lineage | `<login> (tailscale)` as before |
-| cannot be attributed — socket owned by another user's process, ancestry unreadable, several panes, or a store exists but the daemon cannot list panes | refused: `403`, `check: "caller_identity"`, naming why |
+| tied to exactly one registered pane | that agent's alias — commit subject, `Actor:` trailer, comment author, ack `by`, settings attribution; never `operator` |
+| walks cleanly and is tied to no pane (the operator's browser, an ssh tunnel, the loopback gateway) | `operator (ui)` |
+| tailnet-shaped request (see Remote access) tied to no pane | `<login> (tailscale)` as before |
+| cannot be attributed — socket owned by another user's process, ancestry unreadable, tied to several panes, or a store exists but the daemon cannot list panes | refused: `403`, `check: "caller_identity"`, naming why |
+
+The board and `agent answer` also differ in how they place a caller
+tied to no pane: `answer` requires positive terminal evidence (a pts
+that is no pane's) to stamp `operator`, because it gates a pane's own
+menu; the board writes as `operator (ui)`, because the operator's own
+peer is a browser or tunnel that holds no terminal at all.
 
 No `cadence.sqlite3` in the state dir means no agent was ever
 registered, so there is provably no pane and writes are the operator's.
 A different host (non-loopback peer with no local client socket) is
 never a pane here. Reads are unchanged.
 
-The limit: identity follows the process that holds the TCP connection.
-A same-user relay a pane can reach — a detached (`setsid`) child, the
-nginx gateway, an ssh tunnel — writes as the relay's lineage, as it
-would to the daemon's socket. Same-user is not a hostile isolation
-boundary; this closes the direct path (a pane's `curl` approving its
-own work as `operator`), not every indirect one.
+The limit: identity follows the process that holds the TCP connection
+and the process signals it carries. A same-user relay a pane can reach
+but that carries neither still writes as the relay — exactly as it
+would to the daemon's socket:
+
+- **the loopback gateway** (nginx or any long-lived proxy the operator
+  started): its worker holds the connection, descends from no pane,
+  carries no pane's `CADENCE_ALIAS` and holds no pane pty — `operator
+  (ui)`, or refused when it runs as another user;
+- **an ssh tunnel** (`ssh -L` from a pane back to this host): the
+  board's peer is the host's `sshd` session process, whose ancestry
+  is `sshd` and which holds no pane pty — `operator (ui)`;
+- **a detach with redirected stdio** (`setsid -f … </dev/null
+  >/dev/null 2>&1`): no ancestry and no pane pty — `operator (ui)`,
+  whatever `CADENCE_ALIAS` it still carries.
+
+Same-user is not a hostile isolation boundary; this closes the direct
+path (a pane's `curl` approving its own work as `operator`) and the
+casual detach, not every deliberate relay.
 
 ### Security posture
 
@@ -764,7 +795,7 @@ Then the I1 containment still holds:
 
 The honest limit: anyone who can open `http://127.0.0.1:3010` from this
 machine — a local process, or a browser tab on an allowed origin — can
-write the tracker; a process on a pane's lineage writes as that agent
+write the tracker; a process tied to a pane writes as that agent
 (see [Write identity](#write-identity)). That is the threat model: a private repo on a
 single-operator host, loopback plus the guards above. Auth is deferred
 to I3+.

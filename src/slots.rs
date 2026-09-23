@@ -32,16 +32,41 @@
 //! daemon restart revalidates them: a hold survives restart only
 //! while its recorded process still lives (pid + starttime), a dead
 //! holder's slot is reaped at boot rather than silently re-granted.
+//!
+//! Two bindings share the pools (CAD-230). A *legacy* hold is the
+//! CAD-113 shape above — a pty pane's lane, its alive-only fallback and
+//! its `max_hold_secs` reap, all unchanged. A *strict* hold belongs to
+//! a daemon-minted [`Enrollment`] of a managed provider process
+//! ([`strict`]): it is admitted only through verified process identity,
+//! is written through a fail-closed writer (a failed write leaves disk
+//! and memory unchanged and blocks strict admission), and is freed only
+//! by an exact release or proven death — never by revocation, expiry
+//! or `max_hold_secs`, which mark it `expired_pending_reconcile`.
+//! Liveness is tri-state: `alive` retains, `dead` frees, `unknown`
+//! stays accounted. The first strict record upgrades `slots.json` to
+//! the v2 envelope (`enrollments`, strict `holds`, `legacy_holds`);
+//! until then the file keeps its v1 shape.
 
 use std::collections::HashMap;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::error::{Error, Result};
+
+mod strict;
+#[cfg(test)]
+mod strict_tests;
+
+pub use strict::{AuthState, Enrollment, Liveness, ProcFs, ProcIdentity, StrictCaller};
+
+/// The daemon's cap on one enrollment's lifetime. Expiry refuses new
+/// work (holds stay accounted); the same endpoint identity renews at
+/// its next open, a new process enrolls afresh.
+pub const ENROLLMENT_TTL_SECS: f64 = 86_400.0;
 
 /// `[host]` slot configuration from pm.yaml — every key optional,
 /// unset keys keep the defaults.
@@ -156,8 +181,24 @@ struct SlotWait {
     /// abandoned and reaped after `WAITER_TTL_SECS`, so a fast-failed
     /// or timed-out CLI never jams the queue behind a dead lane's pid.
     last_poll: f64,
+    /// A strict waiter's enrollment binding — revalidated on every
+    /// reap pass, before any ranking. `None` for legacy waiters.
+    strict: Option<StrictBind>,
 }
 
+/// What ties a strict waiter or hold to its enrollment: the enrollment
+/// and owner generation it was admitted under, and the exact holder
+/// process (the claimed pid, verified on the caller's chain).
+#[derive(Clone, Debug)]
+struct StrictBind {
+    enrollment_id: String,
+    owner_generation: String,
+    holder: ProcIdentity,
+    /// Last observed holder liveness — status only, never persisted.
+    liveness: Liveness,
+}
+
+#[derive(Clone)]
 struct SlotHold {
     /// Daemon-minted grant token — never the caller's request_id.
     token: String,
@@ -175,6 +216,35 @@ struct SlotHold {
     /// Wall-clock grant instant — persisted so a restart can restore
     /// the hold's age against the new clock epoch.
     acquired_epoch: f64,
+    /// `Some` for a strict hold (CAD-230); `None` is the legacy
+    /// binding with its unchanged alive-only and max-hold rules.
+    strict: Option<StrictBind>,
+}
+
+impl SlotHold {
+    fn enrollment_id(&self) -> Option<&str> {
+        self.strict.as_ref().map(|b| b.enrollment_id.as_str())
+    }
+
+    /// The legacy persisted row — the v1 shape, `legacy_holds` in v2.
+    fn legacy_json(&self) -> Value {
+        json!({
+            "token": self.token, "request_id": self.request_id,
+            "kind": self.kind.as_str(), "lane": self.lane,
+            "pid": self.pid, "pid_start": self.pid_start,
+            "acquired_epoch": self.acquired_epoch,
+        })
+    }
+}
+
+/// Why strict admission is unavailable. `preserve_file` means the
+/// state file itself was rejected — it is retained as evidence and
+/// nothing overwrites it; a failed strict write leaves the last good
+/// file and lets legacy best-effort writes continue.
+#[derive(Clone, Debug)]
+struct Blocked {
+    reason: String,
+    preserve_file: bool,
 }
 
 /// One event the caller should emit — `(alias, kind, payload)`; the
@@ -307,12 +377,28 @@ pub struct Slots {
     /// inherits it — later arrivals stamp their own arrival.
     seniority: HashMap<(String, SlotKind), Seniority>,
     persist_path: Option<PathBuf>,
+    /// Strict enrollments (CAD-230) — persisted with the holds.
+    enrollments: Vec<Enrollment>,
+    /// Where strict identity is read — `/proc`, a fixture in tests.
+    proc: ProcFs,
+    /// The only uid a strict root, worker, holder or peer may run as.
+    daemon_uid: u32,
+    /// `Some` once strict admission is unavailable — a rejected state
+    /// file or a failed strict write. Legacy callers are unaffected.
+    blocked: Option<Blocked>,
+    /// The persisted file is the v2 envelope: set by loading one or by
+    /// the first strict write, never cleared — a legacy write never
+    /// downgrades it or drops a strict record.
+    v2: bool,
+    /// Bumped on every v2 write — the envelope's `state_generation`.
+    state_generation: u64,
 }
 
 impl Slots {
     pub fn new(config: SlotConfig) -> Self {
         Self {
             config,
+            daemon_uid: unsafe { libc::geteuid() },
             ..Default::default()
         }
     }
@@ -374,10 +460,16 @@ impl Slots {
     /// Holder drops emit `slot_released` with the reap reason (and no
     /// token — events never carry one); a dead waiter held nothing,
     /// so it drops silently. Returns what was reaped so `release`
-    /// can answer a just-reaped token softly.
+    /// can answer a just-reaped token softly. Strict holds follow the
+    /// tri-state rule instead ([`Self::reap_strict`]), and strict
+    /// waiters are revalidated against their enrollment here — before
+    /// any caller ranks the queue.
     fn reap_dead(&mut self, now: f64, events: &mut Vec<SlotEvent>) -> Vec<Reaped> {
         let mut dead: Vec<Reaped> = Vec::new();
         self.held.retain(|h| {
+            if h.strict.is_some() {
+                return true;
+            }
             let gone = !pid_matches(h.pid, h.pid_start);
             let expired = now - h.acquired_at >= self.config.max_hold_secs as f64;
             if !gone && !expired {
@@ -407,17 +499,133 @@ impl Slots {
             });
             false
         });
-        // Waiters drop on either abandonment signal: a dead/recycled
-        // pid, or a poll gone silent past the TTL (a fast-failed
-        // --wait-secs 0 caller's pid may still be alive in its parent
-        // — only the silence proves it walked away).
-        self.waiting
-            .retain(|w| pid_matches(w.pid, w.pid_start) && now - w.last_poll <= WAITER_TTL_SECS);
-        self.prune_seniority(now);
         if !dead.is_empty() {
             self.persist();
         }
+        self.expire_enrollments(now, events);
+        self.reap_strict(now, events, &mut dead);
+        // Waiters drop on either abandonment signal: a dead/recycled
+        // pid, or a poll gone silent past the TTL (a fast-failed
+        // --wait-secs 0 caller's pid may still be alive in its parent
+        // — only the silence proves it walked away). A strict waiter
+        // also drops — reported — once its enrollment is revoked,
+        // expired, gone or generation-drifted, or its holder is not
+        // provably alive: the strict check never uses the alive-only
+        // fallback.
+        let (proc, enrollments) = (&self.proc, &self.enrollments);
+        self.waiting.retain(|w| {
+            let Some(b) = &w.strict else {
+                return pid_matches(w.pid, w.pid_start) && now - w.last_poll <= WAITER_TTL_SECS;
+            };
+            let why = match enrollments.iter().find(|e| e.id == b.enrollment_id) {
+                None => Some("enrollment gone"),
+                Some(e) if e.auth != AuthState::Active => Some(e.auth.as_str()),
+                Some(e) if e.owner_generation != b.owner_generation => {
+                    Some("owner generation changed")
+                }
+                Some(_) => match proc.liveness(&b.holder).0 {
+                    Liveness::Alive => None,
+                    Liveness::Dead => Some("waiter died"),
+                    Liveness::Unknown => Some("waiter liveness unknown"),
+                },
+            };
+            if let Some(why) = why {
+                events.push((
+                    w.lane.clone(),
+                    "slot_wait_dropped",
+                    json!({"kind": w.kind.as_str(), "pid": w.pid,
+                           "request_id": w.request_id, "reason": why}),
+                ));
+                return false;
+            }
+            now - w.last_poll <= WAITER_TTL_SECS
+        });
+        self.prune_seniority(now);
         dead
+    }
+
+    /// Strict holds: tri-state liveness of the exact recorded holder.
+    /// `dead` frees — through the fail-closed writer, so a failed
+    /// write keeps the hold accounted — while `alive` and `unknown`
+    /// retain. Revocation, expiry and `max_hold_secs` never free a
+    /// strict hold (see [`Self::accounting`]).
+    fn reap_strict(&mut self, now: f64, events: &mut Vec<SlotEvent>, dead: &mut Vec<Reaped>) {
+        let mut gone: Vec<(String, &'static str)> = Vec::new();
+        for h in self.held.iter_mut() {
+            if let Some(b) = &mut h.strict {
+                let (liveness, why) = self.proc.liveness(&b.holder);
+                b.liveness = liveness;
+                if liveness == Liveness::Dead {
+                    gone.push((h.token.clone(), why));
+                }
+            }
+        }
+        if gone.is_empty() {
+            return;
+        }
+        let next: Vec<SlotHold> = self
+            .held
+            .iter()
+            .filter(|h| !gone.iter().any(|(t, _)| *t == h.token))
+            .cloned()
+            .collect();
+        let freed: Vec<SlotHold> = self
+            .held
+            .iter()
+            .filter(|h| gone.iter().any(|(t, _)| *t == h.token))
+            .cloned()
+            .collect();
+        if self.commit(self.enrollments.clone(), next).is_err() {
+            return;
+        }
+        for h in freed {
+            let reason = gone
+                .iter()
+                .find(|(t, _)| *t == h.token)
+                .map(|(_, why)| *why)
+                .unwrap_or("holder died");
+            events.push((
+                h.lane.clone(),
+                "slot_released",
+                json!({"kind": h.kind.as_str(), "pid": h.pid,
+                       "held_secs": (now - h.acquired_at).max(0.0),
+                       "reason": reason}),
+            ));
+            dead.push(Reaped {
+                token: h.token,
+                lane: h.lane,
+                kind: h.kind,
+                reason,
+            });
+        }
+    }
+
+    /// Active enrollments past their daemon-capped lifetime become
+    /// `expired`: no new work, holds untouched.
+    fn expire_enrollments(&mut self, now: f64, events: &mut Vec<SlotEvent>) {
+        let due: Vec<usize> = (0..self.enrollments.len())
+            .filter(|i| {
+                let e = &self.enrollments[*i];
+                e.auth == AuthState::Active && now >= e.expires_at
+            })
+            .collect();
+        if due.is_empty() {
+            return;
+        }
+        let mut next = self.enrollments.clone();
+        let mut expired = Vec::new();
+        for i in due {
+            next[i].auth = AuthState::Expired;
+            let e = &next[i];
+            expired.push((
+                e.owner_actor.clone(),
+                "slot_enrollment_expired",
+                json!({"enrollment_id": e.id, "root_pid": e.root.pid}),
+            ));
+        }
+        if self.commit(next, self.held.clone()).is_ok() {
+            events.extend(expired);
+        }
     }
 
     /// A `(lane, kind)` episode stays alive while the lane keeps a
@@ -499,40 +707,124 @@ impl Slots {
     /// so a crash cannot lose a persisted hold silently. Seniority is
     /// deliberately not persisted: it measures a wait, and no waiter
     /// survives a restart — every caller re-polls into a fresh anchor.
-    fn persist(&self) {
-        let Some(path) = &self.persist_path else {
-            return;
+    ///
+    /// This is the legacy writer, but it serializes the WHOLE state:
+    /// once any strict record exists (or the file already is v2) it
+    /// writes the v2 envelope with every enrollment and strict hold,
+    /// so a legacy grant, release or reap can never drop strict state.
+    /// A rejected state file is never overwritten — it is evidence.
+    /// Returns whether the file now matches memory.
+    fn persist(&mut self) -> bool {
+        let Some(path) = self.persist_path.clone() else {
+            return true;
         };
-        let doc = json!({
-            "version": 1,
-            "holds": self.held.iter().map(|h| json!({
-                "token": h.token, "request_id": h.request_id,
-                "kind": h.kind.as_str(), "lane": h.lane,
-                "pid": h.pid, "pid_start": h.pid_start,
-                "acquired_epoch": h.acquired_epoch,
-            })).collect::<Vec<_>>(),
-        });
-        let tmp = path.with_extension("tmp");
-        let write = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)
-            .and_then(|mut f| {
-                f.write_all(doc.to_string().as_bytes())?;
-                f.sync_all()
-            })
-            .and_then(|_| std::fs::rename(&tmp, path));
-        match write {
-            Ok(()) => {
-                // The rename is durable only once its directory is.
-                if let Some(dir) = path.parent() {
-                    let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
-                }
-            }
-            Err(e) => eprintln!("slots: persist {} failed: {e}", path.display()),
+        if self.blocked.as_ref().is_some_and(|b| b.preserve_file) {
+            return false;
         }
+        let v2 =
+            self.v2 || !self.enrollments.is_empty() || self.held.iter().any(|h| h.strict.is_some());
+        let doc = if v2 {
+            Self::v2_doc(&self.enrollments, &self.held, self.state_generation + 1)
+        } else {
+            json!({
+                "version": 1,
+                "holds": self.held.iter().map(SlotHold::legacy_json).collect::<Vec<_>>(),
+            })
+        };
+        match write_atomic(&path, &doc) {
+            Ok(()) => {
+                if v2 {
+                    self.v2 = true;
+                    self.state_generation += 1;
+                }
+                true
+            }
+            Err(e) => {
+                eprintln!("slots: persist {} failed: {e}", path.display());
+                false
+            }
+        }
+    }
+
+    /// The v2 envelope: enrollments, strict holds (each naming its
+    /// enrollment), and every legacy hold under `legacy_holds`.
+    fn v2_doc(enrollments: &[Enrollment], held: &[SlotHold], generation: u64) -> Value {
+        json!({
+            "format": "cadence-slots",
+            "version": 2,
+            "state_generation": generation.to_string(),
+            "enrollments": enrollments.iter().map(Enrollment::to_json).collect::<Vec<_>>(),
+            "holds": held.iter().filter_map(|h| {
+                let b = h.strict.as_ref()?;
+                Some(json!({
+                    "token": h.token, "request_id": h.request_id,
+                    "kind": h.kind.as_str(), "lane": h.lane,
+                    "enrollment_id": b.enrollment_id,
+                    "owner_generation": b.owner_generation,
+                    "holder": b.holder.to_json(),
+                    "acquired_epoch": h.acquired_epoch,
+                }))
+            }).collect::<Vec<_>>(),
+            "legacy_holds": held.iter()
+                .filter(|h| h.strict.is_none())
+                .map(SlotHold::legacy_json)
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    /// The fail-closed strict writer. The next state is written FIRST
+    /// and swapped into memory only once the write landed: a failure
+    /// leaves disk and memory exactly as they were — no grant, no free
+    /// — and makes strict admission unavailable until a restart loads
+    /// a good file.
+    ///
+    /// A revoked or expired enrollment is a TOMBSTONE: it stays while
+    /// any hold names it or while its root process is alive or
+    /// unknown, because [`Self::nearest_enrolled_root`] must keep
+    /// seeing that exact root — otherwise its processes would fall
+    /// through to an outer pane's legacy binding. It is pruned only
+    /// once nothing holds under it and its root is proven dead.
+    fn commit(&mut self, enrollments: Vec<Enrollment>, held: Vec<SlotHold>) -> Result<()> {
+        if let Some(b) = &self.blocked {
+            return Err(strict_unavailable(&b.reason));
+        }
+        let enrollments: Vec<Enrollment> = enrollments
+            .into_iter()
+            .filter(|e| {
+                e.auth == AuthState::Active
+                    || held
+                        .iter()
+                        .any(|h| h.enrollment_id() == Some(e.id.as_str()))
+                    || self.proc.liveness(&e.root).0 != Liveness::Dead
+            })
+            .collect();
+        if let Some(path) = self.persist_path.clone() {
+            let generation = self.state_generation + 1;
+            if let Err(e) = write_atomic(&path, &Self::v2_doc(&enrollments, &held, generation)) {
+                let reason = format!("strict state write to {} failed: {e}", path.display());
+                eprintln!("slots: {reason}");
+                self.blocked = Some(Blocked {
+                    reason: reason.clone(),
+                    preserve_file: false,
+                });
+                return Err(strict_unavailable(&reason));
+            }
+            self.v2 = true;
+            self.state_generation = generation;
+        }
+        self.enrollments = enrollments;
+        self.held = held;
+        Ok(())
+    }
+
+    /// The state file itself is unusable: keep it untouched as
+    /// evidence and refuse strict admission.
+    fn reject_file(&mut self, reason: String) {
+        eprintln!("slots: strict admission unavailable — {reason}");
+        self.blocked = Some(Blocked {
+            reason,
+            preserve_file: true,
+        });
     }
 
     /// Revalidate persisted holds at daemon start: a hold survives
@@ -541,20 +833,76 @@ impl Slots {
     /// re-polls still resolve); the dead are dropped with a named
     /// reason rather than silently re-granted. Returns the boot-time
     /// release events for the daemon to emit.
+    ///
+    /// Order (CAD-230): the envelope is validated whole before any of
+    /// it is used — unknown version, malformed JSON or schema, and
+    /// duplicate records reject the file (kept as evidence, strict
+    /// admission unavailable). Then enrollments (expiry, root identity)
+    /// before strict holds (tri-state: alive retains, dead frees,
+    /// unknown stays accounted) before legacy holds (unchanged rules).
+    /// Waiters are never persisted, so none is ever replayed.
     pub fn restore(&mut self, clk: SlotClock) -> Vec<SlotEvent> {
         let mut events = Vec::new();
-        let (now, wall) = (clk.mono, clk.wall);
-        let Some(path) = &self.persist_path else {
+        let Some(path) = self.persist_path.clone() else {
             return events;
         };
-        let Ok(text) = std::fs::read_to_string(path) else {
-            return events;
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return events,
+            Err(e) => {
+                self.reject_file(format!("cannot read {}: {e}", path.display()));
+                return events;
+            }
         };
         let Ok(doc) = serde_json::from_str::<Value>(&text) else {
-            eprintln!("slots: ignoring unparsable {}", path.display());
+            self.reject_file(format!("{} is unparsable", path.display()));
             return events;
         };
-        for h in doc["holds"].as_array().cloned().unwrap_or_default() {
+        let loaded = match (doc.get("format"), doc.get("version")) {
+            (Some(format), Some(version)) if format == "cadence-slots" && version == 2 => {
+                self.restore_v2(&doc, clk, &mut events)
+            }
+            (Some(format), version) => Err(format!(
+                "unknown envelope (format {format}, version {})",
+                version.cloned().unwrap_or(Value::Null)
+            )),
+            (None, Some(version)) if version != 1 => Err(format!("unknown version {version}")),
+            // Anything that is not a well-formed envelope — `{}`,
+            // `null`, `[]`, a non-list `holds` — is malformed state:
+            // kept as evidence, never rewritten, strict blocked.
+            (None, _) if !doc.is_object() || !doc["holds"].is_array() => {
+                Err("not a well-formed v1 envelope (an object with a 'holds' list)".to_string())
+            }
+            // The v1 shape — or a version-less file an older writer
+            // left: the legacy rows, under the unchanged rules.
+            (None, _) => {
+                self.restore_legacy(&doc["holds"], clk, &mut events);
+                Ok(())
+            }
+        };
+        if let Err(why) = loaded {
+            self.reject_file(format!("{}: {why}", path.display()));
+            return events;
+        }
+        // Seniority is never persisted: it measures an unserved wait
+        // and no waiter survives a restart — re-polling callers
+        // anchor fresh. (A stale `seniority` block in an old file is
+        // simply ignored.) A boot rewrite that fails issues no strict
+        // grant until a later restart writes cleanly.
+        if !self.persist() && self.blocked.is_none() {
+            self.blocked = Some(Blocked {
+                reason: format!("boot rewrite of {} failed", path.display()),
+                preserve_file: false,
+            });
+        }
+        events
+    }
+
+    /// Legacy (v1 / `legacy_holds`) rows — the CAD-113 rules exactly:
+    /// the alive-only fallback, per-row skips, dead holders reaped.
+    fn restore_legacy(&mut self, holds: &Value, clk: SlotClock, events: &mut Vec<SlotEvent>) {
+        let (now, wall) = (clk.mono, clk.wall);
+        for h in holds.as_array().cloned().unwrap_or_default() {
             let (Some(kind), Some(lane), Some(pid)) = (
                 h["kind"].as_str().and_then(|k| SlotKind::parse(k).ok()),
                 h["lane"].as_str(),
@@ -594,14 +942,140 @@ impl Slots {
                 pid_start: start,
                 acquired_at: now - held_secs,
                 acquired_epoch: wall - held_secs,
+                strict: None,
             });
         }
-        // Seniority is never persisted: it measures an unserved wait
-        // and no waiter survives a restart — re-polling callers
-        // anchor fresh. (A stale `seniority` block in an old file is
-        // simply ignored.)
-        self.persist();
-        events
+    }
+
+    /// Validate the whole v2 envelope, then apply it in order. Any
+    /// schema fault is an `Err` before anything is applied.
+    fn restore_v2(
+        &mut self,
+        doc: &Value,
+        clk: SlotClock,
+        events: &mut Vec<SlotEvent>,
+    ) -> std::result::Result<(), String> {
+        let (now, wall) = (clk.mono, clk.wall);
+        let generation: u64 = doc["state_generation"]
+            .as_str()
+            .and_then(|g| g.parse().ok())
+            .ok_or("state_generation missing or malformed")?;
+        let list = |key: &str| {
+            doc[key]
+                .as_array()
+                .cloned()
+                .ok_or_else(|| format!("'{key}' missing or not a list"))
+        };
+        let mut enrollments = Vec::new();
+        for e in list("enrollments")? {
+            let parsed = Enrollment::from_json(&e, now, wall)
+                .ok_or_else(|| format!("malformed enrollment {e}"))?;
+            // Ids are unique; a root may appear again only under a
+            // tombstone (a revoked enrollment kept for its holds).
+            let revoked = |e: &Enrollment| matches!(e.auth, AuthState::Revoked(_));
+            if enrollments.iter().any(|o: &Enrollment| {
+                o.id == parsed.id || (o.root == parsed.root && !revoked(o) && !revoked(&parsed))
+            }) {
+                return Err(format!("duplicate enrollment {}", parsed.id));
+            }
+            enrollments.push(parsed);
+        }
+        let mut tokens = std::collections::HashSet::new();
+        let mut strict_rows = Vec::new();
+        for h in list("holds")? {
+            let row = (|| {
+                let enrollment_id = h["enrollment_id"].as_str()?.to_string();
+                let lane = enrollments
+                    .iter()
+                    .find(|e| e.id == enrollment_id)?
+                    .owner_actor
+                    .clone();
+                Some((
+                    h["token"].as_str()?.to_string(),
+                    h["request_id"].as_str()?.to_string(),
+                    SlotKind::parse(h["kind"].as_str()?).ok()?,
+                    lane,
+                    StrictBind {
+                        enrollment_id,
+                        owner_generation: h["owner_generation"].as_str()?.to_string(),
+                        holder: ProcIdentity::from_json(&h["holder"])?,
+                        liveness: Liveness::Unknown,
+                    },
+                    h["acquired_epoch"].as_f64()?,
+                ))
+            })()
+            .ok_or_else(|| format!("malformed or unbound strict hold {h}"))?;
+            if !tokens.insert(row.0.clone()) {
+                return Err(format!("duplicate hold token {}", row.0));
+            }
+            strict_rows.push(row);
+        }
+        let legacy = list("legacy_holds")?;
+        for h in &legacy {
+            let ok = h["token"].as_str().is_some()
+                && h["kind"]
+                    .as_str()
+                    .and_then(|k| SlotKind::parse(k).ok())
+                    .is_some()
+                && h["lane"].as_str().is_some()
+                && h["pid"].as_u64().is_some()
+                && h["acquired_epoch"].as_f64().is_some();
+            if !ok {
+                return Err(format!("malformed legacy hold {h}"));
+            }
+            if !tokens.insert(h["token"].as_str().unwrap_or_default().to_string()) {
+                return Err(format!("duplicate hold token {}", h["token"]));
+            }
+        }
+        // Validated — apply: enrollments, then strict holds, then
+        // legacy holds.
+        self.v2 = true;
+        self.state_generation = generation;
+        for e in &mut enrollments {
+            if e.auth == AuthState::Active && wall >= e.expires_epoch {
+                e.auth = AuthState::Expired;
+            }
+            if matches!(e.auth, AuthState::Revoked(_)) {
+                continue;
+            }
+            match self.proc.liveness(&e.root).0 {
+                Liveness::Alive => {}
+                Liveness::Dead => {
+                    e.auth = AuthState::Revoked("root process gone at restart".into())
+                }
+                Liveness::Unknown => {
+                    e.auth = AuthState::Revoked("root liveness unknown at restart".into())
+                }
+            }
+        }
+        self.enrollments = enrollments;
+        for (token, request_id, kind, lane, mut bind, acquired_epoch) in strict_rows {
+            let held_secs = (wall - acquired_epoch).max(0.0);
+            let (liveness, why) = self.proc.liveness(&bind.holder);
+            if liveness == Liveness::Dead {
+                events.push((
+                    lane,
+                    "slot_released",
+                    json!({"kind": kind.as_str(), "pid": bind.holder.pid,
+                           "held_secs": held_secs, "reason": why}),
+                ));
+                continue;
+            }
+            bind.liveness = liveness;
+            self.held.push(SlotHold {
+                token,
+                request_id,
+                kind,
+                lane,
+                pid: bind.holder.pid,
+                pid_start: Some(bind.holder.starttime),
+                acquired_at: now - held_secs,
+                acquired_epoch: wall - held_secs,
+                strict: Some(bind),
+            });
+        }
+        self.restore_legacy(&Value::Array(legacy), clk, events);
+        Ok(())
     }
 
     /// A hold's identity is (request_id, pid, lane, kind): only the
@@ -613,6 +1087,7 @@ impl Slots {
                 && h.pid == req.pid
                 && h.lane == req.lane
                 && h.kind == req.kind
+                && h.enrollment_id() == req.enrollment_id()
         })
     }
 
@@ -623,15 +1098,40 @@ impl Slots {
     /// any local caller, and token+lane+pid are exactly the inputs a
     /// release authenticates — publishing all three would hand every
     /// peer the keys to a live hold.
+    ///
+    /// A strict grant goes through the fail-closed writer: when the
+    /// write fails nothing is granted and the caller is refused.
     fn grant(
         &mut self,
         req: SlotReq<'_>,
         wait_secs: f64,
         clk: SlotClock,
         events: &mut Vec<SlotEvent>,
-    ) -> Value {
+    ) -> Result<Value> {
         let (now, wall) = (clk.mono, clk.wall);
         let token = format!("slot-{}", Uuid::new_v4().simple());
+        let hold = SlotHold {
+            token: token.clone(),
+            request_id: req.request_id.to_string(),
+            kind: req.kind,
+            lane: req.lane.to_string(),
+            pid: req.pid,
+            pid_start: match &req.strict {
+                Some(b) => Some(b.holder.starttime),
+                None => pid_start(req.pid),
+            },
+            acquired_at: now,
+            acquired_epoch: wall,
+            strict: req.strict.clone(),
+        };
+        if hold.strict.is_some() {
+            let mut next = self.held.clone();
+            next.push(hold);
+            self.commit(self.enrollments.clone(), next)?;
+        } else {
+            self.held.push(hold);
+            self.persist();
+        }
         events.push((
             req.lane.to_string(),
             "slot_acquired",
@@ -644,19 +1144,8 @@ impl Slots {
         // request" queued can never ride an ancient timestamp — its
         // next enqueue anchors at its own honest arrival.
         self.seniority.remove(&(req.lane.to_string(), req.kind));
-        self.held.push(SlotHold {
-            token: token.clone(),
-            request_id: req.request_id.to_string(),
-            kind: req.kind,
-            lane: req.lane.to_string(),
-            pid: req.pid,
-            pid_start: pid_start(req.pid),
-            acquired_at: now,
-            acquired_epoch: wall,
-        });
-        self.persist();
-        json!({"granted": true, "token": token,
-               "kind": req.kind.as_str(), "wait_secs": wait_secs})
+        Ok(json!({"granted": true, "token": token,
+               "kind": req.kind.as_str(), "wait_secs": wait_secs}))
     }
 
     /// Cross-pool deadlock guard: a caller may never QUEUE for one
@@ -690,6 +1179,22 @@ impl Slots {
         probe: bool,
         clk: SlotClock,
     ) -> Result<(Value, Vec<SlotEvent>)> {
+        self.acquire_as(kind, lane, pid, request_id, probe, clk, None)
+    }
+
+    /// [`Self::acquire`] under either binding — `strict` carries the
+    /// verified enrollment binding of a strict caller.
+    #[allow(clippy::too_many_arguments)]
+    fn acquire_as(
+        &mut self,
+        kind: SlotKind,
+        lane: &str,
+        pid: u32,
+        request_id: &str,
+        probe: bool,
+        clk: SlotClock,
+        strict: Option<StrictBind>,
+    ) -> Result<(Value, Vec<SlotEvent>)> {
         let mut events = Vec::new();
         let now = clk.mono;
         if pid == 0 {
@@ -704,6 +1209,15 @@ impl Slots {
             lane,
             pid,
             request_id,
+            strict,
+        };
+        let enrollment = req.enrollment_id().map(str::to_string);
+        let same = |w: &SlotWait| {
+            w.request_id == request_id
+                && w.pid == pid
+                && w.lane == lane
+                && w.kind == kind
+                && w.strict.as_ref().map(|b| b.enrollment_id.as_str()) == enrollment.as_deref()
         };
         // Idempotent re-poll: the same caller re-asking for its grant
         // gets the same minted token back. Anything sharing only the
@@ -721,9 +1235,7 @@ impl Slots {
             // Already queued? A probe is read-only — it reports the
             // existing waiter's real position, never grants it (a
             // grant is a mutation) and never re-ranks it fresh.
-            if let Some(idx) = self.waiting.iter().position(|w| {
-                w.request_id == request_id && w.pid == pid && w.lane == lane && w.kind == kind
-            }) {
+            if let Some(idx) = self.waiting.iter().position(same) {
                 let ranks = self.ranks(now);
                 return Ok((
                     json!({"granted": false, "position": self.outranked(&ranks, idx) + 1,
@@ -743,9 +1255,10 @@ impl Slots {
                 kind,
                 lane: lane.to_string(),
                 pid,
-                pid_start: pid_start(pid),
+                pid_start: req.pid_start(),
                 queued_at: senior,
                 last_poll: now,
+                strict: req.strict.clone(),
             };
             self.waiting.push(w);
             let ranks = self.ranks(now);
@@ -755,7 +1268,7 @@ impl Slots {
             self.waiting.pop();
             self.prune_seniority(now);
             if next {
-                return Ok((self.grant(req, 0.0, clk, &mut events), events));
+                return Ok((self.grant(req, 0.0, clk, &mut events)?, events));
             }
             if self.holds_other_pool(pool, lane, pid) {
                 return Err(Error::rejected(format!(
@@ -772,9 +1285,7 @@ impl Slots {
                 events,
             ));
         }
-        let (idx, created) = match self.waiting.iter().position(|w| {
-            w.request_id == request_id && w.pid == pid && w.lane == lane && w.kind == kind
-        }) {
+        let (idx, created) = match self.waiting.iter().position(same) {
             Some(i) => (i, false),
             None => {
                 if self.waiting.len() >= MAX_WAITERS {
@@ -796,9 +1307,10 @@ impl Slots {
                     kind,
                     lane: lane.to_string(),
                     pid,
-                    pid_start: pid_start(pid),
+                    pid_start: req.pid_start(),
                     queued_at: senior,
                     last_poll: now,
+                    strict: req.strict.clone(),
                 });
                 (self.waiting.len() - 1, true)
             }
@@ -815,9 +1327,12 @@ impl Slots {
         let ranks = self.ranks(now);
         if self.held_in(pool) < self.capacity(pool) && self.outranked(&ranks, idx) == 0 {
             let wait_secs = (now - self.waiting[idx].queued_at).max(0.0);
+            // Grant first: a strict grant whose write fails leaves the
+            // caller queued exactly where it was.
+            let granted = self.grant(req, wait_secs, clk, &mut events)?;
             self.waiting.remove(idx);
             self.prune_seniority(now);
-            return Ok((self.grant(req, wait_secs, clk, &mut events), events));
+            return Ok((granted, events));
         }
         // It must wait — but a caller holding the other pool may not
         // queue at all (the deadlock guard). The forbidden waiter
@@ -868,6 +1383,22 @@ impl Slots {
         pid: u32,
         now: f64,
     ) -> Result<(Value, Vec<SlotEvent>)> {
+        self.release_as(token, lane, pid, now, None)
+    }
+
+    /// [`Self::release`] under either binding. A strict hold is freed
+    /// only by a verified caller of its own enrollment naming the exact
+    /// recorded holder (pid AND starttime) — through the fail-closed
+    /// writer, so a failed write keeps it held. The two bindings never
+    /// release each other's holds.
+    fn release_as(
+        &mut self,
+        token: &str,
+        lane: &str,
+        pid: u32,
+        now: f64,
+        strict: Option<&StrictCaller>,
+    ) -> Result<(Value, Vec<SlotEvent>)> {
         let mut events = Vec::new();
         let reaped = self.reap_dead(now, &mut events);
         let Some(h) = self.held.iter().find(|h| h.token == token) else {
@@ -882,15 +1413,32 @@ impl Slots {
                 "Unknown slot token '{token}' — it was never granted or already released"
             )));
         };
-        if h.lane != lane || h.pid != pid {
+        let exact = match (&h.strict, strict) {
+            (None, None) => true,
+            (Some(b), Some(c)) => {
+                b.enrollment_id == c.enrollment_id
+                    && c.segment.contains(&pid)
+                    && self.proc.identity(pid).is_ok_and(|now| now == b.holder)
+            }
+            _ => false,
+        };
+        if h.lane != lane || h.pid != pid || !exact {
             return Err(Error::rejected(
                 "Slot token is held by another caller — release must come \
                  from the holding lane and pid",
             ));
         }
         let idx = self.held.iter().position(|h| h.token == token).unwrap();
-        let h = self.held.remove(idx);
-        self.persist();
+        let h = if self.held[idx].strict.is_some() {
+            let mut next = self.held.clone();
+            let h = next.remove(idx);
+            self.commit(self.enrollments.clone(), next)?;
+            h
+        } else {
+            let h = self.held.remove(idx);
+            self.persist();
+            h
+        };
         events.push((
             h.lane.clone(),
             "slot_released",
@@ -932,6 +1480,7 @@ impl Slots {
                         if h.lane == caller.lane && caller.pids.contains(&h.pid) {
                             j["token"] = json!(h.token);
                         }
+                        self.strict_hold_json(h, now, &mut j);
                         j
                     })
                     .collect::<Vec<_>>(),
@@ -961,8 +1510,476 @@ impl Slots {
                 "priority_lanes": self.config.priority_lanes,
                 "max_hold_secs": self.config.max_hold_secs,
             },
+            "enrollments": self.enrollments.iter().map(Enrollment::to_json).collect::<Vec<_>>(),
+            "strict": match &self.blocked {
+                None => json!({"available": true,
+                               "state_generation": self.state_generation}),
+                Some(b) => json!({"available": false, "reason": b.reason,
+                                  "reconcile_required": true,
+                                  "state_generation": self.state_generation}),
+            },
         })
     }
+
+    /// A strict hold's accounting: `held` inside `max_hold_secs`,
+    /// `expired_pending_reconcile` past it — still occupying its slot,
+    /// because only an exact release or proven death frees one.
+    fn accounting(&self, h: &SlotHold, now: f64) -> &'static str {
+        if now - h.acquired_at >= self.config.max_hold_secs as f64 {
+            "expired_pending_reconcile"
+        } else {
+            "held"
+        }
+    }
+
+    /// Status fields of a hold's binding: `legacy`, or `strict` with
+    /// its enrollment's authorization kept separate from the hold's own
+    /// liveness and accounting.
+    fn strict_hold_json(&self, h: &SlotHold, now: f64, j: &mut Value) {
+        let Some(b) = &h.strict else {
+            j["binding"] = json!("legacy");
+            return;
+        };
+        let auth = self
+            .enrollments
+            .iter()
+            .find(|e| e.id == b.enrollment_id)
+            .map(|e| e.auth.as_str())
+            .unwrap_or("revoked");
+        let accounting = self.accounting(h, now);
+        j["binding"] = json!("strict");
+        j["enrollment_id"] = json!(b.enrollment_id);
+        j["owner_generation"] = json!(b.owner_generation);
+        j["auth_state"] = json!(auth);
+        j["liveness"] = json!(b.liveness.as_str());
+        j["accounting"] = json!(accounting);
+        j["reconcile_required"] = json!(b.liveness == Liveness::Unknown || accounting != "held");
+    }
+}
+
+/// Strict enrollments (CAD-230 phase a) — minted, renewed, revoked
+/// and revalidated only by the daemon; a caller never names one.
+impl Slots {
+    /// Read strict identity from `root` instead of `/proc` — tests.
+    #[cfg(test)]
+    fn use_proc(&mut self, root: &Path, uid: u32) {
+        self.proc = ProcFs::at(root);
+        self.daemon_uid = uid;
+    }
+
+    /// Mint the enrollment for a managed endpoint the daemon just
+    /// opened: owner `owner` at `owner_generation`, root = worker = the
+    /// provider process `root_pid` as `/proc` reads it now. The same
+    /// owner generation and root identity renew an existing active or
+    /// expired enrollment (resume); anything else supersedes the
+    /// owner's older enrollments. Refuses the daemon itself, init, and
+    /// any root not running as the daemon's uid.
+    pub fn enroll(
+        &mut self,
+        owner: &str,
+        owner_generation: &str,
+        root_pid: u32,
+        clk: SlotClock,
+    ) -> Result<(Value, Vec<SlotEvent>)> {
+        if let Some(b) = &self.blocked {
+            return Err(strict_unavailable(&b.reason));
+        }
+        if root_pid <= 1 || root_pid == std::process::id() {
+            return Err(Error::rejected(format!(
+                "pid {root_pid} cannot be an enrolled provider root — the daemon \
+                 never enrolls itself or init"
+            )));
+        }
+        let root = self
+            .proc
+            .identity(root_pid)
+            .map_err(|why| Error::rejected(format!("cannot enroll pid {root_pid}: {why}")))?;
+        if root.uid != self.daemon_uid {
+            return Err(Error::rejected(format!(
+                "cannot enroll pid {root_pid}: it runs as uid {} — not the daemon's uid {}",
+                root.uid, self.daemon_uid
+            )));
+        }
+        let expires_at = clk.mono + ENROLLMENT_TTL_SECS;
+        let expires_epoch = clk.wall + ENROLLMENT_TTL_SECS;
+        let mut next = self.enrollments.clone();
+        let renew = next.iter().position(|e| {
+            e.owner_actor == owner
+                && e.owner_generation == owner_generation
+                && e.root == root
+                && matches!(e.auth, AuthState::Active | AuthState::Expired)
+        });
+        let (id, renewed) = match renew {
+            Some(i) => {
+                next[i].auth = AuthState::Active;
+                next[i].expires_at = expires_at;
+                next[i].expires_epoch = expires_epoch;
+                (next[i].id.clone(), true)
+            }
+            None => {
+                for e in next.iter_mut().filter(|e| e.owner_actor == owner) {
+                    if !matches!(e.auth, AuthState::Revoked(_)) {
+                        e.auth = AuthState::Revoked("superseded by a new endpoint".into());
+                    }
+                }
+                // A tombstone for this very root is covered by the new
+                // enrollment (which keeps blocking the pane fallback);
+                // keep it only while a hold still names it.
+                let held = &self.held;
+                next.retain(|e| {
+                    e.root != root
+                        || held
+                            .iter()
+                            .any(|h| h.enrollment_id() == Some(e.id.as_str()))
+                });
+                let id = format!("enr-{}", Uuid::new_v4().simple());
+                next.push(Enrollment {
+                    id: id.clone(),
+                    owner_actor: owner.to_string(),
+                    owner_generation: owner_generation.to_string(),
+                    root,
+                    worker: root,
+                    issued_epoch: clk.wall,
+                    expires_epoch,
+                    expires_at,
+                    auth: AuthState::Active,
+                });
+                (id, false)
+            }
+        };
+        self.commit(next, self.held.clone())?;
+        let summary = json!({"enrollment_id": id, "root_pid": root_pid,
+                             "expires_epoch": expires_epoch, "renewed": renewed});
+        Ok((
+            summary.clone(),
+            vec![(owner.to_string(), "slot_enrolled", summary)],
+        ))
+    }
+
+    /// Revoke every live enrollment of `owner` — its endpoint closed.
+    /// New work is refused and its waiters drop; its holds stay
+    /// accounted until released or proven dead.
+    pub fn revoke_owner(&mut self, owner: &str, reason: &str) -> Vec<SlotEvent> {
+        let reason = reason.to_string();
+        self.revoke_where(|e| e.owner_actor == owner, |_| reason.clone())
+    }
+
+    /// Owners with an active enrollment — whose rows the daemon must
+    /// read for [`Self::revalidate_owners`].
+    pub fn enrolled_owners(&self) -> Vec<String> {
+        let mut owners: Vec<String> = self
+            .enrollments
+            .iter()
+            .filter(|e| e.auth == AuthState::Active)
+            .map(|e| e.owner_actor.clone())
+            .collect();
+        owners.sort();
+        owners.dedup();
+        owners
+    }
+
+    /// Revalidate each active enrollment against its owner row as the
+    /// daemon reads it now (`current`: owner → its generation, `None`
+    /// when the row is gone or has no live endpoint). A missing or
+    /// changed generation revokes — fail closed.
+    pub fn revalidate_owners(
+        &mut self,
+        current: &HashMap<String, Option<String>>,
+    ) -> Vec<SlotEvent> {
+        let drifted = |e: &Enrollment| {
+            current.get(&e.owner_actor).and_then(Option::as_deref)
+                != Some(e.owner_generation.as_str())
+        };
+        self.revoke_where(drifted, |e| {
+            match current.get(&e.owner_actor).and_then(Option::as_deref) {
+                None => "owner has no live endpoint".to_string(),
+                Some(_) => "owner generation changed".to_string(),
+            }
+        })
+    }
+
+    fn revoke_where(
+        &mut self,
+        hit: impl Fn(&Enrollment) -> bool,
+        reason: impl Fn(&Enrollment) -> String,
+    ) -> Vec<SlotEvent> {
+        let mut next = self.enrollments.clone();
+        let mut events = Vec::new();
+        for e in next.iter_mut() {
+            if matches!(e.auth, AuthState::Revoked(_)) || !hit(e) {
+                continue;
+            }
+            let why = reason(e);
+            events.push((
+                e.owner_actor.clone(),
+                "slot_enrollment_revoked",
+                json!({"enrollment_id": e.id, "reason": why}),
+            ));
+            e.auth = AuthState::Revoked(why);
+        }
+        if events.is_empty() || self.commit(next, self.held.clone()).is_err() {
+            return Vec::new();
+        }
+        events
+    }
+
+    /// The chain index of the nearest enrolled root on a caller's
+    /// ancestry — any authorization state, tombstones included (see
+    /// [`Self::commit`]), so a revoked or expired enrollment's
+    /// processes can still release but never fall through to an outer
+    /// pane for as long as that exact root lives. A pid only matches a root that is still the same process
+    /// (an unreadable one matches, so the strict verifier refuses it).
+    pub fn nearest_enrolled_root(&self, chain: &[u32]) -> Option<usize> {
+        chain.iter().position(|pid| {
+            self.enrollments
+                .iter()
+                .any(|e| e.root.pid == *pid && self.proc.same_start(*pid, e.root.starttime))
+        })
+    }
+
+    /// Verify `peer_pid` against the enrollment rooted at `root_pid`:
+    /// the peer must be the root or reach it through a complete,
+    /// verified ancestry (see [`ProcFs::verified_descent`]). There is
+    /// no fallback — a failed verification refuses the call.
+    pub fn strict_caller(&self, peer_pid: u32, root_pid: u32) -> Result<StrictCaller> {
+        if let Some(b) = &self.blocked {
+            return Err(strict_unavailable(&b.reason));
+        }
+        let mut why = Vec::new();
+        // A live enrollment before any tombstone sharing its root.
+        let mut candidates: Vec<&Enrollment> = self
+            .enrollments
+            .iter()
+            .filter(|e| e.root.pid == root_pid)
+            .collect();
+        candidates.sort_by_key(|e| matches!(e.auth, AuthState::Revoked(_)));
+        for e in candidates {
+            match self
+                .proc
+                .verified_descent(peer_pid, &e.root, self.daemon_uid)
+            {
+                Ok(segment) => {
+                    return Ok(StrictCaller {
+                        enrollment_id: e.id.clone(),
+                        lane: e.owner_actor.clone(),
+                        segment,
+                    })
+                }
+                Err(e) => why.push(e),
+            }
+        }
+        Err(Error::rejected(format!(
+            "Slot caller pid {peer_pid} is not verifiably its enrolled managed \
+             endpoint's process — {}",
+            if why.is_empty() {
+                "no enrollment".to_string()
+            } else {
+                why.join("; ")
+            }
+        )))
+    }
+
+    /// Strict acquire: the caller's enrollment must be active and the
+    /// claimed `pid` on its verified segment; the holder identity is
+    /// read now and bound to the hold.
+    pub fn acquire_strict(
+        &mut self,
+        kind: SlotKind,
+        caller: &StrictCaller,
+        pid: u32,
+        request_id: &str,
+        probe: bool,
+        clk: SlotClock,
+    ) -> Result<(Value, Vec<SlotEvent>)> {
+        if let Some(b) = &self.blocked {
+            return Err(strict_unavailable(&b.reason));
+        }
+        let e = self
+            .enrollments
+            .iter()
+            .find(|e| e.id == caller.enrollment_id)
+            .ok_or_else(|| Error::rejected("Slot caller's enrollment is gone"))?;
+        if e.auth != AuthState::Active || clk.mono >= e.expires_at {
+            let state = if e.auth == AuthState::Active {
+                "expired"
+            } else {
+                e.auth.as_str()
+            };
+            return Err(Error::rejected(format!(
+                "Enrollment {} is {state} — a revoked or expired enrollment admits \
+                 no new slot work; its holds stay until released or dead",
+                e.id
+            )));
+        }
+        let (owner, owner_generation) = (e.owner_actor.clone(), e.owner_generation.clone());
+        let holder = self.strict_holder(caller, pid)?;
+        self.acquire_as(
+            kind,
+            &owner,
+            pid,
+            request_id,
+            probe,
+            clk,
+            Some(StrictBind {
+                enrollment_id: caller.enrollment_id.clone(),
+                owner_generation,
+                holder,
+                liveness: Liveness::Alive,
+            }),
+        )
+    }
+
+    /// Strict release — see [`Self::release_as`].
+    pub fn release_strict(
+        &mut self,
+        token: &str,
+        caller: &StrictCaller,
+        pid: u32,
+        now: f64,
+    ) -> Result<(Value, Vec<SlotEvent>)> {
+        if let Some(b) = &self.blocked {
+            return Err(strict_unavailable(&b.reason));
+        }
+        let lane = caller.lane.clone();
+        self.release_as(token, &lane, pid, now, Some(caller))
+    }
+
+    /// The exact identity a strict hold binds: `pid` on the caller's
+    /// verified segment, running as the daemon's uid.
+    fn strict_holder(&self, caller: &StrictCaller, pid: u32) -> Result<ProcIdentity> {
+        if !caller.segment.contains(&pid) {
+            return Err(Error::rejected(format!(
+                "Slot caller cannot claim pid {pid} — it is not the connection \
+                 peer or its verified ancestor up to the enrolled root"
+            )));
+        }
+        let holder = self
+            .proc
+            .identity(pid)
+            .map_err(|why| Error::rejected(format!("Slot holder pid {pid}: {why}")))?;
+        if holder.uid != self.daemon_uid {
+            return Err(Error::rejected(format!(
+                "Slot holder pid {pid} runs as uid {} — not the daemon's uid {}",
+                holder.uid, self.daemon_uid
+            )));
+        }
+        Ok(holder)
+    }
+
+    /// Whether strict admission is available now.
+    pub fn strict_available(&self) -> bool {
+        self.blocked.is_none()
+    }
+
+    /// The one mutating operator path over a strict hold: a named
+    /// reconcile of `(enrollment_id, token)` carrying the operator's
+    /// evidence. The evidence must name the hold's recorded identity
+    /// exactly; the daemon then reads `/proc` itself and frees the
+    /// hold only on proven death — a live or unknown holder is refused,
+    /// whatever the evidence says. Deliberately no reap pass first:
+    /// the decision is this call's own observation.
+    pub fn reconcile(
+        &mut self,
+        enrollment_id: &str,
+        token: &str,
+        evidence: &Value,
+        now: f64,
+    ) -> Result<(Value, Vec<SlotEvent>)> {
+        const REQUIRED: [&str; 8] = [
+            "owner_generation",
+            "pid",
+            "starttime",
+            "uid",
+            "observed_at",
+            "process_read",
+            "command_outcome",
+            "side_effect_review",
+        ];
+        let Some((idx, b)) = self.held.iter().enumerate().find_map(|(i, h)| {
+            let b = h
+                .strict
+                .as_ref()
+                .filter(|b| b.enrollment_id == enrollment_id)?;
+            (h.token == token).then(|| (i, b.clone()))
+        }) else {
+            return Err(Error::rejected(format!(
+                "No strict hold '{token}' under enrollment {enrollment_id}"
+            )));
+        };
+        if let Some(missing) = REQUIRED
+            .iter()
+            .find(|k| evidence.get(**k).is_none_or(Value::is_null))
+        {
+            return Err(Error::rejected(format!(
+                "Reconcile evidence must carry {} — missing '{missing}'",
+                REQUIRED.join(", ")
+            )));
+        }
+        let claimed = ProcIdentity::from_json(evidence);
+        if evidence["owner_generation"].as_str() != Some(b.owner_generation.as_str())
+            || claimed != Some(b.holder)
+        {
+            return Err(Error::rejected(
+                "Reconcile evidence does not match the recorded hold — owner \
+                 generation, pid, starttime and uid must be the recorded ones",
+            ));
+        }
+        match self.proc.liveness(&b.holder) {
+            (Liveness::Alive, _) => Err(Error::rejected(format!(
+                "Holder pid {} is alive — reconcile never frees a live hold; \
+                 release it from the holder or let it exit",
+                b.holder.pid
+            ))),
+            (Liveness::Unknown, why) => Err(Error::rejected(format!(
+                "Holder pid {} liveness is unknown ({why}) — reconcile never \
+                 frees a hold it cannot prove dead",
+                b.holder.pid
+            ))),
+            (Liveness::Dead, why) => {
+                let mut next = self.held.clone();
+                let h = next.remove(idx);
+                self.commit(self.enrollments.clone(), next)?;
+                let payload = json!({"kind": h.kind.as_str(), "pid": h.pid,
+                                     "held_secs": (now - h.acquired_at).max(0.0),
+                                     "reason": format!("reconciled: {why}"),
+                                     "enrollment_id": enrollment_id,
+                                     "evidence": evidence});
+                Ok((
+                    json!({"reconciled": true, "token": token, "kind": h.kind.as_str(),
+                           "observed": why}),
+                    vec![(h.lane, "slot_released", payload)],
+                ))
+            }
+        }
+    }
+}
+
+fn strict_unavailable(reason: &str) -> Error {
+    Error::rejected(format!(
+        "Strict build-slot admission is unavailable — {reason}"
+    ))
+}
+
+/// Atomic write: tmp file (mode 0600) fsynced before the rename, the
+/// directory after it, so a crash cannot lose or tear a record.
+fn write_atomic(path: &Path, doc: &Value) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)
+        .and_then(|mut f| {
+            f.write_all(doc.to_string().as_bytes())?;
+            f.sync_all()
+        })
+        .and_then(|_| std::fs::rename(&tmp, path))?;
+    // The rename is durable only once its directory is.
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
+    }
+    Ok(())
 }
 
 /// Borrowed acquire inputs — `grant`/`find_hold` take them as one
@@ -972,6 +1989,22 @@ struct SlotReq<'a> {
     lane: &'a str,
     pid: u32,
     request_id: &'a str,
+    strict: Option<StrictBind>,
+}
+
+impl SlotReq<'_> {
+    fn enrollment_id(&self) -> Option<&str> {
+        self.strict.as_ref().map(|b| b.enrollment_id.as_str())
+    }
+
+    /// The holder's starttime — read from `/proc` for a legacy caller,
+    /// the verified identity for a strict one.
+    fn pid_start(&self) -> Option<u64> {
+        match &self.strict {
+            Some(b) => Some(b.holder.starttime),
+            None => pid_start(self.pid),
+        }
+    }
 }
 
 /// The caller identity a status read runs as — connection-derived by

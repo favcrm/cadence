@@ -1205,17 +1205,19 @@ fn tailnet_request(request: &Request, opts: &ServeOpts) -> bool {
     peer_ok && name.eq_ignore_ascii_case(dns)
 }
 
-/// Who a board write commits as (CAD-254). The cross-site guards stop
-/// browsers, not local processes: an agent with a shell can send the
-/// same headers. So a write derives its caller the way the daemon
-/// does — the TCP peer's process, then its `/proc` ancestry to the
-/// nearest registered pane ([`crate::peer::tcp_peer_pane`]).
+/// Who a board write commits as (CAD-254, CAD-263). The cross-site
+/// guards stop browsers, not local processes: an agent with a shell can
+/// send the same headers. So a write derives its caller from the peer
+/// module the daemon shares — the TCP peer's process, attributed to a
+/// registered pane by a process signal: its `/proc` ancestry or the
+/// pane's pty on its stdio. A caller-chosen `CADENCE_ALIAS` alone never
+/// attributes ([`crate::peer::tcp_peer_pane`]).
 enum WriteCaller {
     /// The operator — `actor` is `operator (ui)` or a trusted tailnet
     /// login; comment authors and monitor acks record `operator`.
     Operator(String),
-    /// A process on a registered pane's lineage IS that agent: its
-    /// alias is the actor and author, never `operator`.
+    /// A process tied to a registered pane IS that agent: its alias is
+    /// the actor and author, never `operator`.
     Agent(String),
 }
 
@@ -1265,8 +1267,8 @@ fn write_caller(
             "caller_identity",
             &format!(
                 "board write refused: caller identity underivable — {why}. \
-                 Writes attribute the peer process to its registered pane, \
-                 or to the operator when it descends from none."
+                 Writes attribute the peer process to the registered pane \
+                 it is tied to, or to the operator when it is tied to none."
             ),
         )),
     }

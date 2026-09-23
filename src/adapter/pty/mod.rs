@@ -352,8 +352,8 @@ pub fn has_control_chars(text: &str) -> bool {
 /// [`caller_chain`] and the live pane map (pane pid → alias): the
 /// NEAREST pane on the chain wins, so a caller's own pane beats any
 /// outer one and resolution never depends on map order. The daemon's
-/// slot identity (CAD-113) and the board's write identity (CAD-254)
-/// both resolve through here.
+/// slot identity (CAD-113) resolves through here; pane-attention and
+/// board-write identity use the wider [`crate::peer::PeerTies`] rule.
 pub(crate) fn nearest_pane<'a>(
     chain: &[u32],
     panes: &'a std::collections::HashMap<u32, String>,

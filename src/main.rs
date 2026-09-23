@@ -1324,6 +1324,22 @@ enum BuildSlotAction {
         #[arg(long)]
         pid: Option<u32>,
     },
+    /// Free a managed endpoint's strict hold whose holder is gone —
+    /// the one operator path over a strict hold (CAD-230). Run it
+    /// outside every pane and managed endpoint. The daemon re-reads
+    /// the holder itself and frees the hold only on proven death: a
+    /// live or unreadable holder is refused whatever the evidence says.
+    Reconcile {
+        /// The hold's enrollment (`build-slot status --json`).
+        enrollment_id: String,
+        /// The hold's token.
+        token: String,
+        /// Evidence JSON naming the recorded hold exactly:
+        /// owner_generation, pid, starttime, uid, plus observed_at,
+        /// process_read, command_outcome and side_effect_review.
+        #[arg(long)]
+        evidence: String,
+    },
     /// Who holds and who waits: per-pool capacity, holders, and the
     /// live queue. Your own lane's holds show their tokens; other
     /// lanes' holds show identity only.
@@ -2616,15 +2632,42 @@ fn print_slot_status(s: &Value) {
             .unwrap_or_default()
             .iter()
             .map(|h| {
-                format!(
+                let mut line = format!(
                     "{} {} {}",
                     h["lane"].as_str().unwrap_or("?"),
                     h["kind"].as_str().unwrap_or("?"),
                     cadence_agent::slots::fmt_wait(h["age_secs"].as_f64().unwrap_or(0.0))
-                )
+                );
+                // A strict hold names what is not ordinary about it:
+                // a non-active enrollment, a holder not provably
+                // alive, or accounting past its bound.
+                if h["binding"] == "strict" {
+                    let flags: Vec<String> = [
+                        ("auth_state", "active"),
+                        ("liveness", "alive"),
+                        ("accounting", "held"),
+                    ]
+                    .iter()
+                    .filter(|(k, ok)| h[*k].as_str().is_some_and(|v| v != *ok))
+                    .map(|(k, _)| format!("{k}={}", h[*k].as_str().unwrap_or("?")))
+                    .collect();
+                    line.push_str(" [strict");
+                    for f in flags {
+                        line.push(' ');
+                        line.push_str(&f);
+                    }
+                    line.push(']');
+                }
+                line
             })
             .collect();
         println!("{pool:<6} {}/{cap:<6} {}", held.len(), held.join(", "));
+    }
+    if s["strict"]["available"] == false {
+        println!(
+            "strict admission unavailable: {}",
+            s["strict"]["reason"].as_str().unwrap_or("?")
+        );
     }
     let waiting = s["waiting"].as_array().cloned().unwrap_or_default();
     if waiting.is_empty() {
@@ -2768,6 +2811,22 @@ fn run_build_slot(state_dir: &Path, action: &BuildSlotAction) -> Result<i32> {
                 json!({"token": token, "lane": lane, "pid": pid}),
             )?;
             println!("released {}", r["token"].as_str().unwrap_or(token));
+            Ok(0)
+        }
+        BuildSlotAction::Reconcile {
+            enrollment_id,
+            token,
+            evidence,
+        } => {
+            let evidence: Value = serde_json::from_str(evidence)
+                .map_err(|e| Error::rejected(format!("--evidence is not JSON: {e}")))?;
+            let r = client::rpc(
+                state_dir,
+                "slot_reconcile",
+                json!({"enrollment_id": enrollment_id, "token": token,
+                       "evidence": evidence}),
+            )?;
+            print_json(&r);
             Ok(0)
         }
         BuildSlotAction::Status {

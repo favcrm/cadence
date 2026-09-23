@@ -31,6 +31,7 @@ use crate::adapter::{
 use crate::client;
 use crate::error::{Error, Result};
 use crate::memory::{self, IdentityProof, NativeIdentity};
+use crate::peer::{unmatched_caller, PeerTies};
 use crate::proto;
 use crate::slots::{SlotConfig, SlotKind, Slots};
 use crate::store::{self, Agent, Message, Store, Take};
@@ -709,6 +710,9 @@ impl Shared {
                 adapter.close();
             }
         }
+        // The endpoint is gone: its build-slot enrollment admits no
+        // more work (holds stay accounted until released or dead).
+        self.revoke_endpoint(alias, "endpoint closed");
         {
             let mut pending = self.pending.lock().unwrap();
             pending.retain(|_, req| req.alias != alias);
@@ -843,6 +847,10 @@ impl Shared {
                     .set_identity_with_quota(alias, &identity, adapter.quota_snapshot())?
             }
         }
+        // CAD-230: a managed provider's process is enrolled for build
+        // slots from the pid just recorded — the daemon's own record,
+        // never a caller's claim.
+        self.enroll_endpoint(alias);
         self.wake();
         let mut gate_notice: Option<String> = None;
         let mut gate_waits: u32 = 0;
@@ -1381,6 +1389,7 @@ impl Shared {
             "slot_acquire" => self.rpc_slot_acquire(params, peer_pid),
             "slot_release" => self.rpc_slot_release(params, peer_pid),
             "slot_status" => self.rpc_slot_status(params, peer_pid),
+            "slot_reconcile" => self.rpc_slot_reconcile(params, peer_pid),
             other => Err(Error::rejected(format!("Unknown method '{other}'"))),
         }
     }
@@ -1398,17 +1407,27 @@ impl Shared {
         self.wake();
     }
 
-    /// The slot caller's connection-bound identity (CAD-113): `lane`
-    /// is the alias of the registered pane the socket peer descends
-    /// from — the NEAREST pane on the chain wins, so the caller's own
-    /// pane beats any outer one and resolution never depends on map
-    /// order — and the returned `Vec` is every pid the caller may bind
-    /// a hold to: the peer itself plus its /proc ancestors (`acquire
-    /// --pid $$` claims the invoking shell). Fail-closed: an
-    /// unreadable ancestry or no pane match refuses the call — there
-    /// is no `operator` fallback; a caller detached from every pane
-    /// holds no lane at all.
-    fn slot_caller(&self, peer_pid: u32) -> Result<(String, Vec<u32>)> {
+    /// The slot caller's connection-bound identity. The peer's pid
+    /// comes from `SO_PEERCRED` and its `/proc` ancestry is walked;
+    /// the NEAREST identity node on that chain decides, so a caller's
+    /// own pane or endpoint beats any outer one and resolution never
+    /// depends on map order:
+    ///
+    /// - a registered pty pane → the legacy binding (CAD-113, unchanged):
+    ///   `lane` is the pane's alias and every pid on the chain may bind
+    ///   a hold (`acquire --pid $$` claims the invoking shell);
+    /// - the root of a strict enrollment (CAD-230: a managed provider
+    ///   the daemon launched) → the strict binding: the peer must be
+    ///   that exact process or reach it through a complete ancestry
+    ///   verified hop by hop (pid + starttime + uid), and only that
+    ///   verified segment may bind a hold. A failed verification
+    ///   refuses — it never falls through to an outer pane.
+    ///
+    /// Fail-closed: an unreadable ancestry or no match refuses the
+    /// call — there is no `operator` fallback; a caller detached from
+    /// every pane and endpoint holds no lane at all. `Ok(None)` is the
+    /// clean "no identity" answer [`Self::rpc_slot_reconcile`] needs.
+    fn slot_identity(&self, peer_pid: u32) -> Result<Option<SlotWho>> {
         let chain = adapter::pty::caller_chain(peer_pid).ok_or_else(|| {
             Error::rejected(format!(
                 "Slot caller pid {peer_pid}: /proc ancestry unreadable — \
@@ -1422,15 +1441,111 @@ impl Shared {
             .into_iter()
             .map(|(alias, (_, pane_pid, _))| (pane_pid, alias))
             .collect();
-        let lane = adapter::pty::nearest_pane(&chain, &panes)
-            .cloned()
-            .ok_or_else(|| {
-                Error::rejected(format!(
-                    "Slot caller pid {peer_pid} descends from no registered \
-                     pane — caller identity underivable"
-                ))
-            })?;
-        Ok((lane, chain))
+        let pane_at = chain.iter().position(|pid| panes.contains_key(pid));
+        let slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        let root_at = slots.nearest_enrolled_root(&chain);
+        match (pane_at, root_at) {
+            (Some(p), Some(r)) if p == r => Err(Error::rejected(format!(
+                "Slot caller pid {peer_pid}: pid {} is both a registered pane and \
+                 an enrolled endpoint — caller identity ambiguous",
+                chain[p]
+            ))),
+            (pane, Some(r)) if pane.is_none_or(|p| r < p) => Ok(Some(SlotWho::Strict(
+                slots.strict_caller(peer_pid, chain[r])?,
+            ))),
+            (Some(p), _) => {
+                let lane = adapter::pty::nearest_pane(&chain[p..], &panes)
+                    .cloned()
+                    .unwrap_or_default();
+                Ok(Some(SlotWho::Pane { lane, chain }))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// [`Self::slot_identity`] for the slot verbs: no identity refuses.
+    fn slot_caller(&self, peer_pid: u32) -> Result<SlotWho> {
+        self.slot_identity(peer_pid)?.ok_or_else(|| {
+            Error::rejected(format!(
+                "Slot caller pid {peer_pid} descends from no registered \
+                 pane and no enrolled managed endpoint — caller identity \
+                 underivable"
+            ))
+        })
+    }
+
+    /// Revalidate every active strict enrollment against its owner row
+    /// before a slot call: a missing row, a closed endpoint or a changed
+    /// owner generation revokes (CAD-230). A store that cannot answer
+    /// refuses the call instead — it proves no drift, so it neither
+    /// revokes nor lets an unrevalidated enrollment admit.
+    fn revalidate_enrollments(&self) -> Result<()> {
+        let owners = self
+            .slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .enrolled_owners();
+        if owners.is_empty() {
+            return Ok(());
+        }
+        let mut current: HashMap<String, Option<String>> = HashMap::new();
+        for alias in owners {
+            let row = self.store.agent_opt(&alias)?;
+            current.insert(alias, row.as_ref().and_then(owner_generation));
+        }
+        let events = self
+            .slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .revalidate_owners(&current);
+        self.emit_slot_events(events);
+        Ok(())
+    }
+
+    /// Mint (or renew) the strict build-slot enrollment for a managed
+    /// endpoint that just opened — from the pid the adapter recorded
+    /// and the owner row as now written. Admission is a side benefit
+    /// of the endpoint: a refusal is recorded, never fatal.
+    fn enroll_endpoint(&self, alias: &str) {
+        let Ok(agent) = self.store.agent(alias) else {
+            return;
+        };
+        if !registry::enrolls_build_slots(&agent.provider, &agent.endpoint_kind) {
+            return;
+        }
+        let (Some(generation), Some(pid)) = (
+            owner_generation(&agent),
+            agent.pid.and_then(|p| u32::try_from(p).ok()),
+        ) else {
+            return;
+        };
+        let clk = crate::slots::SlotClock::at((self.slot_clock)(), epoch_secs());
+        let outcome = self.slots.lock().unwrap_or_else(|e| e.into_inner()).enroll(
+            alias,
+            &generation,
+            pid,
+            clk,
+        );
+        match outcome {
+            Ok((_, events)) => self.emit_slot_events(events),
+            Err(e) => {
+                let _ = self.store.event_public(
+                    alias,
+                    "slot_enrollment_refused",
+                    json!({"pid": pid, "reason": e.to_string()}),
+                );
+            }
+        }
+    }
+
+    /// The endpoint closed: its enrollment authorizes nothing more.
+    fn revoke_endpoint(&self, alias: &str, reason: &str) {
+        let events = self
+            .slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .revoke_owner(alias, reason);
+        self.emit_slot_events(events);
     }
 
     /// Resolve a memory actor only from the Unix connection peer and a
@@ -1620,31 +1735,29 @@ impl Shared {
     /// Non-blocking slot acquire (CAD-113) — the caller polls with a
     /// stable `request_id`; each answer is granted-or-queue-position.
     /// `lane`/`pid` are never taken from the request: identity is the
-    /// connection's, and a `pid` claim off the peer's own ancestry is
-    /// refused.
+    /// connection's, and a `pid` claim off the peer's own ancestry (or,
+    /// for a strict caller, off its verified segment) is refused.
     fn rpc_slot_acquire(&self, params: &Value, peer_pid: u32) -> Result<Value> {
-        let (lane, chain) = self.slot_caller(peer_pid)?;
+        self.revalidate_enrollments()?;
+        let who = self.slot_caller(peer_pid)?;
         let kind = SlotKind::parse(required_str(params, "kind")?)?;
         let request_id = required_str(params, "request_id")?;
         if request_id.len() > 128 {
             return Err(Error::rejected("Slot request_id must be <= 128 bytes"));
         }
-        let pid = Self::claimed_slot_pid(params, &chain, peer_pid)?;
+        let pid = Self::claimed_slot_pid(params, who.chain(), peer_pid)?;
         // `probe` is the read-only fast-fail: it answers granted or
         // position without leaving a waiter in the queue.
         let probe = params["probe"].as_bool().unwrap_or(false);
-        let (result, events) = self
-            .slots
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .acquire(
-                kind,
-                &lane,
-                pid,
-                request_id,
-                probe,
-                crate::slots::SlotClock::at((self.slot_clock)(), epoch_secs()),
-            )?;
+        let clk = crate::slots::SlotClock::at((self.slot_clock)(), epoch_secs());
+        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        let (result, events) = match &who {
+            SlotWho::Pane { lane, .. } => slots.acquire(kind, lane, pid, request_id, probe, clk)?,
+            SlotWho::Strict(caller) => {
+                slots.acquire_strict(kind, caller, pid, request_id, probe, clk)?
+            }
+        };
+        drop(slots);
         self.emit_slot_events(events);
         Ok(result)
     }
@@ -1652,17 +1765,21 @@ impl Shared {
     /// `slot_release` — the release must name the holding (lane,
     /// pid): a token alone is not authority to free another
     /// caller's slot. Both come from the connection: the lane is the
-    /// peer's derived pane and the pid must be on the peer's own
-    /// ancestry, so a caller can only ever name its own lineage.
+    /// peer's derived pane (or enrollment owner) and the pid must be on
+    /// the peer's own ancestry, so a caller can only ever name its own
+    /// lineage.
     fn rpc_slot_release(&self, params: &Value, peer_pid: u32) -> Result<Value> {
-        let (lane, chain) = self.slot_caller(peer_pid)?;
+        self.revalidate_enrollments()?;
+        let who = self.slot_caller(peer_pid)?;
         let token = required_str(params, "token")?;
-        let pid = Self::claimed_slot_pid(params, &chain, peer_pid)?;
-        let (result, events) = self
-            .slots
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .release(token, &lane, pid, (self.slot_clock)())?;
+        let pid = Self::claimed_slot_pid(params, who.chain(), peer_pid)?;
+        let now = (self.slot_clock)();
+        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        let (result, events) = match &who {
+            SlotWho::Pane { lane, .. } => slots.release(token, lane, pid, now)?,
+            SlotWho::Strict(caller) => slots.release_strict(token, caller, pid, now)?,
+        };
+        drop(slots);
         self.emit_slot_events(events);
         Ok(result)
     }
@@ -1672,16 +1789,54 @@ impl Shared {
     /// matches the hold and whose own ancestry includes the hold's
     /// pid. A `lane` param is ignored — identity is the connection's.
     fn rpc_slot_status(&self, _params: &Value, peer_pid: u32) -> Result<Value> {
-        let (lane, chain) = self.slot_caller(peer_pid)?;
+        self.revalidate_enrollments()?;
+        let who = self.slot_caller(peer_pid)?;
         let (status, events) = self.slots.lock().unwrap_or_else(|e| e.into_inner()).status(
             crate::slots::SlotCaller {
-                lane: &lane,
-                pids: &chain,
+                lane: who.lane(),
+                pids: who.chain(),
             },
             (self.slot_clock)(),
         );
         self.emit_slot_events(events);
         Ok(status)
+    }
+
+    /// `slot_reconcile` — the one mutating operator path over a strict
+    /// hold (CAD-230). Operator authority is the connection's: a caller
+    /// that derives ANY slot identity (a pane or an enrolled endpoint)
+    /// is an agent and is refused, and identity-shaped request fields
+    /// are refused rather than read. The daemon frees the hold only on
+    /// its own proof of the holder's death; see [`Slots::reconcile`].
+    fn rpc_slot_reconcile(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        for field in ["by", "operator", "actor", "alias", "lane", "pid"] {
+            if params.get(field).is_some() {
+                return Err(Error::rejected(format!(
+                    "slot reconcile authority is connection-bound; request field \
+                     '{field}' is not accepted"
+                )));
+            }
+        }
+        if let Some(who) = self.slot_identity(peer_pid)? {
+            return Err(Error::rejected(format!(
+                "slot reconcile is an operator action — this connection is agent \
+                 '{}'; run it outside every pane and managed endpoint",
+                who.lane()
+            )));
+        }
+        let enrollment = required_str(params, "enrollment_id")?;
+        let token = required_str(params, "token")?;
+        let evidence = params
+            .get("evidence")
+            .filter(|e| e.is_object())
+            .ok_or_else(|| Error::rejected("slot reconcile needs an evidence object"))?;
+        let (result, events) = self
+            .slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reconcile(enrollment, token, evidence, (self.slot_clock)())?;
+        self.emit_slot_events(events);
+        Ok(result)
     }
 
     fn rpc_register(self: &Arc<Self>, params: &Value) -> Result<Value> {
@@ -2279,9 +2434,11 @@ impl Shared {
     /// from an agent's pane root IS that agent), the pane's own
     /// `CADENCE_ALIAS` env the peer still carries (a `setsid` detach
     /// keeps it), and a shared controlling pty via fd targets (detach
-    /// keeps stdio). A pane must never act on its own pane state: a
-    /// worker that can reach the socket could otherwise self-sanction
-    /// the very decision the menu exists to gate.
+    /// keeps stdio). The signals are [`PeerTies`] — the one rule the
+    /// board's write identity shares (CAD-263). A pane must never act
+    /// on its own pane state: a worker that can reach the socket could
+    /// otherwise self-sanction the very decision the menu exists to
+    /// gate.
     ///
     /// Deterministic: the target's pane is checked first — self-refusal
     /// never loses to map order — then the others sorted by alias.
@@ -2302,34 +2459,28 @@ impl Shared {
         verb: &str,
     ) -> Result<(String, &'static str)> {
         let facts = self.store.pty_endpoint_facts()?;
-        let chain = proc_ancestors(peer_pid);
-        let env_alias = caller_env_alias(peer_pid);
-        let member = |pane_pid: u32| -> bool {
-            chain.as_deref().is_some_and(|c| c.contains(&pane_pid))
-                || holds_pane_tty(peer_pid, pane_pid)
-        };
+        let peer = PeerTies::probe(peer_pid);
         if let Some((_, pane_pid, _)) = facts.get(alias) {
-            if member(*pane_pid) || env_alias.as_deref() == Some(alias) {
+            if peer.tied_to(alias, *pane_pid) {
                 return Err(Error::rejected(format!(
                     "a pane cannot {verb} its own pane — the caller is tied \
                      to the target's pane process",
                 )));
             }
         }
-        let mut others: Vec<(&String, &(String, u32, String))> =
-            facts.iter().filter(|(a, _)| a.as_str() != alias).collect();
-        others.sort_by_key(|(a, _)| *a);
-        for (a, (_, pane_pid, _)) in others {
-            if member(*pane_pid) || env_alias.as_deref() == Some(a.as_str()) {
-                return Ok((a.clone(), "agent"));
-            }
+        let others = facts
+            .iter()
+            .filter(|(a, _)| a.as_str() != alias)
+            .map(|(a, (_, pane_pid, _))| (a.as_str(), *pane_pid));
+        if let Some(agent) = peer.agents(others).into_iter().next() {
+            return Ok((agent, "agent"));
         }
         // `/proc/<pid>` is a directory — `read_link` on it is always
         // EINVAL, so liveness is a `metadata` existence check.
         let target_alive = facts
             .get(alias)
             .is_some_and(|(_, pid, _)| std::fs::metadata(format!("/proc/{pid}")).is_ok());
-        unmatched_caller(chain.is_some(), target_alive, peer_on_tty(peer_pid), verb)
+        unmatched_caller(peer.walked(), target_alive, peer.on_tty(), verb)
     }
 
     /// `agent answer`: one menu-choice keystroke to a pane currently
@@ -4873,6 +5024,47 @@ fn optional_i64(params: &Value, field: &str) -> Option<i64> {
     params.get(field).and_then(Value::as_i64)
 }
 
+/// Who a slot call runs as — see [`Shared::slot_identity`].
+enum SlotWho {
+    /// Legacy binding: the nearest registered pty pane (CAD-113).
+    Pane { lane: String, chain: Vec<u32> },
+    /// Strict binding: a verified caller of a managed endpoint's
+    /// enrollment (CAD-230).
+    Strict(crate::slots::StrictCaller),
+}
+
+impl SlotWho {
+    fn lane(&self) -> &str {
+        match self {
+            SlotWho::Pane { lane, .. } => lane,
+            SlotWho::Strict(c) => &c.lane,
+        }
+    }
+
+    /// Every pid the caller may bind a hold to: the whole ancestry for
+    /// a pane caller, the verified peer-to-root segment for a strict one.
+    fn chain(&self) -> &[u32] {
+        match self {
+            SlotWho::Pane { chain, .. } => chain,
+            SlotWho::Strict(c) => &c.segment,
+        }
+    }
+}
+
+/// An enrollment's owner generation, read from the owner row: the
+/// registration instant, the adapter's endpoint generation and the
+/// recorded provider pid. A re-registration, a reopen or a closed
+/// endpoint (pid cleared) all change or erase it — `None` means the
+/// owner has no live endpoint to enroll.
+fn owner_generation(agent: &Agent) -> Option<String> {
+    let pid = agent.pid?;
+    Some(format!(
+        "{:016x}:{}:{pid}",
+        agent.created.to_bits(),
+        agent.generation.as_deref().unwrap_or("-")
+    ))
+}
+
 /// Reject peers that are not the same Unix user; return the peer PID
 /// used to derive slot and approval-answer caller identity.
 fn check_peer(stream: &UnixStream) -> Result<u32> {
@@ -4917,94 +5109,6 @@ fn process_start_identity(pid: u32) -> Result<u64> {
         .get(19)
         .and_then(|v| v.parse::<u64>().ok())
         .ok_or_else(|| Error::rejected(format!("Missing process start for pid {pid}")))
-}
-
-/// The peer's ancestor chain (peer first, up to pid 1) — `None` when
-/// any `/proc` read fails mid-walk: an incomplete chain proves neither
-/// membership nor its absence, so callers must treat it as unverifiable
-/// rather than outside.
-fn proc_ancestors(mut pid: u32) -> Option<Vec<u32>> {
-    let mut chain = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    while pid > 1 && seen.insert(pid) {
-        chain.push(pid);
-        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-        pid = status
-            .lines()
-            .find_map(|l| l.strip_prefix("PPid:"))
-            .and_then(|v| v.trim().parse().ok())?;
-    }
-    Some(chain)
-}
-
-/// The `CADENCE_ALIAS` the socket peer carries — pane env survives
-/// `setsid`, so a detached pane process still names its agent. An
-/// alias this daemon never registered means nothing (a stale or
-/// foreign daemon's env) — only registered panes match.
-fn caller_env_alias(peer_pid: u32) -> Option<String> {
-    let env = std::fs::read(format!("/proc/{peer_pid}/environ")).ok()?;
-    env.split(|b| *b == 0)
-        .filter_map(|kv| std::str::from_utf8(kv).ok())
-        .find_map(|kv| kv.strip_prefix("CADENCE_ALIAS="))
-        .filter(|a| !a.is_empty())
-        .map(str::to_string)
-}
-
-/// Does `peer_pid` hold the pane's pty? A detached pane process loses
-/// its ancestry and controlling terminal but keeps stdio — the fd
-/// targets still name the pane's pts device. Redirected stdio is the
-/// documented residual (a maximal-effort detach), accepted because the
-/// same actor could `tmux send-keys` its own pane directly.
-fn holds_pane_tty(peer_pid: u32, pane_pid: u32) -> bool {
-    let pane_tty = (0..=2)
-        .filter_map(|fd| std::fs::read_link(format!("/proc/{pane_pid}/fd/{fd}")).ok())
-        .find(|p| p.to_string_lossy().starts_with("/dev/pts/"));
-    let Some(tty) = pane_tty else {
-        return false;
-    };
-    (0..=2)
-        .any(|fd| std::fs::read_link(format!("/proc/{peer_pid}/fd/{fd}")).is_ok_and(|p| p == tty))
-}
-
-/// Does the peer hold a pty at all? Called only after every pane
-/// membership check fails, so any pts fd is foreign by definition —
-/// positive evidence of an interactive terminal, which is what
-/// `operator` means. A detached caller (`setsid … </dev/null >&2`)
-/// holds none.
-fn peer_on_tty(peer_pid: u32) -> bool {
-    (0..=2).any(|fd| {
-        std::fs::read_link(format!("/proc/{peer_pid}/fd/{fd}"))
-            .is_ok_and(|p| p.to_string_lossy().starts_with("/dev/pts/"))
-    })
-}
-
-/// The caller matched no pane — place it honestly. A broken `/proc`
-/// walk (`walked == false`) proves neither membership nor its
-/// absence: a refusal while the target pane is alive, `unknown` once
-/// it is gone. A clean walk with no match is `operator` only with
-/// positive terminal evidence (`foreign_tty`); a detached caller is
-/// `unknown`, never `operator`.
-fn unmatched_caller(
-    walked: bool,
-    target_alive: bool,
-    foreign_tty: bool,
-    verb: &str,
-) -> Result<(String, &'static str)> {
-    if !walked {
-        if target_alive {
-            return Err(Error::rejected(format!(
-                "cannot derive the caller for `{verb}` — /proc could \
-                 not be walked while the target pane is alive; run it \
-                 from a shell attached to a pane or outside all panes",
-            )));
-        }
-        return Ok(("unknown".to_string(), "unknown"));
-    }
-    if foreign_tty {
-        Ok(("operator".to_string(), "operator"))
-    } else {
-        Ok(("unknown".to_string(), "unknown"))
-    }
 }
 
 fn handle_conn(shared: Arc<Shared>, stream: UnixStream) {
