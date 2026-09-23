@@ -610,6 +610,14 @@ pub fn has_actor(provider: &str, kind: &str) -> bool {
         .unwrap_or(true)
 }
 
+/// A managed provider process the daemon launches itself (Claude or
+/// Codex over stdio/WebSocket) — the endpoints whose process the daemon
+/// enrolls for strict build-slot admission (CAD-230). Panes keep their
+/// legacy binding; the fake and mailbox kinds own no provider process.
+pub fn enrolls_build_slots(provider: &str, kind: &str) -> bool {
+    matches!(provider, "claude" | "codex") && matches!(kind, "managed" | "managed-ws")
+}
+
 /// The endpoint exposes an attachable surface (tmux pane or provider
 /// TUI). Headless and actorless endpoints are not attachable.
 pub fn attachable(provider: &str, kind: &str) -> bool {
