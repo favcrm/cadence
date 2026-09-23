@@ -97,7 +97,7 @@ pub fn run(pm: &Pm, only_project: Option<&str>) -> Result<Value> {
                 lint.err(format!("{}/{}: no issue.md", project.key, name));
                 continue;
             }
-            for sub in ["comments", "artifacts"] {
+            for sub in ["comments", "artifacts", crate::issue::task_report::DIR] {
                 let sub_dir = path.join(sub);
                 if sub_dir.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
                     lint.err(format!(
@@ -116,6 +116,17 @@ pub fn run(pm: &Pm, only_project: Option<&str>) -> Result<Value> {
                             ));
                         }
                     }
+                }
+            }
+            // Task reports (CAD-341): each file must be a valid
+            // `cadence.report/2` record filed under this very ticket.
+            for r in crate::issue::task_report::list(&path, &name) {
+                if let Some(e) = r["error"].as_str() {
+                    lint.err(format!(
+                        "{}/{}: {e}",
+                        project.key,
+                        r["path"].as_str().unwrap_or_default()
+                    ));
                 }
             }
             let text = std::fs::read_to_string(&file).unwrap_or_default();

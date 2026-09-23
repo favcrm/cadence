@@ -765,6 +765,7 @@ pub fn detail_json(pm_dir: &Path, view: &View, views_by_id: &HashMap<String, &Vi
             .map(|(name, size)| json!({"name": name, "size": size}))
             .collect::<Vec<_>>(),
         "comments": comments,
+        "reports": crate::issue::task_report::list(&view.issue.dir, &f.id),
         "notes_chain": chain,
         "acceptance": acceptance,
         "history": history,
