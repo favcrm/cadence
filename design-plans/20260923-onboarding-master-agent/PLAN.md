@@ -1,4 +1,4 @@
-# Plan — an autonomous dev team that learns, on your machine
+# Plan — MVP first: an agent team you can hand work to, then one that learns
 
 Date: 2026-09-23. Status: direction accepted by the operator ("go", 2026-09-23);
 individual designs stay proposals until their ADR or ticket lands. Readable
@@ -12,14 +12,46 @@ source of the Plan tab in [index.html](index.html). Companion records:
 
 ## Summary
 
-One **master assistant** talks with the operator. It runs **projects** — a PM
-session per project, with developer, QA and DevOps sessions on the agents the
-operator already pays for. Every agent is a folder of Markdown files (`agents/<slug>/SOUL.md`,
-`AGENT.md`, `MEMORY.md`) and can run many sessions at once. Every finished job, question
-or blocker produces a **report**; a **verifier** (deterministic checks plus a
-curator from a different vendor) turns reports into **verified memory**; every
-agent starts its next task with a small, cited **context pack** instead of
-re-reading. The operator approves what matters.
+**MVP first, then refine** (operator, 2026-09-23). The MVP makes one journey work
+end to end: install → connect the agents you already use → point at a repo → ask
+for work in chat → approve a plan → agents implement and independently review it →
+you answer questions and merge → you come back later and see what happened.
+Memory and learning, platforms, many-project scale and autonomy come after, on the
+same building blocks.
+
+## MVP — use cases and UX
+
+| # | Use case | What the user does | What they see (UX) | Tickets |
+|---|---|---|---|---|
+| 1 | Install | Runs one command (or pastes the agent prompt) | Terminal prints checks and a login link; browser opens | CAD-311, CAD-312, CAD-313 |
+| 2 | Set up | Confirms detected CLIs, picks the master (Claude or Codex), points at a repo | One setup page: checklist, master picker, repo path — nothing else | CAD-327, CAD-358, CAD-338 |
+| 3 | Ask for work | Types a goal in chat | Master replies in a thread; a **plan card** lists tickets with acceptance | CAD-319, CAD-320, CAD-328, CAD-339, CAD-359 |
+| 4 | Approve | Clicks Approve (or asks for changes) | Plan becomes an epic with a progress bar; work starts | CAD-360, CAD-405 |
+| 5 | Watch work | Nothing — or opens the project | Epic progress and stage, each ticket's status, which agent holds it | CAD-361, CAD-325, CAD-326 |
+| 6 | Answer | Clicks an answer on a question or permission card | One **Needs you** list: questions, permissions, merges — each a card with options | CAD-341, CAD-363, CAD-323 |
+| 7 | Review & merge | Clicks Merge after an independent PASS | Card shows reviewer, verdict pinned to the commit, CI state | CAD-362, CAD-363 |
+| 8 | Come back | Opens the browser next day | "Since you left" summary; the chat and project state are intact; sessions resume | CAD-324 |
+
+**MVP exit test:** on a clean Linux box, a new user installs, connects Claude or
+Codex, points at a repo, asks for a small feature, approves the plan, watches 2–3
+tickets implemented and reviewed by a different agent, answers one question,
+merges, closes the browser and returns to an accurate summary — without reading
+docs or touching a terminal after install.
+
+**MVP screens:** Setup · Home (chat + Needs you + since-you-left) · Project (epic
+progress + board) · Agents (who is doing what, minimal). Vault, Platforms and
+Settings beyond the master/repo choice are **not** in the MVP.
+
+**MVP tickets:** tracker tag `mvp` (M0 remainder + selected M1 and M2).
+Safety stays in: sandbox and backups (M0), operator auth, the gate, fresh-context
+review, secret scanning.
+
+**After the MVP, in order of evidence:**
+1. **Refine 1 — Learn:** reports → verified memory → context packs, vault
+   (today's M3; CAD-381 already merged, CAD-382 parked).
+2. **Refine 2 — Reach:** macOS, clean-machine CI, Pi adapter, many projects (M4).
+3. **Refine 3 — Ship:** connected platforms and effects (M5).
+4. **Refine 4 — Autonomy:** the dial after CAD-225 (M6).
 
 ## 0. Pragmatic core — build little, generically
 
@@ -35,12 +67,8 @@ rest is configuration on top of them or is explicitly *later*.
 | **Gate** | One policy check: action × actor × evidence → allow / ask / refuse | Plan approval, dispatch, merge, effects, memory acceptance and the autonomy dial are rows in one table |
 | **Pack** | One context builder: agent + task → bundle | A new knowledge source is one selector |
 
-**Core now** (tracker tag `core`, 30 tickets): M0 sandbox and backups; M1
-install/setup, operator auth, conversation store, continuity, read model, UI
-foundation, wizard, chat Home; M2 agent files, master, reports, plans, the gate,
-dispatch, review routing, decision cards; M3 identity, the stuck-lesson backlog,
-memory policy as gate rules, verification checks, curator, context packs, vault
-layout, stale-lesson withholding.
+**MVP uses four of the five blocks** — files, agents & sessions, records, gate. The
+pack stays minimal (contract + continuity) until Refine 1 adds verified memory.
 
 **Work model** (CAD-405, [record](../../docs/design/WORK-MODEL.md)): explicit epic/task types,
 epic stages with exit criteria, computed size-weighted progress and health,

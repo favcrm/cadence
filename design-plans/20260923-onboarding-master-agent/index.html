@@ -386,7 +386,7 @@ ul.tight{padding-left:18px;margin:6px 0}ul.tight li{margin:3px 0}
 <div class="chrome">
   <div class="brand">
     <svg width="22" height="22" viewBox="0 0 1024 1024" aria-hidden="true"><rect width="1024" height="1024" rx="224" fill="#0B0B0C"/><path d="M232 336 416 512 232 688" fill="none" stroke="#2DD4BF" stroke-opacity=".55" stroke-width="120" stroke-linecap="round" stroke-linejoin="round"/><path d="M408 336 592 512 408 688" fill="none" stroke="#2DD4BF" stroke-width="120" stroke-linecap="round" stroke-linejoin="round"/><rect x="656" y="656" width="160" height="64" rx="32" fill="#2DD4BF" fill-opacity=".7"/></svg>
-    <span class="bname">Cadence</span> <small>· plan, roadmap, research &amp; prototype — v7</small>
+    <span class="bname">Cadence</span> <small>· plan, roadmap, research &amp; prototype — v8</small>
   </div>
   <div class="seg" role="group" aria-label="View" id="tabseg">
     <button data-act="tab" data-v="plan" aria-pressed="true">Plan</button>
@@ -410,6 +410,7 @@ ul.tight{padding-left:18px;margin:6px 0}ul.tight li{margin:3px 0}
 <div class="doc">
   <nav class="toc" aria-label="Plan contents">
     <div class="k">Plan</div>
+    <a href="#p-mvp">MVP first</a>
     <a href="#p-core">Pragmatic core</a>
     <a href="#p-org">One master, many projects</a>
     <a href="#p-learn">How the team learns</a>
@@ -421,14 +422,24 @@ ul.tight{padding-left:18px;margin:6px 0}ul.tight li{margin:3px 0}
   </nav>
   <article>
     <section class="hero">
-      <div class="kicker">Consolidated plan · v7 · 2026-09-23 · Markdown source: design-plans/…/PLAN.md</div>
-      <h1>An autonomous dev team that learns — on your machine.</h1>
+      <div class="kicker">Consolidated plan · v8 · 2026-09-23 · Markdown source: design-plans/…/PLAN.md</div>
+      <h1>MVP first: an agent team you can hand work to — then one that learns.</h1>
       <p class="lede">One <b>master assistant</b> talks with you. It runs <b>projects</b> — a PM session per project, plus developer, QA and DevOps <b>sessions</b> of agents defined once as Markdown folders (<code>agents/&lt;slug&gt;/</code> SOUL.md, AGENT.md, MEMORY.md). Every finished job, question or blocker produces a <b>report</b>; a <b>verifier</b> (deterministic checks plus a curator from a different vendor) turns reports into <b>verified memory</b> in a git <b>company vault</b>; every agent starts its next task with a small, cited <b>context pack</b> instead of re-reading. You approve what matters.</p>
       <p style="margin-top:14px"><button class="btn pri" data-act="tab" data-v="proto">Clickable prototype →</button> <button class="btn" data-act="tab" data-v="roadmap">Milestones &amp; tickets →</button> <button class="btn" data-act="tab" data-v="research">State of the art →</button></p>
     </section>
 
 
-    <h2 id="p-core"><span class="n">00</span>Pragmatic core — build little, generically</h2>
+
+    <h2 id="p-mvp"><span class="n">00</span>MVP first — the journey that must work</h2>
+    <p class="sub">Make one journey work end to end, then refine. Memory, reach, platforms and autonomy come after, on the same building blocks.</p>
+    <div class="tblwrap"><table class="tbl"><tr><th>#</th><th>Use case</th><th>User does</th><th>User sees</th></tr><tr><td>1</td><td>Install</td><td>Runs one command or pastes the agent prompt</td><td>Checks and a login link; browser opens</td></tr><tr><td>2</td><td>Set up</td><td>Confirms CLIs, picks Claude or Codex as master, points at a repo</td><td>One setup page: checklist, master picker, repo path</td></tr><tr><td>3</td><td>Ask for work</td><td>Types a goal in chat</td><td>Master replies; a plan card lists tickets with acceptance</td></tr><tr><td>4</td><td>Approve</td><td>Clicks Approve or asks for changes</td><td>Plan becomes an epic with a progress bar; work starts</td></tr><tr><td>5</td><td>Watch</td><td>Opens the project, or nothing</td><td>Epic stage and progress; each ticket&#x27;s status and agent</td></tr><tr><td>6</td><td>Answer</td><td>Clicks an option on a question or permission card</td><td>One Needs-you list of cards</td></tr><tr><td>7</td><td>Review &amp; merge</td><td>Clicks Merge after an independent PASS</td><td>Reviewer, verdict pinned to the commit, CI state</td></tr><tr><td>8</td><td>Come back</td><td>Opens the browser next day</td><td>Since-you-left summary; chat and state intact</td></tr></table></div>
+    <div class="callout acc" style="max-width:none"><b>MVP exit test:</b> on a clean Linux box a new user installs, connects Claude or Codex, points at a repo, asks for a small feature, approves the plan, watches 2–3 tickets implemented and reviewed by a different agent, answers one question, merges, and returns next day to an accurate summary — without reading docs or touching a terminal after install.</div>
+    <div class="cards">
+      <div class="card"><h4>MVP screens</h4><p>Setup · Home (chat, Needs you, since you left) · Project (epic progress, board) · Agents (who is doing what). Vault and Platforms are later.</p></div>
+      <div class="card"><h4>Safety stays in</h4><p>Sandbox and backups, operator sign-in, the gate, fresh-context review, secret scanning.</p></div>
+      <div class="card"><h4>Then refine</h4><p>1 Learn (memory, vault) · 2 Reach (macOS, CI, Pi, many projects) · 3 Ship (platforms) · 4 Autonomy (after CAD-225).</p></div>
+    </div>
+    <h2 id="p-core"><span class="n">0b</span>Pragmatic core — build little, generically</h2>
     <p class="sub">Add only what is necessary, and make it generic enough to extend. Everything reduces to five building blocks; the rest is configuration or later.</p>
     <div class="tblwrap"><table class="tbl">
       <tr><th>Block</th><th>What it is</th><th>How it extends</th></tr>
@@ -439,7 +450,8 @@ ul.tight{padding-left:18px;margin:6px 0}ul.tight li{margin:3px 0}
       <tr><td>Pack</td><td>One context builder: agent + task → bundle</td><td>A new knowledge source is one selector</td></tr>
     </table></div>
     <div class="cards">
-      <div class="card"><h4>Core now · 30 tickets</h4><p>M0 sandbox and backups · M1 install, operator auth, conversation store, continuity, read model, UI foundation, wizard, chat Home · M2 agent files, master, reports, plans, gate, dispatch, review routing, decision cards · M3 identity, stuck-lesson backlog, memory policy as gate rules, checks, curator, packs, vault layout.</p></div>
+      <div class="card"><h4>MVP uses four blocks</h4><p>Files, agents &amp; sessions, records and the gate. The pack stays minimal (contract + continuity) until Refine 1 adds verified memory.</p></div>
+      <div class="card" hidden><h4>Core now · 30 tickets</h4><p>M0 sandbox and backups · M1 install, operator auth, conversation store, continuity, read model, UI foundation, wizard, chat Home · M2 agent files, master, reports, plans, gate, dispatch, review routing, decision cards · M3 identity, stuck-lesson backlog, memory policy as gate rules, checks, curator, packs, vault layout.</p></div>
       <div class="card"><h4>Work model (CAD-405)</h4><p>Explicit epic / task types · epic stages <i>shape → build → verify → release → done</i> with exit criteria · computed size-weighted progress and health (at risk, stalled) · milestones in PROJECT.md — same issue files, same gate.</p></div>
       <div class="card"><h4>Folded, not built separately</h4><p>Cross-vendor rules are gate rows · question routing is a report + decision · the verification queue is decision cards in Needs-you.</p></div>
       <div class="card"><h4>Later, when evidence asks</h4><p>Write leases, Pi adapter, nightly consolidation, skills promotion, learning dashboard, code maps, Vault UI, home-directory migration, decision-model pilot, many projects, platforms, autonomy dial.</p></div>
@@ -565,160 +577,112 @@ ul.tight{padding-left:18px;margin:6px 0}ul.tight li{margin:3px 0}
 <div class="doc">
   <nav class="toc" aria-label="Roadmap contents">
     <div class="k">Roadmap</div>
-    <a href="#rm-m0-safe">M0 · Safe foundation</a>
-    <a href="#rm-m1-first-chat">M1 · First conversation</a>
-    <a href="#rm-m2-one-team">M2 · One governed project</a>
-    <a href="#rm-m3-team-learns">M3 · The team learns</a>
-    <a href="#rm-m4-many-teams">M4 · Many projects</a>
-    <a href="#rm-m5-ships">M5 · Ships</a>
-    <a href="#rm-m6-autonomy">M6 · Autonomy dial</a>
-    <a href="#rm-gtm">Go-to-market</a>
+    <a href="#rm-mvp">MVP — hand work to an agent team</a>
+    <a href="#rm-m3-team-learns">Refine 1 — Learn</a>
+    <a href="#rm-m4-many-teams">Refine 2 — Reach (plus macOS, clean-machine CI, Pi)</a>
+    <a href="#rm-m5-ships">Refine 3 — Ship</a>
+    <a href="#rm-m6-autonomy">Refine 4 — Autonomy</a>
   </nav>
   <article>
     <section class="hero">
-      <div class="kicker">Milestones &amp; tickets · generated from the tracker</div>
-      <h1>Core first, the rest when evidence asks</h1>
-      <p class="lede"><b>Core</b> marks the 30 tickets on the pragmatic path — the five building blocks (files, agents &amp; sessions, records, gate, pack) and what M0–M3 need. Everything else stays filed as <b>later</b>. Filter with <code>cadence issue ls --tag core</code>.</p>
+      <div class="kicker">Roadmap · generated from the tracker</div>
+      <h1>MVP first, then refine</h1>
+      <p class="lede">The <b>MVP</b> makes one journey work end to end — install, connect your agents, point at a repo, ask in chat, approve a plan, agents implement and independently review, you answer and merge, you come back later. Memory, reach, platforms and autonomy follow as refine phases. Filter with <code>cadence issue ls --tag mvp</code>.</p>
     </section>
 
-    <h2 id="rm-m0-safe">M0 · Safe foundation</h2>
-    <p class="sub"><span class="chip">tag m0-safe</span> <span class="chip acc">3 core</span> <span class="chip">1/5 done</span></p>
-    <div class="callout acc" style="max-width:none"><b>Exit test:</b> Backup → restore round-trip in a sandbox; production untouched.</div>
-    <div class="tblwrap"><table class="tbl"><tr><th>Ticket</th><th>Title</th><th>Status</th><th></th></tr>
-<tr><td class="mono">CAD-310</td><td>Sandbox profile: cadence sandbox up/env/down/reset/ls with isolated state, tracker, port and gated global s…</td><td><span class="chip">doing</span></td><td><span class="chip acc">core</span></td></tr>
-<tr><td class="mono">CAD-316</td><td>Event retention: roll up delivery-noise events; agent rm keeps thread history</td><td><span class="chip">review</span></td><td><span class="chip acc">core</span></td></tr>
-<tr><td class="mono">CAD-396</td><td>Backup hardening after CAD-314: retention trusts manifest-named files, export keeps messages.turn_id, port …</td><td><span class="chip">doing</span></td><td><span class="chip acc">core</span></td></tr>
-<tr><td class="mono">CAD-309</td><td>P0 Foundation: sandbox, install, setup, operator auth, backup/restore</td><td><span class="chip">doing</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-314</td><td>cadence backup/export/restore: SQLite online backup + manifest, bundle without credentials, restore with re…</td><td><span class="chip">done</span></td><td><span class="chip">later</span></td></tr>
+    <h2 id="rm-mvp">MVP — hand work to an agent team</h2>
+    <p class="sub"><span class="chip acc">23 tickets</span> <span class="chip">0 done</span></p>
+    <div class="callout acc" style="max-width:none"><b>Exit test:</b> The eight use cases in PLAN.md work end to end on a clean Linux box.</div>
+    <div class="tblwrap"><table class="tbl"><tr><th>Ticket</th><th>Title</th><th>Status</th></tr>
+<tr><td class="mono">CAD-310</td><td>Sandbox profile: cadence sandbox up/env/down/reset/ls with isolated state, tracker, port and gated global s…</td><td><span class="chip">doing</span></td></tr>
+<tr><td class="mono">CAD-311</td><td>Release workflow and install.sh: linux x86_64/aarch64 + macOS arm64, UI embedded, checksums, --prefix</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-312</td><td>cadence setup: idempotent first run with --json checks {check,status,detail,fix} and single-use login link</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-313</td><td>ADR + implementation: operator identity for the web UI (0600 token -&gt; single-use link -&gt; HttpOnly cookie)</td><td><span class="chip">doing</span></td></tr>
+<tr><td class="mono">CAD-319</td><td>Threads store and payload events (assistant_text, tool_call redacted, tool_result, turn_result)</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-320</td><td>Claude adapter: persist intermediate assistant text and tool I/O summaries</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-323</td><td>Real interrupt: stop the provider turn and reconcile its effects</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-324</td><td>Continuity packs: summary + last N turns + plan state + preferences on new/lost/compacted sessions</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-325</td><td>Read model: indexed tracker and cached overview; SSE carries entity diffs</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-326</td><td>UI foundation: router, query cache, feature folders, light + dark tokens</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-327</td><td>Setup wizard: start (fresh/restore/tracker/import), environment, platforms, master, workspace, team, launch</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-328</td><td>Chat-first Home: thread, plan/permission/effect cards, Needs-you rail, since-you-left</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-338</td><td>Agent filesystem ADR (amends ADR-0001): agents/&lt;slug&gt;/ SOUL.md AGENT.md MEMORY.md with many sessions; staff…</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-339</td><td>Master role: company assistant that creates teams from the catalog, routes escalations and sends a daily di…</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-341</td><td>Structured reports: done / question / blocked with the six-field reflection and context feedback, stored pe…</td><td><span class="chip">doing</span></td></tr>
+<tr><td class="mono">CAD-358</td><td>cadence project new: register a repo and seed its context manifest and team.yaml</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-359</td><td>Plan proposals: plan.yaml schema, plan_proposed event and plan card</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-360</td><td>Plan approval commit and daemon dispatch gate: refuse dispatch outside approved plans with a named reason</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-361</td><td>Staff and dispatch from approved plans via team.yaml roles; the team PM dispatches</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-362</td><td>Reviewer routing: cross-vendor QA assignment, verdict → DevOps merge-queue handoff</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-363</td><td>Merges, effects and operator questions in Needs-you: one decision per cause</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-396</td><td>Backup hardening after CAD-314: retention trusts manifest-named files, export keeps messages.turn_id, port …</td><td><span class="chip">doing</span></td></tr>
+<tr><td class="mono">CAD-405</td><td>Work model: explicit epic/task types, epic stages with exit criteria, computed weighted progress and health…</td><td><span class="chip">backlog</span></td></tr>
 </table></div>
 
-    <h2 id="rm-m1-first-chat">M1 · First conversation</h2>
-    <p class="sub"><span class="chip">tag m1-first-chat</span> <span class="chip acc">9 core</span> <span class="chip">0/16 done</span></p>
-    <div class="callout acc" style="max-width:none"><b>Exit test:</b> Clean box to chat in under 5 minutes; kill the master&#x27;s session mid-plan and it resumes.</div>
-    <div class="tblwrap"><table class="tbl"><tr><th>Ticket</th><th>Title</th><th>Status</th><th></th></tr>
-<tr><td class="mono">CAD-311</td><td>Release workflow and install.sh: linux x86_64/aarch64 + macOS arm64, UI embedded, checksums, --prefix</td><td><span class="chip">backlog</span></td><td><span class="chip acc">core</span></td></tr>
-<tr><td class="mono">CAD-312</td><td>cadence setup: idempotent first run with --json checks {check,status,detail,fix} and single-use login link</td><td><span class="chip">backlog</span></td><td><span class="chip acc">core</span></td></tr>
-<tr><td class="mono">CAD-313</td><td>ADR + implementation: operator identity for the web UI (0600 token -&gt; single-use link -&gt; HttpOnly cookie)</td><td><span class="chip">doing</span></td><td><span class="chip acc">core</span></td></tr>
-<tr><td class="mono">CAD-319</td><td>Threads store and payload events (assistant_text, tool_call redacted, tool_result, turn_result)</td><td><span class="chip">backlog</span></td><td><span class="chip acc">core</span></td></tr>
-<tr><td class="mono">CAD-324</td><td>Continuity packs: summary + last N turns + plan state + preferences on new/lost/compacted sessions</td><td><span class="chip">backlog</span></td><td><span class="chip acc">core</span></td></tr>
-<tr><td class="mono">CAD-325</td><td>Read model: indexed tracker and cached overview; SSE carries entity diffs</td><td><span class="chip">backlog</span></td><td><span class="chip acc">core</span></td></tr>
-<tr><td class="mono">CAD-326</td><td>UI foundation: router, query cache, feature folders, light + dark tokens</td><td><span class="chip">backlog</span></td><td><span class="chip acc">core</span></td></tr>
-<tr><td class="mono">CAD-327</td><td>Setup wizard: start (fresh/restore/tracker/import), environment, platforms, master, workspace, team, launch</td><td><span class="chip">backlog</span></td><td><span class="chip acc">core</span></td></tr>
-<tr><td class="mono">CAD-328</td><td>Chat-first Home: thread, plan/permission/effect cards, Needs-you rail, since-you-left</td><td><span class="chip">backlog</span></td><td><span class="chip acc">core</span></td></tr>
-<tr><td class="mono">CAD-160</td><td>Compose objective + outstanding criteria into every task-bound message; never truncate criteria (ADR-0002 p…</td><td><span class="chip">review</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-315</td><td>macOS port: caller attribution and host doctor without /proc</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-317</td><td>Sandbox S3: clean-machine install CI (ubuntu:24.04 + macos-14) with fake providers</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-318</td><td>P1 Chat and continuity: threads, payload events, Pi adapter, continuity packs, read model, wizard, chat Home</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-320</td><td>Claude adapter: persist intermediate assistant text and tool I/O summaries</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-322</td><td>Pi headless adapter (pi --mode rpc): streaming, tool progress, model/effort, cancel, resume</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-323</td><td>Real interrupt: stop the provider turn and reconcile its effects</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
+    <h2 id="rm-m3-team-learns">Refine 1 — Learn</h2>
+    <p class="sub"><span class="chip ">25 tickets</span> <span class="chip">0 done</span></p>
+    <div class="callout acc" style="max-width:none"><b>Exit test:</b> A lesson from one worker is verified by another vendor and reused by a different worker; stale withheld; poisoned rejected.</div>
+    <div class="tblwrap"><table class="tbl"><tr><th>Ticket</th><th>Title</th><th>Status</th></tr>
+<tr><td class="mono">CAD-66</td><td>Knowledge graph per project via graphify: built from repo, tracker and notes; refreshed on merge; shown on …</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-67</td><td>LLM wiki: agent-maintained project pages with provenance and staleness checks</td><td><span class="chip">dropped</span></td></tr>
+<tr><td class="mono">CAD-111</td><td>Automatic retro per merged issue: rounds, what review caught, flakes, lead time, proposed lessons</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-192</td><td>Evidence-backed memory capture: structured required source, secret scan on propose</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-193</td><td>Memory lifecycle enforcement: prior-status check, verify must cite evidence, atomic supersede</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-194</td><td>Job dispatch injects no memory, and path scope needs recorded commits so new issues match nothing</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-197</td><td>Auditor agents cannot deliver artifacts: codex-1 attach and notify failed with bwrap RTM_NEWADDR</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-203</td><td>Stale and contradicted accepted lessons stay eligible for injection: match filters on status only</td><td><span class="chip">doing</span></td></tr>
+<tr><td class="mono">CAD-260</td><td>Unblock memory review: define native-identity proof for proposers, or an operator curation path</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-346</td><td>Company vault: git layout (company, teams, projects, playbooks, lessons, decisions, faq, inbox) with index …</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-347</td><td>Memory policy v2 (ADR): logic checks + cross-vendor curator for project/role scope, quorum for company scop…</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-348</td><td>Verification runner: resolve citations at HEAD, re-run cited tests in a build slot, secret scan, dedupe, co…</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-349</td><td>Curator role and queue: ADD / UPDATE / INVALIDATE / NOOP / ESCALATE verdicts with operator escalation</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-350</td><td>Candidate extraction from reports and retros: typed claims (fact, strategy, pitfall, procedure, faq) with e…</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-351</td><td>Context pack builder: one path for issue dispatch, job dispatch and continuity; items verified at SHA; plan…</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-352</td><td>Nightly consolidation as a reviewed vault PR: merge duplicates, invalidate stale, propose skills; never rew…</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-353</td><td>Skills from procedures: promote to Agent Skills only after an evaluation shows benefit</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-354</td><td>Learning metrics and A/B harness: reuse, helpful/harm, stale rate, reads avoided, tokens and time; planted-…</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-355</td><td>Move agent notes (/var/www/agent-notes) into git so notes and retros are portable</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-356</td><td>Project context manifests for every project and commit-keyed code maps as pack sources</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-357</td><td>Vault UI: overview, company docs, lessons, verification queue, context-pack preview</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-381</td><td>One identity verifier for every daemon-launched endpoint (pty and managed): reuse the CAD-230 enrollment fo…</td><td><span class="chip">doing</span></td></tr>
+<tr><td class="mono">CAD-382</td><td>Clear the stuck memory backlog: the 11 proposed lessons become agent-claimed candidates and run checks → cu…</td><td><span class="chip">doing</span></td></tr>
+<tr><td class="mono">CAD-392</td><td>Home directory ~/.cadence (CADENCE_HOME) and backward-compatible tracker migration: expand → roll out → mig…</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-394</td><td>Pilot a typed decision model (TypeSafe Jev 1.13 via OpenRouter) for ticket classification, tagging and rout…</td><td><span class="chip">backlog</span></td></tr>
 </table></div>
 
-    <h2 id="rm-m2-one-team">M2 · One governed project</h2>
-    <p class="sub"><span class="chip">tag m2-one-team</span> <span class="chip acc">8 core</span> <span class="chip">0/28 done</span></p>
-    <div class="callout acc" style="max-width:none"><b>Exit test:</b> A 3-issue plan lands with verdicts pinned to each head, a report per job, and one question answered at the lowest level.</div>
-    <div class="tblwrap"><table class="tbl"><tr><th>Ticket</th><th>Title</th><th>Status</th><th></th></tr>
-<tr><td class="mono">CAD-338</td><td>Agent filesystem ADR (amends ADR-0001): agents/&lt;slug&gt;/ SOUL.md AGENT.md MEMORY.md with many sessions; staff…</td><td><span class="chip">backlog</span></td><td><span class="chip acc">core</span></td></tr>
-<tr><td class="mono">CAD-339</td><td>Master role: company assistant that creates teams from the catalog, routes escalations and sends a daily di…</td><td><span class="chip">backlog</span></td><td><span class="chip acc">core</span></td></tr>
-<tr><td class="mono">CAD-341</td><td>Structured reports: done / question / blocked with the six-field reflection and context feedback, stored pe…</td><td><span class="chip">backlog</span></td><td><span class="chip acc">core</span></td></tr>
-<tr><td class="mono">CAD-359</td><td>Plan proposals: plan.yaml schema, plan_proposed event and plan card</td><td><span class="chip">backlog</span></td><td><span class="chip acc">core</span></td></tr>
-<tr><td class="mono">CAD-360</td><td>Plan approval commit and daemon dispatch gate: refuse dispatch outside approved plans with a named reason</td><td><span class="chip">backlog</span></td><td><span class="chip acc">core</span></td></tr>
-<tr><td class="mono">CAD-361</td><td>Staff and dispatch from approved plans via team.yaml roles; the team PM dispatches</td><td><span class="chip">backlog</span></td><td><span class="chip acc">core</span></td></tr>
-<tr><td class="mono">CAD-362</td><td>Reviewer routing: cross-vendor QA assignment, verdict → DevOps merge-queue handoff</td><td><span class="chip">backlog</span></td><td><span class="chip acc">core</span></td></tr>
-<tr><td class="mono">CAD-363</td><td>Merges, effects and operator questions in Needs-you: one decision per cause</td><td><span class="chip">backlog</span></td><td><span class="chip acc">core</span></td></tr>
-<tr><td class="mono">CAD-77</td><td>Multi-level groups: upstream chains, results one level up, escalation that bubbles when unanswered</td><td><span class="chip">dropped</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-78</td><td>Task roles in jobs: planner, implementer, reviewer, merger with enforced separation of duties</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-116</td><td>team.yaml schema + parser + cadence team show with drift report (ADR-0001 phase 2a)</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-120</td><td>Route qa-1&#x27;s review through job verdict so the existing self-review gate is on the live path (ADR-0001 phas…</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-122</td><td>Role capabilities: closed set, verb-to-capability map, daemon refusal with the rule named (ADR-0001 phase 3b)</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-131</td><td>Plumb effort for codex/cursor/devin: resolve (provider, model, effort) and compose slug suffixes, validatin…</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-213</td><td>Reliable report delivery: durable GitHub relay and quota-aware PM intake consumer</td><td><span class="chip">ready</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-223</td><td>Agent profile editor: provider capabilities, desired versus running model and effort</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-224</td><td>Goal intake: turn project outcomes into a dependency-aware executable plan</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-298</td><td>Dispatch refuses an issue with empty acceptance (switch CAD-159&#x27;s warning to a refusal after backfill)</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-329</td><td>P2 Projects and plans: project new, plan propose, plan card approval, daemon dispatch gate</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-330</td><td>P3 Delegation: workers from approved plans, cross-vendor reviewer routing, merges in Needs-you, terminal view</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-340</td><td>Cross-vendor rules: QA provider differs from the author&#x27;s, curator differs from the proposer&#x27;s; fallback la…</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-342</td><td>Question routing up the tree: worker → PM → master → operator, vault/FAQ lookup first; answers become decis…</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-343</td><td>Agents UI: definitions (SOUL, AGENT, MEMORY editor with provider/model/effort), live sessions, reports</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-345</td><td>Reconcile team and memory docs with code: QA vs PM acceptance, role vocabularies, stale claims</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-358</td><td>cadence project new: register a repo and seed its context manifest and team.yaml</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-364</td><td>Live read-only terminal view for pty agents (tmux control mode)</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-378</td><td>One writer per code area: path-scoped write leases in dispatch; parallel work limited to reads (review, res…</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-393</td><td>Board writes by managed agents are attributed to the operator: ui.rs write_caller treats any non-pane peer …</td><td><span class="chip">dropped</span></td><td><span class="chip">later</span></td></tr>
-</table></div>
-
-    <h2 id="rm-m3-team-learns">M3 · The team learns</h2>
-    <p class="sub"><span class="chip">tag m3-team-learns</span> <span class="chip acc">10 core</span> <span class="chip">0/25 done</span></p>
-    <div class="callout acc" style="max-width:none"><b>Exit test:</b> A lesson from one worker is verified by a curator of another vendor and reused by a different worker; a stale item is withheld; a planted poisoned item is rejected.</div>
-    <div class="tblwrap"><table class="tbl"><tr><th>Ticket</th><th>Title</th><th>Status</th><th></th></tr>
-<tr><td class="mono">CAD-194</td><td>Job dispatch injects no memory, and path scope needs recorded commits so new issues match nothing</td><td><span class="chip">backlog</span></td><td><span class="chip acc">core</span></td></tr>
-<tr><td class="mono">CAD-203</td><td>Stale and contradicted accepted lessons stay eligible for injection: match filters on status only</td><td><span class="chip">doing</span></td><td><span class="chip acc">core</span></td></tr>
-<tr><td class="mono">CAD-260</td><td>Unblock memory review: define native-identity proof for proposers, or an operator curation path</td><td><span class="chip">backlog</span></td><td><span class="chip acc">core</span></td></tr>
-<tr><td class="mono">CAD-346</td><td>Company vault: git layout (company, teams, projects, playbooks, lessons, decisions, faq, inbox) with index …</td><td><span class="chip">backlog</span></td><td><span class="chip acc">core</span></td></tr>
-<tr><td class="mono">CAD-347</td><td>Memory policy v2 (ADR): logic checks + cross-vendor curator for project/role scope, quorum for company scop…</td><td><span class="chip">backlog</span></td><td><span class="chip acc">core</span></td></tr>
-<tr><td class="mono">CAD-348</td><td>Verification runner: resolve citations at HEAD, re-run cited tests in a build slot, secret scan, dedupe, co…</td><td><span class="chip">backlog</span></td><td><span class="chip acc">core</span></td></tr>
-<tr><td class="mono">CAD-349</td><td>Curator role and queue: ADD / UPDATE / INVALIDATE / NOOP / ESCALATE verdicts with operator escalation</td><td><span class="chip">backlog</span></td><td><span class="chip acc">core</span></td></tr>
-<tr><td class="mono">CAD-351</td><td>Context pack builder: one path for issue dispatch, job dispatch and continuity; items verified at SHA; plan…</td><td><span class="chip">backlog</span></td><td><span class="chip acc">core</span></td></tr>
-<tr><td class="mono">CAD-381</td><td>One identity verifier for every daemon-launched endpoint (pty and managed): reuse the CAD-230 enrollment fo…</td><td><span class="chip">doing</span></td><td><span class="chip acc">core</span></td></tr>
-<tr><td class="mono">CAD-382</td><td>Clear the stuck memory backlog: the 11 proposed lessons become agent-claimed candidates and run checks → cu…</td><td><span class="chip">backlog</span></td><td><span class="chip acc">core</span></td></tr>
-<tr><td class="mono">CAD-66</td><td>Knowledge graph per project via graphify: built from repo, tracker and notes; refreshed on merge; shown on …</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-67</td><td>LLM wiki: agent-maintained project pages with provenance and staleness checks</td><td><span class="chip">dropped</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-111</td><td>Automatic retro per merged issue: rounds, what review caught, flakes, lead time, proposed lessons</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-192</td><td>Evidence-backed memory capture: structured required source, secret scan on propose</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-193</td><td>Memory lifecycle enforcement: prior-status check, verify must cite evidence, atomic supersede</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-197</td><td>Auditor agents cannot deliver artifacts: codex-1 attach and notify failed with bwrap RTM_NEWADDR</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-350</td><td>Candidate extraction from reports and retros: typed claims (fact, strategy, pitfall, procedure, faq) with e…</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-352</td><td>Nightly consolidation as a reviewed vault PR: merge duplicates, invalidate stale, propose skills; never rew…</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-353</td><td>Skills from procedures: promote to Agent Skills only after an evaluation shows benefit</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-354</td><td>Learning metrics and A/B harness: reuse, helpful/harm, stale rate, reads avoided, tokens and time; planted-…</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-355</td><td>Move agent notes (/var/www/agent-notes) into git so notes and retros are portable</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-356</td><td>Project context manifests for every project and commit-keyed code maps as pack sources</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-357</td><td>Vault UI: overview, company docs, lessons, verification queue, context-pack preview</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-392</td><td>Home directory ~/.cadence (CADENCE_HOME) and backward-compatible tracker migration: expand → roll out → mig…</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-394</td><td>Pilot a typed decision model (TypeSafe Jev 1.13 via OpenRouter) for ticket classification, tagging and rout…</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-</table></div>
-
-    <h2 id="rm-m4-many-teams">M4 · Many projects</h2>
-    <p class="sub"><span class="chip">tag m4-many-teams</span> <span class="chip acc">0 core</span> <span class="chip">0/6 done</span></p>
+    <h2 id="rm-m4-many-teams">Refine 2 — Reach (plus macOS, clean-machine CI, Pi)</h2>
+    <p class="sub"><span class="chip ">6 tickets</span> <span class="chip">0 done</span></p>
     <div class="callout acc" style="max-width:none"><b>Exit test:</b> Two projects run concurrently with no cross-project leakage.</div>
-    <div class="tblwrap"><table class="tbl"><tr><th>Ticket</th><th>Title</th><th>Status</th><th></th></tr>
-<tr><td class="mono">CAD-80</td><td>Budgets per level: tokens, quota and wall-clock per role and per epic, with quota-aware routing</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-82</td><td>Overview dashboard: one screen across all projects for what needs me, who is doing what, what is in flight,…</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-114</td><td>Provider quota visibility: Devin ACU and Codex quota in doctor --host and the Overview</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-212</td><td>Safe agent provider replacement: drain, checkpoint, validate and transfer queued work without duplicate del…</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-226</td><td>Agent inbox UX: accountable consumers, delivery stages and actionable backlog</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-344</td><td>Multiple teams under one master: cross-team capacity and priorities, isolation, daily digest</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
+    <div class="tblwrap"><table class="tbl"><tr><th>Ticket</th><th>Title</th><th>Status</th></tr>
+<tr><td class="mono">CAD-80</td><td>Budgets per level: tokens, quota and wall-clock per role and per epic, with quota-aware routing</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-82</td><td>Overview dashboard: one screen across all projects for what needs me, who is doing what, what is in flight,…</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-114</td><td>Provider quota visibility: Devin ACU and Codex quota in doctor --host and the Overview</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-212</td><td>Safe agent provider replacement: drain, checkpoint, validate and transfer queued work without duplicate del…</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-226</td><td>Agent inbox UX: accountable consumers, delivery stages and actionable backlog</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-344</td><td>Multiple teams under one master: cross-team capacity and priorities, isolation, daily digest</td><td><span class="chip">backlog</span></td></tr>
 </table></div>
 
-    <h2 id="rm-m5-ships">M5 · Ships</h2>
-    <p class="sub"><span class="chip">tag m5-ships</span> <span class="chip acc">0 core</span> <span class="chip">0/7 done</span></p>
-    <div class="callout acc" style="max-width:none"><b>Exit test:</b> Preview deploys automatic; production deploys and sends only on your press.</div>
-    <div class="tblwrap"><table class="tbl"><tr><th>Ticket</th><th>Title</th><th>Status</th><th></th></tr>
-<tr><td class="mono">AOS-49</td><td>Agent credential exchange for local runtimes (Cadence): device-style code, email-OTP sign-in, scope consent…</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-331</td><td>P4 Connected platforms: contract ADR, credential proxy, effect gate (read/draft/send), Cloudflare platform,…</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-365</td><td>ADR: connected-platform contract — credential exchange, MCP tools with declared effects, pending-effect API</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-366</td><td>Platform proxy: credential custody, per-agent scopes, effect gate</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-367</td><td>Cloudflare (own account) platform: preview deploy automatic, production deploy as an effect</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-368</td><td>AgenticOS v2 platform adapter</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-369</td><td>Platforms UI: services, access matrix, pending effects</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
+    <h2 id="rm-m5-ships">Refine 3 — Ship</h2>
+    <p class="sub"><span class="chip ">7 tickets</span> <span class="chip">0 done</span></p>
+    <div class="callout acc" style="max-width:none"><b>Exit test:</b> Preview deploys automatic; production and sends only on your press.</div>
+    <div class="tblwrap"><table class="tbl"><tr><th>Ticket</th><th>Title</th><th>Status</th></tr>
+<tr><td class="mono">AOS-49</td><td>Agent credential exchange for local runtimes (Cadence): device-style code, email-OTP sign-in, scope consent…</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-331</td><td>P4 Connected platforms: contract ADR, credential proxy, effect gate (read/draft/send), Cloudflare platform,…</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-365</td><td>ADR: connected-platform contract — credential exchange, MCP tools with declared effects, pending-effect API</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-366</td><td>Platform proxy: credential custody, per-agent scopes, effect gate</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-367</td><td>Cloudflare (own account) platform: preview deploy automatic, production deploy as an effect</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-368</td><td>AgenticOS v2 platform adapter</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-369</td><td>Platforms UI: services, access matrix, pending effects</td><td><span class="chip">backlog</span></td></tr>
 </table></div>
 
-    <h2 id="rm-m6-autonomy">M6 · Autonomy dial</h2>
-    <p class="sub"><span class="chip">tag m6-autonomy</span> <span class="chip acc">0 core</span> <span class="chip">0/4 done</span></p>
+    <h2 id="rm-m6-autonomy">Refine 4 — Autonomy</h2>
+    <p class="sub"><span class="chip ">4 tickets</span> <span class="chip">0 done</span></p>
     <div class="callout acc" style="max-width:none"><b>Exit test:</b> Only after CAD-225 is green.</div>
-    <div class="tblwrap"><table class="tbl"><tr><th>Ticket</th><th>Title</th><th>Status</th><th></th></tr>
-<tr><td class="mono">CAD-86</td><td>Overview slice 4: flow and quality metrics</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-139</td><td>Idea pipeline: an idea ticket triggers research and a plan draft, then waits for the operator&#x27;s decision</td><td><span class="chip">ready</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-225</td><td>Unattended team acceptance: goal to reviewed merge with restart and provider failure recovery</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-<tr><td class="mono">CAD-332</td><td>Autonomy dial: routine merges automatic per project, unlocked only after CAD-225</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
-</table></div>
-
-    <h2 id="rm-gtm">Go-to-market</h2>
-    <p class="sub"><span class="chip">tag gtm</span> <span class="chip acc">0 core</span> <span class="chip">0/1 done</span></p>
-    <div class="callout acc" style="max-width:none"><b>Exit test:</b> Legal review of provider terms before the beta.</div>
-    <div class="tblwrap"><table class="tbl"><tr><th>Ticket</th><th>Title</th><th>Status</th><th></th></tr>
-<tr><td class="mono">CAD-333</td><td>Go-to-market: design partners, provider-terms legal review, demo, OSS launch</td><td><span class="chip">backlog</span></td><td><span class="chip">later</span></td></tr>
+    <div class="tblwrap"><table class="tbl"><tr><th>Ticket</th><th>Title</th><th>Status</th></tr>
+<tr><td class="mono">CAD-86</td><td>Overview slice 4: flow and quality metrics</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-139</td><td>Idea pipeline: an idea ticket triggers research and a plan draft, then waits for the operator&#x27;s decision</td><td><span class="chip">ready</span></td></tr>
+<tr><td class="mono">CAD-225</td><td>Unattended team acceptance: goal to reviewed merge with restart and provider failure recovery</td><td><span class="chip">backlog</span></td></tr>
+<tr><td class="mono">CAD-332</td><td>Autonomy dial: routine merges automatic per project, unlocked only after CAD-225</td><td><span class="chip">backlog</span></td></tr>
 </table></div>
 
   </article>
@@ -1426,7 +1390,7 @@ function toggleTheme(){
 })();
 
 /* ---------- data ---------- */
-const SCREENS=[['install','Install'],['setup','Setup wizard'],['home','Home · chat'],['projects','Projects'],['teams','Agents'],['vault','Company vault'],['services','Platforms'],['settings','Settings']];
+const SCREENS=[['install','Install'],['setup','Setup wizard'],['home','Home · chat'],['projects','Projects'],['teams','Agents'],['vault','Company vault · later'],['services','Platforms · later'],['settings','Settings']];
 const STEPS=[['Start','fresh · restore · import'],['Environment','checks & fixes'],['Platforms','optional services'],['Master agent','provider & model'],['Workspace','tracker & first project'],['Staffing & autonomy','agents × sessions, dial'],['Launch','review & start']];
 const CHECKS=[
  {n:'git',d:'2.47.1',s:'ok'},{n:'tmux',d:'3.5a · needed for Devin/Cursor panes',s:'ok'},{n:'gh',d:'2.63 · signed in as @harbor-dev',s:'ok'},
