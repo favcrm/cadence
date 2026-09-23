@@ -46,7 +46,7 @@ Error kinds:
 | `agent_send` | `alias, text, message?, reply_to?, source?, task?, nudge?` | `{message,state,duplicate,warning?}` — `task` attaches the delivery to a task for indexing; `nudge: true` (CLI `send --nudge` / `message send --nudge`, pty only, no `reply_to`, not with `--ready`) records a turnless `source: "nudge"` delivery — see the CAD-250 section; `warning` names a stale inbox target (queued anyway — see inbox endpoints) |
 | `agent_ask` | `alias, text, message?, reply_to?, wait?` | the `Message` row; state may be non-terminal if `wait` expired |
 | `agent_events` | `alias, after?, wait(<=30), tail?` | `{events:[Event], cursor, has_older}` — `tail:true` returns the newest page (50) in ascending order instead of paging forward from `after` |
-| `thread_read` | `alias, after?, limit?(1-500, default 100), wait?(<=30)` | `{alias, thread:{id,alias,created,updated}\|null, entries:[{seq,thread,role,kind,text,payload,message,created}], cursor}` — the agent's durable chat (CAD-319), oldest first after `after`. Removing the agent archives its thread (rows kept by thread id, a `system` entry marks the removal) and a new agent under the reused alias starts a fresh one (CAD-304 S4); archived threads are not readable by alias in the MVP. Reads are unscoped in the MVP — any local caller can read any alias's thread, the same as `agent_show`/`agent_events`. Roles `operator\|agent\|system`; kinds `message\|assistant_text\|tool_call\|tool_result\|turn_result`. Text and payload strings are secret-redacted before they are stored; tool calls are a one-line redacted summary, never the raw input. A live turn token quoted in prose is not scrubbed on write — the secret scan does not know it — and is only redacted at `export` |
+| `thread_read` | `alias, after?, limit?(1-500, default 100), wait?(<=30)` | `{alias, thread:{id,alias,created,updated}\|null, entries:[{seq,thread,role,kind,text,payload,message,created}], cursor}` — the agent's durable chat (CAD-319), oldest first after `after`. Removing the agent archives its thread (rows kept by thread id, a `system` entry marks the removal) and a new agent under the reused alias starts a fresh one (CAD-304 S4); archived threads are not readable by alias in the MVP. Reads are unscoped in the MVP — any local caller can read any alias's thread, the same as `agent_show`/`agent_events`. Roles `operator\|agent\|system`; kinds `message\|assistant_text\|tool_call\|tool_result\|turn_result`. Text and payload strings are secret-redacted before they are stored; tool calls and tool results are a one-line redacted summary (≤160 chars; a result adds `payload.is_error`), never the raw input or output. `assistant_text` is intermediate prose only (managed Claude text blocks, Codex commentary items, `payload.phase: "commentary"`); the final answer is stored once, as the `turn_result` (CAD-320). A live turn token quoted in prose is not scrubbed on write — the secret scan does not know it — and is only redacted at `export` |
 | `thread_send` | `alias, text, message?` | `agent_send`'s receipt plus `thread` — starts the alias's thread on first use, inside the enqueue transaction (a refused message starts none), and queues the text as an `operator` entry. Refused for a connection the daemon attributes to an agent (pane or enrolled managed endpoint) and for an underivable caller; tied to no agent is the operator by default, not positive proof (CAD-313). Any other field is refused. Once a thread exists, every message queued to the alias is recorded too: `operator` when `agent_send`'s connection is tied to no agent, `system` (payload `from`/`source`) otherwise |
 | `agent_requests` | `alias` | `{requests:[{request,method,params}]}` |
 | `agent_respond` | `alias, request, decision?|answers?, reason?` | `{state:"answered"}` — `reason` rides a brokered decline as the provider's denial message |
@@ -934,8 +934,15 @@ optional `turn_max_secs` absolute cap, which fences even a chatty turn.
 The fence records the provider's own reason (`No provider event for
 900s`, `Turn exceeded turn_max_secs`, EOF, …) so reconcile knows why.
 Each `assistant` tool_use block also lands as a compact `tool_use`
-event — the tool name only — so `events --follow` shows progress on a
-long turn.
+event — the tool name and a redacted one-line input summary — so
+`events --follow` shows progress on a long turn. Each `tool_result`
+block in a `user` event lands as a `tool_result` event with a redacted
+summary of at most 160 chars and `is_error`, never the output itself.
+For a threaded agent both become thread entries, and so does each
+assistant text block (`assistant_text`, never an event). The adapter
+holds the latest text block until the next event and drops the one
+the `result` repeats, so the final answer appears once, as the
+`turn_result` (CAD-320).
 
 The child's environment is scrubbed **by rule**: `CLAUDECODE` and every
 inherited `CLAUDE_*`, `CODEX_*`, `CADENCE_*` name is removed — a name

@@ -16,12 +16,13 @@
 //! |------------|------------------|---------------------------------------------|
 //! | `operator` | `message`        | a message the operator queued to the agent  |
 //! | `system`   | `message`        | any other queued message (routed result, kickoff, agent peer) |
-//! | `agent`    | `assistant_text` | Codex `agentMessage` items as they persist  |
+//! | `agent`    | `assistant_text` | Codex commentary `agentMessage` items and managed Claude text blocks, as they persist |
 //! | `agent`    | `tool_call`      | managed Claude `tool_use` (name + redacted summary) |
+//! | `agent`    | `tool_result`    | managed Claude `tool_result` (redacted ≤160-char summary + `is_error`) |
 //! | `agent`    | `turn_result`    | the turn's final result, any provider       |
 //!
-//! `tool_result` is reserved; CAD-320 (Claude intermediate text) adds
-//! producers, not kinds or columns.
+//! The final answer is stored once, as the `turn_result`: neither
+//! adapter records it as `assistant_text` too (CAD-320).
 //!
 //! Everything stored is secret-redacted first ([`crate::secret::redact_text`])
 //! and bounded, so a thread can never be the reason an export refuses. A
@@ -257,6 +258,46 @@ pub fn tool_summary(name: &str, input: &Value) -> String {
         None => name.to_string(),
     };
     clean_text(&line, TOOL_SUMMARY_CAP)
+}
+
+/// A one-line, redacted summary of a tool's output — what a thread
+/// stores instead of the output itself (CAD-320). `output` is the
+/// provider's `tool_result.content`: a string, or blocks whose `text` is
+/// joined and whose other types are only named (`[image]`). At most
+/// [`TEXT_CAP`] bytes are scanned, cut back to whitespace so no partial
+/// secret escapes the scan; the scan runs before flattening, so
+/// multi-line rules (private keys) still match.
+pub fn tool_result_summary(output: &Value) -> String {
+    let text = match output {
+        Value::String(s) => s.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .map(|b| match b.get("type").and_then(Value::as_str) {
+                Some("text") => b
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                Some(other) => format!("[{other}]"),
+                None => String::new(),
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => String::new(),
+    };
+    let mut head = take_bytes(&text, TEXT_CAP);
+    if head.len() < text.len() {
+        let cut = head.rfind(char::is_whitespace).unwrap_or(0);
+        head.truncate(cut);
+    }
+    let redacted = clean_text(&head, TEXT_CAP);
+    let flat = redacted
+        .replace(|c: char| c.is_control(), " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    // One byte over the cap keeps `clean_text`'s truncation marker.
+    clean_text(&take_bytes(&flat, TOOL_SUMMARY_CAP + 1), TOOL_SUMMARY_CAP)
 }
 
 /// The thread entry for a message queued to a threaded agent.
@@ -1003,6 +1044,27 @@ mod tests {
             assert!(!cell.contains(&token), "{cell}");
             assert!(cell.contains("[redacted:"), "{cell}");
         }
+    }
+
+    #[test]
+    fn tool_output_is_a_redacted_one_line_summary() {
+        let token = github_token("thread-tool-output");
+        let summary = tool_result_summary(&json!(format!("TOKEN={token}\nok\u{1b}[0m done")));
+        assert!(summary.starts_with("TOKEN=[redacted:"), "{summary}");
+        assert!(!summary.contains(&token), "{summary}");
+        assert!(summary.ends_with("ok [0m done"), "one line: {summary}");
+
+        // Blocks: text joined, other types only named.
+        let blocks = json!([{"type": "text", "text": "a"}, {"type": "image", "source": {}}]);
+        assert_eq!(tool_result_summary(&blocks), "a [image]");
+        assert_eq!(tool_result_summary(&Value::Null), "");
+
+        // Long output: bounded with the marker; the tail never survives.
+        let long = format!("{}TAIL", "y ".repeat(400));
+        let summary = tool_result_summary(&json!(long));
+        assert!(summary.len() <= TOOL_SUMMARY_CAP, "{}", summary.len());
+        assert!(summary.ends_with("…[truncated]"), "{summary}");
+        assert!(!summary.contains("TAIL"), "{summary}");
     }
 
     #[test]

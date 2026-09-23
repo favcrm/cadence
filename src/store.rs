@@ -26,9 +26,9 @@ use crate::proto::identifier;
 
 mod threads;
 pub use threads::{
-    tool_summary, NewEntry, Sender, Thread, ThreadEntry, KIND_ASSISTANT_TEXT, KIND_MESSAGE,
-    KIND_TOOL_CALL, KIND_TOOL_RESULT, KIND_TURN_RESULT, PAGE_MAX as THREAD_PAGE_MAX, ROLE_AGENT,
-    ROLE_OPERATOR, ROLE_SYSTEM,
+    tool_result_summary, tool_summary, NewEntry, Sender, Thread, ThreadEntry, KIND_ASSISTANT_TEXT,
+    KIND_MESSAGE, KIND_TOOL_CALL, KIND_TOOL_RESULT, KIND_TURN_RESULT, PAGE_MAX as THREAD_PAGE_MAX,
+    ROLE_AGENT, ROLE_OPERATOR, ROLE_SYSTEM,
 };
 
 /// How long a connection waits on another process's lock before

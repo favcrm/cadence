@@ -28,6 +28,12 @@
 //! - One `tool_use` lifecycle event per assistant tool call (name plus a
 //!   one-line redacted input summary, never the raw input)
 //!   keeps `events --follow` meaningful without proxying the transcript.
+//!   Each `tool_result` becomes one `tool_result` event (a redacted
+//!   ≤160-char summary plus `is_error`, never the raw output), and each
+//!   assistant text block an `assistant_text` event for a threaded
+//!   agent's chat (CAD-320). The last text block is held until the next
+//!   event: the one the `result` repeats is dropped, so the chat never
+//!   shows the final answer twice.
 //! - `--permission-mode` (default `manual`) and `--allowedTools`
 //!   (always `Bash(cadence *)` plus `params.allowed_tools`) are fixed at
 //!   launch and replayed on resume. Denials surface as
@@ -225,6 +231,9 @@ struct Shared {
     /// Optional absolute turn cap (`params.turn_max_secs`, default
     /// none). Set at `open`.
     max_turn: Mutex<Option<Duration>>,
+    /// The latest assistant text block, not yet emitted — flushed by
+    /// the next event, dropped when the `result` repeats it (CAD-320).
+    pending_text: Mutex<Option<String>>,
     dead: AtomicBool,
 }
 
@@ -241,6 +250,7 @@ impl ClaudeAdapter {
             last_activity: Mutex::new(Instant::now()),
             idle_window: Mutex::new(DEFAULT_TURN_IDLE),
             max_turn: Mutex::new(None),
+            pending_text: Mutex::new(None),
             dead: AtomicBool::new(false),
         });
         let routed = Arc::clone(&shared);
@@ -327,7 +337,11 @@ impl Shared {
                 self.on_init(&params);
             }
             "assistant" => self.on_assistant(&params),
+            "user" => self.on_tool_results(&params),
             "result" => {
+                // Before the result is queued: the turn's entries land
+                // ahead of its `turn_result`.
+                self.flush_text(params.get("result").and_then(Value::as_str));
                 self.results.lock().unwrap().push_back(params.clone());
                 self.result_cv.notify_all();
                 self.emit_result_meta(&params);
@@ -338,9 +352,10 @@ impl Shared {
 
     /// One compact lifecycle event per tool use — the name and a
     /// one-line redacted summary ([`crate::store::tool_summary`], CAD-319),
-    /// never the raw arguments or text — so `cadence events --follow`
-    /// and a threaded agent's chat show progress on a long turn without
-    /// proxying the transcript.
+    /// never the raw arguments — so `cadence events --follow` and a
+    /// threaded agent's chat show progress on a long turn without
+    /// proxying the transcript. Text blocks are held one at a time for
+    /// the chat ([`Self::flush_text`], CAD-320).
     fn on_assistant(&self, event: &Value) {
         let Some(content) = event
             .get("message")
@@ -350,7 +365,15 @@ impl Shared {
             return;
         };
         for block in content {
+            if block.get("type").and_then(Value::as_str) == Some("text") {
+                let text = block.get("text").and_then(Value::as_str).unwrap_or("");
+                if !text.trim().is_empty() {
+                    self.flush_text(None);
+                    *self.pending_text.lock().unwrap() = Some(text.to_string());
+                }
+            }
             if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                self.flush_text(None);
                 if let Some(name) = block.get("name").and_then(Value::as_str) {
                     let input = block.get("input").unwrap_or(&Value::Null);
                     self.emit(
@@ -363,6 +386,46 @@ impl Shared {
                     );
                 }
             }
+        }
+    }
+
+    /// Emit the held assistant text block, unless it is `final_text` —
+    /// the `result` carries that one as the turn result.
+    fn flush_text(&self, final_text: Option<&str>) {
+        let Some(text) = self.pending_text.lock().unwrap().take() else {
+            return;
+        };
+        if final_text.is_some_and(|f| f.trim() == text.trim()) {
+            return;
+        }
+        self.emit("cadence/assistant_text", &json!({ "text": text }));
+    }
+
+    /// One `tool_result` event per tool result block in a `user` event —
+    /// a redacted one-line summary ([`crate::store::tool_result_summary`])
+    /// and `is_error`, never the output itself (CAD-320).
+    fn on_tool_results(&self, event: &Value) {
+        let Some(content) = event
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_array)
+        else {
+            return;
+        };
+        for block in content {
+            if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+                continue;
+            }
+            self.flush_text(None);
+            let output = block.get("content").unwrap_or(&Value::Null);
+            self.emit(
+                "cadence/tool_result",
+                &json!({
+                    "summary": crate::store::tool_result_summary(output),
+                    "is_error": block.get("is_error").and_then(Value::as_bool).unwrap_or(false),
+                    "tool_use_id": block.get("tool_use_id"),
+                }),
+            );
         }
     }
 
@@ -416,6 +479,8 @@ impl Shared {
     /// Transport EOF: wake any turn wait so it can re-check `dead`
     /// instead of sleeping out the turn deadline.
     fn on_disconnect(&self) {
+        // Text the provider printed before dying is still the agent's.
+        self.flush_text(None);
         self.dead.store(true, Ordering::SeqCst);
         let _guard = self.results.lock().unwrap();
         self.result_cv.notify_all();
