@@ -1092,7 +1092,12 @@ fn restart_preserves_attention_fence_without_unknowns() {
     // restart failure. The healthy agent still relaunches; the fenced
     // agent must neither execute its queued work nor lose its error.
     let home = TempDir::new().unwrap();
-    let out = cadence_at(home.path(), &d.state, &["daemon", "restart"]);
+    hold_rollout_lease(home.path(), &d.state);
+    let out = cadence_at(
+        home.path(),
+        &d.state,
+        &["daemon", "restart", "--as", "operator:test"],
+    );
     // Stop the detached replacement before asserting the restart outcome.
     let restarted = d.wait_agent("mismatch", "attention", 15);
     d.wait_agent("healthy", "idle", 15);
@@ -2214,7 +2219,12 @@ fn daemon_restart_reports_fenced_turn() {
         .unwrap();
     unsafe { libc::killpg(pane_pid, libc::SIGKILL) };
     let home = TempDir::new().unwrap();
-    let out = cadence_at(home.path(), &d.state, &["daemon", "restart"]);
+    hold_rollout_lease(home.path(), &d.state);
+    let out = cadence_at(
+        home.path(),
+        &d.state,
+        &["daemon", "restart", "--as", "operator:test"],
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -2242,7 +2252,12 @@ fn daemon_restart_reports_kept_turn() {
     .unwrap();
     let token = pty_token(&d, "dv", "m1");
     let home = TempDir::new().unwrap();
-    let out = cadence_at(home.path(), &d.state, &["daemon", "restart"]);
+    hold_rollout_lease(home.path(), &d.state);
+    let out = cadence_at(
+        home.path(),
+        &d.state,
+        &["daemon", "restart", "--as", "operator:test"],
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success(),
@@ -6296,12 +6311,37 @@ fn fenced_agent_resume_hint() {
 
 /// Spawn the real `cadence` binary under a scratch HOME (skill install
 /// targets `$HOME` directly — no daemon involved).
+fn hold_rollout_lease(home: &Path, state: &Path) {
+    let out = cadence_at(
+        home,
+        state,
+        &[
+            "rollout",
+            "claim",
+            "--reason",
+            "restart test",
+            "--as",
+            "operator:test",
+            "--ttl",
+            "2h",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "rollout claim failed: {} {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 fn cadence_at(home: &Path, state: &Path, args: &[&str]) -> std::process::Output {
     std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
         .arg("--state-dir")
         .arg(state)
         .args(args)
         .env("HOME", home)
+        .env_remove("CADENCE_ALIAS")
+        .env_remove("CADENCE_ROLLOUT_AS")
         // A `daemon restart` child daemon is a separate process: it
         // gets this test's mock commands as its own env, and only it.
         .envs(test_env().vars())
@@ -18963,7 +19003,12 @@ fn daemon_restart_keeps_pane_pid_and_reports_table() {
         .unwrap();
     assert!(pane_pid_before > 0);
     let home = TempDir::new().unwrap();
-    let out = cadence_at(home.path(), &d.state, &["daemon", "restart"]);
+    hold_rollout_lease(home.path(), &d.state);
+    let out = cadence_at(
+        home.path(),
+        &d.state,
+        &["daemon", "restart", "--as", "operator:test"],
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success(),
@@ -19003,11 +19048,20 @@ fn daemon_restart_when_idle_gates_and_proceeds() {
     )
     .unwrap();
     let home = TempDir::new().unwrap();
+    hold_rollout_lease(home.path(), &d.state);
     // Busy pane → timeout exits non-zero and the daemon is untouched.
     let out = cadence_at(
         home.path(),
         &d.state,
-        &["daemon", "restart", "--when-idle", "--timeout", "3"],
+        &[
+            "daemon",
+            "restart",
+            "--when-idle",
+            "--timeout",
+            "3",
+            "--as",
+            "operator:test",
+        ],
     );
     assert!(
         !out.status.success(),
@@ -19023,7 +19077,15 @@ fn daemon_restart_when_idle_gates_and_proceeds() {
     let out = cadence_at(
         home.path(),
         &d.state,
-        &["daemon", "restart", "--when-idle", "--timeout", "30"],
+        &[
+            "daemon",
+            "restart",
+            "--when-idle",
+            "--timeout",
+            "30",
+            "--as",
+            "operator:test",
+        ],
     );
     assert!(
         out.status.success(),
@@ -23353,7 +23415,7 @@ fn monitor_migration_from_v6_bridges_provider_effort_before_v8_v9_and_v10() {
     )
     .unwrap();
     drop(conn);
-    let store = Store::open(&path).unwrap();
+    let store = Store::open_for_schema_tests(&path).unwrap();
     assert!(store.monitors().unwrap().is_empty());
     let conn = rusqlite::Connection::open(&path).unwrap();
     let columns: Vec<String> = conn
@@ -23366,7 +23428,7 @@ fn monitor_migration_from_v6_bridges_provider_effort_before_v8_v9_and_v10() {
     let version: i64 = conn
         .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, cadence_agent::rollout::SCHEMA_VERSION);
     assert!(columns.iter().any(|column| column == "effort"));
     let monitor_columns: Vec<String> = conn
         .prepare("PRAGMA table_info(monitors)")
@@ -23397,7 +23459,7 @@ fn monitor_migration_after_provider_effort_v7_is_v8_v9_and_v10() {
     )
     .unwrap();
     drop(conn);
-    let store = Store::open(&path).unwrap();
+    let store = Store::open_for_schema_tests(&path).unwrap();
     assert!(store.monitors().unwrap().is_empty());
     let conn = rusqlite::Connection::open(&path).unwrap();
     let columns: Vec<String> = conn
@@ -23410,7 +23472,7 @@ fn monitor_migration_after_provider_effort_v7_is_v8_v9_and_v10() {
     let version: i64 = conn
         .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, cadence_agent::rollout::SCHEMA_VERSION);
     assert!(columns.iter().any(|column| column == "effort"));
     let monitor_columns: Vec<String> = conn
         .prepare("PRAGMA table_info(monitors)")
@@ -23449,13 +23511,13 @@ fn monitor_migration_from_v8_defaults_auto_dispatch_off() {
     .unwrap();
     drop(conn);
 
-    let store = Store::open(&path).unwrap();
+    let store = Store::open_for_schema_tests(&path).unwrap();
     assert!(!store.monitor("legacy").unwrap().auto_dispatch_enabled);
     let conn = rusqlite::Connection::open(&path).unwrap();
     let version: i64 = conn
         .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, cadence_agent::rollout::SCHEMA_VERSION);
 }
 
 #[test]
@@ -23475,7 +23537,7 @@ fn monitor_migration_repairs_legacy_pr100_schema9_without_quota() {
     .unwrap();
     drop(conn);
 
-    let store = Store::open(&path).unwrap();
+    let store = Store::open_for_schema_tests(&path).unwrap();
     assert!(store.monitors().unwrap().is_empty());
     let conn = rusqlite::Connection::open(&path).unwrap();
     let agent_columns: Vec<String> = conn
@@ -23495,7 +23557,7 @@ fn monitor_migration_repairs_legacy_pr100_schema9_without_quota() {
     let version: i64 = conn
         .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, cadence_agent::rollout::SCHEMA_VERSION);
     assert!(agent_columns.iter().any(|column| column == "quota"));
     assert!(monitor_columns
         .iter()
@@ -28557,4 +28619,373 @@ fn agent_gc_timer_unconfigured_never_removes() {
         d.rpc("agent_show", json!({"alias": kept})).unwrap();
     }
     assert!(agent_gc_removed_events(&d).is_empty());
+}
+
+/// Restart without a lease must fail before shutdown. The daemon pid
+/// from `daemon start` is still alive afterwards.
+#[test]
+fn daemon_restart_without_a_lease_leaves_the_pid_unchanged() {
+    let home = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let start = cadence_at(home.path(), state.path(), &["daemon", "start"]);
+    assert!(
+        start.status.success(),
+        "start: {}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let v: Value = serde_json::from_slice(&start.stdout).unwrap();
+    let pid = v["pid"].as_u64().unwrap();
+    let restart = cadence_at(home.path(), state.path(), &["daemon", "restart"]);
+    let err = format!(
+        "{} {}",
+        String::from_utf8_lossy(&restart.stdout),
+        String::from_utf8_lossy(&restart.stderr)
+    );
+    assert!(!restart.status.success(), "{err}");
+    assert!(
+        err.contains("before shutdown") && err.contains("rollout"),
+        "{err}"
+    );
+    assert!(
+        std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "daemon pid {pid} exited"
+    );
+    let stop = cadence_at(home.path(), state.path(), &["daemon", "stop"]);
+    assert!(
+        stop.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+}
+
+/// A different build cannot start without the lease. The same build can.
+#[test]
+fn daemon_start_refuses_a_different_build_without_a_lease() {
+    let home = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let start = cadence_at(home.path(), state.path(), &["daemon", "start"]);
+    assert!(
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let stop = cadence_at(home.path(), state.path(), &["daemon", "stop"]);
+    assert!(
+        stop.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    let db = state.path().join("cadence.sqlite3");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute(
+        "UPDATE daemon_build SET commit_sha='deadbeefdead' WHERE id=1",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    let refused = cadence_at(
+        home.path(),
+        state.path(),
+        &["daemon", "start", "--as", "operator:test"],
+    );
+    let err = String::from_utf8_lossy(&refused.stderr);
+    assert!(!refused.status.success(), "{err}");
+    assert!(err.contains("deadbeefdead"), "{err}");
+    hold_rollout_lease(home.path(), state.path());
+    let start = cadence_at(
+        home.path(),
+        state.path(),
+        &["daemon", "start", "--as", "operator:test"],
+    );
+    assert!(
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let stop = cadence_at(home.path(), state.path(), &["daemon", "stop"]);
+    assert!(
+        stop.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+}
+
+/// `--when-idle` queued by the holder must not shut down if the lease
+/// is released while the fleet is still busy.
+#[test]
+fn restart_when_idle_aborts_when_the_lease_is_released() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin("dv", None);
+    d.wait_agent("dv", "idle", 20);
+    let busy = d.pane_file(&mock, "dv", "tui-state");
+    std::fs::write(
+        &busy,
+        "⠸ Thinking · 12s (esc twice to interrupt)\n❭ Guide Devin while it works\n",
+    )
+    .unwrap();
+    let probe = d.rpc("agent_probe", json!({"alias": "dv"})).unwrap();
+    assert_eq!(
+        probe["idle"], false,
+        "pane must be busy before the wait: {probe}"
+    );
+    let home = TempDir::new().unwrap();
+    hold_rollout_lease(home.path(), &d.state);
+    let started = d.rpc("daemon_info", json!({})).unwrap()["started_at"].clone();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args([
+            "daemon",
+            "restart",
+            "--when-idle",
+            "--timeout",
+            "20",
+            "--as",
+            "operator:test",
+        ])
+        .env("HOME", home.path())
+        .env_remove("CADENCE_ALIAS")
+        .env_remove("CADENCE_ROLLOUT_AS")
+        .envs(test_env().vars())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(800));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "restart finished before the lease was released"
+    );
+    let release = cadence_at(
+        home.path(),
+        &d.state,
+        &["rollout", "release", "--as", "operator:test"],
+    );
+    assert!(
+        release.status.success(),
+        "release: {}",
+        String::from_utf8_lossy(&release.stderr)
+    );
+    std::fs::remove_file(&busy).unwrap();
+    let out = child.wait_with_output().unwrap();
+    let err = format!(
+        "{} {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success(), "{err}");
+    assert!(err.contains("released"), "{err}");
+    assert!(err.contains("before shutdown"), "{err}");
+    let info = d.rpc("daemon_info", json!({})).unwrap();
+    assert_eq!(info["started_at"], started, "daemon was restarted: {info}");
+}
+
+fn sqlite_family(state: &std::path::Path) -> Vec<(String, Option<Vec<u8>>)> {
+    let db = state.join("cadence.sqlite3");
+    ["", "-wal", "-shm"]
+        .into_iter()
+        .map(|suffix| {
+            let path = std::path::PathBuf::from(format!("{}{suffix}", db.display()));
+            let bytes = std::fs::read(&path).ok();
+            (suffix.to_string(), bytes)
+        })
+        .collect()
+}
+
+/// A refused schema crossing on the real `daemon start` path must not
+/// rewrite the database or create `-wal`/`-shm`.
+#[test]
+fn daemon_start_refuses_a_lower_schema_without_rewriting_the_file() {
+    let home = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let start = cadence_at(home.path(), state.path(), &["daemon", "start"]);
+    assert!(
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let stop = cadence_at(home.path(), state.path(), &["daemon", "stop"]);
+    assert!(
+        stop.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    let db = state.path().join("cadence.sqlite3");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS rollout_leases;
+         DROP TABLE IF EXISTS daemon_build;
+         UPDATE schema_version SET version=11;
+         PRAGMA wal_checkpoint(TRUNCATE);",
+    )
+    .unwrap();
+    drop(conn);
+    for suffix in ["-wal", "-shm"] {
+        let path = std::path::PathBuf::from(format!("{}{suffix}", db.display()));
+        let _ = std::fs::remove_file(path);
+    }
+    let before = sqlite_family(state.path());
+    let refused = cadence_at(home.path(), state.path(), &["daemon", "start"]);
+    assert!(
+        !refused.status.success(),
+        "{}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    let log = std::fs::read_to_string(state.path().join("daemon.log")).unwrap_or_default();
+    let err = format!("{} {}", String::from_utf8_lossy(&refused.stderr), log);
+    assert!(
+        err.contains("refusing to migrate") || err.contains("rollout"),
+        "{err}"
+    );
+    assert_eq!(sqlite_family(state.path()), before);
+    let version: i64 = rusqlite::Connection::open(&db)
+        .unwrap()
+        .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 11);
+}
+
+/// A receipt is not enough: the migrating process has to be the holder.
+#[test]
+fn daemon_start_by_a_non_holder_does_not_migrate() {
+    let home = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let start = cadence_at(home.path(), state.path(), &["daemon", "start"]);
+    assert!(
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let stop = cadence_at(home.path(), state.path(), &["daemon", "stop"]);
+    assert!(
+        stop.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    let db = state.path().join("cadence.sqlite3");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS rollout_leases;
+         DROP TABLE IF EXISTS daemon_build;
+         UPDATE schema_version SET version=11;
+         PRAGMA wal_checkpoint(TRUNCATE);",
+    )
+    .unwrap();
+    drop(conn);
+    for suffix in ["-wal", "-shm"] {
+        let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+            "{}{suffix}",
+            db.display()
+        )));
+    }
+    let claim = cadence_at(
+        home.path(),
+        state.path(),
+        &[
+            "rollout",
+            "claim",
+            "--reason",
+            "crossing",
+            "--as",
+            "operator:test",
+            "--ttl",
+            "2h",
+        ],
+    );
+    assert!(
+        claim.status.success(),
+        "{}",
+        String::from_utf8_lossy(&claim.stderr)
+    );
+    let backup = home.path().join("backup.sqlite3");
+    std::fs::copy(&db, &backup).unwrap();
+    let recorded = cadence_at(
+        home.path(),
+        state.path(),
+        &[
+            "rollout",
+            "backup",
+            "--path",
+            backup.to_str().unwrap(),
+            "--as",
+            "operator:test",
+        ],
+    );
+    assert!(
+        recorded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recorded.stderr)
+    );
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
+    drop(conn);
+    for suffix in ["-wal", "-shm"] {
+        let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+            "{}{suffix}",
+            db.display()
+        )));
+    }
+    let before = sqlite_family(state.path());
+    let refused = cadence_at(home.path(), state.path(), &["daemon", "start"]);
+    assert!(!refused.status.success());
+    assert_eq!(sqlite_family(state.path()), before);
+    let version: i64 = rusqlite::Connection::open(&db)
+        .unwrap()
+        .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 11);
+}
+
+#[test]
+fn daemon_start_drops_the_forwarded_rollout_identity() {
+    let home = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let start = cadence_at(
+        home.path(),
+        state.path(),
+        &["daemon", "start", "--as", "operator:test"],
+    );
+    assert!(
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let v: Value = serde_json::from_slice(&start.stdout).unwrap();
+    let pid = v["pid"].as_u64().unwrap();
+    let env = std::fs::read(format!("/proc/{pid}/environ")).unwrap();
+    let leaked = env
+        .split(|byte| *byte == 0)
+        .any(|entry| entry.starts_with(b"CADENCE_ROLLOUT_AS="));
+    let stop = cadence_at(home.path(), state.path(), &["daemon", "stop"]);
+    assert!(!leaked, "daemon environ still contains CADENCE_ROLLOUT_AS");
+    assert!(
+        stop.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+}
+
+#[test]
+fn restart_and_rollout_help_say_same_build_restart_is_lease_free() {
+    let home = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    for args in [
+        &["daemon", "restart", "--help"][..],
+        &["rollout", "--help"][..],
+        &["daemon", "stop", "--help"][..],
+    ] {
+        let out = cadence_at(home.path(), state.path(), args);
+        let text = format!(
+            "{} {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "{args:?}\n{text}");
+        assert!(
+            text.contains("lease-free"),
+            "help for {args:?} should say same-build restart is lease-free:\n{text}"
+        );
+    }
 }

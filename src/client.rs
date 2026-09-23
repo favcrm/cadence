@@ -47,19 +47,32 @@ pub fn briefing_path(state_dir: &Path, params: &Value, alias: &str) -> PathBuf {
 /// for the socket to answer. Reports `already_running` when the socket
 /// belonged to a pre-existing daemon — our child exited instead.
 pub fn daemon_start(state_dir: &Path) -> Result<Value> {
+    daemon_start_as(state_dir, None)
+}
+
+/// `daemon_start`, forwarding a rollout identity to the child so
+/// `daemon run` can prove the caller holds the lease when the binary
+/// commit differs from the one last recorded.
+pub fn daemon_start_as(state_dir: &Path, as_identity: Option<&str>) -> Result<Value> {
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
     use std::time::Instant;
+    let forward = crate::rollout::authorize_daemon_spawn(state_dir, as_identity)?;
     let exe = std::env::current_exe()?;
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(state_dir.join("daemon.log"))?;
     let mut command = std::process::Command::new(exe);
+    command.env_remove("CADENCE_ROLLOUT_AS");
     command
         .args(["--state-dir"])
         .arg(state_dir)
-        .args(["daemon", "run"])
+        .args(["daemon", "run"]);
+    if let Some(identity) = forward.as_deref().or(as_identity) {
+        command.arg("--rollout-as").arg(identity);
+    }
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log));

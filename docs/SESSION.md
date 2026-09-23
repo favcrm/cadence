@@ -526,7 +526,11 @@ In this order:
    cadence issue finish <ID>` reminder, so the sweep is the usual
    follow-up.
 4. Restart the daemon. `cadence daemon restart` stops cleanly and
-   starts a new process on the same state; the before/after table
+   starts a new process on the same state. The rollout lease gates a
+   build change and a schema crossing. A same-build `daemon stop`
+   followed by `daemon start`, or a crash restart of the same build,
+   stays lease-free, so the lease check on that same-build
+   `daemon restart` is advisory. The before/after table
    shows each agent's state, pane pid, and `TURN` — `kept` when a
    running pty turn was re-adopted (same token, same pane, no fence),
    `fenced` when it could not be proven and went `unknown`, `-` for
