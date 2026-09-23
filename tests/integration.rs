@@ -27880,12 +27880,24 @@ impl ManagedWorker {
     }
 
     fn request(&mut self, cmd: Value, what: &str) -> Value {
+        let n = self.send(cmd);
+        self.answer(n, what)
+    }
+
+    /// Hand the worker one command without waiting — its number for
+    /// [`Self::answer`]. The worker serves commands one at a time.
+    fn send(&mut self, cmd: Value) -> u64 {
         let n = self.seq;
         self.seq += 1;
         let req = self.cmd_dir.path().join(format!("req-{n}.json"));
         let tmp = req.with_extension("tmp");
         std::fs::write(&tmp, cmd.to_string()).unwrap();
         std::fs::rename(&tmp, &req).unwrap();
+        n
+    }
+
+    /// Wait for command `n`'s answer.
+    fn answer(&self, n: u64, what: &str) -> Value {
         let resp = self.cmd_dir.path().join(format!("resp-{n}.json"));
         let deadline = Instant::now() + Duration::from_secs(20);
         while !resp.exists() {
@@ -28378,6 +28390,114 @@ fn slot_managed_tool_cannot_bind_the_provider_root() {
         "{s}"
     );
     assert!(d.events("wk").iter().any(|e| e["kind"] == "slot_acquired"));
+}
+
+// ---------- CAD-230 phase b1: exec-bound run ----------
+
+/// CAD-230 phase b1 ACCEPTANCE: a managed endpoint's `build-slot run`
+/// holds a strict, exec-bound slot naming exactly the process it execs
+/// into (`$$` of the command IS the recorded holder). While it runs, no
+/// other process can release it — a pane agent naming the token and the
+/// holder pid, or its own pid, is refused. An exec request claiming an
+/// ancestor is refused outright. When the command exits the daemon's
+/// own watcher frees the hold — observed on the event stream, with no
+/// release call and no slot call from anyone.
+#[test]
+fn build_slot_run_exec_bound_hold_ends_with_the_command() {
+    let d = TestDaemon::start_opts(slot_opts(2, 1, 900, &[]));
+    let home = TempDir::new().unwrap();
+    let mut observer = LaneShell::spawn(home.path());
+    plant_pane(&d, "observer", observer.pid());
+    let mut wk = ManagedWorker::start(&d, "wk");
+    // `exec` must claim the requesting peer itself, never an ancestor.
+    let r = wk.rpc(
+        "child",
+        "slot_acquire",
+        json!({"kind": "build", "pid": wk.pid, "request_id": "anc", "exec": true}),
+    );
+    assert_eq!(r["ok"], false, "{r}");
+    assert!(
+        r["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("exec-bound"),
+        "{r}"
+    );
+    let work = TempDir::new().unwrap();
+    let tok = work.path().join("tok");
+    let go = work.path().join("go");
+    let script = format!(
+        "echo \"$CADENCE_BUILD_SLOT_TOKEN $CADENCE_BUILD_SLOT_PID $$\" > {t}.tmp && \
+         mv {t}.tmp {t}; while [ ! -e {g} ]; do sleep 0.05; done; exit 7",
+        t = tok.display(),
+        g = go.display()
+    );
+    let n = wk.send(json!({"how": "exec", "argv": [
+        env!("CARGO_BIN_EXE_cadence"), "--state-dir", d.state.to_str().unwrap(),
+        "build-slot", "run", "build", "--wait-secs", "10", "--", "sh", "-c", script,
+    ]}));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !tok.exists() {
+        assert!(Instant::now() < deadline, "run never started its command");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let line = std::fs::read_to_string(&tok).unwrap();
+    let f: Vec<&str> = line.split_whitespace().collect();
+    let (token, holder) = (f[0].to_string(), f[1].parse::<u64>().unwrap());
+    assert_eq!(f[1], f[2], "the exec'd command is the bound pid: {line}");
+    let s = observer.rpc(&d.state, "slot_status", json!({}));
+    let held = s["result"]["pools"]["build"]["held"].as_array().unwrap();
+    assert_eq!(held.len(), 1, "{s}");
+    assert_eq!(held[0]["pid"], holder);
+    assert_eq!(held[0]["lane"], "wk");
+    assert_eq!(held[0]["binding"], "strict");
+    assert_eq!(held[0]["exec_bound"], true);
+    // Forged releases from another process are refused.
+    let r = observer.rpc(
+        &d.state,
+        "slot_release",
+        json!({"token": token, "pid": holder, "lane": "wk"}),
+    );
+    assert_eq!(r["ok"], false, "{r}");
+    let r = observer.rpc(&d.state, "slot_release", json!({"token": token}));
+    assert_eq!(r["ok"], false, "{r}");
+    assert!(
+        r["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("another caller"),
+        "{r}"
+    );
+    std::fs::write(&go, "").unwrap();
+    let r = wk.answer(n, "exec-bound run");
+    assert_eq!(r["rc"], 7, "run exits with the command's code: {r}");
+    // Freed by the daemon on its own — no slot call is made here.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let freed = d.events("wk").iter().any(|e| {
+            e["kind"] == "slot_released"
+                && e["payload"]["pid"] == holder
+                && ["holder died", "holder exited"]
+                    .contains(&e["payload"]["reason"].as_str().unwrap_or(""))
+        });
+        if freed {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the watcher never freed the hold: {:?}",
+            d.events("wk")
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let s = observer.rpc(&d.state, "slot_status", json!({}));
+    assert!(
+        s["result"]["pools"]["build"]["held"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "{s}"
+    );
 }
 
 /// `starve_secs` promotes a long waiter ahead of a priority lane:

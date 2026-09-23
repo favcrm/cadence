@@ -206,6 +206,9 @@ fn epoch_secs() -> f64 {
         .as_secs_f64()
 }
 
+/// How often the daemon re-reads strict holders (CAD-230b).
+const SLOT_WATCH_TICK: Duration = Duration::from_secs(1);
+
 /// Monotonic seconds since an arbitrary process-local epoch — the
 /// slot clock. NTP steps and wall-clock jumps cannot age a waiter or
 /// expire a hold; the wall epoch rides alongside only for restart
@@ -2202,12 +2205,20 @@ impl Shared {
         // `probe` is the read-only fast-fail: it answers granted or
         // position without leaving a waiter in the queue.
         let probe = params["probe"].as_bool().unwrap_or(false);
+        // `exec` (CAD-230b, `build-slot run`): the requesting peer IS the
+        // process that execs into the command, so it must claim itself —
+        // never an ancestor. A strict caller's hold is then exec-bound;
+        // a pane caller's legacy hold is otherwise unchanged.
+        let exec = params["exec"].as_bool().unwrap_or(false);
+        if exec && pid != peer_pid {
+            return Err(crate::slots::exec_not_peer(pid));
+        }
         let clk = crate::slots::SlotClock::at((self.slot_clock)(), epoch_secs());
         let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         let (result, events) = match &who {
             SlotWho::Pane { lane, .. } => slots.acquire(kind, lane, pid, request_id, probe, clk)?,
             SlotWho::Strict(caller) => {
-                slots.acquire_strict(kind, caller, pid, request_id, probe, clk)?
+                slots.acquire_strict_bound(kind, caller, pid, request_id, probe, clk, exec)?
             }
         };
         drop(slots);
@@ -2329,6 +2340,24 @@ impl Shared {
             .reconcile(enrollment, token, evidence, (self.slot_clock)())?;
         self.emit_slot_events(events);
         Ok(result)
+    }
+
+    /// CAD-230b: a strict hold ends with its exact holder, observed by
+    /// the daemon itself — no release call and no other client's slot
+    /// call needed. Legacy holds keep their reap-on-call rule.
+    fn run_slot_watch(self: &Arc<Self>) {
+        while !self.closing.load(Ordering::SeqCst) {
+            let events = self
+                .slots
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .reap_strict_holds((self.slot_clock)());
+            self.emit_slot_events(events);
+            let deadline = Instant::now() + SLOT_WATCH_TICK;
+            while !self.closing.load(Ordering::SeqCst) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
     }
 
     /// Operator authority for the approval-evidence verbs (CAD-217):
@@ -6982,6 +7011,11 @@ pub fn serve_with(state_dir: &Path, opts: ServeOptions) -> Result<()> {
     {
         let shared = Arc::clone(&shared);
         thread::spawn(move || shared.run_wal_watch());
+    }
+    // Slot watch (CAD-230b): strict holds end with their holder.
+    {
+        let shared = Arc::clone(&shared);
+        thread::spawn(move || shared.run_slot_watch());
     }
     while !shared.closing.load(Ordering::SeqCst) {
         match listener.accept() {

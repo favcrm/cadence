@@ -72,6 +72,9 @@ enum Read {
         starttime: u64,
         /// Real and effective uid from `status`.
         uid: (u32, u32),
+        /// `stat` field 3 — `Z` (zombie) or `X` (dead) is a process
+        /// that has already exited and is only waiting to be reaped.
+        exited: bool,
     },
     /// No such pid — the process is gone.
     Gone,
@@ -128,7 +131,8 @@ impl ProcFs {
             Some((_, after)) => after.split_whitespace().collect(),
             None => return Read::Unreadable(format!("/proc/{pid}/stat: malformed")),
         };
-        let (Some(ppid), Some(starttime)) = (
+        let (Some(state), Some(ppid), Some(starttime)) = (
+            fields.first(),
             fields.get(1).and_then(|v| v.parse::<u32>().ok()),
             fields.get(19).and_then(|v| v.parse::<u64>().ok()),
         ) else {
@@ -149,13 +153,16 @@ impl ProcFs {
             ppid,
             starttime,
             uid,
+            exited: matches!(*state, "Z" | "X"),
         }
     }
 
     /// The live identity of `pid` now. A process whose real and
-    /// effective uid differ has no single identity — refused.
+    /// effective uid differ has no single identity — refused; so is one
+    /// that has already exited (a zombie is no live identity).
     pub fn identity(&self, pid: u32) -> Result<ProcIdentity, String> {
         match self.read(pid) {
+            Read::Found { exited: true, .. } => Err(format!("pid {pid} has exited")),
             Read::Found {
                 starttime,
                 uid: (real, effective),
@@ -178,14 +185,18 @@ impl ProcFs {
     }
 
     /// Is the recorded process still that same process? A missing pid
-    /// or a different starttime proves it gone; an unreadable entry or
-    /// a changed uid proves nothing either way.
+    /// or a different starttime proves it gone, and so does a zombie of
+    /// the recorded process — it has exited, only its parent has not
+    /// reaped it yet (CAD-230b: an exec-bound hold ends with the
+    /// command, not with its parent's `wait`). An unreadable entry or a
+    /// changed uid proves nothing either way.
     pub fn liveness(&self, id: &ProcIdentity) -> (Liveness, &'static str) {
         match self.read(id.pid) {
             Read::Gone => (Liveness::Dead, "holder died"),
             Read::Found { starttime, .. } if starttime != id.starttime => {
                 (Liveness::Dead, "pid recycled")
             }
+            Read::Found { exited: true, .. } => (Liveness::Dead, "holder exited"),
             Read::Found { uid, .. } if uid != (id.uid, id.uid) => {
                 (Liveness::Unknown, "holder uid changed")
             }
@@ -228,6 +239,7 @@ impl ProcFs {
                     ppid,
                     starttime,
                     uid,
+                    ..
                 } => (ppid, starttime, uid),
                 Read::Gone => {
                     return Err(format!(

@@ -2965,17 +2965,18 @@ fn slot_acquire_loop(
     pid: u32,
     request_id: &str,
     wait_secs: u64,
+    exec: bool,
 ) -> Result<Value> {
     let deadline = Instant::now() + Duration::from_secs(wait_secs);
     let probe = wait_secs == 0;
     let mut announced = false;
     loop {
-        let r = client::rpc(
-            state_dir,
-            "slot_acquire",
-            json!({"kind": kind, "lane": lane, "pid": pid,
-                   "request_id": request_id, "probe": probe}),
-        )?;
+        let mut params = json!({"kind": kind, "lane": lane, "pid": pid,
+                                "request_id": request_id, "probe": probe});
+        if exec {
+            params["exec"] = json!(true);
+        }
+        let r = client::rpc(state_dir, "slot_acquire", params)?;
         if r["granted"].as_bool().unwrap_or(false) {
             return Ok(r);
         }
@@ -3019,7 +3020,7 @@ fn run_build_slot(state_dir: &Path, action: &BuildSlotAction) -> Result<i32> {
                 .unwrap_or_else(cadence_agent::slots::default_lane);
             let pid = *pid;
             let request_id = Uuid::new_v4().simple().to_string();
-            let r = slot_acquire_loop(state_dir, kind, &lane, pid, &request_id, *wait_secs)?;
+            let r = slot_acquire_loop(state_dir, kind, &lane, pid, &request_id, *wait_secs, false)?;
             if *json_out {
                 print_json(&json!({"token": r["token"],
                     "kind": parsed.as_str(),
@@ -3043,7 +3044,9 @@ fn run_build_slot(state_dir: &Path, action: &BuildSlotAction) -> Result<i32> {
             // lives exactly as long as the work and dies with it.
             let pid = std::process::id();
             let request_id = Uuid::new_v4().simple().to_string();
-            let r = slot_acquire_loop(state_dir, kind, &lane, pid, &request_id, *wait_secs)?;
+            // `exec`: the daemon verifies this requester IS the holder
+            // it records (CAD-230b) — never an ancestor.
+            let r = slot_acquire_loop(state_dir, kind, &lane, pid, &request_id, *wait_secs, true)?;
             let token = r["token"].as_str().unwrap_or_default().to_string();
             eprintln!(
                 "slot {token} acquired ({kind}, pid {pid}) — running {}",

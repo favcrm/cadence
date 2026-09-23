@@ -93,7 +93,7 @@ Error kinds:
 | `agent_resume` | `alias` | `{alias,state:"starting"|"attention"}` |
 | `agent_remove` | `alias` | deletes the agent + its history; refuses live endpoints |
 | `agent_gc` | `older_than?` | sweeps dead agents; `{removed:[alias]}` |
-| `slot_acquire` | `kind: build|test|suite, request_id, lane?, pid?, probe?` | `{granted:true,token,kind,wait_secs}` or `{granted:false,position,wait_secs?,held,capacity}` — non-blocking; callers poll with a stable `request_id` (queue identity only — the daemon mints the `slot-*` token on grant). Caller identity is connection-derived (below): `lane` is advisory, `pid` must be the socket peer or its ancestor. A re-poll adopts a hold only on an exact `(request_id, pid, lane, kind)` match; any other caller sharing the id queues. `probe:true` answers without joining the queue (the CLI's `--wait-secs 0` path). `pid` is the holder whose death frees the slot |
+| `slot_acquire` | `kind: build|test|suite, request_id, lane?, pid?, probe?, exec?` | `{granted:true,token,kind,wait_secs}` or `{granted:false,position,wait_secs?,held,capacity}` — non-blocking; callers poll with a stable `request_id` (queue identity only — the daemon mints the `slot-*` token on grant). Caller identity is connection-derived (below): `lane` is advisory, `pid` must be the socket peer or its ancestor. A re-poll adopts a hold only on an exact `(request_id, pid, lane, kind)` match — for a strict hold also the exact recorded holder `(pid, starttime, uid)`; any other caller sharing the id queues. `probe:true` answers without joining the queue (the CLI's `--wait-secs 0` path). `pid` is the holder whose death frees the slot. `exec:true` (`build-slot run`, CAD-230b): `pid` must be the socket peer itself — the process that execs into the command — and a strict caller's hold is *exec-bound* |
 | `slot_release` | `token, lane?, pid?` | `{released:true,token,kind}` — the release must name the holding `(lane, pid)`, both derived from the connection (`lane` advisory, `pid` must be the peer or its ancestor); a foreign token is a named refusal, a never-held token a named rejection, and a token just reaped this call answers `{released:false, reason}` to its own lane (a `trap`-style cleanup never hard-fails) — foreign lanes get the same never-held rejection, so a token's existence is never probed across lanes |
 | `slot_status` | `lane?` | `{pools:{build,suite}:{capacity,held[]}, waiting[], config, enrollments[], strict:{available,reason?,reconcile_required?,state_generation}}` — also a reap pass: dead holders/waiters drop on the read. A hold's `token` shows only to the connection whose derived lane owns the hold and whose ancestry includes the hold's pid; everyone else sees identity only. Each hold names its `binding` (`legacy`/`strict`); a strict hold adds `enrollment_id, owner_generation, auth_state, liveness, accounting, reconcile_required` and, when something must be done that reconcile cannot do, a `remedy` (see Managed endpoints below) |
 | `slot_reconcile` | `enrollment_id, token, evidence:{owner_generation,pid,starttime,uid,observed_at,process_read,command_outcome,side_effect_review}` | `{reconciled:true,token,kind,observed}` — the one operator path over a strict hold. Operator authority needs positive proof (CAD-276): refused from any connection that derives a slot identity (a pane or an enrolled endpoint is an agent), and from one that is not provably the operator — the peer must run as the daemon's uid with a fully readable ancestry on which no hop is a registered pane, an enrolled or tombstoned root, a descendant of the daemon, or a same-uid process carrying `CADENCE_ALIAS`, hold no pane pty, and have its session leader on that ancestry (a `setsid` + double-fork orphan does not); refused too when the request carries `by`/`operator`/`actor`/`alias`/`lane`/`pid`. The evidence must name the recorded hold exactly; the daemon then reads `/proc` itself and frees only on proven death — a live or unknown holder is refused whatever the evidence says. `cadence build-slot reconcile <enrollment_id> <token> --evidence <json>` |
@@ -1502,6 +1502,29 @@ Residual: an orphan of a dead provider re-parented under a pane — only
 possible with a subreaper below that pane — has no enrolled root left
 on its chain, so it falls to the pane's legacy binding.
 
+### Exec-bound holds (CAD-230 phase b1)
+
+`build-slot run` sends `exec:true`: the daemon then requires the
+claimed `pid` to be the socket peer itself (an ancestor is refused) —
+the `cadence build-slot run` process, which execs into the command
+once granted. `exec` keeps the pid and the `/proc` starttime, so for a
+strict caller the recorded holder `(pid, starttime, uid)` *is* the
+running build; `slot_status` flags the hold `exec_bound`. A pane
+caller's `run` keeps its legacy hold (the pid check is the only
+difference — `run` always claimed its own pid).
+
+A strict hold ends with its holder without anyone's cooperation: the
+daemon re-reads every strict holder once a second and frees a hold
+whose holder is proven dead — gone, a recycled pid (new starttime), or
+a zombie its parent has not reaped yet (`holder exited`) — through the
+same fail-closed writer (an unwritable file keeps it accounted).
+`unknown` still never frees. A holder's `release` of a hold the watcher
+already freed answers `released:false` with the reason, as a same-call
+reap does. Only the holder or a verified descendant can release it
+(unchanged); a recycled pid is a different process — it reads as the
+holder's death, and its own request gets a fresh hold, never the old
+token. Legacy holds keep the reap-on-call rule above.
+
 *Deviation from design v3:* v3 admits only the exact root/worker
 process. A managed provider's builds run in its tools' subprocesses
 (the provider's shell running `cadence build-slot run … cargo …`), so
@@ -1559,8 +1582,9 @@ caller can never free another's hold. A re-poll whose `request_id`
 matches a hold adopts it only on an exact `(request_id, pid, lane,
 kind)` match — a second process sharing a natural request id queues
 like everyone else. A holder whose process dies or whose pid is
-recycled is reaped on the next acquire/status — a killed agent frees
-its slot, nothing is ever killed for one — and a hold past
+recycled is reaped on the next acquire/status (a strict hold also by
+the daemon's own once-a-second watcher, CAD-230b) — a killed agent
+frees its slot, nothing is ever killed for one — and a hold past
 `max_hold_secs` (default 7200) is reaped as `hold expired` so a
 forgotten hold cannot wedge a pool. Waiting is client-side:
 `slot_acquire` answers instantly with granted-or-position, and a

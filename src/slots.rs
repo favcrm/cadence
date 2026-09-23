@@ -196,6 +196,11 @@ struct StrictBind {
     holder: ProcIdentity,
     /// Last observed holder liveness — status only, never persisted.
     liveness: Liveness,
+    /// CAD-230b: the holder is exactly the process that execs the
+    /// command — `build-slot run` itself (the requesting peer, never an
+    /// ancestor). Exec keeps the pid and
+    /// starttime, so the hold names the running build and ends with it.
+    exec_bound: bool,
 }
 
 #[derive(Clone)]
@@ -342,6 +347,7 @@ const MAX_WAITERS_PER_LANE: usize = 32;
 /// (`released:false` + the reap reason) instead of calling them
 /// unknown tokens — to the hold's own lane only, so a foreign caller
 /// can't probe whether a token ever existed.
+#[derive(Clone)]
 struct Reaped {
     token: String,
     lane: String,
@@ -392,7 +398,14 @@ pub struct Slots {
     v2: bool,
     /// Bumped on every v2 write — the envelope's `state_generation`.
     state_generation: u64,
+    /// Strict holds the daemon's own watcher freed between slot calls
+    /// (CAD-230b) — bounded, so a holder's later `release` still gets
+    /// the soft `released:false` answer a same-call reap would give.
+    recent_reaped: Vec<Reaped>,
 }
+
+/// How many watcher-reaped holds `release` remembers for its soft answer.
+const RECENT_REAPED: usize = 64;
 
 impl Slots {
     pub fn new(config: SlotConfig) -> Self {
@@ -600,6 +613,21 @@ impl Slots {
         }
     }
 
+    /// Watcher pass (CAD-230b): free every strict hold whose exact
+    /// holder is proven dead — no client call needed. `alive` and
+    /// `unknown` retain, a failed write keeps the hold accounted
+    /// (see [`Self::reap_strict`]). Legacy holds keep their CAD-113
+    /// reap-on-call rule untouched. Freed tokens are remembered
+    /// (bounded) so their holder's `release` still answers softly.
+    pub fn reap_strict_holds(&mut self, now: f64) -> Vec<SlotEvent> {
+        let (mut events, mut dead) = (Vec::new(), Vec::new());
+        self.reap_strict(now, &mut events, &mut dead);
+        self.recent_reaped.extend(dead);
+        let excess = self.recent_reaped.len().saturating_sub(RECENT_REAPED);
+        self.recent_reaped.drain(..excess);
+        events
+    }
+
     /// Active enrollments past their daemon-capped lifetime become
     /// `expired`: no new work, holds untouched.
     fn expire_enrollments(&mut self, now: f64, events: &mut Vec<SlotEvent>) {
@@ -756,14 +784,19 @@ impl Slots {
             "enrollments": enrollments.iter().map(Enrollment::to_json).collect::<Vec<_>>(),
             "holds": held.iter().filter_map(|h| {
                 let b = h.strict.as_ref()?;
-                Some(json!({
+                let mut row = json!({
                     "token": h.token, "request_id": h.request_id,
                     "kind": h.kind.as_str(), "lane": h.lane,
                     "enrollment_id": b.enrollment_id,
                     "owner_generation": b.owner_generation,
                     "holder": b.holder.to_json(),
                     "acquired_epoch": h.acquired_epoch,
-                }))
+                });
+                // Additive (CAD-230b): absent reads as not exec-bound.
+                if b.exec_bound {
+                    row["exec_bound"] = json!(true);
+                }
+                Some(row)
             }).collect::<Vec<_>>(),
             "legacy_holds": held.iter()
                 .filter(|h| h.strict.is_none())
@@ -1012,6 +1045,10 @@ impl Slots {
                         owner_generation: h["owner_generation"].as_str()?.to_string(),
                         holder: ProcIdentity::from_json(&h["holder"])?,
                         liveness: Liveness::Unknown,
+                        exec_bound: match h.get("exec_bound") {
+                            None => false,
+                            Some(v) => v.as_bool()?,
+                        },
                     },
                     h["acquired_epoch"].as_f64()?,
                 ))
@@ -1100,6 +1137,10 @@ impl Slots {
                 && h.lane == req.lane
                 && h.kind == req.kind
                 && h.enrollment_id() == req.enrollment_id()
+                // A strict hold is adopted only by its exact recorded
+                // holder — a recycled pid (new starttime) is a
+                // different process and never re-binds it (CAD-230b).
+                && h.strict.as_ref().map(|b| b.holder) == req.strict.as_ref().map(|b| b.holder)
         })
     }
 
@@ -1414,7 +1455,11 @@ impl Slots {
         let mut events = Vec::new();
         let reaped = self.reap_dead(now, &mut events);
         let Some(h) = self.held.iter().find(|h| h.token == token) else {
-            if let Some(r) = reaped.iter().find(|r| r.token == token && r.lane == lane) {
+            if let Some(r) = reaped
+                .iter()
+                .chain(self.recent_reaped.iter())
+                .find(|r| r.token == token && r.lane == lane)
+            {
                 return Ok((
                     json!({"released": false, "token": token,
                            "kind": r.kind.as_str(), "reason": r.reason}),
@@ -1560,6 +1605,9 @@ impl Slots {
             .unwrap_or("revoked");
         let accounting = self.accounting(h, now);
         j["binding"] = json!("strict");
+        if b.exec_bound {
+            j["exec_bound"] = json!(true);
+        }
         j["enrollment_id"] = json!(b.enrollment_id);
         j["owner_generation"] = json!(b.owner_generation);
         j["auth_state"] = json!(auth);
@@ -1861,6 +1909,25 @@ impl Slots {
         probe: bool,
         clk: SlotClock,
     ) -> Result<(Value, Vec<SlotEvent>)> {
+        self.acquire_strict_bound(kind, caller, pid, request_id, probe, clk, false)
+    }
+
+    /// [`Self::acquire_strict`], optionally exec-bound (CAD-230b): with
+    /// `exec` the claimed `pid` must be the connection peer ITSELF — the
+    /// `build-slot run` process that execs into the command, so the
+    /// hold's recorded `(pid, starttime, uid)` is exactly the running
+    /// build and ends with its exit. An ancestor is refused.
+    #[allow(clippy::too_many_arguments)]
+    pub fn acquire_strict_bound(
+        &mut self,
+        kind: SlotKind,
+        caller: &StrictCaller,
+        pid: u32,
+        request_id: &str,
+        probe: bool,
+        clk: SlotClock,
+        exec: bool,
+    ) -> Result<(Value, Vec<SlotEvent>)> {
         if let Some(b) = &self.blocked {
             return Err(strict_unavailable(&b.reason));
         }
@@ -1882,6 +1949,9 @@ impl Slots {
             )));
         }
         let (owner, owner_generation) = (e.owner_actor.clone(), e.owner_generation.clone());
+        if exec && caller.segment.first() != Some(&pid) {
+            return Err(exec_not_peer(pid));
+        }
         let holder = self.strict_holder(caller, pid)?;
         self.acquire_as(
             kind,
@@ -1895,6 +1965,7 @@ impl Slots {
                 owner_generation,
                 holder,
                 liveness: Liveness::Alive,
+                exec_bound: exec,
             }),
         )
     }
@@ -2075,6 +2146,14 @@ impl Slots {
             }
         }
     }
+}
+
+/// An exec-bound request claiming anything but the connection peer.
+pub(crate) fn exec_not_peer(pid: u32) -> Error {
+    Error::rejected(format!(
+        "An exec-bound hold names the requesting process itself — pid {pid} is \
+         not the connection peer (`build-slot run` binds its own pid, then execs)"
+    ))
 }
 
 fn strict_unavailable(reason: &str) -> Error {

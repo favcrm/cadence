@@ -1167,3 +1167,110 @@ fn reconcile_required_only_where_reconcile_can_act() {
         "{dead}"
     );
 }
+
+// ---------- CAD-230 phase b1: exec-bound holds ----------
+
+/// Mark `pid` as exited but not yet reaped by its parent (a zombie).
+fn zombify(p: &FakeProc, pid: u32) {
+    let stat = p.root().join(pid.to_string()).join("stat");
+    let text = std::fs::read_to_string(&stat).unwrap();
+    std::fs::write(&stat, text.replacen(") S ", ") Z ", 1)).unwrap();
+}
+
+fn acquire_exec(s: &mut Slots, peer: u32, pid: u32, req: &str, now: f64) -> Result<Value> {
+    let caller = s.strict_caller(peer, 200)?;
+    s.acquire_strict_bound(SlotKind::Build, &caller, pid, req, false, clk(now), true)
+        .map(|(v, _)| v)
+}
+
+/// ACCEPTANCE (b1): `build-slot run`'s hold names exactly the requesting
+/// process — the one that execs into the command — as (pid, starttime,
+/// uid): an ancestor is refused. The daemon's watcher frees it once
+/// that process exits (gone, or a zombie its parent has not reaped),
+/// with no release call from anyone.
+#[test]
+fn exec_bound_hold_names_the_peer_and_ends_with_its_exit() {
+    for (how, reason) in [("gone", "holder died"), ("zombie", "holder exited")] {
+        let p = tree();
+        let mut s = strict_slots(&p, 1);
+        enroll(&mut s, "wk", "g1", 200);
+        // The shell (an ancestor of the CLI) is not the exec'ing peer.
+        let err = acquire_exec(&mut s, 400, 300, "r0", 0.0).unwrap_err();
+        assert!(err.to_string().contains("exec-bound"), "{how}: {err}");
+        let g = acquire_exec(&mut s, 400, 400, "r1", 0.0).unwrap();
+        assert_eq!(g["granted"], true, "{how}: {g}");
+        let h = held_json(&mut s, 1.0)[0].clone();
+        assert_eq!(h["pid"], 400);
+        assert_eq!(h["exec_bound"], true);
+        assert_eq!(
+            s.held[0].strict.as_ref().unwrap().holder,
+            ProcIdentity {
+                pid: 400,
+                starttime: 70,
+                uid: UID,
+            }
+        );
+        // Alive: the watcher keeps it.
+        assert!(s.reap_strict_holds(2.0).is_empty());
+        assert_eq!(s.held.len(), 1);
+        match how {
+            "gone" => p.kill(400),
+            _ => zombify(&p, 400),
+        }
+        let events = s.reap_strict_holds(3.0);
+        assert!(s.held.is_empty(), "{how}: freed without a release");
+        assert!(
+            events
+                .iter()
+                .any(|e| e.1 == "slot_released" && e.2["pid"] == 400 && e.2["reason"] == reason),
+            "{how}: {events:?}"
+        );
+        // A trap-style release from the lane afterwards stays soft.
+        p.spawn(400, 300, 70);
+        let caller = s.strict_caller(300, 200).unwrap();
+        let token = g["token"].as_str().unwrap();
+        let (r, _) = s.release_strict(token, &caller, 300, 4.0).unwrap();
+        assert_eq!(r["released"], false, "{how}: {r}");
+    }
+}
+
+/// ACCEPTANCE (b1): no other process can release or re-bind an
+/// exec-bound hold — not a sibling, not the invoking shell, not the
+/// legacy path, and not a process that recycled the holder's pid (new
+/// starttime): that one reads as the holder's death, frees the hold
+/// and gets a fresh grant of its own, never the old token.
+#[test]
+fn exec_bound_hold_refuses_forged_release_and_pid_reuse() {
+    let p = tree();
+    let mut s = strict_slots(&p, 2);
+    enroll(&mut s, "wk", "g1", 200);
+    let g = acquire_exec(&mut s, 400, 400, "run-1", 0.0).unwrap();
+    let token = g["token"].as_str().unwrap().to_string();
+    for (peer, claim) in [(310, 310), (300, 300)] {
+        let caller = s.strict_caller(peer, 200).unwrap();
+        let err = s.release_strict(&token, &caller, claim, 1.0).unwrap_err();
+        assert!(err.to_string().contains("another caller"), "{peer}: {err}");
+    }
+    let err = s.release(&token, "wk", 400, 1.0).unwrap_err();
+    assert!(err.to_string().contains("another caller"), "{err}");
+    assert_eq!(s.held.len(), 1, "no forged release freed it");
+    // PID reuse: 400 exits and a new process takes the pid.
+    p.kill(400);
+    p.spawn(400, 300, 99);
+    let again = acquire_exec(&mut s, 400, 400, "run-1", 2.0).unwrap();
+    assert_eq!(again["granted"], true, "{again}");
+    assert_ne!(
+        again["token"],
+        token.as_str(),
+        "never re-binds the old hold"
+    );
+    assert_eq!(s.held.len(), 1);
+    assert_eq!(s.held[0].strict.as_ref().unwrap().holder.starttime, 99);
+    let caller = s.strict_caller(400, 200).unwrap();
+    assert!(s
+        .release_strict(&token, &caller, 400, 3.0)
+        .is_err_and(|e| e.to_string().contains("Unknown slot token")));
+    // The dead holder's release reason named the recycling.
+    let persisted = s.recent_reaped.iter().any(|r| r.token == token);
+    assert!(!persisted, "a same-call reap is answered by that call");
+}
