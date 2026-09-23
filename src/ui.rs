@@ -2764,7 +2764,7 @@ fn start_inner(state_dir: &Path, flags: &UiFlags, reset: bool, quiet: bool) -> R
             Ok(())
         });
     }
-    let mut child = command.spawn()?;
+    let mut child = crate::reaper::spawn(&mut command)?;
     std::fs::write(pid_file(state_dir), child.id().to_string())?;
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {

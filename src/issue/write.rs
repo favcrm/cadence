@@ -294,16 +294,17 @@ pub fn project_add(
         let canonical = path.canonicalize().unwrap_or(path.clone());
         // Store the path as given (~/ keeps it portable); remote is
         // discovered from the repo's own config.
-        let remote = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&canonical)
-            .args(["config", "--get", "remote.origin.url"])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .filter(|r| !r.is_empty())
-            .map(|r| project::normalize_remote(&r));
+        let remote = crate::reaper::output(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&canonical)
+                .args(["config", "--get", "remote.origin.url"]),
+        )
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|r| !r.is_empty())
+        .map(|r| project::normalize_remote(&r));
         repo_entries.push(project::Repo {
             path: Some(repo.clone()),
             remote,

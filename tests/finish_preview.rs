@@ -9,6 +9,10 @@
 //! a present path must still refuse while a process stands in it.
 //! Synthetic repos only; nothing here touches a host worktree.
 
+// A test binary never runs the CAD-308 reaper (only `daemon run` does),
+// so its own spawns need not go through `cadence_agent::reaper`.
+#![allow(clippy::disallowed_methods)]
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 

@@ -2,6 +2,10 @@
 //! `cadence ui` HTTP server in-process — routes, host/method/id/traversal
 //! rejection, and daemon-unreachable honesty.
 
+// A test binary never runs the CAD-308 reaper (only `daemon run` does),
+// so its own spawns need not go through `cadence_agent::reaper`.
+#![allow(clippy::disallowed_methods)]
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};

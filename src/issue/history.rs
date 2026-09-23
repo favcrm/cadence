@@ -245,11 +245,12 @@ fn resolve_rev(pm_dir: &Path, rev: &str) -> Result<String> {
             "Unknown revision '{rev}' — does not resolve to a commit"
         ))
     })?;
-    let ancestor = Command::new("git")
-        .arg("-C")
-        .arg(pm_dir)
-        .args(["merge-base", "--is-ancestor", &sha, "HEAD"])
-        .status();
+    let ancestor = crate::reaper::status(Command::new("git").arg("-C").arg(pm_dir).args([
+        "merge-base",
+        "--is-ancestor",
+        &sha,
+        "HEAD",
+    ]));
     match ancestor {
         Ok(s) if s.success() => Ok(sha),
         _ => Err(Error::rejected(format!(
@@ -271,14 +272,15 @@ fn commit_time(pm_dir: &Path, sha: &str) -> Result<String> {
 /// `git show <rev>:<file>` — `None` when the path does not exist at
 /// that revision (pre-creation revs included).
 fn file_at(pm_dir: &Path, rev: &str, rel_file: &str) -> Option<String> {
-    Command::new("git")
-        .arg("-C")
-        .arg(pm_dir)
-        .args(["show", &format!("{rev}:{rel_file}")])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+    crate::reaper::output(
+        Command::new("git")
+            .arg("-C")
+            .arg(pm_dir)
+            .args(["show", &format!("{rev}:{rel_file}")]),
+    )
+    .ok()
+    .filter(|o| o.status.success())
+    .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
 }
 
 /// Frontmatter as a JSON map — `skip_serializing_if` drops unset
@@ -550,21 +552,23 @@ pub fn ls_at(
     let sha = resolve_rev(pm_dir, rev)?;
     let at = json!({"sha": sha, "time": commit_time(pm_dir, &sha)?});
     let export = TempExport::create()?;
-    let mut archive = Command::new("git")
-        .arg("-C")
-        .arg(pm_dir)
-        .args(["archive", &sha])
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|_| Error::rejected("`git` is required and was not found on PATH"))?;
-    let tar = Command::new("tar")
-        .args(["-x", "-C"])
-        .arg(&export.0)
-        .stdin(archive.stdout.take().expect("piped stdout"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|_| Error::rejected("`tar` is required and was not found on PATH"))?;
+    let mut archive = crate::reaper::spawn(
+        Command::new("git")
+            .arg("-C")
+            .arg(pm_dir)
+            .args(["archive", &sha])
+            .stdout(Stdio::piped()),
+    )
+    .map_err(|_| Error::rejected("`git` is required and was not found on PATH"))?;
+    let tar = crate::reaper::spawn(
+        Command::new("tar")
+            .args(["-x", "-C"])
+            .arg(&export.0)
+            .stdin(archive.stdout.take().expect("piped stdout"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped()),
+    )
+    .map_err(|_| Error::rejected("`tar` is required and was not found on PATH"))?;
     let tar_out = tar.wait_with_output()?;
     let git_status = archive.wait()?;
     if !git_status.success() || !tar_out.status.success() {

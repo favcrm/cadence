@@ -284,8 +284,8 @@ pub fn recover(state_dir: &Path, now: f64) -> Vec<Receipt> {
 /// program), no optional index lock, and only `PATH`/`HOME` from the
 /// daemon's environment.
 fn git(dir: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
-        .arg("-c")
+    let mut cmd = Command::new("git");
+    cmd.arg("-c")
         .arg("core.fsmonitor=false")
         .arg("-C")
         .arg(dir)
@@ -298,8 +298,11 @@ fn git(dir: &Path, args: &[&str]) -> Option<String> {
         )
         .env("GIT_OPTIONAL_LOCKS", "0")
         .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let out = crate::reaper::spawn(&mut cmd)
+        .ok()?
+        .wait_with_output()
         .ok()?;
     out.status
         .success()
@@ -540,22 +543,23 @@ pub fn spawn_gated(intent: &Intent, env: &[(String, String)], log: &Path) -> Res
         .mode(0o600)
         .open(log)?;
     let err = out.try_clone()?;
-    Command::new("/bin/sh")
-        .arg("-c")
-        .arg(GATE)
-        .arg("cadence-runner")
-        .args(&intent.argv)
-        .current_dir(&intent.cwd)
-        .env_clear()
-        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-        .env("CADENCE_RUNNER_ID", &intent.runner_id)
-        .env("CADENCE_RUNNER_DIGEST", &intent.digest)
-        .stdin(Stdio::piped())
-        .stdout(out)
-        .stderr(err)
-        .process_group(0)
-        .spawn()
-        .map_err(|e| Error::rejected(format!("cannot spawn runner {}: {e}", intent.runner_id)))
+    crate::reaper::spawn(
+        Command::new("/bin/sh")
+            .arg("-c")
+            .arg(GATE)
+            .arg("cadence-runner")
+            .args(&intent.argv)
+            .current_dir(&intent.cwd)
+            .env_clear()
+            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .env("CADENCE_RUNNER_ID", &intent.runner_id)
+            .env("CADENCE_RUNNER_DIGEST", &intent.digest)
+            .stdin(Stdio::piped())
+            .stdout(out)
+            .stderr(err)
+            .process_group(0),
+    )
+    .map_err(|e| Error::rejected(format!("cannot spawn runner {}: {e}", intent.runner_id)))
 }
 
 /// Open the gate: the one line [`GATE`] accepts.

@@ -1670,13 +1670,13 @@ fn patch_id(repo: &Path, range: &str) -> Option<String> {
         return None;
     }
     let mut pid = Command::new("git");
-    let mut child = pid
-        .arg("patch-id")
-        .arg("--stable")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .ok()?;
+    let mut child = crate::reaper::spawn(
+        pid.arg("patch-id")
+            .arg("--stable")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped()),
+    )
+    .ok()?;
     child.stdin.take()?.write_all(&out.stdout).ok()?;
     let out = child.wait_with_output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout);

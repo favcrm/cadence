@@ -221,7 +221,12 @@ pub(crate) fn unmatched_caller(
 ///    readable;
 /// 3. no hop is a registered pane pid (`panes`), an enrolled or
 ///    tombstoned managed-endpoint root (`enrolled_root`), or a strict
-///    descendant of `daemon_pid` (every process the daemon launched);
+///    descendant of `daemon_pid` (every process the daemon launched).
+///    Under `daemon run` the daemon is the child subreaper of all of
+///    them (CAD-308, [`crate::reaper`]): a process that detaches from
+///    a tree the daemon launched — `setsid -f`, a double fork — is
+///    re-parented to the daemon, not to init, so it stays a descendant
+///    and this check refuses it whatever its env, session or stdio;
 /// 4. no hop of this uid carries `CADENCE_ALIAS` (an agent's) or
 ///    `CADENCE_RUNNER_ID` (a daemon-launched runner's) in its environment,
 ///    and the peer's own environment is readable. An ancestor's
@@ -236,12 +241,17 @@ pub(crate) fn unmatched_caller(
 ///    session id of 0 (a leader outside this pid namespace) or 1
 ///    (init) cannot come from a detach inside it and passes.
 ///
-/// Residual: a same-uid process that leaves every agent's ancestry
-/// WITHOUT orphaning its session (`setsid -f` makes the reparented
-/// child its own session leader) and scrubs its env and stdio still
-/// passes — the "unattributable local caller is the operator" weakness
-/// tracked as a design note on CAD-276. Reconcile only frees holds
-/// the daemon itself proves dead, so that residual cannot free work.
+/// Residual (CAD-280): the subreaper covers only trees this daemon
+/// instance launched. A same-uid process started by a long-lived
+/// process OUTSIDE them — a tmux server the daemon did not start (one
+/// that outlived a daemon restart, the operator's, an agent-started
+/// one), `systemd-run --user`, cron, `ssh localhost` — or detached
+/// with `setsid -f` from a pane whose server is such a process, and
+/// that scrubs its env and stdio, is its own session leader, is no
+/// daemon descendant, and still passes: the "unattributable local
+/// caller is the operator" weakness that operator-by-positive-proof
+/// (CAD-280) designs out. Reconcile only frees holds the daemon itself
+/// proves dead, so that residual cannot free work.
 pub(crate) fn operator_proof(
     peer_pid: u32,
     uid: u32,
@@ -290,8 +300,8 @@ pub(crate) fn operator_proof(
             // A daemon-launched runner's tree (CAD-230b) carries its id:
             // a detached (`setsid -f`) descendant of a recipe leaves the
             // runner's ancestry but not its environment. One that also
-            // scrubs the variable passes — the known residual (CAD-308,
-            // the daemon child-subreaper follow-up).
+            // scrubs the variable is still refused above, as a daemon
+            // descendant — the daemon is its child subreaper (CAD-308).
             Ok(env)
                 if env
                     .split(|b| *b == 0)

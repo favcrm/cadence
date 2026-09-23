@@ -14,7 +14,7 @@ use crate::error::Result;
 use crate::store::Store;
 
 fn command_version(program: &str, args: &[&str]) -> Value {
-    match Command::new(program).args(args).output() {
+    match crate::reaper::output(Command::new(program).args(args)) {
         Ok(out) if out.status.success() => {
             let text = String::from_utf8_lossy(&out.stdout);
             json!({"present": true, "version": text.trim()})
