@@ -189,7 +189,7 @@ impl StdioAdapter {
                 Ok(())
             });
         }
-        let mut child = command.spawn()?;
+        let mut child = crate::reaper::spawn(&mut command)?;
         let pid = child.id();
         let stdin = child
             .stdin

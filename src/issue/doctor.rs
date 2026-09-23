@@ -13,12 +13,7 @@ use crate::issue::{hooks, lint, Pm};
 /// A git probe that never fails the report — `None` means "absent",
 /// matching doctor semantics (a missing repo is data, not an error).
 fn probe(pm_dir: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(pm_dir)
-        .args(args)
-        .output()
-        .ok()?;
+    let out = crate::reaper::output(Command::new("git").arg("-C").arg(pm_dir).args(args)).ok()?;
     if !out.status.success() {
         return None;
     }

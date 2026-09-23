@@ -344,11 +344,11 @@ pub(crate) fn kill_pane(state_dir: &Path, alias: &str, env: &ProviderEnv) {
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| "tmux".to_string());
     let socket = format!("cadence-{}", short_hash(&state_dir.to_string_lossy()));
-    let _ = Command::new(tmux)
-        .arg("-L")
-        .arg(&socket)
-        .args(["kill-session", "-t", alias])
-        .output();
+    let _ = crate::reaper::output(Command::new(tmux).arg("-L").arg(&socket).args([
+        "kill-session",
+        "-t",
+        alias,
+    ]));
 }
 
 /// Whether `alias` still has a session on this state dir's private
@@ -362,12 +362,12 @@ pub(crate) fn pane_alive(state_dir: &Path, alias: &str, env: &ProviderEnv) -> bo
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| "tmux".to_string());
     let socket = format!("cadence-{}", short_hash(&state_dir.to_string_lossy()));
-    Command::new(tmux)
-        .arg("-L")
-        .arg(&socket)
-        .args(["has-session", "-t", &format!("={alias}")])
-        .output()
-        .map_or(true, |out| out.status.success())
+    crate::reaper::output(Command::new(tmux).arg("-L").arg(&socket).args([
+        "has-session",
+        "-t",
+        &format!("={alias}"),
+    ]))
+    .map_or(true, |out| out.status.success())
 }
 
 /// CAD-96: how many terminal clients are attached to `alias`'s session
@@ -380,18 +380,14 @@ pub(crate) fn pane_clients(state_dir: &Path, alias: &str, env: &ProviderEnv) -> 
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| "tmux".to_string());
     let socket = format!("cadence-{}", short_hash(&state_dir.to_string_lossy()));
-    let out = Command::new(tmux)
-        .arg("-L")
-        .arg(&socket)
-        .args([
-            "list-clients",
-            "-t",
-            &format!("={alias}"),
-            "-F",
-            "#{client_tty}",
-        ])
-        .output()
-        .ok()?;
+    let out = crate::reaper::output(Command::new(tmux).arg("-L").arg(&socket).args([
+        "list-clients",
+        "-t",
+        &format!("={alias}"),
+        "-F",
+        "#{client_tty}",
+    ]))
+    .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -444,8 +440,9 @@ pub(crate) fn descends_from(mut pid: u32, pane_pid: u32) -> bool {
 /// caller identity (CAD-113): an unreadable or malformed link yields
 /// `None`, never a partial chain — a caller whose ancestry cannot be
 /// verified must inherit no identity at all. A detached caller
-/// (`setsid`) reparents to init, so its chain is just itself — which
-/// no registered pane can match.
+/// (`setsid`) reparents to init — or, under `daemon run`, to the daemon,
+/// the child subreaper of everything it launched (CAD-308) — so no
+/// registered pane is left on its chain.
 pub(crate) fn caller_chain(mut pid: u32) -> Option<Vec<u32>> {
     let mut chain = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -580,11 +577,12 @@ impl PtyAdapter {
     }
 
     fn tmux(&self, args: &[&str]) -> Result<std::process::Output> {
-        Ok(Command::new(&self.tmux)
-            .arg("-L")
-            .arg(&self.socket)
-            .args(args)
-            .output()?)
+        Ok(crate::reaper::output(
+            Command::new(&self.tmux)
+                .arg("-L")
+                .arg(&self.socket)
+                .args(args),
+        )?)
     }
 
     fn tmux_ok(&self, args: &[&str]) -> Result<String> {

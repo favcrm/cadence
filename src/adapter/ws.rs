@@ -139,7 +139,7 @@ impl WsAdapter {
                 Ok(())
             });
         }
-        let child = command.spawn()?;
+        let child = crate::reaper::spawn(&mut command)?;
         let pid = child.id();
         self.inner.lock().unwrap().child = Some(child);
 

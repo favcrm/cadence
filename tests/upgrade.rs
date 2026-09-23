@@ -1,6 +1,10 @@
 //! CAD-334: `cadence upgrade` against a fake release source and temp
 //! install dirs. Nothing here calls GitHub or touches `~/.local`.
 
+// A test binary never runs the CAD-308 reaper (only `daemon run` does),
+// so its own spawns need not go through `cadence_agent::reaper`.
+#![allow(clippy::disallowed_methods)]
+
 use std::cell::RefCell;
 use std::fs;
 use std::os::unix::fs::{symlink, PermissionsExt};

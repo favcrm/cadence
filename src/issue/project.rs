@@ -112,12 +112,7 @@ pub fn normalize_remote(remote: &str) -> String {
 }
 
 fn git(dir: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .ok()?;
+    let out = crate::reaper::output(Command::new("git").arg("-C").arg(dir).args(args)).ok()?;
     if out.status.success() {
         Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
     } else {

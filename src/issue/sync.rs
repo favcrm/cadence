@@ -38,12 +38,7 @@ impl Resolve {
 /// (`rev-parse --verify`, `merge-base --is-ancestor`) where the answer
 /// is data, not an error.
 fn probe(dir: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .ok()?;
+    let out = crate::reaper::output(Command::new("git").arg("-C").arg(dir).args(args)).ok()?;
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
@@ -57,13 +52,14 @@ fn probe(dir: &Path, args: &[&str]) -> Option<String> {
 const NO_HOOKS: &str = "core.hooksPath=/dev/null";
 
 fn rebase_step(dir: &Path, step: &str) -> Result<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(["-c", NO_HOOKS, "rebase", step])
-        .env("GIT_EDITOR", "true")
-        .output()
-        .map_err(|_| Error::rejected("`git` is required and was not found on PATH"))?;
+    let out = crate::reaper::output(
+        Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", NO_HOOKS, "rebase", step])
+            .env("GIT_EDITOR", "true"),
+    )
+    .map_err(|_| Error::rejected("`git` is required and was not found on PATH"))?;
     if !out.status.success() {
         return Err(Error::rejected(format!(
             "git rebase {step} failed in {}: {}",
@@ -159,17 +155,13 @@ fn in_progress_markers(git_dir: &Path) -> Vec<String> {
 /// paragraph holds the informational messages. A clean merge lists
 /// just the oid.
 fn would_conflicts(dir: &Path, upstream: &str) -> Vec<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args([
-            "merge-tree",
-            "--write-tree",
-            "--name-only",
-            "HEAD",
-            upstream,
-        ])
-        .output();
+    let out = crate::reaper::output(Command::new("git").arg("-C").arg(dir).args([
+        "merge-tree",
+        "--write-tree",
+        "--name-only",
+        "HEAD",
+        upstream,
+    ]));
     let Ok(out) = out else { return vec![] };
     let text = String::from_utf8_lossy(&out.stdout);
     text.split("\n\n")
