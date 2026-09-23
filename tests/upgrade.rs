@@ -523,6 +523,87 @@ fn refuses_to_replace_a_non_symlink() {
     assert_eq!(fs::read(&e.layout.link).unwrap(), b"a hand-copied binary");
 }
 
+/// Every request shape that could reuse an on-disk release.
+fn reuse_requests() -> [Request; 4] {
+    [
+        req(Target::Sha(SHA.into()), false),
+        req(Target::Sha(SHA.into()), true),
+        req(Target::LatestMain, false),
+        req_unattested(SHA),
+    ]
+}
+
+/// CAD-379: `<releases>/<sha>/cadence` as a symlink to the attested CI
+/// bytes outside `releases`. The bytes would verify, but the link would
+/// then chase a file outside the release tree; it is refused before it is
+/// attested, run, written through or linked.
+#[test]
+fn cad379_refuses_a_symlinked_release_binary() {
+    let e = env();
+    let outside = e.artifact.join("cadence");
+    fs::set_permissions(&outside, fs::Permissions::from_mode(0o755)).unwrap();
+    let dir = e.layout.release_dir(SHA);
+    fs::create_dir_all(&dir).unwrap();
+    for f in ["cadence.sha256", "manifest.json"] {
+        fs::copy(e.artifact.join(f), dir.join(f)).unwrap();
+    }
+    symlink(&outside, dir.join("cadence")).unwrap();
+
+    for request in reuse_requests() {
+        let fake = Fake::new(&e.artifact);
+        let msg = refusal(upgrade::run(&fake, &e.layout, &request));
+        assert!(msg.contains("is a symlink"), "{msg}");
+        assert!(
+            msg.contains(&dir.join("cadence").display().to_string()),
+            "{msg}"
+        );
+        assert!(!fake.called("attest"), "{:?}", fake.calls.borrow());
+        assert!(!fake.called("download"), "{:?}", fake.calls.borrow());
+        assert_eq!(link_target(&e.layout), e.layout.binary(OLD));
+        assert_eq!(fs::read(&outside).unwrap(), fake_binary(SHA));
+    }
+}
+
+/// CAD-379: `<releases>/<sha>` itself a symlink to a directory holding the
+/// full CI artifact outside `releases` — or not a directory at all.
+#[test]
+fn cad379_refuses_a_release_dir_that_is_not_a_directory() {
+    let e = env();
+    fs::set_permissions(
+        e.artifact.join("cadence"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let dir = e.layout.release_dir(SHA);
+    symlink(&e.artifact, &dir).unwrap();
+    let before = snapshot(&e.artifact);
+
+    for request in reuse_requests() {
+        let fake = Fake::new(&e.artifact);
+        let msg = refusal(upgrade::run(&fake, &e.layout, &request));
+        assert!(msg.contains("is a symlink"), "{msg}");
+        assert!(!fake.called("attest"), "{:?}", fake.calls.borrow());
+        assert!(!fake.called("download"), "{:?}", fake.calls.borrow());
+        assert_eq!(link_target(&e.layout), e.layout.binary(OLD));
+    }
+    assert_eq!(
+        snapshot(&e.artifact),
+        before,
+        "written through the dir link"
+    );
+
+    fs::remove_file(&dir).unwrap();
+    fs::write(&dir, b"not a release").unwrap();
+    let fake = Fake::new(&e.artifact);
+    let msg = refusal(upgrade::run(
+        &fake,
+        &e.layout,
+        &req(Target::Sha(SHA.into()), false),
+    ));
+    assert!(msg.contains("not a directory"), "{msg}");
+    assert_eq!(fs::read(&dir).unwrap(), b"not a release");
+}
+
 #[test]
 fn dry_run_verifies_and_changes_nothing() {
     let e = env();
@@ -993,6 +1074,42 @@ fn cli_rollback_prints_restart_command_and_never_restarts() {
         cli.layout.binary(OLD)
     );
     assert!(!stderr(&out).contains("reached"));
+    // CAD-379: the unattested label reaches a human, not only the JSON.
+    let err = stderr(&out);
+    assert!(err.contains("warning: unattested local release"), "{err}");
+    assert!(err.contains("NOT verified"), "{err}");
+}
+
+/// CAD-379: `--allow-unattested` (gh works, the attestation does not
+/// verify) warns on stderr too; stdout stays the JSON report.
+#[test]
+fn cli_allow_unattested_rollback_warns_on_stderr() {
+    let cli = cli_env(
+        "#!/bin/sh\ncase \"$1\" in\n  auth) exit 0 ;;\n  attestation) echo 'no attestation found' >&2; exit 1 ;;\n  *) echo \"unexpected gh $*\" >&2; exit 3 ;;\nesac\n",
+    );
+    let newer = cli.layout.release_dir(SHA);
+    fs::create_dir_all(&newer).unwrap();
+    fs::write(newer.join("cadence"), fake_binary(SHA)).unwrap();
+    fs::set_permissions(newer.join("cadence"), fs::Permissions::from_mode(0o755)).unwrap();
+    fs::remove_file(&cli.layout.link).unwrap();
+    symlink(newer.join("cadence"), &cli.layout.link).unwrap();
+
+    let out = cadence(&cli, &["--sha", OLD, "--allow-unattested"]);
+    let err = stderr(&out);
+    assert!(out.status.success(), "{err}");
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["trust"], "unattested local release");
+    assert!(report["verified"]["attestation"]
+        .as_str()
+        .unwrap()
+        .starts_with("failed:"));
+    assert!(err.contains("warning: unattested local release"), "{err}");
+    assert!(err.contains(OLD), "{err}");
+    assert!(!err.contains("unexpected gh"), "{err}");
+    assert_eq!(
+        fs::read_link(&cli.layout.link).unwrap(),
+        cli.layout.binary(OLD)
+    );
 }
 
 #[test]
