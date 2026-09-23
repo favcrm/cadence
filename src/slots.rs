@@ -2349,7 +2349,11 @@ impl Slots {
     }
 }
 
-/// A slot call from inside a daemon-launched runner's process tree.
+/// A slot call from inside a daemon-launched runner's ATTACHED process
+/// tree (its verified ancestry reaches the runner's enrolled root). A
+/// descendant that detaches and scrubs `CADENCE_RUNNER_ID` leaves that
+/// tree and can pass operator proof instead — the known residual,
+/// closed by the daemon child-subreaper follow-up (CAD-308).
 fn runner_tree_refused(runner: &str) -> Error {
     Error::rejected(format!(
         "This process runs under daemon-launched runner {runner}, which already \

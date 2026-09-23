@@ -278,7 +278,9 @@ pub(crate) fn operator_proof(
             }
             // A daemon-launched runner's tree (CAD-230b) carries its id:
             // a detached (`setsid -f`) descendant of a recipe leaves the
-            // runner's ancestry but not its environment.
+            // runner's ancestry but not its environment. One that also
+            // scrubs the variable passes — the known residual (CAD-308,
+            // the daemon child-subreaper follow-up).
             Ok(env)
                 if env
                     .split(|b| *b == 0)

@@ -28767,12 +28767,14 @@ fn build_slot_launch_refuses_unknown_recipes_injection_and_unproven_callers() {
     assert_eq!(receipts(&d.state), 2);
 }
 
-/// CAD-230 phase b2 (review): a runner's tree stays contained. A
-/// descendant that detaches (`setsid -f`, reparented off the runner) is
-/// still not the operator — it carries the runner's environment — so
-/// it cannot launch as `(operator)`; and a straggler the recipe left
-/// in its process group is ended with the recipe, never left building
-/// after its slot frees.
+/// CAD-230 phase b2 (review): what of a runner's tree is contained. A
+/// descendant that detaches (`setsid -f`, reparented off the runner)
+/// but keeps the runner's environment is still not the operator, so it
+/// cannot launch as `(operator)`; and a straggler the recipe left in its
+/// process group is ended with the recipe, never left building after
+/// its slot frees. A detached descendant that ALSO scrubs the runner's
+/// environment is not contained — see
+/// `build_slot_launch_detached_scrubbed_descendant_passes_as_operator`.
 #[test]
 fn build_slot_launch_runner_tree_is_contained() {
     let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
@@ -28849,6 +28851,100 @@ fn build_slot_launch_runner_tree_is_contained() {
             .count(),
         1,
         "the detached descendant launched nothing"
+    );
+}
+
+/// KNOWN RESIDUAL, pinned (CAD-230 phase b2 review; CAD-308): a recipe
+/// descendant that detaches AND scrubs the runner's environment —
+/// `env -u CADENCE_RUNNER_ID -u CADENCE_RUNNER_DIGEST setsid -f …`, stdio
+/// to /dev/null — re-parents off the runner, carries no marker, and
+/// today PASSES operator proof: its `slot_launch` is accepted as
+/// `(operator)`. This asserts the CURRENT behaviour on purpose. The
+/// daemon child-subreaper fix (CAD-308) must flip it — the launch
+/// refused and no nested runner — so that change lands deliberately.
+#[test]
+fn build_slot_launch_detached_scrubbed_descendant_passes_as_operator() {
+    let d = TestDaemon::start_opts(slot_opts(2, 1, 900, &[]));
+    plant_self(&d);
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let req = work.path().join("req.json");
+    let resp = work.path().join("resp.json");
+    std::fs::write(
+        &req,
+        cadence_agent::proto::request("slot_launch", json!({"recipe": "inner", "project": "p"}))
+            .to_string(),
+    )
+    .unwrap();
+    let py = format!(
+        "import socket,os;s=socket.socket(socket.AF_UNIX);s.connect({sock:?});\
+         s.sendall(open({req:?},'rb').read()+b'\\n');\
+         open({out:?}+'.tmp','w').write(s.makefile().readline());\
+         os.rename({out:?}+'.tmp',{out:?})",
+        sock = client::socket_path(&d.state).display().to_string(),
+        req = req.display().to_string(),
+        out = resp.display().to_string(),
+    );
+    let outer = format!(
+        "env -u CADENCE_RUNNER_ID -u CADENCE_RUNNER_DIGEST setsid -f python3 -c {py} \
+         </dev/null >/dev/null 2>&1; \
+         while [ ! -e {r} ]; do sleep 0.05; done; exit 0",
+        py = shell_quote(&py),
+        r = resp.display()
+    );
+    let recipes = sh_recipe("outer", &outer, &["PATH"]) + &sh_recipe("inner", "echo inner", &[]);
+    let (_proj, _repo) = runner_project(&recipes);
+    let run = cadence_at(
+        home.path(),
+        &d.state,
+        &["build-slot", "launch", "outer", "--project", "p"],
+    );
+    assert_eq!(
+        run.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let answer: Value = serde_json::from_str(&std::fs::read_to_string(&resp).unwrap()).unwrap();
+    // CAD-308 must flip this: expect `ok:false` (refused) instead.
+    assert_eq!(
+        answer["ok"], true,
+        "the residual is pinned as accepted until CAD-308 lands \
+         (a refusal here from another cause means the host's orphan \
+         reaper ancestry differs): {answer}"
+    );
+    assert_eq!(answer["result"]["requester"], "operator", "{answer}");
+    assert_eq!(answer["result"]["lane"], "(operator)", "{answer}");
+    // Cleanup (CAD-306): the nested runner is the daemon's own child and
+    // runs a one-line recipe — wait until it has ended and been reaped,
+    // so no runner outlives this test.
+    let nested = answer["result"]["runner_id"].as_str().unwrap().to_string();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let r = loop {
+        let r = cadence_agent::runner::read_receipt(&d.state, &nested).unwrap();
+        if r.is_terminal() {
+            break r;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "nested runner never ended: {r:?}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(
+        (r.state.as_str(), r.exit_code),
+        ("exited", Some(0)),
+        "{r:?}"
+    );
+    let pid = r.pid.unwrap();
+    assert!(
+        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "nested runner {pid} was reaped"
+    );
+    let s = d.rpc("slot_status", json!({})).unwrap();
+    assert!(
+        s["pools"]["build"]["held"].as_array().unwrap().is_empty(),
+        "{s}"
     );
 }
 
