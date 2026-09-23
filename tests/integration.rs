@@ -29113,6 +29113,11 @@ impl ManagedWorker {
     /// Register `alias` as a managed claude endpoint running the
     /// enrollment mock and wait for the daemon to enroll it.
     fn start(d: &TestDaemon, alias: &str) -> ManagedWorker {
+        Self::start_role(d, alias, "worker")
+    }
+
+    /// [`Self::start`] registering the endpoint with `role`.
+    fn start_role(d: &TestDaemon, alias: &str, role: &str) -> ManagedWorker {
         let cmd_dir = TempDir::new().unwrap();
         let pidfile = d.dir.path().join(format!("claude-{alias}.pid"));
         let script = d.dir.path().join("claude-enroll.py");
@@ -29130,7 +29135,13 @@ impl ManagedWorker {
         let mock = MockClaude {
             pidfile: pidfile.clone(),
         };
-        d.register_claude(alias, Value::Null);
+        let cwd = d.dir.path().to_str().unwrap().to_string();
+        d.rpc(
+            "agent_register",
+            json!({"alias": alias, "provider": "claude",
+                   "endpoint_kind": "managed", "cwd": cwd, "role": role}),
+        )
+        .unwrap();
         // The daemon's own record of the provider it launched — the
         // mock may not even have written its pidfile yet.
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -29204,6 +29215,185 @@ impl ManagedWorker {
         }
         serde_json::from_str(&std::fs::read_to_string(&resp).unwrap()).unwrap()
     }
+}
+
+/// CAD-381 ACCEPTANCE: memory resolves its caller through the one
+/// identity verifier — the daemon's CAD-230 enrollment of a managed
+/// provider it launched — so headless endpoints author, review and
+/// finalize exactly like panes. A proposal by one managed endpoint is
+/// reviewed by two others and finalized by a managed pm to `accepted`;
+/// the author still cannot review its own proposal; a spoofed identity
+/// param is refused; the test process and a managed tool's detached
+/// grandchild are "not an agent" (the operator path), never the
+/// endpoint; and an owner-generation drift revokes the enrollment for
+/// good — restoring the generation does not revive it.
+#[test]
+fn memory_managed_endpoints_authenticate_through_daemon_enrollment() {
+    let tmp = TempDir::new().unwrap();
+    let pm_dir = tmp.path().join("pm");
+    let pm = cadence_agent::issue::Pm::init(&pm_dir).unwrap();
+    std::fs::create_dir_all(pm_dir.join("demo")).unwrap();
+    std::fs::write(
+        pm_dir.join("demo/project.yaml"),
+        "key: demo\nprefix: D\ncomponents: []\n",
+    )
+    .unwrap();
+    pm.commit("project fixture\n\nActor: test\n").unwrap();
+    let _pm_env = PmDirGuard::set(&pm_dir);
+
+    let d = TestDaemon::start_opts(slot_opts(2, 1, 900, &[]));
+    let mut author = ManagedWorker::start(&d, "author");
+    let mut reviewer_a = ManagedWorker::start(&d, "reviewer-a");
+    let mut reviewer_b = ManagedWorker::start(&d, "reviewer-b");
+    let mut lead = ManagedWorker::start_role(&d, "lead", "pm");
+    for alias in ["author", "reviewer-a", "reviewer-b", "lead"] {
+        d.wait_agent(alias, "idle", 25);
+    }
+    let ok = |r: Value, what: &str| -> Value {
+        assert_eq!(r["ok"], true, "{what}: {r}");
+        r["result"].clone()
+    };
+    let refused = |r: &Value, needle: &str, what: &str| {
+        assert_eq!(r["ok"], false, "{what}: {r}");
+        let msg = r["error"]["message"].as_str().unwrap_or_default();
+        assert!(msg.contains(needle), "{what}: want '{needle}' in {r}");
+    };
+    let memory_path = pm_dir.join("demo/memory/managed-rule.md");
+    let read_memory = || std::fs::read(&memory_path).unwrap();
+
+    let proposal = json!({
+        "project": "demo",
+        "kind": "rule",
+        "scope": {"project": true},
+        "source": "CAD-381",
+        "confidence": "high",
+        "text": "\nmanaged endpoints carry daemon-minted identity\n\n**Why:** the enrollment is the authority.\n\n**How to apply:** trust only the daemon's record.\n",
+        "id": "managed-rule"
+    });
+    // A self-asserted identity is refused before any PM write, even
+    // from a genuinely enrolled endpoint.
+    let r = author.rpc(
+        "self",
+        "memory_propose",
+        json!({"alias": "lead", "inner": proposal.clone()}),
+    );
+    refused(&r, "connection-bound", "spoofed alias");
+    assert!(!memory_path.exists());
+
+    // The provider's tool subprocess (a verified descendant) proposes
+    // as the endpoint.
+    let proposed = ok(
+        author.rpc("child", "memory_propose", proposal.clone()),
+        "managed propose",
+    );
+    assert_eq!(proposed["status"], "proposed", "{proposed}");
+    let digest = proposed["digest"].as_str().unwrap().to_string();
+    let review = |verdict_evidence: &str| {
+        json!({
+            "slug": "managed-rule",
+            "project": "demo",
+            "operation": "accept",
+            "verdict": "pass",
+            "evidence": verdict_evidence,
+            "digest": digest,
+        })
+    };
+
+    let before = read_memory();
+    let r = author.rpc("self", "memory_review", review("self review"));
+    refused(&r, "author cannot review", "author reviews own proposal");
+    assert_eq!(before, read_memory());
+
+    // Spoofed reviewer identity from a real endpoint: refused.
+    let mut spoof = review("spoofed reviewer");
+    spoof["reviewer"] = json!("reviewer-b");
+    let r = reviewer_a.rpc("self", "memory_review", spoof);
+    refused(&r, "connection-bound", "spoofed reviewer");
+
+    // Not an agent: the test process itself, and a managed tool's
+    // setsid double-forked grandchild (off the provider's ancestry).
+    let err = d
+        .rpc("memory_review", review("outside every agent tree"))
+        .unwrap_err();
+    assert!(err.to_string().contains("is not an agent"), "{err}");
+    let r = reviewer_a.rpc("detached", "memory_review", review("detached"));
+    refused(&r, "is not an agent", "detached grandchild");
+    assert_eq!(before, read_memory());
+
+    let a = ok(
+        reviewer_a.rpc("self", "memory_review", review("reviewer A checked it")),
+        "reviewer A",
+    );
+    assert_eq!(a["quorum"]["eligible"], false, "{a}");
+    let b = ok(
+        reviewer_b.rpc("child", "memory_review", review("reviewer B checked it")),
+        "reviewer B",
+    );
+    assert_eq!(b["quorum"]["eligible"], true, "{b}");
+    let finalized = ok(
+        lead.rpc(
+            "self",
+            "memory_finalize",
+            json!({"slug": "managed-rule", "project": "demo",
+                   "operation": "accept", "digest": digest}),
+        ),
+        "managed pm finalize",
+    );
+    assert_eq!(finalized["status"], "accepted", "{finalized}");
+
+    let pm = cadence_agent::issue::Pm::at(&pm_dir).unwrap();
+    let (_, accepted) = memory::find(&pm, Some("demo"), "managed-rule").unwrap();
+    assert!(memory::retrieval_status(&accepted).0);
+    let author_proof = accepted.front.author_proof.clone().unwrap();
+    assert_eq!(author_proof.alias, "author");
+    let agent = d.rpc("agent_show", json!({"alias": "author"})).unwrap()["agent"].clone();
+    assert!(
+        author_proof
+            .generation
+            .ends_with(&format!(":{}", author.pid)),
+        "the proof carries the enrolled owner generation: {author_proof:?} {agent}"
+    );
+    assert_eq!(
+        accepted
+            .front
+            .reviews
+            .iter()
+            .map(|r| r.reviewer.as_str())
+            .collect::<Vec<_>>(),
+        vec!["reviewer-a", "reviewer-b"]
+    );
+    assert_eq!(accepted.front.finalizations[0].finalizer.alias, "lead");
+
+    // Owner generation drift revokes the author's enrollment: the old
+    // enrollment no longer authenticates — and never falls through to
+    // "not an agent" — even once the row's generation is restored.
+    let original = agent["generation"].as_str().map(str::to_string);
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    conn.execute(
+        "UPDATE agents SET generation='regenerated' WHERE alias='author'",
+        [],
+    )
+    .unwrap();
+    let second = json!({
+        "project": "demo",
+        "kind": "gotcha",
+        "scope": {"project": true},
+        "source": "CAD-381",
+        "confidence": "low",
+        "text": "stale enrollments vouch for no one\n\n**Why:** drift revokes.\n\n**How to apply:** reopen the endpoint.\n",
+        "id": "stale-rule"
+    });
+    let r = author.rpc("self", "memory_propose", second.clone());
+    refused(&r, "not active", "drifted enrollment");
+    conn.execute(
+        "UPDATE agents SET generation=?1 WHERE alias='author'",
+        [original],
+    )
+    .unwrap();
+    drop(conn);
+    let r = author.rpc("child", "memory_propose", second);
+    refused(&r, "not active", "revoked enrollment after restore");
+    assert!(!pm_dir.join("demo/memory/stale-rule.md").exists());
 }
 
 /// CAD-230 phase a ACCEPTANCE: the daemon enrolls a managed provider
