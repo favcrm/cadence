@@ -30,6 +30,7 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_POLL_INTERVAL_MS: u64 = 1000;
 const DEFAULT_POLL_BUDGET_MS: u64 = 30 * 60 * 1000;
 
+#[derive(Default)]
 struct Session {
     id: Option<String>,
     org: String,
@@ -43,23 +44,6 @@ struct Session {
     text: String,
     wait_sent: bool,
     terminated: bool,
-}
-
-impl Default for Session {
-    fn default() -> Self {
-        Self {
-            id: None,
-            org: String::new(),
-            endpoint: None,
-            status: String::new(),
-            detail: String::new(),
-            acus: None,
-            limit: None,
-            text: String::new(),
-            wait_sent: false,
-            terminated: false,
-        }
-    }
 }
 
 enum CallErr {
@@ -1294,6 +1278,7 @@ mod tests {
             provider: "devin".into(),
             endpoint_kind: "cloud".into(),
             role: "worker".into(),
+            team_role: None,
             cwd: CWD.into(),
             sandbox: "read-only".into(),
             instructions: Some(format!("work in {CWD}")),
@@ -1304,6 +1289,7 @@ mod tests {
             pid: None,
             endpoint: None,
             params: Some(params),
+            model_selection: None,
             quota: None,
             generation: None,
             state: "starting".into(),
