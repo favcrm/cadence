@@ -57,30 +57,19 @@ export function needLabel(kind: string): string {
   return KIND_LABEL[kind] ?? "unknown / unclassified";
 }
 
-const NEED_GROUP: Record<string, "decision" | "team" | "dependency" | "info"> = {
-  approval: "decision",
-  merge: "team",
-  intake: "team",
-  fenced: "team",
-  stalled: "team",
-  review_no_pr: "team",
-  blocked_ready: "team",
-  pr_no_verdict: "team",
-  ci_red: "team",
-  ci_unverified: "team",
-  silent_end: "team",
-  // A sampled menu is not an operator approval.
-  approval_menu: "team",
-  drift: "dependency",
-  inbox_stale: "team",
-  inbox_unread: "info",
-  tracker_behind: "info",
-};
+/**
+ * Overview needs-me sections, keyed by the server-resolved `audience`
+ * (CAD-253). The server decides who a row is for; this is copy only.
+ */
+export const NEED_SECTION_LABEL = {
+  operator: "Needs your decision",
+  team: "Team handling",
+  dependency: "Waiting on dependency",
+  info: "Information",
+} as const;
 
-/** Unknown kinds stay in team handling, matching the previous fallback. */
-export function needGroupKey(kind: string): "decision" | "team" | "dependency" | "info" {
-  return NEED_GROUP[kind] ?? "team";
-}
+/** "Needs your decision" with no operator row — an answer, not a gap. */
+export const NEEDS_DECISION_EMPTY = "Nothing needs your decision";
 
 /**
  * Drawer status line while the board status comes from notes.

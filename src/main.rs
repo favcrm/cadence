@@ -3122,52 +3122,85 @@ fn fmt_age(secs: i64) -> String {
     }
 }
 
+/// `needs_me` sections in render order, keyed by the server-resolved
+/// `audience` (CAD-253) — the CLI never maps kinds to audiences.
+const NEED_SECTIONS: [(&str, &str); 4] = [
+    ("operator", "needs your decision"),
+    ("team", "team handling"),
+    ("dependency", "waiting on dependency"),
+    ("info", "information"),
+];
+
 /// Aligned-list rendering of the overview payload — the TTY default.
 fn print_overview(view: &Value) {
     let needs = view["needs_me"].as_array().cloned().unwrap_or_default();
     println!("NEEDS ME");
-    if needs.is_empty() {
-        println!("  nothing waiting on a human");
-    } else {
-        let mut widths = [0usize; 4];
-        let mut rows = Vec::new();
-        for n in &needs {
-            let title = n["title"].as_str().unwrap_or_default();
-            let title: String = title.chars().take(52).collect();
-            // One row per subject: every cause, most severe first.
-            let causes: Vec<&str> = n["causes"]
-                .as_array()
-                .map(|cs| cs.iter().filter_map(|c| c["cause"].as_str()).collect())
-                .unwrap_or_default();
-            let kind = if causes.is_empty() {
-                n["kind"].as_str().unwrap_or_default().to_string()
-            } else {
-                causes.join("+")
-            };
-            let row = [
-                kind,
-                fmt_age(n["age"].as_i64().unwrap_or(0)),
-                n["project"].as_str().unwrap_or_default().to_string(),
-                title,
-                n["command"].as_str().unwrap_or_default().to_string(),
-            ];
-            for (i, c) in row[..4].iter().enumerate() {
-                widths[i] = widths[i].max(c.chars().count());
-            }
-            rows.push(row);
+    let mut widths = [0usize; 5];
+    let mut rows: Vec<(String, [String; 6])> = Vec::new();
+    for n in &needs {
+        let title = n["title"].as_str().unwrap_or_default();
+        let title: String = title.chars().take(52).collect();
+        // One row per subject: every cause, most severe first.
+        let causes: Vec<&str> = n["causes"]
+            .as_array()
+            .map(|cs| cs.iter().filter_map(|c| c["cause"].as_str()).collect())
+            .unwrap_or_default();
+        let kind = if causes.is_empty() {
+            n["kind"].as_str().unwrap_or_default().to_string()
+        } else {
+            causes.join("+")
+        };
+        let row = [
+            kind,
+            fmt_age(n["age"].as_i64().unwrap_or(0)),
+            n["project"].as_str().unwrap_or_default().to_string(),
+            title,
+            n["audience_reason"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            n["command"].as_str().unwrap_or_default().to_string(),
+        ];
+        for (i, c) in row[..5].iter().enumerate() {
+            widths[i] = widths[i].max(c.chars().count());
         }
-        for r in &rows {
+        // A row without a known `audience` (an older server) reads as
+        // team work.
+        let audience = n["audience"]
+            .as_str()
+            .filter(|a| NEED_SECTIONS.iter().any(|(k, _)| k == a))
+            .unwrap_or("team");
+        rows.push((audience.to_string(), row));
+    }
+    for (key, label) in NEED_SECTIONS {
+        let section: Vec<&[String; 6]> = rows
+            .iter()
+            .filter(|(a, _)| a == key)
+            .map(|(_, r)| r)
+            .collect();
+        // The decision section always renders — an empty one is an
+        // answer, not an omission.
+        if section.is_empty() && key != "operator" {
+            continue;
+        }
+        println!("  {label}");
+        if section.is_empty() {
+            println!("    nothing needs your decision");
+        }
+        for r in section {
             println!(
-                "  {:<w0$}  {:>w1$}  {:<w2$}  {:<w3$}  {}",
+                "    {:<w0$}  {:>w1$}  {:<w2$}  {:<w3$}  {:<w4$}  {}",
                 r[0],
                 r[1],
                 r[2],
                 r[3],
                 r[4],
+                r[5],
                 w0 = widths[0],
                 w1 = widths[1],
                 w2 = widths[2],
                 w3 = widths[3],
+                w4 = widths[4],
             );
         }
     }

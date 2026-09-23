@@ -9,7 +9,8 @@ import type {
   Project,
   ProjectContext,
 } from "../types";
-import { needGroupKey, needLabel, shaCiLabel } from "../uxCopy";
+import { needSections } from "../needSections";
+import { needLabel, shaCiLabel } from "../uxCopy";
 import { StaleChip } from "./ResourceStatus";
 
 const KIND_CHIP: Record<string, string> = {
@@ -52,18 +53,6 @@ const MONITOR_STATE_CHIP: Record<string, string> = {
   off: "bg-ink-800 text-ink-400",
 };
 
-const NEED_GROUPS = [
-  { key: "decision", label: "Needs your decision" },
-  { key: "team", label: "Team handling" },
-  { key: "dependency", label: "Waiting on dependency" },
-  { key: "info", label: "Information" },
-] as const;
-
-function needGroup(kind: string): (typeof NEED_GROUPS)[number] {
-  const key = needGroupKey(kind);
-  return NEED_GROUPS.find((group) => group.key === key) ?? NEED_GROUPS[1];
-}
-
 function projectMatches(value: string | null | undefined, project: string): boolean {
   return project === "all" || value === project;
 }
@@ -72,20 +61,22 @@ function isGlobalProject(value: string | null | undefined): boolean {
   return !value || value === "global" || value === "unknown";
 }
 
-function NeedRows({ rows }: { rows: Overview["needs_me"] }) {
-  const grouped = NEED_GROUPS.map((group) => ({
-    ...group,
-    rows: rows.filter((row) => needGroup(row.kind).key === group.key),
-  })).filter((group) => group.rows.length > 0);
+/** Sections come from the server-resolved `audience` (CAD-253); with
+ *  `decision`, "Needs your decision" always shows, empty or not. */
+function NeedRows({ rows, decision }: { rows: Overview["needs_me"]; decision: boolean }) {
+  const grouped = needSections(rows, decision);
   return (
     <div className="space-y-3">
       {grouped.map((group) => (
-        <details key={group.key} open={group.key === "decision" || group.key === "dependency"}>
+        <details key={group.key} open={group.key === "operator" || group.key === "dependency"}>
           <summary className="flex items-center gap-2 mb-1.5 cursor-pointer list-none">
             <span className="slabel">{group.label}</span>
             <span className="num text-micro text-ink-500">{group.rows.length}</span>
           </summary>
           <div className="space-y-1.5 mt-1.5">
+            {group.rows.length === 0 && group.empty && (
+              <div className="card px-3.5 py-2.5 text-label text-ink-500">{group.empty}</div>
+            )}
             {group.rows.map((n, i) => (
               <div
                 key={`${n.kind}-${n.title}-${i}`}
@@ -116,6 +107,9 @@ function NeedRows({ rows }: { rows: Overview["needs_me"] }) {
                     n.title
                   )}
                 </span>
+                {n.audience === "operator" && n.audience_reason && (
+                  <span className="text-micro text-fail shrink-0">{n.audience_reason}</span>
+                )}
                 <span className="chip bg-ink-800 text-ink-500 shrink-0">
                   {n.project || "global"}
                 </span>
@@ -125,6 +119,7 @@ function NeedRows({ rows }: { rows: Overview["needs_me"] }) {
                   </summary>
                   <div className="mt-1.5 rounded border border-ink-700 bg-ink-900 px-2.5 py-2 text-micro text-ink-400">
                     <div className="text-ink-300">kind {n.kind} · observed {age(n.age)} ago · source {n.project || "global host"}</div>
+                    {n.audience_reason && <div className="text-ink-300">for {n.audience} · {n.audience_reason}</div>}
                     <code className="num block mt-1 whitespace-pre-wrap break-words">{n.command}</code>
                   </div>
                 </details>
@@ -610,19 +605,13 @@ export default function OverviewView({
 
       <section>
         <div className="slabel mb-2">needs me · {project === "all" ? "all projects" : project}</div>
-        {scopedNeeds.length === 0 ? (
-          <div className="card px-4 py-6 text-center text-label text-ink-500">
-            nothing waiting on a human for this project
-          </div>
-        ) : (
-          <NeedRows rows={scopedNeeds} />
-        )}
+        <NeedRows rows={scopedNeeds} decision />
         {project !== "all" && globalNeeds.length > 0 && (
           <details className="mt-4">
             <summary className="cursor-pointer text-micro text-ink-400 hover:text-ink-200">
               Global or unassigned observations · {globalNeeds.length}
             </summary>
-            <div className="mt-2"><NeedRows rows={globalNeeds} /></div>
+            <div className="mt-2"><NeedRows rows={globalNeeds} decision={false} /></div>
           </details>
         )}
       </section>
