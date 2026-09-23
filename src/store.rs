@@ -234,6 +234,67 @@ pub const APPROVAL_RECORDED_EVENT: &str = "approval_recorded";
 /// (a cancelled or superseded queue message) never writes this.
 pub const APPROVAL_REVOKED_EVENT: &str = "approval_revoked";
 
+/// CAD-316: the only event kinds retention may remove — per-delivery
+/// bookkeeping whose facts the message row also records. An allowlist,
+/// never a denylist: a kind added later is kept until someone lists it
+/// here, and every deleting statement repeats this filter.
+pub const ROLLABLE_EVENT_KINDS: [&str; 2] = ["submitting", "submitted"];
+/// The one per-alias row holding the rolled-up delivery counts.
+pub const DELIVERY_ROLLUP_EVENT: &str = "delivery_rolled_up";
+/// Delivery rows younger than this stay rows.
+pub const EVENT_ROLLUP_AGE_SECS: f64 = 7.0 * 86_400.0;
+
+/// `events e` rows a rollup at cutoff `?1` may fold: an allowlisted
+/// kind, older than the cut, outside any job view, and not naming a
+/// message that is still live or `unknown` (unreconciled evidence).
+fn rollable_events_where() -> String {
+    let kinds = ROLLABLE_EVENT_KINDS
+        .iter()
+        .map(|k| format!("'{k}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "e.kind IN ({kinds}) AND e.at < ?1 AND e.job_id IS NULL AND e.task_id IS NULL \
+         AND NOT EXISTS (SELECT 1 FROM messages m \
+           WHERE m.id = json_extract(e.payload, '$.message') \
+           AND m.state NOT IN ('completed','failed','interrupted','cancelled'))"
+    )
+}
+
+/// What `doctor --host` shows about the events table (CAD-316).
+pub(crate) struct EventStoreStats {
+    pub events: u64,
+    pub awaiting_rollup: u64,
+    pub rolled_up: u64,
+}
+
+/// Read-only counts for doctor over an already-open connection.
+pub(crate) fn event_store_stats(
+    conn: &Connection,
+    cutoff: f64,
+) -> rusqlite::Result<EventStoreStats> {
+    let events = conn.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))?;
+    let awaiting_rollup = conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM events e WHERE {}",
+            rollable_events_where()
+        ),
+        [cutoff],
+        |r| r.get(0),
+    )?;
+    let rolled_up = conn.query_row(
+        "SELECT COALESCE(SUM(c.value), 0) FROM events e, json_each(e.payload, '$.counts') c \
+         WHERE e.kind = ?1",
+        [DELIVERY_ROLLUP_EVENT],
+        |r| r.get(0),
+    )?;
+    Ok(EventStoreStats {
+        events,
+        awaiting_rollup,
+        rolled_up,
+    })
+}
+
 /// One operator approval as `Store::record_approval` persists it: the
 /// operator approved `action` on the exact `head_sha` of PR `pr` in
 /// `repo`, as told by `source` (who approved and where — a claim the
@@ -4328,6 +4389,91 @@ impl Store {
             params![alias, keep],
         )?;
         Ok(())
+    }
+
+    /// CAD-316: fold delivery rows older than `cutoff` (see
+    /// [`ROLLABLE_EVENT_KINDS`]) into one [`DELIVERY_ROLLUP_EVENT`] row
+    /// per alias carrying per-kind counts and the folded time span. The
+    /// first rollup reuses the alias's oldest folded row, so the summary
+    /// keeps an old seq and never reads as new activity to a cursor or
+    /// the stall watch; later passes add into that row. Returns the
+    /// number of delivery rows folded.
+    pub fn roll_up_delivery_events(&self, cutoff: f64) -> Result<usize> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let rows: Vec<(i64, String, String, f64)> = {
+            let mut st = tx.prepare(&format!(
+                "SELECT e.seq, e.alias, e.kind, e.at FROM events e WHERE {} \
+                 ORDER BY e.alias, e.seq",
+                rollable_events_where()
+            ))?;
+            let rows = st.query_map([cutoff], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let kinds_sql = ROLLABLE_EVENT_KINDS
+            .iter()
+            .map(|k| format!("'{k}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        for batch in rows.chunk_by(|a, b| a.1 == b.1) {
+            let alias = &batch[0].1;
+            let existing: Option<(i64, String)> = tx
+                .query_row(
+                    "SELECT seq, payload FROM events WHERE alias=?1 AND kind=?2 \
+                     ORDER BY seq LIMIT 1",
+                    params![alias, DELIVERY_ROLLUP_EVENT],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let mut summary = match &existing {
+                Some((_, payload)) => serde_json::from_str::<Value>(payload).map_err(|e| {
+                    Error::internal(format!("{DELIVERY_ROLLUP_EVENT} payload: {e}"))
+                })?,
+                None => json!({
+                    "counts": ROLLABLE_EVENT_KINDS
+                        .iter()
+                        .map(|k| (k.to_string(), json!(0)))
+                        .collect::<serde_json::Map<_, _>>(),
+                }),
+            };
+            for (_, _, kind, at) in batch {
+                let count = summary["counts"][kind.as_str()].as_u64().unwrap_or(0);
+                summary["counts"][kind.as_str()] = json!(count + 1);
+                let first = summary["first_at"].as_f64().map_or(*at, |f| f.min(*at));
+                let last = summary["last_at"].as_f64().map_or(*at, |l| l.max(*at));
+                summary["first_at"] = json!(first);
+                summary["last_at"] = json!(last);
+            }
+            let folded = match existing {
+                Some((seq, _)) => {
+                    tx.execute(
+                        "UPDATE events SET payload=?1 WHERE seq=?2 AND kind=?3",
+                        params![summary.to_string(), seq, DELIVERY_ROLLUP_EVENT],
+                    )?;
+                    batch
+                }
+                None => {
+                    tx.execute(
+                        &format!(
+                            "UPDATE events SET kind=?1, payload=?2 \
+                             WHERE seq=?3 AND kind IN ({kinds_sql})"
+                        ),
+                        params![DELIVERY_ROLLUP_EVENT, summary.to_string(), batch[0].0],
+                    )?;
+                    &batch[1..]
+                }
+            };
+            let mut delete = tx.prepare(&format!(
+                "DELETE FROM events WHERE seq=?1 AND kind IN ({kinds_sql})"
+            ))?;
+            for (seq, ..) in folded {
+                delete.execute([seq])?;
+            }
+        }
+        tx.commit()?;
+        Ok(rows.len())
     }
 
     /// The oldest still-waiting message for the agent — `queued` or
@@ -9569,5 +9715,175 @@ mod tests {
             assert!(note.contains("frees no memory and no disk"), "{note}");
             assert!(note.contains("can no longer be resumed"), "{note}");
         }
+    }
+
+    // ---------- CAD-316: delivery-event rollup ----------
+
+    const DAY: f64 = 86_400.0;
+
+    /// A message row in `state`, and one raw event per `(kind, age)`
+    /// naming it — `at` backdated so the rollup's age cut applies.
+    fn delivery(s: &Store, alias: &str, id: &str, state: &str, events: &[(&str, f64)]) {
+        s.enqueue(alias, "work", None, id, "user").unwrap();
+        let conn = s.conn();
+        conn.execute(
+            "UPDATE messages SET state=?1 WHERE id=?2",
+            params![state, id],
+        )
+        .unwrap();
+        for (kind, age) in events {
+            conn.execute(
+                "INSERT INTO events(alias,kind,payload,at) VALUES(?1,?2,?3,?4)",
+                params![alias, kind, json!({"message": id}).to_string(), now() - age],
+            )
+            .unwrap();
+        }
+    }
+
+    /// Every event row, oldest first: `(seq, alias, kind, payload, at)`.
+    fn event_rows(s: &Store) -> Vec<(i64, String, String, String, f64)> {
+        let conn = s.conn();
+        let mut st = conn
+            .prepare("SELECT seq, alias, kind, payload, at FROM events ORDER BY seq")
+            .unwrap();
+        st.query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
+    }
+
+    fn kinds_of(s: &Store, alias: &str) -> Vec<String> {
+        event_rows(s)
+            .into_iter()
+            .filter(|row| row.1 == alias)
+            .map(|row| row.2)
+            .collect()
+    }
+
+    /// Acceptance 1: `submitting`/`submitted` rows older than seven days
+    /// become one per-alias row of counts; younger rows stay rows, and a
+    /// later pass folds into the same row instead of adding another.
+    #[test]
+    fn delivery_events_older_than_seven_days_roll_up_into_counts() {
+        let (dir, s) = store();
+        reg(&s, "a1", &dir.path().join("w"));
+        reg(&s, "a2", &dir.path().join("w"));
+        delivery(
+            &s,
+            "a1",
+            "m1",
+            "completed",
+            &[("submitting", 9.0 * DAY), ("submitted", 9.0 * DAY)],
+        );
+        delivery(
+            &s,
+            "a1",
+            "m2",
+            "failed",
+            &[("submitting", 8.0 * DAY), ("submitted", 6.0 * DAY)],
+        );
+        delivery(&s, "a2", "m3", "cancelled", &[("submitting", 10.0 * DAY)]);
+        let cutoff = now() - EVENT_ROLLUP_AGE_SECS;
+        assert_eq!(EVENT_ROLLUP_AGE_SECS, 7.0 * DAY);
+
+        assert_eq!(s.roll_up_delivery_events(cutoff).unwrap(), 4);
+        let rollup = |alias: &str| -> Vec<Value> {
+            event_rows(&s)
+                .into_iter()
+                .filter(|row| row.1 == alias && row.2 == DELIVERY_ROLLUP_EVENT)
+                .map(|row| serde_json::from_str(&row.3).unwrap())
+                .collect()
+        };
+        // The six-day-old `submitted` stays a row; the rest is counts.
+        let rest: Vec<String> = kinds_of(&s, "a1")
+            .into_iter()
+            .filter(|k| ROLLABLE_EVENT_KINDS.contains(&k.as_str()) || k == DELIVERY_ROLLUP_EVENT)
+            .collect();
+        assert_eq!(rest, vec![DELIVERY_ROLLUP_EVENT, "submitted"]);
+        let a1 = rollup("a1");
+        assert_eq!(a1.len(), 1, "{a1:?}");
+        assert_eq!(a1[0]["counts"], json!({"submitting": 2, "submitted": 1}));
+        assert!(a1[0]["last_at"].as_f64().unwrap() < cutoff);
+        assert!(a1[0]["first_at"].as_f64().unwrap() <= a1[0]["last_at"].as_f64().unwrap());
+        assert_eq!(
+            rollup("a2")[0]["counts"],
+            json!({"submitting": 1, "submitted": 0})
+        );
+
+        // Nothing new is old enough: a second pass is a no-op.
+        let before = event_rows(&s);
+        assert_eq!(s.roll_up_delivery_events(cutoff).unwrap(), 0);
+        assert_eq!(event_rows(&s), before);
+
+        // A week later the six-day row ages out and folds into the same
+        // row — still one rollup per alias, counts summed.
+        assert_eq!(s.roll_up_delivery_events(now() - DAY).unwrap(), 1);
+        let a1 = rollup("a1");
+        assert_eq!(a1.len(), 1, "{a1:?}");
+        assert_eq!(a1[0]["counts"], json!({"submitting": 2, "submitted": 2}));
+        assert!(!kinds_of(&s, "a1").iter().any(|k| k == "submitted"));
+    }
+
+    /// Acceptance 2: retention deletes by allowlist, never by denylist.
+    /// Every other kind — semantic events and any kind added later —
+    /// survives however old, and so do delivery rows that are still
+    /// evidence: scoped to a job, or naming a message that is live or
+    /// `unknown` (unreconciled).
+    #[test]
+    fn rollup_never_deletes_a_semantic_event() {
+        assert_eq!(ROLLABLE_EVENT_KINDS, ["submitting", "submitted"]);
+        let (dir, s) = store();
+        reg(&s, "a1", &dir.path().join("w"));
+        delivery(&s, "a1", "m-done", "completed", &[]);
+        let old = now() - 30.0 * DAY;
+        {
+            let conn = s.conn();
+            for kind in [
+                "turn_started",
+                "turn_finished",
+                "turn_unknown",
+                "attention",
+                "acknowledged",
+                "paste_not_rendered",
+                "verdict",
+                "job_event",
+                "task_dispatched",
+                "approval_recorded",
+                "agent_gc_removed",
+                "a_kind_added_later",
+            ] {
+                conn.execute(
+                    "INSERT INTO events(alias,kind,payload,at) VALUES('a1',?1,?2,?3)",
+                    params![kind, json!({"message": "m-done"}).to_string(), old],
+                )
+                .unwrap();
+            }
+            // A delivery row a job view reads stays in that view.
+            conn.execute(
+                "INSERT INTO events(alias,kind,payload,job_id,task_id,at)
+                 VALUES('a1','submitted',?1,'job-1','job-1-impl',?2)",
+                params![json!({"message": "m-done"}).to_string(), old],
+            )
+            .unwrap();
+        }
+        for (id, state) in [
+            ("m-queued", "queued"),
+            ("m-submitting", "submitting"),
+            ("m-running", "running"),
+            ("m-unknown", "unknown"),
+        ] {
+            delivery(
+                &s,
+                "a1",
+                id,
+                state,
+                &[("submitting", 30.0 * DAY), ("submitted", 30.0 * DAY)],
+            );
+        }
+        let before = event_rows(&s);
+        assert_eq!(s.roll_up_delivery_events(now()).unwrap(), 0);
+        assert_eq!(event_rows(&s), before);
     }
 }

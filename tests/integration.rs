@@ -23089,6 +23089,7 @@ fn doctor_host_json_reports_all_checks() {
         vec![
             "disk",
             "provider-state",
+            "cadence-store",
             "pipes",
             "memory",
             "processes",

@@ -470,6 +470,7 @@ pub fn run(scan: &Scan) -> Value {
     let checks = [
         check_disk(scan),
         check_provider_state(scan),
+        check_cadence_store(scan),
         check_pipes(scan),
         check_memory(scan),
         check_processes(scan),
@@ -954,6 +955,69 @@ fn check_provider_state(scan: &Scan) -> Check {
     .flatten()
     .collect();
     eval_provider_state(&stores, t)
+}
+
+/// CAD-316: cadence's own store — file and WAL size plus the event
+/// bookkeeping retention acts on: rows, delivery rows the daemon has
+/// rolled into counts, and rows past the age cut still awaiting a
+/// rollup. Informational; the size thresholds stay in provider-state.
+/// Opened read-only, like the census, so doctor never creates or
+/// migrates the file.
+fn check_cadence_store(scan: &Scan) -> Check {
+    let name = "cadence-store";
+    let threshold = json!("informational — size thresholds are provider-state's");
+    let db = scan.state_dir.join("cadence.sqlite3");
+    let Some(store_bytes) = file_size(&db) else {
+        return check(
+            name,
+            Level::Ok,
+            json!({"path": db, "present": false}),
+            threshold,
+            "no cadence.sqlite3 in this state dir".to_string(),
+            String::new(),
+        );
+    };
+    let wal_bytes = wal_sibling(&db).and_then(|w| file_size(&w));
+    let size = match wal_bytes {
+        Some(wal) => format!(
+            "cadence.sqlite3 {} (+wal {})",
+            human(store_bytes),
+            human(wal)
+        ),
+        None => format!("cadence.sqlite3 {}", human(store_bytes)),
+    };
+    let cutoff = scan
+        .now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+        - crate::store::EVENT_ROLLUP_AGE_SECS;
+    let stats = crate::store::open_read_only(&db)
+        .and_then(|conn| crate::store::event_store_stats(&conn, cutoff));
+    let mut value = json!({
+        "path": db,
+        "present": true,
+        "store_bytes": store_bytes,
+        "wal_bytes": wal_bytes,
+    });
+    let detail = match stats {
+        Ok(stats) => {
+            value["events"] = json!(stats.events);
+            value["delivery_rolled_up"] = json!(stats.rolled_up);
+            value["delivery_awaiting_rollup"] = json!(stats.awaiting_rollup);
+            let days = crate::store::EVENT_ROLLUP_AGE_SECS / 86_400.0;
+            format!(
+                "{size}; {} events; {} delivery events rolled up into counts, \
+                 {} older than {days}d awaiting rollup",
+                stats.events, stats.rolled_up, stats.awaiting_rollup
+            )
+        }
+        Err(e) => {
+            value["error"] = json!(e.to_string());
+            format!("{size}; events unreadable: {e}")
+        }
+    };
+    check(name, Level::Ok, value, threshold, detail, String::new())
 }
 
 fn eval_provider_state(stores: &[StoreMeasure], t: &Thresholds) -> Check {
@@ -5782,6 +5846,78 @@ mod tests {
         assert_eq!(stores.len(), 2); // absent stores skipped
     }
 
+    /// CAD-316: the cadence store's own size shows in doctor, with the
+    /// event bookkeeping retention acts on — rows, delivery rows already
+    /// rolled into counts, and rows past the age cut still awaiting a
+    /// rollup. Informational: size thresholds stay in provider-state.
+    #[test]
+    fn cadence_store_shows_size_and_rollup_counts() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let c = check_cadence_store(&scan);
+        assert_eq!(c.name, "cadence-store");
+        assert_eq!(c.level, Level::Ok);
+        assert!(c.detail.contains("no cadence.sqlite3"), "{}", c.detail);
+
+        let db = scan.state_dir.join("cadence.sqlite3");
+        let store = crate::store::Store::open(&db).unwrap();
+        let now = scan
+            .now
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            for (kind, days) in [
+                ("submitting", 9.0),
+                ("submitted", 9.0),
+                ("submitting", 8.0),
+                ("submitted", 1.0),
+                ("turn_finished", 30.0),
+            ] {
+                conn.execute(
+                    "INSERT INTO events(alias,kind,payload,at) VALUES('a1',?1,'{\"message\":\"gone\"}',?2)",
+                    rusqlite::params![kind, now - days * 86_400.0],
+                )
+                .unwrap();
+            }
+        }
+        let c = check_cadence_store(&scan);
+        assert_eq!(c.level, Level::Ok);
+        assert!(c.value["store_bytes"].as_u64().unwrap() > 0, "{}", c.value);
+        assert_eq!(c.value["events"], 5, "{}", c.value);
+        assert_eq!(c.value["delivery_awaiting_rollup"], 3, "{}", c.value);
+        assert_eq!(c.value["delivery_rolled_up"], 0, "{}", c.value);
+        assert!(c.detail.starts_with("cadence.sqlite3 "), "{}", c.detail);
+        assert!(
+            c.detail
+                .contains(&human(c.value["store_bytes"].as_u64().unwrap())),
+            "{}",
+            c.detail
+        );
+        assert!(
+            c.detail.contains("3 older than 7d awaiting rollup"),
+            "{}",
+            c.detail
+        );
+
+        assert_eq!(
+            store
+                .roll_up_delivery_events(now - crate::store::EVENT_ROLLUP_AGE_SECS)
+                .unwrap(),
+            3
+        );
+        let c = check_cadence_store(&scan);
+        assert_eq!(c.value["events"], 3, "{}", c.value);
+        assert_eq!(c.value["delivery_awaiting_rollup"], 0, "{}", c.value);
+        assert_eq!(c.value["delivery_rolled_up"], 3, "{}", c.value);
+        assert!(
+            c.detail.contains("3 delivery events rolled up"),
+            "{}",
+            c.detail
+        );
+    }
+
     // ---------- memory + census ----------
 
     /// Write a fabricated `/proc/meminfo` (values in kB, like the real
@@ -8239,6 +8375,7 @@ mod tests {
             vec![
                 "disk",
                 "provider-state",
+                "cadence-store",
                 "pipes",
                 "memory",
                 "processes",
