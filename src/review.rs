@@ -18,6 +18,7 @@
 //! [`crate::proc::run_bounded`]; timeouts come from `[timeouts]`
 //! (defaults until the config is loaded).
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -585,6 +586,36 @@ fn landed(repo: &Path, base: &str, head: &str, secs: u64) -> Result<Option<Strin
         secs,
     )?;
     Ok(Some(commit))
+}
+
+/// Every path `head` changes itself, `merge-base(base, head)..head`. A
+/// rename lists both its old and its new path — plumbing `diff-tree`
+/// without `-M` reports it as a delete plus an add, where porcelain
+/// `git diff --name-only` would name only the new path — so a file one
+/// PR moves still meets the other PR's edit of the old name (CAD-297).
+fn changed_paths(repo: &Path, base: &str, head: &str, secs: u64) -> Result<BTreeSet<String>> {
+    let mb = git(repo, &["merge-base", base, head], secs)?;
+    let out = git_status(
+        repo,
+        &["diff-tree", "-r", "--name-only", "-z", &mb, head],
+        secs,
+    )?;
+    if out.timed_out || out.status != Some(0) {
+        return Err(Error::internal(format!(
+            "diff-tree {mb} {head}: {}",
+            if out.timed_out {
+                "timed out".to_string()
+            } else {
+                format!("exited {:?}: {}", out.status, out.stderr.trim())
+            }
+        )));
+    }
+    Ok(out
+        .stdout
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect())
 }
 
 /// The review's private ref namespace, `refs/cadence/review/<pr>/`,
@@ -2291,6 +2322,7 @@ pub fn run(opts: &Options) -> Result<i32> {
     let mut not_assessed = Vec::new();
     report["open_pr_conflicts_base"] = json!(base_sha);
     let mine = landed(&root, &base_sha, &head_sha, t.git_secs);
+    let mine_changed = changed_paths(&root, &base_sha, &head_sha, t.git_secs);
     let open = gh(
         &root,
         &[
@@ -2335,18 +2367,37 @@ pub fn run(opts: &Options) -> Result<i32> {
                         .map(|t| (m.clone(), t))
                         .map_err(|e| e.to_string())
                 });
+                let unassessed = |reason: &str| {
+                    let mut entry = json!({"pr": num, "title": other["title"],
+                        "reason": reason});
+                    // Advisory only: the files both PRs change themselves.
+                    // A shared file is not a conflict and a disjoint pair
+                    // is not proof of none — but it keeps a stale PR that
+                    // edits the same files from being invisible (CAD-297).
+                    let theirs_changed = changed_paths(&root, &base_sha, &theirs, t.git_secs);
+                    match (&mine_changed, &theirs_changed) {
+                        (Ok(m), Ok(th)) => {
+                            let both: Vec<&String> = m.intersection(th).collect();
+                            if !both.is_empty() {
+                                entry["advisory_overlap"] = json!(both);
+                            }
+                        }
+                        (Err(e), _) | (_, Err(e)) => {
+                            entry["advisory_overlap_error"] = json!(e.to_string());
+                        }
+                    }
+                    entry
+                };
                 let (mine_landed, theirs_landed) = match pair {
                     Ok((Some(m), Some(t))) => (m, t),
                     Ok((None, _)) => {
                         // This PR itself does not merge into the base —
                         // already a blocking reason; no pair can be judged.
-                        not_assessed.push(json!({"pr": num, "title": other["title"],
-                            "reason": NOT_ASSESSED_THIS_PR}));
+                        not_assessed.push(unassessed(NOT_ASSESSED_THIS_PR));
                         continue;
                     }
                     Ok((_, None)) => {
-                        not_assessed.push(json!({"pr": num, "title": other["title"],
-                            "reason": NOT_ASSESSED_OTHER_PR}));
+                        not_assessed.push(unassessed(NOT_ASSESSED_OTHER_PR));
                         continue;
                     }
                     Err(e) => {
@@ -2469,6 +2520,25 @@ fn runner_refusal(suite: &Value) -> Option<String> {
         .rfind(|l| !l.is_empty())
         .filter(|l| l.starts_with("cadence-nextest: "))
         .map(str::to_string)
+}
+
+/// A not-assessed entry's advisory overlap in words, `None` when the two
+/// PRs share no changed file (CAD-297).
+fn advisory_note(c: &Value) -> Option<String> {
+    if let Some(files) = c["advisory_overlap"].as_array() {
+        Some(format!(
+            "advisory, not a conflict: both PRs change {}",
+            files
+                .iter()
+                .filter_map(|f| f.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    } else {
+        c["advisory_overlap_error"]
+            .as_str()
+            .map(|e| format!("advisory overlap unavailable: {e}"))
+    }
 }
 
 /// `pass|needs-hands-on|blocked` with reasons — computed from the
@@ -2716,15 +2786,23 @@ pub fn suggest(report: &Value, prepare_failed: bool) -> (&'static str, Vec<Strin
     // An open PR that does not merge into the base has no as-landed
     // tree, so an overlap with it is unknown until it rebases. Named
     // here so it is not missed; needs hands-on, never blocking (CAD-295).
-    let unassessed: Vec<String> = report["open_pr_not_assessed"]
+    // Its advisory file overlap rides inside the same reason — one
+    // reason per PR, never a level of its own (CAD-297).
+    let not_assessed = report["open_pr_not_assessed"]
         .as_array()
-        .map(|a| {
-            a.iter()
-                .filter(|c| c["reason"] == NOT_ASSESSED_OTHER_PR)
-                .map(|c| format!("#{}", c["pr"].as_i64().unwrap_or(0)))
-                .collect()
-        })
+        .cloned()
         .unwrap_or_default();
+    let unassessed: Vec<String> = not_assessed
+        .iter()
+        .filter(|c| c["reason"] == NOT_ASSESSED_OTHER_PR)
+        .map(|c| {
+            let pr = c["pr"].as_i64().unwrap_or(0);
+            match advisory_note(c) {
+                Some(note) => format!("#{pr} ({note})"),
+                None => format!("#{pr}"),
+            }
+        })
+        .collect();
     if !unassessed.is_empty() {
         let they = if unassessed.len() == 1 {
             "it does"
@@ -2740,6 +2818,25 @@ pub fn suggest(report: &Value, prepare_failed: bool) -> (&'static str, Vec<Strin
                 unassessed.join(", ")
             ),
         );
+    }
+    // When this PR is the one that does not merge, the merge-conflict
+    // reason already blocks and adds nothing per PR (CAD-295); a PR
+    // that changes the same files is still named, advisory only.
+    for c in not_assessed
+        .iter()
+        .filter(|c| c["reason"] == NOT_ASSESSED_THIS_PR)
+    {
+        if let Some(note) = advisory_note(c) {
+            push_reason(
+                &mut level,
+                &mut reasons,
+                0,
+                format!(
+                    "#{} not assessed as this PR does not merge — {note}",
+                    c["pr"].as_i64().unwrap_or(0)
+                ),
+            );
+        }
     }
     if reasons.is_empty() {
         reasons.push("all mechanical checks green — the hands-on check remains".into());
@@ -2948,6 +3045,10 @@ fn render_markdown(r: &Value) -> String {
         .as_array()
         .cloned()
         .unwrap_or_default();
+    let skipped = r["open_pr_not_assessed"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     md.push_str("## Other open PRs\n\n");
     if let Some(base) = r["open_pr_conflicts_base"].as_str() {
         md.push_str(&format!(
@@ -2957,6 +3058,12 @@ fn render_markdown(r: &Value) -> String {
     }
     if let Some(err) = r["open_pr_conflicts_error"].as_str() {
         md.push_str(&format!("scan failed: {err}\n\n"));
+    } else if conflicts.is_empty() && !skipped.is_empty() {
+        // Not assessed is not "no conflict": the tool cannot say (CAD-297).
+        md.push_str(&format!(
+            "none among assessed PRs — {} not assessed, listed below\n\n",
+            skipped.len()
+        ));
     } else if conflicts.is_empty() {
         md.push_str("none — no conflicting open PRs\n\n");
     } else {
@@ -2983,10 +3090,6 @@ fn render_markdown(r: &Value) -> String {
         }
         md.push('\n');
     }
-    let skipped = r["open_pr_not_assessed"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
     if !skipped.is_empty() {
         md.push_str("Not assessed (no clean as-landed tree to compare):\n\n");
         for c in &skipped {
@@ -2996,6 +3099,9 @@ fn render_markdown(r: &Value) -> String {
                 c["title"].as_str().unwrap_or(""),
                 c["reason"].as_str().unwrap_or("")
             ));
+            if let Some(note) = advisory_note(c) {
+                md.push_str(&format!("  - {note}\n"));
+            }
         }
         md.push('\n');
     }
@@ -3627,6 +3733,57 @@ result_path = "target/nextest/cadence/junit.xml"
             vec!["does not merge into the current base — x.txt"],
             "no duplicate reason for this PR's own conflict"
         );
+    }
+
+    /// CAD-297: a not-assessed PR's advisory overlap rides inside the
+    /// CAD-295 reason — one reason per PR, never a level of its own —
+    /// and an empty hint changes nothing.
+    #[test]
+    fn advisory_overlap_folds_into_the_not_assessed_reason() {
+        let clean = json!({"merge": {}, "prepare": [], "gates": [], "failures": [],
+            "stress": [], "open_pr_conflicts": []});
+        let mut r = clean.clone();
+        r["open_pr_not_assessed"] = json!([
+            {"pr": 14, "title": "a", "reason": NOT_ASSESSED_OTHER_PR,
+             "advisory_overlap": ["big.txt", "src/x.rs"]},
+            {"pr": 15, "title": "b", "reason": NOT_ASSESSED_OTHER_PR},
+            {"pr": 16, "title": "c", "reason": NOT_ASSESSED_OTHER_PR,
+             "advisory_overlap_error": "diff-tree timed out"},
+        ]);
+        let (verdict, reasons) = suggest(&r, false);
+        assert_eq!(verdict, "needs-hands-on", "{reasons:?}");
+        assert_eq!(
+            reasons,
+            vec![
+                "overlap not assessed with \
+                 #14 (advisory, not a conflict: both PRs change big.txt, src/x.rs), #15, \
+                 #16 (advisory overlap unavailable: diff-tree timed out) \
+                 — they do not merge into the current base"
+            ]
+        );
+
+        // This PR does not merge: CAD-295 adds nothing per PR, so a
+        // shared file is named once, at level 0 — the verdict is the
+        // merge conflict's alone. An empty hint adds nothing.
+        let mut r = clean.clone();
+        r["open_pr_not_assessed"] = json!([
+            {"pr": 7, "title": "a", "reason": NOT_ASSESSED_THIS_PR,
+             "advisory_overlap": ["big.txt"]},
+            {"pr": 8, "title": "b", "reason": NOT_ASSESSED_THIS_PR},
+        ]);
+        let (verdict, reasons) = suggest(&r, false);
+        assert_eq!(verdict, "pass", "{reasons:?}");
+        assert_eq!(
+            reasons,
+            vec![
+                "#7 not assessed as this PR does not merge — \
+                 advisory, not a conflict: both PRs change big.txt"
+            ]
+        );
+        r["merge"] = json!({"result": "conflict", "conflict_files": ["x.txt"]});
+        let (verdict, reasons) = suggest(&r, false);
+        assert_eq!(verdict, "blocked");
+        assert_eq!(reasons.len(), 2, "{reasons:?}");
     }
 
     /// CAD-273: a missing or untrusted runner is named as such — one
