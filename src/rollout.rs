@@ -27,12 +27,14 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
+use crate::peer::proc_starttime;
 use crate::store::{self, Store};
 
 /// Current store schema. v12 introduced `rollout_leases` and
-/// `daemon_build`; v13 adds conversation threads (CAD-319).
+/// `daemon_build`; v13 adds conversation threads (CAD-319); v14 adds
+/// `agents.pid_start`, the recorded pid's process start time (CAD-385).
 /// The newest migration in `store` writes this number.
-pub const SCHEMA_VERSION: i64 = 13;
+pub const SCHEMA_VERSION: i64 = 14;
 
 /// Last schema that has no lease table. The bootstrap opt-in covers
 /// only this version.
@@ -1004,9 +1006,14 @@ fn require_operator_proof(state_dir: &Path, verb: &str) -> Result<()> {
     })
 }
 
-/// Registered pty panes (pane pid → alias), the same rows
-/// [`crate::store::Store::pty_endpoint_facts`] reads, via the rollout
-/// read-only peek. No database, or no `agents` table, means no panes.
+/// Registered pty panes (pane pid → alias) for the operator-proof deny
+/// list, the same rows [`crate::store::Store::pty_pane_pids`] reads,
+/// via the rollout read-only peek, each checked against its recorded
+/// start time ([`crate::peer::AgentPids::fenced`], CAD-385): a row
+/// whose pid was reused denies nothing; one with no recorded start —
+/// including every row of a store older than v14, which has no
+/// `pid_start` column — keeps denying. No database, or no `agents`
+/// table, means no panes.
 fn registered_panes(state_dir: &Path) -> Result<HashMap<u32, String>> {
     let path = db_file(state_dir);
     if !path.exists() {
@@ -1016,21 +1023,30 @@ fn registered_panes(state_dir: &Path) -> Result<HashMap<u32, String>> {
     if !table_exists(&peek.conn, "agents")? {
         return Ok(HashMap::new());
     }
-    let mut stmt = peek.conn.prepare(
-        "SELECT alias, pid FROM agents \
-         WHERE endpoint_kind='pty' AND generation IS NOT NULL AND pid IS NOT NULL",
-    )?;
+    let has_start = peek
+        .conn
+        .prepare("SELECT 1 FROM pragma_table_info('agents') WHERE name='pid_start'")?
+        .exists([])?;
+    let start = if has_start { "pid_start" } else { "NULL" };
+    let mut stmt = peek.conn.prepare(&format!(
+        "SELECT alias, pid, {start} FROM agents \
+         WHERE endpoint_kind='pty' AND generation IS NOT NULL AND pid IS NOT NULL"
+    ))?;
     let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, Option<i64>>(2)?,
+        ))
     })?;
-    let mut panes = HashMap::new();
+    let mut panes = Vec::new();
     for row in rows {
-        let (alias, pid) = row?;
+        let (alias, pid, start) = row?;
         if let Ok(pid) = u32::try_from(pid) {
-            panes.insert(pid, alias);
+            panes.push((alias, pid, start.and_then(|s| u64::try_from(s).ok())));
         }
     }
-    Ok(panes)
+    Ok(crate::peer::AgentPids::classify(panes).fenced())
 }
 
 /// Enrollment root pids from `<state>/slots.json`. A missing file means
@@ -1117,13 +1133,6 @@ fn enrolled_root_matches(pid: u32, starttime: u64) -> bool {
         Some(now) => now == starttime,
         None => true,
     }
-}
-
-/// `/proc/<pid>/stat` field 22 (starttime, jiffies since boot).
-fn proc_starttime(pid: u32) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let after = stat.rsplit(')').next()?;
-    after.split_whitespace().nth(19)?.parse().ok()
 }
 
 /// Pid of the running daemon, or `0` when it is stopped.
@@ -2591,7 +2600,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 13);
+        assert_eq!(SCHEMA_VERSION, 14);
     }
 
     struct MigrationHolder;
@@ -3316,6 +3325,51 @@ mod tests {
             "{err}"
         );
         assert!(status_at(&state)["held"].as_bool().unwrap(), "{err}");
+    }
+
+    /// CAD-385: the operator-proof pane deny list checks each row's
+    /// recorded start time. A row whose pid now names a different
+    /// process drops out (as if unregistered); a row with no recorded
+    /// start stays (fail closed) — and on a store older than v14, which
+    /// has no `pid_start` column, every row is such a row.
+    #[test]
+    fn registered_panes_drop_a_reused_pid_and_keep_a_row_without_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = fresh(&dir);
+        let me = std::process::id();
+        let parent = std::os::unix::process::parent_id();
+        let mut other = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let conn = Connection::open(db_file(&state)).unwrap();
+        for (alias, pid, start) in [
+            ("live", me, proc_starttime(me).map(|t| t as i64)),
+            (
+                "reused",
+                parent,
+                proc_starttime(parent).map(|t| t as i64 - 1),
+            ),
+            ("legacy", other.id(), None),
+        ] {
+            conn.execute(
+                "INSERT INTO agents(alias, provider, endpoint_kind, role, cwd, sandbox, \
+                 state, created, updated, pid, pid_start, generation) \
+                 VALUES(?1,'cursor','pty','worker','/tmp','none','idle',0,0,?2,?3,'g1')",
+                rusqlite::params![alias, i64::from(pid), start],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            registered_panes(&state).unwrap(),
+            HashMap::from([(me, "live".to_string()), (other.id(), "legacy".to_string())])
+        );
+        conn.execute_batch("ALTER TABLE agents DROP COLUMN pid_start")
+            .unwrap();
+        drop(conn);
+        assert_eq!(registered_panes(&state).unwrap().len(), 3);
+        let _ = other.kill();
+        let _ = other.wait();
     }
 
     #[test]

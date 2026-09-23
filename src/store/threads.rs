@@ -770,7 +770,7 @@ mod tests {
             s.enqueue("m1", "after", None, "x2", "user").unwrap();
             assert_eq!(s.thread_entries("m1", 0, 10).unwrap().len(), 1);
         }
-        assert_eq!(version(&db), 13);
+        assert_eq!(version(&db), crate::rollout::SCHEMA_VERSION);
         assert!(has_table(&db, "threads") && has_table(&db, "thread_entries"));
         // Half-applied: objects present, version rolled back — converges
         // and keeps the rows.
@@ -782,7 +782,7 @@ mod tests {
             let s = Store::open_for_schema_tests(&db).unwrap();
             assert_eq!(s.thread_entries("m1", 0, 10).unwrap().len(), 1);
         }
-        assert_eq!(version(&db), 13);
+        assert_eq!(version(&db), crate::rollout::SCHEMA_VERSION);
         // Reopening a current store is a no-op.
         let s = Store::open(&db).unwrap();
         assert_eq!(s.thread_entries("m1", 0, 10).unwrap().len(), 1);

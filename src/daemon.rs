@@ -2333,6 +2333,12 @@ impl Shared {
     ///   verified segment may bind a hold. A failed verification
     ///   refuses — it never falls through to an outer pane.
     ///
+    /// A pane row matches only while its recorded process start time
+    /// does (CAD-385, [`crate::peer::AgentPids`]): a row whose pid was
+    /// reused is no pane at all — the caller falls through exactly as
+    /// an unregistered process — and a row with no recorded start on
+    /// the chain refuses the call, naming the remedy.
+    ///
     /// Fail-closed: an unreadable ancestry or no match refuses the
     /// call — there is no `operator` fallback; a caller detached from
     /// every pane and endpoint holds no lane at all. `Ok(None)` is the
@@ -2345,13 +2351,12 @@ impl Shared {
                  caller identity underivable"
             ))
         })?;
-        let panes: HashMap<u32, String> = self
-            .store
-            .pty_endpoint_facts()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(alias, (_, pane_pid, _))| (pane_pid, alias))
-            .collect();
+        let recorded =
+            crate::peer::AgentPids::classify(self.store.pty_pane_pids().unwrap_or_default());
+        recorded
+            .refuse_unproven_on(&chain)
+            .map_err(|why| Error::rejected(format!("Slot caller pid {peer_pid}: {why}")))?;
+        let panes = recorded.live();
         let pane_at = chain.iter().position(|pid| panes.contains_key(pid));
         let slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         let root_at = slots.nearest_enrolled_root(&chain);
@@ -2430,6 +2435,21 @@ impl Shared {
         ) else {
             return;
         };
+        // CAD-385: the enrollment roots at the process the row recorded
+        // — its pid AND start time — never at whatever holds the pid now.
+        let recorded = agent.pid_start.and_then(|s| u64::try_from(s).ok());
+        let proof = crate::peer::pid_proof(pid, recorded);
+        if proof != crate::peer::PidProof::Same {
+            let _ = self.store.event_public(
+                alias,
+                "slot_enrollment_refused",
+                json!({"pid": pid, "reason": format!(
+                    "pid {pid} is not provably the recorded provider process ({proof:?} \
+                     against its recorded start time)"
+                )}),
+            );
+            return;
+        }
         let clk = crate::slots::SlotClock::at((self.slot_clock)(), epoch_secs());
         let outcome = self.slots.lock().unwrap_or_else(|e| e.into_inner()).enroll(
             alias,
@@ -2493,12 +2513,13 @@ impl Shared {
                  identity underivable"
             ))
         })?;
-        let panes: HashMap<u32, String> = self
-            .store
-            .pty_endpoint_facts()?
-            .into_iter()
-            .map(|(alias, (_, pane_pid, _))| (pane_pid, alias))
-            .collect();
+        // A pane node is a row whose recorded start time still matches
+        // (CAD-385): a reused pid is no node, an unproven one refuses.
+        let recorded = crate::peer::AgentPids::classify(self.store.pty_pane_pids()?);
+        recorded
+            .refuse_unproven_on(&chain)
+            .map_err(|why| Error::rejected(format!("Caller pid {peer_pid}: {why}")))?;
+        let panes = recorded.live();
         let slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         let roots = slots.enrolled_roots_on(&chain);
         let mut nodes: Vec<String> = chain
@@ -2568,9 +2589,15 @@ impl Shared {
             .pid
             .and_then(|p| u32::try_from(p).ok())
             .ok_or_else(|| Error::rejected("native endpoint pid disappeared"))?;
-        // /proc: a pane's process start is read live — the pane record
-        // carries no start time of its own.
+        // /proc: the pane's process start is read live and must be the
+        // one the row recorded with its pid (CAD-385).
         let process_start = process_start_identity(pid)?;
+        if agent.pid_start.and_then(|s| u64::try_from(s).ok()) != Some(process_start) {
+            return Err(Error::rejected(format!(
+                "pty endpoint '{alias}': pid {pid} is not the process the row \
+                 recorded (no or a different process start time)"
+            )));
+        }
         let adapter = self.adapter_for(alias)?;
         adapter.verify_owned_endpoint(pid, &generation, agent.session_id.as_deref())?;
         if process_start != process_start_identity(pid)? {
@@ -2601,10 +2628,11 @@ impl Shared {
         })?;
         if owner_generation(&agent).as_deref() != Some(e.owner_generation.as_str())
             || agent.pid != Some(i64::from(e.root.pid))
+            || agent.pid_start.and_then(|s| u64::try_from(s).ok()) != Some(e.root.starttime)
         {
             return Err(Error::rejected(format!(
                 "enrollment {} of '{}' no longer matches its endpoint (owner \
-                 generation or provider pid changed)",
+                 generation, provider pid or its recorded start time changed)",
                 e.id, e.owner_actor
             )));
         }
@@ -2870,18 +2898,17 @@ impl Shared {
 
     /// [`crate::peer::operator_proof`] against the live panes and
     /// enrollments — `Err` names the first check that failed.
+    ///
+    /// The pane deny list is every row that MAY still be its process
+    /// ([`crate::peer::AgentPids::fenced`], CAD-385): a row whose pid
+    /// was reused names another process and denies nothing — exactly
+    /// as if unregistered — while a row with no recorded start keeps
+    /// denying (fail closed).
     fn operator_evidence(&self, peer_pid: u32) -> std::result::Result<(), String> {
-        let panes: HashMap<u32, String> = self
-            .store
-            .pty_endpoint_facts()
-            .map_err(|e| {
-                format!(
-                    "the registered panes cannot be read to prove this connection is not one ({e})"
-                )
-            })?
-            .into_iter()
-            .map(|(alias, (_, pane_pid, _))| (pane_pid, alias))
-            .collect();
+        let panes = crate::peer::AgentPids::classify(self.store.pty_pane_pids().map_err(|e| {
+            format!("the registered panes cannot be read to prove this connection is not one ({e})")
+        })?)
+        .fenced();
         let slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         crate::peer::operator_proof(
             peer_pid,
@@ -4776,28 +4803,41 @@ impl Shared {
         peer_pid: u32,
         verb: &str,
     ) -> Result<(String, &'static str)> {
-        let facts = self.store.pty_endpoint_facts()?;
+        // Pane rows checked against their recorded start (CAD-385): a
+        // reused pid is dropped — no tie, no stamp — and an unproven
+        // row still narrows (the self-check) but never stamps.
+        let panes = crate::peer::AgentPids::classify(self.store.pty_pane_pids()?);
         let peer = PeerTies::probe(peer_pid);
-        if let Some((_, pane_pid, _)) = facts.get(alias) {
-            if peer.tied_to(alias, *pane_pid) {
+        if let Some(target) = panes.get(alias) {
+            if peer.tied_to(alias, target.pid) {
                 return Err(Error::rejected(format!(
                     "a pane cannot {verb} its own pane — the caller is tied \
                      to the target's pane process",
                 )));
             }
         }
-        let others = facts
+        if let Some(row) = panes
+            .unproven()
+            .find(|row| row.alias != alias && peer.tied_to(&row.alias, row.pid))
+        {
+            return Err(Error::rejected(format!(
+                "cannot derive the caller for `{verb}`: {}",
+                crate::peer::unproven_row(&row.alias, row.pid)
+            )));
+        }
+        let live = panes.live();
+        let others = live
             .iter()
-            .filter(|(a, _)| a.as_str() != alias)
-            .map(|(a, (_, pane_pid, _))| (a.as_str(), *pane_pid));
+            .filter(|(_, a)| a.as_str() != alias)
+            .map(|(pane_pid, a)| (a.as_str(), *pane_pid));
         if let Some(agent) = peer.agents(others).into_iter().next() {
             return Ok((agent, "agent"));
         }
         // `/proc/<pid>` is a directory — `read_link` on it is always
         // EINVAL, so liveness is a `metadata` existence check.
-        let target_alive = facts
+        let target_alive = panes
             .get(alias)
-            .is_some_and(|(_, pid, _)| std::fs::metadata(format!("/proc/{pid}")).is_ok());
+            .is_some_and(|row| std::fs::metadata(format!("/proc/{}", row.pid)).is_ok());
         unmatched_caller(peer.walked(), target_alive, peer.on_tty(), verb)
     }
 
@@ -7889,19 +7929,11 @@ fn check_peer(_stream: &UnixStream) -> Result<u32> {
 /// registration discriminator separately; this request-time provenance
 /// catches a stale or reused pid before issuing a receipt.
 fn process_start_identity(pid: u32) -> Result<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|e| {
+    crate::peer::proc_starttime(pid).ok_or_else(|| {
         Error::rejected(format!(
-            "Cannot read native endpoint process start for pid {pid}: {e}"
+            "Cannot read native endpoint process start for pid {pid} (/proc/{pid}/stat)"
         ))
-    })?;
-    let end = stat
-        .rfind(')')
-        .ok_or_else(|| Error::rejected(format!("Malformed /proc/{pid}/stat")))?;
-    let fields: Vec<&str> = stat[end + 1..].split_whitespace().collect();
-    fields
-        .get(19)
-        .and_then(|v| v.parse::<u64>().ok())
-        .ok_or_else(|| Error::rejected(format!("Missing process start for pid {pid}")))
+    })
 }
 
 fn handle_conn(shared: Arc<Shared>, stream: UnixStream) {
@@ -11286,6 +11318,155 @@ mod tests {
         assert!(std::fs::metadata(format!("/proc/{dead}")).is_err());
         let err = shared.derived_caller("tgt", dead, "answer").unwrap_err();
         assert!(err.to_string().contains("could not be walked"), "{err}");
+    }
+
+    /// A real process tree for the CAD-385 tests: `sh` (the process a
+    /// pane row records) and its `sleep` child (the caller, whose
+    /// ancestry reaches `sh`). One process group, killed on drop.
+    struct PaneTree {
+        sh: std::process::Child,
+        caller: u32,
+    }
+
+    impl PaneTree {
+        fn spawn() -> Self {
+            use std::os::unix::process::CommandExt;
+            // `; :` keeps sh from exec-ing into sleep: sh stays the parent.
+            let sh = std::process::Command::new("sh")
+                .args(["-c", "sleep 30; :"])
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let children = format!("/proc/{0}/task/{0}/children", sh.id());
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let caller = loop {
+                let found = std::fs::read_to_string(&children)
+                    .ok()
+                    .and_then(|t| t.split_whitespace().next()?.parse().ok());
+                if let Some(pid) = found {
+                    break pid;
+                }
+                assert!(std::time::Instant::now() < deadline, "sleep never started");
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            Self { sh, caller }
+        }
+
+        fn pane_pid(&self) -> u32 {
+            self.sh.id()
+        }
+    }
+
+    impl Drop for PaneTree {
+        fn drop(&mut self) {
+            // Our own group: sh and the sleep it started, nothing else.
+            unsafe { libc::kill(-(self.sh.id() as libc::pid_t), libc::SIGKILL) };
+            let _ = self.sh.wait();
+        }
+    }
+
+    /// Record `alias` as a live pty pane at `pid` with `pid_start` as
+    /// its recorded process start time (`None`: a row from before v14).
+    fn record_pane(shared: &Shared, dir: &Path, alias: &str, pid: u32, pid_start: Option<u64>) {
+        register(shared, dir, alias);
+        let conn = rusqlite::Connection::open(dir.join("cadence.sqlite3")).unwrap();
+        conn.execute(
+            "UPDATE agents SET endpoint_kind='pty', generation='g1', pid=?1, pid_start=?2 \
+             WHERE alias=?3",
+            rusqlite::params![pid, pid_start.map(|s| s as i64), alias],
+        )
+        .unwrap();
+    }
+
+    /// Every pid → alias mapping the daemon's Unix socket uses, for one
+    /// caller, rendered comparably.
+    fn identity_answers(shared: &Shared, peer: u32) -> Vec<String> {
+        vec![
+            format!(
+                "slot_identity: {:?}",
+                shared
+                    .slot_identity(peer)
+                    .map(|w| w.map(|w| w.lane().to_string()))
+            ),
+            format!(
+                "caller_identity: {:?}",
+                shared.caller_identity(peer).map(|c| match c {
+                    Caller::NoAgentIdentity => "none".to_string(),
+                    Caller::Agent(v) => v.agent.alias.clone(),
+                })
+            ),
+            format!("operator_evidence: {:?}", shared.operator_evidence(peer)),
+            format!(
+                "derived_caller: {:?}",
+                shared.derived_caller("elsewhere", peer, "answer")
+            ),
+        ]
+    }
+
+    /// CAD-385 acceptance 2: a pane row whose pid is now held by an
+    /// unrelated process — a real one, recorded with an EARLIER start
+    /// time than the process holding the pid now — maps the caller to
+    /// no alias in any derivation, answering exactly as when the row is
+    /// not registered at all. The same row with the matching start
+    /// time does name the caller's pane (the check is not blanket).
+    #[test]
+    fn cad385_reused_pane_pid_maps_no_alias_like_an_unregistered_process() {
+        let tree = PaneTree::spawn();
+        let start = crate::peer::proc_starttime(tree.pane_pid()).unwrap();
+
+        let (bare_dir, bare) = shared();
+        register(&bare, bare_dir.path(), "elsewhere");
+        let unregistered = identity_answers(&bare, tree.caller);
+        assert!(unregistered[0].contains("Ok(None)"), "{unregistered:?}");
+
+        let (dir, stale) = shared();
+        register(&stale, dir.path(), "elsewhere");
+        record_pane(&stale, dir.path(), "pm", tree.pane_pid(), Some(start - 1));
+        assert_eq!(identity_answers(&stale, tree.caller), unregistered);
+
+        let (live_dir, live) = shared();
+        register(&live, live_dir.path(), "elsewhere");
+        record_pane(&live, live_dir.path(), "pm", tree.pane_pid(), Some(start));
+        assert!(matches!(
+            live.slot_identity(tree.caller).unwrap(),
+            Some(SlotWho::Pane { ref lane, .. }) if lane == "pm"
+        ));
+        assert_eq!(
+            live.derived_caller("elsewhere", tree.caller, "answer")
+                .unwrap(),
+            ("pm".to_string(), "agent")
+        );
+    }
+
+    /// CAD-385 acceptance 3: a pane row with a pid but no recorded start
+    /// time (written before schema v14) fails closed — no derivation
+    /// names its alias or lets the caller pass as unregistered: slot and
+    /// caller identity refuse naming the remedy, and operator proof
+    /// still counts the row as a pane.
+    #[test]
+    fn cad385_pane_row_without_a_start_time_fails_closed_naming_the_remedy() {
+        let tree = PaneTree::spawn();
+        let (dir, shared) = shared();
+        register(&shared, dir.path(), "elsewhere");
+        record_pane(&shared, dir.path(), "pm", tree.pane_pid(), None);
+
+        let slot = shared.slot_identity(tree.caller).err().unwrap().to_string();
+        let caller = match shared.caller_identity(tree.caller) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a legacy row must not resolve a caller"),
+        };
+        let answer = shared
+            .derived_caller("elsewhere", tree.caller, "answer")
+            .unwrap_err()
+            .to_string();
+        for refusal in [&slot, &caller, &answer] {
+            assert!(refusal.contains("'pm'"), "{refusal}");
+            assert!(refusal.contains("process start time"), "{refusal}");
+            assert!(refusal.contains("cadence daemon restart"), "{refusal}");
+            assert!(refusal.contains("doctor --host"), "{refusal}");
+        }
+        let proof = shared.operator_evidence(tree.caller).unwrap_err();
+        assert!(proof.contains("registered pane 'pm'"), "{proof}");
     }
 
     /// The unmatched-caller tail: a broken walk refuses only while the

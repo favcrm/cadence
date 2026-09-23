@@ -79,10 +79,12 @@ const PATH_COLUMNS: &[(&str, &str)] = &[
 /// Columns an export sets to NULL. `generation` is the live endpoint
 /// generation every turn token is bound to; without it no recorded token
 /// validates. `messages.turn_id` is the turn token itself — the bearer a
-/// running turn reports with. `pid` is a process on the source host.
+/// running turn reports with. `pid` is a process on the source host,
+/// and `pid_start` its start time there (CAD-385).
 const SCRUB_COLUMNS: &[(&str, &str)] = &[
     ("agents", "generation"),
     ("agents", "pid"),
+    ("agents", "pid_start"),
     ("messages", "turn_id"),
 ];
 
@@ -99,7 +101,7 @@ const EXPORT_EXCLUDES: &[&str] = &[
     ".env files",
     "state-dir folders: private/, sessions/, briefings/, reviews/, agents/, roles/, backups/",
     "provider auth (Claude, Codex, Devin, Cursor sign-in state in their own dirs): never read",
-    "endpoint tokens: agents.generation (turn-token generation), messages.turn_id (turn tokens) and agents.pid are set to NULL",
+    "endpoint tokens: agents.generation (turn-token generation), messages.turn_id (turn tokens), agents.pid and agents.pid_start are set to NULL",
     "turn tokens and generations elsewhere (event payloads, message text): every token-shaped value (<prefix>-<hex12|hex32>-<hex32>), its generation, and every hex12|hex32 value under a JSON \"generation\" key is replaced with [redacted] wherever it appears; the export refuses if any remain",
     "freed database pages: VACUUM drops deleted rows",
     "the tracker (PM dir): a git repo with its own remote",
