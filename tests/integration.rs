@@ -30425,9 +30425,9 @@ fn plant_member_pane(
     d.rpc("agent_register", req).unwrap();
     let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
     conn.execute(
-        "UPDATE agents SET provider=?1, endpoint_kind='pty', pid=?2, enabled=0, \
-            generation='planted', session_id='planted' WHERE alias=?3",
-        rusqlite::params![provider, pid as i64, alias],
+        "UPDATE agents SET provider=?1, endpoint_kind='pty', pid=?2, pid_start=?4, \
+            enabled=0, generation='planted', session_id='planted' WHERE alias=?3",
+        rusqlite::params![provider, pid as i64, alias, proc_start(pid)],
     )
     .unwrap();
 }
