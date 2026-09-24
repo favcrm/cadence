@@ -556,14 +556,6 @@ function AgentDrawer({
                       >
                         <i className="w-1.5 h-1.5 rounded-full bg-info" />
                         <span className="num text-label text-ink-200">{m.id}</span>
-                        {m.turn_id && (
-                          <span
-                            className="num text-micro text-ink-500"
-                            title="turn id"
-                          >
-                            {m.turn_id}
-                          </span>
-                        )}
                         {m.task && (
                           <span className="num text-micro text-ink-500">
                             task {m.task}

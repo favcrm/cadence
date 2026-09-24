@@ -34,6 +34,7 @@ use crate::issue::{board, context, history, model, project, write as issue_write
 use crate::proc::{self, BoundedError};
 
 mod home;
+mod read_model;
 mod threads;
 
 /// The options `ui run` and `ui start` share. Every field is optional:
@@ -642,13 +643,32 @@ struct TaskBinding {
     job_state: String,
 }
 
+/// `job_list` as the board reads it: every job, each row carrying its
+/// tasks (`task_list`, CAD-325) so bindings need no per-job `job_show`.
+fn board_job_list(state_dir: &Path) -> Option<Value> {
+    client::rpc(
+        state_dir,
+        "job_list",
+        json!({"all": true, "tasks_detail": true}),
+    )
+    .ok()
+}
+
 /// task id → issue/job context for every task that belongs to an
 /// issue-bound job.
 fn task_issue_map(state_dir: &Path) -> HashMap<String, TaskBinding> {
+    match board_job_list(state_dir) {
+        Some(list) => task_issue_map_from(state_dir, &list),
+        None => HashMap::new(),
+    }
+}
+
+/// [`task_issue_map`] over a `job_list` already in hand. A row without
+/// `task_list` comes from a daemon older than CAD-325 and falls back to
+/// that job's `job_show` — the old per-job fan-out, which cost one RPC
+/// per issue-bound job ever created on every board read.
+fn task_issue_map_from(state_dir: &Path, list: &Value) -> HashMap<String, TaskBinding> {
     let mut map = HashMap::new();
-    let Ok(list) = client::rpc(state_dir, "job_list", json!({"all": true})) else {
-        return map;
-    };
     for job in list["jobs"].as_array().cloned().unwrap_or_default() {
         let Some(issue) = job["issue"].as_str().map(str::to_string) else {
             continue;
@@ -659,8 +679,14 @@ fn task_issue_map(state_dir: &Path) -> HashMap<String, TaskBinding> {
         let Some(job_id) = job["id"].as_str() else {
             continue;
         };
-        let Ok(show) = client::rpc(state_dir, "job_show", json!({"job": job_id})) else {
-            continue;
+        let show = if job["task_list"].is_array() {
+            json!({"job": {"title": job["title"], "state": job["state"],
+                           "tasks": job["task_list"]}})
+        } else {
+            let Ok(show) = client::rpc(state_dir, "job_show", json!({"job": job_id})) else {
+                continue;
+            };
+            show
         };
         let job_title = show["job"]["title"].as_str().map(str::to_string);
         let job_state = show["job"]["state"]
@@ -743,15 +769,16 @@ fn agent_events_tail(state_dir: &Path, alias: &str, cursor: i64, n: i64) -> Vec<
 /// exact task/issue binding, plus the per-agent queue/fence counts and
 /// the per-issue agent map for cards and drawers.
 /// `daemon: "unreachable"` instead of a 500 when the socket is down:
-/// the board still renders.
-fn agents_payload(state_dir: &Path) -> Value {
-    let list = match client::rpc(state_dir, "agent_list", json!({})) {
-        Ok(list) => list,
-        Err(_) => {
-            return json!({"daemon": "unreachable", "agents": [], "totals": null, "by_issue": {}});
-        }
+/// the board still renders. Built from an `agent_list` asked with
+/// `board: true` and a [`board_job_list`] — the read model fetches both
+/// once and shares the job list with the cards' job outcomes.
+fn agents_payload_from(state_dir: &Path, list: Option<Value>, jobs: Option<&Value>) -> Value {
+    let Some(list) = list else {
+        return json!({"daemon": "unreachable", "agents": [], "totals": null, "by_issue": {}});
     };
-    let task_map = task_issue_map(state_dir);
+    let task_map = jobs
+        .map(|jobs| task_issue_map_from(state_dir, jobs))
+        .unwrap_or_default();
     let agents = list["agents"].as_array().cloned().unwrap_or_default();
     let mut out = Vec::new();
     let mut inboxes = 0i64;
@@ -798,7 +825,12 @@ fn agents_payload(state_dir: &Path) -> Value {
             }));
             continue;
         }
-        let show = client::rpc(state_dir, "agent_show", json!({"alias": alias}));
+        // A CAD-325 daemon folds the show slice into the row (`board`);
+        // an older one answers it per agent.
+        let show = match &agent["board"] {
+            board if board.is_object() => Ok(board.clone()),
+            _ => client::rpc(state_dir, "agent_show", json!({"alias": alias})),
+        };
         let (mut running, mut parked) = (0i64, 0i64);
         let mut running_msgs: Vec<Value> = Vec::new();
         let mut last_activity = Value::Null;
@@ -826,6 +858,9 @@ fn agents_payload(state_dir: &Path) -> Value {
                             }
                         }
                     }
+                }
+                if let Some(n) = show["parked"].as_i64() {
+                    parked = n;
                 }
                 (
                     show["queued"].as_i64().unwrap_or(0),
@@ -1214,28 +1249,21 @@ fn write_reply(pm: &Pm, state_dir: &Path, id: &str, out: Value, created: bool) -
 
 /// Fresh card + detail payloads for one id after a write.
 fn issue_payloads(pm: &Pm, state_dir: &Path, id: &str) -> Result<(Value, Value)> {
-    let issues = board::load_all(&pm.dir, None)?;
-    let jobs = board::fetch_job_outcomes(state_dir);
-    let views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
-    let by_id: HashMap<String, &board::View> = views
+    let read = read_model::get(state_dir, &pm.dir).board(pm, None);
+    let by_id: HashMap<String, &board::View> = read
+        .views
         .iter()
         .map(|v| (v.issue.front.id.clone(), v))
         .collect();
     let view = by_id
         .get(id)
         .ok_or_else(|| Error::rejected(format!("unknown issue '{id}'")))?;
-    let by_issue = agents_payload(state_dir)["by_issue"].clone();
-    let ctx = crate::issue::work::Ctx::new(
-        &pm.dir,
-        &by_id,
-        crate::issue::time::now_epoch(),
-        &crate::issue::work::fetch_approvals(state_dir),
-    );
+    let ctx = read.ctx(&by_id);
     Ok((
-        with_agents(crate::issue::work::card_json(&ctx, view), &by_issue, id),
+        read.card(&ctx, view),
         with_agents(
             crate::issue::work::detail_json(&pm.dir, &ctx, view),
-            &by_issue,
+            &read.by_issue,
             id,
         ),
     ))
@@ -2155,80 +2183,6 @@ fn value_fp(value: &Value) -> u64 {
     h.finish()
 }
 
-/// The per-agent fingerprint input: the agent_list row plus the queue
-/// counters and event cursor that only `agent_show` exposes — any
-/// message, fence, or liveness change moves it.
-fn agents_fp(state_dir: &Path, list: &Value) -> u64 {
-    let mut parts = vec![list.clone()];
-    for agent in list["agents"].as_array().cloned().unwrap_or_default() {
-        if let Some(alias) = agent["alias"].as_str() {
-            if let Ok(show) = client::rpc(state_dir, "agent_show", json!({"alias": alias})) {
-                parts.push(json!({
-                    "queued": show["queued"], "unknown": show["unknown"],
-                    "cursor": show["event_cursor"],
-                }));
-            }
-        }
-    }
-    value_fp(&json!(parts))
-}
-
-/// Poll the board inputs once a second and push
-/// `issues|agents|jobs|monitoring` event names into `tx` on change. The
-/// baseline is taken before the loop so a fresh client only sees deltas.
-/// `__tick` is the per-second liveness probe: the reader drops it, and
-/// a failed send means the client hung up — stop polling the daemon.
-fn watch_changes(
-    state_dir: PathBuf,
-    pm_dir: PathBuf,
-    mut tracker: Option<std::time::SystemTime>,
-    mut jobs: u64,
-    mut agents: u64,
-    mut monitoring: u64,
-    tx: std::sync::mpsc::Sender<&'static str>,
-) {
-    loop {
-        std::thread::sleep(Duration::from_secs(1));
-        if tx.send("__tick").is_err() {
-            return;
-        }
-        let t = dir_mtime(&pm_dir);
-        if t != tracker {
-            tracker = t;
-            if tx.send("issues").is_err() {
-                return;
-            }
-        }
-        if let Ok(list) = client::rpc(&state_dir, "job_list", json!({"all": true})) {
-            let fp = value_fp(&list);
-            if fp != jobs {
-                jobs = fp;
-                if tx.send("jobs").is_err() {
-                    return;
-                }
-            }
-        }
-        if let Ok(list) = client::rpc(&state_dir, "agent_list", json!({})) {
-            let fp = agents_fp(&state_dir, &list);
-            if fp != agents {
-                agents = fp;
-                if tx.send("agents").is_err() {
-                    return;
-                }
-            }
-        }
-        if let Ok(list) = client::rpc(&state_dir, "monitor_list", json!({})) {
-            let fp = value_fp(&list);
-            if fp != monitoring {
-                monitoring = fp;
-                if tx.send("monitoring").is_err() {
-                    return;
-                }
-            }
-        }
-    }
-}
-
 /// The board resources one stream event invalidates, sent as the frame's
 /// data (`{"resources":[...]}`) so the client refetches only those. The
 /// event name stays the change source, which older clients key on.
@@ -2257,19 +2211,11 @@ fn event_resources(name: &str) -> &'static [&'static str] {
 /// exit closes the stream — which is also how a dead client surfaces.
 fn stream_events(request: Request, state_dir: &Path, pm_dir: &Path) {
     let mut w = request.into_writer();
-    // Baselines at connect time, before the client can observe the
-    // stream is live — if they were taken inside the spawned thread
-    // they would race the client's first action and silently absorb it.
-    let tracker0 = dir_mtime(pm_dir);
-    let jobs0 = client::rpc(state_dir, "job_list", json!({"all": true}))
-        .map(|l| value_fp(&l))
-        .unwrap_or(0);
-    let agents0 = client::rpc(state_dir, "agent_list", json!({}))
-        .map(|l| agents_fp(state_dir, &l))
-        .unwrap_or(0);
-    let monitoring0 = client::rpc(state_dir, "monitor_list", json!({}))
-        .map(|l| value_fp(&l))
-        .unwrap_or(0);
+    // Join the board's shared watcher before the head goes out: the
+    // first subscriber's baseline is taken inside `subscribe`, so the
+    // client's first action after it sees the stream live cannot be
+    // absorbed into it (CAD-325: one watcher per board, not per client).
+    let rx = read_model::get(state_dir, pm_dir).subscribe();
     let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
                 Cache-Control: no-store\r\nConnection: close\r\n\r\n";
     if w.write_all(head.as_bytes())
@@ -2278,11 +2224,6 @@ fn stream_events(request: Request, state_dir: &Path, pm_dir: &Path) {
     {
         return;
     }
-    let (tx, rx) = std::sync::mpsc::channel::<&'static str>();
-    std::thread::spawn({
-        let (state_dir, pm_dir) = (state_dir.to_path_buf(), pm_dir.to_path_buf());
-        move || watch_changes(state_dir, pm_dir, tracker0, jobs0, agents0, monitoring0, tx)
-    });
     let frame = |w: &mut dyn Write, bytes: &[u8]| -> bool {
         w.write_all(bytes).and_then(|_| w.flush()).is_ok()
     };
@@ -2291,19 +2232,15 @@ fn stream_events(request: Request, state_dir: &Path, pm_dir: &Path) {
     if !frame(&mut w, b": ping\n\n") {
         return;
     }
-    // `: ping` every 15 s of wire silence — the per-second `__tick`
-    // would otherwise starve the keepalive, and an idle dead client
-    // would never surface without a write.
+    // `: ping` every 15 s of wire silence — the watcher's per-second
+    // heartbeat would otherwise starve the keepalive, and an idle dead
+    // client would never surface without a write.
     let mut ping_at = Instant::now() + Duration::from_secs(15);
     loop {
         match rx.recv_timeout(Duration::from_secs(15)) {
-            Ok("__tick") => {}
-            Ok(name) => {
-                let data = json!({"resources": event_resources(name)});
-                if !frame(
-                    &mut w,
-                    format!("event: {name}\ndata: {data}\n\n").as_bytes(),
-                ) {
+            Ok(f) if &*f == read_model::HEARTBEAT => {}
+            Ok(f) => {
+                if !frame(&mut w, f.as_bytes()) {
                     return;
                 }
                 ping_at = Instant::now() + Duration::from_secs(15);
@@ -2379,8 +2316,21 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
     let send = |req: Request, resp: HttpResp| send(req, resp, head_only);
 
     if is_write {
+        // The writer's next read must see its write (CAD-325): drop the
+        // read model's daemon-side caches before the answer goes out.
+        let send_write = |req: Request, resp: HttpResp| {
+            read_model::get(state_dir, pm_dir).invalidate();
+            send(req, resp)
+        };
         write_route(
-            request, &method, &path, &query, state_dir, pm_dir, opts, &send,
+            request,
+            &method,
+            &path,
+            &query,
+            state_dir,
+            pm_dir,
+            opts,
+            &send_write,
         );
         return;
     }
@@ -2455,7 +2405,7 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
         }
         "/api/overview" => send(
             request,
-            json_response(crate::overview::overview_board(state_dir, pm_dir)),
+            json_response(read_model::get(state_dir, pm_dir).overview()),
         ),
         "/api/projects" => match Pm::at(pm_dir) {
             Ok(pm) => {
@@ -2503,32 +2453,18 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
                     send(request, err_response(400, &e.to_string()));
                     return;
                 }
-                let issues = board::load_all(&pm.dir, filter.as_deref()).unwrap_or_default();
-                let jobs = board::fetch_job_outcomes(state_dir);
-                let views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
-                let by_issue = agents_payload(state_dir)["by_issue"].clone();
+                let read = read_model::get(state_dir, pm_dir).board(&pm, filter.as_deref());
                 // CAD-405: each card carries its `work` block.
-                let by_id: HashMap<String, &board::View> = views
-                    .iter()
-                    .map(|v| (v.issue.front.id.clone(), v))
-                    .collect();
-                let ctx = crate::issue::work::Ctx::new(
-                    &pm.dir,
-                    &by_id,
-                    crate::issue::time::now_epoch(),
-                    &crate::issue::work::fetch_approvals(state_dir),
-                );
+                let by_id = read.by_id();
+                let ctx = read.ctx(&by_id);
                 send(
                     request,
                     json_response(json!({
-                        "issues": views
+                        "issues": read
+                            .views
                             .iter()
                             .filter(|v| slice.matches(v))
-                            .map(|v| with_agents(
-                                crate::issue::work::card_json(&ctx, v),
-                                &by_issue,
-                                &v.issue.front.id,
-                            ))
+                            .map(|v| read.card(&ctx, v))
                             .collect::<Vec<_>>(),
                     })),
                 );
@@ -2545,25 +2481,26 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
                     return;
                 }
                 // Every project loads so cross-project children count.
-                let issues = board::load_all(&pm.dir, None).unwrap_or_default();
-                let jobs = board::fetch_job_outcomes(state_dir);
-                let views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
+                let read = read_model::get(state_dir, pm_dir).board(&pm, None);
                 send(
                     request,
                     json_response(json!({
                         "epics": crate::issue::work::epics_json(
                             &pm.dir,
-                            &views,
+                            &read.views,
                             filter.as_deref(),
                             crate::issue::time::now_epoch(),
-                            &crate::issue::work::fetch_approvals(state_dir),
+                            &read.approvals,
                         ),
                     })),
                 );
             }
             Err(e) => send(request, err_response(503, &e.to_string())),
         },
-        "/api/agents" => send(request, json_response(agents_payload(state_dir))),
+        "/api/agents" => send(
+            request,
+            json_response(read_model::get(state_dir, pm_dir).agents()),
+        ),
         "/api/memories" => match Pm::at(pm_dir) {
             Ok(pm) => {
                 let project = query("project");
@@ -2719,10 +2656,9 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
                 };
                 match Pm::at(pm_dir) {
                     Ok(pm) => {
-                        let issues = board::load_all(&pm.dir, None).unwrap_or_default();
-                        let jobs = board::fetch_job_outcomes(state_dir);
-                        let views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
-                        let by_id: std::collections::HashMap<String, &board::View> = views
+                        let read = read_model::get(state_dir, pm_dir).board(&pm, None);
+                        let by_id: std::collections::HashMap<String, &board::View> = read
+                            .views
                             .iter()
                             .map(|v| (v.issue.front.id.clone(), v))
                             .collect();
@@ -2731,26 +2667,18 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
                             return;
                         };
                         match sub {
-                            None => {
-                                let by_issue = agents_payload(state_dir)["by_issue"].clone();
-                                send(
-                                    request,
-                                    json_response(with_agents(
-                                        crate::issue::work::detail_json(
-                                            &pm.dir,
-                                            &crate::issue::work::Ctx::new(
-                                                &pm.dir,
-                                                &by_id,
-                                                crate::issue::time::now_epoch(),
-                                                &crate::issue::work::fetch_approvals(state_dir),
-                                            ),
-                                            view,
-                                        ),
-                                        &by_issue,
-                                        &id,
-                                    )),
-                                )
-                            }
+                            None => send(
+                                request,
+                                json_response(with_agents(
+                                    crate::issue::work::detail_json(
+                                        &pm.dir,
+                                        &read.ctx(&by_id),
+                                        view,
+                                    ),
+                                    &read.by_issue,
+                                    &id,
+                                )),
+                            ),
                             Some("file") => {
                                 let file = view.issue.dir.join("issue.md");
                                 match std::fs::read(&file) {
@@ -2918,6 +2846,15 @@ fn setup_get(state_dir: &Path, pm_dir: &Path, port: u16, fresh: bool) -> HttpRes
         "age_ms": age.as_millis() as u64,
         "recheck_in_ms": SETUP_MIN_RECHECK.saturating_sub(age).as_millis() as u64,
     }))
+}
+
+/// The board read model's cost meters (`parses`, `overview_builds`,
+/// `request_builds`) for
+/// one `(state dir, PM dir)` — what the CAD-325 bench asserts the caches
+/// by. Test support; the board serves no route for it.
+#[doc(hidden)]
+pub fn read_model_stats(state_dir: &Path, pm_dir: &Path) -> Value {
+    read_model::get(state_dir, pm_dir).stats()
 }
 
 /// One mutex for every write route — the server is thread-per-request
