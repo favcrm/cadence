@@ -462,14 +462,14 @@ fn context_query(
         let key = pct_decode(raw_key).ok_or("malformed context query")?;
         let value = pct_decode(raw_value).ok_or("malformed context query")?;
         match key.as_str() {
-            "role" if role.is_none() => role = Some(value),
+            "role" if role.is_none() => role = Some(context::canonical_role(&value).to_string()),
             "expected_revision" if expected_revision.is_none() => expected_revision = Some(value),
             "role" | "expected_revision" => return Err("duplicate context query key"),
             _ => return Err("unknown context query key"),
         }
     }
     if let Some(value) = role.as_deref() {
-        if !matches!(value, "pm" | "dev" | "qa" | "ops") {
+        if !context::valid_role(value) {
             return Err("bad context role");
         }
     }
@@ -3461,10 +3461,21 @@ fn qr_term(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        content_type, health_supports_model_defaults, proxied_actor, running_json, static_answer,
-        static_file, StaticAnswer,
+        content_type, context_query, health_supports_model_defaults, proxied_actor, running_json,
+        static_answer, static_file, StaticAnswer,
     };
     use serde_json::json;
+
+    #[test]
+    fn context_query_stores_devops_and_accepts_ops() {
+        for raw in ["role=devops", "role=ops"] {
+            let (role, _) = context_query(raw).unwrap();
+            assert_eq!(role.as_deref(), Some("devops"), "{raw}");
+        }
+        assert_eq!(context_query("role=pm").unwrap().0.as_deref(), Some("pm"));
+        assert_eq!(context_query("role=operations"), Err("bad context role"));
+        assert_eq!(context_query("role=OPS"), Err("bad context role"));
+    }
 
     /// Brand files sit at the dist root (Vite copies `ui/public/`); they
     /// must come back as themselves with an image type, never as the
