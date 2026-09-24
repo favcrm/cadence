@@ -177,7 +177,11 @@ no delivery, report or turn activity for 60 minutes is stopped through
 the normal `agent stop` path (its pane and MCP children go with it) and
 records `agent_auto_stopped`. It stays resumable — `cadence agent
 resume <alias>`, or `cadence resume <group>` — and `cadence status`
-shows it as `stopped (auto, idle 72m)`. PMs/group roots, inboxes and
+shows it as `stopped (auto, idle 72m)`. A message queued for it
+resumes it automatically and is delivered (CAD-413). An agent stopped
+by an operator or PM stays stopped. A failed auto-resume is not
+retried; it raises an `auto_resume_failed` needs-me row naming the
+waiting message. PMs/group roots, inboxes and
 pty agents with an attached terminal are never stopped; opt one agent
 out with `cadence agent set <alias> auto_stop=off`, or tune the bound
 with `[host] auto_stop_idle_secs` (0 = off) and

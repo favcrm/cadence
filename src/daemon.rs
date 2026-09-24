@@ -1122,6 +1122,12 @@ impl Shared {
                 let _ = self
                     .store
                     .event_public(alias, "attention", json!({"reason": reason}));
+                // CAD-413: an auto-resume whose open never reached
+                // `ready` is still the newest marker — name it.
+                let marker = self.store.last_event_of(alias, AUTO_STOP_MARKER_KINDS);
+                if marker.is_ok_and(|m| m.is_some_and(|e| e.kind == AUTO_RESUME_EVENT)) {
+                    self.auto_resume_failed(alias, &reason);
+                }
             }
             Ok(()) => {
                 let agent = self.store.agent(alias);
@@ -6689,6 +6695,8 @@ impl Shared {
             self.agent_gc_tick();
             // CAD-96: idle auto-stop — checks at most once a minute.
             self.auto_stop_tick();
+            // CAD-413: work queued for an auto-stopped agent resumes it.
+            self.auto_resume_tick();
             std::thread::sleep(STALL_TICK);
         }
     }
@@ -8203,11 +8211,21 @@ pub const AUTO_STOP_FLOOR_SECS: u64 = 600;
 const AUTO_STOP_EVERY_SECS: f64 = 60.0;
 /// The event an auto-stop records on the agent's own stream.
 pub const AUTO_STOP_EVENT: &str = "agent_auto_stopped";
+/// CAD-413: work queued for an auto-stopped agent resumes it — recorded
+/// before the resume starts, so it supersedes the auto-stop marker and
+/// the sweep never retries the same stop.
+pub const AUTO_RESUME_EVENT: &str = "agent_auto_resumed";
+/// CAD-413: that resume failed (a refused start, or an open that never
+/// reached `ready`). The marker holds — no retry — until an operator
+/// resume or stop supersedes it, and it raises a needs-me row.
+pub const AUTO_RESUME_FAILED_EVENT: &str = "agent_auto_resume_failed";
 /// Event kinds that are bookkeeping, not delivery/report/turn work:
 /// they never reset an agent's idle clock. Everything else does — an
 /// unknown new kind errs toward keeping the agent.
 const AUTO_STOP_PASSIVE_KINDS: &[&str] = &[
     AUTO_STOP_EVENT,
+    AUTO_RESUME_EVENT,
+    AUTO_RESUME_FAILED_EVENT,
     "stop_requested",
     "params_updated",
     "quota_updated",
@@ -8218,9 +8236,17 @@ const AUTO_STOP_PASSIVE_KINDS: &[&str] = &[
     "pane_tree_reap_refused",
     "pane_tree_unowned",
 ];
-/// The newest of these decides whether a stopped agent was stopped by
-/// the timer: a later manual stop or a resume supersedes the marker.
-const AUTO_STOP_MARKER_KINDS: &[&str] = &[AUTO_STOP_EVENT, "stop_requested", "ready"];
+/// The newest of these is the agent's durable stop reason: an
+/// auto-stop, a manual stop (`stop_requested`), an open (`ready`), or
+/// an auto-resume in flight or failed. Events outlive a daemon restart,
+/// so the timer's stop is told apart from an operator's across one.
+const AUTO_STOP_MARKER_KINDS: &[&str] = &[
+    AUTO_STOP_EVENT,
+    "stop_requested",
+    "ready",
+    AUTO_RESUME_EVENT,
+    AUTO_RESUME_FAILED_EVENT,
+];
 /// What the attached-client exemption can and cannot see.
 pub const AUTO_STOP_ATTACH_NOTE: &str = "attached-terminal exemption: pty panes via tmux \
      list-clients; a managed-ws codex TUI client (`codex resume --remote`) is not \
@@ -8389,11 +8415,32 @@ fn auto_stop_view(agent: &Agent, marker: Option<&store::Event>) -> Option<Value>
     }))
 }
 
-/// Stamp `auto_stopped` + `state_label` onto an agent JSON row.
+/// CAD-413: the `auto_resume_failed` view of an agent whose newest
+/// marker is a failed auto-resume and that is still not live — what the
+/// needs-me row names: the agent, the message left waiting, and why.
+fn auto_resume_failed_view(agent: &Agent, marker: Option<&store::Event>) -> Option<Value> {
+    let event = marker.filter(|e| e.kind == AUTO_RESUME_FAILED_EVENT)?;
+    if !matches!(agent.state.as_str(), "stopped" | "attention" | "offline") {
+        return None;
+    }
+    Some(json!({
+        "at": event.at,
+        "message": event.payload["message"],
+        "queued": event.payload["queued"],
+        "reason": event.payload["reason"],
+        "resume": format!("cadence agent resume {}", agent.alias),
+    }))
+}
+
+/// Stamp `auto_stopped` + `state_label` (or `auto_resume_failed`) onto
+/// an agent JSON row.
 fn apply_auto_stop_view(j: &mut Value, agent: &Agent, marker: Option<&store::Event>) {
     if let Some(view) = auto_stop_view(agent, marker) {
         j["state_label"] = view["label"].clone();
         j["auto_stopped"] = view;
+    }
+    if let Some(view) = auto_resume_failed_view(agent, marker) {
+        j["auto_resume_failed"] = view;
     }
 }
 
@@ -8430,6 +8477,12 @@ struct AutoStopState {
     stopped_total: u64,
     /// Why each live agent was kept on the last check.
     last_kept: std::collections::BTreeMap<String, String>,
+    /// CAD-413: stopped agents with work waiting whose stop was not the
+    /// timer's — their marker is read once, not every tick. An entry
+    /// leaves when the agent stops being a candidate (resumed, queue
+    /// drained); only an auto-stop, which needs a live agent with an
+    /// empty queue, could make it one again.
+    resume_declined: HashSet<String>,
 }
 
 impl AutoStopTimer {
@@ -8695,6 +8748,119 @@ impl Shared {
         );
         self.wake();
         Ok(())
+    }
+}
+
+// ---- Auto-resume on queued work (CAD-413) ----
+//
+// An agent the idle timer stopped is parked, not dismissed: a message
+// queued for it — by any path, including one left queued across a
+// daemon restart — resumes it through the normal `agent resume` path
+// and the actor delivers as usual. An operator/PM stop, a fence, or a
+// failed auto-resume keeps the agent stopped and the message waits;
+// the failure raises a needs-me row instead of passing silently.
+
+impl Shared {
+    /// Resume every auto-stopped agent with work queued. Runs on the
+    /// stall-watch thread each tick: one grouped queue read, then a
+    /// marker read only for the stopped agents that have work waiting.
+    fn auto_resume_tick(self: &Arc<Self>) {
+        let waiting = match self.store.queued_for_stopped() {
+            Ok(waiting) => waiting,
+            Err(error) => {
+                eprintln!("auto-resume: store read failed: {error}");
+                return;
+            }
+        };
+        let declined = {
+            let mut st = self.auto_stop.state.lock().unwrap();
+            st.resume_declined
+                .retain(|alias| waiting.iter().any(|(a, _, _)| a == alias));
+            st.resume_declined.clone()
+        };
+        for (alias, message, queued) in waiting {
+            if declined.contains(&alias) || self.lifecycle.lock().unwrap().owned(&alias) {
+                continue;
+            }
+            // Only the timer's own stop qualifies — the newest marker
+            // must still be the auto-stop, never a manual stop or an
+            // earlier auto-resume (in flight or failed).
+            let marker = match self.store.last_event_of(&alias, AUTO_STOP_MARKER_KINDS) {
+                Ok(marker) => marker,
+                Err(error) => {
+                    eprintln!("auto-resume: {alias}: stop reason unreadable: {error}");
+                    continue;
+                }
+            };
+            match marker {
+                Some(stopped) if stopped.kind == AUTO_STOP_EVENT => {
+                    self.auto_resume(&alias, &message, queued, stopped.at);
+                }
+                _ => {
+                    self.auto_stop
+                        .state
+                        .lock()
+                        .unwrap()
+                        .resume_declined
+                        .insert(alias);
+                }
+            }
+        }
+    }
+
+    /// Record the auto-resume, then start the actor. The record lands
+    /// first: it supersedes the auto-stop marker, so a failed start is
+    /// never retried by the next tick.
+    fn auto_resume(self: &Arc<Self>, alias: &str, message: &str, queued: i64, stopped_at: f64) {
+        let recorded = self.store.event_public(
+            alias,
+            AUTO_RESUME_EVENT,
+            json!({
+                "message": message,
+                "queued": queued,
+                "auto_stopped_at": stopped_at,
+                "reason": format!("message {message} queued for an agent the idle timer stopped"),
+            }),
+        );
+        if let Err(error) = recorded {
+            eprintln!("auto-resume: {alias}: cannot record the resume, not starting: {error}");
+            return;
+        }
+        let failure = match self.try_resume(alias) {
+            Ok(true) => None,
+            Ok(false) => Some("fenced by an unreconciled unknown message".to_string()),
+            Err(error) => Some(error.to_string()),
+        };
+        match failure {
+            None => eprintln!("auto-resume: resuming {alias} for queued message {message}"),
+            Some(reason) => self.auto_resume_failed(alias, &reason),
+        }
+        self.wake();
+    }
+
+    /// The auto-resume of `alias` failed — refused at start, or its
+    /// open never reached `ready`. Names the waiting message from the
+    /// resume record so the needs-me row can.
+    fn auto_resume_failed(&self, alias: &str, reason: &str) {
+        let resumed = self
+            .store
+            .last_event_of(alias, &[AUTO_RESUME_EVENT])
+            .ok()
+            .flatten()
+            .map(|e| e.payload)
+            .unwrap_or(Value::Null);
+        let _ = self.store.event_public(
+            alias,
+            AUTO_RESUME_FAILED_EVENT,
+            json!({
+                "message": resumed["message"],
+                "queued": resumed["queued"],
+                "reason": reason,
+                "resume": format!("cadence agent resume {alias}"),
+            }),
+        );
+        eprintln!("auto-resume: {alias} failed to resume: {reason}");
+        self.wake();
     }
 }
 

@@ -6839,6 +6839,31 @@ impl Store {
         }
         Ok(out)
     }
+
+    /// CAD-413: per `stopped` agent with work waiting, its oldest queued
+    /// message id and the queued count — the candidates an auto-resume
+    /// sweep considers. Nudges are never queued for a stopped agent and
+    /// are not work to resume for. One grouped pass on the queue index.
+    pub fn queued_for_stopped(&self) -> Result<Vec<(String, String, i64)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT m.alias, m.id FROM messages m JOIN agents a ON a.alias = m.alias
+             WHERE a.state = 'stopped' AND m.state = 'queued' AND m.source != ?
+             ORDER BY m.alias, m.seq",
+        )?;
+        let rows = stmt.query_map([NUDGE_SOURCE], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut out: Vec<(String, String, i64)> = Vec::new();
+        for row in rows {
+            let (alias, id) = row?;
+            match out.last_mut() {
+                Some(last) if last.0 == alias => last.2 += 1,
+                _ => out.push((alias, id, 1)),
+            }
+        }
+        Ok(out)
+    }
 }
 
 const UNKNOWN_EVENT_REASON_CHARS: usize = 512;
