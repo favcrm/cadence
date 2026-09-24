@@ -539,6 +539,11 @@ pub struct Shared {
     /// the first one's `submit_recovered` and refuses, never a second
     /// Enter.
     recover_lock: Mutex<()>,
+    /// CAD-324: agents whose next delivered turn carries a continuity
+    /// pack, and why — set when an actor opens a new session or reopens
+    /// one whose last turn was lost, and when the provider reports a
+    /// compaction; taken by the actor at its next turn.
+    continuity_due: Mutex<HashMap<String, crate::continuity::Reason>>,
 }
 
 impl Shared {
@@ -611,6 +616,7 @@ impl Shared {
             dispatch_lock: Mutex::new(()),
             delivery_lock: Mutex::new(()),
             wake_lock: Mutex::new(()),
+            continuity_due: Mutex::new(HashMap::new()),
             auto_stop: AutoStopTimer::new(opts.auto_stop.clone(), opts.auto_stop_clock.clone()),
             idle_poll: opts.idle_poll.unwrap_or(IDLE_POLL),
             recover_lock: Mutex::new(()),
@@ -711,6 +717,15 @@ impl Shared {
         // channel (ack, tool_use, message_report) alike.
         self.bump_activity(alias);
         self.thread_on_provider_event(alias, method, &params);
+        // CAD-324: the provider compacted the session — its next turn
+        // carries a continuity pack. The event itself is recorded below
+        // like every `cadence/<kind>`.
+        if method == "cadence/session_compacted" {
+            self.continuity_due
+                .lock()
+                .unwrap()
+                .insert(alias.to_string(), crate::continuity::Reason::Compacted);
+        }
         if method == "cadence/codex_quota" {
             let thread_id = params.get("thread_id").and_then(Value::as_str);
             if let Some(thread_id) = thread_id {
@@ -828,6 +843,59 @@ impl Shared {
     /// adapter drops the text block its `result` repeats. A lost append
     /// is logged, never fatal to the turn — the provider transcript
     /// still has it.
+    /// CAD-324: the prompt for `message` — its body, preceded by a
+    /// continuity pack when one is due for `alias` and the endpoint takes
+    /// one. Due-ness is consumed here, delivered or not: a pack goes with
+    /// the first turn of a new or lost session, and with the first turn
+    /// after a compaction. The pack is assembled by the daemon from the
+    /// store, the tracker and USER.md; the thread records that it went
+    /// (counts and digest, never the content). A pack that cannot be
+    /// built never holds the turn back: the message goes alone and the
+    /// failure is an event.
+    fn continuity_prompt(&self, alias: &str, endpoint_kind: &str, message: &Message) -> String {
+        let due = self.continuity_due.lock().unwrap().remove(alias);
+        let Some(reason) = due else {
+            return message.body.clone();
+        };
+        if !crate::continuity::endpoint_takes_packs(endpoint_kind) {
+            return message.body.clone();
+        }
+        let pm_dir = self.pm_dir().ok().filter(|d| d.is_dir());
+        let built =
+            crate::continuity::assemble(&self.store, pm_dir.as_deref(), alias, reason, &message.id);
+        let pack = match built {
+            Ok(Some(pack)) => pack,
+            Ok(None) => return message.body.clone(),
+            Err(e) => {
+                let _ = self.store.event_public(
+                    alias,
+                    "continuity_pack_failed",
+                    json!({"reason": reason.as_str(), "message": message.id,
+                           "error": e.to_string()}),
+                );
+                return message.body.clone();
+            }
+        };
+        let payload = pack.payload(&message.id);
+        if let Err(e) = self.store.thread_append(
+            alias,
+            store::NewEntry {
+                role: store::ROLE_SYSTEM,
+                kind: store::KIND_MESSAGE,
+                text: &pack.note(),
+                payload: Some(payload.clone()),
+                message_id: None,
+            },
+        ) {
+            eprintln!("continuity note for '{alias}' failed: {e}");
+        }
+        let _ = self
+            .store
+            .event_public(alias, crate::continuity::PACK_EVENT, payload);
+        self.wake();
+        pack.wrap(&message.body)
+    }
+
     fn thread_on_provider_event(&self, alias: &str, method: &str, params: &Value) {
         let (kind, text, payload) = match method {
             "item/completed" => {
@@ -1253,7 +1321,24 @@ impl Shared {
             )?,
             None => {
                 self.store
-                    .set_identity_with_quota(alias, &identity, adapter.quota_snapshot())?
+                    .set_identity_with_quota(alias, &identity, adapter.quota_snapshot())?;
+                // CAD-324: a session the provider did not carry over — a
+                // new one, or a reopen whose last turn was lost — starts
+                // its next turn with a continuity pack. An adopted
+                // endpoint is the same live session: nothing is due.
+                let reason = if agent.thread_id.as_deref() != Some(identity.thread_id.as_str()) {
+                    Some(crate::continuity::Reason::New)
+                } else if self.store.last_turn_lost(alias)? {
+                    Some(crate::continuity::Reason::Lost)
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    self.continuity_due
+                        .lock()
+                        .unwrap()
+                        .insert(alias.to_string(), reason);
+                }
             }
         }
         // CAD-230: a managed provider's process is enrolled for build
@@ -1427,8 +1512,14 @@ impl Shared {
                     // while a turn runs. Clear on return, including errors,
                     // so a later user message cannot inherit the flag.
                     let nudge = message.is_nudge();
+                    // CAD-324: a nudge owns no turn and carries no pack.
+                    let prompt = if nudge {
+                        message.body.clone()
+                    } else {
+                        self.continuity_prompt(alias, &agent.endpoint_kind, &message)
+                    };
                     adapter.set_unclaimed_ok(message.is_routed() || nudge);
-                    let outcome = adapter.run_turn(&message.body, &message.id, &move |turn| {
+                    let outcome = adapter.run_turn(&prompt, &message.id, &move |turn| {
                         // CAD-250: a nudge owns no turn — it never becomes
                         // `running`, and its paste is not the held turn's
                         // proof of life.

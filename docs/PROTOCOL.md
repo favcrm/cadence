@@ -1344,8 +1344,9 @@ turn_stalled, turn_resumed, monitor_registered, monitor_alert,
 monitor_alert_ack, monitor_degraded, monitor_dispatch,
 monitor_dispatch_blocked, monitor_dispatch_resolved, monitor_off,
 stop_requested, pane_root, pane_root_unrecorded, pane_tree_reap_intent,
-pane_tree_reaped, pane_tree_reap_refused, pane_tree_unowned`. `wait>0` long-polls
-up to 30s.
+pane_tree_reaped, pane_tree_reap_refused, pane_tree_unowned,
+session_compacted, continuity_pack, continuity_pack_failed`. `wait>0`
+long-polls up to 30s.
 
 Two page shapes. Forward paging sends `after` — rows above the cursor,
 oldest first, up to the page limit. `tail:true` (what `cadence events`
@@ -1361,6 +1362,41 @@ task_reopened, task_failed, task_cancelled, task_sha_recorded,
 task_done, job_closed, job_cancelled` — and `job_events` pages them
 across aliases with the same `after`/`tail` contract
 (`{job, after?, tail?}` → `{events, cursor, has_older}`).
+
+## Continuity packs (CAD-324)
+
+A provider session is disposable; the thread is not. For an agent with
+a thread on a structured endpoint (`managed`, `managed-ws`), the daemon
+puts a **continuity pack** ahead of the message on the first turn of:
+
+- a **new** session — the open minted a session other than the stored
+  one (the first start included);
+- a **lost** session — the reopened session's last finished turn was
+  `unknown`, or reconciled from `unknown`;
+- a **compacted** session — the provider reported a compaction
+  (`cadence/session_compacted`: Claude's `system/compact_boundary`,
+  Codex's `thread/compacted` or a `contextCompaction` item); the pack
+  goes with the next turn.
+
+The daemon assembles it at delivery — the agent never shapes it — from
+`<pm>/company/USER.md` (operator preferences, never read through a
+link, capped at 4 000 characters), the active plans read from the
+tracker (all of them for the master; for another agent only the plans
+with a ticket it owns, and only those tickets), a one-line-per-turn
+summary of the older thread and the last turns verbatim (at most 8).
+Only thread entries whose message reached the agent qualify: a queued
+or cancelled message, and the message the pack travels with, never do.
+The pack is deterministic (no clock or randomness; fixed order),
+bounded (each section capped, the whole ≤ 24 000 bytes) and
+secret-scanned before any cut; a scan that cannot run means no pack.
+Nothing to carry means no pack. The pack starts with
+`[Cadence continuity pack` and ends with
+`[End of continuity pack — the message for this turn follows.]`; a
+quoted boundary inside it is defanged. Each delivery appends a
+`system` thread entry (`payload.event: "continuity_pack"`, reason,
+counts, bytes, `sha256` — never the content) and a `continuity_pack`
+event; a build error is a `continuity_pack_failed` event and the
+message goes alone. PTY and cloud endpoints get no pack.
 
 ## Stall detection
 

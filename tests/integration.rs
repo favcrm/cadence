@@ -48334,3 +48334,199 @@ fn pty_urgent_waits_for_the_held_turn_then_goes_first() {
     pty_token(&d, "w1", "n1");
     assert_eq!(d.message_state("w1", "n2"), "queued");
 }
+
+// ---- CAD-324: continuity packs ----
+
+/// A plan with one ticket for `lead` and one for `other`.
+const CAD324_PLAN: &str = "---\ntitle: CSV export\ngoal: Users export their data\n---\n\n\
+## Build the exporter\nsize: M\nagent: lead\n\n### Acceptance\n- [ ] a CSV downloads\n\n\
+## Write the export docs\nsize: S\nagent: other\ndepends_on: 1\n\n### Acceptance\n- [ ] docs name the columns\n";
+
+/// Every `kind` event of `alias`, oldest first.
+fn events_of_kind(d: &TestDaemon, alias: &str, kind: &str) -> Vec<Value> {
+    d.rpc("agent_events", json!({"alias": alias})).unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == kind)
+        .cloned()
+        .collect()
+}
+
+/// The result text of message `id`.
+fn result_text(d: &TestDaemon, alias: &str, id: &str) -> String {
+    d.wait_message(alias, id, &["completed"], 20)["result"]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The pack text the fake provider received with its `n`th pack.
+fn received_pack(d: &TestDaemon, alias: &str, n: usize) -> String {
+    let packs = events_of_kind(d, alias, "fake_pack");
+    assert!(packs.len() > n, "no pack #{n}: {packs:#?}");
+    packs[n]["payload"]["pack"].as_str().unwrap().to_string()
+}
+
+/// CAD-324 end to end on the fake provider: a threaded agent's new
+/// session starts with a pack (operator preferences with a secret
+/// redacted, only the plan tickets it owns); a later turn on the same
+/// session carries none; a compaction gives the next turn a pack with
+/// the last turns verbatim; a turn lost mid-flight gives the resumed
+/// session a pack — without the message the operator cancelled, a
+/// message still queued, or the message it travels with. An agent with
+/// no thread never gets one. The thread records each delivery (counts
+/// and digest, never the content).
+#[test]
+fn cad324_continuity_packs_on_new_compacted_and_lost_sessions() {
+    let f = PlanFixture::start();
+    f.propose(CAD324_PLAN).unwrap();
+    let token = cad109_token(&["gh", "p_"].concat(), "cad324-user-md", 36);
+    std::fs::create_dir_all(f.pm_dir.join("company")).unwrap();
+    std::fs::write(
+        f.pm_dir.join("company/USER.md"),
+        format!("Prefer small PRs.\nThe deploy key is {token}\n"),
+    )
+    .unwrap();
+
+    // Who gets what plan state (the daemon's reader, directly).
+    let all = cadence_agent::continuity::plan_state(&f.pm_dir, "master", true).unwrap();
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].tickets.len(), 2, "{all:?}");
+    let own = cadence_agent::continuity::plan_state(&f.pm_dir, "lead", false).unwrap();
+    assert_eq!(own[0].tickets.len(), 1, "{own:?}");
+    assert_eq!(own[0].tickets[0].title, "Build the exporter");
+    assert_eq!(own[0].hidden, 1);
+    assert!(
+        cadence_agent::continuity::plan_state(&f.pm_dir, "nobody", false)
+            .unwrap()
+            .is_empty()
+    );
+
+    // An agent with no thread never gets a pack.
+    f.d.register("other");
+    f.d.wait_agent("other", "idle", 15);
+    f.d.rpc(
+        "agent_send",
+        json!({"alias": "other", "text": "no chat", "message": "o1"}),
+    )
+    .unwrap();
+    assert_eq!(result_text(&f.d, "other", "o1"), "FAKE_REPLY: no chat");
+    assert!(events_of_kind(&f.d, "other", "continuity_pack").is_empty());
+
+    // New session: the first turn carries the pack.
+    f.d.register("lead");
+    f.d.wait_agent("lead", "idle", 15);
+    f.d.operator_rpc(
+        "thread_send",
+        json!({"alias": "lead", "text": "hello lead", "message": "c1"}),
+    )
+    .unwrap();
+    let first = result_text(&f.d, "lead", "c1");
+    assert!(first.starts_with("FAKE_PACK "), "{first}");
+    assert!(first.ends_with("FAKE_REPLY: hello lead"), "{first}");
+    let pack = received_pack(&f.d, "lead", 0);
+    assert!(pack.contains("this is a new provider session"), "{pack}");
+    assert!(pack.contains("Prefer small PRs."), "{pack}");
+    assert!(!pack.contains(&token[..20]), "{pack}");
+    assert!(pack.contains("[redacted:"), "{pack}");
+    assert!(pack.contains("\"CSV export\""), "{pack}");
+    assert!(pack.contains("Build the exporter"), "{pack}");
+    assert!(!pack.contains("Write the export docs"), "{pack}");
+    assert!(!pack.contains("hello lead"), "the current message: {pack}");
+    let delivered = events_of_kind(&f.d, "lead", "continuity_pack");
+    assert_eq!(delivered.len(), 1, "{delivered:#?}");
+    let digest = delivered[0]["payload"]["sha256"].as_str().unwrap();
+    assert_eq!(delivered[0]["payload"]["reason"], "new");
+    assert_eq!(delivered[0]["payload"]["message"], "c1");
+    assert!(first.starts_with(&format!("FAKE_PACK {}", &digest[..12])));
+    let note =
+        f.d.rpc("thread_read", json!({"alias": "lead", "limit": 500}))
+            .unwrap()["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["payload"]["event"] == "continuity_pack")
+            .cloned()
+            .expect("the thread records the delivery");
+    assert_eq!(note["role"], "system", "{note}");
+    assert_eq!(note["payload"]["sha256"], digest, "{note}");
+    assert!(
+        !note["text"].as_str().unwrap().contains("Prefer small PRs"),
+        "{note}"
+    );
+
+    // Same session, next turn: no pack.
+    f.d.operator_rpc(
+        "thread_send",
+        json!({"alias": "lead", "text": "second", "message": "c2"}),
+    )
+    .unwrap();
+    assert_eq!(result_text(&f.d, "lead", "c2"), "FAKE_REPLY: second");
+
+    // Compaction: the turn after it carries a pack with the last turns.
+    f.d.operator_rpc(
+        "thread_send",
+        json!({"alias": "lead", "text": "COMPACT", "message": "c3"}),
+    )
+    .unwrap();
+    assert_eq!(result_text(&f.d, "lead", "c3"), "FAKE_COMPACTED");
+    assert_eq!(events_of_kind(&f.d, "lead", "session_compacted").len(), 1);
+    f.d.operator_rpc(
+        "thread_send",
+        json!({"alias": "lead", "text": "after compaction", "message": "c4"}),
+    )
+    .unwrap();
+    assert!(result_text(&f.d, "lead", "c4").starts_with("FAKE_PACK "));
+    let pack = received_pack(&f.d, "lead", 1);
+    assert!(pack.contains("compacted this session's context"), "{pack}");
+    assert!(pack.contains("hello lead"), "{pack}");
+    assert!(
+        pack.contains("result (completed): FAKE_REPLY: second"),
+        "{pack}"
+    );
+    assert!(!pack.contains("after compaction"), "{pack}");
+    // The earlier delivery note is not replayed as a turn.
+    assert!(!pack.contains("Continuity pack delivered"), "{pack}");
+    assert_eq!(
+        events_of_kind(&f.d, "lead", "continuity_pack")[1]["payload"]["reason"],
+        "compacted"
+    );
+
+    // Lost: the provider drops mid-turn; the turn goes unknown.
+    fence_agent(&f.d, "lead", "x1");
+    for (id, text) in [
+        ("w-x", "withdrawn-ask-7f3"),
+        ("r1", "first after resume"),
+        ("r2", "queued-later-9c2"),
+    ] {
+        f.d.rpc(
+            "agent_send",
+            json!({"alias": "lead", "text": text, "message": id}),
+        )
+        .unwrap();
+    }
+    f.d.rpc("message_cancel", json!({"message": "w-x"}))
+        .unwrap();
+    f.d.operator_rpc(
+        "message_reconcile",
+        json!({"message": "x1", "status": "interrupted", "note": "provider killed"}),
+    )
+    .unwrap();
+    f.d.wait_agent("lead", "stopped", 10);
+    f.d.rpc("agent_resume", json!({"alias": "lead"})).unwrap();
+    assert!(result_text(&f.d, "lead", "r1").starts_with("FAKE_PACK "));
+    assert_eq!(
+        result_text(&f.d, "lead", "r2"),
+        "FAKE_REPLY: queued-later-9c2"
+    );
+    let pack = received_pack(&f.d, "lead", 2);
+    assert!(pack.contains("lost mid-turn"), "{pack}");
+    assert!(pack.contains("DISCONNECT"), "{pack}");
+    assert!(pack.contains("result (unknown)"), "{pack}");
+    assert!(!pack.contains("withdrawn-ask-7f3"), "cancelled: {pack}");
+    assert!(!pack.contains("queued-later-9c2"), "still queued: {pack}");
+    assert!(!pack.contains("first after resume"), "current: {pack}");
+    assert_eq!(events_of_kind(&f.d, "lead", "continuity_pack").len(), 3);
+    assert_eq!(events_of_kind(&f.d, "lead", "fake_pack").len(), 3);
+}

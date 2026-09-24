@@ -664,7 +664,76 @@ impl Store {
         rows.reverse();
         Ok((rows, more))
     }
+
+    /// The thread as a continuity pack may carry it (CAD-324): the
+    /// newest `limit` entries, oldest first, plus how many older ones
+    /// qualify beyond them. Only what reached the agent qualifies — an
+    /// entry tied to a message counts only once that message was
+    /// delivered ([`DELIVERED_STATES`], an allowlist): a message still
+    /// queued, or one the operator cancelled, never reaches a pack, and
+    /// neither does `current`, the message the pack travels with.
+    /// Entries tied to no message (system notes) qualify. An alias with
+    /// no thread reads empty.
+    pub fn continuity_entries(
+        &self,
+        alias: &str,
+        current: &str,
+        limit: i64,
+    ) -> Result<(Vec<ThreadEntry>, i64)> {
+        let conn = self.conn();
+        let Some(thread) = Self::thread_in(&conn, alias)? else {
+            return Ok((Vec::new(), 0));
+        };
+        let filter = format!(
+            "e.thread_id=?1 AND (e.message_id IS NULL OR (e.message_id != ?2 AND
+             EXISTS(SELECT 1 FROM messages m WHERE m.id=e.message_id
+                    AND m.state IN {DELIVERED_STATES})))"
+        );
+        let total: i64 = conn.query_row(
+            &format!("SELECT COUNT(*) FROM thread_entries e WHERE {filter}"),
+            params![thread.id, current],
+            |r| r.get(0),
+        )?;
+        let limit = limit.clamp(1, PAGE_MAX);
+        let mut stmt = conn.prepare(&format!(
+            "SELECT e.* FROM thread_entries e WHERE {filter} ORDER BY e.seq DESC LIMIT ?3"
+        ))?;
+        let mut rows = stmt
+            .query_map(params![thread.id, current, limit], row_entry)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.reverse();
+        let older = total - rows.len() as i64;
+        Ok((rows, older.max(0)))
+    }
+
+    /// Did the alias's last finished turn lose its outcome (CAD-324)?
+    /// True when its most recently finished message — nudges and
+    /// cancellations aside — is `unknown`, or was reconciled from
+    /// `unknown` by the operator: the provider session that ran it was
+    /// lost mid-turn, so the next session starts with a continuity pack.
+    pub fn last_turn_lost(&self, alias: &str) -> Result<bool> {
+        let conn = self.conn();
+        let row: Option<(String, Option<String>)> = conn
+            .query_row(
+                "SELECT state, json_extract(result,'$.via') FROM messages
+                 WHERE alias=? AND source != 'nudge' AND completed IS NOT NULL
+                 AND state NOT IN ('queued','cancelled')
+                 ORDER BY completed DESC, seq DESC LIMIT 1",
+                [alias],
+                |r| Ok((r.get(0)?, r.get(1).ok().flatten())),
+            )
+            .optional()?;
+        Ok(row.is_some_and(|(state, via)| {
+            state == "unknown" || via.as_deref() == Some("operator_reconcile")
+        }))
+    }
 }
+
+/// Message states whose thread entries a continuity pack may carry: the
+/// message reached the agent (or was submitted to it). `queued` and
+/// `cancelled` are left out by not being listed.
+const DELIVERED_STATES: &str =
+    "('submitting','running','completed','failed','interrupted','unknown')";
 
 #[cfg(test)]
 mod tests {
