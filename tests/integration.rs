@@ -21482,6 +21482,50 @@ fn daemon_restart_when_idle_gates_and_proceeds() {
     assert!(stop.status.success());
 }
 
+/// CAD-424: an interrupted restore's leftovers refuse `daemon restart`
+/// before anything is shut down, with the recovery `mv` on stderr, and
+/// the running daemon keeps serving. On a host an older binary started
+/// that daemon next to the leftovers; here they appear after its start.
+#[test]
+fn cad424_daemon_restart_refuses_over_restore_leftovers_before_shutdown() {
+    let d = TestDaemon::start();
+    let _reaper = DaemonReaper::new(&d.state);
+    let home = TempDir::new().unwrap();
+    hold_rollout_lease(home.path(), &d.state);
+    let aside = d
+        .state
+        .join("cadence.sqlite3.replaced-20260924T000000Z-deadbeef");
+    std::fs::write(&aside, b"previous store").unwrap();
+
+    let out = cadence_at(
+        home.path(),
+        &d.state,
+        &["daemon", "restart", "--as", "operator:test"],
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "restart ran over restore leftovers: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(stderr.contains("refused before shutdown"), "{stderr}");
+    assert!(
+        stderr.contains(&format!("mv '{}'", aside.display())),
+        "the recovery commands must be on stderr: {stderr}"
+    );
+    assert!(
+        !d.handle.as_ref().unwrap().is_finished(),
+        "the running daemon must not have been shut down"
+    );
+    assert!(
+        d.rpc("health", json!({})).is_ok(),
+        "daemon stopped answering"
+    );
+    assert!(aside.exists());
+    std::fs::remove_file(&aside).unwrap();
+}
+
 /// `daemon stop` waits for the process to release the state-dir lock,
 /// so `stop && start` no longer races the drain. Ten iterations — the
 /// old code lost this race whenever the drain outlived a millisecond.

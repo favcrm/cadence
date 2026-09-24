@@ -2626,6 +2626,18 @@ fn ui_run_args(pid: i32) -> (String, u16, Option<std::path::PathBuf>, Vec<String
     (host, port, dist, allow_hosts)
 }
 
+/// CAD-424: the replacement daemon refuses to start over an interrupted
+/// restore's leftovers, so a restart that shut the old one down first
+/// would leave no daemon at all and the recovery only in daemon.log.
+/// Refuse with the same recovery message before anything stops.
+fn refuse_restart_over_leftovers(state_dir: &Path) -> Result<()> {
+    cadence_agent::backup::refuse_interrupted_restore(state_dir).map_err(|error| {
+        Error::rejected(format!(
+            "daemon restart refused before shutdown; the running daemon is untouched: {error}"
+        ))
+    })
+}
+
 /// `daemon restart`: stop, wait for the process to exit (the
 /// singleton lock is the truth), start, wait until every agent that
 /// was live before settles out of `starting`/`offline`, then print a
@@ -2638,6 +2650,7 @@ fn daemon_restart(
     ui: bool,
     as_identity: Option<String>,
 ) -> Result<i32> {
+    refuse_restart_over_leftovers(state_dir)?;
     let caller =
         cadence_agent::rollout::resolve_caller(as_identity.as_deref()).map_err(|error| {
             Error::rejected(format!("daemon restart refused before shutdown: {error}"))
@@ -2705,6 +2718,8 @@ fn daemon_restart(
     // waits. Re-check immediately before shutdown and do not restart
     // when this caller no longer holds it.
     cadence_agent::rollout::recheck_restart(state_dir, &ticket)?;
+    // --when-idle can wait for minutes; look again right before shutdown.
+    refuse_restart_over_leftovers(state_dir)?;
     cadence_agent::rollout::note_restart_proceeded(state_dir, &ticket)?;
     let was_running = client::rpc(state_dir, "shutdown", json!({})).is_ok();
     if was_running && !wait_daemon_exit(state_dir, 30) {
