@@ -2149,11 +2149,23 @@ fn plant_pane(d: &UiDaemon, alias: &str, pid: u32) {
     );
     let conn = rusqlite::Connection::open(d.state().join("cadence.sqlite3")).unwrap();
     conn.execute(
-        "UPDATE agents SET endpoint_kind='pty', pid=?1, enabled=0, \
+        "UPDATE agents SET endpoint_kind='pty', pid=?1, pid_start=?3, enabled=0, \
             generation='planted', session_id='planted' WHERE alias=?2",
-        rusqlite::params![pid as i64, alias],
+        rusqlite::params![pid as i64, alias, proc_start(pid)],
     )
     .unwrap();
+}
+
+/// `/proc/<pid>/stat` field 22 — what the daemon records as a pid's
+/// `pid_start` (CAD-385), so a planted row names exactly that process.
+fn proc_start(pid: u32) -> Option<i64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
 }
 
 /// CAD-254: the write guards stop browsers, not local processes. A

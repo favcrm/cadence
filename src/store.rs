@@ -361,6 +361,12 @@ pub struct Agent {
     /// Requested/configured effort remains in `params`.
     pub effort: Option<String>,
     pub pid: Option<i64>,
+    /// `/proc/<pid>/stat` field 22 of `pid`, read when the pid was
+    /// recorded (CAD-385): with the pid it names ONE process, so a
+    /// reused pid never inherits this row's alias. `None` on a row
+    /// recorded before schema v14 or when `/proc` was unreadable —
+    /// such a row fails closed ([`crate::peer::PidProof::Unproven`]).
+    pub pid_start: Option<i64>,
     pub endpoint: Option<String>,
     /// Endpoint-specific registration options (`{"session": …}` for pty).
     pub params: Option<Value>,
@@ -748,6 +754,7 @@ fn row_agent(row: &rusqlite::Row) -> rusqlite::Result<Agent> {
         model: row.get("model")?,
         effort: row.get("effort")?,
         pid: row.get("pid")?,
+        pid_start: row.get("pid_start")?,
         endpoint: row.get("endpoint")?,
         params: row
             .get::<_, Option<String>>("params")?
@@ -804,7 +811,8 @@ impl Agent {
             "team_role": self.team_role,
             "cwd": self.cwd, "sandbox": self.sandbox,
             "thread_id": self.thread_id, "session_id": self.session_id,
-            "model": self.model, "pid": self.pid, "state": self.state,
+            "model": self.model, "pid": self.pid, "pid_start": self.pid_start,
+            "state": self.state,
             // What the endpoint runs vs what it was told: the reported
             // model beside the configured launch params, with an
             // unconfigured model named as the provider's default.
@@ -1441,6 +1449,26 @@ impl Store {
             // transaction: a half-applied v13 converges on reopen.
             let tx = conn.unchecked_transaction()?;
             tx.execute_batch(threads::SCHEMA_V13)?;
+            tx.execute("UPDATE schema_version SET version=13", [])?;
+            tx.commit()?;
+        }
+        if version < 14 {
+            // v14: `agents.pid_start` (CAD-385) — the recorded pid's
+            // process start time, so a reused pid never maps to a stale
+            // row's alias. Existing rows stay NULL: they fail closed
+            // until their endpoint is recorded again (recovery below
+            // clears every live pid; adoption re-records it with its
+            // start). Column add + bump in one transaction, and the add
+            // is skipped when present: a half-applied v14 converges.
+            let columns: Vec<String> = conn
+                .prepare("PRAGMA table_info(agents)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .filter_map(std::result::Result::ok)
+                .collect();
+            let tx = conn.unchecked_transaction()?;
+            if !columns.iter().any(|column| column == "pid_start") {
+                tx.execute_batch("ALTER TABLE agents ADD COLUMN pid_start INTEGER")?;
+            }
             tx.execute(
                 "UPDATE schema_version SET version=?1",
                 [crate::rollout::SCHEMA_VERSION],
@@ -1574,7 +1602,7 @@ impl Store {
         // serve loop's relaunch skip and retry a provider session the
         // operator has not cleared.
         tx.execute(
-            "UPDATE agents SET pid=NULL, endpoint=NULL, generation=NULL
+            "UPDATE agents SET pid=NULL, pid_start=NULL, endpoint=NULL, generation=NULL
              WHERE state='attention' AND endpoint_kind != 'inbox'",
             [],
         )?;
@@ -1587,7 +1615,7 @@ impl Store {
         // token validity. Kept aliases need the same clearing, so this
         // is one unconditional UPDATE — the crash path's exact shape.
         tx.execute(
-            "UPDATE agents SET state='offline', pid=NULL, endpoint=NULL,
+            "UPDATE agents SET state='offline', pid=NULL, pid_start=NULL, endpoint=NULL,
                 generation=NULL
              WHERE state NOT IN ('stopped','attention')
                AND endpoint_kind != 'inbox'",
@@ -1714,6 +1742,38 @@ impl Store {
             })?
             .collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()?;
         Ok(facts)
+    }
+
+    /// The registered pty panes a caller can descend from — the rows
+    /// [`Self::pty_endpoint_facts`] reads — as `(alias, pane pid,
+    /// recorded start time)` for [`crate::peer::AgentPids::classify`]:
+    /// every pid → alias mapping checks the start (CAD-385).
+    pub fn pty_pane_pids(&self) -> Result<Vec<(String, u32, Option<u64>)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT alias, pid, pid_start FROM agents
+             WHERE endpoint_kind='pty'
+               AND generation IS NOT NULL AND pid IS NOT NULL",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(alias, pid, start)| {
+                Some((
+                    alias,
+                    u32::try_from(pid).ok()?,
+                    start.and_then(|s| u64::try_from(s).ok()),
+                ))
+            })
+            .collect())
     }
 
     /// The shutdown marker's payload: every in-flight pty message
@@ -3670,8 +3730,15 @@ impl Store {
         let mut params: Vec<rusqlite::types::Value> = vec![now().into(), alias.to_string().into()];
         params.extend(kept_ids.iter().map(|k| k.to_string().into()));
         tx.execute(&sql, rusqlite::params_from_iter(params))?;
+        // CAD-385: the pid is recorded WITH its process start time — on
+        // every open, re-attach and hot-restart adoption alike, since all
+        // of them land here — so a later process reusing the pid is told
+        // apart from this endpoint. Read just after the adapter proved
+        // the process its own; unreadable (a pid-less endpoint's 0, a
+        // process already gone) records NULL, which fails closed.
+        let pid_start = crate::peer::proc_starttime(id.pid).and_then(|s| i64::try_from(s).ok());
         tx.execute(
-            "UPDATE agents SET thread_id=?,session_id=?,model=?,effort=?,pid=?,
+            "UPDATE agents SET thread_id=?,session_id=?,model=?,effort=?,pid=?,pid_start=?,
                 endpoint=?,generation=?,quota=?,state='idle',updated=? WHERE alias=?",
             params![
                 id.thread_id,
@@ -3679,6 +3746,7 @@ impl Store {
                 id.model,
                 id.effort,
                 id.pid as i64,
+                pid_start,
                 id.endpoint,
                 id.generation,
                 quota,
@@ -4073,7 +4141,7 @@ impl Store {
     pub fn set_state_detached(&self, alias: &str, state: &str, error: Option<&str>) -> Result<()> {
         let conn = self.conn();
         conn.execute(
-            "UPDATE agents SET state=?,error=?,pid=NULL,endpoint=NULL,
+            "UPDATE agents SET state=?,error=?,pid=NULL,pid_start=NULL,endpoint=NULL,
                 generation=NULL,updated=? WHERE alias=?",
             params![state, error, now(), alias],
         )?;
@@ -8437,6 +8505,7 @@ mod tests {
             model: None,
             effort: None,
             pid: None,
+            pid_start: None,
             endpoint: None,
             // Even a complete-looking caller value cannot substitute for
             // provider-owned evidence.
@@ -8679,6 +8748,152 @@ mod tests {
         kickoff
     }
 
+    fn endpoint_at(pid: u32) -> crate::adapter::Identity {
+        crate::adapter::Identity {
+            thread_id: "t".into(),
+            session_id: "s".into(),
+            model: None,
+            effort: None,
+            pid,
+            endpoint: None,
+            generation: Some("g1".into()),
+            attach: None,
+        }
+    }
+
+    fn recorded_start(s: &Store, alias: &str) -> (Option<i64>, Option<i64>) {
+        let a = s.agent(alias).unwrap();
+        (a.pid, a.pid_start)
+    }
+
+    /// CAD-385 acceptance 1: every path that records an endpoint pid —
+    /// a plain open and a hot-restart adoption alike — records that
+    /// process's `/proc` start time with it, and every path that clears
+    /// the pid clears the start: a detach, and the recovery a daemon
+    /// restart runs before its panes are adopted again.
+    #[test]
+    fn cad385_every_recorded_pid_carries_its_start_time_and_clears_with_it() {
+        let (dir, s) = store();
+        reg(&s, "w1", &dir.path().join("w"));
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let child_start = crate::peer::proc_starttime(child.id()).map(|t| t as i64);
+        assert!(child_start.is_some());
+
+        s.set_identity("w1", &endpoint_at(child.id())).unwrap();
+        assert_eq!(
+            recorded_start(&s, "w1"),
+            (Some(child.id() as i64), child_start)
+        );
+        assert_eq!(
+            s.agent("w1").unwrap().to_json()["pid_start"],
+            json!(child_start)
+        );
+
+        // A pty row reads back through the pane map with its start.
+        s.conn()
+            .execute("UPDATE agents SET endpoint_kind='pty' WHERE alias='w1'", [])
+            .unwrap();
+        assert_eq!(
+            s.pty_pane_pids().unwrap(),
+            vec![("w1".to_string(), child.id(), child_start.map(|t| t as u64))]
+        );
+
+        // Adoption records the adopted process — here another one.
+        let me = std::process::id();
+        s.set_identity_adopted("w1", &endpoint_at(me), &[]).unwrap();
+        assert_eq!(
+            recorded_start(&s, "w1"),
+            (
+                Some(me as i64),
+                crate::peer::proc_starttime(me).map(|t| t as i64)
+            )
+        );
+
+        s.set_state_detached("w1", "offline", None).unwrap();
+        assert_eq!(recorded_start(&s, "w1"), (None, None));
+
+        // Restart: recovery clears pid and start together.
+        s.set_identity("w1", &endpoint_at(child.id())).unwrap();
+        drop(s);
+        let s = Store::open(&dir.path().join("t.sqlite3")).unwrap();
+        assert_eq!(recorded_start(&s, "w1"), (None, None));
+
+        // An unreadable process (a pid-less endpoint's 0) records none.
+        s.set_identity("w1", &endpoint_at(0)).unwrap();
+        assert_eq!(recorded_start(&s, "w1"), (Some(0), None));
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// CAD-385 acceptance 4: v13 → v14 adds `agents.pid_start` and
+    /// keeps every row; a row that carried a pid across the upgrade has
+    /// no start (it fails closed until re-recorded); a half-applied v14
+    /// converges, and reopening a current store is a no-op.
+    #[test]
+    fn migration_v13_to_v14_adds_pid_start_and_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("t.sqlite3");
+        let version = |db: &Path| -> i64 {
+            Connection::open(db)
+                .unwrap()
+                .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+                .unwrap()
+        };
+        let has_column = |db: &Path| -> bool {
+            Connection::open(db)
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM pragma_table_info('agents') WHERE name='pid_start'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap()
+                == 1
+        };
+        {
+            let s = Store::open(&db).unwrap();
+            reg(&s, "m1", dir.path());
+        }
+        // A genuine v13: no `pid_start`, and a stopped row that kept its
+        // pid (recovery leaves stopped rows alone).
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "ALTER TABLE agents DROP COLUMN pid_start;
+                 UPDATE agents SET state='stopped', pid=4242, generation='g0' WHERE alias='m1';
+                 UPDATE schema_version SET version=13;",
+            )
+            .unwrap();
+        assert!(!has_column(&db));
+        {
+            let s = Store::open_for_schema_tests(&db).unwrap();
+            let a = s.agent("m1").unwrap();
+            assert_eq!(
+                (a.pid, a.pid_start, a.state.as_str()),
+                (Some(4242), None, "stopped")
+            );
+        }
+        assert_eq!(version(&db), 14);
+        assert!(has_column(&db));
+        // Half-applied: column present, version rolled back — converges.
+        Connection::open(&db)
+            .unwrap()
+            .execute("UPDATE schema_version SET version=13", [])
+            .unwrap();
+        {
+            let s = Store::open_for_schema_tests(&db).unwrap();
+            assert_eq!(s.agent("m1").unwrap().pid, Some(4242));
+        }
+        assert_eq!(version(&db), 14);
+        // Reopening a current store is a no-op.
+        let s = Store::open(&db).unwrap();
+        assert_eq!(s.agent("m1").unwrap().pid_start, None);
+        assert_eq!(version(&db), crate::rollout::SCHEMA_VERSION);
+    }
+
     fn run_kickoff(s: &Store, kickoff: &str) -> Message {
         match s.take_queued("w1").unwrap() {
             Take::Message(m) => assert_eq!(m.id, kickoff),
@@ -8908,6 +9123,7 @@ mod tests {
             model: None,
             effort: None,
             pid: None,
+            pid_start: None,
             endpoint: None,
             params: None,
             model_selection: None,

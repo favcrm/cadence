@@ -1537,6 +1537,23 @@ detached helper cannot borrow an identity it was never given.
 appears only to the connection whose derived lane matches the hold
 *and* whose ancestry includes the hold's pid.
 
+A registered pid is a process only together with its start time
+(CAD-385). Every agent row records `pid_start` — `/proc/<pid>/stat`
+field 22 of the pid it records (the pane pid for `pty`, the provider
+pid for managed endpoints) — on each open, re-attach and hot-restart
+adoption, and every pid → alias mapping (slot identity, the memory
+caller verifier, `agent answer`, operator proof, board attribution,
+`rollout release --force`) compares it with the live process first.
+A row whose pid now names another process, or none, is stale: it
+matches nothing, and the caller is placed exactly as an unregistered
+process. A row with no recorded start (written before schema v14, or
+with `/proc` unreadable) cannot be told from a reused pid, so it fails
+closed: a caller descending from it is refused, and operator proof
+still counts it as a pane. `cadence doctor --host` (check
+`pane-identity`) lists such rows; the remedy is `cadence daemon
+restart`, whose recovery clears every recorded pid before each live
+pane is adopted again with its start recorded.
+
 ### Managed endpoints — strict enrollment (CAD-230 phase a)
 
 A managed Claude or Codex worker (`managed`/`managed-ws` endpoint) has

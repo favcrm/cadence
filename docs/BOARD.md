@@ -1038,6 +1038,12 @@ CAD-263), never from anything the request says:
    there is no pty to tie. The pid is the row's live pid: the daemon
    clears it when the endpoint closes, stops or errors.
 
+   Both kinds of row count only while the start time the daemon
+   recorded with the pid (`pid_start`, CAD-385) matches the live
+   process: a row whose pid was reused ties nothing, and a tie to a row
+   with no recorded start (an older daemon's list) refuses the write,
+   naming the remedy.
+
    The pane's `CADENCE_ALIAS` in the peer's environment is **not** a
    board signal on its own: any process can export it, so
    `CADENCE_ALIAS=B curl …` from a pane-less process writes as

@@ -1480,18 +1480,25 @@ fn write_caller(
 ///   enrollment roots at. The daemon clears the pid when the endpoint
 ///   closes, stops or errors.
 ///
+/// Each pid comes with the process start time the daemon recorded
+/// with it (`pid_start`, CAD-385) and is classified against `/proc`
+/// now ([`crate::peer::AgentPids`]): a reused pid attributes nothing,
+/// and a row without one — an older daemon's list — refuses a write
+/// tied to it.
+///
 /// No store file means no agent was ever registered here: provably no
 /// agents. A store the daemon cannot answer for is an error.
 fn agent_roots(state_dir: &Path) -> std::result::Result<crate::peer::AgentRoots, String> {
-    let mut roots = crate::peer::AgentRoots::default();
     if !state_dir.join("cadence.sqlite3").exists() {
-        return Ok(roots);
+        return Ok(crate::peer::AgentRoots::default());
     }
     let list = client::rpc(state_dir, "agent_list", json!({}))
         .map_err(|e| format!("the daemon cannot list registered agents ({e})"))?;
     let agents = list["agents"]
         .as_array()
         .ok_or_else(|| "the daemon's agent list is malformed".to_string())?;
+    let mut panes = Vec::new();
+    let mut managed = Vec::new();
     for a in agents {
         let (Some(pid), Some(alias)) = (
             a["pid"].as_u64().and_then(|p| u32::try_from(p).ok()),
@@ -1499,16 +1506,20 @@ fn agent_roots(state_dir: &Path) -> std::result::Result<crate::peer::AgentRoots,
         ) else {
             continue;
         };
+        let row = (alias.to_string(), pid, a["pid_start"].as_u64());
         let kind = a["endpoint_kind"].as_str().unwrap_or_default();
         if kind == "pty" && !a["generation"].is_null() {
-            roots.panes.insert(pid, alias.to_string());
+            panes.push(row);
         } else if pid > 1
             && registry::enrolls_build_slots(a["provider"].as_str().unwrap_or_default(), kind)
         {
-            roots.managed.insert(pid, alias.to_string());
+            managed.push(row);
         }
     }
-    Ok(roots)
+    Ok(crate::peer::AgentRoots {
+        panes: crate::peer::AgentPids::classify(panes),
+        managed: crate::peer::AgentPids::classify(managed),
+    })
 }
 
 /// The login lands in a commit `Actor:` trailer — take the first

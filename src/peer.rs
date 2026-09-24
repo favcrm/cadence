@@ -448,24 +448,199 @@ fn proc_session(pid: u32) -> Result<u32, String> {
         .ok_or_else(|| format!("/proc/{pid}/stat: malformed"))
 }
 
+/// `/proc/<pid>/stat` field 22 — the process start time in clock ticks
+/// since boot. With the pid it is a process identity that survives pid
+/// reuse: a later process holding the same pid has a later start.
+/// `comm` (field 2) may hold spaces and parens, so fields are counted
+/// after the LAST `)`: state (field 3) is index 0, field 22 index 19.
+/// `None` when the process is gone or its `stat` is unreadable.
+pub(crate) fn proc_starttime(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
+/// What an agent row's recorded `(pid, start time)` proves about the
+/// process holding that pid NOW (CAD-385). The pid alone never names an
+/// agent: pids are reused, and a row outlives its process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PidProof {
+    /// The pid still names the recorded process — same start time.
+    Same,
+    /// The pid names another process, or none: the row is stale and
+    /// maps NOTHING — a caller reaching that pid is placed exactly as
+    /// if the row had never been registered.
+    Stale,
+    /// Nothing to compare: a row recorded before CAD-385 (no start
+    /// time), or a live process whose `stat` cannot be read. It may or
+    /// may not be the row's process, so it fails closed: it vouches for
+    /// no alias, and a caller reaching it is refused, never placed.
+    Unproven,
+}
+
+/// Classify one recorded pid against `/proc` now ([`PidProof`]).
+pub(crate) fn pid_proof(pid: u32, recorded_start: Option<u64>) -> PidProof {
+    let Some(recorded) = recorded_start else {
+        return PidProof::Unproven;
+    };
+    match proc_starttime(pid) {
+        Some(now) if now == recorded => PidProof::Same,
+        Some(_) => PidProof::Stale,
+        // Gone: no process holds the pid, so no caller descends from
+        // it. Present but unreadable: cannot tell.
+        None if std::fs::metadata(format!("/proc/{pid}")).is_err() => PidProof::Stale,
+        None => PidProof::Unproven,
+    }
+}
+
+/// How a caller clears a row [`PidProof::Unproven`] — named in every
+/// refusal and by `doctor --host` (check `pane-identity`).
+pub(crate) const PID_START_REMEDY: &str = "restart the daemon on this build \
+     (`cadence daemon restart`): recovery clears every recorded pid and each \
+     live pane is adopted again with its process start time recorded; \
+     `cadence doctor --host` (check pane-identity) lists the rows affected";
+
+/// One agent's recorded process, classified.
+#[derive(Debug, Clone)]
+pub(crate) struct AgentPid {
+    pub(crate) alias: String,
+    pub(crate) pid: u32,
+    pub(crate) proof: PidProof,
+}
+
+/// The agent rows' recorded processes — pane pids or managed provider
+/// pids — each checked against its recorded start time (CAD-385).
+/// [`PidProof::Stale`] rows are dropped at construction, so nothing
+/// downstream can map a reused pid to the stale row's alias. Every
+/// pid → alias mapping reads one of the views:
+///
+/// - [`Self::live`] — the rows whose process is proven: the only ones
+///   that may IDENTIFY a caller as an agent;
+/// - [`Self::fenced`] — live and unproven rows: deny lists (operator
+///   proof, a pane answering its own menu), where a row that MAY still
+///   be its process must keep refusing;
+/// - [`Self::refuse_unproven_on`] — an unproven row on the caller's
+///   ancestry refuses the call outright: it is neither that agent nor
+///   provably anyone else.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AgentPids {
+    rows: Vec<AgentPid>,
+}
+
+impl AgentPids {
+    /// Classify `(alias, pid, recorded start)` rows against `/proc` now.
+    pub(crate) fn classify(rows: impl IntoIterator<Item = (String, u32, Option<u64>)>) -> Self {
+        Self::from_proofs(
+            rows.into_iter()
+                .map(|(alias, pid, start)| (alias, pid, pid_proof(pid, start))),
+        )
+    }
+
+    /// Rows already classified — tests, and callers with their own
+    /// `/proc`.
+    pub(crate) fn from_proofs(rows: impl IntoIterator<Item = (String, u32, PidProof)>) -> Self {
+        Self {
+            rows: rows
+                .into_iter()
+                .filter(|(_, _, proof)| *proof != PidProof::Stale)
+                .map(|(alias, pid, proof)| AgentPid { alias, pid, proof })
+                .collect(),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    fn map(&self, keep: impl Fn(&AgentPid) -> bool) -> HashMap<u32, String> {
+        self.rows
+            .iter()
+            .filter(|r| keep(r))
+            .map(|r| (r.pid, r.alias.clone()))
+            .collect()
+    }
+
+    /// pid → alias for rows whose recorded process is proven live.
+    pub(crate) fn live(&self) -> HashMap<u32, String> {
+        self.map(|r| r.proof == PidProof::Same)
+    }
+
+    /// pid → alias for every row that may still be its process.
+    pub(crate) fn fenced(&self) -> HashMap<u32, String> {
+        self.map(|_| true)
+    }
+
+    /// The row recorded for `alias`, when it is not stale.
+    pub(crate) fn get(&self, alias: &str) -> Option<&AgentPid> {
+        self.rows.iter().find(|r| r.alias == alias)
+    }
+
+    /// The unproven rows.
+    pub(crate) fn unproven(&self) -> impl Iterator<Item = &AgentPid> {
+        self.rows.iter().filter(|r| r.proof == PidProof::Unproven)
+    }
+
+    /// `Err` naming the nearest unproven row on `chain` (a caller's
+    /// `/proc` ancestry, nearest first) and the remedy.
+    pub(crate) fn refuse_unproven_on(&self, chain: &[u32]) -> Result<(), String> {
+        let unproven = self.map(|r| r.proof == PidProof::Unproven);
+        match chain
+            .iter()
+            .find_map(|pid| Some((*pid, unproven.get(pid)?)))
+        {
+            Some((pid, alias)) => Err(unproven_row(alias, pid)),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The refusal for a caller tied to an [`PidProof::Unproven`] row.
+pub(crate) fn unproven_row(alias: &str, pid: u32) -> String {
+    format!(
+        "pid {pid} is agent '{alias}''s recorded process, but the row has no \
+         process start time that proves it still is (recorded before CAD-385, \
+         or /proc/{pid}/stat unreadable) — the pid may have been reused, so it \
+         vouches for no one and caller identity is underivable; remedy: \
+         {PID_START_REMEDY}"
+    )
+}
+
 /// The live agents a board write can be attributed to, each by the
-/// process the daemon recorded for it.
+/// process the daemon recorded for it and checked against its recorded
+/// start time ([`AgentPids`], CAD-385).
 #[derive(Default)]
 pub(crate) struct AgentRoots {
-    /// Registered pty panes, pane pid → alias. A peer is tied by
-    /// ancestry or by the pane's pty on its stdio
-    /// ([`PeerTies::attributed_agents`]).
-    pub(crate) panes: HashMap<u32, String>,
-    /// Live managed endpoints (CAD-335), provider pid → alias: the
+    /// Registered pty panes by pane pid. A peer is tied by ancestry or
+    /// by the pane's pty on its stdio ([`PeerTies::attributed_agents`]).
+    pub(crate) panes: AgentPids,
+    /// Live managed endpoints (CAD-335) by provider pid: the
     /// claude/codex process the daemon launched with no pane, whose
     /// tool shells descend from it. A peer is tied by ancestry only —
     /// the provider's stdio is pipes and log files, never a pty.
-    pub(crate) managed: HashMap<u32, String>,
+    pub(crate) managed: AgentPids,
 }
 
 impl AgentRoots {
     pub(crate) fn is_empty(&self) -> bool {
         self.panes.is_empty() && self.managed.is_empty()
+    }
+
+    /// [`operator_proof`] for `pid` against these roots. The deny lists
+    /// are every row that MAY still be its process (CAD-385,
+    /// [`AgentPids::fenced`]): a reused pid denies nothing, a row with no
+    /// recorded start keeps denying — panes and managed providers alike.
+    /// The one way the board runs operator proof, so no call site builds
+    /// a deny list from bare pids.
+    pub(crate) fn operator_proof(&self, pid: u32, uid: u32, daemon_pid: u32) -> Result<(), String> {
+        let panes = self.panes.fenced();
+        let managed = self.managed.fenced();
+        operator_proof(pid, uid, daemon_pid, &panes, |hop| {
+            managed.contains_key(&hop)
+        })
     }
 }
 
@@ -473,13 +648,16 @@ impl AgentRoots {
 /// `server_port` is attributed as: the registered pane on its ancestry
 /// or whose pty it holds ([`PeerTies::attributed_agents`]), or the
 /// managed endpoint whose provider is on its ancestry
-/// ([`AgentRoots::managed`]). `Ok(None)` — the peer is a local process
+/// ([`AgentRoots::managed`]) — each only while its recorded start time
+/// still matches ([`AgentPids::live`], CAD-385): a row whose pid was
+/// reused ties nothing. `Ok(None)` — the peer is a local process
 /// tied to no agent, or (non-loopback address, no local socket holds
 /// the connection's other end) a different host, which no agent here
 /// can be. `Ok(None)` is NOT proof of the operator: a process that left
 /// every agent's ancestry lands there too. `Err` — the peer could not
-/// be attributed at all (unreadable ancestry, several agents): callers
-/// must fail closed, never read it as "no agent".
+/// be attributed at all (unreadable ancestry, several agents, a tie to
+/// a row whose process cannot be proven): callers must fail closed,
+/// never read it as "no agent".
 pub(crate) fn tcp_peer_agent(
     server_port: u16,
     peer: SocketAddr,
@@ -507,20 +685,32 @@ pub(crate) fn tcp_peer_agent(
         if !ties.walked() {
             return Err(format!("peer pid {pid}: /proc ancestry unreadable"));
         }
-        agents.extend(
-            ties.attributed_agents(
+        // A tie to a row whose process cannot be proven (CAD-385) is
+        // neither that agent nor provably the operator: refuse.
+        if let Some(row) = roots
+            .panes
+            .unproven()
+            .find(|row| ties.process_tied(row.pid))
+            .or_else(|| {
                 roots
-                    .panes
-                    .iter()
-                    .map(|(pid, alias)| (alias.as_str(), *pid)),
-            ),
+                    .managed
+                    .unproven()
+                    .find(|row| ties.descends_from(row.pid))
+            })
+        {
+            return Err(unproven_row(&row.alias, row.pid));
+        }
+        let panes = roots.panes.live();
+        agents.extend(
+            ties.attributed_agents(panes.iter().map(|(pid, alias)| (alias.as_str(), *pid))),
         );
         agents.extend(
             roots
                 .managed
-                .iter()
-                .filter(|(provider, _)| ties.descends_from(**provider))
-                .map(|(_, alias)| alias.clone()),
+                .live()
+                .into_iter()
+                .filter(|(provider, _)| ties.descends_from(*provider))
+                .map(|(_, alias)| alias),
         );
     }
     if agents.len() > 1 {
@@ -537,7 +727,8 @@ pub(crate) fn tcp_peer_agent(
 /// operator-only writes it relays to the daemon (CAD-328), which would
 /// otherwise see only the board's own process. Every process holding
 /// the client socket must pass: it runs as `uid`, walks cleanly, has
-/// no registered pane or managed provider (`roots`) on its ancestry, is
+/// no registered pane or managed provider (`roots`, each unless its
+/// recorded start time proves the pid reused — CAD-385) on its ancestry, is
 /// no descendant of `daemon_pid` (under `daemon run` a detached child
 /// of a daemon-launched tool re-parents to the daemon), carries no
 /// agent environment, holds no pane pty, and leads or descends from
@@ -563,9 +754,7 @@ pub(crate) fn tcp_peer_operator_proof(
         ));
     }
     for pid in pids {
-        operator_proof(pid, uid, daemon_pid, &roots.panes, |hop| {
-            roots.managed.contains_key(&hop)
-        })?;
+        roots.operator_proof(pid, uid, daemon_pid)?;
     }
     Ok(())
 }
@@ -681,6 +870,12 @@ mod tests {
     use super::*;
     use std::net::{TcpListener, TcpStream};
 
+    /// One row recorded the way the daemon records it: the pid with its
+    /// start time read from `/proc` now.
+    fn recorded(alias: &str, pid: u32) -> AgentPids {
+        AgentPids::classify([(alias.to_string(), pid, proc_starttime(pid))])
+    }
+
     #[test]
     fn parses_proc_net_addresses() {
         let v4 = u32::from_ne_bytes([127, 0, 0, 1]);
@@ -715,7 +910,7 @@ mod tests {
         let none = AgentRoots::default();
         assert_eq!(tcp_peer_agent(port, peer, &none), Ok(None));
         let panes = AgentRoots {
-            panes: HashMap::from([(std::process::id(), "w1".to_string())]),
+            panes: recorded("w1", std::process::id()),
             ..Default::default()
         };
         assert_eq!(tcp_peer_agent(port, peer, &panes), Ok(Some("w1".into())));
@@ -745,7 +940,7 @@ mod tests {
 
         // Our parent stands in for the provider that launched us.
         let managed = AgentRoots {
-            managed: HashMap::from([(parent, "wk".to_string())]),
+            managed: recorded("wk", parent),
             ..Default::default()
         };
         assert_eq!(tcp_peer_agent(port, peer, &managed), Ok(Some("wk".into())));
@@ -756,7 +951,7 @@ mod tests {
             .spawn()
             .unwrap();
         let unrelated = AgentRoots {
-            managed: HashMap::from([(other.id(), "wk".to_string())]),
+            managed: recorded("wk", other.id()),
             ..Default::default()
         };
         assert_eq!(tcp_peer_agent(port, peer, &unrelated), Ok(None));
@@ -764,10 +959,126 @@ mod tests {
         let _ = other.wait();
 
         let both = AgentRoots {
-            panes: HashMap::from([(me, "w1".to_string())]),
-            managed: HashMap::from([(parent, "wk".to_string())]),
+            panes: recorded("w1", me),
+            managed: recorded("wk", parent),
         };
         assert!(tcp_peer_agent(port, peer, &both).is_err());
+    }
+
+    /// CAD-385: a recorded pid is the row's process only while its
+    /// start time matches. A real unrelated process holding the pid
+    /// with a different start is `Stale`, a gone one too; a row with no
+    /// recorded start is `Unproven`, whatever holds the pid.
+    #[test]
+    fn pid_proof_tells_same_stale_and_unproven() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let start = proc_starttime(pid).unwrap();
+        assert_eq!(pid_proof(pid, Some(start)), PidProof::Same);
+        // The row recorded an EARLIER process under this pid.
+        assert_eq!(pid_proof(pid, Some(start - 1)), PidProof::Stale);
+        assert_eq!(pid_proof(pid, None), PidProof::Unproven);
+        let rows = AgentPids::classify([
+            ("live".to_string(), pid, Some(start)),
+            ("reused".to_string(), pid, Some(start - 1)),
+            ("legacy".to_string(), pid, None),
+        ]);
+        assert_eq!(rows.live(), HashMap::from([(pid, "live".to_string())]));
+        assert!(rows.get("reused").is_none(), "a stale row maps nothing");
+        assert_eq!(
+            rows.unproven()
+                .map(|r| r.alias.as_str())
+                .collect::<Vec<_>>(),
+            vec!["legacy"]
+        );
+        let err = rows.refuse_unproven_on(&[42, pid]).unwrap_err();
+        assert!(
+            err.contains("'legacy'") && err.contains("doctor --host"),
+            "{err}"
+        );
+        assert!(rows.refuse_unproven_on(&[42]).is_ok());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(pid_proof(pid, Some(start)), PidProof::Stale, "gone");
+    }
+
+    /// CAD-385 on the board: a pane row whose pid now names another
+    /// process (here: this test process, recorded with an earlier start)
+    /// attributes the write to no agent — exactly as with no row; a row
+    /// with no recorded start refuses the write and names the remedy.
+    #[test]
+    fn a_reused_or_unrecorded_pane_pid_never_attributes_a_board_write() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let (_accepted, peer) = listener.accept().unwrap();
+        let me = std::process::id();
+        let start = proc_starttime(me).unwrap();
+        let unregistered = tcp_peer_agent(port, peer, &AgentRoots::default());
+        assert_eq!(unregistered, Ok(None));
+
+        let reused = AgentRoots {
+            panes: AgentPids::classify([("pm".to_string(), me, Some(start - 1))]),
+            managed: AgentPids::classify([("wk".to_string(), me, Some(start + 1))]),
+        };
+        assert_eq!(tcp_peer_agent(port, peer, &reused), unregistered);
+
+        let legacy = AgentRoots {
+            panes: AgentPids::classify([("pm".to_string(), me, None)]),
+            ..Default::default()
+        };
+        let err = tcp_peer_agent(port, peer, &legacy).unwrap_err();
+        assert!(
+            err.contains("'pm'") && err.contains("doctor --host"),
+            "{err}"
+        );
+        let legacy_managed = AgentRoots {
+            managed: AgentPids::classify([("wk".to_string(), me, None)]),
+            ..Default::default()
+        };
+        assert!(tcp_peer_agent(port, peer, &legacy_managed).is_err());
+    }
+
+    /// CAD-385 in the board's operator proof (CAD-328): the pane and
+    /// managed deny lists are the fenced views — a row whose pid now
+    /// names another process denies nothing (the answer is exactly the
+    /// unregistered one), while a live row and a row with no recorded
+    /// start both still deny.
+    #[test]
+    fn board_operator_proof_denies_live_and_unproven_rows_but_not_reused_ones() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let (_accepted, peer) = listener.accept().unwrap();
+        let me = std::process::id();
+        let start = proc_starttime(me).unwrap();
+        let (_, uid) = proc_uids(me).unwrap();
+        let proof = |roots: &AgentRoots| tcp_peer_operator_proof(port, peer, uid, 0, roots);
+        let unregistered = proof(&AgentRoots::default());
+
+        let reused = AgentRoots {
+            panes: AgentPids::classify([("pm".to_string(), me, Some(start - 1))]),
+            managed: AgentPids::classify([("wk".to_string(), me, Some(start + 1))]),
+        };
+        assert_eq!(proof(&reused), unregistered);
+
+        for start in [Some(start), None] {
+            let pane = AgentRoots {
+                panes: AgentPids::classify([("pm".to_string(), me, start)]),
+                ..Default::default()
+            };
+            let err = proof(&pane).unwrap_err();
+            assert!(err.contains("registered pane 'pm'"), "{err}");
+            let managed = AgentRoots {
+                managed: AgentPids::classify([("wk".to_string(), me, start)]),
+                ..Default::default()
+            };
+            let err = proof(&managed).unwrap_err();
+            assert!(err.contains("enrolled managed endpoint"), "{err}");
+        }
     }
 
     /// The client socket's uid column is read, and it is ours for a
