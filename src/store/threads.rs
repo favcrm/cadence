@@ -882,6 +882,26 @@ mod tests {
         }
     }
 
+    /// A provider item that lands between `take_queued` (`submitting`)
+    /// and `mark_running` still links to its turn (the CI race behind
+    /// `cad319_thread_records_codex_agent_messages`).
+    #[test]
+    fn running_append_links_a_submitting_turn() {
+        let (dir, s) = store();
+        reg(&s, "master", dir.path());
+        s.ensure_thread("master").unwrap();
+        s.enqueue("master", "do it", None, "m1", "user").unwrap();
+        assert!(matches!(
+            s.take_queued("master").unwrap(),
+            crate::store::Take::Message(_)
+        ));
+        assert_eq!(s.message("m1").unwrap().unwrap().state, "submitting");
+        s.thread_append_running("master", ROLE_AGENT, KIND_ASSISTANT_TEXT, "looking", None)
+            .unwrap();
+        let entries = s.thread_entries("master", 0, 10).unwrap();
+        assert_eq!(entries[1].message_id.as_deref(), Some("m1"), "{entries:?}");
+    }
+
     #[test]
     fn entries_page_by_after_and_limit() {
         let (dir, s) = store();

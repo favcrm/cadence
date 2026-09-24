@@ -8176,18 +8176,31 @@ fn quotable(token: &str) -> bool {
     token.len() >= 16
 }
 
-/// Withhold `tokens` from `value` (CAD-375): a `turn_id` field holding
-/// one becomes `null`; any string that IS or quotes a [`quotable`]
-/// token has it masked (`null` when it is the whole string). A short
-/// schemeless token (a codex `t-1`, a fake `fake-turn-1`) is withheld
-/// only as a `turn_id` value — elsewhere the same text is someone
-/// else's data (a message id, `fake-turn-10`).
+/// Fields that name a record, never a credential: withholding touches
+/// none of them, even when an id happens to equal a token's text (a
+/// caller-chosen message id may be anything).
+const ID_FIELDS: &[&str] = &[
+    "id",
+    "message",
+    "message_id",
+    "dispatch_message",
+    "request",
+    "task",
+    "task_id",
+    "job",
+    "alias",
+];
+
+/// Withhold `tokens` from `value` (CAD-375). Only token-bearing places
+/// change: a `turn_id` field holding one becomes `null`, and prose (any
+/// other string field, never an [`ID_FIELDS`] one) quoting a
+/// [`quotable`] token has it masked. A short schemeless token (a codex
+/// `t-1`, a fake `fake-turn-1`) is withheld only as a `turn_id` value —
+/// elsewhere the same text is someone else's data.
 fn redact_tokens(value: &mut Value, tokens: &[&str]) {
     match value {
         Value::String(text) => {
-            if tokens.iter().any(|t| quotable(t) && t == text) {
-                *value = Value::Null;
-            } else if tokens.iter().any(|t| quotable(t) && text.contains(t)) {
+            if tokens.iter().any(|t| quotable(t) && text.contains(t)) {
                 let mut masked = text.clone();
                 for token in tokens.iter().filter(|t| quotable(t)) {
                     masked = masked.replace(token, "[turn token withheld]");
@@ -8198,9 +8211,11 @@ fn redact_tokens(value: &mut Value, tokens: &[&str]) {
         Value::Array(items) => items.iter_mut().for_each(|v| redact_tokens(v, tokens)),
         Value::Object(map) => {
             for (key, v) in map.iter_mut() {
-                if key == "turn_id" && v.as_str().is_some_and(|t| tokens.contains(&t)) {
-                    *v = Value::Null;
-                } else {
+                if key == "turn_id" {
+                    if v.as_str().is_some_and(|t| tokens.contains(&t)) {
+                        *v = Value::Null;
+                    }
+                } else if !(ID_FIELDS.contains(&key.as_str()) && v.is_string()) {
                     redact_tokens(v, tokens);
                 }
             }
@@ -9526,6 +9541,18 @@ mod tests {
         let mut row = json!({"id": "t-1", "turn_id": "t-1"});
         redact_tokens(&mut row, &["t-1"]);
         assert_eq!(row, json!({"id": "t-1", "turn_id": null}));
+        // An id equal to a (long) token's text is still an id: only the
+        // token-bearing field and prose change (review, CI 35936820152).
+        let mut row = json!({"id": tok, "message": tok, "message_id": tok,
+                             "entries": [{"message": tok, "text": format!("see {tok}")}],
+                             "turn_id": tok});
+        redact_tokens(&mut row, &[tok]);
+        assert_eq!(row["id"], tok);
+        assert_eq!(row["message"], tok);
+        assert_eq!(row["message_id"], tok);
+        assert_eq!(row["entries"][0]["message"], tok);
+        assert_eq!(row["entries"][0]["text"], "see [turn token withheld]");
+        assert!(row["turn_id"].is_null(), "{row}");
         let all = withhold_all_turn_ids(json!({"m": [{"turn_id": "x", "id": "m1"}]}));
         assert!(all["m"][0]["turn_id"].is_null() && all["m"][0]["id"] == "m1");
     }
