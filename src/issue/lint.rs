@@ -24,6 +24,18 @@ impl Lint {
 }
 
 pub fn run(pm: &Pm, only_project: Option<&str>) -> Result<Value> {
+    run_with(pm, only_project, None)
+}
+
+/// [`run`] with the operator's work-gate approvals when the caller has
+/// them (`issue lint` asks the daemon). Without them (the commit hook,
+/// sync, doctor) custom gate keys are warned about as possibly
+/// unapproved and stages are checked against the file's own list.
+pub fn run_with(
+    pm: &Pm,
+    only_project: Option<&str>,
+    approvals: Option<&crate::issue::work::Approvals>,
+) -> Result<Value> {
     let mut lint = Lint {
         errors: vec![],
         warnings: vec![],
@@ -41,6 +53,44 @@ pub fn run(pm: &Pm, only_project: Option<&str>) -> Result<Value> {
                 ));
             }
         }
+    }
+    // CAD-405: a malformed PROJECT.md is a warning — readers fall back
+    // to the default stages and stage moves refuse until it is fixed.
+    let mut work_configs: HashMap<String, crate::issue::work::WorkConfig> = HashMap::new();
+    for project in &projects {
+        use crate::issue::work;
+        let (raw, err) = work::load_config_or_default(&pm.dir, &project.key);
+        if let Some(err) = err {
+            lint.warn(format!(
+                "{}/PROJECT.md: {err} — the default stages apply",
+                project.key
+            ));
+        }
+        // Gate keys differing from the defaults take effect only once the
+        // operator approves them.
+        let cfg = match approvals {
+            Some(a) => {
+                let (cfg, note) =
+                    work::effective(&project.key, raw, a.get(&project.key).map(String::as_str));
+                if let Some(note) = note {
+                    lint.warn(note);
+                }
+                cfg
+            }
+            None => {
+                if !work::gates_default(&raw) {
+                    lint.warn(format!(
+                        "{}/PROJECT.md: stages/operator_stages differ from the defaults — they \
+                         apply only if the operator approved exactly these ({}); \
+                         `cadence issue lint` checks the approval",
+                        project.key,
+                        work::gate_digest(&raw)
+                    ));
+                }
+                raw
+            }
+        };
+        work_configs.insert(project.key.clone(), cfg);
     }
     let mut fronts: HashMap<String, (String, model::Front, String)> = HashMap::new();
     for project in &projects {
@@ -207,6 +257,46 @@ pub fn run(pm: &Pm, only_project: Option<&str>) -> Result<Value> {
                 lint.err(format!("{id}: unknown size '{size}' — S, M or L"));
             }
         }
+        // CAD-405 work-model fields. A bad `type` or milestone id is an
+        // error like a bad status; a mismatch with PROJECT.md (which can
+        // change under existing issues) only warns.
+        if let Some(t) = &front.item_type {
+            if !model::TYPES.contains(&t.as_str()) {
+                lint.err(format!(
+                    "{id}: unknown type '{t}' — one of {}",
+                    model::TYPES.join(" ")
+                ));
+            }
+        }
+        if let Some(m) = &front.milestone {
+            if !model::valid_tag(m) {
+                lint.err(format!("{id}: bad milestone grammar '{m}'"));
+            }
+        }
+        if let Some(cfg) = work_configs.get(project_key) {
+            if let Some(stage) = &front.stage {
+                if cfg.index(stage).is_none() {
+                    lint.warn(format!(
+                        "{id}: stage '{stage}' is not in {project_key}'s list ({})",
+                        cfg.stage_ids().join(" ")
+                    ));
+                }
+            }
+            if let Some((m, _)) = model::milestone_of(front) {
+                if !cfg.milestones.is_empty() && !cfg.milestones.iter().any(|d| d.id == m) {
+                    lint.warn(format!(
+                        "{id}: milestone '{m}' is not declared in {project_key}/PROJECT.md"
+                    ));
+                }
+            }
+        }
+        if let Some(at) = &front.stage_at {
+            if crate::issue::time::parse_iso(at).is_none() {
+                lint.warn(format!(
+                    "{id}: stage_at '{at}' is not RFC 3339 UTC — time in stage is unknown"
+                ));
+            }
+        }
         for r in &front.refs {
             if !model::REF_KINDS.contains(&r.kind.as_str()) {
                 lint.err(format!("{id}: unknown ref kind '{}'", r.kind));
@@ -279,6 +369,26 @@ pub fn run(pm: &Pm, only_project: Option<&str>) -> Result<Value> {
                     open.join(", ")
                 ));
             }
+        }
+    }
+
+    // CAD-405: a stage belongs to an epic; an explicit non-epic type on
+    // an issue with children contradicts the tree.
+    let parents: HashSet<&str> = fronts
+        .values()
+        .filter_map(|(_, f, _)| f.parent.as_deref())
+        .collect();
+    for (id, (_, front, _)) in &fronts {
+        let kind = model::item_type(front, parents.contains(id.as_str()));
+        if kind != "epic" && front.stage.is_some() {
+            lint.warn(format!(
+                "{id}: has a stage but is a {kind} — only epics have stages"
+            ));
+        }
+        if kind != "epic" && parents.contains(id.as_str()) {
+            lint.warn(format!(
+                "{id}: type '{kind}' but has children — epics hold tasks"
+            ));
         }
     }
 

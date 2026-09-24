@@ -109,11 +109,25 @@ cadence issue ls [--project p] [--ready] [--json]
                                             # its children, --open = not done or
                                             # dropped; an aligned table without --json
 cadence issue epic ls [--project p] [--json]
-                                            # epics = issues with children: total,
-                                            # counts per status, done_ratio (done ÷
-                                            # total − dropped), blocked, owners
+                                            # epics = type: epic, or issues with
+                                            # children: total, counts per status,
+                                            # done_ratio (done ÷ total − dropped),
+                                            # blocked, owners + a `work` block:
+                                            # stage, size-weighted progress, health
 cadence issue epic show CAD-38 [--json]     # the epic's row + its children:
-                                            # status, owner, priority, tags
+                                            # status, owner, priority, tags; stage
+                                            # exit criterion and health reasons
+cadence issue epic stage CAD-38 verify [--note why]
+                                            # CAD-405 stage move via the daemon: one
+                                            # commit; one stage forward, any back;
+                                            # forward into build/release = operator
+cadence issue project approve-work <key>    # CAD-405, operator only: PROJECT.md
+                                            # stages/operator_stages take effect
+                                            # only while they match this approval
+cadence milestone ls|show [m2] [--project p] [--json]
+                                            # milestones (PROJECT.md, `milestone:`
+                                            # or an m<n>-… tag) with rolled-up
+                                            # weighted progress and health
 cadence issue ls --at <rev> [--project p] [--json]
                                             # the board as it was at <rev> —
                                             # cards report status_source: file
@@ -919,8 +933,8 @@ quick-add, drag, edit, link/ref, attach and comment controls.
 | `GET /api/health` | `ok`, `pm_dir`, `pm_present`, counts, `daemon`, `embedded` |
 | `GET /api/meta` | `read_only`, `actor` (the request's resolved write identity), `tailnet_proof` (`null`, or whether the tailnet proxy was proven and which check refused), `tailnet_url`, the serving binary's `version`/`build_commit`/`build_time`, plus the daemon's `daemon_info` when reachable |
 | `GET /api/projects` | folders, prefixes, components, declared tags, repos, issue counts |
-| `GET /api/issues?project=` | card views: derived status, readiness, `tags`, counts, `rev`. The `issue ls` filters, combinable: `tag=` (repeat or comma-join — all of), `status=` (repeat or comma-join — any of), `epic=<ID>`, `owner=`, `component=`, `priority=`, `open=1`; `400` on a value that could never match (unknown status/priority, bad tag or id grammar) |
-| `GET /api/epics?project=` | issues with children — the `issue epic ls --json` payload: `total`, `counts` per status, `done_ratio`, `blocked`, `owners`, `children` |
+| `GET /api/issues?project=` | card views: derived status, readiness, `tags`, counts, `rev`, the CAD-405 `work` block (type, milestone, size/weight; stage, progress and health on epics). The `issue ls` filters, combinable: `tag=` (repeat or comma-join — all of), `status=` (repeat or comma-join — any of), `epic=<ID>`, `owner=`, `component=`, `priority=`, `open=1`; `400` on a value that could never match (unknown status/priority, bad tag or id grammar) |
+| `GET /api/epics?project=` | epics (`type: epic` or issues with children) — the `issue epic ls --json` payload: `total`, `counts` per status, `done_ratio`, `blocked`, `owners`, `children`, and the CAD-405 `work` block (stage, weighted progress, health — docs/design/WORK-MODEL.md) |
 | `GET /api/issues/:id` | the drawer payload: frontmatter, body, links both ways, refs, files, comments, notes chain, merged activity |
 | `GET /api/issues/:id/file` | raw `issue.md`, `text/markdown` |
 | `GET /api/issues/:id/activity` | the merged activity stream only |
