@@ -197,34 +197,10 @@ impl Shared {
         pr: &str,
         held: &[(String, String)],
     ) -> Result<Option<String>> {
-        let Some(key) = delivery::pr_ref(pr) else {
-            return Ok(Some(format!(
-                "names `pr: {pr}`, which is not a pull request URL"
-            )));
-        };
-        let (slug, _) = task_report::parse_pr_url(pr)?;
-        let want = crate::issue::project::normalize_remote(&format!("github.com/{slug}"))
-            .to_ascii_lowercase();
-        let project = crate::issue::project::list(&pm.dir)?
-            .into_iter()
-            .find(|p| p.key == rec.project);
-        let remotes: Vec<String> = project
-            .iter()
-            .flat_map(|p| p.repos.iter())
-            .filter_map(|r| r.remote.as_deref())
-            .map(|r| crate::issue::project::normalize_remote(r).to_ascii_lowercase())
-            .collect();
-        if !remotes.contains(&want) {
-            let listed = if remotes.is_empty() {
-                "none — `repos[].remote` is unset".to_string()
-            } else {
-                remotes.join(", ")
-            };
-            return Ok(Some(format!(
-                "names {key}, which is not a repo of project {} (its remotes: {listed})",
-                rec.project
-            )));
+        if let Some(why) = delivery::project_pr_refusal(&pm.dir, &rec.project, pr)? {
+            return Ok(Some(why));
         }
+        let key = delivery::pr_ref(pr).unwrap_or_default();
         if let Some((other, _)) = held.iter().find(|(i, k)| *k == key && *i != rec.issue) {
             return Ok(Some(format!(
                 "names {key}, which ticket {other} already holds in the review loop"

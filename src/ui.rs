@@ -33,6 +33,7 @@ use crate::error::{Error, Result};
 use crate::issue::{board, context, history, model, project, write as issue_write, Pm};
 use crate::proc::{self, BoundedError};
 
+pub mod delivery_sync;
 mod home;
 mod read_model;
 mod stages;
@@ -229,6 +230,13 @@ pub struct ServeOpts {
     /// `gh` on PATH when `None`. Never set from the command line —
     /// tests inject a fake.
     pub gh: Option<PathBuf>,
+    /// The board's delivery-sync period (CAD-446), [`delivery_sync::EVERY`]
+    /// when `None`, clamped to its bounds. Never set from the command
+    /// line — tests shorten it.
+    pub delivery_sync_every: Option<Duration>,
+    /// This board process's delivery sync. [`serve`] always replaces it
+    /// (with `None` on a read-only board); never a caller's.
+    pub delivery_sync: Option<std::sync::Arc<delivery_sync::DeliverySync>>,
 }
 
 fn opts_file(state_dir: &Path) -> PathBuf {
@@ -384,6 +392,8 @@ fn serve_opts(eff: &UiOpts) -> Result<ServeOpts> {
         tailscaled_socket: None,
         tailnet_latch: Default::default(),
         gh: None,
+        delivery_sync_every: None,
+        delivery_sync: None,
     })
 }
 
@@ -2449,10 +2459,24 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
             };
             send(request, resp);
         }
-        "/api/overview" => send(
-            request,
-            json_response(read_model::get(state_dir, pm_dir).overview()),
-        ),
+        "/api/overview" => {
+            let mut overview = read_model::get(state_dir, pm_dir).overview();
+            // CAD-446: a page view asks for a delivery sync (bounded,
+            // never during a back-off) and shows the sync's problem.
+            if let Some(sync) = &opts.delivery_sync {
+                sync.nudge();
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                if let (Some(row), Some(needs)) =
+                    (sync.needs_row(now), overview["needs_me"].as_array_mut())
+                {
+                    needs.push(row);
+                }
+            }
+            send(request, json_response(overview))
+        }
         "/api/projects" => match Pm::at(pm_dir) {
             Ok(pm) => {
                 let projects = project::list(&pm.dir).unwrap_or_default();
@@ -2920,9 +2944,23 @@ pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
     } else {
         Default::default()
     };
-    let opts = &opts;
     let server = Server::http(format!("{}:{}", opts.host, opts.port))
         .map_err(|e| Error::internal(format!("ui bind {}:{}: {e}", opts.host, opts.port)))?;
+    // CAD-446: merge decisions appear without a terminal — this process
+    // (the operator's, when it proves so) reads the loop's PRs with the
+    // operator's `gh`. Started only once the port is ours; a read-only
+    // board writes nothing, observations included.
+    opts.delivery_sync = (!opts.read_only).then(|| {
+        delivery_sync::start(
+            state_dir,
+            pm_dir,
+            opts.delivery_sync_every,
+            opts.gh
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(crate::delivery::GH)),
+        )
+    });
+    let opts = &opts;
     eprintln!("cadence ui listening on http://{}:{}", opts.host, opts.port);
     for request in server.incoming_requests() {
         // Thread per request: `/api/stream` holds its connection open

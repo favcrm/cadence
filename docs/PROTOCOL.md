@@ -2071,7 +2071,25 @@ router never routes a `verdict` file it finds under `reports/`.
 
 The daemon never runs `gh`, and no agent environment needs GitHub
 credentials for the loop. `cadence delivery sync --watch <secs>` keeps
-the observations current. The board's `POST /api/delivery/<ID>/merge`
+the observations current from a terminal; the board keeps them current
+without one (CAD-446). A writable board process runs the same read with
+the operator's `gh` on a timer (60 s; the first pass one interval after
+start) and when a page loads `/api/overview` (at most every 15 s):
+- it reads only loops whose PR GitHub can change — `reviewing`,
+  `passed`, `enqueued`, or auto-merge to turn off; with none, it runs
+  no `gh` and no operator check;
+- before any `gh` call it proves its own process is the operator's (the
+  proof the daemon runs on its connection); a board an agent started
+  runs no `gh` for the loop;
+- each PR must be in its ticket's project remotes;
+- one pass in flight, at most 20 PRs a pass (least recently observed
+  first); a failed pass doubles the wait, up to 15 minutes, and a page
+  view never cuts a back-off short;
+- a failing or unprovable pass is one Needs-you `info` row, `kind:
+  delivery_sync` (one line, bounded, secret-redacted text; command
+  `cadence delivery sync`), until a pass succeeds.
+It never merges: that stays the operator's Merge. A read-only board
+runs no sync. The board's `POST /api/delivery/<ID>/merge`
 (`{}`) and `POST /api/delivery/<ID>/decline` (`{"reason"}`) keep the
 operator rule of the chat-first Home (CAD-328): an agent-attributed
 request gets 403 and anything short of positive operator proof on the
