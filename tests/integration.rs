@@ -51268,4 +51268,306 @@ fn cad324_compaction_pack_survives_a_daemon_restart() {
     )
     .unwrap();
     assert_eq!(result_text(&d, "lead", "s3"), "FAKE_REPLY: and then");
+
+// ---- CAD-378: code-area owners and advisory path leases ----
+
+/// The `areas:` fixture: `caller` (src/peer.rs + src/daemon/) owned by
+/// the PM `pm-own`, at most one open PR.
+const CAD378_AREAS: &str =
+    "---\nproject: demo\nareas:\n  caller:\n    paths: [src/peer.rs, src/daemon/]\n    \
+     owner: pm-own\n    max_open_prs: 1\n---\n# Demo\n";
+
+impl PlanFixture {
+    /// `issue new` + `issue set paths=` + `issue start --by <pm>`; the
+    /// start's JSON.
+    fn cad378_lane(&self, title: &str, id: &str, paths: &str, by: &str) -> Value {
+        let (ok, out) = self.cli(&["issue", "new", title, "--project", "demo"]);
+        assert!(ok, "{out}");
+        let (ok, out) = self.cli(&["issue", "set", id, &format!("paths={paths}")]);
+        assert!(ok, "{out}");
+        let (ok, out) = self.cli(&["issue", "start", id, "--by", by]);
+        assert!(ok, "start never refuses on a lease: {out}");
+        out
+    }
+
+    /// Commit `file` in a lane's worktree (fixture identity).
+    fn cad378_commit(&self, worktree: &str, file: &str) {
+        let wt = Path::new(worktree);
+        std::fs::create_dir_all(wt.join(file).parent().unwrap()).unwrap();
+        std::fs::write(wt.join(file), "change\n").unwrap();
+        for args in [
+            vec!["add", "-A"],
+            vec![
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "lane change",
+            ],
+        ] {
+            let o = std::process::Command::new("git")
+                .arg("-C")
+                .arg(wt)
+                .args(&args)
+                .output()
+                .unwrap();
+            assert!(o.status.success(), "git {args:?}: {o:?}");
+        }
+    }
+
+    /// The overview's `area_ack` rows (a merged row counts by its causes).
+    fn cad378_ack_rows(&self) -> Vec<Value> {
+        let (ok, view) = self.cli(&["overview", "--json"]);
+        assert!(ok, "{view}");
+        view["needs_me"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| {
+                r["kind"] == "area_ack"
+                    || r["causes"]
+                        .as_array()
+                        .is_some_and(|cs| cs.iter().any(|c| c["cause"] == "area_ack"))
+            })
+            .cloned()
+            .collect()
+    }
+}
+
+fn cad378_kinds(start: &Value) -> Vec<String> {
+    start["leases"]["warnings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no leases block: {start}"))
+        .iter()
+        .map(|w| w["kind"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// `issue start` (and so `dispatch`, which runs it) warns — never
+/// refuses — when the ticket's planned paths overlap an open lane's
+/// planned or ACTUAL changed paths (naming its ticket, worker and PR),
+/// touch an area owned by another PM, or touch an area already at
+/// `max_open_prs`. The warnings are recorded on the issue as a `lease`
+/// comment. The owner's own lane starts silently.
+#[test]
+fn cad378_start_warns_on_overlap_owner_and_capacity() {
+    let f = PlanFixture::start();
+    std::fs::write(f.pm_dir.join("demo/PROJECT.md"), CAD378_AREAS).unwrap();
+    // The owner's lane: no warning, no lease comment.
+    let d1 = f.cad378_lane("Owner work", "D-1", "src/daemon/caller_rule.rs", "pm-own");
+    assert_eq!(cad378_kinds(&d1), Vec::<String>::new(), "{d1}");
+    assert_eq!(d1["leases"]["areas"][0]["name"], "caller", "{d1}");
+    // It actually changes src/peer.rs — never planned — and has a PR.
+    f.cad378_commit(d1["worktree"].as_str().unwrap(), "src/peer.rs");
+    let (ok, out) = f.cli(&["issue", "ref", "D-1", "pr", "https://github.com/o/r/pull/7"]);
+    assert!(ok, "{out}");
+
+    // Another PM plans src/peer.rs: overlap with D-1's CHANGED file,
+    // a foreign owner, and the area is full (1 open of max 1).
+    let d2 = f.cad378_lane("Other work", "D-2", "src/peer.rs", "pm-other");
+    let mut kinds = cad378_kinds(&d2);
+    kinds.sort();
+    assert_eq!(kinds, ["capacity", "overlap", "owned"], "{d2}");
+    let text = d2["leases"]["warnings"].to_string();
+    for want in [
+        "D-1",
+        "worker pm-own",
+        "https://github.com/o/r/pull/7",
+        "owned by pm-own",
+        "max_open_prs 1",
+    ] {
+        assert!(text.contains(want), "wanted '{want}': {text}");
+    }
+    assert_eq!(f.front("D-2").status, "doing", "the start went ahead");
+    let (_, show) = f.cli(&["issue", "show", "D-2", "--json"]);
+    let lease = show["comments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["kind"] == "lease")
+        .unwrap_or_else(|| panic!("no lease comment: {show}"));
+    assert!(lease.to_string().contains("owned by pm-own"), "{lease}");
+
+    // A plain overlap on D-2's PLANNED path outside every area: only
+    // the overlap warns.
+    let d3 = f.cad378_lane("Third", "D-3", "src/", "pm-other");
+    let kinds = cad378_kinds(&d3);
+    assert!(kinds.contains(&"overlap".to_string()), "{d3}");
+    let text = d3["leases"]["warnings"].to_string();
+    assert!(text.contains("D-2") && text.contains("D-1"), "{text}");
+    // No planned paths: nothing to check, nothing warned.
+    let (ok, _) = f.cli(&["issue", "new", "Unplanned", "--project", "demo"]);
+    assert!(ok);
+    let (ok, d4) = f.cli(&["issue", "start", "D-4", "--by", "pm-other"]);
+    assert!(ok, "{d4}");
+    assert_eq!(cad378_kinds(&d4), Vec::<String>::new(), "{d4}");
+}
+
+/// A malformed `areas:` block is a clear error: lint warns, the start
+/// reports it in `leases.config_error` and still goes ahead, the
+/// overview surfaces `areas_error`, and an ack refuses naming it.
+#[test]
+fn cad378_bad_areas_config_is_reported_not_fatal() {
+    let f = PlanFixture::start();
+    std::fs::write(
+        f.pm_dir.join("demo/PROJECT.md"),
+        "---\nareas:\n  caller:\n    paths: [src/daemon.rs#slot_identity]\n    owner: pm-own\n---\n",
+    )
+    .unwrap();
+    let (ok, lint) = f.cli(&["issue", "lint"]);
+    assert!(ok, "a bad area config is a warning: {lint}");
+    let warnings = lint["warnings"].to_string();
+    assert!(
+        warnings.contains("PROJECT.md areas") && warnings.contains("file-level globs only"),
+        "{lint}"
+    );
+    let (ok, out) = f.cli(&["issue", "new", "Work", "--project", "demo"]);
+    assert!(ok, "{out}");
+    let (ok, out) = f.cli(&["issue", "set", "D-1", "paths=src/daemon.rs"]);
+    assert!(ok, "{out}");
+    let (ok, start) = f.cli(&["issue", "start", "D-1", "--by", "pm-other"]);
+    assert!(ok, "{start}");
+    assert!(
+        start["leases"]["config_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("file-level globs only")),
+        "{start}"
+    );
+    let (ok, view) = f.cli(&["overview", "--json"]);
+    assert!(ok, "{view}");
+    let demo = view["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["key"] == "demo")
+        .unwrap();
+    assert!(
+        demo["areas_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("PROJECT.md areas")),
+        "{demo}"
+    );
+    let err =
+        f.d.operator_rpc("area_ack", json!({"issue": "D-1", "area": "caller"}))
+            .unwrap_err()
+            .to_string();
+    assert!(err.contains("file-level globs only"), "{err}");
+    // A symbol-level planned path is refused at the field too.
+    let (ok, err) = f.cli(&["issue", "set", "D-1", "paths=src/daemon.rs#slot_identity"]);
+    assert!(!ok && err.to_string().contains("file-level"), "{err}");
+}
+
+/// A lane with a PR that changes files in an area owned by someone
+/// else is a Needs-you `area_ack` row, for the owner's PM, until the
+/// owner acks it through the daemon. Adversarial: a tracker comment of
+/// kind `ack` authored as the owner, another agent (the lane's worker
+/// PM), a forged identity field, and the owner's own detached children
+/// (env kept or scrubbed) all leave the row up and write no ack. Only
+/// the owner PM's own connection — or the operator — clears it.
+#[test]
+fn cad378_area_ack_row_needs_the_owner() {
+    let f = PlanFixture::start();
+    std::fs::write(f.pm_dir.join("demo/PROJECT.md"), CAD378_AREAS).unwrap();
+    let d1 = f.cad378_lane("Foreign work", "D-1", "src/peer.rs", "pm-other");
+    f.cad378_commit(
+        d1["worktree"].as_str().unwrap(),
+        "src/daemon/caller_rule.rs",
+    );
+    // No PR yet: no row.
+    assert!(f.cad378_ack_rows().is_empty());
+    let (ok, out) = f.cli(&["issue", "ref", "D-1", "pr", "https://github.com/o/r/pull/9"]);
+    assert!(ok, "{out}");
+    let rows = f.cad378_ack_rows();
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    let row = rows[0].to_string();
+    for want in [
+        "D-1",
+        "caller",
+        "pm-own",
+        "src/daemon/caller_rule.rs",
+        "cadence issue ack D-1 --area caller",
+    ] {
+        assert!(row.contains(want), "wanted '{want}': {row}");
+    }
+    // The overlay lists the lane in the area.
+    let (_, view) = f.cli(&["overview", "--json"]);
+    let lanes = view["projects"][0]["lanes"].clone();
+    assert_eq!(lanes[0]["issue"], "D-1", "{lanes}");
+    assert_eq!(lanes[0]["areas"], json!(["caller"]), "{lanes}");
+
+    // A forged tracker ack — authored as the owner — changes nothing.
+    let (ok, out) = f.cli(&[
+        "issue",
+        "comment",
+        "D-1",
+        "--kind",
+        "ack",
+        "--author",
+        "pm-own",
+        "-m",
+        "ack caller",
+    ]);
+    assert!(ok, "{out}");
+    assert_eq!(f.cad378_ack_rows().len(), 1, "a comment is not an ack");
+
+    let refused = |r: &Value, why: &str, what: &str| {
+        assert_eq!(r["ok"], false, "{what}: {r}");
+        let msg = r["error"]["message"].as_str().unwrap_or_default();
+        assert!(msg.contains(why), "{what}: wanted '{why}': {r}");
+    };
+    let ack = json!({"issue": "D-1", "area": "caller"});
+    // Another agent — here the lane's own PM — is refused, with or
+    // without a forged identity field.
+    let mut other = ManagedWorker::start(&f.d, "pm-other");
+    refused(
+        &other.rpc("self", "area_ack", ack.clone()),
+        "only its owner PM",
+        "other agent",
+    );
+    for field in ["by", "owner", "actor"] {
+        let mut forged = ack.clone();
+        forged[field] = json!("pm-own");
+        refused(
+            &other.rpc("self", "area_ack", forged),
+            "connection-bound",
+            field,
+        );
+    }
+    // The owner's detached children are neither the owner nor the
+    // operator.
+    let mut owner = ManagedWorker::start(&f.d, "pm-own");
+    for how in ["detached", "detached-bare"] {
+        refused(
+            &owner.rpc(how, "area_ack", ack.clone()),
+            "not provably the operator",
+            how,
+        );
+    }
+    // The CLI from a process that is neither is refused too.
+    let (ok, err) = f.cli(&["issue", "ack", "D-1", "--area", "caller"]);
+    assert!(!ok, "{err}");
+    assert!(!areas_acks_file(&f).exists(), "no refusal wrote an ack");
+    assert_eq!(f.cad378_ack_rows().len(), 1);
+
+    // The owner PM's own connection acks; the row clears.
+    let r = owner.rpc("self", "area_ack", ack.clone());
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(r["result"]["by"], "pm-own", "{r}");
+    assert!(f.cad378_ack_rows().is_empty(), "the ack clears the row");
+    assert_eq!(f.daemon_events("area_acked").len(), 1);
+    // The operator may ack too.
+    let out = f.d.operator_rpc("area_ack", ack).unwrap();
+    assert_eq!(out["by"], "operator", "{out}");
+    // An unknown area names the known ones.
+    let err =
+        f.d.operator_rpc("area_ack", json!({"issue": "D-1", "area": "nope"}))
+            .unwrap_err()
+            .to_string();
+    assert!(err.contains("known: caller"), "{err}");
+}
+
+fn areas_acks_file(f: &PlanFixture) -> PathBuf {
+    cadence_agent::issue::areas::acks_path(&f.d.state)
 }

@@ -253,6 +253,19 @@ pub enum IssueAction {
         #[arg(long, value_name = "REASON")]
         take_over: Option<String>,
     },
+    /// Ack a lane's change to a code area its PROJECT.md `areas:` gives
+    /// to another owner (CAD-378): clears that Needs-you row. The daemon
+    /// binds the acker from the connection — only the area's owner PM
+    /// (from its own pane or endpoint) or the operator may.
+    Ack {
+        id: String,
+        /// The area name, as the Needs-you row names it.
+        #[arg(long)]
+        area: String,
+        /// One line on what was agreed.
+        #[arg(long)]
+        note: Option<String>,
+    },
     /// Give up a claim (CAD-383): clears the claim, and owner when it is
     /// the releaser; status is left alone. Only a holder may release.
     Release {
@@ -1027,6 +1040,10 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             if let Some(w) = out["claim"]["warning"].as_str() {
                 eprintln!("warning: {w}");
             }
+            // CAD-378: advisory lease warnings.
+            for line in crate::issue::areas::warning_lines(&out["leases"]) {
+                eprintln!("warning: {line}");
+            }
             print_json(&out);
             Ok(0)
         }
@@ -1049,6 +1066,15 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 eprintln!("warning: {w}");
             }
             print_json(&out);
+            Ok(0)
+        }
+        IssueAction::Ack { id, area, note } => {
+            model::check_id(id)?;
+            print_json(&crate::client::rpc(
+                state_dir,
+                "area_ack",
+                json!({"issue": id, "area": area, "note": note}),
+            )?);
             Ok(0)
         }
         IssueAction::Release { id, by, note } => {

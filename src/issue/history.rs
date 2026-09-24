@@ -27,6 +27,7 @@ const FIELD_ORDER: &[&str] = &[
     "claim",
     "component",
     "tags",
+    "paths",
     "parent",
     "blocked_by",
     "relates",

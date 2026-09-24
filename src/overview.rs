@@ -2981,6 +2981,14 @@ fn overview_from(
         }
         // CAD-383: in-flight claims per project, with their age.
         let claim_clock = claim::Clock::new(line_times.as_ref());
+        // CAD-378: the review loop's recorded PR per issue, for lanes
+        // whose tracker carries no `pr` ref.
+        let delivery_prs: std::collections::BTreeMap<String, String> =
+            crate::delivery::records(state_dir)
+                .into_values()
+                .filter(|r| !r.state.terminal())
+                .filter_map(|r| r.pr.map(|pr| (r.issue, pr)))
+                .collect();
         for p in &projects {
             if opts.scope.project.as_deref().is_some_and(|k| k != p.key) {
                 continue;
@@ -3013,11 +3021,51 @@ fn overview_from(
                     oldest_review = Some(oldest_review.map_or(age, |o| o.max(age)));
                 }
             }
+            // CAD-378: open lanes, the code areas they plan or change,
+            // and overlaps (the board's overlay); a lane with a PR that
+            // changes an area owned by someone else is a Needs-you row
+            // until the owner's PM or the operator acks it.
+            let (areas, areas_error) = issue::areas::load_or_error(&pm.dir, &p.key);
+            let project_issues: Vec<&issue::board::Issue> = views
+                .iter()
+                .filter(|v| v.issue.project == p.key)
+                .map(|v| &v.issue)
+                .collect();
+            let lanes = issue::areas::open_lanes(&project_issues, &delivery_prs);
+            let acks = issue::areas::acks(state_dir);
+            let has_pr = |l: &issue::areas::Lane| {
+                let prefix = crate::worktree::layout::issue_branch_prefix(&l.issue);
+                open_pr_branches.iter().any(|b| b.starts_with(&prefix))
+            };
+            for need in issue::areas::ack_needs(&areas, &lanes, &acks, has_pr) {
+                let owner = need.area.pm.clone();
+                let mut row = item(
+                    28,
+                    "area_ack",
+                    &need.title(),
+                    0,
+                    &need.project,
+                    need.pr.as_deref(),
+                    &issue::areas::cmd_ack(&need.issue, &need.area.name),
+                )
+                .about("issue", &need.issue)
+                .for_agent(owner.as_deref().unwrap_or_default())
+                .owned_by(Some(owner.as_deref().unwrap_or(inbox::OPERATOR)));
+                row.json["area"] = json!({
+                    "issue": need.issue, "area": need.area.name, "owner": need.area.owner(),
+                    "pm": need.area.pm, "files": need.files, "pr": need.pr,
+                    "worker": need.worker,
+                });
+                needs.push(row);
+            }
             projects_out.push(json!({
                 "key": p.key,
                 "open_by_status": open_by_status,
                 "oldest_review_age": oldest_review,
                 "claims": claims,
+                "lanes": issue::areas::overlay(&areas, &lanes),
+                "areas": areas.iter().map(|a| a.name.clone()).collect::<Vec<_>>(),
+                "areas_error": areas_error,
             }));
         }
         // Tracker behind its upstream — local refs only, never a fetch.

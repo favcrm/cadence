@@ -875,6 +875,12 @@ fn apply_pairs(
                 changed.push(format!("tags={}", front.tags.join(",")));
                 continue;
             }
+            // CAD-378: advisory planned paths; an empty value clears.
+            "paths" => {
+                front.paths = crate::issue::areas::parse_paths(value)?;
+                changed.push(format!("paths={}", front.paths.join(",")));
+                continue;
+            }
             // CAD-405: an empty value clears each of these.
             "type" => {
                 if !value.is_empty() {

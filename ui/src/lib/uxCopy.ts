@@ -16,6 +16,7 @@ const KIND_LABEL: Record<string, string> = {
   inbox_unread: "inbox",
   inbox_stale: "stale inbox",
   tracker_behind: "behind",
+  area_ack: "area ack",
 };
 
 /**

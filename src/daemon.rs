@@ -26,6 +26,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 mod answer_rpc;
+mod area_rpc;
 mod caller_rule;
 mod delivery_rpc;
 mod master_rpc;
@@ -2500,6 +2501,7 @@ impl Shared {
             "epic_stage" => self.rpc_epic_stage(params, peer_pid),
             "project_work_approve" => self.rpc_project_work_approve(params, peer_pid),
             "project_new" => self.rpc_project_new(params, peer_pid),
+            "area_ack" => self.rpc_area_ack(params, peer_pid),
             "rollout_grant" => self.rpc_rollout_grant(params, peer_pid),
             "rollout_revoke" => self.rpc_rollout_revoke(params, peer_pid),
             "project_work_approvals" => Ok(json!({

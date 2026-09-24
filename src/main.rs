@@ -6727,6 +6727,11 @@ fn run() -> Result<i32> {
             if let Some(warning) = out["acceptance"]["warning"].as_str() {
                 eprintln!("warning: {warning}");
             }
+            // CAD-378: overlapping lanes, owned or full code areas —
+            // advisory only.
+            for line in cadence_agent::issue::areas::warning_lines(&out["leases"]) {
+                eprintln!("warning: {line}");
+            }
             print_json(&out);
             Ok(0)
         }

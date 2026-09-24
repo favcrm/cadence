@@ -686,6 +686,7 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
         "slot_env": started["slot_env"],
         "acceptance": acceptance,
         "claim": started["claim"],
+        "leases": started["leases"],
     });
     if let Some(msg) = live {
         out["dispatched"] = json!(false);
@@ -1066,6 +1067,11 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
              the onboarding text; the bootstrap turn delivers it again."
         )),
         _ => {}
+    }
+    // CAD-378: the advisory lease warnings, recorded with the dispatch
+    // they were raised on — never a refusal.
+    for line in crate::issue::areas::warning_lines(&started["leases"]) {
+        comment_text.push_str(&format!("\nLease warning: {line}"));
     }
     let comment = write::add_comment(pm, id, &comment_text, None, Some("dispatch"), None, actor)?;
 
