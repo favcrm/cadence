@@ -8202,8 +8202,13 @@ impl Drop for UiProc {
     }
 }
 
-#[allow(clippy::zombie_processes)] // UiProc's Drop kills + waits.
 fn spawn_ui(pm: &Path, state: &Path) -> (u16, UiProc) {
+    spawn_ui_env(pm, state, &[])
+}
+
+/// `spawn_ui` with `env` set on the server after the sanitizing.
+#[allow(clippy::zombie_processes)] // UiProc's Drop kills + waits.
+fn spawn_ui_env(pm: &Path, state: &Path, env: &[(&str, &str)]) -> (u16, UiProc) {
     let port = free_port();
     let mut cmd = Command::new(bin());
     cmd.arg("--state-dir")
@@ -8225,6 +8230,7 @@ fn spawn_ui(pm: &Path, state: &Path) -> (u16, UiProc) {
     if let Ok(home) = std::env::var("HOME") {
         cmd.env("HOME", home);
     }
+    cmd.envs(env.iter().copied());
     let child = cmd.spawn().unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -8241,6 +8247,47 @@ fn spawn_ui(pm: &Path, state: &Path) -> (u16, UiProc) {
         }
         assert!(Instant::now() < deadline, "ui subprocess did not start");
         thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The board as an operator runs it, however the suite is run: a
+/// detached `cadence ui start`. Operator-only relays (`model_defaults_set`,
+/// CAD-337) refuse a board whose ancestry carries an agent, and when the
+/// suite itself runs in an agent pane this test process is one — so
+/// `start_ui`'s in-process board is (CAD-380). `ui start` hands the
+/// server to a fresh session leader (`setsid`) that is reparented off
+/// this process's ancestry once `start` exits, `env_clear` leaves no
+/// `CADENCE_ALIAS`, and stdio is a log file, not a pane tty — the shape
+/// `peer::operator_proof` accepts, as `TestDaemon::operator_rpc` does in
+/// tests/integration.rs (CAD-291). The gate itself is untouched.
+/// `free_port` is a bind-release race, so a failed start retries.
+fn start_operator_ui(pm: &Path, state: &Path) -> (u16, DetachedUi) {
+    let guard = DetachedUi(state.to_path_buf());
+    let overall = Instant::now() + Duration::from_secs(30);
+    loop {
+        let port = free_port();
+        let out = Command::new(bin())
+            .arg("--state-dir")
+            .arg(state)
+            .args(["ui", "start", "--port", &port.to_string()])
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", pm)
+            .env("CADENCE_PM_DIR", pm)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        if out.status.success() {
+            return (port, guard);
+        }
+        // A start that timed out leaves its pid file — clear it, or the
+        // retry answers `already_running` on the old port.
+        drop(DetachedUi(state.to_path_buf()));
+        assert!(
+            Instant::now() < overall,
+            "operator ui did not start: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }
 
@@ -10018,7 +10065,10 @@ fn model_defaults_http_round_trip_guards_and_conflict() {
 
     let d = UiDaemon::start();
     let pm = TempDir::new().unwrap();
-    let port = start_ui(pm.path().to_path_buf(), d.state());
+    // The write relays through the board's own daemon connection, which
+    // the operator gate proves (CAD-337) — an operator-shaped board, so
+    // this passes from an agent pane too (CAD-380).
+    let (port, _ui) = start_operator_ui(pm.path(), &d.state());
     let host = format!("127.0.0.1:{port}");
     let (code, body) = http(port, "GET", "/api/settings/model-defaults", &host);
     assert_eq!(code, 200, "{body}");
@@ -10078,6 +10128,28 @@ fn model_defaults_http_round_trip_guards_and_conflict() {
     assert_eq!(code, 403, "{body}");
 
     let doc = r#"{"expected_revision":0,"config":{"schema":1,"providers":{"claude":{"default":{"mode":"model","model":"baseline-a"},"roles":{"qa":{"mode":"provider_default"}}}}}}"#;
+    // An agent-shaped board — its own environment carries CADENCE_ALIAS
+    // — is refused by the daemon's gate, however the suite is run, and
+    // nothing is written.
+    let (agent_port, _agent_ui) =
+        spawn_ui_env(pm.path(), &d.state(), &[("CADENCE_ALIAS", "board-agent")]);
+    let agent_host = format!("127.0.0.1:{agent_port}");
+    let (code, _, body) = write_json(
+        agent_port,
+        "POST",
+        "/api/settings/model-defaults",
+        &agent_host,
+        doc,
+    );
+    assert_eq!(code, 400, "{body}");
+    assert!(
+        body.contains("not provably the operator") && body.contains("carries CADENCE_ALIAS"),
+        "{body}"
+    );
+    let (code, body) = http(port, "GET", "/api/settings/model-defaults", &host);
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["revision"], 0);
+
     let (code, _, body) = write_json(port, "POST", "/api/settings/model-defaults", &host, doc);
     assert_eq!(code, 200, "{body}");
     let saved: Value = serde_json::from_str(&body).unwrap();
