@@ -638,6 +638,19 @@ export interface MemoryFinalization {
   finalizer: string;
 }
 
+/** A lesson's freshness as retrieval reads it (CAD-395). */
+export interface MemoryEvidence {
+  /** verified (inside the window) | unverified | withheld (stale mark). */
+  state: "verified" | "unverified" | "withheld" | string;
+  /** "verified <date>", "unverified (last verified <date>)", "unverified" or "withheld". */
+  label: string;
+  /** Why a withheld lesson is not injected. */
+  reason?: string | null;
+  /** The verify finalization time — not the raw verified_at field. */
+  last_verified?: string | null;
+  window_days?: number | null;
+}
+
 export interface MemoryCard {
   project: string;
   slug: string;
@@ -655,6 +668,8 @@ export interface MemoryCard {
   author?: string | null;
   created: string;
   verified_at?: string | null;
+  /** Absent on older daemons; absence shows no evidence label. */
+  evidence?: MemoryEvidence | null;
   supersedes?: string | null;
   /** Semantic revision digest used by native review/finalization. */
   revision_digest?: string | null;
