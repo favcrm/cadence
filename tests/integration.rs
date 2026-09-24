@@ -1476,7 +1476,7 @@ fn restart_preserves_attention_fence_without_unknowns() {
     // agent must neither execute its queued work nor lose its error.
     let home = TempDir::new().unwrap();
     hold_rollout_lease(home.path(), &d.state);
-    let out = cadence_at(
+    let out = operator_cadence_at(
         home.path(),
         &d.state,
         &["daemon", "restart", "--as", "operator:test"],
@@ -1485,7 +1485,7 @@ fn restart_preserves_attention_fence_without_unknowns() {
     let restarted = d.wait_agent("mismatch", "attention", 15);
     d.wait_agent("healthy", "idle", 15);
     let queued = d.message_state("mismatch", "m2");
-    let stop = cadence_at(home.path(), &d.state, &["daemon", "stop"]);
+    let stop = operator_cadence_at(home.path(), &d.state, &["daemon", "stop"]);
     assert!(stop.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -3096,7 +3096,7 @@ fn daemon_restart_reports_fenced_turn() {
     unsafe { libc::killpg(pane_pid, libc::SIGKILL) };
     let home = TempDir::new().unwrap();
     hold_rollout_lease(home.path(), &d.state);
-    let out = cadence_at(
+    let out = operator_cadence_at(
         home.path(),
         &d.state,
         &["daemon", "restart", "--as", "operator:test"],
@@ -3108,7 +3108,7 @@ fn daemon_restart_reports_fenced_turn() {
         "a fenced turn must fail the restart: {stdout} {stderr}"
     );
     assert!(stdout.contains("fenced"), "{stdout} {stderr}");
-    let stop = cadence_at(home.path(), &d.state, &["daemon", "stop"]);
+    let stop = operator_cadence_at(home.path(), &d.state, &["daemon", "stop"]);
     assert!(stop.status.success());
 }
 
@@ -3130,7 +3130,7 @@ fn daemon_restart_reports_kept_turn() {
     let token = pty_token(&d, "dv", "m1");
     let home = TempDir::new().unwrap();
     hold_rollout_lease(home.path(), &d.state);
-    let out = cadence_at(
+    let out = operator_cadence_at(
         home.path(),
         &d.state,
         &["daemon", "restart", "--as", "operator:test"],
@@ -3152,7 +3152,7 @@ fn daemon_restart_reports_kept_turn() {
     )
     .unwrap();
     d.wait_message("dv", "m1", &["completed"], 15);
-    let stop = cadence_at(home.path(), &d.state, &["daemon", "stop"]);
+    let stop = operator_cadence_at(home.path(), &d.state, &["daemon", "stop"]);
     assert!(stop.status.success());
 }
 
@@ -8049,6 +8049,18 @@ fn hold_rollout_lease(home: &Path, state: &Path) {
 }
 
 fn cadence_at(home: &Path, state: &Path, args: &[&str]) -> std::process::Output {
+    cadence_at_cmd(home, state, args).output().unwrap()
+}
+
+/// [`cadence_at`] as an operator shell outside every pane (CAD-384): the
+/// operator verbs — `daemon stop`/`restart`, `agent stop`/`resume`, … —
+/// need operator proof, which a child of this process (the in-process
+/// daemon) never has. See [`OperatorOutput`].
+fn operator_cadence_at(home: &Path, state: &Path, args: &[&str]) -> std::process::Output {
+    cadence_at_cmd(home, state, args).operator_output().unwrap()
+}
+
+fn cadence_at_cmd(home: &Path, state: &Path, args: &[&str]) -> std::process::Command {
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"));
     cmd.arg("--state-dir")
         .arg(state)
@@ -8059,9 +8071,7 @@ fn cadence_at(home: &Path, state: &Path, args: &[&str]) -> std::process::Output 
         // A `daemon restart` child daemon is a separate process: it
         // gets this test's mock commands as its own env, and only it.
         .envs(test_env().vars());
-    // An operator shell outside every pane (CAD-384): `daemon stop`,
-    // `agent stop`, … need operator proof.
-    cmd.operator_output().unwrap()
+    cmd
 }
 
 #[test]
@@ -21702,7 +21712,7 @@ fn daemon_restart_keeps_pane_pid_and_reports_table() {
     assert!(pane_pid_before > 0);
     let home = TempDir::new().unwrap();
     hold_rollout_lease(home.path(), &d.state);
-    let out = cadence_at(
+    let out = operator_cadence_at(
         home.path(),
         &d.state,
         &["daemon", "restart", "--as", "operator:test"],
@@ -21724,7 +21734,7 @@ fn daemon_restart_keeps_pane_pid_and_reports_table() {
         .as_u64()
         .unwrap();
     assert_eq!(pane_pid_before, pane_pid_after);
-    let stop = cadence_at(home.path(), &d.state, &["daemon", "stop"]);
+    let stop = operator_cadence_at(home.path(), &d.state, &["daemon", "stop"]);
     assert!(
         stop.status.success(),
         "stop after restart failed: {}",
@@ -21749,7 +21759,7 @@ fn daemon_restart_when_idle_gates_and_proceeds() {
     let home = TempDir::new().unwrap();
     hold_rollout_lease(home.path(), &d.state);
     // Busy pane → timeout exits non-zero and the daemon is untouched.
-    let out = cadence_at(
+    let out = operator_cadence_at(
         home.path(),
         &d.state,
         &[
@@ -21773,7 +21783,7 @@ fn daemon_restart_when_idle_gates_and_proceeds() {
     );
     // Pane goes idle — the same command now completes the restart.
     std::fs::remove_file(d.pane_file(&mock, "dv", "tui-state")).unwrap();
-    let out = cadence_at(
+    let out = operator_cadence_at(
         home.path(),
         &d.state,
         &[
@@ -21792,7 +21802,7 @@ fn daemon_restart_when_idle_gates_and_proceeds() {
         String::from_utf8_lossy(&out.stderr),
         restart_diag(&d, "dv")
     );
-    let stop = cadence_at(home.path(), &d.state, &["daemon", "stop"]);
+    let stop = operator_cadence_at(home.path(), &d.state, &["daemon", "stop"]);
     assert!(stop.status.success());
 }
 
