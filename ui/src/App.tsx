@@ -20,7 +20,7 @@ import Login from "./features/auth/Login";
 import SignIn from "./features/auth/SignIn";
 import { writeBlock } from "./features/auth/gate";
 import { WriteGate } from "./features/auth/WriteGate";
-import { setSessionKey } from "./lib/sessionKey";
+import { sessionKey, setSessionKey } from "./lib/sessionKey";
 import Toast, { type ToastMsg } from "./ui/Toast";
 import { Logo } from "./ui/Logo";
 import { countLabel, issueCounts } from "./lib/counts";
@@ -197,13 +197,16 @@ export default function App() {
   const refresh = useCallback(() => {
     api.health().then(setHealth).catch(() => setHealth(null));
     const asked = !operatorKnown.current;
+    const sentKey = sessionKey();
     api
       .meta(asked)
       .then((next) => {
         const changed = signedIn.current !== undefined && next.signed_in !== signedIn.current;
         signedIn.current = next.signed_in;
-        // A key the server no longer honours (expired, revoked) is dropped.
-        if (next.signed_in === false) setSessionKey(null);
+        // A key the server refused (expired, revoked) is dropped — only
+        // the very key this request carried: a sign-in that finished
+        // while it was in flight stored a newer one.
+        if (next.signed_in === false && sentKey && sessionKey() === sentKey) setSessionKey(null);
         if (changed && !asked) {
           operatorKnown.current = false;
           setMeta({ ...next, operator: undefined });
