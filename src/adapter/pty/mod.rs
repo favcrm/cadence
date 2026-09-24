@@ -60,7 +60,7 @@ pub mod stub;
 pub use claude::{analyze_claude, analyze_claude_styled, ClaudeProfile};
 pub use cursor::{analyze_cursor, CursorProfile};
 pub use devin::{analyze_devin, DevinProfile};
-pub use profile::TuiProfile;
+pub use profile::{DraftView, TuiProfile};
 pub use stub::StubProfile;
 
 use std::io::Write;
@@ -77,7 +77,10 @@ use crate::adapter::registry;
 use crate::error::{Error, Result};
 use crate::store::Agent;
 
-use super::{AdapterHooks, Identity, Probe, ProviderAdapter, ProviderEnv, TurnResult};
+use super::{
+    AdapterHooks, Identity, Probe, ProviderAdapter, ProviderEnv, RecoverConfirm, RecoverSubmit,
+    TurnResult,
+};
 use render::{RenderDecision, RenderObservation, RenderOutcome};
 
 /// How long an operator readiness claim stays valid for one send.
@@ -208,6 +211,100 @@ fn normalize_screen(text: &str) -> String {
         .filter(|c| !c.is_whitespace() && !MARKDOWN_MARKERS.contains(c))
         .collect()
 }
+
+/// How a visible draft compares with a message body — the
+/// `agent recover-submit` draft check (CAD-152).
+#[derive(Debug, PartialEq, Eq)]
+enum DraftMatch {
+    /// Every row is the next piece of the body, in order, and every
+    /// row break is provably the TUI's own wrap (see [`match_draft`]).
+    Exact,
+    /// The rows are part of the body, or equal it only once whitespace
+    /// is dropped, or a row break cannot be proven to be a wrap: a
+    /// clipped or scrolled input box, or a whitespace difference a wrap
+    /// could hide. Not provably the body.
+    Ambiguous,
+    /// Other text: an edited draft, operator text, another message.
+    Differs,
+}
+
+/// Compare the draft's `rows` (chrome removed and trimmed by the
+/// profile) with `body`. Pty bodies are single-line (`run_turn`
+/// rejects control characters), so every row break on screen is a
+/// wrap, and a wrap is only accepted when it is provably the TUI's:
+///
+/// - text within a row compares verbatim — whitespace runs included;
+/// - a break where the body has one space is a word wrap only if the
+///   next row's first word could not have fit on the row
+///   (`row + 1 + word > width`), and never where the body has two or
+///   more;
+/// - a break inside a word is a hard wrap only if the row is full
+///   (`row >= width`).
+///
+/// `width` is the profile's upper bound on an input row's text width;
+/// `None` (width unknown) makes every multi-row draft ambiguous. An
+/// over-estimate only refuses more, never accepts more.
+fn match_draft(rows: &[String], width: Option<usize>, body: &str) -> DraftMatch {
+    let body = body.trim();
+    let rows: Vec<&str> = rows
+        .iter()
+        .map(|r| r.trim())
+        .filter(|r| !r.is_empty())
+        .collect();
+    if rows.is_empty() {
+        return DraftMatch::Differs;
+    }
+    let mut rest = body;
+    let mut walked = true;
+    let mut proven = true;
+    for (i, row) in rows.iter().enumerate() {
+        let Some(after) = rest.strip_prefix(row) else {
+            walked = false;
+            break;
+        };
+        rest = after;
+        let Some(next) = rows.get(i + 1) else {
+            break;
+        };
+        let Some(width) = width else {
+            proven = false;
+            rest = rest.strip_prefix(' ').unwrap_or(rest);
+            continue;
+        };
+        let len = row.chars().count();
+        match rest.strip_prefix(' ') {
+            Some(after) => {
+                let word = next.split_whitespace().next().unwrap_or("").chars().count();
+                if after.starts_with(char::is_whitespace) || len + 1 + word <= width {
+                    proven = false;
+                }
+                rest = after;
+            }
+            None => {
+                if len < width {
+                    proven = false;
+                }
+            }
+        }
+    }
+    if walked && rest.is_empty() {
+        return if proven {
+            DraftMatch::Exact
+        } else {
+            DraftMatch::Ambiguous
+        };
+    }
+    let squash = |t: &str| t.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    if squash(body).contains(&squash(&rows.concat())) {
+        DraftMatch::Ambiguous
+    } else {
+        DraftMatch::Differs
+    }
+}
+
+/// How long `agent recover-submit` watches for the draft to leave the
+/// input line after its one Enter.
+const RECOVER_DEADLINE: Duration = RENDER_DEADLINE;
 
 /// The last `n` characters of `text` (by char, not byte).
 fn tail_chars(text: &str, n: usize) -> String {
@@ -1409,6 +1506,167 @@ impl ProviderAdapter for PtyAdapter {
         Ok(probe)
     }
 
+    /// `agent recover-submit`: see [`ProviderAdapter::recover_submit`].
+    /// Held under the paste lock end to end — the checks, the one
+    /// Enter and the watch after it — so no paste, answer or second
+    /// recovery can land keys in between.
+    fn recover_submit(
+        &self,
+        generation: &str,
+        body: &str,
+        confirm: &RecoverConfirm,
+    ) -> Result<RecoverSubmit> {
+        let refused = |check: &str, reason: String, probe: Option<Probe>| {
+            Ok(RecoverSubmit::Refused {
+                check: check.to_string(),
+                reason,
+                probe,
+            })
+        };
+        let _paste_guard = self.paste_lock.lock().unwrap();
+        let (session, native, live) = {
+            let s = self.state.lock().unwrap();
+            (
+                s.session.clone(),
+                s.native_session.clone(),
+                s.generation.clone(),
+            )
+        };
+        if live != generation {
+            return refused(
+                "stale_generation",
+                "the endpoint was relaunched since this message was pasted — its \
+                 generation is no longer the live one"
+                    .to_string(),
+                None,
+            );
+        }
+        let dead = !self.has_session(&session)
+            || self
+                .pane_value(&session, "#{pane_dead}")
+                .map_or(true, |v| v == "1");
+        if dead {
+            return refused(
+                "endpoint",
+                "the pane is gone or its process exited".to_string(),
+                None,
+            );
+        }
+        if let Err(e) = self.verify_ownership(&session, &native) {
+            return refused(
+                "endpoint",
+                format!("the pane no longer proves ownership of its native session: {e}"),
+                None,
+            );
+        }
+        if self.pane_value(&session, "#{pane_in_mode}").ok().as_deref() != Some("0") {
+            return refused(
+                "pane_mode",
+                "the pane is in a tmux mode (copy/view) — an Enter would not reach the TUI"
+                    .to_string(),
+                None,
+            );
+        }
+        let styled = self.capture_visible_styled()?;
+        let before = self
+            .profile
+            .analyze_styled(&styled, self.cursor_pos(&session));
+        if before.approval_menu {
+            return refused(
+                "approval_menu",
+                format!(
+                    "an approval menu is open ({}) — answer it with `cadence agent answer`",
+                    before.reason
+                ),
+                Some(before),
+            );
+        }
+        if before.busy_marker {
+            return refused(
+                "busy",
+                format!("the TUI is busy ({})", before.reason),
+                Some(before),
+            );
+        }
+        if !before.input_nonempty {
+            return refused(
+                "empty_input",
+                "the input line is empty — no draft is staged to submit".to_string(),
+                Some(before),
+            );
+        }
+        let draft = match self.profile.draft_rows(&styled) {
+            Ok(draft) if draft.rows.iter().any(|r| !r.trim().is_empty()) => draft,
+            Ok(_) => {
+                return refused(
+                    "draft_unreadable",
+                    "the input line reads non-empty but no draft text could be read".to_string(),
+                    Some(before),
+                )
+            }
+            Err(why) => return refused("draft_unreadable", why, Some(before)),
+        };
+        // Neither reason quotes the draft: it may be operator text.
+        match match_draft(&draft.rows, draft.width, body) {
+            DraftMatch::Exact => {}
+            DraftMatch::Ambiguous => {
+                return refused(
+                    "ambiguous_wrap",
+                    "the visible draft is only part of the message body, differs from it \
+                     only in whitespace, or wraps where the TUI's own wrapping cannot be \
+                     proven — it cannot be proven to be the whole message"
+                        .to_string(),
+                    Some(before),
+                )
+            }
+            DraftMatch::Differs => {
+                return refused(
+                    "draft_mismatch",
+                    "the staged draft is not this message's body (edited, or other text)"
+                        .to_string(),
+                    Some(before),
+                )
+            }
+        }
+        if let Err((check, reason)) = confirm(&before) {
+            return refused(&check, reason, Some(before));
+        }
+        // Exactly one Enter — never a re-paste. A failed send may still
+        // have landed, so it is watched like a sent one.
+        let send_error = self
+            .tmux_ok(&["send-keys", "-t", &session, "Enter"])
+            .err()
+            .map(|e| e.to_string());
+        // `submitted` needs positive evidence: the TUI's own prompt line
+        // back on screen with nothing in it, on a pane still alive. A
+        // vanished prompt (an overlay, a dead or cleared pane) proves
+        // nothing and stays `unconfirmed`.
+        let submitted = |p: &Probe| p.prompt_visible && !p.input_nonempty;
+        let started = Instant::now();
+        let mut after = before.clone();
+        loop {
+            if let Ok(styled) = self.capture_visible_styled() {
+                after = self
+                    .profile
+                    .analyze_styled(&styled, self.cursor_pos(&session));
+                if submitted(&after) {
+                    break;
+                }
+            }
+            if started.elapsed() >= RECOVER_DEADLINE {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(150));
+        }
+        let alive = self.pane_value(&session, "#{pane_dead}").ok().as_deref() == Some("0");
+        Ok(RecoverSubmit::Sent {
+            confirmed: alive && submitted(&after),
+            before,
+            after,
+            send_error,
+        })
+    }
+
     fn sample_screen(&self) -> Result<(String, Probe)> {
         let session = self.session();
         let styled = self.capture_visible_styled()?;
@@ -1432,7 +1690,123 @@ impl ProviderAdapter for PtyAdapter {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_screen, pane_env, tail_chars};
+    use super::{match_draft, normalize_screen, pane_env, tail_chars, DraftMatch};
+
+    fn rows(lines: &[&str]) -> Vec<String> {
+        lines.iter().map(|l| l.to_string()).collect()
+    }
+
+    /// CAD-152: a draft matches its body when every row is the next
+    /// piece of it verbatim and every row break is provably the TUI's
+    /// wrap — a word wrap where the next word could not have fit, or a
+    /// hard wrap of a full row.
+    #[test]
+    fn draft_match_accepts_provable_wraps() {
+        let body = "Kickoff AOS-11: read the brief  and report with your token.";
+        // One row: verbatim, a doubled space included.
+        let one = rows(&[body]);
+        assert_eq!(match_draft(&one, None, body), DraftMatch::Exact);
+        assert_eq!(match_draft(&one, Some(20), body), DraftMatch::Exact);
+        // Word wraps at width 24: each next word would not have fit.
+        let word = rows(&[
+            "Kickoff AOS-11: read the",
+            "brief  and report with",
+            "your token.",
+        ]);
+        assert_eq!(match_draft(&word, Some(24), body), DraftMatch::Exact);
+        // Hard wraps of full rows (width 10): no space consumed.
+        let hard = rows(&[
+            "Kickoff AO",
+            "S-11: read",
+            "the brief",
+            "and report",
+            "with your",
+            "token.",
+        ]);
+        let body2 = "Kickoff AOS-11: read the brief and report with your token.";
+        let hard_body = rows(&[
+            "Kickoff AO",
+            "S-11: read the brief and report with your token.",
+        ]);
+        assert_eq!(match_draft(&hard_body, Some(10), body2), DraftMatch::Exact);
+        // A mix: breaks 2..5 are word wraps at width 10.
+        assert_eq!(match_draft(&hard, Some(10), body2), DraftMatch::Exact);
+    }
+
+    /// Part of the body (a clipped or scrolled box), a whitespace-only
+    /// difference, or a row break that cannot be proven to be the TUI's
+    /// wrap is not provably the whole message: ambiguous. Anything else
+    /// differs.
+    #[test]
+    fn draft_match_refuses_partial_whitespace_unprovable_wraps_and_other_text() {
+        let body = "Kickoff AOS-11: read the brief and report with your token.";
+        for (draft, width) in [
+            (rows(&["and report with your token."]), Some(80)),
+            (rows(&["Kickoff AOS-11: read the brief"]), Some(80)),
+            (
+                rows(&["Kickoff AOS-11: read thebrief and report with your token."]),
+                Some(80),
+            ),
+            (
+                rows(&["Kickoff AOS-11: read the  brief and report with your token."]),
+                Some(80),
+            ),
+            // Width unknown: no break can be proven.
+            (
+                rows(&[
+                    "Kickoff AOS-11: read the",
+                    "brief and report with your token.",
+                ]),
+                None,
+            ),
+            // "brief" would have fit on the first row: not a word wrap.
+            (
+                rows(&[
+                    "Kickoff AOS-11: read the",
+                    "brief and report with your token.",
+                ]),
+                Some(40),
+            ),
+        ] {
+            assert_eq!(
+                match_draft(&draft, width, body),
+                DraftMatch::Ambiguous,
+                "{draft:?} at {width:?}"
+            );
+        }
+        // qa-pr227 note 1: a space inserted (or dropped) exactly at a
+        // row break must not pass for the body. A mid-word break needs a
+        // full row; a word wrap needs the next word not to fit.
+        assert_eq!(
+            match_draft(
+                &rows(&["report to pm", "2 now"]),
+                Some(40),
+                "report to pm2 now"
+            ),
+            DraftMatch::Ambiguous
+        );
+        assert_eq!(
+            match_draft(&rows(&["rm build", "cache"]), Some(40), "rm build cache"),
+            DraftMatch::Ambiguous
+        );
+        assert_eq!(
+            match_draft(&rows(&["a b"]), Some(40), "a  b"),
+            DraftMatch::Ambiguous
+        );
+        for draft in [
+            rows(&["Kickoff AOS-11: read the brief and report with your token. also do X"]),
+            rows(&["Kickoff AOS-12: read the brief and report with your token."]),
+            rows(&["operator note"]),
+            rows(&[""]),
+            Vec::new(),
+        ] {
+            assert_eq!(
+                match_draft(&draft, Some(80), body),
+                DraftMatch::Differs,
+                "{draft:?}"
+            );
+        }
+    }
 
     #[test]
     fn normalize_and_tail_helpers() {

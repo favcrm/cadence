@@ -30,7 +30,7 @@ use crate::adapter::{Probe, ProviderEnv};
 use crate::error::{Error, Result};
 use crate::store::Agent;
 
-use super::profile::TuiProfile;
+use super::profile::{DraftView, TuiProfile};
 use super::{descends_from, resolve_on_path, shlex_quote};
 
 /// Bounded wait for the launched Claude TUI to publish its session
@@ -824,6 +824,51 @@ impl TuiProfile for ClaudeProfile {
         analyze_claude_styled(styled, cursor)
     }
 
+    /// The draft is the input box's interior: the last boxed `❯` row
+    /// and any wrapped rows under it, down to the box's bottom `─`
+    /// border. Dim cells anywhere in it (a prompt suggestion, a
+    /// placeholder) refuse — ghost text must never pass for the draft,
+    /// and no bottom border means the box is cut off.
+    fn draft_rows(&self, styled: &str) -> std::result::Result<DraftView, String> {
+        let frame = super::sgr::parse(styled);
+        let plain: Vec<&str> = frame.plain.lines().collect();
+        let undimmed: Vec<&str> = frame.undimmed.lines().collect();
+        let border = |l: &str| {
+            let t = l.trim();
+            !t.is_empty() && t.chars().all(|c| c == claude_screen::BORDER)
+        };
+        let start = (1..plain.len())
+            .rev()
+            .find(|&i| {
+                border(plain[i - 1]) && plain[i].trim_start().starts_with(claude_screen::PROMPT)
+            })
+            .ok_or("no Claude input box on screen")?;
+        let end = (start + 1..plain.len()).find(|&i| border(plain[i])).ok_or(
+            "the Claude input box has no bottom border on screen — the draft cannot be delimited",
+        )?;
+        if (start..end).any(|i| undimmed.get(i).map(|u| u.trim_end()) != Some(plain[i].trim_end()))
+        {
+            return Err(
+                "dim text in the Claude input box — a suggestion or placeholder cannot be \
+                 told apart from the draft"
+                    .to_string(),
+            );
+        }
+        let mut rows = vec![plain[start]
+            .trim_start()
+            .trim_start_matches(claude_screen::PROMPT)
+            .trim()
+            .to_string()];
+        rows.extend(plain[start + 1..end].iter().map(|l| l.trim().to_string()));
+        // The border spans the box; a row's text is at most that less
+        // the `❯ ` prompt (continuation rows are indented as far).
+        let width = plain[end].trim().chars().count().saturating_sub(2);
+        Ok(DraftView {
+            rows,
+            width: Some(width),
+        })
+    }
+
     fn respond_rejection(&self) -> &'static str {
         "pty endpoints have no approval channel — answer Claude \
          permission prompts in the terminal itself"
@@ -1257,6 +1302,32 @@ mod tests {
             allowed_tools: Vec::new(),
             real: false,
         }
+    }
+
+    /// CAD-152: the Claude draft is the boxed `❯` row and its wrapped
+    /// rows down to the bottom border — read from a live capture; dim
+    /// text in the box (a suggestion) and a box cut off below refuse.
+    #[test]
+    fn draft_rows_read_the_boxed_input() {
+        let prof = profile();
+        assert_eq!(
+            prof.draft_rows(&fixture("draft.txt")).unwrap().rows,
+            vec!["Review the deploy plan and reply"]
+        );
+        let rule = "─".repeat(40);
+        let wrapped = format!("● done\n\n{rule}\n❯\u{a0}Kickoff AOS-11: read the\n  brief and report\n{rule}\n  [Opus]");
+        let draft = prof.draft_rows(&wrapped).unwrap();
+        assert_eq!(
+            draft.rows,
+            vec!["Kickoff AOS-11: read the", "brief and report"]
+        );
+        // The border's width less the `❯ ` prompt.
+        assert_eq!(draft.width, Some(38));
+        let err = prof.draft_rows(&fixture("suggestion.ansi")).unwrap_err();
+        assert!(err.contains("dim text"), "{err}");
+        let cut = format!("{rule}\n❯ Kickoff AOS-11: read the brief");
+        let err = prof.draft_rows(&cut).unwrap_err();
+        assert!(err.contains("no bottom border"), "{err}");
     }
 
     /// The trust dialog's option block — ` Security guide` sits right

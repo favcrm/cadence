@@ -1942,6 +1942,32 @@ enum AgentAction {
         #[arg(long)]
         reason: Option<String>,
     },
+    /// Submit a pty message that was pasted but never submitted — the
+    /// draft still sits in the input line while the message stays
+    /// `running` — with exactly one Enter, never a re-paste, so the
+    /// message keeps its turn token and report path (CAD-152).
+    ///
+    /// Refuses and sends nothing unless every check holds at action
+    /// time: the message is the agent's pending pasted turn (running,
+    /// unacknowledged, token from the live endpoint generation), the
+    /// pane shows a non-empty input with no busy marker and no approval
+    /// menu, and the visible draft is the message body (normalised for
+    /// wrapping). Each refusal names its check. A second recovery of the
+    /// same message refuses. Only the operator or the agent's PM may
+    /// run it (caller rule, CAD-149). Records `submit_recovered` or
+    /// `submit_recover_refused` — never the message body. Exits 1 when
+    /// the Enter went out but the draft did not visibly leave the input
+    /// (unconfirmed: inspect, never retried).
+    RecoverSubmit {
+        alias: String,
+        /// The stuck message's id.
+        #[arg(long)]
+        message: String,
+        /// The endpoint generation you inspected (from `agent show`);
+        /// refuses if the endpoint has been relaunched since.
+        #[arg(long)]
+        generation: Option<String>,
+    },
     /// Merge `key=value` pairs into an agent's endpoint params — e.g.
     /// `agent set <alias> auto_ready=verified` opts a live agent into
     /// daemon-verified readiness.
@@ -5299,6 +5325,19 @@ fn run() -> Result<i32> {
                         "agent_answer",
                         json!({"alias": alias, "choice": choice, "by": by, "note": reason}),
                     )?
+                }
+                AgentAction::RecoverSubmit {
+                    alias,
+                    message,
+                    generation,
+                } => {
+                    let out = client::rpc(
+                        &state_dir,
+                        "agent_recover_submit",
+                        json!({"alias": alias, "message": message, "generation": generation}),
+                    )?;
+                    print_json(&out);
+                    return Ok(if out["state"] == "submitted" { 0 } else { 1 });
                 }
                 AgentAction::Set {
                     alias,
