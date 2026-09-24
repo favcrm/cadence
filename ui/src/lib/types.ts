@@ -444,7 +444,6 @@ export interface AgentTask {
   message?: {
     id: string;
     task?: string;
-    turn_id?: string;
     created?: string;
     summary?: string | null;
   } | null;
@@ -531,14 +530,12 @@ export interface Agent {
   message?: {
     id: string;
     task?: string;
-    turn_id?: string;
     created?: string;
     summary?: string | null;
   } | null;
   running_messages?: {
     id: string;
     task?: string;
-    turn_id?: string;
     created?: string;
     summary?: string | null;
   }[];
@@ -613,7 +610,6 @@ export interface AgentDetail {
   running: {
     id: string;
     task?: string;
-    turn_id?: string;
     created?: string;
     summary?: string | null;
   }[];
