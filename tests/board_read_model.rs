@@ -727,9 +727,10 @@ fn status_clock_follows_the_commit_not_the_cached_edit() {
     );
 }
 
-/// Review round 2: an agent mid-turn must not defeat the overview cache.
-/// Its `silent_secs` ticks every second; the change fingerprint leaves
-/// such clocks out, so the watcher marks no change, no legacy `agents`
+/// Review rounds 2 and 3: an agent mid-turn, or a mailbox holding a
+/// queued message, must not defeat the overview cache. Their
+/// `silent_secs` and backlog age tick every second; the change
+/// fingerprint leaves such clocks out, so the watcher marks no change, no legacy `agents`
 /// frame fires each second, and reads keep being served from the cache.
 #[test]
 fn overview_cache_holds_while_an_agent_runs_a_turn() {
@@ -748,6 +749,13 @@ fn overview_cache_holds_while_an_agent_runs_a_turn() {
         "agent_send",
         json!({"alias": "sleeper", "text": "SLEEP:600"}),
     );
+    // A mailbox with one queued message: its backlog age ticks too.
+    fx.daemon.rpc(
+        "agent_register",
+        json!({"alias": "box", "provider": "inbox", "endpoint_kind": "inbox"}),
+    );
+    fx.daemon
+        .rpc("agent_send", json!({"alias": "box", "text": "waiting"}));
     wait_for("the turn to run", 20, || {
         fx.daemon.rpc("agent_show", json!({"alias": "sleeper"}))["messages"]
             .as_array()
@@ -774,7 +782,7 @@ fn overview_cache_holds_while_an_agent_runs_a_turn() {
     let ticked = frames(&stream, "agents").len() - agents_frames;
     assert!(
         ticked <= 1,
-        "{ticked} legacy agents frames in ~5 s while nothing but silent_secs moved"
+        "{ticked} legacy agents frames in ~5 s while only clocks moved"
     );
     assert!(
         builds_after - builds <= (SAMPLES / 4) as u64,

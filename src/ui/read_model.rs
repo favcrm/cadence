@@ -378,8 +378,10 @@ pub(super) struct DaemonSnap {
 /// Fields of an `agent_list` row (and of the board's agent row) that the
 /// daemon computes from "now" and so move every second on their own — a
 /// running turn's `silent_secs`, a silent end's `ended_secs`, the
-/// awaiting-report clock, a mailbox's idle and unread ages and the
-/// warning text that quotes them. They stay in what is served (the
+/// awaiting-report clock, a mailbox's backlog age (`inbox`, beside the
+/// absolute `oldest_created_at` that still moves on a new or drained
+/// backlog), its health block's idle and unread ages and the warning
+/// text that quotes them. They stay in what is served (the
 /// overview's age cap bounds them); they are left out of the change
 /// fingerprints, which would otherwise mark a change every tick while an
 /// agent runs and keep the overview cache from ever serving. Job and
@@ -387,6 +389,7 @@ pub(super) struct DaemonSnap {
 const TICKING: &[(&str, &[&str])] = &[
     ("", &["silent_secs", "ended_secs"]),
     ("awaiting_report", &["since_secs", "remaining_secs"]),
+    ("inbox", &["oldest_age_secs"]),
     (
         "inbox_health",
         &["idle_secs", "oldest_unread_age_secs", "warning"],
@@ -980,6 +983,34 @@ mod tests {
         moved = later;
         moved["stalled"] = json!(true);
         assert_ne!(value_fp(&stable_row(&row)), value_fp(&stable_row(&moved)));
+    }
+
+    #[test]
+    fn mailbox_backlog_age_ticks_but_the_backlog_still_moves() {
+        let mailbox = |queued: i64, oldest: Option<f64>, age: Option<f64>| {
+            json!({"alias": "box", "inbox": {
+                "state": if queued > 0 { "backlog" } else { "idle" },
+                "queued": queued,
+                "oldest_created_at": oldest,
+                "oldest_age_secs": age,
+            }})
+        };
+        let one = mailbox(1, Some(100.0), Some(5.0));
+        // The clock alone: no change.
+        assert_eq!(
+            value_fp(&stable_row(&one)),
+            value_fp(&stable_row(&mailbox(1, Some(100.0), Some(6.0))))
+        );
+        // A new message queued: a change.
+        assert_ne!(
+            value_fp(&stable_row(&one)),
+            value_fp(&stable_row(&mailbox(2, Some(100.0), Some(6.0))))
+        );
+        // The backlog drained: a change.
+        assert_ne!(
+            value_fp(&stable_row(&one)),
+            value_fp(&stable_row(&mailbox(0, None, None)))
+        );
     }
 
     #[test]
