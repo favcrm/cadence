@@ -891,6 +891,18 @@ enum Commands {
         #[command(subcommand)]
         action: MasterAction,
     },
+    /// The worker loop (CAD-431): a ticket the master dispatched goes to
+    /// its worker; the worker's `done` report (`sha:` + `pr:`) is routed
+    /// to an independent reviewer; the reviewer's `verdict` report sends
+    /// a REVISE back (at most 2, then the operator decides) or a PASS
+    /// on; a PASS on a green head is one "merge?" row in Needs-you.
+    /// `ls` reads the loop. `sync`, `merge` and `decline` are the
+    /// operator's and run GitHub (`gh`) with the operator's own
+    /// credentials from this process — the daemon never does.
+    Delivery {
+        #[command(subcommand)]
+        action: DeliveryAction,
+    },
     /// File a report: a question, feedback, idea or bug becomes a
     /// tracker issue with context — instead of dying in a terminal
     /// scrollback. Routing is by kind, not by cwd: `question`,
@@ -2008,7 +2020,9 @@ enum ReportAction {
         /// The ticket the report is about (must match `task:` if set).
         #[arg(long)]
         task: String,
-        /// done|question|blocked|answer (must match `kind:` if set).
+        /// done|question|blocked|answer|verdict (must match `kind:` if
+        /// set). A verdict (`verdict: pass|revise`, `sha:`) is filed by
+        /// the daemon, only by the ticket's assigned reviewer.
         #[arg(long, value_enum)]
         kind: cadence_agent::issue::task_report::Kind,
         /// The report Markdown; else stdin.
@@ -2351,6 +2365,69 @@ enum MasterAction {
         #[arg(long)]
         post: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum DeliveryAction {
+    /// Every ticket in the loop and where it stands.
+    Ls {
+        /// Only this ticket.
+        issue: Option<String>,
+    },
+    /// Read each open PR in the loop from GitHub (head, CI, diff stats)
+    /// and hand it to the daemon; turn auto-merge off where the head
+    /// moved past what was reviewed. Operator only. `--watch <secs>`
+    /// repeats until interrupted.
+    Sync {
+        /// Only this ticket.
+        issue: Option<String>,
+        /// Repeat every N seconds.
+        #[arg(long)]
+        watch: Option<u64>,
+    },
+    /// Merge a PASSed ticket: enqueue its PR in the merge queue pinned
+    /// to the reviewed head (`gh pr merge --auto --squash
+    /// --match-head-commit`). Operator only.
+    Merge {
+        /// The ticket id.
+        issue: String,
+    },
+    /// Decline the merge decision (or an escalated review) with a
+    /// reason. Operator only.
+    Decline {
+        /// The ticket id.
+        issue: String,
+        /// Why.
+        #[arg(long)]
+        reason: String,
+    },
+}
+
+fn run_delivery(state_dir: &Path, action: DeliveryAction) -> Result<i32> {
+    use cadence_agent::delivery;
+    let result = match action {
+        DeliveryAction::Ls { issue } => {
+            client::rpc(state_dir, "delivery_list", json!({"issue": issue}))?
+        }
+        DeliveryAction::Sync { issue, watch } => match watch {
+            None => delivery::sync(state_dir, issue.as_deref())?,
+            Some(secs) => loop {
+                match delivery::sync(state_dir, issue.as_deref()) {
+                    Ok(v) => println!("{v}"),
+                    Err(e) => eprintln!("delivery sync: {e}"),
+                }
+                std::thread::sleep(std::time::Duration::from_secs(secs.max(5)));
+            },
+        },
+        DeliveryAction::Merge { issue } => delivery::merge(state_dir, &issue)?,
+        DeliveryAction::Decline { issue, reason } => client::rpc(
+            state_dir,
+            "delivery_decline",
+            json!({"issue": issue, "reason": reason}),
+        )?,
+    };
+    print_json(&result);
+    Ok(0)
 }
 
 fn run_master(state_dir: &Path, action: MasterAction) -> Result<i32> {
@@ -5813,6 +5890,7 @@ fn run() -> Result<i32> {
             cadence_agent::issue::cli::run_milestone(&action, &state_dir)
         }
         Commands::Master { action } => run_master(&state_dir, action),
+        Commands::Delivery { action } => run_delivery(&state_dir, action),
         Commands::Report {
             kind,
             project,
@@ -5823,6 +5901,24 @@ fn run() -> Result<i32> {
             action,
         } => {
             use cadence_agent::issue::report;
+            // CAD-431: a verdict is filed by the daemon, which checks the
+            // caller is the assigned reviewer — this process needs no
+            // tracker of its own for it.
+            if let Some(ReportAction::File {
+                task,
+                kind: cadence_agent::issue::task_report::Kind::Verdict,
+                file,
+            }) = &action
+            {
+                let cap = cadence_agent::issue::task_report::BODY_MAX as u64;
+                let text = read_body_capped(None, file.clone(), cap)?;
+                print_json(&client::rpc(
+                    &state_dir,
+                    "report_verdict",
+                    json!({"issue": task, "text": text}),
+                )?);
+                return Ok(0);
+            }
             let pm = cadence_agent::issue::Pm::open_default()?;
             match action {
                 Some(ReportAction::Ls { kind, project }) => {
@@ -9320,6 +9416,9 @@ mod tests {
             ov::cmd_agent_respond("w1", "abc123", "totally/unknownMethod"),
             ov::cmd_issue_show("CAD-3"),
             ov::cmd_issue_set_ready("CAD-5"),
+            ov::cmd_delivery_merge("CAD-6"),
+            ov::cmd_delivery_decline("CAD-6"),
+            ov::cmd_delivery_sync("CAD-6"),
             ov::CMD_ISSUE_SYNC.to_string(),
             ov::CMD_RESTART_WHEN_IDLE.to_string(),
             ov::CMD_UPGRADE_LATEST_MAIN.to_string(),

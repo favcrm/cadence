@@ -189,6 +189,22 @@ pub fn cmd_issue_show(id: &str) -> String {
     format!("cadence issue show {id}")
 }
 
+/// CAD-431: the operator's merge decision on a PASSed ticket.
+pub fn cmd_delivery_merge(id: &str) -> String {
+    format!("cadence delivery merge {id}")
+}
+
+/// CAD-431: decline it instead (the reason is the operator's).
+pub fn cmd_delivery_decline(id: &str) -> String {
+    format!("cadence delivery decline {id} --reason \"<why>\"")
+}
+
+/// CAD-431: re-read the loop's PRs from GitHub (and turn off auto-merge
+/// on a moved head).
+pub fn cmd_delivery_sync(id: &str) -> String {
+    format!("cadence delivery sync {id}")
+}
+
 pub fn cmd_issue_set_ready(id: &str) -> String {
     format!("cadence issue set {id} status=ready")
 }
@@ -685,6 +701,10 @@ impl Audience {
             // CAD-339 Needs-you: a question the master escalated and a
             // plan awaiting approval are the operator's to decide.
             "approval" | "fenced" | "question" | "plan" => Self::Operator,
+            // CAD-431: the merge decision, a review that did not
+            // converge, one nobody can take, and auto-merge left on a
+            // moved head are the operator's.
+            "merge" | "review_escalated" | "review_unstaffed" | "auto_merge_on" => Self::Operator,
             "drift" => Self::Dependency,
             "inbox_unread" | "tracker_behind" => Self::Info,
             _ => Self::Team,
@@ -835,6 +855,115 @@ impl Item {
         self.since = since;
         self.json["since"] = json!(since);
     }
+}
+
+/// CAD-431 Needs-you rows from the daemon's worker-loop record — the
+/// only source; a report file cannot raise them. One "merge?" row per
+/// PASS that the operator's process saw open and green at the reviewed
+/// head, with owner, age, PR link, the verdict's summary and diff stats;
+/// one row per review that did not converge or that nobody can take;
+/// one per PR whose auto-merge must be turned off.
+fn delivery_items(state_dir: &Path, now: i64) -> Vec<Item> {
+    let mut out = Vec::new();
+    for rec in crate::delivery::records(state_dir).into_values() {
+        let id = rec.issue.as_str();
+        let age = now - rec.since;
+        let pr = rec.pr.as_deref();
+        if rec.disable_auto {
+            out.push(
+                item(
+                    18,
+                    "auto_merge_on",
+                    &format!("{id}: auto-merge is on for a head nobody approved — turn it off"),
+                    age,
+                    &rec.project,
+                    pr,
+                    &cmd_delivery_sync(id),
+                )
+                .about("issue", id)
+                .for_agent(&rec.worker)
+                .since(Some(rec.since)),
+            );
+        }
+        let row = match rec.state {
+            crate::delivery::State::Passed if rec.merge_ready() => {
+                let v = rec
+                    .verdict
+                    .clone()
+                    .unwrap_or_else(|| crate::delivery::VerdictRec {
+                        verdict: String::new(),
+                        sha: String::new(),
+                        reviewer: String::new(),
+                        summary: String::new(),
+                        report: String::new(),
+                        at: rec.since,
+                    });
+                let o = rec.observed.clone().unwrap_or_default();
+                let number = pr
+                    .and_then(|u| crate::issue::task_report::parse_pr_url(u).ok())
+                    .map(|(_, n)| format!(" #{n}"))
+                    .unwrap_or_default();
+                let mut row = item(
+                    22,
+                    "merge",
+                    &format!(
+                        "merge? {id}{number} by {} — PASS by {}: {} (+{} −{}, {} files)",
+                        rec.worker, v.reviewer, v.summary, o.additions, o.deletions, o.files
+                    ),
+                    now - v.at,
+                    &rec.project,
+                    pr,
+                    &cmd_delivery_merge(id),
+                )
+                .about("issue", id)
+                .for_agent(&rec.worker)
+                .owned_by(Some(&rec.worker))
+                .since(Some(v.at));
+                row.json["merge"] = json!({
+                    "issue": id, "pr": pr, "sha": v.sha, "owner": rec.worker,
+                    "reviewer": v.reviewer, "verdict_summary": v.summary,
+                    "report": v.report, "additions": o.additions,
+                    "deletions": o.deletions, "files": o.files,
+                    "decline": cmd_delivery_decline(id),
+                });
+                Some(row)
+            }
+            crate::delivery::State::Escalated => Some(
+                item(
+                    24,
+                    "review_escalated",
+                    &format!(
+                        "{id}: {} REVISE verdicts — the review did not converge",
+                        rec.revisions
+                    ),
+                    age,
+                    &rec.project,
+                    pr,
+                    &cmd_issue_show(id),
+                )
+                .about("issue", id)
+                .for_agent(&rec.worker)
+                .since(Some(rec.since)),
+            ),
+            crate::delivery::State::Unstaffed => Some(
+                item(
+                    26,
+                    "review_unstaffed",
+                    &format!("{id}: no reviewer is staffed for its review"),
+                    age,
+                    &rec.project,
+                    pr,
+                    "cadence agent list",
+                )
+                .about("issue", id)
+                .for_agent(&rec.worker)
+                .since(Some(rec.since)),
+            ),
+            _ => None,
+        };
+        out.extend(row);
+    }
+    out
 }
 
 /// Urgency order: kind rank ascending, then oldest first inside a kind.
@@ -2755,6 +2884,7 @@ fn overview_from(
             );
         }
         needs.extend(intake);
+        needs.extend(delivery_items(state_dir, now));
         if clock.skipped > 0 {
             degraded_notes.push(degraded(
                 "tracker_status_time",

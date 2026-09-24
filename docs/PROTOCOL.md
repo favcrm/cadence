@@ -104,6 +104,11 @@ Error kinds:
 | `slot_launch` | `recipe, project, worktree?, wait_secs?` | `{runner_id,state:"queued",project,recipe,kind,digest,head_sha,log_path,lane,requester}` — CAD-230b: the daemon runs one of the project's `build.recipes` as a *runner* under an exec-bound strict slot (see Daemon-launched runners below). Only these four fields are accepted — `argv`, `cmd`, `env`, `cwd`, `lane`, `alias`, `pid` or anything else is refused by name. The requester must derive a pane (legacy), an active enrolled managed endpoint, or pass operator proof; the runner's process tree never launches — attached, or detached and env-scrubbed: the daemon is its child subreaper, so a detached descendant stays a daemon descendant and fails operator proof (CAD-308). Answers at once; poll `slot_runner`. `cadence build-slot launch <recipe> [--project] [--worktree] [--wait-secs] [--detach]` |
 | `slot_runner` | `runner_id` | the runner's receipt `{runner_id,project,recipe,kind,digest,head_sha,dirty,worktree,cwd,argv,env,requester,state,complete,last_state?,pid,starttime,enrollment_id,created,started,ended,exit_code,signal,reason,log_path}` — readable by any connection with a slot identity or operator proof; carries no token. `cadence build-slot runner <id>` |
 | `slot_reconcile` | `enrollment_id, token, evidence:{owner_generation,pid,starttime,uid,observed_at,process_read,command_outcome,side_effect_review}` | `{reconciled:true,token,kind,observed}` — the one operator path over a strict hold. Operator authority needs positive proof (CAD-276): refused from any connection that derives a slot identity (a pane or an enrolled endpoint is an agent), and from one that is not provably the operator — the peer must run as the daemon's uid with a fully readable ancestry on which no hop is a registered pane, an enrolled or tombstoned root, a descendant of the daemon (the daemon is the child subreaper of everything it launches, so a `setsid -f`/double-fork orphan of one of its trees stays its descendant — CAD-308), or a same-uid process carrying `CADENCE_ALIAS` or `CADENCE_RUNNER_ID` (a daemon-launched runner's tree, CAD-230b), hold no pane pty, and have its session leader on that ancestry (a `setsid` + double-fork orphan does not); refused too when the request carries `by`/`operator`/`actor`/`alias`/`lane`/`pid`. The evidence must name the recorded hold exactly; the daemon then reads `/proc` itself and frees only on proven death — a live or unknown holder is refused whatever the evidence says. `cadence build-slot reconcile <enrollment_id> <token> --evidence <json>` |
+| `report_verdict` | `issue, text` | the stored report (`{id, report, path, kind:"verdict", agent, committed, duplicate}`) plus `delivery` (the ticket's loop record). CAD-431: the only way a `verdict` report is filed — `text` is the report Markdown (`verdict: pass\|revise`, `sha:`, findings as the body). See "Worker loop" for who may file it |
+| `delivery_list` | `issue?` | `{records:[Record]}` — the worker loop's records (CAD-431), oldest dispatch first. A read, open to anyone (the master included) |
+| `delivery_observe` | `issue, head, pr_state (OPEN\|MERGED\|CLOSED), ci_green?, auto_merge?, additions?, deletions?, files?` | `{issue, state, was, disable_auto, merge_ready}` — what the operator's process read from GitHub. **Operator only** |
+| `delivery_merge` | `issue, phase (authorize\|check\|enqueued), sha?` | `authorize`/`check`: `{issue, sha, pr}`; `enqueued`: the record, now `enqueued`. **Operator only** |
+| `delivery_decline` | `issue, reason` | the record, now `declined`, `note` = the reason. **Operator only** |
 
 `alias`, `provider`, `message` ids: `^[a-z0-9][a-z0-9-]{0,63}$`.
 `text`: 1–48000 chars. `reply_to` may not equal `alias`.
@@ -153,6 +158,8 @@ below they are refused, naming the field, and nothing is written.
 | `message_reconcile`, `agent_unfence` | the proven operator; the record says `by:"operator"` | every agent: the fenced one, a peer and its own PM ("reconciliation is an explicit operator decision"). A PM cannot unfence or reconcile its worker; it escalates to the operator |
 | `agent_respond` | the proven operator, or the requester's own PM (`params.upstream`, bound to the PM's registration as in `agent_set`) | the requesting agent itself, a peer, another group's PM |
 | `plan_approve`, `plan_reject`, `approval_record`, `approval_revoke`, `model_defaults_set`, `slot_reconcile` | the proven operator (`operator_connection`) | every agent |
+| `report_verdict` | the ticket's assigned reviewer, by its verified connection (a pane or enrolled managed endpoint) | the ticket's worker (`… never judges its own work`), any other agent (`… review is assigned to r1, not r2`), the master (not on its allowlist), the operator (`… decides at the merge`), a frontmatter `agent` naming anyone but the caller, and a verdict whose `sha` is not the head under review (`stale verdict`) |
+| `delivery_observe`, `delivery_merge`, `delivery_decline` | the proven operator (`operator_connection`) | every agent, and a detached child of any agent |
 | `project_new` | the proven operator (`operator_connection`) or the master by its verified connection (`caller_is_master`, CAD-339); identity-shaped fields are refused for both first; the commit's `Actor:` is `operator` or `master` | every other agent, and a detached child of any agent (the master's included) |
 | running turn tokens (any answer) | only the connection that derives the agent owning the turn | everyone else, the operator and the board included, reads `null` for that `turn_id` (and `[turn token withheld]` where prose quotes it), whether or not the token is current |
 
@@ -1923,6 +1930,59 @@ A caller with no derivable pane identity — the operator's own shell
 included — sees the slot calls refused; the footers then simply omit
 the slot line rather than fail.
 Nothing here kills a process or cancels anyone's work.
+
+## Worker loop (CAD-431)
+
+A ticket the master dispatches (`master_dispatch`) enters the loop: the
+daemon keeps one record per ticket in `<state>/delivery.json`, and only
+the daemon writes it. Report files never move a ticket through the loop.
+
+1. **Done → review.** The report router (the same pass that routes
+   reports to the master) takes the worker's newest `done` report filed
+   after the dispatch. It needs `sha:` (the head) and `pr:`
+   (`https://github.com/<owner>/<repo>/pull/<n>`); without them the
+   worker is told to file again. The daemon picks the reviewer: never
+   the worker, never the master, never a fenced or disabled agent or an
+   inbox. The previous round's reviewer keeps the ticket while it
+   qualifies; otherwise an agent of a different provider from the
+   worker's wins, else another session of the same provider. With
+   nobody eligible the record is `unstaffed` (a Needs-you row) and the
+   router retries every pass. The kickoff is composed by the daemon on
+   one line: the PR, the head, the acceptance criteria (or the ticket
+   path when they do not fit the endpoint's kickoff ceiling), and the
+   pinning rules.
+2. **Verdict.** `cadence report file --task <ID> --kind verdict --file
+   <f>` sends the report to `report_verdict`. The daemon derives the
+   caller from the connection and files it only for the assigned
+   reviewer, while the ticket is `reviewing`, for exactly the head under
+   review. REVISE goes back to the worker as a message pinned to the
+   ticket (the record returns to `working`); the worker fixes, pushes
+   and files a new `done`. The second REVISE does not go back: the
+   record is `escalated`, a Needs-you row for the operator. PASS makes
+   the record `passed`.
+3. **Merge decision.** GitHub facts come only from the operator's own
+   process: `cadence delivery sync` reads each PR with the operator's
+   `gh` (head, CI rollup, diff stats, auto-merge) and hands them to
+   `delivery_observe`. A PASS whose head GitHub shows open and green is
+   one `merge` row in Needs-you: owner, age, PR link, the verdict's
+   first line, diff stats. `cadence delivery merge <ID>` checks with
+   the daemon, re-reads the PR, then runs `gh pr merge <n> -R
+   <owner/repo> --auto --squash --match-head-commit <reviewed sha>` and
+   records `enqueued`. `cadence delivery decline <ID> --reason …`
+   records the reason. Both are refused for any agent before `gh` runs.
+4. **Head moves.** A new `done` sha, or an observed head that differs
+   from the reviewed one while `reviewing`, `passed` or `enqueued`,
+   re-enters review at the new head, and the old PASS is stale.
+   Whenever auto-merge is on for a head that is not the enqueued,
+   reviewed one, `delivery_observe` answers `disable_auto: true` and
+   `sync` runs `gh pr merge <n> --disable-auto`; until an observation
+   shows it off, Needs-you carries an `auto_merge_on` row. A `MERGED`
+   or `CLOSED` observation ends the loop.
+
+The daemon never runs `gh`, and no agent environment needs GitHub
+credentials for the loop. `cadence delivery sync --watch <secs>` keeps
+the observations current; the board route for Merge/Decline follows
+the operator rule of the chat-first Home (CAD-328).
 
 ## Recovery
 

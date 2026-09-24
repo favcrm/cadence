@@ -56,6 +56,8 @@ pub const MASTER_ALLOWED: &[&str] = &[
     "master_summary",
     "message_report",
     "interrupt",
+    // CAD-431: read the review loop (never file a verdict or decide).
+    "delivery_list",
 ];
 
 /// Most reports one router pass queues to the master; the rest wait for
@@ -305,6 +307,11 @@ impl Shared {
         // and recording that would hand the master interrupt rights over
         // it (CAD-323).
         if out["dispatched"] != json!(false) {
+            // CAD-431: the ticket enters the review loop; its worker's
+            // done report is what moves it on.
+            if let Err(e) = self.delivery_start(id, &ticket.project, &to) {
+                tracing::warn!("delivery record for {id}: {e}");
+            }
             let _ = self.store.event_public(
                 DAEMON_ALIAS,
                 "master_dispatched",
@@ -588,6 +595,9 @@ impl Shared {
                 if let Err(e) = self.route_reports() {
                     tracing::debug!("report router: {e}");
                 }
+                if let Err(e) = self.route_delivery() {
+                    tracing::debug!("delivery router: {e}");
+                }
                 next = Instant::now() + every;
             }
             std::thread::sleep(std::time::Duration::from_millis(250));
@@ -646,7 +656,7 @@ impl Shared {
                     };
                     let name = row["name"].as_str().unwrap_or_default();
                     let route = match row["kind"].as_str() {
-                        Some("done" | "blocked") => at >= baseline,
+                        Some("done" | "blocked" | "verdict") => at >= baseline,
                         Some("question") => {
                             row["open"] == true
                                 && !escalated.contains_key(&format!("{id}/{name}"))

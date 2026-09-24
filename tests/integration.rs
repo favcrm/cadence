@@ -42875,4 +42875,553 @@ fn cad323_refused_interrupt_is_recorded() {
         .as_str()
         .unwrap()
         .contains("no provider-native"));
+
+// ==== CAD-431: the worker loop — review routing, verdicts, merge ====
+
+/// A fake `gh` for the operator's process: `pr view` answers from
+/// `gh-state.json` beside it, `pr merge` enqueues (refusing a head that
+/// is not the pinned one) or disables auto-merge. Every call is logged
+/// to `gh.log`.
+const FAKE_GH_PY: &str = r#"#!/usr/bin/env python3
+import json, os, sys
+d = os.path.dirname(os.path.abspath(__file__))
+state_p = os.path.join(d, "gh-state.json")
+with open(os.path.join(d, "gh.log"), "a") as f:
+    f.write(" ".join(sys.argv[1:]) + "\n")
+st = json.load(open(state_p))
+a = sys.argv[1:]
+if a[:2] == ["pr", "view"]:
+    run = {"__typename": "CheckRun", "name": "ci", "status": "COMPLETED", "conclusion": "SUCCESS"}
+    if not st["green"]:
+        run = {"__typename": "CheckRun", "name": "ci", "status": "IN_PROGRESS", "conclusion": None}
+    print(json.dumps({"headRefOid": st["head"], "state": st["state"],
+                      "statusCheckRollup": [run], "additions": 12, "deletions": 3,
+                      "changedFiles": 2,
+                      "autoMergeRequest": {"enabledAt": "x"} if st["auto"] else None}))
+elif a[:2] == ["pr", "merge"]:
+    if "--disable-auto" in a:
+        st["auto"] = False
+    else:
+        sha = a[a.index("--match-head-commit") + 1]
+        if sha != st["head"]:
+            sys.stderr.write("head moved\n")
+            sys.exit(1)
+        st["auto"] = True
+    json.dump(st, open(state_p, "w"))
+else:
+    sys.exit(2)
+"#;
+
+const LOOP_PR: &str = "https://github.com/acme/app/pull/7";
+
+/// The loop's fixture: a routed tracker + daemon, the master, a managed
+/// worker `w1`, managed agents `r1` (the reviewer: first by alias among
+/// same-provider peers) and `r2` (a bystander), and a fake `gh` only the
+/// operator's process has on its PATH.
+struct LoopFixture {
+    f: PlanFixture,
+    m: ManagedWorker,
+    w1: ManagedWorker,
+    r1: ManagedWorker,
+    r2: ManagedWorker,
+    gh_dir: PathBuf,
+}
+
+impl LoopFixture {
+    /// Up to D-2 dispatched by the master to w1.
+    fn dispatched() -> LoopFixture {
+        let f = PlanFixture::start_routed();
+        let (mut m, _) = f.start_master();
+        let w1 = ManagedWorker::start(&f.d, "w1");
+        let r1 = ManagedWorker::start(&f.d, "r1");
+        let r2 = ManagedWorker::start(&f.d, "r2");
+        let plan = f.file("plan.md", MASTER_PLAN);
+        let (ok, out) = f.as_master(
+            &mut m,
+            &format!("plan propose --project demo --file {plan}"),
+        );
+        assert!(ok, "{out}");
+        f.d.operator_rpc("plan_approve", json!({"epic": "D-1"}))
+            .unwrap();
+        let (ok, sent) = f.as_master(&mut m, "master dispatch D-2");
+        assert!(ok, "{sent}");
+        let gh_dir = f.tmp.path().join("ghbin");
+        std::fs::create_dir_all(&gh_dir).unwrap();
+        let gh = gh_dir.join("gh");
+        std::fs::write(&gh, FAKE_GH_PY).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let lf = LoopFixture {
+            f,
+            m,
+            w1,
+            r1,
+            r2,
+            gh_dir,
+        };
+        lf.set_gh(&"0".repeat(40), "OPEN", false, false);
+        assert_eq!(lf.rec()["state"], "working", "{}", lf.rec());
+        lf
+    }
+
+    fn set_gh(&self, head: &str, state: &str, green: bool, auto: bool) {
+        std::fs::write(
+            self.gh_dir.join("gh-state.json"),
+            json!({"head": head, "state": state, "green": green, "auto": auto}).to_string(),
+        )
+        .unwrap();
+    }
+
+    fn gh_log(&self) -> String {
+        std::fs::read_to_string(self.gh_dir.join("gh.log")).unwrap_or_default()
+    }
+
+    fn rec(&self) -> Value {
+        self.f
+            .d
+            .rpc("delivery_list", json!({"issue": "D-2"}))
+            .unwrap()["records"][0]
+            .clone()
+    }
+
+    fn wait_rec(&self, what: &str, ok: impl Fn(&Value) -> bool) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let r = self.rec();
+            if ok(&r) {
+                return r;
+            }
+            assert!(Instant::now() < deadline, "never {what}: {r:#}");
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// What a refusal must leave untouched: tracker commits, the loop's
+    /// record, and every queued message.
+    fn snapshot(&self) -> (usize, String, usize, usize, usize) {
+        (
+            self.f.commits(),
+            std::fs::read_to_string(self.f.d.state.join("delivery.json")).unwrap_or_default(),
+            self.f.messages_of("w1").len(),
+            self.f.messages_of("r1").len(),
+            self.gh_log()
+                .lines()
+                .filter(|l| l.contains("pr merge"))
+                .count(),
+        )
+    }
+
+    /// `cadence <args>` run by a managed agent's tool subprocess.
+    fn as_agent(&mut self, who: &str, args: &str) -> (bool, Value) {
+        let line = format!(
+            "env CADENCE_PM_DIR={} {}",
+            self.f.pm_dir.display(),
+            self.f.master_line(args)
+        );
+        let agent = match who {
+            "w1" => &mut self.w1,
+            "r1" => &mut self.r1,
+            "r2" => &mut self.r2,
+            _ => unreachable!(),
+        };
+        let r = agent.exec(&["sh", "-c", &line]);
+        let out = r["out"].as_str().unwrap_or_default();
+        let text = if out.trim().is_empty() {
+            r["err"].as_str().unwrap_or_default()
+        } else {
+            out
+        };
+        let value =
+            serde_json::from_str(text.trim()).unwrap_or_else(|_| Value::String(text.to_string()));
+        (r["rc"] == 0, value)
+    }
+
+    /// `cadence <args>` from the operator's own shell, with the fake
+    /// `gh` first on its PATH.
+    fn operator(&self, args: &[&str]) -> (bool, Value) {
+        let path = format!(
+            "PATH={}:{}",
+            self.gh_dir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let bin = env!("CARGO_BIN_EXE_cadence");
+        let state = self.f.d.state.to_str().unwrap().to_string();
+        let mut argv = vec!["env", path.as_str(), bin, "--state-dir", state.as_str()];
+        argv.extend_from_slice(args);
+        let script = self.f.d.dir.path().join("operator-cli.py");
+        if !script.exists() {
+            std::fs::write(&script, OPERATOR_CLI_PY).unwrap();
+        }
+        let out = self
+            .f
+            .d
+            .dir
+            .path()
+            .join(format!("op-{}.json", uuid::Uuid::new_v4().simple()));
+        let status = std::process::Command::new("setsid")
+            .arg("-f")
+            .arg("python3")
+            .arg(&script)
+            .arg(&out)
+            .arg(std::process::id().to_string())
+            .args(&argv)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", self.f.d.dir.path())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !out.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "operator {args:?} never finished"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        let text = if v["stdout"].as_str().unwrap_or_default().trim().is_empty() {
+            v["stderr"].as_str().unwrap_or_default().to_string()
+        } else {
+            v["stdout"].as_str().unwrap_or_default().to_string()
+        };
+        let value = serde_json::from_str(text.trim()).unwrap_or(Value::String(text));
+        (v["rc"] == 0, value)
+    }
+
+    /// The worker files `done` at `sha` (its own report, by alias).
+    fn done(&self, sha: &str) {
+        let report = self.f.file(
+            &format!("done-{sha}.md"),
+            &format!("---\nkind: done\nsha: {sha}\npr: {LOOP_PR}\n---\n{REFLECTION}"),
+        );
+        let (ok, out) = self.f.cli_as(
+            "w1",
+            &[
+                "report", "file", "--task", "D-2", "--kind", "done", "--file", &report,
+            ],
+        );
+        assert!(ok, "{out}");
+    }
+
+    fn verdict_file(&self, name: &str, verdict: &str, sha: &str, extra: &str) -> String {
+        self.f.file(
+            name,
+            &format!(
+                "---\nverdict: {verdict}\nsha: {sha}\n{extra}---\n{verdict} findings: the \
+                 migration lacks a down step.\n"
+            ),
+        )
+    }
+
+    fn verdict_as(&mut self, who: &str, verdict: &str, sha: &str) -> (bool, Value) {
+        let file = self.verdict_file(&format!("v-{who}-{verdict}-{sha}.md"), verdict, sha, "");
+        self.as_agent(
+            who,
+            &format!("report file --task D-2 --kind verdict --file {file}"),
+        )
+    }
+
+    fn needs(&self, kind: &str) -> Vec<Value> {
+        self.f
+            .needs_me()
+            .into_iter()
+            .filter(|r| {
+                r["kind"] == kind
+                    || r["causes"]
+                        .as_array()
+                        .is_some_and(|c| c.iter().any(|c| c["cause"] == kind))
+            })
+            .collect()
+    }
+}
+
+/// CAD-431 acceptance, end to end with fake providers and a fake `gh`:
+/// plan approved → master_dispatch → worker done → reviewer REVISE →
+/// worker fix → reviewer PASS → merge decision in Needs-you → merged.
+/// On the way every adversarial caller is refused having written
+/// nothing: the worker and the master filing a verdict, the operator
+/// filing one, a forged author, a verdict for a stale head, a verdict
+/// file planted in the tracker, and agents pressing merge. A head that
+/// moves after the merge was enqueued turns auto-merge off and
+/// re-enters review.
+#[test]
+fn delivery_loop_review_revise_pass_merge_end_to_end() {
+    let mut lf = LoopFixture::dispatched();
+    let (a, b, c) = ("a".repeat(40), "b".repeat(40), "c".repeat(40));
+
+    // Worker done → the daemon routes a review to r1 (never w1, never
+    // the master), composed from the ticket.
+    lf.done(&a);
+    let rec = lf.wait_rec("reviewing", |r| r["state"] == "reviewing");
+    assert_eq!(rec["reviewer"], "r1", "{rec}");
+    assert_eq!(rec["head"], a, "{rec}");
+    let kickoff =
+        lf.f.messages_of("r1")
+            .into_iter()
+            .find(|m| m["id"].as_str().is_some_and(|i| i.starts_with("review-")))
+            .expect("r1 got the review kickoff");
+    let text = kickoff["body"].as_str().unwrap();
+    for needle in [
+        LOOP_PR,
+        a.as_str(),
+        "migration adds reminders",
+        "--kind verdict",
+    ] {
+        assert!(text.contains(needle), "{needle}: {text}");
+    }
+    assert!(!lf
+        .f
+        .messages_of("master")
+        .iter()
+        .any(|m| m["id"].as_str().is_some_and(|i| i.starts_with("review-"))));
+
+    // Adversarial verdicts: each refused, nothing written.
+    let before = lf.snapshot();
+    let (ok, err) = lf.verdict_as("w1", "pass", &a);
+    assert!(
+        !ok && err.to_string().contains("never judges its own work"),
+        "{err}"
+    );
+    let (ok, err) = lf.verdict_as("r2", "pass", &a);
+    assert!(
+        !ok && err.to_string().contains("assigned to r1, not r2"),
+        "{err}"
+    );
+    let file = lf.verdict_file("forged.md", "pass", &a, "agent: r1\n");
+    let (ok, err) = lf.as_agent(
+        "w1",
+        &format!("report file --task D-2 --kind verdict --file {file}"),
+    );
+    assert!(
+        !ok && err.to_string().contains("is not the caller"),
+        "{err}"
+    );
+    let (ok, err) = lf.f.as_master(
+        &mut lf.m,
+        &format!("report file --task D-2 --kind verdict --file {file}"),
+    );
+    assert!(
+        !ok && err.to_string().contains("may not call report_verdict"),
+        "{err}"
+    );
+    let (ok, err) = lf.operator(&[
+        "report", "file", "--task", "D-2", "--kind", "verdict", "--file", &file,
+    ]);
+    assert!(
+        !ok && err.to_string().contains("assigned reviewer"),
+        "{err}"
+    );
+    let (ok, err) = lf.verdict_as("r1", "pass", &b);
+    assert!(!ok && err.to_string().contains("stale verdict"), "{err}");
+    // A forged identity field on the wire.
+    let err =
+        lf.f.d
+            .rpc(
+                "report_verdict",
+                json!({"issue": "D-2", "text": "x", "reviewer": "r1"}),
+            )
+            .unwrap_err();
+    assert!(err.to_string().contains("'reviewer'"), "{err}");
+    // A verdict written straight into the tracker moves nothing.
+    let planted = lf.f.pm_dir.join("demo/D-2/reports/20990101T000000Z-r1.md");
+    std::fs::write(
+        &planted,
+        format!("---\nschema: cadence.report/2\nkind: verdict\ntask: D-2\nagent: r1\nverdict: pass\nsha: {a}\n---\nok\n"),
+    )
+    .unwrap();
+    thread::sleep(Duration::from_millis(2500));
+    std::fs::remove_file(&planted).unwrap();
+    assert_eq!(lf.snapshot(), before, "a refusal wrote something");
+    assert_eq!(lf.rec()["state"], "reviewing");
+
+    // Reviewer REVISE → back to w1, pinned to D-2.
+    let (ok, out) = lf.verdict_as("r1", "revise", &a);
+    assert!(ok, "{out}");
+    assert_eq!(out["delivery"]["state"], "working", "{out}");
+    assert_eq!(out["delivery"]["revisions"], 1, "{out}");
+    let revise =
+        lf.f.messages_of("w1")
+            .into_iter()
+            .find(|m| m["id"].as_str().is_some_and(|i| i.starts_with("revise-")))
+            .expect("w1 got the REVISE");
+    let text = revise["body"].as_str().unwrap();
+    assert!(text.contains("D-2") && text.contains("down step"), "{text}");
+    assert!(lf.needs("merge").is_empty());
+
+    // Worker fix → round 2 at the new head, same reviewer.
+    lf.done(&b);
+    let rec = lf.wait_rec("round 2", |r| r["state"] == "reviewing" && r["head"] == b);
+    assert_eq!(rec["rounds"], 2, "{rec}");
+    let before = lf.snapshot();
+    let (ok, err) = lf.verdict_as("r1", "pass", &a);
+    assert!(!ok && err.to_string().contains("stale verdict"), "{err}");
+    assert_eq!(lf.snapshot(), before);
+
+    // Reviewer PASS at b. No merge row until the operator's process saw
+    // the head green.
+    let (ok, out) = lf.verdict_as("r1", "pass", &b);
+    assert!(ok, "{out}");
+    assert_eq!(out["delivery"]["state"], "passed", "{out}");
+    assert!(lf.needs("merge").is_empty());
+    lf.set_gh(&b, "OPEN", false, false);
+    let (ok, out) = lf.operator(&["delivery", "sync"]);
+    assert!(ok, "{out}");
+    assert!(lf.needs("merge").is_empty(), "CI not green yet");
+    lf.set_gh(&b, "OPEN", true, false);
+    let (ok, out) = lf.operator(&["delivery", "sync"]);
+    assert!(ok, "{out}");
+    let rows = lf.needs("merge");
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    let row = &rows[0];
+    assert_eq!(row["audience"], "operator", "{row}");
+    assert_eq!(row["link"], LOOP_PR, "{row}");
+    assert_eq!(row["merge"]["owner"], "w1", "{row}");
+    assert_eq!(row["merge"]["reviewer"], "r1", "{row}");
+    assert_eq!(row["merge"]["sha"], b, "{row}");
+    assert_eq!(row["merge"]["additions"], 12, "{row}");
+    assert_eq!(row["merge"]["files"], 2, "{row}");
+    assert!(row["merge"]["verdict_summary"]
+        .as_str()
+        .unwrap()
+        .contains("down step"));
+    assert!(row["age"].is_i64(), "{row}");
+
+    // Agents pressing merge (or decline, or observe) are refused before
+    // any gh call.
+    let before = lf.snapshot();
+    let (ok, err) = lf.f.as_master(&mut lf.m, "delivery merge D-2");
+    assert!(!ok, "{err}");
+    for who in ["r1", "w1"] {
+        let (ok, err) = lf.as_agent(who, "delivery merge D-2");
+        assert!(
+            !ok && err.to_string().contains("operator action"),
+            "{who}: {err}"
+        );
+        let (ok, err) = lf.as_agent(who, "delivery decline D-2 --reason no");
+        assert!(
+            !ok && err.to_string().contains("operator action"),
+            "{who}: {err}"
+        );
+    }
+    // On the wire too — the reviewer's own connection and its detached
+    // grandchildren (env kept, or scrubbed) — for every operator verb.
+    for (method, params) in [
+        (
+            "delivery_observe",
+            json!({"issue": "D-2", "head": c, "pr_state": "OPEN", "ci_green": true}),
+        ),
+        ("delivery_merge", json!({"issue": "D-2", "phase": "check"})),
+        (
+            "delivery_merge",
+            json!({"issue": "D-2", "phase": "enqueued", "sha": b}),
+        ),
+        ("delivery_decline", json!({"issue": "D-2", "reason": "no"})),
+    ] {
+        for how in ["self", "detached", "detached-bare"] {
+            let r = lf.r1.rpc(how, method, params.clone());
+            assert_eq!(r["ok"], false, "{how} {method}: {r}");
+            let msg = r["error"]["message"].as_str().unwrap_or_default();
+            assert!(msg.contains("operator"), "{how} {method}: {r}");
+        }
+    }
+    assert_eq!(lf.snapshot(), before, "an agent's merge wrote something");
+    assert_eq!(lf.rec()["state"], "passed");
+    assert!(!lf.gh_log().contains("pr merge"), "{}", lf.gh_log());
+
+    // The operator merges: enqueued in the merge queue pinned to b.
+    let (ok, out) = lf.operator(&["delivery", "merge", "D-2"]);
+    assert!(ok, "{out}");
+    assert_eq!(out["state"], "enqueued", "{out}");
+    assert!(
+        lf.gh_log().contains(&format!(
+            "pr merge 7 -R acme/app --auto --squash --match-head-commit {b}"
+        )),
+        "{}",
+        lf.gh_log()
+    );
+    assert!(lf.needs("merge").is_empty());
+
+    // The head moves after the review: auto-merge goes off and the new
+    // head re-enters review; the old PASS is stale.
+    lf.set_gh(&c, "OPEN", true, true);
+    let (ok, out) = lf.operator(&["delivery", "sync"]);
+    assert!(ok, "{out}");
+    assert_eq!(out["synced"][0]["auto_merge_disabled"], true, "{out}");
+    assert!(
+        lf.gh_log()
+            .contains("pr merge 7 -R acme/app --disable-auto"),
+        "{}",
+        lf.gh_log()
+    );
+    let rec = lf.rec();
+    assert_eq!(rec["state"], "reviewing", "{rec}");
+    assert_eq!(rec["head"], c, "{rec}");
+    assert_eq!(rec["rounds"], 3, "{rec}");
+    let (ok, err) = lf.verdict_as("r1", "pass", &b);
+    assert!(!ok && err.to_string().contains("stale verdict"), "{err}");
+    // The next sync sees auto-merge off: nothing left to turn off.
+    let (ok, _) = lf.operator(&["delivery", "sync"]);
+    assert!(ok);
+    assert_eq!(lf.rec()["disable_auto"], false);
+
+    // PASS at c → merge → merged.
+    let (ok, out) = lf.verdict_as("r1", "pass", &c);
+    assert!(ok, "{out}");
+    let (ok, out) = lf.operator(&["delivery", "merge", "D-2"]);
+    assert!(ok, "{out}");
+    assert!(lf.gh_log().contains(&format!("--match-head-commit {c}")));
+    lf.set_gh(&c, "MERGED", true, false);
+    let (ok, out) = lf.operator(&["delivery", "sync"]);
+    assert!(ok, "{out}");
+    assert_eq!(lf.rec()["state"], "merged", "{}", lf.rec());
+    for kind in ["merge", "review_escalated", "auto_merge_on"] {
+        assert!(lf.needs(kind).is_empty(), "{kind}");
+    }
+}
+
+/// CAD-431: two REVISE verdicts escalate to the operator's Needs-you
+/// instead of a third round; the operator declines with a reason. The
+/// escalated ticket takes no more verdicts, and only the operator
+/// declines.
+#[test]
+fn delivery_loop_escalates_after_two_revise_rounds() {
+    let mut lf = LoopFixture::dispatched();
+    let (a, b) = ("a".repeat(40), "b".repeat(40));
+    lf.done(&a);
+    lf.wait_rec("reviewing a", |r| r["state"] == "reviewing");
+    let (ok, out) = lf.verdict_as("r1", "revise", &a);
+    assert!(ok, "{out}");
+    lf.done(&b);
+    lf.wait_rec("reviewing b", |r| {
+        r["state"] == "reviewing" && r["head"] == b
+    });
+    let (ok, out) = lf.verdict_as("r1", "revise", &b);
+    assert!(ok, "{out}");
+    assert_eq!(out["delivery"]["state"], "escalated", "{out}");
+    let revises =
+        lf.f.messages_of("w1")
+            .into_iter()
+            .filter(|m| m["id"].as_str().is_some_and(|i| i.starts_with("revise-")))
+            .count();
+    assert_eq!(revises, 1, "the second REVISE goes to the operator, not w1");
+    let rows = lf.needs("review_escalated");
+    assert_eq!(rows.len(), 1, "{:#?}", lf.f.needs_me());
+    assert_eq!(rows[0]["audience"], "operator");
+    // A third done does not start round 3.
+    lf.done(&"d".repeat(40));
+    thread::sleep(Duration::from_millis(2500));
+    assert_eq!(lf.rec()["state"], "escalated");
+    let before = lf.snapshot();
+    let (ok, err) = lf.as_agent("w1", "delivery decline D-2 --reason stop");
+    assert!(!ok && err.to_string().contains("operator action"), "{err}");
+    assert_eq!(lf.snapshot(), before);
+    let (ok, out) = lf.operator(&["delivery", "decline", "D-2", "--reason", "scope too big"]);
+    assert!(ok, "{out}");
+    assert_eq!(out["state"], "declined", "{out}");
+    assert_eq!(out["note"], "scope too big", "{out}");
+    assert!(lf.needs("review_escalated").is_empty());
 }

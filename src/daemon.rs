@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+mod delivery_rpc;
 mod master_rpc;
 
 /// CAD-339: the daemon methods a master connection may call.
@@ -518,6 +519,9 @@ pub struct Shared {
     /// check and its dispatch are one step, so concurrent calls for a
     /// ticket dispatch it once.
     dispatch_lock: Mutex<()>,
+    /// CAD-431: serializes every transition of the worker loop's
+    /// record (`delivery.json`).
+    delivery_lock: Mutex<()>,
 }
 
 impl Shared {
@@ -588,6 +592,7 @@ impl Shared {
             router_backlog: std::sync::atomic::AtomicUsize::new(0),
             escalation_lock: Mutex::new(()),
             dispatch_lock: Mutex::new(()),
+            delivery_lock: Mutex::new(()),
             auto_stop: AutoStopTimer::new(opts.auto_stop.clone(), opts.auto_stop_clock.clone()),
         });
         // Holds dropped by boot-time revalidation get their release
@@ -2282,6 +2287,11 @@ impl Shared {
             "master_start" => self.rpc_master_start(params, peer_pid),
             "master_summary" => self.rpc_master_summary(params, peer_pid),
             "reports_changed" => self.rpc_reports_changed(peer_pid),
+            "report_verdict" => self.rpc_report_verdict(params, peer_pid),
+            "delivery_list" => self.rpc_delivery_list(params),
+            "delivery_observe" => self.rpc_delivery_observe(params, peer_pid),
+            "delivery_merge" => self.rpc_delivery_merge(params, peer_pid),
+            "delivery_decline" => self.rpc_delivery_decline(params, peer_pid),
             other => Err(Error::rejected(format!("Unknown method '{other}'"))),
         }
     }
