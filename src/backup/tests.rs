@@ -1067,3 +1067,51 @@ fn cad319_export_scans_and_redacts_thread_entries() {
     assert!(!err.contains(&pat), "{err}");
     assert!(!out_dir.exists());
 }
+
+/// CAD-410: a private key with no END marker (a head-limited read quoted
+/// in thread prose) is redacted when the store writes it, so none of its
+/// body reaches the export bundle — the export's own scan only flags a
+/// whole key.
+#[test]
+fn cad410_export_carries_no_body_of_a_truncated_private_key() {
+    let root = TempDir::new().unwrap();
+    let state = root.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let body: Vec<String> = (0..8)
+        .map(|i| noise(&format!("cad410-export:{i}"), 64))
+        .collect();
+    let key = format!(
+        "{}\n{}",
+        ["-----BEGIN ", "PRIVATE", " KEY-----"].concat(),
+        body.join("\n")
+    );
+    {
+        drop(Store::open(&live(&state)).unwrap());
+        let conn = writer(&state);
+        add_agent(&conn, "master", "/nowhere");
+        drop(conn);
+        let store = Store::open(&live(&state)).unwrap();
+        store.ensure_thread("master").unwrap();
+        store
+            .enqueue("master", "show me the key", None, "m1", "user")
+            .unwrap();
+        store.mark_running("m1", "tok-cad410").unwrap();
+        store
+            .thread_append_running(
+                "master",
+                crate::store::ROLE_AGENT,
+                crate::store::KIND_ASSISTANT_TEXT,
+                &format!("head -n 9 of the key file:\n{key}"),
+                Some(serde_json::json!({"quoted": key})),
+            )
+            .unwrap();
+    }
+
+    export(&state, &root.path().join("bundle")).unwrap();
+
+    let bytes = std::fs::read(root.path().join("bundle").join(BUNDLE_DB)).unwrap();
+    for line in &body {
+        assert!(!contains(&bytes, line), "key body left in the bundle");
+    }
+    assert!(contains(&bytes, "[redacted:private-key]"));
+}
