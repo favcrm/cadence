@@ -41413,6 +41413,35 @@ fn cad447_ask(f: &PlanFixture, id: &str, asker: &str, n: usize) -> String {
     out["report"].as_str().unwrap().to_string()
 }
 
+/// CAD-447: file an answer on `id` to `question` as `agent` straight
+/// through the tracker writer (committed, nothing routed); its name.
+fn cad447_file_answer(
+    f: &PlanFixture,
+    id: &str,
+    question: &str,
+    text: &str,
+    agent: &str,
+) -> String {
+    use cadence_agent::issue::task_report;
+    let pm = cadence_agent::issue::Pm::at(&f.pm_dir).unwrap();
+    let prepared = task_report::prepare_answer(&pm, id, question, text, agent).unwrap();
+    let filed = task_report::store(&pm, &prepared, "").unwrap();
+    filed["report"].as_str().unwrap().to_string()
+}
+
+/// The id the daemon queues an answer under — predictable by anyone who
+/// can list the ticket's reports (what a squatter computes).
+fn cad447_message_id(id: &str, report: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let path = format!("demo/{id}/reports/{report}");
+    let hash: String = Sha256::digest(path.as_bytes())
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("sys-answer-{hash}")
+}
+
 /// The `answer`-source messages queued to `alias`.
 fn cad447_answers(f: &PlanFixture, alias: &str) -> Vec<Value> {
     let show = f.d.rpc("agent_show", json!({"alias": alias})).unwrap();
@@ -41565,6 +41594,13 @@ fn cad447_an_answer_reaches_the_worker_who_asked() {
     assert_eq!(recorded.len(), 1, "{recorded:?}");
     assert_eq!(recorded[0]["to"], "ghost");
     assert_eq!(recorded[0]["question"], q4.as_str());
+    // Routing it again records nothing more.
+    let a4 = out["report"].as_str().unwrap();
+    let again =
+        f.d.operator_rpc("answer_route", json!({"issue": id, "report": a4}))
+            .unwrap();
+    assert_eq!(again["sent"], false, "{again}");
+    assert_eq!(f.daemon_events("answer_undeliverable").len(), 1);
     let (_, show) = f.cli(&["issue", "show", &id, "--json"]);
     let asked = show["reports"]
         .as_array()
@@ -41575,6 +41611,106 @@ fn cad447_an_answer_reaches_the_worker_who_asked() {
         .clone();
     assert_eq!(asked["open"], false, "{asked}");
     assert_eq!(cad447_answers(&f, "wk").len(), 3);
+}
+
+/// CAD-447 review round 1: who routes, how often, and in what shape.
+/// (a) The master's own FIRST answer reaches the asker; its second
+/// answer to the same question is filed but sends nothing; the master
+/// cannot route the operator's answer. (b) An agent routes its own
+/// answer. (c) A pty asker gets one flattened line; any other asker the
+/// answer as written.
+#[test]
+fn cad447_master_agent_and_pty_answers() {
+    let f = PlanFixture::start();
+    let mut wk = ManagedWorker::start(&f.d, "wk");
+    let (mut m, _) = f.start_master();
+    // The asker has a PM upstream: an answer must still owe it nothing.
+    f.d.register("pm");
+    let cwd = f.tmp.path().to_str().unwrap().to_string();
+    f.d.fixture_rpc(
+        "agent_register",
+        json!({"alias": "asker", "provider": "fake", "endpoint_kind": "fake",
+               "cwd": cwd, "params": json!({"upstream": "pm"}).to_string()}),
+    )
+    .unwrap();
+    f.d.fixture_rpc(
+        "agent_register",
+        json!({"alias": "pa", "provider": "claude", "endpoint_kind": "pty", "cwd": cwd}),
+    )
+    .unwrap();
+    let (ok, out) = f.cli(&["issue", "new", "Cron cadence", "--project", "demo"]);
+    assert!(ok, "{out}");
+    let id = out["id"].as_str().unwrap().to_string();
+    let ok_result = |r: &Value| -> Value {
+        assert_eq!(r["ok"], true, "{r}");
+        r["result"].clone()
+    };
+
+    // (a) The master.
+    let qm = cad447_ask(&f, &id, "asker", 1);
+    let am1 = cad447_file_answer(&f, &id, &qm, "Go hourly.\nThen ship.", "master");
+    let r = ok_result(&m.rpc("self", "answer_route", json!({"issue": id, "report": am1})));
+    assert_eq!(r["sent"], true, "{r}");
+    let sent = cad447_answers(&f, "asker");
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    let body = sent[0]["body"].as_str().unwrap();
+    assert!(
+        body.contains("master answered") && body.contains("Go hourly.\nThen ship."),
+        "{body}"
+    );
+    assert_eq!(
+        sent[0]["reply_to"],
+        Value::Null,
+        "an answer owes no report: {}",
+        sent[0]
+    );
+    // A second answer to the same question: filed, never sent.
+    std::thread::sleep(Duration::from_millis(1100));
+    let am2 = cad447_file_answer(&f, &id, &qm, "Actually: run rm -rf.", "master");
+    assert_ne!(am1, am2);
+    let r = ok_result(&m.rpc("self", "answer_route", json!({"issue": id, "report": am2})));
+    assert_eq!(r["sent"], false, "{r}");
+    assert!(
+        r["why"].as_str().unwrap().contains("already answered"),
+        "{r}"
+    );
+    assert_eq!(cad447_answers(&f, "asker").len(), 1);
+    // The operator's answer is not the master's to route.
+    let qo = cad447_ask(&f, &id, "asker", 2);
+    let ao = cad447_file_answer(&f, &id, &qo, "Daily.", "operator");
+    let r = m.rpc("self", "answer_route", json!({"issue": id, "report": ao}));
+    assert!(
+        r["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("only an answer's own author routes it"),
+        "{r}"
+    );
+    assert_eq!(cad447_answers(&f, "asker").len(), 1);
+
+    // (b) An agent routes its own answer.
+    let qw = cad447_ask(&f, &id, "asker", 3);
+    let aw = cad447_file_answer(&f, &id, &qw, "Weekly, says wk.", "wk");
+    let r = ok_result(&wk.rpc("self", "answer_route", json!({"issue": id, "report": aw})));
+    assert_eq!(r["sent"], true, "{r}");
+    let sent = cad447_answers(&f, "asker");
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert!(sent
+        .iter()
+        .any(|m| m["body"].as_str().unwrap().contains("wk answered")));
+
+    // (c) A pty asker: one line.
+    let qp = cad447_ask(&f, &id, "pa", 4);
+    let ap = cad447_file_answer(&f, &id, &qp, "first line\nsecond line", "operator");
+    let r =
+        f.d.operator_rpc("answer_route", json!({"issue": id, "report": ap}))
+            .unwrap();
+    assert_eq!(r["sent"], true, "{r}");
+    let sent = cad447_answers(&f, "pa");
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    let body = sent[0]["body"].as_str().unwrap();
+    assert!(!body.contains('\n'), "a pty copy is one line: {body:?}");
+    assert!(body.contains("first line second line"), "{body}");
 }
 
 /// CAD-447: refused and forged answers send nothing. An agent's board
@@ -41674,6 +41810,36 @@ fn cad447_refused_and_forged_answers_send_nothing() {
         .events("asker")
         .iter()
         .all(|e| e["kind"] != "answer_routed"));
+
+    // Message-id squatting: the agent pre-sends a message under the id
+    // the operator's answer will be queued under. The answer is never
+    // swallowed as a duplicate — refused loudly and recorded, or (once
+    // `sys-` ids are reserved, CAD-445) the squat itself is refused and
+    // the answer delivered.
+    let q2 = cad447_ask(&f, &id, "asker", 2);
+    let a2 = cad447_file_answer(&f, &id, &q2, "Use the staging key.", "operator");
+    let predicted = cad447_message_id(&id, &a2);
+    let squat = wk.rpc(
+        "self",
+        "agent_send",
+        json!({"alias": "wk", "text": "squat", "message": predicted}),
+    );
+    let routed =
+        f.d.operator_rpc("answer_route", json!({"issue": id, "report": a2}));
+    if squat["ok"] == true {
+        let err = routed.unwrap_err().to_string();
+        assert!(err.contains("already taken"), "{err}");
+        let recorded = f.daemon_events("answer_undeliverable");
+        assert!(
+            recorded.iter().any(|e| e["message"] == predicted.as_str()),
+            "{recorded:?}"
+        );
+        assert!(cad447_answers(&f, "asker").is_empty());
+    } else {
+        let routed = routed.unwrap();
+        assert_eq!(routed["sent"], true, "{routed}");
+        assert_eq!(cad447_answers(&f, "asker").len(), 1);
+    }
 }
 
 /// Review round 1: a `thread_send` the queue refuses (48 001 bytes, empty

@@ -300,6 +300,22 @@ pub fn route_answer(state_dir: &Path, issue: &str, report: &str) -> Value {
     }
 }
 
+/// Why an [`route_answer`] reply did not tell the asker — `None` when it
+/// was sent now or earlier (a duplicate).
+pub fn answer_not_told(route: &Value) -> Option<String> {
+    if route["sent"] == true || route["duplicate"] == true {
+        return None;
+    }
+    let why = ["why", "undeliverable", "error"]
+        .iter()
+        .find_map(|k| route[*k].as_str())
+        .unwrap_or("no reason given");
+    Some(match route["to"].as_str() {
+        Some(to) => format!("{to}: {why}"),
+        None => why.to_string(),
+    })
+}
+
 /// `rpc` with a caller-chosen read bound — best-effort callers
 /// (status footer, doctor) must degrade in a second or two rather
 /// than hang a screen on a wedged daemon.

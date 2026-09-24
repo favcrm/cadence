@@ -6065,7 +6065,11 @@ fn run() -> Result<i32> {
                     // answer stands either way; `route` says what happened.
                     if kind == task_report::Kind::Answer {
                         let report = out["report"].as_str().unwrap_or_default().to_string();
-                        out["route"] = client::route_answer(&state_dir, &task, &report);
+                        let route = client::route_answer(&state_dir, &task, &report);
+                        if let Some(why) = client::answer_not_told(&route) {
+                            eprintln!("cadence: the asker was not told: {why}");
+                        }
+                        out["route"] = route;
                     }
                     print_json(&out);
                     // CAD-339: the daemon's report router routes it now
