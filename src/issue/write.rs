@@ -919,13 +919,21 @@ fn unstage(pm: &Pm, path: &Path) {
 /// already `done` or `dropped` is left alone: answers `Some(status)`
 /// and writes nothing. `None` means it was marked done. The plan gate
 /// every status write passes ([`crate::issue::plan::check_status_write`])
-/// applies here too.
+/// applies here too. With `expect`, the ticket is marked only while its
+/// status is still that one — a status changed since (the operator
+/// reopened or moved it) is left alone and answered like `done`.
 ///
 /// It never waits for the tracker lock: a busy tracker is an error the
 /// caller retries (the daemon holds its own lock here). A failed commit
 /// leaves nothing behind — `issue.md` is restored and unstaged, so the
 /// next writer's `git add -A` cannot commit `status: done` for it.
-pub fn mark_done_on_merge(pm: &Pm, id: &str, why: &str, actor: &str) -> Result<Option<String>> {
+pub fn mark_done_on_merge(
+    pm: &Pm,
+    id: &str,
+    why: &str,
+    actor: &str,
+    expect: Option<&str>,
+) -> Result<Option<String>> {
     let Some(_lock) = pm.try_lock()? else {
         return Err(Error::rejected(
             "the tracker is locked by another writer (.write.lock)",
@@ -933,7 +941,9 @@ pub fn mark_done_on_merge(pm: &Pm, id: &str, why: &str, actor: &str) -> Result<O
     };
     let (_project, dir) = issue_dir(pm, id)?;
     let (mut front, body) = load_front(&dir)?;
-    if matches!(front.status.as_str(), "done" | "dropped") {
+    if matches!(front.status.as_str(), "done" | "dropped")
+        || expect.is_some_and(|e| e != front.status)
+    {
         return Ok(Some(front.status));
     }
     crate::issue::plan::check_status_write(&pm.dir, &front, "done")?;
@@ -1745,7 +1755,7 @@ mod tests {
         assert_eq!(load_front(&dir).unwrap().0.status, "done");
         // Done already: left alone.
         assert_eq!(
-            mark_done_on_merge(&pm, "CAD-1", "again", "operator").unwrap(),
+            mark_done_on_merge(&pm, "CAD-1", "again", "operator", None).unwrap(),
             Some("done".to_string())
         );
     }
@@ -1756,7 +1766,7 @@ mod tests {
         let (_dir, pm) = tracker();
         let held = pm.lock().unwrap();
         let t = std::time::Instant::now();
-        let e = mark_done_on_merge(&pm, "CAD-1", "w", "operator").unwrap_err();
+        let e = mark_done_on_merge(&pm, "CAD-1", "w", "operator", None).unwrap_err();
         assert!(e.to_string().contains("locked"), "{e}");
         assert!(t.elapsed() < std::time::Duration::from_secs(2));
         drop(held);

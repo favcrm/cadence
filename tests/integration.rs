@@ -45679,9 +45679,11 @@ fn delivery_unreviewed_or_unmerged_never_marks_ticket_done() {
 /// merged: the tracker holds no committed PASS for it.
 #[test]
 fn delivery_agent_cannot_mark_ticket_done() {
-    let mut lf = LoopFixture::dispatched_plan(LOOP_PLAN);
-    let (ok, sent) = lf.f.as_master(&mut lf.m, "master dispatch D-3");
-    assert!(ok, "{sent}");
+    let mut lf = LoopFixture::dispatched_plan(DONE_PLAN);
+    for id in ["D-3", "D-5"] {
+        let (ok, sent) = lf.f.as_master(&mut lf.m, &format!("master dispatch {id}"));
+        assert!(ok, "{id}: {sent}");
+    }
     let (a, f) = ("a".repeat(40), "f".repeat(40));
     lf.pass_on("D-2", &a, LOOP_PR);
     lf.set_gh(&a, "OPEN", true, false);
@@ -45823,7 +45825,31 @@ fn delivery_agent_cannot_mark_ticket_done() {
     );
     assert_eq!(lf.f.front("D-4").status, d4_status);
 
-    for id in ["D-2", "D-3", "D-4"] {
+    // D-5 carries D-2's genuine PASS — same sha, reviewer and report —
+    // on a project PR of its own: that verdict is D-2's, not D-5's.
+    let d2 = lf.rec_of("D-2")["verdict"].clone();
+    assert_eq!(d2["verdict"], "pass", "{d2}");
+    let d5_status = lf.f.front("D-5").status;
+    forge(
+        "D-5",
+        "https://github.com/acme/app/pull/10",
+        &a,
+        d2["reviewer"].as_str().unwrap(),
+        d2["report"].as_str().unwrap(),
+    );
+    lf.set_gh(&a, "MERGED", true, false);
+    let row = lf.sync_of("D-5");
+    assert_eq!(row["ticket"]["outcome"], "refused", "{row}");
+    assert!(
+        row["ticket"]["why"]
+            .as_str()
+            .unwrap()
+            .contains("the daemon recorded no PASS"),
+        "{row}"
+    );
+    assert_eq!(lf.f.front("D-5").status, d5_status);
+
+    for id in ["D-2", "D-3", "D-4", "D-5"] {
         assert!(lf.done_commits(id).is_empty(), "{id} was marked done");
     }
     assert!(lf.daemon_events("ticket_done_on_merge").is_empty());
@@ -45838,8 +45864,10 @@ fn delivery_agent_cannot_mark_ticket_done() {
 #[test]
 fn delivery_failed_done_write_is_retried_and_leaves_nothing_staged() {
     let mut lf = LoopFixture::dispatched_plan(LOOP_PLAN);
-    let (ok, sent) = lf.f.as_master(&mut lf.m, "master dispatch D-3");
-    assert!(ok, "{sent}");
+    for id in ["D-3", "D-4"] {
+        let (ok, sent) = lf.f.as_master(&mut lf.m, &format!("master dispatch {id}"));
+        assert!(ok, "{id}: {sent}");
+    }
     let (a, b) = ("a".repeat(40), "b".repeat(40));
     let pm_dir = lf.f.pm_dir.clone();
     let git = |args: &[&str]| {
@@ -45968,6 +45996,43 @@ fn delivery_failed_done_write_is_retried_and_leaves_nothing_staged() {
     assert_eq!(lf.f.front("D-3").status, "done");
     assert_eq!(lf.done_commits("D-3").len(), 1);
     assert!(!row(&lf, "D-3"), "{:#?}", lf.f.needs_me());
+
+    // Pending, and the operator (sent by the row) moves the ticket by
+    // hand: the retry never overwrites that. A commit-msg hook refuses
+    // only the done write, so the operator's own write goes through.
+    let c = "c".repeat(40);
+    lf.pass_on("D-4", &c, "https://github.com/acme/app/pull/9");
+    let d4_status = lf.f.front("D-4").status;
+    let msg_hook = hooks.join("commit-msg");
+    std::fs::write(
+        &msg_hook,
+        "#!/bin/sh\ngrep -q 'set status=done — ' \"$1\" && exit 1\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&msg_hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    lf.set_gh(&c, "MERGED", true, false);
+    let row4 = lf.sync_of("D-4");
+    assert_eq!(row4["ticket"]["outcome"], "pending", "{row4}");
+    assert_eq!(
+        lf.rec_of("D-4")["ticket_done"]["from"],
+        d4_status.as_str(),
+        "{}",
+        lf.rec_of("D-4")
+    );
+    assert!(row(&lf, "D-4"), "{:#?}", lf.f.needs_me());
+    let (ok, out) = lf.f.cli(&["issue", "set", "D-4", "status=review"]);
+    assert!(ok, "{out}");
+    std::fs::remove_file(&msg_hook).unwrap();
+    let rec = lf.wait_of("D-4", "settled", |r| {
+        r["ticket_done"]["outcome"] != "pending"
+    });
+    assert_eq!(rec["ticket_done"]["outcome"], "kept", "{rec}");
+    assert_eq!(rec["ticket_done"]["status"], "review", "{rec}");
+    // More retries would have had their chance; still the operator's.
+    thread::sleep(Duration::from_millis(2_500));
+    assert_eq!(lf.f.front("D-4").status, "review");
+    assert!(lf.done_commits("D-4").is_empty());
+    assert!(!row(&lf, "D-4"), "{:#?}", lf.f.needs_me());
 }
 
 // ---- CAD-384: one caller rule for every agent-mutating RPC ----

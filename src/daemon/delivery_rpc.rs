@@ -612,10 +612,14 @@ impl Shared {
         let ended = (before != rec.state).then(|| rec.clone());
         delivery::save(&self.state_dir, &all)?;
         drop(guard);
-        self.post_notices(&pm, notices);
+        // The wake first: it releases `wake_lock`, which a comment waiting
+        // on the tracker lock must not hold.
         if let Some(rec) = ended {
             self.wake_on_delivery_end(&rec, wake_guard);
+        } else {
+            drop(wake_guard);
         }
+        self.post_notices(&pm, notices);
         if rec_state_changed(&out, was_disable) {
             let _ = self
                 .store
@@ -650,24 +654,60 @@ impl Shared {
                     continue;
                 };
                 let next = match rec.ticket_done.clone() {
-                    Some(TicketDone::Pending { why }) => {
-                        let head = rec.observed.as_ref().map(|o| o.head.clone());
-                        let mut mine = Vec::new();
-                        let next =
-                            self.mark_ticket_done(&pm, rec, &head.unwrap_or_default(), &mut mine);
-                        // One comment per failure, not one per pass.
-                        if matches!(&next, TicketDone::Pending { why: now } if *now == why) {
-                            continue;
-                        }
-                        if matches!(next, TicketDone::Marked { .. }) {
+                    Some(TicketDone::Pending { why, from }) => {
+                        // Only while the status is still what it was at
+                        // the merge: a status set by hand since (the
+                        // `merged_not_done` row sends the operator here)
+                        // is the operator's decision, never overwritten.
+                        let Some(from) = from else {
                             notices.push(Notice {
                                 issue: id.clone(),
-                                comment: Some(format!(
-                                    "{id} marked done after a retry (the first write failed: \
-                                     {why})."
-                                )),
+                                comment: None,
+                                kind: "ticket_done_refused",
+                                payload: json!({"issue": id, "why": "status at merge unknown"}),
+                            });
+                            rec.ticket_done = Some(TicketDone::Refused {
+                                why: format!(
+                                    "the done write failed ({why}) and the status at the \
+                                     merge is unknown — the operator sets it"
+                                ),
+                            });
+                            moved += 1;
+                            continue;
+                        };
+                        let head = rec.observed.as_ref().map(|o| o.head.clone());
+                        let mut mine = Vec::new();
+                        let next = self.mark_ticket_done(
+                            &pm,
+                            rec,
+                            &head.unwrap_or_default(),
+                            Some(&from),
+                            &mut mine,
+                        );
+                        // One comment per failure, not one per pass.
+                        if matches!(&next, TicketDone::Pending { why: now, .. } if *now == why) {
+                            continue;
+                        }
+                        let comment = match &next {
+                            TicketDone::Marked { .. } => Some(format!(
+                                "{id} marked done after a retry (the first write failed: {why})."
+                            )),
+                            TicketDone::Kept { status }
+                                if status != "done" && status != "dropped" =>
+                            {
+                                Some(format!(
+                                    "{id} was not marked done: its status was set to {status} \
+                                     by hand after the merge (it was {from}); left as it is."
+                                ))
+                            }
+                            _ => None,
+                        };
+                        if let Some(text) = comment {
+                            notices.push(Notice {
+                                issue: id.clone(),
+                                comment: Some(text),
                                 kind: "ticket_done_retried",
-                                payload: json!({"issue": id, "why": why}),
+                                payload: json!({"issue": id, "why": why, "outcome": next}),
                             });
                         }
                         notices.extend(mine);
@@ -719,7 +759,7 @@ impl Shared {
             Err(e) => Some(format!("the merge could not be checked: {e}")),
         };
         let Some(why) = refused else {
-            return self.mark_ticket_done(pm, rec, head, notices);
+            return self.mark_ticket_done(pm, rec, head, None, notices);
         };
         let pr_ref = rec_pr_ref(rec);
         let id = &rec.issue;
@@ -736,21 +776,23 @@ impl Shared {
     }
 
     /// The tracker write for a reviewed merge: `marked`, `kept` (already
-    /// done or dropped) or `pending` (the write failed; retried by the
-    /// router pass). The commit's `Actor:` names the observer and the
+    /// done or dropped, or — with `expect` — no longer that status) or
+    /// `pending` (the write failed; retried by the router pass while the
+    /// status is still what it was). The commit's `Actor:` names the observer and the
     /// delivery. Never waits for the tracker lock.
     fn mark_ticket_done(
         &self,
         pm: &Pm,
         rec: &Record,
         head: &str,
+        expect: Option<&str>,
         notices: &mut Vec<Notice>,
     ) -> TicketDone {
         let id = &rec.issue;
         let pr_ref = rec_pr_ref(rec);
         let actor = format!("operator (delivery {pr_ref})");
         let why = format!("{pr_ref} merged at {head}");
-        match issue::write::mark_done_on_merge(pm, id, &why, &actor) {
+        match issue::write::mark_done_on_merge(pm, id, &why, &actor, expect) {
             Ok(None) => {
                 notices.push(Notice {
                     issue: id.clone(),
@@ -772,7 +814,15 @@ impl Shared {
                     kind: "ticket_done_pending",
                     payload: json!({"issue": id, "pr": pr_ref, "head": head, "why": why}),
                 });
-                TicketDone::Pending { why }
+                // What a retry must still find: the status the write
+                // left in place (it rolled back), read now.
+                let from = match expect {
+                    Some(e) => Some(e.to_string()),
+                    None => issue::board::find_issue(&pm.dir, id)
+                        .ok()
+                        .map(|t| t.front.status),
+                };
+                TicketDone::Pending { why, from }
             }
         }
     }

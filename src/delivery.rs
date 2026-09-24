@@ -115,19 +115,26 @@ pub struct Observed {
 pub enum TicketDone {
     /// The merge marked it done.
     Marked { at: i64 },
-    /// It was already `done` or `dropped` — left alone.
+    /// Left as it was: already `done` or `dropped`, or changed by hand
+    /// while the write was pending (`status` is what it was found at).
     Kept { status: String },
     /// The merge is not the reviewed one; the operator sets the status.
     Refused { why: String },
-    /// The tracker write failed (busy, a failing hook); retried.
-    Pending { why: String },
+    /// The tracker write failed (busy, a failing hook); retried — but
+    /// only while the status is still `from`, what it was at the merge.
+    /// A record without `from` is never marked by a retry.
+    Pending {
+        why: String,
+        #[serde(default)]
+        from: Option<String>,
+    },
 }
 
 impl TicketDone {
     /// The ticket still waits on the operator or a retry.
     pub fn open(&self) -> Option<&str> {
         match self {
-            TicketDone::Refused { why } | TicketDone::Pending { why } => Some(why),
+            TicketDone::Refused { why } | TicketDone::Pending { why, .. } => Some(why),
             _ => None,
         }
     }
