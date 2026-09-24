@@ -3738,11 +3738,22 @@ impl Shared {
     /// Identity-shaped request fields are refused, never read.
     ///
     /// CAD-339 HOOK (PR #213, the master agent, not merged when this
-    /// landed): the master may run it too. When #213 is on main, accept
-    /// the master before the operator check —
-    /// `if self.caller_is_master(peer_pid) { crate::master::ALIAS }` —
-    /// and add `"project_new"` to `MASTER_ALLOWED` and
-    /// `"Bash(cadence project new *)"` to `master::CLAUDE_ALLOWED_TOOLS`.
+    /// landed): the master may run it too. When #213 is on main:
+    ///
+    /// 1. refuse identity-shaped fields FIRST, for every caller —
+    ///    `reject_identity_fields(params, "project new")?` plus the
+    ///    `operator_connection` list (`by`, `actor`, `operator`, …) — so
+    ///    the master branch never skips the field refusal;
+    /// 2. then `let actor = if self.caller_is_master(peer_pid) {
+    ///    crate::master::ALIAS } else { self.operator_connection(..)?;
+    ///    "operator" };`
+    /// 3. add `"project_new"` to `MASTER_ALLOWED` and
+    ///    `"Bash(cadence project new *)"` to `master::CLAUDE_ALLOWED_TOOLS`;
+    /// 4. test: the master is accepted (actor `master`), a master call
+    ///    carrying `actor`/`by` is refused with nothing written, and the
+    ///    tracker-root refusal (`issue::project_new::run`) holds for the
+    ///    master exactly as for the operator.
+    ///
     /// Until then the master, like every agent, is refused here.
     fn rpc_project_new(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         self.operator_connection("project new", params, peer_pid)?;

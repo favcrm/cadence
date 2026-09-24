@@ -41394,7 +41394,11 @@ fn project_new_registers_seeds_and_is_operator_only() {
         manifest
     );
 
-    // Refused with nothing written.
+    // Refused with nothing written — the tracker too, by path or link.
+    let pm_s = pm_dir.to_str().unwrap().to_string();
+    let link = tmp.path().join("tracker-link");
+    std::os::unix::fs::symlink(&pm_dir, &link).unwrap();
+    let link_s = link.to_str().unwrap().to_string();
     for (args, why) in [
         (vec!["reminders", "--repo", b.as_str()], "different repo"),
         (vec!["agents", "--repo", b.as_str()], "reserved"),
@@ -41403,6 +41407,8 @@ fn project_new_registers_seeds_and_is_operator_only() {
             "Invalid project key",
         ),
         (vec!["fresh", "--repo", plain.as_str()], "not a git repo"),
+        (vec!["fresh", "--repo", pm_s.as_str()], "is the tracker"),
+        (vec!["fresh", "--repo", link_s.as_str()], "is the tracker"),
     ] {
         let mut argv = vec!["project", "new"];
         argv.extend(args.iter().copied());

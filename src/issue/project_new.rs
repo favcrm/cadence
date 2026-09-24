@@ -224,6 +224,18 @@ pub fn run(pm: &Pm, req: &Request, actor: &str) -> Result<Value> {
     };
     let canonical = req.repo.canonicalize().map_err(|_| not_git())?;
     let (root, remote) = project::repo_identity(&canonical).ok_or_else(not_git)?;
+    // The tracker is never a project's repo: cwd resolution would read
+    // the tracker as that project and its lanes would be worktrees of
+    // the tracker. Compared canonically, so a symlink cannot hide it.
+    let tracker = pm.dir.canonicalize().unwrap_or_else(|_| pm.dir.clone());
+    if root.starts_with(&tracker) || tracker.starts_with(&root) || canonical.starts_with(&tracker) {
+        return Err(Error::rejected(format!(
+            "{} is the tracker ({}), inside it or contains it — a project's repo \
+             must be its own checkout; nothing written",
+            req.repo.display(),
+            tracker.display()
+        )));
+    }
 
     let _lock = pm.lock()?;
     let projects = project::list(&pm.dir)?;
@@ -342,13 +354,29 @@ pub fn run(pm: &Pm, req: &Request, actor: &str) -> Result<Value> {
         write::commit(pm, &format!("project {key} {what}"), &ids, actor)
     })();
     if let Err(e) = result {
+        // Unstage first (the commit's `git add -A` staged them), then
+        // remove: a failed call leaves neither index entries nor files.
+        let mut unstage: Vec<String> = vec!["reset".into(), "-q".into(), "--".into()];
+        unstage.extend(
+            created
+                .iter()
+                .filter_map(|f| f.strip_prefix(&pm.dir).ok())
+                .map(|f| f.to_string_lossy().to_string()),
+        );
+        if unstage.len() > 3 {
+            let args: Vec<&str> = unstage.iter().map(String::as_str).collect();
+            let _ = crate::issue::git(&pm.dir, &args);
+        }
         for file in created.iter().rev() {
             let _ = std::fs::remove_file(file);
         }
         if created_dir {
             let _ = std::fs::remove_dir(&dir);
         }
-        return Err(e);
+        // `e` carries git's stderr (a refusing hook's output included).
+        return Err(Error::rejected(format!(
+            "project {key}: the tracker commit failed, nothing kept — {e}"
+        )));
     }
     Ok(json!({
         "project": key, "prefix": prefix, "path": dir, "repo": root,
@@ -456,6 +484,8 @@ mod tests {
         let b = repo(tmp.path(), "b");
         let plain = tmp.path().join("plain");
         std::fs::create_dir_all(&plain).unwrap();
+        let tracker_link = tmp.path().join("tracker-link");
+        std::os::unix::fs::symlink(&pm.dir, &tracker_link).unwrap();
         let out = run(&pm, &req("demo", &a), "operator").unwrap();
         assert_eq!(out["changed"], true, "{out}");
         assert_eq!(out["prefix"], "DEM");
@@ -479,6 +509,9 @@ mod tests {
             (req("fresh", &plain), "not a git repo"),
             (req("fresh", &tmp.path().join("missing")), "not a git repo"),
             (req("fresh", Path::new("rel")), "must be absolute"),
+            (req("fresh", &pm.dir), "is the tracker"),
+            (req("fresh", &pm.dir.join("demo")), "is the tracker"),
+            (req("fresh", &tracker_link), "is the tracker"),
             (
                 Request {
                     prefix: Some("DEM".into()),
@@ -532,5 +565,90 @@ mod tests {
         assert!(work::config_file(&pm.dir, "demo").is_file());
         let out = run(&pm, &req("demo", &a), "master").unwrap();
         assert_eq!(out["changed"], false, "{out}");
+    }
+
+    /// A repo that contains the tracker is refused too (the tracker
+    /// nested in a product checkout).
+    #[test]
+    fn a_repo_containing_the_tracker_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outer = repo(tmp.path(), "outer");
+        let pm = Pm::init(&outer.join("pm")).unwrap();
+        let err = run(&pm, &req("outer", &outer), "operator")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is the tracker"), "{err}");
+        assert!(!pm.dir.join("outer").exists());
+    }
+
+    /// A refused tracker commit (here a pre-commit hook) leaves nothing
+    /// staged and nothing on disk, and the error carries git's stderr.
+    #[test]
+    fn a_failed_commit_unstages_and_removes_what_it_created() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pm = pm(tmp.path());
+        let a = repo(tmp.path(), "a");
+        let hook = pm.dir.join(".git/hooks/pre-commit");
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        std::fs::write(&hook, "#!/bin/sh\necho 'lint says no' >&2\nexit 1\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let before = commits(&pm);
+        let err = run(&pm, &req("demo", &a), "operator")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("lint says no") && err.contains("nothing kept"),
+            "{err}"
+        );
+        assert_eq!(commits(&pm), before);
+        assert!(!pm.dir.join("demo").exists());
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&pm.dir)
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(status.stdout.is_empty(), "{status:?}");
+    }
+
+    /// Concurrent runs for one key serialize on the tracker lock:
+    /// exactly one registers and commits, the rest see it done.
+    #[test]
+    fn concurrent_runs_commit_once() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pm_dir = pm(tmp.path()).dir;
+        let a = repo(tmp.path(), "a");
+        let before = commits(&Pm::at(&pm_dir).unwrap()).lines().count();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(6));
+        let handles: Vec<_> = (0..6)
+            .map(|_| {
+                let (pm_dir, a, barrier) = (pm_dir.clone(), a.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    let pm = Pm::at(&pm_dir).unwrap();
+                    barrier.wait();
+                    run(&pm, &req("demo", &a), "operator")
+                })
+            })
+            .collect();
+        let outs: Vec<Value> = handles
+            .into_iter()
+            .map(|h| h.join().unwrap().unwrap())
+            .collect();
+        let changed = outs.iter().filter(|o| o["changed"] == true).count();
+        assert_eq!(changed, 1, "{outs:?}");
+        let pm = Pm::at(&pm_dir).unwrap();
+        assert_eq!(commits(&pm).lines().count(), before + 1);
+    }
+
+    #[test]
+    fn project_add_refuses_the_reserved_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pm = pm(tmp.path());
+        let err = write::project_add(&pm, "agents", "AG", &[], &[], &[], None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("reserved"), "{err}");
+        assert!(!pm.dir.join("agents").exists());
     }
 }
