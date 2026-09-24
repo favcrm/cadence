@@ -939,14 +939,179 @@ fn cad396_remaining_tokens_refuse_the_export() {
     let root = TempDir::new().unwrap();
     let db = root.path().join("x.sqlite3");
     let conn = Connection::open(&db).unwrap();
-    conn.execute_batch("CREATE TABLE t(v TEXT); INSERT INTO t VALUES ('has tok-abcdefgh here');")
-        .unwrap();
+    conn.execute_batch(
+        "CREATE TABLE t(v TEXT); INSERT INTO t VALUES ('has 0123456789ab here');
+         CREATE TABLE u(v TEXT); INSERT INTO u VALUES ('fine');",
+    )
+    .unwrap();
     drop(conn);
-    let matcher = aho_corasick::AhoCorasick::new(["tok-abcdefgh"]).unwrap();
-    let err = refuse_remaining_tokens(&db, &matcher)
+    let matcher = aho_corasick::AhoCorasick::new(["0123456789ab"]).unwrap();
+    let err = refuse_remaining_tokens(&db, &token_shape(), Some(&matcher))
         .unwrap_err()
         .to_string();
     assert!(err.contains("t.v rowid 1"), "{err}");
+    assert!(!err.contains("u.v"), "{err}");
+}
+
+// ---- CAD-407 ----
+
+fn hex(n: usize) -> String {
+    uuid::Uuid::new_v4().simple().to_string()[..n].to_string()
+}
+
+fn raw_event(conn: &Connection, payload: &str) {
+    conn.execute(
+        "INSERT INTO events(alias,kind,payload,at) VALUES('w1','note',?1,1)",
+        [payload],
+    )
+    .unwrap();
+}
+
+/// Probe E4: a `turn_id` key whose value is prose is not a token. The
+/// old export collected "workspace" from it and rewrote every cell that
+/// contained the word — `agents.cwd` and `agents.sandbox` included.
+#[test]
+fn cad407_prose_under_a_turn_id_key_is_not_redacted() {
+    let root = TempDir::new().unwrap();
+    let state = fresh_state(root.path(), "state");
+    let conn = writer(&state);
+    add_agent(&conn, "w1", "/srv/workspace/repo");
+    add_message(&conn, "m1", "w1", r#"{"turn_id": "workspace"}"#);
+    raw_event(&conn, r#"{"turn_id":"not-a-token-at-all"}"#);
+    drop(conn);
+
+    let out = export(&state, &root.path().join("bundle")).unwrap();
+
+    let db = root.path().join("bundle").join(BUNDLE_DB);
+    assert_eq!(
+        text(&db, "SELECT cwd FROM agents").as_deref(),
+        Some("/srv/workspace/repo")
+    );
+    assert_eq!(
+        text(&db, "SELECT sandbox FROM agents").as_deref(),
+        Some("workspace-write")
+    );
+    assert_eq!(
+        text(&db, "SELECT body FROM messages").as_deref(),
+        Some(r#"{"turn_id": "workspace"}"#)
+    );
+    assert_eq!(out["redacted"], json!({"tokens": 0, "cells": 0}), "{out}");
+}
+
+/// Probe E2: a token no column and no `"turn_id"` key names — under
+/// another key, inside double-encoded JSON, in prose, in any table — is
+/// redacted, and so is its generation wherever it stands alone.
+#[test]
+fn cad407_orphan_tokens_are_redacted_whatever_the_key_or_escaping() {
+    let root = TempDir::new().unwrap();
+    let state = fresh_state(root.path(), "state");
+    let (g_pty, g_claude) = (hex(32), hex(12));
+    let under_other_key = format!("pty-{g_pty}-{}", hex(32));
+    let double_encoded = format!("claude-{g_claude}-{}", hex(32));
+    let in_prose = format!("pty-{}-{}", hex(32), hex(32));
+    let conn = writer(&state);
+    add_agent(&conn, "w1", "/nowhere");
+    add_message(
+        &conn,
+        "m1",
+        "w1",
+        &format!(r#"{{"token":"{under_other_key}"}}"#),
+    );
+    raw_event(
+        &conn,
+        &format!(r#"{{"inner":"{{\"turn_id\":\"{double_encoded}\"}}"}}"#),
+    );
+    add_message(
+        &conn,
+        "m2",
+        "w1",
+        &format!("reported with --token {in_prose}; pane generation {g_pty} was live"),
+    );
+    raw_event(&conn, &format!(r#"{{"generation":"{g_claude}"}}"#));
+    drop(conn);
+
+    let out = export(&state, &root.path().join("bundle")).unwrap();
+
+    let db = root.path().join("bundle").join(BUNDLE_DB);
+    let bytes = std::fs::read(&db).unwrap();
+    for secret in [
+        &under_other_key,
+        &double_encoded,
+        &in_prose,
+        &g_pty,
+        &g_claude,
+    ] {
+        assert!(!contains(&bytes, secret), "{secret} left in the bundle");
+    }
+    assert_eq!(out["redacted"]["cells"], json!(4), "{out}");
+    assert_eq!(
+        text(&db, "SELECT body FROM messages WHERE id='m2'").as_deref(),
+        Some("reported with --token [redacted]; pane generation [redacted] was live")
+    );
+    assert_eq!(
+        text(&db, "SELECT body FROM messages WHERE id='m1'").as_deref(),
+        Some(r#"{"token":"[redacted]"}"#)
+    );
+}
+
+/// With a store in place as well, the refusal cannot tell a finished
+/// restore from an empty store created after the interruption: it names
+/// both recoveries, each with its commands, and every sidecar's own name.
+#[test]
+fn cad407_leftover_refusal_names_both_recoveries_when_a_store_exists() {
+    let root = TempDir::new().unwrap();
+    let state = fresh_state(root.path(), "state");
+    let db = state.join("cadence.sqlite3.replaced-20260923T000000Z-deadbeef");
+    let wal = state.join("cadence.sqlite3-wal.replaced-20260923T000000Z-deadbeef");
+    std::fs::write(&db, b"previous store").unwrap();
+    std::fs::write(&wal, b"previous wal").unwrap();
+
+    let err = refuse_interrupted_restore(&state).unwrap_err().to_string();
+
+    // Listed in name order: "-wal" sorts before ".replaced".
+    let q = |p: &Path| format!("'{}'", p.display());
+    assert!(err.contains("If it is the store you restored"), "{err}");
+    assert!(
+        err.contains(&format!(
+            "mv {} {} {}",
+            q(&wal),
+            q(&db),
+            q(&default_dir(&state))
+        )),
+        "{err}"
+    );
+    assert!(
+        err.contains(&format!(
+            "mv {} {} && mv {} {}",
+            q(&wal),
+            q(&state.join("cadence.sqlite3-wal")),
+            q(&db),
+            q(&live(&state))
+        )),
+        "{err}"
+    );
+    assert!(live(&state).exists() && db.exists() && wal.exists());
+}
+
+/// A token spelled with JSON `\u` escapes cannot be redacted in place;
+/// the recheck reads through the escapes and refuses the export.
+#[test]
+fn cad407_an_escaped_token_refuses_the_export() {
+    let root = TempDir::new().unwrap();
+    let state = fresh_state(root.path(), "state");
+    let conn = writer(&state);
+    add_agent(&conn, "w1", "/nowhere");
+    // `-` as a JSON unicode escape: backslash, "u002d".
+    let dash = ['\\'.to_string(), "u002d".to_string()].concat();
+    raw_event(
+        &conn,
+        &format!(r#"{{"t":"pty{dash}{}{dash}{}"}}"#, hex(32), hex(32)),
+    );
+    drop(conn);
+    let out = root.path().join("bundle");
+    let err = export(&state, &out).unwrap_err().to_string();
+    assert!(err.contains("events.payload rowid"), "{err}");
+    assert!(!out.exists());
 }
 
 #[test]
