@@ -47,6 +47,12 @@ upgrade` (x86_64-linux only for now):
 ## Quick start
 
 ```bash
+cadence setup                   # first run, idempotent: state dir, tracker, skill,
+                                #  daemon and board; reports provider CLIs
+                                #  (version + sign-in), the master agent and
+                                #  the login link. A present item is `ok` and
+                                #  never re-initialised. --json prints one
+                                #  {check,status,detail,fix} line per check
 cadence daemon start            # detached controller (CADENCE_STATE_DIR sets the state dir)
 cadence skill install           # install the `cadence` agent skill into
                                 #  ~/.agents/skills + .claude/.cursor/.copilot
