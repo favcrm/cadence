@@ -20,8 +20,24 @@ export interface SetupCheck {
   group: SetupGroup;
 }
 
+/** A provider the master can run on (CAD-448), offered in the master step. */
+export interface MasterOffer {
+  /** The provider CLI's check name ("claude"). */
+  bin: string;
+  /** Its check is ready — the CLI is installed and signed in. */
+  ready: boolean;
+  /** `cadence master start --provider <bin>`; null while not ready, no
+   * `master` verb, or the `master` check's own prerequisites unmet. */
+  start: string | null;
+  /** The risk an offered `--unconfined` command carries (no filesystem
+   * sandbox); absent on boards built before CAD-448's review fix. */
+  warning?: string | null;
+}
+
 export interface SetupReport {
   checks: SetupCheck[];
+  /** The master step's provider offers (CAD-448); absent on a board built before it. */
+  master?: { providers: MasterOffer[] };
   /** Epoch ms the checks ran (the board reuses one run for a minute). */
   checked_at: number;
   detect_only: boolean;
@@ -34,10 +50,12 @@ export interface SetupReport {
 }
 
 /** Checks Home insists on when this build can fix them. */
-export const REQUIRED_CHECKS = ["state_dir", "tracker", "daemon", "master"] as const;
+export const REQUIRED_CHECKS = ["state_dir", "tracker", "daemon", "master", "master_login"] as const;
 
-/** CLIs that can be the master in the MVP — one of them must be ready. */
-export const MASTER_CLIS = ["claude", "codex"] as const;
+/** CLIs `master start` accepts — the fallback when the board's
+ * `master.providers` (CAD-448) is absent. The payload's list is the
+ * authority; a ready CLI the master cannot run does not count. */
+export const MASTER_CLIS = ["claude"] as const;
 
 const LABELS: Record<string, string> = {
   state_dir: "State directory",
@@ -47,6 +65,7 @@ const LABELS: Record<string, string> = {
   ui: "Board",
   login: "Operator login link",
   master: "Master agent",
+  master_login: "Master login",
   claude: "Claude Code",
   codex: "Codex",
   "cursor-agent": "Cursor agent",
@@ -82,6 +101,17 @@ export function inGroup(report: SetupReport | null, group: SetupGroup): SetupChe
 }
 
 /**
+ * True while the `master` check waits on an unmet prerequisite — the
+ * backend reports "needs `<dep>` first". The provider offer card hides
+ * until then: the step shows one command for starting the master, not
+ * two (CAD-448 review, N4).
+ */
+export function masterNeedsUnmet(report: SetupReport): boolean {
+  const master = report.checks.find((c) => c.check === "master");
+  return !!master && !isReady(master) && master.detail.startsWith("needs `");
+}
+
+/**
  * What still blocks a first run: each required check that is not ready
  * and that this build can act on, plus "a master CLI" when neither
  * Claude nor Codex is signed in. A check with no fix (`master` in a
@@ -90,11 +120,16 @@ export function inGroup(report: SetupReport | null, group: SetupGroup): SetupChe
  */
 export function missingRequired(report: SetupReport): string[] {
   const by = new Map(report.checks.map((c) => [c.check, c]));
+  // Once an offer carries the provider-qualified start command the
+  // `master` check's own fix is absorbed by it (N4) — the command still
+  // exists, so the check still blocks Home until it runs.
+  const offerStart = (report.master?.providers ?? []).some((o) => o.start);
   const out: string[] = REQUIRED_CHECKS.filter((name) => {
     const c = by.get(name);
-    return !c || (!isReady(c) && c.fix !== null);
+    return !c || (!isReady(c) && (c.fix !== null || (name === "master" && offerStart)));
   });
-  const cliReady = MASTER_CLIS.some((name) => {
+  const masterBins = report.master?.providers.map((p) => p.bin) ?? MASTER_CLIS;
+  const cliReady = masterBins.some((name) => {
     const c = by.get(name);
     return c !== undefined && isReady(c);
   });

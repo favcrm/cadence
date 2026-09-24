@@ -8,6 +8,7 @@ import {
   checkLabel,
   inGroup,
   isReady,
+  masterNeedsUnmet,
   missingRequired,
   statusChip,
   type SetupCheck,
@@ -122,6 +123,58 @@ function CheckList({ checks }: { checks: SetupCheck[] }) {
   );
 }
 
+/**
+ * The master step's provider choice (CAD-448): every CLI `master start`
+ * accepts, each ready one with its exact start command — a not-ready
+ * one shows its own install/sign-in fix instead, and an `--unconfined`
+ * command carries its risk warning. Hidden once the master's files
+ * exist (`master start` already ran or planted them), while the
+ * `master` check waits on its own prerequisites, and on a board built
+ * before CAD-448. Detect only: the command is the operator's to paste,
+ * never run from the board.
+ */
+function MasterProviders({ report }: { report: SetupReport }) {
+  const offers = report.master?.providers ?? [];
+  const files = report.checks.find((c) => c.check === "master");
+  if (offers.length === 0 || (files && isReady(files)) || masterNeedsUnmet(report)) return null;
+  return (
+    <div className="card mt-4 px-4 py-3">
+      <p className="text-secondary text-ink-400">
+        <span className="font-medium text-ink-200">Choose the CLI it runs on.</span> Its command
+        installs the agent files and starts the master.
+      </p>
+      <ul className="mt-3 space-y-3">
+        {offers.map((o) => {
+          const provider = report.checks.find((c) => c.check === o.bin);
+          const chip = provider
+            ? statusChip(provider)
+            : { label: "not found", tone: "muted" as Tone };
+          const command = o.start ?? (!o.ready ? provider?.fix : null) ?? null;
+          return (
+            <li key={o.bin} className="min-w-0">
+              <div className="flex items-baseline gap-2">
+                <span className="text-body font-medium text-ink-100">{checkLabel(o.bin)}</span>
+                <span className={`chip ${TONE[chip.tone]}`}>{chip.label}</span>
+              </div>
+              {provider && (
+                <p className="text-secondary text-ink-500 mt-0.5 break-words [overflow-wrap:anywhere]">
+                  {provider.detail}
+                </p>
+              )}
+              {o.warning && (
+                <p className="mt-1.5 rounded bg-warn/10 px-3 py-2 text-secondary font-medium text-warn break-words [overflow-wrap:anywhere]">
+                  {o.warning}
+                </p>
+              )}
+              {command && <CopyFix command={command} />}
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
+
 function StepBody({
   step,
   report,
@@ -157,8 +210,9 @@ function StepBody({
           <h2 className="text-section font-semibold text-ink-100">Agent CLIs</h2>
           <p className="text-body text-ink-400 mt-1 max-w-[68ch]">
             The coding agents already on this machine, with their version and whether each is
-            signed in. Claude or Codex can be the master; the others join as workers. Sign-in is
-            read from an exit code or whether a credentials file exists — never its contents.
+            signed in. A signed-in one that can run the master is offered in the next step; the
+            others join as workers. Sign-in is read from an exit code or whether a credentials
+            file exists — never its contents.
           </p>
           <CheckList checks={inGroup(report, "provider")} />
         </>
@@ -168,9 +222,11 @@ function StepBody({
         <>
           <h2 className="text-section font-semibold text-ink-100">Master agent</h2>
           <p className="text-body text-ink-400 mt-1 max-w-[68ch]">
-            The master plans, creates projects and hands work to the team. Start it from the
-            command line; its status shows here.
+            The master plans, creates projects and hands work to the team. Pick the provider CLI
+            it runs on — its command installs the agent files and starts it. The master signs in
+            with its own login, separate from yours.
           </p>
+          {report && <MasterProviders report={report} />}
           <CheckList checks={inGroup(report, "master")} />
         </>
       );

@@ -2884,7 +2884,9 @@ fn setup_refusal(request: &Request, opts: &ServeOpts) -> Option<HttpResp> {
 /// `GET /api/setup` — setup's checks, detect only
 /// ([`crate::setup::board_detect`]): nothing is applied, started or
 /// written, provider probes are bounded and never echoed. Each entry is
-/// setup's `{check, status, detail, fix}` plus the wizard `group`.
+/// setup's `{check, status, detail, fix}` plus the wizard `group`;
+/// `master.providers` carries the master step's provider offers
+/// (CAD-448) — its exact start command, never run from the board.
 fn setup_get(state_dir: &Path, pm_dir: &Path, port: u16, fresh: bool) -> HttpResp {
     let mut cache = SETUP_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     let reuse = cache.as_ref().is_some_and(|(at, _, _)| {
@@ -2893,11 +2895,12 @@ fn setup_get(state_dir: &Path, pm_dir: &Path, port: u16, fresh: bool) -> HttpRes
     });
     if !reuse {
         SETUP_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let outcomes = match crate::setup::board_detect(state_dir, pm_dir, port) {
-            Ok(o) => o,
+        let detected = match crate::setup::board_detect(state_dir, pm_dir, port) {
+            Ok(d) => d,
             Err(e) => return err_response(500, &e.to_string()),
         };
-        let checks: Vec<Value> = outcomes
+        let checks: Vec<Value> = detected
+            .checks
             .iter()
             .map(|o| {
                 let mut v = serde_json::to_value(o).unwrap_or_default();
@@ -2909,12 +2912,20 @@ fn setup_get(state_dir: &Path, pm_dir: &Path, port: u16, fresh: bool) -> HttpRes
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        *cache = Some((Instant::now(), checked_at, json!(checks)));
+        *cache = Some((
+            Instant::now(),
+            checked_at,
+            json!({
+                "checks": checks,
+                "master": {"providers": detected.master_providers},
+            }),
+        ));
     }
-    let (at, checked_at, checks) = cache.as_ref().expect("filled above");
+    let (at, checked_at, run) = cache.as_ref().expect("filled above");
     let age = at.elapsed();
     json_response(json!({
-        "checks": checks,
+        "checks": run["checks"],
+        "master": run["master"],
         "checked_at": checked_at,
         "detect_only": true,
         // Whether this request ran the checks, how old the run is, and
