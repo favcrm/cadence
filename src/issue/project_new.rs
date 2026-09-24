@@ -339,7 +339,7 @@ pub fn run(pm: &Pm, req: &Request, actor: &str, guarded: &[(&str, &Path)]) -> Re
     // what this call created, so a refusal leaves nothing behind.
     let created_dir = !dir.exists();
     let mut created: Vec<PathBuf> = Vec::new();
-    let result = (|| -> Result<()> {
+    let result = (|| -> Result<Vec<String>> {
         std::fs::create_dir_all(&dir)?;
         if write_yaml {
             let yaml = serde_yaml::to_string(&project::Project {
@@ -370,39 +370,36 @@ pub fn run(pm: &Pm, req: &Request, actor: &str, guarded: &[(&str, &Path)]) -> Re
             "PROJECT.md seeded"
         };
         let ids: Vec<&str> = req.issue.iter().map(String::as_str).collect();
-        write::commit(pm, &format!("project {key} {what}"), &ids, actor)
+        write::commit(pm, &created, &format!("project {key} {what}"), &ids, actor)
     })();
-    if let Err(e) = result {
-        // Unstage first (the commit's `git add -A` staged them), then
-        // remove: a failed call leaves neither index entries nor files.
-        let mut unstage: Vec<String> = vec!["reset".into(), "-q".into(), "--".into()];
-        unstage.extend(
-            created
-                .iter()
-                .filter_map(|f| f.strip_prefix(&pm.dir).ok())
-                .map(|f| f.to_string_lossy().to_string()),
-        );
-        if unstage.len() > 3 {
-            let args: Vec<&str> = unstage.iter().map(String::as_str).collect();
-            let _ = crate::issue::git(&pm.dir, &args);
+    let foreign = match result {
+        Err(e) => {
+            // The commit unstaged its own paths already; remove the
+            // files too — a failed call leaves neither index entries
+            // nor files.
+            for file in created.iter().rev() {
+                let _ = std::fs::remove_file(file);
+            }
+            if created_dir {
+                let _ = std::fs::remove_dir(&dir);
+            }
+            // `e` carries git's stderr (a refusing hook's output included).
+            return Err(Error::rejected(format!(
+                "project {key}: the tracker commit failed, nothing kept — {e}"
+            )));
         }
-        for file in created.iter().rev() {
-            let _ = std::fs::remove_file(file);
-        }
-        if created_dir {
-            let _ = std::fs::remove_dir(&dir);
-        }
-        // `e` carries git's stderr (a refusing hook's output included).
-        return Err(Error::rejected(format!(
-            "project {key}: the tracker commit failed, nothing kept — {e}"
-        )));
-    }
-    Ok(json!({
+        Ok(foreign) => foreign,
+    };
+    let mut out = json!({
         "project": key, "prefix": prefix, "path": dir, "repo": root,
         "remote": remote, "manifest": manifest,
         "agents": agents.iter().map(|(s, n)| (s.clone(), json!(n))).collect::<serde_json::Map<_, _>>(),
         "seeded": write_manifest, "changed": true, "committed": true, "actor": actor,
-    }))
+    });
+    if !foreign.is_empty() {
+        out["foreign_files"] = json!(foreign);
+    }
+    Ok(out)
 }
 
 fn create_new(path: &Path, text: &str) -> Result<()> {

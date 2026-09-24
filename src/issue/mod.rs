@@ -32,6 +32,7 @@ pub mod time;
 pub mod work;
 pub mod write;
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -158,7 +159,10 @@ impl Pm {
         let pm = Self::at(dir)?;
         // Every write is a commit — the skeleton included.
         if pm.git_dirty() {
-            pm.commit(&format!("init\n\nActor: {}", write::actor_who("", None)))?;
+            let _ = pm.commit(
+                &[pm_yaml, readme, gitignore],
+                &format!("init\n\nActor: {}", write::actor_who("", None)),
+            )?;
         }
         Ok(pm)
     }
@@ -221,42 +225,190 @@ impl Pm {
         }
     }
 
-    /// `git add -A` + one commit — every CLI write ends in exactly one.
-    /// The identity is fixed so PM commits never depend on user config.
-    pub fn commit(&self, message: &str) -> Result<()> {
-        git(&self.dir, &["add", "-A"])?;
-        if !self.git_dirty_cached() {
-            return Ok(());
+    /// `git add -- <paths>` + one path-limited `git commit -- <paths>`
+    /// — every CLI write ends in exactly one commit, and that commit
+    /// carries only the paths the write itself touched. `git add -A`
+    /// swept any planted file (a forged report, a stray note) into the
+    /// next ordinary write under that writer's name (CAD-454); a
+    /// path-limited commit never does, even when foreign entries are
+    /// already staged. The identity is fixed so PM commits never
+    /// depend on user config.
+    ///
+    /// Foreign paths — staged, modified or untracked files this write
+    /// did not touch — are left alone and reported once: stderr for
+    /// the operator watching the CLI/daemon log, the commit's
+    /// `Foreign-Files:` trailer for the audit trail, and the returned
+    /// list for callers that surface JSON. They never block the write
+    /// (a plant must not become a way to stall every tracker write).
+    /// On an add or commit failure this write's own paths are
+    /// unstaged, so a retry — or the next writer — never carries them.
+    ///
+    /// `paths` are absolute (or `pm.dir`-relative) paths under the
+    /// tracker; an empty list or a path outside `pm.dir` is a caller
+    /// bug and refused. Returns the foreign paths, repo-relative.
+    pub fn commit(&self, paths: &[PathBuf], message: &str) -> Result<Vec<String>> {
+        let mut rel = Vec::with_capacity(paths.len());
+        for p in paths {
+            let abs = if p.is_absolute() {
+                p.clone()
+            } else {
+                self.dir.join(p)
+            };
+            let r = abs.strip_prefix(&self.dir).map_err(|_| {
+                Error::internal(format!(
+                    "tracker write {} is outside the PM dir {}",
+                    p.display(),
+                    self.dir.display()
+                ))
+            })?;
+            rel.push(r.to_string_lossy().into_owned());
         }
-        git(
-            &self.dir,
-            &[
-                "-c",
-                "user.name=cadence",
-                "-c",
-                "user.email=cadence@localhost",
-                "commit",
-                "-q",
-                "-m",
-                message,
-            ],
-        )?;
-        Ok(())
+        if rel.is_empty() {
+            return Err(Error::internal(
+                "a tracker commit must name the paths it wrote",
+            ));
+        }
+        rel.sort();
+        rel.dedup();
+        let unstage = |dir: &Path, rel: &[String]| {
+            let mut args = vec!["reset", "-q", "--"];
+            args.extend(rel.iter().map(String::as_str));
+            let _ = git(dir, &args);
+        };
+        {
+            let mut add = vec!["add", "--"];
+            add.extend(rel.iter().map(String::as_str));
+            if let Err(e) = git(&self.dir, &add) {
+                unstage(&self.dir, &rel);
+                return Err(e);
+            }
+        }
+        let foreign = self.foreign_paths(&rel);
+        // Nothing of ours staged means nothing to commit — the foreign
+        // paths still get reported.
+        if !self.staged_dirty(&rel) {
+            warn_foreign(&self.dir, &foreign);
+            return Ok(foreign);
+        }
+        let message = if foreign.is_empty() {
+            message.to_string()
+        } else {
+            format!("{message}Foreign-Files: {}\n", foreign_listed(&foreign))
+        };
+        let mut commit = vec![
+            "-c",
+            "user.name=cadence",
+            "-c",
+            "user.email=cadence@localhost",
+            "commit",
+            "-q",
+            "-m",
+            message.as_str(),
+            "--",
+        ];
+        commit.extend(rel.iter().map(String::as_str));
+        if let Err(e) = git(&self.dir, &commit) {
+            unstage(&self.dir, &rel);
+            return Err(e);
+        }
+        warn_foreign(&self.dir, &foreign);
+        Ok(foreign)
     }
 
-    fn git_dirty_cached(&self) -> bool {
-        let diff = crate::reaper::status(
-            Command::new("git")
-                .arg("-C")
-                .arg(&self.dir)
-                .args(["diff", "--cached", "--quiet"]),
-        );
-        match diff {
-            // exit 1 = staged changes exist; 0 = clean.
-            Ok(s) => !s.success(),
-            Err(_) => false,
-        }
+    /// True when the index carries a change under one of `rel`.
+    fn staged_dirty(&self, rel: &[String]) -> bool {
+        let mut cmd = Command::new("git");
+        cmd.arg("-C")
+            .arg(&self.dir)
+            .args(["diff", "--cached", "--quiet", "--"]);
+        cmd.args(rel);
+        // exit 1 = staged changes under those paths; 0 = clean.
+        crate::reaper::status(&mut cmd)
+            .map(|s| !s.success())
+            .unwrap_or(false)
     }
+
+    /// Paths `git status` reports that this write did not touch —
+    /// untracked plants, foreign modifications and staged entries
+    /// alike. `.write.lock` and `.index/` are the tracker's own
+    /// scratch (gitignored); they are filtered so a missing .gitignore
+    /// never turns every write into a false alarm.
+    fn foreign_paths(&self, ours: &[String]) -> Vec<String> {
+        // Raw stdout — porcelain's leading-space XY codes must not be
+        // trimmed (` M` is an unstaged modification).
+        let Ok(out) = crate::reaper::output(Command::new("git").arg("-C").arg(&self.dir).args([
+            "status",
+            "--porcelain",
+            "-z",
+        ])) else {
+            return vec![];
+        };
+        if !out.status.success() {
+            return vec![];
+        }
+        let out = String::from_utf8_lossy(&out.stdout);
+        let ours: HashSet<&str> = ours.iter().map(String::as_str).collect();
+        let foreign =
+            |p: &str| !ours.contains(p) && p != ".write.lock" && !p.starts_with(".index/");
+        let mut found = Vec::new();
+        let mut fields = out.split('\0');
+        while let Some(rec) = fields.next() {
+            if rec.len() < 4 || rec.as_bytes()[2] != b' ' {
+                continue;
+            }
+            let (xy, path) = rec.split_at(2);
+            let path = path[1..].to_string();
+            if foreign(&path) {
+                found.push(path);
+            }
+            // `-z` rename/copy entries carry a second field — the
+            // source path — with no status prefix of its own.
+            if xy.contains('R') || xy.contains('C') {
+                if let Some(orig) = fields.next() {
+                    if foreign(orig) {
+                        found.push(orig.to_string());
+                    }
+                }
+            }
+        }
+        found.sort();
+        found.dedup();
+        found
+    }
+}
+
+/// One stderr line per write that saw foreign files — the immediate
+/// signal for the operator watching the CLI or the daemon's log.
+fn warn_foreign(dir: &Path, foreign: &[String]) {
+    if foreign.is_empty() {
+        return;
+    }
+    eprintln!(
+        "warning: {} foreign path(s) under {} left uncommitted: {}",
+        foreign.len(),
+        dir.display(),
+        foreign_listed(foreign)
+    );
+}
+
+/// The foreign-path list as one line — capped so a planted tree cannot
+/// blow up a commit message or a log line.
+fn foreign_listed(foreign: &[String]) -> String {
+    const SHOW: usize = 8;
+    let mut listed: Vec<String> = foreign
+        .iter()
+        .take(SHOW)
+        .map(|p| {
+            p.chars()
+                .map(|c| if c.is_control() { '?' } else { c })
+                .take(160)
+                .collect()
+        })
+        .collect();
+    if foreign.len() > SHOW {
+        listed.push(format!("(+{} more)", foreign.len() - SHOW));
+    }
+    listed.join(", ")
 }
 
 pub struct PmLock {

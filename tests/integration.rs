@@ -20870,7 +20870,11 @@ fn memory_native_socket_identity_requires_distinct_reviewers() {
         "key: demo\nprefix: D\ncomponents: []\n",
     )
     .unwrap();
-    pm.commit("project fixture\n\nActor: test\n").unwrap();
+    pm.commit(
+        &[pm_dir.join("demo/project.yaml")],
+        "project fixture\n\nActor: test\n",
+    )
+    .unwrap();
 
     let mock_dir = TempDir::new().unwrap();
     let mock = install_mock_devin(mock_dir.path());
@@ -32477,7 +32481,11 @@ fn memory_managed_endpoints_authenticate_through_daemon_enrollment() {
         "key: demo\nprefix: D\ncomponents: []\n",
     )
     .unwrap();
-    pm.commit("project fixture\n\nActor: test\n").unwrap();
+    pm.commit(
+        &[pm_dir.join("demo/project.yaml")],
+        "project fixture\n\nActor: test\n",
+    )
+    .unwrap();
     test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
     let d = TestDaemon::start_opts(slot_opts(2, 1, 900, &[]));
     let mut author = ManagedWorker::start(&d, "author");
@@ -32649,7 +32657,11 @@ fn memory_managed_identity_survives_ttl_and_refuses_ambiguity() {
         "key: demo\nprefix: D\ncomponents: []\n",
     )
     .unwrap();
-    pm.commit("project fixture\n\nActor: test\n").unwrap();
+    pm.commit(
+        &[pm_dir.join("demo/project.yaml")],
+        "project fixture\n\nActor: test\n",
+    )
+    .unwrap();
     test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
     let clock = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1_000));
     let d = TestDaemon::start_opts(slot_opts_clock(

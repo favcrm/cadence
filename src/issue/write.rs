@@ -30,12 +30,27 @@ pub(crate) fn actor_who(actor: &str, who: Option<&str>) -> String {
 /// keep the bare subject. Every commit also carries trailers after a
 /// blank line: `Issue: <ID>` once per issue the write touches (links
 /// record both ends) and `Actor: <who>` — the truthful actor history
-/// reads instead of the git author.
-pub(crate) fn commit(pm: &Pm, message: &str, ids: &[&str], actor: &str) -> Result<()> {
-    commit_who(pm, message, ids, actor, None)
+/// reads instead of the git author. `paths` are exactly the files the
+/// write touched — they are all the commit stages (CAD-454); the
+/// returned list names foreign paths the commit saw but left alone.
+pub(crate) fn commit(
+    pm: &Pm,
+    paths: &[PathBuf],
+    message: &str,
+    ids: &[&str],
+    actor: &str,
+) -> Result<Vec<String>> {
+    commit_who(pm, paths, message, ids, actor, None)
 }
 
-fn commit_who(pm: &Pm, message: &str, ids: &[&str], actor: &str, who: Option<&str>) -> Result<()> {
+fn commit_who(
+    pm: &Pm,
+    paths: &[PathBuf],
+    message: &str,
+    ids: &[&str],
+    actor: &str,
+    who: Option<&str>,
+) -> Result<Vec<String>> {
     let subject = if actor.is_empty() {
         message.to_string()
     } else {
@@ -46,7 +61,7 @@ fn commit_who(pm: &Pm, message: &str, ids: &[&str], actor: &str, who: Option<&st
         trailers.push_str(&format!("Issue: {id}\n"));
     }
     trailers.push_str(&format!("Actor: {}\n", actor_who(actor, who)));
-    pm.commit(&format!("{subject}\n\n{trailers}"))
+    pm.commit(paths, &format!("{subject}\n\n{trailers}"))
 }
 
 /// Content hash of `issue.md` — the optimistic-concurrency token the
@@ -118,6 +133,36 @@ fn atomic_write(path: &Path, text: &str) -> Result<()> {
     std::fs::write(&tmp, text)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// A tracker file's bytes before this write touches it — `None` when
+/// it does not exist. Feeds [`restore_preimage`] when the commit
+/// fails, so a refused write leaves neither an index entry (the
+/// commit unstages its own paths) nor a half-written file (CAD-454).
+fn file_preimage(path: &Path) -> Option<Vec<u8>> {
+    std::fs::read(path).ok()
+}
+
+/// Undo what a write did to `path`: the old bytes go back where they
+/// were; a file this write created is removed.
+fn restore_preimage(path: &Path, prev: Option<Vec<u8>>) {
+    match prev {
+        Some(bytes) => {
+            let _ = std::fs::write(path, bytes);
+        }
+        None => {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Fold the foreign paths a commit saw into the write's JSON result —
+/// `foreign_files` is present only when the tracker held files the
+/// write did not stage.
+fn attach_foreign(out: &mut Value, foreign: &[String]) {
+    if !foreign.is_empty() {
+        out["foreign_files"] = json!(foreign);
+    }
 }
 
 /// Create a file exclusively; on a name collision try `-2`, `-3`…
@@ -241,16 +286,32 @@ pub fn set_acceptance(pm: &Pm, id: &str, source: &Path, actor: &str) -> Result<V
     let _lock = pm.lock()?;
     let (front, body) = load_front(&dir)?;
     let body = parse::replace_acceptance(&body, &items)?;
+    let file = dir.join("issue.md");
+    let prev = file_preimage(&file);
     save_front(&dir, &front, &body)?;
-    commit(pm, &format!("{id}: acceptance replaced"), &[id], actor)?;
-    Ok(json!({
+    let foreign = match commit(
+        pm,
+        std::slice::from_ref(&file),
+        &format!("{id}: acceptance replaced"),
+        &[id],
+        actor,
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            restore_preimage(&file, prev);
+            return Err(e);
+        }
+    };
+    let mut out = json!({
         "id": id,
         "acceptance": items
             .iter()
             .map(parse::AcceptanceItem::to_json)
             .collect::<Vec<_>>(),
         "committed": true,
-    }))
+    });
+    attach_foreign(&mut out, &foreign);
+    Ok(out)
 }
 
 /// `project add` — create `<pm>/<key>/project.yaml`.
@@ -317,10 +378,25 @@ pub fn project_add(
     std::fs::create_dir_all(&dir)?;
     let yaml = serde_yaml::to_string(&project)
         .map_err(|e| Error::internal(format!("project.yaml: {e}")))?;
-    std::fs::write(dir.join("project.yaml"), yaml)?;
-    commit(pm, &format!("project {key} added"), &[], "")?;
-    Ok(json!({"project": key, "prefix": project.prefix,
-              "path": dir, "committed": true}))
+    let yaml_path = dir.join("project.yaml");
+    std::fs::write(&yaml_path, yaml)?;
+    let foreign = match commit(
+        pm,
+        std::slice::from_ref(&yaml_path),
+        &format!("project {key} added"),
+        &[],
+        "",
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = std::fs::remove_file(&yaml_path);
+            return Err(e);
+        }
+    };
+    let mut out = json!({"project": key, "prefix": project.prefix,
+              "path": dir, "committed": true});
+    attach_foreign(&mut out, &foreign);
+    Ok(out)
 }
 
 /// Allocate the next id under the write lock: `<PREFIX>-<max+1>`.
@@ -414,8 +490,22 @@ pub fn new_issue(
         let _ = std::fs::remove_dir_all(&dir);
         return Err(e);
     }
-    commit(pm, &format!("{id}: created"), &[&id], actor)?;
-    Ok(json!({"id": id, "project": project.key, "path": dir, "committed": true}))
+    let foreign = match commit(
+        pm,
+        &[dir.join("issue.md")],
+        &format!("{id}: created"),
+        &[&id],
+        actor,
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(e);
+        }
+    };
+    let mut out = json!({"id": id, "project": project.key, "path": dir, "committed": true});
+    attach_foreign(&mut out, &foreign);
+    Ok(out)
 }
 
 /// CAD-359 `plan propose` — the epic (the plan, `plan.state:
@@ -498,7 +588,7 @@ pub fn create_plan(
         )));
     }
     let created = || files.iter().map(|(dir, _, _)| dir);
-    let build = || -> Result<()> {
+    let build = || -> Result<Vec<String>> {
         for (dir, front, body) in &files {
             std::fs::create_dir_all(dir.join("comments"))?;
             std::fs::create_dir_all(dir.join("artifacts"))?;
@@ -509,8 +599,13 @@ pub fn create_plan(
             check_structure(&issues, id)?;
         }
         let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let paths: Vec<PathBuf> = files
+            .iter()
+            .map(|(dir, _, _)| dir.join("issue.md"))
+            .collect();
         commit(
             pm,
+            &paths,
             &format!(
                 "{epic}: plan proposed — {} ({} tickets)",
                 doc.title,
@@ -520,13 +615,16 @@ pub fn create_plan(
             actor,
         )
     };
-    if let Err(e) = build() {
-        for dir in created() {
-            let _ = std::fs::remove_dir_all(dir);
+    let foreign = match build() {
+        Ok(foreign) => foreign,
+        Err(e) => {
+            for dir in created() {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+            return Err(e);
         }
-        return Err(e);
-    }
-    Ok(json!({
+    };
+    let mut out = json!({
         "epic": epic,
         "project": project.key,
         "title": doc.title,
@@ -534,7 +632,9 @@ pub fn create_plan(
         "proposed_by": proposer,
         "tickets": ids[1..],
         "committed": true,
-    }))
+    });
+    attach_foreign(&mut out, &foreign);
+    Ok(out)
 }
 
 /// CAD-360 `plan approve` / `plan reject` — record the operator's
@@ -611,15 +711,22 @@ pub fn decide_plan(
     } else {
         format!("{epic}: plan rejected by {by}")
     };
+    let paths: Vec<PathBuf> = writes
+        .iter()
+        .map(|(dir, _, _)| dir.join("issue.md"))
+        .collect();
     let written = writes
         .iter()
         .try_for_each(|(dir, front, body)| save_front(dir, front, body))
-        .and_then(|_| commit_who(pm, &subject, &ids, "", Some(by)));
-    if let Err(e) = written {
-        restore();
-        return Err(e);
-    }
-    Ok(json!({
+        .and_then(|_| commit_who(pm, &paths, &subject, &ids, "", Some(by)));
+    let foreign = match written {
+        Ok(f) => f,
+        Err(e) => {
+            restore();
+            return Err(e);
+        }
+    };
+    let mut out = json!({
         "epic": epic,
         "project": project.key,
         "state": state,
@@ -628,7 +735,9 @@ pub fn decide_plan(
         "reason": decided.reason,
         "ready": ready,
         "committed": true,
-    }))
+    });
+    attach_foreign(&mut out, &foreign);
+    Ok(out)
 }
 
 /// Reject shapes lint would flag, at write time: self-links, missing
@@ -842,13 +951,49 @@ fn stage(
 
 /// Write the staged fronts and make the one commit that names them all
 /// — subject `<ID>[, <ID>…]: <summary>`, one `Issue:` trailer per id.
-fn commit_staged(pm: &Pm, staged: &[Staged], summary: &str, actor: &str) -> Result<Vec<String>> {
-    for s in staged {
-        save_front(&s.dir, &s.front, &s.body)?;
+/// Only the staged issues' `issue.md` files reach the commit. Returns
+/// the committed ids plus the foreign paths the commit saw; a failed
+/// write or commit restores every file it touched (CAD-454).
+fn commit_staged(
+    pm: &Pm,
+    staged: &[Staged],
+    summary: &str,
+    actor: &str,
+) -> Result<(Vec<String>, Vec<String>)> {
+    if staged.is_empty() {
+        return Ok((vec![], vec![]));
     }
+    let originals: Vec<(PathBuf, Option<Vec<u8>>)> = staged
+        .iter()
+        .map(|s| {
+            let file = s.dir.join("issue.md");
+            let prev = file_preimage(&file);
+            (file, prev)
+        })
+        .collect();
+    let paths: Vec<PathBuf> = originals.iter().map(|(f, _)| f.clone()).collect();
     let ids: Vec<&str> = staged.iter().map(|s| s.id.as_str()).collect();
-    commit(pm, &format!("{}: {summary}", ids.join(", ")), &ids, actor)?;
-    Ok(ids.iter().map(|i| i.to_string()).collect())
+    let written = staged
+        .iter()
+        .try_for_each(|s| save_front(&s.dir, &s.front, &s.body))
+        .and_then(|_| {
+            commit(
+                pm,
+                &paths,
+                &format!("{}: {summary}", ids.join(", ")),
+                &ids,
+                actor,
+            )
+        });
+    match written {
+        Ok(foreign) => Ok((ids.iter().map(|i| i.to_string()).collect(), foreign)),
+        Err(e) => {
+            for (file, prev) in originals {
+                restore_preimage(&file, prev);
+            }
+            Err(e)
+        }
+    }
 }
 
 /// `issue set <ID>… key=value…` — the writable frontmatter fields, on
@@ -879,7 +1024,7 @@ pub fn set_fields(pm: &Pm, ids: &[String], pairs: &[String], actor: &str) -> Res
         }
         Ok(true)
     })?;
-    let ids = commit_staged(pm, &staged, &format!("set {}", changed.join(" ")), actor)?;
+    let (ids, foreign) = commit_staged(pm, &staged, &format!("set {}", changed.join(" ")), actor)?;
     // The post-merge reminder (CAD-94): when this set marks an issue
     // done while a worktree ref is still open, the CLI prints the
     // one-line `issue finish` hint for each of these ids.
@@ -901,16 +1046,10 @@ pub fn set_fields(pm: &Pm, ids: &[String], pairs: &[String], actor: &str) -> Res
     } else {
         Vec::new()
     };
-    Ok(json!({"id": ids[0], "ids": ids, "set": changed,
-              "worktree_open": worktree_open, "committed": true}))
-}
-
-/// Put `path`'s index entry back to HEAD's after a failed commit — the
-/// commit's `git add -A` staged it. Best effort: the write already failed.
-fn unstage(pm: &Pm, path: &Path) {
-    if let Ok(rel) = path.strip_prefix(&pm.dir) {
-        let _ = crate::issue::git(&pm.dir, &["reset", "-q", "--", &rel.to_string_lossy()]);
-    }
+    let mut out = json!({"id": ids[0], "ids": ids, "set": changed,
+              "worktree_open": worktree_open, "committed": true});
+    attach_foreign(&mut out, &foreign);
+    Ok(out)
 }
 
 /// CAD-449: a merged delivery marks its ticket done — one frontmatter
@@ -925,8 +1064,9 @@ fn unstage(pm: &Pm, path: &Path) {
 ///
 /// It never waits for the tracker lock: a busy tracker is an error the
 /// caller retries (the daemon holds its own lock here). A failed commit
-/// leaves nothing behind — `issue.md` is restored and unstaged, so the
-/// next writer's `git add -A` cannot commit `status: done` for it.
+/// leaves nothing behind — `issue.md` is restored, and the commit
+/// itself unstages the path, so no later write can commit
+/// `status: done` for it.
 pub fn mark_done_on_merge(
     pm: &Pm,
     id: &str,
@@ -950,11 +1090,17 @@ pub fn mark_done_on_merge(
     front.status = "done".to_string();
     let file = dir.join("issue.md");
     let original = std::fs::read(&file)?;
-    let written = save_front(&dir, &front, &body)
-        .and_then(|_| commit(pm, &format!("{id}: set status=done — {why}"), &[id], actor));
+    let written = save_front(&dir, &front, &body).and_then(|_| {
+        commit(
+            pm,
+            std::slice::from_ref(&file),
+            &format!("{id}: set status=done — {why}"),
+            &[id],
+            actor,
+        )
+    });
     if let Err(e) = written {
         let _ = std::fs::write(&file, &original);
-        unstage(pm, &file);
         return Err(e);
     }
     Ok(None)
@@ -1064,14 +1210,25 @@ pub fn move_stage(
     if let Some(n) = &note {
         subject.push_str(&format!(" — {n}"));
     }
-    let written = save_front(&dir, &front, &body)
-        .and_then(|_| commit_who(pm, &subject, &[epic], "", Some(&by)));
-    if let Err(e) = written {
-        // Nothing half-done: the file goes back to what was committed.
-        let _ = atomic_write(&file, &original);
-        return Err(e);
-    }
-    Ok(json!({
+    let written = save_front(&dir, &front, &body).and_then(|_| {
+        commit_who(
+            pm,
+            std::slice::from_ref(&file),
+            &subject,
+            &[epic],
+            "",
+            Some(&by),
+        )
+    });
+    let foreign = match written {
+        Ok(f) => f,
+        Err(e) => {
+            // Nothing half-done: the file goes back to what was committed.
+            let _ = atomic_write(&file, &original);
+            return Err(e);
+        }
+    };
+    let mut out = json!({
         "epic": epic,
         "project": project.key,
         "from": mv.from,
@@ -1084,7 +1241,9 @@ pub fn move_stage(
         "at": at,
         "config_unapproved": unapproved,
         "committed": true,
-    }))
+    });
+    attach_foreign(&mut out, &foreign);
+    Ok(out)
 }
 
 /// `issue tag <ID>… add|rm <tag>…` — add or remove tags on one issue or
@@ -1121,13 +1280,16 @@ pub fn tag_edit(pm: &Pm, ids: &[String], add: bool, tags: &[String], actor: &str
         .iter()
         .map(|s| json!({"id": s.id, "tags": s.front.tags}))
         .collect();
-    let ids = commit_staged(
+    let (ids, foreign) = commit_staged(
         pm,
         &staged,
         &format!("tag {verb} {}", tags.join(" ")),
         actor,
     )?;
-    Ok(json!({"ids": ids, "tag": verb, "tags": tags, "issues": tagged, "committed": true}))
+    let mut out =
+        json!({"ids": ids, "tag": verb, "tags": tags, "issues": tagged, "committed": true});
+    attach_foreign(&mut out, &foreign);
+    Ok(out)
 }
 
 /// The HTTP PATCH surface: typed fields instead of `key=value` pairs,
@@ -1225,15 +1387,26 @@ pub fn patch_issue(
             "nothing to patch — send at least one field",
         ));
     }
+    let file = dir.join("issue.md");
+    let prev = file_preimage(&file);
     save_front(&dir, &front, &body)?;
-    commit(
+    let foreign = match commit(
         pm,
+        std::slice::from_ref(&file),
         &format!("{id}: set {}", changed.join(" ")),
         &[id],
         actor,
-    )?;
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            restore_preimage(&file, prev);
+            return Err(e);
+        }
+    };
     let warnings = blocked_warnings(pm, id, state_dir)?;
-    Ok(json!({"id": id, "set": changed, "committed": true, "warnings": warnings}))
+    let mut out = json!({"id": id, "set": changed, "committed": true, "warnings": warnings});
+    attach_foreign(&mut out, &foreign);
+    Ok(out)
 }
 
 /// `issue link` / `issue unlink`. `blocked_by`/`relates` are list
@@ -1327,16 +1500,27 @@ pub fn link(
         this.front = front.clone();
     }
     check_structure(&preview, id)?;
+    let file = dir.join("issue.md");
+    let prev = file_preimage(&file);
     save_front(&dir, &front, &body)?;
-    commit(
+    let foreign = match commit(
         pm,
+        std::slice::from_ref(&file),
         &format!("{id}: {verb} {kind} {target}"),
         &[id, target],
         actor,
-    )?;
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            restore_preimage(&file, prev);
+            return Err(e);
+        }
+    };
     let warnings = blocked_warnings(pm, id, state_dir)?;
-    Ok(json!({"id": id, "link": kind, "target": target,
-              "unlink": unlink, "committed": true, "warnings": warnings}))
+    let mut out = json!({"id": id, "link": kind, "target": target,
+              "unlink": unlink, "committed": true, "warnings": warnings});
+    attach_foreign(&mut out, &foreign);
+    Ok(out)
 }
 
 /// `issue ref <ID> <kind> <url-or-path> [--label x]`. A scheme makes it
@@ -1375,10 +1559,26 @@ pub fn add_ref(
         agent: agent.map(str::to_string),
     };
     front.refs.push(r);
+    let file = dir.join("issue.md");
+    let prev = file_preimage(&file);
     save_front(&dir, &front, &body)?;
-    commit(pm, &format!("{id}: ref {kind}"), &[id], actor)?;
-    Ok(json!({"id": id, "ref": {"kind": kind, "target": target},
-              "committed": true}))
+    let foreign = match commit(
+        pm,
+        std::slice::from_ref(&file),
+        &format!("{id}: ref {kind}"),
+        &[id],
+        actor,
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            restore_preimage(&file, prev);
+            return Err(e);
+        }
+    };
+    let mut out = json!({"id": id, "ref": {"kind": kind, "target": target},
+              "committed": true});
+    attach_foreign(&mut out, &foreign);
+    Ok(out)
 }
 
 /// Mark every open `<kind>` ref naming `target` closed — kept as
@@ -1399,8 +1599,19 @@ pub fn close_ref(pm: &Pm, id: &str, kind: &str, target: &str, actor: &str) -> Re
         }
     }
     if hit {
+        let file = dir.join("issue.md");
+        let prev = file_preimage(&file);
         save_front(&dir, &front, &body)?;
-        commit(pm, &format!("{id}: ref {kind} closed"), &[id], actor)?;
+        if let Err(e) = commit(
+            pm,
+            std::slice::from_ref(&file),
+            &format!("{id}: ref {kind} closed"),
+            &[id],
+            actor,
+        ) {
+            restore_preimage(&file, prev);
+            return Err(e);
+        }
     }
     Ok(())
 }
@@ -1461,25 +1672,28 @@ pub fn add_comment(
         &format!("{}-{author}.md", time::basic(epoch)),
         text.as_bytes(),
     )?;
-    // A failed commit leaves nothing behind (CAD-449): the file goes,
-    // and so does the `git add -A` staging of it — else the next
-    // writer's commit carries this comment under its own subject.
-    if let Err(e) = commit_who(
+    // A failed commit leaves no comment file behind — an orphan would
+    // sit foreign and uncommitted under the next writer's eye.
+    let foreign = match commit_who(
         pm,
+        std::slice::from_ref(&path),
         &format!("{id}: comment by {author}"),
         &[id],
         actor,
         author_opt,
     ) {
-        let _ = std::fs::remove_file(&path);
-        unstage(pm, &path);
-        return Err(e);
-    }
+        Ok(f) => f,
+        Err(e) => {
+            let _ = std::fs::remove_file(&path);
+            return Err(e);
+        }
+    };
     let mut out = json!({"id": id, "comment": path.file_name().map(|n| n.to_string_lossy().to_string()),
               "author": author, "committed": true});
     if !secret_warnings.is_empty() {
         out["secret_warnings"] = crate::secret::warnings_json(&secret_warnings);
     }
+    attach_foreign(&mut out, &foreign);
     Ok(out)
 }
 
@@ -1522,8 +1736,16 @@ pub(crate) fn commit_front_with_comment(
         &format!("{}-{author}.md", time::basic(epoch)),
         rendered.as_bytes(),
     )?;
-    let committed = save_front(dir, front, body)
-        .and_then(|_| commit_who(pm, &format!("{id}: {subject}"), &[id], actor, Some(author)));
+    let committed = save_front(dir, front, body).and_then(|_| {
+        commit_who(
+            pm,
+            &[dir.join("issue.md"), path.clone()],
+            &format!("{id}: {subject}"),
+            &[id],
+            actor,
+            Some(author),
+        )
+    });
     if let Err(e) = committed {
         let _ = save_front(dir, prev, body);
         let _ = std::fs::remove_file(&path);
@@ -1576,21 +1798,27 @@ pub fn add_report(
     )?;
     // A failed commit must not leave the file behind: a retry would hit
     // the duplicate short-circuit and never commit it.
-    if let Err(e) = commit_who(
+    let foreign = match commit_who(
         pm,
+        std::slice::from_ref(&path),
         &format!("{id}: report {kind} by {agent}"),
         &[id],
         actor,
         Some(&agent),
     ) {
-        let _ = std::fs::remove_file(&path);
-        return Err(e);
-    }
+        Ok(f) => f,
+        Err(e) => {
+            let _ = std::fs::remove_file(&path);
+            return Err(e);
+        }
+    };
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
-    Ok(out(&name, false))
+    let mut out = out(&name, false);
+    attach_foreign(&mut out, &foreign);
+    Ok(out)
 }
 
 /// `issue attach <ID> <file>` — copy into `artifacts/` (basename only),
@@ -1670,11 +1898,23 @@ pub fn attach_bytes(
             Err(e) => return Err(e.into()),
         }
     };
-    commit(pm, &format!("{id}: attach {name}"), &[id], actor)?;
-    Ok(
-        json!({"id": id, "artifact": path.file_name().map(|n| n.to_string_lossy().to_string()),
-              "size": bytes.len(), "committed": true}),
-    )
+    let foreign = match commit(
+        pm,
+        std::slice::from_ref(&path),
+        &format!("{id}: attach {name}"),
+        &[id],
+        actor,
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = std::fs::remove_file(&path);
+            return Err(e);
+        }
+    };
+    let mut out = json!({"id": id, "artifact": path.file_name().map(|n| n.to_string_lossy().to_string()),
+              "size": bytes.len(), "committed": true});
+    attach_foreign(&mut out, &foreign);
+    Ok(out)
 }
 
 #[cfg(test)]
