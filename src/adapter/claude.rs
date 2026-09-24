@@ -264,7 +264,7 @@ fn launch_command(
     mcp_config: Option<&Path>,
 ) -> (Vec<String>, Option<crate::confine::Policy>) {
     let command = build_command(env, agent, session_id, resume, mcp_config);
-    if !master_confined(agent) {
+    if !master_confined(env, agent) {
         return (command, None);
     }
     let (confine, policy) = master_confinement(env, state_dir);
@@ -272,10 +272,15 @@ fn launch_command(
     (argv, Some(policy))
 }
 
-/// The master, unless the operator started it `--unconfined` on a host
-/// without Landlock.
-fn master_confined(agent: &Agent) -> bool {
-    crate::master::is_master(&agent.alias) && !crate::master::unconfined(agent.params.as_ref())
+/// The master, confined whenever this host can confine it — the stored
+/// `unconfined` param (the operator's `--unconfined` on a host without
+/// Landlock) counts only where it cannot (review round 2).
+fn master_confined(env: &ProviderEnv, agent: &Agent) -> bool {
+    crate::master::is_master(&agent.alias)
+        && crate::master::is_confined(
+            agent.params.as_ref(),
+            crate::master::confinement_available(env).is_ok(),
+        )
 }
 
 /// The confining binary and the policy a master launched by a daemon
@@ -773,7 +778,7 @@ impl ProviderAdapter for ClaudeAdapter {
             env.extend(crate::master::env_overrides(
                 &self.state_dir,
                 pm.as_deref(),
-                master_confined(agent),
+                master_confined(&self.env, agent),
             ));
         }
         let params = agent.params.clone().unwrap_or(Value::Null);
@@ -1106,13 +1111,25 @@ mod tests {
         let (argv, _) = launch_command(&env, state, &master, "s", true, None);
         assert_eq!(argv[..2], ["/opt/cadence/bin/cadence", "confine"]);
         assert!(argv.iter().any(|a| a == "--resume"));
-        // An operator's `--unconfined` start (no Landlock on the host):
-        // the CAD-339 line, unwrapped.
+        // A stored `unconfined` param does not unconfine the master where
+        // the host can confine it (review round 2)…
         let loose = agent("master", json!({"unconfined": true}));
+        if crate::confine::available().is_ok() {
+            let (argv, policy) = launch_command(&env, state, &loose, "s", false, None);
+            assert!(policy.is_some(), "{argv:?}");
+            assert_eq!(argv[..2], ["/opt/cadence/bin/cadence", "confine"]);
+        }
+        // …only where it cannot (the operator's `--unconfined`): the
+        // CAD-339 line, unwrapped.
+        env.set(crate::master::TEST_NO_LANDLOCK, "1");
         let (argv, policy) = launch_command(&env, state, &loose, "s", false, None);
         assert!(policy.is_none());
         assert_eq!(argv, build_command(&env, &loose, "s", false, None));
         assert_eq!(flag_values(&argv, "--permission-mode"), ["dontAsk"]);
+        // Without the param, a host without Landlock never launches it.
+        let (argv, policy) = launch_command(&env, state, &master, "s", false, None);
+        assert!(policy.is_some() && argv[1] == "confine");
+        env.remove(crate::master::TEST_NO_LANDLOCK);
         // Any other agent: no wrapper, no policy.
         let dev = agent("dev-1", json!({}));
         let (argv, policy) = launch_command(&env, state, &dev, "s", false, None);

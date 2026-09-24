@@ -41950,9 +41950,17 @@ fn master_reads_nothing_outside_its_views() {
             std::fs::write(c, &token).unwrap();
         }
     }
-    let (mut m, out) = f.start_master();
+    // The operator's explicit `--copy-login`.
+    let (mut m, out) = f.start_master_with(json!({"provider": "claude", "copy_login": true}));
     assert_eq!(out["confined"], true, "{out}");
     assert_eq!(out["login"], "copied", "{out}");
+    assert!(out["login_command"].is_null(), "{out}");
+    assert!(
+        f.d.events("master")
+            .iter()
+            .any(|e| e["kind"] == "master_login_copied"),
+        "the copy is recorded"
+    );
     // Review I1: the master's own config dir holds the Claude login only.
     let own = cadence_agent::master::claude_config_dir(&f.d.state).join(".credentials.json");
     let text = std::fs::read_to_string(&own).unwrap();
@@ -42009,6 +42017,53 @@ fn master_reads_nothing_outside_its_views() {
     let r = m.exec(&["cat", &own]);
     assert_eq!(r["rc"], 0, "{r}");
     assert_eq!(r["out"], "mine");
+}
+
+/// CAD-439 operator decision: the master gets its own, separate Claude
+/// login by default — `master start` copies nothing, reports `login:
+/// none` with the command that creates one, and Needs-you shows that
+/// command until the login exists.
+#[test]
+fn master_start_copies_no_login_by_default() {
+    let f = PlanFixture::start();
+    let home = f.tmp.path().join("home");
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    let login = format!("login-{}", uuid::Uuid::new_v4().simple());
+    std::fs::write(
+        home.join(".claude/.credentials.json"),
+        json!({"claudeAiOauth": {"accessToken": login}}).to_string(),
+    )
+    .unwrap();
+    let (_m, out) = f.start_master();
+    let command = cadence_agent::master::login_command(&f.d.state);
+    assert_eq!(out["login"], "none", "{out}");
+    assert_eq!(out["login_command"], command.as_str(), "{out}");
+    assert!(command.starts_with(&format!(
+        "CLAUDE_CONFIG_DIR={} ",
+        cadence_agent::master::claude_config_dir(&f.d.state).display()
+    )));
+    let dir = cadence_agent::master::claude_config_dir(&f.d.state);
+    assert!(!dir.join(".credentials.json").exists(), "nothing copied");
+    assert!(!f
+        .d
+        .events("master")
+        .iter()
+        .any(|e| e["kind"] == "master_login_copied"));
+    let has_login_row = |rows: &[Value]| {
+        rows.iter().any(|r| {
+            let causes = r["causes"].as_array().cloned().unwrap_or_default();
+            (r["kind"] == "master_login" && r["command"] == command.as_str())
+                || causes
+                    .iter()
+                    .any(|c| c["cause"] == "master_login" && c["command"] == command.as_str())
+        })
+    };
+    let rows = f.needs_me();
+    assert!(has_login_row(&rows), "{rows:#?}");
+    // The operator signs the master in: the row goes.
+    std::fs::write(dir.join(".credentials.json"), "{}").unwrap();
+    let rows = f.needs_me();
+    assert!(!has_login_row(&rows), "{rows:#?}");
 }
 
 /// CAD-439 review I2: `cadence upgrade` repoints the `cadence` link to a
@@ -42091,6 +42146,18 @@ fn master_without_landlock_starts_only_on_the_operators_opt_in() {
     assert!(
         f.d.rpc("agent_show", json!({"alias": "master"})).is_err(),
         "a refusal registers nothing"
+    );
+    // `--copy-login` is for a confined master's own config dir.
+    let err =
+        f.d.operator_rpc(
+            "master_start",
+            json!({"provider": "claude", "unconfined": true, "copy_login": true}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("--copy-login is for a confined master"),
+        "{err}"
     );
     let (mut m, out) = f.start_master_with(json!({"provider": "claude", "unconfined": true}));
     assert_eq!(out["confined"], false, "{out}");

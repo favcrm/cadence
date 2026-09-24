@@ -53,9 +53,14 @@
 //! `~/.claude.json` is in the policy — a confined CLI could otherwise
 //! only rewrite that shared file in place, unlocked, and a writable
 //! `~/.claude/settings.json` would plant hooks in every operator
-//! session. `master start` copies the operator's Claude login into it
-//! ([`provision_login`]). Residue: the master's tree can read that copy
-//! of its own login.
+//! session. By default (operator decision, 2026-09-24) the master has
+//! its own, separate login: `master start` copies nothing, reports
+//! `login: none` and prints [`login_command`]
+//! (`CLAUDE_CONFIG_DIR=<state>/master/claude claude auth login`), and
+//! Needs-you shows that command while the dir holds no login. `master
+//! start --copy-login` is the opt-in copy ([`copy_login`]), with its
+//! token-rotation risk. Residue: the master's tree can read its own
+//! login.
 //!
 //! Where Landlock is unavailable (macOS, older kernels) `master start`
 //! refuses; `master start --unconfined` (operator decision) starts it
@@ -426,16 +431,16 @@ pub fn confinement_available(env: &crate::adapter::ProviderEnv) -> Result<()> {
     crate::confine::available()
 }
 
-/// How the master's Claude login was provisioned.
+/// The master's Claude login, as `master start` found or made it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Login {
-    /// The master's config dir already has a login (an earlier copy, or
-    /// the operator's own `claude auth login` into it) — left alone.
+    /// The master's config dir has a login — its own `claude auth
+    /// login`, or an earlier `--copy-login` — left alone.
     Own,
-    /// Copied from the operator's Claude config at this start.
+    /// Copied from the operator's Claude config (`--copy-login`).
     Copied,
-    /// The operator has no file login to copy (API key auth, a macOS
-    /// keychain login): the master's CLI finds none.
+    /// None: the master's CLI cannot authenticate until the operator
+    /// runs [`login_command`].
     None,
 }
 
@@ -449,34 +454,59 @@ impl Login {
     }
 }
 
-/// `master start` (the operator, through the daemon): give the master's
-/// config dir a Claude login when it has none — the `claudeAiOauth`
-/// entry of the operator's `.credentials.json` only (never its MCP
-/// server tokens), written once, mode 0600, in a 0700 dir. Never via
-/// env or argv.
-///
-/// Refresh and expiry: the master's CLI refreshes its access token into
-/// its own copy. Whether a refresh on one side invalidates the other
-/// side's refresh token (refresh-token rotation) is the provider's
-/// policy and unverified here; if it does, whichever side refreshes
-/// second must sign in again. For an independent grant the operator
-/// runs `CLAUDE_CONFIG_DIR=<state>/master/claude claude auth login`
-/// once — an existing login is never overwritten. When the master's
-/// login expires or is revoked its turns fail with the CLI's auth error;
-/// delete `<state>/master/claude/.credentials.json` and run `master
-/// start` again, or sign in into that dir.
-pub fn provision_login(state_dir: &Path, operator_config: &Path) -> Result<Login> {
-    use std::io::Write as _;
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+/// The command that gives the master its own Claude login (operator
+/// decision, 2026-09-24: a separate login is the default).
+pub fn login_command(state_dir: &Path) -> String {
+    format!(
+        "CLAUDE_CONFIG_DIR={} claude auth login",
+        claude_config_dir(state_dir).display()
+    )
+}
+
+/// Does the master's config dir hold a login?
+pub fn has_login(state_dir: &Path) -> bool {
+    claude_config_dir(state_dir)
+        .join(".credentials.json")
+        .is_file()
+}
+
+/// Create the master's config dir, or tighten an existing one, to 0700;
+/// report whether it holds a login. Copies nothing.
+pub fn ensure_config_dir(state_dir: &Path) -> Result<Login> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     let dir = claude_config_dir(state_dir);
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(&dir)?;
-    let target = dir.join(".credentials.json");
-    if target.exists() {
+    // `mode` applies only to a dir this call creates.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    Ok(if has_login(state_dir) {
+        Login::Own
+    } else {
+        Login::None
+    })
+}
+
+/// `master start --copy-login` (the operator's explicit opt-in): give a
+/// master with no login a copy of the operator's — the `claudeAiOauth`
+/// entry of its `.credentials.json` only (never its MCP server tokens),
+/// mode 0600 in a 0700 dir, never via env or argv. An existing login is
+/// never overwritten.
+///
+/// Token rotation: both copies hold the same refresh token. Each side
+/// refreshes its access token into its own file; if the provider
+/// rotates refresh tokens, a refresh on one side can invalidate the
+/// other, and that side must sign in again. That is why the default is
+/// a separate login ([`login_command`]).
+pub fn copy_login(state_dir: &Path, operator_config: &Path) -> Result<Login> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+    if ensure_config_dir(state_dir)? == Login::Own {
         return Ok(Login::Own);
     }
+    let dir = claude_config_dir(state_dir);
+    let target = dir.join(".credentials.json");
     let Ok(text) = std::fs::read_to_string(operator_config.join(".credentials.json")) else {
         return Ok(Login::None);
     };
@@ -498,6 +528,13 @@ pub fn provision_login(state_dir: &Path, operator_config: &Path) -> Result<Login
     file.sync_all()?;
     std::fs::rename(&tmp, &target)?;
     Ok(Login::Copied)
+}
+
+/// Does a master with these params run confined? Always where this host
+/// can confine it — the stored `unconfined` param counts only where it
+/// cannot (review round 2).
+pub fn is_confined(params: Option<&Value>, available: bool) -> bool {
+    available || !unconfined(params)
 }
 
 /// The operator's Claude config dir: `CLAUDE_CONFIG_DIR`, else
@@ -989,15 +1026,49 @@ mod tests {
         assert!(!policy.read.iter().any(|p| p.starts_with(root.join(&sha))));
     }
 
-    /// Review I1: the master's login is the operator's `claudeAiOauth`
-    /// only (never its MCP tokens), 0600 in a 0700 dir, written once.
+    /// Operator decision: by default nothing is copied — the dir is made
+    /// 0700 (tightened when it already exists, review round 2) and the
+    /// login is reported missing, with the command that creates one.
+    #[test]
+    fn config_dir_is_0700_and_holds_no_copied_login_by_default() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = tmp.path().join("s");
+        let dir = claude_config_dir(&state);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(ensure_config_dir(&state).unwrap(), Login::None);
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        assert!(!has_login(&state));
+        assert_eq!(
+            login_command(&state),
+            format!("CLAUDE_CONFIG_DIR={} claude auth login", dir.display())
+        );
+        std::fs::write(dir.join(".credentials.json"), "{}").unwrap();
+        assert_eq!(ensure_config_dir(&state).unwrap(), Login::Own);
+    }
+
+    /// Review round 2: the stored `unconfined` param counts only where
+    /// the host cannot confine.
+    #[test]
+    fn unconfined_param_counts_only_without_landlock() {
+        let loose = json!({"unconfined": true});
+        assert!(is_confined(Some(&loose), true));
+        assert!(!is_confined(Some(&loose), false));
+        assert!(is_confined(Some(&json!({})), false));
+        assert!(is_confined(None, true));
+    }
+
+    /// `--copy-login`: the operator's `claudeAiOauth` only (never its
+    /// MCP tokens), 0600 in a 0700 dir, written once.
     #[test]
     fn provision_login_copies_only_the_claude_login_once() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::TempDir::new().unwrap();
         let (state, operator) = (tmp.path().join("s"), tmp.path().join("op"));
         std::fs::create_dir_all(&operator).unwrap();
-        assert_eq!(provision_login(&state, &operator).unwrap(), Login::None);
+        assert_eq!(copy_login(&state, &operator).unwrap(), Login::None);
         // Secret-shaped values built at runtime.
         let token = format!("tok-{}", uuid::Uuid::new_v4().simple());
         let mcp = format!("mcp-{}", uuid::Uuid::new_v4().simple());
@@ -1006,7 +1077,7 @@ mod tests {
             "mcpOAuth": {"github|x": {"accessToken": mcp}},
         });
         std::fs::write(operator.join(".credentials.json"), creds.to_string()).unwrap();
-        assert_eq!(provision_login(&state, &operator).unwrap(), Login::Copied);
+        assert_eq!(copy_login(&state, &operator).unwrap(), Login::Copied);
         let file = claude_config_dir(&state).join(".credentials.json");
         let text = std::fs::read_to_string(&file).unwrap();
         assert!(text.contains(&token) && !text.contains(&mcp), "{text}");
@@ -1015,12 +1086,12 @@ mod tests {
         assert_eq!(mode(&claude_config_dir(&state)), 0o700);
         // An existing login — the master's own sign-in — is left alone.
         std::fs::write(&file, "{\"claudeAiOauth\":{\"accessToken\":\"own\"}}").unwrap();
-        assert_eq!(provision_login(&state, &operator).unwrap(), Login::Own);
+        assert_eq!(copy_login(&state, &operator).unwrap(), Login::Own);
         assert!(std::fs::read_to_string(&file).unwrap().contains("own"));
         // A credentials file without a Claude login copies nothing.
         let other = tmp.path().join("s2");
         std::fs::write(operator.join(".credentials.json"), "{\"mcpOAuth\":{}}").unwrap();
-        assert_eq!(provision_login(&other, &operator).unwrap(), Login::None);
+        assert_eq!(copy_login(&other, &operator).unwrap(), Login::None);
         assert!(!claude_config_dir(&other).join(".credentials.json").exists());
     }
 

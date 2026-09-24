@@ -2328,6 +2328,14 @@ enum MasterAction {
         /// shows it while it runs.
         #[arg(long)]
         unconfined: bool,
+        /// Copy your Claude login (its claudeAiOauth entry only, 0600)
+        /// into the master's own config dir when it has none. Both then
+        /// share one refresh token: if the provider rotates refresh
+        /// tokens, a refresh on one side can sign the other out. The
+        /// default is a separate login — `master start` prints the
+        /// command.
+        #[arg(long)]
+        copy_login: bool,
     },
     /// Replace the master's SOUL.md or AGENT.md (operator only; one
     /// tracker commit). Takes effect at the next `master start`.
@@ -2385,15 +2393,22 @@ fn run_master(state_dir: &Path, action: MasterAction) -> Result<i32> {
             model,
             effort,
             unconfined,
+            copy_login,
         } => {
             let out = client::rpc(
                 state_dir,
                 "master_start",
                 json!({"provider": provider, "model": model, "effort": effort,
-                       "unconfined": unconfined}),
+                       "unconfined": unconfined, "copy_login": copy_login}),
             )?;
             if let Some(w) = out["warning"].as_str() {
                 eprintln!("WARNING: {w}");
+            }
+            if let Some(cmd) = out["login_command"].as_str() {
+                eprintln!(
+                    "The master has no Claude login yet. Give it its own:\n  {cmd}\n\
+                     (or `cadence master start --copy-login` to copy yours)"
+                );
             }
             out
         }

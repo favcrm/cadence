@@ -441,6 +441,17 @@ impl Shared {
             .get("unconfined")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let copy = params
+            .get("copy_login")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if copy && unconfined {
+            return Err(Error::invalid(
+                "master_copy_login",
+                "--copy-login is for a confined master's own config dir; an unconfined \
+                 master uses the operator's Claude config as it is",
+            ));
+        }
         match (
             master::confinement_available(&self.provider_env),
             unconfined,
@@ -503,20 +514,26 @@ impl Shared {
         // repo, where any agent can plant CLAUDE.md, hooks or settings.
         let cwd = master::workdir(&self.state_dir);
         std::fs::create_dir_all(&cwd)?;
-        // Confined, the master's CLI has its own config dir: give it a
-        // login (CAD-439 review, I1). Unconfined, it keeps the operator's.
+        // Confined, the master's CLI has its own config dir (CAD-439
+        // review, I1) and, by default, its own separate login: nothing is
+        // copied unless the operator asks (`--copy-login`). Unconfined,
+        // it keeps the operator's config.
         let login = if unconfined {
             None
-        } else {
+        } else if copy {
             let operator = master::operator_claude_config(
                 self.provider_env.var("CLAUDE_CONFIG_DIR"),
                 self.provider_env.var("HOME"),
             );
             Some(match operator {
-                Some(dir) => master::provision_login(&self.state_dir, &dir)?,
-                None => master::Login::None,
+                Some(dir) => master::copy_login(&self.state_dir, &dir)?,
+                None => master::ensure_config_dir(&self.state_dir)?,
             })
+        } else {
+            Some(master::ensure_config_dir(&self.state_dir)?)
         };
+        let login_command =
+            (login == Some(master::Login::None)).then(|| master::login_command(&self.state_dir));
         self.store.register_agent(&store::NewAgent {
             alias: ALIAS,
             provider,
@@ -564,6 +581,14 @@ impl Shared {
                    "confined": !unconfined,
                    "login": login.map(master::Login::as_str)}),
         );
+        if login == Some(master::Login::Copied) {
+            let _ = self.store.event_public(
+                ALIAS,
+                "master_login_copied",
+                json!({"by": "operator", "what": "claudeAiOauth",
+                       "to": master::claude_config_dir(&self.state_dir)}),
+            );
+        }
         if unconfined {
             let _ = self.store.event_public(
                 ALIAS,
@@ -575,6 +600,7 @@ impl Shared {
         Ok(json!({
             "confined": !unconfined,
             "login": login.map(master::Login::as_str),
+            "login_command": login_command,
             "warning": unconfined.then_some(UNCONFINED_WARNING),
             "alias": ALIAS,
             "provider": provider,
