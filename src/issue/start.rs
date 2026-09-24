@@ -487,6 +487,7 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
             let committed = write::save_front(&dir, &refreshed, &body).and_then(|_| {
                 write::commit(
                     pm,
+                    &[dir.join("issue.md")],
                     &format!("{}: start {branch} (refs refreshed)", front.id),
                     &[front.id.as_str()],
                     actor,
@@ -560,6 +561,7 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         let committed = write::save_front(&dir, &new_front, &body).and_then(|_| {
             write::commit(
                 pm,
+                &[dir.join("issue.md")],
                 &format!("{}: start {branch}", front.id),
                 &[front.id.as_str()],
                 actor,

@@ -1674,6 +1674,11 @@ pub(crate) fn run(
             r.closed = Some(true);
         }
     }
+    // CAD-454: the front write is committed only if the tracker commit
+    // lands — a refused commit puts the file back so the refs stay
+    // open on disk, not just in memory.
+    let front_file = dir.join("issue.md");
+    let front_prev = std::fs::read(&front_file).ok();
     write::save_front(&dir, &t.front, &t.body)?;
     let what = if branch.is_empty() {
         wt_name.as_deref().unwrap_or("worktree").to_string()
@@ -1689,7 +1694,20 @@ pub(crate) fn run(
     if force {
         trailers.push_str("Forced: true\n");
     }
-    pm.commit(&format!("{subject}\n\n{trailers}"))?;
+    if let Err(e) = pm.commit(
+        std::slice::from_ref(&front_file),
+        &format!("{subject}\n\n{trailers}"),
+    ) {
+        match &front_prev {
+            Some(bytes) => {
+                let _ = std::fs::write(&front_file, bytes);
+            }
+            None => {
+                let _ = std::fs::remove_file(&front_file);
+            }
+        }
+        return Err(e);
+    }
     // The commit phase is done — the pm lock goes back before the
     // remote delete: a `push` can take seconds and the lock's spin
     // deadline is 15s. The lease below, not lock ordering, is what
