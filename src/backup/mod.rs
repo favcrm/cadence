@@ -100,7 +100,7 @@ const EXPORT_EXCLUDES: &[&str] = &[
     "state-dir folders: private/, sessions/, briefings/, reviews/, agents/, roles/, backups/",
     "provider auth (Claude, Codex, Devin, Cursor sign-in state in their own dirs): never read",
     "endpoint tokens: agents.generation (turn-token generation), messages.turn_id (turn tokens) and agents.pid are set to NULL",
-    "turn tokens and generations elsewhere (event payloads, message text): every token-shaped value (<prefix>-<hex12|hex32>-<hex32>) and its generation is replaced with [redacted]; the export refuses if any remain",
+    "turn tokens and generations elsewhere (event payloads, message text): every token-shaped value (<prefix>-<hex12|hex32>-<hex32>), its generation, and every hex12|hex32 value under a JSON \"generation\" key is replaced with [redacted] wherever it appears; the export refuses if any remain",
     "freed database pages: VACUUM drops deleted rows",
     "the tracker (PM dir): a git repo with its own remote",
 ];
@@ -666,14 +666,28 @@ fn token_shape() -> regex::Regex {
         .expect("the registry's turn-token pattern compiles")
 }
 
+/// An endpoint generation logged on its own under a JSON `"generation"`
+/// key — the `ready` and `pane_root` event payloads — at any JSON escape
+/// depth (CAD-424). Group 1 is the generation. `owner_generation` and
+/// other keys that merely end in `generation` do not match.
+fn logged_generation_shape() -> regex::Regex {
+    regex::Regex::new(&format!(
+        r#"\\*"generation\\*"\s*:\s*\\*"({})\\*""#,
+        crate::adapter::registry::TURN_TOKEN_GENERATION
+    ))
+    .expect("the logged-generation pattern compiles")
+}
+
 /// Every turn token in the snapshot and the generation each is bound to.
 /// A value counts only when it has the registry's token shape
 /// (`<prefix>-<hex12|hex32>-<hex32>`), and then wherever it stands: any
 /// table or column, under any JSON key or none, inside escaped JSON
 /// (CAD-407). Prose under a `"turn_id"` key is not a token. Generations
-/// — spelled inside each token, or a generation-shaped
-/// `agents.generation` — are redacted where they stand alone too. Each
-/// occurrence in any text cell is replaced with [`REDACTED`].
+/// — spelled inside each token, a generation-shaped `agents.generation`,
+/// or a generation-shaped value under a JSON `"generation"` key (CAD-424:
+/// an old endpoint's `ready` event outlives every token naming it) — are
+/// redacted where they stand alone too. Each occurrence in any text cell
+/// is replaced with [`REDACTED`].
 fn redact_turn_tokens(conn: &Connection, shape: &regex::Regex) -> Result<Redaction> {
     let generation_shape = regex::Regex::new(&format!(
         "^(?:{})$",
@@ -692,9 +706,13 @@ fn redact_turn_tokens(conn: &Connection, shape: &regex::Regex) -> Result<Redacti
         }
     }
     // messages.turn_id is a text cell like any other.
+    let logged_generation = logged_generation_shape();
     each_text_cell(conn, |_, _, _, text| {
         for caps in shape.captures_iter(text) {
             values.insert(caps[0].to_string());
+            values.insert(caps[1].to_string());
+        }
+        for caps in logged_generation.captures_iter(text) {
             values.insert(caps[1].to_string());
         }
         Ok(())
@@ -737,10 +755,11 @@ fn redact_turn_tokens(conn: &Connection, shape: &regex::Regex) -> Result<Redacti
     })
 }
 
-/// Fail closed: after redaction, no token-shaped value and no redacted
-/// generation may be left anywhere in the file. Each cell is read through
-/// JSON `\uXXXX` escapes, so a token spelled with them — which cannot be
-/// redacted in place — refuses the export.
+/// Fail closed: after redaction, no token-shaped value, no redacted
+/// generation and no generation under a `"generation"` key may be left
+/// anywhere in the file. Each cell is read through JSON `\uXXXX` escapes,
+/// so a token or generation spelled with them — which cannot be redacted
+/// in place — refuses the export.
 fn refuse_remaining_tokens(
     db: &Path,
     shape: &regex::Regex,
@@ -748,6 +767,7 @@ fn refuse_remaining_tokens(
 ) -> Result<()> {
     let escape = regex::Regex::new(r"\\u([0-9a-fA-F]{4})")
         .map_err(|e| Error::internal(format!("escape pattern: {e}")))?;
+    let logged_generation = logged_generation_shape();
     let conn = crate::store::open_read_only(db)?;
     let mut left: Vec<String> = Vec::new();
     each_text_cell(&conn, |table, column, rowid, text| {
@@ -757,7 +777,9 @@ fn refuse_remaining_tokens(
                 .and_then(char::from_u32)
                 .map_or_else(|| caps[0].to_string(), String::from)
         });
-        let found = shape.is_match(&text) || matcher.is_some_and(|m| m.is_match(text.as_ref()));
+        let found = shape.is_match(&text)
+            || logged_generation.is_match(&text)
+            || matcher.is_some_and(|m| m.is_match(text.as_ref()));
         if found && left.len() < LIST_CAP {
             left.push(format!("{table}.{column} rowid {rowid}"));
         }

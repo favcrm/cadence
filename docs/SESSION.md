@@ -1077,13 +1077,21 @@ Only the store goes in. It is changed in these ways:
   key or none, or inside escaped JSON. Event payloads outlive their
   messages, so this covers tokens whose message row is gone. Only that
   shape counts: prose under a `"turn_id"` key, such as
-  `{"turn_id": "workspace"}`, is left alone. The generation inside each
-  token, and a generation-shaped `agents.generation`, are redacted where
-  they appear on their own too.
+  `{"turn_id": "workspace"}`, is left alone.
+- A generation is 12 or 32 lowercase hex. It is redacted in every text
+  cell where it appears, alone or inside other text, when the store
+  names it in one of three places: inside a turn token,
+  in `agents.generation`, or as the value under a JSON `"generation"`
+  key at any escape depth. The last covers an old endpoint's `ready` or
+  `pane_root` event after every token and agent row naming it is gone.
+  Hex under any other key (`owner_generation`, a message id, a commit
+  SHA) is not collected as a generation. It stays, except where it
+  contains a generation collected in one of those three places.
 - The export then re-reads every text cell, decoding JSON `\uXXXX`
-  escapes. It refuses if any token-shaped value or redacted generation is
-  still there. That includes a token spelled with escapes, which cannot
-  be redacted in place. The result reports `redacted: {tokens, cells}`.
+  escapes. It refuses if any token-shaped value, redacted generation or
+  generation under a `"generation"` key is still there. That includes a
+  token or generation spelled with escapes, which cannot be redacted in
+  place. The result reports `redacted: {tokens, cells}`.
 - `agents.pid` is set to NULL.
 - The file is `VACUUM`ed, so deleted rows left in freed pages do not travel.
 
@@ -1147,8 +1155,10 @@ of these cases:
 - **An earlier forced restore was interrupted**: a
   `cadence.sqlite3*.replaced-*` file in the state dir may hold the
   previous store. Every restore refuses until it is moved back or away.
-  So does the daemon: `daemon start`, `daemon run` and `daemon restart`
-  all refuse before they open or create a store. The error names each
+  So does the daemon: `daemon start` and `daemon run` refuse before they
+  open or create a store. `daemon restart` refuses before it shuts
+  anything down, so the running daemon keeps serving, and checks again
+  right before shutdown after a `--when-idle` wait. The error names each
   leftover and gives the `mv` commands that recover. If
   `cadence.sqlite3` is missing, it gives the commands that put the
   previous store back. If `cadence.sqlite3` exists too, the restore may

@@ -1114,6 +1114,88 @@ fn cad407_an_escaped_token_refuses_the_export() {
     assert!(!out.exists());
 }
 
+// ---- CAD-424 ----
+
+/// An old endpoint generation logged alone — the `ready` or `pane_root`
+/// event of an endpoint since replaced, with no surviving token and no
+/// agent row naming it — is redacted wherever it appears, at any JSON
+/// escape depth. Hex under other keys, and a `"generation"` value that is
+/// not generation-shaped, stay.
+#[test]
+fn cad424_a_generation_logged_alone_is_redacted() {
+    let root = TempDir::new().unwrap();
+    let state = fresh_state(root.path(), "state");
+    let (ready, pane_root, nested) = (hex(32), hex(12), hex(32));
+    let (message_id, owner) = (hex(32), hex(32));
+    let conn = writer(&state);
+    add_agent(&conn, "w1", "/nowhere");
+    raw_event(
+        &conn,
+        &format!(r#"{{"thread_id":null,"pid":7,"endpoint":"pty","generation":"{ready}"}}"#),
+    );
+    raw_event(
+        &conn,
+        &format!(r#"{{"pid":7,"start_time":1,"sid":7,"generation":"{pane_root}"}}"#),
+    );
+    raw_event(
+        &conn,
+        &format!(r#"{{"inner":"{{\"generation\":\"{nested}\"}}"}}"#),
+    );
+    add_message(
+        &conn,
+        "m1",
+        "w1",
+        &format!("pane reopened; generation {ready} is gone"),
+    );
+    let kept = format!(
+        r#"{{"message":"{message_id}","owner_generation":"{owner}","generation":"gen-1"}}"#
+    );
+    raw_event(&conn, &kept);
+    drop(conn);
+
+    let out = export(&state, &root.path().join("bundle")).unwrap();
+
+    let db = root.path().join("bundle").join(BUNDLE_DB);
+    let bytes = std::fs::read(&db).unwrap();
+    for generation in [&ready, &pane_root, &nested] {
+        assert!(
+            !contains(&bytes, generation),
+            "{generation} left in the bundle"
+        );
+    }
+    assert_eq!(
+        text(&db, "SELECT body FROM messages WHERE id='m1'").as_deref(),
+        Some("pane reopened; generation [redacted] is gone")
+    );
+    assert_eq!(
+        count(
+            &db,
+            &format!("SELECT count(*) FROM events WHERE payload = '{kept}'")
+        ),
+        1,
+        "hex under other keys and a non-generation value must be left alone"
+    );
+    assert_eq!(out["redacted"], json!({"tokens": 3, "cells": 4}), "{out}");
+}
+
+/// A logged generation spelled with JSON `\u` escapes cannot be redacted
+/// in place; the recheck reads through the escapes and refuses.
+#[test]
+fn cad424_an_escaped_logged_generation_refuses_the_export() {
+    let root = TempDir::new().unwrap();
+    let state = fresh_state(root.path(), "state");
+    let conn = writer(&state);
+    add_agent(&conn, "w1", "/nowhere");
+    // "a" as a JSON unicode escape: backslash, "u0061".
+    let a = ['\\'.to_string(), "u0061".to_string()].concat();
+    raw_event(&conn, &format!(r#"{{"generation":"{a}{}"}}"#, hex(11)));
+    drop(conn);
+    let out = root.path().join("bundle");
+    let err = export(&state, &out).unwrap_err().to_string();
+    assert!(err.contains("events.payload rowid"), "{err}");
+    assert!(!out.exists());
+}
+
 #[test]
 fn cad396_restore_refuses_after_an_interrupted_forced_restore() {
     let root = TempDir::new().unwrap();
