@@ -100,7 +100,7 @@ const EXPORT_EXCLUDES: &[&str] = &[
     "state-dir folders: private/, sessions/, briefings/, reviews/, agents/, roles/, backups/",
     "provider auth (Claude, Codex, Devin, Cursor sign-in state in their own dirs): never read",
     "endpoint tokens: agents.generation (turn-token generation), messages.turn_id (turn tokens) and agents.pid are set to NULL",
-    "turn tokens and generations elsewhere (event payloads, message text): every known value is replaced with [redacted]; the export refuses if any remain",
+    "turn tokens and generations elsewhere (event payloads, message text): every token-shaped value (<prefix>-<hex12|hex32>-<hex32>) and its generation is replaced with [redacted]; the export refuses if any remain",
     "freed database pages: VACUUM drops deleted rows",
     "the tracker (PM dir): a git repo with its own remote",
 ];
@@ -587,8 +587,9 @@ fn scrub(db: &Path) -> Result<Scrub> {
     let conn = Connection::open(db)?;
     // Turn tokens live on in event payloads and prose long after the
     // messages row, and a token spells out its generation. Redact every
-    // known value everywhere before the columns are nulled.
-    let redaction = redact_turn_tokens(&conn)?;
+    // token-shaped value everywhere before the columns are nulled.
+    let shape = token_shape();
+    let redaction = redact_turn_tokens(&conn, &shape)?;
     let mut scrubbed = Vec::new();
     for (table, column) in SCRUB_COLUMNS {
         if has_column(&conn, table, column)? {
@@ -598,9 +599,7 @@ fn scrub(db: &Path) -> Result<Scrub> {
     }
     conn.execute_batch("VACUUM")?;
     conn.close().map_err(|(_, e)| e)?;
-    if let Some(matcher) = &redaction.matcher {
-        refuse_remaining_tokens(db, matcher)?;
-    }
+    refuse_remaining_tokens(db, &shape, redaction.matcher.as_ref())?;
     Ok(Scrub {
         columns: scrubbed,
         redacted_values: redaction.values,
@@ -622,10 +621,6 @@ struct Redaction {
 
 /// What a redacted turn token or generation reads as in an export.
 pub const REDACTED: &str = "[redacted]";
-
-/// Shortest value treated as a token: shorter strings are too likely to
-/// occur in unrelated text.
-const MIN_TOKEN_LEN: usize = 8;
 
 fn user_tables(conn: &Connection) -> Result<Vec<String>> {
     Ok(conn
@@ -665,41 +660,45 @@ fn each_text_cell(
     Ok(())
 }
 
-/// Every turn token and generation the snapshot knows: `messages.turn_id`,
-/// `agents.generation`, every `"turn_id": "…"` value in any text cell
-/// (events outlive their messages), and the generation spelled inside
-/// each `<prefix>-<generation>-<uuid>` token. Each occurrence in any text
-/// cell is replaced with [`REDACTED`].
-fn redact_turn_tokens(conn: &Connection) -> Result<Redaction> {
+/// The registry's turn-token shape (CAD-407); group 1 is the generation.
+fn token_shape() -> regex::Regex {
+    regex::Regex::new(&crate::adapter::registry::turn_token_pattern())
+        .expect("the registry's turn-token pattern compiles")
+}
+
+/// Every turn token in the snapshot and the generation each is bound to.
+/// A value counts only when it has the registry's token shape
+/// (`<prefix>-<hex12|hex32>-<hex32>`), and then wherever it stands: any
+/// table or column, under any JSON key or none, inside escaped JSON
+/// (CAD-407). Prose under a `"turn_id"` key is not a token. Generations
+/// — spelled inside each token, or a generation-shaped
+/// `agents.generation` — are redacted where they stand alone too. Each
+/// occurrence in any text cell is replaced with [`REDACTED`].
+fn redact_turn_tokens(conn: &Connection, shape: &regex::Regex) -> Result<Redaction> {
+    let generation_shape = regex::Regex::new(&format!(
+        "^(?:{})$",
+        crate::adapter::registry::TURN_TOKEN_GENERATION
+    ))
+    .map_err(|e| Error::internal(format!("generation pattern: {e}")))?;
     let mut values = std::collections::BTreeSet::new();
-    for (table, column) in [("messages", "turn_id"), ("agents", "generation")] {
-        if has_column(conn, table, column)? {
-            let mut stmt = conn.prepare(&format!(
-                "SELECT DISTINCT {column} FROM {table} WHERE {column} IS NOT NULL"
-            ))?;
-            for value in stmt.query_map([], |r| r.get::<_, String>(0))? {
-                values.insert(value?);
+    if has_column(conn, "agents", "generation")? {
+        let mut stmt =
+            conn.prepare("SELECT DISTINCT generation FROM agents WHERE generation IS NOT NULL")?;
+        for value in stmt.query_map([], |r| r.get::<_, String>(0))? {
+            let value = value?;
+            if generation_shape.is_match(&value) {
+                values.insert(value);
             }
         }
     }
-    let keyed = regex::Regex::new(r#""turn_id"\s*:\s*"([^"\\]+)""#)
-        .map_err(|e| Error::internal(format!("turn_id pattern: {e}")))?;
+    // messages.turn_id is a text cell like any other.
     each_text_cell(conn, |_, _, _, text| {
-        for caps in keyed.captures_iter(text) {
+        for caps in shape.captures_iter(text) {
+            values.insert(caps[0].to_string());
             values.insert(caps[1].to_string());
         }
         Ok(())
     })?;
-    let generations: Vec<String> = values
-        .iter()
-        .filter_map(|token| {
-            let mut parts = token.splitn(3, '-');
-            let (_prefix, generation, _id) = (parts.next()?, parts.next()?, parts.next()?);
-            Some(generation.to_string())
-        })
-        .collect();
-    values.extend(generations);
-    values.retain(|v| v.len() >= MIN_TOKEN_LEN && v != REDACTED);
     if values.is_empty() {
         return Ok(Redaction {
             values: 0,
@@ -738,13 +737,28 @@ fn redact_turn_tokens(conn: &Connection) -> Result<Redaction> {
     })
 }
 
-/// Fail closed: after redaction, no known token or generation may be
-/// left anywhere in the file.
-fn refuse_remaining_tokens(db: &Path, matcher: &aho_corasick::AhoCorasick) -> Result<()> {
+/// Fail closed: after redaction, no token-shaped value and no redacted
+/// generation may be left anywhere in the file. Each cell is read through
+/// JSON `\uXXXX` escapes, so a token spelled with them — which cannot be
+/// redacted in place — refuses the export.
+fn refuse_remaining_tokens(
+    db: &Path,
+    shape: &regex::Regex,
+    matcher: Option<&aho_corasick::AhoCorasick>,
+) -> Result<()> {
+    let escape = regex::Regex::new(r"\\u([0-9a-fA-F]{4})")
+        .map_err(|e| Error::internal(format!("escape pattern: {e}")))?;
     let conn = crate::store::open_read_only(db)?;
     let mut left: Vec<String> = Vec::new();
     each_text_cell(&conn, |table, column, rowid, text| {
-        if matcher.is_match(text) && left.len() < LIST_CAP {
+        let text = escape.replace_all(text, |caps: &regex::Captures| {
+            u32::from_str_radix(&caps[1], 16)
+                .ok()
+                .and_then(char::from_u32)
+                .map_or_else(|| caps[0].to_string(), String::from)
+        });
+        let found = shape.is_match(&text) || matcher.is_some_and(|m| m.is_match(text.as_ref()));
+        if found && left.len() < LIST_CAP {
             left.push(format!("{table}.{column} rowid {rowid}"));
         }
         Ok(())
@@ -1089,7 +1103,8 @@ fn under(path: &str, root: &str) -> bool {
 /// pre-restore backup before this point).
 /// Files an interrupted `restore --force` left behind: the previous store
 /// (or its sidecars) renamed aside as `cadence.sqlite3*.replaced-*`.
-/// A restore refuses while any exist, and `daemon start` warns.
+/// A restore refuses while any exist, and so does the daemon
+/// ([`refuse_interrupted_restore`]).
 pub fn interrupted_restore_leftovers(state_dir: &Path) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = fs::read_dir(state_dir)
         .into_iter()
@@ -1103,6 +1118,57 @@ pub fn interrupted_restore_leftovers(state_dir: &Path) -> Vec<PathBuf> {
         .collect();
     out.sort();
     out
+}
+
+/// CAD-407: refuse to open the store while an interrupted restore's aside
+/// files exist. The daemon checks this before anything opens or creates
+/// `cadence.sqlite3`: a daemon started over them would build a fresh,
+/// empty store next to the previous one. The error names every leftover
+/// and the `mv` that recovers each case.
+pub fn refuse_interrupted_restore(state_dir: &Path) -> Result<()> {
+    let leftovers = interrupted_restore_leftovers(state_dir);
+    if leftovers.is_empty() {
+        return Ok(());
+    }
+    let quote = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', r"'\''"));
+    let put_back = leftovers
+        .iter()
+        .map(|aside| {
+            let name = aside.file_name().unwrap_or_default().to_string_lossy();
+            let original = name.split(".replaced-").next().unwrap_or_default();
+            format!("mv {} {}", quote(aside), quote(&state_dir.join(original)))
+        })
+        .collect::<Vec<_>>()
+        .join(" && ");
+    let listed = leftovers
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let live = db_file(state_dir);
+    let recovery = if live.exists() {
+        let aside_dir = default_dir(state_dir);
+        format!(
+            "{live} exists too. If it is the store you restored, move the aside files \
+             out of the state dir: mkdir -p {dir} && mv {files} {dir}. If it is not (for \
+             example an empty store created after the interruption), move {live} and its \
+             -wal/-shm out of the state dir first, then put the previous store back: {put_back}",
+            live = live.display(),
+            dir = quote(&aside_dir),
+            files = leftovers
+                .iter()
+                .map(|p| quote(p))
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
+    } else {
+        format!("Put the previous store back: {put_back}")
+    };
+    Err(Error::rejected(format!(
+        "an interrupted restore left {listed} in {}; refusing to open the store there. \
+         {recovery}. Then start the daemon again",
+        state_dir.display()
+    )))
 }
 
 /// Rename every aside file back after a failed install. The outcome is

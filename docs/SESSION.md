@@ -1067,13 +1067,21 @@ Only the store goes in. It is changed in these ways:
 
 - `agents.generation`, the generation every turn token is bound to, is set to NULL.
 - `messages.turn_id`, the turn token itself, is set to NULL.
-- Every turn token and generation the store knows — `messages.turn_id`,
-  `agents.generation`, each `"turn_id": "…"` value in any text cell
-  (event payloads outlive their messages), and the generation inside
-  each `<prefix>-<generation>-<uuid>` token — is replaced with
-  `[redacted]` in every text cell, before the columns above are nulled.
-  The export refuses if any of those values is still present afterwards.
-  The result reports `redacted: {tokens, cells}`.
+- Every turn token in the store is replaced with `[redacted]` in every
+  text cell, before the columns above are nulled. A turn token is a value
+  with the registry's token shape, `<prefix>-<generation>-<nonce>`: the
+  prefix `pty` or `claude`, a generation of 12 or 32 lowercase hex, and a
+  32-hex nonce. The value can sit in any table or column, under any JSON
+  key or none, or inside escaped JSON. Event payloads outlive their
+  messages, so this covers tokens whose message row is gone. Only that
+  shape counts: prose under a `"turn_id"` key, such as
+  `{"turn_id": "workspace"}`, is left alone. The generation inside each
+  token, and a generation-shaped `agents.generation`, are redacted where
+  they appear on their own too.
+- The export then re-reads every text cell, decoding JSON `\uXXXX`
+  escapes. It refuses if any token-shaped value or redacted generation is
+  still there. That includes a token spelled with escapes, which cannot
+  be redacted in place. The result reports `redacted: {tokens, cells}`.
 - `agents.pid` is set to NULL.
 - The file is `VACUUM`ed, so deleted rows left in freed pages do not travel.
 
@@ -1136,9 +1144,14 @@ of these cases:
   refused.
 - **An earlier forced restore was interrupted**: a
   `cadence.sqlite3*.replaced-*` file in the state dir may hold the
-  previous store. Every restore refuses until it is moved back or away,
-  and `cadence daemon start` prints a warning (and a `warning` field)
-  while one exists.
+  previous store. Every restore refuses until it is moved back or away.
+  So does the daemon: `daemon start`, `daemon run` and `daemon restart`
+  all refuse before they open or create a store. The error names each
+  leftover and gives the `mv` commands that recover. If
+  `cadence.sqlite3` is missing, it gives the commands that put the
+  previous store back. If `cadence.sqlite3` exists too, the restore may
+  have finished, or a store may have been created after the
+  interruption. The error then gives both recoveries.
 
 Repo paths are rewritten by remote. The restore matches each recorded
 repo to the `--repo` checkout whose `origin` is the same remote.

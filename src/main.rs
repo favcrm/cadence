@@ -4547,26 +4547,12 @@ fn run() -> Result<i32> {
                 as_identity,
             } => {
                 std::fs::create_dir_all(&state_dir)?;
-                // CAD-396: an interrupted `restore --force` leaves the old
-                // store renamed aside; a daemon started now would create an
-                // empty store next to it.
-                let leftovers = cadence_agent::backup::interrupted_restore_leftovers(&state_dir);
-                if !leftovers.is_empty() {
-                    eprintln!(
-                        "warning: an interrupted restore left {} in {}; the previous store \
-                         may be there. Stop the daemon and move it back to cadence.sqlite3",
-                        leftovers
-                            .iter()
-                            .map(|p| p.display().to_string())
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                        state_dir.display()
-                    );
-                }
+                // CAD-396/407: an interrupted `restore --force` leaves the
+                // old store renamed aside; a daemon started now would create
+                // an empty store next to it. `serve` refuses too; this says
+                // so before anything is spawned.
+                cadence_agent::backup::refuse_interrupted_restore(&state_dir)?;
                 let mut result = client::daemon_start_as(&state_dir, as_identity.as_deref())?;
-                if !leftovers.is_empty() {
-                    result["warning"] = json!({"interrupted_restore": leftovers});
-                }
                 // --resume: once the daemon answers, sweep every agent
                 // with a stored thread and no live endpoint.
                 if resume {
