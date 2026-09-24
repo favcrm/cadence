@@ -40518,12 +40518,13 @@ fn master_end_to_end_chat_plan_approve_dispatch_report() {
     assert_eq!(posted["payload"]["event"], "since_summary", "{posted}");
 }
 
-/// Every method of the daemon's dispatch table — parsed from the source,
+/// Every method of the daemon's dispatch table (`dispatch_method`, which
+/// `dispatch` wraps after the master policy) — parsed from the source,
 /// so a method added later is covered without touching this test.
 fn daemon_methods() -> Vec<String> {
     let src = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/daemon.rs"))
         .unwrap();
-    let start = src.find("    pub fn dispatch(\n").unwrap();
+    let start = src.find("    fn dispatch_method(\n").unwrap();
     let body = &src[start..];
     let body = &body[body.find("match method {").unwrap()..];
     let body = &body[..body

@@ -26,6 +26,7 @@ use crate::client;
 use crate::error::{Error, Result};
 use crate::issue::{self, task_report};
 use crate::master::{self, ALIAS};
+use crate::peer::AgentCaller;
 use crate::store;
 
 /// The daemon methods a master connection may call — everything else is
@@ -133,6 +134,28 @@ impl Shared {
             )
     }
 
+    /// The master's and the operator's verbs (escalate, posting the
+    /// summary): the caller as #221's shared derivation
+    /// ([`Shared::agent_caller`]) names it — the master's connection, or
+    /// the proven operator; any other agent is refused. Identity-shaped
+    /// request fields are refused, never read. Returns who acted.
+    fn master_or_operator(
+        &self,
+        params: &Value,
+        peer_pid: u32,
+        verb: &str,
+    ) -> Result<&'static str> {
+        super::reject_identity_fields(params, verb)?;
+        match self.agent_caller(peer_pid, verb)? {
+            AgentCaller::Operator => Ok("operator"),
+            AgentCaller::Agent(alias) if master::is_master(&alias) => Ok(ALIAS),
+            AgentCaller::Agent(alias) => Err(Error::rejected(format!(
+                "{verb} is an operator action (or the master's) — this connection is \
+                 agent '{alias}'"
+            ))),
+        }
+    }
+
     /// CAD-339: run before every RPC. Nobody but `master_start` registers
     /// the alias `master`; a master connection reaches only
     /// [`MASTER_ALLOWED`], and its `message_report` only for its own
@@ -182,6 +205,7 @@ impl Shared {
     /// once: dispatch moves it to `doing`, and every master dispatch runs
     /// under `dispatch_lock`, check included.
     pub(super) fn rpc_master_dispatch(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        super::reject_identity_fields(params, "master dispatch")?;
         if !self.caller_is_master(peer_pid) {
             return Err(Error::invalid(
                 "master_only",
@@ -284,12 +308,7 @@ impl Shared {
     /// Needs-you reads — a report file can never put a question there.
     /// A tracker comment keeps the human record on the ticket.
     pub(super) fn rpc_question_escalate(&self, params: &Value, peer_pid: u32) -> Result<Value> {
-        let by = if self.caller_is_master(peer_pid) {
-            ALIAS
-        } else {
-            self.proven_operator("question escalate", peer_pid)?;
-            "operator"
-        };
+        let by = self.master_or_operator(params, peer_pid, "question escalate")?;
         let id = required_str(params, "issue")?;
         let question = required_str(params, "question")?;
         let summary = required_str(params, "summary")?.trim();
@@ -446,11 +465,9 @@ impl Shared {
         let thread = self.store.ensure_thread(ALIAS)?;
         if let Err(e) = self.launch_actor(ALIAS) {
             // No half-started master: the row goes with its launch.
-            let _ = self.store.remove_agent(
-                ALIAS,
-                true,
-                &json!({"by": "operator", "by_kind": "operator"}),
-            );
+            let _ =
+                self.store
+                    .remove_agent(ALIAS, true, &super::caller_audit(&AgentCaller::Operator));
             return Err(e);
         }
         let body = if briefing.len() <= BOOTSTRAP_INLINE_MAX {
@@ -513,9 +530,7 @@ impl Shared {
                     "no master to post to — `cadence master start` first",
                 ));
             }
-            if !self.caller_is_master(peer_pid) {
-                self.proven_operator("posting into the master's thread", peer_pid)?;
-            }
+            self.master_or_operator(params, peer_pid, "posting into the master's thread")?;
         }
         let pm = issue::Pm::at(&self.pm_dir()?)?;
         let escalated = master::escalations(&self.state_dir);
@@ -738,11 +753,13 @@ mod tests {
         assert_eq!(clip("short", 10), "short");
     }
 
-    /// Every method name in `Shared::dispatch`'s match — parsed from the
+    /// Every method name in `Shared::dispatch_method`'s match — parsed from the
     /// source so the test sees methods added later.
     pub(crate) fn dispatch_methods() -> Vec<String> {
         let src = include_str!("../daemon.rs");
-        let start = src.find("    pub fn dispatch(\n").expect("dispatch fn");
+        let start = src
+            .find("    fn dispatch_method(\n")
+            .expect("dispatch_method fn");
         let body = &src[start..];
         let body = &body[body.find("match method {").expect("match")..];
         let body = &body[..body
