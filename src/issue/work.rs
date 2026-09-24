@@ -445,7 +445,8 @@ pub struct Move {
 /// stage at a time (each exit criterion is a gate); backward moves —
 /// sending an epic back — may go to any earlier stage down to `floor`,
 /// and need the operator when they land in an operator stage from a
-/// stage that was never entered (`status` / `default` source)
+/// stage that was never entered; any move out of a status-derived
+/// stage needs the operator
 /// ([`floor`]: an approved plan's first stage belongs to the plan). From
 /// a stage the list does not know, only the floor stage is reachable.
 pub fn check_move(cfg: &WorkConfig, cur: &StageState, to: &str, floor: usize) -> Result<Move> {
@@ -494,13 +495,17 @@ pub fn check_move(cfg: &WorkConfig, cur: &StageState, to: &str, floor: usize) ->
         from: cur.id.clone(),
         to: to.to_string(),
         forward,
-        // A move into an operator stage needs the operator unless it goes
-        // back from a stage that was actually entered — recorded by a
-        // move or mapped from the operator-approved plan. A stage read
-        // off the status or the default is display-only: moving "back"
-        // from a derived `done` must not reach build or release unseen.
-        needs_operator: cfg.operator_stages.iter().any(|s| s == to)
-            && (forward || !matches!(cur.source, "field" | "plan")),
+        // A stage read off the status (a done epic never moved) was never
+        // entered, so every move out of it is the operator's — whatever
+        // the target, or a pane could step to a non-operator stage and
+        // then "back" into build. From an entered stage (recorded by a
+        // move, or mapped from the approved plan) a move into an
+        // operator stage needs the operator unless it goes back. The
+        // `default` source is always the floor (first) stage: its only
+        // move is one step forward, under that same rule.
+        needs_operator: cur.source == "status"
+            || (cfg.operator_stages.iter().any(|s| s == to)
+                && (forward || !matches!(cur.source, "field" | "plan"))),
         exit,
     })
 }
@@ -1170,22 +1175,96 @@ mod tests {
         assert!(!m.forward && !m.needs_operator);
         let m = check_move(&cfg, &at("done"), "release", 0).unwrap();
         assert!(!m.forward && !m.needs_operator, "recorded done → release");
-        // A `done` read off the status was never entered: going "back"
-        // into an operator stage from it is the operator's.
+        // Source × target class → does the move need the operator?
+        let with_source = |id: &str, source: &'static str| {
+            let mut s = at(id);
+            s.source = source;
+            s
+        };
         let derived = stage_of(
             &Front::new("CAD-9", "e", "2026-09-01T00:00:00Z"),
             &cfg,
             true,
         );
-        assert_eq!(derived.source, "status");
-        for to in ["release", "build"] {
-            let m = check_move(&cfg, &derived, to, 0).unwrap();
-            assert!(!m.forward && m.needs_operator, "{to}");
+        assert_eq!((derived.id.as_str(), derived.source), ("done", "status"));
+        let default = stage_of(
+            &Front::new("CAD-9", "e", "2026-09-01T00:00:00Z"),
+            &cfg,
+            false,
+        );
+        assert_eq!((default.id.as_str(), default.source), ("shape", "default"));
+        for (cur, to, want, class) in [
+            // Entered stages (`field`, `plan`): forward into an operator
+            // stage needs the operator; back and non-operator do not.
+            (with_source("shape", "field"), "build", true, "field fwd op"),
+            (
+                with_source("build", "field"),
+                "verify",
+                false,
+                "field fwd plain",
+            ),
+            (
+                with_source("done", "field"),
+                "release",
+                false,
+                "field back op",
+            ),
+            (
+                with_source("release", "field"),
+                "verify",
+                false,
+                "field back plain",
+            ),
+            (
+                with_source("verify", "field"),
+                "shape",
+                false,
+                "field back floor",
+            ),
+            (
+                with_source("verify", "plan"),
+                "release",
+                true,
+                "plan fwd op",
+            ),
+            (
+                with_source("build", "plan"),
+                "verify",
+                false,
+                "plan fwd plain",
+            ),
+            (
+                with_source("verify", "plan"),
+                "build",
+                false,
+                "plan back op",
+            ),
+            // Status-derived: every move is the operator's.
+            (derived.clone(), "release", true, "status back op"),
+            (derived.clone(), "build", true, "status back op 2"),
+            (derived.clone(), "verify", true, "status back plain"),
+            (derived.clone(), "shape", true, "status back floor"),
+            // Default (always the floor): forward under the normal rule.
+            (default.clone(), "build", true, "default fwd op"),
+        ] {
+            let m = check_move(&cfg, &cur, to, 0).unwrap();
+            assert_eq!(m.needs_operator, want, "{class}: {} → {to}", cur.id);
         }
+        let open = WorkConfig {
+            operator_stages: vec![],
+            ..WorkConfig::default()
+        };
         assert!(
-            !check_move(&cfg, &derived, "verify", 0)
+            !check_move(&open, &default, "build", 0)
                 .unwrap()
-                .needs_operator
+                .needs_operator,
+            "default fwd plain (no operator stages)"
+        );
+        assert!(
+            check_move(&open, &derived, "verify", 0)
+                .unwrap()
+                .needs_operator,
+            "status needs the operator even with no operator stages"
         );
         for (from, to, want) in [
             ("shape", "verify", "skips a stage"),

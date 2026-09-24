@@ -112,11 +112,14 @@ goes through the daemon's `epic_stage` RPC and ends in one tracker commit
   on an approved plan (a hand edit) reads as build, so plan state and stage agree.
 - **Migration.** An epic whose (derived) status is `done` and that has no recorded
   stage reads the last stage (`done`, source `status`), so finished epics do not
-  show as shape. A stage read off the status (or the `default` first stage) was
-  never entered, so it is display-only for the gates: any move from it into an
-  operator stage — even "back" from a derived `done` into release or build — needs
-  the operator. Only a move back from a recorded (`field`) or plan-mapped stage into
-  an operator stage is open to any attributable caller.
+  show as shape. A stage read off the status was never entered, so **every move
+  out of it needs the operator**, whatever the target — otherwise a pane could step
+  from a derived `done` to verify (not an operator stage) and then "back" into build.
+  No floor exception is needed: a status-derived stage only exists without a plan
+  (an approved plan maps to `plan`), and the `default` source is always the first
+  (floor) stage, whose only move is one step forward under the usual rule. Only a
+  move back from a recorded (`field`) or plan-mapped stage into an operator stage is
+  open to any attributable caller.
 - A malformed `PROJECT.md` refuses every move; readers fall back to the defaults.
 - The exit criterion of the stage being left is shown with the move (and in
   `issue epic show`), not machine-checked; automatic routine moves are a later cut.

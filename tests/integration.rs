@@ -38068,11 +38068,13 @@ fn work_model_project_md_and_milestones() {
     );
 }
 
-/// CAD-405 review round 2: a stage read off the status (a done epic
-/// never moved) is display-only for the gates. A pane agent moving it
-/// "back" into release or build is refused — nothing written — so it
-/// cannot reach an operator stage the operator never entered; the
-/// operator can. An epic with a recorded stage moves back as before.
+/// CAD-405 review rounds 2–3: a stage read off the status (a done epic
+/// never moved) was never entered, so every move out of it is the
+/// operator's. A pane agent is refused — nothing written — whether it
+/// aims straight at release or build, or at verify (the first step of
+/// done → verify → build); the operator makes done → verify → build.
+/// A default first stage follows the usual rule (shape → build is the
+/// operator's), and a recorded stage moves back as before.
 #[test]
 fn work_model_status_derived_stage_needs_operator_for_gates() {
     let f = PlanFixture::start();
@@ -38098,7 +38100,7 @@ fn work_model_status_derived_stage_needs_operator_for_gates() {
     let epic_file = f.pm_dir.join("demo/D-1/issue.md");
     let before = f.commits();
     let bytes = std::fs::read(&epic_file).unwrap();
-    for to in ["release", "build"] {
+    for to in ["release", "build", "verify", "shape"] {
         let r = pane.rpc(
             &f.d.state,
             "epic_stage",
@@ -38117,16 +38119,32 @@ fn work_model_status_derived_stage_needs_operator_for_gates() {
         "refused moves write nothing"
     );
 
-    // The operator can make the move.
-    let out =
-        f.d.operator_rpc("epic_stage", json!({"epic": "D-1", "stage": "release"}))
-            .unwrap();
-    assert_eq!(
-        (out["from"].as_str(), out["to"].as_str()),
-        (Some("done"), Some("release"))
+    // The operator walks done → verify → build.
+    for (from, to) in [("done", "verify"), ("verify", "build")] {
+        let out =
+            f.d.operator_rpc("epic_stage", json!({"epic": "D-1", "stage": to}))
+                .unwrap();
+        assert_eq!(
+            (out["from"].as_str(), out["to"].as_str()),
+            (Some(from), Some(to))
+        );
+        assert_eq!(out["by"], "operator", "{out}");
+    }
+    assert_eq!(f.commits(), before + 2);
+    assert_eq!(f.front("D-1").stage.as_deref(), Some("build"));
+
+    // A default first stage: the pane's shape → build is refused as
+    // before (build is an operator stage), nothing written.
+    let d3 = f.pm_dir.join("demo/D-3/issue.md");
+    let (before, bytes) = (f.commits(), std::fs::read(&d3).unwrap());
+    let r = pane.rpc(
+        &f.d.state,
+        "epic_stage",
+        json!({"epic": "D-3", "stage": "build"}),
     );
-    assert_eq!(out["by"], "operator", "{out}");
-    assert_eq!(f.commits(), before + 1);
+    let msg = r["error"]["message"].as_str().unwrap_or_default();
+    assert!(msg.contains("operator action"), "{r}");
+    assert_eq!((f.commits(), std::fs::read(&d3).unwrap()), (before, bytes));
 
     // A recorded stage behaves as before: the operator moves D-3 into
     // build, the pane moves it on to verify and back into build.
