@@ -480,7 +480,16 @@ impl TestDaemon {
 
 impl Drop for TestDaemon {
     fn drop(&mut self) {
-        let _ = self.rpc("shutdown", json!({}));
+        // CAD-384: `shutdown` is the operator's (or the rollout lease
+        // holder's). A test that planted this process as a pane
+        // ([`plant_self`]), or a suite run inside an agent pane, is
+        // refused by the caller rule — the daemon answered, so stop it
+        // the way an operator shell would.
+        if let Err(e) = self.rpc("shutdown", json!({})) {
+            if e.to_string().contains("caller rule") {
+                let _ = self.operator_rpc("shutdown", json!({}));
+            }
+        }
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -1434,7 +1443,7 @@ fn restart_preserves_attention_fence_without_unknowns() {
         .arg("--state-dir")
         .arg(&d.state)
         .args(["resume", "--all"])
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -1554,7 +1563,7 @@ fn resume_all_lists_fenced_without_attempting() {
         .arg("--state-dir")
         .arg(&d.state)
         .args(["resume", "--all"])
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -7236,7 +7245,7 @@ fn message_send_ready_claims_then_sends() {
         .arg(&d.state)
         .args(["message", "send", "dv1", "--text", "hi"])
         .args(["--message", "m9", "--ready"])
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -7252,7 +7261,7 @@ fn message_send_ready_claims_then_sends() {
         .arg(&d.state)
         .args(["message", "send", "w1", "--text", "hi"])
         .args(["--message", "m10", "--ready"])
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -8040,8 +8049,8 @@ fn hold_rollout_lease(home: &Path, state: &Path) {
 }
 
 fn cadence_at(home: &Path, state: &Path, args: &[&str]) -> std::process::Output {
-    std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
-        .arg("--state-dir")
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"));
+    cmd.arg("--state-dir")
         .arg(state)
         .args(args)
         .env("HOME", home)
@@ -8049,9 +8058,10 @@ fn cadence_at(home: &Path, state: &Path, args: &[&str]) -> std::process::Output 
         .env_remove("CADENCE_ROLLOUT_AS")
         // A `daemon restart` child daemon is a separate process: it
         // gets this test's mock commands as its own env, and only it.
-        .envs(test_env().vars())
-        .output()
-        .unwrap()
+        .envs(test_env().vars());
+    // An operator shell outside every pane (CAD-384): `daemon stop`,
+    // `agent stop`, … need operator proof.
+    cmd.operator_output().unwrap()
 }
 
 #[test]
@@ -8487,7 +8497,7 @@ fn agent_resume_waits_and_attaches_like_launch() {
         .arg("--state-dir")
         .arg(&d.state)
         .args(["agent", "resume", "dv1", "--detach"])
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -8511,7 +8521,7 @@ fn agent_resume_waits_and_attaches_like_launch() {
         .arg("--state-dir")
         .arg(&d.state)
         .args(["agent", "resume", "dv1"])
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -8534,7 +8544,7 @@ fn agent_resume_waits_and_attaches_like_launch() {
         .arg("--state-dir")
         .arg(&d.state)
         .args(["agent", "resume", "w1"])
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -8582,7 +8592,7 @@ fn group_resume_orders_pm_first_and_skips_live() {
         .arg("--state-dir")
         .arg(&d.state)
         .args(["resume", "pm", "--detach"])
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -8633,7 +8643,7 @@ fn resume_all_and_daemon_start_resume_sweep() {
         .arg("--state-dir")
         .arg(&d.state)
         .args(["resume", "--all"])
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -8660,7 +8670,7 @@ fn resume_all_and_daemon_start_resume_sweep() {
         .arg("--state-dir")
         .arg(&d.state)
         .args(["daemon", "start", "--resume"])
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -8693,7 +8703,7 @@ fn group_stop_tears_down_members_and_pm() {
         .arg("--state-dir")
         .arg(&d.state)
         .args(["stop", "pm"])
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -8789,7 +8799,7 @@ fn group_resume_reports_unrecoverable_session_mismatch() {
         .arg("--state-dir")
         .arg(&d.state)
         .args(["resume", "pm", "--detach"])
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -14096,7 +14106,7 @@ fn cli_join_same_provider_resumes_stopped_alias() {
         .arg("--state-dir")
         .arg(&d.state)
         .args(["join", "pm", "fake", "--alias", "wx", "--detach"])
-        .output()
+        .operator_output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{stderr}");
@@ -15953,7 +15963,7 @@ fn cadence_cli(state: &Path, args: &[&str], envs: &[(String, String)]) -> (bool,
     for (k, v) in envs {
         cmd.env(k, v);
     }
-    let out = cmd.output().unwrap();
+    let out = cmd.operator_output().unwrap();
     let text = if out.stdout.is_empty() {
         String::from_utf8_lossy(&out.stderr).to_string()
     } else {
@@ -18104,7 +18114,7 @@ fn dispatch_kickoff_and_finish_guards() {
                 ),
             )
             .env_remove("CADENCE_ALIAS")
-            .output()
+            .operator_output()
             .unwrap();
         let text = if out.stdout.is_empty() {
             String::from_utf8_lossy(&out.stderr).to_string()
@@ -37560,7 +37570,7 @@ fn dispatch_warns_on_empty_acceptance() {
                 ),
             )
             .env_remove("CADENCE_ALIAS")
-            .output()
+            .operator_output()
             .unwrap();
         let stderr = String::from_utf8_lossy(&out.stderr).to_string();
         let text = if out.stdout.is_empty() {
@@ -37789,7 +37799,7 @@ fn seed_board(pm: &Path, state: &Path) {
             .args(args)
             .env("CADENCE_PM_DIR", pm)
             .env_remove("CADENCE_ALIAS")
-            .output()
+            .operator_output()
             .unwrap();
         assert!(
             out.status.success(),
@@ -40712,7 +40722,7 @@ fn dispatch_job_precheck_measures_the_issues_existing_lane() {
                 ),
             )
             .env_remove("CADENCE_ALIAS")
-            .output()
+            .operator_output()
             .unwrap();
         (
             out.status.success(),
