@@ -40104,10 +40104,8 @@ fn cad320_thread_records_claude_text_and_tool_results_redacted() {
     assert_eq!(status, 200, "{get}");
     let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
     s.write_all(
-        format!(
-            "GET /api/threads/lead/stream?after=0 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
-        )
-        .as_bytes(),
+        format!("GET /api/threads/lead/stream?after=0 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n")
+            .as_bytes(),
     )
     .unwrap();
     let mut sse = String::new();
@@ -41030,4 +41028,75 @@ fn master_escalation_reaches_the_operator_needs_you() {
         assert!(Instant::now() < deadline, "second pass never routed");
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// CAD-339 review round 2: concurrent `master dispatch` calls for one
+/// ticket dispatch it exactly once. The ready check and the dispatch run
+/// under one daemon lock, so every other caller sees `doing` and is
+/// refused having written nothing: one kickoff, one comment, one ref.
+#[test]
+fn master_dispatch_races_dispatch_a_ticket_once() {
+    let f = PlanFixture::start_routed();
+    f.d.register("w1");
+    f.d.wait_agent("w1", "idle", 10);
+    let (mut m, _) = f.start_master();
+    let plan = f.file("plan.md", MASTER_PLAN);
+    let (ok, out) = f.as_master(
+        &mut m,
+        &format!("plan propose --project demo --file {plan}"),
+    );
+    assert!(ok, "{out}");
+    f.d.operator_rpc("plan_approve", json!({"epic": "D-1"}))
+        .unwrap();
+
+    // Five dispatches of D-2 at once, from the master's tool process.
+    const N: usize = 5;
+    let outs: Vec<PathBuf> = (0..N)
+        .map(|n| f.tmp.path().join(format!("tmp/race-{n}.out")))
+        .collect();
+    let script = outs
+        .iter()
+        .map(|o| {
+            format!(
+                "( {} > {} 2>&1; echo rc=$? >> {} ) &",
+                f.master_line("master dispatch D-2"),
+                o.display(),
+                o.display()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let r = m.exec(&["sh", "-c", &format!("{script} wait")]);
+    assert_eq!(r["rc"], 0, "{r}");
+    let results: Vec<String> = outs
+        .iter()
+        .map(|o| std::fs::read_to_string(o).unwrap())
+        .collect();
+    let won: Vec<&String> = results.iter().filter(|t| t.contains("rc=0")).collect();
+    assert_eq!(won.len(), 1, "exactly one dispatch succeeds: {results:#?}");
+    assert!(won[0].contains("\"dispatched\": true"), "{}", won[0]);
+    for lost in results.iter().filter(|t| !t.contains("rc=0")) {
+        assert!(lost.contains("D-2 is doing"), "{lost}");
+    }
+
+    // One kickoff, one comment, one message ref.
+    let kickoffs = f.messages_of("w1");
+    assert_eq!(kickoffs.len(), 1, "{kickoffs:#?}");
+    let refs: Vec<_> = f
+        .front("D-2")
+        .refs
+        .into_iter()
+        .filter(|r| r.kind == "message")
+        .collect();
+    assert_eq!(refs.len(), 1, "{refs:?}");
+    assert_eq!(refs[0].path.as_deref(), kickoffs[0]["id"].as_str());
+    let (ok, show) = f.cli(&["issue", "show", "D-2", "--json"]);
+    assert!(ok, "{show}");
+    let dispatched = show["comments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c.to_string().contains("Dispatched to w1"))
+        .count();
+    assert_eq!(dispatched, 1, "{show}");
 }

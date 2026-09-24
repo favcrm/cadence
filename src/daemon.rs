@@ -514,6 +514,10 @@ pub struct Shared {
     router_backlog: std::sync::atomic::AtomicUsize,
     /// CAD-339: serializes writers of the escalation record.
     escalation_lock: Mutex<()>,
+    /// CAD-339: serializes `master_dispatch` — the ticket's `ready`
+    /// check and its dispatch are one step, so concurrent calls for a
+    /// ticket dispatch it once.
+    dispatch_lock: Mutex<()>,
 }
 
 impl Shared {
@@ -583,6 +587,7 @@ impl Shared {
             },
             router_backlog: std::sync::atomic::AtomicUsize::new(0),
             escalation_lock: Mutex::new(()),
+            dispatch_lock: Mutex::new(()),
             auto_stop: AutoStopTimer::new(opts.auto_stop.clone(), opts.auto_stop_clock.clone()),
         });
         // Holds dropped by boot-time revalidation get their release

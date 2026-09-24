@@ -179,7 +179,8 @@ impl Shared {
     /// (`owner`, set from the plan's `agent:`), or to `to` only when the
     /// ticket names none; and the kickoff is the standard one composed
     /// from the ticket (its `issue.md` is the note). A ticket dispatches
-    /// once: dispatch moves it to `doing`.
+    /// once: dispatch moves it to `doing`, and every master dispatch runs
+    /// under `dispatch_lock`, check included.
     pub(super) fn rpc_master_dispatch(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         if !self.caller_is_master(peer_pid) {
             return Err(Error::invalid(
@@ -188,6 +189,12 @@ impl Shared {
             ));
         }
         let id = required_str(params, "issue")?;
+        // One master dispatch at a time (review round 2): the ticket is
+        // read — `ready`, blockers done — under the same lock the
+        // dispatch runs under, so a concurrent second call sees `doing`
+        // and is refused having written nothing. The dispatch's own
+        // daemon calls (agent_show, agent_send) never take this lock.
+        let _serial = self.dispatch_lock.lock().unwrap_or_else(|e| e.into_inner());
         let pm = issue::Pm::at(&self.pm_dir()?)?;
         let ticket = issue::board::find_issue(&pm.dir, id)?;
         let front = &ticket.front;
