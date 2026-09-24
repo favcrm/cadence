@@ -3485,7 +3485,10 @@ mod tests {
             "/projects/x/logo.png",
             "/agents/a/b.js",
         ] {
-            assert!(matches!(answer(missing), StaticAnswer::Missing), "{missing}");
+            assert!(
+                matches!(answer(missing), StaticAnswer::Missing),
+                "{missing}"
+            );
         }
         // /api never falls through to the shell, even with a file of that name.
         std::fs::create_dir(dist.path().join("api")).unwrap();
