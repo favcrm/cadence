@@ -28,7 +28,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use super::{optional_str, required_str, Shared, DAEMON_ALIAS};
+use super::{check_values, optional_str, optional_strs, required_str, Shared, DAEMON_ALIAS};
 use crate::delivery::{self, Candidate, Observed, Record, State, TicketDone, VerdictRec};
 use crate::error::{Error, Result};
 use crate::issue::{self, task_report, Pm};
@@ -502,11 +502,23 @@ impl Shared {
     }
 
     /// `delivery_list` — every record, oldest dispatch first. A read.
+    /// CAD-437: `issues`/`states`/`projects` are repeatable any-of
+    /// filters; `open` keeps the loop's live rows (non-terminal).
     pub(super) fn rpc_delivery_list(&self, params: &Value) -> Result<Value> {
-        let only = optional_str(params, "issue");
+        let mut issues = optional_strs(params, "issues")?;
+        if let Some(one) = optional_str(params, "issue") {
+            issues.push(one.to_string());
+        }
+        let states = optional_strs(params, "states")?;
+        check_values("states", &states, &State::all_str())?;
+        let projects = optional_strs(params, "projects")?;
+        let open = params.get("open").and_then(Value::as_bool) == Some(true);
         let mut rows: Vec<Record> = delivery::load(&self.state_dir)?
             .into_values()
-            .filter(|r| only.is_none_or(|o| o == r.issue))
+            .filter(|r| issues.is_empty() || issues.contains(&r.issue))
+            .filter(|r| states.is_empty() || states.iter().any(|s| s == r.state.as_str()))
+            .filter(|r| projects.is_empty() || projects.contains(&r.project))
+            .filter(|r| !open || !r.state.terminal())
             .collect();
         rows.sort_by_key(|r| r.dispatched_at);
         // CAD-446: the tracker whose project remotes this daemon checks

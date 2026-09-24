@@ -39,7 +39,7 @@ use serde_json::{json, Value};
 use crate::client;
 use crate::doctor::host::redact_argv;
 use crate::error::{Error, Result};
-use crate::issue::{board, model, project, time, write, Pm};
+use crate::issue::{board, model, project, task_report, time, write, Pm};
 use crate::proc::run_bounded;
 
 /// Stored body cap — a paste bigger than this is refused, not
@@ -839,32 +839,184 @@ fn report_kind(front: &model::Front) -> String {
         .unwrap_or_default()
 }
 
-/// `cadence report ls [--kind K] [--project P]` — open intake: issues
-/// tagged `intake` that are not done/dropped by the *derived* status
-/// (notes roll-ups count, same as the overview row), newest first.
-pub fn ls(pm: &Pm, kind: Option<Kind>, project: Option<&str>) -> Result<Value> {
+/// The `report ls` selection — every field is a repeatable any-of
+/// filter; different fields AND (CAD-437's grammar).
+#[derive(Clone, Debug, Default)]
+pub struct LsFilter {
+    /// Intake kinds (`question` `feedback` `idea` `bug`) and
+    /// `cadence.report/2` kinds (`done` `question` `blocked` `answer`
+    /// `verdict`) — one shared vocabulary.
+    pub kinds: Vec<String>,
+    /// Intake id, or the ticket a `cadence.report/2` report is filed
+    /// on — `--ticket X` is "reports about X".
+    pub tickets: Vec<String>,
+    /// Intake `actor:` / task-report `agent:`.
+    pub agents: Vec<String>,
+    pub projects: Vec<String>,
+    /// `intake` or `task`.
+    pub sources: Vec<String>,
+    /// Only strictly-open rows (open intake, unanswered questions).
+    pub open: bool,
+    /// Everything, including resolved rows (closed intake, answered
+    /// questions). Conflicts with `open`.
+    pub all: bool,
+    /// `--sort` spec (default `-at` — newest first).
+    pub sort: Option<String>,
+    pub limit: Option<usize>,
+    /// `--fields` — keep only these keys per row.
+    pub fields: Vec<String>,
+}
+
+/// The `--kind` vocabulary — intake kinds plus `cadence.report/2`
+/// kinds.
+pub const LS_KINDS: &[&str] = &[
+    "question", "feedback", "idea", "bug", "done", "blocked", "answer", "verdict",
+];
+/// The `--source` vocabulary.
+pub const LS_SOURCES: &[&str] = &["intake", "task"];
+
+/// The `- actor:` line inside an intake issue's `## Report context`.
+fn intake_actor(body: &str) -> Option<String> {
+    let ctx = body.split("## Report context").nth(1)?;
+    ctx.lines()
+        .find_map(|l| l.trim().strip_prefix("- actor:").map(str::trim))
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// `cadence report ls` — the report ledger: intake issues (questions,
+/// feedback, ideas, bugs filed through `report`) plus `cadence.
+/// report/2` task reports under each ticket's `reports/` folder.
+///
+/// Bare `report ls` lists what needs attention — open intake and
+/// unanswered questions (the pre-CAD-437 behaviour plus open task
+/// questions). With filter flags it queries the ledger: rows that are
+/// open plus the `done`/`blocked`/`answer`/`verdict` records, which
+/// carry `open: null` and are never "resolved". `--open` keeps only
+/// strictly-open rows; `--all` adds the resolved ones (closed intake,
+/// answered questions). Newest first.
+pub fn ls(pm: &Pm, f: &LsFilter) -> Result<Value> {
+    crate::filter::check_set("kind", &f.kinds, LS_KINDS)?;
+    crate::filter::check_set("source", &f.sources, LS_SOURCES)?;
+    for t in &f.tickets {
+        model::check_id(t)?;
+    }
+    for p in &f.projects {
+        model::check_key(p)?;
+        if !project::list(&pm.dir)?.iter().any(|pr| &pr.key == p) {
+            return Err(project::unknown_project(p, &pm.dir));
+        }
+    }
+    if f.open && f.all {
+        return Err(Error::rejected("--open and --all conflict"));
+    }
     let issues = board::load_all(&pm.dir, None)?;
     let views = board::views(&pm.config.notes_dir(), issues);
-    let mut rows: Vec<Value> = views
-        .iter()
-        .filter(|v| v.issue.front.tags.iter().any(|t| t == "intake"))
-        .filter(|v| !matches!(v.status.as_str(), "done" | "dropped"))
-        .filter(|v| {
-            kind.map(|k| report_kind(&v.issue.front) == k.as_str())
-                .unwrap_or(true)
-        })
-        .filter(|v| project.map(|p| v.issue.project == p).unwrap_or(true))
-        .map(|v| {
-            json!({
-                "id": v.issue.front.id, "project": v.issue.project,
-                "kind": report_kind(&v.issue.front),
-                "status": v.status, "priority": v.issue.front.priority,
-                "title": v.issue.front.title, "created": v.issue.front.created,
-                "owner": v.issue.front.owner,
-            })
-        })
-        .collect();
-    rows.sort_by(|a, b| b["id"].as_str().cmp(&a["id"].as_str()));
+    let mut rows: Vec<Value> = vec![];
+    for v in &views {
+        let front = &v.issue.front;
+        if front.tags.iter().any(|t| t == "intake") {
+            let open = !matches!(v.status.as_str(), "done" | "dropped");
+            rows.push(json!({
+                "id": front.id,
+                "name": front.id,
+                "source": "intake",
+                "kind": report_kind(front),
+                "ticket": front.id,
+                "project": v.issue.project,
+                "agent": intake_actor(&v.issue.body),
+                "open": open,
+                "status": v.status,
+                "priority": front.priority,
+                "title": front.title,
+                "owner": front.owner,
+                "at": front.created,
+            }));
+        }
+        for r in task_report::list(&v.issue.dir, &front.id) {
+            let mut row = json!({
+                "id": r["name"],
+                "name": r["name"],
+                "path": r["path"],
+                "source": "task",
+                "kind": r["kind"],
+                "ticket": r["task"].as_str().unwrap_or(&front.id),
+                "project": v.issue.project,
+                "agent": r["agent"],
+                // A question is open until answered; the record kinds
+                // have no open state.
+                "open": r.get("open").cloned().unwrap_or(Value::Null),
+                "at": r["at"],
+                "session": r["session"],
+                "sha": r["sha"],
+                "state": r["state"],
+                "answers": r["answers"],
+                "answered_by": r.get("answered_by").cloned().unwrap_or(Value::Null),
+                "verdict": r["verdict"],
+                "pr": r["pr"],
+                "summary": task_report::summary_line(
+                    r["body"].as_str().unwrap_or_default(),
+                    80,
+                ),
+            });
+            if !r["error"].is_null() {
+                row["error"] = r["error"].clone();
+            }
+            rows.push(row);
+        }
+    }
+    let selecting = !f.kinds.is_empty()
+        || !f.tickets.is_empty()
+        || !f.agents.is_empty()
+        || !f.projects.is_empty()
+        || !f.sources.is_empty();
+    rows.retain(|r| {
+        crate::filter::any_of(&f.kinds, r["kind"].as_str())
+            && crate::filter::any_of(&f.tickets, r["ticket"].as_str())
+            && crate::filter::any_of(&f.agents, r["agent"].as_str())
+            && crate::filter::any_of(&f.projects, r["project"].as_str())
+            && crate::filter::any_of(&f.sources, r["source"].as_str())
+    });
+    rows.retain(|r| {
+        if f.all {
+            return true;
+        }
+        match r["open"].as_bool() {
+            // open==true rows survive every scope.
+            Some(true) => true,
+            // Resolved rows need --all.
+            Some(false) => false,
+            // Records (`done`/`blocked`/`answer`/`verdict`) have no
+            // open state: a filtered query keeps them, --open and the
+            // bare triage view do not.
+            None => selecting && !f.open,
+        }
+    });
+    // Newest first by default; natural id breaks ties (X-16 after
+    // X-9). `--sort` overrides the ordering.
+    const REPORT_SORTS: &[(&str, &str)] = &[
+        ("id", "id"),
+        ("at", "at"),
+        ("kind", "kind"),
+        ("ticket", "ticket"),
+        ("agent", "agent"),
+        ("project", "project"),
+        ("status", "status"),
+        ("source", "source"),
+    ];
+    match &f.sort {
+        Some(spec) => crate::filter::sort_rows(&mut rows, spec, REPORT_SORTS, "id")?,
+        None => rows.sort_by(|a, b| {
+            let aid = a["id"].as_str().unwrap_or_default();
+            let bid = b["id"].as_str().unwrap_or_default();
+            b["at"]
+                .as_str()
+                .cmp(&a["at"].as_str())
+                .then_with(|| board::natural_key(bid).cmp(&board::natural_key(aid)))
+        }),
+    }
+    crate::filter::apply_limit(&mut rows, f.limit);
+    crate::filter::apply_fields(&mut rows, &f.fields)?;
     Ok(json!({"reports": rows, "count": rows.len()}))
 }
 

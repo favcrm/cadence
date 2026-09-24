@@ -114,17 +114,23 @@ cadence issue new "title"                   # --project wins, else CADENCE_PROJE
                                             # --tag t (repeatable), --epic <ID>
                                             # (= --parent)
 cadence issue ls [--project p] [--ready] [--json]
-    [--tag t]... [--status s]... [--epic <ID>]  # filters combine (AND): every --tag
-    [--owner o] [--component c]             # must be present, any --status may
-    [--priority P1] [--open]                # match (derived status), --epic lists
-                                            # its children, --open = not done or
-                                            # dropped; an aligned table without --json
+    [--tag t]... [--status s]... [--epic <ID>]  # CAD-437: one grammar — a value
+    [--owner o] [--component c]             # flag repeats and comma-joins (ANY
+    [--priority P1] [--type t]              # of its values); different flags AND;
+    [--milestone m2] [--stage s]            # an unknown value is an error.
+    [--health h] [--plan [st]] [--since t]  # --tag is the exception: every tag
+    [--until t] [--open]                    # must be present. --epic lists its
+    [--sort k] [--limit n] [--fields f,…]   # children, --open = not done/dropped,
+                                            # --since/--until bound the issue's
+                                            # last-update time (24h, 7d, ISO,
+                                            # epoch); table without --json
 cadence issue epic ls [--project p] [--json]
-                                            # epics = type: epic, or issues with
-                                            # children: total, counts per status,
-                                            # done_ratio (done ÷ total − dropped),
-                                            # blocked, owners + a `work` block:
-                                            # stage, size-weighted progress, health
+    [--stage s] [--health h] [--milestone m]# same grammar: any-of per flag, AND
+    [--sort k] [--limit n] [--fields f,…]   # across flags — epics = type: epic, or
+                                            # issues with children: total, counts
+                                            # per status, done_ratio, blocked,
+                                            # owners + a `work` block: stage,
+                                            # size-weighted progress, health
 cadence issue epic show CAD-38 [--json]     # the epic's row + its children:
                                             # status, owner, priority, tags; stage
                                             # exit criterion and health reasons
@@ -136,9 +142,10 @@ cadence issue project approve-work <key>    # CAD-405, operator only: PROJECT.md
                                             # stages/operator_stages take effect
                                             # only while they match this approval
 cadence milestone ls|show [m2] [--project p] [--json]
-                                            # milestones (PROJECT.md, `milestone:`
-                                            # or an m<n>-… tag) with rolled-up
-                                            # weighted progress and health
+    [--stage s] [--health h] [--sort k]     # milestones (PROJECT.md, `milestone:`
+    [--limit n] [--fields f,…]              # or an m<n>-… tag) with rolled-up
+                                            # weighted progress and health —
+                                            # same filter grammar
 cadence issue ls --at <rev> [--project p] [--json]
                                             # the board as it was at <rev> —
                                             # cards report status_source: file
@@ -648,8 +655,11 @@ cadence memory accept pipe-drain [--project demo]   # PM finalization only
 cadence memory reject <slug>                       # PM only
 cadence memory supersede <old> <new>               # currently refused
 cadence memory verify <slug>                       # fresh review cycle + PM
-cadence memory ls [--project k] [--status s] [--type t] [--component c]
-                  [--path f] [--stale [--days 30]] [--json]
+cadence memory ls [--project k]... [--status s]... [--type t]...
+                  [--component c]... [--path f]... [--stale [--days 30]]
+                  [--sort k] [--limit n] [--fields f,…] [--json]
+                                            # value flags repeat/comma-join
+                                            # (any-of); flags AND
 cadence memory show <slug> [--json]
 cadence memory match --issue <ID> [--provider p] [--json]
 cadence memory lint [--project k]
@@ -986,7 +996,7 @@ quick-add, drag, edit, link/ref, attach and comment controls.
 | `GET /api/meta` | `read_only`, `actor` (the request's resolved write identity), `tailnet_proof` (`null`, or whether the tailnet proxy was proven and which check refused), `tailnet_url`, `signed_in` (CAD-313: this request holds a live operator session), `session` (`{id, origin, created, last_used, idle_expires_at, expires_at, user_agent}` or `null` — never the token), `login_hint` (`cadence ui login`, or `… --tailnet` on the tailnet), `operator` (CAD-432, only with `?operator=1` — the proof walks `/proc`, so the SPA asks once per page load; `null` otherwise: this client passes the operator decisions' checks — a writable board, a live operator session (CAD-313) from a caller tied to no agent, CAD-276's positive proof on the peer, and the same proof on the board process itself, whose daemon connection relays the decision; the UI offers operator decisions such as stage moves only then), the serving binary's `version`/`build_commit`/`build_time`, plus the daemon's `daemon_info` when reachable |
 | `GET /api/setup[?fresh=1]` | the `/setup` wizard's checks (CAD-327): `cadence setup`'s list run **detect only** — no `apply`, nothing created, started or written; the `ui` check is answered by the serving board. `{checks: [{check, status, detail, fix, group}], master: {providers: [{bin, ready, start, warning}]}, checked_at, detect_only: true}`, `group` one of `environment`/`provider`/`master`. `master.providers` (CAD-448) is the master step's provider choice — every CLI `master start` accepts, each ready one with its exact `master start --provider <bin>` command once the `master` check's own prerequisites are met (the offer then absorbs the check's bare `master start` fix: one command for the action); a host that cannot confine adds `--unconfined` and carries the `UNCONFINED_WARNING` risk text in `warning`, and `master_login` states the same risk. Provider probes follow setup's rules (a version token and an exit code or a file's presence — never their output), each bounded at 5 s. One run is reused for 60 s and concurrent requests share it; `fresh=1` (or `true`) re-runs unless the last run is under 5 s old, and each answer says `ran_now`, `age_ms` and `recheck_in_ms`. **Operator on the host only:** `403` before any probe runs on a read-only board (`check: "read_only"`), for a request through the tailnet (`"tailnet"`, proven or not) and for a non-loopback peer (`"loopback"`) — the payload shows HOME's layout, installed CLIs and their sign-in state, and the daemon's pid and socket. Write methods answer `405` |
 | `GET /api/projects` | folders, prefixes, components, declared tags, repos, issue counts |
-| `GET /api/issues?project=` | card views: derived status, readiness, `tags`, counts, `rev`, the CAD-405 `work` block (type, milestone, size/weight; stage, progress and health on epics). The `issue ls` filters, combinable: `tag=` (repeat or comma-join — all of), `status=` (repeat or comma-join — any of), `epic=<ID>`, `owner=`, `component=`, `priority=`, `open=1`; `400` on a value that could never match (unknown status/priority, bad tag or id grammar) |
+| `GET /api/issues?project=` | card views: derived status, readiness, `tags`, counts, `rev`, the CAD-405 `work` block (type, milestone, size/weight; stage, progress and health on epics). The `issue ls` filters, combinable (AND across keys): `tag=` (repeat or comma-join — all of), `status=`/`type=`/`milestone=`/`owner=`/`component=`/`priority=`/`epic=<ID>` (repeat or comma-join — any of), `plan=` (`any` or a plan state), `open=1`; `400` on a value that could never match (unknown status/priority, bad tag or id grammar) |
 | `GET /api/epics?project=` | epics (`type: epic` or issues with children) — the `issue epic ls --json` payload: `total`, `counts` per status, `done_ratio`, `blocked`, `owners`, `children`, and the CAD-405 `work` block (stage, weighted progress, health — docs/design/WORK-MODEL.md) |
 | `GET /api/milestones?project=` | CAD-432: the `cadence milestone ls --json` rows — per (project, milestone): `title`/`exit` from `PROJECT.md`, `configured`, size-weighted `progress` over its work items, `health` (the worst of its epics', at risk too on a blocked loose item) with `reasons`, its `epics` and loose `issues`; `400` on a bad key |
 | `GET /api/issues/:id` | the drawer payload: frontmatter, body, links both ways, refs, files, comments, notes chain, merged activity |

@@ -843,6 +843,9 @@ pub fn epic_row(ctx: &Ctx, view: &View) -> Value {
 
 const HEALTH_RANK: &[&str] = &["on_track", "at_risk", "stalled"];
 
+/// The `--health` vocabulary (`HEALTH_RANK`, exported for validation).
+pub const HEALTH_STATES: &[&str] = HEALTH_RANK;
+
 fn worse(a: &str, b: &str) -> &'static str {
     let rank = |s: &str| HEALTH_RANK.iter().position(|h| *h == s).unwrap_or(0);
     HEALTH_RANK[rank(a).max(rank(b))]

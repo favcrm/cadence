@@ -63,27 +63,59 @@ pub enum IssueAction {
         id: Option<String>,
     },
     /// List issues — a compact table on a TTY, `--json` for agents.
-    /// Filters combine (AND).
+    /// Value flags repeat and comma-join and match ANY of their values;
+    /// different flags AND; `--tag` is the exception — all must be
+    /// present. See PROTOCOL.md "List grammar".
+    #[command(after_long_help = crate::filter::GRAMMAR)]
     Ls {
-        #[arg(long)]
-        project: Option<String>,
-        /// Filter by status (backlog ready doing review done dropped);
+        /// Project key; repeatable — issues in any of them.
+        #[arg(long, value_delimiter = ',')]
+        project: Vec<String>,
+        /// Status (backlog ready doing review done dropped);
         /// repeatable — any of them.
-        #[arg(long)]
+        #[arg(long, value_delimiter = ',')]
         status: Vec<String>,
         /// Only issues carrying this tag; repeatable — all of them.
-        #[arg(long = "tag")]
+        #[arg(long = "tag", value_delimiter = ',')]
         tags: Vec<String>,
-        /// Only the children of this epic.
+        /// Only children of these epics; repeatable — any of them.
+        #[arg(long, value_delimiter = ',')]
+        epic: Vec<String>,
+        /// Owner; repeatable — any of them.
+        #[arg(long, value_delimiter = ',')]
+        owner: Vec<String>,
+        /// Component; repeatable — any of them.
+        #[arg(long, value_delimiter = ',')]
+        component: Vec<String>,
+        /// P0..P3; repeatable — any of them.
+        #[arg(long, value_delimiter = ',')]
+        priority: Vec<String>,
+        /// Effective item type (epic task bug spike); repeatable.
+        #[arg(long = "type", value_delimiter = ',')]
+        types: Vec<String>,
+        /// Milestone id (`milestone:` field or `m<n>` tag); repeatable.
+        #[arg(long, value_delimiter = ',')]
+        milestone: Vec<String>,
+        /// Work stage (the project's `stages:` ids, or shape build
+        /// verify release done, plus rejected); repeatable. Not under
+        /// `--at` — stages are computed for the live board.
+        #[arg(long, value_delimiter = ',')]
+        stage: Vec<String>,
+        /// Work health (on_track at_risk stalled); repeatable. Not
+        /// under `--at`.
+        #[arg(long, value_delimiter = ',')]
+        health: Vec<String>,
+        /// Plan state (proposed approved rejected); a bare `--plan`
+        /// matches every issue carrying a plan. Repeatable.
+        #[arg(long, num_args = 0..=1, default_missing_value = "any")]
+        plan: Vec<String>,
+        /// Only issues whose tracker folder changed at or after this
+        /// time (30m, 24h, 7d, YYYY-MM-DD, epoch).
         #[arg(long)]
-        epic: Option<String>,
+        since: Option<String>,
+        /// Only issues changed at or before this time.
         #[arg(long)]
-        owner: Option<String>,
-        #[arg(long)]
-        component: Option<String>,
-        /// P0..P3.
-        #[arg(long)]
-        priority: Option<String>,
+        until: Option<String>,
         /// Only open issues — not done, not dropped.
         #[arg(long)]
         open: bool,
@@ -94,6 +126,16 @@ pub enum IssueAction {
         /// and lists it read-only; cards report `status_source: file`.
         #[arg(long)]
         at: Option<String>,
+        /// Sort by id created updated priority status owner title
+        /// project; `-KEY` for descending [default: id].
+        #[arg(long, allow_hyphen_values = true)]
+        sort: Option<String>,
+        /// Keep only the first N rows.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Keep only these keys in each --json row (comma-joined).
+        #[arg(long, value_delimiter = ',', requires = "json")]
+        fields: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -391,9 +433,33 @@ pub enum EpicAction {
     /// `blocked`, the distinct owners of their children and a `work`
     /// block: stage, size-weighted progress (S=1 M=3 L=8, unsized=M,
     /// dropped excluded) and health (on_track | at_risk | stalled).
+    /// Value flags repeat and comma-join and match ANY of their values;
+    /// different flags AND.
+    #[command(after_long_help = crate::filter::GRAMMAR)]
     Ls {
+        /// Project key; repeatable — epics in any of them.
+        #[arg(long, value_delimiter = ',')]
+        project: Vec<String>,
+        /// Stage id (the project's `stages:` list, or shape build
+        /// verify release done, plus rejected); repeatable.
+        #[arg(long, value_delimiter = ',')]
+        stage: Vec<String>,
+        /// Health (on_track at_risk stalled); repeatable.
+        #[arg(long, value_delimiter = ',')]
+        health: Vec<String>,
+        /// Milestone id; repeatable.
+        #[arg(long, value_delimiter = ',')]
+        milestone: Vec<String>,
+        /// Sort by id project title status priority owner total
+        /// done_ratio blocked stage health progress; `-KEY` descending.
+        #[arg(long, allow_hyphen_values = true)]
+        sort: Option<String>,
+        /// Keep only the first N rows.
         #[arg(long)]
-        project: Option<String>,
+        limit: Option<usize>,
+        /// Keep only these keys in each --json row (comma-joined).
+        #[arg(long, value_delimiter = ',', requires = "json")]
+        fields: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -424,9 +490,33 @@ pub enum EpicAction {
 #[derive(Subcommand)]
 pub enum MilestoneAction {
     /// Every milestone: configured first, then any an issue names.
+    /// Value flags repeat and comma-join and match ANY of their values;
+    /// different flags AND.
+    #[command(after_long_help = crate::filter::GRAMMAR)]
     Ls {
+        /// Project key; repeatable — milestones in any of them.
+        #[arg(long, value_delimiter = ',')]
+        project: Vec<String>,
+        /// Milestone id; repeatable — any of them.
+        #[arg(long, value_delimiter = ',')]
+        milestone: Vec<String>,
+        /// Only milestones with at least one epic in this stage;
+        /// repeatable.
+        #[arg(long, value_delimiter = ',')]
+        stage: Vec<String>,
+        /// Health (on_track at_risk stalled); repeatable.
+        #[arg(long, value_delimiter = ',')]
+        health: Vec<String>,
+        /// Sort by id project title configured progress health;
+        /// `-KEY` descending.
+        #[arg(long, allow_hyphen_values = true)]
+        sort: Option<String>,
+        /// Keep only the first N rows.
         #[arg(long)]
-        project: Option<String>,
+        limit: Option<usize>,
+        /// Keep only these keys in each --json row (comma-joined).
+        #[arg(long, value_delimiter = ',', requires = "json")]
+        fields: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -467,7 +557,21 @@ pub enum ProjectAction {
         owner: Option<String>,
     },
     /// List registered projects.
-    Ls,
+    #[command(after_long_help = crate::filter::GRAMMAR)]
+    Ls {
+        /// Sort by key prefix default_owner; `-KEY` descending.
+        #[arg(long, allow_hyphen_values = true)]
+        sort: Option<String>,
+        /// Keep only the first N rows.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Keep only these keys in each row (comma-joined).
+        #[arg(long, value_delimiter = ',')]
+        fields: Vec<String>,
+        /// Output is JSON already — accepted for grammar parity.
+        #[arg(long)]
+        json: bool,
+    },
     /// Approve the project's PROJECT.md gate keys (`stages`,
     /// `operator_stages`) as they are now — operator only, through the
     /// daemon. Until approved (and after any later edit), the default
@@ -546,20 +650,43 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 )?);
                 Ok(0)
             }
-            ProjectAction::Ls => {
+            ProjectAction::Ls {
+                sort,
+                limit,
+                fields,
+                json: _,
+            } => {
                 let pm = open_pm()?;
                 let projects = project::list(&pm.dir)?;
-                print_json(&json!({
-                    "projects": projects.iter().map(|p| json!({
-                        "key": p.key, "prefix": p.prefix,
-                        "components": p.components,
-                        "tags": p.tags,
-                        "default_owner": p.default_owner,
-                        "repos": p.repos.iter().map(|r| json!({
-                            "path": r.path, "remote": r.remote,
-                        })).collect::<Vec<_>>(),
-                    })).collect::<Vec<_>>(),
-                }));
+                let mut rows: Vec<Value> = projects
+                    .iter()
+                    .map(|p| {
+                        json!({
+                            "key": p.key, "prefix": p.prefix,
+                            "components": p.components,
+                            "tags": p.tags,
+                            "default_owner": p.default_owner,
+                            "repos": p.repos.iter().map(|r| json!({
+                                "path": r.path, "remote": r.remote,
+                            })).collect::<Vec<_>>(),
+                        })
+                    })
+                    .collect();
+                if let Some(spec) = sort {
+                    crate::filter::sort_rows(
+                        &mut rows,
+                        spec,
+                        &[
+                            ("key", "key"),
+                            ("prefix", "prefix"),
+                            ("default_owner", "default_owner"),
+                        ],
+                        "key",
+                    )?;
+                }
+                crate::filter::apply_limit(&mut rows, *limit);
+                crate::filter::apply_fields(&mut rows, fields)?;
+                print_json(&json!({ "projects": rows }));
                 Ok(0)
             }
         },
@@ -602,18 +729,39 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             owner,
             component,
             priority,
+            types,
+            milestone,
+            stage,
+            health,
+            plan,
+            since,
+            until,
             open,
             ready,
             at,
+            sort,
+            limit,
+            fields,
             json: json_flag,
         } => {
+            crate::filter::fields_need_json(fields, *json_flag)?;
+            // `--plan` is the one flag without a comma delimiter
+            // (its value is optional), so comma-join it by hand.
+            let plans: Vec<String> = plan
+                .iter()
+                .flat_map(|v| v.split(',').map(str::to_string))
+                .filter(|v| !v.is_empty())
+                .collect();
             let filter = board::Filter {
                 tags: tags.clone(),
-                epic: epic.clone(),
-                owner: owner.clone(),
+                epics: epic.clone(),
+                owners: owner.clone(),
                 statuses: status.clone(),
-                component: component.clone(),
-                priority: priority.clone(),
+                components: component.clone(),
+                priorities: priority.clone(),
+                types: types.clone(),
+                milestones: milestone.clone(),
+                plans,
                 open: *open,
             };
             filter.validate()?;
@@ -621,23 +769,54 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             // An unknown key must not read as an empty project that
             // invites `issue new` into the wrong place. `--at` may name
             // a project that existed only in history, so it is exempt.
-            if let (Some(want), None) = (project.as_deref(), at) {
+            if at.is_none() && !project.is_empty() {
                 let keys: Vec<String> =
                     project::list(&pm.dir)?.into_iter().map(|p| p.key).collect();
-                if !keys.iter().any(|k| k == want) {
-                    return Err(Error::rejected(format!(
-                        "unknown project '{want}' — known: {}",
-                        keys.join(", ")
-                    )));
+                for want in project {
+                    if !keys.iter().any(|k| k == want) {
+                        return Err(Error::rejected(format!(
+                            "unknown project '{want}' — known: {}",
+                            keys.join(", ")
+                        )));
+                    }
                 }
             }
+            let now = crate::issue::time::now_epoch();
+            let since = since
+                .as_deref()
+                .map(|s| crate::filter::parse_time("since", s, now))
+                .transpose()?;
+            let until = until
+                .as_deref()
+                .map(|s| crate::filter::parse_time("until", s, now))
+                .transpose()?;
+            // Stages and health are computed from the live PROJECT.md —
+            // a `--at` export has neither its config nor its clock.
+            if at.is_some() && (!stage.is_empty() || !health.is_empty()) {
+                return Err(Error::rejected(
+                    "--stage/--health describe the live board — not under --at",
+                ));
+            }
+            let sort_spec = sort.clone().unwrap_or_else(|| "id".to_string());
+            const LS_SORTS: &[&str] = &[
+                "id", "created", "updated", "priority", "status", "owner", "title", "project",
+            ];
+            let (sort_key, sort_desc) = match sort_spec.strip_prefix('-') {
+                Some(k) => (k.to_string(), true),
+                None => (sort_spec.clone(), false),
+            };
+            if !LS_SORTS.contains(&sort_key.as_str()) {
+                return Err(crate::filter::unknown("sort", &sort_spec, LS_SORTS));
+            }
+            let need_updated =
+                since.is_some() || until.is_some() || sort_key == "updated" || *json_flag;
             let (views, at_meta) = match at {
                 Some(rev) => {
-                    let (meta, views) = history::ls_at(&pm.dir, rev, project.as_deref())?;
+                    let (meta, views) = history::ls_at(&pm.dir, rev, None)?;
                     (views, Some(meta))
                 }
                 None => {
-                    let issues = board::load_all(&pm.dir, project.as_deref())?;
+                    let issues = board::load_all(&pm.dir, None)?;
                     let jobs = crate::client::state_dir()
                         .map(|d| board::fetch_job_outcomes(&d))
                         .unwrap_or_default();
@@ -647,29 +826,112 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                     )
                 }
             };
+            let updated = if need_updated {
+                board::updated_map(&pm.dir, at.as_deref())
+            } else {
+                Default::default()
+            };
+            let updated_of = |v: &board::View| -> Option<i64> {
+                updated
+                    .get(&v.issue.front.id)
+                    .copied()
+                    .or_else(|| crate::issue::time::parse_iso(&v.issue.front.created))
+            };
             let all = views;
             let mut views: Vec<&board::View> = all.iter().collect();
             views.retain(|v| filter.matches(v));
+            views.retain(|v| project.is_empty() || project.contains(&v.issue.project));
+            if let Some(s) = since {
+                views.retain(|v| updated_of(v).is_some_and(|t| t >= s));
+            }
+            if let Some(u) = until {
+                views.retain(|v| updated_of(v).is_some_and(|t| t <= u));
+            }
             if *ready {
                 views.retain(|v| v.ready);
             }
-            if *json_flag {
-                let mut out = json!({
-                    "issues": views.iter().map(|v| board::card_json(v)).collect::<Vec<_>>(),
-                });
-                // CAD-405: the `work` block (not for `--at`: history
-                // exports carry no PROJECT.md or clock of that time).
-                if at_meta.is_none() {
-                    let by_id: std::collections::HashMap<String, &board::View> =
-                        all.iter().map(|v| (v.issue.front.id.clone(), v)).collect();
-                    let ctx = work::Ctx::new(
-                        &pm.dir,
-                        &by_id,
-                        crate::issue::time::now_epoch(),
-                        &work::fetch_approvals(state_dir),
-                    );
-                    out["issues"] = views.iter().map(|v| work::card_json(&ctx, v)).collect();
+            // Stage/health filters run on the work block — one ctx.
+            let by_id: std::collections::HashMap<String, &board::View> =
+                all.iter().map(|v| (v.issue.front.id.clone(), v)).collect();
+            let want_work =
+                !stage.is_empty() || !health.is_empty() || (*json_flag && at_meta.is_none());
+            let ctx = want_work
+                .then(|| work::Ctx::new(&pm.dir, &by_id, now, &work::fetch_approvals(state_dir)));
+            if let Some(ctx) = &ctx {
+                if !stage.is_empty() {
+                    let mut valid: Vec<String> = ctx
+                        .configs
+                        .values()
+                        .flat_map(|w| w.cfg.stage_ids().into_iter().map(str::to_string))
+                        .collect();
+                    valid.push("rejected".to_string());
+                    valid.sort();
+                    valid.dedup();
+                    for s in stage {
+                        if !valid.contains(s) {
+                            let list = valid.iter().map(String::as_str).collect::<Vec<_>>();
+                            return Err(crate::filter::unknown("stage", s, &list));
+                        }
+                    }
+                    views.retain(|v| {
+                        let w = work::item_json(ctx, v);
+                        let id = w["stage"]["id"].as_str().unwrap_or_default();
+                        stage.iter().any(|s| s == id)
+                    });
                 }
+                if !health.is_empty() {
+                    crate::filter::check_set("health", health, work::HEALTH_STATES)?;
+                    views.retain(|v| {
+                        let w = work::item_json(ctx, v);
+                        let state = w["health"]["state"].as_str().unwrap_or_default();
+                        health.iter().any(|h| h == state)
+                    });
+                }
+            }
+            // `--sort` orders the surviving rows; the id key ties break
+            // on so the order is always total.
+            views.sort_by(|a, b| {
+                let (fa, fb) = (&a.issue.front, &b.issue.front);
+                let ord = match sort_key.as_str() {
+                    "created" => fa.created.cmp(&fb.created),
+                    "updated" => updated_of(a).cmp(&updated_of(b)),
+                    "priority" => fa.priority.cmp(&fb.priority),
+                    "status" => a.status.cmp(&b.status),
+                    "owner" => fa.owner.cmp(&fb.owner),
+                    "title" => fa.title.cmp(&fb.title),
+                    "project" => a.issue.project.cmp(&b.issue.project),
+                    _ => board::natural_key(&fa.id).cmp(&board::natural_key(&fb.id)),
+                };
+                let ord =
+                    ord.then_with(|| board::natural_key(&fa.id).cmp(&board::natural_key(&fb.id)));
+                if sort_desc {
+                    ord.reverse()
+                } else {
+                    ord
+                }
+            });
+            crate::filter::apply_limit(&mut views, *limit);
+            if *json_flag {
+                let mut rows: Vec<serde_json::Value> = match &ctx {
+                    Some(ctx) => views
+                        .iter()
+                        .map(|v| {
+                            let mut c = work::card_json(ctx, v);
+                            c["updated"] = updated_of(v).map(crate::issue::time::iso).into();
+                            c
+                        })
+                        .collect(),
+                    None => views
+                        .iter()
+                        .map(|v| {
+                            let mut c = board::card_json(v);
+                            c["updated"] = updated_of(v).map(crate::issue::time::iso).into();
+                            c
+                        })
+                        .collect(),
+                };
+                crate::filter::apply_fields(&mut rows, fields)?;
+                let mut out = json!({ "issues": rows });
                 if let Some(meta) = at_meta {
                     out["at"] = meta;
                 }
@@ -963,10 +1225,20 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 return Ok(0);
             }
             let pm = open_pm()?;
-            let project = match action {
-                EpicAction::Ls { project, .. } => project.as_deref(),
-                _ => None,
+            let projects = match action {
+                EpicAction::Ls { project, .. } => project.clone(),
+                _ => vec![],
             };
+            if !projects.is_empty() {
+                let keys: Vec<String> =
+                    project::list(&pm.dir)?.into_iter().map(|p| p.key).collect();
+                for want in &projects {
+                    model::check_key(want)?;
+                    if !keys.iter().any(|k| k == want) {
+                        return Err(project::unknown_project(want, &pm.dir));
+                    }
+                }
+            }
             // Every project loads so cross-project children count.
             let issues = board::load_all(&pm.dir, None)?;
             let jobs = crate::client::state_dir()
@@ -974,27 +1246,93 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 .unwrap_or_default();
             let views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
             let now = crate::issue::time::now_epoch();
+            let by_id: std::collections::HashMap<String, &board::View> = views
+                .iter()
+                .map(|v| (v.issue.front.id.clone(), v))
+                .collect();
             match action {
-                EpicAction::Ls { json, .. } => {
-                    let epics = work::epics_json(
-                        &pm.dir,
-                        &views,
-                        project,
-                        now,
-                        &work::fetch_approvals(state_dir),
-                    );
+                EpicAction::Ls {
+                    stage,
+                    health,
+                    milestone,
+                    sort,
+                    limit,
+                    fields,
+                    json,
+                    ..
+                } => {
+                    crate::filter::fields_need_json(fields, *json)?;
+                    let ctx =
+                        work::Ctx::new(&pm.dir, &by_id, now, &work::fetch_approvals(state_dir));
+                    if !stage.is_empty() {
+                        let mut valid: Vec<String> = ctx
+                            .configs
+                            .values()
+                            .flat_map(|w| w.cfg.stage_ids().into_iter().map(str::to_string))
+                            .collect();
+                        valid.push("rejected".to_string());
+                        valid.sort();
+                        valid.dedup();
+                        for s in stage {
+                            if !valid.contains(s) {
+                                let list = valid.iter().map(String::as_str).collect::<Vec<_>>();
+                                return Err(crate::filter::unknown("stage", s, &list));
+                            }
+                        }
+                    }
+                    crate::filter::check_set("health", health, work::HEALTH_STATES)?;
+                    for m in milestone {
+                        if !model::valid_tag(m) {
+                            return Err(Error::rejected(format!(
+                                "Invalid milestone filter '{m}' — a milestone id like m1"
+                            )));
+                        }
+                    }
+                    let mut rows: Vec<Value> = views
+                        .iter()
+                        .filter(|v| model::item_type(&v.issue.front, v.container) == "epic")
+                        .map(|v| work::epic_row(&ctx, v))
+                        .filter(|r| {
+                            projects.is_empty()
+                                || projects
+                                    .iter()
+                                    .any(|p| r["project"].as_str() == Some(p.as_str()))
+                        })
+                        .filter(|r| crate::filter::any_of(stage, r["work"]["stage"]["id"].as_str()))
+                        .filter(|r| {
+                            crate::filter::any_of(health, r["work"]["health"]["state"].as_str())
+                        })
+                        .filter(|r| {
+                            crate::filter::any_of(milestone, r["work"]["milestone"].as_str())
+                        })
+                        .collect();
+                    const EPIC_SORTS: &[(&str, &str)] = &[
+                        ("id", "id"),
+                        ("project", "project"),
+                        ("title", "title"),
+                        ("status", "status"),
+                        ("priority", "priority"),
+                        ("owner", "owner"),
+                        ("total", "total"),
+                        ("done_ratio", "done_ratio"),
+                        ("blocked", "blocked"),
+                        ("stage", "work.stage.id"),
+                        ("health", "work.health.state"),
+                        ("progress", "work.progress.ratio"),
+                    ];
+                    if let Some(spec) = sort {
+                        crate::filter::sort_rows(&mut rows, spec, EPIC_SORTS, "id")?;
+                    }
+                    crate::filter::apply_limit(&mut rows, *limit);
+                    crate::filter::apply_fields(&mut rows, fields)?;
                     if *json {
-                        print_json(&json!({"epics": epics}));
+                        print_json(&json!({"epics": rows}));
                     } else {
-                        print_epics_table(&epics);
+                        print_epics_table(&rows);
                     }
                 }
                 EpicAction::Show { id, json } => {
                     model::check_id(id)?;
-                    let by_id: std::collections::HashMap<String, &board::View> = views
-                        .iter()
-                        .map(|v| (v.issue.front.id.clone(), v))
-                        .collect();
                     let epic = by_id.get(id).ok_or_else(|| {
                         Error::rejected(format!(
                             "Unknown issue '{id}' — `cadence issue epic ls` lists epics"
@@ -1322,14 +1660,13 @@ fn print_stage_and_health(w: &Value) {
 /// `cadence milestone ls|show` — read-only.
 pub fn run_milestone(action: &MilestoneAction, state_dir: &std::path::Path) -> Result<i32> {
     let pm = open_pm()?;
-    let wanted = match action {
-        MilestoneAction::Ls { project, .. } | MilestoneAction::Show { project, .. } => {
-            project.as_deref()
-        }
+    let wanted: Vec<String> = match action {
+        MilestoneAction::Ls { project, .. } => project.clone(),
+        MilestoneAction::Show { project, .. } => project.iter().cloned().collect(),
     };
-    if let Some(want) = wanted {
+    for want in &wanted {
         model::check_key(want)?;
-        if !project::list(&pm.dir)?.iter().any(|p| p.key == want) {
+        if !project::list(&pm.dir)?.iter().any(|p| &p.key == want) {
             return Err(project::unknown_project(want, &pm.dir));
         }
     }
@@ -1348,9 +1685,65 @@ pub fn run_milestone(action: &MilestoneAction, state_dir: &std::path::Path) -> R
         crate::issue::time::now_epoch(),
         &work::fetch_approvals(state_dir),
     );
+    let one = wanted.first().map(String::as_str);
     match action {
-        MilestoneAction::Ls { json, .. } => {
-            let rows = work::milestones_json(&ctx, &views, wanted);
+        MilestoneAction::Ls {
+            milestone,
+            stage,
+            health,
+            sort,
+            limit,
+            fields,
+            json,
+            ..
+        } => {
+            crate::filter::fields_need_json(fields, *json)?;
+            if !stage.is_empty() {
+                let mut valid: Vec<String> = ctx
+                    .configs
+                    .values()
+                    .flat_map(|w| w.cfg.stage_ids().into_iter().map(str::to_string))
+                    .collect();
+                valid.push("rejected".to_string());
+                valid.sort();
+                valid.dedup();
+                for s in stage {
+                    if !valid.contains(s) {
+                        let list = valid.iter().map(String::as_str).collect::<Vec<_>>();
+                        return Err(crate::filter::unknown("stage", s, &list));
+                    }
+                }
+            }
+            crate::filter::check_set("health", health, work::HEALTH_STATES)?;
+            let mut rows: Vec<Value> = work::milestones_json(&ctx, &views, None)
+                .into_iter()
+                .filter(|r| crate::filter::any_of(&wanted, r["project"].as_str()))
+                .filter(|r| crate::filter::any_of(milestone, r["id"].as_str()))
+                .filter(|r| crate::filter::any_of(health, r["health"]["state"].as_str()))
+                .filter(|r| {
+                    stage.is_empty()
+                        || r["epics"].as_array().is_some_and(|epics| {
+                            epics.iter().any(|e| {
+                                stage
+                                    .iter()
+                                    .any(|s| e["stage"].as_str() == Some(s.as_str()))
+                            })
+                        })
+                })
+                .collect();
+            const MILESTONE_SORTS: &[(&str, &str)] = &[
+                ("id", "id"),
+                ("project", "project"),
+                ("title", "title"),
+                ("configured", "configured"),
+                ("progress", "progress.ratio"),
+                ("health", "health.state"),
+            ];
+            if let Some(spec) = sort {
+                crate::filter::sort_rows(&mut rows, spec, MILESTONE_SORTS, "id")?;
+            }
+            crate::filter::apply_limit(&mut rows, *limit);
+            crate::filter::apply_fields(&mut rows, fields)?;
             if *json {
                 print_json(&json!({"milestones": rows}));
             } else {
@@ -1358,7 +1751,7 @@ pub fn run_milestone(action: &MilestoneAction, state_dir: &std::path::Path) -> R
             }
         }
         MilestoneAction::Show { id, json, .. } => {
-            let row = work::milestone_show(&ctx, &views, id, wanted)?;
+            let row = work::milestone_show(&ctx, &views, id, one)?;
             if *json {
                 print_json(&row);
             } else {

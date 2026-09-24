@@ -190,6 +190,38 @@ pub fn load(file: &Path) -> Result<Project> {
     Ok(project)
 }
 
+/// The project key a cwd's repo identity resolves to — remote first,
+/// then checkout path, same as [`resolve`]'s cwd arm — or `None` when
+/// nothing matches. Read-only; `agent list --project` maps each row's
+/// `cwd` through this.
+pub fn key_for_cwd(pm_dir: &Path, cwd: &Path) -> Option<String> {
+    let (root, remote) = repo_identity(cwd)?;
+    let projects = list(pm_dir).ok()?;
+    if let Some(remote) = &remote {
+        if let Some(p) = projects.iter().find(|p| {
+            p.repos.iter().any(|r| {
+                r.remote
+                    .as_deref()
+                    .map(|rr| normalize_remote(rr) == *remote)
+                    .unwrap_or(false)
+            })
+        }) {
+            return Some(p.key.clone());
+        }
+    }
+    projects
+        .iter()
+        .find(|p| {
+            p.repos.iter().any(|r| {
+                r.path.as_ref().is_some_and(|path| {
+                    let path = expand_home(path);
+                    path.canonicalize().unwrap_or(path) == root
+                })
+            })
+        })
+        .map(|p| p.key.clone())
+}
+
 /// Resolve the project an issue command files into: `--project` flag,
 /// then `CADENCE_PROJECT`, then the cwd's git identity against every
 /// project.yaml (remote first, then checkout path). No match fails

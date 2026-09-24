@@ -18,6 +18,7 @@ pub mod daemon;
 pub mod delivery;
 pub mod doctor;
 pub mod error;
+pub mod filter;
 pub mod inbox;
 pub mod issue;
 pub mod master;

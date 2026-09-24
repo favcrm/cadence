@@ -1875,6 +1875,7 @@ pub fn stale(pm: &Pm, days: Option<u64>) -> (Vec<Value>, Vec<String>) {
         let hit = |reason: &str| {
             json!({
                 "project": m.project, "slug": m.front.id,
+                "type": m.front.kind,
                 "verified_at": last_verified(&m),
                 "evidence": evidence_json(&m, &fresh),
                 "reason": reason,

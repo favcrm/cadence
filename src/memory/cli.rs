@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 
 use clap::Subcommand;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::client;
 use crate::error::{Error, Result};
@@ -108,21 +108,25 @@ pub enum MemoryAction {
         project: Option<String>,
     },
     /// List memories — a compact table on a TTY, `--json` for agents.
+    /// Value flags repeat and comma-join and match ANY of their values;
+    /// different flags AND.
+    #[command(after_long_help = crate::filter::GRAMMAR)]
     Ls {
-        #[arg(long)]
-        project: Option<String>,
-        /// proposed | accepted | rejected | superseded.
-        #[arg(long)]
-        status: Option<String>,
-        /// rule | gotcha | decision | recipe.
-        #[arg(long = "type")]
-        kind: Option<String>,
-        /// Only memories applying to this component.
-        #[arg(long)]
-        component: Option<String>,
-        /// Only memories whose path globs match this file.
-        #[arg(long)]
-        path: Option<String>,
+        /// Project key; repeatable.
+        #[arg(long, value_delimiter = ',')]
+        project: Vec<String>,
+        /// proposed | accepted | rejected | superseded; repeatable.
+        #[arg(long, value_delimiter = ',')]
+        status: Vec<String>,
+        /// rule | gotcha | decision | recipe; repeatable.
+        #[arg(long = "type", value_delimiter = ',')]
+        kind: Vec<String>,
+        /// Only memories applying to this component; repeatable.
+        #[arg(long, value_delimiter = ',')]
+        component: Vec<String>,
+        /// Only memories whose path globs match this file; repeatable.
+        #[arg(long, value_delimiter = ',')]
+        path: Vec<String>,
         /// Accepted memories whose evidence is not current, read the
         /// way retrieval reads it: marked stale (withheld), no verify
         /// inside the window (unverified), or path globs matching files
@@ -130,9 +134,20 @@ pub enum MemoryAction {
         #[arg(long)]
         stale: bool,
         /// Freshness window in days [default: the project's
-        /// `memory.stale_days`, else 30].
+        /// `memory.stale_days`, else 30]. --component/--path select a
+        /// retrieval scope and don't apply to the stale axis.
         #[arg(long)]
         days: Option<u64>,
+        /// Sort by project slug type status confidence created;
+        /// `-KEY` descending.
+        #[arg(long, allow_hyphen_values = true)]
+        sort: Option<String>,
+        /// Keep only the first N rows.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Keep only these keys in each --json row (comma-joined).
+        #[arg(long, value_delimiter = ',')]
+        fields: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -329,18 +344,44 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
             path,
             stale,
             days,
+            sort,
+            limit,
+            fields,
             json: as_json,
         } => {
             let pm = open_pm()?;
+            crate::filter::fields_need_json(fields, *as_json)?;
+            crate::filter::check_set("status", status, memory::STATUSES)?;
+            crate::filter::check_set("type", kind, memory::TYPES)?;
             if *stale {
                 let (mut hits, errors) = memory::stale(&pm, *days);
                 if let Some(line) = memory::load_errors_line(&errors) {
                     eprintln!("{line}");
                 }
-                if let Some(key) = project {
-                    hits.retain(|h| h["project"].as_str() == Some(key.as_str()));
+                // Stale rows are all `accepted` — --status proposed
+                // yields nothing. --component/--path don't apply:
+                // they pick the retrieval scope, not the stale axis.
+                hits.retain(|h| {
+                    crate::filter::any_of(project, h["project"].as_str())
+                        && crate::filter::any_of(kind, h["type"].as_str())
+                        && crate::filter::any_of(status, Some("accepted"))
+                });
+                if let Some(spec) = sort {
+                    crate::filter::sort_rows(
+                        &mut hits,
+                        spec,
+                        &[
+                            ("project", "project"),
+                            ("slug", "slug"),
+                            ("reason", "reason"),
+                            ("label", "evidence.label"),
+                        ],
+                        "slug",
+                    )?;
                 }
+                crate::filter::apply_limit(&mut hits, *limit);
                 if *as_json {
+                    crate::filter::apply_fields(&mut hits, fields)?;
                     crate::issue::cli::print_json(&json!({"stale": hits, "load_errors": errors}));
                 } else if hits.is_empty() {
                     match days {
@@ -375,12 +416,11 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
                 return Ok(0);
             }
             let ctx = MatchCtx {
-                components: component.clone().into_iter().collect(),
-                paths: path.clone().into_iter().collect(),
+                components: component.clone(),
+                paths: path.clone(),
                 providers: vec![],
                 tags: vec![],
             };
-            let filtering = component.is_some() || path.is_some();
             let (all, load_errors) = memory::load_all_report(&pm.dir);
             let projects = crate::issue::project::list(&pm.dir).unwrap_or_default();
             if let Some(line) = memory::load_errors_line(&load_errors) {
@@ -388,46 +428,72 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
             }
             let mut mems = Vec::new();
             for m in all {
-                if let Some(key) = project {
-                    if m.project != *key {
-                        continue;
-                    }
+                if !crate::filter::any_of(project, Some(m.project.as_str()))
+                    || !crate::filter::any_of(status, Some(m.front.status.as_str()))
+                    || !crate::filter::any_of(kind, Some(m.front.kind.as_str()))
+                {
+                    continue;
                 }
-                if let Some(s) = status {
-                    if m.front.status != *s {
-                        continue;
-                    }
+                // Component and path are retrieval axes — a project-wide
+                // memory applies to every component/path — but different
+                // flags still AND: a `--component X --path Y` row must
+                // apply to both.
+                let scope = scope_of(&m);
+                if !component.is_empty()
+                    && !scope.project
+                    && !scope.components.iter().any(|c| component.contains(c))
+                {
+                    continue;
                 }
-                if let Some(k) = kind {
-                    if m.front.kind != *k {
-                        continue;
-                    }
-                }
-                if filtering && !matches_ctx(scope_of(&m), &ctx) {
+                if !path.is_empty()
+                    && !scope.project
+                    && !scope
+                        .paths
+                        .iter()
+                        .any(|g| ctx.paths.iter().any(|p| memory::glob_match(g, p)))
+                {
                     continue;
                 }
                 mems.push(m);
             }
+            let mut rows: Vec<Value> = mems
+                .iter()
+                .map(|m| memory::card_json(m, &memory::Freshness::among(&projects, &m.project)))
+                .collect();
+            if let Some(spec) = sort {
+                crate::filter::sort_rows(
+                    &mut rows,
+                    spec,
+                    &[
+                        ("project", "project"),
+                        ("slug", "slug"),
+                        ("type", "type"),
+                        ("status", "status"),
+                        ("confidence", "confidence"),
+                        ("created", "created"),
+                    ],
+                    "slug",
+                )?;
+            }
+            crate::filter::apply_limit(&mut rows, *limit);
             if *as_json {
+                crate::filter::apply_fields(&mut rows, fields)?;
                 crate::issue::cli::print_json(&json!({
-                    "memories": mems
-                        .iter()
-                        .map(|m| memory::card_json(m, &memory::Freshness::among(&projects, &m.project)))
-                        .collect::<Vec<_>>(),
+                    "memories": rows,
                     "load_errors": load_errors,
                 }));
-            } else if mems.is_empty() {
+            } else if rows.is_empty() {
                 println!("no memories");
             } else {
-                for m in &mems {
+                for r in &rows {
                     println!(
                         "{}/{}\t{}\t{}\t{}\t{}",
-                        m.project,
-                        m.front.id,
-                        m.front.status,
-                        m.front.kind,
-                        m.front.confidence,
-                        memory::fact_line(&m.body),
+                        r["project"].as_str().unwrap_or_default(),
+                        r["slug"].as_str().unwrap_or_default(),
+                        r["status"].as_str().unwrap_or_default(),
+                        r["type"].as_str().unwrap_or_default(),
+                        r["confidence"].as_str().unwrap_or_default(),
+                        r["fact"].as_str().unwrap_or_default(),
                     );
                 }
             }
@@ -575,16 +641,4 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
             }
         }
     }
-}
-
-/// `ls --component/--path` filtering reuses the matcher's union
-/// semantics — a memory shows when any of its scope axes matches the
-/// asked-for file/component.
-fn matches_ctx(scope: &Scope, ctx: &MatchCtx) -> bool {
-    scope.project
-        || scope.components.iter().any(|c| ctx.components.contains(c))
-        || scope
-            .paths
-            .iter()
-            .any(|g| ctx.paths.iter().any(|p| memory::glob_match(g, p)))
 }

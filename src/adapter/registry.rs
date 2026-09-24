@@ -676,6 +676,30 @@ pub fn model_provider_matrix() -> &'static [ModelProviderRow] {
     &ROWS
 }
 
+/// The `--provider`/`--kind` vocabularies for `agent list` (CAD-437):
+/// the distinct non-internal providers and endpoint kinds.
+pub fn provider_ids() -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = SPECS
+        .iter()
+        .filter(|s| !s.internal)
+        .map(|s| s.provider)
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+pub fn endpoint_kind_ids() -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = SPECS
+        .iter()
+        .filter(|s| !s.internal)
+        .map(|s| s.endpoint_kind)
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 /// Providers whose settings may store a baseline.
 pub fn model_provider_ids() -> Vec<&'static str> {
     model_provider_matrix()

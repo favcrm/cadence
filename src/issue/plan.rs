@@ -616,6 +616,90 @@ fn ratio(done: u64, total: u64) -> f64 {
     }
 }
 
+/// `plan ls` — one row per issue carrying a plan: state, proposer,
+/// decision, the ticket ids and size-weighted progress (CAD-437).
+/// Value flags repeat and comma-join and match ANY of their values;
+/// different flags AND.
+pub fn ls(
+    pm: &Pm,
+    states: &[String],
+    projects: &[String],
+    sort: Option<&str>,
+    limit: Option<usize>,
+    fields: &[String],
+) -> Result<Value> {
+    for s in states {
+        if !model::PLAN_STATES.contains(&s.as_str()) {
+            return Err(crate::filter::unknown("state", s, model::PLAN_STATES));
+        }
+    }
+    for p in projects {
+        model::check_key(p)?;
+        if !crate::issue::project::list(&pm.dir)?
+            .iter()
+            .any(|pr| &pr.key == p)
+        {
+            return Err(crate::issue::project::unknown_project(p, &pm.dir));
+        }
+    }
+    let views = board::views(&pm.config.notes_dir(), board::load_all(&pm.dir, None)?);
+    let by_id: HashMap<String, &board::View> = views
+        .iter()
+        .map(|v| (v.issue.front.id.clone(), v))
+        .collect();
+    let mut rows: Vec<Value> = views
+        .iter()
+        .filter(|v| v.issue.front.plan.is_some())
+        .map(|v| {
+            let f = &v.issue.front;
+            let p = f.plan.as_ref().unwrap();
+            let kids: Vec<&&board::View> =
+                p.tickets.iter().filter_map(|id| by_id.get(id)).collect();
+            let pairs: Vec<(&str, Option<&str>)> = kids
+                .iter()
+                .map(|k| (k.status.as_str(), k.issue.front.size.as_deref()))
+                .collect();
+            let (done, total) = progress(&pairs);
+            json!({
+                "id": f.id,
+                "project": v.issue.project,
+                "title": f.title,
+                "status": v.status,
+                "state": p.state,
+                "proposed_by": p.proposed_by,
+                "proposed_at": p.proposed_at,
+                "decided_by": p.decided_by,
+                "decided_at": p.decided_at,
+                "reason": p.reason,
+                "tickets": p.tickets,
+                "progress": {
+                    "done_weight": done,
+                    "total_weight": total,
+                    "ratio": ratio(done, total),
+                },
+            })
+        })
+        .filter(|r| crate::filter::any_of(states, r["state"].as_str()))
+        .filter(|r| crate::filter::any_of(projects, r["project"].as_str()))
+        .collect();
+    const PLAN_SORTS: &[(&str, &str)] = &[
+        ("id", "id"),
+        ("project", "project"),
+        ("title", "title"),
+        ("status", "status"),
+        ("state", "state"),
+        ("proposed_by", "proposed_by"),
+        ("proposed_at", "proposed_at"),
+        ("progress", "progress.ratio"),
+    ];
+    if let Some(spec) = sort {
+        crate::filter::sort_rows(&mut rows, spec, PLAN_SORTS, "id")?;
+    }
+    crate::filter::apply_limit(&mut rows, limit);
+    crate::filter::apply_fields(&mut rows, fields)?;
+    Ok(json!({"plans": rows, "count": rows.len()}))
+}
+
 /// `plan show <EPIC>` — the epic, its plan state, tickets and progress.
 pub fn show(pm: &Pm, id: &str) -> Result<Value> {
     model::check_id(id)?;
