@@ -385,7 +385,15 @@ pub fn ensure_lease_tables(conn: &Connection) -> Result<()> {
          CREATE TABLE IF NOT EXISTS daemon_build(
             id INTEGER PRIMARY KEY CHECK (id = 1),
             commit_sha TEXT NOT NULL,
-            recorded_at REAL NOT NULL);",
+            recorded_at REAL NOT NULL);
+         CREATE TABLE IF NOT EXISTS rollout_grants(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            alias TEXT NOT NULL,
+            granted_by TEXT NOT NULL,
+            granted_at REAL NOT NULL,
+            expires_at REAL,
+            revoked_at REAL,
+            revoked_by TEXT);",
     )?;
     Ok(())
 }
@@ -613,6 +621,128 @@ pub fn recheck_restart(state_dir: &Path, ticket: &RestartTicket) -> Result<()> {
     Ok(())
 }
 
+/// The holder of the active, unexpired rollout lease — when that
+/// holder also holds a live operator grant (CAD-384). The daemon's
+/// `shutdown` caller rule admits that agent's own pane: the rollout
+/// owner restarts from its pane, but only because the operator granted
+/// it (`cadence rollout grant`). A lease without a live grant — an
+/// agent's handoff, a grant since revoked or expired — admits nobody.
+/// Read-only; no lease table (or no database yet) is no holder.
+pub fn granted_lease_holder(state_dir: &Path) -> Result<Option<String>> {
+    let path = db_file(state_dir);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let conn = connect(&path)?;
+    let now = unix_now();
+    let Some(lease) = active_lease(&conn)?.filter(|lease| lease.expires_at > now) else {
+        return Ok(None);
+    };
+    Ok(live_grant(&conn, &lease.holder, now)?.map(|_| lease.holder))
+}
+
+/// The live grant for `alias` — not revoked, not expired — as
+/// `(granted_by, granted_at, expires_at)`.
+fn live_grant(
+    conn: &Connection,
+    alias: &str,
+    now: f64,
+) -> Result<Option<(String, f64, Option<f64>)>> {
+    if !table_exists(conn, "rollout_grants")? {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT granted_by, granted_at, expires_at FROM rollout_grants
+         WHERE alias=?1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?2)
+         ORDER BY id DESC LIMIT 1",
+        params![alias, now],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// `rollout grant` (CAD-384): the operator lets agent `alias` claim the
+/// rollout lease — and, holding it, stop the daemon from its own pane.
+/// The caller must already be proven the operator: the daemon's
+/// `rollout_grant` RPC is the only caller. A new grant supersedes the
+/// alias's live one. `until` is an absolute expiry (epoch seconds).
+pub fn grant(state_dir: &Path, alias: &str, until: Option<f64>, by: &str) -> Result<Value> {
+    validate_identity(alias)?;
+    let conn = connect_ensured(&db_file(state_dir))?;
+    let now = unix_now();
+    if until.is_some_and(|at| at <= now) {
+        return Err(Error::rejected("a grant's --until must be in the future"));
+    }
+    committed(immediate(&conn, |conn| {
+        conn.execute(
+            "UPDATE rollout_grants SET revoked_at=?1, revoked_by='superseded'
+             WHERE alias=?2 AND revoked_at IS NULL",
+            params![now, alias],
+        )?;
+        conn.execute(
+            "INSERT INTO rollout_grants(alias,granted_by,granted_at,expires_at)
+             VALUES(?1,?2,?3,?4)",
+            params![alias, by, now, until],
+        )?;
+        let payload = json!({"alias": alias, "by": by, "expires_at": until});
+        insert_event(conn, "rollout_grant", payload.clone(), now)?;
+        Ok(TxResult::Done(json!({
+            "granted": alias, "by": by, "granted_at": now, "expires_at": until,
+        })))
+    }))
+}
+
+/// `rollout revoke` (CAD-384): end `alias`'s live grant. Its lease, if
+/// it holds one, no longer admits its pane's `shutdown`, and it cannot
+/// claim again. The operator only, like [`grant`].
+pub fn revoke(state_dir: &Path, alias: &str, by: &str) -> Result<Value> {
+    let conn = connect_ensured(&db_file(state_dir))?;
+    let now = unix_now();
+    committed(immediate(&conn, |conn| {
+        let n = conn.execute(
+            "UPDATE rollout_grants SET revoked_at=?1, revoked_by=?2
+             WHERE alias=?3 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?1)",
+            params![now, by, alias],
+        )?;
+        if n == 0 {
+            return Ok(TxResult::Refuse(format!(
+                "'{alias}' holds no live rollout grant"
+            )));
+        }
+        insert_event(
+            conn,
+            "rollout_revoke",
+            json!({"alias": alias, "by": by}),
+            now,
+        )?;
+        Ok(TxResult::Done(
+            json!({"revoked": alias, "by": by, "at": now}),
+        ))
+    }))
+}
+
+/// Live grants, for `rollout status`.
+fn live_grants(conn: &Connection, now: f64) -> Result<Vec<Value>> {
+    if !table_exists(conn, "rollout_grants")? {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT alias, granted_by, granted_at, expires_at FROM rollout_grants
+         WHERE revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?1) ORDER BY alias",
+    )?;
+    let rows = stmt.query_map(params![now], |row| {
+        Ok(json!({
+            "alias": row.get::<_, String>(0)?,
+            "by": row.get::<_, String>(1)?,
+            "granted_at": row.get::<_, f64>(2)?,
+            "expires_at": row.get::<_, Option<f64>>(3)?,
+        }))
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
 pub fn note_restart_proceeded(state_dir: &Path, ticket: &RestartTicket) -> Result<()> {
     let conn = connect(&db_file(state_dir))?;
     insert_event(
@@ -641,6 +771,14 @@ pub fn claim(state_dir: &Path, req: &ClaimRequest<'_>) -> Result<Value> {
     if let Some(target) = req.target {
         validate_target(target)?;
     }
+    // CAD-384: an operator-shaped holder (`--as operator:<name>`, no
+    // pane alias) must BE the operator — otherwise an agent's
+    // `env -u CADENCE_ALIAS … claim --as operator:x` holds the lease and
+    // blocks the operator's own claim. Checked before any write, outside
+    // the transaction (the proof peeks the same database).
+    if req.caller.source == "as" {
+        require_operator_proof(state_dir, "rollout claim --as")?;
+    }
     let conn = connect_ensured(&db_file(state_dir))?;
     committed(immediate(&conn, |conn| claim_in(conn, req)))
 }
@@ -655,7 +793,7 @@ pub fn status(state_dir: &Path) -> Result<Value> {
         return Ok(json!({"held": false}));
     }
     let now = unix_now();
-    committed(immediate(&conn, |conn| {
+    let mut view = committed(immediate(&conn, |conn| {
         if let Some(lease) = active_lease(conn)? {
             if lease.expires_at <= now {
                 // Report the expiry without ending the row. Ending it
@@ -667,7 +805,13 @@ pub fn status(state_dir: &Path) -> Result<Value> {
             return Ok(TxResult::Done(held_status(&lease, now)));
         }
         Ok(TxResult::Done(json!({"held": false})))
-    }))
+    }))?;
+    // CAD-384: who the operator lets claim the lease from a pane.
+    let grants = live_grants(&conn, now)?;
+    if !grants.is_empty() {
+        view["grants"] = json!(grants);
+    }
+    Ok(view)
 }
 
 pub fn release(state_dir: &Path, caller: &Caller) -> Result<Value> {
@@ -734,7 +878,7 @@ pub fn release_forced(
     // After the holder checks, before any write. The proof peeks the
     // database itself; doing it under the write transaction can stall
     // that peek on the same file.
-    require_operator_proof(state_dir)?;
+    require_operator_proof(state_dir, "rollout release --force")?;
     let conn = connect_ensured(&db_file(state_dir))?;
     let now = unix_now();
     committed(immediate(&conn, |conn| {
@@ -840,7 +984,7 @@ fn preview_force_refusal(
 
 /// `peer::operator_proof` for this process. Pane pids come from a
 /// read-only peek. Enrolled roots come from `slots.json`.
-fn require_operator_proof(state_dir: &Path) -> Result<()> {
+fn require_operator_proof(state_dir: &Path, verb: &str) -> Result<()> {
     let panes = registered_panes(state_dir)?;
     let roots = enrolled_roots(state_dir)?;
     let daemon_pid = daemon_pid_for_proof(state_dir)?;
@@ -853,7 +997,7 @@ fn require_operator_proof(state_dir: &Path) -> Result<()> {
     )
     .map_err(|why| {
         Error::rejected(format!(
-            "rollout release --force is an operator action — this process is not \
+            "{verb} is an operator action — this process is not \
              provably the operator: {why}; run it from a shell outside every pane \
              and managed endpoint"
         ))
@@ -1311,6 +1455,24 @@ fn nonempty(text: &str) -> Option<&str> {
 }
 
 fn claim_in(conn: &Connection, req: &ClaimRequest<'_>) -> Result<TxResult<Value>> {
+    // CAD-384: an agent (the identity is its pane's `CADENCE_ALIAS`)
+    // claims only under a live operator grant — the lease is what lets a
+    // pane stop the production daemon.
+    if req.caller.source == "alias" && live_grant(conn, &req.caller.identity, req.now)?.is_none() {
+        let message = format!(
+            "refusing claim: agent '{}' holds no rollout grant — the operator grants \
+             one from a shell outside every pane (`cadence rollout grant {}`), or \
+             claims the lease itself with `--as operator:<name>`",
+            req.caller.identity, req.caller.identity
+        );
+        insert_event(
+            conn,
+            "rollout_claim_refused",
+            json!({"holder": req.caller.identity, "reason": message}),
+            req.now,
+        )?;
+        return Ok(TxResult::Refuse(message));
+    }
     let existing = active_lease(conn)?;
     if let Some(lease) = existing {
         if lease.expires_at <= req.now {

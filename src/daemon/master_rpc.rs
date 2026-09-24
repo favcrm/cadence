@@ -587,7 +587,7 @@ impl Shared {
         self.send_as(
             &json!({"alias": ALIAS, "text": body, "message": "bootstrap-master",
                     "source": "bootstrap"}),
-            &|_| store::Sender::Unattributed,
+            &|_| Ok(store::Sender::Unattributed),
         )?;
         let _ = self.store.event_public(
             DAEMON_ALIAS,
@@ -831,7 +831,7 @@ impl Shared {
         };
         self.send_as(
             &json!({"alias": ALIAS, "text": text, "message": mid, "source": "report"}),
-            &|_| store::Sender::Unattributed,
+            &|_| Ok(store::Sender::Unattributed),
         )?;
         let _ = self.store.event_public(
             ALIAS,

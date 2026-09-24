@@ -168,7 +168,7 @@ impl Shared {
             self.send_as(
                 &json!({"alias": rec.worker, "text": text, "message": mid,
                         "source": "review"}),
-                &|_| store::Sender::Unattributed,
+                &|_| Ok(store::Sender::Unattributed),
             )?;
             let _ = self.store.event_public(
                 DAEMON_ALIAS,
@@ -332,7 +332,7 @@ impl Shared {
         let mid = format!("review-{}", hash(&format!("{}/{sha}/{round}", rec.issue)));
         self.send_as(
             &json!({"alias": reviewer, "text": text, "message": mid, "source": "review"}),
-            &|_| store::Sender::Unattributed,
+            &|_| Ok(store::Sender::Unattributed),
         )?;
         rec.rounds = round;
         rec.reviewer = Some(reviewer.clone());
@@ -462,7 +462,7 @@ impl Shared {
                         &json!({"alias": rec.worker, "text": msg,
                                 "message": format!("revise-{}", hash(&report)),
                                 "source": "review"}),
-                        &|_| store::Sender::Unattributed,
+                        &|_| Ok(store::Sender::Unattributed),
                     )?;
                     rec.enter(State::Working, at);
                     format!(
@@ -495,7 +495,7 @@ impl Shared {
             let _ = self.send_as(
                 &json!({"alias": master::ALIAS, "text": text,
                         "message": format!("verdict-{}", hash(&report)), "source": "report"}),
-                &|_| store::Sender::Unattributed,
+                &|_| Ok(store::Sender::Unattributed),
             );
         }
         let _ = self.store.event_public(
