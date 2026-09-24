@@ -3002,13 +3002,13 @@ impl Shared {
         if chain.iter().skip(1).any(|&hop| hop == me) {
             return false;
         }
-        let Ok(facts) = self.store.pty_endpoint_facts() else {
+        // Pane rows deny through the fenced view (CAD-385): a row whose
+        // pid was reused ties nothing, one with no recorded start still
+        // ties.
+        let Ok(rows) = self.store.pty_pane_pids() else {
             return false;
         };
-        let panes: HashMap<u32, String> = facts
-            .into_iter()
-            .map(|(alias, (_, pane_pid, _))| (pane_pid, alias))
-            .collect();
+        let panes = crate::peer::AgentPids::classify(rows).fenced();
         {
             let slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
             if chain.iter().any(|hop| {

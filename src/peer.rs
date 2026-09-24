@@ -628,6 +628,20 @@ impl AgentRoots {
     pub(crate) fn is_empty(&self) -> bool {
         self.panes.is_empty() && self.managed.is_empty()
     }
+
+    /// [`operator_proof`] for `pid` against these roots. The deny lists
+    /// are every row that MAY still be its process (CAD-385,
+    /// [`AgentPids::fenced`]): a reused pid denies nothing, a row with no
+    /// recorded start keeps denying — panes and managed providers alike.
+    /// The one way the board runs operator proof, so no call site builds
+    /// a deny list from bare pids.
+    pub(crate) fn operator_proof(&self, pid: u32, uid: u32, daemon_pid: u32) -> Result<(), String> {
+        let panes = self.panes.fenced();
+        let managed = self.managed.fenced();
+        operator_proof(pid, uid, daemon_pid, &panes, |hop| {
+            managed.contains_key(&hop)
+        })
+    }
 }
 
 /// Which live agent the TCP peer `peer` of a connection to our
@@ -739,15 +753,8 @@ pub(crate) fn tcp_peer_operator_proof(
             "socket {inode} of peer {peer} has no visible owner"
         ));
     }
-    // Deny lists are every row that MAY still be its process (CAD-385,
-    // [`AgentPids::fenced`]): a reused pid denies nothing, a row with no
-    // recorded start keeps denying — panes and managed providers alike.
-    let panes = roots.panes.fenced();
-    let managed = roots.managed.fenced();
     for pid in pids {
-        operator_proof(pid, uid, daemon_pid, &panes, |hop| {
-            managed.contains_key(&hop)
-        })?;
+        roots.operator_proof(pid, uid, daemon_pid)?;
     }
     Ok(())
 }
