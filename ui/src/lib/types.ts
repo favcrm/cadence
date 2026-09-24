@@ -730,6 +730,20 @@ export interface AgentDetail {
  *  identity headers; `read_only` boards refuse every write. */
 export interface Meta {
   read_only: boolean;
+  /** CAD-313: this browser holds a live operator session. Absent on a
+   *  server that predates sessions. */
+  operator?: boolean;
+  session?: {
+    id: string;
+    origin: "loopback" | "tailnet";
+    created: number;
+    last_used: number;
+    idle_expires_at: number;
+    expires_at: number;
+    user_agent: string;
+  } | null;
+  /** The command that signs this origin in (`cadence ui login [--tailnet]`). */
+  login_hint?: string;
   actor: string;
   /** CAD-432: this client passes the board's operator proof. */
   operator?: boolean;

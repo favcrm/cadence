@@ -1,3 +1,4 @@
+import { useWriteBlock } from "../auth/WriteGate";
 import { useState } from "react";
 import { api, ApiError } from "../../lib/api";
 import type { ResourceState } from "../../lib/cache";
@@ -33,6 +34,7 @@ function AnswerForm({
   onDone: (text: string) => void;
 }) {
   const { issue, report, options, impact, body } = need.action;
+  const block = useWriteBlock(readOnly);
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -64,7 +66,7 @@ function AnswerForm({
         </details>
       )}
       {readOnly ? (
-        <p className="text-micro text-ink-500">Board is read-only — answer with `cadence report file --kind answer`.</p>
+        <p className="text-micro text-ink-500">{block} Or answer with `cadence report file --kind answer`.</p>
       ) : (
         <>
           {options.length > 0 && (

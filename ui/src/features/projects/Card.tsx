@@ -1,3 +1,4 @@
+import { useWriteBlock } from "../auth/WriteGate";
 import type { IssueCard } from "../../lib/types";
 
 const PRIORITY_CHIP: Record<string, string> = {
@@ -41,7 +42,8 @@ export default function Card({
 }: Props) {
   const t = issue;
   const derived = t.status_source !== "file";
-  const noDrag = noDragReason(t) ?? (canDrag ? null : "board is read-only");
+  const block = useWriteBlock(!canDrag);
+  const noDrag = noDragReason(t) ?? block;
   const pr = prLabel(t);
   const artifacts = t.counts.artifacts + t.counts.refs;
   const meta: React.ReactNode[] = [];

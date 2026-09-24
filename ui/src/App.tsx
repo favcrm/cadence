@@ -16,6 +16,10 @@ import SectionTabs from "./ui/SectionTabs";
 import ThemeToggle from "./ui/ThemeToggle";
 import Setup from "./features/setup/Setup";
 import SetupNudge from "./features/setup/SetupNudge";
+import Login from "./features/auth/Login";
+import SignIn from "./features/auth/SignIn";
+import { writeBlock } from "./features/auth/gate";
+import { WriteGate } from "./features/auth/WriteGate";
 import Toast, { type ToastMsg } from "./ui/Toast";
 import { Logo } from "./ui/Logo";
 import { countLabel, issueCounts } from "./lib/counts";
@@ -59,6 +63,7 @@ const SCREEN_LABEL: Record<Screen, string> = {
   agents: "agents",
   setup: "setup",
   settings: "settings",
+  login: "sign in",
   notFound: "not found",
 };
 
@@ -110,7 +115,11 @@ export default function App() {
   const [menuOpen, setMenuOpen] = useState(false);
   const toastTimer = useRef<number>(0);
 
-  const readOnly = meta?.read_only ?? false;
+  // Writes are off on a read-only board and, since CAD-313, until this
+  // browser holds the operator's session — `block` says why.
+  const boardReadOnly = meta?.read_only ?? false;
+  const block = writeBlock(meta);
+  const readOnly = block !== null;
   const actor = meta?.actor ?? "operator (ui)";
 
   useEffect(() => {
@@ -252,8 +261,8 @@ export default function App() {
 
   const ackMonitor = useCallback(
     (monitor: string, seq: number) => {
-      if (readOnly) {
-        say("err", "board is read-only — monitor acknowledgements are disabled");
+      if (block) {
+        say("err", `monitor acknowledgements are disabled — ${block}`);
         return;
       }
       api
@@ -269,7 +278,7 @@ export default function App() {
           ),
         );
     },
-    [readOnly, say],
+    [block, say],
   );
 
   /// A write response is authoritative: merge the fresh card into the
@@ -317,8 +326,8 @@ export default function App() {
   /// `rollback` restores the previous card on failure.
   const moveIssue = useCallback(
     (issue: IssueCard, status: string) => {
-      if (readOnly) {
-        say("err", "board is read-only — writes are disabled");
+      if (block) {
+        say("err", `writes are disabled — ${block}`);
         return;
       }
       if (issue.status === status) return;
@@ -335,7 +344,7 @@ export default function App() {
           writeError(e, `${issue.id} move`);
         });
     },
-    [applyWrite, writeError, readOnly, say],
+    [applyWrite, writeError, block, say],
   );
 
   const openIssue = useCallback((id: string) => update((c) => ({ ...c, openId: id })), []);
@@ -348,6 +357,7 @@ export default function App() {
   const projectSlug = project === "all" ? null : project;
 
   return (
+    <WriteGate.Provider value={block}>
     <div className="grid lg:grid-cols-[208px_minmax(0,1fr)] min-h-screen bg-ink-900">
       <Sidebar
         screen={screen}
@@ -357,6 +367,7 @@ export default function App() {
         projects={projects}
         issues={issuesState}
         projectsError={projectsState.status === "failed" ? projectsState.error : null}
+        signedIn={meta?.operator ?? null}
       />
 
       <div className="min-w-0 flex flex-col">
@@ -388,7 +399,7 @@ export default function App() {
           </div>
 
           <div className="ml-auto flex items-center gap-2 shrink-0">
-            {readOnly && (
+            {boardReadOnly && (
               <span
                 className="chip bg-warn/10 text-warn"
                 title="the server refuses every write — browsing only"
@@ -396,6 +407,7 @@ export default function App() {
                 read-only
               </span>
             )}
+            <SignIn meta={meta} onChange={refresh} />
             {health && (
               <span
                 className={`chip ${
@@ -494,7 +506,7 @@ export default function App() {
           </nav>
         )}
 
-        {screen === "home" && <SetupNudge readOnly={meta ? readOnly : null} />}
+        {screen === "home" && <SetupNudge readOnly={meta ? boardReadOnly : null} />}
         {screen === "home" && (
           <Home
             readOnly={readOnly}
@@ -588,7 +600,7 @@ export default function App() {
           />
         )}
         {screen === "setup" && (
-          <Setup settingsHref={hrefFor({ screen: "settings", section: "models" })} readOnly={meta ? readOnly : null} />
+          <Setup settingsHref={hrefFor({ screen: "settings", section: "models" })} readOnly={meta ? boardReadOnly : null} />
         )}
         {route.screen === "settings" && (
           <SectionTabs
@@ -603,6 +615,14 @@ export default function App() {
           <Memory project={project} onError={writeError} />
         )}
         {route.screen === "settings" && route.section === "models" && <ModelDefaults />}
+        {screen === "login" && (
+          <Login
+            onSignedIn={() => {
+              refresh();
+              window.setTimeout(() => goRoute({ screen: "home" }), 900);
+            }}
+          />
+        )}
         {screen === "notFound" && (
           <main className="px-4 lg:px-8 pt-10 pb-9">
             <h1 className="text-section font-semibold text-ink-100">Nothing lives here</h1>
@@ -636,5 +656,6 @@ export default function App() {
 
       <Toast msg={toast} />
     </div>
+    </WriteGate.Provider>
   );
 }

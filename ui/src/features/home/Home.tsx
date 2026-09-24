@@ -1,3 +1,4 @@
+import { useWriteBlock } from "../auth/WriteGate";
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { api, ApiError } from "../../lib/api";
 import type { ResourceState } from "../../lib/cache";
@@ -403,7 +404,8 @@ export default function Home({
 
   const missing = thread.data?.missing === true;
   const status = masterStatus(agents.data, missing);
-  const block = composerBlock(readOnly, status);
+  const writeBlock = useWriteBlock(readOnly);
+  const block = composerBlock(writeBlock, status);
   const items = useMemo(() => threadItems(thread.data), [thread.data]);
   const loaded = thread.data !== null;
   const moreBefore = thread.data?.moreBefore === true;

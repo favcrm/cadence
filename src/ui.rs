@@ -3697,6 +3697,7 @@ mod tests {
             "/setup",
             "/settings",
             "/settings/memory",
+            "/login",
             "/unknown-page",
             "/agents/cc.worker-1",
         ] {

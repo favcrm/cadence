@@ -10,12 +10,17 @@ import "./styles.css";
 import App from "./App";
 import { applyLegacyRedirect } from "./lib/useLocation";
 import { initTheme } from "./lib/theme";
+import { captureLoginNonce } from "./features/auth/session";
 
 // The stored theme pick, before the first paint of the app.
 initTheme();
 
 // A pre-router link (`/?tab=board&project=cadence`) opens at its route.
 applyLegacyRedirect();
+
+// A `cadence ui login` link: take its nonce out of the address bar
+// before anything renders (CAD-313).
+captureLoginNonce();
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>

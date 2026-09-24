@@ -48,16 +48,17 @@ async function main() {
   {
     equal(planGoal(detail(PLAN).body), "First chat in five minutes", "goal section");
     equal(planGoal("no goal here"), null, "no goal");
-    const v = planView(detail(PLAN), false)!;
+    const v = planView(detail(PLAN), null)!;
     equal([v.epic, v.state, v.goal, v.percent, v.done, v.total], ["D-2", "proposed", "First chat in five minutes", 11, 1, 2], "view");
     equal(v.tickets.map((t) => [t.id, t.size, t.acceptance]), [["D-3", "L", 2], ["D-4", "S", 1], ["D-5", null, 1]], "tickets");
     equal([v.canDecide, v.blockedReason], [true, null], "proposed → decide");
-    const ro = planView(detail(PLAN), true)!;
-    equal(ro.canDecide, false, "read-only → no buttons");
-    equal(ro.blockedReason?.includes("read-only"), true, "with the reason");
-    equal(planView(detail({ ...PLAN, state: "approved" }), false)!.canDecide, false, "decided plans have no buttons");
-    equal(planView(detail(null), false), null, "not a plan");
-    const bare = planView(detail({ state: "proposed" }), false)!;
+    const ro = planView(detail(PLAN), "Sign in with `cadence ui login` to act as the operator.")!;
+    equal(ro.canDecide, false, "blocked → no buttons");
+    equal(ro.blockedReason?.includes("cadence ui login"), true, "with the reason");
+    equal(ro.blockedReason?.includes("cadence plan approve"), true, "and the CLI path");
+    equal(planView(detail({ ...PLAN, state: "approved" }), null)!.canDecide, false, "decided plans have no buttons");
+    equal(planView(detail(null), null), null, "not a plan");
+    const bare = planView(detail({ state: "proposed" }), null)!;
     equal([bare.tickets, bare.percent], [[], null], "missing fields degrade");
   }
 
