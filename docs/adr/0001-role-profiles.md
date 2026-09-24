@@ -591,7 +591,7 @@ if task.assignee.as_deref() == Some(reviewer) {
 }
 ```
 
-It is tested (`tests/integration.rs:9129`,
+It is tested (`tests/dispatch_jobs_monitor.rs`,
 `verdict_rejects_every_bad_shape`) and documented as A4 "reviewer
 independence" (`docs/JOBS.md:204-209`). It is backed by real actor
 handling in `rpc_task_verdict` (`daemon.rs:2304-2323`): inside a pane the
@@ -802,7 +802,8 @@ cadence team show --file /tmp/bad-team.yaml; test $? -ne 0
 
 ```bash
 # D3, 3a: the gate that already exists is now on the live path.
-# This already passes today in isolation (tests/integration.rs:9129);
+# This already passes today in isolation (tests/dispatch_jobs_monitor.rs,
+# verdict_rejects_every_bad_shape);
 # the check is that the real review reaches it.
 cadence job verdict <task> --sha <head> --pass   # as the task assignee -> refused:
                                                  # "cannot verdict its own revision"

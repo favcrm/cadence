@@ -6,7 +6,10 @@
 **Host:** `ip-172-31-1-32`
 **Toolchain:** `rustc 1.98.1 (48a229cea 2026-09-01)`, `cargo 1.98.1 (797e8a9bc 2026-08-05)`
 
-This evidence is for the test-only phase trace in `tests/integration.rs`. The
+This evidence is for the test-only phase trace that lived in
+`tests/integration.rs` (since CAD-426 the helper is in `tests/common/mod.rs`
+and the traced tests sit in the per-area `tests/*.rs` binaries — the
+equivalent command today is `cargo test --test <area> <exact-test>`). The
 runtime, render deadline, retry count, retry wait, and all existing assertions
 are unchanged. Each test was run five times in isolation, sequentially, with
 `CARGO_BUILD_JOBS=4`. The commands were filtered `cargo test --test

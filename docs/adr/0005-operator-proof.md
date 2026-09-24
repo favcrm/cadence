@@ -127,7 +127,7 @@ the operator:
 | An agent-started tmux or screen server, `systemd-run --user`, `ssh localhost`, cron, `at` | `operator_proof` (the same class as above) | the residual text in `peer.rs` `operator_proof`'s doc comment |
 | `setsid -f env -i PATH=$PATH sh -c 'cadence agent set w2 approval_policy=never --next-launch' </dev/null` | the caller rule on `agent set/remove/gc`. It lands and is audited `by:operator`. | qa-pr187 F1 (PR #187), comment on CAD-280, 2026-09-23T14:31Z |
 | `curl` to the board from a `setsid` child, a managed agent's tool shell, or any process that has left every pane's ancestry | `write_caller` gives `operator (ui)` | CAD-335. ADR 0004 F1. |
-| **The test suite itself** | `operator_rpc` in `tests/integration.rs` reaches the operator verbs with `setsid -f` plus `env_clear` plus null stdio, because that is how an operator shell looks | `tests/integration.rs` `operator_rpc` (its doc comment says so) |
+| **The test suite itself** | `operator_rpc` in `tests/common/mod.rs` reaches the operator verbs with `setsid -f` plus `env_clear` plus null stdio, because that is how an operator shell looks | `tests/common/mod.rs` `operator_rpc` (its doc comment says so) |
 
 The last row matters most. Cadence's own harness cannot be the operator
 except by using the escape an agent would use. So today's tests cannot
@@ -781,7 +781,7 @@ committed signers (T4) for records.
 
 ## 10. Test plan (acceptance item 2)
 
-The tests extend `tests/integration.rs` and `tests/board.rs`, against a
+The tests extend the `tests/` area binaries and `tests/board.rs`, against a
 temporary state dir and a random port. Keys are generated per test with
 `ssh-keygen -t ed25519 -N ''` into the temp dir. CI cannot touch a
 hardware key, so the `-sk` path is covered by a unit test of the

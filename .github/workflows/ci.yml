@@ -166,7 +166,7 @@ jobs:
           echo "CADENCE_NEXTTEST_BIN=${RUNNER_TEMP}/cadence-nextest-0.9.145/cargo-nextest" >> "$GITHUB_ENV"
       # The all-targets inventory must be non-empty and exactly equal between
       # Cargo and nextest before the process-per-test runner starts. This
-      # covers lib, bin, board, and integration; it is not integration-only.
+      # covers lib, bin and every tests/ binary; it is not one suite only.
       - name: Verify all-targets inventory parity
         env:
           CARGO_BUILD_JOBS: 4

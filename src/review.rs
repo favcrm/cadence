@@ -3155,10 +3155,10 @@ index 111..222 100644
 @@ -1,2 +1,3 @@
 +fn helper_not_a_test() {}
  fn old() {}
-diff --git a/tests/integration.rs b/tests/integration.rs
+diff --git a/tests/daemon.rs b/tests/daemon.rs
 index 333..444 100644
---- a/tests/integration.rs
-+++ b/tests/integration.rs
+--- a/tests/daemon.rs
++++ b/tests/daemon.rs
 @@ -10,0 +11,6 @@
 +#[test]
 +fn new_daemon_wait() {
@@ -3195,7 +3195,7 @@ index 555..666 100644
 
     #[test]
     fn glob_matching() {
-        assert!(glob_match("tests/**", "tests/integration.rs"));
+        assert!(glob_match("tests/**", "tests/daemon.rs"));
         assert!(glob_match("tests/**", "tests/deep/sub.rs"));
         assert!(!glob_match("tests/**", "src/tests/x.rs"));
         assert!(glob_match("tests/*.rs", "tests/a.rs"));
@@ -3214,7 +3214,7 @@ index 555..666 100644
         let tests = parse_new_tests(DIFF, &globs(), &pats);
         let names: Vec<&str> = tests.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, vec!["new_daemon_wait", "tokio_wait", "another_wait"]);
-        assert_eq!(tests[0].file, "tests/integration.rs");
+        assert_eq!(tests[0].file, "tests/daemon.rs");
         assert_eq!(tests[2].file, "tests/deep/sub.rs");
     }
 
@@ -3239,14 +3239,14 @@ index 555..666 100644
     fn test_command_substitution() {
         let nt = NewTest {
             name: "x".into(),
-            file: "tests/integration.rs".into(),
+            file: "tests/daemon.rs".into(),
             body: String::new(),
         };
         // Substitutions arrive shell-quoted — the template must not
         // pre-quote.
         assert_eq!(
             test_command("cargo test --test {target} {test}", &nt),
-            "cargo test --test 'integration' 'x'"
+            "cargo test --test 'daemon' 'x'"
         );
     }
 
@@ -3405,7 +3405,7 @@ gate_secs = 42
     fn junit_results_name_failures_and_reject_zero_tests() {
         let xml = r#"<?xml version="1.0"?>
 <testsuites tests="2" failures="1">
-  <testsuite name="cadence-agent::integration" tests="2" failures="1">
+  <testsuite name="cadence-agent::daemon" tests="2" failures="1">
     <testcase name="healthy_test" time="0.125"></testcase>
     <testcase name="broken_test" time="0.25"><failure type="test failure">boom</failure></testcase>
   </testsuite>
@@ -3452,7 +3452,7 @@ gate_secs = 42
 
         let step = |outcome: &'static str, result: TestRunSummary| Step {
             name: "ignored_case".into(),
-            cmd: "scripts/cadence-nextest --test integration -- ignored_case --exact".into(),
+            cmd: "scripts/cadence-nextest --test daemon -- ignored_case --exact".into(),
             duration_ms: 0,
             outcome,
             exit: Some(4),
@@ -3571,7 +3571,7 @@ gate_secs = 42
         let toml = r#"
 prepare = ["make deps"]
 gates = ["cargo fmt --check"]
-full_suite = "scripts/cadence-nextest --test integration"
+full_suite = "scripts/cadence-nextest --all-targets"
 test_globs = ["tests/**"]
 test_command = "scripts/cadence-nextest --test {target} -- {test} --exact"
 [runner]

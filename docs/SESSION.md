@@ -242,9 +242,9 @@ Lanes that held up in this repository:
 | CI and scripts | `.github/`, `scripts/`, script tests |
 
 Say in every kickoff which files the worker owns and which the other
-lanes own right now. Shared files (`src/main.rs`, the end of
-`tests/integration.rs`) survive if each lane touches only its own verbs
-and appends its own tests.
+lanes own right now. Shared files (`src/main.rs`, the shared harness in
+`tests/common/`) survive if each lane touches only its own verbs and
+appends its own tests to its own area binary under `tests/`.
 
 Two limits matter more than the issue graph:
 
@@ -416,11 +416,11 @@ per repo (a lock under `<state>/reviews/`), and the host-wide suite
 slot. `CADENCE_SUITE_LOCK` names one path per host
 (`$HOME/.local/state/cadence/suite.lock` — spell out `$HOME` in agent
 env files, where `~` is not expanded); every full
-`cargo test --test integration` — a worker's, a reviewer's, `cadence
+`cargo test --all-targets` — a worker's, a reviewer's, `cadence
 review`'s — takes that exclusive `flock` when its first test daemon
 starts and holds it until the test process exits, so
 ten-minute suites on one host take turns instead of starving each other
-into load flakes. A filtered run (`cargo test --test integration
+into load flakes. A filtered run (`cargo test --test agents_pty
 claude_`) never queues. A waiting suite prints `suite slot … busy` and
 gives up after `CADENCE_SUITE_LOCK_WAIT_SECS` (default 3600).
 `cadence review` refuses its full run while the variable is unset
@@ -454,8 +454,8 @@ or zero-test evidence is unknown/blocking rather than a pass. A change to
 that config is still human-class (risk class 7).
 
 The CI follow-up uses the same reviewed wrapper for `--all-targets` after a
-non-empty Cargo/nextest inventory comparison covering the library, binary,
-board, and integration targets. Because nextest does not execute Rust
+non-empty Cargo/nextest inventory comparison covering the library, binary
+and every `tests/` target. Because nextest does not execute Rust
 doctests, CI runs `cargo test --doc --locked` as a separate explicit step;
 doctests are not silently treated as part of the four-target parity count.
 

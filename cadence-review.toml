@@ -37,7 +37,9 @@ gates = [
 # --no-suite-lock); the suite binary sees the variable empty so it does
 # not queue behind its own parent. Worst case is two full_secs: up to
 # full_secs waiting for the slot, then up to full_secs for the run.
-full_suite = "scripts/cadence-nextest --test integration"
+# Since CAD-426 the former `integration` binary is split into per-area
+# tests/*.rs binaries, so the full suite is the --all-targets group.
+full_suite = "scripts/cadence-nextest --all-targets"
 
 # Diff paths that count as test files — `fn` items added under these
 # are the PR's new tests.

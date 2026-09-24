@@ -68,18 +68,6 @@ run_cargo_case() {
     filter=$3
     shift 3
     case "$target" in
-        integration)
-            run_case "$label" env CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" \
-                CADENCE_NEXTTEST_BIN="$NEXTEST_BIN" CADENCE_SUITE_LOCK="$SUITE_LOCK" \
-                "$ROOT/scripts/cadence-nextest" --test integration --locked \
-                -E "test(=$filter)" "$@"
-            ;;
-        board)
-            run_case "$label" env CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" \
-                CADENCE_NEXTTEST_BIN="$NEXTEST_BIN" CADENCE_SUITE_LOCK="$SUITE_LOCK" \
-                "$ROOT/scripts/cadence-nextest" --test board --locked \
-                -E "test(=$filter)" "$@"
-            ;;
         lib)
             run_case "$label" env CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" \
                 CADENCE_NEXTTEST_BIN="$NEXTEST_BIN" CADENCE_SUITE_LOCK="$SUITE_LOCK" \
@@ -87,9 +75,12 @@ run_cargo_case() {
                 -E "test(=$filter)" "$@"
             ;;
         *)
-            printf 'unknown test target %s\n' "$target" >&2
-            failed=$((failed + 1))
-            failed_labels="$failed_labels $label"
+            # CAD-426: any other value is a tests/<target>.rs binary stem —
+            # the old monolith was split into per-area binaries.
+            run_case "$label" env CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" \
+                CADENCE_NEXTTEST_BIN="$NEXTEST_BIN" CADENCE_SUITE_LOCK="$SUITE_LOCK" \
+                "$ROOT/scripts/cadence-nextest" --test "$target" --locked \
+                -E "test(=$filter)" "$@"
             ;;
     esac
 }
@@ -100,15 +91,8 @@ run_expected_missing_filter() {
     filter=$3
     log="$LOG_ROOT/$label.log"
     case "$target" in
-        integration) target_args="--test integration --locked" ;;
-        board) target_args="--test board --locked" ;;
         lib) target_args="--lib --locked" ;;
-        *)
-            harness_failed=$((harness_failed + 1))
-            failed_labels="$failed_labels $label"
-            printf '  result: FAIL (unknown target %s)\n' "$target"
-            return
-            ;;
+        *) target_args="--test $target --locked" ;;
     esac
     printf 'HARNESS %s\n' "$label"
     printf '  command: env CARGO_BUILD_JOBS=%s CADENCE_NEXTTEST_BIN=%s CADENCE_SUITE_LOCK=%s %s %s -E test(=%s)\n' \
@@ -171,25 +155,25 @@ mkdir -p "$(dirname -- "$SUITE_LOCK")"
 # The wrapper supplies --no-tests fail and a pinned binary/checksum. This
 # expected-failure probe proves a renamed or missing filter cannot silently
 # turn into a green case with zero executed tests.
-run_expected_missing_filter missing_filter_rejected integration cad225_missing_filter_probe
+run_expected_missing_filter missing_filter_rejected daemon cad225_missing_filter_probe
 
 # Goal/plan/task creation and the complete existing job state machine:
 # dispatch, durable completion, independent review, revision, verified edge
 # and the merge-evidence acceptance edge.
-run_cargo_case goal_plan_task integration issue_start_job_opens_scoped_task
-run_cargo_case job_review_revision_accept integration job_seeded_bug_loop_end_to_end
+run_cargo_case goal_plan_task tracker_issue issue_start_job_opens_scoped_task
+run_cargo_case job_review_revision_accept dispatch_jobs_monitor job_seeded_bug_loop_end_to_end
 
 # Exactly-once and restart/lost-wake protections in the current store.
-run_cargo_case duplicate_dispatch integration dispatch_dedupes_live_kickoff_and_reassign_bumps
-run_cargo_case restart_lost_wake integration restart_fences_task_kickoff_and_job_show_reports_drift
-run_cargo_case provider_approval integration approval_lifecycle
+run_cargo_case duplicate_dispatch dispatch_jobs_monitor dispatch_dedupes_live_kickoff_and_reassign_bumps
+run_cargo_case restart_lost_wake daemon restart_fences_task_kickoff_and_job_show_reports_drift
+run_cargo_case provider_approval daemon approval_lifecycle
 run_cargo_case missing_recipient_identity lib store::tests::missing_job_event_recipient_is_durable_and_not_replayed
 run_cargo_case identity_change lib store::tests::finish_refuses_re_registered_alias_with_changed_identity
 
 # Current watchdog boundary: durable observation plus explicit guarded handoff,
 # with alert deduplication and restart-safe monitor state.
-run_cargo_case monitor_restart_alert_dedupe integration monitor_persists_coverage_heartbeats_and_deduplicates_alerts
-run_cargo_case monitor_guarded_dispatch integration monitor_dispatch_requires_explicit_safe_eligibility
+run_cargo_case monitor_restart_alert_dedupe dispatch_jobs_monitor monitor_persists_coverage_heartbeats_and_deduplicates_alerts
+run_cargo_case monitor_guarded_dispatch dispatch_jobs_monitor monitor_dispatch_requires_explicit_safe_eligibility
 
 # Exact-head and author/reviewer separation. This is a store-level check so it
 # does not depend on a live provider or a GitHub identity.
