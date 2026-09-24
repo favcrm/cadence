@@ -18,10 +18,17 @@
 //! - `REPORT_SHA:<hex>` anywhere in the prompt — reply echoes the
 //!   prompt then ends with a `SHA: <hex>` trailer line, the managed-
 //!   endpoint reporting convention (`message result` is never called).
+//! - `COMPACT` — report a context compaction (`cadence/session_compacted`)
+//!   and complete with `FAKE_COMPACTED`.
 //! - anything else — `FAKE_REPLY: <prompt>`.
 //!
 //! Agent param `fake_open_fail_if: <path>` — `open` fails while that
 //! file exists (a provider/session error on resume, for tests).
+//!
+//! A continuity pack ahead of the message (CAD-324) is not part of the
+//! directive: the fake reports the pack it received verbatim as a
+//! `cadence/fake_pack` event, answers `FAKE_PACK <sha256 prefix>` on the
+//! reply's first line, and reads directives from the message after it.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -29,6 +36,7 @@ use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use super::{AdapterHooks, Identity, ProviderAdapter, ProviderRequest, TurnResult};
 use crate::error::{Error, Result};
@@ -97,6 +105,29 @@ impl ProviderAdapter for FakeAdapter {
     ) -> Result<TurnResult> {
         let turn_id = self.turn_id();
         on_started(&turn_id);
+        let (pack, prompt) = crate::continuity::split(prompt);
+        let pack_line = pack.map(|pack| {
+            (self.hooks.on_event)("cadence/fake_pack", json!({ "pack": pack }));
+            let digest: String = Sha256::digest(pack.as_bytes())
+                .iter()
+                .take(6)
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            format!("FAKE_PACK {digest}\n")
+        });
+        if prompt == "COMPACT" {
+            (self.hooks.on_event)(
+                "cadence/session_compacted",
+                json!({"trigger": "fake", "pre_tokens": null}),
+            );
+            return Ok(TurnResult {
+                turn_id,
+                status: "completed".to_string(),
+                text: format!("{}FAKE_COMPACTED", pack_line.unwrap_or_default()),
+                stop_reason: Some("end_turn".to_string()),
+                error: None,
+            });
+        }
         if prompt == "DISCONNECT" {
             self.disconnected.store(true, Ordering::SeqCst);
             return Err(Error::unknown(
@@ -181,7 +212,7 @@ impl ProviderAdapter for FakeAdapter {
                 error: None,
             });
         }
-        let mut text = format!("FAKE_REPLY: {prompt}");
+        let mut text = format!("{}FAKE_REPLY: {prompt}", pack_line.unwrap_or_default());
         if let Some(rest) = prompt.split("REPORT_SHA:").nth(1) {
             let hex: String = rest.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
             text += &format!("\nSHA: {hex}");

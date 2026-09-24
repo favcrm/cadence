@@ -30,6 +30,7 @@ pub use threads::{
     KIND_MESSAGE, KIND_TOOL_CALL, KIND_TOOL_RESULT, KIND_TURN_RESULT, PAGE_MAX as THREAD_PAGE_MAX,
     ROLE_AGENT, ROLE_OPERATOR, ROLE_SYSTEM,
 };
+pub use threads::{COMPACTED_EVENT as THREAD_COMPACTED_EVENT, PACK_EVENT as THREAD_PACK_EVENT};
 
 /// How long a connection waits on another process's lock before
 /// SQLITE_BUSY (CAD-256). The daemon's writer and every out-of-process

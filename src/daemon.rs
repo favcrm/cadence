@@ -539,6 +539,12 @@ pub struct Shared {
     /// the first one's `submit_recovered` and refuses, never a second
     /// Enter.
     recover_lock: Mutex<()>,
+    /// CAD-324: agents whose next delivered turn carries a continuity
+    /// pack because an actor opened a new session or reopened one whose
+    /// last turn was lost; taken by the actor at its next turn. A
+    /// compaction is not kept here but as a thread note
+    /// ([`Store::compaction_pending`]), so it survives a restart.
+    continuity_due: Mutex<HashMap<String, crate::continuity::Reason>>,
 }
 
 impl Shared {
@@ -611,6 +617,7 @@ impl Shared {
             dispatch_lock: Mutex::new(()),
             delivery_lock: Mutex::new(()),
             wake_lock: Mutex::new(()),
+            continuity_due: Mutex::new(HashMap::new()),
             auto_stop: AutoStopTimer::new(opts.auto_stop.clone(), opts.auto_stop_clock.clone()),
             idle_poll: opts.idle_poll.unwrap_or(IDLE_POLL),
             recover_lock: Mutex::new(()),
@@ -711,6 +718,26 @@ impl Shared {
         // channel (ack, tool_use, message_report) alike.
         self.bump_activity(alias);
         self.thread_on_provider_event(alias, method, &params);
+        // CAD-324: the provider compacted the session — its next turn
+        // carries a continuity pack. The due-ness is a thread note, so it
+        // survives a daemon restart; the event itself is recorded below
+        // like every `cadence/<kind>`.
+        if method == "cadence/session_compacted" {
+            if let Err(e) = self.store.thread_append(
+                alias,
+                store::NewEntry {
+                    role: store::ROLE_SYSTEM,
+                    kind: store::KIND_MESSAGE,
+                    text: "The provider compacted this session's context; the next turn \
+                           carries a continuity pack.",
+                    payload: Some(json!({"event": crate::continuity::COMPACTED_EVENT,
+                                         "trigger": params.get("trigger")})),
+                    message_id: None,
+                },
+            ) {
+                eprintln!("compaction note for '{alias}' failed: {e}");
+            }
+        }
         if method == "cadence/codex_quota" {
             let thread_id = params.get("thread_id").and_then(Value::as_str);
             if let Some(thread_id) = thread_id {
@@ -828,6 +855,118 @@ impl Shared {
     /// adapter drops the text block its `result` repeats. A lost append
     /// is logged, never fatal to the turn — the provider transcript
     /// still has it.
+    /// CAD-324: the prompt for `message` — its body, preceded by a
+    /// continuity pack when one is due for `alias` and the endpoint takes
+    /// one. Due-ness is consumed here, delivered or not: a pack goes with
+    /// the first turn of a new or lost session, and with the first turn
+    /// after a compaction. The pack is assembled by the daemon from the
+    /// store, the tracker and USER.md; the thread records that it went
+    /// (counts and digest, never the content). A pack that cannot be
+    /// built never holds the turn back: the message goes alone and the
+    /// failure is an event.
+    fn continuity_prompt(&self, alias: &str, endpoint_kind: &str, message: &Message) -> String {
+        // A new or lost session is decided at open (in memory: the next
+        // open decides again); a compaction is a thread note, pending
+        // until a pack note follows it.
+        let due = self
+            .continuity_due
+            .lock()
+            .unwrap()
+            .remove(alias)
+            .or_else(|| {
+                self.store
+                    .compaction_pending(alias)
+                    .unwrap_or(false)
+                    .then_some(crate::continuity::Reason::Compacted)
+            });
+        let Some(reason) = due else {
+            return message.body.clone();
+        };
+        if !crate::continuity::endpoint_takes_packs(endpoint_kind) {
+            return message.body.clone();
+        }
+        let pm_dir = self.pm_dir().ok().filter(|d| d.is_dir());
+        let built =
+            crate::continuity::assemble(&self.store, pm_dir.as_deref(), alias, reason, &message.id);
+        let pack = match built {
+            Ok(Some(pack)) => pack,
+            Ok(None) => {
+                // Nothing to carry. A pending compaction is settled so
+                // later turns do not rebuild it.
+                if reason == crate::continuity::Reason::Compacted {
+                    self.continuity_settle(alias, reason, &message.id, "skipped", None);
+                }
+                return message.body.clone();
+            }
+            Err(e) => {
+                // One failure per trigger: the note settles it, so a
+                // pack that cannot be built is not rebuilt (and its
+                // failure not re-reported) on every later turn.
+                let error = e.to_string();
+                let _ = self.store.event_public(
+                    alias,
+                    "continuity_pack_failed",
+                    json!({"reason": reason.as_str(), "message": message.id,
+                           "error": error}),
+                );
+                self.continuity_settle(alias, reason, &message.id, "failed", Some(&error));
+                return message.body.clone();
+            }
+        };
+        let payload = pack.payload(&message.id);
+        if let Err(e) = self.store.thread_append(
+            alias,
+            store::NewEntry {
+                role: store::ROLE_SYSTEM,
+                kind: store::KIND_MESSAGE,
+                text: &pack.note(),
+                payload: Some(payload.clone()),
+                message_id: None,
+            },
+        ) {
+            eprintln!("continuity note for '{alias}' failed: {e}");
+        }
+        let _ = self
+            .store
+            .event_public(alias, crate::continuity::PACK_EVENT, payload);
+        self.wake();
+        pack.wrap(&message.body)
+    }
+
+    /// CAD-324: record in the thread that a due pack was not delivered
+    /// (`outcome`: `skipped` — nothing to carry — or `failed`). The note
+    /// is a pack note, so it settles a pending compaction.
+    fn continuity_settle(
+        &self,
+        alias: &str,
+        reason: crate::continuity::Reason,
+        message: &str,
+        outcome: &str,
+        error: Option<&str>,
+    ) {
+        let text = match error {
+            Some(e) => format!("Continuity pack not delivered ({}): {e}", reason.as_str()),
+            None => format!(
+                "Continuity pack not delivered ({}): nothing to carry.",
+                reason.as_str()
+            ),
+        };
+        if let Err(e) = self.store.thread_append(
+            alias,
+            store::NewEntry {
+                role: store::ROLE_SYSTEM,
+                kind: store::KIND_MESSAGE,
+                text: &text,
+                payload: Some(json!({"event": crate::continuity::PACK_EVENT,
+                                     "reason": reason.as_str(), "message": message,
+                                     "outcome": outcome, "error": error})),
+                message_id: None,
+            },
+        ) {
+            eprintln!("continuity note for '{alias}' failed: {e}");
+        }
+    }
+
     fn thread_on_provider_event(&self, alias: &str, method: &str, params: &Value) {
         let (kind, text, payload) = match method {
             "item/completed" => {
@@ -1253,7 +1392,24 @@ impl Shared {
             )?,
             None => {
                 self.store
-                    .set_identity_with_quota(alias, &identity, adapter.quota_snapshot())?
+                    .set_identity_with_quota(alias, &identity, adapter.quota_snapshot())?;
+                // CAD-324: a session the provider did not carry over — a
+                // new one, or a reopen whose last turn was lost — starts
+                // its next turn with a continuity pack. An adopted
+                // endpoint is the same live session: nothing is due.
+                let reason = if agent.thread_id.as_deref() != Some(identity.thread_id.as_str()) {
+                    Some(crate::continuity::Reason::New)
+                } else if self.store.last_turn_lost(alias)? {
+                    Some(crate::continuity::Reason::Lost)
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    self.continuity_due
+                        .lock()
+                        .unwrap()
+                        .insert(alias.to_string(), reason);
+                }
             }
         }
         // CAD-230: a managed provider's process is enrolled for build
@@ -1427,8 +1583,14 @@ impl Shared {
                     // while a turn runs. Clear on return, including errors,
                     // so a later user message cannot inherit the flag.
                     let nudge = message.is_nudge();
+                    // CAD-324: a nudge owns no turn and carries no pack.
+                    let prompt = if nudge {
+                        message.body.clone()
+                    } else {
+                        self.continuity_prompt(alias, &agent.endpoint_kind, &message)
+                    };
                     adapter.set_unclaimed_ok(message.is_routed() || nudge);
-                    let outcome = adapter.run_turn(&message.body, &message.id, &move |turn| {
+                    let outcome = adapter.run_turn(&prompt, &message.id, &move |turn| {
                         // CAD-250: a nudge owns no turn — it never becomes
                         // `running`, and its paste is not the held turn's
                         // proof of life.
@@ -10167,6 +10329,176 @@ mod pty_retry_tests {
 mod tests {
     use super::*;
     use crate::store::NewAgent;
+
+    /// CAD-324: a pending compaction whose pack cannot be sent is
+    /// settled once in the thread — never rebuilt on every later turn.
+    #[test]
+    fn an_undeliverable_compaction_pack_is_settled_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = ServeOptions::default();
+        let no_pm = dir.path().join("no-pm");
+        opts.provider_env
+            .set("CADENCE_PM_DIR", no_pm.to_str().unwrap());
+        let shared = Shared::new(dir.path(), &opts).unwrap();
+        let cwd = dir.path().to_str().unwrap().to_string();
+        shared
+            .store
+            .register_agent(&NewAgent {
+                alias: "lead",
+                provider: "fake",
+                endpoint_kind: "fake",
+                role: "worker",
+                cwd: &cwd,
+                sandbox: "read-only",
+                instructions: None,
+                params: None,
+                team_role: None,
+                model_policy: None,
+            })
+            .unwrap();
+        shared.store.ensure_thread("lead").unwrap();
+        // Only the compaction note: nothing for a pack to carry.
+        shared
+            .store
+            .thread_append(
+                "lead",
+                store::NewEntry {
+                    role: store::ROLE_SYSTEM,
+                    kind: store::KIND_MESSAGE,
+                    text: "compacted",
+                    payload: Some(json!({"event": crate::continuity::COMPACTED_EVENT})),
+                    message_id: None,
+                },
+            )
+            .unwrap();
+        assert!(shared.store.compaction_pending("lead").unwrap());
+        for id in ["k1", "k2"] {
+            shared
+                .store
+                .enqueue("lead", "an ask", None, id, "user")
+                .unwrap();
+            let Take::Message(m) = shared.store.take_queued("lead").unwrap() else {
+                panic!("nothing queued");
+            };
+            assert_eq!(shared.continuity_prompt("lead", "fake", &m), "an ask");
+            shared
+                .store
+                .finish(&m, "completed", &json!({"text": "ok"}), None)
+                .unwrap();
+        }
+        assert!(!shared.store.compaction_pending("lead").unwrap());
+        let settled = shared
+            .store
+            .thread_entries("lead", 0, 100)
+            .unwrap()
+            .into_iter()
+            .filter(|e| {
+                e.payload.as_ref().and_then(|p| p.get("outcome")) == Some(&json!("skipped"))
+            })
+            .count();
+        assert_eq!(settled, 1, "settled once, not per turn");
+    }
+
+    /// CAD-324: a terminal pane (the pack would be a paste) and a cloud
+    /// session never get a continuity pack — not with a thread, an
+    /// earlier turn to carry, a new session due and a compaction
+    /// pending. A structured endpoint in the same position does.
+    #[test]
+    fn continuity_packs_skip_pty_and_cloud_endpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = ServeOptions::default();
+        // A tracker path that does not exist: never the host's ~/pm.
+        let no_pm = dir.path().join("no-pm");
+        opts.provider_env
+            .set("CADENCE_PM_DIR", no_pm.to_str().unwrap());
+        let shared = Shared::new(dir.path(), &opts).unwrap();
+        let cwd = dir.path().to_str().unwrap().to_string();
+        for (alias, provider, kind, packs) in [
+            ("p-claude", "claude", "pty", false),
+            ("p-devin", "devin", "pty", false),
+            ("p-cursor", "cursor", "pty", false),
+            ("c-devin", "devin", "cloud", false),
+            ("m-claude", "claude", "managed", true),
+            ("w-codex", "codex", "managed-ws", true),
+        ] {
+            shared
+                .store
+                .register_agent(&NewAgent {
+                    alias,
+                    provider,
+                    endpoint_kind: kind,
+                    role: "worker",
+                    cwd: &cwd,
+                    sandbox: "read-only",
+                    instructions: None,
+                    params: None,
+                    team_role: None,
+                    model_policy: None,
+                })
+                .unwrap();
+            shared.store.ensure_thread(alias).unwrap();
+            shared
+                .store
+                .enqueue(alias, "an earlier ask", None, &format!("{alias}-0"), "user")
+                .unwrap();
+            let Take::Message(first) = shared.store.take_queued(alias).unwrap() else {
+                panic!("nothing queued for {alias}");
+            };
+            shared
+                .store
+                .finish(
+                    &first,
+                    "completed",
+                    &json!({"text": "an earlier answer"}),
+                    None,
+                )
+                .unwrap();
+            shared
+                .continuity_due
+                .lock()
+                .unwrap()
+                .insert(alias.to_string(), crate::continuity::Reason::New);
+            shared
+                .store
+                .thread_append(
+                    alias,
+                    store::NewEntry {
+                        role: store::ROLE_SYSTEM,
+                        kind: store::KIND_MESSAGE,
+                        text: "compacted",
+                        payload: Some(json!({"event": crate::continuity::COMPACTED_EVENT})),
+                        message_id: None,
+                    },
+                )
+                .unwrap();
+            shared
+                .store
+                .enqueue(alias, "the ask", None, &format!("{alias}-1"), "user")
+                .unwrap();
+            let Take::Message(message) = shared.store.take_queued(alias).unwrap() else {
+                panic!("nothing queued for {alias}");
+            };
+            let prompt = shared.continuity_prompt(alias, kind, &message);
+            let delivered = shared
+                .store
+                .events_tail(alias, 50)
+                .unwrap()
+                .iter()
+                .any(|e| e.kind == crate::continuity::PACK_EVENT);
+            if packs {
+                assert!(
+                    prompt.starts_with(crate::continuity::PACK_BEGIN),
+                    "{alias}: {prompt}"
+                );
+                assert!(prompt.ends_with("the ask"), "{alias}");
+                assert!(prompt.contains("an earlier answer"), "{alias}");
+                assert!(delivered, "{alias}");
+            } else {
+                assert_eq!(prompt, "the ask", "{alias}");
+                assert!(!delivered, "{alias}");
+            }
+        }
+    }
 
     /// CAD-407: `serve` — so `daemon start`, `run` and `restart` — refuses
     /// while an interrupted restore's aside files exist, before the
