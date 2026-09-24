@@ -83,23 +83,13 @@ impl Origin {
 
 // ---------- credentials ----------
 
-/// 32 bytes from the kernel's CSPRNG (`getrandom(2)`), as hex.
+/// 32 bytes from the kernel's CSPRNG, as hex — `getrandom(2)` on
+/// Linux, `getentropy(3)` on macOS/*BSD, chosen per target by the
+/// `getrandom` crate. `fill` either fills the whole buffer or errors;
+/// a credential never ships partially random.
 pub fn random_credential() -> Result<String> {
     let mut buf = [0u8; 32];
-    let mut filled = 0;
-    while filled < buf.len() {
-        // SAFETY: the pointer and length name the unfilled tail of `buf`.
-        let n =
-            unsafe { libc::getrandom(buf[filled..].as_mut_ptr().cast(), buf.len() - filled, 0) };
-        if n < 0 {
-            let e = std::io::Error::last_os_error();
-            if e.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(Error::internal(format!("getrandom: {e}")));
-        }
-        filled += n as usize;
-    }
+    getrandom::fill(&mut buf).map_err(|e| Error::internal(format!("getrandom: {e}")))?;
     Ok(hex(&buf))
 }
 

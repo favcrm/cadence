@@ -118,6 +118,7 @@ version = "0.1.0"
 dependencies = [
  "aho-corasick",
  "clap",
+ "getrandom 0.3.4",
  "libc",
  "qrcode",
  "regex",

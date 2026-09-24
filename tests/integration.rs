@@ -41168,7 +41168,8 @@ fn cad319_thread_post_is_refused_for_an_agent_caller() {
     assert_eq!(r["rc"], 0, "{r}");
     let out = r["out"].as_str().unwrap();
     assert!(out.contains(" 403 "), "{out}");
-    assert!(out.contains("caller_agent"), "{out}");
+    assert!(out.contains("operator_only"), "{out}");
+    assert!(out.contains("'wk'"), "{out}");
 
     let frame = wk.rpc(
         "self",
@@ -42497,15 +42498,17 @@ fn cad447_an_answer_reaches_the_worker_who_asked() {
     assert_eq!(again["route"]["message"], mid.as_str(), "{again}");
     assert_eq!(cad447_answers(&f, "wk").len(), 1);
 
-    // The board's answer.
+    // The board's answer — a write, so it carries the operator's
+    // session (CAD-313): cookie and the page's X-Cadence-Session key.
     let q2 = cad447_ask(&f, &id, "wk", 2);
     let port = start_board(&f.pm_dir, &f.d.state);
+    let op = sign_in(&f.d.state, port);
     let (status, reply) = board_http(
         port,
         &cad328_post(
             port,
             &format!("/api/issues/{id}/answers"),
-            THREAD_GUARDS,
+            &op_guards(&op),
             &format!(r#"{{"question":"{q2}","text":"daily, from the board"}}"#),
         ),
     );
