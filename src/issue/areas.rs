@@ -34,11 +34,16 @@
 //!
 //! A lane's `side.pm`, probed worktree and branch come from the
 //! daemon's dispatch record (`dispatches.json`, written only by the
-//! `dispatch_record` RPC whose `pm` is the connection-derived caller)
-//! — never `claim.by`, `Actor:` trailers or planted comments, all of
-//! which an agent can write. A lane with no record is *unbound*: its
-//! `pm` is nothing, its `head` pins nothing, and its area rows are
-//! never suppressed — the fail-loud direction. The epic side
+//! `dispatch_record` RPC and `master_dispatch`) — never `claim.by`,
+//! `Actor:` trailers or planted comments, all of which an agent can
+//! write. The record names the kickoff message the daemon delivered;
+//! its `pm` is the sender the daemon attributed at send time (the job's
+//! PM for a task dispatch), its worktree and branch come from the task
+//! row or the kickoff body — never the request. Only the dispatch's own
+//! PM may record it, and only that PM (or the operator) may replace an
+//! existing record. A lane with no record is *unbound*: its `pm` is
+//! nothing, its `head` pins nothing, and its area rows are never
+//! suppressed — the fail-loud direction. The epic side
 //! (`parent`, `plan_epic`) is still frontmatter and remains advisory:
 //! a lane that claims membership of the owning epic is the same class
 //! of self-assertion this feature tolerates. Everything here warns;
@@ -952,9 +957,33 @@ pub fn dispatches(state_dir: &Path) -> Map<String, Value> {
 static DISPATCH_WRITER: Mutex<()> = Mutex::new(());
 
 /// Record one dispatch (tmp + rename, writers serialized in-process).
-pub fn record_dispatch(state_dir: &Path, issue: &str, record: Value) -> Result<()> {
+///
+/// One record per issue — a re-dispatch replaces it, but only under the
+/// same PM or with `replace_other_pm`: a record another PM's dispatch
+/// wrote is that PM's binding, and overwriting it is refused. The
+/// `dispatch_record` RPC passes `replace_other_pm` for the proven
+/// operator only; the daemon's own `master_dispatch` always may (its
+/// record is the daemon's own dispatch). Everything else — any agent —
+/// may only replace what it dispatched itself.
+pub fn record_dispatch(
+    state_dir: &Path,
+    issue: &str,
+    record: Value,
+    replace_other_pm: bool,
+) -> Result<()> {
     let _guard = DISPATCH_WRITER.lock().unwrap_or_else(|e| e.into_inner());
     let mut all = dispatches(state_dir);
+    if let Some(old) = all.get(issue) {
+        let old_pm = old["pm"].as_str().unwrap_or_default();
+        let new_pm = record["pm"].as_str().unwrap_or_default();
+        if old_pm != new_pm && !replace_other_pm {
+            return Err(Error::rejected(format!(
+                "dispatch record: {issue}'s record was written by '{old_pm}' — \
+                 only that PM or the operator may replace it; a re-dispatch by \
+                 '{new_pm}' cannot overwrite it"
+            )));
+        }
+    }
     all.insert(issue.to_string(), record);
     let path = dispatches_path(state_dir);
     let tmp = path.with_extension("json.tmp");
@@ -1642,6 +1671,7 @@ mod tests {
             &state,
             "D-1",
             json!({"pm": "pm-a", "worktree": wt, "branch": "lane", "message": "m-1"}),
+            false,
         )
         .unwrap();
         let issues = [issue_at(&dir, "demo", "D-1")];
@@ -1662,6 +1692,7 @@ mod tests {
             &state,
             "D-1",
             json!({"pm": "pm-a", "worktree": wt, "branch": "--upload-pack=touch /tmp/x"}),
+            false,
         )
         .unwrap();
         let lanes = open_lanes(&state, &refs, &BTreeMap::new());
@@ -1750,6 +1781,7 @@ mod tests {
             &state,
             "D-1",
             json!({"pm": "pm-a", "worktree": dir, "branch": "main"}),
+            false,
         )
         .unwrap();
         let issues = [issue_at(&dir, "demo", "D-1")];
@@ -1766,6 +1798,32 @@ mod tests {
         assert_eq!(lanes[0].side.pm, None);
         assert_eq!(lanes[0].head, None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A dispatch record one PM wrote is that PM's binding: the same
+    /// PM may re-record (a re-dispatch), another PM is refused, and
+    /// only `replace_other_pm` — the operator or the daemon's own
+    /// dispatch — crosses it. The refused write leaves the file
+    /// untouched.
+    #[test]
+    fn dispatch_record_overwrite_needs_same_pm_or_operator() {
+        let state = tmpdir("records").join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let rec = |pm: &str, wt: &str| json!({"pm": pm, "worktree": wt, "branch": "b"});
+        record_dispatch(&state, "D-1", rec("pm-a", "/lane/a"), false).unwrap();
+        // Same PM re-records its own dispatch — allowed without the flag.
+        record_dispatch(&state, "D-1", rec("pm-a", "/lane/a2"), false).unwrap();
+        assert_eq!(dispatches(&state)["D-1"]["worktree"], "/lane/a2");
+        // A different PM cannot overwrite it.
+        let err = record_dispatch(&state, "D-1", rec("pm-b", "/decoy"), false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pm-a"), "{err}");
+        assert_eq!(dispatches(&state)["D-1"]["worktree"], "/lane/a2");
+        // With the operator/daemon flag the replacement goes through.
+        record_dispatch(&state, "D-1", rec("pm-b", "/lane/b"), true).unwrap();
+        assert_eq!(dispatches(&state)["D-1"]["pm"], "pm-b");
+        let _ = std::fs::remove_dir_all(state.parent().unwrap());
     }
 
     /// A throwaway git repo under TMPDIR — commits carry the fixture

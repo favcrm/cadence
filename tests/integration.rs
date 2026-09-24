@@ -51300,6 +51300,7 @@ impl PlanFixture {
                 "branch": out["branch"],
                 "message": "fixture-kickoff",
             }),
+            false,
         )
         .unwrap();
         out
@@ -51866,6 +51867,7 @@ fn cad378_bound_lane_unreadable_recorded_dir_raises() {
         &f.d.state,
         "D-1",
         json!({"pm": "pm-other", "worktree": "/nonexistent/wt", "branch": "cadence/d-1"}),
+        false,
     )
     .unwrap();
     let rows = f.cad378_ack_rows();
@@ -51880,53 +51882,299 @@ fn cad378_bound_lane_unreadable_recorded_dir_raises() {
     );
 }
 
-/// `dispatch_record` takes its pm from the connection — a `pm` param
-/// is ignored, identity-shaped fields are refused, and a bogus
-/// worktree or branch is rejected before anything is written.
+/// `dispatch_record` derives everything from the named kickoff — the
+/// pm is the send's recorded sender, the worktree and branch come from
+/// the kickoff body, corroborated by the issue's own open refs. A
+/// message the daemon never delivered, a non-kickoff, a kickoff for
+/// another issue, one the issue does not bind (`message` ref), and one
+/// whose worktree/branch is not an open lane ref are all refused — and
+/// caller-supplied `pm`/`worktree`/`branch` params steer nothing.
 #[test]
-fn cad378_dispatch_record_binds_the_connection() {
+fn cad378_dispatch_record_binds_the_kickoff_not_the_request() {
     let f = PlanFixture::start();
     let (ok, out) = f.cli(&["issue", "new", "Work", "--project", "demo"]);
     assert!(ok, "{out}");
-    let (ok, start) = f.cli(&["issue", "start", "D-1", "--by", "pm-other"]);
+    let (ok, start) = f.cli(&["issue", "start", "D-1", "--by", "pm-own"]);
     assert!(ok, "{start}");
     let wt = start["worktree"].as_str().unwrap().to_string();
     let branch = start["branch"].as_str().unwrap().to_string();
-    // A `pm` param is not how the pm binds — the connection's identity
-    // (the operator here) is what the record keeps.
+    // A worker with a thread, so the kickoff's sender is recorded on it.
+    f.d.operator_rpc(
+        "agent_register",
+        json!({"alias": "w-1", "provider": "inbox", "endpoint_kind": "inbox",
+               "cwd": f.d.dir.path().to_str().unwrap()}),
+    )
+    .unwrap();
+    f.d.operator_rpc(
+        "thread_send",
+        json!({"alias": "w-1", "text": "ready", "message": "t0"}),
+    )
+    .unwrap();
+    let kick = |wt: &str, branch: &str, issue: &str| {
+        format!(
+            "read /n — {issue}: Work. Your worktree exists: {wt} (branch \
+             {branch}, base deadbee). Commit trailer: Issue: {issue}. PR \
+             to main; reply to pm-own."
+        )
+    };
+    // The operator sends the real kickoff and binds it on the issue —
+    // exactly the order dispatch::run uses (ref lands before the send).
+    let (ok, out) = f.cli(&["issue", "ref", "D-1", "message", "m-real"]);
+    assert!(ok, "{out}");
+    f.d.operator_rpc(
+        "agent_send",
+        json!({"alias": "w-1", "text": kick(&wt, &branch, "D-1"),
+               "message": "m-real"}),
+    )
+    .unwrap();
+    // Params that would steer the old record — pm, worktree, branch —
+    // are ignored now: the record binds the kickoff and its sender.
     let r =
         f.d.operator_rpc(
             "dispatch_record",
-            json!({"issue": "D-1", "worktree": wt, "branch": branch, "pm": "pm-own"}),
+            json!({"issue": "D-1", "message": "m-real", "pm": "pm-evil",
+                   "worktree": "/tmp/decoy", "branch": "main"}),
         )
         .unwrap();
     assert_eq!(r["pm"], "operator", "{r}");
+    assert_eq!(r["worktree"], json!(wt), "{r}");
+    assert_eq!(r["branch"], json!(branch), "{r}");
+    assert_eq!(r["worker"], "w-1", "{r}");
+    // Identity-shaped fields are refused, as before.
     for (field, val) in [("by", "pm-own"), ("actor", "pm-own"), ("owner", "pm-own")] {
         let err =
             f.d.operator_rpc(
                 "dispatch_record",
-                json!({"issue": "D-1", "worktree": &wt, "branch": &branch, field: val}),
+                json!({"issue": "D-1", "message": "m-real", field: val}),
             )
             .unwrap_err()
             .to_string();
         assert!(err.contains("connection-bound"), "{field}: {err}");
     }
-    // A worktree that is not absolute and a branch git would read as
-    // an option are refused; an unknown issue is refused too.
-    for params in [
-        json!({"issue": "D-1", "worktree": "rel/path", "branch": "b"}),
-        json!({"issue": "D-1", "worktree": &wt, "branch": "-rf"}),
-        json!({"issue": "D-9", "worktree": &wt, "branch": "b"}),
+    // Every dishonest message is refused.
+    f.d.operator_rpc(
+        "agent_send",
+        json!({"alias": "w-1", "text": "just mail", "message": "m-mail"}),
+    )
+    .unwrap();
+    // A kickoff-shaped send naming another issue.
+    f.d.operator_rpc(
+        "agent_send",
+        json!({"alias": "w-1", "text": kick(&wt, &branch, "D-2"),
+               "message": "m-d2"}),
+    )
+    .unwrap();
+    // One naming a worktree the issue does not record open — bound on
+    // the issue too, so the lane-ref check is what refuses it.
+    let (ok, out) = f.cli(&["issue", "ref", "D-1", "message", "m-decoy"]);
+    assert!(ok, "{out}");
+    f.d.operator_rpc(
+        "agent_send",
+        json!({"alias": "w-1", "text": kick("/tmp/decoy-wt", &branch, "D-1"),
+               "message": "m-decoy"}),
+    )
+    .unwrap();
+    // A kickoff-shaped send the issue does not bind (no `message` ref).
+    let (ok, out) = f.cli(&["issue", "new", "Other", "--project", "demo"]);
+    assert!(ok, "{out}");
+    let (ok, s3) = f.cli(&["issue", "start", "D-2", "--by", "pm-own"]);
+    assert!(ok, "{s3}");
+    f.d.operator_rpc(
+        "agent_send",
+        json!({"alias": "w-1",
+               "text": kick(s3["worktree"].as_str().unwrap(),
+                            s3["branch"].as_str().unwrap(), "D-2"),
+               "message": "m-unbound"}),
+    )
+    .unwrap();
+    for (params, why) in [
+        (json!({"issue": "D-1"}), "no message named"),
+        (
+            json!({"issue": "D-1", "message": "m-ghost"}),
+            "no such message",
+        ),
+        (
+            json!({"issue": "D-1", "message": "m-mail"}),
+            "not a kickoff",
+        ),
+        (
+            json!({"issue": "D-1", "message": "m-d2"}),
+            "kickoff for another issue",
+        ),
+        (
+            json!({"issue": "D-1", "message": "m-decoy"}),
+            "worktree not an open lane",
+        ),
+        (
+            json!({"issue": "D-2", "message": "m-unbound"}),
+            "issue does not bind it",
+        ),
+        (
+            json!({"issue": "D-9", "message": "m-real"}),
+            "unknown issue",
+        ),
     ] {
-        assert!(
-            f.d.operator_rpc("dispatch_record", params).is_err(),
-            "refused params were recorded"
-        );
+        let err =
+            f.d.operator_rpc("dispatch_record", params)
+                .unwrap_err()
+                .to_string();
+        assert!(!err.is_empty(), "{why} recorded: {err}");
     }
-    // The operator's earlier record still stands — bind it to a real
-    // pm via the record file the RPC wrote, and the lane binds.
+    // The one honest record still stands — nothing refused overwrote it.
+    let recs = cadence_agent::issue::areas::dispatches(&f.d.state);
+    assert_eq!(recs["D-1"]["pm"], "operator", "{recs:?}");
+    assert_eq!(recs["D-1"]["worktree"], json!(wt), "{recs:?}");
+    assert!(recs.get("D-2").is_none(), "{recs:?}");
     let (_, view) = f.cli(&["overview", "--json"]);
     let lanes = view["projects"][0]["lanes"].clone();
     assert_eq!(lanes[0]["pm"], "operator", "{lanes}");
     assert_eq!(lanes[0]["bound"], true, "{lanes}");
+}
+
+/// The R3 finding: `dispatch_record` accepted any proven agent for any
+/// issue with any worktree+branch and silently overwrote the real
+/// record — `w-evil` re-recorded D-1 onto a clean decoy and the owner's
+/// Needs-you row dropped. Now only the kickoff's own sender (or the
+/// operator) may write a record, and only the same PM (or the operator)
+/// may replace one: `w-evil` is refused whether it names the real
+/// kickoff or a fake it sent itself, and the record never moves.
+#[test]
+fn cad378_dispatch_record_other_agents_cannot_overwrite() {
+    let f = PlanFixture::start();
+    let home = TempDir::new().unwrap();
+    let mut pm = LaneShell::spawn(home.path());
+    let mut evil = LaneShell::spawn(home.path());
+    plant_member_pane(&f.d, "pm-own", "inbox", None, pm.pid());
+    plant_member_pane(&f.d, "w-evil", "inbox", None, evil.pid());
+    f.d.operator_rpc(
+        "agent_register",
+        json!({"alias": "w-1", "provider": "inbox", "endpoint_kind": "inbox",
+               "cwd": f.d.dir.path().to_str().unwrap(),
+               "params": json!({"upstream": "pm-own"}).to_string()}),
+    )
+    .unwrap();
+    f.d.operator_rpc(
+        "thread_send",
+        json!({"alias": "w-1", "text": "ready", "message": "t0"}),
+    )
+    .unwrap();
+    let (ok, out) = f.cli(&["issue", "new", "Work", "--project", "demo"]);
+    assert!(ok, "{out}");
+    let (ok, start) = f.cli(&["issue", "start", "D-1", "--by", "pm-own"]);
+    assert!(ok, "{start}");
+    let wt = start["worktree"].as_str().unwrap().to_string();
+    let branch = start["branch"].as_str().unwrap().to_string();
+    let kick = |wt: &str, branch: &str, reply: &str| {
+        format!(
+            "read /n — D-1: Work. Your worktree exists: {wt} (branch \
+             {branch}, base deadbee). Commit trailer: Issue: D-1. PR to \
+             main; reply to {reply}."
+        )
+    };
+    // pm-own sends the real kickoff and records the dispatch — the
+    // `message` ref lands first, as dispatch::run orders it.
+    let (ok, out) = f.cli(&["issue", "ref", "D-1", "message", "m-real"]);
+    assert!(ok, "{out}");
+    let r = pm.rpc(
+        &f.d.state,
+        "agent_send",
+        json!({"alias": "w-1", "text": kick(&wt, &branch, "pm-own"),
+               "reply_to": "pm-own", "message": "m-real"}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+    let r = pm.rpc(
+        &f.d.state,
+        "dispatch_record",
+        json!({"issue": "D-1", "message": "m-real"}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(r["result"]["pm"], "pm-own", "{r}");
+
+    // w-evil — not the dispatcher — tries exactly what the review did:
+    // re-record D-1 onto a clean decoy lane, naming the real kickoff.
+    let r = evil.rpc(
+        &f.d.state,
+        "dispatch_record",
+        json!({"issue": "D-1", "message": "m-real"}),
+    );
+    let e = frame_err(&r);
+    assert!(e.contains("was sent by 'pm-own'"), "{r}");
+
+    // Then with a decoy kickoff it sent itself: a worktree ref planted
+    // on the issue and a kickoff-shaped send naming it (the lane's own
+    // branch, so every corroboration passes). The record's pm would
+    // honestly be w-evil — and a different pm still cannot overwrite
+    // pm-own's record.
+    let decoy = f.tmp.path().join("decoy-wt");
+    let decoy_s = decoy.display().to_string();
+    let mut front = f.front("D-1");
+    front.refs.push(cadence_agent::issue::model::Ref {
+        kind: "worktree".to_string(),
+        url: None,
+        path: Some(decoy_s.clone()),
+        label: None,
+        closed: None,
+        worktree: None,
+        cargo_target: None,
+        agent: None,
+    });
+    front.refs.push(cadence_agent::issue::model::Ref {
+        kind: "message".to_string(),
+        url: None,
+        path: Some("m-evil".to_string()),
+        label: None,
+        closed: None,
+        worktree: None,
+        cargo_target: None,
+        agent: None,
+    });
+    f.write_front("D-1", &front);
+    let r = evil.rpc(
+        &f.d.state,
+        "agent_send",
+        json!({"alias": "w-1", "text": kick(&decoy_s, &branch, "w-evil"),
+               "reply_to": "w-evil", "message": "m-evil"}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+    let r = evil.rpc(
+        &f.d.state,
+        "dispatch_record",
+        json!({"issue": "D-1", "message": "m-evil"}),
+    );
+    let e = frame_err(&r);
+    assert!(e.contains("pm-own"), "{r}");
+    // The real record never moved — pm, worktree, branch all intact.
+    let recs = cadence_agent::issue::areas::dispatches(&f.d.state);
+    assert_eq!(recs["D-1"]["pm"], "pm-own", "{recs:?}");
+    assert_eq!(recs["D-1"]["worktree"], json!(wt), "{recs:?}");
+    assert_eq!(recs["D-1"]["branch"], json!(branch), "{recs:?}");
+
+    // On an unbound lane the same self-sent fake cannot even be
+    // written: the issue binds no `message` ref for it, so it is mail,
+    // not a dispatch — fail loud, no record.
+    let (ok, out) = f.cli(&["issue", "new", "Unbound", "--project", "demo"]);
+    assert!(ok, "{out}");
+    let (ok, s2) = f.cli(&["issue", "start", "D-2", "--by", "pm-own"]);
+    assert!(ok, "{s2}");
+    let r = evil.rpc(
+        &f.d.state,
+        "agent_send",
+        json!({"alias": "w-1",
+               "text": format!("read /n — D-2: Unbound. Your worktree exists: {} \
+                                (branch {}, base deadbee). Commit trailer: \
+                                Issue: D-2. PR to main; reply to w-evil.",
+                               s2["worktree"].as_str().unwrap(),
+                               s2["branch"].as_str().unwrap()),
+               "reply_to": "w-evil", "message": "m-evil2"}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+    let r = evil.rpc(
+        &f.d.state,
+        "dispatch_record",
+        json!({"issue": "D-2", "message": "m-evil2"}),
+    );
+    let e = frame_err(&r);
+    assert!(e.contains("message"), "{r}");
+    let recs = cadence_agent::issue::areas::dispatches(&f.d.state);
+    assert!(recs.get("D-2").is_none(), "{recs:?}");
 }

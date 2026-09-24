@@ -105,45 +105,208 @@ impl Shared {
     }
 
     /// `dispatch_record` — the daemon's own record of a lane dispatch:
-    /// which worktree+branch a kickoff bound, and which PM sent it.
-    /// `pm` is the connection's identity, never a param — an agent can
-    /// only ever record a dispatch it really sent, and identity-shaped
-    /// fields are refused. The record is what binds a lane's owner
-    /// rows; tracker data (`claim.by`, frontmatter refs, commit
-    /// trailers, comments) is agent-writable and binds nothing. One
-    /// record per issue — a re-dispatch overwrites.
+    /// which worktree+branch the kickoff bound, which PM sent it, and
+    /// to which worker. `message` names the kickoff the daemon
+    /// delivered; every recorded field is derived from that message and
+    /// the daemon's own rows — the task for a `--job` kickoff, the
+    /// thread entry's connection-attributed sender plus the kickoff
+    /// body for a plain one. Request fields never steer it: the `pm` is
+    /// the send's recorded sender, and only that sender (or the
+    /// operator) may write or replace the record — a caller-supplied
+    /// worktree, branch or `pm` binds nothing and one record overwrites
+    /// another only under the same PM or the operator (CAD-378 R3).
     pub(super) fn rpc_dispatch_record(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         const VERB: &str = "dispatch_record";
         reject_identity_fields(params, VERB)?;
         let caller = self.agent_caller(peer_pid, VERB)?;
         let id = issue::model::check_id(required_str(params, "issue")?)?;
-        let worktree = required_str(params, "worktree")?;
-        let branch = required_str(params, "branch")?;
-        issue::model::check_ref_value(worktree)?;
-        issue::model::check_ref_value(branch)?;
-        let wt = std::path::Path::new(worktree);
-        if !wt.is_absolute() {
+        let mid = required_str(params, "message")?;
+        let pm = Pm::at(&self.pm_dir()?)?;
+        let (_, dir) = issue::write::issue_dir(&pm, &id)?;
+        let (front, _) = issue::write::load_front(&dir)?;
+        let msg = self.store.message(mid)?.ok_or_else(|| {
+            Error::rejected(format!(
+                "{VERB}: '{mid}' is not a message the daemon delivered — \
+                 the record names the kickoff it binds, nothing else"
+            ))
+        })?;
+        let (owner, owner_kind, worktree, branch) =
+            self.kickoff_binding(VERB, &id, &front, &msg)?;
+        // Only the kickoff's own sender may record it; the operator may
+        // always (it dispatches by hand and repairs). A different agent
+        // cannot write or overwrite this issue's binding.
+        let allowed = match &caller {
+            AgentCaller::Operator => true,
+            AgentCaller::Agent(alias) => *alias == owner,
+        };
+        if !allowed {
+            let (by, _) = caller.audit();
             return Err(Error::rejected(format!(
-                "{VERB}: worktree '{worktree}' must be an absolute path"
+                "{VERB}: the kickoff {mid} was sent by '{owner}' — only that PM \
+                 or the operator may record it; this connection is agent '{by}'"
             )));
         }
-        let pm = Pm::at(&self.pm_dir()?)?;
-        issue::write::issue_dir(&pm, &id)?;
-        let (by, by_kind) = caller.audit();
         let record = json!({
             "issue": id,
-            "pm": by,
-            "pm_kind": by_kind,
+            "pm": owner,
+            "pm_kind": owner_kind,
+            "worker": msg.alias,
             "worktree": worktree,
             "branch": branch,
-            "message": optional_str(params, "message"),
+            "message": mid,
             "at": issue::time::iso(issue::time::now_epoch()),
         });
-        areas::record_dispatch(&self.state_dir, &id, record.clone())?;
+        areas::record_dispatch(
+            &self.state_dir,
+            &id,
+            record.clone(),
+            matches!(caller, AgentCaller::Operator),
+        )?;
         let _ = self
             .store
             .event_public(DAEMON_ALIAS, "dispatch_recorded", record.clone());
         self.wake();
         Ok(record)
+    }
+
+    /// The `(pm, pm_kind, worktree, branch)` a delivered message binds
+    /// for `dispatch_record` — derived, never requested. A task-bound
+    /// message (`task_dispatch`) must BE the task's recorded dispatch
+    /// kickoff and its job must name this issue; the lane comes from
+    /// the task's row and the pm is the job's recorded PM. A plain
+    /// kickoff must carry the fixed binding line naming this issue, and
+    /// its pm is the sender the daemon attributed when it was queued
+    /// (the message's `reply_to` stands in only when the recipient
+    /// keeps no thread — an attributed sender is never taken from a
+    /// request field). Either way the bound worktree and branch must be
+    /// ones `front` records open — the lane the issue actually has, not
+    /// a dir only the kickoff text claims (a fake binding then has to
+    /// corrupt the lane's own record, never just a mailbox).
+    fn kickoff_binding(
+        &self,
+        verb: &str,
+        id: &str,
+        front: &issue::model::Front,
+        msg: &crate::store::Message,
+    ) -> Result<(String, &'static str, String, String)> {
+        let (owner, owner_kind, worktree, branch) = if let Some(task_id) = &msg.task_id {
+            let task = self.store.task(task_id)?;
+            if task.dispatch_message.as_deref() != Some(msg.id.as_str()) {
+                return Err(Error::rejected(format!(
+                    "{verb}: message {} is bound to task {task_id} but is not its \
+                     dispatch kickoff — a task note or report cannot anchor \
+                     {id}'s record",
+                    msg.id
+                )));
+            }
+            let job = self.store.job(&task.job_id)?;
+            if job.issue_id.as_deref() != Some(id) {
+                return Err(Error::rejected(format!(
+                    "{verb}: task {task_id}'s job {} is bound to issue {:?}, \
+                     not {id}",
+                    job.id, job.issue_id
+                )));
+            }
+            let repo = job.repo.as_deref().ok_or_else(|| {
+                Error::rejected(format!(
+                    "{verb}: job {} records no repo — the task's worktree \
+                     cannot be resolved",
+                    job.id
+                ))
+            })?;
+            let wt_name = task.worktree.as_deref().ok_or_else(|| {
+                Error::rejected(format!(
+                    "{verb}: task {task_id} records no worktree — the lane \
+                     it bound is unknown"
+                ))
+            })?;
+            let wt = crate::worktree::layout::worktree_dir(std::path::Path::new(repo), wt_name);
+            (
+                job.pm_alias.clone(),
+                "job",
+                wt.to_string_lossy().into_owned(),
+                task.branch.as_deref().unwrap_or("HEAD").to_string(),
+            )
+        } else {
+            // A plain kickoff: the pm is the sender the daemon
+            // attributed at send time; `reply_to` stands in only when
+            // the recipient keeps no thread entry (unthreaded workers
+            // carry none).
+            let (owner, owner_kind) = match self.store.message_sender(&msg.id)? {
+                Some((role, _)) if role == "operator" => ("operator".to_string(), "operator"),
+                Some((_, Some(from))) => (from, "agent"),
+                _ => match msg.reply_to.as_deref() {
+                    Some(reply) => (reply.to_string(), "agent"),
+                    None => {
+                        return Err(Error::rejected(format!(
+                            "{verb}: message {} carries no daemon-attributed sender \
+                             and no reply_to — it cannot anchor {id}'s record",
+                            msg.id
+                        )))
+                    }
+                },
+            };
+            let (worktree, branch) = issue::dispatch::parse_kickoff_fields(&msg.body, id)
+                .ok_or_else(|| {
+                    Error::rejected(format!(
+                        "{verb}: message {} is not {id}'s dispatch kickoff — it \
+                         carries no worktree binding naming the issue",
+                        msg.id
+                    ))
+                })?;
+            // A real dispatch binds the kickoff id on the issue BEFORE
+            // the send (`add_ref kind=message`); a message nobody bound
+            // on the issue is just mail — it cannot anchor the record.
+            let bound = front.refs.iter().any(|r| {
+                r.kind == "message"
+                    && r.closed != Some(true)
+                    && r.path.as_deref() == Some(msg.id.as_str())
+            });
+            if !bound {
+                return Err(Error::rejected(format!(
+                    "{verb}: {id} records no open `message` ref for {} — \
+                     a dispatch binds its kickoff on the issue, and only that \
+                     kickoff can anchor the record",
+                    msg.id
+                )));
+            }
+            (owner, owner_kind, worktree, branch)
+        };
+        issue::model::check_ref_value(&worktree)?;
+        issue::model::check_ref_value(&branch)?;
+        let wt = std::path::Path::new(&worktree);
+        if !wt.is_absolute() {
+            return Err(Error::rejected(format!(
+                "{verb}: the kickoff's worktree '{worktree}' is not an \
+                 absolute path"
+            )));
+        }
+        // The bound worktree+branch must be refs the issue itself
+        // records open — the lane `issue start`/`dispatch` actually
+        // made. A kickoff naming anywhere else (a clean decoy) is not
+        // this issue's dispatch.
+        let norm = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        let lanes = issue::start::open_worktrees(front);
+        if !lanes.iter().map(|p| norm(p)).any(|p| p == norm(wt)) {
+            return Err(Error::rejected(format!(
+                "{verb}: the kickoff's worktree '{worktree}' is not one of \
+                 {id}'s open lanes — the record binds the lane the issue \
+                 actually has"
+            )));
+        }
+        let branches: Vec<&str> = front
+            .refs
+            .iter()
+            .filter(|r| r.kind == "branch" && r.closed != Some(true))
+            .filter_map(|r| r.path.as_deref())
+            .collect();
+        if !branches.is_empty() && !branches.contains(&branch.as_str()) {
+            return Err(Error::rejected(format!(
+                "{verb}: the kickoff's branch '{branch}' is not one of \
+                 {id}'s open branch refs — the record binds the lane the \
+                 issue actually has"
+            )));
+        }
+        Ok((owner, owner_kind, worktree, branch))
     }
 }

@@ -290,8 +290,8 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     (
         "dispatch_record",
         Rule::Handler(
-            "rpc_dispatch_record: any proven caller; the record's pm is the \
-             connection's, never a param (CAD-378)",
+            "rpc_dispatch_record: the kickoff's recorded sender or the operator; \
+             pm binds the send's sender, never a param (CAD-378)",
         ),
     ),
     ("project_work_approvals", Rule::Read),

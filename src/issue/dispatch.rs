@@ -89,6 +89,27 @@ fn kickoff_body(
     )
 }
 
+/// The lane a plain-path kickoff body binds — `(worktree, branch)` —
+/// parsed back out of the fixed template [`kickoff_body`] writes.
+/// `dispatch_record` reads these from the delivered message instead of
+/// trusting request fields: a body counts as `issue`'s kickoff only
+/// when it names the issue in both fixed spots AND carries the
+/// worktree line — anything else is not a dispatch kickoff and cannot
+/// anchor a record (CAD-378).
+pub(crate) fn parse_kickoff_fields(body: &str, issue: &str) -> Option<(String, String)> {
+    // Anchor on the fixed trailer: the title (agent-writable) may
+    // itself contain the marker text, so the binding line is the LAST
+    // "Your worktree exists:" before ". Commit trailer: Issue: <id>."
+    let (head, _) = body.split_once(&format!("). Commit trailer: Issue: {issue}."))?;
+    if !head.contains(&format!(" — {issue}: ")) {
+        return None;
+    }
+    let rest = head.rsplit_once("Your worktree exists: ")?.1;
+    let (worktree, rest) = rest.split_once(" (branch ")?;
+    let (branch, _) = rest.split_once(", base ")?;
+    Some((worktree.to_string(), branch.to_string()))
+}
+
 /// CAD-159: an issue's acceptance items on one line; `None` when there
 /// are none. Always the whole list — CAD-160 removed the "N items, too
 /// long to inline" pointer, since criteria are never dropped.
@@ -1040,25 +1061,28 @@ pub fn run(
     }
 
     // CAD-378: the daemon records what this dispatch bound — worktree,
-    // branch and the connection-derived pm — in dispatches.json. That
-    // record, not anything the tracker carries, binds the lane's
+    // branch, worker and pm — in dispatches.json, derived from the
+    // kickoff message the daemon just delivered (never request fields).
+    // That record, not anything the tracker carries, binds the lane's
     // area-owner rows. A failure is reported, never silent: the kickoff
     // already went out, and an unbound lane's rows stay up (fail loud).
     let dispatch_record = match dispatch_pm {
         // An in-daemon dispatch writes the record itself — its pm is
         // the master's alias, not whatever a round-trip connection
-        // would derive.
+        // would derive — and it may replace any prior record (the
+        // daemon's own dispatch is the operator-grade writer).
         Some(pm_alias) => {
             let record = json!({
                 "issue": front.id,
                 "pm": pm_alias,
                 "pm_kind": "daemon",
+                "worker": args.to,
                 "worktree": started["worktree"],
                 "branch": started["branch"],
                 "message": message,
                 "at": crate::issue::time::iso(crate::issue::time::now_epoch()),
             });
-            crate::issue::areas::record_dispatch(state_dir, &front.id, record.clone())
+            crate::issue::areas::record_dispatch(state_dir, &front.id, record.clone(), true)
                 .map(|_| record)
         }
         None => client::rpc(
@@ -1066,8 +1090,6 @@ pub fn run(
             "dispatch_record",
             json!({
                 "issue": front.id,
-                "worktree": started["worktree"],
-                "branch": started["branch"],
                 "message": message,
             }),
         ),

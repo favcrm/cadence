@@ -81,11 +81,22 @@ What the probe reads — the worktree directory and the `<rev>` it diffs
 — comes from the **daemon's dispatch record**, not the live tracker.
 `dispatches.json` in the daemon's state dir holds one record per issue:
 the worktree and branch the kickoff bound, the kickoff's message id,
-and the `pm` — the connection-derived caller `dispatch_record` saw
-(an agent records only a dispatch it really sent; `master_dispatch`
-writes the record in-daemon with the master's alias). `cadence
-dispatch` writes it after the kickoff send; a record failure is
-reported on the dispatch result, never silently dropped.
+and the `pm` — the sender the daemon attributed when it delivered that
+kickoff. `dispatch_record` names the kickoff message and derives every
+recorded field from the daemon's own rows: for a `--job` dispatch the
+message must be the task's recorded kickoff and its job must name the
+issue (lane from the task row, pm from the job's PM); for a plain
+dispatch the body must carry the issue's binding line, the worktree and
+branch are parsed back out of it, and the issue must itself bind that
+message id (`message` ref) and record the lane open. Only the kickoff's
+own sender — or the operator — may write the record, and only the same
+PM (or the operator) may replace one that exists: a different agent's
+`dispatch_record` for an issue it did not dispatch is refused, so no
+agent can re-bind a lane onto a clean decoy (`master_dispatch` writes
+the record in-daemon with the master's alias). Request fields — `pm`,
+`worktree`, `branch` — steer nothing. `cadence dispatch` writes the
+record after the kickoff send; a record failure is reported on the
+dispatch result, never silently dropped.
 
 A lane with no dispatch record is **unbound**: `pm` is empty, `head`
 pins nothing, and its frontmatter worktree still feeds the advisory
@@ -143,11 +154,16 @@ aliases and planted frontmatter are all agent-writable.
 Residuals: area ownership lives in `PROJECT.md`, which agents can edit
 — deleting or renaming an area silences its rows, and a changed owner
 shows in the tracker's git history but needs no operator approval;
-advisory by design. `dispatch_record` trusts the connection, so a lane
-bound at dispatch stays bound — but a same-uid process that writes the
-state dir directly can rewrite `dispatches.json`/`area_acks.json`
-(the CAD-276 residual every state-dir record shares), which is why the
-feature warns and never refuses.
+advisory by design. `dispatch_record` binds the daemon's send record,
+so a record can never move a lane's pm or worktree onto a caller's
+claim — but a kickoff-shaped send an agent wrote itself can still
+anchor a record on an *unbound* lane when the issue's refs were
+corrupted to match (planted `message`/`worktree` refs are the same
+tracker-write class `claim.by` was); on a bound lane the different-PM
+refusal still holds. A same-uid process that writes the state dir
+directly can rewrite `dispatches.json`/`area_acks.json` (the CAD-276
+residual every state-dir record shares), which is why the feature
+warns and never refuses.
 
 ## Board
 
