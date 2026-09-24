@@ -771,6 +771,14 @@ pub fn claim(state_dir: &Path, req: &ClaimRequest<'_>) -> Result<Value> {
     if let Some(target) = req.target {
         validate_target(target)?;
     }
+    // CAD-384: an operator-shaped holder (`--as operator:<name>`, no
+    // pane alias) must BE the operator — otherwise an agent's
+    // `env -u CADENCE_ALIAS … claim --as operator:x` holds the lease and
+    // blocks the operator's own claim. Checked before any write, outside
+    // the transaction (the proof peeks the same database).
+    if req.caller.source == "as" {
+        require_operator_proof(state_dir, "rollout claim --as")?;
+    }
     let conn = connect_ensured(&db_file(state_dir))?;
     committed(immediate(&conn, |conn| claim_in(conn, req)))
 }
@@ -870,7 +878,7 @@ pub fn release_forced(
     // After the holder checks, before any write. The proof peeks the
     // database itself; doing it under the write transaction can stall
     // that peek on the same file.
-    require_operator_proof(state_dir)?;
+    require_operator_proof(state_dir, "rollout release --force")?;
     let conn = connect_ensured(&db_file(state_dir))?;
     let now = unix_now();
     committed(immediate(&conn, |conn| {
@@ -976,7 +984,7 @@ fn preview_force_refusal(
 
 /// `peer::operator_proof` for this process. Pane pids come from a
 /// read-only peek. Enrolled roots come from `slots.json`.
-fn require_operator_proof(state_dir: &Path) -> Result<()> {
+fn require_operator_proof(state_dir: &Path, verb: &str) -> Result<()> {
     let panes = registered_panes(state_dir)?;
     let roots = enrolled_roots(state_dir)?;
     let daemon_pid = daemon_pid_for_proof(state_dir)?;
@@ -989,7 +997,7 @@ fn require_operator_proof(state_dir: &Path) -> Result<()> {
     )
     .map_err(|why| {
         Error::rejected(format!(
-            "rollout release --force is an operator action — this process is not \
+            "{verb} is an operator action — this process is not \
              provably the operator: {why}; run it from a shell outside every pane \
              and managed endpoint"
         ))

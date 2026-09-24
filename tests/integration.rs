@@ -8026,7 +8026,9 @@ fn fenced_agent_resume_hint() {
 /// Spawn the real `cadence` binary under a scratch HOME (skill install
 /// targets `$HOME` directly — no daemon involved).
 fn hold_rollout_lease(home: &Path, state: &Path) {
-    let out = cadence_at(
+    // An `--as` claim must be provably the operator (CAD-384): claim from
+    // an operator shell, not as a child of the in-process daemon.
+    let out = operator_cadence_at(
         home,
         state,
         &[
@@ -44558,4 +44560,77 @@ fn cad384_operator_daemon_stop_from_a_plain_shell() {
     let (ok, out, err) = d.operator_cadence(&["daemon", "stop"]);
     assert!(ok, "operator daemon stop: {out} {err}");
     assert!(d.rpc("health", json!({})).is_err());
+}
+
+/// CAD-384 round 2 (R2-1): the sandbox exemption belongs to a SANDBOX
+/// daemon only. On a real `daemon run` outside any sandbox, a caller
+/// whose ancestor carries an alias this daemon never registered (a
+/// detached child of another daemon's agent) — no pane on its ancestry,
+/// not a daemon descendant — is still refused `agent_stop` and
+/// `shutdown`, and nothing is written. An in-process daemon cannot
+/// probe this: every child of the test process descends from it.
+#[test]
+fn cad384_no_sandbox_exemption_outside_a_sandbox() {
+    let d = TestDaemon::start_process_in(TempDir::new().unwrap());
+    d.register("w1");
+    d.wait_agent("w1", "idle", 15);
+    let ghost = |method: &str| -> Value {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            // `sh` stays the parent (no exec of the last command), so the
+            // ghost alias is on the caller's ancestry, not in its env.
+            .arg("env -u CADENCE_ALIAS python3 -c \"$1\" \"$2\" \"$3\"; rc=$?; exit $rc")
+            .arg("sh")
+            .arg(
+                "import socket,sys;s=socket.socket(socket.AF_UNIX);s.connect(sys.argv[1]);\
+                 s.sendall(sys.argv[2].encode()+b'\\n');print(s.makefile().readline())",
+            )
+            .arg(client::socket_path(&d.state))
+            .arg(cadence_agent::proto::request(method, json!({"alias": "w1"})).to_string())
+            .env("CADENCE_ALIAS", "ghost")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    for method in ["agent_stop", "shutdown"] {
+        let before = db_snapshot(&d);
+        let r = ghost(method);
+        assert_refused_clean(&d, &before, &r, &format!("ghost {method}"));
+    }
+    assert!(d.rpc("health", json!({})).is_ok(), "the daemon was stopped");
+    assert_eq!(d.wait_agent("w1", "idle", 1)["state"], "idle");
+}
+
+/// CAD-384 round 2: an operator-shaped lease holder must be the
+/// operator. An agent's pane that drops its alias and claims
+/// `--as operator:evil` is refused before any lease is written, so it
+/// cannot sit on the lease and block the operator's own claim.
+#[test]
+fn cad384_agent_cannot_claim_the_lease_as_the_operator() {
+    let d = TestDaemon::start();
+    let mut p = guard_panes(&d);
+    let (rc, out) = p.pm.run(&format!(
+        "env -u CADENCE_ALIAS {} --state-dir {} rollout claim --reason probe --as operator:evil",
+        env!("CARGO_BIN_EXE_cadence"),
+        d.state.display()
+    ));
+    assert_ne!(rc, 0, "{out}");
+    assert!(
+        out.contains("rollout claim --as is an operator action"),
+        "{out}"
+    );
+    let status = cadence_agent::rollout::status(&d.state).unwrap();
+    assert_eq!(status["held"], false, "{status}");
+    // The operator's own `--as` claim still lands.
+    let (ok, out, err) = d.operator_cadence(&[
+        "rollout",
+        "claim",
+        "--reason",
+        "probe",
+        "--as",
+        "operator:ada",
+    ]);
+    assert!(ok, "{out} {err}");
 }

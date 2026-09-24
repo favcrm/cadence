@@ -2958,7 +2958,12 @@ impl Shared {
     /// its ancestry, a descendant of this daemon (everything it
     /// launched), a pane's pty on its stdio, or a `CADENCE_ALIAS` on any
     /// hop that names an agent registered here. Anything unreadable is
-    /// tied (fail closed).
+    /// tied (fail closed): the ancestry, the pane facts, a hop's uid, and
+    /// the environment of any hop running as this daemon's uid — agents
+    /// run as that uid, and its own processes' environments are readable.
+    /// A hop of ANOTHER uid (a root `sshd`, whose environment the kernel
+    /// hides) cannot be an agent and is skipped, as `peer::operator_proof`
+    /// skips it.
     fn sandbox_outsider(&self, peer_pid: u32) -> bool {
         if !crate::rollout::sandbox_exempt(&self.state_dir) {
             return false;
@@ -2993,9 +2998,18 @@ impl Shared {
         {
             return false;
         }
-        chain.iter().all(|&hop| match proc_env_alias(hop) {
-            None => true,
-            Some(alias) => matches!(self.store.agent_opt(&alias), Ok(None)),
+        let uid = unsafe { libc::geteuid() };
+        chain.iter().all(|&hop| {
+            match crate::peer::proc_uids(hop) {
+                Ok((real, effective)) if real != uid && effective != uid => return true,
+                Ok(_) => {}
+                Err(_) => return false,
+            }
+            match proc_env_alias(hop) {
+                Err(()) => false,
+                Ok(None) => true,
+                Ok(Some(alias)) => matches!(self.store.agent_opt(&alias), Ok(None)),
+            }
         })
     }
 
@@ -8799,14 +8813,17 @@ fn reject_operator_fields(verb: &str, params: &Value) -> Result<()> {
     Ok(())
 }
 
-/// The `CADENCE_ALIAS` in `pid`'s environment, if readable and set.
-fn proc_env_alias(pid: u32) -> Option<String> {
-    let env = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
-    env.split(|b| *b == 0)
+/// The `CADENCE_ALIAS` in `pid`'s environment: `Ok(None)` when unset,
+/// `Err(())` when the environment cannot be read — the caller decides
+/// (the sandbox-outsider check fails closed on it).
+fn proc_env_alias(pid: u32) -> std::result::Result<Option<String>, ()> {
+    let env = std::fs::read(format!("/proc/{pid}/environ")).map_err(|_| ())?;
+    Ok(env
+        .split(|b| *b == 0)
         .filter_map(|kv| std::str::from_utf8(kv).ok())
         .find_map(|kv| kv.strip_prefix("CADENCE_ALIAS="))
         .filter(|a| !a.is_empty())
-        .map(str::to_string)
+        .map(str::to_string))
 }
 
 fn reject_identity_fields(params: &Value, verb: &str) -> Result<()> {

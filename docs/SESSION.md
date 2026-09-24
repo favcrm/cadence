@@ -614,7 +614,14 @@ In this order:
    restart names the refusal and records no `rollout_restart_proceeded`
    — so a pane-run rollout owner holds a grant and claims the lease
    first, even for a same-build restart. `--ui` restarts the board
-   without the pane's `CADENCE_ALIAS`: the board is the operator's. The before/after table
+   without the pane's `CADENCE_ALIAS`: the board is the operator's.
+   An operator-shaped holder (`rollout claim --as operator:<name>`)
+   must be provably the operator too, so a pane cannot hold the lease
+   under an operator name. **This gate stops mistaken and misattributed
+   stops — an agent restarting production it does not own, a detached
+   child passing for the operator. It is not a security boundary:** an
+   agent running as the same uid can write the state database or signal
+   the daemon directly (CAD-280). The before/after table
    shows each agent's state, pane pid, and `TURN` — `kept` when a
    running pty turn was re-adopted (same token, same pane, no fence),
    `fenced` when it could not be proven and went `unknown`, `-` for
