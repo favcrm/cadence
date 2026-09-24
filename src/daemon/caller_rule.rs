@@ -282,6 +282,10 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         Rule::Handler("proven_operator (CAD-339)"),
     ),
     (
+        "interrupt",
+        Rule::Handler("authorize_agent_mutation / master_dispatched (CAD-323)"),
+    ),
+    (
         "rollout_grant",
         Rule::Handler("operator_connection (CAD-384)"),
     ),
