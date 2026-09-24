@@ -8414,6 +8414,363 @@ fn agent_list_scopes_to_callers_group() {
     assert_eq!(aliases(&v), vec!["other", "pm1", "w1"], "{v}");
 }
 
+/// CAD-437: `agent list` shares the grammar — server-side any-of on
+/// state/provider/kind, AND across flags, unknown values name the
+/// valid set, and filters narrow the caller's group scope.
+#[test]
+fn agent_list_cad437_filters() {
+    let d = TestDaemon::start();
+    d.register("pm1");
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    d.rpc(
+        "agent_register",
+        json!({"alias": "w1", "provider": "fake", "endpoint_kind": "fake",
+               "cwd": cwd, "params": "{\"upstream\":\"pm1\"}"}),
+    )
+    .unwrap();
+    d.wait_agent("pm1", "idle", 10);
+    d.wait_agent("w1", "idle", 10);
+
+    // Server-side: any-of within a param, AND across params.
+    let v = d.rpc("agent_list", json!({"states": ["idle"]})).unwrap();
+    assert_eq!(v["agents"].as_array().unwrap().len(), 2);
+    let v = d
+        .rpc("agent_list", json!({"states": ["idle", "busy"]}))
+        .unwrap();
+    assert_eq!(v["agents"].as_array().unwrap().len(), 2);
+    let v = d.rpc("agent_list", json!({"states": ["busy"]})).unwrap();
+    assert_eq!(v["agents"].as_array().unwrap().len(), 0);
+    let v = d
+        .rpc(
+            "agent_list",
+            json!({"states": ["idle"], "providers": ["fake"],
+                   "kinds": ["fake"]}),
+        )
+        .unwrap();
+    assert_eq!(v["agents"].as_array().unwrap().len(), 2);
+    // AND across params: a real provider no agent uses selects none.
+    let v = d
+        .rpc(
+            "agent_list",
+            json!({"states": ["idle"], "providers": ["claude"]}),
+        )
+        .unwrap();
+    assert_eq!(v["agents"].as_array().unwrap().len(), 0);
+    // Unknown values are errors naming the valid set.
+    let err = d.rpc("agent_list", json!({"states": ["zzz"]})).unwrap_err();
+    assert!(err.to_string().contains("idle"), "{err}");
+    assert!(d.rpc("agent_list", json!({"providers": ["zzz"]})).is_err());
+    assert!(d.rpc("agent_list", json!({"kinds": ["zzz"]})).is_err());
+
+    // CLI: comma-joined and repeated flags are the same any-of; the
+    // caller's group scope still binds.
+    let bin = env!("CARGO_BIN_EXE_cadence");
+    let run = |alias: Option<&str>, extra: &[&str]| -> (bool, String, String) {
+        let mut cmd = std::process::Command::new(bin);
+        cmd.arg("--state-dir")
+            .arg(&d.state)
+            .args(["agent", "list"])
+            .args(extra)
+            .env_remove("CADENCE_ALIAS");
+        if let Some(a) = alias {
+            cmd.env("CADENCE_ALIAS", a);
+        }
+        let out = cmd.output().unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    };
+    let names = |v: &Value| -> Vec<String> {
+        let mut n: Vec<String> = v["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["alias"].as_str().unwrap().to_string())
+            .collect();
+        n.sort();
+        n
+    };
+    let (ok, out, err) = run(None, &["--state", "idle,busy", "--json"]);
+    assert!(ok, "{err}");
+    assert_eq!(names(&serde_json::from_str(&out).unwrap()), ["pm1", "w1"]);
+    let (ok, out, err) = run(None, &["--provider", "fake", "--json"]);
+    assert!(ok, "{err}");
+    assert_eq!(
+        names(&serde_json::from_str::<Value>(&out).unwrap()),
+        ["pm1", "w1"]
+    );
+    // A state nobody is in narrows a pane-scoped list to empty — it
+    // never widens it.
+    let (ok, out, err) = run(Some("w1"), &["--state", "offline", "--json"]);
+    assert!(ok, "{err}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&out).unwrap()["agents"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    // sort desc + limit + fields.
+    let (ok, out, err) = run(None, &["--sort", "-alias", "--limit", "1", "--json"]);
+    assert!(ok, "{err}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["agents"][0]["alias"], "w1");
+    let (ok, out, err) = run(None, &["--fields", "alias,state", "--json"]);
+    assert!(ok, "{err}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    let keys: Vec<&String> = v["agents"][0].as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["alias", "state"], "{v}");
+    // Unknown values fail on the CLI too. The output is JSON either
+    // way, so --fields does not need --json on this command.
+    let (ok, _, err) = run(None, &["--state", "zzz"]);
+    assert!(!ok && err.contains("idle"), "{err}");
+    let (ok, out, err) = run(None, &["--fields", "alias"]);
+    assert!(ok, "{err}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    let keys: Vec<&String> = v["agents"][0].as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["alias"], "{v}");
+    let (ok, _, err) = run(None, &["--sort", "zzz"]);
+    assert!(!ok && err.contains("--sort"), "{err}");
+}
+
+/// CAD-437: `job list` — `states` any-of beats the singular `state`,
+/// an explicit state set implies terminal rows, unknown values error.
+#[test]
+fn job_list_cad437_filters() {
+    let d = TestDaemon::start();
+    d.register("pm");
+    let (spec, sha) = d.spec_file("spec.md", "first job");
+    d.rpc(
+        "job_new",
+        json!({"pm": "pm", "job": "j1", "spec": spec, "spec_sha256": sha,
+               "issue": "CAD-26"}),
+    )
+    .unwrap();
+    let (spec2, sha2) = d.spec_file("spec2.md", "second job");
+    d.rpc(
+        "job_new",
+        json!({"pm": "pm", "job": "j2", "spec": spec2, "spec_sha256": sha2,
+               "issue": "CAD-27"}),
+    )
+    .unwrap();
+
+    let ids = |v: &Value| -> Vec<String> {
+        let mut ids: Vec<String> = v["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|j| j["id"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        ids
+    };
+    // Legacy singular and the new plural agree; any-of unions.
+    let v = d.rpc("job_list", json!({"state": "open"})).unwrap();
+    assert_eq!(ids(&v), ["j1", "j2"]);
+    let v = d
+        .rpc("job_list", json!({"states": ["open", "done"]}))
+        .unwrap();
+    assert_eq!(ids(&v), ["j1", "j2"]);
+    // An explicit state shows terminal rows the default hides — none
+    // here, so the answer is empty rather than an error.
+    let v = d.rpc("job_list", json!({"states": ["done"]})).unwrap();
+    assert_eq!(ids(&v), Vec::<String>::new());
+    let err = d.rpc("job_list", json!({"states": ["zzz"]})).unwrap_err();
+    assert!(err.to_string().contains("open"), "{err}");
+
+    // CLI: repeatable flag, comma-joined, sort/limit/fields.
+    let bin = env!("CARGO_BIN_EXE_cadence");
+    let run = |args: &[&str]| -> (bool, String, String) {
+        let out = std::process::Command::new(bin)
+            .arg("--state-dir")
+            .arg(&d.state)
+            .args(args)
+            .env_remove("CADENCE_ALIAS")
+            .output()
+            .unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    };
+    let (ok, out, err) = run(&["job", "list", "--state", "open,done", "--json"]);
+    assert!(ok, "{err}");
+    assert_eq!(ids(&serde_json::from_str(&out).unwrap()), ["j1", "j2"]);
+    let (ok, out, err) = run(&["job", "list", "--sort", "-id", "--limit", "1", "--json"]);
+    assert!(ok, "{err}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["jobs"][0]["id"], "j2");
+    let (ok, out, err) = run(&["job", "list", "--fields", "id,state", "--json"]);
+    assert!(ok, "{err}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    let keys: Vec<&String> = v["jobs"][0].as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["id", "state"], "{v}");
+    let (ok, _, err) = run(&["job", "list", "--state", "zzz"]);
+    assert!(!ok && err.contains("open"), "{err}");
+}
+
+/// CAD-437: `delivery ls` — issue/state/project filters apply in the
+/// daemon, `--open` drops terminal records, CLI adds the sort/limit/
+/// fields tail. The legacy singular `issue` stays accepted.
+#[test]
+fn delivery_list_cad437_filters() {
+    let d = TestDaemon::start();
+    let mut recs = std::collections::BTreeMap::new();
+    let mut rec = |issue: &str, project: &str, state: cadence_agent::delivery::State, at: i64| {
+        let mut r = cadence_agent::delivery::Record::new(issue, project, "w1", at);
+        r.state = state;
+        recs.insert(issue.to_string(), r);
+    };
+    rec("D-1", "demo", cadence_agent::delivery::State::Working, 100);
+    rec("D-2", "demo", cadence_agent::delivery::State::Merged, 300);
+    rec(
+        "D-3",
+        "infra",
+        cadence_agent::delivery::State::Reviewing,
+        200,
+    );
+    std::fs::write(
+        d.state.join("delivery.json"),
+        serde_json::to_string(&recs).unwrap(),
+    )
+    .unwrap();
+
+    let ids = |v: &Value| -> Vec<String> {
+        v["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["issue"].as_str().unwrap().to_string())
+            .collect()
+    };
+    // Dispatched-at order is the default; the singular `issue` stays.
+    let v = d.rpc("delivery_list", json!({})).unwrap();
+    assert_eq!(ids(&v), ["D-1", "D-3", "D-2"]);
+    let v = d.rpc("delivery_list", json!({"issue": "D-1"})).unwrap();
+    assert_eq!(ids(&v), ["D-1"]);
+    let v = d
+        .rpc("delivery_list", json!({"issues": ["D-1", "D-3"]}))
+        .unwrap();
+    assert_eq!(ids(&v), ["D-1", "D-3"]);
+    // Any-of within states; AND across issue/state/project; --open
+    // drops terminal.
+    let v = d
+        .rpc("delivery_list", json!({"states": ["working", "merged"]}))
+        .unwrap();
+    assert_eq!(ids(&v), ["D-1", "D-2"]);
+    let v = d
+        .rpc(
+            "delivery_list",
+            json!({"states": ["working", "merged"], "projects": ["infra"]}),
+        )
+        .unwrap();
+    assert_eq!(ids(&v), Vec::<String>::new());
+    let v = d.rpc("delivery_list", json!({"open": true})).unwrap();
+    assert_eq!(ids(&v), ["D-1", "D-3"]);
+    let err = d
+        .rpc("delivery_list", json!({"states": ["zzz"]}))
+        .unwrap_err();
+    assert!(err.to_string().contains("working"), "{err}");
+    // An unknown --project is an error naming the valid set — tracker
+    // keys union the projects live records carry — never an empty page.
+    let err = d
+        .rpc("delivery_list", json!({"projects": ["bogus"]}))
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("demo") && err.to_string().contains("infra"),
+        "{err}"
+    );
+
+    // CLI: positional issue, repeatable --issue, the shaping tail.
+    let bin = env!("CARGO_BIN_EXE_cadence");
+    let run = |args: &[&str]| -> (bool, String, String) {
+        let out = std::process::Command::new(bin)
+            .arg("--state-dir")
+            .arg(&d.state)
+            .args(args)
+            .env_remove("CADENCE_ALIAS")
+            .output()
+            .unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    };
+    // `--project` validates tracker-side before the RPC: the CLI needs
+    // a pm dir naming the keys (the daemon accepts record projects too,
+    // so `infra` passes both checks).
+    let pm_dir = d.dir.path().join("pmfx");
+    cadence_agent::issue::Pm::init(&pm_dir).unwrap();
+    for key in ["demo", "infra"] {
+        std::fs::create_dir_all(pm_dir.join(key)).unwrap();
+        std::fs::write(
+            pm_dir.join(key).join("project.yaml"),
+            format!(
+                "key: {key}\nprefix: {}\ncomponents: []\n",
+                key.to_uppercase()
+            ),
+        )
+        .unwrap();
+    }
+    let run_pm = |args: &[&str]| -> (bool, String, String) {
+        let out = std::process::Command::new(bin)
+            .arg("--state-dir")
+            .arg(&d.state)
+            .args(args)
+            .env_remove("CADENCE_ALIAS")
+            .env("CADENCE_PM_DIR", &pm_dir)
+            .output()
+            .unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    };
+    let (ok, out, err) = run_pm(&["delivery", "ls", "--project", "infra", "--json"]);
+    assert!(ok, "{err}");
+    assert_eq!(ids(&serde_json::from_str(&out).unwrap()), ["D-3"]);
+    let (ok, _, err) = run_pm(&["delivery", "ls", "--project", "bogus", "--json"]);
+    assert!(
+        !ok && err.contains("--project") && err.contains("demo"),
+        "{err}"
+    );
+    let (ok, out, err) = run(&["delivery", "ls", "D-3", "--json"]);
+    assert!(ok, "{err}");
+    assert_eq!(ids(&serde_json::from_str(&out).unwrap()), ["D-3"]);
+    let (ok, out, err) = run(&[
+        "delivery", "ls", "--issue", "D-1", "--issue", "D-2", "--json",
+    ]);
+    assert!(ok, "{err}");
+    assert_eq!(ids(&serde_json::from_str(&out).unwrap()), ["D-1", "D-2"]);
+    let (ok, out, err) = run(&["delivery", "ls", "--open", "--json"]);
+    assert!(ok, "{err}");
+    assert_eq!(ids(&serde_json::from_str(&out).unwrap()), ["D-1", "D-3"]);
+    let (ok, out, err) = run(&[
+        "delivery",
+        "ls",
+        "--sort",
+        "-dispatched_at",
+        "--limit",
+        "1",
+        "--json",
+    ]);
+    assert!(ok, "{err}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(ids(&v), ["D-2"]);
+    let (ok, out, err) = run(&["delivery", "ls", "--fields", "issue,state", "--json"]);
+    assert!(ok, "{err}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    let keys: Vec<&String> = v["records"][0].as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["issue", "state"], "{v}");
+    let (ok, _, err) = run(&["delivery", "ls", "--state", "zzz"]);
+    assert!(!ok && err.contains("working"), "{err}");
+}
+
 /// Every launch writes the briefing under the state dir — the cwd repo
 /// stays byte-identical unless the operator opts in. Standalone launches
 /// stay silent (no message) unless --bootstrap is passed.
@@ -27430,6 +27787,86 @@ fn report_needs_me_row_and_ls_filters() {
     );
 }
 
+/// CAD-437: `report ls` shares the grammar — any-of value flags, AND
+/// across them, `--open`/`--all` scopes, unknown values error, and the
+/// sort/limit/fields tail.
+#[test]
+fn report_ls_cad437_grammar() {
+    let s = ReportFx::new();
+    // Bugs route to the `cadence` project wherever they are filed.
+    for (cwd, kind, msg) in [
+        (&s.product_repo, "idea", "idea one"), // P-1
+        (&s.product_repo, "bug", "bug one"),   // C-1
+        (&s.cadence_repo, "bug", "cad bug"),   // C-2
+    ] {
+        let (ok, out) = s.cli_at(cwd, &["report", "--kind", kind, "-m", msg]);
+        assert!(ok, "{out}");
+    }
+    let ids = |v: &Value| -> Vec<String> {
+        let mut ids: Vec<String> = v["reports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        ids
+    };
+
+    // Comma-join and repeat are the same any-of; AND across flags.
+    let (_, out) = s.cli(&["report", "ls", "--kind", "bug,idea"]);
+    assert_eq!(ids(&out).len(), 3, "{out}");
+    let (_, out) = s.cli(&["report", "ls", "--kind", "bug", "--kind", "idea"]);
+    assert_eq!(ids(&out).len(), 3, "{out}");
+    let (_, out) = s.cli(&["report", "ls", "--kind", "bug", "--project", "cadence"]);
+    assert_eq!(ids(&out), ["C-1", "C-2"], "{out}");
+    let (_, out) = s.cli(&["report", "ls", "--ticket", "P-1"]);
+    assert_eq!(ids(&out), ["P-1"], "{out}");
+    let (_, out) = s.cli(&["report", "ls", "--source", "task"]);
+    assert_eq!(ids(&out), Vec::<String>::new(), "{out}");
+
+    // --open drops resolved intake rows; --all brings them back.
+    let (ok, _) = s.cli(&["issue", "set", "P-1", "status=done"]);
+    assert!(ok);
+    let (_, out) = s.cli(&["report", "ls"]);
+    assert_eq!(ids(&out), ["C-1", "C-2"], "{out}");
+    let (_, out) = s.cli(&["report", "ls", "--all"]);
+    assert_eq!(ids(&out), ["C-1", "C-2", "P-1"], "{out}");
+    // clap refuses --open with --all before the handler runs (plain
+    // text on stderr, not the JSON error channel).
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&s.state)
+        .args(["report", "ls", "--open", "--all"])
+        .env("CADENCE_PM_DIR", &s.pm_dir)
+        .env("HOME", &s.home)
+        .env_remove("CADENCE_ALIAS")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+
+    // Unknown values and bad sorts are errors.
+    for args in [
+        &["report", "ls", "--kind", "zzz"][..],
+        &["report", "ls", "--source", "zzz"][..],
+        &["report", "ls", "--project", "zzz"][..],
+        &["report", "ls", "--ticket", "not an id"][..],
+        &["report", "ls", "--sort", "zzz"][..],
+    ] {
+        let (ok, err, _) = s.cli_at_env(&s.product_repo, args, &[]);
+        assert!(!ok, "{args:?} must fail: {err}");
+    }
+
+    // sort asc + limit + fields.
+    let (_, out) = s.cli(&["report", "ls", "--all", "--sort", "id", "--limit", "2"]);
+    assert_eq!(ids(&out), ["C-1", "C-2"], "{out}");
+    let (_, out) = s.cli(&[
+        "report", "ls", "--kind", "bug", "--fields", "id,kind", "--json",
+    ]);
+    let keys: Vec<&String> = out["reports"][0].as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["id", "kind"], "{out}");
+}
+
 /// A report notifies the project's PM inbox — `team.yaml`
 /// `roles.pm.alias` names it (ADR 0001); absent any resolvable PM the
 /// report still files, with `notified` recording the miss.
@@ -39755,6 +40192,68 @@ fn plan_propose_approve_gate_and_progress() {
         !ok && err.to_string().contains("plan D-6 is rejected"),
         "{err}"
     );
+}
+
+/// CAD-437: `plan ls` shares the grammar — any-of `--state`, AND with
+/// `--project`, unknown values name the valid set, sort/limit/fields.
+#[test]
+fn plan_ls_cad437_grammar() {
+    let f = PlanFixture::start();
+    let e1 = f.propose(PLAN_MD).unwrap()["epic"].clone(); // D-1
+    f.propose("---\ntitle: Later\ngoal: g\n---\n## Only\n### Acceptance\n- [ ] a\n")
+        .unwrap(); // D-5
+    f.d.operator_rpc("plan_approve", json!({"epic": e1}))
+        .unwrap();
+    let ids = |v: &Value| -> Vec<String> {
+        let mut ids: Vec<String> = v["plans"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        ids
+    };
+
+    let (ok, out) = f.cli(&["plan", "ls", "--json"]);
+    assert!(ok, "{out}");
+    assert_eq!(ids(&out), ["D-1", "D-5"]);
+    // Any-of within --state, comma-joined or repeated.
+    let (ok, out) = f.cli(&["plan", "ls", "--state", "proposed,approved", "--json"]);
+    assert!(ok, "{out}");
+    assert_eq!(ids(&out), ["D-1", "D-5"]);
+    let (ok, out) = f.cli(&["plan", "ls", "--state", "approved", "--json"]);
+    assert!(ok, "{out}");
+    assert_eq!(ids(&out), ["D-1"]);
+    let (ok, out) = f.cli(&["plan", "ls", "--state", "rejected", "--json"]);
+    assert!(ok, "{out}");
+    assert_eq!(ids(&out), Vec::<String>::new());
+    // AND across flags; unknown values are errors.
+    let (ok, out) = f.cli(&[
+        "plan",
+        "ls",
+        "--state",
+        "approved",
+        "--project",
+        "demo",
+        "--json",
+    ]);
+    assert!(ok, "{out}");
+    assert_eq!(ids(&out), ["D-1"]);
+    let (ok, out) = f.cli(&["plan", "ls", "--state", "bogus", "--json"]);
+    assert!(!ok && out.to_string().contains("proposed"), "{out}");
+    let (ok, out) = f.cli(&["plan", "ls", "--project", "bogus", "--json"]);
+    assert!(!ok, "{out}");
+    let (ok, out) = f.cli(&["plan", "ls", "--sort", "bogus", "--json"]);
+    assert!(!ok && out.to_string().contains("--sort"), "{out}");
+    // The tail: -id descends, limit caps, fields project.
+    let (ok, out) = f.cli(&["plan", "ls", "--sort", "-id", "--limit", "1", "--json"]);
+    assert!(ok, "{out}");
+    assert_eq!(out["plans"][0]["id"], "D-5");
+    let (ok, out) = f.cli(&["plan", "ls", "--fields", "id,state", "--json"]);
+    assert!(ok, "{out}");
+    let keys: Vec<&String> = out["plans"][0].as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["id", "state"], "{out}");
 }
 
 /// CAD-360: approve and reject are operator decisions. A pane agent is

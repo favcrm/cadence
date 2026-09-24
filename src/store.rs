@@ -251,6 +251,22 @@ pub const APPROVAL_RECORDED_EVENT: &str = "approval_recorded";
 /// (a cancelled or superseded queue message) never writes this.
 pub const APPROVAL_REVOKED_EVENT: &str = "approval_revoked";
 
+/// The agent-state vocabulary — the `agents.state` column values —
+/// for `agent list --state` (CAD-437). `attention` is a fence, `error`
+/// is recorded on the row but never stored as a state.
+pub const AGENT_STATES: &[&str] = &[
+    "starting",
+    "idle",
+    "busy",
+    "waiting_input",
+    "attention",
+    "stopping",
+    "stopped",
+    "offline",
+];
+/// The `jobs.state` vocabulary for `job list --state`.
+pub const JOB_STATES: &[&str] = &["draft", "open", "done", "failed", "cancelled"];
+
 /// One operator approval as `Store::record_approval` persists it: the
 /// operator approved `action` on the exact `head_sha` of PR `pr` in
 /// `repo`, as told by `source` (who approved and where — a claim the

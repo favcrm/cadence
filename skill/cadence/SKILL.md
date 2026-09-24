@@ -69,6 +69,34 @@ automatically — just report normally. Routed `worker_result`
 notifications you receive are informational: they complete on delivery,
 so do not report on them — they carry no `turn_id` for you.
 
+## Listing things
+
+Every `ls`/`list` command shares one filter grammar — filter instead of
+grepping, and pass `--json` when consuming the output:
+
+```bash
+cadence issue ls --status doing,review --owner <you> --json
+cadence issue ls --ready --sort priority --limit 5 --json
+cadence agent list --state idle,busy --json
+cadence job list --state open --json
+cadence delivery ls --open --json
+cadence plan ls --state proposed --json
+cadence report ls --kind question --open --json
+cadence memory ls --type gotcha --project <key> --json
+cadence issue epic ls --health at_risk --json
+cadence milestone ls --json
+```
+
+- A value flag repeats and comma-joins — `--status doing --status review`
+  is `--status doing,review` — and matches ANY of its values. Different
+  flags AND. An unknown value is an error naming the valid set.
+- `--sort KEY` orders (`-KEY` descending), `--limit N` caps, `--fields a,b`
+  keeps only those JSON row keys, `--since/--until` take `24h`/`7d`, an ISO
+  date, or an epoch.
+- `issue ls --tag` is the one exception: every named tag must be present.
+- `agent list` from your pane still shows only your group — filters narrow
+  it, `--all` widens past it.
+
 ## Rules
 
 - Messages must be **single line**, no control characters (pty transport).

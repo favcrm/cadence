@@ -2455,15 +2455,19 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
                         return;
                     }
                 }
-                // The same slices as `issue ls`: tag (all of), status
-                // (any of), epic, owner, component, priority, open=1.
+                // The same slices as `issue ls`: tag (all of — the
+                // grammar's exception), every other key any-of over
+                // repeated/comma values, open=1.
                 let slice = board::Filter {
                     tags: query_all("tag"),
-                    epic: query("epic").filter(|s| !s.is_empty()),
-                    owner: query("owner").filter(|s| !s.is_empty()),
+                    epics: query_all("epic"),
+                    owners: query_all("owner"),
                     statuses: query_all("status"),
-                    component: query("component").filter(|s| !s.is_empty()),
-                    priority: query("priority").filter(|s| !s.is_empty()),
+                    components: query_all("component"),
+                    priorities: query_all("priority"),
+                    types: query_all("type"),
+                    milestones: query_all("milestone"),
+                    plans: query_all("plan"),
                     open: query("open").is_some_and(|v| v == "1" || v == "true"),
                 };
                 if let Err(e) = slice.validate() {
@@ -2524,26 +2528,42 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
         ),
         "/api/memories" => match Pm::at(pm_dir) {
             Ok(pm) => {
-                let project = query("project");
-                let status = query("status");
-                let kind = query("type");
+                // The `memory ls` grammar: keys repeat and comma-join
+                // (any-of), different keys AND.
+                let project = query_all("project");
+                let status = query_all("status");
+                let kind = query_all("type");
+                let component = query_all("component");
+                let paths = query_all("path");
+                if let Err(e) = crate::filter::check_set("status", &status, crate::memory::STATUSES)
+                    .and_then(|_| crate::filter::check_set("type", &kind, crate::memory::TYPES))
+                {
+                    send(request, err_response(400, &e.to_string()));
+                    return;
+                }
                 let (mems, errors) = crate::memory::load_all_report(&pm.dir);
                 let projects = project::list(&pm.dir).unwrap_or_default();
-                let payload: Vec<Value> = mems
-                    .iter()
-                    .filter(|m| {
-                        project.as_deref().map(|p| m.project == p).unwrap_or(true)
-                            && status
-                                .as_deref()
-                                .map(|s| m.front.status == s)
-                                .unwrap_or(true)
-                            && kind.as_deref().map(|k| m.front.kind == k).unwrap_or(true)
-                    })
-                    .map(|m| {
-                        let fresh = crate::memory::Freshness::among(&projects, &m.project);
-                        crate::memory::card_json(m, &fresh)
-                    })
-                    .collect();
+                let payload: Vec<Value> =
+                    mems.iter()
+                        .filter(|m| {
+                            let scope = &m.front.scope;
+                            crate::filter::any_of(&project, Some(m.project.as_str()))
+                                && crate::filter::any_of(&status, Some(m.front.status.as_str()))
+                                && crate::filter::any_of(&kind, Some(m.front.kind.as_str()))
+                                && (component.is_empty()
+                                    || scope.project
+                                    || scope.components.iter().any(|c| component.contains(c)))
+                                && (paths.is_empty()
+                                    || scope.project
+                                    || scope.paths.iter().any(|g| {
+                                        paths.iter().any(|p| crate::memory::glob_match(g, p))
+                                    }))
+                        })
+                        .map(|m| {
+                            let fresh = crate::memory::Freshness::among(&projects, &m.project);
+                            crate::memory::card_json(m, &fresh)
+                        })
+                        .collect();
                 send(
                     request,
                     json_response(json!({
