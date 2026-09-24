@@ -7,7 +7,8 @@
 // (only `daemon run` does), so the spawn registry need not see it.
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
 
-use std::io::Read;
+use std::collections::{HashMap, VecDeque};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -786,22 +787,64 @@ enum Commands {
     /// inbound count instead.
     #[command(name = "self")]
     SelfInfo,
-    /// Drain an inbox agent's durable queue: one JSON object per
-    /// message, oldest first, each marked completed `via=inbox_read`.
+    /// Read an inbox agent's durable queue: one JSON object per
+    /// message, oldest first. The default drains — each message is
+    /// marked completed `via=inbox_read` as it is printed. The safe
+    /// mode (CAD-480) is `--peek` plus `inbox ack`: peek changes no
+    /// state, so a reader that crashes or truncates loses nothing, and
+    /// each reader's server-side cursor resumes it after its last ack.
     /// `--follow` blocks on the daemon for new arrivals — a waiting
     /// consumer needs no polling loop.
     Inbox {
         /// Inbox agent alias or provider-native id.
-        alias: String,
-        /// Only consume messages after this sequence cursor.
-        #[arg(long, default_value_t = 0)]
-        after: i64,
+        alias: Option<String>,
+        #[command(subcommand)]
+        action: Option<InboxAction>,
+        /// Read without consuming: messages stay `queued` for the next
+        /// reader. Without `--after` the reader resumes after its own
+        /// last ack (the server-side cursor for `--reader`).
+        #[arg(long)]
+        peek: bool,
+        /// Only consume or peek messages after this sequence cursor.
+        /// Peek mode defaults to the reader's ack watermark; a drain
+        /// defaults to 0 (everything queued).
+        #[arg(long)]
+        after: Option<i64>,
         /// Seconds to wait for new messages per request (0-30).
         #[arg(long, default_value_t = 0)]
         wait: u64,
-        /// Keep draining new arrivals until interrupted.
+        /// Keep reading new arrivals until interrupted.
         #[arg(long)]
         follow: bool,
+        /// Reader name for the server-side ack cursor. Readers that
+        /// share a name share a cursor (default "default").
+        #[arg(long)]
+        reader: Option<String>,
+        /// Push delivery: run CMD once per message, implying
+        /// `--follow --peek`. Everything after `--exec` is the command's
+        /// argv, run without a shell — write `--exec sh -c '…'` to ask
+        /// for one (so `--exec` must come last). The message JSON is
+        /// written to the command's stdin; it is acked only when the
+        /// command exits 0. A non-zero exit leaves the message queued
+        /// and retries it with bounded backoff. No message content is
+        /// placed in argv or the environment.
+        #[arg(long, num_args = 1.., allow_hyphen_values = true, value_name = "CMD")]
+        exec: Option<Vec<String>>,
+        /// First retry delay for a failed `--exec` run, in
+        /// milliseconds; it doubles per failure up to 30 seconds.
+        #[arg(long, default_value_t = 1000)]
+        exec_retry_ms: u64,
+        /// Per-message wall-clock limit for one `--exec` run, in
+        /// milliseconds (default 120000 = 2 minutes). A run past the
+        /// limit is killed and counted as a failure; 0 disables the
+        /// limit.
+        #[arg(long, default_value_t = 120_000)]
+        exec_timeout_ms: u64,
+        /// Consecutive failures on one message before it is parked:
+        /// the follower records `inbox_park` for its reader, skips the
+        /// message (it stays queued and unread) and moves on.
+        #[arg(long, default_value_t = 5)]
+        exec_max_failures: u32,
     },
     /// Install or inspect the `cadence` agent skill under
     /// `~/.agents/skills/cadence` with symlinks into the `.claude`,
@@ -2200,6 +2243,34 @@ enum ReportAction {
         /// The report Markdown; else stdin.
         #[arg(long)]
         file: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum InboxAction {
+    /// Acknowledge consumed messages: `inbox ack <alias> <seq>...`
+    /// completes every queued message at or below the greatest seq and
+    /// records the reader's durable cursor — a restart resumes after
+    /// it. Acking is a watermark: every queued message with `seq <=
+    /// through` is consumed, so never ack past a message you have not
+    /// processed.
+    Ack {
+        /// Inbox agent alias.
+        alias: String,
+        /// Message seqs consumed — the watermark is the greatest.
+        seqs: Vec<i64>,
+        /// Consume through this seq (same as passing it as a seq).
+        #[arg(long)]
+        through: Option<i64>,
+        /// Reader name for the server-side ack cursor (default
+        /// "default").
+        #[arg(long)]
+        reader: Option<String>,
+        /// Drop the reader's cursor instead of acking: its next peek
+        /// resumes from 0 and re-delivers everything still queued.
+        /// Operator-only.
+        #[arg(long)]
+        reset: bool,
     },
 }
 
@@ -4376,6 +4447,194 @@ fn run_build_slot_launch(
     }
 }
 
+/// `cadence inbox <alias> --follow --exec <cmd>` (CAD-480): push each
+/// queued message to the command as JSON on stdin; it is acked
+/// (`agent_inbox_ack` watermark) only after the command exits 0. A
+/// non-zero exit leaves the message queued and retries it with bounded
+/// backoff — `retry_base_ms` doubling per attempt, capped at 30s —
+/// head-of-line, so a later message is never acked past a failed one.
+/// A run past `timeout_ms` (0 = no limit) is killed and counted as a
+/// failure; after `max_failures` consecutive failures on one message
+/// the follower parks it (`inbox_park` — it stays queued and unread
+/// but the reader's peeks skip it) and moves on. Every failure lands
+/// on stderr and in the inbox's `inbox_exec_fail` events. The loop
+/// ends only on interrupt or a daemon error.
+fn run_inbox_exec(
+    state_dir: &Path,
+    alias: &str,
+    reader: &str,
+    argv: &[String],
+    retry_base_ms: u64,
+    timeout_ms: u64,
+    max_failures: u32,
+) -> Result<i32> {
+    const RETRY_CAP_MS: u64 = 30_000;
+    let mut pending: VecDeque<Value> = VecDeque::new();
+    let mut attempts: HashMap<i64, u32> = HashMap::new();
+    let mut retry_at: Option<Instant> = None;
+    loop {
+        if let Some(m) = pending.front().cloned() {
+            if let Some(t) = retry_at {
+                let now = Instant::now();
+                if now < t {
+                    // Bounded backoff — poll again soon so new arrivals
+                    // still queue up behind the failed head.
+                    std::thread::sleep((t - now).min(Duration::from_secs(1)));
+                    continue;
+                }
+                retry_at = None;
+            }
+            let seq = m["seq"].as_i64().unwrap_or_default();
+            match inbox_exec_once(argv, &m, timeout_ms) {
+                Ok(()) => {
+                    client::rpc(
+                        state_dir,
+                        "agent_inbox_ack",
+                        json!({"alias": alias, "through": seq, "reader": reader}),
+                    )?;
+                    println!("{}", serde_json::to_string(&m).unwrap_or_default());
+                    pending.pop_front();
+                    attempts.remove(&seq);
+                }
+                Err(why) => {
+                    let a = {
+                        let a = attempts.entry(seq).or_insert(0);
+                        *a += 1;
+                        *a
+                    };
+                    client::rpc(
+                        state_dir,
+                        "agent_inbox_ack",
+                        json!({"alias": alias, "reader": reader,
+                               "fail": {"message": m["id"], "seq": seq,
+                                        "attempt": a, "error": why}}),
+                    )?;
+                    if a >= max_failures {
+                        // Poison: park it for this reader — queued and
+                        // unread still, but no longer head-of-line.
+                        let reason = format!("exec failed {a} times; last: {why}");
+                        client::rpc(
+                            state_dir,
+                            "agent_inbox_ack",
+                            json!({"alias": alias, "reader": reader,
+                                   "park": m["id"], "reason": reason}),
+                        )?;
+                        eprintln!(
+                            "inbox {alias}: seq {seq} parked after {a} failures \
+                             ({why}) — still queued; moving on"
+                        );
+                        pending.pop_front();
+                        attempts.remove(&seq);
+                        continue;
+                    }
+                    let delay = retry_base_ms
+                        .saturating_mul(1u64 << a.saturating_sub(1).min(10))
+                        .min(RETRY_CAP_MS);
+                    eprintln!(
+                        "inbox {alias}: exec failed for seq {seq} (attempt {a}): \
+                         {why} — the message stays queued; retrying in {delay}ms"
+                    );
+                    retry_at = Some(Instant::now() + Duration::from_millis(delay));
+                }
+            }
+            continue;
+        }
+        // Queue empty — long-poll for arrivals. Peek changes nothing:
+        // an un-acked message comes back every round until exec
+        // succeeds.
+        let page = client::rpc(
+            state_dir,
+            "agent_inbox",
+            json!({"alias": alias, "peek": true, "reader": reader, "wait": 25}),
+        )?;
+        for m in page["messages"].as_array().cloned().unwrap_or_default() {
+            let seq = m["seq"].as_i64().unwrap_or_default();
+            if !pending.iter().any(|p| p["seq"].as_i64() == Some(seq)) {
+                pending.push_back(m);
+            }
+        }
+    }
+}
+
+/// Run one `--exec` argv on one message: the message JSON on stdin, no
+/// shell. `Ok(())` only on exit 0; `Err` carries the exit status and a
+/// stderr tail for the failure report. A run still alive at
+/// `timeout_ms` (0 = no limit) is killed — the error names the timeout.
+fn inbox_exec_once(
+    argv: &[String],
+    message: &Value,
+    timeout_ms: u64,
+) -> std::result::Result<(), String> {
+    let mut child = cadence_agent::reaper::spawn(
+        Command::new(&argv[0])
+            .args(&argv[1..])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::piped()),
+    )
+    .map_err(|e| format!("could not spawn '{}': {e}", argv[0]))?;
+    // The write runs on its own thread: a consumer that never reads
+    // stdin or exits early must not block the wait on a full pipe.
+    let writer = child.stdin.take().map(|mut stdin| {
+        let body = serde_json::to_string(message)
+            .unwrap_or_default()
+            .into_bytes();
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&body);
+        })
+    });
+    // Poll try_wait: std has no wait-with-timeout, and a wedged
+    // consumer must not block the inbox head-of-line forever.
+    let deadline = (timeout_ms > 0).then(|| Instant::now() + Duration::from_millis(timeout_ms));
+    let timed_out = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break false,
+            Ok(None) => {
+                if let Some(t) = deadline {
+                    if Instant::now() >= t {
+                        let _ = child.kill();
+                        break true;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(e) => return Err(format!("could not wait on '{}': {e}", argv[0])),
+        }
+    };
+    // Reaped or killed: wait_with_output drains the piped stderr (EOF
+    // on exit) and reports the status.
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("could not wait on '{}': {e}", argv[0]))?;
+    if let Some(w) = writer {
+        let _ = w.join();
+    }
+    if timed_out {
+        return Err(format!(
+            "'{}' killed after {}ms timeout",
+            argv[0], timeout_ms
+        ));
+    }
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stderr = stderr.trim();
+    let tail = if stderr.len() > 500 {
+        &stderr[stderr.len() - 500..]
+    } else {
+        stderr
+    };
+    Err(format!(
+        "'{}' {}: {}",
+        argv[0],
+        out.status
+            .code()
+            .map_or_else(|| "died on a signal".to_string(), |c| format!("exited {c}")),
+        if tail.is_empty() { "no stderr" } else { tail }
+    ))
+}
+
 /// `cadence audit approve|revoke` — the operator's approval-evidence
 /// writers (CAD-217). The daemon decides authority from the connection;
 /// nothing here names the caller.
@@ -6077,6 +6336,10 @@ fn run() -> Result<i32> {
                     "alias": show["agent"]["alias"],
                     "endpoint_kind": kind,
                     "queued": show["queued"],
+                    // CAD-480: the unread backlog and its age — what a
+                    // consumer owes this mailbox.
+                    "unread": show["inbox"]["queued"],
+                    "oldest_unread_age_secs": show["inbox"]["oldest_age_secs"],
                 }));
                 return Ok(0);
             }
@@ -6108,29 +6371,92 @@ fn run() -> Result<i32> {
         }
         Commands::Inbox {
             alias,
+            action,
+            peek,
             after,
             wait,
             follow,
+            reader,
+            exec,
+            exec_retry_ms,
+            exec_timeout_ms,
+            exec_max_failures,
         } => {
-            // One JSON object per drained message, oldest first. Each
-            // line already completed `via=inbox_read` server-side —
-            // printed output is proof of consumption, never re-read.
-            let mut cursor = after;
-            loop {
-                let page = client::rpc(
+            if let Some(InboxAction::Ack {
+                alias,
+                seqs,
+                through,
+                reader,
+                reset,
+            }) = action
+            {
+                if reset && (through.is_some() || !seqs.is_empty()) {
+                    return Err(Error::rejected(
+                        "`cadence inbox ack --reset` takes no seqs — it drops \
+                         the reader's cursor instead of acking",
+                    ));
+                }
+                if !reset && seqs.is_empty() && through.is_none() {
+                    return Err(Error::rejected(
+                        "`cadence inbox ack` needs at least one seq — \
+                         `inbox ack <alias> <seq>...` or `--through <seq>`",
+                    ));
+                }
+                let mut req = json!({"alias": alias, "seqs": seqs});
+                if reset {
+                    req["reset"] = json!(true);
+                }
+                if let Some(t) = through {
+                    req["through"] = json!(t);
+                }
+                if let Some(r) = reader {
+                    req["reader"] = json!(r);
+                }
+                let r = client::rpc(&state_dir, "agent_inbox_ack", req)?;
+                print_json(&r);
+                return Ok(0);
+            }
+            let Some(alias) = alias else {
+                return Err(Error::rejected(
+                    "`cadence inbox` needs an alias — `cadence inbox <alias>` to \
+                     read, `cadence inbox ack <alias> <seq>...` to acknowledge",
+                ));
+            };
+            let reader = reader.clone().unwrap_or_else(|| "default".to_string());
+            if let Some(argv) = exec {
+                return run_inbox_exec(
                     &state_dir,
-                    "agent_inbox",
-                    json!({"alias": alias, "after": cursor,
-                           "wait": if follow { 25 } else { wait }}),
-                )?;
+                    &alias,
+                    &reader,
+                    &argv,
+                    exec_retry_ms,
+                    exec_timeout_ms,
+                    exec_max_failures,
+                );
+            }
+            // One JSON object per message, oldest first. The default
+            // drain completes each `via=inbox_read` as printed —
+            // printed output is proof of consumption, never re-read.
+            // `--peek` changes nothing: the same lines, still queued.
+            let mut after = after;
+            loop {
+                let mut req = json!({"alias": alias, "reader": reader,
+                                     "wait": if follow { 25 } else { wait }});
+                if peek {
+                    req["peek"] = json!(true);
+                }
+                if let Some(a) = after {
+                    req["after"] = json!(a);
+                }
+                let page = client::rpc(&state_dir, "agent_inbox", req)?;
                 let messages = page["messages"].as_array().cloned().unwrap_or_default();
                 for m in &messages {
                     println!("{}", serde_json::to_string(m).unwrap_or_default());
                 }
-                cursor = page["cursor"].as_i64().unwrap_or(cursor);
+                after = Some(page["cursor"].as_i64().unwrap_or(after.unwrap_or(0)));
                 if !follow {
-                    // An empty drain prints nothing — drained output is
-                    // the complete record of what was consumed.
+                    // An empty drain/peek prints nothing — the output
+                    // is the complete record of what was seen.
                     break;
                 }
             }
