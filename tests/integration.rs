@@ -11714,14 +11714,21 @@ fn claude_brokered_permission_accept() {
     assert_eq!(req["method"], "cadence/approval", "{req}");
     assert_eq!(req["params"]["tool"], "Bash", "{req}");
     assert_eq!(req["params"]["input"]["command"], "run ls", "{req}");
-    // A retried open with the same handle dedupes — still one request.
-    d.rpc(
-        "request_open",
-        json!({"alias": "w1", "kind": "approval", "tool": "Bash",
-               "request": handle, "input_summary": "run ls",
-               "input": {"command": "run ls"}}),
-    )
-    .unwrap();
+    // The request came from w1's own permission server (a child of
+    // its enrolled provider root); a connection without w1's identity
+    // re-opening the same handle is refused (CAD-376) — still one
+    // request. The owner's retry dedupe is
+    // `brokered_request_handles_belong_to_their_agent`.
+    let err = d
+        .rpc(
+            "request_open",
+            json!({"alias": "w1", "kind": "approval", "tool": "Bash",
+                   "request": handle, "input_summary": "run ls",
+                   "input": {"command": "run ls"}}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("CAD-376"), "{err}");
     assert_eq!(d.requests("w1").len(), 1);
     // request_opened event names the handle.
     let ev = d.wait_event("w1", "request_opened", 10);
@@ -11892,12 +11899,18 @@ fn claude_brokered_permission_daemon_restart_denies() {
     // The real server binary under test: open a brokered request,
     // restart the daemon mid-wait, and read the verdict off the wire.
     let mut d = TestDaemon::start();
-    let _mock = d.mock_claude("ok", None);
-    broker_command();
-    d.register_claude("w1", json!({"broker_approvals": true}));
-    d.wait_agent("w1", "idle", 15);
     let state = d.state.clone();
     let mut mcp = Mcp::spawn(&state, "w1", 120);
+    // Only w1's own connection opens and awaits its requests (CAD-376):
+    // plant w1 as a brokered pane rooted at the server process itself,
+    // standing in for the provider the real server is a child of. The
+    // planted row survives the restart below.
+    plant_pane(&d, "w1", mcp.child.id());
+    cad162_sql(
+        &d,
+        "UPDATE agents SET params=?1 WHERE alias='w1'",
+        &[&json!({"broker_approvals": true}).to_string()],
+    );
     // tools/call blocks in request_wait — its response arrives after
     // the restart as a clean denial, never a hang or a crash.
     let verdict_reader = {
@@ -12042,17 +12055,17 @@ fn claude_brokered_params_replayed_on_resume() {
 fn claude_brokered_flag_validation() {
     let d = TestDaemon::start();
     let _mock = d.mock_claude("ok", None);
-    // request_open refuses a non-brokered agent.
-    d.register_claude("w1", Value::Null);
-    d.wait_agent("w1", "idle", 15);
-    let err = d
-        .rpc(
-            "request_open",
-            json!({"alias": "w1", "kind": "approval", "tool": "Bash"}),
-        )
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("--broker-approvals"), "{err}");
+    // request_open refuses a non-brokered agent — asked from that
+    // agent's own connection, so the caller rule (CAD-376) passes.
+    let lane_home = TempDir::new().unwrap();
+    let mut own = LaneShell::spawn(lane_home.path());
+    plant_pane(&d, "wn", own.pid());
+    let r = own.rpc(
+        &d.state,
+        "request_open",
+        json!({"alias": "wn", "kind": "approval", "tool": "Bash"}),
+    );
+    assert_refused(&r, "", "--broker-approvals", "non-brokered agent");
     // Register-time validation rejects malformed broker params.
     for (params, want) in [
         (json!({"broker_approvals": "yes"}), "boolean"),
@@ -34487,15 +34500,17 @@ fn agent_respond_refuses_the_requester_and_its_peers() {
             &[&brokered, alias],
         );
     }
-    let open = |handle: &str| {
-        d.rpc(
+    // The requester's own connection opens its requests (CAD-376).
+    let open = |worker: &mut LaneShell, handle: &str| {
+        let r = worker.rpc(
+            &d.state,
             "request_open",
             json!({"alias": "wr", "tool": "Bash", "input_summary": "rm -rf /tmp/x",
                    "request": handle}),
-        )
-        .unwrap();
+        );
+        assert_eq!(r["ok"], true, "{r}");
     };
-    open("h1");
+    open(&mut worker, "h1");
     let accept = json!({"alias": "wr", "request": "h1", "decision": "accept"});
 
     let r = worker.rpc(&d.state, "agent_respond", accept.clone());
@@ -34529,7 +34544,7 @@ fn agent_respond_refuses_the_requester_and_its_peers() {
     // The requester's PM answers; so does the operator.
     let r = pm.rpc(&d.state, "agent_respond", accept);
     assert_eq!(r["ok"], true, "{r}");
-    open("h2");
+    open(&mut worker, "h2");
     d.operator_rpc(
         "agent_respond",
         json!({"alias": "wr", "request": "h2", "decision": "decline"}),
@@ -34537,6 +34552,139 @@ fn agent_respond_refuses_the_requester_and_its_peers() {
     .unwrap();
     let pending = d.rpc("agent_requests", json!({"alias": "wr"})).unwrap();
     assert_eq!(pending["requests"], json!([]), "{pending}");
+}
+
+/// CAD-376: a brokered request handle belongs to its agent's own
+/// permission server. Another agent (even a group peer) and a
+/// connection with no agent identity can neither open a request on a
+/// brokered agent — nothing is parked, no `waiting_input` — nor close
+/// or await one, which would retire or consume it as a denial; the
+/// handle stays pending and the owner still opens, awaits and closes
+/// normally.
+#[test]
+fn brokered_request_handles_belong_to_their_agent() {
+    let d = TestDaemon::start();
+    let home = TempDir::new().unwrap();
+    let mut pm = LaneShell::spawn(home.path());
+    plant_pane(&d, "lead", pm.pid());
+    let mut owner = LaneShell::spawn(home.path());
+    plant_pane(&d, "wr", owner.pid());
+    let mut peer = LaneShell::spawn(home.path());
+    plant_pane(&d, "wp", peer.pid());
+    let brokered = json!({"upstream": "lead", "broker_approvals": true}).to_string();
+    for alias in ["wr", "wp"] {
+        cad162_sql(
+            &d,
+            "UPDATE agents SET params=?1, state='busy' WHERE alias=?2",
+            &[&brokered, alias],
+        );
+    }
+    let state = |alias: &str| {
+        d.rpc("agent_show", json!({"alias": alias})).unwrap()["agent"]["state"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let opened = |alias: &str| {
+        d.events(alias)
+            .iter()
+            .filter(|e| e["kind"] == "request_opened")
+            .count()
+    };
+    let open = |handle: &str| {
+        json!({"alias": "wr", "kind": "approval", "tool": "Bash",
+               "input_summary": "rm -rf /tmp/x", "request": handle})
+    };
+
+    // A fake open on the brokered agent: refused from a peer's pane,
+    // with forged identity fields, and from a connection that is no
+    // agent. The target stays busy with nothing pending.
+    let r = peer.rpc(&d.state, "request_open", open("h1"));
+    assert_refused(&r, "request_open", "cannot act on 'wr''s", "peer open");
+    for (field, value) in [("by", "wr"), ("pane", "wr"), ("actor", "wr")] {
+        let r = peer.rpc(&d.state, "request_open", forged(&open("h1"), field, value));
+        assert_refused(&r, "request_open", "connection-bound", field);
+    }
+    let err = d.rpc("request_open", open("h1")).unwrap_err().to_string();
+    assert!(
+        err.contains("request_open refused") && err.contains("no agent identity"),
+        "{err}"
+    );
+    assert!(d.requests("wr").is_empty());
+    assert_eq!(state("wr"), "busy");
+    assert_eq!(opened("wr"), 0);
+
+    // The owner's own connection opens it and parks itself; its retry
+    // of the same handle dedupes.
+    let r = owner.rpc(&d.state, "request_open", open("h1"));
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(state("wr"), "waiting_input");
+    let r = owner.rpc(&d.state, "request_open", open("h1"));
+    assert_eq!(r["result"]["existing"], true, "{r}");
+    assert_eq!(d.requests("wr").len(), 1);
+    assert_eq!(opened("wr"), 1);
+
+    // A peer's close or wait is refused and the handle stays pending;
+    // so is one from a connection that is no agent.
+    let h1 = json!({"request": "h1"});
+    let r = peer.rpc(&d.state, "request_close", h1.clone());
+    assert_refused(&r, "request_close", "cannot act on 'wr''s", "peer close");
+    let r = peer.rpc(
+        &d.state,
+        "request_wait",
+        json!({"request": "h1", "wait": 1}),
+    );
+    assert_refused(&r, "request_wait", "cannot act on 'wr''s", "peer wait");
+    let err = d.rpc("request_close", h1.clone()).unwrap_err().to_string();
+    assert!(err.contains("request_close refused"), "{err}");
+    assert_eq!(d.requests("wr")[0]["request"], "h1");
+    assert_eq!(state("wr"), "waiting_input");
+    let closed = d.events("wr").iter().any(|e| e["kind"] == "request_closed");
+    assert!(!closed, "a refused close must not retire the handle");
+
+    // Once the PM answers, the parked answer is the owner's alone: a
+    // peer can neither take it by waiting nor discard it by closing.
+    let r = pm.rpc(
+        &d.state,
+        "agent_respond",
+        json!({"alias": "wr", "request": "h1", "decision": "accept"}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+    let r = peer.rpc(
+        &d.state,
+        "request_wait",
+        json!({"request": "h1", "wait": 1}),
+    );
+    assert_refused(
+        &r,
+        "request_wait",
+        "cannot act on 'wr''s",
+        "peer takes answer",
+    );
+    let r = peer.rpc(&d.state, "request_close", h1.clone());
+    assert_refused(
+        &r,
+        "request_close",
+        "cannot act on 'wr''s",
+        "peer drops answer",
+    );
+    let r = owner.rpc(
+        &d.state,
+        "request_wait",
+        json!({"request": "h1", "wait": 1}),
+    );
+    assert_eq!(r["result"]["state"], "answered", "{r}");
+    assert_eq!(r["result"]["answer"]["decision"], "accept", "{r}");
+
+    // The owner retires its own abandoned request normally.
+    let r = owner.rpc(&d.state, "request_open", open("h2"));
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(state("wr"), "waiting_input");
+    let r = owner.rpc(&d.state, "request_close", json!({"request": "h2"}));
+    assert_eq!(r["result"]["state"], "closed", "{r}");
+    assert!(d.requests("wr").is_empty());
+    assert_eq!(state("wr"), "busy");
+    d.wait_event("wr", "request_closed", 5);
 }
 
 /// CAD-375: a running turn's token is `message_report`'s credential, so

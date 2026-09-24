@@ -2066,9 +2066,9 @@ impl Shared {
                 Ok(json!({"requests": requests}))
             }
             "agent_respond" => self.rpc_respond(params, peer_pid),
-            "request_open" => self.rpc_request_open(params),
-            "request_wait" => self.rpc_request_wait(params),
-            "request_close" => self.rpc_request_close(params),
+            "request_open" => self.rpc_request_open(params, peer_pid),
+            "request_wait" => self.rpc_request_wait(params, peer_pid),
+            "request_close" => self.rpc_request_close(params, peer_pid),
             "agent_ready" => self.rpc_ready(params),
             "agent_capture" => self.rpc_capture(params),
             "agent_probe" => self.rpc_probe(params),
@@ -4234,14 +4234,58 @@ impl Shared {
         Ok(json!({"state": "answered"}))
     }
 
+    /// The agent a brokered-request RPC comes from (CAD-376), from the
+    /// connection alone: the nearest registered pane or strictly
+    /// verified enrolled endpoint on the peer's ancestry
+    /// ([`Self::slot_identity`]) — never the request's `alias`, never
+    /// `CADENCE_ALIAS`. A brokered handle belongs to its agent's own
+    /// permission server (`cadence mcp-permission`, a child of the
+    /// brokered provider), so only that agent opens, waits on or
+    /// closes it. A connection with no agent identity is refused too:
+    /// the operator (and the requester's PM) answer with `agent
+    /// respond`, which is gated separately (CAD-370).
+    fn request_caller(&self, params: &Value, peer_pid: u32, verb: &str) -> Result<String> {
+        reject_identity_fields(params, verb)?;
+        self.revalidate_enrollments()?;
+        match self.slot_identity(peer_pid)? {
+            Some(who) if !who.lane().is_empty() => Ok(who.lane().to_string()),
+            Some(_) => Err(Error::rejected(format!(
+                "{verb} refused: caller pid {peer_pid} descends from a pane whose \
+                 agent cannot be named — caller identity underivable"
+            ))),
+            None => Err(Error::rejected(format!(
+                "{verb} refused: this connection derives no agent identity — a \
+                 brokered request is opened, awaited and closed only by its agent's \
+                 own permission server; the operator or the agent's PM answers it \
+                 with `cadence agent respond` (caller rule, CAD-376)"
+            ))),
+        }
+    }
+
+    /// The refusal for a caller naming another agent's brokered request.
+    fn foreign_request(verb: &str, caller: &str, owner: &str) -> Error {
+        Error::rejected(format!(
+            "{verb} refused: agent '{caller}' cannot act on '{owner}''s brokered \
+             requests — only '{owner}''s own permission server opens, awaits and \
+             closes them (caller rule, CAD-376)"
+        ))
+    }
+
     /// `request_open` — a brokered request raised by an external
     /// requester (the `cadence mcp-permission` server a brokered
     /// claude launches) rather than by the provider adapter itself.
     /// Same model as `on_provider_request`: durable through the event
     /// log, visible via `agent_requests`, and holding the agent in
-    /// `waiting_input` until `agent respond` answers it.
-    fn rpc_request_open(self: &Arc<Self>, params: &Value) -> Result<Value> {
+    /// `waiting_input` until `agent respond` answers it. Only the
+    /// agent's own connection opens one ([`Self::request_caller`]).
+    fn rpc_request_open(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        // Decided before anything is recorded, so a refused caller
+        // parks nothing and notifies no one.
+        let caller = self.request_caller(params, peer_pid, "request_open")?;
+        if caller != alias {
+            return Err(Self::foreign_request("request_open", &caller, &alias));
+        }
         let agent = self.store.agent(&alias)?;
         let brokered = agent
             .params
@@ -4343,8 +4387,12 @@ impl Shared {
     /// closed, or the caller's slice expires. `request_wait` callers
     /// re-issue until their own deadline; each pass stamps provider
     /// activity so a human's thinking time is never an idle fence.
-    fn rpc_request_wait(self: &Arc<Self>, params: &Value) -> Result<Value> {
+    /// Only the owning agent's connection waits: the parked answer is
+    /// consumed here, so another agent's wait could take the answer
+    /// and leave the owner's server reading `closed` — a denial.
+    fn rpc_request_wait(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
         let handle = required_str(params, "request")?;
+        let caller = self.request_caller(params, peer_pid, "request_wait")?;
         let wait = optional_u64(params, "wait").unwrap_or(60).min(120);
         let deadline = Instant::now() + Duration::from_secs(wait);
         loop {
@@ -4359,12 +4407,20 @@ impl Shared {
                 // answer before dropping it, so the mailbox is
                 // authoritative here; an actor exit sweep or a daemon
                 // restart leaves it empty, which reads as closed.
-                if let Some((_, answer)) = self.answered.lock().unwrap().remove(handle) {
+                let mut answered = self.answered.lock().unwrap();
+                if let Some((owner, _)) = answered.get(handle) {
+                    if *owner != caller {
+                        return Err(Self::foreign_request("request_wait", &caller, owner));
+                    }
+                    let (_, answer) = answered.remove(handle).expect("entry just read");
                     return Ok(json!({"state": "answered", "answer": answer}));
                 }
                 return Ok(json!({"state": "closed",
                                  "reason": "request is not pending"}));
             };
+            if alias != caller {
+                return Err(Self::foreign_request("request_wait", &caller, &alias));
+            }
             if let Ok(adapter) = self.adapter_for(&alias) {
                 adapter.note_activity();
             }
@@ -4384,19 +4440,33 @@ impl Shared {
     /// `agent_requests` drains. An answer parked at the boundary still
     /// lands — `agent respond` fills the mailbox before dropping the
     /// pending entry, so a close that finds it returns `answered`.
-    fn rpc_request_close(self: &Arc<Self>, params: &Value) -> Result<Value> {
+    /// Only the owning agent's connection closes a handle; a refused
+    /// close leaves it pending (and any parked answer parked).
+    fn rpc_request_close(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
         let handle = required_str(params, "request")?;
+        // Derived before the locks: it walks /proc and reads the store.
+        let caller = self.request_caller(params, peer_pid, "request_close")?;
         let alias = {
             let mut pending = self.pending.lock().unwrap();
             // Same lock order as respond (pending → answered): a
             // respond mid-flight holds pending through its mailbox
             // insert, so whichever we observe here is final.
-            if let Some((alias, answer)) = self.answered.lock().unwrap().remove(handle) {
+            let mut answered = self.answered.lock().unwrap();
+            let owner = answered
+                .get(handle)
+                .map(|(alias, _)| alias)
+                .or_else(|| pending.get(handle).map(|req| &req.alias));
+            if let Some(owner) = owner.filter(|owner| **owner != caller) {
+                return Err(Self::foreign_request("request_close", &caller, owner));
+            }
+            if let Some((alias, answer)) = answered.remove(handle) {
+                drop(answered);
                 pending.remove(handle);
                 drop(pending);
                 self.relax_waiting(&alias);
                 return Ok(json!({"state": "answered", "answer": answer}));
             }
+            drop(answered);
             pending.remove(handle).map(|req| req.alias)
         };
         if let Some(alias) = alias {
