@@ -14,9 +14,10 @@
 //!   stream is open, one shared watcher refreshes it every second and
 //!   reads are served from it; with no stream open a read fetches it.
 //! - **Overview**: built from the indexed views, the last daemon probe
-//!   pass and a git-clock cache keyed by `issue.md` rev. A tracker change
-//!   rebuilds it on the next read; a time-stale one is served while a
-//!   background pass refreshes it.
+//!   pass and the status/claim line times cached per tracker HEAD
+//!   (`issue::line_times`, CAD-403). A tracker change rebuilds it on the
+//!   next read; a time-stale one is served while a background pass
+//!   refreshes it.
 //! - **Stream**: one watcher per board, not one per connection, emits
 //!   the legacy `issues|jobs|agents|monitoring` frames unchanged plus
 //!   entity diffs — `issue`, `agent` and `plan` upserts and deletes
@@ -82,7 +83,6 @@ pub(super) fn get(state_dir: &Path, pm_dir: &Path) -> Arc<Model> {
                 tracker: Mutex::default(),
                 daemon: Mutex::default(),
                 overview: Mutex::default(),
-                clocks: Mutex::default(),
                 hub: Mutex::default(),
                 changed_at: Mutex::default(),
                 build_lock: Mutex::default(),
@@ -99,7 +99,6 @@ pub(super) struct Model {
     tracker: Mutex<Tracker>,
     daemon: Mutex<Option<Arc<DaemonSnap>>>,
     overview: Mutex<OverviewState>,
-    clocks: overview::ClockCache,
     hub: Mutex<Hub>,
     /// When the daemon side last moved — a change the watcher saw, or a
     /// write through this board. Nothing read before it is served again.
@@ -649,11 +648,7 @@ impl Model {
         overview::overview_board_from(
             &self.state_dir,
             &self.pm_dir,
-            overview::Reuse {
-                views,
-                sources,
-                clocks: &self.clocks,
-            },
+            overview::Reuse { views, sources },
             gh_wait,
         )
     }

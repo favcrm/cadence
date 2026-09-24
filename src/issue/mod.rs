@@ -14,6 +14,7 @@ pub mod doctor;
 pub mod finish;
 pub mod history;
 pub mod hooks;
+pub mod line_times;
 pub mod lint;
 pub mod model;
 pub mod notes;

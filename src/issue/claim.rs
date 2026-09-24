@@ -21,11 +21,12 @@
 //! flight, so it only warns.
 
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
+use crate::issue::line_times::LineTimes;
 use crate::issue::model::{Claim, Front};
 use crate::issue::{history, time, write, Pm};
 
@@ -210,31 +211,25 @@ pub fn new_claim(by: &str, note: Option<String>) -> Claim {
     }
 }
 
-/// Claim ages for many issues under one time budget — the git fallback
-/// for owner-only issues must not stall `status`/`overview`. Past the
-/// budget an owner-only issue reports no age.
+/// Claim ages for many issues — `status`, `overview` and the board's
+/// poll. An owner-only issue is dated from the tracker's cached line
+/// times (CAD-403), never a git walk per issue; without them (git did
+/// not answer in time) it reports no age.
 pub struct Clock<'a> {
-    pm_dir: &'a Path,
-    deadline: Instant,
+    times: Option<&'a LineTimes>,
 }
 
 impl<'a> Clock<'a> {
-    pub fn new(pm_dir: &'a Path, budget: Duration) -> Self {
-        Self {
-            pm_dir,
-            deadline: Instant::now() + budget,
-        }
+    pub fn new(times: Option<&'a LineTimes>) -> Self {
+        Self { times }
     }
 
     pub fn since(&self, project: &str, front: &Front) -> Option<i64> {
         if let Some(c) = &front.claim {
             return time::parse_iso(&c.at);
         }
-        let left = self.deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return None;
-        }
-        since(self.pm_dir, project, front, left.min(OWNER_CLOCK_TIMEOUT))
+        front.owner.as_ref()?;
+        self.times?.owner_at(project, &front.id)
     }
 }
 
