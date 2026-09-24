@@ -2013,6 +2013,13 @@ impl Shared {
                     if let Some(awaiting) = self.awaiting_report_view(&agent) {
                         j["awaiting_report"] = awaiting;
                     }
+                    // CAD-325: `board: true` folds what the board read
+                    // per agent through `agent_show` into this one pass.
+                    if params.get("board").and_then(Value::as_bool) == Some(true)
+                        && registry::has_actor(&agent.provider, &agent.endpoint_kind)
+                    {
+                        j["board"] = self.board_view(&agent.alias)?;
+                    }
                     agents.push(j);
                 }
                 Ok(json!({"agents": agents}))
@@ -5024,6 +5031,32 @@ impl Shared {
     /// fake never die. `resumable` is the question `dead` was being
     /// asked: stopped-or-dead with a saved native thread and no
     /// unreconciled unknowns fencing it.
+    /// CAD-325: the slice of `agent_show` the board renders an agent row
+    /// from — running messages, the parked count, queue and fence counts
+    /// and the event cursor — without the whole message history.
+    fn board_view(&self, alias: &str) -> Result<Value> {
+        let messages = self.store.messages(alias)?;
+        let running: Vec<Value> = messages
+            .iter()
+            .filter(|m| m.state == "running")
+            .map(Message::to_json)
+            .collect();
+        let parked = messages
+            .iter()
+            .filter(|m| {
+                m.state != "running"
+                    && m.result.as_ref().and_then(|r| r["via"].as_str()) == Some("pty_render_miss")
+            })
+            .count();
+        Ok(json!({
+            "messages": running,
+            "parked": parked,
+            "queued": self.store.queued_count(alias)?,
+            "unknown": self.store.unknown_messages(alias)?.len(),
+            "event_cursor": self.store.event_cursor(alias)?,
+        }))
+    }
+
     fn agent_liveness(&self, agent: &Agent) -> (bool, bool) {
         let dead = if registry::attachable(&agent.provider, &agent.endpoint_kind) {
             agent.endpoint.is_none() && agent.state != "stopped"
@@ -5162,15 +5195,25 @@ impl Shared {
             optional_str(params, "state"),
             params.get("all").and_then(Value::as_bool).unwrap_or(false),
         )?;
+        // CAD-325: `tasks_detail` lists each task's id/state/title, so the
+        // board binds agents to issues without one `job_show` per job.
+        let detail = params.get("tasks_detail").and_then(Value::as_bool) == Some(true);
         let mut out = Vec::new();
         for job in jobs {
             let mut j = job.to_json();
             let mut counts: std::collections::BTreeMap<String, i64> =
                 std::collections::BTreeMap::new();
-            for task in self.store.tasks_for_job(&job.id)? {
+            let tasks = self.store.tasks_for_job(&job.id)?;
+            for task in &tasks {
                 *counts.entry(task.state.clone()).or_insert(0) += 1;
             }
             j["tasks"] = json!(counts);
+            if detail {
+                j["task_list"] = json!(tasks
+                    .iter()
+                    .map(|t| json!({"id": t.id, "state": t.state, "title": t.title}))
+                    .collect::<Vec<_>>());
+            }
             out.push(j);
         }
         Ok(json!({"jobs": out}))

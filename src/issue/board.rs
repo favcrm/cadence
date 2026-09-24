@@ -212,7 +212,7 @@ pub fn load_all(pm_dir: &Path, project_key: Option<&str>) -> Result<Vec<Issue>> 
 }
 
 /// `CAD-16` → ("CAD", 16) so CAD-9 sorts before CAD-16.
-fn natural_key(id: &str) -> (String, u64) {
+pub(crate) fn natural_key(id: &str) -> (String, u64) {
     let (p, n) = id.rsplit_once('-').unwrap_or((id, "0"));
     (p.to_string(), n.parse().unwrap_or(0))
 }
@@ -531,6 +531,12 @@ pub fn rev_of(issue: &Issue) -> Value {
 
 /// Compact card payload for `GET /api/issues` and `issue ls --json`.
 pub fn card_json(view: &View) -> Value {
+    card_json_rev(view, rev_of(&view.issue))
+}
+
+/// [`card_json`] with the `rev` token supplied — the board's read model
+/// hashes `issue.md` once per change instead of once per card render.
+pub fn card_json_rev(view: &View, rev: Value) -> Value {
     let f = &view.issue.front;
     json!({
         "id": f.id,
@@ -553,7 +559,7 @@ pub fn card_json(view: &View) -> Value {
         "blocked": view.blocked,
         "blocked_reason": view.blocked_reason,
         "created": f.created,
-        "rev": rev_of(&view.issue),
+        "rev": rev,
         "counts": {
             "comments": view.issue.comments.len(),
             "artifacts": view.issue.artifacts.len(),
