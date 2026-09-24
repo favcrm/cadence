@@ -235,6 +235,13 @@ fn automatic_quota_error(agent: &Agent) -> Option<String> {
 /// the `daemon` stream, which the WAL watcher trims to its newest rows.
 /// `cadence audit` reads it read-only; nothing else consults it.
 pub const APPROVAL_STREAM: &str = "audit:approvals";
+/// CAD-449: every verdict `report_verdict` recorded — the daemon's own
+/// statement of who judged which head, written from the identity it
+/// derived from the reviewer's connection. Like [`APPROVAL_STREAM`] the
+/// name is no agent identifier, so no `agent rm` deletes it and no
+/// retention prune names it; no RPC writes it but `report_verdict`.
+pub const VERDICT_STREAM: &str = "audit:verdicts";
+pub const VERDICT_RECORDED_EVENT: &str = "review_verdict";
 /// CAD-405: a project's work gate keys approved by the operator.
 pub const WORK_APPROVED_EVENT: &str = "project_work_approved";
 /// An operator approved `action` on one exact head — see [`NewApproval`].
@@ -2094,6 +2101,45 @@ impl Store {
     pub fn record_work_approval(&self, payload: Value) -> Result<()> {
         let conn = self.conn();
         Self::event(&conn, APPROVAL_STREAM, WORK_APPROVED_EVENT, payload)
+    }
+
+    /// CAD-449: record a verdict `report_verdict` accepted (`issue`,
+    /// `verdict`, `sha`, `reviewer`, `report`) on [`VERDICT_STREAM`].
+    pub fn record_review_verdict(&self, payload: Value) -> Result<()> {
+        let conn = self.conn();
+        Self::event(&conn, VERDICT_STREAM, VERDICT_RECORDED_EVENT, payload)
+    }
+
+    /// CAD-449: did `report_verdict` record exactly this verdict — the
+    /// same issue, verdict, sha, reviewer and report?
+    pub fn verdict_recorded(
+        &self,
+        issue: &str,
+        verdict: &str,
+        sha: &str,
+        reviewer: &str,
+        report: &str,
+    ) -> Result<bool> {
+        let conn = self.conn();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE alias=?1 AND kind=?2 \
+             AND json_extract(payload,'$.issue')=?3 \
+             AND json_extract(payload,'$.verdict')=?4 \
+             AND json_extract(payload,'$.sha')=?5 \
+             AND json_extract(payload,'$.reviewer')=?6 \
+             AND json_extract(payload,'$.report')=?7",
+            params![
+                VERDICT_STREAM,
+                VERDICT_RECORDED_EVENT,
+                issue,
+                verdict,
+                sha,
+                reviewer,
+                report
+            ],
+            |row| row.get(0),
+        )?;
+        Ok(n > 0)
     }
 
     /// CAD-405: the latest work-gate approval per project.

@@ -110,7 +110,7 @@ Error kinds:
 | `report_verdict` | `issue, text` | the stored report (`{id, report, path, kind:"verdict", agent, committed, duplicate}`) plus `delivery` (the ticket's loop record). CAD-431: the only way a `verdict` report is filed — `text` is the report Markdown (`verdict: pass\|revise`, `sha:`, findings as the body). See "Worker loop" for who may file it |
 | `answer_route` | `issue, report` (no other field) | Sent: `{sent:true, to, message, duplicate:false, state}`. A retry: `{sent:false, to, message, duplicate:true}` (told before). Not told, the answer standing: `{sent:false, to, why}` — `why` is `already answered — …` (another answer to the question was sent first) or `the answerer asked it`; `{sent:false, to, undeliverable}` — the asker is not registered (recorded once per question as a daemon-stream `answer_undeliverable` event). Any other message already holding the question's id (a squat) is an error, also recorded `answer_undeliverable`. CAD-447: queues ONE message per question through the daemon's own `daemon_message` (CAD-445: source `answer`, id `sys-answer-<hash of the QUESTION's path>`, both refused from every caller; no `reply_to` — it owes nobody a report) to the author of the question the `answer` report `report` names — the first answer to route wins, whatever the file names, same-second answers or concurrent routes — with the answer text and the report's path (a pty asker gets one flattened line). Sent by `cadence report file --kind answer` (which prints `the asker was not told: …` on stderr otherwise) and the board's answer route right after filing |
 | `delivery_list` | `issue?` | `{records:[Record]}` — the worker loop's records (CAD-431), oldest dispatch first. A read, open to anyone (the master included) |
-| `delivery_observe` | `issue, head, pr_state (OPEN\|MERGED\|CLOSED), ci_green?, auto_merge?, additions?, deletions?, files?` | `{issue, state, was, disable_auto, merge_ready}` — what the operator's process read from GitHub. **Operator only** |
+| `delivery_observe` | `issue, head, pr_state (OPEN\|MERGED\|CLOSED), ci_green?, auto_merge?, additions?, deletions?, files?` | `{issue, state, was, disable_auto, merge_ready, ticket?}` — what the operator's process read from GitHub. `ticket` is present only on the transition into `merged`: `{outcome: marked, at}`, `{outcome: kept, status}`, `{outcome: refused, why}` or `{outcome: pending, why, from}` — also kept on the record as `ticket_done` (CAD-449, see Worker loop step 5). **Operator only** |
 | `delivery_merge` | `issue, phase (authorize\|check\|enqueued), sha?` | `authorize`/`check`: `{issue, sha, pr}`; `enqueued`: the record, now `enqueued`. **Operator only** |
 | `delivery_decline` | `issue, reason` | the record, now `declined`, `note` = the reason. **Operator only** |
 
@@ -2080,6 +2080,56 @@ the daemon writes it. Report files never move a ticket through the loop.
    `sync` runs `gh pr merge <n> --disable-auto`; until an observation
    shows it off, Needs-you carries an `auto_merge_on` row. A `MERGED`
    or `CLOSED` observation ends the loop.
+5. **Merged → done (CAD-449).** The observation that moves a record
+   into `merged` also settles the ticket's tracker status, and records
+   how on the record as `ticket_done`:
+   - `marked` — the status became `done` in a commit
+     `<ID>: set status=done — <owner/repo#n> merged at <sha>` whose
+     `Actor:` is `operator (delivery <owner/repo#n>)`. The observer is
+     the proven operator's process (`delivery sync`, or the board's
+     timer), the same authority that recorded the merge. A
+     `ticket_done_on_merge` event is recorded, and the status commit
+     shows in "since you left" (`master_summary`'s `tickets_moved`).
+   - `kept` — the ticket was already `done` or `dropped`; nothing is
+     written.
+   - `refused` — the merge is not the reviewed one. The status is left
+     as it is, a ticket comment and a `ticket_done_refused` event say
+     why, and Needs-you carries a `merged_not_done` row until the
+     operator sets the status (the router pass then records `kept`).
+   - `pending` — the tracker write failed (another writer holds the
+     tracker lock, which the daemon never waits for; a failing commit
+     hook). `issue.md` is restored and unstaged, so the next writer
+     commits no `status: done`. A `ticket_done_pending` event and the
+     `merged_not_done` row carry it; a ticket comment says why when the
+     tracker takes writes, and the router pass retries until it settles
+     (`marked`, with a comment naming the first failure, or `kept`).
+     A retry marks done only while the status is still `from`, what it
+     was at the merge: a status the operator set by hand meanwhile (the
+     row sends them to the ticket) is their decision — the retry
+     records `kept` with that status, comments, and the row goes. A
+     `pending` record without `from` is `refused` instead of retried.
+
+   It is `marked` only when all of these hold: the record was `passed`
+   or `enqueued` before the merge; the merged head is the PASSed sha;
+   the PR is in the project's repos (the done report's check, run
+   again); and the store's `audit:verdicts` stream holds that PASS —
+   the entry `report_verdict` writes, with the identity the daemon
+   derived from the reviewer's connection, naming this issue, sha,
+   reviewer and report. That stream is written by no RPC but
+   `report_verdict` and never pruned. A `delivery.json` rewritten on
+   disk, or a verdict report planted in the tracker (and committed by
+   another writer's `git add -A`), carries no such entry. A PASS
+   recorded before this stream existed is `refused` — the operator
+   sets the status. `CLOSED`, `declined` and an unmerged PR never set
+   done.
+
+   Only the transition settles it: the `merged` record is the guard, so
+   a second sync (which skips a finished loop), a replayed or concurrent
+   observation, or a ticket the operator reopened after its merge
+   writes nothing. Tickets that waited on this one are named ready by
+   the loop-end wake that follows the done write (CAD-445), exactly
+   once: that wake records them, so the router's blocker-done pass does
+   not wake them again.
 
 Pinning: `gh pr merge --match-head-commit <sha>` sends the SHA as
 GraphQL `expectedHeadOid` on every path — `mergePullRequest` for a
@@ -2151,14 +2201,19 @@ master when
 
 - the operator approves a plan (`plan_approve`),
 - a ticket's loop ends — `merged` or `closed` (seen by
-  `delivery_observe`) or `declined` (`delivery_decline`); a merged ticket
-  that ready tickets still wait on is named with what unblocks them
-  (the operator marks it done),
+  `delivery_observe`) or `declined` (`delivery_decline`). A reviewed
+  merge has already marked the ticket done (CAD-449, Worker loop step
+  5), so the wake names the tickets that waited on it as ready; when the
+  merge did not mark it (refused or pending), a merged ticket that ready
+  tickets still wait on is named with what unblocks them (the operator
+  marks it done). The dependents a merge wake names ready are
+  remembered, and `wake_lock` is held from before the done write until
+  then, so the blocker-done pass below never wakes them a second time,
 - a `ready` ticket of an approved plan has every `blocked_by` done or
-  dropped. Tracker status is written by the CLI, not the daemon, so the
-  report router's pass finds it (within one router period, 30 s by
-  default). A ticket the plan's approval wake already named ready is not
-  woken again for the same blockers.
+  dropped. A status the CLI writes (the operator's `issue set`) is found
+  by the report router's pass (within one router period, 30 s by
+  default). A ticket the plan's approval wake or a merge wake already
+  named ready is not woken again for the same blockers.
 
 Each wake lists the project's tickets ready to dispatch now and those
 still waiting on a blocker. It is a hint: the master dispatches with

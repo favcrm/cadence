@@ -905,6 +905,61 @@ pub fn set_fields(pm: &Pm, ids: &[String], pairs: &[String], actor: &str) -> Res
               "worktree_open": worktree_open, "committed": true}))
 }
 
+/// Put `path`'s index entry back to HEAD's after a failed commit — the
+/// commit's `git add -A` staged it. Best effort: the write already failed.
+fn unstage(pm: &Pm, path: &Path) {
+    if let Ok(rel) = path.strip_prefix(&pm.dir) {
+        let _ = crate::issue::git(&pm.dir, &["reset", "-q", "--", &rel.to_string_lossy()]);
+    }
+}
+
+/// CAD-449: a merged delivery marks its ticket done — one frontmatter
+/// write and one tracker commit, `<ID>: set status=done — <why>`, whose
+/// `Actor:` trailer is `actor` (the observer and the delivery). A ticket
+/// already `done` or `dropped` is left alone: answers `Some(status)`
+/// and writes nothing. `None` means it was marked done. The plan gate
+/// every status write passes ([`crate::issue::plan::check_status_write`])
+/// applies here too. With `expect`, the ticket is marked only while its
+/// status is still that one — a status changed since (the operator
+/// reopened or moved it) is left alone and answered like `done`.
+///
+/// It never waits for the tracker lock: a busy tracker is an error the
+/// caller retries (the daemon holds its own lock here). A failed commit
+/// leaves nothing behind — `issue.md` is restored and unstaged, so the
+/// next writer's `git add -A` cannot commit `status: done` for it.
+pub fn mark_done_on_merge(
+    pm: &Pm,
+    id: &str,
+    why: &str,
+    actor: &str,
+    expect: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(_lock) = pm.try_lock()? else {
+        return Err(Error::rejected(
+            "the tracker is locked by another writer (.write.lock)",
+        ));
+    };
+    let (_project, dir) = issue_dir(pm, id)?;
+    let (mut front, body) = load_front(&dir)?;
+    if matches!(front.status.as_str(), "done" | "dropped")
+        || expect.is_some_and(|e| e != front.status)
+    {
+        return Ok(Some(front.status));
+    }
+    crate::issue::plan::check_status_write(&pm.dir, &front, "done")?;
+    front.status = "done".to_string();
+    let file = dir.join("issue.md");
+    let original = std::fs::read(&file)?;
+    let written = save_front(&dir, &front, &body)
+        .and_then(|_| commit(pm, &format!("{id}: set status=done — {why}"), &[id], actor));
+    if let Err(e) = written {
+        let _ = std::fs::write(&file, &original);
+        unstage(pm, &file);
+        return Err(e);
+    }
+    Ok(None)
+}
+
 /// CAD-405: an issue with a plan or children is an epic — an explicit
 /// other type would silently drop it from every epic view.
 fn check_type_change(pm: &Pm, front: &Front) -> Result<()> {
@@ -1406,13 +1461,20 @@ pub fn add_comment(
         &format!("{}-{author}.md", time::basic(epoch)),
         text.as_bytes(),
     )?;
-    commit_who(
+    // A failed commit leaves nothing behind (CAD-449): the file goes,
+    // and so does the `git add -A` staging of it — else the next
+    // writer's commit carries this comment under its own subject.
+    if let Err(e) = commit_who(
         pm,
         &format!("{id}: comment by {author}"),
         &[id],
         actor,
         author_opt,
-    )?;
+    ) {
+        let _ = std::fs::remove_file(&path);
+        unstage(pm, &path);
+        return Err(e);
+    }
     let mut out = json!({"id": id, "comment": path.file_name().map(|n| n.to_string_lossy().to_string()),
               "author": author, "committed": true});
     if !secret_warnings.is_empty() {
@@ -1613,4 +1675,125 @@ pub fn attach_bytes(
         json!({"id": id, "artifact": path.file_name().map(|n| n.to_string_lossy().to_string()),
               "size": bytes.len(), "committed": true}),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A tracker with project `cadence` and one ticket, CAD-1.
+    fn tracker() -> (tempfile::TempDir, Pm) {
+        let dir = tempfile::tempdir().unwrap();
+        let pm = Pm::init(&dir.path().join("pm")).unwrap();
+        project_add(&pm, "cadence", "CAD", &[], &[], &[], None).unwrap();
+        new_issue(
+            &pm,
+            dir.path(),
+            Some("cadence"),
+            "ticket",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            &[],
+            None,
+            "t",
+        )
+        .unwrap();
+        (dir, pm)
+    }
+
+    /// A pre-commit hook that refuses every commit; remove it to heal.
+    fn failing_hook(pm: &Pm) -> PathBuf {
+        let hooks = crate::issue::git(&pm.dir, &["rev-parse", "--git-path", "hooks"]).unwrap();
+        let hooks = pm.dir.join(hooks);
+        std::fs::create_dir_all(&hooks).unwrap();
+        let hook = hooks.join("pre-commit");
+        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        hook
+    }
+
+    /// Nothing staged, nothing changed in the work tree.
+    fn clean(pm: &Pm) -> bool {
+        crate::issue::git(&pm.dir, &["diff", "--cached", "--quiet"]).is_ok()
+            && crate::issue::git(&pm.dir, &["status", "--porcelain"]).is_ok_and(|s| s.is_empty())
+    }
+
+    /// CAD-449: a failed done commit restores `issue.md` and its index
+    /// entry — the next writer's `git add -A` finds nothing of it.
+    #[test]
+    fn a_failed_done_write_leaves_nothing_behind() {
+        let (_dir, pm) = tracker();
+        let (_, dir) = issue_dir(&pm, "CAD-1").unwrap();
+        let before = std::fs::read(dir.join("issue.md")).unwrap();
+        assert!(clean(&pm));
+        let hook = failing_hook(&pm);
+        let e = mark_done_on_merge(
+            &pm,
+            "CAD-1",
+            "o/r#1 merged at x",
+            "operator (delivery o/r#1)",
+            None,
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("commit"), "{e}");
+        assert_eq!(std::fs::read(dir.join("issue.md")).unwrap(), before);
+        assert!(clean(&pm), "a failed done write left something staged");
+        std::fs::remove_file(hook).unwrap();
+        // A status changed since the merge (`expect` no longer holds) is
+        // left alone and nothing is written.
+        let commits = crate::issue::git(&pm.dir, &["rev-list", "--count", "HEAD"]).unwrap();
+        assert_eq!(
+            mark_done_on_merge(&pm, "CAD-1", "w", "operator", Some("doing")).unwrap(),
+            Some("backlog".to_string())
+        );
+        assert_eq!(load_front(&dir).unwrap().0.status, "backlog");
+        assert_eq!(
+            crate::issue::git(&pm.dir, &["rev-list", "--count", "HEAD"]).unwrap(),
+            commits
+        );
+        assert_eq!(
+            mark_done_on_merge(
+                &pm,
+                "CAD-1",
+                "o/r#1 merged at x",
+                "operator (delivery o/r#1)",
+                Some("backlog"),
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(load_front(&dir).unwrap().0.status, "done");
+        // Done already: left alone.
+        assert_eq!(
+            mark_done_on_merge(&pm, "CAD-1", "again", "operator", None).unwrap(),
+            Some("done".to_string())
+        );
+    }
+
+    /// CAD-449: the done write never waits for a busy tracker.
+    #[test]
+    fn a_busy_tracker_refuses_the_done_write_at_once() {
+        let (_dir, pm) = tracker();
+        let held = pm.lock().unwrap();
+        let t = std::time::Instant::now();
+        let e = mark_done_on_merge(&pm, "CAD-1", "w", "operator", None).unwrap_err();
+        assert!(e.to_string().contains("locked"), "{e}");
+        assert!(t.elapsed() < std::time::Duration::from_secs(2));
+        drop(held);
+    }
+
+    /// CAD-449: a comment whose commit fails removes its file and its
+    /// staging, so no later commit carries it.
+    #[test]
+    fn a_failed_comment_leaves_nothing_behind() {
+        let (_dir, pm) = tracker();
+        let hook = failing_hook(&pm);
+        assert!(add_comment(&pm, "CAD-1", "hello", Some("w1"), None, None, "w1").is_err());
+        assert!(clean(&pm), "a failed comment left something behind");
+        std::fs::remove_file(hook).unwrap();
+    }
 }

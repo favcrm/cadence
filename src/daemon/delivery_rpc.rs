@@ -15,6 +15,10 @@
 //!   proven operator's: GitHub facts come only from the operator's own
 //!   process (`cadence delivery sync|merge`), and a head that moved after
 //!   review re-enters review and asks that process to disable auto-merge.
+//! - The observation that moves a record into `merged` marks the ticket
+//!   `done` (CAD-449) — once, and only for the reviewed merge
+//!   ([`Shared::merge_done_refusal`]); the router pass retries a
+//!   tracker write that failed ([`Shared::settle_ticket_done`]).
 //!
 //! Every refusal happens before anything is written — the tracker, the
 //! record and the message queue alike.
@@ -25,7 +29,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use super::{optional_str, required_str, Shared, DAEMON_ALIAS};
-use crate::delivery::{self, Candidate, Observed, Record, State, VerdictRec};
+use crate::delivery::{self, Candidate, Observed, Record, State, TicketDone, VerdictRec};
 use crate::error::{Error, Result};
 use crate::issue::{self, task_report, Pm};
 use crate::master;
@@ -71,6 +75,9 @@ impl Shared {
     /// unconsumed `done` report goes to review; an unstaffed review is
     /// retried. Returns how many records moved.
     pub(super) fn route_delivery(self: &Arc<Self>) -> Result<usize> {
+        if let Err(e) = self.settle_ticket_done() {
+            tracing::warn!("delivery router, merged tickets: {e}");
+        }
         let _g = self.delivery_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut all = delivery::load(&self.state_dir)?;
         if all.values().all(|r| r.state.terminal()) {
@@ -452,6 +459,14 @@ impl Shared {
         };
         let out = rec.to_json();
         delivery::save(&self.state_dir, &all)?;
+        // CAD-449: the daemon's own statement of this verdict — what a
+        // merge must match to mark the ticket done.
+        if let Err(e) = self.store.record_review_verdict(json!({
+            "issue": id, "verdict": verdict.as_str(), "sha": sha, "reviewer": who,
+            "report": report,
+        })) {
+            tracing::warn!("verdict evidence for {id}: {e}");
+        }
         let _ = issue::write::add_comment(
             &pm,
             id,
@@ -533,7 +548,7 @@ impl Shared {
             at: now(),
         };
         let pm = Pm::at(&self.pm_dir()?)?;
-        let _g = self.delivery_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = self.delivery_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut all = delivery::load(&self.state_dir)?;
         let rec = all.get_mut(id).ok_or_else(|| not_in_loop(id))?;
         let before = rec.state;
@@ -571,16 +586,40 @@ impl Shared {
         let approved = rec.state == State::Enqueued && rec.passed_sha() == Some(head.as_str());
         rec.disable_auto = obs.auto_merge && !approved && rec.state != State::Merged;
         rec.observed = Some(obs);
-        let out = json!({
+        let mut out = json!({
             "issue": id, "state": rec.state.as_str(), "was": before.as_str(),
             "disable_auto": rec.disable_auto, "merge_ready": rec.merge_ready(),
         });
-        // CAD-445: a loop that just ended wakes the master once.
+        // CAD-449: only the transition into `merged` settles the ticket's
+        // status. The record's `merged` is the once-guard: a replay, a
+        // second sync or a ticket reopened after its merge finds it
+        // merged already and writes nothing. The tracker write comes
+        // first — if the save then fails, the next sync transitions
+        // again and finds the ticket done (`kept`).
+        let mut notices = Vec::new();
+        // CAD-445 + CAD-449: `wake_lock` is held from before the done
+        // write until the loop-end wake records the dependents it named,
+        // so the router's blocker-done pass cannot wake them a second time.
+        let merging = before != State::Merged && rec.state == State::Merged;
+        let wake_guard = merging.then(|| self.wake_lock.lock().unwrap_or_else(|e| e.into_inner()));
+        if merging {
+            let done = self.settle_merge(&pm, rec, before, &head, &mut notices);
+            out["ticket"] = serde_json::to_value(&done).unwrap_or(Value::Null);
+            rec.ticket_done = Some(done);
+        }
+        // CAD-445: a loop that just ended wakes the master once — after
+        // the ticket's status is settled, so the wake reads it done.
         let ended = (before != rec.state).then(|| rec.clone());
         delivery::save(&self.state_dir, &all)?;
+        drop(guard);
+        // The wake first: it releases `wake_lock`, which a comment waiting
+        // on the tracker lock must not hold.
         if let Some(rec) = ended {
-            self.wake_on_delivery_end(&rec);
+            self.wake_on_delivery_end(&rec, wake_guard);
+        } else {
+            drop(wake_guard);
         }
+        self.post_notices(&pm, notices);
         if rec_state_changed(&out, was_disable) {
             let _ = self
                 .store
@@ -588,6 +627,279 @@ impl Shared {
             self.wake();
         }
         Ok(out)
+    }
+
+    /// CAD-449, the router pass: a merged loop whose ticket is not
+    /// settled — `pending` (the tracker write failed: busy, a failing
+    /// hook) is written again; `refused` becomes `kept` once the
+    /// operator set the status by hand. Answers how many records moved.
+    pub(super) fn settle_ticket_done(&self) -> Result<usize> {
+        let (moved, notices, pm) = {
+            let _g = self.delivery_lock.lock().unwrap_or_else(|e| e.into_inner());
+            let mut all = delivery::load(&self.state_dir)?;
+            let open: Vec<String> = all
+                .values()
+                .filter(|r| r.state == State::Merged)
+                .filter(|r| r.ticket_done.as_ref().is_some_and(|d| d.open().is_some()))
+                .map(|r| r.issue.clone())
+                .collect();
+            if open.is_empty() {
+                return Ok(0);
+            }
+            let pm = Pm::at(&self.pm_dir()?)?;
+            let mut notices = Vec::new();
+            let mut moved = 0;
+            for id in open {
+                let Some(rec) = all.get_mut(&id) else {
+                    continue;
+                };
+                let next = match rec.ticket_done.clone() {
+                    Some(TicketDone::Pending { why, from }) => {
+                        // Only while the status is still what it was at
+                        // the merge: a status set by hand since (the
+                        // `merged_not_done` row sends the operator here)
+                        // is the operator's decision, never overwritten.
+                        let Some(from) = from else {
+                            notices.push(Notice {
+                                issue: id.clone(),
+                                comment: None,
+                                kind: "ticket_done_refused",
+                                payload: json!({"issue": id, "why": "status at merge unknown"}),
+                            });
+                            rec.ticket_done = Some(TicketDone::Refused {
+                                why: format!(
+                                    "the done write failed ({why}) and the status at the \
+                                     merge is unknown — the operator sets it"
+                                ),
+                            });
+                            moved += 1;
+                            continue;
+                        };
+                        let head = rec.observed.as_ref().map(|o| o.head.clone());
+                        let mut mine = Vec::new();
+                        let next = self.mark_ticket_done(
+                            &pm,
+                            rec,
+                            &head.unwrap_or_default(),
+                            Some(&from),
+                            &mut mine,
+                        );
+                        // One comment per failure, not one per pass.
+                        if matches!(&next, TicketDone::Pending { why: now, .. } if *now == why) {
+                            continue;
+                        }
+                        let comment = match &next {
+                            TicketDone::Marked { .. } => Some(format!(
+                                "{id} marked done after a retry (the first write failed: {why})."
+                            )),
+                            TicketDone::Kept { status }
+                                if status != "done" && status != "dropped" =>
+                            {
+                                Some(format!(
+                                    "{id} was not marked done: its status was set to {status} \
+                                     by hand after the merge (it was {from}); left as it is."
+                                ))
+                            }
+                            _ => None,
+                        };
+                        if let Some(text) = comment {
+                            notices.push(Notice {
+                                issue: id.clone(),
+                                comment: Some(text),
+                                kind: "ticket_done_retried",
+                                payload: json!({"issue": id, "why": why, "outcome": next}),
+                            });
+                        }
+                        notices.extend(mine);
+                        next
+                    }
+                    Some(TicketDone::Refused { .. }) => {
+                        match issue::board::find_issue(&pm.dir, &id) {
+                            Ok(t) if matches!(t.front.status.as_str(), "done" | "dropped") => {
+                                TicketDone::Kept {
+                                    status: t.front.status.clone(),
+                                }
+                            }
+                            _ => continue,
+                        }
+                    }
+                    _ => continue,
+                };
+                rec.ticket_done = Some(next);
+                moved += 1;
+            }
+            if moved > 0 {
+                delivery::save(&self.state_dir, &all)?;
+            }
+            (moved, notices, pm)
+        };
+        self.post_notices(&pm, notices);
+        if moved > 0 {
+            self.wake();
+        }
+        Ok(moved)
+    }
+
+    /// CAD-449: the operator's process just saw `rec`'s PR merged at
+    /// `head` (the record left `before` for `merged`). The ticket becomes
+    /// `done` when the merge is the reviewed one — see
+    /// [`Self::merge_done_refusal`] — else it is `refused` and a ticket
+    /// comment says why. Runs under `delivery_lock`; what to tell goes to
+    /// `notices`, posted after the lock is released.
+    fn settle_merge(
+        &self,
+        pm: &Pm,
+        rec: &Record,
+        before: State,
+        head: &str,
+        notices: &mut Vec<Notice>,
+    ) -> TicketDone {
+        let refused = match self.merge_done_refusal(pm, rec, before, head) {
+            Ok(r) => r,
+            Err(e) => Some(format!("the merge could not be checked: {e}")),
+        };
+        let Some(why) = refused else {
+            return self.mark_ticket_done(pm, rec, head, None, notices);
+        };
+        let pr_ref = rec_pr_ref(rec);
+        let id = &rec.issue;
+        notices.push(Notice {
+            issue: id.clone(),
+            comment: Some(format!(
+                "{pr_ref} merged at {head}, but {id} was not marked done: {why}. \
+                 The operator sets its status."
+            )),
+            kind: "ticket_done_refused",
+            payload: json!({"issue": id, "pr": pr_ref, "head": head, "why": why}),
+        });
+        TicketDone::Refused { why }
+    }
+
+    /// The tracker write for a reviewed merge: `marked`, `kept` (already
+    /// done or dropped, or — with `expect` — no longer that status) or
+    /// `pending` (the write failed; retried by the router pass while the
+    /// status is still what it was). The commit's `Actor:` names the observer and the
+    /// delivery. Never waits for the tracker lock.
+    fn mark_ticket_done(
+        &self,
+        pm: &Pm,
+        rec: &Record,
+        head: &str,
+        expect: Option<&str>,
+        notices: &mut Vec<Notice>,
+    ) -> TicketDone {
+        let id = &rec.issue;
+        let pr_ref = rec_pr_ref(rec);
+        let actor = format!("operator (delivery {pr_ref})");
+        let why = format!("{pr_ref} merged at {head}");
+        match issue::write::mark_done_on_merge(pm, id, &why, &actor, expect) {
+            Ok(None) => {
+                notices.push(Notice {
+                    issue: id.clone(),
+                    comment: None,
+                    kind: "ticket_done_on_merge",
+                    payload: json!({"issue": id, "pr": pr_ref, "head": head, "actor": actor}),
+                });
+                TicketDone::Marked { at: now() }
+            }
+            Ok(Some(status)) => TicketDone::Kept { status },
+            Err(e) => {
+                let why = e.to_string();
+                notices.push(Notice {
+                    issue: id.clone(),
+                    comment: Some(format!(
+                        "{pr_ref} merged at {head}, but marking {id} done failed: {why}. \
+                         The daemon retries; the operator can set its status."
+                    )),
+                    kind: "ticket_done_pending",
+                    payload: json!({"issue": id, "pr": pr_ref, "head": head, "why": why}),
+                });
+                // What a retry must still find: the status the write
+                // left in place (it rolled back), read now.
+                let from = match expect {
+                    Some(e) => Some(e.to_string()),
+                    None => issue::board::find_issue(&pm.dir, id)
+                        .ok()
+                        .map(|t| t.front.status),
+                };
+                TicketDone::Pending { why, from }
+            }
+        }
+    }
+
+    /// Post what [`Self::settle_merge`] had to tell, outside
+    /// `delivery_lock`: a comment waits for the tracker lock like any
+    /// writer, and must not hold the loop up while it does.
+    fn post_notices(&self, pm: &Pm, notices: Vec<Notice>) {
+        for n in notices {
+            // A write that failed on a busy tracker would wait out the
+            // same lock here; the Needs-you row and the event carry it,
+            // and the retry that settles it comments then.
+            let busy = n.kind == "ticket_done_pending" && pm.dir.join(".write.lock").exists();
+            if let Some(text) = n.comment.as_ref().filter(|_| !busy) {
+                let _ = issue::write::add_comment(
+                    pm,
+                    &n.issue,
+                    text,
+                    Some(DAEMON_ALIAS),
+                    Some("review"),
+                    None,
+                    DAEMON_ALIAS,
+                );
+            }
+            let _ = self.store.event_public(DAEMON_ALIAS, n.kind, n.payload);
+        }
+    }
+
+    /// Why a merge observed for `rec` does not mark its ticket done, if
+    /// it does not. Allowlist: the loop stood on a PASS (`passed` or
+    /// `enqueued` before the merge — never a review in progress, an
+    /// escalation or an unstaffed review); the merged head is the
+    /// PASSed sha; the PR is in the project's own repos (the check a
+    /// done report passes, run again now); and the PASS is one
+    /// `report_verdict` recorded — the store's [`store::VERDICT_STREAM`]
+    /// holds that verdict, sha, reviewer and report, written from the
+    /// identity the daemon derived from the reviewer's connection. The
+    /// record is never trusted on its own: `delivery.json` and the
+    /// tracker are files, and neither carries the daemon's statement.
+    fn merge_done_refusal(
+        &self,
+        pm: &Pm,
+        rec: &Record,
+        before: State,
+        head: &str,
+    ) -> Result<Option<String>> {
+        if !matches!(before, State::Passed | State::Enqueued) {
+            return Ok(Some(format!(
+                "the loop was {} when it merged, not passed or enqueued",
+                before.as_str()
+            )));
+        }
+        let Some(v) = rec.verdict.as_ref().filter(|v| v.verdict == "pass") else {
+            return Ok(Some("no PASS verdict stands".to_string()));
+        };
+        if v.sha != head {
+            return Ok(Some(format!(
+                "the merged head {head} is not the reviewed {}",
+                v.sha
+            )));
+        }
+        let Some(pr) = rec.pr.as_deref() else {
+            return Ok(Some("the loop records no PR".to_string()));
+        };
+        if let Some(why) = self.pr_refusal(pm, rec, pr, &[])? {
+            return Ok(Some(format!("the PR {why}")));
+        }
+        if !self
+            .store
+            .verdict_recorded(&rec.issue, "pass", head, &v.reviewer, &v.report)?
+        {
+            return Ok(Some(format!(
+                "the daemon recorded no PASS by {} for {head} ({})",
+                v.reviewer, v.report
+            )));
+        }
+        Ok(None)
     }
 
     /// `delivery_merge` — the operator's merge decision, in phases run
@@ -695,7 +1007,7 @@ impl Shared {
         let out = rec.to_json();
         let ended = rec.clone();
         delivery::save(&self.state_dir, &all)?;
-        self.wake_on_delivery_end(&ended);
+        self.wake_on_delivery_end(&ended, None);
         if let Ok(pm) = self.pm_dir().and_then(|d| Pm::at(&d)) {
             let _ = issue::write::add_comment(
                 &pm,
@@ -723,4 +1035,20 @@ impl Shared {
 /// not on every observation (CAD-446: the board observes every minute).
 fn rec_state_changed(out: &Value, was_disable: bool) -> bool {
     out["state"] != out["was"] || (out["disable_auto"] == true && !was_disable)
+}
+
+/// Something the loop tells after `delivery_lock` is released: an
+/// optional ticket comment and one event.
+struct Notice {
+    issue: String,
+    comment: Option<String>,
+    kind: &'static str,
+    payload: Value,
+}
+
+fn rec_pr_ref(rec: &Record) -> String {
+    rec.pr
+        .as_deref()
+        .and_then(delivery::pr_ref)
+        .unwrap_or_default()
 }
