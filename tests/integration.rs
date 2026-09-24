@@ -48472,6 +48472,16 @@ fn cad324_continuity_packs_on_new_compacted_and_lost_sessions() {
     .unwrap();
     assert_eq!(result_text(&f.d, "lead", "c3"), "FAKE_COMPACTED");
     assert_eq!(events_of_kind(&f.d, "lead", "session_compacted").len(), 1);
+    // The compaction is a thread note — what keeps it due across a restart.
+    let compacted =
+        f.d.rpc("thread_read", json!({"alias": "lead", "limit": 500}))
+            .unwrap()["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["payload"]["event"] == "session_compacted")
+            .count();
+    assert_eq!(compacted, 1);
     f.d.operator_rpc(
         "thread_send",
         json!({"alias": "lead", "text": "after compaction", "message": "c4"}),
@@ -48486,8 +48496,9 @@ fn cad324_continuity_packs_on_new_compacted_and_lost_sessions() {
         "{pack}"
     );
     assert!(!pack.contains("after compaction"), "{pack}");
-    // The earlier delivery note is not replayed as a turn.
+    // The daemon's own notes are not replayed as turns.
     assert!(!pack.contains("Continuity pack delivered"), "{pack}");
+    assert!(!pack.contains("the next turn carries"), "{pack}");
     assert_eq!(
         events_of_kind(&f.d, "lead", "continuity_pack")[1]["payload"]["reason"],
         "compacted"
@@ -48529,4 +48540,93 @@ fn cad324_continuity_packs_on_new_compacted_and_lost_sessions() {
     assert!(!pack.contains("first after resume"), "current: {pack}");
     assert_eq!(events_of_kind(&f.d, "lead", "continuity_pack").len(), 3);
     assert_eq!(events_of_kind(&f.d, "lead", "fake_pack").len(), 3);
+}
+
+/// CAD-324: a compaction stays due across a daemon restart. The state
+/// dir is left the way a daemon that died right after the provider
+/// compacted leaves it — the session's identity stored, a turn in the
+/// thread, the compaction note — and the first turn after the restart
+/// carries the pack, once.
+#[test]
+fn cad324_compaction_pack_survives_a_daemon_restart() {
+    let seeded = TempDir::new().unwrap();
+    let state = seeded.path().to_path_buf();
+    {
+        let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
+        let cwd = state.to_str().unwrap().to_string();
+        store
+            .register_agent(&NewAgent {
+                alias: "lead",
+                provider: "fake",
+                endpoint_kind: "fake",
+                role: "worker",
+                cwd: &cwd,
+                sandbox: "read-only",
+                instructions: None,
+                params: None,
+                team_role: None,
+                model_policy: None,
+            })
+            .unwrap();
+        // The fake's own session id: the reopen is the same session.
+        store
+            .set_identity(
+                "lead",
+                &cadence_agent::adapter::Identity {
+                    thread_id: "fake-thread-lead".into(),
+                    session_id: "fake-session-lead".into(),
+                    model: None,
+                    effort: None,
+                    pid: 1,
+                    endpoint: None,
+                    generation: None,
+                    attach: None,
+                },
+            )
+            .unwrap();
+        store.ensure_thread("lead").unwrap();
+        store
+            .enqueue("lead", "before the restart", None, "s1", "user")
+            .unwrap();
+        let Take::Message(m) = store.take_queued("lead").unwrap() else {
+            panic!("expected a message");
+        };
+        store
+            .finish(&m, "completed", &json!({"text": "answered before"}), None)
+            .unwrap();
+        store
+            .thread_append(
+                "lead",
+                cadence_agent::store::NewEntry {
+                    role: cadence_agent::store::ROLE_SYSTEM,
+                    kind: cadence_agent::store::KIND_MESSAGE,
+                    text: "The provider compacted this session's context.",
+                    payload: Some(json!({"event": "session_compacted"})),
+                    message_id: None,
+                },
+            )
+            .unwrap();
+    }
+    // The restarted daemon reopens the agent's stored session itself.
+    let d = TestDaemon::start_on(state);
+    d.wait_agent("lead", "idle", 15);
+    d.operator_rpc(
+        "thread_send",
+        json!({"alias": "lead", "text": "after the restart", "message": "s2"}),
+    )
+    .unwrap();
+    assert!(result_text(&d, "lead", "s2").starts_with("FAKE_PACK "));
+    let pack = received_pack(&d, "lead", 0);
+    assert!(pack.contains("compacted this session's context"), "{pack}");
+    assert!(pack.contains("answered before"), "{pack}");
+    let delivered = events_of_kind(&d, "lead", "continuity_pack");
+    assert_eq!(delivered.len(), 1, "{delivered:#?}");
+    assert_eq!(delivered[0]["payload"]["reason"], "compacted");
+    // Delivered once: the next turn carries none.
+    d.operator_rpc(
+        "thread_send",
+        json!({"alias": "lead", "text": "and then", "message": "s3"}),
+    )
+    .unwrap();
+    assert_eq!(result_text(&d, "lead", "s3"), "FAKE_REPLY: and then");
 }

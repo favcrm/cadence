@@ -1376,7 +1376,10 @@ puts a **continuity pack** ahead of the message on the first turn of:
 - a **compacted** session — the provider reported a compaction
   (`cadence/session_compacted`: Claude's `system/compact_boundary`,
   Codex's `thread/compacted` or a `contextCompaction` item); the pack
-  goes with the next turn.
+  goes with the next turn. The daemon records the compaction as a
+  `system` thread note (`payload.event: "session_compacted"`), and it
+  stays due until a later `continuity_pack` note — across a daemon
+  restart too. A new or lost session is decided again at every open.
 
 The daemon assembles it at delivery — the agent never shapes it — from
 `<pm>/company/USER.md` (operator preferences, never read through a

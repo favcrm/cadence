@@ -706,6 +706,27 @@ impl Store {
         Ok((rows, older.max(0)))
     }
 
+    /// Is a compaction still waiting for its continuity pack (CAD-324)?
+    /// True when the alias's thread records a `session_compacted` note
+    /// newer than its last `continuity_pack` note. Both are thread rows,
+    /// so the answer survives a daemon restart.
+    pub fn compaction_pending(&self, alias: &str) -> Result<bool> {
+        let conn = self.conn();
+        let Some(thread) = Self::thread_in(&conn, alias)? else {
+            return Ok(false);
+        };
+        let last = |event: &str| -> Result<i64> {
+            Ok(conn.query_row(
+                "SELECT COALESCE(MAX(seq), 0) FROM thread_entries
+                 WHERE thread_id=? AND role='system' AND message_id IS NULL
+                 AND json_extract(payload,'$.event')=?",
+                params![thread.id, event],
+                |r| r.get(0),
+            )?)
+        };
+        Ok(last(COMPACTED_EVENT)? > last(PACK_EVENT)?)
+    }
+
     /// Did the alias's last finished turn lose its outcome (CAD-324)?
     /// True when its most recently finished message — nudges and
     /// cancellations aside — is `unknown`, or was reconciled from
@@ -728,6 +749,12 @@ impl Store {
         }))
     }
 }
+
+/// `payload.event` of the thread note recording a delivered continuity
+/// pack (CAD-324).
+pub const PACK_EVENT: &str = "continuity_pack";
+/// `payload.event` of the thread note recording a provider compaction.
+pub const COMPACTED_EVENT: &str = "session_compacted";
 
 /// Message states whose thread entries a continuity pack may carry: the
 /// message reached the agent (or was submitted to it). `queued` and

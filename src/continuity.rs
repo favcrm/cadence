@@ -85,7 +85,10 @@ pub const PACK_BEGIN: &str = "[Cadence continuity pack";
 /// The pack's last line; the turn's own message follows it.
 pub const PACK_END: &str = "[End of continuity pack — the message for this turn follows.]";
 /// Thread entries carrying this `payload.event` record a delivered pack.
-pub const PACK_EVENT: &str = "continuity_pack";
+pub const PACK_EVENT: &str = store::THREAD_PACK_EVENT;
+/// Thread entries carrying this `payload.event` record a provider
+/// compaction still owed a pack until a later [`PACK_EVENT`] note.
+pub const COMPACTED_EVENT: &str = store::THREAD_COMPACTED_EVENT;
 
 /// Why a session gets a pack.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -423,13 +426,17 @@ struct Turn<'a> {
     first: &'a ThreadEntry,
 }
 
+/// The daemon's own session notes — a delivered pack, a compaction —
+/// are bookkeeping, never turns of a later pack.
 fn is_pack_note(entry: &ThreadEntry) -> bool {
-    entry
-        .payload
-        .as_ref()
-        .and_then(|p| p.get("event"))
-        .and_then(Value::as_str)
-        == Some(PACK_EVENT)
+    matches!(
+        entry
+            .payload
+            .as_ref()
+            .and_then(|p| p.get("event"))
+            .and_then(Value::as_str),
+        Some(PACK_EVENT | COMPACTED_EVENT)
+    )
 }
 
 /// Group entries into turns in first-appearance order. Entries of one

@@ -540,9 +540,10 @@ pub struct Shared {
     /// Enter.
     recover_lock: Mutex<()>,
     /// CAD-324: agents whose next delivered turn carries a continuity
-    /// pack, and why — set when an actor opens a new session or reopens
-    /// one whose last turn was lost, and when the provider reports a
-    /// compaction; taken by the actor at its next turn.
+    /// pack because an actor opened a new session or reopened one whose
+    /// last turn was lost; taken by the actor at its next turn. A
+    /// compaction is not kept here but as a thread note
+    /// ([`Store::compaction_pending`]), so it survives a restart.
     continuity_due: Mutex<HashMap<String, crate::continuity::Reason>>,
 }
 
@@ -718,13 +719,24 @@ impl Shared {
         self.bump_activity(alias);
         self.thread_on_provider_event(alias, method, &params);
         // CAD-324: the provider compacted the session — its next turn
-        // carries a continuity pack. The event itself is recorded below
+        // carries a continuity pack. The due-ness is a thread note, so it
+        // survives a daemon restart; the event itself is recorded below
         // like every `cadence/<kind>`.
         if method == "cadence/session_compacted" {
-            self.continuity_due
-                .lock()
-                .unwrap()
-                .insert(alias.to_string(), crate::continuity::Reason::Compacted);
+            if let Err(e) = self.store.thread_append(
+                alias,
+                store::NewEntry {
+                    role: store::ROLE_SYSTEM,
+                    kind: store::KIND_MESSAGE,
+                    text: "The provider compacted this session's context; the next turn \
+                           carries a continuity pack.",
+                    payload: Some(json!({"event": crate::continuity::COMPACTED_EVENT,
+                                         "trigger": params.get("trigger")})),
+                    message_id: None,
+                },
+            ) {
+                eprintln!("compaction note for '{alias}' failed: {e}");
+            }
         }
         if method == "cadence/codex_quota" {
             let thread_id = params.get("thread_id").and_then(Value::as_str);
@@ -853,7 +865,20 @@ impl Shared {
     /// built never holds the turn back: the message goes alone and the
     /// failure is an event.
     fn continuity_prompt(&self, alias: &str, endpoint_kind: &str, message: &Message) -> String {
-        let due = self.continuity_due.lock().unwrap().remove(alias);
+        // A new or lost session is decided at open (in memory: the next
+        // open decides again); a compaction is a thread note, pending
+        // until a pack note follows it.
+        let due = self
+            .continuity_due
+            .lock()
+            .unwrap()
+            .remove(alias)
+            .or_else(|| {
+                self.store
+                    .compaction_pending(alias)
+                    .unwrap_or(false)
+                    .then_some(crate::continuity::Reason::Compacted)
+            });
         let Some(reason) = due else {
             return message.body.clone();
         };
@@ -10246,6 +10271,107 @@ mod pty_retry_tests {
 mod tests {
     use super::*;
     use crate::store::NewAgent;
+
+    /// CAD-324: a terminal pane (the pack would be a paste) and a cloud
+    /// session never get a continuity pack — not with a thread, an
+    /// earlier turn to carry, a new session due and a compaction
+    /// pending. A structured endpoint in the same position does.
+    #[test]
+    fn continuity_packs_skip_pty_and_cloud_endpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = ServeOptions::default();
+        // A tracker path that does not exist: never the host's ~/pm.
+        let no_pm = dir.path().join("no-pm");
+        opts.provider_env
+            .set("CADENCE_PM_DIR", no_pm.to_str().unwrap());
+        let shared = Shared::new(dir.path(), &opts).unwrap();
+        let cwd = dir.path().to_str().unwrap().to_string();
+        for (alias, provider, kind, packs) in [
+            ("p-claude", "claude", "pty", false),
+            ("p-devin", "devin", "pty", false),
+            ("p-cursor", "cursor", "pty", false),
+            ("c-devin", "devin", "cloud", false),
+            ("m-claude", "claude", "managed", true),
+            ("w-codex", "codex", "managed-ws", true),
+        ] {
+            shared
+                .store
+                .register_agent(&NewAgent {
+                    alias,
+                    provider,
+                    endpoint_kind: kind,
+                    role: "worker",
+                    cwd: &cwd,
+                    sandbox: "read-only",
+                    instructions: None,
+                    params: None,
+                    team_role: None,
+                    model_policy: None,
+                })
+                .unwrap();
+            shared.store.ensure_thread(alias).unwrap();
+            shared
+                .store
+                .enqueue(alias, "an earlier ask", None, &format!("{alias}-0"), "user")
+                .unwrap();
+            let Take::Message(first) = shared.store.take_queued(alias).unwrap() else {
+                panic!("nothing queued for {alias}");
+            };
+            shared
+                .store
+                .finish(
+                    &first,
+                    "completed",
+                    &json!({"text": "an earlier answer"}),
+                    None,
+                )
+                .unwrap();
+            shared
+                .continuity_due
+                .lock()
+                .unwrap()
+                .insert(alias.to_string(), crate::continuity::Reason::New);
+            shared
+                .store
+                .thread_append(
+                    alias,
+                    store::NewEntry {
+                        role: store::ROLE_SYSTEM,
+                        kind: store::KIND_MESSAGE,
+                        text: "compacted",
+                        payload: Some(json!({"event": crate::continuity::COMPACTED_EVENT})),
+                        message_id: None,
+                    },
+                )
+                .unwrap();
+            shared
+                .store
+                .enqueue(alias, "the ask", None, &format!("{alias}-1"), "user")
+                .unwrap();
+            let Take::Message(message) = shared.store.take_queued(alias).unwrap() else {
+                panic!("nothing queued for {alias}");
+            };
+            let prompt = shared.continuity_prompt(alias, kind, &message);
+            let delivered = shared
+                .store
+                .events_tail(alias, 50)
+                .unwrap()
+                .iter()
+                .any(|e| e.kind == crate::continuity::PACK_EVENT);
+            if packs {
+                assert!(
+                    prompt.starts_with(crate::continuity::PACK_BEGIN),
+                    "{alias}: {prompt}"
+                );
+                assert!(prompt.ends_with("the ask"), "{alias}");
+                assert!(prompt.contains("an earlier answer"), "{alias}");
+                assert!(delivered, "{alias}");
+            } else {
+                assert_eq!(prompt, "the ask", "{alias}");
+                assert!(!delivered, "{alias}");
+            }
+        }
+    }
 
     /// CAD-407: `serve` — so `daemon start`, `run` and `restart` — refuses
     /// while an interrupted restore's aside files exist, before the
