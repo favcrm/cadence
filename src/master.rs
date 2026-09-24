@@ -708,6 +708,7 @@ pub fn install_defaults(pm: &Pm, actor: &str) -> Result<Vec<String>> {
     }
     if let Err(e) = crate::issue::write::commit(
         pm,
+        &written,
         &format!("agents/{ALIAS}: install default {}", missing.join(", ")),
         &[],
         actor,
@@ -730,9 +731,13 @@ pub fn write_file(pm: &Pm, slug: &str, name: &str, text: &str, actor: &str) -> R
     let path = dir.join(name);
     let before = std::fs::read(&path).ok();
     write_atomic(&path, text)?;
-    if let Err(e) =
-        crate::issue::write::commit(pm, &format!("agents/{slug}: write {name}"), &[], actor)
-    {
+    if let Err(e) = crate::issue::write::commit(
+        pm,
+        std::slice::from_ref(&path),
+        &format!("agents/{slug}: write {name}"),
+        &[],
+        actor,
+    ) {
         // Put the old file back — a refused commit leaves no write.
         match &before {
             Some(old) => {

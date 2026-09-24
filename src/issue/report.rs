@@ -799,12 +799,19 @@ pub fn file(
         let _ = std::fs::remove_dir_all(&dir);
         return Err(e);
     }
-    write::commit(
+    let foreign = match write::commit(
         pm,
+        &[dir.join("issue.md")],
         &format!("{id}: report {}", kind.as_str()),
         &[&id],
         actor,
-    )?;
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(e);
+        }
+    };
 
     let inbox = pm_inbox(pm, &project, state_dir);
     let notified = notify_pm(
@@ -819,6 +826,9 @@ pub fn file(
         "priority": priority, "status": "backlog",
         "path": dir, "committed": true, "notified": notified,
     });
+    if !foreign.is_empty() {
+        out["foreign_files"] = json!(foreign);
+    }
     if !secret_warnings.is_empty() {
         out["secret_warnings"] = crate::secret::warnings_json(&secret_warnings);
     }

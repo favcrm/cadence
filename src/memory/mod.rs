@@ -810,13 +810,39 @@ pub fn retrieval_status(mem: &Memory) -> (bool, String) {
 /// are not issue writes. Returns whether a commit object was actually
 /// created — `Pm::commit` no-ops on an empty staged diff (e.g. a
 /// verify that re-stamps the same second), which callers report
-/// honestly as `committed: false`.
-fn commit_mem(pm: &Pm, slug: &str, subject: &str, actor: &str) -> Result<bool> {
+/// honestly as `committed: false`. Only `mem.path` is staged: a
+/// tracker write never sweeps foreign files (CAD-454).
+fn commit_mem(pm: &Pm, mem: &Memory, subject: &str, actor: &str) -> Result<bool> {
     let who = write::actor_who(actor, None);
     let before = git(&pm.dir, &["rev-parse", "HEAD"]).unwrap_or_default();
-    pm.commit(&format!("{subject}\n\nMemory: {slug}\nActor: {who}\n"))?;
+    pm.commit(
+        std::slice::from_ref(&mem.path),
+        &format!("{subject}\n\nMemory: {}\nActor: {who}\n", mem.front.id),
+    )?;
     let after = git(&pm.dir, &["rev-parse", "HEAD"]).unwrap_or_default();
-    Ok(!before.is_empty() && before != after)
+    Ok(before != after)
+}
+
+/// `save_mem` + `commit_mem` — a refused commit restores the prior
+/// file (or removes a new one), so a failure leaves neither an index
+/// entry nor a half-written memory behind (CAD-454).
+fn save_and_commit_mem(pm: &Pm, mem: &Memory, subject: &str, actor: &str) -> Result<bool> {
+    let prev = std::fs::read(&mem.path).ok();
+    save_mem(mem)?;
+    match commit_mem(pm, mem, subject, actor) {
+        Ok(committed) => Ok(committed),
+        Err(e) => {
+            match &prev {
+                Some(bytes) => {
+                    let _ = std::fs::write(&mem.path, bytes);
+                }
+                None => {
+                    let _ = std::fs::remove_file(&mem.path);
+                }
+            }
+            Err(e)
+        }
+    }
 }
 
 fn save_mem(mem: &Memory) -> Result<()> {
@@ -1017,10 +1043,9 @@ pub fn propose_native(
         )));
     }
     std::fs::create_dir_all(memory_dir(pm, key))?;
-    save_mem(&mem)?;
-    let committed = commit_mem(
+    let committed = save_and_commit_mem(
         pm,
-        &slug,
+        &mem,
         &format!("{key}/memory/{slug}: proposed"),
         &actor.proof.alias,
     )?;
@@ -1207,10 +1232,9 @@ pub fn submit_review(
         recorded_at: time::iso(time::now_epoch()),
     });
     check_front(&mem, &proj.components)?;
-    save_mem(&mem)?;
-    let committed = commit_mem(
+    let committed = save_and_commit_mem(
         pm,
-        slug,
+        &mem,
         &format!("{}/memory/{slug}: review {operation} {verdict}", proj.key),
         &actor.proof.alias,
     )?;
@@ -1321,10 +1345,9 @@ pub fn finalize_native(
     });
     mem.front.active_operation = None;
     check_front(&mem, &proj.components)?;
-    save_mem(&mem)?;
-    let committed = commit_mem(
+    let committed = save_and_commit_mem(
         pm,
-        slug,
+        &mem,
         &format!("{}/memory/{slug}: {operation} finalized", proj.key),
         &actor.proof.alias,
     )?;
@@ -1364,10 +1387,9 @@ pub fn reject_native(
     mem.front.verified_at = None;
     mem.front.active_operation = None;
     check_front(&mem, &proj.components)?;
-    save_mem(&mem)?;
-    let committed = commit_mem(
+    let committed = save_and_commit_mem(
         pm,
-        slug,
+        &mem,
         &format!("{}/memory/{slug}: rejected", proj.key),
         &actor.proof.alias,
     )?;
@@ -2183,7 +2205,11 @@ mod tests {
             "key: demo\nprefix: D\ncomponents: []\n",
         )
         .unwrap();
-        pm.commit("project fixture\n\nActor: test\n").unwrap();
+        pm.commit(
+            &[project_dir.join("project.yaml")],
+            "project fixture\n\nActor: test\n",
+        )
+        .unwrap();
         (dir, pm)
     }
 
@@ -2553,7 +2579,10 @@ mod tests {
             changed.front.source = Some("CAD-191-concurrent-update".to_string());
             save_mem(&changed).unwrap();
             writer_pm
-                .commit("concurrent memory update\n\nActor: writer\n")
+                .commit(
+                    std::slice::from_ref(&changed.path),
+                    "concurrent memory update\n\nActor: writer\n",
+                )
                 .unwrap();
             drop(lock);
             bytes_tx.send(std::fs::read(writer_path).unwrap()).unwrap();
@@ -3440,5 +3469,50 @@ mod tests {
         mem.front.finalizations[2].digest = digest.clone();
         mem.front.reviews[4].verdict = "revise".to_string();
         assert!(!retrieval_status(&mem).0);
+    }
+
+    /// CAD-454: a memory write's commit carries only the memory file —
+    /// a file planted elsewhere in the tracker is never swept in and
+    /// stays untracked.
+    #[test]
+    fn memory_commit_stages_only_its_own_file() {
+        let (dir, pm) = mutation_fixture();
+        let author = native("worker-author", 1);
+        std::fs::write(dir.path().join("demo/planted.md"), "planted\n").unwrap();
+        propose_native(
+            &pm,
+            "demo",
+            "rule",
+            &Scope {
+                project: true,
+                ..Scope::default()
+            },
+            Some("CAD-454"),
+            Some("high"),
+            None,
+            Some("fact\n\n**Why:** e\n\n**How to apply:** use it\n"),
+            Some("no-sweep"),
+            &author,
+        )
+        .unwrap();
+        let (_, mem) = find(&pm, Some("demo"), "no-sweep").unwrap();
+        let rel = mem
+            .path
+            .strip_prefix(&pm.dir)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let committed: Vec<String> = git(
+            &pm.dir,
+            &["show", "--pretty=format:", "--name-only", "HEAD"],
+        )
+        .unwrap()
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+        assert_eq!(committed, [rel]);
+        let status = git(&pm.dir, &["status", "--porcelain"]).unwrap();
+        assert_eq!(status.trim(), "?? demo/planted.md");
     }
 }
