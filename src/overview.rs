@@ -209,6 +209,9 @@ pub fn cmd_delivery_sync(id: &str) -> String {
     format!("cadence delivery sync {id}")
 }
 
+/// CAD-446: re-read every loop's PR from the operator's own shell.
+pub const CMD_DELIVERY_SYNC: &str = "cadence delivery sync";
+
 pub fn cmd_issue_set_ready(id: &str) -> String {
     format!("cadence issue set {id} status=ready")
 }
@@ -716,6 +719,9 @@ impl Audience {
             "drift" => Self::Dependency,
             // CAD-439: informs the operator; nothing for the team.
             "inbox_unread" | "tracker_behind" | "master_unconfined" | "master_login" => Self::Info,
+            // CAD-446: the board's own GitHub read is failing or is not
+            // the operator's — merge decisions may lag; nothing to decide.
+            "delivery_sync" => Self::Info,
             _ => Self::Team,
         }
     }
@@ -993,6 +999,36 @@ fn delivery_items(state_dir: &Path, now: i64) -> Vec<Item> {
         out.extend(row);
     }
     out
+}
+
+/// CAD-446: a board delivery-sync problem as one Needs-you `info` row
+/// (`kind: delivery_sync`, subject `tracker:<subject>`), shaped like
+/// every other row after classification and the subject merge. `title`
+/// is the board's text — already one line, bounded and redacted;
+/// `since` is when the problem began (epoch secs).
+pub(crate) fn delivery_sync_row(title: &str, subject: &str, since: i64, now: i64) -> Value {
+    let mut rows = vec![item(
+        120,
+        "delivery_sync",
+        title,
+        now - since,
+        "",
+        None,
+        CMD_DELIVERY_SYNC,
+    )
+    .about("tracker", subject)
+    .since(Some(since))];
+    classify_needs(
+        &mut rows,
+        &Owners::new(false, &[]),
+        now,
+        ESCALATE_AFTER_SECS,
+    );
+    merge_by_subject(rows)
+        .into_iter()
+        .next()
+        .map(|i| i.json)
+        .unwrap_or(Value::Null)
 }
 
 /// Urgency order: kind rank ascending, then oldest first inside a kind.
