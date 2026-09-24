@@ -4228,9 +4228,18 @@ fn probe_lock_file(path: &Path) -> LockBit {
         Ok(meta) if meta.is_file() => {}
         _ => return LockBit::Unknown,
     }
+    try_lock_probe(&file)
+}
+
+/// Take and give back an exclusive flock on an open lock file. A lock
+/// the probe won is released with `flock`, not by close: a fork in
+/// another thread shares this descriptor until its child execs, and a
+/// closed probe would hold cargo's lock for that long (CAD-389).
+fn try_lock_probe(file: &std::fs::File) -> LockBit {
     use std::os::unix::io::AsRawFd;
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc == 0 {
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
         return LockBit::Free;
     }
     let err = std::io::Error::last_os_error();
@@ -6998,6 +7007,14 @@ mod tests {
             .unwrap_or_else(|| panic!("no task-target row {name} in {value}"))
     }
 
+    /// The remedy with the fixture root masked. A random TempDir name
+    /// such as `/tmp/.tmpXrmQ2a` would otherwise match a search for an
+    /// `rm` command (CAD-389).
+    fn remedy_without_root(c: &Check, root: &TempDir) -> String {
+        c.remedy
+            .replace(&root.path().display().to_string(), "<root>")
+    }
+
     #[test]
     fn legacy_task_target_name_matches_only_the_missed_shape() {
         for name in [
@@ -7086,7 +7103,11 @@ mod tests {
         assert_eq!(c.value["count"], 3);
         assert_eq!(c.value["safe_to_delete"], false);
         assert_eq!(c.value["record_search"], "complete");
-        assert!(!c.remedy.contains("rm"));
+        assert!(
+            !remedy_without_root(&c, &root).contains("rm"),
+            "{}",
+            c.remedy
+        );
         assert!(c.remedy.contains("read-only"));
         assert!(c.detail.contains("not proof"));
         let names: Vec<&str> = c.value["rows"]
@@ -7214,7 +7235,12 @@ mod tests {
 
     #[test]
     fn task_targets_lock_probe_rejects_fifo_and_symlink_without_blocking() {
-        let root = TempDir::new().unwrap();
+        // `rm` in the root on purpose: the no-`rm` remedy check below
+        // must not depend on what the random TempDir name spells.
+        let root = tempfile::Builder::new()
+            .prefix("cad389-rm-")
+            .tempdir()
+            .unwrap();
         let scan = fake_scan(&root);
         let fifo_dir = scan.temp_dir.join("cad410-fifo-target");
         std::fs::create_dir_all(fifo_dir.join("debug")).unwrap();
@@ -7260,7 +7286,25 @@ mod tests {
             task_row(&c.value, "cad412-freelock-target")["cargo_lock"],
             "free"
         );
-        assert!(!c.remedy.contains("rm"));
+        assert!(
+            !remedy_without_root(&c, &root).contains("rm"),
+            "{}",
+            c.remedy
+        );
+    }
+
+    #[test]
+    fn lock_probe_releases_a_lock_its_descriptor_shares() {
+        let root = TempDir::new().unwrap();
+        let lock = root.path().join(".cargo-lock");
+        std::fs::write(&lock, b"lock").unwrap();
+        let file = std::fs::File::open(&lock).unwrap();
+        // Stands in for a sibling thread's fork that has not exec'd yet.
+        let forked = file.try_clone().unwrap();
+        assert_eq!(try_lock_probe(&file), LockBit::Free);
+        drop(file);
+        assert_eq!(probe_lock_bounded(&lock), LockBit::Free);
+        drop(forked);
     }
 
     #[test]
@@ -7695,7 +7739,11 @@ mod tests {
             .unwrap()
             .iter()
             .all(|r| r["name"] != format!("cad{TASK_TARGET_ROW_CAP:04}-row-target")));
-        assert!(!c.remedy.contains("rm"));
+        assert!(
+            !remedy_without_root(&c, &root).contains("rm"),
+            "{}",
+            c.remedy
+        );
     }
 
     // ---------- stale worktrees ----------

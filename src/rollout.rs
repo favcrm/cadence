@@ -996,6 +996,21 @@ fn daemon_pid_for_proof(state_dir: &Path) -> Result<u32> {
 /// absent or the lock is free — a successful probe lock is dropped
 /// before returning, so this function does not leave a daemon lock behind.
 fn flock_holder(path: &Path) -> Result<Option<u32>> {
+    flock_holder_from(path, || std::fs::read_to_string("/proc/locks"))
+}
+
+/// Reads of `/proc/locks` a held lock gets before its holder counts as
+/// missing. The file is not a snapshot: the kernel renders it about a
+/// page per `read` and resumes by position, so a lock taken or dropped
+/// elsewhere between two reads can skip a live line (CAD-389). A miss
+/// re-probes and rereads; only a lock that stays held and unlisted
+/// every time is refused.
+const PROC_LOCKS_READS: usize = 5;
+
+fn flock_holder_from(
+    path: &Path,
+    mut read_locks: impl FnMut() -> std::io::Result<String>,
+) -> Result<Option<u32>> {
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::io::AsRawFd;
     let file = match std::fs::OpenOptions::new().write(true).open(path) {
@@ -1008,31 +1023,44 @@ fn flock_holder(path: &Path) -> Result<Option<u32>> {
             )));
         }
     };
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc == 0 {
-        return Ok(None);
-    }
-    let error = std::io::Error::last_os_error();
-    if error.raw_os_error() != Some(libc::EWOULDBLOCK) {
-        return Err(Error::rejected(format!(
-            "rollout release --force cannot probe {} ({error})",
-            path.display()
-        )));
-    }
     let meta = file.metadata().map_err(|error| {
         Error::rejected(format!(
             "rollout release --force cannot stat {} ({error})",
             path.display()
         ))
     })?;
-    let dev = meta.dev();
-    let (major, minor) = dev_major_minor(dev);
+    let (major, minor) = dev_major_minor(meta.dev());
     let inode = meta.ino();
-    let text = std::fs::read_to_string("/proc/locks").map_err(|error| {
-        Error::rejected(format!(
-            "rollout release --force cannot read /proc/locks ({error})"
-        ))
-    })?;
+    for _ in 0..PROC_LOCKS_READS {
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(None);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EWOULDBLOCK) {
+            return Err(Error::rejected(format!(
+                "rollout release --force cannot probe {} ({error})",
+                path.display()
+            )));
+        }
+        let text = read_locks().map_err(|error| {
+            Error::rejected(format!(
+                "rollout release --force cannot read /proc/locks ({error})"
+            ))
+        })?;
+        if let Some(pid) = proc_locks_flock_writer(&text, major, minor, inode)? {
+            return Ok(Some(pid));
+        }
+    }
+    Err(Error::rejected(format!(
+        "rollout release --force: {} is locked but its holder is not in /proc/locks",
+        path.display()
+    )))
+}
+
+/// The pid `/proc/locks` lists as the exclusive flock holder of one
+/// inode, if the text has that line.
+fn proc_locks_flock_writer(text: &str, major: u32, minor: u32, inode: u64) -> Result<Option<u32>> {
     for line in text.lines() {
         let fields: Vec<&str> = line.split_whitespace().collect();
         if fields.len() < 6 || fields[1] != "FLOCK" || fields[3] != "WRITE" {
@@ -1063,10 +1091,7 @@ fn flock_holder(path: &Path) -> Result<Option<u32>> {
             return Ok(Some(pid));
         }
     }
-    Err(Error::rejected(format!(
-        "rollout release --force: {} is locked but its holder is not in /proc/locks",
-        path.display()
-    )))
+    Ok(None)
 }
 
 /// A device id as `/proc/locks` prints it (`major:minor`).
@@ -3063,21 +3088,50 @@ mod tests {
             "sentinel 0 is on the ancestry: {chain:?}"
         );
         let path = state.join("cadence.lock");
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&path)
-            .unwrap();
-        use std::os::unix::io::AsRawFd;
-        assert_eq!(
-            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0,
-            "lock probe failed"
-        );
+        std::fs::write(&path, "").unwrap();
+        // Released with `flock`, not by close: a sibling test's fork
+        // shares the descriptor until its child execs, and a closed
+        // holder would still read as the daemon (CAD-389).
+        let held = crate::worktree::TestFileLock::acquire(&path);
         assert_eq!(daemon_pid_for_proof(state).unwrap(), std::process::id());
-        drop(file);
+        held.release();
         assert_eq!(daemon_pid_for_proof(state).unwrap(), 0);
+    }
+
+    #[test]
+    fn flock_holder_rereads_proc_locks_that_skipped_a_live_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cadence.lock");
+        std::fs::write(&path, "").unwrap();
+        let held = crate::worktree::TestFileLock::acquire(&path);
+        // First read stands in for a page boundary that lost the line.
+        let mut reads = 0;
+        let holder = flock_holder_from(&path, || {
+            reads += 1;
+            if reads == 1 {
+                Ok(String::new())
+            } else {
+                std::fs::read_to_string("/proc/locks")
+            }
+        })
+        .unwrap();
+        assert_eq!(holder, Some(std::process::id()));
+        // A real read under lock churn can skip the line too.
+        assert!(reads >= 2, "{reads}");
+
+        let mut reads = 0;
+        let err = flock_holder_from(&path, || {
+            reads += 1;
+            Ok(String::new())
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("is locked but its holder is not in /proc/locks"),
+            "{err}"
+        );
+        assert_eq!(reads, PROC_LOCKS_READS);
+        held.release();
     }
 
     #[test]
