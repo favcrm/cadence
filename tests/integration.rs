@@ -38237,6 +38237,17 @@ fn start_board_with(pm: &Path, state: &Path, read_only: bool) -> u16 {
 
 /// [`start_board_with`] whose Merge runs `gh` (CAD-431: a fake).
 fn start_board_gh(pm: &Path, state: &Path, read_only: bool, gh: Option<PathBuf>) -> u16 {
+    start_board_sync(pm, state, read_only, gh, None)
+}
+
+/// [`start_board_gh`] whose delivery sync (CAD-446) runs every `every`.
+fn start_board_sync(
+    pm: &Path,
+    state: &Path,
+    read_only: bool,
+    gh: Option<PathBuf>,
+    every: Option<Duration>,
+) -> u16 {
     use std::io::Read;
     let overall = Instant::now() + Duration::from_secs(20);
     loop {
@@ -38252,6 +38263,7 @@ fn start_board_gh(pm: &Path, state: &Path, read_only: bool, gh: Option<PathBuf>)
                 port,
                 read_only,
                 gh,
+                delivery_sync_every: every,
                 ..Default::default()
             };
             let _ = cadence_agent::ui::serve(&sd, &pd, &opts);
@@ -44988,6 +45000,336 @@ fn delivery_loop_refuses_foreign_and_held_prs_and_a_corrupt_record() {
         "the refused dispatch wrote something"
     );
     assert_eq!(lf.f.front("D-4").status, "ready");
+}
+
+// ==== CAD-446: the board process runs the delivery sync ====
+
+/// The board's `needs_me` rows of `kind` (as primary or merged cause).
+fn cad446_board_needs(port: u16, kind: &str) -> Vec<Value> {
+    let (status, body) = board_get(port, "/api/overview");
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    v["needs_me"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| {
+            r["kind"] == kind
+                || r["causes"]
+                    .as_array()
+                    .is_some_and(|c| c.iter().any(|c| c["cause"] == kind))
+        })
+        .collect()
+}
+
+/// Poll the board's overview until a `kind` row satisfies `ok`.
+fn cad446_wait_row(port: u16, kind: &str, secs: u64, ok: impl Fn(&Value) -> bool) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        let rows = cad446_board_needs(port, kind);
+        if let Some(row) = rows.iter().find(|r| ok(r)) {
+            return row.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no {kind} row in {secs}s: {rows:#?}"
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// `gh pr view` calls in the fake `gh`'s log.
+fn cad446_pr_views(lf: &LoopFixture) -> usize {
+    lf.gh_log()
+        .lines()
+        .filter(|l| l.starts_with("pr view"))
+        .count()
+}
+
+/// CAD-446 acceptance: merge decisions appear without a terminal. Nobody
+/// runs `cadence delivery sync`; the operator's board reads the loop's
+/// PR with the operator's (fake) `gh` on its timer.
+/// - A board an agent started, with a loop awaiting GitHub, runs no
+///   `gh` at all and says why in Needs-you.
+/// - The operator's board observes the PR under review; a ticket back
+///   with its worker after a REVISE costs no `gh` call.
+/// - A PASS on a green head shows the merge decision within one
+///   interval, and the board never merges on its own.
+/// - A failing `gh` is one Needs-you `info` row, and the board backs
+///   off instead of calling it every interval; the row clears when a
+///   pass succeeds.
+#[test]
+fn cad446_board_syncs_delivery_without_a_terminal() {
+    let mut lf = LoopFixture::dispatched();
+    let (a, b) = ("a".repeat(40), "b".repeat(40));
+    lf.done(&a);
+    lf.wait_rec("reviewing", |r| r["state"] == "reviewing" && r["head"] == a);
+    lf.set_gh(&a, "OPEN", false, false);
+
+    // A board the reviewer's tool started, with the fake gh first on its
+    // PATH: it proves it is not the operator's and never runs gh.
+    let agent_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let pidfile = lf.f.tmp.path().join("agent-board.pid");
+    let script = format!(
+        "echo $$ > {pid}; exec env PATH={gh}:$PATH CADENCE_PM_DIR={pm} {bin} --state-dir {state} \
+         ui run --port {agent_port}",
+        pid = pidfile.display(),
+        gh = lf.gh_dir.display(),
+        pm = lf.f.pm_dir.display(),
+        bin = env!("CARGO_BIN_EXE_cadence"),
+        state = lf.f.d.state.display(),
+    );
+    let n = lf
+        .r2
+        .send(json!({"how": "exec", "argv": ["bash", "-c", script]}));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !(std::net::TcpStream::connect(("127.0.0.1", agent_port)).is_ok()
+        && board_get(agent_port, "/api/health").0 == 200)
+    {
+        assert!(Instant::now() < deadline, "the agent's board never came up");
+        thread::sleep(Duration::from_millis(50));
+    }
+    let row = cad446_wait_row(agent_port, "delivery_sync", 30, |r| {
+        r["title"]
+            .as_str()
+            .is_some_and(|t| t.contains("not started by the operator"))
+    });
+    assert_eq!(row["audience"], "info", "{row}");
+    // (The overview's own read-only repo listing — `pr list`, `api
+    // repos/…`, CAD-249 — predates the sync and is not gated here.)
+    assert!(
+        !lf.gh_log()
+            .lines()
+            .any(|l| l.starts_with("pr view") || l.starts_with("pr merge")),
+        "an agent's board ran the delivery sync's gh: {}",
+        lf.gh_log()
+    );
+    assert!(lf.rec()["observed"].is_null(), "{}", lf.rec());
+    let pid: i32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    let _ = lf.r2.answer(n, "agent board exit");
+
+    // The operator's board: its first pass observes the PR under review.
+    // Its gh wraps the fake: `pr merge` fails while `refuse-merge`
+    // exists beside it.
+    let wrap_dir = lf.f.tmp.path().join("ghwrap");
+    std::fs::create_dir_all(&wrap_dir).unwrap();
+    let refuse = wrap_dir.join("refuse-merge");
+    let wrapper = wrap_dir.join("gh");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nif [ \"$1 $2\" = \"pr merge\" ] && [ -e {refuse} ]; then\n  \
+             echo 'gh: auto-merge could not be disabled' >&2; exit 1\nfi\nexec {fake} \"$@\"\n",
+            refuse = refuse.display(),
+            fake = lf.gh_dir.join("gh").display(),
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let every = Duration::from_secs(1);
+    let port = start_board_sync(
+        &lf.f.pm_dir,
+        &lf.f.d.state,
+        false,
+        Some(wrapper.clone()),
+        Some(every),
+    );
+    let (_, meta) = board_get(port, "/api/meta");
+    let meta: Value = serde_json::from_str(&meta).unwrap();
+    assert_eq!(
+        meta["delivery_sync"]["gh"],
+        wrapper.to_str().unwrap(),
+        "the board shows the gh it fixed at start: {meta}"
+    );
+    lf.wait_rec("observed by the board", |r| r["observed"]["head"] == a);
+    assert!(
+        lf.gh_log().contains("pr view 7 -R acme/app"),
+        "{}",
+        lf.gh_log()
+    );
+
+    // REVISE: the worker holds the ticket — no gh call however long the
+    // board runs.
+    let (ok, out) = lf.verdict_as("r1", "revise", &a);
+    assert!(ok, "{out}");
+    lf.wait_rec("back with the worker", |r| r["state"] == "working");
+    thread::sleep(every * 2);
+    let views = cad446_pr_views(&lf);
+    thread::sleep(every * 4);
+    assert_eq!(
+        cad446_pr_views(&lf),
+        views,
+        "gh ran for a ticket the worker holds: {}",
+        lf.gh_log()
+    );
+
+    // Fix, PASS on a green head: the merge decision appears on its own.
+    lf.done(&b);
+    lf.wait_rec("round 2", |r| r["state"] == "reviewing" && r["head"] == b);
+    lf.set_gh(&b, "OPEN", true, false);
+    let (ok, out) = lf.verdict_as("r1", "pass", &b);
+    assert!(ok, "{out}");
+    let passed = Instant::now();
+    let row = cad446_wait_row(port, "merge_decision", 20, |_| true);
+    let took = passed.elapsed();
+    assert_eq!(row["merge"]["sha"], b, "{row}");
+    assert_eq!(row["audience"], "operator", "{row}");
+    assert!(
+        took <= every * 10,
+        "the merge decision took {took:?} with a {every:?} interval"
+    );
+    assert_eq!(
+        lf.needs("merge_decision").len(),
+        1,
+        "{:#?}",
+        lf.f.needs_me()
+    );
+    assert!(
+        !lf.gh_log().contains("pr merge"),
+        "the board merged on its own: {}",
+        lf.gh_log()
+    );
+    assert_eq!(lf.rec()["state"], "passed");
+
+    // Auto-merge turns on for a head nobody enqueued, and the operator's
+    // gh keeps failing to turn it off: the row says so, and the daemon
+    // raises the observation (event + wake) once, not on every pass.
+    let raised = |lf: &LoopFixture| {
+        lf.f.daemon_events("delivery_observed")
+            .iter()
+            .filter(|e| e["disable_auto"] == true)
+            .count()
+    };
+    let before = raised(&lf);
+    std::fs::write(&refuse, "").unwrap();
+    lf.set_gh(&b, "OPEN", true, true);
+    cad446_wait_row(port, "delivery_sync", 20, |r| {
+        r["title"]
+            .as_str()
+            .is_some_and(|t| t.contains("D-2 — ") && t.contains("could not be disabled"))
+    });
+    let views = cad446_pr_views(&lf);
+    thread::sleep(Duration::from_secs(7));
+    assert!(
+        cad446_pr_views(&lf) >= views + 2,
+        "the failing ticket was not observed again: {}",
+        lf.gh_log()
+    );
+    assert_eq!(lf.rec()["disable_auto"], true, "{}", lf.rec());
+    assert_eq!(
+        raised(&lf),
+        before + 1,
+        "a disable_auto that stays true was raised again"
+    );
+    std::fs::remove_file(&refuse).unwrap();
+    lf.wait_rec("auto-merge turned off", |r| r["disable_auto"] == false);
+    assert!(
+        lf.gh_log()
+            .contains("pr merge 7 -R acme/app --disable-auto"),
+        "{}",
+        lf.gh_log()
+    );
+
+    // gh fails: one info row, and the board backs off (2 s, 4 s, …)
+    // although the page is being viewed all the while.
+    std::fs::write(lf.gh_dir.join("gh-state.json"), "not json").unwrap();
+    let row = cad446_wait_row(port, "delivery_sync", 20, |r| {
+        r["title"]
+            .as_str()
+            .is_some_and(|t| t.contains("GitHub read failed"))
+    });
+    assert_eq!(row["audience"], "info", "{row}");
+    assert_eq!(row["command"], "cadence delivery sync", "{row}");
+    let title = row["title"].as_str().unwrap();
+    assert!(title.contains("D-2") && !title.contains('\n'), "{title}");
+    let failed_at = cad446_pr_views(&lf);
+    let window = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < window {
+        let _ = cad446_board_needs(port, "delivery_sync");
+        thread::sleep(Duration::from_millis(200));
+    }
+    let during = cad446_pr_views(&lf) - failed_at;
+    assert!(
+        during <= 3,
+        "{during} gh calls in 6 s of failures at a {every:?} interval — no back-off"
+    );
+
+    // gh answers again: the row clears.
+    lf.set_gh(&b, "OPEN", true, false);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !cad446_board_needs(port, "delivery_sync").is_empty() {
+        assert!(Instant::now() < deadline, "the sync row never cleared");
+        thread::sleep(Duration::from_millis(200));
+    }
+    assert_eq!(cad446_board_needs(port, "merge_decision").len(), 1);
+
+    // A record forged into the loop's file naming a PR outside the
+    // project's repos: the board refuses it before gh reads it, and the
+    // refusal is that ticket's alone — D-2 is still read every interval.
+    let file = lf.f.d.state.join("delivery.json");
+    let forge = || {
+        let mut all: Value =
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        if all.get("D-3").is_some() {
+            return;
+        }
+        let mut rec = all["D-2"].clone();
+        rec["issue"] = json!("D-3");
+        rec["pr"] = json!("https://github.com/evil/repo/pull/1");
+        rec["observed"] = Value::Null;
+        all["D-3"] = rec;
+        let tmp = file.with_extension("forged");
+        std::fs::write(&tmp, serde_json::to_vec_pretty(&all).unwrap()).unwrap();
+        std::fs::rename(&tmp, &file).unwrap();
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        // The board's own observations rewrite the file; forge again
+        // until a pass has read the forged record.
+        forge();
+        let rows = cad446_board_needs(port, "delivery_sync");
+        if rows.iter().any(|r| {
+            r["title"].as_str().is_some_and(|t| {
+                t.contains("D-3 — names evil/repo#1, which is not a repo of project demo")
+            })
+        }) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the forged PR was not refused: {rows:#?}"
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+    let views = cad446_pr_views(&lf);
+    let window = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < window {
+        forge();
+        thread::sleep(Duration::from_millis(200));
+    }
+    let during = cad446_pr_views(&lf) - views;
+    assert!(
+        during >= 4,
+        "D-2 was read {during} times in 6 s at a {every:?} interval beside a refused ticket"
+    );
+    assert!(
+        !lf.gh_log().contains("evil/repo"),
+        "gh read a PR outside the project: {}",
+        lf.gh_log()
+    );
 }
 
 // ---- CAD-384: one caller rule for every agent-mutating RPC ----

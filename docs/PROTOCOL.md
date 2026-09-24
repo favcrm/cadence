@@ -2071,7 +2071,40 @@ router never routes a `verdict` file it finds under `reports/`.
 
 The daemon never runs `gh`, and no agent environment needs GitHub
 credentials for the loop. `cadence delivery sync --watch <secs>` keeps
-the observations current. The board's `POST /api/delivery/<ID>/merge`
+the observations current from a terminal; the board keeps them current
+without one (CAD-446). A writable board process runs the same read with
+the operator's `gh` on a timer (60 s; the first pass one interval after
+start) and when a page loads `/api/overview` (at most every 15 s and 4
+times per 10 minutes — the route needs no login):
+- it reads only loops whose PR GitHub can change — `reviewing`,
+  `passed`, `enqueued`, or auto-merge to turn off; with none, it runs
+  no `gh` and no operator check;
+- before any `gh` call it proves its own process is the operator's (the
+  proof the daemon runs on its connection); a board an agent started
+  runs no `gh` for the loop;
+- its `gh` is fixed to an absolute path when the board starts (from
+  absolute `PATH` entries only) and never looked up again; `/api/meta`
+  shows it under `delivery_sync.gh`, and Merge uses the same one;
+- each PR must be in its ticket's project remotes, read from the
+  daemon's tracker (`delivery_list` answers its `pm_dir`);
+- one pass in flight, at most 20 PRs a pass (least recently attempted
+  first);
+- a PR that cannot be read, or is refused, backs off on its own
+  (doubling, up to 15 minutes) while the others keep their interval,
+  and one Needs-you `info` row (`kind: delivery_sync`, `tickets: [{issue,
+  error, since}]`) names each failing ticket and why;
+- a failure of the pass itself — the daemon unreachable, no usable
+  `gh`, not the operator, a crash — backs off the whole sync the same
+  way, with its own `delivery_sync` row; a page view never cuts a
+  back-off short;
+- row text is one printable line, bounded, with URL credentials and
+  secret-shaped spans redacted; command `cadence delivery sync`.
+Like `cadence delivery sync`, it runs `gh pr merge <n> --disable-auto`
+when the daemon answers `disable_auto: true` — the only GitHub write it
+makes. It never merges: that stays the operator's Merge. A read-only
+board runs no sync. `delivery_observe` raises `delivery_observed` (and
+wakes the loop) when the state moves or auto-merge newly needs turning
+off — not again on every observation while it stays on. The board's `POST /api/delivery/<ID>/merge`
 (`{}`) and `POST /api/delivery/<ID>/decline` (`{"reason"}`) keep the
 operator rule of the chat-first Home (CAD-328): an agent-attributed
 request gets 403 and anything short of positive operator proof on the

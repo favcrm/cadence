@@ -144,7 +144,7 @@ pub(super) fn operator_viewer(
 /// run on its connection ([`crate::peer::operator_proof`]): no pane or
 /// managed provider on its ancestry, not a daemon descendant, no agent
 /// environment, a session leader on its ancestry. Unprovable is false.
-fn board_is_operator(state_dir: &std::path::Path) -> bool {
+pub(super) fn board_is_operator(state_dir: &std::path::Path) -> bool {
     let Some(daemon_pid) = client::rpc(state_dir, "health", json!({}))
         .ok()
         .and_then(|h| h["pid"].as_u64())

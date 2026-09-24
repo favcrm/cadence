@@ -446,13 +446,67 @@ pub fn sync(state_dir: &Path, only: Option<&str>, gh_bin: &str) -> Result<Value>
         if matches!(state, "merged" | "declined" | "closed") && rec["disable_auto"] != true {
             continue;
         }
-        let row = match sync_one(state_dir, &issue, url, gh_bin) {
-            Ok(v) => v,
-            Err(e) => json!({"issue": issue, "error": e.to_string()}),
-        };
-        out.push(row);
+        out.push(sync_pr(state_dir, &issue, url, gh_bin));
     }
     Ok(json!({"synced": out}))
+}
+
+/// A loop the board's unattended sync (CAD-446) reads GitHub for: a PR
+/// under review, PASSed or enqueued — whose head, CI or merge GitHub may
+/// change — or any loop whose auto-merge must be turned off. A ticket
+/// the worker still holds (dispatched, or back after a REVISE) waits on
+/// the worker, not on GitHub, and costs no `gh` call.
+pub fn awaiting_github(rec: &Record) -> bool {
+    rec.pr.is_some()
+        && (matches!(
+            rec.state,
+            State::Reviewing | State::Passed | State::Enqueued
+        ) || rec.disable_auto)
+}
+
+/// Why `pr` is not a PR of `project`'s own repos, if it is not: it must
+/// parse as a pull request URL whose repo is one of the project's
+/// `repos[].remote` (compared normalized). The daemon applies it when a
+/// done report names a PR; the board's unattended sync applies it again
+/// before its `gh` reads one.
+pub fn project_pr_refusal(pm_dir: &Path, project: &str, pr: &str) -> Result<Option<String>> {
+    let Some(key) = pr_ref(pr) else {
+        return Ok(Some(format!(
+            "names `pr: {pr}`, which is not a pull request URL"
+        )));
+    };
+    let (slug, _) = crate::issue::task_report::parse_pr_url(pr)?;
+    let want =
+        crate::issue::project::normalize_remote(&format!("github.com/{slug}")).to_ascii_lowercase();
+    let found = crate::issue::project::list(pm_dir)?
+        .into_iter()
+        .find(|p| p.key == project);
+    let remotes: Vec<String> = found
+        .iter()
+        .flat_map(|p| p.repos.iter())
+        .filter_map(|r| r.remote.as_deref())
+        .map(|r| crate::issue::project::normalize_remote(r).to_ascii_lowercase())
+        .collect();
+    if remotes.contains(&want) {
+        return Ok(None);
+    }
+    let listed = if remotes.is_empty() {
+        "none — `repos[].remote` is unset".to_string()
+    } else {
+        remotes.join(", ")
+    };
+    Ok(Some(format!(
+        "names {key}, which is not a repo of project {project} (its remotes: {listed})"
+    )))
+}
+
+/// Observe one ticket's PR — the row [`sync`] reports for it, with
+/// `error` set when reading or reporting it failed.
+pub fn sync_pr(state_dir: &Path, issue: &str, url: &str, gh_bin: &str) -> Value {
+    match sync_one(state_dir, issue, url, gh_bin) {
+        Ok(v) => v,
+        Err(e) => json!({"issue": issue, "error": e.to_string()}),
+    }
 }
 
 fn sync_one(state_dir: &Path, issue: &str, url: &str, gh_bin: &str) -> Result<Value> {
