@@ -112,7 +112,7 @@ impl Shared {
             return Ok(false);
         }
         let dir = pm.dir.join(&rec.project).join(&rec.issue);
-        let fresh: Vec<Value> = task_report::list(&dir, &rec.issue)
+        let mut fresh: Vec<Value> = task_report::list(&dir, &rec.issue)
             .into_iter()
             .filter(|r| {
                 r["kind"] == "done"
@@ -128,6 +128,12 @@ impl Shared {
                         .any(|h| Some(h.as_str()) == r["name"].as_str())
             })
             .collect();
+        // Newest last by filing order, not by name: a same-second report
+        // (`…-w1-1.md`) sorts before the first by name, and a refused one
+        // must never hide a valid one filed after it.
+        fresh.sort_by_key(|r| {
+            delivery::filing_order(r["name"].as_str().unwrap_or_default(), &rec.worker)
+        });
         let Some(latest) = fresh.last().cloned() else {
             if rec.state == State::Unstaffed {
                 self.start_review(pm, rec)?;

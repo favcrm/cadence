@@ -343,6 +343,27 @@ pub fn pick_reviewer(
     ranked.first().map(|a| a.alias.clone())
 }
 
+/// Filing order of one agent's reports on a ticket: `(UTC second,
+/// same-second counter)`. The writer names a report
+/// `<UTC-basic>-<agent>.md` and a same-second one `…-<agent>-<n>.md`,
+/// which sorts BEFORE the first by name (`-` < `.`) — so name order can
+/// put a later report first. `agent` must be the report's author: an
+/// alias may itself contain `-<digits>`.
+pub fn filing_order(name: &str, agent: &str) -> (String, u32) {
+    let stem = name.strip_suffix(".md").unwrap_or(name);
+    let Some((at, rest)) = stem.split_once('-') else {
+        return (stem.to_string(), 0);
+    };
+    let n = rest
+        .strip_prefix(agent)
+        .and_then(|tail| match tail {
+            "" => Some(0),
+            t => t.strip_prefix('-')?.parse().ok(),
+        })
+        .unwrap_or(0);
+    (at.to_string(), n)
+}
+
 /// The daemon-composed review kickoff: one line, so a pty reviewer can
 /// take it as it is. It carries the PR, the head, the acceptance
 /// criteria and the pinning rules. When the criteria do not fit
@@ -602,6 +623,38 @@ mod tests {
         assert_eq!(
             pick_reviewer("w1", Some("claude"), Some("w1"), &[], &agents).as_deref(),
             Some("a")
+        );
+    }
+
+    #[test]
+    fn filing_order_puts_a_same_second_report_after_the_first() {
+        let mut names = vec![
+            "20260924T041026Z-w1-1.md", // filed second, sorts first by name
+            "20260924T041026Z-w1.md",
+            "20260924T041025Z-w1.md",
+            "20260924T041026Z-w1-10.md",
+            "20260924T041026Z-w1-2.md",
+        ];
+        names.sort();
+        names.sort_by_key(|n| filing_order(n, "w1"));
+        assert_eq!(
+            names,
+            vec![
+                "20260924T041025Z-w1.md",
+                "20260924T041026Z-w1.md",
+                "20260924T041026Z-w1-1.md",
+                "20260924T041026Z-w1-2.md",
+                "20260924T041026Z-w1-10.md",
+            ]
+        );
+        // An alias that ends in digits is not mistaken for a counter.
+        assert_eq!(
+            filing_order("20260924T041026Z-dev-1.md", "dev-1"),
+            ("20260924T041026Z".into(), 0)
+        );
+        assert_eq!(
+            filing_order("20260924T041026Z-dev-1-3.md", "dev-1"),
+            ("20260924T041026Z".into(), 3)
         );
     }
 

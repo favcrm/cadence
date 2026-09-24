@@ -80,6 +80,118 @@ with open(out + ".tmp", "w") as f:
 os.rename(out + ".tmp", out)
 "#;
 
+/// Runs a spec'd command as an operator shell outside every agent and
+/// outside the (in-process) daemon's tree: `setsid -f` detaches it,
+/// the runner waits until it has left the test process's ancestry,
+/// then runs the command with the spec's env and cwd and lands
+/// `<out>.stdout`, `<out>.stderr` and `<out>` (`{"rc"}`).
+const OPERATOR_EXEC_PY: &str = r#"
+import json, os, subprocess, sys, time
+
+spec_path, out, runner = sys.argv[1:4]
+spec = json.load(open(spec_path))
+
+def on_lineage(pid):
+    p = os.getpid()
+    while p > 1:
+        if p == pid:
+            return True
+        with open("/proc/%d/status" % p) as f:
+            p = int([l for l in f if l.startswith("PPid:")][0].split()[1])
+    return False
+
+while on_lineage(int(runner)):
+    time.sleep(0.02)
+r = subprocess.run(spec["argv"], env=spec["env"], cwd=spec["cwd"],
+                   stdin=subprocess.DEVNULL, capture_output=True)
+open(out + ".stdout", "wb").write(r.stdout)
+open(out + ".stderr", "wb").write(r.stderr)
+with open(out + ".tmp", "w") as f:
+    json.dump({"rc": r.returncode}, f)
+os.rename(out + ".tmp", out)
+"#;
+
+/// `Command::output`, run the way an operator's own shell reaches the
+/// daemon (CAD-431): agent registration needs positive operator proof,
+/// and a CLI the test process spawns directly descends from the
+/// in-process daemon, which that proof refuses. The command keeps this
+/// process's environment (less any agent identity) plus its own env
+/// and cwd; stdin is empty.
+trait OperatorOutput {
+    fn operator_output(&mut self) -> std::io::Result<std::process::Output>;
+}
+
+impl OperatorOutput for std::process::Command {
+    fn operator_output(&mut self) -> std::io::Result<std::process::Output> {
+        use std::os::unix::process::ExitStatusExt;
+        let mut env: std::collections::BTreeMap<String, String> = std::env::vars_os()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.to_string_lossy().into_owned(),
+                )
+            })
+            .filter(|(k, _)| k != "CADENCE_ALIAS" && k != "CADENCE_ROLLOUT_AS")
+            .collect();
+        for (k, v) in self.get_envs() {
+            let k = k.to_string_lossy().into_owned();
+            match v {
+                Some(v) => env.insert(k, v.to_string_lossy().into_owned()),
+                None => env.remove(&k),
+            };
+        }
+        let mut argv = vec![self.get_program().to_string_lossy().into_owned()];
+        argv.extend(self.get_args().map(|a| a.to_string_lossy().into_owned()));
+        let cwd = match self.get_current_dir() {
+            Some(d) => d.to_path_buf(),
+            None => std::env::current_dir()?,
+        };
+        let dir = std::env::temp_dir().join(format!("opx-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir)?;
+        let (script, spec, out) = (dir.join("run.py"), dir.join("spec.json"), dir.join("out"));
+        std::fs::write(&script, OPERATOR_EXEC_PY)?;
+        std::fs::write(
+            &spec,
+            json!({"argv": argv, "env": env, "cwd": cwd}).to_string(),
+        )?;
+        let status = std::process::Command::new("setsid")
+            .arg("-f")
+            .arg("python3")
+            .arg(&script)
+            .arg(&spec)
+            .arg(&out)
+            .arg(std::process::id().to_string())
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        assert!(status.success(), "setsid -f failed: {status}");
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while !out.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "operator command {argv:?} never finished"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        let rc: Value = serde_json::from_str(&std::fs::read_to_string(&out)?)?;
+        let rc = rc["rc"].as_i64().unwrap_or(1);
+        let output = std::process::Output {
+            status: if rc >= 0 {
+                std::process::ExitStatus::from_raw((rc as i32) << 8)
+            } else {
+                std::process::ExitStatus::from_raw(-rc as i32)
+            },
+            stdout: std::fs::read(dir.join("out.stdout"))?,
+            stderr: std::fs::read(dir.join("out.stderr"))?,
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(output)
+    }
+}
+
 struct TestDaemon {
     dir: TempDir,
     state: PathBuf,
@@ -4590,7 +4702,7 @@ fn codex_cli_approval_policy_flag_roundtrips_through_resume() {
             .arg("--state-dir")
             .arg(&d.state)
             .args(args)
-            .output()
+            .operator_output()
             .unwrap()
     };
     let cwd = pm_repo.to_str().unwrap();
@@ -6799,7 +6911,7 @@ fn cli_devin_permission_mode_flag_and_bypass() {
             "--cwd",
         ])
         .arg(d.dir.path())
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -6816,7 +6928,7 @@ fn cli_devin_permission_mode_flag_and_bypass() {
         .args(["--state-dir"])
         .arg(&d.state)
         .args(["devin", "--permission-mode", "bogus", "--detach"])
-        .output()
+        .operator_output()
         .unwrap();
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
@@ -7239,7 +7351,7 @@ fn join_bootstrap_briefs_and_queues() {
         .arg("--state-dir")
         .arg(&d.state)
         .args(["join", "pm", "devin", "--alias", "w-join", "--detach"])
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -7295,7 +7407,7 @@ fn join_bootstrap_briefs_and_queues() {
             "--detach",
             "--no-bootstrap",
         ])
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -7325,7 +7437,7 @@ fn join_bootstrap_runs_on_fake_worker() {
         .arg("--state-dir")
         .arg(&d.state)
         .args(["join", "pm", "fake", "--alias", "w-fake", "--detach"])
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -7362,7 +7474,7 @@ fn devin_worktree_isolates_checkout() {
             "w-wt",
             "--detach",
         ])
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -7397,7 +7509,7 @@ fn devin_worktree_isolates_checkout() {
             "w-wt",
             "--detach",
         ])
-        .output()
+        .operator_output()
         .unwrap();
     assert!(!out.status.success());
     assert!(
@@ -7420,7 +7532,7 @@ fn devin_worktree_isolates_checkout() {
             "w-wt2",
             "--detach",
         ])
-        .output()
+        .operator_output()
         .unwrap();
     assert!(!out.status.success());
     assert!(
@@ -7445,7 +7557,7 @@ fn devin_worktree_isolates_checkout() {
             "w-ng",
             "--detach",
         ])
-        .output()
+        .operator_output()
         .unwrap();
     assert!(!out.status.success());
     assert!(
@@ -8215,7 +8327,7 @@ fn standalone_launch_writes_briefing_only() {
         .arg(&d.state)
         .args(["devin", "--alias", "solo", "--detach", "--cwd"])
         .arg(&repo)
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -8254,7 +8366,7 @@ fn standalone_launch_writes_briefing_only() {
         .arg(&d.state)
         .args(["devin", "--alias", "wb", "--bootstrap", "--detach", "--cwd"])
         .arg(&repo)
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -8278,7 +8390,7 @@ fn standalone_launch_writes_briefing_only() {
             "--cwd",
         ])
         .arg(&repo)
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -13735,7 +13847,7 @@ fn cli_claude_tui_flag_launches_pty_endpoint() {
         .args(["claude", "--tui", "--alias", "cl", "--cwd"])
         .arg(d.dir.path())
         .args(["--detach", "--no-bootstrap"])
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -13770,7 +13882,7 @@ fn cli_claude_tui_resume_passes_resume() {
         ])
         .arg(d.dir.path())
         .args(["--detach", "--no-bootstrap"])
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -13850,7 +13962,7 @@ fn cli_join_claude_tui_briefs_prefixes() {
         .arg("--state-dir")
         .arg(&d.state)
         .args(["join", "pm", "claude", "--tui", "--alias", "wj", "--detach"])
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -14173,7 +14285,7 @@ fn cli_join_codex_sandbox_defaults_writable_and_flag_roundtrips() {
         .arg("--state-dir")
         .arg(&d.state)
         .args(["join", "pm", "codex", "--alias", "wj", "--detach"])
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -14196,7 +14308,7 @@ fn cli_join_codex_sandbox_defaults_writable_and_flag_roundtrips() {
             "--sandbox",
             "read-only",
         ])
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -14228,7 +14340,7 @@ fn cli_join_codex_sandbox_defaults_writable_and_flag_roundtrips() {
             "--sandbox",
             "bogus",
         ])
-        .output()
+        .operator_output()
         .unwrap();
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
@@ -14825,7 +14937,7 @@ fn cli_cursor_launch_opens_pty_endpoint() {
         .args(["cursor", "--alias", "cu", "--cwd"])
         .arg(d.dir.path())
         .args(["--detach", "--no-bootstrap"])
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -14858,7 +14970,7 @@ fn cli_cursor_resume_passes_resume() {
         .args(["cursor", "-r", &chat, "--alias", "cu", "--cwd"])
         .arg(d.dir.path())
         .args(["--detach", "--no-bootstrap"])
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -14917,7 +15029,7 @@ fn cli_join_cursor_briefs_prefixes() {
         .arg("--state-dir")
         .arg(&d.state)
         .args(["join", "pm", "cursor", "--alias", "wj", "--detach"])
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -14958,7 +15070,7 @@ fn launch_leaves_cwd_repo_untouched() {
             "join", "pm", "fake", "--alias", "w-clean", "--detach", "--cwd",
         ])
         .arg(&repo)
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -15010,7 +15122,7 @@ fn failed_open_writes_nothing() {
             "join", "pm", "claude", "--alias", "w-bad", "--detach", "--cwd",
         ])
         .arg(&repo)
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -15060,7 +15172,7 @@ fn agents_md_opt_in_and_worktree_gitignore() {
             "--cwd",
         ])
         .arg(&repo)
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -15085,7 +15197,7 @@ fn agents_md_opt_in_and_worktree_gitignore() {
         .arg("--state-dir")
         .arg(&d.state)
         .args(["agent", "resume", "w-am", "--detach"])
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -15117,7 +15229,7 @@ fn agents_md_opt_in_and_worktree_gitignore() {
             "--cwd",
         ])
         .arg(&repo)
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -15150,7 +15262,7 @@ fn agents_md_opt_in_and_worktree_gitignore() {
             "--cwd",
         ])
         .arg(&repo)
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -33870,12 +33982,13 @@ fn build_slot_cli_wait_then_grant() {
     slot_release(&d, &token, SELF_LANE, std::process::id());
 }
 
-fn cadence_bin(state: &Path, args: &[&str]) -> std::process::Output {
+/// `cadence <args>` from the operator's own shell ([`OperatorOutput`]).
+fn cadence_bin_operator(state: &Path, args: &[&str]) -> std::process::Output {
     std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
         .arg("--state-dir")
         .arg(state)
         .args(args)
-        .output()
+        .operator_output()
         .unwrap()
 }
 
@@ -33896,7 +34009,7 @@ fn model_defaults_register_resume_and_mock_argv() {
     d.operator_rpc("model_defaults_set", json!({"document": doc_a}))
         .unwrap();
 
-    let conflict = cadence_bin(
+    let conflict = cadence_bin_operator(
         &d.state,
         &[
             "agent",
@@ -33922,7 +34035,7 @@ fn model_defaults_register_resume_and_mock_argv() {
         "{}",
         String::from_utf8_lossy(&conflict.stderr)
     );
-    let unsupported = cadence_bin(
+    let unsupported = cadence_bin_operator(
         &d.state,
         &[
             "agent",
@@ -33945,7 +34058,7 @@ fn model_defaults_register_resume_and_mock_argv() {
         json!({"alias": "pm", "provider": "fake", "endpoint_kind": "fake", "cwd": cwd, "role": "pm"}),
     )
     .unwrap();
-    let joined = cadence_bin(
+    let joined = cadence_bin_operator(
         &d.state,
         &[
             "join",
@@ -33987,7 +34100,7 @@ fn model_defaults_register_resume_and_mock_argv() {
     assert_eq!(qa["model_reported"], "mock-claude");
     assert_ne!(qa["model_configured"], qa["model_reported"]);
 
-    let explicit = cadence_bin(
+    let explicit = cadence_bin_operator(
         &d.state,
         &[
             "agent",
@@ -34752,11 +34865,12 @@ fn turn_tokens_are_shown_only_to_the_owning_connection() {
 
 /// Run the built CLI against `d`'s state dir.
 fn launch_cli(d: &TestDaemon, args: &[&str]) -> std::process::Output {
+    // The operator's shell: launches register agents (CAD-431).
     std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
         .arg("--state-dir")
         .arg(&d.state)
         .args(args)
-        .output()
+        .operator_output()
         .unwrap()
 }
 
@@ -43206,6 +43320,28 @@ fn delivery_loop_review_revise_pass_merge_end_to_end() {
                "params": r#"{"upstream": "w1"}"#}),
     );
     assert_eq!(r["ok"], true, "{r}");
+    // Its detached children (env kept, or scrubbed) derive no agent
+    // identity and are not the operator: a root agent they try to mint
+    // outside the worker's group is refused, nothing written.
+    let before = lf.snapshot();
+    let agents = || lf.f.d.rpc("agent_list", json!({})).unwrap()["agents"].clone();
+    let roster = agents();
+    for (how, alias) in [("detached", "a0"), ("detached-bare", "a00")] {
+        let r = lf.w1.rpc(
+            how,
+            "agent_register",
+            json!({"alias": alias, "provider": "fake", "endpoint_kind": "fake", "cwd": cwd}),
+        );
+        assert_eq!(r["ok"], false, "{how}: {r}");
+        let msg = r["error"]["message"].as_str().unwrap_or_default();
+        assert!(msg.contains("not provably the operator"), "{how}: {r}");
+        assert!(
+            lf.f.d.rpc("agent_show", json!({"alias": alias})).is_err(),
+            "{how}"
+        );
+    }
+    assert_eq!(agents(), roster, "a refused registration wrote an agent");
+    assert_eq!(lf.snapshot(), before);
 
     // Worker done → the daemon routes a review to r1 (never w1, its
     // member a1, or the master), composed from the ticket.
@@ -43595,8 +43731,29 @@ fn delivery_loop_refuses_foreign_and_held_prs_and_a_corrupt_record() {
     assert_eq!(record(), before, "a foreign PR was recorded");
     assert!(lf.f.messages_of("r1").is_empty() && lf.f.messages_of("r2").is_empty());
 
-    // The project's PR (owner/repo case and .git ignored) enters review.
-    lf.done_on("D-2", &a, LOOP_PR);
+    // Two done reports in the same second: a refused one (foreign PR),
+    // then the project's PR (owner/repo case and .git ignored). The
+    // writer names the second `…-w1-1.md`, which sorts BEFORE `…-w1.md`
+    // by name; filing order still makes the valid one the newest, so it
+    // enters review.
+    let t = cadence_agent::issue::time::basic(cadence_agent::issue::time::now_epoch() + 1);
+    let reports = lf.f.pm_dir.join("demo/D-2/reports");
+    for (name, pr) in [
+        (
+            format!("{t}-w1.md"),
+            "https://github.com/someone-else/infra/pull/13",
+        ),
+        (format!("{t}-w1-1.md"), LOOP_PR),
+    ] {
+        std::fs::write(
+            reports.join(name),
+            format!(
+                "---\nschema: cadence.report/2\nkind: done\ntask: D-2\nagent: w1\nsha: {a}\n\
+                 pr: {pr}\n---\n{REFLECTION}"
+            ),
+        )
+        .unwrap();
+    }
     lf.wait_rec("reviewing", |r| r["state"] == "reviewing");
     assert_eq!(lf.rec()["pr_ref"], "acme/app#7");
 

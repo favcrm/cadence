@@ -2974,7 +2974,12 @@ impl Shared {
         }
         self.revalidate_enrollments()?;
         let Some(who) = self.slot_identity(peer_pid)? else {
-            return Ok(());
+            // No agent on the connection is not the operator: a worker's
+            // detached (setsid + fork) child derives no identity either,
+            // and would otherwise mint a root agent outside its group —
+            // one the review loop would take as independent (CAD-431).
+            // Unattributed registration needs positive operator proof.
+            return self.proven_operator("agent register", peer_pid);
         };
         let caller = who.lane();
         let upstream = params
