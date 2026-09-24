@@ -39,6 +39,18 @@ exactly that commit. Managed endpoints (codex/claude) never run
 a last line `SHA: <40-hex>` — the daemon reads the last such line as the
 reported revision.
 
+A ticket the master dispatched goes to independent review when you file
+its `done` report with the head and the PR (`sha: <40-hex>` and
+`pr: https://github.com/<owner>/<repo>/pull/<n>` in the frontmatter).
+A REVISE comes back to you as a message: fix it on the same branch, push,
+and file a new `done` with the new head.
+
+If you are sent a `[review]` kickoff, judge exactly the head it names and
+file your verdict as a report: `cadence report file --task <ID> --kind
+verdict --file <f>`, frontmatter `verdict: pass` or `verdict: revise` and
+`sha: <the head you reviewed>`, the findings as the body. Only the
+assigned reviewer can file it, and only for the head under review.
+
 ## Peers and your group
 
 ```bash

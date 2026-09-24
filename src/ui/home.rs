@@ -8,6 +8,12 @@
 //! - `POST /api/issues/<ID>/answers` `{"question", "text"}` — file an
 //!   `answer` report (CAD-341) on the question report `question`,
 //!   authored `operator`.
+//! - `POST /api/delivery/<ID>/merge` `{}` and
+//!   `POST /api/delivery/<ID>/decline` `{"reason"}` — the worker loop's
+//!   merge decision (CAD-431). Merge runs [`crate::delivery::merge`] in
+//!   this board process — the operator's own `gh` enqueues the PR pinned
+//!   to the reviewed head; the daemon never runs `gh`. Decline relays the
+//!   daemon's operator-only `delivery_decline`.
 //! - `GET /api/master/summary?since=<epoch secs>` — relay the daemon's
 //!   `master_summary` (CAD-339) without posting it; a daemon without the
 //!   method answers 501 so the UI shows "not available".
@@ -231,6 +237,78 @@ pub(super) fn decide_plan(
         "plan_reject"
     };
     match client::rpc(state_dir, method, params) {
+        Ok(out) => json_response(out),
+        Err(e) => rpc_err(&e, method),
+    }
+}
+
+/// `(issue, verb)` for `/api/delivery/<id>/<verb>`, `None` otherwise.
+pub(super) fn delivery_route(path: &str) -> Option<(&str, &str)> {
+    let tail = path.strip_prefix("/api/delivery/")?;
+    let (id, verb) = tail.split_once('/')?;
+    (!id.is_empty() && !verb.contains('/')).then_some((id, verb))
+}
+
+/// `POST /api/delivery/<id>/merge|decline` (CAD-431) — the same
+/// operator rule as the plan decision ([`operator_write`]).
+pub(super) fn decide_delivery(
+    request: &mut Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+    id: &str,
+    verb: &str,
+) -> HttpResp {
+    let merge = match verb {
+        "merge" => true,
+        "decline" => false,
+        _ => return err_response(404, "no such delivery route"),
+    };
+    if let Err(resp) = operator_write(request, state_dir, opts, &format!("delivery {verb}")) {
+        return resp;
+    }
+    let Ok(id) = model::check_id(id) else {
+        return err_response(400, "bad issue id");
+    };
+    let bytes = match read_body(request, BODY_CAP) {
+        Ok(bytes) => bytes,
+        Err(resp) => return resp,
+    };
+    let req: DecideReq = match parse_json(&bytes) {
+        Ok(req) => req,
+        Err(resp) => return resp,
+    };
+    let reason = req
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty());
+    let (out, method) = if merge {
+        if reason.is_some() {
+            return err_response(400, "a merge takes no reason");
+        }
+        let gh = opts
+            .gh
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| crate::delivery::GH.to_string());
+        (
+            crate::delivery::merge(state_dir, &id, &gh),
+            "delivery_merge",
+        )
+    } else {
+        let Some(reason) = reason else {
+            return coded_response(400, "reason_required", "a decline needs a reason", None);
+        };
+        (
+            client::rpc(
+                state_dir,
+                "delivery_decline",
+                json!({"issue": id, "reason": reason}),
+            ),
+            "delivery_decline",
+        )
+    };
+    match out {
         Ok(out) => json_response(out),
         Err(e) => rpc_err(&e, method),
     }
