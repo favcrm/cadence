@@ -32,9 +32,10 @@ export function masterStatus(agents: AgentsPayload | null, threadMissing: boolea
   return { kind: "running", state: row.state };
 }
 
-/** Why the composer is disabled, or null when it may send. */
-export function composerBlock(readOnly: boolean, status: MasterStatus): string | null {
-  if (readOnly) return "This board is read-only — the server refuses every write, so messages cannot be sent.";
+/** Why the composer is disabled, or null when it may send. `block` is
+ *  why this board cannot write at all (read-only, not signed in). */
+export function composerBlock(block: string | null, status: MasterStatus): string | null {
+  if (block) return `${block} Messages cannot be sent until then.`;
   switch (status.kind) {
     case "unknown":
       return "Checking whether the master is running…";

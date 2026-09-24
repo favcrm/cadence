@@ -18,6 +18,8 @@ interface Props {
   issues: ResourceState<IssueCard[]>;
   /** Set when the project list never loaded. */
   projectsError?: string | null;
+  /** CAD-313: this browser's operator session — null while unknown. */
+  signedIn?: boolean | null;
 }
 
 const boardIcon = (
@@ -52,7 +54,7 @@ const NAV_ICONS: Record<string, ReactNode> = {
   settings: settingsIcon,
 };
 
-export default function Sidebar({ screen, navHref, project, projectHref, projects, issues, projectsError }: Props) {
+export default function Sidebar({ screen, navHref, project, projectHref, projects, issues, projectsError, signedIn = null }: Props) {
   // "…" until the cards load; a stale list keeps its numbers.
   const count = (key: string) => {
     if (!issues.data) return { n: issues.status === "failed" ? "!" : "…", title: issues.error ?? "loading issues" };
@@ -112,9 +114,9 @@ export default function Sidebar({ screen, navHref, project, projectHref, project
       </div>
       <div className="mt-auto pt-4 border-t border-ink-700 mx-1 text-ink-500 text-label leading-relaxed">
         <div className="slabel mb-1">session</div>
-        no auth · loopback only
+        {signedIn === true ? "operator · signed in" : signedIn === false ? "not signed in · read only" : "…"}
         <br />
-        <span className="num text-micro">cadence.localhost:18000</span>
+        <span className="num text-micro">{location.host}</span>
       </div>
     </aside>
   );

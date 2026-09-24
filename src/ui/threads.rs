@@ -28,10 +28,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tiny_http::Request;
 
-use super::{
-    err_response, guard_fail, header_value, json_response, parse_json, read_body, write_caller,
-    write_guard, HttpResp, ServeOpts, WriteCaller,
-};
+use super::{err_response, header_value, json_response, parse_json, read_body, HttpResp};
 use crate::client;
 use crate::error::Error;
 
@@ -234,36 +231,17 @@ pub(super) fn stream(
 }
 
 /// `POST /api/threads/<alias>/messages` — the operator's chat message.
-/// Guards first (read-only, the cross-site write guards, caller
-/// attribution), then the body, then the daemon.
+/// Operator-only: `operator::admit` has already run the guards, the
+/// operator session and the process proof on the peer (CAD-313) — an
+/// agent caller is refused there (`operator_only`); agents message each
+/// other with `cadence send`.
 pub(super) fn post_message(
     request: &mut Request,
     state_dir: &std::path::Path,
-    opts: &ServeOpts,
     alias: &str,
 ) -> HttpResp {
     if !valid_alias(alias) {
         return err_response(400, "bad agent alias");
-    }
-    if opts.read_only {
-        return guard_fail("read_only", "board is read-only — writes are disabled");
-    }
-    if let Err(resp) = write_guard(request, "application/json", opts) {
-        return resp;
-    }
-    match write_caller(request, state_dir, opts) {
-        Ok(WriteCaller::Operator(_)) => {}
-        Ok(WriteCaller::Agent(agent)) => {
-            return guard_fail(
-                "caller_agent",
-                &format!(
-                    "thread message refused: this request comes from agent '{agent}' — \
-                     only the operator writes into an agent's chat; agents message \
-                     each other with `cadence send`"
-                ),
-            )
-        }
-        Err(resp) => return resp,
     }
     let bytes = match read_body(request, MESSAGE_CAP) {
         Ok(bytes) => bytes,

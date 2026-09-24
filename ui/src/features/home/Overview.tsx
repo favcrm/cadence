@@ -1,3 +1,4 @@
+import { useWriteBlock } from "../auth/WriteGate";
 import { exclusionLabel, issueCounts, statusBreakdown } from "../../lib/counts";
 import type { ResourceState } from "../../lib/cache";
 import type {
@@ -280,6 +281,7 @@ function MonitorAlertView({
   onAck: (monitor: string, seq: number) => void;
 }) {
   const open = alert.state === "open";
+  const block = useWriteBlock(readOnly);
   const stateLabel = alert.state === "resolved" ? "resolved" : open ? "open" : "acknowledged";
   return (
     <div className="rounded border border-ink-700/70 bg-ink-875 px-3 py-2.5 space-y-1.5">
@@ -296,7 +298,7 @@ function MonitorAlertView({
           <button
             className="chip ml-auto bg-accent/10 text-accent hover:bg-accent/20 disabled:opacity-50"
             disabled={readOnly}
-            title={readOnly ? "board is read-only" : "acknowledge this durable monitor alert"}
+            title={block ?? "acknowledge this durable monitor alert"}
             onClick={() => onAck(alert.monitor, alert.seq)}
           >
             ack

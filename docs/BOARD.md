@@ -764,6 +764,8 @@ cadence ui run                  # foreground, 127.0.0.1:3010
 cadence ui start [--port 3010]  # detached; pid + ui.log under state dir
 cadence ui status               # pid, /api/health probe, effective options
 cadence ui stop [--tailscale-off]
+cadence ui login [--tailnet] [--rotate]   # single-use sign-in link (2 min)
+cadence ui sessions [--revoke <id> | --revoke-all]
 
 cadence ui tailscale start [--port 9450] [--read-only]
 cadence ui tailscale stop
@@ -781,6 +783,42 @@ a later plain `ui start` reuses it, `--reset` forgets it, and
 the Host/Origin allowlists), `--read-only` (every write answers `403`,
 the SPA hides its edit controls; `--no-read-only` clears a persisted
 one).
+
+**Signing in (CAD-313, ADR 0004).** Board writes need the operator's
+session. `cadence ui login`, run from your own shell, prints a link —
+`http://cadence-<port>.localhost:<port>/login#n=<nonce>` (`--tailnet`:
+the tailnet URL) — that works once, within 120 s, for one browser.
+`cadence-<port>.localhost` is this board's own name: every `*.localhost`
+resolves to loopback, and cookies are scoped by host, not port, so a
+cookie on this name is never sent to another board, an agent's dev
+server or anything else on `127.0.0.1`, `localhost` or
+`cadence.localhost` (the gateway vhost), whatever the port. Loopback
+sessions are opened and honoured on this Host only; on any other Host
+the board is sign-in-less and refuses writes. Opening
+it sets an HttpOnly, `SameSite=Strict` session cookie (`Secure` and
+`__Host-` on the https tailnet origin) valid 24 h idle, 7 days at most,
+and hands the page a second key it keeps in that tab's `sessionStorage`
+and sends as `X-Cadence-Session` on every request. The cookie alone is
+no session: a server on another port that receives it (cookies ignore
+ports) never has the key, and a cross-site page cannot set the header.
+A new tab signs in with a fresh link — the board tells it so. Links to
+this machine in agent-written markdown are shown, never clickable.
+The nonce rides in the URL fragment, which a browser never sends to a
+server, so it never reaches `ui.log`. The link is minted only for a
+caller that passes positive operator proof **and** presents the
+operator secret, `<state>/operator/secret` (`0600` in a `0700`
+directory, read under ssh-style strict modes and never repaired: a
+loose mode is refused with the `chmod` to run). Agents are refused.
+`cadence ui sessions` lists sessions (display id, origin, created, last
+used, user agent) and revokes one or all; `ui login --rotate` replaces
+the secret and revokes everything first. Lost the browser or the
+cookie? Run `ui login` again. The secret, nonces and tokens are never in
+argv, the environment, a log or a backup; `operator/sessions.json` holds
+token hashes only. There is no failed-login rate limit: a nonce is 256
+random bits, and a shared failure budget would let an agent lock the
+operator out with no credential at all. A second link opened in the same
+tab (only the fragment changes, so no page load) is picked up by the
+login view's `hashchange` listener.
 
 ## Remote access — `ui tailscale`
 
@@ -839,10 +877,11 @@ on the first that cannot be read or does not hold:
 | `socket_owner` | that socket was created by tailscaled's uid — the table's `uid` column, readable for another user's socket |
 | `foreign_uid` | tailscaled's uid is not the board's; otherwise any same-uid process could pose as it |
 
-A request that fails is attributed to its own peer process —
-`operator (ui)`, or the agent it is tied to (see
-[Write identity](#write-identity)) — and its identity headers are never
-read. A request that is proven but carries **no** `Tailscale-User-Login`
+A request that fails is attributed to its own peer process — the
+agent it is tied to, or else nobody: it has no origin, so no session
+can be used or opened on it, and without one its writes are refused
+(see [Write identity](#write-identity)) — and its identity headers are
+never read. A request that is proven but carries **no** `Tailscale-User-Login`
 (a Funnel client from the internet, a tagged node) names nobody: its
 writes are refused (`403`, `check: "caller_identity"`), never written
 as `operator (ui)`. `GET /api/meta` reports `{read_only, actor,
@@ -942,7 +981,7 @@ quick-add, drag, edit, link/ref, attach and comment controls.
 | Route | Returns |
 |---|---|
 | `GET /api/health` | `ok`, `pm_dir`, `pm_present`, counts, `daemon`, `embedded` |
-| `GET /api/meta` | `read_only`, `actor` (the request's resolved write identity), `tailnet_proof` (`null`, or whether the tailnet proxy was proven and which check refused), `tailnet_url`, `operator` (CAD-432, only with `?operator=1` — the proof walks `/proc`, so the SPA asks once per page load; `null` otherwise: this client passes the operator decisions' checks — a writable board, a caller tied to no agent, CAD-276's positive proof on the peer, and the same proof on the board process itself, whose daemon connection relays the decision; the UI offers operator decisions such as stage moves only then), the serving binary's `version`/`build_commit`/`build_time`, plus the daemon's `daemon_info` when reachable |
+| `GET /api/meta` | `read_only`, `actor` (the request's resolved write identity), `tailnet_proof` (`null`, or whether the tailnet proxy was proven and which check refused), `tailnet_url`, `signed_in` (CAD-313: this request holds a live operator session), `session` (`{id, origin, created, last_used, idle_expires_at, expires_at, user_agent}` or `null` — never the token), `login_hint` (`cadence ui login`, or `… --tailnet` on the tailnet), `operator` (CAD-432, only with `?operator=1` — the proof walks `/proc`, so the SPA asks once per page load; `null` otherwise: this client passes the operator decisions' checks — a writable board, a live operator session (CAD-313) from a caller tied to no agent, CAD-276's positive proof on the peer, and the same proof on the board process itself, whose daemon connection relays the decision; the UI offers operator decisions such as stage moves only then), the serving binary's `version`/`build_commit`/`build_time`, plus the daemon's `daemon_info` when reachable |
 | `GET /api/setup[?fresh=1]` | the `/setup` wizard's checks (CAD-327): `cadence setup`'s list run **detect only** — no `apply`, nothing created, started or written; the `ui` check is answered by the serving board. `{checks: [{check, status, detail, fix, group}], master: {providers: [{bin, ready, start, warning}]}, checked_at, detect_only: true}`, `group` one of `environment`/`provider`/`master`. `master.providers` (CAD-448) is the master step's provider choice — every CLI `master start` accepts, each ready one with its exact `master start --provider <bin>` command once the `master` check's own prerequisites are met (the offer then absorbs the check's bare `master start` fix: one command for the action); a host that cannot confine adds `--unconfined` and carries the `UNCONFINED_WARNING` risk text in `warning`, and `master_login` states the same risk. Provider probes follow setup's rules (a version token and an exit code or a file's presence — never their output), each bounded at 5 s. One run is reused for 60 s and concurrent requests share it; `fresh=1` (or `true`) re-runs unless the last run is under 5 s old, and each answer says `ran_now`, `age_ms` and `recheck_in_ms`. **Operator on the host only:** `403` before any probe runs on a read-only board (`check: "read_only"`), for a request through the tailnet (`"tailnet"`, proven or not) and for a non-loopback peer (`"loopback"`) — the payload shows HOME's layout, installed CLIs and their sign-in state, and the daemon's pid and socket. Write methods answer `405` |
 | `GET /api/projects` | folders, prefixes, components, declared tags, repos, issue counts |
 | `GET /api/issues?project=` | card views: derived status, readiness, `tags`, counts, `rev`, the CAD-405 `work` block (type, milestone, size/weight; stage, progress and health on epics). The `issue ls` filters, combinable: `tag=` (repeat or comma-join — all of), `status=` (repeat or comma-join — any of), `epic=<ID>`, `owner=`, `component=`, `priority=`, `open=1`; `400` on a value that could never match (unknown status/priority, bad tag or id grammar) |
@@ -974,6 +1013,8 @@ exactly one git commit whose subject carries the actor:
 
 | Route | Body | Returns |
 |---|---|---|
+| `POST /api/session` | `{nonce}` — a `ui login` link's fragment; answers `{session_key}` for the page. Write guards apply, the Host must be this board's own name (or the proven tailnet) and `Origin` this request's own; the link must be for this origin. The peer is attributed first: an agent, or a peer the board cannot attribute (its socket already closed), spends the link and gets nothing (`session_from_agent` / `caller_identity`); so does a board whose own daemon connection is an agent's (the daemon checks) | `200 {session_key}` + `Set-Cookie`; `403 login_link` naming `already_used`, `expired`, `wrong_origin` or `unknown`; `403 session_origin` on any other Host |
+| `POST /api/session/logout` | `{}` | `204`, the presenting session ended and its cookie cleared |
 | `POST /api/issues` | `{project, title, priority?, owner?, component?, tags?, parent?, blocked_by?}` | `201` |
 | `PATCH /api/issues/:id` | `{status?, priority?, owner?, component?, tags?, title?, body?, if_rev?}` — `""` clears owner/component; `tags` replaces the list (`[]` clears) under the CLI's validation; `body` replaces the markdown only | `200` |
 | `POST /api/issues/:id/links` | `{type: blocked_by\|relates\|parent\|duplicate_of, target, if_rev?}` | `200` |
@@ -1004,6 +1045,55 @@ the current rev. Unknown JSON fields are rejected
 fully buffered first.
 
 ### Write identity
+
+**Who is trusted as the operator (CAD-313, CAD-428).** Exactly one
+kind of request: one that presents a live **operator session** — the
+cookie a `cadence ui login` link was exchanged for AND the page's
+session key in `X-Cadence-Session` (either alone is no session) — on the origin it
+was issued for (loopback on the board's own `cadence-<port>.localhost`
+name, or the proven `tailscale serve` proxy), with `Origin` equal to
+its own scheme and Host, from a peer tied to no agent (or another
+uid's proxy whose socket is still open). Every write is admitted by
+its class in `src/ui/operator.rs`'s `WRITE_ROUTES` before any handler
+runs: agent-allowed (issue writes, monitor acks) takes the session or
+the one agent the peer is tied to; operator-only (plan approve/reject,
+answers, delivery merge/decline, model defaults, thread messages, epic
+stage moves, and every write route not listed) takes the session and
+then positive process proof on the HTTP peer (`operator_proof`, as the
+daemon does for its own operator verbs). `/api/meta?operator=1`
+(CAD-432) reports exactly that check, plus the proof on the board
+process itself. Nothing else is the operator:
+not a loopback peer, not a relay — nginx, the gateway vhost, `socat`,
+an agent's own proxy: the board sees the relay, never who is behind it
+— not a Host, not a `Tailscale-User-*` or `X-Forwarded-*` header, and
+not the absence of a pane tie. Without a session such a request is
+refused, `403`, `check: "operator_session_required"`, and nothing is
+written.
+
+| Session | Peer | Result |
+|---|---|---|
+| live | tied to an agent | refused `session_from_agent`; the session is revoked and the daemon records `operator_session_from_agent` |
+| live | the proven `tailscale serve` proxy | the operator, as `<login> (tailscale)` (a proven request with no login is refused) |
+| live | tied to no agent, or unattributable with its client socket still open and another uid's (sshd, tailscaled) | the operator, `operator (ui)` |
+| live | unattributable otherwise — its socket already closed (a sender that hung up at once to escape attribution) or this uid's with no visible owner | refused `caller_identity`; nothing is written |
+| none | tied to an agent | that agent — on agent-allowed routes (issue writes, monitor acks) only |
+| none | tied to no agent, a relay, or the proxy | refused `operator_session_required` |
+| none | unattributable | refused `caller_identity` |
+
+A cookie-bearing write without `Origin`, or with any `Origin` but its
+own, is refused (`check: "origin"`). A session opened on loopback is no
+session on the tailnet and the reverse, and a session on
+`cadence-<port>.localhost` is no session on `127.0.0.1` or any other
+Host. The accepted residual (ADR 0004 §1.3, phase 2 under CAD-280):
+any same-uid process that passes `operator_proof` and reads the
+operator secret can mint its own link. A process cadence did not
+launch — an agent CLI the operator started by hand, outside every
+pane cadence registered — passes the proof with no evasion at all; an
+agent's `setsid -f` child with a scrubbed env and stdio passes by
+evasion. `operator_secret_theft_residual_pinned` pins the second.
+
+Agent attribution — which agent a request without a session writes
+as — is unchanged:
 
 The cross-site guards below stop browsers, not local processes: any
 process with a shell can send `X-Cadence-Board: 1` and a board Origin.
@@ -1046,85 +1136,73 @@ CAD-263), never from anything the request says:
 
    The pane's `CADENCE_ALIAS` in the peer's environment is **not** a
    board signal on its own: any process can export it, so
-   `CADENCE_ALIAS=B curl …` from a pane-less process writes as
-   `operator (ui)`, never as agent B. (`agent answer` does consult it,
+   `CADENCE_ALIAS=B curl …` from a pane-less process is never agent B
+   (and, holding no session, is refused). (`agent answer` does consult it,
    only to *refuse* a caller tied to the target pane and to label its
    audit stamp — there it can narrow, never authorize.)
 
 | Peer | Writes as |
 |---|---|
 | tied to exactly one registered pane, or descends from exactly one live managed endpoint's provider | that agent's alias — commit subject, `Actor:` trailer, comment author, ack `by`; never `operator`. A model-defaults write is refused (`403`, `check: "operator_only"`): the board relays it over its own daemon connection, which the daemon's operator gate sees instead of the caller (CAD-337) |
-| walks cleanly and is tied to no agent (the operator's browser, an ssh tunnel, the loopback gateway, the tailnet `socat` relay) | `operator (ui)` |
-| proven `tailscale serve` proxy (see Remote access) | `<login> (tailscale)` |
+| walks cleanly and is tied to no agent (the operator's browser, an ssh tunnel, the loopback gateway, the tailnet `socat` relay, a detached agent child) | `operator (ui)` **with the operator's session**; refused `operator_session_required` without one |
+| proven `tailscale serve` proxy (see Remote access) | `<login> (tailscale)` with a session; refused without one |
 | cannot be attributed — socket owned by another user's process, ancestry unreadable, tied to several agents, or a store exists but the daemon cannot list its agents | refused: `403`, `check: "caller_identity"`, naming why |
 
-**"Tied to no agent" is not proof of the operator.** It is the absence
-of every signal above, and today it still defaults to `operator (ui)`
-because the operator's own peer (a browser behind the tailnet `socat`
-relay or an ssh tunnel) carries no signal either. Phase 1 of CAD-335
-(this rule) only stops a managed agent's *ordinary* processes from
-landing there. Phase 2 (CAD-335 items 1 and 3, with ADR 0004 /
-CAD-313's operator session) replaces the default with positive proof
-and refuses every unattributed write.
-
-The board and `agent answer` also differ in how they place a caller
-tied to no pane: `answer` requires positive terminal evidence (a pts
-that is no pane's) to stamp `operator`, because it gates a pane's own
-menu; the board writes as `operator (ui)`, because the operator's own
-peer is a browser or tunnel that holds no terminal at all.
+**"Tied to no agent" is not proof of the operator** — it is the
+absence of every signal above, and since CAD-313 it is never enough:
+the operator's own peer (a browser behind a relay or an ssh tunnel)
+carries no signal either, so the operator proves itself by possession
+of the session instead.
 
 No `cadence.sqlite3` in the state dir means no agent was ever
-registered, so there is provably no pane or managed endpoint and writes
-are the operator's.
+registered, so there is provably no pane or managed endpoint — writes
+still need the session, and the daemon (the session authority) must be
+up for any operator write.
 A different host (non-loopback peer with no local client socket) is
 never a pane here. Reads are unchanged.
 
-The limit: identity follows the process that holds the TCP connection
-and the process signals it carries. A same-user relay a pane can reach
-but that carries neither still writes as the relay — exactly as it
-would to the daemon's socket:
+The limit: attribution follows the process that holds the TCP
+connection and the process signals it carries. A same-user relay a pane
+can reach but that carries neither is attributed to no agent — which,
+since CAD-313, means refused unless the request carries the operator's
+session:
 
 - **the loopback gateway** (nginx or any long-lived proxy the operator
   started): its worker holds the connection, descends from no pane,
-  carries no pane's `CADENCE_ALIAS` and holds no pane pty — `operator
-  (ui)`, or refused when it runs as another user;
+  carries no pane's `CADENCE_ALIAS` and holds no pane pty — refused
+  without a session (CAD-428), `operator (ui)` with one;
 - **an ssh tunnel** (`ssh -L` from a pane back to this host): the
-  board's peer is the host's `sshd` session process, whose ancestry
-  is `sshd` and which holds no pane pty — `operator (ui)`;
+  board's peer is the host's `sshd` session process — the same;
 - **a detach with redirected stdio** (`setsid -f … </dev/null
-  >/dev/null 2>&1`): no ancestry and no pane pty — `operator (ui)`,
-  whatever `CADENCE_ALIAS` it still carries.
-- **a detached or orphaned managed-endpoint process** (phase-2
-  remainder, CAD-335): a managed provider's `setsid -f` or
-  double-forked descendant leaves the provider's ancestry, and a
-  managed endpoint has no pty to fall back on, so it is `operator
-  (ui)`. So is a tool process orphaned when its provider died — once
-  the provider is gone, nothing proves the orphan was ever its. A
-  managed endpoint whose pid is not recorded (the launch has not
-  finished) matches nothing either; a recycled provider pid could
-  attribute an unrelated process *to* that agent (a narrowing, never
-  operator).
+  >/dev/null 2>&1`): no ancestry and no pane pty — refused without a
+  session, whatever `CADENCE_ALIAS` it still carries;
+- **a detached or orphaned managed-endpoint process**: a managed
+  provider's `setsid -f` or double-forked descendant leaves the
+  provider's ancestry, and a managed endpoint has no pty to fall back
+  on — refused without a session. A managed endpoint whose pid is not
+  recorded (the launch has not finished) matches nothing either; a
+  recycled provider pid could attribute an unrelated process *to* that
+  agent (a narrowing, never operator).
 
 - **a borrowed pane pty** (accepted residual, CAD-276): a same-user
   process on no pane's ancestry that opens a registered pane's
   `/dev/pts/N` onto its stdio is attributed as *that pane's* agent —
-  lateral authorship forgery between agents, with no privilege beyond
-  what the same process already had as `operator (ui)`. The pty tie is
-  kept because dropping it would send a `setsid` child of a pane back
-  to `operator (ui)`, an escalation. `tests/board.rs` pins the
+  lateral authorship forgery between agents, with no operator
+  privilege. The pty tie was kept because dropping it would have sent a
+  `setsid` child of a pane back to `operator (ui)`; since CAD-313 that
+  child is refused instead, and CAD-280 re-decides the tie. `tests/board.rs` pins the
   residual so a fix flips it deliberately.
 
-Same-user is not a hostile isolation boundary; this closes the direct
-path (a pane's `curl` approving its own work as `operator`) and the
-casual detach, not every deliberate relay. The root weakness — a local
-caller tied to no agent defaults to `operator (ui)` — is CAD-335 phase 2
-(operator by positive proof, as `slot_reconcile` already requires, and
-ADR 0004's operator session for the browser).
+Same-user is not a hostile isolation boundary. The operator session
+closes the ambient default (a local caller tied to no agent, and every
+relay, used to be `operator (ui)`); it does not stop a same-uid process
+that deliberately steals the secret and evades `operator_proof` — ADR
+0004 phase 2 (CAD-280) makes the secret unreadable to agents.
 
 ### Security posture
 
-No auth — **containment is the whole defence**, so the write path adds
-four cross-site guards, each checked in order before any body is read
+Reads need no auth; operator authority needs the session above. The
+rest is containment, so the write path adds four cross-site guards, each checked in order before any body is read
 or any writer runs, and each refusal names its check in `403` JSON:
 
 1. **Route + method.** Writes are `POST`/`PATCH`/`DELETE` on known

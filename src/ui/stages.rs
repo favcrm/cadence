@@ -13,8 +13,10 @@
 //! applies the operator rule to every move, not only to moves into an
 //! operator stage: the write guards, then an agent-attributed caller is
 //! refused (403 `operator_only`), then the HTTP peer must carry
-//! CAD-276's positive operator proof (403 `operator_proof`) — the same
-//! [`home::operator_write`] path the plan decisions take. Agents move
+//! CAD-276's positive operator proof (403 `operator_proof`) — enforced
+//! for the route's `WRITE_ROUTES` class (operator-only) by
+//! `operator::admit` before this handler runs, with a live operator
+//! session required (CAD-313). Agents move
 //! stages through their own `cadence issue epic stage`, where the
 //! daemon attributes the move to their lane. Identity-shaped request
 //! fields are never read: the body denies unknown fields.
@@ -23,8 +25,8 @@ use serde::Deserialize;
 use serde_json::json;
 use tiny_http::Request;
 
-use super::home::{operator_write, rpc_err};
-use super::{err_response, json_response, parse_json, read_body, HttpResp, ServeOpts};
+use super::home::rpc_err;
+use super::{err_response, json_response, parse_json, read_body, HttpResp};
 use crate::client;
 use crate::issue::{board, model, Pm};
 
@@ -48,12 +50,8 @@ pub(super) fn stage_route(path: &str) -> Option<&str> {
 pub(super) fn move_stage(
     request: &mut Request,
     state_dir: &std::path::Path,
-    opts: &ServeOpts,
     epic: &str,
 ) -> HttpResp {
-    if let Err(resp) = operator_write(request, state_dir, opts, "a stage move") {
-        return resp;
-    }
     let Ok(epic) = model::check_id(epic) else {
         return err_response(400, "bad epic id");
     };

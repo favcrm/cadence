@@ -20,24 +20,46 @@
 //!   `master_summary` (CAD-339) without posting it; a daemon without the
 //!   method answers 501 so the UI shows "not available".
 //!
-//! Every write passes the board's write path first: read-only, the
-//! cross-site guards ([`write_guard`]) and caller attribution
-//! ([`write_caller`]). A caller the board attributes to an agent gets
-//! 403 — these are the operator's decisions, and the daemon would see
-//! the board's own connection, not the agent's. No request field names
-//! who decided: the request bodies deny unknown fields, and the daemon
-//! derives the operator from the board's connection. A caller tied to
-//! no agent is the operator by DEFAULT, not by positive proof — the gap
-//! every board write has until CAD-313 lands operator identity for the
-//! web UI.
+//! Who is trusted as the operator here (CAD-313, CAD-428): every route
+//! in this file is operator-only in `operator::WRITE_ROUTES`, so
+//! `operator::admit` has admitted the request before any handler here
+//! runs — exactly a request that passes all of:
+//!
+//! 1. read-only off, and the cross-site guards (`write_guard`);
+//! 2. a live **operator session** ([`operator::board_caller`]): the
+//!    HttpOnly cookie a `cadence ui login` link was exchanged for plus
+//!    the page's `X-Cadence-Session` key, presented on the origin it was issued for (this board's own
+//!    `cadence-<port>.localhost` name, or the proven `tailscale serve`
+//!    proxy) with that origin's `Origin` header, by a peer tied to no
+//!    agent — or whose socket is another uid's proxy. No session is
+//!    refused `operator_session_required` — whatever relays it (nginx,
+//!    `socat`, a gateway vhost), whatever Host, `Tailscale-*` or
+//!    `X-Forwarded-*` header it carries, and however detached from its
+//!    pane the sender is. A peer tied to an agent is refused
+//!    `operator_only` (and a session it presents is revoked,
+//!    `session_from_agent`); a session-bearing peer the board cannot
+//!    attribute (its socket closed early) is refused `caller_identity`;
+//! 3. positive process proof on the HTTP peer
+//!    ([`prove_operator_peer`]), the rule the daemon applies to its own
+//!    operator verbs — the board is never less strict than the RPC it
+//!    relays. The proven tailnet proxy passes: its peer is tailscaled.
+//!
+//! No request field names who decided: the request bodies deny unknown
+//! fields, and the daemon derives the operator from the board's
+//! connection. Residual (ADR 0004 §1.3, phase 2 under CAD-280): any
+//! same-uid process that passes `operator_proof` — one cadence did not
+//! launch passes with no evasion at all (an agent CLI the operator
+//! started by hand), an agent's `setsid -f` child with a scrubbed env
+//! and stdio passes by evasion — and reads the operator secret can mint
+//! its own login link.
 
 use serde::Deserialize;
 use serde_json::json;
 use tiny_http::Request;
 
 use super::{
-    agent_roots, coded_response, err_response, guard_fail, json_response, parse_json, read_body,
-    tailnet_proxy, write_caller, write_guard, write_reply, HttpResp, ServeOpts, WriteCaller,
+    agent_roots, coded_response, err_response, guard_fail, json_response, operator, parse_json,
+    read_body, tailnet_proxy, write_reply, HttpResp, ServeOpts,
 };
 use crate::client;
 use crate::error::Error;
@@ -79,55 +101,18 @@ pub(super) fn answer_route(path: &str) -> Option<&str> {
     (!id.is_empty() && !id.contains('/')).then_some(id)
 }
 
-/// The board's write path for an operator decision: read-only, the
-/// cross-site guards, then the caller — an agent is refused (403,
-/// `check: "operator_only"`) — and then POSITIVE operator proof for the
-/// HTTP peer ([`prove_operator_peer`]): being tied to no agent is not
-/// enough here, because the daemon checks the board's own connection
-/// and would accept whatever the board relays. Returns the operator's
-/// actor.
-pub(super) fn operator_write(
-    request: &Request,
-    state_dir: &std::path::Path,
-    opts: &ServeOpts,
-    what: &str,
-) -> std::result::Result<String, HttpResp> {
-    if opts.read_only {
-        return Err(guard_fail(
-            "read_only",
-            "board is read-only — writes are disabled",
-        ));
-    }
-    write_guard(request, "application/json", opts)?;
-    match write_caller(request, state_dir, opts)? {
-        WriteCaller::Operator(actor) => {
-            prove_operator_peer(request, state_dir, opts, what)?;
-            Ok(actor)
-        }
-        WriteCaller::Agent(alias) => Err(guard_fail(
-            "operator_only",
-            &format!(
-                "{what} is the operator's decision — this request comes from agent \
-                 '{alias}'; decide from the operator's browser"
-            ),
-        )),
-    }
-}
-
 /// Whether this client may make the operator's board decisions — what
-/// `/api/meta` reports so the UI offers them only to the operator. The
-/// same checks as [`operator_write`] minus the browser write guards: a
-/// writable board, a caller tied to no agent, and the positive proof.
-/// Anything unprovable is `false`. The UI's answer is a courtesy; every
-/// write still runs the full check.
+/// `/api/meta?operator=1` reports so the UI offers them only to the
+/// operator. The same checks `operator::admit` runs on an operator-only
+/// write, minus the browser write guards: a writable board, a live
+/// operator session (CAD-313) presented by a caller tied to no agent,
+/// and the positive proof on the peer. Anything unprovable is `false`.
+/// The UI's answer is a courtesy; every write still runs the full check.
 ///
 /// The board relays decisions over its OWN daemon connection, so the
 /// board process must be the operator's too ([`board_is_operator`]): a
 /// board an agent started would have the daemon refuse every relayed
 /// decision, and shows no buttons.
-///
-/// TODO(CAD-313): once the web UI has an operator session, require it
-/// here as well.
 pub(super) fn operator_viewer(
     request: &Request,
     state_dir: &std::path::Path,
@@ -135,8 +120,8 @@ pub(super) fn operator_viewer(
 ) -> bool {
     !opts.read_only
         && matches!(
-            write_caller(request, state_dir, opts),
-            Ok(WriteCaller::Operator(_))
+            operator::board_caller(request, state_dir, opts, false),
+            Ok(operator::Caller::Operator(_))
         )
         && prove_operator_peer(request, state_dir, opts, "reading the operator role").is_ok()
         && board_is_operator(state_dir)
@@ -178,7 +163,7 @@ pub(super) fn board_is_operator(state_dir: &std::path::Path) -> bool {
 /// peer is tailscaled. Anything unprovable — a daemon that cannot say
 /// its pid, agents it cannot list — refuses with 403 `operator_proof`,
 /// before anything is written.
-fn prove_operator_peer(
+pub(super) fn prove_operator_peer(
     request: &Request,
     state_dir: &std::path::Path,
     opts: &ServeOpts,
@@ -246,7 +231,6 @@ pub(super) fn rpc_err(e: &Error, method: &str) -> HttpResp {
 pub(super) fn decide_plan(
     request: &mut Request,
     state_dir: &std::path::Path,
-    opts: &ServeOpts,
     epic: &str,
     verb: &str,
 ) -> HttpResp {
@@ -255,9 +239,6 @@ pub(super) fn decide_plan(
         "reject" => false,
         _ => return err_response(404, "no such plan route"),
     };
-    if let Err(resp) = operator_write(request, state_dir, opts, &format!("plan {verb}")) {
-        return resp;
-    }
     let Ok(epic) = model::check_id(epic) else {
         return err_response(400, "bad plan epic id");
     };
@@ -304,7 +285,7 @@ pub(super) fn delivery_route(path: &str) -> Option<(&str, &str)> {
 }
 
 /// `POST /api/delivery/<id>/merge|decline` (CAD-431) — the same
-/// operator rule as the plan decision ([`operator_write`]).
+/// operator rule as the plan decision (`operator::admit`).
 pub(super) fn decide_delivery(
     request: &mut Request,
     state_dir: &std::path::Path,
@@ -317,9 +298,6 @@ pub(super) fn decide_delivery(
         "decline" => false,
         _ => return err_response(404, "no such delivery route"),
     };
-    if let Err(resp) = operator_write(request, state_dir, opts, &format!("delivery {verb}")) {
-        return resp;
-    }
     let Ok(id) = model::check_id(id) else {
         return err_response(400, "bad issue id");
     };
@@ -375,13 +353,9 @@ pub(super) fn answer(
     request: &mut Request,
     state_dir: &std::path::Path,
     pm_dir: &std::path::Path,
-    opts: &ServeOpts,
+    actor: &str,
     id: &str,
 ) -> HttpResp {
-    let actor = match operator_write(request, state_dir, opts, "answering a question") {
-        Ok(actor) => actor,
-        Err(resp) => return resp,
-    };
     let Ok(id) = model::check_id(id) else {
         return err_response(400, "bad issue id");
     };
@@ -400,7 +374,7 @@ pub(super) fn answer(
     // The author is the operator — derived above, never read from the
     // request or from this process's environment.
     let filed = task_report::prepare_answer(&pm, &id, &req.question, &req.text, "operator")
-        .and_then(|p| task_report::store(&pm, &p, &actor));
+        .and_then(|p| task_report::store(&pm, &p, actor));
     match filed {
         Ok(out) => {
             // CAD-447: the accepted answer goes to the question's author.

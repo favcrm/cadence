@@ -31,6 +31,7 @@ const paths: [string, Route][] = [
   ["/overview", { screen: "overview" }],
   ["/settings", { screen: "settings", section: "models" }],
   ["/settings/memory", { screen: "settings", section: "memory" }],
+  ["/login", { screen: "login" }],
 ];
 for (const [path, route] of paths) {
   equal(matchRoute(path), route, `match ${path}`);
@@ -40,7 +41,7 @@ equal(matchRoute("/projects/cadence/"), matchRoute("/projects/cadence"), "traili
 equal(matchRoute("/agents/a%20b"), { screen: "agents", alias: "a b" }, "decoded alias");
 equal(routePath({ screen: "agents", alias: "a b" }), "/agents/a%20b", "encoded alias");
 equal(matchRoute("/index.html"), { screen: "home" }, "index.html is home");
-for (const dead of ["/overview/x", "/nope", "/projects/x/y", "/agents/a/b", "/settings/nope", "/setup/x", "/projects/%E0"]) {
+for (const dead of ["/overview/x", "/nope", "/projects/x/y", "/agents/a/b", "/settings/nope", "/setup/x", "/login/x", "/projects/%E0"]) {
   equal(matchRoute(dead).screen, "notFound", `not found ${dead}`);
 }
 

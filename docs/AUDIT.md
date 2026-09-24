@@ -215,6 +215,40 @@ passes. Operator-by-positive-proof as a design decision
 (tracker issue **CAD-280**, "operator by positive proof") will replace this rule for
 board writes, `slot_reconcile` and these verbs alike.
 
+Board writes moved first (CAD-313, ADR 0004 phase 1): the board's
+operator is the holder of a session opened with a `cadence ui login`
+link, and minting that link needs this same proof **plus** the
+operator secret file. The residual carries over: a same-uid process
+that reads `<state>/operator/secret` and passes the proof can mint a
+link. A process cadence launched (a pane, a managed endpoint, a runner,
+anything the daemon started) must evade the proof — `setsid -f` with a
+scrubbed env and stdio (`operator_secret_theft_residual_pinned` pins
+it). **A same-uid process cadence never launched needs no evasion at
+all**: an agent CLI the operator started by hand, outside every
+registered pane, passes the proof as it is (the PR #249 reviewer minted
+a link from its own Claude Code shell), and can read the file. A board
+session is two credentials: the HttpOnly cookie and a key the signed-in
+tab keeps in its `sessionStorage` and sends as `X-Cadence-Session`.
+Phase 1 therefore refuses cadence-launched agents, relays, forged
+headers, a cookie replayed WITHOUT the key (the round-2 probe: a cookie
+leaked to another port's listener through a link the operator
+clicked), and a replay whose sender hangs up early to escape
+attribution. What it does not stop, stated plainly: an unregistered
+same-uid agent that chooses to sign in (above); a same-uid process that
+reads the operator browser's memory or profile when that browser runs
+on this host as this user (it then has both credentials — a tailnet or
+`ssh -L` browser on another machine is out of its reach); script that
+runs on the board origin (XSS) and can read `sessionStorage` — the CSP
+(no inline script) and the markdown sanitiser are load-bearing; and a
+same-uid process that captures the operator's terminal while `ui login`
+prints a link (e.g. `tmux capture-pane`) and opens it within 120 s.
+Phase 2 under CAD-280 makes the secret unreadable to every agent
+process tree. Other decisions recorded in ADR 0004 §12: the session
+cookie lives on the board's own `cadence-<port>.localhost` name, links
+to this machine in agent-written markdown are never clickable, and
+there is no failed-login rate limit (a shared budget let an agent lock
+the operator out). These audit verbs do not take the secret yet (ADR 0004 §12, Q7).
+
 **Approvals are operator claims, not proof — until CAD-280.** Two
 gaps mean a bound record cannot prove the operator approved:
 

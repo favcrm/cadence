@@ -1,4 +1,5 @@
-import Markdown from "react-markdown";
+import Markdown, { defaultUrlTransform } from "react-markdown";
+import { isLoopbackHref } from "./links";
 
 // Bare issue ids become `issue:` links before rendering; matches inside
 // code spans or existing markdown links are left alone.
@@ -18,8 +19,9 @@ export default function Md({
 }) {
   return (
     <Markdown
-      // `issue:` ids are ours; external hrefs still get rel=noreferrer.
-      urlTransform={(url) => url}
+      // `issue:` ids are ours; everything else takes react-markdown's
+      // safe transform (no `javascript:` and friends).
+      urlTransform={(url) => (url.startsWith("issue:") ? url : defaultUrlTransform(url))}
       components={{
         a: ({ href, children }) =>
           href?.startsWith("issue:") ? (
@@ -29,6 +31,14 @@ export default function Md({
             >
               {children}
             </button>
+          ) : href && isLoopbackHref(href) ? (
+            // A link to this machine is shown, never followed (CAD-313).
+            <span
+              className="text-warn"
+              title="A link to this machine — not clickable on the board, so the board's session cookie is never sent to another local server. Copy it if you trust it."
+            >
+              {children} <code className="num break-all">[{href}]</code>
+            </span>
           ) : (
             <a
               className="lnk"

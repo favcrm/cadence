@@ -1,3 +1,4 @@
+import { useWriteBlock } from "../auth/WriteGate";
 import { useState } from "react";
 import { api, ApiError } from "../../lib/api";
 import { resources } from "../../lib/resources";
@@ -42,8 +43,9 @@ export default function PlanCard({
   const [reason, setReason] = useState("");
   const [error, setError] = useState<string | null>(null);
 
+  const block = useWriteBlock(readOnly);
   const detail = state.data?.id === epic ? state.data : null;
-  const view = detail ? planView(detail, readOnly) : null;
+  const view = detail ? planView(detail, block) : null;
 
   if (!detail) {
     return (
