@@ -3629,6 +3629,7 @@ fn daemon_opts() -> daemon::ServeOptions {
         // tests (which bind CADENCE_PM_DIR) turn it on.
         report_router: Some(0),
         idle_poll: None,
+        stop: None,
     }
 }
 
