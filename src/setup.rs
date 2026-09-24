@@ -44,6 +44,11 @@
 //! login held only in an API-key environment variable is not inspected
 //! and reads as not signed in.
 //!
+//! The board's `/setup` page (CAD-327) runs the same list through
+//! [`board_detect`]: detect only — [`detect_checks`] never calls an
+//! `apply` — with the `ui` check answered by the serving board and each
+//! provider probe bounded by [`BOARD_PROBE_TIMEOUT`].
+//!
 //! Hooks for work in other lanes: the single-use operator login link
 //! is CAD-313 ([`login_link`] returns `None` until its `cadence ui
 //! login` lands), and the master agent's files and bootstrap are
@@ -202,7 +207,15 @@ impl Check {
 
     /// The runner — the one place the status rules live.
     pub fn run(&self, ctx: &Ctx, done: &[Outcome]) -> Outcome {
-        let fix = || Some((self.fix)(ctx));
+        self.run_as(ctx, done, Mode::Apply)
+    }
+
+    fn run_as(&self, ctx: &Ctx, done: &[Outcome], mode: Mode) -> Outcome {
+        // An empty fix is "no command exists in this build".
+        let fix = || Some((self.fix)(ctx)).filter(|f| !f.is_empty());
+        // Detect only: an absent check is reported with its fix, exactly
+        // as a check without an `apply` is.
+        let apply = self.apply.as_ref().filter(|_| mode == Mode::Apply);
         if let Some(dep) = self
             .needs
             .iter()
@@ -220,7 +233,7 @@ impl Check {
                 self.outcome(Status::Failed, detail, own.or_else(fix))
             }
             Found::Manual { detail, fix: own } => self.outcome(Status::Missing, detail, own),
-            Found::Absent(d) => match &self.apply {
+            Found::Absent(d) => match apply {
                 None => self.outcome(Status::Missing, d, fix()),
                 Some(apply) => match apply(ctx) {
                     Err(e) => self.outcome(Status::Failed, format!("{d}; {e}"), fix()),
@@ -242,6 +255,13 @@ impl Check {
             },
         }
     }
+}
+
+/// Whether the runner may call a check's `apply`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Apply,
+    DetectOnly,
 }
 
 /// What every check reads.
@@ -763,7 +783,15 @@ fn master_check() -> Check {
                 }
             }
         },
-        |ctx| ctx.cadence("master start"),
+        // Without the verb there is nothing to paste — also while the
+        // tracker it needs is still missing.
+        |ctx| {
+            if ctx.has_verb("master") {
+                ctx.cadence("master start")
+            } else {
+                String::new()
+            }
+        },
     )
     .needs(&["tracker"])
 }
@@ -805,6 +833,98 @@ pub fn run_checks(ctx: &Ctx, checks: &[Check], mut emit: impl FnMut(&Outcome)) -
         done.push(outcome);
     }
     done
+}
+
+/// Run `checks` detect only: no `apply` is ever called, so nothing is
+/// created, started or written — an absent check is `missing` with its
+/// fix. The `needs` rule still holds (a check whose prerequisite is not
+/// ready reports that instead of probing).
+pub fn detect_checks(ctx: &Ctx, checks: &[Check]) -> Vec<Outcome> {
+    if cfg!(debug_assertions) {
+        validate(checks);
+    }
+    let mut done: Vec<Outcome> = Vec::with_capacity(checks.len());
+    for check in checks {
+        let outcome = check.run_as(ctx, &done, Mode::DetectOnly);
+        done.push(outcome);
+    }
+    done
+}
+
+// ---------- the board's detect-only entry point (CAD-327) ----------
+
+/// Bound on each provider probe when the board runs the checks: a
+/// browser waits on the answer, so it is half the CLI's.
+pub const BOARD_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// This binary's top-level verbs, registered by `main` before a board
+/// serves — the library cannot see the CLI, and a fix may name only a
+/// verb that exists (`master start` arrives with CAD-339).
+static VERBS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+pub fn register_verbs(verbs: Vec<String>) {
+    let _ = VERBS.set(verbs);
+}
+
+/// Which wizard step a check belongs to — `provider` for each CLI in
+/// [`PROVIDERS`], `master` for the master agent, else `environment`.
+pub fn check_group(name: &str) -> &'static str {
+    if PROVIDERS.iter().any(|p| p.bin == name) {
+        "provider"
+    } else if name == "master" {
+        "master"
+    } else {
+        "environment"
+    }
+}
+
+/// The board itself: it is answering this request, so it is running.
+/// Replaces the `ui` check, whose detect would probe the board over
+/// HTTP and try to bind its port.
+fn board_self_check(url: String) -> Check {
+    Check::new(
+        "ui",
+        move |_| Found::Present(format!("board at {url} (serving this page)")),
+        |ctx| ctx.cadence("ui status"),
+    )
+}
+
+/// The checks the board runs: setup's list, the `ui` check answered by
+/// the serving board.
+pub fn board_checks(board_url: &str) -> Vec<Check> {
+    checks()
+        .into_iter()
+        .map(|c| {
+            if c.name == "ui" {
+                board_self_check(board_url.to_string())
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// `GET /api/setup` — every setup check, detect only, for the board at
+/// `port`. Reads the process environment as `cadence setup` does; never
+/// applies, starts or writes anything; provider probes are bounded by
+/// [`BOARD_PROBE_TIMEOUT`] and report only a version token and an exit
+/// code or a file's presence (the rules in [`PROVIDERS`]).
+pub fn board_detect(state_dir: &Path, pm_dir: &Path, port: u16) -> Result<Vec<Outcome>> {
+    let home = process_env("HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .ok_or_else(|| Error::rejected("HOME is not set to an absolute path"))?;
+    let ctx = Ctx {
+        state_dir: state_dir.to_path_buf(),
+        pm_dir: pm_dir.to_path_buf(),
+        home,
+        port: Some(port),
+        sandbox: crate::sandbox::profile(),
+        env: process_env,
+        probe_timeout: BOARD_PROBE_TIMEOUT,
+        verbs: VERBS.get().cloned().unwrap_or_default(),
+    };
+    Ok(detect_checks(&ctx, &board_checks(&ctx.board_url())))
 }
 
 /// Every `needs` names a check that runs earlier — a dependency that is
@@ -1030,6 +1150,25 @@ mod tests {
         assert!(!with_verb.pm_dir.join("agents").exists());
     }
 
+    /// A missing tracker blocks master; the fix still names only a verb
+    /// this binary has.
+    #[test]
+    fn master_behind_a_missing_tracker_names_no_absent_verb() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx(dir.path());
+        let tracker = Check::new("tracker", |_| Found::Absent("t".into()), |_| "init".into());
+        let checks = [tracker, master_check()];
+        let out = detect_checks(&ctx, &checks);
+        assert!(out[1].detail.contains("needs `tracker`"), "{:?}", out[1]);
+        assert_eq!(out[1].fix, None, "{:?}", out[1]);
+        let with_verb = Ctx {
+            verbs: vec!["master".into()],
+            ..ctx
+        };
+        let out = detect_checks(&with_verb, &checks);
+        assert!(out[1].fix.as_deref().unwrap().ends_with("master start"));
+    }
+
     #[test]
     fn a_started_apply_reports_started() {
         let dir = tempfile::tempdir().unwrap();
@@ -1058,6 +1197,52 @@ mod tests {
     #[test]
     fn the_shipped_check_list_orders_every_dependency() {
         validate(&checks());
+        validate(&board_checks("http://127.0.0.1:3111"));
+    }
+
+    #[test]
+    fn detect_only_never_applies_and_reports_the_fix() {
+        let dir = tempfile::tempdir().unwrap();
+        let applied = Rc::new(Cell::new(0));
+        let checks = [flag_check("a", applied.clone(), true)];
+        let out = detect_checks(&ctx(dir.path()), &checks);
+        assert_eq!(out[0].status, Status::Missing, "{:?}", out[0]);
+        assert_eq!(out[0].detail, "gone");
+        assert_eq!(out[0].fix.as_deref(), Some("make a"));
+        assert_eq!(applied.get(), 0, "detect-only ran an apply");
+    }
+
+    /// Every shipped check, detect only, over an empty host: nothing is
+    /// created — no state dir, tracker, skill or board.
+    #[test]
+    fn the_board_list_detect_only_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx(dir.path());
+        let url = "http://127.0.0.1:3111";
+        let out = detect_checks(&ctx, &board_checks(url));
+        let names: Vec<&str> = out.iter().map(|o| o.check.as_str()).collect();
+        let shipped: Vec<String> = checks().into_iter().map(|c| c.name).collect();
+        assert_eq!(names, shipped, "the board runs setup's own list");
+        let by = |n: &str| out.iter().find(|o| o.check == n).unwrap();
+        for name in ["state_dir", "tracker", "skill"] {
+            assert_eq!(by(name).status, Status::Missing, "{:?}", by(name));
+            assert!(by(name).fix.is_some(), "{:?}", by(name));
+        }
+        assert_eq!(by("ui").status, Status::Ok);
+        assert!(by("ui").detail.contains(url), "{:?}", by("ui"));
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "detect-only created files"
+        );
+    }
+
+    #[test]
+    fn checks_are_grouped_for_the_wizard() {
+        assert_eq!(check_group("claude"), "provider");
+        assert_eq!(check_group("pi"), "provider");
+        assert_eq!(check_group("master"), "master");
+        assert_eq!(check_group("daemon"), "environment");
     }
 
     #[test]
