@@ -680,6 +680,8 @@ use temp_dirs::check_temp_dirs;
 #[allow(unused_imports)]
 pub(crate) use util::find_wals;
 #[allow(unused_imports)]
+pub(crate) use util::has_secret_prefix;
+#[allow(unused_imports)]
 pub(crate) use util::wal_roots;
 #[allow(unused_imports)]
 pub(crate) use util::Census;
@@ -689,6 +691,8 @@ pub(crate) use util::FsFree;
 pub(crate) use util::WalRoot;
 #[allow(unused_imports)]
 pub(crate) use util::WalScan;
+#[allow(unused_imports)]
+pub(crate) use util::SECRET_PREFIXES;
 #[allow(unused_imports)]
 use util::{
     census_of, comm_family, dir_size, dir_size_limited, file_locked, group_line, kill_lines,
