@@ -23421,29 +23421,44 @@ fn overview_scope_flags_filter_rows_and_reject_unknown_keys() {
 }
 
 /// CAD-253: `cadence overview --json` carries each needs-me row's
-/// server-resolved audience. A fenced worker whose PM is live stays
-/// team work; one whose PM is itself fenced, and a fenced root agent
-/// with no PM at all, are the operator's — and the plain render groups
-/// them the same way.
+/// server-resolved audience. A stalled worker whose PM is live stays
+/// team work; one whose PM is fenced, and a stalled root agent with no
+/// PM at all, are the operator's — and the plain render groups them the
+/// same way. A fenced agent is the operator's whatever its PM (CAD-374:
+/// only the operator may unfence or reconcile).
 #[test]
 fn overview_needs_me_audience_follows_owner_liveness() {
     let d = TestDaemon::start();
     let home = TempDir::new().unwrap();
     let pm = TempDir::new().unwrap();
-    let cwd = d.dir.path().to_str().unwrap().to_string();
     d.register_inbox("pm");
     d.register("lead");
-    for (alias, upstream) in [("w1", "pm"), ("w2", "lead")] {
+    for (alias, upstream) in [("w1", "pm"), ("w2", "lead"), ("w4", "pm")] {
+        register_fake_opts(&d, alias, json!({"upstream": upstream, "stall_secs": 2}));
+    }
+    register_fake_opts(&d, "w3", json!({"stall_secs": 2}));
+    for w in ["lead", "w1", "w2", "w3", "w4"] {
+        d.wait_agent(w, "idle", 10);
+    }
+    for w in ["lead", "w4"] {
+        fence_agent(&d, w, &format!("x-{w}"));
+    }
+    // A silent turn stalls the worker: a row its PM owns.
+    for w in ["w1", "w2", "w3"] {
         d.rpc(
-            "agent_register",
-            json!({"alias": alias, "provider": "fake", "endpoint_kind": "fake",
-                   "cwd": cwd, "params": json!({"upstream": upstream}).to_string()}),
+            "agent_send",
+            json!({"alias": w, "text": "SLEEP:20", "message": format!("s-{w}")}),
         )
         .unwrap();
     }
-    for w in ["lead", "w1", "w2"] {
-        d.wait_agent(w, "idle", 10);
-        fence_agent(&d, w, &format!("x-{w}"));
+    for w in ["w1", "w2", "w3"] {
+        let id = format!("s-{w}");
+        d.wait_event_where(
+            w,
+            "turn_stalled",
+            |e| e["payload"]["message"].as_str() == Some(id.as_str()),
+            20,
+        );
     }
     let out = overview_cmd(home.path(), &d.state, pm.path(), &[]);
     assert!(
@@ -23452,27 +23467,39 @@ fn overview_needs_me_audience_follows_owner_liveness() {
         String::from_utf8_lossy(&out.stderr)
     );
     let view: Value = serde_json::from_slice(&out.stdout).unwrap();
-    let row = |alias: &str| -> (String, String) {
+    let row = |alias: &str, kind: &str| -> (String, String) {
         let r = view["needs_me"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|n| n["subject"]["id"] == alias && n["kind"] == "fenced")
-            .unwrap_or_else(|| panic!("no fenced row for {alias}: {view}"));
+            .find(|n| n["subject"]["id"] == alias && n["kind"] == kind)
+            .unwrap_or_else(|| panic!("no {kind} row for {alias}: {view}"));
         (
             r["audience"].as_str().unwrap().to_string(),
             r["audience_reason"].as_str().unwrap().to_string(),
         )
     };
-    assert_eq!(row("w1"), ("team".into(), "owner pm can act".into()));
     assert_eq!(
-        row("w2"),
+        row("w1", "stalled"),
+        ("team".into(), "owner pm can act".into())
+    );
+    assert_eq!(
+        row("w2", "stalled"),
         ("operator".into(), "owner lead is fenced".into())
     );
-    assert_eq!(row("lead"), ("operator".into(), "no owner".into()));
+    assert_eq!(row("w3", "stalled"), ("operator".into(), "no owner".into()));
+    // Fenced: the operator's, even with a live PM.
+    assert_eq!(
+        row("w4", "fenced"),
+        ("operator".into(), "operator decision".into())
+    );
+    assert_eq!(
+        row("lead", "fenced"),
+        ("operator".into(), "operator decision".into())
+    );
 
-    // The plain render reads the same field: w2 and lead under the
-    // decision, w1 under team handling.
+    // The plain render reads the same field: w2, w3, w4 and lead under
+    // the decision, w1 under team handling.
     let plain = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
         .arg("--state-dir")
         .arg(&d.state)
@@ -23490,13 +23517,18 @@ fn overview_needs_me_audience_follows_owner_liveness() {
         text.find(needle)
             .unwrap_or_else(|| panic!("{needle}: {text}"))
     };
-    for op in ["agent lead fenced", "agent w2 fenced"] {
+    for op in [
+        "agent lead fenced",
+        "agent w4 fenced",
+        "agent w2 turn silent",
+        "agent w3 turn silent",
+    ] {
         assert!(
             (decision..team).contains(&at(op)),
             "{op} not a decision: {text}"
         );
     }
-    assert!(at("agent w1 fenced") > team, "w1 is team work: {text}");
+    assert!(at("agent w1 turn silent") > team, "w1 is team work: {text}");
     assert!(!text.contains("nothing needs your decision"), "{text}");
 }
 
