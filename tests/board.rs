@@ -11897,7 +11897,9 @@ fn an_early_closed_replay_of_a_stolen_session_writes_nothing() {
     let (_, last) = git(pm.path(), &["log", "-1", "--format=%B"]);
     assert!(!last.contains("hit and run"), "{last}");
 
-    // The login exchange, hit and run: the link is spent.
+    // The login exchange, hit and run: the link is spent, and the
+    // exchange is refused as a stolen one (recorded), not opened.
+    let spent_before = daemon_events(&d.state(), "operator_session_from_agent").len();
     let link = op::login_link(bin(), &d.state(), port, &[]).unwrap();
     let nonce = op::nonce_of(&link);
     let host = op::board_host(port);
@@ -11919,9 +11921,10 @@ fn an_early_closed_replay_of_a_stolen_session_writes_nothing() {
     let (code, _, body) = op::exchange(port, &host, &nonce);
     assert_eq!(code, 403, "{body}");
     assert!(body.contains("already_used"), "{body}");
-    assert!(
-        !daemon_events(&d.state(), "operator_session_from_agent").is_empty(),
-        "the spent exchange is recorded"
+    assert_eq!(
+        daemon_events(&d.state(), "operator_session_from_agent").len(),
+        spent_before + 1,
+        "the hit-and-run exchange is refused and recorded"
     );
 }
 
@@ -11999,6 +12002,26 @@ fn route_classes_are_enforced_for_an_agent_caller() {
             &[("PORT", port.to_string()), ("REQ", req)],
         )
     };
+    // The table itself is pinned: exactly these writes are agent-allowed.
+    let mut agent_allowed: Vec<String> = ui::WRITE_ROUTES
+        .iter()
+        .filter(|r| r.class == ui::RouteClass::AgentAllowed)
+        .map(|r| format!("{} {}", r.method, r.pattern))
+        .collect();
+    agent_allowed.sort();
+    assert_eq!(
+        agent_allowed,
+        [
+            "DELETE /api/issues/*/links",
+            "PATCH /api/issues/*",
+            "POST /api/issues",
+            "POST /api/issues/*/artifacts",
+            "POST /api/issues/*/comments",
+            "POST /api/issues/*/links",
+            "POST /api/issues/*/refs",
+            "POST /api/monitors/*/alerts/*/ack",
+        ]
+    );
     let mut classes = (0, 0);
     for r in ui::WRITE_ROUTES {
         let segs: Vec<&str> = r.pattern.split('/').collect();
