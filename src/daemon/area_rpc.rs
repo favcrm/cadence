@@ -199,6 +199,17 @@ impl Shared {
                     msg.id
                 )));
             }
+            // The kickoff went to the task's recorded worker — the lane
+            // belongs to the assignee the dispatch named, and a kickoff
+            // delivered to anyone else is not this lane's dispatch.
+            if task.assignee.as_deref() != Some(msg.alias.as_str()) {
+                return Err(Error::rejected(format!(
+                    "{verb}: the dispatch kickoff {} was sent to '{}' but task \
+                     {task_id} records assignee {:?} — it did not go to this \
+                     lane's worker",
+                    msg.id, msg.alias, task.assignee
+                )));
+            }
             let job = self.store.job(&task.job_id)?;
             if job.issue_id.as_deref() != Some(id) {
                 return Err(Error::rejected(format!(
