@@ -1552,10 +1552,11 @@ mod tests {
         );
     }
 
-    /// CAD-109: a credential shape the summary scrubber lets through (a
-    /// GitLab token is too short for its entropy test) is refused by the
-    /// secret scan. Nothing reaches GitHub, the receipt names the rule and
-    /// not the value, and an edit that removes the value publishes.
+    /// CAD-109: a credential shape the summary scrubber lets through —
+    /// a GitLab deploy token, whose `gldt-` prefix the scrubber's shared
+    /// list does not know — is refused by the secret scan. Nothing
+    /// reaches GitHub, the receipt names the rule and not the value, and
+    /// an edit that removes the value publishes.
     #[test]
     fn credential_shaped_report_is_blocked_not_published() {
         use sha2::{Digest, Sha256};
@@ -1573,7 +1574,7 @@ mod tests {
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect();
-        let token = ["gl", "pat-", &digest[..20]].concat();
+        let token = ["gl", "dt-", &digest[..20]].concat();
         let path = pm_temp.path().join("cadence/CAD-1/issue.md");
         let clean = fs::read_to_string(&path).unwrap();
         fs::write(&path, format!("{clean}\nDeploy with\n{token}\n")).unwrap();
@@ -1586,8 +1587,8 @@ mod tests {
         let r = &state.reports["CAD-1"];
         assert_eq!(r.state, "blocked");
         let reason = r.reason.clone().unwrap();
-        assert!(reason.contains("rule cadence-gitlab-pat"), "{reason}");
-        assert!(!reason.contains(&token[6..]), "{reason}");
+        assert!(reason.contains("rule gitlab-deploy-token"), "{reason}");
+        assert!(!reason.contains(&token[5..]), "{reason}");
         assert_eq!(errors, vec![reason]);
 
         // A later pass re-checks without repeating the error.

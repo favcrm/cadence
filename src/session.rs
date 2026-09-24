@@ -292,30 +292,15 @@ fn scrub_auth_spans(s: &str) -> String {
 
 /// Whitespace-separator gate for `scrub_auth_spans` — is this token
 /// secret-looking enough to mask on a bare space? `hunter2` yes
-/// (length plus a digit), `expired`/`test_x`/`localhost` no.
+/// (length plus a digit), `expired`/`test_x`/`localhost` no. The
+/// provider-prefix set is the shared [`doctor::host::has_secret_prefix`]
+/// — one list for every credential gate (CAD-440).
 fn looks_secret(tok: &str) -> bool {
-    const PREFIXES: &[&str] = &[
-        "figd_",
-        "ghp_",
-        "gho_",
-        "ghu_",
-        "ghs_",
-        "ghr_",
-        "github_pat_",
-        "sk-",
-        "xoxa-",
-        "xoxb-",
-        "xoxp-",
-        "xoxr-",
-        "xoxs-",
-        "AKIA",
-        "ASIA",
-    ];
     let t = tok.trim_matches(|c: char| matches!(c, '"' | '\'' | ',' | ';' | ')'));
     t.len() >= 12
         || (t.len() >= 6 && t.bytes().any(|b| b.is_ascii_digit()))
         || t.ends_with('=')
-        || PREFIXES.iter().any(|p| t.starts_with(p))
+        || doctor::host::has_secret_prefix(t)
         || (t.starts_with("eyJ") && t.contains('.'))
 }
 
