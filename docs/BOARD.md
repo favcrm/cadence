@@ -539,8 +539,10 @@ The start that puts an unclaimed issue into work records the claim —
 commit as the refs, so the dispatching PM stays a holder after the
 worker becomes `owner`. Claim age is `now − claim.at`; an issue owned
 before claims existed is dated by the tracker commit that last changed
-its `owner:` line (a bounded `git log -G '^owner:'`, "age unknown" past
-the bound).
+its `owner:` line — a bounded `git log -G '^owner:'` for the one issue
+a claim check refuses; `status`, `overview` and the board's poll read it
+from the same line-time cache as the status clock, never a git walk per
+issue. "age unknown" past the bound.
 
 **A PM whose lanes run outside cadence** (Claude Code subagents, Codex,
 a human) leaves no dispatch message ref — the claim is the only signal,
@@ -1233,7 +1235,7 @@ minutes):
 
 | Kind | `since` |
 |---|---|
-| `review_no_pr`, `intake` | when the issue entered its effective status: a file status is the tracker's last commit changing the `status:` line (one bounded `git log -G` per issue, cached per build, 3 s budget per build — past it, rows get no clock and one `degraded` note); a notes status is the deriving note's time; a rollup or job status has none |
+| `review_no_pr`, `intake` | when the issue entered its effective status: a file status is the tracker's last commit changing the `status:` line (read from the tracker's line-time cache in its git dir, keyed by HEAD: an unmoved HEAD reads the file, a fast-forward walks only the new commits, any other move walks the whole history again — 3 s budget per build; past it, rows get no clock and one `degraded` note); a notes status is the deriving note's time; a rollup or job status has none |
 | `blocked_ready` | the newest of its blockers' status clocks (when the last one reached done) |
 | `fenced` | the earliest `completed` of the agent's `unknown` messages; a fence without one (a disconnect while idle, a restart mismatch) uses the row's `updated` — every write that enters `attention` stamps it, so it is a lower bound on time fenced |
 | `stalled` / `silent_end` | `now − silent_secs` / `now − ended_secs` from the daemon's stall view |

@@ -620,31 +620,12 @@ fn subject_mentions(subject: &str, id: &str) -> bool {
     })
 }
 
-/// When the issue's `status:` line last changed (CAD-253): the author
-/// time of the newest tracker commit whose diff adds or removes a
-/// `status:` line in its `issue.md` — one bounded `git log`, no `show`
-/// walk like [`blame`]. A body line starting `status:` can only make
-/// the answer newer, never older. `None` without a git tracker, a
-/// matching commit, or within `timeout`.
-pub fn status_changed_at(
-    pm_dir: &Path,
-    project_key: &str,
-    id: &str,
-    timeout: Duration,
-) -> Option<i64> {
-    let rel = format!("{}/issue.md", issue_rel(project_key, id));
-    let out = git_bounded(
-        pm_dir,
-        &["log", "-1", "--format=%at", "-G", "^status:", "--", &rel],
-        timeout,
-    )
-    .ok()?;
-    out.trim().parse().ok()
-}
-
 /// CAD-383: when the issue's `owner:` line last changed — the claim age
-/// of an issue owned before claims were recorded. Same bounded
-/// `git log -G` as [`status_changed_at`].
+/// of an issue owned before claims were recorded: the author time of
+/// the newest tracker commit whose diff adds or removes an `owner:`
+/// line in its `issue.md`, one bounded `git log -G`. For one issue's
+/// claim check; `status`/`overview` read every issue's from the cached
+/// [`crate::issue::line_times::LineTimes`] instead (CAD-403).
 pub fn owner_changed_at(
     pm_dir: &Path,
     project_key: &str,

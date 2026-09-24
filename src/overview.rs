@@ -28,7 +28,8 @@ use serde_json::{json, Value};
 use crate::adapter::registry;
 use crate::client;
 use crate::inbox;
-use crate::issue::{self, board, claim, history, project, report};
+use crate::issue::line_times::LineTimes;
+use crate::issue::{self, board, claim, project, report};
 use crate::proc::run_bounded;
 
 /// Git identity baked in by build.rs — `unknown` when git or a repo
@@ -2194,118 +2195,54 @@ pub fn daemon_sources(state_dir: &Path, opts: &Options) -> DaemonSources {
     })
 }
 
-/// Git-derived status and claim times kept across builds (CAD-325), per
-/// `(kind, issue id)` with the key they were read under — the tracker's
-/// `HEAD` plus the `issue.md` rev. The answer is a `git log`, so it moves
-/// with history as well as the file: an edit, a commit, a reset or a pull
-/// each re-read it, and nothing else does. Only found times are kept — a
-/// `None` may be a spent budget or a timed-out `git`.
-pub type ClockCache = Mutex<HashMap<(&'static str, String), (String, i64)>>;
-
-/// The clock cache as one build uses it: the cache and the tracker `HEAD`
-/// this build read (`git rev-parse HEAD`, once per build).
-#[derive(Clone, Copy)]
-struct SharedClocks<'a> {
-    cache: &'a ClockCache,
-    head: &'a str,
-}
-
-impl SharedClocks<'_> {
-    /// The cache key for `v` now, `None` when `issue.md` is unreadable.
-    fn key(&self, v: &board::View) -> Option<String> {
-        let rev = issue::write::issue_rev(&v.issue.dir).ok()?;
-        Some(format!("{} {rev}", self.head))
-    }
-
-    fn get(&self, kind: &'static str, id: &str, key: &str) -> Option<i64> {
-        let map = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        map.get(&(kind, id.to_string()))
-            .filter(|(k, _)| k == key)
-            .map(|(_, at)| *at)
-    }
-
-    fn put(&self, kind: &'static str, id: &str, key: String, at: Option<i64>) {
-        if let Some(at) = at {
-            self.cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert((kind, id.to_string()), (key, at));
-        }
-    }
-}
-
 /// What a long-lived caller hands a build instead of re-reading it: the
-/// indexed tracker's views, a recent daemon pass and the clock cache.
+/// indexed tracker's views and a recent daemon pass. Status and claim
+/// times need no hand-off — [`LineTimes`] is cached per tracker HEAD
+/// (CAD-403).
 pub struct Reuse<'a> {
     pub views: &'a [board::View],
     pub sources: &'a DaemonSources,
-    pub clocks: &'a ClockCache,
 }
 
-/// Total wall time the tracker status clocks may spend per build; rows
-/// past it get no clock (owner-only escalation) and one `degraded` note.
+/// Wall time the tracker line times may take to load per build (a cold
+/// cache or a moved HEAD walks git); past it rows get no clock
+/// (owner-only escalation) and one `degraded` note.
 const STATUS_CLOCK_BUDGET: Duration = Duration::from_secs(3);
 
-/// When each issue entered its current effective status (CAD-253), read
-/// once per issue per build under one time budget. A `file` status is
-/// the tracker's last `status:` change ([`history::status_changed_at`]);
-/// a `notes` status is the deriving note's time; a `rollup` or `job`
-/// status has no single change to point at, so no clock.
+/// When each issue entered its current effective status (CAD-253). A
+/// `file` status is the tracker's last `status:` change, read from the
+/// cached [`LineTimes`] (CAD-403 — no git walk per issue); a `notes`
+/// status is the deriving note's time; a `rollup` or `job` status has
+/// no single change to point at, so no clock.
 struct StatusClock<'a> {
-    pm_dir: &'a Path,
-    deadline: Instant,
-    cache: HashMap<String, Option<i64>>,
-    /// The read model's cache across builds, when there is one.
-    shared: Option<SharedClocks<'a>>,
-    /// Issues left without a clock because the budget ran out.
-    skipped: usize,
+    /// `None` when the line times could not be loaded in time.
+    times: Option<&'a LineTimes>,
+    /// Issues asked for whose `file` status has no clock because the
+    /// line times are missing, each counted once.
+    skipped: std::collections::HashSet<String>,
 }
 
 impl<'a> StatusClock<'a> {
-    fn new(pm_dir: &'a Path, budget: Duration, shared: Option<SharedClocks<'a>>) -> Self {
+    fn new(times: Option<&'a LineTimes>) -> Self {
         Self {
-            pm_dir,
-            deadline: Instant::now() + budget,
-            cache: HashMap::new(),
-            shared,
-            skipped: 0,
+            times,
+            skipped: Default::default(),
         }
     }
 
     fn since(&mut self, v: &board::View) -> Option<i64> {
         let id = &v.issue.front.id;
-        if let Some(hit) = self.cache.get(id) {
-            return *hit;
-        }
-        let at = match v.status_source {
-            "file" => {
-                let shared = self.shared.and_then(|c| Some((c, c.key(v)?)));
-                if let Some(hit) = shared.as_ref().and_then(|(c, k)| c.get("status", id, k)) {
-                    self.cache.insert(id.clone(), Some(hit));
-                    return Some(hit);
-                }
-                let left = self.deadline.saturating_duration_since(Instant::now());
-                if left.is_zero() {
-                    self.skipped += 1;
+        match v.status_source {
+            "file" => match self.times {
+                Some(t) => t.status_at(&v.issue.project, id),
+                None => {
+                    self.skipped.insert(id.clone());
                     None
-                } else {
-                    let at = history::status_changed_at(
-                        self.pm_dir,
-                        &v.issue.project,
-                        id,
-                        left.min(GIT_TIMEOUT),
-                    );
-                    if let Some((c, k)) = shared {
-                        c.put("status", id, k, at);
-                    }
-                    at
                 }
-            }
+            },
             "notes" => v.chain.last().and_then(|n| parse_iso(&n.at)),
             _ => None,
-        };
-        self.cache.insert(id.clone(), at);
-        at
+        }
     }
 }
 
@@ -2619,30 +2556,6 @@ fn group_members(view: &DaemonView, root: &str) -> Result<Vec<String>, String> {
         .collect())
 }
 
-/// A claim's age through the read model's clock cache: a recorded claim
-/// carries its own time; an owner-only issue's `git log` answer is kept
-/// per `HEAD` and `issue.md` rev.
-fn claim_since(
-    clock: &claim::Clock,
-    shared: Option<SharedClocks<'_>>,
-    project: &str,
-    v: &board::View,
-) -> Option<i64> {
-    let front = &v.issue.front;
-    let keyed = shared
-        .filter(|_| front.claim.is_none())
-        .and_then(|c| Some((c, c.key(v)?)));
-    let Some((c, key)) = keyed else {
-        return clock.since(project, front);
-    };
-    if let Some(at) = c.get("claim", &front.id, &key) {
-        return Some(at);
-    }
-    let at = clock.since(project, front);
-    c.put("claim", &front.id, key, at);
-    at
-}
-
 /// Build the screen under `opts`. The daemon probes, the gh refresh and
 /// the tracker read run concurrently — each bounded — so the view costs
 /// its slowest source, not their sum. Fails only on a scope naming an
@@ -2762,17 +2675,6 @@ fn overview_from(
         Some(r) => pm.as_ref().map(|_| r.views),
         None => fresh_views.as_deref(),
     };
-    // The clock cache keys on the tracker's HEAD — one read per build; no
-    // HEAD (not a repo, git failing) means no cross-build cache.
-    let head = reused.and(pm.as_ref()).and_then(|pm| {
-        git_text(&pm.dir, &["rev-parse".into(), "HEAD".into()])
-            .ok()
-            .map(|h| h.trim().to_string())
-    });
-    let clocks = reused.zip(head.as_deref()).map(|(r, head)| SharedClocks {
-        cache: r.clocks,
-        head,
-    });
     let mut degraded_notes = daemon.degraded.clone();
     if !slugs.is_empty() {
         if let Some(e) = gh_state["error"].as_str() {
@@ -2828,7 +2730,8 @@ fn overview_from(
             .iter()
             .map(|v| (v.issue.front.id.as_str(), v))
             .collect();
-        let mut clock = StatusClock::new(&pm.dir, STATUS_CLOCK_BUDGET, clocks);
+        let line_times = LineTimes::load(&pm.dir, STATUS_CLOCK_BUDGET).ok();
+        let mut clock = StatusClock::new(line_times.as_ref());
         let mut intake: Vec<Item> = Vec::new();
         let escalations = crate::master::escalations(state_dir);
         for v in views {
@@ -3042,18 +2945,18 @@ fn overview_from(
         }
         needs.extend(intake);
         needs.extend(delivery_items(state_dir, now));
-        if clock.skipped > 0 {
+        if !clock.skipped.is_empty() {
             degraded_notes.push(degraded(
                 "tracker_status_time",
                 "",
                 format!(
                     "{} issue(s) past the status-time budget — those rows escalate by owner only",
-                    clock.skipped
+                    clock.skipped.len()
                 ),
             ));
         }
         // CAD-383: in-flight claims per project, with their age.
-        let claim_clock = claim::Clock::new(&pm.dir, STATUS_CLOCK_BUDGET);
+        let claim_clock = claim::Clock::new(line_times.as_ref());
         for p in &projects {
             if opts.scope.project.as_deref().is_some_and(|k| k != p.key) {
                 continue;
@@ -3069,7 +2972,7 @@ fn overview_from(
                 if matches!(v.status.as_str(), "doing" | "review")
                     && !claim::holders(front).is_empty()
                 {
-                    let since = claim_since(&claim_clock, clocks, &p.key, v);
+                    let since = claim_clock.since(&p.key, front);
                     let mut row = claim::row(&p.key, front, since, now);
                     row["status"] = json!(v.status);
                     claims.push(row);
