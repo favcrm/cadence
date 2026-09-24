@@ -759,10 +759,20 @@ mod tests {
             decide(true, Attribution::NoAgent),
             Verdict::Operator(UI_ACTOR.into())
         );
+        // Another uid's live socket (sshd, tailscaled) is excused; a
+        // socket that is gone (an early-closed replay) is not.
         assert_eq!(
-            decide(true, Attribution::Unknown("sshd".into())),
+            decide(true, Attribution::Foreign("sshd".into())),
             Verdict::Operator(UI_ACTOR.into())
         );
+        assert!(matches!(
+            decide(true, Attribution::Unknown("socket gone".into())),
+            Verdict::Refuse("caller_identity", _)
+        ));
+        assert!(matches!(
+            decide(false, Attribution::Foreign("sshd".into())),
+            Verdict::Refuse("caller_identity", _)
+        ));
         // Without one: never the operator, whatever the peer.
         assert_eq!(decide(false, agent()), Verdict::Agent("pane-a".into()));
         assert!(matches!(
