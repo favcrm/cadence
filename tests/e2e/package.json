@@ -5,6 +5,9 @@
   "type": "module",
   "packageManager": "pnpm@12.2.1",
   "description": "CAD-433: the headless board steps of the MVP journey (scripts/e2e/mvp.sh)",
+  "scripts": {
+    "test:header390": "node header390.mjs"
+  },
   "devDependencies": {
     "playwright-core": "1.63.0"
   }
