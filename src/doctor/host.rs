@@ -1884,38 +1884,62 @@ fn exempt_plain(s: &str) -> bool {
             .all(|(p, n)| p.len() == n && hex(p))
 }
 
-/// Credential shapes — provider prefixes (Figma `figd_`, GitHub
-/// `ghp_`/`gho_`/`github_pat_`, `sk-`, Slack `xox[abpr]-`), AWS
-/// `AKIA…`, JWTs, and 32+ char high-entropy tokens. `slash_ok` widens
+/// Token prefixes that name their issuer — evidence on their own, no
+/// entropy or keyword context needed: Figma `figd_`; GitHub `ghp_`,
+/// `gho_`, `ghu_`, `ghs_`, `ghr_`, `github_pat_`; GitLab `glpat-`;
+/// Anthropic and OpenAI `sk-…`; Slack `xox…` and `xapp-`; AWS key-id
+/// families `AKIA`, `ASIA`, `ABIA`, `ACCA`, `A3T`; Alibaba `LTAI`; npm
+/// `npm_`; Devin `dvn_`; Google `AIza`. One list for every credential
+/// gate — this
+/// scrubber's [`credential_shape`], `session`'s `looks_secret` and the
+/// `crate::secret` scan's entropy bypass — so the copies cannot drift
+/// apart (CAD-440).
+pub(crate) const SECRET_PREFIXES: &[&str] = &[
+    "figd_",
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "ghr_",
+    "github_pat_",
+    "glpat-",
+    "sk-",
+    "xoxa-",
+    "xoxb-",
+    "xoxe-",
+    "xoxe.",
+    "xoxo-",
+    "xoxp-",
+    "xoxr-",
+    "xoxs-",
+    "xapp-",
+    "A3T",
+    "ABIA",
+    "ACCA",
+    "AKIA",
+    "ASIA",
+    "LTAI",
+    "npm_",
+    "dvn_",
+    "AIza",
+];
+
+/// `token` opens with a known provider prefix — [`SECRET_PREFIXES`].
+pub(crate) fn has_secret_prefix(token: &str) -> bool {
+    SECRET_PREFIXES.iter().any(|p| token.starts_with(p))
+}
+
+/// Credential shapes — a known provider prefix ([`has_secret_prefix`]),
+/// JWTs, and 32+ char high-entropy tokens. `slash_ok` widens
 /// the entropy charset to base64 (`/`, `+`) for a value under a flag
 /// or env name — AWS secret access keys carry both and can be
 /// digit-free — while a standalone arg with `/` stays classed as a
 /// path and keeps the strict charset.
 fn credential_shape(s: &str, slash_ok: bool) -> bool {
-    const PREFIXES: &[&str] = &[
-        "figd_",
-        "ghp_",
-        "gho_",
-        "github_pat_",
-        "sk-",
-        "xoxa-",
-        "xoxb-",
-        "xoxp-",
-        "xoxr-",
-    ];
     if exempt_plain(s) {
         return false;
     }
-    if PREFIXES.iter().any(|p| s.starts_with(p)) {
-        return true;
-    }
-    // AWS access key id: `AKIA` + 16 uppercase/digits, exactly.
-    if s.len() == 20
-        && s.starts_with("AKIA")
-        && s[4..]
-            .chars()
-            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
-    {
+    if has_secret_prefix(s) {
         return true;
     }
     // JWT: `eyJ…`.`…`.`…` — three non-empty base64url segments.
@@ -6706,8 +6730,6 @@ mod tests {
             "sk-TESTTOKEN",
             "xoxb-TESTTOKEN",
             "xoxp-TESTTOKEN",
-            // AKIA + 16 uppercase/digits is the whole shape.
-            "AKIAXXXXXXXXXXXXXXXX",
             "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5t_Q",
             // 32+ char high-entropy token
             "9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c",
@@ -6718,6 +6740,10 @@ mod tests {
                 "{token}"
             );
         }
+        // AKIA + 16 uppercase/digits is the whole shape — built at
+        // runtime so the literal is not itself a scan finding.
+        let akia = ["AK", "IA", &"X".repeat(16)].concat();
+        assert_eq!(redact_argv(&["tool", &akia]), format!("tool {REDACTED}"));
         // …but ordinary long args survive: a path (`/` excluded), an
         // all-alpha run (no digit), a short token-looking arg.
         for arg in [

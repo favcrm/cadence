@@ -22,6 +22,13 @@
 //! - the CAD-108 argv rule: a secret-named flag or `NAME=value` whose value
 //!   [`redact_argv`] would redact and which looks random.
 //!
+//! A rule's `entropy` floor drops shape-only guesses — it never applies to
+//! a secret that carries its own evidence in the first characters: a known
+//! provider prefix ([`has_secret_prefix`]) or the rule's own keyword when
+//! that keyword is the token's literal prefix, as it is for every
+//! prefix-anchored rule (`ghp_`, `sk-ant-api03`, `xoxb`). A low-entropy
+//! token of a documented shape is still a leak (CAD-440).
+//!
 //! Speed: gitleaks' own keyword prefilter decides whether a rule runs, and a
 //! rule's regex compiles on first use, once per process.
 //!
@@ -46,7 +53,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::doctor::host::redact_argv;
+use crate::doctor::host::{has_secret_prefix, redact_argv};
 use crate::error::{Error, Result};
 
 #[cfg(test)]
@@ -328,6 +335,29 @@ fn any_match(patterns: &[Lazy], hay: &[u8]) -> Result<bool> {
         }
     }
     Ok(false)
+}
+
+/// `value` proves itself in its first characters: either a known
+/// provider prefix ([`has_secret_prefix`]) or one of this rule's
+/// keywords that is the token's literal prefix — for prefix-anchored
+/// rules the gitleaks keyword IS that prefix (`ghp_`, `gldt-`,
+/// `xoxe.xoxb-`), so this also covers the pack's prefixed families
+/// beyond the shared list. The keyword must carry a separator —
+/// `_`, `-`, `.`, `~` — which is how a token prefix is written; a bare
+/// context word (`api`, `adobe`, `password`, `t3blbkfj`) is not prefix
+/// evidence and keeps the entropy floor, as does a bare repeated
+/// string (CAD-440).
+fn prefix_confirmed(rule: &Rule, value: &[u8]) -> bool {
+    if let Ok(v) = std::str::from_utf8(value) {
+        if has_secret_prefix(v) {
+            return true;
+        }
+    }
+    rule.keywords.iter().any(|k| {
+        k.bytes().any(|b| matches!(b, b'_' | b'-' | b'.' | b'~'))
+            && value.len() >= k.len()
+            && value[..k.len()].eq_ignore_ascii_case(k.as_bytes())
+    })
 }
 
 type Confirm = fn(&Captures) -> bool;
@@ -779,7 +809,10 @@ fn raw_hits(text: &str, path: Option<&str>) -> Result<Vec<(usize, usize, Finding
             if value.is_empty() {
                 continue;
             }
-            if rule.entropy > 0.0 && entropy(value) <= rule.entropy {
+            if rule.entropy > 0.0
+                && !prefix_confirmed(rule, value)
+                && entropy(value) <= rule.entropy
+            {
                 continue;
             }
             if rule.confirm.is_some_and(|confirm| !confirm(&caps)) {

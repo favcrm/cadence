@@ -29365,22 +29365,44 @@ fn report_issue_attaches_comment() {
     assert!(text.contains("## Report context"), "{text}");
 }
 
-/// A credential-shaped string in the report body is stored redacted —
-/// body, title and context all pass through the shared scrubber.
+/// A credential-shaped string in the report body never lands: a known
+/// provider prefix is a blocking scan finding and the write is refused
+/// (CAD-440), while a shape only the scrubber knows — a bare
+/// high-entropy token — is stored redacted.
 #[test]
 fn report_redacts_credential_shapes() {
     let s = ReportFx::new();
     let secret = "ghp_".to_string() + &"a".repeat(36);
+    let (ok, stderr, _) = s.cli_at_env(
+        &s.product_repo,
+        &[
+            "report",
+            "--kind",
+            "bug",
+            "-m",
+            &format!("leaked {secret} in CI log"),
+        ],
+        &[],
+    );
+    assert!(!ok, "{stderr}");
+    assert!(
+        stderr.contains("secret_detected") || stderr.contains("refused"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(&secret), "{stderr}");
+
+    let s = ReportFx::new();
+    let token = format!("{}{}", "x9K", "mQ2").repeat(10);
     let (ok, out) = s.cli(&[
         "report",
         "--kind",
         "bug",
         "-m",
-        &format!("leaked {secret} in CI log"),
+        &format!("saw {token} in CI log"),
     ]);
     assert!(ok, "{out}");
     let body = s.issue_body("cadence", out["id"].as_str().unwrap());
-    assert!(!body.contains(&secret), "{body}");
+    assert!(!body.contains(&token), "{body}");
     assert!(body.contains("[REDACTED]"), "{body}");
 }
 
