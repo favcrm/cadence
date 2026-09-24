@@ -150,6 +150,10 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         Rule::Handler("authorize_agent_mutation (CAD-149)"),
     ),
     (
+        "agent_recover_submit",
+        Rule::Handler("authorize_agent_mutation: the operator or the target's PM (CAD-152)"),
+    ),
+    (
         "agent_inbox",
         Rule::Unguarded("a mailbox's consumer has no verifiable identity (CAD-251)"),
     ),

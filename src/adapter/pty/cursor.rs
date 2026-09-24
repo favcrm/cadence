@@ -1235,6 +1235,20 @@ mod tests {
         assert!(!p.idle && p.approval_menu);
     }
 
+    /// CAD-152: no Cursor input-box shape is proven, so recover-submit
+    /// cannot read a Cursor draft — the profile keeps the fail-closed
+    /// default and names the attach route.
+    #[test]
+    fn draft_rows_refuse_for_cursor() {
+        let err = screen_profile()
+            .draft_rows("→ Kickoff AOS-11: read the brief")
+            .unwrap_err();
+        assert!(
+            err.contains("Cursor drafts cannot be read reliably") && err.contains("agent attach"),
+            "{err}"
+        );
+    }
+
     /// A profile for `approval_answer` tests — the method only reads
     /// the screen, so the launch fields are dummies.
     fn screen_profile() -> CursorProfile {

@@ -206,6 +206,38 @@ impl Probe {
     }
 }
 
+/// What `agent recover-submit` found and did on the pane (CAD-152).
+/// Never carries the draft or the message body — only the check that
+/// decided and the probe verdicts around it.
+#[derive(Debug, Clone)]
+pub enum RecoverSubmit {
+    /// A precondition failed; nothing was sent. `check` names it
+    /// (`stale_generation`, `endpoint`, `pane_mode`, `approval_menu`,
+    /// `busy`, `empty_input`, `draft_unreadable`, `draft_mismatch`,
+    /// `ambiguous_wrap`, or a caller-side check raised by `confirm`).
+    Refused {
+        check: String,
+        reason: String,
+        probe: Option<Probe>,
+    },
+    /// One Enter was sent (or its send failed after the checks passed,
+    /// `send_error` — it may still have landed). `confirmed` is true
+    /// only on positive evidence within the bound — the TUI's prompt
+    /// line back and empty on a live pane; false leaves the outcome
+    /// visible as unconfirmed — it is never retried.
+    Sent {
+        before: Probe,
+        after: Probe,
+        confirmed: bool,
+        send_error: Option<String>,
+    },
+}
+
+/// `agent recover-submit`'s last check before the Enter
+/// ([`ProviderAdapter::recover_submit`]): given the probe the Enter is
+/// admitted under, `Err((check, reason))` refuses and nothing is sent.
+pub type RecoverConfirm<'a> = dyn Fn(&Probe) -> std::result::Result<(), (String, String)> + 'a;
+
 /// Notification sink: `(method, params)` for lifecycle events. Methods
 /// prefixed `cadence/` are recorded verbatim as event kinds — the
 /// adapter's own bookkeeping channel, not provider traffic.
@@ -354,6 +386,28 @@ pub trait ProviderAdapter: Send + Sync {
     fn answer_approval(&self, _choice: &str) -> Result<Probe> {
         Err(crate::error::Error::rejected(
             "this endpoint kind has no approval-menu channel",
+        ))
+    }
+    /// `agent recover-submit` (CAD-152, pty only): submit a draft that
+    /// was pasted but never submitted with exactly one Enter — never a
+    /// re-paste. Every precondition is checked in one critical section
+    /// with the keystroke: the live endpoint `generation`, a live owned
+    /// pane in no tmux mode, no approval menu, no busy marker, a
+    /// non-empty input line, and a visible draft equal to `body` once
+    /// wrapping is normalised. `confirm` runs last, just before the
+    /// Enter, with the probe the Enter is admitted under, so the caller
+    /// can re-check its own state and durably reserve the action inside
+    /// the same section; its `Err` is a refusal named `(check, reason)`
+    /// and nothing is sent. `Err` from this method is a transport
+    /// failure before any key.
+    fn recover_submit(
+        &self,
+        _generation: &str,
+        _body: &str,
+        _confirm: &RecoverConfirm,
+    ) -> Result<RecoverSubmit> {
+        Err(crate::error::Error::rejected(
+            "this endpoint kind has no staged-draft submit (pty only)",
         ))
     }
     /// One bounded liveness sample for the stall watch: the activity

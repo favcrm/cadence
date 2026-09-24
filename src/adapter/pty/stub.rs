@@ -13,7 +13,7 @@ use std::time::Duration;
 use crate::adapter::{Probe, ProviderEnv};
 use crate::error::{Error, Result};
 
-use super::profile::TuiProfile;
+use super::profile::{DraftView, TuiProfile};
 use super::{descends_from, lock_holders, shlex_quote};
 
 /// Bound on the stub TUI acquiring its session after launch.
@@ -37,6 +37,10 @@ mod stub_screen {
     /// Open approval/menu markers.
     pub const APPROVAL: &[&str] = &["stub approval", "stub menu open"];
 }
+
+/// The stub TUI's input row width: a staged draft wraps at this many
+/// characters (the fake-TUI harness stages its rows accordingly).
+pub const STUB_INPUT_WIDTH: usize = 40;
 
 /// Leading characters the stub treats as commands — deliberately
 /// disjoint from the Devin list so the prefix guard proves it reads
@@ -239,6 +243,33 @@ impl TuiProfile for StubProfile {
 
     fn analyze(&self, screen: &str, _cursor: Option<(u32, u32)>) -> Probe {
         analyze_stub(screen)
+    }
+
+    /// The stub's draft: the last `»` row plus the wrapped rows under
+    /// it, up to the first blank row. The stub's input rows are
+    /// [`STUB_INPUT_WIDTH`] wide.
+    fn draft_rows(&self, styled: &str) -> std::result::Result<DraftView, String> {
+        let screen = super::sgr::strip(styled);
+        let lines: Vec<&str> = screen.lines().collect();
+        let start = lines
+            .iter()
+            .rposition(|l| l.trim_start().starts_with(stub_screen::PROMPT))
+            .ok_or("no stub input line on screen")?;
+        let mut rows = vec![lines[start]
+            .trim_start()
+            .trim_start_matches(stub_screen::PROMPT)
+            .trim()
+            .to_string()];
+        rows.extend(
+            lines[start + 1..]
+                .iter()
+                .take_while(|l| !l.trim().is_empty())
+                .map(|l| l.trim().to_string()),
+        );
+        Ok(DraftView {
+            rows,
+            width: Some(STUB_INPUT_WIDTH),
+        })
     }
 
     fn respond_rejection(&self) -> &'static str {
