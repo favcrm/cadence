@@ -529,6 +529,9 @@ pub struct Shared {
     delivery_lock: Mutex<()>,
     /// The actor's empty-queue poll — the backstop behind its wake.
     idle_poll: Duration,
+    /// CAD-445: serialises `<state>/master-wakes.json` (blocker epochs,
+    /// tickets a plan-approved wake already named).
+    wake_lock: Mutex<()>,
 }
 
 impl Shared {
@@ -600,6 +603,7 @@ impl Shared {
             escalation_lock: Mutex::new(()),
             dispatch_lock: Mutex::new(()),
             delivery_lock: Mutex::new(()),
+            wake_lock: Mutex::new(()),
             auto_stop: AutoStopTimer::new(opts.auto_stop.clone(), opts.auto_stop_clock.clone()),
             idle_poll: opts.idle_poll.unwrap_or(IDLE_POLL),
         });
@@ -979,9 +983,6 @@ impl Shared {
                     "thread send refused: caller identity underivable — {e}"
                 )))
             }
-        }
-        if let Some(id) = optional_str(params, "message") {
-            proto::caller_message_id(id)?;
         }
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
         let mut send = params.clone();
@@ -4157,11 +4158,6 @@ impl Shared {
     /// `agent_send` over the socket: a threaded agent's chat records
     /// who queued it, derived from the connection (CAD-319).
     fn rpc_send_from(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
-        // CAD-445: `sys-` ids are the daemon's own messages — a caller
-        // squatting one would suppress it as a duplicate.
-        if let Some(id) = optional_str(params, "message") {
-            proto::caller_message_id(id)?;
-        }
         self.send_as(params, &|alias| self.thread_sender(alias, peer_pid))
     }
 

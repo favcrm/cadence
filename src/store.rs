@@ -2392,8 +2392,47 @@ impl Store {
         Ok(out)
     }
 
+    /// CAD-445: a message the daemon itself originates — a master wake,
+    /// and any later system message. The only way in for an id with
+    /// [`crate::proto::DAEMON_MESSAGE_PREFIX`] or a source of
+    /// [`crate::proto::DAEMON_SOURCES`]; every other enqueue refuses both.
+    /// Unattributed (a system entry in a thread), owing no report.
+    pub fn enqueue_daemon(
+        &self,
+        alias: &str,
+        body: &str,
+        id: &str,
+        source: &str,
+    ) -> Result<(bool, String)> {
+        if !id.starts_with(crate::proto::DAEMON_MESSAGE_PREFIX)
+            || !crate::proto::DAEMON_SOURCES.contains(&source)
+        {
+            return Err(Error::internal(format!(
+                "a daemon message needs a daemon id and source, not {id}/{source}"
+            )));
+        }
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let out = self.enqueue_tx_as(
+            &tx,
+            alias,
+            body,
+            None,
+            id,
+            source,
+            None,
+            &Sender::Unattributed,
+            true,
+        )?;
+        tx.commit()?;
+        Ok(out)
+    }
+
     /// Transactional enqueue — validation, idempotent dedupe, insert,
     /// `queued` event — usable inside a caller's `BEGIN IMMEDIATE`.
+    /// Every caller-reachable path (`agent_send`, `thread_send`,
+    /// `task_dispatch`, dispatch kickoffs) comes through here, and the
+    /// daemon's reserved ids and sources are refused (CAD-445).
     #[allow(clippy::too_many_arguments)]
     fn enqueue_tx(
         &self,
@@ -2406,6 +2445,27 @@ impl Store {
         task_id: Option<&str>,
         sender: &Sender,
     ) -> Result<(bool, String)> {
+        self.enqueue_tx_as(
+            tx, alias, body, reply_to, id, source, task_id, sender, false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_tx_as(
+        &self,
+        tx: &Connection,
+        alias: &str,
+        body: &str,
+        reply_to: Option<&str>,
+        id: &str,
+        source: &str,
+        task_id: Option<&str>,
+        sender: &Sender,
+        daemon: bool,
+    ) -> Result<(bool, String)> {
+        if !daemon {
+            crate::proto::caller_message(id, source)?;
+        }
         if body.is_empty() || body.len() > 48_000 {
             return Err(Error::rejected("Prompt must contain 1-48000 characters"));
         }

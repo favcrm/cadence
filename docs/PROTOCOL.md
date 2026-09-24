@@ -45,7 +45,7 @@ Error kinds:
 | `agent_show` | `alias` | `{agent, messages, event_cursor, queued, unknown, inbox?}` — `unknown` counts unreconciled unknowns fencing the agent; `agent.awaiting_report` (also on `agent_list` rows) is `{message, turn_id, task_id, since_secs, acked, report_timeout_secs, remaining_secs, count, queued_behind}` while a delivered pty turn awaits its report (null otherwise; `remaining_secs` null when the bound is disabled; `turn_id`, here and on message rows, is `null` unless the connection is that agent's own pane or endpoint — CAD-375), and that message's row carries `awaiting_report: true`; passive `inbox` evidence includes queued count, oldest age, last receipt/progress, and `semantic_completion:"external_consumer_required"`; it is never a drain or completion claim. `agent.capabilities` is the registry descriptor; `agent.model_reported` is the model the provider reports running (claude: the stream's `system/init` model) beside `model_configured`, `model_effective`, `model_source` (`configured` or `provider default`), `effort_configured`, `effort_reported`, `effort_effective` and legacy `effort` — also on every `agent_list` row. `team_role`, `model_lookup_role`, and `model_selection` (`source`, `lookup_role`, `revision`, `model`) record how a launch model was chosen. Unsupported endpoints leave `model_selection` null. Existing rows without stored provenance are labeled `legacy_configured` or `legacy_provider_default` at read time |
 | `model_defaults_get` | — | `{revision, config, providers, roles}` — daemon-wide provider baselines and team-role overrides. Suggestions are previously observed model ids, not a catalog. Does not start provider processes |
 | `model_defaults_set` | `document` (raw JSON string `{expected_revision, config}`) | the same snapshot as get, after an atomic revision bump. Mismatched `expected_revision` is `kind:"conflict"`, `code:"revision_conflict"`, with `revision` set to the current value and no write. **Operator only** (CAD-337), the connection-bound gate `slot_reconcile` and `approval_record` use: a pane or managed endpoint, or any caller not provably the operator (`peer::operator_proof`), is refused naming the rule; identity-shaped fields (`attribution`, `by`, `actor`, …) are refused, not read. The `model_defaults_updated` event records the verified caller: attribution `operator`, transport `operator-connection` |
-| `agent_send` | `alias, text, message?, reply_to?, source?, task?, nudge?` | `{message,state,duplicate,warning?}` — a `message` id starting `sys-` is refused (the daemon's own, CAD-445); `task` attaches the delivery to a task for indexing; `nudge: true` (CLI `send --nudge` / `message send --nudge`, pty only, no `reply_to`, not with `--ready`) records a turnless `source: "nudge"` delivery — see the CAD-250 section; `warning` names a stale inbox target (queued anyway — see inbox endpoints) |
+| `agent_send` | `alias, text, message?, reply_to?, source?, task?, nudge?` | `{message,state,duplicate,warning?}` — a `message` id starting `sys-` or a `source` of `wake` is refused (the daemon's own, CAD-445 — refused by the store on every enqueue path); `task` attaches the delivery to a task for indexing; `nudge: true` (CLI `send --nudge` / `message send --nudge`, pty only, no `reply_to`, not with `--ready`) records a turnless `source: "nudge"` delivery — see the CAD-250 section; `warning` names a stale inbox target (queued anyway — see inbox endpoints) |
 | `agent_ask` | `alias, text, message?, reply_to?, wait?` | the `Message` row; state may be non-terminal if `wait` expired |
 | `agent_events` | `alias, after?, wait(<=30), tail?` | `{events:[Event], cursor, has_older}` — `tail:true` returns the newest page (50) in ascending order instead of paging forward from `after` |
 | `thread_read` | `alias, after?, limit?(1-500, default 100), wait?(<=30)` — or backwards: `tail?:true` / `before?(seq>=1)`, `limit?` (CAD-328) | `{alias, thread:{id,alias,created,updated}\|null, entries:[{seq,thread,role,kind,text,payload,message,created}], cursor}` — the agent's durable chat (CAD-319), oldest first after `after`. `tail` reads the newest `limit` entries and `before` the `limit` entries below a seq, still oldest first, plus `more_before` (older entries remain); a backward read never waits and refuses `after`/`wait`. Removing the agent archives its thread (rows kept by thread id, a `system` entry marks the removal) and a new agent under the reused alias starts a fresh one (CAD-304 S4); archived threads are not readable by alias in the MVP. Reads are unscoped in the MVP — any local caller can read any alias's thread, the same as `agent_show`/`agent_events`. Roles `operator\|agent\|system`; kinds `message\|assistant_text\|tool_call\|tool_result\|turn_result`. Text and payload strings are secret-redacted before they are stored; tool calls and tool results are a one-line redacted summary (≤160 chars; a result adds `payload.is_error`), never the raw input or output. `assistant_text` is intermediate prose only (managed Claude text blocks, Codex commentary items, `payload.phase: "commentary"`); the final answer is stored once, as the `turn_result` (CAD-320). Codex `final_answer` and unphased items are held until the message finishes and kept as `assistant_text` only when the result does not carry them — an `unknown` or failed turn loses none of its text. A live turn token quoted in prose is not scrubbed on write — the secret scan does not know it — and is redacted at `export`; a read by anyone but the owning agent's connection masks it (CAD-375) |
@@ -2087,25 +2087,36 @@ master when
 
 - the operator approves a plan (`plan_approve`),
 - a ticket's loop ends — `merged` or `closed` (seen by
-  `delivery_observe`) or `declined` (`delivery_decline`),
+  `delivery_observe`) or `declined` (`delivery_decline`); a merged ticket
+  that ready tickets still wait on is named with what unblocks them
+  (the operator marks it done),
 - a `ready` ticket of an approved plan has every `blocked_by` done or
   dropped. Tracker status is written by the CLI, not the daemon, so the
   report router's pass finds it (within one router period, 30 s by
-  default).
+  default). A ticket the plan's approval wake already named ready is not
+  woken again for the same blockers.
 
 Each wake lists the project's tickets ready to dispatch now and those
-still waiting on a blocker; the master dispatches with
+still waiting on a blocker. It is a hint: the master dispatches with
 `master_dispatch`, which re-checks everything. A wake grants nothing:
-the master's allowlist and every caller rule are unchanged.
+the master's allowlist and every caller rule are unchanged. Tracker
+strings in a wake (owners, blocker ids, statuses) are shown only when
+they are identifiers.
 
 Once: a wake's id is `sys-wake-<hash>` of `(event, ticket, revision)` —
-the plan's `decided_at`, the loop record's `dispatched_at`, the ticket's
-sorted blocker set — so a replay, another router pass or a daemon
-restart finds it queued. Message ids starting `sys-` are the daemon's:
-`agent_send`, `agent_ask` and `thread_send` refuse a caller-supplied
-one, so no caller can squat a wake's id to suppress it. A master that
-is registered but not running keeps the wake queued in its mailbox until
-it runs again; with no master registered nothing is queued.
+the plan's `decided_at`, the loop record's `dispatched_at`, or the
+ticket's blockers each with its epoch (how often the daemon saw it go
+from open to done or dropped, kept in `<state>/master-wakes.json`, so a
+blocker reopened and done again wakes the master again). A replay,
+another router pass or a daemon restart finds it queued. The store
+refuses a message id starting `sys-` and a daemon source (`wake`) on
+every enqueue but the daemon's own (`agent_send`, `agent_ask`,
+`thread_send`, `task_dispatch` and every other path), and the daemon
+counts an existing row as its wake only when it is the master's with
+source `wake` — any other holder is refused with a
+`daemon_message_squatted` event. A master that is registered but not
+running keeps the wake queued in its mailbox until it runs again; with
+no master registered nothing is queued.
 
 ## Recovery
 
