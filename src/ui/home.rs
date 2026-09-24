@@ -7,7 +7,9 @@
 //!   operator-only `plan_approve` / `plan_reject` (CAD-360).
 //! - `POST /api/issues/<ID>/answers` `{"question", "text"}` — file an
 //!   `answer` report (CAD-341) on the question report `question`,
-//!   authored `operator`.
+//!   authored `operator`, then hand it to the daemon's `answer_route`
+//!   (CAD-447) so the question's author is told; the reply's `route`
+//!   says whether it was.
 //! - `POST /api/delivery/<ID>/merge` `{}` and
 //!   `POST /api/delivery/<ID>/decline` `{"reason"}` — the worker loop's
 //!   merge decision (CAD-431). Merge runs [`crate::delivery::merge`] in
@@ -401,8 +403,13 @@ pub(super) fn answer(
         .and_then(|p| task_report::store(&pm, &p, &actor));
     match filed {
         Ok(out) => {
-            // Best effort: wake the daemon's report router (CAD-339) so
-            // the asker hears back now rather than at its next scan. A
+            // CAD-447: the accepted answer goes to the question's author.
+            // The answer stands whatever the daemon says; its reply rides
+            // along as `route`.
+            let mut out = out;
+            let report = out["report"].as_str().unwrap_or_default().to_string();
+            out["route"] = client::route_answer(state_dir, &id, &report);
+            // Best effort: wake the daemon's report router (CAD-339). A
             // daemon without the method, or one that is down, just waits.
             let _ = client::rpc(state_dir, "reports_changed", json!({}));
             write_reply(&pm, state_dir, &id, out, true)
