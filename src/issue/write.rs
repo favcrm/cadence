@@ -264,29 +264,11 @@ pub fn project_add(
     tags: &[String],
     owner: Option<&str>,
 ) -> Result<Value> {
-    model::check_key(key)?;
-    // CAD-339: `<pm>/agents/` holds agent folders (SOUL.md, AGENT.md).
-    if key == "agents" {
-        return Err(Error::rejected(
-            "Project key 'agents' is reserved — <pm>/agents/ holds the agent files",
-        ));
-    }
+    // `agents` is reserved for the agent files (CAD-358).
+    crate::issue::project_new::check_key(key)?;
     let tags = model::normalize_tags(tags)?;
     let prefix = prefix.to_ascii_uppercase();
-    if prefix.is_empty()
-        || prefix.len() > 8
-        || !prefix
-            .chars()
-            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
-        || !prefix
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_uppercase())
-    {
-        return Err(Error::rejected(format!(
-            "Invalid prefix '{prefix}' — uppercase letters/digits starting with a letter"
-        )));
-    }
+    crate::issue::project_new::check_prefix(&prefix)?;
     if project::list(&pm.dir)?.iter().any(|p| p.key == key) {
         return Err(Error::rejected(format!(
             "Project '{key}' already exists — edit {} directly",

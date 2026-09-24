@@ -2240,6 +2240,7 @@ impl Shared {
             "plan_reject" => self.rpc_plan_decide(params, peer_pid, false),
             "epic_stage" => self.rpc_epic_stage(params, peer_pid),
             "project_work_approve" => self.rpc_project_work_approve(params, peer_pid),
+            "project_new" => self.rpc_project_new(params, peer_pid),
             "project_work_approvals" => Ok(json!({
                 "approvals": self.store.work_approvals()?,
             })),
@@ -3423,24 +3424,7 @@ impl Shared {
     /// that leaves every agent's ancestry without orphaning its session
     /// and scrubs its env and stdio still passes.
     fn operator_connection(&self, verb: &str, params: &Value, peer_pid: u32) -> Result<()> {
-        for field in [
-            "by",
-            "operator",
-            "actor",
-            "alias",
-            "lane",
-            "pid",
-            "pane",
-            "recorded_via",
-            "attribution",
-        ] {
-            if params.get(field).is_some() {
-                return Err(Error::rejected(format!(
-                    "{verb} authority is connection-bound; request field \
-                     '{field}' is not accepted"
-                )));
-            }
-        }
+        reject_operator_fields(verb, params)?;
         if let Some(who) = self.slot_identity(peer_pid)? {
             return Err(Error::rejected(format!(
                 "{verb} is an operator action — this connection is agent \
@@ -3727,6 +3711,62 @@ impl Shared {
         self.store.record_work_approval(payload.clone())?;
         self.wake();
         Ok(payload)
+    }
+
+    /// CAD-358 `project_new` — register a repo as a project and seed its
+    /// PROJECT.md in one tracker commit ([`crate::issue::project_new`]).
+    /// Callers: the proven operator, and the master (CAD-339) by its
+    /// verified connection ([`Self::caller_is_master`]) — never by a
+    /// request field. Identity-shaped fields are refused FIRST, for every
+    /// caller, so the master path never skips that refusal. Every other
+    /// agent — a pane, a managed endpoint or its tool subprocess — and a
+    /// detached child of any agent, the master included, is refused
+    /// (`operator_connection`). On both paths the tracker and this
+    /// daemon's state dir are refused as the repo.
+    fn rpc_project_new(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        reject_identity_fields(params, "project new")?;
+        reject_operator_fields("project new", params)?;
+        let actor = if self.caller_is_master(peer_pid) {
+            crate::master::ALIAS
+        } else {
+            self.operator_connection("project new", params, peer_pid)?;
+            "operator"
+        };
+        let text = |name: &str| optional_str(params, name).map(str::to_string);
+        let agents = match params.get("agents") {
+            None | Some(Value::Null) => vec![],
+            Some(Value::Array(list)) => list
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| Error::rejected("'agents' must be a list of strings"))
+                })
+                .collect::<Result<_>>()?,
+            Some(_) => return Err(Error::rejected("'agents' must be a list of strings")),
+        };
+        let req = crate::issue::project_new::Request {
+            key: required_str(params, "key")?.to_string(),
+            repo: std::path::PathBuf::from(required_str(params, "repo")?),
+            prefix: text("prefix"),
+            goal: text("goal"),
+            agents,
+            issue: text("issue"),
+        };
+        let pm = crate::issue::Pm::at(&self.pm_dir()?)?;
+        let out = crate::issue::project_new::run(
+            &pm,
+            &req,
+            actor,
+            &[("the daemon state dir", self.state_dir.as_path())],
+        )?;
+        if out["changed"] == true {
+            let _ = self
+                .store
+                .event_public(DAEMON_ALIAS, "project_registered", out.clone());
+            self.wake();
+        }
+        Ok(out)
     }
 
     fn rpc_register(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
@@ -8298,6 +8338,32 @@ fn withhold_all_turn_ids(mut value: Value) -> Value {
 const IDENTITY_FIELDS: &[&str] = &[
     "by", "as", "actor", "caller", "operator", "reviewer", "pane", "lane", "pid",
 ];
+
+/// Request fields an operator-connection verb refuses rather than reads
+/// ([`Shared::operator_connection`]).
+const OPERATOR_FIELDS: &[&str] = &[
+    "by",
+    "operator",
+    "actor",
+    "alias",
+    "lane",
+    "pid",
+    "pane",
+    "recorded_via",
+    "attribution",
+];
+
+fn reject_operator_fields(verb: &str, params: &Value) -> Result<()> {
+    for field in OPERATOR_FIELDS {
+        if params.get(field).is_some() {
+            return Err(Error::rejected(format!(
+                "{verb} authority is connection-bound; request field \
+                 '{field}' is not accepted"
+            )));
+        }
+    }
+    Ok(())
+}
 
 fn reject_identity_fields(params: &Value, verb: &str) -> Result<()> {
     for field in IDENTITY_FIELDS {

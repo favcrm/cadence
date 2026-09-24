@@ -30,7 +30,8 @@ use crate::peer::AgentCaller;
 use crate::store;
 
 /// The daemon methods a master connection may call — everything else is
-/// refused (review round 1, C2). Reads, proposing a plan, its own
+/// refused (review round 1, C2). Reads, proposing a plan, registering a
+/// project (`project_new`, CAD-358), its own
 /// dispatch/escalate/summary verbs, and a report on its own message.
 pub const MASTER_ALLOWED: &[&str] = &[
     "health",
@@ -45,6 +46,9 @@ pub const MASTER_ALLOWED: &[&str] = &[
     "task_show",
     "model_defaults_get",
     "plan_propose",
+    // CAD-358: register a repo and seed PROJECT.md (tracker and state
+    // dir refused; identity fields refused).
+    "project_new",
     "master_dispatch",
     "question_escalate",
     "master_summary",
