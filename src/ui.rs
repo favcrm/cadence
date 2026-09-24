@@ -117,7 +117,7 @@ pub enum UiAction {
     /// state dir.
     Login {
         /// A link for the tailnet URL (`ui tailscale start`) instead of
-        /// this host's `http://cadence.localhost:<port>`.
+        /// this board's own `http://cadence-<port>.localhost:<port>`.
         #[arg(long)]
         tailnet: bool,
         /// Replace the operator secret and revoke every session and
@@ -464,7 +464,7 @@ fn host_allowed(host: &str, port: u16, extra: &[String]) -> bool {
     let host = host.trim().to_ascii_lowercase();
     host == "cadence.localhost"
         || host == "cadence.localhost:18000"
-        || host == format!("cadence.localhost:{port}")
+        || host == operator::board_host(port)
         || host == format!("127.0.0.1:{port}")
         || host == format!("localhost:{port}")
         || host == format!("[::1]:{port}")
@@ -1147,7 +1147,7 @@ fn origin_allowed(origin: &str, port: u16, hosts: &[String], origins: &[String])
     let mut allowed = vec![
         "http://cadence.localhost".to_string(),
         "http://cadence.localhost:18000".to_string(),
-        format!("http://cadence.localhost:{port}"),
+        format!("http://{}", operator::board_host(port)),
         format!("http://127.0.0.1:{port}"),
         format!("http://localhost:{port}"),
         format!("http://[::1]:{port}"),
@@ -1609,31 +1609,11 @@ fn read_settings_body(request: &mut Request) -> std::result::Result<Vec<u8>, Htt
     Ok(buf)
 }
 
-fn model_defaults_post(request: &mut Request, state_dir: &Path, opts: &ServeOpts) -> HttpResp {
-    if opts.read_only {
-        return guard_fail("read_only", "board is read-only — writes are disabled");
-    }
-    if let Err(resp) = write_guard(request, "application/json", opts) {
-        return resp;
-    }
+/// `POST /api/settings/model-defaults` — operator-only, admitted by
+/// `operator::admit` (session plus process proof) before this runs.
+fn model_defaults_post(request: &mut Request, state_dir: &Path) -> HttpResp {
     if let Err(resp) = require_model_defaults(state_dir) {
         return resp;
-    }
-    // The relay below is the board's own connection, which the daemon's
-    // operator gate sees instead of this caller (CAD-337): an agent is
-    // refused here or it would land as the operator.
-    match operator::board_caller(request, state_dir, opts) {
-        Ok(operator::Caller::Operator(_)) => {}
-        Ok(operator::Caller::Agent(alias)) => {
-            return guard_fail(
-                "operator_only",
-                &format!(
-                    "model defaults are an operator setting — this caller is \
-                     agent '{alias}'; change them from the operator's browser"
-                ),
-            )
-        }
-        Err(resp) => return resp,
     }
     let bytes = match read_settings_body(request) {
         Ok(bytes) => bytes,
@@ -1703,12 +1683,22 @@ fn write_route(
         );
         return;
     }
+    // CAD-313: every other write is admitted HERE by its class in
+    // `operator::WRITE_ROUTES` (unlisted: operator-only) before any
+    // handler runs; the handlers below check no caller themselves.
+    let caller = match operator::admit(&request, method.as_str(), path, state_dir, opts) {
+        Ok(caller) => caller,
+        Err(resp) => {
+            send(request, resp);
+            return;
+        }
+    };
     if path == "/api/settings/model-defaults" {
         if *method != Method::Post {
             send(request, err_response(405, "method not allowed"));
             return;
         }
-        let resp = model_defaults_post(&mut request, state_dir, opts);
+        let resp = model_defaults_post(&mut request, state_dir);
         send(request, resp);
         return;
     }
@@ -1732,23 +1722,9 @@ fn write_route(
             send(request, err_response(404, "no such monitor write route"));
             return;
         }
-        if opts.read_only {
-            send(
-                request,
-                guard_fail("read_only", "board is read-only — writes are disabled"),
-            );
+        let Some(caller) = caller else {
+            send(request, err_response(500, "unadmitted write"));
             return;
-        }
-        if let Err(resp) = write_guard(&request, "application/json", opts) {
-            send(request, resp);
-            return;
-        }
-        let caller = match operator::board_caller(&request, state_dir, opts) {
-            Ok(caller) => caller,
-            Err(resp) => {
-                send(request, resp);
-                return;
-            }
         };
         // `MonitorAlert` uses the protocol identifier grammar for its audit
         // actor.  The browser actor includes a display suffix, so record
@@ -1816,7 +1792,7 @@ fn write_route(
             send(request, err_response(405, "method not allowed"));
             return;
         }
-        let resp = home::decide_plan(&mut request, state_dir, opts, epic, verb);
+        let resp = home::decide_plan(&mut request, state_dir, epic, verb);
         send(request, resp);
         return;
     }
@@ -1838,7 +1814,7 @@ fn write_route(
             send(request, err_response(405, "method not allowed"));
             return;
         }
-        let resp = stages::move_stage(&mut request, state_dir, opts, epic);
+        let resp = stages::move_stage(&mut request, state_dir, epic);
         send(request, resp);
         return;
     }
@@ -1847,7 +1823,11 @@ fn write_route(
             send(request, err_response(405, "method not allowed"));
             return;
         }
-        let resp = home::answer(&mut request, state_dir, pm_dir, opts, id);
+        let Some(caller) = &caller else {
+            send(request, err_response(500, "unadmitted write"));
+            return;
+        };
+        let resp = home::answer(&mut request, state_dir, pm_dir, caller.actor(), id);
         send(request, resp);
         return;
     }
@@ -1858,7 +1838,7 @@ fn write_route(
             send(request, err_response(404, "no such thread write route"));
             return;
         }
-        let resp = threads::post_message(&mut request, state_dir, opts, alias);
+        let resp = threads::post_message(&mut request, state_dir, alias);
         send(request, resp);
         return;
     }
@@ -1895,28 +1875,9 @@ fn write_route(
         send(request, err_response(code, "no such write route"));
         return;
     }
-    if opts.read_only {
-        send(
-            request,
-            guard_fail("read_only", "board is read-only — writes are disabled"),
-        );
+    let Some(caller) = caller else {
+        send(request, err_response(500, "unadmitted write"));
         return;
-    }
-    let want_ct = if sub == Some("artifacts") {
-        "application/octet-stream"
-    } else {
-        "application/json"
-    };
-    if let Err(resp) = write_guard(&request, want_ct, opts) {
-        send(request, resp);
-        return;
-    }
-    let caller = match operator::board_caller(&request, state_dir, opts) {
-        Ok(caller) => caller,
-        Err(resp) => {
-            send(request, resp);
-            return;
-        }
     };
     let actor = caller.actor().to_string();
     let pm = match Pm::at(pm_dir) {

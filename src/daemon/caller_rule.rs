@@ -343,7 +343,10 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ),
     // CAD-313: the board's session verbs — the nonce or the session
     // token the request carries is the credential.
-    ("operator_session_open", Rule::Bearer),
+    (
+        "operator_session_open",
+        Rule::Handler("nonce bearer; a connection that derives an agent spends it and is refused (CAD-313)"),
+    ),
     ("operator_session_check", Rule::Bearer),
     ("operator_session_logout", Rule::Bearer),
     ("operator_session_stolen", Rule::Bearer),

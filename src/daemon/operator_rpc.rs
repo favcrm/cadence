@@ -10,7 +10,11 @@
 //!   and origin, never the nonce.
 //! - `operator_session_open {nonce, origin, user_agent?}` — the board's
 //!   `POST /api/session`. The nonce is the credential. A refusal records
-//!   `operator_link_rejected` with its reason.
+//!   `operator_link_rejected` with its reason. The verb is open to any
+//!   socket caller, so it runs the board's agent check itself: a
+//!   connection that derives an agent (a pane or enrolled managed
+//!   endpoint on its ancestry — an agent that skipped the board, or a
+//!   board an agent started) spends the nonce and gets no session.
 //! - `operator_session_check {token, origin}` — the board, on every
 //!   operator decision and `/api/meta`.
 //! - `operator_session_logout {token}` — the board's
@@ -101,15 +105,33 @@ impl Shared {
         }))
     }
 
-    pub(super) fn rpc_operator_session_open(&self, params: &Value) -> Result<Value> {
+    pub(super) fn rpc_operator_session_open(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         let nonce = required_str(params, "nonce")?;
         let origin = origin_param(params)?;
         let user_agent = optional_str(params, "user_agent").unwrap_or_default();
+        let agent = self
+            .slot_identity(peer_pid)?
+            .map(|who| who.lane().to_string());
         let now = self.operator_now();
         let opened = self.operator_auth().open(nonce, origin, user_agent, now);
         match opened {
             Ok(created) => {
                 let opened = created?;
+                if let Some(agent) = agent {
+                    self.operator_auth().revoke_token(&opened.token)?;
+                    let _ = self.store.event_public(
+                        DAEMON_ALIAS,
+                        "operator_session_from_agent",
+                        json!({"agent": agent, "revoked": true, "alert": true}),
+                    );
+                    return Err(Error::invalid(
+                        "session_from_agent",
+                        format!(
+                            "session open refused: this connection is agent '{agent}' — \
+                             the link is spent"
+                        ),
+                    ));
+                }
                 let _ = self.store.event_public(
                     DAEMON_ALIAS,
                     "operator_session_opened",

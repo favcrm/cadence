@@ -238,9 +238,10 @@ fn sign_in(state: &Path, port: u16) -> op::Session {
     op::sign_in(bin(), state, port)
 }
 
-/// [`http_write`] as the signed-in operator `op`: its session cookie,
-/// plus this request's own `Origin` unless `headers` already set one
-/// (a cookie-bearing write must say where it comes from).
+/// [`http_write`] as the signed-in operator `op`: to `port`'s own board
+/// Host with the session cookie, plus that Host's `Origin` unless
+/// `headers` set one (a cookie-bearing write must say where it comes
+/// from). `host` is replaced: sessions live on the board's name only.
 fn op_http_write(
     op: &op::Session,
     port: u16,
@@ -250,8 +251,13 @@ fn op_http_write(
     headers: &[&str],
     body: &[u8],
 ) -> (u16, String, String) {
+    // A session lives on the board's own Host only (CAD-313): the
+    // signed-in write goes to `port`'s own name, whatever `host` the
+    // caller used; an `Origin` the caller set on purpose is kept.
+    let _ = host;
+    let own = op::board_host(port);
     let cookie = format!("Cookie: {}", op.cookie);
-    let origin = format!("Origin: http://{host}");
+    let origin = format!("Origin: http://{own}");
     let mut all: Vec<&str> = headers.to_vec();
     if !headers
         .iter()
@@ -260,7 +266,7 @@ fn op_http_write(
         all.push(&origin);
     }
     all.push(&cookie);
-    http_write(port, method, path, host, &all, body)
+    http_write(port, method, path, &own, &all, body)
 }
 
 /// [`write_json`] as the signed-in operator `op`.
@@ -767,8 +773,10 @@ fn ui_routes_and_rejections() {
     let (code, body) = http(port, "POST", "/api/issues", &ok_host);
     assert_eq!(code, 403);
     assert!(body.contains("content_type"));
-    let (code, _) = http(port, "DELETE", "/api/issues/CAD-1", &ok_host);
-    assert_eq!(code, 405);
+    // CAD-313: an unlisted write (DELETE on an issue) is operator-only
+    // and fails closed before any route — 403, not 405.
+    let (code, body) = http(port, "DELETE", "/api/issues/CAD-1", &ok_host);
+    assert_eq!(code, 403, "{body}");
     // OPTIONS is never a preflight — 405, and no Access-Control-* header
     // is ever sent on any response.
     let (code, headers, _) = http_full(port, "OPTIONS", "/api/issues", &ok_host);
@@ -3943,9 +3951,10 @@ fn issue_history_api_matches_cli_and_guards() {
     );
     let (code, _) = http(fx.port, "GET", "/api/issues/CAD-1/history?limit=x", &host);
     assert_eq!(code, 400);
-    // The route is read-only — POST has no write route to reach.
+    // The route is read-only — POST has no write route to reach; as an
+    // unlisted write it is operator-only and fails closed (CAD-313).
     let (code, _) = http(fx.port, "POST", "/api/issues/CAD-1/history", &host);
-    assert_eq!(code, 404);
+    assert_eq!(code, 403);
 }
 
 #[test]
@@ -7727,13 +7736,19 @@ fn forged_tailscale_headers_not_attributed() {
     assert!(body.contains("operator_session_required"), "{body}");
     let _d = UiDaemon::start_on(state.path().to_path_buf());
     let op = sign_in(state.path(), port);
+    // On the board's own Host (where the session lives) with its Origin.
+    let signed: Vec<&str> = href
+        .iter()
+        .copied()
+        .filter(|h| !h.starts_with("Origin:"))
+        .collect();
     let (code, _, _) = op_http_write(
         &op,
         port,
         "PATCH",
         "/api/issues/CAD-2",
         &host,
-        &href,
+        &signed,
         br#"{"status":"done"}"#,
     );
     assert_eq!(code, 200);
@@ -10767,12 +10782,24 @@ fn model_defaults_http_round_trip_guards_and_conflict() {
         .iter()
         .all(|row| row["id"] != "inbox" && row["id"] != "fake"));
 
+    // CAD-313: an unlisted write fails closed as operator-only — 403;
+    // with the operator's session it reaches the route's 405.
     let (code, _, _) = http_write(
         port,
         "DELETE",
         "/api/settings/model-defaults",
         &host,
         &[],
+        b"{}",
+    );
+    assert_eq!(code, 403);
+    let (code, _, _) = op_http_write(
+        &op,
+        port,
+        "DELETE",
+        "/api/settings/model-defaults",
+        &host,
+        WRITE_HEADERS,
         b"{}",
     );
     assert_eq!(code, 405);
@@ -11051,15 +11078,16 @@ fn a_login_link_opens_exactly_one_session_and_leaves_no_trace() {
     seed(pm.path(), state.path());
     let d = UiDaemon::start_on(state.path().to_path_buf());
     let (port, _ui) = start_operator_ui(pm.path(), &d.state());
-    let host = format!("127.0.0.1:{port}");
+    // Sessions live on the board's own name (CAD-313).
+    let host = op::board_host(port);
 
     let meta = meta_with(port, &host, &[]);
-    assert_eq!(meta["operator"], false, "{meta}");
+    assert_eq!(meta["signed_in"], false, "{meta}");
     assert_eq!(meta["login_hint"], "cadence ui login", "{meta}");
 
     let link = op::login_link(bin(), &d.state(), port, &[]).unwrap();
     assert!(
-        link.starts_with(&format!("http://cadence.localhost:{port}/login#n=")),
+        link.starts_with(&format!("http://cadence-{port}.localhost:{port}/login#n=")),
         "{link}"
     );
     let nonce = op::nonce_of(&link);
@@ -11119,7 +11147,7 @@ fn a_login_link_opens_exactly_one_session_and_leaves_no_trace() {
     };
     let cookie_h = format!("Cookie: {cookie}");
     let meta = meta_with(port, &host, &[&cookie_h]);
-    assert_eq!(meta["operator"], true, "{meta}");
+    assert_eq!(meta["signed_in"], true, "{meta}");
     assert_eq!(meta["session"]["origin"], "loopback", "{meta}");
     let (code, _, body) = op_write_json(
         &session,
@@ -11137,7 +11165,7 @@ fn a_login_link_opens_exactly_one_session_and_leaves_no_trace() {
     let (code, head, _) = op::raw(port, &session.request("POST", "/api/session/logout", "{}"));
     assert_eq!(code, 204, "{head}");
     assert!(head.contains("Max-Age=0"), "{head}");
-    assert_eq!(meta_with(port, &host, &[&cookie_h])["operator"], false);
+    assert_eq!(meta_with(port, &host, &[&cookie_h])["signed_in"], false);
     let (code, _, body) = op_write_json(
         &session,
         port,
@@ -11183,7 +11211,7 @@ fn a_login_link_expires_after_its_ttl() {
     };
     let d = UiDaemon::start_with_clock(state.path().to_path_buf(), clock);
     let port = start_ui(pm.path().to_path_buf(), d.state());
-    let host = format!("127.0.0.1:{port}");
+    let host = op::board_host(port);
     let late = op::nonce_of(&op::login_link(bin(), &d.state(), port, &[]).unwrap());
     let on_time = op::nonce_of(&op::login_link(bin(), &d.state(), port, &[]).unwrap());
     skew.store(121, std::sync::atomic::Ordering::SeqCst);
@@ -11210,7 +11238,8 @@ fn links_and_sessions_are_bound_to_their_origin() {
     let (ts_dir, sock) = fake_localapi();
     let port = start_ui_opts(pm.path().to_path_buf(), d.state(), tailnet_opts(&sock));
     localapi_says(ts_dir.path(), Some(true), serve_https_only(port));
-    let host = format!("127.0.0.1:{port}");
+    let host = op::board_host(port);
+    let plain = format!("127.0.0.1:{port}");
     let ts_host = format!("{TS_DNS}:9450");
     // `ui login --tailnet` reads the persisted sharing block.
     std::fs::write(
@@ -11244,7 +11273,7 @@ fn links_and_sessions_are_bound_to_their_origin() {
         ),
     );
     assert_eq!(code, 403, "{body}");
-    assert_eq!(check_of(&body), "tailnet_proof");
+    assert_eq!(check_of(&body), "session_origin");
 
     let s = sign_in(&d.state(), port);
     let patch = r#"{"priority":"P0"}"#;
@@ -11287,6 +11316,16 @@ fn links_and_sessions_are_bound_to_their_origin() {
         assert_eq!(code, 403, "{h} {origin:?}: {body}");
         assert_eq!(check_of(&body), check, "{h} {origin:?}: {body}");
     }
+    // The cookie presented on another loopback Host of this very board
+    // (127.0.0.1, where every port's cookies meet) is no session.
+    let (code, _, body) = with(&plain, Some(&format!("http://{plain}")), &s.cookie);
+    assert_eq!(code, 403, "{body}");
+    assert_eq!(check_of(&body), "operator_session_required");
+    // Nor can a link be exchanged there.
+    let spare = op::login_link(bin(), &d.state(), port, &[]).unwrap();
+    let (code, _, body) = op::exchange(port, &plain, &op::nonce_of(&spare));
+    assert_eq!(code, 403, "{body}");
+    assert_eq!(check_of(&body), "session_origin");
     let foreign = s.cookie.replacen(
         &format!("cadence_operator_{port}="),
         &format!("cadence_operator_{}=", port.wrapping_add(1)),
@@ -11605,16 +11644,41 @@ fn an_allowed_tailnet_host_without_armed_sharing_trusts_no_header() {
         &["Tailscale-User-Login: mallory@evil.example"],
     );
     assert_eq!(meta["actor"], "operator (ui)", "{meta}");
-    assert_eq!(meta["operator"], false, "{meta}");
+    assert_eq!(meta["signed_in"], false, "{meta}");
 
-    let s = op::sign_in_at(bin(), &d.state(), port, &ts_host);
+    // The operator's session does not travel to that Host (sessions live
+    // on the board's own name only) …
+    let s = sign_in(&d.state(), port);
+    let with_cookie: Vec<String> = headers
+        .iter()
+        .cloned()
+        .chain([format!("Cookie: {}", s.cookie)])
+        .collect();
+    let wref: Vec<&str> = with_cookie.iter().map(String::as_str).collect();
+    let (code, _, body) = http_write(
+        port,
+        "PATCH",
+        "/api/issues/CAD-3",
+        &ts_host,
+        &wref,
+        br#"{"priority":"P0"}"#,
+    );
+    assert_eq!(code, 403, "{body}");
+    assert_eq!(check_of(&body), "operator_session_required");
+    assert_eq!(commits(pm.path()), before);
+    // … and where it lives, the forged login header still names nobody.
+    let no_origin: Vec<&str> = href
+        .iter()
+        .copied()
+        .filter(|h| !h.starts_with("Origin:"))
+        .collect();
     let (code, _, body) = op_http_write(
         &s,
         port,
         "PATCH",
         "/api/issues/CAD-3",
         &ts_host,
-        &href,
+        &no_origin,
         br#"{"priority":"P0"}"#,
     );
     assert_eq!(code, 200, "{body}");

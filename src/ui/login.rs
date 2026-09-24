@@ -30,10 +30,11 @@ fn board_base(state_dir: &Path, tailnet: bool, port: Option<u16>) -> Result<Stri
                 )
             });
     }
-    // `cadence.localhost`, not 127.0.0.1: cookies ignore ports, and no
-    // agent's dev server answers on this name.
+    // This board's own name, not 127.0.0.1 or a shared vhost: cookies
+    // ignore ports, so only a per-board host keeps the session cookie
+    // away from every other server on this machine.
     let port = port.or(persisted.port).unwrap_or(3010);
-    Ok(format!("http://cadence.localhost:{port}"))
+    Ok(format!("http://{}", super::operator::board_host(port)))
 }
 
 pub(super) fn login(

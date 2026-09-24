@@ -293,10 +293,15 @@ pub fn exchange(port: u16, host: &str, nonce: &str) -> (u16, String, String) {
     )
 }
 
+/// This board's own name — the only loopback Host a session lives on.
+pub fn board_host(port: u16) -> String {
+    format!("cadence-{port}.localhost:{port}")
+}
+
 /// Sign in to the board on `port` (state dir `state`) as the operator,
-/// on Host `127.0.0.1:<port>`.
+/// on the board's own Host ([`board_host`]).
 pub fn sign_in(bin: &str, state: &Path, port: u16) -> Session {
-    sign_in_at(bin, state, port, &format!("127.0.0.1:{port}"))
+    sign_in_at(bin, state, port, &board_host(port))
 }
 
 /// [`sign_in`] on an explicit loopback Host.

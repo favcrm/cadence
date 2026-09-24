@@ -2501,7 +2501,7 @@ impl Shared {
             "delivery_merge" => self.rpc_delivery_merge(params, peer_pid),
             "delivery_decline" => self.rpc_delivery_decline(params, peer_pid),
             "operator_link_mint" => self.rpc_operator_link_mint(params, peer_pid),
-            "operator_session_open" => self.rpc_operator_session_open(params),
+            "operator_session_open" => self.rpc_operator_session_open(params, peer_pid),
             "operator_session_check" => self.rpc_operator_session_check(params),
             "operator_session_logout" => self.rpc_operator_session_logout(params),
             "operator_session_stolen" => self.rpc_operator_session_stolen(params),

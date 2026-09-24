@@ -39116,11 +39116,16 @@ fn ui_write_caller_keeps_the_operator_relay_with_a_managed_agent_live() {
     assert_eq!(board_last_commit(pm.path()), before, "nothing is written");
 
     let op = sign_in(&d.state, port);
-    let request = board_comment_request(port, "via the relay").replacen(
-        "\r\nContent-Type",
-        &format!("\r\nCookie: {}\r\nContent-Type", op.cookie),
-        1,
-    );
+    let request = board_comment_request(port, "via the relay")
+        .replace(
+            &format!("127.0.0.1:{port}"),
+            &format!("cadence-{port}.localhost:{port}"),
+        )
+        .replacen(
+            "\r\nContent-Type",
+            &format!("\r\nCookie: {}\r\nContent-Type", op.cookie),
+            1,
+        );
     let response = via_relay(&request);
     let comment = board_replied_comment(&response, "via the relay");
     assert_eq!(comment["author"], "operator", "{comment}");
@@ -40648,11 +40653,23 @@ fn board_get(port: u16, path: &str) -> (u16, String) {
 
 /// A thread POST with `headers` (each `Name: value\r\n`) and `body`.
 fn thread_post_request(port: u16, alias: &str, headers: &str, body: &str) -> String {
+    let host = board_host_for(port, headers);
     format!(
-        "POST /api/threads/{alias}/messages HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\
+        "POST /api/threads/{alias}/messages HTTP/1.0\r\nHost: {host}\r\n\
          {headers}Content-Length: {}\r\n\r\n{body}",
         body.len()
     )
+}
+
+/// The Host a raw board request carries: the board's own name when the
+/// headers carry an operator session (CAD-313: sessions live only on
+/// `cadence-<port>.localhost`), else plain `127.0.0.1:<port>`.
+fn board_host_for(port: u16, headers: &str) -> String {
+    if headers.contains("Cookie: cadence_operator_") {
+        format!("cadence-{port}.localhost:{port}")
+    } else {
+        format!("127.0.0.1:{port}")
+    }
 }
 
 const THREAD_GUARDS: &str = "Content-Type: application/json\r\nX-Cadence-Board: 1\r\n";
@@ -41125,7 +41142,7 @@ fn cad319_thread_post_is_refused_for_an_agent_caller() {
     assert_eq!(r["rc"], 0, "{r}");
     let out = r["out"].as_str().unwrap();
     assert!(out.contains(" 403 "), "{out}");
-    assert!(out.contains("caller_agent"), "{out}");
+    assert!(out.contains("operator_only"), "{out}");
     assert!(out.contains("'wk'"), "{out}");
     // The gate refuses before the route resolves the alias: an agent's
     // POST to an unknown agent is the same 403, never the route's 404
@@ -41207,10 +41224,37 @@ fn op_guards(op: &op::Session) -> String {
     format!("{THREAD_GUARDS}{}", op.headers())
 }
 
+/// The session `op` as presented to the board on `port` instead: that
+/// board's own Host and Origin, its cookie name, the same token (a
+/// session is the daemon's, not one board's).
+fn op_on(op: &op::Session, port: u16) -> op::Session {
+    let host = op::board_host(port);
+    let token = op.cookie.split_once('=').unwrap().1;
+    op::Session {
+        host: host.clone(),
+        origin: format!("http://{host}"),
+        cookie: format!("cadence_operator_{port}={token}"),
+        set_cookie: op.set_cookie.clone(),
+    }
+}
+
+/// `GET path` on `port` as the signed-in operator (no `Origin`: a
+/// browser sends none on a same-origin GET).
+fn op_get(op: &op::Session, port: u16, path: &str) -> (u16, String) {
+    board_http(
+        port,
+        &format!(
+            "GET {path} HTTP/1.0\r\nHost: {}\r\nCookie: {}\r\n\r\n",
+            op.host, op.cookie
+        ),
+    )
+}
+
 /// A raw board POST to `path` with `headers` (each `Name: value\r\n`).
 fn cad328_post(port: u16, path: &str, headers: &str, body: &str) -> String {
+    let host = board_host_for(port, headers);
     format!(
-        "POST {path} HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n{headers}\
+        "POST {path} HTTP/1.0\r\nHost: {host}\r\n{headers}\
          Content-Length: {}\r\n\r\n{body}",
         body.len()
     )
@@ -41561,6 +41605,8 @@ fn cad432_board_stage_moves_are_operator_only_and_relayed() {
     let f = PlanFixture::start();
     cad432_epic(&f);
     let port = start_board(&f.pm_dir, &f.d.state);
+    let op = sign_in(&f.d.state, port);
+    let guards = op_guards(&op);
     let stage = || f.front("D-1").stage;
     let before = f.commits();
     let untouched = |what: &str, commits: usize, want: Option<&str>| {
@@ -41590,7 +41636,7 @@ fn cad432_board_stage_moves_are_operator_only_and_relayed() {
         r#"{"note":"x"}"#,
         r#"{"stage":"  "}"#,
     ] {
-        let (status, reply) = cad432_move(port, THREAD_GUARDS, body);
+        let (status, reply) = cad432_move(port, &guards, body);
         assert_eq!(status, 400, "{body}: {reply}");
     }
     assert_eq!(board_get(port, "/api/epics/D-1/stage").0, 404);
@@ -41621,21 +41667,30 @@ fn cad432_board_stage_moves_are_operator_only_and_relayed() {
     untouched("agent → build", before, None);
     assert!(f.daemon_events("epic_stage_moved").is_empty());
 
-    // The operator: this test process, outside every agent. The proof
-    // walks /proc, so `/api/meta` runs it only when asked.
-    let (_, meta) = board_get(port, "/api/meta");
+    // The operator: this test process, outside every agent — with its
+    // session (CAD-313). The proof walks /proc, so `/api/meta` runs it
+    // only when asked; without the session it is nobody's.
+    let (_, meta) = op_get(&op, port, "/api/meta");
     let meta: Value = serde_json::from_str(&meta).unwrap();
     assert_eq!(
         meta["operator"],
         Value::Null,
         "not computed unasked: {meta}"
     );
+    assert_eq!(meta["signed_in"], true, "{meta}");
     let (_, meta) = board_get(port, "/api/meta?operator=1");
+    let meta: Value = serde_json::from_str(&meta).unwrap();
+    assert_eq!(meta["operator"], false, "no session, no operator: {meta}");
+    let (status, reply) = cad432_move(port, THREAD_GUARDS, to_build);
+    assert_eq!(status, 403, "{reply}");
+    assert!(reply.contains("operator_session_required"), "{reply}");
+    untouched("no session", before, None);
+    let (_, meta) = op_get(&op, port, "/api/meta?operator=1");
     let meta: Value = serde_json::from_str(&meta).unwrap();
     assert_eq!(meta["operator"], true, "{meta}");
     let (status, reply) = cad432_move(
         port,
-        THREAD_GUARDS,
+        &guards,
         r#"{"stage":"build","note":"shaped (all 2 tasks)"}"#,
     );
     assert_eq!(status, 200, "{reply}");
@@ -41663,7 +41718,7 @@ fn cad432_board_stage_moves_are_operator_only_and_relayed() {
         (r#"{"stage":"ship"}"#, "Unknown stage"),
         (r#"{"stage":"build"}"#, "already in stage"),
     ] {
-        let (status, reply) = cad432_move(port, THREAD_GUARDS, body);
+        let (status, reply) = cad432_move(port, &guards, body);
         assert!(status == 400 || status == 409, "{body}: {status} {reply}");
         assert!(reply.contains(want), "{body}: {reply}");
     }
@@ -41751,6 +41806,10 @@ fn cad432_stage_move_refuses_a_detached_managed_child_under_daemon_run() {
     let mut wk = mock.enroll(&f.d, "wk");
     cad432_epic(&f);
     let port = start_board(&f.pm_dir, &f.d.state);
+    // CAD-313: the child presents the operator's session, as if stolen —
+    // what refuses it is the process proof on the peer.
+    let op = sign_in(&f.d.state, port);
+    let guards = op_guards(&op);
     let before = f.commits();
 
     const INNER: &str = r#"exec 3<>"/dev/tcp/127.0.0.1/$1"; printf '%s' "$2" >&3; cat <&3 > "$3.tmp"; mv "$3.tmp" "$3""#;
@@ -41785,7 +41844,7 @@ fn cad432_stage_move_refuses_a_detached_managed_child_under_daemon_run() {
     let reply = detached(cad328_post(
         port,
         "/api/epics/D-1/stage",
-        THREAD_GUARDS,
+        &guards,
         r#"{"stage":"build"}"#,
     ));
     assert!(reply.contains(" 403 "), "{reply}");
@@ -41798,11 +41857,12 @@ fn cad432_stage_move_refuses_a_detached_managed_child_under_daemon_run() {
     assert_eq!(f.front("D-1").stage, None);
     assert!(f.daemon_events("epic_stage_moved").is_empty());
     let reply = detached(format!(
-        "GET /api/meta?operator=1 HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n"
+        "GET /api/meta?operator=1 HTTP/1.0\r\nHost: {}\r\nCookie: {}\r\n\r\n",
+        op.host, op.cookie
     ));
     assert!(reply.contains("\"operator\": false"), "{reply}");
 
-    let (status, reply) = cad432_move(port, THREAD_GUARDS, r#"{"stage":"build"}"#);
+    let (status, reply) = cad432_move(port, &guards, r#"{"stage":"build"}"#);
     assert_eq!(status, 200, "{reply}");
     assert_eq!(f.front("D-1").stage.as_deref(), Some("build"));
 }
@@ -41852,7 +41912,21 @@ fn cad432_board_started_by_an_agent_cannot_relay_a_move() {
     }
     let before = f.commits();
 
-    let (_, meta) = board_get(port, "/api/meta?operator=1");
+    // CAD-313: the agent's board cannot even open a session — the
+    // daemon sees the worker on the board's connection and spends the
+    // link. The operator signs in on its own board instead, and presents
+    // that session to the agent's board.
+    let link = op::login_link(env!("CARGO_BIN_EXE_cadence"), &f.d.state, port, &[]).unwrap();
+    let (status, _, body) = op::exchange(port, &op::board_host(port), &op::nonce_of(&link));
+    assert_eq!(status, 403, "{body}");
+    assert!(
+        body.contains("session_from_agent") || body.contains("'wk'"),
+        "{body}"
+    );
+    let own = start_board(&f.pm_dir, &f.d.state);
+    let op = op_on(&sign_in(&f.d.state, own), port);
+
+    let (_, meta) = op_get(&op, port, "/api/meta?operator=1");
     let meta: Value = serde_json::from_str(&meta).unwrap();
     assert_eq!(
         meta["operator"], false,
@@ -41861,7 +41935,7 @@ fn cad432_board_started_by_an_agent_cannot_relay_a_move() {
 
     // The proven operator (this test process) asks that board for a
     // routine move.
-    let (status, reply) = cad432_move(port, THREAD_GUARDS, r#"{"stage":"verify"}"#);
+    let (status, reply) = cad432_move(port, &op_guards(&op), r#"{"stage":"verify"}"#);
     assert_eq!(status, 403, "{reply}");
     assert!(reply.contains("operator_proof"), "{reply}");
     assert!(

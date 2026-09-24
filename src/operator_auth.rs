@@ -51,9 +51,6 @@ pub const ABSOLUTE_SECS: i64 = 7 * 24 * 3600;
 /// `last_used` is written at most this often — a busy tab does not
 /// rewrite the file on every request.
 const TOUCH_EVERY_SECS: i64 = 60;
-/// Failed link exchanges tolerated per [`FAILURE_WINDOW_SECS`].
-const MAX_FAILURES: usize = 10;
-const FAILURE_WINDOW_SECS: i64 = 60;
 /// A secret, nonce or token: 32 bytes as lowercase hex.
 const CREDENTIAL_HEX: usize = 64;
 
@@ -319,8 +316,6 @@ pub enum LinkRefusal {
     Expired,
     /// Minted for the other origin (loopback vs tailnet).
     WrongOrigin,
-    /// Too many failed exchanges in the last minute.
-    RateLimited,
 }
 
 impl LinkRefusal {
@@ -331,7 +326,6 @@ impl LinkRefusal {
             Self::AlreadyUsed => "already_used",
             Self::Expired => "expired",
             Self::WrongOrigin => "wrong_origin",
-            Self::RateLimited => "rate_limited",
         }
     }
 
@@ -351,7 +345,6 @@ impl LinkRefusal {
                 "this login link was minted for another address (loopback vs tailnet) — \
                  run `cadence ui login` (or `--tailnet`) for the address you opened"
             }
-            Self::RateLimited => "too many failed logins in the last minute — wait, then retry",
         }
     }
 }
@@ -419,6 +412,11 @@ struct SessionsFile {
 /// The daemon's operator-auth state: live link nonces (memory only — a
 /// restart voids every unexchanged link), the spent ones (so a replay
 /// says "already used", not "unknown"), and the persisted sessions.
+///
+/// There is deliberately no rate limit on failed exchanges: a nonce is
+/// 256 random bits, so guessing gains nothing, while any shared failure
+/// budget is one an agent can spend with no credential at all to lock
+/// the operator's fresh link out (review of PR #249).
 pub struct Auth {
     path: PathBuf,
     sessions: Vec<Row>,
@@ -426,7 +424,6 @@ pub struct Auth {
     links: HashMap<String, (Origin, i64)>,
     /// spent nonce hash → when it would have expired (pruned after)
     spent: HashMap<String, i64>,
-    failures: Vec<i64>,
 }
 
 /// Printable ASCII, bounded — the user agent is shown by `ui sessions`.
@@ -456,7 +453,6 @@ impl Auth {
             sessions,
             links: HashMap::new(),
             spent: HashMap::new(),
-            failures: Vec::new(),
         }
     }
 
@@ -497,7 +493,6 @@ impl Auth {
         // "expired" rather than "unknown".
         self.links.retain(|_, (_, exp)| now <= *exp + LINK_TTL_SECS);
         self.spent.retain(|_, exp| now <= *exp + LINK_TTL_SECS);
-        self.failures.retain(|at| now - *at < FAILURE_WINDOW_SECS);
         let before = self.sessions.len();
         self.sessions.retain(|r| r.live(now));
         before != self.sessions.len()
@@ -524,29 +519,22 @@ impl Auth {
         now: i64,
     ) -> std::result::Result<Result<Opened>, LinkRefusal> {
         self.prune(now);
-        if self.failures.len() >= MAX_FAILURES {
-            return Err(LinkRefusal::RateLimited);
-        }
-        let refused = |me: &mut Self, why: LinkRefusal| {
-            me.failures.push(now);
-            Err(why)
-        };
         if !well_formed(nonce) {
-            return refused(self, LinkRefusal::Malformed);
+            return Err(LinkRefusal::Malformed);
         }
         let hash = digest(nonce);
         if self.spent.contains_key(&hash) {
-            return refused(self, LinkRefusal::AlreadyUsed);
+            return Err(LinkRefusal::AlreadyUsed);
         }
         let Some((minted_for, expires)) = self.links.remove(&hash) else {
-            return refused(self, LinkRefusal::Unknown);
+            return Err(LinkRefusal::Unknown);
         };
         self.spent.insert(hash, expires);
         if now > expires {
-            return refused(self, LinkRefusal::Expired);
+            return Err(LinkRefusal::Expired);
         }
         if minted_for != origin {
-            return refused(self, LinkRefusal::WrongOrigin);
+            return Err(LinkRefusal::WrongOrigin);
         }
         Ok(self.create(origin, user_agent, now))
     }
@@ -804,21 +792,19 @@ mod tests {
         assert_eq!(err_kind(&err), Some(LinkRefusal::WrongOrigin));
     }
 
+    /// No failure budget: a flood of bogus nonces never locks the
+    /// operator's live link out.
     #[test]
-    fn failed_exchanges_are_rate_limited() {
+    fn bogus_exchanges_never_lock_out_a_live_link() {
         let s = state();
         let mut auth = Auth::load(s.path());
-        for _ in 0..MAX_FAILURES {
+        let live = auth.mint(Origin::Loopback, T0).unwrap();
+        for _ in 0..1000 {
             let bogus = random_credential().unwrap();
             let err = auth.open(&bogus, Origin::Loopback, "ua", T0);
             assert_eq!(err_kind(&err), Some(LinkRefusal::Unknown));
         }
-        let nonce = auth.mint(Origin::Loopback, T0).unwrap();
-        let err = auth.open(&nonce, Origin::Loopback, "ua", T0);
-        assert_eq!(err_kind(&err), Some(LinkRefusal::RateLimited));
-        // A minute later the window has passed.
-        let nonce = auth.mint(Origin::Loopback, T0 + 61).unwrap();
-        assert!(auth.open(&nonce, Origin::Loopback, "ua", T0 + 61).is_ok());
+        assert!(auth.open(&live, Origin::Loopback, "ua", T0).is_ok());
     }
 
     /// A session is bound to its origin, idles out and ends absolutely.
