@@ -9,3 +9,4 @@ __pycache__/
 *.py[cod]
 .cadence/
 /design-plans/**/*.png
+/tests/e2e/node_modules

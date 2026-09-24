@@ -71,3 +71,35 @@ const row = (r: Partial<NeedsMe> & Record<string, unknown>): NeedsMe =>
 equal([ageLabel(5), ageLabel(7200), ageLabel(90000)], ["5s", "2h", "1d"], "age labels");
 
 console.log("home needs checks passed");
+
+// CAD-431/433: a merge decision is a Merge button pinned to the reviewed
+// head; a row without a valid issue falls back to its command.
+{
+  const needs = homeNeeds([
+    row({
+      kind: "merge_decision",
+      audience: "operator",
+      title: "merge? D-2 acme/app#7 by w1 — PASS by r1: ok (+12 −3, 2 files)",
+      owner: "w1",
+      subject: { kind: "issue", id: "D-2" },
+      merge: {
+        issue: "D-2",
+        pr: "https://github.com/acme/app/pull/7",
+        pr_ref: "acme/app#7",
+        sha: "b".repeat(40),
+        owner: "w1",
+        reviewer: "r1",
+        verdict_summary: "PASS: ok",
+      },
+    }),
+    row({ kind: "merge_decision", audience: "operator", title: "odd", merge: { issue: "not an id" } }),
+  ]);
+  equal(needs[0].label, "merge", "chip label");
+  equal(
+    needs[0].action,
+    { type: "merge", issue: "D-2", pr: "acme/app#7", sha: "b".repeat(40), reviewer: "r1", verdict: "PASS: ok" },
+    "merge_decision → merge",
+  );
+  equal(needs[0].owner, "w1", "the worker owns it");
+  equal(needs[1].action, { type: "command", command: "cadence x" }, "bad issue → command");
+}
