@@ -61,7 +61,8 @@ Error kinds:
 | `agent_answer` | `alias, choice, by?, note?` | `{state:"answered"}` — sends one menu-choice keystroke to a `pty` pane probing `approval_menu` (CLI: `cadence agent answer <alias> <choice> [--reason <text>]`); re-probes and refuses any other detected pane state. Detection uses terminal text: CAD-220 tracks the residual ambiguity of a quoted menu directly adjoining the busy frame, so this is not an authoritative provider approval signal. `choice` is the option's index in the whole printed option block (top to bottom, independent of the highlighted row); the profile's keymap turns it into tmux keys — numbered menus take the digit, hotkeyed options their suffix, unnumbered selects arrows + Enter relative to the highlight. The answerer is derived from the socket peer's pid — `/proc` ancestry into the pane roots plus the pane `CADENCE_ALIAS` env and the pane's pty fds (a `setsid` detach keeps both) — a caller inside or tied to the target's own pane is refused, inside another agent's pane stamps `by_kind:"agent"`, an ancestry walk that cannot complete refuses while the target pane is alive (never a derivation-failure `operator`), and a caller that matches no pane is `operator` only when it holds a terminal no pane owns — a fully detached caller is honestly `unknown`; a supplied `by` that disagrees is kept only as `claimed_by`. Records `approval_answered` with `by`/`by_kind`/`caller_pid`/`choice`/`line`/`note` and wakes the agent's delivery loop |
 | `agent_recover_submit` | `alias, message, generation?` | `{state:"submitted"|"unconfirmed", before, after, generation}` — CAD-152: submits a `pty` task message that was pasted but never submitted (still `running` under its turn token, the draft sitting in the input line) with exactly one Enter, never a re-paste, so the turn token and report path are the ones minted at paste (CLI: `cadence agent recover-submit <alias> --message <id> [--generation <g>]`). Caller rule (CAD-149): the operator or the target's own PM only, derived from the connection; identity-shaped fields are refused. Refuses and sends nothing unless every check holds at action time, naming the failed check: `unsupported_endpoint` (not pty), `message`, `already_submitted` (a prior recovery of this message), `other_message_pending` (another message holds the agent's turn), `not_running`, `not_a_turn` (routed notice or nudge), `acknowledged`, `stale_generation` (the `generation` given, the message's turn token, or a relaunch during the recovery), `endpoint` (pane gone, dead, not owning its session, or the agent's endpoint replaced during the recovery), `pane_mode` (tmux copy/view mode), `approval_menu`, `busy`, `empty_input`, `draft_unreadable` (the profile cannot delimit the draft — Cursor always, fail closed), `draft_mismatch`, `ambiguous_wrap`, `record` (the durable record could not be written). Draft rule: text within a row compares verbatim (whitespace runs included); a row break is accepted only as the TUI's provable wrap — a word wrap where the body has exactly one space and the next row's first word could not have fitted (`row + 1 + word > width`), or a hard wrap of a full row (`row >= width`); `width` is the profile's upper bound on a row's text (the input box's rule/border less the two-column prompt; unknown width makes every multi-row draft ambiguous). Only part of the body, a whitespace-only difference, or an unprovable break is `ambiguous_wrap`; other text is `draft_mismatch`. The message checks run again inside the adapter's critical section just before the Enter, with the agent re-read (same generation, same live adapter), and recoveries are serialised daemon-wide. Before the Enter, one store write reserves the recovery — the `submit_recovered` record (result `sending`) plus `result.recovered.at`, which restarts the CAD-250 report clock — so a failed later write can never admit a second Enter. After the Enter the pane is watched up to 4 s: `submitted` only on positive evidence (the TUI's prompt line back and empty on a live pane), else `unconfirmed` (CLI exit 1) — never retried. The record is completed with `after` and `result`; `submit_recover_refused` records an authorized caller's refusal. Both carry `by`/`by_kind`/`caller_pid`/`alias`/`generation`/`message`/`before`/`after`/`result` (+`check`/`reason` on a refusal, `send_error` if the keystroke errored) — never the message body, the draft or the turn token |
 | `agent_set` | `alias, patch, next_launch?` | merges an allowlisted param into the live agent — `auto_ready` (`"verified"` or null-removal, pty only), `stall_secs`, `silent_end_secs` (pty only), `report_timeout_secs` (pty only); `{state:"updated"}`. With `next_launch: true` it instead stores launch params `model`/`effort` (claude; Codex model/effort are checked against `model/list`; null clears to the provider default) or `approval_policy` (codex; `never|on-request|on-failure|untrusted`, null clears) for the next open without touching the live process; `{state:"updated", applies:"next launch"}` Caller rule (CAD-149), from the connection only (the nearest registered pane or enrolled endpoint on the peer's ancestry, else `peer::operator_proof`): the operator and the target's own PM (`params.upstream`) may set any allowed key; the agent itself only `next_launch` model/effort (`registry::ParamClass`); anyone else is refused, naming the rule. A request carrying `by`/`as`/`actor`/`caller`/`operator`/`reviewer`/`pane`/`lane`/`pid` is refused. Every accepted change records `params_updated` with `by`, `by_kind`, `target`, `next_launch` and `changes:[{key,old,new}]` **Residual (F1, CAD-280):** "operator" means only that `peer::operator_proof` passed, and a same-uid process that detaches from every pane (`setsid -f env -i … </dev/null >/dev/null`) passes it — any worker can do that. So the rule stops an agent acting from its own pane, not a hostile one, and an audit `by:"operator"` is not proof the operator acted; CAD-280 (operator by positive proof) tightens this. PM authority is bound to the PM's registration: the `upstream` alias counts only while its current registration predates the target, so a removed PM's alias registered again governs none of the old members |
-| `agent_inbox` | `alias, after?, wait?` | drains queued inbox messages, completing each `via=inbox_read`; `{messages, cursor}` |
+| `agent_inbox` | `alias, after?, wait?, peek?, reader?` | drains queued inbox messages, completing each `via=inbox_read`; `{messages, cursor, unread}` — `peek:true` returns the same set with no state change (skipping messages `reader` parked), defaults `after` to `reader`'s ack watermark. Peek is an unguarded read; a drain consumes, so a proven agent caller may drain only its own inbox |
+| `agent_inbox_ack` | `alias, seqs?|through?, reader?, reset?, park?, reason?, fail?` | completes every still-`queued` message at or below the watermark `via=inbox_ack`, records the reader's durable cursor as an `inbox_ack` event; `{acked, through, reader, unread}` — `through` is clamped to the inbox's tail before storing; agent callers may act only on their own alias. `reset:true` drops the reader's cursor (`inbox_ack_reset`, operator-only). `park:<id>` marks a queued message so `reader`'s peeks skip it (`inbox_park`; it stays queued, and the reader's own acks skip it too). `fail:{...}` records one failed `--exec` attempt as `inbox_exec_fail` |
 | `message_report` | `message, token, kind: ack|result, text?, sha?` | `{state:"reported"}` — explicit ack/result; `sha` names the produced commit for task-attached kickoffs. The token must equal the message's `turn_id` and be current for the agent's live generation under its endpoint's own scheme (CAD-162: pty `pty-<gen>-…`, managed Claude `claude-<gen>-…` — `ack` only, its turn result completes the message; codex, devin cloud, fake and inbox have no checkable scheme and refuse every report) |
 | `message_reconcile` | `message, status: interrupted|completed|failed, note?, sha?` | `{state:"reconciled", message}` — operator-only exit from `unknown`, by the connection (CAD-374): an agent is refused and `by` is refused, the record says `operator`; no turn token. `completed`/`failed` route `reply_to` as a result; `interrupted` routes an informational notice. A `sha` on `completed` binds like a worker `--sha` |
 | `message_cancel` | `message, by?, reason?` | `{state:"cancelled", message}` — terminal exit from `queued`; never delivered. Refused for any other state (the error names it) and for task-bound deliveries (`task cancel` owns those). Caller rule (CAD-384): the proven operator or the recipient's own PM; `by` is the caller |
@@ -1178,7 +1179,69 @@ blocks on the socket instead of polling — `cadence inbox <alias>
 [--after N] [--wait S]` prints one JSON object per consumed message
 and nothing on an empty drain. `agent_show` reports the backlog as
 `queued`; `cadence self` on an inbox answers that count rather than a
-running turn.
+running turn, plus `unread` and `oldest_unread_age_secs`.
+
+Peek and ack (CAD-480). The drain above loses messages when a reader
+crashes or truncates after reading — the rows were completed as they
+were printed. The safe consumption mode is `peek` plus explicit ack:
+`agent_inbox` with `peek:true` returns the same queued set but changes
+no state, so a failed reader loses nothing. `agent_inbox_ack`
+(`cadence inbox ack <alias> <seq>...`, or `--through N`) is the
+consume: a **watermark** that completes every still-`queued` message
+with `seq <= through` in one transaction — `via=inbox_ack` receipts,
+the same local-receipt treatment as `inbox_read` — idempotent on the
+`queued` state guard, so concurrent readers never double-complete and
+re-acking a consumed seq is a no-op. Never ack past a message that was
+not processed. `through` is clamped to the inbox's greatest existing
+seq before it is stored: a claim past the tail completes what exists
+but can never leave the reader's cursor blind to later arrivals.
+
+Each ack also records a durable **reader cursor**: `reader` (default
+`"default"`; an identifier, the alias grammar) names an independent
+consumer and the ack lands an `inbox_ack` event carrying
+`{reader, through, seqs, by}`. The cursor is derived from the event
+log, so it survives daemon restarts. A peek without an explicit
+`after` resumes at its reader's watermark — a restarted reader sees
+exactly the messages past its last ack plus anything it peeked but
+never acked. `agent_show`'s `inbox.readers` maps each reader to
+`{through, last_ack_at}`. `cadence inbox ack <alias> --reset` drops a
+reader's cursor (operator-only): the `inbox_ack_reset` event clears
+its watermark so the next peek re-delivers everything still queued —
+completed messages stay completed, nothing is lost.
+
+Push delivery. `cadence inbox <alias> --follow --exec <CMD>...` runs
+the command once per message and acks only on exit 0 — delivery is
+push-shaped but the store still owns receipt. Everything after
+`--exec` is the command's argv, executed **without a shell** (to ask
+for one, say `--exec sh -c '…'`); `--exec` must come last. The message
+JSON is written to the command's stdin — never argv or the
+environment, so message content never appears in `ps` or `/proc`
+environ. A non-zero exit (or a failed spawn) leaves the message
+`queued` and retries it with exponential backoff — `--exec-retry-ms`
+(default 1000) doubling per failure, capped at 30s — head-of-line, so
+a later message is never acked past a failed one; each failure prints
+the exit status and a stderr tail and lands an `inbox_exec_fail`
+event. A run still alive at `--exec-timeout-ms` (default 120000, 0
+disables) is killed and counted as a failure, so a wedged consumer
+cannot hold the head of line silently. After `--exec-max-failures`
+consecutive failures on one message (default 5) the follower **parks**
+it: an `inbox_park` event marks it for the reader, its peeks skip it,
+its own acks skip it, and it stays `queued` — still counted in
+`unread`, still drainable by the operator or another reader — instead
+of blocking the queue forever. The consumer's acks land under its
+`--reader` cursor, so a restarted `--follow --exec` resumes after the
+last success rather than re-delivering it.
+
+Caller rule. A mailbox's consumer has no verifiable identity (CAD-251),
+so the peek read and the consume verbs admit unattributed and operator
+callers — the one guard is that a proven **agent** caller may drain,
+ack, park or report only on its own alias: a worker can never consume
+another agent's inbox. **Residual (CAD-280 class):** unattributed
+means exactly that — a same-uid process that detaches from every pane
+and scrubs its env can still call these verbs; the guard stops an
+agent acting *from its own proven identity*, not a hostile one. The
+alias `ack` is reserved for inboxes (`cadence inbox ack` would shadow
+it).
 
 Lifecycle: a mailbox is always `idle`, so `agent_resume` is rejected
 (there is nothing to resume), `agent_stop` is rejected (there is
@@ -1371,6 +1434,7 @@ result_routed, notice_routed, ready, ready_claimed, claim_used,
 gate_wait, submitted, session_minted, session_resume_failed,
 session_persist_failed,
 acknowledged, paste_not_rendered, delivery_parked, inbox_read,
+inbox_ack, inbox_ack_reset, inbox_park, inbox_exec_fail,
 inbox_unconsumed,
 params_updated, reconciled, relaunch_skipped, attention,
 approval_menu, approval_answered, turn_silent_end,

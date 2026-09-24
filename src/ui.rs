@@ -876,6 +876,12 @@ fn agents_payload_from(state_dir: &Path, list: Option<Value>, jobs: Option<&Valu
         let actor = registry::has_actor(provider, kind);
         if !actor {
             inboxes += 1;
+            // CAD-480: the mailbox's unread backlog and its oldest
+            // unread age are the row's queue evidence — the daemon
+            // computes both in `agent.inbox`.
+            let unread = agent["inbox"]["queued"].as_i64().unwrap_or(0);
+            let oldest_unread_age_secs = agent["inbox"]["oldest_age_secs"].clone();
+            totals["queued"] = json!(totals["queued"].as_i64().unwrap_or(0) + unread);
             out.push(json!({
                 "alias": alias, "provider": agent["provider"],
                 "endpoint_kind": agent["endpoint_kind"],
@@ -895,7 +901,9 @@ fn agents_payload_from(state_dir: &Path, list: Option<Value>, jobs: Option<&Valu
                 "usage_limit": agent["usage_limit"],
                 "state": "inbox", "group": agent["params"]["upstream"].as_str().unwrap_or(alias),
                 "group_root": agent["params"]["upstream"].is_null(),
-                "running": 0, "queued": 0, "unknown": 0, "parked": 0,
+                "running": 0, "queued": unread, "unread": unread,
+                "oldest_unread_age_secs": oldest_unread_age_secs,
+                "unknown": 0, "parked": 0,
                 "fenced": false, "on": [], "tasks": [], "message": Value::Null,
                 "dead": agent["dead"], "inbox": true,
             }));
@@ -3623,10 +3631,38 @@ fn qr_term(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        content_type, context_query, health_supports_model_defaults, proxied_actor, running_json,
-        static_answer, static_file, StaticAnswer,
+        agents_payload_from, content_type, context_query, health_supports_model_defaults,
+        proxied_actor, running_json, static_answer, static_file, StaticAnswer,
     };
-    use serde_json::json;
+    use serde_json::{json, Value};
+
+    /// CAD-480: a mailbox row on the Agents screen carries its unread
+    /// backlog and oldest-unread age from `agent.inbox`, and the unread
+    /// count folds into the queued total.
+    #[test]
+    fn agents_payload_inbox_row_reports_unread_backlog() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let list = json!({"agents": [{
+            "alias": "obs", "provider": "inbox", "endpoint_kind": "inbox",
+            "role": Value::Null, "team_role": Value::Null,
+            "model_selection": Value::Null, "model_lookup_role": Value::Null,
+            "model": Value::Null, "model_reported": Value::Null,
+            "model_configured": Value::Null, "model_source": Value::Null,
+            "effort": Value::Null, "effort_reported": Value::Null,
+            "effort_source": Value::Null, "effort_applicable": Value::Null,
+            "quota": Value::Null, "usage_limit": Value::Null,
+            "thread_id": "", "session_id": "", "endpoint": "inbox://obs",
+            "params": Value::Null, "dead": false,
+            "inbox": {"queued": 3, "oldest_age_secs": 42.0},
+        }]});
+        let out = agents_payload_from(dir.path(), Some(list), None);
+        let row = &out["agents"][0];
+        assert_eq!(row["inbox"], true, "{row}");
+        assert_eq!(row["queued"], 3, "{row}");
+        assert_eq!(row["unread"], 3, "{row}");
+        assert_eq!(row["oldest_unread_age_secs"], 42.0, "{row}");
+        assert_eq!(out["totals"]["queued"], 3, "{out}");
+    }
 
     #[test]
     fn context_query_stores_devops_and_accepts_ops() {

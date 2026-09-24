@@ -155,7 +155,19 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ),
     (
         "agent_inbox",
-        Rule::Unguarded("a mailbox's consumer has no verifiable identity (CAD-251)"),
+        Rule::Handler(
+            "rpc_inbox: peek is an unguarded read — a mailbox's consumer has no \
+             verifiable identity (CAD-251); a drain consumes, so a proven agent \
+             caller may drain only its own inbox (CAD-480)",
+        ),
+    ),
+    (
+        "agent_inbox_ack",
+        Rule::Handler(
+            "rpc_inbox_ack: consumers pass unauthenticated as on the read \
+             (CAD-251); an agent caller may ack, park or report only on its own \
+             alias, and cursor resets are operator-only (CAD-480)",
+        ),
     ),
     ("message_report", Rule::Bearer),
     (
@@ -695,13 +707,7 @@ mod tests {
             .collect();
         assert_eq!(
             unguarded,
-            [
-                "request_open",
-                "agent_inbox",
-                "job_new",
-                "task_new",
-                "monitor_heartbeat"
-            ]
+            ["request_open", "job_new", "task_new", "monitor_heartbeat"]
         );
     }
 
