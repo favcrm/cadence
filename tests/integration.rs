@@ -39123,7 +39123,11 @@ fn ui_write_caller_keeps_the_operator_relay_with_a_managed_agent_live() {
         )
         .replacen(
             "\r\nContent-Type",
-            &format!("\r\nCookie: {}\r\nContent-Type", op.cookie),
+            &format!(
+                "\r\nCookie: {}\r\n{}\r\nContent-Type",
+                op.cookie,
+                op.key_header()
+            ),
             1,
         );
     let response = via_relay(&request);
@@ -41240,6 +41244,7 @@ fn op_on(op: &op::Session, port: u16) -> op::Session {
         origin: format!("http://{host}"),
         cookie: format!("cadence_operator_{port}={token}"),
         set_cookie: op.set_cookie.clone(),
+        key: op.key.clone(),
     }
 }
 
@@ -41249,8 +41254,10 @@ fn op_get(op: &op::Session, port: u16, path: &str) -> (u16, String) {
     board_http(
         port,
         &format!(
-            "GET {path} HTTP/1.0\r\nHost: {}\r\nCookie: {}\r\n\r\n",
-            op.host, op.cookie
+            "GET {path} HTTP/1.0\r\nHost: {}\r\nCookie: {}\r\n{}\r\n\r\n",
+            op.host,
+            op.cookie,
+            op.key_header()
         ),
     )
 }
@@ -41883,8 +41890,10 @@ fn cad432_stage_move_refuses_a_detached_managed_child_under_daemon_run() {
     assert_eq!(f.front("D-1").stage, None);
     assert!(f.daemon_events("epic_stage_moved").is_empty());
     let reply = detached(format!(
-        "GET /api/meta?operator=1 HTTP/1.0\r\nHost: {}\r\nCookie: {}\r\n\r\n",
-        op.host, op.cookie
+        "GET /api/meta?operator=1 HTTP/1.0\r\nHost: {}\r\nCookie: {}\r\n{}\r\n\r\n",
+        op.host,
+        op.cookie,
+        op.key_header()
     ));
     assert!(reply.contains("\"operator\": false"), "{reply}");
 

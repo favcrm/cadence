@@ -322,15 +322,32 @@ fn require_own_origin(request: &Request, origin: Origin) -> Result<(), HttpResp>
 }
 
 /// Ask the daemon whether `token` is a live session on `origin`.
+/// The header carrying a session's second credential (review round 2,
+/// PR #249). The page holds it in `sessionStorage` — scoped to its exact
+/// origin, port included — so a listener on another port that receives
+/// the cookie (cookies ignore ports) never has it, and a cross-site page
+/// cannot set a custom header without a preflight this board refuses.
+pub(super) const SESSION_HEADER: &str = "X-Cadence-Session";
+
+/// The page's session key, `""` when the request carries none.
+fn session_key(request: &Request) -> String {
+    header_value(request, SESSION_HEADER)
+        .map(|k| k.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Ask the daemon whether the cookie's `token` and the page's `key`
+/// together are a live session on `origin`.
 fn check_session(
     state_dir: &std::path::Path,
     token: &str,
+    key: &str,
     origin: Origin,
 ) -> Result<Option<Value>, HttpResp> {
     match client::rpc(
         state_dir,
         "operator_session_check",
-        json!({"token": token, "origin": origin.as_str()}),
+        json!({"token": token, "key": key, "origin": origin.as_str()}),
     ) {
         Ok(v) if v["valid"] == true => Ok(Some(v["session"].clone())),
         Ok(_) => Ok(None),
@@ -433,12 +450,23 @@ fn attribute(
         ));
     }
     let found = agent_roots(state_dir).and_then(|roots| {
-        if roots.is_empty() {
-            return Ok(None);
-        }
         let peer = request
             .remote_addr()
             .ok_or_else(|| "the request has no peer address".to_string())?;
+        if roots.is_empty() {
+            // No live agent to tie the peer to — but the connection must
+            // still be one: a loopback client whose socket is already
+            // gone (an early-closed replay by an agent that then exited)
+            // is unattributable, never "tied to no agent" (review round 2).
+            let peer = crate::peer::canonical(*peer);
+            if peer.ip().is_loopback() && crate::peer::client_socket(opts.port, peer)?.is_none() {
+                return Err(format!(
+                    "no local socket is the client end of {peer} → port {}",
+                    opts.port
+                ));
+            }
+            return Ok(None);
+        }
         crate::peer::tcp_peer_agent(opts.port, *peer, &roots)
     });
     match found {
@@ -483,7 +511,7 @@ pub(super) fn board_caller(
                 if write {
                     require_own_origin(request, *o)?;
                 }
-                check_session(state_dir, &token, *o)?.map(|_| token)
+                check_session(state_dir, &token, &session_key(request), *o)?.map(|_| token)
             }
             None => None,
         },
@@ -522,8 +550,11 @@ pub(super) fn meta(request: &Request, state_dir: &std::path::Path, opts: &ServeO
                 Origin::Loopback => "cadence ui login",
                 Origin::Tailnet => "cadence ui login --tailnet",
             };
-            let session = session_cookie(request, opts, o)
-                .and_then(|token| check_session(state_dir, &token, o).ok().flatten());
+            let session = session_cookie(request, opts, o).and_then(|token| {
+                check_session(state_dir, &token, &session_key(request), o)
+                    .ok()
+                    .flatten()
+            });
             (hint, session)
         }
         ReqOrigin::NoSession(_) => ("cadence ui login", None),
@@ -561,8 +592,9 @@ fn cookie_attrs(origin: Origin, max_age: i64) -> String {
     format!("Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}{secure}")
 }
 
-/// `POST /api/session {"nonce"}` — exchange a login link for a session
-/// cookie. The write guards apply, the Host must be this board's own
+/// `POST /api/session {"nonce"}` — exchange a login link for a session:
+/// the cookie (`Set-Cookie`) plus `{"session_key"}` for the page, both
+/// required on every later write. The write guards apply, the Host must be this board's own
 /// name (or the proven tailnet), and `Origin` must be this request's
 /// own; the link must have been minted for this origin. The peer is
 /// attributed BEFORE the exchange, under the same rule as a
@@ -649,7 +681,12 @@ pub(super) fn open(
     }
     let now = crate::issue::time::now_epoch();
     let expires = opened["session"]["expires_at"].as_i64().unwrap_or(now);
-    let mut resp = Response::from_data(Vec::new()).with_status_code(StatusCode(204));
+    // The key goes to this page only, once: it keeps it in
+    // `sessionStorage` and sends it as `X-Cadence-Session`.
+    let key = opened["key"].as_str().unwrap_or_default();
+    let body = serde_json::to_vec(&json!({ "session_key": key })).unwrap_or_default();
+    let mut resp = Response::from_data(body).with_status_code(StatusCode(200));
+    resp.add_header(Header::from_bytes("Content-Type", "application/json").unwrap());
     set_cookie(
         &mut resp,
         &format!(

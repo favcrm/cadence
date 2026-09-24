@@ -257,24 +257,41 @@ pub struct Session {
     pub cookie: String,
     /// The full `Set-Cookie` value, for attribute checks.
     pub set_cookie: String,
+    /// The session's second credential, sent as `X-Cadence-Session`.
+    pub key: String,
 }
 
 impl Session {
     /// A write carrying this session and its own Origin.
     pub fn request(&self, method: &str, path: &str, body: &str) -> String {
-        request(
+        let req = request(
             method,
             path,
             &self.host,
             Some(&self.origin),
             Some(&self.cookie),
             body,
+        );
+        req.replacen(
+            "X-Cadence-Board: 1\r\n",
+            &format!("X-Cadence-Board: 1\r\n{}\r\n", self.key_header()),
+            1,
         )
     }
 
     /// The raw `Name: value\r\n` headers a signed-in write adds.
     pub fn headers(&self) -> String {
-        format!("Origin: {}\r\nCookie: {}\r\n", self.origin, self.cookie)
+        format!(
+            "Origin: {}\r\nCookie: {}\r\n{}\r\n",
+            self.origin,
+            self.cookie,
+            self.key_header()
+        )
+    }
+
+    /// `X-Cadence-Session: <key>` (no line end).
+    pub fn key_header(&self) -> String {
+        format!("X-Cadence-Session: {}", self.key)
     }
 }
 
@@ -308,13 +325,18 @@ pub fn sign_in(bin: &str, state: &Path, port: u16) -> Session {
 pub fn sign_in_at(bin: &str, state: &Path, port: u16, host: &str) -> Session {
     let link = login_link(bin, state, port, &[]).unwrap_or_else(|e| panic!("ui login: {e}"));
     let (status, head, body) = exchange(port, host, &nonce_of(&link));
-    assert_eq!(status, 204, "{head}\n{body}");
+    assert_eq!(status, 200, "{head}\n{body}");
     let set = set_cookie(&head).unwrap_or_else(|| panic!("no Set-Cookie: {head}"));
     let cookie = set.split(';').next().unwrap().trim().to_string();
+    let key = serde_json::from_str::<Value>(&body).unwrap()["session_key"]
+        .as_str()
+        .unwrap()
+        .to_string();
     Session {
         host: host.to_string(),
         origin: format!("http://{host}"),
         cookie,
         set_cookie: set,
+        key,
     }
 }

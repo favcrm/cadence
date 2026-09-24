@@ -15,8 +15,9 @@
 //!   connection that derives an agent (a pane or enrolled managed
 //!   endpoint on its ancestry — an agent that skipped the board, or a
 //!   board an agent started) spends the nonce and gets no session.
-//! - `operator_session_check {token, origin}` — the board, on every
-//!   operator decision and `/api/meta`.
+//! - `operator_session_check {token, key, origin}` — the board, on every
+//!   write and `/api/meta`: the cookie's token AND the page's
+//!   `X-Cadence-Session` key, both required.
 //! - `operator_session_logout {token}` — the board's
 //!   `POST /api/session/logout`: possession of the token ends it.
 //! - `operator_session_stolen {token, agent}` — the board saw a session
@@ -137,7 +138,7 @@ impl Shared {
                     "operator_session_opened",
                     json!({"session": opened.session.id, "origin": origin.as_str()}),
                 );
-                Ok(json!({"token": opened.token, "session": opened.session}))
+                Ok(json!({"token": opened.token, "key": opened.key, "session": opened.session}))
             }
             Err(why) => {
                 // An already-used link means someone else may have
@@ -158,9 +159,10 @@ impl Shared {
 
     pub(super) fn rpc_operator_session_check(&self, params: &Value) -> Result<Value> {
         let token = required_str(params, "token")?;
+        let key = optional_str(params, "key").unwrap_or_default();
         let origin = origin_param(params)?;
         let now = self.operator_now();
-        let session = self.operator_auth().check(token, origin, now)?;
+        let session = self.operator_auth().check(token, key, origin, now)?;
         Ok(json!({"valid": session.is_some(), "session": session}))
     }
 

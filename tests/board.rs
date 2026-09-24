@@ -257,6 +257,7 @@ fn op_http_write(
     let _ = host;
     let own = op::board_host(port);
     let cookie = format!("Cookie: {}", op.cookie);
+    let key = op.key_header();
     let origin = format!("Origin: http://{own}");
     let mut all: Vec<&str> = headers.to_vec();
     if !headers
@@ -266,6 +267,7 @@ fn op_http_write(
         all.push(&origin);
     }
     all.push(&cookie);
+    all.push(&key);
     http_write(port, method, path, &own, &all, body)
 }
 
@@ -7507,7 +7509,10 @@ fn tailnet_shaped_local_write_is_not_the_proxy() {
     let before = commits(pm.path());
     let mut headers = ts_write_headers(&origin, "fable@example.com");
     for cookie in [None, Some(format!("Cookie: {}", op.cookie))] {
-        headers.retain(|h| !h.starts_with("Cookie:"));
+        headers.retain(|h| !h.starts_with("Cookie:") && !h.starts_with("X-Cadence-Session:"));
+        if cookie.is_some() {
+            headers.push(op.key_header());
+        }
         headers.extend(cookie);
         let href: Vec<&str> = headers.iter().map(String::as_str).collect();
         let (code, _, body) = http_write(
@@ -11096,18 +11101,18 @@ fn a_login_link_opens_exactly_one_session_and_leaves_no_trace() {
         .map(|_| {
             let (nonce, host) = (nonce.clone(), host.clone());
             thread::spawn(move || {
-                let (code, head, _) = op::exchange(port, &host, &nonce);
-                (code, head)
+                let (code, head, body) = op::exchange(port, &host, &nonce);
+                (code, format!("{head}\r\n\r\n{body}"))
             })
         })
         .collect::<Vec<_>>()
         .into_iter()
         .map(|h| h.join().unwrap())
         .collect();
-    let won: Vec<&(u16, String)> = wins.iter().filter(|(c, _)| *c == 204).collect();
+    let won: Vec<&(u16, String)> = wins.iter().filter(|(c, _)| *c == 200).collect();
     assert_eq!(won.len(), 1, "{wins:?}");
-    assert!(wins.iter().all(|(c, _)| *c == 204 || *c == 403), "{wins:?}");
-    let head = &won[0].1;
+    assert!(wins.iter().all(|(c, _)| *c == 200 || *c == 403), "{wins:?}");
+    let (head, body) = won[0].1.split_once("\r\n\r\n").unwrap();
     assert!(
         head.to_ascii_lowercase()
             .contains("cache-control: no-store"),
@@ -11124,6 +11129,13 @@ fn a_login_link_opens_exactly_one_session_and_leaves_no_trace() {
     assert!(!set.contains("Domain") && !set.contains("Secure"), "{set}");
     let cookie = set.split(';').next().unwrap().to_string();
     let token = cookie.split_once('=').unwrap().1.to_string();
+    // The page's second credential rides in the body, never a cookie.
+    let key = serde_json::from_str::<Value>(body).unwrap()["session_key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(key.len(), 64, "{body}");
+    assert!(!head.contains(&key), "the key must not be in a header");
 
     // A replay is refused loudly, and the daemon records the alert.
     let (code, _, body) = op::exchange(port, &host, &nonce);
@@ -11144,9 +11156,13 @@ fn a_login_link_opens_exactly_one_session_and_leaves_no_trace() {
         origin: format!("http://{host}"),
         cookie: cookie.clone(),
         set_cookie: set.clone(),
+        key: key.clone(),
     };
     let cookie_h = format!("Cookie: {cookie}");
-    let meta = meta_with(port, &host, &[&cookie_h]);
+    let key_h = session.key_header();
+    // The cookie alone is no session: the page's key is required too.
+    assert_eq!(meta_with(port, &host, &[&cookie_h])["signed_in"], false);
+    let meta = meta_with(port, &host, &[&cookie_h, &key_h]);
     assert_eq!(meta["signed_in"], true, "{meta}");
     assert_eq!(meta["session"]["origin"], "loopback", "{meta}");
     let (code, _, body) = op_write_json(
@@ -11165,7 +11181,10 @@ fn a_login_link_opens_exactly_one_session_and_leaves_no_trace() {
     let (code, head, _) = op::raw(port, &session.request("POST", "/api/session/logout", "{}"));
     assert_eq!(code, 204, "{head}");
     assert!(head.contains("Max-Age=0"), "{head}");
-    assert_eq!(meta_with(port, &host, &[&cookie_h])["signed_in"], false);
+    assert_eq!(
+        meta_with(port, &host, &[&cookie_h, &key_h])["signed_in"],
+        false
+    );
     let (code, _, body) = op_write_json(
         &session,
         port,
@@ -11187,6 +11206,14 @@ fn a_login_link_opens_exactly_one_session_and_leaves_no_trace() {
     assert!(
         !contains(&everything, &token),
         "the session token was persisted"
+    );
+    assert!(
+        !contains(&everything, &key),
+        "the session key was persisted"
+    );
+    assert!(
+        !contains(log.as_bytes(), &key),
+        "the session key reached the log"
     );
     let secret = std::fs::read_to_string(d.state().join("operator/secret")).unwrap();
     assert!(
@@ -11220,7 +11247,7 @@ fn a_login_link_expires_after_its_ttl() {
     assert!(body.contains("expired"), "{body}");
     skew.store(119, std::sync::atomic::Ordering::SeqCst);
     let (code, _, body) = op::exchange(port, &host, &on_time);
-    assert_eq!(code, 204, "{body}");
+    assert_eq!(code, 200, "{body}");
 }
 
 /// L3 and L5 — a link and a session belong to one origin. A tailnet
@@ -11278,17 +11305,21 @@ fn links_and_sessions_are_bound_to_their_origin() {
     let s = sign_in(&d.state(), port);
     let patch = r#"{"priority":"P0"}"#;
     let with = |host: &str, origin: Option<&str>, cookie: &str| {
-        op::raw(
-            port,
-            &op::request(
-                "PATCH",
-                "/api/issues/CAD-3",
-                host,
-                origin,
-                Some(cookie),
-                patch,
-            ),
+        // The page's key rides along: only the cookie's origin varies.
+        let req = op::request(
+            "PATCH",
+            "/api/issues/CAD-3",
+            host,
+            origin,
+            Some(cookie),
+            patch,
         )
+        .replacen(
+            "X-Cadence-Board: 1\r\n",
+            &format!("X-Cadence-Board: 1\r\n{}\r\n", s.key_header()),
+            1,
+        );
+        op::raw(port, &req)
     };
     let other = format!("http://localhost:{port}");
     for (h, origin, cookie, check) in [
@@ -11652,7 +11683,7 @@ fn an_allowed_tailnet_host_without_armed_sharing_trusts_no_header() {
     let with_cookie: Vec<String> = headers
         .iter()
         .cloned()
-        .chain([format!("Cookie: {}", s.cookie)])
+        .chain([format!("Cookie: {}", s.cookie), s.key_header()])
         .collect();
     let wref: Vec<&str> = with_cookie.iter().map(String::as_str).collect();
     let (code, _, body) = http_write(
@@ -12105,7 +12136,7 @@ fn bogus_sign_ins_never_lock_the_operator_out() {
     }
     let link = op::login_link(bin(), &d.state(), port, &[]).unwrap();
     let (code, _, body) = op::exchange(port, &host, &op::nonce_of(&link));
-    assert_eq!(code, 204, "{body}");
+    assert_eq!(code, 200, "{body}");
 }
 
 /// The daemon's own session checks, end to end over the socket: a
@@ -12121,15 +12152,20 @@ fn the_daemon_binds_sessions_to_their_origin_and_refuses_agents() {
     let port = start_ui(pm.path().to_path_buf(), d.state());
     let s = sign_in(&d.state(), port);
     let token = s.cookie.split_once('=').unwrap().1.to_string();
-    let check = |origin: &str| {
+    let check = |origin: &str, key: &str| {
         d.rpc(
             "operator_session_check",
-            json!({"token": token, "origin": origin}),
+            json!({"token": token, "key": key, "origin": origin}),
         )["valid"]
             .clone()
     };
-    assert_eq!(check("loopback"), true);
-    assert_eq!(check("tailnet"), false);
+    assert_eq!(check("loopback", &s.key), true);
+    assert_eq!(check("tailnet", &s.key), false);
+    assert_eq!(
+        check("loopback", ""),
+        false,
+        "the token alone is no session"
+    );
     // A tailnet link, exchanged directly as loopback.
     std::fs::write(
         d.state().join("ui.json"),
@@ -12169,4 +12205,191 @@ fn the_daemon_binds_sessions_to_their_origin_and_refuses_agents() {
     let (code, _, body) = op::exchange(port, &op::board_host(port), &nonce);
     assert_eq!(code, 403, "{body}");
     assert!(body.contains("already_used"), "{body}");
+}
+
+// --- CAD-313 review round 2 (PR #249): the second credential ---
+
+/// A session is the cookie AND the page's `X-Cadence-Session` key,
+/// together: either alone is refused, both are the operator.
+#[test]
+fn a_session_needs_the_cookie_and_the_page_key() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let d = UiDaemon::start_on(state.path().to_path_buf());
+    let port = start_ui(pm.path().to_path_buf(), d.state());
+    let s = sign_in(&d.state(), port);
+    let before = commits(pm.path());
+    let full = s.request("PATCH", "/api/issues/CAD-3", r#"{"priority":"P0"}"#);
+    let cookie_line = format!("Cookie: {}\r\n", s.cookie);
+    let key_line = format!("{}\r\n", s.key_header());
+    for (what, req) in [
+        ("cookie without key", full.replacen(&key_line, "", 1)),
+        ("key without cookie", full.replacen(&cookie_line, "", 1)),
+        (
+            "cookie with another session's key",
+            full.replacen(&s.key, &"ab".repeat(32), 1),
+        ),
+    ] {
+        assert_ne!(req, full, "{what}: the request did not change");
+        let (code, _, body) = op::raw(port, &req);
+        assert_eq!(code, 403, "{what}: {body}");
+        assert_eq!(check_of(&body), "operator_session_required", "{what}");
+    }
+    assert_eq!(commits(pm.path()), before, "a half session wrote");
+    let (code, _, body) = op::raw(port, &full);
+    assert_eq!(code, 200, "both: {body}");
+    // meta agrees: signed in only with both.
+    let host = op::board_host(port);
+    let cookie_h = format!("Cookie: {}", s.cookie);
+    assert_eq!(meta_with(port, &host, &[&cookie_h])["signed_in"], false);
+    assert_eq!(
+        meta_with(port, &host, &[&cookie_h, &s.key_header()])["signed_in"],
+        true
+    );
+}
+
+/// The round-2 probe: a worker's comment links to
+/// `http://cadence-<board port>.localhost:<its port>/…`; the operator's
+/// browser follows it and sends the board's cookie there (cookies
+/// ignore ports). The agent's listener captures what the browser sends —
+/// the cookie, never the page's key, which lives in the board origin's
+/// `sessionStorage` — and hands it to a `setsid -f env -i` child of its
+/// pane. The replay is refused on an agent-allowed route (a comment) and
+/// an operator-only one (model defaults), and nothing is written.
+#[test]
+fn a_cookie_leaked_to_another_port_is_worthless_alone() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let d = UiDaemon::start_on(state.path().to_path_buf());
+    let port = start_ui(pm.path().to_path_buf(), d.state());
+    let s = sign_in(&d.state(), port);
+    // The agent's listener on another port, and what the browser sends
+    // it for `http://cadence-<port>.localhost:<other>/preview`.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let other = listener.local_addr().unwrap().port();
+    let browser = thread::spawn(move || {
+        let mut c = TcpStream::connect(("127.0.0.1", other)).unwrap();
+        write!(
+            c,
+            "GET /preview HTTP/1.1\r\nHost: cadence-{port}.localhost:{other}\r\n\
+             Sec-Fetch-Site: same-site\r\nCookie: {}\r\n\r\n",
+            s.cookie
+        )
+        .unwrap();
+    });
+    let (mut conn, _) = listener.accept().unwrap();
+    let mut seen = Vec::new();
+    let mut buf = [0u8; 1024];
+    while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+        let n = conn.read(&mut buf).unwrap();
+        assert!(n > 0, "the browser hung up early");
+        seen.extend_from_slice(&buf[..n]);
+    }
+    browser.join().unwrap();
+    let captured = String::from_utf8_lossy(&seen).to_string();
+    let stolen = captured
+        .lines()
+        .find_map(|l| l.strip_prefix("Cookie: "))
+        .unwrap()
+        .to_string();
+    assert!(
+        !captured.contains(&s.key),
+        "the listener must never see the key: {captured}"
+    );
+
+    let host = op::board_host(port);
+    let doc = r#"{"expected_revision":0,"config":{"schema":1,"providers":{}}}"#;
+    let before = commits(pm.path());
+    for (n, (path, body)) in [
+        (
+            "/api/issues/CAD-3/comments",
+            r#"{"body":"as the operator"}"#,
+        ),
+        ("/api/settings/model-defaults", doc),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let out = work.path().join(format!("reply-{n}"));
+        let req = op::request(
+            "POST",
+            path,
+            &host,
+            Some(&format!("http://{host}")),
+            Some(&stolen),
+            body,
+        );
+        let script = r#"PANE=$$ setsid -f env -i PATH="$PATH" PANE=$$ PORT="$PORT" REQ="$REQ" OUT="$OUT" bash -c '
+            while p=$$; true; do
+                on=0; while [ "$p" -gt 1 ]; do [ "$p" = "$PANE" ] && on=1 && break
+                    p=$(awk "/^PPid:/{print \$2}" /proc/$p/status) || break; done
+                [ $on = 0 ] && break; sleep 0.02; done
+            exec 3<>"/dev/tcp/127.0.0.1/$PORT"; printf "%s" "$REQ" >&3
+            cat <&3 >"$OUT.tmp" && mv "$OUT.tmp" "$OUT"' </dev/null >/dev/null 2>&1"#;
+        as_pane_child(
+            &d,
+            &format!("pane-l{n}"),
+            script,
+            &[
+                ("PORT", port.to_string()),
+                ("REQ", req),
+                ("OUT", out.display().to_string()),
+            ],
+        );
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !out.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the detached child never answered"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+        let reply = std::fs::read_to_string(&out).unwrap();
+        assert!(reply.contains(" 403 "), "{path}: {reply}");
+        assert!(
+            reply.contains("operator_session_required"),
+            "{path}: {reply}"
+        );
+    }
+    assert_eq!(commits(pm.path()), before, "the replay wrote");
+    let current: Value =
+        serde_json::from_str(&http(port, "GET", "/api/settings/model-defaults", &host).1).unwrap();
+    assert_eq!(current["revision"], 0, "{current}");
+}
+
+/// Review round 2 (3): with NO live agent, the board used to skip the
+/// socket check and read any peer as "tied to no agent". A full session
+/// replayed hit-and-run (its socket closed at once) is still
+/// unattributable, and refused: nothing is written.
+#[test]
+fn an_early_closed_replay_with_no_live_agent_writes_nothing() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let d = UiDaemon::start_on(state.path().to_path_buf());
+    let port = start_ui(pm.path().to_path_buf(), d.state());
+    let before = commits(pm.path());
+    for n in 0..3 {
+        let s = sign_in(&d.state(), port);
+        let req = s.request(
+            "POST",
+            "/api/issues/CAD-3/comments",
+            &format!(r#"{{"body":"no agent, hit and run {n}"}}"#),
+        );
+        let status = Command::new("bash")
+            .args([
+                "-c",
+                r#"exec 3<>"/dev/tcp/127.0.0.1/$PORT"; printf '%s' "$REQ" >&3; exec 3>&-"#,
+            ])
+            .env("PORT", port.to_string())
+            .env("REQ", req)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        thread::sleep(Duration::from_millis(500));
+        assert_eq!(commits(pm.path()), before, "attempt {n} wrote");
+    }
 }

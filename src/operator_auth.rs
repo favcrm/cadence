@@ -353,6 +353,11 @@ impl LinkRefusal {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Row {
     hash: String,
+    /// `sha256(key)` of the session's second credential — the value the
+    /// page sends as `X-Cadence-Session`. A row without one (written
+    /// before it existed) never matches.
+    #[serde(default)]
+    key_hash: String,
     origin: Origin,
     created: i64,
     last_used: i64,
@@ -398,9 +403,16 @@ pub struct SessionView {
 }
 
 /// A freshly opened session: the token goes to the board once, for its
-/// `Set-Cookie`, and is never stored or returned again.
+/// `Set-Cookie`, and the key once, for the page — neither is stored or
+/// returned again.
 pub struct Opened {
     pub token: String,
+    /// The session's second credential (review round 2, PR #249): the
+    /// page keeps it in `sessionStorage` — scoped to its exact origin,
+    /// port included — and sends it as `X-Cadence-Session` on every
+    /// write. A cookie leaked to another port's listener is worthless
+    /// without it, and a cross-site request cannot set the header.
+    pub key: String,
     pub session: SessionView,
 }
 
@@ -541,8 +553,10 @@ impl Auth {
 
     fn create(&mut self, origin: Origin, user_agent: &str, now: i64) -> Result<Opened> {
         let token = random_credential()?;
+        let key = random_credential()?;
         let row = Row {
             hash: digest(&token),
+            key_hash: digest(&key),
             origin,
             created: now,
             last_used: now,
@@ -552,24 +566,41 @@ impl Auth {
         let session = row.view();
         self.sessions.push(row);
         self.persist()?;
-        Ok(Opened { token, session })
+        Ok(Opened {
+            token,
+            key,
+            session,
+        })
     }
 
-    /// The live session `token` names on `origin`, touching its idle
-    /// clock. A token presented on the other origin is no session there.
-    pub fn check(&mut self, token: &str, origin: Origin, now: i64) -> Result<Option<SessionView>> {
+    /// The live session `token` AND `key` name together on `origin`,
+    /// touching its idle clock. Either credential alone — or a pair
+    /// presented on the other origin — is no session.
+    pub fn check(
+        &mut self,
+        token: &str,
+        key: &str,
+        origin: Origin,
+        now: i64,
+    ) -> Result<Option<SessionView>> {
         let mut dirty = self.prune(now);
-        if !well_formed(token) {
+        if !well_formed(token) || !well_formed(key) {
             if dirty {
                 self.persist()?;
             }
             return Ok(None);
         }
         let hash = digest(token);
+        let key_hash = digest(key);
         let found = self
             .sessions
             .iter_mut()
-            .find(|r| same_credential(&r.hash, &hash) && r.origin == origin)
+            .find(|r| {
+                // Both compared in full, whatever the first says.
+                let token_ok = same_credential(&r.hash, &hash);
+                let key_ok = same_credential(&r.key_hash, &key_hash);
+                token_ok & key_ok && r.origin == origin
+            })
             .map(|row| {
                 if now - row.last_used >= TOUCH_EVERY_SECS {
                     row.last_used = now;
@@ -807,6 +838,44 @@ mod tests {
         assert!(auth.open(&live, Origin::Loopback, "ua", T0).is_ok());
     }
 
+    /// Both credentials, together: the cookie's token alone, the page's
+    /// key alone, or a key from another session are no session.
+    #[test]
+    fn a_session_needs_its_token_and_its_key() {
+        let s = state();
+        let mut auth = Auth::load(s.path());
+        let a = opened(&mut auth, Origin::Loopback, T0);
+        let b = opened(&mut auth, Origin::Loopback, T0);
+        let none = "0".repeat(64);
+        assert!(auth
+            .check(&a.token, &a.key, Origin::Loopback, T0)
+            .unwrap()
+            .is_some());
+        assert!(auth
+            .check(&a.token, "", Origin::Loopback, T0)
+            .unwrap()
+            .is_none());
+        assert!(auth
+            .check(&a.token, &none, Origin::Loopback, T0)
+            .unwrap()
+            .is_none());
+        assert!(auth
+            .check(&a.token, &b.key, Origin::Loopback, T0)
+            .unwrap()
+            .is_none());
+        assert!(auth
+            .check(&a.key, &a.key, Origin::Loopback, T0)
+            .unwrap()
+            .is_none());
+        assert!(auth
+            .check("", &a.key, Origin::Loopback, T0)
+            .unwrap()
+            .is_none());
+        // Only hashes are kept, of both.
+        let text = fs::read_to_string(dir(s.path()).join(SESSIONS)).unwrap();
+        assert!(!text.contains(&a.key) && text.contains(&digest(&a.key)));
+    }
+
     /// A session is bound to its origin, idles out and ends absolutely.
     #[test]
     fn sessions_check_origin_idle_and_absolute_expiry() {
@@ -814,13 +883,16 @@ mod tests {
         let mut auth = Auth::load(s.path());
         let o = opened(&mut auth, Origin::Loopback, T0);
         assert!(auth
-            .check(&o.token, Origin::Loopback, T0)
+            .check(&o.token, &o.key, Origin::Loopback, T0)
             .unwrap()
             .is_some());
-        assert!(auth.check(&o.token, Origin::Tailnet, T0).unwrap().is_none());
+        assert!(auth
+            .check(&o.token, &o.key, Origin::Tailnet, T0)
+            .unwrap()
+            .is_none());
         // Idle: untouched for 24 h is gone.
         assert!(auth
-            .check(&o.token, Origin::Loopback, T0 + IDLE_SECS)
+            .check(&o.token, &o.key, Origin::Loopback, T0 + IDLE_SECS)
             .unwrap()
             .is_none());
         // Absolute: used every hour, still gone after 7 days.
@@ -829,12 +901,12 @@ mod tests {
         while now + 3600 < T0 + ABSOLUTE_SECS {
             now += 3600;
             assert!(auth
-                .check(&o.token, Origin::Loopback, now)
+                .check(&o.token, &o.key, Origin::Loopback, now)
                 .unwrap()
                 .is_some());
         }
         assert!(auth
-            .check(&o.token, Origin::Loopback, T0 + ABSOLUTE_SECS)
+            .check(&o.token, &o.key, Origin::Loopback, T0 + ABSOLUTE_SECS)
             .unwrap()
             .is_none());
     }
@@ -855,7 +927,7 @@ mod tests {
         let mut reloaded = Auth::load(s.path());
         assert_eq!(
             reloaded
-                .check(&o.token, Origin::Loopback, T0 + 1)
+                .check(&o.token, &o.key, Origin::Loopback, T0 + 1)
                 .unwrap()
                 .map(|v| v.id),
             Some(o.session.id)
@@ -872,22 +944,28 @@ mod tests {
         let c = opened(&mut auth, Origin::Tailnet, T0);
         assert!(auth.revoke_token(&a.token).unwrap());
         assert!(auth
-            .check(&a.token, Origin::Loopback, T0)
+            .check(&a.token, &a.key, Origin::Loopback, T0)
             .unwrap()
             .is_none());
         assert!(auth
-            .check(&b.token, Origin::Loopback, T0)
+            .check(&b.token, &b.key, Origin::Loopback, T0)
             .unwrap()
             .is_some());
         assert_eq!(auth.revoke_id(&b.session.id).unwrap(), 1);
         assert!(auth
-            .check(&b.token, Origin::Loopback, T0)
+            .check(&b.token, &b.key, Origin::Loopback, T0)
             .unwrap()
             .is_none());
-        assert!(auth.check(&c.token, Origin::Tailnet, T0).unwrap().is_some());
+        assert!(auth
+            .check(&c.token, &c.key, Origin::Tailnet, T0)
+            .unwrap()
+            .is_some());
         let pending = auth.mint(Origin::Loopback, T0).unwrap();
         assert_eq!(auth.revoke_all().unwrap(), 1);
-        assert!(auth.check(&c.token, Origin::Tailnet, T0).unwrap().is_none());
+        assert!(auth
+            .check(&c.token, &c.key, Origin::Tailnet, T0)
+            .unwrap()
+            .is_none());
         let err = auth.open(&pending, Origin::Loopback, "ua", T0);
         assert_eq!(err_kind(&err), Some(LinkRefusal::AlreadyUsed));
     }
