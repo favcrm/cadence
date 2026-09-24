@@ -36,7 +36,8 @@ export function planGoal(body: string | null | undefined): string | null {
   return goal ? goal : null;
 }
 
-export function planView(detail: IssueDetail, readOnly: boolean): PlanView | null {
+/** `block` is why this board cannot write (read-only, not signed in), or null. */
+export function planView(detail: IssueDetail, block: string | null): PlanView | null {
   const plan = detail.plan;
   if (!plan) return null;
   const tickets = Array.isArray(plan.tickets) ? plan.tickets : [];
@@ -54,8 +55,8 @@ export function planView(detail: IssueDetail, readOnly: boolean): PlanView | nul
     percent: typeof ratio === "number" ? Math.round(ratio * 100) : null,
     done: tickets.filter((t) => t.status === "done").length,
     total: tickets.filter((t) => t.status !== "dropped").length,
-    canDecide: proposed && !readOnly,
-    blockedReason: proposed && readOnly ? "board is read-only — decide from a writable board or `cadence plan approve`" : null,
+    canDecide: proposed && !block,
+    blockedReason: proposed && block ? `${block} Or decide with cadence plan approve.` : null,
   };
 }
 

@@ -289,10 +289,10 @@ async function main() {
       "offline",
       "daemon down",
     );
-    equal(composerBlock(false, { kind: "running", state: "idle" }), null, "may send");
-    const ro = composerBlock(true, { kind: "running", state: "idle" }) ?? "";
-    equal(ro.includes("read-only"), true, "read-only reason");
-    const absent = composerBlock(false, { kind: "absent" }) ?? "";
+    equal(composerBlock(null, { kind: "running", state: "idle" }), null, "may send");
+    const ro = composerBlock("The board is read-only.", { kind: "running", state: "idle" }) ?? "";
+    equal(ro.includes("read-only"), true, "the board's reason comes first");
+    const absent = composerBlock(null, { kind: "absent" }) ?? "";
     equal(absent.includes("cadence master start"), true, "what to run");
   }
   console.log("thread checks passed");

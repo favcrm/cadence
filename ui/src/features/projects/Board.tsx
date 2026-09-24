@@ -1,3 +1,4 @@
+import { useWriteBlock } from "../auth/WriteGate";
 import { useState } from "react";
 import { api, type WriteResp } from "../../lib/api";
 import { boardHeadline, boardScope, boardVisible, issueCounts } from "../../lib/counts";
@@ -287,6 +288,7 @@ export default function Board({
   onError,
   onAgents,
 }: Props) {
+  const block = useWriteBlock(readOnly);
   const [over, setOver] = useState<string | null>(null);
   const issues = issuesState.data ?? [];
   const loaded = issuesState.data !== null;
@@ -741,7 +743,7 @@ export default function Board({
         source: {health?.pm_dir ?? "~/pm"} issue folders ·{" "}
         /var/www/agent-notes chains · cadence daemon socket ·{" "}
         {readOnly
-          ? "read-only — writes are disabled."
+          ? `writes are disabled — ${block}`
           : `writes commit as ${actor}.`}
       </footer>
     </main>

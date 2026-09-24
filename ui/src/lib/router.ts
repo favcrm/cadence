@@ -14,6 +14,7 @@ import { readAppUrlState, type AppTab, type ProjectView } from "./urlState";
  *   /agents[/:alias]           agents, optionally one agent's drawer
  *   /setup                     first-run setup
  *   /settings[/memory]         model defaults, memory
+ *   /login                     a `cadence ui login` link lands here
  *
  * Query parameters carry the rest: `project` (the scope on screens whose
  * path has no slug), `issue` (the open issue drawer, on any screen),
@@ -32,6 +33,7 @@ export type Route =
   | { screen: "agents"; alias: string | null }
   | { screen: "setup" }
   | { screen: "settings"; section: SettingsSection }
+  | { screen: "login" }
   | { screen: "notFound"; path: string };
 
 export type Screen = Route["screen"];
@@ -82,6 +84,7 @@ export function matchRoute(pathname: string): Route {
       if (alias) return { screen: "agents", alias };
     }
     if (head === "setup" && !a) return { screen: "setup" };
+    if (head === "login" && !a) return { screen: "login" };
     if (head === "overview" && !a) return { screen: "overview" };
     if (head === "settings" && !b) {
       if (!a) return { screen: "settings", section: "models" };
@@ -104,6 +107,8 @@ export function routePath(route: Route): string {
       return route.alias ? `/agents/${encodeURIComponent(route.alias)}` : "/agents";
     case "setup":
       return "/setup";
+    case "login":
+      return "/login";
     case "overview":
       return "/overview";
     case "settings":

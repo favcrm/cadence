@@ -1,4 +1,6 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useContext, useEffect, useMemo, useState } from "react";
+import { READ_ONLY_REASON } from "../auth/gate";
+import { WriteGate } from "../auth/WriteGate";
 import { api, ApiError } from "../../lib/api";
 import { canonicalJson } from "./modelDefaultsCompare";
 import { modelIdProblem } from "./modelId";
@@ -158,7 +160,9 @@ export default function ModelDefaults() {
     [snapshot, drafts],
   );
   const dirty = snapshot ? canonicalJson(built) !== canonicalJson(snapshot.config) : false;
-  const readOnly = Boolean(snapshot?.read_only);
+  // Read-only board, or not signed in as the operator (CAD-313).
+  const gate = useContext(WriteGate);
+  const readOnly = Boolean(snapshot?.read_only) || gate !== null;
   const frozen = saving || readOnly;
 
   const problems = useMemo(() => {
@@ -261,7 +265,9 @@ export default function ModelDefaults() {
                 </span>
               )}
             {readOnly && (
-              <span className="chip bg-warn/10 text-warn">read-only board</span>
+              <span className="chip bg-warn/10 text-warn" title={gate ?? READ_ONLY_REASON}>
+                {snapshot?.read_only ? "read-only board" : "sign in to edit"}
+              </span>
             )}
             {dirty && <span className="chip bg-accent/15 text-accent">unsaved draft</span>}
             {saving && <span className="text-ink-400">Saving…</span>}
