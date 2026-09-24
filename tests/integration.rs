@@ -44454,12 +44454,16 @@ fn cad384_operator_attributed_sends_need_proof() {
     d.wait_message("chat", "t2", &["completed"], 20);
 }
 
-/// CAD-384 acceptance 1: `shutdown` (daemon stop) refuses a detached
-/// child of an agent and an agent that does not hold the rollout lease;
-/// the lease holder's pane may stop it (the rollout owner's
-/// `daemon restart` from its pane), as may the operator.
+/// CAD-384 acceptance 1 + round-1 I1/I3: `shutdown` (daemon stop)
+/// refuses a detached child of an agent and any agent that is not the
+/// rollout lease holder under a live OPERATOR GRANT. An agent cannot
+/// grant itself, cannot claim the lease without a grant, and a revoked
+/// grant blocks both the claim and the shutdown. A refused `daemon
+/// restart` from the holder's pane reports the refusal and records no
+/// `rollout_restart_proceeded`.
 #[test]
-fn cad384_shutdown_needs_the_operator_or_the_rollout_holder() {
+fn cad384_shutdown_needs_the_operator_or_a_granted_rollout_holder() {
+    use cadence_agent::rollout::{claim, resolve_caller_with, unix_now, ClaimRequest};
     let d = TestDaemon::start();
     let mut p = guard_panes(&d);
     let before = db_snapshot(&d);
@@ -44467,25 +44471,83 @@ fn cad384_shutdown_needs_the_operator_or_the_rollout_holder() {
     assert_refused_clean(&d, &before, &r, "detached shutdown");
     let r = p.pm.rpc(&d.state, "shutdown", json!({}));
     assert_refused_clean(&d, &before, &r, "pm shutdown without the lease");
-    assert!(d.rpc("health", json!({})).is_ok());
 
-    let caller = cadence_agent::rollout::resolve_caller_with(Some("pm"), None).unwrap();
-    cadence_agent::rollout::claim(
-        &d.state,
-        &cadence_agent::rollout::ClaimRequest {
-            caller: &caller,
-            reason: "cad384 probe",
-            target: None,
-            ttl: Duration::from_secs(600),
-            takeover: false,
-            now: cadence_agent::rollout::unix_now(),
-        },
-    )
-    .unwrap();
+    // Grants are the operator's: an agent is refused, writing nothing.
+    for method in ["rollout_grant", "rollout_revoke"] {
+        let before = db_snapshot(&d);
+        let r = p.pm.rpc(&d.state, method, json!({"agent": "pm"}));
+        assert_eq!(r["ok"], false, "{method}: {r}");
+        assert!(frame_err(&r).contains("operator action"), "{method}: {r}");
+        assert_eq!(before, db_snapshot(&d), "{method}: a refusal wrote");
+        let r = unprovable_rpc(&d, method, json!({"agent": "pm"}));
+        assert_eq!(r["ok"], false, "detached {method}: {r}");
+    }
+
+    let pm = resolve_caller_with(Some("pm"), None).unwrap();
+    let claim_pm = || {
+        claim(
+            &d.state,
+            &ClaimRequest {
+                caller: &pm,
+                reason: "cad384 probe",
+                target: None,
+                ttl: Duration::from_secs(600),
+                takeover: false,
+                now: unix_now(),
+            },
+        )
+    };
+    // No grant: the agent's claim is refused.
+    let e = claim_pm().unwrap_err().to_string();
+    assert!(e.contains("holds no rollout grant"), "{e}");
+    // Granted, then revoked: still refused.
+    d.operator_rpc("rollout_grant", json!({"agent": "pm"}))
+        .unwrap();
+    d.operator_rpc("rollout_revoke", json!({"agent": "pm"}))
+        .unwrap();
+    let e = claim_pm().unwrap_err().to_string();
+    assert!(e.contains("holds no rollout grant"), "{e}");
+    // Granted: the claim lands.
+    d.operator_rpc("rollout_grant", json!({"agent": "pm", "until_secs": 3600}))
+        .unwrap();
+    claim_pm().unwrap();
+    let status = cadence_agent::rollout::status(&d.state).unwrap();
+    assert_eq!(status["grants"][0]["alias"], "pm", "{status}");
+    // Another agent is not the holder.
     let r = p.pm2.rpc(&d.state, "shutdown", json!({}));
     assert_eq!(r["ok"], false, "pm2 is not the holder: {r}");
+
+    // The grant revoked while pm still holds the lease: its pane's
+    // `daemon restart` is refused by the daemon — named as such, not
+    // "not running" — and nothing records the restart as proceeding.
+    d.operator_rpc("rollout_revoke", json!({"agent": "pm"}))
+        .unwrap();
+    let (rc, out) = p.pm.run(&format!(
+        "CADENCE_ALIAS=pm {} --state-dir {} daemon restart",
+        env!("CARGO_BIN_EXE_cadence"),
+        d.state.display()
+    ));
+    assert_ne!(rc, 0, "{out}");
+    assert!(out.contains("caller rule"), "{out}");
+    assert!(!out.contains("does not answer the socket"), "{out}");
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    let proceeded: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM events WHERE kind='rollout_restart_proceeded'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(proceeded, 0, "a refused restart recorded proceeding");
+    assert!(d.rpc("health", json!({})).is_ok());
     let r = p.pm.rpc(&d.state, "shutdown", json!({}));
-    assert_eq!(r["ok"], true, "the lease holder's pane: {r}");
+    assert_eq!(r["ok"], false, "a revoked grant: {r}");
+
+    // Granted again: the holder's pane stops the daemon.
+    d.operator_rpc("rollout_grant", json!({"agent": "pm"}))
+        .unwrap();
+    let r = p.pm.rpc(&d.state, "shutdown", json!({}));
+    assert_eq!(r["ok"], true, "the granted holder's pane: {r}");
 }
 
 /// CAD-384: the operator's `cadence daemon stop` from a plain shell

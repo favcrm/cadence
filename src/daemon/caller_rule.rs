@@ -63,8 +63,9 @@ pub(crate) enum Rule {
         default: Option<&'static str>,
     },
     /// `shutdown`: the operator, or the agent holding the live rollout
-    /// lease (the rollout owner's `daemon restart` from its pane); in a
-    /// sandbox, also a caller tied to none of its agents.
+    /// lease under a live operator grant (the rollout owner's `daemon
+    /// restart` from its pane); in a sandbox, also a caller tied to none
+    /// of its agents.
     Shutdown,
     /// A mutation with no connection check yet — each names why and
     /// its follow-up. The table test pins this list.
@@ -281,6 +282,14 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         Rule::Handler("proven_operator (CAD-339)"),
     ),
     (
+        "rollout_grant",
+        Rule::Handler("operator_connection (CAD-384)"),
+    ),
+    (
+        "rollout_revoke",
+        Rule::Handler("operator_connection (CAD-384)"),
+    ),
+    (
         "project_new",
         Rule::Handler("caller_is_master or operator_connection (CAD-358)"),
     ),
@@ -308,10 +317,14 @@ impl Rule {
 pub(crate) struct Facts {
     /// [`Rule::OnAgent`]: the target agent and its own PM.
     pub(crate) target: Option<(String, Option<String>)>,
-    /// [`Rule::Shutdown`]: the live rollout lease holder.
+    /// [`Rule::Shutdown`]: the live rollout lease holder, when it also
+    /// holds a live operator grant (`rollout::granted_lease_holder`).
     pub(crate) lease_holder: Option<String>,
-    /// [`Rule::Shutdown`]: this daemon serves a sandbox (CAD-310).
-    pub(crate) sandbox: bool,
+    /// [`Rule::Shutdown`], [`Rule::OnAgent`]: this daemon serves a
+    /// sandbox (CAD-310) and the caller is tied to none of its agents
+    /// (`Shared::sandbox_outsider`) — e.g. `sandbox down` run from a
+    /// production agent's pane.
+    pub(crate) sandbox_outsider: bool,
 }
 
 /// The verb as refusals name it: `agent_stop` → `agent stop`.
@@ -335,8 +348,16 @@ pub(crate) fn admit(
     let verb = verb(method);
     let alias = match who {
         Who::Unproven(why) => {
-            if rule == Rule::Shutdown && facts.sandbox {
-                return Ok(None);
+            // A sandbox's owner running `sandbox down` from a production
+            // pane: tied to none of the sandbox's agents (CAD-310/384).
+            if facts.sandbox_outsider {
+                match rule {
+                    Rule::Shutdown => return Ok(None),
+                    Rule::OnAgent(..) => {
+                        return Ok(Some(("by", json!("operator (sandbox)"))));
+                    }
+                    _ => {}
+                }
             }
             return Err(format!(
                 "{verb} refused: this connection derives no agent identity and is \
@@ -363,11 +384,21 @@ pub(crate) fn admit(
             None | Some(Value::Null) => {}
             Some(v) if v.as_str() == Some(alias) => {}
             Some(v) => {
+                // The CLI of an agent whose env lost `CADENCE_ALIAS`
+                // defaults `--by`/`--owner` to the operator.
+                let hint = if v.as_str() == Some("operator") {
+                    format!(
+                        "; drop `--{field} operator` (and set CADENCE_ALIAS={alias}) — the \
+                         daemon records the caller itself"
+                    )
+                } else {
+                    String::new()
+                };
                 return Err(format!(
                     "{verb} refused: agent '{alias}' is attributed to itself — request \
                      field '{field}' names {v}, and an agent never acts as another \
-                     agent or as the operator (caller rule, CAD-384)"
-                ))
+                     agent or as the operator{hint} (caller rule, CAD-384)"
+                ));
             }
         }
     }
@@ -375,9 +406,11 @@ pub(crate) fn admit(
         Rule::Shutdown => match facts.lease_holder.as_deref() {
             Some(holder) if holder == alias => Ok(None),
             holder => Err(format!(
-                "{verb} refused: agent '{alias}' does not hold the rollout lease \
-                 (holder: {}) — the daemon is stopped by the operator or by the \
-                 rollout owner (`cadence rollout claim`) (caller rule, CAD-384)",
+                "{verb} refused: agent '{alias}' does not hold the rollout lease under \
+                 a live operator grant (granted holder: {}) — the daemon is stopped by \
+                 the operator, or by the rollout owner the operator granted \
+                 (`cadence rollout grant {alias}`, then `cadence rollout claim`) \
+                 (caller rule, CAD-384)",
                 holder.unwrap_or("none")
             )),
         },
@@ -449,6 +482,10 @@ mod tests {
 
     fn detached() -> Who {
         Who::Unproven("pid 7 on its ancestry carries CADENCE_ALIAS".into())
+    }
+
+    fn p_facts() -> Facts {
+        Facts::default()
     }
 
     /// Facts for a request on `tgt`, a worker in pm's group.
@@ -619,7 +656,7 @@ mod tests {
         assert!(e.contains("holder: pm"), "{e}");
         assert!(admit("shutdown", Rule::Shutdown, &detached(), &p, &holder).is_err());
         let sandbox = Facts {
-            sandbox: true,
+            sandbox_outsider: true,
             ..Facts::default()
         };
         assert_eq!(
@@ -627,6 +664,27 @@ mod tests {
             Ok(None)
         );
         assert!(admit("shutdown", Rule::Shutdown, &agent("w1"), &p, &sandbox).is_err());
+        // The sandbox outsider may also stop and resume the sandbox's
+        // agents (`sandbox down`), recorded as the sandbox's operator;
+        // an unproven caller outside a sandbox still may not.
+        let stop = Rule::OnAgent(Target::Alias, SelfService);
+        assert_eq!(
+            admit("agent_stop", stop, &detached(), &p, &sandbox),
+            Ok(Some(("by", json!("operator (sandbox)"))))
+        );
+        assert!(admit("agent_stop", stop, &detached(), &p, &Facts::default()).is_err());
+        // Attributed and handler rules get no sandbox exemption.
+        assert!(admit("task_fail", BY_OPERATOR, &detached(), &p, &sandbox).is_err());
+        // An agent naming the operator is told to drop the flag.
+        let e = admit(
+            "task_fail",
+            BY_OPERATOR,
+            &agent("w1"),
+            &json!({"by": "operator"}),
+            &p_facts(),
+        )
+        .unwrap_err();
+        assert!(e.contains("drop `--by operator`"), "{e}");
         assert_eq!(
             admit(
                 "shutdown",

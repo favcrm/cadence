@@ -2284,6 +2284,8 @@ impl Shared {
             "epic_stage" => self.rpc_epic_stage(params, peer_pid),
             "project_work_approve" => self.rpc_project_work_approve(params, peer_pid),
             "project_new" => self.rpc_project_new(params, peer_pid),
+            "rollout_grant" => self.rpc_rollout_grant(params, peer_pid),
+            "rollout_revoke" => self.rpc_rollout_revoke(params, peer_pid),
             "project_work_approvals" => Ok(json!({
                 "approvals": self.store.work_approvals()?,
             })),
@@ -2947,6 +2949,56 @@ impl Shared {
         })
     }
 
+    /// CAD-384: in a sandbox daemon only, a caller tied to NONE of the
+    /// sandbox's agents — the shape of `cadence sandbox down` run from a
+    /// production agent's pane, whose `CADENCE_ALIAS` names no sandbox
+    /// agent. It is unproven only because of production's pane env; in
+    /// its own disposable sandbox it may stop agents and the daemon.
+    /// Tied means any of: a pane or enrolled endpoint of this daemon on
+    /// its ancestry, a descendant of this daemon (everything it
+    /// launched), a pane's pty on its stdio, or a `CADENCE_ALIAS` on any
+    /// hop that names an agent registered here. Anything unreadable is
+    /// tied (fail closed).
+    fn sandbox_outsider(&self, peer_pid: u32) -> bool {
+        if !crate::rollout::sandbox_exempt(&self.state_dir) {
+            return false;
+        }
+        let Some(chain) = adapter::pty::caller_chain(peer_pid) else {
+            return false;
+        };
+        let me = std::process::id();
+        if chain.iter().skip(1).any(|&hop| hop == me) {
+            return false;
+        }
+        let Ok(facts) = self.store.pty_endpoint_facts() else {
+            return false;
+        };
+        let panes: HashMap<u32, String> = facts
+            .into_iter()
+            .map(|(alias, (_, pane_pid, _))| (pane_pid, alias))
+            .collect();
+        {
+            let slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+            if chain.iter().any(|hop| {
+                panes.contains_key(hop) || slots.nearest_enrolled_root(&[*hop]).is_some()
+            }) {
+                return false;
+            }
+        }
+        let ties = PeerTies::probe(peer_pid);
+        if !ties.walked()
+            || !ties
+                .agents(panes.iter().map(|(pid, alias)| (alias.as_str(), *pid)))
+                .is_empty()
+        {
+            return false;
+        }
+        chain.iter().all(|&hop| match proc_env_alias(hop) {
+            None => true,
+            Some(alias) => matches!(self.store.agent_opt(&alias), Ok(None)),
+        })
+    }
+
     /// CAD-384: apply `method`'s caller rule ([`caller_rule::RULES`])
     /// before it runs. `Ok(Some(params))` is the request with its
     /// attribution field stamped to the caller; a refusal happens
@@ -2978,10 +3030,10 @@ impl Shared {
                 facts.target = Some((alias, self.effective_pm(&agent)?));
             }
             (Rule::Shutdown, Who::Agent(_)) => {
-                facts.lease_holder = crate::rollout::live_holder(&self.state_dir)?;
+                facts.lease_holder = crate::rollout::granted_lease_holder(&self.state_dir)?;
             }
-            (Rule::Shutdown, Who::Unproven(_)) => {
-                facts.sandbox = crate::rollout::sandbox_exempt(&self.state_dir);
+            (Rule::Shutdown | Rule::OnAgent(..), Who::Unproven(_)) => {
+                facts.sandbox_outsider = self.sandbox_outsider(peer_pid);
             }
             _ => {}
         }
@@ -3568,6 +3620,23 @@ impl Shared {
         }
         reject_identity_fields(&fields, verb)?;
         self.operator_connection(verb, &fields, peer_pid)
+    }
+
+    /// `rollout_grant` (CAD-384) — the operator lets `agent` claim the
+    /// rollout lease, and so stop this daemon from its own pane while it
+    /// holds it. Operator only, by the connection; `until_secs` bounds
+    /// the grant. Recorded as a `rollout_grant` event.
+    fn rpc_rollout_grant(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.operator_connection("rollout grant", params, peer_pid)?;
+        let agent = required_str(params, "agent")?;
+        let until = optional_u64(params, "until_secs").map(|secs| epoch_secs() + secs as f64);
+        crate::rollout::grant(&self.state_dir, agent, until, "operator")
+    }
+
+    /// `rollout_revoke` (CAD-384) — end `agent`'s grant. Operator only.
+    fn rpc_rollout_revoke(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.operator_connection("rollout revoke", params, peer_pid)?;
+        crate::rollout::revoke(&self.state_dir, required_str(params, "agent")?, "operator")
     }
 
     /// `approval_record` — persist an operator's merge approval for one
@@ -8728,6 +8797,16 @@ fn reject_operator_fields(verb: &str, params: &Value) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The `CADENCE_ALIAS` in `pid`'s environment, if readable and set.
+fn proc_env_alias(pid: u32) -> Option<String> {
+    let env = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    env.split(|b| *b == 0)
+        .filter_map(|kv| std::str::from_utf8(kv).ok())
+        .find_map(|kv| kv.strip_prefix("CADENCE_ALIAS="))
+        .filter(|a| !a.is_empty())
+        .map(str::to_string)
 }
 
 fn reject_identity_fields(params: &Value, verb: &str) -> Result<()> {

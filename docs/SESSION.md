@@ -603,9 +603,18 @@ In this order:
    `daemon restart` is advisory. The daemon's own `shutdown` is not
    (CAD-384): it admits the proven operator — a shell outside every
    pane, `--as operator:<name>` / `CADENCE_ROLLOUT_AS` — or the agent
-   that holds the live rollout lease, from its own pane. Any other
-   agent's `daemon stop`/`restart` is refused, so a pane-run rollout
-   owner claims the lease first even for a same-build restart. The before/after table
+   that holds the live rollout lease **under an operator grant**, from
+   its own pane. The operator grants the rollout owner once, from a
+   shell outside every pane: `cadence rollout grant ops-1 [--until 7d]`
+   (recorded as a `rollout_grant` event, listed by `rollout status`);
+   `cadence rollout revoke ops-1` ends it. Without a live grant an
+   agent's `rollout claim` is refused, and a lease it holds (a handoff,
+   a grant since revoked or expired) does not let its pane stop the
+   daemon. Any other agent's `daemon stop`/`restart` is refused — the
+   restart names the refusal and records no `rollout_restart_proceeded`
+   — so a pane-run rollout owner holds a grant and claims the lease
+   first, even for a same-build restart. `--ui` restarts the board
+   without the pane's `CADENCE_ALIAS`: the board is the operator's. The before/after table
    shows each agent's state, pane pid, and `TURN` — `kept` when a
    running pty turn was re-adopted (same token, same pane, no fence),
    `fenced` when it could not be proven and went `unknown`, `-` for
