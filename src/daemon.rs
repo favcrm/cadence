@@ -4906,30 +4906,50 @@ impl Shared {
             Some(h) => proto::identifier(h, "Request handle")?,
             None => Uuid::new_v4().simple().to_string(),
         };
+        // A handle names one agent's request until that agent's wait
+        // collects the answer (CAD-452). `agent respond` parks the
+        // answer and drops the pending entry, so the mailbox is checked
+        // too: a peer re-opening an answered handle under its own alias
+        // would own it, the owner's wait would be refused, and the
+        // operator's accept would reach the provider as a deny. Check
+        // and insert share one scope, locked in respond's order
+        // (pending → answered), so no respond or open lands between.
         {
-            let pending = self.pending.lock().unwrap();
-            if let Some(req) = pending.get(&handle) {
-                if req.alias == alias {
-                    return Ok(json!({"request": handle, "state": "waiting_input",
-                                     "existing": true}));
+            let mut pending = self.pending.lock().unwrap();
+            let answered = self.answered.lock().unwrap();
+            let held = pending
+                .get(&handle)
+                .map(|req| (&req.alias, "waiting_input", "already pending for"))
+                .or_else(|| {
+                    answered
+                        .get(&handle)
+                        .map(|(owner, _)| (owner, "answered", "holding an answer parked for"))
+                });
+            if let Some((owner, state, what)) = held {
+                if *owner == alias {
+                    // The owner's retry: its wait collects any answer.
+                    return Ok(json!({"request": handle, "state": state, "existing": true}));
                 }
-                return Err(Error::rejected(
-                    "Request handle is already pending for another agent",
-                ));
+                return Err(Error::rejected(format!(
+                    "request_open refused: handle '{handle}' is {what} '{owner}' — a \
+                     handle names one agent's request until that agent's wait collects \
+                     its answer (CAD-452)"
+                )));
             }
-        }
-        self.pending.lock().unwrap().insert(
-            handle.clone(),
-            PendingRequest {
-                alias: alias.clone(),
-                // No provider request id — the answer parks in
-                // `answered` for `request_wait`, never `adapter.respond`.
-                id: Value::Null,
-                method: format!("cadence/{kind}"),
-                params: json!({"kind": kind, "tool": tool,
+            drop(answered);
+            pending.insert(
+                handle.clone(),
+                PendingRequest {
+                    alias: alias.clone(),
+                    // No provider request id — the answer parks in
+                    // `answered` for `request_wait`, never `adapter.respond`.
+                    id: Value::Null,
+                    method: format!("cadence/{kind}"),
+                    params: json!({"kind": kind, "tool": tool,
                                "input_summary": input_summary, "input": input}),
-            },
-        );
+                },
+            );
+        }
         // Requests only arrive mid-turn; relax/stop may have moved the
         // agent on already — never clobber a non-busy state.
         let _ = self
