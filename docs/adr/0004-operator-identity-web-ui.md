@@ -98,7 +98,7 @@ get more.**
 | Adversary | Reach today | What this ADR must achieve |
 |---|---|---|
 | **Same-uid agent, ordinary behaviour** (curl from a pane, a `setsid` child, a scrubbed env, its own tmux server, a double fork) | Writes as `operator (ui)` (F1). Can forge a tailnet login (F2). Can call ungated daemon RPCs (F3). | **No operator authority by any process shape.** It is refused on operator-only routes and attributed to its pane (or refused) on agent-allowed routes. This is the target of acceptance item 2. |
-| **Same-uid agent, deliberate credential theft** (it reads the operator secret file, *and* evades `operator_proof` via `setsid -f` with a scrubbed env and stdio) | Not applicable today (there is nothing to steal, because the default already grants operator). | **Phase 1: overt, multi-step and detected (§5.10), not prevented.** **Phase 2 (§5.11): prevented** by making the file unreadable from agent process trees. |
+| **Same-uid agent, deliberate credential theft** (it reads the operator secret file, *and* passes `operator_proof` — by evasion, `setsid -f` with a scrubbed env and stdio, or with no evasion at all when cadence never launched it: an agent CLI the operator started by hand passes as it is; see §12) | Not applicable today (there is nothing to steal, because the default already grants operator). | **Phase 1: overt, multi-step and detected (§5.10), not prevented.** **Phase 2 (§5.11): prevented** by making the file unreadable from agent process trees. |
 | **Same-uid agent that reads the operator's browser cookie store** | Not applicable | Possible only when the browser runs on this host as this uid. It is not possible for a tailnet or ssh-tunnel browser (F4). This is stated as a residual. |
 | **Agent-authored content rendered in the operator's browser** (issue bodies, comments, artifacts in the SPA) | XSS would reach nothing that a curl could not already reach | **This becomes the most important path once a cookie exists.** Script that runs on the board origin can *ride* the session, even though it cannot read an HttpOnly cookie. The CSP (`ui.rs` `CSP`, no inline script), the markdown sanitiser, and the forced download of html/svg artifacts move from defence in depth to load-bearing. The security review must re-audit them. |
 | **Cross-site page in the operator's browser** (CSRF) | Blocked by the four guards | Unchanged guards. In addition, `Origin` becomes **mandatory** on any request that carries the session cookie, and the cookie is `SameSite=Strict`. |
@@ -956,20 +956,57 @@ enforcement the acceptance note asked for:
 **Departures.**
 
 - Credentials are 32 random bytes as lowercase hex, not base64url.
-- The cookie name carries the board port (`cadence_operator_<port>`,
-  `__Host-cadence_operator_<port>` on the tailnet), so two boards on one
-  host (production and a sandbox) do not overwrite each other's cookie.
+- **Each board has its own host, `cadence-<port>.localhost`** (review
+  round 1, PR #249). `cadence.localhost` alone is shared by every port,
+  and cookies ignore ports: the reviewer's headless Chrome sent a
+  session cookie set on `:3141` to a sandbox board on `:3142` and a
+  plain server on `:3143`. The link now points at the board's own name,
+  the Host/Origin allowlists carry it, and loopback sessions are opened
+  and honoured on that Host only. The cookie name also carries the port.
+  Residual: a server that listens on another port can receive the
+  cookie only if the browser is sent to `cadence-<port>.localhost:<its
+  port>` by name.
 - A cookie-bearing write must send `Origin`, and it must equal the
   request's own scheme and Host, not merely an allowlisted origin.
-- Operator-only routes keep the positive process proof on the HTTP peer
-  (`prove_operator_peer`) in addition to the session. The §5.6 table
-  alone would grant `Err`-attributed peers; the repo rule is that the
-  board is never less strict than the daemon verb it relays. The cost:
-  an operator browser whose peer fails `operator_proof` (another uid's
-  relay) is refused on those routes and uses the CLI.
+- **`WRITE_ROUTES` is enforced, not documentation** (review round 1):
+  `write_route` admits every write by its class before any handler, and
+  the handlers check no caller. Operator-only means the session plus
+  `prove_operator_peer`; the §5.6 table alone would grant `Err`-attributed
+  peers, and the repo rule is that the board is never less strict than
+  the daemon verb it relays. Model defaults and thread messages had
+  skipped the proof in round 1; they no longer can.
+- **Unattributable counts as the operator only for another uid's live
+  socket** (review round 1). The §5.6 row "valid session + `Err` →
+  operator" let a pane replay a stolen cookie and close its socket at
+  once (`exec 3>&-`), leaving the board nothing to attribute: it
+  committed as `operator (ui)` three times out of three. Now a
+  session-bearing peer the board cannot attribute is refused unless
+  its client socket is still listed and belongs to another uid (sshd's
+  or tailscaled's). `POST /api/session` attributes the peer before the
+  exchange under the same rule.
+- **The daemon's `operator_session_open` runs the agent check itself**
+  (review round 1): the verb is open to any socket caller, so an agent
+  with a leaked nonce could skip the board. A connection that derives an
+  agent (pane or enrolled managed endpoint) spends the nonce and gets no
+  session — which also means a board an agent started opens none.
+- **No failed-login rate limit** (review round 1). Round 1 had a global
+  budget of 10 failures a minute; anyone could spend it with no
+  credential, over HTTP or the socket verb, and lock the operator's
+  fresh link out. A nonce is 256 random bits, so the limit bought
+  nothing. It is gone.
 - A session is bound to its origin at the daemon. A request whose Host
   names the tailnet but fails the tailnet proof has no origin, so no
   session can be used or opened on it.
+- CAD-432's `/api/meta?operator=1` hint now requires the session; the
+  session itself is reported as `signed_in`.
+- **`ssh -L`.** The operator can sign in through a tunnel (open
+  `http://cadence-<port>.localhost:<port>` on the laptop end), and
+  agent-allowed writes work. Operator-only routes also run
+  `operator_proof` on the HTTP peer, which is then the host's per-user
+  `sshd` process: its environment is often unreadable (non-dumpable),
+  which the proof refuses. Operator decisions through `ssh -L` may
+  therefore be refused `operator_proof`; use the tailnet share or the
+  CLI (`cadence plan approve`, `cadence delivery merge`, …) there.
 - Not built in this phase: the inotify detection of §5.10 (the
   `operator_link_rejected` and `operator_session_from_agent` daemon
   events are recorded with `alert: true`, but are not yet projected onto
@@ -980,4 +1017,19 @@ enforcement the acceptance note asked for:
   connection gate (`operator_connection`, CAD-337) and do not also take
   the forwarded session.
 - TS3 (the hairpin probe) was not run: it needs the real tailnet, which
-  this lane may not touch. It remains for the security review.
+  this lane may not touch. It stays operator-run.
+
+**The residual, stated precisely (§1.3 as implemented).** Minting a
+link needs `operator_proof` and the secret. `operator_proof` catches a
+process that cadence launched or that sits in a registered pane or
+managed endpoint's tree; it does **not** catch a same-uid process
+cadence never launched. The reviewer ran `cadence ui login` from its
+own Claude Code shell — an agent the operator started by hand, not
+registered with this daemon — and got a link with no evasion at all.
+Such a process can also read the secret. So in phase 1 the operator
+session keeps every cadence-launched agent and every detach of one
+(unless it also evades the proof) off operator authority, and stops
+relays, forged headers and cookie replays; it does not stop an
+unregistered same-uid agent that chooses to sign in. Phase 2 (CAD-280)
+must make the secret unreadable to every agent process tree, registered
+or not.

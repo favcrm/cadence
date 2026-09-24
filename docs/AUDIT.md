@@ -218,12 +218,24 @@ board writes, `slot_reconcile` and these verbs alike.
 Board writes moved first (CAD-313, ADR 0004 phase 1): the board's
 operator is the holder of a session opened with a `cadence ui login`
 link, and minting that link needs this same proof **plus** the
-operator secret file. The residual carries over, narrowed: a same-uid
-process must now both read `<state>/operator/secret` and pass the proof
-by `setsid -f` with a scrubbed env and stdio
-(`operator_secret_theft_residual_pinned` pins it). Phase 2 under CAD-280
-makes the secret unreadable to agent process trees. These audit verbs
-do not take the secret yet (ADR 0004 §12, Q7).
+operator secret file. The residual carries over: a same-uid process
+that reads `<state>/operator/secret` and passes the proof can mint a
+link. A process cadence launched (a pane, a managed endpoint, a runner,
+anything the daemon started) must evade the proof — `setsid -f` with a
+scrubbed env and stdio (`operator_secret_theft_residual_pinned` pins
+it). **A same-uid process cadence never launched needs no evasion at
+all**: an agent CLI the operator started by hand, outside every
+registered pane, passes the proof as it is (the PR #249 reviewer minted
+a link from its own Claude Code shell), and can read the file. Phase 1
+therefore stops cadence-launched agents, relays, forged headers and
+cookie replays (including one that hangs up early to escape
+attribution); it does not stop an unregistered same-uid agent that
+chooses to sign in. Phase 2 under CAD-280 makes the secret unreadable
+to every agent process tree. Other decisions recorded in ADR 0004 §12:
+the session cookie lives on the board's own `cadence-<port>.localhost`
+name (a cookie on a shared host reached every port), and there is no
+failed-login rate limit (a shared budget let an agent lock the operator
+out). These audit verbs do not take the secret yet (ADR 0004 §12, Q7).
 
 **Approvals are operator claims, not proof — until CAD-280.** Two
 gaps mean a bound record cannot prove the operator approved:
