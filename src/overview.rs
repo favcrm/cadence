@@ -146,6 +146,10 @@ pub fn cmd_agent_show(alias: &str) -> String {
     format!("cadence agent show {alias}")
 }
 
+pub fn cmd_agent_resume(alias: &str) -> String {
+    format!("cadence agent resume {alias}")
+}
+
 /// The menu-answer command for a pty pane probing `approval_menu` —
 /// `<choice>` is the option's printed index on the open menu.
 pub fn cmd_agent_answer(alias: &str) -> String {
@@ -2334,7 +2338,27 @@ fn agent_items(a: &Value, probe: &AgentProbe, project: &str, now: i64) -> Vec<It
     // Condition clocks (CAD-253): a daemon-measured age is a start
     // time; `updated` is not — any params/model write moves it.
     let secs_ago = |key: &str| a[key].as_f64().map(|s| now - s as i64);
-    if a["state"].as_str() == Some("attention") {
+    // CAD-413: an auto-resume for queued work failed — the agent is
+    // down with a message waiting. The more specific row: it replaces
+    // the generic `fenced` row a failed open would otherwise raise.
+    let resume_failed = &a["auto_resume_failed"];
+    if resume_failed.is_object() {
+        let at = resume_failed["at"].as_f64().map(|at| at as i64);
+        items.push(
+            row(
+                30,
+                "auto_resume_failed",
+                &format!(
+                    "agent {alias} auto-resume failed — message {} waiting: {}",
+                    resume_failed["message"].as_str().unwrap_or("?"),
+                    resume_failed["reason"].as_str().unwrap_or("unknown error"),
+                ),
+                at.map_or(age, |at| now - at),
+                &cmd_agent_resume(alias),
+            )
+            .since(at),
+        );
+    } else if a["state"].as_str() == Some("attention") {
         items.push(
             row(
                 30,
@@ -3455,6 +3479,28 @@ mod tests {
             assert_eq!(out[0]["audience"], "operator", "{}", out[0]);
             assert_eq!(out[0]["audience_reason"], "operator decision");
         }
+    }
+
+    /// CAD-413: a failed auto-resume is one row naming the agent and
+    /// the waiting message, clocked from the failure — it replaces the
+    /// generic `fenced` row the failed open left in `attention`.
+    #[test]
+    fn failed_auto_resume_names_agent_and_waiting_message() {
+        let (mut w1, probe) = fenced_worker(120);
+        w1["auto_resume_failed"] = json!({
+            "at": (NOW - 300) as f64, "message": "m-wait", "queued": 1,
+            "reason": "fake open refused", "resume": "cadence agent resume w1",
+        });
+        let pm = pm_row(false, "idle");
+        let out = resolve(agent_items(&w1, &probe, "cadence", NOW), &[w1.clone(), pm]);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0]["kind"], "auto_resume_failed", "{}", out[0]);
+        let title = out[0]["title"].as_str().unwrap();
+        assert!(title.contains("agent w1"), "{title}");
+        assert!(title.contains("message m-wait waiting"), "{title}");
+        assert!(title.contains("fake open refused"), "{title}");
+        assert_eq!(out[0]["command"], "cadence agent resume w1");
+        assert_eq!(out[0]["since"], NOW - 300, "{}", out[0]);
     }
 
     /// The clock is when the issue entered its status, not its age: an

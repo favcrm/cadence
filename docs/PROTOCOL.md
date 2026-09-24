@@ -430,6 +430,34 @@ agent back. `health` reports `agent_auto_stop`: the effective bound,
 per-provider overrides, `warning`, the last check, `last_stopped`,
 `stopped_total`, and `last_kept` — why each live agent was kept.
 
+**Auto-resume on queued work (CAD-413).** An auto-stop parks an agent;
+it does not dismiss it. The agent's durable stop reason is the newest
+of its `agent_auto_stopped`, `stop_requested`, `ready`,
+`agent_auto_resumed` and `agent_auto_resume_failed` events, so it
+survives a daemon restart. On every stall-watch tick the daemon looks
+for `stopped` agents with a queued message (nudges excluded); one whose
+stop reason is still `agent_auto_stopped` records `agent_auto_resumed`
+(`message` — the oldest waiting, `queued`, `auto_stopped_at`, `reason`)
+and is resumed through the `agent resume` path, and its actor delivers
+the queue as usual (the pty ready gate still applies). Whatever path
+queued the message — a send, a routed result, a job dispatch — and
+whether it was queued before a restart, the result is the same. An
+operator or PM `agent stop` (before or after an auto-stop) writes
+`stop_requested` and supersedes the marker: that agent stays stopped
+and the message waits. The daemon re-checks the marker, records the
+resume and starts the agent under the lifecycle lock that `agent stop`
+takes before it writes `stop_requested`. A stop racing the sweep
+therefore always wins: in flight or finished, the resume declines
+quietly, with no event and no needs-me row. A resume that was recorded
+but never started (the daemon died in between) is reported as failed on
+the next sweep. A resume that is refused at start or whose open
+never reaches `ready` records `agent_auto_resume_failed` (`message`,
+`queued`, `reason`, `resume`) and is not retried; `agent_show` and
+`agent_list` then carry `auto_resume_failed`, and the Overview raises
+an `auto_resume_failed` needs-me row naming the agent and the waiting
+message, with `cadence agent resume <alias>` as the command. It
+replaces the generic `fenced` row. An operator resume or stop clears it.
+
 A fenced
 agent with no endpoint prints the `devin -r <session>` resume hint from
 its launch summary.

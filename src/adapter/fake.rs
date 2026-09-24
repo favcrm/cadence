@@ -19,6 +19,9 @@
 //!   prompt then ends with a `SHA: <hex>` trailer line, the managed-
 //!   endpoint reporting convention (`message result` is never called).
 //! - anything else — `FAKE_REPLY: <prompt>`.
+//!
+//! Agent param `fake_open_fail_if: <path>` — `open` fails while that
+//! file exists (a provider/session error on resume, for tests).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -66,6 +69,14 @@ impl FakeAdapter {
 
 impl ProviderAdapter for FakeAdapter {
     fn open(&self, agent: &Agent) -> Result<Identity> {
+        let fail_if = agent
+            .params
+            .as_ref()
+            .and_then(|p| p.get("fake_open_fail_if"))
+            .and_then(Value::as_str);
+        if let Some(path) = fail_if.filter(|p| std::path::Path::new(p).exists()) {
+            return Err(Error::provider(format!("fake open refused: {path} exists")));
+        }
         Ok(Identity {
             thread_id: format!("fake-thread-{}", agent.alias),
             session_id: format!("fake-session-{}", agent.alias),

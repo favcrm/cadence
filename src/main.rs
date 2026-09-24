@@ -9518,6 +9518,7 @@ mod tests {
         for cmd in [
             ov::cmd_agent_unfence("w1"),
             ov::cmd_agent_show("w1"),
+            ov::cmd_agent_resume("w1"),
             ov::cmd_inbox("pm"),
             ov::cmd_agent_respond("w1", "abc123", "cadence/approval"),
             ov::cmd_agent_respond("w1", "abc123", "item/commandExecution/requestApproval"),

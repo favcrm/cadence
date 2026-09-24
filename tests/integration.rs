@@ -37385,8 +37385,18 @@ fn auto_stop_daemon(
     setting: daemon::AutoStopSetting,
 ) -> (TestDaemon, std::sync::Arc<std::sync::atomic::AtomicI64>) {
     let offset = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
-    let o = std::sync::Arc::clone(&offset);
-    let d = TestDaemon::start_opts(daemon::ServeOptions {
+    let d = TestDaemon::start_opts(auto_stop_opts(setting, &offset));
+    (d, offset)
+}
+
+/// Daemon options with idle auto-stop pinned to `setting` on a clock
+/// at wall time plus `offset` seconds.
+fn auto_stop_opts(
+    setting: daemon::AutoStopSetting,
+    offset: &std::sync::Arc<std::sync::atomic::AtomicI64>,
+) -> daemon::ServeOptions {
+    let o = std::sync::Arc::clone(offset);
+    daemon::ServeOptions {
         auto_stop: Some(setting),
         auto_stop_clock: Some(std::sync::Arc::new(move || {
             SystemTime::now()
@@ -37396,8 +37406,7 @@ fn auto_stop_daemon(
                 + o.load(std::sync::atomic::Ordering::SeqCst) as f64
         })),
         ..daemon_opts()
-    });
-    (d, offset)
+    }
 }
 
 fn auto_stop_status(d: &TestDaemon) -> Value {
@@ -38017,6 +38026,174 @@ fn dispatch_warns_on_empty_acceptance() {
         })
         .count();
     assert_eq!(warned, 1, "{issue}");
+}
+
+// ---- CAD-413: work queued for an auto-stopped agent resumes it ----
+
+/// The stop reason is durable: across a daemon restart, a message for
+/// the agent the idle timer stopped resumes it and is delivered, while
+/// an operator/PM-stopped agent — including one stopped by hand after
+/// its auto-stop — stays stopped with the message queued.
+#[test]
+fn auto_resume_after_restart_only_for_the_timers_stop() {
+    let root = TempDir::new().unwrap();
+    let state = root.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let offset = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+    {
+        let d = TestDaemon::start_on_opts(
+            state.clone(),
+            auto_stop_opts(daemon::AutoStopSetting::idle_after(3600), &offset),
+        );
+        d.register_inbox("pm");
+        for alias in ["w-auto", "w-op", "w-both"] {
+            register_fake_opts(&d, alias, json!({"upstream": "pm"}));
+            d.wait_agent(alias, "idle", 20);
+        }
+        // An operator/PM stop before the timer could act.
+        d.rpc("agent_stop", json!({"alias": "w-op"})).unwrap();
+        offset.store(7200, std::sync::atomic::Ordering::SeqCst);
+        wait_auto_stopped(&d, "w-auto");
+        wait_auto_stopped(&d, "w-both");
+        offset.store(0, std::sync::atomic::Ordering::SeqCst);
+        // A manual stop after the auto-stop supersedes it.
+        d.rpc("agent_stop", json!({"alias": "w-both"})).unwrap();
+        let both = d.rpc("agent_show", json!({"alias": "w-both"})).unwrap()["agent"].clone();
+        assert!(both["auto_stopped"].is_null(), "{both}");
+    }
+    // A fresh daemon — auto-stop pinned off — reads the stop reasons
+    // back from the durable event streams.
+    let d = TestDaemon::start_on(state.clone());
+    for alias in ["w-auto", "w-op", "w-both"] {
+        assert_eq!(d.wait_agent(alias, "stopped", 10)["state"], "stopped");
+    }
+    for (alias, id) in [("w-op", "m-op"), ("w-both", "m-both"), ("w-auto", "m-auto")] {
+        d.rpc(
+            "agent_send",
+            json!({"alias": alias, "text": "work", "message": id}),
+        )
+        .unwrap();
+    }
+    // The auto-stopped agent resumes on its saved thread and delivers.
+    let done = d.wait_message("w-auto", "m-auto", &["completed"], 20);
+    assert_eq!(done["state"], "completed", "{done}");
+    let agent = d.wait_agent("w-auto", "idle", 10);
+    assert_eq!(agent["enabled"], true, "{agent}");
+    assert_eq!(agent["thread_id"], "fake-thread-w-auto", "{agent}");
+    assert!(agent["auto_stopped"].is_null(), "{agent}");
+    let resumed = d.wait_event("w-auto", "agent_auto_resumed", 5);
+    assert_eq!(resumed["payload"]["message"], "m-auto", "{resumed}");
+    assert_eq!(resumed["payload"]["queued"], 1, "{resumed}");
+    let kinds = event_kinds(&d, "w-auto");
+    let pos = |k: &str| kinds.iter().rposition(|x| x == k).unwrap();
+    assert!(
+        pos("agent_auto_stopped") < pos("agent_auto_resumed")
+            && pos("agent_auto_resumed") < pos("ready"),
+        "{kinds:?}"
+    );
+    // The sweep that resumed w-auto read every stopped agent's queue
+    // after m-op and m-both were enqueued — and left both alone.
+    for (alias, id) in [("w-op", "m-op"), ("w-both", "m-both")] {
+        let agent = d.rpc("agent_show", json!({"alias": alias})).unwrap()["agent"].clone();
+        assert_eq!(agent["state"], "stopped", "{alias}: {agent}");
+        assert_eq!(agent["enabled"], false, "{alias}: {agent}");
+        assert_eq!(d.message_state(alias, id), "queued", "{alias}");
+        let kinds = event_kinds(&d, alias);
+        assert!(
+            !kinds.iter().any(|k| k.starts_with("agent_auto_resume")),
+            "{alias}: {kinds:?}"
+        );
+    }
+}
+
+/// A resume that fails at open (a provider/session error) does not
+/// fail silently: the agent is named with its waiting message on an
+/// Overview needs-me row, it is not retried, and an operator resume
+/// clears the row and delivers. A healthy auto-stopped peer resumes
+/// and delivers in the same daemon.
+#[test]
+fn auto_resume_failure_raises_needs_me_row_naming_the_message() {
+    let (d, offset) = auto_stop_daemon(daemon::AutoStopSetting::idle_after(3600));
+    d.register_inbox("pm");
+    let flag = d.dir.path().join("open-fails");
+    register_fake_opts(
+        &d,
+        "w-fail",
+        json!({"upstream": "pm", "fake_open_fail_if": flag.to_str().unwrap()}),
+    );
+    register_fake_opts(&d, "w-ok", json!({"upstream": "pm"}));
+    for alias in ["w-fail", "w-ok"] {
+        d.wait_agent(alias, "idle", 20);
+    }
+    offset.store(7200, std::sync::atomic::Ordering::SeqCst);
+    wait_auto_stopped(&d, "w-fail");
+    wait_auto_stopped(&d, "w-ok");
+    offset.store(0, std::sync::atomic::Ordering::SeqCst);
+
+    std::fs::write(&flag, "").unwrap();
+    for (alias, id) in [("w-fail", "m-fail"), ("w-ok", "m-ok")] {
+        d.rpc(
+            "agent_send",
+            json!({"alias": alias, "text": "work", "message": id}),
+        )
+        .unwrap();
+    }
+    d.wait_message("w-ok", "m-ok", &["completed"], 20);
+    let failed = d.wait_event("w-fail", "agent_auto_resume_failed", 20);
+    assert_eq!(failed["payload"]["message"], "m-fail", "{failed}");
+    assert!(
+        failed["payload"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("fake open refused"),
+        "{failed}"
+    );
+    let agent = d.wait_agent("w-fail", "attention", 10);
+    assert_eq!(agent["auto_resume_failed"]["message"], "m-fail", "{agent}");
+    assert_eq!(d.message_state("w-fail", "m-fail"), "queued");
+
+    let home = TempDir::new().unwrap();
+    let view = overview_at(home.path(), &d.state, None, &[]);
+    let needs = view["needs_me"].as_array().unwrap();
+    let row = needs
+        .iter()
+        .find(|n| n["kind"] == "auto_resume_failed")
+        .unwrap_or_else(|| panic!("no auto_resume_failed row: {needs:?}"));
+    let title = row["title"].as_str().unwrap();
+    assert!(
+        title.contains("agent w-fail") && title.contains("message m-fail waiting"),
+        "{row}"
+    );
+    assert_eq!(row["command"], "cadence agent resume w-fail", "{row}");
+    assert!(
+        !needs
+            .iter()
+            .any(|n| n["kind"] == "fenced" && n["title"].as_str().unwrap().contains("w-fail")),
+        "{needs:?}"
+    );
+    // Not retried: one resume attempt, however many ticks passed.
+    let attempts = event_kinds(&d, "w-fail")
+        .iter()
+        .filter(|k| *k == "agent_auto_resumed")
+        .count();
+    assert_eq!(attempts, 1);
+
+    // The operator fixes the cause and resumes: the row clears and the
+    // waiting message is delivered.
+    std::fs::remove_file(&flag).unwrap();
+    d.rpc("agent_resume", json!({"alias": "w-fail"})).unwrap();
+    d.wait_message("w-fail", "m-fail", &["completed"], 20);
+    let agent = d.wait_agent("w-fail", "idle", 10);
+    assert!(agent["auto_resume_failed"].is_null(), "{agent}");
+    let view = overview_at(home.path(), &d.state, None, &[]);
+    assert!(
+        !view["needs_me"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["kind"] == "auto_resume_failed"),
+        "{view}"
+    );
 }
 
 // ---- CAD-335: board writes from a managed endpoint's processes ----
