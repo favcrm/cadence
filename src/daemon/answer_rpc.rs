@@ -14,20 +14,22 @@
 //!   routed by an agent, a detached child with no identity, or a request
 //!   carrying any field but `issue` and `report` sends nothing;
 //! - the answer must be a valid stored report naming a question on the
-//!   same ticket, and the question's FIRST answer — a later answer to a
-//!   question already answered is filed but routes nothing, so no
-//!   answerer (the master included) gets a free-text channel to a past
-//!   asker; the message goes only to that question's recorded author;
-//! - the message id is the daemon's own `sys-answer-<hash>` of the
-//!   answer's path, so a retried answer (the tracker returns the same
-//!   file for identical content) or a concurrent second call queues
-//!   nothing new. Only an identical message — to the asker, source
-//!   `answer`, same text, no `reply_to` — counts as that duplicate; any
-//!   other holder of the id (a squat) is recorded `answer_undeliverable`
-//!   and refused as an error, never a silent duplicate. Reserving `sys-` against callers is CAD-445's (#250);
+//!   same ticket; the message goes only to that question's recorded
+//!   author;
+//! - ONE message per question: the id is the daemon's own
+//!   `sys-answer-<hash>` of the QUESTION's path, so the store's unique
+//!   id lets exactly one answer through — the first to route, whatever
+//!   the file names, same-second answers or concurrent routes. A later
+//!   answer is filed but answers `{sent:false, why:"already answered"}`,
+//!   so no answerer (the master included) gets a free-text channel to a
+//!   past asker. A retried answer is the identical message: a duplicate.
+//!   Any other holder of the id (a squat) is recorded
+//!   `answer_undeliverable` and refused as an error, never a silent
+//!   duplicate. Reserving `sys-` ids and daemon sources against callers
+//!   is CAD-445's (#250);
 //! - the message owes nobody a report: it is queued with no `reply_to`,
 //!   so it never routes a result to the asker's PM;
-//! - an asker that is no longer registered is recorded once per answer
+//! - an asker that is no longer registered is recorded once per question
 //!   as `answer_undeliverable` on the daemon stream; the answer itself
 //!   stands.
 
@@ -55,10 +57,10 @@ const CLIP_MARK_MAX: usize = 48;
 /// The message source an answer is queued under.
 pub(super) const SOURCE: &str = "answer";
 
-/// The message id an answer is queued under — one per answer file, in
-/// the daemon's `sys-` namespace (CAD-445).
-pub(super) fn message_id(project: &str, issue: &str, report: &str) -> String {
-    let path = format!("{project}/{issue}/{}/{report}", task_report::DIR);
+/// The message id an answer is queued under — one per QUESTION (its
+/// report file), in the daemon's `sys-` namespace (CAD-445).
+pub(super) fn message_id(project: &str, issue: &str, question: &str) -> String {
+    let path = format!("{project}/{issue}/{}/{question}", task_report::DIR);
     let hash: String = Sha256::digest(path.as_bytes())
         .iter()
         .take(8)
@@ -189,18 +191,6 @@ impl Shared {
                 ))
             })?;
         let asker = asked["agent"].as_str().unwrap_or_default().to_string();
-        // Only the question's first answer reaches the asker.
-        let first = asked["answered_by"]
-            .as_array()
-            .and_then(|a| a.first())
-            .and_then(Value::as_str);
-        if first != Some(report) {
-            return Ok(json!({"sent": false, "to": asker, "why": format!(
-                "already answered — {question} was first answered by {}; a later answer \
-                 is filed but not sent",
-                first.unwrap_or("another report")
-            )}));
-        }
         let path = pm_dir
             .join(&project.key)
             .join(issue)
@@ -208,7 +198,10 @@ impl Shared {
             .join(report)
             .display()
             .to_string();
-        let mid = message_id(&project.key, issue, report);
+        // One message per QUESTION: the id is the question's, so the
+        // store's unique id lets exactly one answer through — whichever
+        // routes first, however many answers share a second or race.
+        let mid = message_id(&project.key, issue, question);
         let facts = json!({"issue": issue, "question": question, "answer": report,
                            "to": asker, "by": by, "message": mid});
         if asker == by {
@@ -238,8 +231,18 @@ impl Shared {
                 if e.to_string()
                     .contains("already used with different content") =>
             {
-                // A squat: another message holds the answer's id. Never a
-                // silent duplicate — record it and refuse loudly.
+                // Another answer to this question was sent first.
+                let answered = self
+                    .store
+                    .message(&mid)?
+                    .is_some_and(|m| m.source == SOURCE && m.alias == asker);
+                if answered {
+                    return Ok(json!({"sent": false, "to": asker, "message": mid, "why":
+                        format!("already answered — {asker} was told another answer to \
+                                 {question}; this one is filed but not sent")}));
+                }
+                // A squat: another message holds the question's id. Never
+                // a silent duplicate — record it and refuse loudly.
                 let why = format!(
                     "message id {mid} is already taken by a different message — {asker} \
                      was not told; the answer stands"
@@ -258,7 +261,8 @@ impl Shared {
                   "duplicate": duplicate, "state": state}))
     }
 
-    /// Record once per answer (its message id) that it reached nobody.
+    /// Record once per question (its message id) that an answer reached
+    /// nobody.
     fn undeliverable(&self, facts: Value, why: &str) {
         let _one = UNDELIVERABLE.lock().unwrap_or_else(|e| e.into_inner());
         let mid = facts["message"].as_str().unwrap_or_default();
@@ -282,7 +286,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn message_id_is_one_per_answer_file() {
+    fn message_id_is_one_per_question_file() {
         let a = message_id("demo", "D-1", "20260924T000000Z-operator.md");
         assert_eq!(a, message_id("demo", "D-1", "20260924T000000Z-operator.md"));
         assert_ne!(a, message_id("demo", "D-1", "20260924T000001Z-operator.md"));

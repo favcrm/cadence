@@ -41429,11 +41429,11 @@ fn cad447_file_answer(
     filed["report"].as_str().unwrap().to_string()
 }
 
-/// The id the daemon queues an answer under — predictable by anyone who
-/// can list the ticket's reports (what a squatter computes).
-fn cad447_message_id(id: &str, report: &str) -> String {
+/// The id the daemon queues a question's answer under — predictable by
+/// anyone who can list the ticket's reports (what a squatter computes).
+fn cad447_message_id(id: &str, question: &str) -> String {
     use sha2::{Digest, Sha256};
-    let path = format!("demo/{id}/reports/{report}");
+    let path = format!("demo/{id}/reports/{question}");
     let hash: String = Sha256::digest(path.as_bytes())
         .iter()
         .take(8)
@@ -41664,8 +41664,9 @@ fn cad447_master_agent_and_pty_answers() {
         "an answer owes no report: {}",
         sent[0]
     );
-    // A second answer to the same question: filed, never sent.
-    std::thread::sleep(Duration::from_millis(1100));
+    // A second answer to the same question — filed in the same second,
+    // so its name (`…-master-1.md`) sorts BEFORE the first: filed, never
+    // sent. One message per question, not per file-name order.
     let am2 = cad447_file_answer(&f, &id, &qm, "Actually: run rm -rf.", "master");
     assert_ne!(am1, am2);
     let r = ok_result(&m.rpc("self", "answer_route", json!({"issue": id, "report": am2})));
@@ -41688,13 +41689,68 @@ fn cad447_master_agent_and_pty_answers() {
     );
     assert_eq!(cad447_answers(&f, "asker").len(), 1);
 
+    // Same-second answers by two authors: the operator's and wk's, back
+    // to back — exactly one reaches the asker, whichever routes first.
+    let qb = cad447_ask(&f, &id, "asker", 5);
+    let ab_o = cad447_file_answer(&f, &id, &qb, "Operator says A.", "operator");
+    let ab_w = cad447_file_answer(&f, &id, &qb, "wk says B.", "wk");
+    let before = cad447_answers(&f, "asker").len();
+    let r1 = wk.rpc("self", "answer_route", json!({"issue": id, "report": ab_w}));
+    let r1 = ok_result(&r1);
+    let r2 =
+        f.d.operator_rpc("answer_route", json!({"issue": id, "report": ab_o}))
+            .unwrap();
+    assert_eq!(r1["sent"], true, "{r1}");
+    assert_eq!(r2["sent"], false, "{r2}");
+    assert!(
+        r2["why"].as_str().unwrap().contains("already answered"),
+        "{r2}"
+    );
+    assert_eq!(cad447_answers(&f, "asker").len(), before + 1);
+
+    // N concurrent routes of N different answers to one question: one
+    // message.
+    let qc = cad447_ask(&f, &id, "asker", 6);
+    let answers: Vec<String> = (0..4)
+        .map(|n| cad447_file_answer(&f, &id, &qc, &format!("Answer number {n}."), "operator"))
+        .collect();
+    let before = cad447_answers(&f, "asker").len();
+    let results: Vec<Value> = thread::scope(|s| {
+        let calls: Vec<_> = answers
+            .iter()
+            .map(|a| {
+                let id = &id;
+                let f = &f;
+                s.spawn(move || {
+                    f.d.operator_rpc("answer_route", json!({"issue": id, "report": a}))
+                        .unwrap()
+                })
+            })
+            .collect();
+        calls.into_iter().map(|c| c.join().unwrap()).collect()
+    });
+    let fresh = results.iter().filter(|r| r["sent"] == true).count();
+    assert_eq!(fresh, 1, "one answer per question: {results:?}");
+    assert!(
+        results
+            .iter()
+            .filter(|r| r["sent"] != true)
+            .all(|r| r["why"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("already answered")),
+        "{results:?}"
+    );
+    assert_eq!(cad447_answers(&f, "asker").len(), before + 1);
+
     // (b) An agent routes its own answer.
+    let before = cad447_answers(&f, "asker").len();
     let qw = cad447_ask(&f, &id, "asker", 3);
     let aw = cad447_file_answer(&f, &id, &qw, "Weekly, says wk.", "wk");
     let r = ok_result(&wk.rpc("self", "answer_route", json!({"issue": id, "report": aw})));
     assert_eq!(r["sent"], true, "{r}");
     let sent = cad447_answers(&f, "asker");
-    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert_eq!(sent.len(), before + 1, "{sent:?}");
     assert!(sent
         .iter()
         .any(|m| m["body"].as_str().unwrap().contains("wk answered")));
@@ -41818,7 +41874,7 @@ fn cad447_refused_and_forged_answers_send_nothing() {
     // the answer delivered.
     let q2 = cad447_ask(&f, &id, "asker", 2);
     let a2 = cad447_file_answer(&f, &id, &q2, "Use the staging key.", "operator");
-    let predicted = cad447_message_id(&id, &a2);
+    let predicted = cad447_message_id(&id, &q2);
     let squat = wk.rpc(
         "self",
         "agent_send",
