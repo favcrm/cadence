@@ -1736,18 +1736,32 @@ mod tests {
             "CAD-1",
             "o/r#1 merged at x",
             "operator (delivery o/r#1)",
+            None,
         )
         .unwrap_err();
         assert!(e.to_string().contains("commit"), "{e}");
         assert_eq!(std::fs::read(dir.join("issue.md")).unwrap(), before);
         assert!(clean(&pm), "a failed done write left something staged");
         std::fs::remove_file(hook).unwrap();
+        // A status changed since the merge (`expect` no longer holds) is
+        // left alone and nothing is written.
+        let commits = crate::issue::git(&pm.dir, &["rev-list", "--count", "HEAD"]).unwrap();
+        assert_eq!(
+            mark_done_on_merge(&pm, "CAD-1", "w", "operator", Some("doing")).unwrap(),
+            Some("backlog".to_string())
+        );
+        assert_eq!(load_front(&dir).unwrap().0.status, "backlog");
+        assert_eq!(
+            crate::issue::git(&pm.dir, &["rev-list", "--count", "HEAD"]).unwrap(),
+            commits
+        );
         assert_eq!(
             mark_done_on_merge(
                 &pm,
                 "CAD-1",
                 "o/r#1 merged at x",
-                "operator (delivery o/r#1)"
+                "operator (delivery o/r#1)",
+                Some("backlog"),
             )
             .unwrap(),
             None
