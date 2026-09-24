@@ -8176,9 +8176,10 @@ fn quotable(token: &str) -> bool {
     token.len() >= 16
 }
 
-/// Fields that name a record, never a credential: withholding touches
-/// none of them, even when an id happens to equal a token's text (a
-/// caller-chosen message id may be anything).
+/// Fields that usually name a record: a string under one of them that
+/// EXACTLY equals a token's text is an id collision (a caller-chosen
+/// message id may be anything) and is left alone. Any other string
+/// there is prose and is masked like everywhere else.
 const ID_FIELDS: &[&str] = &[
     "id",
     "message",
@@ -8192,9 +8193,9 @@ const ID_FIELDS: &[&str] = &[
 ];
 
 /// Withhold `tokens` from `value` (CAD-375). Only token-bearing places
-/// change: a `turn_id` field holding one becomes `null`, and prose (any
-/// other string field, never an [`ID_FIELDS`] one) quoting a
-/// [`quotable`] token has it masked. A short schemeless token (a codex
+/// change: a `turn_id` field holding one becomes `null`, and prose
+/// quoting a [`quotable`] token has it masked — in any field, except an
+/// [`ID_FIELDS`] value that is exactly the token (an id collision). A short schemeless token (a codex
 /// `t-1`, a fake `fake-turn-1`) is withheld only as a `turn_id` value —
 /// elsewhere the same text is someone else's data.
 fn redact_tokens(value: &mut Value, tokens: &[&str]) {
@@ -8215,7 +8216,12 @@ fn redact_tokens(value: &mut Value, tokens: &[&str]) {
                     if v.as_str().is_some_and(|t| tokens.contains(&t)) {
                         *v = Value::Null;
                     }
-                } else if !(ID_FIELDS.contains(&key.as_str()) && v.is_string()) {
+                } else if !(ID_FIELDS.contains(&key.as_str())
+                    && v.as_str().is_some_and(|t| tokens.contains(&t)))
+                {
+                    // Under an id key only an EXACT token text is an id
+                    // collision left alone; prose there (a Devin event's
+                    // `message`) is masked like anywhere else.
                     redact_tokens(v, tokens);
                 }
             }
@@ -9553,6 +9559,11 @@ mod tests {
         assert_eq!(row["entries"][0]["message"], tok);
         assert_eq!(row["entries"][0]["text"], "see [turn token withheld]");
         assert!(row["turn_id"].is_null(), "{row}");
+        // Prose under an id-named key is still masked (a Devin cloud
+        // event carries provider text as `message`).
+        let mut ev = json!({"event_id": "e1", "message": format!("done, token is {tok}")});
+        redact_tokens(&mut ev, &[tok]);
+        assert_eq!(ev["message"], "done, token is [turn token withheld]");
         let all = withhold_all_turn_ids(json!({"m": [{"turn_id": "x", "id": "m1"}]}));
         assert!(all["m"][0]["turn_id"].is_null() && all["m"][0]["id"] == "m1");
     }
