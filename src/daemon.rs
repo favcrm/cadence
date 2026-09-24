@@ -8023,6 +8023,11 @@ impl Shared {
         if let Some((age, last_activity, probe)) = end_fire {
             if let Some(m) = running.as_ref() {
                 self.silent_end_fired(&agent, m, age, last_activity, &probe);
+                // CAD-468: the edge is also the reminder — the pane is
+                // provably idle while the turn still runs, so prompt the
+                // worker in band before the report bound forces the
+                // unknown.
+                self.report_reminder(&agent, m);
             }
         }
         match after {
@@ -8199,6 +8204,48 @@ impl Shared {
             task_id,
         );
         self.wake();
+    }
+
+    /// CAD-468: at the silent-end edge, prompt the worker in band — one
+    /// daemon-originated nudge per turn carrying the exact
+    /// `cadence message result` command. It is turnless like any nudge,
+    /// so it delivers while this turn still holds the actor, and the
+    /// `(nudge, "report-reminder:<message>:<turn>")` id dedupes a
+    /// restart, a re-probe or a second edge: once per turn, never twice.
+    /// A report that already landed skips it; the reminder itself never
+    /// resolves the turn and never fences — the unchanged
+    /// `report_timeout_secs` bound still decides `unknown`.
+    fn report_reminder(&self, agent: &Agent, message: &Message) {
+        // Re-read: a report can land between the probe's verdict and
+        // this write — only a still-running turn is reminded.
+        let Ok(Some(m)) = self.store.message(&message.id) else {
+            return;
+        };
+        if m.state != "running" {
+            return;
+        }
+        let token = m.turn_id.as_deref().unwrap_or("<turn_id>");
+        let bound = store::report_timeout_secs(agent.params.as_ref());
+        let mut text = format!(
+            "Pane idle with a turn still open — report it: \
+             `cadence message result {} --token {token} --text '<summary>'`.",
+            m.id
+        );
+        if bound > 0 {
+            text.push_str(&format!(
+                " No report inside report_timeout_secs={bound} leaves the \
+                 turn `unknown` for the operator to judge."
+            ));
+        }
+        let key = format!("report-reminder:{}:{token}", m.id);
+        if let Err(e) = self.daemon_message(&agent.alias, store::NUDGE_SOURCE, &key, &text) {
+            tracing::warn!(
+                event = "report_reminder_failed",
+                alias = agent.alias.as_str(),
+                message = m.id.as_str(),
+                error = e.to_string()
+            );
+        }
     }
 
     /// The one notice an episode sends: a `job_event` to the PM for a

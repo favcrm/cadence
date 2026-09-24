@@ -289,9 +289,11 @@ impl Shared {
     /// Queue a daemon-originated message to `alias` once per
     /// `(source, key)` — the one helper for every message the daemon
     /// originates (CAD-445; CAD-447's answer routing adopts it). `source`
-    /// must be one of [`proto::DAEMON_SOURCES`], which no caller can
-    /// write; the id is [`proto::daemon_message_id`]. The message is
-    /// unattributed (a system entry in a thread) and owes no report.
+    /// must be one of [`proto::DAEMON_SOURCES`] or `nudge` — the CAD-468
+    /// report reminder is a daemon-originated nudge, and its `sys-` id
+    /// still proves the daemon made it. The id is
+    /// [`proto::daemon_message_id`]. The message is unattributed (a
+    /// system entry in a thread) and owes no report.
     ///
     /// `Some(id)` when queued now, `None` when this daemon queued it
     /// before. A row under the id that is not this message — another
@@ -299,7 +301,7 @@ impl Shared {
     /// refused with a `daemon_message_squatted` event, never taken as a
     /// duplicate.
     pub(super) fn daemon_message(
-        self: &Arc<Self>,
+        &self,
         alias: &str,
         source: &str,
         key: &str,

@@ -7,6 +7,7 @@
 //! branch, commit or queued message behind.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -52,6 +53,13 @@ pub struct DispatchArgs {
 /// address. Built verbatim: a title or `--summary` carrying control
 /// chars produces a violating body and `check_body` refuses rather
 /// than laundering it into something the operator didn't write.
+///
+/// CAD-468: an explicitly-reported endpoint's kickoff also carries the
+/// exact `cadence message result` command — the worker that missed or
+/// never read its briefing still has the contract in the message that
+/// opened its turn. Turn-result endpoints finish by their result text
+/// and never run it, so theirs is omitted.
+#[allow(clippy::too_many_arguments)]
 fn kickoff_body(
     issue: &str,
     title: &str,
@@ -60,12 +68,22 @@ fn kickoff_body(
     branch: &str,
     base_sha: &str,
     reply_to: &str,
+    provider: &str,
+    endpoint_kind: &str,
 ) -> String {
     let sha7: String = base_sha.chars().take(7).collect();
+    let report = if crate::adapter::registry::report_hint(provider, endpoint_kind)
+        == crate::adapter::registry::Reporting::Explicit
+    {
+        " Report: `cadence message result <id> --token <turn_id> --text '<summary>'` \
+         (`cadence self` prints both)."
+    } else {
+        ""
+    };
     format!(
         "read {} — {issue}: {title}. Your worktree exists: {} (branch \
          {branch}, base {sha7}). Commit trailer: Issue: {issue}. PR to \
-         main; reply to {reply_to}.",
+         main; reply to {reply_to}.{report}",
         note.display(),
         wt_dir.display()
     )
@@ -210,11 +228,23 @@ fn plain_kickoff(
     base_sha: &str,
     reply_to: &str,
     items: &[AcceptanceItem],
+    provider: &str,
+    endpoint_kind: &str,
 ) -> Result<String> {
     const CUT: &str = "…";
     let build = |title: &str| {
         with_acceptance(
-            kickoff_body(issue, title, note, wt_dir, branch, base_sha, reply_to),
+            kickoff_body(
+                issue,
+                title,
+                note,
+                wt_dir,
+                branch,
+                base_sha,
+                reply_to,
+                provider,
+                endpoint_kind,
+            ),
             items,
         )
     };
@@ -403,6 +433,18 @@ pub(crate) fn check_lane_cwd(
     )))
 }
 
+/// The lane worktree's current HEAD — best-effort evidence carried on
+/// a reported-duplicate record; `None` when git cannot answer (a lane
+/// deleted mid-dispatch reads as unknown, never as a match).
+fn lane_head(worktree: &Path) -> Option<String> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(worktree).args(["rev-parse", "HEAD"]);
+    let out = crate::proc::run_bounded(&mut cmd, Duration::from_secs(30)).ok()?;
+    (out.status.success())
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// `dispatch <ISSUE> --to <worker> --note <path> [--job --spec f]`.
 pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path) -> Result<Value> {
     let (project, dir) = write::issue_dir(pm, id)?;
@@ -462,6 +504,10 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
     // CAD-202: the lane's pane must still be inside this project.
     let cwd_override = check_lane_cwd(&project, &args.to, agent, args.force)?;
     let provider = agent["provider"].as_str().unwrap_or_default().to_string();
+    let endpoint_kind = agent["endpoint_kind"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
     if args.job_spec.is_some() {
         let member = agent["alias"].as_str() == Some(reply_to.as_str())
             || agent["params"]["upstream"].as_str() == Some(reply_to.as_str());
@@ -490,7 +536,16 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
     let body = if args.job_spec.is_none() {
         let summary = args.summary.as_deref().unwrap_or(&front.title);
         let body = plain_kickoff(
-            &front.id, summary, &note, &wt_dir, &branch, &base_sha, &reply_to, &items,
+            &front.id,
+            summary,
+            &note,
+            &wt_dir,
+            &branch,
+            &base_sha,
+            &reply_to,
+            &items,
+            &provider,
+            &endpoint_kind,
         )?;
         check_body(&body, &provider)?;
         Some(body)
@@ -539,6 +594,8 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
                 started["base"]["sha"].as_str().unwrap_or_default(),
                 &reply_to,
                 &items,
+                &provider,
+                &endpoint_kind,
             )?;
             check_body(&body, &provider).map(|_| body)
         })
@@ -546,9 +603,19 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
 
     // Duplicate dispatch: a previously recorded `message` ref still
     // live means a kickoff is in flight — reuse the worktree, queue
-    // nothing, say so. The ref label names the worker it went to, so
-    // a re-dispatch to a DIFFERENT worker is still caught.
+    // nothing, say so. The ref names the worker it went to, so a
+    // re-dispatch to a DIFFERENT worker is still caught.
+    // CAD-467: a ref whose kickoff this worker already REPORTED —
+    // completed against this same lane — is the late duplicate: the
+    // work it kicks off is done, so nothing re-sends and the detection
+    // is recorded on the issue. A kickoff bound to a different
+    // worktree is another lane's history, not this dispatch's.
     let mut live: Option<Value> = None;
+    let mut reported: Option<Value> = None;
+    // A fresh read on the target — `show` predates `issue start`, and
+    // a launch finishing mid-dispatch can have enqueued a bootstrap.
+    let show_now = client::rpc(state_dir, "agent_show", json!({"alias": args.to}))
+        .unwrap_or_else(|_| show.clone());
     for r in front
         .refs
         .iter()
@@ -558,29 +625,38 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
             continue;
         };
         let owner = r
-            .label
+            .agent
             .as_deref()
-            .and_then(|l| l.strip_prefix("dispatch → "))
+            .or_else(|| {
+                r.label
+                    .as_deref()
+                    .and_then(|l| l.strip_prefix("dispatch → "))
+            })
             .unwrap_or(&args.to);
         let messages = if owner == args.to {
-            Some(show.clone())
+            Some(show_now.clone())
         } else {
             client::rpc(state_dir, "agent_show", json!({"alias": owner})).ok()
         };
-        let found = messages.and_then(|s| {
-            s["messages"].as_array().and_then(|ms| {
-                ms.iter()
-                    .find(|m| {
-                        m["id"].as_str() == Some(mid)
-                            && LIVE_MESSAGE_STATES
-                                .contains(&m["state"].as_str().unwrap_or_default())
-                    })
-                    .cloned()
-            })
-        });
-        if found.is_some() {
-            live = found;
+        let Some(found) = messages.and_then(|s| {
+            s["messages"]
+                .as_array()
+                .and_then(|ms| ms.iter().find(|m| m["id"].as_str() == Some(mid)).cloned())
+        }) else {
+            continue;
+        };
+        let state = found["state"].as_str().unwrap_or_default();
+        if LIVE_MESSAGE_STATES.contains(&state) {
+            live = Some(found);
             break;
+        }
+        if owner == args.to
+            && state == "completed"
+            && r.worktree
+                .as_deref()
+                .is_none_or(|w| Some(w) == started["worktree"].as_str())
+        {
+            reported = Some(found);
         }
     }
     let mut out = json!({
@@ -600,6 +676,7 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
     if let Some(msg) = live {
         out["dispatched"] = json!(false);
         out["duplicate"] = json!(true);
+        out["duplicate_kind"] = json!("live");
         // CAD-300 (QA R4): a duplicate sends nothing, so its warning
         // must not say it dispatched.
         if items.is_empty() {
@@ -607,6 +684,54 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
         }
         out["message"] = msg["id"].clone();
         out["message_state"] = msg["state"].clone();
+        return Ok(out);
+    }
+    if let Some(msg) = reported {
+        // The kickoff's own report sha against the lane's head now —
+        // equal is the cleanest late duplicate; either way the issue
+        // was reported by this worker in this lane, so nothing
+        // re-sends. Both sides are recorded so the PM can judge.
+        let mid = msg["id"].as_str().unwrap_or_default();
+        let reported_sha = msg["result"]["sha"].as_str();
+        let via = msg["result"]["via"].as_str().unwrap_or("report");
+        let lane_head = started["worktree"]
+            .as_str()
+            .and_then(|wt| lane_head(Path::new(wt)));
+        let same_head = match (reported_sha, lane_head.as_deref()) {
+            (Some(s), Some(h)) => Some(s == h),
+            _ => None,
+        };
+        out["dispatched"] = json!(false);
+        out["duplicate"] = json!(true);
+        out["duplicate_kind"] = json!("reported");
+        if items.is_empty() {
+            out["acceptance"]["warning"] = json!(self::acceptance_warning(&front.id, false));
+        }
+        out["message"] = msg["id"].clone();
+        out["message_state"] = msg["state"].clone();
+        out["reported"] = json!({
+            "sha": reported_sha,
+            "via": via,
+            "lane_head": lane_head,
+            "same_head": same_head,
+        });
+        let _ = write::add_comment(
+            pm,
+            id,
+            &format!(
+                "Late duplicate dispatch suppressed: {} already reported \
+                 kickoff {} (via {}, sha {}, lane head {}) — nothing re-sent.",
+                args.to,
+                mid,
+                via,
+                reported_sha.unwrap_or("none recorded"),
+                lane_head.as_deref().unwrap_or("unreadable"),
+            ),
+            None,
+            Some("dispatch"),
+            None,
+            actor,
+        );
         return Ok(out);
     }
 
@@ -696,6 +821,48 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
         }
     }
 
+    // CAD-467: a freshly joined worker's `bootstrap-<alias>` still
+    // `queued` would deliver as a bare onboarding turn AHEAD of this
+    // kickoff — and a worker that treated it as the task would then
+    // meet the kickoff as a second statement of the same work. Fold it
+    // instead: cancel the queued row and carry its body verbatim ahead
+    // of the kickoff, so the lane's first turn is the task and still
+    // teaches identity, briefing path and the report command. A
+    // bootstrap already `running` keeps its turn — this kickoff queues
+    // behind it — and a folded body that outgrows the pty ceiling
+    // leaves the bootstrap to deliver on its own. `--job` kickoffs are
+    // daemon-templated and cannot carry it, so the fold is plain-path
+    // only. The cancel is state-guarded: a bootstrap claimed in the
+    // meantime refuses it and the kickoff queues behind, unchanged.
+    let bootstrap_id = format!("bootstrap-{}", args.to);
+    let mut send_body = body;
+    let mut bootstrap_state: Option<String> = None;
+    if let Some(boot) = send_body.as_ref().and_then(|_| {
+        show_now["messages"].as_array().and_then(|ms| {
+            ms.iter()
+                .find(|m| m["id"].as_str() == Some(bootstrap_id.as_str()))
+        })
+    }) {
+        bootstrap_state = boot["state"].as_str().map(str::to_string);
+        if bootstrap_state.as_deref() == Some("queued") {
+            if let (Some(boot_body), Some(b)) = (boot["body"].as_str(), send_body.as_deref()) {
+                let folded = format!("{boot_body} {b}");
+                if check_body(&folded, &provider).is_ok()
+                    && client::rpc(
+                        state_dir,
+                        "message_cancel",
+                        json!({"message": bootstrap_id, "by": reply_to,
+                               "reason": format!("folded into kickoff {mid} for {}", front.id)}),
+                    )
+                    .is_ok()
+                {
+                    send_body = Some(folded);
+                    bootstrap_state = Some("folded".to_string());
+                }
+            }
+        }
+    }
+
     // The ref lands before the send, naming the worktree the kickoff
     // runs against — a re-start under `--name` must not inherit it.
     // If the send then fails the ref stays as the attempt's history
@@ -719,10 +886,18 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
         // stale reason) for a concurrent finish; best-effort — the
         // send error is the one that matters.
         let _ = write::close_ref(pm, id, "message", &mid, actor);
+        // CAD-467: a folded bootstrap is already cancelled — the
+        // worker's onboarding rode the kickoff that failed, so name it
+        // on the failure comment for the operator to re-bootstrap.
+        let folded = if bootstrap_state.as_deref() == Some("folded") {
+            format!(" (bootstrap {bootstrap_id} was already folded into it — `cadence agent bootstrap {}` restores onboarding)", args.to)
+        } else {
+            String::new()
+        };
         let _ = write::add_comment(
             pm,
             id,
-            &format!("Dispatch send to {} failed: {e}", args.to),
+            &format!("Dispatch send to {} failed: {e}{folded}", args.to),
             None,
             Some("dispatch"),
             None,
@@ -733,7 +908,7 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
 
     // Exactly one send — plain text kickoff, or `job dispatch`'s
     // spec-bound kickoff for --job (its state lives on the task).
-    let (message, sent_state) = if let Some(body) = body {
+    let (message, sent_state) = if let Some(body) = send_body {
         let sent = client::rpc(
             state_dir,
             "agent_send",
@@ -800,6 +975,14 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
     if let Some(warning) = &acceptance_warning {
         comment_text.push_str(&format!("\nAcceptance warning: {warning}"));
     }
+    // CAD-467: a folded bootstrap is recorded on the dispatch's own
+    // comment — the cancelled row's history names this kickoff too.
+    if bootstrap_state.as_deref() == Some("folded") {
+        comment_text.push_str(&format!(
+            "\nBootstrap {bootstrap_id} folded into this kickoff — the queued \
+             onboarding turn was cancelled; its instructions ride this message."
+        ));
+    }
     let comment = write::add_comment(pm, id, &comment_text, None, Some("dispatch"), None, actor)?;
 
     // The worker's current probe verdict — pty only; the operator
@@ -829,6 +1012,11 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
         .map(|e| json!(e))
         .unwrap_or(Value::Null);
     out["comment"] = comment["comment"].clone();
+    // CAD-467: `folded` when the queued bootstrap was cancelled into
+    // this kickoff; a live-but-unfolded bootstrap (`queued`/`running`)
+    // means the kickoff delivers after it reports — surfaced so the PM
+    // sees why this kickoff is not the lane's first turn.
+    out["bootstrap"] = bootstrap_state.map(|s| json!(s)).unwrap_or(Value::Null);
     out["job"] = started["job"].clone();
     out["task"] = started["task"].clone();
     out["probe"] = probe.unwrap_or(Value::Null);
@@ -849,7 +1037,33 @@ mod tests {
             "cadence/d-1-title",
             "0123456789abcdef",
             "pm",
+            "devin",
+            "pty",
         )
+    }
+
+    /// CAD-468: the kickoff names the report command exactly when the
+    /// endpoint reports explicitly — a turn-result endpoint's turn
+    /// finishes by its result text and never runs the command.
+    #[test]
+    fn kickoff_teaches_the_report_command_only_for_explicit_endpoints() {
+        assert!(
+            kickoff().contains("cadence message result <id> --token <turn_id>"),
+            "{}",
+            kickoff()
+        );
+        let managed = kickoff_body(
+            "D-1",
+            "Title",
+            Path::new("/tmp/note.md"),
+            Path::new("/r/.cadence/wt/d-1-title"),
+            "cadence/d-1-title",
+            "0123456789abcdef",
+            "pm",
+            "claude",
+            "managed",
+        );
+        assert!(!managed.contains("message result"), "{managed}");
     }
 
     /// CAD-159: an empty section and a stub-only section both yield no
@@ -955,6 +1169,8 @@ mod tests {
             "0123456789abcdef",
             "pm",
             &items,
+            "devin",
+            "pty",
         )
         .unwrap();
         check_body(&body, "fake").unwrap();
@@ -1004,6 +1220,8 @@ mod tests {
             "0123456789abcdef",
             "pm",
             &items,
+            "devin",
+            "pty",
         )
         .unwrap_err()
         .to_string();

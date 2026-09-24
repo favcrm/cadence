@@ -2748,6 +2748,12 @@ impl Store {
     /// [`crate::proto::DAEMON_MESSAGE_PREFIX`] or a source of
     /// [`crate::proto::DAEMON_SOURCES`]; every other enqueue refuses both.
     /// Unattributed (a system entry in a thread), owing no report.
+    /// CAD-468: `nudge` is daemon-writable too — the silent-end report
+    /// reminder rides the turnless nudge lane; its `sys-` id still
+    /// proves daemon provenance (no caller can mint the prefix, and no
+    /// caller path reaches this enqueue). The id's kind segment must
+    /// be the source — `sys-nudge-…` is a daemon nudge, `sys-wake-…` a
+    /// wake; a crossed pair is refused like any other mismatch.
     pub fn enqueue_daemon(
         &self,
         alias: &str,
@@ -2755,8 +2761,9 @@ impl Store {
         id: &str,
         source: &str,
     ) -> Result<(bool, String)> {
-        if !id.starts_with(crate::proto::DAEMON_MESSAGE_PREFIX)
-            || !crate::proto::DAEMON_SOURCES.contains(&source)
+        let daemon_id = format!("{}{}-", crate::proto::DAEMON_MESSAGE_PREFIX, source);
+        if !(crate::proto::DAEMON_SOURCES.contains(&source) || source == NUDGE_SOURCE)
+            || !id.starts_with(&daemon_id)
         {
             return Err(Error::internal(format!(
                 "a daemon message needs a daemon id and source, not {id}/{source}"
@@ -8318,6 +8325,49 @@ mod tests {
         let (dup, state) = s.enqueue("a1", "hello", None, "m1", "user").unwrap();
         assert!(dup && state == "queued");
         assert!(s.enqueue("a1", "different", None, "m1", "user").is_err());
+    }
+
+    /// CAD-468: `enqueue_daemon` admits exactly the pairs the daemon
+    /// mints — `sys-<source>-…` for a daemon source (`wake`, and `nudge`
+    /// for the silent-end report reminder) — and refuses every crossing:
+    /// a caller id under a daemon source, a daemon id under a caller
+    /// source, a daemon id whose kind segment is not the source, and a
+    /// routed source. Callers stay fenced the other way by
+    /// `proto::caller_message` — no `sys-` id, no `wake` source.
+    #[test]
+    fn enqueue_daemon_admits_only_matching_daemon_pairs() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        reg(&s, "a1", &cwd);
+        // The reminder pair the daemon mints.
+        let (dup, _) = s
+            .enqueue_daemon("a1", "report it", "sys-nudge-0123456789abcdef", "nudge")
+            .unwrap();
+        assert!(!dup);
+        let (dup, _) = s
+            .enqueue_daemon("a1", "report it", "sys-nudge-0123456789abcdef", "nudge")
+            .unwrap();
+        assert!(dup, "the same daemon id dedupes");
+        // And the wake pair.
+        s.enqueue_daemon("a1", "wake", "sys-wake-0123456789abcdef", "wake")
+            .unwrap();
+        for (id, source) in [
+            ("m-1", "nudge"),             // caller id + daemon source
+            ("m-1", "wake"),              // caller id + daemon source
+            ("sys-nudge-x", "user"),      // daemon id + caller source
+            ("sys-wake-x", "nudge"),      // crossed daemon pair
+            ("sys-nudge-x", "wake"),      // crossed daemon pair
+            ("sys-x-x", "worker_notice"), // routed source can't go daemon
+        ] {
+            assert!(
+                s.enqueue_daemon("a1", "x", id, source).is_err(),
+                "{id}/{source} must be refused"
+            );
+        }
+        // The caller side of the same fence.
+        assert!(crate::proto::caller_message("sys-nudge-x", "nudge").is_err());
+        assert!(crate::proto::caller_message("m-1", "wake").is_err());
+        assert!(crate::proto::caller_message("m-1", "nudge").is_ok());
     }
 
     fn approval<'a>(id: &'a str, source: &'a str, head: &'a str, pr: u64) -> NewApproval<'a> {
