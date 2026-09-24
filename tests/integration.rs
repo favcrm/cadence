@@ -38068,6 +38068,81 @@ fn work_model_project_md_and_milestones() {
     );
 }
 
+/// CAD-405 review round 2: a stage read off the status (a done epic
+/// never moved) is display-only for the gates. A pane agent moving it
+/// "back" into release or build is refused — nothing written — so it
+/// cannot reach an operator stage the operator never entered; the
+/// operator can. An epic with a recorded stage moves back as before.
+#[test]
+fn work_model_status_derived_stage_needs_operator_for_gates() {
+    let f = PlanFixture::start();
+    let home = TempDir::new().unwrap();
+    let mut pane = LaneShell::spawn(home.path());
+    plant_pane(&f.d, "pane-1", pane.pid());
+    for (title, epic) in [
+        ("Done", None),
+        ("Kid", Some("D-1")),
+        ("Moved", None),
+        ("Kid2", Some("D-3")),
+    ] {
+        let mut args = vec!["issue", "new", title, "--project", "demo"];
+        if let Some(e) = epic {
+            args.extend(["--epic", e]);
+        }
+        assert!(f.cli(&args).0, "{title}");
+    }
+    assert!(f.cli(&["issue", "set", "D-2", "status=done"]).0);
+    let (_, out) = f.cli(&["issue", "show", "D-1", "--json"]);
+    assert_eq!(out["work"]["stage"]["source"], "status", "{out}");
+
+    let epic_file = f.pm_dir.join("demo/D-1/issue.md");
+    let before = f.commits();
+    let bytes = std::fs::read(&epic_file).unwrap();
+    for to in ["release", "build"] {
+        let r = pane.rpc(
+            &f.d.state,
+            "epic_stage",
+            json!({"epic": "D-1", "stage": to}),
+        );
+        let msg = r["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("operator action") && msg.contains("pane-1"),
+            "{to}: {r}"
+        );
+    }
+    assert_eq!(f.commits(), before, "refused moves commit nothing");
+    assert_eq!(
+        std::fs::read(&epic_file).unwrap(),
+        bytes,
+        "refused moves write nothing"
+    );
+
+    // The operator can make the move.
+    let out =
+        f.d.operator_rpc("epic_stage", json!({"epic": "D-1", "stage": "release"}))
+            .unwrap();
+    assert_eq!(
+        (out["from"].as_str(), out["to"].as_str()),
+        (Some("done"), Some("release"))
+    );
+    assert_eq!(out["by"], "operator", "{out}");
+    assert_eq!(f.commits(), before + 1);
+
+    // A recorded stage behaves as before: the operator moves D-3 into
+    // build, the pane moves it on to verify and back into build.
+    f.d.operator_rpc("epic_stage", json!({"epic": "D-3", "stage": "build"}))
+        .unwrap();
+    for to in ["verify", "build"] {
+        let r = pane.rpc(
+            &f.d.state,
+            "epic_stage",
+            json!({"epic": "D-3", "stage": to}),
+        );
+        assert_eq!(r["result"]["by"], "pane-1", "{to}: {r}");
+    }
+    assert_eq!(f.front("D-3").stage.as_deref(), Some("build"));
+}
+
 /// CAD-405 review round 1: an agent editing PROJECT.md cannot move an
 /// epic past the operator stages. The gate keys (`stages`,
 /// `operator_stages`) apply only while they match the digest the
