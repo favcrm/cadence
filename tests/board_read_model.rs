@@ -809,7 +809,7 @@ fn overview_is_never_served_past_a_change_or_the_age_cap() {
     assert!(unread(&ov, 2), "the refetch after the frame shows it: {ov}");
 }
 
-/// Review round 1, item 3: the git-clock cache follows history, not
+/// Review round 1, item 3: the status clock follows history, not
 /// just the file. An uncommitted status edit read once, then committed,
 /// must report the commit's time — not the time cached before it.
 #[test]

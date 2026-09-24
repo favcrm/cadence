@@ -3366,7 +3366,8 @@ fn status_view(state_dir: &Path, group: Option<&str>) -> Result<Value> {
     }
     // Tracker issues per owner — only when a tracker is reachable.
     // `views` gives the derived status the board shows; `load_all`
-    // stays a filesystem read, never a git walk.
+    // stays a filesystem read, and claim ages come from the tracker's
+    // cached line times (CAD-403) — never a git walk per issue.
     let pm = cadence_agent::issue::Pm::open_default().ok();
     let tracker = pm.is_some();
     let mut owned_issues: std::collections::HashMap<String, Vec<String>> =
@@ -3377,7 +3378,9 @@ fn status_view(state_dir: &Path, group: Option<&str>) -> Result<Value> {
         use cadence_agent::issue::claim;
         let issues = cadence_agent::issue::board::load_all(&pm.dir, None).unwrap_or_default();
         let views = cadence_agent::issue::board::views(&pm.config.notes_dir(), issues);
-        let clock = claim::Clock::new(&pm.dir, Duration::from_secs(3));
+        let times =
+            cadence_agent::issue::line_times::LineTimes::load(&pm.dir, Duration::from_secs(3)).ok();
+        let clock = claim::Clock::new(times.as_ref());
         let now = cadence_agent::issue::time::now_epoch();
         for v in views {
             if !matches!(v.status.as_str(), "doing" | "review") {
