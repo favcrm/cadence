@@ -14,22 +14,25 @@
 //! |---|---|---|
 //! | valid | tied to an agent (pane or managed endpoint) | refused `session_from_agent`; the session is revoked |
 //! | valid | the proven `tailscale serve` proxy (CAD-336) | the operator, as `<login> (tailscale)` (no login: refused) |
-//! | valid | tied to no agent, or unattributable | the operator, `operator (ui)` |
+//! | valid | tied to no agent, or unattributable with its client socket alive and another uid's (sshd, tailscaled) | the operator, `operator (ui)` |
+//! | valid | unattributable otherwise (socket already closed, or ours with no visible owner) | refused `caller_identity` |
 //! | none/invalid | tied to an agent | that agent (agent-allowed routes only) |
 //! | none/invalid | tied to no agent, a relay, or the proxy | refused `operator_session_required` |
 //! | none/invalid | unattributable | refused `caller_identity` |
 //!
-//! A session is bound to its origin: `loopback` (any Host this board
-//! allows that is not the tailnet name) or `tailnet` (a request the
-//! tailnet proof passes). A request whose Host names the tailnet but
-//! fails the proof has no origin, so no session. A write that carries a
+//! A session is bound to its origin: `loopback` — on this board's own
+//! name, `cadence-<port>.localhost:<port>` ([`board_host`]), and no
+//! other Host, so the cookie is never sent to another port's server — or
+//! `tailnet` (a request the tailnet proof passes). Any other request has
+//! no origin, so no session. A write that carries a
 //! session cookie must also carry `Origin`, and it must be this very
 //! request's own scheme and Host — a cookie replayed from another
 //! origin, or by a client that sends none, is refused.
 //!
-//! Operator-only routes additionally run positive process proof on the
-//! HTTP peer (`home::prove_operator_peer`): the board is never less
-//! strict than the daemon verb it relays.
+//! [`WRITE_ROUTES`] classifies every write, and [`admit`] enforces the
+//! class before any handler runs. Operator-only routes additionally run
+//! positive process proof on the HTTP peer (`home::prove_operator_peer`):
+//! the board is never less strict than the daemon verb it relays.
 
 use serde::Deserialize;
 use serde_json::{json, Value};
