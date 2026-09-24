@@ -98,6 +98,15 @@ cadence master escalate <ID> <question report file name> --file - <<'SUMMARY'
 SUMMARY
 ```
 
+Stop a ticket you dispatched while its agent is still on it — the
+agent's running turn ends `interrupted` and the agent stays up for the
+next message. Only a turn you dispatched; anything else is the
+operator's:
+
+```sh
+cadence interrupt <alias>
+```
+
 ## Never
 
 - Approve or reject plans, record approvals, accept or merge work.

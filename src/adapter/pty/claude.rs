@@ -935,6 +935,12 @@ impl TuiProfile for ClaudeProfile {
         Ok(keys)
     }
 
+    /// Claude Code interrupts a running turn on Esc (`esc to interrupt`);
+    /// `C-c` on an idle prompt arms the exit instead.
+    fn interrupt_keys(&self) -> &'static [&'static str] {
+        &["Escape"]
+    }
+
     fn forbidden_prefixes(&self) -> &'static [char] {
         FORBIDDEN_PREFIXES
     }

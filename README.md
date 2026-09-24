@@ -151,6 +151,9 @@ cadence message reconcile <id> --status interrupted [--note "why"]
 cadence message cancel <id> [--reason "why"]
                                 # operator exit from `queued`: never delivered;
                                 #  reply_to gets one notice, task-bound refused
+cadence interrupt <slug>        # stop the running turn with the provider's own
+                                #  interrupt (never a kill): it ends `interrupted`,
+                                #  the agent stays idle; operator or its PM only
 cadence agent ready <slug>      # operator claim: pane inspected, idle, empty input
 cadence agent probe <slug>      # analyze the pane without claiming (pty)
 cadence agent set <slug> k=v    # merge an allowlisted param (auto_ready)

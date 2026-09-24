@@ -81,6 +81,10 @@ pub struct StdioAdapter {
     on_message: MessageHandler,
     on_disconnect: DisconnectHook,
     inner: Mutex<Inner>,
+    /// The child's stdin, locked apart from [`Inner`]: a write blocked
+    /// on a full pipe must never hold up a signal, an exit poll or the
+    /// close that would unblock it (CAD-323).
+    stdin: Mutex<Option<ChildStdin>>,
     pending: Pending,
     disconnected: AtomicBool,
     /// Raw newline-delimited event stream (no JSON-RPC framing).
@@ -89,7 +93,6 @@ pub struct StdioAdapter {
 
 struct Inner {
     child: Option<Child>,
-    stdin: Option<ChildStdin>,
 }
 
 impl StdioAdapter {
@@ -126,10 +129,8 @@ impl StdioAdapter {
             env_scrub,
             on_message,
             on_disconnect,
-            inner: Mutex::new(Inner {
-                child: None,
-                stdin: None,
-            }),
+            inner: Mutex::new(Inner { child: None }),
+            stdin: Mutex::new(None),
             pending: Pending::new(),
             disconnected: AtomicBool::new(false),
             raw_lines,
@@ -200,9 +201,8 @@ impl StdioAdapter {
             .take()
             .ok_or_else(|| Error::internal("provider stdout unavailable"))?;
         {
-            let mut inner = self.inner.lock().unwrap();
-            inner.stdin = Some(stdin);
-            inner.child = Some(child);
+            *self.stdin.lock().unwrap() = Some(stdin);
+            self.inner.lock().unwrap().child = Some(child);
         }
         let adapter = Arc::clone(self);
         thread::spawn(move || adapter.read_loop(stdout));
@@ -256,9 +256,8 @@ impl StdioAdapter {
         if self.disconnected.load(Ordering::SeqCst) {
             return Err(Error::provider("Provider connection is closed"));
         }
-        let mut inner = self.inner.lock().unwrap();
-        let stdin = inner
-            .stdin
+        let mut guard = self.stdin.lock().unwrap();
+        let stdin = guard
             .as_mut()
             .ok_or_else(|| Error::provider("Provider connection is closed"))?;
         let mut payload = message.to_string();
@@ -267,6 +266,61 @@ impl StdioAdapter {
             .write_all(payload.as_bytes())
             .and_then(|()| stdin.flush())
             .map_err(|e| Error::unknown(format!("Provider connection closed while writing: {e}")))
+    }
+
+    /// [`Self::send`] that never blocks (CAD-323): a frame of at most
+    /// `PIPE_BUF` bytes is written with `O_NONBLOCK` — all or nothing,
+    /// by the pipe's atomicity guarantee — or not at all. A busy writer
+    /// (another frame mid-write) or a full pipe is an `Err` with provably
+    /// no bytes sent, so the caller can fall back (a signal) instead of
+    /// hanging an interrupt, a stop or a shutdown behind the pipe.
+    pub fn try_send(&self, message: Value) -> Result<()> {
+        use std::os::unix::io::AsRawFd;
+        if self.disconnected.load(Ordering::SeqCst) {
+            return Err(Error::provider("Provider connection is closed"));
+        }
+        let mut payload = message.to_string();
+        payload.push('\n');
+        if payload.len() > libc::PIPE_BUF {
+            return Err(Error::provider("frame too large for a non-blocking write"));
+        }
+        let Ok(guard) = self.stdin.try_lock() else {
+            return Err(Error::provider("provider stdin is busy with another write"));
+        };
+        let stdin = guard
+            .as_ref()
+            .ok_or_else(|| Error::provider("Provider connection is closed"))?;
+        let fd = stdin.as_raw_fd();
+        // SAFETY: fcntl/write on a pipe fd this adapter owns and holds
+        // locked; the original flags are restored before unlocking.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            if flags < 0 {
+                return Err(Error::provider("provider stdin flags unreadable"));
+            }
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            let n = libc::write(fd, payload.as_ptr().cast(), payload.len());
+            let err = std::io::Error::last_os_error();
+            libc::fcntl(fd, libc::F_SETFL, flags);
+            if n == payload.len() as isize {
+                Ok(())
+            } else if n < 0 && err.kind() == std::io::ErrorKind::WouldBlock {
+                Err(Error::provider(
+                    "provider stdin is full — the write would block",
+                ))
+            } else {
+                Err(Error::unknown(format!(
+                    "Provider connection closed while writing: {err}"
+                )))
+            }
+        }
+    }
+
+    /// [`Self::request_timeout`] whose frame goes out through
+    /// [`Self::try_send`] — the whole call is bounded by `timeout`.
+    pub fn request_bounded(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
+        self.pending
+            .request(|msg| self.try_send(msg), method, params, timeout)
     }
 
     /// JSON-RPC request/response with a bounded wait. A timeout is
@@ -314,8 +368,21 @@ impl StdioAdapter {
 
     /// Drop the stdin pipe — a stream-json provider treats EOF as a
     /// clean shutdown request and exits on its own.
+    /// A writer blocked on a full pipe keeps the pipe; [`Self::close`]'s
+    /// signals end the child and so unblock it.
     pub fn close_stdin(&self) {
-        self.inner.lock().unwrap().stdin.take();
+        // A short frame in flight lets go at once; wait briefly for it.
+        let deadline = std::time::Instant::now() + Duration::from_millis(200);
+        loop {
+            if let Ok(mut stdin) = self.stdin.try_lock() {
+                stdin.take();
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Poll for child exit up to `timeout`; true when the process ended.
@@ -361,6 +428,64 @@ impl StdioAdapter {
                 }
             }
         }
-        inner.stdin.take();
+        drop(inner);
+        // A writer still blocked (a descendant outside the group keeps
+        // the pipe open) holds its own lock; never wait on it here.
+        if let Ok(mut stdin) = self.stdin.try_lock() {
+            stdin.take();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// A provider that never reads its stdin.
+    fn deaf(dir: &std::path::Path) -> Arc<StdioAdapter> {
+        let adapter = StdioAdapter::new_lines(
+            &["sleep".to_string(), "60".to_string()],
+            EnvScrub::names(&[]),
+            Box::new(|_| {}),
+            Box::new(|| {}),
+        );
+        adapter
+            .launch(dir.to_str().unwrap(), &dir.join("stderr.log"), &[])
+            .unwrap();
+        adapter
+    }
+
+    /// CAD-323 review N1: a full stdin pipe makes `try_send` fail at
+    /// once instead of blocking; a `send` blocked on that pipe never
+    /// holds up `try_send`, the signal fallback or `close`.
+    #[test]
+    fn try_send_never_blocks_on_a_full_or_busy_pipe() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let adapter = deaf(dir.path());
+        let frame = json!({"type": "control_request", "request": {"subtype": "interrupt"}});
+        let started = Instant::now();
+        let mut sent = 0;
+        while adapter.try_send(frame.clone()).is_ok() {
+            sent += 1;
+            assert!(sent < 100_000, "the pipe never filled");
+        }
+        assert!(sent > 0);
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        // A blocking writer parked on the full pipe.
+        let writer = Arc::clone(&adapter);
+        let blocked = std::thread::spawn(move || writer.send(json!({"big": "x".repeat(1 << 16)})));
+        std::thread::sleep(Duration::from_millis(200));
+        let t = Instant::now();
+        assert!(adapter.try_send(frame.clone()).is_err());
+        adapter.interrupt(); // the SIGINT fallback: child lock only
+        adapter.close_stdin();
+        adapter.close();
+        assert!(t.elapsed() < Duration::from_secs(8), "{:?}", t.elapsed());
+        assert!(
+            blocked.join().unwrap().is_err(),
+            "the writer failed once the child died"
+        );
     }
 }

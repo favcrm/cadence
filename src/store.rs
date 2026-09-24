@@ -1863,6 +1863,20 @@ impl Store {
         Ok(())
     }
 
+    /// Does `alias`'s stream hold a `kind` event naming `message_id`
+    /// (`payload.message`) — e.g. the daemon's `master_dispatched`
+    /// record of a master kickoff (CAD-323).
+    pub fn event_names_message(&self, alias: &str, kind: &str, message_id: &str) -> Result<bool> {
+        let conn = self.conn();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE alias=?1 AND kind=?2 \
+             AND json_extract(payload,'$.message')=?3",
+            params![alias, kind, message_id],
+            |row| row.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
     /// One alert after held-recovery gives up. The agent stays unfenced
     /// and the held message is not replayed. A second call is a no-op.
     pub fn escalate_cloud_hold(&self, message: &Message, reason: &str) -> Result<()> {
