@@ -235,6 +235,8 @@ fn automatic_quota_error(agent: &Agent) -> Option<String> {
 /// the `daemon` stream, which the WAL watcher trims to its newest rows.
 /// `cadence audit` reads it read-only; nothing else consults it.
 pub const APPROVAL_STREAM: &str = "audit:approvals";
+/// CAD-405: a project's work gate keys approved by the operator.
+pub const WORK_APPROVED_EVENT: &str = "project_work_approved";
 /// An operator approved `action` on one exact head — see [`NewApproval`].
 pub const APPROVAL_RECORDED_EVENT: &str = "approval_recorded";
 /// An operator withdrew an earlier approval id. Message delivery state
@@ -1898,6 +1900,33 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// CAD-405: record the operator's approval of a project's work gate
+    /// keys (`project`, `digest`, `by`, `at`, …) on [`APPROVAL_STREAM`]
+    /// — never pruned, and not a mailbox anything can cancel.
+    pub fn record_work_approval(&self, payload: Value) -> Result<()> {
+        let conn = self.conn();
+        Self::event(&conn, APPROVAL_STREAM, WORK_APPROVED_EVENT, payload)
+    }
+
+    /// CAD-405: the latest work-gate approval per project.
+    pub fn work_approvals(&self) -> Result<std::collections::HashMap<String, Value>> {
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare("SELECT payload FROM events WHERE alias=? AND kind=? ORDER BY seq")?;
+        let mut rows = stmt.query(params![APPROVAL_STREAM, WORK_APPROVED_EVENT])?;
+        let mut out = std::collections::HashMap::new();
+        while let Some(row) = rows.next()? {
+            let raw: String = row.get(0)?;
+            let Ok(payload) = serde_json::from_str::<Value>(&raw) else {
+                continue;
+            };
+            if let Some(project) = payload["project"].as_str() {
+                out.insert(project.to_string(), payload.clone());
+            }
+        }
+        Ok(out)
     }
 
     /// Standalone event insert for runtime/daemon bookkeeping.

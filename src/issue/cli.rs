@@ -9,8 +9,8 @@ use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
 use crate::issue::{
-    board, claim, doctor, finish, history, hooks, lint, model, project, retro, start, sync, write,
-    Pm,
+    board, claim, doctor, finish, history, hooks, lint, model, project, retro, start, sync, work,
+    write, Pm,
 };
 
 #[derive(Subcommand)]
@@ -295,7 +295,8 @@ pub enum IssueAction {
         from: PathBuf,
     },
     /// Set writable fields: `status priority owner component title
-    /// tags`. Several ids make a bulk edit: one commit, and nothing is
+    /// tags type milestone size` (`type`: epic|task|bug|spike; `size`:
+    /// S|M|L; an epic's stage moves with `issue epic stage`). Several ids make a bulk edit: one commit, and nothing is
     /// written unless every id and pair is valid.
     Set {
         /// `<ID>… key=value…` — ids first; an empty value clears
@@ -310,7 +311,8 @@ pub enum IssueAction {
         #[arg(required = true)]
         args: Vec<String>,
     },
-    /// Epics — issues with children — and their progress.
+    /// Epics — `type: epic`, or issues with children — with stage,
+    /// weighted progress and health; `stage` moves one.
     Epic {
         #[command(subcommand)]
         action: EpicAction,
@@ -386,7 +388,9 @@ pub enum IssueAction {
 #[derive(Subcommand)]
 pub enum EpicAction {
     /// List epics with `total`, per-status counts, `done_ratio`,
-    /// `blocked` and the distinct owners of their children.
+    /// `blocked`, the distinct owners of their children and a `work`
+    /// block: stage, size-weighted progress (S=1 M=3 L=8, unsized=M,
+    /// dropped excluded) and health (on_track | at_risk | stalled).
     Ls {
         #[arg(long)]
         project: Option<String>,
@@ -396,6 +400,43 @@ pub enum EpicAction {
     /// One epic and its children: status, owner, priority, tags.
     Show {
         id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Move an epic to another stage — a gate decision and one tracker
+    /// commit, through the daemon. One stage forward at a time, any
+    /// stage back. A forward move into an operator stage (default
+    /// `build` and `release`; PROJECT.md `operator_stages`) needs the
+    /// operator's own connection; other moves take the caller's lane.
+    Stage {
+        /// The epic id.
+        id: String,
+        /// Target stage (default list: shape build verify release done).
+        stage: String,
+        /// Why — one line, recorded in the commit subject.
+        #[arg(long)]
+        note: Option<String>,
+    },
+}
+
+/// `cadence milestone` — milestones from PROJECT.md and the issues'
+/// `milestone` field or `m<n>-…` tag, with rolled-up progress. Read-only.
+#[derive(Subcommand)]
+pub enum MilestoneAction {
+    /// Every milestone: configured first, then any an issue names.
+    Ls {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// One milestone: exit test, epics (stage, progress, health) and
+    /// its loose issues.
+    Show {
+        /// Milestone id, e.g. `m2`.
+        id: String,
+        #[arg(long)]
+        project: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -427,6 +468,14 @@ pub enum ProjectAction {
     },
     /// List registered projects.
     Ls,
+    /// Approve the project's PROJECT.md gate keys (`stages`,
+    /// `operator_stages`) as they are now — operator only, through the
+    /// daemon. Until approved (and after any later edit), the default
+    /// stages and operator stages apply.
+    ApproveWork {
+        /// Project key.
+        key: String,
+    },
 }
 
 pub(crate) fn print_json(value: &Value) {
@@ -486,6 +535,15 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                     owner.as_deref(),
                 )?;
                 print_json(&out);
+                Ok(0)
+            }
+            ProjectAction::ApproveWork { key } => {
+                model::check_key(key)?;
+                print_json(&crate::client::rpc(
+                    state_dir,
+                    "project_work_approve",
+                    json!({"project": key}),
+                )?);
                 Ok(0)
             }
             ProjectAction::Ls => {
@@ -589,7 +647,8 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                     )
                 }
             };
-            let mut views: Vec<&board::View> = views.iter().collect();
+            let all = views;
+            let mut views: Vec<&board::View> = all.iter().collect();
             views.retain(|v| filter.matches(v));
             if *ready {
                 views.retain(|v| v.ready);
@@ -598,6 +657,19 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 let mut out = json!({
                     "issues": views.iter().map(|v| board::card_json(v)).collect::<Vec<_>>(),
                 });
+                // CAD-405: the `work` block (not for `--at`: history
+                // exports carry no PROJECT.md or clock of that time).
+                if at_meta.is_none() {
+                    let by_id: std::collections::HashMap<String, &board::View> =
+                        all.iter().map(|v| (v.issue.front.id.clone(), v)).collect();
+                    let ctx = work::Ctx::new(
+                        &pm.dir,
+                        &by_id,
+                        crate::issue::time::now_epoch(),
+                        &work::fetch_approvals(state_dir),
+                    );
+                    out["issues"] = views.iter().map(|v| work::card_json(&ctx, v)).collect();
+                }
                 if let Some(meta) = at_meta {
                     out["at"] = meta;
                 }
@@ -808,10 +880,26 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                     "Unknown issue '{id}' — `cadence issue ls` lists what exists"
                 ))
             })?;
+            let ctx = work::Ctx::new(
+                &pm.dir,
+                &by_id,
+                crate::issue::time::now_epoch(),
+                &work::fetch_approvals(state_dir),
+            );
             if *json {
-                print_json(&board::detail_json(&pm.dir, view, &by_id));
+                print_json(&work::detail_json(&pm.dir, &ctx, view));
             } else {
                 print_show(view, &by_id);
+                let w = work::item_json(&ctx, view);
+                let mut line = format!("type: {}", w["type"].as_str().unwrap_or("?"));
+                if let Some(m) = w["milestone"].as_str() {
+                    line.push_str(&format!("  milestone: {m}"));
+                }
+                if let Some(size) = w["size"].as_str() {
+                    line.push_str(&format!("  size: {size}"));
+                }
+                println!("\n{line}");
+                print_stage_and_health(&w);
             }
             Ok(0)
         }
@@ -864,10 +952,20 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             Ok(0)
         }
         IssueAction::Epic { action } => {
+            if let EpicAction::Stage { id, stage, note } = action {
+                model::check_id(id)?;
+                let out = crate::client::rpc(
+                    state_dir,
+                    "epic_stage",
+                    json!({"epic": id, "stage": stage, "note": note}),
+                )?;
+                print_json(&out);
+                return Ok(0);
+            }
             let pm = open_pm()?;
             let project = match action {
                 EpicAction::Ls { project, .. } => project.as_deref(),
-                EpicAction::Show { .. } => None,
+                _ => None,
             };
             // Every project loads so cross-project children count.
             let issues = board::load_all(&pm.dir, None)?;
@@ -875,9 +973,16 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 .map(|d| board::fetch_job_outcomes(&d))
                 .unwrap_or_default();
             let views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
+            let now = crate::issue::time::now_epoch();
             match action {
                 EpicAction::Ls { json, .. } => {
-                    let epics = board::epics_json(&views, project);
+                    let epics = work::epics_json(
+                        &pm.dir,
+                        &views,
+                        project,
+                        now,
+                        &work::fetch_approvals(state_dir),
+                    );
                     if *json {
                         print_json(&json!({"epics": epics}));
                     } else {
@@ -895,27 +1000,32 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                             "Unknown issue '{id}' — `cadence issue epic ls` lists epics"
                         ))
                     })?;
-                    if !epic.container {
+                    if model::item_type(&epic.issue.front, epic.container) != "epic" {
                         return Err(Error::rejected(format!(
-                            "{id} has no children — `cadence issue new --epic {id} \"title\"` \
-                             makes it an epic"
+                            "{id} has no children and is not `type: epic` — \
+                             `cadence issue new --epic {id} \"title\"` makes it an epic"
                         )));
                     }
+                    let ctx =
+                        work::Ctx::new(&pm.dir, &by_id, now, &work::fetch_approvals(state_dir));
                     let kids: Vec<&board::View> = epic
                         .children
                         .iter()
                         .filter_map(|k| by_id.get(k).copied())
                         .collect();
                     if *json {
-                        let mut out = board::epic_json(epic, &by_id);
-                        out["issues"] = kids.iter().map(|v| board::card_json(v)).collect();
+                        let mut out = work::epic_row(&ctx, epic);
+                        out["issues"] = kids.iter().map(|v| work::card_json(&ctx, v)).collect();
                         print_json(&out);
                     } else {
-                        print_epics_table(&[board::epic_json(epic, &by_id)]);
+                        let row = work::epic_row(&ctx, epic);
+                        print_epics_table(std::slice::from_ref(&row));
+                        print_stage_and_health(&row["work"]);
                         println!();
                         print_ls_table(&kids);
                     }
                 }
+                EpicAction::Stage { .. } => unreachable!("handled above"),
             }
             Ok(0)
         }
@@ -1007,7 +1117,8 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
         }
         IssueAction::Lint { project } => {
             let pm = open_pm()?;
-            let report = lint::run(&pm, project.as_deref())?;
+            let approvals = work::fetch_approvals(state_dir);
+            let report = lint::run_with(&pm, project.as_deref(), Some(&approvals))?;
             if report["ok"].as_bool() == Some(true) {
                 print_json(&report);
                 Ok(0)
@@ -1114,42 +1225,232 @@ fn print_ls_table(views: &[&board::View]) {
     );
 }
 
-/// `issue epic ls` table — one row per epic from `board::epic_json`.
+/// `issue epic ls` table — one row per epic from `work::epics_json`:
+/// stage, size-weighted progress, the open · doing · review · blocked
+/// counts and health.
 fn print_epics_table(epics: &[Value]) {
     if epics.is_empty() {
         eprintln!("no epics — `cadence issue new --epic <ID> \"title\"` gives an issue children");
         return;
     }
     let mut rows = vec![[
-        "EPIC", "STATUS", "DONE", "OPEN", "DOING", "REVIEW", "BLOCKED", "OWNERS", "TITLE",
+        "EPIC", "STAGE", "STATUS", "PROGRESS", "OPEN", "DOING", "REVIEW", "BLOCKED", "HEALTH",
+        "OWNERS", "TITLE",
     ]
     .map(str::to_string)
     .to_vec()];
     for e in epics {
-        let n = |k: &str| e["counts"][k].as_u64().unwrap_or(0);
-        let live = e["total"].as_u64().unwrap_or(0) - n("dropped");
+        let w = &e["work"];
+        let p = &w["progress"];
+        let n = |k: &str| p["counts"][k].as_u64().unwrap_or(0);
         let owners: Vec<&str> = e["owners"]
             .as_array()
             .map(|o| o.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
         rows.push(vec![
             e["id"].as_str().unwrap_or_default().to_string(),
+            w["stage"]["id"].as_str().unwrap_or("-").to_string(),
             e["status"].as_str().unwrap_or_default().to_string(),
             format!(
                 "{}/{} {:.0}%",
-                n("done"),
-                live,
-                e["done_ratio"].as_f64().unwrap_or(0.0) * 100.0
+                p["done_weight"].as_u64().unwrap_or(0),
+                p["total_weight"].as_u64().unwrap_or(0),
+                p["ratio"].as_f64().unwrap_or(0.0) * 100.0
             ),
-            (n("backlog") + n("ready")).to_string(),
+            n("open").to_string(),
             n("doing").to_string(),
             n("review").to_string(),
-            e["blocked"].as_u64().unwrap_or(0).to_string(),
+            n("blocked").to_string(),
+            w["health"]["state"]
+                .as_str()
+                .unwrap_or("-")
+                .replace('_', " "),
             owners.join(","),
             e["title"].as_str().unwrap_or_default().to_string(),
         ]);
     }
     print_table(&rows);
+    eprintln!("PROGRESS = done weight / live weight (S=1 M=3 L=8, unsized=M)");
+}
+
+/// The stage line (exit criterion, next stage) and each health reason
+/// of one epic's `work` block.
+fn print_stage_and_health(w: &Value) {
+    let st = &w["stage"];
+    if st.is_null() {
+        return;
+    }
+    let since = st["since"]
+        .as_str()
+        .map(|s| format!(" since {s}"))
+        .unwrap_or_default();
+    println!(
+        "stage: {} ({}){since}",
+        st["id"].as_str().unwrap_or("?"),
+        st["source"].as_str().unwrap_or("?")
+    );
+    if let Some(exit) = st["exit"].as_str().filter(|e| !e.is_empty()) {
+        println!("  exit: {exit}");
+    }
+    if let Some(next) = st["next"].as_str() {
+        let who = if st["next_needs_operator"].as_bool() == Some(true) {
+            " (operator)"
+        } else {
+            ""
+        };
+        println!("  next: {next}{who}");
+    }
+    let h = &w["health"];
+    println!(
+        "health: {}",
+        h["state"].as_str().unwrap_or("?").replace('_', " ")
+    );
+    for r in h["reasons"].as_array().into_iter().flatten() {
+        println!(
+            "  {} — {} (owner {}; next: {})",
+            r["cause"].as_str().unwrap_or("?"),
+            r["detail"].as_str().unwrap_or(""),
+            r["owner"].as_str().unwrap_or("-"),
+            r["next"].as_str().unwrap_or("")
+        );
+    }
+    if let Some(e) = w["config_error"].as_str() {
+        println!("config: {e} — using the defaults");
+    }
+}
+
+/// `cadence milestone ls|show` — read-only.
+pub fn run_milestone(action: &MilestoneAction, state_dir: &std::path::Path) -> Result<i32> {
+    let pm = open_pm()?;
+    let wanted = match action {
+        MilestoneAction::Ls { project, .. } | MilestoneAction::Show { project, .. } => {
+            project.as_deref()
+        }
+    };
+    if let Some(want) = wanted {
+        model::check_key(want)?;
+        if !project::list(&pm.dir)?.iter().any(|p| p.key == want) {
+            return Err(project::unknown_project(want, &pm.dir));
+        }
+    }
+    let issues = board::load_all(&pm.dir, None)?;
+    let jobs = crate::client::state_dir()
+        .map(|d| board::fetch_job_outcomes(&d))
+        .unwrap_or_default();
+    let views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
+    let by_id: std::collections::HashMap<String, &board::View> = views
+        .iter()
+        .map(|v| (v.issue.front.id.clone(), v))
+        .collect();
+    let ctx = work::Ctx::new(
+        &pm.dir,
+        &by_id,
+        crate::issue::time::now_epoch(),
+        &work::fetch_approvals(state_dir),
+    );
+    match action {
+        MilestoneAction::Ls { json, .. } => {
+            let rows = work::milestones_json(&ctx, &views, wanted);
+            if *json {
+                print_json(&json!({"milestones": rows}));
+            } else {
+                print_milestones_table(&rows);
+            }
+        }
+        MilestoneAction::Show { id, json, .. } => {
+            let row = work::milestone_show(&ctx, &views, id, wanted)?;
+            if *json {
+                print_json(&row);
+            } else {
+                print_milestones_table(std::slice::from_ref(&row));
+                if let Some(exit) = row["exit"].as_str() {
+                    println!("exit: {exit}");
+                }
+                for r in row["health"]["reasons"].as_array().into_iter().flatten() {
+                    println!(
+                        "  {} — {} (next: {})",
+                        r["cause"].as_str().unwrap_or("?"),
+                        r["detail"].as_str().unwrap_or(""),
+                        r["next"].as_str().unwrap_or("")
+                    );
+                }
+                let mut rows = vec![
+                    ["ID", "KIND", "STAGE/STATUS", "PROGRESS", "HEALTH", "TITLE"]
+                        .map(str::to_string)
+                        .to_vec(),
+                ];
+                for e in row["epics"].as_array().into_iter().flatten() {
+                    rows.push(vec![
+                        e["id"].as_str().unwrap_or_default().to_string(),
+                        "epic".to_string(),
+                        e["stage"].as_str().unwrap_or("-").to_string(),
+                        format!("{:.0}%", e["progress"].as_f64().unwrap_or(0.0) * 100.0),
+                        e["health"].as_str().unwrap_or("-").replace('_', " "),
+                        e["title"].as_str().unwrap_or_default().to_string(),
+                    ]);
+                }
+                for i in row["issues"].as_array().into_iter().flatten() {
+                    rows.push(vec![
+                        i["id"].as_str().unwrap_or_default().to_string(),
+                        i["type"].as_str().unwrap_or_default().to_string(),
+                        i["status"].as_str().unwrap_or_default().to_string(),
+                        String::new(),
+                        if i["blocked"].as_bool() == Some(true) {
+                            "blocked".to_string()
+                        } else {
+                            String::new()
+                        },
+                        i["title"].as_str().unwrap_or_default().to_string(),
+                    ]);
+                }
+                println!();
+                print_table(&rows);
+            }
+        }
+    }
+    Ok(0)
+}
+
+fn print_milestones_table(rows: &[Value]) {
+    if rows.is_empty() {
+        eprintln!(
+            "no milestones — declare them in <pm>/<project>/PROJECT.md or set \
+             `cadence issue set <ID> milestone=m1`"
+        );
+        return;
+    }
+    let mut table = vec![[
+        "PROJECT",
+        "MILESTONE",
+        "PROGRESS",
+        "EPICS",
+        "ISSUES",
+        "HEALTH",
+        "TITLE",
+    ]
+    .map(str::to_string)
+    .to_vec()];
+    for r in rows {
+        let p = &r["progress"];
+        table.push(vec![
+            r["project"].as_str().unwrap_or_default().to_string(),
+            r["id"].as_str().unwrap_or_default().to_string(),
+            format!(
+                "{}/{} {:.0}%",
+                p["done_weight"].as_u64().unwrap_or(0),
+                p["total_weight"].as_u64().unwrap_or(0),
+                p["ratio"].as_f64().unwrap_or(0.0) * 100.0
+            ),
+            r["epics"].as_array().map_or(0, Vec::len).to_string(),
+            r["issues"].as_array().map_or(0, Vec::len).to_string(),
+            r["health"]["state"]
+                .as_str()
+                .unwrap_or("-")
+                .replace('_', " "),
+            r["title"].as_str().unwrap_or("-").to_string(),
+        ]);
+    }
+    print_table(&table);
 }
 
 fn print_show(view: &board::View, by_id: &std::collections::HashMap<String, &board::View>) {

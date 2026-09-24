@@ -269,6 +269,11 @@ cadence plan approve CAD-40        # operator only; tickets → ready. Until
                                       # its tickets refuse (`plan reject
                                       # CAD-40 --reason …` records a no)
 cadence plan show CAD-40           # state, tickets, size-weighted progress
+cadence issue epic stage CAD-40 verify
+                                   # CAD-405: move an epic's stage (one
+                                      # forward, any back; build/release
+                                      # forward = operator only)
+cadence milestone ls               # milestones with weighted progress
 cadence ui run                     # 127.0.0.1:3010 — SPA + read/write API
 cadence secret scan [--file f]     # credential scan: JSON findings
                                    # {rule,line,column,redacted,severity,

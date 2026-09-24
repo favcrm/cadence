@@ -849,6 +849,13 @@ enum Commands {
         #[command(subcommand)]
         action: PlanAction,
     },
+    /// Milestones (CAD-405): declared in the project's PROJECT.md or
+    /// named by an issue's `milestone` / `m<n>-…` tag, with size-weighted
+    /// progress and health rolled up from their epics and issues.
+    Milestone {
+        #[command(subcommand)]
+        action: cadence_agent::issue::cli::MilestoneAction,
+    },
     /// File a report: a question, feedback, idea or bug becomes a
     /// tracker issue with context — instead of dying in a terminal
     /// scrollback. Routing is by kind, not by cwd: `question`,
@@ -5557,6 +5564,9 @@ fn run() -> Result<i32> {
         }
         Commands::Issue { action } => cadence_agent::issue::cli::run(&action, &state_dir),
         Commands::Plan { action } => run_plan(&state_dir, action),
+        Commands::Milestone { action } => {
+            cadence_agent::issue::cli::run_milestone(&action, &state_dir)
+        }
         Commands::Report {
             kind,
             project,
