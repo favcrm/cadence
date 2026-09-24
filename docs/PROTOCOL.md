@@ -45,7 +45,7 @@ Error kinds:
 | `agent_show` | `alias` | `{agent, messages, event_cursor, queued, unknown, inbox?}` — `unknown` counts unreconciled unknowns fencing the agent; `agent.awaiting_report` (also on `agent_list` rows) is `{message, turn_id, task_id, since_secs, acked, report_timeout_secs, remaining_secs, count, queued_behind}` while a delivered pty turn awaits its report (null otherwise; `remaining_secs` null when the bound is disabled; `turn_id`, here and on message rows, is `null` unless the connection is that agent's own pane or endpoint — CAD-375), and that message's row carries `awaiting_report: true`; passive `inbox` evidence includes queued count, oldest age, last receipt/progress, and `semantic_completion:"external_consumer_required"`; it is never a drain or completion claim. `agent.capabilities` is the registry descriptor; `agent.model_reported` is the model the provider reports running (claude: the stream's `system/init` model) beside `model_configured`, `model_effective`, `model_source` (`configured` or `provider default`), `effort_configured`, `effort_reported`, `effort_effective` and legacy `effort` — also on every `agent_list` row. `team_role`, `model_lookup_role`, and `model_selection` (`source`, `lookup_role`, `revision`, `model`) record how a launch model was chosen. Unsupported endpoints leave `model_selection` null. Existing rows without stored provenance are labeled `legacy_configured` or `legacy_provider_default` at read time |
 | `model_defaults_get` | — | `{revision, config, providers, roles}` — daemon-wide provider baselines and team-role overrides. Suggestions are previously observed model ids, not a catalog. Does not start provider processes |
 | `model_defaults_set` | `document` (raw JSON string `{expected_revision, config}`) | the same snapshot as get, after an atomic revision bump. Mismatched `expected_revision` is `kind:"conflict"`, `code:"revision_conflict"`, with `revision` set to the current value and no write. **Operator only** (CAD-337), the connection-bound gate `slot_reconcile` and `approval_record` use: a pane or managed endpoint, or any caller not provably the operator (`peer::operator_proof`), is refused naming the rule; identity-shaped fields (`attribution`, `by`, `actor`, …) are refused, not read. The `model_defaults_updated` event records the verified caller: attribution `operator`, transport `operator-connection` |
-| `agent_send` | `alias, text, message?, reply_to?, source?, task?, nudge?` | `{message,state,duplicate,warning?}` — a `message` id starting `sys-` or a `source` of `wake` is refused (the daemon's own, CAD-445 — refused by the store on every enqueue path); `task` attaches the delivery to a task for indexing; `nudge: true` (CLI `send --nudge` / `message send --nudge`, pty only, no `reply_to`, not with `--ready`) records a turnless `source: "nudge"` delivery — see the CAD-250 section; `warning` names a stale inbox target (queued anyway — see inbox endpoints) |
+| `agent_send` | `alias, text, message?, reply_to?, source?, task?, nudge?, priority?, supersedes?` | `{message,state,duplicate,warning?}` — a `message` id starting `sys-` or a `source` of `wake` is refused (the daemon's own, CAD-445 — refused by the store on every enqueue path); `priority` (`normal`\|`urgent`) and `supersedes` (array of message ids) steer the recipient's queue — see the CAD-158 section; `task` attaches the delivery to a task for indexing; `nudge: true` (CLI `send --nudge` / `message send --nudge`, pty only, no `reply_to`, not with `--ready`) records a turnless `source: "nudge"` delivery — see the CAD-250 section; `warning` names a stale inbox target (queued anyway — see inbox endpoints) |
 | `agent_ask` | `alias, text, message?, reply_to?, wait?` | the `Message` row; state may be non-terminal if `wait` expired |
 | `agent_events` | `alias, after?, wait(<=30), tail?` | `{events:[Event], cursor, has_older}` — `tail:true` returns the newest page (50) in ascending order instead of paging forward from `after` |
 | `thread_read` | `alias, after?, limit?(1-500, default 100), wait?(<=30)` — or backwards: `tail?:true` / `before?(seq>=1)`, `limit?` (CAD-328) | `{alias, thread:{id,alias,created,updated}\|null, entries:[{seq,thread,role,kind,text,payload,message,created}], cursor}` — the agent's durable chat (CAD-319), oldest first after `after`. `tail` reads the newest `limit` entries and `before` the `limit` entries below a seq, still oldest first, plus `more_before` (older entries remain); a backward read never waits and refuses `after`/`wait`. Removing the agent archives its thread (rows kept by thread id, a `system` entry marks the removal) and a new agent under the reused alias starts a fresh one (CAD-304 S4); archived threads are not readable by alias in the MVP. Reads are unscoped in the MVP — any local caller can read any alias's thread, the same as `agent_show`/`agent_events`. Roles `operator\|agent\|system`; kinds `message\|assistant_text\|tool_call\|tool_result\|turn_result`. Text and payload strings are secret-redacted before they are stored; tool calls and tool results are a one-line redacted summary (≤160 chars; a result adds `payload.is_error`), never the raw input or output. `assistant_text` is intermediate prose only (managed Claude text blocks, Codex commentary items, `payload.phase: "commentary"`); the final answer is stored once, as the `turn_result` (CAD-320). Codex `final_answer` and unphased items are held until the message finishes and kept as `assistant_text` only when the result does not carry them — an `unknown` or failed turn loses none of its text. A live turn token quoted in prose is not scrubbed on write — the secret scan does not know it — and is redacted at `export`; a read by anyone but the owning agent's connection masks it (CAD-375) |
@@ -175,6 +175,7 @@ it. The table's rules run before the method, on the same derivation
 | `shutdown` (CAD-384) | the proven operator; the agent holding the live rollout lease under a live operator grant; in a sandbox, a caller tied to none of its agents | every other agent (an ungranted or revoked holder included), and a detached child of one. This guards against mistaken or misattributed stops, not a hostile same-uid agent, which can write the state database or kill the daemon (CAD-280) — it is not a security boundary |
 | `rollout_grant`, `rollout_revoke` (CAD-384) | the proven operator (`operator_connection`) | every agent |
 | `agent_stop`, `agent_resume`, `message_cancel` in a sandbox (CAD-384) | also a caller tied to none of the sandbox's agents — `sandbox down` run from a production pane; recorded `by:"operator (sandbox)"` | a caller tied to a sandbox agent by ancestry, pty, env alias, or as a sandbox-daemon descendant |
+| `agent_send`/`agent_ask` with `priority: "urgent"` or `supersedes` (CAD-158) | the proven operator, or the recipient's own PM (`peer::may_mutate_agent`, steer class); superseded rows record `by`/`by_kind` | the recipient itself, a worker writing to its own PM (worker output is never urgent), a peer, another group's PM, a detached child; identity-shaped fields are refused |
 | `thread_send`, and an `agent_send` that would land in a thread as the operator's (CAD-384) | the proven operator | every agent (for `thread_send`); a detached child of an agent |
 | running turn tokens (any answer) | only the connection that derives the agent owning the turn | everyone else, the operator and the board included, reads `null` for that `turn_id` (and `[turn token withheld]` where prose quotes it), whether or not the token is current |
 
@@ -849,6 +850,32 @@ task, a `--task` follow-up, a `send --ready` message — is accepted
 `queued` and stays there, never refused and never pasted, until the
 held turn is reported, reconciled or bounded to `unknown`; a `message
 result` wakes the actor so the next one is claimed at once.
+
+**Priority and supersession (CAD-158).** `cadence send <alias>
+--priority urgent` (RPC `agent_send priority: "urgent"` — a string;
+any other JSON type is refused — stored as
+`messages.priority`, schema v15) is claimed ahead of every queued
+`normal` message for that agent — first in, first out within a
+priority — but only at the next safe boundary: the one-turn hold above
+and the pty submission gate apply unchanged, so an urgent message never
+interrupts a running turn or an open approval (interrupting one is
+`cadence interrupt`, CAD-323). `--supersedes <id>[,<id>…]` (RPC
+`supersedes: [ids]`) replaces stale queued instructions in ONE
+transaction: every named message must be the recipient's own, still
+`queued` (never claimed, so never pasted) and an instruction — not a
+routed notice, not a task kickoff (`task cancel` owns those). Anything
+else refuses the whole call, naming the id and its state, and nothing
+changes. Each superseded row keeps its body and history as `cancelled`
+with `result {via: "supersede", reason: "superseded by <new-id>",
+superseded_by, by, by_kind}` and a `cancelled` event (scoped to its
+task when it was a `--task` follow-up); each DISTINCT `reply_to` of the
+replaced rows gets ONE informational `worker_notice` naming every
+replaced id and the superseding one — none when that `reply_to` is the
+caller itself; a `steered` event on the recipient records the
+priority, the superseded ids and the caller. Retrying the same envelope is a `duplicate` only
+when it names the same set. Both flags are the operator's or the
+recipient's own PM's (see the caller table); `--nudge` takes neither.
+Inbox drains keep arrival order (their cursor is the last `seq`).
 
 **Nudges — mid-turn steering.** `cadence send <alias> --nudge --text
 …` (or `message send --nudge`, RPC `agent_send nudge: true`) is the

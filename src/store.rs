@@ -338,6 +338,8 @@ pub struct Message {
     /// The task this delivery carries (a dispatch kickoff or a
     /// `--task` follow-up). NULL = unattached delivery.
     pub task_id: Option<String>,
+    /// Delivery rank (CAD-158): `urgent` is claimed ahead of `normal`.
+    pub priority: Priority,
     pub created: f64,
     pub started: Option<f64>,
     pub completed: Option<f64>,
@@ -622,6 +624,7 @@ fn row_message(row: &rusqlite::Row) -> rusqlite::Result<Message> {
         result: result.and_then(|r| serde_json::from_str(&r).ok()),
         error: row.get("error")?,
         task_id: row.get("task_id")?,
+        priority: Priority::from_rank(row.get("priority")?),
         created: row.get("created")?,
         started: row.get("started")?,
         completed: row.get("completed")?,
@@ -944,6 +947,10 @@ impl Message {
         if self.is_nudge() {
             j["nudge"] = json!(true);
         }
+        // Additive like `nudge`: only a non-default rank is shown.
+        if self.priority != Priority::Normal {
+            j["priority"] = json!(self.priority.as_str());
+        }
         j
     }
 }
@@ -966,6 +973,83 @@ pub fn report_timeout_secs(params: Option<&Value>) -> u64 {
 
 /// The `source` of a `send --nudge` delivery ([`Message::is_nudge`]).
 pub const NUDGE_SOURCE: &str = "nudge";
+
+/// CAD-158: a queued message's delivery rank, stored as the
+/// `messages.priority` integer. `take_queued` claims `urgent` ahead of
+/// every `normal` row — FIFO within a rank — but only at a safe
+/// boundary: the one-running-turn hold (CAD-250) and the pty submission
+/// gate apply to it unchanged, so it never interrupts a running turn
+/// or an open approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Priority {
+    #[default]
+    Normal,
+    Urgent,
+}
+
+impl Priority {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "normal" => Ok(Priority::Normal),
+            "urgent" => Ok(Priority::Urgent),
+            other => Err(Error::rejected(format!(
+                "priority must be normal or urgent, not '{other}'"
+            ))),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Priority::Normal => "normal",
+            Priority::Urgent => "urgent",
+        }
+    }
+
+    fn rank(self) -> i64 {
+        match self {
+            Priority::Normal => 0,
+            Priority::Urgent => 1,
+        }
+    }
+
+    fn from_rank(rank: i64) -> Self {
+        if rank > 0 {
+            Priority::Urgent
+        } else {
+            Priority::Normal
+        }
+    }
+}
+
+/// The one delivery order of an agent's queue — rank, then arrival.
+/// `take_queued` claims by it and `queued_head` (the stall watch) reads
+/// the same head.
+const QUEUE_ORDER_SQL: &str = "ORDER BY priority DESC, seq";
+
+/// CAD-158: how a send steers the recipient's queue — its rank, and the
+/// still-queued messages it atomically replaces. `by`/`by_kind` is the
+/// daemon-derived caller, stamped on every superseded row.
+#[derive(Debug, Clone, Copy)]
+pub struct Steer<'a> {
+    pub priority: Priority,
+    pub supersedes: &'a [String],
+    pub by: &'a str,
+    pub by_kind: &'a str,
+}
+
+impl Steer<'_> {
+    /// A plain send: normal rank, replaces nothing.
+    pub const NONE: Steer<'static> = Steer {
+        priority: Priority::Normal,
+        supersedes: &[],
+        by: "",
+        by_kind: "",
+    };
+
+    pub fn is_steering(&self) -> bool {
+        self.priority != Priority::Normal || !self.supersedes.is_empty()
+    }
+}
 
 /// Sources that never own a turn — [`Message::is_routed`] plus
 /// [`Message::is_nudge`]; they pass the one-turn hold and never hold it.
@@ -1468,6 +1552,26 @@ impl Store {
             let tx = conn.unchecked_transaction()?;
             if !columns.iter().any(|column| column == "pid_start") {
                 tx.execute_batch("ALTER TABLE agents ADD COLUMN pid_start INTEGER")?;
+            }
+            tx.execute("UPDATE schema_version SET version=14", [])?;
+            tx.commit()?;
+        }
+        if version < 15 {
+            // v15: `messages.priority` (CAD-158) — the delivery rank
+            // `take_queued` orders by (urgent first, then arrival).
+            // Existing rows read 0 = normal, so an upgraded queue keeps
+            // its FIFO order. Column add + bump in one transaction, the
+            // add skipped when present: a half-applied v15 converges.
+            let columns: Vec<String> = conn
+                .prepare("PRAGMA table_info(messages)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .filter_map(std::result::Result::ok)
+                .collect();
+            let tx = conn.unchecked_transaction()?;
+            if !columns.iter().any(|column| column == "priority") {
+                tx.execute_batch(
+                    "ALTER TABLE messages ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
+                )?;
             }
             tx.execute(
                 "UPDATE schema_version SET version=?1",
@@ -2385,9 +2489,97 @@ impl Store {
         task_id: Option<&str>,
         sender: &Sender,
     ) -> Result<(bool, String)> {
+        self.enqueue_steered(
+            alias,
+            body,
+            reply_to,
+            id,
+            source,
+            task_id,
+            sender,
+            &Steer::NONE,
+        )
+    }
+
+    /// `enqueue_sent` with steering (CAD-158): the new message's rank,
+    /// and the still-`queued` messages it replaces — all in ONE
+    /// transaction. Every named id must be `alias`'s own, still
+    /// `queued` (never claimed, so never pasted), and an instruction:
+    /// not a routed notice and not a task kickoff (`task cancel` owns
+    /// that). Any other id refuses the whole call, naming it and its
+    /// state, and nothing changes. Each superseded row keeps its history
+    /// as `cancelled` with reason `superseded by <id>` and the caller,
+    /// and its `reply_to` gets one `superseded` notice naming the new id.
+    ///
+    /// A retry of the same envelope is `duplicate` only when it names
+    /// the same superseded set; otherwise it is a conflict.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_steered(
+        &self,
+        alias: &str,
+        body: &str,
+        reply_to: Option<&str>,
+        id: &str,
+        source: &str,
+        task_id: Option<&str>,
+        sender: &Sender,
+        steer: &Steer,
+    ) -> Result<(bool, String)> {
         let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
-        let out = self.enqueue_tx(&tx, alias, body, reply_to, id, source, task_id, sender)?;
+        let mut named: Vec<&str> = Vec::new();
+        for m in steer.supersedes {
+            if !named.contains(&m.as_str()) {
+                named.push(m);
+            }
+        }
+        let retry = self.message_in(&tx, id)?.is_some();
+        let superseded = if retry {
+            // The envelope itself is compared by `enqueue_tx`; the
+            // superseded set is part of it.
+            let mut replaced = Self::superseded_by_in(&tx, id)?;
+            replaced.sort();
+            let mut wanted: Vec<String> = named.iter().map(|m| m.to_string()).collect();
+            wanted.sort();
+            if replaced != wanted {
+                return Err(Error::rejected(
+                    "Message id was already used with different content",
+                ));
+            }
+            Vec::new()
+        } else {
+            named
+                .iter()
+                .map(|m| self.supersedable_in(&tx, alias, m))
+                .collect::<Result<Vec<_>>>()?
+        };
+        let out = self.enqueue_tx(
+            &tx,
+            alias,
+            body,
+            reply_to,
+            id,
+            source,
+            task_id,
+            sender,
+            steer.priority,
+        )?;
+        for old in &superseded {
+            self.supersede_in(&tx, old, id, steer)?;
+        }
+        self.notify_superseded(&tx, &superseded, id, steer)?;
+        if !retry && steer.is_steering() {
+            Self::event_scoped(
+                &tx,
+                alias,
+                "steered",
+                json!({"message": id, "priority": steer.priority.as_str(),
+                       "supersedes": named, "by": steer.by,
+                       "by_kind": steer.by_kind}),
+                None,
+                task_id,
+            )?;
+        }
         tx.commit()?;
         Ok(out)
     }
@@ -2422,10 +2614,148 @@ impl Store {
             source,
             None,
             &Sender::Unattributed,
+            Priority::Normal,
             true,
         )?;
         tx.commit()?;
         Ok(out)
+    }
+
+    /// The ids a steering send superseded, oldest first.
+    fn superseded_by_in(tx: &Connection, id: &str) -> Result<Vec<String>> {
+        let mut stmt = tx.prepare(
+            "SELECT id FROM messages WHERE state='cancelled'
+             AND json_extract(result,'$.superseded_by')=? ORDER BY seq",
+        )?;
+        let ids = stmt
+            .query_map([id], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(ids)
+    }
+
+    /// CAD-158 fail-closed gate: `id` may be superseded by a send to
+    /// `alias` only while it is `alias`'s own still-`queued` instruction.
+    /// The refusal names the id and what it is.
+    fn supersedable_in(&self, tx: &Connection, alias: &str, id: &str) -> Result<Message> {
+        let refuse = |why: String| {
+            Error::rejected(format!(
+                "--supersedes refused, nothing changed: message '{id}' {why} — only \
+                 {alias}'s own still-queued instructions can be superseded"
+            ))
+        };
+        let Some(message) = self.message_in(tx, id)? else {
+            return Err(refuse("is unknown".to_string()));
+        };
+        if message.alias != alias {
+            return Err(refuse(format!(
+                "is agent '{}''s (state {})",
+                message.alias, message.state
+            )));
+        }
+        if message.state != "queued" {
+            return Err(refuse(format!("is {}", message.state)));
+        }
+        if message.is_routed() {
+            return Err(refuse(format!(
+                "is a routed {} (state queued), not an instruction",
+                message.source
+            )));
+        }
+        if message.source == "job_dispatch" {
+            return Err(refuse(format!(
+                "is task '{}''s kickoff (state queued) — `cadence task cancel` owns it",
+                message.task_id.as_deref().unwrap_or_default()
+            )));
+        }
+        Ok(message)
+    }
+
+    /// Cancel one validated `queued` row as superseded by `new_id`. The
+    /// state-guarded UPDATE loses cleanly to a concurrent claim, and the
+    /// caller's transaction then rolls back the whole send.
+    fn supersede_in(
+        &self,
+        tx: &Connection,
+        message: &Message,
+        new_id: &str,
+        steer: &Steer,
+    ) -> Result<()> {
+        let reason = format!("superseded by {new_id}");
+        let result = json!({
+            "status": "cancelled", "via": "supersede",
+            "by": steer.by, "by_kind": steer.by_kind,
+            "reason": reason, "superseded_by": new_id,
+        });
+        let n = tx.execute(
+            "UPDATE messages SET state='cancelled',result=?,completed=?
+             WHERE id=? AND state='queued'",
+            params![result.to_string(), now(), message.id],
+        )?;
+        if n == 0 {
+            return Err(Error::rejected(format!(
+                "--supersedes refused, nothing changed: message '{}' left queued \
+                 state before the supersede committed",
+                message.id
+            )));
+        }
+        // Scoped like the row's own `queued` event: a superseded
+        // `--task` follow-up leaves its cancellation on the task's
+        // (and job's) stream, not only the agent's.
+        let job_id: Option<String> = match message.task_id.as_deref() {
+            Some(task) => tx
+                .query_row("SELECT job_id FROM tasks WHERE id=?", [task], |r| r.get(0))
+                .optional()?,
+            None => None,
+        };
+        Self::event_scoped(
+            tx,
+            &message.alias,
+            "cancelled",
+            json!({"message": message.id, "by": steer.by, "by_kind": steer.by_kind,
+                   "reason": reason, "superseded_by": new_id}),
+            job_id.as_deref(),
+            message.task_id.as_deref(),
+        )?;
+        Ok(())
+    }
+
+    /// One `superseded` notice per DISTINCT `reply_to` of the rows a
+    /// steering send replaced, naming every replaced id and the new one —
+    /// and none to the caller itself: a PM superseding its own queued
+    /// instructions already knows, and N notices would be N wasted
+    /// turns. The deterministic notice id is keyed on the first
+    /// replaced row per recipient.
+    fn notify_superseded(
+        &self,
+        tx: &Connection,
+        superseded: &[Message],
+        new_id: &str,
+        steer: &Steer,
+    ) -> Result<()> {
+        let mut targets: Vec<&str> = Vec::new();
+        for m in superseded {
+            if let Some(target) = m.reply_to.as_deref() {
+                let caller = steer.by_kind == "agent" && target == steer.by;
+                if !caller && !targets.contains(&target) {
+                    targets.push(target);
+                }
+            }
+        }
+        for target in targets {
+            let group: Vec<&Message> = superseded
+                .iter()
+                .filter(|m| m.reply_to.as_deref() == Some(target))
+                .collect();
+            let result = json!({
+                "status": "cancelled", "via": "supersede",
+                "by": steer.by, "by_kind": steer.by_kind,
+                "reason": format!("superseded by {new_id}"),
+                "superseded_by": new_id,
+                "superseded": group.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            });
+            self.route_notice(tx, group[0], "superseded", &result)?;
+        }
+        Ok(())
     }
 
     /// Transactional enqueue — validation, idempotent dedupe, insert,
@@ -2444,9 +2774,10 @@ impl Store {
         source: &str,
         task_id: Option<&str>,
         sender: &Sender,
+        priority: Priority,
     ) -> Result<(bool, String)> {
         self.enqueue_tx_as(
-            tx, alias, body, reply_to, id, source, task_id, sender, false,
+            tx, alias, body, reply_to, id, source, task_id, sender, priority, false,
         )
     }
 
@@ -2461,6 +2792,7 @@ impl Store {
         source: &str,
         task_id: Option<&str>,
         sender: &Sender,
+        priority: Priority,
         daemon: bool,
     ) -> Result<(bool, String)> {
         if !daemon {
@@ -2490,7 +2822,8 @@ impl Store {
                 && old.body == body
                 && old.reply_to.as_deref() == reply_to
                 && old.source == source
-                && old.task_id.as_deref() == task_id;
+                && old.task_id.as_deref() == task_id
+                && old.priority == priority;
             if !same {
                 return Err(Error::rejected(
                     "Message id was already used with different content",
@@ -2499,9 +2832,18 @@ impl Store {
             return Ok((true, old.state));
         }
         tx.execute(
-            "INSERT INTO messages(id,alias,body,reply_to,source,task_id,created)
-             VALUES(?,?,?,?,?,?,?)",
-            params![id, alias, body, reply_to, source, task_id, now()],
+            "INSERT INTO messages(id,alias,body,reply_to,source,task_id,priority,created)
+             VALUES(?,?,?,?,?,?,?,?)",
+            params![
+                id,
+                alias,
+                body,
+                reply_to,
+                source,
+                task_id,
+                priority.rank(),
+                now()
+            ],
         )?;
         Self::event_scoped(
             tx,
@@ -2765,9 +3107,10 @@ impl Store {
         )
     }
 
-    /// Atomically take the oldest queued message for `alias` and mark it
-    /// `submitting`. The actor is the only caller; one actor per alias keeps
-    /// turns serialized.
+    /// Atomically take the next queued message for `alias` — the oldest
+    /// of the highest rank ([`QUEUE_ORDER_SQL`]) — and mark it
+    /// `submitting`. The actor is the only caller; one actor per alias
+    /// keeps turns serialized.
     pub fn take_queued(&self, alias: &str) -> Result<Take> {
         let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
@@ -2792,12 +3135,13 @@ impl Store {
         let next_sql = if holding {
             format!(
                 "SELECT * FROM messages WHERE alias=? AND state='queued'
-                 AND source IN {TURNLESS_SOURCES_SQL} ORDER BY seq LIMIT 1"
+                 AND source IN {TURNLESS_SOURCES_SQL} {QUEUE_ORDER_SQL} LIMIT 1"
             )
         } else {
-            "SELECT * FROM messages WHERE alias=? AND state='queued'
-             ORDER BY seq LIMIT 1"
-                .to_string()
+            format!(
+                "SELECT * FROM messages WHERE alias=? AND state='queued'
+                 {QUEUE_ORDER_SQL} LIMIT 1"
+            )
         };
         loop {
             let next = tx.query_row(&next_sql, [alias], row_message).ok();
@@ -3382,6 +3726,26 @@ impl Store {
                     "A managed worker's queued message was cancelled before delivery — nothing \
                  ran. This is an informational notice, not a result; do not treat it as \
                  worker output. {payload}"
+                ),
+                "superseded" => format!(
+                    "A managed worker's queued message(s) {} were superseded by message {} \
+                 before delivery — nothing ran; that message carries the current instruction. \
+                 This is an informational notice, not a result; do not treat it as worker \
+                 output. {payload}",
+                    result
+                        .get("superseded")
+                        .and_then(Value::as_array)
+                        .map(|ids| {
+                            ids.iter()
+                                .filter_map(Value::as_str)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .unwrap_or_default(),
+                    result
+                        .get("superseded_by")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
                 ),
                 _ => format!(
                     "A managed worker's turn outcome is unknown — the worker is fenced and an \
@@ -4742,14 +5106,18 @@ impl Store {
         Ok(())
     }
 
-    /// The oldest still-waiting message for the agent — `queued` or
-    /// mid-gate `submitting`. The stall watch tracks it so a pane menu
-    /// blocking delivery is visible before any turn starts.
+    /// The next still-waiting message for the agent — `queued` or
+    /// mid-gate `submitting` — in `take_queued`'s order. The stall watch
+    /// tracks it so a pane menu blocking delivery is visible before any
+    /// turn starts.
     pub fn queued_head(&self, alias: &str) -> Result<Option<Message>> {
         let conn = self.conn();
+        // A mid-gate `submitting` row is the one being delivered, so it
+        // leads whatever its rank.
         match conn.query_row(
             "SELECT * FROM messages WHERE alias=? AND state IN
-             ('queued','submitting') ORDER BY seq LIMIT 1",
+             ('queued','submitting')
+             ORDER BY state='submitting' DESC, priority DESC, seq LIMIT 1",
             [alias],
             row_message,
         ) {
@@ -5187,6 +5555,7 @@ impl Store {
             "job_dispatch",
             Some(task_id),
             &Sender::Unattributed,
+            Priority::Normal,
         )?;
         if duplicate {
             tx.commit()?;
@@ -6135,6 +6504,7 @@ impl Store {
             "job_dispatch",
             Some(task_id),
             &Sender::Unattributed,
+            Priority::Normal,
         )?;
         if duplicate {
             return Ok((task, kickoff, true, false));
@@ -8961,7 +9331,7 @@ mod tests {
                 (Some(4242), None, "stopped")
             );
         }
-        assert_eq!(version(&db), 14);
+        assert_eq!(version(&db), crate::rollout::SCHEMA_VERSION);
         assert!(has_column(&db));
         // Half-applied: column present, version rolled back — converges.
         Connection::open(&db)
@@ -8972,7 +9342,7 @@ mod tests {
             let s = Store::open_for_schema_tests(&db).unwrap();
             assert_eq!(s.agent("m1").unwrap().pid, Some(4242));
         }
-        assert_eq!(version(&db), 14);
+        assert_eq!(version(&db), crate::rollout::SCHEMA_VERSION);
         // Reopening a current store is a no-op.
         let s = Store::open(&db).unwrap();
         assert_eq!(s.agent("m1").unwrap().pid_start, None);
@@ -10941,5 +11311,473 @@ mod tests {
             assert!(note.contains("frees no memory and no disk"), "{note}");
             assert!(note.contains("can no longer be resumed"), "{note}");
         }
+    }
+
+    // ---- CAD-158: priority steering and supersession ----
+
+    fn steer_as_pm(priority: Priority, supersedes: &[String]) -> Steer<'_> {
+        Steer {
+            priority,
+            supersedes,
+            by: "pm",
+            by_kind: "agent",
+        }
+    }
+
+    fn send_steered(
+        s: &Store,
+        alias: &str,
+        reply_to: Option<&str>,
+        id: &str,
+        steer: &Steer,
+    ) -> Result<(bool, String)> {
+        s.enqueue_steered(
+            alias,
+            "the current instruction",
+            reply_to,
+            id,
+            "user",
+            None,
+            &Sender::Unattributed,
+            steer,
+        )
+    }
+
+    fn strings(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    /// `(id, body)` of every routed notice queued on `alias`.
+    fn notices(s: &Store, alias: &str) -> Vec<(String, String)> {
+        s.messages(alias)
+            .unwrap()
+            .into_iter()
+            .filter(|m| m.source == "worker_notice")
+            .map(|m| (m.id, m.body))
+            .collect()
+    }
+
+    /// Acceptance 1 + 3: one call cancels every named still-queued row
+    /// and queues the new one; each row keeps its history as
+    /// `cancelled`, reason "superseded by <new>", with the caller. Each
+    /// distinct `reply_to` hears ONE notice naming every replaced id and
+    /// the new one (PR #252 QA N4) — and the caller's own reply_to hears
+    /// nothing: it did the superseding.
+    #[test]
+    fn supersede_replaces_queued_messages_in_one_transaction() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        reg(&s, "pm", &cwd);
+        reg(&s, "w1", &cwd);
+        reg(&s, "qa", &cwd);
+        s.enqueue("w1", "old fix", Some("qa"), "m1", "user")
+            .unwrap();
+        s.enqueue("w1", "old push", Some("qa"), "m2", "user")
+            .unwrap();
+        s.enqueue("w1", "old preview", None, "m3", "user").unwrap();
+        s.enqueue("w1", "unrelated", None, "m4", "user").unwrap();
+        s.enqueue("w1", "old status", Some("pm"), "m5", "user")
+            .unwrap();
+        let named = strings(&["m1", "m2", "m3", "m5"]);
+        let receipt = send_steered(
+            &s,
+            "w1",
+            Some("pm"),
+            "new1",
+            &steer_as_pm(Priority::Normal, &named),
+        )
+        .unwrap();
+        assert_eq!(receipt, (false, "queued".to_string()));
+        for (id, body) in [
+            ("m1", "old fix"),
+            ("m2", "old push"),
+            ("m3", "old preview"),
+            ("m5", "old status"),
+        ] {
+            let m = s.message(id).unwrap().unwrap();
+            assert_eq!(m.state, "cancelled", "{id}");
+            assert_eq!(m.body, body, "history kept");
+            let r = m.result.unwrap();
+            assert_eq!(r["via"], "supersede");
+            assert_eq!(r["reason"], "superseded by new1");
+            assert_eq!(r["superseded_by"], "new1");
+            assert_eq!(
+                (r["by"].as_str(), r["by_kind"].as_str()),
+                (Some("pm"), Some("agent"))
+            );
+        }
+        assert_eq!(s.message("m4").unwrap().unwrap().state, "queued");
+        assert_eq!(s.message("new1").unwrap().unwrap().state, "queued");
+        let events = s.events("w1", 0, 100).unwrap();
+        let cancelled: Vec<_> = events
+            .iter()
+            .filter(|e| e.kind == "cancelled")
+            .map(|e| e.payload["superseded_by"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(cancelled, ["new1", "new1", "new1", "new1"]);
+        let steered = events.iter().find(|e| e.kind == "steered").unwrap();
+        assert_eq!(
+            steered.payload["supersedes"],
+            json!(["m1", "m2", "m3", "m5"])
+        );
+        assert_eq!(steered.payload["by"], "pm");
+        // One notice for qa's two rows, naming both and the new id; m3
+        // had no reply_to, and m5's reply_to is the caller itself.
+        let heard = notices(&s, "qa");
+        assert_eq!(heard.len(), 1, "{heard:?}");
+        let body = &heard[0].1;
+        assert!(
+            body.contains("m1, m2 were superseded by message new1"),
+            "{body}"
+        );
+        assert!(notices(&s, "pm").is_empty(), "the caller is not notified");
+        // A retry of the same envelope dedupes and notifies nobody again;
+        // the same id naming another set is a conflict.
+        let again = send_steered(
+            &s,
+            "w1",
+            Some("pm"),
+            "new1",
+            &steer_as_pm(Priority::Normal, &strings(&["m5", "m3", "m2", "m1"])),
+        )
+        .unwrap();
+        assert_eq!(again, (true, "queued".to_string()));
+        assert_eq!(notices(&s, "qa").len(), 1);
+        assert!(notices(&s, "pm").is_empty());
+        let err = send_steered(
+            &s,
+            "w1",
+            Some("pm"),
+            "new1",
+            &steer_as_pm(Priority::Normal, &strings(&["m1"])),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("different content"), "{err}");
+        // The replacement waits its turn behind older normal work.
+        let order: Vec<String> = (0..2)
+            .map(|_| match s.take_queued("w1").unwrap() {
+                Take::Message(m) => m.id,
+                _ => panic!("expected a message"),
+            })
+            .collect();
+        assert_eq!(order, ["m4", "new1"]);
+    }
+
+    /// PR #252 QA N2: superseding a `--task` follow-up records its
+    /// cancellation on the task's (and job's) stream, like its `queued`
+    /// event — not only on the agent's.
+    #[test]
+    fn superseding_a_task_follow_up_is_recorded_on_the_task() {
+        let (dir, s) = store();
+        let kickoff = seeded_task(&s, &dir.path().join("w"));
+        s.enqueue_task("w1", "old detail", None, "f1", "user", Some("t1"))
+            .unwrap();
+        s.enqueue("w1", "unbound", None, "u1", "user").unwrap();
+        send_steered(
+            &s,
+            "w1",
+            None,
+            "new1",
+            &steer_as_pm(Priority::Normal, &strings(&["f1", "u1"])),
+        )
+        .unwrap();
+        let on_task: Vec<Event> = s
+            .job_events("j1", 0, 500)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "cancelled")
+            .collect();
+        assert_eq!(on_task.len(), 1, "{on_task:?}");
+        assert_eq!(on_task[0].payload["message"], "f1");
+        assert_eq!(on_task[0].payload["superseded_by"], "new1");
+        assert_eq!(on_task[0].task_id.as_deref(), Some("t1"));
+        // The kickoff itself is never supersedable.
+        let err = send_steered(
+            &s,
+            "w1",
+            None,
+            "new2",
+            &steer_as_pm(Priority::Normal, &strings(&[&kickoff])),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("kickoff"), "{err}");
+    }
+
+    /// Acceptance 2: a named message that is not still queued — per
+    /// state, unknown, another agent's, a routed notice or a task
+    /// kickoff — refuses the whole call naming it, and nothing changes.
+    #[test]
+    fn supersede_refuses_anything_not_still_queued_and_changes_nothing() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        reg(&s, "pm", &cwd);
+        reg(&s, "w1", &cwd);
+        reg(&s, "w2", &cwd);
+        s.enqueue("w1", "stale", Some("pm"), "ok", "user").unwrap();
+        let set_state = |id: &str, state: &str, result: Option<Value>| {
+            s.conn()
+                .execute(
+                    "UPDATE messages SET state=?, result=? WHERE id=?",
+                    params![state, result.map(|r| r.to_string()), id],
+                )
+                .unwrap();
+        };
+        let mut cases: Vec<(String, String)> = Vec::new();
+        for state in [
+            "submitting",
+            "running",
+            "submitted",
+            "completed",
+            "failed",
+            "interrupted",
+            "cancelled",
+            "unknown",
+        ] {
+            let id = format!("x-{state}");
+            s.enqueue("w1", "x", Some("pm"), &id, "user").unwrap();
+            if state == "submitted" {
+                // Delivered to a pty pane, report owed.
+                set_state(&id, "running", Some(json!({"status": "submitted"})));
+                cases.push((id, "is running".to_string()));
+            } else {
+                set_state(&id, state, None);
+                cases.push((id, format!("is {state}")));
+            }
+        }
+        cases.push(("nope".to_string(), "is unknown".to_string()));
+        s.enqueue("w2", "theirs", None, "theirs", "user").unwrap();
+        cases.push(("theirs".to_string(), "is agent 'w2''s".to_string()));
+        s.enqueue("w1", "notice", None, "routed", "worker_notice")
+            .unwrap();
+        cases.push(("routed".to_string(), "routed worker_notice".to_string()));
+        s.enqueue("w1", "kickoff", None, "kick", "job_dispatch")
+            .unwrap();
+        cases.push(("kick".to_string(), "kickoff".to_string()));
+        let events_before = s.events("w1", 0, 1000).unwrap().len();
+        for (n, (bad, why)) in cases.iter().enumerate() {
+            let new = format!("new-{n}");
+            let err = send_steered(
+                &s,
+                "w1",
+                Some("pm"),
+                &new,
+                &steer_as_pm(Priority::Urgent, &strings(&["ok", bad])),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains(&format!("message '{bad}'")), "{err}");
+            assert!(err.contains(why), "{bad}: {err}");
+            assert!(err.contains("nothing changed"), "{err}");
+            assert!(s.message(&new).unwrap().is_none(), "{new} enqueued");
+        }
+        assert_eq!(s.message("ok").unwrap().unwrap().state, "queued");
+        assert_eq!(s.events("w1", 0, 1000).unwrap().len(), events_before);
+        assert!(notices(&s, "pm").is_empty());
+    }
+
+    /// Acceptance 4: urgent is claimed ahead of every queued normal row,
+    /// FIFO within a rank — but only at the next safe boundary: a
+    /// running turn (including one parked on an open approval) holds
+    /// it like any other turn-owning delivery.
+    #[test]
+    fn urgent_goes_first_at_the_next_safe_boundary_fifo_within_rank() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        reg(&s, "pm", &cwd);
+        reg(&s, "w2", &cwd);
+        reg_pty(&s, "w1", &cwd);
+        s.enqueue("w1", "running turn", None, "m0", "user").unwrap();
+        let Take::Message(m0) = s.take_queued("w1").unwrap() else {
+            panic!("m0 must be claimed");
+        };
+        s.mark_running(&m0.id, "pty-g-m0").unwrap();
+        s.set_agent_state("w1", "waiting_input", None).unwrap();
+        let none: &[String] = &[];
+        for (id, priority) in [
+            ("n1", Priority::Normal),
+            ("n2", Priority::Normal),
+            ("u1", Priority::Urgent),
+            ("n3", Priority::Normal),
+            ("u2", Priority::Urgent),
+        ] {
+            send_steered(&s, "w1", None, id, &steer_as_pm(priority, none)).unwrap();
+        }
+        // Never interrupts the running turn or its open approval.
+        assert!(matches!(s.take_queued("w1").unwrap(), Take::Empty));
+        assert_eq!(s.message("m0").unwrap().unwrap().state, "running");
+        assert_eq!(s.queued_head("w1").unwrap().unwrap().id, "u1");
+        // A routed notice still passes the hold, as before.
+        s.enqueue("w2", "side", Some("w1"), "x1", "user").unwrap();
+        let Take::Message(x1) = s.take_queued("w2").unwrap() else {
+            panic!("x1 must be claimed");
+        };
+        s.finish(
+            &x1,
+            "completed",
+            &json!({"status": "completed", "text": "ok"}),
+            None,
+        )
+        .unwrap();
+        let Take::Message(routed) = s.take_queued("w1").unwrap() else {
+            panic!("the routed result passes the hold");
+        };
+        assert_eq!(routed.source, "worker_result");
+        s.finish(&routed, "completed", &json!({"status": "completed"}), None)
+            .unwrap();
+        // The turn ends: the boundary.
+        s.finish_running("m0", "completed", &json!({"status": "completed"}), None)
+            .unwrap()
+            .unwrap();
+        let mut order = Vec::new();
+        while let Take::Message(m) = s.take_queued("w1").unwrap() {
+            s.mark_running(&m.id, &format!("pty-g-{}", m.id)).unwrap();
+            s.finish_running(&m.id, "completed", &json!({"status": "completed"}), None)
+                .unwrap()
+                .unwrap();
+            order.push(m.id);
+        }
+        assert_eq!(order, ["u1", "u2", "n1", "n2", "n3"]);
+        assert_eq!(
+            s.message("u1").unwrap().unwrap().to_json()["priority"],
+            "urgent"
+        );
+        assert!(s
+            .message("n1")
+            .unwrap()
+            .unwrap()
+            .to_json()
+            .get("priority")
+            .is_none());
+        // Same id, another rank: a conflict, not a duplicate.
+        let err =
+            send_steered(&s, "w1", None, "n1", &steer_as_pm(Priority::Urgent, none)).unwrap_err();
+        assert!(err.to_string().contains("different content"), "{err}");
+    }
+
+    /// Acceptance 6 — already delivered before CAD-158: a routed result
+    /// or notice has a deterministic id per source message (and per
+    /// notice kind), so repeated reports of the same (message, turn_id)
+    /// — the "worker_result delivered 3x with identical turn_id" case —
+    /// and a late adapter finish route exactly one delivery, which is
+    /// claimed once.
+    #[test]
+    fn routed_result_and_notice_per_message_turn_are_delivered_once() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        reg(&s, "pm", &cwd);
+        reg_pty(&s, "w1", &cwd);
+        s.enqueue("w1", "work", Some("pm"), "m1", "user").unwrap();
+        let Take::Message(m1) = s.take_queued("w1").unwrap() else {
+            panic!("m1 must be claimed");
+        };
+        s.mark_running(&m1.id, "pty-g-t1").unwrap();
+        let running = s.message("m1").unwrap().unwrap();
+        s.mark_submitted(&running).unwrap();
+        let stored = json!({"status": "completed", "text": "done",
+                            "turn_id": "pty-g-t1", "via": "pty_report"});
+        assert!(s
+            .finish_running("m1", "completed", &stored, None)
+            .unwrap()
+            .is_ok());
+        for _ in 0..2 {
+            let again = s.finish_running("m1", "completed", &stored, None).unwrap();
+            assert_eq!(again.unwrap_err().unwrap().state, "completed");
+        }
+        // A late second finish of the same turn routes nothing new.
+        s.finish(&running, "completed", &stored, None).unwrap();
+        let routed: Vec<Message> = s
+            .messages("pm")
+            .unwrap()
+            .into_iter()
+            .filter(|m| m.source == "worker_result")
+            .collect();
+        assert_eq!(routed.len(), 1, "{routed:?}");
+        let Take::Message(delivery) = s.take_queued("pm").unwrap() else {
+            panic!("the one routed result is claimed");
+        };
+        assert_eq!(delivery.id, routed[0].id);
+        s.finish(
+            &delivery,
+            "completed",
+            &json!({"status": "completed"}),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(s.take_queued("pm").unwrap(), Take::Empty));
+        // Notices: one per (kind, message) however often it fires.
+        s.enqueue("w1", "work 2", Some("pm"), "m2", "user").unwrap();
+        let Take::Message(m2) = s.take_queued("w1").unwrap() else {
+            panic!("m2 must be claimed");
+        };
+        s.mark_running(&m2.id, "pty-g-t2").unwrap();
+        assert!(s.expire_awaiting_report("m2", None, "bound").unwrap());
+        let m2 = s.message("m2").unwrap().unwrap();
+        s.finish(&m2, "unknown", &json!({"status": "unknown"}), Some("again"))
+            .unwrap();
+        assert_eq!(notices(&s, "pm").len(), 1);
+    }
+
+    /// Store v15 (CAD-158): an upgraded queue reads every existing row as
+    /// normal and keeps its FIFO order; a half-applied v15 converges.
+    #[test]
+    fn migration_v14_to_v15_adds_priority_and_keeps_fifo() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("t.sqlite3");
+        std::fs::create_dir(dir.path().join("w")).unwrap();
+        {
+            let s = Store::open(&db).unwrap();
+            reg(&s, "a1", &dir.path().join("w"));
+            s.enqueue("a1", "first", None, "m1", "user").unwrap();
+            s.enqueue("a1", "second", None, "m2", "user").unwrap();
+        }
+        // A genuine v14: no priority column.
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "ALTER TABLE messages DROP COLUMN priority;
+                 UPDATE schema_version SET version=14;",
+            )
+            .unwrap();
+        let version = |db: &Path| -> i64 {
+            Connection::open(db)
+                .unwrap()
+                .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+                .unwrap()
+        };
+        {
+            let s = Store::open_for_schema_tests(&db).unwrap();
+            assert_eq!(s.message("m1").unwrap().unwrap().priority, Priority::Normal);
+            let none: &[String] = &[];
+            s.enqueue_steered(
+                "a1",
+                "urgent",
+                None,
+                "u1",
+                "user",
+                None,
+                &Sender::Unattributed,
+                &steer_as_pm(Priority::Urgent, none),
+            )
+            .unwrap();
+            let order: Vec<String> = (0..3)
+                .map(|_| match s.take_queued("a1").unwrap() {
+                    Take::Message(m) => m.id,
+                    _ => panic!("expected a message"),
+                })
+                .collect();
+            assert_eq!(order, ["u1", "m1", "m2"]);
+        }
+        assert_eq!(version(&db), crate::rollout::SCHEMA_VERSION);
+        assert_eq!(crate::rollout::SCHEMA_VERSION, 15);
+        // Half-applied: column present, version rolled back.
+        Connection::open(&db)
+            .unwrap()
+            .execute("UPDATE schema_version SET version=14", [])
+            .unwrap();
+        {
+            let s = Store::open_for_schema_tests(&db).unwrap();
+            assert_eq!(s.message("u1").unwrap().unwrap().priority, Priority::Urgent);
+        }
+        assert_eq!(version(&db), 15);
     }
 }
