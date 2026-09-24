@@ -20919,6 +20919,8 @@ fn dispatch_folds_bootstrap_and_suppresses_reported_duplicate() {
         )
     };
     assert!(cli(&["issue", "init"]).0);
+    git(&pm_dir, &["config", "user.email", "t@t"]);
+    git(&pm_dir, &["config", "user.name", "t"]);
     let repo_s = repo.canonicalize().unwrap().to_str().unwrap().to_string();
     assert!(cli(&["issue", "project", "add", "demo", "--prefix", "D", "--repo", &repo_s,]).0);
     for title in [
@@ -42536,10 +42538,10 @@ fn work_model_project_md_and_milestones() {
         out["epics"][0]["work"]["config_unapproved"].is_string(),
         "{out}"
     );
-    // The CLI verb reaches the daemon; from the test's own process
-    // tree it is not the proven operator, so it is refused too.
-    let (ok, err) = f.cli(&["issue", "project", "approve-work", "demo"]);
-    assert!(!ok && err.to_string().contains("operator action"), "{err}");
+    // The verb reaches the daemon; a caller that proves nothing —
+    // detached, carrying an agent env — is refused too.
+    let r = unprovable_rpc(&f.d, "project_work_approve", json!({"project": "demo"}));
+    assert!(frame_err(&r).contains("operator action"), "{r}");
     let out =
         f.d.operator_rpc("project_work_approve", json!({"project": "demo"}))
             .unwrap();
