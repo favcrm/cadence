@@ -37961,6 +37961,13 @@ impl PlanFixture {
     }
 
     fn start_with(opts: daemon::ServeOptions) -> PlanFixture {
+        Self::start_on(move || TestDaemon::start_opts(opts))
+    }
+
+    /// [`Self::start`] over the daemon `daemon` starts — a real `daemon
+    /// run` process ([`TestDaemon::start_process_in`]) takes its env at
+    /// spawn, after `CADENCE_PM_DIR` is set here.
+    fn start_on(daemon: impl FnOnce() -> TestDaemon) -> PlanFixture {
         let tmp = TempDir::new().unwrap();
         let (pm_dir, repo) = (tmp.path().join("pm"), tmp.path().join("repo"));
         for sub in ["home", "tmp"] {
@@ -37994,7 +38001,7 @@ impl PlanFixture {
         // The daemon's own env: never the host's ~/pm.
         test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
         let f = PlanFixture {
-            d: TestDaemon::start_opts(opts),
+            d: daemon(),
             tmp,
             pm_dir,
         };
@@ -39998,6 +40005,250 @@ fn cad328_plan_endpoints_guards_agents_and_decisions() {
         (plan.state.as_str(), plan.reason.as_deref()),
         ("rejected", Some("not this quarter"))
     );
+}
+
+/// CAD-328 review round 1: the board relays operator decisions from its
+/// own process, so the daemon's operator gate sees the board, not the
+/// HTTP caller. Under a real `daemon run`, a detached, env-scrubbed
+/// child of an enrolled managed worker's tool (`setsid -f env -i …`) —
+/// what the master's Bash tool could spawn — is tied to no agent, so
+/// `write_caller` alone read it as the operator. The board now runs
+/// CAD-276's positive proof on its TCP peer: that child descends from
+/// the daemon (its subreaper) and is refused `403 operator_proof` for
+/// approve, reject and answer, writing nothing; the operator's own
+/// requests still land.
+#[test]
+fn cad328_operator_writes_refuse_a_detached_managed_child_under_daemon_run() {
+    let dir = TempDir::new().unwrap();
+    let mock = ManagedWorker::install(dir.path(), dir.path(), "wk");
+    let f = PlanFixture::start_on(|| TestDaemon::start_process_in(dir));
+    let _reaper = DaemonReaper::new(&f.d.state);
+    let daemon_pid = subreaper_daemon_pid(&f.d);
+    let mut wk = mock.enroll(&f.d, "wk");
+    let out = f.propose(PLAN_MD).unwrap();
+    let epic = out["epic"].as_str().unwrap().to_string();
+    let later = f
+        .propose("---\ntitle: Later\ngoal: g\n---\n## Only\n### Acceptance\n- [ ] a\n")
+        .unwrap()["epic"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (ok, out) = f.cli(&["issue", "new", "Cron cadence", "--project", "demo"]);
+    assert!(ok, "{out}");
+    let id = out["id"].as_str().unwrap().to_string();
+    let q = f.tmp.path().join("q.md");
+    std::fs::write(
+        &q,
+        task_report_text("options: [hourly, every 15 minutes]\nimpact: sets the cost\n"),
+    )
+    .unwrap();
+    let (ok, out) = f.cli(&[
+        "report",
+        "file",
+        "--task",
+        &id,
+        "--kind",
+        "question",
+        "--file",
+        q.to_str().unwrap(),
+    ]);
+    assert!(ok, "{out}");
+    let (_, show) = f.cli(&["issue", "show", &id, "--json"]);
+    let question = show["reports"][0]["name"].as_str().unwrap().to_string();
+    let port = start_board(&f.pm_dir, &f.d.state);
+    let reports = f.pm_dir.join("demo").join(&id).join("reports");
+    let count = || std::fs::read_dir(&reports).unwrap().count();
+    let before = (f.commits(), count());
+
+    // The probe: the worker's tool detaches a scrubbed child that talks
+    // to the board and lands the raw reply at `out`.
+    const INNER: &str = r#"exec 3<>"/dev/tcp/127.0.0.1/$1"; printf '%s' "$2" >&3; cat <&3 > "$3.tmp"; mv "$3.tmp" "$3""#;
+    const OUTER: &str =
+        r#"setsid -f env -i /bin/bash -c "$1" _ "$2" "$3" "$4" </dev/null >/dev/null 2>&1"#;
+    let work = TempDir::new().unwrap();
+    let mut n = 0;
+    let mut detached = |path: &str, body: &str| -> String {
+        n += 1;
+        let out = work.path().join(format!("reply-{n}"));
+        let request = cad328_post(port, path, THREAD_GUARDS, body);
+        let r = wk.exec(&[
+            "bash",
+            "-c",
+            OUTER,
+            "_",
+            INNER,
+            &port.to_string(),
+            &request,
+            out.to_str().unwrap(),
+        ]);
+        assert_eq!(r["rc"], 0, "{r}");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !out.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "{path}: the detached child never answered"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        std::fs::read_to_string(&out).unwrap()
+    };
+    let answer_body = format!(r#"{{"question":"{question}","text":"hourly"}}"#);
+    for (path, body) in [
+        (format!("/api/plans/{epic}/approve"), "{}".to_string()),
+        (
+            format!("/api/plans/{epic}/reject"),
+            r#"{"reason":"agent says no"}"#.to_string(),
+        ),
+        (format!("/api/issues/{id}/answers"), answer_body.clone()),
+    ] {
+        let reply = detached(&path, &body);
+        assert!(reply.contains(" 403 "), "{path}: {reply}");
+        assert!(reply.contains("operator_proof"), "{path}: {reply}");
+        assert!(
+            reply.contains(&format!("descends from the daemon (pid {daemon_pid})")),
+            "{path}: refused by the daemon-descendant rule: {reply}"
+        );
+    }
+    assert_eq!((f.commits(), count()), before, "refusals write nothing");
+    assert_eq!(f.front(&epic).plan.unwrap().state, "proposed");
+    assert_eq!(f.front(&later).plan.unwrap().state, "proposed");
+    for id in ["D-3", "D-4", "D-5"] {
+        assert_eq!(f.front(id).status, "backlog", "{id} stays backlog");
+    }
+    assert!(f.daemon_events("plan_approved").is_empty());
+    assert!(f.daemon_events("plan_rejected").is_empty());
+
+    // The operator's own requests (this test process, outside every
+    // agent) pass the same proof and land.
+    let (status, reply) = board_http(
+        port,
+        &cad328_post(
+            port,
+            &format!("/api/plans/{epic}/approve"),
+            THREAD_GUARDS,
+            "{}",
+        ),
+    );
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(f.front("D-3").status, "ready");
+    let (status, reply) = board_http(
+        port,
+        &cad328_post(
+            port,
+            &format!("/api/plans/{later}/reject"),
+            THREAD_GUARDS,
+            r#"{"reason":"not now"}"#,
+        ),
+    );
+    assert_eq!(status, 200, "{reply}");
+    let (status, reply) = board_http(
+        port,
+        &cad328_post(
+            port,
+            &format!("/api/issues/{id}/answers"),
+            THREAD_GUARDS,
+            &answer_body,
+        ),
+    );
+    assert_eq!(status, 201, "{reply}");
+    assert_eq!(count(), before.1 + 1);
+}
+
+/// CAD-328 review round 1: a chat view opens on the NEWEST page.
+/// `GET /api/threads/<alias>?tail=1` (daemon `thread_read {tail}`) is the
+/// newest `limit` entries, oldest first, with `more_before`;
+/// `?before=<seq>` pages backwards; neither combines with `after`.
+#[test]
+fn cad328_thread_reads_tail_and_before() {
+    let d = TestDaemon::start();
+    let pm = TempDir::new().unwrap();
+    let port = start_board(pm.path(), &d.state);
+    d.register("master");
+    d.wait_agent("master", "idle", 15);
+    for n in 1..=3 {
+        d.rpc(
+            "thread_send",
+            json!({"alias": "master", "text": format!("ask {n}"), "message": format!("m{n}")}),
+        )
+        .unwrap();
+        d.wait_message("master", &format!("m{n}"), &["completed"], 20);
+    }
+    let all = d
+        .rpc("thread_read", json!({"alias": "master", "limit": 500}))
+        .unwrap();
+    let seqs: Vec<i64> = all["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["seq"].as_i64().unwrap())
+        .collect();
+    assert!(seqs.len() >= 6, "{all}");
+    let last = *seqs.last().unwrap();
+    let page_seqs = |v: &Value| -> Vec<i64> {
+        v["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["seq"].as_i64().unwrap())
+            .collect()
+    };
+
+    let (status, body) = board_get(port, "/api/threads/master?tail=1&limit=2");
+    assert_eq!(status, 200, "{body}");
+    let tail: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(page_seqs(&tail), seqs[seqs.len() - 2..].to_vec(), "{tail}");
+    assert_eq!(tail["more_before"], true, "{tail}");
+    assert_eq!(tail["cursor"], last, "the stream resumes after the newest");
+
+    let first_held = seqs[seqs.len() - 2];
+    let (status, body) = board_get(
+        port,
+        &format!("/api/threads/master?before={first_held}&limit=2"),
+    );
+    assert_eq!(status, 200, "{body}");
+    let older: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        page_seqs(&older),
+        seqs[seqs.len() - 4..seqs.len() - 2].to_vec()
+    );
+    let (_, body) = board_get(
+        port,
+        &format!("/api/threads/master?before={}&limit=500", seqs[1]),
+    );
+    let oldest: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(page_seqs(&oldest), vec![seqs[0]]);
+    assert_eq!(oldest["more_before"], false, "{oldest}");
+
+    // A whole thread in one tail page: nothing before it.
+    let whole = d
+        .rpc(
+            "thread_read",
+            json!({"alias": "master", "tail": true, "limit": 500}),
+        )
+        .unwrap();
+    assert_eq!(page_seqs(&whole), seqs);
+    assert_eq!(whole["more_before"], false);
+
+    for bad in [
+        "/api/threads/master?tail=1&after=3",
+        "/api/threads/master?before=0",
+        "/api/threads/master?before=x",
+    ] {
+        assert_eq!(board_get(port, bad).0, 400, "{bad}");
+    }
+    let err = d
+        .rpc(
+            "thread_read",
+            json!({"alias": "master", "tail": true, "wait": 5}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("either after/wait"), "{err}");
+    // The forward read is unchanged.
+    let (_, body) = board_get(port, "/api/threads/master?after=0&limit=2");
+    let fwd: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(page_seqs(&fwd), seqs[..2].to_vec());
+    assert!(fwd.get("more_before").is_none(), "{fwd}");
 }
 
 /// CAD-328: `POST /api/issues/<id>/answers` files an `answer` report

@@ -45,6 +45,9 @@ export interface ThreadState {
   exists: boolean;
   /** The thread endpoint answered 404: no such agent is registered. */
   missing?: boolean;
+  /** Older entries exist on the server than the ones held; null when
+   *  the daemon cannot say (it predates backward reads). */
+  moreBefore?: boolean | null;
   entries: ThreadEntry[];
   pending: PendingMessage[];
 }
@@ -96,7 +99,7 @@ export function mergeEntries(state: ThreadState | null, incoming: ThreadEntry[])
   );
   const pending = base.pending.filter((p) => !stored.has(p.message));
   if (!changed && pending.length === base.pending.length && base.exists) return base;
-  return { exists: true, missing: false, entries, pending };
+  return { ...base, exists: true, missing: false, entries, pending };
 }
 
 /** `streamInto`'s reducer: an `entry` frame merges; anything else is ignored. */
@@ -203,11 +206,13 @@ export function threadItems(state: ThreadState | null): ThreadItem[] {
 const EPIC_ID = /[A-Z][A-Z0-9]{0,9}-\d+/;
 const EPIC_JSON = new RegExp(`"epic"\\s*:\\s*"(${EPIC_ID.source})"`);
 const PLAN_CMD = new RegExp(`\\bplan (?:propose[ds]?|show|approve|reject)\\b[^\\n]*?\\b(${EPIC_ID.source})\\b`);
+const PLAN_TICKETS = /"tickets"\s*:\s*\[/;
+const PLAN_BLOCK = /"plan"\s*:\s*\{/;
 const PLAN_PROSE = new RegExp(`\\b[Pp]lan (${EPIC_ID.source})\\b`);
 
 /**
  * The plan epic an entry points at, if any: a payload `epic`, an
- * `"epic": "X-1"` in a tool result, a `plan propose|show|approve …
+ * `"epic": "X-1"` in a plan-shaped tool result, a `plan propose|show|approve …
  * X-1` command, or "plan X-1" in prose. The thread shows each plan's
  * card once, at its first mention.
  */
@@ -216,8 +221,12 @@ export function planRef(entry: ThreadEntry): string | null {
   if (typeof epic === "string" && new RegExp(`^${EPIC_ID.source}$`).test(epic)) return epic;
   if (entry.role === "operator") return null;
   const text = entry.text ?? "";
+  // `"epic"` alone is not a plan (`epic stage` prints `{"epic","stage"}`):
+  // only a plan-shaped payload — `plan propose`'s `tickets` list or
+  // `plan show`'s `plan` block — counts.
+  const planShaped = PLAN_TICKETS.test(text) || PLAN_BLOCK.test(text);
   return (
-    EPIC_JSON.exec(text)?.[1] ??
+    (planShaped ? EPIC_JSON.exec(text)?.[1] : null) ??
     (TOOL_KINDS.has(entry.kind) ? PLAN_CMD.exec(text)?.[1] : null) ??
     PLAN_PROSE.exec(text)?.[1] ??
     null
@@ -248,38 +257,102 @@ export function newMessageId(rand: () => number = Math.random, now: () => number
   return `ui-${now().toString(36)}-${Math.floor(rand() * 36 ** 6).toString(36)}`;
 }
 
-/** One page fetch: `(after, limit)` → the endpoint's page. */
-export type PageFetcher = (
-  after: number,
-  limit: number,
-) => Promise<{ thread?: unknown; entries?: unknown[] }>;
+/** One page of `GET /api/threads/<alias>`. */
+export interface ThreadPageLike {
+  thread?: unknown;
+  entries?: unknown[];
+  /** Backward reads only (CAD-328): older entries remain. Absent on a
+   *  daemon that predates `tail`/`before` — it answered a forward page. */
+  more_before?: boolean;
+}
+
+/** How the store reads pages: forward after a seq, the newest page, or
+ *  the page below a seq. */
+export interface PageReader {
+  after: (after: number, limit: number) => Promise<ThreadPageLike>;
+  tail: (limit: number) => Promise<ThreadPageLike>;
+  before: (before: number, limit: number) => Promise<ThreadPageLike>;
+}
+
+/** Entries fetched per page — the newest page on open, each "earlier". */
+export const PAGE = 200;
+/** Forward catch-up pages before giving up and reopening on the tail. */
+const CATCH_UP_PAGES = 2;
+
+function notFound(e: unknown): boolean {
+  return (e as { status?: number }).status === 404;
+}
 
 /**
- * Load everything after what `current` already holds, page by page
- * (at most `maxPages`), keeping its pending messages. A 404 (no such
- * agent) is not a failure: it is the "master not started" state.
+ * Load the thread for display (CAD-328). With nothing held, read the
+ * NEWEST page (`tail`) — never the whole history from the start; the
+ * stream then resumes after its last seq. With entries held (a
+ * refetch), catch up forward a couple of pages; a longer gap reopens on
+ * the tail. Pending messages survive either way. A daemon that ignores
+ * `tail` answers a forward page (no `more_before`): that page is kept
+ * and `moreBefore` stays unknown. A 404 (no such agent) is the "master
+ * not started" state, not a failure.
  */
 export async function loadThread(
-  fetchPage: PageFetcher,
+  read: PageReader,
   current: ThreadState | null,
-  limit = 500,
-  maxPages = 20,
+  limit = PAGE,
 ): Promise<ThreadState> {
-  let state: ThreadState = current ?? EMPTY_THREAD;
-  let after = lastSeq(state) ?? 0;
+  const held = current ?? EMPTY_THREAD;
   try {
-    for (let i = 0; i < maxPages; i++) {
-      const page = await fetchPage(after, limit);
-      state = mergePage(state, page);
-      const next = lastSeq(state) ?? 0;
-      if ((page.entries ?? []).length < limit || next <= after) break;
-      after = next;
+    let after = lastSeq(held);
+    if (after !== null) {
+      let state = held;
+      for (let i = 0; i < CATCH_UP_PAGES; i++) {
+        const page = await read.after(after, limit);
+        state = mergePage(state, page);
+        if ((page.entries ?? []).length < limit) return state;
+        after = lastSeq(state) ?? after;
+      }
+      // Too far behind to replay: reopen on the newest page.
     }
+    const page = await read.tail(limit);
+    const fresh = mergePage({ ...EMPTY_THREAD, pending: held.pending }, page);
+    return {
+      ...fresh,
+      moreBefore: typeof page.more_before === "boolean" ? page.more_before : null,
+    };
   } catch (e) {
-    if ((e as { status?: number }).status === 404) {
-      return { ...state, exists: false, missing: true };
-    }
+    if (notFound(e)) return { ...held, exists: false, missing: true };
     throw e;
   }
-  return state;
+}
+
+/** The page older than what `state` holds, or null when none is left. */
+export function fetchEarlier(
+  read: PageReader,
+  state: ThreadState,
+  limit = PAGE,
+): Promise<ThreadPageLike> | null {
+  const first = state.entries[0]?.seq;
+  if (first === undefined || first <= 1) return null;
+  return read.before(first, limit);
+}
+
+/**
+ * Fold an older page into the CURRENT state (stream frames may have
+ * landed while it was in flight): merge by seq, and record whether
+ * anything older remains.
+ */
+export function applyEarlier(state: ThreadState | null, page: ThreadPageLike): ThreadState {
+  const merged = mergePage(state, page);
+  return { ...merged, moreBefore: page.more_before === true };
+}
+
+/** Items rendered at most, until the operator asks for earlier ones. */
+export const WINDOW = 300;
+
+/**
+ * The last `limit` items and how many are hidden above them — the
+ * thread view renders a bounded window however long the thread grows
+ * (a live stream keeps appending).
+ */
+export function visibleWindow<T>(items: T[], limit = WINDOW): { shown: T[]; hidden: number } {
+  const hidden = Math.max(0, items.length - limit);
+  return { shown: hidden ? items.slice(hidden) : items, hidden };
 }

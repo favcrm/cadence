@@ -22,6 +22,8 @@ export interface ThreadPage {
   thread: { id: string; alias: string; created: string; updated: string } | null;
   entries: unknown[];
   cursor?: number;
+  /** Backward reads (`tail`/`before`): older entries remain. */
+  more_before?: boolean;
 }
 
 export class ApiError extends Error {
@@ -269,10 +271,13 @@ export const api = {
     `/api/issues/${id}/artifacts/${encodeURIComponent(name)}`,
 
   /** `GET /api/threads/<alias>` — one page after `after`. */
-  thread: (alias: string, after = 0, limit = 500) =>
-    get<ThreadPage>(
-      `/api/threads/${encodeURIComponent(alias)}?after=${after}&limit=${limit}`,
-    ),
+  thread: (alias: string, at: { after?: number; before?: number; tail?: boolean; limit?: number } = {}) => {
+    const q = new URLSearchParams({ limit: String(at.limit ?? 200) });
+    if (at.tail) q.set("tail", "1");
+    else if (at.before !== undefined) q.set("before", String(at.before));
+    else q.set("after", String(at.after ?? 0));
+    return get<ThreadPage>(`/api/threads/${encodeURIComponent(alias)}?${q.toString()}`);
+  },
   /** `POST /api/threads/<alias>/messages` — `message` makes a retry idempotent. */
   threadSend: (alias: string, text: string, message: string) =>
     post<Record<string, unknown>>(`/api/threads/${encodeURIComponent(alias)}/messages`, {

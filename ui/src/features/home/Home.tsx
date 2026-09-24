@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { api, ApiError } from "../../lib/api";
 import type { ResourceState } from "../../lib/cache";
-import { resources } from "../../lib/resources";
+import { resources, threadReader } from "../../lib/resources";
 import { streamInto, type SseErrorState } from "../../lib/sse";
 import { useQuery, useResource } from "../../lib/useResource";
 import type { Overview } from "../../lib/types";
@@ -14,11 +14,15 @@ import {
   addPending,
   discardPending,
   lastSeq,
+  applyEarlier,
+  fetchEarlier,
   newMessageId,
   planAnchors,
   reduceFrame,
   settlePending,
   threadItems,
+  visibleWindow,
+  WINDOW,
   type ThreadEntry,
   type ThreadItem,
 } from "./thread";
@@ -227,6 +231,152 @@ function Examples({ onPick, disabled }: { onPick: (text: string) => void; disabl
   );
 }
 
+/** Queue `text` to the master: optimistic entry, reconciled by message id. */
+function sendToMaster(text: string, message = newMessageId()): void {
+  const body = text.trim();
+  if (!body) return;
+  const store = resources.masterThread;
+  store.write((s) => addPending(s, message, body, Date.now()));
+  api
+    .threadSend(MASTER, body, message)
+    .then(() => store.write((s) => settlePending(s, message, { ok: true })))
+    .catch((e: ApiError) =>
+      store.write((s) => settlePending(s, message, { ok: false, error: e.message ?? String(e) })),
+    );
+}
+
+const retry = (message: string, text: string) => sendToMaster(text, message);
+const discard = (message: string) => resources.masterThread.write((s) => discardPending(s, message));
+
+/**
+ * The composer owns its draft: typing re-renders this form only, never
+ * the thread above it. `seed` (an example ask) replaces the draft.
+ */
+function Composer({ block, seed }: { block: string | null; seed: { text: string; n: number } }) {
+  const [draft, setDraft] = useState("");
+  const form = useRef<HTMLFormElement>(null);
+  useEffect(() => {
+    if (seed.n > 0) setDraft(seed.text);
+  }, [seed]);
+  // The composer is sticky on wide screens: keep scrolled-to controls
+  // (a plan card's buttons, a focused field) clear of it by reserving
+  // its height as the page's bottom scroll padding.
+  useEffect(() => {
+    const el = form.current;
+    const root = document.documentElement;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const apply = () => {
+      const sticky = getComputedStyle(el).position === "sticky";
+      root.style.scrollPaddingBottom = sticky ? `${el.offsetHeight + 24}px` : "";
+    };
+    const ro = new ResizeObserver(apply);
+    ro.observe(el);
+    addEventListener("resize", apply);
+    apply();
+    return () => {
+      ro.disconnect();
+      removeEventListener("resize", apply);
+      root.style.scrollPaddingBottom = "";
+    };
+  }, []);
+  const submit = () => {
+    if (!draft.trim() || block) return;
+    sendToMaster(draft);
+    setDraft("");
+  };
+  const onKey = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+      e.preventDefault();
+      submit();
+    }
+  };
+  return (
+    <form
+      ref={form}
+      className="card p-2.5 lg:sticky lg:bottom-3"
+      data-composer
+      onSubmit={(e) => {
+        e.preventDefault();
+        submit();
+      }}
+    >
+      <textarea
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onKeyDown={onKey}
+        rows={2}
+        disabled={!!block}
+        placeholder={block ? "" : "Ask the master for work…"}
+        aria-label="message to the master"
+        className="w-full resize-y bg-transparent text-body text-ink-100 placeholder:text-ink-500 outline-none disabled:opacity-50 min-h-[2.75rem]"
+      />
+      <div className="flex items-center gap-2 mt-1.5">
+        <p className="text-micro text-ink-500 min-w-0 flex-1 break-words" data-composer-block={block ? "" : undefined}>
+          {block ?? "Enter sends · Shift+Enter for a new line"}
+        </p>
+        <button
+          type="submit"
+          disabled={!!block || !draft.trim()}
+          className="h-8 px-3 rounded bg-accent text-on-accent text-label font-medium disabled:opacity-40 shrink-0"
+        >
+          Send
+        </button>
+      </div>
+    </form>
+  );
+}
+
+/**
+ * The rendered thread: a bounded window of the newest items (a long
+ * thread renders at most `limit`), with "load earlier" above it. Memoized
+ * — it re-renders when the thread or the window changes, not on
+ * unrelated Home state.
+ */
+const ThreadList = memo(function ThreadList({
+  items,
+  limit,
+  moreBefore,
+  loadingEarlier,
+  onEarlier,
+  readOnly,
+  onOpenIssue,
+}: {
+  items: ThreadItem[];
+  limit: number;
+  moreBefore: boolean;
+  loadingEarlier: boolean;
+  onEarlier: () => void;
+  readOnly: boolean;
+  onOpenIssue: (id: string) => void;
+}) {
+  const { shown, hidden } = useMemo(() => visibleWindow(items, limit), [items, limit]);
+  const anchors = useMemo(() => planAnchors(items), [items]);
+  if (items.length === 0) return null;
+  return (
+    <>
+      {(hidden > 0 || moreBefore) && (
+        <div className="flex justify-center">
+          <button className="lnk text-label disabled:opacity-50" disabled={loadingEarlier} onClick={onEarlier}>
+            {loadingEarlier ? "Loading…" : "Load earlier messages"}
+          </button>
+        </div>
+      )}
+      <ol className="space-y-3 min-w-0" aria-label="messages" data-rendered={shown.length}>
+        {shown.map((item) => (
+          <li key={item.key} className="min-w-0 space-y-2">
+            <Item item={item} onOpenIssue={onOpenIssue} onRetry={retry} onDiscard={discard} />
+            {anchors.has(item.key) && (
+              <div className="ml-8">
+                <PlanCard epic={anchors.get(item.key)!} readOnly={readOnly} onOpenIssue={onOpenIssue} />
+              </div>
+            )}
+          </li>
+        ))}
+      </ol>
+    </>
+  );
+});
+
 /**
  * Home (CAD-328): the master's thread with a composer, the "since you
  * left" card above it, and the Needs-you rail beside it (above it on a
@@ -245,20 +395,23 @@ export default function Home({
 }) {
   const thread = useQuery(resources.masterThread);
   const agents = useResource(resources.agents);
-  const [draft, setDraft] = useState("");
+  const [seed, setSeed] = useState({ text: "", n: 0 });
   const [link, setLink] = useState<SseErrorState | "live" | null>(null);
+  const [limit, setLimit] = useState(WINDOW);
+  const [loadingEarlier, setLoadingEarlier] = useState(false);
   const bottom = useRef<HTMLDivElement>(null);
 
   const missing = thread.data?.missing === true;
   const status = masterStatus(agents.data, missing);
   const block = composerBlock(readOnly, status);
   const items = useMemo(() => threadItems(thread.data), [thread.data]);
-  const anchors = useMemo(() => planAnchors(items), [items]);
   const loaded = thread.data !== null;
+  const moreBefore = thread.data?.moreBefore === true;
 
-  // Live entries: stream after the last stored seq. `streamInto` resumes
-  // with `?after=<last id>` when the source closes, and the reducer
-  // dedupes by seq, so a reconnect neither drops nor repeats entries.
+  // Live entries: the store opened on the newest page, so the stream
+  // resumes after its last seq — never a replay of the history. On a
+  // reconnect `streamInto` resumes with `?after=<last id>` and the
+  // reducer dedupes by seq: no gaps, no repeats.
   useEffect(() => {
     if (!loaded || missing) return;
     const sub = streamInto(resources.masterThread, reduceFrame, {
@@ -275,37 +428,35 @@ export default function Home({
     return () => sub.close();
   }, [loaded, missing]);
 
-  // Follow the conversation while it grows.
-  const count = items.length;
+  // Follow the conversation as it grows at the bottom (not when earlier
+  // messages are loaded above).
+  const lastKey = items.length ? items[items.length - 1].key : "";
   useEffect(() => {
-    bottom.current?.scrollIntoView?.({ block: "end" });
-  }, [count]);
+    if (lastKey) bottom.current?.scrollIntoView?.({ block: "end" });
+  }, [lastKey]);
 
-  const send = (text: string, message = newMessageId()) => {
-    const body = text.trim();
-    if (!body || block) return;
-    const store = resources.masterThread;
-    store.write((s) => addPending(s, message, body, Date.now()));
-    api
-      .threadSend(MASTER, body, message)
-      .then(() => store.write((s) => settlePending(s, message, { ok: true })))
-      .catch((e: ApiError) =>
-        store.write((s) => settlePending(s, message, { ok: false, error: e.message ?? String(e) })),
-      );
-  };
-
-  const submit = () => {
-    if (!draft.trim() || block) return;
-    send(draft);
-    setDraft("");
-  };
-
-  const onKey = (e: KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
-      e.preventDefault();
-      submit();
+  const onEarlier = useCallback(() => {
+    const data = resources.masterThread.get().data;
+    if (!data) return;
+    const hidden = Math.max(0, threadItems(data).length - limit);
+    if (hidden > 0) {
+      setLimit((l) => l + WINDOW);
+      return;
     }
-  };
+    const page = fetchEarlier(threadReader(MASTER), data);
+    if (!page) {
+      resources.masterThread.write((cur) => ({ ...(cur ?? data), moreBefore: false }));
+      return;
+    }
+    setLoadingEarlier(true);
+    page
+      .then((older) => {
+        resources.masterThread.write((cur) => applyEarlier(cur, older));
+        setLimit((l) => l + WINDOW);
+      })
+      .catch(() => undefined)
+      .finally(() => setLoadingEarlier(false));
+  }, [limit]);
 
   const showNotStarted = status.kind === "absent" || status.kind === "stopped";
   const empty = loaded && !missing && items.length === 0;
@@ -347,59 +498,22 @@ export default function Home({
         )}
         {!loaded && thread.status !== "failed" && <p className="text-label text-ink-500">Reading the thread…</p>}
         {showNotStarted && items.length === 0 && <NotStarted status={status} />}
-        {empty && !showNotStarted && <Examples onPick={(t) => setDraft(t)} disabled={!!block} />}
-
-        {items.length > 0 && (
-          <ol className="space-y-3 min-w-0" aria-label="messages">
-            {items.map((item) => (
-              <li key={item.key} className="min-w-0 space-y-2">
-                <Item
-                  item={item}
-                  onOpenIssue={onOpenIssue}
-                  onRetry={(message, text) => send(text, message)}
-                  onDiscard={(message) => resources.masterThread.write((s) => discardPending(s, message))}
-                />
-                {anchors.has(item.key) && (
-                  <div className="ml-8">
-                    <PlanCard epic={anchors.get(item.key)!} readOnly={readOnly} onOpenIssue={onOpenIssue} />
-                  </div>
-                )}
-              </li>
-            ))}
-          </ol>
+        {empty && !showNotStarted && (
+          <Examples onPick={(t) => setSeed((s) => ({ text: t, n: s.n + 1 }))} disabled={!!block} />
         )}
+
+        <ThreadList
+          items={items}
+          limit={limit}
+          moreBefore={moreBefore}
+          loadingEarlier={loadingEarlier}
+          onEarlier={onEarlier}
+          readOnly={readOnly}
+          onOpenIssue={onOpenIssue}
+        />
         <div ref={bottom} />
 
-        <form
-          className="card p-2.5 lg:sticky lg:bottom-3"
-          onSubmit={(e) => {
-            e.preventDefault();
-            submit();
-          }}
-        >
-          <textarea
-            value={draft}
-            onChange={(e) => setDraft(e.target.value)}
-            onKeyDown={onKey}
-            rows={2}
-            disabled={!!block}
-            placeholder={block ? "" : "Ask the master for work…"}
-            aria-label="message to the master"
-            className="w-full resize-y bg-transparent text-body text-ink-100 placeholder:text-ink-500 outline-none disabled:opacity-50 min-h-[2.75rem]"
-          />
-          <div className="flex items-center gap-2 mt-1.5">
-            <p className="text-micro text-ink-500 min-w-0 flex-1 break-words" data-composer-block={block ? "" : undefined}>
-              {block ?? "Enter sends · Shift+Enter for a new line"}
-            </p>
-            <button
-              type="submit"
-              disabled={!!block || !draft.trim()}
-              className="h-8 px-3 rounded bg-accent text-on-accent text-label font-medium disabled:opacity-40 shrink-0"
-            >
-              Send
-            </button>
-          </div>
-        </form>
+        <Composer block={block} seed={seed} />
       </section>
     </main>
   );

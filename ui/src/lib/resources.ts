@@ -1,6 +1,15 @@
 import { api } from "./api";
 import { QueryCache, type Resource } from "./cache";
-import { loadThread, type ThreadState } from "../features/home/thread";
+import { loadThread, type PageReader, type ThreadState } from "../features/home/thread";
+
+/** Page reads of one agent's thread. */
+export function threadReader(alias: string): PageReader {
+  return {
+    after: (after, limit) => api.thread(alias, { after, limit }),
+    tail: (limit) => api.thread(alias, { tail: true, limit }),
+    before: (before, limit) => api.thread(alias, { before, limit }),
+  };
+}
 import type { AgentsPayload, IssueCard, IssueDetail, Overview, Project } from "./types";
 
 /** The app's one query cache — every screen reads its stores from here. */
@@ -12,7 +21,7 @@ export const cache = new QueryCache();
  * messages; the Home screen streams the rest in (`streamInto`).
  */
 const masterThread: Resource<ThreadState> = cache.resource<ThreadState>("thread:master", () =>
-  loadThread((after, limit) => api.thread("master", after, limit), masterThread.get().data),
+  loadThread(threadReader("master"), masterThread.get().data),
 );
 
 /**

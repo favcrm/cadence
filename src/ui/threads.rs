@@ -4,7 +4,9 @@
 //! acks, so a board built from a newer binary stays compatible with an
 //! older live daemon (a missing method answers 501).
 //!
-//! - `GET  /api/threads/<alias>?after=<seq>&limit=<n>` — one page.
+//! - `GET  /api/threads/<alias>?after=<seq>&limit=<n>` — one page;
+//!   `?tail=1` or `?before=<seq>` read the newest page / the page below
+//!   a seq instead (`more_before` says whether older entries remain).
 //! - `GET  /api/threads/<alias>/stream[?after=<seq>]` — server-sent
 //!   events, one `entry` frame per entry with `id: <seq>`; a reconnect
 //!   resumes from `Last-Event-ID` (preferred) or `after`.
@@ -121,11 +123,30 @@ pub(super) fn read(
             }
         },
     };
-    match client::rpc(
-        state_dir,
-        "thread_read",
-        json!({"alias": alias, "after": after, "limit": limit}),
-    ) {
+    // CAD-328: `?tail=1` (the newest page) or `?before=<seq>` read
+    // backwards — a chat view opens on its latest entries.
+    let tail = matches!(query("tail").as_deref(), Some("1" | "true"));
+    let before = match query("before") {
+        None => None,
+        Some(v) => match v.trim().parse::<i64>() {
+            Ok(n) if n >= 1 => Some(n),
+            _ => return err_response(400, "before must be a positive seq"),
+        },
+    };
+    let params = if tail || before.is_some() {
+        if query("after").is_some() {
+            return err_response(400, "after cannot be combined with tail or before");
+        }
+        let mut p = json!({"alias": alias, "limit": limit});
+        match before {
+            Some(b) => p["before"] = json!(b),
+            None => p["tail"] = json!(true),
+        }
+        p
+    } else {
+        json!({"alias": alias, "after": after, "limit": limit})
+    };
+    match client::rpc(state_dir, "thread_read", params) {
         Ok(page) => json_response(page),
         Err(e) => rpc_err(&e),
     }

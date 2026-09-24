@@ -5,8 +5,14 @@ import {
   discardPending,
   EMPTY_THREAD,
   lastSeq,
+  applyEarlier,
+  fetchEarlier,
   loadThread,
   mergePage,
+  PAGE,
+  visibleWindow,
+  WINDOW,
+  type PageReader,
   newMessageId,
   planAnchors,
   planRef,
@@ -161,31 +167,84 @@ async function main() {
     equal(/^ui-[0-9a-z]+-[0-9a-z]+$/.test(id), true, "message id shape");
   }
 
-  // Loading pages: after what is held, until a short page; 404 is the
-  // "master not started" state, not a failure; other errors throw.
+  // Loading: the NEWEST page first (tail), never the history from the
+  // start; a refetch catches up forward, a long gap reopens on the tail;
+  // earlier pages fold in on demand; 404 is "master not started".
   {
-    const calls: number[] = [];
-    const pages: Record<number, unknown[]> = {
-      0: [entry(1, "operator", "message", "a"), entry(2, "agent", "turn_result", "b")],
-      2: [entry(3, "agent", "turn_result", "c")],
+    const all = Array.from({ length: 10_000 }, (_, i) => entry(i + 1, i % 2 ? "agent" : "operator", i % 2 ? "turn_result" : "message", `m${i + 1}`));
+    const calls: string[] = [];
+    const server = (): PageReader => ({
+      after: async (after, limit) => {
+        calls.push(`after:${after}`);
+        return { thread: { id: "t1" }, entries: all.filter((e) => e.seq > after).slice(0, limit) };
+      },
+      tail: async (limit) => {
+        calls.push(`tail:${limit}`);
+        return { thread: { id: "t1" }, entries: all.slice(-limit), more_before: all.length > limit };
+      },
+      before: async (before, limit) => {
+        calls.push(`before:${before}`);
+        const older = all.filter((e) => e.seq < before);
+        return { thread: { id: "t1" }, entries: older.slice(-limit), more_before: older.length > limit };
+      },
+    });
+    const read = server();
+    let s = await loadThread(read, null);
+    equal(calls, [`tail:${PAGE}`], "opens on the tail");
+    equal([s.entries[0].seq, lastSeq(s), s.moreBefore], [10_000 - PAGE + 1, 10_000, true], "newest page");
+    // Stream resumes from the newest seq, not from 0.
+    equal(lastSeq(s), 10_000, "resume cursor is the newest seq");
+
+    // The rendered window stays bounded however long the thread is.
+    const everything = mergePage(null, { thread: { id: "t1" }, entries: all });
+    const items = threadItems(everything);
+    const { shown, hidden } = visibleWindow(items);
+    equal(shown.length <= WINDOW, true, "rendered items stay within the window");
+    equal(shown.length + hidden, items.length, "hidden above");
+    equal(shown[shown.length - 1], items[items.length - 1], "window ends at the newest");
+    equal(visibleWindow(items.slice(0, 3)).hidden, 0, "short thread shows all");
+
+    // Earlier: one page below the first held seq, merged into the
+    // current state (a frame that landed meanwhile is kept).
+    const older = await fetchEarlier(read, s)!;
+    equal(calls[calls.length - 1], `before:${10_000 - PAGE + 1}`, "before the first held seq");
+    const live = reduceFrame(s, { type: "entry", data: JSON.stringify(entry(10_001, "agent", "turn_result", "new")), id: "10001" });
+    s = applyEarlier(live, older);
+    equal([s.entries.length, s.entries[0].seq, lastSeq(s), s.moreBefore], [2 * PAGE + 1, 10_000 - 2 * PAGE + 1, 10_001, true], "earlier merged, live kept");
+    const first = mergePage(null, { thread: { id: "t" }, entries: [entry(1, "operator", "message", "a")] });
+    equal(fetchEarlier(read, first), null, "nothing before seq 1");
+
+    // Refetch with entries held: forward catch-up; a long gap reopens on
+    // the tail, keeping pending messages.
+    calls.length = 0;
+    const near = addPending(mergePage(null, { thread: { id: "t1" }, entries: all.slice(-5, -2) }), "p", "keep me", 1);
+    const caught = await loadThread(read, near);
+    equal(calls, [`after:${10_000 - 2}`], "one forward page");
+    equal([lastSeq(caught), caught.pending.length], [10_000, 1], "caught up, pending kept");
+    calls.length = 0;
+    const far = addPending(mergePage(null, { thread: { id: "t1" }, entries: all.slice(0, 3) }), "p", "keep me", 1);
+    const reopened = await loadThread(read, far);
+    equal(calls, ["after:3", `after:${3 + PAGE}`, `tail:${PAGE}`], "gap too long → tail");
+    equal([reopened.entries[0].seq, reopened.pending.length], [10_000 - PAGE + 1, 1], "reopened, pending kept");
+
+    // A daemon without backward reads answers a forward page: kept, and
+    // "more before" is unknown rather than wrong.
+    const old: PageReader = {
+      after: async () => ({ thread: { id: "t" }, entries: [] }),
+      tail: async () => ({ thread: { id: "t" }, entries: all.slice(0, 3) }),
+      before: async () => ({ thread: { id: "t" }, entries: [] }),
     };
-    const s = await loadThread(async (after) => {
-      calls.push(after);
-      return { thread: { id: "t1" }, entries: pages[after] ?? [] };
-    }, null, 2);
-    equal(calls, [0, 2], "pages until a short one");
-    equal(s.entries.map((e) => e.seq), [1, 2, 3], "all pages merged");
-    const held = addPending(s, "p", "keep me", 1);
-    const again = await loadThread(async (after) => {
-      calls.push(after);
-      return { thread: { id: "t1" }, entries: [] };
-    }, held);
-    equal(calls[calls.length - 1], 3, "refetch starts after the held cursor");
-    equal(again.pending.length, 1, "pending survives a refetch");
-    const gone = await loadThread(() => Promise.reject(Object.assign(new Error("no agent"), { status: 404 })), null);
+    const fallback = await loadThread(old, null);
+    equal([fallback.entries.length, fallback.moreBefore], [3, null], "old daemon degrades");
+
+    const fail = (status: number): PageReader => {
+      const no = () => Promise.reject(Object.assign(new Error("x"), { status }));
+      return { after: no, tail: no, before: no };
+    };
+    const gone = await loadThread(fail(404), null);
     equal([gone.missing, gone.exists], [true, false], "404 → missing");
     let threw = false;
-    await loadThread(() => Promise.reject(Object.assign(new Error("down"), { status: 503 })), null).catch(() => {
+    await loadThread(fail(503), null).catch(() => {
       threw = true;
     });
     equal(threw, true, "a 503 is a failure");
@@ -194,6 +253,9 @@ async function main() {
   // Plan cards: each epic once, at its first mention.
   {
     equal(planRef(entry(1, "agent", "tool_result", '{"epic": "D-2", "tickets": ["D-3"]}')), "D-2", "json epic");
+    equal(planRef(entry(1, "agent", "tool_result", '{"id": "D-2", "plan": {"state": "proposed"}}')), null, "plan block without epic key");
+    equal(planRef(entry(1, "agent", "tool_result", '{"epic": "D-2", "plan": {"state": "proposed"}}')), "D-2", "plan show shape");
+    equal(planRef(entry(1, "agent", "tool_result", '{"epic": "D-8", "stage": "build"}')), null, "epic stage output is not a plan");
     equal(planRef(entry(1, "agent", "tool_call", "Bash: cadence plan show CAD-12 --json")), "CAD-12", "plan command");
     equal(planRef(entry(1, "agent", "turn_result", "I proposed plan D-7 for you.")), "D-7", "prose");
     equal(planRef(entry(1, "agent", "turn_result", "D-7 is done.")), null, "an id alone is not a plan");
@@ -204,7 +266,7 @@ async function main() {
         thread: { id: "t" },
         entries: [
           entry(1, "agent", "tool_call", "Bash: cadence plan propose demo"),
-          entry(2, "agent", "tool_result", '{"epic":"D-2"}'),
+          entry(2, "agent", "tool_result", '{"epic":"D-2","tickets":["D-3"]}'),
           entry(3, "agent", "turn_result", "Plan D-2 is ready for you."),
         ],
       }),

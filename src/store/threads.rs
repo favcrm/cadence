@@ -633,6 +633,37 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
+
+    /// The newest `limit` entries with `seq < before` (`None`: the
+    /// newest of all), oldest first, and whether older entries remain —
+    /// a chat view opens on its latest page and pages backwards
+    /// (CAD-328) instead of replaying the whole thread from the start.
+    pub fn thread_entries_before(
+        &self,
+        alias: &str,
+        before: Option<i64>,
+        limit: i64,
+    ) -> Result<(Vec<ThreadEntry>, bool)> {
+        let conn = self.conn();
+        let Some(thread) = Self::thread_in(&conn, alias)? else {
+            return Ok((Vec::new(), false));
+        };
+        let limit = limit.clamp(1, PAGE_MAX);
+        let mut stmt = conn.prepare(
+            "SELECT * FROM thread_entries WHERE thread_id=? AND seq<?
+             ORDER BY seq DESC LIMIT ?",
+        )?;
+        let mut rows = stmt
+            .query_map(
+                params![thread.id, before.unwrap_or(i64::MAX), limit + 1],
+                row_entry,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let more = rows.len() as i64 > limit;
+        rows.truncate(limit as usize);
+        rows.reverse();
+        Ok((rows, more))
+    }
 }
 
 #[cfg(test)]

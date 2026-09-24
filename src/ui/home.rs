@@ -28,8 +28,8 @@ use serde_json::json;
 use tiny_http::Request;
 
 use super::{
-    coded_response, err_response, guard_fail, json_response, parse_json, read_body, write_caller,
-    write_guard, write_reply, HttpResp, ServeOpts, WriteCaller,
+    agent_roots, coded_response, err_response, guard_fail, json_response, parse_json, read_body,
+    tailnet_proxy, write_caller, write_guard, write_reply, HttpResp, ServeOpts, WriteCaller,
 };
 use crate::client;
 use crate::error::Error;
@@ -73,7 +73,11 @@ pub(super) fn answer_route(path: &str) -> Option<&str> {
 
 /// The board's write path for an operator decision: read-only, the
 /// cross-site guards, then the caller — an agent is refused (403,
-/// `check: "operator_only"`). Returns the operator's actor.
+/// `check: "operator_only"`) — and then POSITIVE operator proof for the
+/// HTTP peer ([`prove_operator_peer`]): being tied to no agent is not
+/// enough here, because the daemon checks the board's own connection
+/// and would accept whatever the board relays. Returns the operator's
+/// actor.
 fn operator_write(
     request: &Request,
     state_dir: &std::path::Path,
@@ -88,7 +92,10 @@ fn operator_write(
     }
     write_guard(request, "application/json", opts)?;
     match write_caller(request, state_dir, opts)? {
-        WriteCaller::Operator(actor) => Ok(actor),
+        WriteCaller::Operator(actor) => {
+            prove_operator_peer(request, state_dir, opts, what)?;
+            Ok(actor)
+        }
         WriteCaller::Agent(alias) => Err(guard_fail(
             "operator_only",
             &format!(
@@ -97,6 +104,51 @@ fn operator_write(
             ),
         )),
     }
+}
+
+/// CAD-276's positive operator proof, run on the board's TCP peer — the
+/// rule the daemon applies to its own operator verbs
+/// ([`crate::peer::tcp_peer_operator_proof`]): the peer walks cleanly,
+/// no registered pane or managed provider is on its ancestry, it does
+/// not descend from the daemon process (a detached child of a
+/// daemon-launched tool re-parents to the daemon under `daemon run`),
+/// it carries no agent environment and holds no pane pty, and its
+/// session leader is on its ancestry. A request proven to come through
+/// `tailscale serve` (CAD-336) is the tailnet login's and passes: its
+/// peer is tailscaled. Anything unprovable — a daemon that cannot say
+/// its pid, agents it cannot list — refuses with 403 `operator_proof`,
+/// before anything is written.
+fn prove_operator_peer(
+    request: &Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+    what: &str,
+) -> std::result::Result<(), HttpResp> {
+    if matches!(tailnet_proxy(request, opts), Some(Ok(()))) {
+        return Ok(());
+    }
+    let refuse = |why: String| {
+        guard_fail(
+            "operator_proof",
+            &format!(
+                "{what} refused: this request is not provably from the operator — {why}. \
+                 Decide from the operator's own browser or shell, outside every pane \
+                 and managed endpoint"
+            ),
+        )
+    };
+    let daemon_pid = client::rpc(state_dir, "health", json!({}))
+        .ok()
+        .and_then(|h| h["pid"].as_u64())
+        .and_then(|p| u32::try_from(p).ok())
+        .ok_or_else(|| refuse("the daemon's pid cannot be read".to_string()))?;
+    let roots = agent_roots(state_dir).map_err(refuse)?;
+    let peer = request
+        .remote_addr()
+        .ok_or_else(|| refuse("the request has no peer address".to_string()))?;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    crate::peer::tcp_peer_operator_proof(opts.port, *peer, uid, daemon_pid, &roots).map_err(refuse)
 }
 
 /// Daemon error → HTTP for the relayed operator RPCs.
@@ -123,6 +175,9 @@ fn rpc_err(e: &Error, method: &str) -> HttpResp {
             coded_response(404, "unknown_issue", m, None)
         }
         Error::Rejected(m) if m.contains("already") => coded_response(409, "decided", m, None),
+        _ if e.kind() == "conflict" => {
+            coded_response(409, e.code().unwrap_or("conflict"), &text, e.revision())
+        }
         _ => coded_response(400, e.code().unwrap_or("invalid_request"), &text, None),
     }
 }
