@@ -42881,6 +42881,7 @@ fn cad323_refused_interrupt_is_recorded() {
         .as_str()
         .unwrap()
         .contains("no provider-native"));
+}
 
 // ==== CAD-431: the worker loop — review routing, verdicts, merge ====
 
