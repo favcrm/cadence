@@ -146,6 +146,28 @@ fn build_command(
     if let Some(effort) = params.get("effort").and_then(Value::as_str) {
         cmd.extend(["--effort".to_string(), effort.to_string()]);
     }
+    // CAD-339: the master's posture is fixed by its alias, never by
+    // stored params (review round 1, C1/I4): only the Bash tool, only
+    // the listed `cadence` subcommands, deny-by-default without prompts
+    // (`dontAsk`), no user/project/local settings files, hooks or MCP
+    // servers (`--restricted`, `--strict-mcp-config`).
+    if crate::master::is_master(&agent.alias) {
+        cmd.extend([
+            "--restricted".to_string(),
+            "--strict-mcp-config".to_string(),
+            "--tools".to_string(),
+            crate::master::CLAUDE_TOOLS.to_string(),
+            "--permission-mode".to_string(),
+            "dontAsk".to_string(),
+        ]);
+        for tool in crate::master::CLAUDE_ALLOWED_TOOLS {
+            cmd.extend(["--allowedTools".to_string(), tool.to_string()]);
+        }
+        for tool in crate::master::CLAUDE_DISALLOWED_TOOLS {
+            cmd.extend(["--disallowedTools".to_string(), tool.to_string()]);
+        }
+        return cmd;
+    }
     let mode = params
         .get("permission_mode")
         .and_then(Value::as_str)
@@ -276,13 +298,19 @@ impl ClaudeAdapter {
     }
 
     /// A transport bound to `command` but wired into this adapter's
-    /// shared state — the swap target at `open()`.
-    fn transport_for(&self, command: &[String]) -> Arc<StdioAdapter> {
+    /// shared state — the swap target at `open()`. The master's scrub
+    /// also drops forge and platform credentials (CAD-339).
+    fn transport_for(&self, command: &[String], master: bool) -> Arc<StdioAdapter> {
         let routed = Arc::clone(&self.shared);
         let disconnected = Arc::clone(&self.shared);
+        let scrub = if master {
+            claude_env_scrub().and_names(crate::master::DENIED_ENV)
+        } else {
+            claude_env_scrub()
+        };
         StdioAdapter::new_lines(
             command,
-            claude_env_scrub(),
+            scrub,
             Box::new(move |incoming| routed.dispatch(incoming)),
             Box::new(move || disconnected.on_disconnect()),
         )
@@ -516,7 +544,9 @@ impl ProviderAdapter for ClaudeAdapter {
         // every other launch param, and carrying the identity env the
         // `mcp-permission` server needs explicitly (independent of the
         // provider's own env propagation).
-        let mcp_config = if brokered(agent) {
+        let master = crate::master::is_master(&agent.alias);
+        // The master never brokers prompts: it runs `dontAsk`.
+        let mcp_config = if brokered(agent) && !master {
             Some(self.write_mcp_config(agent)?)
         } else {
             None
@@ -535,6 +565,18 @@ impl ProviderAdapter for ClaudeAdapter {
             ),
         ];
         env.extend(super::daemon_context_env(&self.env));
+        if master {
+            // Its cwd is not the tracker: name the tracker explicitly
+            // when the daemon's context does not already.
+            let pm = self
+                .env
+                .var("CADENCE_PM_DIR")
+                .filter(|v| !v.is_empty())
+                .is_none()
+                .then(crate::issue::default_dir)
+                .and_then(Result::ok);
+            env.extend(crate::master::env_overrides(&self.state_dir, pm.as_deref()));
+        }
         let params = agent.params.clone().unwrap_or(Value::Null);
         let idle_secs = params
             .get("turn_idle_secs")
@@ -546,7 +588,7 @@ impl ProviderAdapter for ClaudeAdapter {
             .and_then(Value::as_u64)
             .map(|s| Duration::from_secs(s.max(1)));
         *self.shared.last_activity.lock().unwrap() = Instant::now();
-        let transport = self.transport_for(&command);
+        let transport = self.transport_for(&command, master);
         let pid = transport.launch(&agent.cwd, &self.log_path, &env)?;
         *self.transport.write().unwrap() = transport;
         Ok(Identity {
@@ -745,5 +787,103 @@ impl ProviderAdapter for ClaudeAdapter {
         transport.close_stdin();
         transport.wait_exit(Duration::from_secs(3));
         transport.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn agent(alias: &str, params: Value) -> Agent {
+        Agent {
+            alias: alias.into(),
+            provider: "claude".into(),
+            endpoint_kind: "managed".into(),
+            role: "worker".into(),
+            team_role: None,
+            cwd: "/tmp".into(),
+            sandbox: "read-only".into(),
+            instructions: None,
+            thread_id: None,
+            session_id: None,
+            model: None,
+            effort: None,
+            pid: None,
+            endpoint: None,
+            params: Some(params),
+            model_selection: None,
+            quota: None,
+            generation: None,
+            state: "starting".into(),
+            enabled: true,
+            error: None,
+            created: 0.0,
+            updated: 0.0,
+        }
+    }
+
+    fn flag_values(cmd: &[String], flag: &str) -> Vec<String> {
+        cmd.windows(2)
+            .filter(|w| w[0] == flag)
+            .map(|w| w[1].clone())
+            .collect()
+    }
+
+    /// CAD-339: the master's launch line ignores stored permission
+    /// params — `cadence` commands only, edits, gh and push disallowed —
+    /// while any other agent keeps its params.
+    #[test]
+    fn master_tool_posture_is_fixed_by_alias() {
+        let env = ProviderEnv::default();
+        let loose = json!({"permission_mode": "bypassPermissions",
+                           "allowed_tools": ["Bash(gh *)", "Edit"]});
+        let cmd = build_command(&env, &agent("master", loose.clone()), "s", false, None);
+        assert_eq!(flag_values(&cmd, "--permission-mode"), ["dontAsk"]);
+        assert_eq!(flag_values(&cmd, "--tools"), ["Bash"]);
+        assert!(cmd.iter().any(|a| a == "--restricted"), "{cmd:?}");
+        assert!(cmd.iter().any(|a| a == "--strict-mcp-config"), "{cmd:?}");
+        let allowed = flag_values(&cmd, "--allowedTools");
+        assert_eq!(allowed, crate::master::CLAUDE_ALLOWED_TOOLS);
+        // Review round 1, C1: never a bare `cadence *` — build-slot run
+        // execs arbitrary argv — and nothing that execs or writes agents.
+        for a in &allowed {
+            assert!(a.starts_with("Bash(cadence "), "{a}");
+            for bad in [
+                "Bash(cadence *)",
+                "build-slot",
+                "agent set",
+                "cadence send",
+                "cadence dispatch",
+            ] {
+                assert!(!a.contains(bad), "{a}");
+            }
+        }
+        let denied = flag_values(&cmd, "--disallowedTools");
+        for tool in ["Edit", "Write", "Bash(gh *)", "Bash(git push *)"] {
+            assert!(denied.iter().any(|d| d == tool), "{tool}: {cmd:?}");
+        }
+        let cmd = build_command(&env, &agent("dev-1", loose), "s", false, None);
+        assert_eq!(
+            flag_values(&cmd, "--permission-mode"),
+            ["bypassPermissions"]
+        );
+        assert_eq!(flag_values(&cmd, "--allowedTools").len(), 3);
+        assert!(flag_values(&cmd, "--disallowedTools").is_empty());
+    }
+
+    #[test]
+    fn master_scrub_drops_forge_and_platform_credentials() {
+        let scrub = claude_env_scrub().and_names(crate::master::DENIED_ENV);
+        for name in [
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "SSH_AUTH_SOCK",
+            "CLOUDFLARE_API_TOKEN",
+        ] {
+            assert!(scrub.removes_name(name), "{name}");
+            assert!(!claude_env_scrub().removes_name(name), "{name}");
+        }
+        assert!(!scrub.removes_name("ANTHROPIC_API_KEY"));
+        assert!(!scrub.removes_name("PATH"));
     }
 }

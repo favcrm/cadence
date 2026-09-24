@@ -17,6 +17,7 @@ pub mod doctor;
 pub mod error;
 pub mod inbox;
 pub mod issue;
+pub mod master;
 pub mod mcp;
 pub mod memory;
 pub mod model_defaults;

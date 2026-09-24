@@ -86,8 +86,18 @@ report (`answers: <question file name>`, free body) answers a question on the
 same ticket; a question is open until an answer names it — the question file
 is never edited. `cadence issue show` and the board's issue detail payload
 (`reports`, with `open`/`answered_by` on questions) list them; `cadence issue
-lint` validates them. Typed claims inside `## Lesson` and managed workers'
-trailing report block are not parsed yet.
+lint` validates them.
+
+Routing (CAD-339, MVP): with a master registered, the daemon's report router
+queues to the master (so it lands in the master's thread) every `done`/`blocked`
+report filed after the master started, and every question still open and
+unescalated after `[host] question_escalate_after_secs` (default 900 s — the
+window a PM has to answer), including questions open before the master
+started; at most five per pass, the rest counted as the routing backlog in the
+summary. A question the master cannot answer is escalated through the daemon
+(`cadence master escalate`, master or operator only — not a report kind); it
+stays in the operator's Needs-you (the overview's `needs_me`, kind `question`,
+with the master's summary) until an answer names it.
 
 ## 2. Verification
 

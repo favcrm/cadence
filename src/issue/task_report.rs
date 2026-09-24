@@ -612,6 +612,16 @@ pub fn list(issue_dir: &Path, id: &str) -> Vec<Value> {
     rows
 }
 
+/// The open questions on a ticket — [`list`] rows of kind `question`
+/// that no answer names yet (CAD-339: what the report router and the
+/// operator's Needs-you read).
+pub fn open_questions(issue_dir: &Path, id: &str) -> Vec<Value> {
+    list(issue_dir, id)
+        .into_iter()
+        .filter(|r| r["kind"] == "question" && r["open"] == true && r["error"].is_null())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

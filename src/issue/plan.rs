@@ -459,6 +459,26 @@ pub fn gate(pm_dir: &Path, front: &Front, body: &str) -> Result<()> {
     Ok(())
 }
 
+/// CAD-339: the master's dispatch gate — [`gate`], and the issue must
+/// be a ticket of an **approved** plan. Where [`gate`] lets an issue in
+/// no plan through, the master is refused: it dispatches only work the
+/// operator approved. Same fail-closed membership rules.
+pub fn gate_master(pm_dir: &Path, front: &Front, body: &str) -> Result<()> {
+    gate(pm_dir, front, body)?;
+    match membership(pm_dir, front)? {
+        Some((_, plan)) if plan.state == "approved" => Ok(()),
+        _ => Err(Error::invalid(
+            "master_outside_plan",
+            format!(
+                "{} is not a ticket of an approved plan — the master dispatches only \
+                 approved plan tickets; propose a plan (`cadence plan propose`) and \
+                 wait for the operator's approval",
+                front.id
+            ),
+        )),
+    }
+}
+
 /// [`gate`] by issue id — for callers holding only an id (the daemon's
 /// job dispatch). An id no project holds passes (jobs need not name a
 /// tracker issue); one that exists but cannot be read refuses.

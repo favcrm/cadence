@@ -294,14 +294,21 @@ fn setup_creates_once_and_a_second_run_changes_nothing() {
         .unwrap()
         .contains("cursor.com/install"));
 
-    // CAD-339 and CAD-313 are reported, never implemented here.
-    // `master start` is not a verb of this binary yet: no fix to paste.
+    // CAD-339 and CAD-313 are reported, never implemented here. This
+    // binary has `master start` (CAD-339), so setup names it as the fix
+    // and still installs nothing itself.
     assert_eq!(status(&checks, "master"), "missing");
-    assert!(checks["master"]["fix"].is_null(), "{}", checks["master"]);
+    assert!(
+        checks["master"]["fix"]
+            .as_str()
+            .is_some_and(|f| f.ends_with("master start")),
+        "{}",
+        checks["master"]
+    );
     assert!(checks["master"]["detail"]
         .as_str()
         .unwrap()
-        .contains("CAD-339"));
+        .contains("`master start` installs them (CAD-339)"));
     assert!(!host.path("home/pm/agents").exists());
     assert_eq!(status(&checks, "login"), "unknown");
 

@@ -682,7 +682,9 @@ impl Audience {
         match kind {
             // A fenced agent's exit is `agent unfence` / `message
             // reconcile`, which only the operator may run (CAD-374).
-            "approval" | "fenced" => Self::Operator,
+            // CAD-339 Needs-you: a question the master escalated and a
+            // plan awaiting approval are the operator's to decide.
+            "approval" | "fenced" | "question" | "plan" => Self::Operator,
             "drift" => Self::Dependency,
             "inbox_unread" | "tracker_behind" => Self::Info,
             _ => Self::Team,
@@ -2386,6 +2388,7 @@ pub fn overview_with(state_dir: &Path, pm_dir: &Path, opts: &Options) -> Result<
             .collect();
         let mut clock = StatusClock::new(&pm.dir, STATUS_CLOCK_BUDGET);
         let mut intake: Vec<Item> = Vec::new();
+        let escalations = crate::master::escalations(state_dir);
         for v in views {
             let id = v.issue.front.id.as_str();
             let project = v.issue.project.as_str();
@@ -2452,6 +2455,83 @@ pub fn overview_with(state_dir: &Path, pm_dir: &Path, opts: &Options) -> Result<
                     .owned_by(Some(owner))
                     .since(since),
                 );
+            }
+            // CAD-339 Needs-you: a plan waiting for the operator's
+            // decision, and every open question the master escalated —
+            // with the master's summary, the question and its options.
+            if let Some(plan) = v
+                .issue
+                .front
+                .plan
+                .as_ref()
+                .filter(|p| p.state == "proposed")
+            {
+                let since = parse_iso(&plan.proposed_at);
+                let mut row = item(
+                    25,
+                    "plan",
+                    &format!(
+                        "{id} plan proposed by {} — {} ({} tickets)",
+                        plan.proposed_by,
+                        v.issue.front.title,
+                        plan.tickets.len()
+                    ),
+                    since.map_or(age, |t| now - t),
+                    project,
+                    None,
+                    &format!("cadence plan show {id} && cadence plan approve {id}"),
+                )
+                .about("issue", id)
+                .since(since);
+                row.json["plan"] = json!({"epic": id, "proposed_by": plan.proposed_by,
+                                          "tickets": plan.tickets});
+                needs.push(row);
+            }
+            // Only the daemon's escalation record puts a question here —
+            // a report file never can (review round 1, I3); reports are
+            // parsed only for tickets that have one.
+            let escalated_here = escalations.keys().any(|k| k.starts_with(&format!("{id}/")));
+            let open = if escalated_here {
+                issue::task_report::open_questions(&v.issue.dir, id)
+            } else {
+                vec![]
+            };
+            for q in open {
+                let key = format!("{id}/{}", q["name"].as_str().unwrap_or_default());
+                let Some(up) = escalations.get(&key).and_then(Value::as_object) else {
+                    continue;
+                };
+                let since = q["at"].as_str().and_then(parse_iso);
+                let mut row = item(
+                    20,
+                    "question",
+                    &format!(
+                        "{id} question from {} — {}",
+                        q["agent"].as_str().unwrap_or_default(),
+                        q["impact"].as_str().unwrap_or_default()
+                    ),
+                    since.map_or(age, |t| now - t),
+                    project,
+                    None,
+                    &format!(
+                        "cadence issue show {id}  # answer: cadence report file --task {id} \
+                         --kind answer (answers: {})",
+                        q["name"].as_str().unwrap_or_default()
+                    ),
+                )
+                .about(
+                    "report",
+                    &format!("{id}/{}", q["name"].as_str().unwrap_or_default()),
+                )
+                .for_agent(q["agent"].as_str().unwrap_or_default())
+                .since(since);
+                row.json["question"] = json!({
+                    "issue": id, "report": q["name"], "agent": q["agent"],
+                    "options": q["options"], "impact": q["impact"], "body": q["body"],
+                });
+                row.json["summary"] = up.get("summary").cloned().unwrap_or(Value::Null);
+                row.json["escalated_by"] = up.get("by").cloned().unwrap_or(Value::Null);
+                needs.push(row);
             }
             // `cadence report` intake: a backlog-tagged row surfaces
             // until triage moves it off backlog — the effective status

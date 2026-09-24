@@ -215,6 +215,40 @@ dir, never into the product repository, and regenerated on every launch.
 3. Drift between `AGENT.md` and a running session (model, effort, permissions) is
    reported as "restart to apply", never switched mid-task.
 
+## First implementation: the master (CAD-339, MVP)
+
+Until CAD-338 lands, only the master is an agent folder, and it lives where
+this record puts the system filesystem: **`<pm>/agents/master/`** — the
+tracker dir (`~/pm`, or `CADENCE_PM_DIR`), which is already git with one
+writer. `agents/` carries no `project.yaml`, so the tracker never reads it as
+a project; the project key `agents` is refused by `issue project add` and
+flagged by lint. The repo ships the default `agents/master/SOUL.md` and
+`AGENT.md`; `cadence master start` (operator only) installs whichever is
+missing in one tracker commit, then has the daemon launch alias `master` as a
+managed **Claude** session and queue its briefing — SOUL.md then AGENT.md,
+verbatim. The master is Claude-only for now: a Codex master needs a read-only
+sandbox with its writes going through daemon verbs (follow-up). Its working
+directory is an empty folder under the state dir (`<state>/master/cwd`), never
+the tracker or a repo, where any agent could plant a `CLAUDE.md`, hooks or
+settings; the tracker is passed as `CADENCE_PM_DIR`. The master is started
+explicitly, never at daemon start (auto-start belongs to the setup wizard,
+CAD-327).
+
+What is enforced, and how:
+
+| Rule | Enforced by | Gap (process guard, not a security boundary) |
+|---|---|---|
+| The master reaches only its own verbs | The daemon's master policy is an **allowlist** (`MASTER_ALLOWED`): reads, `plan_propose`, `master_dispatch`, `question_escalate`, `master_summary`, `message_report` on its own messages. Every other method — present or added later — is refused before it runs; a test walks the whole method table | A process that escapes the master's tree (setsid + double fork) is not recognised as the master (CAD-276's residual; CAD-384 for all agents) |
+| Its tools are those verbs only | Claude launch: `--restricted` (no user/project/local settings files), `--strict-mcp-config` (no MCP servers), `--tools Bash`, `--permission-mode dontAsk`, and `--allowedTools` listing the exact `cadence` subcommands — never `cadence *` (`build-slot run -- <argv>` would exec anything); edits, `gh`, `git push/merge/commit` also disallowed. Fixed by alias, never by stored params | Claude's own prefix matching is the boundary for shell tricks inside an allowed command |
+| It dispatches only approved plan tickets, once, by the rules | `master_dispatch`: the daemon checks the ticket is in an approved plan, `ready`, its `blocked_by` done or dropped, and sends to the ticket's own agent (`--to` only when none is named) the standard kickoff composed from the ticket. `agent_send`/`agent_ask`/jobs are refused to the master | As above |
+| Only the operator writes `SOUL.md`/`AGENT.md` | `cadence master edit` → daemon `agent_file_write`, proven operator only; every write and install records a per-file sha256 in the state dir, and `master start` refuses a file whose digest changed (before it writes anything) | A same-uid process can edit the file and the digest record; the edit is caught only at the next start |
+| An escalation is the master's (or operator's) | `cadence master escalate` → daemon `question_escalate`, bound to the connection; the record is in the state dir and is the only source of Needs-you question rows. There is no `escalate` report kind — a forged one fails `report file` and lint | Same-uid write to the state dir |
+| No merge, push or platform effect | Launch: no forge/platform tokens in env, `GH_CONFIG_DIR` empty, `GIT_TERMINAL_PROMPT=0`, plus the tool posture above | Credentials in files (ssh keys, a token file) stay readable by the same uid |
+
+`thread_send` (the operator's chat) needs a provably-operator connection
+(CAD-276), so a detached child of any agent cannot post as the operator; the
+board relays browser writes from its own process (CAD-313's gap).
+
 ## Migration
 
 - `docs/roles/*.md` and `~/.local/state/cadence/roles/` become

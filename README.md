@@ -254,8 +254,9 @@ cadence issue start CAD-16         # mints the project worktree+branch,
 cadence issue finish CAD-16        # safe cleanup: refuses while the owner
                                       # is busy, the tree dirty, or the
                                       # branch unmerged+unpushed
-cadence dispatch CAD-16 --to w1 --note kick.md
-                                   # one-step hand-off: issue start +
+cadence dispatch CAD-16 --to w1 [--note kick.md]
+                                   # one-step hand-off (note defaults to
+                                      # the ticket's issue.md): issue start +
                                       # one templated kickoff + comment;
                                       # --job --spec f dispatches the job
 cadence plan propose --project cadence --file PLAN.md
@@ -274,6 +275,22 @@ cadence issue epic stage CAD-40 verify
                                       # forward, any back; build/release
                                       # forward = operator only)
 cadence milestone ls               # milestones with weighted progress
+cadence master start               # operator only: the one `master` agent
+                                      # (managed claude) briefed from
+                                      # <pm>/agents/master/{SOUL,AGENT}.md,
+                                      # defaults installed when missing; chat
+                                      # via its thread. It may only read,
+                                      # propose plans, `master dispatch`
+                                      # approved tickets and `master escalate`
+                                      # questions; the daemon refuses it
+                                      # everything else (CAD-339)
+cadence master edit SOUL.md --file f
+                                   # the one writer of the master's files
+                                      # (operator only; start refuses files
+                                      # edited around it)
+cadence master summary --since 24h [--post]
+                                   # "since you left": plans, moved tickets,
+                                      # reports, open questions
 cadence ui run                     # 127.0.0.1:3010 — SPA + read/write API
 cadence secret scan [--file f]     # credential scan: JSON findings
                                    # {rule,line,column,redacted,severity,

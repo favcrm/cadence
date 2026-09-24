@@ -24,6 +24,7 @@ pub mod relay;
 pub mod report;
 pub mod retro;
 pub mod start;
+pub mod summary;
 pub mod sync;
 pub mod task_report;
 pub mod time;

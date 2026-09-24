@@ -191,6 +191,11 @@ pub struct HostOverrides {
     /// Per-provider idle bound (`claude: 7200`, `codex: 0` = off for
     /// that provider) — overrides `auto_stop_idle_secs`.
     pub auto_stop_idle_secs_by_provider: Option<std::collections::BTreeMap<String, u64>>,
+    /// CAD-339 — read by the daemon's report router, not by
+    /// `Thresholds`. A worker's open question reaches the master once no
+    /// PM has answered it for this many seconds (unset = 900; `0` routes
+    /// it at once).
+    pub question_escalate_after_secs: Option<u64>,
 }
 
 /// Every threshold in one place; `pm.yaml [host]` overrides any subset.
