@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+mod caller_rule;
 mod delivery_rpc;
 mod master_rpc;
 
@@ -978,7 +979,7 @@ impl Shared {
         send["source"] = json!("operator");
         // The thread starts inside the enqueue transaction: a refused
         // message leaves no thread and no `thread_created` event.
-        let mut receipt = self.send_as(&send, &|_| store::Sender::OperatorChat)?;
+        let mut receipt = self.send_as(&send, &|_| Ok(store::Sender::OperatorChat))?;
         receipt["thread"] = self
             .store
             .thread(&alias)?
@@ -1942,6 +1943,11 @@ impl Shared {
         params: &Value,
         peer_pid: u32,
     ) -> Result<Value> {
+        // CAD-384: the one caller rule, before any method runs — a
+        // refusal leaves no write. An admitted request may come back
+        // with its attribution field stamped to the caller.
+        let stamped = self.caller_gate(method, params, peer_pid)?;
+        let params = stamped.as_ref().unwrap_or(params);
         match method {
             // `pid` is the singleton-lock holder: `daemon start` tells
             // the child it spawned from a daemon that already ran.
@@ -2278,6 +2284,8 @@ impl Shared {
             "epic_stage" => self.rpc_epic_stage(params, peer_pid),
             "project_work_approve" => self.rpc_project_work_approve(params, peer_pid),
             "project_new" => self.rpc_project_new(params, peer_pid),
+            "rollout_grant" => self.rpc_rollout_grant(params, peer_pid),
+            "rollout_revoke" => self.rpc_rollout_revoke(params, peer_pid),
             "project_work_approvals" => Ok(json!({
                 "approvals": self.store.work_approvals()?,
             })),
@@ -2904,27 +2912,155 @@ impl Shared {
     /// session and scrubs its env and stdio passes operator proof —
     /// CAD-280 (operator by positive proof) is where that tightens.
     fn agent_caller(&self, peer_pid: u32, verb: &str) -> Result<AgentCaller> {
+        match self.connection_caller(peer_pid)? {
+            caller_rule::Who::Operator => Ok(AgentCaller::Operator),
+            caller_rule::Who::Agent(alias) => Ok(AgentCaller::Agent(alias)),
+            caller_rule::Who::Unproven(why) => Err(Error::rejected(format!(
+                "{verb} refused: this connection derives no agent identity and \
+                 is not provably the operator: {why}. Run it from the calling \
+                 agent's own pane, or from an attached operator shell outside \
+                 every pane and managed endpoint (caller rule, CAD-149)"
+            ))),
+        }
+    }
+
+    /// The connection's caller for the one caller rule (CAD-149,
+    /// CAD-384) — see [`Self::agent_caller`] for the derivation. A pane
+    /// whose agent cannot be named, or no agent identity without
+    /// operator proof, is [`caller_rule::Who::Unproven`]; an ancestry
+    /// that cannot be verified (a failed strict check, an ambiguous
+    /// node) refuses outright.
+    fn connection_caller(&self, peer_pid: u32) -> Result<caller_rule::Who> {
+        use caller_rule::Who;
         self.revalidate_enrollments()?;
         if let Some(who) = self.slot_identity(peer_pid)? {
             let lane = who.lane();
             if lane.is_empty() {
-                return Err(Error::rejected(format!(
-                    "{verb} refused: caller pid {peer_pid} descends from a pane \
-                     whose agent cannot be named — caller identity underivable"
+                return Ok(Who::Unproven(format!(
+                    "caller pid {peer_pid} descends from a pane whose agent cannot \
+                     be named — caller identity underivable"
                 )));
             }
-            return Ok(AgentCaller::Agent(lane.to_string()));
+            return Ok(Who::Agent(lane.to_string()));
         }
-        self.operator_evidence(peer_pid)
-            .map(|()| AgentCaller::Operator)
-            .map_err(|why| {
-                Error::rejected(format!(
-                    "{verb} refused: this connection derives no agent identity and \
-                     is not provably the operator: {why}. Run it from the calling \
-                     agent's own pane, or from an attached operator shell outside \
-                     every pane and managed endpoint (caller rule, CAD-149)"
-                ))
-            })
+        Ok(match self.operator_evidence(peer_pid) {
+            Ok(()) => Who::Operator,
+            Err(why) => Who::Unproven(why),
+        })
+    }
+
+    /// CAD-384: in a sandbox daemon only, a caller tied to NONE of the
+    /// sandbox's agents — the shape of `cadence sandbox down` run from a
+    /// production agent's pane, whose `CADENCE_ALIAS` names no sandbox
+    /// agent. It is unproven only because of production's pane env; in
+    /// its own disposable sandbox it may stop agents and the daemon.
+    /// Tied means any of: a pane or enrolled endpoint of this daemon on
+    /// its ancestry, a descendant of this daemon (everything it
+    /// launched), a pane's pty on its stdio, or a `CADENCE_ALIAS` on any
+    /// hop that names an agent registered here. Anything unreadable is
+    /// tied (fail closed): the ancestry, the pane facts, a hop's uid, and
+    /// the environment of any hop running as this daemon's uid — agents
+    /// run as that uid, and its own processes' environments are readable.
+    /// A hop of ANOTHER uid (a root `sshd`, whose environment the kernel
+    /// hides) cannot be an agent and is skipped, as `peer::operator_proof`
+    /// skips it.
+    fn sandbox_outsider(&self, peer_pid: u32) -> bool {
+        if !crate::rollout::sandbox_exempt(&self.state_dir) {
+            return false;
+        }
+        let Some(chain) = adapter::pty::caller_chain(peer_pid) else {
+            return false;
+        };
+        let me = std::process::id();
+        if chain.iter().skip(1).any(|&hop| hop == me) {
+            return false;
+        }
+        let Ok(facts) = self.store.pty_endpoint_facts() else {
+            return false;
+        };
+        let panes: HashMap<u32, String> = facts
+            .into_iter()
+            .map(|(alias, (_, pane_pid, _))| (pane_pid, alias))
+            .collect();
+        {
+            let slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+            if chain.iter().any(|hop| {
+                panes.contains_key(hop) || slots.nearest_enrolled_root(&[*hop]).is_some()
+            }) {
+                return false;
+            }
+        }
+        let ties = PeerTies::probe(peer_pid);
+        if !ties.walked()
+            || !ties
+                .agents(panes.iter().map(|(pid, alias)| (alias.as_str(), *pid)))
+                .is_empty()
+        {
+            return false;
+        }
+        let uid = unsafe { libc::geteuid() };
+        chain.iter().all(|&hop| {
+            match crate::peer::proc_uids(hop) {
+                Ok((real, effective)) if real != uid && effective != uid => return true,
+                Ok(_) => {}
+                Err(_) => return false,
+            }
+            match proc_env_alias(hop) {
+                Err(()) => false,
+                Ok(None) => true,
+                Ok(Some(alias)) => matches!(self.store.agent_opt(&alias), Ok(None)),
+            }
+        })
+    }
+
+    /// CAD-384: apply `method`'s caller rule ([`caller_rule::RULES`])
+    /// before it runs. `Ok(Some(params))` is the request with its
+    /// attribution field stamped to the caller; a refusal happens
+    /// before any write. Only reads are made here: the connection's
+    /// `/proc` ancestry, the target row, the rollout lease.
+    fn caller_gate(&self, method: &str, params: &Value, peer_pid: u32) -> Result<Option<Value>> {
+        use caller_rule::{Facts, Rule, Target, Who};
+        let Some(rule) = caller_rule::rule_of(method) else {
+            return Ok(None);
+        };
+        if !rule.checks_connection() {
+            return Ok(None);
+        }
+        let who = self.connection_caller(peer_pid)?;
+        let mut facts = Facts::default();
+        match (rule, &who) {
+            (Rule::OnAgent(target, _), Who::Agent(_)) => {
+                let alias = match target {
+                    Target::Alias => self.resolve_alias(required_str(params, "alias")?)?,
+                    Target::Message => {
+                        let id = required_str(params, "message")?;
+                        self.store
+                            .message(id)?
+                            .ok_or_else(|| Error::rejected(format!("Unknown message '{id}'")))?
+                            .alias
+                    }
+                };
+                let agent = self.store.agent(&alias)?;
+                facts.target = Some((alias, self.effective_pm(&agent)?));
+            }
+            (Rule::Shutdown, Who::Agent(_)) => {
+                facts.lease_holder = crate::rollout::granted_lease_holder(&self.state_dir)?;
+            }
+            (Rule::Shutdown | Rule::OnAgent(..), Who::Unproven(_)) => {
+                facts.sandbox_outsider = self.sandbox_outsider(peer_pid);
+            }
+            _ => {}
+        }
+        let stamp =
+            caller_rule::admit(method, rule, &who, params, &facts).map_err(Error::rejected)?;
+        Ok(stamp.map(|(field, value)| {
+            let mut stamped = params.clone();
+            if !stamped.is_object() {
+                stamped = json!({});
+            }
+            stamped[field] = value;
+            stamped
+        }))
     }
 
     /// Authorize one agent-mutating request against `target` (CAD-149,
@@ -3500,6 +3636,23 @@ impl Shared {
         self.operator_connection(verb, &fields, peer_pid)
     }
 
+    /// `rollout_grant` (CAD-384) — the operator lets `agent` claim the
+    /// rollout lease, and so stop this daemon from its own pane while it
+    /// holds it. Operator only, by the connection; `until_secs` bounds
+    /// the grant. Recorded as a `rollout_grant` event.
+    fn rpc_rollout_grant(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.operator_connection("rollout grant", params, peer_pid)?;
+        let agent = required_str(params, "agent")?;
+        let until = optional_u64(params, "until_secs").map(|secs| epoch_secs() + secs as f64);
+        crate::rollout::grant(&self.state_dir, agent, until, "operator")
+    }
+
+    /// `rollout_revoke` (CAD-384) — end `agent`'s grant. Operator only.
+    fn rpc_rollout_revoke(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.operator_connection("rollout revoke", params, peer_pid)?;
+        crate::rollout::revoke(&self.state_dir, required_str(params, "agent")?, "operator")
+    }
+
     /// `approval_record` — persist an operator's merge approval for one
     /// exact head as audit evidence (`id` optional: the store picks a
     /// fresh default, see `Store::record_approval`). It grants nothing: dispatch and
@@ -3934,7 +4087,7 @@ impl Shared {
     /// a threaded agent records the message as unattributed.
     #[cfg(test)]
     fn rpc_send(self: &Arc<Self>, params: &Value) -> Result<Value> {
-        self.send_as(params, &|_| store::Sender::Unattributed)
+        self.send_as(params, &|_| Ok(store::Sender::Unattributed))
     }
 
     /// `agent_send` over the socket: a threaded agent's chat records
@@ -3945,24 +4098,30 @@ impl Shared {
 
     /// Who queued a message for `alias`'s thread. Only computed for an
     /// alias that has one — the identity walk is not free. An agent
-    /// connection is that agent; no agent is the operator by default
-    /// (not proof — CAD-313); an underivable caller is unattributed.
-    fn thread_sender(&self, alias: &str, peer_pid: u32) -> store::Sender {
+    /// connection is that agent; an underivable caller is unattributed.
+    /// A connection tied to no agent would write into the thread as the
+    /// operator, so it must be provably the operator (CAD-384, CAD-276):
+    /// a detached child of an agent is refused, before anything is
+    /// written.
+    fn thread_sender(&self, alias: &str, peer_pid: u32) -> Result<store::Sender> {
         match self.store.thread(alias) {
             Ok(Some(_)) => {}
-            _ => return store::Sender::Unattributed,
+            _ => return Ok(store::Sender::Unattributed),
         }
-        match self.caller_identity(peer_pid) {
+        Ok(match self.caller_identity(peer_pid) {
             Ok(Caller::Agent(v)) => store::Sender::Agent(v.agent.alias.clone()),
-            Ok(Caller::NoAgentIdentity) => store::Sender::Operator,
+            Ok(Caller::NoAgentIdentity) => {
+                self.proven_operator("send into an operator thread", peer_pid)?;
+                store::Sender::Operator
+            }
             Err(_) => store::Sender::Unattributed,
-        }
+        })
     }
 
     fn send_as(
         self: &Arc<Self>,
         params: &Value,
-        sender_of: &dyn Fn(&str) -> store::Sender,
+        sender_of: &dyn Fn(&str) -> Result<store::Sender>,
     ) -> Result<Value> {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
         let text = required_str(params, "text")?;
@@ -4059,7 +4218,7 @@ impl Shared {
             optional_str(params, "source").unwrap_or("user")
         };
         proto::identifier(source, "Message source")?;
-        let sender = sender_of(&alias);
+        let sender = sender_of(&alias)?;
         let (duplicate, state) = self.store.enqueue_sent(
             &alias,
             text,
@@ -4524,12 +4683,13 @@ impl Shared {
 
     /// Operator readiness claim for gated endpoints (pty): asserts the
     /// terminal was inspected and is idle with an empty input. Single
-    /// use, short TTL — see the adapter for semantics. `by` carries the
-    /// claimer's `CADENCE_ALIAS` when the call came from inside a pane —
-    /// recorded for audit (G5 policy stays open; the record exists).
+    /// use, short TTL — see the adapter for semantics. `by` is the
+    /// claimer the caller rule attributed (CAD-384): the agent whose pane
+    /// the call came from, else the proven operator — recorded for audit
+    /// (G5 policy stays open; the record exists).
     fn rpc_ready(self: &Arc<Self>, params: &Value) -> Result<Value> {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
-        let by = optional_str(params, "by").map(str::to_string);
+        let by = required_str(params, "by")?.to_string();
         let force = params
             .get("force")
             .and_then(Value::as_bool)
@@ -4537,9 +4697,11 @@ impl Shared {
         // The claim itself runs the idle probe and refuses a busy
         // pane — `force` is the operator's explicit override and is
         // recorded as such on the event.
-        let probe = self.adapter_for(&alias)?.claim_ready(by.clone(), force)?;
+        let probe = self
+            .adapter_for(&alias)?
+            .claim_ready(Some(by.clone()), force)?;
         let mut detail = json!({
-            "by": by.unwrap_or_else(|| "operator".to_string()),
+            "by": by,
             "probe": probe.to_json(),
         });
         if force {
@@ -4956,7 +5118,7 @@ impl Shared {
     /// the terminal state promptly.
     fn rpc_cancel(self: &Arc<Self>, params: &Value) -> Result<Value> {
         let message_id = required_str(params, "message")?;
-        let by = optional_str(params, "by").unwrap_or("operator");
+        let by = required_str(params, "by")?;
         let reason = optional_str(params, "reason");
         let message = self.store.cancel(message_id, by, reason)?;
         if let Some(result) = message.result.clone() {
@@ -5633,7 +5795,7 @@ impl Shared {
         let to = optional_str(params, "to")
             .map(|a| self.resolve_alias(a))
             .transpose()?;
-        let by = optional_str(params, "by").unwrap_or("operator");
+        let by = required_str(params, "by")?;
         self.plan_gate_task(required_str(params, "task")?)?;
         let (task, message, duplicate, behind_dead) = self.store.dispatch_task(
             required_str(params, "task")?,
@@ -5714,7 +5876,7 @@ impl Shared {
     }
 
     fn rpc_task_accept(self: &Arc<Self>, params: &Value) -> Result<Value> {
-        let by = optional_str(params, "by").unwrap_or("operator");
+        let by = required_str(params, "by")?;
         let task = self.store.accept_task(
             required_str(params, "task")?,
             optional_str(params, "merged_sha"),
@@ -5730,7 +5892,7 @@ impl Shared {
     /// kickoff reported no SHA (A3): the PM/operator records it
     /// explicitly; never inferred.
     fn rpc_task_sha(self: &Arc<Self>, params: &Value) -> Result<Value> {
-        let by = optional_str(params, "by").unwrap_or("operator");
+        let by = required_str(params, "by")?;
         let task = self.store.set_task_sha(
             required_str(params, "task")?,
             required_str(params, "sha")?,
@@ -5741,7 +5903,7 @@ impl Shared {
     }
 
     fn rpc_task_fail(self: &Arc<Self>, params: &Value) -> Result<Value> {
-        let by = optional_str(params, "by").unwrap_or("operator");
+        let by = required_str(params, "by")?;
         let task = self.store.fail_task(
             required_str(params, "task")?,
             required_str(params, "reason")?,
@@ -5788,7 +5950,7 @@ impl Shared {
     }
 
     fn rpc_task_cancel(self: &Arc<Self>, params: &Value) -> Result<Value> {
-        let by = optional_str(params, "by").unwrap_or("operator");
+        let by = required_str(params, "by")?;
         let task = self.store.cancel_task(required_str(params, "task")?, by)?;
         self.wake();
         Ok(json!({"task": task.to_json()}))
@@ -5807,7 +5969,7 @@ impl Shared {
                     .ok_or_else(|| Error::rejected("Monitor task ids must be strings"))
             })
             .collect::<Result<Vec<_>>>()?;
-        let owner = optional_str(params, "owner").unwrap_or("operator");
+        let owner = required_str(params, "owner")?;
         let interval = optional_u64(params, "interval_secs").unwrap_or(60);
         let dispatch_enabled = params
             .get("dispatch_enabled")
@@ -5875,7 +6037,7 @@ impl Shared {
         let id = required_str(params, "monitor")?;
         let seq = optional_i64(params, "alert")
             .ok_or_else(|| Error::rejected("Monitor alert acknowledgement requires --alert"))?;
-        let by = optional_str(params, "by").unwrap_or("operator");
+        let by = required_str(params, "by")?;
         let alert = self.store.ack_monitor_alert(id, seq, by)?;
         self.wake();
         Ok(json!({"alert": alert.to_json()}))
@@ -6113,14 +6275,14 @@ impl Shared {
     }
 
     fn rpc_job_cancel(self: &Arc<Self>, params: &Value) -> Result<Value> {
-        let by = optional_str(params, "by").unwrap_or("operator");
+        let by = required_str(params, "by")?;
         let job = self.store.cancel_job(required_str(params, "job")?, by)?;
         self.wake();
         Ok(json!({"job": job.to_json()}))
     }
 
     fn rpc_job_close(self: &Arc<Self>, params: &Value) -> Result<Value> {
-        let by = optional_str(params, "by").unwrap_or("operator");
+        let by = required_str(params, "by")?;
         let job = self.store.close_job(required_str(params, "job")?, by)?;
         self.wake();
         Ok(json!({"job": job.to_json()}))
@@ -8622,7 +8784,7 @@ fn withhold_all_turn_ids(mut value: Value) -> Value {
 /// agent-mutating verbs (CAD-149): the caller is the connection's,
 /// never a name the request carries.
 const IDENTITY_FIELDS: &[&str] = &[
-    "by", "as", "actor", "caller", "operator", "reviewer", "pane", "lane", "pid",
+    "by", "as", "actor", "caller", "operator", "reviewer", "pane", "lane", "pid", "owner",
 ];
 
 /// Request fields an operator-connection verb refuses rather than reads
@@ -8649,6 +8811,19 @@ fn reject_operator_fields(verb: &str, params: &Value) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The `CADENCE_ALIAS` in `pid`'s environment: `Ok(None)` when unset,
+/// `Err(())` when the environment cannot be read — the caller decides
+/// (the sandbox-outsider check fails closed on it).
+fn proc_env_alias(pid: u32) -> std::result::Result<Option<String>, ()> {
+    let env = std::fs::read(format!("/proc/{pid}/environ")).map_err(|_| ())?;
+    Ok(env
+        .split(|b| *b == 0)
+        .filter_map(|kv| std::str::from_utf8(kv).ok())
+        .find_map(|kv| kv.strip_prefix("CADENCE_ALIAS="))
+        .filter(|a| !a.is_empty())
+        .map(str::to_string))
 }
 
 fn reject_identity_fields(params: &Value, verb: &str) -> Result<()> {

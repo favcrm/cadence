@@ -1639,6 +1639,24 @@ enum RolloutAction {
         #[arg(long = "as")]
         as_identity: Option<String>,
     },
+    /// Let an agent claim the rollout lease — and, holding it, stop the
+    /// daemon from its own pane (`daemon restart`). The operator only,
+    /// from a shell outside every pane; recorded as an event. Without a
+    /// grant an agent's `rollout claim` is refused (CAD-384).
+    Grant {
+        /// The agent alias granted, e.g. the rollout owner `ops-1`.
+        alias: String,
+        /// How long the grant lasts: 90s, 30m, 12h, 1d, or bare seconds
+        /// [default: until revoked].
+        #[arg(long)]
+        until: Option<String>,
+    },
+    /// End an agent's rollout grant. The operator only. A lease it
+    /// holds no longer lets its pane stop the daemon.
+    Revoke {
+        /// The agent alias whose grant ends.
+        alias: String,
+    },
     /// Record a backup receipt on the lease. The holder only. The file
     /// must already exist and be a readable SQLite database; this
     /// command does not take the backup.
@@ -3070,8 +3088,16 @@ fn daemon_restart(
     cadence_agent::rollout::recheck_restart(state_dir, &ticket)?;
     // --when-idle can wait for minutes; look again right before shutdown.
     refuse_restart_over_leftovers(state_dir)?;
+    // CAD-384: a daemon that ANSWERS is running — a refusal (the caller
+    // rule: not the operator, not a granted lease holder) aborts the
+    // restart here, before anything is recorded. Only an unreachable
+    // socket means "not running".
+    let was_running = match client::rpc_answer(state_dir, "shutdown", json!({})) {
+        Ok(Ok(_)) => true,
+        Ok(Err(refused)) => return Err(refused),
+        Err(_) => false,
+    };
     cadence_agent::rollout::note_restart_proceeded(state_dir, &ticket)?;
-    let was_running = client::rpc(state_dir, "shutdown", json!({})).is_ok();
     if was_running && !wait_daemon_exit(state_dir, 30) {
         return Err(Error::rejected(
             "daemon did not exit within 30s — restart aborted; the old \
@@ -3139,6 +3165,13 @@ fn daemon_restart(
                 ..Default::default()
             }
         };
+        // CAD-384: the board is the operator's, even when the rollout
+        // owner restarts from its pane — a board that inherits the pane's
+        // `CADENCE_ALIAS` fails operator proof on every operator write it
+        // relays (`monitor_alert_ack`, `thread_send`, `model_defaults_set`).
+        // The restart's caller was resolved above; nothing after this
+        // reads the alias.
+        std::env::remove_var("CADENCE_ALIAS");
         cadence_agent::ui::run_cli(
             state_dir,
             &cadence_agent::ui::UiAction::Start {
@@ -5028,6 +5061,21 @@ fn run() -> Result<i32> {
                 RolloutAction::Handoff { to, as_identity } => {
                     cadence_agent::rollout::handoff(&state_dir, &caller(&as_identity)?, &to)?
                 }
+                RolloutAction::Grant { alias, until } => {
+                    let until_secs = until
+                        .as_deref()
+                        .map(cadence_agent::rollout::parse_ttl)
+                        .transpose()?
+                        .map(|d| d.as_secs());
+                    client::rpc(
+                        &state_dir,
+                        "rollout_grant",
+                        json!({"agent": alias, "until_secs": until_secs}),
+                    )?
+                }
+                RolloutAction::Revoke { alias } => {
+                    client::rpc(&state_dir, "rollout_revoke", json!({"agent": alias}))?
+                }
                 RolloutAction::Backup { path, as_identity } => {
                     cadence_agent::rollout::record_backup(
                         &state_dir,
@@ -5762,8 +5810,7 @@ fn run() -> Result<i32> {
                         &state_dir,
                         "message_cancel",
                         json!({"message": message, "reason": reason,
-                               "by": by.or_else(|| std::env::var("CADENCE_ALIAS").ok())
-                                   .unwrap_or_else(|| "operator".into())}),
+                               "by": by.or_else(|| std::env::var("CADENCE_ALIAS").ok())}),
                     )?,
                     false,
                 ),
@@ -6362,8 +6409,7 @@ fn run_monitor(state_dir: &Path, action: &MonitorAction) -> Result<i32> {
                 "monitor_register",
                 json!({"monitor": monitor, "project": project,
                        "tasks": tasks, "interval_secs": interval_secs,
-                       "owner": owner.as_deref().or(pane.as_deref())
-                           .unwrap_or("operator"),
+                       "owner": owner.as_deref().or(pane.as_deref()),
                        "dispatch_enabled": dispatch,
                        "auto_dispatch_enabled": auto_dispatch}),
             )?);
@@ -6391,7 +6437,7 @@ fn run_monitor(state_dir: &Path, action: &MonitorAction) -> Result<i32> {
             print_json(&rpc(
                 "monitor_alert_ack",
                 json!({"monitor": monitor, "alert": alert,
-                       "by": pane.as_deref().unwrap_or("operator")}),
+                       "by": pane.as_deref()}),
             )?);
         }
         MonitorAction::Stop { monitor } => {
@@ -6414,7 +6460,10 @@ fn run_monitor(state_dir: &Path, action: &MonitorAction) -> Result<i32> {
 /// the actor; outside, `operator`.
 fn run_job(state_dir: &Path, action: &JobAction) -> Result<i32> {
     let pane = std::env::var("CADENCE_ALIAS").ok();
-    let by = pane.clone().unwrap_or_else(|| "operator".to_string());
+    // CAD-384: the daemon attributes the caller itself — an agent's pane
+    // as that agent, the proven operator as `operator`. Send only what
+    // names the caller, never an `operator` default.
+    let by = pane.clone();
     let rpc = |method: &str, params: Value| client::rpc(state_dir, method, params);
     match action {
         JobAction::New {

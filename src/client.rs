@@ -296,6 +296,25 @@ pub fn rpc_timeout(
     params: Value,
     timeout: Duration,
 ) -> Result<Value> {
+    proto::unwrap(rpc_frame(state_dir, method, params, timeout)?)
+}
+
+/// `rpc` that tells the two failures apart: the outer `Err` is the
+/// transport — no daemon at the socket, an I/O error, a malformed
+/// frame — and the inner result is the daemon's own answer, a refusal
+/// included (CAD-384: `daemon restart` must not read a caller-rule
+/// refusal of `shutdown` as "not running").
+pub fn rpc_answer(state_dir: &Path, method: &str, params: Value) -> Result<Result<Value>> {
+    Ok(proto::unwrap(rpc_frame(
+        state_dir,
+        method,
+        params,
+        Duration::from_secs(700),
+    )?))
+}
+
+/// One request/response frame over the daemon socket.
+fn rpc_frame(state_dir: &Path, method: &str, params: Value, timeout: Duration) -> Result<Value> {
     let socket = socket_path(state_dir);
     let mut stream = UnixStream::connect(&socket).map_err(|_| {
         Error::internal(format!(
@@ -308,9 +327,7 @@ pub fn rpc_timeout(
     writeln!(stream, "{request}")?;
     let mut line = String::new();
     BufReader::new(&stream).read_line(&mut line)?;
-    let frame: Value = serde_json::from_str(&line)
-        .map_err(|_| Error::internal("Daemon returned a malformed response"))?;
-    proto::unwrap(frame)
+    serde_json::from_str(&line).map_err(|_| Error::internal("Daemon returned a malformed response"))
 }
 
 #[cfg(test)]

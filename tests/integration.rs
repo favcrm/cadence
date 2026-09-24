@@ -480,7 +480,16 @@ impl TestDaemon {
 
 impl Drop for TestDaemon {
     fn drop(&mut self) {
-        let _ = self.rpc("shutdown", json!({}));
+        // CAD-384: `shutdown` is the operator's (or the rollout lease
+        // holder's). A test that planted this process as a pane
+        // ([`plant_self`]), or a suite run inside an agent pane, is
+        // refused by the caller rule — the daemon answered, so stop it
+        // the way an operator shell would.
+        if let Err(e) = self.rpc("shutdown", json!({})) {
+            if e.to_string().contains("caller rule") {
+                let _ = self.operator_rpc("shutdown", json!({}));
+            }
+        }
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -1434,7 +1443,7 @@ fn restart_preserves_attention_fence_without_unknowns() {
         .arg("--state-dir")
         .arg(&d.state)
         .args(["resume", "--all"])
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -1467,7 +1476,7 @@ fn restart_preserves_attention_fence_without_unknowns() {
     // agent must neither execute its queued work nor lose its error.
     let home = TempDir::new().unwrap();
     hold_rollout_lease(home.path(), &d.state);
-    let out = cadence_at(
+    let out = operator_cadence_at(
         home.path(),
         &d.state,
         &["daemon", "restart", "--as", "operator:test"],
@@ -1476,7 +1485,7 @@ fn restart_preserves_attention_fence_without_unknowns() {
     let restarted = d.wait_agent("mismatch", "attention", 15);
     d.wait_agent("healthy", "idle", 15);
     let queued = d.message_state("mismatch", "m2");
-    let stop = cadence_at(home.path(), &d.state, &["daemon", "stop"]);
+    let stop = operator_cadence_at(home.path(), &d.state, &["daemon", "stop"]);
     assert!(stop.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -1554,7 +1563,7 @@ fn resume_all_lists_fenced_without_attempting() {
         .arg("--state-dir")
         .arg(&d.state)
         .args(["resume", "--all"])
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -3087,7 +3096,7 @@ fn daemon_restart_reports_fenced_turn() {
     unsafe { libc::killpg(pane_pid, libc::SIGKILL) };
     let home = TempDir::new().unwrap();
     hold_rollout_lease(home.path(), &d.state);
-    let out = cadence_at(
+    let out = operator_cadence_at(
         home.path(),
         &d.state,
         &["daemon", "restart", "--as", "operator:test"],
@@ -3099,7 +3108,7 @@ fn daemon_restart_reports_fenced_turn() {
         "a fenced turn must fail the restart: {stdout} {stderr}"
     );
     assert!(stdout.contains("fenced"), "{stdout} {stderr}");
-    let stop = cadence_at(home.path(), &d.state, &["daemon", "stop"]);
+    let stop = operator_cadence_at(home.path(), &d.state, &["daemon", "stop"]);
     assert!(stop.status.success());
 }
 
@@ -3121,7 +3130,7 @@ fn daemon_restart_reports_kept_turn() {
     let token = pty_token(&d, "dv", "m1");
     let home = TempDir::new().unwrap();
     hold_rollout_lease(home.path(), &d.state);
-    let out = cadence_at(
+    let out = operator_cadence_at(
         home.path(),
         &d.state,
         &["daemon", "restart", "--as", "operator:test"],
@@ -3143,7 +3152,7 @@ fn daemon_restart_reports_kept_turn() {
     )
     .unwrap();
     d.wait_message("dv", "m1", &["completed"], 15);
-    let stop = cadence_at(home.path(), &d.state, &["daemon", "stop"]);
+    let stop = operator_cadence_at(home.path(), &d.state, &["daemon", "stop"]);
     assert!(stop.status.success());
 }
 
@@ -7236,7 +7245,7 @@ fn message_send_ready_claims_then_sends() {
         .arg(&d.state)
         .args(["message", "send", "dv1", "--text", "hi"])
         .args(["--message", "m9", "--ready"])
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -7252,7 +7261,7 @@ fn message_send_ready_claims_then_sends() {
         .arg(&d.state)
         .args(["message", "send", "w1", "--text", "hi"])
         .args(["--message", "m10", "--ready"])
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -8017,7 +8026,9 @@ fn fenced_agent_resume_hint() {
 /// Spawn the real `cadence` binary under a scratch HOME (skill install
 /// targets `$HOME` directly — no daemon involved).
 fn hold_rollout_lease(home: &Path, state: &Path) {
-    let out = cadence_at(
+    // An `--as` claim must be provably the operator (CAD-384): claim from
+    // an operator shell, not as a child of the in-process daemon.
+    let out = operator_cadence_at(
         home,
         state,
         &[
@@ -8040,8 +8051,20 @@ fn hold_rollout_lease(home: &Path, state: &Path) {
 }
 
 fn cadence_at(home: &Path, state: &Path, args: &[&str]) -> std::process::Output {
-    std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
-        .arg("--state-dir")
+    cadence_at_cmd(home, state, args).output().unwrap()
+}
+
+/// [`cadence_at`] as an operator shell outside every pane (CAD-384): the
+/// operator verbs — `daemon stop`/`restart`, `agent stop`/`resume`, … —
+/// need operator proof, which a child of this process (the in-process
+/// daemon) never has. See [`OperatorOutput`].
+fn operator_cadence_at(home: &Path, state: &Path, args: &[&str]) -> std::process::Output {
+    cadence_at_cmd(home, state, args).operator_output().unwrap()
+}
+
+fn cadence_at_cmd(home: &Path, state: &Path, args: &[&str]) -> std::process::Command {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"));
+    cmd.arg("--state-dir")
         .arg(state)
         .args(args)
         .env("HOME", home)
@@ -8049,9 +8072,8 @@ fn cadence_at(home: &Path, state: &Path, args: &[&str]) -> std::process::Output 
         .env_remove("CADENCE_ROLLOUT_AS")
         // A `daemon restart` child daemon is a separate process: it
         // gets this test's mock commands as its own env, and only it.
-        .envs(test_env().vars())
-        .output()
-        .unwrap()
+        .envs(test_env().vars());
+    cmd
 }
 
 #[test]
@@ -8487,7 +8509,7 @@ fn agent_resume_waits_and_attaches_like_launch() {
         .arg("--state-dir")
         .arg(&d.state)
         .args(["agent", "resume", "dv1", "--detach"])
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -8511,7 +8533,7 @@ fn agent_resume_waits_and_attaches_like_launch() {
         .arg("--state-dir")
         .arg(&d.state)
         .args(["agent", "resume", "dv1"])
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -8534,7 +8556,7 @@ fn agent_resume_waits_and_attaches_like_launch() {
         .arg("--state-dir")
         .arg(&d.state)
         .args(["agent", "resume", "w1"])
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -8582,7 +8604,7 @@ fn group_resume_orders_pm_first_and_skips_live() {
         .arg("--state-dir")
         .arg(&d.state)
         .args(["resume", "pm", "--detach"])
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -8633,7 +8655,7 @@ fn resume_all_and_daemon_start_resume_sweep() {
         .arg("--state-dir")
         .arg(&d.state)
         .args(["resume", "--all"])
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -8660,7 +8682,7 @@ fn resume_all_and_daemon_start_resume_sweep() {
         .arg("--state-dir")
         .arg(&d.state)
         .args(["daemon", "start", "--resume"])
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -8693,7 +8715,7 @@ fn group_stop_tears_down_members_and_pm() {
         .arg("--state-dir")
         .arg(&d.state)
         .args(["stop", "pm"])
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -8789,7 +8811,7 @@ fn group_resume_reports_unrecoverable_session_mismatch() {
         .arg("--state-dir")
         .arg(&d.state)
         .args(["resume", "pm", "--detach"])
-        .output()
+        .operator_output()
         .unwrap();
     assert!(
         out.status.success(),
@@ -14096,7 +14118,7 @@ fn cli_join_same_provider_resumes_stopped_alias() {
         .arg("--state-dir")
         .arg(&d.state)
         .args(["join", "pm", "fake", "--alias", "wx", "--detach"])
-        .output()
+        .operator_output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{stderr}");
@@ -15953,7 +15975,7 @@ fn cadence_cli(state: &Path, args: &[&str], envs: &[(String, String)]) -> (bool,
     for (k, v) in envs {
         cmd.env(k, v);
     }
-    let out = cmd.output().unwrap();
+    let out = cmd.operator_output().unwrap();
     let text = if out.stdout.is_empty() {
         String::from_utf8_lossy(&out.stderr).to_string()
     } else {
@@ -18104,7 +18126,7 @@ fn dispatch_kickoff_and_finish_guards() {
                 ),
             )
             .env_remove("CADENCE_ALIAS")
-            .output()
+            .operator_output()
             .unwrap();
         let text = if out.stdout.is_empty() {
             String::from_utf8_lossy(&out.stderr).to_string()
@@ -21692,7 +21714,7 @@ fn daemon_restart_keeps_pane_pid_and_reports_table() {
     assert!(pane_pid_before > 0);
     let home = TempDir::new().unwrap();
     hold_rollout_lease(home.path(), &d.state);
-    let out = cadence_at(
+    let out = operator_cadence_at(
         home.path(),
         &d.state,
         &["daemon", "restart", "--as", "operator:test"],
@@ -21714,7 +21736,7 @@ fn daemon_restart_keeps_pane_pid_and_reports_table() {
         .as_u64()
         .unwrap();
     assert_eq!(pane_pid_before, pane_pid_after);
-    let stop = cadence_at(home.path(), &d.state, &["daemon", "stop"]);
+    let stop = operator_cadence_at(home.path(), &d.state, &["daemon", "stop"]);
     assert!(
         stop.status.success(),
         "stop after restart failed: {}",
@@ -21739,7 +21761,7 @@ fn daemon_restart_when_idle_gates_and_proceeds() {
     let home = TempDir::new().unwrap();
     hold_rollout_lease(home.path(), &d.state);
     // Busy pane → timeout exits non-zero and the daemon is untouched.
-    let out = cadence_at(
+    let out = operator_cadence_at(
         home.path(),
         &d.state,
         &[
@@ -21763,7 +21785,7 @@ fn daemon_restart_when_idle_gates_and_proceeds() {
     );
     // Pane goes idle — the same command now completes the restart.
     std::fs::remove_file(d.pane_file(&mock, "dv", "tui-state")).unwrap();
-    let out = cadence_at(
+    let out = operator_cadence_at(
         home.path(),
         &d.state,
         &[
@@ -21782,7 +21804,7 @@ fn daemon_restart_when_idle_gates_and_proceeds() {
         String::from_utf8_lossy(&out.stderr),
         restart_diag(&d, "dv")
     );
-    let stop = cadence_at(home.path(), &d.state, &["daemon", "stop"]);
+    let stop = operator_cadence_at(home.path(), &d.state, &["daemon", "stop"]);
     assert!(stop.status.success());
 }
 
@@ -37560,7 +37582,7 @@ fn dispatch_warns_on_empty_acceptance() {
                 ),
             )
             .env_remove("CADENCE_ALIAS")
-            .output()
+            .operator_output()
             .unwrap();
         let stderr = String::from_utf8_lossy(&out.stderr).to_string();
         let text = if out.stdout.is_empty() {
@@ -37789,7 +37811,7 @@ fn seed_board(pm: &Path, state: &Path) {
             .args(args)
             .env("CADENCE_PM_DIR", pm)
             .env_remove("CADENCE_ALIAS")
-            .output()
+            .operator_output()
             .unwrap();
         assert!(
             out.status.success(),
@@ -40712,7 +40734,7 @@ fn dispatch_job_precheck_measures_the_issues_existing_lane() {
                 ),
             )
             .env_remove("CADENCE_ALIAS")
-            .output()
+            .operator_output()
             .unwrap();
         (
             out.status.success(),
@@ -44204,4 +44226,411 @@ fn delivery_loop_refuses_foreign_and_held_prs_and_a_corrupt_record() {
         "the refused dispatch wrote something"
     );
     assert_eq!(lf.f.front("D-4").status, "ready");
+}
+
+// ---- CAD-384: one caller rule for every agent-mutating RPC ----
+
+/// Every row of every table, in a stable order — a refused call must
+/// leave this unchanged (CAD-384: every refusal writes nothing).
+fn db_snapshot(d: &TestDaemon) -> String {
+    let conn = rusqlite::Connection::open_with_flags(
+        d.state.join("cadence.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let tables: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let mut out = String::new();
+    for table in tables {
+        let mut stmt = conn.prepare(&format!("SELECT * FROM \"{table}\"")).unwrap();
+        let cols = stmt.column_count();
+        let mut rows: Vec<String> = stmt
+            .query_map([], |r| {
+                Ok((0..cols)
+                    .map(|i| format!("{:?}", r.get_ref(i).unwrap()))
+                    .collect::<Vec<_>>()
+                    .join("|"))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        rows.sort();
+        out.push_str(&format!("## {table}\n{}\n", rows.join("\n")));
+    }
+    out
+}
+
+/// Assert `frame` is a caller-rule refusal and nothing was written.
+fn assert_refused_clean(d: &TestDaemon, before: &str, frame: &Value, what: &str) {
+    assert_eq!(frame["ok"], false, "{what}: admitted: {frame}");
+    let err = frame_err(frame);
+    assert!(
+        err.contains("caller rule") || err.contains("not provably the operator"),
+        "{what}: not a caller-rule refusal: {err}"
+    );
+    assert_eq!(before, db_snapshot(d), "{what}: a refusal wrote");
+}
+
+/// The fleet for the agent-verb probes: fake agents `tgt` (live) and
+/// `q` (stopped, one queued message `m-q`), both in pm's group;
+/// pm/pm2/w1 are planted panes.
+fn cad384_fleet(d: &TestDaemon) -> GuardPanes {
+    let p = guard_panes(d);
+    for alias in ["tgt", "q"] {
+        d.register_member(alias, "pm");
+        d.wait_agent(alias, "idle", 15);
+    }
+    d.operator_rpc("agent_stop", json!({"alias": "q"})).unwrap();
+    d.wait_agent("q", "stopped", 10);
+    d.operator_rpc(
+        "agent_send",
+        json!({"alias": "q", "text": "later", "message": "m-q"}),
+    )
+    .unwrap();
+    assert_eq!(d.message_state("q", "m-q"), "queued");
+    p
+}
+
+/// CAD-384 acceptance 1 + 4: agent stop/resume and message cancel pass
+/// one caller rule (`peer::may_mutate_agent`; unfence, reconcile and
+/// respond are #221's operator gates, CAD-370/374). A peer worker,
+/// another group's PM and a detached child of an agent (no agent
+/// identity, not provably the operator) are refused before anything is
+/// written; the target's own PM and the operator are admitted, each
+/// attributed to itself.
+#[test]
+fn cad384_agent_verbs_one_caller_rule() {
+    let d = TestDaemon::start();
+    let mut p = cad384_fleet(&d);
+    let cases = [
+        ("agent_stop", json!({"alias": "tgt"})),
+        ("agent_resume", json!({"alias": "q"})),
+        ("message_cancel", json!({"message": "m-q"})),
+    ];
+    for (method, params) in &cases {
+        let before = db_snapshot(&d);
+        let r = p.pm2.rpc(&d.state, method, params.clone());
+        assert_refused_clean(&d, &before, &r, &format!("pm2 {method}"));
+        let r = p.w1.rpc(&d.state, method, params.clone());
+        assert_refused_clean(&d, &before, &r, &format!("w1 {method}"));
+        let r = unprovable_rpc(&d, method, params.clone());
+        assert_refused_clean(&d, &before, &r, &format!("detached {method}"));
+    }
+    assert_eq!(d.wait_agent("tgt", "idle", 1)["state"], "idle");
+    assert_eq!(d.message_state("q", "m-q"), "queued");
+
+    // The target's PM may not act as the operator either.
+    let before = db_snapshot(&d);
+    let r = p.pm.rpc(
+        &d.state,
+        "message_cancel",
+        json!({"message": "m-q", "by": "operator"}),
+    );
+    assert_refused_clean(&d, &before, &r, "pm cancel as operator");
+
+    // The target's own PM: admitted, attributed to itself.
+    let r =
+        p.pm.rpc(&d.state, "message_cancel", json!({"message": "m-q"}));
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(r["result"]["message"]["result"]["by"], "pm", "{r}");
+    let r = p.pm.rpc(&d.state, "agent_stop", json!({"alias": "tgt"}));
+    assert_eq!(r["ok"], true, "{r}");
+    // The operator, from a plain shell through the CLI.
+    let (ok, out, err) = d.operator_cadence(&["agent", "resume", "q", "--detach"]);
+    assert!(ok, "operator agent resume: {out} {err}");
+    let (ok, out, err) = d.operator_cadence(&["agent", "stop", "q"]);
+    assert!(ok, "operator agent stop: {out} {err}");
+}
+
+/// CAD-384 acceptance 2: the job/task verbs never default `by` to the
+/// operator. A detached child of an agent is refused; an agent is
+/// attributed to itself and may not name anyone else; the operator's
+/// `by` defaults to `operator`.
+#[test]
+fn cad384_job_verbs_attribute_the_caller() {
+    let d = TestDaemon::start();
+    let mut p = guard_panes(&d);
+    let (spec, sha) = d.spec_file("spec.md", "do the thing");
+    for job in ["j1", "j2", "j3"] {
+        d.job_new("pm", job, &spec, &sha);
+    }
+    let task_of = |job: &str| {
+        d.rpc("job_show", json!({"job": job})).unwrap()["job"]["tasks"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let (t1, t2) = (task_of("j1"), task_of("j2"));
+    let cases = [
+        ("job_cancel", json!({"job": "j1"})),
+        ("job_close", json!({"job": "j1"})),
+        ("task_fail", json!({"task": t1, "reason": "x"})),
+        ("task_cancel", json!({"task": t1})),
+        ("task_dispatch", json!({"task": t1, "to": "w1"})),
+        ("task_accept", json!({"task": t1})),
+        ("task_sha", json!({"task": t1, "sha": SHA_A})),
+        (
+            "monitor_register",
+            json!({"monitor": "m1", "project": "p", "tasks": [t1]}),
+        ),
+    ];
+    for (method, params) in &cases {
+        let before = db_snapshot(&d);
+        let r = unprovable_rpc(&d, method, params.clone());
+        assert_refused_clean(&d, &before, &r, &format!("detached {method}"));
+        // An agent naming the operator, or another agent, is refused.
+        let mut forged = params.clone();
+        forged["by"] = json!("operator");
+        let r = p.pm2.rpc(&d.state, method, forged);
+        assert_refused_clean(&d, &before, &r, &format!("pm2 {method} by operator"));
+    }
+    // An agent is attributed to itself.
+    let r =
+        p.pm.rpc(&d.state, "task_fail", json!({"task": t1, "reason": "boom"}));
+    assert_eq!(r["ok"], true, "{r}");
+    let r = p.pm.rpc(&d.state, "job_cancel", json!({"job": "j1"}));
+    assert_eq!(r["ok"], true, "{r}");
+    // The operator: `by` defaults to the operator.
+    d.operator_rpc("task_cancel", json!({"task": t2})).unwrap();
+    let by_of = |job: &str, kind: &str| -> Vec<Value> {
+        d.rpc("job_events", json!({"job": job})).unwrap()["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["kind"] == kind)
+            .map(|e| e["payload"]["by"].clone())
+            .collect()
+    };
+    assert_eq!(by_of("j1", "task_failed"), vec![json!("pm")]);
+    assert_eq!(by_of("j2", "task_cancelled"), vec![json!("operator")]);
+    // The operator CLI still works from a plain shell.
+    let (ok, out, err) = d.operator_cadence(&["job", "cancel", "j3"]);
+    assert!(ok, "operator job cancel: {out} {err}");
+}
+
+/// CAD-384 acceptance 3: operator-attributed writes from the socket
+/// need positive operator proof. A detached child of an agent (no
+/// agent identity) is refused for `thread_send` and for an
+/// `agent_send` that would land in a thread as the operator's.
+#[test]
+fn cad384_operator_attributed_sends_need_proof() {
+    let d = TestDaemon::start();
+    d.register("chat");
+    d.wait_agent("chat", "idle", 15);
+    d.operator_rpc(
+        "thread_send",
+        json!({"alias": "chat", "text": "hello", "message": "t1"}),
+    )
+    .unwrap();
+    d.wait_message("chat", "t1", &["completed"], 20);
+    for (method, params) in [
+        (
+            "thread_send",
+            json!({"alias": "chat", "text": "forged", "message": "f1"}),
+        ),
+        (
+            "agent_send",
+            json!({"alias": "chat", "text": "forged", "message": "f2"}),
+        ),
+    ] {
+        let before = db_snapshot(&d);
+        let r = unprovable_rpc(&d, method, params);
+        assert_eq!(r["ok"], false, "{method}: {r}");
+        assert!(
+            frame_err(&r).contains("not provably the operator"),
+            "{method}: {r}"
+        );
+        assert_eq!(before, db_snapshot(&d), "{method}: a refusal wrote");
+    }
+    // The operator's own send still lands as the operator's.
+    d.operator_rpc(
+        "agent_send",
+        json!({"alias": "chat", "text": "mine", "message": "t2"}),
+    )
+    .unwrap();
+    d.wait_message("chat", "t2", &["completed"], 20);
+}
+
+/// CAD-384 acceptance 1 + round-1 I1/I3: `shutdown` (daemon stop)
+/// refuses a detached child of an agent and any agent that is not the
+/// rollout lease holder under a live OPERATOR GRANT. An agent cannot
+/// grant itself, cannot claim the lease without a grant, and a revoked
+/// grant blocks both the claim and the shutdown. A refused `daemon
+/// restart` from the holder's pane reports the refusal and records no
+/// `rollout_restart_proceeded`.
+#[test]
+fn cad384_shutdown_needs_the_operator_or_a_granted_rollout_holder() {
+    use cadence_agent::rollout::{claim, resolve_caller_with, unix_now, ClaimRequest};
+    let d = TestDaemon::start();
+    let mut p = guard_panes(&d);
+    let before = db_snapshot(&d);
+    let r = unprovable_rpc(&d, "shutdown", json!({}));
+    assert_refused_clean(&d, &before, &r, "detached shutdown");
+    let r = p.pm.rpc(&d.state, "shutdown", json!({}));
+    assert_refused_clean(&d, &before, &r, "pm shutdown without the lease");
+
+    // Grants are the operator's: an agent is refused, writing nothing.
+    for method in ["rollout_grant", "rollout_revoke"] {
+        let before = db_snapshot(&d);
+        let r = p.pm.rpc(&d.state, method, json!({"agent": "pm"}));
+        assert_eq!(r["ok"], false, "{method}: {r}");
+        assert!(frame_err(&r).contains("operator action"), "{method}: {r}");
+        assert_eq!(before, db_snapshot(&d), "{method}: a refusal wrote");
+        let r = unprovable_rpc(&d, method, json!({"agent": "pm"}));
+        assert_eq!(r["ok"], false, "detached {method}: {r}");
+    }
+
+    let pm = resolve_caller_with(Some("pm"), None).unwrap();
+    let claim_pm = || {
+        claim(
+            &d.state,
+            &ClaimRequest {
+                caller: &pm,
+                reason: "cad384 probe",
+                target: None,
+                ttl: Duration::from_secs(600),
+                takeover: false,
+                now: unix_now(),
+            },
+        )
+    };
+    // No grant: the agent's claim is refused.
+    let e = claim_pm().unwrap_err().to_string();
+    assert!(e.contains("holds no rollout grant"), "{e}");
+    // Granted, then revoked: still refused.
+    d.operator_rpc("rollout_grant", json!({"agent": "pm"}))
+        .unwrap();
+    d.operator_rpc("rollout_revoke", json!({"agent": "pm"}))
+        .unwrap();
+    let e = claim_pm().unwrap_err().to_string();
+    assert!(e.contains("holds no rollout grant"), "{e}");
+    // Granted: the claim lands.
+    d.operator_rpc("rollout_grant", json!({"agent": "pm", "until_secs": 3600}))
+        .unwrap();
+    claim_pm().unwrap();
+    let status = cadence_agent::rollout::status(&d.state).unwrap();
+    assert_eq!(status["grants"][0]["alias"], "pm", "{status}");
+    // Another agent is not the holder.
+    let r = p.pm2.rpc(&d.state, "shutdown", json!({}));
+    assert_eq!(r["ok"], false, "pm2 is not the holder: {r}");
+
+    // The grant revoked while pm still holds the lease: its pane's
+    // `daemon restart` is refused by the daemon — named as such, not
+    // "not running" — and nothing records the restart as proceeding.
+    d.operator_rpc("rollout_revoke", json!({"agent": "pm"}))
+        .unwrap();
+    let (rc, out) = p.pm.run(&format!(
+        "CADENCE_ALIAS=pm {} --state-dir {} daemon restart",
+        env!("CARGO_BIN_EXE_cadence"),
+        d.state.display()
+    ));
+    assert_ne!(rc, 0, "{out}");
+    assert!(out.contains("caller rule"), "{out}");
+    assert!(!out.contains("does not answer the socket"), "{out}");
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    let proceeded: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM events WHERE kind='rollout_restart_proceeded'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(proceeded, 0, "a refused restart recorded proceeding");
+    assert!(d.rpc("health", json!({})).is_ok());
+    let r = p.pm.rpc(&d.state, "shutdown", json!({}));
+    assert_eq!(r["ok"], false, "a revoked grant: {r}");
+
+    // Granted again: the holder's pane stops the daemon.
+    d.operator_rpc("rollout_grant", json!({"agent": "pm"}))
+        .unwrap();
+    let r = p.pm.rpc(&d.state, "shutdown", json!({}));
+    assert_eq!(r["ok"], true, "the granted holder's pane: {r}");
+}
+
+/// CAD-384: the operator's `cadence daemon stop` from a plain shell
+/// still stops the daemon (a real `daemon run` process).
+#[test]
+fn cad384_operator_daemon_stop_from_a_plain_shell() {
+    let d = TestDaemon::start_process_in(TempDir::new().unwrap());
+    let (ok, out, err) = d.operator_cadence(&["daemon", "stop"]);
+    assert!(ok, "operator daemon stop: {out} {err}");
+    assert!(d.rpc("health", json!({})).is_err());
+}
+
+/// CAD-384 round 2 (R2-1): the sandbox exemption belongs to a SANDBOX
+/// daemon only. On a real `daemon run` outside any sandbox, a caller
+/// whose ancestor carries an alias this daemon never registered (a
+/// detached child of another daemon's agent) — no pane on its ancestry,
+/// not a daemon descendant — is still refused `agent_stop` and
+/// `shutdown`, and nothing is written. An in-process daemon cannot
+/// probe this: every child of the test process descends from it.
+#[test]
+fn cad384_no_sandbox_exemption_outside_a_sandbox() {
+    let d = TestDaemon::start_process_in(TempDir::new().unwrap());
+    d.register("w1");
+    d.wait_agent("w1", "idle", 15);
+    let ghost = |method: &str| -> Value {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            // `sh` stays the parent (no exec of the last command), so the
+            // ghost alias is on the caller's ancestry, not in its env.
+            .arg("env -u CADENCE_ALIAS python3 -c \"$1\" \"$2\" \"$3\"; rc=$?; exit $rc")
+            .arg("sh")
+            .arg(
+                "import socket,sys;s=socket.socket(socket.AF_UNIX);s.connect(sys.argv[1]);\
+                 s.sendall(sys.argv[2].encode()+b'\\n');print(s.makefile().readline())",
+            )
+            .arg(client::socket_path(&d.state))
+            .arg(cadence_agent::proto::request(method, json!({"alias": "w1"})).to_string())
+            .env("CADENCE_ALIAS", "ghost")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    for method in ["agent_stop", "shutdown"] {
+        let before = db_snapshot(&d);
+        let r = ghost(method);
+        assert_refused_clean(&d, &before, &r, &format!("ghost {method}"));
+    }
+    assert!(d.rpc("health", json!({})).is_ok(), "the daemon was stopped");
+    assert_eq!(d.wait_agent("w1", "idle", 1)["state"], "idle");
+}
+
+/// CAD-384 round 2: an operator-shaped lease holder must be the
+/// operator. An agent's pane that drops its alias and claims
+/// `--as operator:evil` is refused before any lease is written, so it
+/// cannot sit on the lease and block the operator's own claim.
+#[test]
+fn cad384_agent_cannot_claim_the_lease_as_the_operator() {
+    let d = TestDaemon::start();
+    let mut p = guard_panes(&d);
+    let (rc, out) = p.pm.run(&format!(
+        "env -u CADENCE_ALIAS {} --state-dir {} rollout claim --reason probe --as operator:evil",
+        env!("CARGO_BIN_EXE_cadence"),
+        d.state.display()
+    ));
+    assert_ne!(rc, 0, "{out}");
+    assert!(
+        out.contains("rollout claim --as is an operator action"),
+        "{out}"
+    );
+    let status = cadence_agent::rollout::status(&d.state).unwrap();
+    assert_eq!(status["held"], false, "{status}");
+    // The operator's own `--as` claim still lands.
+    let (ok, out, err) = d.operator_cadence(&[
+        "rollout",
+        "claim",
+        "--reason",
+        "probe",
+        "--as",
+        "operator:ada",
+    ]);
+    assert!(ok, "{out} {err}");
 }

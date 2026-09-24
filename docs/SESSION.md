@@ -600,7 +600,28 @@ In this order:
    build change and a schema crossing. A same-build `daemon stop`
    followed by `daemon start`, or a crash restart of the same build,
    stays lease-free, so the lease check on that same-build
-   `daemon restart` is advisory. The before/after table
+   `daemon restart` is advisory. The daemon's own `shutdown` is not
+   (CAD-384): it admits the proven operator — a shell outside every
+   pane, `--as operator:<name>` / `CADENCE_ROLLOUT_AS` — or the agent
+   that holds the live rollout lease **under an operator grant**, from
+   its own pane. The operator grants the rollout owner once, from a
+   shell outside every pane: `cadence rollout grant ops-1 [--until 7d]`
+   (recorded as a `rollout_grant` event, listed by `rollout status`);
+   `cadence rollout revoke ops-1` ends it. Without a live grant an
+   agent's `rollout claim` is refused, and a lease it holds (a handoff,
+   a grant since revoked or expired) does not let its pane stop the
+   daemon. Any other agent's `daemon stop`/`restart` is refused — the
+   restart names the refusal and records no `rollout_restart_proceeded`
+   — so a pane-run rollout owner holds a grant and claims the lease
+   first, even for a same-build restart. `--ui` restarts the board
+   without the pane's `CADENCE_ALIAS`: the board is the operator's.
+   An operator-shaped holder (`rollout claim --as operator:<name>`)
+   must be provably the operator too, so a pane cannot hold the lease
+   under an operator name. **This gate stops mistaken and misattributed
+   stops — an agent restarting production it does not own, a detached
+   child passing for the operator. It is not a security boundary:** an
+   agent running as the same uid can write the state database or signal
+   the daemon directly (CAD-280). The before/after table
    shows each agent's state, pane pid, and `TURN` — `kept` when a
    running pty turn was re-adopted (same token, same pane, no fence),
    `fenced` when it could not be proven and went `unknown`, `-` for

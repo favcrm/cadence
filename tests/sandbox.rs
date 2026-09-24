@@ -458,6 +458,47 @@ fn a_sandbox_claude_worker_keeps_the_sandbox_tracker_and_profile() {
     assert_eq!(down["daemon"], "stopped", "{down}");
 }
 
+/// CAD-384 round 1 (I2): `sandbox down` run by an agent of PRODUCTION
+/// — its env carries a `CADENCE_ALIAS` no sandbox agent has, so the
+/// sandbox daemon sees a caller with no identity and no operator proof —
+/// still stops the sandbox's agents and daemon: in a sandbox, a caller
+/// tied to none of its agents may. A caller carrying a SANDBOX agent's
+/// alias (a detached child of that agent) is refused both.
+#[test]
+fn sandbox_down_from_a_production_agent_stops_the_sandbox_agents() {
+    let mut host = Host::new();
+    let dump = host.tmp.path().join("claude.env");
+    let script = host.tmp.path().join("claude.py");
+    std::fs::write(&script, MOCK_CLAUDE_ENV_PY).unwrap();
+    let command = format!("python3 {} {}", script.display(), dump.display());
+    let v = host.up_free("pa", &[("CADENCE_CLAUDE_COMMAND", &command)]);
+    let state = PathBuf::from(v["state_dir"].as_str().unwrap());
+    client::rpc(
+        &state,
+        "agent_register",
+        json!({"alias": "w1", "provider": "claude", "endpoint_kind": "managed",
+               "cwd": host.tmp.path().to_str().unwrap()}),
+    )
+    .unwrap();
+    wait_file(&dump, 20);
+
+    // Tied to the sandbox's own agent `w1`: refused, the agent keeps
+    // running and the daemon stays up.
+    let tied = host.run(&["sandbox", "down", "pa"], &[("CADENCE_ALIAS", "w1")]);
+    assert!(!tied.status.success(), "{}", text(&tied));
+    assert!(text(&tied).contains("caller rule"), "{}", text(&tied));
+    assert!(daemon_answers(&state));
+    let show = client::rpc(&state, "agent_show", json!({"alias": "w1"})).unwrap();
+    assert_eq!(show["agent"]["enabled"], true, "{show}");
+
+    // A production agent's pane (an alias the sandbox never registered).
+    let down = host.run(&["sandbox", "down", "pa"], &[("CADENCE_ALIAS", "prod-pm")]);
+    assert!(down.status.success(), "{}", text(&down));
+    let down: Value = serde_json::from_slice(&down.stdout).unwrap();
+    assert_eq!(down["agents_stopped"], 1, "{down}");
+    assert_eq!(down["daemon"], "stopped", "{down}");
+}
+
 /// The state dir decides, not the caller's env: a sandbox restarted
 /// from a bare shell with only `--state-dir` still skips the skill
 /// sync, reports its profile, serves its own tracker and refuses the
