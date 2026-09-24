@@ -134,7 +134,7 @@ pub(crate) fn master_may_call(method: &str) -> bool {
 impl Shared {
     /// Is a master registered at all — every master check is skipped,
     /// at no cost, on an install without one.
-    fn master_exists(&self) -> bool {
+    pub(super) fn master_exists(&self) -> bool {
         self.store.agent_opt(ALIAS).ok().flatten().is_some()
     }
 
@@ -697,6 +697,9 @@ impl Shared {
                 }
                 if let Err(e) = self.route_delivery() {
                     tracing::debug!("delivery router: {e}");
+                }
+                if let Err(e) = self.route_wakes() {
+                    tracing::debug!("master wakes: {e}");
                 }
                 next = Instant::now() + every;
             }

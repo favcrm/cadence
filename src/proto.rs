@@ -109,3 +109,53 @@ pub fn identifier(value: &str, what: &str) -> Result<String> {
         )))
     }
 }
+
+/// The message-id prefix only the daemon writes (CAD-445): a message
+/// the daemon originates — a master wake, and any later system message
+/// — is queued under `sys-<kind>-<hash>`, and the hash is of a key a
+/// caller can often predict (`blocker_done/D-3/D-2`). A caller-supplied
+/// id with this prefix is refused ([`caller_message_id`]), so no agent
+/// can squat the id and suppress the daemon's message as a duplicate.
+pub const DAEMON_MESSAGE_PREFIX: &str = "sys-";
+
+/// The id of the daemon-originated message of `kind` for `key` — the
+/// dedupe key: the same `(kind, key)` always maps to the same id, so a
+/// replay or a restart finds the message already queued.
+pub fn daemon_message_id(kind: &str, key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let hash: String = Sha256::digest(format!("{kind}\n{key}").as_bytes())
+        .iter()
+        .take(10)
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("{DAEMON_MESSAGE_PREFIX}{kind}-{hash}")
+}
+
+/// Refuse a caller-supplied message id in the daemon's namespace
+/// ([`DAEMON_MESSAGE_PREFIX`]).
+pub fn caller_message_id(id: &str) -> Result<()> {
+    if id.starts_with(DAEMON_MESSAGE_PREFIX) {
+        return Err(Error::rejected(format!(
+            "message ids starting '{DAEMON_MESSAGE_PREFIX}' are the daemon's own — pick another \
+             id, or omit it"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daemon_message_ids_are_stable_valid_and_reserved() {
+        let a = daemon_message_id("wake", "blocker_done/D-3/D-2");
+        assert_eq!(a, daemon_message_id("wake", "blocker_done/D-3/D-2"));
+        assert_ne!(a, daemon_message_id("wake", "blocker_done/D-4/D-2"));
+        assert_ne!(a, daemon_message_id("answer", "blocker_done/D-3/D-2"));
+        assert!(a.starts_with("sys-wake-"), "{a}");
+        identifier(&a, "Message id").unwrap();
+        assert!(caller_message_id(&a).is_err());
+        caller_message_id("dispatch-d-3").unwrap();
+    }
+}

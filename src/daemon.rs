@@ -28,6 +28,7 @@ use uuid::Uuid;
 mod caller_rule;
 mod delivery_rpc;
 mod master_rpc;
+mod master_wake;
 
 /// CAD-339: the daemon methods a master connection may call.
 pub use master_rpc::MASTER_ALLOWED;
@@ -978,6 +979,9 @@ impl Shared {
                     "thread send refused: caller identity underivable — {e}"
                 )))
             }
+        }
+        if let Some(id) = optional_str(params, "message") {
+            proto::caller_message_id(id)?;
         }
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
         let mut send = params.clone();
@@ -3828,7 +3832,12 @@ impl Shared {
     /// caller with no agent identity must be the proven operator
     /// (CAD-276). The decision is a tracker commit; approval moves the
     /// plan's backlog tickets to ready.
-    fn rpc_plan_decide(&self, params: &Value, peer_pid: u32, approve: bool) -> Result<Value> {
+    fn rpc_plan_decide(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+        approve: bool,
+    ) -> Result<Value> {
         let verb = if approve {
             "plan approve"
         } else {
@@ -3850,6 +3859,10 @@ impl Shared {
             "plan_rejected"
         };
         let _ = self.store.event_public(DAEMON_ALIAS, kind, out.clone());
+        // CAD-445: the approved tickets are the master's to dispatch now.
+        if approve {
+            self.wake_on_plan_approved(&out);
+        }
         self.wake();
         Ok(out)
     }
@@ -4144,6 +4157,11 @@ impl Shared {
     /// `agent_send` over the socket: a threaded agent's chat records
     /// who queued it, derived from the connection (CAD-319).
     fn rpc_send_from(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
+        // CAD-445: `sys-` ids are the daemon's own messages — a caller
+        // squatting one would suppress it as a duplicate.
+        if let Some(id) = optional_str(params, "message") {
+            proto::caller_message_id(id)?;
+        }
         self.send_as(params, &|alias| self.thread_sender(alias, peer_pid))
     }
 

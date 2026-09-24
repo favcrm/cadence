@@ -45396,3 +45396,265 @@ fn cad384_agent_cannot_claim_the_lease_as_the_operator() {
     ]);
     assert!(ok, "{out} {err}");
 }
+
+// ==== CAD-445: the master wakes when work can move on ====
+
+/// The master's queued wakes (`sys-wake-…` messages), oldest first.
+fn master_wakes(f: &PlanFixture) -> Vec<Value> {
+    f.messages_of("master")
+        .into_iter()
+        .filter(|m| m["id"].as_str().is_some_and(|i| i.starts_with("sys-wake-")))
+        .collect()
+}
+
+/// CAD-445 acceptance, two tickets in sequence with no operator chat:
+/// approving the plan wakes the master with D-2 ready → the master
+/// dispatches D-2 → D-2 is done → the router wakes the master once for
+/// each ticket that just became dispatchable → the master dispatches D-3.
+/// Proposing wakes nobody, every wake is a system entry queued once
+/// (more router passes and a replayed approval add none), and no caller
+/// — an agent, its detached child, the operator's own chat — can squat a
+/// wake's id to suppress it.
+#[test]
+fn master_wakes_on_plan_approval_and_blocker_done_two_tickets_in_sequence() {
+    let f = PlanFixture::start_routed();
+    let (mut m, _) = f.start_master();
+    let mut w1 = ManagedWorker::start(&f.d, "w1");
+    f.d.register("w2");
+    f.d.wait_agent("w2", "idle", 10);
+
+    let plan = f.file("plan.md", MASTER_PLAN);
+    let (ok, proposed) = f.as_master(
+        &mut m,
+        &format!("plan propose --project demo --file {plan}"),
+    );
+    assert!(ok, "{proposed}");
+    // A proposal wakes nobody — the operator decides first.
+    thread::sleep(Duration::from_millis(2_500));
+    assert!(master_wakes(&f).is_empty(), "{:#?}", master_wakes(&f));
+
+    // The operator approves: one wake, D-2 ready, D-3/D-4 waiting on it.
+    f.d.operator_rpc("plan_approve", json!({"epic": "D-1"}))
+        .unwrap();
+    let wake = f.wait_thread("[wake] plan D-1 approved by operator", 10);
+    assert_eq!(wake["role"], "system", "{wake}");
+    let text = wake["text"].as_str().unwrap();
+    assert!(text.contains("Ready to dispatch now: D-2 (w1)."), "{text}");
+    assert!(text.contains("D-3 (waits: D-2 is ready)"), "{text}");
+    assert!(text.contains("D-4 (waits: D-2 is ready)"), "{text}");
+    assert!(text.contains("cadence master dispatch <ID>"), "{text}");
+    let decided_at = f.front("D-1").plan.unwrap().decided_at.unwrap();
+    assert_eq!(
+        master_wakes(&f)
+            .iter()
+            .map(|m| m["id"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!(cadence_agent::master::wake_id(
+            "plan_approved",
+            &format!("D-1/{decided_at}")
+        ))]
+    );
+    // A replayed approval is refused and wakes nobody again.
+    assert!(f
+        .d
+        .operator_rpc("plan_approve", json!({"epic": "D-1"}))
+        .is_err());
+
+    // The woken master dispatches what the wake named; D-3 still waits.
+    let (ok, sent) = f.as_master(&mut m, "master dispatch D-2");
+    assert!(ok, "{sent}");
+    assert_eq!(sent["worker"], "w1", "{sent}");
+    let (ok, refused) = f.as_master(&mut m, "master dispatch D-3");
+    assert!(!ok, "{refused}");
+
+    // Squatting the id of D-3's coming wake, so the daemon would take it
+    // as already sent: refused for the agent, its detached child, an
+    // unattributed caller and the operator's chat alike — nothing queued.
+    let d3 = cadence_agent::master::wake_id("blocker_done", "D-3/D-2");
+    let squat = json!({"alias": "master", "text": "all quiet", "message": d3});
+    for how in ["self", "detached"] {
+        let r = w1.rpc(how, "agent_send", squat.clone());
+        assert_eq!(r["ok"], false, "{how}: {r}");
+        assert!(
+            r["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("the daemon's own"),
+            "{how}: {r}"
+        );
+    }
+    assert!(f.d.rpc("agent_send", squat.clone()).is_err());
+    assert!(f.d.operator_rpc("agent_send", squat.clone()).is_err());
+    assert!(f
+        .d
+        .operator_rpc(
+            "thread_send",
+            json!({"alias": "master", "text": "all quiet", "message": d3})
+        )
+        .is_err());
+    assert!(
+        !f.messages_of("master")
+            .iter()
+            .any(|m| m["id"] == d3.as_str()),
+        "a squatted wake id was queued"
+    );
+
+    // D-2 is done (the operator's tracker write, not through the
+    // daemon): the router wakes the master once for D-3 and once for D-4.
+    let (ok, out) = f.cli(&["issue", "set", "D-2", "status=done"]);
+    assert!(ok, "{out}");
+    let wake = f.wait_thread("[wake] D-3 is ready to dispatch", 10);
+    assert_eq!(wake["role"], "system", "{wake}");
+    let text = wake["text"].as_str().unwrap();
+    assert!(
+        text.contains("its blockers are done or dropped: D-2."),
+        "{text}"
+    );
+    assert!(
+        text.contains("Ready to dispatch now: D-3 (w1), D-4 (w2)."),
+        "{text}"
+    );
+    f.wait_thread("[wake] D-4 is ready to dispatch", 10);
+
+    // The woken master dispatches the second ticket in sequence.
+    let (ok, sent) = f.as_master(&mut m, "master dispatch D-3");
+    assert!(ok, "{sent}");
+    assert_eq!(sent["dispatched"], true, "{sent}");
+    assert_eq!(sent["worker"], "w1", "{sent}");
+    assert_eq!(f.front("D-3").status, "doing");
+
+    // Exactly once: more router passes queue nothing new.
+    thread::sleep(Duration::from_millis(2_500));
+    let ids: Vec<Value> = master_wakes(&f).iter().map(|m| m["id"].clone()).collect();
+    assert_eq!(ids.len(), 3, "{ids:#?}");
+    assert!(ids.contains(&json!(d3)), "{ids:#?}");
+    assert!(
+        ids.contains(&json!(cadence_agent::master::wake_id(
+            "blocker_done",
+            "D-4/D-2"
+        ))),
+        "{ids:#?}"
+    );
+    let woken =
+        f.d.events("daemon")
+            .into_iter()
+            .filter(|e| e["kind"] == "master_woken")
+            .count();
+    assert_eq!(woken, 3);
+}
+
+/// Two independent tickets, for the merge-end wakes.
+const WAKE_PLAN: &str = "---\ntitle: Export\ngoal: Users export CSV\n---\n\n\
+## Schema\nsize: S\nagent: w1\n\nThe export table.\n\n### Acceptance\n- [ ] migration adds exports\n\n\
+## Button\nsize: S\nagent: w1\n\n### Acceptance\n- [ ] a user can press export\n";
+
+/// CAD-445: a review loop that ends wakes the master once — merged (seen
+/// by the operator's `delivery sync`) and declined (the operator's
+/// `delivery decline`) — with what is ready next. A replayed observation
+/// or a second decline wakes nobody again, and an agent cannot end a
+/// loop (so cannot cause a wake).
+#[test]
+fn master_wakes_once_when_a_delivery_is_merged_or_declined() {
+    let mut lf = LoopFixture::dispatched_plan(WAKE_PLAN);
+    lf.f.wait_thread("[wake] plan D-1 approved", 10);
+    let (ok, sent) = lf.f.as_master(&mut lf.m, "master dispatch D-3");
+    assert!(ok, "{sent}");
+    let a = "a".repeat(40);
+
+    // D-2: done → review → GitHub shows it merged.
+    lf.done(&a);
+    lf.wait_rec("reviewing", |r| r["state"] == "reviewing");
+    lf.set_gh(&a, "MERGED", true, false);
+    let (ok, out) = lf.operator(&["delivery", "sync"]);
+    assert!(ok, "{out}");
+    assert_eq!(lf.rec()["state"], "merged");
+    let wake = lf.f.wait_thread("[wake] D-2 merged (acme/app#7).", 10);
+    assert_eq!(wake["role"], "system", "{wake}");
+    assert!(
+        wake["text"]
+            .as_str()
+            .unwrap()
+            .contains("Nothing is ready to dispatch now."),
+        "{wake}"
+    );
+    // The same observation again (a replay, a second sync) moves nothing.
+    let replay = json!({"issue": "D-2", "head": a, "pr_state": "MERGED", "ci_green": true});
+    lf.f.d.operator_rpc("delivery_observe", replay).unwrap();
+    let (ok, _) = lf.operator(&["delivery", "sync"]);
+    assert!(ok);
+
+    // An agent cannot end D-3's loop, so cannot wake the master.
+    let (ok, err) = lf.as_agent("w1", "delivery decline D-3 --reason agents-do-not-decide");
+    assert!(!ok, "{err}");
+
+    // D-3: the operator declines.
+    let (ok, out) = lf.operator(&["delivery", "decline", "D-3", "--reason", "not this sprint"]);
+    assert!(ok, "{out}");
+    let wake = lf.f.wait_thread(
+        "[wake] the operator declined D-3's merge: not this sprint",
+        10,
+    );
+    assert_eq!(wake["role"], "system", "{wake}");
+    let (ok, _) = lf.operator(&["delivery", "decline", "D-3", "--reason", "again"]);
+    assert!(!ok, "a second decline was accepted");
+
+    thread::sleep(Duration::from_millis(2_000));
+    let texts: Vec<String> = master_wakes(&lf.f)
+        .iter()
+        .map(|m| m["body"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(texts.len(), 3, "{texts:#?}");
+    assert_eq!(
+        texts.iter().filter(|t| t.contains("D-2 merged")).count(),
+        1,
+        "{texts:#?}"
+    );
+    assert_eq!(
+        texts.iter().filter(|t| t.contains("declined D-3")).count(),
+        1,
+        "{texts:#?}"
+    );
+}
+
+/// CAD-445: a master that is not running is never written to — its wake
+/// waits, queued, in its mailbox for the next time it runs (and is not
+/// dropped). The master's own `message_report` rule still covers it:
+/// the wake is addressed to the master.
+#[test]
+fn master_wake_waits_queued_while_the_master_is_stopped() {
+    let f = PlanFixture::start_routed();
+    let (mut m, _) = f.start_master();
+    f.d.register("w1");
+    f.d.wait_agent("w1", "idle", 10);
+    let plan = f.file("plan.md", MASTER_PLAN);
+    let (ok, out) = f.as_master(
+        &mut m,
+        &format!("plan propose --project demo --file {plan}"),
+    );
+    assert!(ok, "{out}");
+    f.d.operator_rpc("agent_stop", json!({"alias": "master"}))
+        .unwrap();
+    // Stopped mid-turn (the mock never finishes its bootstrap), the
+    // master is fenced rather than cleanly stopped — either way it has no
+    // live endpoint to write into.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let a = f.d.rpc("agent_show", json!({"alias": "master"})).unwrap()["agent"].clone();
+        if a["endpoint"].is_null() && matches!(a["state"].as_str(), Some("stopped" | "attention")) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "master never stopped: {a}");
+        thread::sleep(Duration::from_millis(50));
+    }
+    f.d.operator_rpc("plan_approve", json!({"epic": "D-1"}))
+        .unwrap();
+    let wakes = master_wakes(&f);
+    assert_eq!(wakes.len(), 1, "{wakes:#?}");
+    assert_eq!(wakes[0]["state"], "queued", "{:#}", wakes[0]);
+    assert_eq!(wakes[0]["source"], "wake", "{:#}", wakes[0]);
+    // Still queued, and still only one, after more router passes.
+    thread::sleep(Duration::from_millis(2_500));
+    let again = master_wakes(&f);
+    assert_eq!(again.len(), 1, "{again:#?}");
+    assert_eq!(again[0]["state"], "queued", "{:#}", again[0]);
+}

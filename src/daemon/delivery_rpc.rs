@@ -593,7 +593,12 @@ impl Shared {
             "issue": id, "state": rec.state.as_str(), "was": before.as_str(),
             "disable_auto": rec.disable_auto, "merge_ready": rec.merge_ready(),
         });
+        // CAD-445: a loop that just ended wakes the master once.
+        let ended = (before != rec.state).then(|| rec.clone());
         delivery::save(&self.state_dir, &all)?;
+        if let Some(rec) = ended {
+            self.wake_on_delivery_end(&rec);
+        }
         if rec_state_changed(&out) {
             let _ = self
                 .store
@@ -677,7 +682,11 @@ impl Shared {
 
     /// `delivery_decline` — the operator declines the merge decision
     /// (or an escalated or unstaffed review) with a reason.
-    pub(super) fn rpc_delivery_decline(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+    pub(super) fn rpc_delivery_decline(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
         self.operator_connection("delivery decline", params, peer_pid)?;
         let id = required_str(params, "issue")?;
         let reason = required_str(params, "reason")?.trim();
@@ -702,7 +711,9 @@ impl Shared {
         rec.note = Some(reason.to_string());
         rec.enter(State::Declined, now());
         let out = rec.to_json();
+        let ended = rec.clone();
         delivery::save(&self.state_dir, &all)?;
+        self.wake_on_delivery_end(&ended);
         if let Ok(pm) = self.pm_dir().and_then(|d| Pm::at(&d)) {
             let _ = issue::write::add_comment(
                 &pm,
