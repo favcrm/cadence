@@ -62,7 +62,7 @@ use std::sync::{Arc, RwLock};
 
 use serde_json::Value;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::store::Agent;
 
 /// Per-daemon values for the provider launch variables
@@ -149,6 +149,21 @@ pub struct TurnResult {
     pub text: String,
     pub stop_reason: Option<String>,
     pub error: Option<String>,
+}
+
+/// What [`ProviderAdapter::interrupt_turn`] did (CAD-323).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterruptOutcome {
+    /// The provider's own interrupt reached the running turn; the turn's
+    /// result arrives on the wire and finishes the message as usual.
+    Delivered,
+    /// The interrupt keys reached a terminal that has no result wire
+    /// (pty): nothing will report this turn, so the caller records the
+    /// `interrupted` finish itself.
+    Unsettled,
+    /// The named turn is not the one in flight (it already ended) —
+    /// nothing was sent.
+    NotRunning,
 }
 
 /// Outcome of one held-recovery poll.
@@ -250,6 +265,19 @@ pub trait ProviderAdapter: Send + Sync {
     fn respond(&self, request_id: &Value, result: Value) -> Result<()>;
     /// Best-effort cancellation of an active turn.
     fn interrupt(&self);
+    /// `cadence interrupt` (CAD-323): stop exactly the running turn
+    /// `turn_id` with the provider's own interrupt — never a kill. A
+    /// turn that is no longer in flight is [`InterruptOutcome::NotRunning`]
+    /// and nothing is sent. The default refuses: an endpoint without a
+    /// provider-native, non-destructive interrupt (Devin cloud's
+    /// `interrupt` terminates the session) must not pretend to have one.
+    fn interrupt_turn(&self, turn_id: &str) -> Result<InterruptOutcome> {
+        let _ = turn_id;
+        Err(Error::rejected(
+            "this endpoint has no provider-native turn interrupt — \
+             `cadence agent stop` ends the endpoint instead",
+        ))
+    }
     /// What `agent stop` does before it waits. Defaults to [`interrupt`].
     /// Devin cloud overrides this: `interrupt` terminates the remote
     /// session, while stop must archive it via [`close`] instead.

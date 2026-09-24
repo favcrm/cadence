@@ -1221,9 +1221,21 @@ impl ProviderAdapter for PtyAdapter {
         Err(Error::rejected(self.profile.respond_rejection()))
     }
 
+    /// The profile's own interrupt keys ([`TuiProfile::interrupt_keys`]).
     fn interrupt(&self) {
         let session = self.session();
-        let _ = self.tmux(&["send-keys", "-t", &session, "C-c"]);
+        let mut args = vec!["send-keys", "-t", session.as_str()];
+        args.extend_from_slice(self.profile.interrupt_keys());
+        let _ = self.tmux(&args);
+    }
+
+    /// CAD-323: a pane has no result wire — the keys stop the turn and
+    /// the caller records the `interrupted` finish. A worker report that
+    /// races it loses to the guarded finish, never the other way round.
+    fn interrupt_turn(&self, turn_id: &str) -> Result<super::InterruptOutcome> {
+        let _ = turn_id;
+        self.interrupt();
+        Ok(super::InterruptOutcome::Unsettled)
     }
 
     fn disconnected(&self) -> bool {

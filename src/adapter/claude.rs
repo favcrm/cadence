@@ -18,8 +18,14 @@
 //! - `system/init` must report the session id this process was opened
 //!   with (`--session-id` fresh, `--resume` on reopen); a mismatch means
 //!   another process owns the expected session — the agent fences.
-//! - Interrupt is SIGINT to the child's own process group; a bounded
-//!   grace waits for the interrupted result, then fails closed.
+//! - Interrupt is the CLI's own stream-json control request
+//!   (`{"type":"control_request","request":{"subtype":"interrupt"}}` on
+//!   stdin, CAD-323) — never a signal or a kill; SIGINT to the child's
+//!   process group is only the fallback when stdin is already gone. A
+//!   bounded grace waits for the turn's final result, then fails closed.
+//!   The interrupted turn's result is an error result whose
+//!   `terminal_reason` is `aborted_streaming`/`aborted_tools` — mapped to
+//!   `interrupted`, as is any error result of a turn Cadence interrupted.
 //! - Turn liveness is activity, not wall clock: any stdout event resets
 //!   the clock, and a turn fences `unknown` only after
 //!   `params.turn_idle_secs` of silence (default 900) or the optional
@@ -73,6 +79,42 @@ const DEFAULT_TURN_IDLE: Duration = Duration::from_secs(900);
 /// After SIGINT the provider is expected to emit a final `result` —
 /// a bounded grace keeps a hung interrupt from parking the actor.
 const INTERRUPT_GRACE: Duration = Duration::from_secs(60);
+/// Request ids of Cadence's interrupt control requests.
+const INTERRUPT_REQUEST_PREFIX: &str = "cadence-interrupt-";
+
+/// Map a `result` event to a Cadence status. `interrupted_here` is true
+/// when Cadence asked the CLI to interrupt this turn: then any error
+/// result is the interrupt's, not a failure. A clean `success` still
+/// completes — the turn finished before the interrupt landed.
+fn result_status(result: &Value, interrupted_here: bool) -> &'static str {
+    let is_error = result
+        .get("is_error")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let subtype = result
+        .get("subtype")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let aborted = result
+        .get("terminal_reason")
+        .and_then(Value::as_str)
+        .is_some_and(|r| r.starts_with("aborted"));
+    if subtype.contains("interrupt") || aborted {
+        "interrupted"
+    } else if is_error || subtype.starts_with("error") {
+        if interrupted_here {
+            "interrupted"
+        } else {
+            "failed"
+        }
+    } else if subtype == "success" || subtype.is_empty() {
+        "completed"
+    } else {
+        // An unrecognized terminal subtype is still a definitive
+        // provider answer — fail the message, never fence on it.
+        "failed"
+    }
+}
 
 /// Scrubbed by rule, not by name list — a list keeps missing new leak
 /// variables (`CLAUDE_CODE_SUBAGENT_MODEL`, `CLAUDE_EFFORT`,
@@ -244,6 +286,10 @@ struct Shared {
     generation: Mutex<String>,
     /// Set by `interrupt()` — the next result's grace deadline.
     interrupt_at: Mutex<Option<Instant>>,
+    /// The turn token `run_turn` is waiting on — set once the user line
+    /// is written, cleared when it returns. `interrupt_turn` targets
+    /// only this turn (CAD-323).
+    active_turn: Mutex<Option<String>>,
     /// Last provider stdout event — the turn liveness clock. Stamped in
     /// `dispatch`, so every parsed line (assistant, user, system,
     /// stream_event, result) counts as activity.
@@ -271,6 +317,7 @@ impl ClaudeAdapter {
             session_mismatch: Mutex::new(None),
             generation: Mutex::new(String::new()),
             interrupt_at: Mutex::new(None),
+            active_turn: Mutex::new(None),
             last_activity: Mutex::new(Instant::now()),
             idle_window: Mutex::new(DEFAULT_TURN_IDLE),
             max_turn: Mutex::new(None),
@@ -368,6 +415,7 @@ impl Shared {
             }
             "assistant" => self.on_assistant(&params),
             "user" => self.on_tool_results(&params),
+            "control_response" => self.on_control_response(&params),
             "result" => {
                 // Before the result is queued: the turn's entries land
                 // ahead of its `turn_result`.
@@ -457,6 +505,28 @@ impl Shared {
                 }),
             );
         }
+    }
+
+    /// The CLI's answer to our interrupt control request — recorded, so
+    /// a refused interrupt is visible on the agent (CAD-323). Only our
+    /// own request ids are ours to report.
+    fn on_control_response(&self, event: &Value) {
+        let response = event.get("response").unwrap_or(&Value::Null);
+        let request_id = response
+            .get("request_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !request_id.starts_with(INTERRUPT_REQUEST_PREFIX) {
+            return;
+        }
+        self.emit(
+            "cadence/interrupt_ack",
+            &json!({
+                "request_id": request_id,
+                "subtype": response.get("subtype"),
+                "error": response.get("error"),
+            }),
+        );
     }
 
     /// The session id in `system/init` is authoritative identity proof:
@@ -614,6 +684,9 @@ impl ProviderAdapter for ClaudeAdapter {
     ) -> Result<TurnResult> {
         let generation = self.shared.generation.lock().unwrap().clone();
         let turn_id = registry::CLAUDE_MANAGED_TURN_TOKENS.mint(&generation);
+        // An interrupt aimed at an earlier turn (or at an idle process)
+        // never shortens this one's grace.
+        *self.shared.interrupt_at.lock().unwrap() = None;
         // A queued result here is stale — it belongs to a turn the
         // daemon already fenced. Discard it rather than misattribute.
         {
@@ -627,6 +700,9 @@ impl ProviderAdapter for ClaudeAdapter {
             "type": "user",
             "message": {"role": "user", "content": prompt},
         }))?;
+        // Only now is there a turn for `interrupt_turn` to stop — the
+        // message is marked running (and so interruptible) just below.
+        *self.shared.active_turn.lock().unwrap() = Some(turn_id.clone());
         on_started(&turn_id);
         // The liveness clock is provider activity, not wall clock: a
         // turn that keeps emitting events is alive no matter how long it
@@ -698,8 +774,9 @@ impl ProviderAdapter for ClaudeAdapter {
         // session mismatch): the held text block is the agent's, and it
         // must land now — linked to the running message, ahead of the
         // turn result the daemon records next (CAD-320).
+        *self.shared.active_turn.lock().unwrap() = None;
         let result = waited.inspect_err(|_| self.shared.flush_text(None))?;
-        *self.shared.interrupt_at.lock().unwrap() = None;
+        let interrupted_here = self.shared.interrupt_at.lock().unwrap().take().is_some();
         let is_error = result
             .get("is_error")
             .and_then(Value::as_bool)
@@ -713,17 +790,7 @@ impl ProviderAdapter for ClaudeAdapter {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let status = if subtype == "interrupted" || subtype.contains("interrupt") {
-            "interrupted"
-        } else if is_error || subtype.starts_with("error") {
-            "failed"
-        } else if subtype == "success" || subtype.is_empty() {
-            "completed"
-        } else {
-            // An unrecognized terminal subtype is still a definitive
-            // provider answer — fail the message, never fence on it.
-            "failed"
-        };
+        let status = result_status(&result, interrupted_here);
         // Error results carry an `errors` array, not `result` text —
         // surface the provider's own message before the subtype label.
         let errors = result
@@ -768,12 +835,33 @@ impl ProviderAdapter for ClaudeAdapter {
         ))
     }
 
-    /// SIGINT the provider's own process group — Claude ends the active
-    /// turn and emits a final `result` (interrupted). The waiter bounds
-    /// the hang to `INTERRUPT_GRACE` before failing closed.
+    /// The CLI's own interrupt control request — Claude ends the active
+    /// turn and emits its final `result`. The waiter bounds the hang to
+    /// `INTERRUPT_GRACE` before failing closed. Only when stdin is gone
+    /// does it fall back to SIGINT on the provider's own process group.
     fn interrupt(&self) {
         *self.shared.interrupt_at.lock().unwrap() = Some(Instant::now());
-        self.transport.read().unwrap().interrupt();
+        let transport = self.transport.read().unwrap().clone();
+        let request = json!({
+            "type": "control_request",
+            "request_id": format!("{INTERRUPT_REQUEST_PREFIX}{}", Uuid::new_v4().simple()),
+            "request": {"subtype": "interrupt"},
+        });
+        if transport.send(request).is_err() {
+            transport.interrupt();
+        }
+    }
+
+    /// CAD-323: interrupt `turn_id` only while it is the turn in flight.
+    fn interrupt_turn(&self, turn_id: &str) -> Result<super::InterruptOutcome> {
+        // Held across the send: `run_turn` clears the active turn under
+        // this lock, so an interrupt can never land on the next turn.
+        let active = self.shared.active_turn.lock().unwrap();
+        if active.as_deref() != Some(turn_id) {
+            return Ok(super::InterruptOutcome::NotRunning);
+        }
+        self.interrupt();
+        Ok(super::InterruptOutcome::Delivered)
     }
 
     fn disconnected(&self) -> bool {
@@ -885,5 +973,29 @@ mod tests {
         }
         assert!(!scrub.removes_name("ANTHROPIC_API_KEY"));
         assert!(!scrub.removes_name("PATH"));
+    }
+
+    /// CAD-323: an aborted result is `interrupted`; an error result is
+    /// the interrupt's only when Cadence asked for one; a clean success
+    /// completes even then (the turn beat the interrupt).
+    #[test]
+    fn result_status_maps_interrupts() {
+        let aborted = json!({"subtype": "error_during_execution", "is_error": true,
+                             "terminal_reason": "aborted_tools"});
+        assert_eq!(result_status(&aborted, false), "interrupted");
+        let streaming = json!({"subtype": "success", "is_error": false,
+                               "terminal_reason": "aborted_streaming"});
+        assert_eq!(result_status(&streaming, false), "interrupted");
+        assert_eq!(
+            result_status(&json!({"subtype": "interrupted"}), false),
+            "interrupted"
+        );
+        let error = json!({"subtype": "error_during_execution", "is_error": true});
+        assert_eq!(result_status(&error, false), "failed");
+        assert_eq!(result_status(&error, true), "interrupted");
+        let success = json!({"subtype": "success", "is_error": false});
+        assert_eq!(result_status(&success, true), "completed");
+        assert_eq!(result_status(&success, false), "completed");
+        assert_eq!(result_status(&json!({"subtype": "odd"}), false), "failed");
     }
 }

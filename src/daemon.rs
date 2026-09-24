@@ -31,8 +31,8 @@ mod master_rpc;
 pub use master_rpc::MASTER_ALLOWED;
 
 use crate::adapter::{
-    self, registry, AdapterHooks, Probe, ProviderAdapter, ProviderEnv, ProviderRequest,
-    SettledPoll, TurnResult,
+    self, registry, AdapterHooks, InterruptOutcome, Probe, ProviderAdapter, ProviderEnv,
+    ProviderRequest, SettledPoll, TurnResult,
 };
 use crate::client;
 use crate::error::{Error, Result};
@@ -2102,6 +2102,7 @@ impl Shared {
             "message_report" => self.rpc_message_report(params),
             "message_reconcile" => self.rpc_reconcile(params, peer_pid),
             "message_cancel" => self.rpc_cancel(params),
+            "interrupt" => self.rpc_interrupt(params, peer_pid),
             "job_new" => self.rpc_job_new(params),
             "job_list" => self.rpc_job_list(params),
             "job_show" => self.rpc_job_show(params),
@@ -4941,6 +4942,157 @@ impl Shared {
         }
         self.wake();
         Ok(json!({"state": "cancelled", "message": message.to_json()}))
+    }
+
+    /// `interrupt` (CAD-323) — stop the agent's running provider turn with
+    /// the provider's own interrupt ([`ProviderAdapter::interrupt_turn`]:
+    /// Claude's stream-json interrupt control request, Codex
+    /// `turn/interrupt`, a pty's interrupt keys), never a kill.
+    ///
+    /// Caller rule: the operator, or the agent's own dispatcher — its PM,
+    /// via the one agent-mutation policy ([`crate::peer::may_mutate_agent`],
+    /// `Controlled`), or the master for a turn it dispatched
+    /// (`master_dispatched`) — an agent interrupts neither a peer nor
+    /// itself.
+    ///
+    /// Reconciliation is the ordinary turn path: a managed turn's own
+    /// result finishes the message `interrupted` (held text flushed and
+    /// partial tool results recorded first, CAD-320), which leaves the
+    /// agent idle for its next message; nothing is requeued, so no
+    /// kickoff is replayed. A pane has no result wire, so its running
+    /// message is finished `interrupted` here, guarded against a report
+    /// that lands first. No running turn — or a turn that ended before
+    /// the interrupt reached it — is a recorded no-op. `wait` (seconds,
+    /// default 30, max 120) bounds how long the answer waits for the
+    /// message to settle.
+    fn rpc_interrupt(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
+        let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        let agent = self.store.agent(&alias)?;
+        // Read once: the turn the caller is authorized for is the one
+        // interrupted — a later turn is never reached by this call.
+        let running = self.store.running_message(&alias)?;
+        let caller = if self.caller_is_master(peer_pid) {
+            // The master dispatches tickets but is no agent's PM: it may
+            // interrupt exactly a turn the daemon's own record says it
+            // dispatched (`master_dispatched`), nothing else.
+            reject_identity_fields(params, "interrupt")?;
+            let dispatched = match &running {
+                Some(m) => {
+                    self.store
+                        .event_names_message(DAEMON_ALIAS, "master_dispatched", &m.id)?
+                }
+                None => false,
+            };
+            if !dispatched {
+                return Err(Error::invalid(
+                    "master_refused",
+                    format!(
+                        "the master interrupts only a turn it dispatched — {alias} is \
+                         not running one; ask the operator"
+                    ),
+                ));
+            }
+            AgentCaller::Agent(crate::master::ALIAS.to_string())
+        } else {
+            self.authorize_agent_mutation(
+                params,
+                peer_pid,
+                "interrupt",
+                &agent,
+                AgentMutation::Controlled,
+            )?
+        };
+        let wait = optional_u64(params, "wait").unwrap_or(30).min(120);
+        let audit = caller_audit(&caller);
+        let noop = |reason: &str, message: Option<&Message>| -> Result<Value> {
+            let mut payload = json!({"outcome": "noop", "reason": reason,
+                                     "message": message.map(|m| m.id.clone())});
+            payload["by"] = audit["by"].clone();
+            payload["by_kind"] = audit["by_kind"].clone();
+            self.store
+                .event_public(&alias, "interrupt_requested", payload)?;
+            Ok(
+                json!({"alias": alias, "interrupted": false, "reason": reason,
+                      "message": message.map(|m| m.id.clone()),
+                      "state": message.map(|m| m.state.clone())}),
+            )
+        };
+        let Some(message) = running else {
+            return noop("no running turn", None);
+        };
+        let Some(turn_id) = message.turn_id.clone() else {
+            return noop("no running turn", None);
+        };
+        let adapter = self
+            .lifecycle
+            .lock()
+            .unwrap()
+            .agents
+            .get(&alias)
+            .and_then(|ctl| ctl.adapter.lock().unwrap().clone());
+        let Some(adapter) = adapter else {
+            return Err(Error::rejected(format!(
+                "Agent '{alias}' has no live endpoint to interrupt — its running \
+                 message {} is the reconcile's (`cadence message reconcile {} \
+                 --status interrupted`)",
+                message.id, message.id
+            )));
+        };
+        let outcome = match adapter.interrupt_turn(&turn_id) {
+            Ok(outcome) => outcome,
+            // The provider refused — most often because the turn ended
+            // on its own in the gap. A settled message is a no-op; a
+            // still-running one surfaces the provider's answer.
+            Err(error) => {
+                let current = self.store.message(&message.id)?;
+                if current.as_ref().is_some_and(|m| m.state != "running") {
+                    return noop("turn already ended", current.as_ref());
+                }
+                return Err(error);
+            }
+        };
+        if outcome == InterruptOutcome::NotRunning {
+            let current = self.store.message(&message.id)?;
+            return noop("turn already ended", current.as_ref().or(Some(&message)));
+        }
+        let mut payload = json!({"outcome": "delivered", "message": message.id,
+                                 "turn_id": turn_id});
+        payload["by"] = audit["by"].clone();
+        payload["by_kind"] = audit["by_kind"].clone();
+        self.store
+            .event_public(&alias, "interrupt_requested", payload)?;
+        if outcome == InterruptOutcome::Unsettled {
+            let stored = json!({"status": "interrupted", "text": "", "turn_id": turn_id,
+                                "via": "interrupt", "by": audit["by"]});
+            let reason = format!(
+                "interrupted by {}",
+                audit["by"].as_str().unwrap_or("operator")
+            );
+            if let Ok(finished) =
+                self.store
+                    .finish_running(&message.id, "interrupted", &stored, Some(&reason))?
+            {
+                self.notify_routed_target(&finished, &stored);
+            }
+            self.wake();
+        }
+        let deadline = Instant::now() + Duration::from_secs(wait);
+        let settled = loop {
+            let current = self.store.message(&message.id)?;
+            let running = current.as_ref().is_some_and(|m| m.state == "running");
+            if !running || Instant::now() >= deadline || self.closing.load(Ordering::SeqCst) {
+                break current;
+            }
+            self.changed
+                .wait_until(deadline.min(Instant::now() + Duration::from_millis(250)));
+        };
+        Ok(json!({
+            "alias": alias,
+            "interrupted": true,
+            "message": message.id,
+            "turn_id": turn_id,
+            "state": settled.map(|m| m.state),
+        }))
     }
 
     /// The resume path shared by `agent_resume` and `agent_unfence`:

@@ -69,6 +69,7 @@ pub const CLAUDE_ALLOWED_TOOLS: &[&str] = &[
     "Bash(cadence master escalate *)",
     "Bash(cadence master summary)",
     "Bash(cadence master summary *)",
+    "Bash(cadence interrupt *)",
     "Bash(cadence report file *)",
     "Bash(cadence agent list)",
     "Bash(cadence agent list *)",

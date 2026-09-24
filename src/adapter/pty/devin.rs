@@ -662,6 +662,11 @@ impl TuiProfile for DevinProfile {
         Ok(keys)
     }
 
+    /// Devin interrupts on a second Esc (`esc twice to interrupt`).
+    fn interrupt_keys(&self) -> &'static [&'static str] {
+        &["Escape", "Escape"]
+    }
+
     fn forbidden_prefixes(&self) -> &'static [char] {
         FORBIDDEN_PREFIXES
     }

@@ -32,7 +32,9 @@ use crate::store;
 /// The daemon methods a master connection may call — everything else is
 /// refused (review round 1, C2). Reads, proposing a plan, registering a
 /// project (`project_new`, CAD-358), its own
-/// dispatch/escalate/summary verbs, and a report on its own message.
+/// dispatch/escalate/summary verbs, a report on its own message, and
+/// `interrupt` — only of a turn it dispatched (CAD-323, checked in
+/// `rpc_interrupt`).
 pub const MASTER_ALLOWED: &[&str] = &[
     "health",
     "daemon_info",
@@ -53,6 +55,7 @@ pub const MASTER_ALLOWED: &[&str] = &[
     "question_escalate",
     "master_summary",
     "message_report",
+    "interrupt",
 ];
 
 /// Most reports one router pass queues to the master; the rest wait for

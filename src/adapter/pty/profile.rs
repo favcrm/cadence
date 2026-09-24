@@ -112,6 +112,14 @@ pub trait TuiProfile: Send + Sync {
         ))
     }
 
+    /// tmux key names that interrupt this TUI's running turn — the
+    /// provider's own stop, the one its busy hint names (CAD-323). The
+    /// default is `C-c`; a TUI whose `C-c` also clears or exits
+    /// overrides it with its documented interrupt key.
+    fn interrupt_keys(&self) -> &'static [&'static str] {
+        &["C-c"]
+    }
+
     /// First non-space characters that must never be pasted verbatim.
     /// Terminal UIs commonly treat a leading `/` or `!` as a command or
     /// mode switch, so a literal paste of such a body is an injection

@@ -4,7 +4,12 @@
 //! Ports the reference adapter: initialize + thread start/resume,
 //! `turn/start` correlated by `clientUserMessageId`, turn completion via
 //! `turn/completed`, final-answer `agentMessage` items, provider request
-//! brokering, and `turn/interrupt`. The app-server interface is marked
+//! brokering, and `turn/interrupt` (the provider's own stop for
+//! `cadence interrupt`, CAD-323 — the turn then completes `interrupted`).
+//! Tool items (`commandExecution`, `mcpToolCall`, …) become one
+//! `tool_use` event when they start and one `tool_result` when they
+//! complete — an interrupted tool's partial output included — as
+//! redacted one-line summaries, never the raw output. The app-server interface is marked
 //! experimental by its vendor; the tested CLI version is negotiated at
 //! initialize, not assumed.
 
@@ -19,7 +24,10 @@ use super::link::Incoming;
 use super::registry;
 use super::stdio::{EnvScrub, StdioAdapter};
 use super::ws::WsAdapter;
-use super::{AdapterHooks, Identity, ProviderAdapter, ProviderEnv, ProviderRequest, TurnResult};
+use super::{
+    AdapterHooks, Identity, InterruptOutcome, ProviderAdapter, ProviderEnv, ProviderRequest,
+    TurnResult,
+};
 use crate::error::{Error, Result};
 use crate::store::Agent;
 
@@ -43,6 +51,64 @@ pub(crate) fn scrub_names() -> Vec<&'static str> {
     let mut names = ENV_SCRUB.to_vec();
     names.extend_from_slice(super::CLOUD_SECRET_ENV);
     names
+}
+
+/// App-server item types that are tool calls — recorded as `tool_use`
+/// / `tool_result` (CAD-323). Messages, reasoning and plans are not.
+const TOOL_ITEM_TYPES: &[&str] = &[
+    "commandExecution",
+    "fileChange",
+    "mcpToolCall",
+    "dynamicToolCall",
+    "collabAgentToolCall",
+    "webSearch",
+    "imageView",
+];
+
+/// A tool item's `(name, input)` for [`crate::store::tool_summary`]:
+/// an MCP call is named `server/tool` over its arguments; a file change
+/// by its first path; the rest by their type over the item itself
+/// (`command`, `query`, `path` are summary fields).
+fn tool_item_call(kind: &str, item: &Value) -> (String, Value) {
+    match kind {
+        "mcpToolCall" | "dynamicToolCall" => {
+            let tool = item.get("tool").and_then(Value::as_str).unwrap_or(kind);
+            let name = match item.get("server").and_then(Value::as_str) {
+                Some(server) => format!("{server}/{tool}"),
+                None => tool.to_string(),
+            };
+            (name, item.get("arguments").cloned().unwrap_or(Value::Null))
+        }
+        "fileChange" => {
+            let path = item
+                .pointer("/changes/0/path")
+                .cloned()
+                .unwrap_or(Value::Null);
+            (kind.to_string(), json!({ "path": path }))
+        }
+        _ => (kind.to_string(), item.clone()),
+    }
+}
+
+/// A completed tool item's output and error flag: a command's
+/// aggregated output (partial when the turn was interrupted mid-run),
+/// an MCP call's result content or error message. A failed or declined
+/// status, or a nonzero exit code, is an error.
+fn tool_item_result(item: &Value) -> (Value, bool) {
+    let output = item
+        .get("aggregatedOutput")
+        .filter(|o| !o.is_null())
+        .cloned()
+        .or_else(|| item.pointer("/result/content").cloned())
+        .or_else(|| item.pointer("/error/message").cloned())
+        .unwrap_or(Value::Null);
+    let status = item.get("status").and_then(Value::as_str).unwrap_or("");
+    let exit_failed = item
+        .get("exitCode")
+        .and_then(Value::as_i64)
+        .is_some_and(|code| code != 0);
+    let is_error = matches!(status, "failed" | "declined") || exit_failed;
+    (output, is_error)
 }
 
 /// The provider's model catalogue is queried only when a caller requests a
@@ -537,9 +603,37 @@ impl Shared {
 
     fn notification(&self, method: &str, params: Value) {
         match method {
+            "item/started" => {
+                let item = &params["item"];
+                let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
+                if TOOL_ITEM_TYPES.contains(&kind) {
+                    let (name, input) = tool_item_call(kind, item);
+                    self.emit(
+                        "cadence/tool_use",
+                        &json!({
+                            "tool": name,
+                            "summary": crate::store::tool_summary(&name, &input),
+                            "tool_use_id": item.get("id"),
+                        }),
+                    );
+                }
+            }
             "item/completed" => {
                 let item = &params["item"];
-                if item.get("type").and_then(Value::as_str) == Some("agentMessage") {
+                let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
+                if TOOL_ITEM_TYPES.contains(&kind) {
+                    let (output, is_error) = tool_item_result(item);
+                    self.emit(
+                        "cadence/tool_result",
+                        &json!({
+                            "summary": crate::store::tool_result_summary(&output),
+                            "is_error": is_error,
+                            "tool_use_id": item.get("id"),
+                            "status": item.get("status"),
+                        }),
+                    );
+                }
+                if kind == "agentMessage" {
                     if let (Some(turn), Some(id)) = (
                         params.get("turnId").and_then(Value::as_str),
                         item.get("id").and_then(Value::as_str),
@@ -847,7 +941,18 @@ impl ProviderAdapter for CodexAdapter {
             .filter(|item| item.get("phase").and_then(Value::as_str) == Some("final_answer"))
             .copied()
             .collect();
-        let selected = if finals.is_empty() { messages } else { finals };
+        // No final answer (an older, unphased Codex — or an interrupted
+        // turn, CAD-323): the unphased items are the answer. Commentary
+        // is never the result — the thread already shows it, and
+        // repeating it as the turn result would record it twice.
+        let selected = if finals.is_empty() {
+            messages
+                .into_iter()
+                .filter(|item| item.get("phase").and_then(Value::as_str).is_none())
+                .collect()
+        } else {
+            finals
+        };
         let text = selected
             .iter()
             .filter_map(|item| item.get("text").and_then(Value::as_str))
@@ -889,6 +994,30 @@ impl ProviderAdapter for CodexAdapter {
                 );
             }
         }
+    }
+
+    /// CAD-323: `turn/interrupt` on exactly `turn_id` while it is the
+    /// turn in flight — the provider completes it `interrupted`. Turn
+    /// ids are the provider's own, so a stale id can never stop a later
+    /// turn; a refusal is the provider's answer, surfaced as is.
+    fn interrupt_turn(&self, turn_id: &str) -> Result<InterruptOutcome> {
+        let active = self.shared.active_turn.lock().unwrap().clone();
+        if active.as_deref() != Some(turn_id) {
+            return Ok(InterruptOutcome::NotRunning);
+        }
+        let thread = self
+            .shared
+            .thread_id
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| Error::provider("Codex thread is not open"))?;
+        self.transport.request_timeout(
+            "turn/interrupt",
+            json!({"threadId": thread, "turnId": turn_id}),
+            Duration::from_secs(5),
+        )?;
+        Ok(InterruptOutcome::Delivered)
     }
 
     fn disconnected(&self) -> bool {
