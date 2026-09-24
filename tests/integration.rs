@@ -5627,9 +5627,19 @@ if cmd == "capture-pane":
             out += glyph + " " + staged + "\n"
     except FileNotFoundError: pass
     # Test-controlled extra screen content — a file the test writes to
-    # make the pane look busy, approval-blocked, etc.
-    try: out += open(sess_path(name, "tui-state")).read()
-    except FileNotFoundError: pass
+    # make the pane look busy, approval-blocked, etc. A `tui-once` file
+    # replaces it for exactly one capture: the rename claims it
+    # atomically, so no second capture can see it however the test's
+    # writes interleave with this read.
+    once = sess_path(name, "tui-once")
+    claimed = "%s.%d" % (once, os.getpid())
+    try:
+        os.rename(once, claimed)
+        out += open(claimed).read()
+        os.unlink(claimed)
+    except FileNotFoundError:
+        try: out += open(sess_path(name, "tui-state")).read()
+        except FileNotFoundError: pass
     # Real tmux only prints the pane with `-p` — without it the capture
     # lands in the paste buffer and stdout stays empty. Emulate that so
     # a dropped `-p` fails loudly here the way it does on a real pane.
@@ -16908,9 +16918,10 @@ fn pty_stall_resume_rearms_and_spinner_is_not_activity() {
 
 /// Screen activity is debounced: a hash seen for exactly one sample —
 /// a capture taken mid-repaint — can neither reset the silence clock
-/// nor resume a stalled turn. The mock `captures` counter pins the
-/// empty tail to exactly one sighting: it is written after one
-/// capture's read and reverted before the next-but-one. Real
+/// nor resume a stalled turn. The mock's one-shot `tui-once` frame
+/// pins the empty tail to exactly one sighting — one capture claims
+/// it by rename, so no write timing can show it twice (CAD-451: the
+/// old write-then-revert protocol raced the capture's read). Real
 /// persistent motion still resumes, one interval later.
 #[test]
 fn pty_stall_transient_sample_neither_resumes_nor_resets() {
@@ -16946,22 +16957,31 @@ fn pty_stall_transient_sample_neither_resumes_nor_resets() {
             .as_u64()
             .unwrap_or(0)
     };
-    // `contents` is visible to exactly one sample: the counter ticks
-    // before the capture reads the screen, so once a capture has
-    // started its read is done — write now, and the NEXT capture is
-    // the only one that can see it. Revert before the one after that.
+    // `contents` is visible to exactly one sample: the capture that
+    // claims the one-shot frame. Once it is claimed, that capture has
+    // ticked the counter, so the count read then already includes it.
+    // The ticker starts a capture only after the previous sample
+    // landed and was folded in, so two more captures starting proves
+    // the transient sample and one restored sample after it were both
+    // folded — and the tick that folded the transient has finished
+    // its events.
     let transient = |contents: &str| {
-        let n = captures();
-        wait_capture(n);
-        atomic_write(d.stub_pane_file(&mock, "w1", "tui-state"), contents);
-        let n = captures();
-        wait_capture(n);
-        atomic_write(d.stub_pane_file(&mock, "w1", "tui-state"), "⠋ Working\n");
+        let once = d.stub_pane_file(&mock, "w1", "tui-once");
+        atomic_write(once.clone(), contents);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while once.exists() {
+            assert!(Instant::now() < deadline, "no capture claimed the frame");
+            thread::sleep(Duration::from_millis(30));
+        }
+        wait_capture(captures() + 1);
     };
 
-    // Let the baseline settle — two consecutive identical samples.
+    // Let the baseline settle: captures n0 + 1 and n0 + 2 started after
+    // the write above, so both saw this screen, and n0 + 3 starting
+    // proves both were folded in — however the samples before them
+    // straddled the write.
     let n0 = captures();
-    wait_capture(n0 + 1);
+    wait_capture(n0 + 2);
     // An empty tail for one sample must not reset the silence clock.
     let before = silent();
     transient("");
@@ -16976,8 +16996,6 @@ fn pty_stall_transient_sample_neither_resumes_nor_resets() {
 
     // Mid-stall, the same one-sample transient cannot resume.
     transient("");
-    let n = captures();
-    wait_capture(n); // one more sample on the restored screen
     assert!(
         d.events("w1")
             .iter()
