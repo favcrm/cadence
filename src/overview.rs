@@ -1001,12 +1001,12 @@ fn delivery_items(state_dir: &Path, now: i64) -> Vec<Item> {
     out
 }
 
-/// CAD-446: the board process's own delivery-sync problem as one
-/// Needs-you `info` row (`kind: delivery_sync`), shaped like every other
-/// row after classification and the subject merge. `title` is the
-/// board's text — already one line, bounded and redacted; `since` is
-/// when the problem began (epoch secs).
-pub(crate) fn delivery_sync_row(title: &str, since: i64, now: i64) -> Value {
+/// CAD-446: a board delivery-sync problem as one Needs-you `info` row
+/// (`kind: delivery_sync`, subject `tracker:<subject>`), shaped like
+/// every other row after classification and the subject merge. `title`
+/// is the board's text — already one line, bounded and redacted;
+/// `since` is when the problem began (epoch secs).
+pub(crate) fn delivery_sync_row(title: &str, subject: &str, since: i64, now: i64) -> Value {
     let mut rows = vec![item(
         120,
         "delivery_sync",
@@ -1016,7 +1016,7 @@ pub(crate) fn delivery_sync_row(title: &str, since: i64, now: i64) -> Value {
         None,
         CMD_DELIVERY_SYNC,
     )
-    .about("tracker", "delivery-sync")
+    .about("tracker", subject)
     .since(Some(since))];
     classify_needs(
         &mut rows,

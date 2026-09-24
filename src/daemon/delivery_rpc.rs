@@ -494,7 +494,12 @@ impl Shared {
             .filter(|r| only.is_none_or(|o| o == r.issue))
             .collect();
         rows.sort_by_key(|r| r.dispatched_at);
-        Ok(json!({"records": rows.iter().map(Record::to_json).collect::<Vec<_>>()}))
+        // CAD-446: the tracker whose project remotes this daemon checks
+        // PRs against — the board's unattended sync checks the same one.
+        Ok(json!({
+            "records": rows.iter().map(Record::to_json).collect::<Vec<_>>(),
+            "pm_dir": self.pm_dir().ok(),
+        }))
     }
 
     /// `delivery_observe` — the operator's process reports what GitHub
@@ -562,6 +567,7 @@ impl Shared {
             }
         }
         // Auto-merge stays on only for the enqueued, reviewed head.
+        let was_disable = rec.disable_auto;
         let approved = rec.state == State::Enqueued && rec.passed_sha() == Some(head.as_str());
         rec.disable_auto = obs.auto_merge && !approved && rec.state != State::Merged;
         rec.observed = Some(obs);
@@ -575,7 +581,7 @@ impl Shared {
         if let Some(rec) = ended {
             self.wake_on_delivery_end(&rec);
         }
-        if rec_state_changed(&out) {
+        if rec_state_changed(&out, was_disable) {
             let _ = self
                 .store
                 .event_public(DAEMON_ALIAS, "delivery_observed", out.clone());
@@ -711,6 +717,10 @@ impl Shared {
     }
 }
 
-fn rec_state_changed(out: &Value) -> bool {
-    out["state"] != out["was"] || out["disable_auto"] == true
+/// An observation worth an event and a wake: the state moved, or
+/// auto-merge newly needs turning off. A `disable_auto` that stays
+/// true (the operator's `gh` keeps failing to turn it off) wakes once,
+/// not on every observation (CAD-446: the board observes every minute).
+fn rec_state_changed(out: &Value, was_disable: bool) -> bool {
+    out["state"] != out["was"] || (out["disable_auto"] == true && !was_disable)
 }

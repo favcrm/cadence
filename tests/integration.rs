@@ -45119,13 +45119,40 @@ fn cad446_board_syncs_delivery_without_a_terminal() {
     let _ = lf.r2.answer(n, "agent board exit");
 
     // The operator's board: its first pass observes the PR under review.
+    // Its gh wraps the fake: `pr merge` fails while `refuse-merge`
+    // exists beside it.
+    let wrap_dir = lf.f.tmp.path().join("ghwrap");
+    std::fs::create_dir_all(&wrap_dir).unwrap();
+    let refuse = wrap_dir.join("refuse-merge");
+    let wrapper = wrap_dir.join("gh");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nif [ \"$1 $2\" = \"pr merge\" ] && [ -e {refuse} ]; then\n  \
+             echo 'gh: auto-merge could not be disabled' >&2; exit 1\nfi\nexec {fake} \"$@\"\n",
+            refuse = refuse.display(),
+            fake = lf.gh_dir.join("gh").display(),
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
     let every = Duration::from_secs(1);
     let port = start_board_sync(
         &lf.f.pm_dir,
         &lf.f.d.state,
         false,
-        Some(lf.gh_dir.join("gh")),
+        Some(wrapper.clone()),
         Some(every),
+    );
+    let (_, meta) = board_get(port, "/api/meta");
+    let meta: Value = serde_json::from_str(&meta).unwrap();
+    assert_eq!(
+        meta["delivery_sync"]["gh"],
+        wrapper.to_str().unwrap(),
+        "the board shows the gh it fixed at start: {meta}"
     );
     lf.wait_rec("observed by the board", |r| r["observed"]["head"] == a);
     assert!(
@@ -45177,6 +45204,45 @@ fn cad446_board_syncs_delivery_without_a_terminal() {
     );
     assert_eq!(lf.rec()["state"], "passed");
 
+    // Auto-merge turns on for a head nobody enqueued, and the operator's
+    // gh keeps failing to turn it off: the row says so, and the daemon
+    // raises the observation (event + wake) once, not on every pass.
+    let raised = |lf: &LoopFixture| {
+        lf.f.daemon_events("delivery_observed")
+            .iter()
+            .filter(|e| e["disable_auto"] == true)
+            .count()
+    };
+    let before = raised(&lf);
+    std::fs::write(&refuse, "").unwrap();
+    lf.set_gh(&b, "OPEN", true, true);
+    cad446_wait_row(port, "delivery_sync", 20, |r| {
+        r["title"]
+            .as_str()
+            .is_some_and(|t| t.contains("D-2 — ") && t.contains("could not be disabled"))
+    });
+    let views = cad446_pr_views(&lf);
+    thread::sleep(Duration::from_secs(7));
+    assert!(
+        cad446_pr_views(&lf) >= views + 2,
+        "the failing ticket was not observed again: {}",
+        lf.gh_log()
+    );
+    assert_eq!(lf.rec()["disable_auto"], true, "{}", lf.rec());
+    assert_eq!(
+        raised(&lf),
+        before + 1,
+        "a disable_auto that stays true was raised again"
+    );
+    std::fs::remove_file(&refuse).unwrap();
+    lf.wait_rec("auto-merge turned off", |r| r["disable_auto"] == false);
+    assert!(
+        lf.gh_log()
+            .contains("pr merge 7 -R acme/app --disable-auto"),
+        "{}",
+        lf.gh_log()
+    );
+
     // gh fails: one info row, and the board backs off (2 s, 4 s, …)
     // although the page is being viewed all the while.
     std::fs::write(lf.gh_dir.join("gh-state.json"), "not json").unwrap();
@@ -45211,7 +45277,8 @@ fn cad446_board_syncs_delivery_without_a_terminal() {
     assert_eq!(cad446_board_needs(port, "merge_decision").len(), 1);
 
     // A record forged into the loop's file naming a PR outside the
-    // project's repos: the board refuses it before gh reads it.
+    // project's repos: the board refuses it before gh reads it, and the
+    // refusal is that ticket's alone — D-2 is still read every interval.
     let file = lf.f.d.state.join("delivery.json");
     let forge = || {
         let mut all: Value =
@@ -45236,7 +45303,7 @@ fn cad446_board_syncs_delivery_without_a_terminal() {
         let rows = cad446_board_needs(port, "delivery_sync");
         if rows.iter().any(|r| {
             r["title"].as_str().is_some_and(|t| {
-                t.contains("D-3 names evil/repo#1, which is not a repo of project demo")
+                t.contains("D-3 — names evil/repo#1, which is not a repo of project demo")
             })
         }) {
             break;
@@ -45247,6 +45314,17 @@ fn cad446_board_syncs_delivery_without_a_terminal() {
         );
         thread::sleep(Duration::from_millis(200));
     }
+    let views = cad446_pr_views(&lf);
+    let window = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < window {
+        forge();
+        thread::sleep(Duration::from_millis(200));
+    }
+    let during = cad446_pr_views(&lf) - views;
+    assert!(
+        during >= 4,
+        "D-2 was read {during} times in 6 s at a {every:?} interval beside a refused ticket"
+    );
     assert!(
         !lf.gh_log().contains("evil/repo"),
         "gh read a PR outside the project: {}",

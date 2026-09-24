@@ -17,27 +17,38 @@
 //!   own process is the operator's ([`super::home::board_is_operator`],
 //!   the proof the daemon runs on the board's connection). A board an
 //!   agent started runs no `gh` at all and says so in Needs-you.
+//! - **One `gh`, fixed at start.** [`resolve_gh`] turns the board's `gh`
+//!   into an absolute path once, from absolute `PATH` entries only; the
+//!   board never looks it up again, so a `gh` planted on `PATH` later is
+//!   never run. `/api/meta` shows which one it is.
 //! - **Only the project's own repos.** Each PR must be in its ticket's
-//!   project remotes ([`crate::delivery::project_pr_refusal`]) before
-//!   `gh` reads it.
+//!   project remotes, read from the daemon's tracker
+//!   ([`crate::delivery::project_pr_refusal`]), before `gh` reads it.
 //! - **Bounded.** One pass in flight ([`DeliverySync::tick`]); at most
-//!   [`MAX_PER_PASS`] PRs per pass, least recently observed first; the
+//!   [`MAX_PER_PASS`] PRs per pass, least recently attempted first; the
 //!   interval is clamped to [`MIN_EVERY`]..=[`MAX_EVERY`]; a page view
-//!   runs a pass at most every [`PAGE_GAP`] and never during a back-off;
-//!   each failed pass doubles the wait up to [`MAX_BACKOFF`].
-//! - **Failures are visible.** A failed pass is one Needs-you `info` row
-//!   (`kind: delivery_sync`) until a pass succeeds.
+//!   runs a pass at most every [`PAGE_GAP`], at most [`PAGE_BUDGET`]
+//!   times per [`PAGE_WINDOW`], and never during a back-off.
+//! - **Failures are isolated and visible.** A PR that cannot be read
+//!   backs off on its own (doubling, up to [`MAX_BACKOFF`]) while the
+//!   others keep their interval; one Needs-you `info` row names each
+//!   failing ticket and why. Only a failure of the pass itself (the
+//!   daemon unreachable, no usable `gh`, not the operator, a crash)
+//!   backs off the whole sync, with its own row.
 //! - **`gh` output is data.** It is parsed into the observation's typed
-//!   fields; nothing from it becomes a command. Error text shown in the
-//!   row is one line, bounded and secret-redacted. The board never
-//!   handles a GitHub token: `gh` reads its own.
+//!   fields; nothing from it becomes a command. Error text shown in a
+//!   row is one line of printable text, bounded, with URL credentials
+//!   and secret-shaped spans redacted. The board never handles a GitHub
+//!   token: `gh` reads its own.
 //!
 //! A read-only board runs no sync: an observation writes the loop's
 //! record and may turn auto-merge off on GitHub.
 
+use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -55,10 +66,17 @@ pub const MAX_EVERY: Duration = Duration::from_secs(10 * 60);
 pub const MAX_BACKOFF: Duration = Duration::from_secs(15 * 60);
 /// A page view runs a pass at most this often.
 pub const PAGE_GAP: Duration = Duration::from_secs(15);
+/// Page-view passes allowed per [`PAGE_WINDOW`]: `/api/overview` needs
+/// no login, so a local client polling it cannot drive `gh` harder than
+/// this.
+pub const PAGE_BUDGET: usize = 4;
+pub const PAGE_WINDOW: Duration = Duration::from_secs(10 * 60);
 /// PRs one pass reads; the rest wait for the next pass.
 pub const MAX_PER_PASS: usize = 20;
-/// Bytes of error text the Needs-you row shows.
+/// Bytes of one error text a row shows.
 const ERROR_MAX: usize = 300;
+/// Failing tickets a row names before "and N more".
+const ROW_TICKETS: usize = 3;
 
 /// What started a pass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,12 +88,21 @@ pub enum Trigger {
 /// What one pass found.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Pass {
-    /// No loop awaits GitHub: nothing was read.
+    /// No loop is due: nothing was read.
     Idle,
-    /// Every awaited PR was read and reported.
+    /// This many PRs were attempted; each one's outcome is its own.
     Synced(usize),
-    /// The pass could not do its job — the Needs-you row's text.
+    /// The pass itself could not run — the Needs-you row's text.
     Failed(String),
+}
+
+/// One ticket's own schedule.
+struct RecSync {
+    failures: u32,
+    next_due: Option<Instant>,
+    last_attempt: Option<Instant>,
+    /// Why the last attempt failed, and when the failures began.
+    error: Option<(String, i64)>,
 }
 
 #[derive(Default)]
@@ -83,17 +110,22 @@ struct Sched {
     /// When the timer is next due; `None` is now.
     next_due: Option<Instant>,
     last_start: Option<Instant>,
+    /// Failed passes in a row.
     failures: u32,
     /// The failing pass's text and when the failures began.
     problem: Option<(String, i64)>,
     /// A page view asked for a pass.
     nudged: bool,
+    /// When page-view passes ran, within the last [`PAGE_WINDOW`].
+    page_runs: Vec<Instant>,
+    records: HashMap<String, RecSync>,
 }
 
-/// One board's sync schedule and its last problem.
+/// One board's sync schedule and its problems.
 pub struct DeliverySync {
     every: Duration,
-    gh: PathBuf,
+    /// The `gh` fixed at start ([`resolve_gh`]), or why there is none.
+    gh: std::result::Result<PathBuf, String>,
     running: AtomicBool,
     sched: Mutex<Sched>,
     wake: Condvar,
@@ -101,10 +133,10 @@ pub struct DeliverySync {
 
 impl DeliverySync {
     /// `every` defaults to [`EVERY`] and is clamped to
-    /// [`MIN_EVERY`]..=[`MAX_EVERY`]; `gh` is the operator's `gh`. The
-    /// timer's first pass is one interval out; the first page view runs
-    /// one at once.
-    pub fn new(every: Option<Duration>, gh: PathBuf) -> Arc<Self> {
+    /// [`MIN_EVERY`]..=[`MAX_EVERY`]; `gh` is the resolved operator's
+    /// `gh`. The timer's first pass is one interval out; the first page
+    /// view runs one at once.
+    pub fn new(every: Option<Duration>, gh: std::result::Result<PathBuf, String>) -> Arc<Self> {
         let every = every.unwrap_or(EVERY).clamp(MIN_EVERY, MAX_EVERY);
         Arc::new(DeliverySync {
             every,
@@ -122,7 +154,7 @@ impl DeliverySync {
         self.sched.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The wait after `failures` failed passes in a row: the interval,
+    /// The wait after `failures` failures in a row: the interval,
     /// doubled per failure, at most [`MAX_BACKOFF`].
     fn backoff(&self, failures: u32) -> Duration {
         let factor = 1u32.checked_shl(failures.min(20)).unwrap_or(u32::MAX);
@@ -134,22 +166,27 @@ impl DeliverySync {
 
     /// Run one pass with `run` if `trigger` makes one due and none is in
     /// flight; `None` when it did not run. The timer is due at its next
-    /// time. A page view is due as well when no back-off is running and
-    /// the last pass began at least [`PAGE_GAP`] ago.
+    /// time. A page view is due as well when no back-off is running, the
+    /// last pass began at least [`PAGE_GAP`] ago and the page budget is
+    /// not spent. A panic in `run` is a failed pass, not a dead thread.
     pub fn tick(&self, trigger: Trigger, run: impl FnOnce() -> Pass) -> Option<Pass> {
         let now = Instant::now();
-        {
-            let st = self.lock();
+        let by_page = {
+            let mut st = self.lock();
+            st.page_runs
+                .retain(|t| now.duration_since(*t) < PAGE_WINDOW);
             let timer_due = st.next_due.is_none_or(|d| now >= d);
             let page_due = trigger == Trigger::PageView
                 && st.failures == 0
+                && st.page_runs.len() < PAGE_BUDGET
                 && st
                     .last_start
                     .is_none_or(|s| now.duration_since(s) >= PAGE_GAP);
             if !timer_due && !page_due {
                 return None;
             }
-        }
+            !timer_due
+        };
         // One pass in flight: every trigger that finds one running is
         // dropped, not queued.
         if self.running.swap(true, Ordering::AcqRel) {
@@ -162,8 +199,25 @@ impl DeliverySync {
             }
         }
         let _release = Release(&self.running);
-        self.lock().last_start = Some(now);
-        let pass = run();
+        {
+            let mut st = self.lock();
+            st.last_start = Some(now);
+            if by_page {
+                st.page_runs.push(now);
+            }
+        }
+        let pass =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)).unwrap_or_else(|panic| {
+                let what = panic
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| panic.downcast_ref::<&str>().copied())
+                    .unwrap_or("a panic");
+                Pass::Failed(row_text(&format!(
+                    "merge decisions are not refreshing: the board's delivery sync failed \
+                     unexpectedly — {what}"
+                )))
+            });
         let done = Instant::now();
         let mut st = self.lock();
         match &pass {
@@ -189,11 +243,110 @@ impl DeliverySync {
         self.wake.notify_one();
     }
 
-    /// The Needs-you `info` row for the current problem, if any.
-    pub fn needs_row(&self, now: i64) -> Option<Value> {
+    /// The records this pass reads: those awaiting GitHub whose own
+    /// back-off has run out, least recently attempted first (never
+    /// attempted before all), at most [`MAX_PER_PASS`]. A ticket that
+    /// left the loop's awaited states drops its schedule and its error.
+    pub fn select(&self, records: Vec<Record>, now: Instant) -> Vec<Record> {
+        let mut st = self.lock();
+        let awaited: Vec<Record> = records
+            .into_iter()
+            .filter(delivery::awaiting_github)
+            .collect();
+        st.records
+            .retain(|issue, _| awaited.iter().any(|r| &r.issue == issue));
+        let mut due: Vec<(Option<Instant>, Record)> = awaited
+            .into_iter()
+            .filter_map(|r| {
+                let mine = st.records.get(&r.issue);
+                let ready = mine.and_then(|m| m.next_due).is_none_or(|d| now >= d);
+                ready.then(|| (mine.and_then(|m| m.last_attempt), r))
+            })
+            .collect();
+        due.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.issue.cmp(&b.1.issue)));
+        due.truncate(MAX_PER_PASS);
+        due.into_iter().map(|(_, r)| r).collect()
+    }
+
+    /// Record one ticket's attempt: a success clears its back-off and
+    /// error; a failure backs it off alone, doubling.
+    pub fn record(&self, issue: &str, outcome: std::result::Result<(), String>, at: Instant) {
+        let mut st = self.lock();
+        let entry = st.records.entry(issue.to_string()).or_insert(RecSync {
+            failures: 0,
+            next_due: None,
+            last_attempt: None,
+            error: None,
+        });
+        entry.last_attempt = Some(at);
+        match outcome {
+            Ok(()) => {
+                entry.failures = 0;
+                entry.next_due = None;
+                entry.error = None;
+            }
+            Err(why) => {
+                entry.failures = entry.failures.saturating_add(1);
+                let since = entry.error.as_ref().map_or_else(epoch_now, |e| e.1);
+                entry.error = Some((row_text(&why), since));
+                let wait = self.backoff(entry.failures);
+                entry.next_due = Some(at + wait);
+            }
+        }
+    }
+
+    /// The Needs-you `info` rows: the pass's own problem, and one row
+    /// naming every ticket whose PR the board cannot read and why.
+    pub fn needs_rows(&self, now: i64) -> Vec<Value> {
         let st = self.lock();
-        let (why, since) = st.problem.as_ref()?;
-        Some(crate::overview::delivery_sync_row(why, *since, now))
+        let mut rows = Vec::new();
+        if let Some((why, since)) = &st.problem {
+            rows.push(crate::overview::delivery_sync_row(
+                why,
+                "delivery-sync",
+                *since,
+                now,
+            ));
+        }
+        let mut failing: Vec<(&String, &(String, i64))> = st
+            .records
+            .iter()
+            .filter_map(|(issue, r)| r.error.as_ref().map(|e| (issue, e)))
+            .collect();
+        failing.sort_by(|a, b| a.0.cmp(b.0));
+        if let Some(since) = failing.iter().map(|(_, e)| e.1).min() {
+            let named: Vec<String> = failing
+                .iter()
+                .take(ROW_TICKETS)
+                .map(|(issue, (why, _))| format!("{issue} — {why}"))
+                .collect();
+            let more = match failing.len().saturating_sub(ROW_TICKETS) {
+                0 => String::new(),
+                n => format!("; and {n} more"),
+            };
+            let title = format!(
+                "merge decisions are not refreshing for {} ticket(s): the board's GitHub \
+                 read failed for {}{more}",
+                failing.len(),
+                named.join("; ")
+            );
+            let mut row =
+                crate::overview::delivery_sync_row(&title, "delivery-sync-tickets", since, now);
+            row["tickets"] = json!(failing
+                .iter()
+                .map(|(issue, (why, since))| json!({"issue": issue, "error": why, "since": since}))
+                .collect::<Vec<_>>());
+            rows.push(row);
+        }
+        rows
+    }
+
+    /// What `/api/meta` shows: the `gh` this board runs and its period.
+    pub fn meta(&self) -> Value {
+        match &self.gh {
+            Ok(gh) => json!({"gh": gh, "every_secs": self.every.as_secs()}),
+            Err(e) => json!({"gh": null, "gh_error": e, "every_secs": self.every.as_secs()}),
+        }
     }
 
     /// The board's sync thread: wait for the timer or a page view, then
@@ -222,29 +375,133 @@ impl DeliverySync {
                 }
             };
             self.tick(trigger, || {
-                pass(&state_dir, &pm_dir, &self.gh, || {
+                self.pass(&state_dir, &pm_dir, || {
                     super::home::board_is_operator(&state_dir)
                 })
             });
         }
     }
+
+    /// One pass: read the loop from the daemon; when a PR is due, prove
+    /// the board is the operator's, then read each due PR in its
+    /// project's repos with the fixed `gh` and report it. One ticket's
+    /// failure is that ticket's.
+    fn pass(&self, state_dir: &Path, board_pm: &Path, is_operator: impl Fn() -> bool) -> Pass {
+        let list = match client::rpc(state_dir, "delivery_list", json!({})) {
+            Ok(v) => v,
+            Err(e) => {
+                return Pass::Failed(row_text(&format!(
+                    "merge decisions are not refreshing: the board cannot read the review \
+                     loop from the daemon — {e}"
+                )))
+            }
+        };
+        let records: Vec<Record> = list["records"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|r| serde_json::from_value(r.clone()).ok())
+            .collect();
+        let due = self.select(records, Instant::now());
+        if due.is_empty() {
+            return Pass::Idle;
+        }
+        if !is_operator() {
+            return Pass::Failed(
+                "merge decisions are not refreshing: this board was not started by the \
+                 operator, so it does not read GitHub — restart it from the operator's shell \
+                 (`cadence ui start`) or run `cadence delivery sync`"
+                    .into(),
+            );
+        }
+        let gh = match &self.gh {
+            Ok(gh) => gh.to_string_lossy().to_string(),
+            Err(e) => {
+                return Pass::Failed(row_text(&format!(
+                    "merge decisions are not refreshing: the board found no usable `gh` when \
+                     it started — {e}"
+                )))
+            }
+        };
+        // The project remotes are the daemon's tracker's — the one its
+        // done-report check used — not whatever this board was given.
+        let Some(pm_dir) = list["pm_dir"].as_str().map(PathBuf::from) else {
+            return Pass::Failed(
+                "merge decisions are not refreshing: the daemon does not say which tracker \
+                 holds the project remotes — restart it on this build"
+                    .into(),
+            );
+        };
+        for rec in &due {
+            let Some(url) = rec.pr.as_deref() else {
+                continue;
+            };
+            let outcome = match delivery::project_pr_refusal(&pm_dir, &rec.project, url) {
+                Ok(None) => {
+                    let row = delivery::sync_pr(state_dir, &rec.issue, url, &gh);
+                    match row["error"].as_str() {
+                        Some(e) => Err(e.to_string()),
+                        None => Ok(()),
+                    }
+                }
+                Ok(Some(why)) => Err(why),
+                Err(e) => Err(e.to_string()),
+            };
+            self.record(&rec.issue, outcome, Instant::now());
+        }
+        // The next overview read shows what the daemon just recorded.
+        super::read_model::get(state_dir, board_pm).invalidate();
+        Pass::Synced(due.len())
+    }
 }
 
-/// Start the board's sync thread; the handle serves page-view nudges
-/// and the Needs-you row.
+/// Start the board's sync thread; the handle serves page-view nudges,
+/// `/api/meta` and the Needs-you rows. A thread that cannot start is
+/// logged and shown as the sync's problem.
 pub fn start(
     state_dir: &Path,
     pm_dir: &Path,
     every: Option<Duration>,
-    gh: PathBuf,
+    gh: std::result::Result<PathBuf, String>,
 ) -> Arc<DeliverySync> {
     let sync = DeliverySync::new(every, gh);
     let (worker, state_dir, pm_dir) = (sync.clone(), state_dir.to_path_buf(), pm_dir.to_path_buf());
-    std::thread::Builder::new()
+    if let Err(e) = std::thread::Builder::new()
         .name("delivery-sync".into())
         .spawn(move || worker.run_forever(state_dir, pm_dir))
-        .ok();
+    {
+        let why = format!(
+            "merge decisions are not refreshing: the board could not start its delivery sync \
+             — {e}"
+        );
+        eprintln!("cadence ui: {why}");
+        sync.lock().problem = Some((why, epoch_now()));
+    }
     sync
+}
+
+/// The board's `gh` as an absolute path, fixed once at start: `gh` when
+/// it names a path (made absolute), else the first executable `gh` in
+/// an ABSOLUTE `PATH` entry — an empty or relative entry would resolve
+/// against whatever directory the board runs in.
+pub fn resolve_gh(gh: &Path, path_env: Option<&OsStr>) -> std::result::Result<PathBuf, String> {
+    use std::os::unix::fs::PermissionsExt;
+    let runnable = |p: &Path| {
+        std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    };
+    if gh.components().count() > 1 || gh.is_absolute() {
+        let abs = std::path::absolute(gh).map_err(|e| format!("{}: {e}", gh.display()))?;
+        return if runnable(&abs) {
+            Ok(abs)
+        } else {
+            Err(format!("{} is not an executable file", abs.display()))
+        };
+    }
+    std::env::split_paths(path_env.unwrap_or_default())
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(gh))
+        .find(|p| runnable(p))
+        .ok_or_else(|| format!("no executable `{}` on an absolute PATH entry", gh.display()))
 }
 
 fn epoch_now() -> i64 {
@@ -254,16 +511,34 @@ fn epoch_now() -> i64 {
         .unwrap_or(0)
 }
 
-/// Error text fit for the Needs-you row: its first line, secret-shaped
-/// spans redacted, at most [`ERROR_MAX`] bytes. It is shown as text and
-/// never run.
+/// `scheme://user:pass@` — credentials in a URL.
+static URL_CREDENTIALS: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"([A-Za-z][A-Za-z0-9+.\-]*://)[^/\s@]+@").expect("static regex")
+});
+
+/// A bidirectional-text or invisible formatting control.
+fn is_bidi_or_format(c: char) -> bool {
+    matches!(c,
+        '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+        | '\u{2060}'..='\u{2069}' | '\u{FEFF}')
+}
+
+/// Error text fit for a Needs-you row: its first line, control and
+/// bidi characters removed, URL credentials and secret-shaped spans
+/// redacted, at most [`ERROR_MAX`] bytes. It is shown as text and never
+/// run.
 pub fn row_text(raw: &str) -> String {
     let line = raw
         .lines()
         .map(str::trim)
         .find(|l| !l.is_empty())
         .unwrap_or("");
-    let clean = crate::secret::redact_text(line)
+    let printable: String = line
+        .chars()
+        .filter(|c| !c.is_control() && !is_bidi_or_format(*c))
+        .collect();
+    let no_userinfo = URL_CREDENTIALS.replace_all(&printable, "${1}[REDACTED]@");
+    let clean = crate::secret::redact_text(&no_userinfo)
         .unwrap_or_else(|_| "(error text withheld: it could not be scanned for secrets)".into());
     if clean.len() <= ERROR_MAX {
         return clean;
@@ -275,93 +550,6 @@ pub fn row_text(raw: &str) -> String {
     format!("{}…", &clean[..end])
 }
 
-/// The records one pass reads, least recently observed first, at most
-/// [`MAX_PER_PASS`].
-pub fn awaited(records: Vec<Record>) -> Vec<Record> {
-    let mut due: Vec<Record> = records
-        .into_iter()
-        .filter(delivery::awaiting_github)
-        .collect();
-    due.sort_by_key(|r| {
-        (
-            r.observed.as_ref().map_or(i64::MIN, |o| o.at),
-            r.issue.clone(),
-        )
-    });
-    due.truncate(MAX_PER_PASS);
-    due
-}
-
-/// One pass: read the loop from the daemon; when a PR awaits GitHub,
-/// prove the board is the operator's, then read each PR in its
-/// project's repos with the operator's `gh` and report it.
-fn pass(state_dir: &Path, pm_dir: &Path, gh: &Path, is_operator: impl Fn() -> bool) -> Pass {
-    let list = match client::rpc(state_dir, "delivery_list", json!({})) {
-        Ok(v) => v,
-        Err(e) => {
-            return Pass::Failed(row_text(&format!(
-                "merge decisions are not refreshing: the board cannot read the review loop \
-                 from the daemon — {e}"
-            )))
-        }
-    };
-    let records: Vec<Record> = list["records"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|r| serde_json::from_value(r.clone()).ok())
-        .collect();
-    let due = awaited(records);
-    if due.is_empty() {
-        return Pass::Idle;
-    }
-    if !is_operator() {
-        return Pass::Failed(
-            "merge decisions are not refreshing: this board was not started by the operator, \
-             so it does not read GitHub — restart it from the operator's shell \
-             (`cadence ui start`) or run `cadence delivery sync`"
-                .into(),
-        );
-    }
-    let gh = gh.to_string_lossy();
-    let mut errors = Vec::new();
-    for rec in &due {
-        let Some(url) = rec.pr.as_deref() else {
-            continue;
-        };
-        match delivery::project_pr_refusal(pm_dir, &rec.project, url) {
-            Ok(None) => {}
-            Ok(Some(why)) => {
-                errors.push(format!("{} {why}", rec.issue));
-                continue;
-            }
-            Err(e) => {
-                errors.push(format!("{}: {e}", rec.issue));
-                continue;
-            }
-        }
-        let row = delivery::sync_pr(state_dir, &rec.issue, url, &gh);
-        if let Some(e) = row["error"].as_str() {
-            errors.push(format!("{}: {e}", rec.issue));
-        }
-    }
-    // The next overview read shows what the daemon just recorded.
-    super::read_model::get(state_dir, pm_dir).invalidate();
-    match errors.first() {
-        None => Pass::Synced(due.len()),
-        Some(first) => {
-            let more = match errors.len() {
-                1 => String::new(),
-                n => format!(" (and {} more)", n - 1),
-            };
-            Pass::Failed(row_text(&format!(
-                "merge decisions are not refreshing: the board's GitHub read failed for \
-                 {first}{more}"
-            )))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,7 +557,10 @@ mod tests {
     use std::sync::Barrier;
 
     fn sync(every: u64) -> Arc<DeliverySync> {
-        DeliverySync::new(Some(Duration::from_secs(every)), PathBuf::from("gh"))
+        DeliverySync::new(
+            Some(Duration::from_secs(every)),
+            Ok(PathBuf::from("/usr/bin/gh")),
+        )
     }
 
     /// Concurrent triggers (the timer and many page views at once) run
@@ -422,7 +613,7 @@ mod tests {
     }
 
     /// The timer waits its interval; a page view is due only past
-    /// [`PAGE_GAP`]; a failure backs off, doubling, and no page view
+    /// [`PAGE_GAP`]; a failed pass backs off, doubling, and no page view
     /// cuts a back-off short; a success clears it.
     #[test]
     fn timer_page_view_and_backoff_schedule() {
@@ -451,7 +642,9 @@ mod tests {
             "{:?}",
             due - before
         );
-        let row = s.needs_row(since + 5).unwrap();
+        let rows = s.needs_rows(since + 5);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let row = &rows[0];
         assert_eq!(row["kind"], "delivery_sync", "{row}");
         assert_eq!(row["audience"], "info", "{row}");
         assert_eq!(row["title"], "boom", "{row}");
@@ -472,15 +665,58 @@ mod tests {
         // A success clears the row and the back-off.
         s.lock().next_due = None;
         s.tick(Trigger::Timer, || Pass::Idle);
-        assert!(s.needs_row(0).is_none());
+        assert!(s.needs_rows(0).is_empty());
         assert_eq!(s.lock().failures, 0);
+    }
+
+    /// Page views (an unauthenticated `/api/overview` poll) run at most
+    /// [`PAGE_BUDGET`] passes per [`PAGE_WINDOW`], however they are
+    /// spaced.
+    #[test]
+    fn page_views_spend_a_bounded_budget() {
+        let s = sync(600);
+        let mut ran = 0;
+        for _ in 0..PAGE_BUDGET * 3 {
+            s.lock().last_start = Some(Instant::now() - PAGE_GAP);
+            if s.tick(Trigger::PageView, || Pass::Idle).is_some() {
+                ran += 1;
+            }
+        }
+        assert_eq!(ran, PAGE_BUDGET);
+        // The timer is not charged to the budget, nor refused by it.
+        s.lock().next_due = None;
+        assert!(s.tick(Trigger::Timer, || Pass::Idle).is_some());
+        // An old window no longer counts.
+        let old = Instant::now() - PAGE_WINDOW;
+        s.lock().page_runs = vec![old; PAGE_BUDGET];
+        s.lock().last_start = Some(Instant::now() - PAGE_GAP);
+        assert!(s.tick(Trigger::PageView, || Pass::Idle).is_some());
+    }
+
+    /// A panic inside a pass is a failed pass with a row; the sync goes
+    /// on, and the in-flight flag is released.
+    #[test]
+    fn a_panicking_pass_is_a_failed_pass() {
+        let s = sync(60);
+        s.lock().next_due = None;
+        let out = s.tick(Trigger::Timer, || panic!("kaboom"));
+        match out {
+            Some(Pass::Failed(why)) => assert!(why.contains("kaboom"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(s.needs_rows(0)[0]["title"]
+            .as_str()
+            .unwrap()
+            .contains("failed unexpectedly"));
+        s.lock().next_due = None;
+        assert_eq!(s.tick(Trigger::Timer, || Pass::Idle), Some(Pass::Idle));
     }
 
     #[test]
     fn interval_and_backoff_are_bounded() {
         assert_eq!(sync(0).every, MIN_EVERY);
         assert_eq!(sync(86_400).every, MAX_EVERY);
-        assert_eq!(DeliverySync::new(None, "gh".into()).every, EVERY);
+        assert_eq!(DeliverySync::new(None, Err("x".into())).every, EVERY);
         let s = sync(60);
         assert_eq!(s.backoff(1), Duration::from_secs(120));
         assert_eq!(s.backoff(3), Duration::from_secs(480));
@@ -497,12 +733,17 @@ mod tests {
         r
     }
 
+    fn ids(v: Vec<Record>) -> Vec<String> {
+        v.into_iter().map(|r| r.issue).collect()
+    }
+
     /// Only loops whose PR GitHub can change are read; a worker's ticket,
     /// a finished loop and a loop without a PR cost no `gh` call. At most
-    /// [`MAX_PER_PASS`], least recently observed first.
+    /// [`MAX_PER_PASS`].
     #[test]
     fn a_pass_reads_only_loops_awaiting_github() {
         use delivery::State::*;
+        let s = sync(60);
         let mut off = rec("D-9", Merged, true);
         off.disable_auto = true;
         let all = vec![
@@ -516,29 +757,79 @@ mod tests {
             rec("D-8", Passed, false),
             off,
         ];
-        let ids: Vec<String> = awaited(all).into_iter().map(|r| r.issue).collect();
-        assert_eq!(ids, ["D-2", "D-3", "D-4", "D-9"]);
-        assert!(awaited(vec![rec("D-1", Working, true), rec("D-5", Escalated, true)]).is_empty());
-
+        assert_eq!(
+            ids(s.select(all, Instant::now())),
+            ["D-2", "D-3", "D-4", "D-9"]
+        );
+        assert!(s
+            .select(
+                vec![rec("D-1", Working, true), rec("D-5", Escalated, true)],
+                Instant::now()
+            )
+            .is_empty());
         let many: Vec<Record> = (0..MAX_PER_PASS + 5)
-            .map(|n| {
-                let mut r = rec(&format!("D-{n}"), Passed, true);
-                r.observed = Some(delivery::Observed {
-                    at: 1000 - n as i64,
-                    ..Default::default()
-                });
-                r
-            })
+            .map(|n| rec(&format!("D-{n:02}"), Passed, true))
             .collect();
-        let due = awaited(many);
-        assert_eq!(due.len(), MAX_PER_PASS);
-        assert_eq!(due[0].issue, format!("D-{}", MAX_PER_PASS + 4));
+        assert_eq!(s.select(many, Instant::now()).len(), MAX_PER_PASS);
     }
 
-    /// Error text in the row is one line, bounded, and never carries a
-    /// token-shaped span.
+    /// I1: one ticket whose PR cannot be read backs off alone — the
+    /// others stay due every interval — and the row names it and why.
+    /// Order is by last ATTEMPT, so a ticket that never succeeds cannot
+    /// stay first and starve the rest past [`MAX_PER_PASS`].
     #[test]
-    fn row_text_is_one_redacted_bounded_line() {
+    fn a_failing_ticket_backs_off_alone_and_never_starves_the_rest() {
+        use delivery::State::*;
+        let s = sync(60);
+        let t0 = Instant::now();
+        let both = || vec![rec("D-2", Passed, true), rec("D-3", Passed, true)];
+        assert_eq!(ids(s.select(both(), t0)), ["D-2", "D-3"]);
+        s.record("D-2", Ok(()), t0);
+        s.record("D-3", Err("gh: HTTP 404\nmore".into()), t0);
+        // One interval later: D-2 is due, D-3 waits out its back-off.
+        let t1 = t0 + Duration::from_secs(60);
+        assert_eq!(ids(s.select(both(), t1)), ["D-2"]);
+        s.record("D-2", Ok(()), t1);
+        let t2 = t0 + Duration::from_secs(120);
+        // D-3's back-off ran out; it was attempted before D-2 was.
+        assert_eq!(ids(s.select(both(), t2)), ["D-3", "D-2"]);
+        s.record("D-3", Err("gh: HTTP 404".into()), t2);
+        assert_eq!(ids(s.select(both(), t2 + Duration::from_secs(60))), ["D-2"]);
+        let rows = s.needs_rows(epoch_now());
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let title = rows[0]["title"].as_str().unwrap();
+        assert!(
+            title.contains("1 ticket(s)") && title.contains("D-3 — gh: HTTP 404"),
+            "{title}"
+        );
+        assert!(!title.contains("D-2") && !title.contains("more"), "{title}");
+        assert_eq!(rows[0]["tickets"][0]["issue"], "D-3", "{}", rows[0]);
+        // Last attempt, not last success: a ticket that always fails
+        // comes AFTER one attempted less recently.
+        let s = sync(60);
+        let many: Vec<Record> = (0..MAX_PER_PASS + 1)
+            .map(|n| rec(&format!("D-{n:02}"), Passed, true))
+            .collect();
+        let first = s.select(many.clone(), t0);
+        assert_eq!(first.len(), MAX_PER_PASS);
+        for r in &first {
+            s.record(&r.issue, Ok(()), t0);
+        }
+        s.record("D-00", Err("x".into()), t0);
+        // Past every back-off, the one never attempted comes first and
+        // the failing D-00 is not ahead of it.
+        let later = t0 + MAX_BACKOFF;
+        let next = ids(s.select(many, later));
+        assert_eq!(next[0], format!("D-{MAX_PER_PASS:02}"), "{next:?}");
+        // A ticket that leaves the awaited states drops its error.
+        s.select(vec![rec("D-01", Merged, true)], later);
+        assert!(s.needs_rows(0).is_empty());
+    }
+
+    /// Error text in a row is one printable line, bounded, and never
+    /// carries a token-shaped span or URL credentials.
+    #[test]
+    fn row_text_is_one_redacted_printable_bounded_line() {
         let token = format!("ghp_{}", "A1b2C3d4E5".repeat(4).get(..36).unwrap());
         let raw = format!("gh: HTTP 401 bad credentials {token}\nsecond line\n");
         let text = row_text(&raw);
@@ -550,5 +841,40 @@ mod tests {
         assert!(text.starts_with("gh: HTTP 401"), "{text}");
         let long = row_text(&"é".repeat(1000));
         assert!(long.len() <= ERROR_MAX + '…'.len_utf8(), "{}", long.len());
+        // Controls and bidi overrides are dropped.
+        let (esc, rlo, pdi) = (char::from(0x1b), '\u{202E}', '\u{2069}');
+        let text = row_text(&format!("a{esc}[31mb{rlo}c{pdi}d\te"));
+        assert_eq!(text, "a[31mbcde", "{text:?}");
+        // URL userinfo is redacted.
+        let pass = ["hunter", "2"].concat();
+        let text = row_text(&format!("fetch https://bob:{pass}@github.com/o/r failed"));
+        assert!(!text.contains(&pass) && !text.contains("bob"), "{text}");
+        assert!(text.contains("https://[REDACTED]@github.com/o/r"), "{text}");
+    }
+
+    /// `gh` is fixed to an absolute path; a relative or empty `PATH`
+    /// entry is never searched.
+    #[test]
+    fn gh_resolves_once_to_an_absolute_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let gh = bin.join("gh");
+        std::fs::write(&gh, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::join_paths([Path::new("relative/bin"), Path::new(""), &bin]).unwrap();
+        assert_eq!(
+            resolve_gh(Path::new("gh"), Some(&path)).unwrap(),
+            gh,
+            "the absolute entry"
+        );
+        let rel_only = std::env::join_paths([Path::new("bin"), Path::new(".")]).unwrap();
+        assert!(resolve_gh(Path::new("gh"), Some(&rel_only)).is_err());
+        assert_eq!(resolve_gh(&gh, None).unwrap(), gh);
+        let data = bin.join("data");
+        std::fs::write(&data, "x").unwrap();
+        assert!(resolve_gh(&data, None).is_err(), "not executable");
+        assert!(resolve_gh(Path::new("gh"), None).is_err());
     }
 }

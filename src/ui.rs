@@ -2415,6 +2415,9 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
                     "build_commit": crate::overview::BUILD_COMMIT,
                     "build_time": crate::overview::BUILD_TIME,
                     "daemon": daemon,
+                    // CAD-446: the `gh` this board's sync runs, fixed at
+                    // start; `null` when the board runs no sync.
+                    "delivery_sync": opts.delivery_sync.as_ref().map(|s| s.meta()),
                 })),
             );
         }
@@ -2469,10 +2472,8 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0);
-                if let (Some(row), Some(needs)) =
-                    (sync.needs_row(now), overview["needs_me"].as_array_mut())
-                {
-                    needs.push(row);
+                if let Some(needs) = overview["needs_me"].as_array_mut() {
+                    needs.extend(sync.needs_rows(now));
                 }
             }
             send(request, json_response(overview))
@@ -2950,16 +2951,17 @@ pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
     // (the operator's, when it proves so) reads the loop's PRs with the
     // operator's `gh`. Started only once the port is ours; a read-only
     // board writes nothing, observations included.
-    opts.delivery_sync = (!opts.read_only).then(|| {
-        delivery_sync::start(
-            state_dir,
-            pm_dir,
-            opts.delivery_sync_every,
-            opts.gh
-                .clone()
-                .unwrap_or_else(|| PathBuf::from(crate::delivery::GH)),
-        )
-    });
+    // `gh` is fixed to an absolute path once, here: neither the sync
+    // nor Merge looks it up on PATH again.
+    let gh = delivery_sync::resolve_gh(
+        opts.gh.as_deref().unwrap_or(Path::new(crate::delivery::GH)),
+        std::env::var_os("PATH").as_deref(),
+    );
+    if let Ok(abs) = &gh {
+        opts.gh = Some(abs.clone());
+    }
+    opts.delivery_sync = (!opts.read_only)
+        .then(|| delivery_sync::start(state_dir, pm_dir, opts.delivery_sync_every, gh));
     let opts = &opts;
     eprintln!("cadence ui listening on http://{}:{}", opts.host, opts.port);
     for request in server.incoming_requests() {
