@@ -8,6 +8,7 @@ import type {
   MemoryCard,
   MemoryDetail,
   Meta,
+  MilestoneRow,
   ModelDefaultsConfig,
   ModelDefaultsSnapshot,
   Overview,
@@ -297,6 +298,15 @@ export const api = {
   /** `POST /api/issues/<id>/answers` — the operator's answer report. */
   answer: (issue: string, question: string, text: string) =>
     write("POST", `/api/issues/${encodeURIComponent(issue)}/answers`, { question, text }),
+  /** `GET /api/milestones?project=` — progress and worst health per milestone. */
+  milestones: (project: string) =>
+    get<{ milestones: MilestoneRow[] }>(`/api/milestones?project=${encodeURIComponent(project)}`),
+  /** `POST /api/epics/<id>/stage` — relays `epic_stage`; operator-only on the board. */
+  moveStage: (epic: string, stage: string, note?: string) =>
+    post<{ epic: string; from: string; to: string; by: string; at: string }>(
+      `/api/epics/${encodeURIComponent(epic)}/stage`,
+      note && note.trim() ? { stage, note: note.trim() } : { stage },
+    ),
   /** `GET /api/master/summary?since=` — 501 on a daemon without it. */
   masterSummary: (since: number) =>
     get<Record<string, unknown>>(`/api/master/summary?since=${Math.floor(since)}`),

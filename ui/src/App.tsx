@@ -3,6 +3,8 @@ import { api, ApiError, type WriteResp } from "./lib/api";
 import Agents from "./features/agents/Agents";
 import Board from "./features/projects/Board";
 import Drawer from "./features/projects/Drawer";
+import Epics from "./features/projects/Epics";
+import Milestones from "./features/projects/Milestones";
 import Memory from "./features/settings/Memory";
 import ModelDefaults from "./features/settings/ModelDefaults";
 import OverviewView from "./features/home/Overview";
@@ -507,6 +509,12 @@ export default function App() {
             label={route.slug}
             tabs={[
               { label: "Issues", href: hrefFor({ ...route, section: "issues" }), on: route.section === "issues" },
+              { label: "Epics", href: hrefFor({ ...route, section: "epics" }), on: route.section === "epics" },
+              {
+                label: "Milestones",
+                href: hrefFor({ ...route, section: "milestones" }),
+                on: route.section === "milestones",
+              },
               { label: "Context", href: hrefFor({ ...route, section: "context" }), on: route.section === "context" },
             ]}
           />
@@ -533,6 +541,18 @@ export default function App() {
             onError={writeError}
             onAgents={() => goRoute({ screen: "agents", alias: null })}
           />
+        )}
+        {route.screen === "projects" && route.slug && route.section === "epics" && (
+          <Epics
+            project={route.slug}
+            issues={issuesState}
+            viewer={{ readOnly, operator: meta?.operator === true }}
+            onOpenIssue={openIssue}
+            onRetry={() => void resources.issues.refresh()}
+          />
+        )}
+        {route.screen === "projects" && route.slug && route.section === "milestones" && (
+          <Milestones project={route.slug} issues={issuesState} onOpenIssue={openIssue} />
         )}
         {route.screen === "projects" && route.section === "context" && (
           <Plan

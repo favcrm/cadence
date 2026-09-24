@@ -510,6 +510,29 @@ pub fn check_move(cfg: &WorkConfig, cur: &StageState, to: &str, floor: usize) ->
     })
 }
 
+/// Every stage `epic_stage` would accept from `cur` right now —
+/// [`check_move`] over the whole list, so a view offers exactly the
+/// moves the writer allows and never re-derives the rule. A plan that
+/// is not approved owns the stage: no moves (`move_stage` refuses them).
+/// `needs_operator` marks the moves only the proven operator may make.
+pub fn legal_moves(front: &Front, cfg: &WorkConfig, cur: &StageState) -> Vec<Value> {
+    if front.plan.as_ref().is_some_and(|p| p.state != "approved") {
+        return vec![];
+    }
+    let floor = floor(front, cfg);
+    cfg.stages
+        .iter()
+        .filter_map(|s| check_move(cfg, cur, &s.id, floor).ok())
+        .map(|mv| {
+            json!({
+                "to": mv.to,
+                "forward": mv.forward,
+                "needs_operator": mv.needs_operator,
+            })
+        })
+        .collect()
+}
+
 /// One project's work settings as a render uses them.
 #[derive(Clone, Debug)]
 pub struct ProjectWork {
@@ -735,6 +758,7 @@ pub fn item_json(ctx: &Ctx, view: &View) -> Value {
             "next_needs_operator": next.as_ref().is_some_and(|n| cfg.operator_stages.contains(n)),
             "terminal": stage.terminal,
             "stages": cfg.stage_ids(),
+            "moves": legal_moves(f, cfg, &stage),
         });
         out["progress"] = progress_json(&kids);
         out["health"] = health_json(view, &stage, cfg, &kids, ctx.now);
@@ -1276,6 +1300,69 @@ mod tests {
             assert!(err.contains(want), "{from}→{to}: {err}");
         }
         assert!(!check_move(&cfg, &at("limbo"), "shape", 0).unwrap().forward);
+    }
+
+    /// CAD-432: the board offers exactly the moves `check_move` accepts
+    /// — one step forward, any step back to the floor — with the
+    /// operator flag the writer applies; a plan that is not approved
+    /// offers none.
+    #[test]
+    fn legal_moves_mirror_check_move() {
+        let cfg = WorkConfig::default();
+        let moves = |f: &Front, done: bool| -> Vec<(String, bool, bool)> {
+            legal_moves(f, &cfg, &stage_of(f, &cfg, done))
+                .iter()
+                .map(|m| {
+                    (
+                        m["to"].as_str().unwrap().to_string(),
+                        m["forward"].as_bool().unwrap(),
+                        m["needs_operator"].as_bool().unwrap(),
+                    )
+                })
+                .collect()
+        };
+        let own = |s: &str| (s.to_string(), false, false);
+        let mut f = Front::new("CAD-1", "e", "2026-09-01T00:00:00Z");
+        assert_eq!(moves(&f, false), vec![("build".to_string(), true, true)]);
+        f.stage = Some("verify".into());
+        assert_eq!(
+            moves(&f, false),
+            vec![
+                own("shape"),
+                own("build"),
+                ("release".to_string(), true, true)
+            ]
+        );
+        f.stage = Some("build".into());
+        assert_eq!(
+            moves(&f, false),
+            vec![own("shape"), ("verify".to_string(), true, false)]
+        );
+        f.stage = Some("done".into());
+        assert_eq!(
+            moves(&f, false),
+            vec![own("shape"), own("build"), own("verify"), own("release")]
+        );
+        // A done epic never moved: every move out is the operator's.
+        let derived = Front::new("CAD-2", "e", "2026-09-01T00:00:00Z");
+        assert!(moves(&derived, true).iter().all(|(_, fwd, op)| !fwd && *op));
+        // An approved plan owns the first stage; an unapproved one owns
+        // the stage outright.
+        let mut p = Front::new("CAD-3", "e", "2026-09-01T00:00:00Z");
+        p.plan = Some(model::Plan {
+            state: "approved".into(),
+            proposed_by: "operator".into(),
+            proposed_at: "2026-09-01T00:00:00Z".into(),
+            tickets: vec![],
+            decided_by: Some("operator".into()),
+            decided_at: Some("2026-09-02T00:00:00Z".into()),
+            reason: None,
+        });
+        assert_eq!(moves(&p, false), vec![("verify".to_string(), true, false)]);
+        for state in ["proposed", "rejected"] {
+            p.plan.as_mut().unwrap().state = state.into();
+            assert!(moves(&p, false).is_empty(), "{state}");
+        }
     }
 
     #[test]

@@ -213,7 +213,8 @@ before the first `cadence plan propose`.
 As implemented, one `work` block carries the model everywhere: `type` and
 `type_source`, `milestone` and `milestone_source` (`field` | `tag`), `size`,
 `weight`, and for epics `stage` (`id`, `source` = `field` | `plan` | `default`,
-`since`, `exit`, `next`, `next_needs_operator`, `terminal`, `stages`), `progress`
+`since`, `exit`, `next`, `next_needs_operator`, `terminal`, `stages`, and — CAD-432 —
+`moves`: every `{to, forward, needs_operator}` that `check_move` accepts now), `progress`
 and `health` (`null` for non-epics), plus `config_error` when `PROJECT.md` is bad.
 `config_unapproved` appears when unapproved gate keys were replaced by the defaults.
 It is on every card of `GET /api/issues` and `issue ls --json`, on the detail of
@@ -221,7 +222,12 @@ It is on every card of `GET /api/issues` and `issue ls --json`, on the detail of
 `issue epic ls|show --json`. The existing card fields (`done_ratio` is still the
 count ratio) are unchanged. `issue epic ls` lists effective epics (explicit
 `type: epic` or children); its table shows STAGE, weighted PROGRESS, the counts and
-HEALTH. Board screens come later (CAD-325 read model).
+HEALTH. The board's Projects screen (CAD-432) shows them: a project's Epics tab
+lists each epic's stage, weighted progress, health with its reasons and next actions,
+and milestone; opening one shows its children, its stage history (who moved each
+stage, when — `stage` entries of the issue history) and, to the proven operator only,
+the legal moves (`POST /api/epics/:epic/stage`). The Milestones tab shows progress and
+worst health per milestone (`GET /api/milestones`).
 
 ## Migration
 

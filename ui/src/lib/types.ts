@@ -49,6 +49,94 @@ export interface IssueCard {
   rev: string;
   counts: { comments: number; artifacts: number; refs: number };
   checks: { done: number; total: number };
+  /** CAD-405 work model: type, milestone, size; stage/progress/health on epics. */
+  work?: WorkBlock;
+}
+
+/** CAD-405 epic health. `stalled` is time in stage, not child activity. */
+export type HealthState = "on_track" | "at_risk" | "stalled";
+
+/** One reason an epic or milestone is not on track, with its next action. */
+export interface HealthReason {
+  cause: string;
+  issue: string;
+  owner?: string | null;
+  detail: string;
+  next: string;
+}
+
+export interface WorkProgress {
+  done_weight: number;
+  total_weight: number;
+  ratio: number;
+  counts: Record<string, number>;
+}
+
+/** One move `epic_stage` accepts from the epic's current stage. */
+export interface StageMove {
+  to: string;
+  forward: boolean;
+  /** Only the proven operator may make it. */
+  needs_operator: boolean;
+}
+
+export interface WorkStage {
+  id: string;
+  source: string;
+  since: string | null;
+  exit: string | null;
+  next: string | null;
+  next_needs_operator: boolean;
+  terminal: boolean;
+  stages: string[];
+  /** CAD-432: the legal moves; absent from a server that predates it. */
+  moves?: StageMove[];
+}
+
+/** The `work` block on `/api/issues` cards and `/api/issues/:id`. */
+export interface WorkBlock {
+  type: string;
+  milestone: string | null;
+  size: string | null;
+  weight: number;
+  stage: WorkStage | null;
+  progress: WorkProgress | null;
+  health: {
+    state: HealthState;
+    days_in_stage: number | null;
+    limit_days: number;
+    reasons: HealthReason[];
+  } | null;
+  config_error?: string;
+  config_unapproved?: string;
+}
+
+/** `GET /api/milestones` — one (project, milestone) roll-up. */
+export interface MilestoneRow {
+  project: string;
+  id: string;
+  title: string | null;
+  exit: string | null;
+  configured: boolean;
+  progress: WorkProgress;
+  health: { state: HealthState; reasons: HealthReason[] };
+  epics: {
+    id: string;
+    title: string;
+    owner?: string | null;
+    stage: string | null;
+    progress: number | null;
+    health: HealthState;
+  }[];
+  issues: {
+    id: string;
+    title: string;
+    type: string;
+    status: string;
+    size?: string | null;
+    owner?: string | null;
+    blocked: boolean;
+  }[];
 }
 
 export interface LinkRef {
@@ -97,9 +185,15 @@ export interface IssueHistoryEntry {
     | "comment"
     | "attach"
     | "tag"
+    | "stage"
+    | "plan"
     | "other";
   summary: string;
   fields?: Record<string, string | null>;
+  /** `stage` entries (CAD-432): the move and its note. */
+  from?: string;
+  to?: string;
+  note?: string | null;
 }
 
 export interface IssueDetail extends IssueCard {
@@ -637,6 +731,8 @@ export interface AgentDetail {
 export interface Meta {
   read_only: boolean;
   actor: string;
+  /** CAD-432: this client passes the board's operator proof. */
+  operator?: boolean;
   tailnet_url: string | null;
   version: string;
   build_commit: string;
