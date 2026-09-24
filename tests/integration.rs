@@ -10827,9 +10827,22 @@ fn inbox_follow_exec_parks_a_poison_message() {
         .unwrap();
     }
     let done = wait_lines(&log, 1, 20);
+    assert_eq!(done, vec!["good"], "{done:?}");
+    // "good"'s line lands when its exec exits; the follower sends
+    // `agent_inbox_ack` through that seq right after. The kill has to
+    // wait for the watermark — killing first can drop the ack and
+    // leave the consumed message queued.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let show = d.rpc("agent_show", json!({"alias": "obs"})).unwrap();
+        if show["queued"] == 1 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "good's ack never landed: {show}");
+        thread::sleep(Duration::from_millis(50));
+    }
     let _ = child.kill();
     let _ = child.wait();
-    assert_eq!(done, vec!["good"], "{done:?}");
     let show = d.rpc("agent_show", json!({"alias": "obs"})).unwrap();
     assert_eq!(show["queued"], 1, "{show}");
     let parks: Vec<_> = d
