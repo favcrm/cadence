@@ -62,6 +62,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 use std::time::Duration;
 
+use crate::peer::proc_starttime;
+
 /// Spawners hold it for reading across `spawn` + registration; the
 /// reaper holds it for writing across a whole pass.
 static GATE: RwLock<()> = RwLock::new(());
@@ -340,20 +342,6 @@ fn children() -> Vec<u32> {
     pids.sort_unstable();
     pids.dedup();
     pids
-}
-
-/// `/proc/<pid>/stat` field 22, the start time in clock ticks since
-/// boot — with the pid, a process identity that survives pid reuse.
-fn proc_starttime(pid: u32) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // comm (field 2) may hold spaces and parens: fields after the last
-    // ')' start at 3 (state), so field 22 is index 19.
-    stat.rsplit_once(')')?
-        .1
-        .split_whitespace()
-        .nth(19)?
-        .parse()
-        .ok()
 }
 
 #[cfg(test)]

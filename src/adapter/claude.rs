@@ -1039,6 +1039,7 @@ mod tests {
             model: None,
             effort: None,
             pid: None,
+            pid_start: None,
             endpoint: None,
             params: Some(params),
             model_selection: None,

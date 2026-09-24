@@ -1880,6 +1880,64 @@ fn pty_hot_restart_adopts_running_turn() {
     );
 }
 
+/// CAD-385 acceptance 1 + 3: a daemon restart re-records each adopted
+/// pane's process start time — even over a row recorded without one
+/// (the pre-v14 shape) — so a live pane keeps its identity: an RPC from
+/// inside the pane resolves to its agent. The same row with the pid's
+/// start changed (a reused pid) is no pane at all — the caller is
+/// placed exactly as an unregistered process — and with no start the
+/// call is refused, naming the remedy.
+#[test]
+fn cad385_hot_restart_rerecords_pane_start_and_the_pane_keeps_its_identity() {
+    let (state, mock, _token, pane_pid) = stopped_mid_turn_devin();
+    let db = state.join("cadence.sqlite3");
+    let set_start = |start: Option<i64>| {
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute(
+                "UPDATE agents SET pid_start=?1 WHERE alias='dv1'",
+                rusqlite::params![start],
+            )
+            .unwrap();
+    };
+    // The row the stopped daemon left, as a pre-v14 daemon would have.
+    set_start(None);
+    let d = TestDaemon::start_on(state.clone());
+    d.wait_agent("dv1", "idle", 25);
+    let kinds = event_kinds(&d, "dv1");
+    assert!(kinds.iter().any(|k| k == "turn_adopted"), "{kinds:?}");
+    let agent = d.rpc("agent_show", json!({"alias": "dv1"})).unwrap()["agent"].clone();
+    assert_eq!(agent["pid"].as_i64(), Some(i64::from(pane_pid)), "{agent}");
+    let start = proc_start(pane_pid as u32).expect("the adopted pane is alive");
+    assert_eq!(agent["pid_start"].as_i64(), Some(start), "{agent}");
+
+    // The live pane keeps working: its own RPC derives its lane.
+    d.memory_rpc(&mock, "dv1", "slot_status", json!({}))
+        .expect("the adopted pane's caller identity resolves");
+
+    // The pid now "reused": same number, a different recorded start.
+    set_start(Some(start - 1));
+    let err = d
+        .memory_rpc(&mock, "dv1", "slot_status", json!({}))
+        .unwrap_err();
+    assert!(
+        err.contains("descends from no registered pane"),
+        "a stale row must place the caller as unregistered: {err}"
+    );
+    // No recorded start: refused, naming the remedy.
+    set_start(None);
+    let err = d
+        .memory_rpc(&mock, "dv1", "slot_status", json!({}))
+        .unwrap_err();
+    assert!(
+        err.contains("'dv1'") && err.contains("cadence daemon restart"),
+        "{err}"
+    );
+    set_start(Some(start));
+    d.memory_rpc(&mock, "dv1", "slot_status", json!({}))
+        .expect("restored");
+}
+
 #[test]
 fn pty_hot_restart_no_marker_fences() {
     // No marker == crash: the pane survives but the turn fences
@@ -17745,8 +17803,8 @@ fn pty_answer_derives_caller_from_peer_pid() {
     let set_pid = |alias: &str, pid: i64| {
         let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
         conn.execute(
-            "UPDATE agents SET pid=?1 WHERE alias=?2",
-            rusqlite::params![pid, alias],
+            "UPDATE agents SET pid=?1, pid_start=?3 WHERE alias=?2",
+            rusqlite::params![pid, alias, proc_start(pid as u32)],
         )
         .unwrap();
     };
@@ -24401,6 +24459,7 @@ fn doctor_host_json_reports_all_checks() {
             "memory",
             "processes",
             "sessions",
+            "pane-identity",
             "orphans",
             "temp-dirs",
             "task-targets",
@@ -30231,11 +30290,23 @@ fn plant_pane(d: &TestDaemon, alias: &str, pid: u32) {
     );
     let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
     conn.execute(
-        "UPDATE agents SET endpoint_kind='pty', pid=?1, enabled=0, \
+        "UPDATE agents SET endpoint_kind='pty', pid=?1, pid_start=?3, enabled=0, \
             generation='planted', session_id='planted' WHERE alias=?2",
-        rusqlite::params![pid as i64, alias],
+        rusqlite::params![pid as i64, alias, proc_start(pid)],
     )
     .unwrap();
+}
+
+/// `/proc/<pid>/stat` field 22 — what the daemon records as a pid's
+/// `pid_start` (CAD-385), so a planted row names exactly that process.
+fn proc_start(pid: u32) -> Option<i64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
 }
 
 /// The lane every in-process `d.rpc` slot call derives: the test
@@ -30372,9 +30443,9 @@ fn plant_member_pane(
     d.rpc("agent_register", req).unwrap();
     let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
     conn.execute(
-        "UPDATE agents SET provider=?1, endpoint_kind='pty', pid=?2, enabled=0, \
-            generation='planted', session_id='planted' WHERE alias=?3",
-        rusqlite::params![provider, pid as i64, alias],
+        "UPDATE agents SET provider=?1, endpoint_kind='pty', pid=?2, pid_start=?4, \
+            enabled=0, generation='planted', session_id='planted' WHERE alias=?3",
+        rusqlite::params![provider, pid as i64, alias, proc_start(pid)],
     )
     .unwrap();
 }
@@ -37302,7 +37373,7 @@ fn holder_migrates_through_daemon_start_without_a_test_override() {
         .unwrap()
         .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 13);
+    assert_eq!(version, cadence_agent::rollout::SCHEMA_VERSION);
 }
 
 // ---- CAD-96: idle auto-stop (default ON in production, pinned here) ----

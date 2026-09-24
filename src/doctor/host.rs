@@ -480,6 +480,7 @@ pub fn run(scan: &Scan) -> Value {
         check_memory(scan),
         check_processes(scan),
         check_sessions(scan),
+        check_pane_identity(scan),
         check_orphans(scan),
         check_temp_dirs(scan),
         check_task_targets(scan),
@@ -3834,6 +3835,117 @@ fn check_sessions(scan: &Scan) -> Check {
 }
 
 // ---------- leaked temp dirs ----------
+
+/// CAD-385: every agent row's recorded pid carries the process start
+/// time read when it was recorded (`agents.pid_start`), and the daemon,
+/// the board and `rollout release --force` map a caller's pid to an
+/// alias only while that start still matches. A row with NO recorded
+/// start — written before schema v14, by a daemon on an older build, or
+/// with `/proc` unreadable — cannot be told apart from a reused pid, so
+/// it fails closed: any caller descending from it is refused. Those
+/// rows warn here with the remedy. A row whose pid now names another
+/// process (or none) is stale: it maps nothing, so it is reported but
+/// does not warn. Read-only; `/proc` is `scan.proc_root`.
+fn check_pane_identity(scan: &Scan) -> Check {
+    let name = "pane-identity";
+    let threshold = json!(
+        "warn: a recorded agent pid has no recorded process start time (fails closed \
+         for caller identity)"
+    );
+    let path = scan.state_dir.join("cadence.sqlite3");
+    let skipped = |detail: String| {
+        check(
+            name,
+            Level::Ok,
+            json!({"skipped": true}),
+            threshold.clone(),
+            detail,
+            String::new(),
+        )
+    };
+    if !path.exists() {
+        return skipped("no store — no recorded agent pids".to_string());
+    }
+    let Ok(conn) = crate::store::open_read_only(&path) else {
+        return skipped("store not readable read-only — see `sessions`".to_string());
+    };
+    // A store older than v14 has no `pid_start`: every row is legacy.
+    let has_start = conn
+        .prepare("SELECT 1 FROM pragma_table_info('agents') WHERE name='pid_start'")
+        .and_then(|mut st| st.exists([]))
+        .unwrap_or(false);
+    let start = if has_start { "pid_start" } else { "NULL" };
+    let rows: Vec<(String, u32, Option<u64>)> = match conn.prepare(&format!(
+        "SELECT alias, pid, {start} FROM agents WHERE pid IS NOT NULL AND pid > 1 \
+         ORDER BY alias"
+    )) {
+        Ok(mut st) => st
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                ))
+            })
+            .map(|rows| {
+                rows.flatten()
+                    .filter_map(|(alias, pid, start)| {
+                        Some((
+                            alias,
+                            u32::try_from(pid).ok()?,
+                            start.and_then(|s| u64::try_from(s).ok()),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Err(_) => return skipped("store has no readable agents table".to_string()),
+    };
+    let mut legacy = Vec::new();
+    let mut stale = Vec::new();
+    for (alias, pid, recorded) in &rows {
+        let now = proc_stat(&scan.proc_root.join(pid.to_string())).map(|p| p.start_jiffies);
+        match (recorded, now) {
+            (None, _) => legacy.push(format!("{alias} (pid {pid})")),
+            (Some(r), Some(n)) if *r == n => {}
+            (Some(_), _) => stale.push(format!("{alias} (pid {pid})")),
+        }
+    }
+    let value = json!({
+        "recorded": rows.len(),
+        "no_start_time": legacy,
+        "stale": stale,
+        "schema_has_pid_start": has_start,
+    });
+    if legacy.is_empty() {
+        let detail = if stale.is_empty() {
+            format!(
+                "{} recorded agent pid(s), each proven by its start time",
+                rows.len()
+            )
+        } else {
+            format!(
+                "{} recorded agent pid(s); stale (pid reused or gone — maps no alias): {}",
+                rows.len(),
+                stale.join(", ")
+            )
+        };
+        return check(name, Level::Ok, value, threshold, detail, String::new());
+    }
+    check(
+        name,
+        Level::Warn,
+        value,
+        threshold,
+        format!(
+            "{} agent row(s) with a pid but no recorded process start time — callers \
+             descending from them are refused: {}",
+            legacy.len(),
+            legacy.join(", ")
+        ),
+        crate::peer::PID_START_REMEDY.to_string(),
+    )
+}
 
 /// `cadence-nextest-<version>/cargo-nextest`, as written by
 /// `scripts/install-cadence-nextest` into a task-local TMPDIR.
@@ -8267,6 +8379,88 @@ mod tests {
         assert!(!file_locked(&lock));
     }
 
+    /// CAD-385: `pane-identity` warns on every recorded agent pid with
+    /// no recorded process start time — all of them on a store older
+    /// than v14 — and names the remedy; a row whose recorded start no
+    /// longer matches `/proc` is reported stale but maps nothing, so it
+    /// does not warn; no store is ok.
+    #[test]
+    fn pane_identity_names_rows_without_a_start_time_with_the_remedy() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        assert_eq!(check_pane_identity(&scan).level, Level::Ok);
+
+        let proc = scan.proc_root.clone();
+        add_pid(&proc, 4101, None, None, None, 60, &[]);
+        add_pid(&proc, 4102, None, None, None, 60, &[]);
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as i64;
+        let start = (1_000_000 - 60) * hz;
+        let conn = fake_registry(&scan.state_dir);
+        let cwd = root.path().join("repo");
+        add_agent(
+            &conn,
+            "pm",
+            "pty",
+            Some(4101),
+            Some("g"),
+            "idle",
+            &cwd,
+            now_epoch(),
+        );
+        add_agent(
+            &conn,
+            "w1",
+            "managed",
+            Some(4102),
+            None,
+            "idle",
+            &cwd,
+            now_epoch(),
+        );
+        add_agent(
+            &conn,
+            "gone",
+            "pty",
+            None,
+            None,
+            "offline",
+            &cwd,
+            now_epoch(),
+        );
+
+        // v13 shape: no `pid_start` column — every recorded pid warns.
+        let c = check_pane_identity(&scan);
+        assert_eq!(c.level, Level::Warn, "{}", c.detail);
+        assert_eq!(
+            c.value["no_start_time"],
+            json!(["pm (pid 4101)", "w1 (pid 4102)"])
+        );
+        assert!(c.remedy.contains("cadence daemon restart"), "{}", c.remedy);
+        assert!(c.remedy.contains("pane-identity"), "{}", c.remedy);
+
+        conn.execute_batch("ALTER TABLE agents ADD COLUMN pid_start INTEGER")
+            .unwrap();
+        conn.execute("UPDATE agents SET pid_start=?1 WHERE alias='pm'", [start])
+            .unwrap();
+        conn.execute(
+            "UPDATE agents SET pid_start=?1 WHERE alias='w1'",
+            [start - 1],
+        )
+        .unwrap();
+        let c = check_pane_identity(&scan);
+        assert_eq!(c.level, Level::Ok, "{}", c.detail);
+        assert_eq!(c.value["stale"], json!(["w1 (pid 4102)"]));
+        assert!(c.detail.contains("stale"), "{}", c.detail);
+
+        conn.execute("UPDATE agents SET pid_start=NULL WHERE alias='pm'", [])
+            .unwrap();
+        let c = check_pane_identity(&scan);
+        assert_eq!(c.level, Level::Warn);
+        assert_eq!(c.value["no_start_time"], json!(["pm (pid 4101)"]));
+        assert!(render(&json!({"level": "warn", "checks": [c.to_json()]}))
+            .contains("remedy: restart the daemon"));
+    }
+
     #[test]
     fn worktrees_skip_when_no_repo() {
         let root = TempDir::new().unwrap();
@@ -8309,6 +8503,7 @@ mod tests {
                 "memory",
                 "processes",
                 "sessions",
+                "pane-identity",
                 "orphans",
                 "temp-dirs",
                 "task-targets",

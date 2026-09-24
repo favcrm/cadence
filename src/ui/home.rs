@@ -157,10 +157,11 @@ fn board_is_operator(state_dir: &std::path::Path) -> bool {
     };
     // SAFETY: geteuid has no preconditions and cannot fail.
     let uid = unsafe { libc::geteuid() };
-    crate::peer::operator_proof(std::process::id(), uid, daemon_pid, &roots.panes, |hop| {
-        roots.managed.contains_key(&hop)
-    })
-    .is_ok()
+    // Fenced deny lists (CAD-385): a reused pid denies nothing, a row
+    // with no recorded start keeps denying.
+    roots
+        .operator_proof(std::process::id(), uid, daemon_pid)
+        .is_ok()
 }
 
 /// CAD-276's positive operator proof, run on the board's TCP peer — the
