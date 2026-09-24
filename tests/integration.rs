@@ -41178,3 +41178,246 @@ fn master_dispatch_races_dispatch_a_ticket_once() {
         .count();
     assert_eq!(dispatched, 1, "{show}");
 }
+
+// ---- CAD-358: `cadence project new` ----
+
+/// CAD-358: `cadence project new <key> --repo <path>` registers the repo
+/// and seeds PROJECT.md (goal, staffing `agents:`, the default stages,
+/// empty milestones) in one tracker commit with `Issue:`/`Actor:`
+/// trailers, and lint passes on the result. A second identical run
+/// changes nothing; a different repo for the key, the reserved key
+/// `agents`, an invalid key and a path that is not a git repo are
+/// refused with nothing written. Caller rule: the proven operator runs
+/// it; a pane agent, a managed endpoint (and its tool subprocess), and
+/// detached children of both are refused, as are identity-shaped
+/// fields. (The master's leg lands with CAD-339 — see the hook on
+/// `rpc_project_new`; until then it is an agent and refused like one.)
+#[test]
+fn project_new_registers_seeds_and_is_operator_only() {
+    let tmp = TempDir::new().unwrap();
+    let pm_dir = tmp.path().join("pm");
+    let pm = cadence_agent::issue::Pm::init(&pm_dir).unwrap();
+    cadence_agent::issue::write::project_add(&pm, "demo", "D", &[], &[], &[], None).unwrap();
+    let cwd = tmp.path().to_path_buf();
+    cadence_agent::issue::write::new_issue(
+        &pm,
+        &cwd,
+        Some("demo"),
+        "Register reminders",
+        None,
+        None,
+        &[],
+        None,
+        None,
+        &[],
+        None,
+        "",
+    )
+    .unwrap();
+    let git = |dir: &Path, args: &[&str]| {
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "git {args:?}: {o:?}");
+        String::from_utf8_lossy(&o.stdout).to_string()
+    };
+    let repo = |name: &str| {
+        let dir = tmp.path().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q", "-b", "main"]);
+        dir.canonicalize().unwrap().to_str().unwrap().to_string()
+    };
+    let (a, b) = (repo("rem"), repo("other"));
+    let plain = tmp.path().join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    let plain = plain.to_str().unwrap().to_string();
+    let commits = || git(&pm_dir, &["rev-list", "--count", "HEAD"]);
+
+    test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
+    let d = TestDaemon::start_opts(slot_opts(2, 1, 900, &[]));
+    let home = TempDir::new().unwrap();
+    let mut pane = LaneShell::spawn(home.path());
+    plant_pane(&d, "pane-1", pane.pid());
+    let mut wk = ManagedWorker::start(&d, "wk");
+    d.wait_agent("wk", "idle", 25);
+
+    let params = json!({"key": "reminders", "repo": a});
+    let before = commits();
+    let refused = |r: &Value, why: &str, route: &str| {
+        assert_eq!(r["ok"], false, "{route}: {r}");
+        let msg = r["error"]["message"].as_str().unwrap_or_default();
+        assert!(msg.contains(why), "{route}: wanted '{why}': {r}");
+    };
+    // Agents: a pane, a managed endpoint and its tool subprocess.
+    let r = pane.rpc(&d.state, "project_new", params.clone());
+    refused(&r, "operator action", "pane");
+    refused(&r, "pane-1", "pane");
+    for how in ["self", "child"] {
+        let r = wk.rpc(how, "project_new", params.clone());
+        refused(&r, "operator action", &format!("managed {how}"));
+    }
+    // Detached children of an agent derive no identity, and are still
+    // not the operator.
+    let r = wk.rpc("detached", "project_new", params.clone());
+    refused(&r, "not provably the operator", "managed detach");
+    let r = wk.rpc("detached-bare", "project_new", params.clone());
+    refused(
+        &r,
+        "not provably the operator",
+        "managed detach, alias scrubbed",
+    );
+    let script = d.dir.path().join("claude-enroll.py");
+    let frame = json!({"method": "project_new", "params": params}).to_string();
+    assert!(
+        !frame.contains('\''),
+        "the frame rides a single-quoted argv"
+    );
+    let outs = TempDir::new().unwrap();
+    for (i, env) in ["CADENCE_ALIAS=pane-1", "env -u CADENCE_ALIAS"]
+        .into_iter()
+        .enumerate()
+    {
+        let out = outs.path().join(format!("pane-{i}.json"));
+        let (rc, text) = pane.run(&format!(
+            "{env} python3 {} --detached {} '{frame}' {} {}",
+            script.display(),
+            client::socket_path(&d.state).display(),
+            out.display(),
+            pane.pid()
+        ));
+        assert_eq!(rc, 0, "{text}");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !out.exists() {
+            assert!(Instant::now() < deadline, "pane detach {i} never answered");
+            thread::sleep(Duration::from_millis(20));
+        }
+        let r: Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        refused(
+            &r,
+            "not provably the operator",
+            &format!("pane detach ({env})"),
+        );
+    }
+    // Identity is the connection's, never a field — even the operator's.
+    let mut spoof = params.clone();
+    spoof["actor"] = json!("operator");
+    let err = d
+        .operator_rpc("project_new", spoof)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("connection-bound"), "{err}");
+    assert_eq!(commits(), before, "no refused caller wrote anything");
+    assert!(!pm_dir.join("reminders").exists());
+
+    // The operator, through the CLI.
+    let (ok, out, err) = d.operator_cadence(&[
+        "project",
+        "new",
+        "reminders",
+        "--repo",
+        &a,
+        "--goal",
+        "Remind people on time.",
+        "--agent",
+        "pm=1,dev=2",
+        "--issue",
+        "D-1",
+    ]);
+    assert!(ok, "{out}{err}");
+    let out: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(out["changed"], true, "{out}");
+    assert_eq!(out["prefix"], "REM", "{out}");
+    assert_eq!(out["actor"], "operator", "{out}");
+    let after = commits();
+    assert_eq!(
+        after.trim().parse::<u64>().unwrap(),
+        before.trim().parse::<u64>().unwrap() + 1,
+        "one tracker commit"
+    );
+    let msg = git(&pm_dir, &["log", "-1", "--format=%B"]);
+    assert!(msg.starts_with("project reminders registered"), "{msg}");
+    assert!(
+        msg.contains("\nIssue: D-1\n") && msg.contains("\nActor: operator\n"),
+        "{msg}"
+    );
+    let files = git(&pm_dir, &["show", "--name-only", "--format=", "HEAD"]);
+    assert_eq!(
+        files.lines().collect::<Vec<_>>(),
+        ["reminders/PROJECT.md", "reminders/project.yaml"],
+        "no team.yaml, nothing else"
+    );
+    let yaml = std::fs::read_to_string(pm_dir.join("reminders/project.yaml")).unwrap();
+    let project = cadence_agent::issue::project::load(&pm_dir.join("reminders/project.yaml"))
+        .unwrap_or_else(|e| panic!("{e}: {yaml}"));
+    assert_eq!(project.repos[0].path.as_deref(), Some(a.as_str()));
+    let manifest = std::fs::read_to_string(pm_dir.join("reminders/PROJECT.md")).unwrap();
+    assert!(manifest.contains("agents: {pm: 1, dev: 2}"), "{manifest}");
+    assert!(manifest.contains("milestones: []"), "{manifest}");
+    assert!(
+        manifest.contains("## Goal\n\nRemind people on time."),
+        "{manifest}"
+    );
+    let cfg = cadence_agent::issue::work::load_config(&pm_dir, "reminders").unwrap();
+    assert!(
+        cadence_agent::issue::work::gates_default(&cfg),
+        "{manifest}"
+    );
+    assert!(cfg.milestones.is_empty());
+
+    // Lint passes on the seeded project, with no stage warning.
+    let lint = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .args(["issue", "lint"])
+        .env("CADENCE_PM_DIR", &pm_dir)
+        .env("HOME", home.path())
+        .env_remove("CADENCE_ALIAS")
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&lint.stdout),
+        String::from_utf8_lossy(&lint.stderr)
+    );
+    assert!(lint.status.success(), "{text}");
+    assert!(!text.contains("reminders/PROJECT.md"), "{text}");
+
+    // Idempotent: the same key and repo again changes nothing.
+    let (ok, out, err) = d.operator_cadence(&["project", "new", "reminders", "--repo", &a]);
+    assert!(ok, "{out}{err}");
+    assert!(out.contains("\"changed\": false"), "{out}");
+    assert_eq!(commits(), after);
+    assert_eq!(
+        std::fs::read_to_string(pm_dir.join("reminders/PROJECT.md")).unwrap(),
+        manifest
+    );
+
+    // Refused with nothing written.
+    for (args, why) in [
+        (vec!["reminders", "--repo", b.as_str()], "different repo"),
+        (vec!["agents", "--repo", b.as_str()], "reserved"),
+        (
+            vec!["Not_A_Key", "--repo", b.as_str()],
+            "Invalid project key",
+        ),
+        (vec!["fresh", "--repo", plain.as_str()], "not a git repo"),
+    ] {
+        let mut argv = vec!["project", "new"];
+        argv.extend(args.iter().copied());
+        let (ok, out, err) = d.operator_cadence(&argv);
+        assert!(
+            !ok && err.contains(why),
+            "{args:?}: wanted '{why}': {out}{err}"
+        );
+    }
+    assert_eq!(commits(), after, "a refusal commits nothing");
+    for key in ["agents", "Not_A_Key", "fresh"] {
+        assert!(!pm_dir.join(key).exists(), "{key}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(pm_dir.join("reminders/project.yaml")).unwrap(),
+        yaml
+    );
+}

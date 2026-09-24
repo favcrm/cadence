@@ -2240,6 +2240,7 @@ impl Shared {
             "plan_reject" => self.rpc_plan_decide(params, peer_pid, false),
             "epic_stage" => self.rpc_epic_stage(params, peer_pid),
             "project_work_approve" => self.rpc_project_work_approve(params, peer_pid),
+            "project_new" => self.rpc_project_new(params, peer_pid),
             "project_work_approvals" => Ok(json!({
                 "approvals": self.store.work_approvals()?,
             })),
@@ -3727,6 +3728,55 @@ impl Shared {
         self.store.record_work_approval(payload.clone())?;
         self.wake();
         Ok(payload)
+    }
+
+    /// CAD-358 `project_new` — register a repo as a project and seed its
+    /// PROJECT.md in one tracker commit ([`crate::issue::project_new`]).
+    /// The operator runs it, connection-bound like `approve-work`: any
+    /// agent connection is refused, and so is a caller that is not
+    /// provably the operator — a detached child of an agent included.
+    /// Identity-shaped request fields are refused, never read.
+    ///
+    /// CAD-339 HOOK (PR #213, the master agent, not merged when this
+    /// landed): the master may run it too. When #213 is on main, accept
+    /// the master before the operator check —
+    /// `if self.caller_is_master(peer_pid) { crate::master::ALIAS }` —
+    /// and add `"project_new"` to `MASTER_ALLOWED` and
+    /// `"Bash(cadence project new *)"` to `master::CLAUDE_ALLOWED_TOOLS`.
+    /// Until then the master, like every agent, is refused here.
+    fn rpc_project_new(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.operator_connection("project new", params, peer_pid)?;
+        let actor = "operator";
+        let text = |name: &str| optional_str(params, name).map(str::to_string);
+        let agents = match params.get("agents") {
+            None | Some(Value::Null) => vec![],
+            Some(Value::Array(list)) => list
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| Error::rejected("'agents' must be a list of strings"))
+                })
+                .collect::<Result<_>>()?,
+            Some(_) => return Err(Error::rejected("'agents' must be a list of strings")),
+        };
+        let req = crate::issue::project_new::Request {
+            key: required_str(params, "key")?.to_string(),
+            repo: std::path::PathBuf::from(required_str(params, "repo")?),
+            prefix: text("prefix"),
+            goal: text("goal"),
+            agents,
+            issue: text("issue"),
+        };
+        let pm = crate::issue::Pm::at(&self.pm_dir()?)?;
+        let out = crate::issue::project_new::run(&pm, &req, actor)?;
+        if out["changed"] == true {
+            let _ = self
+                .store
+                .event_public(DAEMON_ALIAS, "project_registered", out.clone());
+            self.wake();
+        }
+        Ok(out)
     }
 
     fn rpc_register(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {

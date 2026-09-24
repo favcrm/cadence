@@ -129,6 +129,12 @@ write_leases: per-issue planned paths
 Goal, non-goals, context links (architecture, ADRs, runbooks).
 ```
 
+`cadence project new <key> --repo <path>` (CAD-358, operator only) registers the
+repo in `project.yaml` and seeds this file: the goal, an `agents:` map (default
+`{pm: 1, dev: 1, qa: 1}`), the default stages and `milestones: []`. The repo list
+stays in `project.yaml`, the one place cwd resolution reads; `<pm>/agents/` holds
+the agent files, so `agents` is not a project key.
+
 Teams can come back later as a grouping of projects if several projects share
 staffing; nothing in this layout depends on them.
 

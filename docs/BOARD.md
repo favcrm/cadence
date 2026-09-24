@@ -96,6 +96,16 @@ cadence issue project add cadence --prefix CAD --repo ~/Project/cadence \
     --component adapter --owner cookie-cesium
                                             # --tag t (repeatable) declares the
                                             # project's tag vocabulary
+cadence project new reminders --repo ~/code/reminders [--prefix REM] \
+    [--goal "…"] [--agent pm=1,dev=2] [--issue CAD-9]
+                                            # CAD-358, operator only (the master
+                                            # too once CAD-339 lands), via the
+                                            # daemon: project.yaml + a seeded
+                                            # PROJECT.md (goal, agents, default
+                                            # stages, no milestones) in one commit;
+                                            # re-running it changes nothing; a
+                                            # different repo, key `agents`, a bad
+                                            # key or a non-git path writes nothing
 cadence issue new "title"                   # --project wins, else CADENCE_PROJECT,
                                             # else the cwd repo's remote/path; no
                                             # match fails closed. --parent, --priority,
