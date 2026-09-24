@@ -145,6 +145,18 @@ fn parse_subject(subject: &str, id: &str) -> Option<(&'static str, String, Strin
     if !ids.split(", ").any(|i| i == id) {
         return None;
     }
+    // CAD-405/360 epic stage moves and plan decisions: the writer names
+    // the actor only in the trailer, and a stage note or the ticket
+    // count may end in `)` — never paren-parse these.
+    for (prefix, kind) in [
+        ("stage ", "stage"),
+        ("plan approved ", "plan"),
+        ("plan rejected ", "plan"),
+    ] {
+        if rest.starts_with(prefix) {
+            return Some((kind, rest.trim_end().to_string(), String::new()));
+        }
+    }
     let (summary, actor) = split_paren(rest);
     let summary = summary.trim_end().to_string();
     let kind = match summary.split_whitespace().next().unwrap_or("") {
@@ -200,6 +212,19 @@ fn entry(raw: &RawCommit, id: &str) -> Value {
         "by": by,
         "kind": kind, "summary": summary,
     });
+    if kind == "stage" {
+        // `stage <from> → <to>[ — <note>]` — the board's stage history.
+        let move_ = summary["stage ".len()..].to_string();
+        let (arrow, note) = match move_.split_once(" — ") {
+            Some((a, n)) => (a.to_string(), Some(n.to_string())),
+            None => (move_, None),
+        };
+        if let Some((from, to)) = arrow.split_once(" → ") {
+            e["from"] = json!(from.trim());
+            e["to"] = json!(to.trim());
+            e["note"] = json!(note);
+        }
+    }
     if kind == "set" {
         // `set k=v …`; patch writes bare `title`/`body` — keys whose
         // new value the subject does not carry map to null.
@@ -856,6 +881,48 @@ mod tests {
         assert!(parse_subject("wip", "CAD-1").is_none());
         // Prefixed but unknown verb → not cadence-shaped.
         assert!(parse_subject("CAD-1: frobnicate", "CAD-1").is_none());
+    }
+
+    /// CAD-432: a stage move is a `stage` entry with from, to and note —
+    /// the note may end in `)` and is never read as the actor, which
+    /// comes from the trailer; plan decisions are `plan` entries.
+    #[test]
+    fn stage_and_plan_entries() {
+        let raw = |subject: &str| RawCommit {
+            full: "x".into(),
+            sha: "abc1234".into(),
+            at: "2026-09-18T00:00:00Z".into(),
+            author: "cadence".into(),
+            subject: subject.into(),
+            trailer_actor: "pane-1".into(),
+        };
+        let e = entry(
+            &raw("D-1: stage build → verify — tasks done (all 3)"),
+            "D-1",
+        );
+        assert_eq!(e["kind"], "stage", "{e}");
+        assert_eq!(e["by"], "pane-1");
+        assert_eq!(
+            (&e["from"], &e["to"], &e["note"]),
+            (
+                &json!("build"),
+                &json!("verify"),
+                &json!("tasks done (all 3)")
+            )
+        );
+        let e = entry(&raw("D-1: stage verify → build"), "D-1");
+        assert_eq!((&e["to"], &e["note"]), (&json!("build"), &Value::Null));
+        let e = entry(
+            &raw("D-1: plan approved by operator (2 tickets ready)"),
+            "D-1",
+        );
+        assert_eq!(e["kind"], "plan", "{e}");
+        assert_eq!(e["summary"], "plan approved by operator (2 tickets ready)");
+        assert_eq!(
+            entry(&raw("D-1: plan rejected by operator"), "D-1")["kind"],
+            "plan"
+        );
+        assert_eq!(entry(&raw("D-1: staged"), "D-1")["kind"], "other");
     }
 
     #[test]

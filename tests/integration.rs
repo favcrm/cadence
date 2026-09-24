@@ -40398,6 +40398,369 @@ fn cad328_operator_writes_refuse_a_detached_managed_child_under_daemon_run() {
     assert_eq!(count(), before.1 + 1);
 }
 
+// ---- CAD-432: the Projects screen's epic stages and milestones ----
+
+/// A demo epic `D-1` (type=epic, milestone m1) with two sized children;
+/// the epic has never moved, so it reads as `shape`.
+fn cad432_epic(f: &PlanFixture) {
+    assert!(f.cli(&["issue", "new", "Epic", "--project", "demo"]).0);
+    for title in ["Big", "Small"] {
+        let (ok, out) = f.cli(&["issue", "new", title, "--project", "demo", "--epic", "D-1"]);
+        assert!(ok, "{out}");
+    }
+    assert!(f.cli(&["issue", "set", "D-2", "size=L", "status=done"]).0);
+    assert!(f.cli(&["issue", "set", "D-3", "size=S"]).0);
+    let (ok, out) = f.cli(&["issue", "set", "D-1", "type=epic", "milestone=m1"]);
+    assert!(ok, "{out}");
+}
+
+fn cad432_move(port: u16, headers: &str, body: &str) -> (u16, String) {
+    board_http(
+        port,
+        &cad328_post(port, "/api/epics/D-1/stage", headers, body),
+    )
+}
+
+/// CAD-432: `POST /api/epics/<id>/stage` relays the daemon's `epic_stage`
+/// behind the board's operator write path. The relay runs over the
+/// board's own connection, which the daemon attributes to the operator,
+/// so EVERY board move — the routine `build → verify` included, which a
+/// pane may make over its own connection — is the operator's: an
+/// agent-attributed caller gets 403, and so do a missing guard, a
+/// read-only board and an identity-shaped field; each refusal writes
+/// nothing. The operator's move lands as one commit by `operator`, the
+/// history reads it as a `stage` entry, the card offers exactly the
+/// legal next moves, `/api/meta` says who is the operator, and
+/// `/api/milestones` rolls the epic up.
+#[test]
+fn cad432_board_stage_moves_are_operator_only_and_relayed() {
+    let f = PlanFixture::start();
+    cad432_epic(&f);
+    let port = start_board(&f.pm_dir, &f.d.state);
+    let stage = || f.front("D-1").stage;
+    let before = f.commits();
+    let untouched = |what: &str, commits: usize, want: Option<&str>| {
+        assert_eq!(f.commits(), commits, "{what}: a refusal writes nothing");
+        assert_eq!(stage().as_deref(), want, "{what}");
+    };
+    let to_build = r#"{"stage":"build"}"#;
+
+    // The board's write guards, then a read-only board.
+    let (status, reply) = cad432_move(port, "Content-Type: application/json\r\n", to_build);
+    assert_eq!(status, 403, "{reply}");
+    assert!(reply.contains("x_cadence_board"), "{reply}");
+    let ro = start_board_with(&f.pm_dir, &f.d.state, true);
+    let (status, reply) = cad432_move(ro, THREAD_GUARDS, to_build);
+    assert_eq!(status, 403, "{reply}");
+    assert!(reply.contains("read_only"), "{reply}");
+    let (_, meta) = board_get(ro, "/api/meta?operator=1");
+    let meta: Value = serde_json::from_str(&meta).unwrap();
+    assert_eq!(meta["operator"], false, "read-only is nobody's: {meta}");
+    untouched("guards", before, None);
+
+    // No identity-shaped field is read; a GET is not a move.
+    for body in [
+        r#"{"stage":"build","by":"operator"}"#,
+        r#"{"stage":"build","actor":"operator"}"#,
+        r#"{"stage":"build","operator":true}"#,
+        r#"{"note":"x"}"#,
+        r#"{"stage":"  "}"#,
+    ] {
+        let (status, reply) = cad432_move(port, THREAD_GUARDS, body);
+        assert_eq!(status, 400, "{body}: {reply}");
+    }
+    assert_eq!(board_get(port, "/api/epics/D-1/stage").0, 404);
+    untouched("bad requests", before, None);
+
+    // An agent-attributed caller is refused before any relay — for the
+    // operator stage and, below, for a routine move too.
+    let mut wk = ManagedWorker::start(&f.d, "wk");
+    let mut agent_move = |body: &str| -> String {
+        let request = cad328_post(port, "/api/epics/D-1/stage", THREAD_GUARDS, body);
+        let r = wk.exec(&[
+            "bash",
+            "-c",
+            DEV_TCP_CLIENT,
+            "_",
+            &port.to_string(),
+            &request,
+        ]);
+        assert_eq!(r["rc"], 0, "{r}");
+        r["out"].as_str().unwrap().to_string()
+    };
+    let out = agent_move(to_build);
+    assert!(out.contains(" 403 "), "{out}");
+    assert!(
+        out.contains("operator_only") && out.contains("'wk'"),
+        "{out}"
+    );
+    untouched("agent → build", before, None);
+    assert!(f.daemon_events("epic_stage_moved").is_empty());
+
+    // The operator: this test process, outside every agent. The proof
+    // walks /proc, so `/api/meta` runs it only when asked.
+    let (_, meta) = board_get(port, "/api/meta");
+    let meta: Value = serde_json::from_str(&meta).unwrap();
+    assert_eq!(
+        meta["operator"],
+        Value::Null,
+        "not computed unasked: {meta}"
+    );
+    let (_, meta) = board_get(port, "/api/meta?operator=1");
+    let meta: Value = serde_json::from_str(&meta).unwrap();
+    assert_eq!(meta["operator"], true, "{meta}");
+    let (status, reply) = cad432_move(
+        port,
+        THREAD_GUARDS,
+        r#"{"stage":"build","note":"shaped (all 2 tasks)"}"#,
+    );
+    assert_eq!(status, 200, "{reply}");
+    let moved: Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(
+        (&moved["from"], &moved["to"], &moved["by"]),
+        (&json!("shape"), &json!("build"), &json!("operator")),
+        "{moved}"
+    );
+    assert_eq!(f.commits(), before + 1);
+    assert_eq!(stage().as_deref(), Some("build"));
+    assert_eq!(f.daemon_events("epic_stage_moved").len(), 1);
+    let after_build = f.commits();
+
+    // A routine move is still the operator's on the board: the daemon
+    // would take the board's relay as the operator's own.
+    let out = agent_move(r#"{"stage":"verify"}"#);
+    assert!(out.contains(" 403 "), "{out}");
+    assert!(out.contains("operator_only"), "{out}");
+    untouched("agent → verify", after_build, Some("build"));
+
+    // The daemon's move rules hold through the relay.
+    for (body, want) in [
+        (r#"{"stage":"release"}"#, "skips a stage"),
+        (r#"{"stage":"ship"}"#, "Unknown stage"),
+        (r#"{"stage":"build"}"#, "already in stage"),
+    ] {
+        let (status, reply) = cad432_move(port, THREAD_GUARDS, body);
+        assert!(status == 400 || status == 409, "{body}: {status} {reply}");
+        assert!(reply.contains(want), "{body}: {reply}");
+    }
+    untouched("illegal moves", after_build, Some("build"));
+
+    // Stage history: who moved it, when, from and to.
+    let (status, body) = board_get(port, "/api/issues/D-1/history?limit=50");
+    assert_eq!(status, 200, "{body}");
+    let hist: Value = serde_json::from_str(&body).unwrap();
+    let moves: Vec<&Value> = hist["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "stage")
+        .collect();
+    assert_eq!(moves.len(), 1, "{hist}");
+    assert_eq!(
+        (
+            &moves[0]["from"],
+            &moves[0]["to"],
+            &moves[0]["by"],
+            &moves[0]["note"]
+        ),
+        (
+            &json!("shape"),
+            &json!("build"),
+            &json!("operator"),
+            &json!("shaped (all 2 tasks)")
+        ),
+        "{hist}"
+    );
+    assert!(moves[0]["at"].as_str().is_some_and(|a| !a.is_empty()));
+
+    // The card offers exactly the legal moves, flagged for the operator.
+    let (_, body) = board_get(port, "/api/issues?project=demo");
+    let cards: Value = serde_json::from_str(&body).unwrap();
+    let epic = cards["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "D-1")
+        .unwrap();
+    assert_eq!(
+        epic["work"]["stage"]["moves"],
+        json!([
+            {"to": "shape", "forward": false, "needs_operator": false},
+            {"to": "verify", "forward": true, "needs_operator": false},
+        ]),
+        "{epic}"
+    );
+
+    // Milestones: weighted progress (L done of L+S) and worst health.
+    let (status, body) = board_get(port, "/api/milestones?project=demo");
+    assert_eq!(status, 200, "{body}");
+    let ms: Value = serde_json::from_str(&body).unwrap();
+    let m1 = &ms["milestones"][0];
+    assert_eq!(m1["id"], "m1", "{ms}");
+    assert_eq!(
+        (
+            &m1["progress"]["done_weight"],
+            &m1["progress"]["total_weight"]
+        ),
+        (&json!(8), &json!(9)),
+        "{ms}"
+    );
+    assert_eq!(m1["health"]["state"], "on_track", "{ms}");
+    assert_eq!(m1["epics"][0]["stage"], "build", "{ms}");
+    assert_eq!(board_get(port, "/api/milestones?project=Bad!").0, 400);
+}
+
+/// CAD-432 adversarial: under a real `daemon run`, a detached,
+/// env-scrubbed child of an enrolled managed worker's tool is tied to no
+/// agent, so `write_caller` alone would read it as the operator. The
+/// stage route runs the positive operator proof on its peer: the child
+/// descends from the daemon and is refused `403 operator_proof`, writing
+/// nothing, and `/api/meta` tells it it is not the operator. The
+/// operator's own move still lands.
+#[test]
+fn cad432_stage_move_refuses_a_detached_managed_child_under_daemon_run() {
+    let dir = TempDir::new().unwrap();
+    let mock = ManagedWorker::install(dir.path(), dir.path(), "wk");
+    let f = PlanFixture::start_on(|| TestDaemon::start_process_in(dir));
+    let _reaper = DaemonReaper::new(&f.d.state);
+    let daemon_pid = subreaper_daemon_pid(&f.d);
+    let mut wk = mock.enroll(&f.d, "wk");
+    cad432_epic(&f);
+    let port = start_board(&f.pm_dir, &f.d.state);
+    let before = f.commits();
+
+    const INNER: &str = r#"exec 3<>"/dev/tcp/127.0.0.1/$1"; printf '%s' "$2" >&3; cat <&3 > "$3.tmp"; mv "$3.tmp" "$3""#;
+    const OUTER: &str =
+        r#"setsid -f env -i /bin/bash -c "$1" _ "$2" "$3" "$4" </dev/null >/dev/null 2>&1"#;
+    let work = TempDir::new().unwrap();
+    let mut n = 0;
+    let mut detached = |request: String| -> String {
+        n += 1;
+        let out = work.path().join(format!("reply-{n}"));
+        let r = wk.exec(&[
+            "bash",
+            "-c",
+            OUTER,
+            "_",
+            INNER,
+            &port.to_string(),
+            &request,
+            out.to_str().unwrap(),
+        ]);
+        assert_eq!(r["rc"], 0, "{r}");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !out.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the detached child never answered"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        std::fs::read_to_string(&out).unwrap()
+    };
+    let reply = detached(cad328_post(
+        port,
+        "/api/epics/D-1/stage",
+        THREAD_GUARDS,
+        r#"{"stage":"build"}"#,
+    ));
+    assert!(reply.contains(" 403 "), "{reply}");
+    assert!(reply.contains("operator_proof"), "{reply}");
+    assert!(
+        reply.contains(&format!("descends from the daemon (pid {daemon_pid})")),
+        "{reply}"
+    );
+    assert_eq!(f.commits(), before, "a refusal writes nothing");
+    assert_eq!(f.front("D-1").stage, None);
+    assert!(f.daemon_events("epic_stage_moved").is_empty());
+    let reply = detached(format!(
+        "GET /api/meta?operator=1 HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n"
+    ));
+    assert!(reply.contains("\"operator\": false"), "{reply}");
+
+    let (status, reply) = cad432_move(port, THREAD_GUARDS, r#"{"stage":"build"}"#);
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(f.front("D-1").stage.as_deref(), Some("build"));
+}
+
+/// CAD-432 review round 1: the board relays a move over its OWN daemon
+/// connection. A board an enrolled worker's tool started descends from
+/// that worker, so without `operator_decision` the daemon attributed the
+/// proven operator's ROUTINE move (`build → verify`, no operator stage)
+/// to the worker: `200`, `by: wk`, `Actor: wk`. The board now marks
+/// every relayed move as the operator's decision and the daemon demands
+/// the operator on the board's connection for any target: the move is
+/// refused and nothing is written. `/api/meta` reports `operator: false`
+/// on that board, so it offers no move buttons.
+#[test]
+fn cad432_board_started_by_an_agent_cannot_relay_a_move() {
+    let f = PlanFixture::start();
+    cad432_epic(&f);
+    f.d.operator_rpc("epic_stage", json!({"epic": "D-1", "stage": "build"}))
+        .unwrap();
+    let mut wk = ManagedWorker::start(&f.d, "wk");
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let pidfile = f.tmp.path().join("agent-board.pid");
+    // The worker's tool runs `cadence ui run` in the foreground (the
+    // worker stays busy with it); the board is the tool's own child.
+    let script = format!(
+        "echo $$ > {pid}; exec env CADENCE_PM_DIR={pm} {bin} --state-dir {state} ui run --port {port}",
+        pid = pidfile.display(),
+        pm = f.pm_dir.display(),
+        bin = env!("CARGO_BIN_EXE_cadence"),
+        state = f.d.state.display(),
+    );
+    let n = wk.send(json!({"how": "exec", "argv": ["bash", "-c", script]}));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        // `board_get` unwraps its connect; probe the bind first.
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
+            && board_get(port, "/api/health").0 == 200
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the agent's board never came up");
+        thread::sleep(Duration::from_millis(50));
+    }
+    let before = f.commits();
+
+    let (_, meta) = board_get(port, "/api/meta?operator=1");
+    let meta: Value = serde_json::from_str(&meta).unwrap();
+    assert_eq!(
+        meta["operator"], false,
+        "an agent's board is nobody's: {meta}"
+    );
+
+    // The proven operator (this test process) asks that board for a
+    // routine move.
+    let (status, reply) = cad432_move(port, THREAD_GUARDS, r#"{"stage":"verify"}"#);
+    assert_eq!(status, 403, "{reply}");
+    assert!(reply.contains("operator_proof"), "{reply}");
+    assert!(
+        reply.contains("'wk'"),
+        "refused as the worker's connection: {reply}"
+    );
+    assert_eq!(f.commits(), before, "a refusal writes nothing");
+    assert_eq!(f.front("D-1").stage.as_deref(), Some("build"));
+    assert!(
+        !f.last_commit().contains("Actor: wk"),
+        "{}",
+        f.last_commit()
+    );
+
+    let pid: i32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    let _ = wk.answer(n, "agent board exit");
+}
+
 /// CAD-328 review round 1: a chat view opens on the NEWEST page.
 /// `GET /api/threads/<alias>?tail=1` (daemon `thread_read {tail}`) is the
 /// newest `limit` entries, oldest first, with `more_before`;

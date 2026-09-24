@@ -253,7 +253,10 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("plan_reject", Rule::Handler("operator_connection")),
     (
         "epic_stage",
-        Rule::Handler("slot_identity or operator_evidence"),
+        Rule::Handler(
+            "slot_identity or operator_evidence; operator_connection into an operator stage \
+             or with operator_decision (CAD-432: every board-relayed move)",
+        ),
     ),
     ("project_work_approve", Rule::Handler("operator_connection")),
     ("project_work_approvals", Rule::Read),
