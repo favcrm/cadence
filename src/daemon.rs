@@ -890,14 +890,26 @@ impl Shared {
             crate::continuity::assemble(&self.store, pm_dir.as_deref(), alias, reason, &message.id);
         let pack = match built {
             Ok(Some(pack)) => pack,
-            Ok(None) => return message.body.clone(),
+            Ok(None) => {
+                // Nothing to carry. A pending compaction is settled so
+                // later turns do not rebuild it.
+                if reason == crate::continuity::Reason::Compacted {
+                    self.continuity_settle(alias, reason, &message.id, "skipped", None);
+                }
+                return message.body.clone();
+            }
             Err(e) => {
+                // One failure per trigger: the note settles it, so a
+                // pack that cannot be built is not rebuilt (and its
+                // failure not re-reported) on every later turn.
+                let error = e.to_string();
                 let _ = self.store.event_public(
                     alias,
                     "continuity_pack_failed",
                     json!({"reason": reason.as_str(), "message": message.id,
-                           "error": e.to_string()}),
+                           "error": error}),
                 );
+                self.continuity_settle(alias, reason, &message.id, "failed", Some(&error));
                 return message.body.clone();
             }
         };
@@ -919,6 +931,40 @@ impl Shared {
             .event_public(alias, crate::continuity::PACK_EVENT, payload);
         self.wake();
         pack.wrap(&message.body)
+    }
+
+    /// CAD-324: record in the thread that a due pack was not delivered
+    /// (`outcome`: `skipped` — nothing to carry — or `failed`). The note
+    /// is a pack note, so it settles a pending compaction.
+    fn continuity_settle(
+        &self,
+        alias: &str,
+        reason: crate::continuity::Reason,
+        message: &str,
+        outcome: &str,
+        error: Option<&str>,
+    ) {
+        let text = match error {
+            Some(e) => format!("Continuity pack not delivered ({}): {e}", reason.as_str()),
+            None => format!(
+                "Continuity pack not delivered ({}): nothing to carry.",
+                reason.as_str()
+            ),
+        };
+        if let Err(e) = self.store.thread_append(
+            alias,
+            store::NewEntry {
+                role: store::ROLE_SYSTEM,
+                kind: store::KIND_MESSAGE,
+                text: &text,
+                payload: Some(json!({"event": crate::continuity::PACK_EVENT,
+                                     "reason": reason.as_str(), "message": message,
+                                     "outcome": outcome, "error": error})),
+                message_id: None,
+            },
+        ) {
+            eprintln!("continuity note for '{alias}' failed: {e}");
+        }
     }
 
     fn thread_on_provider_event(&self, alias: &str, method: &str, params: &Value) {
@@ -10271,6 +10317,75 @@ mod pty_retry_tests {
 mod tests {
     use super::*;
     use crate::store::NewAgent;
+
+    /// CAD-324: a pending compaction whose pack cannot be sent is
+    /// settled once in the thread — never rebuilt on every later turn.
+    #[test]
+    fn an_undeliverable_compaction_pack_is_settled_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = ServeOptions::default();
+        let no_pm = dir.path().join("no-pm");
+        opts.provider_env
+            .set("CADENCE_PM_DIR", no_pm.to_str().unwrap());
+        let shared = Shared::new(dir.path(), &opts).unwrap();
+        let cwd = dir.path().to_str().unwrap().to_string();
+        shared
+            .store
+            .register_agent(&NewAgent {
+                alias: "lead",
+                provider: "fake",
+                endpoint_kind: "fake",
+                role: "worker",
+                cwd: &cwd,
+                sandbox: "read-only",
+                instructions: None,
+                params: None,
+                team_role: None,
+                model_policy: None,
+            })
+            .unwrap();
+        shared.store.ensure_thread("lead").unwrap();
+        // Only the compaction note: nothing for a pack to carry.
+        shared
+            .store
+            .thread_append(
+                "lead",
+                store::NewEntry {
+                    role: store::ROLE_SYSTEM,
+                    kind: store::KIND_MESSAGE,
+                    text: "compacted",
+                    payload: Some(json!({"event": crate::continuity::COMPACTED_EVENT})),
+                    message_id: None,
+                },
+            )
+            .unwrap();
+        assert!(shared.store.compaction_pending("lead").unwrap());
+        for id in ["k1", "k2"] {
+            shared
+                .store
+                .enqueue("lead", "an ask", None, id, "user")
+                .unwrap();
+            let Take::Message(m) = shared.store.take_queued("lead").unwrap() else {
+                panic!("nothing queued");
+            };
+            assert_eq!(shared.continuity_prompt("lead", "fake", &m), "an ask");
+            shared
+                .store
+                .finish(&m, "completed", &json!({"text": "ok"}), None)
+                .unwrap();
+        }
+        assert!(!shared.store.compaction_pending("lead").unwrap());
+        let settled = shared
+            .store
+            .thread_entries("lead", 0, 100)
+            .unwrap()
+            .into_iter()
+            .filter(|e| {
+                e.payload.as_ref().and_then(|p| p.get("outcome")) == Some(&json!("skipped"))
+            })
+            .count();
+        assert_eq!(settled, 1, "settled once, not per turn");
+    }
 
     /// CAD-324: a terminal pane (the pack would be a paste) and a cloud
     /// session never get a continuity pack — not with a thread, an

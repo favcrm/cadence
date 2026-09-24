@@ -48339,8 +48339,8 @@ fn pty_urgent_waits_for_the_held_turn_then_goes_first() {
 
 /// A plan with one ticket for `lead` and one for `other`.
 const CAD324_PLAN: &str = "---\ntitle: CSV export\ngoal: Users export their data\n---\n\n\
-## Build the exporter\nsize: M\nagent: lead\n\n### Acceptance\n- [ ] a CSV downloads\n\n\
-## Write the export docs\nsize: S\nagent: other\ndepends_on: 1\n\n### Acceptance\n- [ ] docs name the columns\n";
+## Build the exporter\nsize: M\nagent: lead\ndepends_on: 2\n\n### Acceptance\n- [ ] a CSV downloads\n\n\
+## Write the export docs\nsize: S\nagent: other\n\n### Acceptance\n- [ ] docs name the columns\n";
 
 /// Every `kind` event of `alias`, oldest first.
 fn events_of_kind(d: &TestDaemon, alias: &str, kind: &str) -> Vec<Value> {
@@ -48433,6 +48433,11 @@ fn cad324_continuity_packs_on_new_compacted_and_lost_sessions() {
     assert!(pack.contains("\"CSV export\""), "{pack}");
     assert!(pack.contains("Build the exporter"), "{pack}");
     assert!(!pack.contains("Write the export docs"), "{pack}");
+    // Its dependency on a ticket it is not shown is counted, not named.
+    assert!(!pack.contains("D-3"), "{pack}");
+    assert!(pack.contains("depends on 1 ticket(s) not shown"), "{pack}");
+    // Stored text arrives quoted.
+    assert!(pack.contains("> Prefer small PRs."), "{pack}");
     assert!(!pack.contains("hello lead"), "the current message: {pack}");
     let delivered = events_of_kind(&f.d, "lead", "continuity_pack");
     assert_eq!(delivered.len(), 1, "{delivered:#?}");
@@ -48492,7 +48497,7 @@ fn cad324_continuity_packs_on_new_compacted_and_lost_sessions() {
     assert!(pack.contains("compacted this session's context"), "{pack}");
     assert!(pack.contains("hello lead"), "{pack}");
     assert!(
-        pack.contains("result (completed): FAKE_REPLY: second"),
+        pack.contains("result (completed):\n> FAKE_REPLY: second"),
         "{pack}"
     );
     assert!(!pack.contains("after compaction"), "{pack}");

@@ -1382,24 +1382,45 @@ puts a **continuity pack** ahead of the message on the first turn of:
   restart too. A new or lost session is decided again at every open.
 
 The daemon assembles it at delivery — the agent never shapes it — from
-`<pm>/company/USER.md` (operator preferences, never read through a
-link, capped at 4 000 characters), the active plans read from the
-tracker (all of them for the master; for another agent only the plans
-with a ticket it owns, and only those tickets), a one-line-per-turn
-summary of the older thread and the last turns verbatim (at most 8).
-Only thread entries whose message reached the agent qualify: a queued
-or cancelled message, and the message the pack travels with, never do.
-The pack is deterministic (no clock or randomness; fixed order),
-bounded (each section capped, the whole ≤ 24 000 bytes) and
-secret-scanned before any cut; a scan that cannot run means no pack.
-Nothing to carry means no pack. The pack starts with
-`[Cadence continuity pack` and ends with
-`[End of continuity pack — the message for this turn follows.]`; a
-quoted boundary inside it is defanged. Each delivery appends a
-`system` thread entry (`payload.event: "continuity_pack"`, reason,
-counts, bytes, `sha256` — never the content) and a `continuity_pack`
-event; a build error is a `continuity_pack_failed` event and the
-message goes alone. PTY and cloud endpoints get no pack.
+`<pm>/company/USER.md` (operator preferences: a regular file only, never
+read through a link or from a FIFO or device, capped at 4 000 bytes),
+the active plans read from the tracker (all of them for the master; for
+another agent only the plans with a ticket it owns, only those tickets,
+and a dependency on a ticket it is not shown is counted, never named),
+a one-line-per-turn summary of the older thread and the last turns
+verbatim (at most 8). Only thread entries whose message reached the
+agent qualify: a queued or cancelled message, and the message the pack
+travels with, never do.
+
+Stored text is data, never structure: every multi-line text (messages,
+agent text, results, USER.md) is quoted line by line with `> `, and
+every one-line fragment (tool summaries, titles, the summary's excerpts)
+has its line breaks — LF, CR, VT, FF, NEL, U+2028, U+2029 — turned into
+spaces. Only the daemon's own lines (headings, turn headers, list items)
+start any other way. The pack's first line is
+`[Cadence continuity pack <nonce> for '<alias>' — <reason>.]` and its
+last line `[End of continuity pack <nonce> — the message for this turn
+follows.]`, where `<nonce>` is 16 hex digits of the SHA-256 of the body
+between them; stored text cannot carry the nonce of the pack it is in,
+so only that last line ends the pack.
+
+The pack is deterministic (no clock or randomness; fixed order) and at
+most 24 000 bytes: each section has a byte budget (preferences 4 500,
+plans 4 500, summary 3 500, turns 10 000, one turn at most 6 000) whose
+sum stays under the cap, so nothing is cut at assembly; should redaction
+ever grow a section past it, whole sections are dropped — summary,
+plans, preferences, then the oldest turns — never the newest turn. It
+is secret-scanned before any cut and again per section; a scan that
+cannot run means no pack. Nothing to carry means no pack. Each delivery
+appends a `system` thread entry (`payload.event: "continuity_pack"`,
+`outcome: "delivered"`, reason, counts, bytes, `sha256` — never the
+content) and a `continuity_pack` event. A due pack that is not sent is
+settled once with a `continuity_pack` note of `outcome: "failed"` (a
+build error, also a `continuity_pack_failed` event; the message goes
+alone) or `outcome: "skipped"` (a compaction with nothing to carry), so
+a pending compaction is never rebuilt on every turn. Only `system`
+notes tied to no message count toward a pending compaction. PTY and
+cloud endpoints get no pack.
 
 ## Stall detection
 
