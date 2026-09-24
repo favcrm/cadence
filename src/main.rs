@@ -4648,14 +4648,7 @@ fn run() -> Result<i32> {
             json,
             port,
             no_open: _,
-        } => {
-            use clap::CommandFactory;
-            let verbs = Cli::command()
-                .get_subcommands()
-                .map(|c| c.get_name().to_string())
-                .collect();
-            cadence_agent::setup::cli(&state_dir, port, json, verbs)
-        }
+        } => cadence_agent::setup::cli(&state_dir, port, json, cli_verbs()),
         Commands::Daemon { action } => match action {
             DaemonAction::Run { rollout_as } => {
                 // CAD-308: before anything is spawned, so every tree the
@@ -5852,7 +5845,11 @@ fn run() -> Result<i32> {
             print_json(&report);
             Ok(if blocking { 1 } else { 0 })
         }
-        Commands::Ui { action } => cadence_agent::ui::run_cli(&state_dir, &action),
+        Commands::Ui { action } => {
+            // The board's `/api/setup` names only verbs this binary has.
+            cadence_agent::setup::register_verbs(cli_verbs());
+            cadence_agent::ui::run_cli(&state_dir, &action)
+        }
         Commands::Sandbox { action } => cadence_agent::sandbox::run_cli(&action),
         Commands::Status { group, json, watch } => {
             run_status(&state_dir, group.as_deref(), json, watch)
@@ -8252,6 +8249,15 @@ unsafe extern "C" fn cadence_raise_test_stack() {
     }
 }
 
+/// This binary's top-level verbs — setup names a fix only by a verb
+/// that exists.
+fn cli_verbs() -> Vec<String> {
+    use clap::CommandFactory;
+    Cli::command()
+        .get_subcommands()
+        .map(|c| c.get_name().to_string())
+        .collect()
+}
 #[cfg(test)]
 mod tests {
     use super::*;
