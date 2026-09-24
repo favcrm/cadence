@@ -11,17 +11,26 @@
 //!
 //!  1. installs the tarball with `scripts/install.sh` from `file://`;
 //!  2. runs `cadence setup`, then `cadence project new demo --repo …`;
-//!  3. starts the master (`cadence master start`, confined by Landlock)
+//!  3. signs the operator's browser tab in with a `cadence ui login`
+//!     link (CAD-313) — the cookie plus the per-tab session key every
+//!     later board write rides on;
+//!  4. starts the master (`cadence master start`, confined by Landlock)
 //!     and registers a worker `w1` and a reviewer `r1`;
-//!  4. asks the master for work in the board's chat (Playwright);
-//!  5. approves the master's plan on its plan card;
-//!  6. tells the master to go ahead; it dispatches to `w1`, whose
+//!  5. asks the master for work in the board's chat (Playwright);
+//!  6. approves the master's plan on its plan card; the daemon's own
+//!     wake (CAD-445 — no nudge) has the master dispatch to `w1`, whose
 //!     question the master escalates and the operator answers on the
-//!     board; `w1` then commits and files `done` with a sha and a PR;
-//!  7. `r1` passes it; the merge decision appears in Needs-you and Merge
-//!     enqueues it through the fake `gh`;
+//!     board — routed back to `w1` (CAD-447), which commits and files
+//!     `done` with a sha and a PR;
+//!  7. `r1` passes it; the board's own delivery sync (CAD-446 — no
+//!     `delivery sync` call) sees the green head, Merge enqueues it
+//!     through the fake `gh`, and a later pass settles the merged
+//!     ticket done (CAD-449) — the epic's stage and weighted progress
+//!     track all of it (CAD-432);
 //!  8. restarts the daemon, then comes back two hours "later" to the
-//!     since-you-left card.
+//!     since-you-left card; along the way the master's provider
+//!     compacts its context, so the routed question's turn opens with
+//!     a continuity pack carrying the active plan (CAD-324).
 //!
 //! Every agent is `tests/e2e/fake-claude.py` (a scripted stream-json
 //! stand-in for the Claude CLI) and `gh` is `tests/fixtures/fake-gh.py`
@@ -56,7 +65,6 @@ use tempfile::TempDir;
 const BUDGET: Duration = Duration::from_secs(600);
 /// The operator's first chat and the master's answer (fake-claude.py).
 const ASK: &str = "plan a CSV export";
-const GO: &str = "Approved, go ahead";
 const PR: &str = "https://github.com/acme/demo/pull/1";
 
 fn manifest_dir() -> PathBuf {
@@ -113,6 +121,8 @@ struct Journey {
     port: u16,
     artifacts: PathBuf,
     started: Instant,
+    /// The operator's browser, spawned on the first board step.
+    driver: Option<Board>,
     cases: Vec<Case>,
     steps: Vec<(String, f64)>,
 }
@@ -141,6 +151,7 @@ impl Journey {
             root,
             artifacts,
             started: Instant::now(),
+            driver: None,
             cases: Vec::new(),
             steps: Vec::new(),
         };
@@ -167,6 +178,13 @@ impl Journey {
         format!("http://127.0.0.1:{}", self.port)
     }
 
+    /// The board as the operator's browser must reach it: the session
+    /// cookie lives on this name (CAD-313), and a request on
+    /// 127.0.0.1 is outside every session.
+    fn board_url(&self) -> String {
+        format!("http://cadence-{}.localhost:{}", self.port, self.port)
+    }
+
     /// The fake `claude` the setup check detects (version and a signed-in
     /// status exit code only), the scripted provider the daemon launches
     /// in its place, and the fake `gh` on the operator's PATH.
@@ -184,13 +202,22 @@ impl Journey {
         fs::copy(&fake, self.path("fake/fake-claude.py")).unwrap();
         let gh = manifest_dir().join("tests/fixtures/fake-gh.py");
         exe(&self.path("gh/gh"), &fs::read_to_string(gh).unwrap());
-        self.set_gh(&"0".repeat(40), false);
+        self.set_gh(false);
     }
 
-    fn set_gh(&self, head: &str, green: bool) {
+    /// The fake GitHub's checks flag. The PR's head is never stored:
+    /// `head_from` has the fake `gh` ask the real repo for the ticket
+    /// branch's tip, so the board's sync can never observe a stale head
+    /// (the worker's commit IS the PR head — CAD-446).
+    fn set_gh(&self, green: bool) {
         fs::write(
             self.path("gh/gh-state.json"),
-            json!({"head": head, "state": "OPEN", "green": green, "auto": false}).to_string(),
+            json!({
+                "head_from": {"repo": self.path("repo"), "glob": "cadence/dem-2*"},
+                "head": "0".repeat(40),
+                "state": "OPEN", "green": green, "auto": false,
+            })
+            .to_string(),
         )
         .unwrap();
     }
@@ -267,35 +294,30 @@ impl Journey {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
+    /// `cadence ui login --json`: the single-use link that signs one
+    /// browser tab in (CAD-313), on the board's own name.
+    fn ui_login(&self) -> String {
+        let out = self.ok(&["ui", "login", "--json"]);
+        let link = out["link"].as_str().unwrap_or_default().to_string();
+        assert!(
+            link.starts_with(&self.board_url()) && link.contains("/login#n="),
+            "ui login --json: {out}"
+        );
+        link
+    }
+
     /// One headless board step (tests/e2e/board.mjs). The browser is the
-    /// operator's: started from this process, outside every agent.
+    /// operator's: started from this process, outside every agent — one
+    /// Chrome, one context, one signed-in tab for the whole journey.
     fn board(&mut self, step: &str, args: Value) -> Value {
         let t = Instant::now();
-        let dir = manifest_dir().join("tests/e2e");
-        // The sandbox's clean env (HOME, XDG, TMPDIR): the browser's
-        // profile and caches stay under the sandbox root.
-        let mut cmd = self.command(host_program("node").to_str().unwrap());
-        if let Some(chrome) = std::env::var_os("E2E_CHROME") {
-            cmd.env("E2E_CHROME", chrome);
+        if self.driver.is_none() {
+            self.driver = Some(Board::spawn(self));
         }
-        let out = cmd
-            .arg(dir.join("board.mjs"))
-            .arg(step)
-            .arg(args.to_string())
-            .current_dir(&dir)
-            .env("E2E_URL", self.url())
-            .env("E2E_ARTIFACTS", self.artifacts.join("screens"))
-            .output()
-            .unwrap();
-        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-        assert!(
-            out.status.success(),
-            "board step {step} failed:\n{stdout}{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        let out = self.driver.as_mut().unwrap().step(step, &args);
         self.steps
             .push((format!("board {step}"), t.elapsed().as_secs_f64()));
-        serde_json::from_str(stdout.trim().lines().last().unwrap_or("{}")).unwrap()
+        out
     }
 
     fn pass(&mut self, use_case: u8, what: &'static str) {
@@ -467,9 +489,95 @@ impl Drop for Journey {
     /// Collect the evidence, then stop the sandbox's board and daemon
     /// (and with it every agent) — pass or fail.
     fn drop(&mut self) {
+        drop(self.driver.take());
         self.collect();
         let _ = self.command("cadence").args(["ui", "stop"]).output();
         let _ = self.command("cadence").args(["daemon", "stop"]).output();
+    }
+}
+
+/// The operator's browser (tests/e2e/board.mjs), kept alive for the
+/// whole journey: one Chrome, one context, one page — the signed-in tab
+/// every board write rides on (CAD-313). Steps go in as one JSON line
+/// each; each answers one JSON line. Anything it prints to stderr lands
+/// in `board-driver.log` under the artifacts.
+struct Board {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    stdout: std::io::BufReader<std::process::ChildStdout>,
+    log: PathBuf,
+}
+
+impl Board {
+    fn spawn(j: &Journey) -> Board {
+        let dir = manifest_dir().join("tests/e2e");
+        // The sandbox's clean env (HOME, XDG, TMPDIR): the browser's
+        // profile and caches stay under the sandbox root.
+        let mut cmd = j.command(host_program("node").to_str().unwrap());
+        if let Some(chrome) = std::env::var_os("E2E_CHROME") {
+            cmd.env("E2E_CHROME", chrome);
+        }
+        let log_path = j.artifacts.join("board-driver.log");
+        let log = fs::File::create(&log_path).unwrap();
+        let mut child = cmd
+            .arg(dir.join("board.mjs"))
+            .current_dir(&dir)
+            .env("E2E_URL", j.board_url())
+            .env("E2E_ARTIFACTS", j.artifacts.join("screens"))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::from(log))
+            .spawn()
+            .unwrap();
+        Board {
+            stdin: child.stdin.take().unwrap(),
+            stdout: std::io::BufReader::new(child.stdout.take().unwrap()),
+            child,
+            log: log_path,
+        }
+    }
+
+    fn log_tail(&self) -> String {
+        let text = fs::read_to_string(&self.log).unwrap_or_default();
+        let tail: Vec<&str> = text.lines().rev().take(40).collect();
+        tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+    }
+
+    fn step(&mut self, step: &str, args: &Value) -> Value {
+        use std::io::{BufRead, Write};
+        let req = format!("{}\n", json!({"step": step, "args": args}));
+        let sent = self
+            .stdin
+            .write_all(req.as_bytes())
+            .and_then(|()| self.stdin.flush());
+        assert!(
+            sent.is_ok(),
+            "board driver is gone before {step}:\n{}",
+            self.log_tail()
+        );
+        let mut line = String::new();
+        let read = self.stdout.read_line(&mut line);
+        assert!(
+            matches!(read, Ok(n) if n > 0),
+            "board driver is gone at {step}:\n{}",
+            self.log_tail()
+        );
+        let out: Value = serde_json::from_str(line.trim())
+            .unwrap_or_else(|_| panic!("board driver answered badly at {step}: {line:?}"));
+        assert_eq!(
+            out["ok"],
+            true,
+            "board step {step} failed:\n{}",
+            out["error"].as_str().unwrap_or_default()
+        );
+        out
+    }
+}
+
+impl Drop for Board {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -512,11 +620,6 @@ fn mvp_journey_end_to_end() {
     j.pass(
         1,
         "install.sh installs the local release from file:// and verifies it",
-    );
-    j.expected_skip(
-        1,
-        "install prints a single-use login link and opens the browser",
-        "CAD-313",
     );
 
     // ---- 2. Set up: setup, then the project ----
@@ -594,6 +697,21 @@ fn mvp_journey_end_to_end() {
         "cadence project new registers the repo (prefix DEM, GitHub remote)",
     );
 
+    // ---- CAD-313: the operator's browser signs in — one tab, one
+    // session (cookie + per-tab key). Every board write from here rides
+    // on it. The link works once, and a tab that holds only the cookie
+    // — never the exchanged key — writes nothing.
+    let t = Instant::now();
+    let link = j.ui_login();
+    j.board("login", json!({"link": link}));
+    j.board("login-replay", json!({"link": link}));
+    j.board("unsigned-write", json!({}));
+    j.step_done("operator sign-in", t);
+    j.pass(
+        2,
+        "cadence ui login signs this tab in — every later board write carries its session; a link works once; a cookie-only tab writes nothing (CAD-313)",
+    );
+
     // ---- 3. The master and its team ----
     let t = Instant::now();
     let master = j.ok(&["master", "start"]);
@@ -669,22 +787,35 @@ fn mvp_journey_end_to_end() {
     let plan = j.ok(&["plan", "show", "DEM-1"]);
     assert_eq!(plan["plan"]["state"], "approved", "{plan}");
     assert_eq!(plan["plan"]["decided_by"], "operator", "{plan}");
-    for id in ["DEM-2", "DEM-3"] {
-        let show = j.ok(&["issue", "show", id, "--json"]);
-        assert_eq!(show["status"], "ready", "{id}: {show}");
-    }
     j.step_done("approve", t);
     j.pass(4, "Approve on the plan card: plan approved by the operator, tickets ready, progress bar at 0%");
-    j.expected_skip(
+    // CAD-432: the epic reads the approved plan's stage — build — with
+    // size-weighted progress and health on the Projects screen. (No
+    // children: the daemon's wake may have DEM-2 dispatched already —
+    // the child rows are read once the dispatch has settled, below.)
+    j.board(
+        "epics",
+        json!({"project": "demo", "epic": "DEM-1",
+               "stage": "build 2/5", "percent": "0", "label": "0/2 weight",
+               "health": "at risk"}),
+    );
+    j.pass(
         4,
-        "the approved plan's epic stage and weighted progress on the Projects screen",
-        "CAD-432",
+        "the approved plan's epic reads stage build with size-weighted progress and health (CAD-432)",
     );
 
     // ---- Use case 5: work starts — dispatch, the dependency gate ----
     let t = Instant::now();
-    j.board("chat", json!({"text": GO, "expect": "DEM-2: dispatched"}));
+    // CAD-445: the daemon's own wake — "[wake] plan DEM-1 approved …" —
+    // reaches the master, which dispatches on it. No operator nudge.
+    j.wait("the plan-approved wake dispatches DEM-2", 120, || {
+        j.thread_text().contains("DEM-2: dispatched").then_some(())
+    });
     let thread = j.thread_text();
+    assert!(
+        thread.contains("[wake] plan DEM-1 approved"),
+        "the daemon's own wake is in the master's thread: {thread}"
+    );
     assert!(
         thread.contains("DEM-3 depends on DEM-2"),
         "the gate holds DEM-3 until DEM-2 is done: {thread}"
@@ -693,20 +824,31 @@ fn mvp_journey_end_to_end() {
     assert_eq!(rec["worker"], "w1", "{rec}");
     let show = j.ok(&["issue", "show", "DEM-2", "--json"]);
     assert_eq!(show["status"], "doing", "{show}");
+    let show = j.ok(&["issue", "show", "DEM-3", "--json"]);
+    assert_eq!(
+        show["status"], "ready",
+        "the blocked ticket is still ready, not dispatched: {show}"
+    );
     j.board(
         "watch",
         json!({"project": "demo", "issue": "DEM-2", "agent": "w1"}),
     );
+    j.board(
+        "epics",
+        json!({"project": "demo", "epic": "DEM-1",
+               "stage": "build 2/5", "percent": "0", "label": "0/2 weight",
+               "health": "at risk",
+               "children": {"DEM-2": "doing", "DEM-3": "blocked"}}),
+    );
     j.step_done("dispatch", t);
     j.pass(
         5,
-        "the master dispatches DEM-2 to w1; DEM-3 waits on its dependency",
+        "the master dispatches DEM-2 to w1 on the daemon's wake; DEM-3 waits on its dependency",
     );
     j.pass(
         5,
-        "the project board shows the ticket and the agents screen its worker",
+        "the project board shows the ticket and the agents screen its worker; the epic's stage and progress track the work",
     );
-    j.expected_skip(5, "epic progress and stage while the work runs", "CAD-432");
 
     // ---- Use case 6: a question, escalated by the master, answered ----
     let t = Instant::now();
@@ -715,6 +857,20 @@ fn mvp_journey_end_to_end() {
             .contains("Escalated DEM-2 to you: ok")
             .then_some(())
     });
+    // CAD-324: the master's provider reported a context compaction on
+    // its dispatch turn, so the routed question that followed opened
+    // with a continuity pack — the thread records it went, with the
+    // active plan it carried (counts, never content). A first-ever
+    // kickoff cannot carry one: the worker's thread does not exist
+    // until its operator chats it into being.
+    j.wait(
+        "the compacted master's next turn carried a pack",
+        60,
+        || {
+            let t = j.thread_of("master");
+            (t.contains("Continuity pack delivered") && t.contains("1 plan")).then_some(())
+        },
+    );
     j.board(
         "answer",
         json!({"issue": "DEM-2", "option": "comma", "summary": "I recommend comma"}),
@@ -752,6 +908,10 @@ fn mvp_journey_end_to_end() {
         6,
         "the answer is routed back to w1 as one message (CAD-447)",
     );
+    j.pass(
+        6,
+        "the compacted session's next turn opened with a continuity pack carrying its plan (CAD-324)",
+    );
     j.expected_skip(
         6,
         "permission cards (a provider's tool approval) in Needs-you",
@@ -778,10 +938,20 @@ fn mvp_journey_end_to_end() {
     // The worker's sha is a real commit on the ticket's branch.
     let branch = j.git(&["-C", &repo, "branch", "--contains", &sha]);
     assert!(branch.contains("cadence/dem-2"), "{branch}");
-    // CI goes green on that head; the operator's process observes it.
-    j.set_gh(&sha, true);
-    let synced = j.ok(&["delivery", "sync"]);
-    assert_eq!(synced["synced"][0]["merge_ready"], true, "{synced}");
+    // CI goes green on that head; the board's own delivery sync reads
+    // the PR on its timer or a page view — no `delivery sync` call —
+    // and the observed head is the reviewed one (CAD-446).
+    j.set_gh(true);
+    let rec = j.wait("the board's sync sees the green head", 90, || {
+        let r = j.delivery("DEM-2");
+        (r["merge_ready"] == true).then_some(r)
+    });
+    assert_eq!(
+        rec["observed"]["head"].as_str().unwrap_or_default(),
+        sha,
+        "the board observed the reviewed head: {rec}"
+    );
+    assert_eq!(rec["observed"]["ci_green"], true, "{rec}");
     assert!(
         !j.gh_log().contains("pr merge"),
         "nothing merged before the click"
@@ -825,12 +995,30 @@ fn mvp_journey_end_to_end() {
         j.gh_log()
     );
     assert_eq!(j.delivery("DEM-2")["state"], "enqueued");
+    // Auto-merge lands with checks green; the board's next sync pass
+    // observes the PR merged and the ticket settles done (CAD-449) —
+    // DEM-3's blocker lifts, the epic's progress moves.
+    j.wait("the merge settles DEM-2 done", 90, || {
+        (j.delivery("DEM-2")["state"] == "merged").then_some(())
+    });
+    assert_eq!(
+        j.ok(&["issue", "show", "DEM-2", "--json"])["status"],
+        "done",
+        "the merged ticket settled done"
+    );
+    j.board(
+        "epics",
+        json!({"project": "demo", "epic": "DEM-1",
+               "stage": "build 2/5", "percent": "50", "label": "1/2 weight",
+               "health": "on track",
+               "children": {"DEM-2": "done", "DEM-3": "ready"}}),
+    );
     j.step_done("review + merge", t);
     j.pass(
         7,
         "the worker's own Merge on the board is refused 403 operator_only, before any gh call",
     );
-    j.pass(7, "w1's done (sha + PR) goes to r1; PASS pinned to the head; Merge in Needs-you enqueues it via gh");
+    j.pass(7, "w1's done (sha + PR) goes to r1; PASS pinned to the head; Merge in Needs-you enqueues it via gh; the merged ticket settles done");
 
     // ---- Use case 8: come back ----
     let t = Instant::now();
@@ -854,7 +1042,7 @@ fn mvp_journey_end_to_end() {
             // question, answer, done, verdict: the card shows 3 rows and
             // "+1 more", in an order that is not stable within a second.
             "counts": {"Plans": 2, "Reports": 4},
-            "thread": [ASK, "Proposed plan DEM-1", GO],
+            "thread": [ASK, "Proposed plan DEM-1", "DEM-2: dispatched"],
         }),
     );
     // Which reports the card counted, from the same summary it reads.
@@ -881,11 +1069,6 @@ fn mvp_journey_end_to_end() {
     j.pass(
         8,
         "a return two hours later shows since-you-left: the plan, the question, the done report",
-    );
-    j.expected_skip(
-        8,
-        "continuity packs (summary + last turns) on a new or lost session",
-        "CAD-324",
     );
 
     // Every use case has at least one passing assertion.
