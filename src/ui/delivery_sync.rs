@@ -863,13 +863,27 @@ mod tests {
         let gh = bin.join("gh");
         std::fs::write(&gh, "#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let path = std::env::join_paths([Path::new("relative/bin"), Path::new(""), &bin]).unwrap();
+        // A planted `gh` reachable through a RELATIVE entry (resolved
+        // against this process's cwd), listed first.
+        let planted_dir = dir.path().join("planted");
+        std::fs::create_dir(&planted_dir).unwrap();
+        let planted = planted_dir.join("gh");
+        std::fs::write(&planted, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let up = "../".repeat(cwd.components().count() - 1);
+        let relative = PathBuf::from(format!(
+            "{up}{}",
+            planted_dir.strip_prefix("/").unwrap().display()
+        ));
+        assert!(relative.join("gh").is_file(), "{}", relative.display());
+        let path = std::env::join_paths([relative.as_path(), Path::new(""), &bin]).unwrap();
         assert_eq!(
             resolve_gh(Path::new("gh"), Some(&path)).unwrap(),
             gh,
-            "the absolute entry"
+            "the absolute entry, never the relative one"
         );
-        let rel_only = std::env::join_paths([Path::new("bin"), Path::new(".")]).unwrap();
+        let rel_only = std::env::join_paths([relative.as_path(), Path::new(".")]).unwrap();
         assert!(resolve_gh(Path::new("gh"), Some(&rel_only)).is_err());
         assert_eq!(resolve_gh(&gh, None).unwrap(), gh);
         let data = bin.join("data");
