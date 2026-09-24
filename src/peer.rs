@@ -1039,6 +1039,20 @@ mod tests {
         };
         assert_eq!(tcp_peer_agent(port, peer, &reused), unregistered);
 
+        // CAD-390: the recorded start matching, the same managed row is
+        // the agent — and a reused row beside it changes nothing.
+        let live = AgentRoots {
+            managed: AgentPids::classify([
+                ("wk".to_string(), me, Some(start)),
+                ("gone".to_string(), me, Some(start + 1)),
+            ]),
+            ..Default::default()
+        };
+        assert_eq!(
+            tcp_peer_agent(port, peer, &live),
+            Ok(Some("wk".to_string()))
+        );
+
         let legacy = AgentRoots {
             panes: AgentPids::classify([("pm".to_string(), me, None)]),
             ..Default::default()

@@ -39576,6 +39576,78 @@ fn ui_write_caller_attributes_a_managed_endpoint_tool_process() {
     assert!(!last.contains("operator"), "{last}");
 }
 
+/// CAD-390: the board ties a write to a managed endpoint only while the
+/// provider pid still names the process the daemon recorded — pid AND
+/// start time (`pid_start`, CAD-385). The daemon records the real
+/// provider's start, so its tool process writes as the agent. With the
+/// same pid but a different recorded start — what the row says once the
+/// provider died and another process took its pid — the row ties
+/// nothing: the write is placed exactly as a process tied to no agent,
+/// never as `wk`. A row with no recorded start refuses the write.
+#[test]
+fn cad390_a_reused_managed_provider_pid_never_attributes_a_board_write() {
+    let d = TestDaemon::start();
+    let pm = TempDir::new().unwrap();
+    seed_board(pm.path(), &d.state);
+    let port = start_board(pm.path(), &d.state);
+    let mut wk = ManagedWorker::start(&d, "wk");
+    let provider = wk.pid;
+    let db = d.state.join("cadence.sqlite3");
+    let set_start = |start: Option<i64>| {
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute(
+                "UPDATE agents SET pid_start=?1 WHERE alias='wk'",
+                rusqlite::params![start],
+            )
+            .unwrap();
+    };
+    let mut write = |body: &str| {
+        let request = board_comment_request(port, body);
+        let r = wk.exec(&[
+            "bash",
+            "-c",
+            DEV_TCP_CLIENT,
+            "_",
+            &port.to_string(),
+            &request,
+        ]);
+        assert_eq!(r["rc"], 0, "{r}");
+        r["out"].as_str().unwrap().to_string()
+    };
+
+    let agent = d.rpc("agent_show", json!({"alias": "wk"})).unwrap()["agent"].clone();
+    assert_eq!(agent["pid"].as_u64(), Some(u64::from(provider)), "{agent}");
+    let start = proc_start(provider).expect("the provider is alive");
+    assert_eq!(agent["pid_start"].as_i64(), Some(start), "{agent}");
+
+    // The real provider: its tool process is the agent.
+    let comment = board_replied_comment(&write("from the real provider"), "from the real provider");
+    assert_eq!(comment["author"], "wk", "{comment}");
+    assert!(board_last_commit(pm.path()).contains("Actor: wk"));
+
+    // The pid "reused": same number, a different recorded start.
+    set_start(Some(start - 1));
+    let comment = board_replied_comment(&write("after pid reuse"), "after pid reuse");
+    assert_eq!(comment["author"], "operator", "{comment}");
+    let last = board_last_commit(pm.path());
+    assert!(last.contains("(operator (ui))"), "{last}");
+    assert!(!last.contains("wk"), "{last}");
+
+    // No recorded start: unprovable, so the write is refused.
+    set_start(None);
+    let refused = write("with no recorded start");
+    assert!(refused.starts_with("HTTP/1.1 403"), "{refused}");
+    assert!(refused.contains("caller_identity"), "{refused}");
+    assert!(refused.contains("'wk'"), "{refused}");
+    assert!(!board_last_commit(pm.path()).contains("with no recorded start"));
+
+    // The recorded start restored: the provider is the agent again.
+    set_start(Some(start));
+    let comment = board_replied_comment(&write("restored"), "restored");
+    assert_eq!(comment["author"], "wk", "{comment}");
+}
+
 /// Forwards ONE connection from a fresh loopback port (printed first)
 /// to 127.0.0.1:`argv[1]` — the shape of the operator's tailnet relay
 /// (`socat TCP-LISTEN:13010,fork TCP:127.0.0.1:3010`), whose forking
