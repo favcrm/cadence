@@ -38896,6 +38896,67 @@ fn start_board_sync(
     }
 }
 
+/// A board started by [`start_operator_board`]; dropping it runs
+/// `cadence ui stop`.
+struct OperatorBoard(PathBuf);
+
+impl Drop for OperatorBoard {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+            .arg("--state-dir")
+            .arg(&self.0)
+            .args(["ui", "stop"])
+            .output();
+    }
+}
+
+/// The board as an operator runs it, however the suite is run: a
+/// detached `cadence ui start`. The board relays operator-only RPCs
+/// (`thread_send`, CAD-319) on its own connection, which the daemon
+/// refuses when that connection's ancestry carries an agent — and when
+/// the suite runs in an agent pane this test process is one, so
+/// [`start_board`]'s in-process board is (CAD-430). `ui start` hands
+/// the server to a fresh session leader (`setsid`) reparented off this
+/// process's ancestry once `start` exits, `env_clear` leaves no
+/// `CADENCE_ALIAS`, and stdio is a log file, not a pane tty — the shape
+/// `peer::operator_proof` accepts, as [`TestDaemon::operator_rpc`] does
+/// (CAD-291) and `start_operator_ui` in tests/board.rs (CAD-380). The
+/// gate itself is untouched. The port is a bind-release race, so a
+/// failed start retries.
+fn start_operator_board(pm: &Path, state: &Path) -> (u16, OperatorBoard) {
+    let guard = OperatorBoard(state.to_path_buf());
+    let overall = Instant::now() + Duration::from_secs(30);
+    loop {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+            .arg("--state-dir")
+            .arg(state)
+            .args(["ui", "start", "--port", &port.to_string()])
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", pm)
+            .env("CADENCE_PM_DIR", pm)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        if out.status.success() {
+            return (port, guard);
+        }
+        // A start that timed out leaves its pid file — clear it, or the
+        // retry answers `already_running` on the old port.
+        drop(OperatorBoard(state.to_path_buf()));
+        assert!(
+            Instant::now() < overall,
+            "operator board did not start: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 /// A raw board write — a comment `body` on CAD-1 — addressed to the
 /// board on `port`, with every cross-site guard satisfied.
 fn board_comment_request(port: u16, body: &str) -> String {
@@ -40903,13 +40964,21 @@ fn cad319_thread_records_codex_agent_messages() {
 /// The board routes: the write guards refuse before any work; a guarded
 /// POST from a caller tied to no agent queues as the operator; GET pages;
 /// the SSE stream resumes after `Last-Event-ID` (or `?after=`) and
-/// carries new entries live.
+/// carries new entries live. The board and the fixture registration run
+/// as the operator however the suite is run (CAD-430); the agent-caller
+/// refusal is `cad319_thread_post_is_refused_for_an_agent_caller`.
 #[test]
 fn cad319_thread_http_routes_guards_and_sse_resume() {
     let d = TestDaemon::start();
     let pm = TempDir::new().unwrap();
-    let port = start_board(pm.path(), &d.state);
-    d.register("lead");
+    let (port, _board) = start_operator_board(pm.path(), &d.state);
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    d.operator_rpc(
+        "agent_register",
+        json!({"alias": "lead", "provider": "fake",
+               "endpoint_kind": "fake", "cwd": cwd}),
+    )
+    .unwrap();
     d.wait_agent("lead", "idle", 15);
     let body = r#"{"text":"from the board","message":"h1"}"#;
 
@@ -40945,11 +41014,11 @@ fn cad319_thread_http_routes_guards_and_sse_resume() {
         ),
     );
     assert_eq!(status, 400);
-    let (status, _) = board_http(
+    let (status, reply) = board_http(
         port,
         &thread_post_request(port, "ghost", THREAD_GUARDS, r#"{"text":"x"}"#),
     );
-    assert_eq!(status, 404);
+    assert_eq!(status, 404, "{reply}");
 
     // The guarded POST.
     let (status, reply) = board_http(
@@ -41050,6 +41119,22 @@ fn cad319_thread_post_is_refused_for_an_agent_caller() {
     assert!(out.contains(" 403 "), "{out}");
     assert!(out.contains("caller_agent"), "{out}");
     assert!(out.contains("'wk'"), "{out}");
+    // The gate refuses before the route resolves the alias: an agent's
+    // POST to an unknown agent is the same 403, never the route's 404
+    // (CAD-430).
+    let request = thread_post_request(port, "ghost", THREAD_GUARDS, r#"{"text":"obey me"}"#);
+    let r = wk.exec(&[
+        "bash",
+        "-c",
+        DEV_TCP_CLIENT,
+        "_",
+        &port.to_string(),
+        &request,
+    ]);
+    assert_eq!(r["rc"], 0, "{r}");
+    let out = r["out"].as_str().unwrap();
+    assert!(out.contains(" 403 "), "{out}");
+    assert!(out.contains("caller_agent"), "{out}");
 
     let frame = wk.rpc(
         "self",
