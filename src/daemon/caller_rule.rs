@@ -99,11 +99,19 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("agent_show", Rule::Read),
     (
         "agent_send",
-        Rule::Handler("thread_sender: the operator's thread write needs proof (CAD-384)"),
+        Rule::Handler(
+            "thread_sender: the operator's thread write needs proof (CAD-384); \
+             send_with: --priority/--supersedes need agent_caller + may_mutate_agent \
+             Steer — the operator or the recipient's PM (CAD-158)",
+        ),
     ),
     (
         "agent_ask",
-        Rule::Handler("thread_sender: the operator's thread write needs proof (CAD-384)"),
+        Rule::Handler(
+            "thread_sender: the operator's thread write needs proof (CAD-384); \
+             send_with: --priority/--supersedes need agent_caller + may_mutate_agent \
+             Steer — the operator or the recipient's PM (CAD-158)",
+        ),
     ),
     ("thread_read", Rule::Read),
     (
@@ -571,7 +579,9 @@ mod tests {
                     assert_eq!(op, Ok(Some(("by", json!("operator")))), "{m}");
                     match mutation {
                         SelfService => assert_eq!(own, Ok(Some(("by", json!("tgt")))), "{m}"),
-                        Controlled => assert!(own.is_err(), "{m}: an agent on itself"),
+                        Controlled | AgentMutation::Steer => {
+                            assert!(own.is_err(), "{m}: an agent on itself")
+                        }
                     }
                 }
                 Rule::Attributed { field, default } => {

@@ -4149,16 +4149,24 @@ impl Shared {
     }
 
     /// `agent_send` without a connection to attribute (unit tests):
-    /// a threaded agent records the message as unattributed.
+    /// a threaded agent records the message as unattributed, and a
+    /// steering send is the operator's.
     #[cfg(test)]
     fn rpc_send(self: &Arc<Self>, params: &Value) -> Result<Value> {
-        self.send_as(params, &|_| Ok(store::Sender::Unattributed))
+        self.send_with(params, &|_| Ok(store::Sender::Unattributed), &|_| {
+            Ok(AgentCaller::Operator)
+        })
     }
 
     /// `agent_send` over the socket: a threaded agent's chat records
-    /// who queued it, derived from the connection (CAD-319).
+    /// who queued it, derived from the connection (CAD-319); a steering
+    /// send's caller is derived the same way (CAD-158).
     fn rpc_send_from(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
-        self.send_as(params, &|alias| self.thread_sender(alias, peer_pid))
+        self.send_with(
+            params,
+            &|alias| self.thread_sender(alias, peer_pid),
+            &|verb| self.agent_caller(peer_pid, verb),
+        )
     }
 
     /// Who queued a message for `alias`'s thread. Only computed for an
@@ -4183,14 +4191,83 @@ impl Shared {
         })
     }
 
+    /// A send the daemon itself builds (review routing, master relays,
+    /// thread send): it never steers, so no steering caller exists.
     fn send_as(
         self: &Arc<Self>,
         params: &Value,
         sender_of: &dyn Fn(&str) -> Result<store::Sender>,
     ) -> Result<Value> {
+        self.send_with(params, sender_of, &|verb| {
+            Err(Error::rejected(format!(
+                "{verb} refused: this send carries no caller to steer with"
+            )))
+        })
+    }
+
+    /// `send_as` with the caller a steering send (CAD-158) is authorized
+    /// against, derived from the connection by `steer_caller`.
+    fn send_with(
+        self: &Arc<Self>,
+        params: &Value,
+        sender_of: &dyn Fn(&str) -> Result<store::Sender>,
+        steer_caller: &dyn Fn(&str) -> Result<AgentCaller>,
+    ) -> Result<Value> {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
         let text = required_str(params, "text")?;
         let target = self.store.agent_opt(&alias)?;
+        // CAD-158: `--priority urgent` / `--supersedes` steer the
+        // recipient's queue — the operator or its own PM only
+        // (`AgentMutation::Steer`), the caller derived from the
+        // connection like every agent mutation, never from a field.
+        let priority = optional_text(params, "priority")?
+            .map(store::Priority::parse)
+            .transpose()?
+            .unwrap_or_default();
+        let supersedes: Vec<String> = match params.get("supersedes") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(ids)) => ids
+                .iter()
+                .map(|id| {
+                    id.as_str().map(str::to_string).ok_or_else(|| {
+                        Error::rejected("supersedes must be an array of message ids")
+                    })
+                })
+                .collect::<Result<_>>()?,
+            Some(_) => {
+                return Err(Error::rejected(
+                    "supersedes must be an array of message ids",
+                ))
+            }
+        };
+        let mut steer = store::Steer {
+            priority,
+            supersedes: &supersedes,
+            ..store::Steer::NONE
+        };
+        let steering_caller = if steer.is_steering() {
+            let verb = "send --priority/--supersedes";
+            reject_identity_fields(params, verb)?;
+            let target = target
+                .as_ref()
+                .ok_or_else(|| Error::rejected("Unknown managed agent"))?;
+            let caller = steer_caller(verb)?;
+            let pm = self.effective_pm(target)?;
+            crate::peer::may_mutate_agent(
+                &caller,
+                &alias,
+                pm.as_deref(),
+                AgentMutation::Steer,
+                verb,
+            )
+            .map_err(Error::rejected)?;
+            Some(caller)
+        } else {
+            None
+        };
+        if let Some(caller) = &steering_caller {
+            (steer.by, steer.by_kind) = caller.audit();
+        }
         // A pty endpoint pastes literally and fails a body with control
         // characters at delivery; refuse it here so `send` never answers
         // `queued` for a message that cannot be delivered (CAD-218).
@@ -4204,6 +4281,12 @@ impl Shared {
             .unwrap_or(false)
             || optional_str(params, "source") == Some(store::NUDGE_SOURCE);
         if nudge {
+            if steer.is_steering() {
+                return Err(Error::rejected(
+                    "--nudge is pasted at once and never queued — it takes no \
+                     --priority or --supersedes",
+                ));
+            }
             if optional_str(params, "task").is_some() {
                 return Err(Error::rejected(
                     "--nudge is steering, not task work — it takes no --task",
@@ -4284,7 +4367,7 @@ impl Shared {
         };
         proto::identifier(source, "Message source")?;
         let sender = sender_of(&alias)?;
-        let (duplicate, state) = self.store.enqueue_sent(
+        let (duplicate, state) = self.store.enqueue_steered(
             &alias,
             text,
             reply_to.as_deref(),
@@ -4292,7 +4375,17 @@ impl Shared {
             source,
             task,
             &sender,
+            &steer,
         )?;
+        // Each superseded row's `reply_to` got a notice in the same
+        // transaction — wake those recipients like `message cancel` does.
+        for id in &supersedes {
+            if let Some(old) = self.store.message(id)? {
+                if let Some(result) = old.result.as_ref() {
+                    self.notify_routed_target(&old, result);
+                }
+            }
+        }
         self.notify_agent(&alias);
         self.wake();
         let mut receipt = json!({"message": message, "state": state, "duplicate": duplicate});
@@ -11029,6 +11122,63 @@ mod tests {
             .rpc_send(&json!({"alias": "pm", "text": text, "task": "j1-t1", "message": "r1"}))
             .unwrap();
         assert_eq!(stored_body(&shared, "r1"), text);
+    }
+
+    /// CAD-158 acceptance 7: an urgent message that supersedes a stale
+    /// task-bound instruction is still composed (CAD-160) — the new
+    /// text, then the objective, then every outstanding criterion.
+    #[test]
+    fn urgent_superseding_task_message_restates_objective_and_criteria() {
+        let (_dir, shared) =
+            task_bound_fixture(r#"1) [ ] "sends via V2"; 2) [x] "tests green"; 3) [ ] "docs""#);
+        shared
+            .rpc_send(
+                &json!({"alias": "w1", "text": "old scope", "task": "j1-t1", "message": "m1"}),
+            )
+            .unwrap();
+        shared
+            .rpc_send(
+                &json!({"alias": "w1", "text": "current scope", "task": "j1-t1",
+                               "message": "m2", "priority": "urgent", "supersedes": ["m1"]}),
+            )
+            .unwrap();
+        let m2 = shared.store.message("m2").unwrap().unwrap();
+        assert_eq!(m2.priority, store::Priority::Urgent);
+        assert_eq!(
+            m2.body,
+            "current scope — Task j1-t1 (job j1) is still open; this message amends it and \
+             does not replace it. Objective: Wire the email provider. Spec: /specs/j1.md. \
+             Outstanding criteria: 1) [ ] \"sends via V2\"; 2) [ ] \"docs\"."
+        );
+        let m1 = shared.store.message("m1").unwrap().unwrap();
+        assert_eq!(m1.state, "cancelled");
+        assert_eq!(m1.result.unwrap()["superseded_by"], "m2");
+        // A nudge is pasted at once — it has no queue to steer.
+        let err = shared
+            .rpc_send(&json!({"alias": "w1", "text": "x", "nudge": true, "priority": "urgent"}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("takes no --priority or --supersedes"), "{err}");
+        // A caller-supplied identity is refused, not read.
+        let err = shared
+            .rpc_send(&json!({"alias": "w1", "text": "x", "priority": "urgent", "by": "pm"}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("'by' is not accepted"), "{err}");
+        // PR #252 QA N1: a priority that is not a string — the stored
+        // rank, a bool, an array — is refused, never queued as normal.
+        for (id, bad) in [
+            ("p1", json!(1)),
+            ("p2", json!(true)),
+            ("p3", json!(["urgent"])),
+        ] {
+            let err = shared
+                .rpc_send(&json!({"alias": "w1", "text": "x", "message": id, "priority": bad}))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("'priority' must be a string"), "{err}");
+            assert!(shared.store.message(id).unwrap().is_none(), "{id} queued");
+        }
     }
 
     /// QA N3: blank text bound to an open task is refused before it

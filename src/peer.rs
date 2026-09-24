@@ -374,6 +374,11 @@ pub(crate) enum AgentMutation {
     /// Anything else: trust-bearing or posture params, and removal
     /// (which deletes the agent's history).
     Controlled,
+    /// Steering the agent's queue (CAD-158): an `urgent` send, or one
+    /// that supersedes its queued messages. Never self-service — and a
+    /// worker is never its PM's PM, so worker output cannot jump its
+    /// PM's queue.
+    Steer,
 }
 
 /// The one rule for "may `caller` mutate agent `target`" (CAD-149,
@@ -383,9 +388,10 @@ pub(crate) enum AgentMutation {
 /// - the operator may do anything;
 /// - the target's own PM may do anything to it (a PM is never its own
 ///   PM, even if an upstream names itself);
-/// - the agent itself may make a self-service change only;
-/// - everyone else — a peer worker, the PM of another group — is
-///   refused.
+/// - the agent itself may make a self-service change only (it may not
+///   steer its own queue);
+/// - everyone else — a peer worker, the PM of another group, a worker
+///   writing to its own PM — is refused.
 ///
 /// `Err` is the refusal text, naming the rule.
 pub(crate) fn may_mutate_agent(
@@ -406,10 +412,17 @@ pub(crate) fn may_mutate_agent(
         Some(pm) => format!("the operator or its PM '{pm}'"),
         None => "the operator (it has no PM)".to_string(),
     };
+    if mutation == AgentMutation::Steer {
+        return Err(format!(
+            "{verb} refused: agent '{alias}' may not send urgent or superseding \
+             messages to '{target}' — only {owner} may steer '{target}''s queue \
+             (steering rule: operator or the recipient's PM, CAD-158)"
+        ));
+    }
     if alias == target {
         return match mutation {
             AgentMutation::SelfService => Ok(()),
-            AgentMutation::Controlled => Err(format!(
+            AgentMutation::Controlled | AgentMutation::Steer => Err(format!(
                 "{verb} refused: agent '{alias}' cannot make this change to itself — \
                  an agent may set only its own model/effort; trust-bearing and \
                  posture params and removal of '{target}' belong to {owner} \
@@ -1131,5 +1144,41 @@ mod tests {
         assert!(may(&pm, "pm", None, SelfService).is_ok());
         // An upstream naming the target itself grants it nothing.
         assert!(may(&w1, "w1", Some("w1"), Controlled).is_err());
+    }
+
+    /// CAD-158: urgent/supersede sends — the operator or the recipient's
+    /// own PM only; the refusal names the steering rule on every route.
+    #[test]
+    fn steer_is_operator_or_recipients_pm_only() {
+        let steer = |c: &AgentCaller, target: &str, target_pm: Option<&str>| {
+            may_mutate_agent(
+                c,
+                target,
+                target_pm,
+                AgentMutation::Steer,
+                "send --priority",
+            )
+        };
+        let agent = |a: &str| AgentCaller::Agent(a.into());
+        assert!(steer(&AgentCaller::Operator, "w1", Some("pm")).is_ok());
+        assert!(steer(&AgentCaller::Operator, "pm", None).is_ok());
+        assert!(steer(&agent("pm"), "w1", Some("pm")).is_ok());
+        for (caller, target, target_pm) in [
+            // A worker to its own PM: never urgent.
+            ("w1", "pm", None),
+            // A worker on itself.
+            ("w1", "w1", Some("pm")),
+            // A peer worker in the same group.
+            ("w2", "w1", Some("pm")),
+            // Another group's PM.
+            ("pm2", "w1", Some("pm")),
+            // A PM on itself, and an upstream naming the target itself.
+            ("pm", "pm", None),
+            ("w1", "w1", Some("w1")),
+        ] {
+            let e = steer(&agent(caller), target, target_pm).unwrap_err();
+            assert!(e.contains("steering rule"), "{caller}->{target}: {e}");
+            assert!(e.contains(&format!("agent '{caller}'")), "{e}");
+        }
     }
 }

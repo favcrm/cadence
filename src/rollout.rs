@@ -32,9 +32,10 @@ use crate::store::{self, Store};
 
 /// Current store schema. v12 introduced `rollout_leases` and
 /// `daemon_build`; v13 adds conversation threads (CAD-319); v14 adds
-/// `agents.pid_start`, the recorded pid's process start time (CAD-385).
+/// `agents.pid_start`, the recorded pid's process start time (CAD-385);
+/// v15 adds `messages.priority` (CAD-158).
 /// The newest migration in `store` writes this number.
-pub const SCHEMA_VERSION: i64 = 14;
+pub const SCHEMA_VERSION: i64 = 15;
 
 /// Last schema that has no lease table. The bootstrap opt-in covers
 /// only this version.
@@ -2600,7 +2601,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 14);
+        assert_eq!(SCHEMA_VERSION, 15);
     }
 
     struct MigrationHolder;

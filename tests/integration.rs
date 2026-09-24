@@ -45747,3 +45747,280 @@ fn master_wake_waits_queued_while_the_master_is_stopped() {
     assert_eq!(again.len(), 1, "{again:#?}");
     assert_eq!(again[0]["state"], "queued", "{:#}", again[0]);
 }
+
+/// A message row by id, from `agent_show`.
+fn shown_message(d: &TestDaemon, alias: &str, id: &str) -> Value {
+    d.rpc("agent_show", json!({"alias": alias})).unwrap()["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == id)
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+/// CAD-158: only the operator or the recipient's own PM may send an
+/// urgent or superseding message — one route per caller kind, each
+/// refusal naming the steering rule and changing nothing; the caller is
+/// derived from the connection and stamped on every superseded row.
+#[test]
+fn steering_send_caller_rule_per_route() {
+    let d = TestDaemon::start();
+    let mut p = guard_panes(&d);
+    let w3 = LaneShell::spawn(p._home.path());
+    plant_member_pane(&d, "w3", "inbox", Some("pm"), w3.pid());
+    let mut w3 = w3;
+    // Planted rows own no actor: w1's queue stays queued.
+    for id in ["q1", "q2", "q3"] {
+        d.rpc(
+            "agent_send",
+            json!({"alias": "w1", "text": format!("stale {id}"), "message": id}),
+        )
+        .unwrap();
+    }
+    let steer = |id: &str, target: &str| {
+        json!({"alias": target, "text": "the current instruction", "message": id,
+               "priority": "urgent", "supersedes": ["q1"]})
+    };
+    let refused: Vec<(&str, Value, &str)> = vec![
+        // A worker to its own PM: never urgent.
+        (
+            "w1->pm",
+            p.w1.rpc(&d.state, "agent_send", steer("r1", "pm")),
+            "agent 'w1'",
+        ),
+        // A worker on itself.
+        (
+            "w1->w1",
+            p.w1.rpc(&d.state, "agent_send", steer("r2", "w1")),
+            "agent 'w1'",
+        ),
+        // A peer worker in the same group.
+        (
+            "w3->w1",
+            w3.rpc(&d.state, "agent_send", steer("r3", "w1")),
+            "agent 'w3'",
+        ),
+        // Another group's PM.
+        (
+            "pm2->w1",
+            p.pm2.rpc(&d.state, "agent_send", steer("r4", "w1")),
+            "agent 'pm2'",
+        ),
+    ];
+    for (route, frame, who) in &refused {
+        let e = frame_err(frame);
+        assert!(e.contains("steering rule"), "{route}: {frame}");
+        assert!(e.contains(who), "{route}: {frame}");
+    }
+    // Tied to no pane and not provably the operator.
+    let r = unprovable_rpc(&d, "agent_send", steer("r5", "w1"));
+    assert!(frame_err(&r).contains("not provably the operator"), "{r}");
+    // A claimed identity is refused, never read.
+    let mut forged = steer("r6", "w1");
+    forged["by"] = json!("operator");
+    let r = p.w1.rpc(&d.state, "agent_send", forged);
+    assert!(frame_err(&r).contains("'by' is not accepted"), "{r}");
+    // Urgent alone is gated too — and the CLI path from a worker pane.
+    let r = p.w1.rpc(
+        &d.state,
+        "agent_send",
+        json!({"alias": "pm", "text": "done", "message": "r7", "priority": "urgent"}),
+    );
+    assert!(frame_err(&r).contains("steering rule"), "{r}");
+    let (rc, out) = p.w1.cadence(
+        &d.state,
+        "send pm --text done --message r8 --priority urgent",
+    );
+    assert_ne!(rc, 0, "{out}");
+    assert!(out.contains("steering rule"), "{out}");
+    // Nothing changed on any refused route.
+    for id in ["q1", "q2", "q3"] {
+        assert_eq!(shown_message(&d, "w1", id)["state"], "queued", "{id}");
+    }
+    for id in ["r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8"] {
+        for alias in ["w1", "pm"] {
+            assert!(
+                shown_message(&d, alias, id).is_null(),
+                "{id} queued on {alias}"
+            );
+        }
+    }
+
+    // The recipient's PM may.
+    let r = p.pm.rpc(&d.state, "agent_send", steer("s1", "w1"));
+    assert_eq!(r["ok"], true, "{r}");
+    let q1 = shown_message(&d, "w1", "q1");
+    assert_eq!(q1["state"], "cancelled");
+    assert_eq!(q1["result"]["reason"], "superseded by s1");
+    assert_eq!(q1["result"]["by"], "pm");
+    assert_eq!(q1["result"]["by_kind"], "agent");
+    assert_eq!(shown_message(&d, "w1", "s1")["priority"], "urgent");
+    // So may the operator, through the CLI.
+    let (ok, stdout, stderr) = d.operator_cadence(&[
+        "send",
+        "w1",
+        "--text",
+        "one current instruction",
+        "--message",
+        "s2",
+        "--priority",
+        "urgent",
+        "--supersedes",
+        "q2,q3",
+    ]);
+    assert!(ok, "{stdout}{stderr}");
+    for id in ["q2", "q3"] {
+        let m = shown_message(&d, "w1", id);
+        assert_eq!(m["state"], "cancelled", "{id}");
+        assert_eq!(m["result"]["reason"], "superseded by s2");
+        assert_eq!(m["result"]["by"], "operator");
+    }
+    // A supersede naming an already superseded row changes nothing.
+    let (ok, stdout, stderr) = d.operator_cadence(&[
+        "send",
+        "w1",
+        "--text",
+        "again",
+        "--message",
+        "s3",
+        "--supersedes",
+        "s2,q1",
+    ]);
+    assert!(!ok, "{stdout}");
+    assert!(
+        stderr.contains("message 'q1' is cancelled") && stderr.contains("nothing changed"),
+        "{stderr}"
+    );
+    assert_eq!(shown_message(&d, "w1", "s2")["state"], "queued");
+    assert!(shown_message(&d, "w1", "s3").is_null());
+}
+
+/// CAD-158 acceptance 4, end to end on a managed (fake) actor: an urgent
+/// message sent while a turn is parked on an open approval neither
+/// interrupts the turn nor answers the approval; once the turn ends it
+/// is delivered ahead of the normal messages queued before it, and
+/// those keep their FIFO order. A managed actor's loop is serial, so
+/// this does not exercise the CAD-250 hold —
+/// `pty_urgent_waits_for_the_held_turn_then_goes_first` does.
+#[test]
+fn urgent_waits_for_the_open_approval_then_goes_first() {
+    let d = TestDaemon::start();
+    d.register("w1");
+    d.wait_agent("w1", "idle", 10);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "NEED_INPUT:hold", "message": "m0"}),
+    )
+    .unwrap();
+    d.wait_agent("w1", "waiting_input", 10);
+    for id in ["n1", "n2"] {
+        d.rpc(
+            "agent_send",
+            json!({"alias": "w1", "text": format!("normal {id}"), "message": id}),
+        )
+        .unwrap();
+    }
+    d.operator_rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "urgent correction", "message": "u1",
+               "priority": "urgent"}),
+    )
+    .unwrap();
+    // The open approval and its turn are untouched.
+    assert_eq!(shown_message(&d, "w1", "m0")["state"], "running");
+    assert_eq!(shown_message(&d, "w1", "u1")["state"], "queued");
+    let requests = d.rpc("agent_requests", json!({"alias": "w1"})).unwrap();
+    let list = requests["requests"].as_array().unwrap();
+    assert_eq!(list.len(), 1, "{requests}");
+    let handle = list[0]["request"].as_str().unwrap().to_string();
+    d.rpc(
+        "agent_respond",
+        json!({"alias": "w1", "request": handle, "decision": "accept"}),
+    )
+    .unwrap();
+    for id in ["m0", "u1", "n1", "n2"] {
+        d.wait_message("w1", id, &["completed"], 15);
+    }
+    let started: Vec<String> = d
+        .events("w1")
+        .iter()
+        .filter(|e| e["kind"] == "submitting")
+        .map(|e| e["payload"]["message"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(started, ["m0", "u1", "n1", "n2"]);
+}
+
+/// CAD-158 acceptance 4 on a pty lane (PR #252 QA N3): the CAD-250 hold
+/// is what keeps an urgent message from interrupting a running turn. A
+/// pty worker holds one unreported turn; an urgent message queued behind
+/// it stays `queued` even while the actor demonstrably keeps claiming
+/// (a routed notice queued after it is delivered). The report is the
+/// boundary: the urgent message is the next turn, ahead of the normal
+/// ones queued before it, which keep their order.
+#[test]
+fn pty_urgent_waits_for_the_held_turn_then_goes_first() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_stub();
+    d.register("helper");
+    d.register_stub("w1", json!({"auto_ready": "verified"}));
+    d.wait_agent("helper", "idle", 10);
+    d.wait_agent("w1", "idle", 20);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "held turn", "message": "h0"}),
+    )
+    .unwrap();
+    let token0 = pty_token(&d, "w1", "h0");
+    for id in ["n1", "n2"] {
+        d.rpc(
+            "agent_send",
+            json!({"alias": "w1", "text": format!("normal {id}"), "message": id}),
+        )
+        .unwrap();
+    }
+    d.operator_rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "urgent correction", "message": "u1",
+               "priority": "urgent"}),
+    )
+    .unwrap();
+    // The actor keeps claiming past the hold: a routed notice queued
+    // after u1 is pasted, while u1 stays queued behind the held turn.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "helper", "text": "ping", "message": "x1", "reply_to": "w1"}),
+    )
+    .unwrap();
+    d.wait_message("helper", "x1", &["completed"], 15);
+    let routed = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["source"] == "worker_result")
+        .expect("routed result queued on w1")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    d.wait_message("w1", &routed, &["completed"], 20);
+    assert_eq!(d.message_state("w1", "h0"), "running");
+    for id in ["u1", "n1", "n2"] {
+        assert_eq!(d.message_state("w1", id), "queued", "{id}");
+    }
+    // The report is the safe boundary: u1 is the next turn.
+    d.rpc(
+        "message_report",
+        json!({"message": "h0", "token": token0, "kind": "result", "text": "done"}),
+    )
+    .unwrap();
+    let token1 = pty_token(&d, "w1", "u1");
+    assert_eq!(d.message_state("w1", "n1"), "queued");
+    assert_eq!(d.message_state("w1", "n2"), "queued");
+    d.rpc(
+        "message_report",
+        json!({"message": "u1", "token": token1, "kind": "result", "text": "done"}),
+    )
+    .unwrap();
+    pty_token(&d, "w1", "n1");
+    assert_eq!(d.message_state("w1", "n2"), "queued");
+}
