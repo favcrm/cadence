@@ -43747,7 +43747,29 @@ fn delivery_loop_review_revise_pass_merge_end_to_end() {
     // identity and are not the operator: a root agent they try to mint
     // outside the worker's group is refused, nothing written.
     let before = lf.snapshot();
-    let agents = || lf.f.d.rpc("agent_list", json!({})).unwrap()["agents"].clone();
+    // Registrations only: rows also carry live clocks (`silent_secs`,
+    // inbox ages) that tick under load and say nothing about a write.
+    let agents = || -> std::collections::BTreeMap<String, Value> {
+        let list = lf.f.d.rpc("agent_list", json!({})).unwrap()["agents"].clone();
+        list.as_array()
+            .unwrap()
+            .iter()
+            .map(|a| {
+                let reg = [
+                    "provider",
+                    "endpoint_kind",
+                    "role",
+                    "team_role",
+                    "cwd",
+                    "params",
+                ]
+                .iter()
+                .map(|k| (k.to_string(), a[*k].clone()))
+                .collect::<serde_json::Map<_, _>>();
+                (a["alias"].as_str().unwrap().to_string(), Value::Object(reg))
+            })
+            .collect()
+    };
     let roster = agents();
     for (how, alias) in [("detached", "a0"), ("detached-bare", "a00")] {
         let r = lf.w1.rpc(
@@ -43763,7 +43785,11 @@ fn delivery_loop_review_revise_pass_merge_end_to_end() {
             "{how}"
         );
     }
-    assert_eq!(agents(), roster, "a refused registration wrote an agent");
+    assert_eq!(
+        agents(),
+        roster,
+        "a refused registration wrote or changed an agent"
+    );
     assert_eq!(lf.snapshot(), before);
 
     // Worker done → the daemon routes a review to r1 (never w1, its
