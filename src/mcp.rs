@@ -17,7 +17,10 @@
 //! `arguments` carry `tool_name`, `input` and `tool_use_id`.
 //!
 //! Identity comes from `CADENCE_ALIAS`/`CADENCE_STATE_DIR` in the
-//! environment (the generated mcp-config sets both explicitly).
+//! environment (the generated mcp-config sets both explicitly). The
+//! alias only names the agent: the daemon accepts these request RPCs
+//! solely from that agent's own connection — this server runs as a
+//! child of the brokered provider, whose enrollment proves it (CAD-376).
 //! `CADENCE_PERMISSION_TIMEOUT_SECS` bounds the wait — expiry denies
 //! rather than hanging the turn. A daemon restart mid-wait is retried
 //! until the deadline, then denied: the pending map is in-memory, so a

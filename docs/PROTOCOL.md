@@ -52,9 +52,9 @@ Error kinds:
 | `thread_send` | `alias, text, message?` | `agent_send`'s receipt plus `thread` — starts the alias's thread on first use, inside the enqueue transaction (a refused message starts none), and queues the text as an `operator` entry. Refused for a connection the daemon attributes to an agent (pane or enrolled managed endpoint), for an underivable caller, and for one tied to no agent that is not provably the operator (`peer::operator_proof`, CAD-384) — a detached child of an agent. Any other field is refused. Once a thread exists, every message queued to the alias is recorded too: `operator` when `agent_send`'s connection is tied to no agent — which then must be provably the operator, or the send is refused (CAD-384) — `system` (payload `from`/`source`) otherwise |
 | `agent_requests` | `alias` | `{requests:[{request,method,params}]}` |
 | `agent_respond` | `alias, request, decision?|answers?, reason?` | `{state:"answered"}` — `reason` rides a brokered decline as the provider's denial message. Caller rule (CAD-370): the proven operator or the requester's own PM; the requesting agent never answers its own request, and a refused answer leaves it pending (see Caller rules) |
-| `request_open` | `alias, kind?, tool, input_summary?, input?, request?` | `{request,state:"waiting_input",existing?}` — registers a brokered request (caller-named `request` dedupes retries); `rejected` unless the agent's params carry `broker_approvals` |
-| `request_wait` | `request, wait?(<=120)` | `{state:"waiting"}` on slice expiry, `{state:"answered",answer}` after `agent_respond`, `{state:"closed",reason}` once the handle is gone (actor exit, daemon restart, `request_close`) |
-| `request_close` | `request` | `{state:"closed"}` or `{state:"answered",answer}` — retires the handle a waiter abandoned (local deadline); a boundary-parked answer still lands |
+| `request_open` | `alias, kind?, tool, input_summary?, input?, request?` | `{request,state:"waiting_input",existing?}` — registers a brokered request (caller-named `request` dedupes retries); `rejected` unless the agent's params carry `broker_approvals`. **Caller rule (CAD-376), from the connection only** (the nearest registered pane or strictly verified enrolled endpoint on the peer's ancestry — never `alias`, never `CADENCE_ALIAS`): only the owning agent's own connection — in practice its `mcp-permission` server, a child of the brokered provider — may call it; another agent, a connection with no agent identity (the operator included: it answers with `agent_respond`) and a request carrying `by`/`as`/`actor`/`caller`/`operator`/`reviewer`/`pane`/`lane`/`pid` are refused naming the rule, before anything is recorded — a refused open parks nothing and notifies no one |
+| `request_wait` | `request, wait?(<=120)` | `{state:"waiting"}` on slice expiry, `{state:"answered",answer}` after `agent_respond`, `{state:"closed",reason}` once the handle is gone (actor exit, daemon restart, `request_close`). Waiting consumes the parked answer, so the same caller rule applies: another agent's wait is refused and the answer stays parked for the owner |
+| `request_close` | `request` | `{state:"closed"}` or `{state:"answered",answer}` — retires the handle a waiter abandoned (local deadline); a boundary-parked answer still lands. Same caller rule: another agent's close is refused and the handle stays pending (or its answer parked) |
 | `agent_ready` | `alias, by?, force?` | `{state:"ready-claimed"}` — single-use readiness claim for `pty`; probes the pane first and refuses a visibly busy one unless `force`; `by` records the claimer |
 | `agent_capture` | `alias` | `{capture}` — current pane contents (pty) |
 | `agent_probe` | `alias` | `{probe:{idle,reason,...}}` — analyzed pane state without claiming (pty) |
@@ -1495,7 +1495,8 @@ The agent stays `waiting_input` while other requests remain pending.
 Brokered requests share the same model through a second entry point:
 `request_open` registers one (method `cadence/<kind>`), `request_wait`
 blocks the caller until the answer is parked or the handle is gone, and
-`request_close` retires a handle the caller abandoned. `agent_respond`
+`request_close` retires a handle the caller abandoned — all three only
+from the requesting agent's own connection (CAD-376). `agent_respond`
 branches on the method — `cadence/*` requests accept `--decision
 accept|decline` (with an optional `--reason` on decline) and park the
 answer for the waiter instead of calling `adapter.respond`; provider
