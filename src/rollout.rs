@@ -3235,7 +3235,13 @@ mod tests {
             Ok(value) => serde_json::json!({"ok": true, "value": value}),
             Err(error) => serde_json::json!({"ok": false, "error": error.to_string()}),
         };
-        std::fs::write(out_path, payload.to_string()).unwrap();
+        // The reparented parent polls for `out.json` and reads it the
+        // moment it exists; `fs::write` creates the file before it
+        // writes, so publish by rename — the parent sees all or nothing
+        // (CAD-421).
+        let partial = format!("{out_path}.partial");
+        std::fs::write(&partial, payload.to_string()).unwrap();
+        std::fs::rename(&partial, out_path).unwrap();
     }
 
     #[test]
