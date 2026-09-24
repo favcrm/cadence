@@ -913,24 +913,56 @@ mod tests {
         }
     }
 
-    /// A provider item that lands between `take_queued` (`submitting`)
-    /// and `mark_running` still links to its turn (the CI race behind
-    /// `cad319_thread_records_codex_agent_messages`).
+    /// CAD-415: Codex persists items right behind the `turn/start`
+    /// reply, before `on_started` marks the message `running`. Text that
+    /// lands in that window — appended or held — still belongs to the
+    /// turn; with only `running` counted it was recorded with no message.
     #[test]
-    fn running_append_links_a_submitting_turn() {
+    fn items_before_the_turn_is_marked_running_link_to_the_submitting_message() {
         let (dir, s) = store();
         reg(&s, "master", dir.path());
         s.ensure_thread("master").unwrap();
-        s.enqueue("master", "do it", None, "m1", "user").unwrap();
-        assert!(matches!(
-            s.take_queued("master").unwrap(),
-            crate::store::Take::Message(_)
-        ));
-        assert_eq!(s.message("m1").unwrap().unwrap().state, "submitting");
-        s.thread_append_running("master", ROLE_AGENT, KIND_ASSISTANT_TEXT, "looking", None)
+        s.enqueue("master", "status?", None, "x1", "user").unwrap();
+        let crate::store::Take::Message(taken) = s.take_queued("master").unwrap() else {
+            panic!("x1 was not taken");
+        };
+        assert_eq!(taken.id, "x1");
+        assert_eq!(s.message("x1").unwrap().unwrap().state, "submitting");
+        s.thread_append_running(
+            "master",
+            ROLE_AGENT,
+            KIND_ASSISTANT_TEXT,
+            "looking",
+            Some(json!({"phase": "commentary"})),
+        )
+        .unwrap();
+        s.thread_hold_running("master", "an aside", json!({"phase": null}))
             .unwrap();
-        let entries = s.thread_entries("master", 0, 10).unwrap();
-        assert_eq!(entries[1].message_id.as_deref(), Some("m1"), "{entries:?}");
+        s.mark_running("x1", "t-1").unwrap();
+        let message = s.message("x1").unwrap().unwrap();
+        s.finish(
+            &message,
+            "completed",
+            &json!({"turn_id": "t-1", "status": "completed", "text": "MOCK_OK"}),
+            None,
+        )
+        .unwrap();
+        let shape: Vec<(String, String, Option<String>)> = s
+            .thread_entries("master", 0, 10)
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.kind, e.text, e.message_id))
+            .collect();
+        let x1 = || Some("x1".to_string());
+        assert_eq!(
+            shape,
+            vec![
+                ("message".into(), "status?".into(), x1()),
+                ("assistant_text".into(), "looking".into(), x1()),
+                ("assistant_text".into(), "an aside".into(), x1()),
+                ("turn_result".into(), "MOCK_OK".into(), x1()),
+            ]
+        );
     }
 
     #[test]
