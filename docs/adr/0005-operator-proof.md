@@ -66,6 +66,13 @@ This inventory is taken at `77529d8`. It does not include open PRs
 #184 (CAD-337) and #187 (CAD-149/304), which add caller checks to
 `model_defaults_set` and to `agent set/remove/gc`.
 
+> **Superseded in part by §1.6.** #241 (CAD-384), #184 and #187 gave
+> every daemon RPC a caller rule. The Class 3 rows below (for example
+> `agent_set`, `model_defaults_set`, `message_cancel` and `job_close`)
+> therefore describe `77529d8`, not current main. For those methods,
+> read the rule in `daemon::caller_rule::RULES`. Classes 1, 2 and 4
+> still describe main, apart from the rows §1.6 names.
+
 **Class 1 — `operator_proof` gated.** These are positive in name only
 (§1.3).
 
@@ -179,7 +186,7 @@ accepted this ADR, the CAD-411 epic had landed or opened the following:
 
 | Change | Effect on this ADR |
 |---|---|
-| #241 (CAD-384), merged | `daemon::caller_rule::RULES` gives every daemon RPC one caller rule. `Who` is one of three values: `Operator` (by `operator_proof`), `Agent` (by a pane or enrolled endpoint) or `Unproven`. `Unproven` is refused by every connection-checked rule. The CLI no longer defaults `--by` to `operator`. **On the daemon, P1 is therefore mostly in place already.** What remains is that `Who::Operator` is still a heuristic, and that 4 methods are still `Rule::Unguarded` (§13 T6). #241 also adds `rollout_grant` / `rollout_revoke`: an operator-granted, time-boxed right for one agent. That is the first delegation in cadence, and the ticket that builds §5.5 should generalise it (§13 T5). |
+| #241 (CAD-384), merged | `daemon::caller_rule::RULES` gives every daemon RPC one caller rule. `Who` is one of three values: `Operator` (by `operator_proof`), `Agent` (by a pane or enrolled endpoint) or `Unproven`. `Unproven` is refused by every connection-checked rule. The CLI no longer defaults `--by` to `operator`. **On the daemon, P1 is therefore mostly in place already.** What remains is that `Who::Operator` is still a heuristic, and that five methods are still `Rule::Unguarded` in the table: `request_open`, `agent_inbox`, `job_new`, `task_new` and `monitor_heartbeat` (§13 T6). #240 (CAD-376), since merged, scopes `request_open`'s brokered request handles to the agent's own connection, but its table row still reads `Unguarded`. #241 also adds `rollout_grant` / `rollout_revoke`: an operator-granted, time-boxed right for one agent. That is the first delegation in cadence, and the ticket that builds §5.5 should generalise it (§13 T5). |
 | #184 (CAD-337) and #187 (CAD-149/304), merged | `model_defaults_set` and `agent set/remove/gc` now check the caller through that rule. That closes Class 3 for them, still with a heuristic `Operator`. |
 | #220 (CAD-385), merged | A start-time check on the pid-to-alias maps (pid reuse). `unlock` (§5.2) binds the session leader's start time in the same way. |
 | #249 (CAD-313 + CAD-428), open | Implements ADR 0004. Operator-only board routes need a session plus the process proof on the TCP peer. The link mint (`operator_link_mint`) needs `operator_proof` **and** the 0600 secret. §13 T2 swaps that mint factor for a signed `login` grant and leaves the rest of #249 as it is. |
@@ -219,9 +226,13 @@ Two new pieces of evidence were added to CAD-280 after the proposal:
   *narrowing* layer: they can refuse, never grant.
 - **P4 — the audit can tell proof from claim.** `docs/AUDIT.md` marks
   every approval `operator-claimed · unverified until CAD-280`. After
-  this ADR, an approval is either **verified** (by a check that A2 cannot
-  satisfy on this host) or reported as a claim. It is never silently
-  upgraded.
+  this ADR, an approval is either **verified** or reported as a claim.
+  It is never silently upgraded. **Verified** means the signature checks
+  out against the **committed, human-class-reviewed**
+  `.cadence/operator_signers` (Q8, §13 T4), not only against the
+  state-dir `allowed_signers`. A same-uid agent can rewrite the
+  state-dir file (§8 R7). It cannot change the committed file without a
+  reviewed approval.
 - **P5 — honest residuals, pinned by tests.** Every path that still
   gives operator without the operator is listed in §8. Where a test can
   express it, a test pins it, so that a fix flips it on purpose.
@@ -320,20 +331,36 @@ The key is used in two ways:
 2. **Signed records (durable evidence).** A human-class decision, such as
    an approval of an exact head, a plan decision, or a force-release, is
    stored **with its signature** over a canonical record (repo, PR, full
-   head SHA, class, decision, time, nonce). `cadence audit` verifies the
-   signature. So can CI, with `allowed_signers` committed to the repo.
-   **Writing that row directly into `cadence.sqlite3` (A2) cannot forge
-   the signature.** This is what lets the audit move from
-   `operator-claimed` to `verified` (P4).
+   head SHA, class, decision, time, nonce). `cadence audit` and CI
+   verify the signature against the **committed**
+   `.cadence/operator_signers`. **Writing that row directly into
+   `cadence.sqlite3` (A2) does not forge a signature by a committed
+   key.** This is what lets the audit move from `operator-claimed` to
+   `verified` (P4).
+
+   The state-dir `allowed_signers` is **not** a trust anchor against A2:
+   it is a file owned by the agents' own uid (§8 R7). A local
+   verification against it alone proves nothing against A2, and `audit`
+   must not call it `verified`.
 
 - **A1:** it holds for every detach shape. No process shape produces a
   signature. `setsid -f`, `env -i`, its own tmux server,
   `systemd-run --user` and a scrubbed stdio all produce the same thing:
   a caller without a grant.
 - **A2:** mixed, and stated precisely:
-  - **Signed records: they hold.** A2 can delete or roll back rows, but
-    it cannot forge one. The CI verifier sees any forgery. A deletion
-    shows up as a missing approval, which the audit already reports.
+  - **Signed records: they hold against the committed signers, and only
+    against those.** A2 can delete or roll back rows. It can also enrol
+    its own key in the state-dir `allowed_signers`, or run a patched
+    daemon, and then sign rows that verify *locally* (R7). What it cannot
+    do is produce a signature by a key in the committed
+    `.cadence/operator_signers`. So verification against the committed
+    file (CI, T4) catches the forgery. A deletion shows up as a missing
+    approval, which the audit already reports.
+  - **Live authority: a deliberate, detected act, not a boundary.** The
+    same R7 path (rewrite the state-dir signers, or patch the daemon, then
+    restart) gives A2 live operator authority. The fingerprint log at
+    daemon start and `operator_signers_changed` detect it. Only Option D
+    (CAD-461) prevents it.
   - **A hardware key: holds for each signature.** A2 cannot touch the
     token. It *can* trigger a signing prompt at a moment when the
     operator expects one (a confused touch). §5.3 makes the prompt show
@@ -366,7 +393,8 @@ The key is used in two ways:
 - **Migration:** §6. **Tests:** §10.
 - **Verdict: chosen** (§4, §12). It is the only option that closes A1 by
   construction, works for HTTP and CLI alike, works on macOS, adds no
-  crate, and gives the audit evidence that survives A2.
+  crate, and gives the audit evidence that survives A2 when it is
+  verified against the committed signers (R7).
 
 ### Option D — A separate OS user for agents, with no sudo
 
@@ -410,8 +438,8 @@ The agents run as `cadence-agent`. The operator stays `ubuntu`.
 | | A heuristics | B 0600 secret | **C operator key** | D separate uid |
 |---|---|---|---|---|
 | A1: any detach shape | fails | fails (`cat`) | **holds** | holds |
-| A2: live authority | fails | fails | holds per signature; the unlock TTL lends | **holds** |
-| A2: forged approval rows | fails | fails | **holds** (verified signature) | holds |
+| A2: live authority | fails | fails | a deliberate, detected act (R7); the unlock TTL lends (R2) | **holds** |
+| A2: forged approval rows | fails | fails | **holds against the committed signers** (CI, T4); not against the state-dir file (R7) | holds |
 | A3: root | fails | fails | records hold off host; touch holds | holds only without agent sudo |
 | Works for HTTP / the board | no | yes | yes (it mints ADR 0004's link) | yes |
 | macOS, no `/proc` | no | yes | **yes** | yes |
@@ -449,7 +477,9 @@ What this buys against CAD-280's acceptance:
 - **Item 2 holds against A1**, for every detach shape, by construction.
 - Against A2 it becomes a deliberate act, and a detected one where
   detection is possible.
-- Against A2 and A3, human-class records stay verifiable.
+- Against A2 and A3, human-class records stay verifiable against the
+  committed `.cadence/operator_signers` (T4). They are not verifiable
+  against the state-dir file, which A2 can rewrite (R7).
 
 ## 5. Design sketch
 
@@ -470,12 +500,16 @@ work and a reviewer to attack the design. Field names are illustrative.
 - **Detection:** the daemon keeps `allowed_signers` in memory. It
   refuses to use a file that changed on disk without going through the
   verb, and raises `operator_signers_changed` on the Overview "needs me"
-  rail. A2 can still restart the daemon to reload a forged file. That
-  restart is itself a daemon event, and the daemon logs the key
-  fingerprint set at every start.
-- **The repo copy:** for CI verification, `allowed_signers` is also
-  committed. `.cadence/operator_signers` is a public key, not a secret.
-  Changing it is a risk-class `human` change (trigger 1).
+  rail. A2 can still restart the daemon to reload a forged file, or
+  run a patched daemon. That restart is itself a daemon event, and the
+  daemon logs the key fingerprint set at every start. This is residual
+  R7 (§8). The state-dir file is the daemon's **working copy**. The
+  trust anchor for records is the committed copy.
+- **The repo copy:** `.cadence/operator_signers` is committed. It holds
+  public keys, not secrets. Changing it is a risk-class `human` change
+  (trigger 1). `cadence audit` verifies records against it. When the
+  state-dir set differs from the committed set, `audit` flags the
+  mismatch, and it never reports `verified` on the state-dir set alone.
 
 ### 5.2 Grants (challenge-response)
 
@@ -640,9 +674,19 @@ differ, §13 applies.
 
 ### 6.3 Existing installs, this host included
 
-- The operator enrols a key before step 3 reaches `enforce`. `cadence
-  doctor` and `ui status` report "no operator key enrolled", with the
-  command to run.
+- **A deployment precondition, not a rollout step.** The operator
+  enrols **both** keys (Q2: the FIDO2 key and the passphrase recovery
+  key) on the production state dir, and commits them to
+  `.cadence/operator_signers`, **before** any release carrying T2 or T3
+  is installed. `cadence doctor` must report both keys as enrolled and
+  matching the committed set.
+  - T3 enforces per-act signatures as soon as it is deployed. It has no
+    observe phase.
+  - T2 makes board login require a signed grant.
+  - Without the keys, approvals, plan decisions, force-release and board
+    login all become impossible. The only way back is the R4 bootstrap.
+  - Until then, `cadence doctor` and `ui status` report "no operator key
+    enrolled", with the command to run.
 - Legacy approval rows stay `operator-claimed` forever. They are not
   re-signed after the fact, because re-signing an old decision would
   launder it.
@@ -665,6 +709,12 @@ differ, §13 applies.
 The operator accepted this table with the ADR. The §13 tickets close or
 re-state each residual in code and docs, and each ticket names its rows.
 
+The QA review of this ADR (qa-1, 2026-09-24) found one **new** residual
+that this design itself creates. A same-uid agent can enrol its own key
+in the state-dir `allowed_signers`. It is accepted as **R7** in §8, and
+its fix is tied to CAD-461 (Option D) for live authority, and to the
+committed signers (T4) for records.
+
 | Residual | Where it is documented today | Under this ADR |
 |---|---|---|
 | **CAD-276, the reconcile detach.** `env -u CADENCE_ALIAS setsid -f` passes `operator_proof`. | `peer.rs` `operator_proof` doc. `docs/AUDIT.md`. | **Closed.** A detached process holds no grant: it left the unlocked session, and it cannot sign. `operator_proof` no longer grants anything, so its residual is no longer an authority path. |
@@ -681,12 +731,13 @@ re-state each residual in code and docs, and each ticket names its rows.
 
 | # | Residual | Class | Why it is accepted | Pinned by |
 |---|---|---|---|---|
-| R1 | Root (NOPASSWD sudo on this host) can patch the daemon and grant anything live | A3 | No in-host design survives root. Signed records stay verifiable off the host. §9 Q1. | Documented. Not testable in CI. |
+| R1 | Root (NOPASSWD sudo on this host) can patch the daemon and grant anything live | A3 | No in-host design survives root. Signed records stay verifiable off the host, against the committed signers. §9 Q1. | Documented. Not testable in CI. |
 | R2 | An agent can drive an **unlocked** operator terminal (tmux `send-keys`, the operator's tmux server) and use the routine grant until its TTL lapses | A2 | This is the unlock trade-off (sudo's timestamp has the same one). Human-class acts still show a prompt and need a touch or a passphrase. | A test: `send-keys` into an unlocked fixture session succeeds for a routine verb and produces a visible prompt for a human-class verb. |
 | R3 | A trojaned `cadence` or `ssh-keygen` on `PATH` captures a passphrase, or triggers an unexpected touch | A2 | A binary the uid can replace cannot be trusted by that uid. A hardware key limits this to one confused touch, never to a key. | Documented. `cadence doctor` checks that the release symlink matches the release manifest. |
 | R4 | Bootstrap and all-keys-lost fall back to `operator_proof` with the daemon stopped | A1 (narrow) | Bootstrap needs *some* first proof. It requires a stopped daemon, which is an overt act, and it is logged at the next start. | A test: bootstrap refuses while the daemon runs. |
 | R5 | Anything the operator runs **inside** an unlocked terminal inherits the routine grant, for example an agent CLI started by hand in that shell | operator's choice | The same as sudo. The narrowing layer refuses registered panes and endpoints. An un-cadenced agent the operator started is the operator's delegate by their own act. | Documented in the `unlock` output. |
 | R6 | A2 deletes or rolls back signed approval rows | A2 | This cannot be prevented on one uid. The audit already reports a missing approval as a finding, and CI verification catches a substituted row. | The existing audit tests, plus a new tampered-row test. |
+| R7 | **A2 enrols its own key.** It rewrites the state-dir `<state>/operator/allowed_signers` (a 0600 file owned by the agents' own uid), or runs a patched daemon, and restarts the daemon. It then holds **live operator authority**, and it signs records that **verify locally** against the state-dir file. | A2 | On one uid, the daemon's own inputs and binary are the agent's to write. The daemon logs the fingerprint set at every start and raises `operator_signers_changed`. **Records** stay honest: signatures by a key that is not in the committed `.cadence/operator_signers` fail verification in CI and in `audit` (T4), and changing the committed file needs a human-class approval. **Live authority** is closed only by Option D, agents under a uid without sudo (CAD-461, T8). | A test: a key appended to the state-dir file directly (not through the verb) is not used until a restart. After a restart, `audit` reports records signed by it as not verified against the committed signers, and flags the signer-set mismatch. |
 
 ## 9. Questions the operator answered (the answers are in §12)
 
@@ -778,8 +829,10 @@ is the test that proves a grant cannot be carried out of its session.
 - A row written straight into `cadence.sqlite3` with a made-up signature
   is reported `forged`. A legacy row is reported `operator-claimed`. A
   deleted row is reported missing (as today).
-- CI's verifier, run against the committed signers, gives the same
-  answer as `cadence audit`.
+- CI's verifier and `cadence audit` both verify against the committed
+  `.cadence/operator_signers`, and they give the same answer. A key
+  appended to the state-dir file (R7) yields `unanchored` in `audit` and
+  a failure in CI, never `verified`.
 
 ### 10.4 Delegation (T-D)
 
@@ -835,10 +888,10 @@ rows are marked **default**, and the operator may override any of them.
 
 | # | Question | Decision | Source |
 |---|---|---|---|
-| Q1 | Sudo posture | **Accepted for now.** Operator proof is a guardrail against A1, not a boundary against a determined same-uid agent (A2 or A3). Option D (agents under a uid without sudo) is scheduled as a follow-up ticket (§13 T8). | operator |
-| Q2 | Key kind | **A FIDO2 hardware key for daily use, plus a passphrase key enrolled as recovery.** Both are enrolled at setup (§6.4). Every grant event and every signed record names the key fingerprint that signed it, so any use of the recovery key is visible. | operator |
+| Q1 | Sudo posture | **Accepted for now.** Operator proof is a guardrail against A1, not a boundary against a determined same-uid agent (A2 or A3). Option D (agents under a uid without sudo) is scheduled as follow-up ticket **CAD-461** (§13 T8). | operator |
+| Q2 | Key kind | **A FIDO2 hardware key for daily use, plus a passphrase key enrolled as recovery.** Both are enrolled at setup (§6.4). Every grant event and every signed record names the key fingerprint that signed it, so any use of the recovery key is visible. **Still open: how the FIDO2 signature reaches this host.** The token is on the operator's machine, not on this host. Either `-sk` agent forwarding over ssh, or a challenge pasted and signed locally, with the signature pasted back. The operator has not answered this. T1 owns it, and must support whichever path the operator actually uses (ask before building). | operator (kind); **open** (transport, T1) |
 | Q3 | Per-act signatures | **The proposed set:** approval record and revoke, plan approve and reject, and rollout force-release. Merge (`cadence land`) and `agent set approval_policy=…` were **not** added. They were left unanswered, so the default applies. | operator (set); default (no additions) |
-| Q4 | Delegation | **Yes.** A PM session that is attributable (a pane or an enrolled endpoint) may hold a signed, time-boxed delegation for **routine operator verbs only**. Human-class acts are never delegable. The maximum lifetime is **24 h**, the value from §5.5's example. The delegation generalises #241's `rollout_grant`. | default |
+| Q4 | Delegation | **Yes.** A PM session that is attributable (a pane or an enrolled endpoint) may hold a signed, time-boxed delegation for **routine operator verbs only**. These are exactly the daemon verbs of §4 item 5: `slot_reconcile`, `agent_set`, `agent_remove`, `agent_gc`, `agent_register` and `model_defaults_set`, plus the rollout lease right that #241's `rollout_grant` already delegates (`rollout claim` and the lease holder's `shutdown`). **Never delegable:** the human-class acts (Q3); board operator routes, which run on the operator's own browser session; and the `operator` verbs themselves (enrol, unlock, delegate, grants). The maximum lifetime is **24 h**, from §5.5's example (§9 Q4 posed the question without a number). The delegation generalises `rollout_grant`. | default |
 | Q5 | Unlock TTL | **8 h** default with no idle expiry, and a **12 h** maximum | default |
 | Q6 | Unattributable callers | **Refused.** They get public reads only. There is no `unproven-local` stamp, and the Class 4 tracker writes stop stamping `operator` (§13 T6). | operator |
 | Q7 | ADR 0004's mint factor | **Replaced** by a signed `login` grant. `operator_link_mint` stops requiring `operator_proof` plus the 0600 secret as its proof. The rest of ADR 0004 (#249) stands. | default |
@@ -864,15 +917,15 @@ caller-derivation PRs** at a time.
 | Ticket | Scope | Depends on | Derivation | Tests (§10) |
 |---|---|---|---|---|
 | **T1 — Operator keys, enrolment and the grant verifier** | **Enrolment:** `cadence operator enroll`, plus `--bootstrap` which needs the daemon stopped (§5.1). The first key needs `operator_proof` plus proof of possession. Later keys need a signature by an enrolled key. **Signers file:** `allowed_signers` is held in memory, and a change on disk raises an alert. **Grants:** `operator_challenge` / `operator_prove` shell out to `ssh-keygen -Y` (§5.2). `unlock` binds the sid, the session leader's start time (as in #220's CAD-385) and the ctty, with the 8 h / 12 h TTL. `lock` and `grants --revoke-all` end grants. The `act` grant is plumbed through. The grant events name the key fingerprint. **Harness:** a per-test key. `operator_rpc` signs instead of `setsid -f`, and the CAD-291 probe test is flipped. **Rows:** new `caller_rule::RULES` rows. **Not changed:** who counts as `Who::Operator`. | — | no (new RPCs only) | T-O (§10.2) |
-| **T2 — A signed `login` grant replaces ADR 0004's mint factor** | `cadence ui login` runs the challenge with `kind: login`. `operator_link_mint` accepts only a verified `login` grant. The 0600 secret leaves the mint path, and its file is retired or kept only for rotation of existing sessions (the ticket decides and documents which). Closes the CAD-412 row of §7 together with #249. | T1; #249 merged | yes (board operator path) | T-A row 9 (board `curl` from every shape). Minting from every shape without a signature is refused. |
-| **T3 — Per-act signatures for human-class verbs, and signed records** | Approval record and revoke, plan approve and reject, and rollout force-release, including the daemon-stopped path, which verifies against the signers in the state dir. The store keeps the statement, signature and fingerprint. `cadence audit` reports `verified`, `forged` or `operator-claimed` (legacy). `docs/AUDIT.md` "unverified until CAD-280" becomes "verified when signed". | T1 | yes (these verbs) | T-R (§10.3). For these verbs, T-A in full. |
-| **T4 — CI signer verification** | Commit `.cadence/operator_signers` (Q8). A CI job verifies, with `ssh-keygen -Y verify`, every human-class approval that a merge relies on. A change to the signers file must itself carry a human-class approval. | T3 | no | T-R's CI equivalence check |
-| **T5 — Delegation, and the `observe` release** | `cadence operator delegate <alias> --verbs … --until ≤24h` (Q4) generalises `rollout_grant`. Its stamp is `<alias> for operator`. `Who::Operator` is computed from grants alongside `operator_proof`. A caller that passes only `operator_proof` is still admitted but emits `operator_grant_would_refuse`, naming the verb and the peer's shape. `op-pm` moves to a pane plus a delegation. Ships as **one release** (Q9), and the would-refuse log is reviewed before T6. | T1 | yes | T-D (§10.4). A test that observe mode logs and does not refuse. |
-| **T6 — Refuse unattributable callers (`enforce`)** | `Who::Operator` only from a grant (an unlock, an `act`, a delegation, or a board session through the daemon). `operator_proof` becomes a narrowing check and is renamed. The four remaining `Rule::Unguarded` rows are closed, or each is re-stated with a reason. `agent_register` comes under the rule, and the raw harness sites are converted (the #187 note). Class 4 tracker writes stop stamping `operator` (Q6): they go through a daemon RPC, or they are refused. Closes the §7 rows for CAD-276, CAD-288, CAD-335 and qa-pr187 F1. | T5 plus one observe release; T2; T3 | yes | T-A (§10.1), the full matrix, run both with and without an unlocked session |
+| **T2 — A signed `login` grant replaces ADR 0004's mint factor** | `cadence ui login` runs the challenge with `kind: login`. `operator_link_mint` accepts only a verified `login` grant. The 0600 secret leaves the mint path, and its file is retired or kept only for rotation of existing sessions (the ticket decides and documents which). Closes the CAD-412 row of §7 together with #249. | T1; #249 merged. **Deploy precondition:** both operator keys enrolled on this host (§6.3). | yes (board operator path) | T-A row 9 (board `curl` from every shape). Minting from every shape without a signature is refused. |
+| **T3 — Per-act signatures for human-class verbs, and signed records** | Approval record and revoke, plan approve and reject, and rollout force-release, including the daemon-stopped path. For *live authority*, the daemon-stopped path verifies against the state-dir signers. The store keeps the statement, signature and fingerprint. `cadence audit` verifies records against the **committed** `.cadence/operator_signers`, not the state-dir file (R7). It reports `verified`, `forged`, `unanchored` (valid only against a state-dir key that is not committed; flagged) or `operator-claimed` (legacy). `docs/AUDIT.md` "unverified until CAD-280" becomes "verified when signed by a committed key". **Deploy precondition:** both operator keys are enrolled and committed on this host (§6.3). | T1 | yes (these verbs) | T-R (§10.3). For these verbs, T-A in full. |
+| **T4 — CI signer verification** | `.cadence/operator_signers` (Q8) is already committed under the §6.3 precondition. It is the trust anchor for records against A2 (R7). A CI job verifies, with `ssh-keygen -Y verify`, every human-class approval that a merge relies on. A change to the signers file must itself carry a human-class approval. | T3 | no | T-R's CI equivalence check |
+| **T5 — Delegation, and the `observe` release** | `cadence operator delegate <alias> --verbs … --until ≤24h`, for the verbs Q4 lists and no others generalises `rollout_grant`. Its stamp is `<alias> for operator`. `Who::Operator` is computed from grants alongside `operator_proof`. A caller that passes only `operator_proof` is still admitted but emits `operator_grant_would_refuse`, naming the verb and the peer's shape. `op-pm` moves to a pane plus a delegation. Ships as **one release** (Q9), and the would-refuse log is reviewed before T6. | T1 | yes | T-D (§10.4). A test that observe mode logs and does not refuse. |
+| **T6 — Refuse unattributable callers (`enforce`)** | `Who::Operator` only from a grant (an unlock, an `act`, a delegation, or a board session through the daemon). `operator_proof` becomes a narrowing check and is renamed. The five remaining `Rule::Unguarded` rows are closed, or each is re-stated with a reason: `request_open` (already scoped by #240), `agent_inbox`, `job_new`, `task_new` and `monitor_heartbeat`. `agent_register` comes under the rule, and the raw harness sites are converted (the #187 note). Class 4 tracker writes stop stamping `operator` (Q6): they go through a daemon RPC, or they are refused. Closes the §7 rows for CAD-276, CAD-288, CAD-335 and qa-pr187 F1. | T5 plus one observe release; T2; T3 | yes | T-A (§10.1), the full matrix, run both with and without an unlocked session |
 | **T7 — Drop the lateral pty tie for attribution** | `PeerTies::attributed_agents` uses ancestry and managed roots only. The pty and `CADENCE_ALIAS` narrow only (Q10). `ui_write_caller_pty_tie_is_forgeable_residual_pinned` flips to refused. After `respawn-pane`, the pty adapter refreshes the recorded pane pid, so the respawned process is attributed by ancestry (§7). | T6, since dropping the tie before unattributed callers are refused would escalate them | yes | The pinned-residual flip, plus a respawn-pane attribution test |
-| **T8 — Option D: agents under a uid without sudo** (Q1 follow-up) | Design and ops. Covers: creating the uid, splitting credentials (provider logins, `gh`, ssh), worktree ownership and `safe.directory`, tmux and the pty adapter across uids, and removing NOPASSWD sudo from the agent uid. It ends in its own ADR or runbook, and a decision on this host's posture. | — | no | Its own |
+| **T8 — Option D: agents under a uid without sudo** (Q1 follow-up; filed as **CAD-461**) | Design and ops. It is the only fix for R7's live-authority path. Covers: creating the uid, splitting credentials (provider logins, `gh`, ssh), worktree ownership and `safe.directory`, tmux and the pty adapter across uids, and removing NOPASSWD sudo from the agent uid. It ends in its own ADR or runbook, and a decision on this host's posture. | — | no | Its own |
 
-**Order.** T1 first. Then T2 and T3 in parallel (two derivation PRs).
+**Order.** T1 first. **Before T2 or T3 is deployed on this host, the operator enrols both keys and commits them (§6.3).** Then T2 and T3 in parallel (two derivation PRs).
 T4 follows T3. T5 follows the first of T2 and T3 to merge, within the
 two-PR limit. Then one release in `observe`, then T6, then T7. T8 is
 independent of all of them.
