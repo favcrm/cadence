@@ -18233,9 +18233,10 @@ fn recover_submit_sends_one_enter_and_keeps_correlation() {
         "{screen}"
     );
     // Normal correlation: still running under the token minted at
-    // paste; the report completes it.
-    let m = d.wait_message("st", "m1", &["running"], 5);
-    assert_eq!(m["turn_id"], token.as_str(), "{m}");
+    // paste (read from the store — CAD-375 withholds it from this
+    // connection); the report completes it.
+    d.wait_message("st", "m1", &["running"], 5);
+    assert_eq!(running_token(&d, "m1"), token);
     // A second recovery of the same message — racing, or later —
     // refuses and sends nothing.
     atomic_write(d.stub_pane_file(&mock, "st", "input"), RECOVER_BODY);
