@@ -12854,4 +12854,31 @@ fn pm_commit_stages_only_the_named_paths() {
         .unwrap();
     assert_eq!(foreign, ["planted.txt", "staged.txt"]);
     assert_eq!(commits(dir.path()), before);
+
+    // A plant inside a fresh untracked directory is named exactly —
+    // porcelain's default collapsing would report only `nest/`.
+    let nested = dir.path().join("nest/deep/planted-in-dir.txt");
+    std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+    std::fs::write(&nested, "x\n").unwrap();
+    let foreign = pm
+        .commit(&[dir.path().join("renamed.txt")], "no-op\n\nActor: t\n")
+        .unwrap();
+    assert_eq!(
+        foreign,
+        ["nest/deep/planted-in-dir.txt", "planted.txt", "staged.txt"],
+        "{foreign:?}"
+    );
+
+    // The scan is capped: past 64 foreign paths the list ends with a
+    // "(+N more)" marker instead of naming them all.
+    let big = dir.path().join("big");
+    std::fs::create_dir_all(&big).unwrap();
+    for i in 0..70 {
+        std::fs::write(big.join(format!("f{i:03}.txt")), "x\n").unwrap();
+    }
+    let foreign = pm
+        .commit(&[dir.path().join("renamed.txt")], "no-op\n\nActor: t\n")
+        .unwrap();
+    assert_eq!(foreign.len(), 65, "{foreign:?}");
+    assert_eq!(foreign.last().unwrap(), "(+9 more)");
 }

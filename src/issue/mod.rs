@@ -283,17 +283,20 @@ impl Pm {
                 return Err(e);
             }
         }
-        let foreign = self.foreign_paths(&rel);
+        let (foreign, foreign_extra) = self.foreign_paths(&rel);
         // Nothing of ours staged means nothing to commit — the foreign
         // paths still get reported.
         if !self.staged_dirty(&rel) {
-            warn_foreign(&self.dir, &foreign);
-            return Ok(foreign);
+            warn_foreign(&self.dir, &foreign, foreign_extra);
+            return Ok(foreign_out(foreign, foreign_extra));
         }
-        let message = if foreign.is_empty() {
+        let message = if foreign.is_empty() && foreign_extra == 0 {
             message.to_string()
         } else {
-            format!("{message}Foreign-Files: {}\n", foreign_listed(&foreign))
+            format!(
+                "{message}Foreign-Files: {}\n",
+                foreign_listed(&foreign, foreign_extra)
+            )
         };
         let mut commit = vec![
             "-c",
@@ -311,8 +314,8 @@ impl Pm {
             unstage(&self.dir, &rel);
             return Err(e);
         }
-        warn_foreign(&self.dir, &foreign);
-        Ok(foreign)
+        warn_foreign(&self.dir, &foreign, foreign_extra);
+        Ok(foreign_out(foreign, foreign_extra))
     }
 
     /// True when the index carries a change under one of `rel`.
@@ -330,70 +333,99 @@ impl Pm {
 
     /// Paths `git status` reports that this write did not touch —
     /// untracked plants, foreign modifications and staged entries
-    /// alike. `.write.lock` and `.index/` are the tracker's own
-    /// scratch (gitignored); they are filtered so a missing .gitignore
-    /// never turns every write into a false alarm.
-    fn foreign_paths(&self, ours: &[String]) -> Vec<String> {
+    /// alike. `--untracked-files=all` so a plant inside a fresh
+    /// directory is named exactly (`?? dir/` collapsing would report
+    /// only the directory — useless for spotting a forged file).
+    /// `.write.lock` and `.index/` are the tracker's own scratch
+    /// (gitignored); they are filtered so a missing .gitignore never
+    /// turns every write into a false alarm.
+    ///
+    /// Returns (paths, extra): `paths` holds at most [`FOREIGN_CAP`]
+    /// entries and `extra` counts the rest — a planted tree cannot
+    /// make a write collect and report unbounded lists. git still
+    /// walks the tree once; that walk is the price of a correct scan.
+    fn foreign_paths(&self, ours: &[String]) -> (Vec<String>, usize) {
         // Raw stdout — porcelain's leading-space XY codes must not be
         // trimmed (` M` is an unstaged modification).
         let Ok(out) = crate::reaper::output(Command::new("git").arg("-C").arg(&self.dir).args([
             "status",
             "--porcelain",
             "-z",
+            "--untracked-files=all",
         ])) else {
-            return vec![];
+            return (vec![], 0);
         };
         if !out.status.success() {
-            return vec![];
+            return (vec![], 0);
         }
         let out = String::from_utf8_lossy(&out.stdout);
         let ours: HashSet<&str> = ours.iter().map(String::as_str).collect();
         let foreign =
             |p: &str| !ours.contains(p) && p != ".write.lock" && !p.starts_with(".index/");
         let mut found = Vec::new();
+        let mut extra = 0usize;
+        let mut note = |path: &str| {
+            if !foreign(path) {
+                return;
+            }
+            if found.len() < FOREIGN_CAP {
+                found.push(path.to_string());
+            } else {
+                extra += 1;
+            }
+        };
         let mut fields = out.split('\0');
         while let Some(rec) = fields.next() {
             if rec.len() < 4 || rec.as_bytes()[2] != b' ' {
                 continue;
             }
             let (xy, path) = rec.split_at(2);
-            let path = path[1..].to_string();
-            if foreign(&path) {
-                found.push(path);
-            }
+            note(&path[1..]);
             // `-z` rename/copy entries carry a second field — the
             // source path — with no status prefix of its own.
             if xy.contains('R') || xy.contains('C') {
                 if let Some(orig) = fields.next() {
-                    if foreign(orig) {
-                        found.push(orig.to_string());
-                    }
+                    note(orig);
                 }
             }
         }
         found.sort();
         found.dedup();
-        found
+        (found, extra)
     }
+}
+
+/// The most foreign paths a write collects and reports — beyond it a
+/// trailing "(+N more)" stands in everywhere the list is surfaced.
+const FOREIGN_CAP: usize = 64;
+
+/// `foreign` + its unlisted `extra` as the value callers serialize:
+/// the marker travels with the list so JSON results show the same
+/// truncation the operator sees on stderr and in the commit trailer.
+fn foreign_out(mut foreign: Vec<String>, extra: usize) -> Vec<String> {
+    if extra > 0 {
+        foreign.push(format!("(+{extra} more)"));
+    }
+    foreign
 }
 
 /// One stderr line per write that saw foreign files — the immediate
 /// signal for the operator watching the CLI or the daemon's log.
-fn warn_foreign(dir: &Path, foreign: &[String]) {
-    if foreign.is_empty() {
+fn warn_foreign(dir: &Path, foreign: &[String], extra: usize) {
+    if foreign.is_empty() && extra == 0 {
         return;
     }
     eprintln!(
         "warning: {} foreign path(s) under {} left uncommitted: {}",
-        foreign.len(),
+        foreign.len() + extra,
         dir.display(),
-        foreign_listed(foreign)
+        foreign_listed(foreign, extra)
     );
 }
 
 /// The foreign-path list as one line — capped so a planted tree cannot
 /// blow up a commit message or a log line.
-fn foreign_listed(foreign: &[String]) -> String {
+fn foreign_listed(foreign: &[String], extra: usize) -> String {
     const SHOW: usize = 8;
     let mut listed: Vec<String> = foreign
         .iter()
@@ -405,8 +437,9 @@ fn foreign_listed(foreign: &[String]) -> String {
                 .collect()
         })
         .collect();
-    if foreign.len() > SHOW {
-        listed.push(format!("(+{} more)", foreign.len() - SHOW));
+    let hidden = foreign.len().saturating_sub(SHOW) + extra;
+    if hidden > 0 {
+        listed.push(format!("(+{hidden} more)"));
     }
     listed.join(", ")
 }
