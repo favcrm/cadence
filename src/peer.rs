@@ -713,7 +713,8 @@ pub(crate) fn tcp_peer_agent(
 /// operator-only writes it relays to the daemon (CAD-328), which would
 /// otherwise see only the board's own process. Every process holding
 /// the client socket must pass: it runs as `uid`, walks cleanly, has
-/// no registered pane or managed provider (`roots`) on its ancestry, is
+/// no registered pane or managed provider (`roots`, each unless its
+/// recorded start time proves the pid reused — CAD-385) on its ancestry, is
 /// no descendant of `daemon_pid` (under `daemon run` a detached child
 /// of a daemon-launched tool re-parents to the daemon), carries no
 /// agent environment, holds no pane pty, and leads or descends from
@@ -738,9 +739,14 @@ pub(crate) fn tcp_peer_operator_proof(
             "socket {inode} of peer {peer} has no visible owner"
         ));
     }
+    // Deny lists are every row that MAY still be its process (CAD-385,
+    // [`AgentPids::fenced`]): a reused pid denies nothing, a row with no
+    // recorded start keeps denying — panes and managed providers alike.
+    let panes = roots.panes.fenced();
+    let managed = roots.managed.fenced();
     for pid in pids {
-        operator_proof(pid, uid, daemon_pid, &roots.panes, |hop| {
-            roots.managed.contains_key(&hop)
+        operator_proof(pid, uid, daemon_pid, &panes, |hop| {
+            managed.contains_key(&hop)
         })?;
     }
     Ok(())
@@ -1027,6 +1033,45 @@ mod tests {
             ..Default::default()
         };
         assert!(tcp_peer_agent(port, peer, &legacy_managed).is_err());
+    }
+
+    /// CAD-385 in the board's operator proof (CAD-328): the pane and
+    /// managed deny lists are the fenced views — a row whose pid now
+    /// names another process denies nothing (the answer is exactly the
+    /// unregistered one), while a live row and a row with no recorded
+    /// start both still deny.
+    #[test]
+    fn board_operator_proof_denies_live_and_unproven_rows_but_not_reused_ones() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let (_accepted, peer) = listener.accept().unwrap();
+        let me = std::process::id();
+        let start = proc_starttime(me).unwrap();
+        let (_, uid) = proc_uids(me).unwrap();
+        let proof = |roots: &AgentRoots| tcp_peer_operator_proof(port, peer, uid, 0, roots);
+        let unregistered = proof(&AgentRoots::default());
+
+        let reused = AgentRoots {
+            panes: AgentPids::classify([("pm".to_string(), me, Some(start - 1))]),
+            managed: AgentPids::classify([("wk".to_string(), me, Some(start + 1))]),
+        };
+        assert_eq!(proof(&reused), unregistered);
+
+        for start in [Some(start), None] {
+            let pane = AgentRoots {
+                panes: AgentPids::classify([("pm".to_string(), me, start)]),
+                ..Default::default()
+            };
+            let err = proof(&pane).unwrap_err();
+            assert!(err.contains("registered pane 'pm'"), "{err}");
+            let managed = AgentRoots {
+                managed: AgentPids::classify([("wk".to_string(), me, start)]),
+                ..Default::default()
+            };
+            let err = proof(&managed).unwrap_err();
+            assert!(err.contains("enrolled managed endpoint"), "{err}");
+        }
     }
 
     /// The client socket's uid column is read, and it is ours for a
