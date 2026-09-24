@@ -33,6 +33,7 @@ use crate::error::{Error, Result};
 use crate::issue::{board, context, history, model, project, write as issue_write, Pm};
 use crate::proc::{self, BoundedError};
 
+mod home;
 mod threads;
 
 /// The options `ui run` and `ui start` share. Every field is optional:
@@ -1773,6 +1774,27 @@ fn write_route(
         );
         return;
     }
+    // The operator's plan decision (CAD-328 → CAD-360 RPCs) and answer
+    // to a question report (CAD-341) — guarded, operator-only, inside
+    // `home`.
+    if let Some((epic, verb)) = home::plan_route(path) {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let resp = home::decide_plan(&mut request, state_dir, opts, epic, verb);
+        send(request, resp);
+        return;
+    }
+    if let Some(id) = home::answer_route(path) {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let resp = home::answer(&mut request, state_dir, pm_dir, opts, id);
+        send(request, resp);
+        return;
+    }
     // The operator's chat message to an agent (CAD-319) — guarded and
     // caller-attributed inside `threads::post_message`.
     if let Some((alias, sub)) = threads::route(path) {
@@ -2643,6 +2665,11 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
                     }
                     Err(e) => send(request, err_response(404, &e.to_string())),
                 }
+                return;
+            }
+            // `/api/master/summary?since=` — "since you left" (CAD-328).
+            if path == "/api/master/summary" {
+                send(request, home::master_summary(state_dir, &query));
                 return;
             }
             // `/api/threads/<alias>[/stream]` — an agent's chat (CAD-319).

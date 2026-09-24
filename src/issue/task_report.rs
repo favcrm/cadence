@@ -435,6 +435,45 @@ pub fn prepare(pm: &Pm, text: &str, task: Option<&str>, kind: Option<Kind>) -> R
     let (front, body) = parse_text(&text)?;
     check_claim(&front, std::env::var("CADENCE_ALIAS").ok().as_deref())?;
     let front = validate(front, &body, task, kind, &default_agent())?;
+    checked(pm, front, body, &text)
+}
+
+/// The board's answer (CAD-328): an `answer` report on `task` naming
+/// the open `question`, filed as `agent` — the author the board derived
+/// from the connection. Nothing here reads the process environment or
+/// request-supplied identity: the board process's own `CADENCE_ALIAS`
+/// is not the browser's. Same validation, question check and secret
+/// scan as [`prepare`].
+pub fn prepare_answer(
+    pm: &Pm,
+    task: &str,
+    question: &str,
+    text: &str,
+    agent: &str,
+) -> Result<Prepared> {
+    if text.len() > BODY_MAX {
+        return Err(Error::rejected(format!(
+            "Answer exceeds the {} KB cap — trim it",
+            BODY_MAX / 1024
+        )));
+    }
+    let body = strip_controls(text);
+    let front = Front {
+        kind: Some(Kind::Answer),
+        task: Some(task.to_string()),
+        agent: Some(agent.to_string()),
+        answers: Some(question.to_string()),
+        ..Front::default()
+    };
+    let front = validate(front, &body, None, None, agent)?;
+    let scan = format!("answers: {question}\n{body}");
+    checked(pm, front, body, &scan)
+}
+
+/// The checks after validation: an `answer`'s question must exist on
+/// the same ticket, and `scan` (the text as filed) must pass the secret
+/// guard.
+fn checked(pm: &Pm, front: Front, body: String, scan: &str) -> Result<Prepared> {
     let id = front.task.clone().unwrap_or_default();
     let (_, dir) = write::issue_dir(pm, &id)?;
     if let Some(q) = &front.answers {
@@ -450,7 +489,7 @@ pub fn prepare(pm: &Pm, text: &str, task: Option<&str>, kind: Option<Kind>) -> R
             )));
         }
     }
-    let warnings = crate::secret::guard(&format!("{id}: report"), &text)?;
+    let warnings = crate::secret::guard(&format!("{id}: report"), scan)?;
     Ok(Prepared {
         front,
         body,

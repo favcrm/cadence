@@ -1,9 +1,28 @@
 import { api } from "./api";
-import { QueryCache } from "./cache";
+import { QueryCache, type Resource } from "./cache";
+import { loadThread, type PageReader, type ThreadState } from "../features/home/thread";
+
+/** Page reads of one agent's thread. */
+export function threadReader(alias: string): PageReader {
+  return {
+    after: (after, limit) => api.thread(alias, { after, limit }),
+    tail: (limit) => api.thread(alias, { tail: true, limit }),
+    before: (before, limit) => api.thread(alias, { before, limit }),
+  };
+}
 import type { AgentsPayload, IssueCard, IssueDetail, Overview, Project } from "./types";
 
 /** The app's one query cache — every screen reads its stores from here. */
 export const cache = new QueryCache();
+
+/**
+ * `GET /api/threads/master` — the master's thread (CAD-328). A fetch
+ * loads only what the store does not hold yet and keeps its pending
+ * messages; the Home screen streams the rest in (`streamInto`).
+ */
+const masterThread: Resource<ThreadState> = cache.resource<ThreadState>("thread:master", () =>
+  loadThread(threadReader("master"), masterThread.get().data),
+);
 
 /**
  * The board's resources — one store each, shared by every screen. List
@@ -30,6 +49,7 @@ export const resources = {
    * the last payload instead of starting another slow request.
    */
   overview: cache.resource<Overview>("overview", () => api.overview(), { freshMs: 30_000 }),
-  /** `GET /api/issues/<id>` — one drawer's detail. */
+  masterThread,
+  /** `GET /api/issues/<id>` — one drawer's detail (and a plan card's epic). */
   issue: cache.family<string, IssueDetail>("issue", (id) => api.issue(id)),
 };

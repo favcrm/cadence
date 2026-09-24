@@ -958,8 +958,9 @@ quick-add, drag, edit, link/ref, attach and comment controls.
 | `GET /api/memories/:project/:slug` | one memory: frontmatter + body; `404` on unknown slug, `400` on grammar |
 | `GET /api/overview` | the Overview screen payload: `needs_me`, `drift`, `projects`, `github`, `daemon`, `generated_at` — same shape as `cadence overview --json` |
 | `GET /api/stream` | server-sent events — `event: issues` on tracker change, `event: jobs`/`event: agents`/`event: monitoring` on daemon state change; each frame's data names the board resources it invalidates (`{"resources":["agents","issue","overview"]}`); `: ping` immediately and every 15 s of silence; `405` on HEAD; deltas only (baselines at connect) |
-| `GET /api/threads/<alias>?after=&limit=` | one page of the agent's durable chat (CAD-319) over the daemon's `thread_read`: `{thread, entries, cursor}`; `404` unknown alias, `501` a daemon without threads. Unscoped in the MVP: any caller that reaches the board reads any agent's thread, as with `/api/agents/<alias>`. A live turn token quoted in thread prose is only redacted at `export` |
+| `GET /api/threads/<alias>?after=&limit=` | one page of the agent's durable chat (CAD-319) over the daemon's `thread_read`: `{thread, entries, cursor}`; `?tail=1` (the newest page) or `?before=<seq>` read backwards and add `more_before` (CAD-328; `400` combined with `after`); `404` unknown alias, `501` a daemon without threads. Unscoped in the MVP: any caller that reaches the board reads any agent's thread, as with `/api/agents/<alias>`. A live turn token quoted in thread prose is only redacted at `export` |
 | `GET /api/threads/<alias>/stream` | server-sent events — one `event: entry` frame per thread entry with `id: <seq>`; resumes after `Last-Event-ID` (else `?after=`); `: ping` on each 15 s idle poll; `event: error` while the daemon is unreachable; `405` on HEAD |
+| `GET /api/master/summary?since=<epoch secs>` | "since you left" (CAD-328) over the daemon's `master_summary` (CAD-339), never posted to the thread: plans proposed and decided, tickets moved, reports, open questions, `routing_backlog`; `400` without a numeric `since`, `501 unsupported_daemon` on a daemon without the master, `503` daemon down |
 
 ### API — writes
 
@@ -981,6 +982,9 @@ exactly one git commit whose subject carries the actor:
 | `POST /api/issues/:id/artifacts?name=<base>` | raw bytes, create-only | `200` |
 | `POST /api/memories/:project/:slug/accept` | `{body?}` — guarded route shape, then refused because HTTP cannot prove a native agent endpoint; body edits are never accepted | `400` with an actionable refusal |
 | `POST /api/memories/:project/:slug/reject` | `{}` — refused for the same missing native endpoint proof | `400` with an actionable refusal |
+| `POST /api/plans/:epic/approve` | `{}` — the operator approves a proposed plan (CAD-328) over the daemon's operator-only `plan_approve` (CAD-360): the plan's backlog tickets move to ready in one commit. Read-only, the write guards and caller attribution run first; a caller attributed to an agent gets `403 operator_only`. No identity field is read (`deny_unknown_fields`); and the board runs CAD-276's positive operator proof on its own TCP peer (`crate::peer::tcp_peer_operator_proof`: no pane or managed provider on its ancestry, not a descendant of the daemon process, no agent environment, session leader on its ancestry — a `tailscale serve` request proven by CAD-336 passes as its login), refusing `403 operator_proof` before anything is written; the daemon then checks the board's own connection again | `200` with the decision; `409` already decided; `404` unknown epic; `501` a daemon without plans |
+| `POST /api/plans/:epic/reject` | `{reason}` — same path and refusals; a missing or blank reason is `400 reason_required` before the daemon is asked | same |
+| `POST /api/issues/:id/answers` | `{question, text}` — the operator's answer (CAD-328) to the open question report `question` on `:id`: an `answer` task report (CAD-341) authored `operator`, never from the request or the board's environment; `403 operator_only` for an agent caller and `403 operator_proof` for a peer that is not provably the operator (same proof as the plan routes); `400` when `question` is not a question report on the ticket or `text` is blank. Then a best-effort `reports_changed` so the master's report router (CAD-339) picks it up at once | `201` `{issue, card, warnings}` |
 | `POST /api/threads/:alias/messages` | `{text, message?}` — the operator's chat message (CAD-319): starts the thread on first use and queues `text` to the agent like `cadence send`. Refused `403 caller_agent` when the caller is attributed to an agent (pane or managed endpoint tool process); the daemon refuses agent connections again. Tied to no agent is the operator by default, not positive proof (CAD-313) | `200` with the send receipt and `thread` |
 
 Success bodies are `{issue, card, warnings}` — the fresh payloads, so
@@ -1307,10 +1311,35 @@ panel. Memory curation is read-only in the browser: proposed entries show
 their native quorum/finalization state, while accept, reject, and supersede
 require an authenticated native agent endpoint.
 
-The SPA has real routes (CAD-326, `ui/src/lib/router.ts`): `/` Home (the
-overview), `/projects[/:slug[/context]]`, `/agents[/:alias]`, `/setup`
-and `/settings[/memory]`; the nav shows Home, Projects, Agents and
-Settings. The server answers any client route with `index.html` and a
+The SPA has real routes (CAD-326, `ui/src/lib/router.ts`): `/` Home,
+`/overview` (the team overview: needs, drift, monitors, projects),
+`/projects[/:slug[/context]]`, `/agents[/:alias]`, `/setup` and
+`/settings[/memory]`; the nav shows Home, Projects, Agents and Settings,
+and Home's rail links to the overview.
+
+Home is chat-first (CAD-328, `ui/src/features/home/`): the master's
+thread (`/api/threads/master`) rendered by kind — the operator's
+message, `assistant_text` as commentary, runs of `tool_call` /
+`tool_result` as one collapsed line, `turn_result` as the answer — and
+streamed live with `streamInto`: entries merge by `seq`, so a reconnect
+(`?after=<last seq>`) neither drops nor repeats one. It opens on the
+newest page (`?tail=1`, 200 entries) and pages back with "load earlier"
+(`?before=`); at most 300 items render at once, and the composer keeps
+its draft to itself, so typing never re-renders the thread. The composer posts
+with a client message id, shows the message at once and retires it when
+the stored `operator` entry with that id arrives; it is disabled, with
+the reason, on a read-only board or while the master is not running.
+A plan the thread mentions (or a `plan` row in Needs you) renders as a
+card — goal, tickets with size and acceptance, weighted progress, and
+Approve / Reject-with-reason through the plan endpoints above. The
+Needs-you rail is the overview's operator rows (`plan` and `question`
+rows from CAD-339 first), each with owner, age and one action; a
+question is answered in place through `/answers`. A return after an
+hour (last-seen per browser in localStorage) shows a "since you left"
+card from `/api/master/summary`; a daemon without it shows "not
+available". Fields the master adds are read through adapters
+(`needs.ts`, `sinceLeft.ts`, `plan.ts`), so a missing one degrades a row
+instead of breaking the screen. The server answers any client route with `index.html` and a
 missing file (under `/assets/` or with an extension) with 404. Links from
 before the router (`/?tab=board&project=cadence`) redirect to their
 route. Colours are CSS variables with a light and a dark theme — system

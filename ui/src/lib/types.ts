@@ -121,6 +121,54 @@ export interface IssueDetail extends IssueCard {
   activity: ActivityItem[];
   commits?: IssueCommit[];
   commits_skipped?: { repo: string; reason: string }[];
+  /** CAD-359/360: plan state, tickets and progress — null unless a plan epic. */
+  plan?: PlanBlock | null;
+  /** CAD-341 task reports on the ticket (questions carry `open`). */
+  reports?: TaskReport[];
+}
+
+/** One ticket of a plan, with its derived status. */
+export interface PlanTicket {
+  id: string;
+  title: string;
+  status: string;
+  size?: string | null;
+  weight?: number;
+  owner?: string | null;
+  blocked_by?: string[];
+  /** Number of acceptance criteria. */
+  acceptance?: number;
+}
+
+/** The `plan` block of a plan epic's detail. */
+export interface PlanBlock {
+  state: string;
+  proposed_by?: string;
+  proposed_at?: string;
+  decided_by?: string | null;
+  decided_at?: string | null;
+  reason?: string | null;
+  tickets: PlanTicket[];
+  progress?: {
+    done_weight: number;
+    total_weight: number;
+    ratio: number;
+    counts?: Record<string, number>;
+  };
+}
+
+/** One task report row (`reports` on an issue detail). */
+export interface TaskReport {
+  name: string;
+  kind?: string;
+  agent?: string;
+  at?: string | null;
+  options?: string[];
+  impact?: string | null;
+  answers?: string | null;
+  body?: string;
+  open?: boolean;
+  error?: string;
 }
 
 export interface Project {
