@@ -46685,6 +46685,45 @@ fn master_wakes_once_when_a_delivery_is_merged_or_declined() {
     );
 }
 
+/// CAD-445 + CAD-449, the chain: a reviewed PR merges → the operator's
+/// sync marks D-2 done → the master is woken exactly once for D-4 (which
+/// waited on D-2): the merge wake names it ready, with no "ask the
+/// operator" line, and no router pass wakes it again as blocker-done.
+#[test]
+fn merged_delivery_marks_done_and_wakes_the_dependent_once() {
+    let mut lf = LoopFixture::dispatched_plan(WAKE_PLAN);
+    lf.f.wait_thread("[wake] plan D-1 approved", 10);
+    // A router pass has seen D-4 waiting on the open D-2.
+    thread::sleep(Duration::from_millis(1_500));
+    let a = "a".repeat(40);
+    lf.pass_on("D-2", &a, LOOP_PR);
+    lf.set_gh(&a, "MERGED", true, false);
+    let row = lf.sync_of("D-2");
+    assert_eq!(row["ticket"]["outcome"], "marked", "{row}");
+    assert_eq!(lf.f.front("D-2").status, "done");
+    let wake = lf.f.wait_thread("[wake] D-2 merged (acme/app#7).", 10);
+    let text = wake["text"].as_str().unwrap();
+    assert!(text.contains("Ready to dispatch now:"), "{text}");
+    assert!(text.contains("D-4 (w1)"), "{text}");
+    assert!(!text.contains("ask the operator"), "{text}");
+    // Router passes see D-2 done and D-4 unblocked: already named.
+    thread::sleep(Duration::from_millis(3_500));
+    let bodies: Vec<String> = master_wakes(&lf.f)
+        .iter()
+        .map(|m| m["body"].as_str().unwrap_or_default().to_string())
+        .collect();
+    let naming_d4 = bodies.iter().filter(|b| b.contains("D-4")).count();
+    assert!(
+        !bodies
+            .iter()
+            .any(|b| b.contains("D-4 is ready to dispatch")),
+        "{bodies:#?}"
+    );
+    // The approval wake (D-4 waiting) and the merge wake (D-4 ready).
+    assert_eq!(naming_d4, 2, "{bodies:#?}");
+    assert_eq!(bodies.len(), 2, "{bodies:#?}");
+}
+
 /// CAD-445: a master that is not running is never written to — its wake
 /// waits, queued, in its mailbox for the next time it runs (and is not
 /// dropped). The master's own `message_report` rule still covers it:

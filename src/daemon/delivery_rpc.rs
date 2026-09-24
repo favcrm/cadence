@@ -597,7 +597,12 @@ impl Shared {
         // first — if the save then fails, the next sync transitions
         // again and finds the ticket done (`kept`).
         let mut notices = Vec::new();
-        if before != State::Merged && rec.state == State::Merged {
+        // CAD-445 + CAD-449: `wake_lock` is held from before the done
+        // write until the loop-end wake records the dependents it named,
+        // so the router's blocker-done pass cannot wake them a second time.
+        let merging = before != State::Merged && rec.state == State::Merged;
+        let wake_guard = merging.then(|| self.wake_lock.lock().unwrap_or_else(|e| e.into_inner()));
+        if merging {
             let done = self.settle_merge(&pm, rec, before, &head, &mut notices);
             out["ticket"] = serde_json::to_value(&done).unwrap_or(Value::Null);
             rec.ticket_done = Some(done);
@@ -609,7 +614,7 @@ impl Shared {
         drop(guard);
         self.post_notices(&pm, notices);
         if let Some(rec) = ended {
-            self.wake_on_delivery_end(&rec);
+            self.wake_on_delivery_end(&rec, wake_guard);
         }
         if rec_state_changed(&out, was_disable) {
             let _ = self
@@ -952,7 +957,7 @@ impl Shared {
         let out = rec.to_json();
         let ended = rec.clone();
         delivery::save(&self.state_dir, &all)?;
-        self.wake_on_delivery_end(&ended);
+        self.wake_on_delivery_end(&ended, None);
         if let Ok(pm) = self.pm_dir().and_then(|d| Pm::at(&d)) {
             let _ = issue::write::add_comment(
                 &pm,
