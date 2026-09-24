@@ -762,6 +762,21 @@ enum Commands {
         /// Group handle — the PM agent's alias or provider-native id.
         group: String,
     },
+    /// Stop an agent's running turn with the provider's own interrupt —
+    /// Claude's stream-json interrupt request, Codex `turn/interrupt`, a
+    /// pane's interrupt key — never a kill. The message finishes
+    /// `interrupted` (held text and partial tool results recorded), the
+    /// agent stays up and idle for its next message, and nothing is
+    /// replayed. Only the operator or the agent's own PM may interrupt
+    /// it. No running turn is a recorded no-op.
+    Interrupt {
+        /// Agent alias or provider-native id.
+        alias: String,
+        /// Seconds to wait for the turn to settle before answering
+        /// (max 120; 0 answers as soon as the interrupt is sent).
+        #[arg(long, default_value_t = 30)]
+        wait: u64,
+    },
     /// Inside a cadence-owned pane: print this agent's alias, its
     /// running message id and the report token for it. Errors when
     /// `CADENCE_ALIAS` is absent (not a cadence pane). For an inbox
@@ -5421,6 +5436,15 @@ fn run() -> Result<i32> {
         Commands::Attach { name, print } => attach_command(&state_dir, name, print),
         Commands::Resume { group, all, detach } => resume_command(&state_dir, group, all, detach),
         Commands::Stop { group } => stop_group(&state_dir, &group),
+        Commands::Interrupt { alias, wait } => {
+            let answer = client::rpc(
+                &state_dir,
+                "interrupt",
+                json!({"alias": alias, "wait": wait}),
+            )?;
+            print_json(&answer);
+            Ok(0)
+        }
         Commands::Send {
             alias,
             text,
