@@ -18,7 +18,11 @@ export function writeBlock(meta: Meta | null): string | null {
   if (meta.read_only) return READ_ONLY_REASON;
   // An older server that reports no `operator` field predates sessions.
   if (meta.signed_in === false) {
-    return `Sign in with ${meta.login_hint ?? SIGN_IN_COMMAND} to act as the operator.`;
+    const cmd = meta.login_hint ?? SIGN_IN_COMMAND;
+    if (meta.tab_signed_out) {
+      return `This tab is not signed in — each tab signs in on its own. Run ${cmd} and open the new link in this tab.`;
+    }
+    return `Sign in with ${cmd} to act as the operator.`;
   }
   return null;
 }

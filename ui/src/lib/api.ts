@@ -1,3 +1,4 @@
+import { sessionHeaders } from "./sessionKey";
 import type {
   AgentDetail,
   AgentsPayload,
@@ -56,7 +57,7 @@ export class ApiError extends Error {
 }
 
 async function get<T>(path: string): Promise<T> {
-  const resp = await fetch(path);
+  const resp = await fetch(path, { headers: sessionHeaders() });
   if (!resp.ok) {
     const body = await resp.json().catch(() => null);
     throw new ApiError(
@@ -90,6 +91,7 @@ async function write<T extends object | undefined>(
     headers: {
       "Content-Type": "application/json",
       "X-Cadence-Board": "1",
+      ...sessionHeaders(),
     },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
@@ -111,6 +113,7 @@ async function post<T>(path: string, body: object): Promise<T> {
     headers: {
       "Content-Type": "application/json",
       "X-Cadence-Board": "1",
+      ...sessionHeaders(),
     },
     body: JSON.stringify(body),
   });
@@ -176,6 +179,7 @@ export const api = {
         headers: {
           "Content-Type": "application/json",
           "X-Cadence-Board": "1",
+      ...sessionHeaders(),
         },
         body: "{}",
       },
@@ -254,6 +258,7 @@ export const api = {
         headers: {
           "Content-Type": "application/octet-stream",
           "X-Cadence-Board": "1",
+      ...sessionHeaders(),
         },
         body: data,
       },
@@ -331,6 +336,7 @@ async function writeSettings(body: {
     headers: {
       "Content-Type": "application/json",
       "X-Cadence-Board": "1",
+      ...sessionHeaders(),
     },
     body: JSON.stringify(body),
   });

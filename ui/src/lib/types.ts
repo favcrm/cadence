@@ -744,6 +744,9 @@ export interface Meta {
   } | null;
   /** The command that signs this origin in (`cadence ui login [--tailnet]`). */
   login_hint?: string;
+  /** This browser holds the session cookie but this tab has no live
+   *  session key — a new tab: each tab signs in on its own. */
+  tab_signed_out?: boolean;
   actor: string;
   /** CAD-432 (only with `?operator=1`): this client may make the
    *  operator's decisions — a live session (CAD-313) plus the board's

@@ -20,6 +20,7 @@ import Login from "./features/auth/Login";
 import SignIn from "./features/auth/SignIn";
 import { writeBlock } from "./features/auth/gate";
 import { WriteGate } from "./features/auth/WriteGate";
+import { setSessionKey } from "./lib/sessionKey";
 import Toast, { type ToastMsg } from "./ui/Toast";
 import { Logo } from "./ui/Logo";
 import { countLabel, issueCounts } from "./lib/counts";
@@ -201,6 +202,8 @@ export default function App() {
       .then((next) => {
         const changed = signedIn.current !== undefined && next.signed_in !== signedIn.current;
         signedIn.current = next.signed_in;
+        // A key the server no longer honours (expired, revoked) is dropped.
+        if (next.signed_in === false) setSessionKey(null);
         if (changed && !asked) {
           operatorKnown.current = false;
           setMeta({ ...next, operator: undefined });

@@ -16,11 +16,11 @@ export default function SignIn({ meta, onChange }: { meta: Meta | null; onChange
     return (
       <span
         className="chip bg-warn/10 text-warn max-w-[14rem] truncate"
-        title={`Board writes need the operator's session. Run ${cmd} in your own shell on the host and open the link it prints.`}
+        title={`Board writes need the operator's session. Run ${cmd} in your own shell on the host and open the link it prints — in this tab: each tab signs in on its own.`}
       >
-        <span className="sm:hidden">sign in</span>
+        <span className="sm:hidden">{meta.tab_signed_out ? "sign in this tab" : "sign in"}</span>
         <span className="hidden sm:inline">
-          Sign in with&nbsp;<code className="num">{cmd}</code>
+          {meta.tab_signed_out ? "Sign in this tab with" : "Sign in with"}&nbsp;<code className="num">{cmd}</code>
         </span>
       </span>
     );

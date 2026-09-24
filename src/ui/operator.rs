@@ -544,25 +544,29 @@ pub(super) fn board_caller(
 /// session), `session` (its display id and expiries, never the token)
 /// and `login_hint` (the command that signs this origin in).
 pub(super) fn meta(request: &Request, state_dir: &std::path::Path, opts: &ServeOpts) -> Value {
-    let (hint, session) = match request_origin(request, opts) {
+    let (hint, cookie, session) = match request_origin(request, opts) {
         ReqOrigin::Known(o) => {
             let hint = match o {
                 Origin::Loopback => "cadence ui login",
                 Origin::Tailnet => "cadence ui login --tailnet",
             };
-            let session = session_cookie(request, opts, o).and_then(|token| {
-                check_session(state_dir, &token, &session_key(request), o)
+            let token = session_cookie(request, opts, o);
+            let session = token.as_deref().and_then(|token| {
+                check_session(state_dir, token, &session_key(request), o)
                     .ok()
                     .flatten()
             });
-            (hint, session)
+            (hint, token.is_some(), session)
         }
-        ReqOrigin::NoSession(_) => ("cadence ui login", None),
+        ReqOrigin::NoSession(_) => ("cadence ui login", false, None),
     };
     json!({
         "signed_in": session.is_some(),
         "session": session,
         "login_hint": hint,
+        // A cookie but no live session for this page: typically a new
+        // tab — the key lives in the signing-in tab's `sessionStorage`.
+        "tab_signed_out": cookie && session.is_none(),
     })
 }
 

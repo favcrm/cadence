@@ -2348,6 +2348,7 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
                     "signed_in": session["signed_in"],
                     "session": session["session"],
                     "login_hint": session["login_hint"],
+                    "tab_signed_out": session["tab_signed_out"],
                     "actor": actor,
                     "tailnet_proof": tailnet_proof,
                     "operator": operator,
