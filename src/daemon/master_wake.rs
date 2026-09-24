@@ -417,10 +417,20 @@ impl Shared {
     }
 
     /// A review-loop record just entered a terminal state. A merged
-    /// ticket that other ready tickets still wait on is named, with what
-    /// the operator does to unblock them (CAD-449 decides whether a merge
-    /// marks it done by itself).
-    pub(super) fn wake_on_delivery_end(self: &Arc<Self>, rec: &Record) {
+    /// ticket is normally done by now (CAD-449 marks it on the merge);
+    /// when it is not (the merge was not the reviewed one, or the write
+    /// is pending), the tickets waiting on it are named with what the
+    /// operator does to unblock them. The dependents this wake names
+    /// ready are remembered, so the router does not wake the master for
+    /// them again as `blocker_done`. `held` is `wake_lock` when the
+    /// caller already holds it (across the done write, so no router pass
+    /// sees the blocker done before this wake records what it named).
+    pub(super) fn wake_on_delivery_end(
+        self: &Arc<Self>,
+        rec: &Record,
+        held: Option<std::sync::MutexGuard<'_, ()>>,
+    ) {
+        let _g = held.unwrap_or_else(|| self.wake_lock.lock().unwrap_or_else(|e| e.into_inner()));
         let pr = rec
             .pr
             .as_deref()
@@ -443,40 +453,63 @@ impl Shared {
             ),
             _ => return,
         };
-        let rest = match self.wake_issues() {
-            Some((pm_dir, issues)) => {
-                let ready = plan_ready(&pm_dir, &issues, Some(&rec.project));
-                let mut s = String::new();
-                let own = statuses(&issues).get(rec.issue.as_str()).copied();
-                let waiting: Vec<&str> = ready
-                    .iter()
-                    .filter(|(i, _)| i.front.blocked_by.contains(&rec.issue))
-                    .map(|(i, _)| i.front.id.as_str())
-                    .collect();
-                if rec.state == State::Merged
-                    && !waiting.is_empty()
-                    && own.is_some_and(|s| !finished(s))
-                {
-                    s.push_str(&format!(
-                        "{} is still {} — ask the operator to mark it done \
-                         (`cadence issue set {} status=done`) to unblock {}.\n",
-                        rec.issue,
-                        shown(own.unwrap_or_default()),
-                        rec.issue,
-                        waiting.join(", ")
-                    ));
-                }
-                s + &next_steps(&outlook(&ready))
-            }
-            None => Self::UNREADABLE.to_string(),
+        let key = format!("{}/{}", rec.issue, rec.dispatched_at);
+        let Some((pm_dir, issues)) = self.wake_issues() else {
+            let _ = self.wake_master(
+                event,
+                &rec.issue,
+                &key,
+                &format!("{what}\n{}", Self::UNREADABLE),
+            );
+            return;
         };
+        let ready = plan_ready(&pm_dir, &issues, Some(&rec.project));
+        let mut rest = String::new();
+        let status = statuses(&issues);
+        let own = status.get(rec.issue.as_str()).copied();
+        let waiting: Vec<&str> = ready
+            .iter()
+            .filter(|(i, _)| i.front.blocked_by.contains(&rec.issue))
+            .map(|(i, _)| i.front.id.as_str())
+            .collect();
+        if rec.state == State::Merged && !waiting.is_empty() && own.is_some_and(|s| !finished(s)) {
+            rest.push_str(&format!(
+                "{} is still {} — ask the operator to mark it done \
+                 (`cadence issue set {} status=done`) to unblock {}.\n",
+                rec.issue,
+                shown(own.unwrap_or_default()),
+                rec.issue,
+                waiting.join(", ")
+            ));
+        }
+        rest.push_str(&next_steps(&outlook(&ready)));
         let text = format!("{what}\n{rest}");
-        let _ = self.wake_master(
-            event,
-            &rec.issue,
-            &format!("{}/{}", rec.issue, rec.dispatched_at),
-            &text,
-        );
+        // The blocker epochs first, from the tracker this wake read: a
+        // ticket named ready here is announced under the key the router
+        // would compute for it.
+        let mut st = match WakeState::load(&self.state_dir) {
+            Ok(st) => Some(st),
+            Err(e) => {
+                tracing::warn!("master wakes: {e}");
+                None
+            }
+        };
+        if let Some(st) = st.as_mut() {
+            st.observe(&status, &plan_ready(&pm_dir, &issues, None));
+        }
+        if !self.wake_master(event, &rec.issue, &key, &text) {
+            return;
+        }
+        let Some(mut st) = st else { return };
+        for (i, open) in &ready {
+            if open.is_empty() && i.front.blocked_by.contains(&rec.issue) {
+                let k = st.blocker_key(i);
+                st.announced.insert(i.front.id.clone(), k);
+            }
+        }
+        if let Err(e) = st.save(&self.state_dir) {
+            tracing::warn!("master wakes: {e}");
+        }
     }
 
     /// One router pass (CAD-445): every ready ticket of an approved plan

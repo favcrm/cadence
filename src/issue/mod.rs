@@ -191,6 +191,22 @@ impl Pm {
         }
     }
 
+    /// [`Self::lock`] without the wait: `None` when another writer holds
+    /// it. For a caller that must not stall behind a writer (the daemon
+    /// under its own lock, CAD-449) and retries later instead.
+    pub fn try_lock(&self) -> Result<Option<PmLock>> {
+        let path = self.dir.join(".write.lock");
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => Ok(Some(PmLock { path })),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// True when the worktree differs from HEAD.
     fn git_dirty(&self) -> bool {
         let status = crate::reaper::output(
