@@ -3,12 +3,12 @@ import type { NeedsMe } from "../../lib/types";
 /**
  * The Home rail's "Needs you" (CAD-328), built from the overview's
  * `needs_me`. Rows the server resolved to the operator, plus the two
- * kinds the master adds (CAD-339): `plan` (a plan awaiting approval,
- * carrying `plan`) and `question` (an open question the master
- * escalated, carrying `question` and its `summary`). Everything the
- * newer daemon adds is read through this adapter, so a missing field
- * degrades the row — a plan without its epic falls back to the
- * command — instead of breaking the rail. Tested in
+ * kinds the master adds (CAD-339, src/overview.rs): `plan` (a plan
+ * awaiting approval, carrying `plan`) and `question` (an open question
+ * the master escalated, carrying `question`, the master's `summary` and
+ * `escalated_by`). Rows are read through this adapter, so a missing or
+ * malformed field degrades the row — a plan without a valid epic falls
+ * back to its command — instead of breaking the rail. Tested in
  * tests/homeNeeds.test.ts.
  */
 
@@ -36,6 +36,8 @@ export interface HomeNeed {
   age: number;
   /** The master's summary of an escalated question. */
   summary: string | null;
+  /** Who escalated the question to the operator (the master). */
+  escalatedBy: string | null;
   action: NeedAction;
 }
 
@@ -80,6 +82,7 @@ export function homeNeed(row: NeedsMe, index = 0): HomeNeed {
     title: row.title,
     age: row.age,
     summary: null as string | null,
+    escalatedBy: null as string | null,
   };
   const command: NeedAction = { type: "command", command: row.command };
   if (row.kind === "plan") {
@@ -99,6 +102,7 @@ export function homeNeed(row: NeedsMe, index = 0): HomeNeed {
       ...base,
       owner: str(q.agent) ?? row.owner ?? "—",
       summary: str(extra.summary),
+      escalatedBy: str(extra.escalated_by),
       action:
         issue && report && ID.test(issue)
           ? { type: "answer", issue, report, options, impact: str(q.impact), body: str(q.body) }

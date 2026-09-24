@@ -40163,18 +40163,18 @@ fn cad328_thread_reads_tail_and_before() {
     let d = TestDaemon::start();
     let pm = TempDir::new().unwrap();
     let port = start_board(pm.path(), &d.state);
-    d.register("master");
-    d.wait_agent("master", "idle", 15);
+    d.register("lead");
+    d.wait_agent("lead", "idle", 15);
     for n in 1..=3 {
         d.rpc(
             "thread_send",
-            json!({"alias": "master", "text": format!("ask {n}"), "message": format!("m{n}")}),
+            json!({"alias": "lead", "text": format!("ask {n}"), "message": format!("m{n}")}),
         )
         .unwrap();
-        d.wait_message("master", &format!("m{n}"), &["completed"], 20);
+        d.wait_message("lead", &format!("m{n}"), &["completed"], 20);
     }
     let all = d
-        .rpc("thread_read", json!({"alias": "master", "limit": 500}))
+        .rpc("thread_read", json!({"alias": "lead", "limit": 500}))
         .unwrap();
     let seqs: Vec<i64> = all["entries"]
         .as_array()
@@ -40193,7 +40193,7 @@ fn cad328_thread_reads_tail_and_before() {
             .collect()
     };
 
-    let (status, body) = board_get(port, "/api/threads/master?tail=1&limit=2");
+    let (status, body) = board_get(port, "/api/threads/lead?tail=1&limit=2");
     assert_eq!(status, 200, "{body}");
     let tail: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(page_seqs(&tail), seqs[seqs.len() - 2..].to_vec(), "{tail}");
@@ -40203,7 +40203,7 @@ fn cad328_thread_reads_tail_and_before() {
     let first_held = seqs[seqs.len() - 2];
     let (status, body) = board_get(
         port,
-        &format!("/api/threads/master?before={first_held}&limit=2"),
+        &format!("/api/threads/lead?before={first_held}&limit=2"),
     );
     assert_eq!(status, 200, "{body}");
     let older: Value = serde_json::from_str(&body).unwrap();
@@ -40213,7 +40213,7 @@ fn cad328_thread_reads_tail_and_before() {
     );
     let (_, body) = board_get(
         port,
-        &format!("/api/threads/master?before={}&limit=500", seqs[1]),
+        &format!("/api/threads/lead?before={}&limit=500", seqs[1]),
     );
     let oldest: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(page_seqs(&oldest), vec![seqs[0]]);
@@ -40223,29 +40223,29 @@ fn cad328_thread_reads_tail_and_before() {
     let whole = d
         .rpc(
             "thread_read",
-            json!({"alias": "master", "tail": true, "limit": 500}),
+            json!({"alias": "lead", "tail": true, "limit": 500}),
         )
         .unwrap();
     assert_eq!(page_seqs(&whole), seqs);
     assert_eq!(whole["more_before"], false);
 
     for bad in [
-        "/api/threads/master?tail=1&after=3",
-        "/api/threads/master?before=0",
-        "/api/threads/master?before=x",
+        "/api/threads/lead?tail=1&after=3",
+        "/api/threads/lead?before=0",
+        "/api/threads/lead?before=x",
     ] {
         assert_eq!(board_get(port, bad).0, 400, "{bad}");
     }
     let err = d
         .rpc(
             "thread_read",
-            json!({"alias": "master", "tail": true, "wait": 5}),
+            json!({"alias": "lead", "tail": true, "wait": 5}),
         )
         .unwrap_err()
         .to_string();
     assert!(err.contains("either after/wait"), "{err}");
     // The forward read is unchanged.
-    let (_, body) = board_get(port, "/api/threads/master?after=0&limit=2");
+    let (_, body) = board_get(port, "/api/threads/lead?after=0&limit=2");
     let fwd: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(page_seqs(&fwd), seqs[..2].to_vec());
     assert!(fwd.get("more_before").is_none(), "{fwd}");

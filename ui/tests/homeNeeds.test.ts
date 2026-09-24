@@ -43,7 +43,12 @@ const row = (r: Partial<NeedsMe> & Record<string, unknown>): NeedsMe =>
     { type: "answer", issue: "D-2", report: "q.md", options: ["hourly", "every 15m"], impact: "blocks D-2", body: "which?" },
     "question → answer, empty options dropped",
   );
-  equal([needs[1].owner, needs[1].summary], ["w1", "Cost policy: 4x requests."], "asker and the master's summary");
+  equal(
+    [needs[1].owner, needs[1].summary, needs[1].escalatedBy],
+    ["w1", "Cost policy: 4x requests.", "master"],
+    "asker, the master's summary, who escalated",
+  );
+  equal(needs[0].escalatedBy, null, "only questions are escalated");
   equal(needs[2].action, { type: "command", command: "cadence x" }, "others → the command");
   equal(needs[2].owner, "pm", "owner");
 }

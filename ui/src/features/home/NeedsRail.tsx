@@ -131,6 +131,7 @@ function NeedItem({
           <div className="text-secondary text-ink-200 break-words">{need.title}</div>
           <div className="text-micro text-ink-500 mt-0.5">
             {need.owner} · waiting {ageLabel(need.age)}
+            {need.escalatedBy ? ` · escalated by ${need.escalatedBy}` : ""}
           </div>
         </div>
       </div>
