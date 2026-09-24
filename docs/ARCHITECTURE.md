@@ -81,15 +81,20 @@ its provider process ended. Reclamation must prove ownership at action time.
 ## Memory implementation boundaries
 
 `src/issue/dispatch.rs` matches accepted project memories, writes a bounded
-lessons file and records included IDs. `src/main.rs` adds accepted project-wide
-rules to generated briefings. The generic job/coordinator path must be checked
-separately; do not assume all entry points share this retrieval behavior.
+lessons file and records included and withheld IDs. `src/main.rs` adds accepted
+project-wide rules to generated briefings. `--job` kickoffs are
+daemon-templated and carry no lessons (CAD-194); do not assume every entry point
+shares this retrieval behavior.
 
-The current memory schema records proposer, source, confidence and verification
-time, but still needs stronger authenticated curator identity and independent
-acceptance evidence. Path-only matching depends on recorded commit paths, so
-new work without commits can miss a relevant lesson. Proposed improvements are
-in the [learning design](design/DEVELOPMENT-TEAM.md).
+A memory record carries the daemon-authenticated proposer proof, one receipt
+per independent reviewer (identity, digest, evidence) and PM finalization
+receipts; `src/memory/mod.rs` refuses retrieval without two non-author passes
+and a matching PM finalization ([TEAM.md](TEAM.md#memory-acceptance)).
+Freshness is a label from the last finalized verify; only an explicit `stale:`
+mark withholds, and no citation re-check exists yet. Path-only matching depends
+on recorded commit paths, so new work without commits can miss a relevant
+lesson. Proposed improvements are in the
+[learning design](design/LEARNING-LOOP.md).
 
 ## Validation and change impact
 

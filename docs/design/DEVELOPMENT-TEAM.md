@@ -35,7 +35,7 @@ alerts by task/revision/cause. Resolve an alert after verified recovery. Unknown
 execution outcomes are reconciled before retry, not blindly repeated.
 
 Workers send evidence to the role that can act: implementation to QA, QA findings
-back to the author, verified delivery to Ops. PM sees exceptions, priorities and
+back to the author, verified delivery to DevOps. PM sees exceptions, priorities and
 summaries. Peer discussions are task-scoped and end in a decision or artifact;
 there is no always-on all-agent discussion loop.
 
@@ -60,7 +60,7 @@ structural changes update the map in the same PR.
 A future task-start context bundle selects the relevant documents, accepted
 lessons and current task evidence for the consuming role. A PM gets goal and
 dependency context; a developer gets acceptance and affected modules; QA gets the
-exact diff and regression risks; Ops gets rollout/authority evidence. The bundle
+exact diff and regression risks; DevOps gets rollout/authority evidence. The bundle
 is bounded, revision-labelled and explains why each item was selected.
 
 ## Verified memory lifecycle
@@ -109,7 +109,7 @@ retrieval from another project.
 
 A daily curator batch should deduplicate candidates and prioritize repeated
 failure modes. QA contributes what it caught; developers contribute failed and
-successful approaches; Ops contributes ownership/recovery lessons; research
+successful approaches; DevOps contributes ownership/recovery lessons; research
 contributes verified findings with scope. The system learns through reviewed
 artifacts and improved tooling/evals, not through model-weight training.
 

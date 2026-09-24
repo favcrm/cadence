@@ -41,7 +41,7 @@ verified delivery with routine coordination handled by the system.
 
 For PMs, start with goal, dependencies and stage wait times. For developers, read
 acceptance and the affected module. For QA, inspect the exact diff and evidence
-independently. For Ops, read release compatibility, live state and recorded
+independently. For DevOps, read release compatibility, live state and recorded
 merge/rollout authority. Curators need original evidence and prior lesson
 versions, not only the short injected summary.
 
