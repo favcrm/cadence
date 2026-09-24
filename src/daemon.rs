@@ -878,6 +878,30 @@ impl Shared {
                 store::THREAD_PAGE_MAX
             )));
         }
+        // CAD-328: `tail` (the newest page) or `before` (the page below a
+        // seq) read backwards for a chat view; neither waits.
+        let tail = params.get("tail").and_then(Value::as_bool).unwrap_or(false);
+        let before = optional_i64(params, "before");
+        if tail || before.is_some() {
+            if params.get("after").is_some() || params.get("wait").is_some() {
+                return Err(Error::rejected(
+                    "Thread read takes either after/wait (forward) or tail/before (backward)",
+                ));
+            }
+            if before.is_some_and(|b| b < 1) {
+                return Err(Error::rejected("Thread 'before' must be a positive seq"));
+            }
+            let thread = self.store.thread(&alias)?;
+            let (entries, more) = self.store.thread_entries_before(&alias, before, limit)?;
+            let cursor = entries.last().map(|e| e.seq).unwrap_or(0);
+            return Ok(json!({
+                "alias": alias,
+                "thread": thread.as_ref().map(store::Thread::to_json),
+                "entries": entries.iter().map(store::ThreadEntry::to_json).collect::<Vec<_>>(),
+                "cursor": cursor,
+                "more_before": more,
+            }));
+        }
         let wait = optional_u64(params, "wait").unwrap_or(0).min(30);
         let deadline = Instant::now() + Duration::from_secs(wait);
         loop {

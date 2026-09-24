@@ -16,6 +16,16 @@ import type {
   ContextRole,
 } from "./types";
 
+/** `GET /api/threads/<alias>` — `thread` is null until the first message. */
+export interface ThreadPage {
+  alias?: string;
+  thread: { id: string; alias: string; created: string; updated: string } | null;
+  entries: unknown[];
+  cursor?: number;
+  /** Backward reads (`tail`/`before`): older entries remain. */
+  more_before?: boolean;
+}
+
 export class ApiError extends Error {
   status: number;
   conflict?: string;
@@ -91,6 +101,40 @@ async function write<T extends object | undefined>(
     );
   }
   return parsed as WriteResp;
+}
+
+/** A board write that answers its own JSON (not an issue `WriteResp`). */
+async function post<T>(path: string, body: object): Promise<T> {
+  const resp = await fetch(path, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Cadence-Board": "1",
+    },
+    body: JSON.stringify(body),
+  });
+  const parsed = await resp.json().catch(() => null);
+  if (!resp.ok) {
+    throw new ApiError(
+      parsed?.error ?? `${resp.status} ${resp.statusText}`,
+      resp.status,
+      parsed ?? undefined,
+    );
+  }
+  return parsed as T;
+}
+
+/** A plan decision's request: approve takes nothing, reject a reason. */
+export function planDecision(
+  epic: string,
+  verb: "approve" | "reject",
+  reason?: string,
+): { path: string; body: { reason?: string } } {
+  const path = `/api/plans/${encodeURIComponent(epic)}/${verb}`;
+  if (verb === "approve") return { path, body: {} };
+  const why = (reason ?? "").trim();
+  if (!why) throw new ApiError("a rejection needs a reason", 400, { code: "reason_required" });
+  return { path, body: { reason: why } };
 }
 
 export const api = {
@@ -225,6 +269,37 @@ export const api = {
 
   artifactUrl: (id: string, name: string) =>
     `/api/issues/${id}/artifacts/${encodeURIComponent(name)}`,
+
+  /** `GET /api/threads/<alias>` — one page after `after`. */
+  thread: (alias: string, at: { after?: number; before?: number; tail?: boolean; limit?: number } = {}) => {
+    const q = new URLSearchParams({ limit: String(at.limit ?? 200) });
+    if (at.tail) q.set("tail", "1");
+    else if (at.before !== undefined) q.set("before", String(at.before));
+    else q.set("after", String(at.after ?? 0));
+    return get<ThreadPage>(`/api/threads/${encodeURIComponent(alias)}?${q.toString()}`);
+  },
+  /** `POST /api/threads/<alias>/messages` — `message` makes a retry idempotent. */
+  threadSend: (alias: string, text: string, message: string) =>
+    post<Record<string, unknown>>(`/api/threads/${encodeURIComponent(alias)}/messages`, {
+      text,
+      message,
+    }),
+  /** `POST /api/plans/<epic>/approve|reject` — operator-only (CAD-328). */
+  decidePlan: (epic: string, verb: "approve" | "reject", reason?: string) => {
+    let req: ReturnType<typeof planDecision>;
+    try {
+      req = planDecision(epic, verb, reason);
+    } catch (e) {
+      return Promise.reject(e);
+    }
+    return post<Record<string, unknown>>(req.path, req.body);
+  },
+  /** `POST /api/issues/<id>/answers` — the operator's answer report. */
+  answer: (issue: string, question: string, text: string) =>
+    write("POST", `/api/issues/${encodeURIComponent(issue)}/answers`, { question, text }),
+  /** `GET /api/master/summary?since=` — 501 on a daemon without it. */
+  masterSummary: (since: number) =>
+    get<Record<string, unknown>>(`/api/master/summary?since=${Math.floor(since)}`),
 
   modelDefaults: () => get<ModelDefaultsSnapshot>("/api/settings/model-defaults"),
   saveModelDefaults: (body: { expected_revision: number; config: ModelDefaultsConfig }) =>

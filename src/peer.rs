@@ -532,6 +532,44 @@ pub(crate) fn tcp_peer_agent(
     Ok(agents.into_iter().next())
 }
 
+/// Positive operator proof (CAD-276, [`operator_proof`]) for the TCP
+/// peer of a connection to our `server_port` — the board's gate for
+/// operator-only writes it relays to the daemon (CAD-328), which would
+/// otherwise see only the board's own process. Every process holding
+/// the client socket must pass: it runs as `uid`, walks cleanly, has
+/// no registered pane or managed provider (`roots`) on its ancestry, is
+/// no descendant of `daemon_pid` (under `daemon run` a detached child
+/// of a daemon-launched tool re-parents to the daemon), carries no
+/// agent environment, holds no pane pty, and leads or descends from
+/// its session. A peer on another host, or whose socket has no visible
+/// owner, is unprovable and refused.
+pub(crate) fn tcp_peer_operator_proof(
+    server_port: u16,
+    peer: SocketAddr,
+    uid: u32,
+    daemon_pid: u32,
+    roots: &AgentRoots,
+) -> Result<(), String> {
+    let peer = canonical(peer);
+    let Some((inode, _)) = client_socket(server_port, peer)? else {
+        return Err(format!(
+            "no local socket is the client end of {peer} → port {server_port}"
+        ));
+    };
+    let pids = socket_owners(inode);
+    if pids.is_empty() {
+        return Err(format!(
+            "socket {inode} of peer {peer} has no visible owner"
+        ));
+    }
+    for pid in pids {
+        operator_proof(pid, uid, daemon_pid, &roots.panes, |hop| {
+            roots.managed.contains_key(&hop)
+        })?;
+    }
+    Ok(())
+}
+
 /// A v4-mapped v6 address (`::ffff:127.0.0.1`, what a dual-stack
 /// listener reports) compares as the v4 address the kernel lists.
 pub(crate) fn canonical(addr: SocketAddr) -> SocketAddr {
