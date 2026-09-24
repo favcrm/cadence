@@ -27,10 +27,35 @@
 //! in [`CLAUDE_ALLOWED_TOOLS`]; forge and platform credentials are
 //! dropped from its env ([`DENIED_ENV`], an empty `GH_CONFIG_DIR`). All
 //! of it is keyed on the alias, not on stored params. The daemon's own
-//! allowlist (`daemon::MASTER_ALLOWED`) is the second line. This is a
-//! process guard, not a security boundary: a same-uid process can still
-//! read credential files and edit the tracker by hand (see
-//! docs/design/AGENT-FILESYSTEM.md).
+//! allowlist (`daemon::MASTER_ALLOWED`) is the second line.
+//!
+//! **Read confinement (CAD-439).** The allowlist does not bound what the
+//! master reads: Claude Code auto-allows the Bash commands it deems
+//! read-only (`id`, `ps`, `echo <glob>`, `cat` inside its working dirs)
+//! in every permission mode, `dontAsk` included, and an allowlisted
+//! `cadence report file`/`master escalate --file <path>` reads any path.
+//! So the daemon launches the provider under `cadence confine`
+//! ([`crate::confine`], Linux Landlock) with [`confinement`]: the
+//! system trees, the Claude CLI's own state, the programs it runs, the
+//! tracker, and the master's own dirs — nothing else of `$HOME`, the
+//! state dir or `/proc`. Every descendant inherits it, detached or not.
+//! Chosen after, in order: (a) no Claude Code flag, setting or mode
+//! turns read-only auto-allow off — the docs say the set "is not
+//! configurable", and `--restricted` confines only the file tools;
+//! (b) a `--disallowedTools` list cannot be complete for the same
+//! reason (the set is undocumented and version-dependent, and deny rules
+//! miss `/usr/bin/cat`-style forms); (c) bubblewrap, including Claude
+//! Code's own Bash sandbox, needs unprivileged user namespaces, which
+//! Ubuntu 24.04+ refuses by default — Landlock needs none. Other
+//! platforms have no verified sandbox, so `cadence confine` refuses and
+//! the master does not start there. Known residue: the Claude CLI's own
+//! state (`~/.claude`, which holds its login) stays readable to the
+//! whole tree — Claude's path check denies `cat` there, but an
+//! allowlisted `--file` verb can read it.
+//!
+//! Beyond the master's own tree this is a process guard, not a security
+//! boundary: another same-uid process can still read credential files
+//! and edit the tracker by hand (see docs/design/AGENT-FILESYSTEM.md).
 
 use std::path::{Path, PathBuf};
 
@@ -98,8 +123,7 @@ pub const CLAUDE_DISALLOWED_TOOLS: &[&str] = &[
 
 /// Forge and platform credentials removed from the master's env. The
 /// scrub is by name; a credential stored in a file (gh's `hosts.yml`,
-/// ssh keys) is what the empty `GH_CONFIG_DIR` and the tool denials
-/// cover, and what stays a documented gap.
+/// ssh keys) is outside the master's [`confinement`] (CAD-439).
 pub const DENIED_ENV: &[&str] = &[
     "GH_TOKEN",
     "GITHUB_TOKEN",
@@ -129,12 +153,16 @@ pub fn is_master(alias: &str) -> bool {
 pub fn env_overrides(state_dir: &Path, pm_dir: Option<&Path>) -> Vec<(String, String)> {
     let gh = state_dir.join("master").join("no-forge");
     let _ = std::fs::create_dir_all(&gh);
+    let tmp = tmpdir(state_dir);
+    let _ = std::fs::create_dir_all(&tmp);
     let mut env = vec![
         (
             "GH_CONFIG_DIR".to_string(),
             gh.to_string_lossy().to_string(),
         ),
         ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
+        // CAD-439: `/tmp` is outside its confinement.
+        ("TMPDIR".to_string(), tmp.to_string_lossy().to_string()),
     ];
     if let Some(pm) = pm_dir {
         env.push((
@@ -143,6 +171,197 @@ pub fn env_overrides(state_dir: &Path, pm_dir: Option<&Path>) -> Vec<(String, St
         ));
     }
     env
+}
+
+/// System trees the master's process tree may read and execute:
+/// binaries, shared libraries, `/etc` (TLS roots, resolver, passwd) and
+/// `/sys`. `/proc` is not listed whole — other processes' command lines
+/// stay unreadable; only the provider's own `/proc/self` (resolved at
+/// launch, so it is the provider's pid) and a few host-wide files.
+pub const CONFINE_SYSTEM_READ: &[&str] = &[
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/libx32",
+    "/etc",
+    "/sys",
+    "/proc/self",
+    "/proc/version",
+    "/proc/filesystems",
+    "/proc/meminfo",
+    "/proc/cpuinfo",
+    "/proc/stat",
+    "/proc/loadavg",
+    "/proc/uptime",
+    "/proc/sys/vm/overcommit_memory",
+    "/proc/sys/vm/mmap_min_addr",
+    "/proc/sys/kernel/pid_max",
+];
+
+/// Device files the master's process tree may use — not `/dev` whole
+/// (`/dev/shm` holds other processes' shared memory).
+pub const CONFINE_SYSTEM_WRITE: &[&str] = &[
+    "/dev/null",
+    "/dev/zero",
+    "/dev/full",
+    "/dev/random",
+    "/dev/urandom",
+    "/dev/tty",
+    "/dev/ptmx",
+    "/dev/pts",
+];
+
+/// The Claude CLI's own state under `$HOME`: its config dir (auth,
+/// session transcripts for `--resume`, shell snapshots), its config
+/// file and its version locks. Nothing else under `$HOME`.
+pub const CONFINE_HOME_WRITE: &[&str] = &[".claude", ".claude.json", ".local/state/claude"];
+
+/// The native Claude CLI's install tree under `$HOME`.
+pub const CONFINE_HOME_READ: &[&str] = &[".local/share/claude"];
+
+/// Daemon env naming extra paths (`:`-separated) the master may read,
+/// or also write — for a provider installed somewhere the defaults do
+/// not cover. Set by whoever starts the daemon, never by an agent.
+pub const CONFINE_EXTRA_READ_ENV: &str = "CADENCE_MASTER_CONFINE_READ";
+pub const CONFINE_EXTRA_WRITE_ENV: &str = "CADENCE_MASTER_CONFINE_WRITE";
+
+/// What the master's confinement is computed from.
+pub struct ConfineInputs {
+    pub state_dir: PathBuf,
+    pub home: Option<PathBuf>,
+    pub pm_dir: Option<PathBuf>,
+    /// Programs the master's process tree runs — the provider CLI (and
+    /// its `#!` interpreter), `cadence`. Each one's real directory is
+    /// readable.
+    pub programs: Vec<PathBuf>,
+    pub extra_read: Vec<PathBuf>,
+    pub extra_write: Vec<PathBuf>,
+}
+
+/// CAD-439: the filesystem the master's process tree — the Claude CLI
+/// and every command it runs — may touch. Claude Code auto-allows the
+/// read-only Bash commands it recognises (`id`, `ps`, `echo <glob>`,
+/// `cat` inside its working dirs …) in every permission mode, `dontAsk`
+/// included, and the set is not configurable; an allowlisted
+/// `cadence report file --file <path>` reads any path it is given. So
+/// the boundary is the OS: [`crate::confine`] (Landlock) exposes only
+/// the system trees, the master's own dirs under the state dir (cwd,
+/// tmp, briefing), the tracker (`cadence issue`/`report` read and commit
+/// it directly), the Claude CLI's own state, and the programs it runs.
+/// `$HOME` — ssh keys, forge logins, other repos — and the daemon's
+/// store stay unreadable. The daemon socket is reached by connect,
+/// which the sandbox does not restrict.
+pub fn confinement(inputs: &ConfineInputs) -> crate::confine::Policy {
+    let mut read: Vec<PathBuf> = CONFINE_SYSTEM_READ.iter().map(PathBuf::from).collect();
+    let mut write: Vec<PathBuf> = CONFINE_SYSTEM_WRITE.iter().map(PathBuf::from).collect();
+    if let Some(home) = &inputs.home {
+        read.extend(CONFINE_HOME_READ.iter().map(|p| home.join(p)));
+        write.extend(CONFINE_HOME_WRITE.iter().map(|p| home.join(p)));
+    }
+    for program in &inputs.programs {
+        if let Some(dir) = program_dir(program) {
+            if !read.contains(&dir) {
+                read.push(dir);
+            }
+        }
+    }
+    read.push(crate::client::briefing_path(
+        &inputs.state_dir,
+        &Value::Null,
+        ALIAS,
+    ));
+    write.push(workdir(&inputs.state_dir));
+    write.push(tmpdir(&inputs.state_dir));
+    if let Some(pm) = &inputs.pm_dir {
+        write.push(pm.clone());
+    }
+    read.extend(inputs.extra_read.iter().cloned());
+    write.extend(inputs.extra_write.iter().cloned());
+    crate::confine::Policy { read, write }
+}
+
+/// The directory holding `program`'s real file (symlinks resolved), so
+/// the whole install — a native build's versions dir, an npm package —
+/// is readable. `None` when the program does not exist.
+fn program_dir(program: &Path) -> Option<PathBuf> {
+    let real = program.canonicalize().ok()?;
+    real.parent().map(Path::to_path_buf)
+}
+
+/// `name` resolved against `path` (a `PATH` value) the way `execvp`
+/// does; an absolute or relative path with a `/` is taken as is.
+pub fn which(name: &str, path: Option<&str>) -> Option<PathBuf> {
+    if name.contains('/') {
+        return Some(PathBuf::from(name));
+    }
+    use std::os::unix::fs::PermissionsExt;
+    path?.split(':').filter(|d| !d.is_empty()).find_map(|dir| {
+        let candidate = Path::new(dir).join(name);
+        let meta = std::fs::metadata(&candidate).ok()?;
+        (meta.is_file() && meta.permissions().mode() & 0o111 != 0).then_some(candidate)
+    })
+}
+
+/// `program` plus the interpreter its `#!` line names (`/usr/bin/env
+/// node` resolves `node` on `path`) — an npm-installed Claude CLI is a
+/// node script.
+pub fn with_interpreter(program: &Path, path: Option<&str>) -> Vec<PathBuf> {
+    let mut out = vec![program.to_path_buf()];
+    let mut head = [0u8; 256];
+    let n = std::fs::File::open(program)
+        .and_then(|mut f| std::io::Read::read(&mut f, &mut head))
+        .unwrap_or(0);
+    let head = String::from_utf8_lossy(&head[..n]);
+    if let Some(line) = head.strip_prefix("#!").and_then(|h| h.lines().next()) {
+        let mut words = line.split_whitespace();
+        if let Some(interp) = words.next() {
+            if interp.ends_with("/env") {
+                if let Some(found) = words
+                    .find(|w| !w.starts_with('-'))
+                    .and_then(|w| which(w, path))
+                {
+                    out.push(found);
+                }
+            } else {
+                out.push(PathBuf::from(interp));
+            }
+        }
+    }
+    out
+}
+
+/// Split a `:`-separated env value into paths.
+pub fn split_paths(value: Option<String>) -> Vec<PathBuf> {
+    value
+        .unwrap_or_default()
+        .split(':')
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
+/// `cadence confine <policy> -- <command>`: the master's provider
+/// command wrapped in its confinement. `confine_exe` is the cadence
+/// binary that applies it.
+pub fn confine_argv(
+    confine_exe: &str,
+    policy: &crate::confine::Policy,
+    command: &[String],
+) -> Vec<String> {
+    let mut argv = vec![confine_exe.to_string(), "confine".to_string()];
+    argv.extend(policy.to_args());
+    argv.push("--".to_string());
+    argv.extend(command.iter().cloned());
+    argv
+}
+
+/// The master's private temp dir (its `TMPDIR`) — `/tmp` itself is not
+/// in its confinement.
+pub fn tmpdir(state_dir: &Path) -> PathBuf {
+    state_dir.join("master").join("tmp")
 }
 
 /// The master's working directory: an empty folder under the state dir
@@ -521,6 +740,98 @@ mod tests {
         let agent = text.find("agent text").unwrap();
         assert!(soul < agent, "{text}");
         assert!(text.contains("<!-- agents/master/AGENT.md -->"));
+    }
+
+    /// CAD-439: the master's confinement names the system trees, the
+    /// Claude CLI's own state and the master's own dirs — never `$HOME`,
+    /// the state dir, `/tmp`, `/proc` or `/dev` whole.
+    #[test]
+    fn confinement_exposes_only_the_masters_views() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let bin = tmp.path().join("tools").join("claude");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        let policy = confinement(&ConfineInputs {
+            state_dir: PathBuf::from("/s"),
+            home: Some(PathBuf::from("/h")),
+            pm_dir: Some(PathBuf::from("/pm")),
+            programs: vec![bin.clone(), PathBuf::from("/missing/cadence")],
+            extra_read: vec![PathBuf::from("/x")],
+            extra_write: vec![PathBuf::from("/y")],
+        });
+        let all: Vec<&PathBuf> = policy.read.iter().chain(&policy.write).collect();
+        for whole in [
+            "/", "/h", "/s", "/tmp", "/proc", "/dev", "/home", "/var", "/run",
+        ] {
+            assert!(
+                !all.iter().any(|p| p.as_path() == Path::new(whole)),
+                "{whole} exposed whole: {policy:?}"
+            );
+        }
+        let under = |root: &str| -> Vec<String> {
+            let mut v: Vec<String> = all
+                .iter()
+                .filter(|p| p.starts_with(root))
+                .map(|p| p.to_string_lossy().to_string())
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            under("/h"),
+            [
+                "/h/.claude",
+                "/h/.claude.json",
+                "/h/.local/share/claude",
+                "/h/.local/state/claude"
+            ]
+        );
+        assert_eq!(
+            under("/s"),
+            [
+                "/s/briefings/master/BRIEFING-master.md",
+                "/s/master/cwd",
+                "/s/master/tmp"
+            ]
+        );
+        assert_eq!(under("/proc/self"), ["/proc/self"]);
+        assert!(policy.write.contains(&PathBuf::from("/pm")));
+        assert!(policy.read.contains(&PathBuf::from("/x")));
+        assert!(policy.write.contains(&PathBuf::from("/y")));
+        // A program's real directory; a missing one adds nothing.
+        let dir = bin.canonicalize().unwrap().parent().unwrap().to_path_buf();
+        assert!(policy.read.contains(&dir), "{policy:?}");
+        assert!(!all.iter().any(|p| p.starts_with("/missing")));
+        // The briefing and system trees are read-only.
+        assert!(!policy
+            .write
+            .iter()
+            .any(|p| p.starts_with("/usr") || p.starts_with("/etc")));
+    }
+
+    #[test]
+    fn interpreter_of_a_script_is_a_program_too() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let node = tmp.path().join("node");
+        std::fs::write(&node, "").unwrap();
+        std::fs::set_permissions(&node, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let cli = tmp.path().join("cli.js");
+        std::fs::write(&cli, "#!/usr/bin/env node\nconsole.log(1)\n").unwrap();
+        let path = tmp.path().to_str().unwrap();
+        assert_eq!(with_interpreter(&cli, Some(path)), [cli.clone(), node]);
+        let sh = tmp.path().join("run.sh");
+        std::fs::write(&sh, "#!/bin/bash -e\n").unwrap();
+        assert_eq!(
+            with_interpreter(&sh, None),
+            [sh.clone(), PathBuf::from("/bin/bash")]
+        );
+        assert_eq!(which("node", Some(path)), Some(tmp.path().join("node")));
+        assert_eq!(which("nope", Some(path)), None);
+        assert_eq!(
+            split_paths(Some("/a::/b".into())),
+            [PathBuf::from("/a"), PathBuf::from("/b")]
+        );
     }
 
     #[test]

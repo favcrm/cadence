@@ -41060,7 +41060,21 @@ impl PlanFixture {
     /// `master_start` (as the operator) with the enrollment mock as the
     /// master's claude; waits for the daemon to enroll it.
     fn start_master(&self) -> (ManagedWorker, Value) {
-        let mock = ManagedWorker::install(self.d.dir.path(), &self.d.state, "master");
+        // CAD-439: the master's provider runs under `cadence confine`.
+        // The built binary applies it (`current_exe` is this runner),
+        // and the mock's own files — script, pidfile, command dir — are
+        // the only extra paths it gets: never the test's state dir.
+        // `/proc` too: the mock's detached grandchild walks its ancestry
+        // there (the real provider gets only `/proc/self`).
+        let mock_dir = self.tmp.path().join("mock");
+        std::fs::create_dir_all(&mock_dir).unwrap();
+        let mock = ManagedWorker::install(&mock_dir, &self.d.state, "master");
+        test_env().set("CADENCE_CONFINE_COMMAND", env!("CARGO_BIN_EXE_cadence"));
+        test_env().set(cadence_agent::master::CONFINE_EXTRA_READ_ENV, "/proc");
+        test_env().set(
+            cadence_agent::master::CONFINE_EXTRA_WRITE_ENV,
+            format!("{}:{}", mock_dir.display(), mock.cmd_dir.path().display()),
+        );
         let out = self
             .d
             .operator_rpc("master_start", json!({"provider": "claude"}))
@@ -41076,7 +41090,8 @@ impl PlanFixture {
         format!(
             "env HOME={h} XDG_CONFIG_HOME={h}/.config TMPDIR={t} {bin} --state-dir {s} {args}",
             h = home.display(),
-            t = self.tmp.path().join("tmp").display(),
+            // CAD-439: the master's own TMPDIR — `/tmp` is outside it.
+            t = cadence_agent::master::tmpdir(&self.d.state).display(),
             bin = env!("CARGO_BIN_EXE_cadence"),
             s = self.d.state.display(),
         )
@@ -41097,8 +41112,12 @@ impl PlanFixture {
         (r["rc"] == 0, value)
     }
 
+    /// A file in the master's own temp dir — inside its confinement
+    /// (CAD-439), so the master's `--file` reads reach it.
     fn file(&self, name: &str, text: &str) -> String {
-        let path = self.tmp.path().join("tmp").join(name);
+        let dir = cadence_agent::master::tmpdir(&self.d.state);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
         std::fs::write(&path, text).unwrap();
         path.to_str().unwrap().to_string()
     }
@@ -41796,6 +41815,141 @@ fn master_escalation_reaches_the_operator_needs_you() {
     }
 }
 
+/// `cadence confine` (CAD-439) run directly: the listed paths work,
+/// nothing else does — not through a symlink planted in a writable dir,
+/// not from a `setsid` grandchild, not another process's `/proc`, and a
+/// program outside the read set cannot even be executed. A missing
+/// command refuses.
+#[test]
+fn confine_denies_everything_unlisted() {
+    let tmp = TempDir::new().unwrap();
+    let (open, secret) = (tmp.path().join("open"), tmp.path().join("secret"));
+    std::fs::create_dir_all(&open).unwrap();
+    std::fs::create_dir_all(&secret).unwrap();
+    let token = format!("CANARY{}", uuid::Uuid::new_v4().simple());
+    std::fs::write(secret.join("key"), &token).unwrap();
+    std::fs::write(open.join("mine"), "mine").unwrap();
+    std::os::unix::fs::symlink(secret.join("key"), open.join("link")).unwrap();
+    std::fs::copy("/bin/cat", secret.join("mycat")).unwrap();
+    let policy = cadence_agent::master::confinement(&cadence_agent::master::ConfineInputs {
+        state_dir: tmp.path().join("state"),
+        home: None,
+        pm_dir: None,
+        programs: vec![],
+        extra_read: vec![],
+        extra_write: vec![open.clone()],
+    });
+    let run = |script: &str| {
+        let mut argv = policy.to_args();
+        argv.extend(["--".into(), "sh".into(), "-c".into(), script.into()]);
+        std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+            .arg("confine")
+            .args(&argv)
+            .output()
+            .unwrap()
+    };
+    let o = run(&format!(
+        "cat {}/mine && echo new > {}/new",
+        open.display(),
+        open.display()
+    ));
+    assert!(o.status.success(), "{o:?}");
+    assert_eq!(String::from_utf8_lossy(&o.stdout), "mine");
+    assert_eq!(std::fs::read_to_string(open.join("new")).unwrap(), "new\n");
+    let key = secret.join("key");
+    for script in [
+        format!("cat {}", key.display()),
+        format!("cat < {}", key.display()),
+        format!("cat {}/link", open.display()),
+        format!("ls {}", secret.display()),
+        format!("setsid sh -c 'cat {}'", key.display()),
+        format!("{}/mycat {}/mine", secret.display(), open.display()),
+        format!("cat /proc/{}/cmdline", std::process::id()),
+        format!("cp {} {}/stolen", key.display(), open.display()),
+    ] {
+        let o = run(&script);
+        let all = format!("{o:?}");
+        assert!(
+            !o.status.success() && !all.contains(&token),
+            "{script}: {all}"
+        );
+    }
+    assert!(!open.join("stolen").exists());
+    let o = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .args(["confine", "--read", "/usr"])
+        .output()
+        .unwrap();
+    assert!(!o.status.success(), "{o:?}");
+}
+
+/// CAD-439 ACCEPTANCE: the master's process tree reads nothing outside
+/// its views. Claude Code auto-allows read-only Bash commands (`cat`,
+/// `id`, `echo <glob>` …) even under `dontAsk`, so the boundary is the
+/// OS sandbox the daemon launches the provider in. Its tool
+/// subprocesses — plain, redirected, detached with `setsid`, or an
+/// allowlisted `cadence … --file <path>` — cannot read a canary in
+/// `$HOME`, in the daemon's state dir or in a repo, nor list `$HOME`;
+/// what it needs (the daemon socket, the tracker, its own temp dir)
+/// still works.
+#[test]
+fn master_reads_nothing_outside_its_views() {
+    let f = PlanFixture::start();
+    // The daemon's `$HOME` — never the host's.
+    let home = f.tmp.path().join("home");
+    test_env().set("HOME", home.to_str().unwrap());
+    let (mut m, _) = f.start_master();
+    let token = format!("CANARY{}", uuid::Uuid::new_v4().simple());
+    let canaries = [
+        home.join(".ssh").join("id_canary"),
+        home.join(".config").join("gh").join("hosts.yml"),
+        f.d.state.join("canary.txt"),
+        f.tmp.path().join("repo").join("canary.txt"),
+    ];
+    for c in &canaries {
+        std::fs::create_dir_all(c.parent().unwrap()).unwrap();
+        std::fs::write(c, &token).unwrap();
+    }
+    let leaked = |r: &Value| r.to_string().contains(&token);
+    for c in &canaries {
+        let c = c.to_str().unwrap();
+        for argv in [
+            vec!["cat", c],
+            vec!["head", c],
+            vec!["grep", "-r", "CANARY", c],
+            vec!["sh", "-c", &format!("cat < {c}")],
+            vec!["setsid", "sh", "-c", &format!("cat {c}")],
+        ] {
+            let r = m.exec(&argv);
+            assert!(r["rc"] != 0 && !leaked(&r), "{argv:?} read a canary: {r}");
+        }
+        // An allowlisted verb that reads a named file.
+        let (ok, out) = f.as_master(&mut m, &format!("master escalate D-1 q.md --file {c}"));
+        assert!(!ok && !out.to_string().contains(&token), "{out}");
+        assert!(out.to_string().contains("Permission denied"), "{out}");
+    }
+    let r = m.exec(&["ls", home.to_str().unwrap()]);
+    assert!(r["rc"] != 0, "listed $HOME: {r}");
+    let r = m.exec(&["ls", f.d.state.to_str().unwrap()]);
+    assert!(r["rc"] != 0, "listed the state dir: {r}");
+    let tracker = std::process::Command::new("grep")
+        .args(["-r", &token])
+        .arg(&f.pm_dir)
+        .output()
+        .unwrap();
+    assert!(tracker.stdout.is_empty(), "a canary reached the tracker");
+
+    // What the master needs still works: the daemon socket, the
+    // tracker, its own temp dir.
+    let (ok, out) = f.as_master(&mut m, "agent list");
+    assert!(ok, "{out}");
+    let (ok, out) = f.as_master(&mut m, "issue ls");
+    assert!(ok, "{out}");
+    let own = f.file("own.txt", "mine");
+    let r = m.exec(&["cat", &own]);
+    assert_eq!(r["rc"], 0, "{r}");
+    assert_eq!(r["out"], "mine");
+}
+
 /// CAD-339 review round 2: concurrent `master dispatch` calls for one
 /// ticket dispatch it exactly once. The ready check and the dispatch run
 /// under one daemon lock, so every other caller sees `doing` and is
@@ -41818,7 +41972,7 @@ fn master_dispatch_races_dispatch_a_ticket_once() {
     // Five dispatches of D-2 at once, from the master's tool process.
     const N: usize = 5;
     let outs: Vec<PathBuf> = (0..N)
-        .map(|n| f.tmp.path().join(format!("tmp/race-{n}.out")))
+        .map(|n| cadence_agent::master::tmpdir(&f.d.state).join(format!("race-{n}.out")))
         .collect();
     let script = outs
         .iter()

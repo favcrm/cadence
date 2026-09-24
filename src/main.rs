@@ -1140,6 +1140,19 @@ enum Commands {
     /// Stdio MCP server backing `--permission-prompt-tool` on a
     /// brokered managed claude — spawned by the provider CLI via the
     /// generated `--mcp-config`, never by hand.
+    /// Run a command under a filesystem sandbox (CAD-439): `--read`
+    /// paths are readable and executable, `--write` paths fully usable,
+    /// everything else denied. The daemon launches the master's
+    /// provider through it.
+    #[command(hide = true)]
+    Confine {
+        #[arg(long, value_name = "PATH")]
+        read: Vec<PathBuf>,
+        #[arg(long, value_name = "PATH")]
+        write: Vec<PathBuf>,
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
     #[command(hide = true)]
     McpPermission {
         /// Override the decision deadline in seconds (else
@@ -2351,6 +2364,12 @@ enum MasterAction {
         #[arg(long)]
         post: bool,
     },
+    /// Print the filesystem confinement `master start` launches the
+    /// master's provider under (CAD-439), computed from this env exactly
+    /// as the daemon does: `{confine, read, write}`. Reads nothing,
+    /// starts nothing — for `scripts/master-read-probe.sh`.
+    #[command(hide = true)]
+    Confinement,
 }
 
 fn run_master(state_dir: &Path, action: MasterAction) -> Result<i32> {
@@ -2395,6 +2414,12 @@ fn run_master(state_dir: &Path, action: MasterAction) -> Result<i32> {
             "master_summary",
             json!({"since": since, "post": post}),
         )?,
+        MasterAction::Confinement => {
+            let env = cadence_agent::adapter::ProviderEnv::default();
+            let (confine, policy) =
+                cadence_agent::adapter::claude::master_confinement(&env, state_dir);
+            json!({"confine": confine, "read": policy.read, "write": policy.write})
+        }
     };
     print_json(&result);
     Ok(0)
@@ -6084,6 +6109,13 @@ fn run() -> Result<i32> {
             },
         ),
         Commands::McpPermission { timeout_secs } => cadence_agent::mcp::run(timeout_secs),
+        Commands::Confine {
+            read,
+            write,
+            command,
+        } => {
+            cadence_agent::confine::exec(&cadence_agent::confine::Policy { read, write }, &command)
+        }
     }
 }
 

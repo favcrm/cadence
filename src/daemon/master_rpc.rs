@@ -428,6 +428,9 @@ impl Shared {
                 ),
             ));
         }
+        // CAD-439: the master runs only confined — refuse before
+        // anything is installed or registered on a host that cannot.
+        crate::confine::available()?;
         let installed = master::install_defaults(&pm, "operator")?;
         let files = master::read_files(&pm.dir, ALIAS, true)?;
         master::verify(&self.state_dir, ALIAS, &files)?;
