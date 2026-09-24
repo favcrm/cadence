@@ -136,19 +136,42 @@ fn text(out: &Output) -> String {
     )
 }
 
-/// A free board port in 3110-3199 — never production's 3010. Each
-/// call hands out a port no earlier call in this process did, so tests
-/// running in parallel never pick the same one.
-fn test_port() -> u16 {
-    use std::sync::atomic::{AtomicU16, Ordering};
-    static NEXT: AtomicU16 = AtomicU16::new(3110);
-    loop {
-        let port = NEXT.fetch_add(1, Ordering::SeqCst);
-        assert!(port <= 3199, "no free port in 3110-3199");
+/// A board port in 3110-3199 — never production's 3010 — held for
+/// the test's lifetime. Tests may run as separate processes (nextest)
+/// or as threads (cargo test), so the lease is an exclusive `flock` on
+/// `/tmp/cadence-test-ports/<port>.lock`: it excludes other threads and
+/// other processes alike, and the kernel releases it when the test
+/// ends, however it ends. The scan starts at a pid-derived offset so
+/// concurrent processes rarely contend, and a port something else
+/// (outside this scheme) already listens on is skipped.
+struct PortLease {
+    port: u16,
+    _lock: std::fs::File,
+}
+
+fn test_port() -> PortLease {
+    use std::os::fd::AsRawFd;
+    let dir = Path::new("/tmp/cadence-test-ports");
+    std::fs::create_dir_all(dir).unwrap();
+    let span = 90;
+    let start = std::process::id() as usize * 31 % span;
+    for i in 0..span {
+        let port = 3110 + ((start + i) % span) as u16;
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(format!("{port}.lock")))
+            .unwrap();
+        // SAFETY: plain syscall on a descriptor this function owns.
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            continue;
+        }
         if TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return port;
+            return PortLease { port, _lock: lock };
         }
     }
+    panic!("no free port in 3110-3199");
 }
 
 fn by_check(lines: &[Value]) -> BTreeMap<String, Value> {
@@ -209,8 +232,10 @@ fn install_snapshot(host: &Host) -> BTreeMap<PathBuf, (String, Vec<u8>, i128)> {
 /// no byte and no mtime of the state dir, tracker or skill.
 #[test]
 fn setup_creates_once_and_a_second_run_changes_nothing() {
+    // Declared before the host: dropped after it stops the board.
+    let lease = test_port();
     let host = Host::new();
-    let port = test_port();
+    let port = lease.port;
 
     let first = host.setup_json(port);
     for line in &first {
@@ -332,7 +357,8 @@ fn setup_creates_once_and_a_second_run_changes_nothing() {
 
     // Another --port while the board runs: the running board's URL is
     // reported, the difference named, nothing moved.
-    let other = test_port();
+    let other_lease = test_port();
+    let other = other_lease.port;
     let moved = by_check(&host.setup_json(other));
     let ui = moved["ui"]["detail"].as_str().unwrap();
     assert!(ui.contains(&format!("http://127.0.0.1:{port}")), "{ui}");
@@ -360,8 +386,10 @@ fn setup_creates_once_and_a_second_run_changes_nothing() {
 /// that would re-run `tailscale serve`.
 #[test]
 fn setup_never_restarts_a_tailnet_shared_board() {
+    // Declared before the host: dropped after it stops the board.
+    let lease = test_port();
     let host = Host::new();
-    let port = test_port();
+    let port = lease.port;
     host.setup_json(port);
     assert!(host.run(&["ui", "stop"]).status.success());
     let ui_json = host.state_dir().join("ui.json");
@@ -387,7 +415,8 @@ fn setup_refuses_a_non_tracker_dir_and_skips_what_needs_it() {
     let host = Host::new();
     std::fs::create_dir_all(host.path("home/pm")).unwrap();
     std::fs::write(host.path("home/pm/notes.md"), "mine\n").unwrap();
-    let out = host.run(&["setup", "--json", "--port", &test_port().to_string()]);
+    let lease = test_port();
+    let out = host.run(&["setup", "--json", "--port", &lease.port.to_string()]);
     assert_eq!(out.status.code(), Some(1), "{}", text(&out));
     let lines: Vec<Value> = String::from_utf8_lossy(&out.stdout)
         .lines()
