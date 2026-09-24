@@ -87,6 +87,13 @@ use crate::issue::Pm;
 
 /// The master's alias — and its agent slug.
 pub const ALIAS: &str = "master";
+
+/// The providers `master start` accepts — `claude` only for the MVP: a
+/// Codex master waits for a read-only sandbox with its writes through
+/// daemon verbs. The setup wizard (CAD-448) offers exactly this list
+/// with each one's exact start command, so the daemon's refusal and
+/// the wizard's offer stay in one place.
+pub const PROVIDERS: &[&str] = &["claude"];
 /// The agent files the briefing is built from, in briefing order.
 pub const FILES: [&str; 2] = ["SOUL.md", "AGENT.md"];
 /// Size caps from the agent-filesystem design record (characters).
@@ -445,6 +452,13 @@ pub fn confinement_available(env: &crate::adapter::ProviderEnv) -> Result<()> {
     let _ = env;
     crate::confine::available()
 }
+
+/// What the operator opts into when `master start --unconfined` is the
+/// only way — `master start` answers with it, and the setup wizard
+/// shows it next to the command it offers (CAD-448 review, I1).
+pub const UNCONFINED_WARNING: &str = "the master runs UNCONFINED: no filesystem sandbox on this \
+     host, so it can read and write your files (ssh keys, forge logins, every repo) — its Bash \
+     allowlist is the only limit";
 
 /// The master's Claude login, as `master start` found or made it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

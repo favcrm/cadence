@@ -62,6 +62,23 @@ const steps = {
     await main.getByText("Agent CLIs", { exact: true }).first().click();
     await expectText(main, "signed in", "setup page shows the detected claude CLI signed in");
     await expectText(main, "claude", "setup page lists the detected claude CLI");
+    // CAD-448: the master step offers the signed-in provider's exact
+    // start command and the master's own login command (CAD-439).
+    await main.getByText("Master agent", { exact: true }).first().click();
+    await expectText(
+      main,
+      "master start --provider claude",
+      "setup offers claude's exact master start command",
+    );
+    await expectText(main, "claude auth login", "setup shows the master's own login command");
+    // The step must not overflow a phone-width viewport.
+    await page.setViewportSize({ width: 390, height: 800 });
+    const overflow = await page.evaluate(
+      () =>
+        document.documentElement.scrollWidth > document.documentElement.clientWidth ||
+        document.body.scrollWidth > document.documentElement.clientWidth,
+    );
+    if (overflow) throw new Error("the master step overflows a 390px viewport");
     return {};
   },
 

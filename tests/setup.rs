@@ -462,11 +462,20 @@ impl Board {
     }
 
     fn start_with(host: &Host, port: u16, extra: &[&str]) -> Self {
+        Self::start_env(host, port, extra, &[])
+    }
+
+    /// `start_with`, plus env vars for the board process — the route a
+    /// test seam such as `CADENCE_TEST_NO_LANDLOCK` takes to it.
+    fn start_env(host: &Host, port: u16, extra: &[&str], env: &[(&str, &str)]) -> Self {
         let port_s = port.to_string();
         let mut args = vec!["ui", "run", "--port", &port_s];
         args.extend_from_slice(extra);
-        let child = host
-            .command(&args)
+        let mut cmd = host.command(&args);
+        for (name, value) in env {
+            cmd.env(name, value);
+        }
+        let child = cmd
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
@@ -548,6 +557,22 @@ fn board_setup_is_detect_only_and_writes_nothing() {
     for name in ["state_dir", "tracker", "skill", "daemon"] {
         assert!(checks[name]["fix"].is_string(), "{}", checks[name]);
     }
+    // CAD-448/CAD-439: the master's own login is its own check — missing
+    // until its separate CLAUDE_CONFIG_DIR holds a .credentials.json; a
+    // host that cannot confine runs the master on the operator's login
+    // and asks for nothing.
+    if cadence_agent::confine::available().is_ok() {
+        assert_eq!(status(&checks, "master_login"), "missing");
+        let login_fix = checks["master_login"]["fix"].as_str().unwrap();
+        assert!(login_fix.contains("claude auth login"), "{login_fix}");
+        assert!(login_fix.contains("CLAUDE_CONFIG_DIR="), "{login_fix}");
+    } else {
+        assert_eq!(status(&checks, "master_login"), "ok");
+        assert!(checks["master_login"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("--unconfined"));
+    }
     // The board answering is the board running.
     assert_eq!(status(&checks, "ui"), "ok", "{}", checks["ui"]);
     assert!(checks["ui"]["detail"]
@@ -565,8 +590,27 @@ fn board_setup_is_detect_only_and_writes_nothing() {
     assert_eq!(checks["codex"]["fix"], "codex login");
     assert_eq!(status(&checks, "devin"), "ok", "{}", checks["devin"]);
     assert_eq!(checks["master"]["group"], "master");
+    assert_eq!(checks["master_login"]["group"], "master");
     assert_eq!(checks["daemon"]["group"], "environment");
-
+    // CAD-448: the wizard's master step gets the providers `master
+    // start` accepts — the signed-in claude; devin is signed in but can
+    // never be the master, so it is not offered.
+    let offers = payload["master"]["providers"].as_array().unwrap();
+    assert_eq!(offers.len(), 1, "{offers:?}");
+    assert_eq!(offers[0]["bin"], "claude");
+    assert_eq!(offers[0]["ready"], true, "{offers:?}");
+    // CAD-448 review (N4): `tracker` is missing, so the offer shows the
+    // provider's readiness but no start command — the step's one
+    // command is the master check's own fix, never two for one action.
+    assert!(offers[0]["start"].is_null(), "{offers:?}");
+    assert!(offers[0]["warning"].is_null(), "{offers:?}");
+    assert!(
+        checks["master"]["fix"]
+            .as_str()
+            .is_some_and(|f| f.ends_with("master start")),
+        "{}",
+        checks["master"]
+    );
     // A re-check runs the probes again and still writes nothing.
     std::thread::sleep(std::time::Duration::from_secs(6));
     let (code, body) = board.request("GET", "/api/setup?fresh=1");
@@ -590,6 +634,123 @@ fn board_setup_is_detect_only_and_writes_nothing() {
         install_snapshot(&host),
         "/api/setup changed the host"
     );
+}
+
+/// CAD-448: once the master's own `CLAUDE_CONFIG_DIR` holds a login the
+/// wizard reads its presence — never the file's contents.
+#[test]
+fn board_setup_reports_the_masters_own_login() {
+    let lease = test_port();
+    let host = Host::new();
+    let creds = host.state_dir().join("master/claude/.credentials.json");
+    std::fs::create_dir_all(creds.parent().unwrap()).unwrap();
+    std::fs::write(&creds, format!("{{\"secret\": \"{SECRET}\"}}")).unwrap();
+    let board = Board::start(&host, lease.port);
+    let (code, body) = board.request("GET", "/api/setup");
+    assert_eq!(code, 200, "{body}");
+    assert!(
+        !body.contains(SECRET),
+        "the login file's contents leaked: {body}"
+    );
+    let payload: Value = serde_json::from_str(&body).unwrap();
+    let checks = by_check(payload["checks"].as_array().unwrap());
+    assert_eq!(
+        status(&checks, "master_login"),
+        "ok",
+        "{}",
+        checks["master_login"]
+    );
+    if cadence_agent::confine::available().is_ok() {
+        assert!(checks["master_login"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("own login"));
+    }
+    assert!(checks["master_login"]["fix"].is_null());
+}
+
+/// CAD-448 review (N4): once the `master` check's prerequisite exists
+/// — `cadence issue init` made a tracker — the offer carries the exact
+/// start command, served with the board's own state dir.
+#[test]
+fn board_setup_offers_the_start_command_once_the_tracker_exists() {
+    let lease = test_port();
+    let host = Host::new();
+    let out = host.run(&["issue", "init"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let board = Board::start(&host, lease.port);
+    let (code, body) = board.request("GET", "/api/setup");
+    assert_eq!(code, 200, "{body}");
+    let payload: Value = serde_json::from_str(&body).unwrap();
+    let checks = by_check(payload["checks"].as_array().unwrap());
+    assert_eq!(status(&checks, "tracker"), "ok", "{}", checks["tracker"]);
+    let offers = payload["master"]["providers"].as_array().unwrap();
+    let claude = &offers[0];
+    let start = claude["start"].as_str().unwrap_or_default();
+    assert!(start.contains("master start"), "{claude}");
+    assert!(start.contains("--provider claude"), "{claude}");
+    // The check's bare `master start` fix is the same action — the
+    // offer absorbed it (N4: one command, not two).
+    assert!(checks["master"]["fix"].is_null(), "{}", checks["master"]);
+    if cadence_agent::confine::available().is_ok() {
+        assert_eq!(start, "cadence master start --provider claude");
+        assert!(claude["warning"].is_null(), "{claude}");
+    } else {
+        assert!(start.contains("--unconfined"), "{claude}");
+    }
+}
+
+/// CAD-448 review (I1): `CADENCE_TEST_NO_LANDLOCK` forces the
+/// unconfined branch on any host — the offer's command names
+/// `--unconfined` and carries the warning text, and `master_login`
+/// states the risk instead of framing it as convenient. Runs on a
+/// Landlock host too: the seam is the whole point.
+#[test]
+fn board_setup_warns_when_the_master_would_run_unconfined() {
+    let lease = test_port();
+    let host = Host::new();
+    let out = host.run(&["issue", "init"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let board = Board::start_env(
+        &host,
+        lease.port,
+        &[],
+        &[(cadence_agent::master::TEST_NO_LANDLOCK, "1")],
+    );
+    let (code, body) = board.request("GET", "/api/setup");
+    assert_eq!(code, 200, "{body}");
+    let payload: Value = serde_json::from_str(&body).unwrap();
+    let offers = payload["master"]["providers"].as_array().unwrap();
+    let claude = &offers[0];
+    let start = claude["start"].as_str().unwrap_or_default();
+    assert!(start.contains("--unconfined"), "{claude}");
+    assert!(start.contains("--provider claude"), "{claude}");
+    let warning = claude["warning"].as_str().unwrap_or_default();
+    assert!(
+        warning.contains("UNCONFINED") && warning.contains("read and write your files"),
+        "{claude}"
+    );
+    let checks = by_check(payload["checks"].as_array().unwrap());
+    assert_eq!(
+        status(&checks, "master_login"),
+        "ok",
+        "{}",
+        checks["master_login"]
+    );
+    let detail = checks["master_login"]["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("no filesystem sandbox") && detail.contains("read and write your files"),
+        "{detail}"
+    );
+    assert!(checks["master_login"]["fix"].is_null());
 }
 
 /// A provider CLI that never answers cannot hold the page: each probe
