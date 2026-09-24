@@ -3424,24 +3424,7 @@ impl Shared {
     /// that leaves every agent's ancestry without orphaning its session
     /// and scrubs its env and stdio still passes.
     fn operator_connection(&self, verb: &str, params: &Value, peer_pid: u32) -> Result<()> {
-        for field in [
-            "by",
-            "operator",
-            "actor",
-            "alias",
-            "lane",
-            "pid",
-            "pane",
-            "recorded_via",
-            "attribution",
-        ] {
-            if params.get(field).is_some() {
-                return Err(Error::rejected(format!(
-                    "{verb} authority is connection-bound; request field \
-                     '{field}' is not accepted"
-                )));
-            }
-        }
+        reject_operator_fields(verb, params)?;
         if let Some(who) = self.slot_identity(peer_pid)? {
             return Err(Error::rejected(format!(
                 "{verb} is an operator action — this connection is agent \
@@ -3732,32 +3715,23 @@ impl Shared {
 
     /// CAD-358 `project_new` — register a repo as a project and seed its
     /// PROJECT.md in one tracker commit ([`crate::issue::project_new`]).
-    /// The operator runs it, connection-bound like `approve-work`: any
-    /// agent connection is refused, and so is a caller that is not
-    /// provably the operator — a detached child of an agent included.
-    /// Identity-shaped request fields are refused, never read.
-    ///
-    /// CAD-339 HOOK (PR #213, the master agent, not merged when this
-    /// landed): the master may run it too. When #213 is on main:
-    ///
-    /// 1. refuse identity-shaped fields FIRST, for every caller —
-    ///    `reject_identity_fields(params, "project new")?` plus the
-    ///    `operator_connection` list (`by`, `actor`, `operator`, …) — so
-    ///    the master branch never skips the field refusal;
-    /// 2. then `let actor = if self.caller_is_master(peer_pid) {
-    ///    crate::master::ALIAS } else { self.operator_connection(..)?;
-    ///    "operator" };`
-    /// 3. add `"project_new"` to `MASTER_ALLOWED` and
-    ///    `"Bash(cadence project new *)"` to `master::CLAUDE_ALLOWED_TOOLS`;
-    /// 4. test: the master is accepted (actor `master`), a master call
-    ///    carrying `actor`/`by` is refused with nothing written, and the
-    ///    tracker-root refusal (`issue::project_new::run`) holds for the
-    ///    master exactly as for the operator.
-    ///
-    /// Until then the master, like every agent, is refused here.
+    /// Callers: the proven operator, and the master (CAD-339) by its
+    /// verified connection ([`Self::caller_is_master`]) — never by a
+    /// request field. Identity-shaped fields are refused FIRST, for every
+    /// caller, so the master path never skips that refusal. Every other
+    /// agent — a pane, a managed endpoint or its tool subprocess — and a
+    /// detached child of any agent, the master included, is refused
+    /// (`operator_connection`). On both paths the tracker and this
+    /// daemon's state dir are refused as the repo.
     fn rpc_project_new(&self, params: &Value, peer_pid: u32) -> Result<Value> {
-        self.operator_connection("project new", params, peer_pid)?;
-        let actor = "operator";
+        reject_identity_fields(params, "project new")?;
+        reject_operator_fields("project new", params)?;
+        let actor = if self.caller_is_master(peer_pid) {
+            crate::master::ALIAS
+        } else {
+            self.operator_connection("project new", params, peer_pid)?;
+            "operator"
+        };
         let text = |name: &str| optional_str(params, name).map(str::to_string);
         let agents = match params.get("agents") {
             None | Some(Value::Null) => vec![],
@@ -3780,7 +3754,12 @@ impl Shared {
             issue: text("issue"),
         };
         let pm = crate::issue::Pm::at(&self.pm_dir()?)?;
-        let out = crate::issue::project_new::run(&pm, &req, actor)?;
+        let out = crate::issue::project_new::run(
+            &pm,
+            &req,
+            actor,
+            &[("the daemon state dir", self.state_dir.as_path())],
+        )?;
         if out["changed"] == true {
             let _ = self
                 .store
@@ -8359,6 +8338,32 @@ fn withhold_all_turn_ids(mut value: Value) -> Value {
 const IDENTITY_FIELDS: &[&str] = &[
     "by", "as", "actor", "caller", "operator", "reviewer", "pane", "lane", "pid",
 ];
+
+/// Request fields an operator-connection verb refuses rather than reads
+/// ([`Shared::operator_connection`]).
+const OPERATOR_FIELDS: &[&str] = &[
+    "by",
+    "operator",
+    "actor",
+    "alias",
+    "lane",
+    "pid",
+    "pane",
+    "recorded_via",
+    "attribution",
+];
+
+fn reject_operator_fields(verb: &str, params: &Value) -> Result<()> {
+    for field in OPERATOR_FIELDS {
+        if params.get(field).is_some() {
+            return Err(Error::rejected(format!(
+                "{verb} authority is connection-bound; request field \
+                 '{field}' is not accepted"
+            )));
+        }
+    }
+    Ok(())
+}
 
 fn reject_identity_fields(params: &Value, verb: &str) -> Result<()> {
     for field in IDENTITY_FIELDS {

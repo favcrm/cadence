@@ -189,9 +189,12 @@ fn same_repo(repo: &project::Repo, root: &Path, remote: Option<&str>) -> bool {
 }
 
 /// Register the repo and seed PROJECT.md in one tracker commit, as
-/// `actor` (the daemon's verdict on the caller). Returns what was done;
-/// `changed: false` when the project was already this repo's.
-pub fn run(pm: &Pm, req: &Request, actor: &str) -> Result<Value> {
+/// `actor` (the daemon's verdict on the caller). `guarded` names the
+/// caller's own directories that are never a project's repo — the
+/// daemon passes its state dir; the tracker is always guarded. Returns
+/// what was done; `changed: false` when the project was already this
+/// repo's.
+pub fn run(pm: &Pm, req: &Request, actor: &str, guarded: &[(&str, &Path)]) -> Result<Value> {
     let key = req.key.as_str();
     check_key(key)?;
     let prefix = match &req.prefix {
@@ -223,18 +226,34 @@ pub fn run(pm: &Pm, req: &Request, actor: &str) -> Result<Value> {
         ))
     };
     let canonical = req.repo.canonicalize().map_err(|_| not_git())?;
-    let (root, remote) = project::repo_identity(&canonical).ok_or_else(not_git)?;
-    // The tracker is never a project's repo: cwd resolution would read
-    // the tracker as that project and its lanes would be worktrees of
-    // the tracker. Compared canonically, so a symlink cannot hide it.
-    let tracker = pm.dir.canonicalize().unwrap_or_else(|_| pm.dir.clone());
-    if root.starts_with(&tracker) || tracker.starts_with(&root) || canonical.starts_with(&tracker) {
-        return Err(Error::rejected(format!(
-            "{} is the tracker ({}), inside it or contains it — a project's repo \
+    // cadence's own directories are never a project's repo. The tracker:
+    // cwd resolution would read it as that project and its lanes would
+    // be worktrees of the tracker. The daemon's state dir: its database,
+    // sockets and agent homes. Compared canonically, so a symlink cannot
+    // hide either, and checked on the path before git is asked.
+    let mut own: Vec<(&str, PathBuf)> = vec![("the tracker", pm.dir.clone())];
+    own.extend(guarded.iter().map(|(n, p)| (*n, p.to_path_buf())));
+    let own: Vec<(&str, PathBuf)> = own
+        .into_iter()
+        .map(|(n, p)| (n, p.canonicalize().unwrap_or(p)))
+        .collect();
+    let refuse_own = |name: &str, dir: &Path| {
+        Err(Error::rejected(format!(
+            "{} is {name} ({}), inside it or contains it — a project's repo \
              must be its own checkout; nothing written",
             req.repo.display(),
-            tracker.display()
-        )));
+            dir.display()
+        )))
+    };
+    if let Some((name, dir)) = own.iter().find(|(_, d)| canonical.starts_with(d)) {
+        return refuse_own(name, dir);
+    }
+    let (root, remote) = project::repo_identity(&canonical).ok_or_else(not_git)?;
+    if let Some((name, dir)) = own
+        .iter()
+        .find(|(_, d)| root.starts_with(d) || d.starts_with(&root))
+    {
+        return refuse_own(name, dir);
     }
 
     let _lock = pm.lock()?;
@@ -486,7 +505,7 @@ mod tests {
         std::fs::create_dir_all(&plain).unwrap();
         let tracker_link = tmp.path().join("tracker-link");
         std::os::unix::fs::symlink(&pm.dir, &tracker_link).unwrap();
-        let out = run(&pm, &req("demo", &a), "operator").unwrap();
+        let out = run(&pm, &req("demo", &a), "operator", &[]).unwrap();
         assert_eq!(out["changed"], true, "{out}");
         assert_eq!(out["prefix"], "DEM");
         let yaml = project::load(&pm.dir.join("demo/project.yaml")).unwrap();
@@ -496,7 +515,7 @@ mod tests {
         // Same key and repo (even through a subdirectory): no change.
         std::fs::create_dir_all(a.join("sub")).unwrap();
         for path in [a.clone(), a.join("sub")] {
-            let out = run(&pm, &req("demo", &path), "operator").unwrap();
+            let out = run(&pm, &req("demo", &path), "operator", &[]).unwrap();
             assert_eq!(out["changed"], false, "{out}");
         }
         assert_eq!(commits(&pm), after);
@@ -535,7 +554,7 @@ mod tests {
             ),
         ];
         for (r, want) in refusals {
-            let err = run(&pm, &r, "operator").unwrap_err().to_string();
+            let err = run(&pm, &r, "operator", &[]).unwrap_err().to_string();
             assert!(err.contains(want), "{want}: {err}");
         }
         assert_eq!(commits(&pm), after, "a refusal commits nothing");
@@ -559,11 +578,11 @@ mod tests {
             None,
         )
         .unwrap();
-        let out = run(&pm, &req("demo", &a), "master").unwrap();
+        let out = run(&pm, &req("demo", &a), "master", &[]).unwrap();
         assert_eq!(out["changed"], true, "{out}");
         assert_eq!(out["prefix"], "D");
         assert!(work::config_file(&pm.dir, "demo").is_file());
-        let out = run(&pm, &req("demo", &a), "master").unwrap();
+        let out = run(&pm, &req("demo", &a), "master", &[]).unwrap();
         assert_eq!(out["changed"], false, "{out}");
     }
 
@@ -574,7 +593,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let outer = repo(tmp.path(), "outer");
         let pm = Pm::init(&outer.join("pm")).unwrap();
-        let err = run(&pm, &req("outer", &outer), "operator")
+        let err = run(&pm, &req("outer", &outer), "operator", &[])
             .unwrap_err()
             .to_string();
         assert!(err.contains("is the tracker"), "{err}");
@@ -594,7 +613,7 @@ mod tests {
         std::fs::write(&hook, "#!/bin/sh\necho 'lint says no' >&2\nexit 1\n").unwrap();
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
         let before = commits(&pm);
-        let err = run(&pm, &req("demo", &a), "operator")
+        let err = run(&pm, &req("demo", &a), "operator", &[])
             .unwrap_err()
             .to_string();
         assert!(
@@ -627,7 +646,7 @@ mod tests {
                 std::thread::spawn(move || {
                     let pm = Pm::at(&pm_dir).unwrap();
                     barrier.wait();
-                    run(&pm, &req("demo", &a), "operator")
+                    run(&pm, &req("demo", &a), "operator", &[])
                 })
             })
             .collect();
@@ -650,5 +669,41 @@ mod tests {
             .to_string();
         assert!(err.contains("reserved"), "{err}");
         assert!(!pm.dir.join("agents").exists());
+    }
+
+    /// The caller's guarded dirs (the daemon's state dir) are refused
+    /// like the tracker: a repo inside one, one containing it, or a
+    /// symlink to it.
+    #[test]
+    fn a_guarded_dir_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pm = pm(tmp.path());
+        let state = tmp.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let inside = repo(&state, "nested");
+        let outer = repo(tmp.path(), "outer");
+        std::fs::create_dir_all(outer.join("state")).unwrap();
+        let link = tmp.path().join("state-link");
+        std::os::unix::fs::symlink(&state, &link).unwrap();
+        let before = commits(&pm);
+        for (path, guard) in [
+            (inside.clone(), state.clone()),
+            (link.join("nested"), state.clone()),
+            (outer.clone(), outer.join("state")),
+        ] {
+            let err = run(
+                &pm,
+                &req("x", &path),
+                "master",
+                &[("the daemon state dir", &guard)],
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("is the daemon state dir"), "{path:?}: {err}");
+        }
+        assert_eq!(commits(&pm), before);
+        assert!(!pm.dir.join("x").exists());
+        // Without the guard the same repo registers.
+        run(&pm, &req("x", &inside), "operator", &[]).unwrap();
     }
 }

@@ -851,7 +851,7 @@ enum Commands {
         action: PlanAction,
     },
     /// Projects (CAD-358): `new` registers a repo and seeds its
-    /// PROJECT.md. Operator only (the master too, once CAD-339 lands),
+    /// PROJECT.md. The operator or the master (by its connection),
     /// through the daemon.
     Project {
         #[command(subcommand)]
@@ -2392,8 +2392,9 @@ enum ProjectCmd {
     /// (goal, staffing `agents:` map, the default stages, empty
     /// milestones) in one tracker commit. Idempotent for the same key
     /// and repo; a different repo for an existing key, the reserved key
-    /// `agents`, an invalid key or a path that is not a git repo is
-    /// refused with nothing written. Operator only, through the daemon.
+    /// `agents`, an invalid key, a path that is not a git repo, the
+    /// tracker or the daemon's state dir is refused with nothing written.
+    /// The operator or the master, through the daemon.
     New {
         /// Project key (folder name): 1-32 lowercase letters, digits or
         /// hyphens.

@@ -41190,8 +41190,7 @@ fn master_dispatch_races_dispatch_a_ticket_once() {
 /// refused with nothing written. Caller rule: the proven operator runs
 /// it; a pane agent, a managed endpoint (and its tool subprocess), and
 /// detached children of both are refused, as are identity-shaped
-/// fields. (The master's leg lands with CAD-339 — see the hook on
-/// `rpc_project_new`; until then it is an agent and refused like one.)
+/// fields. The master's leg is `project_new_by_the_master`.
 #[test]
 fn project_new_registers_seeds_and_is_operator_only() {
     let tmp = TempDir::new().unwrap();
@@ -41426,4 +41425,82 @@ fn project_new_registers_seeds_and_is_operator_only() {
         std::fs::read_to_string(pm_dir.join("reminders/project.yaml")).unwrap(),
         yaml
     );
+}
+
+/// CAD-358 × CAD-339: the master registers a project by its verified
+/// connection — the commit's actor is `master` — while identity fields
+/// from the master are refused with nothing written, a detached child
+/// of the master is refused (no identity, not provably the operator),
+/// and the tracker and the daemon's state dir are refused as the repo.
+#[test]
+fn project_new_by_the_master() {
+    let f = PlanFixture::start();
+    let (mut m, _) = f.start_master();
+    let git = |dir: &Path, args: &[&str]| {
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "git {args:?}: {o:?}");
+    };
+    let rem = f.tmp.path().join("rem");
+    std::fs::create_dir_all(&rem).unwrap();
+    git(&rem, &["init", "-q", "-b", "main"]);
+    let rem = rem.canonicalize().unwrap().to_str().unwrap().to_string();
+    let in_state = f.d.state.join("nested-repo");
+    std::fs::create_dir_all(&in_state).unwrap();
+    git(&in_state, &["init", "-q", "-b", "main"]);
+    let before = f.commits();
+    let refused = |r: &Value, why: &str, what: &str| {
+        assert_eq!(r["ok"], false, "{what}: {r}");
+        let msg = r["error"]["message"].as_str().unwrap_or_default();
+        assert!(msg.contains(why), "{what}: wanted '{why}': {r}");
+    };
+
+    // Identity fields are refused even from the master's own connection.
+    for field in ["actor", "by"] {
+        let r = m.rpc(
+            "self",
+            "project_new",
+            json!({"key": "rem", "repo": rem, field: "master"}),
+        );
+        refused(&r, "connection-bound", field);
+    }
+    // A detached child of the master is not the master and not the
+    // operator.
+    for how in ["detached", "detached-bare"] {
+        let r = m.rpc(how, "project_new", json!({"key": "rem", "repo": rem}));
+        refused(&r, "not provably the operator", how);
+    }
+    // The tracker and the daemon's state dir are never a project's repo.
+    let pm_s = f.pm_dir.to_str().unwrap().to_string();
+    let state_s = in_state.to_str().unwrap().to_string();
+    for (repo, why) in [
+        (pm_s.as_str(), "is the tracker"),
+        (state_s.as_str(), "is the daemon state dir"),
+    ] {
+        let (ok, err) = f.as_master(&mut m, &format!("project new other --repo {repo}"));
+        assert!(!ok && err.to_string().contains(why), "{repo}: {err}");
+    }
+    assert_eq!(f.commits(), before, "no refusal wrote anything");
+    assert!(!f.pm_dir.join("rem").exists() && !f.pm_dir.join("other").exists());
+
+    // The master itself: one commit, attributed to it.
+    let (ok, out) = f.as_master(
+        &mut m,
+        &format!("project new rem --repo {rem} --goal 'Remind people.'"),
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out["actor"], "master", "{out}");
+    assert_eq!(out["changed"], true, "{out}");
+    assert_eq!(f.commits(), before + 1);
+    let msg = f.last_commit();
+    assert!(msg.contains("\nActor: master\n"), "{msg}");
+    assert!(f.pm_dir.join("rem/PROJECT.md").is_file());
+    let (ok, out) = f.as_master(&mut m, &format!("project new rem --repo {rem}"));
+    assert!(ok && out["changed"] == false, "{out}");
+    assert_eq!(f.commits(), before + 1);
 }
