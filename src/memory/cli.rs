@@ -139,7 +139,8 @@ pub enum MemoryAction {
         #[arg(long)]
         days: Option<u64>,
         /// Sort by project slug type status confidence created;
-        /// `-KEY` descending.
+        /// `-KEY` descending. Under --stale the row set is different:
+        /// project slug type reason label verified_at.
         #[arg(long, allow_hyphen_values = true)]
         sort: Option<String>,
         /// Keep only the first N rows.
@@ -373,8 +374,10 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
                         &[
                             ("project", "project"),
                             ("slug", "slug"),
+                            ("type", "type"),
                             ("reason", "reason"),
                             ("label", "evidence.label"),
+                            ("verified_at", "verified_at"),
                         ],
                         "slug",
                     )?;

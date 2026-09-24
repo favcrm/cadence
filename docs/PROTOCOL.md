@@ -137,6 +137,16 @@ sets as their CLI flags):
   `YYYY-MM-DD[THH:MM:SSZ]` date, or a raw epoch.
 - The one exception is `issue ls --tag` (and the board API's `tag=`):
   every named tag must be present — all-of, not any-of.
+- `memory ls --component`/`--path` are retrieval axes, not field
+  equality: a project-wide memory applies to every component and path.
+  They still AND across flags — `--component c --path p` keeps only
+  memories that apply to `c` AND whose path globs cover `p` (the API's
+  `component=`/`path=` agree). `--stale` rows carry a fixed subset —
+  `project`, `status` (always `accepted`), `type` filter there;
+  `component`/`path` don't apply.
+- `delivery ls --project` is checked against the tracker's project
+  keys, unioned daemon-side with the projects live records carry — a
+  name in neither is an unknown value, not an empty page.
 
 Wherever a method takes `alias`, a provider-native id — `thread_id` or
 `session_id`, e.g. a Devin session slug — resolves to the canonical

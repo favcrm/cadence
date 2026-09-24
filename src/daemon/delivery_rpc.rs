@@ -516,10 +516,25 @@ impl Shared {
         let mut rows: Vec<Record> = delivery::load(&self.state_dir)?
             .into_values()
             .filter(|r| issues.is_empty() || issues.contains(&r.issue))
-            .filter(|r| states.is_empty() || states.iter().any(|s| s == r.state.as_str()))
-            .filter(|r| projects.is_empty() || projects.contains(&r.project))
-            .filter(|r| !open || !r.state.terminal())
             .collect();
+        if !projects.is_empty() {
+            // The valid set: the tracker's project keys plus whatever
+            // projects live records carry — a project deleted from the
+            // tracker still names its rows, and a name in neither is
+            // an unknown value (the grammar's error), not an empty page.
+            let mut valid: std::collections::BTreeSet<String> =
+                rows.iter().map(|r| r.project.clone()).collect();
+            if let Ok(dir) = self.pm_dir() {
+                if let Ok(list) = issue::project::list(&dir) {
+                    valid.extend(list.into_iter().map(|p| p.key));
+                }
+            }
+            let refs: Vec<&str> = valid.iter().map(String::as_str).collect();
+            check_values("projects", &projects, &refs)?;
+        }
+        rows.retain(|r| projects.is_empty() || projects.contains(&r.project));
+        rows.retain(|r| states.is_empty() || states.iter().any(|s| s == r.state.as_str()));
+        rows.retain(|r| !open || !r.state.terminal());
         rows.sort_by_key(|r| r.dispatched_at);
         // CAD-446: the tracker whose project remotes this daemon checks
         // PRs against — the board's unattended sync checks the same one.

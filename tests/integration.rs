@@ -8674,6 +8674,15 @@ fn delivery_list_cad437_filters() {
         .rpc("delivery_list", json!({"states": ["zzz"]}))
         .unwrap_err();
     assert!(err.to_string().contains("working"), "{err}");
+    // An unknown --project is an error naming the valid set — tracker
+    // keys union the projects live records carry — never an empty page.
+    let err = d
+        .rpc("delivery_list", json!({"projects": ["bogus"]}))
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("demo") && err.to_string().contains("infra"),
+        "{err}"
+    );
 
     // CLI: positional issue, repeatable --issue, the shaping tail.
     let bin = env!("CARGO_BIN_EXE_cadence");
@@ -8691,6 +8700,45 @@ fn delivery_list_cad437_filters() {
             String::from_utf8_lossy(&out.stderr).to_string(),
         )
     };
+    // `--project` validates tracker-side before the RPC: the CLI needs
+    // a pm dir naming the keys (the daemon accepts record projects too,
+    // so `infra` passes both checks).
+    let pm_dir = d.dir.path().join("pmfx");
+    cadence_agent::issue::Pm::init(&pm_dir).unwrap();
+    for key in ["demo", "infra"] {
+        std::fs::create_dir_all(pm_dir.join(key)).unwrap();
+        std::fs::write(
+            pm_dir.join(key).join("project.yaml"),
+            format!(
+                "key: {key}\nprefix: {}\ncomponents: []\n",
+                key.to_uppercase()
+            ),
+        )
+        .unwrap();
+    }
+    let run_pm = |args: &[&str]| -> (bool, String, String) {
+        let out = std::process::Command::new(bin)
+            .arg("--state-dir")
+            .arg(&d.state)
+            .args(args)
+            .env_remove("CADENCE_ALIAS")
+            .env("CADENCE_PM_DIR", &pm_dir)
+            .output()
+            .unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    };
+    let (ok, out, err) = run_pm(&["delivery", "ls", "--project", "infra", "--json"]);
+    assert!(ok, "{err}");
+    assert_eq!(ids(&serde_json::from_str(&out).unwrap()), ["D-3"]);
+    let (ok, _, err) = run_pm(&["delivery", "ls", "--project", "bogus", "--json"]);
+    assert!(
+        !ok && err.contains("--project") && err.contains("demo"),
+        "{err}"
+    );
     let (ok, out, err) = run(&["delivery", "ls", "D-3", "--json"]);
     assert!(ok, "{err}");
     assert_eq!(ids(&serde_json::from_str(&out).unwrap()), ["D-3"]);

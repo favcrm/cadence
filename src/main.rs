@@ -1918,7 +1918,7 @@ enum AgentAction {
         /// a PM dir.
         #[arg(long, value_delimiter = ',')]
         project: Vec<String>,
-        /// Sort by alias state provider kind role project cwd;
+        /// Sort by alias state provider kind role project cwd model;
         /// `-KEY` descending.
         #[arg(long, allow_hyphen_values = true)]
         sort: Option<String>,
@@ -2164,8 +2164,8 @@ enum ReportAction {
         /// Everything, including resolved rows.
         #[arg(long)]
         all: bool,
-        /// Sort by id at kind ticket agent project status source;
-        /// `-KEY` descending [default: -at].
+        /// Sort by id at kind ticket agent project status source
+        /// created (an `at` alias); `-KEY` descending [default: -at].
         #[arg(long, allow_hyphen_values = true)]
         sort: Option<String>,
         /// Keep only the first N rows.
@@ -2610,8 +2610,8 @@ enum DeliveryAction {
         /// Only rows still in the loop (not merged/declined/closed).
         #[arg(long)]
         open: bool,
-        /// Sort by issue project state worker since dispatched_at;
-        /// `-KEY` descending [default: dispatched_at].
+        /// Sort by issue project state worker reviewer since
+        /// dispatched_at; `-KEY` descending [default: dispatched_at].
         #[arg(long, allow_hyphen_values = true)]
         sort: Option<String>,
         /// Keep only the first N rows.
@@ -2670,6 +2670,23 @@ fn run_delivery(state_dir: &Path, action: DeliveryAction) -> Result<i32> {
             let mut all = issues.clone();
             if let Some(one) = &issue {
                 all.push(one.clone());
+            }
+            // The grammar: an unknown --project is an error naming the
+            // valid set, never an empty page. The daemon re-checks.
+            if !project.is_empty() {
+                let pm = cadence_agent::issue::Pm::open_default()?;
+                let keys: Vec<String> = cadence_agent::issue::project::list(&pm.dir)?
+                    .into_iter()
+                    .map(|p| p.key)
+                    .collect();
+                for want in &project {
+                    if !keys.iter().any(|k| k == want) {
+                        return Err(Error::rejected(format!(
+                            "Unknown --project '{want}' — known: {}",
+                            keys.join(" ")
+                        )));
+                    }
+                }
             }
             let mut out = client::rpc(
                 state_dir,

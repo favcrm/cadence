@@ -931,6 +931,9 @@ pub fn ls(pm: &Pm, f: &LsFilter) -> Result<Value> {
                 "title": front.title,
                 "owner": front.owner,
                 "at": front.created,
+                // Pre-CAD-437 rows were keyed `created` — kept as an
+                // alias of `at` for consumers written against that.
+                "created": front.created,
             }));
         }
         for r in task_report::list(&v.issue.dir, &front.id) {
@@ -947,6 +950,8 @@ pub fn ls(pm: &Pm, f: &LsFilter) -> Result<Value> {
                 // have no open state.
                 "open": r.get("open").cloned().unwrap_or(Value::Null),
                 "at": r["at"],
+                // Same `created` alias as the intake rows.
+                "created": r["at"],
                 "session": r["session"],
                 "sha": r["sha"],
                 "state": r["state"],
@@ -997,6 +1002,7 @@ pub fn ls(pm: &Pm, f: &LsFilter) -> Result<Value> {
     const REPORT_SORTS: &[(&str, &str)] = &[
         ("id", "id"),
         ("at", "at"),
+        ("created", "created"),
         ("kind", "kind"),
         ("ticket", "ticket"),
         ("agent", "agent"),
