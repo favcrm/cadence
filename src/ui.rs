@@ -1651,6 +1651,15 @@ fn write_route(
     opts: &ServeOpts,
     send: &dyn Fn(Request, HttpResp),
 ) {
+    // Setup is detect only in the board: applying a fix is the
+    // operator's command to run (CAD-327).
+    if path == "/api/setup" {
+        send(
+            request,
+            err_response(405, "setup is read-only here — GET only"),
+        );
+        return;
+    }
     if path == "/api/settings/model-defaults" {
         if *method != Method::Post {
             send(request, err_response(405, "method not allowed"));
@@ -2403,6 +2412,10 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
                 })),
             );
         }
+        "/api/setup" => send(
+            request,
+            setup_get(state_dir, pm_dir, opts.port, query("fresh").is_some()),
+        ),
         "/api/overview" => send(
             request,
             json_response(crate::overview::overview_board(state_dir, pm_dir)),
@@ -2778,6 +2791,56 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
             }
         }
     }
+}
+
+// ---------- /api/setup — the wizard's checks (CAD-327) ----------
+
+/// How long one run of the setup checks answers `GET /api/setup`.
+const SETUP_FRESH_FOR: Duration = Duration::from_secs(60);
+/// A `?fresh=1` re-check younger than this is answered from the last
+/// run — a held-down button cannot keep provider CLIs spawning.
+const SETUP_MIN_RECHECK: Duration = Duration::from_secs(5);
+
+/// The last run and when it finished. The lock is held while the
+/// checks run, so concurrent requests share one run instead of each
+/// spawning the provider probes.
+static SETUP_CACHE: std::sync::Mutex<Option<(Instant, u64, Value)>> = std::sync::Mutex::new(None);
+
+/// `GET /api/setup` — setup's checks, detect only
+/// ([`crate::setup::board_detect`]): nothing is applied, started or
+/// written, provider probes are bounded and never echoed. Each entry is
+/// setup's `{check, status, detail, fix}` plus the wizard `group`.
+fn setup_get(state_dir: &Path, pm_dir: &Path, port: u16, fresh: bool) -> HttpResp {
+    let mut cache = SETUP_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let reuse = cache.as_ref().is_some_and(|(at, _, _)| {
+        let age = at.elapsed();
+        age < SETUP_MIN_RECHECK || (!fresh && age < SETUP_FRESH_FOR)
+    });
+    if !reuse {
+        let outcomes = match crate::setup::board_detect(state_dir, pm_dir, port) {
+            Ok(o) => o,
+            Err(e) => return err_response(500, &e.to_string()),
+        };
+        let checks: Vec<Value> = outcomes
+            .iter()
+            .map(|o| {
+                let mut v = serde_json::to_value(o).unwrap_or_default();
+                v["group"] = json!(crate::setup::check_group(&o.check));
+                v
+            })
+            .collect();
+        let checked_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        *cache = Some((Instant::now(), checked_at, json!(checks)));
+    }
+    let (_, checked_at, checks) = cache.as_ref().expect("filled above");
+    json_response(json!({
+        "checks": checks,
+        "checked_at": checked_at,
+        "detect_only": true,
+    }))
 }
 
 /// One mutex for every write route — the server is thread-per-request

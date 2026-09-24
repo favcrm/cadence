@@ -81,6 +81,11 @@ impl Host {
     }
 
     fn run(&self, args: &[&str]) -> Output {
+        self.command(args).output().unwrap()
+    }
+
+    /// The binary under this host's isolated environment.
+    fn command(&self, args: &[&str]) -> std::process::Command {
         let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"));
         cmd.args(args)
             .env("HOME", self.path("home"))
@@ -106,7 +111,7 @@ impl Host {
         ] {
             cmd.env_remove(var);
         }
-        cmd.output().unwrap()
+        cmd
     }
 
     fn setup_json(&self, port: u16) -> Vec<Value> {
@@ -433,4 +438,166 @@ fn setup_refuses_a_non_tracker_dir_and_skips_what_needs_it() {
     assert!(!host.path("home/pm/pm.yaml").exists());
     assert!(!host.path("home/pm/.git").exists());
     assert!(!host.state_dir().join("ui.pid").exists());
+}
+
+// ---------- CAD-327: the board's detect-only `/api/setup` ----------
+
+/// A foreground `ui run` on a leased port, killed on drop.
+struct Board {
+    child: std::process::Child,
+    port: u16,
+}
+
+impl Board {
+    fn start(host: &Host, port: u16) -> Self {
+        let child = host
+            .command(&["ui", "run", "--port", &port.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let board = Self { child, port };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while board.request("GET", "/api/health").0 != 200 {
+            assert!(std::time::Instant::now() < deadline, "board never answered");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        board
+    }
+
+    /// `(status, body)`; `(0, "")` when nothing answers.
+    fn request(&self, method: &str, path: &str) -> (u16, String) {
+        use std::io::{Read, Write};
+        let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", self.port)) else {
+            return (0, String::new());
+        };
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(90)))
+            .unwrap();
+        let req = format!(
+            "{method} {path} HTTP/1.0\r\nHost: 127.0.0.1:{}\r\nContent-Length: 0\r\n\r\n",
+            self.port
+        );
+        if stream.write_all(req.as_bytes()).is_err() {
+            return (0, String::new());
+        }
+        let mut buf = Vec::new();
+        let _ = stream.read_to_end(&mut buf);
+        let text = String::from_utf8_lossy(&buf).to_string();
+        let status = text
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let body = text.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+        (status, body.to_string())
+    }
+}
+
+impl Drop for Board {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// `/api/setup` on a fresh host: every setup check, detect only. It
+/// creates nothing (no state dir, tracker, skill, daemon), never echoes
+/// a provider's output, and refuses every write method.
+#[test]
+fn board_setup_is_detect_only_and_writes_nothing() {
+    let lease = test_port();
+    let host = Host::new();
+    let board = Board::start(&host, lease.port);
+    let before = install_snapshot(&host);
+
+    let (code, body) = board.request("GET", "/api/setup");
+    assert_eq!(code, 200, "{body}");
+    assert!(
+        !body.contains(SECRET),
+        "a provider's output reached the board: {body}"
+    );
+    let payload: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(payload["detect_only"], true);
+    let lines = payload["checks"].as_array().unwrap().clone();
+    for line in &lines {
+        for key in ["check", "status", "detail", "fix", "group"] {
+            assert!(line.get(key).is_some(), "{key} missing: {line}");
+        }
+    }
+    let checks = by_check(&lines);
+    // Absent, and reported — never created or started.
+    for name in ["state_dir", "tracker", "skill", "daemon", "master"] {
+        assert_eq!(status(&checks, name), "missing", "{}", checks[name]);
+    }
+    for name in ["state_dir", "tracker", "skill", "daemon"] {
+        assert!(checks[name]["fix"].is_string(), "{}", checks[name]);
+    }
+    // The board answering is the board running.
+    assert_eq!(status(&checks, "ui"), "ok", "{}", checks["ui"]);
+    assert!(checks["ui"]["detail"]
+        .as_str()
+        .unwrap()
+        .contains(&format!("127.0.0.1:{}", lease.port)));
+    // Providers: version and sign-in from setup's own signals.
+    assert_eq!(status(&checks, "claude"), "ok", "{}", checks["claude"]);
+    assert!(checks["claude"]["detail"]
+        .as_str()
+        .unwrap()
+        .contains("9.9.9"));
+    assert_eq!(checks["claude"]["group"], "provider");
+    assert_eq!(status(&checks, "codex"), "missing");
+    assert_eq!(checks["codex"]["fix"], "codex login");
+    assert_eq!(status(&checks, "devin"), "ok", "{}", checks["devin"]);
+    assert_eq!(checks["master"]["group"], "master");
+    assert_eq!(checks["daemon"]["group"], "environment");
+
+    // A re-check runs the probes again and still writes nothing.
+    std::thread::sleep(std::time::Duration::from_secs(6));
+    let (code, body) = board.request("GET", "/api/setup?fresh=1");
+    assert_eq!(code, 200, "{body}");
+    assert!(!body.contains(SECRET), "{body}");
+
+    for method in ["POST", "PATCH", "DELETE"] {
+        let (code, body) = board.request(method, "/api/setup");
+        assert_eq!(code, 405, "{method}: {body}");
+    }
+    assert!(
+        !host.state_dir().exists(),
+        "the board created the state dir"
+    );
+    assert!(
+        !host.path("home/pm").exists(),
+        "the board created a tracker"
+    );
+    assert_eq!(
+        before,
+        install_snapshot(&host),
+        "/api/setup changed the host"
+    );
+}
+
+/// A provider CLI that never answers cannot hold the page: each probe
+/// is bounded, so the whole run answers in bounded time.
+#[test]
+fn board_setup_answers_in_bounded_time_when_a_cli_hangs() {
+    let lease = test_port();
+    let host = Host::new();
+    host.fake("codex", "sleep 120");
+    let board = Board::start(&host, lease.port);
+    let started = std::time::Instant::now();
+    let (code, body) = board.request("GET", "/api/setup");
+    let elapsed = started.elapsed();
+    assert_eq!(code, 200, "{body}");
+    // codex: `--version` and `login status`, 5 s each.
+    assert!(
+        elapsed < std::time::Duration::from_secs(30),
+        "took {elapsed:?}"
+    );
+    let payload: Value = serde_json::from_str(&body).unwrap();
+    let checks = by_check(payload["checks"].as_array().unwrap());
+    assert_eq!(status(&checks, "codex"), "unknown", "{}", checks["codex"]);
+    let detail = checks["codex"]["detail"].as_str().unwrap();
+    assert!(detail.contains("version unknown"), "{detail}");
+    assert!(detail.contains("did not answer"), "{detail}");
 }

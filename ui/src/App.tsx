@@ -12,6 +12,7 @@ import Link from "./ui/Link";
 import SectionTabs from "./ui/SectionTabs";
 import ThemeToggle from "./ui/ThemeToggle";
 import Setup from "./features/setup/Setup";
+import SetupNudge from "./features/setup/SetupNudge";
 import Toast, { type ToastMsg } from "./ui/Toast";
 import { Logo } from "./ui/Logo";
 import { countLabel, issueCounts } from "./lib/counts";
@@ -472,6 +473,7 @@ export default function App() {
           </nav>
         )}
 
+        {screen === "home" && <SetupNudge />}
         {screen === "home" && (
           <OverviewView
             state={overviewState}
