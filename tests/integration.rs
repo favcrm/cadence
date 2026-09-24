@@ -361,16 +361,71 @@ impl TestDaemon {
         cadence_agent::proto::unwrap(frame)
     }
 
+    /// `rpc` from a caller that is deterministically unattributed
+    /// (`Who::Unproven`), however the suite is run: detached exactly
+    /// like [`Self::operator_rpc`] but carrying a `CADENCE_ALIAS` its
+    /// ancestry cannot prove — operator evidence fails on the env mark
+    /// and no pane names it. Plain `rpc` cannot stand in for this: in
+    /// an agent pane the test process is unproven, but in CI it IS the
+    /// operator — the two callers a rule treats differently.
+    fn unproven_rpc(&self, method: &str, params: Value) -> cadence_agent::Result<Value> {
+        let script = self.dir.path().join("operator-rpc.py");
+        if !script.exists() {
+            std::fs::write(&script, OPERATOR_RPC_PY).unwrap();
+        }
+        let out = self.dir.path().join(format!(
+            "unproven-rpc-{}.json",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let frame = json!({"method": method, "params": params}).to_string();
+        let status = std::process::Command::new("setsid")
+            .arg("-f")
+            .arg("python3")
+            .arg(&script)
+            .arg(client::socket_path(&self.state))
+            .arg(&frame)
+            .arg(&out)
+            .arg(std::process::id().to_string())
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("CADENCE_ALIAS", "unproven-lane")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "setsid -f failed: {status}");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !out.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "unproven rpc {method} never answered"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        let frame: Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        cadence_agent::proto::unwrap(frame)
+    }
+
     /// A fixture registration — the operator's act. Plain `rpc` from
     /// this process, unless a test planted this very process as a pane
     /// ([`plant_self`]): then this process IS that agent, which the
     /// registration caller rule (CAD-149) refuses, so the call goes
-    /// through [`Self::operator_rpc`].
+    /// through [`Self::operator_rpc`]. A suite run inside an agent pane
+    /// carries `CADENCE_ALIAS` on its ancestry without any plant —
+    /// unattributed then, and refused for missing operator proof, so
+    /// that refusal goes the operator's way too. Every gate refusal
+    /// reads "… is an operator action …"; the retry replays the same
+    /// call, so a refusal that is not about proof comes back unchanged.
     fn fixture_rpc(&self, method: &str, params: Value) -> cadence_agent::Result<Value> {
         if self.rpc("agent_show", json!({"alias": SELF_LANE})).is_ok() {
-            self.operator_rpc(method, params)
-        } else {
-            self.rpc(method, params)
+            return self.operator_rpc(method, params);
+        }
+        match self.rpc(method, params.clone()) {
+            Err(e) if e.to_string().contains("operator action") => {
+                self.operator_rpc(method, params)
+            }
+            r => r,
         }
     }
 
@@ -9677,7 +9732,7 @@ fn inbox_registers_as_durable_mailbox() {
 
     // A mailbox never runs a process, so socket callers may omit cwd;
     // a process endpoint still requires it.
-    d.rpc(
+    d.fixture_rpc(
         "agent_register",
         json!({"alias": "obs2", "provider": "inbox", "endpoint_kind": "inbox"}),
     )
@@ -9772,7 +9827,7 @@ fn inbox_group_root_collects_worker_results() {
     // `cadence join obs fake` wires exactly this: worker params.upstream
     // = the inbox alias. Register the equivalent directly.
     let cwd = d.dir.path().to_str().unwrap().to_string();
-    d.rpc(
+    d.fixture_rpc(
         "agent_register",
         json!({"alias": "w1", "provider": "fake", "endpoint_kind": "fake",
                "cwd": cwd, "params": json!({"upstream": "obs"}).to_string()}),
@@ -9810,8 +9865,10 @@ fn inbox_collects_direct_send_with_reply_to() {
     d.register_devin("sender", None);
     d.wait_agent("sender", "idle", 20);
     // Direct send on a pty agent with --reply-to obs: the reported
-    // result routes into the mailbox.
-    d.rpc("agent_ready", json!({"alias": "sender"})).unwrap();
+    // result routes into the mailbox. Ready is claimed as the operator —
+    // a fixture act, not the agent's own attestation.
+    d.operator_rpc("agent_ready", json!({"alias": "sender"}))
+        .unwrap();
     d.rpc(
         "agent_send",
         json!({"alias": "sender", "text": "task", "message": "t1",
@@ -9923,14 +9980,19 @@ fn inbox_read_receipt_keeps_history_without_waking_reviewer() {
 fn inbox_lifecycle_guards() {
     let d = TestDaemon::start();
     d.register_inbox("obs");
-    for method in ["agent_resume", "agent_stop"] {
+    // Operator-gated verbs need the operator's proof before the store's
+    // endpoint-kind check is even reached — assert the "inbox" refusal
+    // through `operator_rpc` so the verdict under test is the mailbox's.
+    for method in ["agent_resume", "agent_stop", "agent_ready"] {
         let err = d
-            .rpc(method, json!({"alias": "obs"}))
+            .operator_rpc(method, json!({"alias": "obs"}))
             .unwrap_err()
             .to_string();
         assert!(err.contains("inbox"), "{method}: {err}");
     }
-    for method in ["agent_probe", "agent_capture", "agent_ready"] {
+    // Read-gated verbs admit an unattributed caller — plain `rpc`
+    // reaches the same mailbox refusal.
+    for method in ["agent_probe", "agent_capture"] {
         let err = d
             .rpc(method, json!({"alias": "obs"}))
             .unwrap_err()
@@ -10003,6 +10065,780 @@ fn cli_inbox_drains_and_self_reports_backlog() {
         .unwrap();
     assert!(out.status.success());
     assert!(out.stdout.is_empty());
+}
+
+// ==== CAD-480: inbox peek/ack + reader cursor ====
+
+/// Peek returns the queued set without consuming — a reader that
+/// crashes or truncates after reading loses nothing.
+#[test]
+fn inbox_peek_loses_nothing_without_ack() {
+    let d = TestDaemon::start();
+    d.register_inbox("obs");
+    for (id, text) in [("n1", "note one"), ("n2", "note two")] {
+        d.rpc(
+            "agent_send",
+            json!({"alias": "obs", "text": text, "message": id}),
+        )
+        .unwrap();
+    }
+    let page = d
+        .rpc("agent_inbox", json!({"alias": "obs", "peek": true}))
+        .unwrap();
+    let msgs = page["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 2, "{page}");
+    assert_eq!(page["unread"], 2, "{page}");
+    // Nothing was consumed: rows stay queued, and a reader that
+    // "crashed" after this peek sees the same messages again.
+    let show = d.rpc("agent_show", json!({"alias": "obs"})).unwrap();
+    for m in show["messages"].as_array().unwrap() {
+        assert_eq!(m["state"], "queued", "{m}");
+    }
+    let again = d
+        .rpc("agent_inbox", json!({"alias": "obs", "peek": true}))
+        .unwrap();
+    assert_eq!(again["messages"].as_array().unwrap().len(), 2, "{again}");
+    // An explicit `after` still bounds the peek.
+    let seq1 = msgs[0]["seq"].as_i64().unwrap();
+    let tail = d
+        .rpc(
+            "agent_inbox",
+            json!({"alias": "obs", "peek": true, "after": seq1}),
+        )
+        .unwrap();
+    let t = tail["messages"].as_array().unwrap();
+    assert_eq!(t.len(), 1, "{tail}");
+    assert_eq!(t[0]["id"], "n2");
+}
+
+/// `inbox ack` is a watermark: it completes every queued message at or
+/// below `through`, records the reader's durable cursor, and a restart
+/// resumes after it.
+#[test]
+fn inbox_ack_advances_the_reader_cursor() {
+    let d = TestDaemon::start();
+    d.register_inbox("obs");
+    for id in ["n1", "n2", "n3"] {
+        d.rpc(
+            "agent_send",
+            json!({"alias": "obs", "text": id, "message": id}),
+        )
+        .unwrap();
+    }
+    let page = d
+        .rpc("agent_inbox", json!({"alias": "obs", "peek": true}))
+        .unwrap();
+    let seqs: Vec<i64> = page["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["seq"].as_i64().unwrap())
+        .collect();
+    let ack = d
+        .rpc(
+            "agent_inbox_ack",
+            json!({"alias": "obs", "seqs": [seqs[0], seqs[1]], "reader": "pm"}),
+        )
+        .unwrap();
+    assert_eq!(ack["acked"], json!([seqs[0], seqs[1]]), "{ack}");
+    assert_eq!(ack["unread"], 1, "{ack}");
+    // A fresh peek — a restarted reader — resumes after the watermark.
+    let resume = d
+        .rpc(
+            "agent_inbox",
+            json!({"alias": "obs", "peek": true, "reader": "pm"}),
+        )
+        .unwrap();
+    let left = resume["messages"].as_array().unwrap();
+    assert_eq!(left.len(), 1, "{resume}");
+    assert_eq!(left[0]["id"], "n3");
+    // The queued set is shared — another reader sees the same rest;
+    // its own cursor only differs once it acks.
+    let other = d
+        .rpc(
+            "agent_inbox",
+            json!({"alias": "obs", "peek": true, "reader": "pm2"}),
+        )
+        .unwrap();
+    assert_eq!(other["messages"].as_array().unwrap().len(), 1);
+    // Acked rows completed via=inbox_ack with the reader on the receipt.
+    let show = d.rpc("agent_show", json!({"alias": "obs"})).unwrap();
+    for m in show["messages"].as_array().unwrap() {
+        if m["id"] == "n3" {
+            assert_eq!(m["state"], "queued", "{m}");
+            continue;
+        }
+        assert_eq!(m["state"], "completed", "{m}");
+        assert_eq!(m["result"]["via"], "inbox_ack", "{m}");
+        assert_eq!(m["result"]["reader"], "pm", "{m}");
+    }
+    // The cursor is durable mailbox evidence: status carries the
+    // readers, the stream carries one `inbox_ack` event.
+    assert_eq!(show["inbox"]["readers"]["pm"]["through"], seqs[1], "{show}");
+    let acks: Vec<_> = d
+        .events("obs")
+        .into_iter()
+        .filter(|e| e["kind"] == "inbox_ack")
+        .collect();
+    assert_eq!(acks.len(), 1, "{acks:?}");
+    assert_eq!(acks[0]["payload"]["reader"], "pm");
+    assert_eq!(acks[0]["payload"]["through"], seqs[1]);
+    // An ack receipt never routes a synthetic worker result — the
+    // mailbox stays a receipt, not a conversation (CAD-251).
+    let routed: Vec<_> = show["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["source"] == "worker_result")
+        .collect();
+    assert!(routed.is_empty(), "{routed:?}");
+}
+
+/// A `through` claim past the inbox's tail completes what exists but is
+/// stored clamped to the tail — the reader's cursor can never blind it
+/// to later arrivals. An operator `--reset` drops the cursor outright.
+#[test]
+fn inbox_ack_clamps_past_the_tail_and_reset_restores() {
+    let d = TestDaemon::start();
+    d.register_inbox("obs");
+    for id in ["n1", "n2"] {
+        d.rpc(
+            "agent_send",
+            json!({"alias": "obs", "text": id, "message": id}),
+        )
+        .unwrap();
+    }
+    let page = d
+        .rpc("agent_inbox", json!({"alias": "obs", "peek": true}))
+        .unwrap();
+    let tail = page["messages"].as_array().unwrap().last().unwrap()["seq"]
+        .as_i64()
+        .unwrap();
+    // The poisoning claim: `through` far past the tail.
+    let ack = d
+        .rpc(
+            "agent_inbox_ack",
+            json!({"alias": "obs", "through": i64::MAX - 1, "reader": "pm"}),
+        )
+        .unwrap();
+    assert_eq!(ack["through"], tail, "{ack}");
+    let show = d.rpc("agent_show", json!({"alias": "obs"})).unwrap();
+    assert_eq!(show["inbox"]["readers"]["pm"]["through"], tail, "{show}");
+    // A later arrival is still visible to that reader — not blinded.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "obs", "text": "n3", "message": "n3"}),
+    )
+    .unwrap();
+    let resume = d
+        .rpc(
+            "agent_inbox",
+            json!({"alias": "obs", "peek": true, "reader": "pm"}),
+        )
+        .unwrap();
+    assert_eq!(resume["messages"][0]["id"], "n3", "{resume}");
+
+    // Reset is operator-only: a genuinely unattributed caller
+    // (`unproven_rpc` — plain `rpc` IS the operator in CI) and a
+    // proven foreign agent are both refused.
+    let e = d
+        .unproven_rpc(
+            "agent_inbox_ack",
+            json!({"alias": "obs", "reset": true, "reader": "pm"}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("operator action"), "{e}");
+    plant_pane(&d, "w1", std::process::id());
+    let e = d
+        .rpc(
+            "agent_inbox_ack",
+            json!({"alias": "obs", "reset": true, "reader": "pm"}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("cannot ack another"), "{e}");
+    // The operator's reset drops the cursor — the still-queued message
+    // comes back; the completed ones stay completed.
+    d.operator_rpc(
+        "agent_inbox_ack",
+        json!({"alias": "obs", "reset": true, "reader": "pm"}),
+    )
+    .unwrap();
+    let show = d.rpc("agent_show", json!({"alias": "obs"})).unwrap();
+    assert!(show["inbox"]["readers"].get("pm").is_none(), "{show}");
+    let resume = d
+        .rpc(
+            "agent_inbox",
+            json!({"alias": "obs", "peek": true, "reader": "pm"}),
+        )
+        .unwrap();
+    let left = resume["messages"].as_array().unwrap();
+    assert_eq!(left.len(), 1, "{resume}");
+    assert_eq!(left[0]["id"], "n3");
+}
+
+/// Concurrent readers acking the same watermark never double-complete:
+/// the `state='queued'` guard makes each row's completion exactly once.
+#[test]
+fn inbox_ack_is_idempotent_for_concurrent_readers() {
+    let d = TestDaemon::start();
+    d.register_inbox("obs");
+    for id in ["a", "b", "c"] {
+        d.rpc(
+            "agent_send",
+            json!({"alias": "obs", "text": id, "message": id}),
+        )
+        .unwrap();
+    }
+    let page = d
+        .rpc("agent_inbox", json!({"alias": "obs", "peek": true}))
+        .unwrap();
+    let through = page["messages"].as_array().unwrap().last().unwrap()["seq"]
+        .as_i64()
+        .unwrap();
+    let mut hs = Vec::new();
+    for i in 0..4 {
+        let state = d.state.clone();
+        hs.push(thread::spawn(move || {
+            client::rpc(
+                &state,
+                "agent_inbox_ack",
+                json!({"alias": "obs", "through": through,
+                       "reader": format!("r{i}")}),
+            )
+        }));
+    }
+    let mut total_acked = 0usize;
+    for h in hs {
+        let r = h.join().unwrap().unwrap();
+        total_acked += r["acked"].as_array().unwrap().len();
+    }
+    assert_eq!(total_acked, 3, "the three rows completed exactly once");
+    // Re-acking the watermark is a no-op.
+    let r = d
+        .rpc(
+            "agent_inbox_ack",
+            json!({"alias": "obs", "through": through, "reader": "late"}),
+        )
+        .unwrap();
+    assert!(r["acked"].as_array().unwrap().is_empty(), "{r}");
+    assert_eq!(r["unread"], 0, "{r}");
+    // Every reader's watermark is durable.
+    let readers = d.rpc("agent_show", json!({"alias": "obs"})).unwrap()["inbox"]["readers"].clone();
+    for i in 0..4 {
+        assert_eq!(readers[format!("r{i}")]["through"], through, "{readers}");
+    }
+    assert_eq!(readers["late"]["through"], through, "{readers}");
+}
+
+/// The one guard on the mutation: an agent caller may ack only its own
+/// alias. A mailbox's consumer is otherwise unattributed (CAD-251), so
+/// the read stays unguarded and the ack refuses a foreign agent.
+#[test]
+fn inbox_ack_refuses_another_agents_inbox() {
+    let d = TestDaemon::start();
+    d.register_inbox("obs");
+    d.rpc(
+        "agent_send",
+        json!({"alias": "obs", "text": "x", "message": "n1"}),
+    )
+    .unwrap();
+    // The test process becomes agent 'w1' — every d.rpc from here on
+    // is that caller. The plant flips w1's row to a pty pane.
+    plant_pane(&d, "w1", std::process::id());
+    let r = d.rpc("agent_inbox_ack", json!({"alias": "obs", "through": 1}));
+    let e = r.unwrap_err().to_string();
+    assert!(e.contains("cannot ack another"), "{e}");
+    // Nothing was consumed by the refused ack.
+    assert_eq!(
+        d.rpc("agent_inbox", json!({"alias": "obs", "peek": true}))
+            .unwrap()["unread"],
+        1
+    );
+}
+
+/// The legacy drain consumes too, so it carries the same guard as the
+/// ack: a proven agent may not drain another agent's inbox — the peek
+/// stays a plain read it may do.
+#[test]
+fn inbox_drain_refuses_a_foreign_agent() {
+    let d = TestDaemon::start();
+    d.register_inbox("obs");
+    d.rpc(
+        "agent_send",
+        json!({"alias": "obs", "text": "x", "message": "n1"}),
+    )
+    .unwrap();
+    // The test process becomes agent 'w1' — every d.rpc from here on
+    // is that caller.
+    plant_pane(&d, "w1", std::process::id());
+    // Peeking is a read — the foreign agent may look.
+    assert_eq!(
+        d.rpc("agent_inbox", json!({"alias": "obs", "peek": true}))
+            .unwrap()["unread"],
+        1
+    );
+    // Draining consumes — refused, and nothing completes.
+    let e = d
+        .rpc("agent_inbox", json!({"alias": "obs"}))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("cannot drain another"), "{e}");
+    let show = d.rpc("agent_show", json!({"alias": "obs"})).unwrap();
+    assert_eq!(show["queued"], 1, "{show}");
+    assert_eq!(show["messages"][0]["state"], "queued", "{show}");
+}
+
+/// Reader names are identifiers — the same grammar as aliases — so a
+/// cursor key can never smuggle path or query syntax into the log.
+#[test]
+fn inbox_rejects_bad_reader_names() {
+    let d = TestDaemon::start();
+    d.register_inbox("obs");
+    for bad in ["../x", "a b", "x?y=1", "", &"r".repeat(81)] {
+        for req in [
+            json!({"alias": "obs", "peek": true, "reader": bad}),
+            json!({"alias": "obs", "through": 1, "reader": bad}),
+        ] {
+            let verb = if req.get("peek").is_some() {
+                "agent_inbox"
+            } else {
+                "agent_inbox_ack"
+            };
+            let e = d.rpc(verb, req).unwrap_err().to_string();
+            assert!(e.contains("invalid reader name"), "{verb} {bad:?}: {e}");
+        }
+    }
+    // A normal name still works.
+    d.rpc(
+        "agent_inbox",
+        json!({"alias": "obs", "peek": true, "reader": "pm-1.x"}),
+    )
+    .unwrap();
+}
+
+/// `cadence inbox ack` is the consume verb: an inbox literally named
+/// 'ack' would be unreachable through the CLI, so registering one is
+/// refused.
+#[test]
+fn inbox_register_refuses_the_reserved_ack_alias() {
+    let d = TestDaemon::start();
+    let e = d
+        .fixture_rpc(
+            "agent_register",
+            json!({"alias": "ack", "provider": "inbox",
+                   "endpoint_kind": "inbox",
+                   "cwd": d.dir.path().to_str().unwrap()}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("reserved"), "{e}");
+}
+
+/// Caller identity is connection-bound: a self-asserted `by` field on
+/// the ack verb is refused, like every other mutation verb.
+#[test]
+fn inbox_ack_rejects_identity_fields() {
+    let d = TestDaemon::start();
+    d.register_inbox("obs");
+    let e = d
+        .rpc(
+            "agent_inbox_ack",
+            json!({"alias": "obs", "through": 1, "by": "operator"}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("connection-bound"), "{e}");
+    let e = d
+        .rpc(
+            "agent_inbox",
+            json!({"alias": "obs", "peek": true, "caller": "w1"}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("connection-bound"), "{e}");
+}
+
+/// The CLI path: `inbox --peek` prints without consuming, `inbox ack`
+/// completes the watermark, and `cadence self` reports the unread
+/// backlog and its age.
+#[test]
+fn cli_inbox_peek_ack_and_self_reports_unread() {
+    let d = TestDaemon::start();
+    d.register_inbox("obs");
+    for (id, text) in [("n1", "note one"), ("n2", "note two")] {
+        d.rpc(
+            "agent_send",
+            json!({"alias": "obs", "text": text, "message": id}),
+        )
+        .unwrap();
+    }
+    let bin = env!("CARGO_BIN_EXE_cadence");
+    let cadence = |args: &[&str]| {
+        let out = std::process::Command::new(bin)
+            .arg("--state-dir")
+            .arg(&d.state)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+
+    // `self` shows the unread backlog and the oldest unread's age.
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .arg("self")
+        .env("CADENCE_ALIAS", "obs")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["unread"], 2, "{v}");
+    assert!(v["oldest_unread_age_secs"].as_f64().unwrap() >= 0.0, "{v}");
+
+    // Peek prints both messages; the queue is untouched.
+    let peek = cadence(&["inbox", "obs", "--peek"]);
+    let msgs: Vec<Value> = peek
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(msgs.len(), 2, "{peek}");
+    let seq = msgs[0]["seq"].as_i64().unwrap();
+    assert_eq!(
+        d.rpc("agent_show", json!({"alias": "obs"})).unwrap()["queued"],
+        2
+    );
+
+    // Ack the first — the reader cursor advances; a restarted peek
+    // shows only the rest.
+    let ack: Value =
+        serde_json::from_str(&cadence(&["inbox", "ack", "obs", &seq.to_string()])).unwrap();
+    assert_eq!(ack["acked"], json!([seq]), "{ack}");
+    let peek2 = cadence(&["inbox", "obs", "--peek"]);
+    let left: Vec<Value> = peek2
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(left.len(), 1, "{peek2}");
+    assert_eq!(left[0]["id"], "n2");
+
+    // `inbox ack` with no seq is a clean refusal, not a silent ack.
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["inbox", "ack", "obs"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("at least one seq")
+            || String::from_utf8_lossy(&out.stderr).contains("at least one seq")
+    );
+}
+
+/// Poll a file's line count — the exec'd consumer's evidence file —
+/// with a bounded deadline.
+fn wait_lines(path: &Path, want: usize, secs: u64) -> Vec<String> {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        let lines: Vec<String> = std::fs::read_to_string(path)
+            .map(|s| s.lines().map(str::to_string).collect())
+            .unwrap_or_default();
+        if lines.len() >= want || Instant::now() >= deadline {
+            return lines;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// `--follow --exec` pushes each message's JSON to the command's stdin
+/// and acks it on exit 0 — exactly once per message.
+#[test]
+fn inbox_follow_exec_acks_each_message_once() {
+    let d = TestDaemon::start();
+    d.register_inbox("obs");
+    let bin = env!("CARGO_BIN_EXE_cadence");
+    // The consumer: read one message JSON from stdin, record its id.
+    let script = d.dir.path().join("collect.py");
+    let log = d.dir.path().join("seen.log");
+    std::fs::write(
+        &script,
+        "import json,sys\nm=json.load(sys.stdin)\nopen(sys.argv[1],'a').write(m['id']+'\\n')\n",
+    )
+    .unwrap();
+    let mut child = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args([
+            "inbox",
+            "obs",
+            "--follow",
+            "--exec-retry-ms",
+            "50",
+            "--exec",
+            "python3",
+        ])
+        .arg(&script)
+        .arg(&log)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    for id in ["m1", "m2"] {
+        d.rpc(
+            "agent_send",
+            json!({"alias": "obs", "text": id, "message": id}),
+        )
+        .unwrap();
+    }
+    let seen = wait_lines(&log, 2, 15);
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(seen, vec!["m1", "m2"], "each delivered exactly once");
+    // Both acked — nothing queued, both completed via=inbox_ack.
+    let show = d.rpc("agent_show", json!({"alias": "obs"})).unwrap();
+    assert_eq!(show["queued"], 0, "{show}");
+    for m in show["messages"].as_array().unwrap() {
+        assert_eq!(m["state"], "completed", "{m}");
+        assert_eq!(m["result"]["via"], "inbox_ack", "{m}");
+    }
+}
+
+/// A non-zero exec exit leaves the message queued and retries it with
+/// backoff — the ack lands only after a successful run.
+#[test]
+fn inbox_follow_exec_failure_retries_until_success() {
+    let d = TestDaemon::start();
+    d.register_inbox("obs");
+    let bin = env!("CARGO_BIN_EXE_cadence");
+    let script = d.dir.path().join("flaky.py");
+    let log = d.dir.path().join("tries.log");
+    let flag = d.dir.path().join("ok");
+    // Record every attempt; fail until the flag file exists.
+    std::fs::write(
+        &script,
+        "import json,os,sys\n\
+         m=json.load(sys.stdin)\n\
+         open(sys.argv[1],'a').write(m['id']+'\\n')\n\
+         sys.exit(0 if os.path.exists(sys.argv[2]) else 1)\n",
+    )
+    .unwrap();
+    let mut child = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args([
+            "inbox",
+            "obs",
+            "--follow",
+            "--exec-retry-ms",
+            "50",
+            "--exec",
+            "python3",
+        ])
+        .arg(&script)
+        .arg(&log)
+        .arg(&flag)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "obs", "text": "t", "message": "m1"}),
+    )
+    .unwrap();
+    // First attempts fail — the message is NOT acked. A retry may append
+    // between polls, so assert the delivered identity, not a count.
+    let tries = wait_lines(&log, 1, 15);
+    assert!(tries.iter().all(|t| t == "m1"), "{tries:?}");
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        d.rpc("agent_show", json!({"alias": "obs"})).unwrap()["queued"],
+        1,
+        "failed exec must leave the message queued"
+    );
+    // Once the consumer succeeds the message is delivered and acked.
+    std::fs::write(&flag, "").unwrap();
+    let tries = wait_lines(&log, 2, 15);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while d.rpc("agent_show", json!({"alias": "obs"})).unwrap()["queued"] != 0 {
+        assert!(Instant::now() < deadline, "message never acked");
+        thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(tries.len() >= 2, "retried after failure: {tries:?}");
+    let show = d.rpc("agent_show", json!({"alias": "obs"})).unwrap();
+    assert_eq!(show["messages"][0]["result"]["via"], "inbox_ack");
+}
+
+/// A consumer that hangs is killed at the exec timeout and counted as
+/// a failure; after the failure budget the message is parked — still
+/// queued and unread, but skipped so the follower reaches the next one.
+#[test]
+fn inbox_follow_exec_timeout_kills_then_parks() {
+    let d = TestDaemon::start();
+    d.register_inbox("obs");
+    let bin = env!("CARGO_BIN_EXE_cadence");
+    let script = d.dir.path().join("hang.py");
+    let log = d.dir.path().join("done.log");
+    // 'm1' hangs forever; anything else succeeds.
+    std::fs::write(
+        &script,
+        "import json,sys,time\n\
+         m=json.load(sys.stdin)\n\
+         if m['id']=='m1': time.sleep(600)\n\
+         open(sys.argv[1],'a').write(m['id']+'\\n')\n",
+    )
+    .unwrap();
+    let mut child = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args([
+            "inbox",
+            "obs",
+            "--follow",
+            "--exec-retry-ms",
+            "50",
+            "--exec-timeout-ms",
+            "300",
+            "--exec-max-failures",
+            "2",
+            "--exec",
+            "python3",
+        ])
+        .arg(&script)
+        .arg(&log)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    for id in ["m1", "m2"] {
+        d.rpc(
+            "agent_send",
+            json!({"alias": "obs", "text": id, "message": id}),
+        )
+        .unwrap();
+    }
+    // m1 times out twice (≈600ms of killed sleeps) and parks; m2 —
+    // queued behind it — is still delivered and acked.
+    let done = wait_lines(&log, 1, 20);
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(done, vec!["m2"], "{done:?}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let show = d.rpc("agent_show", json!({"alias": "obs"})).unwrap();
+        let m2 = show["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == "m2")
+            .unwrap()
+            .clone();
+        if m2["state"] == "completed" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "m2 never acked: {show}");
+        thread::sleep(Duration::from_millis(50));
+    }
+    // The poison message stays queued — parked, never lost.
+    let show = d.rpc("agent_show", json!({"alias": "obs"})).unwrap();
+    assert_eq!(show["queued"], 1, "{show}");
+    let events = d.events("obs");
+    let parks: Vec<_> = events
+        .iter()
+        .filter(|e| e["kind"] == "inbox_park")
+        .collect();
+    assert_eq!(parks.len(), 1, "{events:?}");
+    assert_eq!(parks[0]["payload"]["message"], "m1");
+    let fails: Vec<_> = events
+        .iter()
+        .filter(|e| e["kind"] == "inbox_exec_fail")
+        .collect();
+    assert_eq!(fails.len(), 2, "{events:?}");
+    assert!(
+        fails[0]["payload"]["fail"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("timeout"),
+        "{fails:?}"
+    );
+    // Parked for the reader, not deleted: a different reader still sees
+    // m1 queued ahead of nothing.
+    let other = d
+        .rpc(
+            "agent_inbox",
+            json!({"alias": "obs", "peek": true, "reader": "pm-other"}),
+        )
+        .unwrap();
+    assert_eq!(other["messages"][0]["id"], "m1", "{other}");
+}
+
+/// A message that fails every exec is parked after the failure budget —
+/// it stays queued and unread but stops blocking the queue.
+#[test]
+fn inbox_follow_exec_parks_a_poison_message() {
+    let d = TestDaemon::start();
+    d.register_inbox("obs");
+    let bin = env!("CARGO_BIN_EXE_cadence");
+    let script = d.dir.path().join("poison.py");
+    let log = d.dir.path().join("ok.log");
+    std::fs::write(
+        &script,
+        "import json,sys\n\
+         m=json.load(sys.stdin)\n\
+         if m['id']=='bad': sys.exit(1)\n\
+         open(sys.argv[1],'a').write(m['id']+'\\n')\n",
+    )
+    .unwrap();
+    let mut child = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args([
+            "inbox",
+            "obs",
+            "--follow",
+            "--exec-retry-ms",
+            "30",
+            "--exec-max-failures",
+            "3",
+            "--exec",
+            "python3",
+        ])
+        .arg(&script)
+        .arg(&log)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    for id in ["bad", "good"] {
+        d.rpc(
+            "agent_send",
+            json!({"alias": "obs", "text": id, "message": id}),
+        )
+        .unwrap();
+    }
+    let done = wait_lines(&log, 1, 20);
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(done, vec!["good"], "{done:?}");
+    let show = d.rpc("agent_show", json!({"alias": "obs"})).unwrap();
+    assert_eq!(show["queued"], 1, "{show}");
+    let parks: Vec<_> = d
+        .events("obs")
+        .into_iter()
+        .filter(|e| e["kind"] == "inbox_park")
+        .collect();
+    assert_eq!(parks.len(), 1);
+    assert_eq!(parks[0]["payload"]["message"], "bad");
 }
 
 // ==== verified auto-ready (pty) ====
@@ -12847,13 +13683,15 @@ impl TestDaemon {
             .to_string()
     }
 
-    /// `job dispatch` — returns the full RPC payload.
+    /// `job dispatch` — returns the full RPC payload. Dispatch is the
+    /// operator's act (`BY_OPERATOR`), so it goes the operator's way —
+    /// a suite running in an agent pane could not prove it otherwise.
     fn job_dispatch(&self, task: &str, extra: Value) -> cadence_agent::Result<Value> {
         let mut p = json!({"task": task});
         for (k, v) in extra.as_object().unwrap_or(&serde_json::Map::new()) {
             p[k] = v.clone();
         }
-        self.rpc("task_dispatch", p)
+        self.operator_rpc("task_dispatch", p)
     }
 
     /// A verdict from the operator: the reviewer is the verified
@@ -13074,7 +13912,7 @@ fn job_inbox_pm_receives_notifications() {
     d.wait_message("w1", &kickoff, &["completed"], 15);
     d.wait_task("j1-t2", "review", 15);
     d.job_verdict("j1-t2", SHA_A, "pass").unwrap();
-    d.rpc("task_accept", json!({"task": "j1-t2", "by": "operator"}))
+    d.operator_rpc("task_accept", json!({"task": "j1-t2"}))
         .unwrap();
     assert_eq!(d.task_state("j1-t2"), "done");
 
@@ -16134,7 +16972,8 @@ fn long_report_text_survives_pty_report_to_inbox() {
             json!({"alias": "w1", "text": "w", "message": id, "reply_to": "pm"}),
         )
         .unwrap();
-        d.rpc("agent_ready", json!({"alias": "w1"})).unwrap();
+        d.operator_rpc("agent_ready", json!({"alias": "w1"}))
+            .unwrap();
         let token = pty_token(&d, "w1", &id);
         d.rpc(
             "message_report",
@@ -17128,7 +17967,7 @@ fn wait_source(d: &TestDaemon, alias: &str, source: &str, want: usize, secs: u64
 /// A fake actor with explicit launch params — `stall_secs` included.
 fn register_fake_opts(d: &TestDaemon, alias: &str, params: Value) {
     let cwd = d.dir.path().to_str().unwrap().to_string();
-    d.rpc(
+    d.fixture_rpc(
         "agent_register",
         json!({"alias": alias, "provider": "fake",
                "endpoint_kind": "fake", "cwd": cwd,
@@ -25234,7 +26073,7 @@ fn overview_tracker_row_clock_is_the_status_change() {
 
 /// A mailbox with endpoint params (thresholds, upstream).
 fn register_inbox_with(d: &TestDaemon, alias: &str, params: Value) {
-    d.rpc(
+    d.fixture_rpc(
         "agent_register",
         json!({"alias": alias, "provider": "inbox", "endpoint_kind": "inbox",
                "params": params.to_string()}),
@@ -25267,7 +26106,7 @@ fn inbox_without_consumer_warns_on_send_and_route() {
     d.register_inbox("boss");
     register_inbox_with(&d, "routed", limits(json!({"upstream": "boss"})));
     let cwd = d.dir.path().to_str().unwrap().to_string();
-    d.rpc(
+    d.fixture_rpc(
         "agent_register",
         json!({"alias": "w1", "provider": "fake", "endpoint_kind": "fake",
                "cwd": cwd, "params": json!({"upstream": "routed"}).to_string()}),
@@ -38724,7 +39563,7 @@ fn auto_stop_idle_agent_stops_with_event_label_and_resumes() {
 fn auto_stop_keeps_pm_inbox_opted_out_and_busy_agents() {
     let (d, offset) = auto_stop_daemon(daemon::AutoStopSetting::idle_after(3600));
     let cwd = d.dir.path().to_str().unwrap().to_string();
-    d.rpc(
+    d.fixture_rpc(
         "agent_register",
         json!({"alias": "pm", "provider": "fake", "endpoint_kind": "fake",
                "cwd": cwd, "role": "pm"}),

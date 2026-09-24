@@ -392,7 +392,9 @@ pub(super) struct DaemonSnap {
 /// agent runs and keep the overview cache from ever serving. Job and
 /// monitor rows carry no such field: their times are absolute stamps.
 const TICKING: &[(&str, &[&str])] = &[
-    ("", &["silent_secs", "ended_secs"]),
+    // `oldest_unread_age_secs` on a board inbox row (CAD-480) is the
+    // same clock-derived age `inbox.oldest_age_secs` carries.
+    ("", &["silent_secs", "ended_secs", "oldest_unread_age_secs"]),
     ("awaiting_report", &["since_secs", "remaining_secs"]),
     ("inbox", &["oldest_age_secs"]),
     (

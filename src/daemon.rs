@@ -2331,7 +2331,8 @@ impl Shared {
             "agent_answer" => self.rpc_answer(params, peer_pid),
             "agent_recover_submit" => self.rpc_recover_submit(params, peer_pid),
             "agent_set" => self.rpc_set(params, peer_pid),
-            "agent_inbox" => self.rpc_inbox(params),
+            "agent_inbox" => self.rpc_inbox(params, peer_pid),
+            "agent_inbox_ack" => self.rpc_inbox_ack(params, peer_pid),
             "message_report" => self.rpc_message_report(params),
             "message_reconcile" => self.rpc_reconcile(params, peer_pid),
             "message_cancel" => self.rpc_cancel(params),
@@ -4257,6 +4258,14 @@ impl Shared {
                 "Provider 'inbox' and endpoint kind 'inbox' must be used together",
             ));
         }
+        // `cadence inbox ack <alias>` is the consume verb: an inbox
+        // literally named 'ack' would be unreachable through the CLI.
+        if registry::is_inbox_kind(endpoint) && alias == "ack" {
+            return Err(Error::rejected(
+                "the alias 'ack' is reserved for `cadence inbox ack` — \
+                 pick another name for the inbox",
+            ));
+        }
         // A mailbox never runs a process — its cwd is bookkeeping only,
         // so direct socket callers may omit it (the CLI defaults cwd).
         let cwd = match (cwd, endpoint) {
@@ -5675,27 +5684,154 @@ impl Shared {
     /// Drain an inbox agent's durable queue — messages complete
     /// `via=inbox_read` as they are returned. `wait` long-polls on the
     /// daemon's change signal, the same mechanism `events` uses.
-    fn rpc_inbox(self: &Arc<Self>, params: &Value) -> Result<Value> {
+    /// `peek` (CAD-480) returns the same queued set without consuming:
+    /// nothing completes, so a reader that crashes or truncates loses
+    /// nothing. A peeking reader's lower bound defaults to its
+    /// server-side ack cursor (`reader`, default `"default"`) — a
+    /// restart resumes after its last `agent_inbox_ack`, not its last
+    /// read. `unread` is the live queued count either way.
+    ///
+    /// The peek is a read, so it keeps the mailbox's unguarded shape
+    /// (CAD-251). The drain is a consume: like `agent_inbox_ack`, a
+    /// proven **agent** caller may drain only its own inbox — a worker
+    /// can never consume another agent's queue — while unattributed and
+    /// operator callers pass as they always have.
+    fn rpc_inbox(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
+        reject_identity_fields(params, "agent_inbox")?;
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
-        let after = optional_i64(params, "after").unwrap_or(0);
+        let peek = params.get("peek").and_then(Value::as_bool) == Some(true);
+        let reader = inbox_reader(params)?;
+        if !peek {
+            if let caller_rule::Who::Agent(caller) = self.connection_caller(peer_pid)? {
+                if caller != alias {
+                    return Err(Error::rejected(format!(
+                        "agent_inbox refused: agent '{caller}' cannot drain another \
+                         agent's inbox — '{alias}' is consumed by the operator or an \
+                         unattributed mailbox reader (caller rule, CAD-480)"
+                    )));
+                }
+            }
+        }
+        let after = optional_i64(params, "after");
         let wait = optional_u64(params, "wait").unwrap_or(0).min(30);
         let deadline = Instant::now() + Duration::from_secs(wait);
         loop {
-            let messages = self.store.inbox_drain(&alias, after)?;
+            // A peek with no explicit `after` resumes at the reader's
+            // ack watermark; a drain keeps the legacy bound of 0.
+            let bound = match after {
+                Some(a) => a,
+                None if peek => self.store.inbox_reader_cursor(&alias, reader)?,
+                None => 0,
+            };
+            let messages = if peek {
+                self.store.inbox_peek(&alias, bound, reader)?
+            } else {
+                self.store.inbox_drain(&alias, bound)?
+            };
             if !messages.is_empty() || self.closing.load(Ordering::SeqCst) {
                 self.wake();
-                let cursor = messages.last().map(|m| m.seq).unwrap_or(after);
+                let cursor = messages.last().map(|m| m.seq).unwrap_or(bound);
                 return Ok(json!({
                     "messages": messages.iter().map(Message::to_json).collect::<Vec<_>>(),
                     "cursor": cursor,
+                    "unread": self.store.queued_count(&alias)?,
                 }));
             }
             if Instant::now() >= deadline {
-                return Ok(json!({"messages": [], "cursor": after}));
+                return Ok(json!({"messages": [], "cursor": bound,
+                                 "unread": self.store.queued_count(&alias)?}));
             }
             let step = deadline.min(Instant::now() + Duration::from_secs(1));
             self.changed.wait_until(step);
         }
+    }
+
+    /// Acknowledge an inbox's queued messages through a seq watermark
+    /// (CAD-480) — the explicit consume `agent_inbox --peek` leaves to
+    /// the reader — plus the reader-cursor housekeeping verbs on the
+    /// same channel: `park` marks a queued message so the reader's
+    /// peeks skip it (`inbox_park`), `fail` records one failed `--exec`
+    /// attempt (`inbox_exec_fail`), and `reset` drops the reader's
+    /// cursor (`inbox_ack_reset`, operator only). A mailbox's consumer
+    /// has no verifiable identity (CAD-251), so unattributed and
+    /// operator callers pass exactly as they do on the read; the one
+    /// guard is that an agent may act only on its own alias — a worker
+    /// can never consume another agent's inbox.
+    ///
+    /// The ack is a watermark: `through` (or the greatest `seqs` entry)
+    /// completes every still-queued message at or below it, idempotent
+    /// on the `queued` state guard, and records the reader's durable
+    /// cursor on the `inbox_ack` event. The store clamps `through` to
+    /// the inbox's tail before recording it — a claim past the tail
+    /// completes what exists but cannot blind the reader to later
+    /// arrivals.
+    fn rpc_inbox_ack(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
+        reject_identity_fields(params, "agent_inbox_ack")?;
+        let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        let who = self.connection_caller(peer_pid)?;
+        let by = match &who {
+            caller_rule::Who::Agent(caller) if caller != &alias => {
+                return Err(Error::rejected(format!(
+                    "agent_inbox_ack refused: agent '{caller}' cannot ack another \
+                     agent's inbox — '{alias}' is consumed by the operator or an \
+                     unattributed mailbox reader (caller rule, CAD-480)"
+                )));
+            }
+            caller_rule::Who::Agent(caller) => caller.clone(),
+            caller_rule::Who::Operator => "operator".to_string(),
+            caller_rule::Who::Unproven(_) => "inbox-reader".to_string(),
+        };
+        let reader = inbox_reader(params)?;
+        // `reset` is the destructive action — it re-delivers everything
+        // still queued — so it needs operator proof, not merely a
+        // consumer's unattributed pass.
+        if params.get("reset").and_then(Value::as_bool) == Some(true) {
+            if !matches!(who, caller_rule::Who::Operator) {
+                return Err(Error::rejected(
+                    "agent_inbox_ack --reset refused: resetting a reader cursor is \
+                     an operator action — run it from an operator shell outside \
+                     every pane (caller rule, CAD-480)",
+                ));
+            }
+            let result = self.store.inbox_ack_reset(&alias, reader, &by)?;
+            self.wake();
+            return Ok(result);
+        }
+        if let Some(message) = optional_str(params, "park") {
+            let reason = optional_str(params, "reason").unwrap_or("parked");
+            let result = self
+                .store
+                .inbox_park(&alias, reader, message, &by, reason)?;
+            self.wake();
+            return Ok(result);
+        }
+        if let Some(fail) = params.get("fail") {
+            // One failed `--exec` attempt, surfaced to the event log:
+            // the follower reports it, then retries or parks.
+            let payload = json!({"reader": reader, "by": by, "fail": fail});
+            self.store
+                .event_public(&alias, "inbox_exec_fail", payload)?;
+            self.wake();
+            return Ok(json!({"recorded": "inbox_exec_fail"}));
+        }
+        let seqs = params
+            .get("seqs")
+            .and_then(Value::as_array)
+            .map(|s| s.iter().filter_map(Value::as_i64).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let through = optional_i64(params, "through")
+            .into_iter()
+            .chain(seqs.iter().copied())
+            .max()
+            .ok_or_else(|| {
+                Error::rejected(
+                    "agent_inbox_ack needs a seq: pass `seqs` or `through` — \
+                     the ack watermark is the greatest",
+                )
+            })?;
+        let result = self.store.inbox_ack(&alias, through, reader, &by)?;
+        self.wake();
+        Ok(result)
     }
 
     /// Explicit ack/result report for a running message. The `token` is
@@ -9832,6 +9968,24 @@ fn proc_env_alias(pid: u32) -> std::result::Result<Option<String>, ()> {
         .find_map(|kv| kv.strip_prefix("CADENCE_ALIAS="))
         .filter(|a| !a.is_empty())
         .map(str::to_string))
+}
+
+/// An inbox reader name (CAD-480): the alias grammar — `[A-Za-z0-9._-]`,
+/// 1-80 chars — so a cursor key can never carry path or query syntax
+/// into the event log it is recorded on.
+fn inbox_reader(params: &Value) -> Result<&str> {
+    let reader = optional_str(params, "reader").unwrap_or("default");
+    if reader.is_empty()
+        || reader.len() > 80
+        || !reader
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    {
+        return Err(Error::rejected(format!(
+            "invalid reader name '{reader}' — [A-Za-z0-9._-], 1-80 chars"
+        )));
+    }
+    Ok(reader)
 }
 
 fn reject_identity_fields(params: &Value, verb: &str) -> Result<()> {
