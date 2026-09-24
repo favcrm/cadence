@@ -20403,7 +20403,7 @@ fn dispatch_injects_project_memory_lessons() {
     assert!(cli(&["issue", "init"]).0);
     let repo_s = repo.canonicalize().unwrap().to_str().unwrap().to_string();
     assert!(cli(&["issue", "project", "add", "demo", "--prefix", "D", "--repo", &repo_s,]).0);
-    for title in ["One", "Two"] {
+    for title in ["One", "Two", "Three"] {
         assert!(cli(&["issue", "new", title, "--project", "demo"]).0);
     }
 
@@ -20631,7 +20631,84 @@ fn dispatch_injects_project_memory_lessons() {
         text.contains("`aged-rule` (unverified (last verified 2020-01-01))"),
         "{text}"
     );
-    assert!(!text.contains("marked-rule"), "{text}");
+    // CAD-395: the stale-marked rule is not applied, but the briefing
+    // names it and why.
+    assert!(
+        !text.contains("rule whose cited fix was reverted"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "Withheld — stale evidence, not applied:\n\n- `marked-rule`: evidence marked stale: D-9 reverted the cited fix"
+        ),
+        "{text}"
+    );
+
+    // CAD-395: when every match is withheld the lessons file is still
+    // written, carrying only its Withheld section.
+    let mark = |slug: &str, why: &str| {
+        let path = pm_dir.join(format!("demo/memory/{slug}.md"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let (mut front, body) = memory::parse_memory(&text).unwrap();
+        front.stale = Some(why.to_string());
+        std::fs::write(
+            &path,
+            cadence_agent::issue::parse::render(&front, &body).unwrap(),
+        )
+        .unwrap();
+    };
+    mark("always-drain", "D-8 replaced the pipe");
+    mark("aged-rule", "D-7 removed the code it cites");
+    let (ok, out) = cli(&[
+        "dispatch",
+        "D-3",
+        "--to",
+        "w1",
+        "--note",
+        &note_s,
+        "--reply-to",
+        "pm",
+    ]);
+    assert!(ok && out["dispatched"] == true, "{out}");
+    assert_eq!(out["lessons"], json!([]), "{out}");
+    assert_eq!(
+        out["lessons_withheld"].as_array().unwrap().len(),
+        3,
+        "{out}"
+    );
+    let lessons_path = PathBuf::from(out["lessons_file"].as_str().expect("file written"));
+    let text = std::fs::read_to_string(&lessons_path).unwrap();
+    assert_eq!(
+        text,
+        "# Lessons — matched project memories\n\n\
+         \n## Withheld — stale evidence, not applied\n\n\
+         - `aged-rule`: evidence marked stale: D-7 removed the code it cites\n\
+         - `always-drain`: evidence marked stale: D-8 replaced the pipe\n\
+         - `marked-rule`: evidence marked stale: D-9 reverted the cited fix\n"
+    );
+    let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
+    let kick = show["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"].as_str() == out["message"].as_str())
+        .unwrap();
+    assert!(
+        kick["body"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("Lessons: {}.", lessons_path.display())),
+        "{kick}"
+    );
+    // The briefing likewise applies none and names all three.
+    let (ok, out) = cli(&["agent", "bootstrap", "w2"]);
+    assert!(ok, "{out}");
+    let text = std::fs::read_to_string(&briefing).unwrap();
+    assert!(text.contains("(none applied)"), "{text}");
+    assert!(
+        text.contains("- `always-drain`: evidence marked stale: D-8 replaced the pipe"),
+        "{text}"
+    );
 }
 
 /// Explicit-axis matching resolves the current project from cwd and never

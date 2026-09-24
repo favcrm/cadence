@@ -2520,6 +2520,7 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
                 let status = query("status");
                 let kind = query("type");
                 let (mems, errors) = crate::memory::load_all_report(&pm.dir);
+                let projects = project::list(&pm.dir).unwrap_or_default();
                 let payload: Vec<Value> = mems
                     .iter()
                     .filter(|m| {
@@ -2530,7 +2531,10 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
                                 .unwrap_or(true)
                             && kind.as_deref().map(|k| m.front.kind == k).unwrap_or(true)
                     })
-                    .map(crate::memory::card_json)
+                    .map(|m| {
+                        let fresh = crate::memory::Freshness::among(&projects, &m.project);
+                        crate::memory::card_json(m, &fresh)
+                    })
                     .collect();
                 send(
                     request,
@@ -2602,7 +2606,13 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
                     return;
                 }
                 match Pm::at(pm_dir).and_then(|pm| crate::memory::find(&pm, Some(key), slug)) {
-                    Ok((_, m)) => send(request, json_response(crate::memory::detail_json(&m))),
+                    Ok((proj, m)) => {
+                        let fresh = crate::memory::Freshness::for_project(Some(&proj));
+                        send(
+                            request,
+                            json_response(crate::memory::detail_json(&m, &fresh)),
+                        )
+                    }
                     Err(e) => send(request, err_response(404, &e.to_string())),
                 }
                 return;

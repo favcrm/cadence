@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError } from "../../lib/api";
 import type { MemoryCard, MemoryDetail } from "../../lib/types";
 import Md from "../../ui/Md";
+import { evidenceSuffix, quorumLabel, quorumTone, quorumView } from "./memoryView";
 
 const STATUSES = ["", "proposed", "accepted", "rejected", "superseded"];
 const TYPES = ["", "rule", "gotcha", "decision", "recipe"];
@@ -38,52 +39,6 @@ type DetailState = {
   data?: MemoryDetail;
   error?: string;
 };
-
-type QuorumView = {
-  eligible: boolean | null;
-  reason: string;
-  mode: "acceptance" | "retrieval";
-};
-
-function quorumView(m: MemoryCard): QuorumView {
-  const mode = m.status === "proposed" ? "acceptance" : "retrieval";
-  if (!m.quorum) {
-    return {
-      eligible: null,
-      reason: "verification unavailable — this server did not report quorum",
-      mode,
-    };
-  }
-
-  const check = mode === "acceptance" ? m.quorum.accept : m.quorum;
-  if (!check || typeof check.eligible !== "boolean") {
-    return {
-      eligible: null,
-      reason: "verification unavailable — this server did not report quorum",
-      mode,
-    };
-  }
-
-  return {
-    eligible: check.eligible,
-    reason: check.reason || "server did not provide a quorum reason",
-    mode,
-  };
-}
-
-function quorumTone(eligible: boolean | null): string {
-  if (eligible === true) return "bg-accent/10 text-accent";
-  if (eligible === false) return "bg-warn/10 text-warn";
-  return "bg-ink-800 text-ink-400";
-}
-
-function quorumLabel(q: QuorumView): string {
-  if (q.eligible === null) return "verification unavailable";
-  if (q.mode === "acceptance") {
-    return q.eligible ? "awaiting PM finalization" : "review blocked";
-  }
-  return q.eligible ? "available to agents" : "not available to agents";
-}
 
 export default function Memory({
   project,
@@ -254,9 +209,7 @@ export default function Memory({
                   </span>
                   <span className="num text-micro text-ink-500 ml-auto min-w-0 break-words text-right">
                     {m.project}
-                    {q.mode === "retrieval" && q.eligible === true && m.verified_at
-                      ? ` · verified ${m.verified_at.slice(0, 10)}`
-                      : ""}
+                    {evidenceSuffix(m, q)}
                   </span>
                 </div>
                 <div className="text-[13px] text-ink-300 break-words">{m.fact}</div>

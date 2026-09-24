@@ -653,8 +653,11 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
                         .iter()
                         .map(|(m, reason)| (m.front.id.clone(), reason.clone()))
                         .collect();
+                    // Written whenever it has content: a dispatch whose
+                    // every match was withheld still gets the file with
+                    // only its Withheld section.
                     let (text, slugs) = memory::render_lessons(&matched);
-                    if !slugs.is_empty() {
+                    if !text.is_empty() {
                         let ddir = state_dir.join("dispatch");
                         let file = ddir.join(format!("{mid}-lessons.md"));
                         // tmp + rename: a failed write never leaves a

@@ -8074,31 +8074,77 @@ fn memory_match_blocks_legacy_records() {
     assert!(slugs.is_empty(), "{slugs:?}");
 }
 
+/// Give a `legacy_memory` fixture a PM-finalized verify cycle at `at` —
+/// the receipt retrieval reads as "last verified". Freshness readers do
+/// not require quorum; the raw `verified_at` field is not the receipt.
+fn verify_fixture(pm: &Path, slug: &str, at: &str) {
+    let path = pm.join(format!("mem/memory/{slug}.md"));
+    let text = std::fs::read_to_string(&path).unwrap();
+    let (mut front, body) = cadence_agent::memory::parse_memory(&text).unwrap();
+    front.review_cycle = 2;
+    front.finalizations.retain(|r| r.operation != "verify");
+    front
+        .finalizations
+        .push(cadence_agent::memory::FinalizationReceipt {
+            operation: "verify".to_string(),
+            cycle: 2,
+            digest: "fixture".to_string(),
+            finalizer: cadence_agent::memory::IdentityProof {
+                alias: "fixture-pm".to_string(),
+                registration: 4,
+                generation: "fixture-pm-4".to_string(),
+                process_start: 104,
+                role: "pm".to_string(),
+            },
+            finalized_at: at.to_string(),
+        });
+    std::fs::write(
+        &path,
+        cadence_agent::issue::parse::render(&front, &body).unwrap(),
+    )
+    .unwrap();
+}
+
+/// Set (or clear) a fixture's explicit `stale:` mark.
+fn mark_stale_fixture(pm: &Path, slug: &str, why: Option<&str>) {
+    let path = pm.join(format!("mem/memory/{slug}.md"));
+    let text = std::fs::read_to_string(&path).unwrap();
+    let (mut front, body) = cadence_agent::memory::parse_memory(&text).unwrap();
+    front.stale = why.map(str::to_string);
+    std::fs::write(
+        &path,
+        cadence_agent::issue::parse::render(&front, &body).unwrap(),
+    )
+    .unwrap();
+}
+
+fn stale_entry<'a>(out: &'a Value, slug: &str) -> Option<&'a Value> {
+    out["stale"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["slug"] == slug)
+}
+
 #[test]
 fn memory_stale_flags_changed_paths() {
     let (_t, pm, state, repo) = mem_fx();
     let verified_epoch = time::now_epoch();
     let verified = time::iso(verified_epoch);
-    legacy_memory(
-        &pm,
-        "src-watch",
-        "rule",
-        &["--scope-path", "src/**"],
-        "accepted",
-        Some(&verified),
-    );
-    legacy_memory(
-        &pm,
-        "docs-watch",
-        "rule",
-        &["--scope-path", "docs/**"],
-        "accepted",
-        Some(&verified),
-    );
-    // verified_at == now; the change must land strictly after. Staleness is
-    // an informational reader path and does not require trust in a legacy
-    // acceptance receipt. Both stamps are whole seconds: wait for the clock
-    // to pass the verified second (often already true after the CLI calls).
+    for (slug, glob) in [("src-watch", "src/**"), ("docs-watch", "docs/**")] {
+        legacy_memory(
+            &pm,
+            slug,
+            "rule",
+            &["--scope-path", glob],
+            "accepted",
+            Some(&verified),
+        );
+        verify_fixture(&pm, slug, &verified);
+    }
+    // The change must land strictly after the verify. Both stamps are
+    // whole seconds: wait for the clock to pass the verified second
+    // (often already true after the CLI calls).
     let deadline = Instant::now() + Duration::from_secs(5);
     while time::now_epoch() <= verified_epoch {
         assert!(Instant::now() < deadline, "clock never passed {verified}");
@@ -8122,25 +8168,91 @@ fn memory_stale_flags_changed_paths() {
         out["stale"][0]["reason"].as_str().unwrap(),
         "paths changed after verified_at"
     );
+    assert_eq!(out["stale"][0]["evidence"]["state"], "verified", "{out}");
+    assert_eq!(
+        out["stale"][0]["changed"],
+        json!(["src/changed.rs"]),
+        "{out}"
+    );
+}
 
-    // An accepted memory whose verified_at predates the window is
-    // stale even with no path scope at all — hand-age the file.
-    let aged = pm.join("mem/memory/docs-watch.md");
-    let text = std::fs::read_to_string(&aged)
-        .unwrap()
-        .replace("verified_at:", "verified_at: 2020-01-01 # was ");
-    std::fs::write(&aged, text).unwrap();
+/// CAD-395: `ls --stale` reads freshness through the same `Freshness`
+/// retrieval uses — past the window reads "unverified (last verified
+/// <date>)", a stale mark reads withheld with its reason, a raw
+/// `verified_at` with no verify receipt reads unverified, and none of
+/// them is ever "verified".
+#[test]
+fn memory_stale_reads_retrieval_freshness() {
+    let (_t, pm, state, _repo) = mem_fx();
+    let now = time::iso(time::now_epoch());
+    for slug in ["fresh", "aged", "marked", "raw-stamp"] {
+        legacy_memory(
+            &pm,
+            slug,
+            "rule",
+            &["--scope-project"],
+            "accepted",
+            Some(&now),
+        );
+    }
+    verify_fixture(&pm, "fresh", &now);
+    verify_fixture(&pm, "aged", "2020-01-01T00:00:00Z");
+    verify_fixture(&pm, "marked", &now);
+    mark_stale_fixture(&pm, "marked", Some("M-9 reverted the cited fix"));
+
+    let (ok, out) = mem_cli(&pm, &state, &["ls", "--stale", "--json"]);
+    assert!(ok, "{out}");
+    assert!(stale_entry(&out, "fresh").is_none(), "{out}");
+    let aged = stale_entry(&out, "aged").expect("past-window is stale");
+    assert_eq!(aged["reason"], "not verified within the window");
+    assert_eq!(aged["verified_at"], "2020-01-01T00:00:00Z");
+    assert_eq!(aged["evidence"]["state"], "unverified");
+    assert_eq!(
+        aged["evidence"]["label"],
+        "unverified (last verified 2020-01-01)"
+    );
+    let marked = stale_entry(&out, "marked").expect("stale mark is stale");
+    assert_eq!(
+        marked["reason"],
+        "evidence marked stale: M-9 reverted the cited fix"
+    );
+    assert_eq!(marked["evidence"]["state"], "withheld");
+    assert_eq!(
+        marked["evidence"]["reason"],
+        "evidence marked stale: M-9 reverted the cited fix"
+    );
+    // A raw verified_at of now is not a verify receipt.
+    let raw = stale_entry(&out, "raw-stamp").expect("raw stamp is not a verify");
+    assert_eq!(raw["verified_at"], Value::Null);
+    assert_eq!(raw["evidence"]["label"], "unverified");
+
+    // The text view carries the same labels, never "verified".
+    let (ok, text, _) = cli_out_err(&pm, &state, &["memory", "ls", "--stale"]);
+    assert!(ok, "{text}");
+    assert!(
+        text.contains(
+            "mem/aged\tunverified (last verified 2020-01-01)\tnot verified within the window"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("mem/marked\twithheld\tevidence marked stale: M-9 reverted the cited fix"),
+        "{text}"
+    );
+    assert!(text.contains("mem/raw-stamp\tunverified\t"), "{text}");
+    assert!(!text.contains("\tverified"), "{text}");
+
+    // The window is the project's `memory.stale_days`; `--days` overrides.
+    let yaml = pm.join("mem/project.yaml");
+    let mut conf = std::fs::read_to_string(&yaml).unwrap();
+    conf.push_str("memory:\n  stale_days: 100000\n");
+    std::fs::write(&yaml, conf).unwrap();
+    let (ok, out) = mem_cli(&pm, &state, &["ls", "--stale", "--json"]);
+    assert!(ok, "{out}");
+    assert!(stale_entry(&out, "aged").is_none(), "{out}");
     let (ok, out) = mem_cli(&pm, &state, &["ls", "--stale", "--days", "30", "--json"]);
     assert!(ok, "{out}");
-    let stale = out["stale"].as_array().unwrap();
-    let aged_entry = stale
-        .iter()
-        .find(|s| s["slug"] == "docs-watch")
-        .expect("aged memory is stale");
-    assert_eq!(
-        aged_entry["reason"].as_str().unwrap(),
-        "not verified within the window"
-    );
+    assert!(stale_entry(&out, "aged").is_some(), "{out}");
 }
 
 #[test]
@@ -8314,6 +8426,88 @@ fn memory_ui_lists_detail_and_refuses_memory_write() {
         std::fs::read_to_string(pm.join("mem/memory/ui-no.md")).unwrap(),
         before
     );
+}
+
+/// CAD-395: the board's memory view reads a lesson's freshness through
+/// the same `Freshness` retrieval uses, per the lesson's project window:
+/// past-window → "unverified (last verified <date>)", stale-marked →
+/// withheld with its reason, raw `verified_at` alone → unverified.
+#[test]
+fn memory_board_reads_retrieval_freshness() {
+    let (_t, pm, state, _repo) = mem_fx();
+    let now = time::iso(time::now_epoch());
+    for slug in ["fresh", "aged", "marked", "raw-stamp"] {
+        legacy_memory(
+            &pm,
+            slug,
+            "rule",
+            &["--scope-project"],
+            "accepted",
+            Some(&now),
+        );
+    }
+    verify_fixture(&pm, "fresh", &now);
+    verify_fixture(&pm, "aged", "2020-01-01T00:00:00Z");
+    verify_fixture(&pm, "marked", &now);
+    mark_stale_fixture(&pm, "marked", Some("M-9 reverted the cited fix"));
+    let (port, _ui) = spawn_ui(&pm, &state);
+    let host = format!("127.0.0.1:{port}");
+
+    let (status, body) = http(port, "GET", "/api/memories", &host);
+    assert_eq!(status, 200, "{body}");
+    let list: Value = serde_json::from_str(&body).unwrap();
+    let evidence = |slug: &str| -> Value {
+        list["memories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["slug"] == slug)
+            .unwrap()["evidence"]
+            .clone()
+    };
+    let fresh = evidence("fresh");
+    assert_eq!(fresh["state"], "verified", "{fresh}");
+    assert_eq!(fresh["label"], format!("verified {}", &now[..10]));
+    let aged = evidence("aged");
+    assert_eq!(aged["state"], "unverified", "{aged}");
+    assert_eq!(aged["label"], "unverified (last verified 2020-01-01)");
+    assert_eq!(aged["window_days"], 30);
+    let marked = evidence("marked");
+    assert_eq!(marked["state"], "withheld", "{marked}");
+    assert_eq!(marked["label"], "withheld");
+    assert_eq!(
+        marked["reason"],
+        "evidence marked stale: M-9 reverted the cited fix"
+    );
+    let raw = evidence("raw-stamp");
+    assert_eq!(raw["state"], "unverified", "{raw}");
+    assert_eq!(raw["label"], "unverified");
+    assert_eq!(raw["last_verified"], Value::Null);
+
+    // The detail and `memory ls --json` carry the same reading.
+    let (status, body) = http(port, "GET", "/api/memories/mem/aged", &host);
+    assert_eq!(status, 200, "{body}");
+    let detail: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(detail["evidence"], aged);
+    let (ok, out) = mem_cli(&pm, &state, &["ls", "--json"]);
+    assert!(ok, "{out}");
+    let card = out["memories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["slug"] == "marked")
+        .unwrap();
+    assert_eq!(card["evidence"], marked);
+
+    // The window is the lesson's project's.
+    let yaml = pm.join("mem/project.yaml");
+    let mut conf = std::fs::read_to_string(&yaml).unwrap();
+    conf.push_str("memory:\n  stale_days: 100000\n");
+    std::fs::write(&yaml, conf).unwrap();
+    let (status, body) = http(port, "GET", "/api/memories/mem/aged", &host);
+    assert_eq!(status, 200, "{body}");
+    let detail: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(detail["evidence"]["label"], "verified 2020-01-01");
 }
 
 /// `cadence …` returning (ok, stdout, stderr) — load warnings go to
@@ -8544,8 +8738,9 @@ fn memory_lint_bounds_fact_bytes_and_glob() {
     assert!(errs.contains("too complex"), "{errs}");
 }
 
-/// A `verified_at` that isn't ASCII — e.g. `abcé-01-01` — must not
-/// panic the stale scan (the old slicer cut mid-char).
+/// A verify time that isn't ASCII — e.g. `abcé-01-01` — must not
+/// panic the stale scan (the old slicer cut mid-char); it reads as not
+/// current.
 #[test]
 fn memory_malformed_timestamp_is_safe() {
     let (_t, pm, state, _repo) = mem_fx();
@@ -8557,11 +8752,7 @@ fn memory_malformed_timestamp_is_safe() {
         "accepted",
         Some("2026-01-01T00:00:00Z"),
     );
-    let file = pm.join("mem/memory/bad-date.md");
-    let text = std::fs::read_to_string(&file)
-        .unwrap()
-        .replace("verified_at:", "verified_at: abc\u{e9}-01-01 # was ");
-    std::fs::write(&file, text).unwrap();
+    verify_fixture(&pm, "bad-date", "abc\u{e9}-01-01");
 
     let (ok, out) = mem_cli(&pm, &state, &["ls", "--stale", "--json"]);
     assert!(ok, "{out}");

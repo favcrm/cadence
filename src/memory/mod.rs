@@ -21,7 +21,9 @@
 //! outside the project's window, is injected labelled `unverified` (see
 //! `stale_reason`, `evidence_label`). `cadence dispatch` renders the top matches into a
 //! lessons file and names it in the kickoff; the briefing lists eligible
-//! project-wide `rule`s.
+//! project-wide `rule`s and names withheld ones with their reason. The
+//! board and `memory ls --stale` read freshness the same way
+//! (`evidence_json`).
 
 pub mod cli;
 
@@ -1494,7 +1496,12 @@ impl Freshness {
 
     /// `for_project` by key — an unknown project gets the default.
     pub fn for_key(pm_dir: &Path, key: &str) -> Self {
-        let projects = project::list(pm_dir).unwrap_or_default();
+        Freshness::among(&project::list(pm_dir).unwrap_or_default(), key)
+    }
+
+    /// `for_key` over an already-listed registry — one read for a list
+    /// of lessons that spans projects.
+    pub fn among(projects: &[project::Project], key: &str) -> Self {
         Freshness::for_project(projects.iter().find(|p| p.key == key))
     }
 
@@ -1550,6 +1557,28 @@ pub fn stale_reason(mem: &Memory) -> Option<String> {
         "evidence marked stale".to_string()
     } else {
         format!("evidence marked stale: {why}")
+    })
+}
+
+/// A lesson's evidence as retrieval reads it — the one view dispatch,
+/// the board and `memory ls --stale` share: `withheld` with its reason
+/// when explicitly marked stale, else the `evidence_label` (`verified`
+/// only inside the window). `last_verified` is the verify finalization,
+/// never the raw `verified_at` field.
+pub fn evidence_json(mem: &Memory, fresh: &Freshness) -> Value {
+    let (state, label, reason) = match stale_reason(mem) {
+        Some(reason) => ("withheld", "withheld".to_string(), Some(reason)),
+        None if current_verify(mem, fresh).is_some() => {
+            ("verified", evidence_label(mem, fresh), None)
+        }
+        None => ("unverified", evidence_label(mem, fresh), None),
+    };
+    json!({
+        "state": state,
+        "label": label,
+        "reason": reason,
+        "last_verified": last_verified(mem),
+        "window_days": fresh.window_days,
     })
 }
 
@@ -1714,8 +1743,10 @@ pub fn match_for_issue(
 /// type and evidence label, the one-line fact and the how-to-apply.
 /// Capped at `LESSON_MAX_ENTRIES` memories and `LESSON_MAX_BYTES` total
 /// — a truncated tail is noted. Withheld lessons are listed after, with
-/// their reasons, inside the same byte cap. Returns `(text, slugs)`;
-/// no injectable lesson yields an empty string.
+/// their reasons, inside the same byte cap. Returns `(text, slugs)`.
+/// When every match is withheld the text is only the Withheld section
+/// — the "why did I not get this?" answer; nothing matched at all
+/// yields an empty string.
 pub fn render_lessons(matched: &Matched) -> (String, Vec<String>) {
     let mut out = String::from("# Lessons — matched project memories\n\n");
     let mut slugs = Vec::new();
@@ -1745,7 +1776,7 @@ pub fn render_lessons(matched: &Matched) -> (String, Vec<String>) {
             "\n({extra} more matched — `cadence memory ls` lists them)\n"
         ));
     }
-    if slugs.is_empty() {
+    if slugs.is_empty() && matched.withheld.is_empty() {
         return (String::new(), vec![]);
     }
     if !matched.withheld.is_empty() {
@@ -1762,22 +1793,31 @@ pub fn render_lessons(matched: &Matched) -> (String, Vec<String>) {
 }
 
 /// Accepted project-wide `rule`s — the briefing's memory section.
-/// Explicitly stale ones are withheld as at dispatch. Broken files are
-/// skipped, not fatal; callers surface the errors.
-pub fn project_rules(pm: &Pm, key: &str) -> (Vec<Memory>, Vec<String>) {
+/// Explicitly stale ones are withheld with their reason, as at dispatch.
+/// Broken files are skipped, not fatal; callers surface the errors.
+pub fn project_rules(pm: &Pm, key: &str) -> (Matched, Vec<String>) {
     let (mems, errors) = load_project_report(&pm.dir, key);
-    let mut rules: Vec<Memory> = mems
-        .into_iter()
-        .filter(|m| {
-            m.front.status == "accepted"
-                && retrieval_status(m).0
-                && m.front.scope.project
-                && m.front.kind == "rule"
-                && stale_reason(m).is_none()
-        })
-        .collect();
-    rules.sort_by(|a, b| a.front.id.cmp(&b.front.id));
-    (rules, errors)
+    let mut out = Matched {
+        lessons: Vec::new(),
+        withheld: Vec::new(),
+        fresh: Freshness::for_key(&pm.dir, key),
+    };
+    for m in mems {
+        if m.front.status != "accepted"
+            || !retrieval_status(&m).0
+            || !m.front.scope.project
+            || m.front.kind != "rule"
+        {
+            continue;
+        }
+        match stale_reason(&m) {
+            Some(reason) => out.withheld.push((m, reason)),
+            None => out.lessons.push(m),
+        }
+    }
+    out.lessons.sort_by(|a, b| a.front.id.cmp(&b.front.id));
+    out.withheld.sort_by(|a, b| a.0.front.id.cmp(&b.0.front.id));
+    (out, errors)
 }
 
 // ── Staleness ────────────────────────────────────────────────────
@@ -1812,45 +1852,49 @@ fn iso_epoch(s: &str) -> Option<i64> {
     Some(days * 86400 + hh * 3600 + mm * 60 + ss)
 }
 
-/// Stale accepted memories: `verified_at` missing or older than the
-/// `days` window, or path globs matching files changed in a project
-/// repo after `verified_at` (the changed-file scan stays inside the
-/// window). Informational — `verify` is the refresh. Broken files are
-/// skipped and returned as the second tuple element.
-pub fn stale(pm: &Pm, days: u64) -> (Vec<Value>, Vec<String>) {
+/// Stale accepted memories, read through the same `Freshness` retrieval
+/// uses: explicitly marked stale (withheld, with its reason), no verify
+/// finalization inside the window (decayed to unverified — the raw
+/// `verified_at` field is never trusted), or path globs matching files
+/// changed in a project repo since the last verify. The window is the
+/// project's (`memory.stale_days`) unless `days` overrides it.
+/// Informational — `verify` is the refresh. Broken files are skipped
+/// and returned as the second tuple element.
+pub fn stale(pm: &Pm, days: Option<u64>) -> (Vec<Value>, Vec<String>) {
     let mut out = Vec::new();
     let (mems, errors) = load_all_report(&pm.dir);
-    let since_epoch = time::now_epoch() - (days as i64) * 86400;
+    let projects = project::list(&pm.dir).unwrap_or_default();
     for m in mems {
         if m.front.status != "accepted" {
             continue;
         }
-        let verified = m
-            .front
-            .verified_at
-            .as_deref()
-            .and_then(iso_epoch)
-            .unwrap_or(0);
-        if verified < since_epoch {
-            out.push(json!({
+        let mut fresh = Freshness::among(&projects, &m.project);
+        if let Some(days) = days {
+            fresh.window_days = days;
+        }
+        let hit = |reason: &str| {
+            json!({
                 "project": m.project, "slug": m.front.id,
-                "verified_at": m.front.verified_at,
-                "reason": "not verified within the window",
+                "verified_at": last_verified(&m),
+                "evidence": evidence_json(&m, &fresh),
+                "reason": reason,
                 "changed": [],
-            }));
+            })
+        };
+        if let Some(reason) = stale_reason(&m) {
+            out.push(hit(&reason));
             continue;
         }
+        let Some(verified) = current_verify(&m, &fresh).and_then(iso_epoch) else {
+            out.push(hit("not verified within the window"));
+            continue;
+        };
         if m.front.scope.paths.is_empty() {
             continue;
         }
-        // Changes count only after verified_at AND inside the window.
-        let bound = verified.max(since_epoch);
-        let since = time::iso(bound.max(0));
-        let Some(proj) = project::list(&pm.dir)
-            .unwrap_or_default()
-            .into_iter()
-            .find(|p| p.key == m.project)
-        else {
+        // A current verify is inside the window: changes count after it.
+        let since = time::iso(verified.max(0));
+        let Some(proj) = projects.iter().find(|p| p.key == m.project) else {
             continue;
         };
         for repo in &proj.repos {
@@ -1873,13 +1917,10 @@ pub fn stale(pm: &Pm, days: u64) -> (Vec<Value>, Vec<String>) {
             };
             let changed: Vec<&str> = log.lines().filter(|l| !l.is_empty()).collect();
             if !changed.is_empty() {
-                out.push(json!({
-                    "project": m.project, "slug": m.front.id,
-                    "verified_at": m.front.verified_at,
-                    "reason": "paths changed after verified_at",
-                    "repo": path,
-                    "changed": changed.iter().take(10).collect::<Vec<_>>(),
-                }));
+                let mut h = hit("paths changed after verified_at");
+                h["repo"] = json!(path);
+                h["changed"] = json!(changed.iter().take(10).collect::<Vec<_>>());
+                out.push(h);
                 break;
             }
         }
@@ -1989,8 +2030,9 @@ pub fn lint_dir(
     }
 }
 
-/// Card/list payload for `ls` and the UI.
-pub fn card_json(m: &Memory) -> Value {
+/// Card/list payload for `ls` and the UI. `evidence` is the lesson's
+/// freshness under `fresh` (its project's window), as retrieval reads it.
+pub fn card_json(m: &Memory, fresh: &Freshness) -> Value {
     let digest = semantic_digest(m);
     let (eligible, reason) = retrieval_status(m);
     let (accept_eligible, accept_reason) = quorum_status(m, "accept");
@@ -2014,6 +2056,7 @@ pub fn card_json(m: &Memory) -> Value {
         "verified_at": m.front.verified_at,
         "last_verified": last_verified(m),
         "stale": m.front.stale,
+        "evidence": evidence_json(m, fresh),
         "supersedes": m.front.supersedes,
         "revision_digest": digest,
         "review_cycle": m.front.review_cycle,
@@ -2038,8 +2081,8 @@ pub fn card_json(m: &Memory) -> Value {
     })
 }
 
-pub fn detail_json(m: &Memory) -> Value {
-    let mut v = card_json(m);
+pub fn detail_json(m: &Memory, fresh: &Freshness) -> Value {
+    let mut v = card_json(m, fresh);
     v["body"] = json!(m.body);
     v
 }
@@ -2943,6 +2986,93 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("verified 2025"), "{text}");
+    }
+
+    #[test]
+    fn every_match_withheld_still_renders_the_withheld_section() {
+        let mut marked = finalized("marked", Some("2026-02-28T00:00:00Z"));
+        marked.front.stale = Some("CAD-1 reverted the fix it cites".to_string());
+        let matched = match_memories(
+            &[marked],
+            &MatchCtx::default(),
+            &fresh_at("2026-03-01T00:00:00Z"),
+        );
+        assert!(matched.lessons.is_empty());
+        let (text, injected) = render_lessons(&matched);
+        assert!(injected.is_empty());
+        assert_eq!(
+            text,
+            "# Lessons — matched project memories\n\n\
+             \n## Withheld — stale evidence, not applied\n\n\
+             - `marked`: evidence marked stale: CAD-1 reverted the fix it cites\n"
+        );
+        // Nothing matched at all: still no file.
+        let none = match_memories(&[], &MatchCtx::default(), &fresh_at("2026-03-01T00:00:00Z"));
+        assert_eq!(render_lessons(&none), (String::new(), vec![]));
+    }
+
+    #[test]
+    fn evidence_json_reads_freshness_like_retrieval() {
+        let now = fresh_at("2026-03-01T00:00:00Z");
+        let fresh = finalized("fresh", Some("2026-02-20T00:00:00Z"));
+        let v = evidence_json(&fresh, &now);
+        assert_eq!(v["state"], "verified");
+        assert_eq!(v["label"], "verified 2026-02-20");
+        assert_eq!(v["reason"], Value::Null);
+        // Past the window: decayed, never "verified".
+        let aged = finalized("aged", Some("2026-01-10T00:00:00Z"));
+        let v = evidence_json(&aged, &now);
+        assert_eq!(v["state"], "unverified");
+        assert_eq!(v["label"], "unverified (last verified 2026-01-10)");
+        assert_eq!(v["last_verified"], "2026-01-10T00:00:00Z");
+        // A stale mark withholds even a fresh verify, with its reason.
+        let mut marked = fresh.clone();
+        marked.front.stale = Some("CAD-1 reverted the fix it cites".to_string());
+        let v = evidence_json(&marked, &now);
+        assert_eq!(v["state"], "withheld");
+        assert_eq!(v["label"], "withheld");
+        assert_eq!(
+            v["reason"],
+            "evidence marked stale: CAD-1 reverted the fix it cites"
+        );
+        // A raw verified_at is not a verify receipt.
+        let mut legacy = finalized("legacy", None);
+        legacy.front.verified_at = Some("2026-02-28T00:00:00Z".to_string());
+        let v = evidence_json(&legacy, &now);
+        assert_eq!(v["state"], "unverified");
+        assert_eq!(v["label"], "unverified");
+        assert_eq!(v["last_verified"], Value::Null);
+        // The card carries the same reading.
+        assert_eq!(
+            card_json(&aged, &now)["evidence"],
+            evidence_json(&aged, &now)
+        );
+    }
+
+    #[test]
+    fn project_rules_withhold_stale_marked_rules_with_their_reason() {
+        let (dir, pm) = mutation_fixture();
+        let mdir = dir.path().join("demo").join("memory");
+        std::fs::create_dir_all(&mdir).unwrap();
+        let kept = finalized("kept", None);
+        let mut marked = finalized("marked", None);
+        marked.front.stale = Some("CAD-1 reverted the fix it cites".to_string());
+        for m in [&kept, &marked] {
+            std::fs::write(
+                mdir.join(format!("{}.md", m.front.id)),
+                crate::issue::parse::render(&m.front, &m.body).unwrap(),
+            )
+            .unwrap();
+        }
+        let (matched, errors) = project_rules(&pm, "demo");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(slugs(&matched.lessons), vec!["kept"]);
+        assert_eq!(matched.withheld.len(), 1);
+        assert_eq!(matched.withheld[0].0.front.id, "marked");
+        assert_eq!(
+            matched.withheld[0].1,
+            "evidence marked stale: CAD-1 reverted the fix it cites"
+        );
     }
 
     #[test]
