@@ -630,7 +630,8 @@ In this order:
 
 A build is installed from CI, never compiled on the host. On every push
 to `main`, once `fmt`, `clippy`, `test`, `build` and `ui` have passed on
-that sha, CI's `release-artifact` job (ubuntu-24.04, `contents: read`
+that sha (in that push run, or for a queued merge in the merge_group run
+of the same sha, CAD-409; see "Post-merge CI on main"), CI's `release-artifact` job (ubuntu-24.04, `contents: read`
 only) builds `cargo build --release --locked --features ui` after
 `pnpm build` with the same floating `stable` toolchain the test jobs use
 (the exact `rustc`/`cargo` versions go in the manifest), and checks that
@@ -643,8 +644,9 @@ three files:
 - `cadence`, the binary;
 - `cadence.sha256`, its `sha256sum` line;
 - `manifest.json`: `source_sha`, `run_id`, `run_attempt`, `rustc`,
-  `cargo`, `features`, `target`, `runner`, `checks`, `sha256`,
-  `built_at`.
+  `cargo`, `features`, `target`, `runner`, `checks`, `checks_event`
+  (`push` or `merge_group`) and `checks_run_id` (the run whose gates
+  passed; since CAD-409), `sha256`, `built_at`.
 
 The attestation is a GitHub build-provenance attestation for the
 binary. Pull-request and merge-queue runs never produce an artifact,
@@ -665,9 +667,12 @@ refuses, naming the fix, on the first that fails:
 
 1. `gh` is installed and logged in (`gh auth login`).
 2. The sha is on `main` (GitHub compare says `identical` or `ahead`).
-3. A `ci.yml` push run on `main` for that exact sha has a successful
-   `test` job. Pull-request and merge-queue runs do not count.
-4. That run still holds the artifact. It can be missing (the job did not
+3. CI's `test` job passed on that exact sha: in a `ci.yml` push run on
+   `main` (a direct push, and every build before CAD-409), or else in a
+   `ci.yml` merge_group run on a `gh-readonly-queue/main/*` ref whose head
+   is that sha (a queued merge, whose push run skips the gates).
+   Pull-request runs, and merge_group runs of any other sha, do not count.
+4. The push run on `main` for that sha still holds the artifact. It can be missing (the job did not
    run, or the build predates CAD-334) or expired (after 90 days).
 5. The downloaded binary hashes to `cadence.sha256`, and to the
    manifest's `sha256`.
@@ -813,27 +818,58 @@ works; its daemon refuses to start until CAD-315.
 
 ### Post-merge CI on main
 
-Policy (CAD-228): **every commit pushed to `main` is verified**, one run at
-a time, oldest first. Pull requests keep cancel-stale behaviour. The
-`concurrency:` block in `.github/workflows/ci.yml` implements it:
+Policy (CAD-228): **every commit pushed to `main` is verified**, and its
+push run is never cancelled. Pull requests keep cancel-stale behaviour.
+Since CAD-409, a commit that landed through the merge queue is verified
+by the queue's own run of that exact commit, and its push run only builds
+the release. The `concurrency:` block in `.github/workflows/ci.yml` sets
+the groups:
 
 | Event | Group | Running run | Pending runs |
 |-------|-------|-------------|--------------|
 | `pull_request` | `ci-<PR number>` | cancelled by a newer head | at most one; a newer head replaces it (`queue: single`) |
-| `push` to `main` or `feat/**` | `ci-<ref>` | never cancelled | up to 100 wait, oldest first (`queue: max`); only a 101st is cancelled |
+| `push` to `main` | `ci-main-<sha>`, one per commit | never cancelled | none: a commit's group only ever holds its own run, so main push runs never wait for each other |
+| `push` to `feat/**`, `v*` tag | `ci-<ref>` | never cancelled | up to 100 wait, oldest first (`queue: max`); only a 101st is cancelled |
 | `merge_group` (merge queue) | `ci-<gh-readonly-queue ref>`, one per queue entry | never cancelled | `queue: max` |
+
+**What a push run on `main` runs (CAD-409).** The merge queue merges an
+entry by moving `main` to the exact commit its merge_group run tested
+(GitHub: "the temporary branch `main/pr-2` will be merged in to the target
+branch"; on record, #206 landed as 624f656, the head of merge_group run
+35888699424). Re-running the gates on that commit re-tests identical
+content, and while push runs were serial it held the release jobs about
+1.5 h behind merges. So the push run starts with `queue-evidence`, which
+asks the API for a merge_group run of `ci.yml` on a
+`gh-readonly-queue/main/*` ref whose head is this sha and whose latest
+attempt has `fmt`, `clippy`, `test`, `build` and `ui` all `success`:
+
+| Push to `main` | `queue-evidence` | Gates (`fmt` `clippy` `test` `build` `ui`) | `release-artifact` → `release-attest` |
+|---|---|---|---|
+| queued merge, all five gates passed in its merge_group run | `tested=true`, names the run | skipped | run; `manifest.json` records `checks_event: merge_group` and `checks_run_id` |
+| direct or admin-bypass push (no merge_group run), a queue run where a gate failed, or a failed lookup | `tested=false` | run here, as before CAD-409 | run only if all five passed here; `checks_event: push` |
+
+The lookup never fails the run: an API error means `tested=false`, so the
+gates run. `cadence upgrade` accepts the same evidence (the merge_group
+run's `test` passed on that exact sha), keeps accepting a push run's own
+`test` for direct pushes and older builds, and always installs the
+attested artifact of the push run. The gates skip only when evidence
+was found, so every artifact has one kind of evidence or the other.
 
 **Merging through the queue (CAD-290).** When the merge queue is enabled on
 `main`, do not `gh pr update-branch` and rerun by hand each time main moves.
 Enqueue the PR once it is green and reviewed — `gh pr merge <n> --squash
 --auto` (or "Merge when ready" in the UI) — and GitHub builds a
 `gh-readonly-queue/main/*` ref with the PR on top of main and the PRs ahead
-of it, runs the required `test` check there, and merges only if it passes.
-A failing entry is removed and the rest re-test without it. An admin
-bypass merge (`--admin`) skips the queue and its combined test; reserve it
-for emergencies.
+of it, runs the required checks (`test`, `fmt`, `clippy`, `build`, `ui`)
+there, and merges only if they pass. A failing entry is removed and the
+rest re-test without it. The queue's run is also `main`'s CI for that
+commit (CAD-409, above). An admin bypass merge (`--admin`) skips the queue
+and its combined test; the push run then finds no queue evidence and runs
+every gate itself, so the release follows only after they pass. Reserve
+it for emergencies.
 
-Before this, pushes used GitHub's default single pending slot, even though
+History (CAD-228, when push runs were one serial group per ref).
+Before that change, pushes used GitHub's default single pending slot, even though
 `cancel-in-progress` was false. When three merges landed inside one run,
 the second one's pending run was cancelled with zero jobs and that SHA was
 never verified. Runs 35607746920 (a3e6f8f) and 35615227527 (4a9e3e8) are
@@ -860,15 +896,19 @@ new policy those two bursts would have cost about 23 more job-minutes over
 two days. The repo is public, so
 standard hosted runners are not billed. The real cost is that in a burst,
 the newest SHA waits one extra `T` for each extra push ahead of it. Runs
-stay serial (one per group), so the queue is bounded and never becomes
-unbounded parallel CI.
+stayed serial (one per group), so the queue was bounded. Since CAD-409
+main push runs have one group per commit and run in parallel: there is
+at most one per pushed commit, so the merge rate bounds them, and a queued
+merge's run only builds and attests the release.
 
-Reading main CI: a `cancelled` run on a main SHA is **not** a test
+Reading main CI: a green push run on a main SHA means its gates passed
+there, or in the merge_group run that `queue-evidence` names in the run
+summary. A `cancelled` run on a main SHA is **not** a test
 failure, and it is **not** a pass either. That SHA is unverified until
 its own run succeeds, or until a descendant on main succeeds, and even
 then it is only "covered by" that descendant, never passed. Under this
-policy a cancelled main run should only come from a manual cancel or a
-queue past 100. Check it with
+policy a cancelled main run should only come from a manual cancel (on
+`feat/**`, also from a queue past 100). Check it with
 `gh run list --workflow ci.yml --branch main --json databaseId,headSha,status,conclusion`,
 and look at the zero-job runs with `gh run view <id> --json jobs`.
 
