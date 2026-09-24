@@ -2188,6 +2188,13 @@ impl Shared {
             "model_defaults_get" => self.rpc_model_defaults_get(),
             "model_defaults_set" => self.rpc_model_defaults_set(params, peer_pid),
             "agent_list" => {
+                // CAD-437: repeatable any-of filters, daemon-side.
+                let states = optional_strs(params, "states")?;
+                let providers = optional_strs(params, "providers")?;
+                let kinds = optional_strs(params, "kinds")?;
+                check_values("states", &states, crate::store::AGENT_STATES)?;
+                check_values("providers", &providers, &registry::provider_ids())?;
+                check_values("kinds", &kinds, &registry::endpoint_kind_ids())?;
                 let mut agents = Vec::new();
                 // CAD-96: one grouped read tells auto-stopped rows apart.
                 let markers = self
@@ -2195,6 +2202,15 @@ impl Shared {
                     .last_events_of_all(AUTO_STOP_MARKER_KINDS)
                     .unwrap_or_default();
                 for agent in self.store.agents()? {
+                    if !states.is_empty() && !states.contains(&agent.state) {
+                        continue;
+                    }
+                    if !providers.is_empty() && !providers.contains(&agent.provider) {
+                        continue;
+                    }
+                    if !kinds.is_empty() && !kinds.contains(&agent.endpoint_kind) {
+                        continue;
+                    }
                     let mut j = agent.to_json();
                     // The alias's current non-terminal task assignments —
                     // derived from tasks.assignee, never stored.
@@ -6323,10 +6339,29 @@ impl Shared {
     }
 
     fn rpc_job_list(self: &Arc<Self>, params: &Value) -> Result<Value> {
-        let jobs = self.store.jobs(
-            optional_str(params, "state"),
-            params.get("all").and_then(Value::as_bool).unwrap_or(false),
+        // CAD-437: `states` is the repeatable any-of form; the singular
+        // `state` stays accepted and merges into it.
+        let mut states = optional_strs(params, "states")?;
+        if let Some(s) = optional_str(params, "state") {
+            states.push(s.to_string());
+        }
+        states.sort();
+        states.dedup();
+        check_values("state", &states, crate::store::JOB_STATES)?;
+        // One state goes to SQL; several load everything and filter —
+        // an explicit state set also implies `all` (done/failed/
+        // cancelled are terminal rows the default hides).
+        let (sql_state, post) = match states.as_slice() {
+            [one] => (Some(one.as_str()), false),
+            _ => (None, !states.is_empty()),
+        };
+        let mut jobs = self.store.jobs(
+            sql_state,
+            params.get("all").and_then(Value::as_bool).unwrap_or(false) || post,
         )?;
+        if post {
+            jobs.retain(|j| states.contains(&j.state));
+        }
         // CAD-325: `tasks_detail` lists each task's id/state/title, so the
         // board binds agents to issues without one `job_show` per job.
         let detail = params.get("tasks_detail").and_then(Value::as_bool) == Some(true);
@@ -8484,6 +8519,45 @@ fn required_str<'a>(params: &'a Value, field: &str) -> Result<&'a str> {
 
 fn optional_str<'a>(params: &'a Value, field: &str) -> Option<&'a str> {
     params.get(field).and_then(Value::as_str)
+}
+
+/// A repeated-value param (CAD-437): a string or an array of strings.
+/// `None`/absent → empty; anything else is a rejection, never a silent
+/// skip.
+fn optional_strs(params: &Value, field: &str) -> Result<Vec<String>> {
+    match params.get(field) {
+        None | Some(Value::Null) => Ok(vec![]),
+        Some(Value::String(s)) => Ok(vec![s.clone()]),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|v| {
+                v.as_str().map(str::to_string).ok_or_else(|| {
+                    Error::invalid(
+                        "invalid_request",
+                        format!("'{field}' items must be strings"),
+                    )
+                })
+            })
+            .collect(),
+        Some(_) => Err(Error::invalid(
+            "invalid_request",
+            format!("'{field}' must be a string or an array of strings"),
+        )),
+    }
+}
+
+/// Every `values` member in `valid` — a wire peer is untrusted, so the
+/// daemon re-checks the vocabulary the CLI already checked.
+fn check_values(field: &str, values: &[String], valid: &[&str]) -> Result<()> {
+    for v in values {
+        if !valid.contains(&v.as_str()) {
+            return Err(Error::invalid(
+                "invalid_request",
+                format!("'{field}' value '{v}' — one of {}", valid.join(" ")),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A present string field. JSON null and omission are both absent; any

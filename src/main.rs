@@ -1296,12 +1296,29 @@ enum JobAction {
         #[arg(long)]
         task_assignee: Option<String>,
     },
-    /// List jobs — non-terminal by default; `--all` or `--state` widen.
+    /// List jobs — non-terminal by default; `--all` widens and a
+    /// `--state` selection does too (it names states the default
+    /// hides). Repeatable — any of the values.
+    #[command(after_long_help = cadence_agent::filter::GRAMMAR)]
     List {
-        #[arg(long)]
-        state: Option<String>,
+        /// draft open done failed cancelled; repeatable — any of them.
+        #[arg(long, value_delimiter = ',')]
+        state: Vec<String>,
         #[arg(long)]
         all: bool,
+        /// Sort by id state title pm issue created updated; `-KEY`
+        /// descending.
+        #[arg(long, allow_hyphen_values = true)]
+        sort: Option<String>,
+        /// Keep only the first N rows.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Keep only these keys in each row (comma-joined).
+        #[arg(long, value_delimiter = ',')]
+        fields: Vec<String>,
+        /// Output is JSON already — accepted for grammar parity.
+        #[arg(long)]
+        json: bool,
     },
     /// Show a job: tasks with live kickoff state, drift flags, latest
     /// verdicts.
@@ -1452,12 +1469,28 @@ enum MonitorAction {
         auto_dispatch: bool,
     },
     /// List persistent monitor registrations and their separate delivery state.
-    List,
+    #[command(after_long_help = cadence_agent::filter::GRAMMAR)]
+    List {
+        /// Sort by id project owner monitoring heartbeat_at created
+        /// updated open_alerts; `-KEY` descending.
+        #[arg(long, allow_hyphen_values = true)]
+        sort: Option<String>,
+        /// Keep only the first N rows.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Keep only these keys in each row (comma-joined).
+        #[arg(long, value_delimiter = ',')]
+        fields: Vec<String>,
+        /// Output is JSON already — accepted for grammar parity.
+        #[arg(long)]
+        json: bool,
+    },
     /// Show one monitor's heartbeat, cursor, coverage, and alert counts.
     Show { monitor: String },
     /// Record an explicit caller heartbeat; this is not a worker-health claim.
     Heartbeat { monitor: String },
     /// List durable local alerts for one monitor.
+    #[command(after_long_help = cadence_agent::filter::GRAMMAR)]
     Alerts {
         monitor: String,
         #[arg(long, default_value_t = 0)]
@@ -1466,6 +1499,16 @@ enum MonitorAction {
         open: bool,
         #[arg(long, default_value_t = 100)]
         limit: i64,
+        /// Sort by seq monitor task kind state created updated;
+        /// `-KEY` descending.
+        #[arg(long, allow_hyphen_values = true)]
+        sort: Option<String>,
+        /// Keep only these keys in each row (comma-joined).
+        #[arg(long, value_delimiter = ',')]
+        fields: Vec<String>,
+        /// Output is JSON already — accepted for grammar parity.
+        #[arg(long)]
+        json: bool,
     },
     /// Acknowledge one local alert.
     Ack {
@@ -1850,11 +1893,44 @@ enum AgentAction {
     /// resolves to a registered agent) the output is scoped to the
     /// caller's group — the group root plus agents whose
     /// `params.upstream` names it — and the root row is marked
-    /// `"group_root": true`.
+    /// `"group_root": true`. Filters narrow that scope, never widen
+    /// it. Value flags repeat and comma-join and match ANY of their
+    /// values; different flags AND.
+    #[command(after_long_help = cadence_agent::filter::GRAMMAR)]
     List {
         /// Show every agent even inside a cadence pane.
         #[arg(long)]
         all: bool,
+        /// Agent state (starting idle busy waiting_input attention
+        /// stopping stopped offline); repeatable — daemon-side.
+        #[arg(long, value_delimiter = ',')]
+        state: Vec<String>,
+        /// Provider (codex claude devin cursor fake inbox …);
+        /// repeatable — daemon-side.
+        #[arg(long, value_delimiter = ',')]
+        provider: Vec<String>,
+        /// Endpoint kind (managed managed-ws pty cloud fake inbox);
+        /// repeatable — daemon-side.
+        #[arg(long, value_delimiter = ',')]
+        kind: Vec<String>,
+        /// Tracker project the agent's `cwd` resolves to; repeatable —
+        /// an agent whose cwd maps to no project never matches. Needs
+        /// a PM dir.
+        #[arg(long, value_delimiter = ',')]
+        project: Vec<String>,
+        /// Sort by alias state provider kind role project cwd model;
+        /// `-KEY` descending.
+        #[arg(long, allow_hyphen_values = true)]
+        sort: Option<String>,
+        /// Keep only the first N rows.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Keep only these keys in each row (comma-joined).
+        #[arg(long, value_delimiter = ',')]
+        fields: Vec<String>,
+        /// Output is JSON already — accepted for grammar parity.
+        #[arg(long)]
+        json: bool,
     },
     /// Show one agent, its messages and event cursor.
     Show { alias: String },
@@ -2055,15 +2131,52 @@ enum AgentAction {
 
 #[derive(Subcommand)]
 enum ReportAction {
-    /// List open intake: issues tagged `intake` that are not
-    /// done/dropped, newest first.
+    /// The report ledger: open intake issues plus `cadence.report/2`
+    /// task reports under each ticket's `reports/` — newest first.
+    /// Bare `ls` lists open rows (open intake, unanswered questions);
+    /// with filter flags it queries the record — open rows plus the
+    /// done/blocked/answer/verdict records, which have no open state.
+    /// Value flags repeat and comma-join and match ANY of their
+    /// values; different flags AND.
+    #[command(after_long_help = cadence_agent::filter::GRAMMAR)]
     Ls {
-        /// Filter to one report kind.
-        #[arg(long, value_enum)]
-        kind: Option<cadence_agent::issue::report::Kind>,
-        /// Filter to one project key.
+        /// question|feedback|idea|bug (intake) or done|question|
+        /// blocked|answer|verdict (task reports); repeatable.
+        #[arg(long, value_delimiter = ',')]
+        kind: Vec<String>,
+        /// Intake issue id, or the ticket a task report is filed on;
+        /// repeatable.
+        #[arg(long, value_delimiter = ',')]
+        ticket: Vec<String>,
+        /// Intake actor or task-report agent; repeatable.
+        #[arg(long, value_delimiter = ',')]
+        agent: Vec<String>,
+        /// Project key; repeatable.
+        #[arg(long, value_delimiter = ',')]
+        project: Vec<String>,
+        /// intake|task — which ledger a row comes from.
+        #[arg(long, value_delimiter = ',')]
+        source: Vec<String>,
+        /// Only strictly-open rows (open intake, unanswered
+        /// questions).
+        #[arg(long, conflicts_with = "all")]
+        open: bool,
+        /// Everything, including resolved rows.
         #[arg(long)]
-        project: Option<String>,
+        all: bool,
+        /// Sort by id at kind ticket agent project status source
+        /// created (an `at` alias); `-KEY` descending [default: -at].
+        #[arg(long, allow_hyphen_values = true)]
+        sort: Option<String>,
+        /// Keep only the first N rows.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Keep only these keys in each row (comma-joined).
+        #[arg(long, value_delimiter = ',')]
+        fields: Vec<String>,
+        /// Output is JSON already — accepted for grammar parity.
+        #[arg(long)]
+        json: bool,
     },
     /// Print one intake issue — status, tags, body with context.
     Show { id: String },
@@ -2367,6 +2480,32 @@ enum PlanAction {
         /// The plan's epic id.
         epic: String,
     },
+    /// Every plan — one row per epic carrying one: state, proposer,
+    /// decision, ticket ids, size-weighted progress. Value flags
+    /// repeat and comma-join and match ANY of their values; different
+    /// flags AND.
+    #[command(after_long_help = cadence_agent::filter::GRAMMAR)]
+    Ls {
+        /// Plan state (proposed approved rejected); repeatable.
+        #[arg(long, value_delimiter = ',')]
+        state: Vec<String>,
+        /// Project key; repeatable.
+        #[arg(long, value_delimiter = ',')]
+        project: Vec<String>,
+        /// Sort by id project title status state proposed_by
+        /// proposed_at progress; `-KEY` descending.
+        #[arg(long, allow_hyphen_values = true)]
+        sort: Option<String>,
+        /// Keep only the first N rows.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Keep only these keys in each row (comma-joined).
+        #[arg(long, value_delimiter = ',')]
+        fields: Vec<String>,
+        /// Output is JSON already — accepted for grammar parity.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2450,10 +2589,40 @@ enum MasterAction {
 
 #[derive(Subcommand)]
 enum DeliveryAction {
-    /// Every ticket in the loop and where it stands.
+    /// Every ticket in the loop and where it stands. Value flags
+    /// repeat and comma-join and match ANY of their values; different
+    /// flags AND.
+    #[command(after_long_help = cadence_agent::filter::GRAMMAR)]
     Ls {
-        /// Only this ticket.
+        /// Only this ticket — `delivery ls X-1` is `--issue X-1`.
         issue: Option<String>,
+        /// Ticket ids; repeatable — any of them (joins the
+        /// positional).
+        #[arg(long = "issue", value_delimiter = ',')]
+        issues: Vec<String>,
+        /// Loop state (working reviewing unstaffed passed enqueued
+        /// escalated merged declined closed); repeatable.
+        #[arg(long, value_delimiter = ',')]
+        state: Vec<String>,
+        /// Tracker project key; repeatable.
+        #[arg(long, value_delimiter = ',')]
+        project: Vec<String>,
+        /// Only rows still in the loop (not merged/declined/closed).
+        #[arg(long)]
+        open: bool,
+        /// Sort by issue project state worker reviewer since
+        /// dispatched_at; `-KEY` descending [default: dispatched_at].
+        #[arg(long, allow_hyphen_values = true)]
+        sort: Option<String>,
+        /// Keep only the first N rows.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Keep only these keys in each row (comma-joined).
+        #[arg(long, value_delimiter = ',')]
+        fields: Vec<String>,
+        /// Output is JSON already — accepted for grammar parity.
+        #[arg(long)]
+        json: bool,
     },
     /// Read each open PR in the loop from GitHub (head, CI, diff stats)
     /// and hand it to the daemon; turn auto-merge off where the head
@@ -2487,8 +2656,62 @@ enum DeliveryAction {
 fn run_delivery(state_dir: &Path, action: DeliveryAction) -> Result<i32> {
     use cadence_agent::delivery;
     let result = match action {
-        DeliveryAction::Ls { issue } => {
-            client::rpc(state_dir, "delivery_list", json!({"issue": issue}))?
+        DeliveryAction::Ls {
+            issue,
+            issues,
+            state,
+            project,
+            open,
+            sort,
+            limit,
+            fields,
+            json: _,
+        } => {
+            let mut all = issues.clone();
+            if let Some(one) = &issue {
+                all.push(one.clone());
+            }
+            // The grammar: an unknown --project is an error naming the
+            // valid set, never an empty page. The daemon re-checks.
+            if !project.is_empty() {
+                let pm = cadence_agent::issue::Pm::open_default()?;
+                let keys: Vec<String> = cadence_agent::issue::project::list(&pm.dir)?
+                    .into_iter()
+                    .map(|p| p.key)
+                    .collect();
+                for want in &project {
+                    if !keys.iter().any(|k| k == want) {
+                        return Err(Error::rejected(format!(
+                            "Unknown --project '{want}' — known: {}",
+                            keys.join(" ")
+                        )));
+                    }
+                }
+            }
+            let mut out = client::rpc(
+                state_dir,
+                "delivery_list",
+                json!({"issues": all, "states": state, "projects": project,
+                       "open": open}),
+            )?;
+            shape_rows(
+                &mut out,
+                "records",
+                sort.as_deref(),
+                &[
+                    ("issue", "issue"),
+                    ("project", "project"),
+                    ("state", "state"),
+                    ("worker", "worker"),
+                    ("reviewer", "reviewer"),
+                    ("since", "since"),
+                    ("dispatched_at", "dispatched_at"),
+                ],
+                "issue",
+                limit,
+                &fields,
+            )?;
+            out
         }
         DeliveryAction::Sync { issue, watch } => match watch {
             None => delivery::sync(state_dir, issue.as_deref(), delivery::GH)?,
@@ -2672,6 +2895,17 @@ fn run_plan(state_dir: &Path, action: PlanAction) -> Result<i32> {
         PlanAction::Show { epic } => {
             let pm = cadence_agent::issue::Pm::open_default()?;
             cadence_agent::issue::plan::show(&pm, &epic)?
+        }
+        PlanAction::Ls {
+            state,
+            project,
+            sort,
+            limit,
+            fields,
+            json: _,
+        } => {
+            let pm = cadence_agent::issue::Pm::open_default()?;
+            cadence_agent::issue::plan::ls(&pm, &state, &project, sort.as_deref(), limit, &fields)?
         }
     };
     print_json(&result);
@@ -3355,7 +3589,7 @@ fn daemon_restart(
 /// one root; unset scopes like `agent list` (the caller's group inside
 /// a pane, everything otherwise).
 fn status_view(state_dir: &Path, group: Option<&str>) -> Result<Value> {
-    let mut agents = list_agents(state_dir, group.is_some())?["agents"]
+    let mut agents = list_agents(state_dir, &[], &[], &[], &[], group.is_some(), false)?["agents"]
         .as_array()
         .cloned()
         .unwrap_or_default();
@@ -4427,9 +4661,24 @@ fn home_dir() -> Result<PathBuf> {
 /// set, else its own alias; scoped output keeps the root plus agents
 /// whose upstream names it (groups are one level deep), and marks the
 /// root row `"group_root": true`. `CADENCE_ALIAS` unset or unresolvable
-/// falls back to the global list untouched.
-fn list_agents(state_dir: &Path, all: bool) -> Result<Value> {
-    let mut list = client::rpc(state_dir, "agent_list", json!({}))?;
+/// falls back to the global list untouched. `states`/`providers`/`kinds`
+/// filter daemon-side; `projects` filters client-side on the cwd→project
+/// mapping (the daemon never opens the PM dir). Filters narrow the scope,
+/// never widen it.
+fn list_agents(
+    state_dir: &Path,
+    states: &[String],
+    providers: &[String],
+    kinds: &[String],
+    projects: &[String],
+    all: bool,
+    stamp_project: bool,
+) -> Result<Value> {
+    let mut list = client::rpc(
+        state_dir,
+        "agent_list",
+        json!({"states": states, "providers": providers, "kinds": kinds}),
+    )?;
     // Group decoration on every row: "group" names the root (upstream
     // when wired, else the row's own alias) and roots carry
     // "group_root": true — consumers can render the tree without
@@ -4452,22 +4701,63 @@ fn list_agents(state_dir: &Path, all: bool) -> Result<Value> {
                 .map(|s| s["agent"].clone())
         })
     };
-    let Some(caller) = caller else {
-        return Ok(list);
-    };
-    let root = caller["params"]["upstream"]
-        .as_str()
-        .or_else(|| caller["alias"].as_str())
-        .unwrap_or_default()
-        .to_string();
-    let Some(agents) = list["agents"].as_array_mut() else {
-        return Ok(list);
-    };
-    agents.retain(|a| {
-        a["alias"].as_str() == Some(root.as_str())
-            || a["params"]["upstream"].as_str() == Some(root.as_str())
-    });
+    if let Some(caller) = caller {
+        let root = caller["params"]["upstream"]
+            .as_str()
+            .or_else(|| caller["alias"].as_str())
+            .unwrap_or_default()
+            .to_string();
+        if let Some(agents) = list["agents"].as_array_mut() {
+            agents.retain(|a| {
+                a["alias"].as_str() == Some(root.as_str())
+                    || a["params"]["upstream"].as_str() == Some(root.as_str())
+            });
+        }
+    }
+    if !projects.is_empty() || stamp_project {
+        stamp_agent_projects(&mut list)?;
+    }
+    if !projects.is_empty() {
+        let pm = cadence_agent::issue::Pm::open_default()?;
+        let known: Vec<String> = cadence_agent::issue::project::list(&pm.dir)
+            .unwrap_or_default()
+            .iter()
+            .map(|p| p.key.clone())
+            .collect();
+        for p in projects {
+            if !known.iter().any(|k| k == p) {
+                return Err(Error::rejected(format!(
+                    "Unknown --project '{p}' — known: {}",
+                    known.join(" ")
+                )));
+            }
+        }
+        if let Some(agents) = list["agents"].as_array_mut() {
+            agents.retain(|a| {
+                a["project"]
+                    .as_str()
+                    .is_some_and(|p| projects.iter().any(|want| want == p))
+            });
+        }
+    }
     Ok(list)
+}
+
+/// Stamp each agent row's `"project"` with the tracker project its cwd
+/// resolves to (null when it resolves to none). Needs the PM dir — which
+/// `agent list` does not otherwise require — so it opens only when a
+/// filter or sort reads the key.
+fn stamp_agent_projects(list: &mut Value) -> Result<()> {
+    use cadence_agent::issue::{self, project};
+    let pm = issue::Pm::open_default()?;
+    if let Some(agents) = list["agents"].as_array_mut() {
+        for a in agents.iter_mut() {
+            let cwd = a["cwd"].as_str().unwrap_or_default();
+            let key = project::key_for_cwd(&pm.dir, Path::new(cwd));
+            a["project"] = json!(key);
+        }
+    }
+    Ok(())
 }
 
 /// `cadence agent resume`: provider-launch treatment for a reopen —
@@ -4537,6 +4827,30 @@ fn print_json(value: &Value) {
         "{}",
         serde_json::to_string_pretty(value).unwrap_or_default()
     );
+}
+
+/// Sort/limit/fields on `out[key]` — the shared list-grammar tail for
+/// daemon-RPC payloads, which already arrive as JSON. `names` is the
+/// documented sort-key set (`flag name`, `row key`); without `--sort`
+/// the wire order stands.
+fn shape_rows(
+    out: &mut Value,
+    key: &str,
+    sort: Option<&str>,
+    names: &[(&str, &str)],
+    tie: &str,
+    limit: Option<usize>,
+    fields: &[String],
+) -> Result<()> {
+    let Some(rows) = out.get_mut(key).and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    if let Some(spec) = sort {
+        cadence_agent::filter::sort_rows(rows, spec, names, tie)?;
+    }
+    cadence_agent::filter::apply_limit(rows, limit);
+    cadence_agent::filter::apply_fields(rows, fields)?;
+    Ok(())
 }
 
 /// An agent row's group root: its `params.upstream` when wired, else its
@@ -5219,7 +5533,42 @@ fn run() -> Result<i32> {
                         }),
                     )?
                 }
-                AgentAction::List { all } => list_agents(&state_dir, all)?,
+                AgentAction::List {
+                    all,
+                    state,
+                    provider,
+                    kind,
+                    project,
+                    sort,
+                    limit,
+                    fields,
+                    json: _,
+                } => {
+                    // Stamp rows with their tracker project when the filter or
+                    // the sort reads it.
+                    let stamp = !project.is_empty() || sort.as_deref() == Some("project");
+                    let mut out =
+                        list_agents(&state_dir, &state, &provider, &kind, &project, all, stamp)?;
+                    shape_rows(
+                        &mut out,
+                        "agents",
+                        sort.as_deref(),
+                        &[
+                            ("alias", "alias"),
+                            ("state", "state"),
+                            ("provider", "provider"),
+                            ("kind", "endpoint_kind"),
+                            ("role", "role"),
+                            ("project", "project"),
+                            ("cwd", "cwd"),
+                            ("model", "model"),
+                        ],
+                        "alias",
+                        limit,
+                        &fields,
+                    )?;
+                    out
+                }
                 AgentAction::Show { alias } => {
                     client::rpc(&state_dir, "agent_show", json!({"alias": alias}))?
                 }
@@ -6093,8 +6442,34 @@ fn run() -> Result<i32> {
             }
             let pm = cadence_agent::issue::Pm::open_default()?;
             match action {
-                Some(ReportAction::Ls { kind, project }) => {
-                    print_json(&report::ls(&pm, kind, project.as_deref())?);
+                Some(ReportAction::Ls {
+                    kind,
+                    ticket,
+                    agent,
+                    project,
+                    source,
+                    open,
+                    all,
+                    sort,
+                    limit,
+                    fields,
+                    json: _,
+                }) => {
+                    print_json(&report::ls(
+                        &pm,
+                        &report::LsFilter {
+                            kinds: kind,
+                            tickets: ticket,
+                            agents: agent,
+                            projects: project,
+                            sources: source,
+                            open,
+                            all,
+                            sort,
+                            limit,
+                            fields,
+                        },
+                    )?);
                 }
                 Some(ReportAction::Show { id }) => {
                     print_json(&report::show(&pm, &id)?);
@@ -6496,7 +6871,33 @@ fn run_monitor(state_dir: &Path, action: &MonitorAction) -> Result<i32> {
                        "auto_dispatch_enabled": auto_dispatch}),
             )?);
         }
-        MonitorAction::List => print_json(&rpc("monitor_list", json!({}))?),
+        MonitorAction::List {
+            sort,
+            limit,
+            fields,
+            json: _,
+        } => {
+            let mut out = rpc("monitor_list", json!({}))?;
+            shape_rows(
+                &mut out,
+                "monitors",
+                sort.as_deref(),
+                &[
+                    ("id", "id"),
+                    ("project", "project"),
+                    ("owner", "owner"),
+                    ("monitoring", "monitoring"),
+                    ("heartbeat_at", "heartbeat_at"),
+                    ("open_alerts", "open_alerts"),
+                    ("created", "created"),
+                    ("updated", "updated"),
+                ],
+                "id",
+                *limit,
+                fields,
+            )?;
+            print_json(&out);
+        }
         MonitorAction::Show { monitor } => {
             print_json(&rpc("monitor_show", json!({"monitor": monitor}))?);
         }
@@ -6508,12 +6909,33 @@ fn run_monitor(state_dir: &Path, action: &MonitorAction) -> Result<i32> {
             after,
             open,
             limit,
+            sort,
+            fields,
+            json: _,
         } => {
-            print_json(&rpc(
+            let mut out = rpc(
                 "monitor_alerts",
                 json!({"monitor": monitor, "after": after,
                        "open": open, "limit": limit}),
-            )?);
+            )?;
+            shape_rows(
+                &mut out,
+                "alerts",
+                sort.as_deref(),
+                &[
+                    ("seq", "seq"),
+                    ("monitor", "monitor"),
+                    ("task", "task"),
+                    ("kind", "kind"),
+                    ("state", "state"),
+                    ("created", "created"),
+                    ("updated", "updated"),
+                ],
+                "seq",
+                None,
+                fields,
+            )?;
+            print_json(&out);
         }
         MonitorAction::Ack { monitor, alert } => {
             print_json(&rpc(
@@ -6589,8 +7011,33 @@ fn run_job(state_dir: &Path, action: &JobAction) -> Result<i32> {
                        "task_assignee": task_assignee}),
             )?);
         }
-        JobAction::List { state, all } => {
-            print_json(&rpc("job_list", json!({"state": state, "all": all}))?);
+        JobAction::List {
+            state,
+            all,
+            sort,
+            limit,
+            fields,
+            json: _,
+        } => {
+            let mut out = rpc("job_list", json!({"states": state, "all": all}))?;
+            shape_rows(
+                &mut out,
+                "jobs",
+                sort.as_deref(),
+                &[
+                    ("id", "id"),
+                    ("state", "state"),
+                    ("title", "title"),
+                    ("pm", "pm"),
+                    ("issue", "issue"),
+                    ("created", "created"),
+                    ("updated", "updated"),
+                ],
+                "id",
+                *limit,
+                fields,
+            )?;
+            print_json(&out);
         }
         JobAction::Show { job } => {
             print_json(&rpc("job_show", json!({"job": job}))?);

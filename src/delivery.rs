@@ -79,6 +79,25 @@ impl State {
     pub fn terminal(self) -> bool {
         matches!(self, State::Merged | State::Declined | State::Closed)
     }
+
+    /// Every state name — the `delivery ls --state` vocabulary
+    /// (CAD-437).
+    pub fn all_str() -> Vec<&'static str> {
+        [
+            State::Working,
+            State::Reviewing,
+            State::Unstaffed,
+            State::Passed,
+            State::Enqueued,
+            State::Escalated,
+            State::Merged,
+            State::Declined,
+            State::Closed,
+        ]
+        .iter()
+        .map(|s| s.as_str())
+        .collect()
+    }
 }
 
 /// One recorded verdict.

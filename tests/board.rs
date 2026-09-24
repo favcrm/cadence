@@ -4969,6 +4969,214 @@ fn issue_ls_filters_and_epics_match_the_api() {
     assert!(!ok);
 }
 
+/// CAD-437: the shared list grammar on `issue ls` — repeatable any-of
+/// value flags, AND across flags, unknown values are errors, and the
+/// sort/limit/fields tail.
+#[test]
+fn issue_ls_cad437_grammar() {
+    let (pm, state) = tags_fixture();
+    let (pm, state) = (pm.path(), state.path());
+    let run = |args: &[&str]| {
+        let (ok, out) = cli(pm, state, args);
+        assert!(ok, "{args:?}: {out}");
+        out
+    };
+    let ids = |v: &Value| -> Vec<String> {
+        let mut ids: Vec<String> = v["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["id"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        ids
+    };
+
+    // --type: X-1/X-2 are epics by the has-children rule; the rest are
+    // tasks. Any-of across a comma-joined value.
+    let out = run(&["issue", "ls", "--type", "epic", "--json"]);
+    assert_eq!(ids(&out), ["X-1", "X-2"]);
+    let out = run(&["issue", "ls", "--type", "task,bug", "--json"]);
+    assert_eq!(ids(&out).len(), 6, "{out}");
+
+    // --milestone: any-of over the field value (the `m<n>-…` tag
+    // mapping is unit-tested in board.rs).
+    cli(pm, state, &["issue", "set", "X-7", "milestone=m2"]);
+    cli(pm, state, &["issue", "set", "X-8", "milestone=m3"]);
+    let out = run(&["issue", "ls", "--milestone", "m2", "--json"]);
+    assert_eq!(ids(&out), ["X-7"]);
+    let out = run(&[
+        "issue",
+        "ls",
+        "--milestone",
+        "m3",
+        "--milestone",
+        "m2",
+        "--json",
+    ]);
+    assert_eq!(ids(&out), ["X-7", "X-8"]);
+
+    // --plan on a board without plans: `any` selects none; a bad
+    // state is an error, not an empty list.
+    let out = run(&["issue", "ls", "--plan", "any", "--json"]);
+    assert_eq!(ids(&out), Vec::<String>::new());
+    let (ok, _, err) = cli_out_err(pm, state, &["issue", "ls", "--plan", "bogus", "--json"]);
+    assert!(!ok && err.contains("--plan"), "{err}");
+
+    // --since/--until bound the last-update time (commit clock here).
+    let out = run(&["issue", "ls", "--since", "0", "--json"]);
+    assert_eq!(ids(&out).len(), 8);
+    let out = run(&["issue", "ls", "--since", "9999999999", "--json"]);
+    assert_eq!(ids(&out), Vec::<String>::new());
+    let out = run(&["issue", "ls", "--until", "0", "--json"]);
+    assert_eq!(ids(&out), Vec::<String>::new());
+    let (ok, _, err) = cli_out_err(pm, state, &["issue", "ls", "--since", "whenever"]);
+    assert!(!ok && err.contains("--since"), "{err}");
+
+    // --sort descends on `-KEY`; the id breaks ties. --limit caps.
+    let (ok, out) = cli(pm, state, &["issue", "ls", "--sort", "-id", "--json"]);
+    assert!(ok, "{out}");
+    let first = out["issues"][0]["id"].as_str().unwrap();
+    assert_eq!(first, "X-8", "{out}");
+    let out = run(&[
+        "issue", "ls", "--sort", "priority", "--limit", "2", "--json",
+    ]);
+    assert_eq!(ids(&out).len(), 2, "{out}");
+    let (ok, _, err) = cli_out_err(pm, state, &["issue", "ls", "--sort", "bogus"]);
+    assert!(!ok && err.contains("--sort"), "{err}");
+
+    // --fields keeps only the named keys — and needs --json.
+    let out = run(&[
+        "issue",
+        "ls",
+        "--status",
+        "doing",
+        "--fields",
+        "id,status",
+        "--json",
+    ]);
+    assert_eq!(
+        out["issues"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+        ["id", "status"]
+    );
+    let (ok, _, err) = cli_out_err(pm, state, &["issue", "ls", "--fields", "nope", "--json"]);
+    assert!(!ok && err.contains("--fields"), "{err}");
+    let (ok, _, err) = cli_out_err(pm, state, &["issue", "ls", "--fields", "id"]);
+    assert!(!ok && err.contains("--json"), "{err}");
+
+    // Unknown values across the new flags are errors.
+    for args in [
+        &["issue", "ls", "--type", "widget"][..],
+        &["issue", "ls", "--milestone", "BAD TAG"][..],
+        &["issue", "ls", "--health", "sunny"][..],
+        &["issue", "ls", "--stage", "nonsense"][..],
+    ] {
+        let (ok, _, err) = cli_out_err(pm, state, args);
+        assert!(!ok, "{args:?} must fail: {err}");
+    }
+    // --stage/--health are live-computed — refused under --at.
+    let (ok, _, err) = cli_out_err(
+        pm,
+        state,
+        &["issue", "ls", "--at", "HEAD", "--health", "on_track"],
+    );
+    assert!(!ok && err.contains("--at"), "{err}");
+}
+
+/// CAD-437: `epic ls`/`milestone ls` share the grammar — any-of flags,
+/// sort/limit/fields, unknown values error.
+#[test]
+fn epic_and_milestone_ls_cad437_grammar() {
+    let (pm, state) = tags_fixture();
+    let (pm, state) = (pm.path(), state.path());
+    let ids = |v: &Value, key: &str| -> Vec<String> {
+        let mut ids: Vec<String> = v[key]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["id"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        ids
+    };
+
+    // Every epic carries a work block with a stage and health.
+    let (ok, out) = cli(pm, state, &["issue", "epic", "ls", "--json"]);
+    assert!(ok, "{out}");
+    let epics = out["epics"].as_array().unwrap();
+    assert_eq!(epics.len(), 2);
+    let stage = epics[0]["work"]["stage"]["id"].as_str().unwrap_or("?");
+    assert!(!stage.is_empty() && stage != "?", "{epics:?}");
+
+    // --stage/--health/--milestone are any-of; AND across flags.
+    let (ok, out) = cli(
+        pm,
+        state,
+        &[
+            "issue",
+            "epic",
+            "ls",
+            "--health",
+            "on_track,at_risk",
+            "--json",
+        ],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(ids(&out, "epics").len(), 2);
+    let (ok, out) = cli(
+        pm,
+        state,
+        &["issue", "epic", "ls", "--health", "stalled", "--json"],
+    );
+    assert!(ok);
+    assert_eq!(ids(&out, "epics"), Vec::<String>::new());
+    let (ok, out) = cli(
+        pm,
+        state,
+        &[
+            "issue", "epic", "ls", "--sort", "-id", "--limit", "1", "--json",
+        ],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(ids(&out, "epics"), ["X-2"]);
+    let (ok, _, err) = cli_out_err(
+        pm,
+        state,
+        &["issue", "epic", "ls", "--health", "sunny", "--json"],
+    );
+    assert!(!ok && err.contains("--health"), "{err}");
+    let (ok, _, err) = cli_out_err(
+        pm,
+        state,
+        &["issue", "epic", "ls", "--fields", "nope", "--json"],
+    );
+    assert!(!ok && err.contains("--fields"), "{err}");
+
+    // Milestones: name one via the field, filter + shape rows.
+    cli(pm, state, &["issue", "set", "X-7", "milestone=m9"]);
+    let (ok, out) = cli(pm, state, &["milestone", "ls", "--json"]);
+    assert!(ok, "{out}");
+    let ms = out["milestones"].as_array().unwrap();
+    assert!(!ms.is_empty(), "{out}");
+    let (ok, out) = cli(
+        pm,
+        state,
+        &["milestone", "ls", "--milestone", "m9", "--json"],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(ids(&out, "milestones"), ["m9"]);
+    let (ok, _, err) = cli_out_err(
+        pm,
+        state,
+        &["milestone", "ls", "--health", "sunny", "--json"],
+    );
+    assert!(!ok && err.contains("--health"), "{err}");
+}
+
 #[test]
 fn issue_trailer_prints_and_validates() {
     let (pm, state, _repo, _port, _board) = commits_fixture();
@@ -9170,6 +9378,102 @@ fn memory_absent_dir_empty_unreadable_dir_errors() {
             .contains("cannot list"),
         "{v}"
     );
+}
+
+/// CAD-437: `memory ls` shares the grammar — repeatable any-of value
+/// flags, AND across them (with component/path scope semantics kept),
+/// unknown values error, sort/limit/fields tail.
+#[test]
+fn memory_ls_cad437_grammar() {
+    let (_t, pm, state, _repo) = mem_fx();
+    legacy_memory(
+        &pm,
+        "a-rule",
+        "rule",
+        &["--scope-project"],
+        "accepted",
+        None,
+    );
+    legacy_memory(
+        &pm,
+        "a-gotcha",
+        "gotcha",
+        &["--scope-component", "daemon"],
+        "accepted",
+        None,
+    );
+    legacy_memory(
+        &pm,
+        "old-rule",
+        "rule",
+        &["--scope-component", "other"],
+        "superseded",
+        None,
+    );
+    let slugs = |v: &Value| -> Vec<String> {
+        let mut s: Vec<String> = v["memories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["slug"].as_str().unwrap().to_string())
+            .collect();
+        s.sort();
+        s
+    };
+
+    // Any-of within a flag (repeat or comma-join); AND across flags.
+    let (ok, out) = mem_cli(&pm, &state, &["ls", "--type", "rule,gotcha", "--json"]);
+    assert!(ok, "{out}");
+    assert_eq!(slugs(&out).len(), 3, "{out}");
+    let (ok, out) = mem_cli(
+        &pm,
+        &state,
+        &["ls", "--type", "rule", "--status", "accepted", "--json"],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(slugs(&out), ["a-rule"], "{out}");
+    // Scoped axes keep their retrieval meaning: a component filter
+    // still passes project-wide memories.
+    let (ok, out) = mem_cli(&pm, &state, &["ls", "--component", "daemon", "--json"]);
+    assert!(ok, "{out}");
+    assert_eq!(slugs(&out), ["a-gotcha", "a-rule"], "{out}");
+    let (ok, out) = mem_cli(
+        &pm,
+        &state,
+        &[
+            "ls",
+            "--component",
+            "daemon",
+            "--status",
+            "superseded",
+            "--json",
+        ],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(slugs(&out), Vec::<String>::new(), "{out}");
+
+    // Unknown vocabularies error; so do unknown sorts and fields.
+    let (ok, _, err) = cli_out_err(&pm, &state, &["memory", "ls", "--type", "zzz"]);
+    assert!(!ok && err.contains("gotcha"), "{err}");
+    let (ok, _, err) = cli_out_err(&pm, &state, &["memory", "ls", "--status", "zzz"]);
+    assert!(!ok && err.contains("accepted"), "{err}");
+    let (ok, _, err) = cli_out_err(&pm, &state, &["memory", "ls", "--sort", "zzz", "--json"]);
+    assert!(!ok && err.contains("--sort"), "{err}");
+    let (ok, _, err) = cli_out_err(&pm, &state, &["memory", "ls", "--fields", "id"]);
+    assert!(!ok && err.contains("--json"), "{err}");
+
+    // The tail: sort, limit, fields.
+    let (ok, out) = mem_cli(
+        &pm,
+        &state,
+        &["ls", "--sort", "-slug", "--limit", "1", "--json"],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(slugs(&out), ["old-rule"], "{out}");
+    let (ok, out) = mem_cli(&pm, &state, &["ls", "--fields", "slug,type", "--json"]);
+    assert!(ok, "{out}");
+    let keys: Vec<&String> = out["memories"][0].as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["slug", "type"], "{out}");
 }
 
 /// A hand-edited over-complex path glob bypasses write-time

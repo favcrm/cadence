@@ -570,17 +570,24 @@ pub fn card_json_rev(view: &View, rev: Value) -> Value {
 }
 
 /// The slices `issue ls` and `GET /api/issues` share. Every set field
-/// must match (AND); `tags` must all be present, `statuses` is any-of
-/// and compares the derived status.
+/// must match (AND); `tags` must all be present (the grammar's
+/// documented exception — CAD-437); every other field is any-of over
+/// its repeated values. `statuses` compares the derived status.
 #[derive(Clone, Debug, Default)]
 pub struct Filter {
     pub tags: Vec<String>,
-    /// Children of this issue.
-    pub epic: Option<String>,
-    pub owner: Option<String>,
+    /// Children of any of these issues.
+    pub epics: Vec<String>,
+    pub owners: Vec<String>,
     pub statuses: Vec<String>,
-    pub component: Option<String>,
-    pub priority: Option<String>,
+    pub components: Vec<String>,
+    pub priorities: Vec<String>,
+    /// Effective item types (`model::item_type`).
+    pub types: Vec<String>,
+    /// The `milestone` field or `m<n>` tag (`model::milestone_of`).
+    pub milestones: Vec<String>,
+    /// Plan states, or `any` for every issue carrying a plan.
+    pub plans: Vec<String>,
     /// Not done and not dropped.
     pub open: bool,
 }
@@ -597,11 +604,29 @@ impl Filter {
         for status in &self.statuses {
             model::check_status(status)?;
         }
-        if let Some(priority) = &self.priority {
+        for priority in &self.priorities {
             model::check_priority(priority)?;
         }
-        if let Some(epic) = &self.epic {
+        for epic in &self.epics {
             model::check_id(epic)?;
+        }
+        for kind in &self.types {
+            model::check_type(kind)?;
+        }
+        for m in &self.milestones {
+            if !model::valid_tag(m) {
+                return Err(Error::rejected(format!(
+                    "Invalid milestone filter '{m}' — a milestone id like m1"
+                )));
+            }
+        }
+        for state in &self.plans {
+            if state != "any" && !model::PLAN_STATES.contains(&state.as_str()) {
+                return Err(Error::rejected(format!(
+                    "Unknown --plan '{state}' — one of {} or any",
+                    model::PLAN_STATES.join(" ")
+                )));
+            }
         }
         Ok(())
     }
@@ -610,22 +635,68 @@ impl Filter {
         let f = &view.issue.front;
         let open = !matches!(view.status.as_str(), "done" | "dropped");
         self.tags.iter().all(|t| f.tags.contains(t))
-            && self
-                .epic
-                .as_ref()
-                .is_none_or(|e| f.parent.as_ref() == Some(e))
-            && self
-                .owner
-                .as_ref()
-                .is_none_or(|o| f.owner.as_ref() == Some(o))
+            && (self.epics.is_empty() || f.parent.as_ref().is_some_and(|p| self.epics.contains(p)))
+            && (self.owners.is_empty() || f.owner.as_ref().is_some_and(|o| self.owners.contains(o)))
             && (self.statuses.is_empty() || self.statuses.contains(&view.status))
-            && self
-                .component
-                .as_ref()
-                .is_none_or(|c| f.component.as_ref() == Some(c))
-            && self.priority.as_ref().is_none_or(|p| &f.priority == p)
+            && (self.components.is_empty()
+                || f.component
+                    .as_ref()
+                    .is_some_and(|c| self.components.contains(c)))
+            && (self.priorities.is_empty() || self.priorities.contains(&f.priority))
+            && (self.types.is_empty()
+                || self
+                    .types
+                    .iter()
+                    .any(|t| *t == model::item_type(f, view.container)))
+            && (self.milestones.is_empty()
+                || model::milestone_of(f).is_some_and(|(m, _)| self.milestones.contains(&m)))
+            && (self.plans.is_empty()
+                || f.plan
+                    .as_ref()
+                    .is_some_and(|pl| self.plans.iter().any(|p| p == "any" || pl.state == *p)))
             && (!self.open || open)
     }
+}
+
+/// Issue id → epoch of the newest tracker commit touching its folder,
+/// bounded by `rev` (`None` = HEAD). One `git log`; a PM dir without
+/// git (or a timed-out log) yields an empty map and callers fall back
+/// to `created`.
+pub fn updated_map(pm_dir: &Path, rev: Option<&str>) -> HashMap<String, i64> {
+    let mut args: Vec<String> = vec![
+        "-C".into(),
+        pm_dir.display().to_string(),
+        "log".into(),
+        "--format=%ct".into(),
+        "--name-only".into(),
+    ];
+    if let Some(rev) = rev {
+        args.push(rev.into());
+    }
+    let out = crate::reaper::output(std::process::Command::new("git").args(&args));
+    let Ok(out) = out else { return HashMap::new() };
+    if !out.status.success() {
+        return HashMap::new();
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut map = HashMap::new();
+    let mut epoch = 0i64;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Ok(e) = line.parse::<i64>() {
+            epoch = e;
+            continue;
+        }
+        // <project>/<id>/<file> — the issue id is the second segment.
+        let mut parts = line.split('/');
+        let (Some(_project), Some(id), Some(_)) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
+        if model::valid_id(id) {
+            map.entry(id.to_string()).or_insert(epoch);
+        }
+    }
+    map
 }
 
 /// One epic — an issue with children — with its children's progress:
@@ -1113,5 +1184,151 @@ mod tests {
         assert_eq!(v.status_source, "file");
         assert_eq!(v.blocked_reason, Some("job blocked"));
         assert_eq!(card_json(v)["blocked_reason"], "job blocked");
+    }
+
+    // CAD-437: the list grammar — any-of inside one field, AND across
+    // fields, `--tag` all-of as the documented exception, and a value
+    // that could never match is an error not an empty page.
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn filter() -> Filter {
+        Filter {
+            tags: vec![],
+            epics: vec![],
+            owners: vec![],
+            statuses: vec![],
+            components: vec![],
+            priorities: vec![],
+            types: vec![],
+            milestones: vec![],
+            plans: vec![],
+            open: false,
+        }
+    }
+
+    fn matching(f: &Filter, issues: Vec<Issue>) -> Vec<String> {
+        let mut ids: Vec<String> = views(Path::new("/no-notes"), issues)
+            .iter()
+            .filter(|v| f.matches(v))
+            .map(|v| v.issue.front.id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn filter_any_of_within_and_across() {
+        let mut a = issue("CAD-1", "doing");
+        a.front.owner = Some("pm".to_string());
+        let mut b = issue("CAD-2", "review");
+        b.front.owner = Some("w1".to_string());
+        let c = issue("CAD-3", "backlog");
+        let mk = || vec![a.clone(), b.clone(), c.clone()];
+
+        // Any-of inside one field.
+        let mut f = filter();
+        f.statuses = strs(&["doing", "review"]);
+        assert_eq!(matching(&f, mk()), vec!["CAD-1", "CAD-2"]);
+
+        // AND across fields.
+        f.owners = strs(&["w1"]);
+        assert_eq!(matching(&f, mk()), vec!["CAD-2"]);
+
+        // Every other value field is any-of too.
+        let mut p1 = issue("CAD-4", "doing");
+        p1.front.priority = "P1".to_string();
+        let mut f = filter();
+        f.priorities = strs(&["P1", "P3"]);
+        assert_eq!(matching(&f, vec![p1, c.clone()]), vec!["CAD-4"]);
+    }
+
+    #[test]
+    fn filter_tag_all_of_is_the_exception() {
+        let mut a = issue("CAD-1", "doing");
+        a.front.tags = strs(&["api", "ui"]);
+        let mut b = issue("CAD-2", "doing");
+        b.front.tags = strs(&["api"]);
+        let mk = || vec![a.clone(), b.clone()];
+
+        let mut f = filter();
+        f.tags = strs(&["api", "ui"]);
+        assert_eq!(matching(&f, mk()), vec!["CAD-1"]);
+        f.tags = strs(&["api"]);
+        assert_eq!(matching(&f, mk()), vec!["CAD-1", "CAD-2"]);
+    }
+
+    #[test]
+    fn filter_epics_types_milestones_plans_open() {
+        let mut epic = issue("CAD-1", "doing");
+        epic.front.plan = Some(model::Plan {
+            state: "approved".to_string(),
+            proposed_by: "master".to_string(),
+            proposed_at: "2026-09-17T00:00:00Z".to_string(),
+            tickets: vec![],
+            decided_by: None,
+            decided_at: None,
+            reason: None,
+        });
+        let mut child = issue("CAD-2", "doing");
+        child.front.parent = Some("CAD-1".to_string());
+        child.front.milestone = Some("m2".to_string());
+        let mut tagged = issue("CAD-3", "done");
+        tagged.front.tags = strs(&["m3-backend"]);
+        let mk = || vec![epic.clone(), child.clone(), tagged.clone()];
+
+        // --epic names the children of any listed issue.
+        let mut f = filter();
+        f.epics = strs(&["CAD-1"]);
+        assert_eq!(matching(&f, mk()), vec!["CAD-2"]);
+
+        // --type epic: explicit field or the has-children/plan rule.
+        let mut f = filter();
+        f.types = strs(&["epic"]);
+        assert_eq!(matching(&f, mk()), vec!["CAD-1"]);
+
+        // --milestone: the field, and an `m<n>-…` tag normalized to m<n>.
+        let mut f = filter();
+        f.milestones = strs(&["m2"]);
+        assert_eq!(matching(&f, mk()), vec!["CAD-2"]);
+        f.milestones = strs(&["m3"]);
+        assert_eq!(matching(&f, mk()), vec!["CAD-3"]);
+
+        // --plan any + a state; the record carries no open state rules.
+        let mut f = filter();
+        f.plans = strs(&["any"]);
+        assert_eq!(matching(&f, mk()), vec!["CAD-1"]);
+        f.plans = strs(&["proposed"]);
+        assert_eq!(matching(&f, mk()), Vec::<String>::new());
+
+        // --open hides done/dropped.
+        let mut f = filter();
+        f.open = true;
+        assert_eq!(matching(&f, mk()), vec!["CAD-1", "CAD-2"]);
+    }
+
+    #[test]
+    fn filter_validate_rejects_values_that_cannot_match() {
+        let mut f = filter();
+        f.statuses = strs(&["doing", "bogus"]);
+        assert!(f.validate().is_err());
+        let mut f = filter();
+        f.priorities = strs(&["P9"]);
+        assert!(f.validate().is_err());
+        let mut f = filter();
+        f.types = strs(&["widget"]);
+        assert!(f.validate().is_err());
+        let mut f = filter();
+        f.plans = strs(&["maybe"]);
+        assert!(f.validate().is_err());
+        let mut f = filter();
+        f.plans = strs(&["any", "proposed"]);
+        f.validate().unwrap();
+        let mut f = filter();
+        f.epics = strs(&["not an id"]);
+        assert!(f.validate().is_err());
+        filter().validate().unwrap();
     }
 }
