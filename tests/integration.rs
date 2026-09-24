@@ -39637,7 +39637,10 @@ fn cad390_a_reused_managed_provider_pid_never_attributes_a_board_write() {
     // No recorded start: unprovable, so the write is refused.
     set_start(None);
     let refused = write("with no recorded start");
-    assert!(refused.starts_with("HTTP/1.1 403"), "{refused}");
+    assert!(
+        refused.starts_with("HTTP/1.1 403") || refused.starts_with("HTTP/1.0 403"),
+        "{refused}"
+    );
     assert!(refused.contains("caller_identity"), "{refused}");
     assert!(refused.contains("'wk'"), "{refused}");
     assert!(!board_last_commit(pm.path()).contains("with no recorded start"));
