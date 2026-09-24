@@ -13,6 +13,7 @@ pub mod audit;
 pub mod backup;
 pub mod client;
 pub mod daemon;
+pub mod delivery;
 pub mod doctor;
 pub mod error;
 pub mod inbox;

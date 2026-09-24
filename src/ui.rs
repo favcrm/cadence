@@ -224,6 +224,10 @@ pub struct ServeOpts {
     /// This board process's operator-user latch. [`serve`] always
     /// replaces it with a fresh startup read; the default is latched.
     pub tailnet_latch: crate::tailnet_proof::OperatorLatch,
+    /// The `gh` the board's Merge runs (CAD-431) — the operator's own,
+    /// `gh` on PATH when `None`. Never set from the command line —
+    /// tests inject a fake.
+    pub gh: Option<PathBuf>,
 }
 
 fn opts_file(state_dir: &Path) -> PathBuf {
@@ -378,6 +382,7 @@ fn serve_opts(eff: &UiOpts) -> Result<ServeOpts> {
         tailnet,
         tailscaled_socket: None,
         tailnet_latch: Default::default(),
+        gh: None,
     })
 }
 
@@ -1811,6 +1816,17 @@ fn write_route(
             return;
         }
         let resp = home::decide_plan(&mut request, state_dir, opts, epic, verb);
+        send(request, resp);
+        return;
+    }
+    // CAD-431: the operator's merge decision — guarded, operator-only,
+    // inside `home`.
+    if let Some((id, verb)) = home::delivery_route(path) {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let resp = home::decide_delivery(&mut request, state_dir, opts, id, verb);
         send(request, resp);
         return;
     }

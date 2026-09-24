@@ -56,6 +56,8 @@ pub const MASTER_ALLOWED: &[&str] = &[
     "master_summary",
     "message_report",
     "interrupt",
+    // CAD-431: read the review loop (never file a verdict or decide).
+    "delivery_list",
 ];
 
 /// Most reports one router pass queues to the master; the rest wait for
@@ -226,6 +228,14 @@ impl Shared {
         // and is refused having written nothing. The dispatch's own
         // daemon calls (agent_show, agent_send) never take this lock.
         let _serial = self.dispatch_lock.lock().unwrap_or_else(|e| e.into_inner());
+        // CAD-431: a dispatch the review loop cannot record does not
+        // happen — an unreadable delivery.json refuses before anything.
+        crate::delivery::load(&self.state_dir).map_err(|e| {
+            Error::invalid(
+                "delivery_unreadable",
+                format!("{e} — the operator repairs it before the master dispatches"),
+            )
+        })?;
         let pm = issue::Pm::at(&self.pm_dir()?)?;
         let ticket = issue::board::find_issue(&pm.dir, id)?;
         let front = &ticket.front;
@@ -305,6 +315,11 @@ impl Shared {
         // and recording that would hand the master interrupt rights over
         // it (CAD-323).
         if out["dispatched"] != json!(false) {
+            // CAD-431: the ticket enters the review loop; its worker's
+            // done report is what moves it on.
+            if let Err(e) = self.delivery_start(id, &ticket.project, &to) {
+                tracing::warn!("delivery record for {id}: {e}");
+            }
             let _ = self.store.event_public(
                 DAEMON_ALIAS,
                 "master_dispatched",
@@ -588,6 +603,9 @@ impl Shared {
                 if let Err(e) = self.route_reports() {
                     tracing::debug!("report router: {e}");
                 }
+                if let Err(e) = self.route_delivery() {
+                    tracing::debug!("delivery router: {e}");
+                }
                 next = Instant::now() + every;
             }
             std::thread::sleep(std::time::Duration::from_millis(250));
@@ -646,6 +664,9 @@ impl Shared {
                     };
                     let name = row["name"].as_str().unwrap_or_default();
                     let route = match row["kind"].as_str() {
+                        // A verdict reaches the master only from
+                        // `report_verdict` (CAD-431) — a planted file
+                        // under reports/ routes nowhere.
                         Some("done" | "blocked") => at >= baseline,
                         Some("question") => {
                             row["open"] == true

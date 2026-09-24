@@ -7,10 +7,11 @@
 //! ```markdown
 //! ---
 //! schema: cadence.report/2
-//! kind: done              # done | question | blocked | answer
+//! kind: done              # done | question | blocked | answer | verdict
 //! task: CAD-341
 //! agent: dev-1
-//! sha: <40 or 64 hex>     # optional
+//! sha: <40 or 64 hex>     # optional; a verdict's reviewed head
+//! pr: https://github.com/o/r/pull/7   # done only, optional
 //! constraints: [copied verbatim from the kickoff]
 //! context_feedback:
 //!   used: [{id: L-12, helpful: true}]
@@ -31,6 +32,11 @@
 //! `answer` carries `answers: <question report file name>` and a free
 //! body instead of the headings; a question is open until an answer
 //! names it (files stay create-only — the question is never edited).
+//! A `verdict` (CAD-431) is a reviewer's judgement of one head:
+//! `verdict: pass|revise`, the reviewed `sha`, and the findings as a
+//! free body. It is filed only through the daemon (`report_verdict`),
+//! which checks the caller is the ticket's assigned reviewer and the
+//! sha is the head under review — [`prepare`] refuses the kind.
 //! With `CADENCE_ALIAS` set, `agent` must be that alias. A new
 //! kind is a new [`Kind`] value — the record, writer and readers stay
 //! the same. Unknown frontmatter fields are refused, not ignored, so a
@@ -73,6 +79,25 @@ pub enum Kind {
     Blocked,
     /// Answers one `question` report on the same ticket (`answers:`).
     Answer,
+    /// A reviewer's PASS/REVISE on one head (CAD-431); daemon-filed.
+    Verdict,
+}
+
+/// A reviewer's judgement of one head (CAD-431).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum Verdict {
+    Pass,
+    Revise,
+}
+
+impl Verdict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Verdict::Pass => "pass",
+            Verdict::Revise => "revise",
+        }
+    }
 }
 
 impl Kind {
@@ -82,6 +107,7 @@ impl Kind {
             Kind::Question => "question",
             Kind::Blocked => "blocked",
             Kind::Answer => "answer",
+            Kind::Verdict => "verdict",
         }
     }
 }
@@ -150,6 +176,43 @@ pub struct Front {
     /// `answer` only: the file name of the question report it answers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answers: Option<String>,
+    /// `done` only: the pull request the work is in (CAD-431) —
+    /// `https://github.com/<owner>/<repo>/pull/<n>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr: Option<String>,
+    /// `verdict` only: pass or revise (CAD-431).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<Verdict>,
+}
+
+/// A GitHub pull request named by URL: `(owner/repo, number)`. Only
+/// `https://github.com/<owner>/<repo>/pull/<n>` is accepted — the slug
+/// and number reach `gh` as separate arguments, so every part is
+/// checked against a narrow grammar.
+pub fn parse_pr_url(url: &str) -> Result<(String, u64)> {
+    let bad = || {
+        Error::rejected(format!(
+            "'{url}' is not a pull request URL — expected \
+             https://github.com/<owner>/<repo>/pull/<number>"
+        ))
+    };
+    let rest = url.strip_prefix("https://github.com/").ok_or_else(bad)?;
+    let parts: Vec<&str> = rest.trim_end_matches('/').split('/').collect();
+    let [owner, repo, "pull", n] = parts.as_slice() else {
+        return Err(bad());
+    };
+    let name_ok = |s: &str| {
+        !s.is_empty()
+            && s.len() <= 100
+            && !s.starts_with(['.', '-'])
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
+    let number: u64 = n.parse().map_err(|_| bad())?;
+    if !name_ok(owner) || !name_ok(repo) || number == 0 || n.starts_with('0') {
+        return Err(bad());
+    }
+    Ok((format!("{owner}/{repo}"), number))
 }
 
 /// Split and parse a report file. A file without a `---` fence is all
@@ -276,7 +339,7 @@ pub fn validate(
     };
     let Some(k) = front.kind else {
         return Err(Error::rejected(
-            "report needs a kind (done|question|blocked|answer) — `kind:` or --kind",
+            "report needs a kind (done|question|blocked|answer|verdict) — `kind:` or --kind",
         ));
     };
     let agent = front
@@ -358,11 +421,43 @@ pub fn validate(
         }
         (_, None) => {}
     }
-    // An answer is a reply, not a reflection — it needs a body, not
-    // the six headings.
-    if k == Kind::Answer {
+    match (k, front.pr.as_deref()) {
+        (Kind::Done, Some(url)) => {
+            parse_pr_url(url)?;
+        }
+        (_, Some(_)) => {
+            return Err(Error::rejected(format!(
+                "`pr` belongs to a done report, not '{}'",
+                k.as_str()
+            )))
+        }
+        (_, None) => {}
+    }
+    match (k, front.verdict) {
+        (Kind::Verdict, Some(_)) if front.sha.is_some() => {}
+        (Kind::Verdict, _) => {
+            return Err(Error::rejected(
+                "a verdict names its judgement and the head it judged \
+                 (`verdict: pass|revise`, `sha: <head>`)",
+            ))
+        }
+        (_, Some(_)) => {
+            return Err(Error::rejected(format!(
+                "`verdict` belongs to a verdict report, not '{}'",
+                k.as_str()
+            )))
+        }
+        (_, None) => {}
+    }
+    // An answer is a reply and a verdict is findings, not a reflection
+    // — each needs a body, not the six headings.
+    if matches!(k, Kind::Answer | Kind::Verdict) {
         if body.trim().is_empty() {
-            return Err(Error::rejected("an answer report needs a body"));
+            return Err(Error::rejected(if k == Kind::Answer {
+                "an answer report needs a body"
+            } else {
+                "a verdict report needs a body — its findings"
+            }));
         }
     } else {
         check_sections(body)?;
@@ -419,6 +514,11 @@ impl Prepared {
     pub fn task(&self) -> &str {
         self.front.task.as_deref().unwrap_or_default()
     }
+
+    /// The report body as it will be stored.
+    pub fn body(&self) -> &str {
+        &self.body
+    }
 }
 
 /// Validate and secret-scan one report without writing anything:
@@ -435,6 +535,13 @@ pub fn prepare(pm: &Pm, text: &str, task: Option<&str>, kind: Option<Kind>) -> R
     let (front, body) = parse_text(&text)?;
     check_claim(&front, std::env::var("CADENCE_ALIAS").ok().as_deref())?;
     let front = validate(front, &body, task, kind, &default_agent())?;
+    if front.kind == Some(Kind::Verdict) {
+        return Err(Error::rejected(
+            "a verdict is filed through the daemon, which checks you are the ticket's \
+             assigned reviewer and the sha is the head under review — \
+             `cadence report file --task <ID> --kind verdict --file <f>`",
+        ));
+    }
     checked(pm, front, body, &text)
 }
 
@@ -495,6 +602,48 @@ fn checked(pm: &Pm, front: Front, body: String, scan: &str) -> Result<Prepared> 
         body,
         warnings,
     })
+}
+
+/// Validate and secret-scan one `verdict` for the daemon (CAD-431).
+/// `agent` is the caller the daemon derived from the connection: a
+/// frontmatter `agent` naming anyone else is refused, never trusted.
+/// Nothing is written.
+pub fn prepare_verdict(pm: &Pm, text: &str, task: &str, agent: &str) -> Result<Prepared> {
+    if text.len() > BODY_MAX {
+        return Err(Error::rejected(format!(
+            "Verdict exceeds the {} KB cap — trim it",
+            BODY_MAX / 1024
+        )));
+    }
+    let text = strip_controls(text);
+    let (front, body) = parse_text(&text)?;
+    check_claim(&front, Some(agent))?;
+    let front = validate(front, &body, Some(task), Some(Kind::Verdict), agent)?;
+    write::issue_dir(pm, task)?;
+    let warnings = crate::secret::guard(&format!("{task}: verdict"), &text)?;
+    Ok(Prepared {
+        front,
+        body,
+        warnings,
+    })
+}
+
+/// The findings' first non-empty line, for a Needs-you row or a
+/// message — at most `max` bytes, cut on a char boundary.
+pub fn summary_line(body: &str, max: usize) -> String {
+    let line = body
+        .lines()
+        .map(|l| l.trim().trim_start_matches('#').trim())
+        .find(|l| !l.is_empty())
+        .unwrap_or_default();
+    if line.len() <= max {
+        return line.to_string();
+    }
+    let mut end = max;
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &line[..end])
 }
 
 /// Write a prepared report through the tracker writer. Filing
@@ -604,7 +753,8 @@ pub fn list(issue_dir: &Path, id: &str) -> Vec<Value> {
                     "state": f.state, "constraints": f.constraints,
                     "context_feedback": f.context_feedback,
                     "options": f.options, "impact": f.impact,
-                    "answers": f.answers, "body": body,
+                    "answers": f.answers, "pr": f.pr,
+                    "verdict": f.verdict.map(Verdict::as_str), "body": body,
                 }),
                 Err(e) => json!({"name": name, "path": path, "at": at, "error": e.to_string()}),
             }
@@ -820,6 +970,108 @@ mod tests {
         // No alias (operator shell) or no claim: nothing to contradict.
         assert!(check_claim(&claimed, None).is_ok());
         assert!(check_claim(&Front::default(), Some("dev-1")).is_ok());
+    }
+
+    #[test]
+    fn verdict_needs_judgement_sha_and_findings() {
+        let sha = "a".repeat(40);
+        let front = |yaml: &str| -> Front {
+            let (f, _) = parse_text(&format!("---\n{yaml}---\nx\n")).unwrap();
+            f
+        };
+        let ok = validate(
+            front(&format!(
+                "kind: verdict\ntask: CAD-1\nverdict: revise\nsha: {sha}\n"
+            )),
+            "findings",
+            None,
+            None,
+            "qa-1",
+        )
+        .unwrap();
+        assert_eq!(ok.verdict, Some(Verdict::Revise));
+        assert_eq!(ok.sha.as_deref(), Some(sha.as_str()));
+        for (yaml, body) in [
+            (format!("kind: verdict\ntask: CAD-1\nsha: {sha}\n"), "x"), // no verdict
+            (
+                "kind: verdict\ntask: CAD-1\nverdict: pass\n".to_string(),
+                "x",
+            ), // no sha
+            (
+                format!("kind: verdict\ntask: CAD-1\nverdict: pass\nsha: {sha}\n"),
+                " ",
+            ), // no findings
+            (
+                format!("kind: verdict\ntask: CAD-1\nverdict: maybe\nsha: {sha}\n"),
+                "x",
+            ),
+            (
+                format!("kind: done\ntask: CAD-1\nverdict: pass\nsha: {sha}\n"),
+                "x",
+            ), // verdict on done
+        ] {
+            let parsed = parse_text(&format!("---\n{yaml}---\n{body}\n"));
+            let refused = match parsed {
+                Err(_) => true,
+                Ok((f, b)) => validate(f, &b, None, None, "qa-1").is_err(),
+            };
+            assert!(refused, "accepted: {yaml:?} {body:?}");
+        }
+    }
+
+    #[test]
+    fn pr_belongs_to_done_and_is_a_github_pull_url() {
+        assert_eq!(
+            parse_pr_url("https://github.com/favcrm/cadence/pull/231").unwrap(),
+            ("favcrm/cadence".to_string(), 231)
+        );
+        for bad in [
+            "http://github.com/o/r/pull/1",
+            "https://github.com/o/r/pulls/1",
+            "https://github.com/o/r/pull/0",
+            "https://github.com/o/r/pull/01",
+            "https://github.com/o/r/pull/1/files",
+            "https://github.com/-o/r/pull/1",
+            "https://github.com/o/r;rm/pull/1",
+            "https://github.com/o/../pull/1",
+            "https://evil.example/o/r/pull/1",
+        ] {
+            assert!(parse_pr_url(bad).is_err(), "{bad}");
+        }
+        let pr = "https://github.com/o/r/pull/7";
+        assert!(ok(&format!("kind: done\ntask: CAD-1\npr: {pr}\n"), None, None).is_ok());
+        assert!(ok(
+            &format!("kind: blocked\ntask: CAD-1\npr: {pr}\n"),
+            None,
+            None
+        )
+        .is_err());
+        assert!(ok("kind: done\ntask: CAD-1\npr: nope\n", None, None).is_err());
+    }
+
+    #[test]
+    fn a_verdict_is_never_filed_outside_the_daemon() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pm = Pm::init(&tmp.path().join("pm")).unwrap();
+        let sha = "a".repeat(40);
+        let text = format!("---\nkind: verdict\ntask: CAD-1\nverdict: pass\nsha: {sha}\n---\nok\n");
+        let e = prepare(&pm, &text, None, None).err().expect("refused");
+        assert!(e.to_string().contains("through the daemon"), "{e}");
+        // The daemon's path refuses an author other than the caller.
+        let forged = format!(
+            "---\nkind: verdict\ntask: CAD-1\nagent: qa-2\nverdict: pass\nsha: {sha}\n---\nok\n"
+        );
+        let e = prepare_verdict(&pm, &forged, "CAD-1", "qa-1")
+            .err()
+            .expect("refused");
+        assert!(e.to_string().contains("is not the caller"), "{e}");
+    }
+
+    #[test]
+    fn summary_line_is_the_first_text_line_capped() {
+        assert_eq!(summary_line("\n\n## Findings\nx", 50), "Findings");
+        assert_eq!(summary_line("ééé", 3), "é…");
+        assert_eq!(summary_line("", 10), "");
     }
 
     #[test]
