@@ -28145,26 +28145,40 @@ fn automatic_monitor_dispatch_serializes_competing_callers() {
                "acceptance": "serialize automatic dispatch"}),
     )
     .unwrap();
-    d.rpc(
-        "monitor_register",
-        json!({"monitor": "race-monitor", "project": project, "owner": "operator",
-               "tasks": ["race-task"], "interval_secs": 60,
-               "dispatch_enabled": true, "auto_dispatch_enabled": true}),
-    )
-    .unwrap();
 
-    // Stop the watcher before making the competing calls. The transaction
-    // under test still sees an active monitor after this explicit check, but
-    // no background tick can win the race or hide the two callers' result.
+    // CAD-408: stop the daemon — and with it the monitor watcher, which
+    // `serve` joins — before the auto-dispatch monitor exists. A monitor
+    // registered over RPC is due at once, so a watcher tick before the
+    // shutdown dispatched the task, the fake worker completed it, and both
+    // competing callers then saw 'review'. Registering against the store
+    // afterwards leaves the two callers below as the only dispatchers.
     let state = d.state.clone();
     d.rpc("shutdown", json!({})).unwrap();
     d.handle.take().unwrap().join().unwrap().unwrap();
     let store = Arc::new(Store::open(&state.join("cadence.sqlite3")).unwrap());
+    store
+        .register_monitor(
+            "race-monitor",
+            &project,
+            "operator",
+            60,
+            &["race-task".to_string()],
+            true,
+            true,
+        )
+        .unwrap();
+    // The transaction under test requires an active monitor; this explicit
+    // check is the only one that runs.
     let at = SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs_f64();
     store.check_monitor("race-monitor", at).unwrap();
+    assert_eq!(
+        store.task("race-task").unwrap().state,
+        "draft",
+        "no dispatch may precede the competing callers"
+    );
     store.set_enabled("w1", true).unwrap();
     store.set_agent_state("w1", "idle", None).unwrap();
 
