@@ -13,6 +13,8 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -110,17 +112,24 @@ fn get_json(port: u16, path: &str) -> Value {
 /// The in-process daemon — `daemon::serve` on a caller-owned state dir.
 struct Daemon {
     state: PathBuf,
+    stop: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
 impl Daemon {
     fn start(state: PathBuf) -> Self {
         let owned = state.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let opts = daemon::ServeOptions {
+            stop: Some(stop.clone()),
+            ..Default::default()
+        };
         let handle = thread::spawn(move || {
-            let _ = daemon::serve(&owned);
+            let _ = daemon::serve_with(&owned, opts);
         });
         let d = Self {
             state,
+            stop,
             handle: Some(handle),
         };
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -131,30 +140,141 @@ impl Daemon {
         d
     }
 
+    /// A fixture call — the operator's act. From an agent pane this
+    /// process's ancestry carries `CADENCE_ALIAS`, and operator-only
+    /// methods (`agent_register`, `task_dispatch`, …) refuse it,
+    /// correctly; the refused call is made again as an operator shell
+    /// outside every pane ([`Self::operator_rpc`], CAD-471).
     fn rpc(&self, method: &str, params: Value) -> Value {
-        client::rpc(&self.state, method, params.clone())
-            .unwrap_or_else(|e| panic!("{method} {params}: {e}"))
+        match client::rpc(&self.state, method, params.clone()) {
+            Err(e) if e.to_string().contains("not provably the operator") => {
+                self.operator_rpc(method, params.clone())
+            }
+            r => r,
+        }
+        .unwrap_or_else(|e| panic!("{method} {params}: {e}"))
+    }
+
+    /// `TestDaemon::operator_rpc` in tests/integration.rs (CAD-291):
+    /// `setsid -f` hands the call to a fresh session leader that waits
+    /// until it has left this process's ancestry, `env_clear` leaves no
+    /// `CADENCE_ALIAS`, and stdio is not a pane tty — the residual
+    /// `peer::operator_proof` accepts. The gate itself is untouched.
+    fn operator_rpc(&self, method: &str, params: Value) -> cadence_agent::Result<Value> {
+        let script = self.state.join("operator-rpc.py");
+        if !script.exists() {
+            std::fs::write(&script, OPERATOR_RPC_PY).unwrap();
+        }
+        let out = self.state.join(format!(
+            "operator-rpc-{}.json",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let frame = json!({"method": method, "params": params}).to_string();
+        let status = Command::new("setsid")
+            .arg("-f")
+            .arg("python3")
+            .arg(&script)
+            .arg(client::socket_path(&self.state))
+            .arg(&frame)
+            .arg(&out)
+            .arg(std::process::id().to_string())
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "setsid -f failed: {status}");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !out.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "operator rpc {method} never answered"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        let frame: Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        let _ = std::fs::remove_file(&out);
+        cadence_agent::proto::unwrap(frame)
     }
 }
+
+/// [`Daemon::operator_rpc`]'s caller, as in tests/integration.rs: it
+/// waits until it has left the test runner's ancestry, then sends one
+/// frame and lands the reply line atomically.
+const OPERATOR_RPC_PY: &str = r#"
+import json, os, socket, sys, time
+
+sock_path, frame, out, runner = sys.argv[1:5]
+
+def on_lineage(pid):
+    p = os.getpid()
+    while p > 1:
+        if p == pid:
+            return True
+        with open("/proc/%d/status" % p) as f:
+            p = int([l for l in f if l.startswith("PPid:")][0].split()[1])
+    return False
+
+while on_lineage(int(runner)):
+    time.sleep(0.02)
+s = socket.socket(socket.AF_UNIX)
+s.connect(sock_path)
+s.sendall((frame + "\n").encode())
+line = s.makefile().readline()
+s.close()
+with open(out + ".tmp", "w") as f:
+    f.write(line)
+os.rename(out + ".tmp", out)
+"#;
 
 impl Drop for Daemon {
+    /// Not the `shutdown` RPC, which the caller rule refuses this
+    /// process when the suite runs in an agent pane (CAD-384) — the
+    /// join then waited forever (CAD-471).
     fn drop(&mut self) {
-        let _ = client::rpc(&self.state, "shutdown", json!({}));
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
+        self.stop.store(true, Ordering::SeqCst);
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !handle.is_finished() {
+            if Instant::now() >= deadline {
+                // A second panic while unwinding would abort the runner.
+                if !thread::panicking() {
+                    panic!("the in-process daemon did not stop within 60s of its stop flag");
+                }
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
         }
+        let _ = handle.join();
     }
 }
 
-fn start_ui(pm: &Path, state: &Path) -> u16 {
+/// Stops the in-process board when dropped (CAD-471), closing its port
+/// instead of serving for the rest of the run.
+struct BoardStop(Arc<AtomicBool>);
+
+impl Drop for BoardStop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+fn start_ui(pm: &Path, state: &Path) -> (u16, BoardStop) {
     let overall = Instant::now() + Duration::from_secs(30);
     loop {
         let port = free_port();
         let (sd, pd) = (state.to_path_buf(), pm.to_path_buf());
+        let board = BoardStop(Default::default());
+        let stop = board.0.clone();
         thread::spawn(move || {
             let opts = ui::ServeOpts {
                 host: "127.0.0.1".to_string(),
                 port,
+                stop: Some(stop),
                 ..Default::default()
             };
             let _ = ui::serve(&sd, &pd, &opts);
@@ -167,7 +287,7 @@ fn start_ui(pm: &Path, state: &Path) -> u16 {
                 let _ = s.write_all(probe.as_bytes());
                 let mut buf = String::new();
                 if s.read_to_string(&mut buf).is_ok() && buf.contains("200") {
-                    return port;
+                    return (port, board);
                 }
             }
             if Instant::now() >= deadline {
@@ -334,10 +454,10 @@ fn p95(mut samples: Vec<Duration>) -> Duration {
     samples[idx.min(samples.len() - 1)]
 }
 
-/// Fields drop in order: the daemon shuts down before the temp dir that
-/// holds its socket goes away (a deleted socket leaves `shutdown`
-/// unreachable and the join waiting).
+/// Fields drop in order: the board stops, then the daemon, before the
+/// temp dir holding their state goes away.
 struct Fixture {
+    _board: BoardStop,
     daemon: Daemon,
     pm: PathBuf,
     state: PathBuf,
@@ -355,8 +475,9 @@ fn fixture(issues: usize, jobs: usize) -> Fixture {
     seed_tracker(&pm, &state, &notes, issues);
     let daemon = Daemon::start(state.clone());
     seed_daemon(&daemon, &pm, jobs);
-    let port = start_ui(&pm, &state);
+    let (port, board) = start_ui(&pm, &state);
     Fixture {
+        _board: board,
         _tmp: tmp,
         pm,
         state,

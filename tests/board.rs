@@ -216,11 +216,24 @@ fn write_json(
     http_write(port, method, path, host, WRITE_HEADERS, body.as_bytes())
 }
 
+/// Stops an in-process board when dropped (CAD-471): the board closes
+/// its port instead of serving for the rest of the run — a leaked one
+/// outlives its temp dirs, and any client that finds its port pins one
+/// server thread per idle connection until the runner exits.
+struct BoardStop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for BoardStop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Spawn `ui::serve` on a free port and wait for health. The caller owns
-/// the TempDirs keeping the pm/state dirs alive. `free_port` is a
-/// bind-release race — a parallel test may grab the port first, so a
-/// failed start retries on a fresh port.
-fn start_ui(pm_dir: PathBuf, state_dir: PathBuf) -> u16 {
+/// the TempDirs keeping the pm/state dirs alive, and the returned
+/// [`BoardStop`] keeping the board up. `free_port` is a bind-release
+/// race — a parallel test may grab the port first, so a failed start
+/// retries on a fresh port.
+fn start_ui(pm_dir: PathBuf, state_dir: PathBuf) -> (u16, BoardStop) {
     start_ui_opts(pm_dir, state_dir, |_| {})
 }
 
@@ -230,12 +243,15 @@ fn start_ui_opts(
     pm_dir: PathBuf,
     state_dir: PathBuf,
     f: impl Fn(&mut ui::ServeOpts) + Send + Sync + 'static,
-) -> u16 {
+) -> (u16, BoardStop) {
     let f = std::sync::Arc::new(f);
     let overall = Instant::now() + Duration::from_secs(20);
     loop {
         let port = free_port();
         let (sd, pd, f) = (state_dir.clone(), pm_dir.clone(), f.clone());
+        // A start that loses its port race is stopped too.
+        let board = BoardStop(Default::default());
+        let stop = board.0.clone();
         thread::spawn(move || {
             let mut opts = ui::ServeOpts {
                 host: "127.0.0.1".to_string(),
@@ -244,6 +260,7 @@ fn start_ui_opts(
             };
             f(&mut opts);
             opts.port = port;
+            opts.stop = Some(stop);
             let _ = ui::serve(&sd, &pd, &opts);
         });
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -257,7 +274,7 @@ fn start_ui_opts(
                 let _ = s.write_all(probe.as_bytes());
                 let mut buf = String::new();
                 if s.read_to_string(&mut buf).is_ok() && buf.contains("200") {
-                    return port;
+                    return (port, board);
                 }
             }
             if Instant::now() >= deadline {
@@ -660,7 +677,7 @@ fn ui_routes_and_rejections() {
     let pm = TempDir::new().unwrap();
     let state = TempDir::new().unwrap();
     seed(pm.path(), state.path());
-    let port = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+    let (port, _board) = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
     let ok_host = format!("127.0.0.1:{port}");
 
     let (code, body) = http(port, "GET", "/api/health", &ok_host);
@@ -745,7 +762,7 @@ fn ui_write_path() {
     let pm = TempDir::new().unwrap();
     let state = TempDir::new().unwrap();
     seed(pm.path(), state.path());
-    let port = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+    let (port, _board) = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
     let host = format!("127.0.0.1:{port}");
     let before = commits(pm.path());
 
@@ -1194,7 +1211,7 @@ fn ui_pm_absent_is_honest() {
     let pm = TempDir::new().unwrap();
     let empty = pm.path().join("nope");
     let state = TempDir::new().unwrap();
-    let port = start_ui(empty.clone(), state.path().to_path_buf());
+    let (port, _board) = start_ui(empty.clone(), state.path().to_path_buf());
     let host = format!("127.0.0.1:{port}");
     let (code, body) = http(port, "GET", "/api/health", &host);
     assert_eq!(code, 200);
@@ -1333,7 +1350,7 @@ fn writes_validate_fields() {
     );
 
     // --- HTTP: the same writer, the same rejections (400) ---
-    let port = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+    let (port, _board) = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
     let host = format!("127.0.0.1:{port}");
     let before = commits(pm.path());
     for (method, path, body, want) in [
@@ -2079,6 +2096,7 @@ fn post_commit_hook_refuses_mid_sequence_and_detached() {
 struct UiDaemon {
     state: PathBuf,
     _tmp: Option<TempDir>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -2096,12 +2114,18 @@ impl UiDaemon {
 
     fn serve(state: PathBuf, tmp: Option<TempDir>) -> Self {
         let owned = state.clone();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let opts = daemon::ServeOptions {
+            stop: Some(stop.clone()),
+            ..Default::default()
+        };
         let handle = thread::spawn(move || {
-            let _ = daemon::serve(&owned);
+            let _ = daemon::serve_with(&owned, opts);
         });
         let d = Self {
             state,
             _tmp: tmp,
+            stop,
             handle: Some(handle),
         };
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -2118,8 +2142,67 @@ impl UiDaemon {
         client::rpc(&self.state, method, params)
     }
 
+    /// A fixture call — the operator's act — that must succeed. When the
+    /// suite runs in an agent pane, this process's ancestry carries
+    /// `CADENCE_ALIAS` and operator-only methods (`agent_register`,
+    /// `task_dispatch`, …) refuse it, correctly; the refused call is
+    /// made again the way an operator shell outside every pane looks to
+    /// the daemon ([`Self::operator_rpc`], CAD-471). Gate assertions use
+    /// [`Self::rpc_opt`], which never retries.
     fn rpc(&self, method: &str, params: Value) -> Value {
-        self.rpc_opt(method, params).unwrap()
+        match self.rpc_opt(method, params.clone()) {
+            Err(e) if e.to_string().contains("not provably the operator") => {
+                self.operator_rpc(method, params)
+            }
+            r => r,
+        }
+        .unwrap_or_else(|e| panic!("{method}: {e}"))
+    }
+
+    /// `rpc` from a caller that is provably the operator however the
+    /// suite is run — `TestDaemon::operator_rpc` in tests/integration.rs
+    /// (CAD-291): `setsid -f` hands the call to a fresh session leader
+    /// that waits until it has left this process's ancestry,
+    /// `env_clear` leaves no `CADENCE_ALIAS`, and stdio is not a pane
+    /// tty — the residual `peer::operator_proof` accepts. The gate
+    /// itself is untouched.
+    fn operator_rpc(&self, method: &str, params: Value) -> cadence_agent::Result<Value> {
+        let script = self.state.join("operator-rpc.py");
+        if !script.exists() {
+            std::fs::write(&script, OPERATOR_RPC_PY).unwrap();
+        }
+        let out = self.state.join(format!(
+            "operator-rpc-{}.json",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let frame = json!({"method": method, "params": params}).to_string();
+        let status = Command::new("setsid")
+            .arg("-f")
+            .arg("python3")
+            .arg(&script)
+            .arg(client::socket_path(&self.state))
+            .arg(&frame)
+            .arg(&out)
+            .arg(std::process::id().to_string())
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "setsid -f failed: {status}");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !out.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "operator rpc {method} never answered"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        let frame: Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        let _ = std::fs::remove_file(&out);
+        cadence_agent::proto::unwrap(frame)
     }
 
     fn state(&self) -> PathBuf {
@@ -2128,11 +2211,166 @@ impl UiDaemon {
 }
 
 impl Drop for UiDaemon {
+    /// Not the `shutdown` RPC: when the suite runs in an agent pane,
+    /// this process's ancestry carries `CADENCE_ALIAS`, and the caller
+    /// rule refuses it `shutdown` (CAD-384) — the join then waited
+    /// forever (CAD-471). The in-process stop flag needs no connection.
     fn drop(&mut self) {
-        let _ = self.rpc_opt("shutdown", json!({}));
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
         if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+            join_within(handle, DAEMON_STOP_BOUND, "the in-process daemon");
         }
+    }
+}
+
+/// [`UiDaemon::operator_rpc`]'s caller, as in tests/integration.rs: it
+/// waits until it has left the test runner's ancestry, then sends one
+/// frame and lands the reply line atomically.
+const OPERATOR_RPC_PY: &str = r#"
+import json, os, socket, sys, time
+
+sock_path, frame, out, runner = sys.argv[1:5]
+
+def on_lineage(pid):
+    p = os.getpid()
+    while p > 1:
+        if p == pid:
+            return True
+        with open("/proc/%d/status" % p) as f:
+            p = int([l for l in f if l.startswith("PPid:")][0].split()[1])
+    return False
+
+while on_lineage(int(runner)):
+    time.sleep(0.02)
+s = socket.socket(socket.AF_UNIX)
+s.connect(sock_path)
+s.sendall((frame + "\n").encode())
+line = s.makefile().readline()
+s.close()
+with open(out + ".tmp", "w") as f:
+    f.write(line)
+os.rename(out + ".tmp", out)
+"#;
+
+/// How long a stopped in-process daemon may take to return: its accept
+/// poll plus `Shared::shutdown` joining the actors.
+const DAEMON_STOP_BOUND: Duration = Duration::from_secs(60);
+
+/// Join `handle`, failing the test — never hanging it — when the thread
+/// is still running after `bound` (CAD-471).
+fn join_within(handle: thread::JoinHandle<()>, bound: Duration, what: &str) {
+    let deadline = Instant::now() + bound;
+    while !handle.is_finished() {
+        if Instant::now() >= deadline {
+            // A second panic while unwinding would abort the runner.
+            if !thread::panicking() {
+                panic!("{what} did not stop within {bound:?} of its stop flag");
+            }
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let _ = handle.join();
+}
+
+/// CAD-471: CI runs outside every pane, so the suite from an agent pane
+/// is only covered here. Re-run the probe below in a child whose
+/// environment carries an agent's alias, the shape of a run from a
+/// pane: its in-process daemon and board must stop, and the child must
+/// finish, instead of the drop's join waiting forever.
+#[test]
+fn in_process_daemon_stops_from_an_agent_runner() {
+    let mut child = Command::new(std::env::current_exe().unwrap());
+    child
+        .args([
+            "--exact",
+            "in_process_daemon_stops_from_an_agent_runner_probe",
+            "--ignored",
+        ])
+        .env("CADENCE_ALIAS", "cad471-runner")
+        .env("CAD471_PROBE", "1")
+        // A plain libtest child: the outer run's suite lock and
+        // nextest markers are not its to honour.
+        .env_remove("CADENCE_SUITE_LOCK")
+        .env_remove("CADENCE_REVIEW_SUITE_LOCK_HELD")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("NEXTEST") {
+            child.env_remove(key);
+        }
+    }
+    let mut child = child.spawn().unwrap();
+    let deadline = Instant::now() + DAEMON_STOP_BOUND + Duration::from_secs(30);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            // Our own child: killing it can never touch another process.
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "the agent-shaped probe hung: its in-process daemon or board did not stop \
+                 (a drop waiting on a `shutdown` the caller rule refuses, CAD-471)"
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let out = child.wait_with_output().unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains("1 passed"),
+        "the probe must actually run: {text}"
+    );
+}
+
+#[test]
+#[ignore = "run by in_process_daemon_stops_from_an_agent_runner as an agent-shaped child"]
+fn in_process_daemon_stops_from_an_agent_runner_probe() {
+    if std::env::var("CAD471_PROBE").as_deref() != Ok("1") {
+        return;
+    }
+    assert!(std::env::var("CADENCE_ALIAS").is_ok());
+    let d = UiDaemon::start();
+    let pm = TempDir::new().unwrap();
+    seed(pm.path(), &d.state());
+    let (port, board) = start_ui(pm.path().to_path_buf(), d.state());
+    // The gate is untouched: this process carries an agent's
+    // environment, so it may not stop the daemon over its socket.
+    let err = d.rpc_opt("shutdown", json!({})).unwrap_err();
+    assert!(err.to_string().contains("carries CADENCE_ALIAS"), "{err}");
+    assert_eq!(d.rpc("health", json!({}))["state"], "ready");
+    // The in-process stops need no connection: both return.
+    drop(board);
+    wait_port_closed(port);
+    drop(d);
+}
+
+/// A dropped [`BoardStop`] closes its board's port within its accept
+/// poll (CAD-471) — the board does not serve on for the rest of the run.
+#[test]
+fn board_stops_when_its_guard_drops() {
+    let (pm, state) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    seed(pm.path(), state.path());
+    let (port, board) = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+    let host = format!("127.0.0.1:{port}");
+    assert_eq!(http(port, "GET", "/api/health", &host).0, 200);
+    drop(board);
+    wait_port_closed(port);
+}
+
+/// Wait until nothing accepts on `port`; fail after 10 s.
+fn wait_port_closed(port: u16) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while TcpStream::connect(("127.0.0.1", port)).is_ok() {
+        assert!(
+            Instant::now() < deadline,
+            "the board on {port} still accepts after its stop"
+        );
+        thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -2181,7 +2419,7 @@ fn ui_write_caller_derives_from_pane_ancestry() {
     let state = TempDir::new().unwrap();
     seed(pm.path(), state.path());
     let d = UiDaemon::start_on(state.path().to_path_buf());
-    let port = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+    let (port, _board) = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
     let host = format!("127.0.0.1:{port}");
 
     // The pane: a bash that waits for a go line, then runs the client
@@ -2274,7 +2512,7 @@ fn ui_model_defaults_refuses_pane_agent() {
     let state = TempDir::new().unwrap();
     seed(pm.path(), state.path());
     let d = UiDaemon::start_on(state.path().to_path_buf());
-    let port = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+    let (port, _board) = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
     let host = format!("127.0.0.1:{port}");
     let doc = r#"{"expected_revision":0,"config":{"schema":1,"providers":{"claude":{"default":{"mode":"model","model":"forged-model"},"roles":{}}}}}"#;
     let request = format!(
@@ -2379,7 +2617,7 @@ fn ui_write_caller_attributes_a_setsid_child_of_a_pane() {
     let out_dir = TempDir::new().unwrap();
     seed(pm.path(), state.path());
     let d = UiDaemon::start_on(state.path().to_path_buf());
-    let port = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+    let (port, _board) = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
     let host = format!("127.0.0.1:{port}");
     let out = out_dir.path().join("response");
     // The client waits until the pane pid is off its ancestry (the
@@ -2453,7 +2691,7 @@ fn ui_write_caller_ignores_an_uncorroborated_env_alias() {
     let state = TempDir::new().unwrap();
     seed(pm.path(), state.path());
     let d = UiDaemon::start_on(state.path().to_path_buf());
-    let port = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+    let (port, _board) = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
     let host = format!("127.0.0.1:{port}");
     // pane-b is a registered, live pane the client is unrelated to.
     let mut pane_b = Command::new("sleep")
@@ -2502,7 +2740,7 @@ fn ui_write_caller_pty_tie_is_forgeable_residual_pinned() {
     let state = TempDir::new().unwrap();
     seed(pm.path(), state.path());
     let d = UiDaemon::start_on(state.path().to_path_buf());
-    let port = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+    let (port, _board) = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
     let host = format!("127.0.0.1:{port}");
     // The victim pane: a bash whose stdio is a real pty, idling.
     let mut pane = Command::new("python3")
@@ -2594,7 +2832,7 @@ fn ui_job_state_drives_status_and_binding() {
     // CAD-3 is the leaf — CAD-1 is a container whose roll-up legitimately
     // outranks any job.
     let (_, task_id) = bound_job(pm.path(), &d, "CAD-3");
-    let port = start_ui(pm.path().to_path_buf(), d.state());
+    let (port, _board) = start_ui(pm.path().to_path_buf(), d.state());
     let host = format!("127.0.0.1:{port}");
 
     // Card: job state wins over notes/file and binds the agent.
@@ -2767,7 +3005,10 @@ fn ui_overview_surfaces_durable_monitor_alert_and_acknowledges_it() {
         thread::sleep(Duration::from_millis(50));
     };
 
-    let port = start_ui(pm.path().to_path_buf(), d.state());
+    // The ack relays through the board's own daemon connection, which
+    // the caller rule proves (CAD-384) — an operator-shaped board, so
+    // this passes from an agent pane too (CAD-471, as CAD-380).
+    let (port, _board) = start_operator_ui(pm.path(), &d.state());
     let host = format!("127.0.0.1:{port}");
     let (code, body) = http(port, "GET", "/api/overview", &host);
     assert_eq!(code, 200, "{body}");
@@ -2820,7 +3061,7 @@ fn ui_overview_surfaces_durable_monitor_alert_and_acknowledges_it() {
     // The durable acknowledgement remains behind the board's existing
     // read-only guard; a shared browse-only board cannot claim it handled
     // an operator alert.
-    let read_only_port = start_ui_opts(pm.path().to_path_buf(), d.state(), |opts| {
+    let (read_only_port, _ro_board) = start_ui_opts(pm.path().to_path_buf(), d.state(), |opts| {
         opts.read_only = true;
     });
     let read_only_host = format!("127.0.0.1:{read_only_port}");
@@ -2844,7 +3085,7 @@ fn ui_agent_detail_route_and_guards() {
         json!({"alias": "wk", "provider": "fake",
                "endpoint_kind": "fake", "cwd": pm.path().to_str().unwrap()}),
     );
-    let port = start_ui(pm.path().to_path_buf(), d.state());
+    let (port, _board) = start_ui(pm.path().to_path_buf(), d.state());
     let host = format!("127.0.0.1:{port}");
 
     let (code, body) = http(port, "GET", "/api/agents/wk", &host);
@@ -2870,7 +3111,7 @@ fn ui_stream_sse_and_guards() {
     let pm = TempDir::new().unwrap();
     let d = UiDaemon::start();
     seed(pm.path(), &d.state());
-    let port = start_ui(pm.path().to_path_buf(), d.state());
+    let (port, _board) = start_ui(pm.path().to_path_buf(), d.state());
     let host = format!("127.0.0.1:{port}");
 
     // Method guard: HEAD on the stream is refused, not hung.
@@ -3053,7 +3294,7 @@ fn ui_agents_payload_covers_all_kinds() {
         s["unknown"].as_i64().unwrap_or(0) > 0 || s["agent"]["state"].as_str() == Some("attention")
     });
 
-    let port = start_ui(pm.path().to_path_buf(), d.state());
+    let (port, _board) = start_ui(pm.path().to_path_buf(), d.state());
     let host = format!("127.0.0.1:{port}");
     let (code, body) = http(port, "GET", "/api/agents", &host);
     assert_eq!(code, 200);
@@ -3108,6 +3349,7 @@ struct HistFx {
     pm: TempDir,
     state: TempDir,
     port: u16,
+    _board: BoardStop,
     created_sha: String,
     set2_sha: String,
     patch_sha: String,
@@ -3142,7 +3384,7 @@ fn history_fixture() -> HistFx {
         )
         .0
     );
-    let port = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+    let (port, board) = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
     let host = format!("127.0.0.1:{port}");
     assert!(
         cli(
@@ -3221,6 +3463,7 @@ fn history_fixture() -> HistFx {
         pm,
         state,
         port,
+        _board: board,
     }
 }
 
@@ -3770,7 +4013,7 @@ fn issue_log_by_from_trailers() {
 
 /// A tracker whose `x` project declares two repos: `repo` (a real
 /// git dir the test fills) and `/definitely/missing` (skip target).
-fn commits_fixture() -> (TempDir, TempDir, TempDir, u16) {
+fn commits_fixture() -> (TempDir, TempDir, TempDir, u16, BoardStop) {
     let pm = TempDir::new().unwrap();
     let state = TempDir::new().unwrap();
     let repo = TempDir::new().unwrap();
@@ -3834,13 +4077,13 @@ fn commits_fixture() -> (TempDir, TempDir, TempDir, u16) {
     commit("fix (X-1) edge case", None);
     commit("wip X-12 unrelated", None);
     commit("unrelated refactor", None);
-    let port = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
-    (pm, state, repo, port)
+    let (port, board) = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+    (pm, state, repo, port, board)
 }
 
 #[test]
 fn issue_detail_lists_code_commits() {
-    let (pm, state, repo, port) = commits_fixture();
+    let (pm, state, repo, port, _board) = commits_fixture();
     let (ok, out) = cli(pm.path(), state.path(), &["issue", "show", "X-1", "--json"]);
     assert!(ok, "{out}");
     let commits = out["commits"].as_array().unwrap();
@@ -3877,7 +4120,7 @@ fn issue_detail_lists_code_commits() {
 /// default-branch commits even when it is the newest.
 #[test]
 fn issue_detail_dedupes_stale_branch_commits() {
-    let (pm, state, repo, _port) = commits_fixture();
+    let (pm, state, repo, _port, _board) = commits_fixture();
     let commit = |subject: &str, date: &str| {
         assert!(
             git(
@@ -4145,7 +4388,7 @@ fn issue_tags_round_trip_and_declared_list() {
     assert_eq!(tags_of(pm, state, "Y-1"), ["whatever-2"]);
 
     // The HTTP write path: same validation, same if_rev rule.
-    let port = start_ui(pm.to_path_buf(), state.to_path_buf());
+    let (port, _board) = start_ui(pm.to_path_buf(), state.to_path_buf());
     let host = format!("127.0.0.1:{port}");
     let detail = |id: &str| -> Value {
         let (code, body) = http(port, "GET", &format!("/api/issues/{id}"), &host);
@@ -4361,7 +4604,7 @@ fn issue_ls_unknown_project_is_an_error() {
 fn issue_ls_filters_and_epics_match_the_api() {
     let (pm, state) = tags_fixture();
     let (pm, state) = (pm.path(), state.path());
-    let port = start_ui(pm.to_path_buf(), state.to_path_buf());
+    let (port, _board) = start_ui(pm.to_path_buf(), state.to_path_buf());
     let host = format!("127.0.0.1:{port}");
     let ids = |v: &Value| -> Vec<String> {
         v["issues"]
@@ -4531,7 +4774,7 @@ fn issue_ls_filters_and_epics_match_the_api() {
 
 #[test]
 fn issue_trailer_prints_and_validates() {
-    let (pm, state, _repo, _port) = commits_fixture();
+    let (pm, state, _repo, _port, _board) = commits_fixture();
     let (ok, out) = cli_raw(pm.path(), state.path(), &["issue", "trailer", "X-1"]);
     assert!(ok, "{out}");
     assert_eq!(out, "Issue: X-1");
@@ -7101,7 +7344,7 @@ fn tailnet_shaped_local_write_is_not_the_proxy() {
     let (pm, state) = (TempDir::new().unwrap(), TempDir::new().unwrap());
     seed(pm.path(), state.path());
     let (ts_dir, sock) = fake_localapi();
-    let port = start_ui_opts(
+    let (port, _board) = start_ui_opts(
         pm.path().to_path_buf(),
         state.path().to_path_buf(),
         tailnet_opts(&sock),
@@ -7196,7 +7439,7 @@ fn tailnet_proof_refusals_name_their_check() {
     ];
     for (want, setup) in cases {
         let (ts_dir, sock) = fake_localapi();
-        let port = start_ui_opts(
+        let (port, _board) = start_ui_opts(
             pm.path().to_path_buf(),
             state.path().to_path_buf(),
             tailnet_opts(&sock),
@@ -7210,7 +7453,7 @@ fn tailnet_proof_refusals_name_their_check() {
 
     // No LocalAPI socket at all: tailscaled's uid is unknown.
     let nowhere = TempDir::new().unwrap().path().join("absent.sock");
-    let port = start_ui_opts(
+    let (port, _board) = start_ui_opts(
         pm.path().to_path_buf(),
         state.path().to_path_buf(),
         tailnet_opts(&nowhere),
@@ -7233,7 +7476,7 @@ fn tailnet_operator_latch_outlives_a_clear() {
     // The board's user is the operator at startup, then clears itself.
     let (ts_dir, sock) = fake_localapi();
     localapi_operator(ts_dir.path(), &own_user_name());
-    let port = start_ui_opts(
+    let (port, _board) = start_ui_opts(
         pm.path().to_path_buf(),
         state.path().to_path_buf(),
         tailnet_opts(&sock),
@@ -7246,7 +7489,7 @@ fn tailnet_operator_latch_outlives_a_clear() {
     // The startup read fails (no prefs), then the LocalAPI recovers.
     let (ts_dir, sock) = fake_localapi();
     std::fs::remove_file(ts_dir.path().join("prefs.json")).unwrap();
-    let port = start_ui_opts(
+    let (port, _board) = start_ui_opts(
         pm.path().to_path_buf(),
         state.path().to_path_buf(),
         tailnet_opts(&sock),
@@ -7258,7 +7501,7 @@ fn tailnet_operator_latch_outlives_a_clear() {
 
     // Sighted as operator AFTER startup: latched from then on too.
     let (ts_dir, sock) = fake_localapi();
-    let port = start_ui_opts(
+    let (port, _board) = start_ui_opts(
         pm.path().to_path_buf(),
         state.path().to_path_buf(),
         tailnet_opts(&sock),
@@ -7280,7 +7523,7 @@ fn tailnet_write_with_a_tcp_forwarder_is_not_attributed() {
     let (pm, state) = (TempDir::new().unwrap(), TempDir::new().unwrap());
     seed(pm.path(), state.path());
     let (ts_dir, sock) = fake_localapi();
-    let port = start_ui_opts(
+    let (port, _board) = start_ui_opts(
         pm.path().to_path_buf(),
         state.path().to_path_buf(),
         tailnet_opts(&sock),
@@ -7311,7 +7554,7 @@ fn tailnet_write_with_a_tcp_forwarder_is_not_attributed() {
 fn forged_tailscale_headers_not_attributed() {
     let (pm, state) = (TempDir::new().unwrap(), TempDir::new().unwrap());
     seed(pm.path(), state.path());
-    let port = start_ui_opts(
+    let (port, _board) = start_ui_opts(
         pm.path().to_path_buf(),
         state.path().to_path_buf(),
         tailnet_opts(Path::new("/nonexistent/tailscaled.sock")),
@@ -7357,7 +7600,7 @@ fn forged_tailscale_headers_not_attributed() {
 fn tailnet_write_wrong_origin_refused() {
     let (pm, state) = (TempDir::new().unwrap(), TempDir::new().unwrap());
     seed(pm.path(), state.path());
-    let port = start_ui_opts(
+    let (port, _board) = start_ui_opts(
         pm.path().to_path_buf(),
         state.path().to_path_buf(),
         tailnet_opts(Path::new("/nonexistent/tailscaled.sock")),
@@ -7384,7 +7627,7 @@ fn tailnet_write_wrong_origin_refused() {
 fn read_only_board_refuses_every_write() {
     let (pm, state) = (TempDir::new().unwrap(), TempDir::new().unwrap());
     seed(pm.path(), state.path());
-    let port = start_ui_opts(pm.path().to_path_buf(), state.path().to_path_buf(), |o| {
+    let (port, _board) = start_ui_opts(pm.path().to_path_buf(), state.path().to_path_buf(), |o| {
         o.read_only = true
     });
     let host = format!("127.0.0.1:{port}");
@@ -7482,7 +7725,7 @@ fn tcp_relay(listen: u16, target: u16) {
 fn sse_stream_survives_a_tcp_proxy() {
     let (pm, state) = (TempDir::new().unwrap(), TempDir::new().unwrap());
     seed(pm.path(), state.path());
-    let port = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+    let (port, _board) = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
     let relay_port = free_port();
     tcp_relay(relay_port, port);
 
@@ -8907,7 +9150,7 @@ fn overview_meta_and_shell_routes() {
     let pm = TempDir::new().unwrap();
     let state = TempDir::new().unwrap();
     seed(pm.path(), state.path());
-    let port = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+    let (port, _board) = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
     let host = format!("127.0.0.1:{port}");
 
     // /api/meta carries the serving binary's build identity.
@@ -9809,7 +10052,7 @@ fn project_context_api_scopes_projects_and_pins_revision() {
     assert!(cli(pm.path(), state.path(), &["issue", "init"]).0);
     add_context_project(pm.path(), state.path(), "alpha", "A", &[alpha.path()]);
     add_context_project(pm.path(), state.path(), "beta", "B", &[beta.path()]);
-    let port = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+    let (port, _board) = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
     let host = format!("127.0.0.1:{port}");
 
     let (code, body) = http(port, "GET", "/api/projects/alpha/context?role=pm", &host);
@@ -9910,7 +10153,7 @@ fn project_context_accepts_ops_and_stores_devops() {
     assert!(git(repo.path(), &["commit", "-qm", "role fixture"]).0);
     assert!(cli(pm.path(), state.path(), &["issue", "init"]).0);
     add_context_project(pm.path(), state.path(), "roles", "R", &[repo.path()]);
-    let port = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+    let (port, _board) = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
     let host = format!("127.0.0.1:{port}");
 
     for role in ["devops", "ops"] {
@@ -9980,7 +10223,7 @@ fn project_context_dirty_probe_failure_keeps_pinned_documents() {
 
     assert!(cli(pm.path(), state.path(), &["issue", "init"]).0);
     add_context_project(pm.path(), state.path(), "dirty-probe", "D", &[repo.path()]);
-    let port = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+    let (port, _board) = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
     let host = format!("127.0.0.1:{port}");
     let (code, body) = http(port, "GET", "/api/projects/dirty-probe/context", &host);
     assert_eq!(code, 200, "{body}");
@@ -10044,7 +10287,7 @@ fn project_context_rejects_invalid_paths_and_reports_repository_states() {
     );
     // `outside` is deliberately not a git repository; the multi-repo state
     // is decided from declarations before either path is opened.
-    let port = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+    let (port, _board) = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
     let host = format!("127.0.0.1:{port}");
 
     for (key, state_name) in [
@@ -10138,7 +10381,7 @@ fn project_context_manifest_conflicts_are_bounded_and_select_nothing() {
     let _ = context_repo(repo.path(), "conflicts", "docs/guide.md", "guide\n");
     assert!(cli(pm.path(), state.path(), &["issue", "init"]).0);
     add_context_project(pm.path(), state.path(), "conflicts", "C", &[repo.path()]);
-    let port = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+    let (port, _board) = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
     let host = format!("127.0.0.1:{port}");
     let replace_manifest = |manifest: &str, message: &str| -> Value {
         std::fs::write(
@@ -10285,7 +10528,7 @@ fn project_context_memories_include_only_verified_lessons_and_bound_withheld() {
     )
     .unwrap();
 
-    let port = start_ui(pm_dir.path().to_path_buf(), state.path().to_path_buf());
+    let (port, _board) = start_ui(pm_dir.path().to_path_buf(), state.path().to_path_buf());
     let host = format!("127.0.0.1:{port}");
     let (code, body) = http(port, "GET", "/api/projects/memory/context", &host);
     assert_eq!(code, 200, "{body}");
@@ -10316,7 +10559,7 @@ fn project_context_memories_include_only_verified_lessons_and_bound_withheld() {
 fn model_defaults_http_round_trip_guards_and_conflict() {
     let pm = TempDir::new().unwrap();
     let state = TempDir::new().unwrap();
-    let port = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+    let (port, _board) = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
     let host = format!("127.0.0.1:{port}");
     let (code, body) = http(port, "GET", "/api/settings/model-defaults", &host);
     assert_eq!(code, 503, "{body}");
@@ -10484,7 +10727,7 @@ fn model_defaults_http_round_trip_guards_and_conflict() {
     assert!(row["model_selection"].is_null());
     assert!(row.get("model_lookup_role").is_some());
 
-    let read_only = start_ui_opts(pm.path().to_path_buf(), d.state(), |opts| {
+    let (read_only, _ro_board) = start_ui_opts(pm.path().to_path_buf(), d.state(), |opts| {
         opts.read_only = true;
     });
     let read_host = format!("127.0.0.1:{read_only}");
@@ -10519,7 +10762,7 @@ fn setup_is_refused_to_read_only_and_tailnet_viewers() {
     let state = TempDir::new().unwrap();
     let runs = ui::setup_runs();
 
-    let ro = start_ui_opts(pm.path().to_path_buf(), state.path().to_path_buf(), |o| {
+    let (ro, _ro_board) = start_ui_opts(pm.path().to_path_buf(), state.path().to_path_buf(), |o| {
         o.read_only = true;
     });
     let (code, _, body) = http_write(
@@ -10537,7 +10780,7 @@ fn setup_is_refused_to_read_only_and_tailnet_viewers() {
     );
 
     let nowhere = TempDir::new().unwrap().path().join("absent.sock");
-    let ts = start_ui_opts(
+    let (ts, _ts_board) = start_ui_opts(
         pm.path().to_path_buf(),
         state.path().to_path_buf(),
         tailnet_opts(&nowhere),

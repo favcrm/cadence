@@ -237,6 +237,11 @@ pub struct ServeOpts {
     /// This board process's delivery sync. [`serve`] always replaces it
     /// (with `None` on a read-only board); never a caller's.
     pub delivery_sync: Option<std::sync::Arc<delivery_sync::DeliverySync>>,
+    /// The in-process owner's stop (CAD-471): once set, [`serve`] stops
+    /// accepting and returns, closing its port. Never set from the
+    /// command line — a test's board on a thread of the runner stops
+    /// with its test instead of serving for the rest of the run.
+    pub stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 fn opts_file(state_dir: &Path) -> PathBuf {
@@ -394,6 +399,7 @@ fn serve_opts(eff: &UiOpts) -> Result<ServeOpts> {
         gh: None,
         delivery_sync_every: None,
         delivery_sync: None,
+        stop: None,
     })
 }
 
@@ -2977,7 +2983,23 @@ pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
         .then(|| delivery_sync::start(state_dir, pm_dir, opts.delivery_sync_every, gh));
     let opts = &opts;
     eprintln!("cadence ui listening on http://{}:{}", opts.host, opts.port);
-    for request in server.incoming_requests() {
+    loop {
+        let request = match &opts.stop {
+            None => match server.recv() {
+                Ok(request) => request,
+                Err(_) => break,
+            },
+            Some(stop) => {
+                if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                match server.recv_timeout(Duration::from_millis(100)) {
+                    Ok(Some(request)) => request,
+                    Ok(None) => continue,
+                    Err(_) => break,
+                }
+            }
+        };
         // Thread per request: `/api/stream` holds its connection open
         // for the session's lifetime and must not starve the board.
         let (state_dir, pm_dir, opts) =

@@ -9644,6 +9644,14 @@ pub struct ServeOptions {
     /// that must prove a delivery came from the wake, not the poll,
     /// sets it past its own wait bound (CAD-391).
     pub idle_poll: Option<Duration>,
+    /// Test seam (CAD-471): the in-process owner's stop. Setting it
+    /// stops `serve` as the `shutdown` RPC does, without a connection.
+    /// A test daemon on a thread of the test runner cannot stop itself
+    /// over its socket when the suite runs in an agent pane: the caller
+    /// rule refuses `shutdown` from that ancestry (CAD-384), correctly.
+    /// Only code in this process holding the flag can set it, so the
+    /// gate is untouched. Production leaves it unset.
+    pub stop: Option<Arc<AtomicBool>>,
 }
 
 /// Slot configuration precedence: explicit `ServeOptions.slots`, then
@@ -9964,6 +9972,10 @@ pub fn serve_with(state_dir: &Path, opts: ServeOptions) -> Result<()> {
         thread::spawn(move || shared.run_report_router());
     }
     while !shared.closing.load(Ordering::SeqCst) {
+        if opts.stop.as_ref().is_some_and(|s| s.load(Ordering::SeqCst)) {
+            shared.begin_closing();
+            continue;
+        }
         match listener.accept() {
             Ok((stream, _)) => {
                 let shared = Arc::clone(&shared);
