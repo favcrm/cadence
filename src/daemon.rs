@@ -30,6 +30,7 @@ mod caller_rule;
 mod delivery_rpc;
 mod master_rpc;
 mod master_wake;
+mod operator_rpc;
 
 /// CAD-339: the daemon methods a master connection may call.
 pub use master_rpc::MASTER_ALLOWED;
@@ -545,6 +546,11 @@ pub struct Shared {
     /// compaction is not kept here but as a thread note
     /// ([`Store::compaction_pending`]), so it survives a restart.
     continuity_due: Mutex<HashMap<String, crate::continuity::Reason>>,
+    /// CAD-313: login links and board sessions ([`crate::operator_auth`]).
+    operator_auth: Mutex<crate::operator_auth::Auth>,
+    /// CAD-313: the clock links and sessions expire by (epoch seconds) —
+    /// the wall clock in production, injectable in tests.
+    operator_clock: Arc<dyn Fn() -> i64 + Send + Sync>,
 }
 
 impl Shared {
@@ -621,6 +627,11 @@ impl Shared {
             auto_stop: AutoStopTimer::new(opts.auto_stop.clone(), opts.auto_stop_clock.clone()),
             idle_poll: opts.idle_poll.unwrap_or(IDLE_POLL),
             recover_lock: Mutex::new(()),
+            operator_auth: Mutex::new(crate::operator_auth::Auth::load(state_dir)),
+            operator_clock: opts
+                .operator_clock
+                .clone()
+                .unwrap_or_else(|| Arc::new(crate::issue::time::now_epoch)),
         });
         // Holds dropped by boot-time revalidation get their release
         // events now that the store-backed emitter exists.
@@ -2489,6 +2500,13 @@ impl Shared {
             "delivery_observe" => self.rpc_delivery_observe(params, peer_pid),
             "delivery_merge" => self.rpc_delivery_merge(params, peer_pid),
             "delivery_decline" => self.rpc_delivery_decline(params, peer_pid),
+            "operator_link_mint" => self.rpc_operator_link_mint(params, peer_pid),
+            "operator_session_open" => self.rpc_operator_session_open(params),
+            "operator_session_check" => self.rpc_operator_session_check(params),
+            "operator_session_logout" => self.rpc_operator_session_logout(params),
+            "operator_session_stolen" => self.rpc_operator_session_stolen(params),
+            "operator_sessions" => self.rpc_operator_sessions(params, peer_pid),
+            "operator_secret_rotate" => self.rpc_operator_secret_rotate(params, peer_pid),
             other => Err(Error::rejected(format!("Unknown method '{other}'"))),
         }
     }
@@ -9814,6 +9832,9 @@ pub struct ServeOptions {
     /// Only code in this process holding the flag can set it, so the
     /// gate is untouched. Production leaves it unset.
     pub stop: Option<Arc<AtomicBool>>,
+    /// CAD-313: the operator-auth clock (epoch seconds) — `None` is the
+    /// wall clock; tests inject one they advance past a link's TTL.
+    pub operator_clock: Option<Arc<dyn Fn() -> i64 + Send + Sync>>,
 }
 
 /// Slot configuration precedence: explicit `ServeOptions.slots`, then
@@ -10079,6 +10100,13 @@ pub fn serve_with(state_dir: &Path, opts: ServeOptions) -> Result<()> {
     // to adopt.
     let hot = hot_restart_begin(state_dir);
     let shared = Shared::new_hot(state_dir, &opts, hot)?;
+    // CAD-313: the operator secret exists from the first start, so an
+    // upgrade needs no manual step. An existing file is never touched —
+    // a wrong mode is refused at use, naming the fix — and a failure
+    // here only disables board logins; it never stops the daemon.
+    if let Err(e) = crate::operator_auth::ensure_secret(state_dir) {
+        eprintln!("warning: operator secret unavailable, board logins refused: {e}");
+    }
     let socket_path = state_dir.join("cadence.sock");
     if socket_path.exists() {
         // Safe while the singleton is held: no live owner can exist.

@@ -1,0 +1,665 @@
+//! Who the board trusts as the operator (CAD-313, CAD-428; ADR 0004
+//! phase 1). Exactly one thing makes a board request the operator's: a
+//! live **operator session** — an HttpOnly cookie the daemon issued in
+//! exchange for a single-use `cadence ui login` link — presented on the
+//! origin it was issued for, by a process tied to no agent. Nothing
+//! else does: not a loopback peer, not a relay (nginx, `socat`, an
+//! agent's own proxy — the board sees the relay, never who is behind
+//! it), not a Host, not a `Tailscale-User-*` or `X-Forwarded-*` header,
+//! not the absence of a pane tie.
+//!
+//! [`board_caller`] is the one rule, as a table ([`decide`]):
+//!
+//! | session | the TCP peer | caller |
+//! |---|---|---|
+//! | valid | tied to an agent (pane or managed endpoint) | refused `session_from_agent`; the session is revoked |
+//! | valid | the proven `tailscale serve` proxy (CAD-336) | the operator, as `<login> (tailscale)` (no login: refused) |
+//! | valid | tied to no agent, or unattributable | the operator, `operator (ui)` |
+//! | none/invalid | tied to an agent | that agent (agent-allowed routes only) |
+//! | none/invalid | tied to no agent, a relay, or the proxy | refused `operator_session_required` |
+//! | none/invalid | unattributable | refused `caller_identity` |
+//!
+//! A session is bound to its origin: `loopback` (any Host this board
+//! allows that is not the tailnet name) or `tailnet` (a request the
+//! tailnet proof passes). A request whose Host names the tailnet but
+//! fails the proof has no origin, so no session. A write that carries a
+//! session cookie must also carry `Origin`, and it must be this very
+//! request's own scheme and Host — a cookie replayed from another
+//! origin, or by a client that sends none, is refused.
+//!
+//! Operator-only routes additionally run positive process proof on the
+//! HTTP peer (`home::prove_operator_peer`): the board is never less
+//! strict than the daemon verb it relays.
+
+use serde::Deserialize;
+use serde_json::{json, Value};
+use tiny_http::{Header, Request, Response, StatusCode};
+
+use super::{
+    agent_roots, coded_response, guard_fail, header_value, parse_json, proxied_actor, read_body,
+    tailnet_proxy, write_guard, HttpResp, ServeOpts, UI_ACTOR,
+};
+use crate::client;
+use crate::operator_auth::Origin;
+
+/// What a write route requires (ADR 0004 §5.9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteClass {
+    /// An operator session, or a caller attributed to exactly one agent
+    /// (which writes as that agent, never as `operator`).
+    AgentAllowed,
+    /// An operator session (plus process proof on the peer).
+    OperatorOnly,
+    /// The login exchange and logout: the nonce or the session itself is
+    /// the credential.
+    Session,
+    /// Never over HTTP (memory curation needs a native agent endpoint).
+    Refused,
+}
+
+/// One write route: method, path pattern (`*` is one non-empty
+/// segment), class.
+#[derive(Clone, Copy, Debug)]
+pub struct WriteRoute {
+    pub method: &'static str,
+    pub pattern: &'static str,
+    pub class: RouteClass,
+}
+
+const fn route(method: &'static str, pattern: &'static str, class: RouteClass) -> WriteRoute {
+    WriteRoute {
+        method,
+        pattern,
+        class,
+    }
+}
+
+/// Every write route the board answers, classified in one place. A
+/// write that matches no entry is [`RouteClass::OperatorOnly`]
+/// ([`route_class`]) — a new route fails closed until it is listed.
+pub const WRITE_ROUTES: &[WriteRoute] = &[
+    route("POST", "/api/issues", RouteClass::AgentAllowed),
+    route("PATCH", "/api/issues/*", RouteClass::AgentAllowed),
+    route("POST", "/api/issues/*/links", RouteClass::AgentAllowed),
+    route("DELETE", "/api/issues/*/links", RouteClass::AgentAllowed),
+    route("POST", "/api/issues/*/refs", RouteClass::AgentAllowed),
+    route("POST", "/api/issues/*/comments", RouteClass::AgentAllowed),
+    route("POST", "/api/issues/*/artifacts", RouteClass::AgentAllowed),
+    route(
+        "POST",
+        "/api/monitors/*/alerts/*/ack",
+        RouteClass::AgentAllowed,
+    ),
+    route("POST", "/api/issues/*/answers", RouteClass::OperatorOnly),
+    route("POST", "/api/plans/*/approve", RouteClass::OperatorOnly),
+    route("POST", "/api/plans/*/reject", RouteClass::OperatorOnly),
+    route("POST", "/api/delivery/*/merge", RouteClass::OperatorOnly),
+    route("POST", "/api/delivery/*/decline", RouteClass::OperatorOnly),
+    route(
+        "POST",
+        "/api/settings/model-defaults",
+        RouteClass::OperatorOnly,
+    ),
+    route("POST", "/api/threads/*/messages", RouteClass::OperatorOnly),
+    route("POST", "/api/memories/*/*/accept", RouteClass::Refused),
+    route("POST", "/api/memories/*/*/reject", RouteClass::Refused),
+    route("POST", "/api/session", RouteClass::Session),
+    route("POST", "/api/session/logout", RouteClass::Session),
+];
+
+fn matches(pattern: &str, path: &str) -> bool {
+    let mut want = pattern.split('/');
+    let mut got = path.split('/');
+    loop {
+        match (want.next(), got.next()) {
+            (None, None) => return true,
+            (Some("*"), Some(seg)) if !seg.is_empty() => {}
+            (Some(w), Some(g)) if w == g => {}
+            _ => return false,
+        }
+    }
+}
+
+/// The class of a write — [`RouteClass::OperatorOnly`] when unlisted.
+pub fn route_class(method: &str, path: &str) -> RouteClass {
+    WRITE_ROUTES
+        .iter()
+        .find(|r| r.method == method && matches(r.pattern, path))
+        .map(|r| r.class)
+        .unwrap_or(RouteClass::OperatorOnly)
+}
+
+/// A board write's caller, once [`board_caller`] has decided.
+pub(super) enum Caller {
+    /// Holds a live session: `actor` is `operator (ui)` or a proven
+    /// tailnet login; comment authors and monitor acks record `operator`.
+    Operator(String),
+    /// A process tied to a registered pane or a live managed endpoint,
+    /// with no session: its alias is the actor and author.
+    Agent(String),
+}
+
+impl Caller {
+    pub(super) fn actor(&self) -> &str {
+        match self {
+            Caller::Operator(actor) => actor,
+            Caller::Agent(alias) => alias,
+        }
+    }
+
+    pub(super) fn author(&self) -> &str {
+        match self {
+            Caller::Operator(_) => "operator",
+            Caller::Agent(alias) => alias,
+        }
+    }
+}
+
+/// Where a request came from, for session binding.
+enum ReqOrigin {
+    Known(Origin),
+    /// Host names the tailnet, but the tailnet proof refused: no
+    /// session can be used or opened here.
+    Unproven(String),
+}
+
+fn request_origin(request: &Request, opts: &ServeOpts) -> ReqOrigin {
+    match tailnet_proxy(request, opts) {
+        None => ReqOrigin::Known(Origin::Loopback),
+        Some(Ok(())) => ReqOrigin::Known(Origin::Tailnet),
+        Some(Err(r)) => ReqOrigin::Unproven(format!("{}: {}", r.check.as_str(), r.why)),
+    }
+}
+
+/// The session cookie's name on this board. The port keeps two boards
+/// on one host from clobbering each other's cookie (cookies ignore
+/// ports); `__Host-` on the https tailnet origin makes the browser
+/// enforce `Secure`, `Path=/` and no `Domain`.
+fn cookie_name(opts: &ServeOpts, origin: Origin) -> String {
+    match origin {
+        Origin::Loopback => format!("cadence_operator_{}", opts.port),
+        Origin::Tailnet => format!("__Host-cadence_operator_{}", opts.port),
+    }
+}
+
+/// The session token the request presents for `origin`, if any.
+fn session_cookie(request: &Request, opts: &ServeOpts, origin: Origin) -> Option<String> {
+    let name = cookie_name(opts, origin);
+    request
+        .headers()
+        .iter()
+        .filter(|h| h.field.equiv("Cookie"))
+        .flat_map(|h| h.value.as_str().split(';'))
+        .filter_map(|pair| pair.trim().split_once('='))
+        .find(|(k, _)| *k == name)
+        .map(|(_, v)| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// This request's own origin, as a browser on it would send `Origin`.
+fn own_origin(request: &Request, origin: Origin) -> String {
+    let host = header_value(request, "Host")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    match origin {
+        Origin::Loopback => format!("http://{host}"),
+        Origin::Tailnet => format!("https://{}", host.trim_end_matches(":443")),
+    }
+}
+
+/// A cookie-bearing write must say where it comes from, and it must be
+/// here: `Origin` present and equal to this request's scheme + Host.
+fn require_own_origin(request: &Request, origin: Origin) -> Result<(), HttpResp> {
+    let want = own_origin(request, origin);
+    match header_value(request, "Origin") {
+        Some(got) if got.trim().eq_ignore_ascii_case(&want) => Ok(()),
+        Some(got) => Err(guard_fail(
+            "origin",
+            &format!(
+                "an operator session is only accepted from its own origin ({want}); \
+                 this request says '{got}'"
+            ),
+        )),
+        None => Err(guard_fail(
+            "origin",
+            "a request carrying an operator session must send Origin",
+        )),
+    }
+}
+
+/// Ask the daemon whether `token` is a live session on `origin`.
+fn check_session(
+    state_dir: &std::path::Path,
+    token: &str,
+    origin: Origin,
+) -> Result<Option<Value>, HttpResp> {
+    match client::rpc(
+        state_dir,
+        "operator_session_check",
+        json!({"token": token, "origin": origin.as_str()}),
+    ) {
+        Ok(v) if v["valid"] == true => Ok(Some(v["session"].clone())),
+        Ok(_) => Ok(None),
+        Err(e) if e.to_string().contains("Unknown method") => Err(coded_response(
+            501,
+            "unsupported_daemon",
+            "this daemon does not support operator sessions — upgrade it",
+            None,
+        )),
+        Err(e) => Err(coded_response(
+            503,
+            "daemon_unavailable",
+            &format!("operator sessions are checked by the daemon: {e}"),
+            None,
+        )),
+    }
+}
+
+/// How the board's peer attribution came out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Attribution {
+    /// Tied to exactly this agent.
+    Agent(String),
+    /// A local process tied to no agent — the operator's browser, a
+    /// relay, or a detached agent child alike.
+    NoAgent,
+    /// Unattributable (unreadable ancestry, several agents, no daemon).
+    Unknown(String),
+    /// The proven `tailscale serve` proxy, with its login (or why none).
+    Proxy(Result<String, String>),
+}
+
+/// What [`decide`] rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Verdict {
+    Operator(String),
+    Agent(String),
+    /// A live session presented by an agent: revoke it, refuse.
+    Stolen(String),
+    Refuse(&'static str, String),
+}
+
+pub(super) const SESSION_REQUIRED: &str =
+    "board writes need the operator's session — this request \
+     carries none (a caller tied to no agent, or any relay, is never the operator by default). \
+     Sign in with `cadence ui login` from the operator's own shell";
+
+/// The board's one caller rule (module table), pure so every row is
+/// unit-tested — the proven-proxy rows included, which no integration
+/// test can reach (a test cannot own a socket as tailscaled's uid).
+pub(super) fn decide(session: bool, attribution: Attribution) -> Verdict {
+    match (session, attribution) {
+        (true, Attribution::Agent(alias)) => Verdict::Stolen(alias),
+        (true, Attribution::Proxy(Ok(actor))) => Verdict::Operator(actor),
+        (true, Attribution::Proxy(Err(why))) => {
+            Verdict::Refuse("caller_identity", format!("board write refused: {why}."))
+        }
+        (true, Attribution::NoAgent | Attribution::Unknown(_)) => {
+            Verdict::Operator(UI_ACTOR.to_string())
+        }
+        (false, Attribution::Agent(alias)) => Verdict::Agent(alias),
+        (false, Attribution::NoAgent | Attribution::Proxy(_)) => {
+            Verdict::Refuse("operator_session_required", SESSION_REQUIRED.to_string())
+        }
+        (false, Attribution::Unknown(why)) => Verdict::Refuse(
+            "caller_identity",
+            format!(
+                "board write refused: caller identity underivable — {why}. Writes \
+                 attribute the peer process to the registered pane or managed endpoint \
+                 it is tied to; the operator writes with a session (`cadence ui login`)."
+            ),
+        ),
+    }
+}
+
+/// Attribute the TCP peer to an agent ([`crate::peer::tcp_peer_agent`]).
+fn attribute(
+    request: &Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+    origin: &ReqOrigin,
+) -> Attribution {
+    if matches!(origin, ReqOrigin::Known(Origin::Tailnet)) {
+        return Attribution::Proxy(proxied_actor(
+            header_value(request, "Tailscale-User-Login").as_deref(),
+        ));
+    }
+    let found = agent_roots(state_dir).and_then(|roots| {
+        if roots.is_empty() {
+            return Ok(None);
+        }
+        let peer = request
+            .remote_addr()
+            .ok_or_else(|| "the request has no peer address".to_string())?;
+        crate::peer::tcp_peer_agent(opts.port, *peer, &roots)
+    });
+    match found {
+        Ok(Some(alias)) => Attribution::Agent(alias),
+        Ok(None) => Attribution::NoAgent,
+        Err(why) => match origin {
+            ReqOrigin::Unproven(p) => {
+                Attribution::Unknown(format!("{why}. It is not the tailscale proxy either: {p}"))
+            }
+            ReqOrigin::Known(_) => Attribution::Unknown(why),
+        },
+    }
+}
+
+/// The caller of a board write (module doc). `Err` is the refusal to
+/// send; an agent on an operator-only route is the route's to refuse,
+/// with its own words.
+pub(super) fn board_caller(
+    request: &Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+) -> Result<Caller, HttpResp> {
+    let origin = request_origin(request, opts);
+    let session = match &origin {
+        ReqOrigin::Known(o) => match session_cookie(request, opts, *o) {
+            Some(token) => {
+                require_own_origin(request, *o)?;
+                check_session(state_dir, &token, *o)?.map(|_| token)
+            }
+            None => None,
+        },
+        ReqOrigin::Unproven(_) => None,
+    };
+    let attribution = attribute(request, state_dir, opts, &origin);
+    match decide(session.is_some(), attribution) {
+        Verdict::Operator(actor) => Ok(Caller::Operator(actor)),
+        Verdict::Agent(alias) => Ok(Caller::Agent(alias)),
+        Verdict::Stolen(alias) => {
+            let token = session.unwrap_or_default();
+            let _ = client::rpc(
+                state_dir,
+                "operator_session_stolen",
+                json!({"token": token, "agent": alias}),
+            );
+            Err(guard_fail(
+                "session_from_agent",
+                &format!(
+                    "an operator session was presented by agent '{alias}' — the session is \
+                     revoked. Sign in again with `cadence ui login`"
+                ),
+            ))
+        }
+        Verdict::Refuse(check, msg) => Err(guard_fail(check, &msg)),
+    }
+}
+
+/// `/api/meta`'s session fields: `operator` (this request holds a live
+/// session), `session` (its display id and expiries, never the token)
+/// and `login_hint` (the command that signs this origin in).
+pub(super) fn meta(request: &Request, state_dir: &std::path::Path, opts: &ServeOpts) -> Value {
+    let (hint, session) = match request_origin(request, opts) {
+        ReqOrigin::Known(o) => {
+            let hint = match o {
+                Origin::Loopback => "cadence ui login",
+                Origin::Tailnet => "cadence ui login --tailnet",
+            };
+            let session = session_cookie(request, opts, o)
+                .and_then(|token| check_session(state_dir, &token, o).ok().flatten());
+            (hint, session)
+        }
+        ReqOrigin::Unproven(_) => ("cadence ui login", None),
+    };
+    json!({
+        "signed_in": session.is_some(),
+        "session": session,
+        "login_hint": hint,
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionReq {
+    nonce: String,
+}
+
+fn set_cookie(resp: &mut HttpResp, value: &str) {
+    if let Ok(h) = Header::from_bytes("Set-Cookie", value.as_bytes()) {
+        resp.add_header(h);
+    }
+}
+
+fn no_store(mut resp: HttpResp) -> HttpResp {
+    resp.add_header(Header::from_bytes("Cache-Control", "no-store").unwrap());
+    resp
+}
+
+fn cookie_attrs(origin: Origin, max_age: i64) -> String {
+    let secure = if origin == Origin::Tailnet {
+        "; Secure"
+    } else {
+        ""
+    };
+    format!("Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}{secure}")
+}
+
+/// `POST /api/session {"nonce"}` — exchange a login link for a session
+/// cookie. The write guards apply and `Origin` must be this request's
+/// own; the link must have been minted for this origin. A peer tied to
+/// an agent spends the link and gets nothing.
+pub(super) fn open(
+    request: &mut Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+) -> HttpResp {
+    if opts.read_only {
+        return guard_fail("read_only", "board is read-only — sign-in is disabled");
+    }
+    if let Err(resp) = write_guard(request, "application/json", opts) {
+        return resp;
+    }
+    let origin = match request_origin(request, opts) {
+        ReqOrigin::Known(o) => o,
+        ReqOrigin::Unproven(why) => {
+            return guard_fail(
+                "tailnet_proof",
+                &format!("sign-in refused: this request names the tailnet but is not proven to come through tailscale serve — {why}"),
+            )
+        }
+    };
+    if let Err(resp) = require_own_origin(request, origin) {
+        return resp;
+    }
+    let bytes = match read_body(request, 4096) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let req: SessionReq = match parse_json(&bytes) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let user_agent = header_value(request, "User-Agent").unwrap_or_default();
+    let opened = client::rpc(
+        state_dir,
+        "operator_session_open",
+        json!({"nonce": req.nonce, "origin": origin.as_str(), "user_agent": user_agent}),
+    );
+    let opened = match opened {
+        Ok(v) => v,
+        Err(e) if e.code() == Some("login_link") => {
+            return no_store(guard_fail("login_link", &e.to_string()))
+        }
+        Err(e) if e.to_string().contains("Unknown method") => {
+            return coded_response(
+                501,
+                "unsupported_daemon",
+                "this daemon does not support operator sessions — upgrade it",
+                None,
+            )
+        }
+        Err(e) => {
+            return coded_response(503, "daemon_unavailable", &e.to_string(), None);
+        }
+    };
+    let token = opened["token"].as_str().unwrap_or_default().to_string();
+    if let Attribution::Agent(alias) =
+        attribute(request, state_dir, opts, &ReqOrigin::Known(origin))
+    {
+        let _ = client::rpc(
+            state_dir,
+            "operator_session_stolen",
+            json!({"token": token, "agent": alias}),
+        );
+        return guard_fail(
+            "session_from_agent",
+            &format!(
+                "sign-in refused: this request comes from agent '{alias}' — the link is spent"
+            ),
+        );
+    }
+    let now = crate::issue::time::now_epoch();
+    let expires = opened["session"]["expires_at"].as_i64().unwrap_or(now);
+    let mut resp = Response::from_data(Vec::new()).with_status_code(StatusCode(204));
+    set_cookie(
+        &mut resp,
+        &format!(
+            "{}={token}; {}",
+            cookie_name(opts, origin),
+            cookie_attrs(origin, (expires - now).max(0))
+        ),
+    );
+    no_store(resp)
+}
+
+/// `POST /api/session/logout` — end the presenting session (if any) and
+/// clear its cookie. Idempotent.
+pub(super) fn logout(request: &Request, state_dir: &std::path::Path, opts: &ServeOpts) -> HttpResp {
+    if let Err(resp) = write_guard(request, "application/json", opts) {
+        return resp;
+    }
+    let ReqOrigin::Known(origin) = request_origin(request, opts) else {
+        return guard_fail("tailnet_proof", "logout refused: unproven tailnet request");
+    };
+    if let Some(token) = session_cookie(request, opts, origin) {
+        if let Err(resp) = require_own_origin(request, origin) {
+            return resp;
+        }
+        if let Err(e) = client::rpc(
+            state_dir,
+            "operator_session_logout",
+            json!({"token": token}),
+        ) {
+            return coded_response(503, "daemon_unavailable", &e.to_string(), None);
+        }
+    }
+    let mut resp = Response::from_data(Vec::new()).with_status_code(StatusCode(204));
+    set_cookie(
+        &mut resp,
+        &format!(
+            "{}=; {}",
+            cookie_name(opts, origin),
+            cookie_attrs(origin, 0)
+        ),
+    );
+    no_store(resp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn route_table_classifies_and_fails_closed() {
+        let operator_only = WRITE_ROUTES
+            .iter()
+            .filter(|r| r.class == RouteClass::OperatorOnly)
+            .count();
+        assert!(operator_only >= 7, "the table lost operator-only routes");
+        assert_eq!(
+            route_class("POST", "/api/plans/CAD-1/approve"),
+            RouteClass::OperatorOnly
+        );
+        assert_eq!(
+            route_class("POST", "/api/issues/CAD-1/answers"),
+            RouteClass::OperatorOnly
+        );
+        assert_eq!(
+            route_class("POST", "/api/issues/CAD-1/comments"),
+            RouteClass::AgentAllowed
+        );
+        assert_eq!(
+            route_class("PATCH", "/api/issues/CAD-1"),
+            RouteClass::AgentAllowed
+        );
+        assert_eq!(route_class("POST", "/api/issues"), RouteClass::AgentAllowed);
+        assert_eq!(route_class("POST", "/api/session"), RouteClass::Session);
+        // Unlisted writes are operator-only.
+        assert_eq!(route_class("POST", "/api/launch"), RouteClass::OperatorOnly);
+        assert_eq!(
+            route_class("POST", "/api/epics/E-1/stage"),
+            RouteClass::OperatorOnly
+        );
+        assert_eq!(
+            route_class("DELETE", "/api/issues/CAD-1"),
+            RouteClass::OperatorOnly
+        );
+        assert_eq!(
+            route_class("POST", "/api/issues//comments"),
+            RouteClass::OperatorOnly
+        );
+    }
+
+    /// Every row of the caller table, including the proven-proxy rows no
+    /// integration test can reach.
+    #[test]
+    fn the_caller_table() {
+        let agent = || Attribution::Agent("pane-a".into());
+        let proxy = |l: &str| Attribution::Proxy(Ok(format!("{l} (tailscale)")));
+        // With a session.
+        assert_eq!(decide(true, agent()), Verdict::Stolen("pane-a".into()));
+        assert_eq!(
+            decide(true, proxy("fable@example.com")),
+            Verdict::Operator("fable@example.com (tailscale)".into())
+        );
+        assert!(matches!(
+            decide(true, Attribution::Proxy(Err("no login".into()))),
+            Verdict::Refuse("caller_identity", _)
+        ));
+        assert_eq!(
+            decide(true, Attribution::NoAgent),
+            Verdict::Operator(UI_ACTOR.into())
+        );
+        assert_eq!(
+            decide(true, Attribution::Unknown("sshd".into())),
+            Verdict::Operator(UI_ACTOR.into())
+        );
+        // Without one: never the operator, whatever the peer.
+        assert_eq!(decide(false, agent()), Verdict::Agent("pane-a".into()));
+        assert!(matches!(
+            decide(false, Attribution::NoAgent),
+            Verdict::Refuse("operator_session_required", _)
+        ));
+        assert!(matches!(
+            decide(false, proxy("fable@example.com")),
+            Verdict::Refuse("operator_session_required", _)
+        ));
+        assert!(matches!(
+            decide(false, Attribution::Unknown("x".into())),
+            Verdict::Refuse("caller_identity", _)
+        ));
+    }
+
+    #[test]
+    fn cookie_attributes() {
+        let opts = ServeOpts {
+            port: 3123,
+            ..Default::default()
+        };
+        assert_eq!(
+            cookie_name(&opts, Origin::Loopback),
+            "cadence_operator_3123"
+        );
+        assert_eq!(
+            cookie_name(&opts, Origin::Tailnet),
+            "__Host-cadence_operator_3123"
+        );
+        let l = cookie_attrs(Origin::Loopback, 60);
+        assert!(l.contains("HttpOnly") && l.contains("SameSite=Strict") && l.contains("Path=/"));
+        assert!(!l.contains("Secure") && !l.contains("Domain"));
+        assert!(cookie_attrs(Origin::Tailnet, 60).contains("Secure"));
+    }
+}

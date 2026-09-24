@@ -20,6 +20,9 @@ use cadence_agent::{client, daemon};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
+#[path = "support/operator.rs"]
+mod op;
+
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_cadence")
 }
@@ -226,6 +229,50 @@ impl Drop for BoardStop {
     fn drop(&mut self) {
         self.0.store(true, std::sync::atomic::Ordering::SeqCst);
     }
+}
+
+/// Sign in to the board on `port` as the operator (CAD-313) — the real
+/// `cadence ui login` link exchanged at `POST /api/session`. The daemon
+/// on `state` must be up: it is the session authority.
+fn sign_in(state: &Path, port: u16) -> op::Session {
+    op::sign_in(bin(), state, port)
+}
+
+/// [`http_write`] as the signed-in operator `op`: its session cookie,
+/// plus this request's own `Origin` unless `headers` already set one
+/// (a cookie-bearing write must say where it comes from).
+fn op_http_write(
+    op: &op::Session,
+    port: u16,
+    method: &str,
+    path: &str,
+    host: &str,
+    headers: &[&str],
+    body: &[u8],
+) -> (u16, String, String) {
+    let cookie = format!("Cookie: {}", op.cookie);
+    let origin = format!("Origin: http://{host}");
+    let mut all: Vec<&str> = headers.to_vec();
+    if !headers
+        .iter()
+        .any(|h| h.to_ascii_lowercase().starts_with("origin:"))
+    {
+        all.push(&origin);
+    }
+    all.push(&cookie);
+    http_write(port, method, path, host, &all, body)
+}
+
+/// [`write_json`] as the signed-in operator `op`.
+fn op_write_json(
+    op: &op::Session,
+    port: u16,
+    method: &str,
+    path: &str,
+    host: &str,
+    body: &str,
+) -> (u16, String, String) {
+    op_http_write(op, port, method, path, host, WRITE_HEADERS, body.as_bytes())
 }
 
 /// Spawn `ui::serve` on a free port and wait for health. The caller owns
@@ -764,6 +811,17 @@ fn ui_write_path() {
     seed(pm.path(), state.path());
     let (port, _board) = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
     let host = format!("127.0.0.1:{port}");
+    // CAD-313: a board write is the operator's only with a session —
+    // this test process signs in and writes as `operator (ui)`.
+    let _d = UiDaemon::start_on(state.path().to_path_buf());
+    let op = sign_in(state.path(), port);
+    let write_json = |port: u16, method: &str, path: &str, host: &str, body: &str| {
+        op_write_json(&op, port, method, path, host, body)
+    };
+    let http_write =
+        |port: u16, method: &str, path: &str, host: &str, headers: &[&str], body: &[u8]| {
+            op_http_write(&op, port, method, path, host, headers, body)
+        };
     let before = commits(pm.path());
 
     // --- cross-site guards, each failing separately ---
@@ -1352,6 +1410,13 @@ fn writes_validate_fields() {
     // --- HTTP: the same writer, the same rejections (400) ---
     let (port, _board) = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
     let host = format!("127.0.0.1:{port}");
+    // CAD-313: a board write is the operator's only with a session —
+    // this test process signs in and writes as `operator (ui)`.
+    let _d = UiDaemon::start_on(state.path().to_path_buf());
+    let op = sign_in(state.path(), port);
+    let write_json = |port: u16, method: &str, path: &str, host: &str, body: &str| {
+        op_write_json(&op, port, method, path, host, body)
+    };
     let before = commits(pm.path());
     for (method, path, body, want) in [
         (
@@ -2138,6 +2203,33 @@ impl UiDaemon {
         }
     }
 
+    /// Serve with the operator-auth clock `clock` (CAD-313): a test
+    /// advances it past a login link's TTL instead of sleeping.
+    fn start_with_clock(
+        state: PathBuf,
+        clock: std::sync::Arc<dyn Fn() -> i64 + Send + Sync>,
+    ) -> Self {
+        let owned = state.clone();
+        let handle = thread::spawn(move || {
+            let opts = daemon::ServeOptions {
+                operator_clock: Some(clock),
+                ..Default::default()
+            };
+            let _ = daemon::serve_with(&owned, opts);
+        });
+        let d = Self {
+            state,
+            _tmp: None,
+            handle: Some(handle),
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while d.rpc_opt("health", json!({})).is_err() {
+            assert!(Instant::now() < deadline, "daemon did not become healthy");
+            thread::sleep(Duration::from_millis(50));
+        }
+        d
+    }
+
     fn rpc_opt(&self, method: &str, params: Value) -> cadence_agent::Result<Value> {
         client::rpc(&self.state, method, params)
     }
@@ -2410,9 +2502,10 @@ fn proc_start(pid: u32) -> Option<i64> {
 /// board write from a process that descends from a registered pane is
 /// that agent's write — its alias lands in the commit and as the
 /// comment author, never `operator` — while a peer on no pane's lineage
-/// (this test process, standing in for the operator's browser) still
-/// writes as `operator (ui)`. With the store present but the daemon
-/// gone the panes are unknowable, so a write is refused, not guessed.
+/// (this test process, standing in for the operator's browser) writes
+/// as `operator (ui)` only with the operator's session (CAD-313) and is
+/// refused without one. With the store present but the daemon gone the
+/// panes are unknowable, so a write is refused, not guessed.
 #[test]
 fn ui_write_caller_derives_from_pane_ancestry() {
     let pm = TempDir::new().unwrap();
@@ -2472,8 +2565,24 @@ fn ui_write_caller_derives_from_pane_ancestry() {
     assert!(last.contains("Actor: pane-w"), "{last}");
     assert!(!last.contains("operator"), "{last}");
 
-    // The operator: this test process is on no pane's lineage.
-    let (code, _, _) = write_json(
+    // On no pane's lineage is not the operator (CAD-313, F1): without
+    // a session this test process is refused and nothing is written.
+    let commits_before = commits(pm.path());
+    let (code, _, body) = write_json(
+        port,
+        "PATCH",
+        "/api/issues/CAD-3",
+        &host,
+        r#"{"priority":"P1"}"#,
+    );
+    assert_eq!(code, 403, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["check"], "operator_session_required", "{v}");
+    assert_eq!(commits(pm.path()), commits_before);
+    // The operator: this test process, signed in.
+    let op = sign_in(state.path(), port);
+    let (code, _, _) = op_write_json(
+        &op,
         port,
         "PATCH",
         "/api/issues/CAD-3",
@@ -2683,8 +2792,9 @@ fn ui_write_caller_attributes_a_setsid_child_of_a_pane() {
 
 /// CAD-263 review: `CADENCE_ALIAS` is caller-chosen, so on the board it
 /// never attributes by itself. A pane-less process exporting a
-/// registered pane's alias — no ancestry, no pane pty — writes as
-/// `operator (ui)`, not as that agent.
+/// registered pane's alias — no ancestry, no pane pty — is not that
+/// agent, and (CAD-313, flipped deliberately per ADR 0004 §6) not the
+/// operator either: without a session it is refused and writes nothing.
 #[test]
 fn ui_write_caller_ignores_an_uncorroborated_env_alias() {
     let pm = TempDir::new().unwrap();
@@ -2717,10 +2827,13 @@ fn ui_write_caller_ignores_an_uncorroborated_env_alias() {
     let _ = pane_b.kill();
     let _ = pane_b.wait();
     let response = String::from_utf8(client.stdout).unwrap();
-    let comment = replied_comment(&response, "forged alias");
-    assert_eq!(comment["author"], "operator", "{comment}");
+    assert!(
+        response.starts_with("HTTP/1.1 403") || response.starts_with("HTTP/1.0 403"),
+        "{response}"
+    );
+    assert!(response.contains("operator_session_required"), "{response}");
     let (_, last) = git(pm.path(), &["log", "-1", "--format=%B"]);
-    assert!(last.contains("(operator (ui))"), "{last}");
+    assert!(!last.contains("forged alias"), "{last}");
     assert!(!last.contains("pane-b"), "{last}");
 }
 
@@ -2834,6 +2947,12 @@ fn ui_job_state_drives_status_and_binding() {
     let (_, task_id) = bound_job(pm.path(), &d, "CAD-3");
     let (port, _board) = start_ui(pm.path().to_path_buf(), d.state());
     let host = format!("127.0.0.1:{port}");
+    // CAD-313: a board write is the operator's only with a session —
+    // this test process signs in and writes as `operator (ui)`.
+    let op = sign_in(&d.state(), port);
+    let write_json = |port: u16, method: &str, path: &str, host: &str, body: &str| {
+        op_write_json(&op, port, method, path, host, body)
+    };
 
     // Card: job state wins over notes/file and binds the agent.
     let (code, body) = http(port, "GET", "/api/issues", &host);
@@ -3010,6 +3129,12 @@ fn ui_overview_surfaces_durable_monitor_alert_and_acknowledges_it() {
     // this passes from an agent pane too (CAD-471, as CAD-380).
     let (port, _board) = start_operator_ui(pm.path(), &d.state());
     let host = format!("127.0.0.1:{port}");
+    // CAD-313: a board write is the operator's only with a session —
+    // this test process signs in and writes as `operator (ui)`.
+    let op = sign_in(&d.state(), port);
+    let write_json = |port: u16, method: &str, path: &str, host: &str, body: &str| {
+        op_write_json(&op, port, method, path, host, body)
+    };
     let (code, body) = http(port, "GET", "/api/overview", &host);
     assert_eq!(code, 200, "{body}");
     let overview: Value = serde_json::from_str(&body).unwrap();
@@ -3431,13 +3556,17 @@ fn history_fixture() -> HistFx {
         .0
     );
     // One set through the HTTP write path — the commit subject ends in
-    // ` (operator (ui))`.
+    // ` (operator (ui))`. It needs the operator's session (CAD-313), so
+    // a daemon runs just for the sign-in and the write.
+    let d = UiDaemon::start_on(state.path().to_path_buf());
+    let op = sign_in(state.path(), port);
     let (_, detail) = http(port, "GET", "/api/issues/CAD-1", &host);
     let rev = serde_json::from_str::<Value>(&detail).unwrap()["rev"]
         .as_str()
         .unwrap()
         .to_string();
-    let (code, _, body) = write_json(
+    let (code, _, body) = op_write_json(
+        &op,
         port,
         "PATCH",
         "/api/issues/CAD-1",
@@ -3445,6 +3574,7 @@ fn history_fixture() -> HistFx {
         &format!(r#"{{"status":"review","if_rev":"{rev}"}}"#),
     );
     assert_eq!(code, 200, "{body}");
+    drop(d);
     let log = git(pm.path(), &["log", "--format=%H %s", "--", "cadence/CAD-1"]).1;
     let sha_of = |needle: &str| -> String {
         log.lines()
@@ -4390,6 +4520,13 @@ fn issue_tags_round_trip_and_declared_list() {
     // The HTTP write path: same validation, same if_rev rule.
     let (port, _board) = start_ui(pm.to_path_buf(), state.to_path_buf());
     let host = format!("127.0.0.1:{port}");
+    // CAD-313: a board write is the operator's only with a session —
+    // this test process signs in and writes as `operator (ui)`.
+    let _d = UiDaemon::start_on(state.to_path_buf());
+    let op = sign_in(state, port);
+    let write_json = |port: u16, method: &str, path: &str, host: &str, body: &str| {
+        op_write_json(&op, port, method, path, host, body)
+    };
     let detail = |id: &str| -> Value {
         let (code, body) = http(port, "GET", &format!("/api/issues/{id}"), &host);
         assert_eq!(code, 200, "{body}");
@@ -7353,21 +7490,31 @@ fn tailnet_shaped_local_write_is_not_the_proxy() {
     let ts_host = format!("{TS_DNS}:9450");
     let origin = format!("https://{TS_DNS}:9450");
 
-    let headers = ts_write_headers(&origin, "fable@example.com");
-    let href: Vec<&str> = headers.iter().map(String::as_str).collect();
-    let (code, _, _) = http_write(
-        port,
-        "PATCH",
-        "/api/issues/CAD-2",
-        &ts_host,
-        &href,
-        br#"{"status":"done"}"#,
-    );
-    assert_eq!(code, 200);
-    let sha = sha_of(pm.path(), "cadence/CAD-2", "status=done");
-    let t = trailers_of(pm.path(), &sha);
-    assert!(t.contains("Actor: operator (ui)"), "{t}");
-    assert!(!t.contains("fable"), "{t}");
+    // CAD-313/CAD-428: an unproven tailnet request can use no session —
+    // not even the operator's loopback one replayed onto it — so the
+    // local caller is refused and nothing is written, under no name.
+    let _d = UiDaemon::start_on(state.path().to_path_buf());
+    let op = sign_in(state.path(), port);
+    let before = commits(pm.path());
+    let mut headers = ts_write_headers(&origin, "fable@example.com");
+    for cookie in [None, Some(format!("Cookie: {}", op.cookie))] {
+        headers.retain(|h| !h.starts_with("Cookie:"));
+        headers.extend(cookie);
+        let href: Vec<&str> = headers.iter().map(String::as_str).collect();
+        let (code, _, body) = http_write(
+            port,
+            "PATCH",
+            "/api/issues/CAD-2",
+            &ts_host,
+            &href,
+            br#"{"status":"done"}"#,
+        );
+        assert_eq!(code, 403, "{body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["check"], "operator_session_required", "{v}");
+        assert!(!body.contains("fable"), "{body}");
+    }
+    assert_eq!(commits(pm.path()), before, "nothing is written");
 
     // /api/meta agrees, names the refusing check, and still reports
     // the tailnet URL.
@@ -7516,8 +7663,8 @@ fn tailnet_operator_latch_outlives_a_clear() {
 }
 
 /// The TCP-forwarder attack end to end: a tailnet-shaped write through
-/// a board whose serve config forwards raw TCP to it commits as the
-/// local caller, never the forged login.
+/// a board whose serve config forwards raw TCP to it is not the proxy,
+/// so it names nobody — and, holding no session, writes nothing.
 #[test]
 fn tailnet_write_with_a_tcp_forwarder_is_not_attributed() {
     let (pm, state) = (TempDir::new().unwrap(), TempDir::new().unwrap());
@@ -7532,9 +7679,10 @@ fn tailnet_write_with_a_tcp_forwarder_is_not_attributed() {
     serve["TCP"]["7777"] = json!({"TCPForward": format!("127.0.0.1:{port}")});
     localapi_says(ts_dir.path(), Some(true), serve);
     let origin = format!("https://{TS_DNS}:9450");
+    let before = commits(pm.path());
     let headers = ts_write_headers(&origin, "mallory@evil.example");
     let href: Vec<&str> = headers.iter().map(String::as_str).collect();
-    let (code, _, _) = http_write(
+    let (code, _, body) = http_write(
         port,
         "PATCH",
         "/api/issues/CAD-2",
@@ -7542,11 +7690,11 @@ fn tailnet_write_with_a_tcp_forwarder_is_not_attributed() {
         &href,
         br#"{"status":"done"}"#,
     );
-    assert_eq!(code, 200);
-    let sha = sha_of(pm.path(), "cadence/CAD-2", "status=done");
-    let t = trailers_of(pm.path(), &sha);
-    assert!(t.contains("Actor: operator (ui)"), "{t}");
-    assert!(!t.contains("mallory"), "{t}");
+    // CAD-313: unproven, so no session and no operator — refused.
+    assert_eq!(code, 403, "{body}");
+    assert!(body.contains("operator_session_required"), "{body}");
+    assert!(!body.contains("mallory"), "{body}");
+    assert_eq!(commits(pm.path()), before, "nothing is written");
     assert_eq!(tailnet_meta(port).1["check"], "no_tcp_forwarder");
 }
 
@@ -7563,10 +7711,24 @@ fn forged_tailscale_headers_not_attributed() {
 
     // Same headers, but the Host is direct loopback — the identity
     // headers must be ignored (the proxy only sets them on the
-    // tailnet name).
+    // tailnet name). Without a session that is a refusal (CAD-313);
+    // with the operator's, `operator (ui)` — never the forged login.
     let headers = ts_write_headers(&format!("http://127.0.0.1:{port}"), "mallory@evil.example");
     let href: Vec<&str> = headers.iter().map(String::as_str).collect();
-    let (code, _, _) = http_write(
+    let (code, _, body) = http_write(
+        port,
+        "PATCH",
+        "/api/issues/CAD-2",
+        &host,
+        &href,
+        br#"{"status":"done"}"#,
+    );
+    assert_eq!(code, 403, "{body}");
+    assert!(body.contains("operator_session_required"), "{body}");
+    let _d = UiDaemon::start_on(state.path().to_path_buf());
+    let op = sign_in(state.path(), port);
+    let (code, _, _) = op_http_write(
+        &op,
         port,
         "PATCH",
         "/api/issues/CAD-2",
@@ -7757,6 +7919,13 @@ fn sse_stream_survives_a_tcp_proxy() {
 
     // A write → `event: issues` arrives through the same proxy hop.
     let host = format!("127.0.0.1:{port}");
+    // CAD-313: a board write is the operator's only with a session —
+    // this test process signs in and writes as `operator (ui)`.
+    let _d = UiDaemon::start_on(state.path().to_path_buf());
+    let op = sign_in(state.path(), port);
+    let write_json = |port: u16, method: &str, path: &str, host: &str, body: &str| {
+        op_write_json(&op, port, method, path, host, body)
+    };
     let (code, _, _) = write_json(
         port,
         "PATCH",
@@ -10573,6 +10742,11 @@ fn model_defaults_http_round_trip_guards_and_conflict() {
     // this passes from an agent pane too (CAD-380).
     let (port, _ui) = start_operator_ui(pm.path(), &d.state());
     let host = format!("127.0.0.1:{port}");
+    // CAD-313: the operator's writes carry a session.
+    let op = sign_in(&d.state(), port);
+    let write_json = |port: u16, method: &str, path: &str, host: &str, body: &str| {
+        op_write_json(&op, port, method, path, host, body)
+    };
     let (code, body) = http(port, "GET", "/api/settings/model-defaults", &host);
     assert_eq!(code, 200, "{body}");
     let snap: Value = serde_json::from_str(&body).unwrap();
@@ -10637,7 +10811,9 @@ fn model_defaults_http_round_trip_guards_and_conflict() {
     let (agent_port, _agent_ui) =
         spawn_ui_env(pm.path(), &d.state(), &[("CADENCE_ALIAS", "board-agent")]);
     let agent_host = format!("127.0.0.1:{agent_port}");
-    let (code, _, body) = write_json(
+    let agent_op = sign_in(&d.state(), agent_port);
+    let (code, _, body) = op_write_json(
+        &agent_op,
         agent_port,
         "POST",
         "/api/settings/model-defaults",
@@ -10801,4 +10977,793 @@ fn setup_is_refused_to_read_only_and_tailnet_viewers() {
         );
     }
     assert_eq!(ui::setup_runs(), runs, "a refused request ran the checks");
+}
+
+// --- CAD-313 / CAD-428: operator sessions — adversarial first ---
+//
+// Each test below names the guard it pins; each was run against the
+// code with that guard removed and failed (the PR body lists the
+// mutations).
+
+/// The daemon's events of `kind` on its own stream.
+fn daemon_events(state: &Path, kind: &str) -> Vec<Value> {
+    let conn = rusqlite::Connection::open_with_flags(
+        state.join("cadence.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let mut stmt = conn
+        .prepare("SELECT payload FROM events WHERE alias=?1 AND kind=?2 ORDER BY seq")
+        .unwrap();
+    let rows = stmt
+        .query_map(rusqlite::params![Store::DAEMON_STREAM, kind], |r| {
+            r.get::<_, String>(0)
+        })
+        .unwrap();
+    rows.map(|r| serde_json::from_str(&r.unwrap()).unwrap())
+        .collect()
+}
+
+/// `/api/meta` as `headers` see it.
+fn meta_with(port: u16, host: &str, headers: &[&str]) -> Value {
+    let (code, _, body) = http_write(port, "GET", "/api/meta", host, headers, b"");
+    assert_eq!(code, 200, "{body}");
+    serde_json::from_str(&body).unwrap()
+}
+
+fn check_of(body: &str) -> String {
+    serde_json::from_str::<Value>(body).unwrap()["check"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Every byte of every file under `dir`, for "never persisted" checks.
+fn all_bytes(dir: &Path) -> Vec<u8> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        let path = entry.path();
+        let ft = entry.file_type().unwrap();
+        if ft.is_dir() {
+            out.extend(all_bytes(&path));
+        } else if ft.is_file() {
+            out.extend(std::fs::read(&path).unwrap_or_default());
+        }
+    }
+    out
+}
+
+fn contains(hay: &[u8], needle: &str) -> bool {
+    hay.windows(needle.len()).any(|w| w == needle.as_bytes())
+}
+
+/// L1, L4, L7, O1, O2 and "exactly once" under concurrency: a login
+/// link opens ONE session however many callers race for it; a replay
+/// is refused `already_used` and recorded as an alert; the cookie is
+/// HttpOnly, SameSite=Strict, host-only, no-store; the session writes
+/// as `operator (ui)` and logout ends it. Neither the nonce nor the
+/// token is written anywhere under the state dir — the board's own
+/// `ui.log` and the daemon store included.
+#[test]
+fn a_login_link_opens_exactly_one_session_and_leaves_no_trace() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let d = UiDaemon::start_on(state.path().to_path_buf());
+    let (port, _ui) = start_operator_ui(pm.path(), &d.state());
+    let host = format!("127.0.0.1:{port}");
+
+    let meta = meta_with(port, &host, &[]);
+    assert_eq!(meta["operator"], false, "{meta}");
+    assert_eq!(meta["login_hint"], "cadence ui login", "{meta}");
+
+    let link = op::login_link(bin(), &d.state(), port, &[]).unwrap();
+    assert!(
+        link.starts_with(&format!("http://cadence.localhost:{port}/login#n=")),
+        "{link}"
+    );
+    let nonce = op::nonce_of(&link);
+    // Eight racers for one link: exactly one session.
+    let wins: Vec<(u16, String)> = (0..8)
+        .map(|_| {
+            let (nonce, host) = (nonce.clone(), host.clone());
+            thread::spawn(move || {
+                let (code, head, _) = op::exchange(port, &host, &nonce);
+                (code, head)
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|h| h.join().unwrap())
+        .collect();
+    let won: Vec<&(u16, String)> = wins.iter().filter(|(c, _)| *c == 204).collect();
+    assert_eq!(won.len(), 1, "{wins:?}");
+    assert!(wins.iter().all(|(c, _)| *c == 204 || *c == 403), "{wins:?}");
+    let head = &won[0].1;
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("cache-control: no-store"),
+        "{head}"
+    );
+    let set = op::set_cookie(head).unwrap();
+    assert!(
+        set.starts_with(&format!("cadence_operator_{port}=")),
+        "{set}"
+    );
+    for attr in ["HttpOnly", "SameSite=Strict", "Path=/", "Max-Age="] {
+        assert!(set.contains(attr), "{attr}: {set}");
+    }
+    assert!(!set.contains("Domain") && !set.contains("Secure"), "{set}");
+    let cookie = set.split(';').next().unwrap().to_string();
+    let token = cookie.split_once('=').unwrap().1.to_string();
+
+    // A replay is refused loudly, and the daemon records the alert.
+    let (code, _, body) = op::exchange(port, &host, &nonce);
+    assert_eq!(code, 403, "{body}");
+    assert_eq!(check_of(&body), "login_link");
+    assert!(body.contains("already_used"), "{body}");
+    let rejected = daemon_events(&d.state(), "operator_link_rejected");
+    assert!(
+        rejected
+            .iter()
+            .any(|e| e["reason"] == "already_used" && e["alert"] == true),
+        "{rejected:?}"
+    );
+
+    // Signed in: meta says so, and a write is the operator's.
+    let session = op::Session {
+        host: host.clone(),
+        origin: format!("http://{host}"),
+        cookie: cookie.clone(),
+        set_cookie: set.clone(),
+    };
+    let cookie_h = format!("Cookie: {cookie}");
+    let meta = meta_with(port, &host, &[&cookie_h]);
+    assert_eq!(meta["operator"], true, "{meta}");
+    assert_eq!(meta["session"]["origin"], "loopback", "{meta}");
+    let (code, _, body) = op_write_json(
+        &session,
+        port,
+        "PATCH",
+        "/api/issues/CAD-3",
+        &host,
+        r#"{"priority":"P1"}"#,
+    );
+    assert_eq!(code, 200, "{body}");
+    let (_, last) = git(pm.path(), &["log", "-1", "--format=%B"]);
+    assert!(last.contains("Actor: operator (ui)"), "{last}");
+
+    // Logout ends it, and clears the cookie.
+    let (code, head, _) = op::raw(port, &session.request("POST", "/api/session/logout", "{}"));
+    assert_eq!(code, 204, "{head}");
+    assert!(head.contains("Max-Age=0"), "{head}");
+    assert_eq!(meta_with(port, &host, &[&cookie_h])["operator"], false);
+    let (code, _, body) = op_write_json(
+        &session,
+        port,
+        "PATCH",
+        "/api/issues/CAD-3",
+        &host,
+        r#"{"priority":"P2"}"#,
+    );
+    assert_eq!(code, 403, "{body}");
+    assert_eq!(check_of(&body), "operator_session_required");
+
+    // L7: the log is not empty, and holds neither credential; nor does
+    // anything else under the state dir.
+    let log = std::fs::read_to_string(d.state().join("ui.log")).unwrap();
+    assert!(!log.trim().is_empty(), "the board log must be non-empty");
+    assert!(!daemon_events(&d.state(), "operator_link_minted").is_empty());
+    let everything = all_bytes(&d.state());
+    assert!(!contains(&everything, &nonce), "the nonce was persisted");
+    assert!(
+        !contains(&everything, &token),
+        "the session token was persisted"
+    );
+    let secret = std::fs::read_to_string(d.state().join("operator/secret")).unwrap();
+    assert!(
+        !contains(log.as_bytes(), secret.trim()),
+        "the operator secret reached the log"
+    );
+}
+
+/// L2: a link is good for 120 s, not a second more — by the daemon's
+/// clock, advanced instead of slept.
+#[test]
+fn a_login_link_expires_after_its_ttl() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let skew = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let clock = {
+        let skew = skew.clone();
+        std::sync::Arc::new(move || {
+            time::now_epoch() + skew.load(std::sync::atomic::Ordering::SeqCst)
+        })
+    };
+    let d = UiDaemon::start_with_clock(state.path().to_path_buf(), clock);
+    let port = start_ui(pm.path().to_path_buf(), d.state());
+    let host = format!("127.0.0.1:{port}");
+    let late = op::nonce_of(&op::login_link(bin(), &d.state(), port, &[]).unwrap());
+    let on_time = op::nonce_of(&op::login_link(bin(), &d.state(), port, &[]).unwrap());
+    skew.store(121, std::sync::atomic::Ordering::SeqCst);
+    let (code, _, body) = op::exchange(port, &host, &late);
+    assert_eq!(code, 403, "{body}");
+    assert!(body.contains("expired"), "{body}");
+    skew.store(119, std::sync::atomic::Ordering::SeqCst);
+    let (code, _, body) = op::exchange(port, &host, &on_time);
+    assert_eq!(code, 204, "{body}");
+}
+
+/// L3 and L5 — a link and a session belong to one origin. A tailnet
+/// link is refused on loopback; a loopback link cannot be opened on an
+/// unproven tailnet request. A session cookie is honoured only with
+/// this request's own `Origin`: none, a foreign one, another allowed
+/// board origin, or the tailnet Host all fail; another board's cookie
+/// (another port's name) is no session here.
+#[test]
+fn links_and_sessions_are_bound_to_their_origin() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let d = UiDaemon::start_on(state.path().to_path_buf());
+    let (ts_dir, sock) = fake_localapi();
+    let port = start_ui_opts(pm.path().to_path_buf(), d.state(), tailnet_opts(&sock));
+    localapi_says(ts_dir.path(), Some(true), serve_https_only(port));
+    let host = format!("127.0.0.1:{port}");
+    let ts_host = format!("{TS_DNS}:9450");
+    // `ui login --tailnet` reads the persisted sharing block.
+    std::fs::write(
+        d.state().join("ui.json"),
+        json!({"tailscale": {"dns_name": TS_DNS, "https_port": 9450,
+                             "target": format!("http://127.0.0.1:{port}")}})
+        .to_string(),
+    )
+    .unwrap();
+    let before = commits(pm.path());
+
+    let tailnet = op::login_link(bin(), &d.state(), port, &["--tailnet"]).unwrap();
+    assert!(
+        tailnet.starts_with(&format!("https://{TS_DNS}:9450/login#n=")),
+        "{tailnet}"
+    );
+    let (code, _, body) = op::exchange(port, &host, &op::nonce_of(&tailnet));
+    assert_eq!(code, 403, "{body}");
+    assert!(body.contains("wrong_origin"), "{body}");
+
+    let loopback = op::login_link(bin(), &d.state(), port, &[]).unwrap();
+    let (code, _, body) = op::raw(
+        port,
+        &op::request(
+            "POST",
+            "/api/session",
+            &ts_host,
+            Some(&format!("https://{TS_DNS}:9450")),
+            None,
+            &format!(r#"{{"nonce":"{}"}}"#, op::nonce_of(&loopback)),
+        ),
+    );
+    assert_eq!(code, 403, "{body}");
+    assert_eq!(check_of(&body), "tailnet_proof");
+
+    let s = sign_in(&d.state(), port);
+    let patch = r#"{"priority":"P0"}"#;
+    let with = |host: &str, origin: Option<&str>, cookie: &str| {
+        op::raw(
+            port,
+            &op::request(
+                "PATCH",
+                "/api/issues/CAD-3",
+                host,
+                origin,
+                Some(cookie),
+                patch,
+            ),
+        )
+    };
+    let other = format!("http://localhost:{port}");
+    for (h, origin, cookie, check) in [
+        (host.as_str(), None, s.cookie.as_str(), "origin"),
+        (
+            host.as_str(),
+            Some("http://evil.example"),
+            s.cookie.as_str(),
+            "origin",
+        ),
+        (
+            host.as_str(),
+            Some(other.as_str()),
+            s.cookie.as_str(),
+            "origin",
+        ),
+        (
+            ts_host.as_str(),
+            Some("https://node.tail1234.ts.net:9450"),
+            s.cookie.as_str(),
+            "operator_session_required",
+        ),
+    ] {
+        let (code, _, body) = with(h, origin, cookie);
+        assert_eq!(code, 403, "{h} {origin:?}: {body}");
+        assert_eq!(check_of(&body), check, "{h} {origin:?}: {body}");
+    }
+    let foreign = s.cookie.replacen(
+        &format!("cadence_operator_{port}="),
+        &format!("cadence_operator_{}=", port.wrapping_add(1)),
+        1,
+    );
+    let (code, _, body) = with(&host, Some(&s.origin), &foreign);
+    assert_eq!(code, 403, "{body}");
+    assert_eq!(check_of(&body), "operator_session_required");
+    assert_eq!(commits(pm.path()), before, "no refused write landed");
+    // The same session, from its own origin, writes.
+    let (code, _, body) = with(&host, Some(&s.origin), &s.cookie);
+    assert_eq!(code, 200, "{body}");
+}
+
+/// A10, A11 and S2 — only the operator mints. `ui login` from a pane's
+/// child, or from a shell carrying an agent's `CADENCE_ALIAS`, is
+/// refused by the daemon; so is an operator-shaped caller with a wrong
+/// or absent secret; and a loose secret file is refused — by the CLI
+/// and by the daemon, even when the right secret is presented — and
+/// never repaired. No link is minted by any of them.
+#[test]
+fn only_the_operator_with_the_secret_mints_a_login_link() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let d = UiDaemon::start_on(state.path().to_path_buf());
+    let port = start_ui(pm.path().to_path_buf(), d.state());
+    let minted = || daemon_events(&d.state(), "operator_link_minted").len();
+
+    // A pane's child.
+    let mut pane = Command::new("bash")
+        .args([
+            "-c",
+            r#"read -r _; "$BIN" --state-dir "$STATE" ui login --json --port "$PORT" 2>&1; true"#,
+        ])
+        .env("BIN", bin())
+        .env("STATE", d.state())
+        .env("PORT", port.to_string())
+        .env_remove("CADENCE_ALIAS")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    plant_pane(&d, "pane-l", pane.id());
+    pane.stdin.take().unwrap().write_all(b"go\n").unwrap();
+    let mut said = String::new();
+    pane.stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut said)
+        .unwrap();
+    assert!(pane.wait().unwrap().success());
+    assert!(!said.contains("#n="), "a pane minted a link: {said}");
+    assert!(said.contains("pane-l"), "{said}");
+
+    // An agent's environment, however detached.
+    let (ok, out, err) = op::operator_cli_env(
+        bin(),
+        &d.state(),
+        &["ui", "login", "--json", "--port", &port.to_string()],
+        &[("CADENCE_ALIAS", "pane-l")],
+    );
+    assert!(!ok, "{out}");
+    assert!(err.contains("CADENCE_ALIAS"), "{err}");
+
+    // The right shape with a wrong secret, or none.
+    let sock = client::socket_path(&d.state());
+    let made_up = format!("{:064x}", 0x5eed_u128 ^ u128::from(std::process::id()));
+    for params in [
+        json!({"origin": "loopback", "secret": made_up}),
+        json!({"origin": "loopback"}),
+    ] {
+        let frame = op::operator_rpc(&sock, "operator_link_mint", params);
+        assert_eq!(frame["ok"], false, "{frame}");
+        assert_eq!(frame["error"]["code"], "operator_secret", "{frame}");
+    }
+    assert_eq!(minted(), 0, "a refused caller minted");
+
+    // Loose modes: refused by the CLI and the daemon; never repaired.
+    use std::os::unix::fs::PermissionsExt;
+    let secret_path = d.state().join("operator/secret");
+    let secret = std::fs::read_to_string(&secret_path).unwrap();
+    for (path, loose, fix) in [
+        (secret_path.clone(), 0o640, "chmod 600"),
+        (secret_path.clone(), 0o604, "chmod 600"),
+        (d.state().join("operator"), 0o755, "chmod 700"),
+    ] {
+        let tight = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(loose)).unwrap();
+        let (ok, _, err) = op::operator_cli(
+            bin(),
+            &d.state(),
+            &["ui", "login", "--json", "--port", &port.to_string()],
+        );
+        assert!(!ok && err.contains(fix), "{loose:o}: {err}");
+        let frame = op::operator_rpc(
+            &sock,
+            "operator_link_mint",
+            json!({"origin": "loopback", "secret": secret.trim()}),
+        );
+        assert_eq!(
+            frame["error"]["code"], "operator_secret",
+            "{loose:o}: {frame}"
+        );
+        let now = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(now, loose, "the refusal repaired the mode");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(tight)).unwrap();
+    }
+    assert_eq!(minted(), 0, "a loose secret minted");
+    // Restored, the operator mints.
+    assert!(op::login_link(bin(), &d.state(), port, &[]).is_ok());
+    assert_eq!(minted(), 1);
+}
+
+/// A9 — a live session presented by a process tied to an agent is
+/// evidence of theft: refused `session_from_agent`, the session is
+/// revoked (the operator's next request with it fails too), and the
+/// daemon records it. Nothing is written.
+#[test]
+fn a_session_presented_by_an_agent_is_revoked() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let d = UiDaemon::start_on(state.path().to_path_buf());
+    let port = start_ui(pm.path().to_path_buf(), d.state());
+    let host = format!("127.0.0.1:{port}");
+    let s = sign_in(&d.state(), port);
+    let before = commits(pm.path());
+    let request = s.request("POST", "/api/issues/CAD-3/comments", r#"{"body":"stolen"}"#);
+    let mut pane = Command::new("bash")
+        .args(["-c", r#"read -r _; bash -c "$CLIENT"; true"#])
+        .env(
+            "CLIENT",
+            r#"exec 3<>"/dev/tcp/127.0.0.1/$PORT"; printf '%s' "$REQ" >&3; cat <&3"#,
+        )
+        .env("PORT", port.to_string())
+        .env("REQ", &request)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    plant_pane(&d, "pane-t", pane.id());
+    pane.stdin.take().unwrap().write_all(b"go\n").unwrap();
+    let mut response = String::new();
+    pane.stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut response)
+        .unwrap();
+    assert!(pane.wait().unwrap().success());
+    assert!(response.contains(" 403 "), "{response}");
+    assert!(response.contains("session_from_agent"), "{response}");
+    let seen = daemon_events(&d.state(), "operator_session_from_agent");
+    assert!(
+        seen.iter()
+            .any(|e| e["agent"] == "pane-t" && e["revoked"] == true),
+        "{seen:?}"
+    );
+    let (code, _, body) = op_write_json(
+        &s,
+        port,
+        "POST",
+        "/api/issues/CAD-3/comments",
+        &host,
+        r#"{"body":"after"}"#,
+    );
+    assert_eq!(code, 403, "{body}");
+    assert_eq!(check_of(&body), "operator_session_required");
+    assert_eq!(commits(pm.path()), before, "nothing is written");
+}
+
+/// F1 (A2, A5, A6) — without a session, no process shape is the
+/// operator, on any route: a `setsid -f` child of a pane with a
+/// scrubbed env and stdio (tied to no pane any more), this test process
+/// with every guard header forged, and one exporting a registered
+/// pane's alias. Each is refused `operator_session_required` on an
+/// agent-allowed route (a comment) and an operator-only one (model
+/// defaults), and nothing is written.
+#[test]
+fn without_a_session_no_process_shape_is_the_operator() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let out_dir = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let d = UiDaemon::start_on(state.path().to_path_buf());
+    let port = start_ui(pm.path().to_path_buf(), d.state());
+    let host = format!("127.0.0.1:{port}");
+    let before = commits(pm.path());
+    let doc = r#"{"expected_revision":0,"config":{"schema":1,"providers":{}}}"#;
+    let routes = [
+        ("/api/issues/CAD-3/comments", r#"{"body":"f1"}"#),
+        ("/api/settings/model-defaults", doc),
+    ];
+    let forged = |path: &str, body: &str| -> String {
+        format!(
+            "POST {path} HTTP/1.0\r\nHost: {host}\r\nContent-Type: application/json\r\n\
+             X-Cadence-Board: 1\r\nOrigin: http://{host}\r\nSec-Fetch-Site: same-origin\r\n\
+             Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    };
+
+    // A detached, scrubbed child of a pane — off its ancestry and stdio.
+    let client = r#"
+        on_pane_lineage() {
+            p=$$
+            while [ "$p" -gt 1 ]; do
+                [ "$p" = "$PANE" ] && return 0
+                p=$(awk '/^PPid:/{print $2}' "/proc/$p/status") || return 0
+                [ -n "$p" ] || return 0
+            done
+            return 1
+        }
+        while on_pane_lineage; do sleep 0.02; done
+        exec 3<>"/dev/tcp/127.0.0.1/$PORT"
+        printf '%s' "$REQ" >&3
+        cat <&3 >"$OUT.tmp" && mv "$OUT.tmp" "$OUT"
+    "#;
+    for (n, (path, body)) in routes.iter().enumerate() {
+        let out = out_dir.path().join(format!("reply-{n}"));
+        let mut pane = Command::new("bash")
+            .args([
+                "-c",
+                r#"read -r _; PANE=$$ setsid -f env -i PATH="$PATH" PANE=$$ PORT="$PORT" REQ="$REQ" OUT="$OUT" bash -c "$CLIENT" </dev/null >/dev/null 2>&1; true"#,
+            ])
+            .env("CADENCE_ALIAS", "pane-d")
+            .env("CLIENT", client)
+            .env("PORT", port.to_string())
+            .env("REQ", forged(path, body))
+            .env("OUT", &out)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        plant_pane(&d, &format!("pane-d{n}"), pane.id());
+        pane.stdin.take().unwrap().write_all(b"go\n").unwrap();
+        assert!(pane.wait().unwrap().success());
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !out.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the detached child never answered"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+        let reply = std::fs::read_to_string(&out).unwrap();
+        assert!(reply.contains(" 403 "), "{path}: {reply}");
+        assert!(
+            reply.contains("operator_session_required"),
+            "{path}: {reply}"
+        );
+    }
+
+    // This test process, every guard header forged; then with a
+    // registered pane's alias exported.
+    for (path, body) in routes {
+        let (code, _, reply) = op::raw(port, &forged(path, body));
+        assert_eq!(code, 403, "{path}: {reply}");
+        assert_eq!(check_of(&reply), "operator_session_required", "{path}");
+        let out = Command::new("bash")
+            .args([
+                "-c",
+                r#"exec 3<>"/dev/tcp/127.0.0.1/$PORT"; printf '%s' "$REQ" >&3; cat <&3"#,
+            ])
+            .env("CADENCE_ALIAS", "pane-d0")
+            .env("PORT", port.to_string())
+            .env("REQ", forged(path, body))
+            .output()
+            .unwrap();
+        let reply = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            reply.contains("operator_session_required"),
+            "{path}: {reply}"
+        );
+    }
+    assert_eq!(commits(pm.path()), before, "nothing is written");
+    let current: Value =
+        serde_json::from_str(&http(port, "GET", "/api/settings/model-defaults", &host).1).unwrap();
+    assert_eq!(current["revision"], 0, "{current}");
+}
+
+/// CAD-428 / the #233 review probe: a board started with `--allow-host
+/// <tailnet name>` and NO armed tailnet answers a loopback request with
+/// that Host and a `Tailscale-User-Login` as a local caller — which,
+/// without a session, is refused; with the operator's session it writes
+/// as `operator (ui)` and never as the forged login.
+#[test]
+fn an_allowed_tailnet_host_without_armed_sharing_trusts_no_header() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let d = UiDaemon::start_on(state.path().to_path_buf());
+    let port = start_ui_opts(pm.path().to_path_buf(), d.state(), |o| {
+        o.allow_hosts = vec![TS_DNS.to_string(), format!("{TS_DNS}:9450")];
+    });
+    let ts_host = format!("{TS_DNS}:9450");
+    let origin = format!("http://{ts_host}");
+    let before = commits(pm.path());
+    let headers = ts_write_headers(&origin, "mallory@evil.example");
+    let href: Vec<&str> = headers.iter().map(String::as_str).collect();
+    let (code, _, body) = http_write(
+        port,
+        "PATCH",
+        "/api/issues/CAD-3",
+        &ts_host,
+        &href,
+        br#"{"priority":"P0"}"#,
+    );
+    assert_eq!(code, 403, "{body}");
+    assert_eq!(check_of(&body), "operator_session_required");
+    assert!(!body.contains("mallory"), "{body}");
+    assert_eq!(commits(pm.path()), before);
+    let meta = meta_with(
+        port,
+        &ts_host,
+        &["Tailscale-User-Login: mallory@evil.example"],
+    );
+    assert_eq!(meta["actor"], "operator (ui)", "{meta}");
+    assert_eq!(meta["operator"], false, "{meta}");
+
+    let s = op::sign_in_at(bin(), &d.state(), port, &ts_host);
+    let (code, _, body) = op_http_write(
+        &s,
+        port,
+        "PATCH",
+        "/api/issues/CAD-3",
+        &ts_host,
+        &href,
+        br#"{"priority":"P0"}"#,
+    );
+    assert_eq!(code, 200, "{body}");
+    let sha = sha_of(pm.path(), "cadence/CAD-3", "priority=P0");
+    let t = trailers_of(pm.path(), &sha);
+    assert!(t.contains("Actor: operator (ui)"), "{t}");
+    assert!(!t.contains("mallory"), "{t}");
+}
+
+/// T-A over the route table itself (`ui::WRITE_ROUTES`), so a new route
+/// cannot skip it: the table has operator-only routes (an empty table
+/// fails), and every operator-only and agent-allowed write refuses a
+/// caller that holds no session and is tied to no agent — with nothing
+/// written. An unlisted write is operator-only.
+#[test]
+fn every_classified_write_refuses_a_caller_without_a_session() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let d = UiDaemon::start_on(state.path().to_path_buf());
+    let port = start_ui(pm.path().to_path_buf(), d.state());
+    let host = format!("127.0.0.1:{port}");
+    let operator_only = ui::WRITE_ROUTES
+        .iter()
+        .filter(|r| r.class == ui::RouteClass::OperatorOnly)
+        .count();
+    assert!(
+        operator_only >= 7,
+        "the route table lost its operator-only routes"
+    );
+    assert_eq!(
+        ui::route_class("POST", "/api/some/new/route"),
+        ui::RouteClass::OperatorOnly
+    );
+    let before = commits(pm.path());
+    let mut checked = 0;
+    for r in ui::WRITE_ROUTES {
+        if !matches!(
+            r.class,
+            ui::RouteClass::OperatorOnly | ui::RouteClass::AgentAllowed
+        ) {
+            continue;
+        }
+        let mut path = String::new();
+        let segs: Vec<&str> = r.pattern.split('/').collect();
+        for (i, seg) in segs.iter().enumerate() {
+            if i > 0 {
+                path.push('/');
+            }
+            path.push_str(match (*seg, segs.get(i.wrapping_sub(1)).copied()) {
+                ("*", Some("threads")) => "lead",
+                ("*", Some("monitors")) => "m1",
+                ("*", Some("alerts")) => "1",
+                ("*", _) => "CAD-3",
+                (s, _) => s,
+            });
+        }
+        let artifacts = path.ends_with("/artifacts");
+        if artifacts {
+            path.push_str("?name=x.md");
+        }
+        let ct = if artifacts {
+            "Content-Type: application/octet-stream"
+        } else {
+            "Content-Type: application/json"
+        };
+        let origin = format!("Origin: http://{host}");
+        let (code, _, body) = http_write(
+            port,
+            r.method,
+            &path,
+            &host,
+            &[ct, "X-Cadence-Board: 1", &origin],
+            b"{}",
+        );
+        assert_eq!(code, 403, "{} {path}: {body}", r.method);
+        assert_eq!(
+            check_of(&body),
+            "operator_session_required",
+            "{} {path}",
+            r.method
+        );
+        checked += 1;
+    }
+    assert!(checked > operator_only, "the loop checked {checked} routes");
+    assert_eq!(commits(pm.path()), before, "a refused write landed");
+}
+
+/// ADR 0004 §7 — PINS AN ACCEPTED RESIDUAL (phase 1). A same-uid process
+/// that deliberately reads the operator secret AND evades
+/// `operator_proof` — a `setsid -f` child of a pane, env scrubbed, stdio
+/// off the pane's pty — mints a login link. Phase 1 makes this a
+/// deliberate, multi-step act (the daemon records `operator_link_minted`
+/// with the pid); it does not prevent it. Phase 2 (CAD-280: make
+/// `operator/` unreadable from agent process trees) must flip this test
+/// DELIBERATELY: the mint must then fail.
+#[test]
+fn operator_secret_theft_residual_pinned() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let out_dir = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let d = UiDaemon::start_on(state.path().to_path_buf());
+    let port = start_ui(pm.path().to_path_buf(), d.state());
+    let out = out_dir.path().join("minted");
+    let client = r#"
+        on_pane_lineage() {
+            p=$$
+            while [ "$p" -gt 1 ]; do
+                [ "$p" = "$PANE" ] && return 0
+                p=$(awk '/^PPid:/{print $2}' "/proc/$p/status") || return 0
+                [ -n "$p" ] || return 0
+            done
+            return 1
+        }
+        while on_pane_lineage; do sleep 0.02; done
+        "$BIN" --state-dir "$STATE" ui login --json --port "$PORT" >"$OUT.tmp" 2>&1
+        mv "$OUT.tmp" "$OUT"
+    "#;
+    let mut pane = Command::new("bash")
+        .args([
+            "-c",
+            r#"read -r _; setsid -f env -i PATH="$PATH" PANE=$$ BIN="$BIN" STATE="$STATE" PORT="$PORT" OUT="$OUT" bash -c "$CLIENT" </dev/null >/dev/null 2>&1; true"#,
+        ])
+        .env("CADENCE_ALIAS", "pane-r")
+        .env("CLIENT", client)
+        .env("BIN", bin())
+        .env("STATE", d.state())
+        .env("PORT", port.to_string())
+        .env("OUT", &out)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    plant_pane(&d, "pane-r", pane.id());
+    pane.stdin.take().unwrap().write_all(b"go\n").unwrap();
+    assert!(pane.wait().unwrap().success());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !out.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the detached child never finished"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+    let said = std::fs::read_to_string(&out).unwrap();
+    assert!(
+        said.contains("#n="),
+        "CAD-313 residual changed — if phase 2 landed, flip this pin: {said}"
+    );
+    assert_eq!(daemon_events(&d.state(), "operator_link_minted").len(), 1);
 }

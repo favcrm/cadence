@@ -29,8 +29,8 @@ use serde_json::{json, Value};
 use tiny_http::Request;
 
 use super::{
-    err_response, guard_fail, header_value, json_response, parse_json, read_body, write_caller,
-    write_guard, HttpResp, ServeOpts, WriteCaller,
+    err_response, guard_fail, header_value, json_response, operator, parse_json, read_body,
+    write_guard, HttpResp, ServeOpts,
 };
 use crate::client;
 use crate::error::Error;
@@ -251,9 +251,9 @@ pub(super) fn post_message(
     if let Err(resp) = write_guard(request, "application/json", opts) {
         return resp;
     }
-    match write_caller(request, state_dir, opts) {
-        Ok(WriteCaller::Operator(_)) => {}
-        Ok(WriteCaller::Agent(agent)) => {
+    match operator::board_caller(request, state_dir, opts) {
+        Ok(operator::Caller::Operator(_)) => {}
+        Ok(operator::Caller::Agent(agent)) => {
             return guard_fail(
                 "caller_agent",
                 &format!(

@@ -215,6 +215,16 @@ passes. Operator-by-positive-proof as a design decision
 (tracker issue **CAD-280**, "operator by positive proof") will replace this rule for
 board writes, `slot_reconcile` and these verbs alike.
 
+Board writes moved first (CAD-313, ADR 0004 phase 1): the board's
+operator is the holder of a session opened with a `cadence ui login`
+link, and minting that link needs this same proof **plus** the
+operator secret file. The residual carries over, narrowed: a same-uid
+process must now both read `<state>/operator/secret` and pass the proof
+by `setsid -f` with a scrubbed env and stdio
+(`operator_secret_theft_residual_pinned` pins it). Phase 2 under CAD-280
+makes the secret unreadable to agent process trees. These audit verbs
+do not take the secret yet (ADR 0004 §12, Q7).
+
 **Approvals are operator claims, not proof — until CAD-280.** Two
 gaps mean a bound record cannot prove the operator approved:
 

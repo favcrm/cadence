@@ -2,14 +2,18 @@
 //! (tiny_http, no async runtime — the daemon is plain threads too)
 //! serving the built SPA plus a JSON API on loopback.
 //!
-//! No auth, by decision — containment is the defence: loopback bind, no
-//! CORS headers, a Host allowlist against DNS rebinding, id grammar
-//! checked before any path is touched, and no file reads outside the PM
-//! dir or `--dist`. Writes are I2: POST/PATCH/DELETE routes must pass
-//! four cross-site guards (known write route, exact JSON/octet-stream
-//! content type, `X-Cadence-Board: 1`, same-origin Origin/Sec-Fetch-Site)
-//! before any work is done, then go through the authenticated writer the
-//! route supports. Memory curation is deliberately refused here: an HTTP
+//! Reads need no auth; operator authority is a session (CAD-313, ADR
+//! 0004): a `cadence ui login` link exchanged for an HttpOnly cookie the
+//! daemon checks on every operator write — [`operator`] says exactly who
+//! is trusted as the operator, and no relay, header or missing pane tie
+//! ever is. The rest is containment: loopback bind, no CORS headers, a
+//! Host allowlist against DNS rebinding, id grammar checked before any
+//! path is touched, and no file reads outside the PM dir or `--dist`.
+//! Writes are I2: POST/PATCH/DELETE routes must pass four cross-site
+//! guards (known write route, exact JSON/octet-stream content type,
+//! `X-Cadence-Board: 1`, same-origin Origin/Sec-Fetch-Site) before any
+//! work is done, then the caller rule, then the writer the route
+//! supports. Memory curation is deliberately refused here: an HTTP
 //! server peer is not the native agent endpoint proof required by the
 //! daemon, so the browser cannot become a curator by reaching this route.
 
@@ -35,9 +39,13 @@ use crate::proc::{self, BoundedError};
 
 pub mod delivery_sync;
 mod home;
+mod login;
+mod operator;
 mod read_model;
 mod stages;
 mod threads;
+
+pub use operator::{route_class, RouteClass, WriteRoute, WRITE_ROUTES};
 
 /// The options `ui run` and `ui start` share. Every field is optional:
 /// a given flag overrides the persisted `ui.json`, an absent one
@@ -102,6 +110,39 @@ pub enum UiAction {
     },
     /// Report UI server health and the persisted options.
     Status,
+    /// Print a single-use sign-in link for the board (CAD-313). Board
+    /// writes need the operator's session; this link opens one. Run it
+    /// from your own shell — agents are refused. The link is valid for
+    /// 2 minutes and one browser; the secret it proves never leaves the
+    /// state dir.
+    Login {
+        /// A link for the tailnet URL (`ui tailscale start`) instead of
+        /// this host's `http://cadence.localhost:<port>`.
+        #[arg(long)]
+        tailnet: bool,
+        /// Replace the operator secret and revoke every session and
+        /// unused link first.
+        #[arg(long)]
+        rotate: bool,
+        /// The board's port [default: the persisted `ui start` port, else 3010].
+        #[arg(long)]
+        port: Option<u16>,
+        /// Print `{link, origin, expires_in}` as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the board's operator sessions, or revoke them (CAD-313).
+    Sessions {
+        /// Revoke the session with this display id.
+        #[arg(long)]
+        revoke: Option<String>,
+        /// Revoke every session and every unused link.
+        #[arg(long)]
+        revoke_all: bool,
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Share the board over the tailnet (`tailscale serve`, never
     /// funnel). The primary UX for phone/laptop access.
     Tailscale {
@@ -137,6 +178,17 @@ pub fn run_cli(state_dir: &Path, action: &UiAction) -> Result<i32> {
         UiAction::Start { flags, reset } => start(state_dir, flags, *reset),
         UiAction::Stop { tailscale_off } => stop(state_dir, *tailscale_off),
         UiAction::Status => status(state_dir),
+        UiAction::Login {
+            tailnet,
+            rotate,
+            port,
+            json,
+        } => login::login(state_dir, *tailnet, *rotate, *port, *json),
+        UiAction::Sessions {
+            revoke,
+            revoke_all,
+            json,
+        } => login::sessions(state_dir, revoke.as_deref(), *revoke_all, *json),
         UiAction::Tailscale { action } => tailscale_cli(state_dir, action),
     }
 }
@@ -412,6 +464,7 @@ fn host_allowed(host: &str, port: u16, extra: &[String]) -> bool {
     let host = host.trim().to_ascii_lowercase();
     host == "cadence.localhost"
         || host == "cadence.localhost:18000"
+        || host == format!("cadence.localhost:{port}")
         || host == format!("127.0.0.1:{port}")
         || host == format!("localhost:{port}")
         || host == format!("[::1]:{port}")
@@ -1063,7 +1116,8 @@ fn agent_detail(state_dir: &Path, alias: &str) -> std::result::Result<Value, Str
 const JSON_CAP: u64 = 256 * 1024;
 
 /// The actor an operator write commits as — visible in `git log`
-/// subjects. A pane's write commits as its alias (`write_caller`).
+/// subjects. A pane's write commits as its alias
+/// ([`operator::board_caller`]).
 const UI_ACTOR: &str = "operator (ui)";
 
 type HttpResp = Response<std::io::Cursor<Vec<u8>>>;
@@ -1093,6 +1147,7 @@ fn origin_allowed(origin: &str, port: u16, hosts: &[String], origins: &[String])
     let mut allowed = vec![
         "http://cadence.localhost".to_string(),
         "http://cadence.localhost:18000".to_string(),
+        format!("http://cadence.localhost:{port}"),
         format!("http://127.0.0.1:{port}"),
         format!("http://localhost:{port}"),
         format!("http://[::1]:{port}"),
@@ -1387,105 +1442,6 @@ fn tailnet_proxy(
     })
 }
 
-/// Who a board write commits as (CAD-254, CAD-263, CAD-335). The
-/// cross-site guards stop browsers, not local processes: an agent with a
-/// shell can send the same headers. So a write derives its caller from
-/// the peer module the daemon shares — the TCP peer's process,
-/// attributed to a registered pane by a process signal (its `/proc`
-/// ancestry or the pane's pty on its stdio), or to a managed endpoint
-/// whose provider process is on its ancestry. A caller-chosen
-/// `CADENCE_ALIAS` alone never attributes
-/// ([`crate::peer::tcp_peer_agent`]).
-enum WriteCaller {
-    /// Tied to no agent — `actor` is `operator (ui)` or a trusted
-    /// tailnet login; comment authors and monitor acks record
-    /// `operator`. This is a default, not a proof (see [`write_caller`]).
-    Operator(String),
-    /// A process tied to a registered pane, or descending from a live
-    /// managed endpoint's provider, IS that agent: its alias is the
-    /// actor and author, never `operator`.
-    Agent(String),
-}
-
-impl WriteCaller {
-    fn actor(&self) -> &str {
-        match self {
-            WriteCaller::Operator(actor) => actor,
-            WriteCaller::Agent(alias) => alias,
-        }
-    }
-
-    fn author(&self) -> &str {
-        match self {
-            WriteCaller::Operator(_) => "operator",
-            WriteCaller::Agent(alias) => alias,
-        }
-    }
-}
-
-/// Derive the write caller:
-///
-/// - a request proven to come through `tailscale serve`
-///   ([`tailnet_proxy`], CAD-336) writes as its `Tailscale-User-Login`
-///   — its peer is tailscaled, which no agent is — and is refused when
-///   it carries none (Funnel, a tagged node); every other request,
-///   a tailnet-shaped one from any local process included, is
-///   attributed to its own peer process and its identity headers are
-///   never read;
-/// - a peer tied to a registered pane, or descending from a live
-///   managed endpoint's provider process, is that agent — never the
-///   operator, whatever the request's shape or headers;
-/// - a peer that cannot be attributed at all (unreadable ancestry, a
-///   socket owner this user cannot see, several agents, a store the
-///   daemon cannot list) is refused (`403`, `check: "caller_identity"`);
-/// - a peer that walks cleanly and is tied to NO agent is still the
-///   operator (`operator (ui)`). That is a DEFAULT, not proof: the
-///   operator's own peer (the tailnet `socat` relay, an ssh tunnel)
-///   carries no signal, and neither does a same-uid process that left
-///   every agent's ancestry (`setsid -f` with redirected stdio, an
-///   orphan of a dead managed provider). Replacing it with positive
-///   proof is CAD-335 phase 2 (ADR 0004).
-fn write_caller(
-    request: &Request,
-    state_dir: &Path,
-    opts: &ServeOpts,
-) -> std::result::Result<WriteCaller, HttpResp> {
-    let proxy = tailnet_proxy(request, opts);
-    if matches!(proxy, Some(Ok(()))) {
-        return proxied_actor(header_value(request, "Tailscale-User-Login").as_deref())
-            .map(WriteCaller::Operator)
-            .map_err(|why| guard_fail("caller_identity", &format!("board write refused: {why}.")));
-    }
-    let agent = agent_roots(state_dir).and_then(|roots| {
-        if roots.is_empty() {
-            return Ok(None);
-        }
-        let peer = request
-            .remote_addr()
-            .ok_or_else(|| "the request has no peer address".to_string())?;
-        crate::peer::tcp_peer_agent(opts.port, *peer, &roots)
-    });
-    match agent {
-        Ok(Some(alias)) => Ok(WriteCaller::Agent(alias)),
-        Ok(None) => Ok(WriteCaller::Operator(UI_ACTOR.to_string())),
-        Err(why) => {
-            let proxy = match proxy {
-                Some(Err(p)) => format!(" It is not the tailscale proxy either: {p}."),
-                _ => String::new(),
-            };
-            Err(guard_fail(
-                "caller_identity",
-                &format!(
-                    "board write refused: caller identity underivable — {why}.{proxy} \
-                     Writes attribute the peer process to the registered pane \
-                     or managed endpoint it is tied to, or to the operator when \
-                     it is tied to none."
-                ),
-            ))
-        }
-    }
-}
-
 /// The live agents a write can be attributed to, read over the
 /// daemon's `agent_list` RPC:
 ///
@@ -1666,9 +1622,9 @@ fn model_defaults_post(request: &mut Request, state_dir: &Path, opts: &ServeOpts
     // The relay below is the board's own connection, which the daemon's
     // operator gate sees instead of this caller (CAD-337): an agent is
     // refused here or it would land as the operator.
-    match write_caller(request, state_dir, opts) {
-        Ok(WriteCaller::Operator(_)) => {}
-        Ok(WriteCaller::Agent(alias)) => {
+    match operator::board_caller(request, state_dir, opts) {
+        Ok(operator::Caller::Operator(_)) => {}
+        Ok(operator::Caller::Agent(alias)) => {
             return guard_fail(
                 "operator_only",
                 &format!(
@@ -1723,6 +1679,21 @@ fn write_route(
     opts: &ServeOpts,
     send: &dyn Fn(Request, HttpResp),
 ) {
+    // CAD-313: signing in and out — the nonce, or the session itself,
+    // is the credential (`operator`).
+    if path == "/api/session" || path == "/api/session/logout" {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let resp = if path == "/api/session" {
+            operator::open(&mut request, state_dir, opts)
+        } else {
+            operator::logout(&request, state_dir, opts)
+        };
+        send(request, resp);
+        return;
+    }
     // Setup is detect only in the board: applying a fix is the
     // operator's command to run (CAD-327).
     if path == "/api/setup" {
@@ -1772,7 +1743,7 @@ fn write_route(
             send(request, resp);
             return;
         }
-        let caller = match write_caller(&request, state_dir, opts) {
+        let caller = match operator::board_caller(&request, state_dir, opts) {
             Ok(caller) => caller,
             Err(resp) => {
                 send(request, resp);
@@ -1940,7 +1911,7 @@ fn write_route(
         send(request, resp);
         return;
     }
-    let caller = match write_caller(&request, state_dir, opts) {
+    let caller = match operator::board_caller(&request, state_dir, opts) {
         Ok(caller) => caller,
         Err(resp) => {
             send(request, resp);
@@ -2408,10 +2379,14 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
             // once per page load), never on the 30 s poll.
             let operator = matches!(query("operator").as_deref(), Some("1" | "true"))
                 .then(|| home::operator_viewer(&request, state_dir, opts));
+            let session = operator::meta(&request, state_dir, opts);
             send(
                 request,
                 json_response(json!({
                     "read_only": opts.read_only,
+                    "signed_in": session["signed_in"],
+                    "session": session["session"],
+                    "login_hint": session["login_hint"],
                     "actor": actor,
                     "tailnet_proof": tailnet_proof,
                     "operator": operator,
@@ -3186,6 +3161,8 @@ fn start_inner(state_dir: &Path, flags: &UiFlags, reset: bool, quiet: bool) -> R
                         "read_only": eff.read_only,
                         "gateway": "http://cadence.localhost:18000",
                         "log": state_dir.join("ui.log"),
+                        // CAD-313: board writes need the operator's session.
+                        "sign_in": "cadence ui login",
                     }))
                     .unwrap_or_default()
                 );

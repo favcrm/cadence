@@ -14,6 +14,9 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
+#[path = "support/operator.rs"]
+mod op;
+
 use cadence_agent::adapter::ProviderEnv;
 use cadence_agent::client;
 use cadence_agent::daemon;
@@ -3630,6 +3633,9 @@ fn daemon_opts() -> daemon::ServeOptions {
         report_router: Some(0),
         idle_poll: None,
         stop: None,
+        // CAD-313: links and sessions expire by the wall clock unless a
+        // test injects one.
+        operator_clock: None,
     }
 }
 
@@ -39069,8 +39075,10 @@ t.join()
 /// CAD-335 phase 1 (item 4): attributing managed endpoints must not
 /// cost the operator the board. With a managed agent live, a write
 /// relayed by a process that is neither a pane nor a managed
-/// provider's descendant — the operator's `socat` relay shape — still
-/// writes as `operator (ui)`, exactly as before.
+/// provider's descendant — the operator's `socat` relay shape — writes
+/// as `operator (ui)` when it carries the operator's session. CAD-428:
+/// the same relay carrying no session is not the operator — the board
+/// sees only the relay — and writes nothing.
 #[test]
 fn ui_write_caller_keeps_the_operator_relay_with_a_managed_agent_live() {
     use std::io::Read;
@@ -39079,26 +39087,41 @@ fn ui_write_caller_keeps_the_operator_relay_with_a_managed_agent_live() {
     seed_board(pm.path(), &d.state);
     let port = start_board(pm.path(), &d.state);
     let _wk = ManagedWorker::start(&d, "wk");
-    let mut relay = std::process::Command::new("python3")
-        .args(["-c", RELAY_PY, &port.to_string()])
-        .env_remove("CADENCE_ALIAS")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut first = String::new();
-    BufReader::new(relay.stdout.take().unwrap())
-        .read_line(&mut first)
-        .unwrap();
-    let relay_port: u16 = first.trim().parse().unwrap();
-    let mut s = std::net::TcpStream::connect(("127.0.0.1", relay_port)).unwrap();
-    s.write_all(board_comment_request(port, "via the relay").as_bytes())
-        .unwrap();
-    let mut response = String::new();
-    s.read_to_string(&mut response).unwrap();
-    // Closing our end lets the relay's client-side pump finish.
-    drop(s);
-    assert!(relay.wait().unwrap().success());
+    let via_relay = |request: &str| -> String {
+        let mut relay = std::process::Command::new("python3")
+            .args(["-c", RELAY_PY, &port.to_string()])
+            .env_remove("CADENCE_ALIAS")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut first = String::new();
+        BufReader::new(relay.stdout.take().unwrap())
+            .read_line(&mut first)
+            .unwrap();
+        let relay_port: u16 = first.trim().parse().unwrap();
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", relay_port)).unwrap();
+        s.write_all(request.as_bytes()).unwrap();
+        let mut response = String::new();
+        s.read_to_string(&mut response).unwrap();
+        // Closing our end lets the relay's client-side pump finish.
+        drop(s);
+        assert!(relay.wait().unwrap().success());
+        response
+    };
+    let before = board_last_commit(pm.path());
+    let response = via_relay(&board_comment_request(port, "no session"));
+    assert!(response.contains(" 403 "), "{response}");
+    assert!(response.contains("operator_session_required"), "{response}");
+    assert_eq!(board_last_commit(pm.path()), before, "nothing is written");
+
+    let op = sign_in(&d.state, port);
+    let request = board_comment_request(port, "via the relay").replacen(
+        "\r\nContent-Type",
+        &format!("\r\nCookie: {}\r\nContent-Type", op.cookie),
+        1,
+    );
+    let response = via_relay(&request);
     let comment = board_replied_comment(&response, "via the relay");
     assert_eq!(comment["author"], "operator", "{comment}");
     let last = board_last_commit(pm.path());
@@ -39107,11 +39130,6 @@ fn ui_write_caller_keeps_the_operator_relay_with_a_managed_agent_live() {
     assert!(!last.contains("wk"), "{last}");
 }
 
-/// CAD-160 (ADR-0002 phase 1): criteria are never truncated, dropped or
-/// replaced by a pointer. A `dispatch` whose acceptance items cannot
-/// fit the 4000-char pty kickoff whole refuses — plain and `--job`
-/// alike — naming the ceiling and the note or spec file, and leaves no
-/// worktree, branch, job or queued message behind.
 #[test]
 fn dispatch_refuses_criteria_past_the_pty_ceiling() {
     let seeded = TempDir::new().unwrap();
@@ -40973,6 +40991,8 @@ fn cad319_thread_http_routes_guards_and_sse_resume() {
     let d = TestDaemon::start();
     let pm = TempDir::new().unwrap();
     let (port, _board) = start_operator_board(pm.path(), &d.state);
+    let op = sign_in(&d.state, port);
+    let guards = op_guards(&op);
     let cwd = d.dir.path().to_str().unwrap().to_string();
     d.operator_rpc(
         "agent_register",
@@ -41007,30 +41027,17 @@ fn cad319_thread_http_routes_guards_and_sse_resume() {
     // Unknown fields and unknown agents.
     let (status, _) = board_http(
         port,
-        &thread_post_request(
-            port,
-            "lead",
-            THREAD_GUARDS,
-            r#"{"text":"x","as":"operator"}"#,
-        ),
+        &thread_post_request(port, "lead", &guards, r#"{"text":"x","as":"operator"}"#),
     );
     assert_eq!(status, 400);
     let (status, reply) = board_http(
         port,
-        &thread_post_request(port, "ghost", THREAD_GUARDS, r#"{"text":"x"}"#),
+        &thread_post_request(port, "ghost", &guards, r#"{"text":"x"}"#),
     );
     assert_eq!(status, 404, "{reply}");
 
     // The guarded POST.
-    let (status, reply) = board_http(
-        port,
-        &thread_post_request(
-            port,
-            "lead",
-            &format!("{THREAD_GUARDS}Origin: http://127.0.0.1:{port}\r\n"),
-            body,
-        ),
-    );
+    let (status, reply) = board_http(port, &thread_post_request(port, "lead", &guards, body));
     assert_eq!(status, 200, "{reply}");
     let receipt: Value = serde_json::from_str(&reply).unwrap();
     assert_eq!(receipt["message"], "h1", "{receipt}");
@@ -41189,6 +41196,17 @@ fn cad319_thread_post_is_refused_for_an_agent_caller() {
     assert_eq!(peer["payload"]["from"], "wk", "{peer}");
 }
 
+/// Sign in to the board on `port` as the operator (CAD-313): the real
+/// `cadence ui login` link, exchanged at `POST /api/session`.
+fn sign_in(state: &Path, port: u16) -> op::Session {
+    op::sign_in(env!("CARGO_BIN_EXE_cadence"), state, port)
+}
+
+/// The write guards plus a signed-in operator's Origin and cookie.
+fn op_guards(op: &op::Session) -> String {
+    format!("{THREAD_GUARDS}{}", op.headers())
+}
+
 /// A raw board POST to `path` with `headers` (each `Name: value\r\n`).
 fn cad328_post(port: u16, path: &str, headers: &str, body: &str) -> String {
     format!(
@@ -41210,6 +41228,8 @@ fn cad328_plan_endpoints_guards_agents_and_decisions() {
     let out = f.propose(PLAN_MD).unwrap();
     let epic = out["epic"].as_str().unwrap().to_string();
     let port = start_board(&f.pm_dir, &f.d.state);
+    let op = sign_in(&f.d.state, port);
+    let guards = op_guards(&op);
     let approve = format!("/api/plans/{epic}/approve");
     let reject = format!("/api/plans/{epic}/reject");
     let before = f.commits();
@@ -41248,12 +41268,12 @@ fn cad328_plan_endpoints_guards_agents_and_decisions() {
 
     // Reject needs a reason; no identity-shaped field is read; unknown
     // verbs and methods are not routes.
-    let (status, reply) = board_http(port, &cad328_post(port, &reject, THREAD_GUARDS, "{}"));
+    let (status, reply) = board_http(port, &cad328_post(port, &reject, &guards, "{}"));
     assert_eq!(status, 400, "{reply}");
     assert!(reply.contains("reason_required"), "{reply}");
     let (status, _) = board_http(
         port,
-        &cad328_post(port, &reject, THREAD_GUARDS, r#"{"reason":"   "}"#),
+        &cad328_post(port, &reject, &guards, r#"{"reason":"   "}"#),
     );
     assert_eq!(status, 400);
     for body in [
@@ -41266,22 +41286,17 @@ fn cad328_plan_endpoints_guards_agents_and_decisions() {
         } else {
             &approve
         };
-        let (status, reply) = board_http(port, &cad328_post(port, path, THREAD_GUARDS, body));
+        let (status, reply) = board_http(port, &cad328_post(port, path, &guards, body));
         assert_eq!(status, 400, "{body}: {reply}");
     }
     let (status, _) = board_http(
         port,
-        &cad328_post(
-            port,
-            &format!("/api/plans/{epic}/merge"),
-            THREAD_GUARDS,
-            "{}",
-        ),
+        &cad328_post(port, &format!("/api/plans/{epic}/merge"), &guards, "{}"),
     );
     assert_eq!(status, 404);
     let (status, _) = board_http(
         port,
-        &cad328_post(port, "/api/plans/not-an-id/approve", THREAD_GUARDS, "{}"),
+        &cad328_post(port, "/api/plans/not-an-id/approve", &guards, "{}"),
     );
     assert_eq!(status, 400);
     untouched("bad requests");
@@ -41307,17 +41322,17 @@ fn cad328_plan_endpoints_guards_agents_and_decisions() {
     }
     untouched("agent caller");
 
+    // CAD-313: no session is no operator, even from this test process.
+    for (path, body) in [(&approve, "{}"), (&reject, r#"{"reason":"x"}"#)] {
+        let (status, reply) = board_http(port, &cad328_post(port, path, THREAD_GUARDS, body));
+        assert_eq!(status, 403, "{reply}");
+        assert!(reply.contains("operator_session_required"), "{reply}");
+    }
+    untouched("no session");
+
     // The operator approves: tickets → ready, one commit, the daemon's
     // event; approving again is a conflict that writes nothing.
-    let (status, reply) = board_http(
-        port,
-        &cad328_post(
-            port,
-            &approve,
-            &format!("{THREAD_GUARDS}Origin: http://127.0.0.1:{port}\r\n"),
-            "{}",
-        ),
-    );
+    let (status, reply) = board_http(port, &cad328_post(port, &approve, &guards, "{}"));
     assert_eq!(status, 200, "{reply}");
     let decided: Value = serde_json::from_str(&reply).unwrap();
     assert_eq!(decided["state"], "approved", "{decided}");
@@ -41328,7 +41343,7 @@ fn cad328_plan_endpoints_guards_agents_and_decisions() {
         ("approved", Some("operator"))
     );
     assert_eq!(f.daemon_events("plan_approved").len(), 1);
-    let (status, reply) = board_http(port, &cad328_post(port, &approve, THREAD_GUARDS, "{}"));
+    let (status, reply) = board_http(port, &cad328_post(port, &approve, &guards, "{}"));
     assert_eq!(status, 409, "{reply}");
     assert_eq!(
         f.commits(),
@@ -41346,7 +41361,7 @@ fn cad328_plan_endpoints_guards_agents_and_decisions() {
         &cad328_post(
             port,
             &format!("/api/plans/{later}/reject"),
-            THREAD_GUARDS,
+            &guards,
             r#"{"reason":"not this quarter"}"#,
         ),
     );
@@ -41367,7 +41382,9 @@ fn cad328_plan_endpoints_guards_agents_and_decisions() {
 /// CAD-276's positive proof on its TCP peer: that child descends from
 /// the daemon (its subreaper) and is refused `403 operator_proof` for
 /// approve, reject and answer, writing nothing; the operator's own
-/// requests still land.
+/// requests still land. Since CAD-313 the child needs the operator's
+/// session to get this far, so it presents one (a stolen cookie): the
+/// process proof still refuses it.
 #[test]
 fn cad328_operator_writes_refuse_a_detached_managed_child_under_daemon_run() {
     let dir = TempDir::new().unwrap();
@@ -41407,6 +41424,11 @@ fn cad328_operator_writes_refuse_a_detached_managed_child_under_daemon_run() {
     let (_, show) = f.cli(&["issue", "show", &id, "--json"]);
     let question = show["reports"][0]["name"].as_str().unwrap().to_string();
     let port = start_board(&f.pm_dir, &f.d.state);
+    // CAD-313: the operator signs in. The detached child below presents
+    // that very session — as if it had stolen the cookie — so what
+    // refuses it is the second layer, process proof on the HTTP peer.
+    let op = sign_in(&f.d.state, port);
+    let guards = op_guards(&op);
     let reports = f.pm_dir.join("demo").join(&id).join("reports");
     let count = || std::fs::read_dir(&reports).unwrap().count();
     let before = (f.commits(), count());
@@ -41421,7 +41443,7 @@ fn cad328_operator_writes_refuse_a_detached_managed_child_under_daemon_run() {
     let mut detached = |path: &str, body: &str| -> String {
         n += 1;
         let out = work.path().join(format!("reply-{n}"));
-        let request = cad328_post(port, path, THREAD_GUARDS, body);
+        let request = cad328_post(port, path, &guards, body);
         let r = wk.exec(&[
             "bash",
             "-c",
@@ -41473,12 +41495,7 @@ fn cad328_operator_writes_refuse_a_detached_managed_child_under_daemon_run() {
     // agent) pass the same proof and land.
     let (status, reply) = board_http(
         port,
-        &cad328_post(
-            port,
-            &format!("/api/plans/{epic}/approve"),
-            THREAD_GUARDS,
-            "{}",
-        ),
+        &cad328_post(port, &format!("/api/plans/{epic}/approve"), &guards, "{}"),
     );
     assert_eq!(status, 200, "{reply}");
     assert_eq!(f.front("D-3").status, "ready");
@@ -41487,7 +41504,7 @@ fn cad328_operator_writes_refuse_a_detached_managed_child_under_daemon_run() {
         &cad328_post(
             port,
             &format!("/api/plans/{later}/reject"),
-            THREAD_GUARDS,
+            &guards,
             r#"{"reason":"not now"}"#,
         ),
     );
@@ -41497,7 +41514,7 @@ fn cad328_operator_writes_refuse_a_detached_managed_child_under_daemon_run() {
         &cad328_post(
             port,
             &format!("/api/issues/{id}/answers"),
-            THREAD_GUARDS,
+            &guards,
             &answer_body,
         ),
     );
@@ -41868,6 +41885,165 @@ fn cad432_board_started_by_an_agent_cannot_relay_a_move() {
     let _ = wk.answer(n, "agent board exit");
 }
 
+/// A relay started as its own session — `setsid -f`, env cleared, stdio
+/// null: the shape of a gateway (nginx, `socat`, cloudflared) the
+/// operator runs — forwarding ONE connection from a fresh loopback port
+/// (written to `argv[2]`) to 127.0.0.1:`argv[1]`.
+const SESSION_RELAY_PY: &str = r#"
+import os, socket, sys, threading
+target, portfile = int(sys.argv[1]), sys.argv[2]
+ls = socket.socket()
+ls.bind(("127.0.0.1", 0))
+ls.listen(1)
+with open(portfile + ".tmp", "w") as f:
+    f.write(str(ls.getsockname()[1]))
+os.rename(portfile + ".tmp", portfile)
+ls.settimeout(60)
+c, _ = ls.accept()
+u = socket.create_connection(("127.0.0.1", target))
+def pump(a, b):
+    while True:
+        data = a.recv(65536)
+        if not data:
+            break
+        b.sendall(data)
+    try:
+        b.shutdown(socket.SHUT_WR)
+    except OSError:
+        pass
+t = threading.Thread(target=pump, args=(u, c))
+t.start()
+pump(c, u)
+t.join()
+"#;
+
+/// Start [`SESSION_RELAY_PY`] to `target` in its own session; its port.
+fn session_relay(dir: &Path, target: u16) -> u16 {
+    let script = dir.join("relay.py");
+    std::fs::write(&script, SESSION_RELAY_PY).unwrap();
+    let portfile = dir.join(format!("relay-{}", uuid::Uuid::new_v4().simple()));
+    let status = std::process::Command::new("setsid")
+        .arg("-f")
+        .arg("python3")
+        .arg(&script)
+        .arg(target.to_string())
+        .arg(&portfile)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !portfile.exists() {
+        assert!(Instant::now() < deadline, "the relay never listened");
+        thread::sleep(Duration::from_millis(20));
+    }
+    std::fs::read_to_string(&portfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+/// CAD-428 ACCEPTANCE — the PR #229 round-2 probe. A TCP relay started
+/// as its own session (like this host's nginx gateway) forwards an
+/// ENROLLED managed agent's plan approve and reject. The board's TCP
+/// peer is the relay, which is tied to no agent and passes process
+/// proof — so before CAD-313 the approve landed as the operator's.
+/// Now it holds no operator session and is refused
+/// `operator_session_required`, with nothing written: no commit, the
+/// plan still proposed, no decision event. The same relay carrying the
+/// operator's session, and the operator directly on loopback with it,
+/// succeed. (The tailnet-proven operator is the unit-tested
+/// `ui::operator::decide` row: a test cannot own a socket as
+/// tailscaled's uid.)
+#[test]
+fn cad428_a_relay_never_carries_an_agents_approve_as_the_operator() {
+    let f = PlanFixture::start();
+    let epic = f.propose(PLAN_MD).unwrap()["epic"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let later = f
+        .propose("---\ntitle: Later\ngoal: g\n---\n## Only\n### Acceptance\n- [ ] a\n")
+        .unwrap()["epic"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let port = start_board(&f.pm_dir, &f.d.state);
+    let mut wk = ManagedWorker::start(&f.d, "wk");
+    let work = TempDir::new().unwrap();
+    let before = f.commits();
+    let untouched = |what: &str| {
+        assert_eq!(f.commits(), before, "{what}: a refusal writes nothing");
+        assert_eq!(f.front(&epic).plan.unwrap().state, "proposed", "{what}");
+        assert!(f.daemon_events("plan_approved").is_empty(), "{what}");
+        assert!(f.daemon_events("plan_rejected").is_empty(), "{what}");
+    };
+    for (path, body) in [
+        (format!("/api/plans/{epic}/approve"), "{}"),
+        (
+            format!("/api/plans/{epic}/reject"),
+            r#"{"reason":"agent says no"}"#,
+        ),
+    ] {
+        let relay = session_relay(work.path(), port);
+        let request = cad328_post(
+            port,
+            &path,
+            &format!("{THREAD_GUARDS}Origin: http://127.0.0.1:{port}\r\n"),
+            body,
+        );
+        let r = wk.exec(&[
+            "bash",
+            "-c",
+            DEV_TCP_CLIENT,
+            "_",
+            &relay.to_string(),
+            &request,
+        ]);
+        assert_eq!(r["rc"], 0, "{r}");
+        let out = r["out"].as_str().unwrap();
+        assert!(out.contains(" 403 "), "{path}: {out}");
+        assert!(out.contains("operator_session_required"), "{path}: {out}");
+    }
+    untouched("an agent through a relay");
+
+    // The operator: signed in, through the same kind of relay and
+    // directly on loopback.
+    let op = sign_in(&f.d.state, port);
+    let relay = session_relay(work.path(), port);
+    let (status, reply) = board_http(
+        relay,
+        &cad328_post(
+            port,
+            &format!("/api/plans/{later}/reject"),
+            &op_guards(&op),
+            r#"{"reason":"not now"}"#,
+        ),
+    );
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(f.front(&later).plan.unwrap().state, "rejected");
+    let (status, reply) = board_http(
+        port,
+        &cad328_post(
+            port,
+            &format!("/api/plans/{epic}/approve"),
+            &op_guards(&op),
+            "{}",
+        ),
+    );
+    assert_eq!(status, 200, "{reply}");
+    let plan = f.front(&epic).plan.unwrap();
+    assert_eq!(
+        (plan.state.as_str(), plan.decided_by.as_deref()),
+        ("approved", Some("operator"))
+    );
+}
+
 /// CAD-328 review round 1: a chat view opens on the NEWEST page.
 /// `GET /api/threads/<alias>?tail=1` (daemon `thread_read {tail}`) is the
 /// newest `limit` entries, oldest first, with `more_before`;
@@ -42010,6 +42186,8 @@ fn cad328_answer_endpoint_files_an_operator_answer() {
     };
 
     let port = start_board(&f.pm_dir, &f.d.state);
+    let op = sign_in(&f.d.state, port);
+    let guards = op_guards(&op);
     for (headers, check) in [
         ("Content-Type: application/json\r\n", "x_cadence_board"),
         (
@@ -42032,7 +42210,7 @@ fn cad328_answer_endpoint_files_an_operator_answer() {
         format!(r#"{{"question":"{question}","text":"hourly","by":"master"}}"#),
         format!(r#"{{"question":"../{question}","text":"hourly"}}"#),
     ] {
-        let (status, reply) = board_http(port, &cad328_post(port, &path, THREAD_GUARDS, &bad));
+        let (status, reply) = board_http(port, &cad328_post(port, &path, &guards, &bad));
         assert_eq!(status, 400, "{bad}: {reply}");
     }
     untouched("bad requests");
@@ -42053,9 +42231,16 @@ fn cad328_answer_endpoint_files_an_operator_answer() {
     assert!(out.contains("operator_only"), "{out}");
     untouched("agent caller");
 
+    // CAD-313: a caller tied to no agent but holding no session is not
+    // the operator.
+    let (status, reply) = board_http(port, &cad328_post(port, &path, THREAD_GUARDS, &body));
+    assert_eq!(status, 403, "{reply}");
+    assert!(reply.contains("operator_session_required"), "{reply}");
+    untouched("no session");
+
     // The operator's answer: one report, authored operator, the question
     // closed; the reply carries the fresh issue detail.
-    let (status, reply) = board_http(port, &cad328_post(port, &path, THREAD_GUARDS, &body));
+    let (status, reply) = board_http(port, &cad328_post(port, &path, &guards, &body));
     assert_eq!(status, 201, "{reply}");
     let v: Value = serde_json::from_str(&reply).unwrap();
     let rows = v["issue"]["reports"].as_array().unwrap();
@@ -46055,9 +46240,18 @@ fn delivery_loop_review_revise_pass_merge_end_to_end() {
         "an agent's board merge wrote something"
     );
     assert_eq!(lf.rec()["state"], "passed");
+    // CAD-313: without a session this test process is not the operator.
     let (status, reply) = board_http(
         port,
         &cad328_post(port, "/api/delivery/D-2/merge", THREAD_GUARDS, "{}"),
+    );
+    assert_eq!(status, 403, "{reply}");
+    assert!(reply.contains("operator_session_required"), "{reply}");
+    assert_eq!(lf.snapshot(), before, "a merge without a session wrote");
+    let op = sign_in(&lf.f.d.state, port);
+    let (status, reply) = board_http(
+        port,
+        &cad328_post(port, "/api/delivery/D-2/merge", &op_guards(&op), "{}"),
     );
     assert_eq!(status, 200, "{reply}");
     assert!(reply.contains("enqueued"), "{reply}");

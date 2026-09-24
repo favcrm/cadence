@@ -20,24 +20,39 @@
 //!   `master_summary` (CAD-339) without posting it; a daemon without the
 //!   method answers 501 so the UI shows "not available".
 //!
-//! Every write passes the board's write path first: read-only, the
-//! cross-site guards ([`write_guard`]) and caller attribution
-//! ([`write_caller`]). A caller the board attributes to an agent gets
-//! 403 — these are the operator's decisions, and the daemon would see
-//! the board's own connection, not the agent's. No request field names
-//! who decided: the request bodies deny unknown fields, and the daemon
-//! derives the operator from the board's connection. A caller tied to
-//! no agent is the operator by DEFAULT, not by positive proof — the gap
-//! every board write has until CAD-313 lands operator identity for the
-//! web UI.
+//! Who is trusted as the operator here (CAD-313, CAD-428) — exactly a
+//! request that passes all of:
+//!
+//! 1. read-only off, and the cross-site guards ([`write_guard`]);
+//! 2. a live **operator session** ([`operator::board_caller`]): the
+//!    HttpOnly cookie a `cadence ui login` link was exchanged for,
+//!    presented on the origin it was issued for (loopback, or the
+//!    proven `tailscale serve` proxy) with that origin's `Origin`
+//!    header, by a peer tied to no agent. No session is refused
+//!    `operator_session_required` — whatever relays it (nginx, `socat`,
+//!    a gateway vhost), whatever Host, `Tailscale-*` or `X-Forwarded-*`
+//!    header it carries, and however detached from its pane the sender
+//!    is. A peer tied to an agent is refused `operator_only` (and a
+//!    session it presents is revoked, `session_from_agent`);
+//! 3. positive process proof on the HTTP peer
+//!    ([`prove_operator_peer`]), the rule the daemon applies to its own
+//!    operator verbs — the board is never less strict than the RPC it
+//!    relays. The proven tailnet proxy passes: its peer is tailscaled.
+//!
+//! No request field names who decided: the request bodies deny unknown
+//! fields, and the daemon derives the operator from the board's
+//! connection. Residual (ADR 0004 §1.3, phase 2 under CAD-280): a
+//! same-uid process that reads the operator secret AND evades
+//! `operator_proof` (`setsid -f`, scrubbed env and stdio) can mint its
+//! own login link.
 
 use serde::Deserialize;
 use serde_json::json;
 use tiny_http::Request;
 
 use super::{
-    agent_roots, coded_response, err_response, guard_fail, json_response, parse_json, read_body,
-    tailnet_proxy, write_caller, write_guard, write_reply, HttpResp, ServeOpts, WriteCaller,
+    agent_roots, coded_response, err_response, guard_fail, json_response, operator, parse_json,
+    read_body, tailnet_proxy, write_guard, write_reply, HttpResp, ServeOpts,
 };
 use crate::client;
 use crate::error::Error;
@@ -79,13 +94,13 @@ pub(super) fn answer_route(path: &str) -> Option<&str> {
     (!id.is_empty() && !id.contains('/')).then_some(id)
 }
 
-/// The board's write path for an operator decision: read-only, the
-/// cross-site guards, then the caller — an agent is refused (403,
-/// `check: "operator_only"`) — and then POSITIVE operator proof for the
-/// HTTP peer ([`prove_operator_peer`]): being tied to no agent is not
-/// enough here, because the daemon checks the board's own connection
-/// and would accept whatever the board relays. Returns the operator's
-/// actor.
+/// The board's write path for an operator decision (module doc):
+/// read-only, the cross-site guards, the operator session — an agent is
+/// refused (403, `check: "operator_only"`), a caller without a session
+/// `operator_session_required` — and then POSITIVE operator proof for
+/// the HTTP peer ([`prove_operator_peer`]), because the daemon checks
+/// the board's own connection and would accept whatever the board
+/// relays. Returns the operator's actor.
 pub(super) fn operator_write(
     request: &Request,
     state_dir: &std::path::Path,
@@ -99,12 +114,12 @@ pub(super) fn operator_write(
         ));
     }
     write_guard(request, "application/json", opts)?;
-    match write_caller(request, state_dir, opts)? {
-        WriteCaller::Operator(actor) => {
+    match operator::board_caller(request, state_dir, opts)? {
+        operator::Caller::Operator(actor) => {
             prove_operator_peer(request, state_dir, opts, what)?;
             Ok(actor)
         }
-        WriteCaller::Agent(alias) => Err(guard_fail(
+        operator::Caller::Agent(alias) => Err(guard_fail(
             "operator_only",
             &format!(
                 "{what} is the operator's decision — this request comes from agent \
@@ -135,8 +150,8 @@ pub(super) fn operator_viewer(
 ) -> bool {
     !opts.read_only
         && matches!(
-            write_caller(request, state_dir, opts),
-            Ok(WriteCaller::Operator(_))
+            operator::board_caller(request, state_dir, opts),
+            Ok(operator::Caller::Operator(_))
         )
         && prove_operator_peer(request, state_dir, opts, "reading the operator role").is_ok()
         && board_is_operator(state_dir)
