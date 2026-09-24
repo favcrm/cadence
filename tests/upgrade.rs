@@ -73,6 +73,11 @@ struct Fake {
     /// `compare(resolved, linked)` answers `ahead`: the resolved sha is
     /// older than the linked one.
     backwards: bool,
+    /// CAD-409: merge_group runs GitHub returns for the sha (none by
+    /// default: the legacy push-run evidence path), and the `test`
+    /// conclusion in each of them.
+    merge_group: Vec<Run>,
+    merge_group_test: &'static str,
     calls: RefCell<Vec<String>>,
 }
 
@@ -86,6 +91,8 @@ impl Fake {
             artifact: ArtifactState::Present,
             attestation_ok: true,
             backwards: false,
+            merge_group: Vec::new(),
+            merge_group_test: "success",
             calls: RefCell::new(Vec::new()),
         }
     }
@@ -97,13 +104,30 @@ impl Fake {
     }
 }
 
+/// The push run's id; every other run id is a merge_group run.
+const PUSH_RUN: u64 = 42;
+const QUEUE_RUN: u64 = 43;
+
 fn run_for(sha: &str) -> Run {
     Run {
-        id: 42,
+        id: PUSH_RUN,
         attempt: 1,
         head_sha: sha.to_string(),
         head_branch: "main".into(),
         event: "push".into(),
+        status: "completed".into(),
+        conclusion: "success".into(),
+    }
+}
+
+/// A merge_group run of ci.yml on a merge-queue ref for `main`.
+fn queue_run_for(sha: &str) -> Run {
+    Run {
+        id: QUEUE_RUN,
+        attempt: 1,
+        head_sha: sha.to_string(),
+        head_branch: format!("gh-readonly-queue/main/pr-206-{OLD}"),
+        event: "merge_group".into(),
         status: "completed".into(),
         conclusion: "success".into(),
     }
@@ -139,8 +163,18 @@ impl ReleaseSource for Fake {
         self.log("runs");
         Ok(vec![run_for(sha)])
     }
-    fn jobs(&self, _run_id: u64) -> Result<Vec<Job>> {
+    fn merge_group_runs(&self, _sha: &str) -> Result<Vec<Run>> {
+        self.log("merge_group_runs");
+        // Returned as canned, whatever their sha: the client must filter.
+        Ok(self.merge_group.clone())
+    }
+    fn jobs(&self, run_id: u64) -> Result<Vec<Job>> {
         self.log("jobs");
+        let test = if run_id == PUSH_RUN {
+            self.test_conclusion
+        } else {
+            self.merge_group_test
+        };
         Ok(vec![
             Job {
                 name: "fmt".into(),
@@ -150,7 +184,7 @@ impl ReleaseSource for Fake {
             Job {
                 name: "test".into(),
                 status: "completed".into(),
-                conclusion: self.test_conclusion.into(),
+                conclusion: test.into(),
             },
         ])
     }
@@ -454,6 +488,125 @@ fn refuses_when_test_job_did_not_pass() {
             &req(Target::Sha(SHA.into()), false),
         ));
         assert!(msg.contains("`test` job has not passed"), "{msg}");
+        assert!(!fake.called("download"));
+        assert_untouched(&e);
+    }
+}
+
+// ---- CAD-409: a queued merge's merge_group run is the test evidence ----
+
+#[test]
+fn cad409_accepts_merge_group_test_evidence_for_the_exact_sha() {
+    let e = env();
+    let mut fake = Fake::new(&e.artifact);
+    // A queued merge: the push run skipped its gates, the merge_group run
+    // of the same sha passed `test`.
+    fake.test_conclusion = "skipped";
+    fake.merge_group = vec![queue_run_for(SHA)];
+    let report = upgrade::run(&fake, &e.layout, &req(Target::Sha(SHA.into()), false)).unwrap();
+    assert_eq!(report["trust"], "attested CI build");
+    // The artifact still comes from the push run.
+    assert_eq!(report["run_id"], PUSH_RUN);
+    let how = report["verified"]["test_job"].as_str().unwrap();
+    assert!(
+        how.contains(&format!("merge_group run {QUEUE_RUN}")),
+        "{how}"
+    );
+    assert!(how.contains("gh-readonly-queue/main/"), "{how}");
+    assert!(
+        how.contains(&format!("artifact from push run {PUSH_RUN}")),
+        "{how}"
+    );
+    assert_eq!(link_target(&e.layout), e.layout.binary(SHA));
+    let calls = fake.calls.borrow().clone();
+    let pos = |c: &str| calls.iter().position(|x| x == c).unwrap();
+    assert!(pos("merge_group_runs") < pos("download"));
+    assert!(pos("download") < pos("attest"));
+}
+
+#[test]
+fn cad409_still_accepts_legacy_push_run_test_evidence() {
+    let e = env();
+    let mut fake = Fake::new(&e.artifact);
+    // Even a failing merge_group run does not matter: the push run's own
+    // `test` passed (a direct push, or any build before CAD-409).
+    fake.merge_group = vec![queue_run_for(SHA)];
+    fake.merge_group_test = "failure";
+    let report = upgrade::run(&fake, &e.layout, &req(Target::Sha(SHA.into()), false)).unwrap();
+    let how = report["verified"]["test_job"].as_str().unwrap();
+    assert_eq!(
+        how,
+        format!("test success in push run {PUSH_RUN} attempt 1")
+    );
+    assert!(
+        !fake.called("merge_group_runs"),
+        "push-run evidence needs no merge_group lookup"
+    );
+    assert_eq!(link_target(&e.layout), e.layout.binary(SHA));
+}
+
+#[test]
+fn cad409_refuses_without_push_or_merge_group_evidence() {
+    let e = env();
+    let mut fake = Fake::new(&e.artifact);
+    fake.test_conclusion = "skipped";
+    let msg = refusal(upgrade::run(
+        &fake,
+        &e.layout,
+        &req(Target::Sha(SHA.into()), false),
+    ));
+    assert!(msg.contains("`test` job has not passed"), "{msg}");
+    assert!(
+        msg.contains(&format!("run {PUSH_RUN}: test skipped")),
+        "{msg}"
+    );
+    assert!(msg.contains("no merge_group run"), "{msg}");
+    assert!(!fake.called("download"));
+    assert_untouched(&e);
+}
+
+#[test]
+fn cad409_refuses_merge_group_evidence_for_another_sha_ref_or_a_failed_test() {
+    let e = env();
+    let mut other_ref = queue_run_for(SHA);
+    other_ref.head_branch = format!("gh-readonly-queue/feat/x/pr-1-{OLD}");
+    let mut not_queue = queue_run_for(SHA);
+    not_queue.event = "pull_request".into();
+    let cases: [(Run, &str, &str); 6] = [
+        // GitHub answered with a run of another commit.
+        (queue_run_for(OLD), "success", "no merge_group run"),
+        // A queue for another base branch, or not a merge_group run.
+        (other_ref, "success", "no merge_group run"),
+        (not_queue, "success", "no merge_group run"),
+        // The exact sha, but `test` did not pass there.
+        (
+            queue_run_for(SHA),
+            "failure",
+            "merge_group run 43: test failure",
+        ),
+        (
+            queue_run_for(SHA),
+            "cancelled",
+            "merge_group run 43: test cancelled",
+        ),
+        (
+            queue_run_for(SHA),
+            "",
+            "merge_group run 43: test (completed)",
+        ),
+    ];
+    for (run, test, want) in cases {
+        let mut fake = Fake::new(&e.artifact);
+        fake.test_conclusion = "skipped";
+        fake.merge_group = vec![run];
+        fake.merge_group_test = test;
+        let msg = refusal(upgrade::run(
+            &fake,
+            &e.layout,
+            &req(Target::Sha(SHA.into()), false),
+        ));
+        assert!(msg.contains("`test` job has not passed"), "{msg}");
+        assert!(msg.contains(want), "{want}: {msg}");
         assert!(!fake.called("download"));
         assert_untouched(&e);
     }
@@ -1028,6 +1181,60 @@ fn cli_refuses_a_test_job_that_did_not_pass() {
     let err = stderr(&out);
     assert!(err.contains("`test` job has not passed"), "{err}");
     assert!(err.contains("run 7: test failure"), "{err}");
+}
+
+/// CAD-409 through the real `Gh`: the push run skipped `test`, and
+/// `gh run list --event merge_group --commit <sha>` names the queue run
+/// that passed it. A dry run verifies everything and changes nothing.
+#[test]
+fn cli_accepts_merge_group_evidence_through_gh() {
+    let root = TempDir::new().unwrap();
+    let artifact = root.path().join("ci-artifact");
+    write_artifact(&artifact, SHA, SHA);
+    let push = format!(
+        r#"[{{"attempt":1,"conclusion":"success","databaseId":7,"event":"push","headBranch":"main","headSha":"{SHA}","status":"completed"}}]"#
+    );
+    let queue = format!(
+        r#"[{{"attempt":1,"conclusion":"success","databaseId":8,"event":"merge_group","headBranch":"gh-readonly-queue/main/pr-206-{OLD}","headSha":"{SHA}","status":"completed"}}]"#
+    );
+    let name = upgrade::artifact_name(SHA);
+    let script = format!(
+        "#!/bin/sh\n\
+         case \"$1 $2\" in\n\
+         \x20 'auth status') exit 0 ;;\n\
+         \x20 'api repos/favcrm/cadence/compare/{SHA}...main') echo ahead ;;\n\
+         \x20 'api repos/favcrm/cadence/actions/runs/7/artifacts?name={name}') echo '{{\"artifacts\":[{{\"name\":\"{name}\",\"expired\":false}}]}}' ;;\n\
+         \x20 'run list')\n\
+         \x20   case \"$*\" in\n\
+         \x20     *'--event merge_group'*'--commit {SHA}'*) echo '{queue}' ;;\n\
+         \x20     *'--event push'*'--branch main'*'--commit {SHA}'*) echo '{push}' ;;\n\
+         \x20     *) echo \"unexpected gh $*\" >&2; exit 3 ;;\n\
+         \x20   esac ;;\n\
+         \x20 'run view')\n\
+         \x20   case \"$3\" in\n\
+         \x20     7) echo '{{\"jobs\":[{{\"name\":\"test\",\"status\":\"completed\",\"conclusion\":\"skipped\"}}]}}' ;;\n\
+         \x20     8) echo '{{\"jobs\":[{{\"name\":\"test\",\"status\":\"completed\",\"conclusion\":\"success\"}}]}}' ;;\n\
+         \x20   esac ;;\n\
+         \x20 'run download') [ \"$3\" = 7 ] && cp '{art}'/* \"$9\" ;;\n\
+         \x20 'attestation verify') exit 0 ;;\n\
+         \x20 *) echo \"unexpected gh $*\" >&2; exit 3 ;;\n\
+         esac\n",
+        art = artifact.display()
+    );
+    let cli = cli_env(&script);
+    let out = cadence(&cli, &["--sha", SHA, "--dry-run"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["trust"], "attested CI build");
+    assert_eq!(report["run_id"], 7);
+    let how = report["verified"]["test_job"].as_str().unwrap();
+    assert!(how.contains("merge_group run 8"), "{how}");
+    assert_eq!(report["would_install"], true);
+    assert!(!cli.layout.release_dir(SHA).exists());
+    assert_eq!(
+        fs::read_link(&cli.layout.link).unwrap(),
+        cli.layout.binary(OLD)
+    );
 }
 
 #[test]

@@ -13,20 +13,26 @@ on:
     # release-* jobs below publish it to GitHub Releases.
     tags: ['v*']
 
-# Concurrency policy (CAD-228; docs/SESSION.md "Post-merge CI on main"):
+# Concurrency policy (CAD-228, CAD-409; docs/SESSION.md "Post-merge CI on
+# main"):
 # - pull_request: one group per PR number; a new head cancels the running
 #   and the pending run for that PR (stale PR work is never verified).
-# - push (main, feat/**): one group per ref; every pushed commit is
-#   verified, serially. A running push run is never cancelled, and
-#   `queue: max` keeps up to 100 pending runs instead of GitHub's default
-#   single pending slot, where a newer push cancelled the older pending run
-#   with zero jobs. Only a 101st waiting push is cancelled.
+# - push to main: one group per commit (`ci-main-<sha>`), so a push run
+#   never waits behind another main push run and its release jobs start as
+#   soon as runners allow. Each group only ever holds that one run, so no
+#   push run is cancelled or dropped. Every pushed commit still gets its
+#   own run (CAD-228); see queue-evidence below for what that run does.
+# - push to feat/** and v* tags: one group per ref; serial, never
+#   cancelled, `queue: max` keeps up to 100 pending runs instead of
+#   GitHub's default single pending slot (where a newer push cancelled the
+#   older pending run with zero jobs). Only a 101st waiting push is
+#   cancelled.
 # - merge_group: each queue entry has its own gh-readonly-queue/* ref, so
 #   it gets its own group, is never cancelled, and uses `queue: max`.
 # GitHub rejects `queue: max` together with `cancel-in-progress: true`, so
 # both are chosen by event and never meet in one run.
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
+  group: ci-${{ github.event.pull_request.number || (github.event_name == 'push' && github.ref == 'refs/heads/main' && format('main-{0}', github.sha)) || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
   queue: ${{ github.event_name == 'pull_request' && 'single' || 'max' }}
 
@@ -38,7 +44,79 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
+  # CAD-409: with the merge queue (CAD-290), GitHub merges a queue entry by
+  # moving main to the exact commit its merge_group run tested, so a push
+  # run for that sha would re-test identical content. On a push to main
+  # this job looks for that evidence: a merge_group run of this workflow
+  # on a gh-readonly-queue/main/* ref whose head is exactly this sha and
+  # whose latest attempt has fmt, clippy, test, build and ui all
+  # `success`. When found, the five gates below are skipped here and the
+  # run only builds and attests the release. When not found (a direct or
+  # admin-bypass push, a queue entry whose gates did not all pass, or a
+  # failed lookup), `tested` is false and every gate runs on this push as
+  # before. It never fails the run: any lookup error means "not found".
+  # On tags and feat/** it only reports false (tags keep every gate,
+  # CAD-311). On pull_request and merge_group it is skipped, and the gates
+  # run because their `if` tolerates a skipped need.
+  queue-evidence:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+    outputs:
+      tested: ${{ steps.find.outputs.tested }}
+      run_id: ${{ steps.find.outputs.run_id }}
+    steps:
+      - name: Find a merge_group run that passed every gate on this sha
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          REF: ${{ github.ref }}
+        run: |
+          set -uo pipefail
+          tested=false
+          run_id=
+          if [ "$REF" = refs/heads/main ]; then
+            if ids=$(gh api "repos/$REPO/actions/workflows/ci.yml/runs?event=merge_group&head_sha=$SHA&per_page=20" \
+                --jq '.workflow_runs[] | select(.head_sha == $ENV.SHA and (.head_branch | startswith("gh-readonly-queue/main/"))) | .id'); then
+              for id in $ids; do
+                if passed=$(gh api "repos/$REPO/actions/runs/$id/jobs?filter=latest&per_page=100" \
+                    --jq '[.jobs[] | select(.conclusion == "success") | .name] as $ok
+                          | ["fmt", "clippy", "test", "build", "ui"] | all(. as $g | $ok | any(.[]; . == $g))'); then
+                  if [ "$passed" = true ]; then
+                    tested=true
+                    run_id=$id
+                    break
+                  fi
+                  echo "merge_group run $id: not every gate passed"
+                else
+                  echo "::warning::could not read the jobs of merge_group run $id; running the gates here"
+                fi
+              done
+            else
+              echo "::warning::could not list merge_group runs for $SHA; running the gates here"
+            fi
+          fi
+          if [ "$tested" = true ]; then
+            msg="gates skipped: merge_group run $run_id passed fmt, clippy, test, build and ui on $SHA"
+          else
+            msg="gates run here: no merge_group run passed every gate on $SHA ($REF)"
+          fi
+          echo "$msg"
+          echo "$msg" >> "$GITHUB_STEP_SUMMARY"
+          echo "tested=$tested" >> "$GITHUB_OUTPUT"
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+
+  # The five required gates. Each needs queue-evidence only to read its
+  # verdict: `!cancelled()` replaces the default success() check, so a
+  # skipped queue-evidence (pull_request, merge_group) or a failed one
+  # still runs the gate; only `tested == 'true'` skips it.
   fmt:
+    needs: [queue-evidence]
+    if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -47,6 +125,8 @@ jobs:
       - run: cargo fmt --all -- --check
 
   clippy:
+    needs: [queue-evidence]
+    if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -55,6 +135,8 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
 
   test:
+    needs: [queue-evidence]
+    if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -103,6 +185,8 @@ jobs:
         run: cargo test --doc --locked
 
   build:
+    needs: [queue-evidence]
+    if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -111,6 +195,8 @@ jobs:
       - run: cargo build --release --locked
 
   ui:
+    needs: [queue-evidence]
+    if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
@@ -134,8 +220,15 @@ jobs:
         working-directory: ${{ github.workspace }}
 
   # CAD-334: keep the exact tested main build. Runs only on a push to main
-  # (never pull_request or merge_group), and only after every other gate
-  # passed on this same sha, so the manifest's `checks` list is true.
+  # (never pull_request or merge_group), and only when every gate passed
+  # on this same sha: either in this run (a direct push, or no queue
+  # evidence), or in the merge_group run queue-evidence found (CAD-409),
+  # whose gates are then skipped here. manifest.json records which run
+  # holds the checks (`checks_event`, `checks_run_id`), so its `checks`
+  # list stays true.
+  # The `if` spells out the needs' results: skipped gates would otherwise
+  # skip this job, because a job's default success() check fails when a
+  # job it needs was skipped.
   # Two jobs, so third-party build code (cargo build scripts, pnpm
   # packages) never runs with `id-token: write`:
   # - release-artifact builds with `contents: read` only and uploads the
@@ -147,8 +240,13 @@ jobs:
   # release build matches what was tested; the exact rustc/cargo versions
   # are recorded in manifest.json. Neither job is a required check.
   release-artifact:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [fmt, clippy, test, build, ui]
+    needs: [queue-evidence, fmt, clippy, test, build, ui]
+    if: >-
+      ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      (needs.queue-evidence.outputs.tested == 'true' ||
+      (needs.fmt.result == 'success' && needs.clippy.result == 'success' &&
+      needs.test.result == 'success' && needs.build.result == 'success' &&
+      needs.ui.result == 'success')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     permissions:
@@ -180,8 +278,16 @@ jobs:
           SOURCE_SHA: ${{ github.sha }}
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
+          QUEUE_TESTED: ${{ needs.queue-evidence.outputs.tested }}
+          QUEUE_RUN_ID: ${{ needs.queue-evidence.outputs.run_id }}
         run: |
           set -euo pipefail
+          # Which run's gates vouch for `checks` (CAD-409).
+          if [ "$QUEUE_TESTED" = true ]; then
+            checks_event=merge_group checks_run_id=$QUEUE_RUN_ID
+          else
+            checks_event=push checks_run_id=$RUN_ID
+          fi
           mkdir -p dist
           cp target/release/cadence dist/cadence
           chmod 0755 dist/cadence
@@ -199,11 +305,14 @@ jobs:
             --arg rustc "$(rustc --version)" \
             --arg cargo "$(cargo --version)" \
             --arg sha256 "$(cut -d' ' -f1 dist/cadence.sha256)" \
+            --arg checks_event "$checks_event" \
+            --argjson checks_run_id "$checks_run_id" \
             --arg built_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             '{source_sha: $source_sha, run_id: $run_id, run_attempt: $run_attempt,
               rustc: $rustc, cargo: $cargo, features: ["ui"],
               target: "x86_64-linux", runner: "ubuntu-24.04",
               checks: ["fmt", "clippy", "test", "build", "ui"],
+              checks_event: $checks_event, checks_run_id: $checks_run_id,
               sha256: $sha256, built_at: $built_at}' > dist/manifest.json
           cat dist/manifest.json dist/cadence.sha256
           echo "sha256=$(cut -d' ' -f1 dist/cadence.sha256)" >> "$GITHUB_OUTPUT"
@@ -219,8 +328,12 @@ jobs:
           overwrite: true
 
   release-attest:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [release-artifact]
+    # Explicit result check: release-artifact's skipped gate needs (queue
+    # evidence found) would fail the default success() here too.
+    if: >-
+      ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      needs.release-artifact.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -275,8 +388,9 @@ jobs:
   # builds run with `contents: read` only; release-publish runs no repo
   # code (it only reads install.sh) and is the one job that can attest
   # and write the release. Every leg needs all five gates on the tagged
-  # commit, and release-gate refuses a tag that is not on main or does
-  # not match Cargo.toml's version.
+  # commit (queue-evidence reports false for tags, so they always run
+  # and no need of this chain is ever skipped), and release-gate refuses
+  # a tag that is not on main or does not match Cargo.toml's version.
   #
   # Assets, per target (x86_64-linux, aarch64-linux, aarch64-macos):
   #   cadence-<tag>-<target>.tar.gz         cadence, cadence.sha256,

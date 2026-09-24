@@ -4,12 +4,19 @@
 //! `release-artifact` job builds (with `contents: read` only) and
 //! `release-attest` attests the binary and uploads
 //! `cadence-<sha>-x86_64-linux`: the binary, `cadence.sha256` and
-//! `manifest.json`.
+//! `manifest.json`. Since CAD-409 the gates of a queued merge ran in the
+//! merge_group run of that same sha (the merge queue moves `main` to the
+//! exact commit it tested), and the push run skips them; a direct push
+//! still runs every gate in its push run.
 //!
 //! Before anything is installed, this module proves, in order:
 //! 1. the sha is on `main` (GitHub compare: `identical` or `ahead`);
-//! 2. a CI push run on `main` for that exact sha has a successful `test` job;
-//! 3. that run still holds the artifact (not missing, not expired);
+//! 2. CI's `test` job passed on that exact sha: in a push run on `main`
+//!    (a direct push, and every build before CAD-409), or else in a
+//!    merge_group run on a `gh-readonly-queue/main/*` ref whose head is
+//!    that sha (a queued merge);
+//! 3. the push run on `main` for that sha still holds the artifact (not
+//!    missing, not expired);
 //! 4. the downloaded binary hashes to the value in `cadence.sha256`;
 //! 5. `manifest.json`'s `source_sha` is the requested sha;
 //! 6. `gh attestation verify` accepts the binary for this repo, signed by
@@ -58,6 +65,9 @@ pub const MAIN: &str = "main";
 pub const TARGET: &str = "x86_64-linux";
 /// The CI job that must have passed on the exact sha.
 pub const TEST_JOB: &str = "test";
+/// Ref prefix of the merge queue's temporary branches for `main`; a
+/// merge_group run on one of them is test evidence for its head sha.
+pub const QUEUE_REF_PREFIX: &str = "gh-readonly-queue/main/";
 /// Files inside the artifact and inside `<releases>/<sha>/`.
 pub const BINARY: &str = "cadence";
 pub const SHA_FILE: &str = "cadence.sha256";
@@ -143,6 +153,9 @@ pub trait ReleaseSource {
     fn compare(&self, base: &str, head: &str) -> Result<Option<String>>;
     /// Push runs of the workflow on `main` for exactly this sha.
     fn main_runs(&self, sha: &str) -> Result<Vec<Run>>;
+    /// merge_group runs of the workflow whose head is exactly this sha
+    /// (any `gh-readonly-queue/*` branch; the caller filters).
+    fn merge_group_runs(&self, sha: &str) -> Result<Vec<Run>>;
     fn jobs(&self, run_id: u64) -> Result<Vec<Job>>;
     fn artifact(&self, run_id: u64, name: &str) -> Result<ArtifactState>;
     /// Download the artifact's files into `dest`.
@@ -201,7 +214,9 @@ impl Gh {
         )))
     }
 
-    fn runs(&self, extra: &[&str]) -> Result<Vec<Run>> {
+    /// `gh run list` of [`WORKFLOW`] for one event, optionally on one
+    /// branch.
+    fn runs(&self, event: &str, branch: Option<&str>, extra: &[&str]) -> Result<Vec<Run>> {
         let mut args = vec![
             "run",
             "list",
@@ -209,13 +224,14 @@ impl Gh {
             &self.repo,
             "--workflow",
             WORKFLOW,
-            "--branch",
-            MAIN,
             "--event",
-            "push",
+            event,
             "--json",
             "databaseId,attempt,headSha,headBranch,event,status,conclusion",
         ];
+        if let Some(branch) = branch {
+            args.extend_from_slice(&["--branch", branch]);
+        }
         args.extend_from_slice(extra);
         let out = self.run_ok(&args, GH_TIMEOUT)?;
         parse_runs(&out)
@@ -292,7 +308,7 @@ impl ReleaseSource for Gh {
 
     fn latest_green_main(&self) -> Result<Option<Run>> {
         Ok(self
-            .runs(&["--status", "success", "--limit", "1"])?
+            .runs("push", Some(MAIN), &["--status", "success", "--limit", "1"])?
             .into_iter()
             .next())
     }
@@ -324,7 +340,11 @@ impl ReleaseSource for Gh {
     }
 
     fn main_runs(&self, sha: &str) -> Result<Vec<Run>> {
-        self.runs(&["--commit", sha, "--limit", "20"])
+        self.runs("push", Some(MAIN), &["--commit", sha, "--limit", "20"])
+    }
+
+    fn merge_group_runs(&self, sha: &str) -> Result<Vec<Run>> {
+        self.runs("merge_group", None, &["--commit", sha, "--limit", "20"])
     }
 
     fn jobs(&self, run_id: u64) -> Result<Vec<Job>> {
@@ -879,8 +899,9 @@ fn local_release(
     Ok(Local::Use { digest, trust })
 }
 
-/// Steps 1–3: on main, `test` passed on that exact sha, artifact present.
-/// Returns the run that holds the artifact.
+/// Steps 1–3: on main, `test` passed on that exact sha (push run, else
+/// merge_group run), artifact present. Returns the push run that holds
+/// the artifact.
 fn verify_ci(
     src: &dyn ReleaseSource,
     sha: &str,
@@ -911,42 +932,75 @@ fn verify_ci(
         .collect();
     if runs.is_empty() {
         return Err(Error::rejected(format!(
-            "no `{WORKFLOW}` push run on {MAIN} for {sha} — pull-request and merge-queue runs \
-             do not count; wait for the post-merge run (`gh run list --workflow {WORKFLOW} \
-             --branch {MAIN} --commit {sha}`)"
+            "no `{WORKFLOW}` push run on {MAIN} for {sha} — only the push run builds the \
+             release artifact; pull-request and merge-queue runs hold none. Wait for the \
+             post-merge run (`gh run list --workflow {WORKFLOW} --branch {MAIN} --commit {sha}`)"
         )));
     }
     runs.sort_by_key(|r| std::cmp::Reverse(r.id));
     let mut seen = Vec::new();
-    let mut chosen = None;
+    // The push run whose `test` passed (a direct push, or any build from
+    // before CAD-409) is both the evidence and the artifact's run.
+    let mut evidence = None;
     for run in &runs {
-        let jobs = src.jobs(run.id)?;
-        let test = jobs.iter().find(|j| j.name == TEST_JOB);
-        let state = match test {
-            Some(j) if j.conclusion == "success" => {
-                chosen = Some(run);
+        match test_passed(src, run)? {
+            Ok(()) => {
+                evidence = Some((
+                    run,
+                    format!(
+                        "{TEST_JOB} success in push run {} attempt {}",
+                        run.id, run.attempt
+                    ),
+                ));
                 break;
             }
-            Some(j) if j.conclusion.is_empty() => format!("{} ({})", TEST_JOB, j.status),
-            Some(j) => format!("{} {}", TEST_JOB, j.conclusion),
-            None => format!("no `{TEST_JOB}` job"),
-        };
-        seen.push(format!("run {}: {state}", run.id));
+            Err(state) => seen.push(format!("run {}: {state}", run.id)),
+        }
     }
-    let Some(run) = chosen else {
+    // CAD-409: a queued merge skips the gates in its push run; the
+    // merge_group run that tested this exact sha is the evidence, and the
+    // newest push run holds the artifact.
+    if evidence.is_none() {
+        let mut queued: Vec<Run> = src
+            .merge_group_runs(sha)?
+            .into_iter()
+            .filter(|r| {
+                r.head_sha == sha
+                    && r.event == "merge_group"
+                    && r.head_branch.starts_with(QUEUE_REF_PREFIX)
+            })
+            .collect();
+        queued.sort_by_key(|r| std::cmp::Reverse(r.id));
+        if queued.is_empty() {
+            seen.push(format!(
+                "no merge_group run on {QUEUE_REF_PREFIX}* for this sha"
+            ));
+        }
+        for run in &queued {
+            match test_passed(src, run)? {
+                Ok(()) => {
+                    evidence = Some((
+                        &runs[0],
+                        format!(
+                            "{TEST_JOB} success in merge_group run {} attempt {} ({}); \
+                             artifact from push run {}",
+                            run.id, run.attempt, run.head_branch, runs[0].id
+                        ),
+                    ));
+                    break;
+                }
+                Err(state) => seen.push(format!("merge_group run {}: {state}", run.id)),
+            }
+        }
+    }
+    let Some((run, how)) = evidence else {
         return Err(Error::rejected(format!(
             "CI's `{TEST_JOB}` job has not passed for {sha} on {MAIN} ({}) — refusing to \
              install an untested build; wait for the run or pick a green sha",
             seen.join("; ")
         )));
     };
-    verified.insert(
-        "test_job".into(),
-        json!(format!(
-            "{TEST_JOB} success in run {} attempt {}",
-            run.id, run.attempt
-        )),
-    );
+    verified.insert("test_job".into(), json!(how));
     let name = artifact_name(sha);
     match src.artifact(run.id, &name)? {
         ArtifactState::Present => {}
@@ -967,6 +1021,18 @@ fn verify_ci(
         }
     }
     Ok(run.id)
+}
+
+/// `Ok` when the run's latest attempt has a successful [`TEST_JOB`];
+/// otherwise the state seen, for the refusal.
+fn test_passed(src: &dyn ReleaseSource, run: &Run) -> Result<std::result::Result<(), String>> {
+    let jobs = src.jobs(run.id)?;
+    Ok(match jobs.iter().find(|j| j.name == TEST_JOB) {
+        Some(j) if j.conclusion == "success" => Ok(()),
+        Some(j) if j.conclusion.is_empty() => Err(format!("{TEST_JOB} ({})", j.status)),
+        Some(j) => Err(format!("{TEST_JOB} {}", j.conclusion)),
+        None => Err(format!("no `{TEST_JOB}` job")),
+    })
 }
 
 /// Steps 4–7 on the downloaded files.
