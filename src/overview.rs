@@ -1756,7 +1756,7 @@ fn degraded(source: &str, subject: &str, detail: impl Into<String>) -> Value {
 
 /// What one agent's probes returned. A mailbox (no actor) needs none —
 /// its `agent_list` row carries the backlog and health.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct AgentProbe {
     show: Option<Value>,
     requests: Vec<Value>,
@@ -1898,6 +1898,7 @@ fn probe_agents(state_dir: &Path, agents: &[Value], opts: &Options) -> Vec<Agent
 
 /// The daemon's half of the screen: reachability, build identity, the
 /// agent rows and their probes.
+#[derive(Clone)]
 struct DaemonView {
     reachable: bool,
     info: Option<Value>,
@@ -1956,6 +1957,77 @@ fn daemon_view(state_dir: &Path, opts: &Options) -> DaemonView {
     view
 }
 
+/// The daemon-side sources of one build — the agent probes and the
+/// monitoring block. The board's read model (CAD-325) keeps the last
+/// pass and rebuilds the screen from it when only the tracker moved.
+#[derive(Clone)]
+pub struct DaemonSources {
+    daemon: DaemonView,
+    monitoring: Value,
+}
+
+/// Probe the daemon and read the monitors, concurrently.
+pub fn daemon_sources(state_dir: &Path, opts: &Options) -> DaemonSources {
+    std::thread::scope(|s| {
+        let daemon = s.spawn(|| daemon_view(state_dir, opts));
+        let monitoring = s.spawn(|| monitoring(state_dir));
+        DaemonSources {
+            daemon: daemon.join().expect("overview daemon probe panicked"),
+            monitoring: monitoring
+                .join()
+                .expect("overview monitoring read panicked"),
+        }
+    })
+}
+
+/// Git-derived status and claim times kept across builds (CAD-325), per
+/// `(kind, issue id)` with the key they were read under — the tracker's
+/// `HEAD` plus the `issue.md` rev. The answer is a `git log`, so it moves
+/// with history as well as the file: an edit, a commit, a reset or a pull
+/// each re-read it, and nothing else does. Only found times are kept — a
+/// `None` may be a spent budget or a timed-out `git`.
+pub type ClockCache = Mutex<HashMap<(&'static str, String), (String, i64)>>;
+
+/// The clock cache as one build uses it: the cache and the tracker `HEAD`
+/// this build read (`git rev-parse HEAD`, once per build).
+#[derive(Clone, Copy)]
+struct SharedClocks<'a> {
+    cache: &'a ClockCache,
+    head: &'a str,
+}
+
+impl SharedClocks<'_> {
+    /// The cache key for `v` now, `None` when `issue.md` is unreadable.
+    fn key(&self, v: &board::View) -> Option<String> {
+        let rev = issue::write::issue_rev(&v.issue.dir).ok()?;
+        Some(format!("{} {rev}", self.head))
+    }
+
+    fn get(&self, kind: &'static str, id: &str, key: &str) -> Option<i64> {
+        let map = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(&(kind, id.to_string()))
+            .filter(|(k, _)| k == key)
+            .map(|(_, at)| *at)
+    }
+
+    fn put(&self, kind: &'static str, id: &str, key: String, at: Option<i64>) {
+        if let Some(at) = at {
+            self.cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert((kind, id.to_string()), (key, at));
+        }
+    }
+}
+
+/// What a long-lived caller hands a build instead of re-reading it: the
+/// indexed tracker's views, a recent daemon pass and the clock cache.
+pub struct Reuse<'a> {
+    pub views: &'a [board::View],
+    pub sources: &'a DaemonSources,
+    pub clocks: &'a ClockCache,
+}
+
 /// Total wall time the tracker status clocks may spend per build; rows
 /// past it get no clock (owner-only escalation) and one `degraded` note.
 const STATUS_CLOCK_BUDGET: Duration = Duration::from_secs(3);
@@ -1969,16 +2041,19 @@ struct StatusClock<'a> {
     pm_dir: &'a Path,
     deadline: Instant,
     cache: HashMap<String, Option<i64>>,
+    /// The read model's cache across builds, when there is one.
+    shared: Option<SharedClocks<'a>>,
     /// Issues left without a clock because the budget ran out.
     skipped: usize,
 }
 
 impl<'a> StatusClock<'a> {
-    fn new(pm_dir: &'a Path, budget: Duration) -> Self {
+    fn new(pm_dir: &'a Path, budget: Duration, shared: Option<SharedClocks<'a>>) -> Self {
         Self {
             pm_dir,
             deadline: Instant::now() + budget,
             cache: HashMap::new(),
+            shared,
             skipped: 0,
         }
     }
@@ -1990,17 +2065,26 @@ impl<'a> StatusClock<'a> {
         }
         let at = match v.status_source {
             "file" => {
+                let shared = self.shared.and_then(|c| Some((c, c.key(v)?)));
+                if let Some(hit) = shared.as_ref().and_then(|(c, k)| c.get("status", id, k)) {
+                    self.cache.insert(id.clone(), Some(hit));
+                    return Some(hit);
+                }
                 let left = self.deadline.saturating_duration_since(Instant::now());
                 if left.is_zero() {
                     self.skipped += 1;
                     None
                 } else {
-                    history::status_changed_at(
+                    let at = history::status_changed_at(
                         self.pm_dir,
                         &v.issue.project,
                         id,
                         left.min(GIT_TIMEOUT),
-                    )
+                    );
+                    if let Some((c, k)) = shared {
+                        c.put("status", id, k, at);
+                    }
+                    at
                 }
             }
             "notes" => v.chain.last().and_then(|n| parse_iso(&n.at)),
@@ -2250,11 +2334,60 @@ fn group_members(view: &DaemonView, root: &str) -> Result<Vec<String>, String> {
         .collect())
 }
 
+/// A claim's age through the read model's clock cache: a recorded claim
+/// carries its own time; an owner-only issue's `git log` answer is kept
+/// per `HEAD` and `issue.md` rev.
+fn claim_since(
+    clock: &claim::Clock,
+    shared: Option<SharedClocks<'_>>,
+    project: &str,
+    v: &board::View,
+) -> Option<i64> {
+    let front = &v.issue.front;
+    let keyed = shared
+        .filter(|_| front.claim.is_none())
+        .and_then(|c| Some((c, c.key(v)?)));
+    let Some((c, key)) = keyed else {
+        return clock.since(project, front);
+    };
+    if let Some(at) = c.get("claim", &front.id, &key) {
+        return Some(at);
+    }
+    let at = clock.since(project, front);
+    c.put("claim", &front.id, key, at);
+    at
+}
+
 /// Build the screen under `opts`. The daemon probes, the gh refresh and
 /// the tracker read run concurrently — each bounded — so the view costs
 /// its slowest source, not their sum. Fails only on a scope naming an
 /// unknown project key or group.
 pub fn overview_with(state_dir: &Path, pm_dir: &Path, opts: &Options) -> Result<Value, String> {
+    overview_from(state_dir, pm_dir, opts, None)
+}
+
+/// The board read model's build (CAD-325): the tracker, daemon and clock
+/// inputs come from `reuse`; only `gh` (from its cache, waiting at most
+/// `gh_wait`) and the local git reads run here.
+pub fn overview_board_from(
+    state_dir: &Path,
+    pm_dir: &Path,
+    reuse: Reuse<'_>,
+    gh_wait: Duration,
+) -> Value {
+    let opts = Options {
+        gh_wait,
+        ..Options::board()
+    };
+    unscoped(overview_from(state_dir, pm_dir, &opts, Some(reuse)))
+}
+
+fn overview_from(
+    state_dir: &Path,
+    pm_dir: &Path,
+    opts: &Options,
+    reuse: Option<Reuse<'_>>,
+) -> Result<Value, String> {
     let now = now_epoch();
     let pm = issue::Pm::at(pm_dir).ok();
     let projects = pm
@@ -2305,9 +2438,12 @@ pub fn overview_with(state_dir: &Path, pm_dir: &Path, opts: &Options) -> Result<
     slugs.sort();
     slugs.dedup();
 
-    // ---- the three sources, concurrently ----
-    let (daemon, (gh_repos, gh_state), views, monitoring_view) = std::thread::scope(|s| {
-        let daemon = s.spawn(|| daemon_view(state_dir, opts));
+    // ---- the three sources, concurrently (what `reuse` lacks) ----
+    let reused = reuse.as_ref();
+    let (fresh_sources, (gh_repos, gh_state), fresh_views) = std::thread::scope(|s| {
+        let sources = reused
+            .is_none()
+            .then(|| s.spawn(|| daemon_sources(state_dir, opts)));
         let gh = s.spawn(|| {
             if opts.cache_only {
                 github_repos_cached(state_dir, &slugs)
@@ -2316,21 +2452,41 @@ pub fn overview_with(state_dir: &Path, pm_dir: &Path, opts: &Options) -> Result<
             }
         });
         // Local files only — the notes index keeps it one pass.
-        let tracker = s.spawn(|| {
-            pm.as_ref().map(|pm| {
-                let issues = board::load_all(&pm.dir, None).unwrap_or_default();
-                board::views(&pm.config.notes_dir(), issues)
+        let tracker = reused.is_none().then(|| {
+            s.spawn(|| {
+                pm.as_ref().map(|pm| {
+                    let issues = board::load_all(&pm.dir, None).unwrap_or_default();
+                    board::views(&pm.config.notes_dir(), issues)
+                })
             })
         });
-        let monitoring = s.spawn(|| monitoring(state_dir));
         (
-            daemon.join().expect("overview daemon probe panicked"),
+            sources.map(|h| h.join().expect("overview daemon sources panicked")),
             gh.join().expect("overview gh refresh panicked"),
-            tracker.join().expect("overview tracker read panicked"),
-            monitoring
-                .join()
-                .expect("overview monitoring read panicked"),
+            tracker.and_then(|h| h.join().expect("overview tracker read panicked")),
         )
+    });
+    let sources = match (reused, &fresh_sources) {
+        (Some(r), _) => r.sources,
+        (None, Some(fresh)) => fresh,
+        (None, None) => unreachable!("sources are gathered unless reused"),
+    };
+    let daemon = &sources.daemon;
+    let monitoring_view = sources.monitoring.clone();
+    let views: Option<&[board::View]> = match reused {
+        Some(r) => pm.as_ref().map(|_| r.views),
+        None => fresh_views.as_deref(),
+    };
+    // The clock cache keys on the tracker's HEAD — one read per build; no
+    // HEAD (not a repo, git failing) means no cross-build cache.
+    let head = reused.and(pm.as_ref()).and_then(|pm| {
+        git_text(&pm.dir, &["rev-parse".into(), "HEAD".into()])
+            .ok()
+            .map(|h| h.trim().to_string())
+    });
+    let clocks = reused.zip(head.as_deref()).map(|(r, head)| SharedClocks {
+        cache: r.clocks,
+        head,
     });
     let mut degraded_notes = daemon.degraded.clone();
     if !slugs.is_empty() {
@@ -2339,7 +2495,7 @@ pub fn overview_with(state_dir: &Path, pm_dir: &Path, opts: &Options) -> Result<
         }
     }
     let members = match opts.scope.group.as_deref() {
-        Some(root) => Some(group_members(&daemon, root)?),
+        Some(root) => Some(group_members(daemon, root)?),
         None => None,
     };
 
@@ -2372,7 +2528,7 @@ pub fn overview_with(state_dir: &Path, pm_dir: &Path, opts: &Options) -> Result<
     // PR row belongs to the issue's owner for `--group`.
     let mut branch_issue: Vec<(String, String, Option<String>)> = Vec::new();
     let mut projects_out = Vec::new();
-    if let (Some(pm), Some(views)) = (&pm, &views) {
+    if let (Some(pm), Some(views)) = (&pm, views) {
         let mut status_of: HashMap<String, String> = HashMap::new();
         for v in views {
             status_of.insert(v.issue.front.id.clone(), v.status.clone());
@@ -2386,7 +2542,7 @@ pub fn overview_with(state_dir: &Path, pm_dir: &Path, opts: &Options) -> Result<
             .iter()
             .map(|v| (v.issue.front.id.as_str(), v))
             .collect();
-        let mut clock = StatusClock::new(&pm.dir, STATUS_CLOCK_BUDGET);
+        let mut clock = StatusClock::new(&pm.dir, STATUS_CLOCK_BUDGET, clocks);
         let mut intake: Vec<Item> = Vec::new();
         let escalations = crate::master::escalations(state_dir);
         for v in views {
@@ -2626,7 +2782,7 @@ pub fn overview_with(state_dir: &Path, pm_dir: &Path, opts: &Options) -> Result<
                 if matches!(v.status.as_str(), "doing" | "review")
                     && !claim::holders(front).is_empty()
                 {
-                    let since = claim_clock.since(&p.key, front);
+                    let since = claim_since(&claim_clock, clocks, &p.key, v);
                     let mut row = claim::row(&p.key, front, since, now);
                     row["status"] = json!(v.status);
                     claims.push(row);

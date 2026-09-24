@@ -5036,10 +5036,18 @@ impl Shared {
     /// and the event cursor — without the whole message history.
     fn board_view(&self, alias: &str) -> Result<Value> {
         let messages = self.store.messages(alias)?;
+        // Never the turn token: it is the credential `message result`
+        // checks, and the board has no use for it.
         let running: Vec<Value> = messages
             .iter()
             .filter(|m| m.state == "running")
-            .map(Message::to_json)
+            .map(|m| {
+                let mut j = m.to_json();
+                if let Some(o) = j.as_object_mut() {
+                    o.remove("turn_id");
+                }
+                j
+            })
             .collect();
         let parked = messages
             .iter()
