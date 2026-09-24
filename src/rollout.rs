@@ -613,6 +613,21 @@ pub fn recheck_restart(state_dir: &Path, ticket: &RestartTicket) -> Result<()> {
     Ok(())
 }
 
+/// The holder of the active, unexpired rollout lease, if any — the
+/// daemon's `shutdown` caller rule admits that agent (CAD-384): the
+/// rollout owner restarts from its own pane. Read-only; no lease table
+/// (or no database yet) is no holder.
+pub fn live_holder(state_dir: &Path) -> Result<Option<String>> {
+    let path = db_file(state_dir);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let conn = connect(&path)?;
+    Ok(active_lease(&conn)?
+        .filter(|lease| lease.expires_at > unix_now())
+        .map(|lease| lease.holder))
+}
+
 pub fn note_restart_proceeded(state_dir: &Path, ticket: &RestartTicket) -> Result<()> {
     let conn = connect(&db_file(state_dir))?;
     insert_event(

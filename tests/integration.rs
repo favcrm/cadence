@@ -44205,3 +44205,275 @@ fn delivery_loop_refuses_foreign_and_held_prs_and_a_corrupt_record() {
     );
     assert_eq!(lf.f.front("D-4").status, "ready");
 }
+
+// ---- CAD-384: one caller rule for every agent-mutating RPC ----
+
+/// Every row of every table, in a stable order — a refused call must
+/// leave this unchanged (CAD-384: every refusal writes nothing).
+fn db_snapshot(d: &TestDaemon) -> String {
+    let conn = rusqlite::Connection::open_with_flags(
+        d.state.join("cadence.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let tables: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let mut out = String::new();
+    for table in tables {
+        let mut stmt = conn.prepare(&format!("SELECT * FROM \"{table}\"")).unwrap();
+        let cols = stmt.column_count();
+        let mut rows: Vec<String> = stmt
+            .query_map([], |r| {
+                Ok((0..cols)
+                    .map(|i| format!("{:?}", r.get_ref(i).unwrap()))
+                    .collect::<Vec<_>>()
+                    .join("|"))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        rows.sort();
+        out.push_str(&format!("## {table}\n{}\n", rows.join("\n")));
+    }
+    out
+}
+
+/// Assert `frame` is a caller-rule refusal and nothing was written.
+fn assert_refused_clean(d: &TestDaemon, before: &str, frame: &Value, what: &str) {
+    assert_eq!(frame["ok"], false, "{what}: admitted: {frame}");
+    let err = frame_err(frame);
+    assert!(
+        err.contains("caller rule") || err.contains("not provably the operator"),
+        "{what}: not a caller-rule refusal: {err}"
+    );
+    assert_eq!(before, db_snapshot(d), "{what}: a refusal wrote");
+}
+
+/// The fleet for the agent-verb probes: fake agents `tgt` (live) and
+/// `q` (stopped, one queued message `m-q`), both in pm's group;
+/// pm/pm2/w1 are planted panes.
+fn cad384_fleet(d: &TestDaemon) -> GuardPanes {
+    let p = guard_panes(d);
+    for alias in ["tgt", "q"] {
+        d.register_member(alias, "pm");
+        d.wait_agent(alias, "idle", 15);
+    }
+    d.operator_rpc("agent_stop", json!({"alias": "q"})).unwrap();
+    d.wait_agent("q", "stopped", 10);
+    d.operator_rpc(
+        "agent_send",
+        json!({"alias": "q", "text": "later", "message": "m-q"}),
+    )
+    .unwrap();
+    assert_eq!(d.message_state("q", "m-q"), "queued");
+    p
+}
+
+/// CAD-384 acceptance 1 + 4: agent stop/resume and message cancel pass
+/// one caller rule (`peer::may_mutate_agent`; unfence, reconcile and
+/// respond are #221's operator gates, CAD-370/374). A peer worker,
+/// another group's PM and a detached child of an agent (no agent
+/// identity, not provably the operator) are refused before anything is
+/// written; the target's own PM and the operator are admitted, each
+/// attributed to itself.
+#[test]
+fn cad384_agent_verbs_one_caller_rule() {
+    let d = TestDaemon::start();
+    let mut p = cad384_fleet(&d);
+    let cases = [
+        ("agent_stop", json!({"alias": "tgt"})),
+        ("agent_resume", json!({"alias": "q"})),
+        ("message_cancel", json!({"message": "m-q"})),
+    ];
+    for (method, params) in &cases {
+        let before = db_snapshot(&d);
+        let r = p.pm2.rpc(&d.state, method, params.clone());
+        assert_refused_clean(&d, &before, &r, &format!("pm2 {method}"));
+        let r = p.w1.rpc(&d.state, method, params.clone());
+        assert_refused_clean(&d, &before, &r, &format!("w1 {method}"));
+        let r = unprovable_rpc(&d, method, params.clone());
+        assert_refused_clean(&d, &before, &r, &format!("detached {method}"));
+    }
+    assert_eq!(d.wait_agent("tgt", "idle", 1)["state"], "idle");
+    assert_eq!(d.message_state("q", "m-q"), "queued");
+
+    // The target's PM may not act as the operator either.
+    let before = db_snapshot(&d);
+    let r = p.pm.rpc(
+        &d.state,
+        "message_cancel",
+        json!({"message": "m-q", "by": "operator"}),
+    );
+    assert_refused_clean(&d, &before, &r, "pm cancel as operator");
+
+    // The target's own PM: admitted, attributed to itself.
+    let r =
+        p.pm.rpc(&d.state, "message_cancel", json!({"message": "m-q"}));
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(r["result"]["message"]["result"]["by"], "pm", "{r}");
+    let r = p.pm.rpc(&d.state, "agent_stop", json!({"alias": "tgt"}));
+    assert_eq!(r["ok"], true, "{r}");
+    // The operator, from a plain shell through the CLI.
+    let (ok, out, err) = d.operator_cadence(&["agent", "resume", "q", "--detach"]);
+    assert!(ok, "operator agent resume: {out} {err}");
+    let (ok, out, err) = d.operator_cadence(&["agent", "stop", "q"]);
+    assert!(ok, "operator agent stop: {out} {err}");
+}
+
+/// CAD-384 acceptance 2: the job/task verbs never default `by` to the
+/// operator. A detached child of an agent is refused; an agent is
+/// attributed to itself and may not name anyone else; the operator's
+/// `by` defaults to `operator`.
+#[test]
+fn cad384_job_verbs_attribute_the_caller() {
+    let d = TestDaemon::start();
+    let mut p = guard_panes(&d);
+    let (spec, sha) = d.spec_file("spec.md", "do the thing");
+    for job in ["j1", "j2", "j3"] {
+        d.job_new("pm", job, &spec, &sha);
+    }
+    let task_of = |job: &str| {
+        d.rpc("job_show", json!({"job": job})).unwrap()["job"]["tasks"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let (t1, t2) = (task_of("j1"), task_of("j2"));
+    let cases = [
+        ("job_cancel", json!({"job": "j1"})),
+        ("job_close", json!({"job": "j1"})),
+        ("task_fail", json!({"task": t1, "reason": "x"})),
+        ("task_cancel", json!({"task": t1})),
+        ("task_dispatch", json!({"task": t1, "to": "w1"})),
+        ("task_accept", json!({"task": t1})),
+        ("task_sha", json!({"task": t1, "sha": SHA_A})),
+        (
+            "monitor_register",
+            json!({"monitor": "m1", "project": "p", "tasks": [t1]}),
+        ),
+    ];
+    for (method, params) in &cases {
+        let before = db_snapshot(&d);
+        let r = unprovable_rpc(&d, method, params.clone());
+        assert_refused_clean(&d, &before, &r, &format!("detached {method}"));
+        // An agent naming the operator, or another agent, is refused.
+        let mut forged = params.clone();
+        forged["by"] = json!("operator");
+        let r = p.pm2.rpc(&d.state, method, forged);
+        assert_refused_clean(&d, &before, &r, &format!("pm2 {method} by operator"));
+    }
+    // An agent is attributed to itself.
+    let r =
+        p.pm.rpc(&d.state, "task_fail", json!({"task": t1, "reason": "boom"}));
+    assert_eq!(r["ok"], true, "{r}");
+    let r = p.pm.rpc(&d.state, "job_cancel", json!({"job": "j1"}));
+    assert_eq!(r["ok"], true, "{r}");
+    // The operator: `by` defaults to the operator.
+    d.operator_rpc("task_cancel", json!({"task": t2})).unwrap();
+    let by_of = |job: &str, kind: &str| -> Vec<Value> {
+        d.rpc("job_events", json!({"job": job})).unwrap()["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["kind"] == kind)
+            .map(|e| e["payload"]["by"].clone())
+            .collect()
+    };
+    assert_eq!(by_of("j1", "task_failed"), vec![json!("pm")]);
+    assert_eq!(by_of("j2", "task_cancelled"), vec![json!("operator")]);
+    // The operator CLI still works from a plain shell.
+    let (ok, out, err) = d.operator_cadence(&["job", "cancel", "j3"]);
+    assert!(ok, "operator job cancel: {out} {err}");
+}
+
+/// CAD-384 acceptance 3: operator-attributed writes from the socket
+/// need positive operator proof. A detached child of an agent (no
+/// agent identity) is refused for `thread_send` and for an
+/// `agent_send` that would land in a thread as the operator's.
+#[test]
+fn cad384_operator_attributed_sends_need_proof() {
+    let d = TestDaemon::start();
+    d.register("chat");
+    d.wait_agent("chat", "idle", 15);
+    d.operator_rpc(
+        "thread_send",
+        json!({"alias": "chat", "text": "hello", "message": "t1"}),
+    )
+    .unwrap();
+    d.wait_message("chat", "t1", &["completed"], 20);
+    for (method, params) in [
+        (
+            "thread_send",
+            json!({"alias": "chat", "text": "forged", "message": "f1"}),
+        ),
+        (
+            "agent_send",
+            json!({"alias": "chat", "text": "forged", "message": "f2"}),
+        ),
+    ] {
+        let before = db_snapshot(&d);
+        let r = unprovable_rpc(&d, method, params);
+        assert_eq!(r["ok"], false, "{method}: {r}");
+        assert!(
+            frame_err(&r).contains("not provably the operator"),
+            "{method}: {r}"
+        );
+        assert_eq!(before, db_snapshot(&d), "{method}: a refusal wrote");
+    }
+    // The operator's own send still lands as the operator's.
+    d.operator_rpc(
+        "agent_send",
+        json!({"alias": "chat", "text": "mine", "message": "t2"}),
+    )
+    .unwrap();
+    d.wait_message("chat", "t2", &["completed"], 20);
+}
+
+/// CAD-384 acceptance 1: `shutdown` (daemon stop) refuses a detached
+/// child of an agent and an agent that does not hold the rollout lease;
+/// the lease holder's pane may stop it (the rollout owner's
+/// `daemon restart` from its pane), as may the operator.
+#[test]
+fn cad384_shutdown_needs_the_operator_or_the_rollout_holder() {
+    let d = TestDaemon::start();
+    let mut p = guard_panes(&d);
+    let before = db_snapshot(&d);
+    let r = unprovable_rpc(&d, "shutdown", json!({}));
+    assert_refused_clean(&d, &before, &r, "detached shutdown");
+    let r = p.pm.rpc(&d.state, "shutdown", json!({}));
+    assert_refused_clean(&d, &before, &r, "pm shutdown without the lease");
+    assert!(d.rpc("health", json!({})).is_ok());
+
+    let caller = cadence_agent::rollout::resolve_caller_with(Some("pm"), None).unwrap();
+    cadence_agent::rollout::claim(
+        &d.state,
+        &cadence_agent::rollout::ClaimRequest {
+            caller: &caller,
+            reason: "cad384 probe",
+            target: None,
+            ttl: Duration::from_secs(600),
+            takeover: false,
+            now: cadence_agent::rollout::unix_now(),
+        },
+    )
+    .unwrap();
+    let r = p.pm2.rpc(&d.state, "shutdown", json!({}));
+    assert_eq!(r["ok"], false, "pm2 is not the holder: {r}");
+    let r = p.pm.rpc(&d.state, "shutdown", json!({}));
+    assert_eq!(r["ok"], true, "the lease holder's pane: {r}");
+}
+
+/// CAD-384: the operator's `cadence daemon stop` from a plain shell
+/// still stops the daemon (a real `daemon run` process).
+#[test]
+fn cad384_operator_daemon_stop_from_a_plain_shell() {
+    let d = TestDaemon::start_process_in(TempDir::new().unwrap());
+    let (ok, out, err) = d.operator_cadence(&["daemon", "stop"]);
+    assert!(ok, "operator daemon stop: {out} {err}");
+    assert!(d.rpc("health", json!({})).is_err());
+}
