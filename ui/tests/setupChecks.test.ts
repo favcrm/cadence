@@ -1,4 +1,5 @@
 import {
+  masterNeedsUnmet,
   missingRequired,
   readNudgeDismissed,
   statusChip,
@@ -51,9 +52,61 @@ const noLogin = ready.map((c) =>
   c.check === "master_login" ? { ...c, status: "missing" as const, fix: "CLAUDE_CONFIG_DIR=… claude auth login" } : c,
 );
 equal(missingRequired(report(noLogin)), ["master_login"], "the master's own login is required");
-// A host that cannot confine the master runs it on the operator's login —
-// the check reports ok, so nothing is asked for.
-// (covered by `ready` above: master_login ok never blocks)
+// A host that cannot confine the master: `master_login` reports ok (the
+// master uses the operator's login) and the offer carries the
+// `--unconfined` command with its warning — nothing master-side blocks.
+const unconfined = report(
+  ready.map((c) =>
+    c.check === "master_login"
+      ? {
+          ...c,
+          status: "ok" as const,
+          detail:
+            "this host cannot confine the master — `master start --unconfined` runs it on " +
+            "your own Claude login, with no filesystem sandbox: it can read and write your files",
+        }
+      : c,
+  ),
+);
+unconfined.master = {
+  providers: [
+    {
+      bin: "claude",
+      ready: true,
+      start: "cadence master start --unconfined --provider claude",
+      warning:
+        "the master runs UNCONFINED: no filesystem sandbox on this host, so it can read and " +
+        "write your files (ssh keys, forge logins, every repo) — its Bash allowlist is the only limit",
+    },
+  ],
+};
+equal(missingRequired(unconfined), [], "unconfined: master_login ok, the offer carries the command");
+const offer = unconfined.master!.providers[0];
+equal(offer.start!.includes("--unconfined"), true, "the offer names --unconfined");
+equal(offer.warning!.includes("UNCONFINED"), true, "the offer carries the risk warning");
+equal(masterNeedsUnmet(unconfined), false, "a ready-to-offer master is not prerequisite-blocked");
+// While `master` waits on `tracker` the offer card hides — the step
+// shows one command for starting the master, not two (N4).
+const trackerMissing = report(
+  ready.map((c) =>
+    c.check === "tracker"
+      ? { ...c, status: "missing" as const, fix: "cadence issue init" }
+      : c.check === "master"
+        ? { ...c, status: "missing" as const, fix: "cadence master start", detail: "needs `tracker` first" }
+        : c,
+  ),
+);
+trackerMissing.master = { providers: [{ bin: "claude", ready: true, start: null }] };
+equal(masterNeedsUnmet(trackerMissing), true, "needs-blocked master hides the offer card");
+equal(masterNeedsUnmet(report(ready)), false, "a ready master is not blocked");
+// Once the offer carries the start command the check's own fix is
+// absorbed by it — `master` still blocks Home until the command runs.
+const offerFix = report(
+  ready.map((c) => (c.check === "master" ? { ...c, status: "missing" as const, fix: null } : c)),
+);
+offerFix.master = { providers: [{ bin: "claude", ready: true, start: "cadence master start --provider claude" }] };
+equal(missingRequired(offerFix), ["master"], "the offer's command keeps master required");
+equal(masterNeedsUnmet(offerFix), false, "a plain missing master (files absent) does not hide the card");
 // Codex signed in but not master-capable (the board's offer list is the
 // authority — a refused provider does not satisfy "a master CLI").
 const codexOnly = ready.map((c) =>

@@ -453,6 +453,13 @@ pub fn confinement_available(env: &crate::adapter::ProviderEnv) -> Result<()> {
     crate::confine::available()
 }
 
+/// What the operator opts into when `master start --unconfined` is the
+/// only way — `master start` answers with it, and the setup wizard
+/// shows it next to the command it offers (CAD-448 review, I1).
+pub const UNCONFINED_WARNING: &str = "the master runs UNCONFINED: no filesystem sandbox on this \
+     host, so it can read and write your files (ssh keys, forge logins, every repo) — its Bash \
+     allowlist is the only limit";
+
 /// The master's Claude login, as `master start` found or made it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Login {

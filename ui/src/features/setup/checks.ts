@@ -26,8 +26,12 @@ export interface MasterOffer {
   bin: string;
   /** Its check is ready — the CLI is installed and signed in. */
   ready: boolean;
-  /** `cadence master start --provider <bin>`; null while not ready or no `master` verb. */
+  /** `cadence master start --provider <bin>`; null while not ready, no
+   * `master` verb, or the `master` check's own prerequisites unmet. */
   start: string | null;
+  /** The risk an offered `--unconfined` command carries (no filesystem
+   * sandbox); absent on boards built before CAD-448's review fix. */
+  warning?: string | null;
 }
 
 export interface SetupReport {
@@ -97,6 +101,17 @@ export function inGroup(report: SetupReport | null, group: SetupGroup): SetupChe
 }
 
 /**
+ * True while the `master` check waits on an unmet prerequisite — the
+ * backend reports "needs `<dep>` first". The provider offer card hides
+ * until then: the step shows one command for starting the master, not
+ * two (CAD-448 review, N4).
+ */
+export function masterNeedsUnmet(report: SetupReport): boolean {
+  const master = report.checks.find((c) => c.check === "master");
+  return !!master && !isReady(master) && master.detail.startsWith("needs `");
+}
+
+/**
  * What still blocks a first run: each required check that is not ready
  * and that this build can act on, plus "a master CLI" when neither
  * Claude nor Codex is signed in. A check with no fix (`master` in a
@@ -105,9 +120,13 @@ export function inGroup(report: SetupReport | null, group: SetupGroup): SetupChe
  */
 export function missingRequired(report: SetupReport): string[] {
   const by = new Map(report.checks.map((c) => [c.check, c]));
+  // Once an offer carries the provider-qualified start command the
+  // `master` check's own fix is absorbed by it (N4) — the command still
+  // exists, so the check still blocks Home until it runs.
+  const offerStart = (report.master?.providers ?? []).some((o) => o.start);
   const out: string[] = REQUIRED_CHECKS.filter((name) => {
     const c = by.get(name);
-    return !c || (!isReady(c) && c.fix !== null);
+    return !c || (!isReady(c) && (c.fix !== null || (name === "master" && offerStart)));
   });
   const masterBins = report.master?.providers.map((p) => p.bin) ?? MASTER_CLIS;
   const cliReady = masterBins.some((name) => {

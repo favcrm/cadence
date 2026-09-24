@@ -42540,6 +42540,11 @@ fn master_agent_files_have_one_writer() {
     .unwrap();
     let (_m, out) = f.start_master();
     assert_eq!(out["installed"], json!(["AGENT.md"]), "{out}");
+    // CAD-448 review (N1): the requested provider is the one launched —
+    // the response and the registered agent both name it.
+    assert_eq!(out["provider"], "claude", "{out}");
+    let shown = f.d.rpc("agent_show", json!({"alias": "master"})).unwrap();
+    assert_eq!(shown["agent"]["provider"], "claude", "{shown}");
     assert!(f.pm_dir.join("agents/master/AGENT.md").is_file());
     // One master per install.
     let err =
@@ -42547,6 +42552,20 @@ fn master_agent_files_have_one_writer() {
             .unwrap_err()
             .to_string();
     assert!(err.contains("already registered"), "{err}");
+}
+
+/// CAD-448 review (N1): a `master_start` without `provider` launches
+/// the first provider `master::PROVIDERS` accepts — not a literal
+/// hardcoded in the launch path.
+#[test]
+fn master_start_defaults_to_the_first_accepted_provider() {
+    let f = PlanFixture::start();
+    let (_m, out) = f.start_master_with(json!({}));
+    assert_eq!(
+        out["provider"].as_str().unwrap(),
+        cadence_agent::master::PROVIDERS[0],
+        "{out}"
+    );
 }
 
 /// CAD-339 acceptance 4 and review round 1 (I3, router): a worker's

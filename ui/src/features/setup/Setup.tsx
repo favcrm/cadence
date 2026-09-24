@@ -8,6 +8,7 @@ import {
   checkLabel,
   inGroup,
   isReady,
+  masterNeedsUnmet,
   missingRequired,
   statusChip,
   type SetupCheck,
@@ -125,15 +126,17 @@ function CheckList({ checks }: { checks: SetupCheck[] }) {
 /**
  * The master step's provider choice (CAD-448): every CLI `master start`
  * accepts, each ready one with its exact start command — a not-ready
- * one shows its own install/sign-in fix instead. Hidden once the
- * master's files exist (`master start` already ran or planted them) and
- * on a board built before CAD-448. Detect only: the command is the
- * operator's to paste, never run from the board.
+ * one shows its own install/sign-in fix instead, and an `--unconfined`
+ * command carries its risk warning. Hidden once the master's files
+ * exist (`master start` already ran or planted them), while the
+ * `master` check waits on its own prerequisites, and on a board built
+ * before CAD-448. Detect only: the command is the operator's to paste,
+ * never run from the board.
  */
 function MasterProviders({ report }: { report: SetupReport }) {
   const offers = report.master?.providers ?? [];
   const files = report.checks.find((c) => c.check === "master");
-  if (offers.length === 0 || (files && isReady(files))) return null;
+  if (offers.length === 0 || (files && isReady(files)) || masterNeedsUnmet(report)) return null;
   return (
     <div className="card mt-4 px-4 py-3">
       <p className="text-secondary text-ink-400">
@@ -156,6 +159,11 @@ function MasterProviders({ report }: { report: SetupReport }) {
               {provider && (
                 <p className="text-secondary text-ink-500 mt-0.5 break-words [overflow-wrap:anywhere]">
                   {provider.detail}
+                </p>
+              )}
+              {o.warning && (
+                <p className="mt-1.5 rounded bg-warn/10 px-3 py-2 text-secondary font-medium text-warn break-words [overflow-wrap:anywhere]">
+                  {o.warning}
                 </p>
               )}
               {command && <CopyFix command={command} />}

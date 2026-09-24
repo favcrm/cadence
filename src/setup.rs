@@ -807,12 +807,25 @@ fn master_check() -> Check {
     .needs(&["tracker"])
 }
 
+/// [`crate::master::confinement_available`] over this context's env —
+/// the daemon's `ProviderEnv` seam (`CADENCE_TEST_NO_LANDLOCK`, debug
+/// builds) reaches the wizard this way, so tests can force the
+/// unconfined branch on any host.
+fn confinement(ctx: &Ctx) -> Result<()> {
+    let env = crate::adapter::ProviderEnv::default();
+    if let Some(v) = (ctx.env)(crate::master::TEST_NO_LANDLOCK) {
+        env.set(crate::master::TEST_NO_LANDLOCK, v);
+    }
+    crate::master::confinement_available(&env)
+}
+
 /// CAD-448: the master's own Claude login (CAD-439) — a separate
 /// `CLAUDE_CONFIG_DIR` under the state dir, never the operator's
 /// `~/.claude`. Detect only: the login command is interactive, so an
 /// absent login is `missing` with the command to run, never applied.
 /// A host that cannot confine the master runs it `--unconfined` on the
-/// operator's own login — there is no separate login to ask for.
+/// operator's own login — there is no separate login to ask for, and
+/// the detail states the risk that choice carries.
 fn master_login_check() -> Check {
     Check::new(
         "master_login",
@@ -820,10 +833,11 @@ fn master_login_check() -> Check {
             if !ctx.has_verb("master") {
                 return Found::Unknown("the master is not in this build".into());
             }
-            if crate::confine::available().is_err() {
+            if confinement(ctx).is_err() {
                 return Found::Present(
                     "this host cannot confine the master — `master start --unconfined` \
-                     uses your own Claude login"
+                     runs it on your own Claude login, with no filesystem sandbox: it can \
+                     read and write your files"
                         .into(),
                 );
             }
@@ -944,8 +958,14 @@ pub struct MasterOffer {
     /// Its check is ready: the CLI is installed and signed in.
     pub ready: bool,
     /// `cadence … master start --provider <bin>`; `None` while the
-    /// provider is not ready or this build has no `master` verb.
+    /// provider is not ready, this build has no `master` verb, or the
+    /// `master` check's own prerequisites are unmet — the wizard shows
+    /// one command for starting the master, not two.
     pub start: Option<String>,
+    /// [`crate::master::UNCONFINED_WARNING`] when the offered command
+    /// runs the master without a filesystem sandbox — the operator's
+    /// `--unconfined` decision is opt-in with the risk spelled out.
+    pub warning: Option<&'static str>,
 }
 
 /// What `/api/setup` answers: the detect-only checks, and the master
@@ -957,10 +977,16 @@ pub struct BoardDetect {
 }
 
 /// The master step's provider offers (CAD-448). `done` holds the
-/// provider checks' outcomes; a ready provider earns its exact start
-/// command.
-fn master_offers(ctx: &Ctx, done: &[Outcome]) -> Vec<MasterOffer> {
-    let confined = crate::confine::available().is_ok();
+/// checks' outcomes; a ready provider earns its exact start command,
+/// but only once the `master` check's own prerequisites (`tracker`)
+/// are met — before that the step's one command is the check's fix.
+fn master_offers(ctx: &Ctx, list: &[Check], done: &[Outcome]) -> Vec<MasterOffer> {
+    let unconfined = confinement(ctx).is_err();
+    let prereqs_met = list.iter().find(|c| c.name == "master").is_some_and(|m| {
+        m.needs
+            .iter()
+            .all(|dep| done.iter().any(|o| o.check == *dep && o.status.ready()))
+    });
     crate::master::PROVIDERS
         .iter()
         .map(|bin| {
@@ -968,14 +994,21 @@ fn master_offers(ctx: &Ctx, done: &[Outcome]) -> Vec<MasterOffer> {
                 .iter()
                 .find(|o| o.check == *bin)
                 .is_some_and(|o| o.status.ready());
-            let start = (ready && ctx.has_verb("master")).then(|| {
-                if confined {
-                    ctx.cadence(&format!("master start --provider {bin}"))
-                } else {
+            let start = (ready && prereqs_met && ctx.has_verb("master")).then(|| {
+                if unconfined {
                     ctx.cadence(&format!("master start --unconfined --provider {bin}"))
+                } else {
+                    ctx.cadence(&format!("master start --provider {bin}"))
                 }
             });
-            MasterOffer { bin, ready, start }
+            let warning =
+                (start.is_some() && unconfined).then_some(crate::master::UNCONFINED_WARNING);
+            MasterOffer {
+                bin,
+                ready,
+                start,
+                warning,
+            }
         })
         .collect()
 }
@@ -1027,8 +1060,18 @@ pub fn board_detect(state_dir: &Path, pm_dir: &Path, port: u16) -> Result<BoardD
         probe_timeout: BOARD_PROBE_TIMEOUT,
         verbs: VERBS.get().cloned().unwrap_or_default(),
     };
-    let checks = detect_checks(&ctx, &board_checks(&ctx.board_url()));
-    let master_providers = master_offers(&ctx, &checks);
+    let list = board_checks(&ctx.board_url());
+    let mut checks = detect_checks(&ctx, &list);
+    let master_providers = master_offers(&ctx, &list, &checks);
+    // CAD-448 review (N4): one command for starting the master. Once an
+    // offer carries the provider-qualified command, the `master`
+    // check's bare `master start` fix is the same action — the offer
+    // absorbs it.
+    if master_providers.iter().any(|o| o.start.is_some()) {
+        if let Some(m) = checks.iter_mut().find(|o| o.check == "master") {
+            m.fix = None;
+        }
+    }
     Ok(BoardDetect {
         checks,
         master_providers,
@@ -1338,8 +1381,9 @@ mod tests {
             provider("claude", true),
             provider("codex", true),
             provider("pi", false),
+            provider("tracker", true),
         ];
-        let offers = master_offers(&with_master, &done);
+        let offers = master_offers(&with_master, &checks(), &done);
         // Only master::PROVIDERS are offered — a signed-in codex is not
         // a master choice while the daemon refuses it.
         assert_eq!(
@@ -1353,15 +1397,101 @@ mod tests {
         assert!(start.contains("--provider claude"), "{start}");
         if crate::confine::available().is_err() {
             assert!(start.contains("--unconfined"), "{start}");
+            assert_eq!(
+                claude.warning,
+                Some(crate::master::UNCONFINED_WARNING),
+                "{claude:?}"
+            );
+        } else {
+            assert_eq!(claude.warning, None, "{claude:?}");
         }
         // The served state dir is not the default: the command names it.
         assert!(start.contains("--state-dir"), "{start}");
         // Provider not ready → no command to start on it.
-        let done = [provider("claude", false)];
-        assert_eq!(master_offers(&with_master, &done)[0].start, None);
+        let done = [provider("claude", false), provider("tracker", true)];
+        assert_eq!(master_offers(&with_master, &checks(), &done)[0].start, None);
         // No `master` verb in this build → nothing to start with.
         let no_verb = ctx(dir.path());
-        assert_eq!(master_offers(&no_verb, &done)[0].start, None);
+        assert_eq!(master_offers(&no_verb, &checks(), &done)[0].start, None);
+    }
+
+    /// CAD-448 review (N4): while the `master` check's prerequisites
+    /// are unmet — `tracker` missing on a fresh host — the offer shows
+    /// the provider's state but no start command; the step's one
+    /// command is the check's own fix, not two commands for one action.
+    #[test]
+    fn master_offers_wait_for_the_master_checks_prerequisites() {
+        let dir = tempfile::tempdir().unwrap();
+        let with_master = Ctx {
+            verbs: vec!["master".into()],
+            ..ctx(dir.path())
+        };
+        let provider = |name: &str, ready: bool| Outcome {
+            check: name.to_string(),
+            status: if ready { Status::Ok } else { Status::Missing },
+            detail: String::new(),
+            fix: None,
+        };
+        // `tracker` ran and reported missing → the offer carries no
+        // command, whatever the provider's own readiness.
+        let done = [provider("claude", true), provider("tracker", false)];
+        let offers = master_offers(&with_master, &checks(), &done);
+        assert!(offers[0].ready);
+        assert_eq!(offers[0].start, None, "{offers:?}");
+        assert_eq!(offers[0].warning, None, "{offers:?}");
+        // Once `tracker` is ready the same offer earns its command.
+        let done = [provider("claude", true), provider("tracker", true)];
+        let offers = master_offers(&with_master, &checks(), &done);
+        assert!(
+            offers[0].start.as_deref().unwrap().contains("master start"),
+            "{offers:?}"
+        );
+    }
+
+    /// CAD-448 review (I1): `CADENCE_TEST_NO_LANDLOCK` (the daemon's
+    /// debug-build seam) forces the unconfined branch — the offer's
+    /// command names `--unconfined` and carries the warning, and
+    /// `master_login` states the risk instead of asking for a login.
+    /// Runs on any host, confined or not.
+    #[test]
+    fn unconfined_offers_carry_the_flag_and_the_warning() {
+        fn no_landlock(name: &str) -> Option<String> {
+            (name == crate::master::TEST_NO_LANDLOCK).then(|| "1".to_string())
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let unconfined = Ctx {
+            verbs: vec!["master".into()],
+            env: no_landlock,
+            ..ctx(dir.path())
+        };
+        let provider = |name: &str, ready: bool| Outcome {
+            check: name.to_string(),
+            status: if ready { Status::Ok } else { Status::Missing },
+            detail: String::new(),
+            fix: None,
+        };
+        let done = [provider("claude", true), provider("tracker", true)];
+        let offers = master_offers(&unconfined, &checks(), &done);
+        let claude = &offers[0];
+        let start = claude.start.as_deref().unwrap();
+        assert!(start.contains("--unconfined"), "{start}");
+        assert!(start.contains("--provider claude"), "{start}");
+        assert_eq!(
+            claude.warning,
+            Some(crate::master::UNCONFINED_WARNING),
+            "{claude:?}"
+        );
+        // The login check asks for nothing and says why the choice is
+        // risky — not a convenience.
+        let out = detect_checks(&unconfined, &[master_login_check()]);
+        assert_eq!(out[0].status, Status::Ok, "{:?}", out[0]);
+        assert!(out[0].detail.contains("--unconfined"), "{:?}", out[0]);
+        assert!(
+            out[0].detail.contains("no filesystem sandbox")
+                && out[0].detail.contains("read and write your files"),
+            "{:?}",
+            out[0]
+        );
     }
 
     #[test]

@@ -60,11 +60,6 @@ pub const MASTER_ALLOWED: &[&str] = &[
     "delivery_list",
 ];
 
-/// What `master start --unconfined` tells the operator.
-pub const UNCONFINED_WARNING: &str = "the master runs UNCONFINED: no filesystem sandbox on this \
-     host, so it can read and write your files (ssh keys, forge logins, every repo) — its Bash \
-     allowlist is the only limit";
-
 /// Most reports one router pass queues to the master; the rest wait for
 /// the next pass and are counted as the routing backlog.
 const ROUTES_PER_PASS: usize = 5;
@@ -499,7 +494,10 @@ impl Shared {
             .find(|(n, _)| n == "AGENT.md")
             .map(|(_, t)| t.as_str())
             .unwrap_or_default();
-        let provider = "claude";
+        // The provider validated above is the one launched — a refused
+        // provider never reaches this line, a missing one defaults to
+        // the first entry `master::PROVIDERS` accepts.
+        let provider = requested.unwrap_or(master::PROVIDERS[0]);
         let choice = preferred(agent_md).into_iter().find(|c| c.0 == provider);
         let model = optional_str(params, "model")
             .map(str::to_string)
@@ -616,7 +614,7 @@ impl Shared {
             "confined": !unconfined,
             "login": login.map(master::Login::as_str),
             "login_command": login_command,
-            "warning": unconfined.then_some(UNCONFINED_WARNING),
+            "warning": unconfined.then_some(master::UNCONFINED_WARNING),
             "alias": ALIAS,
             "provider": provider,
             "endpoint_kind": "managed",
