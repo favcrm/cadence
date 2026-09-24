@@ -5,7 +5,8 @@ import { readAppUrlState, type AppTab, type ProjectView } from "./urlState";
  * The app's routes — real paths with browser history, so every screen has
  * a link that survives a refresh or a paste:
  *
- *   /                          Home (the overview for now)
+ *   /                          Home — the master's thread (CAD-328)
+ *   /overview                  the team overview (needs, drift, monitors)
  *   /projects[/:slug]          a project's issues (board or list)
  *   /projects/:slug/context    its context and plan
  *   /agents[/:alias]           agents, optionally one agent's drawer
@@ -24,6 +25,7 @@ export type SettingsSection = "models" | "memory";
 
 export type Route =
   | { screen: "home" }
+  | { screen: "overview" }
   | { screen: "projects"; slug: string | null; section: ProjectSection }
   | { screen: "agents"; alias: string | null }
   | { screen: "setup" }
@@ -76,6 +78,7 @@ export function matchRoute(pathname: string): Route {
       if (alias) return { screen: "agents", alias };
     }
     if (head === "setup" && !a) return { screen: "setup" };
+    if (head === "overview" && !a) return { screen: "overview" };
     if (head === "settings" && !b) {
       if (!a) return { screen: "settings", section: "models" };
       if (a === "memory") return { screen: "settings", section: "memory" };
@@ -97,6 +100,8 @@ export function routePath(route: Route): string {
       return route.alias ? `/agents/${encodeURIComponent(route.alias)}` : "/agents";
     case "setup":
       return "/setup";
+    case "overview":
+      return "/overview";
     case "settings":
       return route.section === "memory" ? "/settings/memory" : "/settings";
     case "notFound":

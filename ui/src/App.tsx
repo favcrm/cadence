@@ -6,6 +6,7 @@ import Drawer from "./features/projects/Drawer";
 import Memory from "./features/settings/Memory";
 import ModelDefaults from "./features/settings/ModelDefaults";
 import OverviewView from "./features/home/Overview";
+import Home from "./features/home/Home";
 import Plan from "./features/projects/Plan";
 import Sidebar from "./ui/Sidebar";
 import Link from "./ui/Link";
@@ -18,7 +19,7 @@ import { Logo } from "./ui/Logo";
 import { countLabel, issueCounts } from "./lib/counts";
 import type { BoardFilters } from "./lib/filters";
 import { invalidatedBy } from "./lib/cache";
-import { resources } from "./lib/resources";
+import { cache, resources } from "./lib/resources";
 import { useMaybeResource, useResource } from "./lib/useResource";
 import {
   goTo,
@@ -51,12 +52,16 @@ function update(fn: (current: AppLocation) => AppLocation, opts?: { replace?: bo
 
 const SCREEN_LABEL: Record<Screen, string> = {
   home: "home",
+  overview: "overview",
   projects: "projects",
   agents: "agents",
   setup: "setup",
   settings: "settings",
   notFound: "not found",
 };
+
+/** Screens that read the overview: Home's Needs-you rail and the full overview. */
+const overviewOn = (s: Screen) => s === "home" || s === "overview";
 
 export default function App() {
   // App selection lives in the URL — the route (`/projects/cadence`) plus
@@ -115,9 +120,9 @@ export default function App() {
   // while Home is on screen.
   const screenRef = useRef(screen);
   screenRef.current = screen;
-  // Home shows the project context compactly; Projects → context in full.
+  // The overview shows the project context compactly; Projects → context in full.
   const contextOn =
-    screen === "home" || (route.screen === "projects" && route.section === "context");
+    screen === "overview" || (route.screen === "projects" && route.section === "context");
 
   useEffect(() => {
     const request = ++projectContextRequest.current;
@@ -167,7 +172,7 @@ export default function App() {
   // is fetched only while Home is on screen — revalidated when Home comes
   // back, painting the last payload meanwhile. Requests coalesce.
   useEffect(() => {
-    if (screen === "home") void resources.overview.revalidate();
+    if (overviewOn(screen)) void resources.overview.revalidate();
   }, [screen]);
 
   // Full re-read: first load, the refresh button, focus and the poll.
@@ -178,7 +183,7 @@ export default function App() {
     void resources.projects.refresh();
     void resources.issues.refresh();
     void resources.agents.refresh();
-    if (screenRef.current === "home") void resources.overview.refresh();
+    if (overviewOn(screenRef.current)) void resources.overview.refresh();
     loadDetail();
   }, [loadDetail]);
 
@@ -193,10 +198,11 @@ export default function App() {
     const es = new EventSource("/api/stream");
     const onEvent = (e: MessageEvent<string>) => {
       for (const name of invalidatedBy(e.data)) {
-        if (name === "issue") loadDetail();
+        // Every issue store on screen — the drawer and Home's plan cards.
+        if (name === "issue") cache.invalidate("issue");
         else if (name === "overview") {
           // Hidden overview: skip — it revalidates when Home opens.
-          if (screenRef.current === "home") void resources.overview.invalidate();
+          if (overviewOn(screenRef.current)) void resources.overview.invalidate();
         } else void resources[name].invalidate();
       }
     };
@@ -475,6 +481,14 @@ export default function App() {
 
         {screen === "home" && <SetupNudge readOnly={meta ? readOnly : null} />}
         {screen === "home" && (
+          <Home
+            readOnly={readOnly}
+            overview={overviewState}
+            onOpenIssue={openIssue}
+            overviewHref={hrefFor({ screen: "overview" })}
+          />
+        )}
+        {screen === "overview" && (
           <OverviewView
             state={overviewState}
             issues={issuesState}
