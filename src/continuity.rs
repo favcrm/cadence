@@ -74,15 +74,15 @@ pub const LAST_TURNS: usize = 8;
 /// Newest thread entries read for a pack; older ones are only counted.
 pub const SOURCE_ENTRIES: i64 = 400;
 /// USER.md is capped like SOUL.md (docs/design/AGENT-FILESYSTEM.md) —
-/// in bytes here, so the pack's byte budget holds for any script.
-pub const PREFERENCES_MAX_BYTES: usize = 4_000;
+/// in bytes here, quoting included, so the pack's byte budget holds for
+/// any script and any line length.
+pub const PREFERENCES_MAX_BYTES: usize = 4_500;
 
 // Section budgets, after quoting. Header (≤ 800) + preferences + plans
 // + summary + turns + headings stay under [`PACK_MAX`], so assembly
 // never has to cut; it drops whole sections (summary, plans,
 // preferences, then the oldest turns — never the newest) if redaction
 // ever grows one past the sum.
-const PREFERENCES_SECTION_MAX: usize = 4_500;
 const PLANS_MAX: usize = 4_500;
 const SUMMARY_MAX: usize = 3_500;
 const TURNS_MAX: usize = 10_000;
@@ -577,12 +577,13 @@ fn first_line(text: &str, max: usize) -> String {
     one_line(text.trim().split(is_break).next().unwrap_or(""), max)
 }
 
-/// Stored text as quoted data: at most `max` bytes of it, then every
-/// line prefixed `> `. Only the daemon's own lines start anywhere
-/// else, so no stored text can pass for a heading, a turn or the end
-/// of the pack.
+/// Stored text as quoted data, every line prefixed `> `, at most `max`
+/// bytes in all — the quoting included. Only the daemon's own lines
+/// start anywhere else, so no stored text can pass for a heading, a
+/// turn or the end of the pack.
 fn quote(text: &str, max: usize) -> String {
-    clip(text, max)
+    let quoted: String = text
+        .trim()
         .split(is_break)
         .map(|line| {
             let line: String = line
@@ -591,7 +592,10 @@ fn quote(text: &str, max: usize) -> String {
                 .collect();
             format!("> {line}\n")
         })
-        .collect()
+        .collect();
+    let mut out = clip(&quoted, max.saturating_sub(1));
+    out.push('\n');
+    out
 }
 
 fn payload_str<'a>(entry: &'a ThreadEntry, key: &str) -> Option<&'a str> {
@@ -760,8 +764,7 @@ pub fn build(reason: Reason, sources: &Sources) -> Result<Option<Pack>> {
     if let Some(prefs) = &sources.preferences {
         let quoted = quote(&scrub(prefs)?, PREFERENCES_MAX_BYTES);
         parts.push(Part::Preferences(format!(
-            "## Operator preferences (company/USER.md, quoted)\n\n{}\n",
-            clip(&quoted, PREFERENCES_SECTION_MAX)
+            "## Operator preferences (company/USER.md, quoted)\n\n{quoted}\n"
         )));
     }
 
@@ -1133,7 +1136,13 @@ mod tests {
             assert!(pack.text.len() <= PACK_MAX, "{}", pack.text.len());
             assert!(pack.text.contains("> ask 19: xxx"), "{}", pack.text);
             assert!(pack.text.contains("> answer 19: yyy"), "{}", pack.text);
+            // The budgets hold without dropping a section.
             assert!(pack.preferences && pack.plans > 0 && pack.turns_verbatim >= 1);
+            assert!(
+                pack.text.contains("## Earlier conversation"),
+                "{}",
+                pack.text
+            );
             // The newest turn is whole: header, ask, tool and result.
             let newest = pack.text.rsplit("### ").next().unwrap();
             assert!(newest.contains("· operator\n> ask 19: "), "{newest}");
@@ -1174,8 +1183,8 @@ mod tests {
         // A title long enough that its 160-byte clip lands mid-token.
         p.tickets[0].title = format!("{} {token}", "t".repeat(130));
         s.plans = vec![p];
-        // Preferences whose 4000-byte cap lands mid-token.
-        s.preferences = Some(format!("{} {token} tail", "p".repeat(3_960)));
+        // Preferences whose byte cap lands mid-token.
+        s.preferences = Some(format!("{} {token} tail", "p".repeat(4_460)));
         s.plan_error = Some(format!("tracker said {token}"));
         let pack = build(Reason::New, &s).unwrap().unwrap();
         let head = &token[..20];
@@ -1212,6 +1221,16 @@ mod tests {
         };
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[1], "newest".repeat(900));
+        // A newest turn over the room on its own still stays.
+        let mut parts = vec![
+            Part::Summary(big("s")),
+            Part::Turns(vec![big("a"), "newest".repeat(900)]),
+        ];
+        fit(&mut parts, 3_000);
+        let Part::Turns(blocks) = &parts[0] else {
+            panic!("the turns are what is left");
+        };
+        assert_eq!(blocks, &vec!["newest".repeat(900)]);
         // A body that fits is left alone.
         let mut parts = vec![Part::Summary("s".into()), Part::Turns(vec!["t".into()])];
         fit(&mut parts, 1_000);

@@ -1383,7 +1383,8 @@ puts a **continuity pack** ahead of the message on the first turn of:
 
 The daemon assembles it at delivery — the agent never shapes it — from
 `<pm>/company/USER.md` (operator preferences: a regular file only, never
-read through a link or from a FIFO or device, capped at 4 000 bytes),
+read through a link or from a FIFO or device, at most 4 500 bytes once
+quoted),
 the active plans read from the tracker (all of them for the master; for
 another agent only the plans with a ticket it owns, only those tickets,
 and a dependency on a ticket it is not shown is counted, never named),
@@ -1405,9 +1406,10 @@ between them; stored text cannot carry the nonce of the pack it is in,
 so only that last line ends the pack.
 
 The pack is deterministic (no clock or randomness; fixed order) and at
-most 24 000 bytes: each section has a byte budget (preferences 4 500,
+most 24 000 bytes: each section has a byte budget (preferences 4 500 quoted,
 plans 4 500, summary 3 500, turns 10 000, one turn at most 6 000) whose
-sum stays under the cap, so nothing is cut at assembly; should redaction
+sum, with 800 for the header and end line, stays under the cap, so
+nothing is cut at assembly; should redaction
 ever grow a section past it, whole sections are dropped — summary,
 plans, preferences, then the oldest turns — never the newest turn. It
 is secret-scanned before any cut and again per section; a scan that
