@@ -533,6 +533,17 @@ impl Shared {
             "system" if params.get("subtype").and_then(Value::as_str) == Some("init") => {
                 self.on_init(&params);
             }
+            // CAD-324: the CLI compacted the session's context — the
+            // daemon gives the next turn a continuity pack.
+            "system"
+                if params.get("subtype").and_then(Value::as_str) == Some("compact_boundary") =>
+            {
+                let meta = params.get("compact_metadata").unwrap_or(&Value::Null);
+                self.emit(
+                    "cadence/session_compacted",
+                    &json!({"trigger": meta.get("trigger"), "pre_tokens": meta.get("pre_tokens")}),
+                );
+            }
             "assistant" => self.on_assistant(&params),
             "user" => self.on_tool_results(&params),
             "control_response" => self.on_control_response(&params),

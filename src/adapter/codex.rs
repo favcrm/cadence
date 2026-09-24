@@ -643,6 +643,12 @@ impl Shared {
                         }),
                     );
                 }
+                if kind == "contextCompaction" {
+                    self.emit(
+                        "cadence/session_compacted",
+                        &json!({"trigger": "provider", "turn_id": params.get("turnId")}),
+                    );
+                }
                 if kind == "agentMessage" {
                     if let (Some(turn), Some(id)) = (
                         params.get("turnId").and_then(Value::as_str),
@@ -693,6 +699,12 @@ impl Shared {
                     }),
                 );
             }
+            // CAD-324: the app-server compacted the thread's context —
+            // the daemon gives the next turn a continuity pack.
+            "thread/compacted" => self.emit(
+                "cadence/session_compacted",
+                &json!({"trigger": "provider", "turn_id": params.get("turnId")}),
+            ),
             "turn/started" | "error" | "serverRequest/resolved" => self.emit(method, &params),
             _ => {}
         }
