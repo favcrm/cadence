@@ -16,12 +16,13 @@
 //! |------------|------------------|---------------------------------------------|
 //! | `operator` | `message`        | a message the operator queued to the agent  |
 //! | `system`   | `message`        | any other queued message (routed result, kickoff, agent peer) |
-//! | `agent`    | `assistant_text` | Codex `agentMessage` items as they persist  |
+//! | `agent`    | `assistant_text` | Codex commentary `agentMessage` items and managed Claude text blocks, as they persist |
 //! | `agent`    | `tool_call`      | managed Claude `tool_use` (name + redacted summary) |
+//! | `agent`    | `tool_result`    | managed Claude `tool_result` (redacted ≤160-char summary + `is_error`) |
 //! | `agent`    | `turn_result`    | the turn's final result, any provider       |
 //!
-//! `tool_result` is reserved; CAD-320 (Claude intermediate text) adds
-//! producers, not kinds or columns.
+//! The final answer is stored once, as the `turn_result`: neither
+//! adapter records it as `assistant_text` too (CAD-320).
 //!
 //! Everything stored is secret-redacted first ([`crate::secret::redact_text`])
 //! and bounded, so a thread can never be the reason an export refuses. A
@@ -125,6 +126,14 @@ impl ThreadEntry {
             "created": self.created,
         })
     }
+}
+
+/// Provider text held back until its message finishes: kept only if
+/// the turn result does not carry it (CAD-320).
+#[derive(Debug, Clone)]
+pub struct HeldText {
+    text: String,
+    payload: Value,
 }
 
 /// One entry to append. `text` and every string in `payload` are
@@ -259,6 +268,46 @@ pub fn tool_summary(name: &str, input: &Value) -> String {
     clean_text(&line, TOOL_SUMMARY_CAP)
 }
 
+/// A one-line, redacted summary of a tool's output — what a thread
+/// stores instead of the output itself (CAD-320). `output` is the
+/// provider's `tool_result.content`: a string, or blocks whose `text` is
+/// joined and whose other types are only named (`[image]`). At most
+/// [`TEXT_CAP`] bytes are scanned, cut back to whitespace so no partial
+/// secret escapes the scan; the scan runs before flattening, so
+/// multi-line rules (private keys) still match.
+pub fn tool_result_summary(output: &Value) -> String {
+    let text = match output {
+        Value::String(s) => s.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .map(|b| match b.get("type").and_then(Value::as_str) {
+                Some("text") => b
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                Some(other) => format!("[{other}]"),
+                None => String::new(),
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => String::new(),
+    };
+    let mut head = take_bytes(&text, TEXT_CAP);
+    if head.len() < text.len() {
+        let cut = head.rfind(char::is_whitespace).unwrap_or(0);
+        head.truncate(cut);
+    }
+    let redacted = clean_text(&head, TEXT_CAP);
+    let flat = redacted
+        .replace(|c: char| c.is_control(), " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    // One byte over the cap keeps `clean_text`'s truncation marker.
+    clean_text(&take_bytes(&flat, TOOL_SUMMARY_CAP + 1), TOOL_SUMMARY_CAP)
+}
+
 /// The thread entry for a message queued to a threaded agent.
 fn message_entry<'a>(sender: &Sender, source: &str, body: &'a str, id: &'a str) -> NewEntry<'a> {
     let (role, payload) = match sender {
@@ -373,14 +422,7 @@ impl Store {
         if Self::thread_in(&tx, alias)?.is_none() {
             return Ok(None);
         }
-        let running: Option<String> = tx
-            .query_row(
-                "SELECT id FROM messages WHERE alias=? AND state='running'
-                 ORDER BY seq DESC LIMIT 1",
-                [alias],
-                |r| r.get(0),
-            )
-            .optional()?;
+        let running = Self::running_message_in(&tx, alias)?;
         let seq = Self::thread_append_in(
             &tx,
             alias,
@@ -394,6 +436,64 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(seq)
+    }
+
+    /// Agent text that the turn result may repeat — Codex `final_answer`
+    /// and unphased `agentMessage` items (CAD-320). Held in memory
+    /// against the alias's running message; its finish appends each
+    /// held text the result does not contain as `assistant_text`, ahead
+    /// of the `turn_result` and in the same transaction. So an `unknown`
+    /// or failed turn, or a result built from other items, loses none of
+    /// it, and a result that carries it never shows it twice. With no
+    /// running message there is nothing to dedupe against: it is
+    /// appended now. A daemon restart drops what is held — the provider
+    /// transcript still has it.
+    pub fn thread_hold_running(&self, alias: &str, text: &str, payload: Value) -> Result<()> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        if Self::thread_in(&tx, alias)?.is_none() {
+            return Ok(());
+        }
+        let Some(running) = Self::running_message_in(&tx, alias)? else {
+            Self::thread_append_in(
+                &tx,
+                alias,
+                NewEntry {
+                    role: ROLE_AGENT,
+                    kind: KIND_ASSISTANT_TEXT,
+                    text,
+                    payload: Some(payload),
+                    message_id: None,
+                },
+            )?;
+            tx.commit()?;
+            return Ok(());
+        };
+        self.thread_held
+            .lock()
+            .unwrap()
+            .entry(running)
+            .or_default()
+            .push(HeldText {
+                text: text.to_string(),
+                payload,
+            });
+        Ok(())
+    }
+
+    /// The alias's in-flight turn. `submitting` counts: a provider can
+    /// persist items before `on_started` marks the message `running`
+    /// (Codex emits them right behind the `turn/start` reply).
+    fn running_message_in(tx: &Connection, alias: &str) -> Result<Option<String>> {
+        Ok(tx
+            .query_row(
+                "SELECT id FROM messages WHERE alias=?
+                 AND state IN ('submitting','running') AND source != 'nudge'
+                 ORDER BY seq DESC LIMIT 1",
+                [alias],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     /// Transactional append — used inside enqueue and finish so an entry
@@ -460,8 +560,11 @@ impl Store {
 
     /// The `turn_result` entry for a finished message. The payload is
     /// built from named fields only — the stored result carries the
-    /// turn token, which must never be copied here.
+    /// turn token, which must never be copied here. Text held for the
+    /// message ([`Self::thread_hold_running`]) that the result does not
+    /// carry lands first, as `assistant_text`.
     pub(super) fn thread_note_finished(
+        &self,
         tx: &Connection,
         message: &super::Message,
         status: &str,
@@ -469,6 +572,29 @@ impl Store {
         error: Option<&str>,
     ) -> Result<()> {
         let text = result.get("text").and_then(Value::as_str).unwrap_or("");
+        let held = self
+            .thread_held
+            .lock()
+            .unwrap()
+            .remove(&message.id)
+            .unwrap_or_default();
+        for item in held {
+            let body = item.text.trim();
+            if body.is_empty() || text.contains(body) {
+                continue;
+            }
+            Self::thread_append_in(
+                tx,
+                &message.alias,
+                NewEntry {
+                    role: ROLE_AGENT,
+                    kind: KIND_ASSISTANT_TEXT,
+                    text: &item.text,
+                    payload: Some(item.payload),
+                    message_id: Some(&message.id),
+                },
+            )?;
+        }
         let mut payload = json!({"status": status});
         if let Some(error) = error.filter(|e| !e.is_empty()) {
             payload["error"] = json!(error);
@@ -1003,6 +1129,27 @@ mod tests {
             assert!(!cell.contains(&token), "{cell}");
             assert!(cell.contains("[redacted:"), "{cell}");
         }
+    }
+
+    #[test]
+    fn tool_output_is_a_redacted_one_line_summary() {
+        let token = github_token("thread-tool-output");
+        let summary = tool_result_summary(&json!(format!("TOKEN={token}\nok\u{1b}[0m done")));
+        assert!(summary.starts_with("TOKEN=[redacted:"), "{summary}");
+        assert!(!summary.contains(&token), "{summary}");
+        assert!(summary.ends_with("ok [0m done"), "one line: {summary}");
+
+        // Blocks: text joined, other types only named.
+        let blocks = json!([{"type": "text", "text": "a"}, {"type": "image", "source": {}}]);
+        assert_eq!(tool_result_summary(&blocks), "a [image]");
+        assert_eq!(tool_result_summary(&Value::Null), "");
+
+        // Long output: bounded with the marker; the tail never survives.
+        let long = format!("{}TAIL", "y ".repeat(400));
+        let summary = tool_result_summary(&json!(long));
+        assert!(summary.len() <= TOOL_SUMMARY_CAP, "{}", summary.len());
+        assert!(summary.ends_with("…[truncated]"), "{summary}");
+        assert!(!summary.contains("TAIL"), "{summary}");
     }
 
     #[test]

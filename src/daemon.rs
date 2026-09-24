@@ -682,6 +682,12 @@ impl Shared {
             self.wake();
             return;
         }
+        // Assistant prose belongs to the thread (above), never the
+        // event log — `events` stays a lifecycle envelope (CAD-320).
+        if method == "cadence/assistant_text" {
+            self.wake();
+            return;
+        }
         // `cadence/<kind>` is the adapter's own bookkeeping channel —
         // recorded verbatim, not provider traffic.
         if let Some(kind) = method.strip_prefix("cadence/") {
@@ -760,10 +766,16 @@ impl Shared {
     }
 
     /// Payload events into a threaded agent's chat (CAD-319): Codex
-    /// `agentMessage` items as they persist, managed Claude tool uses
-    /// (name + redacted summary). The turn result lands with the
-    /// message's finish, in the store. A lost append is logged, never
-    /// fatal to the turn — the provider transcript still has it.
+    /// `agentMessage` items as they persist, managed Claude text blocks,
+    /// tool uses (name + redacted summary) and tool results (redacted
+    /// summary + `is_error`, CAD-320). The turn result lands with the
+    /// message's finish, in the store — so the final answer is never
+    /// recorded twice: Codex `final_answer` items (and unphased ones,
+    /// which Codex joins into the result) are held until the finish,
+    /// which keeps only those the result does not carry, and the Claude
+    /// adapter drops the text block its `result` repeats. A lost append
+    /// is logged, never fatal to the turn — the provider transcript
+    /// still has it.
     fn thread_on_provider_event(&self, alias: &str, method: &str, params: &Value) {
         let (kind, text, payload) = match method {
             "item/completed" => {
@@ -772,11 +784,17 @@ impl Shared {
                     return;
                 }
                 let text = item.get("text").and_then(Value::as_str).unwrap_or("");
-                (
-                    store::KIND_ASSISTANT_TEXT,
-                    text.to_string(),
-                    json!({"provider_item": item.get("id"), "phase": item.get("phase")}),
-                )
+                let payload = json!({"provider_item": item.get("id"), "phase": item.get("phase")});
+                let phase = item.get("phase").and_then(Value::as_str);
+                if matches!(phase, None | Some("final_answer")) {
+                    // Codex builds the turn result from these; the
+                    // finish keeps whichever the result does not carry.
+                    if let Err(e) = self.store.thread_hold_running(alias, text, payload) {
+                        eprintln!("thread hold for '{alias}' failed: {e}");
+                    }
+                    return;
+                }
+                (store::KIND_ASSISTANT_TEXT, text.to_string(), payload)
             }
             "cadence/tool_use" => {
                 let tool = params.get("tool").and_then(Value::as_str).unwrap_or("tool");
@@ -793,6 +811,20 @@ impl Shared {
                     json!({"tool": tool, "tool_use_id": params.get("tool_use_id")}),
                 )
             }
+            "cadence/assistant_text" => (
+                store::KIND_ASSISTANT_TEXT,
+                params["text"].as_str().unwrap_or("").to_string(),
+                // Never the final answer — that is the turn result.
+                json!({"phase": "commentary"}),
+            ),
+            "cadence/tool_result" => (
+                store::KIND_TOOL_RESULT,
+                params["summary"].as_str().unwrap_or("").to_string(),
+                json!({
+                    "is_error": params["is_error"].as_bool().unwrap_or(false),
+                    "tool_use_id": params.get("tool_use_id"),
+                }),
+            ),
             _ => return,
         };
         if let Err(e) =
