@@ -4,6 +4,7 @@ const KIND_LABEL: Record<string, string> = {
   approval: "approval",
   approval_menu: "approval menu",
   fenced: "fenced",
+  auto_resume_failed: "auto-resume failed",
   stalled: "stalled",
   drift: "drift",
   pr_no_verdict: "no verdict",
