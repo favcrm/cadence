@@ -811,6 +811,20 @@ pub fn open_questions(issue_dir: &Path, id: &str) -> Vec<Value> {
         .collect()
 }
 
+/// Is a `blocked` [`list`] row still the issue's open state? It clears
+/// when the issue itself reaches done/dropped or a `done` report newer
+/// than it lands — the lane moved. The checkup (CAD-477) escalates
+/// only an open block; Needs-you rows only an open one.
+pub fn blocked_open(reports: &[Value], blocked: &Value, issue_status: &str) -> bool {
+    if blocked["kind"].as_str() != Some("blocked") || matches!(issue_status, "done" | "dropped") {
+        return false;
+    }
+    let at = blocked["at"].as_str().unwrap_or_default();
+    !reports
+        .iter()
+        .any(|r| r["kind"].as_str() == Some("done") && r["at"].as_str().unwrap_or_default() >= at)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
