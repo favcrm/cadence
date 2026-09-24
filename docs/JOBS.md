@@ -176,7 +176,7 @@ work axis (tasks):
 | dispatched → running | **daemon** | kickoff message observed `running` |
 | running → review | **daemon** | kickoff `completed`; `head_sha` = `result.sha` else last `SHA:` line else NULL |
 | review → verified/revising/blocked | reviewer or operator | `job verdict --sha` — one tx |
-| blocked/verified/failed → draft | operator | `job task reopen` — re-scope, `revision` resets to 0 |
+| blocked/verified/failed → draft | the job's PM or operator (by the connection, CAD-373) | `job task reopen` — re-scope, `revision` resets to 0. The caller's derived alias must be the job's `pm` and not the assignee; peers and other PMs are refused |
 | → failed | PM/operator | `job task fail --reason` |
 | → cancelled | PM/operator | `job task cancel` / `job cancel` |
 
@@ -201,17 +201,20 @@ task state.
    the optional `--revision` equals the current one. Verdicts are
    append-only, keyed `(task_id, revision)` — a stale revision can never
    overwrite a judged attempt.
-3. **Reviewer independence (A4).** Inside a cadence pane the reviewer IS
-   `CADENCE_ALIAS` — `--reviewer` is rejected there and `operator` cannot
-   be claimed there. Outside a pane `--reviewer <alias|operator>` is
-   required. `reviewer == assignee` is always rejected. The verdict event
-   records the claimed reviewer and whether a pane alias was present —
-   identity is self-asserted on a same-host socket.
+3. **Reviewer independence (A4, CAD-372).** The reviewer is the verified
+   caller, derived from the connection: the agent whose pane or enrolled
+   managed endpoint the calling process descends from, or `operator` from
+   an operator shell outside every pane (positive operator proof). A
+   `reviewer` or `pane` request field is refused, never read;
+   `--reviewer` is only a client-side check of who the caller is and is
+   never sent. The task's assignee, and the agent whose kickoff reported
+   the judged revision, can never judge it. The verdict event records
+   the derived reviewer and, for an agent, its alias as `pane`.
 
 Max-revision enforcement: `revise` while `revision >=
 jobs.max_revisions` records the verdict but transitions to `blocked` —
 the PM is notified once per verdict, and the loop cannot continue
-without an operator `reopen`.
+without a `reopen` by the job's PM or the operator.
 
 4. **Worktree verification (CAD-51).** When the task carries
    `worktree` + `branch` (every task `cadence issue start --job`
@@ -374,6 +377,8 @@ notification is self-describing.
 ### Turn tokens per endpoint (CAD-162)
 
 `--token` is the running message's `turn_id` (`cadence self` prints it).
+The daemon shows it only to the owning agent's own pane or endpoint
+(CAD-375); every other reader sees `null`.
 A report is accepted only when the token equals the recorded `turn_id`
 AND is current for the agent's live endpoint generation under that
 endpoint's own scheme — one predicate,

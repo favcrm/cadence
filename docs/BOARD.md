@@ -1162,7 +1162,7 @@ payload at read time — nothing is stored; `cadence overview [--json]
 | 10 | `merge` — open PR with `qa-verdict=success` and green checks | team | the issue owner (`cadence/<id>-…` head branch) | `gh pr merge <n> --repo <slug> --squash --admin --match-head-commit <sha>` |
 | 20 | `approval` — a brokered permission request is open | operator | — | `cadence agent respond <a> --request <h> --decision accept` (provider input requests: `--answers-file <f>`) |
 | 20 | `approval_menu` — a sampled pty approval menu | team | the agent's PM (`params.upstream`) | `cadence agent answer <a> <choice>` |
-| 30 | `fenced` — agent in `attention` | team | the agent's PM | `cadence agent unfence <a>` |
+| 30 | `fenced` — agent in `attention` | operator | — (only the operator may unfence or reconcile, CAD-374; the PM escalates) | `cadence agent unfence <a>` |
 | 40 | `stalled` — turn silent past the fence threshold | team | the agent's PM | `cadence agent show <a>` |
 | 40 | `silent_end` — turn ended at an idle pane, never reported | team | the agent's PM | `cadence send <a> --nudge --text "finish and report …"` (a nudge owns no turn, so it pastes past the unreported one; `cadence agent attach <a>` is the manual alternative — CAD-250) |
 | 40 | `awaiting_report` — a delivered pty turn still owes its report while other turns queue behind it (CAD-250) | team | the agent's PM | `cadence agent show <a>` |

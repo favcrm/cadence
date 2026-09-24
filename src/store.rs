@@ -4517,6 +4517,22 @@ impl Store {
         Ok(rows.into_iter().filter(Message::holds_turn).collect())
     }
 
+    /// CAD-375: every running message's turn token and its agent —
+    /// `(alias, turn_id)`. The daemon withholds each from every
+    /// connection but the owner's, current or not. Driven from `agents`
+    /// so each probe is an index seek on `msg_queue(alias,state,…)`,
+    /// never a scan of the history.
+    pub fn running_turn_tokens(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT a.alias, m.turn_id
+             FROM agents a JOIN messages m ON m.alias = a.alias AND m.state = 'running'
+             WHERE m.turn_id IS NOT NULL AND m.turn_id != ''",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// Queued deliveries that are turns of their own — what an
     /// unreported turn holds back (routed notifications still pass).
     pub fn queued_turns(&self, alias: &str) -> Result<i64> {
@@ -6008,10 +6024,10 @@ impl Store {
     /// rejected. `revise` past `max_revisions` records the verdict and
     /// escalates to `blocked` instead of looping.
     ///
-    /// `reviewer` is resolved by the RPC layer (pane alias inside a
-    /// cadence pane, `--reviewer` outside it); `pane` records whether a
-    /// pane alias was present. Reviewer independence is enforced here:
-    /// reviewer == assignee is rejected.
+    /// `reviewer` is the verified caller the RPC layer derived from the
+    /// connection (an agent alias, or `operator` — CAD-372); `pane` is
+    /// the agent's alias when the caller is one. Reviewer independence
+    /// is enforced again here: reviewer == assignee is rejected.
     ///
     /// `verify` is the CLI's worktree-verification result as JSON text
     /// (`{checked, skipped}`) — stored verbatim with the verdict and
