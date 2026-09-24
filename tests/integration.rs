@@ -45209,6 +45209,49 @@ fn cad446_board_syncs_delivery_without_a_terminal() {
         thread::sleep(Duration::from_millis(200));
     }
     assert_eq!(cad446_board_needs(port, "merge_decision").len(), 1);
+
+    // A record forged into the loop's file naming a PR outside the
+    // project's repos: the board refuses it before gh reads it.
+    let file = lf.f.d.state.join("delivery.json");
+    let forge = || {
+        let mut all: Value =
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        if all.get("D-3").is_some() {
+            return;
+        }
+        let mut rec = all["D-2"].clone();
+        rec["issue"] = json!("D-3");
+        rec["pr"] = json!("https://github.com/evil/repo/pull/1");
+        rec["observed"] = Value::Null;
+        all["D-3"] = rec;
+        let tmp = file.with_extension("forged");
+        std::fs::write(&tmp, serde_json::to_vec_pretty(&all).unwrap()).unwrap();
+        std::fs::rename(&tmp, &file).unwrap();
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        // The board's own observations rewrite the file; forge again
+        // until a pass has read the forged record.
+        forge();
+        let rows = cad446_board_needs(port, "delivery_sync");
+        if rows.iter().any(|r| {
+            r["title"].as_str().is_some_and(|t| {
+                t.contains("D-3 names evil/repo#1, which is not a repo of project demo")
+            })
+        }) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the forged PR was not refused: {rows:#?}"
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        !lf.gh_log().contains("evil/repo"),
+        "gh read a PR outside the project: {}",
+        lf.gh_log()
+    );
 }
 
 // ---- CAD-384: one caller rule for every agent-mutating RPC ----
