@@ -2117,9 +2117,10 @@ the daemon writes it. Report files never move a ticket through the loop.
    Only the transition settles it: the `merged` record is the guard, so
    a second sync (which skips a finished loop), a replayed or concurrent
    observation, or a ticket the operator reopened after its merge
-   writes nothing. Tickets that waited on this one are woken by the
-   master-wake pass that watches tracker status (CAD-445), not by a
-   second path here.
+   writes nothing. Tickets that waited on this one are named ready by
+   the loop-end wake that follows the done write (CAD-445), exactly
+   once: that wake records them, so the router's blocker-done pass does
+   not wake them again.
 
 Pinning: `gh pr merge --match-head-commit <sha>` sends the SHA as
 GraphQL `expectedHeadOid` on every path — `mergePullRequest` for a
@@ -2191,14 +2192,19 @@ master when
 
 - the operator approves a plan (`plan_approve`),
 - a ticket's loop ends — `merged` or `closed` (seen by
-  `delivery_observe`) or `declined` (`delivery_decline`); a merged ticket
-  that ready tickets still wait on is named with what unblocks them
-  (the operator marks it done),
+  `delivery_observe`) or `declined` (`delivery_decline`). A reviewed
+  merge has already marked the ticket done (CAD-449, Worker loop step
+  5), so the wake names the tickets that waited on it as ready; when the
+  merge did not mark it (refused or pending), a merged ticket that ready
+  tickets still wait on is named with what unblocks them (the operator
+  marks it done). The dependents a merge wake names ready are
+  remembered, and `wake_lock` is held from before the done write until
+  then, so the blocker-done pass below never wakes them a second time,
 - a `ready` ticket of an approved plan has every `blocked_by` done or
-  dropped. Tracker status is written by the CLI, not the daemon, so the
-  report router's pass finds it (within one router period, 30 s by
-  default). A ticket the plan's approval wake already named ready is not
-  woken again for the same blockers.
+  dropped. A status the CLI writes (the operator's `issue set`) is found
+  by the report router's pass (within one router period, 30 s by
+  default). A ticket the plan's approval wake or a merge wake already
+  named ready is not woken again for the same blockers.
 
 Each wake lists the project's tickets ready to dispatch now and those
 still waiting on a blocker. It is a hint: the master dispatches with
