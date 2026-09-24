@@ -27,10 +27,55 @@
 //! in [`CLAUDE_ALLOWED_TOOLS`]; forge and platform credentials are
 //! dropped from its env ([`DENIED_ENV`], an empty `GH_CONFIG_DIR`). All
 //! of it is keyed on the alias, not on stored params. The daemon's own
-//! allowlist (`daemon::MASTER_ALLOWED`) is the second line. This is a
-//! process guard, not a security boundary: a same-uid process can still
-//! read credential files and edit the tracker by hand (see
-//! docs/design/AGENT-FILESYSTEM.md).
+//! allowlist (`daemon::MASTER_ALLOWED`) is the second line.
+//!
+//! **Read confinement (CAD-439).** The allowlist does not bound what the
+//! master reads: Claude Code auto-allows the Bash commands it deems
+//! read-only (`id`, `ps`, `echo <glob>`, `cat` inside its working dirs)
+//! in every permission mode, `dontAsk` included, and an allowlisted
+//! `cadence report file`/`master escalate --file <path>` reads any path.
+//! So the daemon launches the provider under `cadence confine`
+//! ([`crate::confine`], Linux Landlock) with [`confinement`]: the
+//! system trees, the Claude CLI's own state, the programs it runs, the
+//! tracker, and the master's own dirs — nothing else of `$HOME`, the
+//! state dir or `/proc`. Every descendant inherits it, detached or not.
+//! Chosen after, in order: (a) no Claude Code flag, setting or mode
+//! turns read-only auto-allow off — the docs say the set "is not
+//! configurable", and `--restricted` confines only the file tools;
+//! (b) a `--disallowedTools` list cannot be complete for the same
+//! reason (the set is undocumented and version-dependent, and deny rules
+//! miss `/usr/bin/cat`-style forms); (c) bubblewrap, including Claude
+//! Code's own Bash sandbox, needs unprivileged user namespaces, which
+//! Ubuntu 24.04+ refuses by default — Landlock needs none.
+//!
+//! The confined CLI has its own config dir ([`claude_config_dir`], its
+//! `CLAUDE_CONFIG_DIR`): nothing of the operator's `~/.claude` or
+//! `~/.claude.json` is in the policy — a confined CLI could otherwise
+//! only rewrite that shared file in place, unlocked, and a writable
+//! `~/.claude/settings.json` would plant hooks in every operator
+//! session. By default (operator decision, 2026-09-24) the master has
+//! its own, separate login: `master start` copies nothing, reports
+//! `login: none` and prints [`login_command`]
+//! (`CLAUDE_CONFIG_DIR=<state>/master/claude claude auth login`), and
+//! Needs-you shows that command while the dir holds no login. `master
+//! start --copy-login` is the opt-in copy ([`copy_login`]), with its
+//! token-rotation risk. Residue: the master's tree can read its own
+//! login.
+//!
+//! Where Landlock is unavailable (macOS, older kernels) `master start`
+//! refuses; `master start --unconfined` (operator decision) starts it
+//! unwrapped with its own warning, a `master_started_unconfined` event
+//! and a Needs-you info row while it runs. A macOS `sandbox-exec`
+//! profile is a separate ticket.
+//!
+//! The tracker is in the write set (`cadence report file` commits into
+//! it), so its `.git/hooks` and `.git/config` are too: Landlock grants
+//! whole subtrees and cannot carve those out. Defence in depth only — no
+//! allowlisted verb writes a caller-chosen path there.
+//!
+//! Beyond the master's own tree this is a process guard, not a security
+//! boundary: another same-uid process can still read credential files
+//! and edit the tracker by hand (see docs/design/AGENT-FILESYSTEM.md).
 
 use std::path::{Path, PathBuf};
 
@@ -98,8 +143,7 @@ pub const CLAUDE_DISALLOWED_TOOLS: &[&str] = &[
 
 /// Forge and platform credentials removed from the master's env. The
 /// scrub is by name; a credential stored in a file (gh's `hosts.yml`,
-/// ssh keys) is what the empty `GH_CONFIG_DIR` and the tool denials
-/// cover, and what stays a documented gap.
+/// ssh keys) is outside the master's [`confinement`] (CAD-439).
 pub const DENIED_ENV: &[&str] = &[
     "GH_TOKEN",
     "GITHUB_TOKEN",
@@ -126,16 +170,34 @@ pub fn is_master(alias: &str) -> bool {
 /// `gh` finds no stored login (an empty config dir under the state dir),
 /// git never prompts for credentials, and the tracker is named
 /// explicitly — the master's cwd is not the tracker.
-pub fn env_overrides(state_dir: &Path, pm_dir: Option<&Path>) -> Vec<(String, String)> {
+///
+/// Confined (CAD-439), the CLI also gets its own config dir
+/// ([`claude_config_dir`]); an unconfined master (`master start
+/// --unconfined`, a host without Landlock) keeps the operator's.
+pub fn env_overrides(
+    state_dir: &Path,
+    pm_dir: Option<&Path>,
+    confined: bool,
+) -> Vec<(String, String)> {
     let gh = state_dir.join("master").join("no-forge");
     let _ = std::fs::create_dir_all(&gh);
+    let tmp = tmpdir(state_dir);
+    let _ = std::fs::create_dir_all(&tmp);
     let mut env = vec![
         (
             "GH_CONFIG_DIR".to_string(),
             gh.to_string_lossy().to_string(),
         ),
         ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
+        // CAD-439: `/tmp` is outside its confinement.
+        ("TMPDIR".to_string(), tmp.to_string_lossy().to_string()),
     ];
+    if confined {
+        env.push((
+            "CLAUDE_CONFIG_DIR".to_string(),
+            claude_config_dir(state_dir).to_string_lossy().to_string(),
+        ));
+    }
     if let Some(pm) = pm_dir {
         env.push((
             "CADENCE_PM_DIR".to_string(),
@@ -143,6 +205,354 @@ pub fn env_overrides(state_dir: &Path, pm_dir: Option<&Path>) -> Vec<(String, St
         ));
     }
     env
+}
+
+/// System trees the master's process tree may read and execute:
+/// binaries, shared libraries, `/etc` (TLS roots, resolver, passwd) and
+/// `/sys`. `/proc` is not listed whole — other processes' command lines
+/// stay unreadable; only the provider's own `/proc/self` (resolved at
+/// launch, so it is the provider's pid) and a few host-wide files.
+pub const CONFINE_SYSTEM_READ: &[&str] = &[
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/libx32",
+    "/etc",
+    "/sys",
+    "/proc/self",
+    "/proc/version",
+    "/proc/filesystems",
+    "/proc/meminfo",
+    "/proc/cpuinfo",
+    "/proc/stat",
+    "/proc/loadavg",
+    "/proc/uptime",
+    "/proc/sys/vm/overcommit_memory",
+    "/proc/sys/vm/mmap_min_addr",
+    "/proc/sys/kernel/pid_max",
+];
+
+/// Device files the master's process tree may use — not `/dev` whole
+/// (`/dev/shm` holds other processes' shared memory), and no pty: the
+/// managed master talks over pipes.
+pub const CONFINE_SYSTEM_WRITE: &[&str] = &[
+    "/dev/null",
+    "/dev/zero",
+    "/dev/full",
+    "/dev/random",
+    "/dev/urandom",
+    "/dev/tty",
+];
+
+/// The native Claude CLI's install tree under `$HOME`.
+pub const CONFINE_HOME_READ: &[&str] = &[".local/share/claude"];
+
+/// Daemon env naming extra paths (`:`-separated) the master may read,
+/// or also write — for a provider installed somewhere the defaults do
+/// not cover. Set by whoever starts the daemon, never by an agent.
+pub const CONFINE_EXTRA_READ_ENV: &str = "CADENCE_MASTER_CONFINE_READ";
+pub const CONFINE_EXTRA_WRITE_ENV: &str = "CADENCE_MASTER_CONFINE_WRITE";
+
+/// What the master's confinement is computed from.
+pub struct ConfineInputs {
+    pub state_dir: PathBuf,
+    pub home: Option<PathBuf>,
+    pub pm_dir: Option<PathBuf>,
+    /// Programs the master's process tree runs — the provider CLI (and
+    /// its `#!` interpreter), `cadence`. Each one's real directory is
+    /// readable.
+    pub programs: Vec<PathBuf>,
+    pub extra_read: Vec<PathBuf>,
+    pub extra_write: Vec<PathBuf>,
+}
+
+/// CAD-439: the filesystem the master's process tree — the Claude CLI
+/// and every command it runs — may touch. Claude Code auto-allows the
+/// read-only Bash commands it recognises (`id`, `ps`, `echo <glob>`,
+/// `cat` inside its working dirs …) in every permission mode, `dontAsk`
+/// included, and the set is not configurable; an allowlisted
+/// `cadence report file --file <path>` reads any path it is given. So
+/// the boundary is the OS: [`crate::confine`] (Landlock) exposes only
+/// the system trees, the master's own dirs under the state dir (cwd,
+/// tmp, briefing), the tracker (`cadence issue`/`report` read and commit
+/// it directly), the Claude CLI's own state, and the programs it runs.
+/// `$HOME` — ssh keys, forge logins, other repos — and the daemon's
+/// store stay unreadable. The daemon socket is reached by connect,
+/// which the sandbox does not restrict.
+pub fn confinement(inputs: &ConfineInputs) -> crate::confine::Policy {
+    let mut read: Vec<PathBuf> = CONFINE_SYSTEM_READ.iter().map(PathBuf::from).collect();
+    let mut write: Vec<PathBuf> = CONFINE_SYSTEM_WRITE.iter().map(PathBuf::from).collect();
+    if let Some(home) = &inputs.home {
+        read.extend(CONFINE_HOME_READ.iter().map(|p| home.join(p)));
+    }
+    for program in &inputs.programs {
+        for dir in program_dirs(program) {
+            if !read.contains(&dir) {
+                read.push(dir);
+            }
+        }
+    }
+    read.push(crate::client::briefing_path(
+        &inputs.state_dir,
+        &Value::Null,
+        ALIAS,
+    ));
+    write.push(workdir(&inputs.state_dir));
+    write.push(tmpdir(&inputs.state_dir));
+    write.push(claude_config_dir(&inputs.state_dir));
+    if let Some(pm) = &inputs.pm_dir {
+        write.push(pm.clone());
+    }
+    read.extend(inputs.extra_read.iter().cloned());
+    write.extend(inputs.extra_write.iter().cloned());
+    crate::confine::Policy { read, write }
+}
+
+/// The directory holding `program`'s real file (symlinks resolved), so
+/// the whole install — a native build's versions dir, an npm package —
+/// is readable; for a `cadence` release (`<releases>/<sha>/cadence`,
+/// `<releases>/v<version>/cadence`) the whole releases root, so a
+/// `cadence upgrade` repointing the link mid-run leaves the master's
+/// verbs runnable (it holds only release binaries). Nothing when the
+/// program does not exist.
+fn program_dirs(program: &Path) -> Vec<PathBuf> {
+    let Ok(real) = program.canonicalize() else {
+        return vec![];
+    };
+    if let Some(root) = crate::upgrade::releases_dir_of(&real) {
+        return vec![root];
+    }
+    real.parent().map(Path::to_path_buf).into_iter().collect()
+}
+
+/// `name` resolved against `path` (a `PATH` value) the way `execvp`
+/// does; an absolute or relative path with a `/` is taken as is.
+pub fn which(name: &str, path: Option<&str>) -> Option<PathBuf> {
+    if name.contains('/') {
+        return Some(PathBuf::from(name));
+    }
+    use std::os::unix::fs::PermissionsExt;
+    path?.split(':').filter(|d| !d.is_empty()).find_map(|dir| {
+        let candidate = Path::new(dir).join(name);
+        let meta = std::fs::metadata(&candidate).ok()?;
+        (meta.is_file() && meta.permissions().mode() & 0o111 != 0).then_some(candidate)
+    })
+}
+
+/// `program` plus the interpreter its `#!` line names (`/usr/bin/env
+/// node` resolves `node` on `path`) — an npm-installed Claude CLI is a
+/// node script.
+pub fn with_interpreter(program: &Path, path: Option<&str>) -> Vec<PathBuf> {
+    let mut out = vec![program.to_path_buf()];
+    let mut head = [0u8; 256];
+    let n = std::fs::File::open(program)
+        .and_then(|mut f| std::io::Read::read(&mut f, &mut head))
+        .unwrap_or(0);
+    let head = String::from_utf8_lossy(&head[..n]);
+    if let Some(line) = head.strip_prefix("#!").and_then(|h| h.lines().next()) {
+        let mut words = line.split_whitespace();
+        if let Some(interp) = words.next() {
+            if interp.ends_with("/env") {
+                if let Some(found) = words
+                    .find(|w| !w.starts_with('-'))
+                    .and_then(|w| which(w, path))
+                {
+                    out.push(found);
+                }
+            } else {
+                out.push(PathBuf::from(interp));
+            }
+        }
+    }
+    out
+}
+
+/// Split a `:`-separated env value into paths.
+pub fn split_paths(value: Option<String>) -> Vec<PathBuf> {
+    value
+        .unwrap_or_default()
+        .split(':')
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
+/// `cadence confine <policy> -- <command>`: the master's provider
+/// command wrapped in its confinement. `confine_exe` is the cadence
+/// binary that applies it.
+pub fn confine_argv(
+    confine_exe: &str,
+    policy: &crate::confine::Policy,
+    command: &[String],
+) -> Vec<String> {
+    let mut argv = vec![confine_exe.to_string(), "confine".to_string()];
+    argv.extend(policy.to_args());
+    argv.push("--".to_string());
+    argv.extend(command.iter().cloned());
+    argv
+}
+
+/// The master's own Claude config dir (its `CLAUDE_CONFIG_DIR`, CAD-439
+/// review): the CLI's state — session transcripts for `--resume`, its
+/// `.claude.json`, shell snapshots, its login — lives here, never in the
+/// operator's shared `~/.claude` / `~/.claude.json`, which a confined
+/// CLI could only rewrite in place, unlocked. Nothing of the operator's
+/// config is in the master's confinement.
+pub fn claude_config_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join("master").join("claude")
+}
+
+/// Is the master launched unconfined — `master start --unconfined` on a
+/// host without Landlock (operator decision, CAD-439 review)? Only the
+/// operator-only `master_start` writes this param; `agent_set` cannot.
+pub fn unconfined(params: Option<&Value>) -> bool {
+    params
+        .and_then(|p| p.get("unconfined"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Debug-build test seam: this daemon's own `ProviderEnv` (never the
+/// process env) simulating a host without Landlock.
+pub const TEST_NO_LANDLOCK: &str = "CADENCE_TEST_NO_LANDLOCK";
+
+/// Ok when this daemon can confine the master.
+pub fn confinement_available(env: &crate::adapter::ProviderEnv) -> Result<()> {
+    #[cfg(debug_assertions)]
+    if env.own(TEST_NO_LANDLOCK).is_some() {
+        return Err(Error::provider(
+            "cadence confine: Landlock is unavailable (test seam)",
+        ));
+    }
+    let _ = env;
+    crate::confine::available()
+}
+
+/// The master's Claude login, as `master start` found or made it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Login {
+    /// The master's config dir has a login — its own `claude auth
+    /// login`, or an earlier `--copy-login` — left alone.
+    Own,
+    /// Copied from the operator's Claude config (`--copy-login`).
+    Copied,
+    /// None: the master's CLI cannot authenticate until the operator
+    /// runs [`login_command`].
+    None,
+}
+
+impl Login {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Own => "own",
+            Self::Copied => "copied",
+            Self::None => "none",
+        }
+    }
+}
+
+/// The command that gives the master its own Claude login (operator
+/// decision, 2026-09-24: a separate login is the default).
+pub fn login_command(state_dir: &Path) -> String {
+    format!(
+        "CLAUDE_CONFIG_DIR={} claude auth login",
+        claude_config_dir(state_dir).display()
+    )
+}
+
+/// Does the master's config dir hold a login?
+pub fn has_login(state_dir: &Path) -> bool {
+    claude_config_dir(state_dir)
+        .join(".credentials.json")
+        .is_file()
+}
+
+/// Create the master's config dir, or tighten an existing one, to 0700;
+/// report whether it holds a login. Copies nothing.
+pub fn ensure_config_dir(state_dir: &Path) -> Result<Login> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let dir = claude_config_dir(state_dir);
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)?;
+    // `mode` applies only to a dir this call creates.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    Ok(if has_login(state_dir) {
+        Login::Own
+    } else {
+        Login::None
+    })
+}
+
+/// `master start --copy-login` (the operator's explicit opt-in): give a
+/// master with no login a copy of the operator's — the `claudeAiOauth`
+/// entry of its `.credentials.json` only (never its MCP server tokens),
+/// mode 0600 in a 0700 dir, never via env or argv. An existing login is
+/// never overwritten.
+///
+/// Token rotation: both copies hold the same refresh token. Each side
+/// refreshes its access token into its own file; if the provider
+/// rotates refresh tokens, a refresh on one side can invalidate the
+/// other, and that side must sign in again. That is why the default is
+/// a separate login ([`login_command`]).
+pub fn copy_login(state_dir: &Path, operator_config: &Path) -> Result<Login> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+    if ensure_config_dir(state_dir)? == Login::Own {
+        return Ok(Login::Own);
+    }
+    let dir = claude_config_dir(state_dir);
+    let target = dir.join(".credentials.json");
+    let Ok(text) = std::fs::read_to_string(operator_config.join(".credentials.json")) else {
+        return Ok(Login::None);
+    };
+    let oauth = serde_json::from_str::<Value>(&text)
+        .ok()
+        .and_then(|v| v.get("claudeAiOauth").cloned())
+        .filter(Value::is_object);
+    let Some(oauth) = oauth else {
+        return Ok(Login::None);
+    };
+    let tmp = dir.join(".credentials.json.tmp");
+    let _ = std::fs::remove_file(&tmp);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    file.write_all(json!({"claudeAiOauth": oauth}).to_string().as_bytes())?;
+    file.sync_all()?;
+    std::fs::rename(&tmp, &target)?;
+    Ok(Login::Copied)
+}
+
+/// Does a master with these params run confined? Always where this host
+/// can confine it — the stored `unconfined` param counts only where it
+/// cannot (review round 2).
+pub fn is_confined(params: Option<&Value>, available: bool) -> bool {
+    available || !unconfined(params)
+}
+
+/// The operator's Claude config dir: `CLAUDE_CONFIG_DIR`, else
+/// `$HOME/.claude`.
+pub fn operator_claude_config(config_dir: Option<String>, home: Option<String>) -> Option<PathBuf> {
+    config_dir
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            home.filter(|h| !h.is_empty())
+                .map(|h| Path::new(&h).join(".claude"))
+        })
+}
+
+/// The master's private temp dir (its `TMPDIR`) — `/tmp` itself is not
+/// in its confinement.
+pub fn tmpdir(state_dir: &Path) -> PathBuf {
+    state_dir.join("master").join("tmp")
 }
 
 /// The master's working directory: an empty folder under the state dir
@@ -521,6 +931,193 @@ mod tests {
         let agent = text.find("agent text").unwrap();
         assert!(soul < agent, "{text}");
         assert!(text.contains("<!-- agents/master/AGENT.md -->"));
+    }
+
+    /// CAD-439: the master's confinement names the system trees, the
+    /// Claude CLI's own state and the master's own dirs — never `$HOME`,
+    /// the state dir, `/tmp`, `/proc` or `/dev` whole.
+    #[test]
+    fn confinement_exposes_only_the_masters_views() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let bin = tmp.path().join("tools").join("claude");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        let policy = confinement(&ConfineInputs {
+            state_dir: PathBuf::from("/s"),
+            home: Some(PathBuf::from("/h")),
+            pm_dir: Some(PathBuf::from("/pm")),
+            programs: vec![bin.clone(), PathBuf::from("/missing/cadence")],
+            extra_read: vec![PathBuf::from("/x")],
+            extra_write: vec![PathBuf::from("/y")],
+        });
+        let all: Vec<&PathBuf> = policy.read.iter().chain(&policy.write).collect();
+        for whole in [
+            "/", "/h", "/s", "/tmp", "/proc", "/dev", "/home", "/var", "/run",
+        ] {
+            assert!(
+                !all.iter().any(|p| p.as_path() == Path::new(whole)),
+                "{whole} exposed whole: {policy:?}"
+            );
+        }
+        let under = |root: &str| -> Vec<String> {
+            let mut v: Vec<String> = all
+                .iter()
+                .filter(|p| p.starts_with(root))
+                .map(|p| p.to_string_lossy().to_string())
+                .collect();
+            v.sort();
+            v
+        };
+        // The operator's Claude config is not in it at all (review I1):
+        // only the CLI's install, read-only.
+        assert_eq!(under("/h"), ["/h/.local/share/claude"]);
+        assert!(policy
+            .read
+            .contains(&PathBuf::from("/h/.local/share/claude")));
+        assert_eq!(
+            under("/s"),
+            [
+                "/s/briefings/master/BRIEFING-master.md",
+                "/s/master/claude",
+                "/s/master/cwd",
+                "/s/master/tmp"
+            ]
+        );
+        assert!(!all
+            .iter()
+            .any(|p| p.starts_with("/dev/pts") || p.ends_with("ptmx")));
+        assert_eq!(under("/proc/self"), ["/proc/self"]);
+        assert!(policy.write.contains(&PathBuf::from("/pm")));
+        assert!(policy.read.contains(&PathBuf::from("/x")));
+        assert!(policy.write.contains(&PathBuf::from("/y")));
+        // A program's real directory; a missing one adds nothing.
+        let dir = bin.canonicalize().unwrap().parent().unwrap().to_path_buf();
+        assert!(policy.read.contains(&dir), "{policy:?}");
+        assert!(!all.iter().any(|p| p.starts_with("/missing")));
+        // The briefing and system trees are read-only.
+        assert!(!policy
+            .write
+            .iter()
+            .any(|p| p.starts_with("/usr") || p.starts_with("/etc")));
+    }
+
+    /// Review I2: a `cadence` release grants the whole releases root, so
+    /// an upgrade repointing the link mid-run keeps the verbs runnable.
+    #[test]
+    fn a_cadence_release_grants_its_releases_root() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rel = tmp.path().join("releases");
+        let sha = "a".repeat(40);
+        let bin = rel.join(&sha).join("cadence");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, "").unwrap();
+        let link = tmp.path().join("cadence");
+        std::os::unix::fs::symlink(&bin, &link).unwrap();
+        let policy = confinement(&ConfineInputs {
+            state_dir: PathBuf::from("/s"),
+            home: None,
+            pm_dir: None,
+            programs: vec![link],
+            extra_read: vec![],
+            extra_write: vec![],
+        });
+        let root = rel.canonicalize().unwrap();
+        assert!(policy.read.contains(&root), "{policy:?}");
+        assert!(!policy.read.iter().any(|p| p.starts_with(root.join(&sha))));
+    }
+
+    /// Operator decision: by default nothing is copied — the dir is made
+    /// 0700 (tightened when it already exists, review round 2) and the
+    /// login is reported missing, with the command that creates one.
+    #[test]
+    fn config_dir_is_0700_and_holds_no_copied_login_by_default() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = tmp.path().join("s");
+        let dir = claude_config_dir(&state);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(ensure_config_dir(&state).unwrap(), Login::None);
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        assert!(!has_login(&state));
+        assert_eq!(
+            login_command(&state),
+            format!("CLAUDE_CONFIG_DIR={} claude auth login", dir.display())
+        );
+        std::fs::write(dir.join(".credentials.json"), "{}").unwrap();
+        assert_eq!(ensure_config_dir(&state).unwrap(), Login::Own);
+    }
+
+    /// Review round 2: the stored `unconfined` param counts only where
+    /// the host cannot confine.
+    #[test]
+    fn unconfined_param_counts_only_without_landlock() {
+        let loose = json!({"unconfined": true});
+        assert!(is_confined(Some(&loose), true));
+        assert!(!is_confined(Some(&loose), false));
+        assert!(is_confined(Some(&json!({})), false));
+        assert!(is_confined(None, true));
+    }
+
+    /// `--copy-login`: the operator's `claudeAiOauth` only (never its
+    /// MCP tokens), 0600 in a 0700 dir, written once.
+    #[test]
+    fn provision_login_copies_only_the_claude_login_once() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (state, operator) = (tmp.path().join("s"), tmp.path().join("op"));
+        std::fs::create_dir_all(&operator).unwrap();
+        assert_eq!(copy_login(&state, &operator).unwrap(), Login::None);
+        // Secret-shaped values built at runtime.
+        let token = format!("tok-{}", uuid::Uuid::new_v4().simple());
+        let mcp = format!("mcp-{}", uuid::Uuid::new_v4().simple());
+        let creds = json!({
+            "claudeAiOauth": {"accessToken": token, "refreshToken": "r", "expiresAt": 1},
+            "mcpOAuth": {"github|x": {"accessToken": mcp}},
+        });
+        std::fs::write(operator.join(".credentials.json"), creds.to_string()).unwrap();
+        assert_eq!(copy_login(&state, &operator).unwrap(), Login::Copied);
+        let file = claude_config_dir(&state).join(".credentials.json");
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.contains(&token) && !text.contains(&mcp), "{text}");
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&file), 0o600);
+        assert_eq!(mode(&claude_config_dir(&state)), 0o700);
+        // An existing login — the master's own sign-in — is left alone.
+        std::fs::write(&file, "{\"claudeAiOauth\":{\"accessToken\":\"own\"}}").unwrap();
+        assert_eq!(copy_login(&state, &operator).unwrap(), Login::Own);
+        assert!(std::fs::read_to_string(&file).unwrap().contains("own"));
+        // A credentials file without a Claude login copies nothing.
+        let other = tmp.path().join("s2");
+        std::fs::write(operator.join(".credentials.json"), "{\"mcpOAuth\":{}}").unwrap();
+        assert_eq!(copy_login(&other, &operator).unwrap(), Login::None);
+        assert!(!claude_config_dir(&other).join(".credentials.json").exists());
+    }
+
+    #[test]
+    fn interpreter_of_a_script_is_a_program_too() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let node = tmp.path().join("node");
+        std::fs::write(&node, "").unwrap();
+        std::fs::set_permissions(&node, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let cli = tmp.path().join("cli.js");
+        std::fs::write(&cli, "#!/usr/bin/env node\nconsole.log(1)\n").unwrap();
+        let path = tmp.path().to_str().unwrap();
+        assert_eq!(with_interpreter(&cli, Some(path)), [cli.clone(), node]);
+        let sh = tmp.path().join("run.sh");
+        std::fs::write(&sh, "#!/bin/bash -e\n").unwrap();
+        assert_eq!(
+            with_interpreter(&sh, None),
+            [sh.clone(), PathBuf::from("/bin/bash")]
+        );
+        assert_eq!(which("node", Some(path)), Some(tmp.path().join("node")));
+        assert_eq!(which("nope", Some(path)), None);
+        assert_eq!(
+            split_paths(Some("/a::/b".into())),
+            [PathBuf::from("/a"), PathBuf::from("/b")]
+        );
     }
 
     #[test]

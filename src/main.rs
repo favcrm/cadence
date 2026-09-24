@@ -1149,6 +1149,19 @@ enum Commands {
         #[command(subcommand)]
         action: cadence_agent::sandbox::SandboxAction,
     },
+    /// Run a command under a filesystem sandbox (CAD-439): `--read`
+    /// paths are readable and executable, `--write` paths fully usable,
+    /// everything else denied. The daemon launches the master's
+    /// provider through it.
+    #[command(hide = true)]
+    Confine {
+        #[arg(long, value_name = "PATH")]
+        read: Vec<PathBuf>,
+        #[arg(long, value_name = "PATH")]
+        write: Vec<PathBuf>,
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
     /// Stdio MCP server backing `--permission-prompt-tool` on a
     /// brokered managed claude — spawned by the provider CLI via the
     /// generated `--mcp-config`, never by hand.
@@ -2323,6 +2336,20 @@ enum MasterAction {
         /// Reasoning effort [default: AGENT.md's for that provider].
         #[arg(long)]
         effort: Option<String>,
+        /// Only on a host that cannot confine the master (no Landlock:
+        /// macOS, older kernels): start it WITHOUT the filesystem
+        /// sandbox. It can then read and write your files; Needs-you
+        /// shows it while it runs.
+        #[arg(long)]
+        unconfined: bool,
+        /// Copy your Claude login (its claudeAiOauth entry only, 0600)
+        /// into the master's own config dir when it has none. Both then
+        /// share one refresh token: if the provider rotates refresh
+        /// tokens, a refresh on one side can sign the other out. The
+        /// default is a separate login — `master start` prints the
+        /// command.
+        #[arg(long)]
+        copy_login: bool,
     },
     /// Replace the master's SOUL.md or AGENT.md (operator only; one
     /// tracker commit). Takes effect at the next `master start`.
@@ -2365,6 +2392,12 @@ enum MasterAction {
         #[arg(long)]
         post: bool,
     },
+    /// Print the filesystem confinement `master start` launches the
+    /// master's provider under (CAD-439), computed from this env exactly
+    /// as the daemon does: `{confine, read, write}`. Reads nothing,
+    /// starts nothing — for `scripts/master-read-probe.sh`.
+    #[command(hide = true)]
+    Confinement,
 }
 
 #[derive(Subcommand)]
@@ -2436,11 +2469,26 @@ fn run_master(state_dir: &Path, action: MasterAction) -> Result<i32> {
             provider,
             model,
             effort,
-        } => client::rpc(
-            state_dir,
-            "master_start",
-            json!({"provider": provider, "model": model, "effort": effort}),
-        )?,
+            unconfined,
+            copy_login,
+        } => {
+            let out = client::rpc(
+                state_dir,
+                "master_start",
+                json!({"provider": provider, "model": model, "effort": effort,
+                       "unconfined": unconfined, "copy_login": copy_login}),
+            )?;
+            if let Some(w) = out["warning"].as_str() {
+                eprintln!("WARNING: {w}");
+            }
+            if let Some(cmd) = out["login_command"].as_str() {
+                eprintln!(
+                    "The master has no Claude login yet. Give it its own:\n  {cmd}\n\
+                     (or `cadence master start --copy-login` to copy yours)"
+                );
+            }
+            out
+        }
         MasterAction::Edit { name, file } => {
             let cap = (cadence_agent::master::AGENT_MAX_CHARS * 4) as u64;
             let text = read_body_capped(None, Some(file), cap)?;
@@ -2472,6 +2520,12 @@ fn run_master(state_dir: &Path, action: MasterAction) -> Result<i32> {
             "master_summary",
             json!({"since": since, "post": post}),
         )?,
+        MasterAction::Confinement => {
+            let env = cadence_agent::adapter::ProviderEnv::default();
+            let (confine, policy) =
+                cadence_agent::adapter::claude::master_confinement(&env, state_dir);
+            json!({"confine": confine, "read": policy.read, "write": policy.write})
+        }
     };
     print_json(&result);
     Ok(0)
@@ -6180,6 +6234,13 @@ fn run() -> Result<i32> {
             },
         ),
         Commands::McpPermission { timeout_secs } => cadence_agent::mcp::run(timeout_secs),
+        Commands::Confine {
+            read,
+            write,
+            command,
+        } => {
+            cadence_agent::confine::exec(&cadence_agent::confine::Policy { read, write }, &command)
+        }
     }
 }
 

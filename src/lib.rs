@@ -12,6 +12,7 @@ pub mod adapter;
 pub mod audit;
 pub mod backup;
 pub mod client;
+pub mod confine;
 pub mod daemon;
 pub mod delivery;
 pub mod doctor;
