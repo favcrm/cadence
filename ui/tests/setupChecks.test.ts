@@ -18,7 +18,7 @@ function check(check: string, status: SetupCheck["status"], group: SetupCheck["g
 }
 
 function report(checks: SetupCheck[]): SetupReport {
-  return { checks, checked_at: 0, detect_only: true };
+  return { checks, checked_at: 0, detect_only: true, ran_now: true, age_ms: 0, recheck_in_ms: 5000 };
 }
 
 const ready = [
@@ -36,16 +36,28 @@ const ready = [
 equal(missingRequired(report(ready)), [], "optional checks (skill, login, pi) never block");
 
 const fresh = ready.map((c) =>
-  ["daemon", "master", "claude"].includes(c.check) ? { ...c, status: "missing" as const } : c,
+  ["daemon", "master", "claude"].includes(c.check) ? { ...c, status: "missing" as const, fix: `fix ${c.check}` } : c,
 );
 equal(missingRequired(report(fresh)), ["daemon", "master", "master CLI"], "required and a master CLI");
 equal(missingRequired(report([])), ["state_dir", "tracker", "daemon", "master", "master CLI"], "no checks → all missing");
-const unknownDaemon = ready.map((c) => (c.check === "daemon" ? { ...c, status: "unknown" as const } : c));
+const unknownDaemon = ready.map((c) =>
+  c.check === "daemon" ? { ...c, status: "unknown" as const, fix: "cadence daemon start" } : c,
+);
 equal(missingRequired(report(unknownDaemon)), ["daemon"], "unknown is not ready");
 const piOnly = ready.map((c) =>
   c.check === "claude" ? { ...c, status: "missing" as const } : c.check === "pi" ? { ...c, status: "ok" as const } : c,
 );
 equal(missingRequired(report(piOnly)), ["master CLI"], "pi alone is no master in the MVP");
+
+// A build without `master start`: master is missing with no fix — nothing
+// to run, so it never holds the Home link open.
+const noVerb = ready.map((c) => (c.check === "master" ? { ...c, status: "missing" as const, fix: null } : c));
+equal(missingRequired(report(noVerb)), [], "master with no fix is not actionable");
+// The verb exists: master missing with `master start` stays required.
+const withVerb = ready.map((c) =>
+  c.check === "master" ? { ...c, status: "missing" as const, fix: "cadence master start" } : c,
+);
+equal(missingRequired(report(withVerb)), ["master"], "master with a fix is required");
 
 equal(statusChip(ready[6]).label, "signed in", "provider ok");
 equal(statusChip(ready[7]).label, "sign in", "provider installed, signed out");

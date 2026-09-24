@@ -211,7 +211,8 @@ impl Check {
     }
 
     fn run_as(&self, ctx: &Ctx, done: &[Outcome], mode: Mode) -> Outcome {
-        let fix = || Some((self.fix)(ctx));
+        // An empty fix is "no command exists in this build".
+        let fix = || Some((self.fix)(ctx)).filter(|f| !f.is_empty());
         // Detect only: an absent check is reported with its fix, exactly
         // as a check without an `apply` is.
         let apply = self.apply.as_ref().filter(|_| mode == Mode::Apply);
@@ -782,7 +783,15 @@ fn master_check() -> Check {
                 }
             }
         },
-        |ctx| ctx.cadence("master start"),
+        // Without the verb there is nothing to paste — also while the
+        // tracker it needs is still missing.
+        |ctx| {
+            if ctx.has_verb("master") {
+                ctx.cadence("master start")
+            } else {
+                String::new()
+            }
+        },
     )
     .needs(&["tracker"])
 }
@@ -1139,6 +1148,25 @@ mod tests {
         assert_eq!(out[1].status, Status::Missing);
         assert!(out[1].fix.as_deref().unwrap().ends_with("master start"));
         assert!(!with_verb.pm_dir.join("agents").exists());
+    }
+
+    /// A missing tracker blocks master; the fix still names only a verb
+    /// this binary has.
+    #[test]
+    fn master_behind_a_missing_tracker_names_no_absent_verb() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx(dir.path());
+        let tracker = Check::new("tracker", |_| Found::Absent("t".into()), |_| "init".into());
+        let checks = [tracker, master_check()];
+        let out = detect_checks(&ctx, &checks);
+        assert!(out[1].detail.contains("needs `tracker`"), "{:?}", out[1]);
+        assert_eq!(out[1].fix, None, "{:?}", out[1]);
+        let with_verb = Ctx {
+            verbs: vec!["master".into()],
+            ..ctx
+        };
+        let out = detect_checks(&with_verb, &checks);
+        assert!(out[1].fix.as_deref().unwrap().ends_with("master start"));
     }
 
     #[test]

@@ -473,7 +473,7 @@ export default function App() {
           </nav>
         )}
 
-        {screen === "home" && <SetupNudge />}
+        {screen === "home" && <SetupNudge readOnly={meta ? readOnly : null} />}
         {screen === "home" && (
           <OverviewView
             state={overviewState}
@@ -540,7 +540,9 @@ export default function App() {
             onRetry={() => void resources.agents.refresh()}
           />
         )}
-        {screen === "setup" && <Setup settingsHref={hrefFor({ screen: "settings", section: "models" })} />}
+        {screen === "setup" && (
+          <Setup settingsHref={hrefFor({ screen: "settings", section: "models" })} readOnly={meta ? readOnly : null} />
+        )}
         {route.screen === "settings" && (
           <SectionTabs
             label="settings"

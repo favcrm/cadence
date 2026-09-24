@@ -14,7 +14,7 @@ import {
   type SetupReport,
   type Tone,
 } from "./checks";
-import { recheckSetup, setupResource } from "./setupApi";
+import { recheckSetup, setupResource, SETUP_ON_HOST } from "./setupApi";
 
 /**
  * First-run setup (CAD-327, MVP). Shows `cadence setup`'s checks as the
@@ -216,15 +216,67 @@ function StepBody({
   }
 }
 
-export default function Setup({ settingsHref }: { settingsHref: string }) {
+/** Shown instead of the wizard to a read-only or tailnet viewer. */
+function OnHost() {
+  return (
+    <main className="px-4 lg:px-8 pt-6 pb-9 max-w-[62rem] w-full min-w-0">
+      <h1 className="text-section font-semibold text-ink-100">Setup</h1>
+      <div className="card mt-4 px-4 py-4 max-w-[68ch]" role="status">
+        <p className="text-body font-medium text-ink-100">Setup runs on the host.</p>
+        <p className="text-secondary text-ink-400 mt-1">
+          Its checks read the machine the board runs on, so they are only shown to the operator
+          there — open the board on <span className="num">127.0.0.1</span> on that machine, or run{" "}
+          <span className="num">cadence setup</span> in its terminal.
+        </p>
+      </div>
+    </main>
+  );
+}
+
+function secs(ms: number): string {
+  return `${Math.max(1, Math.ceil(ms / 1000))}s`;
+}
+
+export default function Setup({
+  settingsHref,
+  readOnly,
+}: {
+  settingsHref: string;
+  /** null until `/api/meta` answers — nothing is fetched before then. */
+  readOnly: boolean | null;
+}) {
+  if (readOnly === null) return null;
+  return readOnly ? <OnHost /> : <SetupWizard settingsHref={settingsHref} />;
+}
+
+function SetupWizard({ settingsHref }: { settingsHref: string }) {
   const state = useQuery(setupResource);
   const projectsState = useQuery(resources.projects);
   const [step, setStep] = useState<StepId>("environment");
+  const [checking, setChecking] = useState(false);
+  const [recheckError, setRecheckError] = useState<string | null>(null);
+  /** Set when a re-check was answered from the last run (under 5 s old). */
+  const [reused, setReused] = useState<{ age: number; wait: number } | null>(null);
   const report = state.data;
   const projects = (projectsState.data ?? []).map((p) => p.key);
   const index = STEPS.findIndex((s) => s.id === step);
   const missing = report ? missingRequired(report) : [];
   const checkedAt = report ? new Date(report.checked_at).toLocaleTimeString() : null;
+
+  const recheck = async () => {
+    setChecking(true);
+    setRecheckError(null);
+    try {
+      const r = await recheckSetup();
+      setReused(r.ran_now ? null : { age: r.age_ms, wait: r.recheck_in_ms });
+    } catch (e) {
+      setRecheckError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  if (state.error === SETUP_ON_HOST || recheckError === SETUP_ON_HOST) return <OnHost />;
 
   return (
     <main className="px-4 lg:px-8 pt-6 pb-9 max-w-[62rem] w-full min-w-0">
@@ -235,14 +287,24 @@ export default function Setup({ settingsHref }: { settingsHref: string }) {
           {checkedAt && <span className="text-label text-ink-500">checked {checkedAt}</span>}
           <button
             type="button"
-            onClick={() => void recheckSetup()}
-            disabled={state.inFlight}
+            onClick={() => void recheck()}
+            disabled={checking || state.inFlight}
             className="chip py-1 bg-ink-800 text-ink-300 hover:text-accent disabled:opacity-60 transition-colors"
           >
-            {state.inFlight ? "checking…" : "re-check"}
+            {checking || state.inFlight ? "checking…" : "re-check"}
           </button>
         </div>
       </div>
+      {reused && (
+        <p className="text-label text-ink-500 mt-1" role="status">
+          checked {secs(reused.age)} ago — re-check available in {secs(reused.wait)}
+        </p>
+      )}
+      {recheckError && (
+        <p className="text-label text-fail mt-1" role="alert">
+          re-check failed — {recheckError}
+        </p>
+      )}
       <p className="text-body text-ink-400 mt-2 max-w-[68ch]">
         These checks only look — nothing is installed, signed in or started for you. Each item
         that needs work shows the command to run; run it, then re-check.
@@ -300,7 +362,7 @@ export default function Setup({ settingsHref }: { settingsHref: string }) {
             state={state}
             loading="checking this machine… (agent CLIs can take a few seconds)"
             failed="could not run the setup checks"
-            onRetry={() => void recheckSetup()}
+            onRetry={() => void recheck()}
           />
           {step === "home" ? (
             <>

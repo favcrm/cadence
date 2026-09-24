@@ -42,7 +42,8 @@ impl Host {
         host.fake(
             "claude",
             &format!(
-                "case \"$1 $2\" in\n\
+                "echo \"$*\" >> \"$TMPDIR/probes.txt\"\n\
+                 case \"$1 $2\" in\n\
                  '--version ') echo '9.9.9 (Claude Code)' ;;\n\
                  'auth status') echo 'logged in as {SECRET}'; exit 0 ;;\n\
                  *) exit 2 ;;\nesac"
@@ -450,8 +451,15 @@ struct Board {
 
 impl Board {
     fn start(host: &Host, port: u16) -> Self {
+        Self::start_with(host, port, &[])
+    }
+
+    fn start_with(host: &Host, port: u16, extra: &[&str]) -> Self {
+        let port_s = port.to_string();
+        let mut args = vec!["ui", "run", "--port", &port_s];
+        args.extend_from_slice(extra);
         let child = host
-            .command(&["ui", "run", "--port", &port.to_string()])
+            .command(&args)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
@@ -600,4 +608,77 @@ fn board_setup_answers_in_bounded_time_when_a_cli_hangs() {
     let detail = checks["codex"]["detail"].as_str().unwrap();
     assert!(detail.contains("version unknown"), "{detail}");
     assert!(detail.contains("did not answer"), "{detail}");
+}
+
+/// How often the fake `claude` answered `--version` — one per run of
+/// the checks.
+fn claude_runs(host: &Host) -> usize {
+    std::fs::read_to_string(host.path("tmp/probes.txt"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| *l == "--version")
+        .count()
+}
+
+fn get_json(board: &Board, path: &str) -> Value {
+    let (code, body) = board.request("GET", path);
+    assert_eq!(code, 200, "{path}: {body}");
+    serde_json::from_str(&body).unwrap()
+}
+
+/// A read-only board refuses `/api/setup` before any probe runs.
+#[test]
+fn board_setup_is_refused_on_a_read_only_board() {
+    let lease = test_port();
+    let host = Host::new();
+    let board = Board::start_with(&host, lease.port, &["--read-only"]);
+    let (code, body) = board.request("GET", "/api/setup?fresh=1");
+    assert_eq!(code, 403, "{body}");
+    assert!(body.contains("read_only"), "{body}");
+    assert_eq!(claude_runs(&host), 0, "a refused request spawned a probe");
+}
+
+/// Concurrent requests share one run; a re-check within 5 s answers
+/// from it (and says when the next may run); `fresh=0` is not fresh.
+#[test]
+fn board_setup_shares_one_run_and_throttles_rechecks() {
+    let lease = test_port();
+    let host = Host::new();
+    let board = std::sync::Arc::new(Board::start(&host, lease.port));
+    let answers: Vec<Value> = (0..4)
+        .map(|_| {
+            let board = board.clone();
+            std::thread::spawn(move || get_json(&board, "/api/setup"))
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|t| t.join().unwrap())
+        .collect();
+    assert_eq!(
+        claude_runs(&host),
+        1,
+        "concurrent requests ran the checks twice"
+    );
+    let first = answers[0]["checked_at"].clone();
+    assert!(answers.iter().all(|a| a["checked_at"] == first));
+    assert_eq!(answers.iter().filter(|a| a["ran_now"] == true).count(), 1);
+
+    // A re-check straight away: the same run, and when the next may be.
+    let quick = get_json(&board, "/api/setup?fresh=1");
+    assert_eq!(quick["ran_now"], false, "{quick}");
+    assert_eq!(quick["checked_at"], first);
+    let wait = quick["recheck_in_ms"].as_u64().unwrap();
+    assert!(wait > 0 && wait <= 5000, "{quick}");
+    assert_eq!(claude_runs(&host), 1);
+
+    std::thread::sleep(std::time::Duration::from_millis(wait + 200));
+    // `fresh=0` is an ordinary read: the minute-long run still answers.
+    let zero = get_json(&board, "/api/setup?fresh=0");
+    assert_eq!(zero["ran_now"], false, "{zero}");
+    assert_eq!(zero["recheck_in_ms"], 0, "{zero}");
+    assert_eq!(claude_runs(&host), 1);
+    let again = get_json(&board, "/api/setup?fresh=true");
+    assert_eq!(again["ran_now"], true, "{again}");
+    assert_ne!(again["checked_at"], first);
+    assert_eq!(claude_runs(&host), 2);
 }

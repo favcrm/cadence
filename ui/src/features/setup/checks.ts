@@ -25,9 +25,15 @@ export interface SetupReport {
   /** Epoch ms the checks ran (the board reuses one run for a minute). */
   checked_at: number;
   detect_only: boolean;
+  /** This request ran the checks (false: answered from the last run). */
+  ran_now: boolean;
+  /** Age of the run when answered. */
+  age_ms: number;
+  /** How long until a re-check runs the probes again (0: now). */
+  recheck_in_ms: number;
 }
 
-/** Checks Home insists on: without them nothing can run. */
+/** Checks Home insists on when this build can fix them. */
 export const REQUIRED_CHECKS = ["state_dir", "tracker", "daemon", "master"] as const;
 
 /** CLIs that can be the master in the MVP — one of them must be ready. */
@@ -76,14 +82,17 @@ export function inGroup(report: SetupReport | null, group: SetupGroup): SetupChe
 }
 
 /**
- * What still blocks a first run: each required check that is not ready,
- * plus "a master CLI" when neither Claude nor Codex is signed in.
+ * What still blocks a first run: each required check that is not ready
+ * and that this build can act on, plus "a master CLI" when neither
+ * Claude nor Codex is signed in. A check with no fix (`master` in a
+ * build without `master start`) has no command to run, so it can never
+ * hold the Home link open.
  */
 export function missingRequired(report: SetupReport): string[] {
   const by = new Map(report.checks.map((c) => [c.check, c]));
   const out: string[] = REQUIRED_CHECKS.filter((name) => {
     const c = by.get(name);
-    return !c || !isReady(c);
+    return !c || (!isReady(c) && c.fix !== null);
   });
   const cliReady = MASTER_CLIS.some((name) => {
     const c = by.get(name);

@@ -10366,3 +10366,55 @@ fn model_defaults_http_round_trip_guards_and_conflict() {
         "read_only"
     );
 }
+
+// --- CAD-327: `/api/setup` is the operator's, on the host ---
+
+/// A read-only board and a request through the tailnet (proven or not)
+/// are refused with 403 before anything runs — no provider probe is
+/// spawned for a viewer.
+#[test]
+fn setup_is_refused_to_read_only_and_tailnet_viewers() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let runs = ui::setup_runs();
+
+    let ro = start_ui_opts(pm.path().to_path_buf(), state.path().to_path_buf(), |o| {
+        o.read_only = true;
+    });
+    let (code, _, body) = http_write(
+        ro,
+        "GET",
+        "/api/setup",
+        &format!("127.0.0.1:{ro}"),
+        &[],
+        b"",
+    );
+    assert_eq!(code, 403, "{body}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["check"],
+        "read_only"
+    );
+
+    let nowhere = TempDir::new().unwrap().path().join("absent.sock");
+    let ts = start_ui_opts(
+        pm.path().to_path_buf(),
+        state.path().to_path_buf(),
+        tailnet_opts(&nowhere),
+    );
+    for headers in [vec![], vec!["Tailscale-User-Login: operator@example.com"]] {
+        let (code, _, body) = http_write(
+            ts,
+            "GET",
+            "/api/setup?fresh=1",
+            &format!("{TS_DNS}:9450"),
+            &headers,
+            b"",
+        );
+        assert_eq!(code, 403, "{headers:?}: {body}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap()["check"],
+            "tailnet"
+        );
+    }
+    assert_eq!(ui::setup_runs(), runs, "a refused request ran the checks");
+}

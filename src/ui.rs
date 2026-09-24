@@ -1302,14 +1302,22 @@ fn proxied_actor(login: Option<&str>) -> std::result::Result<String, String> {
 /// [`crate::tailnet_proof::prove`]. `Some(Err)` — tailnet-shaped but
 /// unproven: Host and loopback are caller-controlled, so the identity
 /// headers are not trusted.
+/// Does the request name the tailnet host — did it come (or claim to
+/// come) through `tailscale serve`? Proof aside.
+fn tailnet_host(request: &Request, opts: &ServeOpts) -> bool {
+    let Some((dns, _)) = opts.tailnet.as_ref() else {
+        return false;
+    };
+    let host = header_value(request, "Host").unwrap_or_default();
+    let name = host.split(':').next().unwrap_or_default();
+    name.eq_ignore_ascii_case(dns)
+}
+
 fn tailnet_proxy(
     request: &Request,
     opts: &ServeOpts,
 ) -> Option<std::result::Result<(), crate::tailnet_proof::Refusal>> {
-    let (dns, _) = opts.tailnet.as_ref()?;
-    let host = header_value(request, "Host").unwrap_or_default();
-    let name = host.split(':').next().unwrap_or_default();
-    if !name.eq_ignore_ascii_case(dns) {
+    if !tailnet_host(request, opts) {
         return None;
     }
     Some(match request.remote_addr() {
@@ -2412,10 +2420,17 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
                 })),
             );
         }
-        "/api/setup" => send(
-            request,
-            setup_get(state_dir, pm_dir, opts.port, query("fresh").is_some()),
-        ),
+        "/api/setup" => {
+            // Refused before anything runs: no probe for a viewer.
+            let resp = match setup_refusal(&request, opts) {
+                Some(refused) => refused,
+                None => {
+                    let fresh = matches!(query("fresh").as_deref(), Some("1" | "true"));
+                    setup_get(state_dir, pm_dir, opts.port, fresh)
+                }
+            };
+            send(request, resp);
+        }
         "/api/overview" => send(
             request,
             json_response(crate::overview::overview_board(state_dir, pm_dir)),
@@ -2806,6 +2821,34 @@ const SETUP_MIN_RECHECK: Duration = Duration::from_secs(5);
 /// spawning the provider probes.
 static SETUP_CACHE: std::sync::Mutex<Option<(Instant, u64, Value)>> = std::sync::Mutex::new(None);
 
+/// Runs of the setup checks this process made — tests pin that a
+/// refused or reused request spawns no probe.
+static SETUP_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[doc(hidden)]
+pub fn setup_runs() -> u64 {
+    SETUP_RUNS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// `/api/setup` is the operator's, on the host: it shows HOME's layout,
+/// the installed CLIs and their sign-in state, and the daemon's pid and
+/// socket, and a visit spawns the provider probes. A read-only board, a
+/// request through the tailnet (proven or not) and a peer that is not
+/// loopback are refused — before anything runs.
+fn setup_refusal(request: &Request, opts: &ServeOpts) -> Option<HttpResp> {
+    const WHY: &str = "setup runs on the host — open the board on 127.0.0.1 there";
+    if opts.read_only {
+        return Some(guard_fail("read_only", WHY));
+    }
+    if tailnet_host(request, opts) {
+        return Some(guard_fail("tailnet", WHY));
+    }
+    if !request.remote_addr().is_some_and(|a| a.ip().is_loopback()) {
+        return Some(guard_fail("loopback", WHY));
+    }
+    None
+}
+
 /// `GET /api/setup` — setup's checks, detect only
 /// ([`crate::setup::board_detect`]): nothing is applied, started or
 /// written, provider probes are bounded and never echoed. Each entry is
@@ -2817,6 +2860,7 @@ fn setup_get(state_dir: &Path, pm_dir: &Path, port: u16, fresh: bool) -> HttpRes
         age < SETUP_MIN_RECHECK || (!fresh && age < SETUP_FRESH_FOR)
     });
     if !reuse {
+        SETUP_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let outcomes = match crate::setup::board_detect(state_dir, pm_dir, port) {
             Ok(o) => o,
             Err(e) => return err_response(500, &e.to_string()),
@@ -2835,11 +2879,17 @@ fn setup_get(state_dir: &Path, pm_dir: &Path, port: u16, fresh: bool) -> HttpRes
             .unwrap_or(0);
         *cache = Some((Instant::now(), checked_at, json!(checks)));
     }
-    let (_, checked_at, checks) = cache.as_ref().expect("filled above");
+    let (at, checked_at, checks) = cache.as_ref().expect("filled above");
+    let age = at.elapsed();
     json_response(json!({
         "checks": checks,
         "checked_at": checked_at,
         "detect_only": true,
+        // Whether this request ran the checks, how old the run is, and
+        // how long until a re-check runs them again.
+        "ran_now": !reuse,
+        "age_ms": age.as_millis() as u64,
+        "recheck_in_ms": SETUP_MIN_RECHECK.saturating_sub(age).as_millis() as u64,
     }))
 }
 

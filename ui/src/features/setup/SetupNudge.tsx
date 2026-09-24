@@ -14,9 +14,16 @@ import { setupResource } from "./setupApi";
 /**
  * First-run detection on Home: a link to /setup while any required setup
  * check is not ready. Dismissible per browser; it says nothing while the
- * checks load or fail (Home must not depend on them).
+ * checks load or fail — a tailnet viewer's refused request included
+ * (Home must not depend on them) — and on a read-only board.
  */
-export default function SetupNudge() {
+export default function SetupNudge({ readOnly }: { readOnly: boolean | null }) {
+  // A read-only viewer is not the operator on the host: no checks, no
+  // link — and nothing is fetched before `/api/meta` says which it is.
+  return readOnly === false ? <Nudge /> : null;
+}
+
+function Nudge() {
   const state = useQuery(setupResource);
   const [dismissed, setDismissed] = useState(() => readNudgeDismissed(browserStorage()));
   if (dismissed || !state.data) return null;
