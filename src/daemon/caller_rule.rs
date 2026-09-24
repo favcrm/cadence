@@ -280,6 +280,10 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         "reports_changed",
         Rule::Handler("proven_operator (CAD-339)"),
     ),
+    (
+        "project_new",
+        Rule::Handler("caller_is_master or operator_connection (CAD-358)"),
+    ),
 ];
 
 /// The rule for `method`; `None` for a method the daemon does not
