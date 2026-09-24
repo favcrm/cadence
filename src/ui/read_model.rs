@@ -375,6 +375,51 @@ pub(super) struct DaemonSnap {
     approvals: Arc<work::Approvals>,
 }
 
+/// Fields of an `agent_list` row (and of the board's agent row) that the
+/// daemon computes from "now" and so move every second on their own — a
+/// running turn's `silent_secs`, a silent end's `ended_secs`, the
+/// awaiting-report clock, a mailbox's idle and unread ages and the
+/// warning text that quotes them. They stay in what is served (the
+/// overview's age cap bounds them); they are left out of the change
+/// fingerprints, which would otherwise mark a change every tick while an
+/// agent runs and keep the overview cache from ever serving. Job and
+/// monitor rows carry no such field: their times are absolute stamps.
+const TICKING: &[(&str, &[&str])] = &[
+    ("", &["silent_secs", "ended_secs"]),
+    ("awaiting_report", &["since_secs", "remaining_secs"]),
+    (
+        "inbox_health",
+        &["idle_secs", "oldest_unread_age_secs", "warning"],
+    ),
+];
+
+/// An agent row without its [`TICKING`] fields — what a change is.
+fn stable_row(row: &Value) -> Value {
+    let mut row = row.clone();
+    for (block, keys) in TICKING {
+        let target = if block.is_empty() {
+            Some(&mut row)
+        } else {
+            row.get_mut(*block)
+        };
+        if let Some(obj) = target.and_then(Value::as_object_mut) {
+            for key in *keys {
+                obj.remove(*key);
+            }
+        }
+    }
+    row
+}
+
+/// The fingerprint of a list of agent rows, ticking fields left out.
+fn rows_fp(rows: &Value) -> Value {
+    Value::Array(
+        rows.as_array()
+            .map(|rows| rows.iter().map(stable_row).collect())
+            .unwrap_or_default(),
+    )
+}
+
 /// Two RPCs against a CAD-325 daemon: `job_list` with task rows (job
 /// outcomes and task bindings) and `agent_list` with each actor's board
 /// slice. An older daemon still answers — through the per-job and
@@ -384,7 +429,8 @@ fn fetch_daemon(state_dir: &Path) -> DaemonSnap {
     let jobs = board_job_list(state_dir);
     let list = client::rpc(state_dir, "agent_list", json!({"board": true})).ok();
     let agents = agents_payload_from(state_dir, list.clone(), jobs.as_ref());
-    let agents_fp = list.map(|l| value_fp(&json!([l, agents["agents"]])));
+    let agents_fp =
+        list.map(|l| value_fp(&json!([rows_fp(&l["agents"]), rows_fp(&agents["agents"])])));
     let outcomes = jobs
         .as_ref()
         .map(|l| board::outcomes_from_jobs(l["jobs"].as_array().map(Vec::as_slice).unwrap_or(&[])))
@@ -863,7 +909,7 @@ fn agent_rows(snap: &DaemonSnap) -> Entities {
             rows.iter()
                 .filter_map(|r| {
                     let alias = r["alias"].as_str()?.to_string();
-                    Some((alias, (value_fp(r), r.clone())))
+                    Some((alias, (value_fp(&stable_row(r)), r.clone())))
                 })
                 .collect()
         })
@@ -909,6 +955,31 @@ mod tests {
         std::fs::write(dir.join("next.md"), "ab").unwrap();
         std::fs::rename(dir.join("next.md"), dir.join("issue.md")).unwrap();
         assert_ne!(s4, folder_stamp(&dir), "atomic replace");
+    }
+
+    #[test]
+    fn stable_row_drops_only_the_ticking_fields() {
+        let row = json!({
+            "alias": "w", "state": "busy", "stalled": false,
+            "silent_secs": 12, "ended_secs": 3,
+            "awaiting_report": {"message": "m", "since_secs": 40, "remaining_secs": 20},
+            "inbox_health": {"unread": 2, "idle_secs": 9, "oldest_unread_age_secs": 9,
+                             "warning": "oldest 9s", "stale": false},
+        });
+        let later = json!({
+            "alias": "w", "state": "busy", "stalled": false,
+            "silent_secs": 13, "ended_secs": 4,
+            "awaiting_report": {"message": "m", "since_secs": 41, "remaining_secs": 19},
+            "inbox_health": {"unread": 2, "idle_secs": 10, "oldest_unread_age_secs": 10,
+                             "warning": "oldest 10s", "stale": false},
+        });
+        assert_eq!(value_fp(&stable_row(&row)), value_fp(&stable_row(&later)));
+        let mut moved = later.clone();
+        moved["inbox_health"]["unread"] = json!(3);
+        assert_ne!(value_fp(&stable_row(&row)), value_fp(&stable_row(&moved)));
+        moved = later;
+        moved["stalled"] = json!(true);
+        assert_ne!(value_fp(&stable_row(&row)), value_fp(&stable_row(&moved)));
     }
 
     #[test]

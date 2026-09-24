@@ -726,3 +726,60 @@ fn status_clock_follows_the_commit_not_the_cached_edit() {
         "HEAD moved: the clock re-reads"
     );
 }
+
+/// Review round 2: an agent mid-turn must not defeat the overview cache.
+/// Its `silent_secs` ticks every second; the change fingerprint leaves
+/// such clocks out, so the watcher marks no change, no legacy `agents`
+/// frame fires each second, and reads keep being served from the cache.
+#[test]
+fn overview_cache_holds_while_an_agent_runs_a_turn() {
+    let fx = fixture(ISSUES, 24);
+    let port = fx.port;
+    let stream = stream_into(port);
+    wait_for("the stream to go live", 10, || {
+        stream.lock().unwrap().contains(": ping")
+    });
+    fx.daemon.rpc(
+        "agent_register",
+        json!({"alias": "sleeper", "provider": "fake", "endpoint_kind": "fake",
+               "cwd": fx.pm.to_str().unwrap()}),
+    );
+    fx.daemon.rpc(
+        "agent_send",
+        json!({"alias": "sleeper", "text": "SLEEP:600"}),
+    );
+    wait_for("the turn to run", 20, || {
+        fx.daemon.rpc("agent_show", json!({"alias": "sleeper"}))["messages"]
+            .as_array()
+            .is_some_and(|ms| ms.iter().any(|m| m["state"] == "running"))
+    });
+    // Let the registration and the turn start settle into the baseline.
+    thread::sleep(Duration::from_secs(3));
+    let _ = get_json(port, "/api/overview");
+    let (_, builds) = stats(&fx);
+    let agents_frames = frames(&stream, "agents").len();
+    let mut samples = Vec::new();
+    for _ in 0..SAMPLES {
+        let t = Instant::now();
+        let _ = get_json(port, "/api/overview");
+        samples.push(t.elapsed());
+        thread::sleep(Duration::from_millis(250));
+    }
+    let (_, builds_after) = stats(&fx);
+    let p = p95(samples);
+    eprintln!(
+        "running turn /api/overview: p95 {p:?}, {} builds for {SAMPLES} reads",
+        builds_after - builds
+    );
+    let ticked = frames(&stream, "agents").len() - agents_frames;
+    assert!(
+        ticked <= 1,
+        "{ticked} legacy agents frames in ~5 s while nothing but silent_secs moved"
+    );
+    assert!(
+        builds_after - builds <= (SAMPLES / 4) as u64,
+        "{} overview builds for {SAMPLES} reads while an agent runs a turn",
+        builds_after - builds
+    );
+    assert!(p < P95_BUDGET, "running-turn overview p95 {p:?}");
+}
