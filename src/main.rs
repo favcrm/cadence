@@ -60,6 +60,26 @@ enum Commands {
         #[arg(long, requires = "host")]
         reclaim_plan: bool,
     },
+    /// First run, idempotent: create what is missing — state dir,
+    /// tracker, skill, daemon, board — and report provider CLIs (version
+    /// and sign-in), the master agent (CAD-339) and the operator login
+    /// (CAD-313). Anything already present is reported `ok` and left
+    /// untouched. Exit 1 when any check failed.
+    Setup {
+        /// One JSON object per check, one per line:
+        /// `{check, status, detail, fix}`; status is ok, created,
+        /// missing, failed or unknown; fix is a copy-paste command.
+        #[arg(long)]
+        json: bool,
+        /// Board port [default: the persisted `ui.json` port, else 3010].
+        #[arg(long)]
+        port: Option<u16>,
+        /// Do not open a browser. Setup never opens one yet — it prints
+        /// the board URL; accepted so `install.sh` and INSTALL-AGENT can
+        /// pass it today.
+        #[arg(long)]
+        no_open: bool,
+    },
     /// Manage the persistent controller.
     Daemon {
         #[command(subcommand)]
@@ -4469,6 +4489,18 @@ fn run() -> Result<i32> {
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             Ok(if ok { 0 } else { 1 })
+        }
+        Commands::Setup {
+            json,
+            port,
+            no_open: _,
+        } => {
+            use clap::CommandFactory;
+            let verbs = Cli::command()
+                .get_subcommands()
+                .map(|c| c.get_name().to_string())
+                .collect();
+            cadence_agent::setup::cli(&state_dir, port, json, verbs)
         }
         Commands::Daemon { action } => match action {
             DaemonAction::Run { rollout_as } => {
