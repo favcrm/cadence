@@ -535,6 +535,55 @@ fn static_file(dist: Option<&Path>, path: &str) -> Option<(String, Vec<u8>)> {
     None
 }
 
+/// What a non-API GET answers with.
+enum StaticAnswer {
+    /// A file of the build — or the SPA shell (`index.html`) for a client route.
+    File(String, Vec<u8>),
+    /// A path that names a file the build does not have.
+    Missing,
+    /// No build to serve at all.
+    NoBuild,
+}
+
+/// Whether a path is a client-side route (ui/src/lib/router.ts: `/`,
+/// `/projects/:slug`, `/agents/:alias`, `/setup`, `/settings`, …) that the
+/// SPA shell answers so deep links and refreshes work. The two routes with
+/// a parameter always are — agent aliases may contain dots (`valid_alias`
+/// in ui/threads.rs allows `[A-Za-z0-9._-]`), project keys never do. Any
+/// other path that names a file — under `/assets/`, or a last segment with
+/// a dot — is not: a missing file must be a 404, not HTML the browser would
+/// try to run as a script or stylesheet. `/api` is never a route; its 404
+/// is JSON (answered before the static branch).
+fn is_client_route(path: &str) -> bool {
+    if path == "/api" || path.starts_with("/api/") || path.starts_with("/assets/") {
+        return false;
+    }
+    let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
+    let param_route = match parts.as_slice() {
+        ["agents", alias] => !alias.is_empty(),
+        ["projects", slug] | ["projects", slug, "context"] => !slug.is_empty(),
+        _ => false,
+    };
+    param_route || !path.rsplit('/').next().unwrap_or_default().contains('.')
+}
+
+/// A build file when one matches; else the SPA shell for a client route.
+fn static_answer(dist: Option<&Path>, path: &str) -> StaticAnswer {
+    let target = if path == "/" { "/index.html" } else { path };
+    if !path.starts_with("/api/") {
+        if let Some((name, bytes)) = static_file(dist, target) {
+            return StaticAnswer::File(name, bytes);
+        }
+    }
+    if !is_client_route(path) {
+        return StaticAnswer::Missing;
+    }
+    match static_file(dist, "/index.html") {
+        Some((name, bytes)) => StaticAnswer::File(name, bytes),
+        None => StaticAnswer::NoBuild,
+    }
+}
+
 #[cfg(feature = "ui")]
 mod embedded {
     use std::collections::HashMap;
@@ -2655,11 +2704,10 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
                 send(request, err_response(404, "no such route"));
                 return;
             }
-            // Static: `/` → index.html; otherwise a file under dist or
-            // the embedded build. No SPA routes exist in I1.
-            let target = if path == "/" { "/index.html" } else { &path };
-            match static_file(opts.dist.as_deref(), target) {
-                Some((name, bytes)) => {
+            // Static: a file of the build, the SPA shell for a client
+            // route, or 404 for a file that is not there.
+            match static_answer(opts.dist.as_deref(), &path) {
+                StaticAnswer::File(name, bytes) => {
                     let mut resp = Response::from_data(bytes);
                     resp.add_header(
                         Header::from_bytes("Content-Type", content_type(&name)).unwrap(),
@@ -2667,23 +2715,14 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
                     resp.add_header(Header::from_bytes("Cache-Control", "no-store").unwrap());
                     send(request, resp);
                 }
-                None => {
-                    if let Some((name, bytes)) = static_file(opts.dist.as_deref(), "/index.html") {
-                        let mut resp = Response::from_data(bytes);
-                        resp.add_header(
-                            Header::from_bytes("Content-Type", content_type(&name)).unwrap(),
-                        );
-                        send(request, resp);
-                    } else {
-                        send(
-                            request,
-                            err_response(
-                                503,
-                                "no SPA build — pass --dist or rebuild with --features ui",
-                            ),
-                        );
-                    }
-                }
+                StaticAnswer::Missing => send(request, err_response(404, "no such file")),
+                StaticAnswer::NoBuild => send(
+                    request,
+                    err_response(
+                        503,
+                        "no SPA build — pass --dist or rebuild with --features ui",
+                    ),
+                ),
             }
         }
     }
@@ -3370,7 +3409,8 @@ fn qr_term(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        content_type, health_supports_model_defaults, proxied_actor, running_json, static_file,
+        content_type, health_supports_model_defaults, proxied_actor, running_json, static_answer,
+        static_file, StaticAnswer,
     };
     use serde_json::json;
 
@@ -3392,6 +3432,75 @@ mod tests {
         let (name, _) = static_file(Some(dist.path()), "/apple-touch-icon.png").unwrap();
         assert_eq!(content_type(&name), "image/png");
         assert!(static_file(Some(dist.path()), "/../favicon.svg").is_none());
+    }
+
+    /// Client routes get the SPA shell so deep links and refreshes work;
+    /// build files come back as themselves; a missing file is a 404, never
+    /// the shell under a script's name.
+    #[test]
+    fn client_routes_get_the_spa_shell_without_shadowing_files() {
+        let dist = tempfile::TempDir::new().unwrap();
+        std::fs::write(dist.path().join("index.html"), "<!doctype html>shell").unwrap();
+        std::fs::write(dist.path().join("favicon.svg"), "<svg/>").unwrap();
+        std::fs::create_dir(dist.path().join("assets")).unwrap();
+        std::fs::write(dist.path().join("assets/index.js"), "js").unwrap();
+        let answer = |path: &str| static_answer(Some(dist.path()), path);
+        for route in [
+            "/",
+            "/projects",
+            "/projects/cadence",
+            "/projects/cadence/context",
+            "/agents",
+            "/agents/cc-1",
+            "/setup",
+            "/settings",
+            "/settings/memory",
+            "/unknown-page",
+            "/agents/cc.worker-1",
+        ] {
+            match answer(route) {
+                StaticAnswer::File(name, bytes) => {
+                    assert_eq!(name, "/index.html", "{route}");
+                    assert_eq!(content_type(&name), "text/html; charset=utf-8", "{route}");
+                    assert_eq!(bytes, b"<!doctype html>shell", "{route}");
+                }
+                _ => panic!("{route}: expected the SPA shell"),
+            }
+        }
+        match answer("/assets/index.js") {
+            StaticAnswer::File(name, bytes) => {
+                assert_eq!(name, "/assets/index.js");
+                assert_eq!(bytes, b"js");
+            }
+            _ => panic!("asset not served"),
+        }
+        match answer("/favicon.svg") {
+            StaticAnswer::File(_, bytes) => assert_eq!(bytes, b"<svg/>"),
+            _ => panic!("favicon not served"),
+        }
+        for missing in [
+            "/assets/gone.js",
+            "/assets/chunk",
+            "/gone.css",
+            "/projects/x/logo.png",
+            "/agents/a/b.js",
+        ] {
+            assert!(
+                matches!(answer(missing), StaticAnswer::Missing),
+                "{missing}"
+            );
+        }
+        // /api never falls through to the shell, even with a file of that name.
+        std::fs::create_dir(dist.path().join("api")).unwrap();
+        std::fs::write(dist.path().join("api/issues"), "x").unwrap();
+        assert!(matches!(answer("/api/issues"), StaticAnswer::Missing));
+        assert!(matches!(answer("/api"), StaticAnswer::Missing));
+        // No build: routes say so instead of serving nothing.
+        let empty = tempfile::TempDir::new().unwrap();
+        assert!(matches!(
+            static_answer(Some(empty.path()), "/projects"),
+            StaticAnswer::NoBuild
+        ));
     }
 
     #[test]

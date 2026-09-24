@@ -1,47 +1,81 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { api, ApiError, type WriteResp } from "./api";
-import Agents from "./components/Agents";
-import Board from "./components/Board";
-import Drawer from "./components/Drawer";
-import Memory from "./components/Memory";
-import ModelDefaults from "./components/ModelDefaults";
-import OverviewView from "./components/Overview";
-import Plan from "./components/Plan";
-import Sidebar from "./components/Sidebar";
-import Toast, { type ToastMsg } from "./components/Toast";
-import { Logo } from "./components/Logo";
-import { countLabel, issueCounts } from "./counts";
-import type { BoardFilters } from "./filters";
-import { invalidatedBy } from "./resource";
-import { resources } from "./resources";
-import { useResource } from "./useResource";
-import { requestIsCurrent, responseBelongsToRequest, visibleContext } from "./projectContextGuard";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { api, ApiError, type WriteResp } from "./lib/api";
+import Agents from "./features/agents/Agents";
+import Board from "./features/projects/Board";
+import Drawer from "./features/projects/Drawer";
+import Memory from "./features/settings/Memory";
+import ModelDefaults from "./features/settings/ModelDefaults";
+import OverviewView from "./features/home/Overview";
+import Plan from "./features/projects/Plan";
+import Sidebar from "./ui/Sidebar";
+import Link from "./ui/Link";
+import SectionTabs from "./ui/SectionTabs";
+import ThemeToggle from "./ui/ThemeToggle";
+import Setup from "./features/setup/Setup";
+import Toast, { type ToastMsg } from "./ui/Toast";
+import { Logo } from "./ui/Logo";
+import { countLabel, issueCounts } from "./lib/counts";
+import type { BoardFilters } from "./lib/filters";
+import { invalidatedBy } from "./lib/cache";
+import { resources } from "./lib/resources";
+import { useMaybeResource, useResource } from "./lib/useResource";
+import {
+  goTo,
+  locationHref,
+  NAV,
+  readLocation,
+  withProject,
+  type AppLocation,
+  type Route,
+  type Screen,
+} from "./lib/router";
+import { navigate, useHref } from "./lib/useLocation";
+import { requestIsCurrent, responseBelongsToRequest, visibleContext } from "./features/projects/projectContextGuard";
 import {
   browserStoredProjectView,
   persistBrowserProjectView,
-  APP_TABS,
-  readAppUrlState,
-  serializeAppUrlState,
-  type AppTab,
   type ProjectView,
-} from "./urlState";
-import type {
-  Health,
-  IssueCard,
-  IssueDetail,
-  Meta,
-  ProjectContext,
-} from "./types";
+} from "./lib/urlState";
+import type { Health, IssueCard, Meta, ProjectContext } from "./lib/types";
+
+/** The location as the app reads it — the URL is the only copy. */
+function currentLocation(): AppLocation {
+  return readLocation(location.pathname, location.search, browserStoredProjectView());
+}
+
+/** Move to a new location built from the current one. */
+function update(fn: (current: AppLocation) => AppLocation, opts?: { replace?: boolean }): void {
+  navigate(locationHref(fn(currentLocation()), location.search), opts);
+}
+
+const SCREEN_LABEL: Record<Screen, string> = {
+  home: "home",
+  projects: "projects",
+  agents: "agents",
+  setup: "setup",
+  settings: "settings",
+  notFound: "not found",
+};
 
 export default function App() {
-  const initialState = useRef<ReturnType<typeof readAppUrlState> | null>(null);
-  if (!initialState.current) {
-    initialState.current = readAppUrlState(location.search, browserStoredProjectView());
-  }
-  const initial = initialState.current;
-  const [tab, setTab] = useState<AppTab>(initial.tab);
-  const [view, setView] = useState<ProjectView>(initial.view);
-  const [project, setProject] = useState(initial.project);
+  // App selection lives in the URL — the route (`/projects/cadence`) plus
+  // `?view=list&issue=CAD-16` — so a refresh or pasted link restores it.
+  const href = useHref();
+  const loc = useMemo(() => currentLocation(), [href]);
+  const { route, view, project, openId, filters } = loc;
+  const screen = route.screen;
+  const search = href.includes("?") ? href.slice(href.indexOf("?")) : "";
+  /** The href of a route, carrying the scope and drawer like `goTo`. */
+  const hrefFor = (r: Route) => locationHref(goTo(loc, r), search);
+  const setView = useCallback(
+    (v: ProjectView) => update((c) => ({ ...c, view: v }), { replace: true }),
+    [],
+  );
+  const setFilters = useCallback(
+    (f: BoardFilters) => update((c) => ({ ...c, filters: f }), { replace: true }),
+    [],
+  );
+  const goRoute = useCallback((r: Route) => update((c) => goTo(c, r)), []);
   const [projectContext, setProjectContext] = useState<ProjectContext | null>(null);
   const [projectContextLoading, setProjectContextLoading] = useState(false);
   const [projectContextError, setProjectContextError] = useState<string | null>(null);
@@ -50,8 +84,7 @@ export default function App() {
   const projectContextRequest = useRef(0);
   const observedContextRevisions = useRef<Record<string, string>>({});
   const [query, setQuery] = useState("");
-  const [filters, setFilters] = useState<BoardFilters>(initial.filters);
-  // Per-resource state (resource.ts): loading, failed and empty stay
+  // Per-resource state (lib/cache.ts): loading, failed and empty stay
   // distinct, and a failed refresh keeps the last good payload as stale.
   const issuesState = useResource(resources.issues);
   const projectsState = useResource(resources.projects);
@@ -62,8 +95,9 @@ export default function App() {
   const agents = agentsState.data;
   const [health, setHealth] = useState<Health | null>(null);
   const [meta, setMeta] = useState<Meta | null>(null);
-  const [openId, setOpenId] = useState<string | null>(initial.openId);
-  const [openDetail, setOpenDetail] = useState<IssueDetail | null>(null);
+  // The open drawer's detail, cached per id: reopening a drawer paints
+  // the last payload while it revalidates.
+  const detailState = useMaybeResource(openId ? resources.issue(openId) : null);
   const [toast, setToast] = useState<ToastMsg | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const toastTimer = useRef<number>(0);
@@ -71,50 +105,25 @@ export default function App() {
   const readOnly = meta?.read_only ?? false;
   const actor = meta?.actor ?? "operator (ui)";
 
-  // App selection lives in the URL (`?tab=board&view=list&project=cadence`
-  // `issue=CAD-16`) so a refresh or pasted link restores the same view.
-  useEffect(() => {
-    const read = () => {
-      const next = readAppUrlState(location.search, browserStoredProjectView());
-      setTab(next.tab);
-      setView(next.view);
-      setProject(next.project);
-      setOpenId(next.openId);
-      setFilters(next.filters);
-    };
-    read();
-    addEventListener("popstate", read);
-    return () => removeEventListener("popstate", read);
-  }, []);
-
-  useEffect(() => {
-    const s = serializeAppUrlState(location.search, {
-      tab,
-      view,
-      project,
-      openId,
-      filters,
-    });
-    history.replaceState(null, "", location.pathname + (s ? `?${s}` : ""));
-  }, [tab, view, project, openId, filters]);
-
   useEffect(() => {
     persistBrowserProjectView(view);
   }, [view]);
 
-  // The tab readable inside refresh's stable callback — the overview
+  // The screen readable inside refresh's stable callback — the overview
   // payload costs a daemon probe + gh cache read, so it only fetches
-  // while the tab is on screen.
-  const tabRef = useRef(tab);
-  tabRef.current = tab;
+  // while Home is on screen.
+  const screenRef = useRef(screen);
+  screenRef.current = screen;
+  // Home shows the project context compactly; Projects → context in full.
+  const contextOn =
+    screen === "home" || (route.screen === "projects" && route.section === "context");
 
   useEffect(() => {
     const request = ++projectContextRequest.current;
     setProjectContext(null);
     setProjectContextError(null);
     setProjectContextErrorProject(null);
-    // Overview shows the same context compactly; Plan is the full view.
-    if ((tab !== "plan" && tab !== "overview") || project === "all") {
+    if (!contextOn || project === "all") {
       setProjectContextLoading(false);
       return;
     }
@@ -139,30 +148,26 @@ export default function App() {
           setProjectContextLoading(false);
         }
       });
-  }, [project, tab, projectContextRefresh]);
+  }, [project, contextOn, projectContextRefresh]);
 
-  // The open drawer's detail. Read through a ref so the stream and poll
+  // The open drawer's id, read through a ref so the stream and poll
   // handlers stay stable while the drawer changes.
   const openIdRef = useRef(openId);
   openIdRef.current = openId;
   const loadDetail = useCallback(() => {
     const id = openIdRef.current;
-    if (!id) return;
-    api
-      .issue(id)
-      .then((next) => {
-        if (openIdRef.current === id) setOpenDetail(next);
-      })
-      .catch(() => {});
+    if (id) void resources.issue(id).invalidate();
   }, []);
-  useEffect(loadDetail, [openId, loadDetail]);
+  useEffect(() => {
+    if (openId) void resources.issue(openId).revalidate();
+  }, [openId]);
 
   // The overview costs a daemon probe + gh cache read (~seconds), so it
-  // is fetched only while its tab is on screen — and whenever it becomes
-  // the visible tab. Requests coalesce inside the resource.
+  // is fetched only while Home is on screen — revalidated when Home comes
+  // back, painting the last payload meanwhile. Requests coalesce.
   useEffect(() => {
-    if (tab === "overview") void resources.overview.refresh();
-  }, [tab]);
+    if (screen === "home") void resources.overview.revalidate();
+  }, [screen]);
 
   // Full re-read: first load, the refresh button, focus and the poll.
   // Each resource joins a request already in flight instead of stacking.
@@ -172,7 +177,7 @@ export default function App() {
     void resources.projects.refresh();
     void resources.issues.refresh();
     void resources.agents.refresh();
-    if (tabRef.current === "overview") void resources.overview.refresh();
+    if (screenRef.current === "home") void resources.overview.refresh();
     loadDetail();
   }, [loadDetail]);
 
@@ -189,8 +194,8 @@ export default function App() {
       for (const name of invalidatedBy(e.data)) {
         if (name === "issue") loadDetail();
         else if (name === "overview") {
-          // Hidden overview: skip — it refetches when the tab opens.
-          if (tabRef.current === "overview") void resources.overview.invalidate();
+          // Hidden overview: skip — it revalidates when Home opens.
+          if (screenRef.current === "home") void resources.overview.invalidate();
         } else void resources[name].invalidate();
       }
     };
@@ -256,7 +261,7 @@ export default function App() {
         next[i] = resp.card;
         return next;
       });
-      setOpenDetail((d) => (d && d.id === resp.issue.id ? resp.issue : d));
+      resources.issue(resp.issue.id).write(() => resp.issue);
       const warns = (resp.warnings ?? []).filter(Boolean);
       if (warns.length) {
         say("warn", `${verb} · ${warns.join(" · ")}`);
@@ -311,15 +316,22 @@ export default function App() {
     [applyWrite, writeError, readOnly, say],
   );
 
-  const openIssue = useCallback((id: string) => setOpenId(id), []);
+  const openIssue = useCallback((id: string) => update((c) => ({ ...c, openId: id })), []);
+  const closeIssue = useCallback(() => update((c) => ({ ...c, openId: null })), []);
+  const openAgent = useCallback(
+    (alias: string | null) => update((c) => ({ ...c, route: { screen: "agents", alias } })),
+    [],
+  );
+  const projectHref = (key: string) => locationHref(withProject(loc, key), search);
+  const projectSlug = project === "all" ? null : project;
 
   return (
     <div className="grid lg:grid-cols-[208px_minmax(0,1fr)] min-h-screen bg-ink-900">
       <Sidebar
-        tab={tab}
-        onTab={setTab}
+        screen={screen}
+        navHref={hrefFor}
         project={project}
-        onProject={setProject}
+        projectHref={projectHref}
         projects={projects}
         issues={issuesState}
         projectsError={projectsState.status === "failed" ? projectsState.error : null}
@@ -347,13 +359,13 @@ export default function App() {
               <path d="M2 3.5l3 3 3-3" />
             </svg>
           </button>
-          <div className="num text-label text-ink-500">
+          <div className="num text-label text-ink-500 min-w-0 truncate">
             <span className="hidden sm:inline text-ink-300">cadence</span>
             <span className="hidden sm:inline"> / </span>
-            <span className="text-ink-100">{tab === "board" ? "projects" : tab}</span>
+            <span className="text-ink-100">{SCREEN_LABEL[screen]}</span>
           </div>
 
-          <div className="ml-auto flex items-center gap-2">
+          <div className="ml-auto flex items-center gap-2 shrink-0">
             {readOnly && (
               <span
                 className="chip bg-warn/10 text-warn"
@@ -375,7 +387,8 @@ export default function App() {
                     : "daemon socket unreachable — runtime strip is empty"
                 }
               >
-                daemon {health.daemon}
+                <span className="hidden sm:inline">daemon </span>
+                {health.daemon}
               </span>
             )}
             <button
@@ -385,6 +398,7 @@ export default function App() {
             >
               refresh
             </button>
+            <ThemeToggle />
             {!readOnly && (
               <span
                 className="hidden sm:inline-flex chip bg-ink-800 text-ink-400"
@@ -398,34 +412,28 @@ export default function App() {
 
         {menuOpen && (
           <nav className="lg:hidden border-b border-ink-700 bg-ink-875 px-4 py-3 space-y-1">
-            <div className="grid grid-cols-3 gap-1.5">
-              {APP_TABS.map(
-                (t) => (
-                  <button
-                    key={t}
-                    onClick={() => {
-                      setTab(t);
-                      setMenuOpen(false);
-                    }}
-                    className={`h-9 rounded text-secondary capitalize ${
-                      tab === t
-                        ? "bg-accent/15 text-accent font-medium"
-                        : "bg-ink-800 text-ink-300"
-                    }`}
-                  >
-                    {t === "board" ? "projects" : t}
-                  </button>
-                ),
-              )}
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
+              {NAV.map((item) => (
+                <Link
+                  key={item.screen}
+                  href={hrefFor(item.route)}
+                  onClick={() => setMenuOpen(false)}
+                  aria-current={screen === item.screen ? "page" : undefined}
+                  className={`h-9 inline-flex items-center justify-center rounded text-secondary ${
+                    screen === item.screen
+                      ? "bg-accent/15 text-accent font-medium"
+                      : "bg-ink-800 text-ink-300"
+                  }`}
+                >
+                  {item.label}
+                </Link>
+              ))}
             </div>
             <div className="slabel pt-2">projects</div>
             <div className="grid gap-1">
-              <button
-                onClick={() => {
-                  setProject("all");
-                  setTab("board");
-                  setMenuOpen(false);
-                }}
+              <Link
+                href={projectHref("all")}
+                onClick={() => setMenuOpen(false)}
                 className={`flex items-center justify-between h-8 px-2.5 rounded text-label ${
                   project === "all"
                     ? "bg-accent/15 text-accent"
@@ -439,35 +447,32 @@ export default function App() {
                 >
                   {issuesState.data ? issueCounts(issues).open : "…"}
                 </span>
-              </button>
+              </Link>
               {projects.map((p) => (
-                <button
+                <Link
                   key={p.key}
-                  onClick={() => {
-                    setProject(p.key);
-                    setTab("board");
-                    setMenuOpen(false);
-                  }}
+                  href={projectHref(p.key)}
+                  onClick={() => setMenuOpen(false)}
                   className={`flex items-center justify-between h-8 px-2.5 rounded text-label ${
                     project === p.key
                       ? "bg-accent/15 text-accent"
                       : "text-ink-300 hover:bg-ink-800"
                   }`}
                 >
-                  {p.key}
+                  <span className="truncate">{p.key}</span>
                   <span
                     className="num text-micro text-ink-500"
                     title={issuesState.data ? countLabel(issueCounts(issues, p.key)) : undefined}
                   >
                     {p.prefix} {issuesState.data ? issueCounts(issues, p.key).open : "…"}
                   </span>
-                </button>
+                </Link>
               ))}
             </div>
           </nav>
         )}
 
-        {tab === "overview" && (
+        {screen === "home" && (
           <OverviewView
             state={overviewState}
             issues={issuesState}
@@ -478,10 +483,19 @@ export default function App() {
             contextLoading={projectContextLoading}
             readOnly={readOnly}
             onAck={ackMonitor}
-            onOpenPlan={() => setTab("plan")}
+            onOpenPlan={() => goRoute({ screen: "projects", slug: projectSlug, section: "context" })}
           />
         )}
-        {tab === "board" && (
+        {route.screen === "projects" && route.slug && (
+          <SectionTabs
+            label={route.slug}
+            tabs={[
+              { label: "Issues", href: hrefFor({ ...route, section: "issues" }), on: route.section === "issues" },
+              { label: "Context", href: hrefFor({ ...route, section: "context" }), on: route.section === "context" },
+            ]}
+          />
+        )}
+        {route.screen === "projects" && route.section === "issues" && (
           <Board
             issues={issuesState}
             onRetry={() => void resources.issues.refresh()}
@@ -501,19 +515,10 @@ export default function App() {
             onMove={moveIssue}
             onCreated={applyWrite}
             onError={writeError}
-            onAgents={() => setTab("agents")}
+            onAgents={() => goRoute({ screen: "agents", alias: null })}
           />
         )}
-        {tab === "agents" && (
-          <Agents
-            state={agentsState}
-            issues={issuesState}
-            project={project}
-            onOpenIssue={openIssue}
-            onRetry={() => void resources.agents.refresh()}
-          />
-        )}
-        {tab === "plan" && (
+        {route.screen === "projects" && route.section === "context" && (
           <Plan
             project={project}
             context={visibleContext(project, projectContext)}
@@ -522,8 +527,43 @@ export default function App() {
             onRetryContext={() => setProjectContextRefresh((value) => value + 1)}
           />
         )}
-        {tab === "memory" && <Memory project={project} onError={writeError} />}
-        {tab === "settings" && <ModelDefaults />}
+        {route.screen === "agents" && (
+          <Agents
+            state={agentsState}
+            issues={issuesState}
+            project={project}
+            open={route.alias}
+            onOpenAgent={openAgent}
+            onOpenIssue={openIssue}
+            onRetry={() => void resources.agents.refresh()}
+          />
+        )}
+        {screen === "setup" && <Setup settingsHref={hrefFor({ screen: "settings", section: "models" })} />}
+        {route.screen === "settings" && (
+          <SectionTabs
+            label="settings"
+            tabs={[
+              { label: "Models", href: hrefFor({ screen: "settings", section: "models" }), on: route.section === "models" },
+              { label: "Memory", href: hrefFor({ screen: "settings", section: "memory" }), on: route.section === "memory" },
+            ]}
+          />
+        )}
+        {route.screen === "settings" && route.section === "memory" && (
+          <Memory project={project} onError={writeError} />
+        )}
+        {route.screen === "settings" && route.section === "models" && <ModelDefaults />}
+        {screen === "notFound" && (
+          <main className="px-4 lg:px-8 pt-10 pb-9">
+            <h1 className="text-section font-semibold text-ink-100">Nothing lives here</h1>
+            <p className="text-body text-ink-400 mt-2">
+              <span className="num break-all">{route.screen === "notFound" ? route.path : ""}</span> is
+              not a page of this board.{" "}
+              <Link href={hrefFor({ screen: "home" })} className="lnk">
+                Go home
+              </Link>
+            </p>
+          </main>
+        )}
       </div>
 
       {openId && (
@@ -533,10 +573,10 @@ export default function App() {
           agents={agents}
           projects={projects}
           pmDir={health?.pm_dir}
-          detail={openDetail?.id === openId ? openDetail : null}
+          detail={detailState?.data?.id === openId ? detailState.data : null}
           readOnly={readOnly}
           actor={actor}
-          onClose={() => setOpenId(null)}
+          onClose={closeIssue}
           onOpen={openIssue}
           onWrite={applyWrite}
           onError={writeError}

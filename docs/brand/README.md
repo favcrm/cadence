@@ -10,6 +10,6 @@ The mark is a terminal prompt: a lit chevron, its dim echo, and a block cursor.
 | `docs/brand/icon-mark.svg` | Transparent mark without the tile, for dark surfaces. |
 | `docs/brand/icon-512.png` | 512 px raster of the master. |
 | `docs/brand/social-preview.png` | 1280 by 640 for the GitHub repository social preview (Settings, General, Social preview). |
-| `ui/src/components/Logo.tsx` | The mark at UI sizes (sidebar). |
+| `ui/src/ui/Logo.tsx` | The mark at UI sizes (sidebar). |
 
 Palette: tile `#0B0B0C`, accent `#2DD4BF`, lit gradient `#2DD4BF` to `#22D3EE` at 35 degrees. Regenerate rasters with `rsvg-convert -w <px> ui/public/icon.svg -o <out>.png`.

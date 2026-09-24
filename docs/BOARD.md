@@ -1263,15 +1263,15 @@ between columns (derived/container cards don't — the reason shows on
 hover), the drawer edits fields/body/links/refs, comments and attaches
 artifacts, and backlog has quick-add. In I3 the board is live: the SPA
 opens an `EventSource` on `/api/stream` and each frame refetches only the
-resources its data names (`ui/src/resource.ts`: one store per resource,
+resources its data names (`ui/src/lib/cache.ts`: one store per resource,
 requests coalesced, a failed refresh keeps the last good payload as
 stale) — EventSource reconnects on its own and the 30 s/focus poll stays
 as the fallback. Issue counts in the sidebar, board header and overview
-summary all derive from `ui/src/counts.ts` over the cards, with epics,
+summary all derive from `ui/src/lib/counts.ts` over the cards, with epics,
 done and dropped named as exclusions. A project's Agents view binds an
 agent by dispatch (a job task on one of the project's issues) or by
 ownership (owner of a `doing`/`review` issue) — the `cadence status`
-ISSUES rule (`ui/src/scope.ts`). The Agents screen ranks
+ISSUES rule (`ui/src/lib/scope.ts`). The Agents screen ranks
 fenced agents first, shows the daemon's recovery text verbatim, and
 opens a drawer with identity, params, capabilities, tasks, bound
 issues, running messages, and the event tail. A fence banner on the
@@ -1281,10 +1281,19 @@ panel. Memory curation is read-only in the browser: proposed entries show
 their native quorum/finalization state, while accept, reject, and supersede
 require an authenticated native agent endpoint.
 
+The SPA has real routes (CAD-326, `ui/src/lib/router.ts`): `/` Home (the
+overview), `/projects[/:slug[/context]]`, `/agents[/:alias]`, `/setup`
+and `/settings[/memory]`; the nav shows Home, Projects, Agents and
+Settings. The server answers any client route with `index.html` and a
+missing file (under `/assets/` or with an extension) with 404. Links from
+before the router (`/?tab=board&project=cadence`) redirect to their
+route. Colours are CSS variables with a light and a dark theme — system
+preference unless the header toggle stored a pick.
+
 A filter bar above the columns slices the board by tag, epic, owner and
 component — chips with counts, multi-select: tags narrow (all of them),
 the other three widen within themselves (any of them). The selection
-lives in the URL (`?project=cadence&tag=ui,api&epic=CAD-38&owner=ann&
+lives in the URL (`/projects/cadence?tag=ui,api&epic=CAD-38&owner=ann&
 component=adapter&group=epic`), so a filtered view is a link. "group by
 epic" renders one swimlane per epic with its progress bar (done ÷
 children, dropped excluded — over all children, not only the visible

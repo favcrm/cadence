@@ -55,7 +55,7 @@ Three storage concerns stay distinct:
 | `src/slots.rs`, `src/doctor/host.rs` | Build/test admission and host/session ownership/resource observations. |
 | `src/session.rs`, `src/worktree.rs`, `src/proc.rs` | Session/worktree operations and process helpers. |
 | `src/ui.rs`, `src/overview.rs` | HTTP/API surface and aggregated project/agent/actionable observations. |
-| `ui/src/components/`, `ui/src/types.ts`, `ui/src/api.ts` | React views, frontend types and API access. |
+| `ui/src/features/`, `ui/src/lib/`, `ui/src/ui/` | React screens per feature, shared frontend libraries (API, types, cache, router) and UI primitives. |
 | `tests/` | Integration/board fixtures and the partial unattended-team acceptance harness. |
 | `scripts/`, `.config/nextest.toml`, `.github/workflows/` | Review receipts, pinned test tooling and CI. |
 | `docs/adr/`, `docs/roles/`, `docs/design/` | Decision history, role/policy documents and labelled product design proposals. |

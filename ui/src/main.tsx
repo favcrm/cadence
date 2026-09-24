@@ -8,6 +8,14 @@ import "@fontsource/ibm-plex-mono/latin-500.css";
 import "@fontsource/ibm-plex-mono/latin-600.css";
 import "./styles.css";
 import App from "./App";
+import { applyLegacyRedirect } from "./lib/useLocation";
+import { initTheme } from "./lib/theme";
+
+// The stored theme pick, before the first paint of the app.
+initTheme();
+
+// A pre-router link (`/?tab=board&project=cadence`) opens at its route.
+applyLegacyRedirect();
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
