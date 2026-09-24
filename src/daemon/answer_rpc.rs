@@ -16,17 +16,19 @@
 //! - the answer must be a valid stored report naming a question on the
 //!   same ticket; the message goes only to that question's recorded
 //!   author;
-//! - ONE message per question: the id is the daemon's own
-//!   `sys-answer-<hash>` of the QUESTION's path, so the store's unique
-//!   id lets exactly one answer through — the first to route, whatever
-//!   the file names, same-second answers or concurrent routes. A later
-//!   answer is filed but answers `{sent:false, why:"already answered"}`,
-//!   so no answerer (the master included) gets a free-text channel to a
-//!   past asker. A retried answer is the identical message: a duplicate.
-//!   Any other holder of the id (a squat) is recorded
-//!   `answer_undeliverable` and refused as an error, never a silent
-//!   duplicate. Reserving `sys-` ids and daemon sources against callers
-//!   is CAD-445's (#250);
+//! - ONE message per question, the daemon's own (CAD-445
+//!   `Shared::daemon_message`): id `sys-answer-<hash>` of the QUESTION's
+//!   path and source `answer`, both of which the store refuses from any
+//!   caller — so no agent can squat the id or dress a message as an
+//!   answer. The store's unique id lets exactly one answer through — the
+//!   first to route, whatever the file names, same-second answers or
+//!   concurrent routes. A later answer is filed but answers
+//!   `{sent:false, why:"already answered"}`, so no answerer (the master
+//!   included) gets a free-text channel to a past asker. A retried
+//!   answer is the identical message: a duplicate. Any other holder of
+//!   the id (only possible for a row written before the reservation)
+//!   is recorded `answer_undeliverable` (and `daemon_message_squatted`)
+//!   and refused as an error, never a silent duplicate;
 //! - the message owes nobody a report: it is queued with no `reply_to`,
 //!   so it never routes a result to the asker's PM;
 //! - an asker that is no longer registered is recorded once per question
@@ -36,13 +38,12 @@
 use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 
 use super::{required_str, Shared, DAEMON_ALIAS};
 use crate::error::{Error, Result};
 use crate::issue::{task_report, write, Pm};
 use crate::peer::AgentCaller;
-use crate::store;
+use crate::proto;
 
 /// Answer bytes a message carries to a pty pane (one pasted line under
 /// the pty ceiling); the report file keeps the rest.
@@ -57,16 +58,11 @@ const CLIP_MARK_MAX: usize = 48;
 /// The message source an answer is queued under.
 pub(super) const SOURCE: &str = "answer";
 
-/// The message id an answer is queued under — one per QUESTION (its
-/// report file), in the daemon's `sys-` namespace (CAD-445).
-pub(super) fn message_id(project: &str, issue: &str, question: &str) -> String {
-    let path = format!("{project}/{issue}/{}/{question}", task_report::DIR);
-    let hash: String = Sha256::digest(path.as_bytes())
-        .iter()
-        .take(8)
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    format!("sys-answer-{hash}")
+/// The dedupe key an answer is queued under — one per QUESTION (its
+/// report file). The id is the daemon's own
+/// [`crate::proto::daemon_message_id`]`("answer", key)`, `sys-answer-…`.
+pub(super) fn question_key(project: &str, issue: &str, question: &str) -> String {
+    format!("{project}/{issue}/{}/{question}", task_report::DIR)
 }
 
 /// Serialises the check-then-record of `answer_undeliverable`, so one
@@ -152,9 +148,9 @@ impl Shared {
         }
         let issue = required_str(params, "issue")?;
         let report = required_str(params, "report")?;
-        let (by, sender) = match self.agent_caller(peer_pid, "answer route")? {
-            AgentCaller::Operator => ("operator".to_string(), store::Sender::Operator),
-            AgentCaller::Agent(alias) => (alias.clone(), store::Sender::Agent(alias)),
+        let by = match self.agent_caller(peer_pid, "answer route")? {
+            AgentCaller::Operator => "operator".to_string(),
+            AgentCaller::Agent(alias) => alias,
         };
         let pm_dir = self.pm_dir()?;
         let pm = Pm::at(&pm_dir)?;
@@ -201,7 +197,8 @@ impl Shared {
         // One message per QUESTION: the id is the question's, so the
         // store's unique id lets exactly one answer through — whichever
         // routes first, however many answers share a second or race.
-        let mid = message_id(&project.key, issue, question);
+        let key = question_key(&project.key, issue, question);
+        let mid = proto::daemon_message_id(SOURCE, &key);
         let facts = json!({"issue": issue, "question": question, "answer": report,
                            "to": asker, "by": by, "message": mid});
         if asker == by {
@@ -220,40 +217,39 @@ impl Shared {
             &path,
             target.endpoint_kind == "pty",
         );
-        // No `reply_to`: an answer owes nobody a report. The store's
-        // enqueue dedupes on the id only for identical content.
-        let queued = self
-            .store
-            .enqueue_sent(&asker, &text, None, &mid, SOURCE, None, &sender);
-        let (duplicate, state) = match queued {
-            Ok(q) => q,
-            Err(e)
-                if e.to_string()
-                    .contains("already used with different content") =>
-            {
-                // Another answer to this question was sent first.
-                let answered = self
-                    .store
-                    .message(&mid)?
-                    .is_some_and(|m| m.source == SOURCE && m.alias == asker);
-                if answered {
-                    return Ok(json!({"sent": false, "to": asker, "message": mid, "why":
-                        format!("already answered — {asker} was told another answer to \
-                                 {question}; this one is filed but not sent")}));
-                }
+        // The daemon's own message (CAD-445): `sys-` id and `answer`
+        // source, which no caller can queue; no `reply_to` — an answer
+        // owes nobody a report.
+        let sent = match self.daemon_message(&asker, SOURCE, &key, &text) {
+            Ok(sent) => sent,
+            Err(e) => match self.store.message(&mid)? {
+                // Lost a race to another answer to the same question.
+                Some(m) if m.source == SOURCE && m.alias == asker => None,
                 // A squat: another message holds the question's id. Never
                 // a silent duplicate — record it and refuse loudly.
-                let why = format!(
-                    "message id {mid} is already taken by a different message — {asker} \
-                     was not told; the answer stands"
-                );
-                self.undeliverable(facts, &why);
-                return Err(Error::rejected(format!("answer route: {why}")));
-            }
-            Err(e) => return Err(e),
+                Some(_) => {
+                    let why = format!(
+                        "message id {mid} is already taken by a different message — {asker} \
+                         was not told; the answer stands"
+                    );
+                    self.undeliverable(facts, &why);
+                    return Err(Error::rejected(format!("answer route: {why}")));
+                }
+                None => return Err(e),
+            },
         };
-        self.notify_agent(&asker);
-        self.wake();
+        let duplicate = sent.is_none();
+        if duplicate {
+            // Held by an `answer` message to the asker: this very answer
+            // (a retry — told before) or another one (already answered).
+            let told_this = self.store.message(&mid)?.is_some_and(|m| m.body == text);
+            if !told_this {
+                return Ok(json!({"sent": false, "to": asker, "message": mid, "why":
+                    format!("already answered — {asker} was told another answer to \
+                             {question}; this one is filed but not sent")}));
+            }
+        }
+        let state = if duplicate { "duplicate" } else { "queued" };
         if !duplicate {
             let _ = self.store.event_public(&asker, "answer_routed", facts);
         }
@@ -287,15 +283,19 @@ mod tests {
 
     #[test]
     fn message_id_is_one_per_question_file() {
-        let a = message_id("demo", "D-1", "20260924T000000Z-operator.md");
-        assert_eq!(a, message_id("demo", "D-1", "20260924T000000Z-operator.md"));
-        assert_ne!(a, message_id("demo", "D-1", "20260924T000001Z-operator.md"));
-        assert_ne!(a, message_id("demo", "D-2", "20260924T000000Z-operator.md"));
-        assert!(
-            a.starts_with("sys-answer-") && a.len() == "sys-answer-".len() + 16,
-            "{a}"
-        );
+        let id = |issue: &str, q: &str| {
+            proto::daemon_message_id(SOURCE, &question_key("demo", issue, q))
+        };
+        let a = id("D-1", "20260924T000000Z-operator.md");
+        assert_eq!(a, id("D-1", "20260924T000000Z-operator.md"));
+        assert_ne!(a, id("D-1", "20260924T000001Z-operator.md"));
+        assert_ne!(a, id("D-2", "20260924T000000Z-operator.md"));
+        assert!(a.starts_with("sys-answer-"), "{a}");
         crate::proto::identifier(&a, "Message id").unwrap();
+        assert!(
+            proto::DAEMON_SOURCES.contains(&SOURCE),
+            "answer is a daemon source"
+        );
     }
 
     #[test]
