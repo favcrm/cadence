@@ -115,6 +115,9 @@ impl Notify {
 
 /// Grace period for a cooperative stop before the transport is force-closed.
 const STOP_GRACE: Duration = Duration::from_secs(3);
+/// How long an idle actor waits on an empty queue before it looks
+/// again. Enqueues wake it at once; this is the backstop.
+const IDLE_POLL: Duration = Duration::from_secs(5);
 /// Stall watch cadence — `silent_secs` stays live without a store read
 /// per agent becoming pressure.
 const STALL_TICK: Duration = Duration::from_secs(2);
@@ -523,6 +526,8 @@ pub struct Shared {
     /// CAD-431: serializes every transition of the worker loop's
     /// record (`delivery.json`).
     delivery_lock: Mutex<()>,
+    /// The actor's empty-queue poll — the backstop behind its wake.
+    idle_poll: Duration,
 }
 
 impl Shared {
@@ -595,6 +600,7 @@ impl Shared {
             dispatch_lock: Mutex::new(()),
             delivery_lock: Mutex::new(()),
             auto_stop: AutoStopTimer::new(opts.auto_stop.clone(), opts.auto_stop_clock.clone()),
+            idle_poll: opts.idle_poll.unwrap_or(IDLE_POLL),
         });
         // Holds dropped by boot-time revalidation get their release
         // events now that the store-backed emitter exists.
@@ -1384,7 +1390,7 @@ impl Shared {
                         return Err(Error::unknown("Provider process disconnected while idle"));
                     }
                     ctl.wake
-                        .wait_if_unchanged(ticket, Instant::now() + Duration::from_secs(5));
+                        .wait_if_unchanged(ticket, Instant::now() + self.idle_poll);
                 }
                 Take::Message(message) => {
                     // A gate refusal requeues the same message, so its
@@ -8918,6 +8924,10 @@ pub struct ServeOptions {
     /// is 30; `Some(0)` turns it off — test daemons stay hermetic, no
     /// tracker scan.
     pub report_router: Option<u64>,
+    /// The actor's empty-queue poll — `None` is five seconds. A test
+    /// that must prove a delivery came from the wake, not the poll,
+    /// sets it past its own wait bound (CAD-391).
+    pub idle_poll: Option<Duration>,
 }
 
 /// Slot configuration precedence: explicit `ServeOptions.slots`, then

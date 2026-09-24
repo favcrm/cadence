@@ -3570,6 +3570,7 @@ fn daemon_opts() -> daemon::ServeOptions {
         // CAD-339: the report router scans a tracker; only the master
         // tests (which bind CADENCE_PM_DIR) turn it on.
         report_router: Some(0),
+        idle_poll: None,
     }
 }
 
@@ -9660,12 +9661,16 @@ fn route_worker_result(d: &TestDaemon, worker: &str, pm: &str, id: &str, text: &
 }
 
 /// Idle pty, `auto_ready` unset, no `agent ready`: a routed
-/// `worker_result` is submitted within 2s of the route (the missing
-/// wake must not hide behind the 5s empty-queue poll). The same pane
-/// then refuses a `source=user` send.
+/// `worker_result` is submitted by the route's wake. The empty-queue
+/// poll is pinned far past the wait, so a missing wake cannot hide
+/// behind it (CAD-391: a 2 s deadline against the default 5 s poll
+/// failed under load). The same pane then refuses a `source=user` send.
 #[test]
 fn pty_routed_notice_delivers_idle_without_claim() {
-    let d = TestDaemon::start();
+    let d = TestDaemon::start_opts(daemon::ServeOptions {
+        idle_poll: Some(Duration::from_secs(600)),
+        ..daemon_opts()
+    });
     let mock = d.mock_devin();
     d.register_devin("pm", None);
     d.register("w1");
@@ -9673,7 +9678,7 @@ fn pty_routed_notice_delivers_idle_without_claim() {
     d.wait_agent("w1", "idle", 10);
     let routed_id = route_worker_result(&d, "w1", "pm", "work-1", "review this pane");
     let started = Instant::now();
-    let deadline = started + Duration::from_secs(2);
+    let deadline = started + Duration::from_secs(30);
     let mut submitted = false;
     while Instant::now() < deadline {
         let state = d.message_state("pm", &routed_id);
@@ -9686,7 +9691,7 @@ fn pty_routed_notice_delivers_idle_without_claim() {
     }
     assert!(
         submitted,
-        "routed notice still {} after {:?} — wake did not beat the empty-queue poll",
+        "routed notice still {} after {:?} — the route did not wake the idle actor",
         d.message_state("pm", &routed_id),
         started.elapsed()
     );
