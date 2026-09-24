@@ -35000,6 +35000,73 @@ fn brokered_request_handles_belong_to_their_agent() {
     d.wait_event("wr", "request_closed", 5);
 }
 
+/// CAD-452: an answered request's handle stays its agent's until the
+/// agent's wait collects the answer. `agent respond` parks the answer
+/// and drops the pending entry, and handles are visible to peers
+/// (`agent requests`, the `request_opened` event) — so a brokered
+/// peer re-opening the handle under its own alias in that gap would
+/// own it, the owner's wait would be refused, and the operator's
+/// accept would reach the provider as a deny. The squat is refused
+/// and records nothing; the owner's retry and wait still collect the
+/// accept.
+#[test]
+fn an_answered_handle_cannot_be_squatted_before_its_wait() {
+    let d = TestDaemon::start();
+    let home = TempDir::new().unwrap();
+    let mut pm = LaneShell::spawn(home.path());
+    plant_pane(&d, "lead", pm.pid());
+    let mut owner = LaneShell::spawn(home.path());
+    plant_pane(&d, "wr", owner.pid());
+    let mut peer = LaneShell::spawn(home.path());
+    plant_pane(&d, "wp", peer.pid());
+    let brokered = json!({"upstream": "lead", "broker_approvals": true}).to_string();
+    for alias in ["wr", "wp"] {
+        cad162_sql(
+            &d,
+            "UPDATE agents SET params=?1, state='busy' WHERE alias=?2",
+            &[&brokered, alias],
+        );
+    }
+    let open = |alias: &str| {
+        json!({"alias": alias, "kind": "approval", "tool": "Bash",
+               "input_summary": "rm -rf /tmp/x", "request": "h1"})
+    };
+    let r = owner.rpc(&d.state, "request_open", open("wr"));
+    assert_eq!(r["ok"], true, "{r}");
+    let r = pm.rpc(
+        &d.state,
+        "agent_respond",
+        json!({"alias": "wr", "request": "h1", "decision": "accept"}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+    // The handle is public: the peer read it from the owner's event.
+    assert!(d
+        .events("wr")
+        .iter()
+        .any(|e| e["kind"] == "request_opened" && e["payload"]["request"] == "h1"));
+
+    // The squat: the peer opens the parked handle as its own request.
+    let r = peer.rpc(&d.state, "request_open", open("wp"));
+    assert_refused(&r, "request_open", "answer parked for 'wr'", "squat");
+    assert!(d.requests("wp").is_empty());
+    let wp = d.rpc("agent_show", json!({"alias": "wp"})).unwrap();
+    assert_eq!(wp["agent"]["state"], "busy", "{wp}");
+    assert!(!d.events("wp").iter().any(|e| e["kind"] == "request_opened"));
+
+    // The owner's retried open of its answered handle dedupes without
+    // re-pending it, and its wait collects the operator's accept.
+    let r = owner.rpc(&d.state, "request_open", open("wr"));
+    assert_eq!(r["result"]["existing"], true, "{r}");
+    assert!(d.requests("wr").is_empty());
+    let r = owner.rpc(
+        &d.state,
+        "request_wait",
+        json!({"request": "h1", "wait": 1}),
+    );
+    assert_eq!(r["result"]["state"], "answered", "{r}");
+    assert_eq!(r["result"]["answer"]["decision"], "accept", "{r}");
+}
+
 /// CAD-375: a running turn's token is `message_report`'s credential, so
 /// the daemon shows it only to the connection that derives the owning
 /// agent. A peer's (and the operator's) `agent_show`, `agent_list` and
