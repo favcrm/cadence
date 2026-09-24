@@ -31,6 +31,17 @@ Look around (read-only):
   moved tickets, reports, open questions); add `--post` to put it in your
   thread.
 
+Register a project when the operator asks for one (a git repo on this
+host; never the tracker or the daemon's state dir):
+
+```sh
+cadence project new <key> --repo <path> [--goal "<one paragraph>"] [--agent pm=1,dev=2]
+```
+
+It records the repo and seeds `PROJECT.md` (goal, staffing, default
+stages, no milestones); running it again for the same key and repo
+changes nothing. Tell the operator the key and prefix.
+
 Propose a plan (the operator approves it; you never can):
 
 ```sh

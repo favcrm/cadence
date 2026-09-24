@@ -20,6 +20,7 @@ pub mod notes;
 pub mod parse;
 pub mod plan;
 pub mod project;
+pub mod project_new;
 pub mod relay;
 pub mod report;
 pub mod retro;

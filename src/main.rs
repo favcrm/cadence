@@ -850,6 +850,13 @@ enum Commands {
         #[command(subcommand)]
         action: PlanAction,
     },
+    /// Projects (CAD-358): `new` registers a repo and seeds its
+    /// PROJECT.md. The operator or the master (by its connection),
+    /// through the daemon.
+    Project {
+        #[command(subcommand)]
+        action: ProjectCmd,
+    },
     /// Milestones (CAD-405): declared in the project's PROJECT.md or
     /// named by an issue's `milestone` / `m<n>-…` tag, with size-weighted
     /// progress and health rolled up from their epics and issues.
@@ -2376,6 +2383,75 @@ fn run_master(state_dir: &Path, action: MasterAction) -> Result<i32> {
     };
     print_json(&result);
     Ok(0)
+}
+
+/// `cadence project` verbs.
+#[derive(Subcommand)]
+enum ProjectCmd {
+    /// Register a git repo as project `<key>` and seed `<pm>/<key>/PROJECT.md`
+    /// (goal, staffing `agents:` map, the default stages, empty
+    /// milestones) in one tracker commit. Idempotent for the same key
+    /// and repo; a different repo for an existing key, the reserved key
+    /// `agents`, an invalid key, a path that is not a git repo, the
+    /// tracker or the daemon's state dir is refused with nothing written.
+    /// The operator or the master, through the daemon.
+    New {
+        /// Project key (folder name): 1-32 lowercase letters, digits or
+        /// hyphens.
+        key: String,
+        /// A path in the repo's checkout; its main checkout root and
+        /// origin remote are recorded.
+        #[arg(long)]
+        repo: PathBuf,
+        /// Issue id prefix [default: the key's first three letters,
+        /// uppercased].
+        #[arg(long)]
+        prefix: Option<String>,
+        /// The goal paragraph for PROJECT.md.
+        #[arg(long)]
+        goal: Option<String>,
+        /// Staffing `<agent>=<sessions>` (repeatable or comma-separated)
+        /// [default: pm=1,dev=1,qa=1].
+        #[arg(long = "agent")]
+        agents: Vec<String>,
+        /// The issue this project is created for — the commit's
+        /// `Issue:` trailer.
+        #[arg(long)]
+        issue: Option<String>,
+    },
+}
+
+fn run_project(state_dir: &Path, action: ProjectCmd) -> Result<i32> {
+    match action {
+        ProjectCmd::New {
+            key,
+            repo,
+            prefix,
+            goal,
+            agents,
+            issue,
+        } => {
+            let repo = cadence_agent::issue::project::expand_home(&repo.to_string_lossy());
+            let repo = if repo.is_absolute() {
+                repo
+            } else {
+                std::env::current_dir()?.join(repo)
+            };
+            let repo = repo.canonicalize().map_err(|_| {
+                Error::rejected(format!(
+                    "{} is not a git repo with a checkout — it does not exist",
+                    repo.display()
+                ))
+            })?;
+            print_json(&client::rpc(
+                state_dir,
+                "project_new",
+                json!({"key": key, "repo": repo, "prefix": prefix, "goal": goal,
+                       "agents": agents, "issue": issue}),
+            )?);
+            Ok(0)
+        }
+    }
 }
 
 fn run_plan(state_dir: &Path, action: PlanAction) -> Result<i32> {
@@ -5708,6 +5784,7 @@ fn run() -> Result<i32> {
         }
         Commands::Issue { action } => cadence_agent::issue::cli::run(&action, &state_dir),
         Commands::Plan { action } => run_plan(&state_dir, action),
+        Commands::Project { action } => run_project(&state_dir, action),
         Commands::Milestone { action } => {
             cadence_agent::issue::cli::run_milestone(&action, &state_dir)
         }
