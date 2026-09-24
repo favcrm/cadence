@@ -1280,10 +1280,10 @@ enum JobAction {
         message: Option<String>,
     },
     /// Record a QA verdict bound to the task's reported commit.
-    /// Inside a cadence pane the reviewer is that pane's alias —
-    /// `--reviewer` is refused there. Outside a pane `--reviewer` is
-    /// required (`operator` is the human's id). The reviewer can never
-    /// be the assignee.
+    /// The reviewer is the verified caller (CAD-372): the agent whose
+    /// pane or managed endpoint runs this command, or `operator` from
+    /// an operator shell outside every pane. It is never a flag or an
+    /// env value. The reviewer can never be the assignee.
     #[command(group = clap::ArgGroup::new("verdict").required(true).args(["pass", "revise", "blocked"]))]
     Verdict {
         task: String,
@@ -1301,8 +1301,10 @@ enum JobAction {
         /// Stop the task — blocked until an operator reopens it.
         #[arg(long)]
         blocked: bool,
-        /// Reviewer identity (required outside a pane; forbidden inside
-        /// one).
+        /// Optional check of who this caller is (`operator` outside a
+        /// pane, else the pane's alias). It is never sent: the daemon
+        /// derives the reviewer from the connection (CAD-372), and a
+        /// mismatch is refused here before anything is written.
         #[arg(long)]
         reviewer: Option<String>,
         /// Evidence file — commands run, outputs, artifact paths.
@@ -1455,7 +1457,8 @@ enum TaskAction {
         #[arg(long)]
         reason: String,
     },
-    /// Reopen a blocked/verified/failed task to draft — operator only.
+    /// Reopen a blocked/verified/failed task to draft — the operator or
+    /// the job's own PM, derived from the calling process (CAD-373).
     Reopen { task: String },
     /// Cancel a task; a still-queued kickoff is cancelled with it.
     Cancel { task: String },
@@ -2144,7 +2147,8 @@ enum MessageAction {
         wait: u64,
     },
     /// Record an explicit acknowledgement for a submitted PTY message.
-    /// The token is the `turn_id` shown by `agent show`.
+    /// The token is the `turn_id` `cadence self` prints — shown only
+    /// to the agent's own pane or endpoint (CAD-375).
     Ack {
         /// Message id.
         message: String,
@@ -4792,9 +4796,7 @@ fn run() -> Result<i32> {
                         &state_dir,
                         "agent_unfence",
                         json!({"alias": alias, "status": status.as_str(),
-                               "note": note, "resume": !no_resume,
-                               "by": std::env::var("CADENCE_ALIAS")
-                                   .unwrap_or_else(|_| "operator".into())}),
+                               "note": note, "resume": !no_resume}),
                     )?;
                     if no_resume {
                         print_json(&result);
@@ -5257,6 +5259,17 @@ fn run() -> Result<i32> {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
+            // CAD-375: the daemon shows a running turn's token only to
+            // the agent's own pane or endpoint. A `null` here means this
+            // process is not in it — say so rather than print a report
+            // instruction that cannot work.
+            if running.iter().any(|m| m["turn_id"].is_null()) {
+                return Err(Error::rejected(format!(
+                    "turn tokens for '{alias}' are shown only to that agent's own pane \
+                     or managed endpoint, and this process does not descend from it — \
+                     run `cadence self` inside the agent's pane (CAD-375)"
+                )));
+            }
             print_json(&json!({"alias": alias, "running": running}));
             Ok(0)
         }
@@ -5367,9 +5380,7 @@ fn run() -> Result<i32> {
                         &state_dir,
                         "message_reconcile",
                         json!({"message": message, "status": status.as_str(),
-                               "note": note, "sha": sha,
-                               "by": std::env::var("CADENCE_ALIAS")
-                                   .unwrap_or_else(|_| "operator".into())}),
+                               "note": note, "sha": sha}),
                     )?,
                     false,
                 ),
@@ -5966,15 +5977,12 @@ fn run_monitor(state_dir: &Path, action: &MonitorAction) -> Result<i32> {
             )?);
         }
         MonitorAction::Stop { monitor } => {
-            print_json(&rpc(
-                "monitor_stop",
-                json!({"monitor": monitor, "pane": pane}),
-            )?);
+            print_json(&rpc("monitor_stop", json!({"monitor": monitor}))?);
         }
         MonitorAction::Dispatch { monitor, task } => {
             print_json(&rpc(
                 "monitor_dispatch",
-                json!({"monitor": monitor, "task": task, "pane": pane}),
+                json!({"monitor": monitor, "task": task}),
             )?);
         }
     }
@@ -6139,6 +6147,19 @@ fn run_job(state_dir: &Path, action: &JobAction) -> Result<i32> {
                     "job verdict needs one of --pass, --revise, --blocked",
                 ));
             };
+            // `--reviewer` only states who the caller believes it is;
+            // the daemon records the verified connection's identity.
+            if let Some(claimed) = reviewer {
+                let expected = pane.as_deref().unwrap_or("operator");
+                if claimed != expected {
+                    return Err(Error::rejected(format!(
+                        "--reviewer '{claimed}' is not this caller ('{expected}'): the \
+                         reviewer is the verified connection (CAD-372) — run the \
+                         verdict from the reviewer's own pane, or from an operator \
+                         shell for 'operator'"
+                    )));
+                }
+            }
             let evidence = evidence.as_ref().map(std::fs::read_to_string).transpose()?;
 
             // Worktree verification runs client-side in the job's repo
@@ -6167,7 +6188,6 @@ fn run_job(state_dir: &Path, action: &JobAction) -> Result<i32> {
             let mut out = rpc(
                 "task_verdict",
                 json!({"task": task, "sha": sha, "verdict": verdict,
-                       "reviewer": reviewer, "pane": pane,
                        "evidence": evidence, "message": message,
                        "revision": revision, "verify": verify}),
             )?;
@@ -6239,7 +6259,7 @@ fn run_job(state_dir: &Path, action: &JobAction) -> Result<i32> {
                 )?);
             }
             TaskAction::Reopen { task } => {
-                print_json(&rpc("task_reopen", json!({"task": task, "pane": pane}))?);
+                print_json(&rpc("task_reopen", json!({"task": task}))?);
             }
             TaskAction::Cancel { task } => {
                 print_json(&rpc("task_cancel", json!({"task": task, "by": by}))?);

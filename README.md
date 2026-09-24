@@ -341,11 +341,12 @@ cadence job task add j1 --task j1-fix --assignee w1 \
         --worktree .cadence/wt/fix --accept "tests pass"
 cadence job dispatch j1-fix     # kickoff → w1; revision 1
 cadence job show j1             # tasks + live kickoff state + drift flags
-cadence job verdict j1-fix --sha <40-hex> --revise --reviewer rev
-                                # sha must equal the reported head_sha;
-                                #  revise at the cap blocks instead
+cadence job verdict j1-fix --sha <40-hex> --revise
+                                # from the reviewer's pane (or an operator
+                                #  shell); sha must equal the reported
+                                #  head_sha; revise at the cap blocks instead
 cadence job dispatch j1-fix     # revision 2 — fresh kickoff id
-cadence job verdict j1-fix --sha <40-hex> --pass --reviewer rev
+cadence job verdict j1-fix --sha <40-hex> --pass
 cadence job accept j1-fix --merged-sha <sha>
                                 # verified → done; PM notified via job_event
 cadence job cancel j1           # cancels non-terminal tasks; queued
@@ -357,9 +358,11 @@ Workers on pty report with `message result <id> --token <t> --sha "$(git
 rev-parse HEAD)"`; managed endpoints (codex/claude) never call
 `message result` — their kickoff asks for a last line `SHA: <40-hex>`
 instead, and `job task sha` repairs a missing one. A verdict on a NULL
-SHA is rejected. Inside a cadence pane the reviewer is the pane alias;
-outside, `--reviewer` is required (`operator` is the human's id), and
-the reviewer is never the assignee.
+SHA is rejected. The reviewer is the verified caller (CAD-372): the
+agent whose pane or managed endpoint runs the command, or `operator`
+from an operator shell outside every pane. It is never a flag: an
+optional `--reviewer` only checks who the caller is and is refused on a
+mismatch. The reviewer is never the assignee or the revision's author.
 
 The hot path is verb-first — `devin`, `codex`, `join`, `attach`, `send`,
 `resume`, `stop`, `inbox` — while `agent`, `message` and `daemon` hold

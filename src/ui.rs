@@ -707,13 +707,15 @@ fn current_message_summary(m: &Value) -> Option<String> {
     Some(summary)
 }
 
-/// One running message reduced for the board: id, task, turn token and a
-/// bounded redacted description for ad-hoc current work.
+/// One running message reduced for the board: id, task and a bounded
+/// redacted description for ad-hoc current work. Never the turn token:
+/// it is `message_report`'s credential and the board serves any local
+/// HTTP caller (CAD-375; the daemon withholds it from the board's own
+/// connection too).
 fn running_json(m: &Value) -> Value {
     json!({
         "id": m["id"],
         "task": m["task_id"],
-        "turn_id": m["turn_id"],
         "created": m["created"],
         "summary": current_message_summary(m),
     })
