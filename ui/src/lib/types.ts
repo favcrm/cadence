@@ -732,7 +732,7 @@ export interface Meta {
   read_only: boolean;
   /** CAD-313: this browser holds a live operator session. Absent on a
    *  server that predates sessions. */
-  operator?: boolean;
+  signed_in?: boolean;
   session?: {
     id: string;
     origin: "loopback" | "tailnet";
@@ -745,7 +745,9 @@ export interface Meta {
   /** The command that signs this origin in (`cadence ui login [--tailnet]`). */
   login_hint?: string;
   actor: string;
-  /** CAD-432: this client passes the board's operator proof. */
+  /** CAD-432 (only with `?operator=1`): this client may make the
+   *  operator's decisions — a live session (CAD-313) plus the board's
+   *  operator proof on the peer and on the board process. */
   operator?: boolean;
   tailnet_url: string | null;
   version: string;

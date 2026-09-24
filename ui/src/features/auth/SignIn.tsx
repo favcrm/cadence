@@ -10,13 +10,13 @@ import { closeSession } from "./session";
  */
 export default function SignIn({ meta, onChange }: { meta: Meta | null; onChange: () => void }) {
   const [busy, setBusy] = useState(false);
-  if (!meta || meta.read_only || meta.operator === undefined) return null;
-  if (!meta.operator) {
+  if (!meta || meta.read_only || meta.signed_in === undefined) return null;
+  if (!meta.signed_in) {
     const cmd = meta.login_hint ?? SIGN_IN_COMMAND;
     return (
       <span
         className="chip bg-warn/10 text-warn max-w-[14rem] truncate"
-        title={`Board writes need the operator's session. Run \`${cmd}\` in your own shell on the host and open the link it prints.`}
+        title={`Board writes need the operator's session. Run ${cmd} in your own shell on the host and open the link it prints.`}
       >
         <span className="sm:hidden">sign in</span>
         <span className="hidden sm:inline">

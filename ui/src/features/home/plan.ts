@@ -56,7 +56,7 @@ export function planView(detail: IssueDetail, block: string | null): PlanView | 
     done: tickets.filter((t) => t.status === "done").length,
     total: tickets.filter((t) => t.status !== "dropped").length,
     canDecide: proposed && !block,
-    blockedReason: proposed && block ? `${block} Or decide with \`cadence plan approve\`.` : null,
+    blockedReason: proposed && block ? `${block} Or decide with cadence plan approve.` : null,
   };
 }
 

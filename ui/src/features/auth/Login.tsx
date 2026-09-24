@@ -1,33 +1,52 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { SIGN_IN_COMMAND } from "./gate";
-import { openSession, takeLoginNonce } from "./session";
+import { captureLoginNonce, openSession, takeLoginNonce } from "./session";
 
 type State = { kind: "working" } | { kind: "done" } | { kind: "failed"; why: string };
 
 /**
  * `/login#n=<nonce>` — the page a `cadence ui login` link opens. The
  * nonce was captured and stripped from the address bar before render;
- * here it is exchanged once for the session cookie.
+ * here it is exchanged once for the session cookie. A second link
+ * opened in the same tab changes only the fragment, so no page load
+ * follows: a `hashchange` listener captures, strips and exchanges it.
  */
 export default function Login({ onSignedIn }: { onSignedIn: () => void }) {
   const [state, setState] = useState<State>({ kind: "working" });
   const sent = useRef(false);
 
+  const exchange = useCallback(
+    (nonce: string | null) => {
+      if (!nonce) {
+        setState({ kind: "failed", why: "This page needs a sign-in link, and it has none (or it was already used here)." });
+        return;
+      }
+      setState({ kind: "working" });
+      openSession(nonce)
+        .then(() => {
+          setState({ kind: "done" });
+          onSignedIn();
+        })
+        .catch((e) => setState({ kind: "failed", why: String(e?.message ?? e) }));
+    },
+    [onSignedIn],
+  );
+
   useEffect(() => {
     if (sent.current) return;
     sent.current = true;
-    const nonce = takeLoginNonce();
-    if (!nonce) {
-      setState({ kind: "failed", why: "This page needs a sign-in link, and it has none (or it was already used here)." });
-      return;
-    }
-    openSession(nonce)
-      .then(() => {
-        setState({ kind: "done" });
-        onSignedIn();
-      })
-      .catch((e) => setState({ kind: "failed", why: String(e?.message ?? e) }));
-  }, [onSignedIn]);
+    exchange(takeLoginNonce());
+  }, [exchange]);
+
+  useEffect(() => {
+    const onHash = () => {
+      captureLoginNonce();
+      const nonce = takeLoginNonce();
+      if (nonce) exchange(nonce);
+    };
+    addEventListener("hashchange", onHash);
+    return () => removeEventListener("hashchange", onHash);
+  }, [exchange]);
 
   return (
     <section className="mx-auto max-w-lg px-4 py-10 space-y-3" aria-live="polite">

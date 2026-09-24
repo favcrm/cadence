@@ -18,11 +18,12 @@ const base: Meta = {
 
 // CAD-313: writes are the operator's only with a session.
 equal(writeBlock(null), null, "meta not loaded yet");
-equal(writeBlock({ ...base, operator: true }), null, "signed in");
-equal(writeBlock({ ...base, read_only: true, operator: true }), READ_ONLY_REASON, "read-only wins");
-const out = writeBlock({ ...base, operator: false, login_hint: "cadence ui login" }) ?? "";
-equal(out.includes("Sign in with `cadence ui login`"), true, "how to sign in");
-const ts = writeBlock({ ...base, operator: false, login_hint: "cadence ui login --tailnet" }) ?? "";
+equal(writeBlock({ ...base, signed_in: true }), null, "signed in");
+equal(writeBlock({ ...base, read_only: true, signed_in: true }), READ_ONLY_REASON, "read-only wins");
+const out = writeBlock({ ...base, signed_in: false, login_hint: "cadence ui login" }) ?? "";
+equal(out.includes("Sign in with cadence ui login"), true, "how to sign in");
+equal(out.includes("`"), false, "plain text, no markdown backticks");
+const ts = writeBlock({ ...base, signed_in: false, login_hint: "cadence ui login --tailnet" }) ?? "";
 equal(ts.includes("--tailnet"), true, "the tailnet hint");
 equal(writeBlock(base), null, "an older server without sessions");
 

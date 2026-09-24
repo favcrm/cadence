@@ -190,12 +190,29 @@ export default function App() {
   // Each resource joins a request already in flight instead of stacking.
   // The operator proof walks /proc on the server: ask for it once per
   // page load and keep the answer across the 30 s polls.
+  // A change of sign-in (CAD-313) changes the answer: it is asked again.
   const operatorKnown = useRef(false);
+  const signedIn = useRef<boolean | undefined>(undefined);
   const refresh = useCallback(() => {
     api.health().then(setHealth).catch(() => setHealth(null));
+    const asked = !operatorKnown.current;
     api
-      .meta(!operatorKnown.current)
+      .meta(asked)
       .then((next) => {
+        const changed = signedIn.current !== undefined && next.signed_in !== signedIn.current;
+        signedIn.current = next.signed_in;
+        if (changed && !asked) {
+          operatorKnown.current = false;
+          setMeta({ ...next, operator: undefined });
+          api
+            .meta(true)
+            .then((fresh) => {
+              if (typeof fresh.operator === "boolean") operatorKnown.current = true;
+              setMeta(fresh);
+            })
+            .catch(() => undefined);
+          return;
+        }
         if (typeof next.operator === "boolean") operatorKnown.current = true;
         setMeta((prev) => ({ ...next, operator: next.operator ?? prev?.operator }));
       })
@@ -367,7 +384,7 @@ export default function App() {
         projects={projects}
         issues={issuesState}
         projectsError={projectsState.status === "failed" ? projectsState.error : null}
-        signedIn={meta?.operator ?? null}
+        signedIn={meta?.signed_in ?? null}
       />
 
       <div className="min-w-0 flex flex-col">

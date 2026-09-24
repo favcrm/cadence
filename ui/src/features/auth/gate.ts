@@ -17,8 +17,8 @@ export function writeBlock(meta: Meta | null): string | null {
   if (!meta) return null;
   if (meta.read_only) return READ_ONLY_REASON;
   // An older server that reports no `operator` field predates sessions.
-  if (meta.operator === false) {
-    return `Sign in with \`${meta.login_hint ?? SIGN_IN_COMMAND}\` to act as the operator.`;
+  if (meta.signed_in === false) {
+    return `Sign in with ${meta.login_hint ?? SIGN_IN_COMMAND} to act as the operator.`;
   }
   return null;
 }
