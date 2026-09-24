@@ -73,7 +73,11 @@ pub(super) fn move_stage(
     match client::rpc(
         state_dir,
         "epic_stage",
-        json!({"epic": epic, "stage": stage, "note": note}),
+        // Every relayed move is the operator's decision: the daemon
+        // then demands the operator on this (the board's) connection
+        // for any target, so a board started under an agent can never
+        // land the operator's move as that agent's.
+        json!({"epic": epic, "stage": stage, "note": note, "operator_decision": true}),
     ) {
         Ok(out) => json_response(out),
         Err(e) => rpc_err(&e, "epic_stage"),

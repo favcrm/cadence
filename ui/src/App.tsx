@@ -179,9 +179,22 @@ export default function App() {
 
   // Full re-read: first load, the refresh button, focus and the poll.
   // Each resource joins a request already in flight instead of stacking.
+  // The operator proof walks /proc on the server: ask for it once per
+  // page load and keep the answer across the 30 s polls.
+  const operatorKnown = useRef(false);
   const refresh = useCallback(() => {
     api.health().then(setHealth).catch(() => setHealth(null));
-    api.meta().then(setMeta).catch(() => setMeta(null));
+    api
+      .meta(!operatorKnown.current)
+      .then((next) => {
+        if (typeof next.operator === "boolean") operatorKnown.current = true;
+        setMeta((prev) => ({ ...next, operator: next.operator ?? prev?.operator }));
+      })
+      .catch(() => {
+        // Lost meta loses the answer too: ask again on the next refresh.
+        operatorKnown.current = false;
+        setMeta(null);
+      });
     void resources.projects.refresh();
     void resources.issues.refresh();
     void resources.agents.refresh();

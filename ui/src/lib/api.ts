@@ -140,7 +140,8 @@ export function planDecision(
 
 export const api = {
   health: () => get<Health>("/api/health"),
-  meta: () => get<Meta>("/api/meta"),
+  /** `withOperator` asks the server to run the operator proof (CAD-432) — once per page load. */
+  meta: (withOperator = false) => get<Meta>(withOperator ? "/api/meta?operator=1" : "/api/meta"),
   overview: () => get<Overview>("/api/overview"),
   projects: () => get<{ projects: Project[] }>("/api/projects"),
   projectContext: (project: string, role: ContextRole = "pm", expectedRevision?: string) => {

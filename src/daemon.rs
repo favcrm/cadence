@@ -3823,6 +3823,13 @@ impl Shared {
     /// routine forward ones and every move back — is attributed to the
     /// caller's lane, or the proven operator, and an unattributable
     /// caller is refused. Identity-shaped fields are never read.
+    ///
+    /// CAD-432: `operator_decision: true` makes ANY move the operator's
+    /// — the connection must pass `operator_connection` whatever the
+    /// target. The board sets it on every relayed move: it relays over
+    /// its own connection, so without it a board started under an agent
+    /// would land the operator's routine moves as that agent's. The flag
+    /// only narrows; it never grants.
     fn rpc_epic_stage(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         for field in [
             "by",
@@ -3841,6 +3848,11 @@ impl Shared {
                 )));
             }
         }
+        let operator_decision = match params.get("operator_decision") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => return Err(Error::rejected("'operator_decision' must be a boolean")),
+        };
         let epic = required_str(params, "epic")?;
         let stage = required_str(params, "stage")?;
         let note = optional_str(params, "note");
@@ -3852,7 +3864,7 @@ impl Shared {
             .filter_map(|(k, v)| v["digest"].as_str().map(|d| (k, d.to_string())))
             .collect();
         let out = crate::issue::write::move_stage(&pm, epic, stage, note, &approvals, |mv| {
-            if mv.needs_operator {
+            if mv.needs_operator || operator_decision {
                 self.operator_connection(
                     &format!("stage move into '{}'", mv.to),
                     params,

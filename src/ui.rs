@@ -2374,8 +2374,11 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
             let daemon = client::rpc(state_dir, "daemon_info", json!({})).ok();
             let (actor, tailnet_proof) = request_identity(&request, opts);
             // CAD-432: may this client make the operator's board
-            // decisions — the same proof those writes run.
-            let operator = home::operator_viewer(&request, state_dir, opts);
+            // decisions — the same proof those writes run. It walks
+            // /proc, so it is computed only when asked (`?operator=1`,
+            // once per page load), never on the 30 s poll.
+            let operator = matches!(query("operator").as_deref(), Some("1" | "true"))
+                .then(|| home::operator_viewer(&request, state_dir, opts));
             send(
                 request,
                 json_response(json!({

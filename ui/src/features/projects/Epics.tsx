@@ -12,6 +12,8 @@ import {
   epicsOf,
   healthView,
   noMoveReason,
+  noteBytes,
+  NOTE_MAX_BYTES,
   progressView,
   stageEvents,
   stageLabel,
@@ -199,6 +201,8 @@ function EpicDetail({
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
   const [result, setResult] = useState<{ ok: boolean; text: string } | null>(null);
+  const bytes = noteBytes(note);
+  const noteTooLong = bytes > NOTE_MAX_BYTES;
 
   const move = (to: string) => {
     setBusy(to);
@@ -260,14 +264,17 @@ function EpicDetail({
                 className="field w-full"
                 placeholder="Note for the move (optional)"
                 aria-label="stage move note"
-                maxLength={500}
+                aria-invalid={noteTooLong}
               />
+              <p className={`text-micro num ${noteTooLong ? "text-fail" : "text-ink-500"}`} aria-live="polite">
+                {bytes}/{NOTE_MAX_BYTES} bytes{noteTooLong ? " — shorten the note to move" : ""}
+              </p>
               <div className="flex flex-wrap gap-2">
                 {moves.map((m) => (
                   <button
                     key={m.to}
                     data-move={m.to}
-                    disabled={busy !== null}
+                    disabled={busy !== null || noteTooLong}
                     onClick={() => move(m.to)}
                     className={
                       m.forward

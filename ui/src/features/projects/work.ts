@@ -152,6 +152,14 @@ export function noMoveReason(stage: WorkStage | null | undefined, viewer: Viewer
   return null;
 }
 
+/** The server's cap on a stage note, in UTF-8 bytes (`claim::NOTE_MAX`). */
+export const NOTE_MAX_BYTES = 500;
+
+/** A note's size as the server counts it — bytes, not characters. */
+export function noteBytes(note: string): number {
+  return new TextEncoder().encode(note.trim()).length;
+}
+
 /** One stage-history row, newest first. */
 export interface StageEvent {
   at: string;

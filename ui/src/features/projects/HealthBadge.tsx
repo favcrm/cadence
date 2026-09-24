@@ -17,7 +17,7 @@ export function HealthReasons({ view }: { view: HealthView }) {
     <ul className="space-y-1.5" aria-label="health reasons">
       {view.reasons.map((r, i) => (
         <li key={i} className="text-label min-w-0">
-          <span className={view.tone === "fail" ? "text-fail" : "text-warn"}>{r.detail}</span>
+          <span className={`break-words ${view.tone === "fail" ? "text-fail" : "text-warn"}`}>{r.detail}</span>
           <span className="block text-ink-400 break-words">
             next{r.owner ? ` (${r.owner})` : ""}: {r.next}
           </span>

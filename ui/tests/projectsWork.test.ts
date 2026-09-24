@@ -4,6 +4,8 @@ import {
   epicsOf,
   healthView,
   noMoveReason,
+  noteBytes,
+  NOTE_MAX_BYTES,
   progressView,
   stageEvents,
   stageLabel,
@@ -172,6 +174,14 @@ async function main() {
     equal(noMoveReason(build, READ_ONLY), "The board is read-only.", "read-only reason");
     equal(noMoveReason(stage("shape", [], "plan"), OPERATOR)?.includes("plan"), true, "plan owns the stage");
     equal(noMoveReason(stage("build", undefined), OPERATOR)?.includes("does not list"), true, "old server");
+  }
+
+  // The note cap is the server's: bytes, not characters.
+  {
+    equal(noteBytes("  done  "), 4, "trimmed ascii");
+    equal(noteBytes("é"), 2, "two bytes");
+    equal(noteBytes("✓".repeat(167)) > NOTE_MAX_BYTES, true, "167 three-byte chars exceed 500 bytes");
+    equal("✓".repeat(167).length <= NOTE_MAX_BYTES, true, "though under 500 characters");
   }
 
   // Stage history: who moved each stage and when, newest first; plan
