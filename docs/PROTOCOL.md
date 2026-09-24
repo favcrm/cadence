@@ -444,7 +444,13 @@ queued the message — a send, a routed result, a job dispatch — and
 whether it was queued before a restart, the result is the same. An
 operator or PM `agent stop` (before or after an auto-stop) writes
 `stop_requested` and supersedes the marker: that agent stays stopped
-and the message waits. A resume that is refused at start or whose open
+and the message waits. The daemon re-checks the marker, records the
+resume and starts the agent under the lifecycle lock that `agent stop`
+takes before it writes `stop_requested`. A stop racing the sweep
+therefore always wins: in flight or finished, the resume declines
+quietly, with no event and no needs-me row. A resume that was recorded
+but never started (the daemon died in between) is reported as failed on
+the next sweep. A resume that is refused at start or whose open
 never reaches `ready` records `agent_auto_resume_failed` (`message`,
 `queued`, `reason`, `resume`) and is not retried; `agent_show` and
 `agent_list` then carry `auto_resume_failed`, and the Overview raises
