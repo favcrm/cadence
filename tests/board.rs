@@ -9756,7 +9756,7 @@ fn context_repo(repo: &Path, project: &str, document_path: &str, document: &str)
     assert!(git(repo, &["config", "user.email", "context@test"]).0);
     assert!(git(repo, &["config", "user.name", "context-test"]).0);
     let manifest = format!(
-        "schema: 1\nproject: {project}\ndocuments:\n  - id: guide\n    kind: index\n    path: {document_path}\n    title: Guide\n    required: true\n    roles: [pm, dev, qa, ops]\n"
+        "schema: 1\nproject: {project}\ndocuments:\n  - id: guide\n    kind: index\n    path: {document_path}\n    title: Guide\n    required: true\n    roles: [pm, dev, qa, devops]\n"
     );
     let manifest_path = repo.join("docs/cadence/project-context.yaml");
     std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
@@ -9872,6 +9872,63 @@ fn project_context_api_scopes_projects_and_pins_revision() {
         port,
         "GET",
         "/api/projects/alpha/context?expected_revision=bad",
+        &host,
+    );
+    assert_eq!(code, 400);
+}
+
+/// `devops` is the stored context role. A manifest or caller written
+/// before the rename still says `ops`; both spellings select the same
+/// documents and the response only ever names `devops`.
+#[test]
+fn project_context_accepts_ops_and_stores_devops() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    let _ = context_repo(repo.path(), "roles", "docs/guide.md", "guide text\n");
+    let manifest = "schema: 1\nproject: roles\ndocuments:\n  - id: guide\n    kind: index\n    path: docs/guide.md\n    title: Guide\n    required: true\n  - id: legacy\n    kind: release\n    path: docs/legacy.md\n    title: Legacy ops document\n    required: false\n    roles: [ops]\n  - id: current\n    kind: validation\n    path: docs/current.md\n    title: Current devops document\n    required: false\n    roles: [devops]\n";
+    std::fs::write(
+        repo.path().join("docs/cadence/project-context.yaml"),
+        manifest,
+    )
+    .unwrap();
+    std::fs::write(repo.path().join("docs/legacy.md"), "legacy text\n").unwrap();
+    std::fs::write(repo.path().join("docs/current.md"), "current text\n").unwrap();
+    assert!(git(repo.path(), &["add", "-A"]).0);
+    assert!(git(repo.path(), &["commit", "-qm", "role fixture"]).0);
+    assert!(cli(pm.path(), state.path(), &["issue", "init"]).0);
+    add_context_project(pm.path(), state.path(), "roles", "R", &[repo.path()]);
+    let port = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+    let host = format!("127.0.0.1:{port}");
+
+    for role in ["devops", "ops"] {
+        let query = format!("/api/projects/roles/context?role={role}");
+        let (code, body) = http(port, "GET", &query, &host);
+        assert_eq!(code, 200, "{body}");
+        let value: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["state"], "ready", "role={role}: {body}");
+        for index in [1, 2] {
+            let document = &value["documents"][index];
+            assert_eq!(document["selected"], true, "role={role}: {document}");
+            assert_eq!(document["selection_reason"], "role:devops", "role={role}");
+        }
+        assert!(!body.contains("role:ops"), "role={role}: {body}");
+    }
+
+    let (code, body) = http(port, "GET", "/api/projects/roles/context?role=dev", &host);
+    assert_eq!(code, 200, "{body}");
+    let value: Value = serde_json::from_str(&body).unwrap();
+    for index in [1, 2] {
+        assert_eq!(value["documents"][index]["selected"], false);
+        assert_eq!(
+            value["documents"][index]["selection_reason"],
+            "excluded:role-mismatch"
+        );
+    }
+    let (code, _) = http(
+        port,
+        "GET",
+        "/api/projects/roles/context?role=operations",
         &host,
     );
     assert_eq!(code, 400);
