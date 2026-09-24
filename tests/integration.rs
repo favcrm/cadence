@@ -39135,6 +39135,11 @@ fn ui_write_caller_keeps_the_operator_relay_with_a_managed_agent_live() {
     assert!(!last.contains("wk"), "{last}");
 }
 
+/// CAD-160 (ADR-0002 phase 1): criteria are never truncated, dropped or
+/// replaced by a pointer. A `dispatch` whose acceptance items cannot
+/// fit the 4000-char pty kickoff whole refuses — plain and `--job`
+/// alike — naming the ceiling and the note or spec file, and leaves no
+/// worktree, branch, job or queued message behind.
 #[test]
 fn dispatch_refuses_criteria_past_the_pty_ceiling() {
     let seeded = TempDir::new().unwrap();
@@ -41425,7 +41430,8 @@ fn cad328_plan_endpoints_guards_agents_and_decisions() {
 /// `write_caller` alone read it as the operator. The board now runs
 /// CAD-276's positive proof on its TCP peer: that child descends from
 /// the daemon (its subreaper) and is refused `403 operator_proof` for
-/// approve, reject and answer, writing nothing; the operator's own
+/// approve, reject, answer, model defaults and thread messages, writing
+/// nothing; the operator's own
 /// requests still land. Since CAD-313 the child needs the operator's
 /// session to get this far, so it presents one (a stolen cookie): the
 /// process proof still refuses it.
@@ -41517,6 +41523,15 @@ fn cad328_operator_writes_refuse_a_detached_managed_child_under_daemon_run() {
             r#"{"reason":"agent says no"}"#.to_string(),
         ),
         (format!("/api/issues/{id}/answers"), answer_body.clone()),
+        // CAD-313 review: every operator-only route runs the proof.
+        (
+            "/api/settings/model-defaults".to_string(),
+            r#"{"expected_revision":0,"config":{"schema":1,"providers":{}}}"#.to_string(),
+        ),
+        (
+            "/api/threads/wk/messages".to_string(),
+            r#"{"text":"from a detached child"}"#.to_string(),
+        ),
     ] {
         let reply = detached(&path, &body);
         assert!(reply.contains(" 403 "), "{path}: {reply}");
@@ -41527,6 +41542,17 @@ fn cad328_operator_writes_refuse_a_detached_managed_child_under_daemon_run() {
         );
     }
     assert_eq!((f.commits(), count()), before, "refusals write nothing");
+    assert_eq!(
+        f.d.rpc("model_defaults_get", json!({})).unwrap()["revision"],
+        0,
+        "model defaults unchanged"
+    );
+    assert!(
+        f.d.rpc("thread_read", json!({"alias": "wk"}))
+            .map(|t| t["thread"].is_null())
+            .unwrap_or(true),
+        "no thread message landed"
+    );
     assert_eq!(f.front(&epic).plan.unwrap().state, "proposed");
     assert_eq!(f.front(&later).plan.unwrap().state, "proposed");
     for id in ["D-3", "D-4", "D-5"] {
