@@ -438,13 +438,13 @@ impl Shared {
         // Claude only for the MVP (review round 1, C1): a Codex session
         // cannot yet run read-only with its writes through daemon verbs.
         let requested = optional_str(params, "provider");
-        if requested.is_some_and(|p| p != "claude") {
+        if let Some(p) = requested.filter(|p| !master::PROVIDERS.contains(p)) {
             return Err(Error::invalid(
                 "master_provider",
                 format!(
-                    "the master runs on claude only for now, not '{}': a codex master needs a \
+                    "the master runs on {} only for now, not '{p}': a {p} master needs a \
                      read-only sandbox with its writes going through daemon verbs (follow-up)",
-                    requested.unwrap_or_default()
+                    master::PROVIDERS.join(" or ")
                 ),
             ));
         }

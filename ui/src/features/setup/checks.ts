@@ -20,8 +20,20 @@ export interface SetupCheck {
   group: SetupGroup;
 }
 
+/** A provider the master can run on (CAD-448), offered in the master step. */
+export interface MasterOffer {
+  /** The provider CLI's check name ("claude"). */
+  bin: string;
+  /** Its check is ready — the CLI is installed and signed in. */
+  ready: boolean;
+  /** `cadence master start --provider <bin>`; null while not ready or no `master` verb. */
+  start: string | null;
+}
+
 export interface SetupReport {
   checks: SetupCheck[];
+  /** The master step's provider offers (CAD-448); absent on a board built before it. */
+  master?: { providers: MasterOffer[] };
   /** Epoch ms the checks ran (the board reuses one run for a minute). */
   checked_at: number;
   detect_only: boolean;
@@ -34,10 +46,12 @@ export interface SetupReport {
 }
 
 /** Checks Home insists on when this build can fix them. */
-export const REQUIRED_CHECKS = ["state_dir", "tracker", "daemon", "master"] as const;
+export const REQUIRED_CHECKS = ["state_dir", "tracker", "daemon", "master", "master_login"] as const;
 
-/** CLIs that can be the master in the MVP — one of them must be ready. */
-export const MASTER_CLIS = ["claude", "codex"] as const;
+/** CLIs `master start` accepts — the fallback when the board's
+ * `master.providers` (CAD-448) is absent. The payload's list is the
+ * authority; a ready CLI the master cannot run does not count. */
+export const MASTER_CLIS = ["claude"] as const;
 
 const LABELS: Record<string, string> = {
   state_dir: "State directory",
@@ -47,6 +61,7 @@ const LABELS: Record<string, string> = {
   ui: "Board",
   login: "Operator login link",
   master: "Master agent",
+  master_login: "Master login",
   claude: "Claude Code",
   codex: "Codex",
   "cursor-agent": "Cursor agent",
@@ -94,7 +109,8 @@ export function missingRequired(report: SetupReport): string[] {
     const c = by.get(name);
     return !c || (!isReady(c) && c.fix !== null);
   });
-  const cliReady = MASTER_CLIS.some((name) => {
+  const masterBins = report.master?.providers.map((p) => p.bin) ?? MASTER_CLIS;
+  const cliReady = masterBins.some((name) => {
     const c = by.get(name);
     return c !== undefined && isReady(c);
   });

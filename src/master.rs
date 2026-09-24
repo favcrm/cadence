@@ -87,6 +87,13 @@ use crate::issue::Pm;
 
 /// The master's alias — and its agent slug.
 pub const ALIAS: &str = "master";
+
+/// The providers `master start` accepts — `claude` only for the MVP: a
+/// Codex master waits for a read-only sandbox with its writes through
+/// daemon verbs. The setup wizard (CAD-448) offers exactly this list
+/// with each one's exact start command, so the daemon's refusal and
+/// the wizard's offer stay in one place.
+pub const PROVIDERS: &[&str] = &["claude"];
 /// The agent files the briefing is built from, in briefing order.
 pub const FILES: [&str; 2] = ["SOUL.md", "AGENT.md"];
 /// Size caps from the agent-filesystem design record (characters).

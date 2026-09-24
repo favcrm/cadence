@@ -548,6 +548,22 @@ fn board_setup_is_detect_only_and_writes_nothing() {
     for name in ["state_dir", "tracker", "skill", "daemon"] {
         assert!(checks[name]["fix"].is_string(), "{}", checks[name]);
     }
+    // CAD-448/CAD-439: the master's own login is its own check — missing
+    // until its separate CLAUDE_CONFIG_DIR holds a .credentials.json; a
+    // host that cannot confine runs the master on the operator's login
+    // and asks for nothing.
+    if cadence_agent::confine::available().is_ok() {
+        assert_eq!(status(&checks, "master_login"), "missing");
+        let login_fix = checks["master_login"]["fix"].as_str().unwrap();
+        assert!(login_fix.contains("claude auth login"), "{login_fix}");
+        assert!(login_fix.contains("CLAUDE_CONFIG_DIR="), "{login_fix}");
+    } else {
+        assert_eq!(status(&checks, "master_login"), "ok");
+        assert!(checks["master_login"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("--unconfined"));
+    }
     // The board answering is the board running.
     assert_eq!(status(&checks, "ui"), "ok", "{}", checks["ui"]);
     assert!(checks["ui"]["detail"]
@@ -565,8 +581,21 @@ fn board_setup_is_detect_only_and_writes_nothing() {
     assert_eq!(checks["codex"]["fix"], "codex login");
     assert_eq!(status(&checks, "devin"), "ok", "{}", checks["devin"]);
     assert_eq!(checks["master"]["group"], "master");
+    assert_eq!(checks["master_login"]["group"], "master");
     assert_eq!(checks["daemon"]["group"], "environment");
-
+    // CAD-448: the wizard's master step gets the providers `master
+    // start` accepts — the signed-in claude with its exact command;
+    // devin is signed in but can never be the master, so it is not
+    // offered.
+    let offers = payload["master"]["providers"].as_array().unwrap();
+    assert_eq!(offers.len(), 1, "{offers:?}");
+    assert_eq!(offers[0]["bin"], "claude");
+    assert_eq!(offers[0]["ready"], true, "{offers:?}");
+    // The board serves its own state dir: the command pastes as is.
+    assert_eq!(
+        offers[0]["start"].as_str().unwrap(),
+        "cadence master start --provider claude"
+    );
     // A re-check runs the probes again and still writes nothing.
     std::thread::sleep(std::time::Duration::from_secs(6));
     let (code, body) = board.request("GET", "/api/setup?fresh=1");
@@ -590,6 +619,39 @@ fn board_setup_is_detect_only_and_writes_nothing() {
         install_snapshot(&host),
         "/api/setup changed the host"
     );
+}
+
+/// CAD-448: once the master's own `CLAUDE_CONFIG_DIR` holds a login the
+/// wizard reads its presence — never the file's contents.
+#[test]
+fn board_setup_reports_the_masters_own_login() {
+    let lease = test_port();
+    let host = Host::new();
+    let creds = host.state_dir().join("master/claude/.credentials.json");
+    std::fs::create_dir_all(creds.parent().unwrap()).unwrap();
+    std::fs::write(&creds, format!("{{\"secret\": \"{SECRET}\"}}")).unwrap();
+    let board = Board::start(&host, lease.port);
+    let (code, body) = board.request("GET", "/api/setup");
+    assert_eq!(code, 200, "{body}");
+    assert!(
+        !body.contains(SECRET),
+        "the login file's contents leaked: {body}"
+    );
+    let payload: Value = serde_json::from_str(&body).unwrap();
+    let checks = by_check(payload["checks"].as_array().unwrap());
+    assert_eq!(
+        status(&checks, "master_login"),
+        "ok",
+        "{}",
+        checks["master_login"]
+    );
+    if cadence_agent::confine::available().is_ok() {
+        assert!(checks["master_login"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("own login"));
+    }
+    assert!(checks["master_login"]["fix"].is_null());
 }
 
 /// A provider CLI that never answers cannot hold the page: each probe

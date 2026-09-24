@@ -32,6 +32,7 @@ const ready = [
   check("codex", "missing", "provider", "codex 0.1; not signed in"),
   check("pi", "missing", "provider", "not on PATH"),
   check("master", "ok", "master"),
+  check("master_login", "ok", "master"),
 ];
 equal(missingRequired(report(ready)), [], "optional checks (skill, login, pi) never block");
 
@@ -39,7 +40,37 @@ const fresh = ready.map((c) =>
   ["daemon", "master", "claude"].includes(c.check) ? { ...c, status: "missing" as const, fix: `fix ${c.check}` } : c,
 );
 equal(missingRequired(report(fresh)), ["daemon", "master", "master CLI"], "required and a master CLI");
-equal(missingRequired(report([])), ["state_dir", "tracker", "daemon", "master", "master CLI"], "no checks → all missing");
+equal(
+  missingRequired(report([])),
+  ["state_dir", "tracker", "daemon", "master", "master_login", "master CLI"],
+  "no checks → all missing",
+);
+// The master's own login (CAD-439) is required: without it the master
+// cannot authenticate — `--copy-login` resolves to the same `ok`.
+const noLogin = ready.map((c) =>
+  c.check === "master_login" ? { ...c, status: "missing" as const, fix: "CLAUDE_CONFIG_DIR=… claude auth login" } : c,
+);
+equal(missingRequired(report(noLogin)), ["master_login"], "the master's own login is required");
+// A host that cannot confine the master runs it on the operator's login —
+// the check reports ok, so nothing is asked for.
+// (covered by `ready` above: master_login ok never blocks)
+// Codex signed in but not master-capable (the board's offer list is the
+// authority — a refused provider does not satisfy "a master CLI").
+const codexOnly = ready.map((c) =>
+  c.check === "claude"
+    ? { ...c, status: "missing" as const, fix: "claude auth login" }
+    : c.check === "codex"
+      ? { ...c, status: "ok" as const, fix: null }
+      : c,
+);
+equal(missingRequired(report(codexOnly)), ["master CLI"], "codex is not a master provider");
+// The board's offer list drives it: a payload offering codex accepts it.
+const codexOffered = report(codexOnly);
+codexOffered.master = { providers: [
+  { bin: "claude", ready: false, start: null },
+  { bin: "codex", ready: true, start: "cadence master start --provider codex" },
+] };
+equal(missingRequired(codexOffered), [], "the payload's provider list is the authority");
 const unknownDaemon = ready.map((c) =>
   c.check === "daemon" ? { ...c, status: "unknown" as const, fix: "cadence daemon start" } : c,
 );

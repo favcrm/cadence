@@ -62,6 +62,15 @@ const steps = {
     await main.getByText("Agent CLIs", { exact: true }).first().click();
     await expectText(main, "signed in", "setup page shows the detected claude CLI signed in");
     await expectText(main, "claude", "setup page lists the detected claude CLI");
+    // CAD-448: the master step offers the signed-in provider's exact
+    // start command and the master's own login command (CAD-439).
+    await main.getByText("Master agent", { exact: true }).first().click();
+    await expectText(
+      main,
+      "master start --provider claude",
+      "setup offers claude's exact master start command",
+    );
+    await expectText(main, "claude auth login", "setup shows the master's own login command");
     return {};
   },
 

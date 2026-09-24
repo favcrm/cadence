@@ -47,7 +47,12 @@
 //! The board's `/setup` page (CAD-327) runs the same list through
 //! [`board_detect`]: detect only — [`detect_checks`] never calls an
 //! `apply` — with the `ui` check answered by the serving board and each
-//! provider probe bounded by [`BOARD_PROBE_TIMEOUT`].
+//! provider probe bounded by [`BOARD_PROBE_TIMEOUT`]. Its master step
+//! (CAD-448) also gets [`MasterOffer`]s — the providers `master start`
+//! accepts ([`crate::master::PROVIDERS`]), each ready one with its exact
+//! `master start --provider <bin>` command — and the `master_login`
+//! check reports the master's own Claude login (CAD-439's separate
+//! `CLAUDE_CONFIG_DIR`), never the operator's.
 //!
 //! Hooks for work in other lanes: the single-use operator login link
 //! is CAD-313 ([`login_link`] returns `None` until its `cadence ui
@@ -346,7 +351,13 @@ pub fn checks() -> Vec<Check> {
     list.push(ui_check());
     list.extend(PROVIDERS.iter().map(provider_check));
     list.push(master_check());
+    list.push(master_login_check());
     list.push(login_check());
+    // A provider `master start` accepts must be a check here — the
+    // wizard's offer (CAD-448) reads that outcome, never re-probes.
+    debug_assert!(crate::master::PROVIDERS
+        .iter()
+        .all(|bin| list.iter().any(|c| c.name == *bin)));
     list
 }
 
@@ -796,6 +807,47 @@ fn master_check() -> Check {
     .needs(&["tracker"])
 }
 
+/// CAD-448: the master's own Claude login (CAD-439) — a separate
+/// `CLAUDE_CONFIG_DIR` under the state dir, never the operator's
+/// `~/.claude`. Detect only: the login command is interactive, so an
+/// absent login is `missing` with the command to run, never applied.
+/// A host that cannot confine the master runs it `--unconfined` on the
+/// operator's own login — there is no separate login to ask for.
+fn master_login_check() -> Check {
+    Check::new(
+        "master_login",
+        |ctx| {
+            if !ctx.has_verb("master") {
+                return Found::Unknown("the master is not in this build".into());
+            }
+            if crate::confine::available().is_err() {
+                return Found::Present(
+                    "this host cannot confine the master — `master start --unconfined` \
+                     uses your own Claude login"
+                        .into(),
+                );
+            }
+            let dir = crate::master::claude_config_dir(&ctx.state_dir);
+            if crate::master::has_login(&ctx.state_dir) {
+                Found::Present(format!("own login in {}", dir.display()))
+            } else {
+                Found::Absent(format!(
+                    "no login in {} — the master's Claude cannot authenticate without \
+                     its own (or `master start --copy-login`)",
+                    dir.display()
+                ))
+            }
+        },
+        |ctx| {
+            if ctx.has_verb("master") {
+                crate::master::login_command(&ctx.state_dir)
+            } else {
+                String::new()
+            }
+        },
+    )
+}
+
 /// CAD-313 hook: the single-use operator login link for the board.
 /// `None` until CAD-313's link-minting verb (`cadence ui login`) is on
 /// main — then this calls it and the `login` check reports the link.
@@ -867,15 +919,65 @@ pub fn register_verbs(verbs: Vec<String>) {
 }
 
 /// Which wizard step a check belongs to — `provider` for each CLI in
-/// [`PROVIDERS`], `master` for the master agent, else `environment`.
+/// [`PROVIDERS`], `master` for the master agent (files and its own
+/// login), else `environment`.
 pub fn check_group(name: &str) -> &'static str {
     if PROVIDERS.iter().any(|p| p.bin == name) {
         "provider"
-    } else if name == "master" {
+    } else if matches!(name, "master" | "master_login") {
         "master"
     } else {
         "environment"
     }
+}
+
+/// One provider `master start` can run the master on (CAD-448): the
+/// wizard's master step offers each of [`crate::master::PROVIDERS`]
+/// with its sign-in state and — when installed and signed in — the
+/// exact start command, `--unconfined` included where this host cannot
+/// confine the master. Detect only: the command is the operator's to
+/// paste, never run from the board.
+#[derive(Serialize, Debug, Clone)]
+pub struct MasterOffer {
+    /// The provider check's name — `claude` today.
+    pub bin: &'static str,
+    /// Its check is ready: the CLI is installed and signed in.
+    pub ready: bool,
+    /// `cadence … master start --provider <bin>`; `None` while the
+    /// provider is not ready or this build has no `master` verb.
+    pub start: Option<String>,
+}
+
+/// What `/api/setup` answers: the detect-only checks, and the master
+/// step's provider offers — one per provider `master start` accepts,
+/// read from the provider checks that already ran (never re-probed).
+pub struct BoardDetect {
+    pub checks: Vec<Outcome>,
+    pub master_providers: Vec<MasterOffer>,
+}
+
+/// The master step's provider offers (CAD-448). `done` holds the
+/// provider checks' outcomes; a ready provider earns its exact start
+/// command.
+fn master_offers(ctx: &Ctx, done: &[Outcome]) -> Vec<MasterOffer> {
+    let confined = crate::confine::available().is_ok();
+    crate::master::PROVIDERS
+        .iter()
+        .map(|bin| {
+            let ready = done
+                .iter()
+                .find(|o| o.check == *bin)
+                .is_some_and(|o| o.status.ready());
+            let start = (ready && ctx.has_verb("master")).then(|| {
+                if confined {
+                    ctx.cadence(&format!("master start --provider {bin}"))
+                } else {
+                    ctx.cadence(&format!("master start --unconfined --provider {bin}"))
+                }
+            });
+            MasterOffer { bin, ready, start }
+        })
+        .collect()
 }
 
 /// The board itself: it is answering this request, so it is running.
@@ -905,11 +1007,12 @@ pub fn board_checks(board_url: &str) -> Vec<Check> {
 }
 
 /// `GET /api/setup` — every setup check, detect only, for the board at
-/// `port`. Reads the process environment as `cadence setup` does; never
-/// applies, starts or writes anything; provider probes are bounded by
+/// `port`, plus the master step's provider offers (CAD-448). Reads the
+/// process environment as `cadence setup` does; never applies, starts
+/// or writes anything; provider probes are bounded by
 /// [`BOARD_PROBE_TIMEOUT`] and report only a version token and an exit
 /// code or a file's presence (the rules in [`PROVIDERS`]).
-pub fn board_detect(state_dir: &Path, pm_dir: &Path, port: u16) -> Result<Vec<Outcome>> {
+pub fn board_detect(state_dir: &Path, pm_dir: &Path, port: u16) -> Result<BoardDetect> {
     let home = process_env("HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
@@ -924,7 +1027,12 @@ pub fn board_detect(state_dir: &Path, pm_dir: &Path, port: u16) -> Result<Vec<Ou
         probe_timeout: BOARD_PROBE_TIMEOUT,
         verbs: VERBS.get().cloned().unwrap_or_default(),
     };
-    Ok(detect_checks(&ctx, &board_checks(&ctx.board_url())))
+    let checks = detect_checks(&ctx, &board_checks(&ctx.board_url()));
+    let master_providers = master_offers(&ctx, &checks);
+    Ok(BoardDetect {
+        checks,
+        master_providers,
+    })
 }
 
 /// Every `needs` names a check that runs earlier — a dependency that is
@@ -1167,6 +1275,93 @@ mod tests {
         };
         let out = detect_checks(&with_verb, &checks);
         assert!(out[1].fix.as_deref().unwrap().ends_with("master start"));
+    }
+
+    /// CAD-448/CAD-439: the master's own login is its own check —
+    /// `missing` with the separate-login command until the master's
+    /// `CLAUDE_CONFIG_DIR` holds a `.credentials.json`; never applied.
+    /// Where the host cannot confine the master it uses the operator's
+    /// login, and nothing is asked for.
+    #[test]
+    fn master_login_is_detected_and_never_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let with_master = Ctx {
+            verbs: vec!["master".into()],
+            ..ctx(dir.path())
+        };
+        let out = detect_checks(&with_master, &[master_login_check()]);
+        if crate::confine::available().is_ok() {
+            assert_eq!(out[0].status, Status::Missing, "{:?}", out[0]);
+            let fix = out[0].fix.as_deref().unwrap();
+            assert!(fix.contains("claude auth login"), "{fix}");
+            assert!(fix.contains("CLAUDE_CONFIG_DIR="), "{fix}");
+            assert!(
+                fix.contains(&with_master.state_dir.display().to_string()),
+                "{fix}"
+            );
+            let creds =
+                crate::master::claude_config_dir(&with_master.state_dir).join(".credentials.json");
+            std::fs::create_dir_all(creds.parent().unwrap()).unwrap();
+            std::fs::write(&creds, "{}").unwrap();
+            let out = detect_checks(&with_master, &[master_login_check()]);
+            assert_eq!(out[0].status, Status::Ok, "{:?}", out[0]);
+            assert_eq!(out[0].fix, None, "{:?}", out[0]);
+            assert!(out[0].detail.contains("own login"), "{:?}", out[0]);
+        } else {
+            assert_eq!(out[0].status, Status::Ok, "{:?}", out[0]);
+            assert!(out[0].detail.contains("--unconfined"), "{:?}", out[0]);
+        }
+        // A build without `master` asks for nothing and names nothing.
+        let out = detect_checks(&ctx(dir.path()), &[master_login_check()]);
+        assert_eq!(out[0].status, Status::Unknown);
+        assert_eq!(out[0].fix, None);
+    }
+
+    /// CAD-448: each provider `master start` accepts is offered with its
+    /// own outcome's readiness and — ready and the verb present — the
+    /// exact start command. A provider `master start` refuses is never
+    /// offered.
+    #[test]
+    fn master_offers_follow_the_provider_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let with_master = Ctx {
+            verbs: vec!["master".into()],
+            ..ctx(dir.path())
+        };
+        let provider = |name: &str, ready: bool| Outcome {
+            check: name.to_string(),
+            status: if ready { Status::Ok } else { Status::Missing },
+            detail: String::new(),
+            fix: None,
+        };
+        let done = [
+            provider("claude", true),
+            provider("codex", true),
+            provider("pi", false),
+        ];
+        let offers = master_offers(&with_master, &done);
+        // Only master::PROVIDERS are offered — a signed-in codex is not
+        // a master choice while the daemon refuses it.
+        assert_eq!(
+            offers.iter().map(|o| o.bin).collect::<Vec<_>>(),
+            crate::master::PROVIDERS
+        );
+        let claude = &offers[0];
+        assert!(claude.ready);
+        let start = claude.start.as_deref().unwrap();
+        assert!(start.contains("master start"), "{start}");
+        assert!(start.contains("--provider claude"), "{start}");
+        if crate::confine::available().is_err() {
+            assert!(start.contains("--unconfined"), "{start}");
+        }
+        // The served state dir is not the default: the command names it.
+        assert!(start.contains("--state-dir"), "{start}");
+        // Provider not ready → no command to start on it.
+        let done = [provider("claude", false)];
+        assert_eq!(master_offers(&with_master, &done)[0].start, None);
+        // No `master` verb in this build → nothing to start with.
+        let no_verb = ctx(dir.path());
+        assert_eq!(master_offers(&no_verb, &done)[0].start, None);
     }
 
     #[test]
