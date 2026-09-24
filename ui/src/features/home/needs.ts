@@ -6,10 +6,12 @@ import type { NeedsMe } from "../../lib/types";
  * kinds the master adds (CAD-339, src/overview.rs): `plan` (a plan
  * awaiting approval, carrying `plan`) and `question` (an open question
  * the master escalated, carrying `question`, the master's `summary` and
- * `escalated_by`). Rows are read through this adapter, so a missing or
- * malformed field degrades the row — a plan without a valid epic falls
- * back to its command — instead of breaking the rail. Tested in
- * tests/homeNeeds.test.ts.
+ * `escalated_by`), and the worker loop's `merge_decision` (CAD-431,
+ * carrying `merge`: the PR, the reviewed head and the PASS behind it),
+ * which the rail offers as a Merge button. Rows are read through this
+ * adapter, so a missing or malformed field degrades the row — a plan
+ * without a valid epic falls back to its command — instead of breaking
+ * the rail. Tested in tests/homeNeeds.test.ts.
  */
 
 export type NeedAction =
@@ -21,6 +23,16 @@ export type NeedAction =
       options: string[];
       impact: string | null;
       body: string | null;
+    }
+  | {
+      type: "merge";
+      issue: string;
+      /** `owner/repo#N`, else the PR link. */
+      pr: string | null;
+      /** The reviewed head the merge is pinned to. */
+      sha: string | null;
+      reviewer: string | null;
+      verdict: string | null;
     }
   | { type: "command"; command: string };
 
@@ -57,6 +69,7 @@ const LABEL: Record<string, string> = {
   question: "question",
   approval: "approval",
   merge: "merge",
+  merge_decision: "merge",
 };
 
 /** One needs row → a rail item. */
@@ -73,6 +86,15 @@ export function homeNeed(row: NeedsMe, index = 0): HomeNeed {
     };
     summary?: unknown;
     escalated_by?: unknown;
+    merge?: {
+      issue?: unknown;
+      pr?: unknown;
+      pr_ref?: unknown;
+      sha?: unknown;
+      owner?: unknown;
+      reviewer?: unknown;
+      verdict_summary?: unknown;
+    };
   };
   const key = row.subject ? `${row.subject.kind}:${row.subject.id}` : `${row.kind}:${index}`;
   const base = {
@@ -106,6 +128,25 @@ export function homeNeed(row: NeedsMe, index = 0): HomeNeed {
       action:
         issue && report && ID.test(issue)
           ? { type: "answer", issue, report, options, impact: str(q.impact), body: str(q.body) }
+          : command,
+    };
+  }
+  if (row.kind === "merge_decision") {
+    const m = extra.merge ?? {};
+    const issue = str(m.issue) ?? (row.subject?.kind === "issue" ? row.subject.id : null);
+    return {
+      ...base,
+      owner: str(m.owner) ?? row.owner ?? "—",
+      action:
+        issue && ID.test(issue)
+          ? {
+              type: "merge",
+              issue,
+              pr: str(m.pr_ref) ?? str(m.pr),
+              sha: str(m.sha),
+              reviewer: str(m.reviewer),
+              verdict: str(m.verdict_summary),
+            }
           : command,
     };
   }
