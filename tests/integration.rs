@@ -39582,8 +39582,13 @@ fn ui_write_caller_attributes_a_managed_endpoint_tool_process() {
 /// provider's start, so its tool process writes as the agent. With the
 /// same pid but a different recorded start — what the row says once the
 /// provider died and another process took its pid — the row ties
-/// nothing: the write is placed exactly as a process tied to no agent,
-/// never as `wk`. A row with no recorded start refuses the write.
+/// nothing, and the caller is placed exactly as a process tied to no
+/// agent (CAD-313 caller rule): with no session it is refused
+/// `operator_session_required`; with the operator's session it writes
+/// as `operator (ui)`. Either way never as `wk` — a caller still tied
+/// to `wk` would have written as `wk` without a session, and been
+/// refused `session_from_agent` with one. A row with no recorded start
+/// is unprovable: refused `caller_identity`, session or not.
 #[test]
 fn cad390_a_reused_managed_provider_pid_never_attributes_a_board_write() {
     let d = TestDaemon::start();
@@ -39592,6 +39597,7 @@ fn cad390_a_reused_managed_provider_pid_never_attributes_a_board_write() {
     let port = start_board(pm.path(), &d.state);
     let mut wk = ManagedWorker::start(&d, "wk");
     let provider = wk.pid;
+    let op = sign_in(&d.state, port);
     let db = d.state.join("cadence.sqlite3");
     let set_start = |start: Option<i64>| {
         rusqlite::Connection::open(&db)
@@ -39602,8 +39608,26 @@ fn cad390_a_reused_managed_provider_pid_never_attributes_a_board_write() {
             )
             .unwrap();
     };
-    let mut write = |body: &str| {
-        let request = board_comment_request(port, body);
+    // A comment write from wk's tool process, with the operator's
+    // session (on the board's own Host) or with none.
+    let mut write = |body: &str, session: bool| {
+        let mut request = board_comment_request(port, body);
+        if session {
+            request = request
+                .replace(
+                    &format!("127.0.0.1:{port}"),
+                    &format!("cadence-{port}.localhost:{port}"),
+                )
+                .replacen(
+                    "\r\nContent-Type",
+                    &format!(
+                        "\r\nCookie: {}\r\n{}\r\nContent-Type",
+                        op.cookie,
+                        op.key_header()
+                    ),
+                    1,
+                );
+        }
         let r = wk.exec(&[
             "bash",
             "-c",
@@ -39615,6 +39639,13 @@ fn cad390_a_reused_managed_provider_pid_never_attributes_a_board_write() {
         assert_eq!(r["rc"], 0, "{r}");
         r["out"].as_str().unwrap().to_string()
     };
+    let refused = |response: &str, check: &str| {
+        assert!(
+            response.starts_with("HTTP/1.1 403") || response.starts_with("HTTP/1.0 403"),
+            "{response}"
+        );
+        assert!(response.contains(&format!("\"{check}\"")), "{response}");
+    };
 
     let agent = d.rpc("agent_show", json!({"alias": "wk"})).unwrap()["agent"].clone();
     assert_eq!(agent["pid"].as_u64(), Some(u64::from(provider)), "{agent}");
@@ -39622,32 +39653,42 @@ fn cad390_a_reused_managed_provider_pid_never_attributes_a_board_write() {
     assert_eq!(agent["pid_start"].as_i64(), Some(start), "{agent}");
 
     // The real provider: its tool process is the agent.
-    let comment = board_replied_comment(&write("from the real provider"), "from the real provider");
+    let body = "from the real provider";
+    let comment = board_replied_comment(&write(body, false), body);
     assert_eq!(comment["author"], "wk", "{comment}");
     assert!(board_last_commit(pm.path()).contains("Actor: wk"));
 
-    // The pid "reused": same number, a different recorded start.
+    // The pid "reused": same number, a different recorded start. Tied
+    // to no agent, so no session is no write at all ...
     set_start(Some(start - 1));
-    let comment = board_replied_comment(&write("after pid reuse"), "after pid reuse");
+    let before = board_last_commit(pm.path());
+    refused(
+        &write("reused, no session", false),
+        "operator_session_required",
+    );
+    assert_eq!(board_last_commit(pm.path()), before, "nothing is written");
+    // ... and the operator's session writes as the operator.
+    let body = "reused, with the session";
+    let comment = board_replied_comment(&write(body, true), body);
     assert_eq!(comment["author"], "operator", "{comment}");
     let last = board_last_commit(pm.path());
     assert!(last.contains("(operator (ui))"), "{last}");
     assert!(!last.contains("wk"), "{last}");
 
-    // No recorded start: unprovable, so the write is refused.
+    // No recorded start: unprovable, so the write is refused, session
+    // or not, naming the row.
     set_start(None);
-    let refused = write("with no recorded start");
-    assert!(
-        refused.starts_with("HTTP/1.1 403") || refused.starts_with("HTTP/1.0 403"),
-        "{refused}"
-    );
-    assert!(refused.contains("caller_identity"), "{refused}");
-    assert!(refused.contains("'wk'"), "{refused}");
-    assert!(!board_last_commit(pm.path()).contains("with no recorded start"));
+    let before = board_last_commit(pm.path());
+    for session in [false, true] {
+        let response = write("with no recorded start", session);
+        refused(&response, "caller_identity");
+        assert!(response.contains("'wk'"), "{response}");
+    }
+    assert_eq!(board_last_commit(pm.path()), before, "nothing is written");
 
     // The recorded start restored: the provider is the agent again.
     set_start(Some(start));
-    let comment = board_replied_comment(&write("restored"), "restored");
+    let comment = board_replied_comment(&write("restored", false), "restored");
     assert_eq!(comment["author"], "wk", "{comment}");
 }
 
