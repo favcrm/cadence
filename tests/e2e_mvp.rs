@@ -69,11 +69,34 @@ fn required_env(name: &str) -> String {
     })
 }
 
-/// A free board port in the sandbox range — never 3010.
-fn free_port() -> u16 {
-    (3110..=3199)
-        .find(|p| TcpListener::bind(("127.0.0.1", *p)).is_ok())
+/// The sandbox board range — never 3010.
+const PORTS: std::ops::RangeInclusive<u16> = 3110..=3199;
+/// Setup attempts on a new port when the one picked was taken meanwhile.
+const PORT_ATTEMPTS: usize = 8;
+
+/// A port in [`PORTS`] that binds right now, not in `tried`. The scan
+/// starts at a pid-derived offset, so concurrent journeys (and the other
+/// lanes' boards in the same range) rarely race for one port; the race
+/// that remains between this probe and `setup` binding is retried by
+/// [`Journey::setup`].
+fn free_port(tried: &[u16]) -> u16 {
+    let n = PORTS.len() as u64;
+    let start = (u64::from(std::process::id()) * 7919 + tried.len() as u64 * 13) % n;
+    (0..n)
+        .map(|i| *PORTS.start() + ((start + i) % n) as u16)
+        .find(|p| !tried.contains(p) && TcpListener::bind(("127.0.0.1", *p)).is_ok())
         .expect("no free port in 3110-3199")
+}
+
+/// A program's absolute path on this process's own PATH — the board
+/// steps run with the sandbox's PATH, which does not hold Node.
+fn host_program(name: &str) -> PathBuf {
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+        .map(|d| d.join(name))
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| panic!("{name} is not on PATH"))
 }
 
 /// One MVP use case's outcome, as `acceptance.json` records it.
@@ -108,7 +131,13 @@ impl Journey {
         let artifacts = PathBuf::from(required_env("CADENCE_E2E_ARTIFACTS"));
         fs::create_dir_all(&artifacts).unwrap();
         let j = Journey {
-            port: free_port(),
+            // CADENCE_E2E_PORT pins the first attempt (debugging, and
+            // proving the taken-port retry); the default probes the range.
+            port: std::env::var("CADENCE_E2E_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .filter(|p| PORTS.contains(p))
+                .unwrap_or_else(|| free_port(&[])),
             root,
             artifacts,
             started: Instant::now(),
@@ -243,14 +272,19 @@ impl Journey {
     fn board(&mut self, step: &str, args: Value) -> Value {
         let t = Instant::now();
         let dir = manifest_dir().join("tests/e2e");
-        let out = Command::new("node")
+        // The sandbox's clean env (HOME, XDG, TMPDIR): the browser's
+        // profile and caches stay under the sandbox root.
+        let mut cmd = self.command(host_program("node").to_str().unwrap());
+        if let Some(chrome) = std::env::var_os("E2E_CHROME") {
+            cmd.env("E2E_CHROME", chrome);
+        }
+        let out = cmd
             .arg(dir.join("board.mjs"))
             .arg(step)
             .arg(args.to_string())
             .current_dir(&dir)
             .env("E2E_URL", self.url())
             .env("E2E_ARTIFACTS", self.artifacts.join("screens"))
-            .env_remove("CADENCE_ALIAS")
             .output()
             .unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout).to_string();
@@ -299,6 +333,50 @@ impl Journey {
         }
     }
 
+    /// `cadence setup` on the journey's port. When that port was taken
+    /// between the probe and the bind (another journey, another lane's
+    /// board), the `ui` check fails naming it: pick the next free port
+    /// and run setup again — bounded. Returns each check's status from
+    /// the first attempt where it did not fail (setup is idempotent, so a
+    /// retry reports what the failed attempt created as `ok`).
+    fn setup(&mut self) -> (Vec<(String, String)>, String) {
+        let mut tried = Vec::new();
+        let mut merged: Vec<(String, String)> = Vec::new();
+        let mut all = String::new();
+        for _ in 0..PORT_ATTEMPTS {
+            tried.push(self.port);
+            let port = self.port.to_string();
+            let (ok, out) = self.cadence(&["setup", "--json", "--no-open", "--port", &port]);
+            let text = out.as_str().map(str::to_string).unwrap_or(out.to_string());
+            all.push_str(&text);
+            for c in text
+                .lines()
+                .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            {
+                let name = c["check"].as_str().unwrap_or_default().to_string();
+                let status = c["status"].as_str().unwrap_or_default().to_string();
+                match merged.iter_mut().find(|(n, _)| *n == name) {
+                    Some(slot) if slot.1 == "failed" => slot.1 = status,
+                    Some(_) => {}
+                    None => merged.push((name, status)),
+                }
+            }
+            if ok {
+                return (merged, all);
+            }
+            assert!(
+                text.contains("is taken"),
+                "setup failed, not over a taken port:\n{text}"
+            );
+            println!(
+                "port {} was taken meanwhile — setup again on another",
+                self.port
+            );
+            self.port = free_port(&tried);
+        }
+        panic!("setup found no free board port in {PORT_ATTEMPTS} attempts:\n{all}");
+    }
+
     fn delivery(&self, issue: &str) -> Value {
         let out = self.ok(&["delivery", "ls"]);
         out["records"]
@@ -308,7 +386,11 @@ impl Journey {
     }
 
     fn thread_text(&self) -> String {
-        let (_, out) = self.cadence(&["thread", "show", "master", "--limit", "500"]);
+        self.thread_of("master")
+    }
+
+    fn thread_of(&self, alias: &str) -> String {
+        let (_, out) = self.cadence(&["thread", "show", alias, "--limit", "500"]);
         out.to_string()
     }
 
@@ -439,19 +521,13 @@ fn mvp_journey_end_to_end() {
 
     // ---- 2. Set up: setup, then the project ----
     let t = Instant::now();
+    let (checks, text) = j.setup();
     let port = j.port.to_string();
-    let (ok, out) = j.cadence(&["setup", "--json", "--no-open", "--port", &port]);
-    let text = out.as_str().map(str::to_string).unwrap_or(out.to_string());
-    assert!(ok, "setup failed:\n{text}");
-    let checks: Vec<Value> = text
-        .lines()
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect();
     let status = |name: &str| -> String {
         checks
             .iter()
-            .find(|c| c["check"] == name)
-            .map(|c| c["status"].as_str().unwrap_or_default().to_string())
+            .find(|(n, _)| n == name)
+            .map(|(_, s)| s.clone())
             .unwrap_or_else(|| panic!("no {name} check in:\n{text}"))
     };
     for created in ["state_dir", "tracker", "daemon", "ui"] {
@@ -559,7 +635,25 @@ fn mvp_journey_end_to_end() {
     let plan = j.ok(&["plan", "show", "DEM-1"]);
     assert_eq!(plan["plan"]["state"], "proposed", "{plan}");
     assert_eq!(plan["plan"]["proposed_by"], "master", "{plan}");
+    // Adversarial: the master dispatched DEM-2 before the operator
+    // approved. The plan gate refused it, by name, and nothing moved.
+    let thread = j.thread_text();
+    assert!(
+        thread.contains("Early dispatch of DEM-2: REFUSED")
+            && thread
+                .contains("plan DEM-1 is proposed — approve it with `cadence plan approve DEM-1`"),
+        "the plan gate must refuse a dispatch before approval: {thread}"
+    );
+    assert!(j.delivery("DEM-2").is_null(), "{}", j.delivery("DEM-2"));
+    assert_eq!(
+        j.ok(&["issue", "show", "DEM-2", "--json"])["status"],
+        "backlog"
+    );
     j.step_done("ask for work", t);
+    j.pass(
+        4,
+        "the plan gate refuses the master's dispatch before approval, by name",
+    );
     j.pass(
         3,
         "the operator's chat reaches the master; its reply and plan are in the thread",
@@ -669,9 +763,36 @@ fn mvp_journey_end_to_end() {
         !j.gh_log().contains("pr merge"),
         "nothing merged before the click"
     );
+    // Adversarial: the worker presses the board's Merge itself, from a
+    // child `curl` of its provider. The board refuses it as an agent's
+    // request before any gh call; the loop stays `passed`.
+    // `message ask` waits for the turn; the message record carries the
+    // worker's reply — the daemon's evidence, not the fake's own log.
+    let asked = j.ok(&[
+        "message",
+        "ask",
+        "w1",
+        "--text",
+        &format!("MERGE_PROBE {} DEM-2", j.url()),
+        "--wait",
+        "60",
+    ]);
+    let probe = asked.to_string();
+    assert!(probe.contains("MERGE_PROBE result"), "{probe}");
+    assert!(
+        probe.contains("HTTP 403") && probe.contains("operator_only"),
+        "an agent's Merge must be refused 403 operator_only: {probe}"
+    );
+    assert!(
+        !j.gh_log().contains("pr merge"),
+        "an agent's Merge reached gh:\n{}",
+        j.gh_log()
+    );
+    assert_eq!(j.delivery("DEM-2")["state"], "passed");
     j.board(
         "merge",
-        json!({"issue": "DEM-2", "reviewer": "r1", "sha": sha}),
+        json!({"issue": "DEM-2", "reviewer": "r1", "sha": sha, "pr": "acme/demo#1",
+               "verdict": "PASS: the endpoint streams every record."}),
     );
     assert!(
         j.gh_log().contains(&format!(
@@ -682,6 +803,10 @@ fn mvp_journey_end_to_end() {
     );
     assert_eq!(j.delivery("DEM-2")["state"], "enqueued");
     j.step_done("review + merge", t);
+    j.pass(
+        7,
+        "the worker's own Merge on the board is refused 403 operator_only, before any gh call",
+    );
     j.pass(7, "w1's done (sha + PR) goes to r1; PASS pinned to the head; Merge in Needs-you enqueues it via gh");
 
     // ---- Use case 8: come back ----
@@ -702,15 +827,29 @@ fn mvp_journey_end_to_end() {
     j.board(
         "since",
         json!({
-            "expect": [
-                "Since you left",
-                "DEM-1 CSV export — approved",
-                "DEM-2 question by w1",
-                "DEM-2 done by w1",
-            ],
+            "expect": ["Since you left", "DEM-1 CSV export — approved"],
+            // question, answer, done, verdict: the card shows 3 rows and
+            // "+1 more", in an order that is not stable within a second.
+            "counts": {"Plans": 2, "Reports": 4},
             "thread": [ASK, "Proposed plan DEM-1", GO],
         }),
     );
+    // Which reports the card counted, from the same summary it reads.
+    let summary = j.ok(&["master", "summary", "--since", "24h"]);
+    let reports = summary["reports"].as_array().cloned().unwrap_or_default();
+    for (kind, agent) in [
+        ("question", "w1"),
+        ("answer", "operator"),
+        ("done", "w1"),
+        ("verdict", "r1"),
+    ] {
+        assert!(
+            reports
+                .iter()
+                .any(|r| r["issue"] == "DEM-2" && r["kind"] == kind && r["agent"] == agent),
+            "since-you-left lacks DEM-2 {kind} by {agent}: {summary}"
+        );
+    }
     j.step_done("come back", t);
     j.pass(
         8,

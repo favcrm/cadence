@@ -18,8 +18,11 @@
 #    the eight MVP use cases.
 #
 # Needs: cargo, pnpm, node, python3, git, curl, tar, sha256sum, and
-# Google Chrome (or E2E_CHROME=<browser binary>). Nothing is downloaded
-# at run time, and nothing outside the sandbox and $E2E_OUT is written.
+# Google Chrome (or E2E_CHROME=<browser binary>). The journey itself
+# downloads nothing and writes nothing outside its sandbox and $E2E_OUT
+# (the board steps run with the sandbox's HOME and XDG dirs). The build
+# steps before it use the caller's cargo and pnpm caches as any build
+# does.
 #
 # Evidence (screenshots, the daemon's event log and logs, the fakes'
 # logs, acceptance.json) lands in $E2E_OUT, default target/e2e.

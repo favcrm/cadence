@@ -116,11 +116,13 @@ const steps = {
 
   // Use case 7: the merge decision names the reviewer and the pinned
   // head; Merge enqueues it.
-  async merge(page, { issue, reviewer, sha }) {
+  async merge(page, { issue, reviewer, sha, pr, verdict }) {
     await page.goto(base);
     const row = await needRow(page, "merge_decision", issue);
     await expectText(row, `PASS by ${reviewer}`, "the merge row names the reviewer");
     await row.getByRole("button", { name: "Review merge" }).click();
+    await expectText(row, pr, "the merge row names the PR");
+    await expectText(row, verdict, "the merge row carries the verdict");
     await expectText(row, sha.slice(0, 12), "the merge is pinned to the reviewed head");
     await row.getByRole("button", { name: "Merge", exact: true }).click();
     await expectText(row, "merge enqueued", "the merge row after Merge");
@@ -132,7 +134,7 @@ const steps = {
   // then (set before the app's scripts run: a live Home rewrites it on
   // every visit and on pagehide). The since-you-left card and the thread
   // are both there.
-  async since(page, { expect, thread }) {
+  async since(page, { expect, counts, thread }) {
     const away = Math.floor(Date.now() / 1000) - 2 * 3600;
     await page.addInitScript(
       ([k, v]) => {
@@ -147,6 +149,16 @@ const steps = {
     const card = page.locator("section[data-since-card]");
     await card.waitFor({ timeout: TIMEOUT });
     for (const t of expect) await expectText(card, t, "since you left");
+    // Section sizes, not which rows made the three-row cut: rows sharing
+    // a second (report `at` is second-precision) sort in any order.
+    for (const [label, n] of Object.entries(counts ?? {})) {
+      const dt = card.locator("dt", { hasText: new RegExp(`^\\s*${label}\\b`, "i") });
+      await dt.first().waitFor({ timeout: TIMEOUT });
+      const got = (await dt.first().innerText()).replace(/\s+/g, " ").trim();
+      if (!new RegExp(`^${label} ${n}$`, "i").test(got)) {
+        throw new Error(`since you left: section ${label} should count ${n}, shows "${got}"`);
+      }
+    }
     const messages = page.locator('ol[aria-label="messages"]');
     for (const t of thread) await expectText(messages, t, "the thread survives the return");
     return {};
@@ -166,7 +178,13 @@ async function main() {
   const context = await browser.newContext({ viewport: { width: 1400, height: 1000 } });
   await context.route("**/*", (route) => {
     const url = route.request().url();
-    if (url.startsWith(origin) || url.startsWith("data:") || url.startsWith("blob:")) {
+    let same = false;
+    try {
+      same = new URL(url).origin === origin;
+    } catch {
+      same = false;
+    }
+    if (same || url.startsWith("data:") || url.startsWith("blob:")) {
       return route.continue();
     }
     offsite.push(url);

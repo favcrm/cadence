@@ -13,13 +13,16 @@ Instead of a model it follows a fixed script chosen by its own
 is a tool subprocess of this process — so the daemon attributes it to
 this agent, as it would a real provider's Bash tool:
 
-- `master`: the operator's "plan a CSV export" -> `plan propose`; "go
+- `master`: the operator's "plan a CSV export" -> `plan propose`, then
+  (adversarial) an early `master dispatch` the gate must refuse; "go
   ahead" -> `master dispatch` for each ticket of its plan; a routed
   `[question]` -> `master escalate` with a summary; anything else
   (briefing, routed reports) -> a short acknowledgement.
 - a worker (`w*`): a dispatched ticket -> a `question` report, then it
   waits (polling `issue show`) for the answer, commits in the ticket's
-  worktree and files `done` with that sha and a PR link.
+  worktree and files `done` with that sha and a PR link. On the
+  operator's `MERGE_PROBE <board> <ID>` it (adversarially) POSTs the
+  board's merge route from a child `curl` and replies with the answer.
 - a reviewer (`r*`): a review kickoff -> a `pass` verdict on the head it
   names.
 
@@ -137,8 +140,13 @@ def master_turn(text):
         if rc != 0 or "epic" not in got:
             return "I could not propose the plan: " + (err or out).strip()
         plan_tickets[:] = got.get("tickets", [])
-        return "Proposed plan %s (%s) — approve it on the plan card." % (
-            got["epic"], ", ".join(plan_tickets))
+        # Adversarial: dispatch before the operator approved. The gate
+        # must refuse it; the reply carries the daemon's answer verbatim.
+        rc, dout, derr = cadence("master", "dispatch", plan_tickets[0])
+        early = ("REFUSED " if rc != 0 else "ACCEPTED ") + (derr or dout).strip()
+        return "Proposed plan %s (%s) — approve it on the plan card.\n" \
+               "Early dispatch of %s: %s" % (got["epic"], ", ".join(plan_tickets),
+                                           plan_tickets[0], early)
     if "go ahead" in text:
         lines = []
         for ticket in plan_tickets:
@@ -169,7 +177,20 @@ def answer_to(issue, question):
     return None
 
 
+def merge_probe(text):
+    """Adversarial: the worker presses the board's Merge itself, from a
+    child `curl` of its own process tree. The board must refuse it."""
+    m = re.search(r"MERGE_PROBE (\S+) (\S+)", text)
+    url, issue = m.group(1), m.group(2)
+    rc, out, err = run(["curl", "-sS", "-X", "POST", "-H", "Content-Type: application/json",
+                        "-H", "X-Cadence-Board: 1", "-d", "{}", "-w", "\nHTTP %{http_code}",
+                        "%s/api/delivery/%s/merge" % (url, issue)])
+    return "MERGE_PROBE result rc=%d\n%s%s" % (rc, out, err)
+
+
 def worker_turn(text):
+    if text.startswith("MERGE_PROBE "):
+        return merge_probe(text)
     # The dispatch kickoff: "... — <ID>: <title>. Your worktree exists:
     # <path> (branch ...". Anything else is acknowledged.
     m = re.search(r"\b([A-Z][A-Z0-9]{0,9}-\d+): .*?Your worktree exists: (\S+) \(branch", text,
