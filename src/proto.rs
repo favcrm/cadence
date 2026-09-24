@@ -109,3 +109,67 @@ pub fn identifier(value: &str, what: &str) -> Result<String> {
         )))
     }
 }
+
+/// The message-id prefix only the daemon writes (CAD-445): a message
+/// the daemon originates — a master wake, and any later system message
+/// — is queued under `sys-<kind>-<hash>`, and the hash is of a key a
+/// caller can often predict (`blocker_done/D-3/D-2@1`). The store
+/// refuses a caller-supplied id with this prefix ([`caller_message`]),
+/// so no agent can squat the id and suppress the daemon's message as a
+/// duplicate.
+pub const DAEMON_MESSAGE_PREFIX: &str = "sys-";
+
+/// Message sources only the daemon writes, through the store's
+/// `enqueue_daemon`: a caller's message carrying one is refused
+/// ([`caller_message`]), so nobody can dress a message as a wake.
+pub const DAEMON_SOURCES: &[&str] = &["wake"];
+
+/// The id of the daemon-originated message of `kind` for `key` — the
+/// dedupe key: the same `(kind, key)` always maps to the same id, so a
+/// replay or a restart finds the message already queued.
+pub fn daemon_message_id(kind: &str, key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let hash: String = Sha256::digest(format!("{kind}\n{key}").as_bytes())
+        .iter()
+        .take(10)
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("{DAEMON_MESSAGE_PREFIX}{kind}-{hash}")
+}
+
+/// Refuse a caller's message whose id is in the daemon's namespace
+/// ([`DAEMON_MESSAGE_PREFIX`]) or whose source is a daemon source
+/// ([`DAEMON_SOURCES`]). The store runs this for every message not
+/// queued through `enqueue_daemon`.
+pub fn caller_message(id: &str, source: &str) -> Result<()> {
+    if id.starts_with(DAEMON_MESSAGE_PREFIX) {
+        return Err(Error::rejected(format!(
+            "message ids starting '{DAEMON_MESSAGE_PREFIX}' are the daemon's own — pick another \
+             id, or omit it"
+        )));
+    }
+    if DAEMON_SOURCES.contains(&source) {
+        return Err(Error::rejected(format!(
+            "message source '{source}' is the daemon's own — only the daemon queues it"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daemon_message_ids_are_stable_valid_and_reserved() {
+        let a = daemon_message_id("wake", "blocker_done/D-3/D-2");
+        assert_eq!(a, daemon_message_id("wake", "blocker_done/D-3/D-2"));
+        assert_ne!(a, daemon_message_id("wake", "blocker_done/D-4/D-2"));
+        assert_ne!(a, daemon_message_id("answer", "blocker_done/D-3/D-2"));
+        assert!(a.starts_with("sys-wake-"), "{a}");
+        identifier(&a, "Message id").unwrap();
+        assert!(caller_message(&a, "user").is_err());
+        assert!(caller_message("m1", "wake").is_err());
+        caller_message("dispatch-d-3", "user").unwrap();
+    }
+}

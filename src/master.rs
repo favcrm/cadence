@@ -162,6 +162,21 @@ pub const DENIED_ENV: &[&str] = &[
     "CARGO_REGISTRY_TOKEN",
 ];
 
+/// The source every master wake (CAD-445) is queued under.
+pub const WAKE_SOURCE: &str = "wake";
+
+/// A master wake's `(kind, dedupe key)` for `event` about `key`
+/// (`blocker_done`, `D-3/D-2`) — see `daemon/master_wake.rs`.
+pub fn wake_key(event: &str, key: &str) -> (&'static str, String) {
+    (WAKE_SOURCE, format!("{event}/{key}"))
+}
+
+/// The message id the master's wake for `(event, key)` is queued under.
+pub fn wake_id(event: &str, key: &str) -> String {
+    let (kind, key) = wake_key(event, key);
+    crate::proto::daemon_message_id(kind, &key)
+}
+
 pub fn is_master(alias: &str) -> bool {
     alias == ALIAS
 }

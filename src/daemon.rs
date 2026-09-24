@@ -28,6 +28,7 @@ use uuid::Uuid;
 mod caller_rule;
 mod delivery_rpc;
 mod master_rpc;
+mod master_wake;
 
 /// CAD-339: the daemon methods a master connection may call.
 pub use master_rpc::MASTER_ALLOWED;
@@ -528,6 +529,9 @@ pub struct Shared {
     delivery_lock: Mutex<()>,
     /// The actor's empty-queue poll — the backstop behind its wake.
     idle_poll: Duration,
+    /// CAD-445: serialises `<state>/master-wakes.json` (blocker epochs,
+    /// tickets a plan-approved wake already named).
+    wake_lock: Mutex<()>,
 }
 
 impl Shared {
@@ -599,6 +603,7 @@ impl Shared {
             escalation_lock: Mutex::new(()),
             dispatch_lock: Mutex::new(()),
             delivery_lock: Mutex::new(()),
+            wake_lock: Mutex::new(()),
             auto_stop: AutoStopTimer::new(opts.auto_stop.clone(), opts.auto_stop_clock.clone()),
             idle_poll: opts.idle_poll.unwrap_or(IDLE_POLL),
         });
@@ -3828,7 +3833,12 @@ impl Shared {
     /// caller with no agent identity must be the proven operator
     /// (CAD-276). The decision is a tracker commit; approval moves the
     /// plan's backlog tickets to ready.
-    fn rpc_plan_decide(&self, params: &Value, peer_pid: u32, approve: bool) -> Result<Value> {
+    fn rpc_plan_decide(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+        approve: bool,
+    ) -> Result<Value> {
         let verb = if approve {
             "plan approve"
         } else {
@@ -3850,6 +3860,10 @@ impl Shared {
             "plan_rejected"
         };
         let _ = self.store.event_public(DAEMON_ALIAS, kind, out.clone());
+        // CAD-445: the approved tickets are the master's to dispatch now.
+        if approve {
+            self.wake_on_plan_approved(&out);
+        }
         self.wake();
         Ok(out)
     }
