@@ -37588,6 +37588,11 @@ fn seed_board(pm: &Path, state: &Path) {
 /// test took the port) retries on a fresh one; the probe's `Host`
 /// names the port, so only OUR server answers 200.
 fn start_board(pm: &Path, state: &Path) -> u16 {
+    start_board_with(pm, state, false)
+}
+
+/// [`start_board`], optionally serving read-only (`--read-only`).
+fn start_board_with(pm: &Path, state: &Path, read_only: bool) -> u16 {
     use std::io::Read;
     let overall = Instant::now() + Duration::from_secs(20);
     loop {
@@ -37601,6 +37606,7 @@ fn start_board(pm: &Path, state: &Path) -> u16 {
             let opts = cadence_agent::ui::ServeOpts {
                 host: "127.0.0.1".to_string(),
                 port,
+                read_only,
                 ..Default::default()
             };
             let _ = cadence_agent::ui::serve(&sd, &pd, &opts);
@@ -39823,6 +39829,291 @@ fn cad319_thread_post_is_refused_for_an_agent_caller() {
         .unwrap_or_else(|| panic!("no peer entry in {page}"));
     assert_eq!(peer["role"], "system", "{peer}");
     assert_eq!(peer["payload"]["from"], "wk", "{peer}");
+}
+
+/// A raw board POST to `path` with `headers` (each `Name: value\r\n`).
+fn cad328_post(port: u16, path: &str, headers: &str, body: &str) -> String {
+    format!(
+        "POST {path} HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n{headers}\
+         Content-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// CAD-328: `POST /api/plans/<epic>/approve|reject` relays the daemon's
+/// operator-only plan RPCs behind the board's write path. Every refusal
+/// — a missing write guard, a read-only board, a reject without a
+/// reason, an identity-shaped field, an agent caller (403) — writes
+/// nothing: no tracker commit, the plan stays proposed. The operator's
+/// approve and reject land, and a decided plan is not decided again.
+#[test]
+fn cad328_plan_endpoints_guards_agents_and_decisions() {
+    let f = PlanFixture::start();
+    let out = f.propose(PLAN_MD).unwrap();
+    let epic = out["epic"].as_str().unwrap().to_string();
+    let port = start_board(&f.pm_dir, &f.d.state);
+    let approve = format!("/api/plans/{epic}/approve");
+    let reject = format!("/api/plans/{epic}/reject");
+    let before = f.commits();
+    let untouched = |what: &str| {
+        assert_eq!(f.commits(), before, "{what}: a refusal writes nothing");
+        assert_eq!(f.front(&epic).plan.unwrap().state, "proposed", "{what}");
+        assert!(f.daemon_events("plan_approved").is_empty(), "{what}");
+        assert!(f.daemon_events("plan_rejected").is_empty(), "{what}");
+    };
+
+    // The board's write guards.
+    for (headers, check) in [
+        ("Content-Type: application/json\r\n", "x_cadence_board"),
+        ("Content-Type: text/plain\r\nX-Cadence-Board: 1\r\n", "content_type"),
+        (
+            "Content-Type: application/json\r\nX-Cadence-Board: 1\r\nOrigin: http://evil.example\r\n",
+            "origin",
+        ),
+        (
+            "Content-Type: application/json\r\nX-Cadence-Board: 1\r\nSec-Fetch-Site: cross-site\r\n",
+            "sec_fetch_site",
+        ),
+    ] {
+        let (status, reply) = board_http(port, &cad328_post(port, &approve, headers, "{}"));
+        assert_eq!(status, 403, "{check}: {reply}");
+        assert!(reply.contains(check), "{check}: {reply}");
+    }
+    untouched("guards");
+
+    // A read-only board refuses before anything else.
+    let ro = start_board_with(&f.pm_dir, &f.d.state, true);
+    let (status, reply) = board_http(ro, &cad328_post(ro, &approve, THREAD_GUARDS, "{}"));
+    assert_eq!(status, 403, "{reply}");
+    assert!(reply.contains("read_only"), "{reply}");
+    untouched("read-only");
+
+    // Reject needs a reason; no identity-shaped field is read; unknown
+    // verbs and methods are not routes.
+    let (status, reply) = board_http(port, &cad328_post(port, &reject, THREAD_GUARDS, "{}"));
+    assert_eq!(status, 400, "{reply}");
+    assert!(reply.contains("reason_required"), "{reply}");
+    let (status, _) = board_http(
+        port,
+        &cad328_post(port, &reject, THREAD_GUARDS, r#"{"reason":"   "}"#),
+    );
+    assert_eq!(status, 400);
+    for body in [
+        r#"{"by":"operator"}"#,
+        r#"{"actor":"operator"}"#,
+        r#"{"reason":"x","alias":"master"}"#,
+    ] {
+        let path = if body.contains("reason") {
+            &reject
+        } else {
+            &approve
+        };
+        let (status, reply) = board_http(port, &cad328_post(port, path, THREAD_GUARDS, body));
+        assert_eq!(status, 400, "{body}: {reply}");
+    }
+    let (status, _) = board_http(
+        port,
+        &cad328_post(
+            port,
+            &format!("/api/plans/{epic}/merge"),
+            THREAD_GUARDS,
+            "{}",
+        ),
+    );
+    assert_eq!(status, 404);
+    let (status, _) = board_http(
+        port,
+        &cad328_post(port, "/api/plans/not-an-id/approve", THREAD_GUARDS, "{}"),
+    );
+    assert_eq!(status, 400);
+    untouched("bad requests");
+
+    // An agent-attributed caller (a managed endpoint's tool process) is
+    // refused with 403 for both verbs.
+    let mut wk = ManagedWorker::start(&f.d, "wk");
+    for (path, body) in [(&approve, "{}"), (&reject, r#"{"reason":"agent says"}"#)] {
+        let request = cad328_post(port, path, THREAD_GUARDS, body);
+        let r = wk.exec(&[
+            "bash",
+            "-c",
+            DEV_TCP_CLIENT,
+            "_",
+            &port.to_string(),
+            &request,
+        ]);
+        assert_eq!(r["rc"], 0, "{r}");
+        let out = r["out"].as_str().unwrap();
+        assert!(out.contains(" 403 "), "{out}");
+        assert!(out.contains("operator_only"), "{out}");
+        assert!(out.contains("'wk'"), "{out}");
+    }
+    untouched("agent caller");
+
+    // The operator approves: tickets → ready, one commit, the daemon's
+    // event; approving again is a conflict that writes nothing.
+    let (status, reply) = board_http(
+        port,
+        &cad328_post(
+            port,
+            &approve,
+            &format!("{THREAD_GUARDS}Origin: http://127.0.0.1:{port}\r\n"),
+            "{}",
+        ),
+    );
+    assert_eq!(status, 200, "{reply}");
+    let decided: Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(decided["state"], "approved", "{decided}");
+    assert_eq!(f.commits(), before + 1);
+    let plan = f.front(&epic).plan.unwrap();
+    assert_eq!(
+        (plan.state.as_str(), plan.decided_by.as_deref()),
+        ("approved", Some("operator"))
+    );
+    assert_eq!(f.daemon_events("plan_approved").len(), 1);
+    let (status, reply) = board_http(port, &cad328_post(port, &approve, THREAD_GUARDS, "{}"));
+    assert_eq!(status, 409, "{reply}");
+    assert_eq!(
+        f.commits(),
+        before + 1,
+        "a repeated decision writes nothing"
+    );
+
+    // Reject with a reason: recorded on the plan.
+    let out = f
+        .propose("---\ntitle: Later\ngoal: g\n---\n## Only\n### Acceptance\n- [ ] a\n")
+        .unwrap();
+    let later = out["epic"].as_str().unwrap().to_string();
+    let (status, reply) = board_http(
+        port,
+        &cad328_post(
+            port,
+            &format!("/api/plans/{later}/reject"),
+            THREAD_GUARDS,
+            r#"{"reason":"not this quarter"}"#,
+        ),
+    );
+    assert_eq!(status, 200, "{reply}");
+    let plan = f.front(&later).plan.unwrap();
+    assert_eq!(
+        (plan.state.as_str(), plan.reason.as_deref()),
+        ("rejected", Some("not this quarter"))
+    );
+}
+
+/// CAD-328: `POST /api/issues/<id>/answers` files an `answer` report
+/// (CAD-341) on an open question, authored `operator` whatever the
+/// request says; the question is then closed. Refusals — the write
+/// guards, a read-only board, an agent caller (403), a question that is
+/// not on the ticket, an identity-shaped field — write nothing.
+#[test]
+fn cad328_answer_endpoint_files_an_operator_answer() {
+    let f = PlanFixture::start();
+    let (ok, out) = f.cli(&["issue", "new", "Cron cadence", "--project", "demo"]);
+    assert!(ok, "{out}");
+    let id = out["id"].as_str().unwrap().to_string();
+    let q = f.tmp.path().join("q.md");
+    std::fs::write(
+        &q,
+        task_report_text("options: [hourly, every 15 minutes]\nimpact: sets the cost\n"),
+    )
+    .unwrap();
+    let (ok, out) = f.cli(&[
+        "report",
+        "file",
+        "--task",
+        &id,
+        "--kind",
+        "question",
+        "--file",
+        q.to_str().unwrap(),
+    ]);
+    assert!(ok, "{out}");
+    let (_, show) = f.cli(&["issue", "show", &id, "--json"]);
+    let question = show["reports"][0]["name"].as_str().unwrap().to_string();
+    assert_eq!(show["reports"][0]["open"], true, "{show}");
+    let reports = f.pm_dir.join("demo").join(&id).join("reports");
+    let count = || std::fs::read_dir(&reports).unwrap().count();
+    let before = (f.commits(), count());
+    let path = format!("/api/issues/{id}/answers");
+    let body = format!(r#"{{"question":"{question}","text":"hourly"}}"#);
+    let untouched = |what: &str| {
+        assert_eq!(
+            (f.commits(), count()),
+            before,
+            "{what}: a refusal writes nothing"
+        );
+    };
+
+    let port = start_board(&f.pm_dir, &f.d.state);
+    for (headers, check) in [
+        ("Content-Type: application/json\r\n", "x_cadence_board"),
+        (
+            "Content-Type: text/plain\r\nX-Cadence-Board: 1\r\n",
+            "content_type",
+        ),
+    ] {
+        let (status, reply) = board_http(port, &cad328_post(port, &path, headers, &body));
+        assert_eq!(status, 403, "{check}: {reply}");
+        assert!(reply.contains(check), "{check}: {reply}");
+    }
+    let ro = start_board_with(&f.pm_dir, &f.d.state, true);
+    let (status, reply) = board_http(ro, &cad328_post(ro, &path, THREAD_GUARDS, &body));
+    assert_eq!(status, 403, "{reply}");
+    assert!(reply.contains("read_only"), "{reply}");
+    for bad in [
+        r#"{"question":"nope.md","text":"hourly"}"#.to_string(),
+        format!(r#"{{"question":"{question}","text":"  "}}"#),
+        format!(r#"{{"question":"{question}","text":"hourly","agent":"wk"}}"#),
+        format!(r#"{{"question":"{question}","text":"hourly","by":"master"}}"#),
+        format!(r#"{{"question":"../{question}","text":"hourly"}}"#),
+    ] {
+        let (status, reply) = board_http(port, &cad328_post(port, &path, THREAD_GUARDS, &bad));
+        assert_eq!(status, 400, "{bad}: {reply}");
+    }
+    untouched("bad requests");
+
+    let mut wk = ManagedWorker::start(&f.d, "wk");
+    let request = cad328_post(port, &path, THREAD_GUARDS, &body);
+    let r = wk.exec(&[
+        "bash",
+        "-c",
+        DEV_TCP_CLIENT,
+        "_",
+        &port.to_string(),
+        &request,
+    ]);
+    assert_eq!(r["rc"], 0, "{r}");
+    let out = r["out"].as_str().unwrap();
+    assert!(out.contains(" 403 "), "{out}");
+    assert!(out.contains("operator_only"), "{out}");
+    untouched("agent caller");
+
+    // The operator's answer: one report, authored operator, the question
+    // closed; the reply carries the fresh issue detail.
+    let (status, reply) = board_http(port, &cad328_post(port, &path, THREAD_GUARDS, &body));
+    assert_eq!(status, 201, "{reply}");
+    let v: Value = serde_json::from_str(&reply).unwrap();
+    let rows = v["issue"]["reports"].as_array().unwrap();
+    let answer = rows
+        .iter()
+        .find(|r| r["kind"] == "answer")
+        .unwrap_or_else(|| panic!("no answer in {v}"));
+    assert_eq!(answer["agent"], "operator", "{answer}");
+    assert_eq!(answer["answers"], question.as_str(), "{answer}");
+    assert_eq!(
+        answer["body"].as_str().unwrap().trim(),
+        "hourly",
+        "{answer}"
+    );
+    let asked = rows.iter().find(|r| r["kind"] == "question").unwrap();
+    assert_eq!(asked["open"], false, "{asked}");
+    assert_eq!(f.commits(), before.0 + 1);
+    assert_eq!(count(), before.1 + 1);
+    assert!(
+        f.last_commit().contains("report answer by operator"),
+        "{}",
+        f.last_commit()
+    );
 }
 
 /// Review round 1: a `thread_send` the queue refuses (48 001 bytes, empty
