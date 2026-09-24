@@ -389,14 +389,23 @@ fn measure(port: u16, label: &str) -> Vec<(&'static str, Duration)> {
     report
 }
 
-/// The read model's cost meters for the fixture's board.
+/// The read model's cost meters for the fixture's board: folders parsed
+/// and the overview builds a read waited on. Background refreshes are
+/// left out — they run every 2 s of wall time, so their count depends on
+/// how fast the runner is, not on whether the cache serves.
 fn stats(fx: &Fixture) -> (u64, u64) {
     let s = ui::read_model_stats(&fx.state, &fx.pm);
     (
         s["parses"].as_u64().unwrap(),
-        s["overview_builds"].as_u64().unwrap(),
+        s["request_builds"].as_u64().unwrap(),
     )
 }
+
+/// Request-path builds allowed per run of reads against a warm, unchanged
+/// board. Zero is the steady state; one more covers a background refresh
+/// that overran the 10 s age cap on a loaded runner. Without the cache
+/// every read builds.
+const REQUEST_BUILDS_MAX: u64 = 2;
 
 #[test]
 fn board_reads_p95_under_budget_on_a_400_issue_tracker() {
@@ -405,8 +414,8 @@ fn board_reads_p95_under_budget_on_a_400_issue_tracker() {
     // No stream open: every read fetches the daemon snapshot itself.
     let mut report = measure(port, "no stream");
     // The caches the timings rest on, asserted directly: an unchanged
-    // tracker is never re-parsed, and back-to-back overview reads share
-    // builds (a background refresh past 2 s may add one or two).
+    // tracker is never re-parsed, and overview reads are served from the
+    // cache — a read waits on a build at most REQUEST_BUILDS_MAX times.
     let (parses, builds) = stats(&fx);
     assert!(
         parses >= ISSUES as u64,
@@ -423,8 +432,8 @@ fn board_reads_p95_under_budget_on_a_400_issue_tracker() {
         "an unchanged tracker is never re-parsed"
     );
     assert!(
-        builds_after - builds <= (SAMPLES / 4) as u64,
-        "{} overview builds for {SAMPLES} reads — the overview cache is not serving",
+        builds_after - builds <= REQUEST_BUILDS_MAX,
+        "{} overview reads of {SAMPLES} waited on a build — the overview cache is not serving",
         builds_after - builds
     );
     // Two open board tabs, as on the live host: the shared watcher keeps
@@ -776,7 +785,7 @@ fn overview_cache_holds_while_an_agent_runs_a_turn() {
     let (_, builds_after) = stats(&fx);
     let p = p95(samples);
     eprintln!(
-        "running turn /api/overview: p95 {p:?}, {} builds for {SAMPLES} reads",
+        "running turn /api/overview: p95 {p:?}, {} request-path builds for {SAMPLES} reads",
         builds_after - builds
     );
     let ticked = frames(&stream, "agents").len() - agents_frames;
@@ -785,8 +794,8 @@ fn overview_cache_holds_while_an_agent_runs_a_turn() {
         "{ticked} legacy agents frames in ~5 s while only clocks moved"
     );
     assert!(
-        builds_after - builds <= (SAMPLES / 4) as u64,
-        "{} overview builds for {SAMPLES} reads while an agent runs a turn",
+        builds_after - builds <= REQUEST_BUILDS_MAX,
+        "{} overview reads of {SAMPLES} waited on a build while an agent runs a turn",
         builds_after - builds
     );
     assert!(p < P95_BUDGET, "running-turn overview p95 {p:?}");

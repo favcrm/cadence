@@ -87,6 +87,7 @@ pub(super) fn get(state_dir: &Path, pm_dir: &Path) -> Arc<Model> {
                 changed_at: Mutex::default(),
                 build_lock: Mutex::default(),
                 overview_builds: AtomicU64::new(0),
+                request_builds: AtomicU64::new(0),
             })
         })
         .clone()
@@ -106,6 +107,9 @@ pub(super) struct Model {
     /// One overview build at a time; other readers wait for its result.
     build_lock: Mutex<()>,
     overview_builds: AtomicU64,
+    /// The builds a read waited on — the cache missed. Background
+    /// refreshes are not counted here: they scale with wall time.
+    request_builds: AtomicU64,
 }
 
 /// Runs its closure on drop — resets a flag even when a panic unwinds.
@@ -427,10 +431,22 @@ fn rows_fp(rows: &Value) -> Value {
 /// outcomes and task bindings) and `agent_list` with each actor's board
 /// slice. An older daemon still answers — through the per-job and
 /// per-agent fallbacks in [`agents_payload_from`].
+///
+/// The three calls run concurrently: each daemon connection can wait up
+/// to one 50 ms accept poll before it is served, so in sequence they
+/// cost that wait three times over.
 fn fetch_daemon(state_dir: &Path) -> DaemonSnap {
     let at = Instant::now();
-    let jobs = board_job_list(state_dir);
-    let list = client::rpc(state_dir, "agent_list", json!({"board": true})).ok();
+    let (jobs, list, approvals) = std::thread::scope(|s| {
+        let jobs = s.spawn(|| board_job_list(state_dir));
+        let list = s.spawn(|| client::rpc(state_dir, "agent_list", json!({"board": true})).ok());
+        let approvals = s.spawn(|| work::fetch_approvals(state_dir));
+        (
+            jobs.join().unwrap_or_default(),
+            list.join().unwrap_or_default(),
+            approvals.join().unwrap_or_default(),
+        )
+    });
     let agents = agents_payload_from(state_dir, list.clone(), jobs.as_ref());
     let agents_fp =
         list.map(|l| value_fp(&json!([rows_fp(&l["agents"]), rows_fp(&agents["agents"])])));
@@ -444,7 +460,7 @@ fn fetch_daemon(state_dir: &Path) -> DaemonSnap {
         jobs_fp: jobs.as_ref().map(value_fp),
         agents,
         agents_fp,
-        approvals: Arc::new(work::fetch_approvals(state_dir)),
+        approvals: Arc::new(approvals),
     }
 }
 
@@ -558,11 +574,13 @@ impl Model {
         }
     }
 
-    /// Cost meters for tests: folders parsed and overview builds so far.
+    /// Cost meters for tests: folders parsed, overview builds, and the
+    /// builds a read waited on (the cache missed) — so far.
     pub(super) fn stats(&self) -> Value {
         json!({
             "parses": lock(&self.tracker).parses,
             "overview_builds": self.overview_builds.load(Ordering::Relaxed),
+            "request_builds": self.request_builds.load(Ordering::Relaxed),
         })
     }
 
@@ -705,6 +723,7 @@ impl Model {
         } else {
             Duration::ZERO
         };
+        self.request_builds.fetch_add(1, Ordering::Relaxed);
         let value = self.compose(&views, &sources, gh_wait);
         self.keep_overview(&value, at, key);
         value

@@ -2848,7 +2848,8 @@ fn setup_get(state_dir: &Path, pm_dir: &Path, port: u16, fresh: bool) -> HttpRes
     }))
 }
 
-/// The board read model's cost meters (`parses`, `overview_builds`) for
+/// The board read model's cost meters (`parses`, `overview_builds`,
+/// `request_builds`) for
 /// one `(state dir, PM dir)` — what the CAD-325 bench asserts the caches
 /// by. Test support; the board serves no route for it.
 #[doc(hidden)]
