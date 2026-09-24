@@ -35,6 +35,7 @@ use crate::proc::{self, BoundedError};
 
 mod home;
 mod read_model;
+mod stages;
 mod threads;
 
 /// The options `ui run` and `ui start` share. Every field is optional:
@@ -1830,6 +1831,17 @@ fn write_route(
         send(request, resp);
         return;
     }
+    // An epic stage move (CAD-432) — relayed to the daemon's
+    // `epic_stage`, operator-only on the board (see `stages`).
+    if let Some(epic) = stages::stage_route(path) {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let resp = stages::move_stage(&mut request, state_dir, opts, epic);
+        send(request, resp);
+        return;
+    }
     if let Some(id) = home::answer_route(path) {
         if *method != Method::Post {
             send(request, err_response(405, "method not allowed"));
@@ -2361,12 +2373,19 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
         "/api/meta" => {
             let daemon = client::rpc(state_dir, "daemon_info", json!({})).ok();
             let (actor, tailnet_proof) = request_identity(&request, opts);
+            // CAD-432: may this client make the operator's board
+            // decisions — the same proof those writes run. It walks
+            // /proc, so it is computed only when asked (`?operator=1`,
+            // once per page load), never on the 30 s poll.
+            let operator = matches!(query("operator").as_deref(), Some("1" | "true"))
+                .then(|| home::operator_viewer(&request, state_dir, opts));
             send(
                 request,
                 json_response(json!({
                     "read_only": opts.read_only,
                     "actor": actor,
                     "tailnet_proof": tailnet_proof,
+                    "operator": operator,
                     "tailnet_url": opts
                         .tailnet
                         .as_ref()
@@ -2513,6 +2532,10 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
             }
             Err(e) => send(request, err_response(503, &e.to_string())),
         },
+        "/api/milestones" => send(
+            request,
+            stages::milestones(state_dir, pm_dir, query("project").as_deref()),
+        ),
         "/api/agents" => send(
             request,
             json_response(read_model::get(state_dir, pm_dir).agents()),

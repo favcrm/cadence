@@ -996,18 +996,7 @@ pub fn move_stage(
              (`cadence issue set {epic} type=epic` makes it one)"
         )));
     }
-    if let Some(plan) = &front.plan {
-        if plan.state != "approved" {
-            return Err(Error::invalid(
-                "plan_not_approved",
-                format!(
-                    "{epic} is a {} plan — its stage follows the plan: \
-                     `cadence plan approve {epic}` moves it to build",
-                    plan.state
-                ),
-            ));
-        }
-    }
+    work::plan_allows_moves(&front)?;
     let cur = work::stage_of(&front, &cfg, view.status == "done");
     let mv = work::check_move(&cfg, &cur, to, work::floor(&front, &cfg))?;
     let by = authorize(&mv)?;

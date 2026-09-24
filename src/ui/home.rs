@@ -84,7 +84,7 @@ pub(super) fn answer_route(path: &str) -> Option<&str> {
 /// enough here, because the daemon checks the board's own connection
 /// and would accept whatever the board relays. Returns the operator's
 /// actor.
-fn operator_write(
+pub(super) fn operator_write(
     request: &Request,
     state_dir: &std::path::Path,
     opts: &ServeOpts,
@@ -110,6 +110,57 @@ fn operator_write(
             ),
         )),
     }
+}
+
+/// Whether this client may make the operator's board decisions — what
+/// `/api/meta` reports so the UI offers them only to the operator. The
+/// same checks as [`operator_write`] minus the browser write guards: a
+/// writable board, a caller tied to no agent, and the positive proof.
+/// Anything unprovable is `false`. The UI's answer is a courtesy; every
+/// write still runs the full check.
+///
+/// The board relays decisions over its OWN daemon connection, so the
+/// board process must be the operator's too ([`board_is_operator`]): a
+/// board an agent started would have the daemon refuse every relayed
+/// decision, and shows no buttons.
+///
+/// TODO(CAD-313): once the web UI has an operator session, require it
+/// here as well.
+pub(super) fn operator_viewer(
+    request: &Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+) -> bool {
+    !opts.read_only
+        && matches!(
+            write_caller(request, state_dir, opts),
+            Ok(WriteCaller::Operator(_))
+        )
+        && prove_operator_peer(request, state_dir, opts, "reading the operator role").is_ok()
+        && board_is_operator(state_dir)
+}
+
+/// The board process itself passes the operator proof the daemon will
+/// run on its connection ([`crate::peer::operator_proof`]): no pane or
+/// managed provider on its ancestry, not a daemon descendant, no agent
+/// environment, a session leader on its ancestry. Unprovable is false.
+fn board_is_operator(state_dir: &std::path::Path) -> bool {
+    let Some(daemon_pid) = client::rpc(state_dir, "health", json!({}))
+        .ok()
+        .and_then(|h| h["pid"].as_u64())
+        .and_then(|p| u32::try_from(p).ok())
+    else {
+        return false;
+    };
+    let Ok(roots) = agent_roots(state_dir) else {
+        return false;
+    };
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    crate::peer::operator_proof(std::process::id(), uid, daemon_pid, &roots.panes, |hop| {
+        roots.managed.contains_key(&hop)
+    })
+    .is_ok()
 }
 
 /// CAD-276's positive operator proof, run on the board's TCP peer — the
@@ -158,7 +209,7 @@ fn prove_operator_peer(
 }
 
 /// Daemon error → HTTP for the relayed operator RPCs.
-fn rpc_err(e: &Error, method: &str) -> HttpResp {
+pub(super) fn rpc_err(e: &Error, method: &str) -> HttpResp {
     let text = e.to_string();
     if text.starts_with("Daemon is not reachable") {
         return coded_response(503, "daemon_unavailable", &text, None);

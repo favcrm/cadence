@@ -8,6 +8,8 @@ import { readAppUrlState, type AppTab, type ProjectView } from "./urlState";
  *   /                          Home — the master's thread (CAD-328)
  *   /overview                  the team overview (needs, drift, monitors)
  *   /projects[/:slug]          a project's issues (board or list)
+ *   /projects/:slug/epics      its epics: stage, progress, health (CAD-432)
+ *   /projects/:slug/milestones its milestones: progress, worst health
  *   /projects/:slug/context    its context and plan
  *   /agents[/:alias]           agents, optionally one agent's drawer
  *   /setup                     first-run setup
@@ -20,7 +22,7 @@ import { readAppUrlState, type AppTab, type ProjectView } from "./urlState";
  * so routing is unit-tested in plain node (tests/router.test.ts).
  */
 
-export type ProjectSection = "issues" | "context";
+export type ProjectSection = "issues" | "epics" | "milestones" | "context";
 export type SettingsSection = "models" | "memory";
 
 export type Route =
@@ -70,7 +72,9 @@ export function matchRoute(pathname: string): Route {
       if (!a) return { screen: "projects", slug: null, section: "issues" };
       const slug = segment(a);
       if (slug && !b) return { screen: "projects", slug, section: "issues" };
-      if (slug && b === "context") return { screen: "projects", slug, section: "context" };
+      if (slug && (b === "context" || b === "epics" || b === "milestones")) {
+        return { screen: "projects", slug, section: b };
+      }
     }
     if (head === "agents" && !b) {
       if (!a) return { screen: "agents", alias: null };
@@ -94,7 +98,7 @@ export function routePath(route: Route): string {
     case "projects": {
       if (!route.slug) return "/projects";
       const base = `/projects/${encodeURIComponent(route.slug)}`;
-      return route.section === "context" ? `${base}/context` : base;
+      return route.section === "issues" ? base : `${base}/${route.section}`;
     }
     case "agents":
       return route.alias ? `/agents/${encodeURIComponent(route.alias)}` : "/agents";

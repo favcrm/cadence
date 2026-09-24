@@ -510,6 +510,46 @@ pub fn check_move(cfg: &WorkConfig, cur: &StageState, to: &str, floor: usize) ->
     })
 }
 
+/// A plan that is not approved owns its epic's stage: no move, by
+/// anyone — the one rule [`crate::issue::write::move_stage`] and
+/// [`legal_moves`] share.
+pub fn plan_allows_moves(front: &Front) -> Result<()> {
+    match &front.plan {
+        Some(plan) if plan.state != "approved" => Err(Error::invalid(
+            "plan_not_approved",
+            format!(
+                "{} is a {} plan — its stage follows the plan: \
+                 `cadence plan approve {}` moves it to build",
+                front.id, plan.state, front.id
+            ),
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Every stage `epic_stage` would accept from `cur` right now —
+/// [`check_move`] over the whole list, so a view offers exactly the
+/// moves the writer allows and never re-derives the rule. A plan that
+/// is not approved owns the stage: no moves (`move_stage` refuses them).
+/// `needs_operator` marks the moves only the proven operator may make.
+pub fn legal_moves(front: &Front, cfg: &WorkConfig, cur: &StageState) -> Vec<Value> {
+    if plan_allows_moves(front).is_err() {
+        return vec![];
+    }
+    let floor = floor(front, cfg);
+    cfg.stages
+        .iter()
+        .filter_map(|s| check_move(cfg, cur, &s.id, floor).ok())
+        .map(|mv| {
+            json!({
+                "to": mv.to,
+                "forward": mv.forward,
+                "needs_operator": mv.needs_operator,
+            })
+        })
+        .collect()
+}
+
 /// One project's work settings as a render uses them.
 #[derive(Clone, Debug)]
 pub struct ProjectWork {
@@ -735,6 +775,12 @@ pub fn item_json(ctx: &Ctx, view: &View) -> Value {
             "next_needs_operator": next.as_ref().is_some_and(|n| cfg.operator_stages.contains(n)),
             "terminal": stage.terminal,
             "stages": cfg.stage_ids(),
+            // A PROJECT.md the writer cannot load refuses every move.
+            "moves": if ctx.work(&view.issue.project).is_some_and(|w| w.error.is_some()) {
+                vec![]
+            } else {
+                legal_moves(f, cfg, &stage)
+            },
         });
         out["progress"] = progress_json(&kids);
         out["health"] = health_json(view, &stage, cfg, &kids, ctx.now);
@@ -1276,6 +1322,107 @@ mod tests {
             assert!(err.contains(want), "{from}→{to}: {err}");
         }
         assert!(!check_move(&cfg, &at("limbo"), "shape", 0).unwrap().forward);
+    }
+
+    /// CAD-432: the board offers exactly the moves `check_move` accepts
+    /// — one step forward, any step back to the floor — with the
+    /// operator flag the writer applies; a plan that is not approved
+    /// offers none.
+    #[test]
+    fn legal_moves_mirror_check_move() {
+        let cfg = WorkConfig::default();
+        let moves = |f: &Front, done: bool| -> Vec<(String, bool, bool)> {
+            legal_moves(f, &cfg, &stage_of(f, &cfg, done))
+                .iter()
+                .map(|m| {
+                    (
+                        m["to"].as_str().unwrap().to_string(),
+                        m["forward"].as_bool().unwrap(),
+                        m["needs_operator"].as_bool().unwrap(),
+                    )
+                })
+                .collect()
+        };
+        let own = |s: &str| (s.to_string(), false, false);
+        let mut f = Front::new("CAD-1", "e", "2026-09-01T00:00:00Z");
+        assert_eq!(moves(&f, false), vec![("build".to_string(), true, true)]);
+        f.stage = Some("verify".into());
+        assert_eq!(
+            moves(&f, false),
+            vec![
+                own("shape"),
+                own("build"),
+                ("release".to_string(), true, true)
+            ]
+        );
+        f.stage = Some("build".into());
+        assert_eq!(
+            moves(&f, false),
+            vec![own("shape"), ("verify".to_string(), true, false)]
+        );
+        f.stage = Some("done".into());
+        assert_eq!(
+            moves(&f, false),
+            vec![own("shape"), own("build"), own("verify"), own("release")]
+        );
+        // A done epic never moved: every move out is the operator's.
+        let derived = Front::new("CAD-2", "e", "2026-09-01T00:00:00Z");
+        assert!(moves(&derived, true).iter().all(|(_, fwd, op)| !fwd && *op));
+        // An approved plan owns the first stage; an unapproved one owns
+        // the stage outright.
+        let mut p = Front::new("CAD-3", "e", "2026-09-01T00:00:00Z");
+        p.plan = Some(model::Plan {
+            state: "approved".into(),
+            proposed_by: "operator".into(),
+            proposed_at: "2026-09-01T00:00:00Z".into(),
+            tickets: vec![],
+            decided_by: Some("operator".into()),
+            decided_at: Some("2026-09-02T00:00:00Z".into()),
+            reason: None,
+        });
+        assert_eq!(moves(&p, false), vec![("verify".to_string(), true, false)]);
+        for state in ["proposed", "rejected"] {
+            p.plan.as_mut().unwrap().state = state.into();
+            assert!(moves(&p, false).is_empty(), "{state}");
+        }
+    }
+
+    /// CAD-432 review: a PROJECT.md the writer cannot load refuses every
+    /// move, so the card offers none; a plan that is not approved is the
+    /// same shared rule the writer applies.
+    #[test]
+    fn no_moves_on_a_broken_project_md_or_unapproved_plan() {
+        let mut epic = issue("CAD-1", "backlog");
+        epic.front.item_type = Some("epic".into());
+        epic.front.stage = Some("build".into());
+        let vs = views(Path::new("/nonexistent"), vec![epic]);
+        let by_id: HashMap<String, &View> =
+            vs.iter().map(|v| (v.issue.front.id.clone(), v)).collect();
+        let mut ctx = ctx_for(&by_id);
+        let moves = |ctx: &Ctx| item_json(ctx, &vs[0])["stage"]["moves"].clone();
+        assert_eq!(moves(&ctx).as_array().unwrap().len(), 2, "{}", moves(&ctx));
+        ctx.configs.insert(
+            "cadence".into(),
+            ProjectWork {
+                cfg: WorkConfig::default(),
+                error: Some("PROJECT.md frontmatter: bad".into()),
+                unapproved: None,
+            },
+        );
+        assert_eq!(moves(&ctx), json!([]));
+        let mut f = Front::new("CAD-2", "e", "2026-09-01T00:00:00Z");
+        assert!(plan_allows_moves(&f).is_ok());
+        f.plan = Some(model::Plan {
+            state: "proposed".into(),
+            proposed_by: "operator".into(),
+            proposed_at: "2026-09-01T00:00:00Z".into(),
+            tickets: vec![],
+            decided_by: None,
+            decided_at: None,
+            reason: None,
+        });
+        let err = plan_allows_moves(&f).unwrap_err().to_string();
+        assert!(err.contains("CAD-2 is a proposed plan"), "{err}");
     }
 
     #[test]
