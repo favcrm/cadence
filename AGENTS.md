@@ -36,6 +36,12 @@ this workflow exactly.
   a new test that uses a name this PR reserves. Fix it on the branch,
   show a `git range-diff` against the reviewed head (only the rebase plus
   the fix), and enqueue it again.
+- Auto-merge survives a force-push. `--match-head-commit` is checked only
+  when auto-merge is enabled, so a later push goes into the queue
+  unreviewed. Before sending a PR with auto-merge on back for changes (a
+  rebase, a fix, another review round), run
+  `gh pr merge <n> -R favcrm/cadence --disable-auto`. Re-enable it, pinned
+  to the new head, only after that head passes review.
 - Use `--admin` only in a declared emergency, never as routine.
 
 ### Checks: trust exit codes, not filtered text
