@@ -796,7 +796,13 @@ server or anything else on `127.0.0.1`, `localhost` or
 sessions are opened and honoured on this Host only; on any other Host
 the board is sign-in-less and refuses writes. Opening
 it sets an HttpOnly, `SameSite=Strict` session cookie (`Secure` and
-`__Host-` on the https tailnet origin) valid 24 h idle, 7 days at most.
+`__Host-` on the https tailnet origin) valid 24 h idle, 7 days at most,
+and hands the page a second key it keeps in that tab's `sessionStorage`
+and sends as `X-Cadence-Session` on every request. The cookie alone is
+no session: a server on another port that receives it (cookies ignore
+ports) never has the key, and a cross-site page cannot set the header.
+A new tab signs in with a fresh link — the board tells it so. Links to
+this machine in agent-written markdown are shown, never clickable.
 The nonce rides in the URL fragment, which a browser never sends to a
 server, so it never reaches `ui.log`. The link is minted only for a
 caller that passes positive operator proof **and** presents the
@@ -1007,7 +1013,7 @@ exactly one git commit whose subject carries the actor:
 
 | Route | Body | Returns |
 |---|---|---|
-| `POST /api/session` | `{nonce}` — a `ui login` link's fragment. Write guards apply, the Host must be this board's own name (or the proven tailnet) and `Origin` this request's own; the link must be for this origin. The peer is attributed first: an agent, or a peer the board cannot attribute (its socket already closed), spends the link and gets nothing (`session_from_agent` / `caller_identity`); so does a board whose own daemon connection is an agent's (the daemon checks) | `204` + `Set-Cookie`; `403 login_link` naming `already_used`, `expired`, `wrong_origin` or `unknown`; `403 session_origin` on any other Host |
+| `POST /api/session` | `{nonce}` — a `ui login` link's fragment; answers `{session_key}` for the page. Write guards apply, the Host must be this board's own name (or the proven tailnet) and `Origin` this request's own; the link must be for this origin. The peer is attributed first: an agent, or a peer the board cannot attribute (its socket already closed), spends the link and gets nothing (`session_from_agent` / `caller_identity`); so does a board whose own daemon connection is an agent's (the daemon checks) | `200 {session_key}` + `Set-Cookie`; `403 login_link` naming `already_used`, `expired`, `wrong_origin` or `unknown`; `403 session_origin` on any other Host |
 | `POST /api/session/logout` | `{}` | `204`, the presenting session ended and its cookie cleared |
 | `POST /api/issues` | `{project, title, priority?, owner?, component?, tags?, parent?, blocked_by?}` | `201` |
 | `PATCH /api/issues/:id` | `{status?, priority?, owner?, component?, tags?, title?, body?, if_rev?}` — `""` clears owner/component; `tags` replaces the list (`[]` clears) under the CLI's validation; `body` replaces the markdown only | `200` |
@@ -1042,7 +1048,8 @@ fully buffered first.
 
 **Who is trusted as the operator (CAD-313, CAD-428).** Exactly one
 kind of request: one that presents a live **operator session** — the
-cookie a `cadence ui login` link was exchanged for — on the origin it
+cookie a `cadence ui login` link was exchanged for AND the page's
+session key in `X-Cadence-Session` (either alone is no session) — on the origin it
 was issued for (loopback on the board's own `cadence-<port>.localhost`
 name, or the proven `tailscale serve` proxy), with `Origin` equal to
 its own scheme and Host, from a peer tied to no agent (or another

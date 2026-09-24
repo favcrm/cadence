@@ -1,8 +1,10 @@
 //! Who the board trusts as the operator (CAD-313, CAD-428; ADR 0004
 //! phase 1). Exactly one thing makes a board request the operator's: a
 //! live **operator session** — an HttpOnly cookie the daemon issued in
-//! exchange for a single-use `cadence ui login` link — presented on the
-//! origin it was issued for, by a process tied to no agent. Nothing
+//! exchange for a single-use `cadence ui login` link, AND the page's
+//! session key in `X-Cadence-Session` ([`SESSION_HEADER`]; a cookie leaked
+//! to another port's listener is worthless without it) — presented on
+//! the origin it was issued for, by a process tied to no agent. Nothing
 //! else does: not a loopback peer, not a relay (nginx, `socat`, an
 //! agent's own proxy — the board sees the relay, never who is behind
 //! it), not a Host, not a `Tailscale-User-*` or `X-Forwarded-*` header,

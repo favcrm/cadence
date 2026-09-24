@@ -1028,8 +1028,44 @@ own Claude Code shell — an agent the operator started by hand, not
 registered with this daemon — and got a link with no evasion at all.
 Such a process can also read the secret. So in phase 1 the operator
 session keeps every cadence-launched agent and every detach of one
-(unless it also evades the proof) off operator authority, and stops
-relays, forged headers and cookie replays; it does not stop an
-unregistered same-uid agent that chooses to sign in. Phase 2 (CAD-280)
-must make the secret unreadable to every agent process tree, registered
-or not.
+(unless it also evades the proof) off operator authority, and refuses
+relays, forged headers, a cookie replayed without the page's session
+key, and a replay that hangs up early; it does not stop an unregistered
+same-uid agent that chooses to sign in. Nor does it stop a same-uid
+process that reads the operator browser's memory or profile when that
+browser runs on this host as this user, script on the board origin
+(XSS reads `sessionStorage`; the CSP and the sanitiser are
+load-bearing), or a same-uid process that captures the operator's
+terminal while `ui login` prints a link. Phase 2 (CAD-280) must make the
+secret unreadable to every agent process tree, registered or not.
+
+**Round 2 of the review (PR #249).**
+
+- **A session is two credentials.** The cookie reached an agent's
+  listener whenever the operator followed a link to
+  `cadence-<board port>.localhost:<other port>` (cookies ignore ports;
+  a cross-site navigation leaked it too, through the landing page's
+  favicon request), and a detached pane child replayed it as the
+  operator. Now the exchange also answers a second random key; the
+  SPA keeps it in the tab's `sessionStorage` (scoped to the exact
+  origin, port included) and sends it as `X-Cadence-Session` on every
+  request. The daemon stores only its hash beside the token's and
+  checks both in constant time; either alone is no session. A new tab
+  signs in with a fresh link (the board says so: `tab_signed_out`).
+- **Links to this machine are never clickable** in agent-written
+  markdown (`localhost`, `*.localhost`, `127.0.0.0/8`, `0.0.0.0`,
+  `::1`): they render as text with a warning. The renderer also uses
+  react-markdown's safe URL transform again for everything but
+  `issue:` ids.
+- **No empty-roots shortcut.** With no agent live, the board used to
+  read any peer as "tied to no agent" without looking at its socket; an
+  early-closed replay by the only agent, which then exited, committed
+  as `operator (ui)`. The client socket is now checked either way.
+- **Agent derivation (for CAD-412).** The board attributes its HTTP
+  peer with `peer::tcp_peer_agent` — pane ancestry OR a pane pty on
+  stdio, and managed-provider ancestry; several agents is an error.
+  The daemon's `slot_identity` / `connection_caller` attribute a socket
+  peer by the NEAREST registered pane or enrolled endpoint on the
+  ancestry, with no pty tie. Switching the board would need a daemon
+  verb that attributes an arbitrary pid (the HTTP peer is not the
+  daemon's socket peer); that is left to CAD-412.

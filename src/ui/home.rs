@@ -27,8 +27,8 @@
 //!
 //! 1. read-only off, and the cross-site guards (`write_guard`);
 //! 2. a live **operator session** ([`operator::board_caller`]): the
-//!    HttpOnly cookie a `cadence ui login` link was exchanged for,
-//!    presented on the origin it was issued for (this board's own
+//!    HttpOnly cookie a `cadence ui login` link was exchanged for plus
+//!    the page's `X-Cadence-Session` key, presented on the origin it was issued for (this board's own
 //!    `cadence-<port>.localhost` name, or the proven `tailscale serve`
 //!    proxy) with that origin's `Origin` header, by a peer tied to no
 //!    agent — or whose socket is another uid's proxy. No session is

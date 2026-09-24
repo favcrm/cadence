@@ -3,8 +3,9 @@
 //! serving the built SPA plus a JSON API on loopback.
 //!
 //! Reads need no auth; operator authority is a session (CAD-313, ADR
-//! 0004): a `cadence ui login` link exchanged for an HttpOnly cookie the
-//! daemon checks on every operator write — [`operator`] says exactly who
+//! 0004): a `cadence ui login` link exchanged for an HttpOnly cookie plus
+//! a page-held `X-Cadence-Session` key, both of which the daemon checks
+//! on every operator write — [`operator`] says exactly who
 //! is trusted as the operator, and no relay, header or missing pane tie
 //! ever is. The rest is containment: loopback bind, no CORS headers, a
 //! Host allowlist against DNS rebinding, id grammar checked before any
