@@ -60,6 +60,11 @@ pub const MASTER_ALLOWED: &[&str] = &[
     "delivery_list",
 ];
 
+/// What `master start --unconfined` tells the operator.
+pub const UNCONFINED_WARNING: &str = "the master runs UNCONFINED: no filesystem sandbox on this \
+     host, so it can read and write your files (ssh keys, forge logins, every repo) — its Bash \
+     allowlist is the only limit";
+
 /// Most reports one router pass queues to the master; the rest wait for
 /// the next pass and are counted as the routing backlog.
 const ROUTES_PER_PASS: usize = 5;
@@ -443,6 +448,49 @@ impl Shared {
                 ),
             ));
         }
+        // CAD-439: the master runs confined. On a host that cannot, it
+        // starts only with the operator's explicit `--unconfined`; that
+        // flag is refused where confinement works. Both refuse before
+        // anything is installed or registered.
+        let unconfined = params
+            .get("unconfined")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let copy = params
+            .get("copy_login")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if copy && unconfined {
+            return Err(Error::invalid(
+                "master_copy_login",
+                "--copy-login is for a confined master's own config dir; an unconfined \
+                 master uses the operator's Claude config as it is",
+            ));
+        }
+        match (
+            master::confinement_available(&self.provider_env),
+            unconfined,
+        ) {
+            (Ok(()), false) | (Err(_), true) => {}
+            (Ok(()), true) => {
+                return Err(Error::invalid(
+                    "master_unconfined",
+                    "this host can confine the master (Landlock); --unconfined is only for \
+                     hosts without it",
+                ))
+            }
+            (Err(e), false) => {
+                return Err(Error::invalid(
+                    "master_unconfined",
+                    format!(
+                        "{e}. The master cannot be confined on this host, so it is not \
+                         started. `cadence master start --unconfined` starts it without the \
+                         sandbox — it can then read and write your files (ssh keys, forge \
+                         logins, every repo)"
+                    ),
+                ))
+            }
+        }
         let installed = master::install_defaults(&pm, "operator")?;
         let files = master::read_files(&pm.dir, ALIAS, true)?;
         master::verify(&self.state_dir, ALIAS, &files)?;
@@ -466,6 +514,9 @@ impl Shared {
         if let Some(e) = &effort {
             launch.insert("effort".into(), json!(e));
         }
+        if unconfined {
+            launch.insert("unconfined".into(), json!(true));
+        }
         let launch = Value::Object(launch);
         crate::adapter::registry::validate_launch_params(provider, "managed", &launch)?;
         let briefing = master::compose(&files);
@@ -478,6 +529,26 @@ impl Shared {
         // repo, where any agent can plant CLAUDE.md, hooks or settings.
         let cwd = master::workdir(&self.state_dir);
         std::fs::create_dir_all(&cwd)?;
+        // Confined, the master's CLI has its own config dir (CAD-439
+        // review, I1) and, by default, its own separate login: nothing is
+        // copied unless the operator asks (`--copy-login`). Unconfined,
+        // it keeps the operator's config.
+        let login = if unconfined {
+            None
+        } else if copy {
+            let operator = master::operator_claude_config(
+                self.provider_env.var("CLAUDE_CONFIG_DIR"),
+                self.provider_env.var("HOME"),
+            );
+            Some(match operator {
+                Some(dir) => master::copy_login(&self.state_dir, &dir)?,
+                None => master::ensure_config_dir(&self.state_dir)?,
+            })
+        } else {
+            Some(master::ensure_config_dir(&self.state_dir)?)
+        };
+        let login_command =
+            (login == Some(master::Login::None)).then(|| master::login_command(&self.state_dir));
         self.store.register_agent(&store::NewAgent {
             alias: ALIAS,
             provider,
@@ -521,10 +592,31 @@ impl Shared {
         let _ = self.store.event_public(
             DAEMON_ALIAS,
             "master_started",
-            json!({"provider": provider, "model": model, "installed": installed}),
+            json!({"provider": provider, "model": model, "installed": installed,
+                   "confined": !unconfined,
+                   "login": login.map(master::Login::as_str)}),
         );
+        if login == Some(master::Login::Copied) {
+            let _ = self.store.event_public(
+                ALIAS,
+                "master_login_copied",
+                json!({"by": "operator", "what": "claudeAiOauth",
+                       "to": master::claude_config_dir(&self.state_dir)}),
+            );
+        }
+        if unconfined {
+            let _ = self.store.event_public(
+                ALIAS,
+                "master_started_unconfined",
+                json!({"by": "operator", "reason": "no filesystem sandbox on this host"}),
+            );
+        }
         self.wake();
         Ok(json!({
+            "confined": !unconfined,
+            "login": login.map(master::Login::as_str),
+            "login_command": login_command,
+            "warning": unconfined.then_some(UNCONFINED_WARNING),
             "alias": ALIAS,
             "provider": provider,
             "endpoint_kind": "managed",

@@ -710,7 +710,8 @@ impl Audience {
             | "auto_merge_on"
             | "delivery_unreadable" => Self::Operator,
             "drift" => Self::Dependency,
-            "inbox_unread" | "tracker_behind" => Self::Info,
+            // CAD-439: informs the operator; nothing for the team.
+            "inbox_unread" | "tracker_behind" | "master_unconfined" | "master_login" => Self::Info,
             _ => Self::Team,
         }
     }
@@ -2267,6 +2268,38 @@ fn agent_project(a: &Value, repos: &[(PathBuf, String)]) -> String {
 
 /// The needs-me rows one agent contributes: its `agent_list` row (state,
 /// stall view, mailbox backlog and health) plus its probe.
+/// CAD-439 (operator decision): a confined master whose own Claude
+/// config dir holds no login cannot authenticate — one info row naming
+/// the command that gives it its own, until the login exists.
+fn master_login_item(a: &Value, state_dir: &Path, project: &str, now: i64) -> Option<Item> {
+    let alias = a["alias"].as_str().unwrap_or_default();
+    let confined =
+        crate::master::is_confined(Some(&a["params"]), crate::confine::available().is_ok());
+    if !crate::master::is_master(alias)
+        || !confined
+        || a["state"].as_str() == Some("stopped")
+        || crate::master::has_login(state_dir)
+    {
+        return None;
+    }
+    let command = crate::master::login_command(state_dir);
+    let age = now - a["updated"].as_f64().unwrap_or(now as f64) as i64;
+    Some(
+        item(
+            90,
+            "master_login",
+            &format!("master has no Claude login — give it its own: {command}"),
+            age,
+            project,
+            None,
+            &command,
+        )
+        .about("agent", alias)
+        .for_agent(alias)
+        .owned_by(None),
+    )
+}
+
 fn agent_items(a: &Value, probe: &AgentProbe, project: &str, now: i64) -> Vec<Item> {
     let alias = a["alias"].as_str().unwrap_or_default();
     let age = now - a["updated"].as_f64().unwrap_or(now as f64) as i64;
@@ -2279,6 +2312,25 @@ fn agent_items(a: &Value, probe: &AgentProbe, project: &str, now: i64) -> Vec<It
             .owned_by(pm)
     };
     let mut items = Vec::new();
+    // CAD-439 (operator decision): a master started `--unconfined` on a
+    // host without Landlock shows for as long as it is registered and
+    // not stopped.
+    if crate::master::is_master(alias)
+        && crate::master::unconfined(Some(&a["params"]))
+        && a["state"].as_str() != Some("stopped")
+    {
+        items.push(
+            row(
+                90,
+                "master_unconfined",
+                "master runs unconfined — no filesystem sandbox on this host; it can read and \
+                 write your files",
+                age,
+                &cmd_agent_show(alias),
+            )
+            .owned_by(None),
+        );
+    }
     // Condition clocks (CAD-253): a daemon-measured age is a start
     // time; `updated` is not — any params/model write moves it.
     let secs_ago = |key: &str| a[key].as_f64().map(|s| now - s as i64);
@@ -2661,6 +2713,7 @@ fn overview_from(
     for (a, probe) in daemon.agents.iter().zip(&daemon.probes) {
         let project = agent_project(a, &repo_paths);
         needs.extend(agent_items(a, probe, &project, now));
+        needs.extend(master_login_item(a, state_dir, &project, now));
         panes_idle &= !probe.holds_drift;
         probes_unknown |= probe.probe_unknown;
     }
