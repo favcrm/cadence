@@ -32,14 +32,17 @@
 //! tracker files take any author an agent writes, so a comment could
 //! forge the owner.
 //!
-//! A lane's `side.pm` is the actor its start/dispatch record binds —
-//! the `Actor:` trailer (or ` (actor)` suffix) of the newest
-//! lane-binding tracker commit — never `claim.by`, which is live
-//! frontmatter the lane can rewrite to impersonate its owner and
-//! suppress its own ack row. The epic side (`parent`, `plan_epic`) is
-//! still frontmatter and remains advisory: a lane that claims
-//! membership of the owning epic is the same class of self-assertion
-//! this feature tolerates. Everything here warns; nothing refuses.
+//! A lane's `side.pm`, probed worktree and branch come from the
+//! daemon's dispatch record (`dispatches.json`, written only by the
+//! `dispatch_record` RPC whose `pm` is the connection-derived caller)
+//! — never `claim.by`, `Actor:` trailers or planted comments, all of
+//! which an agent can write. A lane with no record is *unbound*: its
+//! `pm` is nothing, its `head` pins nothing, and its area rows are
+//! never suppressed — the fail-loud direction. The epic side
+//! (`parent`, `plan_epic`) is still frontmatter and remains advisory:
+//! a lane that claims membership of the owning epic is the same class
+//! of self-assertion this feature tolerates. Everything here warns;
+//! nothing refuses.
 //!
 //! Every string that reaches a terminal, a tracker comment or the
 //! overview JSON is scrubbed of control and bidi characters
@@ -463,9 +466,20 @@ pub struct Lane {
     pub worker: Option<String>,
     /// The open `pr` ref, else the review loop's recorded PR.
     pub pr: Option<String>,
-    /// The worktree's committed tip — what an ack pins to.
+    /// A daemon dispatch record exists for this issue — the lane's pm,
+    /// worktree and branch are what the dispatch recorded, not live
+    /// frontmatter. An unbound lane's rows are never suppressed.
+    pub bound: bool,
+    /// The recorded lane's committed tip — what an ack pins to. `None`
+    /// for an unbound lane: nothing a daemon saw can be pinned.
     pub head: Option<String>,
+    /// The probed dir: the dispatch record's worktree when bound, else
+    /// the open frontmatter ref (advisory only — never trusted for an
+    /// ack or a pm).
     pub worktree: PathBuf,
+    /// The rev the probe diffs: the recorded branch when bound, `HEAD`
+    /// of the frontmatter worktree otherwise.
+    pub probe_rev: String,
     pub planned: Vec<String>,
     pub changed: Vec<String>,
     /// Why `changed` could not be read (a missing checkout, a git error).
@@ -506,34 +520,39 @@ impl Lane {
         json!({"issue": self.issue, "project": self.project,
                "worker": self.worker.as_deref().map(scrub),
                "pm": self.side.pm.as_deref().map(scrub),
+               "bound": self.bound,
                "pr": self.pr.as_deref().map(scrub),
-               "worktree": self.worktree,
+               "worktree": scrub(&self.worktree.display().to_string()),
                "planned": scrubbed(&self.planned), "changed": scrubbed(&self.changed),
                "changed_error": self.changed_error.as_deref().map(scrub)})
     }
 }
 
-/// One lane's parallel probe: committed changed files, the tip an ack
-/// pins to, and the PM the dispatch record binds.
-type Probe = (
-    std::result::Result<Vec<String>, String>,
-    Option<String>,
-    Option<String>,
-);
+/// What a lane probes: committed changed files and the tip an ack
+/// pins to.
+type Probe = (std::result::Result<Vec<String>, String>, Option<String>);
 
 /// The open lanes among `issues` (not done/dropped, with an open
-/// worktree ref), each probed for its committed changes, head and
-/// recorded PM. Probes run on a bounded pool — at most
-/// [`LANE_GIT_WORKERS`] git readers at once whatever the lane count —
-/// so a board render cannot fan out a process per lane. `prs` maps an
-/// issue id to the review loop's recorded PR URL.
+/// worktree ref), each probed for its committed changes and head.
+/// Probes run on a bounded pool — at most [`LANE_GIT_WORKERS`] git
+/// readers at once whatever the lane count — so a board render cannot
+/// fan out a process per lane. `prs` maps an issue id to the review
+/// loop's recorded PR URL.
 ///
-/// `pm_dir` is the tracker repo: a lane's `side.pm` is the actor its
-/// dispatch record binds ([`recorded_pm`]), never `claim.by` — live
-/// frontmatter the lane itself can rewrite to impersonate its owner.
+/// `state_dir` holds the daemon's dispatch records: a bound lane's
+/// `side.pm`, probed dir and probed branch all come from the record
+/// ([`dispatches`]), never live frontmatter — `claim.by`, refs and
+/// tracker history are agent-writable. An unbound lane keeps its
+/// frontmatter worktree for the advisory probe only: `pm` stays empty,
+/// `head` pins nothing, and its rows never suppress.
 /// `parent`/`plan_epic` stay frontmatter — advisory by design.
-pub fn open_lanes(pm_dir: &Path, issues: &[&Issue], prs: &BTreeMap<String, String>) -> Vec<Lane> {
-    let (lane_issues, mut lanes): (Vec<&Issue>, Vec<Lane>) = issues
+pub fn open_lanes(
+    state_dir: &Path,
+    issues: &[&Issue],
+    prs: &BTreeMap<String, String>,
+) -> Vec<Lane> {
+    let records = dispatches(state_dir);
+    let mut lanes: Vec<Lane> = issues
         .iter()
         .filter(|i| !matches!(i.front.status.as_str(), "done" | "dropped"))
         .filter_map(|i| {
@@ -557,36 +576,48 @@ pub fn open_lanes(pm_dir: &Path, issues: &[&Issue], prs: &BTreeMap<String, Strin
                 .filter(|p| check_path(p).is_ok())
                 .cloned()
                 .collect();
-            Some((
-                *i,
-                Lane {
-                    issue: f.id.clone(),
-                    project: i.project.clone(),
-                    side: Side::of(f, None),
-                    worker: f.owner.clone(),
-                    pr,
-                    head: None,
-                    worktree: PathBuf::from(wt),
-                    planned,
-                    changed: vec![],
-                    changed_error: None,
-                },
-            ))
+            let rec = records.get(&f.id);
+            let bound = rec.is_some();
+            let (dir, rev) = match rec {
+                Some(r) => (
+                    r["worktree"].as_str().unwrap_or_default().to_string(),
+                    r["branch"].as_str().unwrap_or("HEAD").to_string(),
+                ),
+                None => (wt.clone(), "HEAD".to_string()),
+            };
+            let mut side = Side::of(f, None);
+            side.pm = rec
+                .and_then(|r| r["pm"].as_str())
+                .filter(|p| !p.is_empty())
+                .map(str::to_string);
+            Some(Lane {
+                issue: f.id.clone(),
+                project: i.project.clone(),
+                side,
+                worker: f.owner.clone(),
+                pr,
+                bound,
+                head: None,
+                worktree: PathBuf::from(dir),
+                planned,
+                changed: vec![],
+                changed_error: None,
+                probe_rev: rev,
+            })
         })
-        .unzip();
+        .collect();
     let next = AtomicUsize::new(0);
     let probed: Mutex<Vec<(usize, Probe)>> = Mutex::new(Vec::new());
     std::thread::scope(|s| {
         for _ in 0..LANE_GIT_WORKERS.min(lanes.len()) {
             s.spawn(|| loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
-                let (Some(issue), Some(lane)) = (lane_issues.get(i), lanes.get(i)) else {
-                    break;
-                };
+                let Some(lane) = lanes.get(i) else { break };
                 let probe: Probe = (
-                    changed_files(&lane.worktree),
-                    lane_head(&lane.worktree).ok(),
-                    recorded_pm(pm_dir, issue),
+                    changed_files(&lane.worktree, &lane.probe_rev),
+                    lane.bound
+                        .then(|| lane_head(&lane.worktree, &lane.probe_rev).ok())
+                        .flatten(),
                 );
                 probed
                     .lock()
@@ -595,14 +626,13 @@ pub fn open_lanes(pm_dir: &Path, issues: &[&Issue], prs: &BTreeMap<String, Strin
             });
         }
     });
-    for (i, (changed, head, pm)) in probed.into_inner().unwrap_or_default() {
+    for (i, (changed, head)) in probed.into_inner().unwrap_or_default() {
         let lane = &mut lanes[i];
         match changed {
             Ok(files) => lane.changed = files,
             Err(e) => lane.changed_error = Some(e),
         }
         lane.head = head;
-        lane.side.pm = pm;
     }
     lanes
 }
@@ -646,25 +676,42 @@ fn git_line(dir: &Path, args: &[&str]) -> std::result::Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// A rev name a probe may be given — the dispatch record's branch or
+/// `HEAD`. A leading `-` would read as a git option; recorded branches
+/// passed `model::check_ref_value` already, but a record file is a
+/// state-dir write an attacker at the operator's uid could still edit,
+/// so the guard lives here too: a refused rev errors the probe, which
+/// raises the row (fail loud).
+fn check_rev(rev: &str) -> std::result::Result<&str, String> {
+    if rev.is_empty() || rev.starts_with('-') {
+        Err(format!("rev '{rev}' is not a usable ref"))
+    } else {
+        Ok(rev)
+    }
+}
+
 /// The files a lane's branch changed against its base — the merge base
-/// of `HEAD` with the repo's default branch (`origin/HEAD`, else
-/// `origin/main`, else `main`, else `master`). Both diff sides are
-/// commits, so this never hashes, stats or filters a worktree file:
-/// uncommitted and untracked work is invisible, by design — the board
-/// warns on what a lane has committed. Sorted, de-duplicated, capped
-/// at [`CHANGED_MAX`].
-pub fn changed_files(wt: &Path) -> std::result::Result<Vec<String>, String> {
+/// of `rev` with the repo's default branch (`origin/HEAD`, else
+/// `origin/main`, else `main`, else `master`). `rev` is the dispatch
+/// record's branch (or `HEAD` for an unbound lane's advisory probe) —
+/// never a live worktree ref. Both diff sides are commits, so this
+/// never hashes, stats or filters a worktree file: uncommitted and
+/// untracked work is invisible, by design — the board warns on what a
+/// lane has committed. Sorted, de-duplicated, capped at
+/// [`CHANGED_MAX`].
+pub fn changed_files(wt: &Path, rev: &str) -> std::result::Result<Vec<String>, String> {
     if !wt.is_dir() {
         return Err(format!("worktree {} is missing", wt.display()));
     }
+    let rev = check_rev(rev)?;
     let base = git_line(wt, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
         .ok()
         .into_iter()
         .chain(["origin/main", "main", "master"].map(str::to_string))
         .find(|b| git_line(wt, &["rev-parse", "--verify", "--quiet", b]).is_ok())
         .ok_or_else(|| "no default branch to diff against".to_string())?;
-    let mb = git_line(wt, &["merge-base", "HEAD", &base])?;
-    let text = git_line(wt, &["diff", "--name-only", "--no-renames", &mb, "HEAD"])?;
+    let mb = git_line(wt, &["merge-base", rev, &base])?;
+    let text = git_line(wt, &["diff", "--name-only", "--no-renames", &mb, rev])?;
     let mut files: Vec<String> = text
         .lines()
         .filter(|l| !l.is_empty())
@@ -676,87 +723,13 @@ pub fn changed_files(wt: &Path) -> std::result::Result<Vec<String>, String> {
     Ok(files)
 }
 
-/// The lane's committed tip — what an ack pins to so the row re-raises
-/// when the lane commits again.
-pub fn lane_head(wt: &Path) -> std::result::Result<String, String> {
+/// The tip of the lane's recorded branch — what an ack pins to so the
+/// row re-raises when the lane commits again.
+pub fn lane_head(wt: &Path, rev: &str) -> std::result::Result<String, String> {
     if !wt.is_dir() {
         return Err(format!("worktree {} is missing", wt.display()));
     }
-    git_line(wt, &["rev-parse", "--verify", "HEAD"])
-}
-
-/// The PM a lane's start/dispatch record binds — the actor of the
-/// newest tracker commit that bound the lane: `<id>: start …` (start
-/// and dispatch both write it), `<id>: claim …` (a fresh claim or a
-/// take-over) or `<id>: ref worktree` recorded by hand. A `release` or
-/// a `ref worktree closed` lifts the binding — older commits are stale
-/// and the scan stops there. The actor is the `Actor:` trailer
-/// (CAD-42), else the ` (actor)` subject suffix, else the git author.
-/// With no binding commit, the newest `dispatch`/`claim` comment's
-/// author stands in.
-///
-/// `front.claim.by` is never consulted: it is live frontmatter a lane
-/// rewrites without leaving a record, so trusting it would let a lane
-/// name its owner and suppress its own ack row. The record is still
-/// only *evidence* — a hand-forged commit or comment can fake it —
-/// which is why every use of it warns and never refuses.
-fn recorded_pm(pm_dir: &Path, issue: &Issue) -> Option<String> {
-    let id = issue.front.id.as_str();
-    let rel = format!("{}/{id}", issue.project);
-    let log = git_line(
-        pm_dir,
-        &[
-            "log",
-            "--format=%s%x1f%an%x1f%(trailers:key=Actor,valueonly,separator=%x2C)",
-            "--",
-            &rel,
-        ],
-    )
-    .unwrap_or_default();
-    for line in log.lines() {
-        let mut fields = line.split('\x1f');
-        let (Some(subject), Some(author), Some(trailer)) =
-            (fields.next(), fields.next(), fields.next())
-        else {
-            continue;
-        };
-        let Some(rest) = subject.strip_prefix(&format!("{id}: ")) else {
-            continue;
-        };
-        if rest.starts_with("release") || rest.starts_with("ref worktree closed") {
-            break;
-        }
-        if !(rest.starts_with("start ")
-            || rest.starts_with("claim ")
-            || rest.starts_with("ref worktree"))
-        {
-            continue;
-        }
-        let actor = trailer
-            .split(',')
-            .find(|t| !t.trim().is_empty())
-            .map(str::trim)
-            .map(str::to_string)
-            .or_else(|| {
-                crate::issue::history::split_paren(rest)
-                    .1
-                    .filter(|a| !a.is_empty())
-            })
-            .unwrap_or_else(|| author.to_string());
-        return crate::issue::claim::check_alias(&actor, "pm")
-            .ok()
-            .map(|_| actor);
-    }
-    issue
-        .comments
-        .iter()
-        .rev()
-        .find(|c| matches!(c.front.kind.as_deref(), Some("dispatch") | Some("claim")))
-        .and_then(|c| {
-            crate::issue::claim::check_alias(&c.front.author, "pm")
-                .ok()
-                .map(|_| c.front.author.clone())
-        })
+    git_line(wt, &["rev-parse", "--verify", check_rev(rev)?])
 }
 
 /// Files named in warning text — scrubbed; `files` can carry planted
@@ -850,7 +823,13 @@ pub fn warnings(areas: &[Area], me: &Side, planned: &[String], lanes: &[Lane]) -
 /// The `leases` block `issue start` and `dispatch` return: the areas
 /// the ticket's planned paths touch and the warnings. Every failure is
 /// reported in the block, never raised — the start goes ahead.
-pub fn check_start(pm_dir: &Path, project: &str, front: &Front, requester: &str) -> Value {
+pub fn check_start(
+    pm_dir: &Path,
+    state_dir: &Path,
+    project: &str,
+    front: &Front,
+    requester: &str,
+) -> Value {
     let (areas, config_error) = load_or_error(pm_dir, project);
     // Planted frontmatter bypasses `issue set`'s check_path — validate
     // on load; a path a write would refuse is dropped, not matched.
@@ -882,7 +861,7 @@ pub fn check_start(pm_dir: &Path, project: &str, front: &Front, requester: &str)
         }
     };
     let refs: Vec<&Issue> = issues.iter().filter(|i| i.front.id != front.id).collect();
-    let lanes = open_lanes(pm_dir, &refs, &BTreeMap::new());
+    let lanes = open_lanes(state_dir, &refs, &BTreeMap::new());
     let me = Side::of(front, Some(requester));
     block["warnings"] = json!(warnings(&areas, &me, &planned, &lanes));
     block
@@ -947,6 +926,43 @@ pub fn cmd_ack(issue: &str, area: &str) -> String {
     format!("cadence issue ack {issue} --area {area}")
 }
 
+// ---- dispatch records: daemon-owned, never a tracker file ----
+
+/// `<state>/dispatches.json` — what the daemon saw when a lane was
+/// dispatched: the caller-derived `pm`, the worktree and branch the
+/// dispatch bound, and the kickoff message id. Written only by the
+/// `dispatch_record` RPC and `master_dispatch` — tracker data
+/// (`claim.by`, refs, commit trailers, comments) is agent-writable and
+/// binds nothing here.
+pub fn dispatches_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("dispatches.json")
+}
+
+/// Every recorded dispatch, `{issue: {pm, worktree, branch, message,
+/// at}}`; an unreadable file is none — every lane reads unbound, the
+/// fail-safe direction.
+pub fn dispatches(state_dir: &Path) -> Map<String, Value> {
+    std::fs::read_to_string(dispatches_path(state_dir))
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default()
+}
+
+static DISPATCH_WRITER: Mutex<()> = Mutex::new(());
+
+/// Record one dispatch (tmp + rename, writers serialized in-process).
+pub fn record_dispatch(state_dir: &Path, issue: &str, record: Value) -> Result<()> {
+    let _guard = DISPATCH_WRITER.lock().unwrap_or_else(|e| e.into_inner());
+    let mut all = dispatches(state_dir);
+    all.insert(issue.to_string(), record);
+    let path = dispatches_path(state_dir);
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&Value::Object(all))?)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
 /// One lane × owned-area pair that needs the owner's ack: the lane has
 /// a PR and changed files in an area owned by someone else, and nobody
 /// with the right has acked it.
@@ -968,6 +984,11 @@ pub struct AckNeed {
 /// touching the area or not — re-raises it, so a fresh change gets a
 /// fresh look. Acks recorded without a `head` (pre-pinning records)
 /// suppress nothing; the row stays up, the fail-safe direction.
+///
+/// A lane whose changed files cannot be *known* — no daemon dispatch
+/// record (unbound), or the recorded lane unreadable — raises its row
+/// instead of passing on an empty diff: unknown means needs-ack, never
+/// empty-and-silent. The row names planned files as its evidence then.
 pub fn ack_needs(
     areas: &[Area],
     lanes: &[Lane],
@@ -983,19 +1004,27 @@ pub fn ack_needs(
             if area.owned_by(&lane.side) {
                 continue;
             }
-            let files: Vec<String> = lane
+            let unknown = !lane.bound || lane.changed_error.is_some();
+            let mut files: Vec<String> = lane
                 .changed
                 .iter()
+                .chain(unknown.then(|| lane.planned.iter()).into_iter().flatten())
                 .filter(|c| area.covers(c))
                 .map(|c| scrub(c))
                 .collect();
-            let acked = acks
-                .get(&ack_key(&lane.issue, &area.name))
-                .is_some_and(|a| {
-                    lane.head
-                        .as_deref()
-                        .is_some_and(|h| a["head"].as_str() == Some(h))
-                });
+            files.sort();
+            files.dedup();
+            if files.is_empty() && unknown {
+                files.push("(changed files unknown)".to_string());
+            }
+            let acked = lane.bound
+                && acks
+                    .get(&ack_key(&lane.issue, &area.name))
+                    .is_some_and(|a| {
+                        lane.head
+                            .as_deref()
+                            .is_some_and(|h| a["head"].as_str() == Some(h))
+                    });
             if files.is_empty() || acked {
                 continue;
             }
@@ -1046,6 +1075,8 @@ pub fn overlay(areas: &[Area], lanes: &[Lane]) -> Vec<Value> {
                 "issue": l.issue,
                 "worker": l.worker.as_deref().map(scrub),
                 "pm": l.side.pm.as_deref().map(scrub),
+                "bound": l.bound,
+                "worktree": scrub(&l.worktree.display().to_string()),
                 "pr": l.pr.as_deref().map(scrub),
                 "planned": l.planned.iter().map(|p| scrub(p)).collect::<Vec<_>>(),
                 "changed_count": l.changed.len(),
@@ -1209,8 +1240,10 @@ mod tests {
             },
             worker: Some(format!("w-{issue}")),
             pr: pr.map(str::to_string),
+            bound: true,
             head: Some(format!("h-{issue}")),
             worktree: PathBuf::from("/nowhere"),
+            probe_rev: "HEAD".into(),
             planned: planned.iter().map(|s| s.to_string()).collect(),
             changed: changed.iter().map(|s| s.to_string()).collect(),
             changed_error: None,
@@ -1556,108 +1589,141 @@ mod tests {
             &["config", "core.fsmonitor", &pwn.display().to_string()],
         );
         assert_eq!(
-            changed_files(&dir).unwrap(),
+            changed_files(&dir, "lane").unwrap(),
             vec!["src/x.rs".to_string()],
             "only committed changes count"
         );
         assert!(!fired.exists(), "a worktree filter/fsmonitor ran");
-        assert_eq!(lane_head(&dir).unwrap().len(), 40);
+        assert_eq!(lane_head(&dir, "lane").unwrap().len(), 40);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A lane's PM comes from its start/dispatch record — the `Actor:`
-    /// trailer of the newest binding commit — never from `claim.by`,
-    /// which the lane can rewrite at will.
+    /// A lane's PM comes from the daemon's dispatch record — never
+    /// `claim.by`, an `Actor:` trailer or a planted comment, all of
+    /// which the lane can write itself. The record also fixes the
+    /// probed worktree and branch; re-pointing the frontmatter ref
+    /// redirects nothing.
     #[test]
-    fn recorded_pm_binds_the_commit_actor_not_frontmatter() {
+    fn dispatch_record_binds_pm_worktree_and_branch() {
         let dir = tmpdir("pm");
         let idir = dir.join("demo/D-1");
         std::fs::create_dir_all(&idir).unwrap();
         std::fs::write(dir.join("demo/project.yaml"), "key: demo\nprefix: D\n").unwrap();
-        let text = |by: &str, n: usize| {
-            format!(
-                "---\nid: D-1\ntitle: t\nstatus: doing\npriority: P2\n\
-                 claim: {{by: {by}, at: '2026-01-01T00:00:00Z'}}\n\
-                 created: '2026-01-01T00:00:00Z'\n---\nedit {n}\n"
-            )
-        };
-        // The lie is live in the file from the start: claim.by is the
-        // area's owner pm-own, while the start record binds pm-a.
-        std::fs::write(idir.join("issue.md"), text("pm-own", 0)).unwrap();
-        git(&dir, &["add", "-A"]);
-        git(
-            &dir,
-            &[
-                "commit",
-                "-qm",
-                "D-1: start cadence/d-1-x\n\nIssue: D-1\nActor: pm-a",
-            ],
-        );
-        let issue = issue_at(&dir, "demo", "D-1");
-        assert_eq!(issue.front.claim.as_ref().unwrap().by, "pm-own");
-        assert_eq!(recorded_pm(&dir, &issue).as_deref(), Some("pm-a"));
-        // A hand-committed frontmatter edit is not a binding subject.
-        std::fs::write(idir.join("issue.md"), text("pm-own", 1)).unwrap();
+        // The lie is live in the file: claim.by is the area's owner
+        // pm-own, the frontmatter worktree points somewhere else, and
+        // a forged Actor trailer names pm-own too. The record still
+        // binds pm-a and the real lane.
+        let wt = dir.join("wt-lane");
+        std::fs::create_dir_all(&wt).unwrap();
+        git(&wt, &["init", "-qb", "main"]);
+        std::fs::write(wt.join("base.txt"), "b\n").unwrap();
+        git(&wt, &["add", "-A"]);
+        git(&wt, &["commit", "-qm", "base"]);
+        git(&wt, &["checkout", "-qb", "lane"]);
+        std::fs::write(wt.join("x.rs"), "x\n").unwrap();
+        git(&wt, &["add", "-A"]);
+        git(&wt, &["commit", "-qm", "lane work"]);
+        std::fs::write(
+            idir.join("issue.md"),
+            "---\nid: D-1\ntitle: t\nstatus: doing\npriority: P2\n\
+             claim: {by: pm-own, at: '2026-01-01T00:00:00Z'}\n\
+             refs:\n  - kind: worktree\n    path: '/elsewhere'\n\
+             created: '2026-01-01T00:00:00Z'\n---\n",
+        )
+        .unwrap();
         git(&dir, &["add", "-A"]);
         git(
             &dir,
             &["commit", "-qm", "wip: D-1 claims pm-own\n\nActor: pm-own"],
         );
-        assert_eq!(recorded_pm(&dir, &issue).as_deref(), Some("pm-a"));
-        // A take-over re-binds; a release unbinds.
-        std::fs::write(idir.join("issue.md"), text("pm-b", 2)).unwrap();
-        git(&dir, &["add", "-A"]);
-        git(
-            &dir,
-            &[
-                "commit",
-                "-qm",
-                "D-1: claim take-over by pm-b from pm-a\n\nIssue: D-1\nActor: pm-b",
-            ],
-        );
-        assert_eq!(recorded_pm(&dir, &issue).as_deref(), Some("pm-b"));
-        std::fs::write(idir.join("issue.md"), text("pm-b", 3)).unwrap();
-        git(&dir, &["add", "-A"]);
-        git(
-            &dir,
-            &[
-                "commit",
-                "-qm",
-                "D-1: release by pm-b\n\nIssue: D-1\nActor: pm-b",
-            ],
-        );
-        assert_eq!(recorded_pm(&dir, &issue), None);
-        // With no binding commit, the newest dispatch/claim comment
-        // stands in; with neither, the lane is simply unowned.
-        let (front, body) = parse::parse_issue(
-            "---\nid: D-9\ntitle: t\nstatus: doing\npriority: P2\n\
-             created: '2026-01-01T00:00:00Z'\n---\n",
+        let state = dir.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        record_dispatch(
+            &state,
+            "D-1",
+            json!({"pm": "pm-a", "worktree": wt, "branch": "lane", "message": "m-1"}),
         )
         .unwrap();
-        let mut orphan = Issue {
-            project: "demo".into(),
-            dir: dir.join("demo/D-9"),
-            front,
-            body,
-            comments: vec![],
-            artifacts: vec![],
-        };
-        assert_eq!(recorded_pm(&dir, &orphan), None);
-        orphan.comments.push(crate::issue::board::Comment {
-            name: "x.md".into(),
-            front: model::CommentFront {
-                author: "pm-z".into(),
-                at: "t".into(),
-                kind: Some("dispatch".into()),
-            },
-            body: String::new(),
-        });
-        assert_eq!(recorded_pm(&dir, &orphan).as_deref(), Some("pm-z"));
+        let issues = [issue_at(&dir, "demo", "D-1")];
+        let refs: Vec<&Issue> = issues.iter().collect();
+        let lanes = open_lanes(&state, &refs, &BTreeMap::new());
+        assert_eq!(lanes.len(), 1);
+        let lane = &lanes[0];
+        assert!(lane.bound);
+        assert_eq!(lane.side.pm.as_deref(), Some("pm-a"));
+        assert_eq!(lane.worktree, wt);
+        assert_eq!(lane.probe_rev, "lane");
+        assert_eq!(lane.changed, vec!["x.rs".to_string()]);
+        assert_eq!(lane.head.as_deref().map(|h| h.len()), Some(40));
+
+        // A record field git would read as an option fails closed:
+        // the probe errors, the lane's rows stay up.
+        record_dispatch(
+            &state,
+            "D-1",
+            json!({"pm": "pm-a", "worktree": wt, "branch": "--upload-pack=touch /tmp/x"}),
+        )
+        .unwrap();
+        let lanes = open_lanes(&state, &refs, &BTreeMap::new());
+        assert!(lanes[0].bound);
+        assert!(lanes[0].changed_error.is_some());
+        assert_eq!(lanes[0].head, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// No daemon record: the lane is unbound — `pm` is empty, `head`
+    /// pins nothing, the frontmatter worktree still serves the
+    /// advisory probe, and `ack_needs` can never suppress its row —
+    /// not even by an ack someone managed to record.
+    #[test]
+    fn unbound_lane_rows_never_suppress() {
+        let areas = [area("caller", &["src/"], Some("D-50"), Some("pm-a"), None)];
+        let mut l = lane("D-1", "pm-b", &[], &["src/x.rs"], Some("https://x/pull/1"));
+        l.bound = false;
+        l.side.pm = None;
+        let lanes = vec![l];
+        let none = Map::new();
+        assert_eq!(ack_needs(&areas, &lanes, &none, |_| false).len(), 1);
+        // Even a head-pinned ack matching the lane's head cannot clear
+        // an unbound lane's row — `bound` is the gate, not the pin.
+        let mut acked = Map::new();
+        acked.insert(
+            ack_key("D-1", "caller"),
+            json!({"by": "pm-a", "head": "h-D-1"}),
+        );
+        assert_eq!(ack_needs(&areas, &lanes, &acked, |_| false).len(), 1);
+    }
+
+    /// A bound lane whose recorded lane cannot be probed — the dir is
+    /// gone, the branch is bogus — raises its row as unknown rather
+    /// than passing on an empty diff.
+    #[test]
+    fn bound_lane_probe_error_raises_not_empty() {
+        let areas = [area("caller", &["src/"], Some("D-50"), Some("pm-a"), None)];
+        let mut l = lane(
+            "D-1",
+            "pm-b",
+            &["src/planned.rs"],
+            &[],
+            Some("https://x/pull/1"),
+        );
+        l.changed_error = Some("worktree gone".into());
+        let lanes = vec![l];
+        let needs = ack_needs(&areas, &lanes, &Map::new(), |_| false);
+        assert_eq!(needs.len(), 1);
+        assert_eq!(needs[0].files, vec!["src/planned.rs".to_string()]);
+        // No plausible file at all still raises — the row says the
+        // truth: the lane's changes are unknown.
+        let mut l2 = lane("D-2", "pm-b", &[], &[], Some("https://x/pull/2"));
+        l2.changed_error = Some("worktree gone".into());
+        let needs = ack_needs(&areas, &[l2], &Map::new(), |_| false);
+        assert_eq!(needs.len(), 1);
+        assert_eq!(needs[0].files, vec!["(changed files unknown)".to_string()]);
+    }
+
     /// `open_lanes` drops planted paths `issue set` would have refused
-    /// and binds `side.pm` to the dispatch record.
+    /// and binds `side.pm`, the probed dir and the rev to the daemon's
+    /// dispatch record.
     #[test]
     fn open_lanes_validates_loaded_paths_and_binds_pm() {
         let dir = tmpdir("lanes");
@@ -1677,20 +1743,28 @@ mod tests {
         )
         .unwrap();
         git(&dir, &["add", "-A"]);
-        git(
-            &dir,
-            &[
-                "commit",
-                "-qm",
-                "D-1: start cadence/d-1-x\n\nIssue: D-1\nActor: pm-a",
-            ],
-        );
+        git(&dir, &["commit", "-qm", "D-1: start cadence/d-1-x"]);
+        let state = dir.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        record_dispatch(
+            &state,
+            "D-1",
+            json!({"pm": "pm-a", "worktree": dir, "branch": "main"}),
+        )
+        .unwrap();
         let issues = [issue_at(&dir, "demo", "D-1")];
         let refs: Vec<&Issue> = issues.iter().collect();
-        let lanes = open_lanes(&dir, &refs, &BTreeMap::new());
+        let lanes = open_lanes(&state, &refs, &BTreeMap::new());
         assert_eq!(lanes.len(), 1);
         assert_eq!(lanes[0].planned, vec!["src/ok.rs".to_string()]);
         assert_eq!(lanes[0].side.pm.as_deref(), Some("pm-a"));
+        assert!(lanes[0].bound);
+        // Without the record the same lane is unbound: no pm, no head.
+        let lanes = open_lanes(&dir.join("empty-state"), &refs, &BTreeMap::new());
+        assert_eq!(lanes.len(), 1);
+        assert!(!lanes[0].bound);
+        assert_eq!(lanes[0].side.pm, None);
+        assert_eq!(lanes[0].head, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

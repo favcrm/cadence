@@ -65,24 +65,24 @@ impl Shared {
                 )));
             }
         };
-        // Pin the ack to the lane's committed tip so the Needs-you row
-        // re-raises when the lane commits again, and record the files
-        // it covered for the record. Both reads are object-only; a lane
-        // with no readable worktree acks `head: null`, which pins
-        // nothing — the row stays up.
-        let issue = issue::board::find_issue(&pm.dir, &id)?;
-        let wt = issue
-            .front
-            .refs
-            .iter()
-            .find(|r| r.kind == "worktree" && r.closed != Some(true))
-            .and_then(|r| r.path.clone());
-        let head = wt
-            .as_deref()
-            .and_then(|w| areas::lane_head(std::path::Path::new(w)).ok());
-        let files: Vec<String> = wt
-            .as_deref()
-            .and_then(|w| areas::changed_files(std::path::Path::new(w)).ok())
+        // Pin the ack to the lane the daemon's dispatch record bound —
+        // its recorded worktree and branch, never a live frontmatter
+        // ref an agent can re-point. Both reads are object-only; a
+        // lane whose recorded dir is unreadable acks `head: null`,
+        // which pins nothing — the row stays up. An unbound lane has
+        // nothing a daemon saw to pin: its row cannot be acked at all.
+        let rec = areas::dispatches(&self.state_dir)
+            .remove(&id)
+            .ok_or_else(|| {
+                Error::rejected(format!(
+                    "{VERB}: {id} has no daemon-recorded dispatch — an unbound lane's \
+                 row cannot be pinned or cleared; re-dispatch it or close the lane"
+                ))
+            })?;
+        let wt = rec["worktree"].as_str().unwrap_or_default().to_string();
+        let rev = rec["branch"].as_str().unwrap_or("HEAD").to_string();
+        let head = areas::lane_head(std::path::Path::new(&wt), &rev).ok();
+        let files: Vec<String> = areas::changed_files(std::path::Path::new(&wt), &rev)
             .map(|fs| fs.into_iter().filter(|f| area.covers(f)).collect())
             .unwrap_or_default();
         let record = json!({
@@ -100,6 +100,49 @@ impl Shared {
         let _ = self
             .store
             .event_public(DAEMON_ALIAS, "area_acked", record.clone());
+        self.wake();
+        Ok(record)
+    }
+
+    /// `dispatch_record` — the daemon's own record of a lane dispatch:
+    /// which worktree+branch a kickoff bound, and which PM sent it.
+    /// `pm` is the connection's identity, never a param — an agent can
+    /// only ever record a dispatch it really sent, and identity-shaped
+    /// fields are refused. The record is what binds a lane's owner
+    /// rows; tracker data (`claim.by`, frontmatter refs, commit
+    /// trailers, comments) is agent-writable and binds nothing. One
+    /// record per issue — a re-dispatch overwrites.
+    pub(super) fn rpc_dispatch_record(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        const VERB: &str = "dispatch_record";
+        reject_identity_fields(params, VERB)?;
+        let caller = self.agent_caller(peer_pid, VERB)?;
+        let id = issue::model::check_id(required_str(params, "issue")?)?;
+        let worktree = required_str(params, "worktree")?;
+        let branch = required_str(params, "branch")?;
+        issue::model::check_ref_value(worktree)?;
+        issue::model::check_ref_value(branch)?;
+        let wt = std::path::Path::new(worktree);
+        if !wt.is_absolute() {
+            return Err(Error::rejected(format!(
+                "{VERB}: worktree '{worktree}' must be an absolute path"
+            )));
+        }
+        let pm = Pm::at(&self.pm_dir()?)?;
+        issue::write::issue_dir(&pm, &id)?;
+        let (by, by_kind) = caller.audit();
+        let record = json!({
+            "issue": id,
+            "pm": by,
+            "pm_kind": by_kind,
+            "worktree": worktree,
+            "branch": branch,
+            "message": optional_str(params, "message"),
+            "at": issue::time::iso(issue::time::now_epoch()),
+        });
+        areas::record_dispatch(&self.state_dir, &id, record.clone())?;
+        let _ = self
+            .store
+            .event_public(DAEMON_ALIAS, "dispatch_recorded", record.clone());
         self.wake();
         Ok(record)
     }

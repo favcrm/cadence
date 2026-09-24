@@ -648,7 +648,8 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
     // refuses: the warnings ride the output, and a start that minted
     // the lane records them on the issue as a `lease` comment (the
     // event). A failure to record is reported, not raised.
-    let mut leases = crate::issue::areas::check_start(&pm.dir, &project.key, &front, &requester);
+    let mut leases =
+        crate::issue::areas::check_start(&pm.dir, state_dir, &project.key, &front, &requester);
     let lines = crate::issue::areas::warning_lines(&leases);
     if created && !lines.is_empty() {
         let text = format!("Lease warnings at start:\n- {}", lines.join("\n- "));

@@ -313,7 +313,7 @@ impl Shared {
         // The daemon runs the ordinary dispatch on the master's behalf:
         // worktree, tracker refs and comment, one kickoff — attributed
         // to the master.
-        let out = issue::dispatch::run(&pm, id, &args, ALIAS, &self.state_dir)?;
+        let out = issue::dispatch::run(&pm, id, &args, ALIAS, &self.state_dir, Some(ALIAS))?;
         // Only a real send is the master's dispatch: a duplicate answers
         // with the live kickoff someone else sent (`dispatched: false`),
         // and recording that would hand the master interrupt rights over

@@ -3031,7 +3031,7 @@ fn overview_from(
                 .filter(|v| v.issue.project == p.key)
                 .map(|v| &v.issue)
                 .collect();
-            let lanes = issue::areas::open_lanes(&pm.dir, &project_issues, &delivery_prs);
+            let lanes = issue::areas::open_lanes(state_dir, &project_issues, &delivery_prs);
             let acks = issue::areas::acks(state_dir);
             let has_pr = |l: &issue::areas::Lane| {
                 let prefix = crate::worktree::layout::issue_branch_prefix(&l.issue);

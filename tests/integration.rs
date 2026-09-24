@@ -51268,6 +51268,7 @@ fn cad324_compaction_pack_survives_a_daemon_restart() {
     )
     .unwrap();
     assert_eq!(result_text(&d, "lead", "s3"), "FAKE_REPLY: and then");
+}
 
 // ---- CAD-378: code-area owners and advisory path leases ----
 
@@ -51279,7 +51280,10 @@ const CAD378_AREAS: &str =
 
 impl PlanFixture {
     /// `issue new` + `issue set paths=` + `issue start --by <pm>`; the
-    /// start's JSON.
+    /// start's JSON. The lane is then bound the way a real dispatch
+    /// binds it — a record in the daemon's `dispatches.json` naming
+    /// the pm, worktree and branch at send time (`dispatch_record`
+    /// writes exactly this, pm from the caller's connection).
     fn cad378_lane(&self, title: &str, id: &str, paths: &str, by: &str) -> Value {
         let (ok, out) = self.cli(&["issue", "new", title, "--project", "demo"]);
         assert!(ok, "{out}");
@@ -51287,6 +51291,17 @@ impl PlanFixture {
         assert!(ok, "{out}");
         let (ok, out) = self.cli(&["issue", "start", id, "--by", by]);
         assert!(ok, "start never refuses on a lease: {out}");
+        cadence_agent::issue::areas::record_dispatch(
+            &self.d.state,
+            id,
+            json!({
+                "pm": by,
+                "worktree": out["worktree"],
+                "branch": out["branch"],
+                "message": "fixture-kickoff",
+            }),
+        )
+        .unwrap();
         out
     }
 
@@ -51606,8 +51621,9 @@ fn cad378_area_ack_row_re_raises_on_new_commits() {
 
 /// `claim.by` is live frontmatter — a lane that rewrites it to the
 /// area's owner cannot suppress its own `area_ack` row. The lane's PM
-/// is bound to its start/dispatch record (the `Actor:` trailer of the
-/// newest binding commit), which a frontmatter rewrite does not touch.
+/// is bound to the daemon's dispatch record (`dispatches.json`,
+/// written at send time by `dispatch_record`), which a frontmatter
+/// rewrite, a hand commit or a planted comment does not touch.
 #[test]
 fn cad378_lane_pm_binds_the_dispatch_record_not_frontmatter() {
     let f = PlanFixture::start();
@@ -51703,4 +51719,214 @@ fn cad378_warning_text_is_scrubbed() {
         !body.contains('\u{202e}'),
         "bidi in the lease comment: {body}"
     );
+}
+
+/// A lane the daemon never dispatched is unbound: its `area_ack` row
+/// raises and stays up — no ack can pin or clear it — and `area_ack`
+/// itself refuses with the reason. `issue start` alone (no dispatch
+/// record), a forged `claim.by`, a forged `Actor:` trailer and a
+/// planted `kind: dispatch` comment all leave the row up.
+#[test]
+fn cad378_unbound_lane_row_raises_and_ack_refuses() {
+    let f = PlanFixture::start();
+    std::fs::write(f.pm_dir.join("demo/PROJECT.md"), CAD378_AREAS).unwrap();
+    // `issue start` only — nothing dispatched, so no record.
+    let (ok, out) = f.cli(&["issue", "new", "Hand started", "--project", "demo"]);
+    assert!(ok, "{out}");
+    let (ok, out) = f.cli(&["issue", "set", "D-1", "paths=src/peer.rs"]);
+    assert!(ok, "{out}");
+    let (ok, start) = f.cli(&["issue", "start", "D-1", "--by", "pm-other"]);
+    assert!(ok, "{start}");
+    let wt = start["worktree"].as_str().unwrap().to_string();
+    f.cad378_commit(&wt, "src/peer.rs");
+    let (ok, out) = f.cli(&["issue", "ref", "D-1", "pr", "https://github.com/o/r/pull/9"]);
+    assert!(ok, "{out}");
+    assert_eq!(
+        f.cad378_ack_rows().len(),
+        1,
+        "an unbound lane's row is up and stays up"
+    );
+    // The overlay marks it unbound and names no pm.
+    let (_, view) = f.cli(&["overview", "--json"]);
+    let lanes = view["projects"][0]["lanes"].clone();
+    assert_eq!(lanes[0]["bound"], false, "{lanes}");
+    assert_eq!(lanes[0]["pm"], Value::Null, "{lanes}");
+    // Nothing can ack it — not the operator, not anyone.
+    let err =
+        f.d.operator_rpc("area_ack", json!({"issue": "D-1", "area": "caller"}))
+            .unwrap_err()
+            .to_string();
+    assert!(err.contains("no daemon-recorded dispatch"), "{err}");
+    assert_eq!(f.cad378_ack_rows().len(), 1);
+    // Forged tracker identity changes nothing either.
+    let mut front = f.front("D-1");
+    front.claim.as_mut().unwrap().by = "pm-own".to_string();
+    f.write_front("D-1", &front);
+    let (ok, out) = f.cli(&[
+        "issue",
+        "comment",
+        "D-1",
+        "--kind",
+        "dispatch",
+        "--author",
+        "pm-own",
+        "-m",
+        "dispatch → w",
+    ]);
+    assert!(ok, "{out}");
+    assert_eq!(
+        f.cad378_ack_rows().len(),
+        1,
+        "forged frontmatter and comments bind nothing"
+    );
+}
+
+/// The probe follows the dispatch record's worktree+branch, never the
+/// live frontmatter ref: re-pointing the ref after an ack changes
+/// nothing — the row stays cleared while the recorded branch is still
+/// at the pinned head, and re-raises when that branch commits again.
+#[test]
+fn cad378_probe_follows_the_record_not_the_live_ref() {
+    let f = PlanFixture::start();
+    std::fs::write(f.pm_dir.join("demo/PROJECT.md"), CAD378_AREAS).unwrap();
+    let d1 = f.cad378_lane("Foreign work", "D-1", "src/peer.rs", "pm-other");
+    let wt = d1["worktree"].as_str().unwrap().to_string();
+    f.cad378_commit(&wt, "src/daemon/caller_rule.rs");
+    let (ok, out) = f.cli(&["issue", "ref", "D-1", "pr", "https://github.com/o/r/pull/9"]);
+    assert!(ok, "{out}");
+    assert_eq!(f.cad378_ack_rows().len(), 1);
+    f.d.operator_rpc("area_ack", json!({"issue": "D-1", "area": "caller"}))
+        .unwrap();
+    assert!(f.cad378_ack_rows().is_empty(), "acked at this head");
+
+    // Re-point the frontmatter worktree ref at a decoy repo whose HEAD
+    // could never match — under live-ref probing this is how a lane
+    // un-pins or empties its row. The record still binds the real dir.
+    let decoy = f.tmp.path().join("decoy");
+    std::fs::create_dir_all(&decoy).unwrap();
+    for args in [
+        vec!["init", "-qb", "main"],
+        vec![
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "decoy",
+        ],
+    ] {
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&decoy)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "git {args:?}: {o:?}");
+    }
+    let mut front = f.front("D-1");
+    front
+        .refs
+        .iter_mut()
+        .find(|r| r.kind == "worktree")
+        .unwrap()
+        .path = Some(decoy.display().to_string());
+    f.write_front("D-1", &front);
+    assert!(
+        f.cad378_ack_rows().is_empty(),
+        "the re-pointed ref un-pinned nothing — the record still binds"
+    );
+    let (_, view) = f.cli(&["overview", "--json"]);
+    let lanes = view["projects"][0]["lanes"].clone();
+    assert_eq!(lanes[0]["worktree"], json!(wt), "{lanes}");
+
+    // The recorded branch commits again: the row re-raises even though
+    // the live ref points at the decoy.
+    f.cad378_commit(&wt, "src/daemon/area_rpc.rs");
+    assert_eq!(
+        f.cad378_ack_rows().len(),
+        1,
+        "the recorded branch moved — the row re-raises"
+    );
+}
+
+/// A bound lane whose recorded worktree is gone raises its row as
+/// unknown — never empty-and-silent.
+#[test]
+fn cad378_bound_lane_unreadable_recorded_dir_raises() {
+    let f = PlanFixture::start();
+    std::fs::write(f.pm_dir.join("demo/PROJECT.md"), CAD378_AREAS).unwrap();
+    let d1 = f.cad378_lane("Foreign work", "D-1", "src/peer.rs", "pm-other");
+    let (ok, out) = f.cli(&["issue", "ref", "D-1", "pr", "https://github.com/o/r/pull/9"]);
+    assert!(ok, "{out}");
+    // The record points at a worktree that does not exist.
+    cadence_agent::issue::areas::record_dispatch(
+        &f.d.state,
+        "D-1",
+        json!({"pm": "pm-other", "worktree": "/nonexistent/wt", "branch": "cadence/d-1"}),
+    )
+    .unwrap();
+    let rows = f.cad378_ack_rows();
+    assert_eq!(
+        rows.len(),
+        1,
+        "a bogus recorded dir raises, not clears: {rows:#?}"
+    );
+    assert!(
+        d1["worktree"].as_str().unwrap().contains(".cadence"),
+        "{d1}"
+    );
+}
+
+/// `dispatch_record` takes its pm from the connection — a `pm` param
+/// is ignored, identity-shaped fields are refused, and a bogus
+/// worktree or branch is rejected before anything is written.
+#[test]
+fn cad378_dispatch_record_binds_the_connection() {
+    let f = PlanFixture::start();
+    let (ok, out) = f.cli(&["issue", "new", "Work", "--project", "demo"]);
+    assert!(ok, "{out}");
+    let (ok, start) = f.cli(&["issue", "start", "D-1", "--by", "pm-other"]);
+    assert!(ok, "{start}");
+    let wt = start["worktree"].as_str().unwrap().to_string();
+    let branch = start["branch"].as_str().unwrap().to_string();
+    // A `pm` param is not how the pm binds — the connection's identity
+    // (the operator here) is what the record keeps.
+    let r =
+        f.d.operator_rpc(
+            "dispatch_record",
+            json!({"issue": "D-1", "worktree": wt, "branch": branch, "pm": "pm-own"}),
+        )
+        .unwrap();
+    assert_eq!(r["pm"], "operator", "{r}");
+    for (field, val) in [("by", "pm-own"), ("actor", "pm-own"), ("owner", "pm-own")] {
+        let err =
+            f.d.operator_rpc(
+                "dispatch_record",
+                json!({"issue": "D-1", "worktree": &wt, "branch": &branch, field: val}),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("connection-bound"), "{field}: {err}");
+    }
+    // A worktree that is not absolute and a branch git would read as
+    // an option are refused; an unknown issue is refused too.
+    for params in [
+        json!({"issue": "D-1", "worktree": "rel/path", "branch": "b"}),
+        json!({"issue": "D-1", "worktree": &wt, "branch": "-rf"}),
+        json!({"issue": "D-9", "worktree": &wt, "branch": "b"}),
+    ] {
+        assert!(
+            f.d.operator_rpc("dispatch_record", params).is_err(),
+            "refused params were recorded"
+        );
+    }
+    // The operator's earlier record still stands — bind it to a real
+    // pm via the record file the RPC wrote, and the lane binds.
+    let (_, view) = f.cli(&["overview", "--json"]);
+    let lanes = view["projects"][0]["lanes"].clone();
+    assert_eq!(lanes[0]["pm"], "operator", "{lanes}");
+    assert_eq!(lanes[0]["bound"], true, "{lanes}");
 }

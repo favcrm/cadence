@@ -287,6 +287,13 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         "area_ack",
         Rule::Handler("rpc_area_ack: the operator, or the area's owner PM by its connection (CAD-378)"),
     ),
+    (
+        "dispatch_record",
+        Rule::Handler(
+            "rpc_dispatch_record: any proven caller; the record's pm is the \
+             connection's, never a param (CAD-378)",
+        ),
+    ),
     ("project_work_approvals", Rule::Read),
     // CAD-339: the master agent's verbs. `Shared::master_policy` runs
     // before this table for every method (the master's allowlist).

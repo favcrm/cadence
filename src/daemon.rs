@@ -2502,6 +2502,7 @@ impl Shared {
             "project_work_approve" => self.rpc_project_work_approve(params, peer_pid),
             "project_new" => self.rpc_project_new(params, peer_pid),
             "area_ack" => self.rpc_area_ack(params, peer_pid),
+            "dispatch_record" => self.rpc_dispatch_record(params, peer_pid),
             "rollout_grant" => self.rpc_rollout_grant(params, peer_pid),
             "rollout_revoke" => self.rpc_rollout_revoke(params, peer_pid),
             "project_work_approvals" => Ok(json!({

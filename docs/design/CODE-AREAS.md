@@ -68,7 +68,7 @@ is new, the warnings are recorded on the issue as a comment of kind
 
 An **open lane** is an issue that is not done or dropped and has an open
 worktree ref. Its changed files come from
-`git diff --name-only <merge-base> HEAD` in its worktree — **committed
+`git diff --name-only <merge-base> <rev>` — **committed
 work only**. Both sides of the diff are objects, so the read never
 hashes the working tree: a lane's `.gitattributes` filters, fsmonitor
 command and hooks cannot run inside the board process, no matter what
@@ -77,19 +77,31 @@ uncommitted edits and untracked files are invisible to the board — it
 warns on what a lane has committed. Lane probes run on a bounded pool
 (four git readers at once), each bounded by a timeout.
 
-A lane's *PM* — the `pm` in its lane record — is bound to its
-start/dispatch record: the `Actor:` trailer of the newest tracker
-commit that bound the lane (`start`, `claim`/take-over, a hand-recorded
-`ref worktree`), with a `release` or closed worktree ref lifting the
-binding, and the newest `dispatch`/`claim` comment's author as the
-fallback when no binding commit exists. `claim.by` is never trusted for
-this: it is live frontmatter a lane can rewrite to name its owner and
-suppress its own ack row. `parent` and `plan_epic` — the epic side of
-"the owner's side" — stay frontmatter and remain advisory: a lane that
-claims membership of the owning epic is the same class of
-self-assertion the feature tolerates. All of it is evidence, not proof
-— a hand-forged commit or comment can still fake the record — which is
-why everything warns and nothing refuses.
+What the probe reads — the worktree directory and the `<rev>` it diffs
+— comes from the **daemon's dispatch record**, not the live tracker.
+`dispatches.json` in the daemon's state dir holds one record per issue:
+the worktree and branch the kickoff bound, the kickoff's message id,
+and the `pm` — the connection-derived caller `dispatch_record` saw
+(an agent records only a dispatch it really sent; `master_dispatch`
+writes the record in-daemon with the master's alias). `cadence
+dispatch` writes it after the kickoff send; a record failure is
+reported on the dispatch result, never silently dropped.
+
+A lane with no dispatch record is **unbound**: `pm` is empty, `head`
+pins nothing, and its frontmatter worktree still feeds the advisory
+probe — nothing else. Unbound lanes' `area_ack` rows are **never
+suppressed**: unknown means needs-ack, not empty-and-silent. The same
+rule covers a bound lane whose recorded dir or branch can no longer be
+probed — the row raises and names the lane's planned paths (or says
+the changed files are unknown outright) instead of passing on an
+empty diff.
+
+`claim.by`, frontmatter refs, `Actor:` commit trailers and tracker
+comments bind **nothing** — every one of them is a file the lane can
+write. `parent` and `plan_epic` — the epic side of "the owner's side"
+— stay frontmatter and remain advisory: a lane that claims membership
+of the owning epic is the same class of self-assertion the feature
+tolerates.
 
 ## Needs-you: the owner's ack
 
@@ -112,24 +124,30 @@ stored in the daemon's state dir (`area_acks.json`) together with an
 tracker files accept any author a writer names, so a comment could
 forge the owner.
 
-An ack pins the lane's committed tip (`head`) and records the files it
-covered. The row stays down only while the lane's head is still that
-commit — a lane that commits again re-raises it, whether or not the new
-commits touch the area, so a fresh change gets a fresh look. Acks never
-expire by age; only a new head renews the question. Acks written before
-pinning existed carry no `head` and suppress nothing.
+An ack pins the recorded branch's committed tip (`head`) and records
+the files it covered — the record's worktree and branch, never a live
+frontmatter ref the lane can re-point after the fact. The row stays
+down only while that branch's head is still the pinned commit — a lane
+that commits again re-raises it, whether or not the new commits touch
+the area, so a fresh change gets a fresh look. Acks never expire by
+age; only a new head renews the question. Acks written before pinning
+existed carry no `head` and suppress nothing. An unbound lane cannot
+be acked at all: nothing a daemon saw exists to pin, so `area_ack`
+refuses it by name and its row stays up until the lane is dispatched
+through the daemon or closed.
 
 Warning text and lease comments are scrubbed of control and bidi
 characters before they reach a terminal or a tracker file: refs,
 aliases and planted frontmatter are all agent-writable.
 
-Residuals: area ownership lives in `PROJECT.md`, which agents can edit,
-so a changed owner shows in the tracker's git history but needs no
-operator approval. The dispatch record that binds a lane's PM is
-evidence, not proof — a hand-forged commit can fake it — which is why
-the feature warns and never refuses. A same-uid process that writes the
-state dir directly is the CAD-276 residual that every state-dir record
-shares.
+Residuals: area ownership lives in `PROJECT.md`, which agents can edit
+— deleting or renaming an area silences its rows, and a changed owner
+shows in the tracker's git history but needs no operator approval;
+advisory by design. `dispatch_record` trusts the connection, so a lane
+bound at dispatch stays bound — but a same-uid process that writes the
+state dir directly can rewrite `dispatches.json`/`area_acks.json`
+(the CAD-276 residual every state-dir record shares), which is why the
+feature warns and never refuses.
 
 ## Board
 
