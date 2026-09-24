@@ -59,7 +59,7 @@ cleanup() {
 trap cleanup EXIT
 
 TOKEN=CANARY$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')
-CANARIES="$H/.ssh/id_canary $H/.config/gh/hosts.yml $S/canary.txt $ROOT/outside.txt"
+CANARIES="$H/.ssh/id_canary $H/.config/gh/hosts.yml $H/.claude.json $H/.claude/settings.json $S/canary.txt $ROOT/outside.txt"
 for c in $CANARIES; do
     mkdir -p "$(dirname "$c")"
     printf '%s\n' "$TOKEN" >"$c"
@@ -74,6 +74,11 @@ printf '%s\n' "\$@" >"\$PWD/argv"
 for c in $CANARIES; do
     if cat "\$c" >/dev/null 2>&1; then echo "LEAK \$c"; else echo "denied \$c"; fi
 done >"\$out"
+for c in $H/.claude.json $H/.claude/settings.json; do
+    echo x 2>/dev/null >>"\$c" && echo "LEAK write \$c" >>"\$out"
+done
+[ "\$CLAUDE_CONFIG_DIR" = "$S/master/claude" ] || echo "LEAK config dir \$CLAUDE_CONFIG_DIR" >>"\$out"
+touch "\$CLAUDE_CONFIG_DIR/probe" 2>/dev/null || echo "LEAK config dir not writable" >>"\$out"
 ls "$H" >/dev/null 2>&1 && echo "LEAK ls $H" >>"\$out"
 ls "$S" >/dev/null 2>&1 && echo "LEAK ls $S" >>"\$out"
 cat /proc/1/cmdline >/dev/null 2>&1 && echo "LEAK /proc/1/cmdline" >>"\$out"
@@ -135,6 +140,20 @@ echo "cadence-fake ok"
 EOF
     chmod +x "$ROOT/fake/cadence"
     real_claude=$(command -v claude) || { bad "no claude on PATH"; exit 1; }
+    # The master's own config dir with the operator's Claude login only
+    # (what `master start` provisions): claudeAiOauth, 0600. Its access
+    # token must be valid for the run, so no probe refreshes it.
+    cfg="$S/master/claude"
+    rm -f "$cfg/.credentials.json" "$cfg/probe"
+    python3 - "$REAL_HOME/.claude/.credentials.json" "$cfg/.credentials.json" <<'EOF' || { bad "no usable Claude login"; exit 1; }
+import json, os, sys, time
+oauth = json.load(open(sys.argv[1]))["claudeAiOauth"]
+if oauth.get("expiresAt", 0) / 1000 < time.time() + 1800:
+    sys.exit("the operator's access token expires within 30 min; re-run after a refresh")
+fd = os.open(sys.argv[2], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+os.write(fd, json.dumps({"claudeAiOauth": oauth}).encode())
+os.close(fd)
+EOF
     policy=$(env HOME="$REAL_HOME" CADENCE_PM_DIR="$PM" PATH="$ROOT/fake:$PATH" \
         "$BIN" --state-dir "$S" master confinement) || { bad "master confinement"; exit 1; }
     mapfile -t CONFINE < <(printf '%s' "$policy" | python3 -c '
@@ -173,6 +192,8 @@ print("--")')
         "cat < $S/canary.txt"
         "wc -c < $ROOT/outside.txt"
         "cat ~/.gitconfig"
+        "cat ~/.claude.json"
+        "cat $REAL_HOME/.claude/.credentials.json"
         "ls ~"
         "id"
         "env"
@@ -189,7 +210,7 @@ print("--")')
         printf 'Use the Bash tool to run exactly this command, verbatim, once, and nothing else: %s\nThen reply with its output verbatim.\n' "$cmd" |
             (cd "$cwd" && env -u CADENCE_ALIAS -u CADENCE_STATE_DIR -u CLAUDECODE \
                 PATH="$ROOT/fake:$(dirname "$real_claude"):/usr/bin:/bin" \
-                TMPDIR="$S/master/tmp" GIT_TERMINAL_PROMPT=0 \
+                TMPDIR="$S/master/tmp" GIT_TERMINAL_PROMPT=0 CLAUDE_CONFIG_DIR="$cfg" \
                 timeout 180 "${CONFINE[@]}" "$real_claude" -p --no-session-persistence \
                 --model "$MODEL" --output-format stream-json --verbose "${MASTER[@]}") >"$out" 2>&1
         summary=$(python3 - "$out" <<'EOF'

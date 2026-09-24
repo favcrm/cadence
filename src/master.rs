@@ -46,12 +46,27 @@
 //! reason (the set is undocumented and version-dependent, and deny rules
 //! miss `/usr/bin/cat`-style forms); (c) bubblewrap, including Claude
 //! Code's own Bash sandbox, needs unprivileged user namespaces, which
-//! Ubuntu 24.04+ refuses by default — Landlock needs none. Other
-//! platforms have no verified sandbox, so `cadence confine` refuses and
-//! the master does not start there. Known residue: the Claude CLI's own
-//! state (`~/.claude`, which holds its login) stays readable to the
-//! whole tree — Claude's path check denies `cat` there, but an
-//! allowlisted `--file` verb can read it.
+//! Ubuntu 24.04+ refuses by default — Landlock needs none.
+//!
+//! The confined CLI has its own config dir ([`claude_config_dir`], its
+//! `CLAUDE_CONFIG_DIR`): nothing of the operator's `~/.claude` or
+//! `~/.claude.json` is in the policy — a confined CLI could otherwise
+//! only rewrite that shared file in place, unlocked, and a writable
+//! `~/.claude/settings.json` would plant hooks in every operator
+//! session. `master start` copies the operator's Claude login into it
+//! ([`provision_login`]). Residue: the master's tree can read that copy
+//! of its own login.
+//!
+//! Where Landlock is unavailable (macOS, older kernels) `master start`
+//! refuses; `master start --unconfined` (operator decision) starts it
+//! unwrapped with its own warning, a `master_started_unconfined` event
+//! and a Needs-you info row while it runs. A macOS `sandbox-exec`
+//! profile is a separate ticket.
+//!
+//! The tracker is in the write set (`cadence report file` commits into
+//! it), so its `.git/hooks` and `.git/config` are too: Landlock grants
+//! whole subtrees and cannot carve those out. Defence in depth only — no
+//! allowlisted verb writes a caller-chosen path there.
 //!
 //! Beyond the master's own tree this is a process guard, not a security
 //! boundary: another same-uid process can still read credential files
@@ -150,7 +165,15 @@ pub fn is_master(alias: &str) -> bool {
 /// `gh` finds no stored login (an empty config dir under the state dir),
 /// git never prompts for credentials, and the tracker is named
 /// explicitly — the master's cwd is not the tracker.
-pub fn env_overrides(state_dir: &Path, pm_dir: Option<&Path>) -> Vec<(String, String)> {
+///
+/// Confined (CAD-439), the CLI also gets its own config dir
+/// ([`claude_config_dir`]); an unconfined master (`master start
+/// --unconfined`, a host without Landlock) keeps the operator's.
+pub fn env_overrides(
+    state_dir: &Path,
+    pm_dir: Option<&Path>,
+    confined: bool,
+) -> Vec<(String, String)> {
     let gh = state_dir.join("master").join("no-forge");
     let _ = std::fs::create_dir_all(&gh);
     let tmp = tmpdir(state_dir);
@@ -164,6 +187,12 @@ pub fn env_overrides(state_dir: &Path, pm_dir: Option<&Path>) -> Vec<(String, St
         // CAD-439: `/tmp` is outside its confinement.
         ("TMPDIR".to_string(), tmp.to_string_lossy().to_string()),
     ];
+    if confined {
+        env.push((
+            "CLAUDE_CONFIG_DIR".to_string(),
+            claude_config_dir(state_dir).to_string_lossy().to_string(),
+        ));
+    }
     if let Some(pm) = pm_dir {
         env.push((
             "CADENCE_PM_DIR".to_string(),
@@ -202,7 +231,8 @@ pub const CONFINE_SYSTEM_READ: &[&str] = &[
 ];
 
 /// Device files the master's process tree may use — not `/dev` whole
-/// (`/dev/shm` holds other processes' shared memory).
+/// (`/dev/shm` holds other processes' shared memory), and no pty: the
+/// managed master talks over pipes.
 pub const CONFINE_SYSTEM_WRITE: &[&str] = &[
     "/dev/null",
     "/dev/zero",
@@ -210,14 +240,7 @@ pub const CONFINE_SYSTEM_WRITE: &[&str] = &[
     "/dev/random",
     "/dev/urandom",
     "/dev/tty",
-    "/dev/ptmx",
-    "/dev/pts",
 ];
-
-/// The Claude CLI's own state under `$HOME`: its config dir (auth,
-/// session transcripts for `--resume`, shell snapshots), its config
-/// file and its version locks. Nothing else under `$HOME`.
-pub const CONFINE_HOME_WRITE: &[&str] = &[".claude", ".claude.json", ".local/state/claude"];
 
 /// The native Claude CLI's install tree under `$HOME`.
 pub const CONFINE_HOME_READ: &[&str] = &[".local/share/claude"];
@@ -259,10 +282,9 @@ pub fn confinement(inputs: &ConfineInputs) -> crate::confine::Policy {
     let mut write: Vec<PathBuf> = CONFINE_SYSTEM_WRITE.iter().map(PathBuf::from).collect();
     if let Some(home) = &inputs.home {
         read.extend(CONFINE_HOME_READ.iter().map(|p| home.join(p)));
-        write.extend(CONFINE_HOME_WRITE.iter().map(|p| home.join(p)));
     }
     for program in &inputs.programs {
-        if let Some(dir) = program_dir(program) {
+        for dir in program_dirs(program) {
             if !read.contains(&dir) {
                 read.push(dir);
             }
@@ -275,6 +297,7 @@ pub fn confinement(inputs: &ConfineInputs) -> crate::confine::Policy {
     ));
     write.push(workdir(&inputs.state_dir));
     write.push(tmpdir(&inputs.state_dir));
+    write.push(claude_config_dir(&inputs.state_dir));
     if let Some(pm) = &inputs.pm_dir {
         write.push(pm.clone());
     }
@@ -285,10 +308,19 @@ pub fn confinement(inputs: &ConfineInputs) -> crate::confine::Policy {
 
 /// The directory holding `program`'s real file (symlinks resolved), so
 /// the whole install — a native build's versions dir, an npm package —
-/// is readable. `None` when the program does not exist.
-fn program_dir(program: &Path) -> Option<PathBuf> {
-    let real = program.canonicalize().ok()?;
-    real.parent().map(Path::to_path_buf)
+/// is readable; for a `cadence` release (`<releases>/<sha>/cadence`,
+/// `<releases>/v<version>/cadence`) the whole releases root, so a
+/// `cadence upgrade` repointing the link mid-run leaves the master's
+/// verbs runnable (it holds only release binaries). Nothing when the
+/// program does not exist.
+fn program_dirs(program: &Path) -> Vec<PathBuf> {
+    let Ok(real) = program.canonicalize() else {
+        return vec![];
+    };
+    if let Some(root) = crate::upgrade::releases_dir_of(&real) {
+        return vec![root];
+    }
+    real.parent().map(Path::to_path_buf).into_iter().collect()
 }
 
 /// `name` resolved against `path` (a `PATH` value) the way `execvp`
@@ -356,6 +388,128 @@ pub fn confine_argv(
     argv.push("--".to_string());
     argv.extend(command.iter().cloned());
     argv
+}
+
+/// The master's own Claude config dir (its `CLAUDE_CONFIG_DIR`, CAD-439
+/// review): the CLI's state — session transcripts for `--resume`, its
+/// `.claude.json`, shell snapshots, its login — lives here, never in the
+/// operator's shared `~/.claude` / `~/.claude.json`, which a confined
+/// CLI could only rewrite in place, unlocked. Nothing of the operator's
+/// config is in the master's confinement.
+pub fn claude_config_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join("master").join("claude")
+}
+
+/// Is the master launched unconfined — `master start --unconfined` on a
+/// host without Landlock (operator decision, CAD-439 review)? Only the
+/// operator-only `master_start` writes this param; `agent_set` cannot.
+pub fn unconfined(params: Option<&Value>) -> bool {
+    params
+        .and_then(|p| p.get("unconfined"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Debug-build test seam: this daemon's own `ProviderEnv` (never the
+/// process env) simulating a host without Landlock.
+pub const TEST_NO_LANDLOCK: &str = "CADENCE_TEST_NO_LANDLOCK";
+
+/// Ok when this daemon can confine the master.
+pub fn confinement_available(env: &crate::adapter::ProviderEnv) -> Result<()> {
+    #[cfg(debug_assertions)]
+    if env.own(TEST_NO_LANDLOCK).is_some() {
+        return Err(Error::provider(
+            "cadence confine: Landlock is unavailable (test seam)",
+        ));
+    }
+    let _ = env;
+    crate::confine::available()
+}
+
+/// How the master's Claude login was provisioned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Login {
+    /// The master's config dir already has a login (an earlier copy, or
+    /// the operator's own `claude auth login` into it) — left alone.
+    Own,
+    /// Copied from the operator's Claude config at this start.
+    Copied,
+    /// The operator has no file login to copy (API key auth, a macOS
+    /// keychain login): the master's CLI finds none.
+    None,
+}
+
+impl Login {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Own => "own",
+            Self::Copied => "copied",
+            Self::None => "none",
+        }
+    }
+}
+
+/// `master start` (the operator, through the daemon): give the master's
+/// config dir a Claude login when it has none — the `claudeAiOauth`
+/// entry of the operator's `.credentials.json` only (never its MCP
+/// server tokens), written once, mode 0600, in a 0700 dir. Never via
+/// env or argv.
+///
+/// Refresh and expiry: the master's CLI refreshes its access token into
+/// its own copy. Whether a refresh on one side invalidates the other
+/// side's refresh token (refresh-token rotation) is the provider's
+/// policy and unverified here; if it does, whichever side refreshes
+/// second must sign in again. For an independent grant the operator
+/// runs `CLAUDE_CONFIG_DIR=<state>/master/claude claude auth login`
+/// once — an existing login is never overwritten. When the master's
+/// login expires or is revoked its turns fail with the CLI's auth error;
+/// delete `<state>/master/claude/.credentials.json` and run `master
+/// start` again, or sign in into that dir.
+pub fn provision_login(state_dir: &Path, operator_config: &Path) -> Result<Login> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let dir = claude_config_dir(state_dir);
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)?;
+    let target = dir.join(".credentials.json");
+    if target.exists() {
+        return Ok(Login::Own);
+    }
+    let Ok(text) = std::fs::read_to_string(operator_config.join(".credentials.json")) else {
+        return Ok(Login::None);
+    };
+    let oauth = serde_json::from_str::<Value>(&text)
+        .ok()
+        .and_then(|v| v.get("claudeAiOauth").cloned())
+        .filter(Value::is_object);
+    let Some(oauth) = oauth else {
+        return Ok(Login::None);
+    };
+    let tmp = dir.join(".credentials.json.tmp");
+    let _ = std::fs::remove_file(&tmp);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    file.write_all(json!({"claudeAiOauth": oauth}).to_string().as_bytes())?;
+    file.sync_all()?;
+    std::fs::rename(&tmp, &target)?;
+    Ok(Login::Copied)
+}
+
+/// The operator's Claude config dir: `CLAUDE_CONFIG_DIR`, else
+/// `$HOME/.claude`.
+pub fn operator_claude_config(config_dir: Option<String>, home: Option<String>) -> Option<PathBuf> {
+    config_dir
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            home.filter(|h| !h.is_empty())
+                .map(|h| Path::new(&h).join(".claude"))
+        })
 }
 
 /// The master's private temp dir (its `TMPDIR`) — `/tmp` itself is not
@@ -777,23 +931,24 @@ mod tests {
             v.sort();
             v
         };
-        assert_eq!(
-            under("/h"),
-            [
-                "/h/.claude",
-                "/h/.claude.json",
-                "/h/.local/share/claude",
-                "/h/.local/state/claude"
-            ]
-        );
+        // The operator's Claude config is not in it at all (review I1):
+        // only the CLI's install, read-only.
+        assert_eq!(under("/h"), ["/h/.local/share/claude"]);
+        assert!(policy
+            .read
+            .contains(&PathBuf::from("/h/.local/share/claude")));
         assert_eq!(
             under("/s"),
             [
                 "/s/briefings/master/BRIEFING-master.md",
+                "/s/master/claude",
                 "/s/master/cwd",
                 "/s/master/tmp"
             ]
         );
+        assert!(!all
+            .iter()
+            .any(|p| p.starts_with("/dev/pts") || p.ends_with("ptmx")));
         assert_eq!(under("/proc/self"), ["/proc/self"]);
         assert!(policy.write.contains(&PathBuf::from("/pm")));
         assert!(policy.read.contains(&PathBuf::from("/x")));
@@ -807,6 +962,66 @@ mod tests {
             .write
             .iter()
             .any(|p| p.starts_with("/usr") || p.starts_with("/etc")));
+    }
+
+    /// Review I2: a `cadence` release grants the whole releases root, so
+    /// an upgrade repointing the link mid-run keeps the verbs runnable.
+    #[test]
+    fn a_cadence_release_grants_its_releases_root() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rel = tmp.path().join("releases");
+        let sha = "a".repeat(40);
+        let bin = rel.join(&sha).join("cadence");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, "").unwrap();
+        let link = tmp.path().join("cadence");
+        std::os::unix::fs::symlink(&bin, &link).unwrap();
+        let policy = confinement(&ConfineInputs {
+            state_dir: PathBuf::from("/s"),
+            home: None,
+            pm_dir: None,
+            programs: vec![link],
+            extra_read: vec![],
+            extra_write: vec![],
+        });
+        let root = rel.canonicalize().unwrap();
+        assert!(policy.read.contains(&root), "{policy:?}");
+        assert!(!policy.read.iter().any(|p| p.starts_with(root.join(&sha))));
+    }
+
+    /// Review I1: the master's login is the operator's `claudeAiOauth`
+    /// only (never its MCP tokens), 0600 in a 0700 dir, written once.
+    #[test]
+    fn provision_login_copies_only_the_claude_login_once() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (state, operator) = (tmp.path().join("s"), tmp.path().join("op"));
+        std::fs::create_dir_all(&operator).unwrap();
+        assert_eq!(provision_login(&state, &operator).unwrap(), Login::None);
+        // Secret-shaped values built at runtime.
+        let token = format!("tok-{}", uuid::Uuid::new_v4().simple());
+        let mcp = format!("mcp-{}", uuid::Uuid::new_v4().simple());
+        let creds = json!({
+            "claudeAiOauth": {"accessToken": token, "refreshToken": "r", "expiresAt": 1},
+            "mcpOAuth": {"github|x": {"accessToken": mcp}},
+        });
+        std::fs::write(operator.join(".credentials.json"), creds.to_string()).unwrap();
+        assert_eq!(provision_login(&state, &operator).unwrap(), Login::Copied);
+        let file = claude_config_dir(&state).join(".credentials.json");
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.contains(&token) && !text.contains(&mcp), "{text}");
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&file), 0o600);
+        assert_eq!(mode(&claude_config_dir(&state)), 0o700);
+        // An existing login — the master's own sign-in — is left alone.
+        std::fs::write(&file, "{\"claudeAiOauth\":{\"accessToken\":\"own\"}}").unwrap();
+        assert_eq!(provision_login(&state, &operator).unwrap(), Login::Own);
+        assert!(std::fs::read_to_string(&file).unwrap().contains("own"));
+        // A credentials file without a Claude login copies nothing.
+        let other = tmp.path().join("s2");
+        std::fs::write(operator.join(".credentials.json"), "{\"mcpOAuth\":{}}").unwrap();
+        assert_eq!(provision_login(&other, &operator).unwrap(), Login::None);
+        assert!(!claude_config_dir(&other).join(".credentials.json").exists());
     }
 
     #[test]

@@ -686,7 +686,8 @@ impl Audience {
             // plan awaiting approval are the operator's to decide.
             "approval" | "fenced" | "question" | "plan" => Self::Operator,
             "drift" => Self::Dependency,
-            "inbox_unread" | "tracker_behind" => Self::Info,
+            // CAD-439: informs the operator; nothing for the team.
+            "inbox_unread" | "tracker_behind" | "master_unconfined" => Self::Info,
             _ => Self::Team,
         }
     }
@@ -2126,6 +2127,25 @@ fn agent_items(a: &Value, probe: &AgentProbe, project: &str, now: i64) -> Vec<It
             .owned_by(pm)
     };
     let mut items = Vec::new();
+    // CAD-439 (operator decision): a master started `--unconfined` on a
+    // host without Landlock shows for as long as it is registered and
+    // not stopped.
+    if crate::master::is_master(alias)
+        && crate::master::unconfined(Some(&a["params"]))
+        && a["state"].as_str() != Some("stopped")
+    {
+        items.push(
+            row(
+                90,
+                "master_unconfined",
+                "master runs unconfined — no filesystem sandbox on this host; it can read and \
+                 write your files",
+                age,
+                &cmd_agent_show(alias),
+            )
+            .owned_by(None),
+        );
+    }
     // Condition clocks (CAD-253): a daemon-measured age is a start
     // time; `updated` is not — any params/model write moves it.
     let secs_ago = |key: &str| a[key].as_f64().map(|s| now - s as i64);

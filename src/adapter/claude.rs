@@ -264,12 +264,18 @@ fn launch_command(
     mcp_config: Option<&Path>,
 ) -> (Vec<String>, Option<crate::confine::Policy>) {
     let command = build_command(env, agent, session_id, resume, mcp_config);
-    if !crate::master::is_master(&agent.alias) {
+    if !master_confined(agent) {
         return (command, None);
     }
     let (confine, policy) = master_confinement(env, state_dir);
     let argv = crate::master::confine_argv(&confine, &policy, &command);
     (argv, Some(policy))
+}
+
+/// The master, unless the operator started it `--unconfined` on a host
+/// without Landlock.
+fn master_confined(agent: &Agent) -> bool {
+    crate::master::is_master(&agent.alias) && !crate::master::unconfined(agent.params.as_ref())
 }
 
 /// The confining binary and the policy a master launched by a daemon
@@ -283,18 +289,26 @@ pub fn master_confinement(env: &ProviderEnv, state_dir: &Path) -> (String, crate
     )
 }
 
-/// The cadence binary that runs `confine` for the master —
-/// `CADENCE_CONFINE_COMMAND`, else this binary (tests point it at the
-/// built binary: `current_exe` there is the test runner).
+/// The cadence binary that runs `confine` for the master: this binary.
+/// Debug builds only, the daemon's own `CADENCE_CONFINE_COMMAND` (never
+/// the process env) overrides it — tests point it at the built binary,
+/// `current_exe` there being the test runner.
 fn confine_command(env: &ProviderEnv) -> String {
-    env.var("CADENCE_CONFINE_COMMAND")
-        .filter(|c| !c.trim().is_empty())
-        .or_else(|| {
-            std::env::current_exe()
-                .ok()
-                .map(|p| p.to_string_lossy().to_string())
-        })
-        .unwrap_or_else(|| "cadence".to_string())
+    #[cfg(debug_assertions)]
+    let own = env
+        .own("CADENCE_CONFINE_COMMAND")
+        .filter(|c| !c.trim().is_empty());
+    #[cfg(not(debug_assertions))]
+    let own: Option<String> = {
+        let _ = env;
+        None
+    };
+    own.or_else(|| {
+        std::env::current_exe()
+            .ok()
+            .map(|p| p.to_string_lossy().to_string())
+    })
+    .unwrap_or_else(|| "cadence".to_string())
 }
 
 /// What the master's confinement is computed from, read from this
@@ -327,16 +341,7 @@ fn master_confine_inputs(
         pm_dir,
         programs,
         extra_read: split_paths(env.var(crate::master::CONFINE_EXTRA_READ_ENV)),
-        // A relocated Claude config dir (kept through the env scrub) is
-        // the CLI's own state, like `~/.claude`.
-        extra_write: split_paths(env.var(crate::master::CONFINE_EXTRA_WRITE_ENV))
-            .into_iter()
-            .chain(
-                env.var("CLAUDE_CONFIG_DIR")
-                    .filter(|d| !d.is_empty())
-                    .map(PathBuf::from),
-            )
-            .collect(),
+        extra_write: split_paths(env.var(crate::master::CONFINE_EXTRA_WRITE_ENV)),
     }
 }
 
@@ -765,7 +770,11 @@ impl ProviderAdapter for ClaudeAdapter {
                 .is_none()
                 .then(crate::issue::default_dir)
                 .and_then(Result::ok);
-            env.extend(crate::master::env_overrides(&self.state_dir, pm.as_deref()));
+            env.extend(crate::master::env_overrides(
+                &self.state_dir,
+                pm.as_deref(),
+                master_confined(agent),
+            ));
         }
         let params = agent.params.clone().unwrap_or(Value::Null);
         let idle_secs = params
@@ -1074,10 +1083,20 @@ mod tests {
         for p in ["/usr", "/etc", "/proc/self", "/h/.local/share/claude"] {
             assert!(reads.iter().any(|r| r == p), "{p}: {argv:?}");
         }
-        for p in ["/s/master/cwd", "/s/master/tmp", "/pm", "/h/.claude"] {
+        for p in ["/s/master/cwd", "/s/master/tmp", "/s/master/claude", "/pm"] {
             assert!(writes.iter().any(|w| w == p), "{p}: {argv:?}");
         }
-        for p in ["/", "/h", "/s", "/tmp", "/proc", "/dev"] {
+        for p in [
+            "/",
+            "/h",
+            "/h/.claude",
+            "/h/.claude.json",
+            "/s",
+            "/tmp",
+            "/proc",
+            "/dev",
+            "/dev/pts",
+        ] {
             assert!(
                 !reads.iter().chain(&writes).any(|r| r == p),
                 "{p}: {argv:?}"
@@ -1087,6 +1106,13 @@ mod tests {
         let (argv, _) = launch_command(&env, state, &master, "s", true, None);
         assert_eq!(argv[..2], ["/opt/cadence/bin/cadence", "confine"]);
         assert!(argv.iter().any(|a| a == "--resume"));
+        // An operator's `--unconfined` start (no Landlock on the host):
+        // the CAD-339 line, unwrapped.
+        let loose = agent("master", json!({"unconfined": true}));
+        let (argv, policy) = launch_command(&env, state, &loose, "s", false, None);
+        assert!(policy.is_none());
+        assert_eq!(argv, build_command(&env, &loose, "s", false, None));
+        assert_eq!(flag_values(&argv, "--permission-mode"), ["dontAsk"]);
         // Any other agent: no wrapper, no policy.
         let dev = agent("dev-1", json!({}));
         let (argv, policy) = launch_command(&env, state, &dev, "s", false, None);

@@ -11,9 +11,21 @@
 //!
 //! The daemon launches the master's provider through this command; the
 //! policy the master gets is [`crate::master::confinement`]. A path that
-//! does not exist is skipped, never widened to its parent. Network and
-//! unix-socket connects are not restricted — the master talks to the
-//! daemon socket and the provider's API.
+//! does not exist is skipped, never widened to its parent. On Landlock
+//! ABI 6+ the process is also scoped: it cannot signal processes outside
+//! its domain (the daemon, the operator's shells) nor connect to abstract
+//! unix sockets. Network and path-named unix-socket connects are not
+//! restricted — the master talks to the daemon socket and the provider's
+//! API.
+//!
+//! **What this is not.** It confines the filesystem, not what the
+//! process can ask others to do. A confined process that gets arbitrary
+//! exec escapes through any unix-socket service it can reach —
+//! `systemd-run --user` (the user bus), a tmux server, an ssh-agent — and
+//! runs unconfined there. For the master, the Bash allowlist
+//! (`master::CLAUDE_ALLOWED_TOOLS`) is the barrier against arbitrary
+//! exec; this sandbox is the backstop for reads (Claude Code's auto-
+//! allowed read-only commands, `--file` arguments).
 
 use std::path::PathBuf;
 
@@ -106,6 +118,9 @@ mod landlock {
 
     const CREATE_RULESET_VERSION: u32 = 1;
     const RULE_PATH_BENEATH: libc::c_int = 1;
+    /// ABI 6 scopes.
+    const SCOPE_ABSTRACT_UNIX_SOCKET: u64 = 1 << 0;
+    const SCOPE_SIGNAL: u64 = 1 << 1;
 
     const EXECUTE: u64 = 1 << 0;
     const WRITE_FILE: u64 = 1 << 1;
@@ -163,6 +178,15 @@ mod landlock {
         rights
     }
 
+    /// The scopes this ABI version enforces: none before ABI 6.
+    pub fn scopes(abi: i64) -> u64 {
+        if abi >= 6 {
+            SCOPE_ABSTRACT_UNIX_SOCKET | SCOPE_SIGNAL
+        } else {
+            0
+        }
+    }
+
     pub fn restrict_self(policy: &Policy) -> Result<()> {
         let abi = abi_version();
         if abi < 1 {
@@ -172,15 +196,18 @@ mod landlock {
         let attr = RulesetAttr {
             handled_access_fs: handled,
             handled_access_net: 0,
-            scoped: 0,
+            scoped: scopes(abi),
         };
-        // SAFETY: attr is a valid, fully initialised struct; the kernel
-        // accepts a larger struct whose unknown tail is zero.
+        // The struct size each ABI knows: `scoped` arrived in ABI 6,
+        // `handled_access_net` in ABI 4 — an older kernel refuses a
+        // larger struct with a non-zero tail, and ours is zero there.
+        let size = std::mem::size_of::<RulesetAttr>();
+        // SAFETY: attr is a valid, fully initialised struct of `size`.
         let ruleset = unsafe {
             libc::syscall(
                 libc::SYS_landlock_create_ruleset,
                 &attr as *const RulesetAttr,
-                std::mem::size_of::<RulesetAttr>(),
+                size,
                 0u32,
             )
         };

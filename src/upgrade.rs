@@ -508,7 +508,7 @@ pub fn is_version_tag(s: &str) -> bool {
 
 /// The releases dir holding a link target: `<dir>/<40-hex>/cadence` (an
 /// upgrade) or `<dir>/v<version>/cadence` (an `install.sh` release).
-fn releases_dir_of(target: &Path) -> Option<PathBuf> {
+pub(crate) fn releases_dir_of(target: &Path) -> Option<PathBuf> {
     if let Some((dir, _)) = release_of(target) {
         return Some(dir);
     }

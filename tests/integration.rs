@@ -41060,6 +41060,14 @@ impl PlanFixture {
     /// `master_start` (as the operator) with the enrollment mock as the
     /// master's claude; waits for the daemon to enroll it.
     fn start_master(&self) -> (ManagedWorker, Value) {
+        self.start_master_with(json!({"provider": "claude"}))
+    }
+
+    /// [`Self::start_master`] with explicit `master_start` params.
+    fn start_master_with(&self, params: Value) -> (ManagedWorker, Value) {
+        // The daemon's `$HOME` is the fixture's — `master start` copies
+        // a Claude login from it (CAD-439), never from the host's.
+        test_env().set("HOME", self.tmp.path().join("home").to_str().unwrap());
         // CAD-439: the master's provider runs under `cadence confine`.
         // The built binary applies it (`current_exe` is this runner),
         // and the mock's own files — script, pidfile, command dir — are
@@ -41075,10 +41083,7 @@ impl PlanFixture {
             cadence_agent::master::CONFINE_EXTRA_WRITE_ENV,
             format!("{}:{}", mock_dir.display(), mock.cmd_dir.path().display()),
         );
-        let out = self
-            .d
-            .operator_rpc("master_start", json!({"provider": "claude"}))
-            .unwrap();
+        let out = self.d.operator_rpc("master_start", params).unwrap();
         assert_eq!(out["alias"], "master", "{out}");
         (mock.enrolled(&self.d, "master"), out)
     }
@@ -41875,6 +41880,30 @@ fn confine_denies_everything_unlisted() {
         );
     }
     assert!(!open.join("stolen").exists());
+    // Review: on Landlock ABI 6+ the domain is scoped — no signal to a
+    // process outside it (this test runner stands in for the daemon),
+    // no connect to an abstract unix socket; both work unconfined.
+    use std::os::linux::net::SocketAddrExt;
+    let name = format!("cad439-{}", uuid::Uuid::new_v4().simple());
+    let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+    let _listener = std::os::unix::net::UnixListener::bind_addr(&addr).unwrap();
+    let connect = format!(
+        "python3 -c 'import socket; s=socket.socket(socket.AF_UNIX); s.connect(\"\\0{name}\")'"
+    );
+    let signal = format!("kill -0 {}", std::process::id());
+    for script in [&connect, &signal] {
+        let o = std::process::Command::new("sh")
+            .args(["-c", script])
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "unconfined {script}: {o:?}");
+    }
+    if cadence_agent::confine::abi_version() >= 6 {
+        for script in [&connect, &signal] {
+            let o = run(script);
+            assert!(!o.status.success(), "confined {script}: {o:?}");
+        }
+    }
     let o = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
         .args(["confine", "--read", "/usr"])
         .output()
@@ -41894,21 +41923,40 @@ fn confine_denies_everything_unlisted() {
 #[test]
 fn master_reads_nothing_outside_its_views() {
     let f = PlanFixture::start();
-    // The daemon's `$HOME` — never the host's.
+    // The fixture's `$HOME` (the daemon's, via `start_master`): the
+    // operator's Claude login, with an MCP token beside it, built at
+    // runtime.
     let home = f.tmp.path().join("home");
-    test_env().set("HOME", home.to_str().unwrap());
-    let (mut m, _) = f.start_master();
     let token = format!("CANARY{}", uuid::Uuid::new_v4().simple());
+    let login = format!("login-{}", uuid::Uuid::new_v4().simple());
+    let creds = json!({"claudeAiOauth": {"accessToken": login, "expiresAt": 1},
+                       "mcpOAuth": {"github|x": {"accessToken": token}}});
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    std::fs::write(home.join(".claude/.credentials.json"), creds.to_string()).unwrap();
+    // Every canary exists before the launch: a policy path that does
+    // not exist is skipped, so a canary made later would prove nothing.
     let canaries = [
         home.join(".ssh").join("id_canary"),
         home.join(".config").join("gh").join("hosts.yml"),
+        home.join(".claude.json"),
+        home.join(".claude").join("settings.json"),
+        home.join(".claude").join(".credentials.json"),
         f.d.state.join("canary.txt"),
         f.tmp.path().join("repo").join("canary.txt"),
     ];
     for c in &canaries {
         std::fs::create_dir_all(c.parent().unwrap()).unwrap();
-        std::fs::write(c, &token).unwrap();
+        if !c.exists() {
+            std::fs::write(c, &token).unwrap();
+        }
     }
+    let (mut m, out) = f.start_master();
+    assert_eq!(out["confined"], true, "{out}");
+    assert_eq!(out["login"], "copied", "{out}");
+    // Review I1: the master's own config dir holds the Claude login only.
+    let own = cadence_agent::master::claude_config_dir(&f.d.state).join(".credentials.json");
+    let text = std::fs::read_to_string(&own).unwrap();
+    assert!(text.contains(&login) && !text.contains(&token), "{text}");
     let leaked = |r: &Value| r.to_string().contains(&token);
     for c in &canaries {
         let c = c.to_str().unwrap();
@@ -41922,6 +41970,11 @@ fn master_reads_nothing_outside_its_views() {
             let r = m.exec(&argv);
             assert!(r["rc"] != 0 && !leaked(&r), "{argv:?} read a canary: {r}");
         }
+        // Nor write it: the operator's `~/.claude.json` and settings
+        // hooks above all (review I1).
+        let r = m.exec(&["sh", "-c", &format!("echo x >> {c}")]);
+        assert!(r["rc"] != 0, "{c} written: {r}");
+        assert!(std::fs::read_to_string(c).unwrap().contains(&token));
         // An allowlisted verb that reads a named file.
         let (ok, out) = f.as_master(&mut m, &format!("master escalate D-1 q.md --file {c}"));
         assert!(!ok && !out.to_string().contains(&token), "{out}");
@@ -41944,10 +41997,137 @@ fn master_reads_nothing_outside_its_views() {
     assert!(ok, "{out}");
     let (ok, out) = f.as_master(&mut m, "issue ls");
     assert!(ok, "{out}");
+    let r = m.exec(&["sh", "-c", "printf %s \"$CLAUDE_CONFIG_DIR\""]);
+    assert_eq!(
+        r["out"],
+        cadence_agent::master::claude_config_dir(&f.d.state)
+            .to_str()
+            .unwrap(),
+        "{r}"
+    );
     let own = f.file("own.txt", "mine");
     let r = m.exec(&["cat", &own]);
     assert_eq!(r["rc"], 0, "{r}");
     assert_eq!(r["out"], "mine");
+}
+
+/// CAD-439 review I2: `cadence upgrade` repoints the `cadence` link to a
+/// new release while the master runs — its allowlisted verbs keep
+/// running (the whole releases root is readable, not just the release
+/// it launched with).
+#[test]
+fn master_verbs_survive_an_upgrade_mid_run() {
+    let f = PlanFixture::start();
+    let rel = f.tmp.path().join("releases");
+    let release = |sha: &str| {
+        let bin = rel.join(sha).join("cadence");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(
+            &bin,
+            format!("#!/bin/sh\nexec {} \"$@\"\n", env!("CARGO_BIN_EXE_cadence")),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        bin
+    };
+    let (a, b) = ("a".repeat(40), "b".repeat(40));
+    let bin_dir = f.tmp.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let link = bin_dir.join("cadence");
+    std::os::unix::fs::symlink(release(&a), &link).unwrap();
+    test_env().set(
+        "PATH",
+        format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap()),
+    );
+    let (mut m, _) = f.start_master();
+    let line = f.master_line("agent list").replacen(
+        env!("CARGO_BIN_EXE_cadence"),
+        link.to_str().unwrap(),
+        1,
+    );
+    let r = m.exec(&["sh", "-c", &line]);
+    assert_eq!(r["rc"], 0, "before the upgrade: {r}");
+    // The upgrade: a release that did not exist at launch, the link
+    // swapped atomically.
+    let next = release(&b);
+    let tmp_link = bin_dir.join("cadence.new");
+    std::os::unix::fs::symlink(&next, &tmp_link).unwrap();
+    std::fs::rename(&tmp_link, &link).unwrap();
+    let r = m.exec(&["sh", "-c", &line]);
+    assert_eq!(r["rc"], 0, "after the upgrade: {r}");
+    // Still nothing outside it: a sibling of the releases root.
+    let r = m.exec(&["ls", f.tmp.path().to_str().unwrap()]);
+    assert!(r["rc"] != 0, "{r}");
+}
+
+/// CAD-439 operator decision: on a host without Landlock (simulated by
+/// the daemon's own test seam) `master start` refuses and names
+/// `--unconfined`; `--unconfined` starts it unwrapped, records
+/// `master_started_unconfined`, and Needs-you shows it while it runs.
+/// Where Landlock works, `--unconfined` is refused.
+#[test]
+fn master_without_landlock_starts_only_on_the_operators_opt_in() {
+    let f = PlanFixture::start();
+    let err =
+        f.d.operator_rpc(
+            "master_start",
+            json!({"provider": "claude", "unconfined": true}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("only for hosts without it"), "{err}");
+    test_env().set(cadence_agent::master::TEST_NO_LANDLOCK, "1");
+    let err =
+        f.d.operator_rpc("master_start", json!({"provider": "claude"}))
+            .unwrap_err()
+            .to_string();
+    assert!(
+        err.contains("Landlock is unavailable")
+            && err.contains("--unconfined")
+            && err.contains("read and write your files"),
+        "{err}"
+    );
+    assert!(
+        f.d.rpc("agent_show", json!({"alias": "master"})).is_err(),
+        "a refusal registers nothing"
+    );
+    let (mut m, out) = f.start_master_with(json!({"provider": "claude", "unconfined": true}));
+    assert_eq!(out["confined"], false, "{out}");
+    assert!(
+        out["warning"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("UNCONFINED"),
+        "{out}"
+    );
+    let events = f.d.events("master");
+    assert!(
+        events
+            .iter()
+            .any(|e| e["kind"] == "master_started_unconfined"),
+        "{events:?}"
+    );
+    // Unwrapped: the tool process sees the state dir (and is no Landlock
+    // domain's child — a plain read works).
+    let probe = f.d.state.join("probe.txt");
+    std::fs::write(&probe, "seen").unwrap();
+    let r = m.exec(&["cat", probe.to_str().unwrap()]);
+    assert_eq!(r["out"], "seen", "{r}");
+    let rows = f.needs_me();
+    let row = rows
+        .iter()
+        .find(|r| r["kind"] == "master_unconfined")
+        .unwrap_or_else(|| panic!("no master_unconfined row: {rows:#?}"));
+    assert_eq!(row["audience"], "info", "{row}");
+    assert!(
+        row["title"]
+            .as_str()
+            .unwrap()
+            .contains("read and write your files"),
+        "{row}"
+    );
+    test_env().remove(cadence_agent::master::TEST_NO_LANDLOCK);
 }
 
 /// CAD-339 review round 2: concurrent `master dispatch` calls for one
