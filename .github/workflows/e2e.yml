@@ -1,0 +1,64 @@
+name: e2e
+
+# CAD-433: E2E acceptance tier A — the whole MVP journey in one scripted
+# run (scripts/e2e/mvp.sh → tests/e2e_mvp.rs) with fake providers, a
+# fake `gh` and a headless board. Nightly and on every `v*` tag, never on
+# pull requests: it is not a required check and cannot block a PR. A
+# failed run uploads the board screenshots, the daemon's event log and
+# logs, the fakes' logs and acceptance.json.
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  mvp:
+    # 24.04: Linux with Landlock, which the master's confinement needs —
+    # the journey never starts it `--unconfined`. Google Chrome ships on
+    # the runner image, so no browser is downloaded.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: rustup toolchain install stable --profile minimal --component clippy
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          package_json_file: ui/package.json
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: |
+            ui/pnpm-lock.yaml
+            tests/e2e/pnpm-lock.yaml
+      # The journey's own target is built only with `--features e2e`, so
+      # the PR clippy job never sees it; lint it here.
+      - run: cargo clippy --locked --features e2e --test e2e_mvp -- -D warnings
+      - name: MVP journey
+        env:
+          E2E_OUT: ${{ runner.temp }}/e2e
+          CARGO_BUILD_JOBS: 4
+        run: scripts/e2e/mvp.sh
+      - if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-mvp-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/e2e
+            !${{ runner.temp }}/e2e/release
+          if-no-files-found: warn
+          retention-days: 14

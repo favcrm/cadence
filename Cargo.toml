@@ -18,6 +18,11 @@ path = "src/main.rs"
 # `ui/` first; without the feature `cadence ui run --dist <dir>` serves
 # the same files from disk.
 ui = []
+# CAD-433: build the MVP journey test (`tests/e2e_mvp.rs`). It needs a
+# release built and packed by `scripts/e2e/mvp.sh`, Node and Chrome, so
+# it is its own opt-in target — never part of `cargo test` or the PR
+# suite; CI runs it nightly and on every `v*` tag.
+e2e = []
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
@@ -44,6 +49,11 @@ regex = "1"
 # CAD-396: redact every turn token/generation from an export in one pass.
 aho-corasick = "1"
 ureq = { version = "3.4.2", default-features = false, features = ["json", "rustls"] }
+
+[[test]]
+name = "e2e_mvp"
+path = "tests/e2e_mvp.rs"
+required-features = ["e2e"]
 
 [dev-dependencies]
 shlex = "2.0.1"

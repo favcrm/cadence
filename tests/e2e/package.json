@@ -1,0 +1,11 @@
+{
+  "name": "cadence-e2e",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "packageManager": "pnpm@12.2.1",
+  "description": "CAD-433: the headless board steps of the MVP journey (scripts/e2e/mvp.sh)",
+  "devDependencies": {
+    "playwright-core": "1.63.0"
+  }
+}
