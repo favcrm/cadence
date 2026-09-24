@@ -3372,12 +3372,37 @@ for line in sys.stdin:
             emit({"id": mid, "result": {"turn": {"id": "t-1"}}})
         else:
             emit({"id": mid, "result": {"turn": {"id": "t-1"}}})
-            if mode == "items":
+            def item(iid, text, phase=None):
+                it = {"id": iid, "type": "agentMessage", "text": text}
+                if phase:
+                    it["phase"] = phase
+                emit({"method": "item/completed",
+                      "params": {"turnId": "t-1", "item": it}})
+                return it
+            if mode in ("items", "items-mixed"):
                 # A commentary agentMessage persisted mid-turn (CAD-319).
-                emit({"method": "item/completed", "params": {
-                    "turnId": "t-1", "item": {
-                        "id": "i0", "type": "agentMessage",
-                        "text": "looking", "phase": "commentary"}}})
+                item("i0", "looking", "commentary")
+            if mode == "items-mixed":
+                # Unphased beside a final: Codex's result is the final
+                # only, so the thread keeps this one (CAD-320).
+                item("i0b", "an aside")
+            if mode in ("items", "items-mixed"):
+                # The final answer persists as an item too; the turn
+                # result carries it, so the thread must not repeat it
+                # (CAD-320).
+                item("i1", "MOCK_OK", "final_answer")
+            if mode == "items-unphased":
+                # An older Codex: no phases, the result joins them all.
+                done = [item("i0", "first"), item("i1", "second")]
+                emit({"method": "turn/completed", "params": {"turn": {
+                    "id": "t-1", "status": "completed", "items": done}}})
+                continue
+            if mode == "items-die":
+                # Items persist, then the process dies: the turn is
+                # unknown and its result empty — the thread keeps both.
+                item("i0", "partial")
+                item("i1", "almost there", "final_answer")
+                os._exit(0)
             if mode == "heartbeat":
                 # ~3.6s of streamed activity, never silent for long.
                 for _ in range(12):
@@ -10236,6 +10261,7 @@ fn agent_set_opts_live_agent_into_auto_ready() {
 ///   deny             — result success carrying a non-empty
 ///                      permission_denials array
 ///   die              — exits on the first user message (mid-turn death)
+///   text-die         — init and one "working" text block, then exits
 ///   bad-session      — init reports a session id that is not argv's
 ///   await-interrupt  — no result until SIGINT, then an interrupted one
 ///   replay           — replays the `<pidfile>.fixture` events verbatim,
@@ -10418,6 +10444,8 @@ for line in sys.stdin:
           "message": {"role": "assistant",
                       "content": [{"type": "text", "text": "working"}]},
           "session_id": sid})
+    if mode_now == "text-die":
+        os._exit(0)  # dies mid-turn, after a text block (CAD-320)
     if mode_now == "await-interrupt":
         continue  # the SIGINT handler emits the result
     if mode_now == "hold":
@@ -37824,11 +37852,13 @@ fn cad319_thread_records_operator_messages_and_turn_results() {
 }
 
 /// Managed Claude: the tool use lands as a `tool_call` with its redacted
-/// one-line summary, then the final result text.
+/// one-line summary, then the final result text. The mock's intermediate
+/// "working" text block lands as `assistant_text` (CAD-320) — flushed by
+/// the tool use, or by a `result` that does not repeat it.
 #[test]
 fn cad319_thread_records_managed_claude_tool_use_and_result() {
     let d = TestDaemon::start();
-    let _mock = d.mock_claude("tooluse", None);
+    let mock = d.mock_claude("tooluse", None);
     d.register_claude("master", Value::Null);
     d.wait_agent("master", "idle", 15);
     d.rpc(
@@ -37837,19 +37867,32 @@ fn cad319_thread_records_managed_claude_tool_use_and_result() {
     )
     .unwrap();
     d.wait_message("master", "c1", &["completed"], 20);
+    // No tool use: the held text is not the result, so it is kept.
+    std::fs::write(mock.pidfile.with_extension("pid.mode"), "ok").unwrap();
+    d.rpc(
+        "thread_send",
+        json!({"alias": "master", "text": "again", "message": "c2"}),
+    )
+    .unwrap();
+    d.wait_message("master", "c2", &["completed"], 20);
     assert_eq!(
         thread_shape(&d, "master"),
         vec![
             triple("operator", "message", "hi"),
+            triple("agent", "assistant_text", "working"),
             triple("agent", "tool_call", "Bash: true"),
             triple("agent", "turn_result", "MOCK_OK:hi"),
+            triple("operator", "message", "again"),
+            triple("agent", "assistant_text", "working"),
+            triple("agent", "turn_result", "MOCK_OK:again"),
         ]
     );
     let page = d.rpc("thread_read", json!({"alias": "master"})).unwrap();
-    assert_eq!(page["entries"][1]["payload"]["tool"], "Bash", "{page}");
+    assert_eq!(page["entries"][2]["payload"]["tool"], "Bash", "{page}");
+    assert_eq!(page["entries"][2]["message"], "c1", "{page}");
     assert_eq!(page["entries"][1]["message"], "c1", "{page}");
     assert_eq!(
-        page["entries"][2]["payload"]["status"], "completed",
+        page["entries"][3]["payload"]["status"], "completed",
         "{page}"
     );
 }
@@ -37909,7 +37952,8 @@ fn cad319_thread_redacts_secrets_in_claude_tool_input() {
 }
 
 /// Managed Codex: a persisted commentary `agentMessage` item lands as
-/// `assistant_text` before the final turn result.
+/// `assistant_text` before the final turn result; the persisted
+/// `final_answer` item is the turn result, never repeated (CAD-320).
 #[test]
 fn cad319_thread_records_codex_agent_messages() {
     let d = TestDaemon::start();
@@ -38425,4 +38469,267 @@ fn dispatch_job_precheck_measures_the_issues_existing_lane() {
     let jobs = jobs["jobs"].as_array().unwrap();
     assert_eq!(jobs.len(), 1, "{jobs:?}");
     assert_eq!(jobs[0]["issue"], "D-2", "{jobs:?}");
+}
+
+// ---- CAD-320: Claude intermediate text and tool results in threads ----
+
+/// Every byte of the runtime store (main file, WAL, shm) — a leak check
+/// that no table, index or journal page holds a value.
+fn store_bytes(d: &TestDaemon) -> Vec<u8> {
+    let mut all = Vec::new();
+    for suffix in ["", "-wal", "-shm"] {
+        let path = d.state.join(format!("cadence.sqlite3{suffix}"));
+        if let Ok(bytes) = std::fs::read(&path) {
+            all.extend(bytes);
+        }
+    }
+    all
+}
+
+/// A managed Claude turn replaying text -> tool_use -> tool_result ->
+/// text -> text -> result: the thread keeps that order; the tool output
+/// is a redacted one-line summary plus `is_error`; the last text block,
+/// which the result repeats, is stored once as the turn result. Runtime-built
+/// tokens in the assistant text and the tool output reach none of the
+/// store, `thread_read`, the HTTP GET, the SSE stream or the events.
+#[test]
+fn cad320_thread_records_claude_text_and_tool_results_redacted() {
+    let d = TestDaemon::start();
+    let pm = TempDir::new().unwrap();
+    let port = start_board(pm.path(), &d.state);
+    let in_text = cad109_token(&["gh", "p_"].concat(), "cad320-assistant-text", 36);
+    let in_output = cad109_token(&["gh", "p_"].concat(), "cad320-tool-output", 36);
+    let tail = "CAD320_RAW_TAIL";
+    let output = format!(
+        "GITHUB_TOKEN={in_output}\nline two\n{}{tail}",
+        "x".repeat(400)
+    );
+    let fixture = d.dir.path().join("cad320.jsonl");
+    let text_block = |text: &str| {
+        json!({"type": "assistant", "session_id": "",
+               "message": {"role": "assistant", "content": [{"type": "text", "text": text}]}})
+    };
+    let lines = [
+        json!({"type": "system", "subtype": "init", "session_id": "", "model": "mock-claude", "tools": []}),
+        text_block(&format!("checking the env, saw {in_text}")),
+        json!({"type": "assistant", "session_id": "",
+               "message": {"role": "assistant", "content": [
+                   {"type": "tool_use", "id": "tu_1", "name": "Bash", "input": {"command": "env"}}]}}),
+        json!({"type": "user", "session_id": "",
+               "message": {"role": "user", "content": [
+                   {"type": "tool_result", "tool_use_id": "tu_1", "is_error": true,
+                    "content": [{"type": "text", "text": output}]}]}}),
+        text_block("the output looks fine"),
+        text_block("all clear"),
+        json!({"type": "result", "subtype": "success", "is_error": false, "session_id": "",
+               "result": "all clear", "stop_reason": "end_turn", "num_turns": 2}),
+    ];
+    std::fs::write(
+        &fixture,
+        lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+    let _mock = d.mock_claude("replay", Some(&fixture));
+    d.register_claude("master", Value::Null);
+    d.wait_agent("master", "idle", 15);
+    d.rpc(
+        "thread_send",
+        json!({"alias": "master", "text": "check", "message": "k1"}),
+    )
+    .unwrap();
+    d.wait_message("master", "k1", &["completed"], 20);
+
+    let shape = thread_shape(&d, "master");
+    let kinds: Vec<&str> = shape.iter().map(|(_, k, _)| k.as_str()).collect();
+    assert_eq!(
+        kinds,
+        [
+            "message",
+            "assistant_text",
+            "tool_call",
+            "tool_result",
+            "assistant_text",
+            "turn_result"
+        ],
+        "{shape:?}"
+    );
+    assert!(
+        shape[1].2.starts_with("checking the env, saw [redacted:"),
+        "{shape:?}"
+    );
+    assert_eq!(shape[2].2, "Bash: env", "{shape:?}");
+    let summary = &shape[3].2;
+    assert!(summary.starts_with("GITHUB_TOKEN=[redacted:"), "{summary}");
+    assert!(summary.contains("line two"), "one line: {summary}");
+    assert!(summary.len() <= 160, "{}", summary.len());
+    assert!(summary.ends_with("…[truncated]"), "{summary}");
+    assert_eq!(shape[4].2, "the output looks fine", "{shape:?}");
+    // The final text is the turn result only.
+    assert_eq!(shape[5], triple("agent", "turn_result", "all clear"));
+    assert_eq!(
+        shape.iter().filter(|(_, _, t)| t == "all clear").count(),
+        1,
+        "{shape:?}"
+    );
+
+    let page = d.rpc("thread_read", json!({"alias": "master"})).unwrap();
+    let result = &page["entries"][3];
+    assert_eq!(result["payload"]["is_error"], true, "{result}");
+    assert_eq!(result["payload"]["tool_use_id"], "tu_1", "{result}");
+    assert_eq!(result["message"], "k1", "{result}");
+    assert_eq!(page["entries"][1]["payload"]["phase"], "commentary");
+
+    let (status, get) = board_get(port, "/api/threads/master?after=0");
+    assert_eq!(status, 200, "{get}");
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.write_all(
+        format!(
+            "GET /api/threads/master/stream?after=0 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let mut sse = String::new();
+    sse_until(&mut s, &mut sse, "turn_result", 20);
+    drop(s);
+    assert!(sse.contains("tool_result"), "{sse}");
+
+    let events = Value::Array(d.events("master")).to_string();
+    let tool_event = d.wait_event("master", "tool_result", 10);
+    assert_eq!(
+        tool_event["payload"]["summary"],
+        summary.as_str(),
+        "{tool_event}"
+    );
+    // Assistant prose lives in the thread only, never the event log.
+    assert!(!events.contains("checking the env"), "{events}");
+
+    let db = String::from_utf8_lossy(&store_bytes(&d)).to_string();
+    for (surface, body) in [
+        ("thread_read", page.to_string()),
+        ("http get", get),
+        ("sse", sse),
+        ("events", events),
+        ("store", db),
+    ] {
+        for secret in [&in_text, &in_output] {
+            assert!(!body.contains(secret.as_str()), "{surface} leaked a token");
+        }
+        assert!(!body.contains(tail), "{surface} kept raw tool output");
+    }
+}
+
+/// Codex text the turn result would repeat is held until the finish,
+/// which keeps exactly what the result does not carry: an older Codex's
+/// unphased items are the joined result (stored once); an unphased item
+/// beside a final answer is not in the result (kept, in order).
+#[test]
+fn cad320_codex_final_and_unphased_items_are_stored_once() {
+    for (mode, want) in [
+        (
+            "items-unphased",
+            vec![
+                triple("operator", "message", "go"),
+                triple("agent", "turn_result", "first\nsecond"),
+            ],
+        ),
+        (
+            "items-mixed",
+            vec![
+                triple("operator", "message", "go"),
+                triple("agent", "assistant_text", "looking"),
+                triple("agent", "assistant_text", "an aside"),
+                triple("agent", "turn_result", "MOCK_OK"),
+            ],
+        ),
+    ] {
+        let d = TestDaemon::start();
+        let _mock = d.mock_codex(mode);
+        d.register_codex("master");
+        d.wait_agent("master", "idle", 15);
+        d.rpc(
+            "thread_send",
+            json!({"alias": "master", "text": "go", "message": "x1"}),
+        )
+        .unwrap();
+        d.wait_message("master", "x1", &["completed"], 20);
+        assert_eq!(thread_shape(&d, "master"), want, "{mode}");
+        let page = d.rpc("thread_read", json!({"alias": "master"})).unwrap();
+        for entry in page["entries"].as_array().unwrap().iter().skip(1) {
+            assert_eq!(entry["message"], "x1", "{mode}: {entry}");
+        }
+    }
+}
+
+/// A Codex turn whose process dies after persisting an unphased and a
+/// final item ends `unknown` with an empty result: both texts are kept,
+/// linked to the message, ahead of the turn result.
+#[test]
+fn cad320_codex_items_survive_an_unknown_turn() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_codex("items-die");
+    d.register_codex("master");
+    d.wait_agent("master", "idle", 15);
+    d.rpc(
+        "thread_send",
+        json!({"alias": "master", "text": "go", "message": "x1"}),
+    )
+    .unwrap();
+    d.wait_message("master", "x1", &["unknown"], 30);
+    assert_eq!(
+        thread_shape(&d, "master"),
+        vec![
+            triple("operator", "message", "go"),
+            triple("agent", "assistant_text", "partial"),
+            triple("agent", "assistant_text", "almost there"),
+            triple("agent", "turn_result", ""),
+        ]
+    );
+    let page = d.rpc("thread_read", json!({"alias": "master"})).unwrap();
+    assert_eq!(page["entries"][2]["payload"]["phase"], "final_answer");
+    assert_eq!(page["entries"][3]["payload"]["status"], "unknown");
+    for entry in page["entries"].as_array().unwrap().iter().skip(1) {
+        assert_eq!(entry["message"], "x1", "{entry}");
+    }
+}
+
+/// A managed Claude turn that ends without a result — the process dies,
+/// or the idle fence trips while it is still alive — keeps its held text
+/// block: linked to the message and ahead of the turn result, never
+/// flushed late by the adapter's close.
+#[test]
+fn cad320_claude_held_text_lands_before_an_unknown_turn_result() {
+    for (mode, params) in [
+        ("text-die", Value::Null),
+        ("silent", json!({"turn_idle_secs": 2})),
+    ] {
+        let d = TestDaemon::start();
+        let _mock = d.mock_claude(mode, None);
+        d.register_claude("master", params);
+        d.wait_agent("master", "idle", 15);
+        d.rpc(
+            "thread_send",
+            json!({"alias": "master", "text": "go", "message": "c1"}),
+        )
+        .unwrap();
+        d.wait_message("master", "c1", &["unknown"], 30);
+        d.wait_agent("master", "attention", 15);
+        // The late-flush bug landed ~3 s after the fence: give it room.
+        std::thread::sleep(Duration::from_secs(4));
+        assert_eq!(
+            thread_shape(&d, "master"),
+            vec![
+                triple("operator", "message", "go"),
+                triple("agent", "assistant_text", "working"),
+                triple("agent", "turn_result", ""),
+            ],
+            "{mode}"
+        );
+        let page = d.rpc("thread_read", json!({"alias": "master"})).unwrap();
+        assert_eq!(page["entries"][1]["message"], "c1", "{mode}: {page}");
+    }
 }
