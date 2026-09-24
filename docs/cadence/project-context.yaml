@@ -6,13 +6,13 @@ documents:
     path: docs/START-HERE.md
     title: Project reading order
     required: true
-    roles: [pm, dev, qa, ops]
+    roles: [pm, dev, qa, devops]
   - id: scope
     kind: scope
     path: docs/CHARTER.md
     title: Goals and non-goals
     required: true
-    roles: [pm, dev, qa, ops]
+    roles: [pm, dev, qa, devops]
   - id: architecture
     kind: architecture
     path: docs/ARCHITECTURE.md
@@ -30,10 +30,10 @@ documents:
     path: docs/BOARD.md
     title: Tracker and validation contract
     required: true
-    roles: [pm, dev, qa, ops]
+    roles: [pm, dev, qa, devops]
   - id: release-policy
     kind: release
     path: docs/roles/risk-classes.md
     title: Risk and release authority
     required: true
-    roles: [pm, qa, ops]
+    roles: [pm, qa, devops]

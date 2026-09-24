@@ -29,14 +29,12 @@ Three role fields exist; they are not interchangeable.
 |---|---|---|---|
 | Team role | `pm`, `research`, `architect`, `dev`, `qa`, `devops`, `worker` | `--team-role` on launch; `ops` is accepted as input and stored as `devops` | Model-default lookup; `pm` also marks a group root. Grants no authority |
 | Runtime role | `pm`, `worker` | `--role` on register/join (default `worker`) | Authority: only `pm` may finalize memory (accept, reject, verify); `pm` also marks a group root |
-| Context role | `pm`, `dev`, `qa`, `ops` | `roles:` in `docs/cadence/project-context.yaml`, `?role=` on the context API | Which project documents a role is shown |
+| Context role | `pm`, `dev`, `qa`, `devops` | `roles:` in `docs/cadence/project-context.yaml`, `?role=` on the context API; `ops` is accepted as input and stored as `devops` | Which project documents a role is shown |
 
 The docs call the role DevOps, and its briefing is
-`docs/roles/devops.md`. Team roles store `devops`; `ops` is accepted
-only as launch input. The context API still stores and validates `ops`
-(the manifest's `roles:` and `?role=`) until a follow-up moves it to
-`devops`, so write `ops` there today. `ops-1` is a historical agent
-alias.
+`docs/roles/devops.md`. Team and context roles both store `devops`;
+`ops` is accepted only as input (`--team-role`, the manifest's `roles:`
+and `?role=`). `ops-1` is a historical agent alias.
 
 ## Delivery scope and working set
 

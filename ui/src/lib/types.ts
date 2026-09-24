@@ -276,7 +276,7 @@ export interface Project {
   issues: number;
 }
 
-export type ContextRole = "pm" | "dev" | "qa" | "ops";
+export type ContextRole = "pm" | "dev" | "qa" | "devops";
 
 export interface ProjectContextDocument {
   id: string;

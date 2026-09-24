@@ -26,7 +26,9 @@ pub const MAX_EXCERPT_BYTES: usize = 16 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 const MAX_GIT_OUTPUT_BYTES: usize = 64 * 1024;
 const GIT_TIMEOUT: Duration = Duration::from_secs(3);
-const ROLES: &[&str] = &["pm", "dev", "qa", "ops"];
+/// Canonical context roles. `ops` is an input alias of `devops` (manifests
+/// and callers written before the rename) and is never itself stored.
+const ROLES: &[&str] = &["pm", "dev", "qa", "devops"];
 const KINDS: &[&str] = &[
     "index",
     "scope",
@@ -86,8 +88,34 @@ pub struct ManifestDocument {
     pub path: String,
     pub title: String,
     pub required: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_roles")]
     pub roles: Vec<String>,
+}
+
+/// Map a context role input to its stored key: `ops` becomes `devops`.
+/// Anything else passes through unchanged, so validation still names an
+/// unknown role instead of a silently rewritten one.
+pub fn canonical_role(role: &str) -> &str {
+    if role == "ops" {
+        "devops"
+    } else {
+        role
+    }
+}
+
+pub fn valid_role(role: &str) -> bool {
+    ROLES.contains(&role)
+}
+
+fn deserialize_roles<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let roles = Vec::<String>::deserialize(deserializer)?;
+    Ok(roles
+        .iter()
+        .map(|role| canonical_role(role).to_string())
+        .collect())
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -428,11 +456,7 @@ fn validate_manifest(manifest: &ContextManifest, selected: &str) -> Vec<String> 
         if document.title.is_empty() || document.title.len() > MAX_TITLE_BYTES {
             errors.push(format!("{}: title is too large or empty", document.id));
         }
-        if document
-            .roles
-            .iter()
-            .any(|role| !ROLES.contains(&role.as_str()))
-        {
+        if document.roles.iter().any(|role| !valid_role(role)) {
             errors.push(format!("{}: unsupported role", document.id));
         }
     }
@@ -1056,6 +1080,45 @@ mod tests {
         };
         let errors = validate_manifest(&manifest, "cadence");
         assert!(errors.iter().any(|error| error.contains("duplicate")));
+    }
+
+    #[test]
+    fn manifest_roles_store_devops_and_accept_legacy_ops() {
+        let yaml = "schema: 1\nproject: cadence\ndocuments:\n  - id: release\n    kind: release\n    path: docs/release.md\n    title: Release\n    required: false\n    roles: [pm, ops, devops]\n";
+        let manifest: ContextManifest = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(manifest.documents[0].roles, ["pm", "devops", "devops"]);
+        assert!(validate_manifest(&manifest, "cadence").is_empty());
+
+        // The stored form round-trips as `devops`; `ops` never comes back.
+        let written = serde_yaml::to_string(&manifest).unwrap();
+        assert!(!written.contains("- ops"), "{written}");
+        let reread: ContextManifest = serde_yaml::from_str(&written).unwrap();
+        assert_eq!(reread.documents[0].roles, ["pm", "devops", "devops"]);
+        assert!(validate_manifest(&reread, "cadence").is_empty());
+    }
+
+    #[test]
+    fn manifest_rejects_unknown_roles_without_rewriting_them() {
+        let yaml = "schema: 1\nproject: cadence\ndocuments:\n  - id: release\n    kind: release\n    path: docs/release.md\n    title: Release\n    required: false\n    roles: [operations]\n";
+        let manifest: ContextManifest = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(manifest.documents[0].roles, ["operations"]);
+        let errors = validate_manifest(&manifest, "cadence");
+        assert_eq!(errors, ["release: unsupported role"]);
+    }
+
+    #[test]
+    fn tracked_manifest_uses_devops_and_validates() {
+        let text = include_str!("../../docs/cadence/project-context.yaml");
+        assert!(!text.contains(" ops"), "manifest still writes ops");
+        let manifest: ContextManifest = serde_yaml::from_str(text).unwrap();
+        assert_eq!(
+            validate_manifest(&manifest, "cadence"),
+            Vec::<String>::new()
+        );
+        assert!(manifest
+            .documents
+            .iter()
+            .any(|document| document.roles.iter().any(|role| role == "devops")));
     }
 
     #[test]
