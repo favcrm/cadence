@@ -308,6 +308,11 @@ export const api = {
       `/api/epics/${encodeURIComponent(epic)}/stage`,
       note && note.trim() ? { stage, note: note.trim() } : { stage },
     ),
+  /** `POST /api/delivery/<id>/merge` — the operator's merge decision
+   *  (CAD-431): the board's own `gh` enqueues the PR pinned to the
+   *  reviewed head. */
+  mergeDelivery: (issue: string) =>
+    post<Record<string, unknown>>(`/api/delivery/${encodeURIComponent(issue)}/merge`, {}),
   /** `GET /api/master/summary?since=` — 501 on a daemon without it. */
   masterSummary: (since: number) =>
     get<Record<string, unknown>>(`/api/master/summary?since=${Math.floor(since)}`),

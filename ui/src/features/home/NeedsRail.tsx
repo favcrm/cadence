@@ -108,6 +108,59 @@ function AnswerForm({
   );
 }
 
+/** The merge decision (CAD-431): what passed, then one Merge button. */
+function MergeForm({
+  need,
+  readOnly,
+  onDone,
+}: {
+  need: HomeNeed & { action: { type: "merge" } };
+  readOnly: boolean;
+  onDone: (text: string) => void;
+}) {
+  const { issue, pr, sha, reviewer, verdict } = need.action;
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const merge = () => {
+    setBusy(true);
+    setError(null);
+    api
+      .mergeDelivery(issue)
+      .then((out) => {
+        void resources.overview.invalidate();
+        onDone(`merge ${String((out as { state?: unknown }).state ?? "sent")}`);
+      })
+      .catch((e: ApiError) => setError(e.message ?? String(e)))
+      .finally(() => setBusy(false));
+  };
+  return (
+    <div className="mt-2 space-y-2">
+      <p className="text-micro text-ink-500 break-words">
+        {pr ?? issue}
+        {sha ? ` · head ${sha.slice(0, 12)}` : ""}
+        {reviewer ? ` · PASS by ${reviewer}` : ""}
+      </p>
+      {verdict && <p className="text-label text-ink-300 break-words">{verdict}</p>}
+      {readOnly ? (
+        <p className="text-micro text-ink-500">Board is read-only — merge with `cadence delivery merge {issue}`.</p>
+      ) : (
+        <button
+          disabled={busy}
+          onClick={merge}
+          className="h-8 px-3 rounded bg-accent text-on-accent text-label font-medium disabled:opacity-40"
+        >
+          {busy ? "Merging…" : "Merge"}
+        </button>
+      )}
+      {error && (
+        <p className="text-micro text-fail break-words" role="alert">
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}
+
 function NeedItem({
   need,
   readOnly,
@@ -122,7 +175,15 @@ function NeedItem({
   const [copied, setCopied] = useState(false);
   const action = need.action;
   const label =
-    action.type === "plan" ? "Review plan" : action.type === "answer" ? "Answer" : copied ? "Copied" : "Copy command";
+    action.type === "plan"
+      ? "Review plan"
+      : action.type === "answer"
+        ? "Answer"
+        : action.type === "merge"
+          ? "Review merge"
+          : copied
+            ? "Copied"
+            : "Copy command";
   return (
     <li className="px-3 py-2.5 min-w-0" data-need={need.kind}>
       <div className="flex items-start gap-2 min-w-0">
@@ -136,7 +197,9 @@ function NeedItem({
         </div>
       </div>
       {done ? (
-        <p className="text-micro text-ok mt-1.5">answered: {done}</p>
+        <p className="text-micro text-ok mt-1.5" data-need-done>
+          {action.type === "merge" ? done : `answered: ${done}`}
+        </p>
       ) : (
         <button
           className="mt-1.5 text-label lnk"
@@ -164,6 +227,16 @@ function NeedItem({
         <div className="mt-2">
           <PlanCard epic={action.epic} readOnly={readOnly} onOpenIssue={onOpenIssue} />
         </div>
+      )}
+      {open && action.type === "merge" && !done && (
+        <MergeForm
+          need={need as HomeNeed & { action: { type: "merge" } }}
+          readOnly={readOnly}
+          onDone={(t) => {
+            setDone(t);
+            setOpen(false);
+          }}
+        />
       )}
       {open && action.type === "answer" && !done && (
         <AnswerForm
