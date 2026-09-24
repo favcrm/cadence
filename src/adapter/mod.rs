@@ -157,10 +157,11 @@ pub enum InterruptOutcome {
     /// The provider's own interrupt reached the running turn; the turn's
     /// result arrives on the wire and finishes the message as usual.
     Delivered,
-    /// The interrupt keys reached a terminal that has no result wire
-    /// (pty): nothing will report this turn, so the caller records the
-    /// `interrupted` finish itself.
-    Unsettled,
+    /// A terminal with no result wire (pty): the caller's `settle` —
+    /// the guarded `interrupted` finish — won while the turn was still
+    /// the pane's, and only then were the interrupt keys sent. The
+    /// message is already finished.
+    Settled,
     /// The named turn is not the one in flight (it already ended) —
     /// nothing was sent.
     NotRunning,
@@ -271,8 +272,19 @@ pub trait ProviderAdapter: Send + Sync {
     /// and nothing is sent. The default refuses: an endpoint without a
     /// provider-native, non-destructive interrupt (Devin cloud's
     /// `interrupt` terminates the session) must not pretend to have one.
-    fn interrupt_turn(&self, turn_id: &str) -> Result<InterruptOutcome> {
-        let _ = turn_id;
+    ///
+    /// `settle` is the caller's guarded `interrupted` finish of the
+    /// message; `Ok(true)` when it won. Only an endpoint with no result
+    /// wire calls it — and then before sending anything, under the lock
+    /// that keeps the next turn from starting, so a turn that already
+    /// ended is never stopped in its successor's place ([`InterruptOutcome::Settled`]).
+    /// Managed endpoints ignore it: their turn result finishes the message.
+    fn interrupt_turn(
+        &self,
+        turn_id: &str,
+        settle: &dyn Fn() -> Result<bool>,
+    ) -> Result<InterruptOutcome> {
+        let _ = (turn_id, settle);
         Err(Error::rejected(
             "this endpoint has no provider-native turn interrupt — \
              `cadence agent stop` ends the endpoint instead",

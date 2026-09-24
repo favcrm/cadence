@@ -837,8 +837,10 @@ impl ProviderAdapter for ClaudeAdapter {
 
     /// The CLI's own interrupt control request — Claude ends the active
     /// turn and emits its final `result`. The waiter bounds the hang to
-    /// `INTERRUPT_GRACE` before failing closed. Only when stdin is gone
-    /// does it fall back to SIGINT on the provider's own process group.
+    /// `INTERRUPT_GRACE` before failing closed. The write never blocks
+    /// ([`StdioAdapter::try_send`]); only when stdin is gone, full or
+    /// busy does it fall back to SIGINT on the provider's own process
+    /// group.
     fn interrupt(&self) {
         *self.shared.interrupt_at.lock().unwrap() = Some(Instant::now());
         let transport = self.transport.read().unwrap().clone();
@@ -847,13 +849,19 @@ impl ProviderAdapter for ClaudeAdapter {
             "request_id": format!("{INTERRUPT_REQUEST_PREFIX}{}", Uuid::new_v4().simple()),
             "request": {"subtype": "interrupt"},
         });
-        if transport.send(request).is_err() {
+        // Never blocks: a full stdin pipe or a writer mid-frame must not
+        // hang an interrupt, a stop or a shutdown — SIGINT instead.
+        if transport.try_send(request).is_err() {
             transport.interrupt();
         }
     }
 
     /// CAD-323: interrupt `turn_id` only while it is the turn in flight.
-    fn interrupt_turn(&self, turn_id: &str) -> Result<super::InterruptOutcome> {
+    fn interrupt_turn(
+        &self,
+        turn_id: &str,
+        _settle: &dyn Fn() -> Result<bool>,
+    ) -> Result<super::InterruptOutcome> {
         // Held across the send: `run_turn` clears the active turn under
         // this lock, so an interrupt can never land on the next turn.
         let active = self.shared.active_turn.lock().unwrap();

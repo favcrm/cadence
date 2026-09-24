@@ -4974,12 +4974,18 @@ impl Shared {
         let caller = if self.caller_is_master(peer_pid) {
             // The master dispatches tickets but is no agent's PM: it may
             // interrupt exactly a turn the daemon's own record says it
-            // dispatched (`master_dispatched`), nothing else.
+            // dispatched (`master_dispatched`, written only for a real
+            // send) AND whose results route back to it (`reply_to:
+            // master`) — both, so neither record alone grants it.
             reject_identity_fields(params, "interrupt")?;
             let dispatched = match &running {
                 Some(m) => {
-                    self.store
-                        .event_names_message(DAEMON_ALIAS, "master_dispatched", &m.id)?
+                    m.reply_to.as_deref() == Some(crate::master::ALIAS)
+                        && self.store.event_names_message(
+                            DAEMON_ALIAS,
+                            "master_dispatched",
+                            &m.id,
+                        )?
                 }
                 None => false,
             };
@@ -5023,6 +5029,35 @@ impl Shared {
         let Some(turn_id) = message.turn_id.clone() else {
             return noop("no running turn", None);
         };
+        // Test seam: widen the gap between reading the running turn and
+        // reaching the adapter, so a suite can land the next turn inside
+        // it. Set only on an in-process test daemon (`ProviderEnv::own`
+        // never reads the process environment).
+        if let Some(ms) = self
+            .provider_env
+            .own("CADENCE_TEST_INTERRUPT_PAUSE_MS")
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            let _ = self.store.event_public(
+                &alias,
+                "interrupt_paused",
+                json!({"message": message.id, "ms": ms}),
+            );
+            thread::sleep(Duration::from_millis(ms));
+        }
+        // Every call past the caller rule leaves one `interrupt_requested`
+        // — a refusal included (PROTOCOL.md).
+        let record = |outcome: &str, error: Option<&str>| -> Result<()> {
+            let mut payload = json!({"outcome": outcome, "message": message.id,
+                                     "turn_id": turn_id});
+            payload["by"] = audit["by"].clone();
+            payload["by_kind"] = audit["by_kind"].clone();
+            if let Some(error) = error {
+                payload["error"] = json!(error);
+            }
+            self.store
+                .event_public(&alias, "interrupt_requested", payload)
+        };
         let adapter = self
             .lifecycle
             .lock()
@@ -5031,14 +5066,38 @@ impl Shared {
             .get(&alias)
             .and_then(|ctl| ctl.adapter.lock().unwrap().clone());
         let Some(adapter) = adapter else {
-            return Err(Error::rejected(format!(
+            let error = format!(
                 "Agent '{alias}' has no live endpoint to interrupt — its running \
                  message {} is the reconcile's (`cadence message reconcile {} \
                  --status interrupted`)",
                 message.id, message.id
-            )));
+            );
+            record("refused", Some(&error))?;
+            return Err(Error::rejected(error));
         };
-        let outcome = match adapter.interrupt_turn(&turn_id) {
+        // The pane's settle: the guarded `interrupted` finish, run by the
+        // adapter under its paste lock before any key is sent. A managed
+        // endpoint never calls it — its turn result finishes the message.
+        let stored = json!({"status": "interrupted", "text": "", "turn_id": turn_id,
+                            "via": "interrupt", "by": audit["by"]});
+        let reason = format!(
+            "interrupted by {}",
+            audit["by"].as_str().unwrap_or("operator")
+        );
+        let finished: std::cell::RefCell<Option<Message>> = std::cell::RefCell::new(None);
+        let settle = || -> Result<bool> {
+            match self
+                .store
+                .finish_running(&message.id, "interrupted", &stored, Some(&reason))?
+            {
+                Ok(done) => {
+                    *finished.borrow_mut() = Some(done);
+                    Ok(true)
+                }
+                Err(_) => Ok(false),
+            }
+        };
+        let outcome = match adapter.interrupt_turn(&turn_id, &settle) {
             Ok(outcome) => outcome,
             // The provider refused — most often because the turn ended
             // on its own in the gap. A settled message is a no-op; a
@@ -5048,6 +5107,7 @@ impl Shared {
                 if current.as_ref().is_some_and(|m| m.state != "running") {
                     return noop("turn already ended", current.as_ref());
                 }
+                record("refused", Some(&error.to_string()))?;
                 return Err(error);
             }
         };
@@ -5055,25 +5115,9 @@ impl Shared {
             let current = self.store.message(&message.id)?;
             return noop("turn already ended", current.as_ref().or(Some(&message)));
         }
-        let mut payload = json!({"outcome": "delivered", "message": message.id,
-                                 "turn_id": turn_id});
-        payload["by"] = audit["by"].clone();
-        payload["by_kind"] = audit["by_kind"].clone();
-        self.store
-            .event_public(&alias, "interrupt_requested", payload)?;
-        if outcome == InterruptOutcome::Unsettled {
-            let stored = json!({"status": "interrupted", "text": "", "turn_id": turn_id,
-                                "via": "interrupt", "by": audit["by"]});
-            let reason = format!(
-                "interrupted by {}",
-                audit["by"].as_str().unwrap_or("operator")
-            );
-            if let Ok(finished) =
-                self.store
-                    .finish_running(&message.id, "interrupted", &stored, Some(&reason))?
-            {
-                self.notify_routed_target(&finished, &stored);
-            }
+        record("delivered", None)?;
+        if let Some(done) = finished.into_inner() {
+            self.notify_routed_target(&done, &stored);
             self.wake();
         }
         let deadline = Instant::now() + Duration::from_secs(wait);

@@ -129,6 +129,9 @@ struct PtyState {
     /// own verdict for an operator claim, the just-run probe for a
     /// daemon auto-claim. Carried on `NotRendered` evidence.
     gate_probe: Option<Probe>,
+    /// Token of the latest turn-holding paste (not a routed notice or
+    /// nudge) — the turn `interrupt_turn` may stop (CAD-323).
+    current_turn: Option<String>,
 }
 
 /// The generic adapter: tmux mechanics, readiness claims and the
@@ -553,6 +556,7 @@ impl PtyAdapter {
                 claims: std::collections::VecDeque::new(),
                 disconnected_misses: 0,
                 gate_probe: None,
+                current_turn: None,
             }),
             socket: format!("cadence-{}", short_hash(&state_dir.to_string_lossy())),
             tmux: env
@@ -1003,6 +1007,7 @@ impl ProviderAdapter for PtyAdapter {
             s.pane_pid = pane_pid;
             s.generation = generation.clone();
             s.claims.clear(); // a new endpoint can never inherit claims
+            s.current_turn = None;
         }
         Ok(Identity {
             thread_id: native.clone(),
@@ -1053,6 +1058,7 @@ impl ProviderAdapter for PtyAdapter {
             s.pane_pid = pane_pid;
             s.generation = adoption.generation.clone();
             s.claims.clear(); // claims never survive a daemon restart
+            s.current_turn = None;
         }
         Ok(Identity {
             thread_id: adoption.native_session.clone(),
@@ -1207,6 +1213,12 @@ impl ProviderAdapter for PtyAdapter {
             }
         }
 
+        // Still under `paste_lock`: from here the pane's turn is this
+        // one, until the next turn-holding paste. Routed notices and
+        // nudges ride inside the running turn and never replace it.
+        if !self.unclaimed_ok.load(AtomicOrdering::SeqCst) {
+            self.state.lock().unwrap().current_turn = Some(token.clone());
+        }
         on_started(&token);
         Ok(TurnResult {
             turn_id: token,
@@ -1229,13 +1241,28 @@ impl ProviderAdapter for PtyAdapter {
         let _ = self.tmux(&args);
     }
 
-    /// CAD-323: a pane has no result wire — the keys stop the turn and
-    /// the caller records the `interrupted` finish. A worker report that
-    /// races it loses to the guarded finish, never the other way round.
-    fn interrupt_turn(&self, turn_id: &str) -> Result<super::InterruptOutcome> {
-        let _ = turn_id;
+    /// CAD-323: a pane has no result wire, so the caller's guarded
+    /// finish settles the message. Under `paste_lock` — the lock every
+    /// paste takes — the named turn must still be the pane's latest
+    /// turn-holding paste and the finish must win; only then do the
+    /// keys go. The next turn cannot be pasted in between, so the keys
+    /// can never stop a successor; a report that lands first wins and
+    /// nothing is sent.
+    fn interrupt_turn(
+        &self,
+        turn_id: &str,
+        settle: &dyn Fn() -> Result<bool>,
+    ) -> Result<super::InterruptOutcome> {
+        let _paste_guard = self.paste_lock.lock().unwrap();
+        // `None`: no turn-holding paste in this generation — the running
+        // message is one an adopted pane carried over a restart, and the
+        // guarded finish alone decides.
+        let current = self.state.lock().unwrap().current_turn.clone();
+        if current.is_some_and(|c| c != turn_id) || !settle()? {
+            return Ok(super::InterruptOutcome::NotRunning);
+        }
         self.interrupt();
-        Ok(super::InterruptOutcome::Unsettled)
+        Ok(super::InterruptOutcome::Settled)
     }
 
     fn disconnected(&self) -> bool {

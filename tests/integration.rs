@@ -3455,16 +3455,19 @@ fn daemon_opts() -> daemon::ServeOptions {
 /// A stdio JSON-RPC provider speaking just enough of the app-server wire
 /// to reach each failure mode. Writes its pid to a file for leak checks.
 const MOCK_PY: &str = r#"
-import json, os, sys, time
+import json, os, sys, threading, time
 pidfile, mode = sys.argv[1], sys.argv[2]
 turn_count = 0
 # interrupt-text / interrupt-tool (CAD-323): the turn in flight, waiting
 # for `turn/interrupt` — every interrupt lands in <pidfile>.interrupts.
+# hold: turn t-<n> completes once <pidfile>.release-t-<n> exists.
 in_flight = None
 with open(pidfile, "w") as f:
     f.write(str(os.getpid()))
+emit_lock = threading.Lock()
 def emit(msg):
-    sys.stdout.write(json.dumps(msg) + "\n"); sys.stdout.flush()
+    with emit_lock:
+        sys.stdout.write(json.dumps(msg) + "\n"); sys.stdout.flush()
 for line in sys.stdin:
     try: msg = json.loads(line)
     except Exception: continue
@@ -3533,6 +3536,18 @@ for line in sys.stdin:
             emit({"id": mid, "result": {"turn": {"id": "t-1"}}}); os._exit(0)
         elif mode == "silent":
             emit({"id": mid, "result": {"turn": {"id": "t-1"}}})
+        elif mode == "hold":
+            tid = "t-%d" % turn_count
+            emit({"id": mid, "result": {"turn": {"id": tid}}})
+            in_flight = tid
+            def finish(tid=tid):
+                while not os.path.exists(pidfile + ".release-" + tid):
+                    time.sleep(0.05)
+                emit({"method": "turn/completed", "params": {"turn": {
+                    "id": tid, "status": "completed", "items": [
+                        {"id": "f-" + tid, "type": "agentMessage",
+                         "text": "MOCK_OK", "phase": "final_answer"}]}}})
+            threading.Thread(target=finish, daemon=True).start()
         elif mode in ("interrupt-text", "interrupt-tool") and turn_count == 1:
             # The first turn streams, then waits for turn/interrupt;
             # later turns complete like "ok".
@@ -42470,6 +42485,20 @@ fn cad323_codex_interrupt_mid_tool_records_partial_result() {
     assert_eq!(page["entries"][3]["payload"]["tool_use_id"], "cmd-1");
     let result = d.wait_event("w1", "tool_result", 5);
     assert_eq!(result["payload"]["status"], "failed", "{result}");
+    // Review N3: the recorded turn/completed envelope carries no item
+    // bodies — only their count.
+    let completed = d
+        .events("w1")
+        .into_iter()
+        .find(|e| e["kind"] == "provider_event" && e["payload"]["method"] == "turn/completed")
+        .expect("turn/completed recorded");
+    let turn = &completed["payload"]["data"]["turn"];
+    assert_eq!(turn["status"], "interrupted", "{completed}");
+    assert_eq!(turn["items"], 1, "{completed}");
+    assert!(
+        !completed.to_string().contains("partial line"),
+        "{completed}"
+    );
     cad323_next_turn_then_noop(&d, "w1", pid);
 }
 
@@ -42637,4 +42666,213 @@ fn cad323_master_interrupts_only_a_turn_it_dispatched() {
     assert_eq!(last["by"], "master", "{asked:?}");
     assert_eq!(last["by_kind"], "agent", "{asked:?}");
     f.d.wait_agent("w1", "idle", 10);
+}
+
+/// Run `interrupt` on `alias` with the daemon's pause seam: the call
+/// reads m1 as the running turn, then waits while `land_next` finishes
+/// m1 and starts m2, and only then reaches the adapter. Answers the
+/// interrupt's reply.
+fn cad323_stale_interrupt(d: &TestDaemon, alias: &str, land_next: impl FnOnce()) -> Value {
+    test_env().set("CADENCE_TEST_INTERRUPT_PAUSE_MS", "8000");
+    let reply = std::thread::scope(|s| {
+        let call = s.spawn(|| {
+            d.operator_rpc("interrupt", json!({"alias": alias, "wait": 0}))
+                .unwrap()
+        });
+        let paused = d.wait_event(alias, "interrupt_paused", 20);
+        assert_eq!(paused["payload"]["message"], "m1", "{paused}");
+        land_next();
+        call.join().unwrap()
+    });
+    test_env().remove("CADENCE_TEST_INTERRUPT_PAUSE_MS");
+    assert_eq!(reply["interrupted"], false, "{reply}");
+    assert_eq!(reply["reason"], "turn already ended", "{reply}");
+    assert_eq!(reply["message"], "m1", "{reply}");
+    assert_eq!(d.message_state(alias, "m2"), "running", "m2 was touched");
+    reply
+}
+
+/// Review round 1, I1: an interrupt that read m1 as running but reaches
+/// the pane after m1 was reported and m2 pasted stops nothing — no key
+/// reaches the pane, m2 keeps running and completes by its own report.
+#[test]
+fn cad323_pty_interrupt_never_lands_on_the_next_turn() {
+    let d = TestDaemon::start();
+    let mock = d.mock_claude_tui();
+    d.register_claude_pty("cl", json!({"auto_ready": "verified"}));
+    d.wait_agent("cl", "idle", 20);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "cl", "text": "first job", "message": "m1"}),
+    )
+    .unwrap();
+    let t1 = pty_token(&d, "cl", "m1");
+    cad323_stale_interrupt(&d, "cl", || {
+        d.rpc(
+            "message_report",
+            json!({"message": "m1", "token": t1, "kind": "result", "text": "done"}),
+        )
+        .unwrap();
+        d.wait_message("cl", "m1", &["completed"], 10);
+        d.rpc(
+            "agent_send",
+            json!({"alias": "cl", "text": "second job", "message": "m2"}),
+        )
+        .unwrap();
+        d.wait_message("cl", "m2", &["running"], 20);
+    });
+    let calls = std::fs::read_to_string(
+        mock.dir
+            .join("tmux-state")
+            .join(socket_for(&d.state))
+            .join("calls.log"),
+    )
+    .unwrap();
+    assert!(!calls.contains("Escape"), "a key reached the pane: {calls}");
+    pty_report_done(&d, "cl", "m2");
+}
+
+/// I1 / N2 on managed Claude: the stale interrupt names m1's turn token,
+/// which is no longer the adapter's active turn — no control request
+/// reaches the CLI and m2 completes normally.
+#[test]
+fn cad323_claude_interrupt_never_lands_on_the_next_turn() {
+    let d = TestDaemon::start();
+    let mock = d.mock_claude("hold", None);
+    let release = PathBuf::from(format!("{}.release", mock.pidfile.display()));
+    d.register_claude("w1", Value::Null);
+    d.wait_agent("w1", "idle", 15);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "one", "message": "m1"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "m1", &["running"], 15);
+    cad323_stale_interrupt(&d, "w1", || {
+        std::fs::write(&release, "").unwrap();
+        d.wait_message("w1", "m1", &["completed"], 15);
+        std::fs::remove_file(&release).unwrap();
+        d.rpc(
+            "agent_send",
+            json!({"alias": "w1", "text": "two", "message": "m2"}),
+        )
+        .unwrap();
+        d.wait_message("w1", "m2", &["running"], 15);
+    });
+    assert!(
+        cad323_sidecar(&mock.pidfile, "controls").is_empty(),
+        "an interrupt reached the CLI"
+    );
+    std::fs::write(&release, "").unwrap();
+    d.wait_message("w1", "m2", &["completed"], 15);
+}
+
+/// I1 / N2 on Codex: m1's turn id is not the active turn, so no
+/// `turn/interrupt` reaches the app-server and m2 completes normally.
+#[test]
+fn cad323_codex_interrupt_never_lands_on_the_next_turn() {
+    let d = TestDaemon::start();
+    let mock = d.mock_codex("hold");
+    let release = |tid: &str| {
+        std::fs::write(format!("{}.release-{tid}", mock.pidfile.display()), "").unwrap()
+    };
+    d.register_codex("w1");
+    d.wait_agent("w1", "idle", 15);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "one", "message": "m1"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "m1", &["running"], 15);
+    cad323_stale_interrupt(&d, "w1", || {
+        release("t-1");
+        d.wait_message("w1", "m1", &["completed"], 15);
+        d.rpc(
+            "agent_send",
+            json!({"alias": "w1", "text": "two", "message": "m2"}),
+        )
+        .unwrap();
+        d.wait_message("w1", "m2", &["running"], 15);
+    });
+    assert!(
+        cad323_sidecar(&mock.pidfile, "interrupts").is_empty(),
+        "a turn/interrupt reached the app-server"
+    );
+    release("t-2");
+    d.wait_message("w1", "m2", &["completed"], 15);
+}
+
+/// Review round 1, I2: a duplicate `master dispatch` answers with the
+/// operator's live kickoff (`dispatched: false`). That is not the
+/// master's dispatch — no `master_dispatched` is written, and the
+/// master's interrupt of that kickoff is refused, even though it routes
+/// its result to the master.
+#[test]
+fn cad323_master_duplicate_dispatch_grants_no_interrupt() {
+    let f = PlanFixture::start_routed();
+    let mock = f.d.mock_claude("await-interrupt", None);
+    f.d.register_claude("w1", Value::Null);
+    f.d.wait_agent("w1", "idle", 15);
+    let (mut m, _) = f.start_master();
+    let plan = f.file("plan.md", MASTER_PLAN);
+    let (ok, out) = f.as_master(
+        &mut m,
+        &format!("plan propose --project demo --file {plan}"),
+    );
+    assert!(ok, "{out}");
+    f.d.operator_rpc("plan_approve", json!({"epic": "D-1"}))
+        .unwrap();
+    let (ok, out) = f.cli(&["dispatch", "D-2", "--to", "w1", "--reply-to", "master"]);
+    assert!(ok, "{out}");
+    let kickoff = out["message"].as_str().unwrap().to_string();
+    f.d.wait_message("w1", &kickoff, &["running"], 15);
+    let (ok, out) = f.cli(&["issue", "set", "D-2", "status=ready"]);
+    assert!(ok, "{out}");
+    let (ok, out) = f.as_master(&mut m, "master dispatch D-2");
+    assert!(ok, "{out}");
+    assert_eq!(out["dispatched"], false, "{out}");
+    assert_eq!(out["message"], kickoff.as_str(), "{out}");
+    let recorded = f.d.rpc("agent_events", json!({"alias": "daemon"})).unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "master_dispatched")
+        .count();
+    assert_eq!(recorded, 0, "a duplicate is not the master's dispatch");
+    let (ok, err) = f.as_master(&mut m, "interrupt w1 --wait 5");
+    assert!(
+        !ok && err.to_string().contains("only a turn it dispatched"),
+        "{err}"
+    );
+    assert!(cad323_sidecar(&mock.pidfile, "controls").is_empty());
+    assert_eq!(f.d.message_state("w1", &kickoff), "running");
+}
+
+/// Review round 1, N6: an endpoint with no provider-native interrupt
+/// refuses, and the refusal is recorded like every call past the
+/// caller rule.
+#[test]
+fn cad323_refused_interrupt_is_recorded() {
+    let d = TestDaemon::start();
+    d.register("w1");
+    d.wait_agent("w1", "idle", 10);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "SLEEP:30", "message": "m1"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "m1", &["running"], 15);
+    let err = d
+        .operator_rpc("interrupt", json!({"alias": "w1", "wait": 0}))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no provider-native turn interrupt"), "{err}");
+    let asked = cad323_interrupt_events(&d, "w1");
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert_eq!(asked[0]["outcome"], "refused", "{asked:?}");
+    assert_eq!(asked[0]["message"], "m1", "{asked:?}");
+    assert!(asked[0]["error"]
+        .as_str()
+        .unwrap()
+        .contains("no provider-native"));
 }

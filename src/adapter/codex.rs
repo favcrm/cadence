@@ -349,6 +349,16 @@ impl Transport {
         }
     }
 
+    /// A request whose send never blocks (CAD-323 interrupts): stdio
+    /// writes non-blocking ([`StdioAdapter::request_bounded`]); the
+    /// WebSocket already writes under a timeout.
+    fn request_bounded(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
+        match self {
+            Transport::Stdio(a) => a.request_bounded(method, params, timeout),
+            Transport::Ws(a) => a.request_timeout(method, params, timeout),
+        }
+    }
+
     fn respond(&self, request_id: &Value, result: Value) -> Result<()> {
         match self {
             Transport::Stdio(a) => a.respond(request_id, result),
@@ -656,7 +666,20 @@ impl Shared {
                         .insert(turn_id.to_string(), params["turn"].clone());
                     self.turn_cv.notify_all();
                 }
-                self.emit(method, &params);
+                // The recorded lifecycle envelope carries no item bodies:
+                // `turn.items` holds agent text and tool output, which
+                // reach the store only as redacted thread entries and
+                // summaries (CAD-320/323) — here, just their count.
+                let turn = &params["turn"];
+                self.emit(
+                    method,
+                    &json!({"turn": {
+                        "id": turn.get("id"),
+                        "status": turn.get("status"),
+                        "error": turn.get("error"),
+                        "items": turn.get("items").and_then(Value::as_array).map(Vec::len),
+                    }}),
+                );
             }
             "account/rateLimits/updated" => {
                 let data = self.merge_quota_update(method, &params);
@@ -945,13 +968,24 @@ impl ProviderAdapter for CodexAdapter {
         // turn, CAD-323): the unphased items are the answer. Commentary
         // is never the result — the thread already shows it, and
         // repeating it as the turn result would record it twice.
-        let selected = if finals.is_empty() {
+        let status = turn
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        // No final answer: the items stand in for it, as they always did
+        // — except on an interrupted turn (CAD-323), whose commentary the
+        // thread already holds; repeating it as the turn result would
+        // record it twice and present a progress note as the answer.
+        let selected = if !finals.is_empty() {
+            finals
+        } else if status == "interrupted" {
             messages
                 .into_iter()
-                .filter(|item| item.get("phase").and_then(Value::as_str).is_none())
+                .filter(|item| item.get("phase").and_then(Value::as_str) != Some("commentary"))
                 .collect()
         } else {
-            finals
+            messages
         };
         let text = selected
             .iter()
@@ -964,11 +998,7 @@ impl ProviderAdapter for CodexAdapter {
                 .and_then(Value::as_str)
                 .unwrap_or(&turn_id)
                 .to_string(),
-            status: turn
-                .get("status")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown")
-                .to_string(),
+            status,
             text,
             stop_reason: None,
             error: turn
@@ -987,7 +1017,7 @@ impl ProviderAdapter for CodexAdapter {
         let turn = self.shared.active_turn.lock().unwrap().clone();
         if let (Some(thread), Some(turn)) = (thread_id, turn) {
             if !self.disconnected() {
-                let _ = self.transport.request_timeout(
+                let _ = self.transport.request_bounded(
                     "turn/interrupt",
                     json!({"threadId": thread, "turnId": turn}),
                     Duration::from_secs(5),
@@ -1000,7 +1030,11 @@ impl ProviderAdapter for CodexAdapter {
     /// turn in flight — the provider completes it `interrupted`. Turn
     /// ids are the provider's own, so a stale id can never stop a later
     /// turn; a refusal is the provider's answer, surfaced as is.
-    fn interrupt_turn(&self, turn_id: &str) -> Result<InterruptOutcome> {
+    fn interrupt_turn(
+        &self,
+        turn_id: &str,
+        _settle: &dyn Fn() -> Result<bool>,
+    ) -> Result<InterruptOutcome> {
         let active = self.shared.active_turn.lock().unwrap().clone();
         if active.as_deref() != Some(turn_id) {
             return Ok(InterruptOutcome::NotRunning);
@@ -1012,7 +1046,7 @@ impl ProviderAdapter for CodexAdapter {
             .unwrap()
             .clone()
             .ok_or_else(|| Error::provider("Codex thread is not open"))?;
-        self.transport.request_timeout(
+        self.transport.request_bounded(
             "turn/interrupt",
             json!({"threadId": thread, "turnId": turn_id}),
             Duration::from_secs(5),

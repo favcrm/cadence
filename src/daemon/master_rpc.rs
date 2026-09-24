@@ -300,11 +300,17 @@ impl Shared {
         // worktree, tracker refs and comment, one kickoff — attributed
         // to the master.
         let out = issue::dispatch::run(&pm, id, &args, ALIAS, &self.state_dir)?;
-        let _ = self.store.event_public(
-            DAEMON_ALIAS,
-            "master_dispatched",
-            json!({"issue": id, "to": to, "message": out["message"]}),
-        );
+        // Only a real send is the master's dispatch: a duplicate answers
+        // with the live kickoff someone else sent (`dispatched: false`),
+        // and recording that would hand the master interrupt rights over
+        // it (CAD-323).
+        if out["dispatched"] != json!(false) {
+            let _ = self.store.event_public(
+                DAEMON_ALIAS,
+                "master_dispatched",
+                json!({"issue": id, "to": to, "message": out["message"]}),
+            );
+        }
         Ok(out)
     }
 
