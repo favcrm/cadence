@@ -8274,10 +8274,13 @@ pub fn serve_with(state_dir: &Path, opts: ServeOptions) -> Result<()> {
     }
     // Persistent monitor reconciliation: registrations survive a daemon
     // restart and are checked without an LLM turn or provider invocation.
-    {
+    // Joined before `serve` returns (CAD-408): the watcher can dispatch,
+    // so a stopped daemon must not leave a tick in flight against the
+    // store.
+    let monitor_watch = {
         let shared = Arc::clone(&shared);
-        thread::spawn(move || shared.run_monitor_watch());
-    }
+        thread::spawn(move || shared.run_monitor_watch())
+    };
     // WAL watch: provider stores checkpointed while their provider
     // idles — CAD-132, the 30 GiB sessions.db-wal that ate the disk.
     {
@@ -8316,6 +8319,10 @@ pub fn serve_with(state_dir: &Path, opts: ServeOptions) -> Result<()> {
     if let Some(gate) = &opts.release_shutdown_snapshot {
         gate.wait();
     }
+    // `closing` is set, so the watcher exits within its 100ms sub-step
+    // or at the end of the tick it is in. Joining before the actors stop
+    // lets a kickoff from that last tick settle into the shutdown marker.
+    let _ = monitor_watch.join();
     shared.shutdown();
     let _ = std::fs::remove_file(&socket_path);
     Ok(())
