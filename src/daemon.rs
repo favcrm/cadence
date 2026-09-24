@@ -4483,6 +4483,33 @@ impl Shared {
         if let Some(caller) = &steering_caller {
             (steer.by, steer.by_kind) = caller.audit();
         }
+        // CAD-467: `issue`/`worktree` mark the dispatch lane on the
+        // message row itself — the reported-kickoff duplicate check
+        // trusts them because the tracker can't forge them. Recording
+        // provenance is a dispatch authority: only a caller who may
+        // steer the target (the operator, or its PM — dispatch's
+        // reply_to) may claim a lane on a send; any other caller is
+        // refused, never silently dropped (a dropped field would
+        // mis-suppress silently).
+        let issue = optional_str(params, "issue");
+        let worktree = optional_str(params, "worktree");
+        if issue.is_some() || worktree.is_some() {
+            let verb = "send --issue/--worktree";
+            reject_identity_fields(params, verb)?;
+            let target = target
+                .as_ref()
+                .ok_or_else(|| Error::rejected("Unknown managed agent"))?;
+            let caller = steer_caller(verb)?;
+            let pm = self.effective_pm(target)?;
+            crate::peer::may_mutate_agent(
+                &caller,
+                &alias,
+                pm.as_deref(),
+                AgentMutation::Steer,
+                verb,
+            )
+            .map_err(Error::rejected)?;
+        }
         // A pty endpoint pastes literally and fails a body with control
         // characters at delivery; refuse it here so `send` never answers
         // `queued` for a message that cannot be delivered (CAD-218).
@@ -4589,6 +4616,8 @@ impl Shared {
             &message,
             source,
             task,
+            issue,
+            worktree,
             &sender,
             &steer,
         )?;
@@ -8215,6 +8244,11 @@ impl Shared {
     /// A report that already landed skips it; the reminder itself never
     /// resolves the turn and never fences — the unchanged
     /// `report_timeout_secs` bound still decides `unknown`.
+    ///
+    /// The reminder never carries the live turn token: the body lands
+    /// in pane scrollback and the durable row, readable by any same-uid
+    /// peer — a pasted token would let one forge the report. The worker
+    /// fetches it itself: `cadence self` prints id and token.
     fn report_reminder(&self, agent: &Agent, message: &Message) {
         // Re-read: a report can land between the probe's verdict and
         // this write — only a still-running turn is reminded.
@@ -8224,11 +8258,11 @@ impl Shared {
         if m.state != "running" {
             return;
         }
-        let token = m.turn_id.as_deref().unwrap_or("<turn_id>");
         let bound = store::report_timeout_secs(agent.params.as_ref());
         let mut text = format!(
             "Pane idle with a turn still open — report it: \
-             `cadence message result {} --token {token} --text '<summary>'`.",
+             `cadence message result {} --token <token from `cadence self`> \
+             --text '<summary>'`.",
             m.id
         );
         if bound > 0 {
@@ -8237,6 +8271,10 @@ impl Shared {
                  turn `unknown` for the operator to judge."
             ));
         }
+        // The token still keys the dedupe (hashed into the `sys-nudge-`
+        // id, never pasted): one reminder per TURN, so a turn that ends
+        // and a new one that stalls each get their own.
+        let token = m.turn_id.as_deref().unwrap_or("no-turn");
         let key = format!("report-reminder:{}:{token}", m.id);
         if let Err(e) = self.daemon_message(&agent.alias, store::NUDGE_SOURCE, &key, &text) {
             tracing::warn!(

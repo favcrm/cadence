@@ -605,11 +605,19 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
     // live means a kickoff is in flight — reuse the worktree, queue
     // nothing, say so. The ref names the worker it went to, so a
     // re-dispatch to a DIFFERENT worker is still caught.
-    // CAD-467: a ref whose kickoff this worker already REPORTED —
-    // completed against this same lane — is the late duplicate: the
-    // work it kicks off is done, so nothing re-sends and the detection
-    // is recorded on the issue. A kickoff bound to a different
-    // worktree is another lane's history, not this dispatch's.
+    // CAD-467: a ref whose kickoff was already REPORTED is the late
+    // duplicate: the work it kicks off is done, so nothing re-sends and
+    // the detection is recorded on the issue.
+    //
+    // Review round: the tracker is forgeable — a planted
+    // `refs: [{kind: message, path: <id>}]` must never suppress a real
+    // kickoff. The ref only LOCATES the candidate message; the proof is
+    // on the message row itself, recorded by the daemon at send:
+    // `issue` must be this issue and `worktree` must be this lane's —
+    // both present, both equal. A row missing either (an old kickoff,
+    // or any unrelated completed message a ref was pointed at) never
+    // matches. A kickoff whose recorded worktree is a different lane is
+    // that lane's history, not this dispatch's.
     let mut live: Option<Value> = None;
     let mut reported: Option<Value> = None;
     // A fresh read on the target — `show` predates `issue start`, and
@@ -650,12 +658,18 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
             live = Some(found);
             break;
         }
-        if owner == args.to
-            && state == "completed"
-            && r.worktree
-                .as_deref()
-                .is_none_or(|w| Some(w) == started["worktree"].as_str())
-        {
+        // The proof is the daemon-recorded row: this issue's kickoff,
+        // delivered to THIS worker (the row's `alias` is the send's
+        // target — a kickoff reported by another worker is their
+        // history, not this dispatch's), on THIS lane's worktree.
+        let reported_here = state == "completed"
+            && found["alias"].as_str() == Some(args.to.as_str())
+            && found["issue"].as_str() == Some(front.id.as_str())
+            && match (found["worktree"].as_str(), started["worktree"].as_str()) {
+                (Some(m), Some(lane)) => m == lane,
+                _ => false,
+            };
+        if reported_here {
             reported = Some(found);
         }
     }
@@ -825,18 +839,28 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
     // `queued` would deliver as a bare onboarding turn AHEAD of this
     // kickoff — and a worker that treated it as the task would then
     // meet the kickoff as a second statement of the same work. Fold it
-    // instead: cancel the queued row and carry its body verbatim ahead
-    // of the kickoff, so the lane's first turn is the task and still
-    // teaches identity, briefing path and the report command. A
-    // bootstrap already `running` keeps its turn — this kickoff queues
-    // behind it — and a folded body that outgrows the pty ceiling
-    // leaves the bootstrap to deliver on its own. `--job` kickoffs are
-    // daemon-templated and cannot carry it, so the fold is plain-path
-    // only. The cancel is state-guarded: a bootstrap claimed in the
-    // meantime refuses it and the kickoff queues behind, unchanged.
+    // instead: carry its body verbatim ahead of the kickoff, then —
+    // once the kickoff is safely queued — cancel the bootstrap row, so
+    // the lane's first turn is the task and still teaches identity,
+    // briefing path and the report command. A bootstrap already
+    // `running` keeps its turn — this kickoff queues behind it — and a
+    // folded body that outgrows the pty ceiling leaves the bootstrap
+    // to deliver on its own. `--job` kickoffs are daemon-templated and
+    // cannot carry it, so the fold is plain-path only.
+    //
+    // Ordering (review): the cancel is the LAST step. The fallible
+    // writes — the ref and the send — run while the bootstrap is still
+    // queued, so a failure on either leaves onboarding untouched
+    // rather than stranding a cancelled row (a cancelled
+    // `bootstrap-<alias>` cannot be re-issued — the deterministic id
+    // dedupes the restore). The cancel itself is state-guarded: a
+    // bootstrap claimed in the meantime refuses it, the folded kickoff
+    // still carries the onboarding, and the kickoff queues behind —
+    // at worst the worker sees the same text twice, never zero times.
     let bootstrap_id = format!("bootstrap-{}", args.to);
     let mut send_body = body;
     let mut bootstrap_state: Option<String> = None;
+    let mut fold = false;
     if let Some(boot) = send_body.as_ref().and_then(|_| {
         show_now["messages"].as_array().and_then(|ms| {
             ms.iter()
@@ -847,17 +871,9 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
         if bootstrap_state.as_deref() == Some("queued") {
             if let (Some(boot_body), Some(b)) = (boot["body"].as_str(), send_body.as_deref()) {
                 let folded = format!("{boot_body} {b}");
-                if check_body(&folded, &provider).is_ok()
-                    && client::rpc(
-                        state_dir,
-                        "message_cancel",
-                        json!({"message": bootstrap_id, "by": reply_to,
-                               "reason": format!("folded into kickoff {mid} for {}", front.id)}),
-                    )
-                    .is_ok()
-                {
+                if check_body(&folded, &provider).is_ok() {
                     send_body = Some(folded);
-                    bootstrap_state = Some("folded".to_string());
+                    fold = true;
                 }
             }
         }
@@ -868,6 +884,25 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
     // If the send then fails the ref stays as the attempt's history
     // (a ref id no live message ever matches blocks nothing) and the
     // failure comment below records it.
+    let add_ref_failed = |e: Error| -> Error {
+        if fold {
+            let _ = write::add_comment(
+                pm,
+                id,
+                &format!(
+                    "Dispatch to {} failed recording the kickoff ref: {e} — \
+                     bootstrap {bootstrap_id} was never touched; it still \
+                     delivers as onboarding.",
+                    args.to
+                ),
+                None,
+                Some("dispatch"),
+                None,
+                actor,
+            );
+        }
+        e
+    };
     write::add_ref(
         pm,
         id,
@@ -878,7 +913,8 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
         Some(&args.to),
         None,
         actor,
-    )?;
+    )
+    .map_err(&add_ref_failed)?;
     let send_failed = |e: Error| -> Error {
         // The ref recorded pre-send is an orphan — no live message
         // will ever carry `mid`. Close it so it stays history without
@@ -886,11 +922,14 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
         // stale reason) for a concurrent finish; best-effort — the
         // send error is the one that matters.
         let _ = write::close_ref(pm, id, "message", &mid, actor);
-        // CAD-467: a folded bootstrap is already cancelled — the
-        // worker's onboarding rode the kickoff that failed, so name it
-        // on the failure comment for the operator to re-bootstrap.
-        let folded = if bootstrap_state.as_deref() == Some("folded") {
-            format!(" (bootstrap {bootstrap_id} was already folded into it — `cadence agent bootstrap {}` restores onboarding)", args.to)
+        // CAD-467: with the cancel moved behind the send, a failed
+        // send leaves a fold-intended bootstrap still queued — say so,
+        // so nobody goes looking for a restore that is not needed.
+        let folded = if fold {
+            format!(
+                " (bootstrap {bootstrap_id} was left queued — it still \
+                 delivers as onboarding)"
+            )
         } else {
             String::new()
         };
@@ -907,12 +946,17 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
     };
 
     // Exactly one send — plain text kickoff, or `job dispatch`'s
-    // spec-bound kickoff for --job (its state lives on the task).
+    // spec-bound kickoff for --job (its state lives on the task). Both
+    // record the lane on the message row — `issue`/`worktree` here, the
+    // job's own fields in `task_dispatch` — so a later re-dispatch can
+    // prove this kickoff's report belongs to THIS issue and lane
+    // (CAD-467).
     let (message, sent_state) = if let Some(body) = send_body {
         let sent = client::rpc(
             state_dir,
             "agent_send",
-            json!({"alias": args.to, "text": body, "reply_to": reply_to, "message": mid}),
+            json!({"alias": args.to, "text": body, "reply_to": reply_to, "message": mid,
+                   "issue": front.id, "worktree": started["worktree"]}),
         )
         .map_err(&send_failed)?;
         (
@@ -951,6 +995,37 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
         )?;
     }
 
+    // The kickoff is safely queued — now the fold's cleanup: cancel
+    // the still-queued bootstrap so onboarding does not deliver twice.
+    // The guard refuses a bootstrap claimed in the meantime; report the
+    // row's actual state (best-effort re-read — a claimed bootstrap
+    // reads `running`, the common case) so `bootstrap` never claims a
+    // fold that did not happen.
+    if fold {
+        match client::rpc(
+            state_dir,
+            "message_cancel",
+            json!({"message": bootstrap_id, "by": reply_to,
+                   "reason": format!("folded into kickoff {mid} for {}", front.id)}),
+        ) {
+            Ok(_) => bootstrap_state = Some("folded".to_string()),
+            Err(_) => {
+                bootstrap_state = client::rpc(state_dir, "agent_show", json!({"alias": args.to}))
+                    .ok()
+                    .and_then(|s| {
+                        s["messages"].as_array()?.iter().find_map(|m| {
+                            if m["id"].as_str() == Some(bootstrap_id.as_str()) {
+                                m["state"].as_str().map(str::to_string)
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                    .or(Some("running".to_string()));
+            }
+        }
+    }
+
     // The comment rides its own commit through the existing helper. A
     // second line records which lessons were injected.
     let mut comment_text = format!("Dispatched to {}: {}", args.to, note.display());
@@ -975,13 +1050,22 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
     if let Some(warning) = &acceptance_warning {
         comment_text.push_str(&format!("\nAcceptance warning: {warning}"));
     }
-    // CAD-467: a folded bootstrap is recorded on the dispatch's own
-    // comment — the cancelled row's history names this kickoff too.
-    if bootstrap_state.as_deref() == Some("folded") {
-        comment_text.push_str(&format!(
+    // CAD-467: the fold's outcome is recorded on the dispatch's own
+    // comment — both ways. A cancelled row's history names this
+    // kickoff; a refused cancel (the bootstrap was claimed first)
+    // means this kickoff still carries the onboarding text while the
+    // bootstrap turn runs too — at worst the worker reads it twice.
+    match bootstrap_state.as_deref() {
+        Some("folded") => comment_text.push_str(&format!(
             "\nBootstrap {bootstrap_id} folded into this kickoff — the queued \
              onboarding turn was cancelled; its instructions ride this message."
-        ));
+        )),
+        Some(state) if fold => comment_text.push_str(&format!(
+            "\nBootstrap {bootstrap_id} was meant to fold into this kickoff but \
+             the cancel was refused (row is now {state}) — this kickoff carries \
+             the onboarding text; the bootstrap turn delivers it again."
+        )),
+        _ => {}
     }
     let comment = write::add_comment(pm, id, &comment_text, None, Some("dispatch"), None, actor)?;
 
