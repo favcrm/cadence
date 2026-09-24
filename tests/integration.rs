@@ -45332,6 +45332,644 @@ fn cad446_board_syncs_delivery_without_a_terminal() {
     );
 }
 
+// ==== CAD-449: a merged delivery marks its ticket done ====
+
+/// Seven independent tickets for w1 (D-2 … D-8).
+const DONE_PLAN: &str = "---\ntitle: Reminders\ngoal: Users get a reminder email\n---\n\n\
+## Schema\nsize: S\nagent: w1\n\n### Acceptance\n- [ ] migration adds reminders\n\n\
+## Sender\nsize: S\nagent: w1\n\n### Acceptance\n- [ ] an email goes out\n\n\
+## Settings\nsize: S\nagent: w1\n\n### Acceptance\n- [ ] a user can turn reminders off\n\n\
+## Digest\nsize: S\nagent: w1\n\n### Acceptance\n- [ ] a weekly digest goes out\n\n\
+## Snooze\nsize: S\nagent: w1\n\n### Acceptance\n- [ ] a user can snooze one\n\n\
+## Audit\nsize: S\nagent: w1\n\n### Acceptance\n- [ ] every send is logged\n\n\
+## Export\nsize: S\nagent: w1\n\n### Acceptance\n- [ ] a user can export them\n";
+
+impl LoopFixture {
+    fn rec_of(&self, id: &str) -> Value {
+        self.f.d.rpc("delivery_list", json!({"issue": id})).unwrap()["records"][0].clone()
+    }
+
+    fn wait_of(&self, id: &str, what: &str, ok: impl Fn(&Value) -> bool) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let r = self.rec_of(id);
+            if ok(&r) {
+                return r;
+            }
+            assert!(Instant::now() < deadline, "{id} never {what}: {r:#}");
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// w1 reports `sha` done on `pr`; the review goes to r1, which
+    /// PASSes it through `report_verdict`.
+    fn pass_on(&mut self, id: &str, sha: &str, pr: &str) {
+        self.done_on(id, sha, pr);
+        let rec = self.wait_of(id, "in review", |r| {
+            r["state"] == "reviewing" && r["head"] == sha
+        });
+        assert_eq!(rec["reviewer"], "r1", "{rec}");
+        let file = self.verdict_file(&format!("v-{id}-{sha}.md"), "pass", sha, "");
+        let (ok, out) = self.as_agent(
+            "r1",
+            &format!("report file --task {id} --kind verdict --file {file}"),
+        );
+        assert!(ok, "{out}");
+        assert_eq!(out["delivery"]["state"], "passed", "{out}");
+    }
+
+    /// `cadence delivery sync <id>` from the operator's shell: its row.
+    fn sync_of(&self, id: &str) -> Value {
+        let (ok, out) = self.operator(&["delivery", "sync", id]);
+        assert!(ok, "{out}");
+        out["synced"][0].clone()
+    }
+
+    /// `delivery_observe` straight from the operator's connection — a
+    /// replay of what a sync would hand the daemon.
+    fn observe(&self, id: &str, head: &str, state: &str) -> Value {
+        self.f
+            .d
+            .operator_rpc(
+                "delivery_observe",
+                json!({"issue": id, "head": head, "pr_state": state, "ci_green": true}),
+            )
+            .unwrap()
+    }
+
+    fn daemon_events(&self, kind: &str) -> Vec<Value> {
+        self.f
+            .d
+            .rpc("agent_events", json!({"alias": "daemon", "tail": true}))
+            .unwrap()["events"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|e| e["kind"] == kind)
+            .collect()
+    }
+
+    /// Tracker commits in which a merge marked `id` done (not the
+    /// operator's own `issue set`).
+    fn done_commits(&self, id: &str) -> Vec<String> {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&self.f.pm_dir)
+            .args(["log", "--format=%B%x00"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .split('\0')
+            .filter(|c| {
+                c.trim_start()
+                    .starts_with(&format!("{id}: set status=done — "))
+            })
+            .map(str::to_string)
+            .collect()
+    }
+}
+
+/// CAD-449 acceptance: the operator's sync sees the reviewed PR merged
+/// → the ticket is `done`, in one tracker commit whose Actor names the
+/// observer and the delivery, with a `ticket_done_on_merge` event, and
+/// "since you left" lists it. A second sync, a replayed observation and
+/// two concurrent observations of one merge write it once; a ticket the
+/// operator reopened after its merge stays reopened.
+#[test]
+fn delivery_merged_marks_ticket_done_once() {
+    let mut lf = LoopFixture::dispatched();
+    let a = "a".repeat(40);
+    let t0 = cadence_agent::issue::time::now_epoch() - 1;
+    lf.pass_on("D-2", &a, LOOP_PR);
+    lf.set_gh(&a, "OPEN", true, false);
+    lf.sync_of("D-2");
+    let (ok, out) = lf.operator(&["delivery", "merge", "D-2"]);
+    assert!(ok, "{out}");
+    assert_eq!(out["state"], "enqueued", "{out}");
+    let status = lf.f.front("D-2").status;
+    assert_ne!(status, "done");
+
+    // Merged: done, in exactly one commit.
+    lf.set_gh(&a, "MERGED", true, false);
+    let commits = lf.f.commits();
+    let row = lf.sync_of("D-2");
+    assert_eq!(row["state"], "merged", "{row}");
+    assert_eq!(row["ticket"]["outcome"], "marked", "{row}");
+    assert_eq!(lf.f.front("D-2").status, "done");
+    assert_eq!(lf.f.commits(), commits + 1);
+    let msg = lf.f.last_commit();
+    assert!(
+        msg.starts_with(&format!("D-2: set status=done — acme/app#7 merged at {a}")),
+        "{msg}"
+    );
+    assert!(msg.contains("\nIssue: D-2\n"), "{msg}");
+    assert!(
+        msg.contains("\nActor: operator (delivery acme/app#7)\n"),
+        "{msg}"
+    );
+    let events = lf.daemon_events("ticket_done_on_merge");
+    assert_eq!(events.len(), 1, "{events:#?}");
+    assert_eq!(events[0]["payload"]["issue"], "D-2");
+    assert_eq!(events[0]["payload"]["pr"], "acme/app#7");
+    let summary = lf.f.d.rpc("master_summary", json!({"since": t0})).unwrap();
+    assert!(
+        summary["tickets_moved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["issue"] == "D-2" && t["status"] == "done"),
+        "{summary:#}"
+    );
+
+    // A second sync and a replayed observation write nothing.
+    let commits = lf.f.commits();
+    let (ok, out) = lf.operator(&["delivery", "sync"]);
+    assert!(ok, "{out}");
+    let out = lf.observe("D-2", &a, "MERGED");
+    assert!(out["ticket"].is_null(), "{out}");
+    assert_eq!(lf.f.commits(), commits);
+    assert_eq!(lf.done_commits("D-2").len(), 1);
+
+    // Reopened after its merge: no later sync or replay flips it back.
+    let (ok, out) = lf.f.cli(&["issue", "set", "D-2", "status=doing"]);
+    assert!(ok, "{out}");
+    let commits = lf.f.commits();
+    let (ok, out) = lf.operator(&["delivery", "sync"]);
+    assert!(ok, "{out}");
+    lf.sync_of("D-2");
+    lf.observe("D-2", &a, "MERGED");
+    assert_eq!(lf.f.front("D-2").status, "doing");
+    assert_eq!(lf.f.commits(), commits);
+    assert_eq!(lf.done_commits("D-2").len(), 1);
+    assert_eq!(lf.daemon_events("ticket_done_on_merge").len(), 1);
+
+    // D-3 (it waited on D-2): two observations of its merge race; the
+    // ticket is marked done once.
+    let (ok, out) = lf.f.cli(&["issue", "set", "D-2", "status=done"]);
+    assert!(ok, "{out}");
+    let (ok, sent) = lf.f.as_master(&mut lf.m, "master dispatch D-3");
+    assert!(ok, "{sent}");
+    let b = "b".repeat(40);
+    let pr8 = "https://github.com/acme/app/pull/8";
+    lf.pass_on("D-3", &b, pr8);
+    let answers: Vec<Value> = thread::scope(|s| {
+        let lf = &lf;
+        let b = &b;
+        let hs: Vec<_> = (0..2)
+            .map(|_| s.spawn(move || lf.observe("D-3", b, "MERGED")))
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let marked = answers
+        .iter()
+        .filter(|a| a["ticket"]["outcome"] == "marked")
+        .count();
+    assert_eq!(marked, 1, "{answers:#?}");
+    assert_eq!(lf.f.front("D-3").status, "done");
+    assert_eq!(lf.done_commits("D-3").len(), 1);
+}
+
+/// CAD-449: only a reviewed merge marks a ticket done. A closed PR, a
+/// declined loop, a PR merged at a head nobody PASSed, a merge while a
+/// newer head is in review, and a PR no longer in the project's repos
+/// each leave the status as it was (with a comment saying why); a
+/// dropped ticket stays dropped.
+#[test]
+fn delivery_unreviewed_or_unmerged_never_marks_ticket_done() {
+    let mut lf = LoopFixture::dispatched_plan(DONE_PLAN);
+    for id in ["D-3", "D-4", "D-5", "D-6", "D-7"] {
+        let (ok, sent) = lf.f.as_master(&mut lf.m, &format!("master dispatch {id}"));
+        assert!(ok, "{id}: {sent}");
+    }
+    let (a, b) = ("a".repeat(40), "b".repeat(40));
+    let pr = |n: u32| format!("https://github.com/acme/app/pull/{n}");
+    let status = |lf: &LoopFixture, id: &str| lf.f.front(id).status;
+    let before: std::collections::BTreeMap<&str, String> =
+        ["D-2", "D-3", "D-4", "D-5", "D-6", "D-7"]
+            .into_iter()
+            .map(|id| (id, status(&lf, id)))
+            .collect();
+    assert!(before.values().all(|s| s != "done"), "{before:?}");
+
+    // Closed without merging: closed, never done — nor by a later
+    // merged observation of the finished loop.
+    lf.pass_on("D-2", &a, &pr(7));
+    lf.set_gh(&a, "CLOSED", true, false);
+    let row = lf.sync_of("D-2");
+    assert_eq!(row["state"], "closed", "{row}");
+    assert!(row["ticket"].is_null(), "{row}");
+    lf.set_gh(&a, "MERGED", true, false);
+    let (ok, out) = lf.operator(&["delivery", "sync", "D-2"]);
+    assert!(ok, "{out}");
+    let out = lf.observe("D-2", &a, "MERGED");
+    assert_eq!(out["state"], "closed", "{out}");
+    assert_eq!(status(&lf, "D-2"), before["D-2"]);
+
+    // Declined by the operator: never done, whatever GitHub says later.
+    lf.pass_on("D-3", &a, &pr(8));
+    let (ok, out) = lf.operator(&["delivery", "decline", "D-3", "--reason", "not now"]);
+    assert!(ok, "{out}");
+    let out = lf.observe("D-3", &a, "MERGED");
+    assert_eq!(out["state"], "declined", "{out}");
+    assert_eq!(status(&lf, "D-3"), before["D-3"]);
+
+    // Merged at a head nobody PASSed.
+    lf.pass_on("D-4", &a, &pr(9));
+    let out = lf.observe("D-4", &b, "MERGED");
+    assert_eq!(out["state"], "merged", "{out}");
+    assert_eq!(out["ticket"]["outcome"], "refused", "{out}");
+    let why = out["ticket"]["why"].as_str().unwrap();
+    assert!(why.contains("is not the reviewed"), "{why}");
+    assert_eq!(status(&lf, "D-4"), before["D-4"]);
+    let comments = lf.f.pm_dir.join("demo/D-4/comments");
+    assert!(
+        std::fs::read_dir(&comments).unwrap().any(|e| {
+            std::fs::read_to_string(e.unwrap().path())
+                .unwrap()
+                .contains("acme/app#9 merged at")
+        }),
+        "no comment says why D-4 stayed open"
+    );
+    let refused = lf.daemon_events("ticket_done_refused");
+    assert!(
+        refused.iter().any(|e| e["payload"]["issue"] == "D-4"),
+        "{refused:#?}"
+    );
+    // Needs-you asks the operator until the status is set by hand; the
+    // router pass then records it as kept.
+    let row = |lf: &LoopFixture| {
+        lf.needs("merged_not_done")
+            .into_iter()
+            .any(|r| r["title"].as_str().unwrap_or_default().starts_with("D-4:"))
+    };
+    assert!(row(&lf), "{:#?}", lf.f.needs_me());
+    let (ok, out) = lf.f.cli(&["issue", "set", "D-4", "status=done"]);
+    assert!(ok, "{out}");
+    lf.wait_of("D-4", "settled by hand", |r| {
+        r["ticket_done"]["outcome"] == "kept"
+    });
+    assert!(!row(&lf), "{:#?}", lf.f.needs_me());
+
+    // Merged at the PASSed head while the worker's newer head is in
+    // review: the loop no longer stands on that PASS.
+    lf.pass_on("D-5", &a, &pr(10));
+    lf.done_on("D-5", &b, &pr(10));
+    lf.wait_of("D-5", "back in review", |r| {
+        r["state"] == "reviewing" && r["head"] == b
+    });
+    let out = lf.observe("D-5", &a, "MERGED");
+    assert_eq!(out["ticket"]["outcome"], "refused", "{out}");
+    assert!(
+        out["ticket"]["why"]
+            .as_str()
+            .unwrap()
+            .contains("was reviewing"),
+        "{out}"
+    );
+    assert_eq!(status(&lf, "D-5"), before["D-5"]);
+
+    // A dropped ticket stays dropped, and nothing is written.
+    lf.pass_on("D-6", &a, &pr(11));
+    let (ok, out) = lf.f.cli(&["issue", "set", "D-6", "status=dropped"]);
+    assert!(ok, "{out}");
+    let commits = lf.f.commits();
+    let out = lf.observe("D-6", &a, "MERGED");
+    assert_eq!(out["ticket"]["outcome"], "kept", "{out}");
+    assert_eq!(out["ticket"]["status"], "dropped", "{out}");
+    assert_eq!(status(&lf, "D-6"), "dropped");
+    assert_eq!(lf.f.commits(), commits);
+
+    // The PR is no longer in the project's repos when it merges.
+    lf.pass_on("D-7", &a, &pr(12));
+    let yaml = lf.f.pm_dir.join("demo/project.yaml");
+    let text = std::fs::read_to_string(&yaml).unwrap();
+    std::fs::write(&yaml, text.replace("Acme/app", "Acme/other")).unwrap();
+    let o = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&lf.f.pm_dir)
+        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+        .args(["commit", "-qam", "demo: move the repo"])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{o:?}");
+    let out = lf.observe("D-7", &a, "MERGED");
+    assert_eq!(out["ticket"]["outcome"], "refused", "{out}");
+    assert!(
+        out["ticket"]["why"]
+            .as_str()
+            .unwrap()
+            .contains("not a repo of project demo"),
+        "{out}"
+    );
+    assert_eq!(status(&lf, "D-7"), before["D-7"]);
+
+    for id in ["D-2", "D-3", "D-4", "D-5", "D-6", "D-7"] {
+        assert!(lf.done_commits(id).is_empty(), "{id} was marked done");
+    }
+    assert!(lf.daemon_events("ticket_done_on_merge").is_empty());
+}
+
+/// CAD-449, adversarial: an agent never gets a ticket marked done. Its
+/// own `delivery sync` with a `gh` it planted (answering MERGED) is
+/// refused at `delivery_observe`, from its connection and its detached
+/// children alike; and a `delivery.json` rewritten on disk to show a
+/// PASS the daemon never recorded — even with a verdict report planted
+/// in the tracker — is refused when the operator's sync sees the PR
+/// merged: the tracker holds no committed PASS for it.
+#[test]
+fn delivery_agent_cannot_mark_ticket_done() {
+    let mut lf = LoopFixture::dispatched_plan(LOOP_PLAN);
+    let (ok, sent) = lf.f.as_master(&mut lf.m, "master dispatch D-3");
+    assert!(ok, "{sent}");
+    let (a, f) = ("a".repeat(40), "f".repeat(40));
+    lf.pass_on("D-2", &a, LOOP_PR);
+    lf.set_gh(&a, "OPEN", true, false);
+    lf.sync_of("D-2");
+    let status = lf.f.front("D-2").status;
+
+    // The worker plants a `gh` that says MERGED and runs the sync itself.
+    let planted = lf.f.tmp.path().join("w1-gh");
+    std::fs::create_dir_all(&planted).unwrap();
+    std::fs::write(planted.join("gh"), FAKE_GH_PY).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(planted.join("gh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        planted.join("gh-state.json"),
+        json!({"head": a, "state": "MERGED", "green": true, "auto": false}).to_string(),
+    )
+    .unwrap();
+    let before = lf.snapshot();
+    for who in ["w1", "r1"] {
+        let line = format!(
+            "env PATH={}:$PATH CADENCE_PM_DIR={} {}",
+            planted.display(),
+            lf.f.pm_dir.display(),
+            lf.f.master_line("delivery sync D-2")
+        );
+        let agent = if who == "w1" { &mut lf.w1 } else { &mut lf.r1 };
+        let r = agent.exec(&["sh", "-c", &line]);
+        let text = format!("{}{}", r["out"], r["err"]);
+        assert!(text.contains("operator"), "{who}: {r}");
+    }
+    assert!(
+        std::fs::read_to_string(planted.join("gh.log"))
+            .unwrap()
+            .contains("pr view"),
+        "the planted gh never ran"
+    );
+    for how in ["self", "detached", "detached-bare"] {
+        let r = lf.w1.rpc(
+            how,
+            "delivery_observe",
+            json!({"issue": "D-2", "head": a, "pr_state": "MERGED", "ci_green": true}),
+        );
+        assert_eq!(r["ok"], false, "{how}: {r}");
+        assert!(
+            r["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("operator"),
+            "{how}: {r}"
+        );
+    }
+    assert_eq!(lf.snapshot(), before, "an agent's merge observation wrote");
+    assert_eq!(lf.rec()["state"], "passed");
+    assert_eq!(lf.f.front("D-2").status, status);
+
+    // D-3 is still with its worker. The record is rewritten on disk to
+    // a PASS by r1 at f on a project PR, a matching verdict report is
+    // planted in the tracker, and w1's next ordinary tracker write (a
+    // comment) sweeps the plant into a commit (`git add -A`, CAD-454).
+    let d3_status = lf.f.front("D-3").status;
+    let report = "D-3/reports/20990101T000000Z-r1.md";
+    std::fs::create_dir_all(lf.f.pm_dir.join("demo/D-3/reports")).unwrap();
+    std::fs::write(
+        lf.f.pm_dir.join("demo").join(report),
+        format!(
+            "---\nschema: cadence.report/2\nkind: verdict\ntask: D-3\nagent: r1\n\
+             verdict: pass\nsha: {f}\n---\nok\n"
+        ),
+    )
+    .unwrap();
+    let (ok, out) =
+        lf.f.cli_as("w1", &["issue", "comment", "D-3", "-m", "progress"]);
+    assert!(ok, "{out}");
+    let tracked = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&lf.f.pm_dir)
+        .args(["ls-files", "--error-unmatch", "--"])
+        .arg(format!("demo/{report}"))
+        .output()
+        .unwrap();
+    assert!(tracked.status.success(), "the plant was not swept in");
+    let state = lf.f.d.state.clone();
+    let forge = |id: &str, pr: &str, sha: &str, reviewer: &str, report: &str| {
+        let file = state.join("delivery.json");
+        let mut all: Value =
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        let rec = &mut all[id];
+        rec["state"] = json!("passed");
+        rec["pr"] = json!(pr);
+        rec["head"] = json!(sha);
+        rec["reviewer"] = json!(reviewer);
+        rec["rounds"] = json!(1);
+        rec["verdict"] = json!({"verdict": "pass", "sha": sha, "reviewer": reviewer,
+                                "summary": "ok", "report": report, "at": 0});
+        std::fs::write(&file, serde_json::to_vec_pretty(&all).unwrap()).unwrap();
+    };
+    forge(
+        "D-3",
+        "https://github.com/acme/app/pull/8",
+        &f,
+        "r1",
+        report,
+    );
+    lf.set_gh(&f, "MERGED", true, false);
+    let row = lf.sync_of("D-3");
+    assert_eq!(row["state"], "merged", "{row}");
+    assert_eq!(row["ticket"]["outcome"], "refused", "{row}");
+    assert!(
+        row["ticket"]["why"]
+            .as_str()
+            .unwrap()
+            .contains("the daemon recorded no PASS"),
+        "{row}"
+    );
+    assert_eq!(lf.f.front("D-3").status, d3_status);
+
+    // D-4 has a real PASS by r1 at e. Its record is rewritten to name r2
+    // as the reviewer — a verdict the daemon never recorded.
+    let (ok, sent) = lf.f.as_master(&mut lf.m, "master dispatch D-4");
+    assert!(ok, "{sent}");
+    let e = "e".repeat(40);
+    let pr9 = "https://github.com/acme/app/pull/9";
+    lf.pass_on("D-4", &e, pr9);
+    let real = lf.rec_of("D-4")["verdict"]["report"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let d4_status = lf.f.front("D-4").status;
+    forge("D-4", pr9, &e, "r2", &real);
+    lf.set_gh(&e, "MERGED", true, false);
+    let row = lf.sync_of("D-4");
+    assert_eq!(row["ticket"]["outcome"], "refused", "{row}");
+    assert!(
+        row["ticket"]["why"]
+            .as_str()
+            .unwrap()
+            .contains("recorded no PASS by r2"),
+        "{row}"
+    );
+    assert_eq!(lf.f.front("D-4").status, d4_status);
+
+    for id in ["D-2", "D-3", "D-4"] {
+        assert!(lf.done_commits(id).is_empty(), "{id} was marked done");
+    }
+    assert!(lf.daemon_events("ticket_done_on_merge").is_empty());
+}
+
+/// CAD-449: a tracker write that fails is retried, never lost, and
+/// leaves nothing staged. A tracker locked by another writer and a
+/// failing commit hook each leave the ticket `pending` with a Needs-you
+/// row; `issue.md` is back as it was and unstaged, so the next writer's
+/// commit carries no `status: done`; the router pass marks it done once
+/// the tracker takes writes again, and the row goes.
+#[test]
+fn delivery_failed_done_write_is_retried_and_leaves_nothing_staged() {
+    let mut lf = LoopFixture::dispatched_plan(LOOP_PLAN);
+    let (ok, sent) = lf.f.as_master(&mut lf.m, "master dispatch D-3");
+    assert!(ok, "{sent}");
+    let (a, b) = ("a".repeat(40), "b".repeat(40));
+    let pm_dir = lf.f.pm_dir.clone();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&pm_dir)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let row = |lf: &LoopFixture, id: &str| {
+        lf.needs("merged_not_done").into_iter().any(|r| {
+            r["title"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with(&format!("{id}:"))
+        })
+    };
+
+    // A stale tracker lock.
+    lf.pass_on("D-2", &a, LOOP_PR);
+    let d2_status = lf.f.front("D-2").status;
+    let lock = lf.f.pm_dir.join(".write.lock");
+    std::fs::write(&lock, "").unwrap();
+    lf.set_gh(&a, "MERGED", true, false);
+    let row2 = lf.sync_of("D-2");
+    assert_eq!(row2["ticket"]["outcome"], "pending", "{row2}");
+    assert!(
+        row2["ticket"]["why"].as_str().unwrap().contains("locked"),
+        "{row2}"
+    );
+    assert_eq!(lf.f.front("D-2").status, d2_status);
+    assert!(row(&lf, "D-2"), "{:#?}", lf.f.needs_me());
+    std::fs::remove_file(&lock).unwrap();
+    lf.wait_of("D-2", "marked by a retry", |r| {
+        r["ticket_done"]["outcome"] == "marked"
+    });
+    assert_eq!(lf.f.front("D-2").status, "done");
+    assert_eq!(lf.done_commits("D-2").len(), 1);
+    assert!(!row(&lf, "D-2"), "{:#?}", lf.f.needs_me());
+    assert_eq!(lf.daemon_events("ticket_done_pending").len(), 1);
+    let comments = lf.f.pm_dir.join("demo/D-2/comments");
+    assert!(
+        std::fs::read_dir(&comments).unwrap().any(|e| {
+            std::fs::read_to_string(e.unwrap().path())
+                .unwrap()
+                .contains("marked done after a retry")
+        }),
+        "no comment says D-2's first write failed"
+    );
+
+    // A failing commit hook.
+    lf.pass_on("D-3", &b, "https://github.com/acme/app/pull/8");
+    let d3_status = lf.f.front("D-3").status;
+    let hooks = String::from_utf8(git(&["rev-parse", "--git-path", "hooks"]).stdout).unwrap();
+    let hooks = lf.f.pm_dir.join(hooks.trim());
+    std::fs::create_dir_all(&hooks).unwrap();
+    let hook = hooks.join("pre-commit");
+    // The hook counts its runs, so the test can wait for a retry.
+    let runs = lf.f.tmp.path().join("hook-runs");
+    std::fs::write(
+        &hook,
+        format!("#!/bin/sh\necho x >> {}\nexit 1\n", runs.display()),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    lf.set_gh(&b, "MERGED", true, false);
+    let row3 = lf.sync_of("D-3");
+    assert_eq!(row3["ticket"]["outcome"], "pending", "{row3}");
+    // Past the done write and its comment (both refused by the hook),
+    // a router retry fails too — and no comment follows it to re-stage
+    // the index, so what the retry left staged is what it left.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while std::fs::read_to_string(&runs)
+        .unwrap_or_default()
+        .lines()
+        .count()
+        < 3
+    {
+        assert!(Instant::now() < deadline, "no retry ran");
+        thread::sleep(Duration::from_millis(50));
+    }
+    // Hold the tracker lock while looking, so no retry is mid-write.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock)
+        .is_err()
+    {
+        assert!(Instant::now() < deadline, "the tracker lock never freed");
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(lf.f.front("D-3").status, d3_status);
+    assert!(
+        git(&["diff", "--cached", "--quiet"]).status.success(),
+        "a failed done write left changes staged: {}",
+        String::from_utf8_lossy(&git(&["diff", "--cached", "--name-status"]).stdout)
+    );
+    assert!(
+        git(&["status", "--porcelain", "--", "demo/D-3/issue.md"])
+            .stdout
+            .is_empty(),
+        "a failed done write left issue.md changed"
+    );
+    std::fs::remove_file(&lock).unwrap();
+    assert!(row(&lf, "D-3"), "{:#?}", lf.f.needs_me());
+    // The next writer after the hook is gone commits only its own file.
+    std::fs::remove_file(&hook).unwrap();
+    let (ok, out) =
+        lf.f.cli_as("w1", &["issue", "comment", "D-3", "-m", "progress"]);
+    assert!(ok, "{out}");
+    let log = String::from_utf8(git(&["log", "--format=%x00%s", "--name-only"]).stdout).unwrap();
+    let comment = log
+        .split('\0')
+        .find(|c| c.starts_with("D-3: comment by w1"))
+        .expect("w1's comment commit");
+    assert!(
+        !comment.contains("demo/D-3/issue.md"),
+        "w1's comment committed D-3's status: {comment}"
+    );
+    lf.wait_of("D-3", "marked by a retry", |r| {
+        r["ticket_done"]["outcome"] == "marked"
+    });
+    assert_eq!(lf.f.front("D-3").status, "done");
+    assert_eq!(lf.done_commits("D-3").len(), 1);
+    assert!(!row(&lf, "D-3"), "{:#?}", lf.f.needs_me());
+}
+
 // ---- CAD-384: one caller rule for every agent-mutating RPC ----
 
 /// Every row of every table, in a stable order — a refused call must

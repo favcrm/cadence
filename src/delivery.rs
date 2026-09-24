@@ -107,6 +107,32 @@ pub struct Observed {
     pub at: i64,
 }
 
+/// CAD-449: what a merge did to the ticket's tracker status. Written
+/// once, on the transition into [`State::Merged`]; `pending` is retried
+/// by the router pass until it settles.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum TicketDone {
+    /// The merge marked it done.
+    Marked { at: i64 },
+    /// It was already `done` or `dropped` — left alone.
+    Kept { status: String },
+    /// The merge is not the reviewed one; the operator sets the status.
+    Refused { why: String },
+    /// The tracker write failed (busy, a failing hook); retried.
+    Pending { why: String },
+}
+
+impl TicketDone {
+    /// The ticket still waits on the operator or a retry.
+    pub fn open(&self) -> Option<&str> {
+        match self {
+            TicketDone::Refused { why } | TicketDone::Pending { why } => Some(why),
+            _ => None,
+        }
+    }
+}
+
 /// A ticket's place in the loop — one per dispatched ticket.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Record {
@@ -151,6 +177,9 @@ pub struct Record {
     /// moved without the worker, so it may have pushed that head.
     #[serde(default)]
     pub excluded: Vec<String>,
+    /// CAD-449: what the merge did to the ticket's status.
+    #[serde(default)]
+    pub ticket_done: Option<TicketDone>,
 }
 
 impl Record {
@@ -173,6 +202,7 @@ impl Record {
             disable_auto: false,
             note: None,
             excluded: vec![],
+            ticket_done: None,
         }
     }
 

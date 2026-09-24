@@ -715,7 +715,9 @@ impl Audience {
             | "review_escalated"
             | "review_unstaffed"
             | "auto_merge_on"
-            | "delivery_unreadable" => Self::Operator,
+            | "delivery_unreadable"
+            // CAD-449: a merged ticket the merge could not mark done.
+            | "merged_not_done" => Self::Operator,
             "drift" => Self::Dependency,
             // CAD-439: informs the operator; nothing for the team.
             "inbox_unread" | "tracker_behind" | "master_unconfined" | "master_login" => Self::Info,
@@ -918,6 +920,24 @@ fn delivery_items(state_dir: &Path, now: i64) -> Vec<Item> {
                 .for_agent(&rec.worker)
                 .since(Some(rec.since)),
             );
+        }
+        if rec.state == crate::delivery::State::Merged {
+            if let Some(why) = rec.ticket_done.as_ref().and_then(|d| d.open()) {
+                out.push(
+                    item(
+                        20,
+                        "merged_not_done",
+                        &format!("{id}: merged, but not marked done — {why}"),
+                        age,
+                        &rec.project,
+                        pr,
+                        &format!("cadence issue set {id} status=done"),
+                    )
+                    .about("issue", id)
+                    .for_agent(&rec.worker)
+                    .since(Some(rec.since)),
+                );
+            }
         }
         let row = match rec.state {
             crate::delivery::State::Passed if rec.merge_ready() => {

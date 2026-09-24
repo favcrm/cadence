@@ -108,7 +108,7 @@ Error kinds:
 | `slot_reconcile` | `enrollment_id, token, evidence:{owner_generation,pid,starttime,uid,observed_at,process_read,command_outcome,side_effect_review}` | `{reconciled:true,token,kind,observed}` — the one operator path over a strict hold. Operator authority needs positive proof (CAD-276): refused from any connection that derives a slot identity (a pane or an enrolled endpoint is an agent), and from one that is not provably the operator — the peer must run as the daemon's uid with a fully readable ancestry on which no hop is a registered pane, an enrolled or tombstoned root, a descendant of the daemon (the daemon is the child subreaper of everything it launches, so a `setsid -f`/double-fork orphan of one of its trees stays its descendant — CAD-308), or a same-uid process carrying `CADENCE_ALIAS` or `CADENCE_RUNNER_ID` (a daemon-launched runner's tree, CAD-230b), hold no pane pty, and have its session leader on that ancestry (a `setsid` + double-fork orphan does not); refused too when the request carries `by`/`operator`/`actor`/`alias`/`lane`/`pid`. The evidence must name the recorded hold exactly; the daemon then reads `/proc` itself and frees only on proven death — a live or unknown holder is refused whatever the evidence says. `cadence build-slot reconcile <enrollment_id> <token> --evidence <json>` |
 | `report_verdict` | `issue, text` | the stored report (`{id, report, path, kind:"verdict", agent, committed, duplicate}`) plus `delivery` (the ticket's loop record). CAD-431: the only way a `verdict` report is filed — `text` is the report Markdown (`verdict: pass\|revise`, `sha:`, findings as the body). See "Worker loop" for who may file it |
 | `delivery_list` | `issue?` | `{records:[Record]}` — the worker loop's records (CAD-431), oldest dispatch first. A read, open to anyone (the master included) |
-| `delivery_observe` | `issue, head, pr_state (OPEN\|MERGED\|CLOSED), ci_green?, auto_merge?, additions?, deletions?, files?` | `{issue, state, was, disable_auto, merge_ready}` — what the operator's process read from GitHub. **Operator only** |
+| `delivery_observe` | `issue, head, pr_state (OPEN\|MERGED\|CLOSED), ci_green?, auto_merge?, additions?, deletions?, files?` | `{issue, state, was, disable_auto, merge_ready, ticket?}` — what the operator's process read from GitHub. `ticket` is present only on the transition into `merged`: `{outcome: marked, at}`, `{outcome: kept, status}`, `{outcome: refused, why}` or `{outcome: pending, why}` — also kept on the record as `ticket_done` (CAD-449, see Worker loop step 5). **Operator only** |
 | `delivery_merge` | `issue, phase (authorize\|check\|enqueued), sha?` | `authorize`/`check`: `{issue, sha, pr}`; `enqueued`: the record, now `enqueued`. **Operator only** |
 | `delivery_decline` | `issue, reason` | the record, now `declined`, `note` = the reason. **Operator only** |
 
@@ -2076,6 +2076,50 @@ the daemon writes it. Report files never move a ticket through the loop.
    `sync` runs `gh pr merge <n> --disable-auto`; until an observation
    shows it off, Needs-you carries an `auto_merge_on` row. A `MERGED`
    or `CLOSED` observation ends the loop.
+5. **Merged → done (CAD-449).** The observation that moves a record
+   into `merged` also settles the ticket's tracker status, and records
+   how on the record as `ticket_done`:
+   - `marked` — the status became `done` in a commit
+     `<ID>: set status=done — <owner/repo#n> merged at <sha>` whose
+     `Actor:` is `operator (delivery <owner/repo#n>)`. The observer is
+     the proven operator's process (`delivery sync`, or the board's
+     timer), the same authority that recorded the merge. A
+     `ticket_done_on_merge` event is recorded, and the status commit
+     shows in "since you left" (`master_summary`'s `tickets_moved`).
+   - `kept` — the ticket was already `done` or `dropped`; nothing is
+     written.
+   - `refused` — the merge is not the reviewed one. The status is left
+     as it is, a ticket comment and a `ticket_done_refused` event say
+     why, and Needs-you carries a `merged_not_done` row until the
+     operator sets the status (the router pass then records `kept`).
+   - `pending` — the tracker write failed (another writer holds the
+     tracker lock, which the daemon never waits for; a failing commit
+     hook). `issue.md` is restored and unstaged, so the next writer
+     commits no `status: done`. A `ticket_done_pending` event and the
+     `merged_not_done` row carry it; a ticket comment says why when the
+     tracker takes writes, and the router pass retries until it settles
+     (`marked`, with a comment naming the first failure, or `kept`).
+
+   It is `marked` only when all of these hold: the record was `passed`
+   or `enqueued` before the merge; the merged head is the PASSed sha;
+   the PR is in the project's repos (the done report's check, run
+   again); and the store's `audit:verdicts` stream holds that PASS —
+   the entry `report_verdict` writes, with the identity the daemon
+   derived from the reviewer's connection, naming this issue, sha,
+   reviewer and report. That stream is written by no RPC but
+   `report_verdict` and never pruned. A `delivery.json` rewritten on
+   disk, or a verdict report planted in the tracker (and committed by
+   another writer's `git add -A`), carries no such entry. A PASS
+   recorded before this stream existed is `refused` — the operator
+   sets the status. `CLOSED`, `declined` and an unmerged PR never set
+   done.
+
+   Only the transition settles it: the `merged` record is the guard, so
+   a second sync (which skips a finished loop), a replayed or concurrent
+   observation, or a ticket the operator reopened after its merge
+   writes nothing. Tickets that waited on this one are woken by the
+   master-wake pass that watches tracker status (CAD-445), not by a
+   second path here.
 
 Pinning: `gh pr merge --match-head-commit <sha>` sends the SHA as
 GraphQL `expectedHeadOid` on every path — `mergePullRequest` for a
