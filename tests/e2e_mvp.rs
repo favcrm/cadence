@@ -727,8 +727,31 @@ fn mvp_journey_end_to_end() {
             .any(|r| r["kind"] == "answer" && r["agent"] == "operator"),
         "the operator's answer is on the ticket: {show}"
     );
+    // CAD-447: the answer reaches the worker who asked — one `answer`
+    // message to w1 naming the ticket, with the answer's text.
+    let told = j.wait("w1 is told the operator's answer", 60, || {
+        let (_, show) = j.cadence(&["agent", "show", "w1"]);
+        let answers: Vec<Value> = show["messages"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|m| m["source"] == "answer")
+            .collect();
+        (!answers.is_empty()).then_some(answers)
+    });
+    assert_eq!(told.len(), 1, "one answer message: {told:?}");
+    let body = told[0]["body"].as_str().unwrap_or_default();
+    assert!(
+        body.contains("DEM-2") && body.contains("comma"),
+        "the answer message carries the ticket and the answer: {body}"
+    );
     j.step_done("question", t);
     j.pass(6, "w1's question reaches Needs-you with the master's summary; the operator answers it on the board");
+    j.pass(
+        6,
+        "the answer is routed back to w1 as one message (CAD-447)",
+    );
     j.expected_skip(
         6,
         "permission cards (a provider's tool approval) in Needs-you",

@@ -1247,10 +1247,12 @@ fn write_reply(pm: &Pm, state_dir: &Path, id: &str, out: Value, created: bool) -
     match issue_payloads(pm, state_dir, id) {
         Ok((card, detail)) => {
             let warnings = out.get("warnings").cloned().unwrap_or(json!([]));
-            let body = serde_json::to_vec_pretty(&json!({
-                "issue": detail, "card": card, "warnings": warnings,
-            }))
-            .unwrap_or_default();
+            let mut body = json!({"issue": detail, "card": card, "warnings": warnings});
+            // CAD-447: an answer's delivery to the asker.
+            if let Some(route) = out.get("route") {
+                body["route"] = route.clone();
+            }
+            let body = serde_json::to_vec_pretty(&body).unwrap_or_default();
             let mut resp = Response::from_data(body).with_status_code(StatusCode(if created {
                 201
             } else {
