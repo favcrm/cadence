@@ -86,7 +86,9 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("shutdown", Rule::Shutdown),
     (
         "agent_register",
-        Rule::Handler("authorize_register (CAD-149)"),
+        Rule::Handler(
+            "authorize_register: agent callers by CAD-149; an unattributed caller needs proven_operator (CAD-431)",
+        ),
     ),
     ("model_defaults_get", Rule::Read),
     (
@@ -280,6 +282,24 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     (
         "reports_changed",
         Rule::Handler("proven_operator (CAD-339)"),
+    ),
+    // CAD-431: the worker loop's review and merge verbs.
+    (
+        "report_verdict",
+        Rule::Handler("agent_caller: the report's assigned reviewer (CAD-431)"),
+    ),
+    ("delivery_list", Rule::Read),
+    (
+        "delivery_observe",
+        Rule::Handler("operator_connection (CAD-431)"),
+    ),
+    (
+        "delivery_merge",
+        Rule::Handler("operator_connection (CAD-431)"),
+    ),
+    (
+        "delivery_decline",
+        Rule::Handler("operator_connection (CAD-431)"),
     ),
     (
         "interrupt",
