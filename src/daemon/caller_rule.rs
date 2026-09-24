@@ -299,6 +299,11 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         "report_verdict",
         Rule::Handler("agent_caller: the report's assigned reviewer (CAD-431)"),
     ),
+    // CAD-447: an answer reaches the question's author.
+    (
+        "answer_route",
+        Rule::Handler("agent_caller: the answer's own recorded author (CAD-447)"),
+    ),
     ("delivery_list", Rule::Read),
     (
         "delivery_observe",

@@ -32,9 +32,10 @@ use crate::store;
 /// The daemon methods a master connection may call — everything else is
 /// refused (review round 1, C2). Reads, proposing a plan, registering a
 /// project (`project_new`, CAD-358), its own
-/// dispatch/escalate/summary verbs, a report on its own message, and
+/// dispatch/escalate/summary verbs, a report on its own message,
 /// `interrupt` — only of a turn it dispatched (CAD-323, checked in
-/// `rpc_interrupt`).
+/// `rpc_interrupt`) — and `answer_route` (CAD-447) — only of an answer
+/// it filed itself, and only to that question's author.
 pub const MASTER_ALLOWED: &[&str] = &[
     "health",
     "daemon_info",
@@ -56,6 +57,9 @@ pub const MASTER_ALLOWED: &[&str] = &[
     "master_summary",
     "message_report",
     "interrupt",
+    // CAD-447: route the master's own answer to the question's author
+    // (only an answer it filed, only to that question's author).
+    "answer_route",
     // CAD-431: read the review loop (never file a verdict or decide).
     "delivery_list",
 ];
@@ -917,7 +921,9 @@ mod tests {
     /// daemon's method table — every method of `Shared::dispatch` not
     /// in [`MASTER_ALLOWED`] is refused, so a method added later is
     /// refused by default; and nothing that acts for the operator,
-    /// messages an agent or execs is on the list.
+    /// messages an agent of its choosing or execs is on the list
+    /// (`answer_route` reaches only the author of the question the
+    /// master's own answer names, CAD-447).
     #[test]
     fn master_policy_allowlists_the_method_table() {
         let table = dispatch_methods();

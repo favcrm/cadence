@@ -287,6 +287,19 @@ pub fn rpc(state_dir: &Path, method: &str, params: Value) -> Result<Value> {
     rpc_timeout(state_dir, method, params, Duration::from_secs(700))
 }
 
+/// CAD-447: hand an answer report just filed on `issue` to the daemon,
+/// which queues it to the author of the question it answers. The
+/// answer stands whatever happens here: the daemon's reply, or its
+/// refusal as `{"sent": false, "error"}`, is returned for the caller to
+/// show.
+pub fn route_answer(state_dir: &Path, issue: &str, report: &str) -> Value {
+    let params = serde_json::json!({"issue": issue, "report": report});
+    match rpc_timeout(state_dir, "answer_route", params, Duration::from_secs(10)) {
+        Ok(v) => v,
+        Err(e) => serde_json::json!({"sent": false, "error": e.to_string()}),
+    }
+}
+
 /// `rpc` with a caller-chosen read bound — best-effort callers
 /// (status footer, doctor) must degrade in a second or two rather
 /// than hang a screen on a wedged daemon.

@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+mod answer_rpc;
 mod caller_rule;
 mod delivery_rpc;
 mod master_rpc;
@@ -2313,6 +2314,7 @@ impl Shared {
             "master_summary" => self.rpc_master_summary(params, peer_pid),
             "reports_changed" => self.rpc_reports_changed(peer_pid),
             "report_verdict" => self.rpc_report_verdict(params, peer_pid),
+            "answer_route" => self.rpc_answer_route(params, peer_pid),
             "delivery_list" => self.rpc_delivery_list(params),
             "delivery_observe" => self.rpc_delivery_observe(params, peer_pid),
             "delivery_merge" => self.rpc_delivery_merge(params, peer_pid),

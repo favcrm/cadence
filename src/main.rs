@@ -6060,7 +6060,14 @@ fn run() -> Result<i32> {
                 Some(ReportAction::File { task, kind, file }) => {
                     use cadence_agent::issue::task_report;
                     let text = read_body_capped(None, file, task_report::BODY_MAX as u64)?;
-                    print_json(&task_report::file(&pm, &text, Some(&task), Some(kind), "")?);
+                    let mut out = task_report::file(&pm, &text, Some(&task), Some(kind), "")?;
+                    // CAD-447: the daemon tells the question's author. The
+                    // answer stands either way; `route` says what happened.
+                    if kind == task_report::Kind::Answer {
+                        let report = out["report"].as_str().unwrap_or_default().to_string();
+                        out["route"] = client::route_answer(&state_dir, &task, &report);
+                    }
+                    print_json(&out);
                     // CAD-339: the daemon's report router routes it now
                     // rather than at its next scan. Best effort.
                     let _ = client::rpc_timeout(
