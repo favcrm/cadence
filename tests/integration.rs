@@ -39438,15 +39438,15 @@ fn cad410_thread_redacts_a_truncated_private_key_in_claude_tool_input() {
     )
     .unwrap();
     let _mock = d.mock_claude("replay", Some(&fixture));
-    d.register_claude("master", Value::Null);
-    d.wait_agent("master", "idle", 15);
-    d.rpc(
+    d.register_claude("lead", Value::Null);
+    d.wait_agent("lead", "idle", 15);
+    d.operator_rpc(
         "thread_send",
-        json!({"alias": "master", "text": "stash the key", "message": "r1"}),
+        json!({"alias": "lead", "text": "stash the key", "message": "r1"}),
     )
     .unwrap();
-    d.wait_message("master", "r1", &["completed"], 20);
-    let page = d.rpc("thread_read", json!({"alias": "master"})).unwrap();
+    d.wait_message("lead", "r1", &["completed"], 20);
+    let page = d.rpc("thread_read", json!({"alias": "lead"})).unwrap();
     let call = page["entries"]
         .as_array()
         .unwrap()
@@ -39457,7 +39457,7 @@ fn cad410_thread_redacts_a_truncated_private_key_in_claude_tool_input() {
     let text = call["text"].as_str().unwrap();
     assert!(text.starts_with("Bash: printf "), "{call}");
     assert!(text.ends_with("[redacted:private-key]"), "{call}");
-    let events = Value::Array(d.events("master")).to_string();
+    let events = Value::Array(d.events("lead")).to_string();
     for line in &body {
         assert!(
             !page.to_string().contains(line.as_str()),
