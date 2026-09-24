@@ -147,6 +147,10 @@ pub struct Record {
     /// Why the operator was brought in, or the decline reason.
     #[serde(default)]
     pub note: Option<String>,
+    /// Reviewers barred from this ticket: each was on duty when the head
+    /// moved without the worker, so it may have pushed that head.
+    #[serde(default)]
+    pub excluded: Vec<String>,
 }
 
 impl Record {
@@ -168,6 +172,7 @@ impl Record {
             observed: None,
             disable_auto: false,
             note: None,
+            excluded: vec![],
         }
     }
 
@@ -202,8 +207,16 @@ impl Record {
     pub fn to_json(&self) -> Value {
         let mut v = serde_json::to_value(self).unwrap_or(Value::Null);
         v["merge_ready"] = json!(self.merge_ready());
+        v["pr_ref"] = json!(self.pr.as_deref().and_then(pr_ref));
         v
     }
+}
+
+/// A PR URL as `owner/repo#n` (lowercased owner/repo), the key one PR
+/// is held under and the form every surface shows.
+pub fn pr_ref(url: &str) -> Option<String> {
+    let (slug, n) = crate::issue::task_report::parse_pr_url(url).ok()?;
+    Some(format!("{}#{n}", slug.to_ascii_lowercase()))
 }
 
 pub fn path(state_dir: &Path) -> PathBuf {
@@ -229,10 +242,17 @@ pub fn load(state_dir: &Path) -> Result<BTreeMap<String, Record>> {
 
 /// Replace the records atomically. The daemon serializes writers.
 pub fn save(state_dir: &Path, all: &BTreeMap<String, Record>) -> Result<()> {
+    use std::io::Write;
     let file = path(state_dir);
     let tmp = file.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(all)?)?;
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&serde_json::to_vec_pretty(all)?)?;
+        f.sync_all()?;
+    }
     std::fs::rename(&tmp, &file)?;
+    // The rename itself is durable once the directory is synced.
+    std::fs::File::open(state_dir)?.sync_all()?;
     Ok(())
 }
 
@@ -243,24 +263,67 @@ pub struct Candidate {
     pub provider: String,
     pub state: String,
     pub enabled: bool,
+    /// The agent's PM (`params.upstream`), when it is a group member.
+    pub upstream: Option<String>,
 }
 
-/// The independent reviewer for a worker's head: never the worker,
-/// never the master, never a fenced (`attention`) or disabled agent.
-/// The previous round's reviewer keeps the ticket while it qualifies —
-/// the verdicts stay comparable. Otherwise a different provider from
-/// the worker's wins when one is staffed, else another session of the
-/// same provider; ties go to the alias order.
+/// Every alias in `worker`'s group line: the worker itself, its
+/// upstream chain (its PM, that PM's PM, …), and every agent whose own
+/// upstream chain reaches the worker (members it registered, and
+/// theirs). None of them is independent of the worker's work.
+fn worker_group(worker: &str, agents: &[Candidate]) -> Vec<String> {
+    let up = |alias: &str| {
+        agents
+            .iter()
+            .find(|a| a.alias == alias)
+            .and_then(|a| a.upstream.clone())
+    };
+    // Chains are bounded by the agent count, so a cycle cannot loop.
+    let chain = |from: &str| {
+        let mut out = Vec::new();
+        let mut at = up(from);
+        while let Some(u) = at {
+            if out.contains(&u) || out.len() > agents.len() {
+                break;
+            }
+            at = up(&u);
+            out.push(u);
+        }
+        out
+    };
+    let mut group = vec![worker.to_string()];
+    group.extend(chain(worker));
+    for a in agents {
+        if chain(&a.alias).iter().any(|u| u == worker) {
+            group.push(a.alias.clone());
+        }
+    }
+    group
+}
+
+/// The independent reviewer for a worker's head: never the worker or
+/// anyone in its group line ([`worker_group`]), never the master, never
+/// an alias in `exclude`, never a fenced (`attention`), disabled or
+/// inbox agent. The previous round's reviewer keeps the ticket while it
+/// qualifies — the verdicts stay comparable; a caller passes `None` for
+/// `previous` (and the old reviewer in `exclude`) when the head moved
+/// without the worker, since whoever pushed must not review its own
+/// commits. Otherwise a different provider from the worker's wins when
+/// one is staffed, else another session of the same provider; ties go
+/// to the alias order.
 pub fn pick_reviewer(
     worker: &str,
     worker_provider: Option<&str>,
     previous: Option<&str>,
+    exclude: &[String],
     agents: &[Candidate],
 ) -> Option<String> {
+    let group = worker_group(worker, agents);
     let eligible: Vec<&Candidate> = agents
         .iter()
         .filter(|a| {
-            a.alias != worker
+            !group.contains(&a.alias)
+                && !exclude.contains(&a.alias)
                 && !crate::master::is_master(&a.alias)
                 && a.enabled
                 && a.state != "attention"
@@ -491,6 +554,7 @@ mod tests {
             provider: provider.into(),
             state: "idle".into(),
             enabled: true,
+            upstream: None,
         }
     }
 
@@ -504,7 +568,7 @@ mod tests {
         ];
         // A different provider wins over alias order.
         assert_eq!(
-            pick_reviewer("w1", Some("claude"), None, &agents).as_deref(),
+            pick_reviewer("w1", Some("claude"), None, &[], &agents).as_deref(),
             Some("z-codex")
         );
         // None staffed: another session of the same provider.
@@ -514,30 +578,66 @@ mod tests {
             cand("r", "claude"),
         ];
         assert_eq!(
-            pick_reviewer("w1", Some("claude"), None, &same).as_deref(),
+            pick_reviewer("w1", Some("claude"), None, &[], &same).as_deref(),
             Some("r")
         );
         // Never the worker, never the master.
         let alone = vec![cand("master", "codex"), cand("w1", "claude")];
-        assert_eq!(pick_reviewer("w1", Some("claude"), None, &alone), None);
+        assert_eq!(pick_reviewer("w1", Some("claude"), None, &[], &alone), None);
         // Fenced or disabled agents are skipped; the previous reviewer
         // keeps the ticket while it qualifies.
         let mut fenced = cand("z-codex", "codex");
         fenced.state = "attention".into();
         let agents = vec![cand("a-claude", "claude"), fenced, cand("w1", "claude")];
         assert_eq!(
-            pick_reviewer("w1", Some("claude"), None, &agents).as_deref(),
+            pick_reviewer("w1", Some("claude"), None, &[], &agents).as_deref(),
             Some("a-claude")
         );
         let agents = vec![cand("a", "codex"), cand("b", "codex"), cand("w1", "claude")];
         assert_eq!(
-            pick_reviewer("w1", Some("claude"), Some("b"), &agents).as_deref(),
+            pick_reviewer("w1", Some("claude"), Some("b"), &[], &agents).as_deref(),
             Some("b")
         );
         // A previous reviewer that is the worker now is not reused.
         assert_eq!(
-            pick_reviewer("w1", Some("claude"), Some("w1"), &agents).as_deref(),
+            pick_reviewer("w1", Some("claude"), Some("w1"), &[], &agents).as_deref(),
             Some("a")
+        );
+    }
+
+    #[test]
+    fn reviewer_is_never_in_the_workers_group_line() {
+        let with_up = |alias: &str, up: &str| Candidate {
+            upstream: Some(up.into()),
+            ..cand(alias, "codex")
+        };
+        let agents = vec![
+            with_up("a1", "w1"),   // w1's member
+            with_up("a2", "a1"),   // its member's member
+            with_up("w1", "pm"),   // the worker, under pm
+            with_up("pm", "boss"), // the worker's PM, under boss
+            cand("boss", "codex"),
+            with_up("sib", "pm"), // a sibling under the same PM
+        ];
+        assert_eq!(
+            pick_reviewer("w1", Some("claude"), None, &[], &agents).as_deref(),
+            Some("sib")
+        );
+        // Nor as the sticky previous reviewer.
+        assert_eq!(
+            pick_reviewer("w1", Some("claude"), Some("a1"), &[], &agents).as_deref(),
+            Some("sib")
+        );
+        // A reviewer excluded (it pushed the moved head) is skipped.
+        assert_eq!(
+            pick_reviewer("w1", Some("claude"), None, &["sib".into()], &agents),
+            None
+        );
+        // An upstream cycle ends.
+        let cyc = vec![with_up("w1", "x"), with_up("x", "w1"), cand("r", "codex")];
+        assert_eq!(
+            pick_reviewer("w1", None, None, &[], &cyc).as_deref(),
+            Some("r")
         );
     }
 

@@ -77,12 +77,18 @@ impl Shared {
             return Ok(0);
         }
         let pm = Pm::at(&self.pm_dir()?)?;
+        // The PRs live records hold — one PR belongs to one ticket.
+        let held: Vec<(String, String)> = all
+            .values()
+            .filter(|r| !r.state.terminal())
+            .filter_map(|r| Some((r.issue.clone(), delivery::pr_ref(r.pr.as_deref()?)?)))
+            .collect();
         let mut moved = 0;
         for rec in all.values_mut() {
             // One ticket's failure (a message the queue refuses, an
             // unreadable ticket) never holds up the others; it is
             // retried next pass.
-            match self.route_record(&pm, rec) {
+            match self.route_record(&pm, rec, &held) {
                 Ok(true) => moved += 1,
                 Ok(false) => {}
                 Err(e) => tracing::warn!("delivery router, {}: {e}", rec.issue),
@@ -96,7 +102,12 @@ impl Shared {
     }
 
     /// Route one record; `true` when it changed.
-    fn route_record(self: &Arc<Self>, pm: &Pm, rec: &mut Record) -> Result<bool> {
+    fn route_record(
+        self: &Arc<Self>,
+        pm: &Pm,
+        rec: &mut Record,
+        held: &[(String, String)],
+    ) -> Result<bool> {
         if rec.state.terminal() || rec.state == State::Escalated {
             return Ok(false);
         }
@@ -125,22 +136,40 @@ impl Shared {
             return Ok(false);
         };
         let name = latest["name"].as_str().unwrap_or_default();
-        match (latest["sha"].as_str(), latest["pr"].as_str()) {
-            (Some(sha), Some(pr)) => self.on_done(pm, rec, sha, pr)?,
-            _ => {
-                let text = format!(
-                    "[review] {id}: your done report {name} has no `sha:` and `pr:` — the \
-                     review loop needs both. File a new done report with `sha: <head>` and \
-                     `pr: https://github.com/<owner>/<repo>/pull/<n>`.",
-                    id = rec.issue
-                );
-                let mid = format!("done-incomplete-{}", hash(&format!("{}/{name}", rec.issue)));
-                self.send_as(
-                    &json!({"alias": rec.worker, "text": text, "message": mid,
-                            "source": "review"}),
-                    &|_| store::Sender::Unattributed,
-                )?;
-            }
+        let refusal = match (latest["sha"].as_str(), latest["pr"].as_str()) {
+            (Some(sha), Some(pr)) => match self.pr_refusal(pm, rec, pr, held)? {
+                None => {
+                    self.on_done(pm, rec, sha, pr)?;
+                    None
+                }
+                why => why,
+            },
+            _ => Some(
+                "has no `sha:` and `pr:` — the review loop needs both. File a new done \
+                 report with `sha: <head>` and `pr: https://github.com/<owner>/<repo>/pull/<n>`"
+                    .to_string(),
+            ),
+        };
+        // A refused done report changes nothing in the record: the worker
+        // is told once (the message id is the report's), and the next
+        // done report is judged afresh.
+        if let Some(why) = refusal {
+            let text = format!(
+                "[review] {id}: your done report {name} {why}.",
+                id = rec.issue
+            );
+            let mid = format!("done-refused-{}", hash(&format!("{}/{name}", rec.issue)));
+            self.send_as(
+                &json!({"alias": rec.worker, "text": text, "message": mid,
+                        "source": "review"}),
+                &|_| store::Sender::Unattributed,
+            )?;
+            let _ = self.store.event_public(
+                DAEMON_ALIAS,
+                "review_done_refused",
+                json!({"issue": rec.issue, "report": name, "why": why}),
+            );
+            return Ok(false);
         }
         rec.handled.extend(
             fresh
@@ -148,6 +177,54 @@ impl Shared {
                 .filter_map(|r| r["name"].as_str().map(str::to_string)),
         );
         Ok(true)
+    }
+
+    /// Why a done report's PR cannot enter review, if it cannot: the PR
+    /// must be in one of the ticket's project repos (`repos[].remote`,
+    /// compared normalized), and no other live ticket may hold it —
+    /// otherwise the operator's `gh` would enqueue a PR nobody
+    /// dispatched.
+    fn pr_refusal(
+        &self,
+        pm: &Pm,
+        rec: &Record,
+        pr: &str,
+        held: &[(String, String)],
+    ) -> Result<Option<String>> {
+        let Some(key) = delivery::pr_ref(pr) else {
+            return Ok(Some(format!(
+                "names `pr: {pr}`, which is not a pull request URL"
+            )));
+        };
+        let (slug, _) = task_report::parse_pr_url(pr)?;
+        let want = crate::issue::project::normalize_remote(&format!("github.com/{slug}"))
+            .to_ascii_lowercase();
+        let project = crate::issue::project::list(&pm.dir)?
+            .into_iter()
+            .find(|p| p.key == rec.project);
+        let remotes: Vec<String> = project
+            .iter()
+            .flat_map(|p| p.repos.iter())
+            .filter_map(|r| r.remote.as_deref())
+            .map(|r| crate::issue::project::normalize_remote(r).to_ascii_lowercase())
+            .collect();
+        if !remotes.contains(&want) {
+            let listed = if remotes.is_empty() {
+                "none — `repos[].remote` is unset".to_string()
+            } else {
+                remotes.join(", ")
+            };
+            return Ok(Some(format!(
+                "names {key}, which is not a repo of project {} (its remotes: {listed})",
+                rec.project
+            )));
+        }
+        if let Some((other, _)) = held.iter().find(|(i, k)| *k == key && *i != rec.issue) {
+            return Ok(Some(format!(
+                "names {key}, which ticket {other} already holds in the review loop"
+            )));
+        }
+        Ok(None)
     }
 
     /// The worker reported `sha` done on `pr`.
@@ -173,6 +250,18 @@ impl Shared {
         self.start_review(pm, rec)
     }
 
+    /// The head moved without a done report from the worker: whoever
+    /// reviewed it may have pushed it, so that reviewer is barred from
+    /// this ticket and the review goes to someone else.
+    fn review_moved_head(self: &Arc<Self>, pm: &Pm, rec: &mut Record) -> Result<()> {
+        if let Some(prev) = rec.reviewer.take() {
+            if !rec.excluded.contains(&prev) {
+                rec.excluded.push(prev);
+            }
+        }
+        self.start_review(pm, rec)
+    }
+
     /// Route a review of `rec.head` to an independent reviewer, or mark
     /// the record unstaffed when nobody qualifies.
     fn start_review(self: &Arc<Self>, pm: &Pm, rec: &mut Record) -> Result<()> {
@@ -191,12 +280,14 @@ impl Shared {
                 provider: a.provider.clone(),
                 state: a.state.clone(),
                 enabled: a.enabled,
+                upstream: super::agent_upstream(a).map(str::to_string),
             })
             .collect();
         let Some(reviewer) = delivery::pick_reviewer(
             &rec.worker,
             worker_provider.as_deref(),
             rec.reviewer.as_deref(),
+            &rec.excluded,
             &candidates,
         ) else {
             if rec.state != State::Unstaffed {
@@ -388,6 +479,19 @@ impl Shared {
             None,
             DAEMON_ALIAS,
         );
+        // The master hears of the verdict from here, never from a file
+        // under reports/.
+        if self.store.agent_opt(master::ALIAS).ok().flatten().is_some() {
+            let text = format!(
+                "[report] {id} verdict {} by {who} at {sha}\nReport: {report}\n\n{comment}",
+                verdict.as_str()
+            );
+            let _ = self.send_as(
+                &json!({"alias": master::ALIAS, "text": text,
+                        "message": format!("verdict-{}", hash(&report)), "source": "report"}),
+                &|_| store::Sender::Unattributed,
+            );
+        }
         let _ = self.store.event_public(
             DAEMON_ALIAS,
             "review_verdict",
@@ -403,7 +507,7 @@ impl Shared {
     /// `delivery_list` — every record, oldest dispatch first. A read.
     pub(super) fn rpc_delivery_list(&self, params: &Value) -> Result<Value> {
         let only = optional_str(params, "issue");
-        let mut rows: Vec<Record> = delivery::records(&self.state_dir)
+        let mut rows: Vec<Record> = delivery::load(&self.state_dir)?
             .into_values()
             .filter(|r| only.is_none_or(|o| o == r.issue))
             .collect();
@@ -458,7 +562,7 @@ impl Shared {
                     ) =>
                 {
                     rec.head = Some(head.clone());
-                    self.start_review(&pm, rec)?;
+                    self.review_moved_head(&pm, rec)?;
                     let _ = issue::write::add_comment(
                         &pm,
                         id,

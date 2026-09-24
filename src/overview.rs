@@ -704,9 +704,11 @@ impl Audience {
             // CAD-431: the merge decision, a review that did not
             // converge, one nobody can take, and auto-merge left on a
             // moved head are the operator's.
-            "merge_decision" | "review_escalated" | "review_unstaffed" | "auto_merge_on" => {
-                Self::Operator
-            }
+            "merge_decision"
+            | "review_escalated"
+            | "review_unstaffed"
+            | "auto_merge_on"
+            | "delivery_unreadable" => Self::Operator,
             "drift" => Self::Dependency,
             "inbox_unread" | "tracker_behind" => Self::Info,
             _ => Self::Team,
@@ -867,7 +869,26 @@ impl Item {
 /// one per PR whose auto-merge must be turned off.
 fn delivery_items(state_dir: &Path, now: i64) -> Vec<Item> {
     let mut out = Vec::new();
-    for rec in crate::delivery::records(state_dir).into_values() {
+    let records = match crate::delivery::load(state_dir) {
+        Ok(records) => records,
+        Err(e) => {
+            // Never a silent empty loop: the operator sees it is broken.
+            out.push(
+                item(
+                    12,
+                    "delivery_unreadable",
+                    &format!("the review loop's record is unreadable — {e}"),
+                    0,
+                    "",
+                    None,
+                    "cadence delivery ls",
+                )
+                .about("tracker", "delivery.json"),
+            );
+            return out;
+        }
+    };
+    for rec in records.into_values() {
         let id = rec.issue.as_str();
         let age = now - rec.since;
         let pr = rec.pr.as_deref();
@@ -901,9 +922,10 @@ fn delivery_items(state_dir: &Path, now: i64) -> Vec<Item> {
                         at: rec.since,
                     });
                 let o = rec.observed.clone().unwrap_or_default();
-                let number = pr
-                    .and_then(|u| crate::issue::task_report::parse_pr_url(u).ok())
-                    .map(|(_, n)| format!(" #{n}"))
+                let pr_ref = pr.and_then(crate::delivery::pr_ref);
+                let number = pr_ref
+                    .as_deref()
+                    .map(|r| format!(" {r}"))
                     .unwrap_or_default();
                 let mut row = item(
                     22,
@@ -922,7 +944,7 @@ fn delivery_items(state_dir: &Path, now: i64) -> Vec<Item> {
                 .owned_by(Some(&rec.worker))
                 .since(Some(v.at));
                 row.json["merge"] = json!({
-                    "issue": id, "pr": pr, "sha": v.sha, "owner": rec.worker,
+                    "issue": id, "pr": pr, "pr_ref": pr_ref, "sha": v.sha, "owner": rec.worker,
                     "reviewer": v.reviewer, "verdict_summary": v.summary,
                     "report": v.report, "additions": o.additions,
                     "deletions": o.deletions, "files": o.files,

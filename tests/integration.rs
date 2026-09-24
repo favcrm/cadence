@@ -42936,12 +42936,35 @@ struct LoopFixture {
 impl LoopFixture {
     /// Up to D-2 dispatched by the master to w1.
     fn dispatched() -> LoopFixture {
+        Self::dispatched_plan(MASTER_PLAN)
+    }
+
+    /// [`Self::dispatched`] from `plan` (epic D-1, first ticket D-2).
+    /// The project's repo has the GitHub remote the loop's PRs live in.
+    fn dispatched_plan(plan_md: &str) -> LoopFixture {
         let f = PlanFixture::start_routed();
+        let yaml = f.pm_dir.join("demo/project.yaml");
+        let text = std::fs::read_to_string(&yaml).unwrap();
+        let mut project: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+        project["repos"][0]["remote"] = "https://github.com/Acme/app.git".into();
+        std::fs::write(&yaml, serde_yaml::to_string(&project).unwrap()).unwrap();
+        let git = |args: &[&str]| {
+            let o = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&f.pm_dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(o.status.success(), "git {args:?}: {o:?}");
+        };
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "demo: repo remote"]);
         let (mut m, _) = f.start_master();
         let w1 = ManagedWorker::start(&f.d, "w1");
         let r1 = ManagedWorker::start(&f.d, "r1");
         let r2 = ManagedWorker::start(&f.d, "r2");
-        let plan = f.file("plan.md", MASTER_PLAN);
+        let plan = f.file("plan.md", plan_md);
         let (ok, out) = f.as_master(
             &mut m,
             &format!("plan propose --project demo --file {plan}"),
@@ -43100,17 +43123,30 @@ impl LoopFixture {
 
     /// The worker files `done` at `sha` (its own report, by alias).
     fn done(&self, sha: &str) {
+        self.done_on("D-2", sha, LOOP_PR);
+    }
+
+    fn done_on(&self, id: &str, sha: &str, pr: &str) {
         let report = self.f.file(
-            &format!("done-{sha}.md"),
-            &format!("---\nkind: done\nsha: {sha}\npr: {LOOP_PR}\n---\n{REFLECTION}"),
+            &format!("done-{id}-{sha}-{}.md", pr.len()),
+            &format!("---\nkind: done\nsha: {sha}\npr: {pr}\n---\n{REFLECTION}"),
         );
         let (ok, out) = self.f.cli_as(
             "w1",
             &[
-                "report", "file", "--task", "D-2", "--kind", "done", "--file", &report,
+                "report", "file", "--task", id, "--kind", "done", "--file", &report,
             ],
         );
         assert!(ok, "{out}");
+    }
+
+    /// w1's messages whose id starts with `prefix`.
+    fn w1_messages(&self, prefix: &str) -> Vec<Value> {
+        self.f
+            .messages_of("w1")
+            .into_iter()
+            .filter(|m| m["id"].as_str().is_some_and(|i| i.starts_with(prefix)))
+            .collect()
     }
 
     fn verdict_file(&self, name: &str, verdict: &str, sha: &str, extra: &str) -> String {
@@ -43159,8 +43195,19 @@ fn delivery_loop_review_revise_pass_merge_end_to_end() {
     let mut lf = LoopFixture::dispatched();
     let (a, b, c) = ("a".repeat(40), "b".repeat(40), "c".repeat(40));
 
-    // Worker done → the daemon routes a review to r1 (never w1, never
-    // the master), composed from the ticket.
+    // The worker, a group root, staffs a member of its own before it
+    // reports done: the member sorts first, and is never picked.
+    let cwd = lf.f.d.dir.path().to_str().unwrap().to_string();
+    let r = lf.w1.rpc(
+        "self",
+        "agent_register",
+        json!({"alias": "a1", "provider": "fake", "endpoint_kind": "fake", "cwd": cwd,
+               "params": r#"{"upstream": "w1"}"#}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+
+    // Worker done → the daemon routes a review to r1 (never w1, its
+    // member a1, or the master), composed from the ticket.
     lf.done(&a);
     let rec = lf.wait_rec("reviewing", |r| r["state"] == "reviewing");
     assert_eq!(rec["reviewer"], "r1", "{rec}");
@@ -43170,6 +43217,10 @@ fn delivery_loop_review_revise_pass_merge_end_to_end() {
             .into_iter()
             .find(|m| m["id"].as_str().is_some_and(|i| i.starts_with("review-")))
             .expect("r1 got the review kickoff");
+    assert!(
+        lf.f.messages_of("a1").is_empty(),
+        "the worker's member got a review"
+    );
     let text = kickoff["body"].as_str().unwrap();
     for needle in [
         LOOP_PR,
@@ -43242,6 +43293,13 @@ fn delivery_loop_review_revise_pass_merge_end_to_end() {
     thread::sleep(Duration::from_millis(2500));
     std::fs::remove_file(&planted).unwrap();
     assert_eq!(lf.snapshot(), before, "a refusal wrote something");
+    // ...and never reaches the master: only report_verdict routes one.
+    assert!(
+        !lf.f.messages_of("master").iter().any(|m| m["body"]
+            .as_str()
+            .is_some_and(|b| b.contains("20990101T000000Z-r1.md"))),
+        "a planted verdict was routed to the master"
+    );
     assert_eq!(lf.rec()["state"], "reviewing");
 
     // Reviewer REVISE → back to w1, pinned to D-2.
@@ -43249,6 +43307,12 @@ fn delivery_loop_review_revise_pass_merge_end_to_end() {
     assert!(ok, "{out}");
     assert_eq!(out["delivery"]["state"], "working", "{out}");
     assert_eq!(out["delivery"]["revisions"], 1, "{out}");
+    assert!(
+        lf.f.messages_of("master")
+            .iter()
+            .any(|m| m["id"].as_str().is_some_and(|i| i.starts_with("verdict-"))),
+        "the recorded verdict reaches the master"
+    );
     let revise =
         lf.f.messages_of("w1")
             .into_iter()
@@ -43285,6 +43349,11 @@ fn delivery_loop_review_revise_pass_merge_end_to_end() {
     let row = &rows[0];
     assert_eq!(row["audience"], "operator", "{row}");
     assert_eq!(row["link"], LOOP_PR, "{row}");
+    assert_eq!(row["merge"]["pr_ref"], "acme/app#7", "{row}");
+    assert!(
+        row["title"].as_str().unwrap().contains("acme/app#7"),
+        "{row}"
+    );
     assert_eq!(row["merge"]["owner"], "w1", "{row}");
     assert_eq!(row["merge"]["reviewer"], "r1", "{row}");
     assert_eq!(row["merge"]["sha"], b, "{row}");
@@ -43363,12 +43432,18 @@ fn delivery_loop_review_revise_pass_merge_end_to_end() {
         "{}",
         lf.gh_log()
     );
+    // Nobody but the worker reported it: r1 (on duty when it moved,
+    // maybe its pusher) is barred, and r2 takes the new head.
     let rec = lf.rec();
     assert_eq!(rec["state"], "reviewing", "{rec}");
     assert_eq!(rec["head"], c, "{rec}");
     assert_eq!(rec["rounds"], 3, "{rec}");
-    let (ok, err) = lf.verdict_as("r1", "pass", &b);
+    assert_eq!(rec["reviewer"], "r2", "{rec}");
+    assert_eq!(rec["excluded"], json!(["r1"]), "{rec}");
+    let (ok, err) = lf.verdict_as("r2", "pass", &b);
     assert!(!ok && err.to_string().contains("stale verdict"), "{err}");
+    let (ok, err) = lf.verdict_as("r1", "pass", &c);
+    assert!(!ok && err.to_string().contains("assigned to r2"), "{err}");
     // The next sync sees auto-merge off: nothing left to turn off.
     let (ok, _) = lf.operator(&["delivery", "sync"]);
     assert!(ok);
@@ -43377,7 +43452,7 @@ fn delivery_loop_review_revise_pass_merge_end_to_end() {
     // PASS at c → merge from the board → merged. The board's Merge
     // keeps the operator rule of the chat-first Home: an agent's request
     // is refused (403) before any gh call.
-    let (ok, out) = lf.verdict_as("r1", "pass", &c);
+    let (ok, out) = lf.verdict_as("r2", "pass", &c);
     assert!(ok, "{out}");
     let (ok, out) = lf.operator(&["delivery", "sync"]);
     assert!(ok, "{out}");
@@ -43476,4 +43551,98 @@ fn delivery_loop_escalates_after_two_revise_rounds() {
     assert_eq!(out["state"], "declined", "{out}");
     assert_eq!(out["note"], "scope too big", "{out}");
     assert!(lf.needs("review_escalated").is_empty());
+}
+
+/// Three independent tickets for w1 — two PRs can race for one ticket.
+const LOOP_PLAN: &str = "---\ntitle: Reminders\ngoal: Users get a reminder email\n---\n\n\
+## Schema\nsize: S\nagent: w1\n\n### Acceptance\n- [ ] migration adds reminders\n\n\
+## Sender\nsize: S\nagent: w1\n\n### Acceptance\n- [ ] an email goes out\n\n\
+## Settings\nsize: S\nagent: w1\n\n### Acceptance\n- [ ] a user can turn reminders off\n";
+
+/// CAD-431 review round 1 (I2 and the corrupt record): a done report
+/// whose PR is not in the ticket's project repos, or is already held by
+/// another live ticket, is refused — the worker is told why and the
+/// loop records nothing. An unreadable delivery.json fails visibly:
+/// `delivery ls` and `sync` exit non-zero, Needs-you carries a
+/// `delivery_unreadable` row, and the master cannot dispatch outside the
+/// loop.
+#[test]
+fn delivery_loop_refuses_foreign_and_held_prs_and_a_corrupt_record() {
+    let mut lf = LoopFixture::dispatched_plan(LOOP_PLAN);
+    let (ok, sent) = lf.f.as_master(&mut lf.m, "master dispatch D-3");
+    assert!(ok, "{sent}");
+    let a = "a".repeat(40);
+    let record = || std::fs::read_to_string(lf.f.d.state.join("delivery.json")).unwrap();
+
+    // A foreign repo's PR: refused, nothing recorded.
+    let before = record();
+    lf.done_on("D-2", &a, "https://github.com/someone-else/infra/pull/12");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while lf.w1_messages("done-refused-").is_empty() {
+        assert!(Instant::now() < deadline, "no refusal reached w1");
+        thread::sleep(Duration::from_millis(100));
+    }
+    let why = lf.w1_messages("done-refused-")[0]["body"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        why.contains("someone-else/infra#12") && why.contains("not a repo of project demo"),
+        "{why}"
+    );
+    thread::sleep(Duration::from_millis(1500));
+    assert_eq!(record(), before, "a foreign PR was recorded");
+    assert!(lf.f.messages_of("r1").is_empty() && lf.f.messages_of("r2").is_empty());
+
+    // The project's PR (owner/repo case and .git ignored) enters review.
+    lf.done_on("D-2", &a, LOOP_PR);
+    lf.wait_rec("reviewing", |r| r["state"] == "reviewing");
+    assert_eq!(lf.rec()["pr_ref"], "acme/app#7");
+
+    // D-3 claims the PR D-2 holds: refused, D-3's record untouched.
+    let d3 = || {
+        lf.f.d
+            .rpc("delivery_list", json!({"issue": "D-3"}))
+            .unwrap()["records"][0]
+            .clone()
+    };
+    let d3_before = d3();
+    lf.done_on("D-3", &"b".repeat(40), LOOP_PR);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !lf.w1_messages("done-refused-").iter().any(|m| {
+        m["body"]
+            .as_str()
+            .is_some_and(|b| b.contains("already holds"))
+    }) {
+        assert!(
+            Instant::now() < deadline,
+            "no held-PR refusal: {:#?}",
+            lf.w1_messages("")
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    thread::sleep(Duration::from_millis(1500));
+    assert_eq!(d3(), d3_before, "a held PR was recorded on D-3");
+
+    // A corrupt record fails visibly and stops the master's dispatch.
+    std::fs::write(lf.f.d.state.join("delivery.json"), "{not json").unwrap();
+    let (ok, err) = lf.f.cli(&["delivery", "ls"]);
+    assert!(!ok && err.to_string().contains("unreadable"), "{err}");
+    let (ok, err) = lf.operator(&["delivery", "sync"]);
+    assert!(!ok && err.to_string().contains("unreadable"), "{err}");
+    assert_eq!(
+        lf.needs("delivery_unreadable").len(),
+        1,
+        "{:#?}",
+        lf.f.needs_me()
+    );
+    let commits = lf.f.commits();
+    let (ok, err) = lf.f.as_master(&mut lf.m, "master dispatch D-4");
+    assert!(!ok && err.to_string().contains("unreadable"), "{err}");
+    assert_eq!(
+        lf.f.commits(),
+        commits,
+        "the refused dispatch wrote something"
+    );
+    assert_eq!(lf.f.front("D-4").status, "ready");
 }

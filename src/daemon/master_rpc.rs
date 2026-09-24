@@ -228,6 +228,14 @@ impl Shared {
         // and is refused having written nothing. The dispatch's own
         // daemon calls (agent_show, agent_send) never take this lock.
         let _serial = self.dispatch_lock.lock().unwrap_or_else(|e| e.into_inner());
+        // CAD-431: a dispatch the review loop cannot record does not
+        // happen — an unreadable delivery.json refuses before anything.
+        crate::delivery::load(&self.state_dir).map_err(|e| {
+            Error::invalid(
+                "delivery_unreadable",
+                format!("{e} — the operator repairs it before the master dispatches"),
+            )
+        })?;
         let pm = issue::Pm::at(&self.pm_dir()?)?;
         let ticket = issue::board::find_issue(&pm.dir, id)?;
         let front = &ticket.front;
@@ -656,7 +664,10 @@ impl Shared {
                     };
                     let name = row["name"].as_str().unwrap_or_default();
                     let route = match row["kind"].as_str() {
-                        Some("done" | "blocked" | "verdict") => at >= baseline,
+                        // A verdict reaches the master only from
+                        // `report_verdict` (CAD-431) — a planted file
+                        // under reports/ routes nowhere.
+                        Some("done" | "blocked") => at >= baseline,
                         Some("question") => {
                             row["open"] == true
                                 && !escalated.contains_key(&format!("{id}/{name}"))

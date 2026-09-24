@@ -1941,10 +1941,17 @@ the daemon writes it. Report files never move a ticket through the loop.
    reports to the master) takes the worker's newest `done` report filed
    after the dispatch. It needs `sha:` (the head) and `pr:`
    (`https://github.com/<owner>/<repo>/pull/<n>`); without them the
-   worker is told to file again. The daemon picks the reviewer: never
-   the worker, never the master, never a fenced or disabled agent or an
-   inbox. The previous round's reviewer keeps the ticket while it
-   qualifies; otherwise an agent of a different provider from the
+   worker is told to file again. The PR must be in one of the ticket's
+   project repos (`repos[].remote`, compared with `normalize_remote`,
+   case-insensitive) and held by no other live ticket; otherwise the
+   worker is told why and the record does not change. Every surface
+   shows the PR as `owner/repo#n` (`pr_ref`). The daemon picks the
+   reviewer: never the worker or anyone in its group line (its upstream
+   chain, and every agent whose upstream chain reaches the worker — so a
+   worker cannot staff its own reviewer), never the master, never a
+   fenced or disabled agent or an inbox, never an agent in the record's
+   `excluded` list. The previous round's reviewer keeps the ticket while
+   it qualifies; otherwise an agent of a different provider from the
    worker's wins, else another session of the same provider. With
    nobody eligible the record is `unstaffed` (a Needs-you row) and the
    router retries every pass. The kickoff is composed by the daemon on
@@ -1972,12 +1979,34 @@ the daemon writes it. Report files never move a ticket through the loop.
    records the reason. Both are refused for any agent before `gh` runs.
 4. **Head moves.** A new `done` sha, or an observed head that differs
    from the reviewed one while `reviewing`, `passed` or `enqueued`,
-   re-enters review at the new head, and the old PASS is stale.
+   re-enters review at the new head, and the old PASS is stale. A head
+   that moved without a `done` from the worker may have been pushed by
+   the reviewer on duty, so that reviewer joins `excluded` and the new
+   head goes to someone else.
    Whenever auto-merge is on for a head that is not the enqueued,
    reviewed one, `delivery_observe` answers `disable_auto: true` and
    `sync` runs `gh pr merge <n> --disable-auto`; until an observation
    shows it off, Needs-you carries an `auto_merge_on` row. A `MERGED`
    or `CLOSED` observation ends the loop.
+
+Pinning: `gh pr merge --match-head-commit <sha>` sends the SHA as
+GraphQL `expectedHeadOid` on every path — `mergePullRequest` for a
+direct merge, and the auto-merge / merge-queue mutation when `--auto`
+is given or the base branch requires a queue (cli/cli
+`pkg/cmd/pr/merge`). GitHub checks it when auto-merge is enabled or the
+PR is enqueued, not again afterwards: a later push is not re-checked,
+which is why the loop disables auto-merge on every moved head. `--auto`
+is kept for repos without a queue too — there the same mutation pins
+the head and waits for required checks instead of merging an unfinished
+run.
+
+A `delivery.json` that exists but does not parse is never read as
+empty: `delivery_list` (so `delivery ls` and `delivery sync`) fails,
+Needs-you shows a `delivery_unreadable` row, and `master_dispatch`
+refuses before dispatching anything. Writes go through a synced
+temporary file, a rename and a synced directory, under the lock.
+Verdicts reach the master only from `report_verdict`; the report
+router never routes a `verdict` file it finds under `reports/`.
 
 The daemon never runs `gh`, and no agent environment needs GitHub
 credentials for the loop. `cadence delivery sync --watch <secs>` keeps
