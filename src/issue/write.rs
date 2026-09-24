@@ -43,7 +43,7 @@ pub(crate) fn commit(
     commit_who(pm, paths, message, ids, actor, None)
 }
 
-fn commit_who(
+pub(crate) fn commit_who(
     pm: &Pm,
     paths: &[PathBuf],
     message: &str,

@@ -14,9 +14,11 @@
 //! - **Planned paths** (`paths:` on an issue, `issue set <ID>
 //!   paths=a,b`): what a ticket expects to touch.
 //! - **Open lanes**: issues with an open worktree ref, their planned
-//!   paths and the files their worktree actually changed against its
-//!   base (`git diff --name-only <merge-base>` — local git only, never
-//!   `gh`).
+//!   paths and the files their branch committed against its base
+//!   (`git diff --name-only <merge-base> HEAD` — two objects, so the
+//!   worktree, its attribute filters, its fsmonitor and its hooks are
+//!   never consulted; uncommitted and untracked work is invisible to
+//!   the board. Local git only, never `gh`).
 //!
 //! `issue start` / `dispatch` warn when the ticket's planned paths
 //! overlap an open lane, touch an area owned by someone else, or touch
@@ -24,13 +26,30 @@
 //! adds a Needs-you `area_ack` row while an open lane with a PR changes
 //! files in an area owned by someone else, until the owner's PM (or the
 //! operator) acks it through the daemon (`area_ack`), which binds the
-//! acker from the connection. The ack lives in the daemon's state dir
-//! (`area_acks.json`), never in a tracker comment: tracker files take
-//! any author an agent writes, so a comment could forge the owner.
+//! acker from the connection and pins the lane's head — the row
+//! re-raises when the lane commits again. The ack lives in the
+//! daemon's state dir (`area_acks.json`), never in a tracker comment:
+//! tracker files take any author an agent writes, so a comment could
+//! forge the owner.
+//!
+//! A lane's `side.pm` is the actor its start/dispatch record binds —
+//! the `Actor:` trailer (or ` (actor)` suffix) of the newest
+//! lane-binding tracker commit — never `claim.by`, which is live
+//! frontmatter the lane can rewrite to impersonate its owner and
+//! suppress its own ack row. The epic side (`parent`, `plan_epic`) is
+//! still frontmatter and remains advisory: a lane that claims
+//! membership of the owning epic is the same class of self-assertion
+//! this feature tolerates. Everything here warns; nothing refuses.
+//!
+//! Every string that reaches a terminal, a tracker comment or the
+//! overview JSON is scrubbed of control and bidi characters
+//! ([`scrub`]): refs, aliases and planted frontmatter are all
+//! agent-writable.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -46,6 +65,15 @@ use crate::issue::parse;
 pub const PATH_MAX: usize = 256;
 /// Most planned paths one issue may declare.
 pub const PATHS_MAX: usize = 64;
+/// Most wildcard characters (`*`/`?`) one glob may carry — a cap on
+/// top of [`PATH_MAX`], since wildcards are what makes matching cost
+/// anything at all.
+pub const WILD_MAX: usize = 16;
+/// Changed files per lane kept for matching, sorted. A lane past the
+/// cap warns on the prefix only — advisory, not exhaustive.
+const CHANGED_MAX: usize = 8192;
+/// Git readers [`open_lanes`] runs at once, whatever the lane count.
+const LANE_GIT_WORKERS: usize = 4;
 /// Bound on each git call reading a lane's changed files.
 const GIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Files named per lane in a warning before `…`.
@@ -242,7 +270,40 @@ pub fn check_path(p: &str) -> Result<()> {
     {
         return bad("has an empty, '.' or '..' segment");
     }
+    if p.chars().filter(|c| matches!(c, '*' | '?')).count() > WILD_MAX {
+        return bad(&format!("has more than {WILD_MAX} wildcards"));
+    }
     Ok(())
+}
+
+/// Agent-controlled strings (refs, aliases, planted frontmatter,
+/// filenames, a `changed_error`'s git stderr) reach terminals, tracker
+/// comments and the overview JSON through warnings. Strip anything
+/// that moves a cursor or mirrors text: control characters and bidi or
+/// other invisible format marks. Matching fields stay raw — this is
+/// for display only.
+pub(crate) fn scrub(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control() && !is_format(*c))
+        .collect()
+}
+
+/// Invisible or direction-overriding marks — the bidi controls,
+/// joiners, soft hyphen, BOM, word joiners, interlinear anchors and
+/// hangul fillers — none of which a path, ref or alias legitimately
+/// carries.
+fn is_format(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}'              // soft hyphen
+        | '\u{061C}'            // arabic letter mark
+        | '\u{115F}' | '\u{1160}' | '\u{FFA0}'  // hangul fillers
+        | '\u{200B}'..='\u{200F}' // ZWSP ZWNJ ZWJ LRM RLM
+        | '\u{202A}'..='\u{202E}' // LRE RLE PDF RLO LRO
+        | '\u{2060}'..='\u{2064}' // word joiner, invisible operators
+        | '\u{2066}'..='\u{2069}' // LRI RLI FSI PDI
+        | '\u{FEFF}'            // BOM / ZWNBSP
+        | '\u{FFF9}'..='\u{FFFB}' // interlinear annotation anchors
+    )
 }
 
 /// `issue set <ID> paths=a,b` — validated, sorted, de-duplicated; an
@@ -280,26 +341,62 @@ fn segments(glob: &str) -> Vec<&str> {
     }
 }
 
+/// One pattern segment against one path segment. `*` is the only
+/// pattern that consumes a variable run, so a single backtracking
+/// point — the last `*` seen — suffices: retry means that `*` takes
+/// one more byte. O(|pat| × |s|) worst case, no exponential retry, so
+/// `src/******************z` against sixty `a`s returns in
+/// microseconds instead of hanging a render.
 fn seg_match(pat: &[u8], s: &[u8]) -> bool {
-    match (pat.first(), s.first()) {
-        (None, None) => true,
-        (Some(b'*'), _) => seg_match(&pat[1..], s) || (!s.is_empty() && seg_match(pat, &s[1..])),
-        (Some(b'?'), Some(_)) => seg_match(&pat[1..], &s[1..]),
-        (Some(p), Some(c)) if p == c => seg_match(&pat[1..], &s[1..]),
-        _ => false,
-    }
-}
-
-fn segs_match(pat: &[&str], path: &[&str]) -> bool {
-    match pat.first() {
-        None => path.is_empty(),
-        Some(&"**") => (0..=path.len()).any(|i| segs_match(&pat[1..], &path[i..])),
-        Some(p) => {
-            !path.is_empty()
-                && seg_match(p.as_bytes(), path[0].as_bytes())
-                && segs_match(&pat[1..], &path[1..])
+    let (mut p, mut c) = (0usize, 0usize);
+    // (pattern index just past the last `*`, string index it resumes at).
+    let mut star: Option<(usize, usize)> = None;
+    while c < s.len() {
+        match pat.get(p) {
+            Some(b'*') => {
+                star = Some((p + 1, c));
+                p += 1;
+            }
+            Some(&pc) if pc == b'?' || pc == s[c] => {
+                p += 1;
+                c += 1;
+            }
+            // Mismatch or pattern exhausted mid-string: the last `*`
+            // absorbs one more byte, or there is no match.
+            _ => match star {
+                Some((sp, sc)) => {
+                    p = sp;
+                    c = sc + 1;
+                    star = Some((sp, c));
+                }
+                None => return false,
+            },
         }
     }
+    while pat.get(p) == Some(&b'*') {
+        p += 1;
+    }
+    p == pat.len()
+}
+
+/// Pattern segments against path segments — `**` matches any run of
+/// segments, everything else is one [`seg_match`]. A dynamic program
+/// over (pattern × path): `dp[i][j]` is "`pat[i..]` matches
+/// `path[j..]`", filled back to front in O(|pat| × |path|) cells, so
+/// stacked `**`s cannot multiply work.
+fn segs_match(pat: &[&str], path: &[&str]) -> bool {
+    let (n, m) = (pat.len(), path.len());
+    let mut dp = vec![vec![false; m + 1]; n + 1];
+    for i in (0..=n).rev() {
+        for j in (0..=m).rev() {
+            dp[i][j] = match pat.get(i) {
+                None => j == m,
+                Some(&"**") => dp[i + 1][j] || (j < m && dp[i][j + 1]),
+                Some(p) => j < m && seg_match(p.as_bytes(), path[j].as_bytes()) && dp[i + 1][j + 1],
+            };
+        }
+    }
+    dp[0][0]
 }
 
 /// Does `glob` cover the concrete file `path`? A glob without wildcards
@@ -366,6 +463,8 @@ pub struct Lane {
     pub worker: Option<String>,
     /// The open `pr` ref, else the review loop's recorded PR.
     pub pr: Option<String>,
+    /// The worktree's committed tip — what an ack pins to.
+    pub head: Option<String>,
     pub worktree: PathBuf,
     pub planned: Vec<String>,
     pub changed: Vec<String>,
@@ -374,14 +473,15 @@ pub struct Lane {
 }
 
 impl Lane {
-    /// `CAD-1 (worker w1, PR <url>)`.
+    /// `CAD-1 (worker w1, PR <url>)` — scrubbed: the ref values and
+    /// alias are agent-writable and land in terminals and comments.
     pub fn label(&self) -> String {
-        format!(
+        scrub(&format!(
             "{} (worker {}, PR {})",
             self.issue,
             self.worker.as_deref().unwrap_or("-"),
             self.pr.as_deref().unwrap_or("none yet")
-        )
+        ))
     }
 
     /// Does this lane plan or change anything in `area`?
@@ -399,19 +499,41 @@ impl Lane {
             .collect()
     }
 
+    /// Display form — every field that can carry agent-written bytes
+    /// is scrubbed.
     pub fn to_json(&self) -> Value {
-        json!({"issue": self.issue, "project": self.project, "worker": self.worker,
-               "pm": self.side.pm, "pr": self.pr, "worktree": self.worktree,
-               "planned": self.planned, "changed": self.changed,
-               "changed_error": self.changed_error})
+        let scrubbed = |xs: &[String]| xs.iter().map(|x| scrub(x)).collect::<Vec<_>>();
+        json!({"issue": self.issue, "project": self.project,
+               "worker": self.worker.as_deref().map(scrub),
+               "pm": self.side.pm.as_deref().map(scrub),
+               "pr": self.pr.as_deref().map(scrub),
+               "worktree": self.worktree,
+               "planned": scrubbed(&self.planned), "changed": scrubbed(&self.changed),
+               "changed_error": self.changed_error.as_deref().map(scrub)})
     }
 }
 
+/// One lane's parallel probe: committed changed files, the tip an ack
+/// pins to, and the PM the dispatch record binds.
+type Probe = (
+    std::result::Result<Vec<String>, String>,
+    Option<String>,
+    Option<String>,
+);
+
 /// The open lanes among `issues` (not done/dropped, with an open
-/// worktree ref), their changed files read in parallel. `prs` maps an
+/// worktree ref), each probed for its committed changes, head and
+/// recorded PM. Probes run on a bounded pool — at most
+/// [`LANE_GIT_WORKERS`] git readers at once whatever the lane count —
+/// so a board render cannot fan out a process per lane. `prs` maps an
 /// issue id to the review loop's recorded PR URL.
-pub fn open_lanes(issues: &[&Issue], prs: &BTreeMap<String, String>) -> Vec<Lane> {
-    let mut lanes: Vec<Lane> = issues
+///
+/// `pm_dir` is the tracker repo: a lane's `side.pm` is the actor its
+/// dispatch record binds ([`recorded_pm`]), never `claim.by` — live
+/// frontmatter the lane itself can rewrite to impersonate its owner.
+/// `parent`/`plan_epic` stay frontmatter — advisory by design.
+pub fn open_lanes(pm_dir: &Path, issues: &[&Issue], prs: &BTreeMap<String, String>) -> Vec<Lane> {
+    let (lane_issues, mut lanes): (Vec<&Issue>, Vec<Lane>) = issues
         .iter()
         .filter(|i| !matches!(i.front.status.as_str(), "done" | "dropped"))
         .filter_map(|i| {
@@ -427,42 +549,90 @@ pub fn open_lanes(issues: &[&Issue], prs: &BTreeMap<String, String>) -> Vec<Lane
                 .find(|r| r.kind == "pr" && r.closed != Some(true))
                 .and_then(|r| r.url.clone().or_else(|| r.path.clone()))
                 .or_else(|| prs.get(&f.id).cloned());
-            Some(Lane {
-                issue: f.id.clone(),
-                project: i.project.clone(),
-                side: Side::of(f, f.claim.as_ref().map(|c| c.by.as_str())),
-                worker: f.owner.clone(),
-                pr,
-                worktree: PathBuf::from(wt),
-                planned: f.paths.clone(),
-                changed: vec![],
-                changed_error: None,
-            })
+            // Planted frontmatter bypasses `issue set`'s check_path —
+            // validate on load and drop what a write would refuse.
+            let planned: Vec<String> = f
+                .paths
+                .iter()
+                .filter(|p| check_path(p).is_ok())
+                .cloned()
+                .collect();
+            Some((
+                *i,
+                Lane {
+                    issue: f.id.clone(),
+                    project: i.project.clone(),
+                    side: Side::of(f, None),
+                    worker: f.owner.clone(),
+                    pr,
+                    head: None,
+                    worktree: PathBuf::from(wt),
+                    planned,
+                    changed: vec![],
+                    changed_error: None,
+                },
+            ))
         })
-        .collect();
-    let dirs: Vec<PathBuf> = lanes.iter().map(|l| l.worktree.clone()).collect();
-    let results: Vec<std::result::Result<Vec<String>, String>> = std::thread::scope(|s| {
-        let handles: Vec<_> = dirs
-            .iter()
-            .map(|dir| s.spawn(move || changed_files(dir)))
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().unwrap_or_else(|_| Err("reader panicked".into())))
-            .collect()
+        .unzip();
+    let next = AtomicUsize::new(0);
+    let probed: Mutex<Vec<(usize, Probe)>> = Mutex::new(Vec::new());
+    std::thread::scope(|s| {
+        for _ in 0..LANE_GIT_WORKERS.min(lanes.len()) {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let (Some(issue), Some(lane)) = (lane_issues.get(i), lanes.get(i)) else {
+                    break;
+                };
+                let probe: Probe = (
+                    changed_files(&lane.worktree),
+                    lane_head(&lane.worktree).ok(),
+                    recorded_pm(pm_dir, issue),
+                );
+                probed
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((i, probe));
+            });
+        }
     });
-    for (lane, result) in lanes.iter_mut().zip(results) {
-        match result {
+    for (i, (changed, head, pm)) in probed.into_inner().unwrap_or_default() {
+        let lane = &mut lanes[i];
+        match changed {
             Ok(files) => lane.changed = files,
             Err(e) => lane.changed_error = Some(e),
         }
+        lane.head = head;
+        lane.side.pm = pm;
     }
     lanes
 }
 
+/// `git -C <dir>` as a pure object read. The `-c` flags disarm what an
+/// agent-controlled worktree config could otherwise make the board
+/// run: fsmonitor and hooks are off, and no external diff driver is
+/// consulted. Inherited `GIT_*` env is dropped so a caller's
+/// environment cannot retarget the repo, its index or its objects.
 fn git_line(dir: &Path, args: &[&str]) -> std::result::Result<String, String> {
     let out = crate::proc::run_bounded(
-        Command::new("git").arg("-C").arg(dir).args(args),
+        Command::new("git")
+            .args([
+                "-c",
+                "core.fsmonitor=",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "diff.external=",
+                "-c",
+                "diff.noprefix=false",
+            ])
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORKTREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_OBJECT_DIRECTORY")
+            .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES"),
         GIT_TIMEOUT,
     )
     .map_err(|e| format!("git {}: {e:?}", args.join(" ")))?;
@@ -476,9 +646,13 @@ fn git_line(dir: &Path, args: &[&str]) -> std::result::Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// The files a lane's worktree changed against its base — the merge
-/// base of `HEAD` with the repo's default branch (`origin/HEAD`, else
-/// `origin/main`, else `main`, else `master`), committed or not.
+/// The files a lane's branch changed against its base — the merge base
+/// of `HEAD` with the repo's default branch (`origin/HEAD`, else
+/// `origin/main`, else `main`, else `master`). Both diff sides are
+/// commits, so this never hashes, stats or filters a worktree file:
+/// uncommitted and untracked work is invisible, by design — the board
+/// warns on what a lane has committed. Sorted, de-duplicated, capped
+/// at [`CHANGED_MAX`].
 pub fn changed_files(wt: &Path) -> std::result::Result<Vec<String>, String> {
     if !wt.is_dir() {
         return Err(format!("worktree {} is missing", wt.display()));
@@ -490,7 +664,7 @@ pub fn changed_files(wt: &Path) -> std::result::Result<Vec<String>, String> {
         .find(|b| git_line(wt, &["rev-parse", "--verify", "--quiet", b]).is_ok())
         .ok_or_else(|| "no default branch to diff against".to_string())?;
     let mb = git_line(wt, &["merge-base", "HEAD", &base])?;
-    let text = git_line(wt, &["diff", "--name-only", "--no-renames", &mb])?;
+    let text = git_line(wt, &["diff", "--name-only", "--no-renames", &mb, "HEAD"])?;
     let mut files: Vec<String> = text
         .lines()
         .filter(|l| !l.is_empty())
@@ -498,13 +672,99 @@ pub fn changed_files(wt: &Path) -> std::result::Result<Vec<String>, String> {
         .collect();
     files.sort();
     files.dedup();
+    files.truncate(CHANGED_MAX);
     Ok(files)
 }
 
+/// The lane's committed tip — what an ack pins to so the row re-raises
+/// when the lane commits again.
+pub fn lane_head(wt: &Path) -> std::result::Result<String, String> {
+    if !wt.is_dir() {
+        return Err(format!("worktree {} is missing", wt.display()));
+    }
+    git_line(wt, &["rev-parse", "--verify", "HEAD"])
+}
+
+/// The PM a lane's start/dispatch record binds — the actor of the
+/// newest tracker commit that bound the lane: `<id>: start …` (start
+/// and dispatch both write it), `<id>: claim …` (a fresh claim or a
+/// take-over) or `<id>: ref worktree` recorded by hand. A `release` or
+/// a `ref worktree closed` lifts the binding — older commits are stale
+/// and the scan stops there. The actor is the `Actor:` trailer
+/// (CAD-42), else the ` (actor)` subject suffix, else the git author.
+/// With no binding commit, the newest `dispatch`/`claim` comment's
+/// author stands in.
+///
+/// `front.claim.by` is never consulted: it is live frontmatter a lane
+/// rewrites without leaving a record, so trusting it would let a lane
+/// name its owner and suppress its own ack row. The record is still
+/// only *evidence* — a hand-forged commit or comment can fake it —
+/// which is why every use of it warns and never refuses.
+fn recorded_pm(pm_dir: &Path, issue: &Issue) -> Option<String> {
+    let id = issue.front.id.as_str();
+    let rel = format!("{}/{id}", issue.project);
+    let log = git_line(
+        pm_dir,
+        &[
+            "log",
+            "--format=%s%x1f%an%x1f%(trailers:key=Actor,valueonly,separator=%x2C)",
+            "--",
+            &rel,
+        ],
+    )
+    .unwrap_or_default();
+    for line in log.lines() {
+        let mut fields = line.split('\x1f');
+        let (Some(subject), Some(author), Some(trailer)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let Some(rest) = subject.strip_prefix(&format!("{id}: ")) else {
+            continue;
+        };
+        if rest.starts_with("release") || rest.starts_with("ref worktree closed") {
+            break;
+        }
+        if !(rest.starts_with("start ")
+            || rest.starts_with("claim ")
+            || rest.starts_with("ref worktree"))
+        {
+            continue;
+        }
+        let actor = trailer
+            .split(',')
+            .find(|t| !t.trim().is_empty())
+            .map(str::trim)
+            .map(str::to_string)
+            .or_else(|| {
+                crate::issue::history::split_paren(rest)
+                    .1
+                    .filter(|a| !a.is_empty())
+            })
+            .unwrap_or_else(|| author.to_string());
+        return crate::issue::claim::check_alias(&actor, "pm")
+            .ok()
+            .map(|_| actor);
+    }
+    issue
+        .comments
+        .iter()
+        .rev()
+        .find(|c| matches!(c.front.kind.as_deref(), Some("dispatch") | Some("claim")))
+        .and_then(|c| {
+            crate::issue::claim::check_alias(&c.front.author, "pm")
+                .ok()
+                .map(|_| c.front.author.clone())
+        })
+}
+
+/// Files named in warning text — scrubbed; `files` can carry planted
+/// or quoted-from-git bytes.
 fn named(files: &[String]) -> String {
-    let mut out: Vec<&str> = files.iter().take(NAMED_MAX).map(String::as_str).collect();
+    let mut out: Vec<String> = files.iter().take(NAMED_MAX).map(|f| scrub(f)).collect();
     if files.len() > NAMED_MAX {
-        out.push("…");
+        out.push("…".to_string());
     }
     out.join(", ")
 }
@@ -541,11 +801,11 @@ pub fn warnings(areas: &[Area], me: &Side, planned: &[String], lanes: &[Lane]) -
                 "area": area.name,
                 "owner": area.owner(),
                 "lanes": open.iter().map(|l| l.issue.clone()).collect::<Vec<_>>(),
-                "text": format!(
+                "text": scrub(&format!(
                     "{} plans {} in area '{}' owned by {} — agree it with the owner; \
                      open lanes there: {open_names}",
                     me.issue, named(&mine), area.name, area.owner()
-                ),
+                )),
             }));
         }
         if let Some(max) = area.max_open_prs {
@@ -556,11 +816,11 @@ pub fn warnings(areas: &[Area], me: &Side, planned: &[String], lanes: &[Lane]) -
                     "owner": area.owner(),
                     "max_open_prs": max,
                     "lanes": open.iter().map(|l| l.issue.clone()).collect::<Vec<_>>(),
-                    "text": format!(
+                    "text": scrub(&format!(
                         "area '{}' (owner {}) is at capacity: {} open lane(s)/PR(s), \
                          max_open_prs {max} — {open_names}",
                         area.name, area.owner(), open.len()
-                    ),
+                    )),
                 }));
             }
         }
@@ -575,13 +835,13 @@ pub fn warnings(areas: &[Area], me: &Side, planned: &[String], lanes: &[Lane]) -
         out.push(json!({
             "kind": "overlap",
             "lane": lane.issue,
-            "worker": lane.worker,
-            "pr": lane.pr,
-            "paths": hits,
-            "text": format!(
+            "worker": lane.worker.as_deref().map(scrub),
+            "pr": lane.pr.as_deref().map(scrub),
+            "paths": hits.iter().map(|h| scrub(h)).collect::<Vec<_>>(),
+            "text": scrub(&format!(
                 "{}'s planned paths overlap open lane {}: {}",
                 me.issue, lane.label(), named(&hits)
-            ),
+            )),
         }));
     }
     out
@@ -592,7 +852,14 @@ pub fn warnings(areas: &[Area], me: &Side, planned: &[String], lanes: &[Lane]) -
 /// reported in the block, never raised — the start goes ahead.
 pub fn check_start(pm_dir: &Path, project: &str, front: &Front, requester: &str) -> Value {
     let (areas, config_error) = load_or_error(pm_dir, project);
-    let planned = &front.paths;
+    // Planted frontmatter bypasses `issue set`'s check_path — validate
+    // on load; a path a write would refuse is dropped, not matched.
+    let planned: Vec<String> = front
+        .paths
+        .iter()
+        .filter(|p| check_path(p).is_ok())
+        .cloned()
+        .collect();
     let touched: Vec<Value> = areas
         .iter()
         .filter(|a| planned.iter().any(|p| a.touches(p)))
@@ -615,23 +882,25 @@ pub fn check_start(pm_dir: &Path, project: &str, front: &Front, requester: &str)
         }
     };
     let refs: Vec<&Issue> = issues.iter().filter(|i| i.front.id != front.id).collect();
-    let lanes = open_lanes(&refs, &BTreeMap::new());
+    let lanes = open_lanes(pm_dir, &refs, &BTreeMap::new());
     let me = Side::of(front, Some(requester));
-    block["warnings"] = json!(warnings(&areas, &me, planned, &lanes));
+    block["warnings"] = json!(warnings(&areas, &me, &planned, &lanes));
     block
 }
 
 /// The warning lines of a `leases` block — what the CLI prints and the
-/// tracker comment records.
+/// `lease` comment records. Scrubbed at the boundary: a warning's text
+/// already is, but a planted `config_error` or a caller-built block
+/// goes through the same filter.
 pub fn warning_lines(block: &Value) -> Vec<String> {
     let mut out: Vec<String> = block["warnings"]
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|w| w["text"].as_str().map(str::to_string))
+        .filter_map(|w| w["text"].as_str().map(scrub))
         .collect();
     if let Some(e) = block["config_error"].as_str() {
-        out.push(format!("{e} — area checks skipped"));
+        out.push(scrub(&format!("{e} — area checks skipped")));
     }
     out
 }
@@ -693,6 +962,12 @@ pub struct AckNeed {
 
 /// The ack rows for `lanes` of one project. `has_pr` answers whether a
 /// lane has a PR beyond its own record (an open PR branch on GitHub).
+///
+/// An ack suppresses the row only while the lane's head is still the
+/// commit the ack pinned: a lane that commits again after the ack —
+/// touching the area or not — re-raises it, so a fresh change gets a
+/// fresh look. Acks recorded without a `head` (pre-pinning records)
+/// suppress nothing; the row stays up, the fail-safe direction.
 pub fn ack_needs(
     areas: &[Area],
     lanes: &[Lane],
@@ -712,9 +987,16 @@ pub fn ack_needs(
                 .changed
                 .iter()
                 .filter(|c| area.covers(c))
-                .cloned()
+                .map(|c| scrub(c))
                 .collect();
-            if files.is_empty() || acks.contains_key(&ack_key(&lane.issue, &area.name)) {
+            let acked = acks
+                .get(&ack_key(&lane.issue, &area.name))
+                .is_some_and(|a| {
+                    lane.head
+                        .as_deref()
+                        .is_some_and(|h| a["head"].as_str() == Some(h))
+                });
+            if files.is_empty() || acked {
                 continue;
             }
             out.push(AckNeed {
@@ -732,13 +1014,13 @@ pub fn ack_needs(
 
 impl AckNeed {
     pub fn title(&self) -> String {
-        format!(
+        scrub(&format!(
             "{} changes area '{}' owned by {} — needs the owner's ack ({})",
             self.issue,
             self.area.name,
             self.area.owner(),
             named(&self.files)
-        )
+        ))
     }
 }
 
@@ -762,12 +1044,12 @@ pub fn overlay(areas: &[Area], lanes: &[Lane]) -> Vec<Value> {
                 .collect();
             json!({
                 "issue": l.issue,
-                "worker": l.worker,
-                "pm": l.side.pm,
-                "pr": l.pr,
-                "planned": l.planned,
+                "worker": l.worker.as_deref().map(scrub),
+                "pm": l.side.pm.as_deref().map(scrub),
+                "pr": l.pr.as_deref().map(scrub),
+                "planned": l.planned.iter().map(|p| scrub(p)).collect::<Vec<_>>(),
                 "changed_count": l.changed.len(),
-                "changed_error": l.changed_error,
+                "changed_error": l.changed_error.as_deref().map(scrub),
                 "areas": in_areas,
                 "overlaps": overlaps_with,
             })
@@ -927,6 +1209,7 @@ mod tests {
             },
             worker: Some(format!("w-{issue}")),
             pr: pr.map(str::to_string),
+            head: Some(format!("h-{issue}")),
             worktree: PathBuf::from("/nowhere"),
             planned: planned.iter().map(|s| s.to_string()).collect(),
             changed: changed.iter().map(|s| s.to_string()).collect(),
@@ -1119,9 +1402,33 @@ mod tests {
         // An open PR branch seen on GitHub counts as a PR.
         let needs = ack_needs(&areas, &lanes, &none, |l| l.issue == "D-2");
         assert_eq!(needs.len(), 2);
+        // An ack suppresses the row only while the lane's head is the
+        // pinned commit: acks without a head (pre-pinning records) and
+        // acks for a stale head keep the row up.
         let mut acked = Map::new();
         acked.insert(ack_key("D-1", "caller"), json!({"by": "pm-a"}));
-        assert!(ack_needs(&areas, &lanes, &acked, |_| false).is_empty());
+        assert_eq!(
+            ack_needs(&areas, &lanes, &acked, |_| false).len(),
+            1,
+            "an ack with no pinned head suppresses nothing"
+        );
+        acked.insert(
+            ack_key("D-1", "caller"),
+            json!({"by": "pm-a", "head": "stale"}),
+        );
+        assert_eq!(
+            ack_needs(&areas, &lanes, &acked, |_| false).len(),
+            1,
+            "the lane moved since the ack — the row re-raises"
+        );
+        acked.insert(
+            ack_key("D-1", "caller"),
+            json!({"by": "pm-a", "head": "h-D-1"}),
+        );
+        assert!(
+            ack_needs(&areas, &lanes, &acked, |_| false).is_empty(),
+            "an ack pinned to the current head clears the row"
+        );
     }
 
     #[test]
@@ -1138,5 +1445,293 @@ mod tests {
         assert_eq!(rows[1]["overlaps"], json!(["D-1"]));
         assert_eq!(rows[2]["areas"], json!([]));
         assert_eq!(rows[2]["overlaps"], json!([]));
+    }
+
+    /// The reviewer's hang: `src/******************z` over sixty `a`s
+    /// and a stack of `**`s must resolve in well under 100ms — the
+    /// matchers are linear, no exponential backtracking.
+    #[test]
+    fn globs_are_linear_on_pathological_patterns() {
+        let t0 = std::time::Instant::now();
+        let deep_a = format!("src/{}", "a".repeat(60));
+        for _ in 0..50 {
+            assert!(!matches("src/******************z", &deep_a));
+        }
+        let stacked = format!("{}z", "**/".repeat(60));
+        let deep: String = (0..60)
+            .map(|i| format!("d{i}"))
+            .collect::<Vec<_>>()
+            .join("/");
+        assert!(!matches(&stacked, &deep));
+        // Glob-on-glob overlap goes through the same matchers.
+        assert!(overlaps("x/******************z", "x/******************y"));
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(100),
+            "pathological patterns took {:?}",
+            t0.elapsed()
+        );
+    }
+
+    /// Wildcard and length caps refuse the pathological shapes at the
+    /// field, so they never reach the matcher at all.
+    #[test]
+    fn check_path_caps_wildcards() {
+        assert!(check_path("src/**/*.rs").is_ok());
+        assert!(check_path(&format!("src/{}", "*".repeat(WILD_MAX))).is_ok());
+        let err = check_path(&format!("src/{}", "*".repeat(WILD_MAX + 1))).unwrap_err();
+        assert!(err.to_string().contains("wildcards"), "{err}");
+        assert!(parse_paths("src/******************z").is_err());
+    }
+
+    /// Control and bidi bytes in agent-writable fields never reach a
+    /// warning, a lease comment or the overview JSON.
+    #[test]
+    fn warning_text_is_scrubbed() {
+        let mut evil = lane("D-1", "pm-b", &["src/peer.rs"], &[], None);
+        evil.worker = Some("w\u{1b}[2J\u{202e}detaruS".into());
+        evil.pr = Some("https://x/\u{7}pull/9".into());
+        evil.changed = vec!["src/pe\u{1b}er.rs".into()];
+        assert!(!evil.label().chars().any(|c| c.is_control() || is_format(c)));
+        let ws = warnings(&[], &me("pm-a"), &["src/".into()], &[evil]);
+        assert_eq!(kinds(&ws), vec!["overlap"]);
+        let w = &ws[0];
+        for v in [
+            w["text"].as_str().unwrap().to_string(),
+            w["worker"].as_str().unwrap().to_string(),
+            w["pr"].as_str().unwrap().to_string(),
+            w["paths"].to_string(),
+        ] {
+            assert!(
+                !v.chars().any(|c| c.is_control() || is_format(c)),
+                "unscrubbed bytes in {v:?}"
+            );
+        }
+        // The lease comment path is the same lines.
+        for line in warning_lines(&json!({"warnings": ws, "config_error": null})) {
+            assert!(
+                !line.chars().any(|c| c.is_control() || is_format(c)),
+                "{line:?}"
+            );
+        }
+        // The ESC byte goes; the harmless `[0m` it introduced stays as
+        // literal text — scrubbing removes controls, not sequences.
+        assert_eq!(scrub("a\u{1b}[0mb\u{202e}c\u{200b}"), "a[0mbc");
+    }
+
+    /// `changed_files` diffs two commits — a planted clean filter, an
+    /// fsmonitor command and uncommitted or untracked work in the lane's
+    /// worktree must stay untouched and invisible.
+    #[test]
+    fn changed_files_read_commits_only() {
+        let dir = tmpdir("changed");
+        std::fs::write(dir.join("base.txt"), "base\n").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "base"]);
+        git(&dir, &["checkout", "-qb", "lane"]);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/x.rs"), "x\n").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "lane work"]);
+        // Uncommitted and untracked: invisible to the board.
+        std::fs::write(dir.join("base.txt"), "dirty\n").unwrap();
+        std::fs::write(dir.join("untracked.rs"), "u\n").unwrap();
+        // Traps a worktree read would fire: a clean filter (runs when
+        // git hashes the dirty file) and an fsmonitor command (runs
+        // when git scans the worktree). Neither may execute.
+        let fired = dir.join("fired");
+        let pwn = dir.join("pwn.sh");
+        std::fs::write(&pwn, format!("#!/bin/sh\ntouch '{}'\n", fired.display())).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&pwn, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(dir.join(".gitattributes"), "* filter=pwn\n").unwrap();
+        git(
+            &dir,
+            &["config", "filter.pwn.clean", &pwn.display().to_string()],
+        );
+        git(
+            &dir,
+            &["config", "core.fsmonitor", &pwn.display().to_string()],
+        );
+        assert_eq!(
+            changed_files(&dir).unwrap(),
+            vec!["src/x.rs".to_string()],
+            "only committed changes count"
+        );
+        assert!(!fired.exists(), "a worktree filter/fsmonitor ran");
+        assert_eq!(lane_head(&dir).unwrap().len(), 40);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A lane's PM comes from its start/dispatch record — the `Actor:`
+    /// trailer of the newest binding commit — never from `claim.by`,
+    /// which the lane can rewrite at will.
+    #[test]
+    fn recorded_pm_binds_the_commit_actor_not_frontmatter() {
+        let dir = tmpdir("pm");
+        let idir = dir.join("demo/D-1");
+        std::fs::create_dir_all(&idir).unwrap();
+        std::fs::write(dir.join("demo/project.yaml"), "key: demo\nprefix: D\n").unwrap();
+        let text = |by: &str, n: usize| {
+            format!(
+                "---\nid: D-1\ntitle: t\nstatus: doing\npriority: P2\n\
+                 claim: {{by: {by}, at: '2026-01-01T00:00:00Z'}}\n\
+                 created: '2026-01-01T00:00:00Z'\n---\nedit {n}\n"
+            )
+        };
+        // The lie is live in the file from the start: claim.by is the
+        // area's owner pm-own, while the start record binds pm-a.
+        std::fs::write(idir.join("issue.md"), text("pm-own", 0)).unwrap();
+        git(&dir, &["add", "-A"]);
+        git(
+            &dir,
+            &[
+                "commit",
+                "-qm",
+                "D-1: start cadence/d-1-x\n\nIssue: D-1\nActor: pm-a",
+            ],
+        );
+        let issue = issue_at(&dir, "demo", "D-1");
+        assert_eq!(issue.front.claim.as_ref().unwrap().by, "pm-own");
+        assert_eq!(recorded_pm(&dir, &issue).as_deref(), Some("pm-a"));
+        // A hand-committed frontmatter edit is not a binding subject.
+        std::fs::write(idir.join("issue.md"), text("pm-own", 1)).unwrap();
+        git(&dir, &["add", "-A"]);
+        git(
+            &dir,
+            &["commit", "-qm", "wip: D-1 claims pm-own\n\nActor: pm-own"],
+        );
+        assert_eq!(recorded_pm(&dir, &issue).as_deref(), Some("pm-a"));
+        // A take-over re-binds; a release unbinds.
+        std::fs::write(idir.join("issue.md"), text("pm-b", 2)).unwrap();
+        git(&dir, &["add", "-A"]);
+        git(
+            &dir,
+            &[
+                "commit",
+                "-qm",
+                "D-1: claim take-over by pm-b from pm-a\n\nIssue: D-1\nActor: pm-b",
+            ],
+        );
+        assert_eq!(recorded_pm(&dir, &issue).as_deref(), Some("pm-b"));
+        std::fs::write(idir.join("issue.md"), text("pm-b", 3)).unwrap();
+        git(&dir, &["add", "-A"]);
+        git(
+            &dir,
+            &[
+                "commit",
+                "-qm",
+                "D-1: release by pm-b\n\nIssue: D-1\nActor: pm-b",
+            ],
+        );
+        assert_eq!(recorded_pm(&dir, &issue), None);
+        // With no binding commit, the newest dispatch/claim comment
+        // stands in; with neither, the lane is simply unowned.
+        let (front, body) = parse::parse_issue(
+            "---\nid: D-9\ntitle: t\nstatus: doing\npriority: P2\n\
+             created: '2026-01-01T00:00:00Z'\n---\n",
+        )
+        .unwrap();
+        let mut orphan = Issue {
+            project: "demo".into(),
+            dir: dir.join("demo/D-9"),
+            front,
+            body,
+            comments: vec![],
+            artifacts: vec![],
+        };
+        assert_eq!(recorded_pm(&dir, &orphan), None);
+        orphan.comments.push(crate::issue::board::Comment {
+            name: "x.md".into(),
+            front: model::CommentFront {
+                author: "pm-z".into(),
+                at: "t".into(),
+                kind: Some("dispatch".into()),
+            },
+            body: String::new(),
+        });
+        assert_eq!(recorded_pm(&dir, &orphan).as_deref(), Some("pm-z"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `open_lanes` drops planted paths `issue set` would have refused
+    /// and binds `side.pm` to the dispatch record.
+    #[test]
+    fn open_lanes_validates_loaded_paths_and_binds_pm() {
+        let dir = tmpdir("lanes");
+        let idir = dir.join("demo/D-1");
+        std::fs::create_dir_all(&idir).unwrap();
+        std::fs::write(dir.join("demo/project.yaml"), "key: demo\nprefix: D\n").unwrap();
+        std::fs::write(
+            idir.join("issue.md"),
+            format!(
+                "---\nid: D-1\ntitle: t\nstatus: doing\npriority: P2\n\
+                 claim: {{by: pm-own, at: '2026-01-01T00:00:00Z'}}\n\
+                 paths: ['src/ok.rs', '../escape', 'src/******************z']\n\
+                 refs:\n  - kind: worktree\n    path: '{}'\n\
+                 created: '2026-01-01T00:00:00Z'\n---\n",
+                dir.display()
+            ),
+        )
+        .unwrap();
+        git(&dir, &["add", "-A"]);
+        git(
+            &dir,
+            &[
+                "commit",
+                "-qm",
+                "D-1: start cadence/d-1-x\n\nIssue: D-1\nActor: pm-a",
+            ],
+        );
+        let issues = [issue_at(&dir, "demo", "D-1")];
+        let refs: Vec<&Issue> = issues.iter().collect();
+        let lanes = open_lanes(&dir, &refs, &BTreeMap::new());
+        assert_eq!(lanes.len(), 1);
+        assert_eq!(lanes[0].planned, vec!["src/ok.rs".to_string()]);
+        assert_eq!(lanes[0].side.pm.as_deref(), Some("pm-a"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A throwaway git repo under TMPDIR — commits carry the fixture
+    /// identity, and HOME is pinned to the dir so host config never
+    /// leaks in.
+    fn tmpdir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "cad378-areas-{tag}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-qb", "main"]);
+        dir
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Load an issue the way the board does — the live file, comments
+    /// included — without standing up the whole fixture.
+    fn issue_at(pm_dir: &Path, project: &str, id: &str) -> Issue {
+        crate::issue::board::find_issue(pm_dir, id)
+            .unwrap_or_else(|_| panic!("{project}/{id} unreadable"))
     }
 }

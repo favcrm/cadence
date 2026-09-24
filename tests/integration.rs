@@ -51571,3 +51571,136 @@ fn cad378_area_ack_row_needs_the_owner() {
 fn areas_acks_file(f: &PlanFixture) -> PathBuf {
     cadence_agent::issue::areas::acks_path(&f.d.state)
 }
+
+/// An ack is pinned to the lane's committed tip: once the lane commits
+/// again, the `area_ack` row re-raises for the owner to look at the new
+/// change. Nothing expires by age — only by new commits.
+#[test]
+fn cad378_area_ack_row_re_raises_on_new_commits() {
+    let f = PlanFixture::start();
+    std::fs::write(f.pm_dir.join("demo/PROJECT.md"), CAD378_AREAS).unwrap();
+    let d1 = f.cad378_lane("Foreign work", "D-1", "src/peer.rs", "pm-other");
+    let wt = d1["worktree"].as_str().unwrap().to_string();
+    f.cad378_commit(&wt, "src/daemon/caller_rule.rs");
+    let (ok, out) = f.cli(&["issue", "ref", "D-1", "pr", "https://github.com/o/r/pull/9"]);
+    assert!(ok, "{out}");
+    assert_eq!(f.cad378_ack_rows().len(), 1);
+
+    // An ack (here the operator's — the record path is identical for
+    // the owner PM) pins the lane's head and names the files it
+    // covered; the row clears.
+    let r =
+        f.d.operator_rpc("area_ack", json!({"issue": "D-1", "area": "caller"}))
+            .unwrap();
+    assert_eq!(r["files"], json!(["src/daemon/caller_rule.rs"]), "{r}");
+    assert_eq!(r["head"].as_str().unwrap().len(), 40, "{r}");
+    assert!(f.cad378_ack_rows().is_empty(), "acked at this head");
+
+    // The lane commits again — in the area or not, the pinned head
+    // moved, so the row re-raises.
+    f.cad378_commit(&wt, "src/daemon/area_rpc.rs");
+    let rows = f.cad378_ack_rows();
+    assert_eq!(rows.len(), 1, "new commits re-raise the row: {rows:#?}");
+    assert!(rows[0].to_string().contains("area_rpc.rs"), "{rows:#?}");
+}
+
+/// `claim.by` is live frontmatter — a lane that rewrites it to the
+/// area's owner cannot suppress its own `area_ack` row. The lane's PM
+/// is bound to its start/dispatch record (the `Actor:` trailer of the
+/// newest binding commit), which a frontmatter rewrite does not touch.
+#[test]
+fn cad378_lane_pm_binds_the_dispatch_record_not_frontmatter() {
+    let f = PlanFixture::start();
+    std::fs::write(f.pm_dir.join("demo/PROJECT.md"), CAD378_AREAS).unwrap();
+    let d1 = f.cad378_lane("Foreign work", "D-1", "src/peer.rs", "pm-other");
+    f.cad378_commit(
+        d1["worktree"].as_str().unwrap(),
+        "src/daemon/caller_rule.rs",
+    );
+    let (ok, out) = f.cli(&["issue", "ref", "D-1", "pr", "https://github.com/o/r/pull/9"]);
+    assert!(ok, "{out}");
+    assert_eq!(f.cad378_ack_rows().len(), 1, "the row is up before the lie");
+
+    // The lane plants the owner's identity into its own frontmatter —
+    // claim.by, the field the old code trusted — and commits the plant
+    // as a hand edit so even committed lies change nothing.
+    let mut front = f.front("D-1");
+    front.claim.as_mut().unwrap().by = "pm-own".to_string();
+    front.owner = Some("pm-own".to_string());
+    f.write_front("D-1", &front);
+    for args in [
+        vec!["add", "-A"],
+        vec![
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "wip",
+        ],
+    ] {
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&f.pm_dir)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "git {args:?}: {o:?}");
+    }
+    let rows = f.cad378_ack_rows();
+    assert_eq!(
+        rows.len(),
+        1,
+        "a forged claim.by suppresses nothing: {rows:#?}"
+    );
+    // The overlay names the recorded PM, not the planted one.
+    let (_, view) = f.cli(&["overview", "--json"]);
+    let lanes = view["projects"][0]["lanes"].clone();
+    assert_eq!(lanes[0]["pm"], "pm-other", "{lanes}");
+}
+
+/// Agent bytes never reach a warning raw: a planted owner alias and a
+/// planted PR ref carrying ESC and bidi bytes come back scrubbed in the
+/// warning text and the recorded lease comment.
+#[test]
+fn cad378_warning_text_is_scrubbed() {
+    let f = PlanFixture::start();
+    std::fs::write(f.pm_dir.join("demo/PROJECT.md"), CAD378_AREAS).unwrap();
+    let d1 = f.cad378_lane("Owner work", "D-1", "src/daemon/caller_rule.rs", "pm-own");
+    f.cad378_commit(d1["worktree"].as_str().unwrap(), "src/peer.rs");
+    // Plant hostile bytes in the lane's owner (worker) and PR ref —
+    // frontmatter is agent-writable and refs only refuse a leading '-'.
+    let mut front = f.front("D-1");
+    front.owner = Some("w\u{1b}[2J\u{202e}evil".to_string());
+    front.refs.push(cadence_agent::issue::model::Ref {
+        kind: "pr".to_string(),
+        url: Some("https://x/\u{1b}[31mpull/9".to_string()),
+        path: None,
+        label: None,
+        closed: None,
+        worktree: None,
+        cargo_target: None,
+        agent: None,
+    });
+    f.write_front("D-1", &front);
+    // A second lane overlapping it warns — the text must be clean.
+    let d2 = f.cad378_lane("Other work", "D-2", "src/peer.rs", "pm-other");
+    let text = d2["leases"]["warnings"].to_string();
+    assert!(text.contains("overlap"), "{d2}");
+    assert!(!text.contains('\u{1b}'), "ESC survived: {text}");
+    assert!(!text.contains('\u{202e}'), "bidi survived: {text}");
+    let (_, show) = f.cli(&["issue", "show", "D-2", "--json"]);
+    let lease = show["comments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["kind"] == "lease")
+        .unwrap_or_else(|| panic!("no lease comment: {show}"));
+    let body = lease.to_string();
+    assert!(!body.contains('\u{1b}'), "ESC in the lease comment: {body}");
+    assert!(
+        !body.contains('\u{202e}'),
+        "bidi in the lease comment: {body}"
+    );
+}

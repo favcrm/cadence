@@ -111,7 +111,7 @@ fn raw_log(pm_dir: &Path, rel: &str) -> Result<Vec<RawCommit>> {
 /// A trailing ` (actor)` — the writer appends it for UI writes, and
 /// the actor itself may contain parens (`operator (ui)`), so the scan
 /// is depth-counted from the end.
-fn split_paren(text: &str) -> (String, Option<String>) {
+pub(crate) fn split_paren(text: &str) -> (String, Option<String>) {
     if !text.ends_with(')') {
         return (text.to_string(), None);
     }

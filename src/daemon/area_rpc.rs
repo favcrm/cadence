@@ -65,6 +65,26 @@ impl Shared {
                 )));
             }
         };
+        // Pin the ack to the lane's committed tip so the Needs-you row
+        // re-raises when the lane commits again, and record the files
+        // it covered for the record. Both reads are object-only; a lane
+        // with no readable worktree acks `head: null`, which pins
+        // nothing — the row stays up.
+        let issue = issue::board::find_issue(&pm.dir, &id)?;
+        let wt = issue
+            .front
+            .refs
+            .iter()
+            .find(|r| r.kind == "worktree" && r.closed != Some(true))
+            .and_then(|r| r.path.clone());
+        let head = wt
+            .as_deref()
+            .and_then(|w| areas::lane_head(std::path::Path::new(w)).ok());
+        let files: Vec<String> = wt
+            .as_deref()
+            .and_then(|w| areas::changed_files(std::path::Path::new(w)).ok())
+            .map(|fs| fs.into_iter().filter(|f| area.covers(f)).collect())
+            .unwrap_or_default();
         let record = json!({
             "issue": id,
             "area": name,
@@ -72,6 +92,8 @@ impl Shared {
             "owner": area.owner(),
             "by": by,
             "at": issue::time::iso(issue::time::now_epoch()),
+            "head": head,
+            "files": files,
             "note": note,
         });
         areas::record_ack(&self.state_dir, &areas::ack_key(&id, name), record.clone())?;
