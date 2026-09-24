@@ -1131,6 +1131,63 @@ mod tests {
         }
     }
 
+    /// CAD-410: a private key whose END marker never reaches the scan —
+    /// a head-limited read, or a body cut at the [`TEXT_CAP`] scan limit
+    /// the way a tool-result summary cuts it — keeps none of its body
+    /// in a summary or a stored entry.
+    #[test]
+    fn a_private_key_cut_before_its_end_never_reaches_the_store() {
+        let header = ["-----BEGIN RSA ", "PRIVATE", " KEY-----"].concat();
+        let footer = ["-----END RSA ", "PRIVATE", " KEY-----"].concat();
+        let body: Vec<String> = (0..TEXT_CAP / 64 + 50)
+            .map(|i| noise(&format!("thread-pem:{i}"), 64))
+            .collect();
+        let whole = format!("{header}\n{}\n{footer}\n", body.join("\n"));
+        assert!(whole.len() > TEXT_CAP);
+        let mut head = take_bytes(&whole, TEXT_CAP);
+        head.truncate(head.rfind(char::is_whitespace).unwrap());
+        assert!(!head.contains(&footer), "the END marker is past the cut");
+        let leaked = |cell: &str| {
+            body.iter()
+                .find(|line| cell.contains(line.as_str()))
+                .cloned()
+        };
+
+        let cleaned = clean_text(&head, TEXT_CAP);
+        assert_eq!(cleaned, "[redacted:private-key]");
+        let first = &head[..head.find('\n').unwrap() + 3 * 65];
+        let summary = tool_summary("Bash", &json!({"command": format!("printf '{first}'")}));
+        assert!(summary.starts_with("Bash: printf "), "{summary}");
+        assert!(summary.ends_with("[redacted:private-key]"), "{summary}");
+        assert_eq!(leaked(&summary), None, "{summary}");
+
+        let (dir, s) = store();
+        reg(&s, "master", dir.path());
+        s.ensure_thread("master").unwrap();
+        s.thread_append_running(
+            "master",
+            ROLE_AGENT,
+            KIND_ASSISTANT_TEXT,
+            &head,
+            Some(json!({"raw": first})),
+        )
+        .unwrap();
+        s.enqueue("master", first, None, "m1", "user").unwrap();
+        let raw: Vec<String> = s
+            .conn()
+            .prepare("SELECT text || coalesce(payload,'') FROM thread_entries")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(raw.len(), 2);
+        for cell in &raw {
+            assert_eq!(leaked(cell), None, "key body stored");
+            assert!(cell.contains("[redacted:private-key]"), "{cell}");
+        }
+    }
+
     #[test]
     fn tool_output_is_a_redacted_one_line_summary() {
         let token = github_token("thread-tool-output");

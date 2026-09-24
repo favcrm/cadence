@@ -626,15 +626,29 @@ pub fn scan(text: &str, path: Option<&str>) -> Result<Vec<Finding>> {
 /// one-finding-per-span collapse is for [`scan`]'s report only. The
 /// marker names the first blocking rule in the merged span, else the
 /// first rule.
+///
+/// A private key is also redacted from its BEGIN header to its END
+/// marker, or to the end of the text when no END follows ([`pem_blocks`],
+/// CAD-410): a head- or line-limited read, or a text cut at a scan limit,
+/// carries the key body without the END the gitleaks rule needs.
 pub fn redact_text(text: &str) -> Result<String> {
-    let mut hits = raw_hits(text, None)?;
+    // (start, end, rule, is blocking)
+    let mut hits: Vec<(usize, usize, String, bool)> = raw_hits(text, None)?
+        .into_iter()
+        .map(|(start, end, f)| (start, end, f.rule, f.severity == Severity::Block))
+        .collect();
+    hits.extend(
+        pem_blocks(text)?
+            .into_iter()
+            .map(|(start, end)| (start, end, PEM_RULE.to_string(), true)),
+    );
     if hits.is_empty() {
         return Ok(text.to_string());
     }
-    hits.sort_by_key(|(start, end, _)| (*start, std::cmp::Reverse(*end)));
+    hits.sort_by_key(|(start, end, _, _)| (*start, std::cmp::Reverse(*end)));
     // Merge into (start, end, label rule, label is blocking).
     let mut merged: Vec<(usize, usize, String, bool)> = Vec::new();
-    for (start, end, finding) in hits {
+    for (start, end, rule, block) in hits {
         // Spans are byte offsets from a UTF-8 `&str` scanned as bytes;
         // widen to char boundaries so slicing never panics.
         let start = floor_char_boundary(text, start);
@@ -642,16 +656,15 @@ pub fn redact_text(text: &str) -> Result<String> {
         if end <= start {
             continue;
         }
-        let block = finding.severity == Severity::Block;
         match merged.last_mut() {
             Some(last) if start <= last.1 => {
                 last.1 = last.1.max(end);
                 if block && !last.3 {
-                    last.2 = finding.rule;
+                    last.2 = rule;
                     last.3 = true;
                 }
             }
-            _ => merged.push((start, end, finding.rule, block)),
+            _ => merged.push((start, end, rule, block)),
         }
     }
     let mut out = String::with_capacity(text.len());
@@ -663,6 +676,36 @@ pub fn redact_text(text: &str) -> Result<String> {
     }
     out.push_str(&text[at..]);
     Ok(out)
+}
+
+/// The gitleaks rule a private-key block is redacted under.
+const PEM_RULE: &str = "private-key";
+
+/// Every private-key block in `text`, from its BEGIN header to the next
+/// END marker, or to the end of the text when none follows. The header is
+/// the gitleaks `private-key` rule's own. Redaction only: that rule, and
+/// so [`scan`]'s report, still needs both markers.
+fn pem_blocks(text: &str) -> Result<Vec<(usize, usize)>> {
+    static MARKERS: OnceLock<std::result::Result<(Regex, Regex), String>> = OnceLock::new();
+    let (begin, end) = MARKERS
+        .get_or_init(|| {
+            Ok((
+                compile(r"(?i)-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----")?,
+                compile(r"(?i)-----END[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----")?,
+            ))
+        })
+        .as_ref()
+        .map_err(|e| unavailable(e))?;
+    let bytes = text.as_bytes();
+    Ok(begin
+        .find_iter(bytes)
+        .map(|header| {
+            let stop = end
+                .find_at(bytes, header.end())
+                .map_or(bytes.len(), |m| m.end());
+            (header.start(), stop)
+        })
+        .collect())
 }
 
 fn floor_char_boundary(text: &str, mut i: usize) -> usize {
