@@ -1964,7 +1964,7 @@ the daemon writes it. Report files never move a ticket through the loop.
    process: `cadence delivery sync` reads each PR with the operator's
    `gh` (head, CI rollup, diff stats, auto-merge) and hands them to
    `delivery_observe`. A PASS whose head GitHub shows open and green is
-   one `merge` row in Needs-you: owner, age, PR link, the verdict's
+   one `merge_decision` row in Needs-you: owner, age, PR link, the verdict's
    first line, diff stats. `cadence delivery merge <ID>` checks with
    the daemon, re-reads the PR, then runs `gh pr merge <n> -R
    <owner/repo> --auto --squash --match-head-commit <reviewed sha>` and
@@ -1981,8 +1981,13 @@ the daemon writes it. Report files never move a ticket through the loop.
 
 The daemon never runs `gh`, and no agent environment needs GitHub
 credentials for the loop. `cadence delivery sync --watch <secs>` keeps
-the observations current; the board route for Merge/Decline follows
-the operator rule of the chat-first Home (CAD-328).
+the observations current. The board's `POST /api/delivery/<ID>/merge`
+(`{}`) and `POST /api/delivery/<ID>/decline` (`{"reason"}`) keep the
+operator rule of the chat-first Home (CAD-328): an agent-attributed
+request gets 403 and anything short of positive operator proof on the
+HTTP peer gets 403 `operator_proof`, before `gh` runs. Merge runs in
+the board process, which the operator started, with the operator's
+`gh`.
 
 ## Recovery
 

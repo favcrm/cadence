@@ -33,6 +33,8 @@ use crate::error::{Error, Result};
 pub const MAX_REVISE: u32 = 2;
 /// Bytes of a verdict's first line shown in Needs-you and messages.
 pub const SUMMARY_MAX: usize = 200;
+/// The `gh` the operator's process runs unless told otherwise.
+pub const GH: &str = "gh";
 /// Bound on each `gh` call [`sync`] and the merge action make.
 pub const GH_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -344,7 +346,7 @@ pub fn revise_message(
 /// past what was reviewed. `only` limits it to one ticket. Runs in the
 /// operator's process; the daemon refuses the observation from anyone
 /// else.
-pub fn sync(state_dir: &Path, only: Option<&str>) -> Result<Value> {
+pub fn sync(state_dir: &Path, only: Option<&str>, gh_bin: &str) -> Result<Value> {
     let list = crate::client::rpc(state_dir, "delivery_list", json!({}))?;
     let mut out = Vec::new();
     for rec in list["records"].as_array().cloned().unwrap_or_default() {
@@ -360,7 +362,7 @@ pub fn sync(state_dir: &Path, only: Option<&str>) -> Result<Value> {
         if matches!(state, "merged" | "declined" | "closed") && rec["disable_auto"] != true {
             continue;
         }
-        let row = match sync_one(state_dir, &issue, url) {
+        let row = match sync_one(state_dir, &issue, url, gh_bin) {
             Ok(v) => v,
             Err(e) => json!({"issue": issue, "error": e.to_string()}),
         };
@@ -369,17 +371,20 @@ pub fn sync(state_dir: &Path, only: Option<&str>) -> Result<Value> {
     Ok(json!({"synced": out}))
 }
 
-fn sync_one(state_dir: &Path, issue: &str, url: &str) -> Result<Value> {
+fn sync_one(state_dir: &Path, issue: &str, url: &str, gh_bin: &str) -> Result<Value> {
     let (slug, number) = crate::issue::task_report::parse_pr_url(url)?;
-    let view = gh(&[
-        "pr",
-        "view",
-        &number.to_string(),
-        "-R",
-        &slug,
-        "--json",
-        "headRefOid,state,statusCheckRollup,additions,deletions,changedFiles,autoMergeRequest",
-    ])?;
+    let view = gh(
+        gh_bin,
+        &[
+            "pr",
+            "view",
+            &number.to_string(),
+            "-R",
+            &slug,
+            "--json",
+            "headRefOid,state,statusCheckRollup,additions,deletions,changedFiles,autoMergeRequest",
+        ],
+    )?;
     let pr: Value = serde_json::from_str(&view)
         .map_err(|e| Error::rejected(format!("gh pr view: unreadable ({e})")))?;
     let rollup = pr["statusCheckRollup"]
@@ -398,14 +403,17 @@ fn sync_one(state_dir: &Path, issue: &str, url: &str) -> Result<Value> {
     });
     let mut answer = crate::client::rpc(state_dir, "delivery_observe", observed)?;
     if answer["disable_auto"] == true {
-        gh(&[
-            "pr",
-            "merge",
-            &number.to_string(),
-            "-R",
-            &slug,
-            "--disable-auto",
-        ])?;
+        gh(
+            gh_bin,
+            &[
+                "pr",
+                "merge",
+                &number.to_string(),
+                "-R",
+                &slug,
+                "--disable-auto",
+            ],
+        )?;
         answer["auto_merge_disabled"] = json!(true);
     }
     Ok(answer)
@@ -417,7 +425,7 @@ fn sync_one(state_dir: &Path, issue: &str, url: &str) -> Result<Value> {
 /// then the operator's own `gh` enqueues it in the merge queue pinned
 /// to the reviewed head, and the daemon records it. A refused check
 /// runs no `gh` merge at all.
-pub fn merge(state_dir: &Path, issue: &str) -> Result<Value> {
+pub fn merge(state_dir: &Path, issue: &str, gh_bin: &str) -> Result<Value> {
     // The check runs first: an agent is refused before anything else,
     // the sync included.
     crate::client::rpc(
@@ -425,7 +433,7 @@ pub fn merge(state_dir: &Path, issue: &str) -> Result<Value> {
         "delivery_merge",
         json!({"issue": issue, "phase": "authorize"}),
     )?;
-    let synced = sync(state_dir, Some(issue))?;
+    let synced = sync(state_dir, Some(issue), gh_bin)?;
     if let Some(e) = synced["synced"][0]["error"].as_str() {
         return Err(Error::rejected(format!(
             "{issue}: reading the PR failed, nothing was merged — {e}"
@@ -439,17 +447,20 @@ pub fn merge(state_dir: &Path, issue: &str) -> Result<Value> {
     let sha = check["sha"].as_str().unwrap_or_default().to_string();
     let url = check["pr"].as_str().unwrap_or_default();
     let (slug, number) = crate::issue::task_report::parse_pr_url(url)?;
-    gh(&[
-        "pr",
-        "merge",
-        &number.to_string(),
-        "-R",
-        &slug,
-        "--auto",
-        "--squash",
-        "--match-head-commit",
-        &sha,
-    ])?;
+    gh(
+        gh_bin,
+        &[
+            "pr",
+            "merge",
+            &number.to_string(),
+            "-R",
+            &slug,
+            "--auto",
+            "--squash",
+            "--match-head-commit",
+            &sha,
+        ],
+    )?;
     crate::client::rpc(
         state_dir,
         "delivery_merge",
@@ -457,8 +468,8 @@ pub fn merge(state_dir: &Path, issue: &str) -> Result<Value> {
     )
 }
 
-fn gh(args: &[&str]) -> Result<String> {
-    let out = crate::proc::run_bounded(Command::new("gh").args(args), GH_TIMEOUT)
+fn gh(gh_bin: &str, args: &[&str]) -> Result<String> {
+    let out = crate::proc::run_bounded(Command::new(gh_bin).args(args), GH_TIMEOUT)
         .map_err(|e| Error::rejected(format!("gh {}: {e}", args.join(" "))))?;
     if !out.status.success() {
         return Err(Error::rejected(format!(

@@ -2410,16 +2410,16 @@ fn run_delivery(state_dir: &Path, action: DeliveryAction) -> Result<i32> {
             client::rpc(state_dir, "delivery_list", json!({"issue": issue}))?
         }
         DeliveryAction::Sync { issue, watch } => match watch {
-            None => delivery::sync(state_dir, issue.as_deref())?,
+            None => delivery::sync(state_dir, issue.as_deref(), delivery::GH)?,
             Some(secs) => loop {
-                match delivery::sync(state_dir, issue.as_deref()) {
+                match delivery::sync(state_dir, issue.as_deref(), delivery::GH) {
                     Ok(v) => println!("{v}"),
                     Err(e) => eprintln!("delivery sync: {e}"),
                 }
                 std::thread::sleep(std::time::Duration::from_secs(secs.max(5)));
             },
         },
-        DeliveryAction::Merge { issue } => delivery::merge(state_dir, &issue)?,
+        DeliveryAction::Merge { issue } => delivery::merge(state_dir, &issue, delivery::GH)?,
         DeliveryAction::Decline { issue, reason } => client::rpc(
             state_dir,
             "delivery_decline",

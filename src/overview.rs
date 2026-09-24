@@ -704,7 +704,9 @@ impl Audience {
             // CAD-431: the merge decision, a review that did not
             // converge, one nobody can take, and auto-merge left on a
             // moved head are the operator's.
-            "merge" | "review_escalated" | "review_unstaffed" | "auto_merge_on" => Self::Operator,
+            "merge_decision" | "review_escalated" | "review_unstaffed" | "auto_merge_on" => {
+                Self::Operator
+            }
             "drift" => Self::Dependency,
             "inbox_unread" | "tracker_behind" => Self::Info,
             _ => Self::Team,
@@ -905,7 +907,7 @@ fn delivery_items(state_dir: &Path, now: i64) -> Vec<Item> {
                     .unwrap_or_default();
                 let mut row = item(
                     22,
-                    "merge",
+                    "merge_decision",
                     &format!(
                         "merge? {id}{number} by {} — PASS by {}: {} (+{} −{}, {} files)",
                         rec.worker, v.reviewer, v.summary, o.additions, o.deletions, o.files

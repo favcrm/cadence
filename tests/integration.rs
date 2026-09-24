@@ -37695,6 +37695,11 @@ fn start_board(pm: &Path, state: &Path) -> u16 {
 
 /// [`start_board`], optionally serving read-only (`--read-only`).
 fn start_board_with(pm: &Path, state: &Path, read_only: bool) -> u16 {
+    start_board_gh(pm, state, read_only, None)
+}
+
+/// [`start_board_with`] whose Merge runs `gh` (CAD-431: a fake).
+fn start_board_gh(pm: &Path, state: &Path, read_only: bool, gh: Option<PathBuf>) -> u16 {
     use std::io::Read;
     let overall = Instant::now() + Duration::from_secs(20);
     loop {
@@ -37703,12 +37708,13 @@ fn start_board_with(pm: &Path, state: &Path, read_only: bool) -> u16 {
             .local_addr()
             .unwrap()
             .port();
-        let (sd, pd) = (state.to_path_buf(), pm.to_path_buf());
+        let (sd, pd, gh) = (state.to_path_buf(), pm.to_path_buf(), gh.clone());
         thread::spawn(move || {
             let opts = cadence_agent::ui::ServeOpts {
                 host: "127.0.0.1".to_string(),
                 port,
                 read_only,
+                gh,
                 ..Default::default()
             };
             let _ = cadence_agent::ui::serve(&sd, &pd, &opts);
@@ -43250,7 +43256,7 @@ fn delivery_loop_review_revise_pass_merge_end_to_end() {
             .expect("w1 got the REVISE");
     let text = revise["body"].as_str().unwrap();
     assert!(text.contains("D-2") && text.contains("down step"), "{text}");
-    assert!(lf.needs("merge").is_empty());
+    assert!(lf.needs("merge_decision").is_empty());
 
     // Worker fix → round 2 at the new head, same reviewer.
     lf.done(&b);
@@ -43266,15 +43272,15 @@ fn delivery_loop_review_revise_pass_merge_end_to_end() {
     let (ok, out) = lf.verdict_as("r1", "pass", &b);
     assert!(ok, "{out}");
     assert_eq!(out["delivery"]["state"], "passed", "{out}");
-    assert!(lf.needs("merge").is_empty());
+    assert!(lf.needs("merge_decision").is_empty());
     lf.set_gh(&b, "OPEN", false, false);
     let (ok, out) = lf.operator(&["delivery", "sync"]);
     assert!(ok, "{out}");
-    assert!(lf.needs("merge").is_empty(), "CI not green yet");
+    assert!(lf.needs("merge_decision").is_empty(), "CI not green yet");
     lf.set_gh(&b, "OPEN", true, false);
     let (ok, out) = lf.operator(&["delivery", "sync"]);
     assert!(ok, "{out}");
-    let rows = lf.needs("merge");
+    let rows = lf.needs("merge_decision");
     assert_eq!(rows.len(), 1, "{rows:#?}");
     let row = &rows[0];
     assert_eq!(row["audience"], "operator", "{row}");
@@ -43343,7 +43349,7 @@ fn delivery_loop_review_revise_pass_merge_end_to_end() {
         "{}",
         lf.gh_log()
     );
-    assert!(lf.needs("merge").is_empty());
+    assert!(lf.needs("merge_decision").is_empty());
 
     // The head moves after the review: auto-merge goes off and the new
     // head re-enters review; the old PASS is stale.
@@ -43368,17 +43374,63 @@ fn delivery_loop_review_revise_pass_merge_end_to_end() {
     assert!(ok);
     assert_eq!(lf.rec()["disable_auto"], false);
 
-    // PASS at c → merge → merged.
+    // PASS at c → merge from the board → merged. The board's Merge
+    // keeps the operator rule of the chat-first Home: an agent's request
+    // is refused (403) before any gh call.
     let (ok, out) = lf.verdict_as("r1", "pass", &c);
     assert!(ok, "{out}");
-    let (ok, out) = lf.operator(&["delivery", "merge", "D-2"]);
+    let (ok, out) = lf.operator(&["delivery", "sync"]);
     assert!(ok, "{out}");
+    assert_eq!(
+        lf.needs("merge_decision").len(),
+        1,
+        "{:#?}",
+        lf.f.needs_me()
+    );
+    let port = start_board_gh(
+        &lf.f.pm_dir,
+        &lf.f.d.state,
+        false,
+        Some(lf.gh_dir.join("gh")),
+    );
+    let poster = lf.f.file(
+        "post.py",
+        "import socket, sys\nport, req = int(sys.argv[1]), sys.argv[2]\n\
+         s = socket.create_connection(('127.0.0.1', port))\ns.sendall(req.encode())\n\
+         print(s.makefile().read())\n",
+    );
+    let before = lf.snapshot();
+    for (path, body) in [
+        ("/api/delivery/D-2/merge", "{}"),
+        ("/api/delivery/D-2/decline", r#"{"reason":"agent says no"}"#),
+    ] {
+        let request = cad328_post(port, path, THREAD_GUARDS, body);
+        let r = lf
+            .r1
+            .exec(&["python3", &poster, &port.to_string(), &request]);
+        assert!(
+            r["out"].as_str().unwrap_or_default().contains(" 403 "),
+            "{path}: {r}"
+        );
+    }
+    assert_eq!(
+        lf.snapshot(),
+        before,
+        "an agent's board merge wrote something"
+    );
+    assert_eq!(lf.rec()["state"], "passed");
+    let (status, reply) = board_http(
+        port,
+        &cad328_post(port, "/api/delivery/D-2/merge", THREAD_GUARDS, "{}"),
+    );
+    assert_eq!(status, 200, "{reply}");
+    assert!(reply.contains("enqueued"), "{reply}");
     assert!(lf.gh_log().contains(&format!("--match-head-commit {c}")));
     lf.set_gh(&c, "MERGED", true, false);
     let (ok, out) = lf.operator(&["delivery", "sync"]);
     assert!(ok, "{out}");
     assert_eq!(lf.rec()["state"], "merged", "{}", lf.rec());
-    for kind in ["merge", "review_escalated", "auto_merge_on"] {
+    for kind in ["merge_decision", "review_escalated", "auto_merge_on"] {
         assert!(lf.needs(kind).is_empty(), "{kind}");
     }
 }
