@@ -2220,16 +2220,19 @@ impl UiDaemon {
         clock: std::sync::Arc<dyn Fn() -> i64 + Send + Sync>,
     ) -> Self {
         let owned = state.clone();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let opts = daemon::ServeOptions {
+            operator_clock: Some(clock),
+            stop: Some(stop.clone()),
+            ..Default::default()
+        };
         let handle = thread::spawn(move || {
-            let opts = daemon::ServeOptions {
-                operator_clock: Some(clock),
-                ..Default::default()
-            };
             let _ = daemon::serve_with(&owned, opts);
         });
         let d = Self {
             state,
             _tmp: None,
+            stop,
             handle: Some(handle),
         };
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -11237,7 +11240,7 @@ fn a_login_link_expires_after_its_ttl() {
         })
     };
     let d = UiDaemon::start_with_clock(state.path().to_path_buf(), clock);
-    let port = start_ui(pm.path().to_path_buf(), d.state());
+    let (port, _board) = start_ui(pm.path().to_path_buf(), d.state());
     let host = op::board_host(port);
     let late = op::nonce_of(&op::login_link(bin(), &d.state(), port, &[]).unwrap());
     let on_time = op::nonce_of(&op::login_link(bin(), &d.state(), port, &[]).unwrap());
@@ -11263,7 +11266,7 @@ fn links_and_sessions_are_bound_to_their_origin() {
     seed(pm.path(), state.path());
     let d = UiDaemon::start_on(state.path().to_path_buf());
     let (ts_dir, sock) = fake_localapi();
-    let port = start_ui_opts(pm.path().to_path_buf(), d.state(), tailnet_opts(&sock));
+    let (port, _board) = start_ui_opts(pm.path().to_path_buf(), d.state(), tailnet_opts(&sock));
     localapi_says(ts_dir.path(), Some(true), serve_https_only(port));
     let host = op::board_host(port);
     let plain = format!("127.0.0.1:{port}");
@@ -11383,7 +11386,7 @@ fn only_the_operator_with_the_secret_mints_a_login_link() {
     let state = TempDir::new().unwrap();
     seed(pm.path(), state.path());
     let d = UiDaemon::start_on(state.path().to_path_buf());
-    let port = start_ui(pm.path().to_path_buf(), d.state());
+    let (port, _board) = start_ui(pm.path().to_path_buf(), d.state());
     let minted = || daemon_events(&d.state(), "operator_link_minted").len();
 
     // A pane's child.
@@ -11481,7 +11484,7 @@ fn a_session_presented_by_an_agent_is_revoked() {
     let state = TempDir::new().unwrap();
     seed(pm.path(), state.path());
     let d = UiDaemon::start_on(state.path().to_path_buf());
-    let port = start_ui(pm.path().to_path_buf(), d.state());
+    let (port, _board) = start_ui(pm.path().to_path_buf(), d.state());
     let host = format!("127.0.0.1:{port}");
     let s = sign_in(&d.state(), port);
     let before = commits(pm.path());
@@ -11542,7 +11545,7 @@ fn without_a_session_no_process_shape_is_the_operator() {
     let out_dir = TempDir::new().unwrap();
     seed(pm.path(), state.path());
     let d = UiDaemon::start_on(state.path().to_path_buf());
-    let port = start_ui(pm.path().to_path_buf(), d.state());
+    let (port, _board) = start_ui(pm.path().to_path_buf(), d.state());
     let host = format!("127.0.0.1:{port}");
     let before = commits(pm.path());
     let doc = r#"{"expected_revision":0,"config":{"schema":1,"providers":{}}}"#;
@@ -11649,7 +11652,7 @@ fn an_allowed_tailnet_host_without_armed_sharing_trusts_no_header() {
     let state = TempDir::new().unwrap();
     seed(pm.path(), state.path());
     let d = UiDaemon::start_on(state.path().to_path_buf());
-    let port = start_ui_opts(pm.path().to_path_buf(), d.state(), |o| {
+    let (port, _board) = start_ui_opts(pm.path().to_path_buf(), d.state(), |o| {
         o.allow_hosts = vec![TS_DNS.to_string(), format!("{TS_DNS}:9450")];
     });
     let ts_host = format!("{TS_DNS}:9450");
@@ -11730,7 +11733,7 @@ fn every_classified_write_refuses_a_caller_without_a_session() {
     let state = TempDir::new().unwrap();
     seed(pm.path(), state.path());
     let d = UiDaemon::start_on(state.path().to_path_buf());
-    let port = start_ui(pm.path().to_path_buf(), d.state());
+    let (port, _board) = start_ui(pm.path().to_path_buf(), d.state());
     let host = format!("127.0.0.1:{port}");
     let operator_only = ui::WRITE_ROUTES
         .iter()
@@ -11813,7 +11816,7 @@ fn operator_secret_theft_residual_pinned() {
     let out_dir = TempDir::new().unwrap();
     seed(pm.path(), state.path());
     let d = UiDaemon::start_on(state.path().to_path_buf());
-    let port = start_ui(pm.path().to_path_buf(), d.state());
+    let (port, _board) = start_ui(pm.path().to_path_buf(), d.state());
     let out = out_dir.path().join("minted");
     let client = r#"
         on_pane_lineage() {
@@ -11904,7 +11907,7 @@ fn an_early_closed_replay_of_a_stolen_session_writes_nothing() {
     let state = TempDir::new().unwrap();
     seed(pm.path(), state.path());
     let d = UiDaemon::start_on(state.path().to_path_buf());
-    let port = start_ui(pm.path().to_path_buf(), d.state());
+    let (port, _board) = start_ui(pm.path().to_path_buf(), d.state());
     let before = commits(pm.path());
     const HIT_AND_RUN: &str =
         r#"exec 3<>"/dev/tcp/127.0.0.1/$PORT"; printf '%s' "$REQ" >&3; exec 3>&-; sleep 1"#;
@@ -11969,7 +11972,7 @@ fn every_operator_only_route_runs_the_process_proof() {
     let state = TempDir::new().unwrap();
     seed(pm.path(), state.path());
     let d = UiDaemon::start_on(state.path().to_path_buf());
-    let port = start_ui(pm.path().to_path_buf(), d.state());
+    let (port, _board) = start_ui(pm.path().to_path_buf(), d.state());
     let s = sign_in(&d.state(), port);
     let doc = r#"{"expected_revision":0,"config":{"schema":1,"providers":{}}}"#;
     for (path, body) in [
@@ -12015,7 +12018,7 @@ fn route_classes_are_enforced_for_an_agent_caller() {
     let state = TempDir::new().unwrap();
     seed(pm.path(), state.path());
     let d = UiDaemon::start_on(state.path().to_path_buf());
-    let port = start_ui(pm.path().to_path_buf(), d.state());
+    let (port, _board) = start_ui(pm.path().to_path_buf(), d.state());
     let host = format!("127.0.0.1:{port}");
     let client = r#"exec 3<>"/dev/tcp/127.0.0.1/$PORT"; printf '%s' "$REQ" >&3; cat <&3"#;
     let mut n = 0;
@@ -12127,7 +12130,7 @@ fn bogus_sign_ins_never_lock_the_operator_out() {
     let state = TempDir::new().unwrap();
     seed(pm.path(), state.path());
     let d = UiDaemon::start_on(state.path().to_path_buf());
-    let port = start_ui(pm.path().to_path_buf(), d.state());
+    let (port, _board) = start_ui(pm.path().to_path_buf(), d.state());
     let host = op::board_host(port);
     for i in 0..25u32 {
         let bogus = format!("{:064x}", u128::from(i) * 7919 + 1);
@@ -12149,7 +12152,7 @@ fn the_daemon_binds_sessions_to_their_origin_and_refuses_agents() {
     let state = TempDir::new().unwrap();
     seed(pm.path(), state.path());
     let d = UiDaemon::start_on(state.path().to_path_buf());
-    let port = start_ui(pm.path().to_path_buf(), d.state());
+    let (port, _board) = start_ui(pm.path().to_path_buf(), d.state());
     let s = sign_in(&d.state(), port);
     let token = s.cookie.split_once('=').unwrap().1.to_string();
     let check = |origin: &str, key: &str| {
@@ -12217,7 +12220,7 @@ fn a_session_needs_the_cookie_and_the_page_key() {
     let state = TempDir::new().unwrap();
     seed(pm.path(), state.path());
     let d = UiDaemon::start_on(state.path().to_path_buf());
-    let port = start_ui(pm.path().to_path_buf(), d.state());
+    let (port, _board) = start_ui(pm.path().to_path_buf(), d.state());
     let s = sign_in(&d.state(), port);
     let before = commits(pm.path());
     let full = s.request("PATCH", "/api/issues/CAD-3", r#"{"priority":"P0"}"#);
@@ -12264,7 +12267,7 @@ fn a_cookie_leaked_to_another_port_is_worthless_alone() {
     let work = TempDir::new().unwrap();
     seed(pm.path(), state.path());
     let d = UiDaemon::start_on(state.path().to_path_buf());
-    let port = start_ui(pm.path().to_path_buf(), d.state());
+    let (port, _board) = start_ui(pm.path().to_path_buf(), d.state());
     let s = sign_in(&d.state(), port);
     // The agent's listener on another port, and what the browser sends
     // it for `http://cadence-<port>.localhost:<other>/preview`.
@@ -12370,7 +12373,7 @@ fn an_early_closed_replay_with_no_live_agent_writes_nothing() {
     let state = TempDir::new().unwrap();
     seed(pm.path(), state.path());
     let d = UiDaemon::start_on(state.path().to_path_buf());
-    let port = start_ui(pm.path().to_path_buf(), d.state());
+    let (port, _board) = start_ui(pm.path().to_path_buf(), d.state());
     let before = commits(pm.path());
     for n in 0..3 {
         let s = sign_in(&d.state(), port);
