@@ -539,8 +539,10 @@ enum Commands {
         /// report, completes when the paste is confirmed, never replayed
         /// after a daemon restart. Live pane only; at most 500 chars;
         /// takes no `--reply-to` or `--task`.
-        #[arg(long, conflicts_with_all = ["ready", "reply_to", "task"])]
+        #[arg(long, conflicts_with_all = ["ready", "reply_to", "task", "priority", "supersedes"])]
         nudge: bool,
+        #[command(flatten)]
+        steer: SteerArgs,
     },
     /// One-step issue dispatch: `issue start` (idempotent, owner =
     /// the worker) then exactly one templated kickoff message, a
@@ -2196,8 +2198,10 @@ enum MessageAction {
         /// report, completes when the paste is confirmed, never replayed
         /// after a daemon restart. Live pane only; at most 500 chars;
         /// takes no `--reply-to` or `--task`.
-        #[arg(long, conflicts_with_all = ["ready", "reply_to", "task"])]
+        #[arg(long, conflicts_with_all = ["ready", "reply_to", "task", "priority", "supersedes"])]
         nudge: bool,
+        #[command(flatten)]
+        steer: SteerArgs,
     },
     /// Send and wait for the turn's terminal state.
     Ask {
@@ -2812,6 +2816,25 @@ fn atty_stdin() -> bool {
     unsafe { libc::isatty(libc::STDIN_FILENO) == 1 }
 }
 
+/// CAD-158 steering flags, shared by `send` and `message send`. Only
+/// the operator or the recipient's PM may use them; the daemon derives
+/// the caller from the connection.
+#[derive(clap::Args, Debug, Clone, Default)]
+struct SteerArgs {
+    /// Delivery rank. `urgent` is delivered ahead of every queued
+    /// normal message at the next safe turn boundary — it never
+    /// interrupts a running turn or an open approval; FIFO within a
+    /// rank.
+    #[arg(long, value_parser = ["normal", "urgent"])]
+    priority: Option<String>,
+    /// Replace these still-queued messages (comma-separated ids): in
+    /// one transaction each is cancelled as "superseded by <new id>"
+    /// and this message is queued. If any is not still queued, nothing
+    /// changes.
+    #[arg(long, value_delimiter = ',')]
+    supersedes: Vec<String>,
+}
+
 /// Shared send path for `cadence send` and `cadence message send`:
 /// resolve the body, apply the `--ready` operator claim on pty
 /// endpoints, enqueue. Returns the RPC result plus a `pending` flag
@@ -2828,6 +2851,7 @@ fn send_message(
     force: bool,
     task: Option<String>,
     nudge: bool,
+    steer: SteerArgs,
 ) -> Result<(Value, bool)> {
     let body = read_body(text, file)?;
     // --ready IS the operator's explicit claim — and the claim probes
@@ -2854,7 +2878,9 @@ fn send_message(
         "agent_send",
         json!({"alias": alias, "text": body,
                "message": message, "reply_to": reply_to,
-               "task": task, "nudge": nudge}),
+               "task": task, "nudge": nudge,
+               "priority": steer.priority,
+               "supersedes": (!steer.supersedes.is_empty()).then_some(steer.supersedes)}),
     )?;
     // CAD-251: a stale mailbox still accepted the message — say so on
     // stderr so stdout stays the JSON receipt.
@@ -5634,11 +5660,12 @@ fn run() -> Result<i32> {
             ready,
             force,
             nudge,
+            steer,
         } => {
             // Identical path to `message send` — the verb form is sugar,
             // not a second implementation.
             let (result, _) = send_message(
-                &state_dir, &alias, text, file, message, reply_to, ready, force, task, nudge,
+                &state_dir, &alias, text, file, message, reply_to, ready, force, task, nudge, steer,
             )?;
             print_json(&result);
             Ok(0)
@@ -5741,8 +5768,10 @@ fn run() -> Result<i32> {
                     ready,
                     force,
                     nudge,
+                    steer,
                 } => send_message(
                     &state_dir, &alias, text, file, message, reply_to, ready, force, task, nudge,
+                    steer,
                 )?,
                 MessageAction::Ack {
                     message,
@@ -9135,6 +9164,83 @@ mod tests {
                 action: MessageAction::Send { ready: false, .. }
             }
         ));
+    }
+
+    /// CAD-158: `--priority` and comma-separated `--supersedes` parse on
+    /// both send forms; `--nudge` takes neither.
+    #[test]
+    fn send_steering_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "cadence",
+            "send",
+            "w1",
+            "--text",
+            "current scope",
+            "--priority",
+            "urgent",
+            "--supersedes",
+            "m1,m2",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Send { steer, .. } => {
+                assert_eq!(steer.priority.as_deref(), Some("urgent"));
+                assert_eq!(steer.supersedes, ["m1", "m2"]);
+            }
+            _ => panic!("expected send"),
+        }
+        let cli = Cli::try_parse_from([
+            "cadence",
+            "message",
+            "send",
+            "w1",
+            "--text",
+            "x",
+            "--supersedes",
+            "m3",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Message {
+                action: MessageAction::Send { steer, .. },
+            } => {
+                assert_eq!(steer.priority, None);
+                assert_eq!(steer.supersedes, ["m3"]);
+            }
+            _ => panic!("expected message send"),
+        }
+        assert!(Cli::try_parse_from([
+            "cadence",
+            "send",
+            "w1",
+            "--text",
+            "x",
+            "--priority",
+            "high"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "cadence",
+            "send",
+            "w1",
+            "--text",
+            "x",
+            "--nudge",
+            "--priority",
+            "urgent"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "cadence",
+            "send",
+            "w1",
+            "--text",
+            "x",
+            "--nudge",
+            "--supersedes",
+            "m1"
+        ])
+        .is_err());
     }
 
     #[test]
