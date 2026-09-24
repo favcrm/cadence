@@ -6011,10 +6011,15 @@ while True:
         data = ""
     if "<ENTER>" in data:
         text, rest = data.split("<ENTER>", 1)
-        awrite(inp, rest)
-        if text.strip():
-            aappend(os.environ["FAKE_PANE"] + ".screen",
-                    "> %s\nSTUB_REPLY: %s\n" % (text.strip(), text.strip()))
+        if os.path.exists(os.environ["FAKE_PANE"] + ".hold-enter"):
+            # Enter swallowed: the marker is consumed but the draft
+            # stays staged in the input line, unsubmitted.
+            awrite(inp, text + rest)
+        else:
+            awrite(inp, rest)
+            if text.strip():
+                aappend(os.environ["FAKE_PANE"] + ".screen",
+                        "> %s\nSTUB_REPLY: %s\n" % (text.strip(), text.strip()))
     time.sleep(0.05)
 "#;
 
@@ -18102,14 +18107,21 @@ fn stuck_draft(d: &TestDaemon, mock: &MockStub, alias: &str, id: &str) -> String
     token
 }
 
-/// The mock tmux's call log for the test's socket.
-fn tmux_log(d: &TestDaemon, mock: &MockStub) -> String {
-    std::fs::read_to_string(d.stub_pane_file(mock, "calls", "log")).unwrap_or_default()
+/// The mock tmux's call log for the test's socket; `mock_dir` is the
+/// stub or Devin mock's install dir.
+fn tmux_log(d: &TestDaemon, mock_dir: &Path) -> String {
+    std::fs::read_to_string(
+        mock_dir
+            .join("tmux-state")
+            .join(socket_for(&d.state))
+            .join("calls.log"),
+    )
+    .unwrap_or_default()
 }
 
 /// `(pastes, enters)` the mock tmux delivered to `alias`'s pane.
-fn pane_keys(d: &TestDaemon, mock: &MockStub, alias: &str) -> (usize, usize) {
-    let log = tmux_log(d, mock);
+fn pane_keys(d: &TestDaemon, mock_dir: &Path, alias: &str) -> (usize, usize) {
+    let log = tmux_log(d, mock_dir);
     let target = format!("-t {alias}");
     let pastes = log
         .lines()
@@ -18149,7 +18161,12 @@ fn assert_recover_refused(
         "{text}"
     );
     assert!(!text.contains("CAD152-KICKOFF"), "{text}");
-    assert_eq!(pane_keys(d, mock, alias), (1, 1), "{}", tmux_log(d, mock));
+    assert_eq!(
+        pane_keys(d, &mock.dir, alias),
+        (1, 1),
+        "{}",
+        tmux_log(d, &mock.dir)
+    );
     assert!(recover_events(d, alias, "submit_recovered").is_empty());
     let refused = recover_events(d, alias, "submit_recover_refused");
     let event = refused
@@ -18165,6 +18182,25 @@ fn assert_recover_refused(
     assert_eq!(event["result"], "refused", "{event}");
     assert!(event["after"].is_null(), "{event}");
     assert!(!event.to_string().contains("CAD152-KICKOFF"), "{event}");
+}
+
+/// The stub TUI's input width (`adapter::pty::stub::STUB_INPUT_WIDTH`).
+const STUB_INPUT_WIDTH: usize = 40;
+
+/// `text` word-wrapped the way a TUI renders a long draft: greedy, a
+/// break consumes the space, every row at most `width` characters.
+fn word_wrap(text: &str, width: usize) -> Vec<String> {
+    let mut rows: Vec<String> = Vec::new();
+    for word in text.split(' ') {
+        match rows.last_mut() {
+            Some(row) if row.chars().count() + 1 + word.chars().count() <= width => {
+                row.push(' ');
+                row.push_str(word);
+            }
+            _ => rows.push(word.to_string()),
+        }
+    }
+    rows
 }
 
 fn recover(d: &TestDaemon, alias: &str, id: &str) -> cadence_agent::Result<Value> {
@@ -18194,11 +18230,10 @@ fn recover_fixture(params: Value) -> (TestDaemon, MockStub, String) {
 #[test]
 fn recover_submit_sends_one_enter_and_keeps_correlation() {
     let (d, mock, token) = recover_fixture(json!({"auto_ready": "verified"}));
-    // The TUI wraps a long draft: the row break falls on a space.
-    let (head, tail) = RECOVER_BODY.split_at(RECOVER_BODY.find(" docs/").unwrap());
+    // The TUI word-wraps a long draft at its input width.
     atomic_write(
         d.stub_pane_file(&mock, "st", "input"),
-        format!("{head}\n{}", tail.trim_start()),
+        word_wrap(RECOVER_BODY, STUB_INPUT_WIDTH).join("\n"),
     );
     let generation = d.rpc("agent_show", json!({"alias": "st"})).unwrap()["agent"]["generation"]
         .as_str()
@@ -18220,10 +18255,10 @@ fn recover_submit_sends_one_enter_and_keeps_correlation() {
     assert_eq!(out["after"]["input_nonempty"], false, "{out}");
     // One Enter on top of the delivery's; no re-paste.
     assert_eq!(
-        pane_keys(&d, &mock, "st"),
+        pane_keys(&d, &mock.dir, "st"),
         (1, 2),
         "{}",
-        tmux_log(&d, &mock)
+        tmux_log(&d, &mock.dir)
     );
     // The TUI took the staged draft as the turn.
     let screen = std::fs::read_to_string(d.stub_pane_file(&mock, "st", "screen")).unwrap();
@@ -18245,7 +18280,7 @@ fn recover_submit_sends_one_enter_and_keeps_correlation() {
         e.contains("agent recover-submit refused (already_submitted)"),
         "{e}"
     );
-    assert_eq!(pane_keys(&d, &mock, "st"), (1, 2));
+    assert_eq!(pane_keys(&d, &mock.dir, "st"), (1, 2));
     atomic_write(d.stub_pane_file(&mock, "st", "input"), "");
     d.rpc(
         "message_report",
@@ -18448,10 +18483,10 @@ fn recover_submit_caller_rule_per_caller_kind() {
     assert!(frame_err(&r).contains("'by' is not accepted"), "{r}");
     // Nothing sent, nothing recorded for the refused callers.
     assert_eq!(
-        pane_keys(&d, &mock, "st"),
+        pane_keys(&d, &mock.dir, "st"),
         (1, 1),
         "{}",
-        tmux_log(&d, &mock)
+        tmux_log(&d, &mock.dir)
     );
     assert!(recover_events(&d, "st", "submit_recovered").is_empty());
     assert!(recover_events(&d, "st", "submit_recover_refused").is_empty());
@@ -18459,7 +18494,7 @@ fn recover_submit_caller_rule_per_caller_kind() {
     let r = p.pm.rpc(&d.state, "agent_recover_submit", req);
     assert_eq!(r["ok"], true, "{r}");
     assert_eq!(r["result"]["state"], "submitted", "{r}");
-    assert_eq!(pane_keys(&d, &mock, "st"), (1, 2));
+    assert_eq!(pane_keys(&d, &mock.dir, "st"), (1, 2));
     let sent = recover_events(&d, "st", "submit_recovered");
     assert_eq!(sent.len(), 1, "{sent:?}");
     assert_eq!(sent[0]["by"], "pm", "{sent:?}");
@@ -18491,6 +18526,13 @@ fn recover_submit_devin_lost_submit() {
     atomic_write(d.pane_file(&mock, "dv1", "input"), RECOVER_BODY);
     let r = recover(&d, "dv1", "k1").unwrap();
     assert_eq!(r["state"], "submitted", "{r}");
+    // The delivery's paste and Enter, plus exactly one Enter.
+    assert_eq!(
+        pane_keys(&d, &mock.dir, "dv1"),
+        (1, 2),
+        "{}",
+        tmux_log(&d, &mock.dir)
+    );
     let screen = std::fs::read_to_string(d.pane_file(&mock, "dv1", "screen")).unwrap();
     assert_eq!(
         screen.matches("MOCK_REPLY: CAD152-KICKOFF").count(),
@@ -18503,6 +18545,125 @@ fn recover_submit_devin_lost_submit() {
     )
     .unwrap();
     d.wait_message("dv1", "k1", &["completed"], 10);
+}
+
+/// CAD-152: a pane in a tmux mode (copy/view) refuses — the Enter
+/// would scroll the mode, not reach the TUI.
+#[test]
+fn recover_submit_refuses_pane_in_tmux_mode() {
+    let (d, mock, _token) = recover_fixture(json!({"auto_ready": "verified"}));
+    atomic_write(d.stub_pane_file(&mock, "st", "mode"), "1");
+    let err = recover(&d, "st", "m1").unwrap_err();
+    assert_recover_refused(&d, &mock, "st", "m1", err, "pane_mode");
+}
+
+/// CAD-152 (qa-pr227 note 4): the durable record precedes the Enter —
+/// when it cannot be written, nothing is sent.
+#[test]
+fn recover_submit_sends_nothing_when_the_record_cannot_be_written() {
+    let (d, mock, _token) = recover_fixture(json!({"auto_ready": "verified"}));
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER cad152_no_record BEFORE INSERT ON events \
+         WHEN NEW.kind='submit_recovered' BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+    )
+    .unwrap();
+    let err = recover(&d, "st", "m1").unwrap_err();
+    assert!(err.to_string().contains("could not be recorded"), "{err}");
+    assert_recover_refused(&d, &mock, "st", "m1", err, "record");
+}
+
+/// CAD-152 (qa-pr227 note 5, note 7): an Enter the TUI drops leaves the
+/// draft staged — no positive evidence, so `unconfirmed` (CLI exit 1),
+/// recorded as such, never retried: a second recovery refuses.
+#[test]
+fn recover_submit_reports_unconfirmed_when_the_enter_is_dropped() {
+    let (d, mock, _token) = recover_fixture(json!({"auto_ready": "verified"}));
+    atomic_write(d.stub_pane_file(&mock, "st", "hold-enter"), "1");
+    let (ok, out, err) = d.operator_cadence(&["agent", "recover-submit", "st", "--message", "m1"]);
+    assert!(!ok, "unconfirmed must exit non-zero: {out}\n{err}");
+    let out: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(out["state"], "unconfirmed", "{out}");
+    assert_eq!(out["after"]["input_nonempty"], true, "{out}");
+    assert_eq!(pane_keys(&d, &mock.dir, "st"), (1, 2));
+    let sent = recover_events(&d, "st", "submit_recovered");
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0]["result"], "unconfirmed", "{sent:?}");
+    let e = recover(&d, "st", "m1").unwrap_err().to_string();
+    assert!(e.contains("(already_submitted)"), "{e}");
+    assert_eq!(pane_keys(&d, &mock.dir, "st"), (1, 2));
+}
+
+/// CAD-152 (qa-pr227 I2): the operator and the agent's PM recover the
+/// same stuck draft at once while the TUI keeps dropping the Enter —
+/// the draft stays byte-identical, so every pane check passes for both.
+/// Exactly one Enter goes out and one recovery is recorded; the other
+/// caller is refused as already submitted.
+#[test]
+fn recover_submit_concurrent_operator_and_pm_send_one_enter() {
+    let d = TestDaemon::start();
+    let mock = d.mock_stub();
+    let mut p = guard_panes(&d);
+    d.register_stub("st", json!({"upstream": "pm", "auto_ready": "verified"}));
+    d.wait_agent("st", "idle", 20);
+    stuck_draft(&d, &mock, "st", "m1");
+    atomic_write(d.stub_pane_file(&mock, "st", "hold-enter"), "1");
+    let req = json!({"alias": "st", "message": "m1"});
+    let (operator, pm) = std::thread::scope(|scope| {
+        let operator = scope.spawn(|| d.operator_rpc("agent_recover_submit", req.clone()));
+        let pm = p.pm.rpc(&d.state, "agent_recover_submit", req.clone());
+        (operator.join().unwrap(), pm)
+    });
+    // One Enter on top of the delivery's, whatever else happened.
+    assert_eq!(
+        pane_keys(&d, &mock.dir, "st"),
+        (1, 2),
+        "{}",
+        tmux_log(&d, &mock.dir)
+    );
+    let pm_ok = pm["ok"] == true;
+    let operator_ok = operator.is_ok();
+    assert!(
+        pm_ok != operator_ok,
+        "exactly one recovery must go through: operator {operator:?}, pm {pm}"
+    );
+    let refusal = if pm_ok {
+        operator.unwrap_err().to_string()
+    } else {
+        frame_err(&pm)
+    };
+    assert!(refusal.contains("(already_submitted)"), "{refusal}");
+    assert_eq!(recover_events(&d, "st", "submit_recovered").len(), 1);
+}
+
+/// CAD-152 (qa-pr227 I1): the recovery Enter restarts the CAD-250
+/// report clock — a lost submit found late is not fenced moments after
+/// the worker finally receives it.
+#[test]
+fn recover_submit_restarts_the_report_clock() {
+    let (d, _mock, _token) = recover_fixture(json!({"auto_ready": "verified",
+                                                    "report_timeout_secs": 30}));
+    // Pasted 26 s ago: 4 s of the bound left before the recovery.
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    conn.execute("UPDATE messages SET started=started-26 WHERE id='m1'", [])
+        .unwrap();
+    let r = recover(&d, "st", "m1").unwrap();
+    assert_eq!(r["state"], "submitted", "{r}");
+    let waiting =
+        d.rpc("agent_show", json!({"alias": "st"})).unwrap()["agent"]["awaiting_report"].clone();
+    assert_eq!(waiting["message"], "m1", "{waiting}");
+    assert!(
+        waiting["since_secs"].as_u64().unwrap() < 20,
+        "the clock restarts at the recovery: {waiting}"
+    );
+    // Past the original bound: still running, not fenced.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        assert_eq!(d.message_state("st", "m1"), "running");
+        let agent = d.rpc("agent_show", json!({"alias": "st"})).unwrap()["agent"].clone();
+        assert_ne!(agent["state"], "attention", "{agent}");
+        thread::sleep(Duration::from_millis(250));
+    }
 }
 
 // ---- CAD-55: `cadence dispatch` + `cadence issue finish` against a live daemon ----

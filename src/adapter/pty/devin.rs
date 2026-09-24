@@ -15,7 +15,7 @@ use std::time::Duration;
 use crate::adapter::{Probe, ProviderEnv};
 use crate::error::{Error, Result};
 
-use super::profile::TuiProfile;
+use super::profile::{DraftView, TuiProfile};
 use super::{descends_from, lock_holders, resolve_on_path, shlex_quote};
 
 /// Bounded wait for the launched Devin TUI to take a native session lock.
@@ -513,7 +513,7 @@ impl TuiProfile for DevinProfile {
     /// and any wrapped rows under it, down to the box's bottom rule.
     /// No rule below the input row means the box is cut off — the
     /// draft cannot be delimited, so the recovery refuses.
-    fn draft_rows(&self, styled: &str) -> std::result::Result<Vec<String>, String> {
+    fn draft_rows(&self, styled: &str) -> std::result::Result<DraftView, String> {
         let screen = super::sgr::strip(styled);
         let lines: Vec<&str> = screen.trim_end().lines().collect();
         let start = (0..lines.len())
@@ -530,7 +530,13 @@ impl TuiProfile for DevinProfile {
             .trim()
             .to_string()];
         rows.extend(lines[start + 1..end].iter().map(|l| l.trim().to_string()));
-        Ok(rows)
+        // The box's rule spans it; a row's text is at most that less
+        // the `❭ ` prompt's two columns.
+        let width = lines[end].trim().chars().count().saturating_sub(2);
+        Ok(DraftView {
+            rows,
+            width: Some(width),
+        })
     }
 
     fn respond_rejection(&self) -> &'static str {
@@ -826,16 +832,19 @@ Allow this tool call?
             1,
         );
         assert_eq!(
-            prof.draft_rows(&one).unwrap(),
+            prof.draft_rows(&one).unwrap().rows,
             vec!["Kickoff AOS-11: read the brief"]
         );
         let wrapped = format!(
             "transcript tail\n{RULE}\n❭ Kickoff AOS-11: read the\n  brief and report\n{RULE}\nSWE-2 Max"
         );
+        let draft = prof.draft_rows(&wrapped).unwrap();
         assert_eq!(
-            prof.draft_rows(&wrapped).unwrap(),
+            draft.rows,
             vec!["Kickoff AOS-11: read the", "brief and report"]
         );
+        // The box rule's width less the `❭ ` prompt.
+        assert_eq!(draft.width, Some(RULE.chars().count() - 2));
         let cut = "transcript tail\n❭ Kickoff AOS-11: read the brief";
         let err = prof.draft_rows(cut).unwrap_err();
         assert!(err.contains("no bottom rule"), "{err}");

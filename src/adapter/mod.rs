@@ -222,8 +222,9 @@ pub enum RecoverSubmit {
     },
     /// One Enter was sent (or its send failed after the checks passed,
     /// `send_error` — it may still have landed). `confirmed` is true
-    /// when the draft left the input line within the bound; false leaves
-    /// the outcome visible as unconfirmed — it is never retried.
+    /// only on positive evidence within the bound — the TUI's prompt
+    /// line back and empty on a live pane; false leaves the outcome
+    /// visible as unconfirmed — it is never retried.
     Sent {
         before: Probe,
         after: Probe,
@@ -231,6 +232,11 @@ pub enum RecoverSubmit {
         send_error: Option<String>,
     },
 }
+
+/// `agent recover-submit`'s last check before the Enter
+/// ([`ProviderAdapter::recover_submit`]): given the probe the Enter is
+/// admitted under, `Err((check, reason))` refuses and nothing is sent.
+pub type RecoverConfirm<'a> = dyn Fn(&Probe) -> std::result::Result<(), (String, String)> + 'a;
 
 /// Notification sink: `(method, params)` for lifecycle events. Methods
 /// prefixed `cadence/` are recorded verbatim as event kinds — the
@@ -389,14 +395,16 @@ pub trait ProviderAdapter: Send + Sync {
     /// pane in no tmux mode, no approval menu, no busy marker, a
     /// non-empty input line, and a visible draft equal to `body` once
     /// wrapping is normalised. `confirm` runs last, just before the
-    /// Enter, so the caller can re-check its own state (the message)
-    /// inside the same section; its `Err` is a refusal named
-    /// `(check, reason)`. `Err` from this method is a transport failure.
+    /// Enter, with the probe the Enter is admitted under, so the caller
+    /// can re-check its own state and durably reserve the action inside
+    /// the same section; its `Err` is a refusal named `(check, reason)`
+    /// and nothing is sent. `Err` from this method is a transport
+    /// failure before any key.
     fn recover_submit(
         &self,
         _generation: &str,
         _body: &str,
-        _confirm: &dyn Fn() -> std::result::Result<(), (String, String)>,
+        _confirm: &RecoverConfirm,
     ) -> Result<RecoverSubmit> {
         Err(crate::error::Error::rejected(
             "this endpoint kind has no staged-draft submit (pty only)",

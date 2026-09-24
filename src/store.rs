@@ -906,19 +906,27 @@ impl Message {
 
     /// When the report bound's clock started for a turn-holding row: the
     /// delivery (`started`, else `created`), restarted by the latest valid
-    /// ack — an ack is the worker's own report that it holds the turn.
-    /// `None` for any other row.
+    /// ack — an ack is the worker's own report that it holds the turn —
+    /// and by an `agent recover-submit` Enter (CAD-152), which is when a
+    /// lost submit's turn really reaches the worker. `None` for any other
+    /// row.
     pub fn report_clock(&self) -> Option<f64> {
         if !self.holds_turn() {
             return None;
         }
         let delivered = self.started.unwrap_or(self.created);
-        let acked = self
-            .result
-            .as_ref()
-            .and_then(|r| r.pointer("/ack/at"))
-            .and_then(Value::as_f64);
-        Some(acked.map_or(delivered, |at| at.max(delivered)))
+        let stamp = |ptr: &str| {
+            self.result
+                .as_ref()
+                .and_then(|r| r.pointer(ptr))
+                .and_then(Value::as_f64)
+        };
+        Some(
+            [stamp("/ack/at"), stamp("/recovered/at")]
+                .into_iter()
+                .flatten()
+                .fold(delivered, f64::max),
+        )
     }
 
     /// The report bound has run out at `now` — `bound == 0` disables it.
@@ -2105,6 +2113,78 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    /// CAD-152: reserve an `agent recover-submit` Enter for running
+    /// message `id` — one transaction, before the keystroke: refuse
+    /// (`Ok(None)`) when a `submit_recovered` record for it already
+    /// exists, else stamp `result.recovered.at` (the report clock
+    /// restarts there, [`Message::report_clock`]) and insert the
+    /// `submit_recovered` record `detail`. Returns the record's `seq`
+    /// for [`Self::finish_submit_recovery`]. The record precedes the
+    /// Enter, so a failed later write can never admit a second one.
+    pub fn reserve_submit_recovery(
+        &self,
+        alias: &str,
+        id: &str,
+        detail: Value,
+    ) -> Result<Option<i64>> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let prior: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM events WHERE alias=?1 AND kind='submit_recovered' \
+             AND json_extract(payload,'$.message')=?2",
+            params![alias, id],
+            |row| row.get(0),
+        )?;
+        if prior > 0 {
+            return Ok(None);
+        }
+        let result: Option<String> = tx
+            .query_row(
+                "SELECT result FROM messages WHERE id=?1 AND alias=?2 AND state='running'",
+                params![id, alias],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| Error::rejected(format!("message {id} is no longer running")))?;
+        let mut result = result
+            .and_then(|r| serde_json::from_str::<Value>(&r).ok())
+            .filter(Value::is_object)
+            .unwrap_or_else(|| json!({}));
+        result["recovered"] = json!({"at": now()});
+        tx.execute(
+            "UPDATE messages SET result=?1 WHERE id=?2 AND state='running'",
+            params![result.to_string(), id],
+        )?;
+        Self::event(&tx, alias, "submit_recovered", detail)?;
+        let seq = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(Some(seq))
+    }
+
+    /// CAD-152: merge the outcome (`after`, `result`, …) into the
+    /// `submit_recovered` record reserved at `seq`.
+    pub fn finish_submit_recovery(&self, seq: i64, outcome: &Value) -> Result<()> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let raw: String = tx.query_row(
+            "SELECT payload FROM events WHERE seq=?1 AND kind='submit_recovered'",
+            [seq],
+            |row| row.get(0),
+        )?;
+        let mut payload: Value = serde_json::from_str(&raw)?;
+        if let (Some(p), Some(o)) = (payload.as_object_mut(), outcome.as_object()) {
+            for (k, v) in o {
+                p.insert(k.clone(), v.clone());
+            }
+        }
+        tx.execute(
+            "UPDATE events SET payload=?1 WHERE seq=?2",
+            params![payload.to_string(), seq],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// CAD-152: the `submit_recovered` record of an earlier `agent

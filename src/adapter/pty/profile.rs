@@ -13,6 +13,17 @@ use std::time::Duration;
 use crate::adapter::Probe;
 use crate::error::{Error, Result};
 
+/// A staged draft as the screen shows it (`agent recover-submit`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DraftView {
+    /// The draft's rows, top to bottom, chrome removed.
+    pub rows: Vec<String>,
+    /// An upper bound on one row's text width in characters — the input
+    /// box's width less the prompt glyph's two columns. `None` when the
+    /// screen does not show it: every row break is then unprovable.
+    pub width: Option<usize>,
+}
+
 /// One provider terminal UI, for a generic owned tmux pane.
 pub trait TuiProfile: Send + Sync {
     /// Display name interpolated into operator-facing messages
@@ -122,13 +133,14 @@ pub trait TuiProfile: Send + Sync {
 
     /// `agent recover-submit` (CAD-152): the staged draft's visible
     /// rows, top to bottom, with this TUI's chrome (prompt glyph, box
-    /// rules, indentation) removed — the text the generic matcher
-    /// compares against the message body. Called only after the probe
-    /// saw a non-empty input line. `Err` names why the draft cannot be
-    /// delimited on this screen, and the recovery refuses: the default
-    /// refuses for every TUI whose input area has no proven shape, so a
-    /// new profile fails closed until it opts in.
-    fn draft_rows(&self, _styled: &str) -> std::result::Result<Vec<String>, String> {
+    /// rules, indentation) removed, and an upper bound on a row's text
+    /// width — what the generic matcher needs to compare the draft with
+    /// the message body and prove each row break is a wrap. Called only
+    /// after the probe saw a non-empty input line. `Err` names why the
+    /// draft cannot be delimited on this screen, and the recovery
+    /// refuses: the default refuses for every TUI whose input area has
+    /// no proven shape, so a new profile fails closed until it opts in.
+    fn draft_rows(&self, _styled: &str) -> std::result::Result<DraftView, String> {
         Err(format!(
             "{} drafts cannot be read reliably from the screen — recover it in \
              the terminal (`cadence agent attach`)",

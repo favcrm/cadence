@@ -5093,14 +5093,17 @@ impl Shared {
     /// Every precondition holds at action time or nothing is sent:
     /// the message checks ([`Self::recover_message_check`]) run first
     /// and again inside the adapter's critical section just before the
-    /// Enter; the adapter checks the live generation, the pane, the
+    /// Enter, with the agent re-read (same generation, same live
+    /// adapter); the adapter checks the live generation, the pane, the
     /// probe and the draft ([`ProviderAdapter::recover_submit`]). Each
-    /// refusal names its check. Recoveries are serialised daemon-wide
-    /// and recorded durably — `submit_recovered` for a sent Enter
-    /// (confirmed or not), `submit_recover_refused` for an authorized
-    /// caller's refusal — with the caller, alias, generation, message
-    /// id, before/after probe and result. Neither event carries the
-    /// message body or the draft.
+    /// refusal names its check. Recoveries are serialised daemon-wide.
+    /// The `submit_recovered` record is reserved (result `sending`)
+    /// together with the report-clock restart in one store write before
+    /// the Enter, then completed with the after probe and result
+    /// (`submitted` / `unconfirmed`); `submit_recover_refused` records an
+    /// authorized caller's refusal. Both carry the caller, alias,
+    /// generation, message id, before/after probe and result — never the
+    /// message body, the draft or the turn token.
     fn rpc_recover_submit(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
         const VERB: &str = "agent recover-submit";
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
@@ -5158,7 +5161,56 @@ impl Shared {
             Ok(adapter) => adapter,
             Err(e) => return refuse("endpoint", &e.to_string(), None),
         };
-        let outcome = adapter.recover_submit(&generation, &message.body, &|| check().map(|_| ()));
+        // Inside the adapter's critical section, just before the Enter:
+        // re-read the agent (its generation and live adapter must be the
+        // ones this recovery started on), re-run the message checks, and
+        // durably reserve the recovery — the `submit_recovered` record
+        // (result `sending`) and the report-clock restart land in one
+        // store write BEFORE the key, so no later failure can admit a
+        // second Enter.
+        let reserved: std::cell::Cell<Option<i64>> = std::cell::Cell::new(None);
+        let confirm = |before: &Probe| -> std::result::Result<(), (String, String)> {
+            let fail = |check: &str, reason: String| Err((check.to_string(), reason));
+            let now = match self.store.agent(&alias) {
+                Ok(now) => now,
+                Err(e) => return fail("message", format!("agent lookup failed: {e}")),
+            };
+            if now.generation.as_deref() != Some(generation.as_str()) {
+                return fail(
+                    "stale_generation",
+                    "the endpoint was relaunched during the recovery".to_string(),
+                );
+            }
+            let same_adapter = self
+                .adapter_for(&alias)
+                .is_ok_and(|live| std::ptr::addr_eq(Arc::as_ptr(&live), Arc::as_ptr(&adapter)));
+            if !same_adapter {
+                return fail(
+                    "endpoint",
+                    "the agent's endpoint was replaced during the recovery".to_string(),
+                );
+            }
+            self.recover_message_check(&now, &id, inspected.as_deref())?;
+            let mut detail = audit.clone();
+            detail["before"] = before.to_json();
+            detail["after"] = Value::Null;
+            detail["result"] = json!("sending");
+            match self.store.reserve_submit_recovery(&alias, &id, detail) {
+                Ok(Some(seq)) => {
+                    reserved.set(Some(seq));
+                    Ok(())
+                }
+                Ok(None) => fail(
+                    "already_submitted",
+                    format!("recover-submit already sent its Enter for message {id}"),
+                ),
+                Err(e) => fail(
+                    "record",
+                    format!("the recovery could not be recorded before sending ({e})"),
+                ),
+            }
+        };
+        let outcome = adapter.recover_submit(&generation, &message.body, &confirm);
         let (before, after, confirmed, send_error) = match outcome {
             Ok(adapter::RecoverSubmit::Sent {
                 before,
@@ -5180,22 +5232,22 @@ impl Shared {
         } else {
             "unconfirmed"
         };
-        let mut detail = audit;
-        detail["before"] = before.to_json();
-        detail["after"] = after.to_json();
-        detail["result"] = json!(result);
+        let mut outcome = json!({"after": after.to_json(), "result": result});
         if let Some(e) = &send_error {
-            detail["send_error"] = json!(e);
+            outcome["send_error"] = json!(e);
         }
-        // The durable marker a second recovery refuses on — written
-        // before the lock drops. An Enter already went out, so a failed
-        // write is an uncertain outcome, never a silent success.
+        // The reservation already stands — a failed outcome write leaves
+        // `sending` on record (a second recovery still refuses) and is
+        // reported as uncertain, never as a silent success.
+        let seq = reserved.get().ok_or_else(|| {
+            Error::internal(format!("{VERB}: an Enter was sent without its reservation"))
+        })?;
         self.store
-            .event_public(&alias, "submit_recovered", detail)
+            .finish_submit_recovery(seq, &outcome)
             .map_err(|e| {
                 Error::unknown(format!(
-                    "{VERB}: the Enter was sent but its audit event could not be \
-                     recorded ({e}) — inspect with `cadence agent capture {alias}`"
+                    "{VERB}: the Enter was sent but its outcome could not be recorded \
+                     ({e}) — inspect with `cadence agent capture {alias}`"
                 ))
             })?;
         // The turn really starts now: the stall watch's clock and the
@@ -5213,9 +5265,9 @@ impl Shared {
         });
         if !confirmed {
             out["note"] = json!(
-                "one Enter was sent but the draft did not leave the input line within \
-                 the bound — the outcome is unconfirmed and is never retried; inspect \
-                 with `cadence agent capture`"
+                "one Enter was sent but the TUI's empty prompt line did not come back \
+                 within the bound — the outcome is unconfirmed and is never retried; \
+                 inspect with `cadence agent capture`"
             );
         }
         Ok(out)

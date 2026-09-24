@@ -30,7 +30,7 @@ use crate::adapter::{Probe, ProviderEnv};
 use crate::error::{Error, Result};
 use crate::store::Agent;
 
-use super::profile::TuiProfile;
+use super::profile::{DraftView, TuiProfile};
 use super::{descends_from, resolve_on_path, shlex_quote};
 
 /// Bounded wait for the launched Claude TUI to publish its session
@@ -829,7 +829,7 @@ impl TuiProfile for ClaudeProfile {
     /// border. Dim cells anywhere in it (a prompt suggestion, a
     /// placeholder) refuse — ghost text must never pass for the draft,
     /// and no bottom border means the box is cut off.
-    fn draft_rows(&self, styled: &str) -> std::result::Result<Vec<String>, String> {
+    fn draft_rows(&self, styled: &str) -> std::result::Result<DraftView, String> {
         let frame = super::sgr::parse(styled);
         let plain: Vec<&str> = frame.plain.lines().collect();
         let undimmed: Vec<&str> = frame.undimmed.lines().collect();
@@ -860,7 +860,13 @@ impl TuiProfile for ClaudeProfile {
             .trim()
             .to_string()];
         rows.extend(plain[start + 1..end].iter().map(|l| l.trim().to_string()));
-        Ok(rows)
+        // The border spans the box; a row's text is at most that less
+        // the `❯ ` prompt (continuation rows are indented as far).
+        let width = plain[end].trim().chars().count().saturating_sub(2);
+        Ok(DraftView {
+            rows,
+            width: Some(width),
+        })
     }
 
     fn respond_rejection(&self) -> &'static str {
@@ -1305,15 +1311,18 @@ mod tests {
     fn draft_rows_read_the_boxed_input() {
         let prof = profile();
         assert_eq!(
-            prof.draft_rows(&fixture("draft.txt")).unwrap(),
+            prof.draft_rows(&fixture("draft.txt")).unwrap().rows,
             vec!["Review the deploy plan and reply"]
         );
         let rule = "─".repeat(40);
         let wrapped = format!("● done\n\n{rule}\n❯\u{a0}Kickoff AOS-11: read the\n  brief and report\n{rule}\n  [Opus]");
+        let draft = prof.draft_rows(&wrapped).unwrap();
         assert_eq!(
-            prof.draft_rows(&wrapped).unwrap(),
+            draft.rows,
             vec!["Kickoff AOS-11: read the", "brief and report"]
         );
+        // The border's width less the `❯ ` prompt.
+        assert_eq!(draft.width, Some(38));
         let err = prof.draft_rows(&fixture("suggestion.ansi")).unwrap_err();
         assert!(err.contains("dim text"), "{err}");
         let cut = format!("{rule}\n❯ Kickoff AOS-11: read the brief");
