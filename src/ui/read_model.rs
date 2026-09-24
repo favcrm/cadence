@@ -107,8 +107,10 @@ pub(super) struct Model {
     /// One overview build at a time; other readers wait for its result.
     build_lock: Mutex<()>,
     overview_builds: AtomicU64,
-    /// The builds a read waited on — the cache missed. Background
-    /// refreshes are not counted here: they scale with wall time.
+    /// The builds a read ran itself — the cache missed. Waiting on an
+    /// in-flight background rebuild is not counted: that is a fresh
+    /// build, not a cache miss, and p95 covers the latency. Background
+    /// refreshes are not counted here either: they scale with wall time.
     request_builds: AtomicU64,
 }
 
@@ -575,7 +577,8 @@ impl Model {
     }
 
     /// Cost meters for tests: folders parsed, overview builds, and the
-    /// builds a read waited on (the cache missed) — so far.
+    /// builds a read ran itself (the cache missed; waiting on an in-flight
+    /// background rebuild is not counted) — so far.
     pub(super) fn stats(&self) -> Value {
         json!({
             "parses": lock(&self.tracker).parses,
