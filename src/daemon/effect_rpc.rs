@@ -293,7 +293,7 @@ impl Shared {
             // and the pin then rides the unchanged source machinery.
             .or_else(|| adapter.implied_source(agent, tool, input));
         let source_hash = match &source_name {
-            Some(name) => Some(adapter.source_hash(name).ok_or_else(|| {
+            Some(name) => Some(adapter.source_hash(agent, name).ok_or_else(|| {
                 Error::rejected(format!(
                     "source '{name}' — the platform holds no such reviewed \
                      artifact; the send cannot be pinned"
@@ -664,7 +664,7 @@ impl Shared {
         // inside Execute — an edit the waiting scan missed still
         // cancels the send here, before any traffic.
         if let Some(source) = &row.source_name {
-            let now_hash = adapter.source_hash(source);
+            let now_hash = adapter.source_hash(&row.agent, source);
             if now_hash.as_deref() != row.source_hash.as_deref() {
                 let row = self
                     .store
@@ -859,10 +859,9 @@ impl Shared {
             let Some(source) = &row.source_name else {
                 continue;
             };
-            let changed = self
-                .platforms
-                .get(&row.platform)
-                .is_some_and(|a| a.source_hash(source).as_deref() != row.source_hash.as_deref());
+            let changed = self.platforms.get(&row.platform).is_some_and(|a| {
+                a.source_hash(&row.agent, source).as_deref() != row.source_hash.as_deref()
+            });
             if changed {
                 if let Ok(Some(closed)) = self
                     .store

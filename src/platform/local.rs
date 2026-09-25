@@ -95,7 +95,9 @@ const ITEM_PREVIEW_CAP: usize = 400;
 /// `local-attachments:<json>` descriptor names the canonical worktree
 /// root and the declared attachment spellings whose bytes
 /// `source_hash` re-reads and digests (CAD-553). `input.source` may
-/// name the same shape; anything else resolves to no artifact.
+/// name the same shape — but the root may only ever be the
+/// requesting agent's own worktree; anything else resolves to no
+/// artifact.
 const PIN_PREFIX: &str = "local-attachments:";
 
 /// The default outbox root — `~/.local/share/cadence/outbox`, the same
@@ -216,6 +218,16 @@ fn parse_post(input: &Value) -> Result<Post, String> {
     })
 }
 
+impl Post {
+    /// The declared attachment spellings, in order.
+    fn attachment_raws(&self) -> Vec<String> {
+        self.attachments
+            .iter()
+            .map(|(raw, _)| raw.clone())
+            .collect()
+    }
+}
+
 /// The syntactic half of attachment confinement: no `..`, ever; a `.`
 /// component is normalized away; an absolute path keeps its root so
 /// the lexical prefix test can admit only paths under the worktree.
@@ -320,35 +332,11 @@ impl LocalAdapter {
         canon.is_dir().then_some(canon)
     }
 
-    /// Every registered agent worktree, canonical. A pin descriptor's
-    /// root must be one of these — the daemon never hashes a path a
-    /// caller merely names.
-    fn registered_worktrees(&self) -> Vec<PathBuf> {
-        let Ok(conn) = rusqlite::Connection::open_with_flags(
-            self.state_dir.join("cadence.sqlite3"),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        ) else {
-            return Vec::new();
-        };
-        let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
-        let Ok(mut stmt) = conn.prepare("SELECT cwd FROM agents") else {
-            return Vec::new();
-        };
-        stmt.query_map([], |r| r.get::<_, String>(0))
-            .map(|rows| {
-                rows.flatten()
-                    .filter_map(|cwd| Path::new(&cwd).canonicalize().ok())
-                    .filter(|p| p.is_dir())
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
     /// Read and hash one declared attachment set under a canonical
     /// worktree root — `(inner path, sha256)` per path, in declared
-    /// order. Stage (`source_hash`), the waiting-row scan and the
-    /// preview's digests all run this same read, so every surface
-    /// agrees on what "the pinned bytes" means.
+    /// order. Stage (`source_hash`) and the waiting-row scan run this
+    /// read; the preview instead echoes the `at` the stage's own pin
+    /// verified, so what it shows is exactly what the pin covers.
     fn pin_items(&self, root: &Path, raws: &[String]) -> Result<Vec<(String, String)>, String> {
         let canon = root
             .canonicalize()
@@ -587,8 +575,7 @@ fn nofollow_walk(path: &Path) -> Result<File, String> {
             Component::Normal(name) => name.as_bytes(),
             Component::Prefix(_) => return Err("a Windows prefix is not a worktree".to_string()),
         };
-        let name = std::ffi::CString::new(bytes)
-            .map_err(|_| "the path holds a NUL".to_string())?;
+        let name = std::ffi::CString::new(bytes).map_err(|_| "the path holds a NUL".to_string())?;
         let next = unsafe { libc::openat(fd, name.as_ptr(), flags) };
         if fd != libc::AT_FDCWD {
             unsafe { libc::close(fd) };
@@ -613,7 +600,13 @@ fn nofollow_walk(path: &Path) -> Result<File, String> {
 /// itself — a forged or stale digest refuses the pin. The verified
 /// `at` lets the staged preview echo the pinned bytes' digests
 /// without a third read of the files.
-fn parse_pin(source: &str) -> Option<(PathBuf, Vec<String>, Option<Vec<(String, String)>>)> {
+struct Pin {
+    root: PathBuf,
+    paths: Vec<String>,
+    at: Option<Vec<(String, String)>>,
+}
+
+fn parse_pin(source: &str) -> Option<Pin> {
     let body = source.strip_prefix(PIN_PREFIX)?;
     let v: Value = serde_json::from_str(body).ok()?;
     let root = PathBuf::from(v.get("root")?.as_str()?);
@@ -626,7 +619,22 @@ fn parse_pin(source: &str) -> Option<(PathBuf, Vec<String>, Option<Vec<(String, 
     if paths.len() > ATTACHMENT_CAP {
         return None;
     }
-    Some((root, paths))
+    let at = match v.get("at") {
+        None => None,
+        Some(a) => Some(
+            a.as_array()?
+                .iter()
+                .map(|p| {
+                    let pair = p.as_array()?;
+                    Some((
+                        pair.first()?.as_str()?.to_string(),
+                        pair.get(1)?.as_str()?.to_string(),
+                    ))
+                })
+                .collect::<Option<Vec<_>>>()?,
+        ),
+    };
+    Some(Pin { root, paths, at })
 }
 
 /// The one digest the pin is: `sha256:` over the sorted
@@ -738,22 +746,38 @@ impl PlatformAdapter for LocalAdapter {
                     // The pin digests join the names when the resolved
                     // source (implied or caller-named) parses — the
                     // operator releases the bytes they see.
-                    let digests = input
+                    let digests: Option<Vec<String>> = input
                         .get("source")
                         .and_then(Value::as_str)
                         .and_then(parse_pin)
-                        .and_then(|(root, _)| {
-                            let raws: Vec<String> = post
-                                .attachments
-                                .iter()
-                                .map(|(raw, _)| raw.clone())
-                                .collect();
-                            self.pin_items(&root, &raws).ok()
+                        .and_then(|pin| {
+                            // A descriptor's verified `at` IS the
+                            // pinned read — showing it cannot diverge
+                            // from what the pin covers. Only a
+                            // descriptor without one (hand-named)
+                            // costs a read here.
+                            match pin.at {
+                                Some(at) if at.len() == pin.paths.len() => post
+                                    .attachments
+                                    .iter()
+                                    .map(|(raw, _)| {
+                                        pin.paths
+                                            .iter()
+                                            .zip(&at)
+                                            .find(|(p, _)| *p == raw)
+                                            .map(|(_, (_, sha))| sha.clone())
+                                    })
+                                    .collect(),
+                                _ => self
+                                    .pin_items(&pin.root, &post.attachment_raws())
+                                    .ok()
+                                    .map(|items| items.into_iter().map(|(_, sha)| sha).collect()),
+                            }
                         });
                     out.push_str("\n\nattachments:");
                     for (i, (raw, _)) in post.attachments.iter().enumerate() {
                         match digests.as_ref().and_then(|d| d.get(i)) {
-                            Some((_, sha)) => out.push_str(&format!("\n  {raw} — sha256:{sha}")),
+                            Some(sha) => out.push_str(&format!("\n  {raw} — sha256:{sha}")),
                             None => out.push_str(&format!("\n  {raw}")),
                         }
                     }
@@ -931,10 +955,12 @@ impl PlatformAdapter for LocalAdapter {
 
     /// A publish carrying attachments implies the source artifact the
     /// pin covers: the declared set, named against the *requesting*
-    /// agent's registered worktree. Only a set that resolves confined
-    /// right now gets a name — bad paths still stage so execute's
-    /// refusal can name them (the confinement tests stage them on
-    /// purpose); the pin simply does not cover them.
+    /// agent's registered worktree, carrying the digests this read
+    /// observed (`at`) so the staged preview and pin agree on one
+    /// byte version. Only a set that resolves confined right now gets
+    /// a name — bad paths still stage so execute's refusal can name
+    /// them (the confinement tests stage them on purpose); the pin
+    /// simply does not cover them.
     fn implied_source(&self, agent: &str, tool: &str, input: &Value) -> Option<String> {
         if tool != TOOL_PUBLISH {
             return None;
@@ -944,31 +970,46 @@ impl PlatformAdapter for LocalAdapter {
             return None;
         }
         let root = self.agent_worktree(agent)?;
-        let raws: Vec<String> = post
-            .attachments
+        let raws = post.attachment_raws();
+        let items = self.pin_items(&root, &raws).ok()?;
+        let at: Vec<(String, String)> = raws
             .iter()
-            .map(|(raw, _)| raw.clone())
+            .cloned()
+            .zip(items.iter().map(|(_, sha)| sha.clone()))
             .collect();
-        self.pin_items(&root, &raws).ok()?;
         Some(format!(
             "{PIN_PREFIX}{}",
-            json!({"root": root, "paths": raws})
+            json!({"root": root, "paths": raws, "at": at})
         ))
     }
 
     /// The staged pin's content hash: a `local-attachments:` descriptor
-    /// re-reads the declared set — but only under a root that proves
-    /// to be a registered agent worktree, so a caller-named descriptor
-    /// can never make the daemon hash a path it merely claims.
-    /// `None` (unresolvable) is the same close as a changed digest:
+    /// re-reads the declared set — but only under the *requesting*
+    /// agent's own registered worktree (`agent` is the row's proven
+    /// caller, never something the descriptor asserts), and an `at`
+    /// the descriptor carries must equal what this read finds. A
+    /// caller-named descriptor can therefore only ever pin bytes
+    /// inside its own worktree — a peer's root, or digests for bytes
+    /// that aren't there, resolve to no artifact at all. `None`
+    /// (unresolvable) is the same close as a changed digest:
     /// `source_changed`.
-    fn source_hash(&self, source: &str) -> Option<String> {
-        let (root, paths) = parse_pin(source)?;
-        let canon = root.canonicalize().ok()?;
-        if !self.registered_worktrees().contains(&canon) {
+    fn source_hash(&self, agent: &str, source: &str) -> Option<String> {
+        let pin = parse_pin(source)?;
+        let canon = pin.root.canonicalize().ok()?;
+        if self.agent_worktree(agent).as_deref() != Some(canon.as_path()) {
             return None;
         }
-        let items = self.pin_items(&canon, &paths).ok()?;
+        let items = self.pin_items(&canon, &pin.paths).ok()?;
+        if let Some(at) = &pin.at {
+            let same = at.len() == pin.paths.len()
+                && at
+                    .iter()
+                    .zip(pin.paths.iter().zip(&items))
+                    .all(|((raw, sha), (path, (_, fresh)))| raw == path && sha == fresh);
+            if !same {
+                return None;
+            }
+        }
         Some(pin_digest(&items))
     }
 }
