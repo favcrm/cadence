@@ -32,6 +32,7 @@ pub mod model_defaults;
 pub mod operator_auth;
 pub mod overview;
 pub mod peer;
+pub mod platform;
 pub mod proc;
 pub mod proto;
 pub mod reaper;

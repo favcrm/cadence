@@ -34,6 +34,7 @@ mod dispatch_rpc;
 mod master_rpc;
 mod master_wake;
 mod operator_rpc;
+mod platform_rpc;
 
 /// CAD-339: the daemon methods a master connection may call.
 pub use master_rpc::MASTER_ALLOWED;
@@ -556,6 +557,17 @@ pub struct Shared {
     /// CAD-313: the clock links and sessions expire by (epoch seconds) —
     /// the wall clock in production, injectable in tests.
     operator_clock: Arc<dyn Fn() -> i64 + Send + Sync>,
+    /// CAD-366: where enrolled platform credential bytes live — the
+    /// host's keychain when usable, else the daemon-owned `0600`
+    /// store under the state dir (ADR 0006 §5.3).
+    platform_custody: crate::platform::Custody,
+    /// CAD-366: serializes a custody write against the record write it
+    /// pairs with — concurrent enrolls of one account, or a revoke
+    /// racing a put, must never leave a record's fingerprint and the
+    /// custody bytes disagreeing. One lock for every custody mutation:
+    /// these verbs are operator-paced and rare, so a per-key map buys
+    /// nothing here.
+    platform_custody_lock: Mutex<()>,
 }
 
 impl Shared {
@@ -642,6 +654,8 @@ impl Shared {
                 .operator_clock
                 .clone()
                 .unwrap_or_else(|| Arc::new(crate::issue::time::now_epoch)),
+            platform_custody: crate::platform::Custody::open(state_dir)?,
+            platform_custody_lock: Mutex::new(()),
         });
         // Holds dropped by boot-time revalidation get their release
         // events now that the store-backed emitter exists.
@@ -2538,6 +2552,16 @@ impl Shared {
             "operator_session_stolen" => self.rpc_operator_session_stolen(params),
             "operator_sessions" => self.rpc_operator_sessions(params, peer_pid),
             "operator_secret_rotate" => self.rpc_operator_secret_rotate(params, peer_pid),
+            "platform_enroll" => self.rpc_platform_enroll(params, peer_pid),
+            "platform_rotate" => self.rpc_platform_rotate(params, peer_pid),
+            "platform_revoke" => self.rpc_platform_revoke(params, peer_pid),
+            "platform_accounts" => self.rpc_platform_accounts(params),
+            "platform_grant" => self.rpc_platform_grant(params, peer_pid),
+            "platform_ungrant" => self.rpc_platform_ungrant(params, peer_pid),
+            "platform_grants" => self.rpc_platform_grants(params, peer_pid),
+            "platform_check" => self.rpc_platform_check(params, peer_pid),
+            "platform_defaults" => self.rpc_platform_defaults(params),
+            "platform_default_set" => self.rpc_platform_default_set(params, peer_pid),
             other => Err(Error::rejected(format!("Unknown method '{other}'"))),
         }
     }
