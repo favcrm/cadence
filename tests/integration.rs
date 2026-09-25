@@ -3718,6 +3718,9 @@ fn daemon_opts() -> daemon::ServeOptions {
         // CAD-477: the checkup judges lanes on its own; only the
         // checkup tests turn it on.
         checkup: Some(0),
+        // CAD-484: no idle-lane dispatch seam — checkup tests that
+        // pick a ticket inject their own.
+        checkup_dispatch: None,
         idle_poll: None,
         stop: None,
         // CAD-313: links and sessions expire by the wall clock unless a
