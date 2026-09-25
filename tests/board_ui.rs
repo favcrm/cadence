@@ -955,7 +955,8 @@ fn auto_resume_failure_raises_needs_me_row_naming_the_message() {
     // The operator fixes the cause and resumes: the row clears and the
     // waiting message is delivered.
     std::fs::remove_file(&flag).unwrap();
-    d.operator_rpc("agent_resume", json!({"alias": "w-fail"})).unwrap();
+    d.operator_rpc("agent_resume", json!({"alias": "w-fail"}))
+        .unwrap();
     d.wait_message("w-fail", "m-fail", &["completed"], 20);
     let agent = d.wait_agent("w-fail", "idle", 10);
     assert!(agent["auto_resume_failed"].is_null(), "{agent}");

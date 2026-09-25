@@ -156,8 +156,11 @@ fn cad319_thread_records_operator_messages_and_turn_results() {
     d.wait_message("lead", "t1", &["completed"], 20);
     // Once a thread exists, a plain `cadence send` from a caller tied to
     // no agent is the operator's too.
-    d.send("lead", json!({"text": "and this", "message": "t2"}))
-        .unwrap();
+    d.operator_rpc(
+        "agent_send",
+        json!({"alias": "lead", "text": "and this", "message": "t2"}),
+    )
+    .unwrap();
     d.wait_message("lead", "t2", &["completed"], 20);
     // A mailbox-free peer: w1 is untouched.
     d.send("w1", json!({"text": "not threaded", "message": "w-1"}))
@@ -2057,8 +2060,11 @@ fn cad323_pid(d: &TestDaemon, alias: &str) -> i64 {
 /// and a later interrupt with nothing running is a recorded no-op.
 fn cad323_next_turn_then_noop(d: &TestDaemon, alias: &str, pid: i64) {
     d.wait_agent(alias, "idle", 10);
-    d.send(alias, json!({"text": "next", "message": "m2"}))
-        .unwrap();
+    d.operator_rpc(
+        "agent_send",
+        json!({"alias": alias, "text": "next", "message": "m2"}),
+    )
+    .unwrap();
     d.wait_message(alias, "m2", &["completed"], 20);
     assert_eq!(cad323_pid(d, alias), pid, "the provider was relaunched");
     let noop = d
@@ -2090,7 +2096,7 @@ fn cad323_claude_interrupt_mid_text() {
     d.register_claude("w1", Value::Null);
     d.wait_agent("w1", "idle", 15);
     let pid = cad323_pid(&d, "w1");
-    d.rpc(
+    d.operator_rpc(
         "thread_send",
         json!({"alias": "w1", "text": "go", "message": "m1"}),
     )
@@ -2148,7 +2154,7 @@ fn cad323_claude_interrupt_mid_tool_reconciles_a_kickoff() {
     d.register_claude("w1", json!({"upstream": "pm"}));
     d.wait_agent("w1", "idle", 15);
     let pid = cad323_pid(&d, "w1");
-    d.rpc(
+    d.operator_rpc(
         "thread_send",
         json!({"alias": "w1", "text": "warm up", "message": "m0"}),
     )
@@ -2212,8 +2218,11 @@ fn cad323_claude_interrupt_mid_tool_reconciles_a_kickoff() {
     assert_eq!(states.len(), 2, "{states:?}");
     assert!(states.iter().all(|(_, s)| s == "interrupted"), "{states:?}");
     std::fs::write(format!("{}.mode", mock.pidfile.display()), "ok").unwrap();
-    d.send("w1", json!({"text": "next", "message": "m2"}))
-        .unwrap();
+    d.operator_rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "next", "message": "m2"}),
+    )
+    .unwrap();
     d.wait_message("w1", "m2", &["completed"], 20);
     assert_eq!(cad323_pid(&d, "w1"), pid, "the provider was relaunched");
     assert_eq!(cad323_messages(&d, "w1").len(), 3);
@@ -2229,7 +2238,7 @@ fn cad323_codex_interrupt_mid_text() {
     d.register_codex("w1");
     d.wait_agent("w1", "idle", 15);
     let pid = cad323_pid(&d, "w1");
-    d.rpc(
+    d.operator_rpc(
         "thread_send",
         json!({"alias": "w1", "text": "go", "message": "m1"}),
     )
@@ -2270,7 +2279,7 @@ fn cad323_codex_interrupt_mid_tool_records_partial_result() {
     d.register_codex("w1");
     d.wait_agent("w1", "idle", 15);
     let pid = cad323_pid(&d, "w1");
-    d.rpc(
+    d.operator_rpc(
         "thread_send",
         json!({"alias": "w1", "text": "go", "message": "m1"}),
     )
