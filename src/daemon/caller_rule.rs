@@ -317,6 +317,10 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         "workflow_approve",
         Rule::Handler("operator_connection (CAD-487)"),
     ),
+    (
+        "app_approve",
+        Rule::Handler("operator_connection (CAD-547)"),
+    ),
     // CAD-339: the master agent's verbs. `Shared::master_policy` runs
     // before this table for every method (the master's allowlist).
     (

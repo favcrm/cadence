@@ -920,7 +920,10 @@ export interface WorkflowInput {
  */
 export interface WorkflowRow {
   project: string;
+  /** Stored name, or `<app>/<workflow>` for an installed app's (CAD-547). */
   name: string;
+  /** The app an `<app>/<wf>` row comes from — absent on stored workflows. */
+  app?: string;
   title?: string | null;
   goal?: string | null;
   tickets?: number | null;

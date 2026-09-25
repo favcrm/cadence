@@ -117,9 +117,17 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     // CAD-496: the board relays `plan_propose` over its own daemon
     // connection, so the daemon attributes the run to whoever that
     // connection proves — operator-only, like `plan_approve`.
+    // CAD-547: `<app>/<wf>` names an installed app's workflow — an
+    // extra path segment, still the operator's call (unlisted writes
+    // would fail closed the same way; listed for the reader).
     route(
         "POST",
         "/api/projects/*/workflows/*/propose",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/projects/*/workflows/*/*/propose",
         RouteClass::OperatorOnly,
     ),
     route("POST", "/api/memories/*/*/accept", RouteClass::Refused),

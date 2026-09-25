@@ -120,6 +120,9 @@ function WorkflowCard({
         </button>
         <div className="flex flex-wrap items-center gap-1.5 mt-2">
           <span className={`chip ${approval.cls}`}>{approval.text}</span>
+          {row.app && (
+            <span className="chip bg-accent/10 text-accent">app {row.app}</span>
+          )}
           {typeof row.tickets === "number" && (
             <span className="chip bg-ink-800 text-ink-300">
               {row.tickets} ticket{row.tickets === 1 ? "" : "s"}

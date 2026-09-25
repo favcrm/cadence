@@ -5,6 +5,7 @@
 //! read/write front end over the same files plus agent-notes and the
 //! daemon socket.
 
+pub mod app;
 pub mod areas;
 pub mod board;
 pub mod claim;

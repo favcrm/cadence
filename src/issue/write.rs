@@ -517,6 +517,7 @@ pub fn create_plan(
     pm: &Pm,
     project_key: &str,
     doc: &crate::issue::plan::PlanDoc,
+    workflow: Option<&str>,
     actor: &str,
 ) -> Result<Value> {
     use crate::issue::plan::Dep;
@@ -545,6 +546,7 @@ pub fn create_plan(
         decided_by: None,
         decided_at: None,
         reason: None,
+        workflow: workflow.map(str::to_string),
         tickets: ids[1..].to_vec(),
     });
     epic_front.item_type = Some("epic".to_string());

@@ -5845,6 +5845,50 @@ pub fn wf_add(f: &PlanFixture, name: &str, text: &str) -> Value {
     out
 }
 
+// ---- CAD-547: installable apps ----
+
+/// An app bundle on disk under the fixture's scratch dir — `files` are
+/// `rel-path → text` (`app.md`, `workflows/<wf>.md`, `rubrics/<r>.md`,
+/// …) — answered as the source dir `app install` takes.
+pub fn app_src(f: &PlanFixture, name: &str, files: &[(&str, &str)]) -> PathBuf {
+    let dir = f.tmp.path().join(format!("app-{name}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (rel, text) in files {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, text).unwrap();
+    }
+    dir
+}
+
+/// The fixture app `studio`'s `app.md` — one declared `publish` slot.
+pub const APP_MD: &str = "---\napp: studio\ntitle: Content studio\nversion: 0.1.0\n\
+needs:\n  connections: [publish]\n---\n\n# Guide\n\nHow to run the studio.\n";
+
+/// `studio`'s one workflow — WF_TWO_STEP-shaped, its first ticket
+/// naming the declared slot in `uses:`.
+pub const APP_WF: &str = "---\ntitle: \"Run: {{title}}\"\ngoal: \"Ship {{title}}\"\n\
+inputs:\n  title: { ask: \"What change?\" }\n---\n\n\
+## Do {{title}}\nagent: dev-1\nsize: S\nuses: publish\n\n### Acceptance\n- [ ] done\n\n\
+## Check {{title}}\nagent: qa-1\ndepends_on: 1\n\n### Acceptance\n- [ ] verified\n";
+
+/// `app install` the fixture app `studio` (with a rubric) into `demo`
+/// — asserts success.
+pub fn app_install_studio(f: &PlanFixture) -> Value {
+    let src = app_src(
+        f,
+        "studio",
+        &[
+            ("app.md", APP_MD),
+            ("workflows/do-check.md", APP_WF),
+            ("rubrics/review.md", "check the work\n"),
+        ],
+    );
+    let (ok, out) = f.cli(&["app", "install", src.to_str().unwrap(), "--project", "demo"]);
+    assert!(ok, "app install studio: {out}");
+    out
+}
+
 /// The issue's body text (what follows the frontmatter).
 pub fn issue_body(f: &PlanFixture, id: &str) -> String {
     let text = std::fs::read_to_string(f.pm_dir.join("demo").join(id).join("issue.md")).unwrap();

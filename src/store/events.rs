@@ -32,6 +32,12 @@ pub const WORK_APPROVED_EVENT: &str = "project_work_approved";
 /// file's digest against the latest record.
 pub const WORKFLOW_APPROVED_EVENT: &str = "workflow_approved";
 
+/// CAD-547: an installed app's structural digest (manifest envelope +
+/// bindings + per-workflow gate keys + rubric/template content)
+/// approved by the operator — `plan propose --workflow <app>/<wf>`
+/// matches the installed digest against the latest record.
+pub const APP_APPROVED_EVENT: &str = "app_approved";
+
 /// An operator approved `action` on one exact head — see [`NewApproval`].
 pub const APPROVAL_RECORDED_EVENT: &str = "approval_recorded";
 
@@ -217,6 +223,38 @@ impl Store {
         let mut stmt =
             conn.prepare("SELECT payload FROM events WHERE alias=? AND kind=? ORDER BY seq")?;
         let mut rows = stmt.query(params![APPROVAL_STREAM, WORKFLOW_APPROVED_EVENT])?;
+        let mut out = std::collections::HashMap::new();
+        while let Some(row) = rows.next()? {
+            let raw: String = row.get(0)?;
+            let Ok(payload) = serde_json::from_str::<Value>(&raw) else {
+                continue;
+            };
+            match (payload["project"].as_str(), payload["name"].as_str()) {
+                (Some(p), Some(n)) => {
+                    out.insert(format!("{p}/{n}"), payload.clone());
+                }
+                _ => continue,
+            }
+        }
+        Ok(out)
+    }
+
+    /// CAD-547: record the operator's approval of an app's structural
+    /// digest (`project`, `name`, `digest`, `by`, `at`) on
+    /// [`APPROVAL_STREAM`], keyed `"<project>/<name>"` beside the
+    /// workflow approvals — a separate event kind, so a workflow named
+    /// `a` and an app named `a` never share a row.
+    pub fn record_app_approval(&self, payload: Value) -> Result<()> {
+        let conn = self.conn();
+        Self::event(&conn, APPROVAL_STREAM, APP_APPROVED_EVENT, payload)
+    }
+
+    /// CAD-547: the latest app approval per `"<project>/<name>"`.
+    pub fn app_approvals(&self) -> Result<std::collections::HashMap<String, Value>> {
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare("SELECT payload FROM events WHERE alias=? AND kind=? ORDER BY seq")?;
+        let mut rows = stmt.query(params![APPROVAL_STREAM, APP_APPROVED_EVENT])?;
         let mut out = std::collections::HashMap::new();
         while let Some(row) = rows.next()? {
             let raw: String = row.get(0)?;

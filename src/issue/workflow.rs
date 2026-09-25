@@ -301,14 +301,14 @@ fn placeholders(text: &str, inputs: &BTreeMap<String, InputSpec>) -> Result<()> 
 }
 
 /// Per-ticket metadata lines as `(key, value)` pairs, in file order.
-type TicketMetas = Vec<Vec<(String, String)>>;
+pub(crate) type TicketMetas = Vec<Vec<(String, String)>>;
 
 /// One `##` section's leading metadata: the `key: value` lines in
 /// [`TICKET_META_KEYS`] directly under the heading — the same rule
 /// `parse_ticket` applies to its own keys, extended with the
 /// workflow's extras. A `{{` in a `STATIC_META_KEYS` value refuses:
 /// the dependency graph and sizes must be checkable statically.
-fn ticket_meta(body: &str) -> Result<TicketMetas> {
+pub(crate) fn ticket_meta(body: &str) -> Result<TicketMetas> {
     let (_, sections) = split_sections(body);
     let mut out = Vec::with_capacity(sections.len());
     for (i, (heading, text)) in sections.iter().enumerate() {
