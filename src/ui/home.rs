@@ -415,3 +415,70 @@ pub(super) fn master_summary(
         Err(e) => rpc_err(&e, "master_summary"),
     }
 }
+
+/// `GET /api/outbox[?effect_id=]` (CAD-546) — the `local` platform's
+/// outbox listing, relayed through the daemon's operator-only
+/// `platform_outbox`. A GET carries no write guards, so the operator
+/// rule the write routes get from `operator::admit` is run here by
+/// hand, exactly: a live operator session on an unattributable caller
+/// ([`operator::board_caller`]) — on the public surface the verified
+/// `owner` role is the operator claim (CAD-526) — the positive peer
+/// proof ([`prove_operator_peer`]) for the loopback claim — the board
+/// is never less strict than the RPC it relays — and a board process
+/// the daemon itself accepts as operator ([`board_is_operator`]),
+/// since the relay crosses the daemon connection in the board's own
+/// name.
+pub(super) fn outbox(
+    request: &Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+    effect_id: Option<String>,
+) -> HttpResp {
+    match operator::board_caller(request, state_dir, opts, false) {
+        Ok(operator::Caller::Operator(_)) => {
+            if let Err(resp) = prove_operator_peer(request, state_dir, opts, "GET /api/outbox") {
+                return resp;
+            }
+        }
+        // CAD-526: the verified `owner` role is the operator claim on
+        // the public surface — the platform relay's peer is not a
+        // process this host can prove; a member never reads the ledger.
+        Ok(operator::Caller::Named(named)) => {
+            if !named.operator {
+                return guard_fail(
+                    "member_role",
+                    &format!(
+                        "GET /api/outbox needs the board owner's role — this session is \
+                         {}'s, mapped `member`",
+                        named.actor
+                    ),
+                );
+            }
+        }
+        Ok(operator::Caller::Agent(alias)) => {
+            return guard_fail(
+                "operator_only",
+                &format!(
+                    "GET /api/outbox is the operator's read — this request comes from \
+                     agent '{alias}'; read it from the operator's browser"
+                ),
+            );
+        }
+        Err(resp) => return resp,
+    }
+    if !board_is_operator(state_dir) {
+        return guard_fail(
+            "operator_proof",
+            "GET /api/outbox refused: this board process is not provably the \
+             operator's — the daemon would refuse its relay",
+        );
+    }
+    let params = match effect_id {
+        Some(eid) => json!({ "effect_id": eid }),
+        None => json!({}),
+    };
+    match client::rpc(state_dir, "platform_outbox", params) {
+        Ok(out) => json_response(out),
+        Err(e) => rpc_err(&e, "platform_outbox"),
+    }
+}

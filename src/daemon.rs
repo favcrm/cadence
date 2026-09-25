@@ -582,6 +582,10 @@ pub struct Shared {
     /// no reviewed table means no classification, so no call.
     platforms: effect_rpc::PlatformMap,
     effect_execute_gate: Option<effect_rpc::EffectExecuteGate>,
+    /// CAD-546: the `local` platform's outbox root — what
+    /// `platform_outbox` lists. Set by `platform::local::register`
+    /// alongside the adapter so the read serves what the write lands.
+    outbox_dir: Option<PathBuf>,
 }
 
 impl Shared {
@@ -674,6 +678,7 @@ impl Shared {
             platform_custody_lock: Mutex::new(()),
             platforms: opts.platforms.clone(),
             effect_execute_gate: opts.effect_execute_gate.clone(),
+            outbox_dir: opts.outbox_dir.clone(),
         });
         // Holds dropped by boot-time revalidation get their release
         // events now that the store-backed emitter exists.
@@ -2623,6 +2628,7 @@ impl Shared {
             "platform_call" => self.rpc_platform_call(params, peer_pid),
             "platform_effects" => self.rpc_platform_effects(params, peer_pid),
             "platform_effect_close" => self.rpc_platform_effect_close(params, peer_pid),
+            "platform_outbox" => self.rpc_platform_outbox(params, peer_pid),
             other => Err(Error::rejected(format!("Unknown method '{other}'"))),
         }
     }
@@ -10461,6 +10467,11 @@ pub struct ServeOptions {
     /// recorded, the run never starts, and a restart reconciles the
     /// row. Production leaves it unset (always executes).
     pub effect_execute_gate: Option<effect_rpc::EffectExecuteGate>,
+    /// CAD-546: the `local` platform's outbox root —
+    /// `platform_outbox` lists it. `platform::local::register` sets it
+    /// with the adapter; a daemon without the `local` platform leaves
+    /// it `None` and the read refuses.
+    pub outbox_dir: Option<PathBuf>,
 }
 
 /// What the CAD-484 checkup calls to dispatch a picked ticket to a
@@ -10709,7 +10720,12 @@ fn relaunch_agents(shared: &Arc<Shared>) -> Result<()> {
 
 /// Run the daemon in the foreground until `shutdown` or a signal.
 pub fn serve(state_dir: &Path) -> Result<()> {
-    serve_with(state_dir, ServeOptions::default())
+    let mut opts = ServeOptions::default();
+    // CAD-546: the built-in `local` platform rides the production
+    // daemon — no network, no credential; its `publish` send still
+    // stages and presses like every other adapter's.
+    crate::platform::local::register(state_dir, &mut opts);
+    serve_with(state_dir, opts)
 }
 
 /// `serve` with per-instance options — in-process test daemons pass

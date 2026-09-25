@@ -10,7 +10,16 @@ export function threadReader(alias: string): PageReader {
     before: (before, limit) => api.thread(alias, { before, limit }),
   };
 }
-import type { AgentsPayload, IssueCard, IssueDetail, MilestoneRow, Overview, Project, WorkflowRow } from "./types";
+import type {
+  AgentsPayload,
+  IssueCard,
+  IssueDetail,
+  MilestoneRow,
+  OutboxItem,
+  Overview,
+  Project,
+  WorkflowRow,
+} from "./types";
 
 /** The app's one query cache — every screen reads its stores from here. */
 export const cache = new QueryCache();
@@ -64,4 +73,12 @@ export const resources = {
     (project) => api.workflows(project).then((r) => r.workflows),
     { isEmpty: (rows) => rows.length === 0 },
   ),
+  /**
+   * `GET /api/outbox` — the `local` platform's published items (CAD-546).
+   * Operator-only: on an unsigned board the fetch fails and the screen
+   * shows its sign-in hint.
+   */
+  outbox: cache.resource<OutboxItem[]>("outbox", () => api.outbox().then((r) => r.items), {
+    isEmpty: (rows) => rows.length === 0,
+  }),
 };

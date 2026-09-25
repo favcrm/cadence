@@ -779,7 +779,7 @@ impl Shared {
                 }
             })
             .unwrap_or_default();
-        let body = format!(
+        let mut body = format!(
             "platform effect {} {}: {} on {}/{} — {}{}\npreview: {}",
             row.effect_id,
             state,
@@ -790,6 +790,19 @@ impl Shared {
             verified,
             row.preview,
         );
+        // An adapter may surface a board link in its result (CAD-546's
+        // local outbox does): relay it bounded, and only an http(s)
+        // URL is ever carried into a lane message.
+        if let Some(url) = row
+            .outcome
+            .as_ref()
+            .and_then(|o| o.get("result"))
+            .and_then(|r| r.get("board_url"))
+            .and_then(Value::as_str)
+            .filter(|u| u.len() <= 512 && (u.starts_with("https://") || u.starts_with("http://")))
+        {
+            body.push_str(&format!("\nboard: {url}"));
+        }
         let id = crate::proto::daemon_message_id("effect", &row.effect_id);
         // A `task` the call named that no longer exists must not drop
         // the outcome — retry untagged (the dedupe id is the same; the

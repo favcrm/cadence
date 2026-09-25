@@ -7,6 +7,7 @@ import Epics from "./features/projects/Epics";
 import Milestones from "./features/projects/Milestones";
 import Memory from "./features/settings/Memory";
 import ModelDefaults from "./features/settings/ModelDefaults";
+import Outbox from "./features/outbox/Outbox";
 import OverviewView from "./features/home/Overview";
 import Home from "./features/home/Home";
 import Context from "./features/projects/Context";
@@ -64,6 +65,7 @@ const SCREEN_LABEL: Record<Screen, string> = {
   overview: "overview",
   projects: "projects",
   agents: "agents",
+  outbox: "outbox",
   setup: "setup",
   settings: "settings",
   login: "sign in",
@@ -621,6 +623,7 @@ export default function App() {
             onRetry={() => void resources.agents.refresh()}
           />
         )}
+        {screen === "outbox" && <Outbox />}
         {screen === "setup" && (
           <Setup settingsHref={hrefFor({ screen: "settings", section: "models" })} readOnly={meta ? boardReadOnly : null} />
         )}

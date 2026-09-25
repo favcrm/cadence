@@ -12,6 +12,8 @@ import type {
   MilestoneRow,
   ModelDefaultsConfig,
   ModelDefaultsSnapshot,
+  OutboxDetail,
+  OutboxList,
   Overview,
   Project,
   ProjectContext,
@@ -309,6 +311,11 @@ export const api = {
   /** `GET /api/projects/<key>/workflows` — the project's stored workflows (CAD-496). */
   workflows: (project: string) =>
     get<WorkflowsPayload>(`/api/projects/${encodeURIComponent(project)}/workflows`),
+  /** `GET /api/outbox` — the `local` platform's published items (operator-only). */
+  outbox: () => get<OutboxList>("/api/outbox"),
+  /** `GET /api/outbox?effect_id=` — one item, rendered post included. */
+  outboxItem: (effectId: string) =>
+    get<OutboxDetail>(`/api/outbox?effect_id=${encodeURIComponent(effectId)}`),
   /**
    * `GET /api/projects/<key>/workflows/<name>/preview?inputs=<json>` —
    * what `plan propose --workflow` renders for these inputs. The query

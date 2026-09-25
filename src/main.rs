@@ -1939,6 +1939,13 @@ enum PlatformAction {
         #[arg(long)]
         agent: Option<String>,
     },
+    /// The `local` platform's outbox — the published items, or one
+    /// item's rendered post with `--effect-id` (CAD-546). Operator-only.
+    Outbox {
+        /// One item's detail — the rendered post included.
+        #[arg(long)]
+        effect_id: Option<String>,
+    },
     /// Cancel a staged send still `waiting`, or resolve a `reconcile`
     /// row after inspecting the platform (CAD-506). Agents close only
     /// their own waiting rows; the operator closes any.
@@ -7890,6 +7897,13 @@ fn run_platform(state_dir: &Path, action: &PlatformAction) -> Result<i32> {
                 None => json!({}),
             };
             print_json(&rpc("platform_effects", params)?);
+        }
+        PlatformAction::Outbox { effect_id } => {
+            let params = match effect_id {
+                Some(id) => json!({"effect_id": id}),
+                None => json!({}),
+            };
+            print_json(&rpc("platform_outbox", params)?);
         }
         PlatformAction::EffectClose {
             request,

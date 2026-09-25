@@ -9,6 +9,7 @@
 
 pub mod adapter;
 pub mod custody;
+pub mod local;
 
 pub use adapter::PlatformAdapter;
 

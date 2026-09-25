@@ -478,6 +478,12 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
              closes only its own waiting one (CAD-506)",
         ),
     ),
+    // CAD-546: the `local` platform's outbox ledger — the operator's
+    // read alone (the board's `/api/outbox` relays it, gated the same).
+    (
+        "platform_outbox",
+        Rule::Handler("operator_connection (CAD-546)"),
+    ),
 ];
 
 /// The rule for `method`; `None` for a method the daemon does not
