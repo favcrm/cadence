@@ -1372,7 +1372,7 @@ mod tests {
             let out = detect_checks(&with_master, &[master_login_check()]);
             assert_eq!(out[0].status, Status::Ok, "{:?}", out[0]);
             assert_eq!(out[0].fix, None, "{:?}", out[0]);
-            assert!(out[0].detail.contains("own login"), "{:?}", out[0]);
+            assert!(out[0].detail.contains("own claude login"), "{:?}", out[0]);
         } else {
             assert_eq!(out[0].status, Status::Ok, "{:?}", out[0]);
             assert!(out[0].detail.contains("--unconfined"), "{:?}", out[0]);

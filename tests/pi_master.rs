@@ -54,8 +54,20 @@ fn agent(alias: &str, params: Value) -> Agent {
 
 /// An adapter over fake-pi plus the channel its events land on.
 fn adapter(mode: &str, dir: &Path) -> (PiAdapter, mpsc::Receiver<(String, Value)>) {
+    adapter_env(mode, dir, &[])
+}
+
+fn adapter_env(
+    mode: &str,
+    dir: &Path,
+    own: &[(&str, String)],
+) -> (PiAdapter, mpsc::Receiver<(String, Value)>) {
     let env = ProviderEnv::default();
     env.set("CADENCE_PI_COMMAND", fake_pi(mode));
+    for (k, v) in own {
+        env.set(k, v.clone());
+    }
+    std::fs::create_dir_all(dir.join("logs")).unwrap();
     let (tx, rx) = mpsc::channel();
     let hooks = AdapterHooks {
         on_event: Box::new(move |method, params| {
@@ -63,7 +75,10 @@ fn adapter(mode: &str, dir: &Path) -> (PiAdapter, mpsc::Receiver<(String, Value)
         }),
         on_request: Box::new(|_| {}),
     };
-    (PiAdapter::new(hooks, &dir.join("pi-stderr.log"), &env), rx)
+    (
+        PiAdapter::new(hooks, &dir.join("logs").join("pi-stderr.log"), &env),
+        rx,
+    )
 }
 
 fn collect(rx: &mpsc::Receiver<(String, Value)>, wait: Duration) -> Vec<(String, Value)> {
@@ -409,6 +424,57 @@ fn confined_master_runs_fake_pi_under_the_policy() {
     pi.close();
 }
 
+/// CAD-322 round 3 (N1): the policy a confined Pi master actually gets
+/// is witnessed — `pi_master_confinement` emits the argv `open` feeds
+/// `cadence confine`. Its write set holds `master/pi` and never
+/// `master/claude`; its read set holds neither `master/claude` nor the
+/// operator's `~/.local/share/claude` (Claude's `home_read`). Mutation:
+/// pointing `provider_dir` at `claude_config_dir` fails this test.
+#[test]
+fn the_emitted_pi_policy_is_pis_own_dirs_never_claudes() {
+    let state = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let env = ProviderEnv::default();
+    env.set("CADENCE_PI_COMMAND", fake_pi("normal"));
+    env.set("HOME", home.path().to_string_lossy().to_string());
+    env.set(
+        "CADENCE_PM_DIR",
+        state.path().join("pm").to_string_lossy().to_string(),
+    );
+    let (_confine, policy) = cadence_agent::adapter::pi::pi_master_confinement(&env, state.path());
+    let pi_dir = state.path().join("master/pi");
+    let claude_dir = state.path().join("master/claude");
+    let claude_home = home.path().join(".local/share/claude");
+    let has = |set: &[std::path::PathBuf], dir: &Path| set.iter().any(|p| p.starts_with(dir));
+    assert!(
+        has(&policy.write, &pi_dir),
+        "write set lacks master/pi: {policy:?}"
+    );
+    assert!(
+        !has(&policy.write, &claude_dir),
+        "write set holds master/claude: {policy:?}"
+    );
+    assert!(
+        !has(&policy.read, &claude_dir),
+        "read set holds master/claude: {policy:?}"
+    );
+    assert!(
+        !has(&policy.read, &claude_home),
+        "read set holds ~/.local/share/claude: {policy:?}"
+    );
+    // `master/pi` is also never a read-only grant; the guard extension
+    // is the only extra read the provider sees.
+    assert_eq!(
+        policy
+            .read
+            .iter()
+            .filter(|p| p.starts_with(&pi_dir))
+            .count(),
+        0,
+        "master/pi is write-only: {policy:?}"
+    );
+}
+
 /// CAD-322 round 2 (I3): the master's provider starts from an EMPTY
 /// environment — credentials planted in the daemon's env (the review's
 /// names and neighbours) never reach the child; only the allowlist and
@@ -551,24 +617,39 @@ fn the_pi_guard_is_a_grammar_and_refuses_the_bypasses() {
     }
 }
 
-/// CAD-322 round 2 (I4): close → reopen → first turn. A stale EOF from
-/// the previous reader must never mark the reopened endpoint dead — the
-/// generation tag drops it, and the first turn after reopen completes.
+/// CAD-322 round 2/3 (I4): close → reopen → first turn, with the race
+/// actually open. The `linger` fake forks a grandchild that keeps the
+/// generation-1 stdout pipe open ~1.5 s after the parent exits, so
+/// `close()` returns while the old reader is still waiting for EOF —
+/// and the stale EOF lands inside generation 2's lifetime. The
+/// generation tag must drop it; without the tag the reopened session
+/// is marked dead and the first turn ends
+/// `OutcomeUnknown("Pi process exited before the turn settled")`.
 #[test]
 fn close_then_reopen_then_first_turn_completes() {
     let dir = tempfile::tempdir().unwrap();
-    let (pi, _rx) = adapter("normal", dir.path());
-    pi.open(&agent("dev-1", json!({}))).unwrap();
+    let (pi, _rx) = adapter("linger", dir.path());
+    let first = pi.open(&agent("dev-1", json!({}))).unwrap();
     pi.close();
+    // The parent is reaped but a grandchild still holds its stdout —
+    // the old reader has not seen EOF yet. Reopen inside that window.
+    let second = pi.open(&agent("dev-1", json!({}))).unwrap();
+    assert_ne!(first.thread_id, second.thread_id);
+    // Wait until the grandchild let the pipe go — the marker file is
+    // written the instant before — plus a beat for the stale EOF to
+    // reach the reader thread inside this generation's lifetime.
+    let marker = dir.path().join("linger-eof");
     for _ in 0..100 {
-        if pi.disconnected() {
+        if marker.exists() {
             break;
         }
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(50));
     }
-    assert!(pi.disconnected(), "the closed transport never observed EOF");
-    pi.open(&agent("dev-1", json!({}))).unwrap();
-    assert!(!pi.disconnected(), "stale EOF marked the new session dead");
+    assert!(
+        marker.exists(),
+        "the linger grandchild never released stdout"
+    );
+    std::thread::sleep(Duration::from_millis(200));
     let turn = pi.run_turn("after reopen", "m1", &|_| {}).unwrap();
     assert_eq!(turn.status, "completed");
     assert!(turn.text.contains("fake-pi reply"), "{}", turn.text);

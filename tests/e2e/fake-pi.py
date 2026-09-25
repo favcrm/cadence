@@ -21,6 +21,10 @@ Modes (argv[1]):
   observe a dead process, not hang.
 - `hang`: accepts the prompt, streams deltas, then never settles — the
   caller must abort (the turn then ends with stopReason "aborted").
+- `linger`: normal turns, but on stdin EOF the process forks — the
+  parent exits while a grandchild keeps the stdout pipe open ~1.5 s,
+  so the reader's EOF lands well after `close()` returned (the I4
+  reopen race).
 - `dialog`: emits a blocking `confirm` extension_ui_request at startup;
   the adapter must auto-cancel it (extension_ui_response, cancelled).
 
@@ -40,6 +44,7 @@ adapter's `get_state` verification is exercised.
 import json
 import os
 import sys
+import time
 
 LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
 MODE = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else "normal"
@@ -191,6 +196,20 @@ def main():
             respond(rid, "abort", True)
         else:
             respond(rid, rtype or "unknown", True)
+    # stdin hit EOF (the adapter's close_stdin). `linger` leaves a
+    # grandchild holding stdout open ~1.5 s after the parent exits —
+    # the reader's EOF then lands inside a reopened generation's
+    # lifetime (I4); other modes die at once. The grandchild writes a
+    # marker file the instant before it lets the pipe go, so the test
+    # can wait for the stale EOF deterministically instead of racing
+    # a fixed sleep.
+    if MODE == "linger" and os.fork() == 0:
+        time.sleep(1.5)
+        try:
+            open(os.path.join(os.environ["CADENCE_STATE_DIR"], "linger-eof"), "w").close()
+        except OSError:
+            pass
+    os._exit(0)
 
 
 if __name__ == "__main__":
