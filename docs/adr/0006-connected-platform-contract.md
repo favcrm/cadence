@@ -6,9 +6,10 @@
   trigger 3 wherever secret handling is built). This document is the
   contract they implement; it changes no code.
 - Date: proposed 2026-09-24; revised 2026-09-25 (r2) — applies the
-  operator's decision on §7 and the amendments recorded on CAD-365.
+  operator's decision on §7 and the amendments recorded on CAD-365;
+  revised 2026-09-25 (r3) — review amendments on PR #262.
 - Author: `swe-365` (devin worker), dispatched by `lane-pm`; r2 by
-  `swe-365b`.
+  `swe-365b`; r3 by `swe-365c`.
 - Deciders: the operator. CAD-365's second acceptance item — "Accepted
   by the operator" — is the operator's decision on this document. §7
   now records that decision (2026-09-25); the document stays
@@ -21,7 +22,7 @@
   fixture shared with Cadence P4", §5.6) and AOS-52 (the AgenticOS
   tool manifest, §5.2).
 - Code citations are pinned to
-  `7de54b5c673d394a1c0d8ffb5493d603115c1aca` (origin/main, 2026-09-24).
+  `4b59fa68adcf365ad45e008c8290c34416da18a4` (origin/main, 2026-09-25).
   Line numbers move; re-locate by symbol.
 
 ## 1. Context
@@ -411,7 +412,7 @@ durable row keyed by an `effect_id`.
 | `source_hash` | optional; the content hash of the reviewed source artifact the send derives from — editing the source after staging cancels the pending effect (step 3) |
 | `label` | optional; the platform's own effect class where it differs from cadence's (§5.2's AgenticOS mapping) — display only, never a gate input |
 | `effect_id` | the durable identity; one effect = one request = one execution |
-| `state` | `waiting` → `decided` → `executing` → `done` / `failed`, or `closed`, or `reconcile` |
+| `state` | `waiting` → `decided` → `executing` → `done` / `failed`; or `declined` (`decided` on `decline` — the effect never ran), or `closed`, or `reconcile` — distinct terminals per step 6 |
 | `decision` | `{by, at, reason?}` — `by` is `{member, role, rule}`, the verified presser; v1 `member` is the operator, `rule` `operator-only`. The shape leaves room for policy and team release (§6) without a format change |
 | `outcome` | `{result \| error, verified}` — the platform outcome, parked as the request answer and delivered as a message; `verified` is `true`/`false`/`unknown` from the adapter's read-back against the approved input (step 6) |
 
@@ -428,7 +429,11 @@ durable row keyed by an `effect_id`.
    open rides `request_open` from the agent's MCP bridge (already
    bound to the owning connection by CAD-376) or is created internally
    by the executor is CAD-366's choice; the representation is fixed by
-   this contract either way.
+   this contract either way. Either way, the §1.3 closes that retire
+   an ordinary brokered request — on actor exit and on the requester's
+   deadline — are waived for `kind:"effect"` however the request is
+   opened: the durable row, not the caller, owns the lifecycle
+   (step 7).
 2. **Surface.** `agent_requests` lists it; the overview/board row shows
    platform, tool, `label`, summary, the rendered `preview` and the
    input for review. What the press approves is *this input* — and,
@@ -469,8 +474,10 @@ durable row keyed by an `effect_id`.
    effect ran and failed) stays distinct from `declined` (it never
    ran) and from `closed`/`source_changed` (cancelled before release).
 7. **Deadline.** With asynchronous staging there may be no waiter: the
-   durable row owns the lifecycle, so a caller's deadline or exit ends
-   only its wait — the row stays `waiting` for a press, and a pending
+   durable row owns the lifecycle. The §1.3 `closed`-on-actor-exit and
+   `closed`-on-requester-deadline paths are waived for `kind:"effect"`
+   however the request is opened — a caller's deadline or exit ends
+   only its wait, the row stays `waiting` for a press, and a pending
    effect that outlives its usefulness is closed by `decline` or by
    credential revocation (§5.3), not by the caller going away. A
    boundary-parked answer still lands per the existing
