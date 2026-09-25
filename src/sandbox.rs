@@ -428,6 +428,46 @@ fn require_marker(sb: &Sandbox) -> Result<Value> {
 
 // ---------- port ----------
 
+/// A cooperating test suite fences board ports with an exclusive
+/// `flock` on `<dir>/<port>.lock` — `tests/setup.rs` leases 3110-3199
+/// there. Without it the free pick probes bindability only, and a port
+/// a test just leased — probe-bound, then released — can be stolen in
+/// the gap before its `ui run` binds; the thief then answers the
+/// test's requests. When the env names a dir the pick skips fenced
+/// ports, and the fence `choose_port` returns is held until `up`'s
+/// `ui start` has bound — neither side can take the other's port in
+/// its pick-to-bind window. Test-only: unset outside the suite.
+pub const TEST_PORT_LOCK_DIR: &str = "CADENCE_TEST_PORT_LOCK_DIR";
+
+/// The lease dir [`TEST_PORT_LOCK_DIR`] names — created when absent
+/// so the fence file can be opened in it.
+fn port_lock_dir() -> Option<PathBuf> {
+    let dir = std::env::var_os(TEST_PORT_LOCK_DIR).map(PathBuf::from)?;
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+/// `Ok(Some(f))` holds the port's lease until `f` drops; `Ok(None)`
+/// when no lease dir is configured; `Err` when the lock file cannot be
+/// opened or a cooperating process already holds the port's lease —
+/// either way the port is not ours to take.
+fn fenced_lease(lock_dir: &Option<PathBuf>, port: u16) -> std::io::Result<Option<std::fs::File>> {
+    let Some(dir) = lock_dir else {
+        return Ok(None);
+    };
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(format!("{port}.lock")))?;
+    use std::os::fd::AsRawFd;
+    // SAFETY: plain syscall on a descriptor this function owns.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(Some(lock))
+}
+
 fn bindable(port: u16) -> bool {
     TcpListener::bind(("127.0.0.1", port)).is_ok()
 }
@@ -440,17 +480,20 @@ fn persisted_port(state_dir: &Path) -> Option<u16> {
 }
 
 /// `--port` when given, else the sandbox's own last port, else the
-/// first bindable port in 3110-3199 that no other sandbox records.
-/// 3010 is production's in every case.
-fn choose_port(sb: &Sandbox, wanted: Option<u16>) -> Result<u16> {
+/// first bindable port in 3110-3199 that no other sandbox records and
+/// no lease fences. 3010 is production's in every case. The returned
+/// lease (when a lock dir is configured) is held until the caller
+/// drops it — `up` keeps it until the board has bound.
+fn choose_port(sb: &Sandbox, wanted: Option<u16>) -> Result<(u16, Option<std::fs::File>)> {
     let state = sb.state_dir();
     let running = crate::ui::detached_pid(&state)
         .is_some()
         .then(|| persisted_port(&state))
         .flatten();
+    let lock_dir = port_lock_dir();
     // Where the port came from decides the hint when it cannot be used:
     // only a `--port` the caller typed can be "omitted".
-    let (port, flag) = match (wanted, running) {
+    let (port, flag, mut fence) = match (wanted, running) {
         (Some(p), Some(r)) if p != r => {
             return Err(Error::rejected(format!(
                 "sandbox '{}' board is running on port {r} — \
@@ -458,22 +501,36 @@ fn choose_port(sb: &Sandbox, wanted: Option<u16>) -> Result<u16> {
                 sb.name, sb.name
             )))
         }
-        (Some(p), _) => (p, true),
-        (None, Some(r)) => (r, false),
+        (Some(p), _) => (p, true, None),
+        (None, Some(r)) => (r, false, None),
         (None, None) => match persisted_port(&state) {
-            Some(p) => (p, false),
+            Some(p) => (p, false, None),
             None => {
                 let taken = sandbox_roots(&sb.base)
                     .iter()
                     .filter_map(|root| persisted_port(&root.join("state")))
                     .collect::<Vec<_>>();
-                let free = PORTS
-                    .clone()
-                    .find(|p| !taken.contains(p) && bindable(*p))
-                    .ok_or_else(|| {
-                        Error::rejected("no free port in 3110-3199 — pass `--port <n>`")
-                    })?;
-                (free, false)
+                let mut free = None;
+                for port in PORTS {
+                    if taken.contains(&port) {
+                        continue;
+                    }
+                    let Ok(lease) = fenced_lease(&lock_dir, port) else {
+                        continue;
+                    };
+                    if bindable(port) {
+                        free = Some((port, lease));
+                        break;
+                    }
+                }
+                match free {
+                    Some((p, lease)) => (p, false, lease),
+                    None => {
+                        return Err(Error::rejected(
+                            "no free port in 3110-3199 — pass `--port <n>`",
+                        ))
+                    }
+                }
             }
         },
     };
@@ -488,12 +545,19 @@ fn choose_port(sb: &Sandbox, wanted: Option<u16>) -> Result<u16> {
             "port {PRODUCTION_UI_PORT} is the production board — {hint}"
         )));
     }
-    if running.is_none() && !bindable(port) {
-        return Err(Error::rejected(format!(
-            "port {port} is in use on 127.0.0.1 — {hint}"
-        )));
+    if running.is_none() {
+        if fence.is_none() {
+            fence = fenced_lease(&lock_dir, port).map_err(|_| {
+                Error::rejected(format!("port {port} is in use on 127.0.0.1 — {hint}"))
+            })?;
+        }
+        if !bindable(port) {
+            return Err(Error::rejected(format!(
+                "port {port} is in use on 127.0.0.1 — {hint}"
+            )));
+        }
     }
-    Ok(port)
+    Ok((port, fence))
 }
 
 /// Under a sandbox profile, refuse the production board's port — the
@@ -608,7 +672,10 @@ fn up(sb: &Sandbox, wanted_port: Option<u16>) -> Result<Value> {
             )))
         }
     }
-    let port = choose_port(sb, wanted_port)?;
+    // The chosen port's lease is held from the pick until `ui start`
+    // has bound the board: a cooperating suite can neither take the
+    // port we picked nor have its own leased port stolen in the gap.
+    let (port, _lease) = choose_port(sb, wanted_port)?;
     let exe = std::env::current_exe()?;
     std::fs::create_dir_all(sb.state_dir())?;
     {
@@ -954,5 +1021,22 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("127.0.0.1:3111"), "{text}");
+    }
+
+    /// The suite's port fence: a second opener on the same file is a
+    /// different open-file-description, so its `flock` contends like
+    /// another process's — no separate process needed.
+    #[test]
+    fn a_fenced_port_is_refused_until_the_lease_drops() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let lock_dir = Some(dir.path().to_path_buf());
+        // No dir configured: no protocol, nothing is held.
+        assert!(fenced_lease(&None, 3111).unwrap().is_none());
+        let held = fenced_lease(&lock_dir, 3111).unwrap();
+        assert!(held.is_some());
+        assert!(fenced_lease(&lock_dir, 3111).is_err());
+        assert!(fenced_lease(&lock_dir, 3112).unwrap().is_some());
+        drop(held);
+        assert!(fenced_lease(&lock_dir, 3111).unwrap().is_some());
     }
 }

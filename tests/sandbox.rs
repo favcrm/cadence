@@ -52,7 +52,14 @@ impl Host {
         cmd.args(args)
             .env("HOME", self.home())
             .env("XDG_STATE_HOME", self.xdg())
-            .env("CADENCE_SANDBOX_ROOT", self.base());
+            .env("CADENCE_SANDBOX_ROOT", self.base())
+            // `sandbox up`'s free pick shares 3110-3199 with the
+            // `tests/setup.rs` flock leases — honour them or the pick
+            // can steal a port a setup test just leased.
+            .env(
+                cadence_agent::sandbox::TEST_PORT_LOCK_DIR,
+                "/tmp/cadence-test-ports",
+            );
         for var in [
             "CADENCE_STATE_DIR",
             "CADENCE_PM_DIR",
