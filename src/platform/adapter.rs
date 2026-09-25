@@ -64,4 +64,16 @@ pub trait PlatformAdapter: Send + Sync {
     /// send pins it as `source_hash`; Execute re-verifies it before
     /// firing (§5.4 step 3).
     fn source_hash(&self, source: &str) -> Option<String>;
+
+    /// The reviewed artifact a send will release, named by the
+    /// adapter from the proven caller and its input when `input.source`
+    /// does not name one (CAD-553: `local` names the declared
+    /// attachment set it will read under the requester's worktree).
+    /// `None` implies nothing — the send stages unpinned. An implied
+    /// name rides the same `source_hash` pin and `source_changed`
+    /// close as a caller-declared one; the gate knows no adapter's
+    /// name format.
+    fn implied_source(&self, _agent: &str, _tool: &str, _input: &Value) -> Option<String> {
+        None
+    }
 }
