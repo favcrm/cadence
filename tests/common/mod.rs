@@ -7,6 +7,7 @@ use cadence_agent::adapter::ProviderEnv;
 use cadence_agent::client;
 use cadence_agent::daemon;
 use cadence_agent::store::Store;
+use serde::Serialize;
 use serde_json::json;
 use serde_json::Value;
 use std::io::BufRead;
@@ -195,6 +196,224 @@ impl OperatorOutput for std::process::Command {
     }
 }
 
+/// A `cli(&[args]) -> (ok, json)` closure for the issue/dispatch CLI
+/// fixtures: the cadence bin runs with `CADENCE_PM_DIR`/`HOME` bound, the
+/// test's own bin dir first on PATH (so a spawned `cadence` resolves),
+/// and the operator-proof call shape ([`OperatorOutput`]). Panics when the
+/// reply is not JSON.
+pub fn cadence_cli_json(
+    state: &Path,
+    pm_dir: &Path,
+    home: &Path,
+) -> impl Fn(&[&str]) -> (bool, Value) {
+    let (state, pm_dir, home) = (
+        state.to_path_buf(),
+        pm_dir.to_path_buf(),
+        home.to_path_buf(),
+    );
+    let bin_dir = Path::new(env!("CARGO_BIN_EXE_cadence"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    move |args: &[&str]| -> (bool, Value) {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+            .arg("--state-dir")
+            .arg(&state)
+            .args(args)
+            .env("CADENCE_PM_DIR", &pm_dir)
+            .env("HOME", &home)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin_dir.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env_remove("CADENCE_ALIAS")
+            .operator_output()
+            .unwrap();
+        let text = if out.stdout.is_empty() {
+            String::from_utf8_lossy(&out.stderr).to_string()
+        } else {
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+        (
+            out.status.success(),
+            serde_json::from_str(text.trim()).unwrap_or_else(|_| panic!("not json: {text}")),
+        )
+    }
+}
+
+/// The unwrapped sibling of [`cadence_cli_json`]: `cli_raw(&[args]) ->
+/// (exit_code, stdout, stderr)` for tests that want the streams split —
+/// e.g. an expected failure still needs its own assertion. Runs the bin
+/// as a plain child (`.output()`), not the operator-proof exec.
+pub fn cadence_cli_raw(
+    state: &Path,
+    pm_dir: &Path,
+    home: &Path,
+) -> impl Fn(&[&str]) -> (i32, String, String) {
+    let (state, pm_dir, home) = (
+        state.to_path_buf(),
+        pm_dir.to_path_buf(),
+        home.to_path_buf(),
+    );
+    let bin_dir = Path::new(env!("CARGO_BIN_EXE_cadence"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    move |args: &[&str]| -> (i32, String, String) {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+            .arg("--state-dir")
+            .arg(&state)
+            .args(args)
+            .env("CADENCE_PM_DIR", &pm_dir)
+            .env("HOME", &home)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin_dir.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env_remove("CADENCE_ALIAS")
+            .output()
+            .unwrap();
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    }
+}
+
+/// `git -C <dir> <args>` asserting success, echoing the args and stderr
+/// on failure — the verbatim inline closure of the dispatch lanes.
+pub fn git_ok() -> impl Fn(&Path, &[&str]) {
+    |dir: &Path, args: &[&str]| {
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
+}
+
+/// [`git_ok`]'s twin returning the trimmed stdout — for lanes that
+/// capture `rev-parse` output mid-setup.
+pub fn git_stdout() -> impl Fn(&Path, &[&str]) -> String {
+    |dir: &Path, args: &[&str]| -> String {
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&o.stderr)
+        );
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    }
+}
+
+/// Seed `agents` — `(alias, params, endpoint_kind, role)` tuples —
+/// through [`Store::register_agent`], all `provider: "fake"`,
+/// `sandbox: "read-only"`, no instructions/team/model. `extra` runs
+/// against the still-open store for lanes that seed more than agents
+/// (a fence, an extra registration). Returns the backing TempDir —
+/// keep it bound for the state's lifetime — and the state path.
+pub fn seeded_state(
+    agents: &[(&str, Option<&str>, &str, &str)],
+    extra: impl FnOnce(&Store, &str),
+) -> (TempDir, PathBuf) {
+    let seeded = TempDir::new().unwrap();
+    let state = seeded.path().to_path_buf();
+    {
+        let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
+        let cwd = state.to_str().unwrap().to_string();
+        for &(alias, params, kind, role) in agents {
+            store
+                .register_agent(&cadence_agent::store::NewAgent {
+                    alias,
+                    provider: "fake",
+                    endpoint_kind: kind,
+                    role,
+                    cwd: &cwd,
+                    sandbox: "read-only",
+                    instructions: None,
+                    params,
+                    team_role: None,
+                    model_policy: None,
+                })
+                .unwrap();
+        }
+        extra(&store, &cwd);
+    }
+    (seeded, state)
+}
+
+/// One TempDir holding the `pm`/`repo`/`home` dirs every dispatch CLI
+/// lane creates. Binding `CADENCE_PM_DIR` stays at the call site so its
+/// ordering against `TestDaemon::start_on` is unchanged.
+pub fn pm_lab_dirs() -> (TempDir, PathBuf, PathBuf, PathBuf) {
+    let tmp = TempDir::new().unwrap();
+    let (pm_dir, repo, home) = (
+        tmp.path().join("pm"),
+        tmp.path().join("repo"),
+        tmp.path().join("home"),
+    );
+    for dir in [&pm_dir, &repo, &home] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    (tmp, pm_dir, repo, home)
+}
+
+/// The one-file `f`/`x` repo the dispatch lanes bootstrap: `init -b
+/// main`, the `t@t`/`t` identity, `add -A`, `commit -qm init`. Runs
+/// through the caller's own `git` closure (assert variants differ per
+/// lane). `extra` fires between the write and the add — e.g. the
+/// CAD-95 lane plants a Cargo.toml + .gitignore there.
+pub fn git_f_repo<R>(repo: &Path, git: &dyn Fn(&Path, &[&str]) -> R, extra: impl FnOnce(&Path)) {
+    git(repo, &["init", "-b", "main"]);
+    git(repo, &["config", "user.email", "t@t"]);
+    git(repo, &["config", "user.name", "t"]);
+    std::fs::write(repo.join("f"), "x").unwrap();
+    extra(repo);
+    git(repo, &["add", "-A"]);
+    git(repo, &["commit", "-qm", "init"]);
+}
+
+/// `issue init` + `project add demo --prefix D --repo` — the tracker
+/// bootstrap shared by the dispatch lanes that hang work on `demo`.
+/// Assert arg text is verbatim from the inline originals — `&repo_s`
+/// is a needless borrow here, but the inventory requires the verbatim
+/// condition text, which named a `String` at the call sites.
+#[allow(clippy::needless_borrow)]
+pub fn demo_project_init(cli: &dyn Fn(&[&str]) -> (bool, Value), repo_s: &str) {
+    assert!(cli(&["issue", "init"]).0);
+    assert!(cli(&["issue", "project", "add", "demo", "--prefix", "D", "--repo", &repo_s,]).0);
+}
+
+/// One `issue new --project demo` per title. Only lanes that loop a
+/// `title` var can share it — a literal-title assert keeps its own text.
+pub fn demo_issue_news(cli: &dyn Fn(&[&str]) -> (bool, Value), titles: &[&str]) {
+    for &title in titles {
+        assert!(cli(&["issue", "new", title, "--project", "demo"]).0);
+    }
+}
+
 pub struct TestDaemon {
     pub dir: TempDir,
     pub state: PathBuf,
@@ -310,6 +529,30 @@ impl TestDaemon {
 
     pub fn rpc(&self, method: &str, params: Value) -> cadence_agent::Result<Value> {
         client::rpc(&self.state, method, params)
+    }
+
+    /// `agent_send` with `alias` merged into `fields` — the suite's
+    /// dominant call shape.
+    pub fn send(&self, alias: impl AsRef<str>, fields: Value) -> cadence_agent::Result<Value> {
+        let mut fields = fields.as_object().unwrap().clone();
+        fields.insert("alias".into(), json!(alias.as_ref()));
+        self.rpc("agent_send", Value::Object(fields))
+    }
+
+    /// `message_report` for turn `message` under `token` — every report
+    /// site carries exactly these four fields.
+    pub fn report(
+        &self,
+        message: &str,
+        token: &str,
+        kind: &str,
+        text: &str,
+    ) -> cadence_agent::Result<Value> {
+        self.rpc(
+            "message_report",
+            json!({"message": message, "token": token,
+                   "kind": kind, "text": text}),
+        )
     }
 
     /// `rpc` from a caller that is provably the operator however the
@@ -581,11 +824,8 @@ impl Get for Value {
 /// The DISCONNECT keyword makes the fake provider drop mid-turn — the
 /// message lands `unknown` and fences the agent.
 pub fn fence_agent(d: &TestDaemon, alias: &str, id: &str) {
-    d.rpc(
-        "agent_send",
-        json!({"alias": alias, "text": "DISCONNECT", "message": id}),
-    )
-    .unwrap();
+    d.send(alias, json!({"text": "DISCONNECT", "message": id}))
+        .unwrap();
     d.wait_message(alias, id, &["unknown"], 15);
     d.wait_agent(alias, "attention", 10);
 }
@@ -2555,11 +2795,7 @@ pub fn running_token(d: &TestDaemon, id: &str) -> String {
 /// a second task reports the first before the next can be claimed.
 pub fn pty_report_done(d: &TestDaemon, alias: &str, id: &str) {
     let token = pty_token(d, alias, id);
-    d.rpc(
-        "message_report",
-        json!({"message": id, "token": token, "kind": "result", "text": "done"}),
-    )
-    .unwrap();
+    d.report(id, &token, "result", "done").unwrap();
     d.wait_message(alias, id, &["completed"], 10);
 }
 
@@ -2600,10 +2836,7 @@ pub fn cad162_assert_refused(d: &TestDaemon, alias: &str, id: &str, token: &str,
     let before = cad162_message(d, alias, id);
     for kind in ["ack", "result"] {
         let err = d
-            .rpc(
-                "message_report",
-                json!({"message": id, "token": token, "kind": kind, "text": "forged"}),
-            )
+            .report(id, token, kind, "forged")
             .expect_err(&format!("{what}: {kind} with {token} accepted as current"));
         assert!(
             err.to_string().contains("stale endpoint generation"),
@@ -2938,11 +3171,8 @@ pub fn emit_park_phase_trace(d: &TestDaemon, test_name: &str, alias: &str, route
 /// routed delivery id once the worker's own turn has completed. The
 /// route and the completion commit together.
 pub fn route_worker_result(d: &TestDaemon, worker: &str, pm: &str, id: &str, text: &str) -> String {
-    d.rpc(
-        "agent_send",
-        json!({"alias": worker, "text": text, "message": id, "reply_to": pm}),
-    )
-    .unwrap();
+    d.send(worker, json!({"text": text, "message": id, "reply_to": pm}))
+        .unwrap();
     d.wait_message(worker, id, &["completed"], 15);
     d.rpc("agent_show", json!({"alias": pm})).unwrap()["messages"]
         .as_array()
@@ -3441,6 +3671,90 @@ impl TestDaemon {
             json!({"pm": pm, "job": job, "spec": spec, "spec_sha256": spec_sha}),
         )
         .unwrap()
+    }
+
+    /// `job_new` naming the `repo` it lands in.
+    pub fn job_new_repo(
+        &self,
+        pm: &str,
+        job: &str,
+        spec: &str,
+        spec_sha: &str,
+        repo: &str,
+    ) -> cadence_agent::Result<Value> {
+        self.rpc(
+            "job_new",
+            json!({"pm": pm, "job": job, "spec": spec,
+                   "spec_sha256": spec_sha, "repo": repo}),
+        )
+    }
+
+    /// `job_new` bound to a tracker `issue` id.
+    pub fn job_new_issue(
+        &self,
+        pm: &str,
+        job: &str,
+        spec: &str,
+        spec_sha: &str,
+        issue: &str,
+    ) -> cadence_agent::Result<Value> {
+        self.rpc(
+            "job_new",
+            json!({"pm": pm, "job": job, "spec": spec,
+                   "spec_sha256": spec_sha, "issue": issue}),
+        )
+    }
+
+    /// `agent_register` with explicit `provider`/`endpoint_kind`/`cwd`
+    /// — the suite's dominant raw register shape. `params` is a
+    /// serialized JSON string exactly as sites built it.
+    pub fn register_pc(
+        &self,
+        alias: &str,
+        provider: &str,
+        kind: &str,
+        cwd: &str,
+    ) -> cadence_agent::Result<Value> {
+        self.rpc(
+            "agent_register",
+            json!({"alias": alias, "provider": provider,
+                   "endpoint_kind": kind, "cwd": cwd}),
+        )
+    }
+
+    /// [`register_pc`](Self::register_pc) plus a serialized `params`
+    /// object for sites that wire upstreams or provider options.
+    pub fn register_pcp(
+        &self,
+        alias: &str,
+        provider: &str,
+        kind: &str,
+        cwd: &str,
+        params: &str,
+    ) -> cadence_agent::Result<Value> {
+        self.rpc(
+            "agent_register",
+            json!({"alias": alias, "provider": provider,
+                   "endpoint_kind": kind, "cwd": cwd, "params": params}),
+        )
+    }
+
+    /// `task_new` for a task assigned to `assignee` with an
+    /// `acceptance` gate — the dominant task_new call shape in the
+    /// suite. `acceptance` accepts any serializable value (string or
+    /// json array).
+    pub fn task_new_ac(
+        &self,
+        job: &str,
+        task: &str,
+        assignee: &str,
+        acceptance: impl Serialize,
+    ) -> cadence_agent::Result<Value> {
+        self.rpc(
+            "task_new",
+            json!({"job": job, "task": task,
+                   "assignee": assignee, "acceptance": acceptance}),
+        )
     }
 
     pub fn task_state(&self, task: &str) -> String {

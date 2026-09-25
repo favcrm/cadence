@@ -50,11 +50,12 @@ fn codex_quota_is_provider_bound_and_sparse_updates_handle_nullable_fields() {
     let d = TestDaemon::start();
     let _mock = d.mock_codex("quota-update");
     let cwd = d.dir.path().to_str().unwrap().to_string();
-    d.rpc(
-        "agent_register",
-        json!({"alias": "quota", "provider": "codex",
-               "endpoint_kind": "managed", "cwd": cwd,
-               "params": "{\"quota\":{\"state\":\"available\",\"used_percent\":100}}"}),
+    d.register_pcp(
+        "quota",
+        "codex",
+        "managed",
+        &cwd,
+        "{\"quota\":{\"state\":\"available\",\"used_percent\":100}}",
     )
     .unwrap();
     d.wait_agent("quota", "idle", 15);
@@ -78,9 +79,9 @@ fn codex_quota_is_provider_bound_and_sparse_updates_handle_nullable_fields() {
     assert_eq!(initial["params"]["quota"]["used_percent"], 100);
     assert_eq!(quota["used_percent"], Value::Null);
 
-    d.rpc(
-        "agent_send",
-        json!({"alias": "quota", "text": "clear", "message": "quota-explicit-null"}),
+    d.send(
+        "quota",
+        json!({"text": "clear", "message": "quota-explicit-null"}),
     )
     .unwrap();
     d.wait_message("quota", "quota-explicit-null", &["completed"], 15);
@@ -115,11 +116,8 @@ fn codex_quota_is_provider_bound_and_sparse_updates_handle_nullable_fields() {
         7
     );
 
-    d.rpc(
-        "agent_send",
-        json!({"alias": "quota", "text": "omit", "message": "quota-omitted"}),
-    )
-    .unwrap();
+    d.send("quota", json!({"text": "omit", "message": "quota-omitted"}))
+        .unwrap();
     d.wait_message("quota", "quota-omitted", &["completed"], 15);
     let updated = d.rpc("agent_show", json!({"alias": "quota"})).unwrap()["agent"].clone();
     let quota = &updated["quota"];
@@ -170,9 +168,9 @@ fn codex_quota_recovers_from_unavailable_to_available() {
     let initial = d.rpc("agent_show", json!({"alias": "recover"})).unwrap()["agent"].clone();
     assert_eq!(initial["quota"]["state"], "unavailable");
 
-    d.rpc(
-        "agent_send",
-        json!({"alias": "recover", "text": "refresh", "message": "quota-recover"}),
+    d.send(
+        "recover",
+        json!({"text": "refresh", "message": "quota-recover"}),
     )
     .unwrap();
     d.wait_message("recover", "quota-recover", &["completed"], 15);
@@ -190,11 +188,12 @@ fn codex_model_effort_are_validated_reported_and_replayed_on_resume() {
     let d = TestDaemon::start();
     let mock = d.mock_codex("ok");
     let cwd = d.dir.path().to_str().unwrap().to_string();
-    d.rpc(
-        "agent_register",
-        json!({"alias": "luna", "provider": "codex",
-               "endpoint_kind": "managed", "cwd": cwd,
-               "params": "{\"model\":\"gpt-5.6-luna\",\"effort\":\"max\"}"}),
+    d.register_pcp(
+        "luna",
+        "codex",
+        "managed",
+        &cwd,
+        "{\"model\":\"gpt-5.6-luna\",\"effort\":\"max\"}",
     )
     .unwrap();
     d.wait_agent("luna", "idle", 15);
@@ -228,11 +227,12 @@ fn codex_model_effort_pair_rejection_is_visible() {
     let d = TestDaemon::start();
     let _mock = d.mock_codex("ok");
     let cwd = d.dir.path().to_str().unwrap().to_string();
-    d.rpc(
-        "agent_register",
-        json!({"alias": "bad-luna", "provider": "codex",
-               "endpoint_kind": "managed", "cwd": cwd,
-               "params": "{\"model\":\"gpt-5.6-luna\",\"effort\":\"ultra\"}"}),
+    d.register_pcp(
+        "bad-luna",
+        "codex",
+        "managed",
+        &cwd,
+        "{\"model\":\"gpt-5.6-luna\",\"effort\":\"ultra\"}",
     )
     .unwrap();
     let agent = d.wait_agent("bad-luna", "attention", 15);
@@ -247,11 +247,12 @@ fn codex_model_availability_unknown_is_visible() {
     let d = TestDaemon::start();
     let _mock = d.mock_codex("bad-model-list");
     let cwd = d.dir.path().to_str().unwrap().to_string();
-    d.rpc(
-        "agent_register",
-        json!({"alias": "unknown-luna", "provider": "codex",
-               "endpoint_kind": "managed", "cwd": cwd,
-               "params": "{\"model\":\"gpt-5.6-luna\"}"}),
+    d.register_pcp(
+        "unknown-luna",
+        "codex",
+        "managed",
+        &cwd,
+        "{\"model\":\"gpt-5.6-luna\"}",
     )
     .unwrap();
     let agent = d.wait_agent("unknown-luna", "attention", 15);
@@ -265,11 +266,12 @@ fn codex_ws_model_effort_are_replayed_and_reported() {
     let d = TestDaemon::start();
     let mock = d.mock_codex_ws("ok");
     let cwd = d.dir.path().to_str().unwrap().to_string();
-    d.rpc(
-        "agent_register",
-        json!({"alias": "luna-ws", "provider": "codex",
-               "endpoint_kind": "managed-ws", "cwd": cwd,
-               "params": "{\"model\":\"gpt-5.6-luna\",\"effort\":\"max\"}"}),
+    d.register_pcp(
+        "luna-ws",
+        "codex",
+        "managed-ws",
+        &cwd,
+        "{\"model\":\"gpt-5.6-luna\",\"effort\":\"max\"}",
     )
     .unwrap();
     d.wait_agent("luna-ws", "idle", 15);
@@ -312,11 +314,12 @@ fn codex_approval_policy_rejected_at_register_and_next_launch() {
     // Register: a bogus value is refused before it lands on the row,
     // and the error names every accepted value.
     let err = d
-        .rpc(
-            "agent_register",
-            json!({"alias": "w1", "provider": "codex",
-                   "endpoint_kind": "managed", "cwd": cwd,
-                   "params": "{\"approval_policy\":\"bogus\"}"}),
+        .register_pcp(
+            "w1",
+            "codex",
+            "managed",
+            &cwd,
+            "{\"approval_policy\":\"bogus\"}",
         )
         .unwrap_err()
         .to_string();
@@ -474,11 +477,12 @@ fn codex_sandbox_values_reach_thread_start_and_are_reported() {
         );
     }
     // A configured policy is reported as configured.
-    d.rpc(
-        "agent_register",
-        json!({"alias": "wc", "provider": "codex",
-               "endpoint_kind": "managed", "cwd": cwd,
-               "params": "{\"approval_policy\":\"on-request\"}"}),
+    d.register_pcp(
+        "wc",
+        "codex",
+        "managed",
+        &cwd,
+        "{\"approval_policy\":\"on-request\"}",
     )
     .unwrap();
     d.wait_agent("wc", "idle", 15);
@@ -486,11 +490,7 @@ fn codex_sandbox_values_reach_thread_start_and_are_reported() {
     assert_eq!(agent["approval_policy"], "on-request", "{agent}");
     assert_eq!(agent["approval_policy_source"], "configured", "{agent}");
     // Providers without the setting report neither field.
-    d.rpc(
-        "agent_register",
-        json!({"alias": "f", "provider": "fake", "endpoint_kind": "fake", "cwd": cwd}),
-    )
-    .unwrap();
+    d.register_pc("f", "fake", "fake", &cwd).unwrap();
     let agent = d.rpc("agent_show", json!({"alias": "f"})).unwrap()["agent"].clone();
     assert!(agent["approval_policy"].is_null(), "{agent}");
     assert!(agent["approval_policy_source"].is_null(), "{agent}");
@@ -502,12 +502,8 @@ fn codex_cli_approval_policy_flag_roundtrips_through_resume() {
     let mock = d.mock_codex_ws("ok");
     let pm_repo = d.dir.path().join("pmrepo");
     git_repo(&pm_repo);
-    d.rpc(
-        "agent_register",
-        json!({"alias": "pm", "provider": "fake", "endpoint_kind": "fake",
-               "cwd": pm_repo}),
-    )
-    .unwrap();
+    d.register_pc("pm", "fake", "fake", pm_repo.to_str().unwrap())
+        .unwrap();
     d.wait_agent("pm", "idle", 10);
     let bin = env!("CARGO_BIN_EXE_cadence");
     let run = |args: &[&str]| {
@@ -601,11 +597,8 @@ fn transport_eof_fences_turn_quickly() {
     d.register_codex("w1");
     d.wait_agent("w1", "idle", 15);
     let began = Instant::now();
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "hi", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "hi", "message": "m1"}))
+        .unwrap();
     // EOF must reach the turn-completion wait; without propagation this
     // would sit on turn_cv until the 600s deadline.
     d.wait_message("w1", "m1", &["unknown"], 20);
@@ -622,11 +615,8 @@ fn stop_is_bounded_when_interrupt_is_ignored() {
     let mock = d.mock_codex("silent");
     d.register_codex("w1");
     d.wait_agent("w1", "idle", 15);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "hi", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "hi", "message": "m1"}))
+        .unwrap();
     d.wait_message("w1", "m1", &["running"], 15);
     let began = Instant::now();
     let stopped = d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
@@ -647,21 +637,15 @@ fn malformed_turn_start_is_unknown_not_failed() {
     let _mock = d.mock_codex("bad-turn");
     d.register_codex("w1");
     d.wait_agent("w1", "idle", 15);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "hi", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "hi", "message": "m1"}))
+        .unwrap();
     // Acknowledged but uncorrelatable: the provider may have started work,
     // so the attempt is fenced unknown — not a definitive failure.
     let m1 = d.wait_message("w1", "m1", &["unknown"], 20);
     assert!(m1["error"].as_str().unwrap().contains("no turn id"), "{m1}");
     d.wait_agent("w1", "attention", 10);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "later", "message": "m2"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "later", "message": "m2"}))
+        .unwrap();
     // CAD-184 kept sleep: absence window — no actor runs for a fenced or
     // stopped agent, so nothing records a refusal to poll for.
     thread::sleep(Duration::from_millis(500));
@@ -684,11 +668,8 @@ fn stop_on_fenced_agent_preserves_attention() {
     let d = TestDaemon::start();
     d.register("w1");
     d.wait_agent("w1", "idle", 10);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "DISCONNECT", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "DISCONNECT", "message": "m1"}))
+        .unwrap();
     let fenced = d.wait_agent("w1", "attention", 10);
     let reason = fenced["error"].clone();
     // Actor exit must keep the provider account. The generic review
@@ -737,11 +718,8 @@ fn concurrent_stops_are_idempotent() {
     let d = TestDaemon::start();
     d.register("w1");
     d.wait_agent("w1", "idle", 10);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "NEED_INPUT:x", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "NEED_INPUT:x", "message": "m1"}))
+        .unwrap();
     d.wait_agent("w1", "waiting_input", 10);
     let mut racers = Vec::new();
     for _ in 0..2 {
@@ -825,11 +803,8 @@ fn ws_disconnect_fences_turn_unknown() {
     d.register_codex_ws("w1");
     d.wait_agent("w1", "idle", 15);
     let began = Instant::now();
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "DIE now", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "DIE now", "message": "m1"}))
+        .unwrap();
     // Server closed the socket mid-turn: EOF must reach the wait fast.
     d.wait_message("w1", "m1", &["unknown"], 20);
     assert!(began.elapsed() < Duration::from_secs(20));
@@ -843,11 +818,8 @@ fn ws_stop_is_bounded_when_silent() {
     let mock = d.mock_codex_ws("silent");
     d.register_codex_ws("w1");
     d.wait_agent("w1", "idle", 15);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "hi", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "hi", "message": "m1"}))
+        .unwrap();
     d.wait_message("w1", "m1", &["running"], 15);
     let began = Instant::now();
     let stopped = d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
@@ -866,11 +838,8 @@ fn ws_approval_is_brokered() {
     let _mock = d.mock_codex_ws("ok");
     d.register_codex_ws("w1");
     d.wait_agent("w1", "idle", 15);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "NEED_INPUT:x", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "NEED_INPUT:x", "message": "m1"}))
+        .unwrap();
     d.wait_agent("w1", "waiting_input", 15);
     let requests = d
         .operator_rpc("agent_requests", json!({"alias": "w1"}))
@@ -926,12 +895,7 @@ fn ws_restart_resumes_thread_with_fresh_endpoint() {
     {
         let d = TestDaemon::start_on(state.clone());
         mock = d.mock_codex_ws_at(seeded.path(), "ok");
-        d.rpc(
-            "agent_register",
-            json!({"alias": "w1", "provider": "codex",
-                   "endpoint_kind": "managed-ws", "cwd": cwd}),
-        )
-        .unwrap();
+        d.register_pc("w1", "codex", "managed-ws", &cwd).unwrap();
         let first = d.wait_agent("w1", "idle", 15);
         first_endpoint = first["endpoint"].as_str().unwrap().to_string();
     }
@@ -1016,11 +980,8 @@ fn ws_close_frame_disconnect_fences_unknown() {
     d.register_codex_ws("w1");
     d.wait_agent("w1", "idle", 15);
     let began = Instant::now();
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "DIE2 now", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "DIE2 now", "message": "m1"}))
+        .unwrap();
     d.wait_message("w1", "m1", &["unknown"], 20);
     assert!(began.elapsed() < Duration::from_secs(20));
     d.wait_agent("w1", "attention", 10);
@@ -1058,11 +1019,8 @@ fn ws_external_approval_resolution_drops_pending() {
     let mock = d.mock_codex_ws("ok");
     d.register_codex_ws("w1");
     d.wait_agent("w1", "idle", 15);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "NEED_INPUT_EXT:x", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "NEED_INPUT_EXT:x", "message": "m1"}))
+        .unwrap();
     d.wait_agent("w1", "waiting_input", 15);
     let requests = d
         .operator_rpc("agent_requests", json!({"alias": "w1"}))
@@ -1149,11 +1107,8 @@ fn ws_concurrent_respond_has_single_winner() {
     let _mock = d.mock_codex_ws("ok");
     d.register_codex_ws("w1");
     d.wait_agent("w1", "idle", 15);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "NEED_INPUT:x", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "NEED_INPUT:x", "message": "m1"}))
+        .unwrap();
     d.wait_agent("w1", "waiting_input", 15);
     let requests = d
         .operator_rpc("agent_requests", json!({"alias": "w1"}))
@@ -1200,11 +1155,8 @@ fn ws_second_pending_request_keeps_waiting() {
     let _mock = d.mock_codex_ws("ok");
     d.register_codex_ws("w1");
     d.wait_agent("w1", "idle", 15);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "NEED_INPUT2:x", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "NEED_INPUT2:x", "message": "m1"}))
+        .unwrap();
     d.wait_agent("w1", "waiting_input", 15);
     let requests = d
         .operator_rpc("agent_requests", json!({"alias": "w1"}))
@@ -1257,20 +1209,13 @@ fn claude_managed_ack_keeps_running_until_the_turn_result() {
     let agent = d.wait_agent("w1", "idle", 15);
     let gen = agent["generation"].as_str().unwrap().to_string();
     assert!(!gen.is_empty(), "{agent}");
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "long task", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "long task", "message": "m1"}))
+        .unwrap();
     d.wait_message("w1", "m1", &["running"], 20);
     let token = running_token(&d, "m1");
     assert!(token.starts_with(&format!("claude-{gen}-")), "{token}");
 
-    d.rpc(
-        "message_report",
-        json!({"message": "m1", "token": token, "kind": "ack", "text": "understood"}),
-    )
-    .unwrap();
+    d.report("m1", &token, "ack", "understood").unwrap();
     let m = cad162_message(&d, "w1", "m1");
     assert_eq!(m["state"], "running", "{m}");
     assert_eq!(m["result"]["ack"]["text"], "understood", "{m}");
@@ -1285,10 +1230,7 @@ fn claude_managed_ack_keeps_running_until_the_turn_result() {
     );
 
     let err = d
-        .rpc(
-            "message_report",
-            json!({"message": "m1", "token": token, "kind": "result", "text": "done?"}),
-        )
+        .report("m1", &token, "result", "done?")
         .expect_err("a reported result must not race the managed turn result");
     assert!(err.to_string().contains("report `ack` only"), "{err}");
     assert_eq!(d.message_state("w1", "m1"), "running");
@@ -1309,11 +1251,8 @@ fn claude_managed_report_refuses_stale_generation_and_pty_token() {
     d.register_claude("w1", Value::Null);
     let agent = d.wait_agent("w1", "idle", 15);
     let gen = agent["generation"].as_str().unwrap().to_string();
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "task", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "task", "message": "m1"}))
+        .unwrap();
     d.wait_message("w1", "m1", &["running"], 20);
     let token = running_token(&d, "m1");
 
@@ -1357,9 +1296,9 @@ fn report_refused_on_endpoint_kinds_without_a_token_scheme() {
     }
     // Codex holds a real provider turn ("t-1") open.
     for alias in ["cx1", "cw1"] {
-        d.rpc(
-            "agent_send",
-            json!({"alias": alias, "text": "hold", "message": format!("m-{alias}")}),
+        d.send(
+            alias,
+            json!({"text": "hold", "message": format!("m-{alias}")}),
         )
         .unwrap();
         d.wait_message(alias, &format!("m-{alias}"), &["running"], 20);
@@ -1422,9 +1361,9 @@ fn claude_turn_completes_and_routes_to_inbox_pm() {
     assert_eq!(sid.len(), 36, "{sid}");
     assert_eq!(show["agent"]["endpoint_kind"], "managed");
     assert!(show["agent"]["endpoint"].is_null(), "{show}");
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "Reply with exactly: PONG", "message": "m1"}),
+    d.send(
+        "w1",
+        json!({"text": "Reply with exactly: PONG", "message": "m1"}),
     )
     .unwrap();
     let m1 = d.wait_message("w1", "m1", &["completed"], 20);
@@ -1462,11 +1401,8 @@ fn claude_result_routes_to_pty_pm() {
     d.wait_agent("w1", "idle", 15);
     // Claim the pty gate so the routed result may be pasted.
     d.rpc("agent_ready", json!({"alias": "pm"})).unwrap();
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "hi", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "hi", "message": "m1"}))
+        .unwrap();
     d.wait_message("w1", "m1", &["completed"], 20);
     // The routed copy on the PM pane completes on delivery (is_routed).
     let routed = {
@@ -1496,11 +1432,8 @@ fn claude_failed_result_fails_message() {
     let _mock = d.mock_claude("fail", None);
     d.register_claude("w1", Value::Null);
     d.wait_agent("w1", "idle", 15);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "hi", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "hi", "message": "m1"}))
+        .unwrap();
     // A clean provider-side error result is a definitive answer —
     // failed, never unknown.
     let m1 = d.wait_message("w1", "m1", &["failed"], 20);
@@ -1525,11 +1458,8 @@ fn claude_death_mid_turn_unknown_then_unfence_resume() {
         .as_str()
         .unwrap()
         .to_string();
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "hi", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "hi", "message": "m1"}))
+        .unwrap();
     // EOF before any result event — outcome unknowable, fail closed.
     d.wait_message("w1", "m1", &["unknown"], 20);
     d.wait_agent("w1", "attention", 10);
@@ -1549,11 +1479,8 @@ fn claude_death_mid_turn_unknown_then_unfence_resume() {
     // relaunched mock can still be booting, so `.argv` may still hold
     // the first launch's flags. A completed turn is the cause ordered
     // after the dump: init/result emits mean the script exec'd.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "again", "message": "m2"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "again", "message": "m2"}))
+        .unwrap();
     d.wait_message("w1", "m2", &["completed"], 20);
     // Resume relaunched on the SAME session id via --resume.
     let agent = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["agent"].clone();
@@ -1568,11 +1495,8 @@ fn claude_session_mismatch_fences_attention() {
     let _mock = d.mock_claude("bad-session", None);
     d.register_claude("w1", Value::Null);
     d.wait_agent("w1", "idle", 15);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "hi", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "hi", "message": "m1"}))
+        .unwrap();
     // init reported a foreign session — the turn fails and the agent
     // fences with session-mismatch wording.
     d.wait_agent("w1", "attention", 20);
@@ -1588,11 +1512,8 @@ fn claude_interrupt_yields_interrupted() {
     let _mock = d.mock_claude("await-interrupt", None);
     d.register_claude("w1", Value::Null);
     d.wait_agent("w1", "idle", 15);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "hi", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "hi", "message": "m1"}))
+        .unwrap();
     d.wait_message("w1", "m1", &["running"], 15);
     // Stop interrupts first: the mock emits an interrupted result, so
     // the message lands `interrupted` — never fenced unknown.
@@ -1607,11 +1528,8 @@ fn claude_denials_complete_with_event() {
     let _mock = d.mock_claude("deny", None);
     d.register_claude("w1", Value::Null);
     d.wait_agent("w1", "idle", 15);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "hi", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "hi", "message": "m1"}))
+        .unwrap();
     // permission_denials is not a failure — the turn still completes,
     // and the denial is recorded as an auditable event.
     d.wait_message("w1", "m1", &["completed"], 20);
@@ -1671,11 +1589,8 @@ fn claude_env_injected_and_scrubbed() {
     // The mock writes its env dump at process start, before any
     // protocol emit — `idle` only means the actor's transport opened.
     // A completed turn is the cause ordered after the dump.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "boot", "message": "m-env"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "boot", "message": "m-env"}))
+        .unwrap();
     d.wait_message("w1", "m-env", &["completed"], 20);
     let env = std::fs::read_to_string(mock.pidfile.with_extension("pid.env")).unwrap();
     assert!(env.contains("CADENCE_ALIAS=w1\n"), "{env}");
@@ -1719,11 +1634,8 @@ fn claude_params_replayed_on_resume() {
     // exec'd its script and written the argv dump yet under load. A
     // completed turn is the cause ordered after the dump: init/result
     // emits mean the script ran.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "boot", "message": "m-boot"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "boot", "message": "m-boot"}))
+        .unwrap();
     d.wait_message("w1", "m-boot", &["completed"], 20);
     let argv_file = mock.pidfile.with_extension("pid.argv");
     let argv1 = std::fs::read_to_string(&argv_file).unwrap();
@@ -1743,11 +1655,8 @@ fn claude_params_replayed_on_resume() {
     // Same spawn/write gap on the resumed generation — and the file
     // still holds the first launch's argv until the resumed mock
     // rewrites it. Another completed turn orders after the rewrite.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "boot2", "message": "m-boot2"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "boot2", "message": "m-boot2"}))
+        .unwrap();
     d.wait_message("w1", "m-boot2", &["completed"], 20);
     let argv2 = std::fs::read_to_string(&argv_file).unwrap();
     // Resume replays the same permission/model params verbatim and
@@ -1772,11 +1681,8 @@ fn claude_effort_next_launch_and_model_reported() {
     d.register_claude("w1", json!({"effort": "low"}));
     d.wait_agent("w1", "idle", 15);
     // A completed turn orders after the argv dump and the init event.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "boot", "message": "m-boot"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "boot", "message": "m-boot"}))
+        .unwrap();
     d.wait_message("w1", "m-boot", &["completed"], 20);
     let argv_file = mock.pidfile.with_extension("pid.argv");
     let argv1 = std::fs::read_to_string(&argv_file).unwrap();
@@ -1830,11 +1736,8 @@ fn claude_effort_next_launch_and_model_reported() {
     d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
     d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
     d.wait_agent("w1", "idle", 15);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "boot2", "message": "m-boot2"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "boot2", "message": "m-boot2"}))
+        .unwrap();
     d.wait_message("w1", "m-boot2", &["completed"], 20);
     let argv2 = std::fs::read_to_string(&argv_file).unwrap();
     assert!(argv2.contains("--resume\n"), "{argv2}");
@@ -1860,10 +1763,12 @@ fn claude_effort_validated() {
     let _mock = d.mock_claude("ok", None);
     let cwd = d.dir.path().to_str().unwrap().to_string();
     let err = d
-        .rpc(
-            "agent_register",
-            json!({"alias": "bad", "provider": "claude", "endpoint_kind": "managed",
-                   "cwd": cwd, "params": json!({"effort": "extreme"}).to_string()}),
+        .register_pcp(
+            "bad",
+            "claude",
+            "managed",
+            &cwd,
+            &json!({"effort": "extreme"}).to_string(),
         )
         .unwrap_err()
         .to_string();
@@ -1912,11 +1817,8 @@ fn claude_replay_fixture_turn() {
     let _mock = d.mock_claude("replay", Some(&fixture));
     d.register_claude("w1", Value::Null);
     d.wait_agent("w1", "idle", 15);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "hi", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "hi", "message": "m1"}))
+        .unwrap();
     let m1 = d.wait_message("w1", "m1", &["completed"], 20);
     assert_eq!(m1["result"]["text"], "PONG", "{m1}");
     // The real capture carries a cost figure — recorded as an event.
@@ -1935,11 +1837,8 @@ fn claude_replay_failed_fixture() {
     let _mock = d.mock_claude("replay", Some(&fixture));
     d.register_claude("w1", Value::Null);
     d.wait_agent("w1", "idle", 15);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "hi", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "hi", "message": "m1"}))
+        .unwrap();
     let m1 = d.wait_message("w1", "m1", &["failed"], 20);
     assert!(
         m1["result"]["error"]
@@ -1976,11 +1875,8 @@ fn claude_tool_use_events_recorded() {
     let _mock = d.mock_claude("tooluse", None);
     d.register_claude("w1", Value::Null);
     d.wait_agent("w1", "idle", 15);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "hi", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "hi", "message": "m1"}))
+        .unwrap();
     d.wait_message("w1", "m1", &["completed"], 20);
     // Lifecycle envelope: the tool name lands as a compact event —
     // no arguments, no transcript text.
@@ -1998,11 +1894,8 @@ fn claude_idle_window_counts_activity() {
     let _mock = d.mock_claude("heartbeat", None);
     d.register_claude("w1", json!({"turn_idle_secs": 2}));
     d.wait_agent("w1", "idle", 15);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "hi", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "hi", "message": "m1"}))
+        .unwrap();
     let m1 = d.wait_message("w1", "m1", &["completed"], 30);
     assert!(
         m1["result"]["text"]
@@ -2020,11 +1913,8 @@ fn claude_silent_turn_fences_unknown() {
     let _mock = d.mock_claude("silent", None);
     d.register_claude("w1", json!({"turn_idle_secs": 2}));
     d.wait_agent("w1", "idle", 15);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "hi", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "hi", "message": "m1"}))
+        .unwrap();
     let m1 = d.wait_message("w1", "m1", &["unknown"], 30);
     assert!(
         m1["error"]
@@ -2044,11 +1934,8 @@ fn claude_max_turn_fences_chatty() {
     let _mock = d.mock_claude("chatty", None);
     d.register_claude("w1", json!({"turn_idle_secs": 30, "turn_max_secs": 2}));
     d.wait_agent("w1", "idle", 15);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "hi", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "hi", "message": "m1"}))
+        .unwrap();
     let m1 = d.wait_message("w1", "m1", &["unknown"], 30);
     assert!(
         m1["error"].as_str().unwrap_or("").contains("turn_max_secs"),
@@ -2065,11 +1952,8 @@ fn codex_idle_window_counts_activity() {
     let _mock = d.mock_codex("heartbeat");
     d.register_codex_params("cx1", "managed", json!({"turn_idle_secs": 2}));
     d.wait_agent("cx1", "idle", 15);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "cx1", "text": "hi", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("cx1", json!({"text": "hi", "message": "m1"}))
+        .unwrap();
     let m1 = d.wait_message("cx1", "m1", &["completed"], 30);
     assert!(
         m1["result"]["text"]
@@ -2086,11 +1970,8 @@ fn codex_silent_turn_fences_after_idle_window() {
     let _mock = d.mock_codex("silent");
     d.register_codex_params("cx1", "managed", json!({"turn_idle_secs": 2}));
     d.wait_agent("cx1", "idle", 15);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "cx1", "text": "hi", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("cx1", json!({"text": "hi", "message": "m1"}))
+        .unwrap();
     let m1 = d.wait_message("cx1", "m1", &["unknown"], 30);
     assert!(
         m1["error"]
@@ -2124,11 +2005,8 @@ fn claude_brokered_permission_accept() {
     d.register_inbox("pm");
     d.register_claude("w1", json!({"upstream": "pm", "broker_approvals": true}));
     d.wait_agent("w1", "idle", 15);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "run ls", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "run ls", "message": "m1"}))
+        .unwrap();
     // The prompt surfaces as a request holding the agent in
     // waiting_input — the cause orders after the launch argv write.
     d.wait_agent("w1", "waiting_input", 15);
@@ -2244,11 +2122,8 @@ fn claude_brokered_permission_decline_with_reason() {
     broker_command();
     d.register_claude("w1", json!({"broker_approvals": true}));
     d.wait_agent("w1", "idle", 15);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "rm -rf /", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "rm -rf /", "message": "m1"}))
+        .unwrap();
     let req = d.wait_request("w1", 15);
     d.wait_agent("w1", "waiting_input", 15);
     // The operator's reason reaches the provider as the denial message.
@@ -2295,11 +2170,8 @@ fn claude_brokered_permission_timeout_denies() {
                "turn_idle_secs": 2}),
     );
     d.wait_agent("w1", "idle", 15);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "slow", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "slow", "message": "m1"}))
+        .unwrap();
     d.wait_agent("w1", "waiting_input", 15);
     d.wait_request("w1", 15);
     // Nobody responds: the broker's deadline denies the tool call and
@@ -2392,11 +2264,8 @@ fn claude_brokered_params_replayed_on_resume() {
     );
     d.wait_agent("w1", "idle", 15);
     // A completed turn is the cause ordered after the argv dump.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "boot", "message": "m-boot"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "boot", "message": "m-boot"}))
+        .unwrap();
     d.wait_agent("w1", "waiting_input", 15);
     // Answer it so the launch turn completes — one request only.
     let req = d.wait_request("w1", 10);
@@ -2440,11 +2309,8 @@ fn claude_brokered_params_replayed_on_resume() {
     d.wait_agent("w1", "idle", 15);
     // Resume replays the broker wiring verbatim — config regenerated,
     // same flags, resumed session.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "boot2", "message": "m-boot2"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "boot2", "message": "m-boot2"}))
+        .unwrap();
     d.wait_agent("w1", "waiting_input", 15);
     let req2 = d.wait_request("w1", 10);
     d.operator_rpc(
@@ -2500,12 +2366,12 @@ fn claude_brokered_flag_validation() {
         ),
     ] {
         let err = d
-            .rpc(
-                "agent_register",
-                json!({"alias": "bad", "provider": "claude",
-                       "endpoint_kind": "managed",
-                       "cwd": d.dir.path().to_str().unwrap(),
-                       "params": params.to_string()}),
+            .register_pcp(
+                "bad",
+                "claude",
+                "managed",
+                d.dir.path().to_str().unwrap(),
+                &params.to_string(),
             )
             .unwrap_err()
             .to_string();
@@ -2636,11 +2502,8 @@ fn model_defaults_register_resume_and_mock_argv() {
         String::from_utf8_lossy(&joined.stderr)
     );
     d.wait_agent("qa-cli", "idle", 20);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "qa-cli", "text": "boot", "message": "m-qa"}),
-    )
-    .unwrap();
+    d.send("qa-cli", json!({"text": "boot", "message": "m-qa"}))
+        .unwrap();
     d.wait_message("qa-cli", "m-qa", &["completed"], 20);
     let argv_file = mock.pidfile.with_extension("pid.argv");
     let argv = std::fs::read_to_string(&argv_file).unwrap();
@@ -2682,11 +2545,8 @@ fn model_defaults_register_resume_and_mock_argv() {
         String::from_utf8_lossy(&explicit.stderr)
     );
     d.wait_agent("explicit", "idle", 20);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "explicit", "text": "boot", "message": "m-ex"}),
-    )
-    .unwrap();
+    d.send("explicit", json!({"text": "boot", "message": "m-ex"}))
+        .unwrap();
     d.wait_message("explicit", "m-ex", &["completed"], 20);
     let argv = std::fs::read_to_string(&argv_file).unwrap();
     assert!(argv.contains("--model\nexplicit-model"), "{argv}");
@@ -2700,11 +2560,8 @@ fn model_defaults_register_resume_and_mock_argv() {
     d.rpc("agent_stop", json!({"alias": "qa-cli"})).unwrap();
     d.rpc("agent_resume", json!({"alias": "qa-cli"})).unwrap();
     d.wait_agent("qa-cli", "idle", 20);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "qa-cli", "text": "again", "message": "m-resume"}),
-    )
-    .unwrap();
+    d.send("qa-cli", json!({"text": "again", "message": "m-resume"}))
+        .unwrap();
     d.wait_message("qa-cli", "m-resume", &["completed"], 20);
     let argv = std::fs::read_to_string(&argv_file).unwrap();
     assert!(argv.contains("--model\nqa-model"), "{argv}");
@@ -2716,11 +2573,8 @@ fn model_defaults_register_resume_and_mock_argv() {
     )
     .unwrap();
     d.wait_agent("fresh", "idle", 20);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "fresh", "text": "boot", "message": "m-fresh"}),
-    )
-    .unwrap();
+    d.send("fresh", json!({"text": "boot", "message": "m-fresh"}))
+        .unwrap();
     d.wait_message("fresh", "m-fresh", &["completed"], 20);
     let argv = std::fs::read_to_string(&argv_file).unwrap();
     assert!(argv.contains("--model\nbaseline-b"), "{argv}");
@@ -2739,11 +2593,8 @@ fn model_defaults_register_resume_and_mock_argv() {
     d.rpc("agent_stop", json!({"alias": "fresh"})).unwrap();
     d.rpc("agent_resume", json!({"alias": "fresh"})).unwrap();
     d.wait_agent("fresh", "idle", 20);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "fresh", "text": "native", "message": "m-native"}),
-    )
-    .unwrap();
+    d.send("fresh", json!({"text": "native", "message": "m-native"}))
+        .unwrap();
     d.wait_message("fresh", "m-native", &["completed"], 20);
     let argv = std::fs::read_to_string(&argv_file).unwrap();
     assert!(!argv.contains("--model"), "{argv}");

@@ -9,8 +9,6 @@ mod common;
 use common::*;
 
 use cadence_agent::client;
-use cadence_agent::store::NewAgent;
-use cadence_agent::store::Store;
 use cadence_agent::store::Take;
 use serde_json::json;
 use serde_json::Value;
@@ -967,10 +965,11 @@ fn plan_gate_refuses_job_dispatch_until_approved() {
                    "issue": issue, "repo": project}),
         )
         .unwrap();
-        d.rpc(
-            "task_new",
-            json!({"job": job, "task": format!("{job}-t"), "assignee": "w1",
-                   "acceptance": "the plan ticket's criterion"}),
+        d.task_new_ac(
+            job,
+            &format!("{job}-t"),
+            "w1",
+            "the plan ticket's criterion",
         )
         .unwrap();
     }
@@ -2225,11 +2224,8 @@ fn cad324_continuity_packs_on_new_compacted_and_lost_sessions() {
     // An agent with no thread never gets a pack.
     f.d.register("other");
     f.d.wait_agent("other", "idle", 15);
-    f.d.rpc(
-        "agent_send",
-        json!({"alias": "other", "text": "no chat", "message": "o1"}),
-    )
-    .unwrap();
+    f.d.send("other", json!({"text": "no chat", "message": "o1"}))
+        .unwrap();
     assert_eq!(result_text(&f.d, "other", "o1"), "FAKE_REPLY: no chat");
     assert!(events_of_kind(&f.d, "other", "continuity_pack").is_empty());
 
@@ -2335,11 +2331,8 @@ fn cad324_continuity_packs_on_new_compacted_and_lost_sessions() {
         ("r1", "first after resume"),
         ("r2", "queued-later-9c2"),
     ] {
-        f.d.rpc(
-            "agent_send",
-            json!({"alias": "lead", "text": text, "message": id}),
-        )
-        .unwrap();
+        f.d.send("lead", json!({"text": text, "message": id}))
+            .unwrap();
     }
     f.d.rpc("message_cancel", json!({"message": "w-x"}))
         .unwrap();
@@ -2373,25 +2366,7 @@ fn cad324_continuity_packs_on_new_compacted_and_lost_sessions() {
 /// carries the pack, once.
 #[test]
 fn cad324_compaction_pack_survives_a_daemon_restart() {
-    let seeded = TempDir::new().unwrap();
-    let state = seeded.path().to_path_buf();
-    {
-        let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
-        let cwd = state.to_str().unwrap().to_string();
-        store
-            .register_agent(&NewAgent {
-                alias: "lead",
-                provider: "fake",
-                endpoint_kind: "fake",
-                role: "worker",
-                cwd: &cwd,
-                sandbox: "read-only",
-                instructions: None,
-                params: None,
-                team_role: None,
-                model_policy: None,
-            })
-            .unwrap();
+    let (_seeded, state) = seeded_state(&[("lead", None, "fake", "worker")], |store, _cwd| {
         // The fake's own session id: the reopen is the same session.
         store
             .set_identity(
@@ -2430,7 +2405,7 @@ fn cad324_compaction_pack_survives_a_daemon_restart() {
                 },
             )
             .unwrap();
-    }
+    });
     // The restarted daemon reopens the agent's stored session itself.
     let d = TestDaemon::start_on(state);
     d.wait_agent("lead", "idle", 15);
@@ -3064,11 +3039,8 @@ fn cad378_dispatch_record_binds_the_kickoff_not_the_request() {
     }
     // Every dishonest message is refused. A plain send — no lane tags,
     // just mail.
-    f.d.operator_rpc(
-        "agent_send",
-        json!({"alias": "w-1", "text": "just mail", "message": "m-mail"}),
-    )
-    .unwrap();
+    f.d.send("w-1", json!({"text": "just mail", "message": "m-mail"}))
+        .unwrap();
     // A genuine dispatch_send kickoff for another issue — daemon-tagged
     // D-2, so it can never anchor D-1's record.
     let (ok, out) = f.cli(&["issue", "new", "Other", "--project", "demo"]);

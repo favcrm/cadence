@@ -9,8 +9,6 @@ mod common;
 use common::*;
 
 use cadence_agent::daemon;
-use cadence_agent::store::NewAgent;
-use cadence_agent::store::Store;
 use cadence_agent::store::Take;
 use serde_json::json;
 use serde_json::Value;
@@ -25,36 +23,22 @@ use tempfile::TempDir;
 #[test]
 fn daemon_restart_skips_fenced_and_relaunches_healthy() {
     // Seed: one agent mid-flight (crash → unknown fence) + one healthy.
-    let seeded = TempDir::new().unwrap();
-    let state = seeded.path().to_path_buf();
-    {
-        let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
-        let cwd = state.to_str().unwrap().to_string();
-        for alias in ["fenced", "healthy"] {
-            store
-                .register_agent(&NewAgent {
-                    alias,
-                    provider: "fake",
-                    endpoint_kind: "fake",
-                    role: "worker",
-                    cwd: &cwd,
-                    sandbox: "read-only",
-                    instructions: None,
-                    params: None,
-                    team_role: None,
-                    model_policy: None,
-                })
-                .unwrap();
-        }
-        store.set_agent_state("fenced", "idle", None).unwrap();
-        store.set_agent_state("healthy", "idle", None).unwrap();
-        store.enqueue("fenced", "work", None, "m1", "user").unwrap();
-        match store.take_queued("fenced").unwrap() {
-            Take::Message(m) => assert_eq!(m.id, "m1"),
-            _ => panic!("expected a message"),
-        }
-        // Store dropped mid-flight — the crash this daemon recovers.
-    }
+    let (_seeded, state) = seeded_state(
+        &[
+            ("fenced", None, "fake", "worker"),
+            ("healthy", None, "fake", "worker"),
+        ],
+        |store, _cwd| {
+            store.set_agent_state("fenced", "idle", None).unwrap();
+            store.set_agent_state("healthy", "idle", None).unwrap();
+            store.enqueue("fenced", "work", None, "m1", "user").unwrap();
+            match store.take_queued("fenced").unwrap() {
+                Take::Message(m) => assert_eq!(m.id, "m1"),
+                _ => panic!("expected a message"),
+            }
+            // Store dropped mid-flight — the crash this daemon recovers.
+        },
+    );
     let d = TestDaemon::start_on(state);
     // Healthy relaunched; the fenced one was skipped, still attention.
     d.wait_agent("healthy", "idle", 15);
@@ -67,11 +51,8 @@ fn daemon_restart_skips_fenced_and_relaunches_healthy() {
         kinds.iter().any(|k| k == "relaunch_skipped"),
         "events: {kinds:?}"
     );
-    d.rpc(
-        "agent_send",
-        json!({"alias": "fenced", "text": "later", "message": "m2"}),
-    )
-    .unwrap();
+    d.send("fenced", json!({"text": "later", "message": "m2"}))
+        .unwrap();
     // CAD-184 kept sleep: absence window — no actor runs for a fenced or
     // stopped agent, so nothing records a refusal to poll for.
     thread::sleep(Duration::from_secs(1));
@@ -100,11 +81,8 @@ fn daemon_restart_reports_fenced_turn() {
     d.register_devin("dv1", None);
     d.wait_agent("dv1", "idle", 20);
     d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
-    d.rpc(
-        "agent_send",
-        json!({"alias": "dv1", "text": "task", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("dv1", json!({"text": "task", "message": "m1"}))
+        .unwrap();
     let _token = pty_token(&d, "dv1", "m1");
     let pane_pid: i32 = std::fs::read_to_string(d.pane_file(&mock, "dv1", "pid"))
         .unwrap()
@@ -140,11 +118,8 @@ fn daemon_restart_reports_kept_turn() {
     d.register_devin("dv", None);
     d.wait_agent("dv", "idle", 20);
     d.rpc("agent_ready", json!({"alias": "dv"})).unwrap();
-    d.rpc(
-        "agent_send",
-        json!({"alias": "dv", "text": "task", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("dv", json!({"text": "task", "message": "m1"}))
+        .unwrap();
     let token = pty_token(&d, "dv", "m1");
     let home = TempDir::new().unwrap();
     hold_rollout_lease(home.path(), &d.state);
@@ -163,12 +138,7 @@ fn daemon_restart_reports_kept_turn() {
     assert!(stdout.contains("kept"), "{stdout}");
     // The restarted daemon adopted the turn — its token completes.
     assert_eq!(d.message_state("dv", "m1"), "running");
-    d.rpc(
-        "message_report",
-        json!({"message": "m1", "token": token, "kind": "result",
-               "text": "done"}),
-    )
-    .unwrap();
+    d.report("m1", &token, "result", "done").unwrap();
     d.wait_message("dv", "m1", &["completed"], 15);
     let stop = operator_cadence_at(home.path(), &d.state, &["daemon", "stop"]);
     assert!(stop.status.success());
@@ -1164,11 +1134,8 @@ fn auto_stop_idle_agent_stops_with_event_label_and_resumes() {
     d.register_inbox("pm");
     register_fake_opts(&d, "w1", json!({"upstream": "pm"}));
     d.wait_agent("w1", "idle", 20);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "hello", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "hello", "message": "m1"}))
+        .unwrap();
     d.wait_message("w1", "m1", &["completed"], 20);
     let status = auto_stop_status(&d);
     assert_eq!(status["enabled"], true, "{status}");
@@ -1255,11 +1222,8 @@ fn auto_stop_idle_agent_stops_with_event_label_and_resumes() {
     let why = status["last_kept"]["w1"].as_str().unwrap();
     assert!(why.starts_with("idle "), "{status}");
     assert_eq!(d.wait_agent("w1", "idle", 5)["state"], "idle");
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "again", "message": "m2"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "again", "message": "m2"}))
+        .unwrap();
     d.wait_message("w1", "m2", &["completed"], 20);
 }
 
@@ -1310,11 +1274,8 @@ fn auto_stop_keeps_pm_inbox_opted_out_and_busy_agents() {
         .to_string()
         .contains("only applies to endpoints with an actor"));
     // A turn held open: busy for the whole check.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w-busy", "text": "SLEEP:30", "message": "hold"}),
-    )
-    .unwrap();
+    d.send("w-busy", json!({"text": "SLEEP:30", "message": "hold"}))
+        .unwrap();
     d.wait_message("w-busy", "hold", &["running"], 20);
 
     offset.store(7200, std::sync::atomic::Ordering::SeqCst);
@@ -1454,11 +1415,8 @@ fn auto_resume_after_restart_only_for_the_timers_stop() {
         assert_eq!(d.wait_agent(alias, "stopped", 10)["state"], "stopped");
     }
     for (alias, id) in [("w-op", "m-op"), ("w-both", "m-both"), ("w-auto", "m-auto")] {
-        d.rpc(
-            "agent_send",
-            json!({"alias": alias, "text": "work", "message": id}),
-        )
-        .unwrap();
+        d.send(alias, json!({"text": "work", "message": id}))
+            .unwrap();
     }
     // The auto-stopped agent resumes on its saved thread and delivers.
     let done = d.wait_message("w-auto", "m-auto", &["completed"], 20);

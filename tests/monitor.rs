@@ -195,18 +195,10 @@ fn monitor_check_failure_is_degraded_without_healthy_claim() {
     d.wait_agent("w1", "idle", 10);
     let (spec, sha) = d.spec_file("degraded-monitor.md", "check failure");
     let project = d.dir.path().to_str().unwrap().to_string();
-    d.rpc(
-        "job_new",
-        json!({"pm": "pm", "job": "badjob", "spec": spec,
-               "spec_sha256": sha, "repo": project}),
-    )
-    .unwrap();
-    d.rpc(
-        "task_new",
-        json!({"job": "badjob", "task": "badjob-watch", "assignee": "w1",
-               "acceptance": "observe failures"}),
-    )
-    .unwrap();
+    d.job_new_repo("pm", "badjob", &spec, &sha, &project)
+        .unwrap();
+    d.task_new_ac("badjob", "badjob-watch", "w1", "observe failures")
+        .unwrap();
     d.rpc(
         "monitor_register",
         json!({"monitor": "bad", "project": project, "owner": "operator",
@@ -281,18 +273,9 @@ fn monitor_persists_coverage_heartbeats_and_deduplicates_alerts() {
     d.wait_agent("w1", "idle", 10);
     let (spec, sha) = d.spec_file("monitor-spec.md", "watch this task");
     let project = d.dir.path().to_str().unwrap().to_string();
-    d.rpc(
-        "job_new",
-        json!({"pm": "pm", "job": "mjob", "spec": spec,
-               "spec_sha256": sha, "repo": project}),
-    )
-    .unwrap();
-    d.rpc(
-        "task_new",
-        json!({"job": "mjob", "task": "mjob-watch", "assignee": "w1",
-               "acceptance": "observe the task"}),
-    )
-    .unwrap();
+    d.job_new_repo("pm", "mjob", &spec, &sha, &project).unwrap();
+    d.task_new_ac("mjob", "mjob-watch", "w1", "observe the task")
+        .unwrap();
     let registered = d
         .rpc(
             "monitor_register",
@@ -400,16 +383,13 @@ fn monitor_alerts_task_unknown_outcome_is_scoped_and_restart_safe() {
     d.wait_agent("w1", "idle", 10);
     let (spec, sha) = d.spec_file("unknown-monitor-spec.md", "inspect uncertain work");
     let project = d.dir.path().to_str().unwrap().to_string();
-    d.rpc(
-        "job_new",
-        json!({"pm": "pm", "job": "unknown-job", "spec": spec,
-               "spec_sha256": sha, "repo": project}),
-    )
-    .unwrap();
-    d.rpc(
-        "task_new",
-        json!({"job": "unknown-job", "task": "unknown-task", "assignee": "w1",
-               "acceptance": "inspect uncertain work"}),
+    d.job_new_repo("pm", "unknown-job", &spec, &sha, &project)
+        .unwrap();
+    d.task_new_ac(
+        "unknown-job",
+        "unknown-task",
+        "w1",
+        "inspect uncertain work",
     )
     .unwrap();
     d.rpc(
@@ -489,11 +469,8 @@ fn monitor_alerts_task_unknown_outcome_is_scoped_and_restart_safe() {
     assert_eq!(task["revision"], 1, "{task}");
     assert!(task["head_sha"].is_null(), "{task}");
     d.wait_agent("w1", "attention", 10);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "after", "message": "after-unknown"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "after", "message": "after-unknown"}))
+        .unwrap();
     // CAD-184 kept sleep: absence window — no actor runs for a fenced or
     // stopped agent, so nothing records a refusal to poll for.
     thread::sleep(Duration::from_millis(400));
@@ -674,24 +651,11 @@ fn monitor_dispatch_requires_explicit_safe_eligibility() {
     d.wait_agent("w2", "idle", 10);
     let (spec, sha) = d.spec_file("dispatch-monitor.md", "safe dispatch");
     let project = d.dir.path().to_str().unwrap().to_string();
-    d.rpc(
-        "job_new",
-        json!({"pm": "pm", "job": "djob", "spec": spec,
-               "spec_sha256": sha, "repo": project}),
-    )
-    .unwrap();
-    d.rpc(
-        "task_new",
-        json!({"job": "djob", "task": "djob-ready", "assignee": "w1",
-               "acceptance": "run focused checks"}),
-    )
-    .unwrap();
-    d.rpc(
-        "task_new",
-        json!({"job": "djob", "task": "djob-repeat", "assignee": "w2",
-               "acceptance": "reuse the live kickoff"}),
-    )
-    .unwrap();
+    d.job_new_repo("pm", "djob", &spec, &sha, &project).unwrap();
+    d.task_new_ac("djob", "djob-ready", "w1", "run focused checks")
+        .unwrap();
+    d.task_new_ac("djob", "djob-repeat", "w2", "reuse the live kickoff")
+        .unwrap();
     d.rpc(
         "monitor_register",
         json!({"monitor": "dm", "project": project, "owner": "operator",

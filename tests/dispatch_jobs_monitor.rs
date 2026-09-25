@@ -60,19 +60,10 @@ fn job_list_cad437_filters() {
     let d = TestDaemon::start();
     d.register("pm");
     let (spec, sha) = d.spec_file("spec.md", "first job");
-    d.rpc(
-        "job_new",
-        json!({"pm": "pm", "job": "j1", "spec": spec, "spec_sha256": sha,
-               "issue": "CAD-26"}),
-    )
-    .unwrap();
+    d.job_new_issue("pm", "j1", &spec, &sha, "CAD-26").unwrap();
     let (spec2, sha2) = d.spec_file("spec2.md", "second job");
-    d.rpc(
-        "job_new",
-        json!({"pm": "pm", "job": "j2", "spec": spec2, "spec_sha256": sha2,
-               "issue": "CAD-27"}),
-    )
-    .unwrap();
+    d.job_new_issue("pm", "j2", &spec2, &sha2, "CAD-27")
+        .unwrap();
 
     let ids = |v: &Value| -> Vec<String> {
         let mut ids: Vec<String> = v["jobs"]
@@ -163,39 +154,21 @@ fn job_new_creates_default_task_and_validates_issue() {
     assert_eq!(list[0]["tasks"]["draft"], 1);
 
     // Idempotent re-create with identical params.
-    let dup = d.rpc(
-        "job_new",
-        json!({"pm": "pm", "job": "j1", "spec": spec, "spec_sha256": sha,
-               "issue": "CAD-26"}),
-    );
+    let dup = d.job_new_issue("pm", "j1", &spec, &sha, "CAD-26");
     assert_eq!(dup.unwrap()["duplicate"], true);
 
     // Same id, different content → rejected.
     assert!(d
-        .rpc(
-            "job_new",
-            json!({"pm": "pm", "job": "j1", "spec": "/other.md",
-                   "spec_sha256": "0".repeat(64), "issue": "CAD-26"}),
-        )
+        .job_new_issue("pm", "j1", "/other.md", &"0".repeat(64), "CAD-26")
         .is_err());
 
     // Issue grammar is validated — not the filesystem.
     assert!(d
-        .rpc(
-            "job_new",
-            json!({"pm": "pm", "job": "j2", "spec": spec,
-                   "spec_sha256": sha, "issue": "not-an-issue"}),
-        )
+        .job_new_issue("pm", "j2", &spec, &sha, "not-an-issue")
         .is_err());
 
     // One leaf issue → one open job.
-    assert!(d
-        .rpc(
-            "job_new",
-            json!({"pm": "pm", "job": "j2", "spec": spec,
-                   "spec_sha256": sha, "issue": "CAD-26"}),
-        )
-        .is_err());
+    assert!(d.job_new_issue("pm", "j2", &spec, &sha, "CAD-26").is_err());
 
     // Unknown PM rejected.
     assert!(d
@@ -310,12 +283,8 @@ fn job_inbox_pm_receives_notifications() {
     let (spec, sha) = d.spec_file("spec.md", "inbox pm spec");
     d.job_new("pm-in", "j1", &spec, &sha);
 
-    d.rpc(
-        "task_new",
-        json!({"job": "j1", "task": "j1-t2", "assignee": "w1",
-               "acceptance": format!("ok REPORT_SHA:{SHA_A}")}),
-    )
-    .unwrap();
+    d.task_new_ac("j1", "j1-t2", "w1", format!("ok REPORT_SHA:{SHA_A}"))
+        .unwrap();
     let r = d.job_dispatch("j1-t2", json!({})).unwrap();
     let kickoff = r["message"].as_str().unwrap().to_string();
     d.wait_message("w1", &kickoff, &["completed"], 15);
@@ -351,12 +320,8 @@ fn verdict_rejects_every_bad_shape() {
     d.wait_agent("w1", "idle", 10);
     let (spec, sha) = d.spec_file("spec.md", "verdict rejections");
     d.job_new("pm", "j1", &spec, &sha);
-    d.rpc(
-        "task_new",
-        json!({"job": "j1", "task": "j1-t2", "assignee": "w1",
-               "acceptance": format!("ok REPORT_SHA:{SHA_A}")}),
-    )
-    .unwrap();
+    d.task_new_ac("j1", "j1-t2", "w1", format!("ok REPORT_SHA:{SHA_A}"))
+        .unwrap();
 
     // Not in review → rejected.
     assert!(d.job_verdict("j1-t2", SHA_A, "pass").is_err());
@@ -420,12 +385,7 @@ fn verdict_rejects_null_sha_until_repaired() {
     let (spec, sha) = d.spec_file("spec.md", "no-sha report");
     d.job_new("pm", "j1", &spec, &sha);
     // No REPORT_SHA directive — the fake reply carries no SHA line.
-    d.rpc(
-        "task_new",
-        json!({"job": "j1", "task": "j1-t2", "assignee": "w1",
-               "acceptance": "plain echo"}),
-    )
-    .unwrap();
+    d.task_new_ac("j1", "j1-t2", "w1", "plain echo").unwrap();
     let r = d.job_dispatch("j1-t2", json!({})).unwrap();
     let kickoff = r["message"].as_str().unwrap().to_string();
     d.wait_message("w1", &kickoff, &["completed"], 15);
@@ -485,12 +445,8 @@ fn max_revisions_escalates_to_blocked_once() {
                "max_revisions": 2}),
     )
     .unwrap();
-    d.rpc(
-        "task_new",
-        json!({"job": "j1", "task": "j1-t2", "assignee": "w1",
-               "acceptance": format!("ok REPORT_SHA:{SHA_A}")}),
-    )
-    .unwrap();
+    d.task_new_ac("j1", "j1-t2", "w1", format!("ok REPORT_SHA:{SHA_A}"))
+        .unwrap();
 
     // r1 → review → revise → revising.
     let r = d.job_dispatch("j1-t2", json!({})).unwrap();
@@ -566,12 +522,8 @@ fn job_cancel_semantics() {
     assert_eq!(w2["state"], "stopped"); // operator stop, unchanged
 
     // Running kickoff: cancel leaves it alone — it completes on its own.
-    d.rpc(
-        "task_new",
-        json!({"job": "j1", "task": "j1-tr", "assignee": "w1",
-               "acceptance": format!("ok REPORT_SHA:{SHA_A}")}),
-    )
-    .unwrap();
+    d.task_new_ac("j1", "j1-tr", "w1", format!("ok REPORT_SHA:{SHA_A}"))
+        .unwrap();
     let r = d.job_dispatch("j1-tr", json!({})).unwrap();
     let k = r["message"].as_str().unwrap().to_string();
     d.rpc("task_cancel", json!({"task": "j1-tr", "by": "pm"}))
@@ -608,12 +560,8 @@ fn dispatch_dedupes_live_kickoff_and_reassign_bumps() {
     d.wait_agent("w1", "idle", 10);
     let (spec, sha) = d.spec_file("spec.md", "dedupe + reassign");
     d.job_new("pm", "j1", &spec, &sha);
-    d.rpc(
-        "task_new",
-        json!({"job": "j1", "task": "j1-t2", "assignee": "w1",
-               "acceptance": format!("ok REPORT_SHA:{SHA_A}")}),
-    )
-    .unwrap();
+    d.task_new_ac("j1", "j1-t2", "w1", format!("ok REPORT_SHA:{SHA_A}"))
+        .unwrap();
 
     // Live kickoff → second dispatch is the SAME revision, same id.
     // Deterministic: stop w1 first so its queue never drains.
@@ -665,19 +613,14 @@ fn task_attached_send_and_self() {
     d.wait_agent("w1", "idle", 10);
     let (spec, sha) = d.spec_file("spec.md", "send --task");
     d.job_new("pm", "j1", &spec, &sha);
-    d.rpc(
-        "task_new",
-        json!({"job": "j1", "task": "j1-t2", "assignee": "w1",
-               "acceptance": format!("ok REPORT_SHA:{SHA_A}")}),
-    )
-    .unwrap();
+    d.task_new_ac("j1", "j1-t2", "w1", format!("ok REPORT_SHA:{SHA_A}"))
+        .unwrap();
 
     // `send --task` attaches for indexing — the message completes
     // normally and does NOT drive the task state machine.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "ping", "message": "adhoc1",
-               "task": "j1-t2"}),
+    d.send(
+        "w1",
+        json!({"text": "ping", "message": "adhoc1", "task": "j1-t2"}),
     )
     .unwrap();
     d.wait_message("w1", "adhoc1", &["completed"], 15);
@@ -889,12 +832,8 @@ fn verdict_setup(d: &TestDaemon, repo: &Path) {
     d.wait_agent("pm", "idle", 10);
     d.wait_agent("w1", "idle", 10);
     let (spec, sha) = d.spec_file("spec.md", "do the work");
-    d.rpc(
-        "job_new",
-        json!({"pm": "pm", "job": "j1", "spec": spec, "spec_sha256": sha,
-               "repo": repo.to_str().unwrap()}),
-    )
-    .unwrap();
+    d.job_new_repo("pm", "j1", &spec, &sha, repo.to_str().unwrap())
+        .unwrap();
 }
 
 /// Dispatch `task` to the fake worker; its REPORT_SHA trailer lands
@@ -1438,125 +1377,50 @@ fn job_kickoff_stall_flags_task_and_notifies_pm() {
 fn dispatch_kickoff_and_finish_guards() {
     // Seed the group before the daemon starts: pm plus its members,
     // one fenced, one outside the group.
-    let seeded = TempDir::new().unwrap();
-    let state = seeded.path().to_path_buf();
-    {
-        let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
-        let cwd = state.to_str().unwrap().to_string();
-        // w1/w2 are `inbox` endpoints — no actor drains their queue,
-        // so a queued kickoff stays live for the duplicate checks and
-        // exercises the CAD-64 inbox-owner exemption in finish. The
-        // others are fake.
-        for (alias, params, kind) in [
-            ("pm", None, "fake"),
-            ("w1", Some("{\"upstream\":\"pm\"}"), "inbox"),
-            ("w2", Some("{\"upstream\":\"pm\"}"), "inbox"),
-            ("fenced", Some("{\"upstream\":\"pm\"}"), "fake"),
-            ("outsider", None, "fake"),
-        ] {
+    // w1/w2 are `inbox` endpoints — no actor drains their queue,
+    // so a queued kickoff stays live for the duplicate checks and
+    // exercises the CAD-64 inbox-owner exemption in finish. The
+    // others are fake.
+    let (_seeded, state) = seeded_state(
+        &[
+            ("pm", None, "fake", "worker"),
+            ("w1", Some("{\"upstream\":\"pm\"}"), "inbox", "worker"),
+            ("w2", Some("{\"upstream\":\"pm\"}"), "inbox", "worker"),
+            ("fenced", Some("{\"upstream\":\"pm\"}"), "fake", "worker"),
+            ("outsider", None, "fake", "worker"),
+        ],
+        |store, _cwd| {
             store
-                .register_agent(&NewAgent {
-                    alias,
-                    provider: "fake",
-                    endpoint_kind: kind,
-                    role: "worker",
-                    cwd: &cwd,
-                    sandbox: "read-only",
-                    instructions: None,
-                    params,
-                    team_role: None,
-                    model_policy: None,
-                })
+                .set_agent_state("fenced", "attention", Some("test fence"))
                 .unwrap();
-        }
-        store
-            .set_agent_state("fenced", "attention", Some("test fence"))
-            .unwrap();
-    }
+        },
+    );
     // Tracker + project repo + issues fixture (same shape as the
     // issue-start test). The daemon reads the tracker itself on
     // `dispatch_send` (claim check + lane resolution), so the pm dir
     // binds before it starts — a test daemon never falls back to ~/pm.
-    let tmp = TempDir::new().unwrap();
-    let (pm_dir, repo, home) = (
-        tmp.path().join("pm"),
-        tmp.path().join("repo"),
-        tmp.path().join("home"),
-    );
+    let (tmp, pm_dir, repo, home) = pm_lab_dirs();
     test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
     let d = TestDaemon::start_on(state);
     d.wait_agent("fenced", "attention", 10);
-    for dir in [&pm_dir, &repo, &home] {
-        std::fs::create_dir_all(dir).unwrap();
-    }
-    let git = |dir: &Path, args: &[&str]| {
-        let o = std::process::Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            o.status.success(),
-            "git {}: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&o.stderr)
-        );
-    };
-    git(&repo, &["init", "-b", "main"]);
-    git(&repo, &["config", "user.email", "t@t"]);
-    git(&repo, &["config", "user.name", "t"]);
-    std::fs::write(repo.join("f"), "x").unwrap();
-    // A cargo checkout — CAD-95 r3 plants the dep-cache farm only in
-    // repos with a Cargo.toml; this fixture wants the shared-farm
-    // assertions, so it declares itself a cargo package (build
-    // output gitignored, as real repos do).
-    std::fs::write(
-        repo.join("Cargo.toml"),
-        "[package]\nname = \"m\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-    )
-    .unwrap();
-    std::fs::write(repo.join(".gitignore"), "/target\n").unwrap();
-    git(&repo, &["add", "-A"]);
-    git(&repo, &["commit", "-qm", "init"]);
-    let bin_dir = Path::new(env!("CARGO_BIN_EXE_cadence"))
-        .parent()
-        .unwrap()
-        .to_path_buf();
-    let cli = |args: &[&str]| -> (bool, Value) {
-        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
-            .arg("--state-dir")
-            .arg(&d.state)
-            .args(args)
-            .env("CADENCE_PM_DIR", &pm_dir)
-            .env("HOME", &home)
-            .env(
-                "PATH",
-                format!(
-                    "{}:{}",
-                    bin_dir.display(),
-                    std::env::var("PATH").unwrap_or_default()
-                ),
-            )
-            .env_remove("CADENCE_ALIAS")
-            .operator_output()
-            .unwrap();
-        let text = if out.stdout.is_empty() {
-            String::from_utf8_lossy(&out.stderr).to_string()
-        } else {
-            String::from_utf8_lossy(&out.stdout).to_string()
-        };
-        (
-            out.status.success(),
-            serde_json::from_str(text.trim()).unwrap_or_else(|_| panic!("not json: {text}")),
+
+    let git = git_ok();
+    git_f_repo(&repo, &git, |repo| {
+        // A cargo checkout — CAD-95 r3 plants the dep-cache farm only in
+        // repos with a Cargo.toml; this fixture wants the shared-farm
+        // assertions, so it declares itself a cargo package (build
+        // output gitignored, as real repos do).
+        std::fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"m\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
         )
-    };
-    assert!(cli(&["issue", "init"]).0);
+        .unwrap();
+        std::fs::write(repo.join(".gitignore"), "/target\n").unwrap();
+    });
+    let cli = cadence_cli_json(&d.state, &pm_dir, &home);
     let repo_s = repo.canonicalize().unwrap().to_str().unwrap().to_string();
-    assert!(cli(&["issue", "project", "add", "demo", "--prefix", "D", "--repo", &repo_s,]).0);
-    for title in ["One", "Two", "Three", "Four"] {
-        assert!(cli(&["issue", "new", title, "--project", "demo"]).0);
-    }
+    demo_project_init(&cli, &repo_s);
+    demo_issue_news(&cli, &["One", "Two", "Three", "Four"]);
     let tracker_commits = || {
         String::from_utf8_lossy(
             &std::process::Command::new("git")
@@ -1806,11 +1670,8 @@ fn dispatch_kickoff_and_finish_guards() {
     d.wait_agent("dvb", "idle", 15);
     let (ok, _) = cli(&["issue", "start", "D-3", "--owner", "dvb"]);
     assert!(ok);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "dvb", "text": "keep working", "message": "mk1"}),
-    )
-    .unwrap();
+    d.send("dvb", json!({"text": "keep working", "message": "mk1"}))
+        .unwrap();
     d.fixture_rpc("agent_ready", json!({"alias": "dvb"}))
         .unwrap();
     d.wait_message("dvb", "mk1", &["running"], 10);
@@ -1902,45 +1763,20 @@ fn dispatch_kickoff_and_finish_guards() {
 /// binds nothing.
 #[test]
 fn dispatch_records_ref_before_send() {
-    let seeded = TempDir::new().unwrap();
-    let state = seeded.path().to_path_buf();
-    {
-        let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
-        let cwd = state.to_str().unwrap().to_string();
-        for (alias, params, kind) in [
-            ("pm", None, "fake"),
-            ("w1", Some("{\"upstream\":\"pm\"}"), "inbox"),
-        ] {
-            store
-                .register_agent(&NewAgent {
-                    alias,
-                    provider: "fake",
-                    endpoint_kind: kind,
-                    role: "worker",
-                    cwd: &cwd,
-                    sandbox: "read-only",
-                    instructions: None,
-                    params,
-                    team_role: None,
-                    model_policy: None,
-                })
-                .unwrap();
-        }
-    }
+    let (_seeded, state) = seeded_state(
+        &[
+            ("pm", None, "fake", "worker"),
+            ("w1", Some("{\"upstream\":\"pm\"}"), "inbox", "worker"),
+        ],
+        |_, _| {},
+    );
     // The daemon reads the tracker itself on `dispatch_send` (claim
     // check + lane resolution) — bind the pm dir before it starts; a
     // test daemon never falls back to ~/pm.
-    let tmp = TempDir::new().unwrap();
-    let (pm_dir, repo, home) = (
-        tmp.path().join("pm"),
-        tmp.path().join("repo"),
-        tmp.path().join("home"),
-    );
+    let (tmp, pm_dir, repo, home) = pm_lab_dirs();
     test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
     let d = TestDaemon::start_on(state);
-    for dir in [&pm_dir, &repo, &home] {
-        std::fs::create_dir_all(dir).unwrap();
-    }
+
     let git = |dir: &Path, args: &[&str]| {
         let o = std::process::Command::new("git")
             .arg("-C")
@@ -1950,47 +1786,10 @@ fn dispatch_records_ref_before_send() {
             .unwrap();
         assert!(o.status.success());
     };
-    git(&repo, &["init", "-b", "main"]);
-    git(&repo, &["config", "user.email", "t@t"]);
-    git(&repo, &["config", "user.name", "t"]);
-    std::fs::write(repo.join("f"), "x").unwrap();
-    git(&repo, &["add", "-A"]);
-    git(&repo, &["commit", "-qm", "init"]);
-    let bin_dir = Path::new(env!("CARGO_BIN_EXE_cadence"))
-        .parent()
-        .unwrap()
-        .to_path_buf();
-    let cli = |args: &[&str]| -> (bool, Value) {
-        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
-            .arg("--state-dir")
-            .arg(&d.state)
-            .args(args)
-            .env("CADENCE_PM_DIR", &pm_dir)
-            .env("HOME", &home)
-            .env(
-                "PATH",
-                format!(
-                    "{}:{}",
-                    bin_dir.display(),
-                    std::env::var("PATH").unwrap_or_default()
-                ),
-            )
-            .env_remove("CADENCE_ALIAS")
-            .operator_output()
-            .unwrap();
-        let text = if out.stdout.is_empty() {
-            String::from_utf8_lossy(&out.stderr).to_string()
-        } else {
-            String::from_utf8_lossy(&out.stdout).to_string()
-        };
-        (
-            out.status.success(),
-            serde_json::from_str(text.trim()).unwrap_or_else(|_| panic!("not json: {text}")),
-        )
-    };
-    assert!(cli(&["issue", "init"]).0);
+    git_f_repo(&repo, &git, |_| {});
+    let cli = cadence_cli_json(&d.state, &pm_dir, &home);
     let repo_s = repo.canonicalize().unwrap().to_str().unwrap().to_string();
-    assert!(cli(&["issue", "project", "add", "demo", "--prefix", "D", "--repo", &repo_s,]).0);
+    demo_project_init(&cli, &repo_s);
     assert!(cli(&["issue", "new", "Reffirst", "--project", "demo"]).0);
     let note = tmp.path().join("kickoff.md");
     std::fs::write(&note, "# kickoff").unwrap();
@@ -2100,121 +1899,47 @@ fn dispatch_records_ref_before_send() {
 /// history and never suppresses the new dispatch.
 #[test]
 fn dispatch_folds_bootstrap_and_suppresses_reported_duplicate() {
-    let seeded = TempDir::new().unwrap();
-    let state = seeded.path().to_path_buf();
-    {
-        let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
-        let cwd = state.to_str().unwrap().to_string();
-        // Inbox endpoints: no actor drains them, so queued rows stay
-        // put for the assertions.
-        for (alias, params) in [
-            ("pm", None),
-            ("w1", Some("{\"upstream\":\"pm\"}")),
-            ("w2", Some("{\"upstream\":\"pm\"}")),
-            ("w3", Some("{\"upstream\":\"pm\"}")),
-            ("w4", Some("{\"upstream\":\"pm\"}")),
-            ("w5", Some("{\"upstream\":\"pm\"}")),
-        ] {
-            store
-                .register_agent(&NewAgent {
-                    alias,
-                    provider: "fake",
-                    endpoint_kind: if alias == "pm" { "fake" } else { "inbox" },
-                    role: "worker",
-                    cwd: &cwd,
-                    sandbox: "read-only",
-                    instructions: None,
-                    params,
-                    team_role: None,
-                    model_policy: None,
-                })
-                .unwrap();
-        }
-    }
+    // Inbox endpoints: no actor drains them, so queued rows stay
+    // put for the assertions.
+    let (_seeded, state) = seeded_state(
+        &[
+            ("pm", None, "fake", "worker"),
+            ("w1", Some("{\"upstream\":\"pm\"}"), "inbox", "worker"),
+            ("w2", Some("{\"upstream\":\"pm\"}"), "inbox", "worker"),
+            ("w3", Some("{\"upstream\":\"pm\"}"), "inbox", "worker"),
+            ("w4", Some("{\"upstream\":\"pm\"}"), "inbox", "worker"),
+            ("w5", Some("{\"upstream\":\"pm\"}"), "inbox", "worker"),
+        ],
+        |_, _| {},
+    );
     // The daemon reads the tracker itself on `dispatch_send` (claim
     // check + lane resolution) — bind the pm dir before it starts; a
     // test daemon never falls back to ~/pm.
-    let tmp = TempDir::new().unwrap();
-    let (pm_dir, repo, home) = (
-        tmp.path().join("pm"),
-        tmp.path().join("repo"),
-        tmp.path().join("home"),
-    );
+    let (tmp, pm_dir, repo, home) = pm_lab_dirs();
     test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
     let d = TestDaemon::start_on(state);
-    for dir in [&pm_dir, &repo, &home] {
-        std::fs::create_dir_all(dir).unwrap();
-    }
-    let git = |dir: &Path, args: &[&str]| -> String {
-        let o = std::process::Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            o.status.success(),
-            "git {}: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&o.stderr)
-        );
-        String::from_utf8_lossy(&o.stdout).trim().to_string()
-    };
-    git(&repo, &["init", "-b", "main"]);
-    git(&repo, &["config", "user.email", "t@t"]);
-    git(&repo, &["config", "user.name", "t"]);
-    std::fs::write(repo.join("f"), "x").unwrap();
-    git(&repo, &["add", "-A"]);
-    git(&repo, &["commit", "-qm", "init"]);
-    let bin_dir = Path::new(env!("CARGO_BIN_EXE_cadence"))
-        .parent()
-        .unwrap()
-        .to_path_buf();
-    let cli = |args: &[&str]| -> (bool, Value) {
-        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
-            .arg("--state-dir")
-            .arg(&d.state)
-            .args(args)
-            .env("CADENCE_PM_DIR", &pm_dir)
-            .env("HOME", &home)
-            .env(
-                "PATH",
-                format!(
-                    "{}:{}",
-                    bin_dir.display(),
-                    std::env::var("PATH").unwrap_or_default()
-                ),
-            )
-            .env_remove("CADENCE_ALIAS")
-            .operator_output()
-            .unwrap();
-        let text = if out.stdout.is_empty() {
-            String::from_utf8_lossy(&out.stderr).to_string()
-        } else {
-            String::from_utf8_lossy(&out.stdout).to_string()
-        };
-        (
-            out.status.success(),
-            serde_json::from_str(text.trim()).unwrap_or_else(|_| panic!("not json: {text}")),
-        )
-    };
+
+    let git = git_stdout();
+    git_f_repo(&repo, &git, |_| {});
+    let cli = cadence_cli_json(&d.state, &pm_dir, &home);
     assert!(cli(&["issue", "init"]).0);
     git(&pm_dir, &["config", "user.email", "t@t"]);
     git(&pm_dir, &["config", "user.name", "t"]);
     let repo_s = repo.canonicalize().unwrap().to_str().unwrap().to_string();
     assert!(cli(&["issue", "project", "add", "demo", "--prefix", "D", "--repo", &repo_s,]).0);
-    for title in [
-        "Fold",
-        "Reported",
-        "Runningboot",
-        "Bigboot",
-        "Forge",
-        "Forgefields",
-        "Sendfail",
-        "Reffail",
-    ] {
-        assert!(cli(&["issue", "new", title, "--project", "demo"]).0);
-    }
+    demo_issue_news(
+        &cli,
+        &[
+            "Fold",
+            "Reported",
+            "Runningboot",
+            "Bigboot",
+            "Forge",
+            "Forgefields",
+            "Sendfail",
+            "Reffail",
+        ],
+    );
     let note = tmp.path().join("kickoff.md");
     std::fs::write(&note, "# kickoff").unwrap();
     let note_s = note.canonicalize().unwrap().to_str().unwrap().to_string();
@@ -2233,10 +1958,9 @@ fn dispatch_folds_bootstrap_and_suppresses_reported_duplicate() {
 
     // The freshly joined worker's bootstrap, still queued — seeded the
     // way `join` writes it (deterministic id, bootstrap source).
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "bootstrap body", "message": "bootstrap-w1",
-               "source": "bootstrap"}),
+    d.send(
+        "w1",
+        json!({"text": "bootstrap body", "message": "bootstrap-w1", "source": "bootstrap"}),
     )
     .unwrap();
     assert_eq!(d.message_state("w1", "bootstrap-w1"), "queued");
@@ -2415,11 +2139,8 @@ fn dispatch_folds_bootstrap_and_suppresses_reported_duplicate() {
     let (ok, started) = cli(&["issue", "start", "D-6", "--owner", "w1", "--by", "pm"]);
     assert!(ok, "{started}");
     let wt6 = started["worktree"].as_str().unwrap().to_string();
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "ordinary ask", "message": "m-plain"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "ordinary ask", "message": "m-plain"}))
+        .unwrap();
     {
         let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
         conn.execute(
@@ -2452,10 +2173,9 @@ fn dispatch_folds_bootstrap_and_suppresses_reported_duplicate() {
 
     // Fold failure paths: a send that fails leaves the fold-intended
     // bootstrap queued and says so on the issue.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w4", "text": "boot4", "message": "bootstrap-w4",
-               "source": "bootstrap"}),
+    d.send(
+        "w4",
+        json!({"text": "boot4", "message": "bootstrap-w4", "source": "bootstrap"}),
     )
     .unwrap();
     let (ok, err) = cli(&[
@@ -2497,10 +2217,9 @@ fn dispatch_folds_bootstrap_and_suppresses_reported_duplicate() {
     // before any cancel: the bootstrap stays queued. The issue is
     // pre-started identically (same owner, same claim holder) so the
     // lock only bites at the dispatch's own ref write.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w5", "text": "boot5", "message": "bootstrap-w5",
-               "source": "bootstrap"}),
+    d.send(
+        "w5",
+        json!({"text": "boot5", "message": "bootstrap-w5", "source": "bootstrap"}),
     )
     .unwrap();
     let (ok, started) = cli(&["issue", "start", "D-8", "--owner", "w5", "--by", "pm"]);
@@ -2529,10 +2248,9 @@ fn dispatch_folds_bootstrap_and_suppresses_reported_duplicate() {
     // A bootstrap too large to fold leaves the fold alone: still
     // queued, the kickoff sends unfolded behind it.
     let big = "b".repeat(3900);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w3", "text": big, "message": "bootstrap-w3",
-               "source": "bootstrap"}),
+    d.send(
+        "w3",
+        json!({"text": big, "message": "bootstrap-w3", "source": "bootstrap"}),
     )
     .unwrap();
     let (ok, out) = dispatch("D-4", "w3");
@@ -2566,130 +2284,61 @@ fn dispatch_folds_bootstrap_and_suppresses_reported_duplicate() {
 /// message id.
 #[test]
 fn finish_guard_per_worktree() {
-    let seeded = TempDir::new().unwrap();
-    let state = seeded.path().to_path_buf();
-    {
-        let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
-        let cwd = state.to_str().unwrap().to_string();
-        for (alias, params, kind) in [
-            ("pm", None, "fake"),
-            ("w1", Some("{\"upstream\":\"pm\"}"), "inbox"),
-        ] {
+    let (_seeded, state) = seeded_state(
+        &[
+            ("pm", None, "fake", "worker"),
+            ("w1", Some("{\"upstream\":\"pm\"}"), "inbox", "worker"),
+        ],
+        |store, cwd| {
+            // A fenced devin/pty agent that was never launched: endpoint
+            // none + state attention reads `dead: true` (a `starting`
+            // agent races the daemon's failed-launch → `stopped` parking,
+            // which would read alive). Its queue can never start — a
+            // queued message bound to its worktree must not block finish.
             store
                 .register_agent(&NewAgent {
-                    alias,
-                    provider: "fake",
-                    endpoint_kind: kind,
+                    alias: "deadpty",
+                    provider: "devin",
+                    endpoint_kind: "pty",
                     role: "worker",
-                    cwd: &cwd,
+                    cwd,
                     sandbox: "read-only",
                     instructions: None,
-                    params,
+                    params: Some("{\"upstream\":\"pm\"}"),
                     team_role: None,
                     model_policy: None,
                 })
                 .unwrap();
-        }
-        // A fenced devin/pty agent that was never launched: endpoint
-        // none + state attention reads `dead: true` (a `starting`
-        // agent races the daemon's failed-launch → `stopped` parking,
-        // which would read alive). Its queue can never start — a
-        // queued message bound to its worktree must not block finish.
-        store
-            .register_agent(&NewAgent {
-                alias: "deadpty",
-                provider: "devin",
-                endpoint_kind: "pty",
-                role: "worker",
-                cwd: &cwd,
-                sandbox: "read-only",
-                instructions: None,
-                params: Some("{\"upstream\":\"pm\"}"),
-                team_role: None,
-                model_policy: None,
-            })
-            .unwrap();
-        store
-            .set_agent_state("deadpty", "attention", Some("never launched"))
-            .unwrap();
-        store
-            .enqueue("deadpty", "queued forever", None, "mkdead", "test")
-            .unwrap();
-    }
+            store
+                .set_agent_state("deadpty", "attention", Some("never launched"))
+                .unwrap();
+            store
+                .enqueue("deadpty", "queued forever", None, "mkdead", "test")
+                .unwrap();
+        },
+    );
     // The daemon reads the tracker itself on `dispatch_send` (claim
     // check + lane resolution) — bind the pm dir before it starts; a
     // test daemon never falls back to ~/pm.
-    let tmp = TempDir::new().unwrap();
-    let (pm_dir, repo, home) = (
-        tmp.path().join("pm"),
-        tmp.path().join("repo"),
-        tmp.path().join("home"),
-    );
+    let (tmp, pm_dir, repo, home) = pm_lab_dirs();
     test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
     let d = TestDaemon::start_on(state);
-    for dir in [&pm_dir, &repo, &home] {
-        std::fs::create_dir_all(dir).unwrap();
-    }
-    let git = |dir: &Path, args: &[&str]| {
-        let o = std::process::Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            o.status.success(),
-            "git {}: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&o.stderr)
-        );
-    };
-    git(&repo, &["init", "-b", "main"]);
-    git(&repo, &["config", "user.email", "t@t"]);
-    git(&repo, &["config", "user.name", "t"]);
-    std::fs::write(repo.join("f"), "x").unwrap();
-    git(&repo, &["add", "-A"]);
-    git(&repo, &["commit", "-qm", "init"]);
+
+    let git = git_ok();
+    git_f_repo(&repo, &git, |_| {});
     let bin_dir = Path::new(env!("CARGO_BIN_EXE_cadence"))
         .parent()
         .unwrap()
         .to_path_buf();
-    let cli = |args: &[&str]| -> (bool, Value) {
-        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
-            .arg("--state-dir")
-            .arg(&d.state)
-            .args(args)
-            .env("CADENCE_PM_DIR", &pm_dir)
-            .env("HOME", &home)
-            .env(
-                "PATH",
-                format!(
-                    "{}:{}",
-                    bin_dir.display(),
-                    std::env::var("PATH").unwrap_or_default()
-                ),
-            )
-            .env_remove("CADENCE_ALIAS")
-            .operator_output()
-            .unwrap();
-        let text = if out.stdout.is_empty() {
-            String::from_utf8_lossy(&out.stderr).to_string()
-        } else {
-            String::from_utf8_lossy(&out.stdout).to_string()
-        };
-        (
-            out.status.success(),
-            serde_json::from_str(text.trim()).unwrap_or_else(|_| panic!("not json: {text}")),
-        )
-    };
-    assert!(cli(&["issue", "init"]).0);
+    let cli = cadence_cli_json(&d.state, &pm_dir, &home);
     let repo_s = repo.canonicalize().unwrap().to_str().unwrap().to_string();
-    assert!(cli(&["issue", "project", "add", "demo", "--prefix", "D", "--repo", &repo_s,]).0);
-    for title in [
-        "Awt", "Bwt", "Cwt", "Dwt", "Ghost", "Scoped", "Inboxrun", "Nonowner",
-    ] {
-        assert!(cli(&["issue", "new", title, "--project", "demo"]).0);
-    }
+    demo_project_init(&cli, &repo_s);
+    demo_issue_news(
+        &cli,
+        &[
+            "Awt", "Bwt", "Cwt", "Dwt", "Ghost", "Scoped", "Inboxrun", "Nonowner",
+        ],
+    );
     let note = tmp.path().join("kickoff.md");
     std::fs::write(&note, "# kickoff").unwrap();
     let note_s = note.canonicalize().unwrap().to_str().unwrap().to_string();
@@ -2760,11 +2409,8 @@ fn finish_guard_per_worktree() {
     d.wait_agent("dv", "idle", 15);
     let (ok, _) = cli(&["issue", "set", "D-3", "owner=dv"]);
     assert!(ok);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "dv", "text": "queued against C", "message": "mkc"}),
-    )
-    .unwrap();
+    d.send("dv", json!({"text": "queued against C", "message": "mkc"}))
+        .unwrap();
     let (ok, _) = cli(&["issue", "ref", "D-3", "message", "mkc"]);
     assert!(ok);
     let (ok, err) = cli(&["issue", "finish", "D-3"]);
@@ -3001,66 +2647,13 @@ fn finish_guard_per_worktree() {
 /// sweep cannot force.
 #[test]
 fn finish_holds_unreconciled_unknown() {
-    let seeded = TempDir::new().unwrap();
-    let state = seeded.path().to_path_buf();
+    let (_seeded, state) = seeded_state(&[], |_, _| {});
     let d = TestDaemon::start_on(state);
-    let tmp = TempDir::new().unwrap();
-    let (pm_dir, repo, home) = (
-        tmp.path().join("pm"),
-        tmp.path().join("repo"),
-        tmp.path().join("home"),
-    );
-    for dir in [&pm_dir, &repo, &home] {
-        std::fs::create_dir_all(dir).unwrap();
-    }
-    let git = |dir: &Path, args: &[&str]| {
-        let o = std::process::Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            o.status.success(),
-            "git {}: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&o.stderr)
-        );
-    };
-    git(&repo, &["init", "-b", "main"]);
-    git(&repo, &["config", "user.email", "t@t"]);
-    git(&repo, &["config", "user.name", "t"]);
-    std::fs::write(repo.join("f"), "x").unwrap();
-    git(&repo, &["add", "-A"]);
-    git(&repo, &["commit", "-qm", "init"]);
-    let bin_dir = Path::new(env!("CARGO_BIN_EXE_cadence"))
-        .parent()
-        .unwrap()
-        .to_path_buf();
-    let cli_raw = |args: &[&str]| -> (i32, String, String) {
-        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
-            .arg("--state-dir")
-            .arg(&d.state)
-            .args(args)
-            .env("CADENCE_PM_DIR", &pm_dir)
-            .env("HOME", &home)
-            .env(
-                "PATH",
-                format!(
-                    "{}:{}",
-                    bin_dir.display(),
-                    std::env::var("PATH").unwrap_or_default()
-                ),
-            )
-            .env_remove("CADENCE_ALIAS")
-            .output()
-            .unwrap();
-        (
-            out.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&out.stdout).to_string(),
-            String::from_utf8_lossy(&out.stderr).to_string(),
-        )
-    };
+    let (tmp, pm_dir, repo, home) = pm_lab_dirs();
+
+    let git = git_ok();
+    git_f_repo(&repo, &git, |_| {});
+    let cli_raw = cadence_cli_raw(&d.state, &pm_dir, &home);
     let cli = |args: &[&str]| -> (bool, Value) {
         let (code, stdout, stderr) = cli_raw(args);
         let text = if stdout.is_empty() { stderr } else { stdout };
@@ -3069,12 +2662,12 @@ fn finish_holds_unreconciled_unknown() {
             serde_json::from_str(text.trim()).unwrap_or_else(|_| panic!("not json: {text}")),
         )
     };
-    assert!(cli(&["issue", "init"]).0);
     let repo_s = repo.canonicalize().unwrap().to_str().unwrap().to_string();
-    assert!(cli(&["issue", "project", "add", "demo", "--prefix", "D", "--repo", &repo_s,]).0);
-    for title in ["Reconciled", "Samecwd", "Bound", "Elsewhere", "Child"] {
-        assert!(cli(&["issue", "new", title, "--project", "demo"]).0);
-    }
+    demo_project_init(&cli, &repo_s);
+    demo_issue_news(
+        &cli,
+        &["Reconciled", "Samecwd", "Bound", "Elsewhere", "Child"],
+    );
     for id in ["D-1", "D-2", "D-3", "D-4", "D-5"] {
         let (ok, out) = cli(&["issue", "start", id]);
         assert!(ok, "{out}");
@@ -3304,54 +2897,13 @@ fn finish_merged_sweep() {
     // open — a daemon that cannot answer `agent_list` is itself a
     // refusal now, so the idle-path rows need one that answers.
     let _d = TestDaemon::start_on(state.clone());
-    let git = |dir: &Path, args: &[&str]| {
-        let o = std::process::Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            o.status.success(),
-            "git {}: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&o.stderr)
-        );
-    };
-    git(&repo, &["init", "-b", "main"]);
-    git(&repo, &["config", "user.email", "t@t"]);
-    git(&repo, &["config", "user.name", "t"]);
-    std::fs::write(repo.join("f"), "x").unwrap();
-    git(&repo, &["add", "-A"]);
-    git(&repo, &["commit", "-qm", "init"]);
+    let git = git_ok();
+    git_f_repo(&repo, &git, |_| {});
     let bin_dir = Path::new(env!("CARGO_BIN_EXE_cadence"))
         .parent()
         .unwrap()
         .to_path_buf();
-    let cli_raw = |args: &[&str]| -> (i32, String, String) {
-        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
-            .arg("--state-dir")
-            .arg(&state)
-            .args(args)
-            .env("CADENCE_PM_DIR", &pm_dir)
-            .env("HOME", &home)
-            .env(
-                "PATH",
-                format!(
-                    "{}:{}",
-                    bin_dir.display(),
-                    std::env::var("PATH").unwrap_or_default()
-                ),
-            )
-            .env_remove("CADENCE_ALIAS")
-            .output()
-            .unwrap();
-        (
-            out.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&out.stdout).to_string(),
-            String::from_utf8_lossy(&out.stderr).to_string(),
-        )
-    };
+    let cli_raw = cadence_cli_raw(&state, &pm_dir, &home);
     let cli = |args: &[&str]| -> (bool, Value) {
         let (code, stdout, stderr) = cli_raw(args);
         let text = if stdout.is_empty() { stderr } else { stdout };
@@ -3962,12 +3514,8 @@ fn automatic_monitor_dispatch_is_separate_guarded_and_restart_safe() {
             }}),
         ),
     ] {
-        d.rpc(
-            "agent_register",
-            json!({"alias": alias, "provider": "fake", "endpoint_kind": "fake",
-                   "cwd": cwd, "params": params.to_string()}),
-        )
-        .unwrap();
+        d.register_pcp(alias, "fake", "fake", &cwd, &params.to_string())
+            .unwrap();
     }
     for alias in ["pm", "w1", "w2", "w3"] {
         d.wait_agent(alias, "idle", 10);
@@ -3983,23 +3531,14 @@ fn automatic_monitor_dispatch_is_separate_guarded_and_restart_safe() {
     // idempotency boundary rather than minting another revision.
     let (spec, sha) = d.spec_file("automatic-monitor.md", "coordinator test");
     let project = d.dir.path().to_str().unwrap().to_string();
-    d.rpc(
-        "job_new",
-        json!({"pm": "pm", "job": "ajob", "spec": spec,
-               "spec_sha256": sha, "repo": project}),
-    )
-    .unwrap();
+    d.job_new_repo("pm", "ajob", &spec, &sha, &project).unwrap();
     for (task, assignee) in [
         ("ajob-fresh", "w2"),
         ("ajob-duplicate", "w1"),
         ("ajob-blocked", "w3"),
     ] {
-        d.rpc(
-            "task_new",
-            json!({"job": "ajob", "task": task, "assignee": assignee,
-                   "acceptance": "run the focused coordinator checks"}),
-        )
-        .unwrap();
+        d.task_new_ac("ajob", task, assignee, "run the focused coordinator checks")
+            .unwrap();
     }
     d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
     d.wait_agent("w1", "stopped", 10);
@@ -4230,11 +3769,14 @@ fn automatic_monitor_dispatch_serializes_competing_callers() {
     let mut d = TestDaemon::start();
     d.register("pm");
     let cwd = d.dir.path().to_str().unwrap().to_string();
-    d.rpc(
-        "agent_register",
-        json!({"alias": "w1", "provider": "fake", "endpoint_kind": "fake",
-               "cwd": cwd, "params": json!({"upstream": "pm", "quota":
-                   {"source": "provider", "state": "available"}}).to_string()}),
+    d.register_pcp(
+        "w1",
+        "fake",
+        "fake",
+        &cwd,
+        &json!({"upstream": "pm", "quota":
+                   {"source": "provider", "state": "available"}})
+        .to_string(),
     )
     .unwrap();
     d.wait_agent("pm", "idle", 10);
@@ -4246,16 +3788,13 @@ fn automatic_monitor_dispatch_serializes_competing_callers() {
     seed_provider_quota(&d, "w1", quota_at);
     let (spec, sha) = d.spec_file("automatic-race.md", "serialize dispatch");
     let project = d.dir.path().to_str().unwrap().to_string();
-    d.rpc(
-        "job_new",
-        json!({"pm": "pm", "job": "race-job", "spec": spec,
-               "spec_sha256": sha, "repo": project}),
-    )
-    .unwrap();
-    d.rpc(
-        "task_new",
-        json!({"job": "race-job", "task": "race-task", "assignee": "w1",
-               "acceptance": "serialize automatic dispatch"}),
+    d.job_new_repo("pm", "race-job", &spec, &sha, &project)
+        .unwrap();
+    d.task_new_ac(
+        "race-job",
+        "race-task",
+        "w1",
+        "serialize automatic dispatch",
     )
     .unwrap();
 
@@ -4373,12 +3912,8 @@ fn task_reopen_is_the_operator_or_the_jobs_pm() {
     let (spec, sha) = d.spec_file("spec.md", "reopen rule");
     d.job_new("pm", "j1", &spec, &sha);
     for task in ["j1-a", "j1-b"] {
-        d.rpc(
-            "task_new",
-            json!({"job": "j1", "task": task, "assignee": "w1",
-                   "acceptance": format!("ok REPORT_SHA:{SHA_A}")}),
-        )
-        .unwrap();
+        d.task_new_ac("j1", task, "w1", format!("ok REPORT_SHA:{SHA_A}"))
+            .unwrap();
         d.job_dispatch(task, json!({})).unwrap();
         d.wait_task(task, "review", 15);
         d.job_verdict(task, SHA_A, "blocked").unwrap();
@@ -4453,12 +3988,8 @@ fn verdict_reviewer_is_the_verified_caller() {
     d.wait_agent("w1", "idle", 10);
     let (spec, sha) = d.spec_file("spec.md", "self review");
     d.job_new("pm", "j1", &spec, &sha);
-    d.rpc(
-        "task_new",
-        json!({"job": "j1", "task": "j1-t", "assignee": "w1",
-               "acceptance": format!("ok REPORT_SHA:{SHA_A}")}),
-    )
-    .unwrap();
+    d.task_new_ac("j1", "j1-t", "w1", format!("ok REPORT_SHA:{SHA_A}"))
+        .unwrap();
     d.job_dispatch("j1-t", json!({})).unwrap();
     d.wait_task("j1-t", "review", 15);
     // The worker's pane from here on: its own processes derive `w1`.
@@ -4545,12 +4076,7 @@ fn dispatch_checks_pty_lane_cwd_against_project_repos() {
             .unwrap();
         assert!(o.status.success(), "git {}", args.join(" "));
     };
-    git(&repo, &["init", "-b", "main"]);
-    git(&repo, &["config", "user.email", "t@t"]);
-    git(&repo, &["config", "user.name", "t"]);
-    std::fs::write(repo.join("f"), "x").unwrap();
-    git(&repo, &["add", "-A"]);
-    git(&repo, &["commit", "-qm", "init"]);
+    git_f_repo(&repo, &git, |_| {});
     let cli = |args: &[&str]| lane_cli(&d, &pm_dir, &home, args);
     assert!(cli(&["issue", "init"]).0);
     let repo_s = repo.canonicalize().unwrap().to_str().unwrap().to_string();
@@ -4702,69 +4228,26 @@ fn dispatch_checks_pty_lane_cwd_against_project_repos() {
 fn dispatch_warns_on_empty_acceptance() {
     use cadence_agent::issue::dispatch::parse_acceptance_listing;
     use cadence_agent::issue::parse::AcceptanceItem;
-    let seeded = TempDir::new().unwrap();
-    let state = seeded.path().to_path_buf();
-    {
-        let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
-        let cwd = state.to_str().unwrap().to_string();
-        let member = Some("{\"upstream\":\"pm\"}");
-        for (alias, params, kind) in [
-            ("pm", None, "fake"),
-            ("w1", member, "inbox"),
-            ("j1", member, "inbox"),
-            ("j2", member, "inbox"),
-            ("j3", member, "inbox"),
-        ] {
-            store
-                .register_agent(&NewAgent {
-                    alias,
-                    provider: "fake",
-                    endpoint_kind: kind,
-                    role: "worker",
-                    cwd: &cwd,
-                    sandbox: "read-only",
-                    instructions: None,
-                    params,
-                    team_role: None,
-                    model_policy: None,
-                })
-                .unwrap();
-        }
-    }
+    let member = Some("{\"upstream\":\"pm\"}");
+    let (_seeded, state) = seeded_state(
+        &[
+            ("pm", None, "fake", "worker"),
+            ("w1", member, "inbox", "worker"),
+            ("j1", member, "inbox", "worker"),
+            ("j2", member, "inbox", "worker"),
+            ("j3", member, "inbox", "worker"),
+        ],
+        |_, _| {},
+    );
     // The daemon reads the tracker itself on `dispatch_send` (claim
     // check + lane resolution) — bind the pm dir before it starts; a
     // test daemon never falls back to ~/pm.
-    let tmp = TempDir::new().unwrap();
-    let (pm_dir, repo, home) = (
-        tmp.path().join("pm"),
-        tmp.path().join("repo"),
-        tmp.path().join("home"),
-    );
+    let (tmp, pm_dir, repo, home) = pm_lab_dirs();
     test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
     let d = TestDaemon::start_on(state);
-    for dir in [&pm_dir, &repo, &home] {
-        std::fs::create_dir_all(dir).unwrap();
-    }
-    let git = |dir: &Path, args: &[&str]| {
-        let o = std::process::Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            o.status.success(),
-            "git {}: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&o.stderr)
-        );
-    };
-    git(&repo, &["init", "-b", "main"]);
-    git(&repo, &["config", "user.email", "t@t"]);
-    git(&repo, &["config", "user.name", "t"]);
-    std::fs::write(repo.join("f"), "x").unwrap();
-    git(&repo, &["add", "-A"]);
-    git(&repo, &["commit", "-qm", "init"]);
+
+    let git = git_ok();
+    git_f_repo(&repo, &git, |_| {});
     let bin_dir = Path::new(env!("CARGO_BIN_EXE_cadence"))
         .parent()
         .unwrap()
@@ -5006,43 +4489,21 @@ fn dispatch_warns_on_empty_acceptance() {
 /// worktree, branch, job or queued message behind.
 #[test]
 fn dispatch_refuses_criteria_past_the_pty_ceiling() {
-    let seeded = TempDir::new().unwrap();
-    let state = seeded.path().to_path_buf();
-    {
-        let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
-        let cwd = state.to_str().unwrap().to_string();
-        let member = Some("{\"upstream\":\"pm\"}");
-        for (alias, params, kind) in [("pm", None, "fake"), ("w1", member, "inbox")] {
-            store
-                .register_agent(&NewAgent {
-                    alias,
-                    provider: "fake",
-                    endpoint_kind: kind,
-                    role: "worker",
-                    cwd: &cwd,
-                    sandbox: "read-only",
-                    instructions: None,
-                    params,
-                    team_role: None,
-                    model_policy: None,
-                })
-                .unwrap();
-        }
-    }
+    let member = Some("{\"upstream\":\"pm\"}");
+    let (_seeded, state) = seeded_state(
+        &[
+            ("pm", None, "fake", "worker"),
+            ("w1", member, "inbox", "worker"),
+        ],
+        |_, _| {},
+    );
     // The daemon reads the tracker itself on `dispatch_send` (claim
     // check + lane resolution) — bind the pm dir before it starts; a
     // test daemon never falls back to ~/pm.
-    let tmp = TempDir::new().unwrap();
-    let (pm_dir, repo, home) = (
-        tmp.path().join("pm"),
-        tmp.path().join("repo"),
-        tmp.path().join("home"),
-    );
+    let (tmp, pm_dir, repo, home) = pm_lab_dirs();
     test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
     let d = TestDaemon::start_on(state);
-    for dir in [&pm_dir, &repo, &home] {
-        std::fs::create_dir_all(dir).unwrap();
-    }
+
     let git = |dir: &Path, args: &[&str]| -> String {
         let o = std::process::Command::new("git")
             .arg("-C")
@@ -5058,12 +4519,7 @@ fn dispatch_refuses_criteria_past_the_pty_ceiling() {
         );
         String::from_utf8_lossy(&o.stdout).to_string()
     };
-    git(&repo, &["init", "-b", "main"]);
-    git(&repo, &["config", "user.email", "t@t"]);
-    git(&repo, &["config", "user.name", "t"]);
-    std::fs::write(repo.join("f"), "x").unwrap();
-    git(&repo, &["add", "-A"]);
-    git(&repo, &["commit", "-qm", "init"]);
+    git_f_repo(&repo, &git, |_| {});
     let bin_dir = Path::new(env!("CARGO_BIN_EXE_cadence"))
         .parent()
         .unwrap()
@@ -5178,64 +4634,23 @@ fn dispatch_refuses_criteria_past_the_pty_ceiling() {
 /// and criteria that fit only beside the shorter real names dispatch.
 #[test]
 fn dispatch_job_precheck_measures_the_issues_existing_lane() {
-    let seeded = TempDir::new().unwrap();
-    let state = seeded.path().to_path_buf();
-    {
-        let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
-        let cwd = state.to_str().unwrap().to_string();
-        let member = Some("{\"upstream\":\"pm\"}");
-        for (alias, params, kind) in [("pm", None, "fake"), ("w1", member, "inbox")] {
-            store
-                .register_agent(&NewAgent {
-                    alias,
-                    provider: "fake",
-                    endpoint_kind: kind,
-                    role: "worker",
-                    cwd: &cwd,
-                    sandbox: "read-only",
-                    instructions: None,
-                    params,
-                    team_role: None,
-                    model_policy: None,
-                })
-                .unwrap();
-        }
-    }
+    let member = Some("{\"upstream\":\"pm\"}");
+    let (_seeded, state) = seeded_state(
+        &[
+            ("pm", None, "fake", "worker"),
+            ("w1", member, "inbox", "worker"),
+        ],
+        |_, _| {},
+    );
     // The daemon reads the tracker itself on `dispatch_send` (claim
     // check + lane resolution) — bind the pm dir before it starts; a
     // test daemon never falls back to ~/pm.
-    let tmp = TempDir::new().unwrap();
-    let (pm_dir, repo, home) = (
-        tmp.path().join("pm"),
-        tmp.path().join("repo"),
-        tmp.path().join("home"),
-    );
+    let (tmp, pm_dir, repo, home) = pm_lab_dirs();
     test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
     let d = TestDaemon::start_on(state);
-    for dir in [&pm_dir, &repo, &home] {
-        std::fs::create_dir_all(dir).unwrap();
-    }
-    let git = |dir: &Path, args: &[&str]| -> String {
-        let o = std::process::Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            o.status.success(),
-            "git {}: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&o.stderr)
-        );
-        String::from_utf8_lossy(&o.stdout).trim().to_string()
-    };
-    git(&repo, &["init", "-b", "main"]);
-    git(&repo, &["config", "user.email", "t@t"]);
-    git(&repo, &["config", "user.name", "t"]);
-    std::fs::write(repo.join("f"), "x").unwrap();
-    git(&repo, &["add", "-A"]);
-    git(&repo, &["commit", "-qm", "init"]);
+
+    let git = git_stdout();
+    git_f_repo(&repo, &git, |_| {});
     let base_sha = git(&repo, &["rev-parse", "HEAD"]);
     let bin_dir = Path::new(env!("CARGO_BIN_EXE_cadence"))
         .parent()

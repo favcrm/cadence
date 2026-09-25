@@ -9,7 +9,6 @@ mod common;
 use common::*;
 
 use cadence_agent::store::NewAgent;
-use cadence_agent::store::Store;
 use serde_json::json;
 use serde_json::Value;
 use std::path::Path;
@@ -33,11 +32,8 @@ fn pty_restart_fence_unfence_resume_readopts_pane() {
     let agent = d.wait_agent("dv1", "idle", 20);
     let native = agent["thread_id"].as_str().unwrap().to_string();
     d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
-    d.rpc(
-        "agent_send",
-        json!({"alias": "dv1", "text": "task", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("dv1", json!({"text": "task", "message": "m1"}))
+        .unwrap();
     pty_token(&d, "dv1", "m1");
     let pane_pid: i32 = std::fs::read_to_string(d.pane_file(&mock, "dv1", "pid"))
         .unwrap()
@@ -89,11 +85,8 @@ fn pty_restart_fence_unfence_resume_readopts_pane() {
     assert_eq!(agent["thread_id"].as_str().unwrap(), native);
     // New work flows over the adopted pane.
     d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
-    d.rpc(
-        "agent_send",
-        json!({"alias": "dv1", "text": "again", "message": "m2"}),
-    )
-    .unwrap();
+    d.send("dv1", json!({"text": "again", "message": "m2"}))
+        .unwrap();
     d.wait_message("dv1", "m2", &["running"], 20);
 }
 
@@ -158,11 +151,8 @@ fn pty_shutdown_straggler_detaches_pane() {
     std::env::set_var("MOCK_TMUX_HOLD", "4"); // > STOP_GRACE (3s)
     std::env::set_var("MOCK_TMUX_HOLD_FMT", "#{pane_dead}");
     d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
-    d.rpc(
-        "agent_send",
-        json!({"alias": "dv1", "text": "task", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("dv1", json!({"text": "task", "message": "m1"}))
+        .unwrap();
     // Once the turn is running the actor is inside held adapter probes
     // (gate, then the idle loop's disconnected check); it cannot finish
     // inside the 3s grace, so the straggler path fires every run.
@@ -223,10 +213,9 @@ fn stopped_mid_turn_devin() -> (PathBuf, MockDevin, String, i32) {
     d.register("pm");
     d.wait_agent("dv1", "idle", 20);
     d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
-    d.rpc(
-        "agent_send",
-        json!({"alias": "dv1", "text": "task", "message": "m1",
-               "reply_to": "pm"}),
+    d.send(
+        "dv1",
+        json!({"text": "task", "message": "m1", "reply_to": "pm"}),
     )
     .unwrap();
     let token = pty_token(&d, "dv1", "m1");
@@ -286,12 +275,7 @@ fn pty_hot_restart_adopts_running_turn() {
     );
     // The turn's original token is still authoritative — the recorded
     // generation was reused, so the report validates.
-    d.rpc(
-        "message_report",
-        json!({"message": "m1", "token": token, "kind": "result",
-               "text": "done"}),
-    )
-    .unwrap();
+    d.report("m1", &token, "result", "done").unwrap();
     d.wait_message("dv1", "m1", &["completed"], 15);
     // ... and the result routed to reply_to as always.
     let pm = d.rpc("agent_show", json!({"alias": "pm"})).unwrap();
@@ -459,11 +443,8 @@ fn pty_hot_restart_submitting_never_records_running() {
     d.wait_agent("dv1", "idle", 40);
     atomic_write(d.pane_file(&mock, "dv1", "swallow"), "1");
     d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
-    d.rpc(
-        "agent_send",
-        json!({"alias": "dv1", "text": "task", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("dv1", json!({"text": "task", "message": "m1"}))
+        .unwrap();
     d.wait_message("dv1", "m1", &["submitting"], 15);
     d.rpc("shutdown", json!({})).unwrap();
     d.handle.take().unwrap().join().unwrap().unwrap();
@@ -500,11 +481,8 @@ fn pty_hot_restart_render_during_stop_adopts() {
     d.register_devin("dv1", None);
     d.wait_agent("dv1", "idle", 40);
     d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
-    d.rpc(
-        "agent_send",
-        json!({"alias": "dv1", "text": "task", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("dv1", json!({"text": "task", "message": "m1"}))
+        .unwrap();
     d.wait_message("dv1", "m1", &["submitting"], 15);
     // The stop lands mid-render; the actor finishes the proof before
     // detaching, so the marker records a genuinely running turn.
@@ -530,11 +508,8 @@ fn hot_restart_managed_turn_stays_unknown() {
     let mut d = TestDaemon::start();
     d.register("w1");
     d.wait_agent("w1", "idle", 25);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "SLEEP:60", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "SLEEP:60", "message": "m1"}))
+        .unwrap();
     d.wait_message("w1", "m1", &["running"], 25);
     d.rpc("shutdown", json!({})).unwrap();
     d.handle.take().unwrap().join().unwrap().unwrap();
@@ -560,11 +535,7 @@ fn pty_hot_restart_report_before_adoption_rejected_stale() {
     std::env::set_var("MOCK_TMUX_HOLD", "8");
     std::env::set_var("MOCK_TMUX_HOLD_CMD", "has-session");
     let d = TestDaemon::start_on(state);
-    let early = d.rpc(
-        "message_report",
-        json!({"message": "m1", "token": token, "kind": "result",
-               "text": "early"}),
-    );
+    let early = d.report("m1", &token, "result", "early");
     std::env::remove_var("MOCK_TMUX_HOLD");
     std::env::remove_var("MOCK_TMUX_HOLD_CMD");
     let err = early.expect_err("pre-proof report must be refused");
@@ -578,12 +549,7 @@ fn pty_hot_restart_report_before_adoption_rejected_stale() {
         event_kinds(&d, "dv1").iter().any(|k| k == "turn_adopted"),
         "pane proof did not adopt the turn"
     );
-    d.rpc(
-        "message_report",
-        json!({"message": "m1", "token": token, "kind": "result",
-               "text": "done"}),
-    )
-    .unwrap();
+    d.report("m1", &token, "result", "done").unwrap();
     d.wait_message("dv1", "m1", &["completed"], 15);
 }
 
@@ -604,11 +570,8 @@ fn pty_hot_restart_adopts_multiple_running_turns() {
     let agent = d.wait_agent("dv1", "idle", 20);
     let generation = agent["generation"].as_str().unwrap().to_string();
     d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
-    d.rpc(
-        "agent_send",
-        json!({"alias": "dv1", "text": "task", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("dv1", json!({"text": "task", "message": "m1"}))
+        .unwrap();
     let token1 = pty_token(&d, "dv1", "m1");
     // m2's row as a second proven turn on the same pane — inserted
     // `running` outright so the actor never sees it `queued` and the
@@ -648,12 +611,7 @@ fn pty_hot_restart_adopts_multiple_running_turns() {
     assert_eq!(d.message_state("dv1", "m1"), "running");
     assert_eq!(d.message_state("dv1", "m2"), "running");
     for (id, token) in [("m1", token1), ("m2", token2)] {
-        d.rpc(
-            "message_report",
-            json!({"message": id, "token": token, "kind": "result",
-                   "text": "done"}),
-        )
-        .unwrap();
+        d.report(id, &token, "result", "done").unwrap();
         d.wait_message("dv1", id, &["completed"], 15);
     }
 }
@@ -669,9 +627,9 @@ fn pty_nudge_queued_at_restart_is_cancelled_not_replayed() {
     d.wait_agent("dv1", "idle", 20);
     // An open approval menu holds every paste at the gate.
     atomic_write(d.pane_file(&mock, "dv1", "tui-state"), DEVIN_MENU);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "dv1", "text": "late steer", "message": "n1", "nudge": true}),
+    d.send(
+        "dv1",
+        json!({"text": "late steer", "message": "n1", "nudge": true}),
     )
     .unwrap();
     d.wait_event_where("dv1", "gate_wait", |e| e["payload"]["message"] == "n1", 20);
@@ -774,11 +732,8 @@ fn pty_hot_restart_retires_stale_awaiting_report_rows() {
     let timeouts = wait_event_count(&d, "dv1", "report_timeout", 3, 5);
     assert_eq!(timeouts.len(), 3);
     // Fenced, so a later send is held, never delivered to the pane.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "dv1", "text": "after", "message": "new1"}),
-    )
-    .unwrap();
+    d.send("dv1", json!({"text": "after", "message": "new1"}))
+        .unwrap();
     assert_eq!(d.message_state("dv1", "new1"), "queued");
     let show = d.rpc("agent_show", json!({"alias": "dv1"})).unwrap();
     assert_eq!(show["unknown"], 3, "{show}");
@@ -793,10 +748,9 @@ fn park_idle_labelled_turns(d: &TestDaemon, mock: &MockDevin) -> (String, String
     d.register("pm");
     d.wait_agent("dv1", "idle", 20);
     d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
-    d.rpc(
-        "agent_send",
-        json!({"alias": "dv1", "text": "task", "message": "m1",
-               "reply_to": "pm"}),
+    d.send(
+        "dv1",
+        json!({"text": "task", "message": "m1", "reply_to": "pm"}),
     )
     .unwrap();
     let token1 = pty_token(d, "dv1", "m1");
@@ -947,12 +901,7 @@ fn restart_idle_pty_after_forced_detach(via_signal: bool) {
         "restart must not replay a paste into the pane"
     );
     for (id, token) in [("m1", token1.as_str()), ("m2", token2.as_str())] {
-        d.rpc(
-            "message_report",
-            json!({"message": id, "token": token, "kind": "result",
-                   "text": "done"}),
-        )
-        .unwrap();
+        d.report(id, token, "result", "done").unwrap();
         d.wait_message("dv1", id, &["completed"], 15);
     }
     let pm = d.rpc("agent_show", json!({"alias": "pm"})).unwrap();
@@ -1129,11 +1078,8 @@ fn pty_hot_restart_token_predates_generation_fences() {
     d.register_devin("dv1", None);
     d.wait_agent("dv1", "idle", 20);
     d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
-    d.rpc(
-        "agent_send",
-        json!({"alias": "dv1", "text": "task", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("dv1", json!({"text": "task", "message": "m1"}))
+        .unwrap();
     let _token = pty_token(&d, "dv1", "m1");
     // A "resume" that minted a newer generation than m1's token.
     {
@@ -1273,11 +1219,8 @@ fn pty_dead_pane_fences_submitted_and_stops_actor() {
     d.register_devin("dv1", None);
     d.wait_agent("dv1", "idle", 20);
     d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
-    d.rpc(
-        "agent_send",
-        json!({"alias": "dv1", "text": "task", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("dv1", json!({"text": "task", "message": "m1"}))
+        .unwrap();
     pty_token(&d, "dv1", "m1");
 
     // Kill the pane's whole process group: the submitted message can no
@@ -1342,11 +1285,8 @@ fn pty_unrendered_task_fences_unknown() {
     d.wait_agent("dv", "idle", 20);
     // The pane drops the paste entirely (TUI swallowed the input).
     atomic_write(d.pane_file(&mock, "dv", "swallow"), "1");
-    d.rpc(
-        "agent_send",
-        json!({"alias": "dv", "text": "task that vanishes", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("dv", json!({"text": "task that vanishes", "message": "m1"}))
+        .unwrap();
     // A provable paste miss on a task message: unknown + attention —
     // never a blind replay.
     d.wait_message("dv", "m1", &["unknown"], 20);
@@ -1375,11 +1315,8 @@ fn pty_fence_detaches_pane_for_resume() {
     // The pane drops the paste entirely: unrendered → fence.
     atomic_write(d.pane_file(&mock, "dv1", "swallow"), "1");
     d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
-    d.rpc(
-        "agent_send",
-        json!({"alias": "dv1", "text": "task", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("dv1", json!({"text": "task", "message": "m1"}))
+        .unwrap();
     d.wait_message("dv1", "m1", &["unknown"], 20);
     d.wait_agent("dv1", "attention", 15);
     // The fence detached — the pane process and its pid file are
@@ -1414,11 +1351,8 @@ fn pty_fence_detaches_pane_for_resume() {
     assert_eq!(agent["thread_id"].as_str().unwrap(), native);
     // New work flows over the adopted pane.
     d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
-    d.rpc(
-        "agent_send",
-        json!({"alias": "dv1", "text": "again", "message": "m2"}),
-    )
-    .unwrap();
+    d.send("dv1", json!({"text": "again", "message": "m2"}))
+        .unwrap();
     d.wait_message("dv1", "m2", &["running"], 20);
 }
 
@@ -1437,10 +1371,9 @@ fn pty_stop_remove_gc_kill_surviving_panes() {
     for alias in ["dv-stop", "dv-rm", "dv-gc"] {
         atomic_write(d.pane_file(&mock, alias, "swallow"), "1");
         d.rpc("agent_ready", json!({"alias": alias})).unwrap();
-        d.rpc(
-            "agent_send",
-            json!({"alias": alias, "text": "task",
-                   "message": format!("m-{alias}")}),
+        d.send(
+            alias,
+            json!({"text": "task", "message": format!("m-{alias}")}),
         )
         .unwrap();
     }
@@ -1512,11 +1445,8 @@ fn pty_unfence_resume_reports_adopted_pane() {
     let agent = d.wait_agent("dv1", "idle", 20);
     let native = agent["thread_id"].as_str().unwrap().to_string();
     d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
-    d.rpc(
-        "agent_send",
-        json!({"alias": "dv1", "text": "task", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("dv1", json!({"text": "task", "message": "m1"}))
+        .unwrap();
     pty_report_done(&d, "dv1", "m1");
     let pane_pid: i32 = std::fs::read_to_string(d.pane_file(&mock, "dv1", "pid"))
         .unwrap()
@@ -1526,11 +1456,8 @@ fn pty_unfence_resume_reports_adopted_pane() {
     // Fence: the paste never renders; the pane is detached, not killed.
     atomic_write(d.pane_file(&mock, "dv1", "swallow"), "1");
     d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
-    d.rpc(
-        "agent_send",
-        json!({"alias": "dv1", "text": "dropped", "message": "m2"}),
-    )
-    .unwrap();
+    d.send("dv1", json!({"text": "dropped", "message": "m2"}))
+        .unwrap();
     d.wait_agent("dv1", "attention", 25);
     // One call reconciles the unknown and brings the agent back.
     let r = d
@@ -1570,11 +1497,8 @@ fn pty_unfence_resume_reports_respawned_pane() {
         .unwrap();
     atomic_write(d.pane_file(&mock, "dv1", "swallow"), "1");
     d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
-    d.rpc(
-        "agent_send",
-        json!({"alias": "dv1", "text": "dropped", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("dv1", json!({"text": "dropped", "message": "m1"}))
+        .unwrap();
     d.wait_agent("dv1", "attention", 25);
     // The detached pane dies out-of-band before the resume — nothing
     // left to adopt.
@@ -1615,11 +1539,8 @@ fn pty_unfence_resume_busy_adopted_pane_stays_gated() {
     // Fence; the pane survives detached.
     atomic_write(d.stub_pane_file(&mock, "st", "swallow"), "1");
     d.rpc("agent_ready", json!({"alias": "st"})).unwrap();
-    d.rpc(
-        "agent_send",
-        json!({"alias": "st", "text": "dropped", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("st", json!({"text": "dropped", "message": "m1"}))
+        .unwrap();
     d.wait_agent("st", "attention", 25);
     // The surviving pane is visibly busy — adoption still lands.
     atomic_write(d.stub_pane_file(&mock, "st", "tui-state"), "stub working\n");
@@ -1634,11 +1555,8 @@ fn pty_unfence_resume_busy_adopted_pane_stays_gated() {
     assert_eq!(r["pane"], "adopted", "{r}");
     d.wait_agent("st", "idle", 20);
     // A send without ready must not paste into the busy pane.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "st", "text": "wait for idle", "message": "m2"}),
-    )
-    .unwrap();
+    d.send("st", json!({"text": "wait for idle", "message": "m2"}))
+        .unwrap();
     let wait = d.wait_event("st", "gate_wait", 15);
     assert!(
         wait["payload"]["reason"]
@@ -1866,18 +1784,14 @@ fn pty_stop_reaps_pane_session_tree() {
 /// tree is unowned and signals nothing beyond the pane.
 #[test]
 fn pty_stop_without_pane_root_records_unowned_tree() {
-    let seeded = TempDir::new().unwrap();
-    let state = seeded.path().to_path_buf();
-    {
-        let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
-        let cwd = state.to_str().unwrap().to_string();
+    let (_seeded, state) = seeded_state(&[], |store, cwd| {
         store
             .register_agent(&NewAgent {
                 alias: "old",
                 provider: "tui-stub",
                 endpoint_kind: "pty",
                 role: "worker",
-                cwd: &cwd,
+                cwd,
                 sandbox: "read-only",
                 instructions: None,
                 params: None,
@@ -1887,7 +1801,7 @@ fn pty_stop_without_pane_root_records_unowned_tree() {
             .unwrap();
         store.set_enabled("old", false).unwrap();
         store.set_agent_state("old", "stopped", None).unwrap();
-    }
+    });
     let d = TestDaemon::start_on(state);
     let _mock = d.mock_stub();
     d.rpc("agent_stop", json!({"alias": "old"})).unwrap();
@@ -1914,11 +1828,12 @@ fn pty_deleted_cwd_refuses_delivery_and_is_surfaced() {
     let _mock = d.mock_stub();
     let lane = d.dir.path().join("lane-wt");
     std::fs::create_dir_all(&lane).unwrap();
-    d.rpc(
-        "agent_register",
-        json!({"alias": "st", "provider": "tui-stub", "endpoint_kind": "pty",
-               "cwd": lane.to_str().unwrap(),
-               "params": json!({"auto_ready": "verified"}).to_string()}),
+    d.register_pcp(
+        "st",
+        "tui-stub",
+        "pty",
+        lane.to_str().unwrap(),
+        &json!({"auto_ready": "verified"}).to_string(),
     )
     .unwrap();
     let agent = d.wait_agent("st", "idle", 20);
@@ -1934,11 +1849,8 @@ fn pty_deleted_cwd_refuses_delivery_and_is_surfaced() {
     assert_eq!(agent["cwd_deleted"], true, "{agent}");
     assert_eq!(agent["pane_cwd"]["deleted"], true, "{agent}");
 
-    d.rpc(
-        "agent_send",
-        json!({"alias": "st", "text": "work here", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("st", json!({"text": "work here", "message": "m1"}))
+        .unwrap();
     let wait = d.wait_event("st", "gate_wait", 15);
     assert!(
         wait["payload"]["reason"]
