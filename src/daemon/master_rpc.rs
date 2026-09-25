@@ -230,7 +230,7 @@ impl Shared {
         // read — `ready`, blockers done — under the same lock the
         // dispatch runs under, so a concurrent second call sees `doing`
         // and is refused having written nothing. The dispatch's own
-        // daemon calls (agent_show, agent_send) never take this lock.
+        // daemon calls (agent_show, dispatch_send) never take this lock.
         let _serial = self.dispatch_lock.lock().unwrap_or_else(|e| e.into_inner());
         // CAD-431: a dispatch the review loop cannot record does not
         // happen — an unreadable delivery.json refuses before anything.

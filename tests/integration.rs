@@ -414,15 +414,19 @@ impl TestDaemon {
     /// through [`Self::operator_rpc`]. A suite run inside an agent pane
     /// carries `CADENCE_ALIAS` on its ancestry without any plant —
     /// unattributed then, and refused for missing operator proof, so
-    /// that refusal goes the operator's way too. Every gate refusal
-    /// reads "… is an operator action …"; the retry replays the same
-    /// call, so a refusal that is not about proof comes back unchanged.
+    /// that refusal goes the operator's way too. Gate refusals read
+    /// "… is an operator action …" or "… not provably the operator …";
+    /// the retry replays the same call, so a refusal that is not about
+    /// proof comes back unchanged.
     fn fixture_rpc(&self, method: &str, params: Value) -> cadence_agent::Result<Value> {
         if self.rpc("agent_show", json!({"alias": SELF_LANE})).is_ok() {
             return self.operator_rpc(method, params);
         }
         match self.rpc(method, params.clone()) {
-            Err(e) if e.to_string().contains("operator action") => {
+            Err(e)
+                if e.to_string().contains("operator action")
+                    || e.to_string().contains("not provably the operator") =>
+            {
                 self.operator_rpc(method, params)
             }
             r => r,
@@ -14236,7 +14240,7 @@ fn dispatch_dedupes_live_kickoff_and_reassign_bumps() {
 
     // Live kickoff → second dispatch is the SAME revision, same id.
     // Deterministic: stop w1 first so its queue never drains.
-    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    d.fixture_rpc("agent_stop", json!({"alias": "w1"})).unwrap();
     let r1 = d.job_dispatch("j1-t2", json!({})).unwrap();
     let k1 = r1["message"].as_str().unwrap().to_string();
     assert_eq!(r1["task"]["state"], "dispatched");
@@ -14262,7 +14266,8 @@ fn dispatch_dedupes_live_kickoff_and_reassign_bumps() {
 
     // The natural reassign path: let the kickoff complete, revise,
     // then --to bumps the revision with a fresh kickoff id.
-    d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
+    d.fixture_rpc("agent_resume", json!({"alias": "w1"}))
+        .unwrap();
     d.wait_message("w1", &k1, &["completed"], 15);
     d.wait_task("j1-t2", "review", 15);
     d.job_verdict("j1-t2", SHA_A, "revise").unwrap();
@@ -20239,17 +20244,19 @@ fn dispatch_kickoff_and_finish_guards() {
             .set_agent_state("fenced", "attention", Some("test fence"))
             .unwrap();
     }
-    let d = TestDaemon::start_on(state);
-    d.wait_agent("fenced", "attention", 10);
-
     // Tracker + project repo + issues fixture (same shape as the
-    // issue-start test).
+    // issue-start test). The daemon reads the tracker itself on
+    // `dispatch_send` (claim check + lane resolution), so the pm dir
+    // binds before it starts — a test daemon never falls back to ~/pm.
     let tmp = TempDir::new().unwrap();
     let (pm_dir, repo, home) = (
         tmp.path().join("pm"),
         tmp.path().join("repo"),
         tmp.path().join("home"),
     );
+    test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
+    let d = TestDaemon::start_on(state);
+    d.wait_agent("fenced", "attention", 10);
     for dir in [&pm_dir, &repo, &home] {
         std::fs::create_dir_all(dir).unwrap();
     }
@@ -20575,7 +20582,8 @@ fn dispatch_kickoff_and_finish_guards() {
         json!({"alias": "dvb", "text": "keep working", "message": "mk1"}),
     )
     .unwrap();
-    d.rpc("agent_ready", json!({"alias": "dvb"})).unwrap();
+    d.fixture_rpc("agent_ready", json!({"alias": "dvb"}))
+        .unwrap();
     d.wait_message("dvb", "mk1", &["running"], 10);
     let wt3 = repo.join(".cadence/wt/d-3-three");
     // Give the branch real work so survivability blocks too — the
@@ -20690,13 +20698,17 @@ fn dispatch_records_ref_before_send() {
                 .unwrap();
         }
     }
-    let d = TestDaemon::start_on(state);
+    // The daemon reads the tracker itself on `dispatch_send` (claim
+    // check + lane resolution) — bind the pm dir before it starts; a
+    // test daemon never falls back to ~/pm.
     let tmp = TempDir::new().unwrap();
     let (pm_dir, repo, home) = (
         tmp.path().join("pm"),
         tmp.path().join("repo"),
         tmp.path().join("home"),
     );
+    test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
+    let d = TestDaemon::start_on(state);
     for dir in [&pm_dir, &repo, &home] {
         std::fs::create_dir_all(dir).unwrap();
     }
@@ -20890,13 +20902,17 @@ fn dispatch_folds_bootstrap_and_suppresses_reported_duplicate() {
                 .unwrap();
         }
     }
-    let d = TestDaemon::start_on(state);
+    // The daemon reads the tracker itself on `dispatch_send` (claim
+    // check + lane resolution) — bind the pm dir before it starts; a
+    // test daemon never falls back to ~/pm.
     let tmp = TempDir::new().unwrap();
     let (pm_dir, repo, home) = (
         tmp.path().join("pm"),
         tmp.path().join("repo"),
         tmp.path().join("home"),
     );
+    test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
+    let d = TestDaemon::start_on(state);
     for dir in [&pm_dir, &repo, &home] {
         std::fs::create_dir_all(dir).unwrap();
     }
@@ -21371,13 +21387,17 @@ fn finish_guard_per_worktree() {
             .enqueue("deadpty", "queued forever", None, "mkdead", "test")
             .unwrap();
     }
-    let d = TestDaemon::start_on(state);
+    // The daemon reads the tracker itself on `dispatch_send` (claim
+    // check + lane resolution) — bind the pm dir before it starts; a
+    // test daemon never falls back to ~/pm.
     let tmp = TempDir::new().unwrap();
     let (pm_dir, repo, home) = (
         tmp.path().join("pm"),
         tmp.path().join("repo"),
         tmp.path().join("home"),
     );
+    test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
+    let d = TestDaemon::start_on(state);
     for dir in [&pm_dir, &repo, &home] {
         std::fs::create_dir_all(dir).unwrap();
     }
@@ -23234,14 +23254,16 @@ fn dispatch_injects_project_memory_lessons() {
                 .unwrap();
         }
     }
-    let d = TestDaemon::start_on(state);
-
     let tmp = TempDir::new().unwrap();
     let (pm_dir, repo, home) = (
         tmp.path().join("pm"),
         tmp.path().join("repo"),
         tmp.path().join("home"),
     );
+    // dispatch_send reads the tracker daemon-side (claim + lane refs) —
+    // bind CADENCE_PM_DIR into the daemon's env before it starts.
+    test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
+    let d = TestDaemon::start_on(state);
     for dir in [&pm_dir, &repo, &home] {
         std::fs::create_dir_all(dir).unwrap();
     }
@@ -23787,14 +23809,16 @@ fn dispatch_degrades_on_memory_failures() {
                 .unwrap();
         }
     }
-    let d = TestDaemon::start_on(state);
-
     let tmp = TempDir::new().unwrap();
     let (pm_dir, repo, home) = (
         tmp.path().join("pm"),
         tmp.path().join("repo"),
         tmp.path().join("home"),
     );
+    // dispatch_send reads the tracker daemon-side (claim + lane refs) —
+    // bind CADENCE_PM_DIR into the daemon's env before it starts.
+    test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
+    let d = TestDaemon::start_on(state);
     for dir in [&pm_dir, &repo, &home] {
         std::fs::create_dir_all(dir).unwrap();
     }
@@ -38947,8 +38971,9 @@ fn pty_deleted_cwd_refuses_delivery_and_is_surfaced() {
 /// start --job --assignee` applies the same check.
 #[test]
 fn dispatch_checks_pty_lane_cwd_against_project_repos() {
-    let d = TestDaemon::start();
-    let _mock = d.mock_stub();
+    // The daemon reads the tracker itself on `dispatch_send` (claim
+    // check + lane resolution) — bind the pm dir before it starts; a
+    // test daemon never falls back to ~/pm.
     let tmp = TempDir::new().unwrap();
     let (pm_dir, repo, home, elsewhere, gone) = (
         tmp.path().join("pm"),
@@ -38957,6 +38982,9 @@ fn dispatch_checks_pty_lane_cwd_against_project_repos() {
         tmp.path().join("elsewhere"),
         tmp.path().join("gone"),
     );
+    test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
+    let d = TestDaemon::start();
+    let _mock = d.mock_stub();
     for dir in [&pm_dir, &repo, &home, &elsewhere, &gone] {
         std::fs::create_dir_all(dir).unwrap();
     }
@@ -40507,13 +40535,17 @@ fn dispatch_warns_on_empty_acceptance() {
                 .unwrap();
         }
     }
-    let d = TestDaemon::start_on(state);
+    // The daemon reads the tracker itself on `dispatch_send` (claim
+    // check + lane resolution) — bind the pm dir before it starts; a
+    // test daemon never falls back to ~/pm.
     let tmp = TempDir::new().unwrap();
     let (pm_dir, repo, home) = (
         tmp.path().join("pm"),
         tmp.path().join("repo"),
         tmp.path().join("home"),
     );
+    test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
+    let d = TestDaemon::start_on(state);
     for dir in [&pm_dir, &repo, &home] {
         std::fs::create_dir_all(dir).unwrap();
     }
@@ -41413,13 +41445,17 @@ fn dispatch_refuses_criteria_past_the_pty_ceiling() {
                 .unwrap();
         }
     }
-    let d = TestDaemon::start_on(state);
+    // The daemon reads the tracker itself on `dispatch_send` (claim
+    // check + lane resolution) — bind the pm dir before it starts; a
+    // test daemon never falls back to ~/pm.
     let tmp = TempDir::new().unwrap();
     let (pm_dir, repo, home) = (
         tmp.path().join("pm"),
         tmp.path().join("repo"),
         tmp.path().join("home"),
     );
+    test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
+    let d = TestDaemon::start_on(state);
     for dir in [&pm_dir, &repo, &home] {
         std::fs::create_dir_all(dir).unwrap();
     }
@@ -45269,13 +45305,17 @@ fn dispatch_job_precheck_measures_the_issues_existing_lane() {
                 .unwrap();
         }
     }
-    let d = TestDaemon::start_on(state);
+    // The daemon reads the tracker itself on `dispatch_send` (claim
+    // check + lane resolution) — bind the pm dir before it starts; a
+    // test daemon never falls back to ~/pm.
     let tmp = TempDir::new().unwrap();
     let (pm_dir, repo, home) = (
         tmp.path().join("pm"),
         tmp.path().join("repo"),
         tmp.path().join("home"),
     );
+    test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
+    let d = TestDaemon::start_on(state);
     for dir in [&pm_dir, &repo, &home] {
         std::fs::create_dir_all(dir).unwrap();
     }
