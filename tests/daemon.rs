@@ -166,7 +166,9 @@ fn approval_lifecycle() {
     )
     .unwrap();
     d.wait_agent("w1", "waiting_input", 10);
-    let requests = d.rpc("agent_requests", json!({"alias": "w1"})).unwrap();
+    let requests = d
+        .operator_rpc("agent_requests", json!({"alias": "w1"}))
+        .unwrap();
     let list = requests["requests"].as_array().unwrap();
     assert_eq!(list.len(), 1);
     assert_eq!(list[0]["method"], "item/commandExecution/requestApproval");
@@ -189,7 +191,8 @@ fn approval_lifecycle() {
         "FAKE_DECIDED:{\"decision\":\"accept\"}"
     );
     assert_eq!(
-        d.rpc("agent_requests", json!({"alias": "w1"})).unwrap()["requests"]
+        d.operator_rpc("agent_requests", json!({"alias": "w1"}))
+            .unwrap()["requests"]
             .as_array()
             .unwrap()
             .len(),
@@ -983,7 +986,8 @@ fn second_daemon_fails_without_touching_state() {
     let m1 = &show["messages"].as_array().unwrap()[0];
     assert_eq!(m1["state"], "running");
     assert_eq!(
-        d.rpc("agent_requests", json!({"alias": "w1"})).unwrap()["requests"]
+        d.operator_rpc("agent_requests", json!({"alias": "w1"}))
+            .unwrap()["requests"]
             .as_array()
             .unwrap()
             .len(),
@@ -1089,7 +1093,8 @@ fn stop_during_approval_is_bounded() {
     // interrupted, not stuck running.
     d.wait_message("w1", "m1", &["interrupted"], 10);
     assert_eq!(
-        d.rpc("agent_requests", json!({"alias": "w1"})).unwrap()["requests"]
+        d.operator_rpc("agent_requests", json!({"alias": "w1"}))
+            .unwrap()["requests"]
             .as_array()
             .unwrap()
             .len(),
@@ -4030,7 +4035,9 @@ fn agent_respond_refuses_the_requester_and_its_peers() {
         "cannot answer another agent's request",
         "peer",
     );
-    let pending = d.rpc("agent_requests", json!({"alias": "wr"})).unwrap();
+    let pending = d
+        .operator_rpc("agent_requests", json!({"alias": "wr"}))
+        .unwrap();
     assert_eq!(pending["requests"][0]["request"], "h1", "{pending}");
 
     // The requester's PM answers; so does the operator.
@@ -4042,7 +4049,9 @@ fn agent_respond_refuses_the_requester_and_its_peers() {
         json!({"alias": "wr", "request": "h2", "decision": "decline"}),
     )
     .unwrap();
-    let pending = d.rpc("agent_requests", json!({"alias": "wr"})).unwrap();
+    let pending = d
+        .operator_rpc("agent_requests", json!({"alias": "wr"}))
+        .unwrap();
     assert_eq!(pending["requests"], json!([]), "{pending}");
 }
 

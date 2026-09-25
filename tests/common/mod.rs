@@ -3302,7 +3302,9 @@ impl TestDaemon {
     pub fn wait_request(&self, alias: &str, secs: u64) -> Value {
         let deadline = Instant::now() + Duration::from_secs(secs);
         loop {
-            let requests = self.rpc("agent_requests", json!({"alias": alias})).unwrap()["requests"]
+            let requests = self
+                .operator_rpc("agent_requests", json!({"alias": alias}))
+                .unwrap()["requests"]
                 .as_array()
                 .unwrap()
                 .clone();
@@ -3319,7 +3321,8 @@ impl TestDaemon {
 
     /// Pending request handles for an alias right now.
     pub fn requests(&self, alias: &str) -> Vec<Value> {
-        self.rpc("agent_requests", json!({"alias": alias})).unwrap()["requests"]
+        self.operator_rpc("agent_requests", json!({"alias": alias}))
+            .unwrap()["requests"]
             .as_array()
             .unwrap()
             .clone()

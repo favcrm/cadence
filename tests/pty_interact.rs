@@ -415,7 +415,9 @@ fn fake_silent_turn_stalls_and_brokered_wait_does_not() {
         "brokered wait stalled: {:?}",
         d.events("w1")
     );
-    let requests = d.rpc("agent_requests", json!({"alias": "w1"})).unwrap();
+    let requests = d
+        .operator_rpc("agent_requests", json!({"alias": "w1"}))
+        .unwrap();
     let handle = requests["requests"][0]["request"].as_str().unwrap();
     d.operator_rpc(
         "agent_respond",
@@ -2032,7 +2034,9 @@ fn urgent_waits_for_the_open_approval_then_goes_first() {
     // The open approval and its turn are untouched.
     assert_eq!(shown_message(&d, "w1", "m0")["state"], "running");
     assert_eq!(shown_message(&d, "w1", "u1")["state"], "queued");
-    let requests = d.rpc("agent_requests", json!({"alias": "w1"})).unwrap();
+    let requests = d
+        .operator_rpc("agent_requests", json!({"alias": "w1"}))
+        .unwrap();
     let list = requests["requests"].as_array().unwrap();
     assert_eq!(list.len(), 1, "{requests}");
     let handle = list[0]["request"].as_str().unwrap().to_string();

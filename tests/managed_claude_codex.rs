@@ -872,7 +872,9 @@ fn ws_approval_is_brokered() {
     )
     .unwrap();
     d.wait_agent("w1", "waiting_input", 15);
-    let requests = d.rpc("agent_requests", json!({"alias": "w1"})).unwrap();
+    let requests = d
+        .operator_rpc("agent_requests", json!({"alias": "w1"}))
+        .unwrap();
     let handle = requests["requests"][0]["request"].as_str().unwrap();
     let answered = d
         .operator_rpc(
@@ -1062,7 +1064,9 @@ fn ws_external_approval_resolution_drops_pending() {
     )
     .unwrap();
     d.wait_agent("w1", "waiting_input", 15);
-    let requests = d.rpc("agent_requests", json!({"alias": "w1"})).unwrap();
+    let requests = d
+        .operator_rpc("agent_requests", json!({"alias": "w1"}))
+        .unwrap();
     let handle = requests["requests"][0]["request"]
         .as_str()
         .unwrap()
@@ -1080,7 +1084,9 @@ fn ws_external_approval_resolution_drops_pending() {
         late.to_string().contains("no longer pending"),
         "late respond should be rejected: {late}"
     );
-    let requests = d.rpc("agent_requests", json!({"alias": "w1"})).unwrap();
+    let requests = d
+        .operator_rpc("agent_requests", json!({"alias": "w1"}))
+        .unwrap();
     assert_eq!(requests["requests"].as_array().unwrap().len(), 0);
     d.wait_agent("w1", "idle", 10);
     // The rejected late respond must not regress the finished turn to
@@ -1149,7 +1155,9 @@ fn ws_concurrent_respond_has_single_winner() {
     )
     .unwrap();
     d.wait_agent("w1", "waiting_input", 15);
-    let requests = d.rpc("agent_requests", json!({"alias": "w1"})).unwrap();
+    let requests = d
+        .operator_rpc("agent_requests", json!({"alias": "w1"}))
+        .unwrap();
     let handle = requests["requests"][0]["request"]
         .as_str()
         .unwrap()
@@ -1198,7 +1206,9 @@ fn ws_second_pending_request_keeps_waiting() {
     )
     .unwrap();
     d.wait_agent("w1", "waiting_input", 15);
-    let requests = d.rpc("agent_requests", json!({"alias": "w1"})).unwrap();
+    let requests = d
+        .operator_rpc("agent_requests", json!({"alias": "w1"}))
+        .unwrap();
     let handles: Vec<String> = requests["requests"]
         .as_array()
         .unwrap()

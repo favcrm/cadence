@@ -121,7 +121,13 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         Rule::Handler("rpc_thread_send: agents refused, operator on proof (CAD-384)"),
     ),
     ("agent_events", Rule::Read),
-    ("agent_requests", Rule::Read),
+    (
+        "agent_requests",
+        Rule::Handler(
+            "agent_caller: pending rows disclose to the operator, the owning \
+             agent and its PM — a peer sees none (CAD-506)",
+        ),
+    ),
     (
         "agent_respond",
         Rule::Handler("authorize_respond: the operator or the requester's PM (CAD-370)"),

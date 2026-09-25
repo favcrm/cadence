@@ -110,10 +110,6 @@ impl Daemon {
         self.serve();
     }
 
-    fn rpc(&self, method: &str, params: Value) -> cadence_agent::Result<Value> {
-        client::rpc(&self.state, method, params)
-    }
-
     fn op(&self, method: &str, params: Value) -> cadence_agent::Result<Value> {
         let frame = op::operator_rpc(&client::socket_path(&self.state), method, params);
         proto::unwrap(frame)
@@ -159,6 +155,12 @@ struct Lane {
     stdout: BufReader<std::process::ChildStdout>,
     dir: TempDir,
     seq: u64,
+    /// The row's `endpoint`/`state` as planted — a daemon restart's
+    /// recover() clears runtime fields on every non-inbox agent, so the
+    /// surviving pane replants them (what re-adoption does live).
+    endpoint: Option<String>,
+    state: String,
+    alias: String,
 }
 
 impl Lane {
@@ -169,12 +171,15 @@ impl Lane {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        let lane = Lane {
+        let mut lane = Lane {
             stdin: child.stdin.take().unwrap(),
             stdout: BufReader::new(child.stdout.take().unwrap()),
             child,
             dir: TempDir::new().unwrap(),
             seq: 0,
+            endpoint: None,
+            state: String::new(),
+            alias: alias.to_string(),
         };
         let mut req = json!({"alias": alias, "provider": "inbox",
                              "endpoint_kind": "inbox", "role": role,
@@ -184,14 +189,38 @@ impl Lane {
         }
         d.op("agent_register", req)
             .unwrap_or_else(|e| panic!("register {alias}: {e}"));
+        lane.replant(d);
+        let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+        let (endpoint, state): (Option<String>, String) = conn
+            .query_row(
+                "SELECT endpoint, state FROM agents WHERE alias=?1",
+                [alias],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        lane.endpoint = endpoint;
+        lane.state = state;
+        lane
+    }
+
+    /// The pane survived a daemon restart but the row's runtime fields
+    /// did not — recover() clears them on every non-inbox agent. Write
+    /// the planted facts back, as live re-adoption would.
+    fn replant(&self, d: &Daemon) {
         let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
         conn.execute(
             "UPDATE agents SET endpoint_kind='pty', pid=?1, pid_start=?3, \
                 enabled=0, generation='planted', session_id='planted' WHERE alias=?2",
-            rusqlite::params![lane.pid() as i64, alias, proc_start(lane.pid())],
+            rusqlite::params![self.pid() as i64, self.alias, proc_start(self.pid())],
         )
         .unwrap();
-        lane
+        if let Some(endpoint) = &self.endpoint {
+            conn.execute(
+                "UPDATE agents SET endpoint=?1, state=?2 WHERE alias=?3",
+                rusqlite::params![endpoint, self.state, self.alias],
+            )
+            .unwrap();
+        }
     }
 
     fn pid(&self) -> u32 {
@@ -369,8 +398,7 @@ fn fixture_dir() -> PathBuf {
 }
 
 fn load_vector_fixture() -> Value {
-    let text =
-        std::fs::read_to_string(fixture_dir().join("vectors.json")).unwrap();
+    let text = std::fs::read_to_string(fixture_dir().join("vectors.json")).unwrap();
     serde_json::from_str(&text).unwrap()
 }
 
@@ -381,7 +409,10 @@ fn assert_record(actual: &Value, specimen: &Value, ctx: &str) {
     let mut live = actual.clone();
     if let Some(d) = live.get_mut("decision") {
         let at = d["at"].as_str().unwrap_or_default();
-        assert!(at.contains('T') && at.ends_with('Z'), "{ctx}: decision.at={at}");
+        assert!(
+            at.contains('T') && at.ends_with('Z'),
+            "{ctx}: decision.at={at}"
+        );
         d.as_object_mut().unwrap().remove("at");
     }
     let mut want = specimen.clone();
@@ -428,9 +459,8 @@ fn run_vector(vector: &Value) {
         .unwrap_or_else(|e| panic!("{id}: tool table unparseable: {e}"));
     let platform = table.platform.clone();
     let fake = Arc::new(FakePlatform::new(table));
-    match given.get("reported_manifest_version") {
-        Some(v) => fake.set_reported_manifest_version(v.as_str().map(str::to_string)),
-        None => {}
+    if let Some(v) = given.get("reported_manifest_version") {
+        fake.set_reported_manifest_version(v.as_str().map(str::to_string));
     }
     if let Some(sources) = given.get("sources").and_then(Value::as_object) {
         for (name, content) in sources {
@@ -467,11 +497,12 @@ fn run_vector(vector: &Value) {
     let mut platforms: HashMap<String, Arc<dyn PlatformAdapter>> = HashMap::new();
     platforms.insert(platform.clone(), fake.clone());
     let mut d = Daemon::start(platforms);
-    enroll(&d, &platform, account, &[
-        "widgets:read",
-        "widgets:write",
-        "widgets:publish",
-    ]);
+    enroll(
+        &d,
+        &platform,
+        account,
+        &["widgets:read", "widgets:write", "widgets:publish"],
+    );
 
     // Pressers and the upstream register before the caller so
     // `effective_pm` resolves (the PM row must already exist).
@@ -505,11 +536,13 @@ fn run_vector(vector: &Value) {
         Some(&json!({"upstream": upstream}).to_string()),
         "worker",
     );
-    grant(&d, agent, &platform, account, &[
-        "widgets:read",
-        "widgets:write",
-        "widgets:publish",
-    ]);
+    grant(
+        &d,
+        agent,
+        &platform,
+        account,
+        &["widgets:read", "widgets:write", "widgets:publish"],
+    );
 
     // The row this vector tracks — the most recent `call`'s request.
     let mut current_request: Option<String> = None;
@@ -533,9 +566,7 @@ fn run_vector(vector: &Value) {
                 let request = step["handle"]
                     .as_str()
                     .map(|h| format!("req-{h}"))
-                    .or_else(|| {
-                        expect["record"]["request"].as_str().map(str::to_string)
-                    });
+                    .or_else(|| expect["record"]["request"].as_str().map(str::to_string));
                 if let Some(r) = &request {
                     params["request"] = json!(r);
                 }
@@ -586,9 +617,16 @@ fn run_vector(vector: &Value) {
                 let out = if member == "operator" {
                     d.op("agent_respond", params)
                 } else {
-                    let lane = lanes
-                        .get_mut(member)
-                        .unwrap_or_else(|| panic!("{id}: no lane for presser {member}"));
+                    // A press by the requesting agent itself goes through
+                    // the caller's own lane — "an agent answers its own
+                    // pending effect" is one of the refusals under test.
+                    let lane = if member == agent {
+                        &mut caller
+                    } else {
+                        lanes
+                            .get_mut(member)
+                            .unwrap_or_else(|| panic!("{id}: no lane for presser {member}"))
+                    };
                     lane.rpc(&d, "agent_respond", params)
                 };
                 match expect["press"].as_str() {
@@ -616,6 +654,13 @@ fn run_vector(vector: &Value) {
             "restart" => {
                 d.crash.store(false, Ordering::SeqCst);
                 d.restart();
+                // The panes survived; recover() cleared their runtime
+                // fields. Re-plant, as live re-adoption would — the
+                // retried call and later presses need their identities.
+                for lane in lanes.values() {
+                    lane.replant(&d);
+                }
+                caller.replant(&d);
             }
             "caller_deadline" => {
                 let req = current_request.clone().unwrap();
@@ -638,9 +683,9 @@ fn run_vector(vector: &Value) {
             let state = state.as_str().unwrap();
             match step["action"].as_str().unwrap() {
                 "call" | "press" | "edit_source" | "restart" | "caller_deadline" => {
-                    let row = row.clone().unwrap_or_else(|| {
-                        live_record(&d, req.as_deref().unwrap())
-                    });
+                    let row = row
+                        .clone()
+                        .unwrap_or_else(|| live_record(&d, req.as_deref().unwrap()));
                     assert_eq!(
                         row["state"].as_str().unwrap(),
                         state,
@@ -673,12 +718,7 @@ fn run_vector(vector: &Value) {
                 .as_ref()
                 .map(|r| r["tool"].as_str().unwrap().to_string())
                 .unwrap();
-            assert_eq!(
-                fake.executions_of(&tool) as u64,
-                n,
-                "{}: executions",
-                ctx()
-            );
+            assert_eq!(fake.executions_of(&tool) as u64, n, "{}: executions", ctx());
         }
         if let Some(v) = expect.get("verified").filter(|v| !v.is_null()) {
             let outcome = row.as_ref().unwrap()["outcome"].clone();
@@ -758,9 +798,20 @@ fn unproven_and_forged_callers_get_nothing() {
     let mut platforms: HashMap<String, Arc<dyn PlatformAdapter>> = HashMap::new();
     platforms.insert("fixture".to_string(), Arc::new(FakePlatform::standard()));
     let d = Daemon::start(platforms);
-    enroll(&d, "fixture", "acct-1", &["widgets:read", "widgets:write", "widgets:publish"]);
+    enroll(
+        &d,
+        "fixture",
+        "acct-1",
+        &["widgets:read", "widgets:write", "widgets:publish"],
+    );
     let mut agent = Lane::spawn_as(&d, "w1", None, "worker");
-    grant(&d, "w1", "fixture", "acct-1", &["widgets:read", "widgets:write", "widgets:publish"]);
+    grant(
+        &d,
+        "w1",
+        "fixture",
+        "acct-1",
+        &["widgets:read", "widgets:write", "widgets:publish"],
+    );
 
     // Unproven caller: call/effects/close all refuse.
     for (method, params) in [
@@ -812,6 +863,80 @@ fn unproven_and_forged_callers_get_nothing() {
     assert!(err.contains("refused") || err.contains("own"), "{err}");
     // The row is still waiting — the refused close wrote nothing.
     assert_eq!(effect_row(&d, "req-own-1").unwrap()["state"], "waiting");
+}
+
+/// The CAD-366 review flag CAD-506 owns: `agent_requests` was a
+/// Rule::Read surface — any agent listed every agent's pending rows,
+/// `input` included. Now a pending row discloses to the operator, the
+/// owning agent, and the owner's PM (the reviewer the open notice
+/// directs here); a peer or an unproven caller is refused.
+#[test]
+fn agent_requests_scoped_to_owner_pm_and_operator() {
+    let mut platforms: HashMap<String, Arc<dyn PlatformAdapter>> = HashMap::new();
+    platforms.insert("fixture".to_string(), Arc::new(FakePlatform::standard()));
+    let d = Daemon::start(platforms);
+    enroll(&d, "fixture", "acct-1", &["widgets:publish"]);
+    let mut pm = Lane::spawn_as(&d, "pm1", None, "pm");
+    let mut agent = Lane::spawn_as(
+        &d,
+        "w1",
+        Some(r#"{"broker_approvals": true, "upstream": "pm1"}"#),
+        "worker",
+    );
+    let mut peer = Lane::spawn_as(&d, "w2", None, "worker");
+    grant(&d, "w1", "fixture", "acct-1", &["widgets:publish"]);
+
+    // Two pending rows for w1: a brokered approval and a staged effect.
+    agent
+        .rpc(
+            &d,
+            "request_open",
+            json!({"alias": "w1", "request": "req-brokered",
+                   "tool": "bash", "input_summary": "a declared input"}),
+        )
+        .unwrap();
+    agent
+        .rpc(
+            &d,
+            "platform_call",
+            json!({"platform": "fixture", "account": "acct-1",
+                   "tool": "widgets.publish", "input": {"widget": "w1"},
+                   "request": "req-staged"}),
+        )
+        .unwrap();
+
+    // The owner sees both; the ward's PM sees both (it reviews for the
+    // press); the operator sees both.
+    for out in [
+        agent
+            .rpc(&d, "agent_requests", json!({"alias": "w1"}))
+            .unwrap(),
+        pm.rpc(&d, "agent_requests", json!({"alias": "w1"}))
+            .unwrap(),
+        d.op("agent_requests", json!({"alias": "w1"})).unwrap(),
+    ] {
+        let handles: Vec<&str> = out["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r["request"].as_str())
+            .collect();
+        assert!(handles.contains(&"req-brokered"), "{handles:?}");
+        assert!(handles.contains(&"req-staged"), "{handles:?}");
+    }
+
+    // A peer sees none — refused outright, not filtered to empty: a
+    // pending row is the caller's business alone.
+    let err = refused(peer.rpc(&d, "agent_requests", json!({"alias": "w1"})));
+    assert!(err.contains("refused"), "{err}");
+    // So is a detached, unproven caller.
+    let frame = unprovable_rpc(&d, "agent_requests", json!({"alias": "w1"}));
+    assert_eq!(frame["ok"], false, "an unproven caller read pending rows");
+    // w2's own (empty) list still answers.
+    let own = peer
+        .rpc(&d, "agent_requests", json!({"alias": "w2"}))
+        .unwrap();
+    assert_eq!(own["requests"], json!([]));
 }
 
 /// An agent may retire its own waiting row; it may not retire a row in

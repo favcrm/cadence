@@ -12551,11 +12551,6 @@ mod tests {
             // The migrated store keeps its pre-v17 rows.
             assert!(s.agent("a1").unwrap().alias == "a1");
         }
-        assert_eq!(
-            crate::rollout::SCHEMA_VERSION,
-            17,
-            "bump? pin the new version and add its migration test"
-        );
         // Half-applied: one table present, version rolled back — the
         // reopen converges.
         Connection::open(&db)
@@ -12569,5 +12564,71 @@ mod tests {
             let _ = Store::open_for_schema_tests(&db).unwrap();
         }
         assert!(has(&db, "platform_defaults"));
+    }
+
+    /// v18 adds the pending-effect record and the draft log (CAD-506,
+    /// ADR 0006 §5.2/§5.4): `platform_effects` — one staged send keyed
+    /// by `effect_id`, its brokered handle UNIQUE — and
+    /// `platform_drafts`, the information-only "ran without you" rows.
+    /// `IF NOT EXISTS`, so a v17 store migrates in place and a
+    /// half-applied v18 converges.
+    #[test]
+    fn migration_v17_to_v18_adds_effect_tables() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("t.sqlite3");
+        std::fs::create_dir(dir.path().join("w")).unwrap();
+        {
+            let s = Store::open(&db).unwrap();
+            reg(&s, "a1", &dir.path().join("w"));
+        }
+        // A genuine v17: platform custody tables, no effect tables.
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE platform_effects;
+                 DROP TABLE platform_drafts;
+                 UPDATE schema_version SET version=17;",
+            )
+            .unwrap();
+        let has = |db: &Path, table: &str| -> bool {
+            Connection::open(db)
+                .unwrap()
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()
+                .unwrap()
+                .is_some()
+        };
+        {
+            let s = Store::open_for_schema_tests(&db).unwrap();
+            for table in ["platform_effects", "platform_drafts"] {
+                assert!(has(&db, table), "{table} missing after migrate");
+            }
+            assert!(s.platform_effects(None).unwrap().is_empty());
+            assert!(s.platform_drafts(None, 10).unwrap().is_empty());
+            // The migrated store keeps its pre-v18 rows.
+            assert!(s.agent("a1").unwrap().alias == "a1");
+        }
+        assert_eq!(
+            crate::rollout::SCHEMA_VERSION,
+            18,
+            "bump? pin the new version and add its migration test"
+        );
+        // Half-applied: one table present, version rolled back — the
+        // reopen converges.
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE platform_drafts;
+                 UPDATE schema_version SET version=17;",
+            )
+            .unwrap();
+        {
+            let _ = Store::open_for_schema_tests(&db).unwrap();
+        }
+        assert!(has(&db, "platform_drafts"));
     }
 }

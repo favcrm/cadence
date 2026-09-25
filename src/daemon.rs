@@ -577,7 +577,7 @@ pub struct Shared {
     /// (`platform` name → adapter). A platform with none fails closed —
     /// no reviewed table means no classification, so no call.
     platforms: effect_rpc::PlatformMap,
-    effect_execute_gate: Option<Arc<dyn Fn(&store::EffectRow) -> bool + Send + Sync>>,
+    effect_execute_gate: Option<effect_rpc::EffectExecuteGate>,
 }
 
 impl Shared {
@@ -2346,6 +2346,28 @@ impl Shared {
             "agent_events" => self.rpc_events(params),
             "agent_requests" => {
                 let alias = self.resolve_alias(required_str(params, "alias")?)?;
+                // CAD-506: a pending row carries the caller-declared
+                // input — it discloses to the operator, to the owning
+                // agent, and to the owner's PM (CAD-370's authorised
+                // reviewer; the open notice sends it here for the full
+                // input). A peer agent or an unproven caller is refused;
+                // before this, Rule::Read exposed every agent's pending
+                // input to any caller (the CAD-366 review flag).
+                let may_see = match self.agent_caller(peer_pid, "agent requests")? {
+                    AgentCaller::Operator => true,
+                    AgentCaller::Agent(ref a) if *a == alias => true,
+                    AgentCaller::Agent(ref a) => {
+                        let target = self.store.agent(&alias)?;
+                        self.effective_pm(&target)?.as_deref() == Some(a.as_str())
+                    }
+                };
+                if !may_see {
+                    return Err(Error::rejected(format!(
+                        "agent requests refused: '{alias}'s pending rows disclose \
+                         only to the operator, '{alias}' itself and its PM \
+                         (caller rule, CAD-506)"
+                    )));
+                }
                 let mut requests: Vec<Value> = self
                     .pending
                     .lock()
@@ -2356,24 +2378,15 @@ impl Shared {
                         json!({"request": handle, "method": req.method, "params": req.params})
                     })
                     .collect();
-                // CAD-506: a staged send is a brokered `kind:"effect"`
-                // request whose authority is the durable row — it joins
-                // the listing from the table, so a restart never drops
-                // an unanswered press. Visibility is caller-scoped: the
-                // row's input/preview disclose only to the owning agent
-                // or the operator; an unproven caller sees none.
-                let may_see = match self.connection_caller(peer_pid)? {
-                    caller_rule::Who::Operator => true,
-                    caller_rule::Who::Agent(ref a) => *a == alias,
-                    caller_rule::Who::Unproven(_) => false,
-                };
-                if may_see {
-                    for row in self.store.platform_effects(Some(&alias))? {
-                        if row.state == "waiting" {
-                            requests.push(json!({"request": row.request,
-                                "method": "cadence/effect",
-                                "params": row.to_record()}));
-                        }
+                // A staged send is a brokered `kind:"effect"` request
+                // whose authority is the durable row — it joins the
+                // listing from the table, so a restart never drops an
+                // unanswered press.
+                for row in self.store.platform_effects(Some(&alias))? {
+                    if row.state == "waiting" {
+                        requests.push(json!({"request": row.request,
+                            "method": "cadence/effect",
+                            "params": row.to_record()}));
                     }
                 }
                 Ok(json!({"requests": requests}))
@@ -10429,7 +10442,7 @@ pub struct ServeOptions {
     /// daemon dying inside §5.4 step 5's window — the decision is
     /// recorded, the run never starts, and a restart reconciles the
     /// row. Production leaves it unset (always executes).
-    pub effect_execute_gate: Option<Arc<dyn Fn(&store::EffectRow) -> bool + Send + Sync>>,
+    pub effect_execute_gate: Option<effect_rpc::EffectExecuteGate>,
 }
 
 /// What the CAD-484 checkup calls to dispatch a picked ticket to a

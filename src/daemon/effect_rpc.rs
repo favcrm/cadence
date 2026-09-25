@@ -54,6 +54,18 @@ impl Shared {
     /// for the platform.
     pub(super) fn rpc_platform_call(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         let agent = self.request_caller(params, peer_pid, "platform call")?;
+        // The caller is the connection — `agent`/`alias` are request
+        // fields only where they name a target; a platform call has no
+        // such field, so any present is refused, even one naming the
+        // caller itself (§5.4: the record's agent is never a field).
+        for field in ["agent", "alias"] {
+            if params.get(field).is_some() {
+                return Err(Error::rejected(format!(
+                    "platform call: caller identity is connection-bound; request \
+                     field '{field}' is not accepted"
+                )));
+            }
+        }
         self.store.agent(&agent)?;
         let platform = identifier(required_str(params, "platform")?, "Platform")?;
         let tool = required_str(params, "tool")?;
@@ -288,6 +300,20 @@ impl Shared {
             Some(h) => identifier(h, "Request handle")?,
             None => format!("req-{}", uuid::Uuid::new_v4().simple()),
         };
+        // One handle = one request across both registries — the mirror
+        // of `request_open`'s effect guard: a live brokered entry or a
+        // parked answer already owns this handle (locked in respond's
+        // order: pending → answered).
+        {
+            let pending = self.pending.lock().unwrap();
+            let answered = self.answered.lock().unwrap();
+            if pending.contains_key(&request) || answered.contains_key(&request) {
+                return Err(Error::rejected(format!(
+                    "platform call refused: handle '{request}' already names a \
+                     brokered request — a handle belongs to one request (CAD-506)"
+                )));
+            }
+        }
         let effect_id = format!("eff-{}", request.strip_prefix("req-").unwrap_or(&request));
         let row = EffectRow {
             effect_id: effect_id.clone(),
@@ -847,3 +873,7 @@ fn epoch_now() -> f64 {
 
 /// The adapter map `ServeOptions::platforms` becomes.
 pub(crate) type PlatformMap = HashMap<String, Arc<dyn PlatformAdapter>>;
+
+/// The test-only crash seam between the durable `decided` write and
+/// execution (`ServeOptions::effect_execute_gate`).
+pub(crate) type EffectExecuteGate = Arc<dyn Fn(&EffectRow) -> bool + Send + Sync>;
