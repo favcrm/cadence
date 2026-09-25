@@ -10599,9 +10599,21 @@ fn inbox_follow_exec_acks_each_message_once() {
         .unwrap();
     }
     let seen = wait_lines(&log, 2, 15);
+    assert_eq!(seen, vec!["m1", "m2"], "each delivered exactly once");
+    // The last exec's line lands when it exits; the follower sends
+    // `agent_inbox_ack` through that seq right after — the kill has to
+    // wait for the watermark or the ack can die with it.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let show = d.rpc("agent_show", json!({"alias": "obs"})).unwrap();
+        if show["queued"] == 0 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "m2's ack never landed: {show}");
+        thread::sleep(Duration::from_millis(50));
+    }
     let _ = child.kill();
     let _ = child.wait();
-    assert_eq!(seen, vec!["m1", "m2"], "each delivered exactly once");
     // Both acked — nothing queued, both completed via=inbox_ack.
     let show = d.rpc("agent_show", json!({"alias": "obs"})).unwrap();
     assert_eq!(show["queued"], 0, "{show}");
@@ -10730,9 +10742,10 @@ fn inbox_follow_exec_timeout_kills_then_parks() {
     // m1 times out twice (≈600ms of killed sleeps) and parks; m2 —
     // queued behind it — is still delivered and acked.
     let done = wait_lines(&log, 1, 20);
-    let _ = child.kill();
-    let _ = child.wait();
     assert_eq!(done, vec!["m2"], "{done:?}");
+    // m2's line lands when its exec exits; the follower sends
+    // `agent_inbox_ack` through that seq right after — the kill has to
+    // wait for the watermark or the ack can die with it.
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let show = d.rpc("agent_show", json!({"alias": "obs"})).unwrap();
@@ -10749,6 +10762,8 @@ fn inbox_follow_exec_timeout_kills_then_parks() {
         assert!(Instant::now() < deadline, "m2 never acked: {show}");
         thread::sleep(Duration::from_millis(50));
     }
+    let _ = child.kill();
+    let _ = child.wait();
     // The poison message stays queued — parked, never lost.
     let show = d.rpc("agent_show", json!({"alias": "obs"})).unwrap();
     assert_eq!(show["queued"], 1, "{show}");
@@ -10827,9 +10842,22 @@ fn inbox_follow_exec_parks_a_poison_message() {
         .unwrap();
     }
     let done = wait_lines(&log, 1, 20);
+    assert_eq!(done, vec!["good"], "{done:?}");
+    // "good"'s line lands when its exec exits; the follower sends
+    // `agent_inbox_ack` through that seq right after. The kill has to
+    // wait for the watermark — killing first can drop the ack and
+    // leave the consumed message queued.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let show = d.rpc("agent_show", json!({"alias": "obs"})).unwrap();
+        if show["queued"] == 1 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "good's ack never landed: {show}");
+        thread::sleep(Duration::from_millis(50));
+    }
     let _ = child.kill();
     let _ = child.wait();
-    assert_eq!(done, vec!["good"], "{done:?}");
     let show = d.rpc("agent_show", json!({"alias": "obs"})).unwrap();
     assert_eq!(show["queued"], 1, "{show}");
     let parks: Vec<_> = d
@@ -18704,6 +18732,261 @@ fn pty_silent_end_fires_once_and_recovers() {
     stall_sample(0);
 }
 
+/// CAD-468: at the `turn_silent_end` edge the daemon itself prompts the
+/// worker in band — one `sys-nudge-` reminder carrying the exact
+/// `cadence message result` command with a `<token from `cadence self`>`
+/// placeholder (never the live token — a peer reading scrollback or the
+/// row could forge a report with it), pasted past the held turn like
+/// any nudge and completed at its confirmed paste.
+/// The reminder owns no turn and never resolves anything: the worker's
+/// own report still finishes ms9, and no `unknown` is minted while the
+/// bound has time left. Once per turn — a second idle sweep never sends
+/// a second reminder.
+#[test]
+fn pty_silent_end_sends_one_report_reminder() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_stub();
+    stall_sample(1);
+    d.register_stub(
+        "w1",
+        json!({"auto_ready": "verified", "silent_end_secs": 4}),
+    );
+    d.wait_agent("w1", "idle", 20);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "do work", "message": "ms9"}),
+    )
+    .unwrap();
+    let token = pty_token(&d, "w1", "ms9");
+    d.wait_event("w1", "turn_silent_end", 40);
+
+    // The daemon's reminder: a `sys-nudge-` row only the daemon can
+    // mint, on the turnless nudge lane so it delivers while ms9 holds.
+    let reminders = |d: &TestDaemon| -> Vec<Value> {
+        d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| {
+                m["source"] == "nudge"
+                    && m["id"]
+                        .as_str()
+                        .is_some_and(|i| i.starts_with("sys-nudge-"))
+            })
+            .cloned()
+            .collect()
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let rid = loop {
+        if let Some(m) = reminders(&d).first() {
+            break m["id"].as_str().unwrap().to_string();
+        }
+        assert!(Instant::now() < deadline, "no report reminder was queued");
+        thread::sleep(Duration::from_millis(50));
+    };
+    let n = d.wait_message("w1", &rid, &["completed"], 20);
+    assert_eq!(n["nudge"], true, "{n}");
+    assert_eq!(n["result"]["via"], "pty_nudge", "{n}");
+    assert!(n["reply_to"].is_null(), "a reminder owes no report: {n}");
+    let body = n["body"].as_str().unwrap();
+    // The command names the message but never the live token — the row
+    // is durable and the paste lands in scrollback, both readable by a
+    // same-uid peer who could forge the report with it. The worker gets
+    // the token itself from `cadence self`.
+    assert!(
+        body.contains(
+            "cadence message result ms9 --token <token from `cadence self`> --text '<summary>'"
+        ),
+        "the reminder carries the exact command with the token placeholder: {body}"
+    );
+    assert!(
+        !body.contains(&token),
+        "the live turn token is never pasted: {body}"
+    );
+    assert!(body.contains("report_timeout_secs"), "{body}");
+
+    // Once per turn: the pane stays idle across more sweeps and no
+    // second reminder is minted.
+    thread::sleep(Duration::from_secs(6));
+    assert_eq!(reminders(&d).len(), 1, "{:?}", reminders(&d));
+    // The overview's silent_end row notes the worker was prompted.
+    let home = TempDir::new().unwrap();
+    let view = overview_at(home.path(), &d.state, None, &[]);
+    let ended = view["needs_me"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["kind"] == "silent_end")
+        .expect("silent_end row");
+    assert!(
+        ended["title"].as_str().unwrap().contains("reminder sent"),
+        "{ended}"
+    );
+
+    // The held turn is untouched — still running — and the worker's own
+    // report resolves it normally: never `unknown` on a timely answer.
+    assert_eq!(d.message_state("w1", "ms9"), "running");
+    d.rpc(
+        "message_report",
+        json!({"message": "ms9", "token": token, "kind": "result",
+               "text": "done"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "ms9", &["completed"], 10);
+    assert_eq!(
+        d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["unknown"],
+        0
+    );
+    stall_sample(0);
+}
+
+/// CAD-468: the reminder's `(nudge, "report-reminder:<message>:<turn>")`
+/// id makes the edge once-per-turn across a daemon restart — the adopted
+/// turn's pane re-probes idle and `turn_silent_end` fires again, but no
+/// second reminder is minted.
+#[test]
+fn pty_silent_end_reminder_is_not_resent_after_restart() {
+    let mut d = TestDaemon::start();
+    let _mock = d.mock_stub();
+    stall_sample(1);
+    d.register_stub(
+        "w1",
+        json!({"auto_ready": "verified", "silent_end_secs": 4}),
+    );
+    d.wait_agent("w1", "idle", 20);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "do work", "message": "ms9"}),
+    )
+    .unwrap();
+    pty_token(&d, "w1", "ms9");
+    d.wait_event("w1", "turn_silent_end", 40);
+    let reminders = |d: &TestDaemon| -> Vec<Value> {
+        d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| {
+                m["source"] == "nudge"
+                    && m["id"]
+                        .as_str()
+                        .is_some_and(|i| i.starts_with("sys-nudge-"))
+            })
+            .cloned()
+            .collect()
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while reminders(&d).is_empty() {
+        assert!(Instant::now() < deadline, "no report reminder was queued");
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // Restart over the same state: ms9 is adopted still-running, its
+    // pane re-probes idle, the edge fires a second time — the daemon
+    // message dedupes, so the one reminder row is all there ever is.
+    // `shutdown` is operator-gated, so it takes the operator seam.
+    d.operator_rpc("shutdown", json!({})).unwrap();
+    d.handle.take().unwrap().join().unwrap().unwrap();
+    let state = d.state.clone();
+    std::mem::forget(d);
+    let d = TestDaemon::start_on(state);
+    wait_event_count(&d, "w1", "turn_adopted", 1, 25);
+    let fires = wait_event_count(&d, "w1", "turn_silent_end", 2, 40);
+    assert_eq!(fires.len(), 2, "the edge re-fired after restart: {fires:?}");
+    assert_eq!(reminders(&d).len(), 1, "{:?}", reminders(&d));
+    assert_eq!(d.message_state("w1", "ms9"), "running");
+    stall_sample(0);
+}
+
+/// CAD-468: a caller can nudge (that lane is theirs) but can never mint
+/// the daemon's reminder — `sys-` ids are refused to every caller path,
+/// and a forged `wake` source is refused outright.
+#[test]
+fn daemon_reminder_id_and_source_cannot_be_forged() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_stub();
+    d.register_stub("w1", json!({"auto_ready": "verified"}));
+    d.wait_agent("w1", "idle", 20);
+    let forged_id = cadence_agent::proto::daemon_message_id("nudge", "x");
+    assert!(forged_id.starts_with("sys-nudge-"));
+    for params in [
+        // The exact id the daemon would mint, caller-supplied.
+        json!({"alias": "w1", "text": "fake reminder", "message": forged_id,
+               "source": "nudge"}),
+        json!({"alias": "w1", "text": "fake reminder", "message": forged_id,
+               "nudge": true}),
+        // The daemon's wake source on an ordinary id.
+        json!({"alias": "w1", "text": "fake wake", "source": "wake"}),
+    ] {
+        let err = d.rpc("agent_send", params.clone()).unwrap_err().to_string();
+        assert!(err.contains("daemon"), "{params}: {err}");
+        let err = d
+            .operator_rpc("agent_send", params.clone())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("daemon"), "operator {params}: {err}");
+    }
+    let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
+    assert!(
+        show["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["body"] != "fake reminder" && m["body"] != "fake wake"),
+        "{show}"
+    );
+}
+
+/// CAD-467: `send --issue/--worktree` write the lane provenance the
+/// reported-duplicate check trusts — so only a caller who may steer
+/// the target (the operator, or its PM) may set them. A peer worker,
+/// a foreign PM, a self-send and a detached unprovable caller are all
+/// refused; the target's own PM records the lane, and a plain send is
+/// unaffected.
+#[test]
+fn send_lane_provenance_needs_steer_authority() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_stub();
+    let mut p = guard_panes(&d);
+    let forged = |extra: &[(&str, &str)]| -> Value {
+        let mut v = json!({"alias": "w1", "text": "kickoff-shaped ask"});
+        for (k, val) in extra {
+            v[*k] = json!(val);
+        }
+        v
+    };
+    let both = forged(&[("issue", "D-9"), ("worktree", "/lane/d-9")]);
+
+    // A peer worker steering another agent's lane — refused.
+    let r = p.pm2.rpc(&d.state, "agent_send", both.clone());
+    assert!(frame_err(&r).contains("steer"), "{r}");
+    // The agent itself cannot claim a lane on its own queue.
+    let r = p.w1.rpc(&d.state, "agent_send", both.clone());
+    assert!(frame_err(&r).contains("steer"), "{r}");
+    // A detached caller that proves nothing — refused outright.
+    let r = unprovable_rpc(&d, "agent_send", both.clone());
+    assert!(frame_err(&r).contains("not provably the operator"), "{r}");
+    // Nothing was queued by any refused caller.
+    let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
+    assert!(
+        show["messages"].as_array().unwrap().is_empty(),
+        "refused provenance sends must not enqueue: {show}"
+    );
+
+    // The target's own PM may record the lane — dispatch's shape.
+    let r = p.pm.rpc(&d.state, "agent_send", both);
+    assert_eq!(r["ok"], true, "{r}");
+    let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
+    let msg = &show["messages"].as_array().unwrap()[0];
+    assert_eq!(msg["issue"], "D-9", "{msg}");
+    assert_eq!(msg["worktree"], "/lane/d-9", "{msg}");
+
+    // A bare send from the same peer is unaffected — the gate fires
+    // only on the provenance fields.
+    let r = p.pm2.rpc(&d.state, "agent_send", forged(&[]));
+    assert_eq!(r["ok"], true, "{r}");
+}
+
 /// CAD-250 — the aos-pm accumulation shape: a pty worker that is sent
 /// several tasks and never reports holds exactly ONE `running` turn;
 /// the rest stay `queued` (accepted, never refused, never pasted) while
@@ -20445,7 +20728,7 @@ fn dispatch_records_ref_before_send() {
                 ),
             )
             .env_remove("CADENCE_ALIAS")
-            .output()
+            .operator_output()
             .unwrap();
         let text = if out.stdout.is_empty() {
             String::from_utf8_lossy(&out.stderr).to_string()
@@ -20539,14 +20822,14 @@ fn dispatch_records_ref_before_send() {
         .unwrap();
     let task = format!("{}-t1", created["job"]["id"].as_str().unwrap());
     let first = d
-        .rpc(
+        .fixture_rpc(
             "task_dispatch",
             json!({"task": task, "message": "mint-one", "by": "pm"}),
         )
         .unwrap();
     assert_eq!(first["message"], "mint-one");
     let second = d
-        .rpc(
+        .fixture_rpc(
             "task_dispatch",
             json!({"task": task, "message": "mint-two", "by": "pm"}),
         )
@@ -20554,6 +20837,473 @@ fn dispatch_records_ref_before_send() {
     assert_eq!(
         second["message"], "mint-one",
         "a retry returns the live kickoff id, not the minted one"
+    );
+}
+
+/// CAD-467: dispatching to a freshly joined worker folds its still-queued
+/// `bootstrap-<alias>` into the kickoff — the queued onboarding turn is
+/// cancelled and its body rides ahead of the kickoff text, so the lane's
+/// first turn is the task and still teaches identity and the report
+/// command. A bootstrap already `running` keeps its turn — the kickoff
+/// queues behind it, unfolded — and a kickoff this worker already
+/// REPORTED in this lane is the late duplicate: recorded on the issue,
+/// never re-sent, with the report's sha measured against the lane head.
+/// A completed kickoff bound to a different worktree is another lane's
+/// history and never suppresses the new dispatch.
+#[test]
+fn dispatch_folds_bootstrap_and_suppresses_reported_duplicate() {
+    let seeded = TempDir::new().unwrap();
+    let state = seeded.path().to_path_buf();
+    {
+        let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
+        let cwd = state.to_str().unwrap().to_string();
+        // Inbox endpoints: no actor drains them, so queued rows stay
+        // put for the assertions.
+        for (alias, params) in [
+            ("pm", None),
+            ("w1", Some("{\"upstream\":\"pm\"}")),
+            ("w2", Some("{\"upstream\":\"pm\"}")),
+            ("w3", Some("{\"upstream\":\"pm\"}")),
+            ("w4", Some("{\"upstream\":\"pm\"}")),
+            ("w5", Some("{\"upstream\":\"pm\"}")),
+        ] {
+            store
+                .register_agent(&NewAgent {
+                    alias,
+                    provider: "fake",
+                    endpoint_kind: if alias == "pm" { "fake" } else { "inbox" },
+                    role: "worker",
+                    cwd: &cwd,
+                    sandbox: "read-only",
+                    instructions: None,
+                    params,
+                    team_role: None,
+                    model_policy: None,
+                })
+                .unwrap();
+        }
+    }
+    let d = TestDaemon::start_on(state);
+    let tmp = TempDir::new().unwrap();
+    let (pm_dir, repo, home) = (
+        tmp.path().join("pm"),
+        tmp.path().join("repo"),
+        tmp.path().join("home"),
+    );
+    for dir in [&pm_dir, &repo, &home] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let git = |dir: &Path, args: &[&str]| -> String {
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&o.stderr)
+        );
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    };
+    git(&repo, &["init", "-b", "main"]);
+    git(&repo, &["config", "user.email", "t@t"]);
+    git(&repo, &["config", "user.name", "t"]);
+    std::fs::write(repo.join("f"), "x").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "init"]);
+    let bin_dir = Path::new(env!("CARGO_BIN_EXE_cadence"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let cli = |args: &[&str]| -> (bool, Value) {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+            .arg("--state-dir")
+            .arg(&d.state)
+            .args(args)
+            .env("CADENCE_PM_DIR", &pm_dir)
+            .env("HOME", &home)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin_dir.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env_remove("CADENCE_ALIAS")
+            .operator_output()
+            .unwrap();
+        let text = if out.stdout.is_empty() {
+            String::from_utf8_lossy(&out.stderr).to_string()
+        } else {
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+        (
+            out.status.success(),
+            serde_json::from_str(text.trim()).unwrap_or_else(|_| panic!("not json: {text}")),
+        )
+    };
+    assert!(cli(&["issue", "init"]).0);
+    git(&pm_dir, &["config", "user.email", "t@t"]);
+    git(&pm_dir, &["config", "user.name", "t"]);
+    let repo_s = repo.canonicalize().unwrap().to_str().unwrap().to_string();
+    assert!(cli(&["issue", "project", "add", "demo", "--prefix", "D", "--repo", &repo_s,]).0);
+    for title in [
+        "Fold",
+        "Reported",
+        "Runningboot",
+        "Bigboot",
+        "Forge",
+        "Forgefields",
+        "Sendfail",
+        "Reffail",
+    ] {
+        assert!(cli(&["issue", "new", title, "--project", "demo"]).0);
+    }
+    let note = tmp.path().join("kickoff.md");
+    std::fs::write(&note, "# kickoff").unwrap();
+    let note_s = note.canonicalize().unwrap().to_str().unwrap().to_string();
+    let dispatch = |issue: &str, to: &str| -> (bool, Value) {
+        cli(&[
+            "dispatch",
+            issue,
+            "--to",
+            to,
+            "--note",
+            &note_s,
+            "--reply-to",
+            "pm",
+        ])
+    };
+
+    // The freshly joined worker's bootstrap, still queued — seeded the
+    // way `join` writes it (deterministic id, bootstrap source).
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "bootstrap body", "message": "bootstrap-w1",
+               "source": "bootstrap"}),
+    )
+    .unwrap();
+    assert_eq!(d.message_state("w1", "bootstrap-w1"), "queued");
+
+    // The dispatch folds it: cancelled, its body ahead of the kickoff's.
+    let (ok, out) = dispatch("D-1", "w1");
+    assert!(ok, "{out}");
+    assert_eq!(out["dispatched"], true, "{out}");
+    assert_eq!(out["bootstrap"], "folded", "{out}");
+    let mid = out["message"].as_str().unwrap().to_string();
+    let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
+    let msgs = show["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 2, "{msgs:?}");
+    let boot = msgs.iter().find(|m| m["id"] == "bootstrap-w1").unwrap();
+    assert_eq!(boot["state"], "cancelled", "{boot}");
+    assert_eq!(boot["result"]["via"], "message_cancel", "{boot}");
+    assert!(
+        boot["result"]["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&format!("folded into kickoff {mid}")),
+        "{boot}"
+    );
+    let kickoff = msgs
+        .iter()
+        .find(|m| m["id"].as_str() == Some(&mid))
+        .unwrap();
+    assert_eq!(kickoff["state"], "queued", "{kickoff}");
+    let body = kickoff["body"].as_str().unwrap();
+    assert!(
+        body.starts_with(&format!("bootstrap body read {note_s} — D-1:")),
+        "the bootstrap body rides ahead of the kickoff: {body}"
+    );
+    assert!(
+        body.contains("cadence message result <id> --token <turn_id>"),
+        "the kickoff carries the report command: {body}"
+    );
+    let issue = cli(&["issue", "show", "D-1", "--json"]).1;
+    assert!(
+        issue["comments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["body"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("folded into this kickoff")),
+        "{issue}"
+    );
+
+    // A bootstrap already running keeps its turn — nothing is
+    // cancelled; the kickoff queues behind it unfolded.
+    {
+        let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+        conn.execute(
+            "INSERT INTO messages(id,alias,body,reply_to,source,state,turn_id,created,started)
+             VALUES('bootstrap-w2','w2','boot2',NULL,'bootstrap','running','t-1',0,0)",
+            [],
+        )
+        .unwrap();
+    }
+    let (ok, out) = dispatch("D-2", "w2");
+    assert!(ok, "{out}");
+    assert_eq!(out["dispatched"], true, "{out}");
+    assert_eq!(out["bootstrap"], "running", "{out}");
+    let show = d.rpc("agent_show", json!({"alias": "w2"})).unwrap();
+    let msgs = show["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 2, "{msgs:?}");
+    assert_eq!(
+        msgs.iter().find(|m| m["id"] == "bootstrap-w2").unwrap()["state"],
+        "running"
+    );
+    assert_eq!(
+        d.message_state("w2", out["message"].as_str().unwrap()),
+        "queued"
+    );
+
+    // The late duplicate: D-3's kickoff, reported by w1 in this lane.
+    let (ok, out) = dispatch("D-3", "w1");
+    assert!(ok, "{out}");
+    assert_eq!(out["dispatched"], true, "{out}");
+    let kick_id = out["message"].as_str().unwrap().to_string();
+    let wt = out["worktree"].as_str().unwrap().to_string();
+    let head = git(Path::new(&wt), &["rev-parse", "HEAD"]);
+    {
+        let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+        conn.execute(
+            "UPDATE messages SET state='completed', completed=1,
+                 result=?1 WHERE id=?2",
+            rusqlite::params![
+                json!({"status": "completed", "via": "pty_report",
+                       "sha": head, "turn_id": "t-9"})
+                .to_string(),
+                kick_id
+            ],
+        )
+        .unwrap();
+    }
+    let (ok, out) = dispatch("D-3", "w1");
+    assert!(ok, "{out}");
+    assert_eq!(out["dispatched"], false, "{out}");
+    assert_eq!(out["duplicate"], true, "{out}");
+    assert_eq!(out["duplicate_kind"], "reported", "{out}");
+    assert_eq!(out["message"], kick_id.as_str(), "{out}");
+    assert_eq!(out["reported"]["via"], "pty_report", "{out}");
+    assert_eq!(out["reported"]["sha"], head.as_str(), "{out}");
+    assert_eq!(out["reported"]["lane_head"], head.as_str(), "{out}");
+    assert_eq!(out["reported"]["same_head"], true, "{out}");
+    // Nothing new reached the worker; the suppression is on the issue.
+    let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
+    assert_eq!(show["messages"].as_array().unwrap().len(), 3, "{show}");
+    let issue = cli(&["issue", "show", "D-3", "--json"]).1;
+    assert!(
+        issue["comments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["body"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Late duplicate dispatch suppressed")),
+        "{issue}"
+    );
+
+    // A completed kickoff the daemon recorded against ANOTHER worktree
+    // is that lane's history: the re-dispatch sends fresh. (The proof
+    // is the message row, so the row is what moves.)
+    {
+        let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+        conn.execute(
+            "UPDATE messages SET worktree='/elsewhere' WHERE id=?1",
+            rusqlite::params![kick_id],
+        )
+        .unwrap();
+    }
+    let (ok, out) = dispatch("D-3", "w1");
+    assert!(ok, "{out}");
+    assert_eq!(out["dispatched"], true, "{out}");
+    assert!(
+        out["duplicate"].is_null() || out["duplicate"] == false,
+        "{out}"
+    );
+    let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
+    assert_eq!(show["messages"].as_array().unwrap().len(), 4, "{show}");
+    // The fresh kickoff carries the daemon-recorded lane provenance
+    // the reported check trusts — the issue and this lane's worktree.
+    let new_kick = show["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"].as_str() == out["message"].as_str())
+        .unwrap();
+    assert_eq!(new_kick["issue"], "D-3", "{new_kick}");
+    assert_eq!(
+        new_kick["worktree"].as_str(),
+        Some(wt.as_str()),
+        "{new_kick}"
+    );
+
+    // The reviewer's forgery: a `message` ref planted on ANOTHER issue
+    // pointing at D-3's completed kickoff must never suppress — the
+    // row says D-3, not D-5. `issue ref` writes exactly the shape a
+    // frontmatter edit would.
+    assert!(cli(&["issue", "ref", "D-5", "message", &kick_id]).0);
+    let (ok, out) = dispatch("D-5", "w1");
+    assert!(ok, "{out}");
+    assert_eq!(
+        out["dispatched"], true,
+        "a planted ref to another issue's kickoff must not suppress: {out}"
+    );
+
+    // Same forgery with every ref field filled — `agent` and
+    // `worktree` on the ref match the target and lane perfectly — but
+    // the row it points at is a plain message with no recorded lane:
+    // absent provenance never matches.
+    let (ok, started) = cli(&["issue", "start", "D-6", "--owner", "w1", "--by", "pm"]);
+    assert!(ok, "{started}");
+    let wt6 = started["worktree"].as_str().unwrap().to_string();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "ordinary ask", "message": "m-plain"}),
+    )
+    .unwrap();
+    {
+        let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+        conn.execute(
+            "UPDATE messages SET state='completed', completed=1,
+                 result='{\"status\":\"completed\",\"via\":\"pty_report\"}'
+             WHERE id='m-plain'",
+            [],
+        )
+        .unwrap();
+    }
+    assert!(cli(&["issue", "ref", "D-6", "message", "m-plain"]).0);
+    // Forge the ref's lane fields too — the check never reads them.
+    let issue_file = pm_dir.join("demo").join("D-6").join("issue.md");
+    let text = std::fs::read_to_string(&issue_file).unwrap();
+    let marked = text.replacen(
+        "path: m-plain",
+        &format!("path: m-plain\n  worktree: {wt6}\n  agent: w1"),
+        1,
+    );
+    assert_ne!(marked, text, "the planted ref must be in the file");
+    std::fs::write(&issue_file, marked).unwrap();
+    git(&pm_dir, &["add", "-A"]);
+    git(&pm_dir, &["commit", "-qm", "forged ref fields"]);
+    let (ok, out) = dispatch("D-6", "w1");
+    assert!(ok, "{out}");
+    assert_eq!(
+        out["dispatched"], true,
+        "forged ref fields on a lane-less row must not suppress: {out}"
+    );
+
+    // Fold failure paths: a send that fails leaves the fold-intended
+    // bootstrap queued and says so on the issue.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w4", "text": "boot4", "message": "bootstrap-w4",
+               "source": "bootstrap"}),
+    )
+    .unwrap();
+    let (ok, err) = cli(&[
+        "dispatch",
+        "D-7",
+        "--to",
+        "w4",
+        "--note",
+        &note_s,
+        "--reply-to",
+        "ghost",
+    ]);
+    assert!(!ok, "{err}");
+    assert_eq!(
+        d.message_state("w4", "bootstrap-w4"),
+        "queued",
+        "a failed send must not strand the bootstrap"
+    );
+    let issue = cli(&["issue", "show", "D-7", "--json"]).1;
+    assert!(
+        issue["comments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["body"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("bootstrap-w4 was left queued")),
+        "{issue}"
+    );
+    // The retry folds it normally — nothing was consumed by the
+    // failed attempt.
+    let (ok, out) = dispatch("D-7", "w4");
+    assert!(ok, "{out}");
+    assert_eq!(out["bootstrap"], "folded", "{out}");
+    assert_eq!(d.message_state("w4", "bootstrap-w4"), "cancelled");
+
+    // A ref-write failure fails the dispatch before the send and
+    // before any cancel: the bootstrap stays queued. The issue is
+    // pre-started identically (same owner, same claim holder) so the
+    // lock only bites at the dispatch's own ref write.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w5", "text": "boot5", "message": "bootstrap-w5",
+               "source": "bootstrap"}),
+    )
+    .unwrap();
+    let (ok, started) = cli(&["issue", "start", "D-8", "--owner", "w5", "--by", "pm"]);
+    assert!(ok, "{started}");
+    std::fs::write(pm_dir.join(".write.lock"), "held").unwrap();
+    let (ok, err) = dispatch("D-8", "w5");
+    std::fs::remove_file(pm_dir.join(".write.lock")).unwrap();
+    assert!(!ok, "{err}");
+    assert_eq!(
+        d.message_state("w5", "bootstrap-w5"),
+        "queued",
+        "a failed ref write must not strand the bootstrap"
+    );
+    let show = d.rpc("agent_show", json!({"alias": "w5"})).unwrap();
+    assert_eq!(
+        show["messages"].as_array().unwrap().len(),
+        1,
+        "no kickoff row may exist after the failed ref write: {show}"
+    );
+    // And the recovered retry folds + sends.
+    let (ok, out) = dispatch("D-8", "w5");
+    assert!(ok, "{out}");
+    assert_eq!(out["bootstrap"], "folded", "{out}");
+    assert_eq!(d.message_state("w5", "bootstrap-w5"), "cancelled");
+
+    // A bootstrap too large to fold leaves the fold alone: still
+    // queued, the kickoff sends unfolded behind it.
+    let big = "b".repeat(3900);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w3", "text": big, "message": "bootstrap-w3",
+               "source": "bootstrap"}),
+    )
+    .unwrap();
+    let (ok, out) = dispatch("D-4", "w3");
+    assert!(ok, "{out}");
+    assert_eq!(out["dispatched"], true, "{out}");
+    assert_eq!(out["bootstrap"], "queued", "{out}");
+    let show = d.rpc("agent_show", json!({"alias": "w3"})).unwrap();
+    let msgs = show["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 2, "{msgs:?}");
+    assert_eq!(
+        msgs.iter().find(|m| m["id"] == "bootstrap-w3").unwrap()["state"],
+        "queued",
+        "the oversized bootstrap keeps its own turn"
+    );
+    let kickoff = msgs
+        .iter()
+        .find(|m| m["id"].as_str() == out["message"].as_str())
+        .unwrap();
+    assert_eq!(kickoff["state"], "queued", "{kickoff}");
+    assert!(
+        !kickoff["body"].as_str().unwrap().starts_with('b'),
+        "the kickoff went out unfolded: {}",
+        kickoff["body"]
     );
 }
 
@@ -20664,7 +21414,7 @@ fn finish_guard_per_worktree() {
                 ),
             )
             .env_remove("CADENCE_ALIAS")
-            .output()
+            .operator_output()
             .unwrap();
         let text = if out.stdout.is_empty() {
             String::from_utf8_lossy(&out.stderr).to_string()
@@ -20745,7 +21495,7 @@ fn finish_guard_per_worktree() {
     // pane runs in the project's main checkout, as a real lane does —
     // `dispatch` refuses a pty worker outside the project (CAD-202).
     let _mock = d.mock_devin();
-    d.rpc(
+    d.fixture_rpc(
         "agent_register",
         json!({"alias": "dv", "provider": "devin", "endpoint_kind": "pty",
                "cwd": repo_s}),
@@ -22528,7 +23278,7 @@ fn dispatch_injects_project_memory_lessons() {
                 ),
             )
             .env_remove("CADENCE_ALIAS")
-            .output()
+            .operator_output()
             .unwrap();
         let text = if out.stdout.is_empty() {
             String::from_utf8_lossy(&out.stderr).to_string()
@@ -22748,7 +23498,7 @@ fn dispatch_injects_project_memory_lessons() {
     // The bootstrap briefing carries the project's accepted rules for
     // an agent whose cwd sits inside the project repo — proposed and
     // non-matching scopes stay out.
-    d.rpc(
+    d.fixture_rpc(
         "agent_register",
         json!({"alias": "w2", "provider": "fake", "endpoint_kind": "fake",
                "cwd": repo, "params": json!({"upstream": "pm"}).to_string()}),
@@ -23076,7 +23826,7 @@ fn dispatch_degrades_on_memory_failures() {
                 ),
             )
             .env_remove("CADENCE_ALIAS")
-            .output()
+            .operator_output()
             .unwrap();
         let text = if out.stdout.is_empty() {
             String::from_utf8_lossy(&out.stderr).to_string()
@@ -23271,7 +24021,7 @@ fn dispatch_degrades_on_memory_failures() {
             &"y".repeat(700),
         );
     }
-    d.rpc(
+    d.fixture_rpc(
         "agent_register",
         json!({"alias": "w2", "provider": "fake", "endpoint_kind": "fake",
                "cwd": repo, "params": json!({"upstream": "pm"}).to_string()}),
@@ -32351,7 +33101,7 @@ fn plant_member_pane(
     if let Some(pm) = upstream {
         req["params"] = json!(json!({"upstream": pm}).to_string());
     }
-    d.rpc("agent_register", req).unwrap();
+    d.fixture_rpc("agent_register", req).unwrap();
     let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
     conn.execute(
         "UPDATE agents SET provider=?1, endpoint_kind='pty', pid=?2, pid_start=?4, \
@@ -35824,7 +36574,7 @@ fn issue_start_writes_slot_env() {
                 ),
             )
             .env_remove("CADENCE_ALIAS")
-            .output()
+            .operator_output()
             .unwrap();
         let text = if out.stdout.is_empty() {
             String::from_utf8_lossy(&out.stderr).to_string()
@@ -38109,7 +38859,7 @@ fn lane_cli(d: &TestDaemon, pm_dir: &Path, home: &Path, args: &[&str]) -> (bool,
             ),
         )
         .env_remove("CADENCE_ALIAS")
-        .output()
+        .operator_output()
         .unwrap();
     let text = if out.stdout.is_empty() {
         String::from_utf8_lossy(&out.stderr).to_string()
@@ -38234,7 +38984,7 @@ fn dispatch_checks_pty_lane_cwd_against_project_repos() {
 
     d.register("pm");
     for (alias, cwd) in [("out", &elsewhere), ("inr", &repo), ("gone", &gone)] {
-        d.rpc(
+        d.fixture_rpc(
             "agent_register",
             json!({"alias": alias, "provider": "tui-stub", "endpoint_kind": "pty",
                    "cwd": cwd.to_str().unwrap(),
@@ -40874,7 +41624,7 @@ impl PlanFixture {
             .env("XDG_STATE_HOME", self.tmp.path().join("home/.local/state"))
             .env("TMPDIR", self.tmp.path().join("tmp"))
             .env_remove("CADENCE_ALIAS")
-            .output()
+            .operator_output()
             .unwrap();
         let text = if out.stdout.is_empty() {
             String::from_utf8_lossy(&out.stderr).to_string()
@@ -41816,10 +42566,10 @@ fn work_model_project_md_and_milestones() {
         out["epics"][0]["work"]["config_unapproved"].is_string(),
         "{out}"
     );
-    // The CLI verb reaches the daemon; from the test's own process
-    // tree it is not the proven operator, so it is refused too.
-    let (ok, err) = f.cli(&["issue", "project", "approve-work", "demo"]);
-    assert!(!ok && err.to_string().contains("operator action"), "{err}");
+    // The verb reaches the daemon; a caller that proves nothing —
+    // detached, carrying an agent env — is refused too.
+    let r = unprovable_rpc(&f.d, "project_work_approve", json!({"project": "demo"}));
+    assert!(frame_err(&r).contains("operator action"), "{r}");
     let out =
         f.d.operator_rpc("project_work_approve", json!({"project": "demo"}))
             .unwrap();

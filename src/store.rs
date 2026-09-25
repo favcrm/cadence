@@ -362,6 +362,13 @@ pub struct Message {
     /// The task this delivery carries (a dispatch kickoff or a
     /// `--task` follow-up). NULL = unattached delivery.
     pub task_id: Option<String>,
+    /// The dispatch lane: which issue's kickoff this is, and the
+    /// worktree it ran against (CAD-467). Written at send by the
+    /// daemon — a tracker's `message` ref is forgeable, so the
+    /// reported-duplicate check matches only these. NULL = not a
+    /// dispatch's.
+    pub issue: Option<String>,
+    pub worktree: Option<String>,
     /// Delivery rank (CAD-158): `urgent` is claimed ahead of `normal`.
     pub priority: Priority,
     pub created: f64,
@@ -648,6 +655,8 @@ fn row_message(row: &rusqlite::Row) -> rusqlite::Result<Message> {
         result: result.and_then(|r| serde_json::from_str(&r).ok()),
         error: row.get("error")?,
         task_id: row.get("task_id")?,
+        issue: row.get("issue")?,
+        worktree: row.get("worktree")?,
         priority: Priority::from_rank(row.get("priority")?),
         created: row.get("created")?,
         started: row.get("started")?,
@@ -968,6 +977,7 @@ impl Message {
             "state": self.state, "turn_id": self.turn_id,
             "result": self.result, "error": self.error,
             "task_id": self.task_id,
+            "issue": self.issue, "worktree": self.worktree,
             "created": self.created, "started": self.started,
             "completed": self.completed,
         });
@@ -1604,6 +1614,30 @@ impl Store {
                 tx.execute_batch(
                     "ALTER TABLE messages ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
                 )?;
+            }
+            tx.execute(
+                "UPDATE schema_version SET version=?1",
+                [crate::rollout::SCHEMA_VERSION],
+            )?;
+            tx.commit()?;
+        }
+        if version < 16 {
+            // v16: `messages.issue`/`messages.worktree` (CAD-467) —
+            // the dispatch lane a message row belongs to, written at
+            // send by the daemon. The reported-kickoff duplicate check
+            // matches on these, never on the issue's refs — tracker
+            // frontmatter is forgeable and a planted `message` ref must
+            // not be able to suppress a real kickoff.
+            let columns: Vec<String> = conn
+                .prepare("PRAGMA table_info(messages)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .filter_map(std::result::Result::ok)
+                .collect();
+            let tx = conn.unchecked_transaction()?;
+            for column in ["issue", "worktree"] {
+                if !columns.iter().any(|c| c == column) {
+                    tx.execute_batch(&format!("ALTER TABLE messages ADD COLUMN {column} TEXT"))?;
+                }
             }
             tx.execute(
                 "UPDATE schema_version SET version=?1",
@@ -2655,6 +2689,8 @@ impl Store {
             id,
             source,
             task_id,
+            None,
+            None,
             sender,
             &Steer::NONE,
         )
@@ -2670,6 +2706,10 @@ impl Store {
     /// as `cancelled` with reason `superseded by <id>` and the caller,
     /// and its `reply_to` gets one `superseded` notice naming the new id.
     ///
+    /// `issue`/`worktree` record the dispatch lane on the row
+    /// (CAD-467): which issue's kickoff this is and the worktree it
+    /// runs against. Only the operator's `send` may carry them
+    /// (enforced at the RPC); every other enqueue passes `None`.
     /// A retry of the same envelope is `duplicate` only when it names
     /// the same superseded set; otherwise it is a conflict.
     #[allow(clippy::too_many_arguments)]
@@ -2681,6 +2721,8 @@ impl Store {
         id: &str,
         source: &str,
         task_id: Option<&str>,
+        issue: Option<&str>,
+        worktree: Option<&str>,
         sender: &Sender,
         steer: &Steer,
     ) -> Result<(bool, String)> {
@@ -2720,6 +2762,8 @@ impl Store {
             id,
             source,
             task_id,
+            issue,
+            worktree,
             sender,
             steer.priority,
         )?;
@@ -2748,6 +2792,12 @@ impl Store {
     /// [`crate::proto::DAEMON_MESSAGE_PREFIX`] or a source of
     /// [`crate::proto::DAEMON_SOURCES`]; every other enqueue refuses both.
     /// Unattributed (a system entry in a thread), owing no report.
+    /// CAD-468: `nudge` is daemon-writable too — the silent-end report
+    /// reminder rides the turnless nudge lane; its `sys-` id still
+    /// proves daemon provenance (no caller can mint the prefix, and no
+    /// caller path reaches this enqueue). The id's kind segment must
+    /// be the source — `sys-nudge-…` is a daemon nudge, `sys-wake-…` a
+    /// wake; a crossed pair is refused like any other mismatch.
     pub fn enqueue_daemon(
         &self,
         alias: &str,
@@ -2755,8 +2805,9 @@ impl Store {
         id: &str,
         source: &str,
     ) -> Result<(bool, String)> {
-        if !id.starts_with(crate::proto::DAEMON_MESSAGE_PREFIX)
-            || !crate::proto::DAEMON_SOURCES.contains(&source)
+        let daemon_id = format!("{}{}-", crate::proto::DAEMON_MESSAGE_PREFIX, source);
+        if !(crate::proto::DAEMON_SOURCES.contains(&source) || source == NUDGE_SOURCE)
+            || !id.starts_with(&daemon_id)
         {
             return Err(Error::internal(format!(
                 "a daemon message needs a daemon id and source, not {id}/{source}"
@@ -2771,6 +2822,8 @@ impl Store {
             None,
             id,
             source,
+            None,
+            None,
             None,
             &Sender::Unattributed,
             Priority::Normal,
@@ -2932,11 +2985,14 @@ impl Store {
         id: &str,
         source: &str,
         task_id: Option<&str>,
+        issue: Option<&str>,
+        worktree: Option<&str>,
         sender: &Sender,
         priority: Priority,
     ) -> Result<(bool, String)> {
         self.enqueue_tx_as(
-            tx, alias, body, reply_to, id, source, task_id, sender, priority, false,
+            tx, alias, body, reply_to, id, source, task_id, issue, worktree, sender, priority,
+            false,
         )
     }
 
@@ -2950,6 +3006,8 @@ impl Store {
         id: &str,
         source: &str,
         task_id: Option<&str>,
+        issue: Option<&str>,
+        worktree: Option<&str>,
         sender: &Sender,
         priority: Priority,
         daemon: bool,
@@ -2982,6 +3040,8 @@ impl Store {
                 && old.reply_to.as_deref() == reply_to
                 && old.source == source
                 && old.task_id.as_deref() == task_id
+                && old.issue.as_deref() == issue
+                && old.worktree.as_deref() == worktree
                 && old.priority == priority;
             if !same {
                 return Err(Error::rejected(
@@ -2991,8 +3051,8 @@ impl Store {
             return Ok((true, old.state));
         }
         tx.execute(
-            "INSERT INTO messages(id,alias,body,reply_to,source,task_id,priority,created)
-             VALUES(?,?,?,?,?,?,?,?)",
+            "INSERT INTO messages(id,alias,body,reply_to,source,task_id,issue,worktree,priority,created)
+             VALUES(?,?,?,?,?,?,?,?,?,?)",
             params![
                 id,
                 alias,
@@ -3000,6 +3060,8 @@ impl Store {
                 reply_to,
                 source,
                 task_id,
+                issue,
+                worktree,
                 priority.rank(),
                 now()
             ],
@@ -5977,6 +6039,8 @@ impl Store {
             &kickoff,
             "job_dispatch",
             Some(task_id),
+            job.issue_id.as_deref(),
+            task.worktree.as_deref(),
             &Sender::Unattributed,
             Priority::Normal,
         )?;
@@ -6926,6 +6990,8 @@ impl Store {
             &kickoff,
             "job_dispatch",
             Some(task_id),
+            job.issue_id.as_deref(),
+            task.worktree.as_deref(),
             &Sender::Unattributed,
             Priority::Normal,
         )?;
@@ -8318,6 +8384,57 @@ mod tests {
         let (dup, state) = s.enqueue("a1", "hello", None, "m1", "user").unwrap();
         assert!(dup && state == "queued");
         assert!(s.enqueue("a1", "different", None, "m1", "user").is_err());
+    }
+
+    /// CAD-468: `enqueue_daemon` admits exactly the pairs the daemon
+    /// mints — `sys-<source>-…` for a daemon source (`wake`, and `nudge`
+    /// for the silent-end report reminder) — and refuses every crossing:
+    /// a caller id under a daemon source, a daemon id under a caller
+    /// source, a daemon id whose kind segment is not the source, and a
+    /// routed source. Callers stay fenced the other way by
+    /// `proto::caller_message` — no `sys-` id, no `wake` source.
+    #[test]
+    fn enqueue_daemon_admits_only_matching_daemon_pairs() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        reg(&s, "a1", &cwd);
+        // The reminder pair the daemon mints.
+        let (dup, _) = s
+            .enqueue_daemon("a1", "report it", "sys-nudge-0123456789abcdef", "nudge")
+            .unwrap();
+        assert!(!dup);
+        let (dup, _) = s
+            .enqueue_daemon("a1", "report it", "sys-nudge-0123456789abcdef", "nudge")
+            .unwrap();
+        assert!(dup, "the same daemon id dedupes");
+        // And the wake pair.
+        s.enqueue_daemon("a1", "wake", "sys-wake-0123456789abcdef", "wake")
+            .unwrap();
+        // And the answer pair (CAD-447's routed reply lives on the
+        // daemon lane like wake).
+        s.enqueue_daemon("a1", "answer", "sys-answer-0123456789abcdef", "answer")
+            .unwrap();
+        for (id, source) in [
+            ("m-1", "nudge"),             // caller id + daemon source
+            ("m-1", "wake"),              // caller id + daemon source
+            ("m-1", "answer"),            // caller id + daemon source
+            ("sys-nudge-x", "user"),      // daemon id + caller source
+            ("sys-wake-x", "nudge"),      // crossed daemon pair
+            ("sys-nudge-x", "wake"),      // crossed daemon pair
+            ("sys-answer-x", "nudge"),    // crossed daemon pair
+            ("sys-nudge-x", "answer"),    // crossed daemon pair
+            ("sys-x-x", "worker_notice"), // routed source can't go daemon
+        ] {
+            assert!(
+                s.enqueue_daemon("a1", "x", id, source).is_err(),
+                "{id}/{source} must be refused"
+            );
+        }
+        // The caller side of the same fence.
+        assert!(crate::proto::caller_message("sys-nudge-x", "nudge").is_err());
+        assert!(crate::proto::caller_message("m-1", "wake").is_err());
+        assert!(crate::proto::caller_message("m-1", "answer").is_err());
+        assert!(crate::proto::caller_message("m-1", "nudge").is_ok());
     }
 
     fn approval<'a>(id: &'a str, source: &'a str, head: &'a str, pr: u64) -> NewApproval<'a> {
@@ -11762,6 +11879,8 @@ mod tests {
             id,
             "user",
             None,
+            None,
+            None,
             &Sender::Unattributed,
             steer,
         )
@@ -12179,6 +12298,8 @@ mod tests {
                 "u1",
                 "user",
                 None,
+                None,
+                None,
                 &Sender::Unattributed,
                 &steer_as_pm(Priority::Urgent, none),
             )
@@ -12192,7 +12313,6 @@ mod tests {
             assert_eq!(order, ["u1", "m1", "m2"]);
         }
         assert_eq!(version(&db), crate::rollout::SCHEMA_VERSION);
-        assert_eq!(crate::rollout::SCHEMA_VERSION, 15);
         // Half-applied: column present, version rolled back.
         Connection::open(&db)
             .unwrap()
@@ -12202,6 +12322,76 @@ mod tests {
             let s = Store::open_for_schema_tests(&db).unwrap();
             assert_eq!(s.message("u1").unwrap().unwrap().priority, Priority::Urgent);
         }
-        assert_eq!(version(&db), 15);
+        assert_eq!(version(&db), crate::rollout::SCHEMA_VERSION);
+    }
+
+    /// v16 adds `messages.issue`/`messages.worktree` — the dispatch
+    /// lane a kickoff belongs to (CAD-467). Nullable, so a v15 store
+    /// migrates in place and old rows read NULL.
+    #[test]
+    fn migration_v15_to_v16_adds_lane_provenance() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("t.sqlite3");
+        std::fs::create_dir(dir.path().join("w")).unwrap();
+        {
+            let s = Store::open(&db).unwrap();
+            reg(&s, "a1", &dir.path().join("w"));
+            s.enqueue("a1", "kickoff", None, "k1", "user").unwrap();
+        }
+        // A genuine v15: no provenance columns.
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "ALTER TABLE messages DROP COLUMN issue;
+                 ALTER TABLE messages DROP COLUMN worktree;
+                 UPDATE schema_version SET version=15;",
+            )
+            .unwrap();
+        let version = |db: &Path| -> i64 {
+            Connection::open(db)
+                .unwrap()
+                .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+                .unwrap()
+        };
+        {
+            let s = Store::open_for_schema_tests(&db).unwrap();
+            let old = s.message("k1").unwrap().unwrap();
+            assert_eq!(old.issue, None);
+            assert_eq!(old.worktree, None);
+            s.enqueue_steered(
+                "a1",
+                "lane kickoff",
+                None,
+                "k2",
+                "user",
+                None,
+                Some("D-1"),
+                Some("/lane/d-1"),
+                &Sender::Unattributed,
+                &Steer::NONE,
+            )
+            .unwrap();
+            let new = s.message("k2").unwrap().unwrap();
+            assert_eq!(new.issue.as_deref(), Some("D-1"));
+            assert_eq!(new.worktree.as_deref(), Some("/lane/d-1"));
+        }
+        assert_eq!(version(&db), crate::rollout::SCHEMA_VERSION);
+        assert_eq!(crate::rollout::SCHEMA_VERSION, 16);
+        // Half-applied: one column present, version rolled back.
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "ALTER TABLE messages DROP COLUMN worktree;
+                 UPDATE schema_version SET version=15;",
+            )
+            .unwrap();
+        {
+            let s = Store::open_for_schema_tests(&db).unwrap();
+            assert_eq!(
+                s.message("k2").unwrap().unwrap().issue.as_deref(),
+                Some("D-1")
+            );
+        }
+        assert_eq!(version(&db), crate::rollout::SCHEMA_VERSION);
     }
 }

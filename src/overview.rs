@@ -2415,11 +2415,35 @@ fn agent_items(a: &Value, probe: &AgentProbe, project: &str, now: i64) -> Vec<It
         );
     }
     if a["silent_ended"].as_bool().unwrap_or(false) {
+        // CAD-468: the daemon fires one report-reminder nudge at the
+        // silent-end edge — say so on the row when a `sys-nudge-` row
+        // carrying the report command exists for this agent, so the
+        // operator knows the worker was already prompted in band.
+        let reminded = probe.show.as_ref().is_some_and(|s| {
+            s["messages"].as_array().is_some_and(|ms| {
+                ms.iter().any(|m| {
+                    m["source"].as_str() == Some("nudge")
+                        && m["id"]
+                            .as_str()
+                            .is_some_and(|id| id.starts_with("sys-nudge-"))
+                        && m["body"]
+                            .as_str()
+                            .is_some_and(|b| b.contains("message result"))
+                })
+            })
+        });
+        let text = if reminded {
+            format!(
+                "agent {alias} turn ended at an idle pane — never reported; report reminder sent"
+            )
+        } else {
+            format!("agent {alias} turn ended at an idle pane — never reported")
+        };
         items.push(
             row(
                 40,
                 "silent_end",
-                &format!("agent {alias} turn ended at an idle pane — never reported"),
+                &text,
                 a["ended_secs"].as_f64().unwrap_or(age as f64) as i64,
                 &cmd_send_nudge(alias),
             )

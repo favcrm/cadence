@@ -149,7 +149,10 @@ fn text(out: &Output) -> String {
 /// other processes alike, and the kernel releases it when the test
 /// ends, however it ends. The scan starts at a pid-derived offset so
 /// concurrent processes rarely contend, and a port something else
-/// (outside this scheme) already listens on is skipped.
+/// already listens on is skipped. `sandbox up`'s free pick shares the
+/// range; under `CADENCE_TEST_PORT_LOCK_DIR` (tests/sandbox.rs sets it
+/// to this dir) it honours these leases and holds its own while its
+/// board binds, so neither side can take the other's port mid-pick.
 struct PortLease {
     port: u16,
     _lock: std::fs::File,
