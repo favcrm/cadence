@@ -218,6 +218,7 @@ inputs:
   goal:     { ask: "What is true when this lands?" }
   worker:   { ask: "Agent that implements it" }
   reviewer: { ask: "Agent that reviews it — never the worker" }
+distinct: [worker, reviewer]
 ---
 
 ## Implement {{title}}
@@ -228,9 +229,16 @@ size: M
 ```
 
 `cadence plan propose --workflow <name> --input k=v …` renders it — placeholders
-take the input values, `inputs:` drops out of the frontmatter — and the result
-goes through the unchanged propose → approve → gate path above. A missing or
-unknown input, or an unresolved `{{name}}`, is refused with a named reason.
+take the input values, `inputs:`/`distinct:` drop out of the frontmatter — and
+the result goes through the unchanged propose → approve → gate path above. A
+missing or unknown input, or an unresolved `{{name}}`, is refused with a named
+reason. A value must be a single line (`one_line`): a newline or control
+character would smuggle tickets, dependencies or metadata in under an approved
+skeleton — and after substitution the rendered plan is re-parsed and its
+skeleton (ticket count, per-ticket metadata keys, `depends_on` edges) must
+equal the template's own, refusing `render_diverged` if not. `distinct:` names
+inputs whose values must pairwise differ at render (`not_distinct`) — it is how
+`agent: {{worker}}` + `agent: {{reviewer}}` keep a review independent.
 `cadence workflow check <file|name>` verifies a template without proposing:
 plan-parse, declared inputs, known agents (PROJECT.md `agents:`, `<pm>/agents/`,
 the daemon registry), `depends_on` acyclic, acceptance on every ticket, and no
@@ -240,13 +248,24 @@ tracker commit with `Actor:` recorded — and `show`/`ls` mark each workflow's
 approval state.
 
 Like `PROJECT.md`'s work keys, a workflow is gated by a digest of its **gate
-keys**: the declared inputs, the ticket count, and each ticket's metadata
-(`size`, `agent`, `depends_on`, plus `reviewer`/`tries`/`uses` — keys the plan
-parser does not consume yet but a workflow may already carry). The operator's
-`workflow approve` records that digest; an edit that changes it — CLI or hand —
-unapproves the workflow and `propose --workflow` refuses `workflow_unapproved`
-until it is re-approved. Wording-only edits keep the digest. Approval is a
-process guard, not a security boundary, same as the plan gate.
+keys**: the declared inputs and the `distinct:` group, the ticket count, and
+each ticket's metadata (`size`, `agent`, `depends_on`, plus
+`reviewer`/`tries`/`uses` — keys the plan parser does not consume yet but a
+workflow may already carry). The operator's `workflow approve` records that
+digest; an edit that changes it — CLI or hand — unapproves the workflow and
+`propose --workflow` refuses `workflow_unapproved` until it is re-approved.
+
+What workflow approval covers — and what it does not. The digest pins the
+*shape*: which inputs exist, which must differ, how many tickets, and what each
+ticket's metadata says. It does **not** pin the input values chosen at each
+propose — `agent: {{worker}}` means "any agent, picked per run" under one
+approval, so a run can staff a different worker every time while
+`distinct: [worker, reviewer]` still keeps reviewer≠worker. It does not pin
+wording either: titles, prose and acceptance text may be edited freely and keep
+the digest. And it is not the execution gate — a rendered workflow still
+produces a *proposed* plan, and `plan approve` remains the operator decision
+that lets its tickets run. Approval is a process guard, not a security
+boundary, same as the plan gate.
 
 ## Views
 

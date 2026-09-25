@@ -4015,6 +4015,9 @@ impl Shared {
             },
         };
         let project = required_str(params, "project")?;
+        // `project` joins the pm dir on the workflow path — it is a key,
+        // never a path fragment.
+        crate::issue::model::check_key(project)?;
         let text = optional_str(params, "text");
         let workflow = optional_str(params, "workflow");
         let inputs = params.get("inputs");

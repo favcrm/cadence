@@ -42519,6 +42519,163 @@ the worker — a worker never verdicts its own work.\n\n\
     }
 }
 
+/// CAD-487 r2 (review): input values cannot inject plan structure and
+/// `project` is a key, never a path. A newline, CR or control
+/// character refuses with `one_line` before substitution — asserted on
+/// the code, so a mutant dropping the value check fails here even
+/// though the skeleton guard behind it would still refuse — and the
+/// post-render skeleton parity (unit-tested in `workflow.rs`) is what
+/// would catch it. `distinct:` pins worker≠reviewer at render.
+#[test]
+fn workflow_inputs_cannot_inject_and_project_is_a_key() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    f.d.register("qa-1");
+    wf_add(&f, "two-step", WF_TWO_STEP);
+    let (ok, out) = f.cli(&["workflow", "approve", "two-step", "--project", "demo"]);
+    assert!(ok, "{out}");
+
+    // The three attack shapes from the review — each refused by name
+    // before substitution; nothing is proposed.
+    let before = f.commits();
+    for value in [
+        "x\n\n## Rogue\nagent: qa-1\n\n### Acceptance\n- [ ] y",
+        "x\ndepends_on: 1",
+        "x\nzz: 1",
+        "x\ry",
+        "x\t0",
+    ] {
+        let err =
+            f.d.operator_rpc(
+                "plan_propose",
+                json!({"project": "demo", "workflow": "two-step",
+                       "inputs": {"title": value}}),
+            )
+            .unwrap_err();
+        assert_eq!(err.code(), Some("one_line"), "{value:?}: {err}");
+    }
+    assert_eq!(f.commits(), before, "refusals write nothing");
+
+    // `distinct:` — worker==reviewer refuses by name; differing values
+    // propose. (code-change.md carries the declaration.)
+    let src = concat!(env!("CARGO_MANIFEST_DIR"), "/workflows/code-change.md");
+    let (ok, out) = f.cli(&[
+        "workflow",
+        "add",
+        "code-change",
+        "--project",
+        "demo",
+        "--file",
+        src,
+    ]);
+    assert!(ok, "{out}");
+    let (ok, out) = f.cli(&["workflow", "approve", "code-change", "--project", "demo"]);
+    assert!(ok, "{out}");
+    let err =
+        f.d.operator_rpc(
+            "plan_propose",
+            json!({"project": "demo", "workflow": "code-change",
+                   "inputs": {"title": "t", "goal": "g",
+                              "worker": "dev-1", "reviewer": "dev-1"}}),
+        )
+        .unwrap_err();
+    assert_eq!(err.code(), Some("not_distinct"), "{err}");
+    let out =
+        f.d.operator_rpc(
+            "plan_propose",
+            json!({"project": "demo", "workflow": "code-change",
+                   "inputs": {"title": "t", "goal": "g",
+                              "worker": "dev-1", "reviewer": "qa-1"}}),
+        )
+        .unwrap();
+    assert!(out["epic"].is_string(), "{out}");
+
+    // `project` is a key on every workflow path — traversal and
+    // absolute paths refuse and can never read outside the tracker.
+    for bad in ["../x", "/tmp", "demo/../demo", "demo/../../etc"] {
+        let err =
+            f.d.operator_rpc(
+                "plan_propose",
+                json!({"project": bad, "workflow": "two-step",
+                       "inputs": {"title": "x"}}),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("key"), "{bad}: {err}");
+        let err =
+            f.d.operator_rpc(
+                "workflow_approve",
+                json!({"project": bad, "name": "two-step"}),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("key"), "{bad}: {err}");
+    }
+    // CLI forms too — check/show/add all take the key through the same
+    // guard; `ls` names the bad key as unknown.
+    let good = wf_file(&f, "ok.md", WF_TWO_STEP);
+    for args in [
+        vec!["workflow", "check", "two-step", "--project", "../x"],
+        vec!["workflow", "check", &good, "--project", "/tmp"],
+        vec!["workflow", "show", "two-step", "--project", "/tmp"],
+        vec!["workflow", "add", "x", "--project", "../x", "--file", &good],
+        vec![
+            "workflow",
+            "edit",
+            "two-step",
+            "--project",
+            "/tmp",
+            "--file",
+            &good,
+        ],
+        vec!["workflow", "ls", "--project", "../x"],
+    ] {
+        let (ok, out) = f.cli(&args);
+        assert!(!ok, "{args:?}: {out}");
+        assert!(!f.pm_dir.join("../x").exists(), "{args:?} wrote outside");
+    }
+
+    // A symlinked `workflows/` dir is never followed: `ls` names it as
+    // an error row rather than walking it, and reads refuse.
+    let outside = f.tmp.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("trap.md"), WF_TWO_STEP).unwrap();
+    let repo2 = f.tmp.path().join("repo2");
+    std::fs::create_dir_all(&repo2).unwrap();
+    let git_ok = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo2)
+        .args(["init", "-q", "-b", "main"])
+        .status()
+        .unwrap()
+        .success();
+    assert!(git_ok);
+    let (ok, out) = f.cli(&[
+        "issue",
+        "project",
+        "add",
+        "trap",
+        "--prefix",
+        "T",
+        "--repo",
+        repo2.canonicalize().unwrap().to_str().unwrap(),
+    ]);
+    assert!(ok, "{out}");
+    std::os::unix::fs::symlink(&outside, f.pm_dir.join("trap/workflows")).unwrap();
+    let (ok, out) = f.cli(&["workflow", "ls", "--project", "trap"]);
+    assert!(ok, "{out}");
+    assert!(
+        out["workflows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["error"].as_str().is_some_and(|e| e.contains("symlink"))),
+        "{out}"
+    );
+    let (ok, out) = f.cli(&["workflow", "show", "trap", "--project", "trap"]);
+    assert!(!ok && out.to_string().contains("symlink"), "{out}");
+}
+
 /// CAD-360: `job dispatch` of a task whose job is bound to a ticket of
 /// an unapproved plan is refused with the named reason and queues
 /// nothing; after approval it dispatches. A job bound to an issue in

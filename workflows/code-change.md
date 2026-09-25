@@ -6,6 +6,7 @@ inputs:
   goal:     { ask: "What is true when this change lands?" }
   worker:   { ask: "Agent that implements it" }
   reviewer: { ask: "Agent that reviews the diff — never the worker" }
+distinct: [worker, reviewer]
 ---
 
 The software loop as a plan: one ticket implements, a second —

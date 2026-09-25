@@ -43,9 +43,11 @@ use crate::issue::{plan, project, write, Pm};
 pub const DIR: &str = "workflows";
 
 /// Frontmatter keys a workflow file may carry: the plan's own three,
-/// plus `inputs`. Anything else refuses at parse — the same fail-loud
+/// plus `inputs` and `distinct` (inputs whose values must differ at
+/// render — `distinct: [worker, reviewer]` keeps a reviewer from being
+/// the worker). Anything else refuses at parse — the same fail-loud
 /// rule the plan parser applies with `deny_unknown_fields`.
-const META_KEYS: &[&str] = &["title", "goal", "non_goals", "inputs"];
+const META_KEYS: &[&str] = &["title", "goal", "non_goals", "inputs", "distinct"];
 
 /// Ticket metadata lines a workflow recognises: the plan's own plus
 /// the approval-affecting fields later stages add (a `reviewer:` line
@@ -65,18 +67,21 @@ pub struct InputSpec {
     pub optional: bool,
 }
 
-/// A parsed workflow template: the declared inputs. The plan structure
-/// itself is checked by rendering and running [`plan::parse_plan`].
+/// A parsed workflow template: the declared inputs and the `distinct:`
+/// group — inputs whose rendered values must pairwise differ. The plan
+/// structure itself is checked by rendering and running
+/// [`plan::parse_plan`].
 #[derive(Clone, Debug)]
 pub struct Template {
     pub inputs: BTreeMap<String, InputSpec>,
+    pub distinct: Vec<String>,
 }
 
 /// `{{name}}` — the input name is a bare word, like an alias but with
 /// an optional leading `_`.
 fn valid_input_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
+    name.len() <= 64
+        && !name.is_empty()
         && name
             .chars()
             .next()
@@ -84,6 +89,15 @@ fn valid_input_name(name: &str) -> bool {
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// The whole value is exactly `{{name}}` — returns the input name.
+/// Only a bare placeholder renders exactly its input, which is what
+/// makes `distinct:` meaningful; `x-{{a}}` mixes literal text in.
+fn bare_placeholder(v: &str) -> Option<&str> {
+    v.strip_prefix("{{")?
+        .strip_suffix("}}")
+        .filter(|n| valid_input_name(n))
 }
 
 /// `workflows/<name>.md` — the name is a tag-shaped slug.
@@ -97,7 +111,10 @@ fn check_name(name: &str) -> Result<()> {
 }
 
 /// `<pm>/<project>/workflows/<name>.md` — the dir must be real.
+/// `project` is a key, never a path fragment: `..`, `/` and absolute
+/// paths refuse here so no caller reads outside the tracker.
 fn dir_of(pm_dir: &Path, project: &str) -> Result<PathBuf> {
+    model::check_key(project)?;
     let dir = pm_dir.join(project).join(DIR);
     if dir.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
         return Err(Error::rejected(format!(
@@ -130,8 +147,15 @@ pub fn read_for(pm_dir: &Path, project: &str, name: &str) -> Result<String> {
 }
 
 /// The frontmatter of a template: a YAML mapping restricted to
-/// [`META_KEYS`]; `inputs` is pulled out into [`InputSpec`]s.
-fn parse_front(yaml: &str) -> Result<(serde_yaml::Mapping, BTreeMap<String, InputSpec>)> {
+/// [`META_KEYS`]; `inputs` is pulled out into [`InputSpec`]s and
+/// `distinct` into the must-differ input group.
+fn parse_front(
+    yaml: &str,
+) -> Result<(
+    serde_yaml::Mapping,
+    BTreeMap<String, InputSpec>,
+    Vec<String>,
+)> {
     let meta: serde_yaml::Value = serde_yaml::from_str(yaml)
         .map_err(|e| Error::rejected(format!("workflow frontmatter: {e}")))?;
     let mut map = match meta {
@@ -205,7 +229,35 @@ fn parse_front(yaml: &str) -> Result<(serde_yaml::Mapping, BTreeMap<String, Inpu
             inputs.insert(name.to_string(), spec);
         }
     }
-    Ok((map, inputs))
+    // `distinct: [a, b]` — inputs whose rendered values must pairwise
+    // differ (worker vs reviewer). Names must be declared inputs.
+    let mut distinct = Vec::new();
+    if let Some(v) = map.remove(serde_yaml::Value::String("distinct".to_string())) {
+        let serde_yaml::Value::Sequence(list) = v else {
+            return Err(Error::rejected(
+                "workflow `distinct:` must be a list of input names — `distinct: [a, b]`",
+            ));
+        };
+        for item in list {
+            let Some(name) = item.as_str() else {
+                return Err(Error::rejected(
+                    "workflow `distinct:` entries are input names — `distinct: [a, b]`",
+                ));
+            };
+            if !inputs.contains_key(name) {
+                return Err(Error::rejected(format!(
+                    "distinct: '{name}' is not a declared input — declare it under `inputs:`"
+                )));
+            }
+            distinct.push(name.to_string());
+        }
+        if distinct.len() < 2 {
+            return Err(Error::rejected(
+                "workflow `distinct:` needs at least two input names — it pins them apart",
+            ));
+        }
+    }
+    Ok((map, inputs, distinct))
 }
 
 /// Scan for `{{` … `}}` placeholders: each inner name must be a
@@ -339,10 +391,10 @@ pub fn parse_template(text: &str) -> Result<Template> {
             "{e} — a workflow is a plan file: frontmatter title, goal, non_goals, inputs"
         ))
     })?;
-    let (_meta, inputs) = parse_front(yaml)?;
+    let (_meta, inputs, distinct) = parse_front(yaml)?;
     placeholders(text, &inputs)?;
     ticket_meta(body)?;
-    Ok(Template { inputs })
+    Ok(Template { inputs, distinct })
 }
 
 /// Render `text` with `values`: every `{{name}}` becomes its value
@@ -355,7 +407,11 @@ fn render_values(text: &str, values: &BTreeMap<String, String>) -> Result<String
     let (yaml, body) = parse::split_front(text).map_err(|e| Error::rejected(e.to_string()))?;
     let mut meta: serde_yaml::Mapping = serde_yaml::from_str(yaml)
         .map_err(|e| Error::rejected(format!("workflow frontmatter: {e}")))?;
-    meta.remove(serde_yaml::Value::String("inputs".to_string()));
+    // `inputs:` and `distinct:` are workflow meta — the plan parser
+    // denies unknown fields, so neither reaches the rendered file.
+    for key in ["inputs", "distinct"] {
+        meta.remove(serde_yaml::Value::String(key.to_string()));
+    }
     let mut meta = serde_yaml::Value::Mapping(meta);
     subst_yaml(&mut meta, values);
     let yaml = serde_yaml::to_string(&meta)
@@ -365,7 +421,12 @@ fn render_values(text: &str, values: &BTreeMap<String, String>) -> Result<String
 
 /// Render the template with `provided` (`k=v` pairs): unknown names
 /// and missing required inputs refuse with a named reason; absent
-/// optionals render as empty.
+/// optionals render as empty. A value must be a single line — a
+/// newline or control character would inject plan structure under an
+/// approved skeleton — and `distinct:` inputs must differ. After
+/// substitution the rendered plan's skeleton (ticket count, per-ticket
+/// metadata keys, `depends_on` edges) must match the template's own:
+/// defence in depth if the one-line rule is ever loosened.
 pub fn render(text: &str, provided: &BTreeMap<String, String>) -> Result<String> {
     let tpl = parse_template(text)?;
     for k in provided.keys() {
@@ -395,12 +456,114 @@ pub fn render(text: &str, provided: &BTreeMap<String, String>) -> Result<String>
             missing.join(", ")
         )));
     }
+    for (k, v) in provided {
+        if v.chars().any(|c| c.is_control()) {
+            return Err(Error::invalid(
+                "one_line",
+                format!(
+                    "input '{k}' must be a single line — a newline or control character \
+                     can inject tickets, dependencies or metadata under an approved skeleton"
+                ),
+            ));
+        }
+    }
+    for (i, a) in tpl.distinct.iter().enumerate() {
+        for b in &tpl.distinct[i + 1..] {
+            let (va, vb) = (
+                provided.get(a).map(String::as_str).unwrap_or(""),
+                provided.get(b).map(String::as_str).unwrap_or(""),
+            );
+            if va == vb {
+                return Err(Error::invalid(
+                    "not_distinct",
+                    format!("inputs '{a}' and '{b}' must differ (`distinct:`) — both are '{va}'"),
+                ));
+            }
+        }
+    }
     let values: BTreeMap<String, String> = tpl
         .inputs
         .keys()
         .map(|k| (k.clone(), provided.get(k).cloned().unwrap_or_default()))
         .collect();
-    render_values(text, &values)
+    let rendered = render_values(text, &values)?;
+    check_rendered(text, &tpl, &rendered)?;
+    Ok(rendered)
+}
+
+/// A rendered plan's skeleton: per ticket, the metadata lines as a
+/// sorted atom list — one atom per recognised-key occurrence plus one
+/// `dep:<token>` per normalised `depends_on` edge. Values never
+/// appear: an input's whole job is to fill them. The `parse_plan` call
+/// doubles as the render's own validity check (acceptance, sizes,
+/// aliases) — a render that is not a plan refuses here.
+fn skeleton(text: &str) -> Result<Vec<Vec<String>>> {
+    plan::parse_plan(text)?;
+    let body = parse::split_front(text).map(|(_, b)| b).unwrap_or("");
+    let metas = ticket_meta(body)?;
+    let mut out = Vec::with_capacity(metas.len());
+    for meta in &metas {
+        let mut atoms = Vec::new();
+        for (key, value) in meta {
+            if key == "depends_on" {
+                for tok in normalize_deps(value).split(',') {
+                    if !tok.is_empty() {
+                        atoms.push(format!("dep:{tok}"));
+                    }
+                }
+            } else {
+                atoms.push(key.clone());
+            }
+        }
+        atoms.sort();
+        out.push(atoms);
+    }
+    Ok(out)
+}
+
+/// The second render guard (CAD-487 review): the rendered file's
+/// skeleton must equal the template's canonical one — same ticket
+/// count, same metadata keys per ticket, same `depends_on` edges. Any
+/// difference names itself; the refusal is `render_diverged`.
+fn check_rendered(text: &str, tpl: &Template, rendered: &str) -> Result<()> {
+    let canon_text = canonical(text, &tpl.inputs)?;
+    let want = skeleton(&canon_text).map_err(|e| {
+        Error::rejected(format!(
+            "the workflow does not render to a valid plan even canonically — \
+             run `cadence workflow check` on it: {e}"
+        ))
+    })?;
+    let got = skeleton(rendered).map_err(|e| {
+        Error::invalid(
+            "render_diverged",
+            format!("the inputs render to an invalid plan — {e}"),
+        )
+    })?;
+    if want.len() != got.len() {
+        return Err(Error::invalid(
+            "render_diverged",
+            format!(
+                "the inputs render {} tickets where the template declares {}",
+                got.len(),
+                want.len()
+            ),
+        ));
+    }
+    for (i, (w, g)) in want.iter().zip(got.iter()).enumerate() {
+        if w != g {
+            return Err(Error::invalid(
+                "render_diverged",
+                format!(
+                    "the inputs change ticket {}'s skeleton — template has [{}], \
+                     the render has [{}]",
+                    i + 1,
+                    w.join(", "),
+                    g.join(", ")
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// `render` for `check`: each `{{name}}` becomes its own name — a
@@ -469,6 +632,13 @@ pub fn gate_keys(text: &str) -> Result<String> {
             .collect::<Vec<_>>()
             .join(","),
     );
+    if !tpl.distinct.is_empty() {
+        // The distinctness contract is approval-affecting too — dropping
+        // `distinct:` would silently re-admit worker == reviewer.
+        let mut d = tpl.distinct.clone();
+        d.sort();
+        keys.push_str(&format!(";distinct={}", d.join(",")));
+    }
     keys.push('\n');
     let metas = ticket_meta(body)?;
     keys.push_str(&format!("tickets={}\n", metas.len()));
@@ -546,6 +716,7 @@ fn dep_cycle(doc: &plan::PlanDoc) -> Option<Vec<usize>> {
 /// The agents a ticket's `agent:` may name, and where each came from:
 /// the project's PROJECT.md `agents:` map, the agent files under
 /// `<pm>/agents/`, and (when given) the daemon's registered aliases.
+/// `project_key` must pass [`model::check_key`] — it joins the pm dir.
 pub fn known_agents(
     pm_dir: &Path,
     project_key: Option<&str>,
@@ -554,19 +725,22 @@ pub fn known_agents(
     let mut agents = HashSet::new();
     let mut sources = Vec::new();
     if let Some(key) = project_key {
-        if let Ok(text) = std::fs::read_to_string(pm_dir.join(key).join("PROJECT.md")) {
-            if let Ok((yaml, _)) = parse::split_front(&text) {
-                if let Ok(serde_yaml::Value::Mapping(m)) =
-                    serde_yaml::from_str::<serde_yaml::Value>(yaml)
-                {
-                    if let Some(serde_yaml::Value::Mapping(a)) =
-                        m.get(serde_yaml::Value::String("agents".to_string()))
+        // A malformed key is no project — never a path to join.
+        if let Ok(key) = model::check_key(key) {
+            if let Ok(text) = std::fs::read_to_string(pm_dir.join(&key).join("PROJECT.md")) {
+                if let Ok((yaml, _)) = parse::split_front(&text) {
+                    if let Ok(serde_yaml::Value::Mapping(m)) =
+                        serde_yaml::from_str::<serde_yaml::Value>(yaml)
                     {
-                        for k in a.keys().filter_map(|k| k.as_str()) {
-                            agents.insert(k.to_string());
-                        }
-                        if !a.is_empty() {
-                            sources.push(format!("{key}/PROJECT.md agents:"));
+                        if let Some(serde_yaml::Value::Mapping(a)) =
+                            m.get(serde_yaml::Value::String("agents".to_string()))
+                        {
+                            for k in a.keys().filter_map(|k| k.as_str()) {
+                                agents.insert(k.to_string());
+                            }
+                            if !a.is_empty() {
+                                sources.push(format!("{key}/PROJECT.md agents:"));
+                            }
                         }
                     }
                 }
@@ -777,9 +951,33 @@ pub(crate) fn check_text(
             reviewer_checked = true;
             let agent = get("agent");
             if reviewer.contains("{{") || agent.is_some_and(|a| a.contains("{{")) {
-                notes.push(format!(
-                    "{label}: reviewer is templated — reviewer≠agent is checked at render"
-                ));
+                // Render-time values: independence holds only when both
+                // sides are bare placeholders whose inputs `distinct:`
+                // pins apart — anything else cannot be proven or
+                // enforced, so it refuses rather than notes.
+                match (agent.and_then(bare_placeholder), bare_placeholder(reviewer)) {
+                    _ if agent.is_none() => notes.push(format!(
+                        "{label}: reviewer is templated and the ticket has no `agent:` — \
+                         nothing to collide with"
+                    )),
+                    (Some(a), Some(r)) if a == r => errors.push(format!(
+                        "{label}: agent and reviewer are the same input `{{{{{a}}}}}` — \
+                         they always render equal"
+                    )),
+                    (Some(a), Some(r))
+                        if tpl.distinct.iter().any(|d| d == a)
+                            && tpl.distinct.iter().any(|d| d == r) =>
+                    {
+                        notes.push(format!(
+                            "{label}: reviewer≠agent enforced at render by `distinct:`"
+                        ));
+                    }
+                    _ => errors.push(format!(
+                        "{label}: agent and reviewer are templated — the render cannot \
+                         prove reviewer≠agent. Make each a bare `{{{{input}}}}` and pin \
+                         them: `distinct: [worker, reviewer]`"
+                    )),
+                }
             } else if agent == Some(reviewer) {
                 errors.push(format!(
                     "{label}: reviewer '{reviewer}' is the ticket's own agent — a \
@@ -812,6 +1010,9 @@ pub fn check(
     // resolves `--project` or the cwd's project leniently — without
     // one, `agent:` is still checked against <pm>/agents/ and the
     // daemon registry.
+    if let Some(k) = project_key {
+        model::check_key(k)?;
+    }
     let cwd = std::env::current_dir()?;
     let resolve_lenient =
         |flag: Option<&str>| project::resolve(pm_dir, flag, &cwd).ok().map(|p| p.key);
@@ -922,6 +1123,19 @@ pub fn write_file(
         )));
     }
     let verb = if add { "add" } else { "edit" };
+    let daemon_agents = daemon_aliases(state_dir);
+    let (agents, sources) = known_agents(&pm.dir, Some(project_key), &daemon_agents);
+    let (errors, notes, _) = check_text(text, &agents, &sources);
+    if !errors.is_empty() {
+        return Err(Error::rejected(format!(
+            "workflow {verb} refused — the file fails `workflow check`: {}",
+            errors.join("; ")
+        )));
+    }
+    let warnings = crate::secret::guard(&format!("workflow {name}"), text)?;
+    let _lock = pm.lock()?;
+    // The exists check runs under the lock — two concurrent `add`s must
+    // not both pass it.
     match (add, file.exists()) {
         (true, true) => {
             return Err(Error::rejected(format!(
@@ -936,17 +1150,6 @@ pub fn write_file(
         }
         _ => {}
     }
-    let daemon_agents = daemon_aliases(state_dir);
-    let (agents, sources) = known_agents(&pm.dir, Some(project_key), &daemon_agents);
-    let (errors, notes, _) = check_text(text, &agents, &sources);
-    if !errors.is_empty() {
-        return Err(Error::rejected(format!(
-            "workflow {verb} refused — the file fails `workflow check`: {}",
-            errors.join("; ")
-        )));
-    }
-    let warnings = crate::secret::guard(&format!("workflow {name}"), text)?;
-    let _lock = pm.lock()?;
     if let Some(dir) = file.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -1028,6 +1231,15 @@ pub fn ls(pm: &Pm, project_key: Option<&str>, state_dir: &Path) -> Result<Value>
     let mut rows = Vec::new();
     for p in projects {
         let dir = pm.dir.join(&p.key).join(DIR);
+        // A symlinked workflows/ dir is never followed — name it in the
+        // listing rather than silently walking outside the tracker.
+        if dir.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+            rows.push(json!({
+                "project": p.key, "name": null,
+                "error": "workflows/ is a symlink — the tracker never follows links",
+            }));
+            continue;
+        }
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
@@ -1134,6 +1346,12 @@ pub fn lint_dir(
     err: &mut dyn FnMut(String),
     warn: &mut dyn FnMut(String),
 ) {
+    if dir.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+        err(format!(
+            "{project_key}/{DIR}: symlink — the board never follows links"
+        ));
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -1385,10 +1603,180 @@ Why.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance
         let out = render(WF, &inputs(&[("topic", "a: \"quoted\""), ("keyword", "k")])).unwrap();
         let doc = plan::parse_plan(&out).unwrap();
         assert_eq!(doc.title, "Post: a: \"quoted\"");
-        // A newline can't corrupt the frontmatter either — it lands in
-        // the scalar and the plan parser refuses the field, named.
-        let out = render(WF, &inputs(&[("topic", "x\ny")])).unwrap();
-        let e = plan::parse_plan(&out).unwrap_err().to_string();
-        assert!(e.contains("one line"), "{e}");
+        // A newline never reaches the frontmatter — the value is
+        // refused first, with the named reason.
+        let e = render(WF, &inputs(&[("topic", "x\ny")])).unwrap_err();
+        assert_eq!(e.code(), Some("one_line"), "{e}");
+    }
+
+    #[test]
+    fn input_values_are_single_line() {
+        // \n and \r split lines; other control characters (tab, NUL)
+        // are refused too — all can smuggle structure or mislead a
+        // reader. The named reason is `one_line`.
+        for bad in ["x\ny", "x\ry", "x\ty", "x\u{0}y", "x\u{7}y"] {
+            let e = render(WF, &inputs(&[("topic", bad)])).unwrap_err();
+            assert_eq!(e.code(), Some("one_line"), "{bad:?} -> {e}");
+            assert!(e.to_string().contains("'topic'"), "{e}");
+        }
+        // Mutation proof: if the check goes, the refusal's code does.
+        // Unicode that is not control — punctuation, spaces — is fine.
+        render(WF, &inputs(&[("topic", "a — b: c; d")])).unwrap();
+    }
+
+    /// An input in a meta position (`{{who}}` on `agent:`) and one in
+    /// the intro (`{{note}}`) — the two positions structure can be
+    /// injected through.
+    const WF_INJ: &str = "---\ntitle: T\ngoal: G\ninputs:\n  who: {}\n  note: {}\n---\n\n\
+Intro {{note}}\n\n## Do\nagent: {{who}}\nsize: S\n\n### Acceptance\n- [ ] x\n\n\
+## Check\nagent: qa-1\ndepends_on: 1\n\n### Acceptance\n- [ ] y\n";
+
+    #[test]
+    fn rendered_skeleton_must_match_the_template() {
+        // Guard 2, exercised directly through `check_rendered`: an
+        // injection that slipped past the value check (a mutant
+        // dropping it) still cannot reach `propose` — the rendered
+        // file's skeleton must equal the template's canonical one.
+        let tpl = parse_template(WF_INJ).unwrap();
+        let diverged = |key: &str, v: &str| {
+            let mut vals = inputs(&[("who", "dev-1"), ("note", "n")]);
+            vals.insert(key.to_string(), v.to_string());
+            let rendered = render_values(WF_INJ, &vals).unwrap();
+            check_rendered(WF_INJ, &tpl, &rendered).unwrap_err()
+        };
+        // A rogue ticket via the intro.
+        let e = diverged(
+            "note",
+            "x\n\n## Rogue\nagent: qa-1\n\n### Acceptance\n- [ ] y\n",
+        );
+        assert_eq!(e.code(), Some("render_diverged"));
+        assert!(e.to_string().contains("tickets"), "{e}");
+        // A rogue depends_on edge on ticket 1 via a meta position.
+        let e = diverged("who", "dev-1\ndepends_on: 2");
+        assert_eq!(e.code(), Some("render_diverged"));
+        assert!(e.to_string().contains("ticket 1"), "{e}");
+        // An unknown metadata line: the plan parser stops reading
+        // metadata at it, so `size:` lands in the body and the
+        // skeleton shrinks.
+        let e = diverged("who", "dev-1\nzz: 1");
+        assert_eq!(e.code(), Some("render_diverged"));
+        assert!(e.to_string().contains("ticket 1"), "{e}");
+        // A duplicated known key changes the key count — caught too.
+        let e = diverged("who", "dev-1\nsize: L");
+        assert_eq!(e.code(), Some("render_diverged"), "{e}");
+
+        // `render` refuses an input that leaves a required position
+        // empty — the render is not a plan. This is the parity guard's
+        // reachability witness: with the `check_rendered` call removed
+        // (a mutant) `render` returns the broken text and this fails.
+        let open_agent = WF_INJ.replace("  who: {}", "  who: { optional: true }");
+        let e = render(&open_agent, &inputs(&[("note", "n")])).unwrap_err();
+        assert_eq!(e.code(), Some("render_diverged"), "{e}");
+    }
+
+    const WF_DISTINCT: &str = "---\ntitle: \"T {{title}}\"\ngoal: \"G\"\n\
+inputs:\n  title: {}\n  worker: {}\n  reviewer: {}\ndistinct: [worker, reviewer]\n---\n\n\
+## Do\nagent: {{worker}}\nsize: S\n\n### Acceptance\n- [ ] x\n\n\
+## Review\nagent: {{reviewer}}\nsize: S\ndepends_on: 1\n\n### Acceptance\n- [ ] y\n";
+
+    #[test]
+    fn distinct_refuses_equal_values() {
+        let e = render(
+            WF_DISTINCT,
+            &inputs(&[("title", "t"), ("worker", "dev-1"), ("reviewer", "dev-1")]),
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), Some("not_distinct"), "{e}");
+        assert!(
+            e.to_string().contains("worker") && e.to_string().contains("reviewer"),
+            "{e}"
+        );
+        // Differing values render.
+        render(
+            WF_DISTINCT,
+            &inputs(&[("title", "t"), ("worker", "dev-1"), ("reviewer", "qa-1")]),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn distinct_validates_against_declared_inputs() {
+        // Names an undeclared input.
+        let bad = WF_DISTINCT.replace("distinct: [worker, reviewer]", "distinct: [worker, ghost]");
+        let e = parse_template(&bad).unwrap_err().to_string();
+        assert!(
+            e.contains("ghost") && e.contains("not a declared input"),
+            "{e}"
+        );
+        // Fewer than two names is meaningless.
+        let bad = WF_DISTINCT.replace("distinct: [worker, reviewer]", "distinct: [worker]");
+        assert!(parse_template(&bad).is_err());
+        // Not a list at all.
+        let bad = WF_DISTINCT.replace("distinct: [worker, reviewer]", "distinct: worker");
+        assert!(parse_template(&bad).is_err());
+        // Removing `distinct:` invalidates approval — it is gate-keyed.
+        let without = WF_DISTINCT.replace("distinct: [worker, reviewer]\n", "");
+        assert_ne!(
+            gate_digest(&without).unwrap(),
+            gate_digest(WF_DISTINCT).unwrap()
+        );
+    }
+
+    #[test]
+    fn check_text_templated_agent_reviewer() {
+        // Templated agent/reviewer: independence holds only when both
+        // are bare placeholders pinned in `distinct:` — else refused.
+        const WF_REV: &str = "---\ntitle: T\ngoal: G\ninputs:\n  w: {}\n  r: {}\n---\n\n\
+## Do\nagent: {{w}}\nsize: S\nreviewer: {{r}}\n\n### Acceptance\n- [ ] x\n";
+        let agents = HashSet::new();
+        let sources = vec!["test".to_string()];
+        // No distinct: — cannot prove reviewer≠agent → refusal.
+        let (errors, _, _) = check_text(WF_REV, &agents, &sources);
+        assert!(errors.iter().any(|e| e.contains("distinct")), "{errors:?}");
+        // With distinct: — enforced at render, noted.
+        let pinned = WF_REV.replace("  r: {}", "  r: {}\ndistinct: [w, r]");
+        let (errors, notes, _) = check_text(&pinned, &agents, &sources);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(notes.iter().any(|n| n.contains("distinct")), "{notes:?}");
+        // Same input on both sides — always equal.
+        let same = pinned.replace("reviewer: {{r}}", "reviewer: {{w}}");
+        let (errors, _, _) = check_text(&same, &agents, &sources);
+        assert!(
+            errors.iter().any(|e| e.contains("same input")),
+            "{errors:?}"
+        );
+        // Static reviewer + templated agent — unprovable.
+        let half = pinned.replace("reviewer: {{r}}", "reviewer: qa-1");
+        let (errors, _, _) = check_text(&half, &agents, &sources);
+        assert!(errors.iter().any(|e| e.contains("cannot")), "{errors:?}");
+    }
+
+    #[test]
+    fn check_text_meta_order_parity() {
+        let agents: HashSet<String> = ["dev-1", "dev-2", "qa-1"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let sources = vec!["test".to_string()];
+        // `reviewer:` before `agent:` — the plan parser stops at the
+        // unknown key, so `agent:` lands in the ticket body: refused,
+        // and the refusal names the key.
+        let bad = WF.replace(
+            "agent: dev-1\nsize: S",
+            "reviewer: qa-1\nagent: dev-1\nsize: S",
+        );
+        let (errors, _, _) = check_text(&bad, &agents, &sources);
+        assert!(
+            errors.iter().any(|e| e.contains("`agent` sits after")),
+            "{errors:?}"
+        );
+        // Positive control: a correctly ordered `reviewer:` passes with
+        // no parity error — kills mutants flipping the comparison.
+        let ok = WF.replace(
+            "agent: dev-1\nsize: S",
+            "agent: dev-1\nsize: S\nreviewer: qa-1",
+        );
+        let (errors, _, _) = check_text(&ok, &agents, &sources);
+        assert!(errors.is_empty(), "{errors:?}");
     }
 }
