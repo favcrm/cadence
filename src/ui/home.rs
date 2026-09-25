@@ -421,11 +421,13 @@ pub(super) fn master_summary(
 /// `platform_outbox`. A GET carries no write guards, so the operator
 /// rule the write routes get from `operator::admit` is run here by
 /// hand, exactly: a live operator session on an unattributable caller
-/// ([`operator::board_caller`]), the positive peer proof
-/// ([`prove_operator_peer`]) — the board is never less strict than
-/// the RPC it relays — and a board process the daemon itself accepts
-/// as operator ([`board_is_operator`]), since the relay crosses the
-/// daemon connection in the board's own name.
+/// ([`operator::board_caller`]) — on the public surface the verified
+/// `owner` role is the operator claim (CAD-526) — the positive peer
+/// proof ([`prove_operator_peer`]) for the loopback claim — the board
+/// is never less strict than the RPC it relays — and a board process
+/// the daemon itself accepts as operator ([`board_is_operator`]),
+/// since the relay crosses the daemon connection in the board's own
+/// name.
 pub(super) fn outbox(
     request: &Request,
     state_dir: &std::path::Path,
@@ -433,7 +435,26 @@ pub(super) fn outbox(
     effect_id: Option<String>,
 ) -> HttpResp {
     match operator::board_caller(request, state_dir, opts, false) {
-        Ok(operator::Caller::Operator(_)) => {}
+        Ok(operator::Caller::Operator(_)) => {
+            if let Err(resp) = prove_operator_peer(request, state_dir, opts, "GET /api/outbox") {
+                return resp;
+            }
+        }
+        // CAD-526: the verified `owner` role is the operator claim on
+        // the public surface — the platform relay's peer is not a
+        // process this host can prove; a member never reads the ledger.
+        Ok(operator::Caller::Named(named)) => {
+            if !named.operator {
+                return guard_fail(
+                    "member_role",
+                    &format!(
+                        "GET /api/outbox needs the board owner's role — this session is \
+                         {}'s, mapped `member`",
+                        named.actor
+                    ),
+                );
+            }
+        }
         Ok(operator::Caller::Agent(alias)) => {
             return guard_fail(
                 "operator_only",
@@ -444,9 +465,6 @@ pub(super) fn outbox(
             );
         }
         Err(resp) => return resp,
-    }
-    if let Err(resp) = prove_operator_peer(request, state_dir, opts, "GET /api/outbox") {
-        return resp;
     }
     if !board_is_operator(state_dir) {
         return guard_fail(
