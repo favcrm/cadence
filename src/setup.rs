@@ -821,13 +821,16 @@ fn confinement(ctx: &Ctx) -> Result<()> {
     crate::master::confinement_available(&env)
 }
 
-/// CAD-448: the master's own Claude login (CAD-439) — a separate
-/// `CLAUDE_CONFIG_DIR` under the state dir, never the operator's
-/// `~/.claude`. Detect only: the login command is interactive, so an
-/// absent login is `missing` with the command to run, never applied.
-/// A host that cannot confine the master runs it `--unconfined` on the
-/// operator's own login — there is no separate login to ask for, and
-/// the detail states the risk that choice carries.
+/// CAD-448: the master's own login (CAD-439) — a separate per-provider
+/// config dir under the state dir (`master/claude`, `master/pi`),
+/// never the operator's `~/.claude` or `~/.pi`. Detect only: the login
+/// command is interactive, so an absent login is `missing` with the
+/// command to run, never applied. The provider probed is the one the
+/// master last ran as — its dir is what `master start` created — or,
+/// before any start, the default. A host that cannot confine the master
+/// runs it `--unconfined` on the operator's own login — there is no
+/// separate login to ask for, and the detail states the risk that
+/// choice carries.
 fn master_login_check() -> Check {
     Check::new(
         "master_login",
@@ -838,30 +841,48 @@ fn master_login_check() -> Check {
             if confinement(ctx).is_err() {
                 return Found::Present(
                     "this host cannot confine the master — `master start --unconfined` \
-                     runs it on your own Claude login, with no filesystem sandbox: it can \
+                     runs it on your own login, with no filesystem sandbox: it can \
                      read and write your files"
                         .into(),
                 );
             }
-            let dir = crate::master::claude_config_dir(&ctx.state_dir);
-            if crate::master::has_login(&ctx.state_dir) {
-                Found::Present(format!("own login in {}", dir.display()))
+            let provider = master_provider(ctx);
+            let dir = crate::master::provider_config_dir(provider, &ctx.state_dir);
+            if crate::master::has_login_for(provider, &ctx.state_dir) {
+                Found::Present(format!("own {provider} login in {}", dir.display()))
             } else {
                 Found::Absent(format!(
-                    "no login in {} — the master's Claude cannot authenticate without \
-                     its own (or `master start --copy-login`)",
+                    "no login in {} — the master's {provider} cannot authenticate without \
+                     its own (or `master start --provider {provider} --copy-login`)",
                     dir.display()
                 ))
             }
         },
         |ctx| {
             if ctx.has_verb("master") {
-                crate::master::login_command(&ctx.state_dir)
+                crate::master::login_command_for(master_provider(ctx), &ctx.state_dir)
             } else {
                 String::new()
             }
         },
     )
+}
+
+/// Which provider the master runs as, for the login probe: the
+/// per-provider config dir `master start` created, newest first —
+/// `master/pi` only exists once a Pi master ran. Before any start the
+/// answer is the default provider.
+fn master_provider(ctx: &Ctx) -> &'static str {
+    let mtime = |p: &str| {
+        std::fs::metadata(crate::master::provider_config_dir(p, &ctx.state_dir))
+            .and_then(|m| m.modified())
+            .ok()
+    };
+    match (mtime("pi"), mtime("claude")) {
+        (Some(pi), Some(cl)) if pi > cl => "pi",
+        (Some(_), None) => "pi",
+        _ => "claude",
+    }
 }
 
 /// CAD-313 hook: the single-use operator login link for the board.

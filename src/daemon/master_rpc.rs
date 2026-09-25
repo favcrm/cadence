@@ -105,6 +105,26 @@ fn preferred(agent_md: &str) -> Vec<(String, Option<String>, Option<String>)> {
     out
 }
 
+/// Which provider a `master_start` launches: the explicit request wins;
+/// a bare start resolves AGENT.md's `preferred.provider`, then each
+/// `fallbacks` entry, taking the first the daemon accepts
+/// ([`master::PROVIDERS`]); none usable → the first accepted provider
+/// (CAD-322 round 2, I2).
+fn resolve_provider(
+    requested: Option<&str>,
+    prefs: &[(String, Option<String>, Option<String>)],
+) -> String {
+    if let Some(p) = requested {
+        return p.to_string();
+    }
+    prefs
+        .iter()
+        .map(|c| c.0.as_str())
+        .find(|p| master::PROVIDERS.contains(p))
+        .unwrap_or(master::PROVIDERS[0])
+        .to_string()
+}
+
 fn short_hash(text: &str) -> String {
     Sha256::digest(text.as_bytes())
         .iter()
@@ -500,11 +520,14 @@ impl Shared {
             .find(|(n, _)| n == "AGENT.md")
             .map(|(_, t)| t.as_str())
             .unwrap_or_default();
-        // The provider validated above is the one launched — a refused
-        // provider never reaches this line, a missing one defaults to
-        // the first entry `master::PROVIDERS` accepts.
-        let provider = requested.unwrap_or(master::PROVIDERS[0]);
-        let choice = preferred(agent_md).into_iter().find(|c| c.0 == provider);
+        // The provider launched: an explicit `--provider` wins; a bare
+        // `master start` resolves AGENT.md's `preferred.provider` (then
+        // its `fallbacks`), falling back to the first provider the
+        // daemon accepts when none of the configured ones is usable
+        // (CAD-322 round 2, I2).
+        let prefs = preferred(agent_md);
+        let provider = resolve_provider(requested, &prefs);
+        let choice = prefs.iter().find(|c| c.0 == provider);
         let model = optional_str(params, "model")
             .map(str::to_string)
             .or_else(|| choice.as_ref().and_then(|c| c.1.clone()));
@@ -522,7 +545,7 @@ impl Shared {
             launch.insert("unconfined".into(), json!(true));
         }
         let launch = Value::Object(launch);
-        crate::adapter::registry::validate_launch_params(provider, "managed", &launch)?;
+        crate::adapter::registry::validate_launch_params(&provider, "managed", &launch)?;
         let briefing = master::compose(&files);
         let file = client::briefing_path(&self.state_dir, &Value::Null, ALIAS);
         if let Some(dir) = file.parent() {
@@ -541,23 +564,23 @@ impl Shared {
             None
         } else if copy {
             let operator = master::operator_provider_config(
-                provider,
+                &provider,
                 self.provider_env
-                    .var(crate::master::provider_config_env(provider)),
+                    .var(crate::master::provider_config_env(&provider)),
                 self.provider_env.var("HOME"),
             );
             Some(match operator {
-                Some(dir) => master::copy_login_for(provider, &self.state_dir, &dir)?,
-                None => master::ensure_config_dir_for(provider, &self.state_dir)?,
+                Some(dir) => master::copy_login_for(&provider, &self.state_dir, &dir)?,
+                None => master::ensure_config_dir_for(&provider, &self.state_dir)?,
             })
         } else {
-            Some(master::ensure_config_dir_for(provider, &self.state_dir)?)
+            Some(master::ensure_config_dir_for(&provider, &self.state_dir)?)
         };
         let login_command = (login == Some(master::Login::None))
-            .then(|| master::login_command_for(provider, &self.state_dir));
+            .then(|| master::login_command_for(&provider, &self.state_dir));
         self.store.register_agent(&store::NewAgent {
             alias: ALIAS,
-            provider,
+            provider: &provider,
             endpoint_kind: "managed",
             role: "worker",
             cwd: &cwd.canonicalize()?.to_string_lossy(),
@@ -598,7 +621,7 @@ impl Shared {
         let _ = self.store.event_public(
             DAEMON_ALIAS,
             "master_started",
-            json!({"provider": provider, "model": model, "installed": installed,
+            json!({"provider": &provider, "model": model, "installed": installed,
                    "confined": !unconfined,
                    "login": login.map(master::Login::as_str)}),
         );
@@ -606,8 +629,8 @@ impl Shared {
             let _ = self.store.event_public(
                 ALIAS,
                 "master_login_copied",
-                json!({"by": "operator", "provider": provider,
-                       "to": master::provider_config_dir(provider, &self.state_dir)}),
+                json!({"by": "operator", "provider": &provider,
+                       "to": master::provider_config_dir(&provider, &self.state_dir)}),
             );
         }
         if unconfined {
@@ -877,6 +900,36 @@ mod tests {
         assert_eq!(got[0].1.as_deref(), Some("opus"));
         assert_eq!(got[1].0, "codex");
         assert!(preferred("no frontmatter").is_empty());
+    }
+
+    /// CAD-322 round 2 (I2): a bare `master start` resolves
+    /// `preferred.provider`, then `fallbacks`, then the daemon's first
+    /// accepted provider — an explicit `--provider` wins over all of it.
+    #[test]
+    fn resolve_provider_honours_preferred_then_falls_back() {
+        let prefs = |md: &str| preferred(md);
+        // preferred.provider is used when the daemon accepts it.
+        let md = "---\npreferred: {provider: pi, model: k, effort: high}\n---\n";
+        assert_eq!(resolve_provider(None, &prefs(md)), "pi");
+        // An unusable preferred (not in PROVIDERS) skips to fallbacks,
+        // then to the first accepted provider.
+        let md = "---\npreferred: {provider: codex}\nfallbacks: [{provider: pi}, {provider: cursor}]\n---\n";
+        assert_eq!(resolve_provider(None, &prefs(md)), "pi");
+        let md = "---\npreferred: {provider: codex}\n---\n";
+        assert_eq!(
+            resolve_provider(None, &prefs(md)),
+            master::PROVIDERS[0],
+            "no usable configured provider → first accepted"
+        );
+        assert_eq!(resolve_provider(None, &prefs("no frontmatter")), "claude");
+        // An explicit request wins over a different preferred provider.
+        assert_eq!(
+            resolve_provider(
+                Some("claude"),
+                &prefs("---\npreferred: {provider: pi}\n---\n")
+            ),
+            "claude"
+        );
     }
 
     #[test]

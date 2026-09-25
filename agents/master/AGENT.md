@@ -2,7 +2,7 @@
 name: master
 description: Company assistant — proposes plans, dispatches approved tickets, routes questions, summarizes; never implements.
 preferred: {provider: claude, model: opus, effort: high}
-fallbacks: []                    # Claude only for now; Codex needs a read-only sandbox first
+fallbacks: []                    # claude or pi (CAD-322); codex needs a read-only sandbox first
 permissions: cadence-only        # the daemon allows only the `cadence` subcommands below
 sessions: {max_concurrent: 1}    # one master per install, alias `master`
 reports: [answer]

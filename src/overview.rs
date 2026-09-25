@@ -2270,9 +2270,10 @@ fn agent_project(a: &Value, repos: &[(PathBuf, String)]) -> String {
 
 /// The needs-me rows one agent contributes: its `agent_list` row (state,
 /// stall view, mailbox backlog and health) plus its probe.
-/// CAD-439 (operator decision): a confined master whose own Claude
-/// config dir holds no login cannot authenticate — one info row naming
-/// the command that gives it its own, until the login exists.
+/// CAD-439 (operator decision): a confined master whose own provider
+/// config dir (`master/claude`, `master/pi`) holds no login cannot
+/// authenticate — one info row naming the command that gives it its
+/// own, until the login exists.
 fn master_login_item(a: &Value, state_dir: &Path, project: &str, now: i64) -> Option<Item> {
     let alias = a["alias"].as_str().unwrap_or_default();
     let provider = a["provider"].as_str().unwrap_or("claude");

@@ -24,6 +24,12 @@ Modes (argv[1]):
 - `dialog`: emits a blocking `confirm` extension_ui_request at startup;
   the adapter must auto-cancel it (extension_ui_response, cancelled).
 
+When CADENCE_ALIAS is `master` the fake also records what the launch
+actually delivered — `pi-argv.json` (sys.argv tail, i.e. every flag the
+adapter put on the provider) and `pi-env.json` (sorted environment
+NAMES only, never values) — written into its cwd, which for a master is
+`<state>/master/cwd` (writable under confinement).
+
 `abort` ends a live turn with the aborted tail then responds — it is
 idempotent when idle, like real Pi. `get_state` reports
 sessionId/model/thinkingLevel; `set_thinking_level` honours only real
@@ -36,7 +42,16 @@ import os
 import sys
 
 LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
-MODE = sys.argv[1] if len(sys.argv) > 1 else "normal"
+MODE = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else "normal"
+
+# The master-harness record: the argv tail and the env NAMES the child
+# actually received (values are never written — some are credentials).
+# Only for the master alias — worker tests share /tmp cwds.
+if os.environ.get("CADENCE_ALIAS") == "master":
+    with open(os.path.join(os.getcwd(), "pi-argv.json"), "w") as f:
+        json.dump(sys.argv[1:], f)
+    with open(os.path.join(os.getcwd(), "pi-env.json"), "w") as f:
+        json.dump(sorted(os.environ), f)
 
 state = {
     "sessionId": "fakepi-session-" + str(os.getpid()),

@@ -38,11 +38,16 @@
 //!   and the daemon rebuilds context from the continuity pack (CAD-324)
 //!   instead of resuming provider state.
 //! - The master runs under the same Landlock confinement as Claude
-//!   (`cadence confine`), with its own `PI_CODING_AGENT_DIR` under the
-//!   state dir — never the operator's `~/.pi` — and a generated
+//!   (`cadence confine`) but with Pi's own path set — `master/pi`, never
+//!   `master/claude` or its `.credentials.json` — its own
+//!   `PI_CODING_AGENT_DIR` (never the operator's `~/.pi`), an
+//!   allowlisted child environment (the whole inherited env is dropped;
+//!   only named non-credential variables are re-read), and a generated
 //!   guard extension (`--no-extensions -e <guard>`) that blocks every
-//!   tool except the master's allowlisted `cadence` Bash commands,
-//!   mirroring `CLAUDE_ALLOWED_TOOLS`.
+//!   tool except the master's allowlisted `cadence` Bash commands. The
+//!   guard is a grammar — tokenize, charset-refuse every shell
+//!   metacharacter, require `argv[0] == "cadence"`, then match an
+//!   argv-prefix table — never a string prefix match into `bash -c`.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -77,11 +82,67 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// arrives. Slice 1 cancels them; everything else is recorded only.
 const UI_DIALOG_METHODS: &[&str] = &["select", "confirm", "input", "editor"];
 
-/// Provider API-key variables Pi would otherwise inherit from the
-/// daemon's environment. The master's credentials live only in its own
-/// `PI_CODING_AGENT_DIR`; a managed worker must not silently act on the
-/// operator's keys either. Scrubbed by name — Pi reads a fixed set,
-/// none of them `*_API_KEY`-suffixed generically.
+/// The only inherited variables a Pi MASTER keeps (CAD-322 round 2,
+/// I3): its environment is cleared wholesale and only these names are
+/// re-read — connectivity and locale, never credentials. Every provider
+/// key (AWS_*, Moonshot/Kimi, Together, Fireworks, Baseten, Llama,
+/// NVIDIA, OpenCode, Minimax, Qwen, Xiaomi, ZAI_CN, Ant Ling,
+/// ANTHROPIC_AUTH_TOKEN, COPILOT_GITHUB_TOKEN, …), every `PI_*`,
+/// `CLAUDE_*`, `CADENCE_*`, `GIT_*`, `XDG_*`, `LD_*`, `NODE_OPTIONS`
+/// and `SSH_AUTH_SOCK` is gone however it is spelled — a denylist could
+/// never enumerate the next provider's variable. The daemon context and
+/// `PI_CODING_AGENT_DIR` arrive as explicit env pairs afterwards.
+const PI_MASTER_ENV_KEEP: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "TERM",
+    "COLORTERM",
+    "SHELL",
+    "TZ",
+    // Connectivity config, not secrets: corporate CA roots and proxies.
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "NODE_EXTRA_CA_CERTS",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+];
+
+/// The master's environment posture: cleared, then the allowlist.
+/// `DENIED_ENV`'s forge tokens are re-listed only as defense in depth —
+/// they are not in the keep set anyway.
+pub(crate) fn pi_master_env_scrub() -> EnvScrub {
+    EnvScrub::cleared_except(PI_MASTER_ENV_KEEP).and_names(crate::master::DENIED_ENV)
+}
+
+/// Worker posture (non-master aliases): the old prefix rule still
+/// applies — every inherited `PI_*`, `CADENCE_*`, `CLAUDE_*` and
+/// `CODEX_*` is removed (a `PI_*` or `CLAUDE_*` leak could silently
+/// retarget the child's config or identity); the real pair
+/// (`CADENCE_ALIAS`, `CADENCE_STATE_DIR`) and the daemon context are
+/// re-injected per agent. Provider API keys and cloud-secret names are
+/// always dropped.
+pub(crate) fn pi_env_scrub() -> EnvScrub {
+    EnvScrub::prefixes(&["PI_", "CADENCE_", "CLAUDE_", "CLAUDECODE", "CODEX_"], &[])
+        .and_names(PI_KEY_ENV)
+        .and_names(super::CLOUD_SECRET_ENV)
+}
+
+/// Provider API-key variables a Pi WORKER must not inherit from the
+/// daemon's environment — the master's child env is allowlisted
+/// wholesale ([`pi_master_env_scrub`]) instead. Scrubbed by name: Pi
+/// reads a fixed set, none of them `*_API_KEY`-suffixed generically.
 const PI_KEY_ENV: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_OAUTH_TOKEN",
@@ -100,20 +161,27 @@ const PI_KEY_ENV: &[&str] = &[
     "AI_GATEWAY_API_KEY",
     "AWS_BEARER_TOKEN_BEDROCK",
     "AZURE_OPENAI_API_KEY",
+    // Round-2 review set: vendor keys Pi reads that the original list
+    // missed (the master no longer depends on this list being complete).
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "MOONSHOT_API_KEY",
+    "KIMI_API_KEY",
+    "TOGETHER_API_KEY",
+    "FIREWORKS_API_KEY",
+    "BASETEN_API_KEY",
+    "LLAMA_API_KEY",
+    "NVIDIA_API_KEY",
+    "OPENCODE_API_KEY",
+    "MINIMAX_API_KEY",
+    "QWEN_API_KEY",
+    "DASHSCOPE_API_KEY",
+    "XIAOMI_API_KEY",
+    "ZAI_CN_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "COPILOT_GITHUB_TOKEN",
 ];
-
-/// Scrubbed by rule, not by name list: every inherited `PI_*`,
-/// `CADENCE_*`, `CLAUDE_*` and `CODEX_*` is removed (a `PI_*` or
-/// `CLAUDE_*` leak could silently retarget the child's config or
-/// identity); the real pair (`CADENCE_ALIAS`, `CADENCE_STATE_DIR`) and
-/// the daemon context are re-injected per agent, and the master gets
-/// `PI_CODING_AGENT_DIR` back explicitly. Provider API keys and the
-/// cloud-secret names are always dropped.
-pub(crate) fn pi_env_scrub() -> EnvScrub {
-    EnvScrub::prefixes(&["PI_", "CADENCE_", "CLAUDE_", "CLAUDECODE", "CODEX_"], &[])
-        .and_names(PI_KEY_ENV)
-        .and_names(super::CLOUD_SECRET_ENV)
-}
 
 /// Provider binary; `CADENCE_PI_COMMAND` overrides it (test/mock) —
 /// the mock sees the same argv shape as the real CLI.
@@ -134,9 +202,13 @@ pub fn pi_config_dir(state_dir: &Path) -> PathBuf {
     state_dir.join("master").join("pi")
 }
 
-/// The generated guard extension path (`<state>/master/pi-guard.ts`).
+/// The generated guard extension path (`<state>/master/pi-guard.js`).
+/// Plain `.js` — Pi's loader (jiti) accepts it, and Node can evaluate
+/// the grammar section verbatim in tests. It must live OUTSIDE
+/// `master/pi`: that dir is writable by the confined master, and a
+/// writable guard could rewrite itself.
 fn pi_guard_path(state_dir: &Path) -> PathBuf {
-    state_dir.join("master").join("pi-guard.ts")
+    state_dir.join("master").join("pi-guard.js")
 }
 
 /// `pi --mode rpc --no-session …`: direct argv, no shell. The master
@@ -269,67 +341,111 @@ fn pi_confine_inputs(
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .or_else(|| crate::issue::default_dir().ok());
+    // The guard lives outside `master/pi` — a confined master must read
+    // but never write it. Its own provider dir is `master/pi`: nothing
+    // of `master/claude` (or its `.credentials.json`) is in the policy.
     let mut extra_read = split_paths(env.var(crate::master::CONFINE_EXTRA_READ_ENV));
     extra_read.push(pi_guard_path(state_dir));
-    let mut extra_write = split_paths(env.var(crate::master::CONFINE_EXTRA_WRITE_ENV));
-    extra_write.push(pi_config_dir(state_dir));
     crate::master::ConfineInputs {
         state_dir: state_dir.to_path_buf(),
         home: env.var("HOME").filter(|h| !h.is_empty()).map(PathBuf::from),
         pm_dir,
         programs,
+        provider_dir: pi_config_dir(state_dir),
+        // Nothing of the operator's `$HOME` — Pi's npm package arrives
+        // via `programs`; Claude's `~/.local/share/claude` is not ours.
+        home_read: &[],
         extra_read,
-        extra_write,
+        extra_write: split_paths(env.var(crate::master::CONFINE_EXTRA_WRITE_ENV)),
     }
 }
 
 /// The generated guard extension — the Pi analogue of
-/// `CLAUDE_ALLOWED_TOOLS` + `--tools Bash`: every tool but `bash` is
-/// blocked, and a `bash` call is blocked unless its command is exactly
-/// one of the master's allowlisted `cadence` invocations. Written per
-/// `open` so a missing or stale file never weakens the posture.
+/// `CLAUDE_ALLOWED_TOOLS` + `--tools Bash` (CAD-322 round 2, C1). Pi's
+/// bash tool takes a single command STRING that a shell parses, so a
+/// string-prefix check is a bypass waiting to happen (`cadence status;
+/// rm`, `cadence status | sh`, `FOO=x cadence …`). The check is a
+/// grammar instead: every character must be in `[A-Za-z0-9 ._\/=:-]` —
+/// `;`, `&`, `|`, `$`, backticks, `>`, `<`, `(`, `)`, quotes, newlines
+/// and every control character are refused outright — then the command
+/// tokenizes on whitespace, `argv[0]` must be `cadence` exactly (an
+/// `A=b` env prefix or a `bash -c …` wrapper fails it), and `argv[1..]`
+/// must match one allowlisted subcommand entry. The grammar section
+/// between the markers is evaluated verbatim by `tests/pi_master.rs`
+/// under Node — keep it dependency-free plain JavaScript.
 const PI_GUARD_HEAD: &str = r#"// Generated by cadence (CAD-322) — do not edit.
 // The master may run only the allowlisted `cadence` commands; every
 // other tool call and every other bash command is blocked, matching
 // the Claude master's --tools Bash + Bash(cadence <verb>) posture.
-export default function (pi: any) {
-  const EXACT: string[] = __EXACT__;
-  const PREFIX: string[] = __PREFIX__;
-  pi.on("tool_call", async (event: any) => {
+// Plain JS: tests/pi_master.rs evaluates the grammar section verbatim.
+export default function (pi) {
+  // >>> cadence-guard-grammar >>>
+  // A command is allowed iff it parses under a grammar, never a string
+  // prefix: charset, tokenization, argv[0] === "cadence", then an
+  // argv-prefix match on the allowlist. `args: true` entries are the
+  // `Bash(cadence <verb…> *)` forms — they need at least one arg.
+  const RULES = __RULES__;
+  function piGuardAllows(cmd) {
+    if (typeof cmd !== "string" || cmd.length === 0 || cmd.length > 4096) {
+      return false;
+    }
+    // Every metacharacter, quote, expansion, redirection, glob and
+    // control character is refused by the charset — `;`, `&&`, `||`,
+    // `|`, `$(`, backticks, `>`, `<`, `(`, `)`, `\n`, `"`, `'`, `\`.
+    if (!/^[A-Za-z0-9 ._\/=:-]+$/.test(cmd)) {
+      return false;
+    }
+    const argv = cmd.split(" ").filter((t) => t.length > 0);
+    if (argv[0] !== "cadence") {
+      return false; // env-prefixes (`A=b cadence …`), wrappers, PATH tricks
+    }
+    const rest = argv.slice(1);
+    return RULES.some(
+      (r) =>
+        r.argv.every((tok, i) => rest[i] === tok) &&
+        (r.args ? rest.length > r.argv.length : rest.length === r.argv.length),
+    );
+  }
+  // <<< cadence-guard-grammar <<<
+  pi.on("tool_call", async (event) => {
     if (event.toolName !== "bash") {
       return { block: true, reason: `cadence master: only allowlisted \`cadence\` bash commands are permitted (tool '${event.toolName}' is not enabled)` };
     }
-    const cmd = String(event.input?.command ?? "").trim();
-    const ok =
-      EXACT.includes(cmd) ||
-      PREFIX.some((p) => cmd === p || cmd.startsWith(p + " "));
-    if (!ok) {
+    const cmd = String(event.input?.command ?? "");
+    if (!piGuardAllows(cmd)) {
       return { block: true, reason: `cadence master allowlist refused bash: ${cmd}` };
     }
   });
 }
 "#;
 
-/// Translate `Bash(cadence issue ls *)` → prefix `cadence issue ls`
-/// and `Bash(cadence status)` → exact `cadence status`.
-fn write_pi_guard(state_dir: &Path) -> Result<PathBuf> {
-    let mut exact = Vec::new();
-    let mut prefix = Vec::new();
+/// One allowlisted invocation in the generated guard: the argv after
+/// `cadence`, and whether trailing arguments are allowed
+/// (`Bash(cadence <verb…> *)` forms) or the match is exact.
+fn pi_guard_rules() -> Vec<Value> {
+    let mut rules = Vec::new();
     for tool in crate::master::CLAUDE_ALLOWED_TOOLS {
         let Some(inner) = tool.strip_prefix("Bash(").and_then(|t| t.strip_suffix(')')) else {
             continue;
         };
-        if let Some(stem) = inner.strip_suffix(" *") {
-            prefix.push(stem.to_string());
-        } else if let Some(stem) = inner.strip_suffix('*') {
-            prefix.push(stem.trim_end().to_string());
-        } else {
-            exact.push(inner.to_string());
+        let (stem, args) = match inner.strip_suffix(" *") {
+            Some(stem) => (stem, true),
+            None if inner.ends_with('*') => continue, // `foo*`-forms are never allowlisted
+            None => (inner, false),
+        };
+        let argv: Vec<&str> = stem.split_whitespace().collect();
+        if argv.first() != Some(&"cadence") || argv.len() < 2 {
+            continue; // a rule that cannot start with `cadence` is dead weight
         }
+        rules.push(json!({"argv": argv[1..], "args": args}));
     }
-    let source = PI_GUARD_HEAD
-        .replace("__EXACT__", &json!(exact).to_string())
-        .replace("__PREFIX__", &json!(prefix).to_string());
+    rules
+}
+
+/// Write the guard extension; a missing or stale file never weakens
+/// the posture because `open` regenerates it per launch.
+fn write_pi_guard(state_dir: &Path) -> Result<PathBuf> {
+    let source = PI_GUARD_HEAD.replace("__RULES__", &json!(pi_guard_rules()).to_string());
     let path = pi_guard_path(state_dir);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -436,11 +552,12 @@ impl PiAdapter {
         let routed = Arc::clone(&shared);
         let disconnected = Arc::clone(&shared);
         Self {
+            // Bound to the empty generation — replaced by `open`'s mint.
             transport: RwLock::new(StdioAdapter::new_lines(
                 &pi_command(env),
                 pi_env_scrub(),
-                Box::new(move |incoming| routed.dispatch(incoming)),
-                Box::new(move || disconnected.on_disconnect()),
+                Box::new(move |incoming| routed.dispatch_for("", incoming)),
+                Box::new(move || disconnected.disconnect_for("")),
             )),
             shared,
             log_path: log_path.to_path_buf(),
@@ -474,19 +591,30 @@ impl PiAdapter {
         Ok(())
     }
 
-    fn transport_for(&self, command: &[String], master: bool) -> Arc<StdioAdapter> {
+    /// A transport bound to THIS open's generation: the reader thread
+    /// of a previous endpoint can outlive `close()` by a few
+    /// milliseconds, and its trailing events/EOF must never mark a
+    /// reopened session dead or corrupt its accumulating turn (CAD-322
+    /// round 2, I4).
+    fn transport_for(
+        &self,
+        command: &[String],
+        master: bool,
+        generation: &str,
+    ) -> Arc<StdioAdapter> {
         let routed = Arc::clone(&self.shared);
         let disconnected = Arc::clone(&self.shared);
+        let (gen_dispatch, gen_disconnect) = (generation.to_string(), generation.to_string());
         let scrub = if master {
-            pi_env_scrub().and_names(crate::master::DENIED_ENV)
+            pi_master_env_scrub()
         } else {
             pi_env_scrub()
         };
         StdioAdapter::new_lines(
             command,
             scrub,
-            Box::new(move |incoming| routed.dispatch(incoming)),
-            Box::new(move || disconnected.on_disconnect()),
+            Box::new(move |incoming| routed.dispatch_for(&gen_dispatch, incoming)),
+            Box::new(move || disconnected.disconnect_for(&gen_disconnect)),
         )
     }
 
@@ -534,6 +662,27 @@ impl PiAdapter {
 }
 
 impl Shared {
+    /// Is `generation` the live endpoint generation? Set once per
+    /// `open`; a previous transport's reader keeps its own mint, so
+    /// anything it delivers after a reopen is dropped here.
+    fn is_current(&self, generation: &str) -> bool {
+        self.generation.lock().unwrap().as_str() == generation
+    }
+
+    fn dispatch_for(&self, generation: &str, incoming: Incoming) {
+        if self.is_current(generation) {
+            self.dispatch(incoming);
+        }
+    }
+
+    /// A transport's EOF counts only for the generation that launched
+    /// it — a stale EOF must never mark a reopened session dead.
+    fn disconnect_for(&self, generation: &str) {
+        if self.is_current(generation) {
+            self.on_disconnect();
+        }
+    }
+
     fn dispatch(&self, incoming: Incoming) {
         let Incoming::Notification { method, params } = incoming else {
             return;
@@ -757,16 +906,12 @@ impl ProviderAdapter for PiAdapter {
                 .then(crate::issue::default_dir)
                 .and_then(Result::ok);
             env.extend(crate::master::env_overrides(
+                "pi",
                 &self.state_dir,
                 pm.as_deref(),
                 master_confined(&self.env, agent),
             ));
-            // Pi's own config dir (auth.json) under the state dir —
-            // never the operator's ~/.pi, never an env credential.
-            env.push((
-                "PI_CODING_AGENT_DIR".to_string(),
-                pi_config_dir(&self.state_dir).to_string_lossy().to_string(),
-            ));
+            // No update checks or network on the master's startup path.
             env.push(("PI_OFFLINE".to_string(), "1".to_string()));
         }
         let params = agent.params.clone().unwrap_or(Value::Null);
@@ -780,7 +925,7 @@ impl ProviderAdapter for PiAdapter {
             .and_then(Value::as_u64)
             .map(|s| Duration::from_secs(s.max(1)));
         *self.shared.last_activity.lock().unwrap() = Instant::now();
-        let transport = self.transport_for(&command, master);
+        let transport = self.transport_for(&command, master, &generation);
         // The write-back channel is armed BEFORE launch — Pi can emit
         // a blocking extension_ui_request from its first line, and a
         // dispatch that found no transport would leave it unanswered.
@@ -1005,11 +1150,15 @@ impl ProviderAdapter for PiAdapter {
     }
 
     /// EOF on stdin is a clean shutdown to `pi --mode rpc`; the
-    /// transport's TERM→KILL sequence covers a stubborn child.
+    /// transport's TERM→KILL sequence covers a stubborn child. The
+    /// owner-initiated teardown marks the endpoint dead itself — the
+    /// reader's trailing EOF is then a tagged stale disconnect that can
+    /// never kill a later `open` (I4).
     fn close(&self) {
         let transport = self.transport.read().unwrap().clone();
         transport.close_stdin();
         transport.wait_exit(Duration::from_secs(3));
         transport.close();
+        self.shared.on_disconnect();
     }
 }

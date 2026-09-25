@@ -349,8 +349,8 @@ fn daemon_methods() -> Vec<String> {
 /// recipes included — and each refusal leaves no write. The reviewer's
 /// probes fail closed: `build-slot run -- sh -c …` cannot exec, sends and
 /// dispatch outside `master_dispatch`'s rules are refused, and a detached
-/// child cannot post into an agent's chat as the operator. The launch is
-/// Claude-only with the narrowest tool posture, an empty cwd and no
+/// child cannot post into an agent's chat as the operator. The launch
+/// here is claude with the narrowest tool posture, an empty cwd and no
 /// forge credentials.
 #[test]
 fn master_limits_are_enforced_by_the_daemon() {
@@ -538,8 +538,9 @@ fn master_limits_are_enforced_by_the_daemon() {
 
 /// CAD-339: SOUL.md and AGENT.md have one writer — the proven operator.
 /// Any agent is refused; an edit made around the writer is caught at
-/// `master start`, which then writes nothing; the master is Claude-only;
-/// re-saving the file through the writer lets the master start,
+/// `master start`, which then writes nothing; the master is
+/// claude-or-pi only; re-saving the file through the writer lets the
+/// master start,
 /// installing the missing default.
 #[test]
 fn master_agent_files_have_one_writer() {
@@ -598,12 +599,13 @@ fn master_agent_files_have_one_writer() {
             "{err}"
         );
     }
-    // Claude only: a codex master is refused before anything is written.
+    // claude or pi only: a codex master is refused before anything is
+    // written.
     let err =
         f.d.operator_rpc("master_start", json!({"provider": "codex"}))
             .unwrap_err()
             .to_string();
-    assert!(err.contains("claude only"), "{err}");
+    assert!(err.contains("claude or pi"), "{err}");
     assert!(!f.pm_dir.join("agents/master/AGENT.md").exists());
     assert_eq!(f.commits(), before);
 
@@ -865,6 +867,8 @@ fn confine_denies_everything_unlisted() {
         home: None,
         pm_dir: None,
         programs: vec![],
+        provider_dir: tmp.path().join("state/master/claude"),
+        home_read: &[],
         extra_read: vec![],
         extra_write: vec![open.clone()],
     });

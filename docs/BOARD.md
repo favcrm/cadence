@@ -1450,10 +1450,11 @@ sign-in) → master agent → first project (`cadence project new`, CAD-358)
 → Go to Home, from `GET /api/setup`. It only shows: each check that needs
 work carries its copy-paste command, and "re-check" runs the probes
 again; nothing is applied from the browser. The master step (CAD-448)
-offers every provider `master start` accepts that is installed and
-signed in — Claude today — with its exact `master start --provider
-<bin>` command, and reports the master's own Claude login (its separate
-`CLAUDE_CONFIG_DIR`, CAD-439) with the login command while it has none.
+offers every provider `master start` accepts — claude and pi (CAD-322)
+— each marked ready when installed and signed in, with its exact
+`master start --provider <bin>` command once it is, and reports the
+master's own login (its per-provider config dir, CAD-439) with the
+login command while it has none.
 Platforms and import are listed as later. Home shows a link to `/setup`
 while a required check — state dir, tracker, daemon, master, the
 master's own login, and a master-capable CLI signed in — is not ready
