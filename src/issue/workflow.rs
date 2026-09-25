@@ -300,12 +300,15 @@ fn placeholders(text: &str, inputs: &BTreeMap<String, InputSpec>) -> Result<()> 
     Ok(())
 }
 
+/// Per-ticket metadata lines as `(key, value)` pairs, in file order.
+type TicketMetas = Vec<Vec<(String, String)>>;
+
 /// One `##` section's leading metadata: the `key: value` lines in
 /// [`TICKET_META_KEYS`] directly under the heading — the same rule
 /// `parse_ticket` applies to its own keys, extended with the
 /// workflow's extras. A `{{` in a `STATIC_META_KEYS` value refuses:
 /// the dependency graph and sizes must be checkable statically.
-fn ticket_meta(body: &str) -> Result<Vec<Vec<(String, String)>>> {
+fn ticket_meta(body: &str) -> Result<TicketMetas> {
     let (_, sections) = split_sections(body);
     let mut out = Vec::with_capacity(sections.len());
     for (i, (heading, text)) in sections.iter().enumerate() {
@@ -457,21 +460,39 @@ pub fn render(text: &str, provided: &BTreeMap<String, String>) -> Result<String>
         )));
     }
     for (k, v) in provided {
-        if v.chars().any(|c| c.is_control()) {
+        if v.trim() != v {
             return Err(Error::invalid(
                 "one_line",
                 format!(
-                    "input '{k}' must be a single line — a newline or control character \
-                     can inject tickets, dependencies or metadata under an approved skeleton"
+                    "input '{k}' carries leading or trailing whitespace — the plan \
+                     parser trims it away, so what was compared and what lands would \
+                     differ; pass '{}' instead",
+                    v.trim()
+                ),
+            ));
+        }
+        if let Some(c) = v.chars().find(|&c| bad_value_char(c)) {
+            return Err(Error::invalid(
+                "one_line",
+                format!(
+                    "input '{k}' must be a single line of visible characters — \
+                     U+{:04X} is a control, separator, invisible or non-space \
+                     whitespace character that can smuggle structure or alias \
+                     equality past the checks",
+                    c as u32
                 ),
             ));
         }
     }
+    // `distinct:` compares the trimmed values — the same normalization
+    // the plan parser applies to meta values — and, for inputs filling
+    // agent:/reviewer:-style positions, the rendered positions too
+    // (`check_rendered`), so the check can't drift from the parser.
     for (i, a) in tpl.distinct.iter().enumerate() {
         for b in &tpl.distinct[i + 1..] {
             let (va, vb) = (
-                provided.get(a).map(String::as_str).unwrap_or(""),
-                provided.get(b).map(String::as_str).unwrap_or(""),
+                provided.get(a).map(|s| s.trim()).unwrap_or(""),
+                provided.get(b).map(|s| s.trim()).unwrap_or(""),
             );
             if va == vb {
                 return Err(Error::invalid(
@@ -491,34 +512,48 @@ pub fn render(text: &str, provided: &BTreeMap<String, String>) -> Result<String>
     Ok(rendered)
 }
 
-/// A rendered plan's skeleton: per ticket, the metadata lines as a
-/// sorted atom list — one atom per recognised-key occurrence plus one
-/// `dep:<token>` per normalised `depends_on` edge. Values never
-/// appear: an input's whole job is to fill them. The `parse_plan` call
-/// doubles as the render's own validity check (acceptance, sizes,
-/// aliases) — a render that is not a plan refuses here.
-fn skeleton(text: &str) -> Result<Vec<Vec<String>>> {
-    plan::parse_plan(text)?;
+/// A character an input value may never carry: control characters,
+/// Unicode line/paragraph separators, zero-width and word-joiner
+/// format characters, bidi controls, the BOM, and any whitespace that
+/// is not an ordinary interior space. Each is invisible or splitting
+/// in some reader — none changes what a value names.
+fn bad_value_char(c: char) -> bool {
+    c.is_control()
+        || ('\u{200B}'..='\u{200F}').contains(&c) // ZWSP, ZWNJ, ZWJ, LRM, RLM
+        || ('\u{2028}'..='\u{202E}').contains(&c) // line/para separators, bidi
+        || ('\u{2060}'..='\u{2069}').contains(&c) // word joiner, invisible ops, isolates
+        || c == '\u{FEFF}'
+        || (c.is_whitespace() && c != ' ')
+}
+
+/// Parse a rendered plan into its doc and per-ticket metadata lines —
+/// the parse doubles as the render's own validity check (acceptance,
+/// sizes, aliases).
+fn parsed(text: &str) -> Result<(plan::PlanDoc, TicketMetas)> {
+    let doc = plan::parse_plan(text)?;
     let body = parse::split_front(text).map(|(_, b)| b).unwrap_or("");
     let metas = ticket_meta(body)?;
-    let mut out = Vec::with_capacity(metas.len());
-    for meta in &metas {
-        let mut atoms = Vec::new();
-        for (key, value) in meta {
-            if key == "depends_on" {
-                for tok in normalize_deps(value).split(',') {
-                    if !tok.is_empty() {
-                        atoms.push(format!("dep:{tok}"));
-                    }
+    Ok((doc, metas))
+}
+
+/// A ticket's skeleton atoms: one per recognised metadata-key
+/// occurrence plus one `dep:<token>` per normalised `depends_on` edge.
+/// Values never appear: an input's whole job is to fill them.
+fn atoms_of(meta: &[(String, String)]) -> Vec<String> {
+    let mut atoms = Vec::new();
+    for (key, value) in meta {
+        if key == "depends_on" {
+            for tok in normalize_deps(value).split(',') {
+                if !tok.is_empty() {
+                    atoms.push(format!("dep:{tok}"));
                 }
-            } else {
-                atoms.push(key.clone());
             }
+        } else {
+            atoms.push(key.clone());
         }
-        atoms.sort();
-        out.push(atoms);
     }
-    Ok(out)
+    atoms.sort();
+    atoms
 }
 
 /// The second render guard (CAD-487 review): the rendered file's
@@ -527,18 +562,20 @@ fn skeleton(text: &str) -> Result<Vec<Vec<String>>> {
 /// difference names itself; the refusal is `render_diverged`.
 fn check_rendered(text: &str, tpl: &Template, rendered: &str) -> Result<()> {
     let canon_text = canonical(text, &tpl.inputs)?;
-    let want = skeleton(&canon_text).map_err(|e| {
+    let (_, canon_meta) = parsed(&canon_text).map_err(|e| {
         Error::rejected(format!(
             "the workflow does not render to a valid plan even canonically — \
              run `cadence workflow check` on it: {e}"
         ))
     })?;
-    let got = skeleton(rendered).map_err(|e| {
+    let (rdoc, rmeta) = parsed(rendered).map_err(|e| {
         Error::invalid(
             "render_diverged",
             format!("the inputs render to an invalid plan — {e}"),
         )
     })?;
+    let want: Vec<Vec<String>> = canon_meta.iter().map(|m| atoms_of(m)).collect();
+    let got: Vec<Vec<String>> = rmeta.iter().map(|m| atoms_of(m)).collect();
     if want.len() != got.len() {
         return Err(Error::invalid(
             "render_diverged",
@@ -561,6 +598,57 @@ fn check_rendered(text: &str, tpl: &Template, rendered: &str) -> Result<()> {
                     g.join(", ")
                 ),
             ));
+        }
+    }
+    // The second distinctness layer (CAD-487 r3): compare what each
+    // pinned input rendered *at its positions* — `agent:` is the
+    // parser's own value, other keys are the rendered meta line —
+    // never the raw input strings. An input that normalises onto
+    // another (a separator the parser trims, a stray space) still
+    // refuses, because this compares what the plan will carry.
+    if tpl.distinct.is_empty() {
+        return Ok(());
+    }
+    let tbody = parse::split_front(text).map(|(_, b)| b).unwrap_or("");
+    let tmeta = ticket_meta(tbody)?;
+    let mut positions: BTreeMap<&str, Vec<(usize, &str)>> = BTreeMap::new();
+    for (i, meta) in tmeta.iter().enumerate() {
+        for (key, raw) in meta {
+            if let Some(name) = bare_placeholder(raw) {
+                if tpl.distinct.iter().any(|d| d == name) {
+                    positions.entry(name).or_default().push((i, key.as_str()));
+                }
+            }
+        }
+    }
+    let rendered_at = |i: usize, key: &str| -> Option<&str> {
+        if key == "agent" {
+            rdoc.tickets.get(i).and_then(|t| t.agent.as_deref())
+        } else {
+            rmeta
+                .get(i)
+                .and_then(|m| m.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str()))
+        }
+    };
+    for (i, a) in tpl.distinct.iter().enumerate() {
+        for b in &tpl.distinct[i + 1..] {
+            for (ta, ka) in positions.get(a.as_str()).into_iter().flatten() {
+                for (tb, kb) in positions.get(b.as_str()).into_iter().flatten() {
+                    if let (Some(va), Some(vb)) = (rendered_at(*ta, ka), rendered_at(*tb, kb)) {
+                        if va == vb {
+                            return Err(Error::invalid(
+                                "not_distinct",
+                                format!(
+                                    "inputs '{a}' and '{b}' must differ (`distinct:`) — \
+                                     both render '{va}' ({ka} on ticket {}, {kb} on ticket {})",
+                                    ta + 1,
+                                    tb + 1
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -1622,6 +1710,73 @@ Why.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance
         // Mutation proof: if the check goes, the refusal's code does.
         // Unicode that is not control — punctuation, spaces — is fine.
         render(WF, &inputs(&[("topic", "a — b: c; d")])).unwrap();
+    }
+
+    #[test]
+    fn input_values_refuse_invisible_and_separator_chars() {
+        // CAD-487 r3: the pane-agent payloads that slipped a distinct
+        // self-review past the raw-string compare. Every class the
+        // review named, as interior and trailing positions.
+        for bad in [
+            "dev-1\u{2028}", // LINE SEPARATOR — parser trims it
+            "dev-1\u{2029}", // PARAGRAPH SEPARATOR
+            "dev-1 ",        // trailing ASCII space — trimmed
+            " dev-1",        // leading ASCII space
+            "dev-1\u{A0}",   // NBSP — is_whitespace, trimmed
+            "dev-1\u{2007}", // FIGURE SPACE
+            "dev-1\u{3000}", // IDEOGRAPHIC SPACE
+            "dev\u{200B}1",  // ZERO WIDTH SPACE — interior invisible
+            "dev\u{200D}1",  // ZERO WIDTH JOINER
+            "\u{FEFF}dev-1", // BOM / zero-width no-break space
+            "dev-1\u{202E}", // RIGHT-TO-LEFT OVERRIDE — bidi
+            "dev-1\u{202A}", // LEFT-TO-RIGHT EMBEDDING
+            "dev-1\u{2060}", // WORD JOINER
+            "dev-1\u{2066}", // LEFT-TO-RIGHT ISOLATE
+            "dev-1\u{2069}", // POP DIRECTIONAL ISOLATE
+            "dev-1\u{200F}", // RIGHT-TO-LEFT MARK
+            "dev-1\t2",      // interior tab — control + whitespace
+            "dev-1 ",        // trailing space
+        ] {
+            let e = render(WF, &inputs(&[("topic", bad)])).unwrap_err();
+            assert_eq!(e.code(), Some("one_line"), "{bad:?} -> {e}");
+        }
+        // Ordinary interior spaces and punctuation stay legal.
+        render(WF, &inputs(&[("topic", "a real title — with spaces")])).unwrap();
+        render(WF, &inputs(&[("topic", "double  space is fine")])).unwrap();
+    }
+
+    /// CAD-487 r3, guard 2 for `distinct:`: the compare runs on what
+    /// the plan carries — exercised through `check_rendered` directly,
+    /// bypassing the value charset (as if a mutant removed it).
+    #[test]
+    fn distinct_compares_what_the_plan_parsed() {
+        let tpl = parse_template(WF_DISTINCT).unwrap();
+        // worker's raw value carries a trailing space — `agent:` trims
+        // it in parse, so the rendered positions are BOTH `dev-1`.
+        let rendered = render_values(
+            WF_DISTINCT,
+            &inputs(&[
+                ("title", "t"),
+                ("worker", "dev-1 "), // note the trailing space
+                ("reviewer", "dev-1"),
+            ]),
+        )
+        .unwrap();
+        let e = check_rendered(WF_DISTINCT, &tpl, &rendered).unwrap_err();
+        assert_eq!(e.code(), Some("not_distinct"), "{e}");
+        assert!(
+            e.to_string().contains("worker") && e.to_string().contains("render"),
+            "{e}"
+        );
+
+        // `render` itself refuses the same input earlier, as one_line —
+        // the two layers are independent.
+        let e = render(
+            WF_DISTINCT,
+            &inputs(&[("title", "t"), ("worker", "dev-1 "), ("reviewer", "dev-1")]),
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), Some("one_line"), "{e}");
     }
 
     /// An input in a meta position (`{{who}}` on `agent:`) and one in

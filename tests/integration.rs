@@ -42590,6 +42590,33 @@ fn workflow_inputs_cannot_inject_and_project_is_a_key() {
         .unwrap();
     assert!(out["epic"].is_string(), "{out}");
 
+    // CAD-487 r3, the review's reproducer: a pane agent proposing
+    // code-change with worker=dev-1 and reviewer=dev-1 plus an
+    // invisible or edge character — U+2028, a trailing space, NBSP,
+    // U+2007, U+3000 — which the parser trims, landing `dev-1` on both
+    // sides (self-review). The refusal is `one_line`, on the code.
+    let home = TempDir::new().unwrap();
+    let mut pane = LaneShell::spawn(home.path());
+    plant_pane(&f.d, "pane-wf", pane.pid());
+    let before = f.commits();
+    for value in [
+        "dev-1\u{2028}",
+        "dev-1 ",
+        "dev-1\u{A0}",
+        "dev-1\u{2007}",
+        "dev-1\u{3000}",
+    ] {
+        let r = pane.rpc(
+            &f.d.state,
+            "plan_propose",
+            json!({"project": "demo", "workflow": "code-change",
+                   "inputs": {"title": "t", "goal": "g",
+                              "worker": "dev-1", "reviewer": value}}),
+        );
+        assert_eq!(r["error"]["code"], "one_line", "{value:?}: {r}");
+    }
+    assert_eq!(f.commits(), before, "no epic landed for refused inputs");
+
     // `project` is a key on every workflow path — traversal and
     // absolute paths refuse and can never read outside the tracker.
     for bad in ["../x", "/tmp", "demo/../demo", "demo/../../etc"] {
