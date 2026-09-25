@@ -45,8 +45,9 @@ enum Commands {
     /// Check environment, storage and provider CLIs. `--host` instead
     /// runs the read-only host watchdog — disk free, provider store and
     /// WAL growth, per-user pipe pressure, orphaned processes from
-    /// deleted worktrees, leaked temp dirs and stale worktrees — with
-    /// exit 0 ok, 1 warn, 2 fail.
+    /// deleted worktrees, leaked temp dirs and stale worktrees, and the
+    /// tailnet sign-in proof with its whole remedy chain — with exit
+    /// 0 ok, 1 warn, 2 fail.
     Doctor {
         /// Run the host watchdog checks instead of the environment probe.
         #[arg(long)]

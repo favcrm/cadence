@@ -435,7 +435,8 @@ fn doctor_host_json_reports_all_checks() {
             "task-targets",
             "worktrees",
             "load",
-            "config"
+            "config",
+            "tailnet"
         ]
     );
     for c in report["checks"].as_array().unwrap() {

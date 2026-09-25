@@ -8,7 +8,12 @@
 //! three times over `CommitLimit` made `fork()` fail with EAGAIN
 //! while every check was green (CAD-154); a per-family process census
 //! names the group that ate it (CAD-154) and the daemon checkpoints
-//! provider WALs itself while their provider idles (CAD-132).
+//! provider WALs itself while their provider idles (CAD-132). The
+//! `tailnet` check runs the tailnet sign-in proof's host-side rungs
+//! up front — plus a live board's `operator_latched`, read off its
+//! `/api/meta` — and prints the whole remedy chain in order, so one
+//! sign-in link is spent after the fixes, not one per refusal
+//! (CAD-509).
 //!
 //! Every check reports `ok | warn | fail` with the measured value, the
 //! threshold it was compared against, and a `remedy` — the exact
@@ -364,6 +369,10 @@ pub struct Scan {
     /// fills it best-effort so the load check can report the queue;
     /// `None` means daemon unreachable (reported, not penalised).
     pub slots: Option<Value>,
+    /// tailscaled's LocalAPI socket the `tailnet` check reads
+    /// ([`crate::tailnet_proof`]); `None` reads the default paths.
+    /// Never set from the command line — tests inject a fixture.
+    pub tailscaled_socket: Option<PathBuf>,
     /// Injectable statvfs — tests substitute fabricated free-space
     /// answers so no check ever depends on the host's real disks.
     pub(crate) fs_probe: Option<fn(&Path) -> Option<FsFree>>,
@@ -410,6 +419,7 @@ impl Scan {
                 std::time::Duration::from_secs(2),
             )
             .ok(),
+            tailscaled_socket: None,
             fs_probe: None,
             census: std::cell::OnceCell::new(),
         }
@@ -487,6 +497,7 @@ pub fn run(scan: &Scan) -> Value {
         check_worktrees(scan),
         check_load(scan),
         check_config(scan),
+        check_tailnet(scan),
     ];
     let level = checks.iter().map(|c| c.level).max().unwrap_or(Level::Ok);
     json!({
@@ -5484,6 +5495,190 @@ fn check_load(scan: &Scan) -> Check {
     )
 }
 
+/// CAD-509 — the tailnet sign-in proof run before a link is spent.
+/// [`crate::tailnet_proof::host_refusals`] reads every host-side rung
+/// (the LocalAPI socket, kernel networking, the operator user, TCP
+/// forwarders, tailscaled's uid); a live board's `/api/meta` adds
+/// `operator_latched`, which is the board's memory and no host read
+/// can see. The remedy prints the whole chain in order — the operator
+/// fixes it in one pass instead of spending a link per refusal.
+fn check_tailnet(scan: &Scan) -> Check {
+    use crate::tailnet_proof::Check as T;
+    let opts = crate::ui::persisted_opts(&scan.state_dir);
+    let sharing = opts.tailscale.is_some();
+    let board_port = opts.port.unwrap_or(3010);
+    let mut refusals = crate::tailnet_proof::host_refusals(
+        scan.tailscaled_socket.as_deref(),
+        scan.uid,
+        board_port,
+    );
+    // A forged probe at a running board names the rung it fails now —
+    // `operator_latched` lives in the board's memory. The per-connection
+    // rungs (`client_socket`, `socket_owner`) refuse this probe by
+    // design and say nothing about a real one.
+    let live = if sharing {
+        live_tailnet_verdict(&opts)
+    } else {
+        None
+    };
+    let mut forgeable = false;
+    if let Some((proven, check, why)) = &live {
+        if *proven {
+            forgeable = true;
+        } else if let Some(c) = check {
+            if *c < T::ClientSocket && !refusals.iter().any(|r| r.check == *c) {
+                refusals.push(crate::tailnet_proof::Refusal {
+                    check: *c,
+                    why: why.clone(),
+                });
+            }
+        }
+    }
+    refusals.sort_by_key(|r| r.check);
+    refusals.dedup_by_key(|r| r.check);
+    let names: Vec<&str> = refusals.iter().map(|r| r.check.as_str()).collect();
+    let (level, detail) = if forgeable {
+        (
+            Level::Fail,
+            "a forged loopback request was proven as the tailscale proxy — tailnet \
+             identity headers are forgeable"
+                .to_string(),
+        )
+    } else if !sharing && refusals.iter().all(|r| r.check == T::TailscaledSocket) {
+        (
+            Level::Ok,
+            "tailscale sharing is off and no tailscaled answers — nothing to prove".to_string(),
+        )
+    } else if refusals.is_empty() {
+        match (sharing, live.is_some()) {
+            (true, true) => (
+                Level::Ok,
+                "sharing on; every host-side rung passes and the board is not latched".to_string(),
+            ),
+            (true, false) => (
+                Level::Warn,
+                "sharing on and the host side is clean, but the board does not answer — \
+                 its operator latch cannot be read until it runs"
+                    .to_string(),
+            ),
+            (false, _) => (
+                Level::Ok,
+                "tailscale sharing is off; the host-side proof would pass".to_string(),
+            ),
+        }
+    } else {
+        (
+            if sharing { Level::Fail } else { Level::Warn },
+            format!("a tailnet sign-in would refuse on: {}", names.join(", ")),
+        )
+    };
+    let mut remedy = String::new();
+    if level != Level::Ok {
+        let mut steps: Vec<String> = refusals
+            .iter()
+            .map(|r| format!("{} — {}", r.check.as_str(), tailnet_remedy(r.check)))
+            .collect();
+        if forgeable {
+            steps.push(
+                "stop sharing until the proof is sound — `cadence ui tailscale stop`".to_string(),
+            );
+        } else {
+            if sharing && live.is_none() {
+                steps.push(
+                    "the board is down — `cadence ui start` (its latch cannot be read \
+                     while stopped)"
+                        .to_string(),
+                );
+            }
+            steps.push(if sharing {
+                "then mint a fresh link — `cadence ui login --tailnet`".to_string()
+            } else {
+                "then `cadence ui tailscale start` and `cadence ui login --tailnet`".to_string()
+            });
+        }
+        remedy = steps.join("\n");
+    }
+    check(
+        "tailnet",
+        level,
+        json!({
+            "sharing": sharing,
+            "refusals": names,
+            "board_answered": live.is_some(),
+        }),
+        json!("no refusal ahead of a tailnet sign-in"),
+        detail,
+        remedy,
+    )
+}
+
+/// A forged probe at the running board's `/api/meta` — the tailnet
+/// Host, a made-up login: `(proven, check, why)`. `operator_latched`
+/// is the board's memory; only this sees it. `None` when sharing is
+/// off or nothing answers on the board's port.
+fn live_tailnet_verdict(
+    opts: &crate::ui::UiOpts,
+) -> Option<(bool, Option<crate::tailnet_proof::Check>, String)> {
+    let ts = opts.tailscale.as_ref()?;
+    let port = opts.port.unwrap_or(3010);
+    let host = format!("{}:{}", ts.dns_name, ts.https_port);
+    let (code, body) = crate::ui::http_get(
+        "127.0.0.1",
+        port,
+        "/api/meta",
+        &host,
+        &["Tailscale-User-Login: doctor-probe@cadence.invalid"],
+    )
+    .ok()?;
+    if code != 200 {
+        return None;
+    }
+    let meta: Value = serde_json::from_str(&body).ok()?;
+    let proof = &meta["tailnet_proof"];
+    Some((
+        proof["proven"].as_bool()?,
+        crate::tailnet_proof::Check::named(proof["check"].as_str().unwrap_or_default()),
+        proof["why"].as_str().unwrap_or_default().to_string(),
+    ))
+}
+
+/// The operator's fix for one tailnet refusal — the command, not the
+/// explanation (the refusal's `why` already carries that).
+fn tailnet_remedy(check: crate::tailnet_proof::Check) -> &'static str {
+    use crate::tailnet_proof::Check::*;
+    match check {
+        TailscaledSocket => {
+            "start tailscaled — `sudo systemctl start tailscaled`, then `tailscale up`"
+        }
+        Localapi => "tailscaled must answer its LocalAPI — `sudo systemctl status tailscaled`",
+        KernelNetworking => {
+            "run tailscaled on kernel networking (a TUN device) — userspace networking \
+             can never prove a peer"
+        }
+        NotOperatorUser => {
+            "move the operator seat off the board's uid — `sudo tailscale set \
+             --operator=root` (root already holds every power), or clear it with \
+             `sudo tailscale set --operator=`"
+        }
+        OperatorLatched => {
+            "restart the board so the latch clears — `cadence ui stop && cadence ui start`"
+        }
+        NoTcpForwarder => {
+            "drop the TCP forwarder to the board's port — `tailscale serve status`, then \
+             `tailscale serve --tcp=<port> off`"
+        }
+        ClientSocket | SocketOwner => {
+            "the connection was not tailscaled's own — rerun doctor; if it persists, \
+             restart tailscaled"
+        }
+        ForeignUid => {
+            "run tailscaled as its own user (the packaged systemd unit) — as the board's \
+             uid it proves nothing"
+        }
+        Loopback => "unreachable for a real proxy request — report this",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5510,6 +5705,7 @@ mod tests {
             thresholds: Thresholds::default(),
             linux: true,
             slots: None,
+            tailscaled_socket: Some(root.path().join("tailscaled.sock")),
             fs_probe: Some(|path| {
                 Some(FsFree {
                     path: path.to_path_buf(),
@@ -8509,7 +8705,8 @@ mod tests {
                 "task-targets",
                 "worktrees",
                 "load",
-                "config"
+                "config",
+                "tailnet"
             ]
         );
         for c in report["checks"].as_array().unwrap() {
@@ -9627,5 +9824,118 @@ mod tests {
         // Reaped → gone from /proc → omitted; nothing left → no remedy.
         assert!(kill_lines(Path::new("/proc"), &[pid]).is_empty());
         assert_eq!(kill_remedy(Path::new("/proc"), &[pid], "why"), "");
+    }
+
+    /// This test's user name — the uid the fixture socket is owned by.
+    fn own_name() -> String {
+        let out = Command::new("id").arg("-un").output().unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    /// CAD-509 — no tailscaled and no sharing is a fact, not a
+    /// failure: a host that never touches the tailnet stays `ok`.
+    #[test]
+    fn tailnet_check_is_quiet_without_tailscale() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root); // tailscaled_socket points nowhere
+        let c = check_tailnet(&scan).to_json();
+        assert_eq!(c["level"], "ok", "{c}");
+        assert_eq!(c["value"]["refusals"], json!(["tailscaled_socket"]));
+    }
+
+    /// CAD-509 — a missing `OperatorUser` (tailscaled's omitempty) is
+    /// "no operator": never `not_operator_user`. A non-object prefs
+    /// body stays a LocalAPI refusal — fail closed, never a silent
+    /// pass.
+    #[test]
+    fn tailnet_check_reads_a_missing_operator_user_as_none() {
+        let root = TempDir::new().unwrap();
+        let mut scan = fake_scan(&root); // sharing off → advisory only
+        let tsdir = root.path().join("ts");
+        let sock = crate::tailnet_proof::tests::localapi(&tsdir);
+        for (f, v) in [
+            ("status.json", json!({"TUN": true})),
+            ("prefs.json", json!({"WantRunning": true})),
+            ("serve.json", json!({})),
+        ] {
+            crate::tailnet_proof::tests::localapi_says(&tsdir, f, v);
+        }
+        scan.tailscaled_socket = Some(sock);
+        let c = check_tailnet(&scan).to_json();
+        // The fixture socket is owned by this uid, so `foreign_uid`
+        // stays — `not_operator_user` must not.
+        assert_eq!(c["value"]["refusals"], json!(["foreign_uid"]), "{c}");
+        assert_eq!(c["level"], "warn", "{c}");
+
+        crate::tailnet_proof::tests::localapi_says(&tsdir, "prefs.json", json!(["x"]));
+        let c = check_tailnet(&scan).to_json();
+        assert_eq!(c["value"]["refusals"], json!(["localapi"]), "{c}");
+    }
+
+    /// CAD-509 — with sharing on, every host-side refusal prints its
+    /// remedy in proof order, then the board start and the link: one
+    /// pass, one spent link.
+    #[test]
+    fn tailnet_check_prints_the_whole_remedy_chain() {
+        let root = TempDir::new().unwrap();
+        let mut scan = fake_scan(&root);
+        // Sharing on, board down: the probe port is bound then dropped
+        // so nothing answers on it.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        std::fs::write(
+            scan.state_dir.join("ui.json"),
+            json!({
+                "port": port,
+                "tailscale": {
+                    "dns_name": "box.tailnet.example",
+                    "https_port": 9450,
+                    "target": format!("http://127.0.0.1:{port}"),
+                },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // TUN on, this uid as the operator, a forwarder to the board.
+        let tsdir = root.path().join("ts");
+        let sock = crate::tailnet_proof::tests::localapi(&tsdir);
+        for (f, v) in [
+            ("status.json", json!({"TUN": true})),
+            ("prefs.json", json!({"OperatorUser": own_name()})),
+            (
+                "serve.json",
+                json!({"TCP": {"443": {"TCPForward": format!("127.0.0.1:{port}")}}}),
+            ),
+        ] {
+            crate::tailnet_proof::tests::localapi_says(&tsdir, f, v);
+        }
+        scan.tailscaled_socket = Some(sock);
+        let c = check_tailnet(&scan).to_json();
+        assert_eq!(c["level"], "fail", "{c}");
+        assert_eq!(
+            c["value"]["refusals"],
+            json!(["not_operator_user", "no_tcp_forwarder", "foreign_uid"]),
+            "{c}"
+        );
+        let remedy = c["remedy"].as_str().unwrap();
+        let at = |s: &str| {
+            remedy
+                .find(s)
+                .unwrap_or_else(|| panic!("{s} not in {remedy}"))
+        };
+        let (op, fwd, foreign) = (
+            at("--operator=root"),
+            at("TCP forwarder"),
+            at("its own user"),
+        );
+        let (start, link) = (at("cadence ui start"), at("cadence ui login --tailnet"));
+        assert!(
+            op < fwd && fwd < foreign && foreign < start && start < link,
+            "{remedy}"
+        );
     }
 }
