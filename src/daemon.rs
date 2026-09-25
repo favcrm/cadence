@@ -2505,6 +2505,7 @@ impl Shared {
             "project_work_approvals" => Ok(json!({
                 "approvals": self.store.work_approvals()?,
             })),
+            "workflow_approve" => self.rpc_workflow_approve(params, peer_pid),
             "master_dispatch" => self.rpc_master_dispatch(params, peer_pid),
             "question_escalate" => self.rpc_question_escalate(params, peer_pid),
             "agent_file_write" => self.rpc_agent_file_write(params, peer_pid),
@@ -4014,10 +4015,32 @@ impl Shared {
             },
         };
         let project = required_str(params, "project")?;
-        let text = required_str(params, "text")?;
+        // `project` joins the pm dir on the workflow path — it is a key,
+        // never a path fragment.
+        crate::issue::model::check_key(project)?;
+        let text = optional_str(params, "text");
+        let workflow = optional_str(params, "workflow");
+        let inputs = params.get("inputs");
+        let text = match (text, workflow) {
+            (Some(t), None) => {
+                if inputs.is_some() {
+                    return Err(Error::rejected(
+                        "'inputs' belong to a workflow proposal — `--workflow <name>`",
+                    ));
+                }
+                t.to_string()
+            }
+            (None, Some(name)) => self.workflow_plan_text(project, name, inputs)?,
+            _ => {
+                return Err(Error::rejected(
+                    "plan propose needs exactly one of 'text' or 'workflow' — \
+                     `--file` or `--workflow`",
+                ))
+            }
+        };
         let pm = crate::issue::Pm::at(&self.pm_dir()?)?;
         let allow = crate::secret::Allowlist::load(&self.state_dir)?;
-        let out = crate::issue::plan::propose(&pm, project, text, &allow, &actor)?;
+        let out = crate::issue::plan::propose(&pm, project, &text, &allow, &actor)?;
         let _ = self.store.event_public(
             DAEMON_ALIAS,
             "plan_proposed",
@@ -4028,10 +4051,71 @@ impl Shared {
                 "tickets": out["tickets"],
                 "ticket_count": out["tickets"].as_array().map_or(0, Vec::len),
                 "proposed_by": out["proposed_by"],
+                "workflow": workflow,
             }),
         );
         self.wake();
         Ok(out)
+    }
+
+    /// `plan propose --workflow <name>`: read
+    /// `<pm>/<project>/workflows/<name>.md`, refuse unless its gate
+    /// keys match the operator's recorded approval (a wording-only or
+    /// structural edit alike self-unapproves until then), render it
+    /// with `inputs` (a `{k: v}` map — missing required and unknown
+    /// names refuse), and hand the rendered plan text to the ordinary
+    /// propose path.
+    fn workflow_plan_text(
+        &self,
+        project: &str,
+        name: &str,
+        inputs: Option<&Value>,
+    ) -> Result<String> {
+        let provided: std::collections::BTreeMap<String, String> = match inputs {
+            None | Some(Value::Null) => Default::default(),
+            Some(Value::Object(m)) => {
+                let mut out = std::collections::BTreeMap::new();
+                for (k, v) in m {
+                    match v.as_str() {
+                        Some(s) => {
+                            out.insert(k.clone(), s.to_string());
+                        }
+                        None => {
+                            return Err(Error::rejected(format!(
+                                "input '{k}' must be a string — `--input {k}=<value>`"
+                            )))
+                        }
+                    }
+                }
+                out
+            }
+            Some(_) => {
+                return Err(Error::rejected(
+                    "'inputs' must be an object of string values — `--input k=v`",
+                ))
+            }
+        };
+        let pm_dir = self.pm_dir()?;
+        let text = crate::issue::workflow::read_for(&pm_dir, project, name)?;
+        let digest = crate::issue::workflow::gate_digest(&text)?;
+        let approvals = self.store.workflow_approvals()?;
+        let ok = approvals
+            .get(&crate::issue::workflow::approval_key(project, name))
+            .and_then(|p| p["digest"].as_str())
+            == Some(digest.as_str());
+        if !ok {
+            return Err(Error::invalid(
+                "workflow_unapproved",
+                format!(
+                    "workflow '{name}' in {project} is not approved for its current gate \
+                     keys ({digest}) — an approval-affecting edit (agent, depends_on, \
+                     size, reviewer, tries, uses, a ticket added or dropped) resets it; \
+                     the operator re-approves with `cadence workflow approve {name} \
+                     --project {project}`"
+                ),
+            ));
+        }
+        crate::issue::workflow::render(&text, &provided)
     }
 
     /// CAD-360 `plan_approve` / `plan_reject` — operator only, exactly
@@ -4181,6 +4265,55 @@ impl Shared {
             "at": crate::issue::time::iso(crate::issue::time::now_epoch()),
         });
         self.store.record_work_approval(payload.clone())?;
+        self.wake();
+        Ok(payload)
+    }
+
+    /// CAD-487 `workflow_approve` — the operator approves a workflow's
+    /// gate keys (the ticket skeleton: `agent`, `depends_on`, `size`,
+    /// `reviewer`, `tries`, `uses`) as they are now. The digest lands
+    /// on the audit stream keyed `"<project>/<name>"`; `plan propose
+    /// --workflow` matches the file's digest against it. Operator only,
+    /// connection-bound like `plan approve`. A workflow that fails
+    /// `workflow check` cannot be approved.
+    fn rpc_workflow_approve(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.operator_connection("workflow approve", params, peer_pid)?;
+        let project = required_str(params, "project")?;
+        crate::issue::model::check_key(project)?;
+        let name = required_str(params, "name")?;
+        let pm_dir = self.pm_dir()?;
+        if !crate::issue::project::list(&pm_dir)?
+            .iter()
+            .any(|p| p.key == project)
+        {
+            return Err(crate::issue::project::unknown_project(project, &pm_dir));
+        }
+        let text = crate::issue::workflow::read_for(&pm_dir, project, name)?;
+        let aliases: Vec<String> = self
+            .store
+            .agents()?
+            .iter()
+            .map(|a| a.alias.clone())
+            .collect();
+        let (agents, sources) =
+            crate::issue::workflow::known_agents(&pm_dir, Some(project), &aliases);
+        let (errors, notes, _) = crate::issue::workflow::check_text(&text, &agents, &sources);
+        if !errors.is_empty() {
+            return Err(Error::rejected(format!(
+                "workflow '{name}' fails `workflow check` — approve it only after these \
+                 are fixed: {}",
+                errors.join("; ")
+            )));
+        }
+        let payload = json!({
+            "project": project,
+            "name": name,
+            "digest": crate::issue::workflow::gate_digest(&text)?,
+            "by": "operator",
+            "at": crate::issue::time::iso(crate::issue::time::now_epoch()),
+            "notes": notes,
+        });
+        self.store.record_workflow_approval(payload.clone())?;
         self.wake();
         Ok(payload)
     }

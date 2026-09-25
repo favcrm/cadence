@@ -3484,10 +3484,35 @@ fn stall_sample(secs: u64) {
     TEST_STALL_SAMPLE.with(|s| s.store(secs, std::sync::atomic::Ordering::Relaxed));
 }
 
+/// The tracker's pre-commit hook runs `cadence` from PATH (`issue
+/// init` installs it) — under `cargo test` that resolves to the
+/// installed release, whose lint predates whatever this tree adds
+/// (a `workflows/` dir flags as "no issue.md" and refuses the
+/// commit). Put the binary under test first on PATH, once per
+/// process: every child spawned afterwards — fixture CLIs, a
+/// `daemon run` process, the git commits an in-process daemon makes
+/// — lints with the code being tested. The `issue init` hook tests
+/// do the same per-command; this covers the paths that inherit the
+/// process env instead.
+fn hook_bin_on_path() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let bin_dir = Path::new(env!("CARGO_BIN_EXE_cadence"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let mut path: Vec<PathBuf> =
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
+        path.insert(0, bin_dir);
+        std::env::set_var("PATH", std::env::join_paths(path).unwrap());
+    });
+}
+
 /// This test's provider launch overrides (mock commands). Each test
 /// runs on its own thread, so every daemon it starts — restarts
 /// included — shares them, and no other test's daemon ever sees them.
 fn test_env() -> ProviderEnv {
+    hook_bin_on_path();
     TEST_ENV.with(ProviderEnv::clone)
 }
 
@@ -42011,6 +42036,671 @@ fn plan_decisions_are_operator_only() {
         f.d.operator_rpc("plan_approve", json!({"epic": "D-1"}))
             .unwrap();
     assert_eq!(out["state"], "approved", "{out}");
+}
+
+/// The two-step workflow every test below adds to `demo`.
+const WF_TWO_STEP: &str = "---\ntitle: \"Change: {{title}}\"\ngoal: \"Ship {{title}}\"\n\
+inputs:\n  title: { ask: \"What change?\" }\n  note: { optional: true }\n---\n\n\
+## Do {{title}}\nagent: dev-1\nsize: S\n\n### Acceptance\n- [ ] done\n\n\
+## Check {{title}}\nagent: qa-1\ndepends_on: 1\n\n### Acceptance\n- [ ] verified\n";
+
+/// Write `text` into the fixture's scratch dir; answer its path.
+fn wf_file(f: &PlanFixture, name: &str, text: &str) -> String {
+    let path = f.tmp.path().join(name);
+    std::fs::write(&path, text).unwrap();
+    path.to_str().unwrap().to_string()
+}
+
+/// `workflow add` the text as `name` in `demo` — asserts success.
+fn wf_add(f: &PlanFixture, name: &str, text: &str) -> Value {
+    let file = wf_file(f, &format!("{name}.md"), text);
+    let (ok, out) = f.cli(&[
+        "workflow",
+        "add",
+        name,
+        "--project",
+        "demo",
+        "--file",
+        &file,
+    ]);
+    assert!(ok, "workflow add {name}: {out}");
+    out
+}
+
+/// The issue's body text (what follows the frontmatter).
+fn issue_body(f: &PlanFixture, id: &str) -> String {
+    let text = std::fs::read_to_string(f.pm_dir.join("demo").join(id).join("issue.md")).unwrap();
+    cadence_agent::issue::parse::parse_issue(&text).unwrap().1
+}
+
+/// CAD-487: `workflow add|edit|ls|show` are the only writers — one
+/// tracker commit each, `Actor:` recorded — and `workflow check`
+/// validates a file or a stored name, non-zero on any refusal.
+#[test]
+fn workflow_cli_crud_check_and_actor() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    f.d.register("qa-1");
+
+    // check a file: ok with named inputs; a bad one exits non-zero
+    // naming the refusal.
+    let good = wf_file(&f, "good.md", WF_TWO_STEP);
+    let (ok, out) = f.cli(&["workflow", "check", &good, "--project", "demo"]);
+    assert!(ok && out["ok"] == true, "{out}");
+    assert_eq!(out["inputs"].as_array().unwrap().len(), 2, "{out}");
+    let bad = wf_file(
+        &f,
+        "bad.md",
+        &WF_TWO_STEP.replace("agent: dev-1", "agent: nobody"),
+    );
+    let (ok, out) = f.cli(&["workflow", "check", &bad, "--project", "demo"]);
+    assert!(!ok, "unknown agent must refuse: {out}");
+    assert!(out.to_string().contains("'nobody'"), "{out}");
+
+    // add: one commit, the file lands beside PROJECT.md, actor trailer.
+    let before = f.commits();
+    wf_add(&f, "two-step", WF_TWO_STEP);
+    assert_eq!(f.commits(), before + 1, "one commit per workflow write");
+    assert!(
+        f.pm_dir.join("demo/workflows/two-step.md").is_file(),
+        "stored at <pm>/<project>/workflows/<name>.md"
+    );
+    let msg = f.last_commit();
+    assert!(msg.contains("two-step.md added"), "{msg}");
+    assert!(msg.contains("Actor: operator\n"), "{msg}");
+
+    // add refuses an existing name; edit requires it.
+    let (ok, out) = f.cli(&[
+        "workflow",
+        "add",
+        "two-step",
+        "--project",
+        "demo",
+        "--file",
+        &good,
+    ]);
+    assert!(!ok && out.to_string().contains("already exists"), "{out}");
+    let (ok, out) = f.cli(&[
+        "workflow",
+        "edit",
+        "missing",
+        "--project",
+        "demo",
+        "--file",
+        &good,
+    ]);
+    assert!(
+        !ok && out.to_string().contains("no workflow 'missing'"),
+        "{out}"
+    );
+    // A bad name can never escape the workflows/ dir.
+    let (ok, out) = f.cli(&[
+        "workflow",
+        "add",
+        "../escape",
+        "--project",
+        "demo",
+        "--file",
+        &good,
+    ]);
+    assert!(!ok, "{out}");
+    // An unknown project is named.
+    let (ok, out) = f.cli(&["workflow", "add", "x", "--project", "nope", "--file", &good]);
+    assert!(!ok && out.to_string().contains("nope"), "{out}");
+
+    // ls and show read the store.
+    let (ok, out) = f.cli(&["workflow", "ls", "--project", "demo"]);
+    assert!(ok, "{out}");
+    assert_eq!(out["workflows"][0]["name"], "two-step", "{out}");
+    let (ok, out) = f.cli(&["workflow", "show", "two-step", "--project", "demo"]);
+    assert!(ok, "{out}");
+    // `show` renders the placeholders to their input names — the
+    // canonical view the gate's digest covers.
+    assert_eq!(out["title"], "Change: title", "{out}");
+    assert_eq!(out["tickets"].as_array().unwrap().len(), 2, "{out}");
+
+    // check by name resolves inside the project.
+    let (ok, out) = f.cli(&["workflow", "check", "two-step", "--project", "demo"]);
+    assert!(ok && out["ok"] == true, "{out}");
+
+    // edit: one commit, recorded; the stored file changes.
+    let edited = WF_TWO_STEP.replace("Ship {{title}}", "Ship {{title}} well");
+    let file = wf_file(&f, "two-step-v2.md", &edited);
+    let before = f.commits();
+    let (ok, out) = f.cli(&[
+        "workflow",
+        "edit",
+        "two-step",
+        "--project",
+        "demo",
+        "--file",
+        &file,
+    ]);
+    assert!(ok, "{out}");
+    assert_eq!(f.commits(), before + 1);
+    assert!(
+        std::fs::read_to_string(f.pm_dir.join("demo/workflows/two-step.md"))
+            .unwrap()
+            .contains("well"),
+        "edit lands"
+    );
+    // An edit that fails check lands nothing and commits nothing.
+    let broken = wf_file(
+        &f,
+        "broken.md",
+        &WF_TWO_STEP.replace("agent: qa-1", "agent: ghost"),
+    );
+    let before = f.commits();
+    let (ok, out) = f.cli(&[
+        "workflow",
+        "edit",
+        "two-step",
+        "--project",
+        "demo",
+        "--file",
+        &broken,
+    ]);
+    assert!(!ok && out.to_string().contains("ghost"), "{out}");
+    assert_eq!(f.commits(), before, "a refused edit writes nothing");
+}
+
+/// CAD-487: `plan propose --workflow` renders the stored file with
+/// `--input` values onto the unchanged propose path — the epic and
+/// tickets arrive `proposed` and gated exactly like a `--file` plan —
+/// but only while the file's gate keys match the operator's recorded
+/// approval. Missing and unknown inputs refuse, naming the input.
+#[test]
+fn workflow_propose_renders_and_gates() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    f.d.register("qa-1");
+    wf_add(&f, "two-step", WF_TWO_STEP);
+
+    // Unapproved: refused with the named reason, nothing written.
+    let before = f.commits();
+    let err =
+        f.d.operator_rpc(
+            "plan_propose",
+            json!({"project": "demo", "workflow": "two-step"}),
+        )
+        .unwrap_err();
+    assert_eq!(err.code(), Some("workflow_unapproved"), "{err}");
+    assert_eq!(f.commits(), before);
+
+    // The operator approves the gate keys as they are now.
+    let (ok, out) = f.cli(&["workflow", "approve", "two-step", "--project", "demo"]);
+    assert!(ok, "{out}");
+    assert_eq!(out["by"], "operator", "{out}");
+
+    // Inputs: a missing required names itself; an unknown name refuses;
+    // a non-string input refuses.
+    for (inputs, want) in [
+        (json!({}), "missing required input"),
+        (json!({"title": "x", "bogus": "y"}), "unknown input 'bogus'"),
+        (json!({"title": {"nested": 1}}), "'title' must be a string"),
+    ] {
+        let err =
+            f.d.operator_rpc(
+                "plan_propose",
+                json!({"project": "demo", "workflow": "two-step", "inputs": inputs}),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(want), "{want}: {err}");
+    }
+    assert_eq!(f.commits(), before, "refusals write nothing");
+
+    // The CLI form: --workflow + repeatable --input. The rendered plan
+    // is the same epic+tickets a --file plan writes, gated identically.
+    let (ok, out) = f.cli(&[
+        "plan",
+        "propose",
+        "--project",
+        "demo",
+        "--workflow",
+        "two-step",
+        "--input",
+        "title=login fix",
+    ]);
+    assert!(ok, "{out}");
+    assert_eq!(out["epic"], "D-1", "{out}");
+    assert_eq!(out["tickets"], json!(["D-2", "D-3"]), "{out}");
+    let plan = f.front("D-1").plan.unwrap();
+    assert_eq!(plan.state, "proposed");
+    let t1 = f.front("D-2");
+    assert_eq!(
+        (t1.title.as_str(), t1.owner.as_deref(), t1.size.as_deref()),
+        ("Do login fix", Some("dev-1"), Some("S"))
+    );
+    assert_eq!(f.front("D-3").blocked_by, vec!["D-2".to_string()]);
+    // The rendered frontmatter dropped `inputs:` — the epic holds a
+    // plain plan (parse_plan denies unknown fields, so it never saw it).
+    assert!(issue_body(&f, "D-1").contains("Ship login fix"));
+    // The plan gate is unchanged: a proposed ticket cannot start.
+    let (ok, err) = f.cli(&["issue", "start", "D-2"]);
+    assert!(
+        !ok && err.to_string().contains("plan D-1 is proposed"),
+        "{err}"
+    );
+    // `plan_proposed` names the workflow it came from.
+    let events = f.daemon_events("plan_proposed");
+    assert_eq!(events[0]["workflow"], "two-step", "{events:?}");
+
+    // A wording-only edit keeps approval — propose still works.
+    let wording = WF_TWO_STEP.replace("Ship {{title}}", "Land {{title}} safely");
+    let file = wf_file(&f, "wording.md", &wording);
+    let (ok, out) = f.cli(&[
+        "workflow",
+        "edit",
+        "two-step",
+        "--project",
+        "demo",
+        "--file",
+        &file,
+    ]);
+    assert!(ok && out["approved"] == true, "{out}");
+    // An approval-affecting edit unapproves: a new agent name is a new
+    // gate key.
+    let structural = WF_TWO_STEP.replace("agent: qa-1", "agent: dev-1");
+    let file = wf_file(&f, "structural.md", &structural);
+    let (ok, out) = f.cli(&[
+        "workflow",
+        "edit",
+        "two-step",
+        "--project",
+        "demo",
+        "--file",
+        &file,
+    ]);
+    assert!(ok && out["approved"] == false, "{out}");
+    assert!(out["unapproved"].is_string(), "{out}");
+    let err =
+        f.d.operator_rpc(
+            "plan_propose",
+            json!({"project": "demo", "workflow": "two-step",
+                   "inputs": {"title": "x"}}),
+        )
+        .unwrap_err();
+    assert_eq!(err.code(), Some("workflow_unapproved"), "{err}");
+    // Re-approving the new keys restores it.
+    let (ok, _) = f.cli(&["workflow", "approve", "two-step", "--project", "demo"]);
+    assert!(ok);
+    let out =
+        f.d.operator_rpc(
+            "plan_propose",
+            json!({"project": "demo", "workflow": "two-step",
+                   "inputs": {"title": "x"}}),
+        )
+        .unwrap();
+    assert_eq!(out["epic"], "D-4", "{out}");
+}
+
+/// CAD-487: `workflow_approve` is the operator's, decided by the
+/// connection — a pane agent is refused (even forging identity
+/// fields), a detached child carrying an alias it cannot prove is
+/// refused, and only the proven operator records the approval.
+/// The digest, not the file text, is what the proposal gate compares.
+#[test]
+fn workflow_approve_is_operator_only() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    f.d.register("qa-1");
+    wf_add(&f, "two-step", WF_TWO_STEP);
+
+    let home = TempDir::new().unwrap();
+    let mut pane = LaneShell::spawn(home.path());
+    plant_pane(&f.d, "pane-9", pane.pid());
+    let r = pane.rpc(
+        &f.d.state,
+        "workflow_approve",
+        json!({"project": "demo", "name": "two-step"}),
+    );
+    let msg = r["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("operator action") && msg.contains("pane-9"),
+        "pane approve: {r}"
+    );
+    for (field, value) in FORGED_IDENTITY {
+        let r = pane.rpc(
+            &f.d.state,
+            "workflow_approve",
+            forged(
+                &json!({"project": "demo", "name": "two-step"}),
+                field,
+                value,
+            ),
+        );
+        assert_eq!(r["ok"], false, "pane forging {field}: {r}");
+    }
+    let r =
+        f.d.unproven_rpc(
+            "workflow_approve",
+            json!({"project": "demo", "name": "two-step"}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        r.contains("not provably the operator") || r.contains("operator action"),
+        "{r}"
+    );
+    // A forged field on the operator's own call is refused, not read.
+    let err =
+        f.d.operator_rpc(
+            "workflow_approve",
+            json!({"project": "demo", "name": "two-step", "by": "operator"}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("'by'"), "{err}");
+
+    // The proven operator approves — the record names operator.
+    let out =
+        f.d.operator_rpc(
+            "workflow_approve",
+            json!({"project": "demo", "name": "two-step"}),
+        )
+        .unwrap();
+    assert_eq!(out["by"], "operator", "{out}");
+    assert!(
+        out["digest"].as_str().unwrap().starts_with("sha256:"),
+        "{out}"
+    );
+    // Approving twice is idempotent (the latest record wins) — no
+    // "exactly once" semantics to guard.
+    let again =
+        f.d.operator_rpc(
+            "workflow_approve",
+            json!({"project": "demo", "name": "two-step"}),
+        )
+        .unwrap();
+    assert_eq!(again["digest"], out["digest"]);
+    // A workflow that fails check cannot be approved.
+    let bad = wf_file(
+        &f,
+        "bad-wf.md",
+        &WF_TWO_STEP.replace("agent: qa-1", "agent: ghost"),
+    );
+    let (ok, _) = f.cli(&[
+        "workflow",
+        "add",
+        "bad-wf",
+        "--project",
+        "demo",
+        "--file",
+        &bad,
+    ]);
+    assert!(!ok, "a failing check refuses even the add");
+}
+
+/// CAD-487 N4: `workflows/code-change.md` — the software loop as a
+/// workflow — proposes the same epic and tickets as the hand-written
+/// plan it abbreviates. Compared field by field on the created issues.
+#[test]
+fn workflow_code_change_matches_handwritten_plan() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    f.d.register("qa-1");
+    let src = concat!(env!("CARGO_MANIFEST_DIR"), "/workflows/code-change.md");
+    let (ok, out) = f.cli(&[
+        "workflow",
+        "add",
+        "code-change",
+        "--project",
+        "demo",
+        "--file",
+        src,
+    ]);
+    assert!(ok, "{out}");
+    let (ok, out) = f.cli(&["workflow", "approve", "code-change", "--project", "demo"]);
+    assert!(ok, "{out}");
+
+    let inputs = json!({"title": "Login fix", "goal": "Users land on /home",
+                        "worker": "dev-1", "reviewer": "qa-1"});
+    let wf =
+        f.d.operator_rpc(
+            "plan_propose",
+            json!({"project": "demo", "workflow": "code-change", "inputs": inputs}),
+        )
+        .unwrap();
+    // The same plan, written by hand — what `plan propose --file`
+    // takes today.
+    let hand = "---\ntitle: \"Code change: Login fix\"\ngoal: \"Users land on /home\"\n---\n\n\
+The software loop as a plan: one ticket implements, a second —\n\
+independent — reviews the result pinned to its head. Render it with\n\
+`cadence plan propose --workflow code-change --input title=…\n\
+--input goal=… --input worker=… --input reviewer=…`.\n\n\
+## Implement Login fix\nagent: dev-1\nsize: M\n\n\
+Users land on /home\n\n\
+Work in the lane worktree; every commit carries the `Issue:` trailer;\n\
+open the PR and report the head SHA.\n\n\
+### Acceptance\n\
+- [ ] the change does what the goal says\n\
+- [ ] the touched checks pass (`fmt`, `clippy`, the relevant tests)\n\
+- [ ] a PR names the head SHA under review\n\n\
+## Review Login fix\nagent: qa-1\nsize: S\ndepends_on: 1\n\n\
+Review the diff pinned to its head SHA. The reviewer is independent of\n\
+the worker — a worker never verdicts its own work.\n\n\
+### Acceptance\n- [ ] a verdict is recorded against the reviewed head\n";
+    let hw = f.propose(hand).unwrap();
+
+    // Same shape: one epic, two tickets, same titles/agents/sizes/deps,
+    // same bodies — only the ids differ.
+    let wf_ids: Vec<String> = std::iter::once(wf["epic"].as_str().unwrap().to_string())
+        .chain(
+            wf["tickets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t.as_str().unwrap().to_string()),
+        )
+        .collect();
+    let hw_ids: Vec<String> = std::iter::once(hw["epic"].as_str().unwrap().to_string())
+        .chain(
+            hw["tickets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t.as_str().unwrap().to_string()),
+        )
+        .collect();
+    assert_eq!(wf_ids.len(), hw_ids.len());
+    let index_of = |ids: &[String], id: &str| ids.iter().position(|x| x == id).unwrap();
+    for (a, b) in wf_ids.iter().zip(hw_ids.iter()) {
+        let (fa, fb) = (f.front(a), f.front(b));
+        assert_eq!(fa.title, fb.title, "{a} vs {b}");
+        assert_eq!(fa.item_type, fb.item_type, "{a} vs {b}");
+        assert_eq!(fa.owner, fb.owner, "{a} vs {b}");
+        assert_eq!(fa.size, fb.size, "{a} vs {b}");
+        // blocked_by carries absolute ids — compare positions.
+        let pa: Vec<usize> = fa.blocked_by.iter().map(|d| index_of(&wf_ids, d)).collect();
+        let pb: Vec<usize> = fb.blocked_by.iter().map(|d| index_of(&hw_ids, d)).collect();
+        assert_eq!(pa, pb, "{a} vs {b} deps");
+        assert_eq!(issue_body(&f, a), issue_body(&f, b), "{a} vs {b} body");
+    }
+}
+
+/// CAD-487 r2 (review): input values cannot inject plan structure and
+/// `project` is a key, never a path. A newline, CR or control
+/// character refuses with `one_line` before substitution — asserted on
+/// the code, so a mutant dropping the value check fails here even
+/// though the skeleton guard behind it would still refuse — and the
+/// post-render skeleton parity (unit-tested in `workflow.rs`) is what
+/// would catch it. `distinct:` pins worker≠reviewer at render.
+#[test]
+fn workflow_inputs_cannot_inject_and_project_is_a_key() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    f.d.register("qa-1");
+    wf_add(&f, "two-step", WF_TWO_STEP);
+    let (ok, out) = f.cli(&["workflow", "approve", "two-step", "--project", "demo"]);
+    assert!(ok, "{out}");
+
+    // The three attack shapes from the review — each refused by name
+    // before substitution; nothing is proposed.
+    let before = f.commits();
+    for value in [
+        "x\n\n## Rogue\nagent: qa-1\n\n### Acceptance\n- [ ] y",
+        "x\ndepends_on: 1",
+        "x\nzz: 1",
+        "x\ry",
+        "x\t0",
+    ] {
+        let err =
+            f.d.operator_rpc(
+                "plan_propose",
+                json!({"project": "demo", "workflow": "two-step",
+                       "inputs": {"title": value}}),
+            )
+            .unwrap_err();
+        assert_eq!(err.code(), Some("one_line"), "{value:?}: {err}");
+    }
+    assert_eq!(f.commits(), before, "refusals write nothing");
+
+    // `distinct:` — worker==reviewer refuses by name; differing values
+    // propose. (code-change.md carries the declaration.)
+    let src = concat!(env!("CARGO_MANIFEST_DIR"), "/workflows/code-change.md");
+    let (ok, out) = f.cli(&[
+        "workflow",
+        "add",
+        "code-change",
+        "--project",
+        "demo",
+        "--file",
+        src,
+    ]);
+    assert!(ok, "{out}");
+    let (ok, out) = f.cli(&["workflow", "approve", "code-change", "--project", "demo"]);
+    assert!(ok, "{out}");
+    let err =
+        f.d.operator_rpc(
+            "plan_propose",
+            json!({"project": "demo", "workflow": "code-change",
+                   "inputs": {"title": "t", "goal": "g",
+                              "worker": "dev-1", "reviewer": "dev-1"}}),
+        )
+        .unwrap_err();
+    assert_eq!(err.code(), Some("not_distinct"), "{err}");
+    let out =
+        f.d.operator_rpc(
+            "plan_propose",
+            json!({"project": "demo", "workflow": "code-change",
+                   "inputs": {"title": "t", "goal": "g",
+                              "worker": "dev-1", "reviewer": "qa-1"}}),
+        )
+        .unwrap();
+    assert!(out["epic"].is_string(), "{out}");
+
+    // CAD-487 r3, the review's reproducer: a pane agent proposing
+    // code-change with worker=dev-1 and reviewer=dev-1 plus an
+    // invisible or edge character — U+2028, a trailing space, NBSP,
+    // U+2007, U+3000 — which the parser trims, landing `dev-1` on both
+    // sides (self-review). The refusal is `one_line`, on the code.
+    let home = TempDir::new().unwrap();
+    let mut pane = LaneShell::spawn(home.path());
+    plant_pane(&f.d, "pane-wf", pane.pid());
+    let before = f.commits();
+    for value in [
+        "dev-1\u{2028}",
+        "dev-1 ",
+        "dev-1\u{A0}",
+        "dev-1\u{2007}",
+        "dev-1\u{3000}",
+    ] {
+        let r = pane.rpc(
+            &f.d.state,
+            "plan_propose",
+            json!({"project": "demo", "workflow": "code-change",
+                   "inputs": {"title": "t", "goal": "g",
+                              "worker": "dev-1", "reviewer": value}}),
+        );
+        assert_eq!(r["error"]["code"], "one_line", "{value:?}: {r}");
+    }
+    assert_eq!(f.commits(), before, "no epic landed for refused inputs");
+
+    // `project` is a key on every workflow path — traversal and
+    // absolute paths refuse and can never read outside the tracker.
+    for bad in ["../x", "/tmp", "demo/../demo", "demo/../../etc"] {
+        let err =
+            f.d.operator_rpc(
+                "plan_propose",
+                json!({"project": bad, "workflow": "two-step",
+                       "inputs": {"title": "x"}}),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("key"), "{bad}: {err}");
+        let err =
+            f.d.operator_rpc(
+                "workflow_approve",
+                json!({"project": bad, "name": "two-step"}),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("key"), "{bad}: {err}");
+    }
+    // CLI forms too — check/show/add all take the key through the same
+    // guard; `ls` names the bad key as unknown.
+    let good = wf_file(&f, "ok.md", WF_TWO_STEP);
+    for args in [
+        vec!["workflow", "check", "two-step", "--project", "../x"],
+        vec!["workflow", "check", &good, "--project", "/tmp"],
+        vec!["workflow", "show", "two-step", "--project", "/tmp"],
+        vec!["workflow", "add", "x", "--project", "../x", "--file", &good],
+        vec![
+            "workflow",
+            "edit",
+            "two-step",
+            "--project",
+            "/tmp",
+            "--file",
+            &good,
+        ],
+        vec!["workflow", "ls", "--project", "../x"],
+    ] {
+        let (ok, out) = f.cli(&args);
+        assert!(!ok, "{args:?}: {out}");
+        assert!(!f.pm_dir.join("../x").exists(), "{args:?} wrote outside");
+    }
+
+    // A symlinked `workflows/` dir is never followed: `ls` names it as
+    // an error row rather than walking it, and reads refuse.
+    let outside = f.tmp.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("trap.md"), WF_TWO_STEP).unwrap();
+    let repo2 = f.tmp.path().join("repo2");
+    std::fs::create_dir_all(&repo2).unwrap();
+    let git_ok = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo2)
+        .args(["init", "-q", "-b", "main"])
+        .status()
+        .unwrap()
+        .success();
+    assert!(git_ok);
+    let (ok, out) = f.cli(&[
+        "issue",
+        "project",
+        "add",
+        "trap",
+        "--prefix",
+        "T",
+        "--repo",
+        repo2.canonicalize().unwrap().to_str().unwrap(),
+    ]);
+    assert!(ok, "{out}");
+    std::os::unix::fs::symlink(&outside, f.pm_dir.join("trap/workflows")).unwrap();
+    let (ok, out) = f.cli(&["workflow", "ls", "--project", "trap"]);
+    assert!(ok, "{out}");
+    assert!(
+        out["workflows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["error"].as_str().is_some_and(|e| e.contains("symlink"))),
+        "{out}"
+    );
+    let (ok, out) = f.cli(&["workflow", "show", "trap", "--project", "trap"]);
+    assert!(!ok && out.to_string().contains("symlink"), "{out}");
 }
 
 /// CAD-360: `job dispatch` of a task whose job is bound to a ticket of

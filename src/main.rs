@@ -910,6 +910,16 @@ enum Commands {
         #[command(subcommand)]
         action: PlanAction,
     },
+    /// Workflows (CAD-487): reusable plan files with `inputs:`,
+    /// stored as `<pm>/<project>/workflows/<name>.md` beside
+    /// PROJECT.md. `add`/`edit` are the only writers — one tracker
+    /// commit each, `Actor:` recorded. `check` validates a file or a
+    /// stored name. `approve` (operator only) pins the file's gate
+    /// keys; `plan propose --workflow` renders it.
+    Workflow {
+        #[command(subcommand)]
+        action: WorkflowAction,
+    },
     /// Projects (CAD-358): `new` registers a repo and seeds its
     /// PROJECT.md. The operator or the master (by its connection),
     /// through the daemon.
@@ -2519,7 +2529,9 @@ enum MessageAction {
 #[derive(Subcommand)]
 enum PlanAction {
     /// Create an epic (the plan, `proposed`) and one backlog ticket per
-    /// `## <title>` section of `--file`, in one tracker commit.
+    /// `## <title>` section of `--file`, in one tracker commit. With
+    /// `--workflow` the file is the project's stored template, rendered
+    /// with `--input k=v` first (CAD-487).
     Propose {
         /// Project key the plan files into.
         #[arg(long)]
@@ -2528,8 +2540,19 @@ enum PlanAction {
         /// `## <ticket>` section each with optional `size: S|M|L`,
         /// `agent: <alias>`, `depends_on: 2, CAD-9` lines and a
         /// `### Acceptance` checklist. `-` reads stdin.
+        #[arg(long, conflicts_with = "workflow")]
+        file: Option<PathBuf>,
+        /// Propose the stored workflow `<pm>/<project>/workflows/<name>.md`:
+        /// `{{input}}` placeholders take the `--input` values and the
+        /// rendered plan lands on the same approve → gate path. The
+        /// workflow's gate keys must be operator-approved
+        /// (`cadence workflow approve`).
         #[arg(long)]
-        file: PathBuf,
+        workflow: Option<String>,
+        /// `k=v` for the workflow's `inputs:` — repeatable; a missing
+        /// required input or an unknown name refuses.
+        #[arg(long = "input", requires = "workflow")]
+        inputs: Vec<String>,
     },
     /// Approve a proposed plan: its backlog tickets move to ready and
     /// may dispatch. Operator only.
@@ -2576,6 +2599,79 @@ enum PlanAction {
         /// Output is JSON already — accepted for grammar parity.
         #[arg(long)]
         json: bool,
+    },
+}
+
+/// `cadence workflow` verbs (CAD-487). `add`/`edit` write the file in
+/// one tracker commit with the actor recorded — the only writer;
+/// `check`/`ls`/`show` read; `approve` is the operator's gate.
+#[derive(Subcommand)]
+enum WorkflowAction {
+    /// Store `<file>` as the project's `<name>` workflow — refuses if
+    /// it exists (use `edit`) or fails `workflow check`.
+    Add {
+        /// Workflow name — 1-32 lowercase letters, digits or hyphens;
+        /// the file lands at `<pm>/<project>/workflows/<name>.md`.
+        name: String,
+        /// Project key.
+        #[arg(long)]
+        project: String,
+        /// The workflow file; `-` reads stdin.
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Replace a stored workflow — the file must exist and pass
+    /// `workflow check`. An approval-affecting change (agent,
+    /// depends_on, size, reviewer, tries, uses, a ticket added or
+    /// dropped) unapproves it until `workflow approve` runs again;
+    /// wording-only edits keep approval.
+    Edit {
+        /// Workflow name.
+        name: String,
+        /// Project key.
+        #[arg(long)]
+        project: String,
+        /// The new content; `-` reads stdin.
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Validate a workflow: parses, every `agent` exists, `depends_on`
+    /// has no cycle, every ticket has acceptance, every `{{name}}` is
+    /// a declared input, no reviewer is the ticket's own agent.
+    /// Non-zero exit on any refusal. `<target>` is a file path or a
+    /// name in `--project`'s workflows/.
+    Check {
+        /// A file path (…/x.md) or a stored workflow name.
+        target: String,
+        /// Project key — the name form needs it; the file form uses it
+        /// (or the cwd's project) to resolve `agent:` names.
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Every stored workflow: project, name, inputs, approval state.
+    Ls {
+        /// Project key; all projects when absent.
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// A stored workflow's summary: title, inputs, tickets, gate
+    /// digest and approval state.
+    Show {
+        /// Workflow name.
+        name: String,
+        /// Project key.
+        #[arg(long)]
+        project: String,
+    },
+    /// Approve the workflow's current gate keys — `plan propose
+    /// --workflow` refuses it until this matches the file on disk.
+    /// Operator only, through the daemon.
+    Approve {
+        /// Workflow name.
+        name: String,
+        /// Project key.
+        #[arg(long)]
+        project: String,
     },
 }
 
@@ -2944,16 +3040,46 @@ fn run_project(state_dir: &Path, action: ProjectCmd) -> Result<i32> {
 
 fn run_plan(state_dir: &Path, action: PlanAction) -> Result<i32> {
     let result = match action {
-        PlanAction::Propose { project, file } => {
-            let cap = cadence_agent::issue::plan::MAX_PLAN_BYTES as u64;
-            let text = read_body_capped(None, Some(file.clone()), cap).map_err(|e| {
-                Error::rejected(format!("Cannot read plan {}: {e}", file.display()))
-            })?;
-            client::rpc(
-                state_dir,
-                "plan_propose",
-                json!({"project": project, "text": text}),
-            )?
+        PlanAction::Propose {
+            project,
+            file,
+            workflow,
+            inputs,
+        } => {
+            let mut params = json!({"project": project});
+            match (file, workflow) {
+                (Some(file), None) => {
+                    let cap = cadence_agent::issue::plan::MAX_PLAN_BYTES as u64;
+                    let text = read_body_capped(None, Some(file.clone()), cap).map_err(|e| {
+                        Error::rejected(format!("Cannot read plan {}: {e}", file.display()))
+                    })?;
+                    params["text"] = json!(text);
+                }
+                (None, Some(name)) => {
+                    params["workflow"] = json!(name);
+                    if !inputs.is_empty() {
+                        let mut map = serde_json::Map::new();
+                        for pair in &inputs {
+                            let Some((k, v)) = pair.split_once('=') else {
+                                return Err(Error::rejected(format!(
+                                    "--input '{pair}' — expected k=v"
+                                )));
+                            };
+                            if k.is_empty() {
+                                return Err(Error::rejected("--input needs a name: k=v"));
+                            }
+                            map.insert(k.to_string(), json!(v));
+                        }
+                        params["inputs"] = Value::Object(map);
+                    }
+                }
+                _ => {
+                    return Err(Error::rejected(
+                        "plan propose needs --file <plan.md> or --workflow <name>",
+                    ))
+                }
+            }
+            client::rpc(state_dir, "plan_propose", params)?
         }
         PlanAction::Approve { epic } => {
             client::rpc(state_dir, "plan_approve", json!({"epic": epic}))?
@@ -2978,6 +3104,70 @@ fn run_plan(state_dir: &Path, action: PlanAction) -> Result<i32> {
             let pm = cadence_agent::issue::Pm::open_default()?;
             cadence_agent::issue::plan::ls(&pm, &state, &project, sort.as_deref(), limit, &fields)?
         }
+    };
+    print_json(&result);
+    Ok(0)
+}
+
+/// `cadence workflow …` (CAD-487). `add`/`edit` write the tracker
+/// directly — one commit each, `Actor:` recorded — and `check`/`ls`/
+/// `show` read it; `approve` is the operator's daemon call, like
+/// `issue project approve-work`. `check` exits non-zero on any
+/// refusal, like `issue doctor`.
+fn run_workflow(state_dir: &Path, action: WorkflowAction) -> Result<i32> {
+    use cadence_agent::issue::workflow;
+    let result = match &action {
+        WorkflowAction::Add {
+            name,
+            project,
+            file,
+        }
+        | WorkflowAction::Edit {
+            name,
+            project,
+            file,
+        } => {
+            let cap = cadence_agent::issue::plan::MAX_PLAN_BYTES as u64;
+            let text = read_body_capped(None, Some(file.clone()), cap).map_err(|e| {
+                Error::rejected(format!("Cannot read workflow {}: {e}", file.display()))
+            })?;
+            let pm = cadence_agent::issue::Pm::open_default()?;
+            workflow::write_file(
+                &pm,
+                project,
+                name,
+                &text,
+                matches!(action, WorkflowAction::Add { .. }),
+                state_dir,
+                "",
+            )?
+        }
+        WorkflowAction::Check { target, project } => {
+            let pm = cadence_agent::issue::Pm::open_default()?;
+            let report = workflow::check(&pm.dir, target, project.as_deref(), state_dir)?;
+            if report["ok"].as_bool() == Some(true) {
+                print_json(&report);
+                return Ok(0);
+            }
+            eprintln!(
+                "{}",
+                serde_json::to_string_pretty(&report).unwrap_or_default()
+            );
+            return Ok(1);
+        }
+        WorkflowAction::Ls { project } => {
+            let pm = cadence_agent::issue::Pm::open_default()?;
+            workflow::ls(&pm, project.as_deref(), state_dir)?
+        }
+        WorkflowAction::Show { name, project } => {
+            let pm = cadence_agent::issue::Pm::open_default()?;
+            workflow::show(&pm, project, name, state_dir)?
+        }
+        WorkflowAction::Approve { name, project } => client::rpc(
+            state_dir,
+            "workflow_approve",
+            json!({"project": project, "name": name}),
+        )?,
     };
     print_json(&result);
     Ok(0)
@@ -6732,6 +6922,7 @@ fn run() -> Result<i32> {
         }
         Commands::Issue { action } => cadence_agent::issue::cli::run(&action, &state_dir),
         Commands::Plan { action } => run_plan(&state_dir, action),
+        Commands::Workflow { action } => run_workflow(&state_dir, action),
         Commands::Project { action } => run_project(&state_dir, action),
         Commands::Milestone { action } => {
             cadence_agent::issue::cli::run_milestone(&action, &state_dir)
@@ -9382,13 +9573,14 @@ fn main() {
             // eprintln itself hits a closed pipe, the hook must
             // exit with the real code, not success.
             INTENDED_EXIT.store(1, Ordering::Relaxed);
-            eprintln!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "error": error.to_string(), "kind": error.kind(),
-                }))
-                .unwrap_or_default()
-            );
+            // `code` is the stable refusal name (e.g.
+            // `workflow_unapproved`) — the wire carries it, so the
+            // CLI's error print does too.
+            let mut err = json!({"error": error.to_string(), "kind": error.kind()});
+            if let Some(code) = error.code() {
+                err["code"] = json!(code);
+            }
+            eprintln!("{}", serde_json::to_string_pretty(&err).unwrap_or_default());
             1
         }
     };
