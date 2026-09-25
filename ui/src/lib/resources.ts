@@ -10,7 +10,7 @@ export function threadReader(alias: string): PageReader {
     before: (before, limit) => api.thread(alias, { before, limit }),
   };
 }
-import type { AgentsPayload, IssueCard, IssueDetail, MilestoneRow, Overview, Project } from "./types";
+import type { AgentsPayload, IssueCard, IssueDetail, MilestoneRow, Overview, Project, WorkflowRow } from "./types";
 
 /** The app's one query cache — every screen reads its stores from here. */
 export const cache = new QueryCache();
@@ -56,6 +56,12 @@ export const resources = {
   milestones: cache.family<string, MilestoneRow[]>(
     "milestones",
     (project) => api.milestones(project).then((r) => r.milestones),
+    { isEmpty: (rows) => rows.length === 0 },
+  ),
+  /** `GET /api/projects/<key>/workflows` — the project's stored workflows (CAD-496). */
+  workflows: cache.family<string, WorkflowRow[]>(
+    "workflows",
+    (project) => api.workflows(project).then((r) => r.workflows),
     { isEmpty: (rows) => rows.length === 0 },
   ),
 };

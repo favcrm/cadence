@@ -11,6 +11,7 @@ import { readAppUrlState, type AppTab, type ProjectView } from "./urlState";
  *   /projects/:slug/epics      its epics: stage, progress, health (CAD-432)
  *   /projects/:slug/milestones its milestones: progress, worst health
  *   /projects/:slug/context    its context
+ *   /projects/:slug/workflows  its stored workflows and new runs (CAD-496)
  *   /agents[/:alias]           agents, optionally one agent's drawer
  *   /setup                     first-run setup
  *   /settings[/memory]         model defaults, memory
@@ -23,7 +24,7 @@ import { readAppUrlState, type AppTab, type ProjectView } from "./urlState";
  * so routing is unit-tested in plain node (tests/router.test.ts).
  */
 
-export type ProjectSection = "issues" | "epics" | "milestones" | "context";
+export type ProjectSection = "issues" | "epics" | "milestones" | "context" | "workflows";
 export type SettingsSection = "models" | "memory";
 
 export type Route =
@@ -74,7 +75,7 @@ export function matchRoute(pathname: string): Route {
       if (!a) return { screen: "projects", slug: null, section: "issues" };
       const slug = segment(a);
       if (slug && !b) return { screen: "projects", slug, section: "issues" };
-      if (slug && (b === "context" || b === "epics" || b === "milestones")) {
+      if (slug && (b === "context" || b === "epics" || b === "milestones" || b === "workflows")) {
         return { screen: "projects", slug, section: b };
       }
     }

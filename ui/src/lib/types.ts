@@ -887,3 +887,50 @@ export interface ModelDefaultsSnapshot {
   roles: ModelRoleInfo[];
   read_only: boolean;
 }
+
+/** One declared `inputs:` entry in a workflow's frontmatter (CAD-496). */
+export interface WorkflowInput {
+  name: string;
+  ask?: string | null;
+  optional?: boolean;
+}
+
+/**
+ * `GET /api/projects/<key>/workflows` row — one stored workflow beside
+ * PROJECT.md. `approved` is `true`/`false`, or the string
+ * "unknown — daemon unreachable" when approvals cannot be read.
+ * `error` marks a file that never parsed (a symlink, broken template).
+ */
+export interface WorkflowRow {
+  project: string;
+  name: string;
+  title?: string | null;
+  goal?: string | null;
+  tickets?: number | null;
+  inputs?: WorkflowInput[] | null;
+  approved?: boolean | string | null;
+  digest?: string | null;
+  errors?: string[];
+  notes?: string[];
+  error?: string;
+}
+
+export interface WorkflowsPayload {
+  workflows: WorkflowRow[];
+}
+
+/**
+ * `GET /api/projects/<key>/workflows/<name>/preview` — what
+ * `plan propose --workflow` would render for the current inputs, or
+ * the refusal in `error` with its named `code` (the daemon's
+ * one_line / not_distinct / render_diverged).
+ */
+export interface WorkflowPreview {
+  project: string;
+  name: string;
+  rendered?: string | null;
+  error?: string;
+  code?: string | null;
+  approved?: boolean | string | null;
+  digest?: string | null;
+}

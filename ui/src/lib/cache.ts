@@ -313,6 +313,7 @@ export const RESOURCE_NAMES = [
   "agents",
   "overview",
   "issue",
+  "workflows",
 ] as const;
 export type ResourceName = (typeof RESOURCE_NAMES)[number];
 

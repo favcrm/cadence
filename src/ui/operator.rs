@@ -109,6 +109,14 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     ),
     route("POST", "/api/threads/*/messages", RouteClass::OperatorOnly),
     route("POST", "/api/epics/*/stage", RouteClass::OperatorOnly),
+    // CAD-496: the board relays `plan_propose` over its own daemon
+    // connection, so the daemon attributes the run to whoever that
+    // connection proves — operator-only, like `plan_approve`.
+    route(
+        "POST",
+        "/api/projects/*/workflows/*/propose",
+        RouteClass::OperatorOnly,
+    ),
     route("POST", "/api/memories/*/*/accept", RouteClass::Refused),
     route("POST", "/api/memories/*/*/reject", RouteClass::Refused),
     route("POST", "/api/session", RouteClass::Session),

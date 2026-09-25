@@ -45,6 +45,7 @@ mod operator;
 mod read_model;
 mod stages;
 mod threads;
+mod workflows;
 
 pub use operator::{route_class, RouteClass, WriteRoute, WRITE_ROUTES};
 
@@ -1827,6 +1828,17 @@ fn write_route(
         send(request, resp);
         return;
     }
+    // A workflow run (CAD-496) — relayed to the daemon's
+    // `plan_propose`, operator-only on the board (see `workflows`).
+    if let Some((key, name)) = workflows::propose_route(path) {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let resp = workflows::propose(&mut request, state_dir, key, name);
+        send(request, resp);
+        return;
+    }
     if let Some(id) = home::answer_route(path) {
         if *method != Method::Post {
             send(request, err_response(405, "method not allowed"));
@@ -2192,11 +2204,18 @@ fn value_fp(value: &Value) -> u64 {
 /// - monitors → the overview's monitoring block only.
 fn event_resources(name: &str) -> &'static [&'static str] {
     match name {
-        "issues" => &["issues", "projects", "issue", "overview"],
+        "issues" => &["issues", "projects", "issue", "overview", "workflows"],
         "jobs" => &["issues", "agents", "issue", "overview"],
         "agents" => &["agents", "issue", "overview"],
         "monitoring" => &["overview"],
-        _ => &["issues", "projects", "agents", "issue", "overview"],
+        _ => &[
+            "issues",
+            "projects",
+            "agents",
+            "issue",
+            "overview",
+            "workflows",
+        ],
     }
 }
 
@@ -2626,6 +2645,15 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
                             Err(error) => send(request, err_response(503, &error.to_string())),
                         },
                         Err(error) => send(request, err_response(503, &error.to_string())),
+                    }
+                    return;
+                }
+                // `/api/projects/<key>/workflows[/<name>/preview]` — the
+                // project's workflow templates beside PROJECT.md (CAD-496).
+                if let Some(read) = workflows::read_route(&path) {
+                    match Pm::at(pm_dir) {
+                        Ok(pm) => send(request, workflows::read(&pm, state_dir, &query, read)),
+                        Err(e) => send(request, err_response(503, &e.to_string())),
                     }
                     return;
                 }
