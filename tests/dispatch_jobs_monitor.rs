@@ -3545,7 +3545,7 @@ fn automatic_monitor_dispatch_is_separate_guarded_and_restart_safe() {
         .unwrap();
     d.wait_agent("w1", "stopped", 10);
     let existing = d
-        .rpc(
+        .operator_rpc(
             "task_dispatch",
             json!({"task": "ajob-duplicate", "by": "operator"}),
         )
@@ -3565,7 +3565,7 @@ fn automatic_monitor_dispatch_is_separate_guarded_and_restart_safe() {
         .contains("separate manual dispatch permission"));
 
     let registered = d
-        .rpc(
+        .operator_rpc(
             "monitor_register",
             json!({"monitor": "auto", "project": project,
                    "owner": "operator", "tasks": ["ajob-blocked", "ajob-duplicate", "ajob-fresh"],
