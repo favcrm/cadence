@@ -5,7 +5,10 @@
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-TARGET=${1:-integration}
+# CAD-426: the monolithic `integration` binary is split into per-area
+# tests/*.rs binaries. TARGET is `all-targets` or a test binary name
+# (the tests/<name>.rs stem, e.g. `daemon`, `board`, `agents_pty`).
+TARGET=${1:-all-targets}
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/cadence-nextest-inventory.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT HUP INT TERM
 
@@ -17,16 +20,20 @@ die() {
 command -v jq >/dev/null 2>&1 || die "jq is required to parse nextest list JSON"
 
 case "$TARGET" in
-    integration)
-        CARGO_TARGET_ARGS="--test integration"
-        NEXTEST_TARGET_ARGS="--test integration"
-        ;;
     all-targets)
         CARGO_TARGET_ARGS="--all-targets"
         NEXTEST_TARGET_ARGS="--all-targets"
         ;;
+    integration)
+        die "the 'integration' binary was split into per-area tests/*.rs \
+binaries (CAD-426); use all-targets or a binary name such as 'daemon'"
+        ;;
+    *[!A-Za-z0-9_]*|"")
+        die "unsupported target '$TARGET' (use all-targets or a tests/*.rs stem)"
+        ;;
     *)
-        die "unsupported target '$TARGET' (use integration or all-targets)"
+        CARGO_TARGET_ARGS="--test $TARGET"
+        NEXTEST_TARGET_ARGS="--test $TARGET"
         ;;
 esac
 

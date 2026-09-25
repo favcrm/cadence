@@ -155,7 +155,7 @@ impl Daemon {
         .unwrap_or_else(|e| panic!("{method} {params}: {e}"))
     }
 
-    /// `TestDaemon::operator_rpc` in tests/integration.rs (CAD-291):
+    /// `TestDaemon::operator_rpc` in tests/common/mod.rs (CAD-291):
     /// `setsid -f` hands the call to a fresh session leader that waits
     /// until it has left this process's ancestry, `env_clear` leaves no
     /// `CADENCE_ALIAS`, and stdio is not a pane tty — the residual
@@ -200,7 +200,7 @@ impl Daemon {
     }
 }
 
-/// [`Daemon::operator_rpc`]'s caller, as in tests/integration.rs: it
+/// [`Daemon::operator_rpc`]'s caller, as in tests/common/mod.rs: it
 /// waits until it has left the test runner's ancestry, then sends one
 /// frame and lands the reply line atomically.
 const OPERATOR_RPC_PY: &str = r#"

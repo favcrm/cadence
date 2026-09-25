@@ -1,0 +1,1683 @@
+#!/usr/bin/env python3
+"""CAD-426: deterministic split of tests/integration.rs into per-area binaries.
+
+Reads tests/integration.rs and writes:
+
+  - tests/common/mod.rs   — the shared harness: every item used by more than
+                            one area plus all type/impl/mod declarations,
+                            promoted to `pub` so binaries see them through
+                            `use common::*`.
+  - tests/<area>.rs       — one test binary per area: its #[test] fns and any
+                            helper no other area references.
+  - tests/split-map.toml  — manifest mapping every test fn and helper to its
+                            binary (regenerated; do not hand-edit).
+
+Placement of a test is decided by, in order:
+
+  1. PINNED        — the reviewed cut carried forward from the original split
+                     (favcrm/cadence PR #267) plus explicit assignments for
+                     tests main added since;
+  2. PREFIX_RULES  — first matching regex on the test name;
+  3. SECTION_RULES — first matching regex on the `// ---- <section> ----`
+                     marker that introduces the test;
+  4. otherwise the test lands in tests/unplaced.rs and the script fails.
+
+Running it again on a newer main reproduces the same layout for every test
+it knows and files new ones by the rules. Run from the repo root:
+
+    scripts/split-integration-tests            # regenerate + remove source
+    scripts/split-integration-tests --check    # verify outputs are current
+
+Two assertions in the old file were baked to the binary name `integration`
+and are rewritten verbatim by TEXT_EDITS (see the comments there). The
+gitleaks allow-markers on the synthetic PEM fixtures travel the same way.
+"""
+
+import os
+import re
+import subprocess
+import sys
+from bisect import bisect_left
+
+SRC = "tests/integration.rs"
+COMMON = "tests/common/mod.rs"
+MANIFEST = "tests/split-map.toml"
+UNPLACED = "tests/unplaced.rs"
+
+# --------------------------------------------------------------------------
+# Area binaries, in emission order.
+# --------------------------------------------------------------------------
+
+AREAS = [
+    "daemon",
+    "agents_pty",
+    "pty_lifecycle",
+    "pty_interact",
+    "managed_claude_codex",
+    "threads",
+    "tracker_issue",
+    "plan_work",
+    "dispatch_jobs_monitor",
+    "audit_review",
+    "build_slot",
+    "delivery",
+    "reports_memory",
+    "board_ui",
+    "backup_rollout",
+    "monitor",
+]
+
+# --------------------------------------------------------------------------
+# Pinned placements. The seed below is the reviewed CAD-426 cut (PR #267),
+# followed by explicit assignments for tests main added since. A pinned test
+# ignores PREFIX_RULES and SECTION_RULES; a lane that wants a different home
+# for a test edits this table.
+# --------------------------------------------------------------------------
+
+# The reviewed PR #267 cut, used as the placement seed (generated from that
+# PR's own output; do not hand-edit — edit the PINNED.update table below).
+PINNED_DATA = {
+    "agent_addressable_by_native_id": "agents_pty",
+    "agent_bootstrap_retrofits_live_agent": "agents_pty",
+    "agent_capabilities_match_the_registry_table": "agents_pty",
+    "agent_dead_and_resumable_per_endpoint_kind": "agents_pty",
+    "agent_list_scopes_to_callers_group": "agents_pty",
+    "agent_remove_and_gc_caller_rule_per_caller_kind": "agents_pty",
+    "agent_remove_and_gc_sweep": "agents_pty",
+    "agent_remove_force_notifies_reply_to": "agents_pty",
+    "agent_remove_force_refuses_unknown_kickoff_and_rejoin_is_unfenced": "agents_pty",
+    "agent_remove_force_unassigns_open_tasks": "agents_pty",
+    "agent_remove_keeps_job_history": "agents_pty",
+    "agent_remove_refuses_non_terminal_task_and_cli_force_overrides": "agents_pty",
+    "agent_remove_refuses_queued_message_and_force_overrides": "agents_pty",
+    "agent_resume_waits_and_attaches_like_launch": "agents_pty",
+    "agent_set_caller_rule_per_caller_kind": "agents_pty",
+    "agent_set_opts_live_agent_into_auto_ready": "agents_pty",
+    "agent_set_rejects_non_allowlisted_params": "agents_pty",
+    "agents_md_opt_in_and_worktree_gitignore": "agents_pty",
+    "attach_listing_groups_workers_under_pm": "agents_pty",
+    "cadence_self_reports_running_token": "agents_pty",
+    "cli_claude_resume_without_tui_rejected": "agents_pty",
+    "cli_claude_tui_flag_launches_pty_endpoint": "agents_pty",
+    "cli_claude_tui_resume_passes_resume": "agents_pty",
+    "cli_cursor_launch_opens_pty_endpoint": "agents_pty",
+    "cli_cursor_permission_mode_validated": "agents_pty",
+    "cli_cursor_resume_passes_resume": "agents_pty",
+    "cli_devin_permission_mode_flag_and_bypass": "agents_pty",
+    "cli_doctor_smoke": "agents_pty",
+    "cli_inbox_drains_and_self_reports_backlog": "agents_pty",
+    "cli_join_claude_tui_briefs_prefixes": "agents_pty",
+    "cli_join_codex_sandbox_defaults_writable_and_flag_roundtrips": "agents_pty",
+    "cli_join_cursor_briefs_prefixes": "agents_pty",
+    "cli_join_refuses_different_provider_managed": "agents_pty",
+    "cli_join_refuses_different_provider_pty": "agents_pty",
+    "cli_join_same_provider_resumes_stopped_alias": "agents_pty",
+    "cli_launch_fails_closed_when_alias_lookup_errors": "agents_pty",
+    "cli_launch_refuses_endpoint_kind_change_claude": "agents_pty",
+    "cli_launch_refuses_endpoint_kind_change_devin": "agents_pty",
+    "cli_tui_flag_rejects_provider_without_pty": "agents_pty",
+    "failed_open_writes_nothing": "agents_pty",
+    "group_resume_orders_pm_first_and_skips_live": "agents_pty",
+    "group_resume_reports_unrecoverable_session_mismatch": "agents_pty",
+    "group_stop_tears_down_members_and_pm": "agents_pty",
+    "join_bootstrap_briefs_and_queues": "agents_pty",
+    "join_bootstrap_runs_on_fake_worker": "agents_pty",
+    "launch_leaves_cwd_repo_untouched": "agents_pty",
+    "message_result_sha_flag_on_pty_path": "agents_pty",
+    "message_send_ready_claims_then_sends": "agents_pty",
+    "pty_ack_then_result_and_duplicate_rules": "agents_pty",
+    "pty_auto_ready_self_claims_when_idle": "agents_pty",
+    "pty_auto_ready_waits_on_busy_pane_then_delivers": "agents_pty",
+    "pty_claim_is_single_use_and_expires": "agents_pty",
+    "pty_claude_busy_and_approval_gate_sends": "agents_pty",
+    "pty_claude_dim_prompt_suggestion_probes_idle": "agents_pty",
+    "pty_claude_forbidden_prefixes_reject_prewrite": "agents_pty",
+    "pty_claude_foreign_session_refuses_takeover": "agents_pty",
+    "pty_claude_launch_mints_session_and_proves_ownership": "agents_pty",
+    "pty_claude_resume_passes_resume_flag": "agents_pty",
+    "pty_claude_resume_timeout_keeps_session": "agents_pty",
+    "pty_claude_send_pastes_and_completes_via_report": "agents_pty",
+    "pty_cursor_allowlist_merged_into_cli_config": "agents_pty",
+    "pty_cursor_busy_and_approval_gate_sends": "agents_pty",
+    "pty_cursor_cleared_session_leaves_foreign_chat": "agents_pty",
+    "pty_cursor_forbidden_prefixes_reject_prewrite": "agents_pty",
+    "pty_cursor_foreign_argv_refuses_takeover": "agents_pty",
+    "pty_cursor_foreign_session_refuses_takeover": "agents_pty",
+    "pty_cursor_launch_mints_chat_and_proves_ownership": "agents_pty",
+    "pty_cursor_malformed_cli_config_refuses_launch": "agents_pty",
+    "pty_cursor_minted_session_persists_and_model_replays": "agents_pty",
+    "pty_cursor_proven_chat_deleted_mints_fresh": "agents_pty",
+    "pty_cursor_resume_passes_resume_flag": "agents_pty",
+    "pty_cursor_send_pastes_and_completes_via_report": "agents_pty",
+    "pty_cursor_unresumable_chat_clears_and_mints_fresh": "agents_pty",
+    "pty_forbidden_prefix_is_prewrite_and_keeps_claim": "agents_pty",
+    "pty_locked_session_refuses_takeover": "agents_pty",
+    "pty_nudge_needs_a_live_pane_and_dies_with_the_actor": "agents_pty",
+    "pty_nudge_steers_without_owning_a_turn": "agents_pty",
+    "pty_pane_env_exports_identity": "agents_pty",
+    "pty_pane_gets_default_options": "agents_pty",
+    "pty_paste_not_rendered_carries_screen_evidence": "agents_pty",
+    "pty_probe_busy_markers_survive_trailing_blank_rows": "agents_pty",
+    "pty_ready_claim_refuses_busy_pane_unless_forced": "agents_pty",
+    "pty_ready_claims_stack_fifo_with_claimer": "agents_pty",
+    "pty_render_check_is_differential_not_contains": "agents_pty",
+    "pty_rendered_but_not_submitted_is_not_running": "agents_pty",
+    "pty_report_refuses_stale_generation_and_managed_token": "agents_pty",
+    "pty_respond_rejected_and_mode_blocks_send": "agents_pty",
+    "pty_routed_notice_delivers_idle_without_claim": "agents_pty",
+    "pty_routed_notice_waits_on_busy_pane": "agents_pty",
+    "pty_routed_result_body_is_single_line": "agents_pty",
+    "pty_send_pastes_literal_and_completes_via_report": "agents_pty",
+    "pty_send_rejects_control_chars": "agents_pty",
+    "pty_silent_end_fires_once_and_recovers": "agents_pty",
+    "pty_stale_generation_report_rejected": "agents_pty",
+    "pty_stub_profile_busy_marker_blocks_paste": "agents_pty",
+    "pty_stub_profile_consumes_one_claim_per_send": "agents_pty",
+    "pty_stub_profile_drives_gate_and_render": "agents_pty",
+    "pty_unrendered_worker_result_requeues_then_parks": "agents_pty",
+    "pty_unreported_turn_holds_queue_and_bounds_to_unknown": "agents_pty",
+    "send_file_and_stdin_persist_full_bodies": "agents_pty",
+    "send_verb_matches_message_send": "agents_pty",
+    "standalone_launch_writes_briefing_only": "agents_pty",
+    "audit_approval_record_is_operator_only": "audit_review",
+    "audit_binds_human_merge_to_exact_head_approval": "audit_review",
+    "audit_digest_decides_identity_over_the_fleet_not_the_window": "audit_review",
+    "audit_digest_reports_shared_identity_once": "audit_review",
+    "audit_docs_state_exit_code_accepts_operator_claimed": "audit_review",
+    "audit_evidence_unavailable_is_unknown_not_flag": "audit_review",
+    "audit_filters_since_class_project_limit": "audit_review",
+    "audit_fixture_never_shells_gh": "audit_review",
+    "audit_flags_merge_with_no_verdict_on_head": "audit_review",
+    "audit_flags_reviewer_equals_merger": "audit_review",
+    "audit_gh_unavailable_is_unknown_not_flag": "audit_review",
+    "audit_json_shape_is_stable": "audit_review",
+    "audit_live_self_review_outside_qa_token_window_is_flagged": "audit_review",
+    "audit_live_structural_only_when_every_fetched_pr_is_in_hand": "audit_review",
+    "audit_post_hoc_verdict_does_not_clear_flag": "audit_review",
+    "audit_reconstructs_clean_merge": "audit_review",
+    "review_verb_base_prepare_failure_marks_inconclusive": "audit_review",
+    "review_verb_end_to_end": "audit_review",
+    "review_verb_gates_run_without_a_git_identity": "audit_review",
+    "review_verb_gates_with_the_base_config_when_the_pr_rewrites_it": "audit_review",
+    "review_verb_hints_a_not_assessed_overlap_across_a_rename": "audit_review",
+    "review_verb_ignores_base_drift_between_pr_cut_points": "audit_review",
+    "review_verb_lock_refuses_a_second_run": "audit_review",
+    "review_verb_merge_conflict_blocks": "audit_review",
+    "review_verb_refuses_to_adopt_an_existing_dir": "audit_review",
+    "review_verb_reports_a_rename_overlap": "audit_review",
+    "review_verb_resolves_its_own_refs_despite_a_concurrent_fetch": "audit_review",
+    "review_verb_suite_lock_serializes": "audit_review",
+    "review_verb_ui_typecheck_gate_catches_a_ui_type_error": "audit_review",
+    "auto_resume_after_restart_only_for_the_timers_stop": "backup_rollout",
+    "auto_stop_idle_agent_stops_with_event_label_and_resumes": "backup_rollout",
+    "auto_stop_keeps_pm_inbox_opted_out_and_busy_agents": "backup_rollout",
+    "auto_stop_keeps_pty_pane_with_attached_client_then_stops_it": "backup_rollout",
+    "auto_stop_pinned_off_in_test_daemons_and_reported": "backup_rollout",
+    "cad424_daemon_restart_refuses_over_restore_leftovers_before_shutdown": "backup_rollout",
+    "concurrent_daemon_starts_report_one_started_one_already_running": "backup_rollout",
+    "daemon_restart_keeps_pane_pid_and_reports_table": "backup_rollout",
+    "daemon_restart_reports_fenced_turn": "backup_rollout",
+    "daemon_restart_reports_kept_turn": "backup_rollout",
+    "daemon_restart_skips_fenced_and_relaunches_healthy": "backup_rollout",
+    "daemon_restart_when_idle_gates_and_proceeds": "backup_rollout",
+    "daemon_restart_without_a_lease_leaves_the_pid_unchanged": "backup_rollout",
+    "daemon_restarts_after_owner_exit": "backup_rollout",
+    "daemon_start_by_a_non_holder_does_not_migrate": "backup_rollout",
+    "daemon_start_drops_the_forwarded_rollout_identity": "backup_rollout",
+    "daemon_start_refuses_a_different_build_without_a_lease": "backup_rollout",
+    "daemon_start_refuses_a_lower_schema_without_rewriting_the_file": "backup_rollout",
+    "daemon_start_reports_started_for_its_child_and_already_running_after": "backup_rollout",
+    "daemon_start_whose_precheck_failed_leaves_only_the_live_daemon": "backup_rollout",
+    "daemon_stop_then_start_never_races_lock": "backup_rollout",
+    "direct_daemon_run_by_a_non_holder_keeps_the_hot_restart_marker": "backup_rollout",
+    "holder_migrates_through_daemon_start_without_a_test_override": "backup_rollout",
+    "restart_and_rollout_help_say_same_build_restart_is_lease_free": "backup_rollout",
+    "restart_when_idle_aborts_when_the_lease_is_released": "backup_rollout",
+    "auto_resume_failure_raises_needs_me_row_naming_the_message": "board_ui",
+    "cad432_board_stage_moves_are_operator_only_and_relayed": "board_ui",
+    "cad432_board_started_by_an_agent_cannot_relay_a_move": "board_ui",
+    "cad432_stage_move_refuses_a_detached_managed_child_under_daemon_run": "board_ui",
+    "overview_approval_row_for_brokered_request": "board_ui",
+    "overview_daemon_info_fenced_and_inbox_rows": "board_ui",
+    "overview_drift_reports_commits_after_build": "board_ui",
+    "overview_main_ci_red_and_unverified_from_actions_runs": "board_ui",
+    "overview_needs_me_audience_follows_owner_liveness": "board_ui",
+    "overview_scope_flags_filter_rows_and_reject_unknown_keys": "board_ui",
+    "overview_tracker_row_clock_is_the_status_change": "board_ui",
+    "status_footer_shows_slots": "board_ui",
+    "status_group_scopes_rows": "board_ui",
+    "status_rows_probe_once_and_footer": "board_ui",
+    "ui_write_caller_attributes_a_managed_endpoint_tool_process": "board_ui",
+    "ui_write_caller_keeps_the_operator_relay_with_a_managed_agent_live": "board_ui",
+    "build_slot_cli_acquire_release_status": "build_slot",
+    "build_slot_cli_wait_then_grant": "build_slot",
+    "build_slot_launch_detached_scrubbed_descendant_is_refused": "build_slot",
+    "build_slot_launch_in_flight_at_restart_is_unknown_never_relaunched": "build_slot",
+    "build_slot_launch_refuses_a_source_that_moved_while_queued": "build_slot",
+    "build_slot_launch_refuses_unknown_recipes_injection_and_unproven_callers": "build_slot",
+    "build_slot_launch_runner_tree_is_contained": "build_slot",
+    "build_slot_launch_runs_a_fixed_recipe_under_an_exec_bound_slot": "build_slot",
+    "build_slot_launch_times_out_in_the_queue_without_running": "build_slot",
+    "build_slot_run_binds_the_real_process": "build_slot",
+    "build_slot_run_exec_bound_hold_ends_with_the_command": "build_slot",
+    "slot_acquire_queues_until_release": "build_slot",
+    "slot_acquire_refuses_a_pid_off_the_caller_chain": "build_slot",
+    "slot_acquired_event_cannot_release_a_peers_hold": "build_slot",
+    "slot_dead_holder_is_reaped": "build_slot",
+    "slot_duplicate_request_id_different_pid_queues": "build_slot",
+    "slot_managed_endpoint_enrolls_and_admits_only_its_verified_processes": "build_slot",
+    "slot_managed_tool_cannot_bind_the_provider_root": "build_slot",
+    "slot_planted_pane_row_survives_restart": "build_slot",
+    "slot_pools_are_independent": "build_slot",
+    "slot_reconcile_refuses_a_managed_tools_setsid_detach": "build_slot",
+    "slot_reconcile_refuses_agents_and_live_holds": "build_slot",
+    "slot_reconcile_refuses_detached_agent_processes": "build_slot",
+    "slot_release_foreign_caller_is_rejected": "build_slot",
+    "slot_restart_revalidates_holders": "build_slot",
+    "slot_revoked_managed_endpoint_never_falls_back_to_an_outer_pane": "build_slot",
+    "slot_rpc_refuses_an_underivable_caller": "build_slot",
+    "slot_starve_promotes_long_waiter": "build_slot",
+    "slot_status_reveals_tokens_only_to_the_owner": "build_slot",
+    "subreaper_managed_endpoint_starts_and_stops_cleanly": "build_slot",
+    "subreaper_reaps_orphans_while_owners_keep_their_exit_statuses": "build_slot",
+    "agent_gc_timer_configured_removes_old_row_with_event": "daemon",
+    "agent_gc_timer_unconfigured_never_removes": "daemon",
+    "agent_register_caller_rule": "daemon",
+    "agent_respond_refuses_the_requester_and_its_peers": "daemon",
+    "agent_show_reports_missing_briefing": "daemon",
+    "agent_unfence_reconciles_all_then_resume_works": "daemon",
+    "approval_lifecycle": "daemon",
+    "cad384_agent_cannot_claim_the_lease_as_the_operator": "daemon",
+    "cad384_agent_verbs_one_caller_rule": "daemon",
+    "cad384_job_verbs_attribute_the_caller": "daemon",
+    "cad384_no_sandbox_exemption_outside_a_sandbox": "daemon",
+    "cad384_operator_attributed_sends_need_proof": "daemon",
+    "cad384_operator_daemon_stop_from_a_plain_shell": "daemon",
+    "cad384_shutdown_needs_the_operator_or_a_granted_rollout_holder": "daemon",
+    "concurrent_resume_has_single_winner": "daemon",
+    "devin_permission_mode_persisted_and_replayed": "daemon",
+    "devin_permission_mode_validated_at_register_and_not_settable": "daemon",
+    "devin_worktree_isolates_checkout": "daemon",
+    "events_default_page_is_newest_with_continue_cursor": "daemon",
+    "events_follow_starts_at_tail": "daemon",
+    "fenced_agent_resume_hint": "daemon",
+    "fifo_queue_and_idempotent_send": "daemon",
+    "inbox_collects_direct_send_with_reply_to": "daemon",
+    "inbox_drains_messages_once": "daemon",
+    "inbox_group_root_collects_worker_results": "daemon",
+    "inbox_lifecycle_guards": "daemon",
+    "inbox_read_receipt_keeps_history_without_waking_reviewer": "daemon",
+    "inbox_registers_as_durable_mailbox": "daemon",
+    "inbox_wait_blocks_until_arrival": "daemon",
+    "inbox_without_consumer_warns_on_send_and_route": "daemon",
+    "instructions_file_lands_in_briefing": "daemon",
+    "instructions_file_with_no_bootstrap_refused_except_codex": "daemon",
+    "message_cancel_gate_pty_and_running_refusal": "daemon",
+    "message_cancel_queued_lifecycle": "daemon",
+    "message_cancel_races_claim_atomically": "daemon",
+    "message_cancel_task_bound_refused": "daemon",
+    "nextest_requires_external_suite_lock_without_nested_flock": "daemon",
+    "operator_rpc_from_an_agent_runner_probe": "daemon",
+    "operator_rpc_is_the_operator_even_from_an_agent_runner": "daemon",
+    "operator_verbs_refuse_agents_whatever_they_claim": "daemon",
+    "reconcile_completed_routes_result_interrupted_routes_notice": "daemon",
+    "reconcile_interrupted_clears_fence_and_preserves_history": "daemon",
+    "reconcile_rejects_non_unknown_and_repeats": "daemon",
+    "reregistered_pm_alias_inherits_no_authority": "daemon",
+    "restart_fences_task_kickoff_and_job_show_reports_drift": "daemon",
+    "restart_fences_unknown_inflight": "daemon",
+    "restart_keeps_original_unknown_reason_beside_later_inflight": "daemon",
+    "restart_preserves_attention_fence_without_unknowns": "daemon",
+    "result_routing_wakes_pm": "daemon",
+    "resume_all_and_daemon_start_resume_sweep": "daemon",
+    "resume_all_lists_fenced_without_attempting": "daemon",
+    "resume_error_hints": "daemon",
+    "resume_rejected_while_actor_stopping": "daemon",
+    "second_daemon_fails_without_touching_state": "daemon",
+    "stop_and_resume": "daemon",
+    "stop_during_approval_is_bounded": "daemon",
+    "turn_tokens_are_shown_only_to_the_owning_connection": "daemon",
+    "turn_tokens_are_withheld_on_every_read_path": "daemon",
+    "turns_are_serialized_per_agent": "daemon",
+    "unclassifiable_completion_fences_agent": "daemon",
+    "unfence_resume_non_pty_reports_no_pane": "daemon",
+    "unfenced_agent_stays_stopped_across_restart": "daemon",
+    "unknown_outcome_never_replays": "daemon",
+    "upstream_param_defaults_reply_to": "daemon",
+    "cad446_board_syncs_delivery_without_a_terminal": "delivery",
+    "confine_denies_everything_unlisted": "delivery",
+    "delivery_agent_cannot_mark_ticket_done": "delivery",
+    "delivery_failed_done_write_is_retried_and_leaves_nothing_staged": "delivery",
+    "delivery_loop_escalates_after_two_revise_rounds": "delivery",
+    "delivery_loop_refuses_foreign_and_held_prs_and_a_corrupt_record": "delivery",
+    "delivery_loop_review_revise_pass_merge_end_to_end": "delivery",
+    "delivery_merged_marks_ticket_done_once": "delivery",
+    "delivery_unreviewed_or_unmerged_never_marks_ticket_done": "delivery",
+    "master_agent_files_have_one_writer": "delivery",
+    "master_dispatch_races_dispatch_a_ticket_once": "delivery",
+    "master_end_to_end_chat_plan_approve_dispatch_report": "delivery",
+    "master_escalation_reaches_the_operator_needs_you": "delivery",
+    "master_limits_are_enforced_by_the_daemon": "delivery",
+    "master_reads_nothing_outside_its_views": "delivery",
+    "master_start_copies_no_login_by_default": "delivery",
+    "master_start_defaults_to_the_first_accepted_provider": "delivery",
+    "master_verbs_survive_an_upgrade_mid_run": "delivery",
+    "master_wake_waits_queued_while_the_master_is_stopped": "delivery",
+    "master_wakes_on_plan_approval_and_blocker_done_two_tickets_in_sequence": "delivery",
+    "master_wakes_once_when_a_delivery_is_merged_or_declined": "delivery",
+    "master_without_landlock_starts_only_on_the_operators_opt_in": "delivery",
+    "merged_delivery_marks_done_and_wakes_the_dependent_once": "delivery",
+    "automatic_monitor_dispatch_is_separate_guarded_and_restart_safe": "dispatch_jobs_monitor",
+    "automatic_monitor_dispatch_serializes_competing_callers": "dispatch_jobs_monitor",
+    "dispatch_checks_pty_lane_cwd_against_project_repos": "dispatch_jobs_monitor",
+    "dispatch_dedupes_live_kickoff_and_reassign_bumps": "dispatch_jobs_monitor",
+    "dispatch_job_precheck_measures_the_issues_existing_lane": "dispatch_jobs_monitor",
+    "dispatch_kickoff_and_finish_guards": "dispatch_jobs_monitor",
+    "dispatch_records_ref_before_send": "dispatch_jobs_monitor",
+    "dispatch_refuses_criteria_past_the_pty_ceiling": "dispatch_jobs_monitor",
+    "dispatch_warns_on_empty_acceptance": "dispatch_jobs_monitor",
+    "finish_guard_per_worktree": "dispatch_jobs_monitor",
+    "finish_holds_unreconciled_unknown": "dispatch_jobs_monitor",
+    "finish_merged_sweep": "dispatch_jobs_monitor",
+    "job_cancel_semantics": "dispatch_jobs_monitor",
+    "job_event_parks_on_unrendered_pty_pm": "dispatch_jobs_monitor",
+    "job_inbox_pm_receives_notifications": "dispatch_jobs_monitor",
+    "job_kickoff_stall_flags_task_and_notifies_pm": "dispatch_jobs_monitor",
+    "job_new_creates_default_task_and_validates_issue": "dispatch_jobs_monitor",
+    "job_seeded_bug_loop_end_to_end": "dispatch_jobs_monitor",
+    "job_verdict_status_bridge_failures_keep_the_verdict": "dispatch_jobs_monitor",
+    "job_verdict_status_bridge_posts_qa_verdict": "dispatch_jobs_monitor",
+    "job_verdict_unscoped_task_is_unchanged": "dispatch_jobs_monitor",
+    "job_verdict_worktree_verify_binds_and_records": "dispatch_jobs_monitor",
+    "job_verdict_worktree_verify_rejects_each_check": "dispatch_jobs_monitor",
+    "job_verdict_worktree_verify_skips_and_opt_out": "dispatch_jobs_monitor",
+    "max_revisions_escalates_to_blocked_once": "dispatch_jobs_monitor",
+    "monitor_alerts_task_unknown_outcome_is_scoped_and_restart_safe": "dispatch_jobs_monitor",
+    "monitor_check_failure_is_degraded_without_healthy_claim": "dispatch_jobs_monitor",
+    "monitor_dispatch_requires_explicit_safe_eligibility": "dispatch_jobs_monitor",
+    "monitor_migration_after_provider_effort_v7_is_v8_v9_and_v10": "dispatch_jobs_monitor",
+    "monitor_migration_from_v6_bridges_provider_effort_before_v8_v9_and_v10": "dispatch_jobs_monitor",
+    "monitor_migration_from_v8_defaults_auto_dispatch_off": "dispatch_jobs_monitor",
+    "monitor_migration_repairs_legacy_pr100_schema9_without_quota": "dispatch_jobs_monitor",
+    "monitor_persists_coverage_heartbeats_and_deduplicates_alerts": "dispatch_jobs_monitor",
+    "task_attached_send_and_self": "dispatch_jobs_monitor",
+    "task_reopen_is_the_operator_or_the_jobs_pm": "dispatch_jobs_monitor",
+    "verdict_rejects_every_bad_shape": "dispatch_jobs_monitor",
+    "verdict_rejects_null_sha_until_repaired": "dispatch_jobs_monitor",
+    "verdict_reviewer_is_the_verified_caller": "dispatch_jobs_monitor",
+    "brokered_request_handles_belong_to_their_agent": "managed_claude_codex",
+    "claude_brokered_flag_validation": "managed_claude_codex",
+    "claude_brokered_params_replayed_on_resume": "managed_claude_codex",
+    "claude_brokered_permission_accept": "managed_claude_codex",
+    "claude_brokered_permission_daemon_restart_denies": "managed_claude_codex",
+    "claude_brokered_permission_decline_with_reason": "managed_claude_codex",
+    "claude_brokered_permission_timeout_denies": "managed_claude_codex",
+    "claude_death_mid_turn_unknown_then_unfence_resume": "managed_claude_codex",
+    "claude_denials_complete_with_event": "managed_claude_codex",
+    "claude_effort_next_launch_and_model_reported": "managed_claude_codex",
+    "claude_effort_validated": "managed_claude_codex",
+    "claude_env_injected_and_scrubbed": "managed_claude_codex",
+    "claude_failed_result_fails_message": "managed_claude_codex",
+    "claude_idle_window_counts_activity": "managed_claude_codex",
+    "claude_interrupt_yields_interrupted": "managed_claude_codex",
+    "claude_managed_ack_keeps_running_until_the_turn_result": "managed_claude_codex",
+    "claude_managed_report_refuses_stale_generation_and_pty_token": "managed_claude_codex",
+    "claude_max_turn_fences_chatty": "managed_claude_codex",
+    "claude_params_replayed_on_resume": "managed_claude_codex",
+    "claude_replay_failed_fixture": "managed_claude_codex",
+    "claude_replay_fixture_turn": "managed_claude_codex",
+    "claude_respond_is_rejected_naming_opt_ups": "managed_claude_codex",
+    "claude_result_routes_to_pty_pm": "managed_claude_codex",
+    "claude_session_mismatch_fences_attention": "managed_claude_codex",
+    "claude_silent_turn_fences_unknown": "managed_claude_codex",
+    "claude_tool_use_events_recorded": "managed_claude_codex",
+    "claude_turn_completes_and_routes_to_inbox_pm": "managed_claude_codex",
+    "codex_approval_policy_defaults_to_never_and_replays_on_resume": "managed_claude_codex",
+    "codex_approval_policy_reaches_thread_start_verbatim": "managed_claude_codex",
+    "codex_approval_policy_rejected_at_open": "managed_claude_codex",
+    "codex_approval_policy_rejected_at_register_and_next_launch": "managed_claude_codex",
+    "codex_cli_approval_policy_flag_roundtrips_through_resume": "managed_claude_codex",
+    "codex_idle_window_counts_activity": "managed_claude_codex",
+    "codex_model_availability_unknown_is_visible": "managed_claude_codex",
+    "codex_model_effort_are_validated_reported_and_replayed_on_resume": "managed_claude_codex",
+    "codex_model_effort_pair_rejection_is_visible": "managed_claude_codex",
+    "codex_quota_endpoint_failure_is_explicit_unknown": "managed_claude_codex",
+    "codex_quota_is_provider_bound_and_sparse_updates_handle_nullable_fields": "managed_claude_codex",
+    "codex_quota_recovers_from_unavailable_to_available": "managed_claude_codex",
+    "codex_sandbox_rejected_at_open": "managed_claude_codex",
+    "codex_sandbox_values_reach_thread_start_and_are_reported": "managed_claude_codex",
+    "codex_silent_turn_fences_after_idle_window": "managed_claude_codex",
+    "codex_ws_model_effort_are_replayed_and_reported": "managed_claude_codex",
+    "concurrent_stops_are_idempotent": "managed_claude_codex",
+    "malformed_init_leaves_no_provider_process": "managed_claude_codex",
+    "malformed_turn_start_is_unknown_not_failed": "managed_claude_codex",
+    "model_defaults_register_resume_and_mock_argv": "managed_claude_codex",
+    "model_defaults_set_is_operator_only": "managed_claude_codex",
+    "report_refused_on_endpoint_kinds_without_a_token_scheme": "managed_claude_codex",
+    "stop_during_initialization_is_bounded": "managed_claude_codex",
+    "stop_is_bounded_when_interrupt_is_ignored": "managed_claude_codex",
+    "stop_on_fenced_agent_preserves_attention": "managed_claude_codex",
+    "transport_eof_fences_turn_quickly": "managed_claude_codex",
+    "ws_approval_is_brokered": "managed_claude_codex",
+    "ws_close_frame_disconnect_fences_unknown": "managed_claude_codex",
+    "ws_concurrent_respond_has_single_winner": "managed_claude_codex",
+    "ws_control_frames_share_the_write_path": "managed_claude_codex",
+    "ws_disconnect_fences_turn_unknown": "managed_claude_codex",
+    "ws_drip_handshake_is_bounded": "managed_claude_codex",
+    "ws_external_approval_resolution_drops_pending": "managed_claude_codex",
+    "ws_fragmented_message_with_interleaved_ping": "managed_claude_codex",
+    "ws_handshake_stall_is_bounded_and_cleans_child": "managed_claude_codex",
+    "ws_refused_upgrade_is_bounded": "managed_claude_codex",
+    "ws_restart_resumes_thread_with_fresh_endpoint": "managed_claude_codex",
+    "ws_second_pending_request_keeps_waiting": "managed_claude_codex",
+    "ws_stop_during_handshake_is_bounded": "managed_claude_codex",
+    "ws_stop_during_init_is_bounded": "managed_claude_codex",
+    "ws_stop_is_bounded_when_silent": "managed_claude_codex",
+    "ws_turn_roundtrip_exposes_endpoint": "managed_claude_codex",
+    "cad324_compaction_pack_survives_a_daemon_restart": "plan_work",
+    "cad324_continuity_packs_on_new_compacted_and_lost_sessions": "plan_work",
+    "plan_claim_refused_on_unapproved_ticket": "plan_work",
+    "plan_decisions_are_operator_only": "plan_work",
+    "plan_gate_fails_closed_on_unreadable_or_rewritten_epic": "plan_work",
+    "plan_gate_refuses_job_dispatch_until_approved": "plan_work",
+    "plan_membership_is_the_list_not_the_link": "plan_work",
+    "plan_propose_approve_gate_and_progress": "plan_work",
+    "plan_propose_caps_size": "plan_work",
+    "project_new_by_the_master": "plan_work",
+    "project_new_registers_seeds_and_is_operator_only": "plan_work",
+    "work_model_project_md_and_milestones": "plan_work",
+    "work_model_stage_moves_are_gated_and_committed": "plan_work",
+    "work_model_status_derived_stage_needs_operator_for_gates": "plan_work",
+    "work_model_unapproved_gate_edits_fall_back_to_defaults": "plan_work",
+    "fake_silent_turn_stalls_and_brokered_wait_does_not": "pty_interact",
+    "nudge_refused_off_pty_and_with_ready": "pty_interact",
+    "pty_answer_derives_caller_from_peer_pid": "pty_interact",
+    "pty_answer_full_detach_stamps_unknown": "pty_interact",
+    "pty_answer_refuses_without_a_menu": "pty_interact",
+    "pty_answer_setsid_cannot_launder_self_approval": "pty_interact",
+    "pty_approval_menu_blocks_pastes_and_answers": "pty_interact",
+    "pty_claude_quoted_menu_above_input_box_is_inert": "pty_interact",
+    "pty_devin_quoted_menu_above_input_box_is_inert": "pty_interact",
+    "pty_gate_probe_failure_is_a_gate_refusal": "pty_interact",
+    "pty_idle_pane_menu_surfaces": "pty_interact",
+    "pty_menu_event_refires_after_close": "pty_interact",
+    "pty_queued_menu_surfaces_and_answers": "pty_interact",
+    "pty_routed_notice_waits_on_approval_menu": "pty_interact",
+    "pty_stall_resume_rearms_and_spinner_is_not_activity": "pty_interact",
+    "pty_stall_sampling_runs_while_the_pane_lives": "pty_interact",
+    "pty_stall_static_screen_fires_once_and_notices": "pty_interact",
+    "pty_stall_transient_sample_neither_resumes_nor_resets": "pty_interact",
+    "pty_urgent_waits_for_the_held_turn_then_goes_first": "pty_interact",
+    "recover_submit_caller_rule_per_caller_kind": "pty_interact",
+    "recover_submit_concurrent_operator_and_pm_send_one_enter": "pty_interact",
+    "recover_submit_devin_lost_submit": "pty_interact",
+    "recover_submit_refuses_ambiguous_wrap": "pty_interact",
+    "recover_submit_refuses_busy_pane": "pty_interact",
+    "recover_submit_refuses_edited_draft": "pty_interact",
+    "recover_submit_refuses_empty_input": "pty_interact",
+    "recover_submit_refuses_non_pty_endpoint": "pty_interact",
+    "recover_submit_refuses_open_approval_menu": "pty_interact",
+    "recover_submit_refuses_other_message_pending": "pty_interact",
+    "recover_submit_refuses_pane_in_tmux_mode": "pty_interact",
+    "recover_submit_refuses_stale_generation": "pty_interact",
+    "recover_submit_reports_unconfirmed_when_the_enter_is_dropped": "pty_interact",
+    "recover_submit_restarts_the_report_clock": "pty_interact",
+    "recover_submit_sends_nothing_when_the_record_cannot_be_written": "pty_interact",
+    "recover_submit_sends_one_enter_and_keeps_correlation": "pty_interact",
+    "stall_secs_zero_disables_and_live_set_rearms": "pty_interact",
+    "steering_send_caller_rule_per_route": "pty_interact",
+    "urgent_waits_for_the_open_approval_then_goes_first": "pty_interact",
+    "cad385_hot_restart_rerecords_pane_start_and_the_pane_keeps_its_identity": "pty_lifecycle",
+    "hot_restart_managed_turn_stays_unknown": "pty_lifecycle",
+    "pty_claude_session_mismatch_fences_closed": "pty_lifecycle",
+    "pty_cursor_restart_readopts_pane": "pty_lifecycle",
+    "pty_cursor_session_mismatch_fences_closed": "pty_lifecycle",
+    "pty_dead_pane_fences_submitted_and_stops_actor": "pty_lifecycle",
+    "pty_deleted_cwd_refuses_delivery_and_is_surfaced": "pty_lifecycle",
+    "pty_fence_detaches_pane_for_resume": "pty_lifecycle",
+    "pty_hot_restart_adopts_multiple_running_turns": "pty_lifecycle",
+    "pty_hot_restart_adopts_running_turn": "pty_lifecycle",
+    "pty_hot_restart_dead_pane_fences": "pty_lifecycle",
+    "pty_hot_restart_divergent_marker_entries_fence": "pty_lifecycle",
+    "pty_hot_restart_expired_marker_fences": "pty_lifecycle",
+    "pty_hot_restart_fenced_agent_resume_opens_fresh": "pty_lifecycle",
+    "pty_hot_restart_native_mismatch_fences": "pty_lifecycle",
+    "pty_hot_restart_no_marker_fences": "pty_lifecycle",
+    "pty_hot_restart_render_during_stop_adopts": "pty_lifecycle",
+    "pty_hot_restart_report_before_adoption_rejected_stale": "pty_lifecycle",
+    "pty_hot_restart_retires_stale_awaiting_report_rows": "pty_lifecycle",
+    "pty_hot_restart_stale_instance_fences": "pty_lifecycle",
+    "pty_hot_restart_submitting_never_records_running": "pty_lifecycle",
+    "pty_hot_restart_token_predates_generation_fences": "pty_lifecycle",
+    "pty_nudge_queued_at_restart_is_cancelled_not_replayed": "pty_lifecycle",
+    "pty_reattach_waits_for_session_proof": "pty_lifecycle",
+    "pty_restart_fence_unfence_resume_readopts_pane": "pty_lifecycle",
+    "pty_restart_reattaches_same_native_session": "pty_lifecycle",
+    "pty_shutdown_facts_before_detach_rpc": "pty_lifecycle",
+    "pty_shutdown_facts_before_detach_signal": "pty_lifecycle",
+    "pty_shutdown_facts_before_detach_signal_child": "pty_lifecycle",
+    "pty_shutdown_facts_before_detach_unprovable": "pty_lifecycle",
+    "pty_shutdown_straggler_detaches_pane": "pty_lifecycle",
+    "pty_stop_kills_only_owned_session": "pty_lifecycle",
+    "pty_stop_reaps_pane_session_tree": "pty_lifecycle",
+    "pty_stop_remove_gc_kill_surviving_panes": "pty_lifecycle",
+    "pty_stop_without_pane_root_records_unowned_tree": "pty_lifecycle",
+    "pty_unfence_resume_busy_adopted_pane_stays_gated": "pty_lifecycle",
+    "pty_unfence_resume_reports_adopted_pane": "pty_lifecycle",
+    "pty_unfence_resume_reports_respawned_pane": "pty_lifecycle",
+    "pty_unrendered_task_fences_unknown": "pty_lifecycle",
+    "test_suite_never_signals_the_shared_process": "pty_lifecycle",
+    "body_flags_match_on_send_and_comment": "reports_memory",
+    "dispatch_degrades_on_memory_failures": "reports_memory",
+    "dispatch_injects_project_memory_lessons": "reports_memory",
+    "long_reconcile_note_survives_store_and_route": "reports_memory",
+    "long_report_text_survives_pty_report_to_inbox": "reports_memory",
+    "long_result_bounded_only_for_pty_paste": "reports_memory",
+    "long_result_text_survives_store_and_inbox_route": "reports_memory",
+    "memory_managed_endpoints_authenticate_through_daemon_enrollment": "reports_memory",
+    "memory_managed_identity_survives_ttl_and_refuses_ambiguity": "reports_memory",
+    "memory_match_explicit_axes_stay_in_current_project": "reports_memory",
+    "memory_native_socket_identity_requires_distinct_reviewers": "reports_memory",
+    "report_caps_body_and_title": "reports_memory",
+    "report_comment_redacts_boundary_secret_forms": "reports_memory",
+    "report_ignores_project_tag_allowlist": "reports_memory",
+    "report_issue_attaches_comment": "reports_memory",
+    "report_issue_conflicts_and_show_scope": "reports_memory",
+    "report_kind_survives_extra_tags": "reports_memory",
+    "report_ls_uses_derived_status": "reports_memory",
+    "report_needs_me_caps_intake_rows": "reports_memory",
+    "report_needs_me_row_and_ls_filters": "reports_memory",
+    "report_notifies_pm_inbox": "reports_memory",
+    "report_preserves_multiline_body": "reports_memory",
+    "report_redacts_credential_shapes": "reports_memory",
+    "report_redacts_prose_secret_forms": "reports_memory",
+    "report_routes_by_kind_and_defaults": "reports_memory",
+    "report_strips_control_chars": "reports_memory",
+    "secret_scan_exit_codes_and_redaction": "reports_memory",
+    "send_email_flags_print_real_usage": "reports_memory",
+    "task_report_answer_closes_a_question": "reports_memory",
+    "task_report_attaches_to_message_result": "reports_memory",
+    "task_report_author_is_the_caller": "reports_memory",
+    "task_report_file_stores_and_show_lists": "reports_memory",
+    "task_report_lint_validates_files": "reports_memory",
+    "task_report_refuses_malformed_and_secrets": "reports_memory",
+    "task_report_refuses_symlinked_reports_dir": "reports_memory",
+    "cad319_refused_thread_send_leaves_no_thread": "threads",
+    "cad319_thread_http_routes_guards_and_sse_resume": "threads",
+    "cad319_thread_post_is_refused_for_an_agent_caller": "threads",
+    "cad319_thread_records_codex_agent_messages": "threads",
+    "cad319_thread_records_managed_claude_tool_use_and_result": "threads",
+    "cad319_thread_records_operator_messages_and_turn_results": "threads",
+    "cad319_thread_redacts_secrets_in_claude_tool_input": "threads",
+    "cad320_claude_held_text_lands_before_an_unknown_turn_result": "threads",
+    "cad320_codex_final_and_unphased_items_are_stored_once": "threads",
+    "cad320_codex_items_survive_an_unknown_turn": "threads",
+    "cad320_thread_records_claude_text_and_tool_results_redacted": "threads",
+    "cad323_claude_interrupt_mid_text": "threads",
+    "cad323_claude_interrupt_mid_tool_reconciles_a_kickoff": "threads",
+    "cad323_claude_interrupt_never_lands_on_the_next_turn": "threads",
+    "cad323_codex_interrupt_mid_text": "threads",
+    "cad323_codex_interrupt_mid_tool_records_partial_result": "threads",
+    "cad323_codex_interrupt_never_lands_on_the_next_turn": "threads",
+    "cad323_interrupt_caller_rule_per_caller_kind": "threads",
+    "cad323_master_duplicate_dispatch_grants_no_interrupt": "threads",
+    "cad323_master_interrupts_only_a_turn_it_dispatched": "threads",
+    "cad323_pty_claude_interrupt_sends_escape_and_settles": "threads",
+    "cad323_pty_interrupt_never_lands_on_the_next_turn": "threads",
+    "cad323_refused_interrupt_is_recorded": "threads",
+    "cad328_answer_endpoint_files_an_operator_answer": "threads",
+    "cad328_operator_writes_refuse_a_detached_managed_child_under_daemon_run": "threads",
+    "cad328_plan_endpoints_guards_agents_and_decisions": "threads",
+    "cad328_thread_reads_tail_and_before": "threads",
+    "cad410_thread_redacts_a_truncated_private_key_in_claude_tool_input": "threads",
+    "cad447_an_answer_reaches_the_worker_who_asked": "threads",
+    "cad447_master_agent_and_pty_answers": "threads",
+    "cad447_refused_and_forged_answers_send_nothing": "threads",
+    "daemon_run_refreshes_skill_on_start": "tracker_issue",
+    "doctor_host_json_reports_all_checks": "tracker_issue",
+    "doctor_host_shared_target_and_reclaim_plan": "tracker_issue",
+    "issue_comment_and_report_refuse_credential_shaped_text": "tracker_issue",
+    "issue_finish_keeps_shared_cargo_target": "tracker_issue",
+    "issue_ls_survives_a_closed_downstream_pipe": "tracker_issue",
+    "issue_start_honours_cargo_target_dir_env": "tracker_issue",
+    "issue_start_job_opens_scoped_task": "tracker_issue",
+    "issue_start_links_shared_cargo_deps": "tracker_issue",
+    "issue_start_never_touches_tracked_cargo_config": "tracker_issue",
+    "issue_start_per_worktree_and_invalid_target_dir": "tracker_issue",
+    "issue_start_writes_slot_env": "tracker_issue",
+    "lanes_share_deps_but_not_the_uplifted_binary": "tracker_issue",
+    "reclaim_plan_command_keeps_lanes_buildable": "tracker_issue",
+    "session_end_dry_run_plans_real_run_stops_only_idle": "tracker_issue",
+    "session_end_host_fail_caps_at_warn": "tracker_issue",
+    "session_end_orphans_report_exe_and_argc_never_argv": "tracker_issue",
+    "session_end_project_scopes_sweep": "tracker_issue",
+    "session_end_stop_race_rechecks_show": "tracker_issue",
+    "session_host_report_flag_labels_errors_and_env_is_dead": "tracker_issue",
+    "session_json_single_document_and_project_validation": "tracker_issue",
+    "session_start_ack_downgrades_until_expiry": "tracker_issue",
+    "session_start_reports_failures_and_fix_only_starts_ui": "tracker_issue",
+    "session_start_scopes_to_cwd_project": "tracker_issue",
+    "skill_install_links_and_is_idempotent": "tracker_issue",
+    "skill_install_never_clobbers_real_entries": "tracker_issue",
+    "skill_install_overwrites_stale_content": "tracker_issue",
+}
+
+PINNED = dict(PINNED_DATA)
+
+PINNED.update({
+    # CAD-437 list-filter grammar
+    "agent_list_cad437_filters": "daemon",
+    "job_list_cad437_filters": "dispatch_jobs_monitor",
+    "delivery_list_cad437_filters": "delivery",
+    "report_ls_cad437_grammar": "reports_memory",
+    "plan_ls_cad437_grammar": "plan_work",
+    # CAD-480 inbox peek/ack + follow-exec
+    "inbox_peek_loses_nothing_without_ack": "daemon",
+    "inbox_ack_advances_the_reader_cursor": "daemon",
+    "inbox_ack_clamps_past_the_tail_and_reset_restores": "daemon",
+    "inbox_ack_is_idempotent_for_concurrent_readers": "daemon",
+    "inbox_ack_refuses_another_agents_inbox": "daemon",
+    "inbox_drain_refuses_a_foreign_agent": "daemon",
+    "inbox_rejects_bad_reader_names": "daemon",
+    "inbox_register_refuses_the_reserved_ack_alias": "daemon",
+    "inbox_ack_rejects_identity_fields": "daemon",
+    "cli_inbox_peek_ack_and_self_reports_unread": "daemon",
+    "inbox_follow_exec_acks_each_message_once": "daemon",
+    "inbox_follow_exec_failure_retries_until_success": "daemon",
+    "inbox_follow_exec_timeout_kills_then_parks": "daemon",
+    "inbox_follow_exec_parks_a_poison_message": "daemon",
+    # CAD-102 follow-ups
+    "pty_silent_end_sends_one_report_reminder": "pty_interact",
+    "pty_silent_end_reminder_is_not_resent_after_restart": "pty_interact",
+    "daemon_reminder_id_and_source_cannot_be_forged": "daemon",
+    "send_lane_provenance_is_refused_for_every_caller": "daemon",
+    # dispatch fold
+    "dispatch_folds_bootstrap_and_suppresses_reported_duplicate": "dispatch_jobs_monitor",
+    # CAD-230 ask/handle
+    "an_answered_handle_cannot_be_squatted_before_its_wait": "daemon",
+    # CAD-390/428 board writes
+    "cad390_a_reused_managed_provider_pid_never_attributes_a_board_write": "board_ui",
+    "cad428_a_relay_never_carries_an_agents_approve_as_the_operator": "board_ui",
+    # CAD-487 workflows
+    "workflow_cli_crud_check_and_actor": "plan_work",
+    "workflow_propose_renders_and_gates": "plan_work",
+    "workflow_approve_is_operator_only": "plan_work",
+    "workflow_code_change_matches_handwritten_plan": "plan_work",
+    "workflow_inputs_cannot_inject_and_project_is_a_key": "plan_work",
+    "board_workflow_list_preview_and_propose": "board_ui",
+    "board_workflow_preview_names_render_refusals": "board_ui",
+    # CAD-378 code-area owners
+    "cad378_start_warns_on_overlap_owner_and_capacity": "plan_work",
+    "cad378_bad_areas_config_is_reported_not_fatal": "plan_work",
+    "cad378_area_ack_row_needs_the_owner": "plan_work",
+    "cad378_area_ack_row_re_raises_on_new_commits": "plan_work",
+    "cad378_lane_pm_binds_the_dispatch_record_not_frontmatter": "plan_work",
+    "cad378_warning_text_is_scrubbed": "plan_work",
+    "cad378_unbound_lane_row_raises_and_ack_refuses": "plan_work",
+    "cad378_probe_follows_the_record_not_the_live_ref": "plan_work",
+    "cad378_bound_lane_unreadable_recorded_dir_raises": "plan_work",
+    "cad378_dispatch_record_binds_the_kickoff_not_the_request": "plan_work",
+    "cad378_dispatch_record_other_agents_cannot_overwrite": "plan_work",
+    "cad378_dispatch_record_forged_refs_and_body_bind_nothing": "plan_work",
+    # Resplit adjustment: the dispatch binary would exceed ~6k lines on
+    # current main, so the monitor_* tests move to their own `monitor`
+    # binary (in #267 they lived inside dispatch_jobs_monitor).
+    "monitor_migration_from_v6_bridges_provider_effort_before_v8_v9_and_v10": "monitor",
+    "monitor_migration_after_provider_effort_v7_is_v8_v9_and_v10": "monitor",
+    "monitor_migration_from_v8_defaults_auto_dispatch_off": "monitor",
+    "monitor_migration_repairs_legacy_pr100_schema9_without_quota": "monitor",
+    "monitor_check_failure_is_degraded_without_healthy_claim": "monitor",
+    "monitor_persists_coverage_heartbeats_and_deduplicates_alerts": "monitor",
+    "monitor_alerts_task_unknown_outcome_is_scoped_and_restart_safe": "monitor",
+    "monitor_dispatch_requires_explicit_safe_eligibility": "monitor",
+})
+
+# --------------------------------------------------------------------------
+# Rules for tests PINNED does not know (new code on a newer main). Name rules
+# run before section rules; first match wins.
+# --------------------------------------------------------------------------
+
+PREFIX_RULES = [
+    (r"^(ws_|codex_|claude_|managed_)", "managed_claude_codex"),
+    (r"^pty_(hot_restart|restart|shutdown|reattach|resume|dead|unfence)", "pty_lifecycle"),
+    (r"^pty_", "pty_interact"),
+    (r"^recover_", "pty_interact"),
+    (r"^(audit|review)_", "audit_review"),
+    (r"^(slot|build|subreaper)_", "build_slot"),
+    (r"^(job|dispatch|monitor|verdict|finish|task)_", "dispatch_jobs_monitor"),
+    (r"^(report|memory)_", "reports_memory"),
+    (r"^(issue|session|skill)_", "tracker_issue"),
+    (r"^(plan|work|workflow|project)_", "plan_work"),
+    (r"^(board|overview|ui)_", "board_ui"),
+    (r"^(thread|cad32\d)_", "threads"),
+    (r"^(delivery|master|merged)_", "delivery"),
+    (r"^(backup|rollout|auto_stop)_", "backup_rollout"),
+    (r"^inbox_", "daemon"),
+    (r"^cli_", "daemon"),
+]
+
+SECTION_RULES = [
+    (r"^fence recovery", "daemon"),
+    (r"^CAD-89", "pty_lifecycle"),
+    (r"^review regressions", "daemon"),
+    (r"^mock Codex app-server", "managed_claude_codex"),
+    (r"^managed-ws", "managed_claude_codex"),
+    (r"^mock Devin TUI", "agents_pty"),
+    (r"^message cancel", "daemon"),
+    (r"^CAD-23\b", "reports_memory"),
+    (r"^CAD-51\b", "dispatch_jobs_monitor"),
+    (r"^CAD-52\b", "pty_interact"),
+    (r"^CAD-102\b", "pty_interact"),
+    (r"^CAD-152\b", "pty_interact"),
+    (r"^CAD-95\b", "tracker_issue"),
+    (r"^session start\|end", "tracker_issue"),
+    (r"^CAD-136\b", "reports_memory"),
+    (r"^CAD-153\b", "audit_review"),
+    (r"^CAD-217\b", "audit_review"),
+    (r"^CAD-207\b", "audit_review"),
+    (r"^CAD-113\b", "build_slot"),
+    (r"^CAD-230\b", "build_slot"),
+    (r"^CAD-109\b", "reports_memory"),
+    (r"^CAD-257\b", "tracker_issue"),
+    (r"^CAD-199\b", "backup_rollout"),
+    (r"^CAD-96\b", "backup_rollout"),
+    (r"^CAD-413\b", "backup_rollout"),
+    (r"^CAD-335\b", "plan_work"),
+    (r"^CAD-405\b", "plan_work"),
+    (r"^CAD-319\b", "threads"),
+    (r"^CAD-432\b", "board_ui"),
+    (r"^CAD-320\b", "threads"),
+    (r"^CAD-358\b", "plan_work"),
+    (r"^CAD-323\b", "threads"),
+    (r"^CAD-384\b", "daemon"),
+    (r"^CAD-324\b", "plan_work"),
+    (r"^CAD-378\b", "plan_work"),
+    (r"cadence review`", "audit_review"),
+]
+
+# --------------------------------------------------------------------------
+# Text edits applied to named items while emitting. Each is (find, replace);
+# the script fails if `find` is absent — these are the two binary-name
+# assertions carried over from #267 and the gitleaks markers it added.
+# --------------------------------------------------------------------------
+
+TEXT_EDITS = {
+    # mod op moves down a level (tests/common/mod.rs), so its #[path]
+    # needs one more ".." to reach tests/support/operator.rs.
+    "op": [
+        (
+            '#[path = "support/operator.rs"]',
+            '#[path = "../support/operator.rs"]',
+        ),
+    ],
+    # include_str! is relative to the file it appears in; common/mod.rs
+    # sits one level deeper than the old integration.rs.
+    "FAKE_GH_PY": [
+        (
+            'include_str!("fixtures/fake-gh.py")',
+            'include_str!("../fixtures/fake-gh.py")',
+        ),
+    ],
+    # CAD-406: the self-signal source scan must walk tests/ recursively —
+    # sigterm_own_process moved to tests/common/mod.rs, which a flat
+    # readdir no longer visits. Sanctioned path becomes common/mod.rs.
+    "test_suite_never_signals_the_shared_process": [
+        (
+            """    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let mut hits = Vec::new();
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let src = std::fs::read_to_string(&path).unwrap();
+        let flat: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+        for p in patterns {
+            let n = flat.matches(p).count();
+            if n > 0 {
+                hits.push(format!("{}: {p} x{n}", path.display()));
+            }
+        }
+    }
+    let sanctioned = format!(
+        "{}: {} x1",
+        dir.join("integration.rs").display(),
+        patterns[0]
+    );""",
+            """    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let mut hits = Vec::new();
+    let mut stack = vec![dir.clone()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).unwrap();
+            let flat: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+            for p in patterns {
+                let n = flat.matches(p).count();
+                if n > 0 {
+                    hits.push(format!("{}: {p} x{n}", path.display()));
+                }
+            }
+        }
+    }
+    hits.sort();
+    let sanctioned = format!(
+        "{}: {} x1",
+        dir.join("common/mod.rs").display(),
+        patterns[0]
+    );""",
+        ),
+    ],
+    # The orphan report names the running test binary; after the split the
+    # exe basename is `<area>-<hash>`, not `integration-`. Derive it from
+    # current_exe() (as #267 did).
+    "session_end_orphans_report_exe_and_argc_never_argv": [
+        (
+            """    assert!(
+        text.contains(&format!("orphan pid {me} — integration-")),
+        "self pid shows the executable basename:\\n{text}"
+    );
+    assert!(
+        text.contains(&format!("orphan pid {me} — integration-")) && text.contains(" arg(s))"),
+        "the argument count is shown:\\n{text}"
+    );""",
+            """    let exe = std::env::current_exe()
+        .unwrap()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        text.contains(&format!("orphan pid {me} — {exe}")),
+        "self pid shows the executable basename:\\n{text}"
+    );
+    assert!(
+        text.contains(&format!("orphan pid {me} — {exe}")) && text.contains(" arg(s))"),
+        "the argument count is shown:\\n{text}"
+    );""",
+        ),
+    ],
+    # Synthetic PEM fixtures are flagged by gitleaks when they land as "new"
+    # lines; mark them in place (same markers #267 used).
+    "report_redacts_prose_secret_forms": [
+        (
+            '"pem\\n-----BEGIN RSA PRIVATE KEY-----\\nMIIabc123\\n-----END RSA PRIVATE KEY-----\\ntail",',
+            '"pem\\n-----BEGIN RSA PRIVATE KEY-----\\nMIIabc123\\n-----END RSA PRIVATE KEY-----\\ntail", // gitleaks:allow — synthetic redaction fixture',
+        ),
+        (
+            '"-----BEGIN RSA PRIVATE KEY-----\\nsynthetic_pem_payload\\n-----END RSA PRIVATE KEY-----",',
+            '"-----BEGIN RSA PRIVATE KEY-----\\nsynthetic_pem_payload\\n-----END RSA PRIVATE KEY-----", // gitleaks:allow — synthetic redaction fixture',
+        ),
+    ],
+}
+
+# `use` leaves that are traits must be kept when any of their methods are
+# called — a method call never names the trait. Extend the table if a new
+# trait import appears in the shared use block.
+TRAIT_METHODS = {
+    "std::io::Write": ("write", "write_all", "write_fmt", "flush", "writeln"),
+    "std::io::Read": (
+        "read", "read_to_string", "read_to_end", "read_exact", "bytes",
+    ),
+    "std::io::BufRead": (
+        "fill_buf", "consume", "read_until", "read_line", "split", "lines",
+        "has_data_left",
+    ),
+}
+
+# Helper fns that must live in tests/common/mod.rs no matter which areas
+# reference them. The CAD-406 self-signal machinery is pinned because the
+# source scan asserts the suite's only `kill(std::process::id()` sits in
+# common/mod.rs (see TEXT_EDITS); pinning also keeps the helper reachable
+# for any future binary.
+COMMON_PIN = {
+    "sigterm_own_process",
+    "run_signal_child",
+    "self_signal_refusal",
+}
+
+# rustc is authoritative on unused imports: a trait leaf can be kept by
+# method-name evidence that really resolved to an inherent method (e.g.
+# `str::lines`). Listing the leaf here removes it from that binary so the
+# generated tree stays warning-free and the next run regenerates it.
+DROP_USES = {
+    "tests/agents_pty.rs": ["std::io::BufRead"],
+    "tests/audit_review.rs": ["std::io::BufRead", "std::io::Write"],
+    "tests/backup_rollout.rs": ["std::io::BufRead"],
+    "tests/build_slot.rs": ["std::io::BufRead"],
+    "tests/daemon.rs": ["std::io::BufRead"],
+    "tests/delivery.rs": ["std::io::BufRead", "std::io::Write"],
+    "tests/managed_claude_codex.rs": [
+        "std::io::BufRead", "std::io::Write"],
+    "tests/plan_work.rs": ["std::io::BufRead"],
+    "tests/pty_interact.rs": ["std::io::BufRead"],
+    "tests/reports_memory.rs": ["std::io::BufRead"],
+    "tests/threads.rs": ["std::io::BufRead"],
+}
+
+BIN_PREAMBLE = """//! {area}: area tests split from tests/integration.rs (CAD-426).
+//! End-to-end tests: real socket daemon in-process, fake provider.
+//! These exercise the observable contract — queue order, idempotency,
+//! restart fencing, approval brokering, serialization — without model calls.
+// A test binary never runs the CAD-308 reaper (only `daemon run` does),
+// so its own spawns need not go through `cadence_agent::reaper`.
+#![allow(clippy::disallowed_methods)]
+mod common;
+use common::*;
+"""
+
+COMMON_PREAMBLE = """//! Shared harness for the split integration binaries (CAD-426): TestDaemon,
+//! provider mocks, operator-proof runners and the host-wide suite lock.
+//! Not every binary uses every helper.
+#![allow(dead_code)]
+"""
+
+# --------------------------------------------------------------------------
+# Lexer: blank out strings / char literals / comments so structural scans
+# never see their contents (raw-string bodies start at column 0 and would
+# otherwise look like items).
+# --------------------------------------------------------------------------
+
+_STRING_PREFIX = re.compile(r"(br|cr|b|c|r)?(#*)\"")
+
+
+def lex(src):
+    """Return (mask, spans).
+
+    mask is src with every string literal, char literal and comment blanked
+    to spaces (newlines kept, positions preserved). spans lists the literal
+    contents ranges, for the co-location scan.
+    """
+    n = len(src)
+    mask = list(src)
+    spans = []
+    i = 0
+    while i < n:
+        c = src[i]
+        if c == "/" and src[i:i + 2] == "//":
+            j = src.find("\n", i)
+            j = n if j < 0 else j
+            for k in range(i, j):
+                mask[k] = " "
+            i = j
+        elif c == "/" and src[i:i + 2] == "/*":
+            depth = 1
+            j = i + 2
+            while j < n and depth:
+                if src[j:j + 2] == "/*":
+                    depth += 1
+                    j += 2
+                elif src[j:j + 2] == "*/":
+                    depth -= 1
+                    j += 2
+                else:
+                    j += 1
+            for k in range(i, min(j, n)):
+                if src[k] != "\n":
+                    mask[k] = " "
+            i = j
+        elif c == "'":
+            j = i + 1
+            if j < n and src[j] == "\\":
+                j += 1
+                while j < n and src[j] != "'":
+                    j += 1
+                for k in range(i, min(j + 1, n)):
+                    mask[k] = " "
+                i = j + 1
+            elif j + 1 < n and src[j + 1] == "'" and src[j] != "\n":
+                for k in range(i, i + 3):
+                    mask[k] = " "
+                i += 3
+            else:
+                i += 1  # lifetime or malformed — leave for rustc
+        else:
+            m = _STRING_PREFIX.match(src, i)
+            if c == '"' or m:
+                if c == '"':
+                    pre, hashes = "", ""
+                    j = i + 1
+                else:
+                    pre, hashes = m.group(1) or "", m.group(2)
+                    j = m.end()
+                raw = "r" in pre
+                content_start = j
+                if raw:
+                    close = '"' + hashes
+                    k = src.find(close, j)
+                    j = n if k < 0 else k + len(close)
+                else:
+                    while j < n:
+                        if src[j] == "\\":
+                            j += 2
+                        elif src[j] == '"':
+                            j += 1
+                            break
+                        else:
+                            j += 1
+                spans.append((content_start, min(j, n)))
+                for k in range(i, min(j, n)):
+                    if src[k] != "\n":
+                        mask[k] = " "
+                i = j
+            else:
+                i += 1
+    return "".join(mask), spans
+
+
+# --------------------------------------------------------------------------
+# Item splitting.
+# --------------------------------------------------------------------------
+
+ITEM_HEAD = re.compile(
+    r"(?:pub(?:\s*\([^)]*\))?\s+)?(?:unsafe\s+)?(?:async\s+)?"
+    r"(use|const|static|struct|enum|union|trait|impl|fn|mod|type|"
+    r"macro_rules!|extern)\b"
+)
+NAME_RES = [
+    re.compile(r"\bfn\s+(\w+)"),
+    re.compile(
+        r"\b(?:const|static|struct|enum|union|trait|type|mod)\s+(\w+)"),
+    re.compile(
+        r"\bimpl\b(?:\s*<[^>]*>)?\s+(?:(?:[\w:]+(?:<[^>]*>)?)\s+for\s+)?"
+        r"([\w:]+)"),
+    re.compile(r"\bmacro_rules!\s*(\w+)"),
+]
+
+SECTION_RE = re.compile(r"^//\s*-{3,}\s*(.*?)\s*-*\s*$")
+
+
+class Item:
+    __slots__ = ("kind", "name", "lead", "start", "end", "text", "masked",
+                 "section", "is_test", "order")
+
+    def __init__(self, kind, name, lead, start, end, text, masked, section,
+                 order):
+        self.kind = kind
+        self.name = name
+        self.lead = lead            # raw trivia text preceding the head
+        self.start = start          # offset of trivia start
+        self.end = end              # offset just past the item
+        self.text = text            # raw item text (head..end)
+        self.masked = masked        # masked item text
+        self.section = section      # // ---- marker title in effect
+        self.is_test = False
+        self.order = order
+
+    @property
+    def chunk(self):
+        """lead + item text as emitted (trivia travels with the item)."""
+        return self.lead + self.text
+
+
+def _item_end(mask, start, kind, n):
+    """Offset just past the item beginning at `start` in `mask`."""
+    b = p = s = 0
+    semi_only = kind in ("use", "mod", "const", "static", "type")
+    for i in range(start, n):
+        c = mask[i]
+        if c == "{":
+            b += 1
+        elif c == "}":
+            if b == 1 and p == 0 and s == 0 and not semi_only:
+                return i + 1
+            b -= 1
+        elif c == "(":
+            p += 1
+        elif c == ")":
+            p -= 1
+        elif c == "[":
+            s += 1
+        elif c == "]":
+            s -= 1
+        elif c == ";" and b == 0 and p == 0 and s == 0:
+            return i + 1
+    raise ValueError(f"unterminated {kind} item at byte {start}")
+
+
+def parse_items(src):
+    """Split src into items; the file preamble becomes the first item's lead.
+
+    Returns (items, mask, string_spans).
+    """
+    mask, spans = lex(src)
+    lines = src.split("\n")
+    mlines = mask.split("\n")
+    offs = [0]
+    for l in lines:
+        offs.append(offs[-1] + len(l) + 1)
+    items = []
+    section = ""
+    prev_end = 0
+    for i, ml in enumerate(mlines):
+        m = ITEM_HEAD.match(ml)
+        if not m:
+            continue
+        kind = m.group(1)
+        start = offs[i]
+        end = _item_end(mask, start, kind, len(src))
+        lead = src[prev_end:start]
+        for ll in lead.split("\n"):
+            sm = SECTION_RE.match(ll)
+            if sm and sm.group(1).strip():
+                section = sm.group(1).strip()
+        mtext = mask[start:end]
+        name = None
+        for rx in NAME_RES:
+            nm = rx.search(mtext)
+            if nm:
+                name = nm.group(1)
+                break
+        if kind == "impl" and name:
+            name = "impl:" + name
+        it = Item(kind, name, lead, prev_end, end, src[start:end], mtext,
+                  section, len(items))
+        it.is_test = bool(re.search(r"(?m)^\s*#\[\s*test\s*\]", lead))
+        items.append(it)
+        prev_end = end
+    if items:
+        tail = src[prev_end:]
+        if tail.strip():
+            items[-1].text += tail  # trailing comments ride the last item
+    return items, mask, spans
+
+
+# --------------------------------------------------------------------------
+# `use` pruning.
+# --------------------------------------------------------------------------
+
+def _use_leaves(masked_stmt):
+    """Flatten `use a::{b, c::{d}};` to [(path_tuple, bind_name)].
+
+    Returns None when the item has a `*` leaf — the caller keeps it whole.
+    """
+    body = masked_stmt.strip()
+    assert body.startswith("use ") and body.endswith(";")
+    toks = re.findall(r"[A-Za-z_]\w*|::|\{|\}|,|\*", body[4:-1])
+    out = []
+
+    def parse_path(i, prefix):
+        prefix = prefix + (toks[i],)
+        i += 1
+        while i < len(toks) and toks[i] == "::":
+            i += 1
+            t = toks[i]
+            if t == "{":
+                i += 1
+                while toks[i] != "}":
+                    if toks[i] == ",":
+                        i += 1
+                        continue
+                    i = parse_path(i, prefix)[0]
+                i += 1
+                return i, None
+            if t == "*":
+                out.append((prefix + ("*",), "*"))
+                return i + 1, None
+            prefix = prefix + (t,)
+            i += 1
+        bind = prefix[-1]
+        if i < len(toks) and toks[i] == "as":
+            bind = toks[i + 1]
+            i += 2
+        out.append((prefix, bind))
+        return i, None
+
+    parse_path(0, ())
+    if any(b == "*" for _, b in out):
+        return None
+    fixed = []
+    for path, bind in out:
+        if path[-1] == "self":
+            path = path[:-1]
+            bind = path[-1]
+        fixed.append((path, bind))
+    return fixed
+
+
+def pruned_uses(use_items, masked_chunks):
+    """Keep only leaves whose bound name appears in the emitted code.
+
+    A leaf survives only when its bound name occurs as a *bare* identifier
+    — `Arc` inside `std::sync::Arc::new` does not need `use std::sync::Arc`.
+    Trait leaves additionally survive on method-call (`.m(`) or macro
+    (`m!`) evidence, since a method call never names its trait; that test
+    can over-keep when the call resolves to an inherent method, and the
+    residual is listed in DROP_USES.
+    """
+
+    def bare(name):
+        return re.search(r"(?<![\w:.])" + re.escape(name) + r"\b",
+                         masked_chunks)
+
+    emitted = []
+    for it in use_items:
+        leaves = _use_leaves(it.masked)
+        if leaves is None:
+            emitted.append(it.text.strip())
+            continue
+        for path, bind in leaves:
+            full = "::".join(path)
+            keep = bool(bare(bind))
+            if not keep:
+                meths = TRAIT_METHODS.get(full)
+                keep = bool(meths) and any(
+                    re.search(r"\." + re.escape(m) + r"\s*\(|"
+                              r"\b" + re.escape(m) + r"\s*!",
+                              masked_chunks)
+                    for m in meths)
+            if keep:
+                if bind != path[-1]:
+                    emitted.append(f"use {full} as {bind};")
+                else:
+                    emitted.append(f"use {full};")
+    seen, out = set(), []
+    for u in emitted:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def pruned_uses_for(path, use_items, masked_chunks):
+    drop = set(DROP_USES.get(path, ()))
+    return [u for u in pruned_uses(use_items, masked_chunks)
+            if u[len("use "):-1].split(" as ")[0] not in drop]
+
+
+# --------------------------------------------------------------------------
+# pub-promotion for items emitted into tests/common/mod.rs.
+# --------------------------------------------------------------------------
+
+def _pub_members(text, pred):
+    """Add `pub` to depth-1 member lines matching `pred` inside the item."""
+    m, _ = lex(text)
+    lines = text.split("\n")
+    mlines = m.split("\n")
+    out = []
+    depth = 0
+    for l, ml in zip(lines, mlines):
+        if depth == 1 and not ml.lstrip().startswith("pub"):
+            sm = pred(ml.lstrip())
+            if sm:
+                indent = re.match(r"\s*", l).group(0)
+                l = indent + "pub " + l[len(indent):]
+        out.append(l)
+        depth += ml.count("{") - ml.count("}")
+    return "\n".join(out)
+
+
+def _promote(item):
+    """Item text with pub visibility where common membership needs it."""
+    k = item.kind
+    text = item.text
+    if k == "impl":
+        head = item.masked.split("{", 1)[0]
+        if re.search(r"\bfor\b", head):
+            return text
+        return _pub_members(
+            text, lambda s: re.match(r"(?:fn|const|static|type)\b", s))
+    if k in ("struct", "enum", "union"):
+        text = re.sub(r"^(\s*)", "pub ", text, count=1)
+        if k == "struct":
+            text = _pub_members(
+                text, lambda s: re.match(r"[A-Za-z_]\w*\s*:", s))
+            m = re.search(r"(\bstruct\s+\w+(?:\s*<[^>]*>)?)\s*\(", text)
+            if m:  # tuple struct: pub on every top-level field
+                depth = 0
+                i = text.index("(", m.end() - 1)
+                inner_start = i + 1
+                j = inner_start
+                parts = []
+                cur = []
+                while j < len(text):
+                    c = text[j]
+                    if c in "(<[":
+                        depth += 1
+                    elif c in ")>]":
+                        if depth == 0:
+                            break
+                        depth -= 1
+                    if c == "," and depth == 0:
+                        parts.append("".join(cur))
+                        cur = []
+                    else:
+                        cur.append(c)
+                    j += 1
+                parts.append("".join(cur))
+                inner = ",".join(
+                    p if re.match(r"\s*pub\b", p) else "pub " + p.lstrip()
+                    for p in parts)
+                text = text[:inner_start] + inner + text[j:]
+        return text
+    if k == "mod":
+        return re.sub(r"^(\s*)", "pub ", text, count=1)
+    if k in ("fn", "const", "static", "type", "trait"):
+        return re.sub(r"^(\s*)", "pub ", text, count=1)
+    if k == "macro_rules!":
+        raise SystemExit("macro_rules! items are not supported; add handling")
+    return text
+
+
+def _apply_edits(name, text):
+    for old, new in TEXT_EDITS.get(name, []):
+        if old not in text:
+            raise SystemExit(f"TEXT_EDITS: pattern not found in {name!r}")
+        text = text.replace(old, new, 1)
+    return text
+
+
+# --------------------------------------------------------------------------
+# Placement.
+# --------------------------------------------------------------------------
+
+def place_test(name, section):
+    if name in PINNED:
+        return PINNED[name]
+    for rx, area in PREFIX_RULES:
+        if re.match(rx, name):
+            return area
+    for rx, area in SECTION_RULES:
+        if re.search(rx, section):
+            return area
+    if not section:
+        return "daemon"  # pre-marker core tests
+    return None
+
+
+def assign_helpers(items, area_of_test):
+    """Split non-test items into common vs per-area via a reachability BFS.
+
+    A helper reached from exactly one area's tests stays local to that
+    binary; anything else lands in common. Name scans run on masked text and
+    over-approximate — a false positive only pushes an item into common.
+    """
+    named = [it for it in items if it.kind != "use" and not it.is_test]
+    by_name = {}
+    for it in named:
+        if it.name:
+            by_name[it.name] = it
+    word = re.compile(r"\b(" + "|".join(
+        re.escape(n) for n in sorted(by_name, key=len, reverse=True))
+        + r")\b") if by_name else None
+
+    reach = {}
+    tests_by_area = {}
+    for it in items:
+        if it.is_test and area_of_test.get(it.name):
+            tests_by_area.setdefault(area_of_test[it.name], []).append(it)
+    for area, roots in tests_by_area.items():
+        seen = set()
+        stack = list(roots)
+        while stack:
+            it = stack.pop()
+            if id(it) in seen:
+                continue
+            seen.add(id(it))
+            if word:
+                for nm in word.findall(it.masked):
+                    tgt = by_name.get(nm)
+                    if tgt is not None and tgt is not it:
+                        stack.append(tgt)
+        for it in named:
+            if id(it) in seen:
+                reach.setdefault(it.name, set()).add(area)
+
+    # A helper a common item calls must live in common too — impl blocks
+    # are never reached by name (nothing in code spells "impl:X"), so a
+    # fn called only inside an impl plus one area's tests would otherwise
+    # land in that binary while common/mod.rs still calls it. Compute the
+    # per-item dependency set and close over common until stable.
+    deps = {}
+    for it in named:
+        deps[id(it)] = {
+            by_name[nm] for nm in word.findall(it.masked)
+            if nm in by_name and by_name[nm] is not it
+        } if word else set()
+
+    in_common = {}
+    for it in named:
+        areas = reach.get(it.name) or set()
+        in_common[it] = (
+            not (it.kind == "fn" and len(areas) == 1)
+            or it.name in COMMON_PIN)
+    moved = True
+    while moved:
+        moved = False
+        for it in named:
+            if not in_common[it]:
+                continue
+            for d in deps.get(id(it), ()):
+                if not in_common[d]:
+                    in_common[d] = True
+                    moved = True
+
+    common, local = [], {}
+    for it in named:
+        if in_common[it]:
+            common.append(it)
+        else:
+            areas = reach[it.name]
+            local.setdefault(next(iter(areas)), []).append(it)
+    return common, local
+
+
+# --------------------------------------------------------------------------
+# Emission.
+# --------------------------------------------------------------------------
+
+def emit_common(common_items, use_items):
+    emitted = []
+    for it in common_items:
+        emitted.append(_apply_edits(it.name, it.lead + _promote(it)))
+    joined = "".join(emitted)
+    uses = pruned_uses_for(COMMON, use_items, lex(joined)[0])
+    body = COMMON_PREAMBLE + "\n" + "\n".join(uses) + "\n\n"
+    return body + joined.lstrip("\n")
+
+
+def emit_binary(area, chunks, use_items, common_names):
+    masked_all = "".join(c.masked for c in chunks)
+    uses = pruned_uses_for(f"tests/{area}.rs", use_items, masked_all)
+    head = BIN_PREAMBLE.format(area=area)
+    if not common_names.intersection(
+            set(re.findall(r"[A-Za-z_]\w*", masked_all))):
+        head = head.replace(
+            "use common::*;", "#[allow(unused_imports)]\nuse common::*;")
+    body = head + "\n"
+    if uses:
+        body += "\n".join(uses) + "\n"
+    body += "\n"
+    body += "".join(_apply_edits(c.name, c.chunk) for c in chunks)
+    return body
+
+
+def write(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(text if text.endswith("\n") else text + "\n")
+
+
+def rustfmt(text):
+    """Format emitted Rust the way `cargo fmt` will, so generated files are
+    fmt-clean the moment they land (and `--check` compares the formatted
+    form)."""
+    try:
+        p = subprocess.run(
+            ["rustfmt", "--edition", "2021", "--emit", "stdout"],
+            input=text, capture_output=True, text=True)
+    except FileNotFoundError:
+        raise SystemExit("rustfmt not found on PATH")
+    if p.returncode != 0:
+        raise SystemExit("rustfmt failed on generated output:\n" + p.stderr)
+    return p.stdout
+
+
+def read_manifest_pins():
+    """tests/split-map.toml, if present, pins its listed tests to their
+    binary — the map survives as the seed of the next run."""
+    pins = {}
+    if not os.path.exists(MANIFEST):
+        return pins
+    area = None
+    in_tests = False
+    for line in open(MANIFEST):
+        s = line.strip()
+        m = re.match(r"\[binaries\.(\w+)\]", s)
+        if m:
+            area = m.group(1)
+        elif s == "tests = [":
+            in_tests = area is not None
+        elif s.startswith("]"):
+            in_tests = False
+        elif in_tests and s.startswith('"'):
+            pins[s.strip('",')] = area
+    return pins
+
+
+def main():
+    check = "--check" in sys.argv
+    src = open(SRC).read()
+    items, mask, spans = parse_items(src)
+    if not items:
+        raise SystemExit(f"no items found in {SRC}")
+
+    tests = [it for it in items if it.is_test]
+    use_items = [it for it in items if it.kind == "use"]
+
+    prior = read_manifest_pins()
+    if prior:
+        PINNED.update({k: v for k, v in prior.items()})
+
+    area_of = {}
+    unplaced = []
+    for it in tests:
+        area = place_test(it.name, it.section)
+        (area_of.__setitem__(it.name, area) if area
+         else unplaced.append(it))
+
+    # Co-location: a test that names another test inside a string literal
+    # re-runs it via current_exe(); force the pair into one binary.
+    test_names = {it.name for it in tests}
+    name_re = re.compile(r"\b(" + "|".join(
+        re.escape(n) for n in sorted(test_names, key=len, reverse=True))
+        + r")\b")
+    ends = [it.end for it in tests]
+    name_of = {it.name: it for it in tests}
+
+    def owner(pos):
+        i = bisect_left(ends, pos)
+        if i < len(tests) and tests[i].start <= pos < tests[i].end:
+            return tests[i]
+        return None
+
+    for s0, s1 in spans:
+        it = owner(s0)
+        if it is None:
+            continue
+        for nm in set(name_re.findall(src[s0:s1])) - {it.name}:
+            other = name_of[nm]
+            pa, pb = area_of.get(it.name), area_of.get(other.name)
+            if pa and pb and pa != pb:
+                raise SystemExit(
+                    f"co-location conflict: {it.name} ({pa}) spawns "
+                    f"{other.name} ({pb})")
+            if pa and not pb:
+                area_of[other.name] = pa
+                if other in unplaced:
+                    unplaced.remove(other)
+            elif pb and not pa:
+                area_of[it.name] = pb
+                if it in unplaced:
+                    unplaced.remove(it)
+
+    common, local = assign_helpers(items, area_of)
+
+    outputs = {COMMON: emit_common(common, use_items)}
+    common_names = {it.name for it in common if it.name}
+    for area in AREAS:
+        local_ids = {id(x) for x in local.get(area, [])}
+        chunks = [it for it in items
+                  if it.kind != "use"
+                  and ((it.is_test and area_of.get(it.name) == area)
+                       or (not it.is_test and id(it) in local_ids))]
+        if not chunks:
+            continue
+        outputs[f"tests/{area}.rs"] = emit_binary(
+            area, chunks, use_items, common_names)
+
+    if unplaced:
+        body = BIN_PREAMBLE.format(area="unplaced").replace(
+            "mod common;\nuse common::*;\n", "")
+        body += "".join(it.chunk for it in unplaced)
+        outputs[UNPLACED] = body
+
+    lines = ["# CAD-426 — generated by scripts/split-integration-tests;",
+             "# do not hand-edit. Re-run the script on a newer",
+             "# tests/integration.rs to regenerate this map.",
+             "",
+             "[common]",
+             "helpers = ["]
+    lines += [f'    "{it.name}",' for it in common if it.name]
+    lines += ["]", ""]
+    for area in AREAS:
+        if f"tests/{area}.rs" not in outputs:
+            continue
+        lines.append(f"[binaries.{area}]")
+        lines.append("tests = [")
+        for it in items:
+            if it.is_test and area_of.get(it.name) == area:
+                lines.append(f'    "{it.name}",')
+        lines.append("]")
+        lines.append("helpers = [")
+        for it in local.get(area, []):
+            if it.name:
+                lines.append(f'    "{it.name}",')
+        lines += ["]", ""]
+    outputs[MANIFEST] = "\n".join(lines)
+
+    for p in list(outputs):
+        if p.endswith(".rs"):
+            outputs[p] = rustfmt(outputs[p])
+
+    if check:
+        stale = [p for p, t in outputs.items()
+                 if not os.path.exists(p) or open(p).read() != t]
+        if stale:
+            print("stale generated files:", *stale, sep="\n  ")
+            return 1
+        print("generated files are current")
+        return 0
+
+    for path, text in outputs.items():
+        write(path, text)
+    if not unplaced:
+        if os.path.exists(UNPLACED):
+            os.remove(UNPLACED)
+        os.remove(SRC)
+        print(f"removed {SRC}")
+    for path in outputs:
+        print("wrote", path)
+    if unplaced:
+        print(f"\n{len(unplaced)} unplaced test(s) -> {UNPLACED}:",
+              file=sys.stderr)
+        for it in unplaced:
+            print(f"  {it.name}  (section: {it.section!r})", file=sys.stderr)
+        return 1
+    n_bins = len([p for p in outputs
+                  if p.startswith("tests/") and p.endswith(".rs")
+                  and p != COMMON and p != UNPLACED])
+    print(f"{len(tests)} tests -> {n_bins} binaries")
+    return 0
+
+
+
+if __name__ == "__main__":
+    sys.exit(main())

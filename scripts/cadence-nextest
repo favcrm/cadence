@@ -2,7 +2,8 @@
 # CAD-173: pinned, zero-retry nextest runner.
 #
 # Usage (after human approval installs the pinned binary):
-#   scripts/cadence-nextest --test integration
+#   scripts/cadence-nextest --all-targets          # the whole suite
+#   scripts/cadence-nextest --test daemon          # one area binary
 #
 # Direct invocations take the canonical outer host lock. `cadence review`
 # already owns that lock in src/review.rs; it clears the child lock path and

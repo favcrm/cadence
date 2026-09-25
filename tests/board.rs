@@ -2212,7 +2212,7 @@ fn post_commit_hook_refuses_mid_sequence_and_detached() {
 // ---------- I3: job-derived status, exact binding, SSE, agent detail ----------
 
 /// In-process daemon for the runtime strip — the same `daemon::serve`
-/// integration.rs wraps in TestDaemon, pared down to what the board
+/// common/mod.rs wraps in TestDaemon, pared down to what the board
 /// routes need.
 struct UiDaemon {
     state: PathBuf,
@@ -2323,7 +2323,7 @@ impl UiDaemon {
     }
 
     /// `rpc` from a caller that is provably the operator however the
-    /// suite is run — `TestDaemon::operator_rpc` in tests/integration.rs
+    /// suite is run — `TestDaemon::operator_rpc` in tests/common/mod.rs
     /// (CAD-291): `setsid -f` hands the call to a fresh session leader
     /// that waits until it has left this process's ancestry,
     /// `env_clear` leaves no `CADENCE_ALIAS`, and stdio is not a pane
@@ -2386,7 +2386,7 @@ impl Drop for UiDaemon {
     }
 }
 
-/// [`UiDaemon::operator_rpc`]'s caller, as in tests/integration.rs: it
+/// [`UiDaemon::operator_rpc`]'s caller, as in tests/common/mod.rs: it
 /// waits until it has left the test runner's ancestry, then sends one
 /// frame and lands the reply line atomically.
 const OPERATOR_RPC_PY: &str = r#"
@@ -2416,7 +2416,7 @@ os.rename(out + ".tmp", out)
 "#;
 
 /// `OPERATOR_RPC_PY`'s sibling for process exec, as in
-/// tests/integration.rs: it waits until it has left the test runner's
+/// tests/common/mod.rs: it waits until it has left the test runner's
 /// ancestry, then runs the argv and lands the result atomically — so a
 /// cli child presents as an operator shell outside every pane, not a
 /// process the daemon launched (CAD-467: `dispatch`'s lane-provenance
@@ -2449,7 +2449,7 @@ os.rename(out + ".tmp", out)
 
 /// `cli` detached so the daemon sees a provably-operator caller (the
 /// CAD-291/431 seam, `OperatorOutput::operator_output` in
-/// tests/integration.rs): `setsid -f` reparents it off this process's
+/// tests/common/mod.rs): `setsid -f` reparents it off this process's
 /// ancestry and the env carries no agent identity.
 fn cli_op(pm: &Path, state: &Path, args: &[&str]) -> (bool, Value) {
     let dir = state.join(format!("opx-{}", uuid::Uuid::new_v4().simple()));
@@ -2646,7 +2646,7 @@ fn wait_port_closed(port: u16) {
 /// pane map resolves callers by (a `pty` endpoint with a pid and a
 /// generation). Registered as an actorless `inbox` pair first and kept
 /// `enabled=0`, so no actor ever opens it and overwrites the plant —
-/// the same recipe integration.rs's `plant_pane` uses.
+/// the same recipe common/mod.rs's `plant_pane` uses.
 fn plant_pane(d: &UiDaemon, alias: &str, pid: u32) {
     d.rpc(
         "agent_register",
@@ -3523,7 +3523,7 @@ fn ui_stream_sse_and_guards() {
 }
 
 /// Poll `agent_show` until `pred` holds or the deadline passes — the
-/// board-test equivalent of integration's wait_agent.
+/// board-test equivalent of the common harness's wait_agent.
 fn wait_agent_pred(d: &UiDaemon, alias: &str, secs: u64, pred: impl Fn(&Value) -> bool) -> Value {
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
@@ -9192,7 +9192,7 @@ fn spawn_ui_env(pm: &Path, state: &Path, env: &[(&str, &str)]) -> (u16, UiProc) 
 /// this process's ancestry once `start` exits, `env_clear` leaves no
 /// `CADENCE_ALIAS`, and stdio is a log file, not a pane tty — the shape
 /// `peer::operator_proof` accepts, as `TestDaemon::operator_rpc` does in
-/// tests/integration.rs (CAD-291). The gate itself is untouched.
+/// tests/common/mod.rs (CAD-291). The gate itself is untouched.
 /// `free_port` is a bind-release race, so a failed start retries.
 fn start_operator_ui(pm: &Path, state: &Path) -> (u16, DetachedUi) {
     let guard = DetachedUi(state.to_path_buf());
