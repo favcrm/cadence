@@ -25,6 +25,7 @@ const paths: [string, Route][] = [
   ["/projects/cadence/context", { screen: "projects", slug: "cadence", section: "context" }],
   ["/projects/cadence/epics", { screen: "projects", slug: "cadence", section: "epics" }],
   ["/projects/cadence/milestones", { screen: "projects", slug: "cadence", section: "milestones" }],
+  ["/projects/cadence/workflows", { screen: "projects", slug: "cadence", section: "workflows" }],
   ["/agents", { screen: "agents", alias: null }],
   ["/agents/cc-1", { screen: "agents", alias: "cc-1" }],
   ["/setup", { screen: "setup" }],

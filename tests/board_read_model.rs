@@ -687,7 +687,7 @@ fn tracker_writes_show_on_the_next_read_and_stream_as_entity_diffs() {
 
     // The stream: the legacy frame, unchanged, and the entity diffs.
     const ISSUES_FRAME: &str =
-        "event: issues\ndata: {\"resources\":[\"issues\",\"projects\",\"issue\",\"overview\"]}\n\n";
+        "event: issues\ndata: {\"resources\":[\"issues\",\"projects\",\"issue\",\"overview\",\"workflows\"]}\n\n";
     wait_for("an issue upsert for CAD-3 and the new issue", 10, || {
         let upserts = frames(&stream, "issue");
         upserts

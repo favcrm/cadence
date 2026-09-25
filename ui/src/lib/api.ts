@@ -16,6 +16,8 @@ import type {
   Project,
   ProjectContext,
   ContextRole,
+  WorkflowPreview,
+  WorkflowsPayload,
 } from "./types";
 
 /** `GET /api/threads/<alias>` — `thread` is null until the first message. */
@@ -304,6 +306,30 @@ export const api = {
   /** `POST /api/issues/<id>/answers` — the operator's answer report. */
   answer: (issue: string, question: string, text: string) =>
     write("POST", `/api/issues/${encodeURIComponent(issue)}/answers`, { question, text }),
+  /** `GET /api/projects/<key>/workflows` — the project's stored workflows (CAD-496). */
+  workflows: (project: string) =>
+    get<WorkflowsPayload>(`/api/projects/${encodeURIComponent(project)}/workflows`),
+  /**
+   * `GET /api/projects/<key>/workflows/<name>/preview?inputs=<json>` —
+   * what `plan propose --workflow` renders for these inputs. The query
+   * is built by hand (encodeURIComponent, not URLSearchParams) because
+   * the server decodes %XX but does not treat '+' as a space.
+   */
+  workflowPreview: (project: string, name: string, inputs: Record<string, string>) =>
+    get<WorkflowPreview>(
+      `/api/projects/${encodeURIComponent(project)}/workflows/${encodeURIComponent(name)}/preview` +
+        `?inputs=${encodeURIComponent(JSON.stringify(inputs))}`,
+    ),
+  /**
+   * `POST /api/projects/<key>/workflows/<name>/propose` — relays the
+   * daemon's `plan_propose` (the same call `cadence plan propose
+   * --workflow` makes); operator-only on the board.
+   */
+  workflowPropose: (project: string, name: string, inputs: Record<string, string>) =>
+    post<Record<string, unknown>>(
+      `/api/projects/${encodeURIComponent(project)}/workflows/${encodeURIComponent(name)}/propose`,
+      { inputs },
+    ),
   /** `GET /api/milestones?project=` — progress and worst health per milestone. */
   milestones: (project: string) =>
     get<{ milestones: MilestoneRow[] }>(`/api/milestones?project=${encodeURIComponent(project)}`),

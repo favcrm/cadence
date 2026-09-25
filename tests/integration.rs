@@ -42087,6 +42087,21 @@ inputs:\n  title: { ask: \"What change?\" }\n  note: { optional: true }\n---\n\n
 ## Do {{title}}\nagent: dev-1\nsize: S\n\n### Acceptance\n- [ ] done\n\n\
 ## Check {{title}}\nagent: qa-1\ndepends_on: 1\n\n### Acceptance\n- [ ] verified\n";
 
+/// A workflow whose two tickets are pinned apart by `distinct:` — the
+/// second ticket's `agent:` is the reviewer (like code-change.md), so
+/// worker == reviewer refuses `not_distinct` at render.
+const WF_PAIR: &str = "---\ntitle: \"Pair: {{title}}\"\ngoal: \"Do {{title}}\"\n\
+inputs:\n  title: {}\n  worker: {}\n  reviewer: {}\ndistinct: [worker, reviewer]\n---\n\n\
+## Do {{title}}\nagent: {{worker}}\n\n### Acceptance\n- [ ] done\n\n\
+## Check {{title}}\nagent: {{reviewer}}\ndepends_on: 1\n\n### Acceptance\n- [ ] verified\n";
+
+/// A workflow with a bare `agent:` placeholder — a one-line input that
+/// is no alias (`has spaces`) still renders an invalid plan, so the
+/// skeleton guard answers `render_diverged`.
+const WF_ALIAS: &str = "---\ntitle: \"Alias: {{runner}}\"\ngoal: g\n\
+inputs:\n  runner: {}\n---\n\n\
+## Work\nagent: {{runner}}\n\n### Acceptance\n- [ ] done\n";
+
 /// Write `text` into the fixture's scratch dir; answer its path.
 fn wf_file(f: &PlanFixture, name: &str, text: &str) -> String {
     let path = f.tmp.path().join(name);
@@ -42744,6 +42759,288 @@ fn workflow_inputs_cannot_inject_and_project_is_a_key() {
     );
     let (ok, out) = f.cli(&["workflow", "show", "trap", "--project", "trap"]);
     assert!(!ok && out.to_string().contains("symlink"), "{out}");
+}
+
+/// Percent-encode a query value (`?inputs=<json>`) — the board decodes
+/// `%XX` itself, so the wire form must not rely on form semantics.
+fn pct_encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// CAD-496: the board's workflow endpoints serve Projects → Workflows.
+/// `GET /api/projects/<key>/workflows` lists the stored templates with
+/// the inputs their frontmatter declares (`ask`, `optional`) and the
+/// gate approval; `…/<name>/preview?inputs=<json>` is the rendered plan
+/// file `plan_propose` would get — a render refusal is data, not a
+/// failed request, and carries the daemon's refusal `code` beside its
+/// reason. `POST …/propose` relays `plan_propose` verbatim:
+/// operator-only, daemon-gated (`workflow_unapproved` crosses the wire
+/// unchanged), its result the ordinary proposed plan Needs you shows.
+#[test]
+fn board_workflow_list_preview_and_propose() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    f.d.register("qa-1");
+    wf_add(&f, "two-step", WF_TWO_STEP);
+    let port = start_board(&f.pm_dir, &f.d.state);
+    let op = sign_in(&f.d.state, port);
+    let guards = op_guards(&op);
+    let before = f.commits();
+
+    // The list: one row per stored workflow — inputs as the run form
+    // renders them (BTreeMap order: `note`, then `title`).
+    let (status, body) = board_get(port, "/api/projects/demo/workflows");
+    assert_eq!(status, 200, "{body}");
+    let list: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(list["workflows"].as_array().unwrap().len(), 1, "{list}");
+    let row = &list["workflows"][0];
+    assert_eq!(row["name"], "two-step", "{row}");
+    assert_eq!(row["title"], "Change: title", "{row}");
+    assert_eq!(row["tickets"], 2, "{row}");
+    assert_eq!(row["approved"], false, "not yet approved: {row}");
+    let inputs = row["inputs"].as_array().unwrap();
+    assert_eq!(
+        (
+            inputs[0]["name"].as_str().unwrap(),
+            inputs[0]["optional"].as_bool().unwrap()
+        ),
+        ("note", true),
+        "{inputs:?}"
+    );
+    assert_eq!(
+        (
+            inputs[1]["name"].as_str().unwrap(),
+            inputs[1]["ask"].as_str().unwrap()
+        ),
+        ("title", "What change?"),
+        "{inputs:?}"
+    );
+    // Unknown project, bad key, and a lookalike path.
+    let (status, _) = board_get(port, "/api/projects/nope/workflows");
+    assert_eq!(status, 404);
+    let (status, _) = board_get(port, "/api/projects/Bad%20Key/workflows");
+    assert_eq!(status, 400);
+    let (status, _) = board_get(port, "/api/projects/demo/workflowsx");
+    assert_eq!(status, 404);
+
+    // The preview: the rendered plan file for the current inputs — a
+    // refusal (a missing required input) is `{"error": …}` data, not a
+    // failed GET.
+    let prev = "/api/projects/demo/workflows/two-step/preview";
+    let (status, body) = board_get(
+        port,
+        &format!("{prev}?inputs={}", pct_encode(r#"{"title":"login fix"}"#)),
+    );
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let rendered = v["rendered"].as_str().unwrap_or_default();
+    assert!(rendered.contains("Change: login fix"), "{rendered}");
+    assert!(rendered.contains("## Do login fix"), "{rendered}");
+    assert!(!rendered.contains("inputs:"), "{rendered}");
+    let (status, body) = board_get(port, prev);
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("missing required input 'title'"),
+        "{v}"
+    );
+    // Malformed inputs and unknown names are HTTP errors.
+    for (path, want) in [
+        (format!("{prev}?inputs=%5B%5D"), 400),
+        (format!("{prev}?inputs=%7B%22t%22%3A1%7D"), 400),
+        (format!("{prev}?inputs=%7B"), 400),
+        ("/api/projects/demo/workflows/nope/preview".to_string(), 404),
+        ("/api/projects/demo/workflows/../preview".to_string(), 400),
+        (
+            "/api/projects/demo/workflows/Bad%20Name/preview".to_string(),
+            400,
+        ),
+    ] {
+        let (status, body) = board_get(port, &path);
+        assert_eq!(status, want, "{path}: {body}");
+    }
+
+    // Propose is the operator's — refused without a session, refused
+    // for an agent-attributed caller, and a forged attribution field is
+    // refused by the body schema before the daemon sees it.
+    let propose = "/api/projects/demo/workflows/two-step/propose";
+    let (status, reply) = board_http(port, &cad328_post(port, propose, THREAD_GUARDS, "{}"));
+    assert_eq!(status, 403, "{reply}");
+    assert!(reply.contains("operator_session_required"), "{reply}");
+    let mut wk = ManagedWorker::start(&f.d, "wk");
+    let request = cad328_post(port, propose, THREAD_GUARDS, r#"{"inputs":{"title":"x"}}"#);
+    let r = wk.exec(&[
+        "bash",
+        "-c",
+        DEV_TCP_CLIENT,
+        "_",
+        &port.to_string(),
+        &request,
+    ]);
+    let out = r["out"].as_str().unwrap();
+    assert!(
+        out.contains(" 403 ") && out.contains("operator_only"),
+        "{out}"
+    );
+    for body in [
+        r#"{"inputs":{"title":"x"},"actor":"wk"}"#,
+        r#"{"inputs":{"title":"x"},"by":"operator"}"#,
+        r#"{"inputs":{"title":"x"},"proposed_by":"wk"}"#,
+    ] {
+        let (status, reply) = board_http(port, &cad328_post(port, propose, &guards, body));
+        assert_eq!(status, 400, "{body}: {reply}");
+    }
+    assert_eq!(f.commits(), before, "refusals write nothing");
+
+    // The daemon's gate crosses the board unchanged.
+    let (status, reply) = board_http(
+        port,
+        &cad328_post(port, propose, &guards, r#"{"inputs":{"title":"x"}}"#),
+    );
+    assert_eq!(status, 400, "{reply}");
+    assert!(reply.contains("workflow_unapproved"), "{reply}");
+    let (ok, out) = f.cli(&["workflow", "approve", "two-step", "--project", "demo"]);
+    assert!(ok, "{out}");
+    // Once approved the list row says so — the form may run.
+    let (_, body) = board_get(port, "/api/projects/demo/workflows");
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["workflows"][0]["approved"],
+        true,
+        "{body}"
+    );
+    // Render refusals are the daemon's own messages.
+    for (body, want) in [
+        ("{}", "missing required input"),
+        (
+            r#"{"inputs":{"title":"x","bogus":"y"}}"#,
+            "unknown input 'bogus'",
+        ),
+        (r#"{"inputs":{"title":{"n":1}}}"#, "expected a string"),
+    ] {
+        let (status, reply) = board_http(port, &cad328_post(port, propose, &guards, body));
+        assert_eq!(status, 400, "{body}: {reply}");
+        assert!(reply.contains(want), "{want}: {reply}");
+    }
+
+    // The operator proposes a run — the same epic and tickets a
+    // `plan propose --workflow` lands, waiting as a proposed plan.
+    let (status, reply) = board_http(
+        port,
+        &cad328_post(
+            port,
+            propose,
+            &guards,
+            r#"{"inputs":{"title":"login fix","note":"look twice"}}"#,
+        ),
+    );
+    assert_eq!(status, 200, "{reply}");
+    let out: Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(out["epic"], "D-1", "{out}");
+    assert_eq!(out["tickets"], json!(["D-2", "D-3"]), "{out}");
+    assert_eq!(f.commits(), before + 1, "one commit per proposal");
+    let plan = f.front("D-1").plan.unwrap();
+    assert_eq!(plan.state, "proposed");
+    assert!(issue_body(&f, "D-1").contains("Ship login fix"));
+    let events = f.daemon_events("plan_proposed");
+    assert_eq!(events[0]["workflow"], "two-step", "{events:?}");
+    // It waits in Needs you like every proposal: the overview's plan
+    // row, and the board's issue card carries the proposed plan.
+    let (status, body) = board_get(port, "/api/overview");
+    assert_eq!(status, 200, "{body}");
+    let overview: Value = serde_json::from_str(&body).unwrap();
+    let needs = overview["needs_me"].as_array().unwrap();
+    let row = needs
+        .iter()
+        .find(|n| n["plan"]["epic"] == "D-1")
+        .unwrap_or_else(|| panic!("no plan row for D-1: {needs:?}"));
+    assert_eq!(row["kind"], "plan", "{row}");
+    let (status, body) = board_get(port, "/api/issues/D-1");
+    assert_eq!(status, 200, "{body}");
+    let card: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(card["plan"]["state"], "proposed", "{card}");
+    // The plan gate still applies to the proposed tickets.
+    let (ok, err) = f.cli(&["issue", "start", "D-2"]);
+    assert!(!ok && err.to_string().contains("proposed"), "{err}");
+
+    // A refused propose carries the daemon's named code in the error
+    // body — `coded_response` keeps the Structured code the wire sent.
+    let (status, reply) = board_http(
+        port,
+        &cad328_post(port, propose, &guards, r#"{"inputs":{"title":"a\nb"}}"#),
+    );
+    assert_eq!(status, 400, "{reply}");
+    let v: Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(v["code"], "one_line", "{v}");
+}
+
+/// CAD-496 (CAD-487's codes): a preview refusal is data carrying the
+/// daemon's named `code` beside its reason — `one_line` on a value that
+/// is no single visible line, `not_distinct` when `distinct:` inputs
+/// render equal, `render_diverged` when a one-line value still breaks
+/// the rendered plan (`has spaces` is no alias). The run form shows
+/// each refusal by name.
+#[test]
+fn board_workflow_preview_names_render_refusals() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    f.d.register("qa-1");
+    wf_add(&f, "two-step", WF_TWO_STEP);
+    wf_add(&f, "pair", WF_PAIR);
+    wf_add(&f, "alias", WF_ALIAS);
+    let port = start_board(&f.pm_dir, &f.d.state);
+    let before = f.commits();
+
+    let preview = |name: &str, inputs: &str| -> Value {
+        let (status, body) = board_get(
+            port,
+            &format!(
+                "/api/projects/demo/workflows/{name}/preview?inputs={}",
+                pct_encode(inputs)
+            ),
+        );
+        assert_eq!(status, 200, "{name}: {body}");
+        serde_json::from_str(&body).unwrap()
+    };
+
+    let v = preview("two-step", r#"{"title":"a\nb"}"#);
+    assert_eq!(v["code"], "one_line", "{v}");
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("single line"),
+        "{v}"
+    );
+
+    let v = preview(
+        "pair",
+        r#"{"title":"x","worker":"dev-1","reviewer":"dev-1"}"#,
+    );
+    assert_eq!(v["code"], "not_distinct", "{v}");
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("must differ"),
+        "{v}"
+    );
+
+    let v = preview("alias", r#"{"runner":"has spaces"}"#);
+    assert_eq!(v["code"], "render_diverged", "{v}");
+    assert!(v["error"].as_str().is_some(), "{v}");
+
+    // A refusal is a render answer, never a write: nothing committed.
+    assert_eq!(f.commits(), before, "previews write nothing");
 }
 
 /// CAD-360: `job dispatch` of a task whose job is bound to a ticket of
