@@ -13,6 +13,13 @@ path = "src/lib.rs"
 name = "cadence"
 path = "src/main.rs"
 
+# CAD-512 / ADR 0007 §5 L1: the setuid-root drop helper. Self-contained
+# (std + libc, no cadence_agent link) so its audit surface stays small;
+# T1 installs it root:cadence-launch 4750.
+[[bin]]
+name = "cadence-agent-exec"
+path = "src/bin/cadence-agent-exec/main.rs"
+
 [features]
 # Embed the built `ui/` SPA into the binary. Requires `pnpm build` inside
 # `ui/` first; without the feature `cadence ui run --dist <dir>` serves
