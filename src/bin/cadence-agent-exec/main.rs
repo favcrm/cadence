@@ -14,20 +14,32 @@
 //! act. Nothing runs as root after the drop; a defect before it is why
 //! this file stays small.
 
+// The policy module is pure and portable — it compiles and its unit
+// tests run on every target; only the syscall layer below is
+// Linux-only, so on other targets its items go unused.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod policy;
 
+#[cfg(target_os = "linux")]
 use std::ffi::{CStr, CString, OsString};
+#[cfg(target_os = "linux")]
 use std::io::Write;
+#[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(target_os = "linux")]
 use std::process::exit;
 
 /// Exit codes: refusal is a policy verdict, failure is a syscall or
 /// provisioning problem; exec's own errno maps to the shell
 /// conventions so a daemon-side wait status stays meaningful.
+#[cfg(target_os = "linux")]
 const FAILED: i32 = 1;
+#[cfg(target_os = "linux")]
 const REFUSED: i32 = 2;
+#[cfg(target_os = "linux")]
 const CANNOT_EXEC: i32 = 127;
 
+#[cfg(target_os = "linux")]
 struct Account {
     uid: u32,
     gid: u32,
@@ -36,10 +48,22 @@ struct Account {
     shell: String,
 }
 
+#[cfg(target_os = "linux")]
 fn main() {
     exit(run());
 }
 
+/// ADR 0007 §5 L1 is a Linux boundary (getres*, /proc, close_range);
+/// the cross-build job still compiles this bin on macOS/aarch64, so a
+/// stub stands in — an accidental invocation there refuses loudly
+/// rather than silently doing nothing.
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!("cadence-agent-exec: this helper runs on Linux only");
+    std::process::exit(1);
+}
+
+#[cfg(target_os = "linux")]
 fn run() -> i32 {
     close_fds();
     // The caller gate runs before anything else: group membership is a
@@ -81,11 +105,13 @@ fn run() -> i32 {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn refuse(why: &str) -> i32 {
     eprintln!("cadence-agent-exec: refused: {why}");
     REFUSED
 }
 
+#[cfg(target_os = "linux")]
 fn fail(why: &str) -> i32 {
     eprintln!("cadence-agent-exec: {why}");
     FAILED
@@ -95,6 +121,7 @@ fn fail(why: &str) -> i32 {
 /// setuid binary neither holds them across the drop nor leaks them into
 /// the child. `close_range` is one syscall; the bounded loop is the
 /// fallback for kernels before 5.9.
+#[cfg(target_os = "linux")]
 fn close_fds() {
     #[cfg(target_os = "linux")]
     unsafe {
@@ -109,6 +136,7 @@ fn close_fds() {
 }
 
 /// The caller's kernel group set: primary gid plus supplementary.
+#[cfg(target_os = "linux")]
 fn caller_groups() -> Vec<u32> {
     let mut set = vec![unsafe { libc::getgid() }];
     let n = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
@@ -120,14 +148,16 @@ fn caller_groups() -> Vec<u32> {
     set
 }
 
+#[cfg(target_os = "linux")]
 fn group_named(name: &str) -> Option<u32> {
     let name = CString::new(name).ok()?;
     let group = unsafe { libc::getgrnam(name.as_ptr()) };
     (!group.is_null()).then(|| unsafe { (*group).gr_gid })
 }
 
+#[cfg(target_os = "linux")]
 fn account_named(name: &str) -> Option<Account> {
-    fn s(ptr: *const i8) -> String {
+    fn s(ptr: *const libc::c_char) -> String {
         unsafe { CStr::from_ptr(ptr) }
             .to_string_lossy()
             .into_owned()
@@ -149,6 +179,7 @@ fn account_named(name: &str) -> Option<Account> {
 /// The canonical order: setgroups (root-only) → setgid → setuid — any
 /// earlier step done after setuid is already too late, so a failure
 /// anywhere refuses outright.
+#[cfg(target_os = "linux")]
 fn drop_to(uid: u32, gid: u32, supplementary: &[u32]) -> std::io::Result<()> {
     if unsafe { libc::setgroups(supplementary.len(), supplementary.as_ptr()) } != 0 {
         return Err(std::io::Error::last_os_error());
@@ -165,6 +196,7 @@ fn drop_to(uid: u32, gid: u32, supplementary: &[u32]) -> std::io::Result<()> {
 /// Prove the drop took: all three real/effective/saved ids equal the
 /// target, and the group set is exactly the intended pair. A helper
 /// that fails to drop must never reach the verbs.
+#[cfg(target_os = "linux")]
 fn verify_drop(uid: u32, gid: u32, supplementary: &[u32]) -> bool {
     let (mut r, mut e, mut s) = (0u32, 0u32, 0u32);
     if unsafe { libc::getresuid(&mut r, &mut e, &mut s) } != 0 || [r, e, s] != [uid; 3] {
@@ -179,6 +211,7 @@ fn verify_drop(uid: u32, gid: u32, supplementary: &[u32]) -> bool {
     groups == supplementary
 }
 
+#[cfg(target_os = "linux")]
 fn exec(agent: &Account, env: &[(OsString, OsString)], argv: &[OsString]) -> ! {
     let target = match policy::program_candidates(&argv[0]).into_iter().find(|c| {
         let Ok(c) = CString::new(c.as_bytes()) else {
@@ -197,7 +230,7 @@ fn exec(agent: &Account, env: &[(OsString, OsString)], argv: &[OsString]) -> ! {
     };
     // execve takes NUL-terminated arrays; argv/env bytes come from the
     // kernel's own argv and cannot contain NUL.
-    fn ptrs(items: &[CString]) -> Vec<*const i8> {
+    fn ptrs(items: &[CString]) -> Vec<*const libc::c_char> {
         items
             .iter()
             .map(|c| c.as_ptr())
@@ -228,6 +261,7 @@ fn exec(agent: &Account, env: &[(OsString, OsString)], argv: &[OsString]) -> ! {
 /// `/proc/<pid>/status` for a clean refusal; the kernel's EPERM on the
 /// `kill(2)` itself is the actual boundary (the check is advisory — a
 /// pid can die and be reused between the two calls).
+#[cfg(target_os = "linux")]
 fn kill_verb(pid: i32, signal: i32, agent_uid: u32) -> i32 {
     if let Some((real, effective)) = proc_owner(pid) {
         if !policy::target_is_agent(real, effective, agent_uid) {
@@ -245,6 +279,7 @@ fn kill_verb(pid: i32, signal: i32, agent_uid: u32) -> i32 {
 /// can no longer read cross-uid (cwd — §6's named casualty) plus the
 /// stat identity fields callers verify against (ppid/sid/starttime).
 /// environ is deliberately absent — it carries bearer material (§12).
+#[cfg(target_os = "linux")]
 fn inspect_verb(pid: i32, agent_uid: u32) -> i32 {
     let status = match std::fs::read_to_string(format!("/proc/{pid}/status")) {
         Ok(s) => s,
@@ -275,6 +310,7 @@ fn inspect_verb(pid: i32, agent_uid: u32) -> i32 {
     0
 }
 
+#[cfg(target_os = "linux")]
 fn proc_owner(pid: i32) -> Option<(u32, u32)> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     policy::status_uids(&status)
