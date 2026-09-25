@@ -4065,3 +4065,252 @@ fn cad378_dispatch_record_forged_refs_and_body_bind_nothing() {
         "{recs:?}"
     );
 }
+
+/// CAD-555 N1: the board's app rows enumerate an installed app's
+/// workflows through the same strict walk `app install`/`approve`
+/// enforce — a `workflows/` dir planted as a symlink is the app's
+/// error row, never a listing of the foreign dir it points at.
+#[test]
+fn app_board_rows_never_follows_a_symlinked_workflows_dir() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    f.d.register("qa-1");
+    app_install_studio(&f);
+
+    // Replace the installed workflows/ with a link to a foreign dir.
+    let foreign = f.tmp.path().join("foreign-wf");
+    std::fs::create_dir_all(&foreign).unwrap();
+    std::fs::write(foreign.join("leak.md"), APP_WF).unwrap();
+    let appdir = f.pm_dir.join("demo/apps/studio");
+    std::fs::remove_dir_all(appdir.join("workflows")).unwrap();
+    std::os::unix::fs::symlink(&foreign, appdir.join("workflows")).unwrap();
+
+    let rows = cadence_agent::issue::app::board_rows(&f.pm_dir, "demo", &f.d.state);
+    // Nothing under the link is listed — no stem, no title.
+    assert!(
+        !rows.iter().any(|r| {
+            r["name"].as_str().map_or(false, |n| n.contains("leak"))
+                || r["title"].as_str().map_or(false, |t| t.contains("Run:"))
+        }),
+        "a planted workflows/ link must not list foreign workflows: {rows:?}"
+    );
+    // The app is not hidden either — its row carries why it cannot run.
+    let row = rows
+        .iter()
+        .find(|r| r["app"] == "studio")
+        .unwrap_or_else(|| panic!("no studio row: {rows:?}"));
+    assert!(
+        row["error"].as_str().unwrap_or_default().contains("symlink"),
+        "{row}"
+    );
+}
+
+/// CAD-555 N2: `plan propose --workflow <app>/<wf>` digests the same
+/// buffer it renders — the installed workflow file is read exactly
+/// once, so a co-host writer flipping it between reads can never get
+/// never-digested bytes into an approved proposal.
+#[test]
+fn app_plan_text_digests_the_bytes_it_renders() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    f.d.register("qa-1");
+    app_install_studio(&f);
+    f.d.operator_rpc("app_approve", json!({"project": "demo", "name": "studio"}))
+        .unwrap();
+    let wf = f.pm_dir.join("demo/apps/studio/workflows/do-check.md");
+    let approvals: std::collections::HashMap<String, Value> =
+        cadence_agent::issue::app::fetch_approvals(&f.d.state)
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+    let provided: std::collections::BTreeMap<String, String> =
+        [("title".to_string(), "x".to_string())].into_iter().collect();
+    let propose = || {
+        cadence_agent::issue::app::plan_text(
+            &f.pm_dir, &approvals, "demo", "studio", "do-check", &provided,
+        )
+        .unwrap()
+    };
+    #[cfg(target_os = "linux")]
+    let rendered = {
+        let mut rendered = String::new();
+        let opens = open_count(&wf, || {
+            rendered = propose();
+        });
+        assert_eq!(
+            opens, 1,
+            "the installed workflow must be read once — rendered bytes are digested bytes"
+        );
+        rendered
+    };
+    #[cfg(not(target_os = "linux"))]
+    let rendered = propose();
+    assert!(rendered.contains("Run: x"), "{rendered}");
+}
+
+/// Count `open(2)`s of `path` during `run` via inotify — proof a file
+/// is read exactly once (or not). ACCESS and CLOSE are watched too:
+/// inotify coalesces consecutive identical events, and the interleaved
+/// read/close of each `read_to_string` keeps its OPEN distinct.
+#[cfg(target_os = "linux")]
+fn open_count(path: &Path, run: impl FnOnce()) -> usize {
+    let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+    assert!(fd >= 0, "inotify_init1");
+    let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+    let wd = unsafe {
+        libc::inotify_add_watch(fd, c.as_ptr(), libc::IN_OPEN | libc::IN_ACCESS | libc::IN_CLOSE_NOWRITE)
+    };
+    assert!(wd >= 0, "inotify_add_watch {}", path.display());
+    let mut buf = [0u8; 8192];
+    while unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
+    run();
+    let mut opens = 0;
+    loop {
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if n <= 0 {
+            break;
+        }
+        let mut i = 0usize;
+        while i + 16 <= n as usize {
+            let mask = u32::from_ne_bytes(buf[i + 4..i + 8].try_into().unwrap());
+            let len = u32::from_ne_bytes(buf[i + 12..i + 16].try_into().unwrap()) as usize;
+            if mask & libc::IN_OPEN != 0 {
+                opens += 1;
+            }
+            i += 16 + len;
+        }
+    }
+    unsafe { libc::close(fd) };
+    opens
+}
+
+/// CAD-555 N5: a planted `apps/<name>` symlink is named and refused —
+/// the install never follows it and no byte lands through the link.
+#[test]
+fn app_install_never_writes_through_a_planted_symlink() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    f.d.register("qa-1");
+    let apps = f.pm_dir.join("demo/apps");
+    std::fs::create_dir_all(&apps).unwrap();
+    let loot = f.tmp.path().join("loot");
+    std::fs::create_dir_all(&loot).unwrap();
+    std::os::unix::fs::symlink(&loot, apps.join("studio")).unwrap();
+    let src = app_src(
+        &f,
+        "studio",
+        &[("app.md", APP_MD), ("workflows/do-check.md", APP_WF)],
+    );
+    let (ok, out) = f.cli(&[
+        "app",
+        "install",
+        src.to_str().unwrap(),
+        "--project",
+        "demo",
+    ]);
+    assert!(!ok && out.to_string().contains("symlink"), "{out}");
+    assert!(
+        std::fs::read_dir(&loot).unwrap().next().is_none(),
+        "no byte may land through the link: {out}"
+    );
+    assert!(
+        apps.join("studio")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the planted link is left untouched"
+    );
+}
+
+/// CAD-555 N3: `app install <git-source>` clones with `--` before the
+/// URL — a dash-led source is a repository name, never a switch — and
+/// `GIT_ALLOW_PROTOCOL` pins transports to https/ssh/file, so a scheme
+/// outside the list is refused before any transport runs.
+#[test]
+fn app_install_git_pins_url_and_transport() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    f.d.register("qa-1");
+
+    // `-C` after `--` is the repository name — the refusal names it as
+    // one; without `--` git reports an unknown switch instead.
+    let (ok, out) = f.cli(&["app", "install", "--project", "demo", "--", "-C"]);
+    assert!(
+        !ok && out.to_string().contains("repository '-C'"),
+        "{out}"
+    );
+
+    // `git://` is not in the pinned allowlist — refused by git before
+    // it can connect anywhere.
+    let (ok, out) = f.cli(&[
+        "app",
+        "install",
+        "git://127.0.0.1:1/x",
+        "--project",
+        "demo",
+    ]);
+    assert!(
+        !ok && out.to_string().contains("transport 'git' not allowed"),
+        "{out}"
+    );
+
+    // The pinned list still covers the file:// source the suite uses.
+    let repo = app_src(
+        &f,
+        "studio-git",
+        &[("app.md", APP_MD), ("workflows/do-check.md", APP_WF)],
+    );
+    let git = |args: &[&str]| {
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "git {args:?}: {o:?}");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["add", "-A"]);
+    git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qm",
+        "app",
+    ]);
+    let url = format!("file://{}", repo.display());
+    let (ok, out) = f.cli(&["app", "install", &url, "--project", "demo"]);
+    assert!(ok, "{out}");
+    assert_eq!(out["source"]["kind"], "git", "{out}");
+}
+
+/// CAD-555 N6: `app approve` serialises on the tracker write lock like
+/// `app update` — while a writer holds it the approve refuses rather
+/// than digesting a half-updated bundle.
+#[test]
+fn app_approve_takes_the_pm_lock() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    f.d.register("qa-1");
+    app_install_studio(&f);
+    let pm = cadence_agent::issue::Pm::at(&f.pm_dir).unwrap();
+    let held = pm.lock().unwrap();
+    let err = f
+        .d
+        .operator_rpc("app_approve", json!({"project": "demo", "name": "studio"}))
+        .unwrap_err();
+    assert!(err.to_string().contains("locked"), "{err}");
+    drop(held);
+    let out = f
+        .d
+        .operator_rpc("app_approve", json!({"project": "demo", "name": "studio"}))
+        .unwrap();
+    assert!(
+        out["digest"].as_str().unwrap_or_default().starts_with("sha256:"),
+        "{out}"
+    );
+}
