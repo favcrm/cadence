@@ -89,27 +89,6 @@ fn kickoff_body(
     )
 }
 
-/// The lane a plain-path kickoff body binds — `(worktree, branch)` —
-/// parsed back out of the fixed template [`kickoff_body`] writes.
-/// `dispatch_record` reads these from the delivered message instead of
-/// trusting request fields: a body counts as `issue`'s kickoff only
-/// when it names the issue in both fixed spots AND carries the
-/// worktree line — anything else is not a dispatch kickoff and cannot
-/// anchor a record (CAD-378).
-pub(crate) fn parse_kickoff_fields(body: &str, issue: &str) -> Option<(String, String)> {
-    // Anchor on the fixed trailer: the title (agent-writable) may
-    // itself contain the marker text, so the binding line is the LAST
-    // "Your worktree exists:" before ". Commit trailer: Issue: <id>."
-    let (head, _) = body.split_once(&format!("). Commit trailer: Issue: {issue}."))?;
-    if !head.contains(&format!(" — {issue}: ")) {
-        return None;
-    }
-    let rest = head.rsplit_once("Your worktree exists: ")?.1;
-    let (worktree, rest) = rest.split_once(" (branch ")?;
-    let (branch, _) = rest.split_once(", base ")?;
-    Some((worktree.to_string(), branch.to_string()))
-}
-
 /// CAD-159: an issue's acceptance items on one line; `None` when there
 /// are none. Always the whole list — CAD-160 removed the "N items, too
 /// long to inline" pointer, since criteria are never dropped.

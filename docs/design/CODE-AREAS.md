@@ -80,23 +80,27 @@ warns on what a lane has committed. Lane probes run on a bounded pool
 What the probe reads — the worktree directory and the `<rev>` it diffs
 — comes from the **daemon's dispatch record**, not the live tracker.
 `dispatches.json` in the daemon's state dir holds one record per issue:
-the worktree and branch the kickoff bound, the kickoff's message id,
-and the `pm` — the sender the daemon attributed when it delivered that
-kickoff. `dispatch_record` names the kickoff message and derives every
-recorded field from the daemon's own rows: for a `--job` dispatch the
-message must be the task's recorded kickoff and its job must name the
-issue (lane from the task row, pm from the job's PM); for a plain
-dispatch the body must carry the issue's binding line, the worktree and
-branch are parsed back out of it, and the issue must itself bind that
-message id (`message` ref) and record the lane open. Only the kickoff's
-own sender — or the operator — may write the record, and only the same
-PM (or the operator) may replace one that exists: a different agent's
-`dispatch_record` for an issue it did not dispatch is refused, so no
-agent can re-bind a lane onto a clean decoy (`master_dispatch` writes
-the record in-daemon with the master's alias). Request fields — `pm`,
-`worktree`, `branch` — steer nothing. `cadence dispatch` writes the
-record after the kickoff send; a record failure is reported on the
-dispatch result, never silently dropped.
+the worktree the kickoff bound (and the probed rev — the task's branch
+for a `--job` dispatch, the lane's checkout `HEAD` for a plain one),
+the kickoff's message id, and the `pm` — the sender the daemon
+attributed when it delivered that kickoff. `dispatch_record` names the
+kickoff message and derives every recorded field from the daemon's own
+rows: for a `--job` dispatch the message must be the task's recorded
+kickoff, delivered to the task's recorded assignee, and its job must
+name the issue (lane from the task row, pm from the job's PM); for a
+plain dispatch the message row itself must carry schema v16's
+daemon-written `issue`/`worktree` — set at send behind the steer gate,
+so only the worker's own PM or the operator can mark a send with a
+lane. The kickoff body and tracker refs are never read — both are
+agent-writable. Only the kickoff's own sender — or the operator — may
+write the record, and only the same PM (or the operator) may replace
+one that exists: a different agent's `dispatch_record` for an issue it
+did not dispatch is refused, so no agent can re-bind a lane onto a
+clean decoy (`master_dispatch` writes the record in-daemon with the
+master's alias). Request fields — `pm`, `worktree`, `branch` — steer
+nothing. `cadence dispatch` writes the record after the kickoff send;
+a record failure is reported on the dispatch result, never silently
+dropped.
 
 A lane with no dispatch record is **unbound**: `pm` is empty, `head`
 pins nothing, and its frontmatter worktree still feeds the advisory
@@ -154,16 +158,18 @@ aliases and planted frontmatter are all agent-writable.
 Residuals: area ownership lives in `PROJECT.md`, which agents can edit
 — deleting or renaming an area silences its rows, and a changed owner
 shows in the tracker's git history but needs no operator approval;
-advisory by design. `dispatch_record` binds the daemon's send record,
-so a record can never move a lane's pm or worktree onto a caller's
-claim — but a kickoff-shaped send an agent wrote itself can still
-anchor a record on an *unbound* lane when the issue's refs were
-corrupted to match (planted `message`/`worktree` refs are the same
-tracker-write class `claim.by` was); on a bound lane the different-PM
-refusal still holds. A same-uid process that writes the state dir
-directly can rewrite `dispatches.json`/`area_acks.json` (the CAD-276
-residual every state-dir record shares), which is why the feature
-warns and never refuses.
+advisory by design. `dispatch_record` binds only the daemon's own rows
+— the steer gate means an agent can never mark a send with a lane it
+does not own, so a forged kickoff body or planted tracker refs anchor
+nothing (round-4's forgery died with them). What remains is the PM's
+own authority: a PM may mark a send to ITS worker with any
+issue/worktree pair, and the record honestly names that PM — a PM
+mis-binding its own claimed dispatch is self-attribution, not forgery,
+and a bound record still refuses a different PM. A same-uid process
+that writes the state dir directly can rewrite
+`dispatches.json`/`area_acks.json` (the CAD-276 residual every
+state-dir record shares), which is why the feature warns and never
+refuses.
 
 ## Board
 
