@@ -960,14 +960,16 @@ pub fn run(
 
     // Exactly one send — plain text kickoff, or `job dispatch`'s
     // spec-bound kickoff for --job (its state lives on the task). Both
-    // record the lane on the message row — `issue`/`worktree` here, the
-    // job's own fields in `task_dispatch` — so a later re-dispatch can
-    // prove this kickoff's report belongs to THIS issue and lane
-    // (CAD-467).
+    // record the lane on the message row — `issue`/`worktree` via
+    // `dispatch_send`, which resolves the lane itself and only checks
+    // the worktree this dispatch started (CAD-378 R6: no caller field
+    // can set them), the job's own fields in `task_dispatch` — so a
+    // later re-dispatch can prove this kickoff's report belongs to
+    // THIS issue and lane (CAD-467).
     let (message, sent_state) = if let Some(body) = send_body {
         let sent = client::rpc(
             state_dir,
-            "agent_send",
+            "dispatch_send",
             json!({"alias": args.to, "text": body, "reply_to": reply_to, "message": mid,
                    "issue": front.id, "worktree": started["worktree"]}),
         )

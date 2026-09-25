@@ -2708,8 +2708,10 @@ impl Store {
     ///
     /// `issue`/`worktree` record the dispatch lane on the row
     /// (CAD-467): which issue's kickoff this is and the worktree it
-    /// runs against. Only the operator's `send` may carry them
-    /// (enforced at the RPC); every other enqueue passes `None`.
+    /// runs against. Only a dispatch may write them (CAD-378):
+    /// `dispatch_send` resolves the lane daemon-side, `task_dispatch`
+    /// reads its job rows; `send` refuses the fields outright and
+    /// every other enqueue passes `None`.
     /// A retry of the same envelope is `duplicate` only when it names
     /// the same superseded set; otherwise it is a conflict.
     #[allow(clippy::too_many_arguments)]

@@ -29,6 +29,7 @@ mod answer_rpc;
 mod area_rpc;
 mod caller_rule;
 mod delivery_rpc;
+mod dispatch_rpc;
 mod master_rpc;
 mod master_wake;
 mod operator_rpc;
@@ -2503,6 +2504,7 @@ impl Shared {
             "project_new" => self.rpc_project_new(params, peer_pid),
             "area_ack" => self.rpc_area_ack(params, peer_pid),
             "dispatch_record" => self.rpc_dispatch_record(params, peer_pid),
+            "dispatch_send" => self.rpc_dispatch_send(params, peer_pid),
             "rollout_grant" => self.rpc_rollout_grant(params, peer_pid),
             "rollout_revoke" => self.rpc_rollout_revoke(params, peer_pid),
             "project_work_approvals" => Ok(json!({
@@ -4486,32 +4488,23 @@ impl Shared {
         if let Some(caller) = &steering_caller {
             (steer.by, steer.by_kind) = caller.audit();
         }
-        // CAD-467: `issue`/`worktree` mark the dispatch lane on the
-        // message row itself — the reported-kickoff duplicate check
-        // trusts them because the tracker can't forge them. Recording
-        // provenance is a dispatch authority: only a caller who may
-        // steer the target (the operator, or its PM — dispatch's
-        // reply_to) may claim a lane on a send; any other caller is
-        // refused, never silently dropped (a dropped field would
-        // mis-suppress silently).
-        let issue = optional_str(params, "issue");
-        let worktree = optional_str(params, "worktree");
-        if issue.is_some() || worktree.is_some() {
+        // CAD-467 wrote `issue`/`worktree` on the message row at send,
+        // steer-gated — but the steer gate checks caller-versus-target,
+        // never the values, so a PM could mark a send to its own worker
+        // with a forged lane (CAD-378 R6). Now only dispatch paths write
+        // the tags: `dispatch_send` sets them from the lane the daemon
+        // itself resolves, `task_dispatch` from the job's rows. A caller
+        // field is refused outright — silently dropping it would let a
+        // retry pass as untagged and mis-suppress the reported-kickoff
+        // duplicate check, and would hide the forgery attempt.
+        if optional_str(params, "issue").is_some() || optional_str(params, "worktree").is_some() {
             let verb = "send --issue/--worktree";
             reject_identity_fields(params, verb)?;
-            let target = target
-                .as_ref()
-                .ok_or_else(|| Error::rejected("Unknown managed agent"))?;
-            let caller = steer_caller(verb)?;
-            let pm = self.effective_pm(target)?;
-            crate::peer::may_mutate_agent(
-                &caller,
-                &alias,
-                pm.as_deref(),
-                AgentMutation::Steer,
-                verb,
-            )
-            .map_err(Error::rejected)?;
+            return Err(Error::rejected(format!(
+                "{verb} refused: only a dispatch sets a message's lane tags — \
+                 `cadence dispatch` records the issue and lane worktree from \
+                 the daemon's own resolution; plain sends carry none"
+            )));
         }
         // A pty endpoint pastes literally and fails a body with control
         // characters at delivery; refuse it here so `send` never answers
@@ -4619,8 +4612,8 @@ impl Shared {
             &message,
             source,
             task,
-            issue,
-            worktree,
+            None,
+            None,
             &sender,
             &steer,
         )?;

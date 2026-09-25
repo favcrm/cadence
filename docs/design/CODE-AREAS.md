@@ -89,10 +89,15 @@ rows: for a `--job` dispatch the message must be the task's recorded
 kickoff, delivered to the task's recorded assignee, and its job must
 name the issue (lane from the task row, pm from the job's PM); for a
 plain dispatch the message row itself must carry schema v16's
-daemon-written `issue`/`worktree` — set at send behind the steer gate,
-so only the worker's own PM or the operator can mark a send with a
-lane. The kickoff body and tracker refs are never read — both are
-agent-writable. Only the kickoff's own sender — or the operator — may
+daemon-written `issue`/`worktree` — and only a dispatch path can write
+them. `agent_send`/`message send` refuse the fields for every caller
+(the steer gate authenticated caller-versus-target, never the values,
+so a PM could mark a send to its own worker with a forged lane);
+`dispatch_send` — what `cadence dispatch` and `master_dispatch` send
+the kickoff through — resolves the lane itself from the issue's open
+worktree ref, verified as a live worktree of a declared repo, and lets
+the caller's `worktree` only corroborate that resolution. The kickoff
+body and tracker refs are never read — both are agent-writable. Only the kickoff's own sender — or the operator — may
 write the record, and only the same PM (or the operator) may replace
 one that exists: a different agent's `dispatch_record` for an issue it
 did not dispatch is refused, so no agent can re-bind a lane onto a
@@ -159,13 +164,15 @@ Residuals: area ownership lives in `PROJECT.md`, which agents can edit
 — deleting or renaming an area silences its rows, and a changed owner
 shows in the tracker's git history but needs no operator approval;
 advisory by design. `dispatch_record` binds only the daemon's own rows
-— the steer gate means an agent can never mark a send with a lane it
-does not own, so a forged kickoff body or planted tracker refs anchor
-nothing (round-4's forgery died with them). What remains is the PM's
-own authority: a PM may mark a send to ITS worker with any
-issue/worktree pair, and the record honestly names that PM — a PM
-mis-binding its own claimed dispatch is self-attribution, not forgery,
-and a bound record still refuses a different PM. A same-uid process
+— no send caller can set the lane tags at all, so a forged kickoff
+body, planted tracker refs, or a PM marking a send to its own worker
+all anchor nothing (round-4's forgery and the round-5 steer-gate
+residual died with them). What remains: `dispatch_send` resolves the
+lane from the issue's open worktree refs — agent-writable data — but
+verifies each candidate is a live worktree of a declared repo under
+its worktrees dir, so a planted ref can only ever name a real cadence
+lane of the same project, and an issue with several verifying lanes
+refuses rather than guesses. A same-uid process
 that writes the state dir directly can rewrite
 `dispatches.json`/`area_acks.json` (the CAD-276 residual every
 state-dir record shares), which is why the feature warns and never

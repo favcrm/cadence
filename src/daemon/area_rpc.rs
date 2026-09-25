@@ -176,13 +176,15 @@ impl Shared {
     /// kickoff, its job must name this issue, and it must have been
     /// delivered to the task's recorded worker; the lane comes from the
     /// task's row and the pm is the job's recorded PM. A plain kickoff
-    /// must carry schema v16's daemon-written `issue`/`worktree` — set
-    /// at send behind the steer gate, so only the worker's own PM or
-    /// the operator can mark a send with a lane — and its pm is the
-    /// sender the daemon attributed when it was queued (`reply_to`
-    /// stands in only when the recipient keeps no thread entry). The
-    /// kickoff body and tracker refs prove nothing — both are
-    /// agent-writable — so none is read.
+    /// must carry schema v16's daemon-written `issue`/`worktree` — and
+    /// since R6 only `dispatch_send` can write them (the lane it
+    /// resolved itself) and `task_dispatch` (the job's rows); no caller
+    /// field on any send reaches those columns, so their presence IS
+    /// the dispatch provenance and no marker column is needed. The pm
+    /// is the sender the daemon attributed when it was queued
+    /// (`reply_to` stands in only when the recipient keeps no thread
+    /// entry). The kickoff body and tracker refs prove nothing — both
+    /// are agent-writable — so none is read.
     fn kickoff_binding(
         &self,
         verb: &str,
@@ -240,10 +242,13 @@ impl Shared {
             )
         } else {
             // A plain kickoff binds the lane the daemon itself wrote on
-            // the message at send time (schema v16): `issue` must name
-            // THIS issue and `worktree` IS the bound lane — absolute,
-            // like every `dispatch::run` send records it. A message
-            // without them is just mail, however its body reads.
+            // the message (schema v16): `issue` must name THIS issue
+            // and `worktree` IS the bound lane — absolute, like every
+            // `dispatch::run` send records it. Only `dispatch_send`
+            // writes these on a taskless row — no `agent_send`/`message
+            // send` caller can — so a message carrying them came from
+            // a dispatch; one without them is just mail, however its
+            // body reads.
             if msg.issue.as_deref() != Some(id) {
                 return Err(Error::rejected(format!(
                     "{verb}: message {} carries no daemon-written `issue` \
