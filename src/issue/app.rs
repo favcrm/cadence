@@ -1737,6 +1737,11 @@ pub fn board_rows(pm_dir: &Path, project: &str, state_dir: &Path) -> Vec<Value> 
             continue;
         };
         for wf in wf_entries.flatten() {
+            // Never follow a planted link — `check_installed` already
+            // attaches the reason the app cannot run.
+            if wf.file_type().map(|t| !t.is_file()).unwrap_or(true) {
+                continue;
+            }
             let Some(stem) = wf
                 .file_name()
                 .to_str()
