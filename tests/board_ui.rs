@@ -60,16 +60,16 @@ fn status_rows_probe_once_and_footer() {
     )
     .unwrap();
     // w1 mid-turn: chatty never completes, so m1 stays running.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "draft the migration plan", "message": "m1"}),
+    d.send(
+        "w1",
+        json!({"text": "draft the migration plan", "message": "m1"}),
     )
     .unwrap();
     d.wait_message("w1", "m1", &["running"], 15);
     // pm holds an undrained message — unread inbox in the footer.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "pm", "text": "note for the operator", "message": "pm1"}),
+    d.send(
+        "pm",
+        json!({"text": "note for the operator", "message": "pm1"}),
     )
     .unwrap();
     // fx is fenced: one unknown message, attention state.
@@ -234,11 +234,8 @@ fn overview_daemon_info_fenced_and_inbox_rows() {
     d.wait_agent("w1", "idle", 10);
     fence_agent(&d, "w1", "x1");
     d.register_inbox("pm");
-    d.rpc(
-        "agent_send",
-        json!({"alias": "pm", "text": "ping", "message": "n1"}),
-    )
-    .unwrap();
+    d.send("pm", json!({"text": "ping", "message": "n1"}))
+        .unwrap();
 
     let view = overview_at(home.path(), &d.state, None, &[]);
     let needs = view["needs_me"].as_array().unwrap();
@@ -273,11 +270,8 @@ fn overview_approval_row_for_brokered_request() {
     d.register_inbox("pm");
     d.register_claude("w1", json!({"upstream": "pm", "broker_approvals": true}));
     d.wait_agent("w1", "idle", 15);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "run ls", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "run ls", "message": "m1"}))
+        .unwrap();
     d.wait_agent("w1", "waiting_input", 15);
     let req = d.wait_request("w1", 15);
     let handle = req["request"].as_str().unwrap().to_string();
@@ -655,11 +649,8 @@ fn overview_needs_me_audience_follows_owner_liveness() {
     }
     // A silent turn stalls the worker: a row its PM owns.
     for w in ["w1", "w2", "w3"] {
-        d.rpc(
-            "agent_send",
-            json!({"alias": w, "text": "SLEEP:20", "message": format!("s-{w}")}),
-        )
-        .unwrap();
+        d.send(w, json!({"text": "SLEEP:20", "message": format!("s-{w}")}))
+            .unwrap();
     }
     for w in ["w1", "w2", "w3"] {
         let id = format!("s-{w}");
@@ -917,11 +908,8 @@ fn auto_resume_failure_raises_needs_me_row_naming_the_message() {
 
     std::fs::write(&flag, "").unwrap();
     for (alias, id) in [("w-fail", "m-fail"), ("w-ok", "m-ok")] {
-        d.rpc(
-            "agent_send",
-            json!({"alias": alias, "text": "work", "message": id}),
-        )
-        .unwrap();
+        d.send(alias, json!({"text": "work", "message": id}))
+            .unwrap();
     }
     d.wait_message("w-ok", "m-ok", &["completed"], 20);
     let failed = d.wait_event("w-fail", "agent_auto_resume_failed", 20);

@@ -530,6 +530,18 @@ impl TestDaemon {
         client::rpc(&self.state, method, params)
     }
 
+    /// `agent_send` with `alias` merged into `fields` — the suite's
+    /// dominant call shape.
+    pub fn send(
+        &self,
+        alias: impl AsRef<str>,
+        fields: Value,
+    ) -> cadence_agent::Result<Value> {
+        let mut fields = fields.as_object().unwrap().clone();
+        fields.insert("alias".into(), json!(alias.as_ref()));
+        self.rpc("agent_send", Value::Object(fields))
+    }
+
     /// `rpc` from a caller that is provably the operator however the
     /// suite is run. Operator-only methods (`slot_reconcile`,
     /// `approval_record`, …) refuse any connection whose ancestry
@@ -799,11 +811,8 @@ impl Get for Value {
 /// The DISCONNECT keyword makes the fake provider drop mid-turn — the
 /// message lands `unknown` and fences the agent.
 pub fn fence_agent(d: &TestDaemon, alias: &str, id: &str) {
-    d.rpc(
-        "agent_send",
-        json!({"alias": alias, "text": "DISCONNECT", "message": id}),
-    )
-    .unwrap();
+    d.send(alias, json!({"text": "DISCONNECT", "message": id}))
+        .unwrap();
     d.wait_message(alias, id, &["unknown"], 15);
     d.wait_agent(alias, "attention", 10);
 }
@@ -3152,11 +3161,8 @@ pub fn emit_park_phase_trace(d: &TestDaemon, test_name: &str, alias: &str, route
 /// routed delivery id once the worker's own turn has completed. The
 /// route and the completion commit together.
 pub fn route_worker_result(d: &TestDaemon, worker: &str, pm: &str, id: &str, text: &str) -> String {
-    d.rpc(
-        "agent_send",
-        json!({"alias": worker, "text": text, "message": id, "reply_to": pm}),
-    )
-    .unwrap();
+    d.send(worker, json!({"text": text, "message": id, "reply_to": pm}))
+        .unwrap();
     d.wait_message(worker, id, &["completed"], 15);
     d.rpc("agent_show", json!({"alias": pm})).unwrap()["messages"]
         .as_array()

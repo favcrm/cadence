@@ -38,11 +38,8 @@ fn long_result_text_survives_store_and_inbox_route() {
     // same single-line result text at each probed size.
     for size in [200usize, 2_000, 8_000, 39_000] {
         let id = format!("m{size}");
-        d.rpc(
-            "agent_send",
-            json!({"alias": "w1", "text": "x".repeat(size), "message": id}),
-        )
-        .unwrap();
+        d.send("w1", json!({"text": "x".repeat(size), "message": id}))
+            .unwrap();
         let m = d.wait_message("w1", &id, &["completed"], 30);
         assert_eq!(
             m["result"]["text"].as_str().unwrap().len(),
@@ -82,11 +79,8 @@ fn long_result_bounded_only_for_pty_paste() {
     d.register_claude("w1", json!({"upstream": "pm"}));
     d.wait_agent("w1", "idle", 15);
     d.rpc("agent_ready", json!({"alias": "pm"})).unwrap();
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "x".repeat(39_000), "message": "m1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "x".repeat(39_000), "message": "m1"}))
+        .unwrap();
     let m1 = d.wait_message("w1", "m1", &["completed"], 30);
     assert_eq!(m1["result"]["text"].as_str().unwrap().len(), 39_008);
     // The routed delivery pastes (completes) — before the bound it
@@ -127,10 +121,9 @@ fn long_reconcile_note_survives_store_and_route() {
     d.wait_agent("w1", "idle", 10);
     // An unknown message with reply_to reconciled completed routes its
     // note — a 40k single-line note keeps whole in store and inbox.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "DISCONNECT", "message": "u1",
-               "reply_to": "pm"}),
+    d.send(
+        "w1",
+        json!({"text": "DISCONNECT", "message": "u1", "reply_to": "pm"}),
     )
     .unwrap();
     d.wait_message("w1", "u1", &["unknown"], 15);
@@ -174,11 +167,8 @@ fn long_report_text_survives_pty_report_to_inbox() {
     d.wait_agent("w1", "idle", 20);
     for size in [200usize, 2_000, 8_000, 40_000] {
         let id = format!("r{size}");
-        d.rpc(
-            "agent_send",
-            json!({"alias": "w1", "text": "w", "message": id, "reply_to": "pm"}),
-        )
-        .unwrap();
+        d.send("w1", json!({"text": "w", "message": id, "reply_to": "pm"}))
+            .unwrap();
         d.operator_rpc("agent_ready", json!({"alias": "w1"}))
             .unwrap();
         let token = pty_token(&d, "w1", &id);
@@ -388,9 +378,9 @@ fn memory_native_socket_identity_requires_distinct_reviewers() {
     // Keep the author in a real running turn while its provider socket
     // performs the proposal. This proves the resolver accepts a live,
     // owned endpoint in the ordinary worker state, not only an idle pane.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "author", "text": "hold native identity", "message": "memory-busy"}),
+    d.send(
+        "author",
+        json!({"text": "hold native identity", "message": "memory-busy"}),
     )
     .unwrap();
     let busy_token = pty_token(&d, "author", "memory-busy");

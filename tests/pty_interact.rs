@@ -27,27 +27,21 @@ fn nudge_refused_off_pty_and_with_ready() {
     d.wait_agent("mgd", "idle", 10);
     for (alias, kind) in [("mgd", "fake/fake"), ("box", "inbox/inbox")] {
         let err = d
-            .rpc(
-                "agent_send",
-                json!({"alias": alias, "text": "steer", "nudge": true}),
-            )
+            .send(alias, json!({"text": "steer", "nudge": true}))
             .unwrap_err()
             .to_string();
         assert!(err.contains("pty") && err.contains(kind), "{alias}: {err}");
         // The forged-source path takes the same check.
         let err = d
-            .rpc(
-                "agent_send",
-                json!({"alias": alias, "text": "steer", "source": "nudge"}),
-            )
+            .send(alias, json!({"text": "steer", "source": "nudge"}))
             .unwrap_err()
             .to_string();
         assert!(err.contains(kind), "{alias}: {err}");
     }
     let err = d
-        .rpc(
-            "agent_send",
-            json!({"alias": "mgd", "text": "steer", "nudge": true, "reply_to": "box"}),
+        .send(
+            "mgd",
+            json!({"text": "steer", "nudge": true, "reply_to": "box"}),
         )
         .unwrap_err()
         .to_string();
@@ -124,10 +118,9 @@ fn pty_stall_static_screen_fires_once_and_notices() {
     d.register_inbox("pm");
     d.register_stub("w1", json!({"auto_ready": "verified", "stall_secs": 2}));
     d.wait_agent("w1", "idle", 20);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "do work", "reply_to": "pm",
-               "message": "ms1"}),
+    d.send(
+        "w1",
+        json!({"text": "do work", "reply_to": "pm", "message": "ms1"}),
     )
     .unwrap();
     d.wait_message("w1", "ms1", &["running"], 15);
@@ -198,10 +191,9 @@ fn pty_stall_resume_rearms_and_spinner_is_not_activity() {
     d.register_inbox("pm");
     d.register_stub("w1", json!({"auto_ready": "verified", "stall_secs": 2}));
     d.wait_agent("w1", "idle", 20);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "do work", "reply_to": "pm",
-               "message": "ms2"}),
+    d.send(
+        "w1",
+        json!({"text": "do work", "reply_to": "pm", "message": "ms2"}),
     )
     .unwrap();
     d.wait_message("w1", "ms2", &["running"], 15);
@@ -271,10 +263,9 @@ fn pty_stall_transient_sample_neither_resumes_nor_resets() {
     d.register_inbox("pm");
     d.register_stub("w1", json!({"auto_ready": "verified", "stall_secs": 8}));
     d.wait_agent("w1", "idle", 20);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "do work", "reply_to": "pm",
-               "message": "mtr"}),
+    d.send(
+        "w1",
+        json!({"text": "do work", "reply_to": "pm", "message": "mtr"}),
     )
     .unwrap();
     d.wait_message("w1", "mtr", &["running"], 15);
@@ -378,10 +369,9 @@ fn fake_silent_turn_stalls_and_brokered_wait_does_not() {
     d.wait_agent("w1", "idle", 10);
 
     // A brokered wait outlasts the budget without stalling.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "NEED_INPUT:hold",
-               "reply_to": "pm", "message": "m-need"}),
+    d.send(
+        "w1",
+        json!({"text": "NEED_INPUT:hold", "reply_to": "pm", "message": "m-need"}),
     )
     .unwrap();
     d.wait_agent("w1", "waiting_input", 10);
@@ -429,10 +419,9 @@ fn fake_silent_turn_stalls_and_brokered_wait_does_not() {
     // by payload: a `turn_stalled` for m-need landing late (between
     // respond and completion on a slow host) must not be returned
     // here (CAD-222).
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "SLEEP:12", "reply_to": "pm",
-               "message": "m-sleep"}),
+    d.send(
+        "w1",
+        json!({"text": "SLEEP:12", "reply_to": "pm", "message": "m-sleep"}),
     )
     .unwrap();
     let e = d.wait_event_where(
@@ -464,10 +453,9 @@ fn stall_secs_zero_disables_and_live_set_rearms() {
     d.register_inbox("pm");
     register_fake_opts(&d, "w1", json!({"stall_secs": 0}));
     d.wait_agent("w1", "idle", 10);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "SLEEP:14", "reply_to": "pm",
-               "message": "m-zero"}),
+    d.send(
+        "w1",
+        json!({"text": "SLEEP:14", "reply_to": "pm", "message": "m-zero"}),
     )
     .unwrap();
     d.wait_message("w1", "m-zero", &["running"], 10);
@@ -562,11 +550,8 @@ fn pty_approval_menu_blocks_pastes_and_answers() {
     stall_sample(1);
     d.register_devin_opts("dv", json!({"auto_ready": "verified"}));
     d.wait_agent("dv", "idle", 20);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "dv", "text": "do work", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("dv", json!({"text": "do work", "message": "m1"}))
+        .unwrap();
     pty_token(&d, "dv", "m1");
 
     // The menu appears mid-turn.
@@ -589,11 +574,8 @@ fn pty_approval_menu_blocks_pastes_and_answers() {
     // naming the menu, and no claim is eaten by the refusal.
     d.rpc("agent_ready", json!({"alias": "dv", "force": true}))
         .unwrap();
-    d.rpc(
-        "agent_send",
-        json!({"alias": "dv", "text": "wait for idle", "message": "m2"}),
-    )
-    .unwrap();
+    d.send("dv", json!({"text": "wait for idle", "message": "m2"}))
+        .unwrap();
     let wait = d.wait_event("dv", "gate_wait", 15);
     assert!(
         wait["payload"]["reason"]
@@ -672,11 +654,8 @@ fn pty_silent_end_sends_one_report_reminder() {
         json!({"auto_ready": "verified", "silent_end_secs": 4}),
     );
     d.wait_agent("w1", "idle", 20);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "do work", "message": "ms9"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "do work", "message": "ms9"}))
+        .unwrap();
     let token = pty_token(&d, "w1", "ms9");
     d.wait_event("w1", "turn_silent_end", 40);
 
@@ -774,11 +753,8 @@ fn pty_silent_end_reminder_is_not_resent_after_restart() {
         json!({"auto_ready": "verified", "silent_end_secs": 4}),
     );
     d.wait_agent("w1", "idle", 20);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "do work", "message": "ms9"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "do work", "message": "ms9"}))
+        .unwrap();
     pty_token(&d, "w1", "ms9");
     d.wait_event("w1", "turn_silent_end", 40);
     let reminders = |d: &TestDaemon| -> Vec<Value> {
@@ -833,11 +809,8 @@ fn pty_queued_menu_surfaces_and_answers() {
 
     // The menu opens first; the send behind it can only queue.
     atomic_write(d.pane_file(&mock, "dv", "tui-state"), DEVIN_MENU);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "dv", "text": "blocked send", "message": "mq"}),
-    )
-    .unwrap();
+    d.send("dv", json!({"text": "blocked send", "message": "mq"}))
+        .unwrap();
     // `queued` or `submitting` — the delivery loop may have already
     // claimed the head and be gate-waiting on the menu; it cannot be
     // running while the pane shows a menu.
@@ -1224,11 +1197,8 @@ fn pty_gate_probe_failure_is_a_gate_refusal() {
     // the knob stays env-global rather than growing a per-pane
     // failure file.
     std::env::set_var("MOCK_TMUX_FAIL", "capture-pane");
-    d.rpc(
-        "agent_send",
-        json!({"alias": "dv", "text": "during outage", "message": "mf"}),
-    )
-    .unwrap();
+    d.send("dv", json!({"text": "during outage", "message": "mf"}))
+        .unwrap();
     let wait = d.wait_event("dv", "gate_wait", 15);
     assert!(
         wait["payload"]["reason"]
@@ -1281,11 +1251,8 @@ fn pty_answer_refuses_without_a_menu() {
 /// marker, no menu. The delivery's own paste and Enter are the only
 /// keys the pane has seen. Answers the turn token.
 fn stuck_draft(d: &TestDaemon, mock: &MockStub, alias: &str, id: &str) -> String {
-    d.rpc(
-        "agent_send",
-        json!({"alias": alias, "text": RECOVER_BODY, "message": id}),
-    )
-    .unwrap();
+    d.send(alias, json!({"text": RECOVER_BODY, "message": id}))
+        .unwrap();
     let token = pty_token(d, alias, id);
     atomic_write(d.stub_pane_file(mock, alias, "input"), RECOVER_BODY);
     let probe = d.rpc("agent_probe", json!({"alias": alias})).unwrap();
@@ -1530,11 +1497,8 @@ fn recover_submit_refuses_stale_generation() {
 #[test]
 fn recover_submit_refuses_other_message_pending() {
     let (d, mock, _token) = recover_fixture(json!({"auto_ready": "verified"}));
-    d.rpc(
-        "agent_send",
-        json!({"alias": "st", "text": "a follow-up", "message": "m2"}),
-    )
-    .unwrap();
+    d.send("st", json!({"text": "a follow-up", "message": "m2"}))
+        .unwrap();
     assert_eq!(d.message_state("st", "m2"), "queued");
     let err = recover(&d, "st", "m2").unwrap_err();
     assert!(err.to_string().contains("holds is m1"), "{err}");
@@ -1701,11 +1665,8 @@ fn recover_submit_devin_lost_submit() {
         format!("{}\nSWE-2 Max\n", "─".repeat(60)),
     );
     d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
-    d.rpc(
-        "agent_send",
-        json!({"alias": "dv1", "text": RECOVER_BODY, "message": "k1"}),
-    )
-    .unwrap();
+    d.send("dv1", json!({"text": RECOVER_BODY, "message": "k1"}))
+        .unwrap();
     let token = pty_token(&d, "dv1", "k1");
     atomic_write(d.pane_file(&mock, "dv1", "input"), RECOVER_BODY);
     let r = recover(&d, "dv1", "k1").unwrap();
@@ -1874,11 +1835,8 @@ fn steering_send_caller_rule_per_route() {
     let mut w3 = w3;
     // Planted rows own no actor: w1's queue stays queued.
     for id in ["q1", "q2", "q3"] {
-        d.rpc(
-            "agent_send",
-            json!({"alias": "w1", "text": format!("stale {id}"), "message": id}),
-        )
-        .unwrap();
+        d.send("w1", json!({"text": format!("stale {id}"), "message": id}))
+            .unwrap();
     }
     let steer = |id: &str, target: &str| {
         json!({"alias": target, "text": "the current instruction", "message": id,
@@ -2010,23 +1968,16 @@ fn urgent_waits_for_the_open_approval_then_goes_first() {
     let d = TestDaemon::start();
     d.register("w1");
     d.wait_agent("w1", "idle", 10);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "NEED_INPUT:hold", "message": "m0"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "NEED_INPUT:hold", "message": "m0"}))
+        .unwrap();
     d.wait_agent("w1", "waiting_input", 10);
     for id in ["n1", "n2"] {
-        d.rpc(
-            "agent_send",
-            json!({"alias": "w1", "text": format!("normal {id}"), "message": id}),
-        )
-        .unwrap();
+        d.send("w1", json!({"text": format!("normal {id}"), "message": id}))
+            .unwrap();
     }
-    d.operator_rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "urgent correction", "message": "u1",
-               "priority": "urgent"}),
+    d.send(
+        "w1",
+        json!({"text": "urgent correction", "message": "u1", "priority": "urgent"}),
     )
     .unwrap();
     // The open approval and its turn are untouched.
@@ -2068,30 +2019,23 @@ fn pty_urgent_waits_for_the_held_turn_then_goes_first() {
     d.register_stub("w1", json!({"auto_ready": "verified"}));
     d.wait_agent("helper", "idle", 10);
     d.wait_agent("w1", "idle", 20);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "held turn", "message": "h0"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "held turn", "message": "h0"}))
+        .unwrap();
     let token0 = pty_token(&d, "w1", "h0");
     for id in ["n1", "n2"] {
-        d.rpc(
-            "agent_send",
-            json!({"alias": "w1", "text": format!("normal {id}"), "message": id}),
-        )
-        .unwrap();
+        d.send("w1", json!({"text": format!("normal {id}"), "message": id}))
+            .unwrap();
     }
-    d.operator_rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "urgent correction", "message": "u1",
-               "priority": "urgent"}),
+    d.send(
+        "w1",
+        json!({"text": "urgent correction", "message": "u1", "priority": "urgent"}),
     )
     .unwrap();
     // The actor keeps claiming past the hold: a routed notice queued
     // after u1 is pasted, while u1 stays queued behind the held turn.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "helper", "text": "ping", "message": "x1", "reply_to": "w1"}),
+    d.send(
+        "helper",
+        json!({"text": "ping", "message": "x1", "reply_to": "w1"}),
     )
     .unwrap();
     d.wait_message("helper", "x1", &["completed"], 15);

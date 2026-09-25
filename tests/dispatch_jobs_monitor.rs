@@ -674,10 +674,9 @@ fn task_attached_send_and_self() {
 
     // `send --task` attaches for indexing — the message completes
     // normally and does NOT drive the task state machine.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "ping", "message": "adhoc1",
-               "task": "j1-t2"}),
+    d.send(
+        "w1",
+        json!({"text": "ping", "message": "adhoc1", "task": "j1-t2"}),
     )
     .unwrap();
     d.wait_message("w1", "adhoc1", &["completed"], 15);
@@ -1731,11 +1730,8 @@ fn dispatch_kickoff_and_finish_guards() {
     d.wait_agent("dvb", "idle", 15);
     let (ok, _) = cli(&["issue", "start", "D-3", "--owner", "dvb"]);
     assert!(ok);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "dvb", "text": "keep working", "message": "mk1"}),
-    )
-    .unwrap();
+    d.send("dvb", json!({"text": "keep working", "message": "mk1"}))
+        .unwrap();
     d.fixture_rpc("agent_ready", json!({"alias": "dvb"}))
         .unwrap();
     d.wait_message("dvb", "mk1", &["running"], 10);
@@ -2022,10 +2018,9 @@ fn dispatch_folds_bootstrap_and_suppresses_reported_duplicate() {
 
     // The freshly joined worker's bootstrap, still queued — seeded the
     // way `join` writes it (deterministic id, bootstrap source).
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "bootstrap body", "message": "bootstrap-w1",
-               "source": "bootstrap"}),
+    d.send(
+        "w1",
+        json!({"text": "bootstrap body", "message": "bootstrap-w1", "source": "bootstrap"}),
     )
     .unwrap();
     assert_eq!(d.message_state("w1", "bootstrap-w1"), "queued");
@@ -2204,11 +2199,8 @@ fn dispatch_folds_bootstrap_and_suppresses_reported_duplicate() {
     let (ok, started) = cli(&["issue", "start", "D-6", "--owner", "w1", "--by", "pm"]);
     assert!(ok, "{started}");
     let wt6 = started["worktree"].as_str().unwrap().to_string();
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "ordinary ask", "message": "m-plain"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "ordinary ask", "message": "m-plain"}))
+        .unwrap();
     {
         let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
         conn.execute(
@@ -2241,10 +2233,9 @@ fn dispatch_folds_bootstrap_and_suppresses_reported_duplicate() {
 
     // Fold failure paths: a send that fails leaves the fold-intended
     // bootstrap queued and says so on the issue.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w4", "text": "boot4", "message": "bootstrap-w4",
-               "source": "bootstrap"}),
+    d.send(
+        "w4",
+        json!({"text": "boot4", "message": "bootstrap-w4", "source": "bootstrap"}),
     )
     .unwrap();
     let (ok, err) = cli(&[
@@ -2286,10 +2277,9 @@ fn dispatch_folds_bootstrap_and_suppresses_reported_duplicate() {
     // before any cancel: the bootstrap stays queued. The issue is
     // pre-started identically (same owner, same claim holder) so the
     // lock only bites at the dispatch's own ref write.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w5", "text": "boot5", "message": "bootstrap-w5",
-               "source": "bootstrap"}),
+    d.send(
+        "w5",
+        json!({"text": "boot5", "message": "bootstrap-w5", "source": "bootstrap"}),
     )
     .unwrap();
     let (ok, started) = cli(&["issue", "start", "D-8", "--owner", "w5", "--by", "pm"]);
@@ -2318,10 +2308,9 @@ fn dispatch_folds_bootstrap_and_suppresses_reported_duplicate() {
     // A bootstrap too large to fold leaves the fold alone: still
     // queued, the kickoff sends unfolded behind it.
     let big = "b".repeat(3900);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w3", "text": big, "message": "bootstrap-w3",
-               "source": "bootstrap"}),
+    d.send(
+        "w3",
+        json!({"text": big, "message": "bootstrap-w3", "source": "bootstrap"}),
     )
     .unwrap();
     let (ok, out) = dispatch("D-4", "w3");
@@ -2480,11 +2469,8 @@ fn finish_guard_per_worktree() {
     d.wait_agent("dv", "idle", 15);
     let (ok, _) = cli(&["issue", "set", "D-3", "owner=dv"]);
     assert!(ok);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "dv", "text": "queued against C", "message": "mkc"}),
-    )
-    .unwrap();
+    d.send("dv", json!({"text": "queued against C", "message": "mkc"}))
+        .unwrap();
     let (ok, _) = cli(&["issue", "ref", "D-3", "message", "mkc"]);
     assert!(ok);
     let (ok, err) = cli(&["issue", "finish", "D-3"]);

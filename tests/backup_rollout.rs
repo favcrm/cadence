@@ -51,11 +51,8 @@ fn daemon_restart_skips_fenced_and_relaunches_healthy() {
         kinds.iter().any(|k| k == "relaunch_skipped"),
         "events: {kinds:?}"
     );
-    d.rpc(
-        "agent_send",
-        json!({"alias": "fenced", "text": "later", "message": "m2"}),
-    )
-    .unwrap();
+    d.send("fenced", json!({"text": "later", "message": "m2"}))
+        .unwrap();
     // CAD-184 kept sleep: absence window — no actor runs for a fenced or
     // stopped agent, so nothing records a refusal to poll for.
     thread::sleep(Duration::from_secs(1));
@@ -84,11 +81,8 @@ fn daemon_restart_reports_fenced_turn() {
     d.register_devin("dv1", None);
     d.wait_agent("dv1", "idle", 20);
     d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
-    d.rpc(
-        "agent_send",
-        json!({"alias": "dv1", "text": "task", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("dv1", json!({"text": "task", "message": "m1"}))
+        .unwrap();
     let _token = pty_token(&d, "dv1", "m1");
     let pane_pid: i32 = std::fs::read_to_string(d.pane_file(&mock, "dv1", "pid"))
         .unwrap()
@@ -124,11 +118,8 @@ fn daemon_restart_reports_kept_turn() {
     d.register_devin("dv", None);
     d.wait_agent("dv", "idle", 20);
     d.rpc("agent_ready", json!({"alias": "dv"})).unwrap();
-    d.rpc(
-        "agent_send",
-        json!({"alias": "dv", "text": "task", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("dv", json!({"text": "task", "message": "m1"}))
+        .unwrap();
     let token = pty_token(&d, "dv", "m1");
     let home = TempDir::new().unwrap();
     hold_rollout_lease(home.path(), &d.state);
@@ -1148,11 +1139,8 @@ fn auto_stop_idle_agent_stops_with_event_label_and_resumes() {
     d.register_inbox("pm");
     register_fake_opts(&d, "w1", json!({"upstream": "pm"}));
     d.wait_agent("w1", "idle", 20);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "hello", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "hello", "message": "m1"}))
+        .unwrap();
     d.wait_message("w1", "m1", &["completed"], 20);
     let status = auto_stop_status(&d);
     assert_eq!(status["enabled"], true, "{status}");
@@ -1239,11 +1227,8 @@ fn auto_stop_idle_agent_stops_with_event_label_and_resumes() {
     let why = status["last_kept"]["w1"].as_str().unwrap();
     assert!(why.starts_with("idle "), "{status}");
     assert_eq!(d.wait_agent("w1", "idle", 5)["state"], "idle");
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "again", "message": "m2"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "again", "message": "m2"}))
+        .unwrap();
     d.wait_message("w1", "m2", &["completed"], 20);
 }
 
@@ -1294,11 +1279,8 @@ fn auto_stop_keeps_pm_inbox_opted_out_and_busy_agents() {
         .to_string()
         .contains("only applies to endpoints with an actor"));
     // A turn held open: busy for the whole check.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w-busy", "text": "SLEEP:30", "message": "hold"}),
-    )
-    .unwrap();
+    d.send("w-busy", json!({"text": "SLEEP:30", "message": "hold"}))
+        .unwrap();
     d.wait_message("w-busy", "hold", &["running"], 20);
 
     offset.store(7200, std::sync::atomic::Ordering::SeqCst);
@@ -1438,11 +1420,8 @@ fn auto_resume_after_restart_only_for_the_timers_stop() {
         assert_eq!(d.wait_agent(alias, "stopped", 10)["state"], "stopped");
     }
     for (alias, id) in [("w-op", "m-op"), ("w-both", "m-both"), ("w-auto", "m-auto")] {
-        d.rpc(
-            "agent_send",
-            json!({"alias": alias, "text": "work", "message": id}),
-        )
-        .unwrap();
+        d.send(alias, json!({"text": "work", "message": id}))
+            .unwrap();
     }
     // The auto-stopped agent resumes on its saved thread and delivers.
     let done = d.wait_message("w-auto", "m-auto", &["completed"], 20);

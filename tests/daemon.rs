@@ -28,26 +28,19 @@ fn fifo_queue_and_idempotent_send() {
     d.register("w1");
     d.wait_agent("w1", "idle", 10);
     for n in 1..=3 {
-        d.rpc(
-            "agent_send",
-            json!({"alias": "w1", "text": format!("task {n}"),
-                   "message": format!("m{n}")}),
+        d.send(
+            "w1",
+            json!({"text": format!("task {n}"), "message": format!("m{n}")}),
         )
         .unwrap();
     }
     // Duplicate of the exact same envelope is a no-op.
     let dup = d
-        .rpc(
-            "agent_send",
-            json!({"alias": "w1", "text": "task 1", "message": "m1"}),
-        )
+        .send("w1", json!({"text": "task 1", "message": "m1"}))
         .unwrap();
     assert_eq!(dup["duplicate"], true);
     // Same id, different content: conflict.
-    let conflict = d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "different", "message": "m1"}),
-    );
+    let conflict = d.send("w1", json!({"text": "different", "message": "m1"}));
     assert!(conflict.is_err());
     // All three complete in submission order.
     for n in 1..=3 {
@@ -71,10 +64,9 @@ fn result_routing_wakes_pm() {
     d.register("w1");
     d.wait_agent("pm", "idle", 10);
     d.wait_agent("w1", "idle", 10);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "review this", "message": "work-1",
-               "reply_to": "pm"}),
+    d.send(
+        "w1",
+        json!({"text": "review this", "message": "work-1", "reply_to": "pm"}),
     )
     .unwrap();
     d.wait_message("w1", "work-1", &["completed"], 15);
@@ -106,11 +98,8 @@ fn upstream_param_defaults_reply_to() {
     d.wait_agent("other", "idle", 10);
     d.wait_agent("w1", "idle", 10);
     // No explicit reply_to — the upstream wiring routes the result to pm.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "work", "message": "u1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "work", "message": "u1"}))
+        .unwrap();
     d.wait_message("w1", "u1", &["completed"], 15);
     // CAD-271: routed in u1's completing transaction — durable now. Find
     // it by source rather than position, and name a refused route.
@@ -131,10 +120,9 @@ fn upstream_param_defaults_reply_to() {
     let routed_id = routed["id"].as_str().unwrap().to_string();
     d.wait_message("pm", &routed_id, &["completed"], 15);
     // An explicit reply_to still wins over the upstream default.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "more work", "message": "u2",
-               "reply_to": "other"}),
+    d.send(
+        "w1",
+        json!({"text": "more work", "message": "u2", "reply_to": "other"}),
     )
     .unwrap();
     d.wait_message("w1", "u2", &["completed"], 15);
@@ -160,9 +148,9 @@ fn approval_lifecycle() {
     let d = TestDaemon::start();
     d.register("w1");
     d.wait_agent("w1", "idle", 10);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "NEED_INPUT:run-tests", "message": "a1"}),
+    d.send(
+        "w1",
+        json!({"text": "NEED_INPUT:run-tests", "message": "a1"}),
     )
     .unwrap();
     d.wait_agent("w1", "waiting_input", 10);
@@ -221,11 +209,8 @@ fn restart_fences_unknown_inflight() {
     let m1 = &show["messages"].as_array().unwrap()[0];
     assert_eq!(m1["state"], "unknown");
     // New work is durable but NOT executed while fenced.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "later", "message": "m2"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "later", "message": "m2"}))
+        .unwrap();
     // CAD-184 kept sleep: absence window — no actor runs for a fenced or
     // stopped agent, so nothing records a refusal to poll for.
     thread::sleep(Duration::from_secs(1));
@@ -291,11 +276,8 @@ fn restart_keeps_original_unknown_reason_beside_later_inflight() {
     assert_eq!(m2["state"], "unknown");
     assert_eq!(m2["error"], "Runtime restarted during provider turn");
     assert_eq!(m2["turn_id"], "pty-gen-m2");
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "later", "message": "m3"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "later", "message": "m3"}))
+        .unwrap();
     // CAD-184 kept sleep: absence window — no actor runs for a fenced or
     // stopped agent, so nothing records a refusal to poll for.
     thread::sleep(Duration::from_secs(1));
@@ -310,11 +292,7 @@ fn turns_are_serialized_per_agent() {
     d.register("w1");
     d.wait_agent("w1", "idle", 10);
     for n in 1..=4 {
-        d.rpc(
-            "agent_send",
-            json!({"alias": "w1", "text": format!("job {n}")}),
-        )
-        .unwrap();
+        d.send("w1", json!({"text": format!("job {n}")})).unwrap();
     }
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
@@ -354,11 +332,8 @@ fn unknown_outcome_never_replays() {
     let d = TestDaemon::start();
     d.register("w1");
     d.wait_agent("w1", "idle", 10);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "DISCONNECT", "message": "x1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "DISCONNECT", "message": "x1"}))
+        .unwrap();
     let m = d.wait_message("w1", "x1", &["unknown"], 15);
     // The fence carries the provider's own reason, not a generic label.
     assert!(
@@ -367,11 +342,8 @@ fn unknown_outcome_never_replays() {
     );
     d.wait_agent("w1", "attention", 10);
     // Subsequent messages stay queued — no automatic replay or relaunch.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "after", "message": "x2"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "after", "message": "x2"}))
+        .unwrap();
     // CAD-184 kept sleep: absence window — no actor runs for a fenced or
     // stopped agent, so nothing records a refusal to poll for.
     thread::sleep(Duration::from_secs(1));
@@ -392,11 +364,8 @@ fn reconcile_interrupted_clears_fence_and_preserves_history() {
     d.wait_agent("w1", "idle", 10);
     fence_agent(&d, "w1", "x1");
     // Work queued behind the fence stays queued.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "after", "message": "x2"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "after", "message": "x2"}))
+        .unwrap();
     // A bare resume is rejected, naming the reconcile-first path.
     let err = d.rpc("agent_resume", json!({"alias": "w1"})).unwrap_err();
     let err = err.to_string();
@@ -460,16 +429,14 @@ fn reconcile_completed_routes_result_interrupted_routes_notice() {
     d.wait_agent("w1", "idle", 10);
     d.wait_agent("w2", "idle", 10);
     // Both fence on an unknown outcome; both were reply_to wired to pm.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "DISCONNECT", "message": "x1",
-               "reply_to": "pm"}),
+    d.send(
+        "w1",
+        json!({"text": "DISCONNECT", "message": "x1", "reply_to": "pm"}),
     )
     .unwrap();
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w2", "text": "DISCONNECT", "message": "x2",
-               "reply_to": "pm"}),
+    d.send(
+        "w2",
+        json!({"text": "DISCONNECT", "message": "x2", "reply_to": "pm"}),
     )
     .unwrap();
     d.wait_message("w1", "x1", &["unknown"], 15);
@@ -574,11 +541,8 @@ fn reconcile_rejects_non_unknown_and_repeats() {
     d.register("w1");
     d.wait_agent("w1", "idle", 10);
     // completed → rejected, naming the state.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "done", "message": "c1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "done", "message": "c1"}))
+        .unwrap();
     d.wait_message("w1", "c1", &["completed"], 15);
     let err = d
         .operator_rpc(
@@ -588,11 +552,8 @@ fn reconcile_rejects_non_unknown_and_repeats() {
         .unwrap_err();
     assert!(err.to_string().contains("'completed'"), "{err}");
     // running → rejected, naming the state.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "NEED_INPUT:hold", "message": "r1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "NEED_INPUT:hold", "message": "r1"}))
+        .unwrap();
     d.wait_message("w1", "r1", &["running"], 15);
     let err = d
         .operator_rpc(
@@ -602,11 +563,8 @@ fn reconcile_rejects_non_unknown_and_repeats() {
         .unwrap_err();
     assert!(err.to_string().contains("'running'"), "{err}");
     // queued → rejected, naming the state (w1 is busy holding r1).
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "next", "message": "q2"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "next", "message": "q2"}))
+        .unwrap();
     assert_eq!(d.message_state("w1", "q2"), "queued");
     let err = d
         .operator_rpc(
@@ -739,11 +697,8 @@ fn restart_preserves_attention_fence_without_unknowns() {
         "events: {kinds:?}"
     );
     // No actor ever spawned for it: a queued task is never taken.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "mismatch", "text": "later", "message": "m2"}),
-    )
-    .unwrap();
+    d.send("mismatch", json!({"text": "later", "message": "m2"}))
+        .unwrap();
     // CAD-184 kept sleep: absence window — no actor runs for a fenced or
     // stopped agent, so nothing records a refusal to poll for.
     thread::sleep(Duration::from_secs(1));
@@ -844,11 +799,8 @@ fn unfenced_agent_stays_stopped_across_restart() {
     assert_eq!(agent["enabled"], false);
     assert!(agent["endpoint"].is_null());
     // No actor spawned: a queued message is never taken.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "later", "message": "x2"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "later", "message": "x2"}))
+        .unwrap();
     // CAD-184 kept sleep: absence window — no actor runs for a fenced or
     // stopped agent, so nothing records a refusal to poll for.
     thread::sleep(Duration::from_secs(1));
@@ -916,11 +868,8 @@ fn second_daemon_fails_without_touching_state() {
     d.register("w1");
     d.wait_agent("w1", "idle", 10);
     // Active work in-flight: a second daemon's recovery must never run.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "NEED_INPUT:hold", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "NEED_INPUT:hold", "message": "m1"}))
+        .unwrap();
     d.wait_agent("w1", "waiting_input", 10);
     let err = daemon::serve(&d.state).unwrap_err();
     assert!(
@@ -948,11 +897,8 @@ fn resume_rejected_while_actor_stopping() {
     d.wait_agent("w1", "idle", 10);
     // SLEEP ignores interrupt; only a forced close ends the turn, which
     // makes the in-flight attempt unknown — a real stopping window.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "SLEEP:60", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "SLEEP:60", "message": "m1"}))
+        .unwrap();
     d.wait_message("w1", "m1", &["running"], 10);
     let stop = {
         let state = d.state.clone();
@@ -982,11 +928,8 @@ fn resume_rejected_while_actor_stopping() {
         .remove("agent");
     assert_eq!(agent["enabled"], false);
     // No second actor ever existed: m2 is accepted but never runs.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "later", "message": "m2"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "later", "message": "m2"}))
+        .unwrap();
     // CAD-184 kept sleep: absence window — no actor runs for a fenced or
     // stopped agent, so nothing records a refusal to poll for.
     thread::sleep(Duration::from_millis(500));
@@ -1021,11 +964,8 @@ fn stop_during_approval_is_bounded() {
     let d = TestDaemon::start();
     d.register("w1");
     d.wait_agent("w1", "idle", 10);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "NEED_INPUT:block", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "NEED_INPUT:block", "message": "m1"}))
+        .unwrap();
     d.wait_agent("w1", "waiting_input", 10);
     let began = Instant::now();
     let stopped = d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
@@ -1052,19 +992,13 @@ fn unclassifiable_completion_fences_agent() {
     let d = TestDaemon::start();
     d.register("w1");
     d.wait_agent("w1", "idle", 10);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "BAD_STATUS", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "BAD_STATUS", "message": "m1"}))
+        .unwrap();
     d.wait_message("w1", "m1", &["unknown"], 15);
     d.wait_agent("w1", "attention", 10);
     // Queued work is preserved but never run while fenced.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "after", "message": "m2"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "after", "message": "m2"}))
+        .unwrap();
     // CAD-184 kept sleep: absence window — no actor runs for a fenced or
     // stopped agent, so nothing records a refusal to poll for.
     thread::sleep(Duration::from_millis(500));
@@ -1302,11 +1236,8 @@ fn fenced_agent_resume_hint() {
     let agent = d.wait_agent("dv1", "idle", 20);
     let native = agent["thread_id"].as_str().unwrap().to_string();
     d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
-    d.rpc(
-        "agent_send",
-        json!({"alias": "dv1", "text": "task", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("dv1", json!({"text": "task", "message": "m1"}))
+        .unwrap();
     pty_token(&d, "dv1", "m1");
     // Fence it: pane dies with a submitted message in flight.
     let pid: i32 = std::fs::read_to_string(d.pane_file(&mock, "dv1", "pid"))
@@ -1598,11 +1529,7 @@ fn inbox_drains_messages_once() {
     let d = TestDaemon::start();
     d.register_inbox("obs");
     for (id, text) in [("n1", "note one"), ("n2", "note two")] {
-        d.rpc(
-            "agent_send",
-            json!({"alias": "obs", "text": text, "message": id}),
-        )
-        .unwrap();
+        d.send("obs", json!({"text": text, "message": id})).unwrap();
     }
     // Backlog is visible before draining.
     assert_eq!(
@@ -1680,11 +1607,8 @@ fn inbox_group_root_collects_worker_results() {
     d.wait_agent("w1", "idle", 10);
     // The worker's send defaults reply_to=obs (its upstream) — the
     // completed result routes into the mailbox, not a pane.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "do work", "message": "j1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "do work", "message": "j1"}))
+        .unwrap();
     d.wait_message("w1", "j1", &["completed"], 15);
     let page = d.rpc("agent_inbox", json!({"alias": "obs"})).unwrap();
     let msgs = page["messages"].as_array().unwrap();
@@ -1713,10 +1637,9 @@ fn inbox_collects_direct_send_with_reply_to() {
     // a fixture act, not the agent's own attestation.
     d.operator_rpc("agent_ready", json!({"alias": "sender"}))
         .unwrap();
-    d.rpc(
-        "agent_send",
-        json!({"alias": "sender", "text": "task", "message": "t1",
-               "reply_to": "obs"}),
+    d.send(
+        "sender",
+        json!({"text": "task", "message": "t1", "reply_to": "obs"}),
     )
     .unwrap();
     let token = pty_token(&d, "sender", "t1");
@@ -1745,10 +1668,9 @@ fn inbox_read_receipt_keeps_history_without_waking_reviewer() {
 
     // A real worker result still lands in the mailbox and must survive the
     // same drain alongside the acknowledgement-only message.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "worker", "text": "do work", "message": "work-1",
-               "reply_to": "obs"}),
+    d.send(
+        "worker",
+        json!({"text": "do work", "message": "work-1", "reply_to": "obs"}),
     )
     .unwrap();
     d.wait_message("worker", "work-1", &["completed"], 15);
@@ -1779,10 +1701,9 @@ fn inbox_read_receipt_keeps_history_without_waking_reviewer() {
     // This is the actual receipt path: a mailbox message has a return
     // address, then the consumer drains it. Completing the read must not
     // manufacture a worker_result turn for the reviewer.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "obs", "text": "ack me", "message": "receipt-1",
-               "reply_to": "reviewer"}),
+    d.send(
+        "obs",
+        json!({"text": "ack me", "message": "receipt-1", "reply_to": "reviewer"}),
     )
     .unwrap();
 
@@ -1858,11 +1779,7 @@ fn inbox_peek_loses_nothing_without_ack() {
     let d = TestDaemon::start();
     d.register_inbox("obs");
     for (id, text) in [("n1", "note one"), ("n2", "note two")] {
-        d.rpc(
-            "agent_send",
-            json!({"alias": "obs", "text": text, "message": id}),
-        )
-        .unwrap();
+        d.send("obs", json!({"text": text, "message": id})).unwrap();
     }
     let page = d
         .rpc("agent_inbox", json!({"alias": "obs", "peek": true}))
@@ -1901,11 +1818,7 @@ fn inbox_ack_advances_the_reader_cursor() {
     let d = TestDaemon::start();
     d.register_inbox("obs");
     for id in ["n1", "n2", "n3"] {
-        d.rpc(
-            "agent_send",
-            json!({"alias": "obs", "text": id, "message": id}),
-        )
-        .unwrap();
+        d.send("obs", json!({"text": id, "message": id})).unwrap();
     }
     let page = d
         .rpc("agent_inbox", json!({"alias": "obs", "peek": true}))
@@ -1984,11 +1897,7 @@ fn inbox_ack_clamps_past_the_tail_and_reset_restores() {
     let d = TestDaemon::start();
     d.register_inbox("obs");
     for id in ["n1", "n2"] {
-        d.rpc(
-            "agent_send",
-            json!({"alias": "obs", "text": id, "message": id}),
-        )
-        .unwrap();
+        d.send("obs", json!({"text": id, "message": id})).unwrap();
     }
     let page = d
         .rpc("agent_inbox", json!({"alias": "obs", "peek": true}))
@@ -2007,11 +1916,8 @@ fn inbox_ack_clamps_past_the_tail_and_reset_restores() {
     let show = d.rpc("agent_show", json!({"alias": "obs"})).unwrap();
     assert_eq!(show["inbox"]["readers"]["pm"]["through"], tail, "{show}");
     // A later arrival is still visible to that reader — not blinded.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "obs", "text": "n3", "message": "n3"}),
-    )
-    .unwrap();
+    d.send("obs", json!({"text": "n3", "message": "n3"}))
+        .unwrap();
     let resume = d
         .rpc(
             "agent_inbox",
@@ -2067,11 +1973,7 @@ fn inbox_ack_is_idempotent_for_concurrent_readers() {
     let d = TestDaemon::start();
     d.register_inbox("obs");
     for id in ["a", "b", "c"] {
-        d.rpc(
-            "agent_send",
-            json!({"alias": "obs", "text": id, "message": id}),
-        )
-        .unwrap();
+        d.send("obs", json!({"text": id, "message": id})).unwrap();
     }
     let page = d
         .rpc("agent_inbox", json!({"alias": "obs", "peek": true}))
@@ -2121,11 +2023,8 @@ fn inbox_ack_is_idempotent_for_concurrent_readers() {
 fn inbox_ack_refuses_another_agents_inbox() {
     let d = TestDaemon::start();
     d.register_inbox("obs");
-    d.rpc(
-        "agent_send",
-        json!({"alias": "obs", "text": "x", "message": "n1"}),
-    )
-    .unwrap();
+    d.send("obs", json!({"text": "x", "message": "n1"}))
+        .unwrap();
     // The test process becomes agent 'w1' — every d.rpc from here on
     // is that caller. The plant flips w1's row to a pty pane.
     plant_pane(&d, "w1", std::process::id());
@@ -2147,11 +2046,8 @@ fn inbox_ack_refuses_another_agents_inbox() {
 fn inbox_drain_refuses_a_foreign_agent() {
     let d = TestDaemon::start();
     d.register_inbox("obs");
-    d.rpc(
-        "agent_send",
-        json!({"alias": "obs", "text": "x", "message": "n1"}),
-    )
-    .unwrap();
+    d.send("obs", json!({"text": "x", "message": "n1"}))
+        .unwrap();
     // The test process becomes agent 'w1' — every d.rpc from here on
     // is that caller.
     plant_pane(&d, "w1", std::process::id());
@@ -2250,11 +2146,7 @@ fn cli_inbox_peek_ack_and_self_reports_unread() {
     let d = TestDaemon::start();
     d.register_inbox("obs");
     for (id, text) in [("n1", "note one"), ("n2", "note two")] {
-        d.rpc(
-            "agent_send",
-            json!({"alias": "obs", "text": text, "message": id}),
-        )
-        .unwrap();
+        d.send("obs", json!({"text": text, "message": id})).unwrap();
     }
     let bin = env!("CARGO_BIN_EXE_cadence");
     let cadence = |args: &[&str]| {
@@ -2374,11 +2266,7 @@ fn inbox_follow_exec_acks_each_message_once() {
         .spawn()
         .unwrap();
     for id in ["m1", "m2"] {
-        d.rpc(
-            "agent_send",
-            json!({"alias": "obs", "text": id, "message": id}),
-        )
-        .unwrap();
+        d.send("obs", json!({"text": id, "message": id})).unwrap();
     }
     let seen = wait_lines(&log, 2, 15);
     assert_eq!(seen, vec!["m1", "m2"], "each delivered exactly once");
@@ -2443,11 +2331,8 @@ fn inbox_follow_exec_failure_retries_until_success() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
-    d.rpc(
-        "agent_send",
-        json!({"alias": "obs", "text": "t", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("obs", json!({"text": "t", "message": "m1"}))
+        .unwrap();
     // First attempts fail — the message is NOT acked. A retry may append
     // between polls, so assert the delivered identity, not a count.
     let tries = wait_lines(&log, 1, 15);
@@ -2515,11 +2400,7 @@ fn inbox_follow_exec_timeout_kills_then_parks() {
         .spawn()
         .unwrap();
     for id in ["m1", "m2"] {
-        d.rpc(
-            "agent_send",
-            json!({"alias": "obs", "text": id, "message": id}),
-        )
-        .unwrap();
+        d.send("obs", json!({"text": id, "message": id})).unwrap();
     }
     // m1 times out twice (≈600ms of killed sleeps) and parks; m2 —
     // queued behind it — is still delivered and acked.
@@ -2617,11 +2498,7 @@ fn inbox_follow_exec_parks_a_poison_message() {
         .spawn()
         .unwrap();
     for id in ["bad", "good"] {
-        d.rpc(
-            "agent_send",
-            json!({"alias": "obs", "text": id, "message": id}),
-        )
-        .unwrap();
+        d.send("obs", json!({"text": id, "message": id})).unwrap();
     }
     let done = wait_lines(&log, 1, 20);
     assert_eq!(done, vec!["good"], "{done:?}");
@@ -2760,11 +2637,8 @@ fn message_cancel_queued_lifecycle() {
     d.wait_agent("w1", "idle", 10);
 
     // A completed message refuses, naming its terminal state.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "done work", "message": "m-done"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "done work", "message": "m-done"}))
+        .unwrap();
     d.wait_message("w1", "m-done", &["completed"], 15);
     let err = d
         .rpc("message_cancel", json!({"message": "m-done"}))
@@ -2774,10 +2648,9 @@ fn message_cancel_queued_lifecycle() {
     // Stop the worker so the next send parks queued.
     d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
     d.wait_agent("w1", "stopped", 10);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "queued work", "message": "m-q",
-               "reply_to": "pm"}),
+    d.send(
+        "w1",
+        json!({"text": "queued work", "message": "m-q", "reply_to": "pm"}),
     )
     .unwrap();
     assert_eq!(d.message_state("w1", "m-q"), "queued");
@@ -2827,11 +2700,8 @@ fn message_cancel_queued_lifecycle() {
     // Resume: the cancelled message never delivers; a fresh one does.
     d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
     d.wait_agent("w1", "idle", 10);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "real work", "message": "m-new"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "real work", "message": "m-new"}))
+        .unwrap();
     d.wait_message("w1", "m-new", &["completed"], 15);
     assert_eq!(d.message_state("w1", "m-q"), "cancelled");
 }
@@ -2845,11 +2715,8 @@ fn message_cancel_gate_pty_and_running_refusal() {
 
     // Queued behind the ready gate: the message is durable but the pane
     // has not been claimed.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "dv1", "text": "first", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("dv1", json!({"text": "first", "message": "m1"}))
+        .unwrap();
     // Wait for m1's own recorded refusal, not a fixed sleep: the actor
     // takes the send at once and the gate may still be probing, and a
     // cancel is refused unless the message is back to `queued` (CAD-293).
@@ -2865,11 +2732,8 @@ fn message_cancel_gate_pty_and_running_refusal() {
 
     // The claim stays outstanding, so the next queued message delivers
     // normally.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "dv1", "text": "second", "message": "m2"}),
-    )
-    .unwrap();
+    d.send("dv1", json!({"text": "second", "message": "m2"}))
+        .unwrap();
     let token = pty_token(&d, "dv1", "m2");
     // m2 consumed the one claim, so m1 never did: no trace of it on the
     // screen or in the input line (a pasted m1 would sit in either).
@@ -2951,10 +2815,9 @@ fn message_cancel_task_bound_refused() {
     d.job_new("pm", "j1", &spec, &sha);
     // --task binds the delivery to j1-t1; message cancel defers to the
     // task lifecycle.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "followup", "message": "m-t",
-               "task": "j1-t1"}),
+    d.send(
+        "w1",
+        json!({"text": "followup", "message": "m-t", "task": "j1-t1"}),
     )
     .unwrap();
     let err = d
@@ -3078,11 +2941,8 @@ fn events_default_page_is_newest_with_continue_cursor() {
     // >50 events: each completed send writes several lifecycle events.
     for i in 0..20 {
         let id = format!("m{i}");
-        d.rpc(
-            "agent_send",
-            json!({"alias": "w1", "text": format!("task {i}"), "message": id}),
-        )
-        .unwrap();
+        d.send("w1", json!({"text": format!("task {i}"), "message": id}))
+            .unwrap();
         d.wait_message("w1", &id, &["completed"], 10);
     }
     assert!(d.events("w1").len() > 50, "need >50 events to page");
@@ -3102,11 +2962,8 @@ fn events_default_page_is_newest_with_continue_cursor() {
     assert_eq!(cursor, *seqs.last().unwrap());
     // Continuing forward from the cursor yields only newer events:
     // one more send lands strictly above it.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "epilogue", "message": "ep"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "epilogue", "message": "ep"}))
+        .unwrap();
     d.wait_message("w1", "ep", &["completed"], 10);
     let next = d
         .rpc("agent_events", json!({"alias": "w1", "after": cursor}))
@@ -3162,11 +3019,8 @@ fn events_follow_starts_at_tail() {
     d.wait_agent("w1", "idle", 10);
     for i in 0..15 {
         let id = format!("m{i}");
-        d.rpc(
-            "agent_send",
-            json!({"alias": "w1", "text": format!("task {i}"), "message": id}),
-        )
-        .unwrap();
+        d.send("w1", json!({"text": format!("task {i}"), "message": id}))
+            .unwrap();
         d.wait_message("w1", &id, &["completed"], 10);
     }
     let total = d.events("w1").len();
@@ -3204,11 +3058,8 @@ fn events_follow_starts_at_tail() {
         assert!(Instant::now() < deadline, "tail page never printed");
         thread::sleep(Duration::from_millis(50));
     }
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "post-follow", "message": "mf"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "post-follow", "message": "mf"}))
+        .unwrap();
     d.wait_message("w1", "mf", &["completed"], 10);
     let deadline = Instant::now() + Duration::from_secs(20);
     while !captured.lock().unwrap().contains("\"message\": \"mf\"") {
@@ -3311,11 +3162,8 @@ fn inbox_without_consumer_warns_on_send_and_route() {
     .unwrap();
     d.wait_agent("w1", "idle", 10);
     let send = |alias: &str, id: &str| {
-        d.rpc(
-            "agent_send",
-            json!({"alias": alias, "text": "note", "message": id}),
-        )
-        .unwrap()
+        d.send(alias, json!({"text": "note", "message": id}))
+            .unwrap()
     };
     let job = |id: &str| {
         send("w1", id);
@@ -4564,11 +4412,8 @@ fn cad384_fleet(d: &TestDaemon) -> GuardPanes {
     }
     d.operator_rpc("agent_stop", json!({"alias": "q"})).unwrap();
     d.wait_agent("q", "stopped", 10);
-    d.operator_rpc(
-        "agent_send",
-        json!({"alias": "q", "text": "later", "message": "m-q"}),
-    )
-    .unwrap();
+    d.send("q", json!({"text": "later", "message": "m-q"}))
+        .unwrap();
     assert_eq!(d.message_state("q", "m-q"), "queued");
     p
 }
@@ -4725,11 +4570,8 @@ fn cad384_operator_attributed_sends_need_proof() {
         assert_eq!(before, db_snapshot(&d), "{method}: a refusal wrote");
     }
     // The operator's own send still lands as the operator's.
-    d.operator_rpc(
-        "agent_send",
-        json!({"alias": "chat", "text": "mine", "message": "t2"}),
-    )
-    .unwrap();
+    d.send("chat", json!({"text": "mine", "message": "t2"}))
+        .unwrap();
     d.wait_message("chat", "t2", &["completed"], 20);
 }
 

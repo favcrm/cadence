@@ -131,11 +131,8 @@ fn cad319_thread_records_operator_messages_and_turn_results() {
     d.wait_agent("lead", "idle", 15);
     d.wait_agent("w1", "idle", 15);
     // Before any chat, nothing is recorded.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "lead", "text": "pre-chat", "message": "p0"}),
-    )
-    .unwrap();
+    d.send("lead", json!({"text": "pre-chat", "message": "p0"}))
+        .unwrap();
     d.wait_message("lead", "p0", &["completed"], 20);
     let empty = d.rpc("thread_read", json!({"alias": "lead"})).unwrap();
     assert_eq!(empty["thread"], Value::Null, "{empty}");
@@ -152,18 +149,12 @@ fn cad319_thread_records_operator_messages_and_turn_results() {
     d.wait_message("lead", "t1", &["completed"], 20);
     // Once a thread exists, a plain `cadence send` from a caller tied to
     // no agent is the operator's too.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "lead", "text": "and this", "message": "t2"}),
-    )
-    .unwrap();
+    d.send("lead", json!({"text": "and this", "message": "t2"}))
+        .unwrap();
     d.wait_message("lead", "t2", &["completed"], 20);
     // A mailbox-free peer: w1 is untouched.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "not threaded", "message": "w-1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "not threaded", "message": "w-1"}))
+        .unwrap();
     d.wait_message("w1", "w-1", &["completed"], 20);
 
     assert_eq!(
@@ -2056,11 +2047,8 @@ fn cad323_pid(d: &TestDaemon, alias: &str) -> i64 {
 /// and a later interrupt with nothing running is a recorded no-op.
 fn cad323_next_turn_then_noop(d: &TestDaemon, alias: &str, pid: i64) {
     d.wait_agent(alias, "idle", 10);
-    d.rpc(
-        "agent_send",
-        json!({"alias": alias, "text": "next", "message": "m2"}),
-    )
-    .unwrap();
+    d.send(alias, json!({"text": "next", "message": "m2"}))
+        .unwrap();
     d.wait_message(alias, "m2", &["completed"], 20);
     assert_eq!(cad323_pid(d, alias), pid, "the provider was relaunched");
     let noop = d
@@ -2213,11 +2201,8 @@ fn cad323_claude_interrupt_mid_tool_reconciles_a_kickoff() {
     assert_eq!(states.len(), 2, "{states:?}");
     assert!(states.iter().all(|(_, s)| s == "interrupted"), "{states:?}");
     std::fs::write(format!("{}.mode", mock.pidfile.display()), "ok").unwrap();
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "next", "message": "m2"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "next", "message": "m2"}))
+        .unwrap();
     d.wait_message("w1", "m2", &["completed"], 20);
     assert_eq!(cad323_pid(&d, "w1"), pid, "the provider was relaunched");
     assert_eq!(cad323_messages(&d, "w1").len(), 3);
@@ -2325,11 +2310,8 @@ fn cad323_pty_claude_interrupt_sends_escape_and_settles() {
     let mock = d.mock_claude_tui();
     d.register_claude_pty("cl", json!({"auto_ready": "verified"}));
     d.wait_agent("cl", "idle", 20);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "cl", "text": "long job", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("cl", json!({"text": "long job", "message": "m1"}))
+        .unwrap();
     let token = pty_token(&d, "cl", "m1");
     let r = d.operator_rpc("interrupt", json!({"alias": "cl"})).unwrap();
     assert_eq!(r["interrupted"], true, "{r}");
@@ -2372,11 +2354,8 @@ fn cad323_interrupt_caller_rule_per_caller_kind() {
     let mut p = guard_panes(&d);
     d.register_claude("w2", json!({"upstream": "pm"}));
     d.wait_agent("w2", "idle", 15);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w2", "text": "work", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("w2", json!({"text": "work", "message": "m1"}))
+        .unwrap();
     d.wait_message("w2", "m1", &["running"], 15);
     let target = json!({"alias": "w2", "wait": 10});
 
@@ -2417,11 +2396,8 @@ fn cad323_interrupt_caller_rule_per_caller_kind() {
     assert_eq!(asked[0]["by_kind"], "agent", "{asked:?}");
 
     // The operator, on the next turn.
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w2", "text": "more", "message": "m2"}),
-    )
-    .unwrap();
+    d.send("w2", json!({"text": "more", "message": "m2"}))
+        .unwrap();
     d.wait_message("w2", "m2", &["running"], 15);
     let r = d.operator_rpc("interrupt", json!({"alias": "w2"})).unwrap();
     assert_eq!(r["state"], "interrupted", "{r}");
@@ -2448,11 +2424,8 @@ fn cad323_master_interrupts_only_a_turn_it_dispatched() {
         .unwrap();
 
     // Not its dispatch: refused, nothing reaches the provider.
-    f.d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "operator work", "message": "op-1"}),
-    )
-    .unwrap();
+    f.d.send("w1", json!({"text": "operator work", "message": "op-1"}))
+        .unwrap();
     f.d.wait_message("w1", "op-1", &["running"], 15);
     let (ok, err) = f.as_master(&mut m, "interrupt w1 --wait 5");
     assert!(
@@ -2514,11 +2487,8 @@ fn cad323_pty_interrupt_never_lands_on_the_next_turn() {
     let mock = d.mock_claude_tui();
     d.register_claude_pty("cl", json!({"auto_ready": "verified"}));
     d.wait_agent("cl", "idle", 20);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "cl", "text": "first job", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("cl", json!({"text": "first job", "message": "m1"}))
+        .unwrap();
     let t1 = pty_token(&d, "cl", "m1");
     cad323_stale_interrupt(&d, "cl", || {
         d.rpc(
@@ -2527,11 +2497,8 @@ fn cad323_pty_interrupt_never_lands_on_the_next_turn() {
         )
         .unwrap();
         d.wait_message("cl", "m1", &["completed"], 10);
-        d.rpc(
-            "agent_send",
-            json!({"alias": "cl", "text": "second job", "message": "m2"}),
-        )
-        .unwrap();
+        d.send("cl", json!({"text": "second job", "message": "m2"}))
+            .unwrap();
         d.wait_message("cl", "m2", &["running"], 20);
     });
     let calls = std::fs::read_to_string(
@@ -2555,21 +2522,15 @@ fn cad323_claude_interrupt_never_lands_on_the_next_turn() {
     let release = PathBuf::from(format!("{}.release", mock.pidfile.display()));
     d.register_claude("w1", Value::Null);
     d.wait_agent("w1", "idle", 15);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "one", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "one", "message": "m1"}))
+        .unwrap();
     d.wait_message("w1", "m1", &["running"], 15);
     cad323_stale_interrupt(&d, "w1", || {
         std::fs::write(&release, "").unwrap();
         d.wait_message("w1", "m1", &["completed"], 15);
         std::fs::remove_file(&release).unwrap();
-        d.rpc(
-            "agent_send",
-            json!({"alias": "w1", "text": "two", "message": "m2"}),
-        )
-        .unwrap();
+        d.send("w1", json!({"text": "two", "message": "m2"}))
+            .unwrap();
         d.wait_message("w1", "m2", &["running"], 15);
     });
     assert!(
@@ -2591,20 +2552,14 @@ fn cad323_codex_interrupt_never_lands_on_the_next_turn() {
     };
     d.register_codex("w1");
     d.wait_agent("w1", "idle", 15);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "one", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "one", "message": "m1"}))
+        .unwrap();
     d.wait_message("w1", "m1", &["running"], 15);
     cad323_stale_interrupt(&d, "w1", || {
         release("t-1");
         d.wait_message("w1", "m1", &["completed"], 15);
-        d.rpc(
-            "agent_send",
-            json!({"alias": "w1", "text": "two", "message": "m2"}),
-        )
-        .unwrap();
+        d.send("w1", json!({"text": "two", "message": "m2"}))
+            .unwrap();
         d.wait_message("w1", "m2", &["running"], 15);
     });
     assert!(
@@ -2669,11 +2624,8 @@ fn cad323_refused_interrupt_is_recorded() {
     let d = TestDaemon::start();
     d.register("w1");
     d.wait_agent("w1", "idle", 10);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "SLEEP:30", "message": "m1"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "SLEEP:30", "message": "m1"}))
+        .unwrap();
     d.wait_message("w1", "m1", &["running"], 15);
     let err = d
         .operator_rpc("interrupt", json!({"alias": "w1", "wait": 0}))

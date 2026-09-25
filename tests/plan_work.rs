@@ -2223,11 +2223,8 @@ fn cad324_continuity_packs_on_new_compacted_and_lost_sessions() {
     // An agent with no thread never gets a pack.
     f.d.register("other");
     f.d.wait_agent("other", "idle", 15);
-    f.d.rpc(
-        "agent_send",
-        json!({"alias": "other", "text": "no chat", "message": "o1"}),
-    )
-    .unwrap();
+    f.d.send("other", json!({"text": "no chat", "message": "o1"}))
+        .unwrap();
     assert_eq!(result_text(&f.d, "other", "o1"), "FAKE_REPLY: no chat");
     assert!(events_of_kind(&f.d, "other", "continuity_pack").is_empty());
 
@@ -2333,11 +2330,8 @@ fn cad324_continuity_packs_on_new_compacted_and_lost_sessions() {
         ("r1", "first after resume"),
         ("r2", "queued-later-9c2"),
     ] {
-        f.d.rpc(
-            "agent_send",
-            json!({"alias": "lead", "text": text, "message": id}),
-        )
-        .unwrap();
+        f.d.send("lead", json!({"text": text, "message": id}))
+            .unwrap();
     }
     f.d.rpc("message_cancel", json!({"message": "w-x"}))
         .unwrap();
@@ -3044,11 +3038,8 @@ fn cad378_dispatch_record_binds_the_kickoff_not_the_request() {
     }
     // Every dishonest message is refused. A plain send — no lane tags,
     // just mail.
-    f.d.operator_rpc(
-        "agent_send",
-        json!({"alias": "w-1", "text": "just mail", "message": "m-mail"}),
-    )
-    .unwrap();
+    f.d.send("w-1", json!({"text": "just mail", "message": "m-mail"}))
+        .unwrap();
     // A genuine dispatch_send kickoff for another issue — daemon-tagged
     // D-2, so it can never anchor D-1's record.
     let (ok, out) = f.cli(&["issue", "new", "Other", "--project", "demo"]);

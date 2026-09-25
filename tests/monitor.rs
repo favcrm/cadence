@@ -489,11 +489,8 @@ fn monitor_alerts_task_unknown_outcome_is_scoped_and_restart_safe() {
     assert_eq!(task["revision"], 1, "{task}");
     assert!(task["head_sha"].is_null(), "{task}");
     d.wait_agent("w1", "attention", 10);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "after", "message": "after-unknown"}),
-    )
-    .unwrap();
+    d.send("w1", json!({"text": "after", "message": "after-unknown"}))
+        .unwrap();
     // CAD-184 kept sleep: absence window — no actor runs for a fenced or
     // stopped agent, so nothing records a refusal to poll for.
     thread::sleep(Duration::from_millis(400));
