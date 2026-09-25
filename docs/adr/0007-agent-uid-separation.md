@@ -1,8 +1,11 @@
 # 0007 — Agents under a dedicated uid without sudo
 
-- Status: **proposed**. This document changes no code and no host state.
-  It is the design the operator accepts or amends before CAD-461's
-  implementation tickets are filed.
+- Status: **accepted** on 2026-09-25 by the operator, at
+  `5b72c1e21309b4b45066906e149d4058f3f6a77e`. `op-pm` recorded the
+  decision from the user in a CAD-461 comment at 10:18:40Z; §11 is
+  answered with this document's recommendations (the operator gave no
+  changes). This document changes no code and no host state; CAD-461's
+  implementation tickets follow §13.
 - Risk class **human** (trigger 1 — a trust boundary: who the operator
   and the agents are) for every implementation ticket it spawns. Each
   needs an independent adversarial security review before it merges.
