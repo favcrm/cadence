@@ -1,0 +1,24 @@
+{
+  "$comment": "The fake platform adapter's declared tool table (ADR 0006 §5.2, option B — reviewed data). The Rust double is src/contract_fixture.rs; vectors reference this table as \"default\". `label` demonstrates §5.2's AgenticOS mapping: the platform's own class is kept for display, never gating.",
+  "manifest_version": "1",
+  "platform": "fixture",
+  "tools": [
+    {
+      "tool": "widgets.list",
+      "effect": "read",
+      "scopes": ["widgets:read"]
+    },
+    {
+      "tool": "widgets.preview",
+      "effect": "draft",
+      "scopes": ["widgets:write"],
+      "label": "generate"
+    },
+    {
+      "tool": "widgets.publish",
+      "effect": "send",
+      "scopes": ["widgets:publish"],
+      "label": "deploy"
+    }
+  ]
+}
