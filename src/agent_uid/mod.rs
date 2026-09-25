@@ -500,34 +500,32 @@ impl View for LiveHost {
         #[cfg(unix)]
         {
             use std::ffi::CString;
+            // libc's `getgrouplist` signature follows the platform:
+            // Darwin's buffer and base gid are `int`, elsewhere
+            // `gid_t` — the casts below are real on one side of the
+            // fence and no-ops on the other.
+            #[cfg(target_vendor = "apple")]
+            type GrouplistGid = libc::c_int;
+            #[cfg(not(target_vendor = "apple"))]
+            type GrouplistGid = libc::gid_t;
             let name = CString::new(user.name.clone())
                 .map_err(|_| io::Error::other("user name carries NUL"))?;
             let mut count: libc::c_int = 0;
-            unsafe {
-                libc::getgrouplist(
-                    name.as_ptr(),
-                    user.gid as libc::gid_t,
-                    std::ptr::null_mut(),
-                    &mut count,
-                )
-            };
-            let mut buf = vec![0 as libc::gid_t; count.max(0) as usize + 1];
+            #[allow(clippy::unnecessary_cast)] // gid_t→c_int on Darwin
+            let basegid = user.gid as GrouplistGid;
+            unsafe { libc::getgrouplist(name.as_ptr(), basegid, std::ptr::null_mut(), &mut count) };
+            let mut buf = vec![0 as GrouplistGid; count.max(0) as usize + 1];
             let mut gids = vec![user.gid];
             // A membership that grows between calls makes the second
             // call fail with the needed size in `n` — grow and retry,
             // bounded, rather than audit a truncated group vector.
+            #[allow(clippy::unnecessary_cast)]
             for _ in 0..4 {
                 let mut n = buf.len() as libc::c_int;
-                let got = unsafe {
-                    libc::getgrouplist(
-                        name.as_ptr(),
-                        user.gid as libc::gid_t,
-                        buf.as_mut_ptr(),
-                        &mut n,
-                    )
-                };
+                let got =
+                    unsafe { libc::getgrouplist(name.as_ptr(), basegid, buf.as_mut_ptr(), &mut n) };
                 if got >= 0 {
-                    gids.extend(buf[..n.max(0) as usize].iter().copied());
+                    gids.extend(buf[..n.max(0) as usize].iter().map(|g| *g as u32));
                     break;
                 }
                 buf.resize(n.max(0) as usize + 1, 0);
