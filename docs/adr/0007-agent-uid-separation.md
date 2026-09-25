@@ -14,12 +14,12 @@
   residual R7, and ADR 0004's "supported hardened deployment" (option
   D). It also bears on ADR 0006 §1.5 P4 / §5.3: the custody store's
   same-uid residual closes when the store's readers are a different uid.
-  PR #275 (CAD-366) carries that store — open at this writing; custody
-  was verified daemon-owned `0700` under the state dir at its head —
-  and this ADR is written so the store needs no change under
-  separation; it only becomes private for real.
+  PR #275 (CAD-366) carries that store — merged at this writing;
+  custody is daemon-owned `0700` under the state dir
+  (`src/platform/custody.rs`) — and this ADR is written so the store
+  needs no change under separation; it only becomes private for real.
 - **Code citations are pinned to
-  `ea62ec96f66d67c7e5c8974e7d9de137c78e9fd7`** (origin/main, 2026-09-25).
+  `b9fc7214cdf9060ba4989ab0052e67baf93e2ab6`** (origin/main, 2026-09-25).
   Line numbers move; re-locate by the quoted symbol.
 
 ## 1. Context
@@ -152,7 +152,7 @@ shared or agent zone.**
 
 | Zone | Paths | Owner:group, mode | Why |
 |---|---|---|---|
-| Operator-private (agent uid cannot reach at all) | `~/.local/state/cadence/**` — `cadence.sqlite3`, `slots.json`, `operator/`, custody store (PR #275), `daemon.log`, `ui.log`, `sessions/`, `private/`, `reviews/`, `GATE-STATE.md`; `~/.ssh`, `~/.config/gh`, `~/.claude*`, `~/.codex`, `~/.config/devin`, `~/.local/share/devin`, `~/.cursor*`, `~/.pi`, `~/.npmrc`, `~/.cargo`, `~/.rustup`, `~/.gitconfig` | `ubuntu:ubuntu`, dir `0700`, files as today | Everything that is an operator proof input or a credential stays behind uid. `/home/ubuntu` is `0750` and **never receives an ACL or traversal grant** — §4's store lives outside `~` precisely so this stays true. |
+| Operator-private (agent uid cannot reach at all) | `~/.local/state/cadence/**` — `cadence.sqlite3`, `slots.json`, `operator/`, custody store (PR #275), `daemon.log`, `ui.log`, `sessions/`, `private/`, `reviews/`, `GATE-STATE.md`; `~/.ssh`, `~/.config/gh`, `~/.claude*`, `~/.codex`, `~/.config/devin`, `~/.local/share/devin`, `~/.cursor*`, `~/.pi`, `~/.npmrc`, `~/.cargo`, `~/.rustup`, `~/.gitconfig` | `ubuntu:ubuntu`, modes as today — `0700` state dir; the provider paths keep their measured `775` dirs and `664`/`600` files (§4's list) | Everything that is an operator proof input or a credential stays behind uid. `/home/ubuntu` is `0750` and **never receives an ACL or traversal grant** — §4's store lives outside `~` precisely so this stays true. |
 | Shared edge (`/var/lib/cadence`, root-created once) | `daemon.sock` — the agent-reachable control socket; `pm/` — the relocated tracker checkout; `lanes/` — optional per-lane drop area | `/var/lib/cadence` `ubuntu:cadence` `0750`; socket `0660`; `pm/` `cadence-agent:cadence` `2775` (setgid) | Agents must reach the daemon socket and the tracker; the directory's lack of group `w` means agents can traverse and connect but cannot create, rename or unlink the socket (no squatting). `pm/` is group-writable by design — Class-4 direct tracker writes stay direct writes — and is agent-*owned* on purpose: its `.git` falls under §4's invariant (git there only ever runs as the agent uid). |
 | Agent-owned | `~cadence-agent/**` — provider config, `gh` bot creds, `.gitconfig`, cargo/rustup/npm, `/tmp` scratch; plus `/var/lib/cadence/repos/<name>/**` — each repo's agent-facing clone, its lane worktrees and its shared dep cache | `cadence-agent:cadence-agent` `0750` home; `repos/` `cadence-agent:cadence` `2750` + default ACL `g:cadence:rwX` | A real home is what makes provider CLIs, toolchains and `gh` work unmodified. `repos/` is agent-owned for a load-bearing reason — git's dubious-ownership refusal is the mechanism that keeps operator-uid git out of it (§4). |
 
@@ -250,10 +250,12 @@ build would be moot while sibling secrets leak.
   mixed-content home.
 - **R2 — an agent-owned store outside `~`.** The agent-facing
   checkouts live at `/var/lib/cadence/repos/<name>` — provision clones
-  the operator's checkout once via `git clone file://…` (never
-  `--local`/`--shared`, so no object inode is ever shared with the
-  operator's `.git`), `chown`s it to `cadence-agent`, and repoints
-  `origin` at the forge, which is the only remote it ever syncs with.
+  each repo once **from the forge** (`git clone <forge-url>`; never
+  `file://` a local checkout — under provision's `sudo`, `upload-pack`
+  would run as root inside a `.git` that uid-1000 agents write today —
+  and never `--local`/`--shared`, so no object inode is ever shared
+  with the operator's `.git`), then `chown`s it to `cadence-agent`.
+  `origin` is the forge already — the only remote it ever syncs with.
   Lane worktrees are `repos/<name>/.cadence/wt/<lane>` off the store's
   `.git` — `create_worktree` already takes a root; nothing forced it
   to be the operator's checkout. Nothing under `~` is shared at all:
@@ -296,12 +298,29 @@ topological, not configurational:
    git against `/var/lib/cadence` — `issue start`'s `create_worktree`,
    tracker commits, store fetches and prunes — execs through the
    helper as the agent uid: one spawn wrapper, not per-callsite
-   judgement. The operator deliberately sets no `safe.directory`
-   exception for `/var/lib/cadence`, so a planted hook or config can
-   only ever run as the agent uid — there is no residual code-exec
-   channel to name. Ad-hoc operator archaeology clones the store into
-   `~` (copying *into* operator space is safe); it never runs git
-   inside it.
+   judgement. The refusal is load-bearing, so its two companions are
+   named as rules — each is the obvious fix an operator would reach
+   for when an ordinary `git` fails there, and each silently reopens
+   the channel this rule closes:
+   - **No `safe.directory` or `include.path` covering
+     `/var/lib/cadence` ever appears in a uid-1000 git config** —
+     not in `~/.gitconfig`, `GIT_CONFIG_GLOBAL`, or any file an
+     `include.path` chain pulls in. The moment such an exception
+     exists, a planted `core.fsmonitor`, hook or filter in the
+     agent-owned `.git` executes as uid 1000: the agent→operator
+     code-exec channel, reopened by config.
+   - **An agent-owned `.git` never runs under uid-1000 git —
+     including copies.** Operator inspection of the store reads
+     files, or runs git through the helper as the agent uid. A copy
+     into `~` is data only and must never see a uid-1000 `git`
+     invocation: `cp` lands the copy operator-owned, so the
+     dubious-ownership refusal stops protecting its agent-written
+     `.git` — the first `git status` inside it runs its hooks and
+     `core.fsmonitor` as the operator.
+   The residual, stated honestly: the boundary rests on the operator
+   never granting the exception or running git in a copied tree —
+   §12 names it, and T1's `doctor` asserts that no uid-1000 git
+   config lists the store.
 3. **The two object stores never meet.** The store's `origin` is the
    forge; the operator's checkout uses the same forge. They never
    fetch from each other, so a forged local ref or poisoned object in
@@ -422,17 +441,19 @@ What needs root **once**, at provision (the whole list):
 
 ```text
 useradd --system -m -d /home/cadence-agent -s /usr/sbin/nologin cadence-agent
+install -d -o cadence-agent -g cadence-agent -m 0750 /home/cadence-agent
 groupadd cadence && usermod -aG cadence ubuntu && usermod -aG cadence cadence-agent
 groupadd cadence-launch && usermod -aG cadence-launch ubuntu     # helper's caller scope
-install -o root -g cadence-launch -m 4750 cadence-agent-exec /opt/cadence/libexec/
+install -d -o root          -g root           -m 0755 /opt/cadence
+install -d -o root          -g cadence-launch -m 0750 /opt/cadence/libexec
+install    -o root          -g cadence-launch -m 4750 cadence-agent-exec /opt/cadence/libexec/
 install -d -o ubuntu        -g cadence -m 0750 /var/lib/cadence
 install -d -o ubuntu        -g cadence -m 0750 /var/lib/cadence/lanes
 install -d -o cadence-agent -g cadence -m 2750 /var/lib/cadence/repos
 setfacl -m d:g:cadence:rwX /var/lib/cadence/repos
 install -d -o ubuntu -g cadence -m 0755 /opt/cadence/bin /opt/cadence/releases
-<per repo>: git clone file:///home/ubuntu/Project/<name> /var/lib/cadence/repos/<name> \
-            && chown -R cadence-agent:cadence /var/lib/cadence/repos/<name> \
-            && git -C /var/lib/cadence/repos/<name> remote set-url origin <forge-url>
+<per repo>: git clone <forge-url> /var/lib/cadence/repos/<name> \
+            && chown -R cadence-agent:cadence /var/lib/cadence/repos/<name>
 ```
 
 All of it is one `cadence agent-uid provision` script the operator runs
@@ -592,7 +613,7 @@ it walls the factor's material off from agents.
   readable cross-uid — and classifies it `Attribution::Foreign`. And
   with zero live agent roots, `attribute`'s `roots.is_empty()` arm
   returns a live client socket as `Ok(None)` → `Attribution::NoAgent`
-  (operator.rs ~462–478). `decide` (operator.rs:425) maps `(session,
+  (operator.rs:466–478). `decide` (operator.rs:425) maps `(session,
   Foreign)` *and* `(session, NoAgent)` → `Verdict::Operator("operator
   (ui)")` — designed for tailscaled/sshd proxies, but under separation
   the *agent uid is another foreign uid*: an agent-uid process
@@ -618,8 +639,10 @@ it walls the factor's material off from agents.
 plus provider logins (§7), the `gh` bot credential (§4) and the
 per-repo store clones (§4). Ends with `cadence doctor` reporting the
 uid, groups, shared dirs, the store, the helper and agent-uid logins —
-and asserting the negative: `/home/ubuntu` carries no ACL or grant
-reachable by the agent uid. **Nothing launches differently yet.**
+and asserting the negatives: `/home/ubuntu` carries no ACL or grant
+reachable by the agent uid, and no uid-1000 git config
+(`~/.gitconfig`, `GIT_CONFIG_GLOBAL`, `include.path` chains) lists
+`/var/lib/cadence` (§4 rule 2). **Nothing launches differently yet.**
 
 **Stage B — code, default off.** `agent_uid` is a per-state-dir config
 (`setup`/state record, absent ⇒ today's identical same-uid behaviour —
@@ -709,7 +732,11 @@ widest.
 7. **The §4 sharing decision.** Recommendation: the agent-owned store —
    nothing under `~` is ever ACL'd or shared, and git's own
    dubious-ownership refusal keeps operator-uid git out of the
-   agent-writable `.git`s. The alternative is R1's traverse ACL plus a
+   agent-writable `.git`s. That refusal is load-bearing, so §4 rule 2
+   carries it as named rules — never a `safe.directory`/`include.path`
+   exception covering the store, never a uid-1000 git inside a copied
+   tree — asserted by `doctor`, not left as prose. The alternative is
+   R1's traverse ACL plus a
    recursive `o`-strip lockdown sweep and a standing `doctor` assertion
    that no agent-reachable `o+r` path under `~` survives — a permanent
    obligation on a mixed-content home, which is why the ADR recommends
@@ -723,8 +750,10 @@ A `cadence-agent`-uid adversary — one compromised or prompt-injected
 agent — can still:
 
 - **Read and write every lane's worktree** and the shared tracker,
-  dep cache, repo store and `/var/lib/cadence/lanes` — shared uid means
-  no intra-agent boundary (U2 is the fix; §11 Q2).
+  dep cache and repo store — shared uid means no intra-agent boundary
+  (U2 is the fix; §11 Q2). `/var/lib/cadence/lanes` itself is not
+  writable: `0750 ubuntu:cadence` (§5) — agents traverse and read it
+  but cannot create, rename or unlink entries there.
 - **Rewrite the shared stores' `.git` — config, hooks, filters.** Buys
   nothing new: by §4's invariant those dirs only ever execute git as
   the agent uid, so a planted hook's blast radius is the agent domain
@@ -748,6 +777,14 @@ agent — can still:
 - **Read every provider session in `~cadence-agent`** — one shared home
   means one lane reads another lane's Claude/Codex transcripts and
   config. Accepted for U1; U2 fixes.
+- **Bait the `.git`s it owns for an operator-side slip.** §4's
+  boundary holds only while rule 2's companion rules do: a
+  `safe.directory` or `include.path` exception covering
+  `/var/lib/cadence` in any uid-1000 git config, or a uid-1000 `git`
+  run inside a tree copied into the operator's home, re-opens the
+  agent→operator code-exec channel with no further agent action. T1's
+  `doctor` asserts the config half; the copy half stays an operator
+  rule. Neither may ever happen — named, not excused.
 
 What it **cannot** do, that it can do today: read or write the daemon's
 state, custody store, operator signers, `operator/secret`, logs; signal
@@ -755,8 +792,9 @@ or ptrace operator-uid processes; reach any `/tmp/tmux-1000` socket
 (including cadence's own — closes CAD-288's class); `sudo`; read
 *anything* under `/home/ubuntu` — no ACL is granted, so the `0750`
 home stays absolute; plant code where an operator-uid git will run it
-(the only `.git`s it can reach are agent-owned, and foreign-uid git is
-refused there); see the operator's `gh`, ssh, npm or provider
+— the only `.git`s it can reach are agent-owned and foreign-uid git
+is refused there, for as long as §4 rule 2's companion rules hold;
+see the operator's `gh`, ssh, npm or provider
 credentials; satisfy `Who::Operator` in any process shape.
 
 ## 13. Implementation tickets (proposed, for the epic's owner to file)
@@ -770,7 +808,7 @@ the agent store).
 
 | Ticket | Scope |
 |---|---|
-| T1 — provision verb + host provision | `cadence agent-uid provision` (the §5 script), doctor checks for every artifact — including the negative assertion that `~` carries no agent-reachable ACL — then the operator runs it once on this host |
+| T1 — provision verb + host provision | `cadence agent-uid provision` (the §5 script), doctor checks for every artifact — including the negative assertions that `~` carries no agent-reachable ACL and that no uid-1000 git config (`~/.gitconfig`, `GIT_CONFIG_GLOBAL`, `include.path` chains) carries a `safe.directory`/`include.path` covering `/var/lib/cadence` (§4 rule 2) — then the operator runs it once on this host |
 | T2 — `cadence-agent-exec` helper | the three verbs, env allowlist, caller-group check; adversarial tests (argv injection, env smuggling, signaling a foreign-uid pid refused by kernel) |
 | T3 — socket split + uid admit set | dual-bind, `CADENCE_SOCKET`, `check_peer` admit `{euid, agent_uid}`, peer uid into derivation; board interim rule (§9.3) |
 | T4 — pty launch under agent uid | pane command wrap, `pane_env` rebuild, briefing into lane, kill/inspect routing in `reap_session`/`kill_pane`/`pane_cwd` |
