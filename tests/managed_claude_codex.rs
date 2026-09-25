@@ -746,7 +746,12 @@ fn concurrent_stops_are_idempotent() {
     for _ in 0..2 {
         let state = d.state.clone();
         racers.push(thread::spawn(move || {
-            client::rpc(&state, "agent_stop", json!({"alias": "w1"}))
+            // CAD-482: agent_stop is operator-gated — assert the
+            // operator identity in-band (a no-op scope on a build
+            // without the feature, where the ambient caller answers).
+            cadence_agent::test_seam::scoped(cadence_agent::test_seam::Asserted::Operator, || {
+                client::rpc(&state, "agent_stop", json!({"alias": "w1"}))
+            })
         }));
     }
     // Overlapping stops: exactly one owns the reservation and mutates;
