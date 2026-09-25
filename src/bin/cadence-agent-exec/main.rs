@@ -7,12 +7,13 @@
 //!   inspect <pid>                  print an agent-uid pid's /proc facts
 //!
 //! This file is the privileged syscall layer — every boundary decision
-//! (caller group, verb set, pid/signal bounds, env allowlist) is a pure
-//! unit-tested function in `policy`. The order is the contract: close
-//! inherited fds, gate the caller, resolve the target from the fixed
-//! name, validate argv, drop setgroups→setgid→setuid and verify, then
-//! act. Nothing runs as root after the drop; a defect before it is why
-//! this file stays small.
+//! (caller group, verb set, pid/signal bounds, env allowlist, target-id
+//! sanity) is a pure unit-tested function in `policy`. The order is the
+//! contract: close inherited fds, gate the caller, resolve the target
+//! from the fixed name and vet its ids, validate argv, drop
+//! setgroups→setgid→setuid and verify, set no_new_privs, then act.
+//! Nothing runs as root after the drop; a defect before it is why this
+//! file stays small.
 
 // The policy module is pure and portable — it compiles and its unit
 // tests run on every target; only the syscall layer below is
@@ -81,7 +82,14 @@ fn run() -> i32 {
         Some(g) => g,
         None => return fail("the shared group is not provisioned (T1)"),
     };
-    if let Err(why) = policy::caller_is_not_agent(uid, agent.uid) {
+    let mut supplementary = vec![agent.gid, shared_gid];
+    supplementary.sort_unstable();
+    supplementary.dedup();
+    // Vet the resolved identity before any privileged call: uid 0 — or
+    // gid 0 anywhere in the group set — would make the drop a stay as
+    // root, and an agent uid equal to the caller's real uid is the
+    // operator under the agent's name. Refusal precedes setgroups.
+    if let Err(why) = policy::agent_ids_are_safe(agent.uid, &supplementary, uid) {
         return refuse(&why);
     }
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
@@ -89,14 +97,18 @@ fn run() -> i32 {
         Ok(r) => r,
         Err(why) => return refuse(&why),
     };
-    let mut supplementary = vec![agent.gid, shared_gid];
-    supplementary.sort_unstable();
-    supplementary.dedup();
     if let Err(e) = drop_to(agent.uid, agent.gid, &supplementary) {
         return fail(&format!("privilege drop: {e}"));
     }
     if !verify_drop(agent.uid, agent.gid, &supplementary) {
         return fail("privilege drop did not take — refusing to continue");
+    }
+    // The drop is proven; seal it before any verb. no_new_privs is
+    // one-way and survives execve — the exec'd child can never regain
+    // privilege through a setuid or file-capability exec — and a failed
+    // prctl refuses the request outright.
+    if let Err(e) = set_no_new_privs() {
+        return fail(&format!("PR_SET_NO_NEW_PRIVS: {e}"));
     }
     match request {
         policy::Request::Exec { env, argv } => exec(&agent, &env, &argv),
@@ -117,10 +129,24 @@ fn fail(why: &str) -> i32 {
     FAILED
 }
 
+/// After the drop is verified and before the verbs — most importantly
+/// before `execve`. The flag is one-way and survives exec, so the
+/// exec'd child can never regain privilege through a setuid binary or
+/// a file-capability exec. A failed prctl is a refusal, not a warning.
+#[cfg(target_os = "linux")]
+fn set_no_new_privs() -> std::io::Result<()> {
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// fds >2 belong to the caller (the daemon's open files included) — a
-/// setuid binary neither holds them across the drop nor leaks them into
-/// the child. `close_range` is one syscall; the bounded loop is the
-/// fallback for kernels before 5.9.
+/// setuid binary neither holds them across the drop nor leaks them
+/// into the child. `close_range(3, ~0)` is the full sweep; a kernel
+/// without it (pre-5.9) takes the `/proc/self/fd` walk, the only
+/// fallback with no numeric cap — a descriptor seated above any fixed
+/// bound still appears in the listing.
 #[cfg(target_os = "linux")]
 fn close_fds() {
     #[cfg(target_os = "linux")]
@@ -129,8 +155,37 @@ fn close_fds() {
             return;
         }
     }
-    let max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) }.clamp(1024, 65536);
-    for fd in 3..max as i32 {
+    close_fds_via_procfs();
+}
+
+/// The pre-5.9 sweep: `/proc/self/fd` names exactly the descriptors
+/// this process holds. The readdir fd lands in the listing but is
+/// already closed when the closes run, and nothing opens in between,
+/// so its stale entry is an EBADF no-op. If /proc itself is unreadable
+/// the last resort sweeps to the kernel's own OPEN_MAX — floored at
+/// 1024, never capped (the 65536 cap was the bug being removed: a
+/// descriptor opened before an rlimit drop can sit above any fixed
+/// bound).
+#[cfg(target_os = "linux")]
+fn close_fds_via_procfs() {
+    let mut targets = Vec::new();
+    if let Ok(dir) = std::fs::read_dir("/proc/self/fd") {
+        for entry in dir.flatten() {
+            if let Some(fd) = policy::fd_entry(&entry.file_name()) {
+                targets.push(fd);
+            }
+        }
+    }
+    if targets.is_empty() {
+        let max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) }
+            .max(1024)
+            .min(i32::MAX as i64) as i32;
+        for fd in 3..max {
+            unsafe { libc::close(fd) };
+        }
+        return;
+    }
+    for fd in targets {
         unsafe { libc::close(fd) };
     }
 }
@@ -314,4 +369,134 @@ fn inspect_verb(pid: i32, agent_uid: u32) -> i32 {
 fn proc_owner(pid: i32) -> Option<(u32, u32)> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     policy::status_uids(&status)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+
+    /// Run `body` in a forked child and return its exit code, so the
+    /// one-way process mutations under test (`close_fds`, the prctl)
+    /// never scar the test process itself. `body` must stay
+    /// allocation-free: a lock another test thread held at fork()
+    /// stays held in the child forever.
+    fn in_forked_child(body: impl FnOnce() -> i32) -> i32 {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            unsafe { libc::_exit(body()) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(
+            libc::WIFEXITED(status),
+            "child killed by a signal: {status:#x}"
+        );
+        libc::WEXITSTATUS(status)
+    }
+
+    /// Reported by a child that could not seat the proof descriptor —
+    /// the parent turns it into a loud skip, not a vacuous pass.
+    const SKIP: i32 = 42;
+
+    /// The acceptance shape for the fd sweep: a descriptor seated at
+    /// or above 65537 (the pre-CAD-522 clamp line) must not survive.
+    /// RLIMIT permitting — the child raises its soft limit to the hard
+    /// one (no privilege needed) before dup'ing; hosts that cannot
+    /// seat fd 65537 report SKIP.
+    fn high_fd_child(close: fn()) -> i32 {
+        in_forked_child(move || {
+            const WANT: u64 = 65538;
+            let mut rl = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } != 0 {
+                return SKIP;
+            }
+            if rl.rlim_cur < WANT {
+                if rl.rlim_max < WANT {
+                    return SKIP;
+                }
+                rl.rlim_cur = WANT;
+                if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rl) } != 0 {
+                    return SKIP;
+                }
+            }
+            let high = unsafe { libc::fcntl(0, libc::F_DUPFD, 65537) };
+            if high < 0 {
+                return 5; // the rlimit allowed it but the seat failed
+            }
+            close();
+            if unsafe { libc::fcntl(high, libc::F_GETFD) } == -1 {
+                0
+            } else {
+                1
+            }
+        })
+    }
+
+    #[test]
+    fn close_fds_has_no_65536_clamp() {
+        match high_fd_child(close_fds) {
+            SKIP => eprintln!("SKIP: RLIMIT_NOFILE cannot seat fd 65537"),
+            code => assert_eq!(code, 0, "fd >= 65537 survived close_fds"),
+        }
+    }
+
+    #[test]
+    fn procfs_sweep_has_no_65536_clamp() {
+        match high_fd_child(close_fds_via_procfs) {
+            SKIP => eprintln!("SKIP: RLIMIT_NOFILE cannot seat fd 65537"),
+            code => assert_eq!(code, 0, "fd >= 65537 survived the procfs sweep"),
+        }
+    }
+
+    /// The acceptance proof for no_new_privs, without root: a forked
+    /// child runs our `set_no_new_privs` then execs `sleep`, and the
+    /// parent reads `/proc/<pid>/status` — `NoNewPrivs:\t1` on the
+    /// exec'd image is the flag surviving execve. (Any uid may set
+    /// it; T1's setuid install only changes *why* it matters.)
+    #[test]
+    fn no_new_privs_survives_into_the_execd_child() {
+        let prog = CString::new("/bin/sleep").unwrap();
+        let arg0 = CString::new("sleep").unwrap();
+        let arg1 = CString::new("30").unwrap();
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            // Allocation-free from here (see in_forked_child): the
+            // CStrings were built before the fork.
+            if set_no_new_privs().is_err() {
+                unsafe { libc::_exit(2) };
+            }
+            let argv = [arg0.as_ptr(), arg1.as_ptr(), std::ptr::null()];
+            let envp: [*const libc::c_char; 1] = [std::ptr::null()];
+            unsafe { libc::execve(prog.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
+            unsafe { libc::_exit(3) };
+        }
+        let mut proved = false;
+        let mut reaped = false;
+        for _ in 0..500 {
+            if let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
+                if status.contains("Name:\tsleep") {
+                    proved = status.contains("NoNewPrivs:\t1");
+                    break;
+                }
+            }
+            let mut st = 0;
+            if unsafe { libc::waitpid(pid, &mut st, libc::WNOHANG) } == pid {
+                reaped = true;
+                break; // the child died before exec — nothing to prove
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        if !reaped {
+            let mut st = 0;
+            unsafe { libc::waitpid(pid, &mut st, 0) };
+        }
+        assert!(proved, "the exec'd child lacked NoNewPrivs or never ran");
+    }
 }

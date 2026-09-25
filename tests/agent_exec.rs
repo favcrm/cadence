@@ -125,6 +125,33 @@ fn non_member_is_refused() {
     }
 }
 
+/// Seat an inheritable descriptor at >= 65537 — above the pre-CAD-522
+/// fallback clamp. `F_DUPFD` (not `F_DUPFD_CLOEXEC`) leaves it
+/// inheritable, so every helper spawned while it is open must close it
+/// before the exec'd child lists its own fd table. None when the
+/// rlimit cannot seat it — the caller reports a loud skip.
+fn seat_fd_past_65536() -> Option<i32> {
+    const WANT: u64 = 65538;
+    let mut rl = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } != 0 {
+        return None;
+    }
+    if rl.rlim_cur < WANT {
+        if rl.rlim_max < WANT {
+            return None;
+        }
+        rl.rlim_cur = WANT;
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rl) } != 0 {
+            return None;
+        }
+    }
+    let fd = unsafe { libc::fcntl(0, libc::F_DUPFD, 65537) };
+    (fd >= 0).then_some(fd)
+}
+
 /// `exec` crosses into the agent uid and nothing else: fixed PATH,
 /// passwd-derived HOME/USER/SHELL, and the group set is exactly
 /// {primary, cadence} — no inherited operator groups.
@@ -135,6 +162,10 @@ fn exec_drops_to_the_fixed_uid() {
         assert!(skip("run as a cadence-launch member on a provisioned host"));
         return;
     }
+    // Open before every helper spawn below: the fd is inheritable, so
+    // the helper's sweep must close it or it appears in the child's
+    // own fd table.
+    let high_fd = seat_fd_past_65536();
     let agent = agent_uid().unwrap();
     let out = run(&["exec", "--", "id", "-u"]);
     assert_eq!(
@@ -157,8 +188,9 @@ fn exec_drops_to_the_fixed_uid() {
     );
 
     // fds >2 were closed before the drop: a daemon-held fd must not
-    // appear in the child's fd table. `ls` itself transiently holds
-    // fd 3 for the dir handle — nothing above that may exist.
+    // appear in the child's fd table — the inherited descriptor seated
+    // above 65536 included. `ls` itself transiently holds fd 3 for the
+    // dir handle — nothing above that may exist.
     let out = run(&["exec", "--", "ls", "/proc/self/fd"]);
     let fds = String::from_utf8_lossy(&out.stdout);
     for fd in fds.split_whitespace() {
@@ -167,6 +199,32 @@ fn exec_drops_to_the_fixed_uid() {
             "inherited fd {fd} survived the drop: {fds:?}"
         );
     }
+    match high_fd {
+        Some(fd) => unsafe {
+            libc::close(fd);
+        },
+        None => eprintln!("SKIP: RLIMIT_NOFILE too low to seat fd 65537"),
+    }
+}
+
+/// PR_SET_NO_NEW_PRIVS lands after the verified drop and before
+/// execve — the exec'd image carries `NoNewPrivs: 1`, so it can never
+/// regain privilege through a setuid or file-capability exec.
+#[test]
+#[ignore = "needs T1's provisioned host"]
+fn exec_child_has_no_new_privs() {
+    if !provisioned() || !in_launch_group() {
+        assert!(skip("run as a cadence-launch member on a provisioned host"));
+        return;
+    }
+    let out = run(&["exec", "--", "cat", "/proc/self/status"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("NoNewPrivs:\t1"), "{text}");
 }
 
 fn agent_primary_gid() -> u32 {
@@ -298,7 +356,17 @@ fn inspect_reads_agent_pid_only() {
         text.contains(&format!("gid {}", agent_primary_gid())),
         "{text}"
     );
-    assert!(text.contains("cwd "), "{text}");
+    // The cwd field must carry a real path — an empty read (the helper
+    // prints nothing after "cwd " when readlink fails) is a failure,
+    // not a pass.
+    let cwd = text
+        .lines()
+        .find_map(|l| l.strip_prefix("cwd "))
+        .expect("inspect output carries no cwd line");
+    assert!(
+        !cwd.is_empty(),
+        "empty cwd for a live agent-uid pid: {text}"
+    );
     assert!(text.contains("starttime "), "{text}");
     assert_eq!(run(&["kill", &pid, "KILL"]).status.code(), Some(0));
     let _ = child.wait();
