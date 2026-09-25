@@ -1292,7 +1292,34 @@ fn app_propose_gates_and_provenance() {
         .unwrap_err();
     assert_eq!(err.code(), Some("app_unapproved"), "{err}");
 
-    // Reject the plan → the app can go.
+    // A stored workflow that shares the app's name records a bare
+    // `plan.workflow = "studio"` — no slash — and is not the app's plan:
+    // its open epic must not hold `app remove`.
+    wf_add(&f, "studio", WF_TWO_STEP);
+    f.d.operator_rpc(
+        "workflow_approve",
+        json!({"project": "demo", "name": "studio"}),
+    )
+    .unwrap();
+    let (ok, out) = f.cli(&[
+        "plan",
+        "propose",
+        "--project",
+        "demo",
+        "--workflow",
+        "studio",
+        "--input",
+        "title=stored name",
+    ]);
+    assert!(ok, "{out}");
+    let stored_epic = out["epic"].as_str().unwrap().to_string();
+    assert_eq!(
+        f.front(&stored_epic).plan.unwrap().workflow.as_deref(),
+        Some("studio")
+    );
+
+    // Reject the app's plan → the app can go even while the stored
+    // workflow's own plan stays open.
     f.d.operator_rpc("plan_reject", json!({"epic": "D-1", "reason": "not now"}))
         .unwrap();
     let (ok, out) = f.cli(&["app", "remove", "studio", "--project", "demo"]);
@@ -1506,6 +1533,61 @@ fn app_install_from_git_pins_the_commit() {
     assert_eq!(out["diff"]["added"], json!(["templates/brief.md"]), "{out}");
     let (ok, out) = f.cli(&["app", "show", "studio", "--project", "demo"]);
     assert!(ok && out["record"]["source"]["sha"] == head2, "{out}");
+}
+
+/// CAD-547: `doctor` reports each installed app's slot bindings — the
+/// `local` default verified against the daemon's connection set, an
+/// explicit unbind named in `unbound`, and a binding to a connection
+/// the daemon does not register named in `unknown_connection`.
+#[test]
+fn app_doctor_reports_slot_bindings() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    f.d.register("qa-1");
+    app_install_studio(&f);
+    let studio = |out: &Value| -> Value {
+        out["checks"]["apps"]["apps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["app"] == "studio")
+            .unwrap_or_else(|| panic!("no studio row: {out}"))
+            .clone()
+    };
+
+    // Default: publish binds to the built-in `local` — the fixture
+    // daemon registers no other connections.
+    let (ok, out) = f.cli(&["doctor"]);
+    assert!(ok, "{out}");
+    let row = studio(&out);
+    assert_eq!(
+        row["slots_ok"],
+        json!([{"slot": "publish", "connection": "local"}]),
+        "{row}"
+    );
+    assert_eq!(row["unbound"], json!([]), "{row}");
+    assert_eq!(row["unknown_connection"], json!([]), "{row}");
+
+    // Bound to a connection the daemon does not register → named.
+    let (ok, out) = f.cli(&["app", "set", "studio", "publish=ghost", "--project", "demo"]);
+    assert!(ok, "{out}");
+    let (ok, out) = f.cli(&["doctor"]);
+    assert!(ok, "{out}");
+    let row = studio(&out);
+    assert_eq!(
+        row["unknown_connection"],
+        json!([{"slot": "publish", "connection": "ghost"}]),
+        "{row}"
+    );
+    assert_eq!(row["slots_ok"], json!([]), "{row}");
+
+    // An explicit unbind is reported, not silently defaulted.
+    let (ok, out) = f.cli(&["app", "set", "studio", "publish=", "--project", "demo"]);
+    assert!(ok, "{out}");
+    let (ok, out) = f.cli(&["doctor"]);
+    assert!(ok, "{out}");
+    let row = studio(&out);
+    assert_eq!(row["unbound"], json!(["publish"]), "{row}");
 }
 
 /// CAD-360: `job dispatch` of a task whose job is bound to a ticket of

@@ -729,6 +729,7 @@ tests = [
     "app_propose_gates_and_provenance",
     "app_install_refuses_hostile_input",
     "app_install_from_git_pins_the_commit",
+    "app_doctor_reports_slot_bindings",
     "plan_gate_refuses_job_dispatch_until_approved",
     "plan_membership_is_the_list_not_the_link",
     "plan_gate_fails_closed_on_unreadable_or_rewritten_epic",

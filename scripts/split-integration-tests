@@ -712,6 +712,7 @@ PINNED.update({
     "app_propose_gates_and_provenance": "plan_work",
     "app_install_refuses_hostile_input": "plan_work",
     "app_install_from_git_pins_the_commit": "plan_work",
+    "app_doctor_reports_slot_bindings": "plan_work",
     "board_app_workflow_list_preview_and_propose": "board_ui",
     # CAD-378 code-area owners
     "cad378_start_warns_on_overlap_owner_and_capacity": "plan_work",

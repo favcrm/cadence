@@ -1195,7 +1195,9 @@ fn open_plan_epics(pm_dir: &Path, project_key: &str, name: &str, state_dir: &Pat
         };
         plan.state != "rejected" && !matches!(front.status.as_str(), "done" | "dropped")
     };
-    let from_app = |wf: &str| wf.split('/').next() == Some(name);
+    // `<app>/<wf>` only — a stored workflow that happens to share the
+    // app's name (`plan.workflow = "studio"`, no slash) is not its plan.
+    let from_app = |wf: &str| split_ref(wf).is_some_and(|(app, _)| app == name);
     if let Ok(issues) = board::load_all(pm_dir, Some(project_key)) {
         for issue in &issues {
             if let Some(wf) = issue
