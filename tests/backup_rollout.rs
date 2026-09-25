@@ -320,6 +320,166 @@ fn daemon_restart_when_idle_gates_and_proceeds() {
     assert!(stop.status.success());
 }
 
+/// CAD-503/F19: a `running` message whose agent was stopped can never
+/// report — no actor exists for it — so --when-idle must refuse it
+/// promptly, naming the row and its remedy, instead of waiting out the
+/// timeout. `--ignore-stale` carries the row through the restart.
+#[test]
+fn when_idle_refuses_stale_turns_on_a_stopped_agent() {
+    let d = TestDaemon::start();
+    let _reaper = DaemonReaper::new(&d.state);
+    let _mock = d.mock_devin();
+    d.register_devin("dv", None);
+    d.wait_agent("dv", "idle", 20);
+    d.operator_rpc("agent_ready", json!({"alias": "dv"}))
+        .unwrap();
+    d.operator_rpc(
+        "agent_send",
+        json!({"alias": "dv", "text": "task", "message": "m1"}),
+    )
+    .unwrap();
+    let _token = pty_token(&d, "dv", "m1");
+    // The F19 strand: stopping mid-turn leaves the `running` row behind.
+    d.operator_rpc("agent_stop", json!({"alias": "dv"}))
+        .unwrap();
+    d.wait_agent("dv", "stopped", 15);
+    assert_eq!(d.message_state("dv", "m1"), "running");
+
+    let home = TempDir::new().unwrap();
+    hold_rollout_lease(home.path(), &d.state);
+    let started_at = d.rpc("daemon_info", json!({})).unwrap()["started_at"].clone();
+    // The stale turn is refused at the first pass — long before the
+    // timeout the old code waited out.
+    let started = Instant::now();
+    let out = operator_cadence_at(
+        home.path(),
+        &d.state,
+        &[
+            "daemon",
+            "restart",
+            "--when-idle",
+            "--timeout",
+            "30",
+            "--as",
+            "operator:test",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "a stale turn waited out the timeout: {stderr}"
+    );
+    assert!(stderr.contains("stale"), "{stderr}");
+    assert!(stderr.contains("dv") && stderr.contains("m1"), "{stderr}");
+    assert!(stderr.contains("--ignore-stale"), "{stderr}");
+    // Aborted before touching anything: the daemon still answers and the
+    // row is still `running` for the operator to settle.
+    assert!(d.rpc("health", json!({})).is_ok());
+    assert_eq!(d.message_state("dv", "m1"), "running");
+
+    // The explicit bypass proceeds past the row — and the restart's own
+    // reconciliation then fences it (`running` -> `unknown`), so the
+    // verdict is the same "not cleanly" a fenced turn always earns.
+    let out = operator_cadence_at(
+        home.path(),
+        &d.state,
+        &[
+            "daemon",
+            "restart",
+            "--when-idle",
+            "--timeout",
+            "30",
+            "--ignore-stale",
+            "--as",
+            "operator:test",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stdout}\n{stderr}");
+    assert!(stderr.contains("stale"), "{stderr}");
+    assert!(stdout.contains("fenced"), "{stdout}\n{stderr}");
+    let info = d.rpc("daemon_info", json!({})).unwrap();
+    assert_ne!(info["started_at"], started_at, "daemon did not restart");
+    // Carried through, not hidden: the row is now `unknown` for
+    // `message reconcile` to settle — never silently retried.
+    assert_eq!(d.message_state("dv", "m1"), "unknown");
+    d.wait_agent("dv", "stopped", 15);
+    let stop = operator_cadence_at(home.path(), &d.state, &["daemon", "stop"]);
+    assert!(stop.status.success());
+}
+
+/// CAD-503: only stopped/dead holders are stale — a live agent's
+/// `running` turn still blocks --when-idle until the report lands,
+/// even under --ignore-stale.
+#[test]
+fn when_idle_still_waits_on_a_live_running_turn() {
+    let d = TestDaemon::start();
+    let _reaper = DaemonReaper::new(&d.state);
+    let _mock = d.mock_devin();
+    d.register_devin("dv", None);
+    d.wait_agent("dv", "idle", 20);
+    d.operator_rpc("agent_ready", json!({"alias": "dv"}))
+        .unwrap();
+    d.operator_rpc(
+        "agent_send",
+        json!({"alias": "dv", "text": "task", "message": "m1"}),
+    )
+    .unwrap();
+    let token = pty_token(&d, "dv", "m1");
+
+    let home = TempDir::new().unwrap();
+    hold_rollout_lease(home.path(), &d.state);
+    let out = operator_cadence_at(
+        home.path(),
+        &d.state,
+        &[
+            "daemon",
+            "restart",
+            "--when-idle",
+            "--timeout",
+            "3",
+            "--ignore-stale",
+            "--as",
+            "operator:test",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("fleet still busy"), "{stderr}");
+    assert!(stderr.contains("dv"), "{stderr}");
+    // The turn reports — the same command then proceeds.
+    d.operator_rpc(
+        "message_report",
+        json!({"message": "m1", "token": token, "kind": "result", "text": "done"}),
+    )
+    .unwrap();
+    d.wait_message("dv", "m1", &["completed"], 15);
+    let out = operator_cadence_at(
+        home.path(),
+        &d.state,
+        &[
+            "daemon",
+            "restart",
+            "--when-idle",
+            "--timeout",
+            "30",
+            "--as",
+            "operator:test",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+        restart_diag(&d, "dv")
+    );
+    let stop = operator_cadence_at(home.path(), &d.state, &["daemon", "stop"]);
+    assert!(stop.status.success());
+}
+
 /// CAD-424: an interrupted restore's leftovers refuse `daemon restart`
 /// before anything is shut down, with the recovery `mv` on stderr, and
 /// the running daemon keeps serving. On a host an older binary started

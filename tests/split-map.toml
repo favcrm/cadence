@@ -1025,6 +1025,8 @@ tests = [
     "daemon_restarts_after_owner_exit",
     "daemon_restart_keeps_pane_pid_and_reports_table",
     "daemon_restart_when_idle_gates_and_proceeds",
+    "when_idle_refuses_stale_turns_on_a_stopped_agent",
+    "when_idle_still_waits_on_a_live_running_turn",
     "cad424_daemon_restart_refuses_over_restore_leftovers_before_shutdown",
     "daemon_stop_then_start_never_races_lock",
     "daemon_restart_without_a_lease_leaves_the_pid_unchanged",
