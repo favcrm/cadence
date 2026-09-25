@@ -26,6 +26,8 @@ equal(needLabel("approval_menu"), "approval menu");
 equal(needLabel("not_a_kind"), "unknown / unclassified");
 equal(needLabel("approval"), "approval");
 equal(needLabel("inbox_stale"), "stale inbox");
+// CAD-378: a lane changing another owner's code area.
+equal(needLabel("area_ack"), "area ack");
 // CAD-253: the audience comes from the server; the UI keeps only copy.
 equal(NEED_SECTION_LABEL.operator, "Needs your decision");
 equal(NEEDS_DECISION_EMPTY, "Nothing needs your decision");

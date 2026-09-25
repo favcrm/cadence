@@ -28,6 +28,7 @@ pub const SETTABLE: &[&str] = &[
     "type",
     "milestone",
     "size",
+    "paths",
 ];
 /// CAD-405 work-item types. An issue without `type` is an `epic` when
 /// it has children (or carries a plan) and a `task` otherwise.
@@ -101,6 +102,13 @@ pub struct Front {
     /// Free-form slicing labels — stored sorted and de-duplicated.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// CAD-378: the repo-relative files or globs this ticket plans to
+    /// touch — advisory path leases (`issue set <ID> paths=a,b`).
+    /// `dispatch`/`issue start` warn on overlap with open lanes and on
+    /// owned or full code areas; nothing refuses. Stored sorted and
+    /// de-duplicated. An older binary rewriting the file drops it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
     /// Intake kind for `cadence report` issues
     /// (`question|feedback|idea|bug`) — its own field, not a positional
     /// tag, so an extra tag can never mislabel it. Absent on ordinary
@@ -164,6 +172,7 @@ impl Front {
             claim: None,
             component: None,
             tags: vec![],
+            paths: vec![],
             kind: None,
             plan: None,
             plan_epic: None,

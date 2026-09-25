@@ -433,11 +433,28 @@ export interface OverviewClaim {
   age_secs: number | null;
 }
 
+/** CAD-378: one open lane, the code areas it plans or changes, and
+ *  the other lanes whose planned or changed paths it overlaps. */
+export interface OverviewLane {
+  issue: string;
+  worker: string | null;
+  pm: string | null;
+  pr: string | null;
+  planned: string[];
+  changed_count: number;
+  changed_error?: string | null;
+  areas: string[];
+  overlaps: string[];
+}
+
 export interface OverviewProject {
   key: string;
   open_by_status: Record<string, number>;
   oldest_review_age?: number | null;
   claims?: OverviewClaim[];
+  lanes?: OverviewLane[];
+  areas?: string[];
+  areas_error?: string | null;
 }
 
 export interface MonitorAlert {

@@ -43,7 +43,7 @@ pub(crate) fn commit(
     commit_who(pm, paths, message, ids, actor, None)
 }
 
-fn commit_who(
+pub(crate) fn commit_who(
     pm: &Pm,
     paths: &[PathBuf],
     message: &str,
@@ -873,6 +873,12 @@ fn apply_pairs(
             "tags" => {
                 front.tags = check_tags(project, &split_tags(value))?;
                 changed.push(format!("tags={}", front.tags.join(",")));
+                continue;
+            }
+            // CAD-378: advisory planned paths; an empty value clears.
+            "paths" => {
+                front.paths = crate::issue::areas::parse_paths(value)?;
+                changed.push(format!("paths={}", front.paths.join(",")));
                 continue;
             }
             // CAD-405: an empty value clears each of these.

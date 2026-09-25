@@ -485,12 +485,16 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         let refreshed = with_lane_refs(&front, &branch, &wt_str, &repo_label, &cargo_target);
         if refreshed.refs != front.refs {
             let committed = write::save_front(&dir, &refreshed, &body).and_then(|_| {
-                write::commit(
+                // The trailer binds the requester (the dispatching PM),
+                // not just the OS actor — the lane's area PM is read
+                // back from this record.
+                write::commit_who(
                     pm,
                     &[dir.join("issue.md")],
                     &format!("{}: start {branch} (refs refreshed)", front.id),
                     &[front.id.as_str()],
                     actor,
+                    Some(&requester),
                 )
             });
             if let Err(e) = committed {
@@ -559,12 +563,16 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         // fall together: a refused commit (hook lint, disk error)
         // rolls the file and the git side back so a retry is clean.
         let committed = write::save_front(&dir, &new_front, &body).and_then(|_| {
-            write::commit(
+            // `Actor:` is the requester (the dispatching PM), so the
+            // lane's advisory code-area PM is bound to this record and
+            // not to live frontmatter an agent can rewrite.
+            write::commit_who(
                 pm,
                 &[dir.join("issue.md")],
                 &format!("{}: start {branch}", front.id),
                 &[front.id.as_str()],
                 actor,
+                Some(&requester),
             )
         });
         if let Err(e) = committed {
@@ -635,6 +643,21 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         write::add_comment(pm, id, &note, None, Some("dispatch"), None, actor)?;
         out["cwd_override"] = json!(note);
     }
+    // CAD-378: advisory path leases — the ticket's planned paths
+    // against the project's code areas and the other open lanes. Never
+    // refuses: the warnings ride the output, and a start that minted
+    // the lane records them on the issue as a `lease` comment (the
+    // event). A failure to record is reported, not raised.
+    let mut leases =
+        crate::issue::areas::check_start(&pm.dir, state_dir, &project.key, &front, &requester);
+    let lines = crate::issue::areas::warning_lines(&leases);
+    if created && !lines.is_empty() {
+        let text = format!("Lease warnings at start:\n- {}", lines.join("\n- "));
+        if let Err(e) = write::add_comment(pm, id, &text, None, Some("lease"), None, actor) {
+            leases["record_error"] = json!(e.to_string());
+        }
+    }
+    out["leases"] = leases;
     Ok(out)
 }
 

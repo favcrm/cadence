@@ -616,6 +616,33 @@ impl Store {
         Ok(())
     }
 
+    /// The sender the daemon attributed when `message_id` was queued,
+    /// recovered from the recipient's thread entry: `(role, from)` —
+    /// `from` is the agent alias an agent caller was proven to be
+    /// (`role` is `system`), `None` for operator and unattributed
+    /// sends. `None` overall when the message produced no thread entry
+    /// (an unthreaded recipient keeps none). This is the
+    /// connection-derived record, not a request field: `dispatch_record`
+    /// binds a lane's PM from it (CAD-378).
+    pub fn message_sender(&self, message_id: &str) -> Result<Option<(String, Option<String>)>> {
+        let conn = self.conn();
+        match conn.query_row(
+            "SELECT role,payload FROM thread_entries WHERE message_id=? \
+             ORDER BY seq LIMIT 1",
+            [message_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        ) {
+            Ok((role, payload)) => {
+                let from = payload
+                    .and_then(|p| serde_json::from_str::<Value>(&p).ok())
+                    .and_then(|v| v.get("from").and_then(Value::as_str).map(str::to_string));
+                Ok(Some((role, from)))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Entries after `after`, oldest first, at most `limit` (bounded by
     /// [`PAGE_MAX`]). An alias with no thread reads empty.
     pub fn thread_entries(&self, alias: &str, after: i64, limit: i64) -> Result<Vec<ThreadEntry>> {

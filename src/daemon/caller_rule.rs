@@ -102,7 +102,9 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         Rule::Handler(
             "thread_sender: the operator's thread write needs proof (CAD-384); \
              send_with: --priority/--supersedes need agent_caller + may_mutate_agent \
-             Steer — the operator or the recipient's PM (CAD-158)",
+             Steer — the operator or the recipient's PM (CAD-158); \
+             issue/worktree are refused for every caller — only dispatch_send \
+             and task_dispatch write lane tags (CAD-378 R6)",
         ),
     ),
     (
@@ -283,6 +285,27 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         ),
     ),
     ("project_work_approve", Rule::Handler("operator_connection")),
+    (
+        "area_ack",
+        Rule::Handler("rpc_area_ack: the operator, or the area's owner PM by its connection (CAD-378)"),
+    ),
+    (
+        "dispatch_record",
+        Rule::Handler(
+            "rpc_dispatch_record: the kickoff's attributed sender or the \
+             operator; lane + pm bind the message row's daemon-written \
+             fields, never a param or the tracker (CAD-378, CAD-467)",
+        ),
+    ),
+    (
+        "dispatch_send",
+        Rule::Handler(
+            "rpc_dispatch_send: the target's PM or the operator (steer gate); \
+             an agent caller must also share the issue's holders when it is \
+             doing/review; the lane tags come from the daemon's own \
+             resolution, never caller fields (CAD-378 R6)",
+        ),
+    ),
     ("project_work_approvals", Rule::Read),
     (
         "workflow_approve",

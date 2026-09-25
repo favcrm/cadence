@@ -60,6 +60,7 @@ pub fn run_with(
     for project in &projects {
         use crate::issue::work;
         let (raw, err) = work::load_config_or_default(&pm.dir, &project.key);
+        let file_ok = err.is_none();
         if let Some(err) = err {
             lint.warn(format!(
                 "{}/PROJECT.md: {err} — the default stages apply",
@@ -91,6 +92,15 @@ pub fn run_with(
             }
         };
         work_configs.insert(project.key.clone(), cfg);
+        // CAD-378: a malformed `areas:` block is a warning — the
+        // advisory area checks are skipped until it is fixed; stage
+        // gates are unaffected. (An unreadable file is warned once, above.)
+        if let (true, (_, Some(err))) = (
+            file_ok,
+            crate::issue::areas::load_or_error(&pm.dir, &project.key),
+        ) {
+            lint.warn(format!("{err} — area checks are skipped"));
+        }
     }
     // CAD-339: `<pm>/agents/` holds the agent files — never a project.
     if projects.iter().any(|p| p.key == "agents") {

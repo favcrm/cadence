@@ -11,6 +11,7 @@ import type {
   ProjectContext,
 } from "../../lib/types";
 import { needSections } from "./needSections";
+import { laneSummary, sortLanes } from "./lanes";
 import { needLabel, shaCiLabel } from "../../lib/uxCopy";
 import { StaleChip } from "../../ui/ResourceStatus";
 
@@ -30,6 +31,7 @@ const KIND_CHIP: Record<string, string> = {
   inbox_unread: "bg-warn/10 text-warn",
   inbox_stale: "bg-warn/10 text-warn",
   tracker_behind: "bg-ink-800 text-ink-400",
+  area_ack: "bg-warn/10 text-warn",
 };
 
 function age(secs: number): string {
@@ -709,6 +711,33 @@ export default function OverviewView({
                       </li>
                     ))}
                   </ul>
+                )}
+                {/* CAD-378: open lanes, their code areas and overlaps. */}
+                {p.areas_error && (
+                  <p className="mt-1 sm:ml-[7.75rem] text-micro text-warn break-words">
+                    areas config: {p.areas_error}
+                  </p>
+                )}
+                {(p.lanes ?? []).length > 0 && (
+                  <details className="mt-1 sm:ml-[7.75rem] min-w-0" data-testid="open-lanes">
+                    <summary className="cursor-pointer list-none text-micro text-accent hover:underline">
+                      {(p.lanes ?? []).length} open lanes
+                      {(() => {
+                        const n = (p.lanes ?? []).filter((l) => l.overlaps.length > 0).length;
+                        return n > 0 ? ` · ${n} overlapping` : "";
+                      })()}
+                    </summary>
+                    <ul className="mt-1 space-y-0.5">
+                      {sortLanes(p.lanes ?? []).map((l) => (
+                        <li
+                          key={l.issue}
+                          className={`text-micro break-words ${l.overlaps.length > 0 ? "text-warn" : "text-ink-400"}`}
+                        >
+                          {laneSummary(l)}
+                        </li>
+                      ))}
+                    </ul>
+                  </details>
                 )}
                 </div>
               );

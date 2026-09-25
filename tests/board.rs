@@ -2224,20 +2224,32 @@ struct UiDaemon {
 impl UiDaemon {
     fn start() -> Self {
         let tmp = TempDir::new().unwrap();
-        Self::serve(tmp.path().to_path_buf(), Some(tmp))
+        Self::serve(tmp.path().to_path_buf(), Some(tmp), None)
     }
 
     /// Serve on a caller-owned state dir — for fixtures whose `state`
     /// the cli-under-test already points at.
     fn start_on(state: PathBuf) -> Self {
-        Self::serve(state, None)
+        Self::serve(state, None, None)
     }
 
-    fn serve(state: PathBuf, tmp: Option<TempDir>) -> Self {
+    /// `start_on` with the daemon's `CADENCE_PM_DIR` bound — a dispatch
+    /// reads the tracker daemon-side (`dispatch_send`), so the daemon
+    /// must see the same pm dir the cli calls do.
+    fn start_on_pm(state: PathBuf, pm: &Path) -> Self {
+        Self::serve(state, None, Some(pm))
+    }
+
+    fn serve(state: PathBuf, tmp: Option<TempDir>, pm: Option<&Path>) -> Self {
         let owned = state.clone();
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let provider_env = cadence_agent::adapter::ProviderEnv::default();
+        if let Some(pm) = pm {
+            provider_env.set("CADENCE_PM_DIR", pm.to_str().unwrap());
+        }
         let opts = daemon::ServeOptions {
             stop: Some(stop.clone()),
+            provider_env,
             ..Default::default()
         };
         let handle = thread::spawn(move || {
@@ -7114,7 +7126,10 @@ fn issue_claim_guards_start_and_take_over_is_recorded() {
 #[test]
 fn dispatch_respects_claims() {
     let (tmp, pm, state, repo) = start_fx();
-    let d = UiDaemon::start_on(state.clone());
+    // `dispatch_send` reads the tracker daemon-side (claim check +
+    // lane resolution) — the daemon must see the same pm dir the
+    // cli calls do.
+    let d = UiDaemon::start_on_pm(state.clone(), &pm);
     let cwd = pm.to_str().unwrap();
     for (alias, upstream) in [
         ("pm-a", None),

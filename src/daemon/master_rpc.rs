@@ -230,7 +230,7 @@ impl Shared {
         // read — `ready`, blockers done — under the same lock the
         // dispatch runs under, so a concurrent second call sees `doing`
         // and is refused having written nothing. The dispatch's own
-        // daemon calls (agent_show, agent_send) never take this lock.
+        // daemon calls (agent_show, dispatch_send) never take this lock.
         let _serial = self.dispatch_lock.lock().unwrap_or_else(|e| e.into_inner());
         // CAD-431: a dispatch the review loop cannot record does not
         // happen — an unreadable delivery.json refuses before anything.
@@ -313,7 +313,7 @@ impl Shared {
         // The daemon runs the ordinary dispatch on the master's behalf:
         // worktree, tracker refs and comment, one kickoff — attributed
         // to the master.
-        let out = issue::dispatch::run(&pm, id, &args, ALIAS, &self.state_dir)?;
+        let out = issue::dispatch::run(&pm, id, &args, ALIAS, &self.state_dir, Some(ALIAS))?;
         // Only a real send is the master's dispatch: a duplicate answers
         // with the live kickoff someone else sent (`dispatched: false`),
         // and recording that would hand the master interrupt rights over
