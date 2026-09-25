@@ -142,6 +142,25 @@ pub fn run_with(
                 }
                 continue;
             }
+            // CAD-487: `workflows/` holds the project's stored
+            // workflow files — its own lint validates them as
+            // templates.
+            if name == crate::issue::workflow::DIR {
+                let (mut werrs, mut wwarns) = (Vec::new(), Vec::new());
+                crate::issue::workflow::lint_dir(
+                    &path,
+                    &project.key,
+                    &mut |e| werrs.push(e),
+                    &mut |w| wwarns.push(w),
+                );
+                for e in werrs {
+                    lint.err(e);
+                }
+                for w in wwarns {
+                    lint.warn(w);
+                }
+                continue;
+            }
             let file = path.join("issue.md");
             if file.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
                 lint.err(format!(

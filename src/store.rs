@@ -245,6 +245,10 @@ pub const VERDICT_STREAM: &str = "audit:verdicts";
 pub const VERDICT_RECORDED_EVENT: &str = "review_verdict";
 /// CAD-405: a project's work gate keys approved by the operator.
 pub const WORK_APPROVED_EVENT: &str = "project_work_approved";
+/// CAD-487: a workflow's gate keys (`agent`, `depends_on`, …)
+/// approved by the operator — `plan propose --workflow` matches the
+/// file's digest against the latest record.
+pub const WORKFLOW_APPROVED_EVENT: &str = "workflow_approved";
 /// An operator approved `action` on one exact head — see [`NewApproval`].
 pub const APPROVAL_RECORDED_EVENT: &str = "approval_recorded";
 /// An operator withdrew an earlier approval id. Message delivery state
@@ -2152,6 +2156,38 @@ impl Store {
     pub fn record_work_approval(&self, payload: Value) -> Result<()> {
         let conn = self.conn();
         Self::event(&conn, APPROVAL_STREAM, WORK_APPROVED_EVENT, payload)
+    }
+
+    /// CAD-487: record the operator's approval of a workflow's gate
+    /// keys (`project`, `name`, `digest`, `by`, `at`) on
+    /// [`APPROVAL_STREAM`] — beside the work-gate approvals, keyed
+    /// `"<project>/<name>"` so a project approval and a workflow
+    /// approval never share a row.
+    pub fn record_workflow_approval(&self, payload: Value) -> Result<()> {
+        let conn = self.conn();
+        Self::event(&conn, APPROVAL_STREAM, WORKFLOW_APPROVED_EVENT, payload)
+    }
+
+    /// CAD-487: the latest workflow approval per `"<project>/<name>"`.
+    pub fn workflow_approvals(&self) -> Result<std::collections::HashMap<String, Value>> {
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare("SELECT payload FROM events WHERE alias=? AND kind=? ORDER BY seq")?;
+        let mut rows = stmt.query(params![APPROVAL_STREAM, WORKFLOW_APPROVED_EVENT])?;
+        let mut out = std::collections::HashMap::new();
+        while let Some(row) = rows.next()? {
+            let raw: String = row.get(0)?;
+            let Ok(payload) = serde_json::from_str::<Value>(&raw) else {
+                continue;
+            };
+            match (payload["project"].as_str(), payload["name"].as_str()) {
+                (Some(p), Some(n)) => {
+                    out.insert(format!("{p}/{n}"), payload.clone());
+                }
+                _ => continue,
+            }
+        }
+        Ok(out)
     }
 
     /// CAD-449: record a verdict `report_verdict` accepted (`issue`,

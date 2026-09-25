@@ -159,7 +159,7 @@ fn restore_preimage(path: &Path, prev: Option<Vec<u8>>) {
 /// Fold the foreign paths a commit saw into the write's JSON result —
 /// `foreign_files` is present only when the tracker held files the
 /// write did not stage.
-fn attach_foreign(out: &mut Value, foreign: &[String]) {
+pub(crate) fn attach_foreign(out: &mut Value, foreign: &[String]) {
     if !foreign.is_empty() {
         out["foreign_files"] = json!(foreign);
     }

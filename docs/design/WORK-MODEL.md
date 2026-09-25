@@ -202,6 +202,52 @@ issue. The two-sided markers make a one-sided rewrite fail closed (tickets refus
 with `plan_missing`), but the reader must be on every host and session binary
 before the first `cadence plan propose`.
 
+## Workflows (CAD-487)
+
+A workflow is a reusable plan file with inputs, kept in the tracker beside
+`PROJECT.md` as `<pm>/<project>/workflows/<name>.md`. The format is the plan
+format plus an `inputs:` frontmatter map — `name: {ask, optional}` — and
+`{{name}}` placeholders anywhere in the file:
+
+```markdown
+---
+title: "Code change: {{title}}"
+goal: "{{goal}}"
+inputs:
+  title:    { ask: "Short name for the change" }
+  goal:     { ask: "What is true when this lands?" }
+  worker:   { ask: "Agent that implements it" }
+  reviewer: { ask: "Agent that reviews it — never the worker" }
+---
+
+## Implement {{title}}
+agent: {{worker}}
+size: M
+### Acceptance
+- [ ] the change does what the goal says
+```
+
+`cadence plan propose --workflow <name> --input k=v …` renders it — placeholders
+take the input values, `inputs:` drops out of the frontmatter — and the result
+goes through the unchanged propose → approve → gate path above. A missing or
+unknown input, or an unresolved `{{name}}`, is refused with a named reason.
+`cadence workflow check <file|name>` verifies a template without proposing:
+plan-parse, declared inputs, known agents (PROJECT.md `agents:`, `<pm>/agents/`,
+the daemon registry), `depends_on` acyclic, acceptance on every ticket, and no
+`reviewer:` equal to the ticket's own `agent:`; it exits non-zero on any
+refusal. `workflow add|edit|ls|show` are the only writers — each write is one
+tracker commit with `Actor:` recorded — and `show`/`ls` mark each workflow's
+approval state.
+
+Like `PROJECT.md`'s work keys, a workflow is gated by a digest of its **gate
+keys**: the declared inputs, the ticket count, and each ticket's metadata
+(`size`, `agent`, `depends_on`, plus `reviewer`/`tries`/`uses` — keys the plan
+parser does not consume yet but a workflow may already carry). The operator's
+`workflow approve` records that digest; an edit that changes it — CLI or hand —
+unapproves the workflow and `propose --workflow` refuses `workflow_unapproved`
+until it is re-approved. Wording-only edits keep the digest. Approval is a
+process guard, not a security boundary, same as the plan gate.
+
 ## Views
 
 - **Board** — tasks by status (today's board).
