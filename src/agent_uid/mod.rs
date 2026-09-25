@@ -529,7 +529,7 @@ impl Host for LiveHost {
         if unsafe { libc::chown(c.as_ptr(), owner_uid, group_gid) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        if unsafe { libc::chmod(c.as_ptr(), mode) } != 0 {
+        if unsafe { libc::chmod(c.as_ptr(), mode as libc::mode_t) } != 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(())
