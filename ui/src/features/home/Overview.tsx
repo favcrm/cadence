@@ -347,7 +347,7 @@ function MainCiView({ blocks }: { blocks: MainCi[] }) {
               <div className="flex flex-wrap items-baseline gap-x-2 text-micro">
                 <span className="num text-label text-ink-200">{b.slug}</span>
                 {b.branch && <span className="text-ink-400">{b.branch}</span>}
-                <span className="text-ink-600">{b.workflow ?? "ci.yml"} push runs</span>
+                <span className="text-ink-600">ci · {b.workflow ?? "ci.yml"} push runs</span>
                 {b.order === "runs" && (
                   <span className="text-ink-500" title={b.log_error ?? undefined}>
                     ordered by run time — no local first-parent log
@@ -401,19 +401,19 @@ const DOC_STATE_CHIP: Record<string, string> = {
 
 /// Compact reading of the project's declared scope plus its tracked
 /// document manifest — the same `/api/projects/:key/context` payload the
-/// Plan tab renders in full. Only for a selected project.
+/// Context section renders in full. Only for a selected project.
 function ProjectScope({
   project,
   projects,
   context,
   contextLoading,
-  onOpenPlan,
+  onOpenContext,
 }: {
   project: string;
   projects: Project[];
   context: ProjectContext | null;
   contextLoading: boolean;
-  onOpenPlan: () => void;
+  onOpenContext: () => void;
 }) {
   const meta = projects.find((p) => p.key === project);
   const docs = context?.documents.filter((d) => d.selected) ?? [];
@@ -470,15 +470,15 @@ function ProjectScope({
         )}
         {context && docs.length > shown.length && (
           <p className="text-micro text-ink-500">
-            {docs.length - shown.length} more documents on Plan
+            {docs.length - shown.length} more documents on Context
           </p>
         )}
         <button
-          onClick={onOpenPlan}
+          onClick={onOpenContext}
           className="lnk text-label"
           title="full context — manifest, excerpts and verified memory"
         >
-          open plan →
+          open context →
         </button>
       </div>
     </section>
@@ -495,7 +495,7 @@ export default function OverviewView({
   contextLoading,
   readOnly,
   onAck,
-  onOpenPlan,
+  onOpenContext,
 }: {
   state: ResourceState<Overview>;
   /** The cards — project summary counts come from counts.ts, like the sidebar. */
@@ -507,7 +507,7 @@ export default function OverviewView({
   contextLoading: boolean;
   readOnly: boolean;
   onAck: (monitor: string, seq: number) => void;
-  onOpenPlan: () => void;
+  onOpenContext: () => void;
 }) {
   const data = state.data;
   if (!data) {
@@ -540,7 +540,7 @@ export default function OverviewView({
             projects={projects}
             context={context}
             contextLoading={contextLoading}
-            onOpenPlan={onOpenPlan}
+            onOpenContext={onOpenContext}
           />
         )}
       </div>
@@ -592,7 +592,7 @@ export default function OverviewView({
           projects={projects}
           context={context}
           contextLoading={contextLoading}
-          onOpenPlan={onOpenPlan}
+          onOpenContext={onOpenContext}
         />
       )}
 

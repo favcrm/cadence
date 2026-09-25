@@ -260,14 +260,7 @@ pre {
   border-radius: 6px;
 }
 
-/* Project workspace reader and document layout stay shrinkable on phones. */
-.plan-grid > * {
-  min-width: 0;
-}
-.plan-grid pre,
-.plan-grid table {
-  max-width: 100%;
-}
+/* The issue reader stays shrinkable on phones. */
 .issue-reader {
   min-width: 0;
   overflow-wrap: anywhere;
