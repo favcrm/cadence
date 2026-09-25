@@ -10599,9 +10599,21 @@ fn inbox_follow_exec_acks_each_message_once() {
         .unwrap();
     }
     let seen = wait_lines(&log, 2, 15);
+    assert_eq!(seen, vec!["m1", "m2"], "each delivered exactly once");
+    // The last exec's line lands when it exits; the follower sends
+    // `agent_inbox_ack` through that seq right after — the kill has to
+    // wait for the watermark or the ack can die with it.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let show = d.rpc("agent_show", json!({"alias": "obs"})).unwrap();
+        if show["queued"] == 0 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "m2's ack never landed: {show}");
+        thread::sleep(Duration::from_millis(50));
+    }
     let _ = child.kill();
     let _ = child.wait();
-    assert_eq!(seen, vec!["m1", "m2"], "each delivered exactly once");
     // Both acked — nothing queued, both completed via=inbox_ack.
     let show = d.rpc("agent_show", json!({"alias": "obs"})).unwrap();
     assert_eq!(show["queued"], 0, "{show}");
@@ -10730,9 +10742,10 @@ fn inbox_follow_exec_timeout_kills_then_parks() {
     // m1 times out twice (≈600ms of killed sleeps) and parks; m2 —
     // queued behind it — is still delivered and acked.
     let done = wait_lines(&log, 1, 20);
-    let _ = child.kill();
-    let _ = child.wait();
     assert_eq!(done, vec!["m2"], "{done:?}");
+    // m2's line lands when its exec exits; the follower sends
+    // `agent_inbox_ack` through that seq right after — the kill has to
+    // wait for the watermark or the ack can die with it.
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let show = d.rpc("agent_show", json!({"alias": "obs"})).unwrap();
@@ -10749,6 +10762,8 @@ fn inbox_follow_exec_timeout_kills_then_parks() {
         assert!(Instant::now() < deadline, "m2 never acked: {show}");
         thread::sleep(Duration::from_millis(50));
     }
+    let _ = child.kill();
+    let _ = child.wait();
     // The poison message stays queued — parked, never lost.
     let show = d.rpc("agent_show", json!({"alias": "obs"})).unwrap();
     assert_eq!(show["queued"], 1, "{show}");
