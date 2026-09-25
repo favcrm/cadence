@@ -487,7 +487,10 @@ fn inner_under(root: &Path, rel: &Path, raw: &str) -> Result<PathBuf, String> {
 }
 
 /// The `openat2` `open_how` argument (linux/openat2.h) — declared
-/// here like confine.rs's Landlock ABI structs.
+/// here like confine.rs's Landlock ABI structs. The syscall and its
+/// `RESOLVE_*` flags are Linux-only; elsewhere the per-component
+/// `O_NOFOLLOW` walk is the whole implementation.
+#[cfg(target_os = "linux")]
 #[repr(C)]
 struct OpenHow {
     flags: u64,
@@ -498,6 +501,7 @@ struct OpenHow {
 /// One raw `openat2` — the fd or the errno-valued error. Callers
 /// decide whether a failure is the refusal or the "unsupported —
 /// fall back" marker.
+#[cfg(target_os = "linux")]
 fn sys_openat2(dirfd: RawFd, path: &std::ffi::CStr, how: &OpenHow) -> Result<RawFd, IoError> {
     let fd = unsafe {
         libc::syscall(
@@ -519,6 +523,7 @@ fn sys_openat2(dirfd: RawFd, path: &std::ffi::CStr, how: &OpenHow) -> Result<Raw
 /// filtered — ENOSYS (old kernel), EPERM (seccomp), EINVAL/EOPNOTSUPP
 /// (a kernel predating these flags): the caller falls back to the
 /// per-component `O_NOFOLLOW` opens.
+#[cfg(target_os = "linux")]
 fn openat2_unsupported(e: &IoError) -> bool {
     matches!(
         e.raw_os_error(),
@@ -538,40 +543,77 @@ fn open_refusal(e: &IoError) -> String {
 }
 
 /// Open `path` — the stored spelling, never canonicalized first —
-/// refusing every symlink component along it. `openat2` with
-/// `RESOLVE_NO_SYMLINKS` covers the whole walk atomically; where the
-/// kernel lacks it, `O_NOFOLLOW|O_DIRECTORY` still refuses a symlink
-/// at the final component (the documented weaker floor).
+/// refusing every symlink component along it. On Linux `openat2`
+/// with `RESOLVE_NO_SYMLINKS` covers the whole walk atomically;
+/// where the syscall is absent (an old kernel — or a platform like
+/// macOS that has no `openat2` at all) the stored spelling is opened
+/// component by component, `O_NOFOLLOW` on every step, so a link
+/// swapped in anywhere along the path refuses the open.
 fn open_no_symlinks(path: &Path) -> Result<File, String> {
-    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| "the path holds a NUL".to_string())?;
-    let how = OpenHow {
-        flags: (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
-        mode: 0,
-        resolve: libc::RESOLVE_NO_SYMLINKS,
-    };
-    match sys_openat2(libc::AT_FDCWD, &c, &how) {
-        Ok(fd) => return Ok(unsafe { File::from_raw_fd(fd) }),
-        Err(e) if !openat2_unsupported(&e) => return Err(open_refusal(&e)),
-        Err(_) => {}
+    #[cfg(target_os = "linux")]
+    {
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| "the path holds a NUL".to_string())?;
+        let how = OpenHow {
+            flags: (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+            mode: 0,
+            resolve: libc::RESOLVE_NO_SYMLINKS,
+        };
+        match sys_openat2(libc::AT_FDCWD, &c, &how) {
+            Ok(fd) => return Ok(unsafe { File::from_raw_fd(fd) }),
+            Err(e) if !openat2_unsupported(&e) => return Err(open_refusal(&e)),
+            Err(_) => {}
+        }
     }
-    let fd = unsafe {
-        libc::open(
-            c.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(open_refusal(&IoError::last_os_error()));
+    nofollow_walk(path)
+}
+
+/// The no-`openat2` path: `path`'s own spelling opened component by
+/// component, `O_NOFOLLOW|O_DIRECTORY` on every step — a swapped
+/// parent dir is refused like a swapped leaf. `.`/`..` resolve
+/// against the already-open inode and can never be links. Every
+/// caller opens a directory root, so the leaf carries `O_DIRECTORY`
+/// too; `AT_FDCWD` anchors a relative spelling like `open` does.
+fn nofollow_walk(path: &Path) -> Result<File, String> {
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    let mut fd = libc::AT_FDCWD;
+    for comp in path.components() {
+        let bytes: &[u8] = match comp {
+            // An absolute name ignores dirfd — this opens the real
+            // root, which can itself never be a link.
+            Component::RootDir => b"/",
+            Component::CurDir => continue,
+            Component::ParentDir => b"..",
+            Component::Normal(name) => name.as_bytes(),
+            Component::Prefix(_) => return Err("a Windows prefix is not a worktree".to_string()),
+        };
+        let name = std::ffi::CString::new(bytes)
+            .map_err(|_| "the path holds a NUL".to_string())?;
+        let next = unsafe { libc::openat(fd, name.as_ptr(), flags) };
+        if fd != libc::AT_FDCWD {
+            unsafe { libc::close(fd) };
+        }
+        if next < 0 {
+            return Err(open_refusal(&IoError::last_os_error()));
+        }
+        fd = next;
+    }
+    if fd == libc::AT_FDCWD {
+        return Err("the path names no directory".to_string());
     }
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
 /// A `local-attachments:` descriptor parsed — the canonical root it
-/// claims and the declared spellings it pins. Neither is trusted: the
-/// root must prove to be a registered worktree before `source_hash`
-/// hashes anything under it.
-fn parse_pin(source: &str) -> Option<(PathBuf, Vec<String>)> {
+/// claims, the declared spellings it pins, and `at`: the
+/// `[raw, sha256]` pairs the descriptor's producer observed at stage
+/// (CAD-553 r2). None of it is trusted: `source_hash` honors the
+/// descriptor only when the root is the *requesting* agent's own
+/// registered worktree and any embedded `at` equals what it reads
+/// itself — a forged or stale digest refuses the pin. The verified
+/// `at` lets the staged preview echo the pinned bytes' digests
+/// without a third read of the files.
+fn parse_pin(source: &str) -> Option<(PathBuf, Vec<String>, Option<Vec<(String, String)>>)> {
     let body = source.strip_prefix(PIN_PREFIX)?;
     let v: Value = serde_json::from_str(body).ok()?;
     let root = PathBuf::from(v.get("root")?.as_str()?);
@@ -599,13 +641,15 @@ fn pin_digest(items: &[(String, String)]) -> String {
     format!("sha256:{}", sha256_hex(lines.concat().as_bytes()))
 }
 
-/// Open `rel` under `root_fd`, refusing every symlink — `openat2`
-/// with `RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS` resolves the whole path
-/// atomically where the kernel has it; otherwise each component is
-/// opened `O_NOFOLLOW` (intermediate ones `O_DIRECTORY`), so a link
-/// planted or swapped in anywhere inside the worktree fails the open
-/// rather than redirecting it outside.
+/// Open `rel` under `root_fd`, refusing every symlink — on Linux
+/// `openat2` with `RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS` resolves the
+/// whole path atomically where the kernel has it; otherwise (old
+/// kernels, non-Linux) each component is opened `O_NOFOLLOW`
+/// (intermediate ones `O_DIRECTORY`), so a link planted or swapped
+/// in anywhere inside the worktree fails the open rather than
+/// redirecting it outside.
 fn open_confined(root_fd: RawFd, rel: &Path, raw: &str) -> Result<File, String> {
+    #[cfg(target_os = "linux")]
     if let Ok(c) = std::ffi::CString::new(rel.as_os_str().as_bytes()) {
         let how = OpenHow {
             flags: (libc::O_RDONLY | libc::O_CLOEXEC) as u64,
