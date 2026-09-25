@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0B0B0C" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#F4F5F6" media="(prefers-color-scheme: light)">
+<meta name="color-scheme" content="dark light">
+<title>Content studio — social-content (prototype)</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='4' fill='%230B0B0C'/%3E%3Crect x='3' y='3' width='10' height='10' rx='5' fill='%232DD4BF'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="styles.css?v=1">
+</head>
+<body>
+<div id="chrome"></div>
+<main id="view"></main>
+<noscript>This prototype needs JavaScript — it is a static page, no server required.</noscript>
+
+<!--
+  Dependency-ordered module files. They register on a single `SC` namespace
+  and use no import/export syntax, so the page opens identically from
+  file:// (where module scripts are CORS-gated) and any static server
+  (where the same files are equally valid modules to import).
+-->
+<script src="mock/data.js?v=1"></script>
+<script src="mock/api.js?v=1"></script>
+<script src="lib/dom.js?v=1"></script>
+<script src="lib/widgets.js?v=1"></script>
+<script src="views/home.js?v=1"></script>
+<script src="views/library.js?v=1"></script>
+<script src="views/runs.js?v=1"></script>
+<script src="views/editor.js?v=1"></script>
+<script src="views/decide.js?v=1"></script>
+<script src="views/automations.js?v=1"></script>
+<script src="views/workflows.js?v=1"></script>
+<script src="views/settings.js?v=1"></script>
+<script src="app.js?v=1"></script>
+</body>
+</html>
