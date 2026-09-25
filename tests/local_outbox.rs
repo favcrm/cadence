@@ -794,6 +794,28 @@ fn unknown_tool_gates_send_then_refuses() {
         .contains("no tool"));
 }
 
+/// The `source_hash` pin runs for `local` unchanged: `input.source`
+/// naming an artifact the adapter does not hold is refused at stage —
+/// never staged unpinned.
+#[test]
+fn source_pin_refuses_unknown_artifact() {
+    let d = Daemon::start();
+    let wt = TempDir::new().unwrap();
+    let mut sw = Lane::spawn_as(&d, "sw", wt.path(), None, "worker");
+    enroll(&d, "outbox");
+    grant(&d, "sw", "outbox");
+    let mut input = publish_input("cadence", &[]);
+    input["source"] = json!("reviewed-post.md");
+    let err = refused(sw.rpc(
+        &d,
+        "platform_call",
+        json!({"platform": "local", "account": "outbox",
+               "tool": "publish", "input": input,
+               "request": "req-src"}),
+    ));
+    assert!(err.contains("cannot be pinned"), "{err}");
+}
+
 // ---------- the read side is operator-only ----------
 
 /// `platform_outbox` is the operator's read: an agent caller and an
