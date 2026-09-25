@@ -176,6 +176,10 @@ fn test_port() -> PortLease {
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             continue;
         }
+        // The file's contents name whose claim the holder protects —
+        // clear whatever the previous holder left so a fenced port is
+        // never mistaken for a sandbox's own claim.
+        lock.set_len(0).unwrap();
         if TcpListener::bind(("127.0.0.1", port)).is_ok() {
             return PortLease { port, _lock: lock };
         }
