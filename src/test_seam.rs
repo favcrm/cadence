@@ -252,6 +252,16 @@ mod imp {
     use super::*;
     use serde_json::json;
 
+    /// Release-canary (CAD-482): this byte string exists in the binary
+    /// only when the seam is compiled in. `compile_error!` above blocks
+    /// `test-seam` on a release profile; the CI release job greps the
+    /// built binary for `cadence-test-seam-v1` to prove neither the
+    /// flag nor this code ever shipped — removing the compile_error
+    /// and building `--release --features test-seam` is the mutation
+    /// this catches.
+    #[used]
+    static RELEASE_CANARY: &[u8] = b"cadence-test-seam-v1\n";
+
     std::thread_local! {
         /// The asserting scope the current dispatch/request runs under.
         static ASSERTED: std::cell::RefCell<Option<Asserted>> =

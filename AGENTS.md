@@ -89,6 +89,15 @@ this workflow exactly.
   once", a gate), write the adversarial test first. That means an agent
   caller, a detached child (`setsid`), concurrent calls, and a forged
   field. Prove the test fails without the guard.
+- Operator-gated test calls go through the CAD-482 test seam, not
+  through pane escapes. Build test binaries with
+  `--features test-seam` and assert the caller explicitly:
+  `test_seam::scoped(Asserted::Operator | ::Agent(alias) | ::Unproven,
+  || rpc(..))` in-process, `CADENCE_TEST_AS` on spawned fixture
+  binaries, `X-Cadence-Test-As`/`X-Cadence-Test-Token` on board
+  requests (see `tests/support/operator.rs`). Escaping the pane
+  instead — `setsid`, `env -u CADENCE_ALIAS`, `nohup`, `systemd-run` —
+  stays forbidden.
 - A board or HTTP path must be at least as strict as the daemon RPC it
   relays, so run the same operator proof on the HTTP peer.
 - Restrict actors with allowlists, not denylists.

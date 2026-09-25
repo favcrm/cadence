@@ -24,9 +24,11 @@ use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::thread;
+#[cfg(not(feature = "test-seam"))]
+use tempfile::TempDir;
 
 /// `agent_register`'s params for a fixture agent.
+#[cfg(feature = "test-seam")]
 fn register(alias: &str, cwd: &Path) -> Value {
     json!({"alias": alias, "provider": "fake",
            "endpoint_kind": "fake", "cwd": cwd})
@@ -43,6 +45,7 @@ fn raw_rpc(state: &Path, frame: Value) -> Value {
 }
 
 /// `Ok(v)` or the error text — for comparing two calls' fates.
+#[cfg(feature = "test-seam")]
 fn outcome(r: cadence_agent::Result<Value>) -> std::result::Result<Value, String> {
     r.map_err(|e| e.to_string())
 }
@@ -63,7 +66,7 @@ fn asserted_operator_runs_operator_actions() {
             .unwrap_or_else(|e| panic!("asserted operator refused: {e}"));
     });
     assert_eq!(
-        d.rpc("agent_show", json!({"alias": "seam-op"})).unwrap()["alias"],
+        d.rpc("agent_show", json!({"alias": "seam-op"})).unwrap()["agent"]["alias"],
         "seam-op"
     );
 }
@@ -251,7 +254,7 @@ fn concurrent_assertions_do_not_leak() {
     let run = move |who: &'static str, ok: Option<&'static str>| {
         let (state, token, barrier) = (state.clone(), token.clone(), barrier.clone());
         let cwd = d.dir.path().to_path_buf();
-        thread::spawn(move || {
+        std::thread::spawn(move || {
             for i in 0..8 {
                 barrier.wait();
                 let frame = raw_rpc(
@@ -290,20 +293,16 @@ fn concurrent_assertions_do_not_leak() {
 #[cfg(feature = "test-seam")]
 #[test]
 fn arming_refuses_the_production_state_dir() {
-    // The suite's HOME/XDG are isolated under the temp root, so this
-    // "default" is a temp path — only the production-default check can
-    // refuse it, which is the point.
+    // Asserting `arm_if_requested` directly (not through serve_with)
+    // keeps the check independent of any earlier daemon gate. The dir
+    // is the resolved production default — on this host it may exist;
+    // the seam must refuse it and, refused or not, it is left exactly
+    // as found.
     let default = client::default_state_dir().unwrap();
-    let err = daemon::serve_with(
-        &default,
-        daemon::ServeOptions {
-            test_seam: true,
-            ..daemon_opts()
-        },
-    )
-    .expect_err("the seam must refuse the production default state dir");
+    let err = cadence_agent::test_seam::arm_if_requested(&default, true)
+        .map(|_| ())
+        .expect_err("the seam must refuse the production default state dir");
     assert!(err.to_string().contains("default state dir"), "{err}");
-    let _ = std::fs::remove_dir_all(&default);
 }
 
 #[cfg(feature = "test-seam")]

@@ -1,10 +1,14 @@
-//! Operator sign-in for the board suites (CAD-313): the real flow, no
-//! seam. `cadence ui login` runs as the operator's own shell — detached
-//! with `setsid -f`, off this test process's ancestry, env cleared, stdio
-//! not a pane — the shape `peer::operator_proof` accepts, however the
-//! suite itself is run (in an agent pane included). The printed link's
-//! fragment nonce is then exchanged at `POST /api/session` for the
-//! session cookie, exactly as the SPA's login view does.
+//! Operator sign-in for the board suites (CAD-313): the real flow.
+//! On a seam-armed fixture (CAD-482, `test-seam` builds) the operator
+//! identity is asserted in-band — `CADENCE_TEST_AS` on the `ui login`
+//! child, `X-Cadence-Test-As`/`X-Cadence-Test-Token` on board requests —
+//! identical in a pane and in CI. Without it, `cadence ui login` runs
+//! as the operator's own shell — detached with `setsid -f`, off this
+//! test process's ancestry, env cleared, stdio not a pane — the shape
+//! `peer::operator_proof` accepts, however the suite itself is run
+//! (in an agent pane included). The printed link's fragment nonce is
+//! then exchanged at `POST /api/session` for the session cookie,
+//! exactly as the SPA's login view does.
 #![allow(dead_code)]
 
 use std::io::{Read, Write};
