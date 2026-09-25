@@ -314,6 +314,12 @@ fn op_http_write(
     }
     all.push(&cookie);
     all.push(&key);
+    // CAD-482: the session's caller assertion rides too — the write
+    // proves operator in a pane exactly as ambient proof does in CI.
+    let seam = op.seam.trim_end().to_string();
+    if !seam.is_empty() {
+        all.push(&seam);
+    }
     http_write(port, method, path, &own, &all, body)
 }
 
@@ -357,11 +363,10 @@ fn start_ui_opts(
             let mut opts = ui::ServeOpts {
                 host: "127.0.0.1".to_string(),
                 port,
-                // CAD-482: a board on a seam-armed fixture attaches to
-                // the daemon's credential; assertion headers then say
-                // who each request runs as. Unarmed state dirs serve
-                // the ambient path unchanged.
-                test_seam: cadence_agent::test_seam::armed(&sd),
+                // CAD-482: under the feature every in-process fixture
+                // board attaches — the token is read lazily per request,
+                // so a board may start before its daemon mints.
+                test_seam: cfg!(feature = "test-seam"),
                 ..Default::default()
             };
             f(&mut opts);
@@ -11994,15 +11999,21 @@ fn only_the_operator_with_the_secret_mints_a_login_link() {
     assert!(!said.contains("#n="), "a pane minted a link: {said}");
     assert!(said.contains("pane-l"), "{said}");
 
-    // An agent's environment, however detached.
-    let (ok, out, err) = op::operator_cli_env(
+    // An agent's environment, however detached — on an armed fixture
+    // the child asserts `agent:pane-l` outright; ambiently the alias
+    // on its ancestry is what refuses it.
+    let (ok, out, err) = op::cli_as(
         bin(),
         &d.state(),
         &["ui", "login", "--json", "--port", &port.to_string()],
         &[("CADENCE_ALIAS", "pane-l")],
+        "agent:pane-l",
     );
     assert!(!ok, "{out}");
-    assert!(err.contains("CADENCE_ALIAS"), "{err}");
+    assert!(
+        err.contains("pane-l") || err.contains("CADENCE_ALIAS"),
+        "{err}"
+    );
 
     // The right shape with a wrong secret, or none.
     let sock = client::socket_path(&d.state());
@@ -12067,7 +12078,16 @@ fn a_session_presented_by_an_agent_is_revoked() {
     let host = format!("127.0.0.1:{port}");
     let s = sign_in(&d.state(), port);
     let before = commits(pm.path());
-    let request = s.request("POST", "/api/issues/CAD-3/comments", r#"{"body":"stolen"}"#);
+    // The replay is presented BY the agent, not the operator: on a
+    // seam-armed board the request asserts `agent:pane-t` (the agent a
+    // planted pane would be); without the seam it asserts nothing and
+    // the pane ancestry does the same job.
+    let request = s.request_as(
+        "POST",
+        "/api/issues/CAD-3/comments",
+        r#"{"body":"stolen"}"#,
+        &op::seam_headers(&d.state(), "agent:pane-t"),
+    );
     let mut pane = Command::new("bash")
         .args(["-c", r#"read -r _; bash -c "$CLIENT"; true"#])
         .env(
@@ -12492,10 +12512,14 @@ fn an_early_closed_replay_of_a_stolen_session_writes_nothing() {
         r#"exec 3<>"/dev/tcp/127.0.0.1/$PORT"; printf '%s' "$REQ" >&3; exec 3>&-; sleep 1"#;
     for n in 0..3 {
         let s = sign_in(&d.state(), port);
-        let req = s.request(
+        // The replaying process is a planted pane, not the operator:
+        // assert no seam identity so the pane's own (agent) caller
+        // stands — in a pane and in CI alike.
+        let req = s.request_as(
             "POST",
             "/api/issues/CAD-3/comments",
             &format!(r#"{{"body":"hit and run {n}"}}"#),
+            "",
         );
         as_pane_child(
             &d,
@@ -12565,7 +12589,9 @@ fn every_operator_only_route_runs_the_process_proof() {
             ])
             .env("CADENCE_ALIAS", "some-agent")
             .env("PORT", port.to_string())
-            .env("REQ", s.request("POST", path, body))
+            // The caller fails the process proof, so it must not carry
+            // the operator's seam assertion — ambient identity stands.
+            .env("REQ", s.request_as("POST", path, body, ""))
             .output()
             .unwrap();
         let reply = String::from_utf8_lossy(&out.stdout);
@@ -12956,10 +12982,13 @@ fn an_early_closed_replay_with_no_live_agent_writes_nothing() {
     let before = commits(pm.path());
     for n in 0..3 {
         let s = sign_in(&d.state(), port);
-        let req = s.request(
+        // Replayed by an unattributable process: no seam assertion, the
+        // caller is whatever the socket says — nothing, here.
+        let req = s.request_as(
             "POST",
             "/api/issues/CAD-3/comments",
             &format!(r#"{{"body":"no agent, hit and run {n}"}}"#),
+            "",
         );
         let status = Command::new("bash")
             .args([

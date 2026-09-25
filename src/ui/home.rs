@@ -141,10 +141,12 @@ pub(super) fn operator_viewer(
 /// managed provider on its ancestry, not a daemon descendant, no agent
 /// environment, a session leader on its ancestry. Unprovable is false.
 /// `seam_armed` is the fixture's own declaration — CAD-482 — that this
-/// board runs as the operator's: an armed board *is* its operator's
-/// board, exactly as a pane-free `ui run` is in production.
+/// board runs as the operator's: a board attached to a credential that
+/// actually exists *is* its operator's board, exactly as a pane-free
+/// `ui run` is in production. `armed` answers live, so a board started
+/// before its daemon mints becomes operator's when the token lands.
 pub(super) fn board_is_operator(state_dir: &std::path::Path, seam_armed: bool) -> bool {
-    if seam_armed {
+    if seam_armed && crate::test_seam::armed(state_dir) {
         return true;
     }
     let Some(daemon_pid) = client::rpc(state_dir, "health", json!({}))

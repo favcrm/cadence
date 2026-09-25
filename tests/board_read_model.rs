@@ -276,7 +276,10 @@ fn start_ui(pm: &Path, state: &Path) -> (u16, BoardStop) {
                 host: "127.0.0.1".to_string(),
                 port,
                 stop: Some(stop),
-                test_seam: cadence_agent::test_seam::armed(&sd),
+                // CAD-482: attach unconditionally under the feature —
+                // the token is read lazily per request, so a board may
+                // start before its daemon mints.
+                test_seam: cfg!(feature = "test-seam"),
                 ..Default::default()
             };
             let _ = ui::serve(&sd, &pd, &opts);

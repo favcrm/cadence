@@ -852,6 +852,9 @@ fn cad328_operator_writes_refuse_a_detached_managed_child_under_daemon_run() {
     // refuses it is the second layer, process proof on the HTTP peer.
     let op = sign_in(&f.d.state, port);
     let guards = op_guards(&op);
+    // The detached child presents the stolen session but stands on its
+    // own (daemon-descendant) caller — no seam assertion rides along.
+    let stolen_guards = op_guards_as(&op, "");
     let reports = f.pm_dir.join("demo").join(&id).join("reports");
     let count = || std::fs::read_dir(&reports).unwrap().count();
     let before = (f.commits(), count());
@@ -866,7 +869,7 @@ fn cad328_operator_writes_refuse_a_detached_managed_child_under_daemon_run() {
     let mut detached = |path: &str, body: &str| -> String {
         n += 1;
         let out = work.path().join(format!("reply-{n}"));
-        let request = cad328_post(port, path, &guards, body);
+        let request = cad328_post(port, path, &stolen_guards, body);
         let r = wk.exec(&[
             "bash",
             "-c",
@@ -977,7 +980,7 @@ fn cad328_thread_reads_tail_and_before() {
     d.register("lead");
     d.wait_agent("lead", "idle", 15);
     for n in 1..=3 {
-        d.rpc(
+        d.operator_rpc(
             "thread_send",
             json!({"alias": "lead", "text": format!("ask {n}"), "message": format!("m{n}")}),
         )

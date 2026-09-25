@@ -5676,7 +5676,10 @@ pub fn start_board_sync(
                 read_only,
                 gh,
                 delivery_sync_every: every,
-                test_seam: cadence_agent::test_seam::armed(&sd),
+                // CAD-482: under the feature every in-process fixture
+                // board attaches — the token is read lazily per request,
+                // so a board may start before its daemon mints.
+                test_seam: cfg!(feature = "test-seam"),
                 ..Default::default()
             };
             let _ = cadence_agent::ui::serve(&sd, &pd, &opts);
@@ -6068,9 +6071,16 @@ pub fn sign_in(state: &Path, port: u16) -> op::Session {
     op::sign_in(env!("CARGO_BIN_EXE_cadence"), state, port)
 }
 
-/// The write guards plus a signed-in operator's Origin and cookie.
+/// The write guards plus a signed-in operator's Origin and cookie,
+/// asserted as the session's caller.
 pub fn op_guards(op: &op::Session) -> String {
-    format!("{THREAD_GUARDS}{}", op.headers())
+    op_guards_as(op, &op.seam)
+}
+
+/// [`op_guards`] with a different caller-assertion block — `""` for a
+/// session replayed by a process that must stand on its own identity.
+pub fn op_guards_as(op: &op::Session, seam: &str) -> String {
+    format!("{THREAD_GUARDS}{}", op.headers_as(seam))
 }
 
 /// A raw board POST to `path` with `headers` (each `Name: value\r\n`).

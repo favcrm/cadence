@@ -1644,7 +1644,10 @@ fn board_app_workflow_list_preview_and_propose() {
 
 /// The session `op` as presented to the board on `port` instead: that
 /// board's own Host and Origin, its cookie name, the same token (a
-/// session is the daemon's, not one board's).
+/// session is the daemon's, not one board's). A session carried to a
+/// board it wasn't minted on is a replay: it asserts no caller, so the
+/// HTTP peer stands on its own identity (and an unarmed board doesn't
+/// refuse the header outright).
 fn op_on(op: &op::Session, port: u16) -> op::Session {
     let host = op::board_host(port);
     let token = op.cookie.split_once('=').unwrap().1;
@@ -1654,20 +1657,21 @@ fn op_on(op: &op::Session, port: u16) -> op::Session {
         cookie: format!("cadence_operator_{port}={token}"),
         set_cookie: op.set_cookie.clone(),
         key: op.key.clone(),
-        seam: op.seam.clone(),
+        seam: String::new(),
     }
 }
 
 /// `GET path` on `port` as the signed-in operator (no `Origin`: a
-/// browser sends none on a same-origin GET).
+/// browser sends none on a same-origin GET), asserted as `op.seam`.
 fn op_get(op: &op::Session, port: u16, path: &str) -> (u16, String) {
     board_http(
         port,
         &format!(
-            "GET {path} HTTP/1.0\r\nHost: {}\r\nCookie: {}\r\n{}\r\n\r\n",
+            "GET {path} HTTP/1.0\r\nHost: {}\r\nCookie: {}\r\n{}\r\n{}\r\n",
             op.host,
             op.cookie,
-            op.key_header()
+            op.key_header(),
+            op.seam
         ),
     )
 }
@@ -1916,6 +1920,9 @@ fn cad432_stage_move_refuses_a_detached_managed_child_under_daemon_run() {
     // what refuses it is the process proof on the peer.
     let op = sign_in(&f.d.state, port);
     let guards = op_guards(&op);
+    // The detached child presents the stolen session but stands on its
+    // own (daemon-descendant) caller — no seam assertion rides along.
+    let stolen_guards = op_guards_as(&op, "");
     let before = f.commits();
 
     const INNER: &str = r#"exec 3<>"/dev/tcp/127.0.0.1/$1"; printf '%s' "$2" >&3; cat <&3 > "$3.tmp"; mv "$3.tmp" "$3""#;
@@ -1950,7 +1957,7 @@ fn cad432_stage_move_refuses_a_detached_managed_child_under_daemon_run() {
     let reply = detached(cad328_post(
         port,
         "/api/epics/D-1/stage",
-        &guards,
+        &stolen_guards,
         r#"{"stage":"build"}"#,
     ));
     assert!(reply.contains(" 403 "), "{reply}");
@@ -2042,8 +2049,10 @@ fn cad432_board_started_by_an_agent_cannot_relay_a_move() {
     );
 
     // The proven operator (this test process) asks that board for a
-    // routine move.
-    let (status, reply) = cad432_move(port, &op_guards(&op), r#"{"stage":"verify"}"#);
+    // routine move. It asserts no caller: the agent's board is unarmed
+    // (the seam would be refused outright) and the refusal must come
+    // from the board's own connection being the worker's.
+    let (status, reply) = cad432_move(port, &op_guards_as(&op, ""), r#"{"stage":"verify"}"#);
     assert_eq!(status, 403, "{reply}");
     assert!(reply.contains("operator_proof"), "{reply}");
     assert!(

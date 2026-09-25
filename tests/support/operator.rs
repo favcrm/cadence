@@ -185,13 +185,27 @@ pub fn operator_cli_env(
     args: &[&str],
     env: &[(&str, &str)],
 ) -> (bool, String, String) {
+    cli_as(bin, state, args, env, "operator")
+}
+
+/// [`operator_cli_env`] asserting `who` (`operator`, `agent:<alias>`,
+/// `unproven`) when `state` is armed; on an unarmed fixture `env` alone
+/// shapes the ambient caller — the `env` an agent-shaped caller needs
+/// (`CADENCE_ALIAS`, say) travels in `env` either way.
+pub fn cli_as(
+    bin: &str,
+    state: &Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+    who: &str,
+) -> (bool, String, String) {
     let dir = tempfile::Builder::new()
         .prefix("opcli")
         .tempdir_in("/tmp")
         .unwrap();
     if cadence_agent::test_seam::armed(state) {
-        // CAD-482: the child asserts the operator identity through
-        // CADENCE_TEST_AS — identical in a pane and in CI.
+        // CAD-482: the child asserts `who` through CADENCE_TEST_AS —
+        // identical in a pane and in CI.
         let out = Command::new(bin)
             .arg("--state-dir")
             .arg(state)
@@ -199,7 +213,7 @@ pub fn operator_cli_env(
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", dir.path())
-            .env(cadence_agent::test_seam::AS_ENV, "operator")
+            .env(cadence_agent::test_seam::AS_ENV, who)
             .envs(env.iter().copied())
             .stdin(Stdio::null())
             .output()
@@ -334,8 +348,16 @@ pub struct Session {
 }
 
 impl Session {
-    /// A write carrying this session and its own Origin.
+    /// A write carrying this session and its own Origin, asserted as
+    /// the session's operator caller (or ambient, when unarmed).
     pub fn request(&self, method: &str, path: &str, body: &str) -> String {
+        self.request_as(method, path, body, &self.seam)
+    }
+
+    /// `request` with a different caller-assertion block — a session
+    /// replayed by another asserted caller (`agent:<alias>`) or none at
+    /// all (`""`). Use [`seam_headers`] to build the block.
+    pub fn request_as(&self, method: &str, path: &str, body: &str, seam: &str) -> String {
         let req = request(
             method,
             path,
@@ -346,23 +368,26 @@ impl Session {
         );
         req.replacen(
             "X-Cadence-Board: 1\r\n",
-            &format!(
-                "X-Cadence-Board: 1\r\n{}\r\n{}",
-                self.key_header(),
-                self.seam
-            ),
+            &format!("X-Cadence-Board: 1\r\n{}\r\n{}", self.key_header(), seam),
             1,
         )
     }
 
-    /// The raw `Name: value\r\n` headers a signed-in write adds.
+    /// The raw `Name: value\r\n` headers a signed-in write adds,
+    /// asserted as the session's caller.
     pub fn headers(&self) -> String {
+        self.headers_as(&self.seam)
+    }
+
+    /// `headers` with a different caller-assertion block — like
+    /// [`Session::request_as`] for callers that build requests by hand.
+    pub fn headers_as(&self, seam: &str) -> String {
         format!(
             "Origin: {}\r\nCookie: {}\r\n{}\r\n{}",
             self.origin,
             self.cookie,
             self.key_header(),
-            self.seam
+            seam
         )
     }
 
