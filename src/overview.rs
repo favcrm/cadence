@@ -2545,13 +2545,8 @@ fn agent_items(a: &Value, probe: &AgentProbe, project: &str, now: i64) -> Vec<It
 /// read — an operator-proven board sees all rows; a board run inside
 /// a pane gets a caller-rule refusal, which degrades to no rows rather
 /// than a board error.
-fn platform_effect_items(state_dir: &Path, now: i64) -> Vec<Item> {
-    let Ok(view) = client::rpc_timeout(
-        state_dir,
-        "platform_effects",
-        json!({}),
-        Duration::from_secs(2),
-    ) else {
+fn platform_effect_items(state_dir: &Path, now: i64, timeout: Duration) -> Vec<Item> {
+    let Ok(view) = client::rpc_timeout(state_dir, "platform_effects", json!({}), timeout) else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -2826,7 +2821,7 @@ fn overview_from(
         probes_unknown |= probe.probe_unknown;
     }
     if daemon.reachable {
-        needs.extend(platform_effect_items(state_dir, now));
+        needs.extend(platform_effect_items(state_dir, now, opts.probe_timeout));
     }
 
     // ---- tracker rows ----

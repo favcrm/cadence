@@ -3848,7 +3848,11 @@ pub fn overview_at(home: &Path, state: &Path, pm: Option<&Path>, envs: &[(&str, 
     for (k, v) in envs {
         cmd.env(k, v);
     }
-    let out = cmd.output().unwrap();
+    // The overview's probes call caller-gated reads (`agent_requests`,
+    // `platform_effects` — CAD-506): run it the way the board runs
+    // live — detached, off the in-process daemon's ancestry, provably
+    // the operator (CAD-431's `operator_output`).
+    let out = cmd.operator_output().unwrap();
     assert!(
         out.status.success(),
         "overview: {}",
