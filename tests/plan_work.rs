@@ -965,10 +965,11 @@ fn plan_gate_refuses_job_dispatch_until_approved() {
                    "issue": issue, "repo": project}),
         )
         .unwrap();
-        d.rpc(
-            "task_new",
-            json!({"job": job, "task": format!("{job}-t"), "assignee": "w1",
-                   "acceptance": "the plan ticket's criterion"}),
+        d.task_new_ac(
+            job,
+            &format!("{job}-t"),
+            "w1",
+            "the plan ticket's criterion",
         )
         .unwrap();
     }

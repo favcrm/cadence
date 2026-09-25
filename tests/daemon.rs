@@ -3546,12 +3546,8 @@ fn operator_verbs_refuse_agents_whatever_they_claim() {
                "repo": project}),
     )
     .unwrap();
-    d.rpc(
-        "task_new",
-        json!({"job": "j1", "task": "j1-t", "assignee": "w1",
-               "acceptance": format!("ok REPORT_SHA:{SHA_A}")}),
-    )
-    .unwrap();
+    d.task_new_ac("j1", "j1-t", "w1", format!("ok REPORT_SHA:{SHA_A}"))
+        .unwrap();
     d.job_dispatch("j1-t", json!({})).unwrap();
     d.wait_task("j1-t", "review", 15);
     d.job_verdict("j1-t", SHA_A, "blocked").unwrap();
@@ -3659,11 +3655,7 @@ fn turn_tokens_are_withheld_on_every_read_path() {
     d.wait_agent("dv1", "idle", 20);
     let (spec, sha) = d.spec_file("spec.md", "token reads");
     d.job_new("pm", "j1", &spec, &sha);
-    d.rpc(
-        "task_new",
-        json!({"job": "j1", "task": "j1-t", "assignee": "dv1", "acceptance": "ok"}),
-    )
-    .unwrap();
+    d.task_new_ac("j1", "j1-t", "dv1", "ok").unwrap();
     d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
     let kickoff = d.job_dispatch("j1-t", json!({})).unwrap()["message"]
         .as_str()

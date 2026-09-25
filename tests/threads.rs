@@ -2150,10 +2150,11 @@ fn cad323_claude_interrupt_mid_tool_reconciles_a_kickoff() {
 
     let (spec, sha) = d.spec_file("spec.md", "interrupt me");
     d.job_new("pm", "j1", &spec, &sha);
-    d.rpc(
-        "task_new",
-        json!({"job": "j1", "task": "j1-fix", "assignee": "w1",
-               "acceptance": format!("tests pass REPORT_SHA:{SHA_A}")}),
+    d.task_new_ac(
+        "j1",
+        "j1-fix",
+        "w1",
+        format!("tests pass REPORT_SHA:{SHA_A}"),
     )
     .unwrap();
     let kickoff = d.job_dispatch("j1-fix", json!({})).unwrap()["message"]

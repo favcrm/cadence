@@ -1094,10 +1094,11 @@ fn agent_remove_keeps_job_history() {
     d.wait_agent("qa", "idle", 10);
     let (spec, sha) = d.spec_file("spec.md", "keep history");
     d.job_new("pm", "j1", &spec, &sha);
-    d.rpc(
-        "task_new",
-        json!({"job": "j1", "task": "j1-fix", "assignee": "w1",
-               "acceptance": format!("tests pass REPORT_SHA:{SHA_A}")}),
+    d.task_new_ac(
+        "j1",
+        "j1-fix",
+        "w1",
+        format!("tests pass REPORT_SHA:{SHA_A}"),
     )
     .unwrap();
 
@@ -5162,18 +5163,9 @@ fn agent_remove_force_unassigns_open_tasks() {
     }
     let (spec, sha) = d.spec_file("spec.md", "unassign on force");
     d.job_new("pm", "j1", &spec, &sha);
-    d.rpc(
-        "task_new",
-        json!({"job": "j1", "task": "t1", "assignee": "w1",
-               "acceptance": format!("tests pass REPORT_SHA:{SHA_A}")}),
-    )
-    .unwrap();
-    d.rpc(
-        "task_new",
-        json!({"job": "j1", "task": "t2", "assignee": "w1",
-               "acceptance": "later"}),
-    )
-    .unwrap();
+    d.task_new_ac("j1", "t1", "w1", format!("tests pass REPORT_SHA:{SHA_A}"))
+        .unwrap();
+    d.task_new_ac("j1", "t2", "w1", "later").unwrap();
     let kickoff = d.job_dispatch("t1", json!({})).unwrap()["message"]
         .as_str()
         .unwrap()

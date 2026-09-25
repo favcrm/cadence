@@ -310,12 +310,8 @@ fn job_inbox_pm_receives_notifications() {
     let (spec, sha) = d.spec_file("spec.md", "inbox pm spec");
     d.job_new("pm-in", "j1", &spec, &sha);
 
-    d.rpc(
-        "task_new",
-        json!({"job": "j1", "task": "j1-t2", "assignee": "w1",
-               "acceptance": format!("ok REPORT_SHA:{SHA_A}")}),
-    )
-    .unwrap();
+    d.task_new_ac("j1", "j1-t2", "w1", format!("ok REPORT_SHA:{SHA_A}"))
+        .unwrap();
     let r = d.job_dispatch("j1-t2", json!({})).unwrap();
     let kickoff = r["message"].as_str().unwrap().to_string();
     d.wait_message("w1", &kickoff, &["completed"], 15);
@@ -351,12 +347,8 @@ fn verdict_rejects_every_bad_shape() {
     d.wait_agent("w1", "idle", 10);
     let (spec, sha) = d.spec_file("spec.md", "verdict rejections");
     d.job_new("pm", "j1", &spec, &sha);
-    d.rpc(
-        "task_new",
-        json!({"job": "j1", "task": "j1-t2", "assignee": "w1",
-               "acceptance": format!("ok REPORT_SHA:{SHA_A}")}),
-    )
-    .unwrap();
+    d.task_new_ac("j1", "j1-t2", "w1", format!("ok REPORT_SHA:{SHA_A}"))
+        .unwrap();
 
     // Not in review → rejected.
     assert!(d.job_verdict("j1-t2", SHA_A, "pass").is_err());
@@ -420,12 +412,7 @@ fn verdict_rejects_null_sha_until_repaired() {
     let (spec, sha) = d.spec_file("spec.md", "no-sha report");
     d.job_new("pm", "j1", &spec, &sha);
     // No REPORT_SHA directive — the fake reply carries no SHA line.
-    d.rpc(
-        "task_new",
-        json!({"job": "j1", "task": "j1-t2", "assignee": "w1",
-               "acceptance": "plain echo"}),
-    )
-    .unwrap();
+    d.task_new_ac("j1", "j1-t2", "w1", "plain echo").unwrap();
     let r = d.job_dispatch("j1-t2", json!({})).unwrap();
     let kickoff = r["message"].as_str().unwrap().to_string();
     d.wait_message("w1", &kickoff, &["completed"], 15);
@@ -485,12 +472,8 @@ fn max_revisions_escalates_to_blocked_once() {
                "max_revisions": 2}),
     )
     .unwrap();
-    d.rpc(
-        "task_new",
-        json!({"job": "j1", "task": "j1-t2", "assignee": "w1",
-               "acceptance": format!("ok REPORT_SHA:{SHA_A}")}),
-    )
-    .unwrap();
+    d.task_new_ac("j1", "j1-t2", "w1", format!("ok REPORT_SHA:{SHA_A}"))
+        .unwrap();
 
     // r1 → review → revise → revising.
     let r = d.job_dispatch("j1-t2", json!({})).unwrap();
@@ -566,12 +549,8 @@ fn job_cancel_semantics() {
     assert_eq!(w2["state"], "stopped"); // operator stop, unchanged
 
     // Running kickoff: cancel leaves it alone — it completes on its own.
-    d.rpc(
-        "task_new",
-        json!({"job": "j1", "task": "j1-tr", "assignee": "w1",
-               "acceptance": format!("ok REPORT_SHA:{SHA_A}")}),
-    )
-    .unwrap();
+    d.task_new_ac("j1", "j1-tr", "w1", format!("ok REPORT_SHA:{SHA_A}"))
+        .unwrap();
     let r = d.job_dispatch("j1-tr", json!({})).unwrap();
     let k = r["message"].as_str().unwrap().to_string();
     d.rpc("task_cancel", json!({"task": "j1-tr", "by": "pm"}))
@@ -608,12 +587,8 @@ fn dispatch_dedupes_live_kickoff_and_reassign_bumps() {
     d.wait_agent("w1", "idle", 10);
     let (spec, sha) = d.spec_file("spec.md", "dedupe + reassign");
     d.job_new("pm", "j1", &spec, &sha);
-    d.rpc(
-        "task_new",
-        json!({"job": "j1", "task": "j1-t2", "assignee": "w1",
-               "acceptance": format!("ok REPORT_SHA:{SHA_A}")}),
-    )
-    .unwrap();
+    d.task_new_ac("j1", "j1-t2", "w1", format!("ok REPORT_SHA:{SHA_A}"))
+        .unwrap();
 
     // Live kickoff → second dispatch is the SAME revision, same id.
     // Deterministic: stop w1 first so its queue never drains.
@@ -665,12 +640,8 @@ fn task_attached_send_and_self() {
     d.wait_agent("w1", "idle", 10);
     let (spec, sha) = d.spec_file("spec.md", "send --task");
     d.job_new("pm", "j1", &spec, &sha);
-    d.rpc(
-        "task_new",
-        json!({"job": "j1", "task": "j1-t2", "assignee": "w1",
-               "acceptance": format!("ok REPORT_SHA:{SHA_A}")}),
-    )
-    .unwrap();
+    d.task_new_ac("j1", "j1-t2", "w1", format!("ok REPORT_SHA:{SHA_A}"))
+        .unwrap();
 
     // `send --task` attaches for indexing — the message completes
     // normally and does NOT drive the task state machine.
@@ -3606,12 +3577,8 @@ fn automatic_monitor_dispatch_is_separate_guarded_and_restart_safe() {
         ("ajob-duplicate", "w1"),
         ("ajob-blocked", "w3"),
     ] {
-        d.rpc(
-            "task_new",
-            json!({"job": "ajob", "task": task, "assignee": assignee,
-                   "acceptance": "run the focused coordinator checks"}),
-        )
-        .unwrap();
+        d.task_new_ac("ajob", task, assignee, "run the focused coordinator checks")
+            .unwrap();
     }
     d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
     d.wait_agent("w1", "stopped", 10);
@@ -3864,10 +3831,11 @@ fn automatic_monitor_dispatch_serializes_competing_callers() {
                "spec_sha256": sha, "repo": project}),
     )
     .unwrap();
-    d.rpc(
-        "task_new",
-        json!({"job": "race-job", "task": "race-task", "assignee": "w1",
-               "acceptance": "serialize automatic dispatch"}),
+    d.task_new_ac(
+        "race-job",
+        "race-task",
+        "w1",
+        "serialize automatic dispatch",
     )
     .unwrap();
 
@@ -3985,12 +3953,8 @@ fn task_reopen_is_the_operator_or_the_jobs_pm() {
     let (spec, sha) = d.spec_file("spec.md", "reopen rule");
     d.job_new("pm", "j1", &spec, &sha);
     for task in ["j1-a", "j1-b"] {
-        d.rpc(
-            "task_new",
-            json!({"job": "j1", "task": task, "assignee": "w1",
-                   "acceptance": format!("ok REPORT_SHA:{SHA_A}")}),
-        )
-        .unwrap();
+        d.task_new_ac("j1", task, "w1", format!("ok REPORT_SHA:{SHA_A}"))
+            .unwrap();
         d.job_dispatch(task, json!({})).unwrap();
         d.wait_task(task, "review", 15);
         d.job_verdict(task, SHA_A, "blocked").unwrap();
@@ -4065,12 +4029,8 @@ fn verdict_reviewer_is_the_verified_caller() {
     d.wait_agent("w1", "idle", 10);
     let (spec, sha) = d.spec_file("spec.md", "self review");
     d.job_new("pm", "j1", &spec, &sha);
-    d.rpc(
-        "task_new",
-        json!({"job": "j1", "task": "j1-t", "assignee": "w1",
-               "acceptance": format!("ok REPORT_SHA:{SHA_A}")}),
-    )
-    .unwrap();
+    d.task_new_ac("j1", "j1-t", "w1", format!("ok REPORT_SHA:{SHA_A}"))
+        .unwrap();
     d.job_dispatch("j1-t", json!({})).unwrap();
     d.wait_task("j1-t", "review", 15);
     // The worker's pane from here on: its own processes derive `w1`.

@@ -7,6 +7,7 @@ use cadence_agent::adapter::ProviderEnv;
 use cadence_agent::client;
 use cadence_agent::daemon;
 use cadence_agent::store::Store;
+use serde::Serialize;
 use serde_json::json;
 use serde_json::Value;
 use std::io::BufRead;
@@ -3663,6 +3664,24 @@ impl TestDaemon {
             json!({"pm": pm, "job": job, "spec": spec, "spec_sha256": spec_sha}),
         )
         .unwrap()
+    }
+
+    /// `task_new` for a task assigned to `assignee` with an
+    /// `acceptance` gate — the dominant task_new call shape in the
+    /// suite. `acceptance` accepts any serializable value (string or
+    /// json array).
+    pub fn task_new_ac(
+        &self,
+        job: &str,
+        task: &str,
+        assignee: &str,
+        acceptance: impl Serialize,
+    ) -> cadence_agent::Result<Value> {
+        self.rpc(
+            "task_new",
+            json!({"job": job, "task": task,
+                   "assignee": assignee, "acceptance": acceptance}),
+        )
     }
 
     pub fn task_state(&self, task: &str) -> String {

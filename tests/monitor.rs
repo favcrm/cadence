@@ -201,12 +201,8 @@ fn monitor_check_failure_is_degraded_without_healthy_claim() {
                "spec_sha256": sha, "repo": project}),
     )
     .unwrap();
-    d.rpc(
-        "task_new",
-        json!({"job": "badjob", "task": "badjob-watch", "assignee": "w1",
-               "acceptance": "observe failures"}),
-    )
-    .unwrap();
+    d.task_new_ac("badjob", "badjob-watch", "w1", "observe failures")
+        .unwrap();
     d.rpc(
         "monitor_register",
         json!({"monitor": "bad", "project": project, "owner": "operator",
@@ -287,12 +283,8 @@ fn monitor_persists_coverage_heartbeats_and_deduplicates_alerts() {
                "spec_sha256": sha, "repo": project}),
     )
     .unwrap();
-    d.rpc(
-        "task_new",
-        json!({"job": "mjob", "task": "mjob-watch", "assignee": "w1",
-               "acceptance": "observe the task"}),
-    )
-    .unwrap();
+    d.task_new_ac("mjob", "mjob-watch", "w1", "observe the task")
+        .unwrap();
     let registered = d
         .rpc(
             "monitor_register",
@@ -406,10 +398,11 @@ fn monitor_alerts_task_unknown_outcome_is_scoped_and_restart_safe() {
                "spec_sha256": sha, "repo": project}),
     )
     .unwrap();
-    d.rpc(
-        "task_new",
-        json!({"job": "unknown-job", "task": "unknown-task", "assignee": "w1",
-               "acceptance": "inspect uncertain work"}),
+    d.task_new_ac(
+        "unknown-job",
+        "unknown-task",
+        "w1",
+        "inspect uncertain work",
     )
     .unwrap();
     d.rpc(
@@ -677,18 +670,10 @@ fn monitor_dispatch_requires_explicit_safe_eligibility() {
                "spec_sha256": sha, "repo": project}),
     )
     .unwrap();
-    d.rpc(
-        "task_new",
-        json!({"job": "djob", "task": "djob-ready", "assignee": "w1",
-               "acceptance": "run focused checks"}),
-    )
-    .unwrap();
-    d.rpc(
-        "task_new",
-        json!({"job": "djob", "task": "djob-repeat", "assignee": "w2",
-               "acceptance": "reuse the live kickoff"}),
-    )
-    .unwrap();
+    d.task_new_ac("djob", "djob-ready", "w1", "run focused checks")
+        .unwrap();
+    d.task_new_ac("djob", "djob-repeat", "w2", "reuse the live kickoff")
+        .unwrap();
     d.rpc(
         "monitor_register",
         json!({"monitor": "dm", "project": project, "owner": "operator",
