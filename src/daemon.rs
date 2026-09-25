@@ -7026,7 +7026,7 @@ impl Shared {
     }
 
     /// `job task reopen` — the proven operator or the job's own PM
-    /// (skill/cadence/SKILL.md "Job work": PMs run it). Authority is the
+    /// (skills/cadence/SKILL.md "Job work": PMs run it). Authority is the
     /// connection's (CAD-373, [`Self::agent_caller`]): an agent may
     /// reopen only a task of a job whose recorded `pm` is that agent,
     /// and never one assigned to itself — the assignee, a peer and

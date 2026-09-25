@@ -1,0 +1,39 @@
+schema: 1
+project: cadence
+documents:
+  - id: start-here
+    kind: index
+    path: docs/START-HERE.md
+    title: Project reading order
+    required: true
+    roles: [pm, dev, qa, devops]
+  - id: scope
+    kind: scope
+    path: docs/CHARTER.md
+    title: Goals and non-goals
+    required: true
+    roles: [pm, dev, qa, devops]
+  - id: architecture
+    kind: architecture
+    path: docs/ARCHITECTURE.md
+    title: Boundaries and code map
+    required: true
+    roles: [pm, dev, qa]
+  - id: team-design
+    kind: spec
+    path: docs/design/DEVELOPMENT-TEAM.md
+    title: Development team design proposal
+    required: false
+    roles: [pm, dev, qa]
+  - id: board-contract
+    kind: validation
+    path: docs/BOARD.md
+    title: Tracker and validation contract
+    required: true
+    roles: [pm, dev, qa, devops]
+  - id: release-policy
+    kind: release
+    path: docs/roles/risk-classes.md
+    title: Risk and release authority
+    required: true
+    roles: [pm, qa, devops]

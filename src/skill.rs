@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use crate::error::{Error, Result};
 
 /// The vendored skill document — single source of truth.
-pub const SKILL_MD: &str = include_str!("../skill/cadence/SKILL.md");
+pub const SKILL_MD: &str = include_str!("../skills/cadence/SKILL.md");
 
 /// `~/.claude/skills`-style parents that receive a `cadence` symlink.
 const LINK_PARENTS: [&str; 3] = [".claude/skills", ".cursor/skills", ".copilot/skills"];

@@ -8,5 +8,22 @@
 __pycache__/
 *.py[cod]
 .cadence/
-/design-plans/**/*.png
+/design-plans/
+claudedocs/
 /tests/e2e/node_modules
+
+# docs/ is local working material — only the context manifest and the
+# documents it indexes stay tracked (`cadence issue context` serves them,
+# and one test embeds the manifest).
+docs/*
+!docs/cadence/
+!docs/design/
+!docs/roles/
+!docs/ARCHITECTURE.md
+!docs/BOARD.md
+!docs/CHARTER.md
+!docs/START-HERE.md
+docs/design/*
+docs/roles/*
+!docs/design/DEVELOPMENT-TEAM.md
+!docs/roles/risk-classes.md
