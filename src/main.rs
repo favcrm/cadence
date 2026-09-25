@@ -1680,6 +1680,12 @@ enum DaemonAction {
         /// up [default: 1800].
         #[arg(long, default_value_t = 1800, value_parser = clap::value_parser!(u64).range(1..))]
         timeout: u64,
+        /// With --when-idle, carry the restart past stale turns —
+        /// `running`/`submitted` messages on stopped or dead agents,
+        /// which can never report. Default refuses, naming each stale
+        /// turn and its remedy (CAD-503).
+        #[arg(long)]
+        ignore_stale: bool,
         /// Also restart the detached `cadence ui` server when one is
         /// running for this state dir.
         #[arg(long)]
@@ -3652,11 +3658,30 @@ fn daemon_stop(state_dir: &Path) -> Result<i32> {
     }
 }
 
-/// One status line for the restart wait loops: agents still holding
-/// the fleet busy — pty panes that probe busy, and actor agents with
-/// an in-flight (`running`/`submitted`) message.
-fn busy_agents(state_dir: &Path, agents: &[Value]) -> Vec<String> {
+/// CAD-503: can an in-flight turn on this agent still report? `stopped`,
+/// `offline` and `attention` are settled no-actor states, and `dead` is
+/// the daemon's own no-live-endpoint/no-pid verdict — a `running` or
+/// `submitted` row under either is stale and can never finish, so waiting
+/// on it is a deadlock (F19). `starting`/`stopping` still hold an actor
+/// mid-transition — their rows stay live blockers.
+fn stale_holder(agent: &Value) -> bool {
+    match agent["state"].as_str().unwrap_or_default() {
+        "stopped" | "offline" | "attention" => true,
+        "starting" | "stopping" => false,
+        _ => agent["dead"].as_bool().unwrap_or(false),
+    }
+}
+
+/// One status line for the restart wait loops, split by whether waiting
+/// can help: `busy` agents still holding the fleet (pty panes that probe
+/// busy, actor agents with a `running`/`submitted` message on a live
+/// actor) and `stale` turns — in-flight rows whose agent has no live
+/// actor left to report them (CAD-503). Waiting on a stale turn is a
+/// deadlock, so the caller refuses it (or carries it with
+/// `--ignore-stale`) instead of blocking until the timeout.
+fn busy_agents(state_dir: &Path, agents: &[Value]) -> (Vec<String>, Vec<String>) {
     let mut busy = Vec::new();
+    let mut stale = Vec::new();
     for a in agents {
         let alias = a["alias"].as_str().unwrap_or_default();
         let provider = a["provider"].as_str().unwrap_or_default();
@@ -3677,23 +3702,36 @@ fn busy_agents(state_dir: &Path, agents: &[Value]) -> Vec<String> {
         // read idle between paste and render, so the message row is
         // the authoritative in-flight signal.
         if let Ok(show) = client::rpc(state_dir, "agent_show", json!({"alias": alias})) {
-            let inflight = show["messages"]
+            let inflight: Vec<&Value> = show["messages"]
                 .as_array()
                 .map(|ms| {
-                    ms.iter().any(|m| {
-                        matches!(
-                            m["state"].as_str().unwrap_or_default(),
-                            "running" | "submitted"
-                        )
-                    })
+                    ms.iter()
+                        .filter(|m| {
+                            matches!(
+                                m["state"].as_str().unwrap_or_default(),
+                                "running" | "submitted"
+                            )
+                        })
+                        .collect()
                 })
-                .unwrap_or(false);
-            if inflight {
+                .unwrap_or_default();
+            if inflight.is_empty() {
+                continue;
+            }
+            if stale_holder(a) {
+                for m in inflight {
+                    stale.push(format!(
+                        "{alias}: {} ({})",
+                        m["id"].as_str().unwrap_or("?"),
+                        m["state"].as_str().unwrap_or("?")
+                    ));
+                }
+            } else {
                 busy.push(format!("{alias}(running message)"));
             }
         }
     }
-    busy
+    (busy, stale)
 }
 
 /// The detached UI's `ui run` argv from /proc — restarting the board
@@ -3746,10 +3784,15 @@ fn refuse_restart_over_leftovers(state_dir: &Path) -> Result<()> {
 /// was live before settles out of `starting`/`offline`, then print a
 /// before/after table. `--when-idle` gates the whole thing on a
 /// quiet fleet first; `--ui` bounces the detached board server too.
+/// CAD-503: a `running`/`submitted` row on a stopped or dead agent is
+/// stale — no actor exists to report it, so waiting is a deadlock
+/// (F19). `--when-idle` refuses such turns early with their remedy
+/// instead of timing out; `--ignore-stale` carries them through.
 fn daemon_restart(
     state_dir: &Path,
     when_idle: bool,
     timeout: u64,
+    ignore_stale: bool,
     ui: bool,
     as_identity: Option<String>,
 ) -> Result<i32> {
@@ -3766,12 +3809,37 @@ fn daemon_restart(
     if when_idle {
         let deadline = Instant::now() + Duration::from_secs(timeout);
         let mut next_report = Instant::now();
+        let mut stale_noted = false;
         loop {
             let agents = client::rpc(state_dir, "agent_list", json!({}))?["agents"]
                 .as_array()
                 .cloned()
                 .unwrap_or_default();
-            let busy = busy_agents(state_dir, &agents);
+            let (busy, stale) = busy_agents(state_dir, &agents);
+            if !stale.is_empty() {
+                if !ignore_stale {
+                    return Err(Error::rejected(format!(
+                        "{} stale turn(s) on stopped or dead agents can never \
+                         report — restart aborted before touching anything: {}. \
+                         Settle each with `cadence agent resume <alias>` (the \
+                         report bound then retires it for reconcile) or \
+                         `cadence agent remove --force <alias>` (settles it now, \
+                         dropping the agent), or pass --ignore-stale to carry \
+                         the stale rows through the restart",
+                        stale.len(),
+                        stale.join(", ")
+                    )));
+                }
+                if !stale_noted {
+                    eprintln!(
+                        "when-idle: ignoring {} stale turn(s) on stopped or \
+                         dead agents: {}",
+                        stale.len(),
+                        stale.join(", ")
+                    );
+                    stale_noted = true;
+                }
+            }
             if busy.is_empty() {
                 break;
             }
@@ -5982,9 +6050,17 @@ fn run() -> Result<i32> {
             DaemonAction::Restart {
                 when_idle,
                 timeout,
+                ignore_stale,
                 ui,
                 as_identity,
-            } => daemon_restart(&state_dir, when_idle, timeout, ui, as_identity),
+            } => daemon_restart(
+                &state_dir,
+                when_idle,
+                timeout,
+                ignore_stale,
+                ui,
+                as_identity,
+            ),
         },
         Commands::Backup { dir, keep, reason } => {
             let dir = dir.unwrap_or_else(|| cadence_agent::backup::default_dir(&state_dir));
