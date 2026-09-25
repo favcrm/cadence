@@ -288,6 +288,131 @@ pub fn cadence_cli_raw(
     }
 }
 
+/// `git -C <dir> <args>` asserting success, echoing the args and stderr
+/// on failure — the verbatim inline closure of the dispatch lanes.
+pub fn git_ok() -> impl Fn(&Path, &[&str]) {
+    |dir: &Path, args: &[&str]| {
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
+}
+
+/// [`git_ok`]'s twin returning the trimmed stdout — for lanes that
+/// capture `rev-parse` output mid-setup.
+pub fn git_stdout() -> impl Fn(&Path, &[&str]) -> String {
+    |dir: &Path, args: &[&str]| -> String {
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&o.stderr)
+        );
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    }
+}
+
+/// Seed `agents` — `(alias, params, endpoint_kind, role)` tuples —
+/// through [`Store::register_agent`], all `provider: "fake"`,
+/// `sandbox: "read-only"`, no instructions/team/model. `extra` runs
+/// against the still-open store for lanes that seed more than agents
+/// (a fence, an extra registration). Returns the backing TempDir —
+/// keep it bound for the state's lifetime — and the state path.
+pub fn seeded_state(
+    agents: &[(&str, Option<&str>, &str, &str)],
+    extra: impl FnOnce(&Store, &str),
+) -> (TempDir, PathBuf) {
+    let seeded = TempDir::new().unwrap();
+    let state = seeded.path().to_path_buf();
+    {
+        let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
+        let cwd = state.to_str().unwrap().to_string();
+        for &(alias, params, kind, role) in agents {
+            store
+                .register_agent(&cadence_agent::store::NewAgent {
+                    alias,
+                    provider: "fake",
+                    endpoint_kind: kind,
+                    role,
+                    cwd: &cwd,
+                    sandbox: "read-only",
+                    instructions: None,
+                    params,
+                    team_role: None,
+                    model_policy: None,
+                })
+                .unwrap();
+        }
+        extra(&store, &cwd);
+    }
+    (seeded, state)
+}
+
+/// One TempDir holding the `pm`/`repo`/`home` dirs every dispatch CLI
+/// lane creates. Binding `CADENCE_PM_DIR` stays at the call site so its
+/// ordering against `TestDaemon::start_on` is unchanged.
+pub fn pm_lab_dirs() -> (TempDir, PathBuf, PathBuf, PathBuf) {
+    let tmp = TempDir::new().unwrap();
+    let (pm_dir, repo, home) = (
+        tmp.path().join("pm"),
+        tmp.path().join("repo"),
+        tmp.path().join("home"),
+    );
+    for dir in [&pm_dir, &repo, &home] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    (tmp, pm_dir, repo, home)
+}
+
+/// The one-file `f`/`x` repo the dispatch lanes bootstrap: `init -b
+/// main`, the `t@t`/`t` identity, `add -A`, `commit -qm init`. Runs
+/// through the caller's own `git` closure (assert variants differ per
+/// lane). `extra` fires between the write and the add — e.g. the
+/// CAD-95 lane plants a Cargo.toml + .gitignore there.
+pub fn git_f_repo<R>(repo: &Path, git: &dyn Fn(&Path, &[&str]) -> R, extra: impl FnOnce(&Path)) {
+    git(repo, &["init", "-b", "main"]);
+    git(repo, &["config", "user.email", "t@t"]);
+    git(repo, &["config", "user.name", "t"]);
+    std::fs::write(repo.join("f"), "x").unwrap();
+    extra(repo);
+    git(repo, &["add", "-A"]);
+    git(repo, &["commit", "-qm", "init"]);
+}
+
+/// `issue init` + `project add demo --prefix D --repo` — the tracker
+/// bootstrap shared by the dispatch lanes that hang work on `demo`.
+/// Assert arg text is verbatim from the inline originals — `&repo_s`
+/// is a needless borrow here, but the inventory requires the verbatim
+/// condition text, which named a `String` at the call sites.
+#[allow(clippy::needless_borrow)]
+pub fn demo_project_init(cli: &dyn Fn(&[&str]) -> (bool, Value), repo_s: &str) {
+    assert!(cli(&["issue", "init"]).0);
+    assert!(cli(&["issue", "project", "add", "demo", "--prefix", "D", "--repo", &repo_s,]).0);
+}
+
+/// One `issue new --project demo` per title. Only lanes that loop a
+/// `title` var can share it — a literal-title assert keeps its own text.
+pub fn demo_issue_news(cli: &dyn Fn(&[&str]) -> (bool, Value), titles: &[&str]) {
+    for &title in titles {
+        assert!(cli(&["issue", "new", title, "--project", "demo"]).0);
+    }
+}
+
 pub struct TestDaemon {
     pub dir: TempDir,
     pub state: PathBuf,

@@ -9,8 +9,6 @@ mod common;
 use common::*;
 
 use cadence_agent::client;
-use cadence_agent::store::NewAgent;
-use cadence_agent::store::Store;
 use cadence_agent::store::Take;
 use serde_json::json;
 use serde_json::Value;
@@ -2373,25 +2371,7 @@ fn cad324_continuity_packs_on_new_compacted_and_lost_sessions() {
 /// carries the pack, once.
 #[test]
 fn cad324_compaction_pack_survives_a_daemon_restart() {
-    let seeded = TempDir::new().unwrap();
-    let state = seeded.path().to_path_buf();
-    {
-        let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
-        let cwd = state.to_str().unwrap().to_string();
-        store
-            .register_agent(&NewAgent {
-                alias: "lead",
-                provider: "fake",
-                endpoint_kind: "fake",
-                role: "worker",
-                cwd: &cwd,
-                sandbox: "read-only",
-                instructions: None,
-                params: None,
-                team_role: None,
-                model_policy: None,
-            })
-            .unwrap();
+    let (_seeded, state) = seeded_state(&[("lead", None, "fake", "worker")], |store, _cwd| {
         // The fake's own session id: the reopen is the same session.
         store
             .set_identity(
@@ -2430,7 +2410,7 @@ fn cad324_compaction_pack_survives_a_daemon_restart() {
                 },
             )
             .unwrap();
-    }
+    });
     // The restarted daemon reopens the agent's stored session itself.
     let d = TestDaemon::start_on(state);
     d.wait_agent("lead", "idle", 15);

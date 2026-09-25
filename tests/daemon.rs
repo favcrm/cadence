@@ -200,32 +200,14 @@ fn approval_lifecycle() {
 #[test]
 fn restart_fences_unknown_inflight() {
     // Seed a state dir with an in-flight attempt, then start a daemon.
-    let seeded = TempDir::new().unwrap();
-    let state = seeded.path().to_path_buf();
-    {
-        let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
-        let cwd = state.to_str().unwrap().to_string();
-        store
-            .register_agent(&NewAgent {
-                alias: "w1",
-                provider: "fake",
-                endpoint_kind: "fake",
-                role: "worker",
-                cwd: &cwd,
-                sandbox: "read-only",
-                instructions: None,
-                params: None,
-                team_role: None,
-                model_policy: None,
-            })
-            .unwrap();
+    let (_seeded, state) = seeded_state(&[("w1", None, "fake", "worker")], |store, _cwd| {
         store.enqueue("w1", "work", None, "m1", "user").unwrap();
         match store.take_queued("w1").unwrap() {
             Take::Message(m) => assert_eq!(m.id, "m1"),
             _ => panic!("expected a message"),
         }
         // Simulate crash: store dropped while m1 is 'submitting'.
-    }
+    });
     let d = TestDaemon::start_on(state);
     // The fenced actor lands in attention, not a silent relaunch.
     let agent = d.wait_agent("w1", "attention", 10);
@@ -265,25 +247,7 @@ fn restart_keeps_original_unknown_reason_beside_later_inflight() {
     // original account on agent.error, and without rewriting the older
     // row or dropping the later turn token.
     const ORIGINAL: &str = "submission accepted but never rendered on the endpoint";
-    let seeded = TempDir::new().unwrap();
-    let state = seeded.path().to_path_buf();
-    {
-        let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
-        let cwd = state.to_str().unwrap().to_string();
-        store
-            .register_agent(&NewAgent {
-                alias: "w1",
-                provider: "fake",
-                endpoint_kind: "fake",
-                role: "worker",
-                cwd: &cwd,
-                sandbox: "read-only",
-                instructions: None,
-                params: None,
-                team_role: None,
-                model_policy: None,
-            })
-            .unwrap();
+    let (_seeded, state) = seeded_state(&[("w1", None, "fake", "worker")], |store, _cwd| {
         store.enqueue("w1", "first", None, "m1", "user").unwrap();
         let m1 = match store.take_queued("w1").unwrap() {
             Take::Message(message) => *message,
@@ -303,7 +267,7 @@ fn restart_keeps_original_unknown_reason_beside_later_inflight() {
             _ => panic!("expected m2"),
         };
         store.mark_running(&m2.id, "pty-gen-m2").unwrap();
-    }
+    });
     let d = TestDaemon::start_on(state);
     let agent = d.wait_agent("w1", "attention", 10);
     let error = agent["error"].as_str().unwrap();
@@ -723,51 +687,37 @@ fn restart_preserves_attention_fence_without_unknowns() {
     // recorded error, stored thread — with NO unknown messages.
     // recover() must not rewrite the fence to `offline` before the
     // serve loop reads it.
-    let seeded = TempDir::new().unwrap();
-    let state = seeded.path().to_path_buf();
-    {
-        let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
-        let cwd = state.to_str().unwrap().to_string();
-        for alias in ["mismatch", "healthy"] {
+    let (_seeded, state) = seeded_state(
+        &[
+            ("mismatch", None, "fake", "worker"),
+            ("healthy", None, "fake", "worker"),
+        ],
+        |store, _cwd| {
             store
-                .register_agent(&NewAgent {
-                    alias,
-                    provider: "fake",
-                    endpoint_kind: "fake",
-                    role: "worker",
-                    cwd: &cwd,
-                    sandbox: "read-only",
-                    instructions: None,
-                    params: None,
-                    team_role: None,
-                    model_policy: None,
-                })
+                .set_identity(
+                    "mismatch",
+                    &cadence_agent::adapter::Identity {
+                        thread_id: "th-mismatch".into(),
+                        session_id: "s-mismatch".into(),
+                        model: None,
+                        effort: None,
+                        pid: 1,
+                        endpoint: None,
+                        generation: None,
+                        attach: None,
+                    },
+                )
                 .unwrap();
-        }
-        store
-            .set_identity(
-                "mismatch",
-                &cadence_agent::adapter::Identity {
-                    thread_id: "th-mismatch".into(),
-                    session_id: "s-mismatch".into(),
-                    model: None,
-                    effort: None,
-                    pid: 1,
-                    endpoint: None,
-                    generation: None,
-                    attach: None,
-                },
-            )
-            .unwrap();
-        store
-            .set_agent_state(
-                "mismatch",
-                "attention",
-                Some("pane owns session 'other', expected 's-mismatch'"),
-            )
-            .unwrap();
-        store.set_agent_state("healthy", "idle", None).unwrap();
-    }
+            store
+                .set_agent_state(
+                    "mismatch",
+                    "attention",
+                    Some("pane owns session 'other', expected 's-mismatch'"),
+                )
+                .unwrap();
+            store.set_agent_state("healthy", "idle", None).unwrap();
+        },
+    );
     let d = TestDaemon::start_on(state);
     let _reaper = DaemonReaper::new(&d.state);
     // Healthy relaunched; the fenced agent kept its fence AND its
@@ -2728,83 +2678,59 @@ fn restart_fences_task_kickoff_and_job_show_reports_drift() {
     // flight, then start the daemon — recovery fences the message, the
     // task is untouched, `job show` flags the drift and dispatch is
     // legal again.
-    let seeded = TempDir::new().unwrap();
-    let state = seeded.path().to_path_buf();
-    {
-        let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
-        let cwd = state.to_str().unwrap().to_string();
-        store
-            .register_agent(&NewAgent {
-                alias: "pm",
-                provider: "fake",
-                endpoint_kind: "fake",
-                role: "pm",
-                cwd: &cwd,
-                sandbox: "read-only",
-                instructions: None,
-                params: None,
-                team_role: None,
-                model_policy: None,
-            })
-            .unwrap();
-        store
-            .register_agent(&NewAgent {
-                alias: "w1",
-                provider: "fake",
-                endpoint_kind: "fake",
-                role: "worker",
-                cwd: &cwd,
-                sandbox: "read-only",
-                instructions: None,
-                params: Some(&json!({"upstream": "pm"}).to_string()),
-                team_role: None,
-                model_policy: None,
-            })
-            .unwrap();
-        store
-            .create_job(
-                "j1",
-                None,
-                "/tmp/spec.md",
-                &"0".repeat(64),
-                "pm",
-                None,
-                None,
-                None,
-                2,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
-            .unwrap();
-        store
-            .create_task(
-                "j1",
-                "j1-t2",
-                None,
-                Some("w1"),
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
-            .unwrap();
-        let (task, kickoff, dup, _dead) = store.dispatch_task("j1-t2", None, None, "test").unwrap();
-        assert!(!dup);
-        assert_eq!(task.state, "dispatched");
-        // Simulate a mid-turn crash: kickoff taken + running, store dropped.
-        match store.take_queued("w1").unwrap() {
-            Take::Message(m) => assert_eq!(m.id, kickoff),
-            _ => panic!("expected kickoff"),
-        }
-        store.mark_running(&kickoff, "fake-1-abc").unwrap();
-        assert_eq!(store.task("j1-t2").unwrap().state, "running");
-    }
+    let upstream = json!({"upstream": "pm"}).to_string();
+    let (_seeded, state) = seeded_state(
+        &[
+            ("pm", None, "fake", "pm"),
+            ("w1", Some(upstream.as_str()), "fake", "worker"),
+        ],
+        |store, _cwd| {
+            store
+                .create_job(
+                    "j1",
+                    None,
+                    "/tmp/spec.md",
+                    &"0".repeat(64),
+                    "pm",
+                    None,
+                    None,
+                    None,
+                    2,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+            store
+                .create_task(
+                    "j1",
+                    "j1-t2",
+                    None,
+                    Some("w1"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+            let (task, kickoff, dup, _dead) =
+                store.dispatch_task("j1-t2", None, None, "test").unwrap();
+            assert!(!dup);
+            assert_eq!(task.state, "dispatched");
+            // Simulate a mid-turn crash: kickoff taken + running, store dropped.
+            match store.take_queued("w1").unwrap() {
+                Take::Message(m) => assert_eq!(m.id, kickoff),
+                _ => panic!("expected kickoff"),
+            }
+            store.mark_running(&kickoff, "fake-1-abc").unwrap();
+            assert_eq!(store.task("j1-t2").unwrap().state, "running");
+        },
+    );
     let d = TestDaemon::start_on(state);
     // Recovery fenced the kickoff unknown; the task stays running.
     let show = d.rpc("job_show", json!({"job": "j1"})).unwrap();

@@ -9,8 +9,6 @@ mod common;
 use common::*;
 
 use cadence_agent::daemon;
-use cadence_agent::store::NewAgent;
-use cadence_agent::store::Store;
 use cadence_agent::store::Take;
 use serde_json::json;
 use serde_json::Value;
@@ -25,36 +23,22 @@ use tempfile::TempDir;
 #[test]
 fn daemon_restart_skips_fenced_and_relaunches_healthy() {
     // Seed: one agent mid-flight (crash → unknown fence) + one healthy.
-    let seeded = TempDir::new().unwrap();
-    let state = seeded.path().to_path_buf();
-    {
-        let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
-        let cwd = state.to_str().unwrap().to_string();
-        for alias in ["fenced", "healthy"] {
-            store
-                .register_agent(&NewAgent {
-                    alias,
-                    provider: "fake",
-                    endpoint_kind: "fake",
-                    role: "worker",
-                    cwd: &cwd,
-                    sandbox: "read-only",
-                    instructions: None,
-                    params: None,
-                    team_role: None,
-                    model_policy: None,
-                })
-                .unwrap();
-        }
-        store.set_agent_state("fenced", "idle", None).unwrap();
-        store.set_agent_state("healthy", "idle", None).unwrap();
-        store.enqueue("fenced", "work", None, "m1", "user").unwrap();
-        match store.take_queued("fenced").unwrap() {
-            Take::Message(m) => assert_eq!(m.id, "m1"),
-            _ => panic!("expected a message"),
-        }
-        // Store dropped mid-flight — the crash this daemon recovers.
-    }
+    let (_seeded, state) = seeded_state(
+        &[
+            ("fenced", None, "fake", "worker"),
+            ("healthy", None, "fake", "worker"),
+        ],
+        |store, _cwd| {
+            store.set_agent_state("fenced", "idle", None).unwrap();
+            store.set_agent_state("healthy", "idle", None).unwrap();
+            store.enqueue("fenced", "work", None, "m1", "user").unwrap();
+            match store.take_queued("fenced").unwrap() {
+                Take::Message(m) => assert_eq!(m.id, "m1"),
+                _ => panic!("expected a message"),
+            }
+            // Store dropped mid-flight — the crash this daemon recovers.
+        },
+    );
     let d = TestDaemon::start_on(state);
     // Healthy relaunched; the fenced one was skipped, still attention.
     d.wait_agent("healthy", "idle", 15);

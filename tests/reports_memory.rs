@@ -15,8 +15,6 @@ use cadence_agent::memory::IdentityProof;
 use cadence_agent::memory::Memory;
 use cadence_agent::memory::ReviewReceipt;
 use cadence_agent::memory::Scope;
-use cadence_agent::store::NewAgent;
-use cadence_agent::store::Store;
 use serde_json::json;
 use serde_json::Value;
 use std::io::Write;
@@ -736,72 +734,26 @@ fn memory_native_socket_identity_requires_distinct_reviewers() {
 /// skips the whole path.
 #[test]
 fn dispatch_injects_project_memory_lessons() {
-    let seeded = TempDir::new().unwrap();
-    let state = seeded.path().to_path_buf();
-    {
-        let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
-        let cwd = state.to_str().unwrap().to_string();
-        // w1 is `inbox` — the queued kickoff stays inspectable.
-        for (alias, params, kind) in [
-            ("pm", None, "fake"),
-            ("w1", Some("{\"upstream\":\"pm\"}"), "inbox"),
-        ] {
-            store
-                .register_agent(&NewAgent {
-                    alias,
-                    provider: "fake",
-                    endpoint_kind: kind,
-                    role: "worker",
-                    cwd: &cwd,
-                    sandbox: "read-only",
-                    instructions: None,
-                    params,
-                    team_role: None,
-                    model_policy: None,
-                })
-                .unwrap();
-        }
-    }
-    let tmp = TempDir::new().unwrap();
-    let (pm_dir, repo, home) = (
-        tmp.path().join("pm"),
-        tmp.path().join("repo"),
-        tmp.path().join("home"),
+    // w1 is `inbox` — the queued kickoff stays inspectable.
+    let (_seeded, state) = seeded_state(
+        &[
+            ("pm", None, "fake", "worker"),
+            ("w1", Some("{\"upstream\":\"pm\"}"), "inbox", "worker"),
+        ],
+        |_, _| {},
     );
+    let (tmp, pm_dir, repo, home) = pm_lab_dirs();
     // dispatch_send reads the tracker daemon-side (claim + lane refs) —
     // bind CADENCE_PM_DIR into the daemon's env before it starts.
     test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
     let d = TestDaemon::start_on(state);
-    for dir in [&pm_dir, &repo, &home] {
-        std::fs::create_dir_all(dir).unwrap();
-    }
-    let git = |dir: &Path, args: &[&str]| {
-        let o = std::process::Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            o.status.success(),
-            "git {}: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&o.stderr)
-        );
-    };
-    git(&repo, &["init", "-b", "main"]);
-    git(&repo, &["config", "user.email", "t@t"]);
-    git(&repo, &["config", "user.name", "t"]);
-    std::fs::write(repo.join("f"), "x").unwrap();
-    git(&repo, &["add", "-A"]);
-    git(&repo, &["commit", "-qm", "init"]);
+
+    let git = git_ok();
+    git_f_repo(&repo, &git, |_| {});
     let cli = cadence_cli_json(&d.state, &pm_dir, &home);
-    assert!(cli(&["issue", "init"]).0);
     let repo_s = repo.canonicalize().unwrap().to_str().unwrap().to_string();
-    assert!(cli(&["issue", "project", "add", "demo", "--prefix", "D", "--repo", &repo_s,]).0);
-    for title in ["One", "Two", "Three"] {
-        assert!(cli(&["issue", "new", title, "--project", "demo"]).0);
-    }
+    demo_project_init(&cli, &repo_s);
+    demo_issue_news(&cli, &["One", "Two", "Three"]);
 
     // Three reviewed memories on the project: one project-wide rule
     // (matches), one component-scoped gotcha (no component on the issue
@@ -1261,44 +1213,19 @@ fn memory_match_explicit_axes_stay_in_current_project() {
 /// rule section to ≤8 entries and 4 KiB.
 #[test]
 fn dispatch_degrades_on_memory_failures() {
-    let seeded = TempDir::new().unwrap();
-    let state = seeded.path().to_path_buf();
-    {
-        let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
-        let cwd = state.to_str().unwrap().to_string();
-        for (alias, params, kind) in [
-            ("pm", None, "fake"),
-            ("w1", Some("{\"upstream\":\"pm\"}"), "inbox"),
-        ] {
-            store
-                .register_agent(&NewAgent {
-                    alias,
-                    provider: "fake",
-                    endpoint_kind: kind,
-                    role: "worker",
-                    cwd: &cwd,
-                    sandbox: "read-only",
-                    instructions: None,
-                    params,
-                    team_role: None,
-                    model_policy: None,
-                })
-                .unwrap();
-        }
-    }
-    let tmp = TempDir::new().unwrap();
-    let (pm_dir, repo, home) = (
-        tmp.path().join("pm"),
-        tmp.path().join("repo"),
-        tmp.path().join("home"),
+    let (_seeded, state) = seeded_state(
+        &[
+            ("pm", None, "fake", "worker"),
+            ("w1", Some("{\"upstream\":\"pm\"}"), "inbox", "worker"),
+        ],
+        |_, _| {},
     );
+    let (tmp, pm_dir, repo, home) = pm_lab_dirs();
     // dispatch_send reads the tracker daemon-side (claim + lane refs) —
     // bind CADENCE_PM_DIR into the daemon's env before it starts.
     test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
     let d = TestDaemon::start_on(state);
-    for dir in [&pm_dir, &repo, &home] {
-        std::fs::create_dir_all(dir).unwrap();
-    }
+
     let git = |dir: &Path, args: &[&str]| {
         let o = std::process::Command::new("git")
             .arg("-C")
@@ -1308,12 +1235,7 @@ fn dispatch_degrades_on_memory_failures() {
             .unwrap();
         assert!(o.status.success(), "git {:?}", args);
     };
-    git(&repo, &["init", "-b", "main"]);
-    git(&repo, &["config", "user.email", "t@t"]);
-    git(&repo, &["config", "user.name", "t"]);
-    std::fs::write(repo.join("f"), "x").unwrap();
-    git(&repo, &["add", "-A"]);
-    git(&repo, &["commit", "-qm", "init"]);
+    git_f_repo(&repo, &git, |_| {});
     let cli = cadence_cli_json(&d.state, &pm_dir, &home);
     assert!(cli(&["issue", "init"]).0);
     let repo_s = repo.canonicalize().unwrap().to_str().unwrap().to_string();

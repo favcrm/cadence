@@ -200,26 +200,8 @@ fn issue_start_job_opens_scoped_task() {
     for dir in [&pm, &repo, &home] {
         std::fs::create_dir_all(dir).unwrap();
     }
-    let git = |dir: &Path, args: &[&str]| {
-        let o = std::process::Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            o.status.success(),
-            "git {}: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&o.stderr)
-        );
-    };
-    git(&repo, &["init", "-b", "main"]);
-    git(&repo, &["config", "user.email", "t@t"]);
-    git(&repo, &["config", "user.name", "t"]);
-    std::fs::write(repo.join("f"), "x").unwrap();
-    git(&repo, &["add", "-A"]);
-    git(&repo, &["commit", "-qm", "init"]);
+    let git = git_ok();
+    git_f_repo(&repo, &git, |_| {});
     let bin_dir = Path::new(env!("CARGO_BIN_EXE_cadence"))
         .parent()
         .unwrap()
@@ -1605,20 +1587,7 @@ fn session_end_project_scopes_sweep() {
     for dir in [&pm_dir, &home, &state, &repo_a, &repo_b] {
         std::fs::create_dir_all(dir).unwrap();
     }
-    let git = |dir: &Path, args: &[&str]| {
-        let o = std::process::Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            o.status.success(),
-            "git {}: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&o.stderr)
-        );
-    };
+    let git = git_ok();
     for repo in [&repo_a, &repo_b] {
         git(repo, &["init", "-b", "main"]);
         git(repo, &["config", "user.email", "t@t"]);
@@ -2191,35 +2160,10 @@ fn issue_ls_survives_a_closed_downstream_pipe() {
 #[test]
 fn issue_start_writes_slot_env() {
     let d = TestDaemon::start();
-    let tmp = TempDir::new().unwrap();
-    let (pm_dir, repo, home) = (
-        tmp.path().join("pm"),
-        tmp.path().join("repo"),
-        tmp.path().join("home"),
-    );
-    for dir in [&pm_dir, &repo, &home] {
-        std::fs::create_dir_all(dir).unwrap();
-    }
-    let git = |dir: &Path, args: &[&str]| {
-        let o = std::process::Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            o.status.success(),
-            "git {}: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&o.stderr)
-        );
-    };
-    git(&repo, &["init", "-b", "main"]);
-    git(&repo, &["config", "user.email", "t@t"]);
-    git(&repo, &["config", "user.name", "t"]);
-    std::fs::write(repo.join("f"), "x").unwrap();
-    git(&repo, &["add", "-A"]);
-    git(&repo, &["commit", "-qm", "init"]);
+    let (_tmp, pm_dir, repo, home) = pm_lab_dirs();
+
+    let git = git_ok();
+    git_f_repo(&repo, &git, |_| {});
     let cli = cadence_cli_json(&d.state, &pm_dir, &home);
     assert!(cli(&["issue", "init"]).0);
     let repo_s = repo.canonicalize().unwrap().to_str().unwrap().to_string();

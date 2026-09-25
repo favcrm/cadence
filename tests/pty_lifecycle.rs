@@ -9,7 +9,6 @@ mod common;
 use common::*;
 
 use cadence_agent::store::NewAgent;
-use cadence_agent::store::Store;
 use serde_json::json;
 use serde_json::Value;
 use std::path::Path;
@@ -1866,18 +1865,14 @@ fn pty_stop_reaps_pane_session_tree() {
 /// tree is unowned and signals nothing beyond the pane.
 #[test]
 fn pty_stop_without_pane_root_records_unowned_tree() {
-    let seeded = TempDir::new().unwrap();
-    let state = seeded.path().to_path_buf();
-    {
-        let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
-        let cwd = state.to_str().unwrap().to_string();
+    let (_seeded, state) = seeded_state(&[], |store, cwd| {
         store
             .register_agent(&NewAgent {
                 alias: "old",
                 provider: "tui-stub",
                 endpoint_kind: "pty",
                 role: "worker",
-                cwd: &cwd,
+                cwd,
                 sandbox: "read-only",
                 instructions: None,
                 params: None,
@@ -1887,7 +1882,7 @@ fn pty_stop_without_pane_root_records_unowned_tree() {
             .unwrap();
         store.set_enabled("old", false).unwrap();
         store.set_agent_state("old", "stopped", None).unwrap();
-    }
+    });
     let d = TestDaemon::start_on(state);
     let _mock = d.mock_stub();
     d.rpc("agent_stop", json!({"alias": "old"})).unwrap();
