@@ -60,19 +60,10 @@ fn job_list_cad437_filters() {
     let d = TestDaemon::start();
     d.register("pm");
     let (spec, sha) = d.spec_file("spec.md", "first job");
-    d.rpc(
-        "job_new",
-        json!({"pm": "pm", "job": "j1", "spec": spec, "spec_sha256": sha,
-               "issue": "CAD-26"}),
-    )
-    .unwrap();
+    d.job_new_issue("pm", "j1", &spec, &sha, "CAD-26").unwrap();
     let (spec2, sha2) = d.spec_file("spec2.md", "second job");
-    d.rpc(
-        "job_new",
-        json!({"pm": "pm", "job": "j2", "spec": spec2, "spec_sha256": sha2,
-               "issue": "CAD-27"}),
-    )
-    .unwrap();
+    d.job_new_issue("pm", "j2", &spec2, &sha2, "CAD-27")
+        .unwrap();
 
     let ids = |v: &Value| -> Vec<String> {
         let mut ids: Vec<String> = v["jobs"]
@@ -163,39 +154,21 @@ fn job_new_creates_default_task_and_validates_issue() {
     assert_eq!(list[0]["tasks"]["draft"], 1);
 
     // Idempotent re-create with identical params.
-    let dup = d.rpc(
-        "job_new",
-        json!({"pm": "pm", "job": "j1", "spec": spec, "spec_sha256": sha,
-               "issue": "CAD-26"}),
-    );
+    let dup = d.job_new_issue("pm", "j1", &spec, &sha, "CAD-26");
     assert_eq!(dup.unwrap()["duplicate"], true);
 
     // Same id, different content → rejected.
     assert!(d
-        .rpc(
-            "job_new",
-            json!({"pm": "pm", "job": "j1", "spec": "/other.md",
-                   "spec_sha256": "0".repeat(64), "issue": "CAD-26"}),
-        )
+        .job_new_issue("pm", "j1", "/other.md", &"0".repeat(64), "CAD-26")
         .is_err());
 
     // Issue grammar is validated — not the filesystem.
     assert!(d
-        .rpc(
-            "job_new",
-            json!({"pm": "pm", "job": "j2", "spec": spec,
-                   "spec_sha256": sha, "issue": "not-an-issue"}),
-        )
+        .job_new_issue("pm", "j2", &spec, &sha, "not-an-issue")
         .is_err());
 
     // One leaf issue → one open job.
-    assert!(d
-        .rpc(
-            "job_new",
-            json!({"pm": "pm", "job": "j2", "spec": spec,
-                   "spec_sha256": sha, "issue": "CAD-26"}),
-        )
-        .is_err());
+    assert!(d.job_new_issue("pm", "j2", &spec, &sha, "CAD-26").is_err());
 
     // Unknown PM rejected.
     assert!(d
@@ -859,12 +832,8 @@ fn verdict_setup(d: &TestDaemon, repo: &Path) {
     d.wait_agent("pm", "idle", 10);
     d.wait_agent("w1", "idle", 10);
     let (spec, sha) = d.spec_file("spec.md", "do the work");
-    d.rpc(
-        "job_new",
-        json!({"pm": "pm", "job": "j1", "spec": spec, "spec_sha256": sha,
-               "repo": repo.to_str().unwrap()}),
-    )
-    .unwrap();
+    d.job_new_repo("pm", "j1", &spec, &sha, repo.to_str().unwrap())
+        .unwrap();
 }
 
 /// Dispatch `task` to the fake worker; its REPORT_SHA trailer lands
@@ -3562,12 +3531,7 @@ fn automatic_monitor_dispatch_is_separate_guarded_and_restart_safe() {
     // idempotency boundary rather than minting another revision.
     let (spec, sha) = d.spec_file("automatic-monitor.md", "coordinator test");
     let project = d.dir.path().to_str().unwrap().to_string();
-    d.rpc(
-        "job_new",
-        json!({"pm": "pm", "job": "ajob", "spec": spec,
-               "spec_sha256": sha, "repo": project}),
-    )
-    .unwrap();
+    d.job_new_repo("pm", "ajob", &spec, &sha, &project).unwrap();
     for (task, assignee) in [
         ("ajob-fresh", "w2"),
         ("ajob-duplicate", "w1"),
@@ -3824,12 +3788,8 @@ fn automatic_monitor_dispatch_serializes_competing_callers() {
     seed_provider_quota(&d, "w1", quota_at);
     let (spec, sha) = d.spec_file("automatic-race.md", "serialize dispatch");
     let project = d.dir.path().to_str().unwrap().to_string();
-    d.rpc(
-        "job_new",
-        json!({"pm": "pm", "job": "race-job", "spec": spec,
-               "spec_sha256": sha, "repo": project}),
-    )
-    .unwrap();
+    d.job_new_repo("pm", "race-job", &spec, &sha, &project)
+        .unwrap();
     d.task_new_ac(
         "race-job",
         "race-task",

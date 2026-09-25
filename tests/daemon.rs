@@ -3535,12 +3535,7 @@ fn operator_verbs_refuse_agents_whatever_they_claim() {
     d.wait_agent("w1", "idle", 10);
     let (spec, sha) = d.spec_file("spec.md", "gated verbs");
     let project = d.dir.path().to_str().unwrap().to_string();
-    d.rpc(
-        "job_new",
-        json!({"pm": "pm", "job": "j1", "spec": spec, "spec_sha256": sha,
-               "repo": project}),
-    )
-    .unwrap();
+    d.job_new_repo("pm", "j1", &spec, &sha, &project).unwrap();
     d.task_new_ac("j1", "j1-t", "w1", format!("ok REPORT_SHA:{SHA_A}"))
         .unwrap();
     d.job_dispatch("j1-t", json!({})).unwrap();

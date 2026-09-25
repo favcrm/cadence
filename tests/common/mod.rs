@@ -3666,6 +3666,38 @@ impl TestDaemon {
         .unwrap()
     }
 
+    /// `job_new` naming the `repo` it lands in.
+    pub fn job_new_repo(
+        &self,
+        pm: &str,
+        job: &str,
+        spec: &str,
+        spec_sha: &str,
+        repo: &str,
+    ) -> cadence_agent::Result<Value> {
+        self.rpc(
+            "job_new",
+            json!({"pm": pm, "job": job, "spec": spec,
+                   "spec_sha256": spec_sha, "repo": repo}),
+        )
+    }
+
+    /// `job_new` bound to a tracker `issue` id.
+    pub fn job_new_issue(
+        &self,
+        pm: &str,
+        job: &str,
+        spec: &str,
+        spec_sha: &str,
+        issue: &str,
+    ) -> cadence_agent::Result<Value> {
+        self.rpc(
+            "job_new",
+            json!({"pm": pm, "job": job, "spec": spec,
+                   "spec_sha256": spec_sha, "issue": issue}),
+        )
+    }
+
     /// `agent_register` with explicit `provider`/`endpoint_kind`/`cwd`
     /// — the suite's dominant raw register shape. `params` is a
     /// serialized JSON string exactly as sites built it.
