@@ -1,0 +1,254 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cadence:contracts:connected-platform:v1:vectors",
+  "title": "Connected-platform worked vectors (ADR 0006 §5.6)",
+  "description": "Machine-readable worked examples of the contract: each vector is a scenario script (given + steps) with expected gate decisions and pending-effect states, consumed by both Cadence's and AgenticOS's test suites. Step `expect` objects are a closed vocabulary — every key is enumerated below so a typo fails schema validation. `expect.record` embeds pending-effect record specimens, each validated separately against pending-effect.schema.json.",
+  "type": "object",
+  "required": ["fixture", "version", "vectors"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string", "description": "Inert annotation: a URI naming the schema this document claims." },
+    "fixture": { "const": "connected-platform" },
+    "version": { "const": 1 },
+    "comment": { "type": "string" },
+    "vectors": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/vector" }
+    }
+  },
+  "$defs": {
+    "presser": {
+      "type": "object",
+      "required": ["member", "role", "rule"],
+      "additionalProperties": false,
+      "description": "The decision.by shape: who pressed, their role, the rule that authorised it.",
+      "properties": {
+        "member": { "type": "string", "minLength": 1 },
+        "role": { "type": "string", "minLength": 1 },
+        "rule": { "type": "string", "minLength": 1 }
+      }
+    },
+    "expect": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Assertions on gate decision and pending-effect state after the step. Absent keys are not asserted.",
+      "properties": {
+        "result": {
+          "enum": ["executed", "staged", "existing", "error"],
+          "description": "call steps only. executed: ran through the proxy at once. staged: parked as a pending effect, caller got `staged` + effect_id. existing: a retried open with the same caller-named handle deduped to the already-staged effect (same effect_id, no second row). error: the platform call was attempted and errored."
+        },
+        "press": {
+          "enum": ["applied", "refused"],
+          "description": "press steps only. refused: the press did not take (terminal row, unauthorised presser, or missing effect)."
+        },
+        "effect_id": {
+          "type": "boolean",
+          "description": "call steps only: the staged result carried an effect_id."
+        },
+        "state": {
+          "enum": [
+            "waiting",
+            "decided",
+            "executing",
+            "done",
+            "failed",
+            "declined",
+            "closed",
+            "reconcile",
+            null
+          ],
+          "description": "State of the pending-effect row this step produced (call) or acted on (press/edit_source) after the step. null asserts the step produced no row. For restart/caller_deadline steps it asserts the row the vector is tracking."
+        },
+        "close_reason": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The reason named on a closed row (e.g. source_changed)."
+        },
+        "fired": {
+          "type": "boolean",
+          "description": "Whether this step caused platform traffic for the staged call — the \"decline never fires\" / \"never re-fires\" assertion."
+        },
+        "executions": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Cumulative platform executions for the pending effect after this step — the exactly-once counter (§5.4 step 9)."
+        },
+        "verified": {
+          "enum": [true, false, "unknown"],
+          "description": "outcome.verified after execution (C10)."
+        },
+        "needs_you": {
+          "type": "boolean",
+          "description": "Whether a Needs-you item was raised (verified:false raises one; §5.4 step 6)."
+        },
+        "delivered": {
+          "enum": ["message"],
+          "description": "The outcome arrived as a message to the task or PM — never only to a waiter (C5, §5.4 step 6)."
+        },
+        "wait": {
+          "enum": ["ended", "open"],
+          "description": "caller_deadline steps: the caller's wait ended while the durable row persists."
+        },
+        "record": {
+          "type": "object",
+          "description": "A pending-effect record specimen for the state at this point in the lifecycle; consumers validate it against pending-effect.schema.json."
+        }
+      }
+    },
+    "vector": {
+      "type": "object",
+      "required": ["id", "summary", "contract", "given", "steps"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"
+        },
+        "summary": { "type": "string", "minLength": 1 },
+        "contract": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Contract anchors the vector exercises (C-numbers and/or §-refs of ADR 0006).",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "given": {
+          "type": "object",
+          "required": ["tool_table"],
+          "additionalProperties": false,
+          "properties": {
+            "tool_table": {
+              "description": "The adapter's declared table for this scenario: the string \"default\" resolves to fake-tool-table.json shipped beside this file, or an inline object (which may be deliberately malformed when table_valid is false).",
+              "oneOf": [
+                { "const": "default" },
+                { "type": "object" }
+              ]
+            },
+            "table_valid": {
+              "type": "boolean",
+              "description": "Default true. When true, the tool_table must validate against tool-table.schema.json; when false it must fail — the fixture harness asserts the direction both ways."
+            },
+            "reported_manifest_version": {
+              "type": ["string", "null"],
+              "description": "The manifest version the platform reports now — the platform side, never a call argument. Explicit null means the platform declares none (undeclared → gates as send). When the key is omitted the table's own manifest_version is reported."
+            },
+            "agent": {
+              "type": "string",
+              "minLength": 1,
+              "description": "The calling agent alias (connection-derived at runtime; named here for the record specimen)."
+            },
+            "account": {
+              "type": "string",
+              "minLength": 1,
+              "description": "The enrolled account handle the call runs under."
+            },
+            "sources": {
+              "type": "object",
+              "description": "Reviewed source artifacts preloaded into the fake platform, name → content. A send may pin one via input.source; its sha256 becomes the row's source_hash.",
+              "additionalProperties": { "type": "string" }
+            },
+            "adapter": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "Fake-adapter behaviour knobs — deterministic platform responses.",
+              "properties": {
+                "read_back": {
+                  "enum": ["verify", "mismatch", "unknown"],
+                  "description": "What the platform's post-execution read-back reports: verify compares applied state to the approved input; mismatch simulates divergence (verified:false); unknown models a platform with no read-back."
+                },
+                "fail": {
+                  "type": "object",
+                  "required": ["tool", "error"],
+                  "additionalProperties": false,
+                  "properties": {
+                    "tool": { "type": "string", "minLength": 1 },
+                    "error": { "type": "string", "minLength": 1 }
+                  },
+                  "description": "The named tool's platform call errors with this message."
+                }
+              }
+            }
+          }
+        },
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/step" }
+        }
+      }
+    },
+    "step": {
+      "description": "One scenario action plus its expected gate/row assertions, discriminated by `action`.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["action", "tool", "expect"],
+          "additionalProperties": false,
+          "properties": {
+            "action": { "const": "call" },
+            "tool": { "type": "string", "minLength": 1 },
+            "arguments": {
+              "type": "object",
+              "description": "The call arguments. An `effect` key here is ignored by the gate (C2). May name a source artifact via `source`."
+            },
+            "handle": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Caller-named request handle; a retry with the same handle dedupes (existing:true)."
+            },
+            "expect": { "$ref": "#/$defs/expect" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["action", "decision", "by", "expect"],
+          "additionalProperties": false,
+          "properties": {
+            "action": { "const": "press" },
+            "decision": { "enum": ["accept", "decline"] },
+            "by": { "$ref": "#/$defs/presser" },
+            "reason": { "type": "string" },
+            "crash_after_decision": {
+              "type": "boolean",
+              "description": "Model the restart-inside-the-window case: the decision is recorded durably, then the daemon dies before execution/outcome (§5.4 step 8). The next restart step reconciles the row."
+            },
+            "expect": { "$ref": "#/$defs/expect" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["action", "source", "content", "expect"],
+          "additionalProperties": false,
+          "properties": {
+            "action": { "const": "edit_source" },
+            "source": { "type": "string", "minLength": 1 },
+            "content": { "type": "string" },
+            "uncaught": {
+              "type": "boolean",
+              "description": "The edit lands without the waiting-row cancel scan noticing — models the race §5.4 step 3 covers with the re-check inside Execute."
+            },
+            "expect": { "$ref": "#/$defs/expect" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["action", "expect"],
+          "additionalProperties": false,
+          "properties": {
+            "action": { "const": "restart" },
+            "expect": { "$ref": "#/$defs/expect" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["action", "expect"],
+          "additionalProperties": false,
+          "properties": {
+            "action": { "const": "caller_deadline" },
+            "expect": { "$ref": "#/$defs/expect" }
+          }
+        }
+      ]
+    }
+  }
+}

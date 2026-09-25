@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cadence:contracts:connected-platform:v1:tool-table",
+  "title": "Connected-platform tool table (ADR 0006 §5.2)",
+  "description": "An adapter's declared tool table, shipped and reviewed with the adapter (C2): every tool maps to exactly one effect of {read, draft, send} plus the scopes a grant must cover, and the table is pinned to the platform manifest version it was reviewed against. A table that fails this schema is a defective declaration — calls through it still gate as send (C3); validity is a review property, never a gate bypass. `label` is display-only (§5.2's AgenticOS class mapping) and never a gate input. `tools[].tool` values must be unique; uniqueness is asserted by the consumer (JSON Schema cannot express it).",
+  "type": "object",
+  "required": ["manifest_version", "platform", "tools"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string", "description": "Inert annotation: a URI naming the schema this document claims." },
+    "$comment": { "type": "string", "description": "Inert annotation: free-form note carried by the document." },
+    "manifest_version": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The platform manifest version this table was reviewed against (AOS-52 for AgenticOS). A call made while the platform reports a different — or no — manifest version gates as send (§5.2, C3 applied per version). The call never carries the version; it is platform-reported."
+    },
+    "platform": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The platform name this adapter serves (e.g. cloudflare, agenticos, fixture)."
+    },
+    "tools": {
+      "type": "array",
+      "minItems": 1,
+      "description": "One declaration per tool. Unique on `tool` (checked by the consumer).",
+      "items": {
+        "type": "object",
+        "required": ["tool", "effect", "scopes"],
+        "additionalProperties": false,
+        "properties": {
+          "tool": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The adapter tool name as exposed to agents (MCP tool name)."
+          },
+          "effect": {
+            "enum": ["read", "draft", "send"],
+            "description": "Exactly one of read|draft|send (C1). A tool missing this field, or carrying any other value, is malformed: calls against it gate as send (C3)."
+          },
+          "scopes": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 },
+            "uniqueItems": true,
+            "description": "The platform scopes a call must sit inside; the proxy checks the caller's grant (§5.3) before any traffic. May be empty only for tools needing no scope beyond the enrollment."
+          },
+          "label": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Optional. The platform's own effect class where it differs from cadence's vocabulary (§5.2's AgenticOS mapping). Display only — never a gate input."
+          }
+        }
+      }
+    }
+  }
+}

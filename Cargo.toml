@@ -59,6 +59,7 @@ path = "tests/e2e_mvp.rs"
 required-features = ["e2e"]
 
 [dev-dependencies]
+jsonschema = { version = "=0.56.0", default-features = false }
 shlex = "2.0.1"
 
 # Lanes build privately (CAD-174: a shared target let one lane overwrite

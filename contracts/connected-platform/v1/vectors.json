@@ -1,0 +1,1131 @@
+{
+  "$schema": "./vector.schema.json",
+  "fixture": "connected-platform",
+  "version": 1,
+  "comment": "ADR 0006 §5.6 worked vectors — the machine-readable copy of the contract both Cadence (CAD-506) and AgenticOS (AOS-49/52) test against. See README.md for the step/expect semantics. Specimen `record` values embed sha256 hashes of the declared source contents (e.g. deploy-plan v1 hashes to sha256:ee7dbcc5…).",
+  "vectors": [
+    {
+      "id": "declared-read-executes",
+      "summary": "A tool declared `read` executes through the proxy at call time; no pending effect is staged (§5.2).",
+      "contract": [
+        "C1",
+        "C2",
+        "§5.2"
+      ],
+      "given": {
+        "tool_table": "default",
+        "reported_manifest_version": "1",
+        "agent": "swe-505",
+        "account": "acct-1"
+      },
+      "steps": [
+        {
+          "action": "call",
+          "tool": "widgets.list",
+          "arguments": {
+            "limit": 5
+          },
+          "expect": {
+            "result": "executed",
+            "fired": true,
+            "state": null
+          }
+        }
+      ]
+    },
+    {
+      "id": "declared-draft-executes",
+      "summary": "A `draft` tool executes at once like a read — it produces only a revocable artifact and surfaces as an information-only row, never a pending effect (§5.2, §7 Q3).",
+      "contract": [
+        "C1",
+        "§5.2"
+      ],
+      "given": {
+        "tool_table": "default",
+        "reported_manifest_version": "1",
+        "agent": "swe-505",
+        "account": "acct-1"
+      },
+      "steps": [
+        {
+          "action": "call",
+          "tool": "widgets.preview",
+          "arguments": {
+            "widget": "w1"
+          },
+          "expect": {
+            "result": "executed",
+            "fired": true,
+            "state": null
+          }
+        }
+      ]
+    },
+    {
+      "id": "undeclared-tool-parks-as-send",
+      "summary": "A tool missing from the table gates as send (C3): the call stages a pending effect instead of executing, so a forgotten declaration surfaces as friction, not a bypass.",
+      "contract": [
+        "C3",
+        "§5.2"
+      ],
+      "given": {
+        "tool_table": "default",
+        "reported_manifest_version": "1",
+        "agent": "swe-505",
+        "account": "acct-1"
+      },
+      "steps": [
+        {
+          "action": "call",
+          "tool": "widgets.exfiltrate",
+          "arguments": {
+            "all": true
+          },
+          "expect": {
+            "result": "staged",
+            "effect_id": true,
+            "fired": false,
+            "state": "waiting",
+            "record": {
+              "request": "req-undeclared-1",
+              "kind": "effect",
+              "agent": "swe-505",
+              "platform": "fixture",
+              "account": "acct-1",
+              "tool": "widgets.exfiltrate",
+              "effect": "send",
+              "input_summary": "widgets.exfiltrate {\"all\":true}",
+              "input": {
+                "all": true
+              },
+              "preview": "widgets.exfiltrate on fixture/acct-1: {\"all\":true}",
+              "effect_id": "eff-undeclared-1",
+              "state": "waiting"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "unknown-effect-parks-as-send",
+      "summary": "A table entry declaring an effect outside read|draft|send is malformed (C1); calls against it gate as send (C3). The table itself is schema-invalid — table_valid:false asserts the fixture schema rejects it.",
+      "contract": [
+        "C1",
+        "C3",
+        "§5.2"
+      ],
+      "given": {
+        "tool_table": {
+          "manifest_version": "1",
+          "platform": "fixture",
+          "tools": [
+            {
+              "tool": "widgets.teleport",
+              "effect": "teleport",
+              "scopes": [
+                "widgets:write"
+              ]
+            }
+          ]
+        },
+        "table_valid": false,
+        "reported_manifest_version": "1",
+        "agent": "swe-505",
+        "account": "acct-1"
+      },
+      "steps": [
+        {
+          "action": "call",
+          "tool": "widgets.teleport",
+          "arguments": {
+            "widget": "w1",
+            "to": "prod"
+          },
+          "expect": {
+            "result": "staged",
+            "effect_id": true,
+            "fired": false,
+            "state": "waiting"
+          }
+        }
+      ]
+    },
+    {
+      "id": "missing-effect-parks-as-send",
+      "summary": "A table entry with no `effect` field is a malformed declaration; calls against it gate as send (C3's absent-field case).",
+      "contract": [
+        "C3",
+        "§5.2"
+      ],
+      "given": {
+        "tool_table": {
+          "manifest_version": "1",
+          "platform": "fixture",
+          "tools": [
+            {
+              "tool": "widgets.odd",
+              "scopes": [
+                "widgets:read"
+              ]
+            }
+          ]
+        },
+        "table_valid": false,
+        "reported_manifest_version": "1",
+        "agent": "swe-505",
+        "account": "acct-1"
+      },
+      "steps": [
+        {
+          "action": "call",
+          "tool": "widgets.odd",
+          "arguments": {},
+          "expect": {
+            "result": "staged",
+            "effect_id": true,
+            "fired": false,
+            "state": "waiting"
+          }
+        }
+      ]
+    },
+    {
+      "id": "manifest-version-mismatch-parks",
+      "summary": "The table is pinned to manifest version \"1\"; the platform reports \"2\". Every call under a mismatched manifest gates as send — even a declared read (§5.2, C3 per version).",
+      "contract": [
+        "C3",
+        "§5.2"
+      ],
+      "given": {
+        "tool_table": "default",
+        "reported_manifest_version": "2",
+        "agent": "swe-505",
+        "account": "acct-1"
+      },
+      "steps": [
+        {
+          "action": "call",
+          "tool": "widgets.list",
+          "arguments": {
+            "limit": 5
+          },
+          "expect": {
+            "result": "staged",
+            "effect_id": true,
+            "fired": false,
+            "state": "waiting"
+          }
+        }
+      ]
+    },
+    {
+      "id": "manifest-version-undeclared-parks",
+      "summary": "The platform reports no manifest version at all (null). An undeclared version is undeclared all the way down: calls gate as send (§5.2).",
+      "contract": [
+        "C3",
+        "§5.2"
+      ],
+      "given": {
+        "tool_table": "default",
+        "reported_manifest_version": null,
+        "agent": "swe-505",
+        "account": "acct-1"
+      },
+      "steps": [
+        {
+          "action": "call",
+          "tool": "widgets.list",
+          "arguments": {},
+          "expect": {
+            "result": "staged",
+            "effect_id": true,
+            "fired": false,
+            "state": "waiting"
+          }
+        }
+      ]
+    },
+    {
+      "id": "effect-argument-ignored",
+      "summary": "An `effect` key in call arguments is not a declaration (C2): a send tool stays send when the caller claims `read`, and a read tool stays read when the caller claims `send`.",
+      "contract": [
+        "C2",
+        "§5.2"
+      ],
+      "given": {
+        "tool_table": "default",
+        "reported_manifest_version": "1",
+        "agent": "swe-505",
+        "account": "acct-1"
+      },
+      "steps": [
+        {
+          "action": "call",
+          "tool": "widgets.publish",
+          "arguments": {
+            "widget": "w1",
+            "effect": "read"
+          },
+          "expect": {
+            "result": "staged",
+            "effect_id": true,
+            "fired": false,
+            "state": "waiting"
+          }
+        },
+        {
+          "action": "call",
+          "tool": "widgets.list",
+          "arguments": {
+            "limit": 5,
+            "effect": "send"
+          },
+          "expect": {
+            "result": "executed",
+            "fired": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "send-stages-executes-on-accept",
+      "summary": "The send lifecycle spine (C5, C6, §5.4): the call returns staged + effect_id at once; a retried call with the same handle dedupes (existing); the operator's accept executes the exact staged input once, verified true, outcome delivered as a message; a second press cannot re-fire.",
+      "contract": [
+        "C5",
+        "C6",
+        "C9",
+        "C10",
+        "§5.4"
+      ],
+      "given": {
+        "tool_table": "default",
+        "reported_manifest_version": "1",
+        "agent": "swe-505",
+        "account": "acct-1",
+        "sources": {
+          "deploy-plan": "widget=w1; target=production; rev=2026-09-25"
+        }
+      },
+      "steps": [
+        {
+          "action": "call",
+          "tool": "widgets.publish",
+          "handle": "deploy-w1",
+          "arguments": {
+            "widget": "w1",
+            "source": "deploy-plan"
+          },
+          "expect": {
+            "result": "staged",
+            "effect_id": true,
+            "fired": false,
+            "executions": 0,
+            "state": "waiting",
+            "record": {
+              "request": "req-deploy-w1",
+              "kind": "effect",
+              "agent": "swe-505",
+              "platform": "fixture",
+              "account": "acct-1",
+              "tool": "widgets.publish",
+              "effect": "send",
+              "input_summary": "widgets.publish widget=w1 (deploy-plan)",
+              "input": {
+                "widget": "w1",
+                "source": "deploy-plan"
+              },
+              "preview": "publish w1 to fixture/acct-1 from deploy-plan@sha256:ee7dbcc52faa7b9d053af4ae05dd7f061f0798acd11a9585c0e7ca02c4b945c6",
+              "source_hash": "sha256:ee7dbcc52faa7b9d053af4ae05dd7f061f0798acd11a9585c0e7ca02c4b945c6",
+              "label": "deploy",
+              "effect_id": "eff-deploy-w1",
+              "state": "waiting"
+            }
+          }
+        },
+        {
+          "action": "call",
+          "tool": "widgets.publish",
+          "handle": "deploy-w1",
+          "arguments": {
+            "widget": "w1",
+            "source": "deploy-plan"
+          },
+          "expect": {
+            "result": "existing",
+            "fired": false,
+            "executions": 0
+          }
+        },
+        {
+          "action": "press",
+          "decision": "accept",
+          "by": {
+            "member": "operator",
+            "role": "operator",
+            "rule": "operator-only"
+          },
+          "expect": {
+            "press": "applied",
+            "fired": true,
+            "executions": 1,
+            "state": "done",
+            "verified": true,
+            "delivered": "message",
+            "record": {
+              "request": "req-deploy-w1",
+              "kind": "effect",
+              "agent": "swe-505",
+              "platform": "fixture",
+              "account": "acct-1",
+              "tool": "widgets.publish",
+              "effect": "send",
+              "input_summary": "widgets.publish widget=w1 (deploy-plan)",
+              "input": {
+                "widget": "w1",
+                "source": "deploy-plan"
+              },
+              "preview": "publish w1 to fixture/acct-1 from deploy-plan@sha256:ee7dbcc52faa7b9d053af4ae05dd7f061f0798acd11a9585c0e7ca02c4b945c6",
+              "source_hash": "sha256:ee7dbcc52faa7b9d053af4ae05dd7f061f0798acd11a9585c0e7ca02c4b945c6",
+              "label": "deploy",
+              "effect_id": "eff-deploy-w1",
+              "state": "done",
+              "decision": {
+                "by": {
+                  "member": "operator",
+                  "role": "operator",
+                  "rule": "operator-only"
+                },
+                "at": "2026-09-25T06:00:00Z"
+              },
+              "outcome": {
+                "result": {
+                  "widget": "w1",
+                  "published": true,
+                  "platform_ref": "fixture://widgets/w1"
+                },
+                "verified": true
+              }
+            }
+          }
+        },
+        {
+          "action": "press",
+          "decision": "accept",
+          "by": {
+            "member": "operator",
+            "role": "operator",
+            "rule": "operator-only"
+          },
+          "expect": {
+            "press": "refused",
+            "fired": false,
+            "executions": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "decline-never-fires",
+      "summary": "A decline — here by the requester's PM, since anyone authorised may decline — parks the reason and the effect never runs (§5.4 step 4–5). A later accept is refused: declined is terminal.",
+      "contract": [
+        "C6",
+        "§5.4"
+      ],
+      "given": {
+        "tool_table": "default",
+        "reported_manifest_version": "1",
+        "agent": "swe-505",
+        "account": "acct-1"
+      },
+      "steps": [
+        {
+          "action": "call",
+          "tool": "widgets.publish",
+          "arguments": {
+            "widget": "w1"
+          },
+          "expect": {
+            "result": "staged",
+            "effect_id": true,
+            "fired": false,
+            "state": "waiting"
+          }
+        },
+        {
+          "action": "press",
+          "decision": "decline",
+          "reason": "not this week",
+          "by": {
+            "member": "op-pm",
+            "role": "pm",
+            "rule": "authorised-decline"
+          },
+          "expect": {
+            "press": "applied",
+            "fired": false,
+            "executions": 0,
+            "state": "declined",
+            "record": {
+              "request": "req-decline-1",
+              "kind": "effect",
+              "agent": "swe-505",
+              "platform": "fixture",
+              "account": "acct-1",
+              "tool": "widgets.publish",
+              "effect": "send",
+              "input_summary": "widgets.publish widget=w1",
+              "input": {
+                "widget": "w1"
+              },
+              "preview": "publish w1 to fixture/acct-1",
+              "label": "deploy",
+              "effect_id": "eff-decline-1",
+              "state": "declined",
+              "decision": {
+                "by": {
+                  "member": "op-pm",
+                  "role": "pm",
+                  "rule": "authorised-decline"
+                },
+                "at": "2026-09-25T06:05:00Z",
+                "reason": "not this week"
+              }
+            }
+          }
+        },
+        {
+          "action": "press",
+          "decision": "accept",
+          "by": {
+            "member": "operator",
+            "role": "operator",
+            "rule": "operator-only"
+          },
+          "expect": {
+            "press": "refused",
+            "fired": false,
+            "executions": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "non-operator-accept-refused",
+      "summary": "Release is operator-only in v1 (C6, §5.4 step 4): a PM pressing accept is refused, and the requesting agent pressing accept — an agent answering its own pending effect — is refused. Neither refusal touches the row: it stays waiting, nothing fires, and the operator's accept afterwards still executes once.",
+      "contract": [
+        "C6",
+        "§5.4"
+      ],
+      "given": {
+        "tool_table": "default",
+        "reported_manifest_version": "1",
+        "agent": "swe-505",
+        "account": "acct-1"
+      },
+      "steps": [
+        {
+          "action": "call",
+          "tool": "widgets.publish",
+          "arguments": {
+            "widget": "w1"
+          },
+          "expect": {
+            "result": "staged",
+            "effect_id": true,
+            "fired": false,
+            "executions": 0,
+            "state": "waiting"
+          }
+        },
+        {
+          "action": "press",
+          "decision": "accept",
+          "by": {
+            "member": "op-pm",
+            "role": "pm",
+            "rule": "operator-only"
+          },
+          "expect": {
+            "press": "refused",
+            "fired": false,
+            "executions": 0,
+            "state": "waiting",
+            "record": {
+              "request": "req-c6-1",
+              "kind": "effect",
+              "agent": "swe-505",
+              "platform": "fixture",
+              "account": "acct-1",
+              "tool": "widgets.publish",
+              "effect": "send",
+              "input_summary": "widgets.publish widget=w1",
+              "input": {
+                "widget": "w1"
+              },
+              "preview": "publish w1 to fixture/acct-1",
+              "label": "deploy",
+              "effect_id": "eff-c6-1",
+              "state": "waiting"
+            }
+          }
+        },
+        {
+          "action": "press",
+          "decision": "accept",
+          "by": {
+            "member": "swe-505",
+            "role": "agent",
+            "rule": "operator-only"
+          },
+          "expect": {
+            "press": "refused",
+            "fired": false,
+            "executions": 0,
+            "state": "waiting"
+          }
+        },
+        {
+          "action": "press",
+          "decision": "accept",
+          "by": {
+            "member": "operator",
+            "role": "operator",
+            "rule": "operator-only"
+          },
+          "expect": {
+            "press": "applied",
+            "fired": true,
+            "executions": 1,
+            "state": "done",
+            "verified": true,
+            "delivered": "message"
+          }
+        }
+      ]
+    },
+    {
+      "id": "agent-decline-allowed",
+      "summary": "Decline stays open to anyone authorised (C6, §5.4 step 4) — including a PM that is itself an agent. The decline applies, parks the reason, never fires; only release is gated on the operator.",
+      "contract": [
+        "C6",
+        "§5.4"
+      ],
+      "given": {
+        "tool_table": "default",
+        "reported_manifest_version": "1",
+        "agent": "swe-505",
+        "account": "acct-1"
+      },
+      "steps": [
+        {
+          "action": "call",
+          "tool": "widgets.publish",
+          "arguments": {
+            "widget": "w1"
+          },
+          "expect": {
+            "result": "staged",
+            "effect_id": true,
+            "fired": false,
+            "state": "waiting"
+          }
+        },
+        {
+          "action": "press",
+          "decision": "decline",
+          "reason": "wrong window",
+          "by": {
+            "member": "pm-agent",
+            "role": "agent",
+            "rule": "authorised-decline"
+          },
+          "expect": {
+            "press": "applied",
+            "fired": false,
+            "executions": 0,
+            "state": "declined",
+            "record": {
+              "request": "req-c6-2",
+              "kind": "effect",
+              "agent": "swe-505",
+              "platform": "fixture",
+              "account": "acct-1",
+              "tool": "widgets.publish",
+              "effect": "send",
+              "input_summary": "widgets.publish widget=w1",
+              "input": {
+                "widget": "w1"
+              },
+              "preview": "publish w1 to fixture/acct-1",
+              "label": "deploy",
+              "effect_id": "eff-c6-2",
+              "state": "declined",
+              "decision": {
+                "by": {
+                  "member": "pm-agent",
+                  "role": "agent",
+                  "rule": "authorised-decline"
+                },
+                "at": "2026-09-25T06:20:00Z",
+                "reason": "wrong window"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "source-edit-cancels",
+      "summary": "Editing the source artifact a staged send was hashed from cancels the pending effect while it waits (§5.4 step 3): the row closes source_changed and nothing fires.",
+      "contract": [
+        "§5.4"
+      ],
+      "given": {
+        "tool_table": "default",
+        "reported_manifest_version": "1",
+        "agent": "swe-505",
+        "account": "acct-1",
+        "sources": {
+          "deploy-plan": "widget=w1; target=production; rev=2026-09-25"
+        }
+      },
+      "steps": [
+        {
+          "action": "call",
+          "tool": "widgets.publish",
+          "arguments": {
+            "widget": "w1",
+            "source": "deploy-plan"
+          },
+          "expect": {
+            "result": "staged",
+            "effect_id": true,
+            "fired": false,
+            "state": "waiting"
+          }
+        },
+        {
+          "action": "edit_source",
+          "source": "deploy-plan",
+          "content": "widget=w2; target=production; rev=2026-09-25",
+          "expect": {
+            "state": "closed",
+            "close_reason": "source_changed",
+            "fired": false,
+            "executions": 0,
+            "record": {
+              "request": "req-source-edit-1",
+              "kind": "effect",
+              "agent": "swe-505",
+              "platform": "fixture",
+              "account": "acct-1",
+              "tool": "widgets.publish",
+              "effect": "send",
+              "input_summary": "widgets.publish widget=w1 (deploy-plan)",
+              "input": {
+                "widget": "w1",
+                "source": "deploy-plan"
+              },
+              "preview": "publish w1 to fixture/acct-1 from deploy-plan@sha256:ee7dbcc52faa7b9d053af4ae05dd7f061f0798acd11a9585c0e7ca02c4b945c6",
+              "source_hash": "sha256:ee7dbcc52faa7b9d053af4ae05dd7f061f0798acd11a9585c0e7ca02c4b945c6",
+              "label": "deploy",
+              "effect_id": "eff-source-edit-1",
+              "state": "closed",
+              "close_reason": "source_changed"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "press-rechecks-source",
+      "summary": "A source edit the waiting-row scan missed is still caught inside Execute: the accept press re-verifies source_hash before firing and cancels instead of executing (§5.4 step 3's race clause).",
+      "contract": [
+        "§5.4"
+      ],
+      "given": {
+        "tool_table": "default",
+        "reported_manifest_version": "1",
+        "agent": "swe-505",
+        "account": "acct-1",
+        "sources": {
+          "deploy-plan": "widget=w1; target=production; rev=2026-09-25"
+        }
+      },
+      "steps": [
+        {
+          "action": "call",
+          "tool": "widgets.publish",
+          "arguments": {
+            "widget": "w1",
+            "source": "deploy-plan"
+          },
+          "expect": {
+            "result": "staged",
+            "effect_id": true,
+            "fired": false,
+            "state": "waiting"
+          }
+        },
+        {
+          "action": "edit_source",
+          "source": "deploy-plan",
+          "content": "widget=w2; target=production; rev=2026-09-25",
+          "uncaught": true,
+          "expect": {
+            "state": "waiting",
+            "fired": false
+          }
+        },
+        {
+          "action": "press",
+          "decision": "accept",
+          "by": {
+            "member": "operator",
+            "role": "operator",
+            "rule": "operator-only"
+          },
+          "expect": {
+            "press": "applied",
+            "state": "closed",
+            "close_reason": "source_changed",
+            "fired": false,
+            "executions": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "verified-false-raises-needs-you",
+      "summary": "The send executes but the adapter's read-back does not match the approved input: outcome.verified is false and a Needs-you item is raised (C10, §5.4 step 6). The effect ran — the row is done, not failed.",
+      "contract": [
+        "C10",
+        "§5.4"
+      ],
+      "given": {
+        "tool_table": "default",
+        "reported_manifest_version": "1",
+        "agent": "swe-505",
+        "account": "acct-1",
+        "adapter": {
+          "read_back": "mismatch"
+        }
+      },
+      "steps": [
+        {
+          "action": "call",
+          "tool": "widgets.publish",
+          "arguments": {
+            "widget": "w1"
+          },
+          "expect": {
+            "result": "staged",
+            "effect_id": true,
+            "state": "waiting"
+          }
+        },
+        {
+          "action": "press",
+          "decision": "accept",
+          "by": {
+            "member": "operator",
+            "role": "operator",
+            "rule": "operator-only"
+          },
+          "expect": {
+            "press": "applied",
+            "fired": true,
+            "executions": 1,
+            "state": "done",
+            "verified": false,
+            "needs_you": true,
+            "delivered": "message",
+            "record": {
+              "request": "req-verify-1",
+              "kind": "effect",
+              "agent": "swe-505",
+              "platform": "fixture",
+              "account": "acct-1",
+              "tool": "widgets.publish",
+              "effect": "send",
+              "input_summary": "widgets.publish widget=w1",
+              "input": {
+                "widget": "w1"
+              },
+              "preview": "publish w1 to fixture/acct-1",
+              "label": "deploy",
+              "effect_id": "eff-verify-1",
+              "state": "done",
+              "decision": {
+                "by": {
+                  "member": "operator",
+                  "role": "operator",
+                  "rule": "operator-only"
+                },
+                "at": "2026-09-25T06:10:00Z"
+              },
+              "outcome": {
+                "result": {
+                  "widget": "w1",
+                  "published": true,
+                  "platform_ref": "fixture://widgets/w1"
+                },
+                "verified": false
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "execute-fails-failed",
+      "summary": "The accept fires but the platform call errors: the row lands failed — distinct from declined (never ran) and closed (cancelled before release) — with the platform error as the outcome (§5.4 step 6).",
+      "contract": [
+        "C6",
+        "§5.4"
+      ],
+      "given": {
+        "tool_table": "default",
+        "reported_manifest_version": "1",
+        "agent": "swe-505",
+        "account": "acct-1",
+        "adapter": {
+          "fail": {
+            "tool": "widgets.publish",
+            "error": "platform rejected the deploy"
+          },
+          "read_back": "unknown"
+        }
+      },
+      "steps": [
+        {
+          "action": "call",
+          "tool": "widgets.publish",
+          "arguments": {
+            "widget": "w1"
+          },
+          "expect": {
+            "result": "staged",
+            "effect_id": true,
+            "state": "waiting"
+          }
+        },
+        {
+          "action": "press",
+          "decision": "accept",
+          "by": {
+            "member": "operator",
+            "role": "operator",
+            "rule": "operator-only"
+          },
+          "expect": {
+            "press": "applied",
+            "fired": true,
+            "executions": 1,
+            "state": "failed",
+            "verified": "unknown",
+            "delivered": "message"
+          }
+        }
+      ]
+    },
+    {
+      "id": "restart-reconciles-accepted-never-refires",
+      "summary": "Restart in the dangerous window (C7, §5.4 step 8): the accept is recorded durably but execution is unproven. The row reconciles for an operator decision and is never re-fired automatically — even here, where nothing provably ran.",
+      "contract": [
+        "C7",
+        "§5.4"
+      ],
+      "given": {
+        "tool_table": "default",
+        "reported_manifest_version": "1",
+        "agent": "swe-505",
+        "account": "acct-1"
+      },
+      "steps": [
+        {
+          "action": "call",
+          "tool": "widgets.publish",
+          "arguments": {
+            "widget": "w1"
+          },
+          "expect": {
+            "result": "staged",
+            "effect_id": true,
+            "state": "waiting"
+          }
+        },
+        {
+          "action": "press",
+          "decision": "accept",
+          "by": {
+            "member": "operator",
+            "role": "operator",
+            "rule": "operator-only"
+          },
+          "crash_after_decision": true,
+          "expect": {
+            "press": "applied",
+            "state": "decided",
+            "fired": false,
+            "executions": 0
+          }
+        },
+        {
+          "action": "restart",
+          "expect": {
+            "state": "reconcile",
+            "fired": false,
+            "executions": 0,
+            "record": {
+              "request": "req-reconcile-1",
+              "kind": "effect",
+              "agent": "swe-505",
+              "platform": "fixture",
+              "account": "acct-1",
+              "tool": "widgets.publish",
+              "effect": "send",
+              "input_summary": "widgets.publish widget=w1",
+              "input": {
+                "widget": "w1"
+              },
+              "preview": "publish w1 to fixture/acct-1",
+              "label": "deploy",
+              "effect_id": "eff-reconcile-1",
+              "state": "reconcile",
+              "decision": {
+                "by": {
+                  "member": "operator",
+                  "role": "operator",
+                  "rule": "operator-only"
+                },
+                "at": "2026-09-25T06:30:00Z"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "restart-reparks-waiting",
+      "summary": "A waiting row is durable across restart (§5.4 step 8): it re-parks, a retried stage call with the same handle still dedupes to the existing effect, and the press afterwards executes exactly once.",
+      "contract": [
+        "C7",
+        "C9",
+        "§5.4"
+      ],
+      "given": {
+        "tool_table": "default",
+        "reported_manifest_version": "1",
+        "agent": "swe-505",
+        "account": "acct-1"
+      },
+      "steps": [
+        {
+          "action": "call",
+          "tool": "widgets.publish",
+          "handle": "deploy-w9",
+          "arguments": {
+            "widget": "w9"
+          },
+          "expect": {
+            "result": "staged",
+            "effect_id": true,
+            "state": "waiting"
+          }
+        },
+        {
+          "action": "restart",
+          "expect": {
+            "state": "waiting",
+            "fired": false,
+            "executions": 0
+          }
+        },
+        {
+          "action": "call",
+          "tool": "widgets.publish",
+          "handle": "deploy-w9",
+          "arguments": {
+            "widget": "w9"
+          },
+          "expect": {
+            "result": "existing",
+            "fired": false,
+            "executions": 0
+          }
+        },
+        {
+          "action": "press",
+          "decision": "accept",
+          "by": {
+            "member": "operator",
+            "role": "operator",
+            "rule": "operator-only"
+          },
+          "expect": {
+            "press": "applied",
+            "fired": true,
+            "executions": 1,
+            "state": "done",
+            "verified": true,
+            "delivered": "message"
+          }
+        }
+      ]
+    },
+    {
+      "id": "caller-deadline-ends-only-wait",
+      "summary": "The durable row, not the caller, owns the lifecycle (§5.4 step 7): a caller deadline ends only its wait — the row stays waiting, and the operator's accept afterwards is still authoritative and executes once.",
+      "contract": [
+        "C5",
+        "§5.4"
+      ],
+      "given": {
+        "tool_table": "default",
+        "reported_manifest_version": "1",
+        "agent": "swe-505",
+        "account": "acct-1"
+      },
+      "steps": [
+        {
+          "action": "call",
+          "tool": "widgets.publish",
+          "arguments": {
+            "widget": "w1"
+          },
+          "expect": {
+            "result": "staged",
+            "effect_id": true,
+            "state": "waiting"
+          }
+        },
+        {
+          "action": "caller_deadline",
+          "expect": {
+            "wait": "ended",
+            "state": "waiting",
+            "fired": false,
+            "executions": 0
+          }
+        },
+        {
+          "action": "press",
+          "decision": "accept",
+          "by": {
+            "member": "operator",
+            "role": "operator",
+            "rule": "operator-only"
+          },
+          "expect": {
+            "press": "applied",
+            "fired": true,
+            "executions": 1,
+            "state": "done",
+            "delivered": "message"
+          }
+        }
+      ]
+    }
+  ]
+}
