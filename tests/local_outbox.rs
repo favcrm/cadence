@@ -363,7 +363,11 @@ fn http_parts(reply: &str) -> (u16, String) {
         .nth(1)
         .and_then(|c| c.parse().ok())
         .unwrap_or(0);
-    let body = reply.splitn(2, "\r\n\r\n").nth(1).unwrap_or("").to_string();
+    let body = reply
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b)
+        .unwrap_or("")
+        .to_string();
     (status, body)
 }
 
