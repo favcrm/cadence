@@ -1297,7 +1297,7 @@ fn utf8_straddling_every_text_cap_cannot_panic() {
         fn read_back(&self, tool: &str, input: &Value) -> Verified {
             self.0.read_back(tool, input)
         }
-        fn source_hash(&self, source: &str) -> Option<String> {
+        fn source_hash(&self, _agent: &str, source: &str) -> Option<String> {
             self.0.source_hash(source)
         }
     }

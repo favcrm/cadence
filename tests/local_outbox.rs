@@ -426,6 +426,25 @@ fn mode(path: &Path) -> u32 {
     std::fs::metadata(path).unwrap().permissions().mode() & 0o777
 }
 
+/// One effect row straight from the store — no scan, no RPC. The
+/// press answers the pre-close projection (the close lands in the
+/// same call), so a `source_changed` assertion reads the durable row.
+fn stored_row(d: &Daemon, request: &str) -> Option<Value> {
+    let conn = d.db();
+    conn.query_row(
+        "SELECT state, close_reason, effect_id FROM platform_effects WHERE request=?1",
+        rusqlite::params![request],
+        |r| {
+            Ok(json!({
+                "state": r.get::<_, String>(0)?,
+                "close_reason": r.get::<_, Option<String>>(1)?,
+                "effect_id": r.get::<_, String>(2)?,
+            }))
+        },
+    )
+    .ok()
+}
+
 /// `publish` input naming a project/title/body plus attachments.
 fn publish_input(project: &str, attachments: &[&str]) -> Value {
     json!({
@@ -794,6 +813,119 @@ fn unknown_tool_gates_send_then_refuses() {
         .contains("no tool"));
 }
 
+/// CAD-553: the worktree root is opened with no symlink following.
+/// Between stage and execute a same-uid caller swaps its worktree dir
+/// for a symlink to another real directory holding *identical* bytes —
+/// the attachment pin cannot tell them apart, so only the root's
+/// no-follow open can. Mutation pin: drop the no-follow open and the
+/// swapped file lands `done`.
+#[test]
+fn worktree_root_swap_refuses_execute() {
+    let d = Daemon::start();
+    let wt = TempDir::new().unwrap();
+    let wt_root = wt.path().join("root");
+    std::fs::create_dir_all(&wt_root).unwrap();
+    std::fs::write(wt_root.join("a.txt"), b"SAME-BYTES").unwrap();
+    // The swap target holds byte-identical attachments: identical
+    // digests make the pin alone blind to the redirect.
+    let elsewhere = TempDir::new().unwrap();
+    std::fs::write(elsewhere.path().join("a.txt"), b"SAME-BYTES").unwrap();
+    let mut sw = Lane::spawn_as(&d, "sw", &wt_root, None, "worker");
+    enroll(&d, "outbox");
+    grant(&d, "sw", "outbox");
+
+    let eid = stage(
+        &d,
+        &mut sw,
+        "req-swap",
+        publish_input("cadence", &["a.txt"]),
+    );
+    let row = effect_row(&d, "req-swap").expect("staged row");
+    assert!(
+        row["source_hash"]
+            .as_str()
+            .is_some_and(|h| h.starts_with("sha256:")),
+        "attachments staged without a pin: {row}"
+    );
+
+    // Swap: the registered path itself becomes a symlink to elsewhere.
+    let moved = wt.path().join("root-moved");
+    std::fs::rename(&wt_root, &moved).unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), &wt_root).unwrap();
+
+    let row = press(&d, "sw", "req-swap");
+    assert_eq!(row["state"], "failed", "{row:?}");
+    let err = row["outcome"]["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("symlink"),
+        "refusal does not name the cause: {err}"
+    );
+    assert!(
+        !d.outbox.join("cadence").join(&eid).exists(),
+        "an item landed for a swapped worktree root"
+    );
+}
+
+/// CAD-553: attachment bytes are pinned at stage — the digest rides
+/// the staged `source_hash` and the preview's per-attachment digests,
+/// and a post-stage change (or deletion) closes the effect
+/// `source_changed` at release, writing nothing. Mutation pin: hash
+/// the descriptor string rather than the bytes and the change goes
+/// undetected — the item lands `done` and this test fails.
+#[test]
+fn attachment_change_after_stage_closes_source_changed() {
+    let d = Daemon::start();
+    let wt = TempDir::new().unwrap();
+    let wt_root = wt.path().join("root");
+    std::fs::create_dir_all(&wt_root).unwrap();
+    std::fs::write(wt_root.join("a.txt"), b"V1-BYTES").unwrap();
+    std::fs::write(wt_root.join("b.txt"), b"STABLE").unwrap();
+    let mut sw = Lane::spawn_as(&d, "sw", &wt_root, None, "worker");
+    enroll(&d, "outbox");
+    grant(&d, "sw", "outbox");
+
+    // Changed bytes: the pin must catch it inside Execute's re-verify.
+    let eid = stage(
+        &d,
+        &mut sw,
+        "req-pin",
+        publish_input("cadence", &["a.txt", "b.txt"]),
+    );
+    let row = effect_row(&d, "req-pin").expect("staged row");
+    let pin = row["source_hash"].as_str().unwrap_or_default();
+    assert!(pin.starts_with("sha256:"), "attachments unpinned: {row}");
+    let preview = row["preview"].as_str().unwrap_or_default();
+    assert!(preview.contains("a.txt"), "{preview}");
+    assert!(
+        preview.contains("sha256:"),
+        "pin digests not in preview: {preview}"
+    );
+    std::fs::write(wt_root.join("a.txt"), b"V2-CHANGED").unwrap();
+    press(&d, "sw", "req-pin");
+    let row = stored_row(&d, "req-pin").expect("the row");
+    assert_eq!(row["state"], json!("closed"), "{row:?}");
+    assert_eq!(row["close_reason"], json!("source_changed"), "{row:?}");
+    let (_, body) = outcome_message(&d, &eid).expect("the delivered outcome");
+    assert!(body.contains("closed (source_changed)"), "{body}");
+    assert!(
+        !d.outbox.join("cadence").join(&eid).exists(),
+        "an item landed for changed attachments"
+    );
+
+    // Deletion is a change too — the pin cannot resolve, the effect
+    // closes the same way.
+    let eid = stage(&d, &mut sw, "req-del", publish_input("cadence", &["b.txt"]));
+    std::fs::remove_file(wt_root.join("b.txt")).unwrap();
+    press(&d, "sw", "req-del");
+    let row = stored_row(&d, "req-del").expect("the row");
+    assert_eq!(row["state"], json!("closed"), "{row:?}");
+    assert_eq!(row["close_reason"], json!("source_changed"), "{row:?}");
+    assert!(
+        !d.outbox.join("cadence").join(&eid).exists(),
+        "an item landed for a deleted attachment"
+    );
+}
+
 /// The `source_hash` pin runs for `local` unchanged: `input.source`
 /// naming an artifact the adapter does not hold is refused at stage —
 /// never staged unpinned.
@@ -812,6 +944,41 @@ fn source_pin_refuses_unknown_artifact() {
         json!({"platform": "local", "account": "outbox",
                "tool": "publish", "input": input,
                "request": "req-src"}),
+    ));
+    assert!(err.contains("cannot be pinned"), "{err}");
+}
+
+/// rev-311 mutation probe: a caller-named `local-attachments:`
+/// descriptor must name the *requester's* own registered worktree —
+/// a peer's `agents.cwd` is not the caller's to pin. Correct
+/// behavior: the stage is refused, no digests of the peer's bytes
+/// ever land on the row.
+#[test]
+fn caller_named_source_may_not_name_a_peers_worktree() {
+    let d = Daemon::start();
+    let wt = TempDir::new().unwrap();
+    let a_root = wt.path().join("a");
+    let b_root = wt.path().join("b");
+    std::fs::create_dir_all(&a_root).unwrap();
+    std::fs::create_dir_all(&b_root).unwrap();
+    std::fs::write(a_root.join("mine.txt"), b"A-BYTES").unwrap();
+    std::fs::write(b_root.join("secret.txt"), b"PEER-SECRET-BYTES").unwrap();
+    let mut a = Lane::spawn_as(&d, "a-lane", &a_root, None, "worker");
+    let _b = Lane::spawn_as(&d, "b-lane", &b_root, None, "worker");
+    enroll(&d, "outbox");
+    grant(&d, "a-lane", "outbox");
+
+    let mut input = publish_input("cadence", &["mine.txt"]);
+    input["source"] = json!(format!(
+        "local-attachments:{}",
+        json!({"root": b_root.canonicalize().unwrap(), "paths": ["secret.txt"]})
+    ));
+    let err = refused(a.rpc(
+        &d,
+        "platform_call",
+        json!({"platform": "local", "account": "outbox",
+               "tool": "publish", "input": input,
+               "request": "req-peer"}),
     ));
     assert!(err.contains("cannot be pinned"), "{err}");
 }

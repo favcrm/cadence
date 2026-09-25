@@ -12,7 +12,10 @@
 //! - `attachments/<name>` — byte copies of the declared attachment
 //!   files, confined to the *requesting task's* worktree: an
 //!   attachment path containing `..`, any symlink component, or an
-//!   absolute path outside that worktree refuses the whole call;
+//!   absolute path outside that worktree refuses the whole call, and
+//!   the worktree root itself is opened with no symlink following —
+//!   a same-uid swap of the registered path for a link cannot
+//!   redirect the confined reads;
 //! - `index.json` — the publish record (effect id, digests, the
 //!   outcome payload) the Outbox board view lists.
 //!
@@ -28,10 +31,17 @@
 //! the gate's custody load and grant checks run unchanged; the bytes
 //! are never read here (`execute` takes them only because the gate
 //! attaches them).
+//!
+//! Attachments are pinned at stage: the adapter implies a source
+//! naming the declared set, `source_hash` digests the bytes it
+//! resolves under the requester's worktree, and the staged preview
+//! shows the per-attachment digests — the operator releases the bytes
+//! they saw, and the gate's own `source_changed` close cancels a send
+//! whose attachments drifted (ADR 0006 §5.4 step 3).
 
 use std::fs::{self, File};
 use std::io::{Error as IoError, Read, Write};
-use std::os::fd::{FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
@@ -80,6 +90,15 @@ const NAME_CAP: usize = 255;
 const LIST_CAP: usize = 500;
 /// The preview excerpt stored on an outbox item (chars).
 const ITEM_PREVIEW_CAP: usize = 400;
+
+/// The source-name prefix the adapter's implied pin uses — a
+/// `local-attachments:<json>` descriptor names the canonical worktree
+/// root and the declared attachment spellings whose bytes
+/// `source_hash` re-reads and digests (CAD-553). `input.source` may
+/// name the same shape — but the root may only ever be the
+/// requesting agent's own worktree; anything else resolves to no
+/// artifact.
+const PIN_PREFIX: &str = "local-attachments:";
 
 /// The default outbox root — `~/.local/share/cadence/outbox`, the same
 /// `XDG_DATA_HOME` resolution the daemon's other data paths use.
@@ -199,6 +218,16 @@ fn parse_post(input: &Value) -> Result<Post, String> {
     })
 }
 
+impl Post {
+    /// The declared attachment spellings, in order.
+    fn attachment_raws(&self) -> Vec<String> {
+        self.attachments
+            .iter()
+            .map(|(raw, _)| raw.clone())
+            .collect()
+    }
+}
+
 /// The syntactic half of attachment confinement: no `..`, ever; a `.`
 /// component is normalized away; an absolute path keeps its root so
 /// the lexical prefix test can admit only paths under the worktree.
@@ -241,7 +270,13 @@ impl LocalAdapter {
     /// effect row's `agent` names the caller (connection-derived at
     /// stage time); its agent row holds the registered `cwd`. Never
     /// trusted from the input: the store is the only authority.
-    fn requesting_worktree(&self, effect_id: &str) -> Result<PathBuf, String> {
+    ///
+    /// CAD-553: the stored path itself is opened with no symlink
+    /// following and the fd held for every confined read beneath it —
+    /// a same-uid swap of the registered path for a link cannot
+    /// redirect confinement (canonicalizing first would resolve the
+    /// swap to its target and hide it).
+    fn requesting_worktree(&self, effect_id: &str) -> Result<(PathBuf, File), String> {
         let conn = rusqlite::Connection::open_with_flags(
             self.state_dir.join("cadence.sqlite3"),
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -265,6 +300,8 @@ impl LocalAdapter {
                 format!("requesting agent '{agent}' has no record — the worktree is unresolvable")
             })?;
         let cwd = Path::new(&cwd);
+        let root = open_no_symlinks(cwd)
+            .map_err(|e| format!("the requesting task's worktree {}: {e}", cwd.display()))?;
         let canon = cwd
             .canonicalize()
             .map_err(|e| format!("the requesting task's worktree {cwd:?} does not resolve: {e}"))?;
@@ -274,50 +311,83 @@ impl LocalAdapter {
                 canon.display()
             ));
         }
-        Ok(canon)
+        Ok((canon, root))
+    }
+
+    /// The canonical registered worktree of `agent` — the only root a
+    /// pin descriptor may name.
+    fn agent_worktree(&self, agent: &str) -> Option<PathBuf> {
+        let conn = rusqlite::Connection::open_with_flags(
+            self.state_dir.join("cadence.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .ok()?;
+        let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+        let cwd: String = conn
+            .query_row("SELECT cwd FROM agents WHERE alias=?1", [agent], |r| {
+                r.get(0)
+            })
+            .ok()?;
+        let canon = Path::new(&cwd).canonicalize().ok()?;
+        canon.is_dir().then_some(canon)
+    }
+
+    /// Read and hash one declared attachment set under a canonical
+    /// worktree root — `(inner path, sha256)` per path, in declared
+    /// order. Stage (`source_hash`) and the waiting-row scan run this
+    /// read; the preview instead echoes the `at` the stage's own pin
+    /// verified, so what it shows is exactly what the pin covers.
+    fn pin_items(&self, root: &Path, raws: &[String]) -> Result<Vec<(String, String)>, String> {
+        let canon = root
+            .canonicalize()
+            .map_err(|e| format!("the pin root {} does not resolve: {e}", root.display()))?;
+        if !canon.is_dir() {
+            return Err(format!(
+                "the pin root {} is not a directory",
+                canon.display()
+            ));
+        }
+        let root_file = open_no_symlinks(&canon)
+            .map_err(|e| format!("the pin root {}: {e}", canon.display()))?;
+        let mut out = Vec::with_capacity(raws.len());
+        for raw in raws {
+            let rel = check_path(raw)?;
+            let inner = inner_under(&canon, &rel, raw)?;
+            let mut file = open_confined(root_file.as_raw_fd(), &inner, raw)?;
+            let meta = file
+                .metadata()
+                .map_err(|e| format!("attachment '{raw}': cannot stat: {e}"))?;
+            if !meta.is_file() {
+                return Err(format!("attachment '{raw}' is not a regular file"));
+            }
+            if meta.len() > ATTACHMENT_BYTES_CAP {
+                return Err(format!(
+                    "attachment '{raw}' exceeds {ATTACHMENT_BYTES_CAP} bytes"
+                ));
+            }
+            let mut bytes = Vec::with_capacity(meta.len().min(1 << 20) as usize);
+            file.read_to_end(&mut bytes)
+                .map_err(|e| format!("attachment '{raw}': cannot read: {e}"))?;
+            out.push((inner.display().to_string(), sha256_hex(&bytes)));
+        }
+        Ok(out)
     }
 
     /// Resolve `rel` (or the absolute-inside-root shape) against the
-    /// canonical worktree root and read it confined: every component a
-    /// real directory or file — never a symlink — and the path never
-    /// naming anything outside `root`.
-    fn read_attachment(&self, root: &Path, rel: &Path, raw: &str) -> Result<Attachment, String> {
-        let inner: PathBuf = if rel.is_absolute() {
-            rel.strip_prefix(root)
-                .map_err(|_| {
-                    format!(
-                        "attachment '{raw}': an absolute path must name a file inside \
-                         the task worktree ({})",
-                        root.display()
-                    )
-                })?
-                .to_path_buf()
-        } else {
-            rel.to_path_buf()
-        };
-        if inner.as_os_str().is_empty() {
-            return Err(format!(
-                "attachment '{raw}' names the worktree itself, not a file"
-            ));
-        }
-        let root_c = std::ffi::CString::new(root.as_os_str().as_bytes())
-            .map_err(|_| "the task worktree path holds a NUL".to_string())?;
-        let root_fd = unsafe {
-            libc::open(
-                root_c.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-            )
-        };
-        if root_fd < 0 {
-            return Err(format!(
-                "the task worktree {} cannot be opened: {}",
-                root.display(),
-                IoError::last_os_error()
-            ));
-        }
-        let file = open_confined(root_fd, &inner, raw);
-        unsafe { libc::close(root_fd) };
-        let mut file = file?;
+    /// canonical worktree root and read it confined under the held
+    /// root fd: every component a real directory or file — never a
+    /// symlink — and the path never naming anything outside `root`.
+    /// Answers the resolved inner path alongside the attachment so the
+    /// caller can digest the exact set it shipped.
+    fn read_attachment(
+        &self,
+        root_fd: RawFd,
+        root: &Path,
+        rel: &Path,
+        raw: &str,
+    ) -> Result<(PathBuf, Attachment), String> {
+        let inner = inner_under(root, rel, raw)?;
+        let mut file = open_confined(root_fd, &inner, raw)?;
         let meta = file
             .metadata()
             .map_err(|e| format!("attachment '{raw}': cannot stat: {e}"))?;
@@ -340,7 +410,7 @@ impl LocalAdapter {
         let mut bytes = Vec::with_capacity(meta.len().min(1 << 20) as usize);
         file.read_to_end(&mut bytes)
             .map_err(|e| format!("attachment '{raw}': cannot read: {e}"))?;
-        Ok(Attachment { name, bytes })
+        Ok((inner, Attachment { name, bytes }))
     }
 
     /// `<project>/<effect_id>` — the item's outbox dir name. The
@@ -379,11 +449,230 @@ impl LocalAdapter {
     }
 }
 
-/// Open `rel` under `root_fd`, refusing every symlink — each path
-/// component is opened `O_NOFOLLOW` (intermediate ones `O_DIRECTORY`)
-/// atomically, so a link planted or swapped in anywhere inside the
-/// worktree fails the open rather than redirecting it outside.
+/// The path inside `root` a declared `rel` names — the
+/// absolute-inside-root shape strips the canonical prefix; a relative
+/// shape resolves under it. `..` was already refused by `check_path`.
+fn inner_under(root: &Path, rel: &Path, raw: &str) -> Result<PathBuf, String> {
+    let inner: PathBuf = if rel.is_absolute() {
+        rel.strip_prefix(root)
+            .map_err(|_| {
+                format!(
+                    "attachment '{raw}': an absolute path must name a file inside \
+                     the task worktree ({})",
+                    root.display()
+                )
+            })?
+            .to_path_buf()
+    } else {
+        rel.to_path_buf()
+    };
+    if inner.as_os_str().is_empty() {
+        return Err(format!(
+            "attachment '{raw}' names the worktree itself, not a file"
+        ));
+    }
+    Ok(inner)
+}
+
+/// The `openat2` `open_how` argument (linux/openat2.h) — declared
+/// here like confine.rs's Landlock ABI structs. The syscall and its
+/// `RESOLVE_*` flags are Linux-only; elsewhere the per-component
+/// `O_NOFOLLOW` walk is the whole implementation.
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct OpenHow {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
+
+/// One raw `openat2` — the fd or the errno-valued error. Callers
+/// decide whether a failure is the refusal or the "unsupported —
+/// fall back" marker.
+#[cfg(target_os = "linux")]
+fn sys_openat2(dirfd: RawFd, path: &std::ffi::CStr, how: &OpenHow) -> Result<RawFd, IoError> {
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            dirfd,
+            path.as_ptr(),
+            how as *const OpenHow,
+            std::mem::size_of::<OpenHow>(),
+        )
+    };
+    if fd < 0 {
+        Err(IoError::last_os_error())
+    } else {
+        Ok(fd as RawFd)
+    }
+}
+
+/// Whether an `openat2` failure means the syscall itself is absent or
+/// filtered — ENOSYS (old kernel), EPERM (seccomp), EINVAL/EOPNOTSUPP
+/// (a kernel predating these flags): the caller falls back to the
+/// per-component `O_NOFOLLOW` opens.
+#[cfg(target_os = "linux")]
+fn openat2_unsupported(e: &IoError) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::ENOSYS) | Some(libc::EPERM) | Some(libc::EINVAL) | Some(libc::EOPNOTSUPP)
+    )
+}
+
+/// The refusal wording a confined open reports — names the cause
+/// when resolution died on a symlink or non-directory.
+fn open_refusal(e: &IoError) -> String {
+    match e.raw_os_error() {
+        Some(libc::ELOOP) | Some(libc::ENOTDIR) => {
+            format!("a symlink or non-directory is in the path — refused ({e})")
+        }
+        _ => format!("cannot be opened ({e})"),
+    }
+}
+
+/// Open `path` — the stored spelling, never canonicalized first —
+/// refusing every symlink component along it. On Linux `openat2`
+/// with `RESOLVE_NO_SYMLINKS` covers the whole walk atomically;
+/// where the syscall is absent (an old kernel — or a platform like
+/// macOS that has no `openat2` at all) the stored spelling is opened
+/// component by component, `O_NOFOLLOW` on every step, so a link
+/// swapped in anywhere along the path refuses the open.
+fn open_no_symlinks(path: &Path) -> Result<File, String> {
+    #[cfg(target_os = "linux")]
+    {
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| "the path holds a NUL".to_string())?;
+        let how = OpenHow {
+            flags: (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+            mode: 0,
+            resolve: libc::RESOLVE_NO_SYMLINKS,
+        };
+        match sys_openat2(libc::AT_FDCWD, &c, &how) {
+            Ok(fd) => return Ok(unsafe { File::from_raw_fd(fd) }),
+            Err(e) if !openat2_unsupported(&e) => return Err(open_refusal(&e)),
+            Err(_) => {}
+        }
+    }
+    nofollow_walk(path)
+}
+
+/// The no-`openat2` path: `path`'s own spelling opened component by
+/// component, `O_NOFOLLOW|O_DIRECTORY` on every step — a swapped
+/// parent dir is refused like a swapped leaf. `.`/`..` resolve
+/// against the already-open inode and can never be links. Every
+/// caller opens a directory root, so the leaf carries `O_DIRECTORY`
+/// too; `AT_FDCWD` anchors a relative spelling like `open` does.
+fn nofollow_walk(path: &Path) -> Result<File, String> {
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    let mut fd = libc::AT_FDCWD;
+    for comp in path.components() {
+        let bytes: &[u8] = match comp {
+            // An absolute name ignores dirfd — this opens the real
+            // root, which can itself never be a link.
+            Component::RootDir => b"/",
+            Component::CurDir => continue,
+            Component::ParentDir => b"..",
+            Component::Normal(name) => name.as_bytes(),
+            Component::Prefix(_) => return Err("a Windows prefix is not a worktree".to_string()),
+        };
+        let name = std::ffi::CString::new(bytes).map_err(|_| "the path holds a NUL".to_string())?;
+        let next = unsafe { libc::openat(fd, name.as_ptr(), flags) };
+        if fd != libc::AT_FDCWD {
+            unsafe { libc::close(fd) };
+        }
+        if next < 0 {
+            return Err(open_refusal(&IoError::last_os_error()));
+        }
+        fd = next;
+    }
+    if fd == libc::AT_FDCWD {
+        return Err("the path names no directory".to_string());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// A `local-attachments:` descriptor parsed — the canonical root it
+/// claims, the declared spellings it pins, and `at`: the
+/// `[raw, sha256]` pairs the descriptor's producer observed at stage
+/// (CAD-553 r2). None of it is trusted: `source_hash` honors the
+/// descriptor only when the root is the *requesting* agent's own
+/// registered worktree and any embedded `at` equals what it reads
+/// itself — a forged or stale digest refuses the pin. The verified
+/// `at` lets the staged preview echo the pinned bytes' digests
+/// without a third read of the files.
+struct Pin {
+    root: PathBuf,
+    paths: Vec<String>,
+    at: Option<Vec<(String, String)>>,
+}
+
+fn parse_pin(source: &str) -> Option<Pin> {
+    let body = source.strip_prefix(PIN_PREFIX)?;
+    let v: Value = serde_json::from_str(body).ok()?;
+    let root = PathBuf::from(v.get("root")?.as_str()?);
+    let paths = v
+        .get("paths")?
+        .as_array()?
+        .iter()
+        .map(|p| p.as_str().map(str::to_string))
+        .collect::<Option<Vec<_>>>()?;
+    if paths.len() > ATTACHMENT_CAP {
+        return None;
+    }
+    let at = match v.get("at") {
+        None => None,
+        Some(a) => Some(
+            a.as_array()?
+                .iter()
+                .map(|p| {
+                    let pair = p.as_array()?;
+                    Some((
+                        pair.first()?.as_str()?.to_string(),
+                        pair.get(1)?.as_str()?.to_string(),
+                    ))
+                })
+                .collect::<Option<Vec<_>>>()?,
+        ),
+    };
+    Some(Pin { root, paths, at })
+}
+
+/// The one digest the pin is: `sha256:` over the sorted
+/// `<file-sha>  <inner-path>` lines — order-insensitive over the
+/// declared set, bound to where each byte lived inside the worktree.
+fn pin_digest(items: &[(String, String)]) -> String {
+    let mut lines: Vec<String> = items
+        .iter()
+        .map(|(inner, sha)| format!("{sha}  {inner}\n"))
+        .collect();
+    lines.sort();
+    format!("sha256:{}", sha256_hex(lines.concat().as_bytes()))
+}
+
+/// Open `rel` under `root_fd`, refusing every symlink — on Linux
+/// `openat2` with `RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS` resolves the
+/// whole path atomically where the kernel has it; otherwise (old
+/// kernels, non-Linux) each component is opened `O_NOFOLLOW`
+/// (intermediate ones `O_DIRECTORY`), so a link planted or swapped
+/// in anywhere inside the worktree fails the open rather than
+/// redirecting it outside.
 fn open_confined(root_fd: RawFd, rel: &Path, raw: &str) -> Result<File, String> {
+    #[cfg(target_os = "linux")]
+    if let Ok(c) = std::ffi::CString::new(rel.as_os_str().as_bytes()) {
+        let how = OpenHow {
+            flags: (libc::O_RDONLY | libc::O_CLOEXEC) as u64,
+            mode: 0,
+            resolve: libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_BENEATH,
+        };
+        match sys_openat2(root_fd, &c, &how) {
+            Ok(fd) => return Ok(unsafe { File::from_raw_fd(fd) }),
+            Err(e) if !openat2_unsupported(&e) => {
+                return Err(format!("attachment '{raw}': {}", open_refusal(&e)))
+            }
+            // A kernel without openat2: fall through to the walk.
+            Err(_) => {}
+        }
+    }
     let nofollow = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     let dir_flags = nofollow | libc::O_DIRECTORY;
     let mut fd = root_fd;
@@ -454,9 +743,43 @@ impl PlatformAdapter for LocalAdapter {
                     render_post(&post)
                 );
                 if !post.attachments.is_empty() {
+                    // The pin digests join the names when the resolved
+                    // source (implied or caller-named) parses — the
+                    // operator releases the bytes they see.
+                    let digests: Option<Vec<String>> = input
+                        .get("source")
+                        .and_then(Value::as_str)
+                        .and_then(parse_pin)
+                        .and_then(|pin| {
+                            // A descriptor's verified `at` IS the
+                            // pinned read — showing it cannot diverge
+                            // from what the pin covers. Only a
+                            // descriptor without one (hand-named)
+                            // costs a read here.
+                            match pin.at {
+                                Some(at) if at.len() == pin.paths.len() => post
+                                    .attachments
+                                    .iter()
+                                    .map(|(raw, _)| {
+                                        pin.paths
+                                            .iter()
+                                            .zip(&at)
+                                            .find(|(p, _)| *p == raw)
+                                            .map(|(_, (_, sha))| sha.clone())
+                                    })
+                                    .collect(),
+                                _ => self
+                                    .pin_items(&pin.root, &post.attachment_raws())
+                                    .ok()
+                                    .map(|items| items.into_iter().map(|(_, sha)| sha).collect()),
+                            }
+                        });
                     out.push_str("\n\nattachments:");
-                    for (raw, _) in &post.attachments {
-                        out.push_str(&format!("\n  {raw}"));
+                    for (i, (raw, _)) in post.attachments.iter().enumerate() {
+                        match digests.as_ref().and_then(|d| d.get(i)) {
+                            Some(sha) => out.push_str(&format!("\n  {raw} — sha256:{sha}")),
+                            None => out.push_str(&format!("\n  {raw}")),
+                        }
                     }
                 }
                 out
@@ -471,7 +794,7 @@ impl PlatformAdapter for LocalAdapter {
         tool: &str,
         input: &Value,
         idempotency_key: &str,
-        _expected_hash: Option<&str>,
+        expected_hash: Option<&str>,
     ) -> Result<Value, String> {
         if tool != TOOL_PUBLISH {
             return Err(format!(
@@ -507,17 +830,36 @@ impl PlatformAdapter for LocalAdapter {
             ));
         }
 
-        let root = self.requesting_worktree(idempotency_key)?;
+        let (root, root_file) = self.requesting_worktree(idempotency_key)?;
         let mut attachments: Vec<Attachment> = Vec::with_capacity(post.attachments.len());
+        let mut shipped: Vec<(String, String)> = Vec::with_capacity(post.attachments.len());
         for (raw, rel) in &post.attachments {
-            let att = self.read_attachment(&root, rel, raw)?;
+            let (inner, att) = self.read_attachment(root_file.as_raw_fd(), &root, rel, raw)?;
             if attachments.iter().any(|a| a.name == att.name) {
                 return Err(format!(
                     "attachments share the name '{}' — refused",
                     att.name
                 ));
             }
+            shipped.push((inner.display().to_string(), sha256_hex(&att.bytes)));
             attachments.push(att);
+        }
+        // CAD-553: the operator's press released exactly the bytes the
+        // stage pin digested — the digest over what was just read must
+        // equal the staged `source_hash`, and an attachments-carrying
+        // publish with no pin behind it cannot land at all.
+        if !attachments.is_empty() {
+            match expected_hash {
+                Some(pin) if pin == pin_digest(&shipped) => {}
+                Some(_) => {
+                    return Err(
+                        "the attachment bytes do not match the staged pin — refused".to_string()
+                    )
+                }
+                None => {
+                    return Err("the attachments were staged without a pin — refused".to_string())
+                }
+            }
         }
 
         let post_md = render_post(&post);
@@ -611,9 +953,64 @@ impl PlatformAdapter for LocalAdapter {
         }
     }
 
-    /// `local` holds no reviewed source artifact — nothing to pin.
-    fn source_hash(&self, _source: &str) -> Option<String> {
-        None
+    /// A publish carrying attachments implies the source artifact the
+    /// pin covers: the declared set, named against the *requesting*
+    /// agent's registered worktree, carrying the digests this read
+    /// observed (`at`) so the staged preview and pin agree on one
+    /// byte version. Only a set that resolves confined right now gets
+    /// a name — bad paths still stage so execute's refusal can name
+    /// them (the confinement tests stage them on purpose); the pin
+    /// simply does not cover them.
+    fn implied_source(&self, agent: &str, tool: &str, input: &Value) -> Option<String> {
+        if tool != TOOL_PUBLISH {
+            return None;
+        }
+        let post = parse_post(input).ok()?;
+        if post.attachments.is_empty() {
+            return None;
+        }
+        let root = self.agent_worktree(agent)?;
+        let raws = post.attachment_raws();
+        let items = self.pin_items(&root, &raws).ok()?;
+        let at: Vec<(String, String)> = raws
+            .iter()
+            .cloned()
+            .zip(items.iter().map(|(_, sha)| sha.clone()))
+            .collect();
+        Some(format!(
+            "{PIN_PREFIX}{}",
+            json!({"root": root, "paths": raws, "at": at})
+        ))
+    }
+
+    /// The staged pin's content hash: a `local-attachments:` descriptor
+    /// re-reads the declared set — but only under the *requesting*
+    /// agent's own registered worktree (`agent` is the row's proven
+    /// caller, never something the descriptor asserts), and an `at`
+    /// the descriptor carries must equal what this read finds. A
+    /// caller-named descriptor can therefore only ever pin bytes
+    /// inside its own worktree — a peer's root, or digests for bytes
+    /// that aren't there, resolve to no artifact at all. `None`
+    /// (unresolvable) is the same close as a changed digest:
+    /// `source_changed`.
+    fn source_hash(&self, agent: &str, source: &str) -> Option<String> {
+        let pin = parse_pin(source)?;
+        let canon = pin.root.canonicalize().ok()?;
+        if self.agent_worktree(agent).as_deref() != Some(canon.as_path()) {
+            return None;
+        }
+        let items = self.pin_items(&canon, &pin.paths).ok()?;
+        if let Some(at) = &pin.at {
+            let same = at.len() == pin.paths.len()
+                && at
+                    .iter()
+                    .zip(pin.paths.iter().zip(&items))
+                    .all(|((raw, sha), (path, (_, fresh)))| raw == path && sha == fresh);
+            if !same {
+                return None;
+            }
+        }
+        Some(pin_digest(&items))
     }
 }
 

@@ -269,8 +269,9 @@ impl Shared {
 
     /// `send`: stage the durable row and answer at once — the call
     /// never touches the platform. `input.source` pins the reviewed
-    /// artifact's hash; a caller naming a source the platform does not
-    /// hold is refused rather than staged unpinned.
+    /// artifact's hash, or the adapter's implied source names the
+    /// artifact it will release; a source the platform cannot pin is
+    /// refused rather than staged unpinned.
     #[allow(clippy::too_many_arguments)]
     fn stage_send(
         &self,
@@ -286,12 +287,16 @@ impl Shared {
         let source_name = input
             .get("source")
             .and_then(Value::as_str)
-            .map(str::to_string);
+            .map(str::to_string)
+            // The adapter may imply the artifact the send releases —
+            // `local` names its declared attachment set (CAD-553) —
+            // and the pin then rides the unchanged source machinery.
+            .or_else(|| adapter.implied_source(agent, tool, input));
         let source_hash = match &source_name {
-            Some(name) => Some(adapter.source_hash(name).ok_or_else(|| {
+            Some(name) => Some(adapter.source_hash(agent, name).ok_or_else(|| {
                 Error::rejected(format!(
-                    "input.source names '{name}' — the platform holds no such \
-                     reviewed artifact; the send cannot be pinned"
+                    "source '{name}' — the platform holds no such reviewed \
+                     artifact; the send cannot be pinned"
                 ))
             })?),
             None => None,
@@ -300,7 +305,14 @@ impl Shared {
             platform::load_credential(&self.store, &self.platform_custody, platform_name, account)?;
         let decl = adapter.table().declared(tool);
         let summary = input_summary(tool, input);
-        let mut preview = adapter.preview(account, tool, input);
+        // An implied source joins the preview input so the press sees
+        // the pin's digests; the stored `input` stays caller-verbatim —
+        // the replay pin hashes exactly what the caller sent.
+        let mut preview_in = input.clone();
+        if let Some(name) = &source_name {
+            preview_in["source"] = json!(name.as_str());
+        }
+        let mut preview = adapter.preview(account, tool, &preview_in);
         if preview.len() > PREVIEW_CAP {
             cap_str(&mut preview, PREVIEW_CAP);
         }
@@ -652,7 +664,7 @@ impl Shared {
         // inside Execute — an edit the waiting scan missed still
         // cancels the send here, before any traffic.
         if let Some(source) = &row.source_name {
-            let now_hash = adapter.source_hash(source);
+            let now_hash = adapter.source_hash(&row.agent, source);
             if now_hash.as_deref() != row.source_hash.as_deref() {
                 let row = self
                     .store
@@ -847,10 +859,9 @@ impl Shared {
             let Some(source) = &row.source_name else {
                 continue;
             };
-            let changed = self
-                .platforms
-                .get(&row.platform)
-                .is_some_and(|a| a.source_hash(source).as_deref() != row.source_hash.as_deref());
+            let changed = self.platforms.get(&row.platform).is_some_and(|a| {
+                a.source_hash(&row.agent, source).as_deref() != row.source_hash.as_deref()
+            });
             if changed {
                 if let Ok(Some(closed)) = self
                     .store

@@ -493,7 +493,7 @@ impl crate::platform::PlatformAdapter for FakePlatform {
         self.read_back(tool, input)
     }
 
-    fn source_hash(&self, source: &str) -> Option<String> {
+    fn source_hash(&self, _agent: &str, source: &str) -> Option<String> {
         self.source_hash(source)
     }
 }
