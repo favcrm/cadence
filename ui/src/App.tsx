@@ -10,6 +10,7 @@ import ModelDefaults from "./features/settings/ModelDefaults";
 import OverviewView from "./features/home/Overview";
 import Home from "./features/home/Home";
 import Context from "./features/projects/Context";
+import Workflows from "./features/projects/Workflows";
 import Sidebar from "./ui/Sidebar";
 import Link from "./ui/Link";
 import SectionTabs from "./ui/SectionTabs";
@@ -245,8 +246,8 @@ export default function App() {
     const es = new EventSource("/api/stream");
     const onEvent = (e: MessageEvent<string>) => {
       for (const name of invalidatedBy(e.data)) {
-        // Every issue store on screen — the drawer and Home's plan cards.
-        if (name === "issue") cache.invalidate("issue");
+        // Families are keyed stores — invalidate the prefix, not one entry.
+        if (name === "issue" || name === "workflows") cache.invalidate(name);
         else if (name === "overview") {
           // Hidden overview: skip — it revalidates when Home opens.
           if (overviewOn(screenRef.current)) void resources.overview.invalidate();
@@ -563,6 +564,11 @@ export default function App() {
                 href: hrefFor({ ...route, section: "milestones" }),
                 on: route.section === "milestones",
               },
+              {
+                label: "Workflows",
+                href: hrefFor({ ...route, section: "workflows" }),
+                on: route.section === "workflows",
+              },
               { label: "Context", href: hrefFor({ ...route, section: "context" }), on: route.section === "context" },
             ]}
           />
@@ -601,6 +607,14 @@ export default function App() {
         )}
         {route.screen === "projects" && route.slug && route.section === "milestones" && (
           <Milestones project={route.slug} issues={issuesState} onOpenIssue={openIssue} />
+        )}
+        {route.screen === "projects" && route.slug && route.section === "workflows" && (
+          <Workflows
+            project={route.slug}
+            viewer={{ readOnly, operator: meta?.operator === true }}
+            onOpenIssue={openIssue}
+            onHome={() => goRoute({ screen: "home" })}
+          />
         )}
         {route.screen === "projects" && route.section === "context" && (
           <Context

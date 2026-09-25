@@ -3452,7 +3452,7 @@ fn ui_stream_sse_and_guards() {
     // CAD-258: each frame names the resources it invalidates, so the
     // client refetches only those. The event name stays the source.
     const ISSUES_FRAME: &str =
-        "event: issues\ndata: {\"resources\":[\"issues\",\"projects\",\"issue\",\"overview\"]}\n\n";
+        "event: issues\ndata: {\"resources\":[\"issues\",\"projects\",\"issue\",\"overview\",\"workflows\"]}\n\n";
     const AGENTS_FRAME: &str =
         "event: agents\ndata: {\"resources\":[\"agents\",\"issue\",\"overview\"]}\n\n";
     const JOBS_FRAME: &str =
