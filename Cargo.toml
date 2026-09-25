@@ -75,3 +75,8 @@ shlex = "2.0.1"
 # is only worth it for repeated edit-rebuild cycles of this one crate.
 [profile.dev]
 incremental = false
+# CAD-523: full debuginfo was the main per-build memory cost — cold
+# `cargo test --no-run --all-targets` peaked at 4.1 GB summed RSS and a
+# 6.2 GB target dir. Line tables keep panic locations and backtrace
+# file:line while cutting that to ~3.2 GB and ~3.0 GB.
+debug = "line-tables-only"
