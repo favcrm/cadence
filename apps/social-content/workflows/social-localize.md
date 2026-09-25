@@ -12,13 +12,13 @@ limits: { max_items: 20, max_parallel: 5 }
 agent: writer
 writes: post.caption
 
-Write a zh-HK caption from {{item}}, keeping protected terms verbatim and the
-saved disclaimer when one is set. Read the post's effective instructions, not
-the defaults, when it has its own.
+Write a zh-HK caption from {{item}}, keeping protected terms verbatim. When the
+caption quotes a price, carry the saved disclaimer too. Read the post's
+effective instructions, not the defaults, when it has its own.
 
 ### Acceptance
 - [ ] caption keeps every protected term verbatim
-- [ ] caption includes settings.disclaimer when set
+- [ ] caption includes settings.disclaimer when it quotes a price
 - [ ] caption ≤ 2200 chars
 
 ## Visuals

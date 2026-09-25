@@ -44,10 +44,10 @@
   const sourcePosts = [
     { id: "s1", client: "kura", platform: "instagram", url: "https://instagram.com/p/CxKura01",
       text: "NEW: Black garlic tonkotsu — 18-hour broth, limited to 40 bowls a day. HK$128. From Thursday at both shops. #KuraHK",
-      media: [{ seed: "ramen-black", w: 1080, h: 1080 }], postedAt: ago(9), isNew: true },
+      media: [{ seed: "ramen-black", w: 1080, h: 1080 }], postedAt: ago(9), isNew: false },
     { id: "s2", client: "kura", platform: "facebook", url: "https://facebook.com/kura.ramen.hk/posts/8801",
       text: "Our Central shop closes early on Oct 1 (last order 21:30) for a private event. TST stays open till 23:00 as usual.",
-      media: [{ seed: "shop-front", w: 1200, h: 900 }], postedAt: ago(14), isNew: true },
+      media: [{ seed: "shop-front", w: 1200, h: 900 }], postedAt: ago(14), isNew: false },
     { id: "s3", client: "kura", platform: "instagram", url: "https://instagram.com/p/CxKura07",
       text: "Meet the chef: Mori-san on why we flame the chashu to order. Full video on the site →",
       media: [{ seed: "chef-flame", w: 1080, h: 1080 }], postedAt: ago(30), isNew: true },
@@ -63,13 +63,13 @@
 
     { id: "s7", client: "velvet", platform: "instagram", url: "https://instagram.com/p/CxVel01",
       text: "Courts open 07:00–23:00 daily from October. Bookings live on the app. #VelvetPadel",
-      media: [{ seed: "court-aerial", w: 1080, h: 1080 }], postedAt: ago(6), isNew: true },
+      media: [{ seed: "court-aerial", w: 1080, h: 1080 }], postedAt: ago(6), isNew: false },
     { id: "s8", client: "velvet", platform: "instagram", url: "https://instagram.com/p/CxVel04",
       text: "Autumn ladder: 64 players, 3 weeks, finals Oct 18. Spectators welcome — the bar stays open.",
       media: [{ seed: "ladder-night", w: 1080, h: 1080 }], postedAt: ago(20), isNew: true },
     { id: "s9", client: "velvet", platform: "instagram", url: "https://instagram.com/p/CxVel09",
       text: "New coach alert — @marta.padel joins Velvet from Oct 1. Clinics every Tue/Thu.",
-      media: [{ seed: "coach-marta", w: 1080, h: 1350 }], postedAt: ago(33), isNew: true },
+      media: [{ seed: "coach-marta", w: 1080, h: 1350 }], postedAt: ago(33), isNew: false },
     { id: "s10", client: "velvet", platform: "web", url: "https://velvetpadel.hk/membership",
       text: "Memberships from HK$380/month — off-peak, all courts, guest passes included.",
       media: [{ seed: "membership", w: 1200, h: 630 }], postedAt: ago(80), isNew: false },
@@ -78,7 +78,10 @@
       media: [{ seed: "sauna", w: 1080, h: 1080 }], postedAt: ago(120), isNew: false },
     { id: "s12", client: "velvet", platform: "instagram", url: "https://instagram.com/p/CxVel21",
       text: "Pro shop drop: Velvet x Siux rackets, 20 units, members 48h early access.",
-      media: [{ seed: "racket-drop", w: 1080, h: 1350 }], postedAt: ago(150), isNew: false },
+      media: [{ seed: "racket-drop", w: 1080, h: 1350 }], postedAt: ago(150), isNew: true },
+    { id: "s13", client: "kura", platform: "instagram", url: "https://instagram.com/p/CxKura19",
+      text: "TSUKEMEN returns for October — thicker noodles, concentrated dip, TST shop only.",
+      media: [{ seed: "tsukemen", w: 1080, h: 1080 }], postedAt: ago(40), isNew: true },
   ];
 
   /* Posts (drafts). Revisions are append-only per field; approvals pin a
@@ -137,28 +140,28 @@
       caption: { rev: 2,
         text: "新教練加入!Marta 由 10 月 1 日起加入 Velvet Padel,每週二、四開設訓練班。名額有限,會員優先預約。#VelvetPadel",
         revs: [
-          { rev: 1, by: "writer", job: "run-102", at: ago(9.4),
+          { rev: 1, by: "writer", job: "run-106", at: ago(9.4),
             text: "好消息!新教練 Marta 將於 10 月 1 日正式加入 Velvet Padel,逢星期二及星期四開班授課,名額有限,會員可優先預約。#VelvetPadel" },
           { rev: 2, by: "you", job: null, at: ago(5),
             text: "新教練加入!Marta 由 10 月 1 日起加入 Velvet Padel,每週二、四開設訓練班。名額有限,會員優先預約。#VelvetPadel" },
         ] },
-      image: { rev: 1, asset: "coach-marta", revs: [{ rev: 1, by: "designer", job: "run-102", at: ago(9.1), asset: "coach-marta" }] },
+      image: { rev: 1, asset: "coach-marta", revs: [{ rev: 1, by: "designer", job: "run-106", at: ago(9.1), asset: "coach-marta" }] },
       scheduleAt: at(63), destinations: ["instagram"],
-      lease: null, job: "run-102", approval: null, receipts: [],
+      lease: null, job: "run-106", approval: null, receipts: [],
     },
     {
       id: "p5", client: "velvet", source: "s11", status: "scheduled",
       caption: { rev: 2,
         text: "Recovery Zone 正式開放:桑拿 + 冰浴,會員優先使用。#VelvetPadel",
         revs: [
-          { rev: 1, by: "writer", job: "run-101", at: ago(25),
+          { rev: 1, by: "writer", job: "run-100", at: ago(25),
             text: "全新 Recovery Zone 開放:桑拿及冰浴設施,會員優先體驗。#VelvetPadel" },
-          { rev: 2, by: "editor", job: "run-101", at: ago(24.4),
+          { rev: 2, by: "editor", job: "run-100", at: ago(24.4),
             text: "Recovery Zone 正式開放:桑拿 + 冰浴,會員優先使用。#VelvetPadel" },
         ] },
-      image: { rev: 1, asset: "sauna", revs: [{ rev: 1, by: "designer", job: "run-101", at: ago(24.8), asset: "sauna" }] },
+      image: { rev: 1, asset: "sauna", revs: [{ rev: 1, by: "designer", job: "run-100", at: ago(24.8), asset: "sauna" }] },
       scheduleAt: at(2.6), destinations: ["instagram"],
-      lease: null, job: "run-101", approval: { rev: 2, at: ago(20), digest: "d0" },
+      lease: null, job: "run-100", approval: { rev: 2, at: ago(20), digest: "d9" },
       receipts: [],
     },
     {
@@ -214,13 +217,13 @@
       caption: { rev: 1,
         text: "會籍由 HK$380/月起:非繁忙時段任用所有球場,附送訪客券。#VelvetPadel",
         revs: [
-          { rev: 1, by: "writer", job: "run-102", at: ago(9.6),
+          { rev: 1, by: "writer", job: "run-106", at: ago(9.6),
             text: "會籍由 HK$380/月起:非繁忙時段任用所有球場,附送訪客券。#VelvetPadel" },
         ] },
-      image: { rev: 1, asset: "membership", revs: [{ rev: 1, by: "designer", job: "run-102", at: ago(9.3), asset: "membership" }] },
+      image: { rev: 1, asset: "membership", revs: [{ rev: 1, by: "designer", job: "run-106", at: ago(9.3), asset: "membership" }] },
       scheduleAt: at(87), destinations: ["instagram"],
-      lease: null, job: "run-102",
-      approval: { rev: 1, at: ago(1.2), digest: "d1" },
+      lease: null, job: "run-106",
+      approval: { rev: 1, at: ago(1.1), digest: "d2" },
       receipts: [],
     },
   ];
@@ -229,33 +232,54 @@
    * state. run-103 is seeded mid-flight and advances on the mock clock. */
   const runs = [
     {
-      id: "run-101", kind: "social-localize", client: "kura", status: "done",
-      at: ago(26), label: "Draft 3 posts",
+      id: "run-100", kind: "social-localize", client: "velvet", status: "done",
+      at: ago(25.6), label: "Draft 1 post",
       items: [
-        { post: "p6", steps: { adapt: "done", visuals: "done", review: "done", schedule: "done", verify: "done" } },
-        { post: "p7", steps: { adapt: "done", visuals: "done", review: "done", schedule: "done", verify: "mismatch" } },
         { post: "p5", steps: { adapt: "done", visuals: "done", review: "done", schedule: "done", verify: "waiting" } },
       ],
       log: [
-        [ago(26), "run created from Library selection (3 sources)"],
+        [ago(25.6), "run created from Library selection (1 source)"],
+        [ago(20), "digest d9 approved (1 post)"],
+      ],
+    },
+    {
+      id: "run-101", kind: "social-localize", client: "kura", status: "done",
+      at: ago(26), label: "Draft 2 posts",
+      items: [
+        { post: "p6", steps: { adapt: "done", visuals: "done", review: "done", schedule: "done", verify: "done" } },
+        { post: "p7", steps: { adapt: "done", visuals: "done", review: "done", schedule: "done", verify: "mismatch" } },
+      ],
+      log: [
+        [ago(26), "run created from Library selection (2 sources)"],
         [ago(24.6), "p7 caption edited by you → r3"],
-        [ago(20), "digest d0 approved (3 posts)"],
+        [ago(20), "digest d0 approved (2 posts)"],
         [ago(19), "verify p7: receipt image count 1 ≠ approved 2 → needs-you"],
       ],
     },
     {
       id: "run-102", kind: "social-localize", client: "kura", status: "done",
-      at: ago(9.6), label: "Draft 4 posts",
+      at: ago(9.6), label: "Draft 2 posts",
       items: [
         { post: "p2", steps: { adapt: "done", visuals: "done", review: "done", schedule: "done", verify: "waiting" } },
         { post: "p3", steps: { adapt: "done", visuals: "done", review: "done", schedule: "done", verify: "waiting" } },
-        { post: "p4", steps: { adapt: "done", visuals: "done", review: "done", schedule: "done", verify: "waiting" } },
+      ],
+      log: [
+        [ago(9.6), "run created from Library selection (2 sources)"],
+        [ago(8.1), "p3 review passed after editor touch-up → r2"],
+        [ago(1.2), "digest d1 staged — waiting for approval"],
+      ],
+    },
+    {
+      id: "run-106", kind: "social-localize", client: "velvet", status: "done",
+      at: ago(9.7), label: "Draft 2 posts",
+      items: [
+        { post: "p4", steps: { adapt: "done", visuals: "done", review: "done", schedule: "waiting", verify: "waiting" } },
         { post: "p9", steps: { adapt: "done", visuals: "done", review: "done", schedule: "done", verify: "waiting" } },
       ],
       log: [
-        [ago(9.6), "run created from Library selection (4 sources)"],
-        [ago(8.1), "p3 review passed after editor touch-up → r2"],
-        [ago(1.2), "digest d1 staged — waiting for approval"],
+        [ago(9.7), "run created from Library selection (2 sources)"],
+        [ago(9.3), "p4 caption touched by you — left to you"],
+        [ago(1.1), "digest d2 staged — waiting for approval"],
       ],
     },
     {
@@ -299,12 +323,17 @@
     },
   ];
 
-  // One staged send digest per run approval; items pin (post, revision).
+  // One staged send digest per client; items pin (post, revision).
   const digests = [
     {
       id: "d1", run: "run-102", client: "kura", at: ago(1.2), status: "pending",
       items: [
         { post: "p3", pinnedRev: 2, hold: false },
+      ],
+    },
+    {
+      id: "d2", run: "run-106", client: "velvet", at: ago(1.1), status: "pending",
+      items: [
         { post: "p9", pinnedRev: 1, hold: false },
       ],
     },

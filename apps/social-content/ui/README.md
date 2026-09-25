@@ -19,7 +19,7 @@ Add `?freeze` to the URL to stop the ambient job simulation (the seeded
 
 | File | Role |
 |---|---|
-| `mock/data.js` | the whole fake database: 2 clients, 12 source posts, 9 posts across every state, runs, suggestions, one digest, one verify mismatch |
+| `mock/data.js` | the whole fake database: 2 clients, 13 source posts, 9 posts across every state, runs, suggestions, one pending digest per client, one verify mismatch |
 | `mock/api.js` | **the facade** — every screen calls `api.*`; nothing else sees the store. Wiring replaces only this file. |
 | `lib/` | tiny DOM helper + shared widgets (status chips, IG preview, history, toasts) |
 | `views/` | one file per screen: home, library, runs, editor, decide, automations, workflows, settings |

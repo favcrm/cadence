@@ -33,7 +33,7 @@
 
   /* canned writer output for simulated drafts (per source id) */
   const DRAFTS = {
-    s1: "黑蒜豚骨登場——18 小時熬湯,每日限量 40 碗。HK$128。星期四起兩店同步。#KuraHK",
+    s1: "黑蒜豚骨登場——18 小時熬湯,每日限量 40 碗。HK$128。星期四起兩店同步。#KuraHK All prices in HKD",
     s2: "中環店 10 月 1 日私人活動,提早至 21:30 截單。尖沙咀店照常營業至 23:00。",
     s3: "主廚 Mori 親解:為何叉燒要即叫即炙。完整影片在網站。#KuraHK",
     s7: "10 月起球場每日 07:00–23:00 開放,App 內直接訂場。#VelvetPadel",
@@ -42,22 +42,26 @@
     s10: "會籍由 HK$380/月起:非繁忙時段任用所有球場,附送訪客券。#VelvetPadel",
     s11: "Recovery Zone 開放:桑拿 + 冰浴,會員優先。#VelvetPadel",
     s12: "Velvet x Siux 限量球拍,20 支,會員 48 小時優先。#VelvetPadel",
+    s13: "十月 TSUKEMEN 回歸:粗麵條配濃縮沾汁,尖沙咀店限定。#KuraHK",
   };
   const draftFor = (sid) => DRAFTS[sid] || "本地化草稿(待檢閱)。";
 
   /* ---------- validators (the checks the editor shows live) ---------- */
   function checksFor(p) {
-    const terms = cur().settings.protected_terms;
+    const cli = M.clients.find((c) => c.id === p.client);
+    const terms = cli.settings.protected_terms;
     const srcPost = src(p.source);
     // Terms that appear in the source must survive into the caption verbatim.
     const needed = terms.filter((t) => srcPost && srcPost.text.includes(t));
     const missing = needed.filter((t) => !p.caption.text.includes(t));
-    const disc = cur().settings.disclaimer;
+    const disc = cli.settings.disclaimer;
     const rows = [
       { label: "keeps protected terms", ok: missing.length === 0,
         det: missing.length ? "missing " + missing.join(", ") : needed.join(", ") || "none in source" },
     ];
-    if (disc) rows.push({ label: "includes disclaimer", ok: p.caption.text.includes(disc), det: disc });
+    // the disclaimer is required only when the caption quotes a price
+    if (disc && /HK\$/i.test(p.caption.text))
+      rows.push({ label: "HKD disclaimer on prices", ok: p.caption.text.includes(disc), det: disc });
     rows.push({ label: "≤ 2200 chars", ok: p.caption.text.length <= 2200, det: String(p.caption.text.length) });
     return rows;
   }
@@ -88,18 +92,20 @@
   }
 
   /* ---------- simulated agent work ---------- */
-  const pending = []; // one-shots {in ticks, fn}
-  function after(ticks, fn) { if (FREEZE) ticks = Math.min(ticks, 1); pending.push({ ticks, fn }); }
+  // user-triggered work resolves on a short real timer (even frozen — a demo
+  // or screenshot still needs the ask to land); ambient progression uses tick
+  function after(ticks, fn) { setTimeout(fn, FREEZE ? 120 : ticks * 1400); }
 
+  /* A drafting run drives adapt → visuals → review. schedule and verify are
+   * event-driven instead: the schedule step lands when a digest approves the
+   * post, verify when the publisher writes receipts. */
   const SEQ = ["adapt", "visuals", "review", "schedule", "verify"];
+  const DRAFT_SEQ = ["adapt", "visuals", "review"];
   const WHO = { adapt: "writer", visuals: "designer", review: "editor", schedule: "publisher", verify: "analyst" };
 
   /* Complete the item's running step; when adapt/visuals complete the agent
    * writes its leased field (unless a human already took it over — sticky). */
-  function finishStep(r, it) {
-    const seq = r.kind === "revise" ? ["change"] : SEQ;
-    const step = seq.find((s) => it.steps[s] === "running");
-    if (!step) return;
+  function finishStep(r, it, step) {
     it.steps[step] = "done";
     const p = post(it.post);
     if (!p) return;
@@ -122,27 +128,44 @@
       runlog(r, `designer set ${p.id} image r1 (${m ? "kept source" : "poster render"})`);
     }
     if (step === "review") {
-      const failed = checksFor(p).some((c) => !c.ok);
-      if (failed) { it.steps.review = "failed"; runlog(r, `editor check failed on ${p.id} → stays in review`); }
-      else { setStatus(p, "ready"); runlog(r, `editor check passed on ${p.id} → ready`); }
+      const failed = checksFor(p).filter((c) => !c.ok);
+      if (failed.length) {
+        it.steps.review = "failed";
+        it.steps.schedule = "skipped";
+        it.steps.verify = "skipped";
+        setStatus(p, "in_review", "editor check failed — needs a human pass");
+        runlog(r, `editor check failed on ${p.id} (${failed.map((c) => c.label).join(", ")}) → stays in review`);
+      } else {
+        setStatus(p, "ready");
+        runlog(r, `editor check passed on ${p.id} → ready, waits for the next digest`);
+      }
     }
-    if (step === "schedule") runlog(r, `${p.id} ready — waits for the next digest`);
-    if (step === "verify") runlog(r, `${p.id} receipt verified`);
   }
+
+  /* Advance an item one step: finish whatever is running, else start the next
+   * drafting step. Returns true when something moved. */
+  function advanceItem(r, it) {
+    const running = SEQ.find((s) => it.steps[s] === "running");
+    if (running) { finishStep(r, it, running); return true; }
+    const nxt = DRAFT_SEQ.find((s) => it.steps[s] === "waiting");
+    if (nxt) { it.steps[nxt] = "running"; runlog(r, `${WHO[nxt]} started ${nxt} on ${it.post}`); return true; }
+    return false;
+  }
+
+  function settleRun(r) {
+    const resolved = (i) => DRAFT_SEQ.every((s) => i.steps[s] === "done" || i.steps[s] === "failed");
+    if (r.items.every(resolved) && r.status === "running") {
+      r.status = "done";
+      runlog(r, "run complete — ready posts wait for the next digest");
+    }
+  }
+
   function tick() {
     M.clock += 2;
-    for (const q of pending.splice(0)) { if (--q.ticks <= 0) q.fn(); else pending.push(q); }
     let moved = false;
-    for (const r of M.runs.filter((r) => r.status === "running" && r.kind !== "revise")) {
-      for (const it of r.items) {
-        const running = SEQ.find((s) => it.steps[s] === "running");
-        if (running) { finishStep(r, it); moved = true; continue; }
-        const nxt = SEQ.find((s) => it.steps[s] === "waiting");
-        if (nxt) { it.steps[nxt] = "running"; runlog(r, `${WHO[nxt]} started ${nxt} on ${it.post}`); moved = true; }
-      }
-      const allDone = r.items.every((i) => ["adapt", "visuals", "review"].every((s) => i.steps[s] === "done" || i.steps[s] === "failed"));
-      if (allDone) { r.status = "done"; runlog(r, "run complete — ready posts wait for the next digest"); }
-    }
+    for (const r of M.runs.filter((r) => r.status === "running" && r.kind !== "revise"))
+      for (const it of r.items) moved = advanceItem(r, it) || moved;
+    for (const r of M.runs.filter((r) => r.status === "running" && r.kind !== "revise")) settleRun(r);
     if (moved) emit();
   }
   if (!FREEZE) setInterval(tick, TICK);
@@ -301,15 +324,20 @@
         M.runs.unshift(r);
         M.selection.clear();
         log(`${rid} started — drafting ${sourceIds.length} post(s)`);
-        items.forEach((it, i) => after(1 + i, () => { it.steps.adapt = "running"; runlog(r, `writer started adapt on ${it.post}`); }));
-        items.forEach((it, i) => after(2 + i * 2, () => finishStep(r, it)));
+        items.forEach((it, i) => after(1 + i, () => {
+          if (it.steps.adapt === "waiting") { it.steps.adapt = "running"; runlog(r, `writer started adapt on ${it.post}`); emit(); }
+        }));
+        // live mode: tick() drives the run; frozen mode has no ticks, so chain
+        // real-time advances — a drafted run still completes in a demo.
+        if (FREEZE)
+          for (const it of items) for (let k = 2; k <= 6; k++) after(k, () => { advanceItem(r, it); settleRun(r); emit(); });
         emit();
         return rid;
       },
     },
 
     digest: {
-      current: () => M.digests.find((d) => d.status === "pending") || null,
+      current: () => M.digests.find((d) => d.status === "pending" && d.client === M.currentClient) || null,
       list: () => M.digests,
       setHold(did, pid, hold) {
         const d = M.digests.find((d) => d.id === did);
@@ -323,6 +351,9 @@
           if (it.hold || it.voided) continue;
           const p = post(it.post);
           setStatus(p, "scheduled", `digest ${d.id} approved`);
+          const r0 = run(p.job);
+          const it0 = r0 && r0.items.find((i) => i.post === p.id);
+          if (it0 && it0.steps.schedule === "waiting") it0.steps.schedule = "done";
           went.push(p.id);
           // mock publish+verify a few ticks later
           after(3, () => {
@@ -344,8 +375,8 @@
     needsYou: {
       list() {
         const out = [];
-        const d = M.digests.find((d) => d.status === "pending");
-        if (d) out.push({ kind: "digest", digest: d, title: `Schedule digest ${d.id} — ${d.items.filter((i) => !i.voided).length} posts`, at: d.at });
+        const d = M.digests.find((d) => d.status === "pending" && d.client === M.currentClient);
+        if (d) { const n = d.items.filter((i) => !i.voided).length; out.push({ kind: "digest", digest: d, title: `Schedule digest ${d.id} — ${n} post${n === 1 ? "" : "s"}`, at: d.at }); }
         for (const p of M.posts) {
           if (p.client !== M.currentClient) continue;
           if (p.status === "needs_you" && p.receipts.some((r) => r.verify === "mismatch"))
@@ -384,6 +415,6 @@
   // initial ambient state
   M.currentClient = "kura";
   M.clock = 0;
-  M.nextRun = 106;
+  M.nextRun = 107;
   M.nextPost = 10;
 })(globalThis.SC = globalThis.SC || {});

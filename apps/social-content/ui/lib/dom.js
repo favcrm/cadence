@@ -37,9 +37,9 @@
       return d + "T" + part(iso, { hour: "2-digit", minute: "2-digit", hour12: false });
     },
     weekOf(iso) { // Monday-start day keys (HKT) for the calendar
-      const [y, m, d] = part(iso, { year: "numeric", month: "2-digit", day: "2-digit" }).split("/").map(Number);
+      const [dd, mm, yyyy] = part(iso, { year: "numeric", month: "2-digit", day: "2-digit" }).split("/").map(Number); // DD/MM/YYYY
       const wd = DOWS.indexOf(dowName(iso));
-      const monday = new Date(Date.UTC(y, m - 1, d - ((wd + 6) % 7)));
+      const monday = new Date(Date.UTC(yyyy, mm - 1, dd - ((wd + 6) % 7)));
       return Array.from({ length: 7 }, (_, i) => new Date(monday.getTime() + i * 86400e3));
     },
     hkDayKey(dateObj) { return new Intl.DateTimeFormat("en-GB", { timeZone: TZ, year: "numeric", month: "2-digit", day: "2-digit" }).format(dateObj); },

@@ -4,7 +4,7 @@
   const { h, fmt } = SC.dom;
 
   const STEP_SEQ = ["adapt", "visuals", "review", "schedule", "verify"];
-  const STEP_ICON = { done: "✓", running: "●", waiting: "", failed: "✕", mismatch: "≠" };
+  const STEP_ICON = { done: "✓", running: "●", waiting: "", failed: "✕", mismatch: "≠", skipped: "–" };
 
   function stepsEl(steps) {
     const seq = Object.keys(steps)[0] === "change" ? ["change"] : STEP_SEQ;

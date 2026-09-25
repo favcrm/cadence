@@ -62,7 +62,7 @@
     const themeBtn = h("button", { class: "btn sm", title: `theme: ${pref} (click to cycle)`, onclick: cycleTheme },
       pref === "dark" ? "◐ dark" : pref === "light" ? "◑ light" : "◌ system");
 
-    const blogBtn = h("button", { class: "btn sm", onclick: () =>
+    const blogBtn = h("button", { class: "btn sm blogbtn", onclick: () =>
       w.modal("Write a blog post",
         h("div", { class: "small muted" },
           "This action sits outside the drafting standing approval, so wired-up it opens a plan card first ",
@@ -70,7 +70,7 @@
         h("div", { class: "card", style: "padding:10px 12px" },
           h("div", { class: "small" }, h("strong", null, "blog-post"), " — plan preview"),
           h("div", { class: "small muted", style: "margin-top:4px" },
-            "inputs: topic, keyword → brief → draft → images → review")),
+            "input: brief → outline → draft → images → review — see workflows/blog-post.md")),
         h("div", { class: "row", style: "justify-content:flex-end" },
           h("button", { class: "btn sm", onclick: (e) => e.target.closest(".scrim").remove() }, "Not now"),
           h("button", { class: "btn sm primary", onclick: (e) => { e.target.closest(".scrim").remove(); w.toast("prototype: plan approval would dispatch the workflow here", true); } }, "Approve & run (mock)")))
