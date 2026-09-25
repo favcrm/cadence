@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0B0B0C" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#F4F5F6" media="(prefers-color-scheme: light)">
+<meta name="color-scheme" content="dark light">
+<title>Content studio — social-content (prototype)</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div id="chrome"></div>
+<main id="view"></main>
+<noscript>This prototype needs JavaScript — it is a static page, no server required.</noscript>
+
+<!--
+  Dependency-ordered module files. They register on a single `SC` namespace
+  and use no import/export syntax, so the page opens identically from
+  file:// (where module scripts are CORS-gated) and any static server
+  (where the same files are equally valid modules to import).
+-->
+<script src="mock/data.js"></script>
+<script src="mock/api.js"></script>
+<script src="lib/dom.js"></script>
+<script src="lib/widgets.js"></script>
+<script src="views/home.js"></script>
+<script src="views/library.js"></script>
+<script src="views/runs.js"></script>
+<script src="views/editor.js"></script>
+<script src="views/decide.js"></script>
+<script src="views/automations.js"></script>
+<script src="views/workflows.js"></script>
+<script src="views/settings.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
