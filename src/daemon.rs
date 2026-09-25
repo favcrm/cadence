@@ -586,6 +586,10 @@ pub struct Shared {
     /// `platform_outbox` lists. Set by `platform::local::register`
     /// alongside the adapter so the read serves what the write lands.
     outbox_dir: Option<PathBuf>,
+    /// CAD-538: the hosted lease this daemon holds when `hosted.lease`
+    /// is configured. The heartbeat renews it; its fence is shared with
+    /// `store` (every `write_conn`) and with each [`Self::pm`] handle.
+    lease: Option<Arc<crate::lease::LeaseCtl>>,
 }
 
 impl Shared {
@@ -596,6 +600,22 @@ impl Shared {
     /// `new` with the consumed hot-restart context: the adoption
     /// candidates the marker carried plus this run's instance id.
     pub fn new_hot(state_dir: &Path, opts: &ServeOptions, hot: HotStart) -> Result<Arc<Self>> {
+        // CAD-538: a configured hosted lease must be held before the
+        // store opens — `recover` writes at open. A daemon that cannot
+        // take the lease refuses here having written nothing.
+        let lease = crate::lease::acquire(state_dir, &hosted_config(opts)?)?;
+        Self::new_leased(state_dir, opts, hot, lease)
+    }
+
+    /// `new_hot` over an already-resolved lease — `serve` acquires
+    /// before `hot_restart_begin` so a refused daemon leaves even the
+    /// marker files untouched.
+    fn new_leased(
+        state_dir: &Path,
+        opts: &ServeOptions,
+        hot: HotStart,
+        lease: Option<Arc<crate::lease::LeaseCtl>>,
+    ) -> Result<Arc<Self>> {
         let HotStart { instance, marker } = hot;
         let daemon_id = instance.clone();
         let db_path = state_dir.join("cadence.sqlite3");
@@ -605,6 +625,11 @@ impl Shared {
         // unchanged. `open_adopting` repeats the same check.
         crate::rollout::authorize_migration(&db_path)?;
         let store = Store::open_adopting(&db_path, marker)?;
+        // CAD-538: the store's write path now shares the lease fence —
+        // one trip refuses every later write.
+        if let Some(lease) = &lease {
+            store.install_write_fence(lease.fence());
+        }
         // Same-build crash restart is allowed with no lease. A different
         // build must already hold one — `daemon start` checks before
         // spawn, and this is the backstop for a direct `daemon run`. A
@@ -679,6 +704,7 @@ impl Shared {
             platforms: opts.platforms.clone(),
             effect_execute_gate: opts.effect_execute_gate.clone(),
             outbox_dir: opts.outbox_dir.clone(),
+            lease,
         });
         // Holds dropped by boot-time revalidation get their release
         // events now that the store-backed emitter exists.
@@ -2223,6 +2249,9 @@ impl Shared {
                     .map(|a| json!({"pid": a.pid, "comm": a.comm, "age_secs": a.age_secs}))
                     .collect::<Vec<_>>(),
                 "adopted_reaped_total": adopted_reaped_total,
+                // CAD-538: the hosted lease, when held — provider, epoch,
+                // expiry and the fence reason after a loss.
+                "lease": self.lease.as_ref().map(|l| l.status_json()),
                 })
             }),
             // Build identity + process start — the deploy-drift check
@@ -3018,7 +3047,7 @@ impl Shared {
     /// in-process test daemon pins its own and never races another
     /// test over the process-wide `CADENCE_PM_DIR`.
     fn memory_pm(&self) -> Result<crate::issue::Pm> {
-        crate::issue::Pm::at(&self.pm_dir()?)
+        self.pm()
     }
 
     fn reject_memory_identity_claims(params: &Value) -> Result<()> {
@@ -3647,6 +3676,26 @@ impl Shared {
         }
     }
 
+    /// The one way daemon code opens the tracker — `Pm::at` over this
+    /// daemon's pm_dir plus the lease when `hosted.lease` is on, so a
+    /// fenced daemon's tracker writes refuse and a leased daemon's
+    /// commits carry `Lease-Epoch`. Every RPC `Pm::at(&self.pm_dir())`
+    /// goes through here.
+    fn pm(&self) -> Result<crate::issue::Pm> {
+        self.pm_at(&self.pm_dir()?)
+    }
+
+    /// [`Self::pm`] at an explicit dir — for seams whose signature
+    /// already carries the tracker path (checkup's dispatch seam,
+    /// `route_answer`'s test calls).
+    fn pm_at(&self, pm_dir: &Path) -> Result<crate::issue::Pm> {
+        let mut pm = crate::issue::Pm::at(pm_dir)?;
+        if let Some(lease) = &self.lease {
+            pm.attach_lease(lease.pm_lease());
+        }
+        Ok(pm)
+    }
+
     /// `slot_launch` (CAD-230b) — run one of a project's recipes as a
     /// daemon-launched runner. The request names only the recipe, the
     /// project, optionally a checkout of one of its registered repos and
@@ -4151,7 +4200,7 @@ impl Shared {
                 ))
             }
         };
-        let pm = crate::issue::Pm::at(&self.pm_dir()?)?;
+        let pm = self.pm()?;
         let allow = crate::secret::Allowlist::load(&self.state_dir)?;
         let out = crate::issue::plan::propose(&pm, project, &text, workflow, &allow, &actor)?;
         let _ = self.store.event_public(
@@ -4265,7 +4314,7 @@ impl Shared {
         };
         self.operator_connection(verb, params, peer_pid)?;
         let epic = required_str(params, "epic")?;
-        let pm = crate::issue::Pm::at(&self.pm_dir()?)?;
+        let pm = self.pm()?;
         let out = crate::issue::write::decide_plan(
             &pm,
             epic,
@@ -4328,7 +4377,7 @@ impl Shared {
         let epic = required_str(params, "epic")?;
         let stage = required_str(params, "stage")?;
         let note = optional_str(params, "note");
-        let pm = crate::issue::Pm::at(&self.pm_dir()?)?;
+        let pm = self.pm()?;
         let approvals: crate::issue::work::Approvals = self
             .store
             .work_approvals()?
@@ -4479,7 +4528,7 @@ impl Shared {
         // The tracker write lock `app update`/`install` also take: the
         // installed bundle must not change under check_installed and
         // digest, or the approval could pin a half-updated read (N6).
-        let pm = crate::issue::Pm::at(&pm_dir)?;
+        let pm = self.pm_at(&pm_dir)?;
         let _lock = pm.lock()?;
         let notes = crate::issue::app::check_installed(&pm_dir, project, name, &agents, &sources)
             .map_err(|e| {
@@ -4543,7 +4592,7 @@ impl Shared {
             agents,
             issue: text("issue"),
         };
-        let pm = crate::issue::Pm::at(&self.pm_dir()?)?;
+        let pm = self.pm()?;
         let out = crate::issue::project_new::run(
             &pm,
             &req,
@@ -8875,6 +8924,46 @@ impl Shared {
             write_shutdown_marker(&self.state_dir, &self.instance, entries);
         }
     }
+
+    /// CAD-538: the hosted-lease heartbeat — renew every `renew_every`
+    /// until the daemon begins closing, in 100ms sub-steps so a stop
+    /// lands at once. The first failed or expired renewal is lease
+    /// loss: [`Self::trip_lease`] drops the write fence before the
+    /// next store or tracker write can begin, and this daemon never
+    /// writes again.
+    fn run_lease_heartbeat(self: &Arc<Self>, lease: &Arc<crate::lease::LeaseCtl>) {
+        while !self.closing.load(Ordering::SeqCst) {
+            let deadline = Instant::now() + lease.renew_every;
+            while !self.closing.load(Ordering::SeqCst) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if self.closing.load(Ordering::SeqCst) {
+                break;
+            }
+            if let Err(e) = lease.renew() {
+                self.trip_lease(format!("lease renewal failed: {e}"));
+                return;
+            }
+        }
+    }
+
+    /// CAD-538: the moment the lease is known lost — trip the shared
+    /// fence (`fence_writes` waits out the in-flight writer so no write
+    /// ordered after this can still run ungated), then leave the
+    /// forensic record in the state dir — the daemon's own file, not
+    /// the leased store: every store write including the event stream
+    /// is refused from here on.
+    fn trip_lease(&self, why: String) {
+        self.store.fence_writes(why.clone());
+        let epoch = self.lease.as_ref().map(|l| l.epoch()).unwrap_or(0);
+        let fact = json!({"reason": why, "epoch": epoch, "at": epoch_secs()});
+        let _ = std::fs::write(
+            self.state_dir.join("lease-fence.json"),
+            serde_json::to_string_pretty(&fact).unwrap_or_default(),
+        );
+        eprintln!("cadence: hosted lease lost — daemon fenced: {why}");
+        tracing::warn!("hosted lease lost — daemon fenced: {why}");
+    }
 }
 
 // ---------- provider WAL auto-checkpoint (CAD-132) ----------
@@ -10553,6 +10642,10 @@ pub struct ServeOptions {
     /// with the adapter; a daemon without the `local` platform leaves
     /// it `None` and the read refuses.
     pub outbox_dir: Option<PathBuf>,
+    /// CAD-538: the hosted lifecycle — `Some` is verbatim (a `Hosted`
+    /// with `lease` unset is explicitly off, which is how tests pin
+    /// it); `None` reads the tracker's `hosted:` table in pm.yaml.
+    pub lease: Option<crate::lease::Hosted>,
 }
 
 /// What the CAD-484 checkup calls to dispatch a picked ticket to a
@@ -10561,6 +10654,73 @@ pub struct ServeOptions {
 /// stub. The seam injects behavior, not authority — `dispatch_one`
 /// re-validates the ticket under `dispatch_lock` before calling it.
 type CheckupDispatch = dyn Fn(&Arc<Shared>, &Path, &str, &str) -> Result<Value> + Send + Sync;
+
+/// CAD-538: the `hosted:` table — `ServeOptions.lease` verbatim when
+/// set (a test pins `Some(Hosted::default())` for explicitly-off), else
+/// the tracker's pm.yaml. Absent is off; present-but-unreadable refuses
+/// — a daemon configured to lease must never start unleased on a typo.
+fn hosted_config(opts: &ServeOptions) -> Result<crate::lease::Hosted> {
+    if let Some(hosted) = &opts.lease {
+        return Ok(hosted.clone());
+    }
+    let pm_dir = match opts.provider_env.var("CADENCE_PM_DIR") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => crate::issue::default_dir()?,
+    };
+    crate::doctor::host::read_hosted_overrides(&pm_dir)
+        .map(|o| o.unwrap_or_default())
+        .map_err(Error::internal)
+}
+
+/// The SIGTERM flush bound — the held lease's `flush_timeout`, else
+/// `[hosted] flush_timeout_secs`, else the default. (The flush runs on
+/// every clean stop; the bound exists whether or not a lease did.)
+fn flush_budget(hosted: &crate::lease::Hosted, lease: Option<&crate::lease::LeaseCtl>) -> Duration {
+    if let Some(lease) = lease {
+        return lease.flush_timeout;
+    }
+    Duration::from_secs(
+        hosted
+            .flush_timeout_secs
+            .unwrap_or(crate::lease::DEFAULT_FLUSH_SECS)
+            .max(1),
+    )
+}
+
+/// CAD-538: the stop-time flush — fold the store's WAL back into the db
+/// and, on a leased daemon, commit whatever the tracker's index still
+/// stages — on one thread bounded by `budget`, so a wedged filesystem
+/// or hung git can never hold a signal hostage. The WAL fold runs on
+/// every clean stop (the store is always the daemon's own); the tracker
+/// half is leased-only — an unleased daemon's `pm_dir` may be the
+/// operator's own `~/pm`, which a routine stop must never commit into.
+/// A fenced daemon's tracker half refuses like every write; the WAL
+/// fold is the flush of what it committed while it still held the lease.
+fn lease_flush(shared: &Arc<Shared>, budget: Duration) {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let leased = shared.lease.is_some();
+    let shared = Arc::clone(shared);
+    thread::spawn(move || {
+        match shared.store.checkpoint() {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!("cadence: shutdown flush — WAL checkpoint deferred (a reader held it)")
+            }
+            Err(e) => eprintln!("cadence: shutdown flush — WAL checkpoint failed: {e}"),
+        }
+        if leased {
+            match shared.pm().map(|pm| pm.flush_pending(DAEMON_ALIAS)) {
+                Err(e) => eprintln!("cadence: shutdown flush — tracker flush skipped: {e}"),
+                Ok(Err(e)) => eprintln!("cadence: shutdown flush — tracker flush refused: {e}"),
+                Ok(Ok(_)) => {}
+            }
+        }
+        let _ = tx.send(());
+    });
+    if rx.recv_timeout(budget).is_err() {
+        eprintln!("cadence: shutdown flush exceeded {budget:?} — exiting anyway");
+    }
+}
 
 /// Slot configuration precedence: explicit `ServeOptions.slots`, then
 /// `[host]` in the repo's pm.yaml, then the built-in defaults.
@@ -10824,12 +10984,13 @@ pub fn serve_with(state_dir: &Path, opts: ServeOptions) -> Result<()> {
     // files may be the only copy of the previous store. Every start path
     // — `daemon start`, `run`, `restart` — comes through here.
     crate::backup::refuse_interrupted_restore(state_dir)?;
-    // Consume the shutdown marker and record this run's instance BEFORE
-    // the store opens — recover() protects the candidate entries as it
-    // sweeps, and a crash between here and open simply leaves nothing
-    // to adopt.
+    // CAD-538: a configured hosted lease is taken before the marker is
+    // consumed and before the store opens — a daemon that cannot hold
+    // it refuses here having written nothing but the singleton lock.
+    let hosted = hosted_config(&opts)?;
+    let lease = crate::lease::acquire(state_dir, &hosted)?;
     let hot = hot_restart_begin(state_dir);
-    let shared = Shared::new_hot(state_dir, &opts, hot)?;
+    let shared = Shared::new_leased(state_dir, &opts, hot, lease)?;
     // CAD-313: the operator secret exists from the first start, so an
     // upgrade needs no manual step. An existing file is never touched —
     // a wrong mode is refused at use, naming the fix — and a failure
@@ -10891,6 +11052,12 @@ pub fn serve_with(state_dir: &Path, opts: ServeOptions) -> Result<()> {
         let shared = Arc::clone(&shared);
         thread::spawn(move || shared.run_report_router());
     }
+    // CAD-538: the hosted lease heartbeat — joined in the shutdown
+    // tail so no renew can race the flush and release.
+    let lease_heartbeat = shared.lease.clone().map(|lease| {
+        let shared = Arc::clone(&shared);
+        thread::spawn(move || shared.run_lease_heartbeat(&lease))
+    });
     while !shared.closing.load(Ordering::SeqCst) {
         if opts.stop.as_ref().is_some_and(|s| s.load(Ordering::SeqCst)) {
             shared.begin_closing();
@@ -10926,7 +11093,22 @@ pub fn serve_with(state_dir: &Path, opts: ServeOptions) -> Result<()> {
     // or at the end of the tick it is in. Joining before the actors stop
     // lets a kickoff from that last tick settle into the shutdown marker.
     let _ = monitor_watch.join();
+    // CAD-538: the heartbeat must be quiet before the flush and the
+    // release — a late renew would rewrite the lease file a release
+    // just removed, and a renewal's writes are post-marker state.
+    if let Some(heartbeat) = lease_heartbeat {
+        let _ = heartbeat.join();
+    }
     shared.shutdown();
+    // CAD-538: flush before exit — WAL fold + the tracker's staged
+    // index — then release the lease LAST: a successor may start the
+    // moment it is gone, and this process must have no writes left.
+    lease_flush(&shared, flush_budget(&hosted, shared.lease.as_deref()));
+    if let Some(lease) = &shared.lease {
+        if let Err(e) = lease.release() {
+            eprintln!("cadence: lease release failed (expiry covers it): {e}");
+        }
+    }
     let _ = std::fs::remove_file(&socket_path);
     Ok(())
 }

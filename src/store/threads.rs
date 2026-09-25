@@ -327,7 +327,7 @@ fn message_entry<'a>(sender: &Sender, source: &str, body: &'a str, id: &'a str) 
 impl Store {
     /// The alias's thread, created on first use. The agent must exist.
     pub fn ensure_thread(&self, alias: &str) -> Result<Thread> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         self.agent_in(&tx, alias)?;
         let thread = Self::ensure_thread_in(&tx, alias)?;
@@ -400,7 +400,7 @@ impl Store {
     /// Append to the alias's thread. `Ok(None)` when it has none —
     /// agents without a chat are untouched.
     pub fn thread_append(&self, alias: &str, entry: NewEntry) -> Result<Option<i64>> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let seq = Self::thread_append_in(&tx, alias, entry)?;
         tx.commit()?;
@@ -417,7 +417,7 @@ impl Store {
         text: &str,
         payload: Option<Value>,
     ) -> Result<Option<i64>> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         if Self::thread_in(&tx, alias)?.is_none() {
             return Ok(None);
@@ -449,7 +449,7 @@ impl Store {
     /// appended now. A daemon restart drops what is held — the provider
     /// transcript still has it.
     pub fn thread_hold_running(&self, alias: &str, text: &str, payload: Value) -> Result<()> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         if Self::thread_in(&tx, alias)?.is_none() {
             return Ok(());

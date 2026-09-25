@@ -544,6 +544,7 @@ impl Store {
         }
         let store = Self {
             conn: Mutex::new(conn),
+            write_fence: Default::default(),
             adoptions: Mutex::new(std::collections::HashMap::new()),
             thread_held: Mutex::new(std::collections::HashMap::new()),
         };
@@ -566,7 +567,7 @@ impl Store {
     /// again. Anything else falls back to the fence below, one
     /// `turn_adopt_refused` event per rejected entry.
     fn recover(&self, marker: Option<&ConsumedMarker>) -> Result<()> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         // Store-level qualification of every recorded entry. A refused
         // entry still lands in the sweep below — the refusal only means
@@ -865,7 +866,7 @@ impl Store {
         &self,
         facts: &std::collections::HashMap<String, (String, u32, String)>,
     ) -> Result<Vec<AdoptEntry>> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let mut stmt = tx.prepare(
             "SELECT alias, id, turn_id, state FROM messages

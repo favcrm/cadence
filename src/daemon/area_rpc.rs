@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 
 use super::{optional_str, reject_identity_fields, required_str, Shared, DAEMON_ALIAS};
 use crate::error::{Error, Result};
-use crate::issue::{self, areas, Pm};
+use crate::issue::{self, areas};
 use crate::peer::AgentCaller;
 
 /// Longest ack note.
@@ -33,7 +33,7 @@ impl Shared {
                 "{VERB}: note must be one line of at most {NOTE_MAX} bytes"
             )));
         }
-        let pm = Pm::at(&self.pm_dir()?)?;
+        let pm = self.pm()?;
         let (project, _) = issue::write::issue_dir(&pm, &id)?;
         let all = areas::load(&pm.dir, &project.key)?;
         let area = all.iter().find(|a| a.name == name).ok_or_else(|| {
@@ -124,7 +124,7 @@ impl Shared {
         let caller = self.agent_caller(peer_pid, VERB)?;
         let id = issue::model::check_id(required_str(params, "issue")?)?;
         let mid = required_str(params, "message")?;
-        let pm = Pm::at(&self.pm_dir()?)?;
+        let pm = self.pm()?;
         issue::write::issue_dir(&pm, &id)?;
         let msg = self.store.message(mid)?.ok_or_else(|| {
             Error::rejected(format!(

@@ -262,7 +262,7 @@ impl Shared {
                 format!("{e} — the operator repairs it before the master dispatches"),
             )
         })?;
-        let pm = issue::Pm::at(&self.pm_dir()?)?;
+        let pm = self.pm()?;
         let ticket = issue::board::find_issue(&pm.dir, id)?;
         let front = &ticket.front;
         crate::issue::plan::gate_master(&pm.dir, front, &ticket.body)?;
@@ -373,7 +373,7 @@ impl Shared {
             )));
         }
         crate::secret::guard(&format!("{id}: escalation"), summary)?;
-        let pm = issue::Pm::at(&self.pm_dir()?)?;
+        let pm = self.pm()?;
         let ticket = issue::board::find_issue(&pm.dir, id)?;
         let open = task_report::open_questions(&ticket.dir, id)
             .into_iter()
@@ -420,7 +420,7 @@ impl Shared {
         let slug = required_str(params, "agent")?;
         let name = required_str(params, "file")?;
         let text = required_str(params, "text")?;
-        let pm = issue::Pm::at(&self.pm_dir()?)?;
+        let pm = self.pm()?;
         let out = master::write_file(&pm, slug, name, text, "operator")?;
         master::record(&self.state_dir, slug, name, &master::digest(text))?;
         Ok(out)
@@ -448,7 +448,7 @@ impl Shared {
                 ),
             ));
         }
-        let pm = issue::Pm::at(&self.pm_dir()?)?;
+        let pm = self.pm()?;
         // Files edited around the writer refuse BEFORE anything is
         // installed or registered — a refusal writes nothing.
         master::verify(
@@ -681,7 +681,7 @@ impl Shared {
             }
             self.master_or_operator(params, peer_pid, "posting into the master's thread")?;
         }
-        let pm = issue::Pm::at(&self.pm_dir()?)?;
+        let pm = self.pm()?;
         let escalated = master::escalations(&self.state_dir);
         let mut out = issue::summary::since(&pm, since, &escalated)?;
         out["routing_backlog"] = json!(self.router_backlog.load(Ordering::SeqCst));

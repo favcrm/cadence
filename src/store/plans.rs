@@ -399,7 +399,7 @@ impl Store {
         if stall_secs.is_some_and(|s| s < 0) {
             return Err(Error::rejected("--stall-secs must be >= 0"));
         }
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         self.agent_in(&tx, pm_alias)?;
         if let Ok(existing) = self.job_in(&tx, id) {
@@ -510,7 +510,7 @@ impl Store {
         base_sha: Option<&str>,
     ) -> Result<Task> {
         identifier(id, "Task id")?;
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let job = self.job_in(&tx, job_id)?;
         if job.state != "open" {
@@ -597,7 +597,7 @@ impl Store {
         message_id: Option<&str>,
         by: &str,
     ) -> Result<(Task, String, bool, bool)> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let task = self.task_in(&tx, task_id)?;
         let job = self.job_in(&tx, &task.job_id)?;
@@ -755,7 +755,7 @@ impl Store {
             )));
         }
         let sha = check_commit_sha(sha)?;
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let task = self.task_in(&tx, task_id)?;
         let job = self.job_in(&tx, &task.job_id)?;
@@ -907,7 +907,7 @@ impl Store {
         if let Some(s) = merged_sha {
             check_commit_sha(s)?;
         }
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let task = self.task_in(&tx, task_id)?;
         let job = self.job_in(&tx, &task.job_id)?;
@@ -949,7 +949,7 @@ impl Store {
     /// `job task reopen`: blocked/verified/failed → draft, revision
     /// resets to 0 — a re-scope, not a continuation. Operator intent.
     pub fn reopen_task(&self, task_id: &str, by: &str) -> Result<Task> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let task = self.task_in(&tx, task_id)?;
         if !matches!(task.state.as_str(), "blocked" | "verified" | "failed") {
@@ -978,7 +978,7 @@ impl Store {
 
     /// `job task fail`: PM marks a task unrecoverable. Terminal.
     pub fn fail_task(&self, task_id: &str, reason: &str, by: &str) -> Result<Task> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let task = self.task_in(&tx, task_id)?;
         if is_task_terminal(&task.state) {
@@ -1008,7 +1008,7 @@ impl Store {
     /// `running` kickoff cannot be unpasted and finishes on its own.
     /// Agents are never stopped by a job.
     pub fn cancel_task(&self, task_id: &str, by: &str) -> Result<Task> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let task = self.task_in(&tx, task_id)?;
         if is_task_terminal(&task.state) {
@@ -1049,7 +1049,7 @@ impl Store {
     /// in one transaction (queued kickoffs included). Running kickoffs
     /// are left alone — agents are never stopped by a job.
     pub fn cancel_job(&self, job_id: &str, by: &str) -> Result<Job> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let job = self.job_in(&tx, job_id)?;
         if matches!(job.state.as_str(), "done" | "cancelled" | "failed") {
@@ -1087,7 +1087,7 @@ impl Store {
 
     /// `job close`: legal only when every task is `done`.
     pub fn close_job(&self, job_id: &str, by: &str) -> Result<Job> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let job = self.job_in(&tx, job_id)?;
         if job.state != "open" {
@@ -1130,7 +1130,7 @@ impl Store {
     /// event; overwriting a different SHA is rejected.
     pub fn set_task_sha(&self, task_id: &str, sha: &str, by: &str) -> Result<Task> {
         let sha = check_commit_sha(sha)?;
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let task = self.task_in(&tx, task_id)?;
         if task.state != "review" {

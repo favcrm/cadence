@@ -203,7 +203,7 @@ impl Store {
     /// keys (`project`, `digest`, `by`, `at`, …) on [`APPROVAL_STREAM`]
     /// — never pruned, and not a mailbox anything can cancel.
     pub fn record_work_approval(&self, payload: Value) -> Result<()> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         Self::event(&conn, APPROVAL_STREAM, WORK_APPROVED_EVENT, payload)
     }
 
@@ -213,7 +213,7 @@ impl Store {
     /// `"<project>/<name>"` so a project approval and a workflow
     /// approval never share a row.
     pub fn record_workflow_approval(&self, payload: Value) -> Result<()> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         Self::event(&conn, APPROVAL_STREAM, WORKFLOW_APPROVED_EVENT, payload)
     }
 
@@ -245,7 +245,7 @@ impl Store {
     /// workflow approvals — a separate event kind, so a workflow named
     /// `a` and an app named `a` never share a row.
     pub fn record_app_approval(&self, payload: Value) -> Result<()> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         Self::event(&conn, APPROVAL_STREAM, APP_APPROVED_EVENT, payload)
     }
 
@@ -274,7 +274,7 @@ impl Store {
     /// CAD-449: record a verdict `report_verdict` accepted (`issue`,
     /// `verdict`, `sha`, `reviewer`, `report`) on [`VERDICT_STREAM`].
     pub fn record_review_verdict(&self, payload: Value) -> Result<()> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         Self::event(&conn, VERDICT_STREAM, VERDICT_RECORDED_EVENT, payload)
     }
 
@@ -331,7 +331,7 @@ impl Store {
 
     /// Standalone event insert for runtime/daemon bookkeeping.
     pub fn event_public(&self, alias: &str, kind: &str, payload: Value) -> Result<()> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         Self::event(&conn, alias, kind, payload)
     }
 
@@ -378,7 +378,7 @@ impl Store {
             None => default_approval_id(a.action, a.pr, a.head_sha),
         };
         identifier(&base, "Approval id")?;
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         for n in 1..=1000u32 {
             let id = if n == 1 {
@@ -441,7 +441,7 @@ impl Store {
         approval_source(source)?;
         approval_text(reason, "Approval revocation reason", 256)?;
         let evidence = json!({"approval_id": id, "source": source, "reason": reason});
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         if Self::approval_event(&tx, APPROVAL_RECORDED_EVENT, id)?.is_none() {
             return Err(Error::rejected(format!(
@@ -477,20 +477,20 @@ impl Store {
         job_id: Option<&str>,
         task_id: Option<&str>,
     ) -> Result<()> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         Self::event_scoped(&conn, alias, kind, payload, job_id, task_id)
     }
 
     /// Record the build commit this daemon process is running.
     pub fn record_running_build(&self, commit: &str) -> Result<()> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         crate::rollout::upsert_daemon_build(&conn, commit, crate::rollout::unix_now())
     }
 
     /// Refuse to keep running when this binary's commit is not the one
     /// the daemon last recorded, unless the caller holds the lease.
     pub fn enforce_running_build(&self) -> Result<()> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         crate::rollout::enforce_running_build(&conn)
     }
 
@@ -498,7 +498,7 @@ impl Store {
     /// The refusal itself cannot be inserted into the database it is
     /// refusing to modify.
     pub fn ingest_rollout_gate(&self, state_dir: &Path) -> Result<()> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         crate::rollout::ingest_gate_log(state_dir, &conn)?;
         Ok(())
     }

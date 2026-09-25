@@ -314,8 +314,7 @@ impl Shared {
         agent: &Agent,
         subject: Option<&str>,
     ) -> Result<(Outcome, String)> {
-        let pm_dir = self.pm_dir()?;
-        let pm = Pm::at(&pm_dir)?;
+        let pm = self.pm()?;
         let issues = board::load_all(&pm.dir, None)?;
         let records = delivery::load(&self.state_dir)?;
         let lanes = areas::dispatches(&self.state_dir);

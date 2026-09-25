@@ -10,9 +10,10 @@
 //! Agent states: starting -> idle <-> busy -> waiting_input ->
 //!   attention | stopping -> stopped | offline
 
+use crate::error::{Error, Result};
 use rusqlite::Connection;
 use serde_json::json;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod platform;
@@ -77,6 +78,10 @@ fn now() -> f64 {
 
 pub struct Store {
     conn: Mutex<Connection>,
+    /// CAD-538: the hosted-lease write fence — installed by the daemon
+    /// when it runs under `hosted.lease`. `write_conn` refuses once it
+    /// trips; reads stay up so a fenced daemon can still be diagnosed.
+    write_fence: std::sync::OnceLock<Arc<crate::lease::Fence>>,
     /// Adoption candidates that survived `recover()`'s store-level
     /// checks, keyed by alias — an agent may hold more than one
     /// in-flight turn (routed notifications beside its one report-owing
@@ -138,16 +143,75 @@ impl Store {
                     "store: connection lock was poisoned by a panic; recovered \
                      (rolled_back={rolled_back})"
                 );
-                if let Err(e) = Self::event(
-                    &guard,
-                    Self::DAEMON_STREAM,
-                    "store_poisoned",
-                    json!({"rolled_back": rolled_back}),
-                ) {
-                    eprintln!("store: could not record store_poisoned: {e}");
+                // CAD-538: a fenced daemon writes nothing — not even the
+                // forensic row for the poison it just recovered.
+                let fenced = self.write_fence.get().is_some_and(|f| f.check().is_some());
+                if !fenced {
+                    if let Err(e) = Self::event(
+                        &guard,
+                        Self::DAEMON_STREAM,
+                        "store_poisoned",
+                        json!({"rolled_back": rolled_back}),
+                    ) {
+                        eprintln!("store: could not record store_poisoned: {e}");
+                    }
                 }
                 guard
             }
+        }
+    }
+
+    /// CAD-538: the write path's connection — [`Self::conn`] plus the
+    /// hosted-lease fence, checked while holding the lock so the check
+    /// and the write that follows it are serialized against the trip.
+    /// `check` covers both halves of lease loss: the detected trip and
+    /// the held lease's expiry — a shutdown tail outliving the TTL
+    /// cannot commit into a lease a successor already took. The
+    /// heartbeat's [`Self::fence_writes`] drains the in-flight writer
+    /// before it returns, so no write starts post-trip.
+    fn write_conn(&self) -> Result<MutexGuard<'_, Connection>> {
+        let guard = self.conn();
+        if let Some(reason) = self.write_fence.get().and_then(|f| f.check()) {
+            return Err(Error::rejected(format!(
+                "store write refused — the daemon's hosted lease is lost: {reason}"
+            )));
+        }
+        Ok(guard)
+    }
+
+    /// Install the hosted-lease fence — the daemon calls this right
+    /// after open, only when a lease was acquired.
+    pub fn install_write_fence(&self, fence: Arc<crate::lease::Fence>) {
+        let _ = self.write_fence.set(fence);
+    }
+
+    /// Trip the fence, then wait out the writer in flight — after this
+    /// returns, every [`Self::write_conn`] observes the trip before its
+    /// write begins.
+    pub fn fence_writes(&self, reason: impl Into<String>) {
+        if let Some(fence) = self.write_fence.get() {
+            fence.trip(reason);
+        }
+        let _guard = self.conn();
+    }
+
+    /// Why writes are fenced, when they are (`health` and tests).
+    pub fn fence_reason(&self) -> Option<String> {
+        self.write_fence.get().and_then(|f| f.check())
+    }
+
+    /// CAD-538: fold the WAL back into the db file — the SIGTERM
+    /// flush's SQLite half. PASSIVE first (never blocks), then TRUNCATE;
+    /// a foreign reader keeps the file alive, which is `Ok(false)`,
+    /// not a failure — the WAL is durable either way, just not merged.
+    pub fn checkpoint(&self) -> Result<bool> {
+        let conn = self.conn();
+        let _ = conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()));
+        match conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+        }) {
+            Ok((0, log)) => Ok(log >= 0),
+            _ => Ok(false),
         }
     }
 }

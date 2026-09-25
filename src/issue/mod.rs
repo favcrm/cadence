@@ -112,6 +112,11 @@ impl PmConfig {
 pub struct Pm {
     pub dir: PathBuf,
     pub config: PmConfig,
+    /// CAD-538: the hosting daemon's lease, attached by `Shared::pm`.
+    /// When set, `lock`/`try_lock`/`commit` refuse the moment the
+    /// lease's fence trips, and commits carry a `Lease-Epoch:` trailer.
+    /// `None` for CLI/local use — nothing there changes.
+    lease: Option<crate::lease::PmLease>,
 }
 
 impl Pm {
@@ -131,7 +136,26 @@ impl Pm {
         Ok(Pm {
             dir: dir.to_path_buf(),
             config,
+            lease: None,
         })
+    }
+
+    /// CAD-538: attach the daemon's lease — `lock`/`try_lock`/`commit`
+    /// then refuse once the lease fence trips and `commit` stamps the
+    /// epoch. `pub(crate)`: only daemon code attaches; the CLI stays
+    /// lease-free.
+    pub(crate) fn attach_lease(&mut self, lease: crate::lease::PmLease) {
+        self.lease = Some(lease);
+    }
+
+    /// The lease gate every tracker write passes: refusal while the
+    /// fence is tripped, pass-through otherwise (and always when the
+    /// handle carries no lease — CLI, tests, unleased daemons).
+    fn fence_check(&self) -> Result<()> {
+        match &self.lease {
+            Some(lease) => lease.check(),
+            None => Ok(()),
+        }
     }
 
     pub fn open_default() -> Result<Pm> {
@@ -175,6 +199,7 @@ impl Pm {
     /// allocated under this same lock. Lock file, create-exclusive,
     /// bounded spin; the holder removes it on drop.
     pub fn lock(&self) -> Result<PmLock> {
+        self.fence_check()?;
         let path = self.dir.join(".write.lock");
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
@@ -203,6 +228,7 @@ impl Pm {
     /// it. For a caller that must not stall behind a writer (the daemon
     /// under its own lock, CAD-449) and retries later instead.
     pub fn try_lock(&self) -> Result<Option<PmLock>> {
+        self.fence_check()?;
         let path = self.dir.join(".write.lock");
         match std::fs::OpenOptions::new()
             .write(true)
@@ -250,7 +276,13 @@ impl Pm {
     /// `paths` are absolute (or `pm.dir`-relative) paths under the
     /// tracker; an empty list or a path outside `pm.dir` is a caller
     /// bug and refused. Returns the foreign paths, repo-relative.
+    ///
+    /// CAD-538: under a daemon lease the commit is refused once the
+    /// fence trips — checked again here so a `PmLock` taken before the
+    /// loss cannot sneak a commit past it — and the message gains a
+    /// `Lease-Epoch:` trailer naming the writer generation.
     pub fn commit(&self, paths: &[PathBuf], message: &str) -> Result<Vec<String>> {
+        self.fence_check()?;
         let mut rel = Vec::with_capacity(paths.len());
         for p in paths {
             let abs = if p.is_absolute() {
@@ -302,6 +334,22 @@ impl Pm {
                 foreign_listed(&foreign, foreign_extra)
             )
         };
+        // CAD-538: the lease epoch rides every commit a leased daemon
+        // makes — a reader can order writes across restarts and
+        // holdovers. The trailer joins the closing block directly, or
+        // starts one after a blank line when the message ends bare.
+        let message = match &self.lease {
+            Some(lease) => {
+                let body = message.trim_end_matches('\n');
+                let trailer_shaped = body.rsplit('\n').next().is_some_and(|l| l.contains(": "));
+                format!(
+                    "{body}{}Lease-Epoch: {}\n",
+                    if trailer_shaped { "\n" } else { "\n\n" },
+                    lease.epoch()
+                )
+            }
+            None => message,
+        };
         let mut commit = vec![
             "-c",
             "user.name=cadence",
@@ -320,6 +368,50 @@ impl Pm {
         }
         warn_foreign(&self.dir, &foreign, foreign_extra);
         Ok(foreign_out(foreign, foreign_extra))
+    }
+
+    /// CAD-538 — the tracker half of the SIGTERM flush: commit whatever
+    /// the index already stages, the pending write a crash or kill left
+    /// mid-flight. Never `git add` — worktree dirt and unstaged edits
+    /// are not this flush's to claim, and a planted file somebody only
+    /// dropped must not ride in. `Ok(false)` when nothing was staged or
+    /// the tracker lock was busy. A leased daemon that has lost its
+    /// lease is refused here like every other write.
+    pub fn flush_pending(&self, actor: &str) -> Result<bool> {
+        self.fence_check()?;
+        let Some(_lock) = self.try_lock()? else {
+            return Ok(false);
+        };
+        // exit 1 = the index holds staged changes; 0 = clean.
+        let staged = crate::reaper::status(
+            Command::new("git")
+                .arg("-C")
+                .arg(&self.dir)
+                .args(["diff", "--cached", "--quiet"]),
+        )
+        .map(|s| !s.success())
+        .unwrap_or(false);
+        if !staged {
+            return Ok(false);
+        }
+        let mut message = format!("cadence flush on stop\n\nActor: {actor}\n");
+        if let Some(lease) = &self.lease {
+            message.push_str(&format!("Lease-Epoch: {}\n", lease.epoch()));
+        }
+        git(
+            &self.dir,
+            &[
+                "-c",
+                "user.name=cadence",
+                "-c",
+                "user.email=cadence@localhost",
+                "commit",
+                "-q",
+                "-m",
+                message.as_str(),
+            ],
+        )?;
+        Ok(true)
     }
 
     /// True when the index carries a change under one of `rel`.
@@ -494,3 +586,97 @@ Paths never encode title, status or parent. Issues are never deleted — set\n\
   --from <file> as an ordered - [ ]/- [x] checklist; dispatch enforcement\n\
   remains a later CAD-159 change.\n\
 - Every write is one git commit, serialised on `.write.lock`.\n";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// CAD-538: a `Pm` carrying the daemon's lease stamps every commit
+    /// `Lease-Epoch:` and refuses every write the moment the fence
+    /// trips — lock, try_lock, commit and the shutdown flush alike.
+    #[test]
+    fn cad538_leased_pm_fences_writes_and_stamps_epoch() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let pm_dir = dir.path().join("pm");
+        let mut pm = Pm::init(&pm_dir).unwrap();
+        let ctl = crate::lease::acquire(
+            &state,
+            &crate::lease::Hosted {
+                lease: Some(format!("file:{}", dir.path().join("l").display())),
+                lease_ttl_secs: Some(30),
+                lease_renew_secs: Some(5),
+                flush_timeout_secs: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        pm.attach_lease(ctl.pm_lease());
+
+        // While the lease holds, writes land and commits carry the epoch.
+        let note = pm_dir.join("note.md");
+        std::fs::write(&note, "one\n").unwrap();
+        pm.commit(std::slice::from_ref(&note), "test write\n")
+            .unwrap();
+        let log = git(&pm_dir, &["log", "-1", "--format=%B"]).unwrap();
+        assert!(log.contains("Lease-Epoch: 1"), "{log}");
+        assert!(pm.lock().is_ok());
+        assert!(pm.try_lock().unwrap().is_some());
+
+        // Lease loss fences every write path, before anything moves.
+        ctl.fence().trip("test lease loss");
+        std::fs::write(&note, "two\n").unwrap();
+        let e = pm
+            .commit(std::slice::from_ref(&note), "stolen\n")
+            .unwrap_err();
+        assert!(e.to_string().contains("lease"), "{e}");
+        assert!(pm.lock().is_err());
+        assert!(pm.try_lock().is_err());
+        assert!(pm.flush_pending("test").is_err());
+        // Nothing of the refused write staged — no partial write.
+        let staged = git(&pm_dir, &["diff", "--cached", "--name-only"]).unwrap();
+        assert_eq!(staged, "", "the refused write staged: {staged}");
+        // The refused commit added no object: HEAD is still the
+        // `test write` commit.
+        let head = git(&pm_dir, &["log", "-1", "--format=%s"]).unwrap();
+        assert_eq!(head, "test write", "{head}");
+    }
+
+    /// CAD-538 r2: expiry is the second tripwire — a lease that lapses
+    /// while the daemon still runs (a shutdown tail outliving the TTL)
+    /// fences every write with no renewal failure at all.
+    #[test]
+    fn cad538_expired_lease_fences_writes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let pm_dir = dir.path().join("pm");
+        let mut pm = Pm::init(&pm_dir).unwrap();
+        let ctl = crate::lease::acquire(
+            &state,
+            &crate::lease::Hosted {
+                lease: Some(format!("file:{}", dir.path().join("l").display())),
+                lease_ttl_secs: Some(30),
+                lease_renew_secs: Some(5),
+                flush_timeout_secs: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        pm.attach_lease(ctl.pm_lease());
+
+        // Never tripped — but expired: the write paths refuse alike.
+        ctl.fence().set_expiry(0.0);
+        let note = pm_dir.join("note.md");
+        std::fs::write(&note, "two\n").unwrap();
+        let e = pm
+            .commit(std::slice::from_ref(&note), "post-expiry\n")
+            .unwrap_err();
+        assert!(e.to_string().contains("expired"), "{e}");
+        assert!(pm.lock().is_err());
+        assert!(pm.flush_pending("test").is_err());
+        let staged = git(&pm_dir, &["diff", "--cached", "--name-only"]).unwrap();
+        assert_eq!(staged, "", "the refused write staged: {staged}");
+    }
+}

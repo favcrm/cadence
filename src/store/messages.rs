@@ -378,7 +378,7 @@ impl Store {
         sender: &Sender,
         steer: &Steer,
     ) -> Result<(bool, String)> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let mut named: Vec<&str> = Vec::new();
         for m in steer.supersedes {
@@ -488,7 +488,7 @@ impl Store {
                 "a daemon message needs a daemon id and source, not {id}/{source}"
             )));
         }
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let out = self.enqueue_tx_as(
             &tx,
@@ -933,7 +933,7 @@ impl Store {
     /// `submitting`. The actor is the only caller; one actor per alias
     /// keeps turns serialized.
     pub fn take_queued(&self, alias: &str) -> Result<Take> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let agent = self.agent_in(&tx, alias)?;
         if !agent.enabled {
@@ -1005,7 +1005,7 @@ impl Store {
 
     /// Record that the provider acknowledged a turn start.
     pub fn mark_running(&self, message_id: &str, turn_id: &str) -> Result<()> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         tx.execute(
             "UPDATE messages SET state='running',turn_id=? WHERE id=?",
@@ -1032,7 +1032,7 @@ impl Store {
     /// Return a `submitting` message to `queued` — the submission gate
     /// refused before any paste, so retry is safe.
     pub fn requeue(&self, message_id: &str) -> Result<()> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         conn.execute(
             "UPDATE messages SET state='queued',started=NULL
              WHERE id=? AND state='submitting'",
@@ -1045,7 +1045,7 @@ impl Store {
     /// `running` (turn_id already recorded) with a durable `submitted`
     /// marker until an explicit ack/result report lands.
     pub fn mark_submitted(&self, message: &Message) -> Result<()> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         tx.execute(
             "UPDATE messages SET result=? WHERE id=? AND state='running'",
@@ -1070,7 +1070,7 @@ impl Store {
     /// pty-style (explicitly reported) turn carries the `submitted`
     /// marker, so a managed ack never makes its turn `awaiting_report`.
     pub fn mark_ack(&self, message: &Message, text: Option<&str>) -> Result<()> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let turn_result = tx
             .query_row(
@@ -1271,7 +1271,7 @@ impl Store {
     /// daemon's `wal_checkpointed` stream has no agents row, so the
     /// agent-removal `DELETE` never reaches it.
     pub fn prune_stream(&self, alias: &str, keep: i64) -> Result<()> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         conn.execute(
             "DELETE FROM events WHERE alias=?1 AND seq NOT IN (
                  SELECT seq FROM events WHERE alias=?1
