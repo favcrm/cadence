@@ -224,7 +224,7 @@ pub fn read_record(pm_dir: &Path, project: &str, name: &str) -> Result<Record> {
 fn write_record(file: &Path, record: &Record) -> Result<()> {
     let text = serde_yaml::to_string(record)
         .map_err(|e| Error::internal(format!("install record: {e}")))?;
-    std::fs::write(file, text)?;
+    write_verified(file, &text)?;
     Ok(())
 }
 
@@ -621,19 +621,56 @@ fn validate(root: &Path, agents: &HashSet<String>, agent_sources: &[String]) -> 
     })
 }
 
+/// `mkdir` that never follows a link: `create_dir` is EEXIST on any
+/// existing entry — a planted symlink included — and an existing entry
+/// is accepted only when it is a real directory (N5).
+fn mkdir_verified(dir: &Path) -> Result<()> {
+    match std::fs::create_dir(dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => match dir.symlink_metadata() {
+            Ok(m) if m.is_symlink() => Err(Error::rejected(format!(
+                "{} is a symlink — the tracker never follows links",
+                dir.display()
+            ))),
+            Ok(m) if m.is_dir() => Ok(()),
+            Ok(_) => Err(Error::rejected(format!(
+                "{} exists and is not a directory",
+                dir.display()
+            ))),
+            Err(e) => Err(e.into()),
+        },
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Write `text` to `file` without ever following a planted link —
+/// `O_NOFOLLOW` makes the open refuse one outright (N5).
+fn write_verified(file: &Path, text: &str) -> Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut f = opts.open(file)?;
+    std::io::Write::write_all(&mut f, text.as_bytes())?;
+    Ok(f)
+}
+
 /// Copy a verified bundle into `target`, 0644 files — no mode bits,
 /// exec or otherwise, travel with app content.
 fn copy_verified(files: &[(String, String)], target: &Path) -> Result<()> {
     for (rel, text) in files {
         let to = target.join(rel);
         if let Some(parent) = to.parent() {
-            std::fs::create_dir_all(parent)?;
+            mkdir_verified(parent)?;
         }
-        std::fs::write(&to, text)?;
+        let f = write_verified(&to, text)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&to, std::fs::Permissions::from_mode(0o644))?;
+            f.set_permissions(std::fs::Permissions::from_mode(0o644))?;
         }
     }
     Ok(())
@@ -654,6 +691,15 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// dir (never a source it claims to match). Any structural change —
 /// install or hand edit — changes it, which is what re-gates the app.
 pub fn digest(pm_dir: &Path, project: &str, name: &str) -> Result<String> {
+    digest_over(pm_dir, project, name, &[])
+}
+
+/// `digest` with caller-held workflow texts: for each `(rel, text)` in
+/// `over`, the entry `wf.<x>=` hashes `text` instead of re-reading the
+/// file — a caller that renders a buffer it already read proves the
+/// approval covered THOSE bytes, never a second read a co-host writer
+/// could have flipped (N2: plan_text renders what it digests).
+fn digest_over(pm_dir: &Path, project: &str, name: &str, over: &[(&str, &str)]) -> Result<String> {
     let dir = app_dir(pm_dir, project, name)?;
     let record = read_record(pm_dir, project, name)?;
     let text = std::fs::read_to_string(dir.join(MANIFEST)).map_err(|e| {
@@ -685,8 +731,13 @@ pub fn digest(pm_dir: &Path, project: &str, name: &str) -> Result<String> {
             .strip_prefix("workflows/")
             .and_then(|n| n.strip_suffix(".md"))
         {
-            let text = std::fs::read_to_string(path)
-                .map_err(|e| Error::rejected(format!("cannot read {rel}: {e}")))?;
+            let text: std::borrow::Cow<'_, str> = match over.iter().find(|(r, _)| r == rel) {
+                Some((_, t)) => std::borrow::Cow::Borrowed(*t),
+                None => std::borrow::Cow::Owned(
+                    std::fs::read_to_string(path)
+                        .map_err(|e| Error::rejected(format!("cannot read {rel}: {e}")))?,
+                ),
+            };
             keys.push_str(&format!("wf.{wf}={}\n", workflow::gate_digest(&text)?));
         } else {
             let bytes = std::fs::read(path)
@@ -789,10 +840,15 @@ fn clone_git(url: &str, into: &Path) -> Result<String> {
         std::process::Command::new("timeout")
             .arg("120")
             .arg("git")
-            .args(["clone", "--quiet", "--no-tags", "--depth", "1"])
+            .args(["clone", "--quiet", "--no-tags", "--depth", "1", "--"])
             .arg(url)
             .arg(into)
-            .env("GIT_TERMINAL_PROMPT", "0"),
+            .env("GIT_TERMINAL_PROMPT", "0")
+            // `--` keeps a dash-led source a repository name, never a
+            // switch; transports are pinned to https/ssh/file (a local
+            // dir installs as a path, never through clone) — no `ext::`
+            // or other transport ever runs (N3).
+            .env("GIT_ALLOW_PROTOCOL", "https:ssh:file"),
     )
     .map_err(|e| Error::rejected(format!("git clone of '{url}' failed to run: {e}")))?;
     if !out.status.success() {
@@ -906,14 +962,38 @@ pub fn install(
     let target = apps.join(&name);
     let record_path = apps.join(format!("{name}.yaml"));
     let _lock = pm.lock()?;
-    if target.symlink_metadata().is_ok() || record_path.symlink_metadata().is_ok() {
-        return Err(Error::rejected(format!(
-            "app '{name}' is already installed in {project_key} — `cadence app \
-             update {name} --project {project_key}` replaces it"
-        )));
+    for path in [&target, &record_path] {
+        match path.symlink_metadata() {
+            Ok(m) if m.is_symlink() => {
+                return Err(Error::rejected(format!(
+                    "{} is a symlink — the tracker never follows links",
+                    path.display()
+                )));
+            }
+            Ok(_) => {
+                return Err(Error::rejected(format!(
+                    "app '{name}' is already installed in {project_key} — `cadence \
+                     app update {name} --project {project_key}` replaces it"
+                )));
+            }
+            Err(_) => {}
+        }
     }
-    std::fs::create_dir_all(&apps)?;
-    std::fs::create_dir_all(&target)?;
+    // mkdir, never create_dir_all: a leaf planted between the check and
+    // here — a symlink included — is EEXIST, not a dir the copy writes
+    // into; then what exists is verified a real directory (N5).
+    mkdir_verified(&apps)?;
+    mkdir_verified(&target)?;
+    match target.symlink_metadata() {
+        Ok(m) if m.is_dir() && !m.is_symlink() => {}
+        _ => {
+            let _ = std::fs::remove_dir_all(&target);
+            return Err(Error::rejected(format!(
+                "{} was moved or replaced during install — refusing",
+                target.display()
+            )));
+        }
+    }
     let rollback = |keep_record: bool| {
         let _ = std::fs::remove_dir_all(&target);
         if !keep_record {
@@ -1663,7 +1743,11 @@ pub fn plan_text(
     let _ = app_dir(pm_dir, project, app)?;
     let _ = read_record(pm_dir, project, app)?;
     let text = read_workflow(pm_dir, project, app, wf)?;
-    let digest = digest(pm_dir, project, app)?;
+    // The digest covers THIS buffer for the rendered workflow — the
+    // bytes the operator approved are the bytes rendered, even if a
+    // co-host writer flips the file after this one read (N2).
+    let rel = format!("workflows/{wf}.md");
+    let digest = digest_over(pm_dir, project, app, &[(rel.as_str(), text.as_str())])?;
     let ok = app_approvals
         .get(&approval_key(project, app))
         .and_then(|p| p["digest"].as_str())
@@ -1733,42 +1817,68 @@ pub fn board_rows(pm_dir: &Path, project: &str, state_dir: &Path) -> Vec<Value> 
             },
             Err(_) => Value::Null,
         };
-        let Ok(wf_entries) = std::fs::read_dir(e.path().join("workflows")) else {
-            continue;
-        };
-        for wf in wf_entries.flatten() {
-            // Never follow a planted link — `check_installed` already
-            // attaches the reason the app cannot run.
-            if wf.file_type().map(|t| !t.is_file()).unwrap_or(true) {
-                continue;
+        // The listing goes through bundle_files — the same no-links walk
+        // install and approve enforce — so a symlinked workflows/ dir (or
+        // any planted link) becomes the app's error row instead of
+        // leaking the foreign dir's file names onto the board (N1).
+        match bundle_files(&e.path()) {
+            Ok(files) => {
+                for (rel, path) in &files {
+                    let Some(stem) = rel
+                        .strip_prefix("workflows/")
+                        .and_then(|n| n.strip_suffix(".md"))
+                    else {
+                        continue;
+                    };
+                    // A file verified real at scan could still be swapped
+                    // for a link before the read — re-check the leaf.
+                    if path
+                        .symlink_metadata()
+                        .map(|m| !m.is_file())
+                        .unwrap_or(true)
+                    {
+                        continue;
+                    }
+                    let text = std::fs::read_to_string(path).unwrap_or_default();
+                    let (_, _, doc) = workflow::check_text(&text, &agents, &agent_sources);
+                    let tpl = workflow::parse_template(&text).ok();
+                    let mut row = json!({
+                        "project": project,
+                        "name": format!("{name}/{stem}"),
+                        "app": name,
+                        "title": doc.as_ref().map(|d| d.title.clone()),
+                        "tickets": doc.map(|d| d.tickets.len()),
+                        "inputs": tpl.map(|t| t.inputs.iter().map(|(k, s)| json!({
+                            "name": k, "ask": s.ask, "optional": s.optional,
+                        })).collect::<Vec<_>>()),
+                        "approved": approved,
+                        "digest": app_digest.as_ref().ok(),
+                    });
+                    if let Err(why) = &checked {
+                        row["error"] = json!(why);
+                    }
+                    rows.push(row);
+                }
             }
-            let Some(stem) = wf
-                .file_name()
-                .to_str()
-                .and_then(|n| n.strip_suffix(".md"))
-                .map(str::to_string)
-            else {
-                continue;
-            };
-            let text = std::fs::read_to_string(wf.path()).unwrap_or_default();
-            let (_, _, doc) = workflow::check_text(&text, &agents, &agent_sources);
-            let tpl = workflow::parse_template(&text).ok();
-            let mut row = json!({
-                "project": project,
-                "name": format!("{name}/{stem}"),
-                "app": name,
-                "title": doc.as_ref().map(|d| d.title.clone()),
-                "tickets": doc.map(|d| d.tickets.len()),
-                "inputs": tpl.map(|t| t.inputs.iter().map(|(k, s)| json!({
-                    "name": k, "ask": s.ask, "optional": s.optional,
-                })).collect::<Vec<_>>()),
-                "approved": approved,
-                "digest": app_digest.as_ref().ok(),
-            });
-            if let Err(why) = &checked {
-                row["error"] = json!(why);
+            Err(why) => {
+                // One row still names the broken app — the board shows
+                // why it cannot run rather than hiding it.
+                let mut row = json!({
+                    "project": project,
+                    "name": name,
+                    "app": name,
+                    "title": Value::Null,
+                    "tickets": Value::Null,
+                    "inputs": Value::Null,
+                    "approved": approved,
+                    "digest": app_digest.as_ref().ok(),
+                });
+                row["error"] = match &checked {
+                    Err(checked_why) => json!(checked_why),
+                    Ok(_) => json!(why.to_string()),
+                };
+                rows.push(row);
             }
-            rows.push(row);
         }
     }
     rows

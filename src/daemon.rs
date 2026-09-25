@@ -4476,6 +4476,11 @@ impl Shared {
             .collect();
         let (agents, sources) =
             crate::issue::workflow::known_agents(&pm_dir, Some(project), &aliases);
+        // The tracker write lock `app update`/`install` also take: the
+        // installed bundle must not change under check_installed and
+        // digest, or the approval could pin a half-updated read (N6).
+        let pm = crate::issue::Pm::at(&pm_dir)?;
+        let _lock = pm.lock()?;
         let notes = crate::issue::app::check_installed(&pm_dir, project, name, &agents, &sources)
             .map_err(|e| {
             Error::rejected(format!(

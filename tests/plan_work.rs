@@ -4089,8 +4089,8 @@ fn app_board_rows_never_follows_a_symlinked_workflows_dir() {
     // Nothing under the link is listed — no stem, no title.
     assert!(
         !rows.iter().any(|r| {
-            r["name"].as_str().map_or(false, |n| n.contains("leak"))
-                || r["title"].as_str().map_or(false, |t| t.contains("Run:"))
+            r["name"].as_str().is_some_and(|n| n.contains("leak"))
+                || r["title"].as_str().is_some_and(|t| t.contains("Run:"))
         }),
         "a planted workflows/ link must not list foreign workflows: {rows:?}"
     );
@@ -4100,7 +4100,10 @@ fn app_board_rows_never_follows_a_symlinked_workflows_dir() {
         .find(|r| r["app"] == "studio")
         .unwrap_or_else(|| panic!("no studio row: {rows:?}"));
     assert!(
-        row["error"].as_str().unwrap_or_default().contains("symlink"),
+        row["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("symlink"),
         "{row}"
     );
 }
@@ -4125,7 +4128,9 @@ fn app_plan_text_digests_the_bytes_it_renders() {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
     let provided: std::collections::BTreeMap<String, String> =
-        [("title".to_string(), "x".to_string())].into_iter().collect();
+        [("title".to_string(), "x".to_string())]
+            .into_iter()
+            .collect();
     let propose = || {
         cadence_agent::issue::app::plan_text(
             &f.pm_dir, &approvals, "demo", "studio", "do-check", &provided,
@@ -4159,7 +4164,11 @@ fn open_count(path: &Path, run: impl FnOnce()) -> usize {
     assert!(fd >= 0, "inotify_init1");
     let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
     let wd = unsafe {
-        libc::inotify_add_watch(fd, c.as_ptr(), libc::IN_OPEN | libc::IN_ACCESS | libc::IN_CLOSE_NOWRITE)
+        libc::inotify_add_watch(
+            fd,
+            c.as_ptr(),
+            libc::IN_OPEN | libc::IN_ACCESS | libc::IN_CLOSE_NOWRITE,
+        )
     };
     assert!(wd >= 0, "inotify_add_watch {}", path.display());
     let mut buf = [0u8; 8192];
@@ -4202,13 +4211,7 @@ fn app_install_never_writes_through_a_planted_symlink() {
         "studio",
         &[("app.md", APP_MD), ("workflows/do-check.md", APP_WF)],
     );
-    let (ok, out) = f.cli(&[
-        "app",
-        "install",
-        src.to_str().unwrap(),
-        "--project",
-        "demo",
-    ]);
+    let (ok, out) = f.cli(&["app", "install", src.to_str().unwrap(), "--project", "demo"]);
     assert!(!ok && out.to_string().contains("symlink"), "{out}");
     assert!(
         std::fs::read_dir(&loot).unwrap().next().is_none(),
@@ -4237,20 +4240,11 @@ fn app_install_git_pins_url_and_transport() {
     // `-C` after `--` is the repository name — the refusal names it as
     // one; without `--` git reports an unknown switch instead.
     let (ok, out) = f.cli(&["app", "install", "--project", "demo", "--", "-C"]);
-    assert!(
-        !ok && out.to_string().contains("repository '-C'"),
-        "{out}"
-    );
+    assert!(!ok && out.to_string().contains("repository '-C'"), "{out}");
 
     // `git://` is not in the pinned allowlist — refused by git before
     // it can connect anywhere.
-    let (ok, out) = f.cli(&[
-        "app",
-        "install",
-        "git://127.0.0.1:1/x",
-        "--project",
-        "demo",
-    ]);
+    let (ok, out) = f.cli(&["app", "install", "git://127.0.0.1:1/x", "--project", "demo"]);
     assert!(
         !ok && out.to_string().contains("transport 'git' not allowed"),
         "{out}"
@@ -4299,18 +4293,19 @@ fn app_approve_takes_the_pm_lock() {
     app_install_studio(&f);
     let pm = cadence_agent::issue::Pm::at(&f.pm_dir).unwrap();
     let held = pm.lock().unwrap();
-    let err = f
-        .d
-        .operator_rpc("app_approve", json!({"project": "demo", "name": "studio"}))
-        .unwrap_err();
+    let err =
+        f.d.operator_rpc("app_approve", json!({"project": "demo", "name": "studio"}))
+            .unwrap_err();
     assert!(err.to_string().contains("locked"), "{err}");
     drop(held);
-    let out = f
-        .d
-        .operator_rpc("app_approve", json!({"project": "demo", "name": "studio"}))
-        .unwrap();
+    let out =
+        f.d.operator_rpc("app_approve", json!({"project": "demo", "name": "studio"}))
+            .unwrap();
     assert!(
-        out["digest"].as_str().unwrap_or_default().starts_with("sha256:"),
+        out["digest"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("sha256:"),
         "{out}"
     );
 }
