@@ -343,9 +343,22 @@ impl FakePlatform {
     }
 
     /// The rendered preview the press reviews (§5.4) — deterministic,
-    /// bounded, in the platform's terms.
-    pub fn preview(&self, tool: &str, input: &Value) -> String {
-        let mut text = format!("{tool} on {}: {input}", self.table.platform);
+    /// bounded, in the platform's terms. `widgets.publish` renders its
+    /// deploy sentence (the fixture vectors pin it); every other tool
+    /// renders the generic `{tool} on {platform}/{account}: {input}`.
+    pub fn preview(&self, account: &str, tool: &str, input: &Value) -> String {
+        let mut text = if tool == "widgets.publish" {
+            let widget = input["widget"].as_str().unwrap_or("?");
+            let mut s = format!("publish {widget} to {}/{account}", self.table.platform);
+            if let Some(source) = input.get("source").and_then(Value::as_str) {
+                if let Some(hash) = self.source_hash(source) {
+                    s.push_str(&format!(" from {source}@{hash}"));
+                }
+            }
+            s
+        } else {
+            format!("{tool} on {}/{account}: {input}", self.table.platform)
+        };
         const PREVIEW_CAP: usize = 512;
         if text.len() > PREVIEW_CAP {
             text.truncate(PREVIEW_CAP);
@@ -377,15 +390,23 @@ impl FakePlatform {
                     .lock()
                     .unwrap()
                     .insert(tool.to_string(), input.clone());
-                (
-                    true,
-                    None,
-                    Ok(json!({
+                // `widgets.publish` lands the specimen payload the
+                // vectors pin; other tools report the generic apply.
+                let payload = if tool == "widgets.publish" {
+                    let widget = input["widget"].as_str().unwrap_or("?");
+                    json!({
+                        "widget": widget,
+                        "published": true,
+                        "platform_ref": format!("fixture://widgets/{widget}"),
+                    })
+                } else {
+                    json!({
                         "tool": tool,
                         "applied": input,
                         "platform_ref": format!("fixture://{tool}#{seq}"),
-                    })),
-                )
+                    })
+                };
+                (true, None, Ok(payload))
             }
         };
         self.executions.lock().unwrap().push(Execution {
@@ -433,6 +454,43 @@ impl FakePlatform {
             .iter()
             .filter(|e| e.tool == tool)
             .count()
+    }
+}
+
+// CAD-506: the platform double is one `PlatformAdapter` — the same
+// reviewed table, manifest pin, preview and idempotent send the gate
+// drives for a real adapter. The credential crosses the seam as
+// enrolled opaque bytes; the fake ignores it.
+impl crate::platform::PlatformAdapter for FakePlatform {
+    fn table(&self) -> &ToolTable {
+        self.table()
+    }
+
+    fn reported_manifest_version(&self) -> Option<String> {
+        self.reported_manifest_version()
+    }
+
+    fn preview(&self, account: &str, tool: &str, input: &Value) -> String {
+        self.preview(account, tool, input)
+    }
+
+    fn execute(
+        &self,
+        _credential: &[u8],
+        tool: &str,
+        input: &Value,
+        idempotency_key: &str,
+        expected_hash: Option<&str>,
+    ) -> std::result::Result<Value, String> {
+        self.execute(tool, input, idempotency_key, expected_hash)
+    }
+
+    fn read_back(&self, tool: &str, input: &Value) -> Verified {
+        self.read_back(tool, input)
+    }
+
+    fn source_hash(&self, source: &str) -> Option<String> {
+        self.source_hash(source)
     }
 }
 

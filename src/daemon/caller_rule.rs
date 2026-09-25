@@ -440,6 +440,28 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
              the holder (CAD-366)",
         ),
     ),
+    // CAD-506: the effect gate (ADR 0006 §5.2, §5.4).
+    (
+        "platform_call",
+        Rule::Handler(
+            "request_caller: the calling agent is connection-derived; the \
+             record's agent is never a request field (CAD-506)",
+        ),
+    ),
+    (
+        "platform_effects",
+        Rule::Handler(
+            "effect_caller: an agent reads its own pending effects; the \
+             operator reads all (CAD-506)",
+        ),
+    ),
+    (
+        "platform_effect_close",
+        Rule::Handler(
+            "effect_caller: the operator closes any closeable row; an agent \
+             closes only its own waiting one (CAD-506)",
+        ),
+    ),
 ];
 
 /// The rule for `method`; `None` for a method the daemon does not

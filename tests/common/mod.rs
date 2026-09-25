@@ -941,6 +941,10 @@ pub fn daemon_opts() -> daemon::ServeOptions {
         // CAD-313: links and sessions expire by the wall clock unless a
         // test injects one.
         operator_clock: None,
+        // CAD-506: no platform adapters — a platform call in a test
+        // daemon fails closed unless the test registers one.
+        platforms: Default::default(),
+        effect_execute_gate: None,
     }
 }
 
