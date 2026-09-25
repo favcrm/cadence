@@ -395,6 +395,16 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("operator_session_check", Rule::Bearer),
     ("operator_session_logout", Rule::Bearer),
     ("operator_session_stolen", Rule::Bearer),
+    // CAD-526: the platform sign-in exchange — the compact JWS is the
+    // credential; a connection that derives an agent is refused before
+    // the `jti` is consumed (the handler checks).
+    (
+        "board_session_open",
+        Rule::Handler(
+            "assertion bearer; agent callers refused pre-verification (CAD-526)",
+        ),
+    ),
+    ("board_session_check", Rule::Bearer),
     (
         "operator_sessions",
         Rule::Handler("operator_with_secret: operator proof AND the operator secret (CAD-313)"),

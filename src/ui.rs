@@ -85,6 +85,31 @@ pub struct UiFlags {
     #[arg(long, num_args = 0..=1, default_missing_value = "9450",
            value_name = "HTTPS_PORT")]
     pub tailscale: Option<u16>,
+    /// CAD-526: serve this company's board on its AgenticOS public name
+    /// — `acme.cadencecloud.app`, `acme.board.localhost:port` locally —
+    /// where sign-in is the platform's identity-assertion contract and
+    /// the local login link does not apply. The assertion's `aud` must
+    /// equal exactly this host (hostname plus port when present).
+    /// Env `AGENTICOS_BOARD_HOST`.
+    #[arg(long)]
+    pub board_host: Option<String>,
+    /// CAD-526: the AgenticOS API origin that signs this board's
+    /// assertions — the JWS `iss`, and where the platform JWKS is
+    /// fetched from (`{iss}/.well-known/agenticos-board-jwks.json`).
+    /// Env `AGENTICOS_BOARD_ISSUER`.
+    #[arg(long)]
+    pub board_issuer: Option<String>,
+    /// CAD-526: the platform workspace/company id this instance serves —
+    /// assertions naming another company are refused, not routed.
+    /// Env `AGENTICOS_BOARD_COMPANY`.
+    #[arg(long)]
+    pub board_company: Option<String>,
+    /// CAD-526: where an absent or expired board session redirects —
+    /// `{app}/v2/board/authorize` on the app origin.
+    /// Env `AGENTICOS_BOARD_AUTHORIZE_URL`; defaults to
+    /// `{issuer}/v2/board/authorize`.
+    #[arg(long)]
+    pub board_authorize_url: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -245,6 +270,26 @@ fn tailnet_url(dns_name: &str, https_port: u16) -> String {
     }
 }
 
+/// CAD-526: this board's AgenticOS public identity as `ui start`
+/// recorded it — all four fields together or none.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct PublicBoard {
+    /// The board's public host — `aud` must equal exactly this
+    /// (hostname plus port when present, e.g. `acme.board.localhost:3123`
+    /// locally or `acme.cadencecloud.app` in production).
+    pub host: String,
+    /// The platform issuer — the JWS `iss`, and the origin the JWKS is
+    /// fetched from (`{iss}/.well-known/agenticos-board-jwks.json`).
+    pub issuer: String,
+    /// The company/workspace id this instance serves — `company` must
+    /// equal it; one Cadence serves one company (contract §9).
+    pub company: String,
+    /// Where an absent or expired browser session redirects:
+    /// `{app}/v2/board/authorize` on the app origin.
+    pub authorize_url: String,
+}
+
 /// The effective options `ui start` persists — a later plain start
 /// reuses them, `ui status` prints them, `--reset` forgets them.
 #[derive(Serialize, Deserialize, Default, Clone)]
@@ -257,6 +302,8 @@ pub struct UiOpts {
     pub allow_origins: Vec<String>,
     pub read_only: bool,
     pub tailscale: Option<TailscaleOpts>,
+    /// The AgenticOS board-identity configuration (CAD-526).
+    pub board: Option<PublicBoard>,
 }
 
 /// Everything the running server needs, resolved.
@@ -296,6 +343,11 @@ pub struct ServeOpts {
     /// command line — a test's board on a thread of the runner stops
     /// with its test instead of serving for the rest of the run.
     pub stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// CAD-526: this board's public AgenticOS name, when configured.
+    /// Requests that carry its Host are the platform sign-in surface —
+    /// `__platform/*` routes and `__Host-aos-board-session` reads —
+    /// never the local login flow.
+    pub public: Option<PublicBoard>,
 }
 
 fn opts_file(state_dir: &Path) -> PathBuf {
@@ -386,6 +438,10 @@ fn resolve_opts(flags: &UiFlags, persisted: &UiOpts) -> Result<(UiOpts, ServeOpt
             flags.read_only || persisted.read_only
         },
         tailscale: persisted.tailscale.clone(),
+        // CAD-526: each field resolves flag → env → persisted; the block
+        // is all-or-nothing — any field present with another missing is
+        // an operator error, never a partial trust root.
+        board: resolve_board(flags, persisted)?,
     };
     if let Some(https_port) = flags.tailscale {
         crate::sandbox::refuse_global("`ui start --tailscale`")?;
@@ -410,9 +466,83 @@ fn resolve_opts(flags: &UiFlags, persisted: &UiOpts) -> Result<(UiOpts, ServeOpt
     Ok((eff, serve))
 }
 
-/// Build the runtime view of effective options: tailnet-derived
-/// Host/Origin entries unioned in (deduped, case-insensitive) and the
-/// loopback rule enforced.
+/// CAD-526: merge the board-identity configuration — flags win, then
+/// `AGENTICOS_BOARD_*` env (how the hosted container is told), then the
+/// persisted block. All of host/issuer/company must resolve together.
+/// When a block resolves, its trust root (`host`, `issuer`, `company`)
+/// is written to the daemon-owned `operator/board-identity.json` so the
+/// board RPC has the same root the session check enforces.
+fn resolve_board(flags: &UiFlags, persisted: &UiOpts) -> Result<Option<PublicBoard>> {
+    let field = |flag: Option<&String>, env: &str, saved: Option<&String>| {
+        flag.cloned()
+            .or_else(|| std::env::var(env).ok())
+            .or_else(|| saved.cloned())
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    let saved = persisted.board.as_ref();
+    let host = field(
+        flags.board_host.as_ref(),
+        "AGENTICOS_BOARD_HOST",
+        saved.map(|b| &b.host),
+    );
+    let issuer = field(
+        flags.board_issuer.as_ref(),
+        "AGENTICOS_BOARD_ISSUER",
+        saved.map(|b| &b.issuer),
+    );
+    let company = field(
+        flags.board_company.as_ref(),
+        "AGENTICOS_BOARD_COMPANY",
+        saved.map(|b| &b.company),
+    );
+    let authorize_url = field(
+        flags.board_authorize_url.as_ref(),
+        "AGENTICOS_BOARD_AUTHORIZE_URL",
+        saved.map(|b| &b.authorize_url),
+    );
+    if host.is_none() && issuer.is_none() && company.is_none() && authorize_url.is_none() {
+        return Ok(None);
+    }
+    let missing = |name: &str, env: &str| -> Error {
+        Error::rejected(format!(
+            "board sign-in needs {name} — pass `--board-{name}` or set {env} \
+             (host, issuer and company must all resolve together)"
+        ))
+    };
+    let host = host.ok_or_else(|| missing("host", "AGENTICOS_BOARD_HOST"))?;
+    let issuer = issuer.ok_or_else(|| missing("issuer", "AGENTICOS_BOARD_ISSUER"))?;
+    let company = company.ok_or_else(|| missing("company", "AGENTICOS_BOARD_COMPANY"))?;
+    if !crate::board_identity::valid_aud(&host) {
+        return Err(Error::rejected(format!(
+            "invalid board host '{host}' — expected `slug.board-domain` or \
+             `slug.board.localhost:port` (lowercase host, optional port)"
+        )));
+    }
+    if !(issuer.starts_with("https://") || issuer.starts_with("http://")) {
+        return Err(Error::rejected(format!(
+            "invalid board issuer '{issuer}' — the platform origin, e.g. \
+             https://api.agenticos.com or http://localhost:8810"
+        )));
+    }
+    let authorize_url = authorize_url
+        .unwrap_or_else(|| format!("{}/v2/board/authorize", issuer.trim_end_matches('/')));
+    if !(authorize_url.starts_with("https://") || authorize_url.starts_with("http://")) {
+        return Err(Error::rejected(
+            "invalid board authorize URL — an absolute https:// (or local http://) address",
+        ));
+    }
+    Ok(Some(PublicBoard {
+        host,
+        issuer,
+        company,
+        authorize_url,
+    }))
+}
+
+/// Build the runtime view of effective options: tailnet- and
+/// public-board-derived Host/Origin entries unioned in (deduped,
+/// case-insensitive) and the loopback rule enforced.
 fn serve_opts(eff: &UiOpts) -> Result<ServeOpts> {
     let host = eff.host.clone().unwrap_or_else(|| "127.0.0.1".to_string());
     let port = eff.port.unwrap_or(3010);
@@ -440,6 +570,28 @@ fn serve_opts(eff: &UiOpts) -> Result<ServeOpts> {
         }
         tailnet = Some((ts.dns_name.clone(), ts.https_port));
     }
+    // CAD-526: the public board name (and its write origin) enter the
+    // allowlists at resolve time, like the tailnet ones — never a
+    // caller-supplied header.
+    if let Some(public) = &eff.board {
+        if !allow_hosts
+            .iter()
+            .any(|x| x.eq_ignore_ascii_case(&public.host))
+        {
+            allow_hosts.push(public.host.clone());
+        }
+        let origin = format!(
+            "{}://{}",
+            operator::public_scheme(&public.host),
+            public.host
+        );
+        if !allow_origins
+            .iter()
+            .any(|x| x.eq_ignore_ascii_case(&origin))
+        {
+            allow_origins.push(origin);
+        }
+    }
     Ok(ServeOpts {
         host,
         port,
@@ -454,6 +606,7 @@ fn serve_opts(eff: &UiOpts) -> Result<ServeOpts> {
         delivery_sync_every: None,
         delivery_sync: None,
         stop: None,
+        public: eff.board.clone(),
     })
 }
 
@@ -2274,7 +2427,7 @@ fn stream_events(request: Request, state_dir: &Path, pm_dir: &Path) {
     }
 }
 
-fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
+fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
     let method = request.method().clone();
     let head_only = method == Method::Head;
     let is_write = matches!(method, Method::Post | Method::Patch | Method::Delete);
@@ -2331,6 +2484,65 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
     };
 
     let send = |req: Request, resp: HttpResp| send(req, resp, head_only);
+
+    // CAD-526: a request that names this board's public host is on the
+    // platform sign-in surface. `/__platform/*` is the contract's
+    // reserved prefix; every other request needs the
+    // `__Host-aos-board-session` the session endpoint mints — never the
+    // local login flow (`operator::open` refuses `Origin::Public` too).
+    let public_host = opts
+        .public
+        .as_ref()
+        .is_some_and(|p| host.trim().eq_ignore_ascii_case(&p.host));
+    if public_host {
+        if path.starts_with("/__platform/") {
+            let resp = match (method.as_str(), path.as_str()) {
+                ("GET" | "HEAD", "/__platform/login") => operator::platform_login(opts, raw_query),
+                ("GET" | "HEAD", _) => operator::platform_read(&path),
+                ("POST", "/__platform/session") => {
+                    operator::platform_session(&mut request, state_dir, opts)
+                }
+                _ => operator::platform_unknown(),
+            };
+            send(request, resp);
+            return;
+        }
+        if is_write {
+            let send_write = |req: Request, resp: HttpResp| {
+                read_model::get(state_dir, pm_dir).invalidate();
+                send(req, resp)
+            };
+            write_route(
+                request,
+                &method,
+                &path,
+                &query,
+                state_dir,
+                pm_dir,
+                opts,
+                &send_write,
+            );
+            return;
+        }
+        // A read on the public host needs a live board session —
+        // `/api/health` alone stays open so a probe can see the board
+        // is up without holding a credential.
+        if path != "/api/health" {
+            match operator::public_session(&request, state_dir, opts) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    let resp = operator::session_bounce(&request, &path, opts);
+                    send(request, resp);
+                    return;
+                }
+                Err(resp) => {
+                    send(request, resp);
+                    return;
+                }
+            }
+        }
+        // Signed-in reads fall through to the shared dispatch below.
+    }
 
     if is_write {
         // The writer's next read must see its write (CAD-325): drop the
@@ -2950,6 +3162,20 @@ pub fn read_model_stats(state_dir: &Path, pm_dir: &Path) -> Value {
 static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
+    // CAD-526: a publicly-named board hands the daemon its trust root —
+    // `operator/board-identity.json`, under the same uid-private rules
+    // as the operator secret — before the first request can mint a
+    // session against it.
+    if let Some(public) = &opts.public {
+        crate::board_identity::write_config(
+            state_dir,
+            &crate::board_identity::Config {
+                host: public.host.clone(),
+                issuer: public.issuer.clone(),
+                company: public.company.clone(),
+            },
+        )?;
+    }
     // The tailnet proof's operator latch starts with this process: read
     // tailscaled's operator user now, never trust a caller-made latch.
     let mut opts = opts.clone();
@@ -3289,6 +3515,11 @@ fn status(state_dir: &Path) -> Result<i32> {
                 "read_only": opts.read_only,
             },
             "tailnet_url": opts.tailscale.as_ref().map(|t| t.url()),
+            // CAD-526: the public sign-in surface, when configured.
+            "board_url": opts.board.as_ref().map(|b| format!(
+                "{}://{}", operator::public_scheme(&b.host), b.host)),
+            "board_issuer": opts.board.as_ref().map(|b| b.issuer.clone()),
+            "board_company": opts.board.as_ref().map(|b| b.company.clone()),
         }))
         .unwrap_or_default()
     );

@@ -53,15 +53,21 @@ pub const ABSOLUTE_SECS: i64 = 7 * 24 * 3600;
 const TOUCH_EVERY_SECS: i64 = 60;
 /// A secret, nonce or token: 32 bytes as lowercase hex.
 const CREDENTIAL_HEX: usize = 64;
+/// A public (CAD-526) session's absolute lifetime — the contract's 60
+/// minutes. The cookie's `Max-Age` matches; there is no idle extension.
+pub const PUBLIC_SESSION_SECS: i64 = 60 * 60;
 
 /// Where a login link may be exchanged and a session used: the board on
-/// this host (any loopback Host) or through the proven `tailscale serve`
-/// proxy (CAD-336). A session never crosses from one to the other.
+/// this host (any loopback Host), through the proven `tailscale serve`
+/// proxy (CAD-336), or on the board's configured public name — the
+/// AgenticOS-asserted surface (CAD-526). A session never crosses from
+/// one to the other.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Origin {
     Loopback,
     Tailnet,
+    Public,
 }
 
 impl Origin {
@@ -69,6 +75,7 @@ impl Origin {
         match raw {
             "loopback" => Some(Self::Loopback),
             "tailnet" => Some(Self::Tailnet),
+            "public" => Some(Self::Public),
             _ => None,
         }
     }
@@ -77,6 +84,7 @@ impl Origin {
         match self {
             Self::Loopback => "loopback",
             Self::Tailnet => "tailnet",
+            Self::Public => "public",
         }
     }
 }
@@ -290,6 +298,100 @@ pub fn rotate_secret(state_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Write a small private file under the operator directory — `0600`,
+/// tmp+rename so a partial write never replaces a good one. Used for
+/// trust-root config the daemon reads back (CAD-526 board identity).
+/// The directory is created `0700` when absent and strict-checked
+/// always.
+pub fn write_private(state_dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
+    let dir = dir(state_dir);
+    match fs::DirBuilder::new().mode(0o700).create(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(Error::internal(format!("{}: {e}", dir.display()))),
+    }
+    check_dir(&dir)?;
+    if name.is_empty() || name.contains('/') || name.contains('\\') || name.starts_with('.') {
+        return Err(Error::internal(format!(
+            "operator file name '{name}' is not a bare file name"
+        )));
+    }
+    let path = dir.join(name);
+    let tmp = dir.join(format!("{name}.tmp"));
+    match fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(Error::internal(format!("{}: {e}", tmp.display()))),
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// Read a private file under the operator directory, under the same
+/// strict modes as the secret: real directory owned by this euid with
+/// no group/other bit, then a `O_NOFOLLOW` open of a regular file.
+/// Missing/unreadable yields `Err` with `capability_unavailable` — the
+/// feature the file enables is absent, not its authority loosened.
+pub fn read_private(state_dir: &Path, name: &str) -> Result<Vec<u8>> {
+    let dir = dir(state_dir);
+    check_dir(&dir)?;
+    let path = dir.join(name);
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+        .map_err(|e| {
+            if e.raw_os_error() == Some(libc::ELOOP) {
+                Error::invalid(
+                    "capability_unavailable",
+                    format!("{} is a symlink — refusing it", path.display()),
+                )
+            } else {
+                Error::invalid("capability_unavailable", format!("{}: {e}", path.display()))
+            }
+        })?;
+    let md = file.metadata()?;
+    if !md.is_file() {
+        return Err(Error::invalid(
+            "capability_unavailable",
+            format!("{} is not a regular file — refusing it", path.display()),
+        ));
+    }
+    if md.uid() != euid() {
+        return Err(Error::invalid(
+            "capability_unavailable",
+            format!(
+                "{} is owned by uid {}, not this user (uid {}) — refusing it",
+                path.display(),
+                md.uid(),
+                euid()
+            ),
+        ));
+    }
+    if md.mode() & 0o077 != 0 {
+        return Err(Error::invalid(
+            "capability_unavailable",
+            format!(
+                "{} has mode {:03o}; it must be private — run `chmod 600 {}`",
+                path.display(),
+                md.mode() & 0o777,
+                path.display()
+            ),
+        ));
+    }
+    let mut bytes = Vec::new();
+    (&mut file).take(1 << 20).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
 // ---------- links and sessions ----------
 
 /// Why a link exchange was refused. Each is loud: the browser shows it,
@@ -339,13 +441,55 @@ impl LinkRefusal {
     }
 }
 
+/// A public session's named user (CAD-526): the identity a verified
+/// AgenticOS assertion carried. `handle` is the `[A-Za-z0-9_-]`
+/// attribution that fits the comment-author and monitor-ack grammars;
+/// `role` is the mapped Cadence role — `operator` or `member`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoardUser {
+    pub sub: String,
+    pub email: String,
+    pub name: String,
+    pub role: String,
+    pub handle: String,
+}
+
+impl BoardUser {
+    /// Is this an `owner`-mapped session — allowed the operator-only
+    /// write routes?
+    pub fn is_operator(&self) -> bool {
+        self.role == "operator"
+    }
+
+    /// The display/audit actor: `Fable Chen <fable@example.com> (board)`,
+    /// printable-ASCII only — it lands in commit `Actor:` trailers.
+    pub fn actor(&self) -> String {
+        let clean = |raw: &str| -> String {
+            raw.chars()
+                .filter(|c| c.is_ascii() && !c.is_ascii_control() && *c != '<' && *c != '>')
+                .take(120)
+                .collect::<String>()
+                .trim()
+                .to_string()
+        };
+        let (name, email) = (clean(&self.name), clean(&self.email));
+        match (name.is_empty(), email.is_empty()) {
+            (false, false) => format!("{name} <{email}> (board)"),
+            (false, true) => format!("{name} (board)"),
+            _ => format!("{} (board)", self.handle),
+        }
+    }
+}
+
 /// One stored session: the token's hash and what `ui sessions` shows.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Row {
     hash: String,
     /// `sha256(key)` of the session's second credential — the value the
     /// page sends as `X-Cadence-Session`. A row without one (written
-    /// before it existed) never matches.
+    /// before it existed, or a public session — the contract's cookie
+    /// is the whole credential, CAD-526) never matches the keyed check.
     #[serde(default)]
     key_hash: String,
     origin: Origin,
@@ -354,6 +498,10 @@ struct Row {
     expires_at: i64,
     #[serde(default)]
     user_agent: String,
+    /// The named user a public session belongs to — `None` for the
+    /// operator's loopback/tailnet sessions.
+    #[serde(default)]
+    user: Option<BoardUser>,
 }
 
 impl Row {
@@ -376,6 +524,7 @@ impl Row {
             idle_expires_at: (self.last_used + IDLE_SECS).min(self.expires_at),
             expires_at: self.expires_at,
             user_agent: self.user_agent.clone(),
+            user: self.user.clone(),
         }
     }
 }
@@ -390,6 +539,8 @@ pub struct SessionView {
     pub idle_expires_at: i64,
     pub expires_at: i64,
     pub user_agent: String,
+    /// The platform-asserted user a `public` session names (CAD-526).
+    pub user: Option<BoardUser>,
 }
 
 /// A freshly opened session: the token goes to the board once, for its
@@ -409,6 +560,11 @@ pub struct Opened {
 #[derive(Serialize, Deserialize, Default)]
 struct SessionsFile {
     sessions: Vec<Row>,
+    /// `sha256(jti)` → the assertion's `exp`: platform assertions are
+    /// single-use (CAD-526); persisted so a restart inside the 60 s
+    /// window cannot reopen a replay. Pruned once `exp` passes.
+    #[serde(default)]
+    jtis: HashMap<String, i64>,
 }
 
 /// The daemon's operator-auth state: live link nonces (memory only — a
@@ -426,6 +582,9 @@ pub struct Auth {
     links: HashMap<String, (Origin, i64)>,
     /// spent nonce hash → when it would have expired (pruned after)
     spent: HashMap<String, i64>,
+    /// seen jti hash → its assertion's `exp` — the authoritative
+    /// single-use memory for platform sign-ins (CAD-526).
+    jtis: HashMap<String, i64>,
 }
 
 /// Printable ASCII, bounded — the user agent is shown by `ui sessions`.
@@ -442,19 +601,20 @@ impl Auth {
     /// is the safe failure.
     pub fn load(state_dir: &Path) -> Self {
         let path = dir(state_dir).join(SESSIONS);
-        let sessions = fs::read(&path)
+        let file = fs::read(&path)
             .ok()
             .and_then(|b| serde_json::from_slice::<SessionsFile>(&b).ok())
-            .map(|f| f.sessions)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|r| well_formed(&r.hash))
-            .collect();
+            .unwrap_or_default();
         Self {
             path,
-            sessions,
+            sessions: file
+                .sessions
+                .into_iter()
+                .filter(|r| well_formed(&r.hash))
+                .collect(),
             links: HashMap::new(),
             spent: HashMap::new(),
+            jtis: file.jtis,
         }
     }
 
@@ -483,6 +643,7 @@ impl Auth {
             .open(&tmp)?;
         let body = SessionsFile {
             sessions: self.sessions.clone(),
+            jtis: self.jtis.clone(),
         };
         file.write_all(&serde_json::to_vec_pretty(&body)?)?;
         file.sync_all()?;
@@ -495,14 +656,25 @@ impl Auth {
         // "expired" rather than "unknown".
         self.links.retain(|_, (_, exp)| now <= *exp + LINK_TTL_SECS);
         self.spent.retain(|_, exp| now <= *exp + LINK_TTL_SECS);
+        // A jti stays until its assertion's own expiry — then a replay
+        // fails "expired" before the single-use check anyway.
+        self.jtis.retain(|_, exp| now <= *exp);
         let before = self.sessions.len();
         self.sessions.retain(|r| r.live(now));
         before != self.sessions.len()
     }
 
     /// Mint a single-use link nonce for `origin`. The caller has already
-    /// proved the operator; this only records `sha256(nonce)`.
+    /// proved the operator; this only records `sha256(nonce)`. `public`
+    /// is refused outright — those sessions are born only of a verified
+    /// platform assertion, never a login link (CAD-526).
     pub fn mint(&mut self, origin: Origin, now: i64) -> Result<String> {
+        if origin == Origin::Public {
+            return Err(Error::invalid(
+                "invalid_request",
+                "public sessions open through a verified assertion, not a login link",
+            ));
+        }
         self.prune(now);
         let nonce = random_credential()?;
         self.links
@@ -552,6 +724,7 @@ impl Auth {
             last_used: now,
             expires_at: now + ABSOLUTE_SECS,
             user_agent: clean_user_agent(user_agent),
+            user: None,
         };
         let session = row.view();
         self.sessions.push(row);
@@ -561,6 +734,84 @@ impl Auth {
             key,
             session,
         })
+    }
+
+    /// Open a `public` session for a verified platform user (CAD-526).
+    /// `None` is the refusal — the `jti` was seen before (the daemon
+    /// maps it to the contract's `assertion_replayed`).
+    pub fn open_public(
+        &mut self,
+        user: BoardUser,
+        jti: &str,
+        jti_exp: i64,
+        user_agent: &str,
+        now: i64,
+    ) -> Result<Option<Opened>> {
+        self.prune(now);
+        // The authoritative single-use check (contract §4/§9): verified
+        // jtis persist until `exp` — a restart inside the 60 s window
+        // still knows the assertion is spent.
+        if self.jtis.contains_key(&digest(jti)) {
+            return Ok(None);
+        }
+        let token = random_credential()?;
+        // One session per `sub` (contract §9): a fresh sign-in ends the
+        // user's earlier one — named users never stack sessions.
+        self.sessions.retain(|r| {
+            !(r.origin == Origin::Public && r.user.as_ref().is_some_and(|u| u.sub == user.sub))
+        });
+        let row = Row {
+            hash: digest(&token),
+            // The cookie alone is the credential on the public surface —
+            // there is no page key. An empty hash can never satisfy the
+            // keyed `check`.
+            key_hash: String::new(),
+            origin: Origin::Public,
+            created: now,
+            last_used: now,
+            expires_at: now + PUBLIC_SESSION_SECS,
+            user_agent: clean_user_agent(user_agent),
+            user: Some(user),
+        };
+        let session = row.view();
+        self.sessions.push(row);
+        self.jtis.insert(digest(jti), jti_exp);
+        self.persist()?;
+        Ok(Some(Opened {
+            token,
+            key: String::new(),
+            session,
+        }))
+    }
+
+    /// The live public session `token` names, touching its idle clock.
+    /// Cookie-only — the contract's `__Host-` session has no page key,
+    /// so this deliberately ignores `key`/`origin`: a public row is
+    /// bound to `Origin::Public` by construction.
+    pub fn check_public(&mut self, token: &str, now: i64) -> Result<Option<SessionView>> {
+        let mut dirty = self.prune(now);
+        if !well_formed(token) {
+            if dirty {
+                self.persist()?;
+            }
+            return Ok(None);
+        }
+        let hash = digest(token);
+        let found = self
+            .sessions
+            .iter_mut()
+            .find(|r| r.origin == Origin::Public && same_credential(&r.hash, &hash))
+            .map(|row| {
+                if now - row.last_used >= TOUCH_EVERY_SECS {
+                    row.last_used = now;
+                    dirty = true;
+                }
+                row.view()
+            });
+        if dirty {
+            self.persist()?;
+        }
+        Ok(found)
     }
 
     /// The live session `token` AND `key` name together on `origin`,
@@ -958,5 +1209,141 @@ mod tests {
             .is_none());
         let err = auth.open(&pending, Origin::Loopback, "ua", T0);
         assert_eq!(err_kind(&err), Some(LinkRefusal::AlreadyUsed));
+    }
+
+    fn user(sub: &str, role: &str) -> BoardUser {
+        BoardUser {
+            sub: sub.to_string(),
+            email: format!("{sub}@example.com"),
+            name: format!("{sub} display"),
+            role: role.to_string(),
+            handle: sub.to_string(),
+        }
+    }
+
+    /// CAD-526: a public session is the cookie alone — no page key — and
+    /// carries its named user. The keyed `check` never admits it, on any
+    /// origin, and its token is no link nonce.
+    #[test]
+    fn public_sessions_are_cookie_only_and_named() {
+        let s = state();
+        let mut auth = Auth::load(s.path());
+        let o = auth
+            .open_public(user("u_1", "operator"), "jti-1", T0 + 60, "ua", T0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(o.session.origin, Origin::Public);
+        assert_eq!(o.key, "");
+        assert_eq!(o.session.expires_at, T0 + PUBLIC_SESSION_SECS);
+        let u = o.session.user.unwrap();
+        assert_eq!(u.sub, "u_1");
+        assert!(u.is_operator());
+        // The cookie alone checks.
+        let live = auth.check_public(&o.token, T0).unwrap().unwrap();
+        assert_eq!(live.id, o.session.id);
+        assert_eq!(live.user.unwrap().email, "u_1@example.com");
+        assert!(auth.check_public(&"0".repeat(64), T0).unwrap().is_none());
+        // The keyed check never sees it — whatever key is presented,
+        // whatever origin is named.
+        let key = "f".repeat(64);
+        for origin in [Origin::Loopback, Origin::Tailnet, Origin::Public] {
+            assert!(auth.check(&o.token, &key, origin, T0).unwrap().is_none());
+            assert!(auth.check(&o.token, "", origin, T0).unwrap().is_none());
+        }
+        // It is not a link nonce and a link can never mint `public`.
+        assert_eq!(
+            err_kind(&auth.open(&o.token, Origin::Loopback, "ua", T0)),
+            Some(LinkRefusal::Unknown)
+        );
+        assert!(auth.mint(Origin::Public, T0).is_err());
+    }
+
+    /// CAD-526 §4: the `jti` is single-use, and the memory is persisted —
+    /// a daemon restart inside the assertion's window still refuses the
+    /// replay. Only its sha256 is stored; once `exp` passes it is
+    /// forgotten (the verifier's own expiry bound is the wall).
+    #[test]
+    fn a_spent_jti_stays_spent_across_a_reload() {
+        let s = state();
+        ensure_secret(s.path()).unwrap();
+        let mut auth = Auth::load(s.path());
+        assert!(auth
+            .open_public(user("u_1", "member"), "jti-9", T0 + 60, "ua", T0)
+            .unwrap()
+            .is_some());
+        // Same `jti`, same instant — no second session.
+        assert!(auth
+            .open_public(user("u_1", "member"), "jti-9", T0 + 60, "ua", T0)
+            .unwrap()
+            .is_none());
+        let text = fs::read_to_string(dir(s.path()).join(SESSIONS)).unwrap();
+        assert!(!text.contains("jti-9"), "raw jti persisted");
+        assert!(text.contains(&digest("jti-9")));
+        let mut reloaded = Auth::load(s.path());
+        assert!(reloaded
+            .open_public(user("u_1", "member"), "jti-9", T0 + 60, "ua", T0 + 1)
+            .unwrap()
+            .is_none());
+        // Past `exp` the entry is gone — the assertion would fail
+        // verification before this check anyway.
+        assert!(reloaded
+            .open_public(user("u_1", "member"), "jti-9", T0 + 60, "ua", T0 + 61)
+            .unwrap()
+            .is_some());
+    }
+
+    /// CAD-526 §9: one session per `sub` — a fresh sign-in ends the same
+    /// user's earlier one and leaves every other user's alone; the
+    /// 60-minute bound is absolute, not idle-reset.
+    #[test]
+    fn public_sessions_replace_per_sub_and_die_at_sixty_minutes() {
+        let s = state();
+        let mut auth = Auth::load(s.path());
+        let a = auth
+            .open_public(user("u_1", "member"), "jti-a", T0 + 60, "ua", T0)
+            .unwrap()
+            .unwrap();
+        let b = auth
+            .open_public(user("u_2", "operator"), "jti-b", T0 + 60, "ua", T0)
+            .unwrap()
+            .unwrap();
+        let a2 = auth
+            .open_public(user("u_1", "member"), "jti-a2", T0 + 60, "ua", T0 + 5)
+            .unwrap()
+            .unwrap();
+        assert!(auth.check_public(&a.token, T0 + 5).unwrap().is_none());
+        assert!(auth.check_public(&a2.token, T0 + 5).unwrap().is_some());
+        assert!(auth.check_public(&b.token, T0 + 5).unwrap().is_some());
+        // An operator session for the same sub is never replaced — a
+        // public sign-in ends only public sessions.
+        let op = opened(&mut auth, Origin::Loopback, T0 + 6);
+        let a3 = auth
+            .open_public(user("u_1", "member"), "jti-a3", T0 + 60, "ua", T0 + 7)
+            .unwrap()
+            .unwrap();
+        assert!(auth.check_public(&a2.token, T0 + 7).unwrap().is_none());
+        assert!(auth.check_public(&a3.token, T0 + 7).unwrap().is_some());
+        assert!(auth
+            .check(&op.token, &op.key, Origin::Loopback, T0 + 7)
+            .unwrap()
+            .is_some());
+        // Absolute at 60 minutes even in constant use.
+        let edge = T0 + PUBLIC_SESSION_SECS;
+        assert!(auth.check_public(&b.token, edge - 1).unwrap().is_some());
+        assert!(auth.check_public(&b.token, edge).unwrap().is_none());
+    }
+
+    /// `BoardUser::actor` renders printable-ASCII `git`-trailer-safe
+    /// attribution; empty display data falls back to the handle.
+    #[test]
+    fn a_board_user_actor_is_trailer_safe() {
+        let mut u = user("u_1", "member");
+        assert_eq!(u.actor(), "u_1 display <u_1@example.com> (board)");
+        u.name = "F<b>le\nChen".into();
+        u.email = "f\t@x.co>".into();
+        assert_eq!(u.actor(), "FbleChen <f@x.co> (board)");
+        u.name = "  ".into();
+        u.email = "".into();
+        assert_eq!(u.actor(), "u_1 (board)");
     }
 }
