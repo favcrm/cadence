@@ -1501,6 +1501,7 @@ mod tests {
                 claim: None,
                 component: None,
                 tags: vec!["intake".to_string(), "feedback".to_string()],
+                paths: vec![],
                 kind: Some("feedback".to_string()),
                 plan: None,
                 plan_epic: None,

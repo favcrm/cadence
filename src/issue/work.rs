@@ -246,9 +246,19 @@ fn check_config(cfg: &WorkConfig) -> Result<()> {
 /// Strict load for writers: no file is the defaults; a symlinked,
 /// unreadable or malformed one refuses — a stage move never guesses.
 pub fn load_config(pm_dir: &Path, key: &str) -> Result<WorkConfig> {
+    match read_project_md(pm_dir, key)? {
+        None => Ok(WorkConfig::default()),
+        Some(text) => parse_config(&text).map_err(|e| Error::rejected(format!("{key}: {e}"))),
+    }
+}
+
+/// `<pm>/<key>/PROJECT.md`'s text — `None` when there is no file; a
+/// symlinked or unreadable one refuses. Every PROJECT.md reader (the
+/// work model here, CAD-378's `areas:`) loads through this.
+pub fn read_project_md(pm_dir: &Path, key: &str) -> Result<Option<String>> {
     let file = config_file(pm_dir, key);
     if file.symlink_metadata().is_err() {
-        return Ok(WorkConfig::default());
+        return Ok(None);
     }
     if !board::is_real_file(&file) {
         return Err(Error::rejected(format!(
@@ -256,9 +266,9 @@ pub fn load_config(pm_dir: &Path, key: &str) -> Result<WorkConfig> {
             file.display()
         )));
     }
-    let text = std::fs::read_to_string(&file)
-        .map_err(|e| Error::rejected(format!("cannot read {}: {e}", file.display())))?;
-    parse_config(&text).map_err(|e| Error::rejected(format!("{key}: {e}")))
+    std::fs::read_to_string(&file)
+        .map(Some)
+        .map_err(|e| Error::rejected(format!("cannot read {}: {e}", file.display())))
 }
 
 /// Lenient load for readers: a bad file reads as the defaults plus the

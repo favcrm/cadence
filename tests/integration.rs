@@ -414,15 +414,19 @@ impl TestDaemon {
     /// through [`Self::operator_rpc`]. A suite run inside an agent pane
     /// carries `CADENCE_ALIAS` on its ancestry without any plant —
     /// unattributed then, and refused for missing operator proof, so
-    /// that refusal goes the operator's way too. Every gate refusal
-    /// reads "… is an operator action …"; the retry replays the same
-    /// call, so a refusal that is not about proof comes back unchanged.
+    /// that refusal goes the operator's way too. Gate refusals read
+    /// "… is an operator action …" or "… not provably the operator …";
+    /// the retry replays the same call, so a refusal that is not about
+    /// proof comes back unchanged.
     fn fixture_rpc(&self, method: &str, params: Value) -> cadence_agent::Result<Value> {
         if self.rpc("agent_show", json!({"alias": SELF_LANE})).is_ok() {
             return self.operator_rpc(method, params);
         }
         match self.rpc(method, params.clone()) {
-            Err(e) if e.to_string().contains("operator action") => {
+            Err(e)
+                if e.to_string().contains("operator action")
+                    || e.to_string().contains("not provably the operator") =>
+            {
                 self.operator_rpc(method, params)
             }
             r => r,
@@ -14261,7 +14265,7 @@ fn dispatch_dedupes_live_kickoff_and_reassign_bumps() {
 
     // Live kickoff → second dispatch is the SAME revision, same id.
     // Deterministic: stop w1 first so its queue never drains.
-    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    d.fixture_rpc("agent_stop", json!({"alias": "w1"})).unwrap();
     let r1 = d.job_dispatch("j1-t2", json!({})).unwrap();
     let k1 = r1["message"].as_str().unwrap().to_string();
     assert_eq!(r1["task"]["state"], "dispatched");
@@ -14287,7 +14291,8 @@ fn dispatch_dedupes_live_kickoff_and_reassign_bumps() {
 
     // The natural reassign path: let the kickoff complete, revise,
     // then --to bumps the revision with a fresh kickoff id.
-    d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
+    d.fixture_rpc("agent_resume", json!({"alias": "w1"}))
+        .unwrap();
     d.wait_message("w1", &k1, &["completed"], 15);
     d.wait_task("j1-t2", "review", 15);
     d.job_verdict("j1-t2", SHA_A, "revise").unwrap();
@@ -18962,14 +18967,16 @@ fn daemon_reminder_id_and_source_cannot_be_forged() {
     );
 }
 
-/// CAD-467: `send --issue/--worktree` write the lane provenance the
-/// reported-duplicate check trusts — so only a caller who may steer
-/// the target (the operator, or its PM) may set them. A peer worker,
-/// a foreign PM, a self-send and a detached unprovable caller are all
-/// refused; the target's own PM records the lane, and a plain send is
-/// unaffected.
+/// CAD-467 wrote `send --issue/--worktree` behind the steer gate — but
+/// the gate checks caller-versus-target, never the values, so a PM
+/// could mark a send to its own worker with a forged lane and
+/// `dispatch_record` accepted it (CAD-378 R6). Now the fields are
+/// refused on every send: a peer worker, a foreign PM, the target's
+/// own PM, a self-send and a detached unprovable caller alike. Only
+/// `dispatch_send` (daemon-resolved lane) and `task_dispatch` (job
+/// rows) write the tags; a plain send is unaffected.
 #[test]
-fn send_lane_provenance_needs_steer_authority() {
+fn send_lane_provenance_is_refused_for_every_caller() {
     let d = TestDaemon::start();
     let _mock = d.mock_stub();
     let mut p = guard_panes(&d);
@@ -18981,16 +18988,29 @@ fn send_lane_provenance_needs_steer_authority() {
         v
     };
     let both = forged(&[("issue", "D-9"), ("worktree", "/lane/d-9")]);
+    let one = forged(&[("issue", "D-9")]);
 
-    // A peer worker steering another agent's lane — refused.
+    // Every caller is refused — the values are never read, let alone
+    // authorized.
     let r = p.pm2.rpc(&d.state, "agent_send", both.clone());
-    assert!(frame_err(&r).contains("steer"), "{r}");
-    // The agent itself cannot claim a lane on its own queue.
+    assert!(frame_err(&r).contains("only a dispatch sets"), "{r}");
     let r = p.w1.rpc(&d.state, "agent_send", both.clone());
-    assert!(frame_err(&r).contains("steer"), "{r}");
+    assert!(frame_err(&r).contains("only a dispatch sets"), "{r}");
+    // The target's own PM — admitted by the old steer gate — is refused
+    // like everyone else; so is a single field.
+    let r = p.pm.rpc(&d.state, "agent_send", both.clone());
+    assert!(frame_err(&r).contains("only a dispatch sets"), "{r}");
+    let r = p.pm.rpc(&d.state, "agent_send", one.clone());
+    assert!(frame_err(&r).contains("only a dispatch sets"), "{r}");
+    // The operator is refused too — no caller field reaches the columns.
+    let err = d
+        .operator_rpc("agent_send", both.clone())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("only a dispatch sets"), "{err}");
     // A detached caller that proves nothing — refused outright.
     let r = unprovable_rpc(&d, "agent_send", both.clone());
-    assert!(frame_err(&r).contains("not provably the operator"), "{r}");
+    assert!(frame_err(&r).contains("only a dispatch sets"), "{r}");
     // Nothing was queued by any refused caller.
     let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
     assert!(
@@ -18998,15 +19018,7 @@ fn send_lane_provenance_needs_steer_authority() {
         "refused provenance sends must not enqueue: {show}"
     );
 
-    // The target's own PM may record the lane — dispatch's shape.
-    let r = p.pm.rpc(&d.state, "agent_send", both);
-    assert_eq!(r["ok"], true, "{r}");
-    let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
-    let msg = &show["messages"].as_array().unwrap()[0];
-    assert_eq!(msg["issue"], "D-9", "{msg}");
-    assert_eq!(msg["worktree"], "/lane/d-9", "{msg}");
-
-    // A bare send from the same peer is unaffected — the gate fires
+    // A bare send from the same peer is unaffected — the refusal fires
     // only on the provenance fields.
     let r = p.pm2.rpc(&d.state, "agent_send", forged(&[]));
     assert_eq!(r["ok"], true, "{r}");
@@ -20257,17 +20269,19 @@ fn dispatch_kickoff_and_finish_guards() {
             .set_agent_state("fenced", "attention", Some("test fence"))
             .unwrap();
     }
-    let d = TestDaemon::start_on(state);
-    d.wait_agent("fenced", "attention", 10);
-
     // Tracker + project repo + issues fixture (same shape as the
-    // issue-start test).
+    // issue-start test). The daemon reads the tracker itself on
+    // `dispatch_send` (claim check + lane resolution), so the pm dir
+    // binds before it starts — a test daemon never falls back to ~/pm.
     let tmp = TempDir::new().unwrap();
     let (pm_dir, repo, home) = (
         tmp.path().join("pm"),
         tmp.path().join("repo"),
         tmp.path().join("home"),
     );
+    test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
+    let d = TestDaemon::start_on(state);
+    d.wait_agent("fenced", "attention", 10);
     for dir in [&pm_dir, &repo, &home] {
         std::fs::create_dir_all(dir).unwrap();
     }
@@ -20593,7 +20607,8 @@ fn dispatch_kickoff_and_finish_guards() {
         json!({"alias": "dvb", "text": "keep working", "message": "mk1"}),
     )
     .unwrap();
-    d.rpc("agent_ready", json!({"alias": "dvb"})).unwrap();
+    d.fixture_rpc("agent_ready", json!({"alias": "dvb"}))
+        .unwrap();
     d.wait_message("dvb", "mk1", &["running"], 10);
     let wt3 = repo.join(".cadence/wt/d-3-three");
     // Give the branch real work so survivability blocks too — the
@@ -20708,13 +20723,17 @@ fn dispatch_records_ref_before_send() {
                 .unwrap();
         }
     }
-    let d = TestDaemon::start_on(state);
+    // The daemon reads the tracker itself on `dispatch_send` (claim
+    // check + lane resolution) — bind the pm dir before it starts; a
+    // test daemon never falls back to ~/pm.
     let tmp = TempDir::new().unwrap();
     let (pm_dir, repo, home) = (
         tmp.path().join("pm"),
         tmp.path().join("repo"),
         tmp.path().join("home"),
     );
+    test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
+    let d = TestDaemon::start_on(state);
     for dir in [&pm_dir, &repo, &home] {
         std::fs::create_dir_all(dir).unwrap();
     }
@@ -20908,13 +20927,17 @@ fn dispatch_folds_bootstrap_and_suppresses_reported_duplicate() {
                 .unwrap();
         }
     }
-    let d = TestDaemon::start_on(state);
+    // The daemon reads the tracker itself on `dispatch_send` (claim
+    // check + lane resolution) — bind the pm dir before it starts; a
+    // test daemon never falls back to ~/pm.
     let tmp = TempDir::new().unwrap();
     let (pm_dir, repo, home) = (
         tmp.path().join("pm"),
         tmp.path().join("repo"),
         tmp.path().join("home"),
     );
+    test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
+    let d = TestDaemon::start_on(state);
     for dir in [&pm_dir, &repo, &home] {
         std::fs::create_dir_all(dir).unwrap();
     }
@@ -21389,13 +21412,17 @@ fn finish_guard_per_worktree() {
             .enqueue("deadpty", "queued forever", None, "mkdead", "test")
             .unwrap();
     }
-    let d = TestDaemon::start_on(state);
+    // The daemon reads the tracker itself on `dispatch_send` (claim
+    // check + lane resolution) — bind the pm dir before it starts; a
+    // test daemon never falls back to ~/pm.
     let tmp = TempDir::new().unwrap();
     let (pm_dir, repo, home) = (
         tmp.path().join("pm"),
         tmp.path().join("repo"),
         tmp.path().join("home"),
     );
+    test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
+    let d = TestDaemon::start_on(state);
     for dir in [&pm_dir, &repo, &home] {
         std::fs::create_dir_all(dir).unwrap();
     }
@@ -23252,14 +23279,16 @@ fn dispatch_injects_project_memory_lessons() {
                 .unwrap();
         }
     }
-    let d = TestDaemon::start_on(state);
-
     let tmp = TempDir::new().unwrap();
     let (pm_dir, repo, home) = (
         tmp.path().join("pm"),
         tmp.path().join("repo"),
         tmp.path().join("home"),
     );
+    // dispatch_send reads the tracker daemon-side (claim + lane refs) —
+    // bind CADENCE_PM_DIR into the daemon's env before it starts.
+    test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
+    let d = TestDaemon::start_on(state);
     for dir in [&pm_dir, &repo, &home] {
         std::fs::create_dir_all(dir).unwrap();
     }
@@ -23805,14 +23834,16 @@ fn dispatch_degrades_on_memory_failures() {
                 .unwrap();
         }
     }
-    let d = TestDaemon::start_on(state);
-
     let tmp = TempDir::new().unwrap();
     let (pm_dir, repo, home) = (
         tmp.path().join("pm"),
         tmp.path().join("repo"),
         tmp.path().join("home"),
     );
+    // dispatch_send reads the tracker daemon-side (claim + lane refs) —
+    // bind CADENCE_PM_DIR into the daemon's env before it starts.
+    test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
+    let d = TestDaemon::start_on(state);
     for dir in [&pm_dir, &repo, &home] {
         std::fs::create_dir_all(dir).unwrap();
     }
@@ -38965,8 +38996,9 @@ fn pty_deleted_cwd_refuses_delivery_and_is_surfaced() {
 /// start --job --assignee` applies the same check.
 #[test]
 fn dispatch_checks_pty_lane_cwd_against_project_repos() {
-    let d = TestDaemon::start();
-    let _mock = d.mock_stub();
+    // The daemon reads the tracker itself on `dispatch_send` (claim
+    // check + lane resolution) — bind the pm dir before it starts; a
+    // test daemon never falls back to ~/pm.
     let tmp = TempDir::new().unwrap();
     let (pm_dir, repo, home, elsewhere, gone) = (
         tmp.path().join("pm"),
@@ -38975,6 +39007,9 @@ fn dispatch_checks_pty_lane_cwd_against_project_repos() {
         tmp.path().join("elsewhere"),
         tmp.path().join("gone"),
     );
+    test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
+    let d = TestDaemon::start();
+    let _mock = d.mock_stub();
     for dir in [&pm_dir, &repo, &home, &elsewhere, &gone] {
         std::fs::create_dir_all(dir).unwrap();
     }
@@ -40525,13 +40560,17 @@ fn dispatch_warns_on_empty_acceptance() {
                 .unwrap();
         }
     }
-    let d = TestDaemon::start_on(state);
+    // The daemon reads the tracker itself on `dispatch_send` (claim
+    // check + lane resolution) — bind the pm dir before it starts; a
+    // test daemon never falls back to ~/pm.
     let tmp = TempDir::new().unwrap();
     let (pm_dir, repo, home) = (
         tmp.path().join("pm"),
         tmp.path().join("repo"),
         tmp.path().join("home"),
     );
+    test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
+    let d = TestDaemon::start_on(state);
     for dir in [&pm_dir, &repo, &home] {
         std::fs::create_dir_all(dir).unwrap();
     }
@@ -41431,13 +41470,17 @@ fn dispatch_refuses_criteria_past_the_pty_ceiling() {
                 .unwrap();
         }
     }
-    let d = TestDaemon::start_on(state);
+    // The daemon reads the tracker itself on `dispatch_send` (claim
+    // check + lane resolution) — bind the pm dir before it starts; a
+    // test daemon never falls back to ~/pm.
     let tmp = TempDir::new().unwrap();
     let (pm_dir, repo, home) = (
         tmp.path().join("pm"),
         tmp.path().join("repo"),
         tmp.path().join("home"),
     );
+    test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
+    let d = TestDaemon::start_on(state);
     for dir in [&pm_dir, &repo, &home] {
         std::fs::create_dir_all(dir).unwrap();
     }
@@ -45952,13 +45995,17 @@ fn dispatch_job_precheck_measures_the_issues_existing_lane() {
                 .unwrap();
         }
     }
-    let d = TestDaemon::start_on(state);
+    // The daemon reads the tracker itself on `dispatch_send` (claim
+    // check + lane resolution) — bind the pm dir before it starts; a
+    // test daemon never falls back to ~/pm.
     let tmp = TempDir::new().unwrap();
     let (pm_dir, repo, home) = (
         tmp.path().join("pm"),
         tmp.path().join("repo"),
         tmp.path().join("home"),
     );
+    test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
+    let d = TestDaemon::start_on(state);
     for dir in [&pm_dir, &repo, &home] {
         std::fs::create_dir_all(dir).unwrap();
     }
@@ -51958,4 +52005,1074 @@ fn cad324_compaction_pack_survives_a_daemon_restart() {
     )
     .unwrap();
     assert_eq!(result_text(&d, "lead", "s3"), "FAKE_REPLY: and then");
+}
+
+// ---- CAD-378: code-area owners and advisory path leases ----
+
+/// The `areas:` fixture: `caller` (src/peer.rs + src/daemon/) owned by
+/// the PM `pm-own`, at most one open PR.
+const CAD378_AREAS: &str =
+    "---\nproject: demo\nareas:\n  caller:\n    paths: [src/peer.rs, src/daemon/]\n    \
+     owner: pm-own\n    max_open_prs: 1\n---\n# Demo\n";
+
+impl PlanFixture {
+    /// `issue new` + `issue set paths=` + `issue start --by <pm>`; the
+    /// start's JSON. The lane is then bound the way a real dispatch
+    /// binds it — a record in the daemon's `dispatches.json` naming
+    /// the pm, worktree and branch at send time (`dispatch_record`
+    /// writes exactly this, pm from the caller's connection).
+    fn cad378_lane(&self, title: &str, id: &str, paths: &str, by: &str) -> Value {
+        let (ok, out) = self.cli(&["issue", "new", title, "--project", "demo"]);
+        assert!(ok, "{out}");
+        let (ok, out) = self.cli(&["issue", "set", id, &format!("paths={paths}")]);
+        assert!(ok, "{out}");
+        let (ok, out) = self.cli(&["issue", "start", id, "--by", by]);
+        assert!(ok, "start never refuses on a lease: {out}");
+        cadence_agent::issue::areas::record_dispatch(
+            &self.d.state,
+            id,
+            json!({
+                "pm": by,
+                "worktree": out["worktree"],
+                "branch": out["branch"],
+                "message": "fixture-kickoff",
+            }),
+            false,
+        )
+        .unwrap();
+        out
+    }
+
+    /// Commit `file` in a lane's worktree (fixture identity).
+    fn cad378_commit(&self, worktree: &str, file: &str) {
+        let wt = Path::new(worktree);
+        std::fs::create_dir_all(wt.join(file).parent().unwrap()).unwrap();
+        std::fs::write(wt.join(file), "change\n").unwrap();
+        for args in [
+            vec!["add", "-A"],
+            vec![
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "lane change",
+            ],
+        ] {
+            let o = std::process::Command::new("git")
+                .arg("-C")
+                .arg(wt)
+                .args(&args)
+                .output()
+                .unwrap();
+            assert!(o.status.success(), "git {args:?}: {o:?}");
+        }
+    }
+
+    /// The overview's `area_ack` rows (a merged row counts by its causes).
+    fn cad378_ack_rows(&self) -> Vec<Value> {
+        let (ok, view) = self.cli(&["overview", "--json"]);
+        assert!(ok, "{view}");
+        view["needs_me"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| {
+                r["kind"] == "area_ack"
+                    || r["causes"]
+                        .as_array()
+                        .is_some_and(|cs| cs.iter().any(|c| c["cause"] == "area_ack"))
+            })
+            .cloned()
+            .collect()
+    }
+}
+
+fn cad378_kinds(start: &Value) -> Vec<String> {
+    start["leases"]["warnings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no leases block: {start}"))
+        .iter()
+        .map(|w| w["kind"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// `issue start` (and so `dispatch`, which runs it) warns — never
+/// refuses — when the ticket's planned paths overlap an open lane's
+/// planned or ACTUAL changed paths (naming its ticket, worker and PR),
+/// touch an area owned by another PM, or touch an area already at
+/// `max_open_prs`. The warnings are recorded on the issue as a `lease`
+/// comment. The owner's own lane starts silently.
+#[test]
+fn cad378_start_warns_on_overlap_owner_and_capacity() {
+    let f = PlanFixture::start();
+    std::fs::write(f.pm_dir.join("demo/PROJECT.md"), CAD378_AREAS).unwrap();
+    // The owner's lane: no warning, no lease comment.
+    let d1 = f.cad378_lane("Owner work", "D-1", "src/daemon/caller_rule.rs", "pm-own");
+    assert_eq!(cad378_kinds(&d1), Vec::<String>::new(), "{d1}");
+    assert_eq!(d1["leases"]["areas"][0]["name"], "caller", "{d1}");
+    // It actually changes src/peer.rs — never planned — and has a PR.
+    f.cad378_commit(d1["worktree"].as_str().unwrap(), "src/peer.rs");
+    let (ok, out) = f.cli(&["issue", "ref", "D-1", "pr", "https://github.com/o/r/pull/7"]);
+    assert!(ok, "{out}");
+
+    // Another PM plans src/peer.rs: overlap with D-1's CHANGED file,
+    // a foreign owner, and the area is full (1 open of max 1).
+    let d2 = f.cad378_lane("Other work", "D-2", "src/peer.rs", "pm-other");
+    let mut kinds = cad378_kinds(&d2);
+    kinds.sort();
+    assert_eq!(kinds, ["capacity", "overlap", "owned"], "{d2}");
+    let text = d2["leases"]["warnings"].to_string();
+    for want in [
+        "D-1",
+        "worker pm-own",
+        "https://github.com/o/r/pull/7",
+        "owned by pm-own",
+        "max_open_prs 1",
+    ] {
+        assert!(text.contains(want), "wanted '{want}': {text}");
+    }
+    assert_eq!(f.front("D-2").status, "doing", "the start went ahead");
+    let (_, show) = f.cli(&["issue", "show", "D-2", "--json"]);
+    let lease = show["comments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["kind"] == "lease")
+        .unwrap_or_else(|| panic!("no lease comment: {show}"));
+    assert!(lease.to_string().contains("owned by pm-own"), "{lease}");
+
+    // A plain overlap on D-2's PLANNED path outside every area: only
+    // the overlap warns.
+    let d3 = f.cad378_lane("Third", "D-3", "src/", "pm-other");
+    let kinds = cad378_kinds(&d3);
+    assert!(kinds.contains(&"overlap".to_string()), "{d3}");
+    let text = d3["leases"]["warnings"].to_string();
+    assert!(text.contains("D-2") && text.contains("D-1"), "{text}");
+    // No planned paths: nothing to check, nothing warned.
+    let (ok, _) = f.cli(&["issue", "new", "Unplanned", "--project", "demo"]);
+    assert!(ok);
+    let (ok, d4) = f.cli(&["issue", "start", "D-4", "--by", "pm-other"]);
+    assert!(ok, "{d4}");
+    assert_eq!(cad378_kinds(&d4), Vec::<String>::new(), "{d4}");
+}
+
+/// A malformed `areas:` block is a clear error: lint warns, the start
+/// reports it in `leases.config_error` and still goes ahead, the
+/// overview surfaces `areas_error`, and an ack refuses naming it.
+#[test]
+fn cad378_bad_areas_config_is_reported_not_fatal() {
+    let f = PlanFixture::start();
+    std::fs::write(
+        f.pm_dir.join("demo/PROJECT.md"),
+        "---\nareas:\n  caller:\n    paths: [src/daemon.rs#slot_identity]\n    owner: pm-own\n---\n",
+    )
+    .unwrap();
+    let (ok, lint) = f.cli(&["issue", "lint"]);
+    assert!(ok, "a bad area config is a warning: {lint}");
+    let warnings = lint["warnings"].to_string();
+    assert!(
+        warnings.contains("PROJECT.md areas") && warnings.contains("file-level globs only"),
+        "{lint}"
+    );
+    let (ok, out) = f.cli(&["issue", "new", "Work", "--project", "demo"]);
+    assert!(ok, "{out}");
+    let (ok, out) = f.cli(&["issue", "set", "D-1", "paths=src/daemon.rs"]);
+    assert!(ok, "{out}");
+    let (ok, start) = f.cli(&["issue", "start", "D-1", "--by", "pm-other"]);
+    assert!(ok, "{start}");
+    assert!(
+        start["leases"]["config_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("file-level globs only")),
+        "{start}"
+    );
+    let (ok, view) = f.cli(&["overview", "--json"]);
+    assert!(ok, "{view}");
+    let demo = view["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["key"] == "demo")
+        .unwrap();
+    assert!(
+        demo["areas_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("PROJECT.md areas")),
+        "{demo}"
+    );
+    let err =
+        f.d.operator_rpc("area_ack", json!({"issue": "D-1", "area": "caller"}))
+            .unwrap_err()
+            .to_string();
+    assert!(err.contains("file-level globs only"), "{err}");
+    // A symbol-level planned path is refused at the field too.
+    let (ok, err) = f.cli(&["issue", "set", "D-1", "paths=src/daemon.rs#slot_identity"]);
+    assert!(!ok && err.to_string().contains("file-level"), "{err}");
+}
+
+/// A lane with a PR that changes files in an area owned by someone
+/// else is a Needs-you `area_ack` row, for the owner's PM, until the
+/// owner acks it through the daemon. Adversarial: a tracker comment of
+/// kind `ack` authored as the owner, another agent (the lane's worker
+/// PM), a forged identity field, and the owner's own detached children
+/// (env kept or scrubbed) all leave the row up and write no ack. Only
+/// the owner PM's own connection — or the operator — clears it.
+#[test]
+fn cad378_area_ack_row_needs_the_owner() {
+    let f = PlanFixture::start();
+    std::fs::write(f.pm_dir.join("demo/PROJECT.md"), CAD378_AREAS).unwrap();
+    let d1 = f.cad378_lane("Foreign work", "D-1", "src/peer.rs", "pm-other");
+    f.cad378_commit(
+        d1["worktree"].as_str().unwrap(),
+        "src/daemon/caller_rule.rs",
+    );
+    // No PR yet: no row.
+    assert!(f.cad378_ack_rows().is_empty());
+    let (ok, out) = f.cli(&["issue", "ref", "D-1", "pr", "https://github.com/o/r/pull/9"]);
+    assert!(ok, "{out}");
+    let rows = f.cad378_ack_rows();
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    let row = rows[0].to_string();
+    for want in [
+        "D-1",
+        "caller",
+        "pm-own",
+        "src/daemon/caller_rule.rs",
+        "cadence issue ack D-1 --area caller",
+    ] {
+        assert!(row.contains(want), "wanted '{want}': {row}");
+    }
+    // The overlay lists the lane in the area.
+    let (_, view) = f.cli(&["overview", "--json"]);
+    let lanes = view["projects"][0]["lanes"].clone();
+    assert_eq!(lanes[0]["issue"], "D-1", "{lanes}");
+    assert_eq!(lanes[0]["areas"], json!(["caller"]), "{lanes}");
+
+    // A forged tracker ack — authored as the owner — changes nothing.
+    let (ok, out) = f.cli(&[
+        "issue",
+        "comment",
+        "D-1",
+        "--kind",
+        "ack",
+        "--author",
+        "pm-own",
+        "-m",
+        "ack caller",
+    ]);
+    assert!(ok, "{out}");
+    assert_eq!(f.cad378_ack_rows().len(), 1, "a comment is not an ack");
+
+    let refused = |r: &Value, why: &str, what: &str| {
+        assert_eq!(r["ok"], false, "{what}: {r}");
+        let msg = r["error"]["message"].as_str().unwrap_or_default();
+        assert!(msg.contains(why), "{what}: wanted '{why}': {r}");
+    };
+    let ack = json!({"issue": "D-1", "area": "caller"});
+    // Another agent — here the lane's own PM — is refused, with or
+    // without a forged identity field.
+    let mut other = ManagedWorker::start(&f.d, "pm-other");
+    refused(
+        &other.rpc("self", "area_ack", ack.clone()),
+        "only its owner PM",
+        "other agent",
+    );
+    for field in ["by", "owner", "actor"] {
+        let mut forged = ack.clone();
+        forged[field] = json!("pm-own");
+        refused(
+            &other.rpc("self", "area_ack", forged),
+            "connection-bound",
+            field,
+        );
+    }
+    // The owner's detached children are neither the owner nor the
+    // operator.
+    let mut owner = ManagedWorker::start(&f.d, "pm-own");
+    for how in ["detached", "detached-bare"] {
+        refused(
+            &owner.rpc(how, "area_ack", ack.clone()),
+            "not provably the operator",
+            how,
+        );
+    }
+    // A caller that is neither is refused too — `f.cli` proves the
+    // operator (it spawns detached with a scrubbed env), so this goes
+    // through a connection that is deterministically unproven.
+    let err =
+        f.d.unproven_rpc("area_ack", ack.clone())
+            .unwrap_err()
+            .to_string();
+    assert!(err.contains("not provably the operator"), "{err}");
+    assert!(!areas_acks_file(&f).exists(), "no refusal wrote an ack");
+    assert_eq!(f.cad378_ack_rows().len(), 1);
+
+    // The owner PM's own connection acks; the row clears.
+    let r = owner.rpc("self", "area_ack", ack.clone());
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(r["result"]["by"], "pm-own", "{r}");
+    assert!(f.cad378_ack_rows().is_empty(), "the ack clears the row");
+    assert_eq!(f.daemon_events("area_acked").len(), 1);
+    // The operator may ack too.
+    let out = f.d.operator_rpc("area_ack", ack).unwrap();
+    assert_eq!(out["by"], "operator", "{out}");
+    // An unknown area names the known ones.
+    let err =
+        f.d.operator_rpc("area_ack", json!({"issue": "D-1", "area": "nope"}))
+            .unwrap_err()
+            .to_string();
+    assert!(err.contains("known: caller"), "{err}");
+}
+
+fn areas_acks_file(f: &PlanFixture) -> PathBuf {
+    cadence_agent::issue::areas::acks_path(&f.d.state)
+}
+
+/// An ack is pinned to the lane's committed tip: once the lane commits
+/// again, the `area_ack` row re-raises for the owner to look at the new
+/// change. Nothing expires by age — only by new commits.
+#[test]
+fn cad378_area_ack_row_re_raises_on_new_commits() {
+    let f = PlanFixture::start();
+    std::fs::write(f.pm_dir.join("demo/PROJECT.md"), CAD378_AREAS).unwrap();
+    let d1 = f.cad378_lane("Foreign work", "D-1", "src/peer.rs", "pm-other");
+    let wt = d1["worktree"].as_str().unwrap().to_string();
+    f.cad378_commit(&wt, "src/daemon/caller_rule.rs");
+    let (ok, out) = f.cli(&["issue", "ref", "D-1", "pr", "https://github.com/o/r/pull/9"]);
+    assert!(ok, "{out}");
+    assert_eq!(f.cad378_ack_rows().len(), 1);
+
+    // An ack (here the operator's — the record path is identical for
+    // the owner PM) pins the lane's head and names the files it
+    // covered; the row clears.
+    let r =
+        f.d.operator_rpc("area_ack", json!({"issue": "D-1", "area": "caller"}))
+            .unwrap();
+    assert_eq!(r["files"], json!(["src/daemon/caller_rule.rs"]), "{r}");
+    assert_eq!(r["head"].as_str().unwrap().len(), 40, "{r}");
+    assert!(f.cad378_ack_rows().is_empty(), "acked at this head");
+
+    // The lane commits again — in the area or not, the pinned head
+    // moved, so the row re-raises.
+    f.cad378_commit(&wt, "src/daemon/area_rpc.rs");
+    let rows = f.cad378_ack_rows();
+    assert_eq!(rows.len(), 1, "new commits re-raise the row: {rows:#?}");
+    assert!(rows[0].to_string().contains("area_rpc.rs"), "{rows:#?}");
+}
+
+/// `claim.by` is live frontmatter — a lane that rewrites it to the
+/// area's owner cannot suppress its own `area_ack` row. The lane's PM
+/// is bound to the daemon's dispatch record (`dispatches.json`,
+/// written at send time by `dispatch_record`), which a frontmatter
+/// rewrite, a hand commit or a planted comment does not touch.
+#[test]
+fn cad378_lane_pm_binds_the_dispatch_record_not_frontmatter() {
+    let f = PlanFixture::start();
+    std::fs::write(f.pm_dir.join("demo/PROJECT.md"), CAD378_AREAS).unwrap();
+    let d1 = f.cad378_lane("Foreign work", "D-1", "src/peer.rs", "pm-other");
+    f.cad378_commit(
+        d1["worktree"].as_str().unwrap(),
+        "src/daemon/caller_rule.rs",
+    );
+    let (ok, out) = f.cli(&["issue", "ref", "D-1", "pr", "https://github.com/o/r/pull/9"]);
+    assert!(ok, "{out}");
+    assert_eq!(f.cad378_ack_rows().len(), 1, "the row is up before the lie");
+
+    // The lane plants the owner's identity into its own frontmatter —
+    // claim.by, the field the old code trusted — and commits the plant
+    // as a hand edit so even committed lies change nothing.
+    let mut front = f.front("D-1");
+    front.claim.as_mut().unwrap().by = "pm-own".to_string();
+    front.owner = Some("pm-own".to_string());
+    f.write_front("D-1", &front);
+    for args in [
+        vec!["add", "-A"],
+        vec![
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "wip",
+        ],
+    ] {
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&f.pm_dir)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "git {args:?}: {o:?}");
+    }
+    let rows = f.cad378_ack_rows();
+    assert_eq!(
+        rows.len(),
+        1,
+        "a forged claim.by suppresses nothing: {rows:#?}"
+    );
+    // The overlay names the recorded PM, not the planted one.
+    let (_, view) = f.cli(&["overview", "--json"]);
+    let lanes = view["projects"][0]["lanes"].clone();
+    assert_eq!(lanes[0]["pm"], "pm-other", "{lanes}");
+}
+
+/// Agent bytes never reach a warning raw: a planted owner alias and a
+/// planted PR ref carrying ESC and bidi bytes come back scrubbed in the
+/// warning text and the recorded lease comment.
+#[test]
+fn cad378_warning_text_is_scrubbed() {
+    let f = PlanFixture::start();
+    std::fs::write(f.pm_dir.join("demo/PROJECT.md"), CAD378_AREAS).unwrap();
+    let d1 = f.cad378_lane("Owner work", "D-1", "src/daemon/caller_rule.rs", "pm-own");
+    f.cad378_commit(d1["worktree"].as_str().unwrap(), "src/peer.rs");
+    // Plant hostile bytes in the lane's owner (worker) and PR ref —
+    // frontmatter is agent-writable and refs only refuse a leading '-'.
+    let mut front = f.front("D-1");
+    front.owner = Some("w\u{1b}[2J\u{202e}evil".to_string());
+    front.refs.push(cadence_agent::issue::model::Ref {
+        kind: "pr".to_string(),
+        url: Some("https://x/\u{1b}[31mpull/9".to_string()),
+        path: None,
+        label: None,
+        closed: None,
+        worktree: None,
+        cargo_target: None,
+        agent: None,
+    });
+    f.write_front("D-1", &front);
+    // A second lane overlapping it warns — the text must be clean.
+    let d2 = f.cad378_lane("Other work", "D-2", "src/peer.rs", "pm-other");
+    let text = d2["leases"]["warnings"].to_string();
+    assert!(text.contains("overlap"), "{d2}");
+    assert!(!text.contains('\u{1b}'), "ESC survived: {text}");
+    assert!(!text.contains('\u{202e}'), "bidi survived: {text}");
+    let (_, show) = f.cli(&["issue", "show", "D-2", "--json"]);
+    let lease = show["comments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["kind"] == "lease")
+        .unwrap_or_else(|| panic!("no lease comment: {show}"));
+    let body = lease.to_string();
+    assert!(!body.contains('\u{1b}'), "ESC in the lease comment: {body}");
+    assert!(
+        !body.contains('\u{202e}'),
+        "bidi in the lease comment: {body}"
+    );
+}
+
+/// A lane the daemon never dispatched is unbound: its `area_ack` row
+/// raises and stays up — no ack can pin or clear it — and `area_ack`
+/// itself refuses with the reason. `issue start` alone (no dispatch
+/// record), a forged `claim.by`, a forged `Actor:` trailer and a
+/// planted `kind: dispatch` comment all leave the row up.
+#[test]
+fn cad378_unbound_lane_row_raises_and_ack_refuses() {
+    let f = PlanFixture::start();
+    std::fs::write(f.pm_dir.join("demo/PROJECT.md"), CAD378_AREAS).unwrap();
+    // `issue start` only — nothing dispatched, so no record.
+    let (ok, out) = f.cli(&["issue", "new", "Hand started", "--project", "demo"]);
+    assert!(ok, "{out}");
+    let (ok, out) = f.cli(&["issue", "set", "D-1", "paths=src/peer.rs"]);
+    assert!(ok, "{out}");
+    let (ok, start) = f.cli(&["issue", "start", "D-1", "--by", "pm-other"]);
+    assert!(ok, "{start}");
+    let wt = start["worktree"].as_str().unwrap().to_string();
+    f.cad378_commit(&wt, "src/peer.rs");
+    let (ok, out) = f.cli(&["issue", "ref", "D-1", "pr", "https://github.com/o/r/pull/9"]);
+    assert!(ok, "{out}");
+    assert_eq!(
+        f.cad378_ack_rows().len(),
+        1,
+        "an unbound lane's row is up and stays up"
+    );
+    // The overlay marks it unbound and names no pm.
+    let (_, view) = f.cli(&["overview", "--json"]);
+    let lanes = view["projects"][0]["lanes"].clone();
+    assert_eq!(lanes[0]["bound"], false, "{lanes}");
+    assert_eq!(lanes[0]["pm"], Value::Null, "{lanes}");
+    // Nothing can ack it — not the operator, not anyone.
+    let err =
+        f.d.operator_rpc("area_ack", json!({"issue": "D-1", "area": "caller"}))
+            .unwrap_err()
+            .to_string();
+    assert!(err.contains("no daemon-recorded dispatch"), "{err}");
+    assert_eq!(f.cad378_ack_rows().len(), 1);
+    // Forged tracker identity changes nothing either.
+    let mut front = f.front("D-1");
+    front.claim.as_mut().unwrap().by = "pm-own".to_string();
+    f.write_front("D-1", &front);
+    let (ok, out) = f.cli(&[
+        "issue",
+        "comment",
+        "D-1",
+        "--kind",
+        "dispatch",
+        "--author",
+        "pm-own",
+        "-m",
+        "dispatch → w",
+    ]);
+    assert!(ok, "{out}");
+    assert_eq!(
+        f.cad378_ack_rows().len(),
+        1,
+        "forged frontmatter and comments bind nothing"
+    );
+}
+
+/// The probe follows the dispatch record's worktree+branch, never the
+/// live frontmatter ref: re-pointing the ref after an ack changes
+/// nothing — the row stays cleared while the recorded branch is still
+/// at the pinned head, and re-raises when that branch commits again.
+#[test]
+fn cad378_probe_follows_the_record_not_the_live_ref() {
+    let f = PlanFixture::start();
+    std::fs::write(f.pm_dir.join("demo/PROJECT.md"), CAD378_AREAS).unwrap();
+    let d1 = f.cad378_lane("Foreign work", "D-1", "src/peer.rs", "pm-other");
+    let wt = d1["worktree"].as_str().unwrap().to_string();
+    f.cad378_commit(&wt, "src/daemon/caller_rule.rs");
+    let (ok, out) = f.cli(&["issue", "ref", "D-1", "pr", "https://github.com/o/r/pull/9"]);
+    assert!(ok, "{out}");
+    assert_eq!(f.cad378_ack_rows().len(), 1);
+    f.d.operator_rpc("area_ack", json!({"issue": "D-1", "area": "caller"}))
+        .unwrap();
+    assert!(f.cad378_ack_rows().is_empty(), "acked at this head");
+
+    // Re-point the frontmatter worktree ref at a decoy repo whose HEAD
+    // could never match — under live-ref probing this is how a lane
+    // un-pins or empties its row. The record still binds the real dir.
+    let decoy = f.tmp.path().join("decoy");
+    std::fs::create_dir_all(&decoy).unwrap();
+    for args in [
+        vec!["init", "-qb", "main"],
+        vec![
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "decoy",
+        ],
+    ] {
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&decoy)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "git {args:?}: {o:?}");
+    }
+    let mut front = f.front("D-1");
+    front
+        .refs
+        .iter_mut()
+        .find(|r| r.kind == "worktree")
+        .unwrap()
+        .path = Some(decoy.display().to_string());
+    f.write_front("D-1", &front);
+    assert!(
+        f.cad378_ack_rows().is_empty(),
+        "the re-pointed ref un-pinned nothing — the record still binds"
+    );
+    let (_, view) = f.cli(&["overview", "--json"]);
+    let lanes = view["projects"][0]["lanes"].clone();
+    assert_eq!(lanes[0]["worktree"], json!(wt), "{lanes}");
+
+    // The recorded branch commits again: the row re-raises even though
+    // the live ref points at the decoy.
+    f.cad378_commit(&wt, "src/daemon/area_rpc.rs");
+    assert_eq!(
+        f.cad378_ack_rows().len(),
+        1,
+        "the recorded branch moved — the row re-raises"
+    );
+}
+
+/// A bound lane whose recorded worktree is gone raises its row as
+/// unknown — never empty-and-silent.
+#[test]
+fn cad378_bound_lane_unreadable_recorded_dir_raises() {
+    let f = PlanFixture::start();
+    std::fs::write(f.pm_dir.join("demo/PROJECT.md"), CAD378_AREAS).unwrap();
+    let d1 = f.cad378_lane("Foreign work", "D-1", "src/peer.rs", "pm-other");
+    let (ok, out) = f.cli(&["issue", "ref", "D-1", "pr", "https://github.com/o/r/pull/9"]);
+    assert!(ok, "{out}");
+    // The record points at a worktree that does not exist.
+    cadence_agent::issue::areas::record_dispatch(
+        &f.d.state,
+        "D-1",
+        json!({"pm": "pm-other", "worktree": "/nonexistent/wt", "branch": "cadence/d-1"}),
+        false,
+    )
+    .unwrap();
+    let rows = f.cad378_ack_rows();
+    assert_eq!(
+        rows.len(),
+        1,
+        "a bogus recorded dir raises, not clears: {rows:#?}"
+    );
+    assert!(
+        d1["worktree"].as_str().unwrap().contains(".cadence"),
+        "{d1}"
+    );
+}
+
+/// `dispatch_record` derives everything from the named kickoff — the
+/// pm is the send's recorded sender, the lane is the message's
+/// daemon-written `issue`/`worktree` (schema v16, written at send
+/// behind the steer gate). A message the daemon never delivered, one
+/// carrying no lane fields, one bound to another issue, one naming the
+/// issue but no worktree, and one with a non-absolute worktree are all
+/// refused — and caller-supplied `pm`/`worktree`/`branch` params steer
+/// nothing. The kickoff body and tracker refs are agent-writable and
+/// none is read (they laundered the round-4 forgery).
+#[test]
+fn cad378_dispatch_record_binds_the_kickoff_not_the_request() {
+    let f = PlanFixture::start();
+    let (ok, out) = f.cli(&["issue", "new", "Work", "--project", "demo"]);
+    assert!(ok, "{out}");
+    let (ok, start) = f.cli(&["issue", "start", "D-1", "--by", "pm-own"]);
+    assert!(ok, "{start}");
+    let wt = std::fs::canonicalize(start["worktree"].as_str().unwrap())
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    // A worker with a thread, so the kickoff's sender is recorded on it,
+    // and its PM registered for the kickoff's reply_to.
+    for alias in ["w-1", "pm-own"] {
+        f.d.operator_rpc(
+            "agent_register",
+            json!({"alias": alias, "provider": "inbox", "endpoint_kind": "inbox",
+                   "cwd": f.d.dir.path().to_str().unwrap()}),
+        )
+        .unwrap();
+    }
+    f.d.operator_rpc(
+        "thread_send",
+        json!({"alias": "w-1", "text": "ready", "message": "t0"}),
+    )
+    .unwrap();
+    // The operator sends the real kickoff — `dispatch_send` resolves the
+    // lane itself from the issue's open worktree ref and writes the
+    // tags; the worktree field only corroborates what dispatch::run
+    // resolved.
+    f.d.operator_rpc(
+        "dispatch_send",
+        json!({"alias": "w-1", "text": "read /n — D-1: Work …",
+               "reply_to": "pm-own", "message": "m-real",
+               "issue": "D-1", "worktree": wt}),
+    )
+    .unwrap();
+    // Params that would steer the old record — pm, worktree, branch —
+    // are ignored now: the record binds the kickoff and its sender.
+    let r =
+        f.d.operator_rpc(
+            "dispatch_record",
+            json!({"issue": "D-1", "message": "m-real", "pm": "pm-evil",
+                   "worktree": "/tmp/decoy", "branch": "main"}),
+        )
+        .unwrap();
+    assert_eq!(r["pm"], "operator", "{r}");
+    assert_eq!(r["worktree"], json!(wt), "{r}");
+    // A plain send carries no daemon-written branch — the record probes
+    // the recorded lane's checkout.
+    assert_eq!(r["branch"], "HEAD", "{r}");
+    assert_eq!(r["worker"], "w-1", "{r}");
+    // Identity-shaped fields are refused, as before.
+    for (field, val) in [("by", "pm-own"), ("actor", "pm-own"), ("owner", "pm-own")] {
+        let err =
+            f.d.operator_rpc(
+                "dispatch_record",
+                json!({"issue": "D-1", "message": "m-real", field: val}),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("connection-bound"), "{field}: {err}");
+    }
+    // Every dishonest message is refused. A plain send — no lane tags,
+    // just mail.
+    f.d.operator_rpc(
+        "agent_send",
+        json!({"alias": "w-1", "text": "just mail", "message": "m-mail"}),
+    )
+    .unwrap();
+    // A genuine dispatch_send kickoff for another issue — daemon-tagged
+    // D-2, so it can never anchor D-1's record.
+    let (ok, out) = f.cli(&["issue", "new", "Other", "--project", "demo"]);
+    assert!(ok, "{out}");
+    let (ok, s2) = f.cli(&["issue", "start", "D-2", "--by", "pm-own"]);
+    assert!(ok, "{s2}");
+    f.d.operator_rpc(
+        "dispatch_send",
+        json!({"alias": "w-1", "text": "kickoff for D-2", "reply_to": "pm-own",
+               "message": "m-d2", "issue": "D-2"}),
+    )
+    .unwrap();
+    for (params, why) in [
+        (json!({"issue": "D-1"}), "no message named"),
+        (
+            json!({"issue": "D-1", "message": "m-ghost"}),
+            "no such message",
+        ),
+        (
+            json!({"issue": "D-1", "message": "m-mail"}),
+            "carries no lane fields",
+        ),
+        (
+            json!({"issue": "D-1", "message": "m-d2"}),
+            "bound to another issue",
+        ),
+        (
+            json!({"issue": "D-9", "message": "m-real"}),
+            "unknown issue",
+        ),
+    ] {
+        let err =
+            f.d.operator_rpc("dispatch_record", params)
+                .unwrap_err()
+                .to_string();
+        assert!(!err.is_empty(), "{why} recorded: {err}");
+    }
+    // The one honest record still stands — nothing refused overwrote it.
+    let recs = cadence_agent::issue::areas::dispatches(&f.d.state);
+    assert_eq!(recs["D-1"]["pm"], "operator", "{recs:?}");
+    assert_eq!(recs["D-1"]["worktree"], json!(wt), "{recs:?}");
+    let (_, view) = f.cli(&["overview", "--json"]);
+    let lanes = view["projects"][0]["lanes"].clone();
+    assert_eq!(lanes[0]["pm"], "operator", "{lanes}");
+    assert_eq!(lanes[0]["bound"], true, "{lanes}");
+}
+
+/// The R3 finding: `dispatch_record` accepted any proven agent for any
+/// issue with any worktree+branch and silently overwrote the real
+/// record — `w-evil` re-recorded D-1 onto a clean decoy and the owner's
+/// Needs-you row dropped. Now the record binds only the daemon-written
+/// lane fields on the named kickoff, only the kickoff's own sender (or
+/// the operator) may write it, and only the same PM may replace one:
+/// `w-evil` is refused naming the real kickoff, cannot even mark a
+/// send to another PM's worker, and a crafted body with planted
+/// tracker refs lands nothing — the record never moves.
+#[test]
+fn cad378_dispatch_record_other_agents_cannot_overwrite() {
+    let f = PlanFixture::start();
+    let home = TempDir::new().unwrap();
+    let mut pm = LaneShell::spawn(home.path());
+    let mut evil = LaneShell::spawn(home.path());
+    plant_member_pane(&f.d, "pm-own", "inbox", None, pm.pid());
+    plant_member_pane(&f.d, "w-evil", "inbox", None, evil.pid());
+    f.d.operator_rpc(
+        "agent_register",
+        json!({"alias": "w-1", "provider": "inbox", "endpoint_kind": "inbox",
+               "cwd": f.d.dir.path().to_str().unwrap(),
+               "params": json!({"upstream": "pm-own"}).to_string()}),
+    )
+    .unwrap();
+    f.d.operator_rpc(
+        "thread_send",
+        json!({"alias": "w-1", "text": "ready", "message": "t0"}),
+    )
+    .unwrap();
+    let (ok, out) = f.cli(&["issue", "new", "Work", "--project", "demo"]);
+    assert!(ok, "{out}");
+    let (ok, start) = f.cli(&["issue", "start", "D-1", "--by", "pm-own"]);
+    assert!(ok, "{start}");
+    let wt = std::fs::canonicalize(start["worktree"].as_str().unwrap())
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    // pm-own sends the real kickoff and records the dispatch —
+    // `dispatch_send` (pm-own is w-1's upstream, so the steer gate
+    // admits it) resolves the lane itself and writes the tags; the
+    // worktree field corroborates, never supplies.
+    let r = pm.rpc(
+        &f.d.state,
+        "dispatch_send",
+        json!({"alias": "w-1", "text": "read /n — D-1: Work …",
+               "reply_to": "pm-own", "message": "m-real",
+               "issue": "D-1", "worktree": wt}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+    let r = pm.rpc(
+        &f.d.state,
+        "dispatch_record",
+        json!({"issue": "D-1", "message": "m-real"}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(r["result"]["pm"], "pm-own", "{r}");
+
+    // w-evil — not the dispatcher — tries exactly what the review did:
+    // re-record D-1 naming the real kickoff.
+    let r = evil.rpc(
+        &f.d.state,
+        "dispatch_record",
+        json!({"issue": "D-1", "message": "m-real"}),
+    );
+    let e = frame_err(&r);
+    assert!(e.contains("was sent by 'pm-own'"), "{r}");
+
+    // Then with a decoy kickoff it sent itself. The planted refs that
+    // laundered the round-4 forgery are still on the issue — but none
+    // is read now. w-evil first tries to mark its send with the lane
+    // claim directly: refused — no send caller may set the tags at all
+    // (R6).
+    let decoy = f.tmp.path().join("decoy-wt");
+    let decoy_s = decoy.display().to_string();
+    let mut front = f.front("D-1");
+    for (kind, path) in [
+        ("worktree", decoy_s.as_str()),
+        ("message", "m-evil"),
+        ("branch", "main"),
+    ] {
+        front.refs.push(cadence_agent::issue::model::Ref {
+            kind: kind.to_string(),
+            url: None,
+            path: Some(path.to_string()),
+            label: None,
+            closed: None,
+            worktree: None,
+            cargo_target: None,
+            agent: None,
+        });
+    }
+    f.write_front("D-1", &front);
+    let r = evil.rpc(
+        &f.d.state,
+        "agent_send",
+        json!({"alias": "w-1", "text": "read /n — D-1: Work …",
+               "reply_to": "w-evil", "message": "m-evil",
+               "issue": "D-1", "worktree": decoy_s}),
+    );
+    assert_eq!(r["ok"], false, "{r}");
+    let e = frame_err(&r);
+    assert!(e.contains("only a dispatch sets"), "{r}");
+    // So its crafted kickoff rides only as text — mail, not a dispatch.
+    // The planted refs and kickoff-shaped body launder nothing.
+    let r = evil.rpc(
+        &f.d.state,
+        "agent_send",
+        json!({"alias": "w-1", "text": "read /n — D-1: Work. Your worktree \
+                                       exists: /tmp/decoy-wt (branch main) …",
+               "reply_to": "w-evil", "message": "m-evil"}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+    let r = evil.rpc(
+        &f.d.state,
+        "dispatch_record",
+        json!({"issue": "D-1", "message": "m-evil"}),
+    );
+    let e = frame_err(&r);
+    assert!(e.contains("daemon-written `issue`"), "{r}");
+    // The real record never moved — pm, worktree, branch all intact.
+    let recs = cadence_agent::issue::areas::dispatches(&f.d.state);
+    assert_eq!(recs["D-1"]["pm"], "pm-own", "{recs:?}");
+    assert_eq!(recs["D-1"]["worktree"], json!(wt), "{recs:?}");
+    assert_eq!(recs["D-1"]["branch"], "HEAD", "{recs:?}");
+}
+
+/// The round-4 attack on an UNRECORDED issue, replayed for R6:
+/// `w-evil` plants worktree/message/branch refs on D-1 and sends a
+/// kickoff-shaped body to w-1, then asks `dispatch_record` to write the
+/// record. Under the old binding those agent-writable inputs laundered
+/// the forgery into a record — the unbound lane's fail-loud rows went
+/// silent. Now the message carries no daemon-written `issue`/`worktree`,
+/// so it is refused: no record lands and the owner row stays up.
+///
+/// R6 replays the round-5 residual too: an upstream PM marks a send to
+/// a member it minted itself with forged `issue`/`worktree` — under
+/// #265 that passed the steer gate and wrote the tags. Now every send
+/// caller is refused the fields outright, and `dispatch_send` — the
+/// only remaining tag writer — refuses the foreign-held issue on its
+/// own claim check. The real PM's kickoff still records afterward.
+#[test]
+fn cad378_dispatch_record_forged_refs_and_body_bind_nothing() {
+    let f = PlanFixture::start();
+    std::fs::write(f.pm_dir.join("demo/PROJECT.md"), CAD378_AREAS).unwrap();
+    let home = TempDir::new().unwrap();
+    let mut evil = LaneShell::spawn(home.path());
+    let mut real_pm = LaneShell::spawn(home.path());
+    plant_member_pane(&f.d, "w-evil", "inbox", None, evil.pid());
+    plant_member_pane(&f.d, "pm-other", "inbox", None, real_pm.pid());
+    f.d.operator_rpc(
+        "agent_register",
+        json!({"alias": "w-1", "provider": "inbox", "endpoint_kind": "inbox",
+               "cwd": f.d.dir.path().to_str().unwrap(),
+               "params": json!({"upstream": "pm-own"}).to_string()}),
+    )
+    .unwrap();
+    // The members each side sends to: w-evil's self-minted worker and
+    // pm-other's own — registered so both upstreams resolve.
+    f.d.operator_rpc(
+        "agent_register",
+        json!({"alias": "w-e1", "provider": "inbox", "endpoint_kind": "inbox",
+               "cwd": f.d.dir.path().to_str().unwrap(),
+               "params": json!({"upstream": "w-evil"}).to_string()}),
+    )
+    .unwrap();
+    f.d.operator_rpc(
+        "agent_register",
+        json!({"alias": "w-real", "provider": "inbox", "endpoint_kind": "inbox",
+               "cwd": f.d.dir.path().to_str().unwrap(),
+               "params": json!({"upstream": "pm-other"}).to_string()}),
+    )
+    .unwrap();
+    // D-1 has a real lane touching a foreign-owned area but NO dispatch
+    // record — its owner row is already up, fail-loud.
+    let (ok, out) = f.cli(&["issue", "new", "Handmade", "--project", "demo"]);
+    assert!(ok, "{out}");
+    let (ok, out) = f.cli(&["issue", "set", "D-1", "paths=src/peer.rs"]);
+    assert!(ok, "{out}");
+    let (ok, s2) = f.cli(&["issue", "start", "D-1", "--by", "pm-other"]);
+    assert!(ok, "{s2}");
+    f.cad378_commit(s2["worktree"].as_str().unwrap(), "src/peer.rs");
+    let (ok, out) = f.cli(&["issue", "ref", "D-1", "pr", "https://github.com/o/r/pull/9"]);
+    assert!(ok, "{out}");
+    assert_eq!(
+        f.cad378_ack_rows().len(),
+        1,
+        "the unbound lane's owner row is up"
+    );
+
+    // w-evil plants the refs the forgery laundered — an open worktree
+    // ref naming a clean decoy, a `message` ref binding its own send, a
+    // branch ref — and sends the kickoff-shaped body. The lane-claim
+    // fields themselves are refused by the steer gate, so the send
+    // carries only text.
+    let decoy = f.tmp.path().join("decoy-wt");
+    let decoy_s = decoy.display().to_string();
+    let mut front = f.front("D-1");
+    for (kind, path) in [
+        ("worktree", decoy_s.as_str()),
+        ("message", "m-evil"),
+        ("branch", "main"),
+    ] {
+        front.refs.push(cadence_agent::issue::model::Ref {
+            kind: kind.to_string(),
+            url: None,
+            path: Some(path.to_string()),
+            label: None,
+            closed: None,
+            worktree: None,
+            cargo_target: None,
+            agent: None,
+        });
+    }
+    f.write_front("D-1", &front);
+    let r = evil.rpc(
+        &f.d.state,
+        "agent_send",
+        json!({"alias": "w-1",
+               "text": format!("read /n — D-1: Handmade. Your worktree exists: \
+                                {decoy_s} (branch main, base deadbee). Commit \
+                                trailer: Issue: D-1. PR to main; reply to \
+                                w-evil."),
+               "reply_to": "w-evil", "message": "m-evil"}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+    // Refused — the message carries no daemon-written lane binding, so
+    // no record is written and the owner row stays up.
+    let r = evil.rpc(
+        &f.d.state,
+        "dispatch_record",
+        json!({"issue": "D-1", "message": "m-evil"}),
+    );
+    let e = frame_err(&r);
+    assert!(e.contains("daemon-written `issue`"), "{r}");
+    let recs = cadence_agent::issue::areas::dispatches(&f.d.state);
+    assert!(recs.get("D-1").is_none(), "{recs:?}");
+    assert_eq!(
+        f.cad378_ack_rows().len(),
+        1,
+        "the round-4 forgery cannot convert fail-loud into silent"
+    );
+
+    // R6: the round-5 residual — w-evil mints its own member and marks
+    // a send to it with the forged lane. The steer gate admitted that
+    // caller-vs-target pair under #265; now every send caller is
+    // refused the fields outright.
+    let r = evil.rpc(
+        &f.d.state,
+        "agent_send",
+        json!({"alias": "w-e1", "text": "read /n — D-1: Handmade …",
+               "reply_to": "w-evil", "message": "m-evil2",
+               "issue": "D-1", "worktree": decoy_s}),
+    );
+    assert_eq!(r["ok"], false, "{r}");
+    let e = frame_err(&r);
+    assert!(e.contains("only a dispatch sets"), "{r}");
+    // Through the dispatch path itself it is refused too: D-1 is doing
+    // and held by pm-other — w-evil and w-e1 share no name with its
+    // holders, so the claim check declines before a tag is written.
+    // The attack omits `worktree` entirely — the strongest form, where
+    // only the claim check stands between w-evil and a daemon-tagged
+    // kickoff on an issue it does not hold.
+    let r = evil.rpc(
+        &f.d.state,
+        "dispatch_send",
+        json!({"alias": "w-e1", "text": "read /n — D-1: Handmade …",
+               "reply_to": "w-evil", "message": "m-evil3",
+               "issue": "D-1"}),
+    );
+    assert_eq!(r["ok"], false, "{r}");
+    let e = frame_err(&r);
+    assert!(e.contains("held by"), "{r}");
+    // No message ever carried the forged tags, so no record can land.
+    let r = evil.rpc(
+        &f.d.state,
+        "dispatch_record",
+        json!({"issue": "D-1", "message": "m-evil3"}),
+    );
+    assert_eq!(r["ok"], false, "{r}");
+    let recs = cadence_agent::issue::areas::dispatches(&f.d.state);
+    assert!(recs.get("D-1").is_none(), "{recs:?}");
+    assert_eq!(f.cad378_ack_rows().len(), 1, "the owner row stays up");
+
+    // Even the issue's own PM cannot re-point the tag: a `worktree`
+    // that isn't the daemon-resolved lane is refused, not written.
+    let r = real_pm.rpc(
+        &f.d.state,
+        "dispatch_send",
+        json!({"alias": "w-real", "text": "read /n — D-1: Handmade …",
+               "reply_to": "pm-other", "message": "m-decoy",
+               "issue": "D-1", "worktree": decoy_s}),
+    );
+    assert_eq!(r["ok"], false, "{r}");
+    let e = frame_err(&r);
+    assert!(e.contains("not the lane"), "{r}");
+
+    // The real PM's genuine dispatch still records: its dispatch_send
+    // resolves the issue's real lane (the planted ref verifies as
+    // nothing) and the kickoff's daemon-written tags anchor the record.
+    let r = real_pm.rpc(
+        &f.d.state,
+        "dispatch_send",
+        json!({"alias": "w-real", "text": "read /n — D-1: Handmade …",
+               "reply_to": "pm-other", "message": "m-real",
+               "issue": "D-1"}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+    let r = real_pm.rpc(
+        &f.d.state,
+        "dispatch_record",
+        json!({"issue": "D-1", "message": "m-real"}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(r["result"]["pm"], "pm-other", "{r}");
+    let recs = cadence_agent::issue::areas::dispatches(&f.d.state);
+    assert_eq!(recs["D-1"]["pm"], "pm-other", "{recs:?}");
+    assert_eq!(recs["D-1"]["worker"], "w-real", "{recs:?}");
+    assert_eq!(
+        recs["D-1"]["worktree"],
+        json!(std::fs::canonicalize(s2["worktree"].as_str().unwrap())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()),
+        "{recs:?}"
+    );
 }

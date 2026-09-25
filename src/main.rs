@@ -6906,8 +6906,14 @@ fn run() -> Result<i32> {
                 force,
                 take_over,
             };
-            let out =
-                cadence_agent::issue::dispatch::run(&pm, issue.as_str(), &args, "", &state_dir)?;
+            let out = cadence_agent::issue::dispatch::run(
+                &pm,
+                issue.as_str(),
+                &args,
+                "",
+                &state_dir,
+                None,
+            )?;
             // CAD-383: a backlog/ready issue someone else owns warns only.
             if let Some(warning) = out["claim"]["warning"].as_str() {
                 eprintln!("warning: {warning}");
@@ -6916,6 +6922,11 @@ fn run() -> Result<i32> {
             // dispatches, but the operator sees why it should not.
             if let Some(warning) = out["acceptance"]["warning"].as_str() {
                 eprintln!("warning: {warning}");
+            }
+            // CAD-378: overlapping lanes, owned or full code areas —
+            // advisory only.
+            for line in cadence_agent::issue::areas::warning_lines(&out["leases"]) {
+                eprintln!("warning: {line}");
             }
             print_json(&out);
             Ok(0)

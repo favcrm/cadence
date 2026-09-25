@@ -446,7 +446,19 @@ fn lane_head(worktree: &Path) -> Option<String> {
 }
 
 /// `dispatch <ISSUE> --to <worker> --note <path> [--job --spec f]`.
-pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path) -> Result<Value> {
+///
+/// `dispatch_pm`: `Some(alias)` when the daemon itself dispatches
+/// (master_dispatch) — it writes the dispatch record directly, pm =
+/// its own alias; `None` for the CLI, whose `dispatch_record` RPC
+/// derives the pm from the caller's connection.
+pub fn run(
+    pm: &Pm,
+    id: &str,
+    args: &DispatchArgs,
+    actor: &str,
+    state_dir: &Path,
+    dispatch_pm: Option<&str>,
+) -> Result<Value> {
     let (project, dir) = write::issue_dir(pm, id)?;
     let (front, body) = write::load_front(&dir)?;
     // CAD-360: a ticket of a plan dispatches only once the operator
@@ -686,6 +698,7 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
         "slot_env": started["slot_env"],
         "acceptance": acceptance,
         "claim": started["claim"],
+        "leases": started["leases"],
     });
     if let Some(msg) = live {
         out["dispatched"] = json!(false);
@@ -947,14 +960,16 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
 
     // Exactly one send — plain text kickoff, or `job dispatch`'s
     // spec-bound kickoff for --job (its state lives on the task). Both
-    // record the lane on the message row — `issue`/`worktree` here, the
-    // job's own fields in `task_dispatch` — so a later re-dispatch can
-    // prove this kickoff's report belongs to THIS issue and lane
-    // (CAD-467).
+    // record the lane on the message row — `issue`/`worktree` via
+    // `dispatch_send`, which resolves the lane itself and only checks
+    // the worktree this dispatch started (CAD-378 R6: no caller field
+    // can set them), the job's own fields in `task_dispatch` — so a
+    // later re-dispatch can prove this kickoff's report belongs to
+    // THIS issue and lane (CAD-467).
     let (message, sent_state) = if let Some(body) = send_body {
         let sent = client::rpc(
             state_dir,
-            "agent_send",
+            "dispatch_send",
             json!({"alias": args.to, "text": body, "reply_to": reply_to, "message": mid,
                    "issue": front.id, "worktree": started["worktree"]}),
         )
@@ -1026,6 +1041,41 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
         }
     }
 
+    // CAD-378: the daemon records what this dispatch bound — worktree,
+    // branch, worker and pm — in dispatches.json, derived from the
+    // kickoff message the daemon just delivered (never request fields).
+    // That record, not anything the tracker carries, binds the lane's
+    // area-owner rows. A failure is reported, never silent: the kickoff
+    // already went out, and an unbound lane's rows stay up (fail loud).
+    let dispatch_record = match dispatch_pm {
+        // An in-daemon dispatch writes the record itself — its pm is
+        // the master's alias, not whatever a round-trip connection
+        // would derive — and it may replace any prior record (the
+        // daemon's own dispatch is the operator-grade writer).
+        Some(pm_alias) => {
+            let record = json!({
+                "issue": front.id,
+                "pm": pm_alias,
+                "pm_kind": "daemon",
+                "worker": args.to,
+                "worktree": started["worktree"],
+                "branch": started["branch"],
+                "message": message,
+                "at": crate::issue::time::iso(crate::issue::time::now_epoch()),
+            });
+            crate::issue::areas::record_dispatch(state_dir, &front.id, record.clone(), true)
+                .map(|_| record)
+        }
+        None => client::rpc(
+            state_dir,
+            "dispatch_record",
+            json!({
+                "issue": front.id,
+                "message": message,
+            }),
+        ),
+    };
+
     // The comment rides its own commit through the existing helper. A
     // second line records which lessons were injected.
     let mut comment_text = format!("Dispatched to {}: {}", args.to, note.display());
@@ -1067,6 +1117,11 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
         )),
         _ => {}
     }
+    // CAD-378: the advisory lease warnings, recorded with the dispatch
+    // they were raised on — never a refusal.
+    for line in crate::issue::areas::warning_lines(&started["leases"]) {
+        comment_text.push_str(&format!("\nLease warning: {line}"));
+    }
     let comment = write::add_comment(pm, id, &comment_text, None, Some("dispatch"), None, actor)?;
 
     // The worker's current probe verdict — pty only; the operator
@@ -1080,6 +1135,15 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
     };
 
     out["dispatched"] = json!(true);
+    out["dispatch_record"] = dispatch_record
+        .as_ref()
+        .map(|r| r.clone())
+        .unwrap_or(Value::Null);
+    out["dispatch_record_error"] = dispatch_record
+        .as_ref()
+        .err()
+        .map(|e| json!(e.to_string()))
+        .unwrap_or(Value::Null);
     out["message"] = json!(message);
     out[sent_state.0] = sent_state.1;
     out["lessons"] = json!(lessons);
