@@ -33,6 +33,7 @@ mod delivery_rpc;
 mod dispatch_rpc;
 mod master_rpc;
 mod master_wake;
+mod next_action;
 mod operator_rpc;
 mod platform_rpc;
 
@@ -523,6 +524,9 @@ pub struct Shared {
     router_every: Option<Duration>,
     /// CAD-477: the checkup's pass period; `None` is off.
     checkup_every: Option<Duration>,
+    /// CAD-484: test seam for the idle lane's dispatch — `None` runs
+    /// the real `issue::dispatch::run`.
+    checkup_dispatch: Option<Arc<CheckupDispatch>>,
     /// CAD-339: reports due to the master but held back by the per-pass
     /// cap at the router's last pass.
     router_backlog: std::sync::atomic::AtomicUsize,
@@ -640,6 +644,7 @@ impl Shared {
                 Some(0) => None,
                 Some(secs) => Some(Duration::from_secs(secs)),
             },
+            checkup_dispatch: opts.checkup_dispatch.clone(),
             router_backlog: std::sync::atomic::AtomicUsize::new(0),
             escalation_lock: Mutex::new(()),
             dispatch_lock: Mutex::new(()),
@@ -10329,6 +10334,10 @@ pub struct ServeOptions {
     /// [`checkup::DEFAULT_CHECKUP_SECS`]; `Some(0)` turns it off — test
     /// daemons stay hermetic, no unattended lane judgements.
     pub checkup: Option<u64>,
+    /// CAD-484: the idle lane's dispatch seam — `None` (production)
+    /// runs `issue::dispatch::run`; a test injects a recorder so the
+    /// pick-and-dispatch logic runs without a provider.
+    pub checkup_dispatch: Option<Arc<CheckupDispatch>>,
     /// The actor's empty-queue poll — `None` is five seconds. A test
     /// that must prove a delivery came from the wake, not the poll,
     /// sets it past its own wait bound (CAD-391).
@@ -10345,6 +10354,13 @@ pub struct ServeOptions {
     /// wall clock; tests inject one they advance past a link's TTL.
     pub operator_clock: Option<Arc<dyn Fn() -> i64 + Send + Sync>>,
 }
+
+/// What the CAD-484 checkup calls to dispatch a picked ticket to a
+/// lane: `(shared, pm_dir, issue, alias) → dispatch::run`'s out map.
+/// Production binds `issue::dispatch::run`; a test returns a recorded
+/// stub. The seam injects behavior, not authority — `dispatch_one`
+/// re-validates the ticket under `dispatch_lock` before calling it.
+type CheckupDispatch = dyn Fn(&Arc<Shared>, &Path, &str, &str) -> Result<Value> + Send + Sync;
 
 /// Slot configuration precedence: explicit `ServeOptions.slots`, then
 /// `[host]` in the repo's pm.yaml, then the built-in defaults.

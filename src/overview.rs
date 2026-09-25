@@ -710,7 +710,10 @@ impl Audience {
             // plan awaiting approval are the operator's to decide.
             // CAD-477: a checkup-escalated blocked report and a stopped
             // agent holding queued work take the same operator row.
-            "approval" | "fenced" | "question" | "plan" | "blocked" | "stopped" => Self::Operator,
+            // CAD-484: an idle lane with no safe next step is the
+            // operator's call too.
+            "approval" | "fenced" | "question" | "plan" | "blocked" | "stopped"
+            | "next_action" => Self::Operator,
             // CAD-431: the merge decision, a review that did not
             // converge, one nobody can take, and auto-merge left on a
             // moved head are the operator's.
@@ -2779,6 +2782,26 @@ fn overview_from(
         let mut clock = StatusClock::new(line_times.as_ref());
         let mut intake: Vec<Item> = Vec::new();
         let escalations = crate::master::escalations(state_dir);
+        // CAD-484: a next-action row hides only when its lane is
+        // provably not at rest — the daemon answered and the lane is
+        // busy, queued or working. An unreachable daemon or an
+        // unlisted alias cannot disprove the flag, so the row stands.
+        let lane_working: HashMap<String, bool> = daemon
+            .agents
+            .iter()
+            .zip(&daemon.probes)
+            .filter_map(|(a, p)| {
+                let alias = a["alias"].as_str()?;
+                let queued = a["inbox"]["queued"]
+                    .as_i64()
+                    .or_else(|| p.show.as_ref().and_then(|s| s["queued"].as_i64()))
+                    .unwrap_or(0);
+                Some((
+                    alias.to_string(),
+                    a["state"].as_str() != Some("idle") || p.holds_drift || queued > 0,
+                ))
+            })
+            .collect();
         for v in views {
             let id = v.issue.front.id.as_str();
             let project = v.issue.project.as_str();
@@ -2962,6 +2985,41 @@ fn overview_from(
                     row.json["blocked"] = json!({
                         "issue": id, "report": name, "agent": b["agent"], "body": b["body"],
                     });
+                    row.json["summary"] = up.get("summary").cloned().unwrap_or(Value::Null);
+                    row.json["escalated_by"] = up.get("by").cloned().unwrap_or(Value::Null);
+                    needs.push(row);
+                }
+            }
+            // CAD-484: the checkup's one Needs-you when an idle lane
+            // had no safe next step. The record is keyed
+            // `{issue}/next-action`; the row hides the moment the lane
+            // provably works again — a queued kickoff, a running turn,
+            // a busy pane — and never needs a record delete.
+            if let Some(up) = escalations
+                .get(&format!("{id}/next-action"))
+                .and_then(Value::as_object)
+                .filter(|u| u["kind"].as_str() == Some("next_action"))
+            {
+                let agent = up["agent"].as_str().unwrap_or_default();
+                if !lane_working.get(agent).copied().unwrap_or(false) {
+                    let since = up["at"].as_str().and_then(parse_iso);
+                    let mut row = item(
+                        20,
+                        "next_action",
+                        &format!(
+                            "{id} — {} is idle with no safe next step — {}",
+                            agent,
+                            up["summary"].as_str().unwrap_or_default()
+                        ),
+                        since.map_or(age, |t| now - t),
+                        project,
+                        None,
+                        &format!("cadence issue show {id}"),
+                    )
+                    .about("issue", id)
+                    .for_agent(agent)
+                    .since(since);
+                    row.json["next_action"] = json!({"issue": id, "agent": agent});
                     row.json["summary"] = up.get("summary").cloned().unwrap_or(Value::Null);
                     row.json["escalated_by"] = up.get("by").cloned().unwrap_or(Value::Null);
                     needs.push(row);

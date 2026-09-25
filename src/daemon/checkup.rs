@@ -20,10 +20,12 @@
 //!   turn, a busy pane — never pasted into), a prompt still in
 //!   flight, or a healthy queue.
 //!
-//! What the checkup never does: merge, dispatch new work, or restart
-//! a provider. Its writes are the reminder nudge, the guarded
-//! `unknown` finish, the escalation record and its own `checkup`
-//! events.
+//! What the checkup never does: merge, restart a provider, or touch a
+//! busy lane. Its writes are the reminder nudge, the guarded `unknown`
+//! finish, the escalation record and its own `checkup` events — plus,
+//! for a lane that reported done and is idle, CAD-484's one next
+//! action ([`super::next_action`]): a fix turn, a review routing, one
+//! safe ready-ticket dispatch, or a Needs-you row.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,6 +33,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use super::master_rpc;
+use super::next_action;
 use super::{format_unknown_fence, Shared, AUTO_STOP_EVENT, AUTO_STOP_MARKER_KINDS, DAEMON_ALIAS};
 use crate::error::Result;
 use crate::issue::{self, task_report};
@@ -45,15 +48,21 @@ pub(super) const CHECKUP_EVENT: &str = "checkup";
 pub(super) const DEFAULT_CHECKUP_SECS: u64 = 60;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Outcome {
+pub(super) enum Outcome {
     Nudge,
     Escalate,
     Leave,
+    /// CAD-484: one fix turn went to the lane's open PR.
+    Fix,
+    /// CAD-484: the review loop staffed a reviewer on the lane's head.
+    Review,
+    /// CAD-484: one safe ready ticket went to the free lane.
+    Dispatch,
 }
 
 /// What a pty pane's live watch proves for the checkup.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Pane {
+pub(super) enum Pane {
     /// Probed idle past `silent_end_secs` — the prompt is waiting.
     Idle,
     /// A busy screen, an approval menu or a brokered request — the
@@ -64,20 +73,33 @@ enum Pane {
 }
 
 impl Outcome {
-    fn as_str(self) -> &'static str {
+    pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::Nudge => "nudge",
             Self::Escalate => "escalate",
             Self::Leave => "leave",
+            Self::Fix => "fix",
+            Self::Review => "review",
+            Self::Dispatch => "dispatch",
         }
     }
 }
 
 impl Shared {
-    /// One checkup pass: visit every agent holding a running or queued
-    /// turn, then the report scan — an open question or blocked report
-    /// its PM never picked up escalates to the operator's Needs-you.
+    /// One checkup pass: the report scan first — an open question or
+    /// blocked report its PM never picked up escalates to the
+    /// operator's Needs-you, and the walk feeds the done map — then
+    /// every agent holding a running or queued turn is visited, and
+    /// every lane that reported done and is provably idle gets its one
+    /// next action (CAD-484, [`super::next_action`]).
     pub(super) fn checkup_tick(self: &Arc<Self>) {
+        let done = match self.checkup_reports() {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(event = "checkup_reports_failed", error = e.to_string());
+                next_action::DoneMap::new()
+            }
+        };
         let agents = match self.store.agents() {
             Ok(a) => a,
             Err(e) => {
@@ -91,7 +113,7 @@ impl Shared {
             if agent.endpoint_kind == "inbox" {
                 continue;
             }
-            if let Err(e) = self.checkup_agent(agent) {
+            if let Err(e) = self.checkup_agent(agent, done.get(&agent.alias)) {
                 tracing::warn!(
                     event = "checkup_agent_failed",
                     alias = agent.alias.as_str(),
@@ -99,17 +121,23 @@ impl Shared {
                 );
             }
         }
-        if let Err(e) = self.checkup_reports() {
-            tracing::warn!(event = "checkup_reports_failed", error = e.to_string());
-        }
     }
 
     /// Visit one agent: decide its outcome, act on it, then record the
     /// `checkup` event — one outcome per visited worker per pass.
-    fn checkup_agent(self: &Arc<Self>, agent: &Agent) -> Result<()> {
+    fn checkup_agent(
+        self: &Arc<Self>,
+        agent: &Agent,
+        done: Option<&Vec<next_action::DoneRef>>,
+    ) -> Result<()> {
         let running = self.store.running_message(&agent.alias)?;
         let queued = self.store.queued_head(&agent.alias)?;
         if running.is_none() && queued.is_none() {
+            // CAD-484: no turn in flight — a lane that reported done
+            // still gets its one next action.
+            if let Some(reports) = done.filter(|r| !r.is_empty()) {
+                return self.checkup_idle_lane(agent, reports);
+            }
             return Ok(());
         }
         let head = running.as_ref().or(queued.as_ref());
@@ -208,7 +236,7 @@ impl Shared {
     /// `turn_silent_end` needs for `Idle`: `silent_end_secs` of
     /// consecutive idle samples, never while a menu or a brokered
     /// request explains the wait.
-    fn pane_state(&self, agent: &Agent) -> Pane {
+    pub(super) fn pane_state(&self, agent: &Agent) -> Pane {
         let budget = self.silent_end_budget(agent);
         if budget == 0 {
             return Pane::NoProof;
@@ -341,18 +369,24 @@ impl Shared {
     /// operator's Needs-you through the daemon's own escalation
     /// record, the same write `question_escalate` makes. A report file
     /// still cannot put itself in Needs-you; only this record can.
-    fn checkup_reports(self: &Arc<Self>) -> Result<()> {
+    fn checkup_reports(self: &Arc<Self>) -> Result<next_action::DoneMap> {
         let Ok(pm_dir) = self.pm_dir() else {
-            return Ok(());
+            return Ok(next_action::DoneMap::new());
         };
         self.checkup_reports_in(&pm_dir)
     }
 
     /// The scan over one tracker dir — split from [`Self::pm_dir`]
-    /// resolution so a test can point it at its own pm.
-    fn checkup_reports_in(self: &Arc<Self>, pm_dir: &std::path::Path) -> Result<()> {
+    /// resolution so a test can point it at its own pm. Returns the
+    /// done map alongside the escalation pass: every `done` report by
+    /// the agent who filed it, for the idle-lane visit.
+    pub(super) fn checkup_reports_in(
+        self: &Arc<Self>,
+        pm_dir: &std::path::Path,
+    ) -> Result<next_action::DoneMap> {
+        let mut done: next_action::DoneMap = next_action::DoneMap::new();
         if !pm_dir.join("pm.yaml").is_file() {
-            return Ok(());
+            return Ok(done);
         }
         let grace = crate::doctor::host::read_host_overrides(pm_dir)
             .ok()
@@ -381,6 +415,27 @@ impl Shared {
                 for row in &rows {
                     let name = row["name"].as_str().unwrap_or_default();
                     let kind = row["kind"].as_str().unwrap_or_default();
+                    // CAD-484: every done report feeds the idle-lane
+                    // map before the escalation filters apply.
+                    if kind == "done" {
+                        if let Some(filer) = row["agent"].as_str().filter(|a| !a.is_empty()) {
+                            done.entry(filer.to_string())
+                                .or_default()
+                                .push(next_action::DoneRef {
+                                    issue: id.clone(),
+                                    project: project.key.clone(),
+                                    name: name.to_string(),
+                                    at: row["at"]
+                                        .as_str()
+                                        .and_then(issue::time::parse_iso)
+                                        .unwrap_or(0),
+                                    sha: row["sha"].as_str().map(str::to_string),
+                                    pr: row["pr"].as_str().map(str::to_string),
+                                    status: status.clone(),
+                                });
+                        }
+                        continue;
+                    }
                     let open = match kind {
                         "question" => row["open"] == true,
                         "blocked" => task_report::blocked_open(&rows, row, &status),
@@ -415,7 +470,7 @@ impl Shared {
                 }
             }
         }
-        Ok(())
+        Ok(done)
     }
 
     /// Write one report's escalation and record the outcome on the

@@ -62,12 +62,28 @@ impl Shared {
     /// Open the loop's record for a ticket `master_dispatch` just sent
     /// to `worker`. A finished record is replaced; a live one is kept.
     pub(super) fn delivery_start(&self, id: &str, project: &str, worker: &str) -> Result<()> {
+        self.delivery_adopt(id, project, worker, now())
+    }
+
+    /// CAD-484: open the record for a lane the checkup adopted — the
+    /// worker's done report predates the loop, so the dispatch bound is
+    /// the report's own `at`, letting the router take it rather than
+    /// filter it as filed before the record existed.
+    pub(super) fn delivery_adopt(
+        &self,
+        id: &str,
+        project: &str,
+        worker: &str,
+        dispatched_at: i64,
+    ) -> Result<()> {
         let _g = self.delivery_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut all = delivery::load(&self.state_dir)?;
         if all.get(id).is_some_and(|r| !r.state.terminal()) {
             return Ok(());
         }
-        all.insert(id.to_string(), Record::new(id, project, worker, now()));
+        let mut rec = Record::new(id, project, worker, now());
+        rec.dispatched_at = dispatched_at;
+        all.insert(id.to_string(), rec);
         delivery::save(&self.state_dir, &all)
     }
 
