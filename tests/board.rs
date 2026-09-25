@@ -7930,7 +7930,7 @@ fn tailnet_proof_refusals_name_their_check() {
     let (pm, state) = (TempDir::new().unwrap(), TempDir::new().unwrap());
     seed(pm.path(), state.path());
     type Setup = fn(&Path, u16);
-    let cases: [(&str, Setup); 8] = [
+    let cases: [(&str, Setup); 9] = [
         ("localapi", |d, p| {
             // No TUN field: the status cannot be read as either mode.
             localapi_says(d, None, serve_https_only(p))
@@ -7958,6 +7958,14 @@ fn tailnet_proof_refusals_name_their_check() {
             // An operator name that resolves to no user: fail closed.
             localapi_says(d, Some(true), serve_https_only(p));
             localapi_operator(d, "no-such-user-cad336");
+        }),
+        ("foreign_uid", |d, p| {
+            // CAD-509: tailscaled omits an empty OperatorUser
+            // (omitempty) — a prefs object without the field is "no
+            // operator", so the rungs pass through to the fixture's
+            // own-uid refusal.
+            localapi_says(d, Some(true), serve_https_only(p));
+            std::fs::write(d.join("prefs.json"), r#"{"WantRunning": true}"#).unwrap();
         }),
         ("no_tcp_forwarder", |d, p| {
             // qa-1's attack: `tailscale serve --tcp=N tcp://127.0.0.1:<board>`

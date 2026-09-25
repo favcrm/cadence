@@ -3042,7 +3042,8 @@ fn read_pid(state_dir: &Path) -> Option<i32> {
 /// Tiny blocking GET — enough for health checks without an HTTP client
 /// dependency. `headers` are extra request lines (`Tailscale-User-Login`
 /// for the identity probe). Returns `(status, body)`.
-fn http_get(
+/// `pub(crate)` for `doctor --host`'s tailnet probe (CAD-509).
+pub(crate) fn http_get(
     host: &str,
     port: u16,
     path: &str,
@@ -3599,6 +3600,10 @@ fn ts_status(state_dir: &Path) -> Result<i32> {
                     println!(
                         "identity: local forged login ignored ({actor}; refused by \
                          check {check}); tailnet logins resolve only via {url}/api/meta"
+                    );
+                    println!(
+                        "advice:   `cadence doctor --host` runs the whole tailnet \
+                         proof up front and prints every remedy in order"
                     );
                 }
             }

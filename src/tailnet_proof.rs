@@ -76,7 +76,9 @@ const LOCALAPI_TIMEOUT: Duration = Duration::from_secs(2);
 const LOCALAPI_MAX_BYTES: u64 = 4 << 20;
 
 /// The check a request failed — see the module doc for the order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Declaration order is the proof order: `Ord` sorts a set of
+/// refusals to the first rung a request would fail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Check {
     Loopback,
     TailscaledSocket,
@@ -104,6 +106,26 @@ impl Check {
             Check::SocketOwner => "socket_owner",
             Check::ForeignUid => "foreign_uid",
         }
+    }
+
+    /// The check `name` — `/api/meta` serialises `check` as
+    /// [`as_str`](Check::as_str); a name it could not have written is
+    /// `None`.
+    pub fn named(name: &str) -> Option<Check> {
+        [
+            Check::Loopback,
+            Check::TailscaledSocket,
+            Check::Localapi,
+            Check::KernelNetworking,
+            Check::NotOperatorUser,
+            Check::OperatorLatched,
+            Check::NoTcpForwarder,
+            Check::ClientSocket,
+            Check::SocketOwner,
+            Check::ForeignUid,
+        ]
+        .into_iter()
+        .find(|c| c.as_str() == name)
     }
 }
 
@@ -249,27 +271,29 @@ pub fn prove(
     )
 }
 
-/// Checks 4-7, 9 and 10 once everything is read; `latched` is the
-/// [`OperatorLatch`]'s reason, if any.
-fn decide(
+/// The refusals the host-side facts alone decide — `kernel_networking`,
+/// `not_operator_user`, `no_tcp_forwarder` and `foreign_uid`, in proof
+/// order. `decide` merges the board-memory `operator_latched` and the
+/// per-connection `socket_owner` between them; [`host_refusals`] reports
+/// this list whole so every remedy can print at once.
+fn fact_refusals(
     facts: &Facts,
-    latched: Option<String>,
+    own_uid: u32,
     board_port: u16,
     tailscaled_uid: u32,
-    socket_uid: u32,
-    own_uid: u32,
-) -> Result<(), Refusal> {
+) -> Vec<Refusal> {
+    let mut out = Vec::new();
     if !facts.tun {
-        return Err(refuse(
+        out.push(refuse(
             Check::KernelNetworking,
             "tailscaled runs with userspace networking — it dials loopback for any \
              tailnet peer, so its sockets carry that peer's bytes",
         ));
     }
     match &facts.operator_uid {
-        Err(why) => return Err(refuse(Check::NotOperatorUser, why.clone())),
+        Err(why) => out.push(refuse(Check::NotOperatorUser, why.clone())),
         Ok(Some(uid)) if *uid == own_uid => {
-            return Err(refuse(
+            out.push(refuse(
                 Check::NotOperatorUser,
                 format!(
                     "the board's uid {own_uid} is tailscaled's operator user — it can make \
@@ -280,15 +304,12 @@ fn decide(
         }
         Ok(_) => {}
     }
-    if let Some(why) = latched {
-        return Err(refuse(Check::OperatorLatched, why));
-    }
     if let Some(target) = facts
         .tcp_forwards
         .iter()
         .find(|t| forwards_to(t, board_port))
     {
-        return Err(refuse(
+        out.push(refuse(
             Check::NoTcpForwarder,
             format!(
                 "the serve config has a TCP forwarder to {target} — raw TCP to the board's \
@@ -296,14 +317,8 @@ fn decide(
             ),
         ));
     }
-    if socket_uid != tailscaled_uid {
-        return Err(refuse(
-            Check::SocketOwner,
-            format!("the client socket belongs to uid {socket_uid}, not tailscaled's uid {tailscaled_uid}"),
-        ));
-    }
     if tailscaled_uid == own_uid {
-        return Err(refuse(
+        out.push(refuse(
             Check::ForeignUid,
             format!(
                 "tailscaled runs as this board's uid {own_uid} — any same-uid process \
@@ -311,7 +326,55 @@ fn decide(
             ),
         ));
     }
-    Ok(())
+    out
+}
+
+/// Checks 4-7, 9 and 10 once everything is read; `latched` is the
+/// [`OperatorLatch`]'s reason, if any.
+fn decide(
+    facts: &Facts,
+    latched: Option<String>,
+    board_port: u16,
+    tailscaled_uid: u32,
+    socket_uid: u32,
+    own_uid: u32,
+) -> Result<(), Refusal> {
+    let latched = latched.map(|why| refuse(Check::OperatorLatched, why));
+    let socket_owner = (socket_uid != tailscaled_uid).then(|| {
+        refuse(
+            Check::SocketOwner,
+            format!(
+                "the client socket belongs to uid {socket_uid}, not tailscaled's uid {tailscaled_uid}"
+            ),
+        )
+    });
+    // Check order is the proof order — the smallest failing rung wins.
+    fact_refusals(facts, own_uid, board_port, tailscaled_uid)
+        .into_iter()
+        .chain([latched, socket_owner].into_iter().flatten())
+        .min_by_key(|r| r.check)
+        .map_or(Ok(()), Err)
+}
+
+/// The host-side rungs of the proof, read up front so `doctor --host`
+/// can print the whole remedy chain before a sign-in link is spent
+/// (CAD-509). `own_uid` stands in for the board's uid — a board `ui
+/// start` launches runs as its starter — and `board_port` for its port.
+///
+/// Not decidable here: `loopback`, `client_socket` and `socket_owner`
+/// are per-connection, and `operator_latched` is the running board's
+/// memory — a live board's `/api/meta` reports it. An unreadable rung
+/// ends the pass: below the socket, then the LocalAPI, nothing can be
+/// read.
+pub fn host_refusals(socket: Option<&Path>, own_uid: u32, board_port: u16) -> Vec<Refusal> {
+    let (path, tailscaled_uid) = match anchor(socket) {
+        Ok(found) => found,
+        Err(r) => return vec![r],
+    };
+    match read_facts(&path) {
+        Err(e) => vec![refuse(Check::Localapi, e)],
+        Ok(facts) => fact_refusals(&facts, own_uid, board_port, tailscaled_uid),
+    }
 }
 
 /// Does a `TCPForward` target (`host:port`) reach `port`? A target
@@ -394,15 +457,21 @@ fn read_facts(socket: &Path) -> Result<Facts, String> {
 }
 
 /// `prefs.OperatorUser` resolved to a uid. The outer `Err` is an
-/// unreadable LocalAPI; the inner one a name that resolves to no user.
+/// unreadable LocalAPI — or a prefs body that is not a JSON object;
+/// the inner one a name that resolves to no user. tailscaled omits an
+/// empty `OperatorUser` (`omitempty`), so the field absent — or null —
+/// is "no operator user", not a read failure; any other non-string
+/// still fails closed.
 fn operator_uid(socket: &Path) -> Result<Result<Option<u32>, String>, String> {
     let prefs = localapi_get(socket, "/localapi/v0/prefs")?;
-    let operator = prefs["OperatorUser"]
-        .as_str()
-        .ok_or_else(|| "LocalAPI prefs carry no OperatorUser field".to_string())?;
-    Ok(match operator {
-        "" => Ok(None),
-        name => uid_of(name).map(Some),
+    let map = prefs
+        .as_object()
+        .ok_or_else(|| "LocalAPI prefs is not a JSON object".to_string())?;
+    Ok(match map.get("OperatorUser") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(name)) if name.is_empty() => Ok(None),
+        Some(Value::String(name)) => uid_of(name).map(Some),
+        Some(_) => Err("LocalAPI prefs' OperatorUser is not a user name".to_string()),
     })
 }
 
@@ -497,10 +566,57 @@ fn parse_response(raw: &[u8]) -> Result<Value, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
     use std::net::{TcpListener, TcpStream};
+
+    /// A fake tailscaled LocalAPI on a unix socket under `dir`:
+    /// every request answers `<dir>/status.json`, `prefs.json` or
+    /// `serve.json` read fresh per connection — a 500 when the file
+    /// is absent — so a test rewrites answers between reads.
+    /// `pub(crate)` so `doctor::host`'s tests share the fixture.
+    pub(crate) fn localapi(dir: &Path) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let sock = dir.join("ts.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let root = dir.to_path_buf();
+        std::thread::spawn(move || {
+            for mut conn in listener.incoming().flatten() {
+                // Read through the end of the request head.
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 512];
+                while !raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match conn.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => raw.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let req = String::from_utf8_lossy(&raw).to_string();
+                let path = req.split_whitespace().nth(1).unwrap_or_default();
+                let file = if path.starts_with("/localapi/v0/status") {
+                    Some("status.json")
+                } else if path == "/localapi/v0/prefs" {
+                    Some("prefs.json")
+                } else if path == "/localapi/v0/serve-config" {
+                    Some("serve.json")
+                } else {
+                    None
+                };
+                let resp = match file.and_then(|f| std::fs::read(root.join(f)).ok()) {
+                    Some(body) => [b"HTTP/1.0 200 OK\r\n\r\n".as_slice(), &body].concat(),
+                    None => b"HTTP/1.0 500 Internal Server Error\r\n\r\n".to_vec(),
+                };
+                let _ = conn.write_all(&resp);
+            }
+        });
+        sock
+    }
+
+    /// Write one of the fixture's LocalAPI answers.
+    pub(crate) fn localapi_says(dir: &Path, file: &str, body: Value) {
+        std::fs::write(dir.join(file), body.to_string()).unwrap();
+    }
 
     fn good() -> Facts {
         Facts {
@@ -608,6 +724,99 @@ mod tests {
         assert_eq!(uid_of("root"), Ok(0));
         assert!(uid_of("no-such-user-cad336").is_err());
         assert!(uid_of("bad\0name").is_err());
+    }
+
+    /// CAD-509: tailscaled omits an empty `OperatorUser` (`omitempty`)
+    /// — absent or null reads as "no operator user", the same as an
+    /// empty string. A non-object prefs body is a read error, and a
+    /// present non-string still fails closed: neither can widen into
+    /// "no operator".
+    #[test]
+    fn a_missing_operator_user_is_none_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = localapi(dir.path());
+        let prefs = |v: Value| localapi_says(dir.path(), "prefs.json", v);
+        prefs(json!({"WantRunning": true}));
+        assert_eq!(operator_uid(&sock), Ok(Ok(None)));
+        prefs(json!({"OperatorUser": null, "WantRunning": true}));
+        assert_eq!(operator_uid(&sock), Ok(Ok(None)));
+        prefs(json!({"OperatorUser": "", "WantRunning": true}));
+        assert_eq!(operator_uid(&sock), Ok(Ok(None)));
+        prefs(json!({"OperatorUser": "root"}));
+        assert_eq!(operator_uid(&sock), Ok(Ok(Some(0))));
+        prefs(json!({"OperatorUser": "no-such-user-cad336"}));
+        assert!(matches!(operator_uid(&sock), Ok(Err(_))));
+        prefs(json!({"OperatorUser": 0}));
+        assert!(matches!(operator_uid(&sock), Ok(Err(_))));
+        prefs(json!(["OperatorUser"]));
+        assert!(operator_uid(&sock).is_err());
+    }
+
+    /// `host_refusals` (CAD-509): the up-front pass lists every
+    /// host-side rung in proof order — an unreadable rung ends it —
+    /// and a missing `OperatorUser` no longer appears in it. A fixture
+    /// socket is owned by this test's uid, so `foreign_uid` is
+    /// expected whenever `own_uid` is the test's own.
+    #[test]
+    fn host_refusals_list_the_whole_chain_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let own = unsafe { libc::geteuid() };
+        let not_me = own ^ 1;
+        let names = |rs: Vec<Refusal>| rs.iter().map(|r| r.check).collect::<Vec<_>>();
+
+        // Nothing below an unreadable rung can be read.
+        let missing = dir.path().join("none.sock");
+        assert_eq!(
+            names(host_refusals(Some(&missing), not_me, 3010)),
+            vec![Check::TailscaledSocket]
+        );
+        let sock = localapi(dir.path());
+        std::fs::remove_file(dir.path().join("prefs.json")).ok();
+        localapi_says(dir.path(), "status.json", json!({"TUN": true}));
+        localapi_says(dir.path(), "serve.json", json!({}));
+        assert_eq!(
+            names(host_refusals(Some(&sock), not_me, 3010)),
+            vec![Check::Localapi]
+        );
+
+        // Clean: TUN, prefs with no OperatorUser at all, no forwarder,
+        // a board uid that is neither the operator's nor tailscaled's.
+        localapi_says(dir.path(), "prefs.json", json!({"WantRunning": true}));
+        assert_eq!(names(host_refusals(Some(&sock), not_me, 3010)), vec![]);
+        // ... while the same socket seen as the fixture's owner uid
+        // fails foreign_uid alone.
+        assert_eq!(
+            names(host_refusals(Some(&sock), own, 3010)),
+            vec![Check::ForeignUid]
+        );
+
+        // Every failing rung at once, in proof order: userspace
+        // networking, the board's uid as operator, a forwarder — and
+        // foreign_uid when the board uid is the fixture's owner.
+        localapi_says(dir.path(), "status.json", json!({"TUN": false}));
+        localapi_says(dir.path(), "prefs.json", json!({"OperatorUser": "root"}));
+        localapi_says(
+            dir.path(),
+            "serve.json",
+            json!({"TCP": {"443": {"TCPForward": "127.0.0.1:3010"}}}),
+        );
+        assert_eq!(
+            names(host_refusals(Some(&sock), 0, 3010)),
+            if own == 0 {
+                vec![
+                    Check::KernelNetworking,
+                    Check::NotOperatorUser,
+                    Check::NoTcpForwarder,
+                    Check::ForeignUid,
+                ]
+            } else {
+                vec![
+                    Check::KernelNetworking,
+                    Check::NotOperatorUser,
+                    Check::NoTcpForwarder,
+                ]
+            }
+        );
     }
 
     #[test]
