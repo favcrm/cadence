@@ -349,6 +349,21 @@ fn read_marker(sb: &Sandbox) -> Result<Option<Value>> {
     Ok(Some(marker))
 }
 
+/// `<root>/.cadence-sandbox` when `state_dir` is `<root>/state` beside a
+/// marker — the one file `owner_of` must READ to judge the root, so a
+/// confined process (the master, CAD-524) needs it in its filesystem
+/// policy or every `cadence` verb refuses before dispatch. Presence
+/// only: contents stay `read_marker`'s to reject, and granting the file
+/// never widens to the root. `None` for any other layout, production's
+/// included, so a caller can push it unconditionally.
+pub fn marker_for(state_dir: &Path) -> Option<PathBuf> {
+    if state_dir.file_name().and_then(|n| n.to_str()) != Some("state") {
+        return None;
+    }
+    let marker = state_dir.parent()?.join(MARKER);
+    std::fs::symlink_metadata(&marker).is_ok().then_some(marker)
+}
+
 /// The sandbox `state_dir` belongs to: `<root>/state` beside a marker
 /// naming `<root>`. `None` for any other dir, production's included. A
 /// marker that is present but unusable refuses rather than let the dir
