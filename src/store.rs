@@ -31,6 +31,11 @@ pub use platform::{
     PLATFORM_DEFAULT_EVENT, PLATFORM_DISCONNECTED_EVENT, PLATFORM_STREAM, SCOPE_GRANTED_EVENT,
     SCOPE_REVOKED_EVENT,
 };
+mod effects;
+pub use effects::{
+    presser_json, DraftRow, EffectKey, EffectRow, EFFECT_CANCELLED_EVENT, EFFECT_DECIDED_EVENT,
+    EFFECT_EXECUTED_EVENT, EFFECT_FAILED_EVENT, EFFECT_NEEDS_YOU_EVENT, EFFECT_REQUESTED_EVENT,
+};
 mod threads;
 pub use threads::{
     tool_result_summary, tool_summary, NewEntry, Sender, Thread, ThreadEntry, KIND_ASSISTANT_TEXT,
@@ -1670,6 +1675,20 @@ impl Store {
             )?;
             tx.commit()?;
         }
+        if version < 18 {
+            // v18: the durable pending-effect record and the draft log
+            // (CAD-506, ADR 0006 §5.4) — one row per staged send, keyed
+            // by effect_id with the brokered handle UNIQUE, so a retried
+            // open dedupes and a restart reconciles. Input/summary/
+            // preview only — credentials never land here.
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(effects::SCHEMA_V18)?;
+            tx.execute(
+                "UPDATE schema_version SET version=?1",
+                [crate::rollout::SCHEMA_VERSION],
+            )?;
+            tx.commit()?;
+        }
         if let Some(crossing) = permit.crossing {
             Self::event(
                 &conn,
@@ -1816,6 +1835,12 @@ impl Store {
                AND endpoint_kind != 'inbox'",
             [],
         )?;
+        // CAD-506 (ADR 0006 §5.4 step 8): a pending effect the last run
+        // proved `decided`/`executing` but never reached an outcome may
+        // already have fired — reconcile for a human, never re-fire.
+        // `waiting` rows keep their state; they list from the table, so
+        // nothing needs re-parking.
+        self.reconcile_effects_in(&tx)?;
         tx.commit()?;
         Ok(())
     }
@@ -2872,6 +2897,29 @@ impl Store {
                 "a daemon message needs a daemon id and source, not {id}/{source}"
             )));
         }
+        self.enqueue_daemon_task(alias, body, id, source, None)
+    }
+
+    /// `enqueue_daemon` carrying a task tag (CAD-506): a pending
+    /// effect's outcome lands as a daemon message on the task's lane —
+    /// `task_id` names the task the staged call belonged to, validated
+    /// by `enqueue_tx_as` like any other.
+    pub fn enqueue_daemon_task(
+        &self,
+        alias: &str,
+        body: &str,
+        id: &str,
+        source: &str,
+        task_id: Option<&str>,
+    ) -> Result<(bool, String)> {
+        let daemon_id = format!("{}{}-", crate::proto::DAEMON_MESSAGE_PREFIX, source);
+        if !(crate::proto::DAEMON_SOURCES.contains(&source) || source == NUDGE_SOURCE)
+            || !id.starts_with(&daemon_id)
+        {
+            return Err(Error::internal(format!(
+                "a daemon message needs a daemon id and source, not {id}/{source}"
+            )));
+        }
         let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         let out = self.enqueue_tx_as(
@@ -2881,7 +2929,7 @@ impl Store {
             None,
             id,
             source,
-            None,
+            task_id,
             None,
             None,
             &Sender::Unattributed,
@@ -12503,11 +12551,6 @@ mod tests {
             // The migrated store keeps its pre-v17 rows.
             assert!(s.agent("a1").unwrap().alias == "a1");
         }
-        assert_eq!(
-            crate::rollout::SCHEMA_VERSION,
-            17,
-            "bump? pin the new version and add its migration test"
-        );
         // Half-applied: one table present, version rolled back — the
         // reopen converges.
         Connection::open(&db)
@@ -12521,5 +12564,71 @@ mod tests {
             let _ = Store::open_for_schema_tests(&db).unwrap();
         }
         assert!(has(&db, "platform_defaults"));
+    }
+
+    /// v18 adds the pending-effect record and the draft log (CAD-506,
+    /// ADR 0006 §5.2/§5.4): `platform_effects` — one staged send keyed
+    /// by `effect_id`, its brokered handle UNIQUE — and
+    /// `platform_drafts`, the information-only "ran without you" rows.
+    /// `IF NOT EXISTS`, so a v17 store migrates in place and a
+    /// half-applied v18 converges.
+    #[test]
+    fn migration_v17_to_v18_adds_effect_tables() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("t.sqlite3");
+        std::fs::create_dir(dir.path().join("w")).unwrap();
+        {
+            let s = Store::open(&db).unwrap();
+            reg(&s, "a1", &dir.path().join("w"));
+        }
+        // A genuine v17: platform custody tables, no effect tables.
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE platform_effects;
+                 DROP TABLE platform_drafts;
+                 UPDATE schema_version SET version=17;",
+            )
+            .unwrap();
+        let has = |db: &Path, table: &str| -> bool {
+            Connection::open(db)
+                .unwrap()
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()
+                .unwrap()
+                .is_some()
+        };
+        {
+            let s = Store::open_for_schema_tests(&db).unwrap();
+            for table in ["platform_effects", "platform_drafts"] {
+                assert!(has(&db, table), "{table} missing after migrate");
+            }
+            assert!(s.platform_effects(None).unwrap().is_empty());
+            assert!(s.platform_drafts(None, 10).unwrap().is_empty());
+            // The migrated store keeps its pre-v18 rows.
+            assert!(s.agent("a1").unwrap().alias == "a1");
+        }
+        assert_eq!(
+            crate::rollout::SCHEMA_VERSION,
+            18,
+            "bump? pin the new version and add its migration test"
+        );
+        // Half-applied: one table present, version rolled back — the
+        // reopen converges.
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE platform_drafts;
+                 UPDATE schema_version SET version=17;",
+            )
+            .unwrap();
+        {
+            let _ = Store::open_for_schema_tests(&db).unwrap();
+        }
+        assert!(has(&db, "platform_drafts"));
     }
 }

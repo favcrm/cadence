@@ -121,7 +121,13 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         Rule::Handler("rpc_thread_send: agents refused, operator on proof (CAD-384)"),
     ),
     ("agent_events", Rule::Read),
-    ("agent_requests", Rule::Read),
+    (
+        "agent_requests",
+        Rule::Handler(
+            "agent_caller: pending rows disclose to the operator, the owning \
+             agent and its PM — a peer sees none (CAD-506)",
+        ),
+    ),
     (
         "agent_respond",
         Rule::Handler("authorize_respond: the operator or the requester's PM (CAD-370)"),
@@ -438,6 +444,28 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         Rule::Handler(
             "grant_caller: an agent checks its own grants; the operator names \
              the holder (CAD-366)",
+        ),
+    ),
+    // CAD-506: the effect gate (ADR 0006 §5.2, §5.4).
+    (
+        "platform_call",
+        Rule::Handler(
+            "request_caller: the calling agent is connection-derived; the \
+             record's agent is never a request field (CAD-506)",
+        ),
+    ),
+    (
+        "platform_effects",
+        Rule::Handler(
+            "effect_caller: an agent reads its own pending effects; the \
+             operator reads all (CAD-506)",
+        ),
+    ),
+    (
+        "platform_effect_close",
+        Rule::Handler(
+            "effect_caller: the operator closes any closeable row; an agent \
+             closes only its own waiting one (CAD-506)",
         ),
     ),
 ];

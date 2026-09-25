@@ -540,8 +540,9 @@ impl Store {
     }
 
     /// Revoke `scopes` from `(agent, platform, account)`'s grant —
-    /// `None` drops the grant whole. Answers the surviving grant (or
-    /// `None` when the grant is gone) and whether a grant existed.
+    /// `None` drops the grant whole. Answers `(existed, surviving)`:
+    /// whether a grant was there at all, and the grant that remains
+    /// (`None` when the revoke took it whole).
     pub fn platform_grant_revoke(
         &self,
         agent: &str,
@@ -549,7 +550,7 @@ impl Store {
         account: &str,
         scopes: Option<&[String]>,
         by: &str,
-    ) -> Result<Option<Grant>> {
+    ) -> Result<(bool, Option<Grant>)> {
         let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         let existing: Option<Grant> = tx
@@ -560,7 +561,7 @@ impl Store {
             )
             .optional()?;
         let Some(grant) = existing else {
-            return Ok(None);
+            return Ok((false, None));
         };
         let (kept, revoked): (Vec<String>, Vec<String>) = match scopes {
             None => (Vec::new(), grant.scopes.clone()),
@@ -592,14 +593,17 @@ impl Store {
             )?;
         }
         tx.commit()?;
-        Ok(if kept.is_empty() {
-            None
-        } else {
-            Some(Grant {
-                scopes: kept,
-                ..grant
-            })
-        })
+        Ok((
+            true,
+            if kept.is_empty() {
+                None
+            } else {
+                Some(Grant {
+                    scopes: kept,
+                    ..grant
+                })
+            },
+        ))
     }
 
     /// Record `project`'s default account for `platform`. The account

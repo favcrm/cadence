@@ -308,19 +308,59 @@ impl Shared {
             None | Some(Value::Null) => None,
             Some(_) => Some(scope_list(params, "scopes")?),
         };
-        let Some(grant) = self.store.platform_grant_revoke(
+        let (existed, surviving) = self.store.platform_grant_revoke(
             &agent,
             &platform,
             &account,
             scopes.as_deref(),
             OPERATOR,
-        )?
-        else {
+        )?;
+        if !existed {
             return Err(Error::rejected(format!(
                 "'{agent}' holds no grant on {platform}/{account}"
             )));
-        };
-        Ok(json!({"state": "revoked", "grant": grant.to_json()}))
+        }
+        // CAD-506: a staged send's frozen scopes may no longer be
+        // covered — drain the waiting rows this grant loss stranded
+        // rather than leave a press to close them at Execute.
+        let stranded: Vec<String> = self
+            .store
+            .platform_effects(Some(&agent))?
+            .into_iter()
+            .filter(|r| {
+                r.platform == platform
+                    && r.account == account
+                    && r.state == "waiting"
+                    && r.scopes
+                        .iter()
+                        .any(|s| surviving.as_ref().is_none_or(|g| !g.covers(s)))
+            })
+            .map(|r| (r.request, r.effect_id))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .filter_map(|(request, effect_id)| {
+                self.store
+                    .effect_close(crate::store::EffectKey::Id(effect_id), "grant_revoked")
+                    .ok()
+                    .flatten()
+                    .map(|row| {
+                        let _ = self.store.event_public(
+                            &row.agent,
+                            "request_closed",
+                            json!({"request": request, "kind": "effect",
+                                   "reason": "grant_revoked"}),
+                        );
+                        row.request
+                    })
+            })
+            .collect();
+        if !stranded.is_empty() {
+            self.wake();
+        }
+        Ok(
+            json!({"state": "revoked", "grant": surviving.map(|g| g.to_json()),
+                  "effects_closed": stranded}),
+        )
     }
 
     /// `platform_grants {agent?}` — §5.3's "what am I allowed": an
@@ -470,13 +510,11 @@ impl Shared {
     }
 
     /// §5.3's revocation hook: every pending effect bound to
-    /// `platform`/`account` closes unanswered, its reason named —
-    /// `request_wait` on the handle sees `closed`. CAD-506's
-    /// `kind:"effect"` requests carry the credential's coordinates in
-    /// their recorded params (`platform`/`account`, top-level or under
-    /// the `input` the operator approved); nothing opens them in this
-    /// lane, so today the drain is exercised only by tests — the seam
-    /// is complete and wired into `platform_revoke`.
+    /// `platform`/`account` closes unanswered — CAD-506's durable
+    /// `platform_effects` rows (`waiting`/`reconcile`, close reason
+    /// `credential_revoked`), and any in-memory `kind:"effect"`
+    /// brokered request opened before the durable lane existed. The
+    /// agent-lane `request_closed` ends any waiter on the handle.
     fn close_credential_effects(&self, platform: &str, account: &str, reason: &str) -> Vec<String> {
         /// The credential a pending request is bound to, wherever the
         /// kind records it — `params.platform`/`params.account`, or
@@ -516,6 +554,39 @@ impl Shared {
                        "by": "credential revoked"}),
             );
             closed.push(handle);
+        }
+        // The durable rows — the row's close_reason is the contract's
+        // code; the operator's free-text reason rides the lane event
+        // and the revoke's own audit event.
+        let rows = self
+            .store
+            .platform_effects(None)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| {
+                r.platform == platform
+                    && r.account == account
+                    && matches!(r.state.as_str(), "waiting" | "reconcile")
+            })
+            .map(|r| (r.request.clone(), r.effect_id.clone(), r.agent.clone()))
+            .collect::<Vec<_>>();
+        for (handle, effect_id, alias) in rows {
+            if let Ok(Some(_)) = self
+                .store
+                .effect_close(crate::store::EffectKey::Id(effect_id), "credential_revoked")
+            {
+                let _ = self.store.event_public(
+                    &alias,
+                    "request_closed",
+                    json!({"request": handle, "kind": "effect",
+                           "reason": "credential_revoked", "detail": reason,
+                           "by": "credential revoked"}),
+                );
+                closed.push(handle);
+            }
+        }
+        if !closed.is_empty() {
+            self.wake();
         }
         closed
     }

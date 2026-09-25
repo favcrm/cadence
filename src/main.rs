@@ -1925,6 +1925,27 @@ enum PlatformAction {
         #[arg(long)]
         account: String,
     },
+    /// Pending platform effects and the draft log — an agent sees only
+    /// its own; the operator sees all, or `--agent`'s (CAD-506).
+    Effects {
+        /// The agent whose effects to list (operator only).
+        #[arg(long)]
+        agent: Option<String>,
+    },
+    /// Cancel a staged send still `waiting`, or resolve a `reconcile`
+    /// row after inspecting the platform (CAD-506). Agents close only
+    /// their own waiting rows; the operator closes any.
+    EffectClose {
+        /// The brokered request handle — or `--effect-id`.
+        #[arg(required_unless_present = "effect_id", conflicts_with = "effect_id")]
+        request: Option<String>,
+        /// The durable effect id.
+        #[arg(long)]
+        effect_id: Option<String>,
+        /// Why — recorded as the row's close_reason.
+        #[arg(long)]
+        reason: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -7785,6 +7806,30 @@ fn run_platform(state_dir: &Path, action: &PlatformAction) -> Result<i32> {
                 "platform_default_set",
                 json!({"project": project, "platform": platform, "account": account}),
             )?);
+        }
+        PlatformAction::Effects { agent } => {
+            let params = match agent {
+                Some(a) => json!({"agent": a}),
+                None => json!({}),
+            };
+            print_json(&rpc("platform_effects", params)?);
+        }
+        PlatformAction::EffectClose {
+            request,
+            effect_id,
+            reason,
+        } => {
+            let mut params = json!({});
+            if let Some(r) = request {
+                params["request"] = json!(r);
+            }
+            if let Some(id) = effect_id {
+                params["effect_id"] = json!(id);
+            }
+            if let Some(r) = reason {
+                params["reason"] = json!(r);
+            }
+            print_json(&rpc("platform_effect_close", params)?);
         }
     }
     Ok(0)

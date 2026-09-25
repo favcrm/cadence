@@ -121,9 +121,10 @@ pub const DAEMON_MESSAGE_PREFIX: &str = "sys-";
 
 /// Message sources only the daemon writes, through the store's
 /// `enqueue_daemon`: a caller's message carrying one is refused
-/// ([`caller_message`]), so nobody can dress a message as a wake or as
-/// an answer to a question (CAD-447).
-pub const DAEMON_SOURCES: &[&str] = &["wake", "answer"];
+/// ([`caller_message`]), so nobody can dress a message as a wake, as
+/// an answer to a question (CAD-447), or as a platform-effect outcome
+/// (CAD-506).
+pub const DAEMON_SOURCES: &[&str] = &["wake", "answer", "effect"];
 
 /// The id of the daemon-originated message of `kind` for `key` — the
 /// dedupe key: the same `(kind, key)` always maps to the same id, so a

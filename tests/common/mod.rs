@@ -941,6 +941,10 @@ pub fn daemon_opts() -> daemon::ServeOptions {
         // CAD-313: links and sessions expire by the wall clock unless a
         // test injects one.
         operator_clock: None,
+        // CAD-506: no platform adapters — a platform call in a test
+        // daemon fails closed unless the test registers one.
+        platforms: Default::default(),
+        effect_execute_gate: None,
     }
 }
 
@@ -3298,7 +3302,9 @@ impl TestDaemon {
     pub fn wait_request(&self, alias: &str, secs: u64) -> Value {
         let deadline = Instant::now() + Duration::from_secs(secs);
         loop {
-            let requests = self.rpc("agent_requests", json!({"alias": alias})).unwrap()["requests"]
+            let requests = self
+                .operator_rpc("agent_requests", json!({"alias": alias}))
+                .unwrap()["requests"]
                 .as_array()
                 .unwrap()
                 .clone();
@@ -3315,7 +3321,8 @@ impl TestDaemon {
 
     /// Pending request handles for an alias right now.
     pub fn requests(&self, alias: &str) -> Vec<Value> {
-        self.rpc("agent_requests", json!({"alias": alias})).unwrap()["requests"]
+        self.operator_rpc("agent_requests", json!({"alias": alias}))
+            .unwrap()["requests"]
             .as_array()
             .unwrap()
             .clone()
@@ -3841,7 +3848,11 @@ pub fn overview_at(home: &Path, state: &Path, pm: Option<&Path>, envs: &[(&str, 
     for (k, v) in envs {
         cmd.env(k, v);
     }
-    let out = cmd.output().unwrap();
+    // The overview's probes call caller-gated reads (`agent_requests`,
+    // `platform_effects` — CAD-506): run it the way the board runs
+    // live — detached, off the in-process daemon's ancestry, provably
+    // the operator (CAD-431's `operator_output`).
+    let out = cmd.operator_output().unwrap();
     assert!(
         out.status.success(),
         "overview: {}",

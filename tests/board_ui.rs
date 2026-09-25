@@ -287,7 +287,7 @@ fn overview_approval_row_for_brokered_request() {
     let approval = needs
         .iter()
         .find(|n| n["kind"] == "approval")
-        .expect("approval row");
+        .unwrap_or_else(|| panic!("approval row missing: {view}"));
     assert_eq!(
         approval["command"],
         format!("cadence agent respond w1 --request {handle} --decision accept")
@@ -535,16 +535,17 @@ fn overview_main_ci_red_and_unverified_from_actions_runs() {
 
 /// `cadence overview` with extra args — the raw output, success or not.
 fn overview_cmd(home: &Path, state: &Path, pm: &Path, args: &[&str]) -> std::process::Output {
-    std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
-        .arg("--state-dir")
+    // Operator-proven like `overview_at` — the probes it runs gate on
+    // the caller (CAD-506).
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"));
+    cmd.arg("--state-dir")
         .arg(state)
         .args(["overview", "--json"])
         .args(args)
         .env("HOME", home)
         .env("CADENCE_PM_DIR", pm)
-        .env_remove("CADENCE_ALIAS")
-        .output()
-        .unwrap()
+        .env_remove("CADENCE_ALIAS");
+    cmd.operator_output().unwrap()
 }
 
 /// CAD-252: `--project` and `--group` scope the merged rows; a key the

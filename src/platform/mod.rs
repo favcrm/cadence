@@ -7,7 +7,10 @@
 //! `enroll` takes them, hands them to [`custody`], and records a
 //! fingerprint; every result, event and refusal carries handles only.
 
+pub mod adapter;
 pub mod custody;
+
+pub use adapter::PlatformAdapter;
 
 use serde_json::Value;
 

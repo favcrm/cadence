@@ -723,10 +723,15 @@ impl Audience {
             | "auto_merge_on"
             | "delivery_unreadable"
             // CAD-449: a merged ticket the merge could not mark done.
-            | "merged_not_done" => Self::Operator,
+            | "merged_not_done"
+            // CAD-506: a restart-reconciled send and a read-back
+            // mismatch are the operator's to resolve (§5.4).
+            | "effect_reconcile" | "effect_unverified" => Self::Operator,
             "drift" => Self::Dependency,
             // CAD-439: informs the operator; nothing for the team.
-            "inbox_unread" | "tracker_behind" | "master_unconfined" | "master_login" => Self::Info,
+            "inbox_unread" | "tracker_behind" | "master_unconfined" | "master_login"
+            // CAD-506: a draft ran without a press — information only.
+            | "platform_draft" => Self::Info,
             // CAD-446: the board's own GitHub read is failing or is not
             // the operator's — merge decisions may lag; nothing to decide.
             "delivery_sync" => Self::Info,
@@ -2535,6 +2540,72 @@ fn agent_items(a: &Value, probe: &AgentProbe, project: &str, now: i64) -> Vec<It
     items
 }
 
+/// CAD-506 §5.4: Needs-you rows from the durable pending-effect table
+/// and the information-only draft rows (Q3). One `platform_effects`
+/// read — an operator-proven board sees all rows; a board run inside
+/// a pane gets a caller-rule refusal, which degrades to no rows rather
+/// than a board error.
+fn platform_effect_items(state_dir: &Path, now: i64, timeout: Duration) -> Vec<Item> {
+    let Ok(view) = client::rpc_timeout(state_dir, "platform_effects", json!({}), timeout) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for e in view["needs_you"].as_array().cloned().unwrap_or_default() {
+        let (kind, what) = match e["state"].as_str().unwrap_or_default() {
+            "reconcile" => (
+                "effect_reconcile",
+                "accepted send lacks a proven outcome — inspect the platform, then close",
+            ),
+            _ => (
+                "effect_unverified",
+                "send's read-back does not match the approved input",
+            ),
+        };
+        let id = e["effect_id"].as_str().unwrap_or_default();
+        let agent = e["agent"].as_str().unwrap_or_default();
+        out.push(
+            item(
+                18,
+                kind,
+                &format!(
+                    "{}: {}",
+                    e["tool"].as_str().unwrap_or("platform send"),
+                    what
+                ),
+                0,
+                "",
+                None,
+                &format!("cadence platform effect-close --effect-id {id}"),
+            )
+            .about("effect", id)
+            .for_agent(agent)
+            .owned_by(Some("operator")),
+        );
+    }
+    for d in view["drafts"].as_array().cloned().unwrap_or_default() {
+        let agent = d["agent"].as_str().unwrap_or_default();
+        let label = d["label"].as_str().unwrap_or("draft");
+        let summary = d["input_summary"].as_str().unwrap_or_default();
+        let id = d["artifact"].as_str().unwrap_or_default().to_string();
+        let ran = (d["ran_at"].as_f64().unwrap_or(now as f64)) as i64;
+        out.push(
+            item(
+                96,
+                "platform_draft",
+                &format!("{agent} ran {label}: {summary}"),
+                (now - ran).max(0),
+                "",
+                None,
+                "cadence platform effects",
+            )
+            .about("draft", &id)
+            .for_agent(agent)
+            .since(Some(ran)),
+        );
+    }
+    out
+}
+
 /// `(earliest start, latest finish)` over a PR head's rollup, epoch
 /// secs: a CheckRun contributes `startedAt` and `completedAt`, a status
 /// context its `startedAt` (when it was posted).
@@ -2748,6 +2819,9 @@ fn overview_from(
         needs.extend(master_login_item(a, state_dir, &project, now));
         panes_idle &= !probe.holds_drift;
         probes_unknown |= probe.probe_unknown;
+    }
+    if daemon.reachable {
+        needs.extend(platform_effect_items(state_dir, now, opts.probe_timeout));
     }
 
     // ---- tracker rows ----

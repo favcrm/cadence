@@ -31,6 +31,7 @@ mod caller_rule;
 mod checkup;
 mod delivery_rpc;
 mod dispatch_rpc;
+mod effect_rpc;
 mod master_rpc;
 mod master_wake;
 mod next_action;
@@ -572,6 +573,11 @@ pub struct Shared {
     /// these verbs are operator-paced and rare, so a per-key map buys
     /// nothing here.
     platform_custody_lock: Mutex<()>,
+    /// CAD-506: the registered platform adapters the effect gate drives
+    /// (`platform` name → adapter). A platform with none fails closed —
+    /// no reviewed table means no classification, so no call.
+    platforms: effect_rpc::PlatformMap,
+    effect_execute_gate: Option<effect_rpc::EffectExecuteGate>,
 }
 
 impl Shared {
@@ -661,6 +667,8 @@ impl Shared {
                 .unwrap_or_else(|| Arc::new(crate::issue::time::now_epoch)),
             platform_custody: crate::platform::Custody::open(state_dir)?,
             platform_custody_lock: Mutex::new(()),
+            platforms: opts.platforms.clone(),
+            effect_execute_gate: opts.effect_execute_gate.clone(),
         });
         // Holds dropped by boot-time revalidation get their release
         // events now that the store-backed emitter exists.
@@ -2338,7 +2346,29 @@ impl Shared {
             "agent_events" => self.rpc_events(params),
             "agent_requests" => {
                 let alias = self.resolve_alias(required_str(params, "alias")?)?;
-                let requests = self
+                // CAD-506: a pending row carries the caller-declared
+                // input — it discloses to the operator, to the owning
+                // agent, and to the owner's PM (CAD-370's authorised
+                // reviewer; the open notice sends it here for the full
+                // input). A peer agent or an unproven caller is refused;
+                // before this, Rule::Read exposed every agent's pending
+                // input to any caller (the CAD-366 review flag).
+                let may_see = match self.agent_caller(peer_pid, "agent requests")? {
+                    AgentCaller::Operator => true,
+                    AgentCaller::Agent(ref a) if *a == alias => true,
+                    AgentCaller::Agent(ref a) => {
+                        let target = self.store.agent(&alias)?;
+                        self.effective_pm(&target)?.as_deref() == Some(a.as_str())
+                    }
+                };
+                if !may_see {
+                    return Err(Error::rejected(format!(
+                        "agent requests refused: '{alias}'s pending rows disclose \
+                         only to the operator, '{alias}' itself and its PM \
+                         (caller rule, CAD-506)"
+                    )));
+                }
+                let mut requests: Vec<Value> = self
                     .pending
                     .lock()
                     .unwrap()
@@ -2347,7 +2377,18 @@ impl Shared {
                     .map(|(handle, req)| {
                         json!({"request": handle, "method": req.method, "params": req.params})
                     })
-                    .collect::<Vec<_>>();
+                    .collect();
+                // A staged send is a brokered `kind:"effect"` request
+                // whose authority is the durable row — it joins the
+                // listing from the table, so a restart never drops an
+                // unanswered press.
+                for row in self.store.platform_effects(Some(&alias))? {
+                    if row.state == "waiting" {
+                        requests.push(json!({"request": row.request,
+                            "method": "cadence/effect",
+                            "params": row.to_record()}));
+                    }
+                }
                 Ok(json!({"requests": requests}))
             }
             "agent_respond" => self.rpc_respond(params, peer_pid),
@@ -2567,6 +2608,9 @@ impl Shared {
             "platform_check" => self.rpc_platform_check(params, peer_pid),
             "platform_defaults" => self.rpc_platform_defaults(params),
             "platform_default_set" => self.rpc_platform_default_set(params, peer_pid),
+            "platform_call" => self.rpc_platform_call(params, peer_pid),
+            "platform_effects" => self.rpc_platform_effects(params, peer_pid),
+            "platform_effect_close" => self.rpc_platform_effect_close(params, peer_pid),
             other => Err(Error::rejected(format!("Unknown method '{other}'"))),
         }
     }
@@ -4916,6 +4960,12 @@ impl Shared {
         // Operator note carried on a brokered decline — the MCP server
         // hands it to the provider as the denial message.
         let reason = optional_str(params, "reason").map(str::to_string);
+        // CAD-506: a `kind:"effect"` handle names a durable
+        // pending-effect row, not a `pending` entry — the press path
+        // decides it (accept is operator-only) and runs the staged call.
+        if let Some(row) = self.store.effect_by_request(handle)? {
+            return self.respond_effect(&row, peer_pid, decision, &answers, reason, &alias);
+        }
         // Claim the handle atomically: whichever path removes it first
         // — this respond, an external `serverRequest/resolved`, or the
         // actor's exit sweep — owns the answer, and every other path
@@ -5126,6 +5176,15 @@ impl Shared {
             Some(h) => proto::identifier(h, "Request handle")?,
             None => Uuid::new_v4().simple().to_string(),
         };
+        // A durable pending effect already owns this handle — its
+        // request is never shadowed by a brokered one (CAD-506: one
+        // handle = one request = one execution).
+        if self.store.effect_by_request(&handle)?.is_some() {
+            return Err(Error::rejected(format!(
+                "request_open refused: handle '{handle}' names a staged platform \
+                 effect — a handle belongs to one request (CAD-506)"
+            )));
+        }
         // A handle names one agent's request until that agent's wait
         // collects the answer (CAD-452). `agent respond` parks the
         // answer and drops the pending entry, so the mailbox is checked
@@ -5249,6 +5308,20 @@ impl Shared {
                     let (_, answer) = answered.remove(handle).expect("entry just read");
                     return Ok(json!({"state": "answered", "answer": answer}));
                 }
+                drop(answered);
+                // CAD-506: the handle may name a durable pending effect
+                // — the row owns its lifecycle; this wait only polls it.
+                if let Some(state) = self.effect_wait(handle, &caller)? {
+                    if state["state"] == "waiting" {
+                        if Instant::now() >= deadline {
+                            return Ok(state);
+                        }
+                        self.changed
+                            .wait_until(Instant::now() + Duration::from_millis(250));
+                        continue;
+                    }
+                    return Ok(state);
+                }
                 return Ok(json!({"state": "closed",
                                  "reason": "request is not pending"}));
             };
@@ -5308,6 +5381,13 @@ impl Shared {
             let _ = self
                 .store
                 .event_public(&alias, "request_closed", json!({"request": handle}));
+        }
+        // CAD-506 §5.4 step 7: a `kind:"effect"` handle names a durable
+        // row — the caller's close ends only its wait; the pending
+        // effect stays `waiting` for the press. Nothing is recorded.
+        if let Some(state) = self.effect_caller_close(handle, &caller)? {
+            self.wake();
+            return Ok(state);
         }
         self.wake();
         Ok(json!({"state": "closed"}))
@@ -10353,6 +10433,16 @@ pub struct ServeOptions {
     /// CAD-313: the operator-auth clock (epoch seconds) — `None` is the
     /// wall clock; tests inject one they advance past a link's TTL.
     pub operator_clock: Option<Arc<dyn Fn() -> i64 + Send + Sync>>,
+    /// CAD-506: the platform adapters this daemon proxies through —
+    /// `platform` name → adapter. CAD-367/501 register real ones;
+    /// tests register the shared-fixture `FakePlatform`.
+    pub platforms: effect_rpc::PlatformMap,
+    /// CAD-506 test seam: consulted once per accepted effect between
+    /// the durable `decided` write and execution. `false` models the
+    /// daemon dying inside §5.4 step 5's window — the decision is
+    /// recorded, the run never starts, and a restart reconciles the
+    /// row. Production leaves it unset (always executes).
+    pub effect_execute_gate: Option<effect_rpc::EffectExecuteGate>,
 }
 
 /// What the CAD-484 checkup calls to dispatch a picked ticket to a
