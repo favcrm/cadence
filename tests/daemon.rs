@@ -88,12 +88,8 @@ fn upstream_param_defaults_reply_to() {
     d.register("other");
     // A worker joined to a group carries params.upstream = <pm alias>.
     let cwd = d.dir.path().to_str().unwrap().to_string();
-    d.rpc(
-        "agent_register",
-        json!({"alias": "w1", "provider": "fake", "endpoint_kind": "fake",
-               "cwd": cwd, "params": "{\"upstream\":\"pm\"}"}),
-    )
-    .unwrap();
+    d.register_pcp("w1", "fake", "fake", &cwd, "{\"upstream\":\"pm\"}")
+        .unwrap();
     d.wait_agent("pm", "idle", 10);
     d.wait_agent("other", "idle", 10);
     d.wait_agent("w1", "idle", 10);
@@ -1027,11 +1023,12 @@ fn devin_permission_mode_persisted_and_replayed() {
     let d = TestDaemon::start();
     let mock = d.mock_devin();
     let cwd = d.dir.path().to_str().unwrap().to_string();
-    d.rpc(
-        "agent_register",
-        json!({"alias": "dv1", "provider": "devin", "endpoint_kind": "pty",
-               "cwd": cwd,
-               "params": json!({"permission_mode": "smart"}).to_string()}),
+    d.register_pcp(
+        "dv1",
+        "devin",
+        "pty",
+        &cwd,
+        &json!({"permission_mode": "smart"}).to_string(),
     )
     .unwrap();
     let agent = d.wait_agent("dv1", "idle", 20);
@@ -1072,11 +1069,12 @@ fn devin_permission_mode_validated_at_register_and_not_settable() {
     let cwd = d.dir.path().to_str().unwrap().to_string();
     for bad in ["bogus", "manual", "bypass", "acceptEdits"] {
         let err = d
-            .rpc(
-                "agent_register",
-                json!({"alias": "bad", "provider": "devin", "endpoint_kind": "pty",
-                       "cwd": cwd,
-                       "params": json!({"permission_mode": bad}).to_string()}),
+            .register_pcp(
+                "bad",
+                "devin",
+                "pty",
+                &cwd,
+                &json!({"permission_mode": bad}).to_string(),
             )
             .unwrap_err();
         let msg = err.to_string();
@@ -1088,11 +1086,12 @@ fn devin_permission_mode_validated_at_register_and_not_settable() {
         }
     }
     // The same check does not fire for other providers' params.
-    let err = d.rpc(
-        "agent_register",
-        json!({"alias": "cl1", "provider": "claude", "endpoint_kind": "managed",
-               "cwd": cwd,
-               "params": json!({"permission_mode": "anything-goes"}).to_string()}),
+    let err = d.register_pcp(
+        "cl1",
+        "claude",
+        "managed",
+        &cwd,
+        &json!({"permission_mode": "anything-goes"}).to_string(),
     );
     assert!(err.is_ok(), "claude params must pass through: {err:?}");
     d.rpc("agent_stop", json!({"alias": "cl1"})).unwrap();
@@ -1297,12 +1296,8 @@ fn agent_list_cad437_filters() {
     let d = TestDaemon::start();
     d.register("pm1");
     let cwd = d.dir.path().to_str().unwrap().to_string();
-    d.rpc(
-        "agent_register",
-        json!({"alias": "w1", "provider": "fake", "endpoint_kind": "fake",
-               "cwd": cwd, "params": "{\"upstream\":\"pm1\"}"}),
-    )
-    .unwrap();
+    d.register_pcp("w1", "fake", "fake", &cwd, "{\"upstream\":\"pm1\"}")
+        .unwrap();
     d.wait_agent("pm1", "idle", 10);
     d.wait_agent("w1", "idle", 10);
 

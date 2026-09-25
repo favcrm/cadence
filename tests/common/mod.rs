@@ -3666,6 +3666,40 @@ impl TestDaemon {
         .unwrap()
     }
 
+    /// `agent_register` with explicit `provider`/`endpoint_kind`/`cwd`
+    /// — the suite's dominant raw register shape. `params` is a
+    /// serialized JSON string exactly as sites built it.
+    pub fn register_pc(
+        &self,
+        alias: &str,
+        provider: &str,
+        kind: &str,
+        cwd: &str,
+    ) -> cadence_agent::Result<Value> {
+        self.rpc(
+            "agent_register",
+            json!({"alias": alias, "provider": provider,
+                   "endpoint_kind": kind, "cwd": cwd}),
+        )
+    }
+
+    /// [`register_pc`](Self::register_pc) plus a serialized `params`
+    /// object for sites that wire upstreams or provider options.
+    pub fn register_pcp(
+        &self,
+        alias: &str,
+        provider: &str,
+        kind: &str,
+        cwd: &str,
+        params: &str,
+    ) -> cadence_agent::Result<Value> {
+        self.rpc(
+            "agent_register",
+            json!({"alias": alias, "provider": provider,
+                   "endpoint_kind": kind, "cwd": cwd, "params": params}),
+        )
+    }
+
     /// `task_new` for a task assigned to `assignee` with an
     /// `acceptance` gate — the dominant task_new call shape in the
     /// suite. `acceptance` accepts any serializable value (string or

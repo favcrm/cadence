@@ -804,12 +804,8 @@ fn join_bootstrap_briefs_and_queues() {
     // The PM's cwd is a git repo so the briefing exercises .gitignore.
     let pm_repo = d.dir.path().join("pmrepo");
     git_repo(&pm_repo);
-    d.rpc(
-        "agent_register",
-        json!({"alias": "pm", "provider": "fake", "endpoint_kind": "fake",
-               "cwd": pm_repo}),
-    )
-    .unwrap();
+    d.register_pc("pm", "fake", "fake", pm_repo.to_str().unwrap())
+        .unwrap();
     d.wait_agent("pm", "idle", 10);
 
     let bin = env!("CARGO_BIN_EXE_cadence");
@@ -1297,12 +1293,8 @@ fn agent_list_scopes_to_callers_group() {
     let d = TestDaemon::start();
     d.register("pm1");
     let cwd = d.dir.path().to_str().unwrap().to_string();
-    d.rpc(
-        "agent_register",
-        json!({"alias": "w1", "provider": "fake", "endpoint_kind": "fake",
-               "cwd": cwd, "params": "{\"upstream\":\"pm1\"}"}),
-    )
-    .unwrap();
+    d.register_pcp("w1", "fake", "fake", &cwd, "{\"upstream\":\"pm1\"}")
+        .unwrap();
     d.register("other");
     d.wait_agent("pm1", "idle", 10);
     d.wait_agent("w1", "idle", 10);
@@ -1490,12 +1482,8 @@ fn agent_bootstrap_retrofits_live_agent() {
     let d = TestDaemon::start();
     d.register("pm");
     let cwd = d.dir.path().to_str().unwrap().to_string();
-    d.rpc(
-        "agent_register",
-        json!({"alias": "w1", "provider": "fake", "endpoint_kind": "fake",
-               "cwd": cwd, "params": "{\"upstream\":\"pm\"}"}),
-    )
-    .unwrap();
+    d.register_pcp("w1", "fake", "fake", &cwd, "{\"upstream\":\"pm\"}")
+        .unwrap();
     d.register("solo");
     d.wait_agent("w1", "idle", 10);
     d.wait_agent("solo", "idle", 10);
@@ -1697,12 +1685,8 @@ fn group_stop_tears_down_members_and_pm() {
     let d = TestDaemon::start();
     d.register("pm");
     let cwd = d.dir.path().to_str().unwrap().to_string();
-    d.rpc(
-        "agent_register",
-        json!({"alias": "w1", "provider": "fake", "endpoint_kind": "fake",
-               "cwd": cwd, "params": "{\"upstream\":\"pm\"}"}),
-    )
-    .unwrap();
+    d.register_pcp("w1", "fake", "fake", &cwd, "{\"upstream\":\"pm\"}")
+        .unwrap();
     d.register("other");
     for a in ["pm", "w1", "other"] {
         d.wait_agent(a, "idle", 10);
@@ -1746,11 +1730,12 @@ fn group_resume_reports_unrecoverable_session_mismatch() {
     d.register_devin("pm", None);
     // Member pinned to a specific native session.
     let cwd = d.dir.path().to_str().unwrap().to_string();
-    d.rpc(
-        "agent_register",
-        json!({"alias": "w-bad", "provider": "devin", "endpoint_kind": "pty",
-               "cwd": cwd,
-               "params": "{\"upstream\":\"pm\",\"session\":\"want-x\"}"}),
+    d.register_pcp(
+        "w-bad",
+        "devin",
+        "pty",
+        &cwd,
+        "{\"upstream\":\"pm\",\"session\":\"want-x\"}",
     )
     .unwrap();
     d.wait_agent("pm", "idle", 15);
@@ -1832,12 +1817,8 @@ fn attach_listing_groups_workers_under_pm() {
     let _mock = d.mock_devin();
     d.register_devin("pm", None);
     let cwd = d.dir.path().to_str().unwrap().to_string();
-    d.rpc(
-        "agent_register",
-        json!({"alias": "w1", "provider": "devin", "endpoint_kind": "pty",
-               "cwd": cwd, "params": "{\"upstream\":\"pm\"}"}),
-    )
-    .unwrap();
+    d.register_pcp("w1", "devin", "pty", &cwd, "{\"upstream\":\"pm\"}")
+        .unwrap();
     d.wait_agent("pm", "idle", 15);
     d.wait_agent("w1", "idle", 15);
     // A second, unrelated root sorts by its own group.
@@ -2897,12 +2878,8 @@ fn agent_capabilities_match_the_registry_table() {
     let cwd = d.dir.path().to_str().unwrap().to_string();
     for spec in registry::SPECS {
         let alias = format!("cap-{}-{}", spec.provider, spec.endpoint_kind);
-        d.rpc(
-            "agent_register",
-            json!({"alias": alias, "provider": spec.provider,
-                   "endpoint_kind": spec.endpoint_kind, "cwd": cwd}),
-        )
-        .unwrap();
+        d.register_pc(&alias, spec.provider, spec.endpoint_kind, &cwd)
+            .unwrap();
         let show = d.rpc("agent_show", json!({"alias": alias})).unwrap();
         assert_eq!(
             show["agent"]["capabilities"],
@@ -2941,12 +2918,7 @@ fn agent_capabilities_match_the_registry_table() {
         assert!(caps.contains(&name), "health missing {name}");
     }
     // An unknown registered pair renders `capabilities: null`.
-    d.rpc(
-        "agent_register",
-        json!({"alias": "cap-bogus", "provider": "devin",
-               "endpoint_kind": "bogus", "cwd": cwd}),
-    )
-    .unwrap();
+    d.register_pc("cap-bogus", "devin", "bogus", &cwd).unwrap();
     let show = d.rpc("agent_show", json!({"alias": "cap-bogus"})).unwrap();
     assert!(show["agent"]["capabilities"].is_null());
 }
@@ -3342,12 +3314,8 @@ fn cli_join_claude_tui_briefs_prefixes() {
     let mock = d.mock_claude_tui();
     let pm_repo = d.dir.path().join("pmrepo");
     git_repo(&pm_repo);
-    d.rpc(
-        "agent_register",
-        json!({"alias": "pm", "provider": "fake", "endpoint_kind": "fake",
-               "cwd": pm_repo}),
-    )
-    .unwrap();
+    d.register_pc("pm", "fake", "fake", pm_repo.to_str().unwrap())
+        .unwrap();
     d.wait_agent("pm", "idle", 10);
     let bin = env!("CARGO_BIN_EXE_cadence");
     let out = std::process::Command::new(bin)
@@ -3410,12 +3378,8 @@ fn cli_join_refuses_different_provider_pty() {
     let mock = d.mock_claude_tui();
     let pm_repo = d.dir.path().join("pmrepo");
     git_repo(&pm_repo);
-    d.rpc(
-        "agent_register",
-        json!({"alias": "pm", "provider": "fake", "endpoint_kind": "fake",
-               "cwd": pm_repo}),
-    )
-    .unwrap();
+    d.register_pc("pm", "fake", "fake", pm_repo.to_str().unwrap())
+        .unwrap();
     d.wait_agent("pm", "idle", 10);
     let before = stopped_fake_agent(&d, "wx");
     let bin = env!("CARGO_BIN_EXE_cadence");
@@ -3522,12 +3486,8 @@ fn cli_launch_refuses_endpoint_kind_change_claude() {
     let _mock = d.mock_claude("ok", None);
     let pm_repo = d.dir.path().join("pmrepo");
     git_repo(&pm_repo);
-    d.rpc(
-        "agent_register",
-        json!({"alias": "pm", "provider": "fake", "endpoint_kind": "fake",
-               "cwd": pm_repo}),
-    )
-    .unwrap();
+    d.register_pc("pm", "fake", "fake", pm_repo.to_str().unwrap())
+        .unwrap();
     d.wait_agent("pm", "idle", 10);
     d.register_claude("cm", Value::Null);
     d.wait_agent("cm", "idle", 15);
@@ -3607,10 +3567,12 @@ fn cli_launch_refuses_endpoint_kind_change_devin() {
     assert_eq!(after, before);
 
     let cwd = d.dir.path().to_str().unwrap().to_string();
-    d.rpc(
-        "agent_register",
-        json!({"alias": "dvc", "provider": "devin", "endpoint_kind": "cloud",
-               "cwd": cwd, "params": json!({"repos": ["o/r"]}).to_string()}),
+    d.register_pcp(
+        "dvc",
+        "devin",
+        "cloud",
+        &cwd,
+        &json!({"repos": ["o/r"]}).to_string(),
     )
     .unwrap();
     // With no key the cloud open refuses and parks the agent in
@@ -3663,12 +3625,8 @@ fn cli_join_codex_sandbox_defaults_writable_and_flag_roundtrips() {
     let mock = d.mock_codex_ws("ok");
     let pm_repo = d.dir.path().join("pmrepo");
     git_repo(&pm_repo);
-    d.rpc(
-        "agent_register",
-        json!({"alias": "pm", "provider": "fake", "endpoint_kind": "fake",
-               "cwd": pm_repo}),
-    )
-    .unwrap();
+    d.register_pc("pm", "fake", "fake", pm_repo.to_str().unwrap())
+        .unwrap();
     d.wait_agent("pm", "idle", 10);
     let bin = env!("CARGO_BIN_EXE_cadence");
     // Default: a joined codex worker is writable — the same trust
@@ -4347,12 +4305,8 @@ fn cli_join_cursor_briefs_prefixes() {
     let mock = d.mock_cursor_tui();
     let pm_repo = d.dir.path().join("pmrepo");
     git_repo(&pm_repo);
-    d.rpc(
-        "agent_register",
-        json!({"alias": "pm", "provider": "fake", "endpoint_kind": "fake",
-               "cwd": pm_repo}),
-    )
-    .unwrap();
+    d.register_pc("pm", "fake", "fake", pm_repo.to_str().unwrap())
+        .unwrap();
     d.wait_agent("pm", "idle", 10);
     let bin = env!("CARGO_BIN_EXE_cadence");
     let out = std::process::Command::new(bin)
@@ -4904,12 +4858,14 @@ fn agent_set_caller_rule_per_caller_kind() {
     let d = TestDaemon::start();
     let _mock = d.mock_codex("ok");
     let mut p = guard_panes(&d);
-    d.rpc(
-        "agent_register",
-        json!({"alias": "w2", "provider": "codex", "endpoint_kind": "managed",
-               "cwd": d.dir.path().to_str().unwrap(),
-               "params": json!({"upstream": "pm",
-                                "approval_policy": "on-request"}).to_string()}),
+    d.register_pcp(
+        "w2",
+        "codex",
+        "managed",
+        d.dir.path().to_str().unwrap(),
+        &json!({"upstream": "pm",
+                                "approval_policy": "on-request"})
+        .to_string(),
     )
     .unwrap();
     d.wait_agent("w2", "idle", 15);

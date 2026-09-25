@@ -50,11 +50,12 @@ fn codex_quota_is_provider_bound_and_sparse_updates_handle_nullable_fields() {
     let d = TestDaemon::start();
     let _mock = d.mock_codex("quota-update");
     let cwd = d.dir.path().to_str().unwrap().to_string();
-    d.rpc(
-        "agent_register",
-        json!({"alias": "quota", "provider": "codex",
-               "endpoint_kind": "managed", "cwd": cwd,
-               "params": "{\"quota\":{\"state\":\"available\",\"used_percent\":100}}"}),
+    d.register_pcp(
+        "quota",
+        "codex",
+        "managed",
+        &cwd,
+        "{\"quota\":{\"state\":\"available\",\"used_percent\":100}}",
     )
     .unwrap();
     d.wait_agent("quota", "idle", 15);
@@ -187,11 +188,12 @@ fn codex_model_effort_are_validated_reported_and_replayed_on_resume() {
     let d = TestDaemon::start();
     let mock = d.mock_codex("ok");
     let cwd = d.dir.path().to_str().unwrap().to_string();
-    d.rpc(
-        "agent_register",
-        json!({"alias": "luna", "provider": "codex",
-               "endpoint_kind": "managed", "cwd": cwd,
-               "params": "{\"model\":\"gpt-5.6-luna\",\"effort\":\"max\"}"}),
+    d.register_pcp(
+        "luna",
+        "codex",
+        "managed",
+        &cwd,
+        "{\"model\":\"gpt-5.6-luna\",\"effort\":\"max\"}",
     )
     .unwrap();
     d.wait_agent("luna", "idle", 15);
@@ -225,11 +227,12 @@ fn codex_model_effort_pair_rejection_is_visible() {
     let d = TestDaemon::start();
     let _mock = d.mock_codex("ok");
     let cwd = d.dir.path().to_str().unwrap().to_string();
-    d.rpc(
-        "agent_register",
-        json!({"alias": "bad-luna", "provider": "codex",
-               "endpoint_kind": "managed", "cwd": cwd,
-               "params": "{\"model\":\"gpt-5.6-luna\",\"effort\":\"ultra\"}"}),
+    d.register_pcp(
+        "bad-luna",
+        "codex",
+        "managed",
+        &cwd,
+        "{\"model\":\"gpt-5.6-luna\",\"effort\":\"ultra\"}",
     )
     .unwrap();
     let agent = d.wait_agent("bad-luna", "attention", 15);
@@ -244,11 +247,12 @@ fn codex_model_availability_unknown_is_visible() {
     let d = TestDaemon::start();
     let _mock = d.mock_codex("bad-model-list");
     let cwd = d.dir.path().to_str().unwrap().to_string();
-    d.rpc(
-        "agent_register",
-        json!({"alias": "unknown-luna", "provider": "codex",
-               "endpoint_kind": "managed", "cwd": cwd,
-               "params": "{\"model\":\"gpt-5.6-luna\"}"}),
+    d.register_pcp(
+        "unknown-luna",
+        "codex",
+        "managed",
+        &cwd,
+        "{\"model\":\"gpt-5.6-luna\"}",
     )
     .unwrap();
     let agent = d.wait_agent("unknown-luna", "attention", 15);
@@ -262,11 +266,12 @@ fn codex_ws_model_effort_are_replayed_and_reported() {
     let d = TestDaemon::start();
     let mock = d.mock_codex_ws("ok");
     let cwd = d.dir.path().to_str().unwrap().to_string();
-    d.rpc(
-        "agent_register",
-        json!({"alias": "luna-ws", "provider": "codex",
-               "endpoint_kind": "managed-ws", "cwd": cwd,
-               "params": "{\"model\":\"gpt-5.6-luna\",\"effort\":\"max\"}"}),
+    d.register_pcp(
+        "luna-ws",
+        "codex",
+        "managed-ws",
+        &cwd,
+        "{\"model\":\"gpt-5.6-luna\",\"effort\":\"max\"}",
     )
     .unwrap();
     d.wait_agent("luna-ws", "idle", 15);
@@ -309,11 +314,12 @@ fn codex_approval_policy_rejected_at_register_and_next_launch() {
     // Register: a bogus value is refused before it lands on the row,
     // and the error names every accepted value.
     let err = d
-        .rpc(
-            "agent_register",
-            json!({"alias": "w1", "provider": "codex",
-                   "endpoint_kind": "managed", "cwd": cwd,
-                   "params": "{\"approval_policy\":\"bogus\"}"}),
+        .register_pcp(
+            "w1",
+            "codex",
+            "managed",
+            &cwd,
+            "{\"approval_policy\":\"bogus\"}",
         )
         .unwrap_err()
         .to_string();
@@ -471,11 +477,12 @@ fn codex_sandbox_values_reach_thread_start_and_are_reported() {
         );
     }
     // A configured policy is reported as configured.
-    d.rpc(
-        "agent_register",
-        json!({"alias": "wc", "provider": "codex",
-               "endpoint_kind": "managed", "cwd": cwd,
-               "params": "{\"approval_policy\":\"on-request\"}"}),
+    d.register_pcp(
+        "wc",
+        "codex",
+        "managed",
+        &cwd,
+        "{\"approval_policy\":\"on-request\"}",
     )
     .unwrap();
     d.wait_agent("wc", "idle", 15);
@@ -483,11 +490,7 @@ fn codex_sandbox_values_reach_thread_start_and_are_reported() {
     assert_eq!(agent["approval_policy"], "on-request", "{agent}");
     assert_eq!(agent["approval_policy_source"], "configured", "{agent}");
     // Providers without the setting report neither field.
-    d.rpc(
-        "agent_register",
-        json!({"alias": "f", "provider": "fake", "endpoint_kind": "fake", "cwd": cwd}),
-    )
-    .unwrap();
+    d.register_pc("f", "fake", "fake", &cwd).unwrap();
     let agent = d.rpc("agent_show", json!({"alias": "f"})).unwrap()["agent"].clone();
     assert!(agent["approval_policy"].is_null(), "{agent}");
     assert!(agent["approval_policy_source"].is_null(), "{agent}");
@@ -499,12 +502,8 @@ fn codex_cli_approval_policy_flag_roundtrips_through_resume() {
     let mock = d.mock_codex_ws("ok");
     let pm_repo = d.dir.path().join("pmrepo");
     git_repo(&pm_repo);
-    d.rpc(
-        "agent_register",
-        json!({"alias": "pm", "provider": "fake", "endpoint_kind": "fake",
-               "cwd": pm_repo}),
-    )
-    .unwrap();
+    d.register_pc("pm", "fake", "fake", pm_repo.to_str().unwrap())
+        .unwrap();
     d.wait_agent("pm", "idle", 10);
     let bin = env!("CARGO_BIN_EXE_cadence");
     let run = |args: &[&str]| {
@@ -894,12 +893,7 @@ fn ws_restart_resumes_thread_with_fresh_endpoint() {
     {
         let d = TestDaemon::start_on(state.clone());
         mock = d.mock_codex_ws_at(seeded.path(), "ok");
-        d.rpc(
-            "agent_register",
-            json!({"alias": "w1", "provider": "codex",
-                   "endpoint_kind": "managed-ws", "cwd": cwd}),
-        )
-        .unwrap();
+        d.register_pc("w1", "codex", "managed-ws", &cwd).unwrap();
         let first = d.wait_agent("w1", "idle", 15);
         first_endpoint = first["endpoint"].as_str().unwrap().to_string();
     }
@@ -1759,10 +1753,12 @@ fn claude_effort_validated() {
     let _mock = d.mock_claude("ok", None);
     let cwd = d.dir.path().to_str().unwrap().to_string();
     let err = d
-        .rpc(
-            "agent_register",
-            json!({"alias": "bad", "provider": "claude", "endpoint_kind": "managed",
-                   "cwd": cwd, "params": json!({"effort": "extreme"}).to_string()}),
+        .register_pcp(
+            "bad",
+            "claude",
+            "managed",
+            &cwd,
+            &json!({"effort": "extreme"}).to_string(),
         )
         .unwrap_err()
         .to_string();
@@ -2360,12 +2356,12 @@ fn claude_brokered_flag_validation() {
         ),
     ] {
         let err = d
-            .rpc(
-                "agent_register",
-                json!({"alias": "bad", "provider": "claude",
-                       "endpoint_kind": "managed",
-                       "cwd": d.dir.path().to_str().unwrap(),
-                       "params": params.to_string()}),
+            .register_pcp(
+                "bad",
+                "claude",
+                "managed",
+                d.dir.path().to_str().unwrap(),
+                &params.to_string(),
             )
             .unwrap_err()
             .to_string();

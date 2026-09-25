@@ -1828,11 +1828,12 @@ fn pty_deleted_cwd_refuses_delivery_and_is_surfaced() {
     let _mock = d.mock_stub();
     let lane = d.dir.path().join("lane-wt");
     std::fs::create_dir_all(&lane).unwrap();
-    d.rpc(
-        "agent_register",
-        json!({"alias": "st", "provider": "tui-stub", "endpoint_kind": "pty",
-               "cwd": lane.to_str().unwrap(),
-               "params": json!({"auto_ready": "verified"}).to_string()}),
+    d.register_pcp(
+        "st",
+        "tui-stub",
+        "pty",
+        lane.to_str().unwrap(),
+        &json!({"auto_ready": "verified"}).to_string(),
     )
     .unwrap();
     let agent = d.wait_agent("st", "idle", 20);

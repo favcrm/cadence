@@ -3545,12 +3545,8 @@ fn automatic_monitor_dispatch_is_separate_guarded_and_restart_safe() {
             }}),
         ),
     ] {
-        d.rpc(
-            "agent_register",
-            json!({"alias": alias, "provider": "fake", "endpoint_kind": "fake",
-                   "cwd": cwd, "params": params.to_string()}),
-        )
-        .unwrap();
+        d.register_pcp(alias, "fake", "fake", &cwd, &params.to_string())
+            .unwrap();
     }
     for alias in ["pm", "w1", "w2", "w3"] {
         d.wait_agent(alias, "idle", 10);
@@ -3809,11 +3805,14 @@ fn automatic_monitor_dispatch_serializes_competing_callers() {
     let mut d = TestDaemon::start();
     d.register("pm");
     let cwd = d.dir.path().to_str().unwrap().to_string();
-    d.rpc(
-        "agent_register",
-        json!({"alias": "w1", "provider": "fake", "endpoint_kind": "fake",
-               "cwd": cwd, "params": json!({"upstream": "pm", "quota":
-                   {"source": "provider", "state": "available"}}).to_string()}),
+    d.register_pcp(
+        "w1",
+        "fake",
+        "fake",
+        &cwd,
+        &json!({"upstream": "pm", "quota":
+                   {"source": "provider", "state": "available"}})
+        .to_string(),
     )
     .unwrap();
     d.wait_agent("pm", "idle", 10);
