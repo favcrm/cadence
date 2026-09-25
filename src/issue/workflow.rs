@@ -31,7 +31,9 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
+use regex::Regex;
 use serde_json::{json, Map, Value};
 
 use crate::error::{Error, Result};
@@ -93,10 +95,13 @@ fn valid_input_name(name: &str) -> bool {
 
 /// The whole value is exactly `{{name}}` — returns the input name.
 /// Only a bare placeholder renders exactly its input, which is what
-/// makes `distinct:` meaningful; `x-{{a}}` mixes literal text in.
+/// makes `distinct:` meaningful; `x-{{a}}` mixes literal text in. The
+/// name trims the way `placeholders` and `substitute` already trim,
+/// so `{{ worker }}` names `worker`'s position for the distinct check.
 fn bare_placeholder(v: &str) -> Option<&str> {
     v.strip_prefix("{{")?
         .strip_suffix("}}")
+        .map(str::trim)
         .filter(|n| valid_input_name(n))
 }
 
@@ -512,17 +517,30 @@ pub fn render(text: &str, provided: &BTreeMap<String, String>) -> Result<String>
     Ok(rendered)
 }
 
-/// A character an input value may never carry: control characters,
-/// Unicode line/paragraph separators, zero-width and word-joiner
-/// format characters, bidi controls, the BOM, and any whitespace that
-/// is not an ordinary interior space. Each is invisible or splitting
-/// in some reader — none changes what a value names.
+/// A character an input value may never carry, by Unicode general
+/// category rather than a named code-point list (CAD-507 review): every
+/// `Cf` format control — the soft hyphen, the bidi and
+/// interlinear-annotation controls, tag characters, the BOM — plus the
+/// invisible `Mn` nonspacing marks and the unassigned points reserved
+/// for them (both selected by `Default_Ignorable_Code_Point`): the
+/// grapheme joiner, the Khmer vowel inherents, Mongolian and emoji
+/// variation selectors. A format control or variation selector Unicode
+/// assigns later refuses without a table update. Control characters and
+/// whitespace that is not an ordinary interior space keep refusing
+/// through the other arms — each is invisible or splitting in some
+/// reader, and none changes what a value names.
 fn bad_value_char(c: char) -> bool {
+    /// `\p{Cf}` ∪ (`\p{Mn}` ∩ ignorable) ∪ (unassigned ∩ ignorable).
+    static INVISIBLE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(concat!(
+            r"[\p{Cf}",
+            r"[\p{Mn}&&\p{Default_Ignorable_Code_Point}]",
+            r"[\p{Cn}&&\p{Default_Ignorable_Code_Point}]]"
+        ))
+        .expect("a constant Unicode-category pattern compiles")
+    });
     c.is_control()
-        || ('\u{200B}'..='\u{200F}').contains(&c) // ZWSP, ZWNJ, ZWJ, LRM, RLM
-        || ('\u{2028}'..='\u{202E}').contains(&c) // line/para separators, bidi
-        || ('\u{2060}'..='\u{2069}').contains(&c) // word joiner, invisible ops, isolates
-        || c == '\u{FEFF}'
+        || INVISIBLE.is_match(c.encode_utf8(&mut [0; 4]))
         || (c.is_whitespace() && c != ' ')
 }
 
@@ -1745,6 +1763,51 @@ Why.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance
         render(WF, &inputs(&[("topic", "double  space is fine")])).unwrap();
     }
 
+    #[test]
+    fn input_values_refuse_invisible_chars_by_category() {
+        // CAD-507: the guard is by Unicode general category — every `Cf`
+        // format control and every invisible `Mn` mark — so codepoints
+        // the old list never named refuse. Mutation proof: a mutant
+        // keeping only the named ranges lets these through and the
+        // `one_line` code is gone.
+        for bad in [
+            "dev\u{180E}1",  // MONGOLIAN VOWEL SEPARATOR — Cf
+            "dev\u{00AD}1",  // SOFT HYPHEN — Cf
+            "dev\u{061C}1",  // ARABIC LETTER MARK — Cf
+            "dev\u{070F}1",  // SYRIAC ABBREVIATION MARK — Cf
+            "dev\u{FFF9}1",  // INTERLINEAR ANNOTATION ANCHOR — Cf
+            "dev\u{FFFA}1",  // INTERLINEAR ANNOTATION SEPARATOR — Cf
+            "dev\u{FFFB}1",  // INTERLINEAR ANNOTATION TERMINATOR — Cf
+            "dev\u{E0020}1", // TAG SPACE — Cf
+            "dev\u{E0041}1", // TAG LATIN CAPITAL LETTER A — Cf
+            "dev\u{E007F}1", // CANCEL TAG — Cf
+            "dev\u{034F}1",  // COMBINING GRAPHEME JOINER — invisible Mn
+            "dev\u{17B4}1",  // KHMER VOWEL INHERENT AQ — invisible Mn
+            "dev\u{17B5}1",  // KHMER VOWEL INHERENT AA — invisible Mn
+            "dev\u{180B}1",  // MONGOLIAN FREE VARIATION SELECTOR — Mn
+            "dev\u{FE0F}1",  // VARIATION SELECTOR-16 — invisible Mn
+            "dev\u{E0100}1", // VARIATION SELECTOR-17 — invisible Mn
+        ] {
+            let e = render(WF, &inputs(&[("topic", bad)])).unwrap_err();
+            assert_eq!(e.code(), Some("one_line"), "{bad:?} -> {e}");
+        }
+        // Every provided input is guarded — the optional `keyword`, a
+        // prose `{{note}}` and an agent-position `{{who}}` alike.
+        for bad in ["k\u{00AD}w", "k\u{034F}w", "k\u{FE0F}w"] {
+            let e = render(WF, &inputs(&[("topic", "t"), ("keyword", bad)])).unwrap_err();
+            assert_eq!(e.code(), Some("one_line"), "keyword {bad:?} -> {e}");
+            for key in ["who", "note"] {
+                let mut vals = inputs(&[("who", "dev-1"), ("note", "n")]);
+                vals.insert(key.to_string(), bad.to_string());
+                let e = render(WF_INJ, &vals).unwrap_err();
+                assert_eq!(e.code(), Some("one_line"), "{key} {bad:?} -> {e}");
+            }
+        }
+        // Visible combining marks stay legal — a mutant refusing all
+        // `Mn` breaks an accented name.
+        render(WF, &inputs(&[("topic", "Cafe\u{301} — naïve")])).unwrap();
+    }
+
     /// CAD-487 r3, guard 2 for `distinct:`: the compare runs on what
     /// the plan carries — exercised through `check_rendered` directly,
     /// bypassing the value charset (as if a mutant removed it).
@@ -1874,6 +1937,65 @@ inputs:\n  title: {}\n  worker: {}\n  reviewer: {}\ndistinct: [worker, reviewer]
         assert_ne!(
             gate_digest(&without).unwrap(),
             gate_digest(WF_DISTINCT).unwrap()
+        );
+    }
+
+    /// CAD-507: `{{ worker }}` (spaced) names `worker` — `placeholders`
+    /// and `substitute` already trim the inner name; `bare_placeholder`
+    /// must too, or the parsed-position `distinct:` check cannot see the
+    /// input's positions. Mutation proof: without the trim the spaced
+    /// pair is invisible to both the render and the `check` paths.
+    #[test]
+    fn bare_placeholder_trims_spaced_names() {
+        assert_eq!(bare_placeholder("{{ worker }}"), Some("worker"));
+        assert_eq!(bare_placeholder("{{w}}"), Some("w"));
+        // Whitespace alone is no name; literal text is never bare.
+        assert_eq!(bare_placeholder("{{ }}"), None);
+        assert_eq!(bare_placeholder("x-{{w}}"), None);
+
+        let spaced = WF_DISTINCT
+            .replace("agent: {{worker}}", "agent: {{ worker }}")
+            .replace("agent: {{reviewer}}", "agent: {{ reviewer }}");
+        // Full path: equal values refuse on `distinct:` — the spaced
+        // placeholders rendered fine.
+        let e = render(
+            &spaced,
+            &inputs(&[("title", "t"), ("worker", "dev-1"), ("reviewer", "dev-1")]),
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), Some("not_distinct"), "{e}");
+        // The parsed-position layer: the spaced names record `worker`'s
+        // and `reviewer`'s positions, so raw values that differ only by
+        // what the plan parses away refuse as equal in the render.
+        let tpl = parse_template(&spaced).unwrap();
+        let rendered = render_values(
+            &spaced,
+            &inputs(&[
+                ("title", "t"),
+                ("worker", "dev-1 "), // the plan parses `dev-1`
+                ("reviewer", "dev-1"),
+            ]),
+        )
+        .unwrap();
+        let e = check_rendered(&spaced, &tpl, &rendered).unwrap_err();
+        assert_eq!(e.code(), Some("not_distinct"), "{e}");
+
+        // `check` sees the spaced pair as bare placeholders: pinned by
+        // `distinct:` they prove reviewer≠agent instead of refusing as
+        // unprovable.
+        let sources = vec!["test".to_string()];
+        const WF_S: &str = "---\ntitle: T\ngoal: G\ninputs:\n  w: {}\n  r: {}\n\
+distinct: [w, r]\n---\n\n## Do\nagent: {{ w }}\nsize: S\nreviewer: {{ r }}\n\n\
+### Acceptance\n- [ ] x\n";
+        let (errors, notes, _) = check_text(WF_S, &HashSet::new(), &sources);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(notes.iter().any(|n| n.contains("distinct")), "{notes:?}");
+        // The same input on both sides refuses by name — spaced.
+        let same = WF_S.replace("reviewer: {{ r }}", "reviewer: {{ w }}");
+        let (errors, _, _) = check_text(&same, &HashSet::new(), &sources);
+        assert!(
+            errors.iter().any(|e| e.contains("same input")),
+            "{errors:?}"
         );
     }
 
