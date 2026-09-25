@@ -572,7 +572,9 @@ fn redact(secret: &str) -> String {
     format!("{}…", secret.chars().take(keep).collect::<String>())
 }
 
-fn fingerprint(secret: &[u8]) -> String {
+/// The SHA-256 prefix a custody record carries for its credential —
+/// the same display form findings use (ADR 0006 §5.3).
+pub fn fingerprint(secret: &[u8]) -> String {
     let digest = Sha256::digest(secret);
     digest[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
