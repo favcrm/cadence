@@ -153,7 +153,20 @@ impl Shared {
             AgentCaller::Agent(alias) => alias,
         };
         let pm_dir = self.pm_dir()?;
-        let pm = Pm::at(&pm_dir)?;
+        self.route_answer(&pm_dir, issue, report, &by)
+    }
+
+    /// The route itself, once the caller is proven: `by` is the
+    /// connection's identity, never a request field — an answer routes
+    /// only from its own author (CAD-447).
+    pub(super) fn route_answer(
+        self: &Arc<Self>,
+        pm_dir: &std::path::Path,
+        issue: &str,
+        report: &str,
+        by: &str,
+    ) -> Result<Value> {
+        let pm = Pm::at(pm_dir)?;
         let (project, dir) = write::issue_dir(&pm, issue)?;
         let rows = task_report::list(&dir, issue);
         let answer = rows
@@ -211,7 +224,7 @@ impl Shared {
         };
         let text = compose(
             issue,
-            &by,
+            by,
             question,
             answer["body"].as_str().unwrap_or_default(),
             &path,

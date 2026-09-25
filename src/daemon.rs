@@ -28,6 +28,7 @@ use uuid::Uuid;
 mod answer_rpc;
 mod area_rpc;
 mod caller_rule;
+mod checkup;
 mod delivery_rpc;
 mod dispatch_rpc;
 mod master_rpc;
@@ -519,6 +520,8 @@ pub struct Shared {
     reports_dirty: AtomicBool,
     /// CAD-339: the report router's scan period; `None` is off.
     router_every: Option<Duration>,
+    /// CAD-477: the checkup's pass period; `None` is off.
+    checkup_every: Option<Duration>,
     /// CAD-339: reports due to the master but held back by the per-pass
     /// cap at the router's last pass.
     router_backlog: std::sync::atomic::AtomicUsize,
@@ -617,6 +620,11 @@ impl Shared {
             reports_dirty: AtomicBool::new(false),
             router_every: match opts.report_router {
                 None => Some(Duration::from_secs(30)),
+                Some(0) => None,
+                Some(secs) => Some(Duration::from_secs(secs)),
+            },
+            checkup_every: match opts.checkup {
+                None => Some(Duration::from_secs(checkup::DEFAULT_CHECKUP_SECS)),
                 Some(0) => None,
                 Some(secs) => Some(Duration::from_secs(secs)),
             },
@@ -7731,12 +7739,15 @@ impl Shared {
 
     // ---- Stall watch: report silent turns, never touch them (CAD-52) ----
 
-    /// Sample owned agents on a slow cadence until shutdown. The watch
-    /// only ever emits events and notices — it never interrupts,
-    /// re-dispatches or fences anything it observes.
+    /// Sample owned agents on a slow cadence until shutdown. The stall
+    /// watch itself only ever emits events and notices — it never
+    /// interrupts, re-dispatches or fences anything it observes. The
+    /// PM checkup rides the same loop on its own slower cadence; it
+    /// alone records a lane outcome and may nudge or escalate.
     fn run_stall_watch(self: &Arc<Self>) {
         let mut inbox_swept: Option<Instant> = None;
         let mut nudges_swept: Option<Instant> = None;
+        let mut checkup_at: Option<Instant> = None;
         while !self.closing.load(Ordering::SeqCst) {
             self.stall_tick();
             // CAD-250 N3: a nudge still queued past its TTL is stale
@@ -7759,6 +7770,14 @@ impl Shared {
             self.auto_stop_tick();
             // CAD-413: work queued for an auto-stopped agent resumes it.
             self.auto_resume_tick();
+            // CAD-477: the PM checkup — visits each worker holding a
+            // running or queued turn and records one outcome.
+            if let Some(every) = self.checkup_every {
+                if checkup_at.is_none_or(|at| at.elapsed() >= every) {
+                    self.checkup_tick();
+                    checkup_at = Some(Instant::now());
+                }
+            }
             std::thread::sleep(STALL_TICK);
         }
     }
@@ -10282,6 +10301,10 @@ pub struct ServeOptions {
     /// is 30; `Some(0)` turns it off — test daemons stay hermetic, no
     /// tracker scan.
     pub report_router: Option<u64>,
+    /// CAD-477 checkup period in seconds: `None` (production) is
+    /// [`checkup::DEFAULT_CHECKUP_SECS`]; `Some(0)` turns it off — test
+    /// daemons stay hermetic, no unattended lane judgements.
+    pub checkup: Option<u64>,
     /// The actor's empty-queue poll — `None` is five seconds. A test
     /// that must prove a delivery came from the wake, not the poll,
     /// sets it past its own wait bound (CAD-391).

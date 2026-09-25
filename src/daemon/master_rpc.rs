@@ -68,7 +68,9 @@ pub const MASTER_ALLOWED: &[&str] = &[
 /// the next pass and are counted as the routing backlog.
 const ROUTES_PER_PASS: usize = 5;
 /// Default wait before an unanswered question reaches the master.
-const QUESTION_GRACE_SECS: u64 = 900;
+/// The checkup (CAD-477) gives a report the same grace before it
+/// backstops an absent PM with an operator escalation.
+pub(super) const QUESTION_GRACE_SECS: u64 = 900;
 /// Body bytes a routed report carries; the file keeps the rest.
 const ROUTED_BODY_MAX: usize = 6_000;
 /// Briefing bytes the bootstrap message inlines; a larger briefing is
@@ -848,7 +850,7 @@ impl Shared {
 }
 
 /// The message id a routed report is queued under — one per report file.
-fn route_id(project: &str, id: &str, row: &Value) -> String {
+pub(super) fn route_id(project: &str, id: &str, row: &Value) -> String {
     let name = row["name"].as_str().unwrap_or_default();
     let what = if row["kind"] == "question" {
         "question"

@@ -708,7 +708,9 @@ impl Audience {
             // reconcile`, which only the operator may run (CAD-374).
             // CAD-339 Needs-you: a question the master escalated and a
             // plan awaiting approval are the operator's to decide.
-            "approval" | "fenced" | "question" | "plan" => Self::Operator,
+            // CAD-477: a checkup-escalated blocked report and a stopped
+            // agent holding queued work take the same operator row.
+            "approval" | "fenced" | "question" | "plan" | "blocked" | "stopped" => Self::Operator,
             // CAD-431: the merge decision, a review that did not
             // converge, one nobody can take, and auto-merge left on a
             // moved head are the operator's.
@@ -2331,6 +2333,10 @@ fn agent_items(a: &Value, probe: &AgentProbe, project: &str, now: i64) -> Vec<It
     // Condition clocks (CAD-253): a daemon-measured age is a start
     // time; `updated` is not — any params/model write moves it.
     let secs_ago = |key: &str| a[key].as_f64().map(|s| now - s as i64);
+    let queued = a["inbox"]["queued"]
+        .as_i64()
+        .or_else(|| probe.show.as_ref().and_then(|s| s["queued"].as_i64()))
+        .unwrap_or(0);
     // CAD-413: an auto-resume for queued work failed — the agent is
     // down with a message waiting. The more specific row: it replaces
     // the generic `fenced` row a failed open would otherwise raise.
@@ -2363,6 +2369,25 @@ fn agent_items(a: &Value, probe: &AgentProbe, project: &str, now: i64) -> Vec<It
             // Operator only (CAD-374): the PM escalates, it cannot act.
             .owned_by(None)
             .since(fenced_since(a, probe)),
+        );
+    }
+    // CAD-477: a stopped agent still holding queued work is a lane
+    // nobody drives. The idle timer's own stop is auto-resume's to
+    // restart (CAD-413) — every other stop is the operator's.
+    if a["state"].as_str() == Some("stopped")
+        && !a["auto_stopped"].is_object()
+        && !resume_failed.is_object()
+        && queued > 0
+    {
+        items.push(
+            row(
+                30,
+                "stopped",
+                &format!("agent {alias} stopped with {queued} queued — resume it"),
+                age,
+                &cmd_agent_resume(alias),
+            )
+            .owned_by(None),
         );
     }
     if a["stalled"].as_bool().unwrap_or(false) {
@@ -2450,10 +2475,6 @@ fn agent_items(a: &Value, probe: &AgentProbe, project: &str, now: i64) -> Vec<It
             .since(secs_ago("ended_secs")),
         );
     }
-    let queued = a["inbox"]["queued"]
-        .as_i64()
-        .or_else(|| probe.show.as_ref().and_then(|s| s["queued"].as_i64()))
-        .unwrap_or(0);
     if a["provider"].as_str() == Some(registry::INBOX) && queued > 0 {
         items.push(row(
             100,
@@ -2901,6 +2922,50 @@ fn overview_from(
                 row.json["summary"] = up.get("summary").cloned().unwrap_or(Value::Null);
                 row.json["escalated_by"] = up.get("by").cloned().unwrap_or(Value::Null);
                 needs.push(row);
+            }
+            // CAD-477: a blocked report the checkup escalated is the
+            // operator's to unblock — one row while it is still the
+            // issue's open state; a newer `done` report or a done
+            // issue clears it.
+            if escalated_here {
+                let reports = issue::task_report::list(&v.issue.dir, id);
+                for b in reports
+                    .iter()
+                    .filter(|r| r["kind"].as_str() == Some("blocked"))
+                {
+                    let name = b["name"].as_str().unwrap_or_default();
+                    let Some(up) = escalations
+                        .get(&format!("{id}/{name}"))
+                        .and_then(Value::as_object)
+                    else {
+                        continue;
+                    };
+                    if !issue::task_report::blocked_open(&reports, b, &v.status) {
+                        continue;
+                    }
+                    let since = b["at"].as_str().and_then(parse_iso);
+                    let mut row = item(
+                        20,
+                        "blocked",
+                        &format!(
+                            "{id} blocked — {} reports it cannot proceed",
+                            b["agent"].as_str().unwrap_or_default()
+                        ),
+                        since.map_or(age, |t| now - t),
+                        project,
+                        None,
+                        &format!("cadence issue show {id}"),
+                    )
+                    .about("report", &format!("{id}/{name}"))
+                    .for_agent(b["agent"].as_str().unwrap_or_default())
+                    .since(since);
+                    row.json["blocked"] = json!({
+                        "issue": id, "report": name, "agent": b["agent"], "body": b["body"],
+                    });
+                    row.json["summary"] = up.get("summary").cloned().unwrap_or(Value::Null);
+                    row.json["escalated_by"] = up.get("by").cloned().unwrap_or(Value::Null);
+                    needs.push(row);
+                }
             }
             // `cadence report` intake: a backlog-tagged row surfaces
             // until triage moves it off backlog — the effective status
@@ -3532,6 +3597,44 @@ mod tests {
         assert!(title.contains("fake open refused"), "{title}");
         assert_eq!(out[0]["command"], "cadence agent resume w1");
         assert_eq!(out[0]["since"], NOW - 300, "{}", out[0]);
+    }
+
+    /// CAD-477: a stopped agent still holding queued work is one
+    /// operator row — the idle timer's own stop is auto-resume's to
+    /// restart, so it shows none; an empty queue is nobody's row.
+    #[test]
+    fn stopped_agent_with_queued_work_is_an_operator_row() {
+        let pm = pm_row(false, "idle");
+        let a = |queued: i64| {
+            json!({
+                "alias": "w1", "provider": "devin", "endpoint_kind": "pty",
+                "state": "stopped", "updated": (NOW - 600) as f64,
+                "params": {"upstream": "pm"}, "dead": false,
+                "inbox": {"queued": queued},
+            })
+        };
+        let out = resolve(
+            agent_items(&a(2), &AgentProbe::default(), "cadence", NOW),
+            &[a(2), pm.clone()],
+        );
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0]["kind"], "stopped", "{}", out[0]);
+        assert_eq!(out[0]["audience"], "operator", "{}", out[0]);
+        assert_eq!(out[0]["command"], "cadence agent resume w1");
+        // The idle timer's own stop: auto-resume owns it — no row.
+        let mut auto = a(2);
+        auto["auto_stopped"] = json!({"at": (NOW - 60) as f64, "label": "auto-stopped"});
+        let out = resolve(
+            agent_items(&auto, &AgentProbe::default(), "cadence", NOW),
+            &[auto.clone(), pm.clone()],
+        );
+        assert_eq!(out.len(), 0, "{out:?}");
+        // Nothing queued — nobody's row.
+        let out = resolve(
+            agent_items(&a(0), &AgentProbe::default(), "cadence", NOW),
+            &[a(0), pm],
+        );
+        assert_eq!(out.len(), 0, "{out:?}");
     }
 
     /// The clock is when the issue entered its status, not its age: an

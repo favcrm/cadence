@@ -3715,6 +3715,9 @@ fn daemon_opts() -> daemon::ServeOptions {
         // CAD-339: the report router scans a tracker; only the master
         // tests (which bind CADENCE_PM_DIR) turn it on.
         report_router: Some(0),
+        // CAD-477: the checkup judges lanes on its own; only the
+        // checkup tests turn it on.
+        checkup: Some(0),
         idle_poll: None,
         stop: None,
         // CAD-313: links and sessions expire by the wall clock unless a
