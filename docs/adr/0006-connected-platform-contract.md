@@ -1,6 +1,9 @@
 # 0006 — The connected-platform contract: declared effects, proxied credentials, pending sends
 
-- Status: **proposed**
+- Status: **accepted** on 2026-09-25 by the operator, at
+  `c2c40e78d9f1ac88c52cf10f6fff51845502b8a9`. `op-pm` recorded the
+  decision from the user in a CAD-365 comment at 05:10:16Z; §7 records
+  each answer.
 - Risk class **human** for every implementation ticket (trigger 1, a
   trust boundary — credential custody and the release of outward acts;
   trigger 3 wherever secret handling is built). This document is the
