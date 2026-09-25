@@ -118,13 +118,20 @@ pub(super) fn operator_viewer(
     state_dir: &std::path::Path,
     opts: &ServeOpts,
 ) -> bool {
-    !opts.read_only
-        && matches!(
-            operator::board_caller(request, state_dir, opts, false),
-            Ok(operator::Caller::Operator(_))
-        )
-        && prove_operator_peer(request, state_dir, opts, "reading the operator role").is_ok()
-        && board_is_operator(state_dir)
+    if opts.read_only {
+        return false;
+    }
+    match operator::board_caller(request, state_dir, opts, false) {
+        // CAD-526: a public session's verified `owner` role is the
+        // operator claim on that surface — the platform relay's peer is
+        // not a process this host can prove, and need not be.
+        Ok(operator::Caller::Named(named)) => named.operator && board_is_operator(state_dir),
+        Ok(operator::Caller::Operator(_)) => {
+            prove_operator_peer(request, state_dir, opts, "reading the operator role").is_ok()
+                && board_is_operator(state_dir)
+        }
+        _ => false,
+    }
 }
 
 /// The board process itself passes the operator proof the daemon will

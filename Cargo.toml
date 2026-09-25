@@ -59,6 +59,12 @@ regex = "1"
 # CAD-396: redact every turn token/generation from an export in one pass.
 aho-corasick = "1"
 ureq = { version = "3.4.2", default-features = false, features = ["json", "rustls"] }
+# CAD-526: the platform's board-identity assertions are compact Ed25519
+# JWSs — `ring` verifies them (the same 0.17.14 rustls already compiles;
+# verify-only, so no default features); `base64` decodes the JWS parts and
+# JWKS `x` keys (the single 0.23.1 ureq already uses; `alloc` suffices).
+ring = { version = "0.17", default-features = false }
+base64 = { version = "0.23", default-features = false, features = ["alloc"] }
 
 [[test]]
 name = "e2e_mvp"

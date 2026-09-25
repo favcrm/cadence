@@ -158,12 +158,14 @@ name = "cadence-agent"
 version = "0.1.0"
 dependencies = [
  "aho-corasick",
+ "base64",
  "clap",
  "getrandom 0.3.4",
  "jsonschema",
  "libc",
  "qrcode",
  "regex",
+ "ring",
  "rusqlite",
  "serde",
  "serde_json",

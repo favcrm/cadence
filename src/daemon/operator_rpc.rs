@@ -38,12 +38,17 @@ use crate::operator_auth::{self as auth, Origin};
 
 fn origin_param(params: &Value) -> Result<Origin> {
     let raw = required_str(params, "origin")?;
-    Origin::parse(raw).ok_or_else(|| {
-        Error::invalid(
+    // `public` (CAD-526) is deliberately excluded: a public session is
+    // born only of a verified platform assertion at board_session_open —
+    // no login link may ever mint one.
+    match raw {
+        "loopback" => Ok(Origin::Loopback),
+        "tailnet" => Ok(Origin::Tailnet),
+        _ => Err(Error::invalid(
             "invalid_request",
             format!("origin must be 'loopback' or 'tailnet', not '{raw}'"),
-        )
-    })
+        )),
+    }
 }
 
 impl Shared {
@@ -164,6 +169,125 @@ impl Shared {
         let now = self.operator_now();
         let session = self.operator_auth().check(token, key, origin, now)?;
         Ok(json!({"valid": session.is_some(), "session": session}))
+    }
+
+    /// `board_session_open {assertion, user_agent?}` — the board's
+    /// `POST /__platform/session` (CAD-526, contract §4/§9). The
+    /// assertion is the credential: structure, Ed25519 signature
+    /// against the platform JWKS, `iss`/`aud`/`exp`/`iat`, this
+    /// instance's `company`, the role map, and the authoritative
+    /// single-use `jti` all pass here before a session exists. The
+    /// trust root is the daemon-owned `operator/board-identity.json`;
+    /// nothing the request carries chooses it.
+    ///
+    /// A connection that derives an agent is refused before the `jti`
+    /// is consumed — an agent never mints a browser session, and a
+    /// refused call must not burn the real sign-in's id.
+    pub(super) fn rpc_board_session_open(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        if let Some(who) = self.slot_identity(peer_pid)? {
+            return Err(Error::rejected(format!(
+                "board_session_open is the platform sign-in exchange — this connection \
+                 is agent '{}'; a browser session is never minted for a pane",
+                who.lane()
+            )));
+        }
+        let assertion = required_str(params, "assertion")?;
+        let user_agent = optional_str(params, "user_agent").unwrap_or_default();
+        let config = crate::board_identity::read_config(&self.state_dir)?;
+        let now = self.operator_now();
+        let parsed = crate::board_identity::parse(assertion)
+            .map_err(|r| self.board_rejected(r.code, &r.message))?;
+        // `iss` names the JWKS origin (contract §6) — only after it
+        // matches the configured issuer, so a foreign assertion never
+        // points the fetch at its own keys. `aud` is the cheap early
+        // refuse: a sibling board's assertion goes no further.
+        if parsed.issuer() != config.issuer {
+            return Err(self.board_rejected(
+                "issuer_mismatch",
+                "the assertion was not issued by this board's platform",
+            ));
+        }
+        if parsed.audience() != config.host {
+            return Err(self.board_rejected(
+                "audience_mismatch",
+                "the assertion was minted for another board host",
+            ));
+        }
+        let key = {
+            let mut cache = self.board_jwks.lock().unwrap_or_else(|e| e.into_inner());
+            cache
+                .key(&config.issuer, parsed.kid(), now)
+                // A fetched-but-unpublished `kid` is the caller's bad
+                // assertion (`assertion_invalid`); an unreachable or
+                // malformed JWKS is ours — `capability_unavailable`.
+                .map_err(|e| match e.code() {
+                    Some("assertion_invalid") => {
+                        self.board_rejected("assertion_invalid", &e.to_string())
+                    }
+                    _ => self.board_rejected("capability_unavailable", &e.to_string()),
+                })?
+        };
+        let identity = crate::board_identity::verify(&parsed, &config, &key, now)
+            .map_err(|r| self.board_rejected(r.code, &r.message))?;
+        let opened = self.operator_auth().open_public(
+            identity.user(),
+            parsed.jti(),
+            parsed.exp(),
+            user_agent,
+            now,
+        )?;
+        match opened {
+            None => {
+                let _ = self.store.event_public(
+                    DAEMON_ALIAS,
+                    "board_assertion_rejected",
+                    json!({"reason": "replayed"}),
+                );
+                Err(Error::invalid(
+                    "assertion_replayed",
+                    "the assertion was already exchanged",
+                ))
+            }
+            Some(opened) => {
+                let _ = self.store.event_public(
+                    DAEMON_ALIAS,
+                    "board_session_opened",
+                    json!({
+                        "session": opened.session.id,
+                        "origin": Origin::Public.as_str(),
+                        "sub": opened.session.user.as_ref().map(|u| u.sub.as_str()),
+                        "role": opened.session.user.as_ref().map(|u| u.role.as_str()),
+                    }),
+                );
+                Ok(json!({
+                    "ok": true,
+                    "token": opened.token,
+                    "session": opened.session,
+                }))
+            }
+        }
+    }
+
+    /// `board_session_check {token}` — the board, on every public-host
+    /// request: the `__Host-aos-board-session` cookie alone is the
+    /// credential (there is no page key on this surface). Only
+    /// `public` rows can match.
+    pub(super) fn rpc_board_session_check(&self, params: &Value) -> Result<Value> {
+        let token = required_str(params, "token")?;
+        let now = self.operator_now();
+        let session = self.operator_auth().check_public(token, now)?;
+        Ok(json!({"valid": session.is_some(), "session": session}))
+    }
+
+    /// A refused assertion is loud — `board_assertion_rejected` records
+    /// the refusal's code (never the assertion or key material).
+    fn board_rejected(&self, code: &'static str, message: &str) -> Error {
+        let _ = self.store.event_public(
+            DAEMON_ALIAS,
+            "board_assertion_rejected",
+            json!({"reason": code}),
+        );
+        Error::invalid(code, message)
     }
 
     pub(super) fn rpc_operator_session_logout(&self, params: &Value) -> Result<Value> {

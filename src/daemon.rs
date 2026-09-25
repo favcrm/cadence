@@ -561,6 +561,10 @@ pub struct Shared {
     /// CAD-313: the clock links and sessions expire by (epoch seconds) —
     /// the wall clock in production, injectable in tests.
     operator_clock: Arc<dyn Fn() -> i64 + Send + Sync>,
+    /// CAD-526: the platform JWKS the board-identity assertions verify
+    /// against — short-lived cache, refetched on an unknown `kid`
+    /// ([`crate::board_identity::JwksCache`]).
+    board_jwks: Mutex<crate::board_identity::JwksCache>,
     /// CAD-366: where enrolled platform credential bytes live — the
     /// host's keychain when usable, else the daemon-owned `0600`
     /// store under the state dir (ADR 0006 §5.3).
@@ -659,6 +663,7 @@ impl Shared {
                 .operator_clock
                 .clone()
                 .unwrap_or_else(|| Arc::new(crate::issue::time::now_epoch)),
+            board_jwks: Mutex::new(crate::board_identity::JwksCache::default()),
             platform_custody: crate::platform::Custody::open(state_dir)?,
             platform_custody_lock: Mutex::new(()),
         });
@@ -2553,6 +2558,8 @@ impl Shared {
             "operator_link_mint" => self.rpc_operator_link_mint(params, peer_pid),
             "operator_session_open" => self.rpc_operator_session_open(params, peer_pid),
             "operator_session_check" => self.rpc_operator_session_check(params),
+            "board_session_open" => self.rpc_board_session_open(params, peer_pid),
+            "board_session_check" => self.rpc_board_session_check(params),
             "operator_session_logout" => self.rpc_operator_session_logout(params),
             "operator_session_stolen" => self.rpc_operator_session_stolen(params),
             "operator_sessions" => self.rpc_operator_sessions(params, peer_pid),

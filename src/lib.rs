@@ -11,6 +11,7 @@
 pub mod adapter;
 pub mod audit;
 pub mod backup;
+pub mod board_identity;
 pub mod client;
 pub mod confine;
 pub mod continuity;
