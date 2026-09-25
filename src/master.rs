@@ -340,6 +340,14 @@ pub fn confinement(inputs: &ConfineInputs) -> crate::confine::Policy {
         &Value::Null,
         ALIAS,
     ));
+    // CAD-524: a state dir inside a sandbox gates every `cadence` verb
+    // the master runs — `sandbox::adopt` → `owner_of` must READ the
+    // root's marker, and Landlock permits lstat without a grant but not
+    // the file read. Grant the marker FILE, never the root. Production
+    // state dirs aren't `<root>/state` beside a marker — nothing added.
+    if let Some(marker) = crate::sandbox::marker_for(&inputs.state_dir) {
+        read.push(marker);
+    }
     write.push(workdir(&inputs.state_dir));
     write.push(tmpdir(&inputs.state_dir));
     write.push(inputs.provider_dir.clone());

@@ -939,6 +939,131 @@ fn confine_denies_everything_unlisted() {
     assert!(!o.status.success(), "{o:?}");
 }
 
+/// CAD-524: the confined master inside a sandbox can run `cadence` at
+/// all. `main` calls `sandbox::adopt` → `owner_of`, which lstats
+/// `<root>/.cadence-sandbox` (Landlock allows the metadata lookup) and
+/// then READS it — ungranted, that read is EACCES and every verb is
+/// refused before dispatch ("marker is unusable … refusing to run it
+/// ungated"). Both providers' emitted policies must grant the marker
+/// FILE read — never the root — witnessed end-to-end by `issue ls`
+/// exec'd through `cadence confine` the way the daemon wraps the
+/// master's commands. A non-sandbox state dir emits no grant, so the
+/// production policy is unchanged.
+#[test]
+fn confined_master_in_a_sandbox_can_run_cadence() {
+    if cadence_agent::confine::available().is_err() {
+        eprintln!("no Landlock on this host — confined path skipped");
+        return;
+    }
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("sbx524");
+    let state = root.join("state");
+    let pm = root.join("pm");
+    let marker = root.join(".cadence-sandbox");
+    std::fs::create_dir_all(pm.join("demo")).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(&marker, "{\"name\": \"sbx524\"}\n").unwrap();
+    std::fs::write(pm.join("pm.yaml"), "schema: 1\n").unwrap();
+    std::fs::write(
+        pm.join("demo").join("project.yaml"),
+        "key: demo\nprefix: D\n",
+    )
+    .unwrap();
+
+    // The daemon env the emitted policies are computed from: `cadence`
+    // resolves on PATH (this build, via a link), the sandbox tracker is
+    // CADENCE_PM_DIR, and confine runs the real binary.
+    let bin_dir = tmp.path().join("bin");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let exe = env!("CARGO_BIN_EXE_cadence");
+    std::os::unix::fs::symlink(exe, bin_dir.join("cadence")).unwrap();
+    let env = cadence_agent::adapter::ProviderEnv::default();
+    env.set("PATH", bin_dir.to_string_lossy().to_string());
+    env.set("HOME", home.to_string_lossy().to_string());
+    env.set("CADENCE_PM_DIR", pm.to_string_lossy().to_string());
+    env.set("CADENCE_CONFINE_COMMAND", exe);
+
+    let policies = [
+        (
+            "claude",
+            cadence_agent::adapter::claude::master_confinement(&env, &state).1,
+        ),
+        (
+            "pi",
+            cadence_agent::adapter::pi::pi_master_confinement(&env, &state).1,
+        ),
+    ];
+    for (provider, policy) in &policies {
+        // The marker FILE is readable — read-only, and nothing wider:
+        // no granted path may be the root or an ancestor of it.
+        assert!(policy.read.contains(&marker), "{provider}: {policy:?}");
+        assert!(!policy.write.contains(&marker), "{provider}: {policy:?}");
+        for granted in policy.read.iter().chain(&policy.write) {
+            assert!(
+                !root.starts_with(granted),
+                "{provider} widens the sandbox root via {granted:?}"
+            );
+        }
+        // The daemon's own wrapping: confine + policy, exec'ing
+        // `cadence --state-dir <root>/state issue ls --project demo`.
+        let mut argv = policy.to_args();
+        argv.extend([
+            "--".into(),
+            exe.into(),
+            "--state-dir".into(),
+            state.to_string_lossy().into_owned(),
+            "issue".into(),
+            "ls".into(),
+            "--project".into(),
+            "demo".into(),
+            "--json".into(),
+        ]);
+        let o = std::process::Command::new(exe)
+            .args(["--state-dir", "/tmp"])
+            .arg("confine")
+            .args(&argv)
+            .env("HOME", &home)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{provider}: {o:?}");
+        let out: Value = serde_json::from_slice(&o.stdout)
+            .unwrap_or_else(|_| panic!("{provider} stdout: {o:?}"));
+        assert_eq!(out["issues"], json!([]), "{provider}");
+    }
+
+    // Production: a state dir that is not `<root>/state` beside a
+    // marker — neither layout emits a marker grant, so the policy is
+    // unchanged. Two shapes: not named `state`, and `state` with no
+    // marker file beside it.
+    for sd in [
+        tmp.path().join("prod"),
+        tmp.path().join("prod2").join("state"),
+    ] {
+        std::fs::create_dir_all(&sd).unwrap();
+        for (provider, policy) in [
+            (
+                "claude",
+                cadence_agent::adapter::claude::master_confinement(&env, &sd).1,
+            ),
+            (
+                "pi",
+                cadence_agent::adapter::pi::pi_master_confinement(&env, &sd).1,
+            ),
+        ] {
+            assert!(
+                !policy
+                    .read
+                    .iter()
+                    .chain(&policy.write)
+                    .any(|p| p.ends_with(".cadence-sandbox")),
+                "{provider} grants a sandbox marker for {sd:?}: {policy:?}"
+            );
+        }
+    }
+}
+
 /// CAD-439 ACCEPTANCE: the master's process tree reads nothing outside
 /// its views. Claude Code auto-allows read-only Bash commands (`cat`,
 /// `id`, `echo <glob>` …) even under `dontAsk`, so the boundary is the
