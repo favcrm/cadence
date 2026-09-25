@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:cadence:contracts:connected-platform:v1:pending-effect",
   "title": "Pending-effect record (ADR 0006 §5.4)",
-  "description": "One staged send-class call awaiting the press: a brokered request of kind \"effect\" backed by a durable row keyed by effect_id. One effect = one request = one execution. Field rules are §5.4; conditional requirements below encode the lifecycle invariants (a closed row names its close reason; decided-or-later rows carry the recorded decision; only ran-to-outcome rows carry outcome).",
+  "description": "One staged send-class call awaiting the press: a brokered request of kind \"effect\" backed by a durable row keyed by effect_id. One effect = one request = one execution. Field rules are §5.4; conditional requirements below encode the lifecycle invariants (a closed row names its close reason; decided-or-later rows carry the recorded decision; waiting and closed rows carry none — a cancelled-before-release row never saw an effective press; only ran-to-outcome rows carry outcome).",
   "type": "object",
   "required": [
     "request",
@@ -180,6 +180,15 @@
         "required": ["state"]
       },
       "then": { "not": { "required": ["outcome"] } }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": { "enum": ["waiting", "closed"] }
+        },
+        "required": ["state"]
+      },
+      "then": { "not": { "required": ["decision"] } }
     }
   ]
 }

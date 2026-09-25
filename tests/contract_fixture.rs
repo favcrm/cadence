@@ -26,7 +26,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use cadence_agent::contract_fixture::{
-    classify_call, Effect, FakeAdapter, PendingDecision, PendingEffect, PendingOutcome,
+    classify_call, Effect, FakePlatform, PendingDecision, PendingEffect, PendingOutcome,
     PendingPresser, ReadBack, ToolTable, Verified, FIXTURE_DIR, TOOL_TABLE_JSON,
 };
 use serde_json::{json, Value};
@@ -63,6 +63,8 @@ const REQUIRED_VECTORS: &[&str] = &[
     "manifest-version-mismatch-parks",
     "effect-argument-ignored",
     "send-stages-executes-on-accept",
+    "non-operator-accept-refused",
+    "agent-decline-allowed",
     "decline-never-fires",
     "source-edit-cancels",
     "verified-false-raises-needs-you",
@@ -98,7 +100,7 @@ fn fake_tool_table_conforms_to_schema() {
     let on_disk = std::fs::read_to_string(fixture_dir().join("fake-tool-table.json")).unwrap();
     assert_eq!(TOOL_TABLE_JSON, on_disk);
     assert_eq!(
-        FakeAdapter::standard().table().manifest_version.as_deref(),
+        FakePlatform::standard().table().manifest_version.as_deref(),
         Some("1")
     );
 }
@@ -281,9 +283,19 @@ fn vector_expectations_match_contract_classification() {
                     }
                 }
                 "press" => {
-                    expect["press"].as_str().unwrap_or_else(|| {
+                    let press = expect["press"].as_str().unwrap_or_else(|| {
                         panic!("vector {id} step {i}: press step lacks expect.press")
                     });
+                    // C6: release is operator-only. A vector claiming a
+                    // non-operator accept took must not exist.
+                    if step["decision"].as_str() == Some("accept")
+                        && step["by"]["role"].as_str() != Some("operator")
+                    {
+                        assert_eq!(
+                            press, "refused",
+                            "vector {id} step {i}: non-operator accept must be refused (C6)"
+                        );
+                    }
                 }
                 _ => {}
             }
@@ -317,7 +329,8 @@ fn typed_pending_effect_serializes_to_schema() {
         decision: None,
         outcome: None,
     };
-    let errors = errors_of(&validator, &serde_json::to_value(&waiting).unwrap());
+    let waiting_json = serde_json::to_value(&waiting).unwrap();
+    let errors = errors_of(&validator, &waiting_json);
     assert!(errors.is_empty(), "waiting specimen invalid: {errors:?}");
 
     let done = PendingEffect {
@@ -357,13 +370,39 @@ fn typed_pending_effect_serializes_to_schema() {
         !validator.is_valid(&declined_with_outcome),
         "a declined row carrying outcome must be rejected"
     );
+
+    // waiting and closed rows never carry a decision: the closed case
+    // is a cancelled-before-release row — no effective press exists.
+    let mut waiting_with_decision = waiting_json.clone();
+    waiting_with_decision["decision"] = serialized["decision"].clone();
+    assert!(
+        !validator.is_valid(&waiting_with_decision),
+        "a waiting row carrying decision must be rejected"
+    );
+    let mut closed_with_decision = waiting_json;
+    closed_with_decision["state"] = json!("closed");
+    closed_with_decision["close_reason"] = json!("source_changed");
+    closed_with_decision["decision"] = serialized["decision"].clone();
+    assert!(
+        !validator.is_valid(&closed_with_decision),
+        "a closed-before-press row carrying decision must be rejected"
+    );
+    // and the same closed row without the decision is valid.
+    closed_with_decision
+        .as_object_mut()
+        .unwrap()
+        .remove("decision");
+    assert!(
+        validator.is_valid(&closed_with_decision),
+        "a closed row with close_reason and no decision must validate"
+    );
 }
 
 #[test]
 fn fake_adapter_drives_the_contract_surface() {
     // The adapter the vectors describe: fixture table, deterministic
     // platform, no traffic until execute, idempotent keys, read-back.
-    let adapter = FakeAdapter::standard();
+    let adapter = FakePlatform::standard();
     assert_eq!(adapter.execution_count(), 0);
 
     // A read executes; the platform saw it once.
@@ -392,7 +431,7 @@ fn fake_adapter_drives_the_contract_surface() {
 #[test]
 fn fake_adapter_models_the_vector_knobs() {
     // given.adapter.fail → the platform call errors (a `failed` outcome).
-    let adapter = FakeAdapter::standard();
+    let adapter = FakePlatform::standard();
     adapter.fail_tool("widgets.publish", "platform rejected the deploy");
     assert!(adapter
         .execute("widgets.publish", &json!({"widget": "w1"}), "eff-1", None)

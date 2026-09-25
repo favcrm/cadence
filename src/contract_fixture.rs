@@ -1,7 +1,7 @@
-//! ADR 0006 §5.6 — the fake platform adapter behind the shared
+//! ADR 0006 §5.6 — the fake platform behind the shared
 //! connected-platform fixture in `contracts/connected-platform/v1/`.
 //!
-//! This is a test double, not a connector: it simulates the platform side
+//! Test support, not a live adapter: it simulates the platform side
 //! the proxy and effect gate (CAD-366/CAD-506) talk to, deterministically
 //! and with no network and no credentials. Its declared tool table is the
 //! fixture's own `fake-tool-table.json`, embedded at compile time, so the
@@ -249,8 +249,10 @@ pub enum ReadBack {
 }
 
 /// The deterministic platform-side double. Every knob a vector's
-/// `given.adapter` names lands here.
-pub struct FakeAdapter {
+/// `given.adapter` names lands here. Named `FakePlatform` — the platform
+/// end of the seam — to stay clear of `adapter::fake::FakeAdapter`, the
+/// provider/session double.
+pub struct FakePlatform {
     table: ToolTable,
     /// The manifest version the "platform" currently reports — the
     /// platform side of the pin, never a call argument.
@@ -272,7 +274,7 @@ pub struct FakeAdapter {
     seq: AtomicU64,
 }
 
-impl FakeAdapter {
+impl FakePlatform {
     /// The fixture's own table (`fake-tool-table.json`) with the platform
     /// reporting the table's pinned manifest version.
     pub fn standard() -> Self {
@@ -536,7 +538,7 @@ mod tests {
 
     #[test]
     fn execute_is_idempotent_on_the_key() {
-        let adapter = FakeAdapter::standard();
+        let adapter = FakePlatform::standard();
         let input = json!({"widget": "w1"});
         let first = adapter.execute("widgets.publish", &input, "eff-1", None);
         let second = adapter.execute("widgets.publish", &input, "eff-1", None);
@@ -551,7 +553,7 @@ mod tests {
 
     #[test]
     fn fault_and_read_back_knobs() {
-        let adapter = FakeAdapter::standard();
+        let adapter = FakePlatform::standard();
         adapter.fail_tool("widgets.publish", "platform rejected");
         let err = adapter
             .execute("widgets.publish", &json!({"widget": "w1"}), "eff-1", None)
@@ -573,7 +575,7 @@ mod tests {
 
     #[test]
     fn read_back_compares_applied_state() {
-        let adapter = FakeAdapter::standard();
+        let adapter = FakePlatform::standard();
         adapter
             .execute("widgets.publish", &json!({"widget": "w1"}), "eff-1", None)
             .unwrap();
@@ -589,7 +591,7 @@ mod tests {
 
     #[test]
     fn source_edits_change_the_hash() {
-        let adapter = FakeAdapter::standard();
+        let adapter = FakePlatform::standard();
         assert_eq!(adapter.source_hash("deploy-plan"), None);
         adapter.write_source("deploy-plan", "v1");
         let h1 = adapter.source_hash("deploy-plan").unwrap();

@@ -35,10 +35,11 @@ The path is the version: `contracts/connected-platform/v<N>/`.
 (`CARGO_MANIFEST_DIR/contracts/connected-platform/v1/`), validates the
 table and every vector against the schemas, asserts malformed tables
 are really rejected, and checks each vector's expectations against the
-contract's classification rules (C1–C3). A broken vector fails CI.
-Executing the vectors through the real gate is CAD-506's job; the seam
-is the `step`/`expect` vocabulary plus the fake adapter
-(`src/contract_fixture.rs`, `FakeAdapter::standard()`).
+contract's classification rules (C1–C3) and the C6 press-authority
+invariant. A broken vector fails CI. Executing the vectors through the
+real gate is CAD-506's job; the seam is the `step`/`expect` vocabulary
+plus the fake platform (`src/contract_fixture.rs`,
+`FakePlatform::standard()`).
 
 **AgenticOS** (AOS-49/52) — vendor or fetch this directory at a pinned
 cadence commit; treat it as immutable. Validate `vectors.json` and
@@ -115,6 +116,14 @@ it. The DSL, in full:
 - `record` — a pending-effect record specimen; consumers validate it
   against `pending-effect.schema.json`.
 
+The behavioural `expect` keys — `result`, `press`, `fired`,
+`executions`, `verified`, `needs_you`, `delivered`, `wait`, `state`,
+`close_reason`, `effect_id` — are asserted by CAD-506 when it executes
+the vectors against the real gate. This directory's own check
+(`tests/contract_fixture.rs`) proves only what data can prove: schema
+conformance, classification coherence (C1–C3, C6), and that specimen
+hashes match the declared source bytes.
+
 ### The scenario list and what each proves
 
 | vector | contract |
@@ -128,6 +137,8 @@ it. The DSL, in full:
 | `manifest-version-undeclared-parks` | platform reports no manifest ⇒ send (§5.2) |
 | `effect-argument-ignored` | `arguments.effect` is ignored in both directions (C2) |
 | `send-stages-executes-on-accept` | `staged` + `effect_id`, handle dedupe, accept executes once, `verified:true`, outcome as message, second press refused (C5, C6, C9, C10) |
+| `non-operator-accept-refused` | release is operator-only: PM and requesting-agent accepts are refused and leave the row `waiting`; the operator's accept still executes once (C6, §5.4 step 4) |
+| `agent-decline-allowed` | a PM that is itself an agent may decline — decline is not release (C6, §5.4 step 4) |
 | `decline-never-fires` | decline parks the reason, nothing executes; `declined` is terminal (§5.4) |
 | `source-edit-cancels` | editing a hashed source while waiting closes the row `source_changed` (§5.4 step 3) |
 | `press-rechecks-source` | Execute re-verifies `source_hash`; a missed edit still cancels on press (§5.4 step 3) |
@@ -139,7 +150,7 @@ it. The DSL, in full:
 
 ## The fake adapter
 
-`src/contract_fixture.rs` ships `FakeAdapter`: the deterministic
+`src/contract_fixture.rs` ships `FakePlatform`: the deterministic
 platform-side double these vectors describe — this directory's
 `fake-tool-table.json` as its declared table, a recorded execution log
 ("did it fire?"), idempotency-key dedupe (C9), source artifacts with

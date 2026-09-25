@@ -510,6 +510,171 @@
       ]
     },
     {
+      "id": "non-operator-accept-refused",
+      "summary": "Release is operator-only in v1 (C6, §5.4 step 4): a PM pressing accept is refused, and the requesting agent pressing accept — an agent answering its own pending effect — is refused. Neither refusal touches the row: it stays waiting, nothing fires, and the operator's accept afterwards still executes once.",
+      "contract": [
+        "C6",
+        "§5.4"
+      ],
+      "given": {
+        "tool_table": "default",
+        "reported_manifest_version": "1",
+        "agent": "swe-505",
+        "account": "acct-1"
+      },
+      "steps": [
+        {
+          "action": "call",
+          "tool": "widgets.publish",
+          "arguments": {
+            "widget": "w1"
+          },
+          "expect": {
+            "result": "staged",
+            "effect_id": true,
+            "fired": false,
+            "executions": 0,
+            "state": "waiting"
+          }
+        },
+        {
+          "action": "press",
+          "decision": "accept",
+          "by": {
+            "member": "op-pm",
+            "role": "pm",
+            "rule": "operator-only"
+          },
+          "expect": {
+            "press": "refused",
+            "fired": false,
+            "executions": 0,
+            "state": "waiting",
+            "record": {
+              "request": "req-c6-1",
+              "kind": "effect",
+              "agent": "swe-505",
+              "platform": "fixture",
+              "account": "acct-1",
+              "tool": "widgets.publish",
+              "effect": "send",
+              "input_summary": "widgets.publish widget=w1",
+              "input": {
+                "widget": "w1"
+              },
+              "preview": "publish w1 to fixture/acct-1",
+              "label": "deploy",
+              "effect_id": "eff-c6-1",
+              "state": "waiting"
+            }
+          }
+        },
+        {
+          "action": "press",
+          "decision": "accept",
+          "by": {
+            "member": "swe-505",
+            "role": "agent",
+            "rule": "operator-only"
+          },
+          "expect": {
+            "press": "refused",
+            "fired": false,
+            "executions": 0,
+            "state": "waiting"
+          }
+        },
+        {
+          "action": "press",
+          "decision": "accept",
+          "by": {
+            "member": "operator",
+            "role": "operator",
+            "rule": "operator-only"
+          },
+          "expect": {
+            "press": "applied",
+            "fired": true,
+            "executions": 1,
+            "state": "done",
+            "verified": true,
+            "delivered": "message"
+          }
+        }
+      ]
+    },
+    {
+      "id": "agent-decline-allowed",
+      "summary": "Decline stays open to anyone authorised (C6, §5.4 step 4) — including a PM that is itself an agent. The decline applies, parks the reason, never fires; only release is gated on the operator.",
+      "contract": [
+        "C6",
+        "§5.4"
+      ],
+      "given": {
+        "tool_table": "default",
+        "reported_manifest_version": "1",
+        "agent": "swe-505",
+        "account": "acct-1"
+      },
+      "steps": [
+        {
+          "action": "call",
+          "tool": "widgets.publish",
+          "arguments": {
+            "widget": "w1"
+          },
+          "expect": {
+            "result": "staged",
+            "effect_id": true,
+            "fired": false,
+            "state": "waiting"
+          }
+        },
+        {
+          "action": "press",
+          "decision": "decline",
+          "reason": "wrong window",
+          "by": {
+            "member": "pm-agent",
+            "role": "agent",
+            "rule": "authorised-decline"
+          },
+          "expect": {
+            "press": "applied",
+            "fired": false,
+            "executions": 0,
+            "state": "declined",
+            "record": {
+              "request": "req-c6-2",
+              "kind": "effect",
+              "agent": "swe-505",
+              "platform": "fixture",
+              "account": "acct-1",
+              "tool": "widgets.publish",
+              "effect": "send",
+              "input_summary": "widgets.publish widget=w1",
+              "input": {
+                "widget": "w1"
+              },
+              "preview": "publish w1 to fixture/acct-1",
+              "label": "deploy",
+              "effect_id": "eff-c6-2",
+              "state": "declined",
+              "decision": {
+                "by": {
+                  "member": "pm-agent",
+                  "role": "agent",
+                  "rule": "authorised-decline"
+                },
+                "at": "2026-09-25T06:20:00Z",
+                "reason": "wrong window"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
       "id": "source-edit-cancels",
       "summary": "Editing the source artifact a staged send was hashed from cancels the pending effect while it waits (§5.4 step 3): the row closes source_changed and nothing fires.",
       "contract": [
@@ -547,7 +712,27 @@
             "state": "closed",
             "close_reason": "source_changed",
             "fired": false,
-            "executions": 0
+            "executions": 0,
+            "record": {
+              "request": "req-source-edit-1",
+              "kind": "effect",
+              "agent": "swe-505",
+              "platform": "fixture",
+              "account": "acct-1",
+              "tool": "widgets.publish",
+              "effect": "send",
+              "input_summary": "widgets.publish widget=w1 (deploy-plan)",
+              "input": {
+                "widget": "w1",
+                "source": "deploy-plan"
+              },
+              "preview": "publish w1 to fixture/acct-1 from deploy-plan@sha256:ee7dbcc52faa7b9d053af4ae05dd7f061f0798acd11a9585c0e7ca02c4b945c6",
+              "source_hash": "sha256:ee7dbcc52faa7b9d053af4ae05dd7f061f0798acd11a9585c0e7ca02c4b945c6",
+              "label": "deploy",
+              "effect_id": "eff-source-edit-1",
+              "state": "closed",
+              "close_reason": "source_changed"
+            }
           }
         }
       ]
@@ -791,7 +976,32 @@
           "expect": {
             "state": "reconcile",
             "fired": false,
-            "executions": 0
+            "executions": 0,
+            "record": {
+              "request": "req-reconcile-1",
+              "kind": "effect",
+              "agent": "swe-505",
+              "platform": "fixture",
+              "account": "acct-1",
+              "tool": "widgets.publish",
+              "effect": "send",
+              "input_summary": "widgets.publish widget=w1",
+              "input": {
+                "widget": "w1"
+              },
+              "preview": "publish w1 to fixture/acct-1",
+              "label": "deploy",
+              "effect_id": "eff-reconcile-1",
+              "state": "reconcile",
+              "decision": {
+                "by": {
+                  "member": "operator",
+                  "role": "operator",
+                  "rule": "operator-only"
+                },
+                "at": "2026-09-25T06:30:00Z"
+              }
+            }
           }
         }
       ]

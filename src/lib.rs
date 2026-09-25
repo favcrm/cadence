@@ -14,6 +14,9 @@ pub mod backup;
 pub mod client;
 pub mod confine;
 pub mod continuity;
+// Test support for the shared ADR 0006 fixture — a deterministic
+// platform double, not a live adapter. Hidden from the public API docs.
+#[doc(hidden)]
 pub mod contract_fixture;
 pub mod daemon;
 pub mod delivery;
