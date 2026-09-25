@@ -31,6 +31,9 @@ use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+
 // The identity constants are spelled out in `cadence-agent-exec`'s
 // `policy` module as well; the audit re-derives them from the host so
 // a drift between this list and the helper's fixed sources is itself
@@ -63,6 +66,11 @@ pub const REPOS_DEFAULT_ACL_PERMS: u8 = 0b111; // rwX
 /// warns rather than claiming the negative.
 pub const HOME_ACL_WALK_BUDGET: usize = 100_000;
 
+/// `View::read_file`'s bound — config reads (gitconfig, `include.path`
+/// targets) are attacker-influenceable files read as root: never more
+/// than this many bytes, never a fifo, never through a symlink.
+pub const READ_CAP: u64 = 1 << 20;
+
 /// A passwd entry, resolved through the view.
 #[derive(Clone, Debug)]
 pub struct User {
@@ -94,6 +102,10 @@ pub struct Meta {
     pub mode: u32,
     pub is_dir: bool,
     pub is_file: bool,
+    /// True when the path *itself* is a symlink — the lstat verdict.
+    /// No verb in this lane ever follows one: a symlink anywhere in a
+    /// §5 path is a refusal (ADR §7), never a redirect.
+    pub is_symlink: bool,
 }
 
 /// One POSIX ACL entry — `e_tag`/`e_perm` decoded; ids are numeric
@@ -136,13 +148,36 @@ pub trait View {
     fn acl_supported(&self) -> bool {
         true
     }
+    /// Every account on the host — uid-collision checks need the
+    /// whole passwd map, not just the named lookups.
+    fn users(&self) -> io::Result<Vec<User>>;
+    /// The user's full group vector — primary gid plus every
+    /// supplementary membership (`getgrouplist(3)`). Memberships
+    /// granted outside the spec groups still reach the agent domain,
+    /// so the audit folds them into the principal set.
+    fn member_gids(&self, user: &User) -> io::Result<Vec<u32>>;
+    /// Read a config file bounded: a regular file only, at most
+    /// [`READ_CAP`] bytes, never opened through a symlink — an
+    /// include target can name a fifo and the audit must not hang
+    /// as root.
     fn read_file(&self, path: &str) -> io::Result<Vec<u8>>;
+    /// Where a symlink points — `readlink(2)`, the link itself only.
+    /// The git-config sweep resolves links it refuses to *open* so a
+    /// symlinked include into the agent domain still flags.
+    fn read_link(&self, path: &str) -> io::Result<PathBuf>;
+    /// The file's sha256, streamed — the helper's byte-compare reads
+    /// a multi-MB binary, so it hashes instead of loading.
+    fn file_sha256(&self, path: &str) -> io::Result<[u8; 32]>;
+    /// Vet a helper *source* path and return its sha256 in one
+    /// fd-atomic step: `O_NOFOLLOW`, regular file, trusted owner, not
+    /// group/other-writable — then hash the opened fd, so a path swap
+    /// between vetting and hashing cannot smuggle other bytes in.
+    /// `src` is a real filesystem path (not root-relative).
+    fn helper_source(&self, src: &Path) -> io::Result<[u8; 32]>;
     /// Every entry under `dir` (symlinks not followed), budgeted —
     /// `(paths, truncated)`.
     fn walk(&self, dir: &str, budget: usize) -> io::Result<(Vec<String>, bool)>;
     fn env(&self, key: &str) -> Option<String>;
-    /// All env vars with `prefix` — `GIT_CONFIG_KEY_`* enumeration.
-    fn env_prefixed(&self, prefix: &str) -> Vec<(String, String)>;
 }
 
 /// The write surface provision adds. Each method is the *verb* the
@@ -188,13 +223,26 @@ pub struct NewUser {
 /// audit reads through it.
 pub struct LiveHost {
     root: PathBuf,
+    /// Uids allowed to own a path component provision writes
+    /// *through*: `{0}` plus the operator's uid once `cli` resolves
+    /// it. The agent's uid is never admitted — an agent-owned
+    /// intermediate directory means the agent controls a prefix of
+    /// the path, and every write under it is refused.
+    trusted_uids: BTreeSet<u32>,
 }
 
 impl LiveHost {
     pub fn new() -> Self {
         LiveHost {
             root: PathBuf::from("/"),
+            trusted_uids: BTreeSet::from([0]),
         }
+    }
+
+    /// The operator's uid joins the trusted set once resolved —
+    /// `/var/lib/cadence` is operator-owned by spec.
+    pub fn trust_uid(&mut self, uid: u32) {
+        self.trusted_uids.insert(uid);
     }
 
     /// The logical path `/a/b` on the real disk: `<root>/a/b`.
@@ -216,9 +264,21 @@ impl Default for LiveHost {
     }
 }
 
+/// Root's toolbelt: `groupadd`/`useradd`/`usermod`/`setfacl` run by
+/// absolute path under a scrubbed environment — provision executes as
+/// uid 0 with an otherwise-inherited env, so neither PATH resolution
+/// nor env-carried config may reach the child.
 fn command(prog: &str, args: &[&str]) -> io::Result<()> {
-    let mut cmd = std::process::Command::new(prog);
-    cmd.args(args).stdin(std::process::Stdio::null());
+    let resolved = ["/usr/sbin", "/sbin", "/usr/bin", "/bin"]
+        .iter()
+        .map(|d| format!("{d}/{prog}"))
+        .find(|p| Path::new(p).is_file())
+        .unwrap_or_else(|| prog.to_string());
+    let mut cmd = std::process::Command::new(&resolved);
+    cmd.args(args)
+        .stdin(std::process::Stdio::null())
+        .env_clear()
+        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin");
     let out = crate::reaper::output(&mut cmd)?;
     if out.status.success() {
         Ok(())
@@ -232,6 +292,31 @@ fn command(prog: &str, args: &[&str]) -> io::Result<()> {
     }
 }
 
+/// libc's `*mut c_char` fields → owned String — the shared extractor
+/// for passwd/group entries.
+#[cfg(unix)]
+unsafe fn cstr_field(p: *const libc::c_char) -> String {
+    if p.is_null() {
+        String::new()
+    } else {
+        unsafe { std::ffi::CStr::from_ptr(p) }
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
+#[cfg(unix)]
+fn user_from(pw: &libc::passwd, locked: Option<bool>) -> User {
+    User {
+        name: unsafe { cstr_field(pw.pw_name) },
+        uid: pw.pw_uid,
+        gid: pw.pw_gid,
+        home: unsafe { cstr_field(pw.pw_dir) },
+        shell: unsafe { cstr_field(pw.pw_shell) },
+        locked,
+    }
+}
+
 #[cfg(unix)]
 fn passwd_entry(name: &str) -> Option<User> {
     use std::ffi::CString;
@@ -241,23 +326,7 @@ fn passwd_entry(name: &str) -> Option<User> {
         return None;
     }
     let pw = unsafe { *pw };
-    let s = |p: *const libc::c_char| {
-        if p.is_null() {
-            String::new()
-        } else {
-            unsafe { std::ffi::CStr::from_ptr(p) }
-                .to_string_lossy()
-                .into_owned()
-        }
-    };
-    Some(User {
-        name: s(pw.pw_name),
-        uid: pw.pw_uid,
-        gid: pw.pw_gid,
-        home: s(pw.pw_dir),
-        shell: s(pw.pw_shell),
-        locked: shadow_locked(pw.pw_name),
-    })
+    Some(user_from(&pw, shadow_locked(pw.pw_name)))
 }
 
 /// The password-lock bit lives in /etc/shadow, readable only to root —
@@ -290,15 +359,6 @@ fn group_entry(name: &str) -> Option<Group> {
 
 #[cfg(unix)]
 fn group_from(gr: libc::group) -> Group {
-    let s = |p: *const libc::c_char| {
-        if p.is_null() {
-            String::new()
-        } else {
-            unsafe { std::ffi::CStr::from_ptr(p) }
-                .to_string_lossy()
-                .into_owned()
-        }
-    };
     let mut members = BTreeSet::new();
     let mut i = 0;
     loop {
@@ -306,11 +366,11 @@ fn group_from(gr: libc::group) -> Group {
         if p.is_null() {
             break;
         }
-        members.insert(s(p));
+        members.insert(unsafe { cstr_field(p) });
         i += 1;
     }
     Group {
-        name: s(gr.gr_name),
+        name: unsafe { cstr_field(gr.gr_name) },
         gid: gr.gr_gid,
         members,
     }
@@ -393,6 +453,7 @@ impl View for LiveHost {
             mode: md.mode() & 0o7777,
             is_dir: md.is_dir(),
             is_file: md.is_file(),
+            is_symlink: md.file_type().is_symlink(),
         }))
     }
 
@@ -412,8 +473,97 @@ impl View for LiveHost {
         cfg!(target_os = "linux")
     }
 
+    fn users(&self) -> io::Result<Vec<User>> {
+        #[cfg(unix)]
+        {
+            let mut out = Vec::new();
+            unsafe { libc::setpwent() };
+            loop {
+                let pw = unsafe { libc::getpwent() };
+                if pw.is_null() {
+                    break;
+                }
+                // `locked` stays None here — shadow lookups per
+                // account buy nothing for a uid-collision sweep.
+                out.push(user_from(unsafe { &*pw }, None));
+            }
+            unsafe { libc::endpwent() };
+            Ok(out)
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Vec::new())
+        }
+    }
+
+    fn member_gids(&self, user: &User) -> io::Result<Vec<u32>> {
+        #[cfg(unix)]
+        {
+            use std::ffi::CString;
+            let name = CString::new(user.name.clone())
+                .map_err(|_| io::Error::other("user name carries NUL"))?;
+            let mut count: libc::c_int = 0;
+            unsafe {
+                libc::getgrouplist(
+                    name.as_ptr(),
+                    user.gid as libc::gid_t,
+                    std::ptr::null_mut(),
+                    &mut count,
+                )
+            };
+            let mut buf = vec![0 as libc::gid_t; count.max(0) as usize + 1];
+            let mut gids = vec![user.gid];
+            // A membership that grows between calls makes the second
+            // call fail with the needed size in `n` — grow and retry,
+            // bounded, rather than audit a truncated group vector.
+            for _ in 0..4 {
+                let mut n = buf.len() as libc::c_int;
+                let got = unsafe {
+                    libc::getgrouplist(
+                        name.as_ptr(),
+                        user.gid as libc::gid_t,
+                        buf.as_mut_ptr(),
+                        &mut n,
+                    )
+                };
+                if got >= 0 {
+                    gids.extend(buf[..n.max(0) as usize].iter().copied());
+                    break;
+                }
+                buf.resize(n.max(0) as usize + 1, 0);
+            }
+            gids.sort_unstable();
+            gids.dedup();
+            Ok(gids)
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(vec![user.gid])
+        }
+    }
+
     fn read_file(&self, path: &str) -> io::Result<Vec<u8>> {
-        std::fs::read(self.phys(path))
+        bounded_read(&self.phys(path), path)
+    }
+
+    fn read_link(&self, path: &str) -> io::Result<PathBuf> {
+        std::fs::read_link(self.phys(path))
+    }
+
+    fn file_sha256(&self, path: &str) -> io::Result<[u8; 32]> {
+        sha256_path(&self.phys(path))
+    }
+
+    #[cfg(unix)]
+    fn helper_source(&self, src: &Path) -> io::Result<[u8; 32]> {
+        let f = open_verified_source(src, &self.trusted_uids)?;
+        sha256_file(&f)
+    }
+
+    #[cfg(not(unix))]
+    fn helper_source(&self, src: &Path) -> io::Result<[u8; 32]> {
+        let _ = src;
+        Err(io::Error::other("helper_source: unix only"))
     }
 
     fn walk(&self, dir: &str, budget: usize) -> io::Result<(Vec<String>, bool)> {
@@ -445,18 +595,6 @@ impl View for LiveHost {
 
     fn env(&self, key: &str) -> Option<String> {
         std::env::var_os(key).map(|v| v.to_string_lossy().into_owned())
-    }
-
-    fn env_prefixed(&self, prefix: &str) -> Vec<(String, String)> {
-        std::env::vars_os()
-            .filter(|(k, _)| k.to_string_lossy().starts_with(prefix))
-            .map(|(k, v)| {
-                (
-                    k.to_string_lossy().into_owned(),
-                    v.to_string_lossy().into_owned(),
-                )
-            })
-            .collect()
     }
 }
 
@@ -509,10 +647,34 @@ impl Host for LiveHost {
         )
     }
 
+    #[cfg(unix)]
     fn mkdir(&mut self, path: &str) -> io::Result<()> {
-        std::fs::create_dir_all(self.phys(path))
+        let phys = self.phys(path);
+        let name = phys
+            .file_name()
+            .ok_or_else(|| io::Error::other(format!("{path}: no final component")))?;
+        // The parent chain is walked fd-pinned — a symlinked
+        // intermediate refuses, it is never followed.
+        let pfd = open_pinned_dir(phys.parent(), &self.trusted_uids, true)?;
+        if let Err(e) = mkdirat(pfd.as_raw_fd(), name, 0o755) {
+            // Idempotent: an existing directory is fine, anything
+            // else (a symlink, a file) fails the verify-open.
+            if e.kind() == io::ErrorKind::AlreadyExists {
+                openat_dir(pfd.as_raw_fd(), name)?;
+                return Ok(());
+            }
+            return Err(e);
+        }
+        Ok(())
     }
 
+    #[cfg(not(unix))]
+    fn mkdir(&mut self, path: &str) -> io::Result<()> {
+        let _ = path;
+        Err(io::Error::other("mkdir: unix only"))
+    }
+
+    #[cfg(unix)]
     fn set_meta(&mut self, path: &str, owner: &str, group: &str, mode: u32) -> io::Result<()> {
         let owner_uid = self
             .user(owner)?
@@ -522,19 +684,23 @@ impl Host for LiveHost {
             .group(group)?
             .map(|g| g.gid)
             .ok_or_else(|| io::Error::other(format!("no such group: {group}")))?;
-        let phys = self.phys(path);
-        use std::os::unix::ffi::OsStrExt;
-        let c = std::ffi::CString::new(phys.as_os_str().as_bytes())
-            .map_err(|_| io::Error::other("path carries NUL"))?;
-        if unsafe { libc::chown(c.as_ptr(), owner_uid, group_gid) } != 0 {
+        let fd = open_pinned_dir(Some(&self.phys(path)), &self.trusted_uids, false)?;
+        if unsafe { libc::fchown(fd.as_raw_fd(), owner_uid, group_gid) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        if unsafe { libc::chmod(c.as_ptr(), mode as libc::mode_t) } != 0 {
+        if unsafe { libc::fchmod(fd.as_raw_fd(), mode as libc::mode_t) } != 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(())
     }
 
+    #[cfg(not(unix))]
+    fn set_meta(&mut self, path: &str, owner: &str, group: &str, mode: u32) -> io::Result<()> {
+        let _ = (path, owner, group, mode);
+        Err(io::Error::other("set_meta: unix only"))
+    }
+
+    #[cfg(unix)]
     fn install(
         &mut self,
         src: &Path,
@@ -543,22 +709,409 @@ impl Host for LiveHost {
         group: &str,
         mode: u32,
     ) -> io::Result<()> {
+        if !src.is_absolute() {
+            return Err(io::Error::other(format!(
+                "{}: the helper source must be an absolute path — under sudo the cwd is untrusted",
+                src.display()
+            )));
+        }
+        let mut srcf = open_verified_source(src, &self.trusted_uids)?;
+        let owner_uid = self
+            .user(owner)?
+            .map(|u| u.uid)
+            .ok_or_else(|| io::Error::other(format!("no such user: {owner}")))?;
+        let group_gid = self
+            .group(group)?
+            .map(|g| g.gid)
+            .ok_or_else(|| io::Error::other(format!("no such group: {group}")))?;
         let phys = self.phys(dest);
-        std::fs::copy(src, &phys)?;
-        self.set_meta(dest, owner, group, mode)
+        let name = phys
+            .file_name()
+            .ok_or_else(|| io::Error::other(format!("{dest}: no final component")))?;
+        let pfd = open_pinned_dir(phys.parent(), &self.trusted_uids, true)?;
+        let dfd = openat_file(pfd.as_raw_fd(), name)?;
+        let destf = std::fs::File::from(dfd);
+        copy_verified(&mut srcf, &destf)?;
+        if unsafe { libc::fchown(destf.as_raw_fd(), owner_uid, group_gid) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if unsafe { libc::fchmod(destf.as_raw_fd(), mode as libc::mode_t) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 
+    #[cfg(not(unix))]
+    fn install(
+        &mut self,
+        src: &Path,
+        dest: &str,
+        owner: &str,
+        group: &str,
+        mode: u32,
+    ) -> io::Result<()> {
+        let _ = (src, dest, owner, group, mode);
+        Err(io::Error::other("install: unix only"))
+    }
+
+    #[cfg(unix)]
     fn set_default_group_acl(&mut self, path: &str, group: &str, perms: u8) -> io::Result<()> {
+        // setfacl has no fd form — pin the directory first, then hand
+        // the tool the fd's procfs alias so a name swap between our
+        // check and its run cannot redirect the write.
+        let phys = self.phys(path);
+        let fd = open_pinned_dir(Some(&phys), &self.trusted_uids, false)?;
         const RWX: [&str; 8] = ["---", "--x", "-w-", "-wx", "r--", "r-x", "rw-", "rwx"];
+        let target = if cfg!(target_os = "linux") {
+            format!("/proc/{}/fd/{}", std::process::id(), fd.as_raw_fd())
+        } else {
+            phys.display().to_string()
+        };
         command(
             "setfacl",
             &[
                 "-m",
                 &format!("d:g:{group}:{}", RWX[(perms & 7) as usize]),
-                &self.phys(path).display().to_string(),
+                &target,
             ],
         )
     }
+
+    #[cfg(not(unix))]
+    fn set_default_group_acl(&mut self, path: &str, group: &str, perms: u8) -> io::Result<()> {
+        let _ = (path, group, perms);
+        Err(io::Error::other("set_default_group_acl: unix only"))
+    }
+}
+
+// ---------- fd-pinned writes (unix) ----------
+//
+// Provision writes paths under an operator-writable root —
+// `/var/lib/cadence` is uid-1000 after stage A, and today's agents
+// share that uid — so a planted symlink between assess and apply is a
+// real channel, not a theoretical one. Every write verb opens its
+// target the same way: `openat(O_NOFOLLOW|O_DIRECTORY)` per component
+// from the host root, every intermediate owned by a trusted uid, then
+// `fchown`/`fchmod`/`mkdirat`/`openat` act on the pinned fd — never on
+// the path.
+
+#[cfg(unix)]
+fn c_name(name: &std::ffi::OsStr) -> io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| io::Error::other("path component carries NUL"))
+}
+
+/// `open(2)` a directory — `O_NOFOLLOW` refuses a symlinked final
+/// component instead of following it.
+#[cfg(unix)]
+fn open_dir_fd(path: &Path) -> io::Result<std::os::unix::io::OwnedFd> {
+    use std::os::unix::io::FromRawFd;
+    let c = c_name(path.as_os_str())?;
+    let fd = unsafe {
+        libc::open(
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd) })
+}
+
+/// `openat(2)` one path component — `O_DIRECTORY|O_NOFOLLOW`.
+#[cfg(unix)]
+fn openat_dir(
+    dirfd: std::os::unix::io::RawFd,
+    name: &std::ffi::OsStr,
+) -> io::Result<std::os::unix::io::OwnedFd> {
+    use std::os::unix::io::FromRawFd;
+    let c = c_name(name)?;
+    let fd = unsafe {
+        libc::openat(
+            dirfd,
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn openat_file(
+    dirfd: std::os::unix::io::RawFd,
+    name: &std::ffi::OsStr,
+) -> io::Result<std::os::unix::io::OwnedFd> {
+    use std::os::unix::io::FromRawFd;
+    let c = c_name(name)?;
+    // O_NONBLOCK: a planted fifo opens without hanging, then fstat
+    // refuses it.
+    let fd = unsafe {
+        libc::openat(
+            dirfd,
+            c.as_ptr(),
+            libc::O_RDWR
+                | libc::O_CREAT
+                | libc::O_TRUNC
+                | libc::O_NOFOLLOW
+                | libc::O_CLOEXEC
+                | libc::O_NONBLOCK,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let fd = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd) };
+    let f = std::fs::File::from(fd);
+    if !f.metadata()?.is_file() {
+        return Err(io::Error::other(format!(
+            "{}: exists and is not a regular file — refusing",
+            name.to_string_lossy()
+        )));
+    }
+    Ok(f.into())
+}
+
+#[cfg(unix)]
+fn mkdirat(
+    dirfd: std::os::unix::io::RawFd,
+    name: &std::ffi::OsStr,
+    mode: libc::mode_t,
+) -> io::Result<()> {
+    let c = c_name(name)?;
+    if unsafe { libc::mkdirat(dirfd, c.as_ptr(), mode) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn fd_uid(fd: &std::os::unix::io::OwnedFd) -> io::Result<u32> {
+    use std::os::unix::io::AsRawFd;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(st.st_uid)
+}
+
+/// Open `dir` pinned through its whole chain from `/`: every
+/// component must be a real directory — `O_NOFOLLOW` refuses a
+/// symlink — and every *intermediate* must be owned by a trusted uid.
+/// `check_last_owner`: `true` when `dir` is the parent we will create
+/// or install under (its final component is an intermediate of the
+/// real target — the owner check applies); `false` when `dir` itself
+/// is the target (its owner may be the spec's — e.g. agent-owned
+/// `repos` — or is about to be repaired by the caller).
+/// The returned fd *is* `dir`; writes that act on it cannot be
+/// redirected by renaming the path afterwards.
+#[cfg(unix)]
+fn open_pinned_dir(
+    dir: Option<&Path>,
+    trusted: &BTreeSet<u32>,
+    check_last_owner: bool,
+) -> io::Result<std::os::unix::io::OwnedFd> {
+    use std::os::unix::io::AsRawFd;
+    let dir = dir.ok_or_else(|| io::Error::other("path has no parent chain"))?;
+    let mut comps: Vec<&std::ffi::OsStr> = Vec::new();
+    for c in dir.components() {
+        match c {
+            std::path::Component::RootDir => {}
+            std::path::Component::Normal(name) => comps.push(name),
+            _ => {
+                return Err(io::Error::other(format!(
+                    "{}: non-normal component — refusing",
+                    dir.display()
+                )))
+            }
+        }
+    }
+    let mut fd = open_dir_fd(Path::new("/"))?;
+    if !trusted.contains(&fd_uid(&fd)?) {
+        return Err(io::Error::other("/ is owned by an untrusted uid"));
+    }
+    let mut walked = PathBuf::from("/");
+    for (i, name) in comps.iter().enumerate() {
+        fd = openat_dir(fd.as_raw_fd(), name)?;
+        walked.push(name);
+        if (check_last_owner || i + 1 < comps.len()) && !trusted.contains(&fd_uid(&fd)?) {
+            return Err(io::Error::other(format!(
+                "{}: owned by an untrusted uid — refusing to descend",
+                walked.display()
+            )));
+        }
+    }
+    Ok(fd)
+}
+
+/// The helper-source gate (C2): the operator hands us a *path* — open
+/// it `O_NOFOLLOW`, then judge the fd: regular file only (the
+/// `O_NONBLOCK` keeps a fifo's open from hanging), owner in the
+/// trusted set (root or the operator — never the agent uid), and not
+/// writable by group/other. Anything else refuses rather than copies.
+#[cfg(unix)]
+pub(crate) fn open_verified_source(
+    src: &Path,
+    trusted: &BTreeSet<u32>,
+) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(src)?;
+    let md = f.metadata()?;
+    check_source(src, md.is_file(), md.mode() & 0o7777, md.uid(), trusted)?;
+    Ok(f)
+}
+
+/// What a vetted helper source must look like — shared so the fixture
+/// applies the identical rule to its (possibly forged) source meta.
+#[cfg(unix)]
+pub(crate) fn check_source(
+    src: &Path,
+    is_file: bool,
+    mode: u32,
+    uid: u32,
+    trusted: &BTreeSet<u32>,
+) -> io::Result<()> {
+    if !is_file {
+        return Err(io::Error::other(format!(
+            "{}: helper source is not a regular file — refusing",
+            src.display()
+        )));
+    }
+    if mode & 0o022 != 0 {
+        return Err(io::Error::other(format!(
+            "{}: helper source is group/other-writable ({mode:04o}) — refusing",
+            src.display()
+        )));
+    }
+    if !trusted.contains(&uid) {
+        return Err(io::Error::other(format!(
+            "{}: helper source owned by untrusted uid {uid} — refusing",
+            src.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Copy `src` to `dest` hashing both ends: what left the source is
+/// provably what the destination holds — on the opened fds, so a
+/// path swap mid-copy cannot redirect the install.
+#[cfg(unix)]
+pub(crate) fn copy_verified(src: &mut std::fs::File, dest: &std::fs::File) -> io::Result<()> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let mut w = dest;
+    let mut src_hash = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = src.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        src_hash.update(&buf[..n]);
+        w.write_all(&buf[..n])?;
+    }
+    w.sync_all()?;
+    w.seek(SeekFrom::Start(0))?;
+    let mut dest_hash = Sha256::new();
+    loop {
+        let n = w.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        dest_hash.update(&buf[..n]);
+    }
+    if src_hash.finalize() != dest_hash.finalize() {
+        return Err(io::Error::other(
+            "installed bytes differ from the verified source — refusing",
+        ));
+    }
+    Ok(())
+}
+
+/// Bounded, no-follow config read: `O_NOFOLLOW` refuses a symlinked
+/// path outright; `O_NONBLOCK` plus the regular-file check keeps a
+/// fifo from hanging the audit as root; [`READ_CAP`] keeps a huge
+/// include target from OOMing it.
+#[cfg(unix)]
+pub(crate) fn bounded_read(phys: &Path, logical: &str) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(phys)?;
+    let md = f.metadata()?;
+    if !md.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{logical}: not a regular file — refusing to read"),
+        ));
+    }
+    let mut buf = Vec::new();
+    f.take(READ_CAP + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > READ_CAP {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{logical}: exceeds the {READ_CAP}-byte config bound"),
+        ));
+    }
+    Ok(buf)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn bounded_read(_phys: &Path, logical: &str) -> io::Result<Vec<u8>> {
+    let _ = logical;
+    Err(io::Error::other("bounded_read: unix only"))
+}
+
+/// Streamed sha256 of an already-open file.
+#[cfg(unix)]
+pub(crate) fn sha256_file(mut f: &std::fs::File) -> io::Result<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    Ok(h.finalize().into())
+}
+
+/// Streamed sha256 of a path — `O_NOFOLLOW`, regular files only. Used
+/// for the helper byte-compare at assess time.
+#[cfg(unix)]
+pub(crate) fn sha256_path(phys: &Path) -> io::Result<[u8; 32]> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(phys)?;
+    if !f.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{}: not a regular file", phys.display()),
+        ));
+    }
+    sha256_file(&f)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn sha256_path(phys: &Path) -> io::Result<[u8; 32]> {
+    let bytes = std::fs::read(phys)?;
+    use sha2::{Digest, Sha256};
+    Ok(Sha256::digest(&bytes).into())
 }
 
 /// POSIX ACL xattr decoding — the format is `a_version` (u32 LE, ==2)
@@ -648,16 +1201,25 @@ pub struct AgentPrincipals {
 
 impl AgentPrincipals {
     pub fn resolve(view: &dyn View) -> io::Result<AgentPrincipals> {
-        let uid = view.user(AGENT_USER)?.map(|u| u.uid);
-        let mut gids = Vec::new();
+        let user = view.user(AGENT_USER)?;
+        let uid = user.as_ref().map(|u| u.uid);
+        let mut gids = BTreeSet::new();
         for name in [AGENT_USER, SHARED_GROUP] {
             if let Some(g) = view.group(name)? {
-                gids.push(g.gid);
+                gids.insert(g.gid);
+            }
+        }
+        // Every supplementary membership grants the agent too — a
+        // `usermod -aG docker cadence-agent` is invisible unless the
+        // whole group vector is enumerated.
+        if let Some(u) = &user {
+            for gid in view.member_gids(u)? {
+                gids.insert(gid);
             }
         }
         Ok(AgentPrincipals {
             uid,
-            gids,
+            gids: gids.into_iter().collect(),
             group_names: [AGENT_USER, SHARED_GROUP],
         })
     }

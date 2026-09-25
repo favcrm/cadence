@@ -1276,10 +1276,13 @@ enum AgentUidAction {
         /// proof artifact.
         #[arg(long)]
         dry_run: bool,
-        /// The built cadence-agent-exec to install. Default: beside
-        /// this binary, then target/{debug,release} under the cwd.
-        #[arg(long, value_name = "PATH")]
-        helper: Option<PathBuf>,
+        /// The built cadence-agent-exec to install — a required
+        /// absolute path. The binary being installed is the setuid
+        /// bridge the boundary rests on, so its source is always
+        /// chosen explicitly and never discovered from the cwd, which
+        /// under sudo may be agent-writable.
+        #[arg(long, value_name = "PATH", required = true)]
+        helper: PathBuf,
         /// The uid-1000 operator seat the boundary protects.
         #[arg(long, default_value = "ubuntu", value_name = "USER")]
         operator: String,

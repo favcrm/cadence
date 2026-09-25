@@ -136,7 +136,7 @@ pub fn audit(view: &dyn View, operator: &str) -> Audit {
     };
     let (_accounts, fs) = provision::plan(&spec);
     let mut rows = vec![
-        agent_user_row(view, &agent, provisioned),
+        agent_user_row(view, operator, &agent, provisioned),
         agent_groups_row(view, operator, &agent, provisioned),
     ];
     // The fs artifact rows reuse the plan: one row per directory tree,
@@ -230,7 +230,7 @@ fn artifact_row<'a>(
     row(name, false, level, value, detail, remedy)
 }
 
-fn agent_user_row(view: &dyn View, agent: &Option<User>, provisioned: bool) -> Row {
+fn agent_user_row(view: &dyn View, operator: &str, agent: &Option<User>, provisioned: bool) -> Row {
     let name = "agent-user";
     let Some(u) = agent else {
         return row(
@@ -249,6 +249,28 @@ fn agent_user_row(view: &dyn View, agent: &Option<User>, provisioned: bool) -> R
     let mut problems = Vec::new();
     if u.uid == 0 {
         problems.push("resolved to uid 0 — the account is root".to_string());
+    }
+    // A boundary between two accounts on the same uid is no
+    // boundary — the agent would own the operator's seat.
+    if let Ok(Some(op)) = view.user(operator) {
+        if u.uid == op.uid {
+            problems.push(format!(
+                "resolved to uid {} — the operator's own uid",
+                u.uid
+            ));
+        }
+    }
+    // A second account answering to the agent's uid is the same
+    // collision under another name.
+    if let Ok(users) = view.users() {
+        for other in users {
+            if other.uid == u.uid && other.name != AGENT_USER && other.name != operator {
+                problems.push(format!(
+                    "uid {} is shared with account {}",
+                    u.uid, other.name
+                ));
+            }
+        }
     }
     if u.shell != NOLOGIN {
         problems.push(format!("shell {} is not {NOLOGIN}", u.shell));
@@ -330,15 +352,19 @@ fn agent_groups_row(
                             .join(", ")
                     ));
                 }
-                // The shared edge only counts if both sides are in it.
-                if gname == SHARED_GROUP {
+                // The shared edge only counts if both sides are in
+                // it — and the launch edge must hold the operator, or
+                // the setuid helper refuses the seat it was built
+                // for. Membership is judged by the whole group vector
+                // (supplementary and primary alike).
+                if gname == SHARED_GROUP || gname == LAUNCH_GROUP {
                     for want in &allowed {
-                        let member = g.members.contains(want)
-                            || view
-                                .user(want)
-                                .ok()
-                                .flatten()
-                                .is_some_and(|u| u.gid == g.gid);
+                        let member = view
+                            .user(want)
+                            .ok()
+                            .flatten()
+                            .and_then(|u| view.member_gids(&u).ok())
+                            .is_some_and(|gids| gids.contains(&g.gid));
                         if !member {
                             problems.push(format!("{want} is not in {gname}"));
                         }
@@ -467,7 +493,39 @@ pub fn home_acl_sweep(
             .unverified
             .push(format!("{path}: cannot read ACLs — {e}")),
     };
+    // Mode and ownership grants the ACL pass cannot see: an
+    // agent-owned path, a chgrp into an agent group with group bits
+    // on, or a world-writable path each reach the agent domain with
+    // no ACL attached.
+    let check_mode = |path: &str, sweep: &mut Sweep| match view.stat(path) {
+        Ok(Some(m)) => {
+            if m.is_symlink {
+                return;
+            }
+            if let Some(auid) = principals.uid {
+                if m.uid == auid {
+                    sweep
+                        .findings
+                        .push(format!("{path}: owned by the agent uid {auid}"));
+                }
+            }
+            if principals.gids.contains(&m.gid) && m.mode & 0o070 != 0 {
+                sweep.findings.push(format!(
+                    "{path}: group-owned by an agent group gid {} with {:04o} — a chgrp grant",
+                    m.gid, m.mode
+                ));
+            }
+            if m.mode & 0o002 != 0 {
+                sweep
+                    .findings
+                    .push(format!("{path}: mode {:04o} is world-writable", m.mode));
+            }
+        }
+        Ok(None) => {}
+        Err(e) => sweep.unverified.push(format!("{path}: cannot stat — {e}")),
+    };
     check(&home, &mut sweep);
+    check_mode(&home, &mut sweep);
     match view.walk(&home, budget) {
         Ok((paths, truncated)) => {
             sweep.scanned = paths.len();
@@ -478,6 +536,7 @@ pub fn home_acl_sweep(
             }
             for path in &paths {
                 check(path, &mut sweep);
+                check_mode(path, &mut sweep);
             }
         }
         Err(e) => sweep.unverified.push(format!("cannot walk {home}: {e}")),
@@ -637,11 +696,16 @@ fn unquote(v: &str) -> String {
     out.trim().to_string()
 }
 
-/// Does a `safe.directory` value cover `store`? git's own rule is
-/// exact-match or `*` — anything else an entry names is inert, so the
-/// assertion flags `*`, the store root itself, and entries inside it
-/// (an armed exception for an agent-owned checkout). Ancestor paths do
-/// NOT cover under git semantics and are not flagged.
+/// Does a `safe.directory` value cover `store`? git's grammar has
+/// three armed forms, and all three are flagged:
+///
+/// - `*` alone — every path on the host.
+/// - `dir/*` — a trailing `/*` covers everything *under* `dir`
+///   recursively, so `/var/*`, `/*` and `/var/lib/cadence/*` all arm
+///   the store's checkouts even though none equals it.
+/// - a literal path — flags the store itself or a descendant (an
+///   armed exception for an agent-owned checkout). Ancestor paths do
+///   NOT cover under git semantics and are not flagged.
 fn covers_store(value: &str, store: &str, home: &str) -> bool {
     let value = value.trim();
     if value == "*" {
@@ -667,9 +731,54 @@ fn covers_store(value: &str, store: &str, home: &str) -> bool {
             p => norm.push(p),
         }
     }
-    let norm = PathBuf::from(format!("/{}", norm.join("/")));
     let store = Path::new(store);
+    // `dir/*` covers every path under dir: the store must not sit
+    // beneath the wildcard's root.
+    if norm.last() == Some(&"*") {
+        norm.pop();
+        let dir = PathBuf::from(format!("/{}", norm.join("/")));
+        return store.starts_with(&dir);
+    }
+    let norm = PathBuf::from(format!("/{}", norm.join("/")));
     norm == store || norm.starts_with(store)
+}
+
+/// Config keys that make git *run something*: a value reaching the
+/// agent domain is a command execution channel, and a config file
+/// already inside it sets them for free. This is the negative's
+/// second edge — `safe.directory` is not the only way a checkout
+/// talks back.
+fn exec_capable_key(section: &str, key: &str) -> bool {
+    let full = format!("{section}.{key}");
+    matches!(
+        full.as_str(),
+        "core.fsmonitor"
+            | "core.hookspath"
+            | "core.pager"
+            | "core.editor"
+            | "core.sshcommand"
+            | "core.askpass"
+            | "core.gitproxy"
+            | "diff.external"
+            | "credential.helper"
+            | "sequence.editor"
+            | "interactive.difffilter"
+    ) || (section == "credential" && key == "helper")
+        || (section.starts_with("credential.") && key == "helper")
+        || (section.starts_with("filter.") && matches!(key, "clean" | "smudge" | "process"))
+        || (section.starts_with("merge.") && key == "driver")
+        || (section.starts_with("diff.") && matches!(key, "textconv" | "command"))
+        || (section == "gpg" && key == "program")
+        || (section.starts_with("gpg.") && key == "program")
+        // `*.cmd`-carrying tool sections: difftool, mergetool,
+        // browser, guitool — each names a shell command.
+        || (key == "cmd"
+            && (section.starts_with("difftool.")
+                || section.starts_with("mergetool.")
+                || section.starts_with("browser.")
+                || section.starts_with("guitool.")))
+        || section == "pager"
+        || section.starts_with("pager.")
 }
 
 /// The findings shape both the `git-config` row and provision's
@@ -740,6 +849,11 @@ pub fn git_config_findings(view: &dyn View, operator: &str) -> Vec<String> {
             if key == "include.path" && reaches_store(&val, VAR_LIB, &home, Path::new("/")) {
                 findings.push(format!("env GIT_CONFIG_KEY_{i}: include.path={val}"));
             }
+            if exec_capable_full(&key) && reaches_store(&val, VAR_LIB, &home, Path::new("/")) {
+                findings.push(format!(
+                    "env GIT_CONFIG_KEY_{i}: exec-capable {key}={val} reaches into {VAR_LIB}"
+                ));
+            }
         }
     }
     if let Some(params) = view.env("GIT_CONFIG_PARAMETERS") {
@@ -750,9 +864,24 @@ pub fn git_config_findings(view: &dyn View, operator: &str) -> Vec<String> {
             if key == "include.path" && reaches_store(&val, VAR_LIB, &home, Path::new("/")) {
                 findings.push(format!("GIT_CONFIG_PARAMETERS: include.path={val}"));
             }
+            if exec_capable_full(&key) && reaches_store(&val, VAR_LIB, &home, Path::new("/")) {
+                findings.push(format!(
+                    "GIT_CONFIG_PARAMETERS: exec-capable {key}={val} reaches into {VAR_LIB}"
+                ));
+            }
         }
     }
     findings
+}
+
+/// The env spelling of an exec-capable key: `section.key` with the
+/// subsection folded into the section (the parser already produces
+/// `credential.https://x` as the section).
+fn exec_capable_full(full_key: &str) -> bool {
+    match full_key.rsplit_once('.') {
+        Some((section, key)) => exec_capable_key(section, key),
+        None => false,
+    }
 }
 
 /// `include.path` that reaches *into* the store is its own violation —
@@ -841,9 +970,31 @@ fn scan_git_file(
         return;
     }
     let Ok(bytes) = view.read_file(&path.display().to_string()) else {
+        // A path we refused to open may still matter: git follows a
+        // symlinked include — if the link lands inside the store the
+        // chain reads agent-written config. Resolve it (link text
+        // only) and flag the landing, never the bytes.
+        if let Ok(Some(m)) = view.stat(&path.display().to_string()) {
+            if m.is_symlink {
+                if let Ok(t) = view.read_link(&path.display().to_string()) {
+                    let base = path.parent().unwrap_or(Path::new("/")).to_path_buf();
+                    let t = if t.is_absolute() { t } else { base.join(t) };
+                    if reaches_store(&t.display().to_string(), VAR_LIB, home, Path::new("/")) {
+                        findings.push(format!(
+                            "{}: symlinked config resolves into {VAR_LIB} — git would follow it",
+                            path.display()
+                        ));
+                    }
+                }
+            }
+        }
         return; // absent config is inert
     };
     let text = String::from_utf8_lossy(&bytes);
+    // A config file sitting inside the store is agent-written — every
+    // exec-capable key in it is a command channel regardless of the
+    // value it carries.
+    let file_in_store = reaches_store(&path.display().to_string(), VAR_LIB, home, Path::new("/"));
     for line in parse_gitconfig(&text) {
         let full_key = format!("{}.{}", line.section, line.key);
         if full_key == "safe.directory" && covers_store(&line.value, VAR_LIB, home) {
@@ -852,6 +1003,23 @@ fn scan_git_file(
                 path.display(),
                 line.value
             ));
+        }
+        if exec_capable_key(&line.section, &line.key) {
+            if file_in_store {
+                findings.push(format!(
+                    "{}: exec-capable {}={} set by config inside the agent domain",
+                    path.display(),
+                    full_key,
+                    line.value
+                ));
+            } else if reaches_store(&line.value, VAR_LIB, home, Path::new("/")) {
+                findings.push(format!(
+                    "{}: exec-capable {}={} reaches into {VAR_LIB}",
+                    path.display(),
+                    full_key,
+                    line.value
+                ));
+            }
         }
         let is_include = full_key == "include.path"
             || (line.section.starts_with("includeif") && line.key == "path");

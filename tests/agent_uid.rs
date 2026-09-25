@@ -17,9 +17,9 @@ use cadence_agent::agent_uid::audit::{self, Audit, Level};
 use cadence_agent::agent_uid::fixture::FixtureHost;
 use cadence_agent::agent_uid::provision::{self, Spec};
 use cadence_agent::agent_uid::{
-    enforce_root, AclEntry, Meta, Principal, View, AGENT_HOME, AGENT_USER, HELPER_DEST, LANES_DIR,
-    LAUNCH_GROUP, LIBEXEC_DIR, NOLOGIN, OPERATOR_USER, OPT_BIN, OPT_RELEASES, OPT_ROOT, REPOS_DIR,
-    SHARED_GROUP, VAR_LIB,
+    enforce_root, AclEntry, Host, Meta, Principal, View, AGENT_HOME, AGENT_USER, HELPER_DEST,
+    LANES_DIR, LAUNCH_GROUP, LIBEXEC_DIR, NOLOGIN, OPERATOR_USER, OPT_BIN, OPT_RELEASES, OPT_ROOT,
+    REPOS_DIR, SHARED_GROUP, VAR_LIB,
 };
 use tempfile::TempDir;
 
@@ -35,6 +35,13 @@ impl Lane {
         let dir = TempDir::new().unwrap();
         let helper_src = dir.path().join("cadence-agent-exec");
         std::fs::write(&helper_src, b"fake-helper-bytes").unwrap();
+        // A real build lands 0755 — the gate rejects group/other-writable
+        // sources, so do not leave the file at the process umask (0664).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&helper_src, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         Lane { dir, helper_src }
     }
     fn host(&self) -> FixtureHost {
@@ -92,10 +99,26 @@ fn gid(host: &FixtureHost, name: &str) -> u32 {
 /// The fixture's full provision — asserts the run itself was clean.
 fn provisioned(lane: &Lane) -> FixtureHost {
     let mut host = lane.host();
-    let report = run_provision(&mut host, lane, false);
-    assert!(!report.refused(), "provision refused on a clean fixture");
-    assert!(report.steps.iter().all(|s| s.applied || s.assess.ok()));
+    let (report, text) = run_provision_text(&mut host, lane, false);
+    assert!(
+        !report.refused(),
+        "provision refused on a clean fixture:\n{text}"
+    );
+    assert!(
+        report.steps.iter().all(|s| s.applied || s.assess.ok()),
+        "unapplied steps on a clean fixture:\n{text}"
+    );
     host
+}
+
+/// A freshly provisioned host on its own lane. Each call gets a new
+/// tempdir — reusing one lane for two runs would leave real dirs on
+/// disk whose fs uid reads as a foreign owner to the second host.
+/// Returns the lane so its TempDir outlives the host.
+fn provisioned_fresh() -> (Lane, FixtureHost) {
+    let lane = Lane::new();
+    let host = provisioned(&lane);
+    (lane, host)
 }
 
 // ---------- the root gate ----------
@@ -116,12 +139,12 @@ fn provision_requires_real_root() {
     // must refuse without touching anything.
     if unsafe { libc::geteuid() } != 0 {
         assert_eq!(
-            provision::cli(false, None, OPERATOR_USER).unwrap(),
+            provision::cli(false, PathBuf::from("/x/cadence-agent-exec"), OPERATOR_USER).unwrap(),
             2,
             "non-root caller was not refused"
         );
         assert_eq!(
-            provision::cli(true, None, OPERATOR_USER).unwrap(),
+            provision::cli(true, PathBuf::from("/x/cadence-agent-exec"), OPERATOR_USER).unwrap(),
             2,
             "even --dry-run is root-only"
         );
@@ -274,15 +297,23 @@ fn provision_never_writes_under_operator_home_or_config() {
 #[test]
 fn provision_repairs_drift_but_refuses_a_file() {
     let lane = Lane::new();
-    // Drifted modes/owners are repaired to §3.
+    // Looser modes and root/stray owners are repaired to §3.
     let mut host = lane.host();
     host.seed_dir(VAR_LIB, 0, 0, 0o777);
     host.seed_dir(REPOS_DIR, 1234, 1234, 0o700);
     run_provision(&mut host, &lane, false);
     assert_eq!(meta(&host, VAR_LIB).mode, 0o750);
     assert_eq!(meta(&host, VAR_LIB).uid, 1000);
+    // Repos' stray uid/gid are reclaimed — the operator-tightened
+    // permission bits stand (a repair intersects, never re-opens),
+    // while the dropped setgid is restored: it is functional spec,
+    // not a permission grant.
     let repos = meta(&host, REPOS_DIR);
-    assert_eq!((repos.uid, repos.mode), (agent_uid(&host), 0o2750));
+    assert_eq!(
+        (repos.uid, repos.mode),
+        (agent_uid(&host), 0o2700),
+        "operator-tightened perms loosened, or spec setgid lost"
+    );
 
     // A regular file squatting on a §5 path is a refusal, not an
     // overwrite — on a fresh root (the lane above already has the
@@ -292,6 +323,51 @@ fn provision_repairs_drift_but_refuses_a_file() {
     host.seed_file(VAR_LIB, 0, 0, 0o644, b"squatter");
     let report = run_provision(&mut host, &lane2, false);
     assert!(report.refused(), "a file at {VAR_LIB} was provisioned over");
+}
+
+#[test]
+fn provision_never_loosens_operator_hardening() {
+    // Every harder-than-spec shape survives a second run.
+    let lane = Lane::new();
+    let mut host = provisioned(&lane);
+    host.meta.get_mut(VAR_LIB).unwrap().mode = 0o700;
+    host.meta.get_mut(REPOS_DIR).unwrap().mode = 0o2700;
+    let report = run_provision(&mut host, &lane, false);
+    assert_eq!(meta(&host, VAR_LIB).mode, 0o700, "0700 loosened to 0750");
+    assert_eq!(meta(&host, REPOS_DIR).mode, 0o2700, "2700 loosened");
+    // And the run is clean — tightened modes are not drift.
+    assert!(
+        report.clean(),
+        "a tightened host was reported dirty: {:?}",
+        report
+            .steps
+            .iter()
+            .filter(|s| !s.assess.ok())
+            .map(|s| format!("{:?} → {:?}", s.action, s.assess))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn provision_refuses_incomparable_mode_and_foreign_owner() {
+    let lane = Lane::new();
+    // 0705 vs spec 0750: grants other r-x while dropping group r-x —
+    // neither tighter nor looser, so provision must not guess.
+    let mut host = lane.host();
+    host.seed_dir(VAR_LIB, 0, 0, 0o705);
+    let report = run_provision(&mut host, &lane, false);
+    assert!(report.refused(), "incomparable mode 0705 was rewritten");
+
+    // A foreign account's tree is never chowned into the spec.
+    let lane = Lane::new();
+    let mut host = lane.host();
+    host.add_user_record("mallory", 1500, 1500, "/home/mallory", "/bin/bash");
+    host.seed_dir(VAR_LIB, 1500, 1500, 0o750);
+    let report = run_provision(&mut host, &lane, false);
+    assert!(
+        report.refused(),
+        "a directory owned by mallory was chowned into the boundary"
+    );
 }
 
 #[test]
@@ -355,9 +431,255 @@ fn provision_without_helper_source_leaves_it_absent() {
     spec.helper = None;
     let mut out = Vec::new();
     let report = provision::run(&mut host, &spec, &mut out).unwrap();
-    // The install step fails loudly — the rest of §5 still lands.
+    // The install step fails loudly — and the failure must surface in
+    // the report (a caller maps it to exit 2).
     assert!(host.stat(HELPER_DEST).unwrap().is_none());
     assert!(!report.clean());
+    assert!(
+        report.refused(),
+        "a failed apply must mark the report refused — exit 2, not 0"
+    );
+    assert!(report.failed);
+}
+
+// ---------- C1: a planted symlink refuses every verb ----------
+
+#[test]
+fn symlink_at_a_spec_path_refuses_assess_and_apply() {
+    for path in [
+        VAR_LIB,
+        LANES_DIR,
+        REPOS_DIR,
+        OPT_ROOT,
+        LIBEXEC_DIR,
+        AGENT_HOME,
+    ] {
+        let lane = Lane::new();
+        let mut host = lane.host();
+        host.seed_symlink(path, "/tmp").unwrap();
+        let report = run_provision(&mut host, &lane, false);
+        assert!(
+            report.refused(),
+            "a symlink planted at {path} did not refuse provision"
+        );
+        // The link is still a link — nothing followed or overwrote it.
+        let m = meta(&host, path);
+        assert!(m.is_symlink, "{path}: symlink was overwritten");
+    }
+    // The helper's dest: a symlink refuses the install.
+    let lane = Lane::new();
+    let mut host = lane.host();
+    host.seed_symlink(HELPER_DEST, "/etc/passwd").unwrap();
+    let report = run_provision(&mut host, &lane, false);
+    assert!(report.refused(), "installing over a symlink passed");
+    assert_eq!(
+        std::fs::read_link(host.root.join(HELPER_DEST.trim_start_matches('/'))).unwrap(),
+        PathBuf::from("/etc/passwd"),
+        "the symlink target was disturbed"
+    );
+}
+
+#[test]
+fn apply_verbs_refuse_a_planted_link_even_mid_race() {
+    // assess→apply is a race window; the verbs themselves must refuse.
+    let lane = Lane::new();
+    let mut host = lane.host();
+    host.seed_dir(VAR_LIB, 1000, 1000, 0o750);
+    host.seed_symlink(LANES_DIR, "/etc").unwrap();
+    assert!(
+        host.mkdir(LANES_DIR).is_err(),
+        "mkdir followed a symlinked final component"
+    );
+    assert!(
+        host.set_meta(LANES_DIR, OPERATOR_USER, SHARED_GROUP, 0o750)
+            .is_err(),
+        "set_meta followed a symlink"
+    );
+    // A symlinked intermediate: /var/lib/cadence → elsewhere.
+    let lane2 = Lane::new();
+    let mut host = lane2.host();
+    host.seed_symlink(VAR_LIB, "/tmp").unwrap();
+    assert!(
+        host.mkdir(LANES_DIR).is_err(),
+        "mkdir descended through a symlinked intermediate"
+    );
+    assert!(
+        host.set_meta(LANES_DIR, OPERATOR_USER, SHARED_GROUP, 0o750)
+            .is_err(),
+        "set_meta descended through a symlinked intermediate"
+    );
+    // An untrusted chain owner refuses too — an agent-owned
+    // intermediate means the agent controls a prefix of the path.
+    let lane3 = Lane::new();
+    let mut host = lane3.host();
+    host.seed_dir(VAR_LIB, 4242, 4242, 0o750);
+    assert!(
+        host.mkdir(LANES_DIR).is_err(),
+        "mkdir descended into an untrusted-owner directory"
+    );
+}
+
+#[test]
+fn reprovision_refuses_when_a_path_became_a_symlink() {
+    // The assess-time symlink verdict: provision a clean host, swap a
+    // §5 dir for a link, re-run — refusal, and the link survives.
+    let lane = Lane::new();
+    let mut host = provisioned(&lane);
+    let phys = host.root.join(LANES_DIR.trim_start_matches('/'));
+    std::fs::remove_dir(&phys).unwrap();
+    host.meta.remove(LANES_DIR);
+    host.seed_symlink(LANES_DIR, "/tmp").unwrap();
+    let report = run_provision(&mut host, &lane, false);
+    assert!(report.refused());
+    assert!(meta(&host, LANES_DIR).is_symlink);
+}
+
+// ---------- C2: the helper source is vetted, never discovered ----------
+
+#[test]
+fn helper_source_refuses_agent_owned_group_writable_and_symlink() {
+    // Agent-owned source.
+    let lane = Lane::new();
+    let mut host = lane.host();
+    let auid = 4242;
+    host.meta.insert(
+        lane.helper_src.display().to_string(),
+        Meta {
+            uid: auid,
+            gid: 1000,
+            mode: 0o755,
+            is_dir: false,
+            is_file: true,
+            is_symlink: false,
+        },
+    );
+    assert!(
+        host.helper_source(&lane.helper_src).is_err(),
+        "an agent-owned helper source passed the gate"
+    );
+    assert!(
+        run_provision(&mut host, &lane, false).refused(),
+        "an agent-owned helper was installed"
+    );
+
+    // Group/other-writable source.
+    let lane = Lane::new();
+    let mut host = lane.host();
+    host.meta.insert(
+        lane.helper_src.display().to_string(),
+        Meta {
+            uid: 1000,
+            gid: 1000,
+            mode: 0o664,
+            is_dir: false,
+            is_file: true,
+            is_symlink: false,
+        },
+    );
+    assert!(
+        host.helper_source(&lane.helper_src).is_err(),
+        "a group-writable helper source passed the gate"
+    );
+
+    // A symlink source — O_NOFOLLOW refuses at open.
+    let lane = Lane::new();
+    let host = lane.host();
+    let link = lane.dir.path().join("link-helper");
+    std::os::unix::fs::symlink(&lane.helper_src, &link).unwrap();
+    assert!(
+        host.helper_source(&link).is_err(),
+        "a symlinked helper source passed the gate"
+    );
+
+    // A fifo source — O_NONBLOCK means the open cannot hang either.
+    let lane = Lane::new();
+    let mut host = lane.host();
+    let fifo = lane.dir.path().join("fifo-helper");
+    let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+    assert!(
+        host.helper_source(&fifo).is_err(),
+        "a fifo helper source passed the gate"
+    );
+
+    // A relative path is refused outright — under sudo the cwd is
+    // untrusted.
+    assert!(host
+        .install(&PathBuf::from("rel"), "/x", "root", "root", 0o755)
+        .is_err());
+}
+
+#[test]
+fn installed_helper_bytes_match_the_verified_source() {
+    let lane = Lane::new();
+    let host = provisioned(&lane);
+    // The dest holds exactly the vetted source bytes — same hash the
+    // vet+hash one-fd gate produced.
+    assert_eq!(
+        host.helper_source(&lane.helper_src).unwrap(),
+        host.file_sha256(HELPER_DEST).unwrap()
+    );
+    // A rebuilt source re-installs — the byte compare drives it.
+    let mut host = host;
+    std::fs::write(&lane.helper_src, b"rebuilt-helper").unwrap();
+    let report = run_provision(&mut host, &lane, false);
+    assert!(!report.clean(), "a rebuilt helper was not reinstalled");
+    assert_eq!(host.read_file(HELPER_DEST).unwrap(), b"rebuilt-helper");
+}
+
+// ---------- account-shape refusals ----------
+
+#[test]
+fn provision_refuses_agent_sharing_operator_uid() {
+    let lane = Lane::new();
+    let mut host = lane.host();
+    // The agent account answering to uid 1000 is no boundary.
+    host.add_user_record(AGENT_USER, 1000, 900, AGENT_HOME, NOLOGIN);
+    let report = run_provision(&mut host, &lane, false);
+    assert!(
+        report.refused(),
+        "an agent sharing the operator uid provisioned"
+    );
+}
+
+#[test]
+fn audit_fails_when_agent_shares_operator_uid() {
+    let lane = Lane::new();
+    let mut host = provisioned(&lane);
+    let agid = host.user(AGENT_USER).unwrap().unwrap().gid;
+    host.add_user_record(AGENT_USER, 1000, agid, AGENT_HOME, NOLOGIN);
+    assert_eq!(row(&audit(&host), "agent-user").level, Level::Fail);
+}
+
+#[test]
+fn audit_fails_when_operator_leaves_launch_group() {
+    let lane = Lane::new();
+    let mut host = provisioned(&lane);
+    host.groups
+        .get_mut(LAUNCH_GROUP)
+        .unwrap()
+        .members
+        .remove(OPERATOR_USER);
+    assert_eq!(
+        row(&audit(&host), "agent-groups").level,
+        Level::Fail,
+        "operator outside cadence-launch passed — the helper's gate edge"
+    );
+}
+
+#[test]
+fn apply_failure_on_the_last_step_refuses_the_run() {
+    // The failure must survive as non-zero even when it is the final
+    // action — no trailing step exists to carry the bad news.
+    // OPT_RELEASES is the plan's last action: inject the apply
+    // failure there — assess must still pass, then apply must fail
+    // and the report must carry it to the exit status.
+    let lane = Lane::new();
+    let mut host = lane.host();
+    host.fail_ops.insert(OPT_RELEASES.to_string());
+    let report = run_provision(&mut host, &lane, false);
+    assert!(report.failed, "the failed apply was not recorded");
+    assert!(report.refused(), "a failed apply exited clean");
 }
 
 // ---------- audit: artifact checks ----------
@@ -396,11 +718,8 @@ fn audit_warns_not_fails_on_a_bare_host() {
 
 #[test]
 fn audit_fails_on_each_mutated_artifact() {
-    let lane = Lane::new();
-
     // Agent account: uid 0.
-    let mut host = provisioned(&lane);
-    let uid = agent_uid(&host);
+    let (_lane, mut host) = provisioned_fresh();
     host.add_user_record(AGENT_USER, 0, gid(&host, AGENT_USER), AGENT_HOME, NOLOGIN);
     let report = audit(&host);
     assert_eq!(
@@ -408,17 +727,16 @@ fn audit_fails_on_each_mutated_artifact() {
         Level::Fail,
         "uid-0 agent passed"
     );
-    let _ = uid;
 
     // Agent account: a shell that logs in.
-    let mut host = provisioned(&lane);
+    let (_lane, mut host) = provisioned_fresh();
     let u = host.user(AGENT_USER).unwrap().unwrap();
     host.add_user_record(AGENT_USER, u.uid, u.gid, AGENT_HOME, "/bin/bash");
     assert_eq!(row(&audit(&host), "agent-user").level, Level::Fail);
 
     // A stray member in the launch edge — `nobody` could now exec as
     // the agent.
-    let mut host = provisioned(&lane);
+    let (_lane, mut host) = provisioned_fresh();
     host.groups
         .get_mut(LAUNCH_GROUP)
         .unwrap()
@@ -428,7 +746,7 @@ fn audit_fails_on_each_mutated_artifact() {
 
     // The agent inside the operator's own group — a traversal grant
     // into ~ wearing a different name.
-    let mut host = provisioned(&lane);
+    let (_lane, mut host) = provisioned_fresh();
     host.groups
         .get_mut(OPERATOR_USER)
         .unwrap()
@@ -443,9 +761,9 @@ fn audit_fails_on_each_mutated_artifact() {
         (LIBEXEC_DIR, 0o755, "opt-tree"),
         (VAR_LIB, 0o755, "share-tree"),
         (REPOS_DIR, 0o750, "share-tree"), // setgid dropped
-        (OPT_BIN, 0o750, "opt-tree"),
+        (OPT_BIN, 0o757, "opt-tree"),
     ] {
-        let mut host = provisioned(&lane);
+        let (_lane, mut host) = provisioned_fresh();
         host.meta.get_mut(path).unwrap().mode = bad_mode;
         let report = audit(&host);
         assert_eq!(
@@ -457,20 +775,20 @@ fn audit_fails_on_each_mutated_artifact() {
     }
 
     // The helper: dropped setuid, wrong owner, absent — each fails.
-    let mut host = provisioned(&lane);
+    let (_lane, mut host) = provisioned_fresh();
     host.meta.get_mut(HELPER_DEST).unwrap().mode = 0o750;
     assert_eq!(row(&audit(&host), "helper").level, Level::Fail);
-    let mut host = provisioned(&lane);
+    let (_lane, mut host) = provisioned_fresh();
     host.meta.get_mut(HELPER_DEST).unwrap().uid = 1000;
     assert_eq!(row(&audit(&host), "helper").level, Level::Fail);
-    let mut host = provisioned(&lane);
+    let (_lane, mut host) = provisioned_fresh();
     host.meta.remove(HELPER_DEST);
     std::fs::remove_file(host.root.join(HELPER_DEST.trim_start_matches('/'))).unwrap();
     assert_eq!(row(&audit(&host), "helper").level, Level::Fail);
 
     // The repos default ACL removed — new checkouts would be
     // operator-unreachable.
-    let mut host = provisioned(&lane);
+    let (_lane, mut host) = provisioned_fresh();
     host.acl.get_mut(REPOS_DIR).unwrap().clear();
     assert_eq!(row(&audit(&host), "share-tree").level, Level::Fail);
 }
@@ -593,17 +911,106 @@ fn audit_flags_safe_directory_covering_the_store() {
             "[safe]\n\tdirectory = /var/lib/../lib/cadence\n",
         ),
         ("trailing", "[safe]\n\tdirectory = /var/lib/cadence/\n"),
+        // git's `dir/*` form — every path under dir is covered, so a
+        // wildcard rooted above the store arms every checkout in it.
+        ("var-star", "[safe]\n\tdirectory = /var/*\n"),
+        ("root-star", "[safe]\n\tdirectory = /*\n"),
+        ("lib-star", "[safe]\n\tdirectory = /var/lib/*\n"),
+        ("store-star", "[safe]\n\tdirectory = /var/lib/cadence/*\n"),
+        ("tilde-star", "[safe]\n\tdirectory = ~/*\n"),
     ] {
         let lane = Lane::new();
         let mut host = provisioned(&lane);
         host.write_file("/home/ubuntu/.gitconfig", cfg);
         let report = audit(&host);
+        if label == "tilde-star" {
+            assert_ne!(
+                row(&report, "git-config").level,
+                Level::Fail,
+                "~/covers the operator's home only — it must not flag"
+            );
+            continue;
+        }
         assert_eq!(
             row(&report, "git-config").level,
             Level::Fail,
             "{label}: {cfg:?} was not flagged"
         );
     }
+    // And the non-covering neighbours stay quiet.
+    for cfg in [
+        "[safe]\n\tdirectory = /var/lib/cadencesnap\n",
+        "[safe]\n\tdirectory = /home/ubuntu/*\n",
+        "[safe]\n\tdirectory = /opt/*\n",
+    ] {
+        let lane = Lane::new();
+        let mut host = provisioned(&lane);
+        host.write_file("/home/ubuntu/.gitconfig", cfg);
+        assert_eq!(
+            row(&audit(&host), "git-config").level,
+            Level::Ok,
+            "{cfg:?} was flagged but covers nothing"
+        );
+    }
+}
+
+#[test]
+fn audit_flags_exec_capable_keys_reaching_the_store() {
+    // A command-channel value inside the agent domain — the operator's
+    // own config writing a hook into agent-writable ground.
+    for (label, cfg) in [
+        ("fsmonitor", "[core]\n\tfsmonitor = /var/lib/cadence/spy\n"),
+        (
+            "hooksPath",
+            "[core]\n\thooksPath = /var/lib/cadence/hooks\n",
+        ),
+        ("pager", "[core]\n\tpager = /var/lib/cadence/less\n"),
+        (
+            "sshCommand",
+            "[core]\n\tsshCommand = /var/lib/cadence/ssh\n",
+        ),
+        (
+            "cred-helper",
+            "[credential]\n\thelper = /var/lib/cadence/steal\n",
+        ),
+        (
+            "cred-url",
+            "[credential \"https://x\"]\n\thelper = /var/lib/cadence/steal\n",
+        ),
+        ("filter", "[filter \"x\"]\n\tclean = /var/lib/cadence/f\n"),
+    ] {
+        let lane = Lane::new();
+        let mut host = provisioned(&lane);
+        host.write_file("/home/ubuntu/.gitconfig", cfg);
+        assert_eq!(
+            row(&audit(&host), "git-config").level,
+            Level::Fail,
+            "{label}: {cfg:?} was not flagged"
+        );
+    }
+    // A config file already inside the store is agent-written: an
+    // exec key there flags on its own, whatever value it carries.
+    let lane = Lane::new();
+    let mut host = provisioned(&lane);
+    host.write_file(
+        "/home/ubuntu/.gitconfig",
+        "[include]\n\tpath = /var/lib/cadence/repos/x/.gitconfig\n",
+    );
+    assert_eq!(row(&audit(&host), "git-config").level, Level::Fail);
+    let lane = Lane::new();
+    let mut host = provisioned(&lane);
+    host.write_file("/home/ubuntu/.gitconfig", "[include]\n\tpath = ~/x.inc\n");
+    host.write_file(
+        "/home/ubuntu/x.inc",
+        "[include]\n\tpath = /var/lib/cadence/in.inc\n",
+    );
+    host.write_file("/var/lib/cadence/in.inc", "[core]\n\tpager = less\n");
+    let report = audit(&host);
+    assert_eq!(
+        row(&report, "git-config").level,
+        Level::Fail,
+        "an exec-capable key in agent-domain config was not flagged"
+    );
 }
 
 #[test]
@@ -699,12 +1106,135 @@ fn audit_ignores_innocent_git_config() {
     );
 }
 
+#[test]
+fn audit_flags_chgrp_and_mode_grants_under_home() {
+    // A chgrp into the agent's group with group bits on — no ACL,
+    // just the mode — reaches the agent domain.
+    let lane = Lane::new();
+    let mut host = provisioned(&lane);
+    let sgid = gid(&host, SHARED_GROUP);
+    host.seed_file("/home/ubuntu/leak", 1000, sgid, 0o640, b"x\n");
+    assert_eq!(
+        row(&audit(&host), "home-acl").level,
+        Level::Fail,
+        "a chgrp'ed file under ~ was not flagged"
+    );
+
+    // A file owned by the agent uid itself.
+    let lane = Lane::new();
+    let mut host = provisioned(&lane);
+    host.seed_file(
+        "/home/ubuntu/planted",
+        agent_uid(&host),
+        1000,
+        0o600,
+        b"x\n",
+    );
+    assert_eq!(
+        row(&audit(&host), "home-acl").level,
+        Level::Fail,
+        "an agent-owned file under ~ was not flagged"
+    );
+
+    // World-writable under ~ — anyone, the agent included, writes.
+    let lane = Lane::new();
+    let mut host = provisioned(&lane);
+    host.seed_dir("/home/ubuntu/pub", 1000, 1000, 0o777);
+    assert_eq!(
+        row(&audit(&host), "home-acl").level,
+        Level::Fail,
+        "a world-writable dir under ~ was not flagged"
+    );
+}
+
+#[test]
+fn audit_sees_grants_through_agent_supplementary_groups() {
+    // `usermod -aG docker cadence-agent` makes docker-gid files
+    // agent-reachable — getgrouplist must fold it into the sweep.
+    let lane = Lane::new();
+    let mut host = provisioned(&lane);
+    host.groups.insert(
+        "docker".to_string(),
+        cadence_agent::agent_uid::Group {
+            name: "docker".into(),
+            gid: 4242,
+            members: std::collections::BTreeSet::from([AGENT_USER.to_string()]),
+        },
+    );
+    host.seed_file("/home/ubuntu/leak2", 1000, 4242, 0o640, b"x\n");
+    assert_eq!(
+        row(&audit(&host), "home-acl").level,
+        Level::Fail,
+        "a grant through the agent's supplementary group was not flagged"
+    );
+}
+
+#[test]
+fn include_reads_are_bounded_and_never_follow() {
+    use std::os::unix::ffi::OsStrExt;
+    // A fifo include target must not hang the read — O_NONBLOCK plus
+    // the regular-file check refuse it outright.
+    let lane = Lane::new();
+    let mut host = provisioned(&lane);
+    host.write_file(
+        "/home/ubuntu/.gitconfig",
+        "[include]\n\tpath = ~/fifo.inc\n",
+    );
+    let fifo = host.root.join("home/ubuntu/fifo.inc");
+    let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+    let report = audit(&host); // returns — no hang
+    assert_ne!(row(&report, "git-config").level, Level::Fail);
+
+    // A symlinked include is refused, not followed — but where the
+    // link *lands* is still judged: git would follow it into the
+    // agent domain, so a store-resolving link flags.
+    let lane = Lane::new();
+    let mut host = provisioned(&lane);
+    host.write_file(
+        "/home/ubuntu/.gitconfig",
+        "[include]\n\tpath = ~/link.inc\n",
+    );
+    let real = lane.dir.path().join("home/ubuntu/link.inc");
+    std::os::unix::fs::symlink("/var/lib/cadence/evil", &real).unwrap();
+    assert_eq!(
+        row(&audit(&host), "git-config").level,
+        Level::Fail,
+        "a symlinked include into the store was not flagged"
+    );
+    // …while a link staying under ~ is inert.
+    let lane = Lane::new();
+    let mut host = provisioned(&lane);
+    host.write_file("/home/ubuntu/.gitconfig", "[include]\n\tpath = ~/ok.inc\n");
+    host.write_file("/home/ubuntu/real.inc", "[user]\n\tname = o\n");
+    std::os::unix::fs::symlink(
+        lane.dir.path().join("home/ubuntu/real.inc"),
+        lane.dir.path().join("home/ubuntu/ok.inc"),
+    )
+    .unwrap();
+    assert_ne!(row(&audit(&host), "git-config").level, Level::Fail);
+
+    // An over-cap include target is refused, not OOM'd — even when it
+    // *carries* a violation past the bound.
+    let lane = Lane::new();
+    let mut host = provisioned(&lane);
+    host.write_file("/home/ubuntu/.gitconfig", "[include]\n\tpath = ~/big.inc\n");
+    let mut big = vec![b' '; 1 << 21];
+    big.extend_from_slice(b"\n[safe]\n\tdirectory = *\n");
+    std::fs::write(lane.dir.path().join("home/ubuntu/big.inc"), &big).unwrap();
+    let report = audit(&host); // bounded read refuses — no flag, no OOM
+    assert_eq!(
+        row(&report, "git-config").level,
+        Level::Ok,
+        "the cap must refuse the read, not hang or scan"
+    );
+}
+
 // ---------- audit: exit surface ----------
 
 #[test]
 fn audit_levels_order_and_report_shape() {
-    let lane = Lane::new();
-    let host = provisioned(&lane);
+    let (_lane, host) = provisioned_fresh();
     let report = audit(&host);
     let names: Vec<&str> = report.rows.iter().map(|r| r.name).collect();
     assert_eq!(
@@ -722,7 +1252,7 @@ fn audit_levels_order_and_report_shape() {
     );
     // Every failing row carries a remedy — honest output is part of
     // the contract.
-    let mut host = provisioned(&lane);
+    let (_lane, mut host) = provisioned_fresh();
     host.meta.get_mut(REPOS_DIR).unwrap().mode = 0o777;
     let report = audit(&host);
     for r in &report.rows {

@@ -28,9 +28,11 @@ use super::{
 };
 
 /// The operator-run command. `helper` is the built
-/// `cadence-agent-exec` to install — resolved from the flag, else the
-/// binary's own directory, else `target/{debug,release}` under the
-/// cwd.
+/// `cadence-agent-exec` to install — an explicit absolute path, never
+/// discovered: under sudo the cwd is agent-writable, so a
+/// cwd-relative fallback would install whatever an agent dropped
+/// there (C2). `None` is for spec-only consumers (the audit) that
+/// assess the installed file without a source at hand.
 pub struct Spec {
     pub operator: String,
     pub helper: Option<PathBuf>,
@@ -205,13 +207,13 @@ impl Action {
                         "group {group} pending — created above"
                     )));
                 };
-                if g.members.contains(user) {
-                    return Ok(Assess::Clean);
-                }
-                // Primary-gid membership counts — `usermod -aG` would
-                // add a redundant supplementary entry.
+                // Membership is the whole group vector —
+                // `getgrouplist` folds supplementary and primary-gid
+                // membership into one check, so neither spelling slips
+                // a redundant `usermod -aG` nor misses a satisfied
+                // edge.
                 if let Some(u) = view.user(user)? {
-                    if u.gid == g.gid {
+                    if view.member_gids(&u)?.contains(&g.gid) {
                         return Ok(Assess::Clean);
                     }
                 }
@@ -226,6 +228,11 @@ impl Action {
                 let Some(meta) = view.stat(path)? else {
                     return Ok(Assess::Needed("absent".into()));
                 };
+                if meta.is_symlink {
+                    return Ok(Assess::Blocked(format!(
+                        "{path} is a symlink — refusing to touch it"
+                    )));
+                }
                 if !meta.is_dir {
                     return Ok(Assess::Blocked(format!(
                         "{path} exists and is not a directory"
@@ -243,6 +250,11 @@ impl Action {
                 let Some(meta) = view.stat(dest)? else {
                     return Ok(Assess::Needed("absent".into()));
                 };
+                if meta.is_symlink {
+                    return Ok(Assess::Blocked(format!(
+                        "{dest} is a symlink — refusing to install over it"
+                    )));
+                }
                 if !meta.is_file {
                     return Ok(Assess::Blocked(format!("{dest} exists and is not a file")));
                 }
@@ -252,19 +264,23 @@ impl Action {
                 }
                 // Owner/group/mode match; with a resolved source the
                 // bytes decide clean vs refresh — a rebuilt helper is
-                // reinstalled. Without one the installed file stands.
-                let same = match (src, view.read_file(dest)) {
-                    (Some(src), Ok(have)) => {
-                        std::fs::read(src).map(|want| want == have).unwrap_or(false)
+                // reinstalled. The source is vetted at assess too, so
+                // a bad --helper refuses here, not just at apply.
+                match src {
+                    None => Ok(Assess::Clean),
+                    Some(src) => {
+                        // Vet + hash on the same opened fd — no
+                        // check→read window for a source swap.
+                        let want = match view.helper_source(src) {
+                            Ok(hash) => hash,
+                            Err(e) => return Ok(Assess::Blocked(format!("{e}"))),
+                        };
+                        match view.file_sha256(dest) {
+                            Ok(have) if have == want => Ok(Assess::Clean),
+                            _ => Ok(Assess::Drift("content differs".into())),
+                        }
                     }
-                    (None, _) => true,
-                    _ => false,
-                };
-                Ok(if same {
-                    Assess::Clean
-                } else {
-                    Assess::Drift("content differs".into())
-                })
+                }
             }
             Action::DefaultAcl { path, group, perms } => {
                 let Some(gid) = gid_of(view, group)? else {
@@ -310,10 +326,19 @@ impl Action {
                 group,
                 mode,
             } => {
-                if host.stat(path)?.is_none() {
+                let prior = host.stat(path)?;
+                if prior.is_none() {
                     host.mkdir(path)?;
                 }
-                host.set_meta(path, owner, group, *mode)?;
+                // Permission bits apply as the intersection — bits the
+                // operator removed stay removed. Special bits union:
+                // spec-required ones get restored (setgid on repos is
+                // functional, not a grant) and operator-added ones are
+                // kept.
+                let effective = prior
+                    .map(|m| ((mode | m.mode) & 0o7000) | (mode & m.mode & 0o777))
+                    .unwrap_or(*mode);
+                host.set_meta(path, owner, group, effective)?;
             }
             Action::Install {
                 src,
@@ -339,6 +364,15 @@ impl Action {
 }
 
 /// owner/group/mode comparison, resolving names through the view.
+///
+/// Re-provision only ever *tightens* (§7): a current owner that
+/// resolves to a different account name is a refusal — chowning a
+/// foreign account's tree is not provision's call — while an
+/// unresolvable uid is drift it may repair. A mode strictly tighter
+/// than spec is the operator's own hardening and is left alone; a
+/// looser mode is repaired; one that is neither tighter nor looser
+/// (grants one bit while dropping another) is a refusal — that shape
+/// means someone deviated on purpose and provision must not guess.
 fn assess_meta(
     view: &dyn View,
     path: &str,
@@ -353,13 +387,59 @@ fn assess_meta(
     let want_gid = gid_of(view, group)?
         .ok_or_else(|| Error::internal(format!("group {group} does not resolve")))?;
     if meta.uid != want_uid {
-        drift.push(format!("owner uid {} != {owner}", meta.uid));
+        match view.user_name(meta.uid)? {
+            Some(name) if name == owner => {
+                drift.push(format!("owner uid {} — {owner}'s uid moved", meta.uid))
+            }
+            // A root-owned tree is the caller's own — reclaiming it is
+            // provision's job. Any other resolved account owns its
+            // files: refuse rather than chown a foreign tree.
+            Some(_) if meta.uid == 0 => drift.push(format!("owner root != {owner}")),
+            Some(name) => {
+                return Ok(Assess::Blocked(format!(
+                    "{path} is owned by {name} — refusing to chown a foreign account's tree"
+                )))
+            }
+            None => drift.push(format!("owner uid {} != {owner}", meta.uid)),
+        }
     }
     if meta.gid != want_gid {
-        drift.push(format!("group gid {} != {group}", meta.gid));
+        match view.group_name(meta.gid)? {
+            Some(name) if name == group => {
+                drift.push(format!("group gid {} — {group}'s gid moved", meta.gid))
+            }
+            Some(_) if meta.gid == 0 => drift.push(format!("group root != {group}")),
+            Some(name) => {
+                return Ok(Assess::Blocked(format!(
+                    "{path} is group-owned by {name} — refusing to chgrp a foreign group's tree"
+                )))
+            }
+            None => drift.push(format!("group gid {} != {group}", meta.gid)),
+        }
     }
-    if meta.mode != mode {
-        drift.push(format!("mode {:04o} != {mode:04o}", meta.mode));
+    // Permission bits (0777) are tighten-only: extra grants repair,
+    // missing bits are the operator's own hardening and stand.
+    // Special bits (setuid/setgid/sticky, 07000) are functional, not
+    // grants — a spec bit that was dropped is drift to repair; an
+    // extra one is the operator's addition and also stands.
+    let extra = (meta.mode & 0o777) & !(mode & 0o777);
+    let missing = (mode & 0o777) & !(meta.mode & 0o777);
+    let dropped_special = (mode & 0o7000) & !(meta.mode & 0o7000);
+    match (extra, missing) {
+        (0, _) => {} // tighter or equal perms — the operator's hardening stands
+        (_, 0) => drift.push(format!("mode {:04o} is looser than {mode:04o}", meta.mode)),
+        (_, _) => {
+            return Ok(Assess::Blocked(format!(
+                "{path} mode {:04o} neither contains nor fits spec {mode:04o} — refusing",
+                meta.mode
+            )))
+        }
+    }
+    if dropped_special != 0 {
+        drift.push(format!(
+            "mode {:04o} dropped spec special bits {:04o}",
+            meta.mode, dropped_special
+        ));
     }
     if drift.is_empty() {
         Ok(Assess::Clean)
@@ -475,17 +555,21 @@ pub struct Report {
     pub steps: Vec<StepResult>,
     /// §4 pre-flight findings — non-empty refuses the fs phase.
     pub preflight: Vec<String>,
+    /// An apply failed anywhere — including the last action, which
+    /// must not leave the exit status at 0.
+    pub failed: bool,
     pub dry_run: bool,
 }
 
 impl Report {
     /// Every artifact already as specified (or would be, in dry-run).
     pub fn clean(&self) -> bool {
-        self.steps.iter().all(|s| s.assess.ok()) && self.preflight.is_empty()
+        self.steps.iter().all(|s| s.assess.ok()) && self.preflight.is_empty() && !self.failed
     }
 
     pub fn refused(&self) -> bool {
-        !self.preflight.is_empty()
+        self.failed
+            || !self.preflight.is_empty()
             || self
                 .steps
                 .iter()
@@ -503,7 +587,42 @@ fn preflight(view: &dyn View, operator: &str) -> Vec<String> {
         gids: Vec::new(),
         group_names: [AGENT_USER, SHARED_GROUP],
     });
-    let mut findings = audit::home_acl_findings(view, operator, &principals, HOME_ACL_WALK_BUDGET);
+    let mut findings = Vec::new();
+    // The agent's uid must be its own — an agent sharing the
+    // operator's uid is no boundary at all.
+    if let (Ok(Some(agent)), Ok(Some(op))) = (view.user(AGENT_USER), view.user(operator)) {
+        if agent.uid == op.uid {
+            findings.push(format!(
+                "{AGENT_USER} resolves to uid {} — the operator's own uid — refusing",
+                agent.uid
+            ));
+        }
+        if agent.uid == 0 {
+            findings.push(format!("{AGENT_USER} resolves to uid 0 — refusing"));
+        }
+        // The launch edge must already hold the operator — the setuid
+        // helper gates on `cadence-launch` membership, so a missing
+        // operator row means the tree we are about to arm cannot be
+        // used by the seat it was built for.
+        if let Ok(Some(g)) = view.group(LAUNCH_GROUP) {
+            let in_launch = view
+                .member_gids(&op)
+                .map(|gids| gids.contains(&g.gid))
+                .unwrap_or(false);
+            if !in_launch {
+                findings.push(format!(
+                    "operator {operator} is not in {LAUNCH_GROUP} — the helper's gate would \
+                     refuse the very seat provision is arming"
+                ));
+            }
+        }
+    }
+    findings.extend(audit::home_acl_findings(
+        view,
+        operator,
+        &principals,
+        HOME_ACL_WALK_BUDGET,
+    ));
     findings.extend(audit::git_config_findings(view, operator));
     findings
 }
@@ -625,44 +744,52 @@ pub fn run(host: &mut dyn Host, spec: &Spec, out: &mut dyn Write) -> Result<Repo
     Ok(Report {
         steps,
         preflight: findings,
+        failed,
         dry_run: spec.dry_run,
     })
 }
 
 /// `cadence agent-uid provision` — root gate first, then the engine
 /// against the live host. Refusal is exit 2, like the helper's.
-pub fn cli(dry_run: bool, helper: Option<PathBuf>, operator: &str) -> Result<i32> {
+pub fn cli(dry_run: bool, helper: PathBuf, operator: &str) -> Result<i32> {
     let (uid, euid) = caller_uids();
     if let Err(e) = enforce_root(uid, euid) {
         eprintln!("cadence agent-uid provision: refused: {e}");
         return Ok(2);
     }
-    let helper = helper.or_else(find_helper);
+    // The helper source is the setuid bridge the boundary rests on —
+    // only an explicit absolute path is trusted. No cwd-relative
+    // discovery: under sudo the cwd may be agent-writable.
+    if !helper.is_absolute() {
+        eprintln!(
+            "cadence agent-uid provision: refused: --helper {} must be an absolute path",
+            helper.display()
+        );
+        return Ok(2);
+    }
     let mut host = LiveHost::new();
+    // The operator must resolve — it names groups and owns trees, and
+    // its uid joins the trusted set (`/var/lib/cadence` is operator-
+    // owned by spec, so the pinned write path must accept it). An
+    // unresolvable name would only fail deep inside the run — refuse
+    // it up front, where the error is legible.
+    let op = match host.user(operator) {
+        Ok(Some(op)) => op,
+        _ => {
+            eprintln!(
+                "cadence agent-uid provision: refused: operator account {operator} does not resolve"
+            );
+            return Ok(2);
+        }
+    };
+    host.trust_uid(op.uid);
     let spec = Spec {
         operator: operator.to_string(),
-        helper,
+        helper: Some(helper),
         dry_run,
     };
     let report = run(&mut host, &spec, &mut std::io::stdout())?;
     Ok(if report.refused() { 2 } else { 0 })
-}
-
-/// Where a built helper is looked for when `--helper` is absent:
-/// beside this `cadence` binary, then the usual target dirs under the
-/// cwd.
-fn find_helper() -> Option<PathBuf> {
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("cadence-agent-exec"));
-        }
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join("target/debug/cadence-agent-exec"));
-        candidates.push(cwd.join("target/release/cadence-agent-exec"));
-    }
-    candidates.into_iter().find(|p| p.is_file())
 }
 
 /// Every path a plan touches must live in one of these roots — the

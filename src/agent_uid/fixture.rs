@@ -26,6 +26,13 @@ pub struct FixtureHost {
     /// The calling process's (real, effective) uid.
     pub uid: u32,
     pub euid: u32,
+    /// Uids the write verbs trust — root, the operator, and the real
+    /// euid (helper sources live in a runner-owned tempdir). Tests
+    /// remove/add entries to forge untrusted chain owners.
+    pub trusted_uids: BTreeSet<u32>,
+    /// Paths whose write verbs must fail — the apply-error injection
+    /// knob, so a test can fail the plan's *last* action on purpose.
+    pub fail_ops: BTreeSet<String>,
     next_uid: u32,
     next_gid: u32,
 }
@@ -43,6 +50,13 @@ impl FixtureHost {
             env: BTreeMap::new(),
             uid: 0,
             euid: 0,
+            trusted_uids: {
+                let mut t = BTreeSet::from([0, 1000]);
+                #[cfg(unix)]
+                t.insert(unsafe { libc::geteuid() });
+                t
+            },
+            fail_ops: BTreeSet::new(),
             next_uid: 900,
             next_gid: 900,
         };
@@ -106,6 +120,7 @@ impl FixtureHost {
                 mode,
                 is_dir: true,
                 is_file: false,
+                is_symlink: false,
             },
         );
     }
@@ -125,8 +140,32 @@ impl FixtureHost {
                 mode,
                 is_dir: false,
                 is_file: true,
+                is_symlink: false,
             },
         );
+    }
+
+    /// Plant a real symlink at `path` under the root — the adversarial
+    /// seed: every root write verb must refuse to touch it or anything
+    /// beneath it.
+    pub fn seed_symlink(&mut self, path: &str, target: &str) -> io::Result<()> {
+        let phys = self.phys(path);
+        if let Some(p) = phys.parent() {
+            std::fs::create_dir_all(p)?;
+        }
+        std::os::unix::fs::symlink(target, &phys)?;
+        self.meta.insert(
+            path.to_string(),
+            Meta {
+                uid: 1000,
+                gid: 1000,
+                mode: 0o777,
+                is_dir: false,
+                is_file: false,
+                is_symlink: true,
+            },
+        );
+        Ok(())
     }
 
     /// Record an ACL entry on a path — the negative-assertion tests
@@ -154,6 +193,63 @@ impl FixtureHost {
             Ok(rel) => format!("/{}", rel.display()),
             Err(_) => phys.display().to_string(),
         }
+    }
+
+    /// Mirror of the live chain walk: lstat every component of `phys`;
+    /// a symlink anywhere refuses, and every *intermediate*'s recorded
+    /// owner must sit inside `trusted_uids` — the last component's
+    /// owner is exempt the way the live `O_NOFOLLOW` pin exempts the
+    /// pinned target itself (its owner is the spec's, e.g. agent-owned
+    /// `repos`, or about to be repaired).
+    fn check_chain(&self, phys: &Path) -> io::Result<()> {
+        let rel = match phys.strip_prefix(&self.root) {
+            Ok(r) => r,
+            Err(_) => return Ok(()), // outside the fake root: real fs, no judgement
+        };
+        let comps: Vec<_> = rel.components().collect();
+        let mut cur = self.root.clone();
+        for (i, c) in comps.iter().enumerate() {
+            cur.push(c);
+            let md = match std::fs::symlink_metadata(&cur) {
+                Ok(md) => md,
+                Err(_) => break,
+            };
+            if md.file_type().is_symlink() {
+                return Err(io::Error::other(format!(
+                    "{}: symlink in the path — refusing",
+                    self.logical(&cur)
+                )));
+            }
+            let logical = self.logical(&cur);
+            if i + 1 < comps.len() {
+                if let Some(m) = self.meta.get(&logical) {
+                    if !self.trusted_uids.contains(&m.uid) {
+                        return Err(io::Error::other(format!(
+                            "{logical}: owned by an untrusted uid — refusing to descend"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The live source gate judged on recorded meta first, real fs
+    /// second — a test can forge an agent-owned or group-writable
+    /// helper without `chown`.
+    fn check_source_meta(&self, src: &Path) -> io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let md = std::fs::symlink_metadata(src)?;
+        let key = src.display().to_string();
+        let (is_file, fmode, uid) = match self.meta.get(&key) {
+            Some(m) => (m.is_file, m.mode, m.uid),
+            None => (
+                md.is_file() && !md.file_type().is_symlink(),
+                md.mode() & 0o7777,
+                md.uid(),
+            ),
+        };
+        super::check_source(src, is_file, fmode, uid, &self.trusted_uids)
     }
 
     /// uid/gid a recorded path would report — the fixture's own
@@ -209,6 +305,7 @@ impl View for FixtureHost {
             mode: md.mode() & 0o7777,
             is_dir: md.is_dir(),
             is_file: md.is_file(),
+            is_symlink: md.file_type().is_symlink(),
         }))
     }
 
@@ -220,8 +317,39 @@ impl View for FixtureHost {
         true
     }
 
+    fn users(&self) -> io::Result<Vec<User>> {
+        Ok(self.users.values().cloned().collect())
+    }
+
+    fn member_gids(&self, user: &User) -> io::Result<Vec<u32>> {
+        let mut gids: Vec<u32> = self
+            .groups
+            .values()
+            .filter(|g| g.members.contains(&user.name))
+            .map(|g| g.gid)
+            .collect();
+        gids.push(user.gid);
+        gids.sort_unstable();
+        gids.dedup();
+        Ok(gids)
+    }
+
     fn read_file(&self, path: &str) -> io::Result<Vec<u8>> {
-        std::fs::read(self.phys(path))
+        super::bounded_read(&self.phys(path), path)
+    }
+
+    fn read_link(&self, path: &str) -> io::Result<PathBuf> {
+        std::fs::read_link(self.phys(path))
+    }
+
+    fn file_sha256(&self, path: &str) -> io::Result<[u8; 32]> {
+        super::sha256_path(&self.phys(path))
+    }
+
+    fn helper_source(&self, src: &Path) -> io::Result<[u8; 32]> {
+        self.check_source_meta(src)?;
+        let f = std::fs::File::open(src)?;
+        super::sha256_file(&f)
     }
 
     fn walk(&self, dir: &str, budget: usize) -> io::Result<(Vec<String>, bool)> {
@@ -253,14 +381,6 @@ impl View for FixtureHost {
 
     fn env(&self, key: &str) -> Option<String> {
         self.env.get(key).cloned()
-    }
-
-    fn env_prefixed(&self, prefix: &str) -> Vec<(String, String)> {
-        self.env
-            .iter()
-            .filter(|(k, _)| k.starts_with(prefix))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
     }
 }
 
@@ -310,16 +430,26 @@ impl Host for FixtureHost {
             },
         );
         // `useradd -m` lands the home before our own `install -d`
-        // asserts its final mode.
-        std::fs::create_dir_all(self.phys(&spec.home))?;
+        // asserts its final mode. Never follow a planted link: if the
+        // home is already a symlink, `useradd` still succeeds — the
+        // recorded meta must keep `is_symlink` so the later Dir
+        // action assesses it as the refusal it is.
+        let phys = self.phys(&spec.home);
+        let planted_link = std::fs::symlink_metadata(&phys)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+        if !planted_link {
+            std::fs::create_dir_all(&phys)?;
+        }
         self.meta.insert(
             spec.home.clone(),
             Meta {
                 uid,
                 gid,
                 mode: 0o755,
-                is_dir: true,
+                is_dir: phys.is_dir(),
                 is_file: false,
+                is_symlink: planted_link,
             },
         );
         Ok(())
@@ -344,6 +474,10 @@ impl Host for FixtureHost {
     }
 
     fn add_member(&mut self, group: &str, user: &str) -> io::Result<()> {
+        // `usermod` fails on an absent user — so does the fixture.
+        if !self.users.contains_key(user) {
+            return Err(io::Error::other(format!("no such user: {user}")));
+        }
         let g = self
             .groups
             .get_mut(group)
@@ -353,7 +487,19 @@ impl Host for FixtureHost {
     }
 
     fn mkdir(&mut self, path: &str) -> io::Result<()> {
-        std::fs::create_dir_all(self.phys(path))
+        if self.fail_ops.contains(path) {
+            return Err(io::Error::other(format!("{path}: injected failure")));
+        }
+        let phys = self.phys(path);
+        // The parent chain gets the same refusal the live walk gives:
+        // a planted symlink or an untrusted owner blocks the create.
+        self.check_chain(&phys)?;
+        std::fs::create_dir_all(&phys)?;
+        let md = std::fs::symlink_metadata(&phys)?;
+        if md.file_type().is_symlink() {
+            return Err(io::Error::other(format!("{path}: symlink — refusing")));
+        }
+        Ok(())
     }
 
     fn set_meta(&mut self, path: &str, owner: &str, group: &str, mode: u32) -> io::Result<()> {
@@ -367,13 +513,18 @@ impl Host for FixtureHost {
             .get(group)
             .map(|g| g.gid)
             .ok_or_else(|| io::Error::other(format!("no such group: {group}")))?;
+        if self.fail_ops.contains(path) {
+            return Err(io::Error::other(format!("{path}: injected failure")));
+        }
         let phys = self.phys(path);
+        self.check_chain(&phys)?;
         let entry = self.meta.entry(path.to_string()).or_insert(Meta {
             uid,
             gid,
             mode: 0,
             is_dir: phys.is_dir(),
             is_file: phys.is_file(),
+            is_symlink: false,
         });
         entry.uid = uid;
         entry.gid = gid;
@@ -391,11 +542,34 @@ impl Host for FixtureHost {
         group: &str,
         mode: u32,
     ) -> io::Result<()> {
+        if !src.is_absolute() {
+            return Err(io::Error::other(format!(
+                "{}: the helper source must be an absolute path — under sudo the cwd is untrusted",
+                src.display()
+            )));
+        }
+        self.check_source_meta(src)?;
+        if self.fail_ops.contains(dest) {
+            return Err(io::Error::other(format!("{dest}: injected failure")));
+        }
         let phys = self.phys(dest);
+        // Judge the whole chain *before* creating under it — a
+        // planted link or an untrusted intermediate refuses rather
+        // than being followed by `create_dir_all`.
+        self.check_chain(&phys)?;
         if let Some(p) = phys.parent() {
             std::fs::create_dir_all(p)?;
         }
-        std::fs::copy(src, &phys)?;
+        let mut rf = std::fs::File::open(src)?;
+        // Read-write: `copy_verified` re-reads the destination fd to
+        // prove what landed matches what left the source.
+        let wf = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&phys)?;
+        super::copy_verified(&mut rf, &wf)?;
         self.set_meta(dest, owner, group, mode)
     }
 

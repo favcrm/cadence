@@ -41,21 +41,32 @@ cargo build --release --bin cadence --bin cadence-agent-exec
 ## 2. Preview — print every action, change nothing
 
 ```sh
-sudo ./target/release/cadence agent-uid provision --dry-run
+sudo ./target/release/cadence agent-uid provision --dry-run \
+    --helper "$PWD/target/release/cadence-agent-exec"
 ```
+
+`--helper` is required and must be absolute — the file it names is the
+setuid bridge the boundary rests on, so provision never resolves one
+from the cwd: under sudo the cwd may be agent-writable, and a binary
+dropped there would be installed setuid-root.
 
 Read the printed lines against ADR §5: `groupadd` ×3, `useradd
 --system`, `usermod -aG` ×3, `install -d` per directory with its §3
 mode, the helper at `root:cadence-launch 4750`, the repos default ACL.
-`<helper>` in the install line means no binary was resolved — pass
-`--helper` in step 3.
 
 ## 3. Provision — once, as root, idempotent
 
 ```sh
 sudo ./target/release/cadence agent-uid provision \
-    --helper ./target/release/cadence-agent-exec
+    --helper "$PWD/target/release/cadence-agent-exec"
 ```
+
+The source is vetted before a byte moves: a symlink, a fifo or
+anything else that is not a regular file, a group/other-writable
+file, or an owner that is neither root nor the operator refuses the
+run — and the install re-verifies the copied bytes, so what lands at
+`/opt/cadence/libexec/cadence-agent-exec` is provably the file you
+named.
 
 What it does, in order — each step checks before it acts, so re-running
 is a no-op:
@@ -83,13 +94,18 @@ it: write under any home, write any git config (`safe.directory`,
 ## 4. Verify
 
 ```sh
-cadence agent-uid doctor          # expect: level ok
-cadence doctor --host             # the agent-uid row reports ok
+sudo ./target/release/cadence agent-uid doctor   # expect: level ok
+cadence doctor --host                          # agent-uid row
 ```
 
-Every row checks what §5 installed *and* the §3 mode/ownership table —
-a drifted mode, a stray group member, a missing setuid bit is a `fail`
-row with a remedy line.
+Run `agent-uid doctor` as root here: the `agent-user` row reads
+`/etc/shadow` to prove the account's password is locked, and an
+unprivileged seat cannot — from `ubuntu` the row reports `warn`
+("password lock unverifiable") even on a correctly provisioned host.
+The `doctor --host` row shares that ceiling: expect `ok` from a
+root-capable caller, `warn` with the same detail from uid 1000. Any
+other `fail`/`warn` row means what it says — a drifted mode, a stray
+group member, a missing setuid bit — and carries its remedy line.
 
 ## 5. Acceptance — the helper's live proofs, run for real
 
@@ -103,8 +119,14 @@ fallback clamp.
 ulimit -n 65538     # RLIMIT_NOFILE above the seat; sudo keeps it
 sudo -E env CADENCE_PROVISION_RUNBOOK=1 \
     cargo test --test agent_exec -- --ignored --test-threads 1
+sudo -E env CADENCE_PROVISION_RUNBOOK=1 \
+    cargo test --bin cadence-agent-exec -- --test-threads 1
 ```
 
+- The `--bin` run covers the helper's own unit proofs — including
+  `close_fds_has_no_65536_clamp` and `procfs_sweep_has_no_65536_clamp`,
+  which pin the unclamped fd sweep the `--test agent_exec` run
+  exercises end to end.
 - `CADENCE_PROVISION_RUNBOOK=1` turns every SKIP into **exit 42** — the
   runbook treats exit 42 as a failed acceptance, never as "nothing to
   test". If the sweep cannot seat fd 65537 the binary exits 42; raise
