@@ -1,4 +1,3 @@
-use super::*;
 
     #[test]
     fn approval_evidence_is_idempotent_and_separate_from_delivery() {

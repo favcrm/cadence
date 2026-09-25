@@ -8,7 +8,6 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 
 use super::agents::Agent;
-use super::plans::Task;
 use super::schema::Take;
 use super::{now, Sender, Store};
 
@@ -41,7 +40,7 @@ pub struct Message {
     pub completed: Option<f64>,
 }
 
-fn row_message(row: &rusqlite::Row) -> rusqlite::Result<Message> {
+pub(super) fn row_message(row: &rusqlite::Row) -> rusqlite::Result<Message> {
     let result: Option<String> = row.get("result")?;
     Ok(Message {
         seq: row.get("seq")?,
@@ -275,7 +274,7 @@ const TURNLESS_SOURCES_SQL: &str = "('worker_result','worker_notice','job_event'
 
 /// The `unknown` rows that fence an agent: every one except a nudge's,
 /// whose unconfirmed paste belongs to no turn (CAD-250).
-const FENCING_UNKNOWN_SQL: &str = "state='unknown' AND source != 'nudge'";
+pub(super) const FENCING_UNKNOWN_SQL: &str = "state='unknown' AND source != 'nudge'";
 
 /// Enqueue rejects a body over 48_000 bytes. The inlined spec is cut in
 /// bytes, on a char boundary, so a multibyte spec cannot blow that limit.
@@ -652,7 +651,7 @@ impl Store {
     /// `task_dispatch`, dispatch kickoffs) comes through here, and the
     /// daemon's reserved ids and sources are refused (CAD-445).
     #[allow(clippy::too_many_arguments)]
-    fn enqueue_tx(
+    pub(super) fn enqueue_tx(
         &self,
         tx: &Connection,
         alias: &str,
@@ -761,7 +760,7 @@ impl Store {
         Ok((false, "queued".to_string()))
     }
 
-    fn message_in(&self, conn: &Connection, id: &str) -> Result<Option<Message>> {
+    pub(super) fn message_in(&self, conn: &Connection, id: &str) -> Result<Option<Message>> {
         match conn.query_row("SELECT * FROM messages WHERE id=?", [id], row_message) {
             Ok(m) => Ok(Some(m)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -798,7 +797,7 @@ impl Store {
         Ok(None)
     }
 
-    fn recipient_binding(
+    pub(super) fn recipient_binding(
         &self,
         tx: &Connection,
         source_alias: &str,
@@ -819,7 +818,7 @@ impl Store {
         Ok((expected, current, reason))
     }
 
-    fn handoff_unresolved_exists(
+    pub(super) fn handoff_unresolved_exists(
         &self,
         tx: &Connection,
         delivery: &str,
@@ -845,7 +844,7 @@ impl Store {
     /// intentionally not retried into a later alias registration: the
     /// unresolved event keeps the result visible to the monitor/operator.
     #[allow(clippy::too_many_arguments)]
-    fn handoff_unresolved(
+    pub(super) fn handoff_unresolved(
         &self,
         tx: &Connection,
         task_id: Option<&str>,

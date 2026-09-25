@@ -28,7 +28,7 @@ pub fn check_commit_sha(sha: &str) -> Result<String> {
 /// call `message result --sha`, so the kickoff asks the agent to end
 /// its answer with this line. The LAST line wins — a worker discussing
 /// SHAs mid-answer cannot shadow the trailer it ends with.
-fn last_sha_line(text: &str) -> Option<String> {
+pub(super) fn last_sha_line(text: &str) -> Option<String> {
     text.lines().rev().find_map(|line| {
         let hex = line
             .trim()
@@ -45,7 +45,7 @@ fn last_sha_line(text: &str) -> Option<String> {
 /// other field is shared boilerplate. A fixed 32-hex digest (not the
 /// raw id) keeps the suffix bounded for `--message` override ids of
 /// arbitrary length; the same id always mints the same suffix.
-fn flatten_controls(text: &str) -> String {
+pub(super) fn flatten_controls(text: &str) -> String {
     text.chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect()
@@ -136,7 +136,7 @@ that line as the reported revision. Do not report a SHA you have not committed."
 /// stays `unknown`: a daemon restart or `agent stop` during the hold
 /// fences the worker (resume is refused), and a stop does not archive
 /// the session.
-fn cloud_hold_exit(message: &str, alias: &str, session: &str) -> String {
+pub(super) fn cloud_hold_exit(message: &str, alias: &str, session: &str) -> String {
     format!(
         "The held message `{message}` stays unknown. If the daemon restarts or the agent \
          is stopped before a poll settles it, that message fences the worker until it is \
@@ -149,7 +149,7 @@ fn cloud_hold_exit(message: &str, alias: &str, session: &str) -> String {
     )
 }
 
-fn cloud_kickoff_body(job: &Job, task: &Task, revision: i64) -> Result<String> {
+pub(super) fn cloud_kickoff_body(job: &Job, task: &Task, revision: i64) -> Result<String> {
     let spec = task.spec_path.as_deref().unwrap_or(job.spec_path.as_str());
     let raw = std::fs::read_to_string(spec)
         .unwrap_or_else(|_| "(spec text was not available to inline)".to_string());
@@ -220,7 +220,7 @@ fn cloud_kickoff_body(job: &Job, task: &Task, revision: i64) -> Result<String> {
 /// carry its acceptance criteria whole within `ceiling` — names the
 /// ceiling and the spec file, and says nothing was queued. A kickoff
 /// has no sender text, so its hint names only the criteria.
-fn criteria_too_long(
+pub(super) fn criteria_too_long(
     task: &str,
     kind: &str,
     total: usize,
@@ -259,7 +259,7 @@ pub fn kickoff_ceiling(provider: &str, endpoint_kind: &str) -> usize {
     }
 }
 
-fn kickoff_correlation(message_id: &str) -> String {
+pub(super) fn kickoff_correlation(message_id: &str) -> String {
     let digest = format!("{:x}", Sha256::digest(message_id.as_bytes()));
     format!(" Correlation: {}.", &digest[..32])
 }
@@ -269,7 +269,7 @@ fn kickoff_correlation(message_id: &str) -> String {
 /// the spec path, scope claim and acceptance reference, then the exact
 /// report contract. Managed endpoints never run `message result`, so
 /// they get the `SHA:`-trailer convention instead of `--sha`.
-fn kickoff_body(
+pub(super) fn kickoff_body(
     job: &Job,
     task: &Task,
     revision: i64,

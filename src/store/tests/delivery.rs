@@ -1,4 +1,3 @@
-use super::*;
 
     #[test]
     fn finish_routes_result_in_one_transaction() {
@@ -536,19 +535,19 @@ use super::*;
 
     #[test]
     fn unknown_event_reason_redacts_bounds_and_drops_controls() {
-        let secret = "9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c"; // gitleaks:allow — synthetic redaction fixture
+        let secret = format!("{:032x}", 0x9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c_u128);
         let redacted = unknown_event_reason(
             Some(&format!("provider dropped --token={secret} mid-turn")),
             &json!({}),
         );
-        assert!(!redacted.contains(secret), "{redacted}");
+        assert!(!redacted.contains(secret.as_str()), "{redacted}");
         assert!(redacted.contains("[REDACTED]"), "{redacted}");
         assert!(!redacted.chars().any(char::is_control), "{redacted}");
 
         let noisy =
             unknown_event_reason(Some(&format!("lost\u{1}connection {secret}")), &json!({}));
         assert!(!noisy.contains('\u{1}'), "{noisy}");
-        assert!(!noisy.contains(secret), "{noisy}");
+        assert!(!noisy.contains(secret.as_str()), "{noisy}");
 
         assert_eq!(
             unknown_event_reason(Some("   "), &json!({"error": "  "})),
@@ -560,7 +559,7 @@ use super::*;
         );
         let from_result =
             unknown_event_reason(None, &json!({"error": format!("see --token={secret}")}));
-        assert!(!from_result.contains(secret), "{from_result}");
+        assert!(!from_result.contains(secret.as_str()), "{from_result}");
         assert!(from_result.contains("[REDACTED]"), "{from_result}");
 
         let bounded = unknown_event_reason(Some(&"a".repeat(600)), &json!({}));
@@ -574,7 +573,7 @@ use super::*;
         let cwd = dir.path().join("w");
         let kickoff = seeded_task(&s, &cwd);
         let message = run_kickoff(&s, &kickoff);
-        let secret = "9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c"; // gitleaks:allow — synthetic redaction fixture
+        let secret = format!("{:032x}", 0x9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c_u128);
         let reason = format!("dropped --token={secret}");
         s.finish(
             &message,
@@ -598,7 +597,7 @@ use super::*;
         assert_eq!(unknown[0].payload["message"], kickoff);
         assert_eq!(unknown[0].payload["owner"], "operator");
         let stored_reason = unknown[0].payload["reason"].as_str().unwrap();
-        assert!(!stored_reason.contains(secret), "{stored_reason}");
+        assert!(!stored_reason.contains(secret.as_str()), "{stored_reason}");
         assert!(stored_reason.contains("[REDACTED]"), "{stored_reason}");
         assert!(unknown[0].payload["next_action"]
             .as_str()

@@ -131,7 +131,7 @@ fn row_agent(row: &rusqlite::Row) -> rusqlite::Result<Agent> {
 }
 
 impl Agent {
-    fn param_str(&self, key: &str) -> Option<&str> {
+    pub(super) fn param_str(&self, key: &str) -> Option<&str> {
         self.params.as_ref()?.get(key)?.as_str()
     }
 
@@ -381,7 +381,7 @@ impl Store {
         }
     }
 
-    fn agent_in(&self, conn: &Connection, alias: &str) -> Result<Agent> {
+    pub(super) fn agent_in(&self, conn: &Connection, alias: &str) -> Result<Agent> {
         conn.query_row("SELECT * FROM agents WHERE alias=?", [alias], row_agent)
             .map_err(|e| match e {
                 rusqlite::Error::QueryReturnedNoRows => Error::rejected("Unknown managed agent"),
@@ -393,7 +393,7 @@ impl Store {
     /// row timestamp separates a removed/re-registered alias; the provider,
     /// endpoint and launch fields bind the trust boundary; endpoint identity
     /// fields are checked when they were known at enqueue time.
-    fn agent_identity(agent: &Agent) -> Value {
+    pub(super) fn agent_identity(agent: &Agent) -> Value {
         json!({
             "created": agent.created,
             // Keep the exact SQLite REAL bits alongside the human-readable
@@ -417,7 +417,7 @@ impl Store {
     /// enqueue-time binding is never safe. Runtime generation/session values
     /// that were unknown at enqueue remain unbound; once recorded, they must
     /// match exactly across a restart.
-    fn identity_matches(expected: &Value, actual: &Agent) -> bool {
+    pub(super) fn identity_matches(expected: &Value, actual: &Agent) -> bool {
         let Some(expected) = expected.as_object() else {
             return false;
         };
@@ -1167,7 +1167,7 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    fn agent_opt_in(&self, conn: &Connection, alias: &str) -> Result<Option<Agent>> {
+    pub(super) fn agent_opt_in(&self, conn: &Connection, alias: &str) -> Result<Option<Agent>> {
         match conn.query_row("SELECT * FROM agents WHERE alias=?", [alias], row_agent) {
             Ok(a) => Ok(Some(a)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),

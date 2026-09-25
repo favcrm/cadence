@@ -10,12 +10,12 @@ use super::messages::{Message, FENCING_UNKNOWN_SQL};
 use super::plans::{Job, Task};
 use super::{now, Store};
 
-const UNKNOWN_EVENT_REASON_CHARS: usize = 512;
+pub(super) const UNKNOWN_EVENT_REASON_CHARS: usize = 512;
 
 /// Keep the provider's uncertainty account useful to an operator without
 /// copying credentials, control characters, or an unbounded provider blob
 /// into the durable event stream.
-fn unknown_event_reason(error: Option<&str>, result: &Value) -> String {
+pub(super) fn unknown_event_reason(error: Option<&str>, result: &Value) -> String {
     let reason = error
         .filter(|value| !value.trim().is_empty())
         .or_else(|| {
@@ -219,7 +219,7 @@ impl Store {
     /// naming `reason`. `alias` scopes to one agent (its actor stopped);
     /// `older_than` limits to rows created before that epoch (the TTL).
     /// Returns the `(id, alias)` pairs it closed.
-    fn cancel_nudges_in(
+    pub(super) fn cancel_nudges_in(
         tx: &Connection,
         alias: Option<&str>,
         reason: &str,
@@ -351,7 +351,7 @@ impl Store {
         Ok(true)
     }
 
-    fn finish_in(
+    pub(super) fn finish_in(
         &self,
         tx: &Connection,
         message: &Message,
@@ -434,7 +434,7 @@ impl Store {
     /// The `reply_to` outbox: enqueue the result notification on the
     /// target in the caller's transaction. Routed deliveries get a
     /// deterministic id and no `reply_to`, so they cannot create loops.
-    fn route_result(
+    pub(super) fn route_result(
         &self,
         tx: &Connection,
         message: &Message,
@@ -535,7 +535,7 @@ impl Store {
     /// `cadence-notice:` namespace, disjoint from `cadence-result:`,
     /// so it can never collide with the real verdict a later reconcile
     /// may route.
-    fn route_notice(
+    pub(super) fn route_notice(
         &self,
         tx: &Connection,
         message: &Message,
@@ -949,7 +949,7 @@ impl Store {
     /// is stale by the time this runs. `dedupe` names the triggering
     /// transition (e.g. `verdict:42`) so each distinct event notifies
     /// once while a retried write is a no-op.
-    fn route_job_event(
+    pub(super) fn route_job_event(
         &self,
         tx: &Connection,
         job: &Job,
@@ -1036,7 +1036,7 @@ impl Store {
     /// `job_event` notifications attach `task_id` for indexing but
     /// never drive state. Guarded on the stored state so a cancelled
     /// or already-advanced task is untouched.
-    fn task_on_running(
+    pub(super) fn task_on_running(
         &self,
         tx: &Connection,
         message_id: &str,

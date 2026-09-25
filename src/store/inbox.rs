@@ -4,7 +4,6 @@ use crate::adapter::registry;
 use crate::error::{Error, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
-use std::collections::HashSet;
 
 use super::agents::Agent;
 use super::messages::{row_message, Message};

@@ -7,12 +7,11 @@ use serde_json::json;
 use std::path::Path;
 use std::sync::Mutex;
 
-use super::agents::Agent;
 use super::effects;
 use super::messages::{Message, FENCING_UNKNOWN_SQL};
 use super::platform;
 use super::threads;
-use super::{now, Store, BUSY_TIMEOUT};
+use super::{Store, BUSY_TIMEOUT};
 
 /// Read-only open of the daemon store from another process, with the
 /// shared busy timeout — never creates or migrates the file.

@@ -627,7 +627,7 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    fn monitor_alert_kind(kind: &str) -> bool {
+    pub(super) fn monitor_alert_kind(kind: &str) -> bool {
         matches!(
             kind,
             "turn_stalled"

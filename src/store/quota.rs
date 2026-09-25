@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use super::agents::Agent;
 use super::now;
 
-fn quota_now_iso() -> String {
+pub(super) fn quota_now_iso() -> String {
     crate::issue::time::iso(crate::issue::time::now_epoch())
 }
 
@@ -13,7 +13,7 @@ fn quota_now_iso() -> String {
 /// value, while Codex's nullable window fields explicitly replace stale
 /// telemetry with a JSON null. Other nullable fields, including account
 /// identity, remain conservative and retain the last confirmed value.
-fn merge_quota_json(target: &mut Value, patch: &Value) {
+pub(super) fn merge_quota_json(target: &mut Value, patch: &Value) {
     match (target, patch) {
         (Value::Object(target), Value::Object(patch)) => {
             for (key, value) in patch {
@@ -63,7 +63,7 @@ fn quota_state(data: &Value) -> (&'static str, Option<&'static str>) {
     ("available", None)
 }
 
-fn canonical_quota(
+pub(super) fn canonical_quota(
     alias: &str,
     provider: &str,
     thread_id: &str,
@@ -120,7 +120,7 @@ fn canonical_quota(
 /// absent, stale, or does not bind to the current agent identity.
 const QUOTA_EVIDENCE_MAX_AGE_SECS: f64 = 300.0;
 
-fn automatic_quota_error(agent: &Agent) -> Option<String> {
+pub(super) fn automatic_quota_error(agent: &Agent) -> Option<String> {
     let quota = agent.quota.as_ref();
     let Some(quota) = quota else {
         return Some("quota unknown: no account allowance telemetry".to_string());

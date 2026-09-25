@@ -1,4 +1,3 @@
-use super::*;
 
     #[test]
     fn current_verdict_follows_the_open_revision() {

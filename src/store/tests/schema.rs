@@ -1,4 +1,3 @@
-use super::*;
 
     /// A crash between ALTER and the version bump must not wedge the
     /// database: the migration is one transaction, and a half-applied

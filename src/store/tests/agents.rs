@@ -1,4 +1,3 @@
-use super::*;
 
     /// The conditional transition used by approval relaxation cannot
     /// overwrite a finished/fenced state or its error reason.

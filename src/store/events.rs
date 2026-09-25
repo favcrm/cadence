@@ -6,8 +6,6 @@ use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 use std::path::Path;
 
-use super::messages::Message;
-use super::plans::Job;
 use super::{now, Store};
 
 /// Operator approval evidence (CAD-217) rides its own event stream.
@@ -134,7 +132,7 @@ pub struct Event {
     pub at: f64,
 }
 
-fn row_event(row: &rusqlite::Row) -> rusqlite::Result<Event> {
+pub(super) fn row_event(row: &rusqlite::Row) -> rusqlite::Result<Event> {
     let payload: String = row.get("payload")?;
     Ok(Event {
         seq: row.get("seq")?,
@@ -158,14 +156,14 @@ impl Event {
 }
 
 impl Store {
-    fn event(conn: &Connection, alias: &str, kind: &str, payload: Value) -> Result<()> {
+    pub(super) fn event(conn: &Connection, alias: &str, kind: &str, payload: Value) -> Result<()> {
         Self::event_scoped(conn, alias, kind, payload, None, None)
     }
 
     /// Event insert that additionally records the job/task the event
     /// was caused by — the `job events` view is one indexed query
     /// across these rows.
-    fn event_scoped(
+    pub(super) fn event_scoped(
         conn: &Connection,
         alias: &str,
         kind: &str,

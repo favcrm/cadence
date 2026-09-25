@@ -194,7 +194,7 @@ impl Verdict {
 }
 
 impl Store {
-    fn job_in(&self, conn: &Connection, id: &str) -> Result<Job> {
+    pub(super) fn job_in(&self, conn: &Connection, id: &str) -> Result<Job> {
         conn.query_row("SELECT * FROM jobs WHERE id=?", [id], row_job)
             .map_err(|e| match e {
                 rusqlite::Error::QueryReturnedNoRows => {
@@ -204,7 +204,7 @@ impl Store {
             })
     }
 
-    fn task_in(&self, conn: &Connection, id: &str) -> Result<Task> {
+    pub(super) fn task_in(&self, conn: &Connection, id: &str) -> Result<Task> {
         conn.query_row("SELECT * FROM tasks WHERE id=?", [id], row_task)
             .map_err(|e| match e {
                 rusqlite::Error::QueryReturnedNoRows => {
@@ -559,7 +559,7 @@ impl Store {
     /// Eligible workers for a job: the PM itself or a group member
     /// (`params.upstream == pm`). Dispatch can never bind outside the
     /// job's group — routed results land on the PM via that same wire.
-    fn check_group_member(&self, job: &Job, worker: &Agent) -> Result<()> {
+    pub(super) fn check_group_member(&self, job: &Job, worker: &Agent) -> Result<()> {
         let member = worker.alias == job.pm_alias
             || worker
                 .params
