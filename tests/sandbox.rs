@@ -152,6 +152,36 @@ fn daemon_answers(state: &Path) -> bool {
     client::rpc_timeout(state, "health", json!({}), Duration::from_secs(5)).is_ok()
 }
 
+/// Keep the suite's fence on `port` until the returned `File` drops:
+/// `up` holds the pick-to-bind lease only until its board binds, so
+/// the port the sandbox goes on claiming is free and unfenced the
+/// moment `down` kills the board — a parallel `test_port` can take it
+/// before the probe or the next `up`. Holding the `flock` here keeps
+/// it fenced across `down`, and recording `name`'s claim lets a later
+/// `up` know the hold is for this sandbox.
+fn fence_port(port: u16, name: &str) -> std::fs::File {
+    use std::os::fd::AsRawFd;
+    let mut lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(Path::new("/tmp/cadence-test-ports").join(format!("{port}.lock")))
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    // SAFETY: plain syscall on a descriptor this function owns.
+    while unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "port {port} fence never freed"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    lock.set_len(0).unwrap();
+    lock.write_all(cadence_agent::sandbox::port_claim(name).as_bytes())
+        .unwrap();
+    lock
+}
+
 /// Poll for a file another process writes, bounded.
 fn wait_file(path: &Path, secs: u64) -> String {
     let deadline = std::time::Instant::now() + Duration::from_secs(secs);
@@ -199,6 +229,10 @@ fn sandbox_up_isolates_state_tracker_and_port_then_down_stops_it() {
     let port = v["port"].as_u64().unwrap() as u16;
     assert!((3110..=3199).contains(&port), "{v}");
     assert_eq!(v["url"], format!("http://127.0.0.1:{port}"));
+    // The sandbox claims this port through `down` and the next `up`;
+    // hold the suite's fence for it so a parallel test cannot take it
+    // in the window where the board is down.
+    let _fence = fence_port(port, "iso");
 
     let marker: Value =
         serde_json::from_str(&std::fs::read_to_string(root.join(".cadence-sandbox")).unwrap())

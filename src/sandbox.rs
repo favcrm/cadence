@@ -452,6 +452,13 @@ fn require_marker(sb: &Sandbox) -> Result<Value> {
 /// ports, and the fence `choose_port` returns is held until `up`'s
 /// `ui start` has bound — neither side can take the other's port in
 /// its pick-to-bind window. Test-only: unset outside the suite.
+///
+/// The fence outlives that window only if a suite member keeps it: a
+/// sandbox goes on claiming its port in `state/ui.json` after `up`
+/// returns, and the port is free and unfenced the moment `down` kills
+/// the board. A holder records whose claim it protects by writing
+/// `sandbox:<name>` into the lock file — [`port_claim`] — so a later
+/// `up` can tell "fenced for me" from "fenced by another test".
 pub const TEST_PORT_LOCK_DIR: &str = "CADENCE_TEST_PORT_LOCK_DIR";
 
 /// The lease dir [`TEST_PORT_LOCK_DIR`] names — created when absent
@@ -483,6 +490,28 @@ fn fenced_lease(lock_dir: &Option<PathBuf>, port: u16) -> std::io::Result<Option
     Ok(Some(lock))
 }
 
+/// What the holder of a port's fence writes into its lock file while
+/// it protects `name`'s claim — see [`TEST_PORT_LOCK_DIR`]. `up`
+/// writes it when it fences; a suite member that keeps the fence
+/// across `down` writes it too, and a later `up` for the same sandbox
+/// reads it to know the hold is for its own claim.
+pub fn port_claim(name: &str) -> String {
+    format!("sandbox:{name}")
+}
+
+/// `true` when the port's fence is already held for this sandbox —
+/// [`fenced_lease`] lost the `flock`, and the lock file says the
+/// holder protects this sandbox's claim. `false` for no lock dir, an
+/// unreadable file, or a foreign claim — either way the port is not
+/// ours to take.
+fn claim_held(lock_dir: &Option<PathBuf>, port: u16, sb: &Sandbox) -> bool {
+    let Some(dir) = lock_dir else {
+        return false;
+    };
+    std::fs::read_to_string(dir.join(format!("{port}.lock")))
+        .is_ok_and(|text| text.trim() == port_claim(&sb.name))
+}
+
 fn bindable(port: u16) -> bool {
     TcpListener::bind(("127.0.0.1", port)).is_ok()
 }
@@ -499,13 +528,16 @@ fn persisted_port(state_dir: &Path) -> Option<u16> {
 /// no lease fences. 3010 is production's in every case. The returned
 /// lease (when a lock dir is configured) is held until the caller
 /// drops it — `up` keeps it until the board has bound.
-fn choose_port(sb: &Sandbox, wanted: Option<u16>) -> Result<(u16, Option<std::fs::File>)> {
+fn choose_port(
+    sb: &Sandbox,
+    wanted: Option<u16>,
+    lock_dir: &Option<PathBuf>,
+) -> Result<(u16, Option<std::fs::File>)> {
     let state = sb.state_dir();
     let running = crate::ui::detached_pid(&state)
         .is_some()
         .then(|| persisted_port(&state))
         .flatten();
-    let lock_dir = port_lock_dir();
     // Where the port came from decides the hint when it cannot be used:
     // only a `--port` the caller typed can be "omitted".
     let (port, flag, mut fence) = match (wanted, running) {
@@ -530,7 +562,7 @@ fn choose_port(sb: &Sandbox, wanted: Option<u16>) -> Result<(u16, Option<std::fs
                     if taken.contains(&port) {
                         continue;
                     }
-                    let Ok(lease) = fenced_lease(&lock_dir, port) else {
+                    let Ok(lease) = fenced_lease(lock_dir, port) else {
                         continue;
                     };
                     if bindable(port) {
@@ -562,14 +594,30 @@ fn choose_port(sb: &Sandbox, wanted: Option<u16>) -> Result<(u16, Option<std::fs
     }
     if running.is_none() {
         if fence.is_none() {
-            fence = fenced_lease(&lock_dir, port).map_err(|_| {
-                Error::rejected(format!("port {port} is in use on 127.0.0.1 — {hint}"))
-            })?;
+            match fenced_lease(lock_dir, port) {
+                Ok(lease) => fence = lease,
+                // A suite member may hold the fence for this sandbox's
+                // own claim — its hold covers the bind, so no lease.
+                Err(_) if claim_held(lock_dir, port, sb) => {}
+                Err(_) => {
+                    // The holder may have gone between the `flock`
+                    // and the claim read — take the lease if it did.
+                    fence = fenced_lease(lock_dir, port).map_err(|_| {
+                        Error::rejected(format!("port {port} is in use on 127.0.0.1 — {hint}"))
+                    })?;
+                }
+            }
         }
         if !bindable(port) {
             return Err(Error::rejected(format!(
                 "port {port} is in use on 127.0.0.1 — {hint}"
             )));
+        }
+        if let Some(lease) = &fence {
+            use std::io::Write;
+            let mut lease = lease;
+            let _ = lease.set_len(0);
+            let _ = lease.write_all(port_claim(&sb.name).as_bytes());
         }
     }
     Ok((port, fence))
@@ -690,7 +738,7 @@ fn up(sb: &Sandbox, wanted_port: Option<u16>) -> Result<Value> {
     // The chosen port's lease is held from the pick until `ui start`
     // has bound the board: a cooperating suite can neither take the
     // port we picked nor have its own leased port stolen in the gap.
-    let (port, _lease) = choose_port(sb, wanted_port)?;
+    let (port, _lease) = choose_port(sb, wanted_port, &port_lock_dir())?;
     let exe = std::env::current_exe()?;
     std::fs::create_dir_all(sb.state_dir())?;
     {
@@ -990,10 +1038,10 @@ mod tests {
             format!(r#"{{"port":{port}}}"#),
         )
         .unwrap();
-        let persisted = choose_port(&sb, None).unwrap_err().to_string();
+        let persisted = choose_port(&sb, None, &None).unwrap_err().to_string();
         assert!(persisted.contains("state/ui.json"), "{persisted}");
         assert!(!persisted.contains("omit it"), "{persisted}");
-        let typed = choose_port(&sb, Some(port)).unwrap_err().to_string();
+        let typed = choose_port(&sb, Some(port), &None).unwrap_err().to_string();
         assert!(typed.contains("omit it"), "{typed}");
     }
 
@@ -1053,5 +1101,57 @@ mod tests {
         assert!(fenced_lease(&lock_dir, 3112).unwrap().is_some());
         drop(held);
         assert!(fenced_lease(&lock_dir, 3111).unwrap().is_some());
+    }
+
+    /// A fence the suite already holds for the sandbox's own claim is
+    /// not a refusal — `choose_port` takes the port with no lease of
+    /// its own while the holder keeps the bind window closed. A held
+    /// fence with a foreign (or no) claim still refuses.
+    #[test]
+    fn a_fence_held_for_the_sandbox_is_not_a_refusal() {
+        use std::io::Write;
+        let dir = tempfile::TempDir::new().unwrap();
+        let lock_dir = Some(dir.path().join("locks"));
+        std::fs::create_dir_all(lock_dir.as_ref().unwrap()).unwrap();
+        let free = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = free.local_addr().unwrap().port();
+        drop(free);
+        let sb = Sandbox {
+            name: "iso".into(),
+            base: dir.path().join("base"),
+            root: dir.path().join("base").join("iso"),
+        };
+        std::fs::create_dir_all(sb.state_dir()).unwrap();
+        std::fs::write(
+            sb.state_dir().join("ui.json"),
+            format!(r#"{{"port":{port}}}"#),
+        )
+        .unwrap();
+
+        // The suite holds the fence without a claim: refused.
+        let foreign = fenced_lease(&lock_dir, port).unwrap().unwrap();
+        assert!(choose_port(&sb, None, &lock_dir).is_err());
+
+        // The same hold named for this sandbox: proceeds, and the
+        // caller's fence — not ours — covers the bind.
+        let mut claim = &foreign;
+        claim.write_all(port_claim("iso").as_bytes()).unwrap();
+        let (picked, fence) = choose_port(&sb, None, &lock_dir).unwrap();
+        assert_eq!(picked, port);
+        assert!(fence.is_none());
+
+        // Another sandbox's claim is foreign to this one.
+        let other = Sandbox {
+            name: "other".into(),
+            base: dir.path().join("base"),
+            root: dir.path().join("base").join("other"),
+        };
+        std::fs::create_dir_all(other.state_dir()).unwrap();
+        std::fs::write(
+            other.state_dir().join("ui.json"),
+            format!(r#"{{"port":{port}}}"#),
+        )
+        .unwrap();
+        assert!(choose_port(&other, None, &lock_dir).is_err());
     }
 }
