@@ -63,7 +63,8 @@ fn daemon_restart_skips_fenced_and_relaunches_healthy() {
         json!({"alias": "fenced", "status": "interrupted"}),
     )
     .unwrap();
-    d.rpc("agent_resume", json!({"alias": "fenced"})).unwrap();
+    d.operator_rpc("agent_resume", json!({"alias": "fenced"}))
+        .unwrap();
     d.wait_agent("fenced", "idle", 15);
     d.wait_message("fenced", "m2", &["completed"], 15);
 }
@@ -80,7 +81,8 @@ fn daemon_restart_reports_fenced_turn() {
     let mock = d.mock_devin();
     d.register_devin("dv1", None);
     d.wait_agent("dv1", "idle", 20);
-    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "dv1"}))
+        .unwrap();
     d.send("dv1", json!({"text": "task", "message": "m1"}))
         .unwrap();
     let _token = pty_token(&d, "dv1", "m1");
@@ -117,7 +119,8 @@ fn daemon_restart_reports_kept_turn() {
     let _mock = d.mock_devin();
     d.register_devin("dv", None);
     d.wait_agent("dv", "idle", 20);
-    d.rpc("agent_ready", json!({"alias": "dv"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "dv"}))
+        .unwrap();
     d.send("dv", json!({"text": "task", "message": "m1"}))
         .unwrap();
     let token = pty_token(&d, "dv", "m1");
@@ -1368,7 +1371,9 @@ fn auto_stop_idle_agent_stops_with_event_label_and_resumes() {
     assert!(table.contains(label), "{table}");
 
     // Resume brings it back on its saved thread; the marker is gone.
-    let out = d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
+    let out = d
+        .operator_rpc("agent_resume", json!({"alias": "w1"}))
+        .unwrap();
     assert_eq!(out["state"], "starting", "{out}");
     let agent = d.wait_agent("w1", "idle", 20);
     assert!(agent["auto_stopped"].is_null(), "{agent}");
@@ -1558,13 +1563,15 @@ fn auto_resume_after_restart_only_for_the_timers_stop() {
             d.wait_agent(alias, "idle", 20);
         }
         // An operator/PM stop before the timer could act.
-        d.rpc("agent_stop", json!({"alias": "w-op"})).unwrap();
+        d.operator_rpc("agent_stop", json!({"alias": "w-op"}))
+            .unwrap();
         offset.store(7200, std::sync::atomic::Ordering::SeqCst);
         wait_auto_stopped(&d, "w-auto");
         wait_auto_stopped(&d, "w-both");
         offset.store(0, std::sync::atomic::Ordering::SeqCst);
         // A manual stop after the auto-stop supersedes it.
-        d.rpc("agent_stop", json!({"alias": "w-both"})).unwrap();
+        d.operator_rpc("agent_stop", json!({"alias": "w-both"}))
+            .unwrap();
         let both = d.rpc("agent_show", json!({"alias": "w-both"})).unwrap()["agent"].clone();
         assert!(both["auto_stopped"].is_null(), "{both}");
     }

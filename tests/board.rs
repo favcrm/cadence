@@ -2667,7 +2667,7 @@ fn wait_port_closed(port: u16) {
 /// `enabled=0`, so no actor ever opens it and overwrites the plant —
 /// the same recipe common/mod.rs's `plant_pane` uses.
 fn plant_pane(d: &UiDaemon, alias: &str, pid: u32) {
-    d.rpc(
+    let _ = d.operator_rpc(
         "agent_register",
         json!({"alias": alias, "provider": "inbox", "endpoint_kind": "inbox",
                "cwd": d.state().to_str().unwrap()}),
@@ -3098,13 +3098,13 @@ fn ui_write_caller_pty_tie_is_forgeable_residual_pinned() {
 /// dispatched so the task is live. Returns (job_id, task_id).
 fn bound_job(pm: &Path, d: &UiDaemon, issue: &str) -> (String, String) {
     let cwd = pm.to_str().unwrap();
-    d.rpc(
+    let _ = d.operator_rpc(
         "agent_register",
         json!({"alias": "pm", "provider": "fake",
                "endpoint_kind": "fake", "cwd": cwd}),
     );
     // The worker must sit in the pm's group or dispatch refuses it.
-    d.rpc(
+    let _ = d.operator_rpc(
         "agent_register",
         json!({"alias": "wk", "provider": "fake",
                "endpoint_kind": "fake", "cwd": cwd,
@@ -3128,7 +3128,7 @@ fn bound_job(pm: &Path, d: &UiDaemon, issue: &str) -> (String, String) {
                "acceptance": "verify against CAD-1"}),
     );
     let task_id = task["task"]["id"].as_str().unwrap().to_string();
-    d.rpc("task_dispatch", json!({"task": task_id, "by": "operator"}));
+    let _ = d.operator_rpc("task_dispatch", json!({"task": task_id, "by": "operator"}));
     (job_id, task_id)
 }
 
@@ -3255,12 +3255,12 @@ fn ui_overview_surfaces_durable_monitor_alert_and_acknowledges_it() {
     let d = UiDaemon::start();
     seed(pm.path(), &d.state());
     let cwd = pm.path().to_str().unwrap();
-    d.rpc(
+    let _ = d.operator_rpc(
         "agent_register",
         json!({"alias": "pm", "provider": "fake",
                "endpoint_kind": "fake", "cwd": cwd}),
     );
-    d.rpc(
+    let _ = d.operator_rpc(
         "agent_register",
         json!({"alias": "wk", "provider": "fake",
                "endpoint_kind": "fake", "cwd": cwd,
@@ -3278,7 +3278,7 @@ fn ui_overview_surfaces_durable_monitor_alert_and_acknowledges_it() {
         json!({"job": "ui-monitor-job", "task": "ui-monitor-task",
                "assignee": "wk", "acceptance": "observe the monitor"}),
     );
-    d.rpc(
+    let _ = d.operator_rpc(
         "monitor_register",
         json!({"monitor": "ui-monitor", "project": "cadence",
                "owner": "watchdog", "tasks": ["ui-monitor-task"],
@@ -3400,7 +3400,7 @@ fn ui_agent_detail_route_and_guards() {
     let pm = TempDir::new().unwrap();
     let d = UiDaemon::start();
     seed(pm.path(), &d.state());
-    d.rpc(
+    let _ = d.operator_rpc(
         "agent_register",
         json!({"alias": "wk", "provider": "fake",
                "endpoint_kind": "fake", "cwd": pm.path().to_str().unwrap()}),
@@ -3578,7 +3578,7 @@ fn ui_stream_sse_and_guards() {
     );
 
     // An agent change moves the agent fingerprint → `event: agents`.
-    d.rpc(
+    let _ = d.operator_rpc(
         "agent_register",
         json!({"alias": "late", "provider": "fake",
                "endpoint_kind": "fake", "cwd": pm.path().to_str().unwrap()}),
@@ -3644,19 +3644,19 @@ fn ui_agents_payload_covers_all_kinds() {
     let cwd = pm.path().to_str().unwrap();
 
     // Mailbox — inbox endpoints are counted separately, never fenced.
-    d.rpc(
+    let _ = d.operator_rpc(
         "agent_register",
         json!({"alias": "obs", "provider": "inbox",
                "endpoint_kind": "inbox", "cwd": cwd}),
     );
     // Idle worker — registered, no turn in flight.
-    d.rpc(
+    let _ = d.operator_rpc(
         "agent_register",
         json!({"alias": "idle1", "provider": "fake",
                "endpoint_kind": "fake", "cwd": cwd}),
     );
     // Busy worker — SLEEP holds the turn so `running` stays up.
-    d.rpc(
+    let _ = d.operator_rpc(
         "agent_register",
         json!({"alias": "busy1", "provider": "fake",
                "endpoint_kind": "fake", "cwd": cwd}),
@@ -3672,14 +3672,14 @@ fn ui_agents_payload_covers_all_kinds() {
             .unwrap_or(false)
     });
     // Stopped worker — registered then stopped.
-    d.rpc(
+    let _ = d.operator_rpc(
         "agent_register",
         json!({"alias": "stop1", "provider": "fake",
                "endpoint_kind": "fake", "cwd": cwd}),
     );
-    d.rpc("agent_stop", json!({"alias": "stop1"}));
+    let _ = d.operator_rpc("agent_stop", json!({"alias": "stop1"}));
     // Fenced worker — DISCONNECT drops mid-turn → unknown → attention.
-    d.rpc(
+    let _ = d.operator_rpc(
         "agent_register",
         json!({"alias": "fenced1", "provider": "fake",
                "endpoint_kind": "fake", "cwd": cwd}),
@@ -7241,7 +7241,7 @@ fn dispatch_respects_claims() {
         if let Some(up) = upstream {
             req["params"] = json!(format!("{{\"upstream\":\"{up}\"}}"));
         }
-        d.rpc("agent_register", req);
+        let _ = d.operator_rpc("agent_register", req);
     }
     for title in ["Lane", "Outside"] {
         assert!(cli(&pm, &state, &["issue", "new", title, "--project", "demo"]).0);
@@ -11526,7 +11526,7 @@ fn model_defaults_http_round_trip_guards_and_conflict() {
         "invalid_request"
     );
 
-    d.rpc(
+    let _ = d.operator_rpc(
         "agent_register",
         json!({"alias": "box", "provider": "inbox", "endpoint_kind": "inbox", "team_role": "ops", "role": "worker"}),
     );

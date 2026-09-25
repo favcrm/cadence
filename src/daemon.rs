@@ -608,8 +608,13 @@ impl Shared {
         // CAD-482: the seam check runs before the lease is taken or
         // the store opens — a fixture that arms on the production dir
         // or outside the temp root refuses here, before anything is
-        // written.
-        let seam = crate::test_seam::arm_if_requested(state_dir, opts.test_seam)?;
+        // written. A state dir that still carries a minted token
+        // re-arms: `daemon restart` spawns this process without the
+        // arming env.
+        let seam = crate::test_seam::arm_if_requested(
+            state_dir,
+            opts.test_seam || crate::test_seam::armed(state_dir),
+        )?;
         // CAD-538: a configured hosted lease must be held before the
         // store opens — `recover` writes at open. A daemon that cannot
         // take the lease refuses here having written nothing.
@@ -11078,8 +11083,12 @@ pub fn serve_with(state_dir: &Path, opts: ServeOptions) -> Result<()> {
     crate::backup::refuse_interrupted_restore(state_dir)?;
     // CAD-482: the seam confines a fixture before the lease or the
     // store writes anything — a refused arm leaves only the singleton
-    // lock behind.
-    let seam = crate::test_seam::arm_if_requested(state_dir, opts.test_seam)?;
+    // lock behind. A state dir still carrying a minted token re-arms:
+    // `daemon restart` respawns this process without the arming env.
+    let seam = crate::test_seam::arm_if_requested(
+        state_dir,
+        opts.test_seam || crate::test_seam::armed(state_dir),
+    )?;
     // CAD-538: a configured hosted lease is taken before the marker is
     // consumed and before the store opens — a daemon that cannot hold
     // it refuses here having written nothing but the singleton lock.

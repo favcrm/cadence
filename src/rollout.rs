@@ -992,6 +992,22 @@ fn preview_force_refusal(
 /// `peer::operator_proof` for this process. Pane pids come from a
 /// read-only peek. Enrolled roots come from `slots.json`.
 fn require_operator_proof(state_dir: &Path, verb: &str) -> Result<()> {
+    // CAD-482: a seam assertion on this process answers before
+    // ancestry — a fixture's spawned operator child asserts `operator`
+    // in-band, where `/proc` ancestry would refuse a pane's descendant.
+    if let Some(who) = crate::test_seam::process_asserted(state_dir)? {
+        return match who {
+            crate::test_seam::Asserted::Operator => Ok(()),
+            crate::test_seam::Asserted::Agent(alias) => Err(Error::rejected(format!(
+                "{verb} is an operator action — this process is test-seam \
+                 agent '{alias}', not provably the operator"
+            ))),
+            crate::test_seam::Asserted::Unproven => Err(Error::rejected(format!(
+                "{verb} is an operator action — this process carries a \
+                 test-seam 'unproven' assertion, not operator proof"
+            ))),
+        };
+    }
     let panes = registered_panes(state_dir)?;
     let roots = enrolled_roots(state_dir)?;
     let daemon_pid = daemon_pid_for_proof(state_dir)?;

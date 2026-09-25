@@ -558,6 +558,19 @@ impl TestDaemon {
         self.rpc("agent_send", Value::Object(fields))
     }
 
+    /// [`Self::send`] as the operator: writes into an operator thread
+    /// need positive proof (CAD-384), so the call goes
+    /// [`Self::operator_rpc`]'s way however the suite is run.
+    pub fn operator_send(
+        &self,
+        alias: impl AsRef<str>,
+        fields: Value,
+    ) -> cadence_agent::Result<Value> {
+        let mut fields = fields.as_object().unwrap().clone();
+        fields.insert("alias".into(), json!(alias.as_ref()));
+        self.operator_rpc("agent_send", Value::Object(fields))
+    }
+
     /// `message_report` for turn `message` under `token` — every report
     /// site carries exactly these four fields.
     pub fn report(
@@ -3836,7 +3849,7 @@ impl TestDaemon {
         kind: &str,
         cwd: &str,
     ) -> cadence_agent::Result<Value> {
-        self.rpc(
+        self.fixture_rpc(
             "agent_register",
             json!({"alias": alias, "provider": provider,
                    "endpoint_kind": kind, "cwd": cwd}),
@@ -3853,7 +3866,7 @@ impl TestDaemon {
         cwd: &str,
         params: &str,
     ) -> cadence_agent::Result<Value> {
-        self.rpc(
+        self.fixture_rpc(
             "agent_register",
             json!({"alias": alias, "provider": provider,
                    "endpoint_kind": kind, "cwd": cwd, "params": params}),

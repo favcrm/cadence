@@ -1732,7 +1732,8 @@ fn subreaper_managed_endpoint_starts_and_stops_cleanly() {
     }
     let health = d.rpc("health", json!({})).unwrap();
     assert_eq!(health["adopted_live"], 0, "the provider is owned: {health}");
-    d.rpc("agent_stop", json!({"alias": "wk"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "wk"}))
+        .unwrap();
     let agent = d.wait_agent("wk", "stopped", 20);
     assert!(agent["error"].is_null(), "{agent}");
     wait_reaped(root, "the managed provider, collected by its adapter");

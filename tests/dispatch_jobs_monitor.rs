@@ -228,7 +228,7 @@ fn job_seeded_bug_loop_end_to_end() {
     // pass → verified → accept → done; PM notification routed.
     d.job_verdict("j1-fix", SHA_A, "pass").unwrap();
     assert_eq!(d.task_state("j1-fix"), "verified");
-    d.rpc(
+    d.operator_rpc(
         "task_accept",
         json!({"task": "j1-fix", "merged_sha": SHA_C, "by": "pm"}),
     )
@@ -409,13 +409,13 @@ fn verdict_rejects_null_sha_until_repaired() {
     assert!(e.to_string().contains("job task sha"), "{e}");
 
     // `job task sha` repairs it — recorded as an event, verdict proceeds.
-    d.rpc(
+    d.operator_rpc(
         "task_sha",
         json!({"task": "j1-t2", "sha": SHA_A, "by": "pm"}),
     )
     .unwrap();
     // Same sha again → idempotent ok; a different sha → rejected.
-    d.rpc(
+    d.operator_rpc(
         "task_sha",
         json!({"task": "j1-t2", "sha": SHA_A, "by": "pm"}),
     )
@@ -502,7 +502,8 @@ fn job_cancel_semantics() {
     d.job_new("pm", "j1", &spec, &sha);
 
     // Queued kickoff: stop w2 first so its queue never drains.
-    d.rpc("agent_stop", json!({"alias": "w2"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "w2"}))
+        .unwrap();
     d.rpc(
         "task_new",
         json!({"job": "j1", "task": "j1-tq", "assignee": "w2"}),
@@ -512,7 +513,7 @@ fn job_cancel_semantics() {
     assert_eq!(r["queued_behind_dead"], true, "{r}");
     let k = r["message"].as_str().unwrap().to_string();
     assert_eq!(d.message_state("w2", &k), "queued");
-    d.rpc("task_cancel", json!({"task": "j1-tq", "by": "pm"}))
+    d.operator_rpc("task_cancel", json!({"task": "j1-tq", "by": "pm"}))
         .unwrap();
     assert_eq!(d.task_state("j1-tq"), "cancelled");
     // The queued kickoff was cancelled in the same transaction.
@@ -526,7 +527,7 @@ fn job_cancel_semantics() {
         .unwrap();
     let r = d.job_dispatch("j1-tr", json!({})).unwrap();
     let k = r["message"].as_str().unwrap().to_string();
-    d.rpc("task_cancel", json!({"task": "j1-tr", "by": "pm"}))
+    d.operator_rpc("task_cancel", json!({"task": "j1-tr", "by": "pm"}))
         .unwrap();
     assert_eq!(d.task_state("j1-tr"), "cancelled");
     // The kickoff still ran to completion; the task stays cancelled.
@@ -539,7 +540,7 @@ fn job_cancel_semantics() {
     // job cancel cancels every non-terminal task + the job.
     d.rpc("task_new", json!({"job": "j1", "task": "j1-tz"}))
         .unwrap();
-    d.rpc("job_cancel", json!({"job": "j1", "by": "pm"}))
+    d.operator_rpc("job_cancel", json!({"job": "j1", "by": "pm"}))
         .unwrap();
     assert_eq!(d.job_state("j1"), "cancelled");
     assert_eq!(d.task_state("j1-tz"), "cancelled");
@@ -547,7 +548,7 @@ fn job_cancel_semantics() {
     assert!(d.job_dispatch("j1-tq", json!({})).is_err());
     // job close requires all-done.
     assert!(d
-        .rpc("job_close", json!({"job": "j1", "by": "pm"}))
+        .operator_rpc("job_close", json!({"job": "j1", "by": "pm"}))
         .is_err());
 }
 
@@ -3540,7 +3541,8 @@ fn automatic_monitor_dispatch_is_separate_guarded_and_restart_safe() {
         d.task_new_ac("ajob", task, assignee, "run the focused coordinator checks")
             .unwrap();
     }
-    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "w1"}))
+        .unwrap();
     d.wait_agent("w1", "stopped", 10);
     let existing = d
         .rpc(
@@ -3551,7 +3553,7 @@ fn automatic_monitor_dispatch_is_separate_guarded_and_restart_safe() {
     let existing_kickoff = existing["message"].as_str().unwrap().to_string();
     assert_eq!(existing["duplicate"], false);
 
-    let invalid = d.rpc(
+    let invalid = d.operator_rpc(
         "monitor_register",
         json!({"monitor": "auto-invalid", "project": project,
                "owner": "operator", "tasks": ["ajob-fresh"],
@@ -3723,7 +3725,7 @@ fn automatic_monitor_dispatch_is_separate_guarded_and_restart_safe() {
     assert_eq!(duplicate["duplicate"], true);
     assert_eq!(duplicate["message"], existing_kickoff);
     let state = d.state.clone();
-    d.rpc("shutdown", json!({})).unwrap();
+    d.operator_rpc("shutdown", json!({})).unwrap();
     d.handle.take().unwrap().join().unwrap().unwrap();
     let restarted_at = epoch_now();
     let d2 = TestDaemon::start_on(state);
@@ -3805,7 +3807,7 @@ fn automatic_monitor_dispatch_serializes_competing_callers() {
     // competing callers then saw 'review'. Registering against the store
     // afterwards leaves the two callers below as the only dispatchers.
     let state = d.state.clone();
-    d.rpc("shutdown", json!({})).unwrap();
+    d.operator_rpc("shutdown", json!({})).unwrap();
     d.handle.take().unwrap().join().unwrap().unwrap();
     let store = Arc::new(Store::open(&state.join("cadence.sqlite3")).unwrap());
     store
@@ -3918,7 +3920,8 @@ fn task_reopen_is_the_operator_or_the_jobs_pm() {
         d.wait_task(task, "review", 15);
         d.job_verdict(task, SHA_A, "blocked").unwrap();
     }
-    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "w1"}))
+        .unwrap();
     d.wait_agent("w1", "stopped", 15);
     let mut worker = LaneShell::spawn(home.path());
     plant_pane(&d, "w1", worker.pid());
@@ -3993,7 +3996,8 @@ fn verdict_reviewer_is_the_verified_caller() {
     d.job_dispatch("j1-t", json!({})).unwrap();
     d.wait_task("j1-t", "review", 15);
     // The worker's pane from here on: its own processes derive `w1`.
-    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "w1"}))
+        .unwrap();
     d.wait_agent("w1", "stopped", 15);
     let home = TempDir::new().unwrap();
     let mut worker = LaneShell::spawn(home.path());

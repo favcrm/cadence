@@ -2331,7 +2331,10 @@ fn delivery_merged_marks_ticket_done_once() {
     assert_eq!(events.len(), 1, "{events:#?}");
     assert_eq!(events[0]["payload"]["issue"], "D-2");
     assert_eq!(events[0]["payload"]["pr"], "acme/app#7");
-    let summary = lf.f.d.rpc("master_summary", json!({"since": t0})).unwrap();
+    let summary =
+        lf.f.d
+            .operator_rpc("master_summary", json!({"since": t0}))
+            .unwrap();
     assert!(
         summary["tickets_moved"]
             .as_array()

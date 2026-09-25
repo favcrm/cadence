@@ -260,6 +260,11 @@ fn spawn_daemon_run(state_dir: &Path, identity: Option<&str>) -> Result<std::pro
         .open(state_dir.join("daemon.log"))?;
     let mut command = std::process::Command::new(exe);
     command.env_remove("CADENCE_ROLLOUT_AS");
+    // CAD-482: a daemon is never a caller — a restart under
+    // `CADENCE_TEST_AS` must not let the child assert on its own
+    // outbound RPCs. The child's `daemon run` re-arms from the state
+    // dir's minted token instead.
+    command.env_remove(crate::test_seam::AS_ENV);
     command
         .args(["--state-dir"])
         .arg(state_dir)

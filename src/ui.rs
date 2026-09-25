@@ -3247,8 +3247,13 @@ pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
     }
     // CAD-482: a seam-armed board attaches to the credential its
     // fixture daemon minted — refused loudly on other builds/dirs so a
-    // fixture never silently falls back to ambient identity.
-    opts.seam = crate::test_seam::attach_if_requested(state_dir, opts.test_seam)?;
+    // fixture never silently falls back to ambient identity. A state
+    // dir that still carries the minted token re-attaches: `daemon
+    // restart --ui` respawns this process without the arming env.
+    opts.seam = crate::test_seam::attach_if_requested(
+        state_dir,
+        opts.test_seam || crate::test_seam::armed(state_dir),
+    )?;
     opts.delivery_sync = (!opts.read_only).then(|| {
         delivery_sync::start(
             state_dir,
@@ -3429,6 +3434,11 @@ fn start_inner(state_dir: &Path, flags: &UiFlags, reset: bool, quiet: bool) -> R
     let mut command = Command::new(exe);
     // The detached child re-resolves from `ui.json` — its argv only
     // pins the bind, everything else is the persisted file's business.
+    // CAD-482: a board is never a caller either — requests assert via
+    // headers, so a `CADENCE_TEST_AS` in this process's env must not
+    // leak into the child (a `daemon restart --ui` under it would
+    // blanket-assert every board→daemon RPC).
+    command.env_remove(crate::test_seam::AS_ENV);
     command
         .arg("--state-dir")
         .arg(state_dir)

@@ -217,6 +217,16 @@ pub fn caller_frame(state_dir: &Path) -> Result<Option<Value>> {
     imp::caller_frame(state_dir)
 }
 
+/// The assertion THIS process carries against `state_dir`, for
+/// in-process operator-proof sites a daemon frame never reaches
+/// (`rollout claim --as`, `rollout release --force`): the scoped
+/// assertion — which must hit an armed target, as in [`caller_frame`] —
+/// or the process's [`AS_ENV`], honored only while `state_dir` is a
+/// seam-armed fixture. `Ok(None)` without the feature.
+pub fn process_asserted(state_dir: &Path) -> Result<Option<Asserted>> {
+    imp::process_asserted(state_dir)
+}
+
 /// Daemon-side: resolve a request frame's `test_caller` against the
 /// armed `seam`. The returned [`imp::Scope`] makes the asserted
 /// identity visible for the duration of one dispatch.
@@ -378,8 +388,8 @@ mod imp {
     /// nothing (the process-wide env cannot name one state dir).
     pub fn caller_frame(state_dir: &Path) -> Result<Option<Value>> {
         let scoped = asserted();
-        let env = || std::env::var(AS_ENV).ok().and_then(|v| parse_as(&v).ok());
-        match (scoped, env()) {
+        let env = env_asserted();
+        match (scoped, env) {
             (None, None) => Ok(None),
             (Some(who), _) => {
                 let token = Seam::token_at(state_dir).ok_or_else(|| {
@@ -397,6 +407,27 @@ mod imp {
                 Some(token) => Ok(Some(json!({"token": token, "as": who.as_str()}))),
                 None => Ok(None),
             },
+        }
+    }
+
+    /// The process-wide [`AS_ENV`] assertion, if it parses.
+    fn env_asserted() -> Option<Asserted> {
+        std::env::var(AS_ENV).ok().and_then(|v| parse_as(&v).ok())
+    }
+
+    /// [`super::process_asserted`]: [`caller_frame`]'s two sources
+    /// without the frame — a scoped assertion must name an armed
+    /// target; [`AS_ENV`] proves only against one.
+    pub fn process_asserted(state_dir: &Path) -> Result<Option<Asserted>> {
+        match (asserted(), env_asserted()) {
+            (Some(who), _) if Seam::token_at(state_dir).is_none() => Err(Error::rejected(format!(
+                "test seam: this process asserts '{}' but {} is not a \
+                     seam-armed fixture",
+                who.as_str(),
+                state_dir.display()
+            ))),
+            (Some(who), _) => Ok(Some(who)),
+            (None, env) => Ok(env.filter(|_| Seam::token_at(state_dir).is_some())),
         }
     }
 
@@ -484,6 +515,18 @@ mod imp {
         Ok(None)
     }
 
+    /// No feature, no process assertion — [`AS_ENV`] refuses loudly as
+    /// in [`caller_frame`].
+    pub fn process_asserted(_state_dir: &Path) -> Result<Option<Asserted>> {
+        if std::env::var_os(AS_ENV).is_some() {
+            return Err(Error::rejected(format!(
+                "{AS_ENV} is set but this build has no test seam — build with \
+                 `--features test-seam` (test binaries only)"
+            )));
+        }
+        Ok(None)
+    }
+
     pub fn scope_frame(_seam: Option<&Seam>, frame: &Value) -> Result<Scope> {
         if frame.get(FRAME_FIELD).is_some() {
             return Err(Error::rejected(
@@ -500,10 +543,9 @@ mod imp {
         token: Option<&str>,
     ) -> std::result::Result<Scope, String> {
         if as_value.is_some() || token.is_some() {
-            return Err(format!(
-                "test seam headers are honored only in a `test-seam` build \
+            return Err("test seam headers are honored only in a `test-seam` build \
                  (CAD-482)"
-            ));
+                .to_string());
         }
         Ok(Scope::set(None))
     }
