@@ -1177,16 +1177,12 @@ fn pty_devin_quoted_menu_above_input_box_is_inert() {
 #[test]
 fn pty_gate_probe_failure_is_a_gate_refusal() {
     let d = TestDaemon::start();
-    let _mock = d.mock_devin();
+    let mock = d.mock_devin();
     d.register_devin_opts("dv", json!({"auto_ready": "verified"}));
     d.wait_agent("dv", "idle", 20);
 
-    // `MOCK_TMUX_FAIL` is process-global — a parallel test's mock
-    // calls could trip on it inside this window. The outage is
-    // seconds-long and the failure mode (a gate retry) is benign, so
-    // the knob stays env-global rather than growing a per-pane
-    // failure file.
-    std::env::set_var("MOCK_TMUX_FAIL", "capture-pane");
+    // A capture-pane outage on this test's mock only.
+    mock_knob(&mock.dir, "MOCK_TMUX_FAIL", Some("capture-pane"));
     d.send("dv", json!({"text": "during outage", "message": "mf"}))
         .unwrap();
     let wait = d.wait_event("dv", "gate_wait", 15);
@@ -1198,7 +1194,7 @@ fn pty_gate_probe_failure_is_a_gate_refusal() {
         "{wait}"
     );
     assert_eq!(d.message_state("dv", "mf"), "queued");
-    std::env::remove_var("MOCK_TMUX_FAIL");
+    mock_knob(&mock.dir, "MOCK_TMUX_FAIL", None);
 
     d.wait_message("dv", "mf", &["running"], 20);
     let token = pty_token(&d, "dv", "mf");

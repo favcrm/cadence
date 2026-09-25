@@ -149,10 +149,9 @@ fn pty_shutdown_straggler_detaches_pane() {
         .trim()
         .parse()
         .unwrap();
-    // Real env, under MockDevin's ENV_LOCK: the mock tmux reads its hold
-    // knobs per call from the env it inherits from the daemon.
-    std::env::set_var("MOCK_TMUX_HOLD", "4"); // > STOP_GRACE (3s)
-    std::env::set_var("MOCK_TMUX_HOLD_FMT", "#{pane_dead}");
+    // The mock tmux reads its hold knobs per call.
+    mock_knob(&mock.dir, "MOCK_TMUX_HOLD", Some("4")); // > STOP_GRACE (3s)
+    mock_knob(&mock.dir, "MOCK_TMUX_HOLD_FMT", Some("#{pane_dead}"));
     d.operator_rpc("agent_ready", json!({"alias": "dv1"}))
         .unwrap();
     d.send("dv1", json!({"text": "task", "message": "m1"}))
@@ -167,8 +166,8 @@ fn pty_shutdown_straggler_detaches_pane() {
     // test asserts the fence-then-resume path, not hot adoption.
     drop_shutdown_marker(&d.state);
     let state = d.state.clone();
-    std::env::remove_var("MOCK_TMUX_HOLD");
-    std::env::remove_var("MOCK_TMUX_HOLD_FMT");
+    mock_knob(&mock.dir, "MOCK_TMUX_HOLD", None);
+    mock_knob(&mock.dir, "MOCK_TMUX_HOLD_FMT", None);
     // Leak d's TempDir — it owns the state dir and the mock's pane
     // state, which must outlive the second daemon.
     std::mem::forget(d);
@@ -441,10 +440,9 @@ fn pty_hot_restart_submitting_never_records_running() {
     // restart then fences it like any other uncertain outcome.
     let mut d = TestDaemon::start();
     let mock = d.mock_devin();
-    // Real env, under MockDevin's ENV_LOCK: the mock tmux reads its
-    // hold knobs per call from the env it inherits from the daemon.
-    std::env::set_var("MOCK_TMUX_HOLD", "5");
-    std::env::set_var("MOCK_TMUX_HOLD_CMD", "capture-pane");
+    // The mock tmux reads its hold knobs per call.
+    mock_knob(&mock.dir, "MOCK_TMUX_HOLD", Some("5"));
+    mock_knob(&mock.dir, "MOCK_TMUX_HOLD_CMD", Some("capture-pane"));
     d.register_devin("dv1", None);
     d.wait_agent("dv1", "idle", 40);
     atomic_write(d.pane_file(&mock, "dv1", "swallow"), "1");
@@ -456,8 +454,8 @@ fn pty_hot_restart_submitting_never_records_running() {
     d.operator_rpc("shutdown", json!({})).unwrap();
     d.handle.take().unwrap().join().unwrap().unwrap();
     let state = d.state.clone();
-    std::env::remove_var("MOCK_TMUX_HOLD");
-    std::env::remove_var("MOCK_TMUX_HOLD_CMD");
+    mock_knob(&mock.dir, "MOCK_TMUX_HOLD", None);
+    mock_knob(&mock.dir, "MOCK_TMUX_HOLD_CMD", None);
     std::mem::forget(d);
     let d = TestDaemon::start_on(state);
     d.wait_agent("dv1", "attention", 20);
@@ -478,13 +476,12 @@ fn pty_hot_restart_render_during_stop_adopts() {
     // still in flight when the stop lands is allowed to finish — it IS
     // a proven running turn and is adopted like any other.
     let mut d = TestDaemon::start();
-    let _mock = d.mock_devin();
-    // Real env, under MockDevin's ENV_LOCK: the mock tmux reads its
-    // hold knobs per call from the env it inherits from the daemon.
+    let mock = d.mock_devin();
+    // The mock tmux reads its hold knobs per call.
     // 2s hold vs the 4s render deadline: comfortably inside it while
     // still spanning the stop that must land mid-render.
-    std::env::set_var("MOCK_TMUX_HOLD", "2");
-    std::env::set_var("MOCK_TMUX_HOLD_CMD", "capture-pane");
+    mock_knob(&mock.dir, "MOCK_TMUX_HOLD", Some("2"));
+    mock_knob(&mock.dir, "MOCK_TMUX_HOLD_CMD", Some("capture-pane"));
     d.register_devin("dv1", None);
     d.wait_agent("dv1", "idle", 40);
     d.operator_rpc("agent_ready", json!({"alias": "dv1"}))
@@ -497,8 +494,8 @@ fn pty_hot_restart_render_during_stop_adopts() {
     d.operator_rpc("shutdown", json!({})).unwrap();
     d.handle.take().unwrap().join().unwrap().unwrap();
     let state = d.state.clone();
-    std::env::remove_var("MOCK_TMUX_HOLD");
-    std::env::remove_var("MOCK_TMUX_HOLD_CMD");
+    mock_knob(&mock.dir, "MOCK_TMUX_HOLD", None);
+    mock_knob(&mock.dir, "MOCK_TMUX_HOLD_CMD", None);
     std::mem::forget(d);
     let d = TestDaemon::start_on(state);
     d.wait_agent("dv1", "idle", 25);
@@ -535,17 +532,16 @@ fn pty_hot_restart_report_before_adoption_rejected_stale() {
     // the pane. A report landing inside the window must be refused
     // as stale — the turn is not yet known to be alive — and the
     // same token must complete once `turn_adopted` fires.
-    let (state, _mock, token, _pid) = stopped_mid_turn_devin();
+    let (state, mock, token, _pid) = stopped_mid_turn_devin();
     // Hold the first pane check inside open_adopted so the socket is
-    // serving while the adoption is still unproven. Real env, under
-    // MockDevin's ENV_LOCK: the mock tmux reads its hold knobs per
-    // call from the env it inherits from the daemon.
-    std::env::set_var("MOCK_TMUX_HOLD", "8");
-    std::env::set_var("MOCK_TMUX_HOLD_CMD", "has-session");
+    // serving while the adoption is still unproven. The mock tmux
+    // reads its hold knobs per call.
+    mock_knob(&mock.dir, "MOCK_TMUX_HOLD", Some("8"));
+    mock_knob(&mock.dir, "MOCK_TMUX_HOLD_CMD", Some("has-session"));
     let d = TestDaemon::start_on(state);
     let early = d.report("m1", &token, "result", "early");
-    std::env::remove_var("MOCK_TMUX_HOLD");
-    std::env::remove_var("MOCK_TMUX_HOLD_CMD");
+    mock_knob(&mock.dir, "MOCK_TMUX_HOLD", None);
+    mock_knob(&mock.dir, "MOCK_TMUX_HOLD_CMD", None);
     let err = early.expect_err("pre-proof report must be refused");
     assert!(err.to_string().contains("stale"), "{err}");
     let agent = d.wait_agent("dv1", "idle", 25);
@@ -1217,13 +1213,6 @@ fn pty_hot_restart_divergent_marker_entries_fence() {
     assert!(reason.contains("disagree"), "{reason}");
 }
 
-/// Install the mock tmux/cursor pair — the same private-tmux harness
-/// as `install_mock_devin`, pointing the adapter at the cursor
-/// profile's env overrides instead.
-fn install_mock_cursor_tui(dir: &Path) -> MockCursorTui {
-    install_mock_cursor_tui_inner(dir, None)
-}
-
 #[test]
 fn pty_dead_pane_fences_submitted_and_stops_actor() {
     let d = TestDaemon::start();
@@ -1526,7 +1515,6 @@ fn pty_unfence_resume_reports_respawned_pane() {
     // left to adopt.
     std::process::Command::new(mock.dir.join("tmux"))
         .args(["-L", &socket_for(&d.state), "kill-session", "-t", "dv1"])
-        .env("MOCK_TMUX_STATE", mock.dir.join("tmux-state"))
         .output()
         .unwrap();
     wait_pid_gone(&d.pane_file(&mock, "dv1", "pid"), 10);
@@ -1603,10 +1591,10 @@ fn pty_unfence_resume_busy_adopted_pane_stays_gated() {
 #[test]
 fn pty_claude_session_mismatch_fences_closed() {
     let d = TestDaemon::start();
-    let _mock = d.mock_claude_tui();
-    // Real env, under the TUI mock's ENV_LOCK: the pane's mock process
-    // reads the swap knob from the env the daemon passes to tmux.
-    std::env::set_var("MOCK_CLAUDE_SWAP", "1");
+    let mock = d.mock_claude_tui();
+    // The pane's mock process reads the swap knob from the env the
+    // mock tmux launches it with.
+    mock_knob(&mock.dir, "MOCK_CLAUDE_SWAP", Some("1"));
     d.register_claude_pty("cl", json!({"session": "want-session"}));
     let agent = d.wait_agent("cl", "attention", 20);
     let err = agent["error"].as_str().unwrap_or("");
@@ -1618,10 +1606,10 @@ fn pty_claude_session_mismatch_fences_closed() {
 #[test]
 fn pty_cursor_session_mismatch_fences_closed() {
     let d = TestDaemon::start();
-    let _mock = d.mock_cursor_tui();
-    // Real env, under the TUI mock's ENV_LOCK: the pane's mock process
-    // reads the swap knob from the env the daemon passes to tmux.
-    std::env::set_var("MOCK_CURSOR_SWAP", "1");
+    let mock = d.mock_cursor_tui();
+    // The pane's mock process reads the swap knob from the env the
+    // mock tmux launches it with.
+    mock_knob(&mock.dir, "MOCK_CURSOR_SWAP", Some("1"));
     d.register_cursor_pty("cu", json!({"session": "want-chat"}));
     let agent = d.wait_agent("cu", "attention", 20);
     let err = agent["error"].as_str().unwrap_or("");
