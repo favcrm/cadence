@@ -31,6 +31,7 @@ pub mod sync;
 pub mod task_report;
 pub mod time;
 pub mod work;
+pub mod workflow;
 pub mod write;
 
 use std::collections::HashSet;
