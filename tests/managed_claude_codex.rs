@@ -2120,6 +2120,10 @@ fn claude_brokered_permission_decline_with_reason() {
     let d = TestDaemon::start();
     let mock = d.mock_claude("permit", None);
     broker_command();
+    // A peer pane proves the unscoped `agent_events` read (Rule::Read).
+    let home = TempDir::new().unwrap();
+    let mut peer = LaneShell::spawn(home.path());
+    plant_pane(&d, "w2", peer.pid());
     d.register_claude("w1", json!({"broker_approvals": true}));
     d.wait_agent("w1", "idle", 15);
     d.send("w1", json!({"text": "rm -rf /", "message": "m1"}))
@@ -2138,15 +2142,56 @@ fn claude_brokered_permission_decline_with_reason() {
         m1["result"]["text"], "DENIED:no destructive commands",
         "{m1}"
     );
-    // The denial lands on the standard permission_denied event too.
-    let ev = d.wait_event("w1", "permission_denied", 10);
-    assert!(
-        ev["payload"]["denials"][0]["message"]
-            .as_str()
-            .unwrap()
-            .contains("no destructive commands"),
-        "{ev}"
-    );
+    // The denial lands on the standard permission_denied event — on the
+    // unscoped lane (CAD-542) each denial keeps only the routing fields
+    // and the same redacted one-line summary a tool_use carries: the
+    // real CLI's verbatim `tool_input` (command + description — the
+    // declined input is the most dangerous subset to re-publish) and
+    // the operator's reason never cross.
+    let denied_shape = |ev: &Value, who: &str| {
+        let denial = &ev["payload"]["denials"][0];
+        assert_eq!(denial["tool_name"], "Bash", "{who}: {ev}");
+        assert_eq!(denial["tool_use_id"], "tu_permit", "{who}: {ev}");
+        assert_eq!(denial["summary"], "Bash: rm -rf /", "{who}: {ev}");
+        for field in ["tool_input", "message", "description"] {
+            assert!(
+                denial.get(field).is_none(),
+                "{who}: denial carries {field}: {ev}"
+            );
+        }
+    };
+    denied_shape(&d.wait_event("w1", "permission_denied", 10), "operator");
+    // A peer agent and a caller nothing proves read the same lane; the
+    // canary the mock packs inside `tool_input.description` never
+    // reaches either. (The turn's own result text is on the lane by
+    // design — `turn_finished` carries it; the reason an operator gave
+    // rides the verdict to the provider, not a denial field.)
+    for (who, frame) in [
+        (
+            "peer",
+            peer.rpc(&d.state, "agent_events", json!({"alias": "w1"})),
+        ),
+        (
+            "unproven",
+            unprovable_rpc(&d, "agent_events", json!({"alias": "w1"})),
+        ),
+    ] {
+        assert_eq!(frame["ok"], true, "{who}: {frame}");
+        let text = frame["result"].to_string();
+        assert!(
+            !text.contains("CANARY-DENIED-INPUT-4e7f"),
+            "{who}: denied input on the event lane: {text}"
+        );
+        denied_shape(
+            frame["result"]["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["kind"] == "permission_denied")
+                .unwrap_or_else(|| panic!("{who}: no permission_denied in {frame}")),
+            who,
+        );
+    }
     let verdict: Value = serde_json::from_str(
         &std::fs::read_to_string(mock.pidfile.with_extension("pid.verdict")).unwrap(),
     )

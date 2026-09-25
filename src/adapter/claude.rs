@@ -702,6 +702,29 @@ impl Shared {
             .and_then(Value::as_array)
             .filter(|d| !d.is_empty())
         {
+            // The event lane is unscoped: a denial keeps the routing
+            // fields and the same redacted one-line summary a tool_use
+            // carries — never `tool_input` verbatim. The declined input
+            // is the most dangerous subset of the transcript (the
+            // operator declined because it looked dangerous); the full
+            // wire object stays in the provider transcript (CAD-542).
+            let denials: Vec<Value> = denials
+                .iter()
+                .map(|denial| {
+                    let name = denial
+                        .get("tool_name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    json!({
+                        "tool_name": denial.get("tool_name"),
+                        "tool_use_id": denial.get("tool_use_id"),
+                        "summary": crate::store::tool_summary(
+                            name,
+                            denial.get("tool_input").unwrap_or(&Value::Null),
+                        ),
+                    })
+                })
+                .collect();
             self.emit("cadence/permission_denied", &json!({ "denials": denials }));
         }
     }
@@ -841,8 +864,19 @@ impl ProviderAdapter for ClaudeAdapter {
         {
             let mut queue = self.shared.results.lock().unwrap();
             while let Some(stale) = queue.pop_front() {
-                self.shared
-                    .emit("cadence/stale_result", &json!({"result": stale}));
+                // The stale wire object holds the fenced turn's result
+                // text and any permission denials — the lane keeps the
+                // discard's shape only (CAD-542, same class as
+                // permission_denied: no raw provider objects).
+                self.shared.emit(
+                    "cadence/stale_result",
+                    &json!({
+                        "subtype": stale.get("subtype"),
+                        "is_error": stale.get("is_error"),
+                        "stop_reason": stale.get("stop_reason"),
+                        "session_id": stale.get("session_id"),
+                    }),
+                );
             }
         }
         self.transport.read().unwrap().send(json!({
