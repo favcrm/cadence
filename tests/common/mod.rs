@@ -4993,8 +4993,14 @@ def off_lineage(pid):
     while p > 1:
         if p == pid:
             return False
-        with open("/proc/%d/status" % p) as f:
-            p = int([l for l in f if l.startswith("PPid:")][0].split()[1])
+        # A hop can vanish mid-walk — the detach's intermediates exit
+        # fast and the kernel reparents only once they do. An incomplete
+        # chain proves neither tied nor detached: keep waiting, never die.
+        try:
+            with open("/proc/%d/status" % p) as f:
+                p = int([l for l in f if l.startswith("PPid:")][0].split()[1])
+        except (OSError, IndexError):
+            return False
     return True
 
 if sys.argv[1] == "--child":
