@@ -488,7 +488,7 @@ pub(super) fn outbox(
         }
         Err(resp) => return resp,
     }
-    if !board_is_operator(state_dir) {
+    if !board_is_operator(state_dir, opts.seam.is_some()) {
         return guard_fail(
             "operator_proof",
             "GET /api/outbox refused: this board process is not provably the \
