@@ -357,6 +357,11 @@ fn start_ui_opts(
             let mut opts = ui::ServeOpts {
                 host: "127.0.0.1".to_string(),
                 port,
+                // CAD-482: a board on a seam-armed fixture attaches to
+                // the daemon's credential; assertion headers then say
+                // who each request runs as. Unarmed state dirs serve
+                // the ambient path unchanged.
+                test_seam: cadence_agent::test_seam::armed(&sd),
                 ..Default::default()
             };
             f(&mut opts);
@@ -2250,6 +2255,7 @@ impl UiDaemon {
         let opts = daemon::ServeOptions {
             stop: Some(stop.clone()),
             provider_env,
+            test_seam: cfg!(feature = "test-seam"),
             ..Default::default()
         };
         let handle = thread::spawn(move || {
@@ -2282,6 +2288,7 @@ impl UiDaemon {
         let opts = daemon::ServeOptions {
             operator_clock: Some(clock),
             stop: Some(stop.clone()),
+            test_seam: cfg!(feature = "test-seam"),
             ..Default::default()
         };
         let handle = thread::spawn(move || {
@@ -2324,12 +2331,19 @@ impl UiDaemon {
 
     /// `rpc` from a caller that is provably the operator however the
     /// suite is run — `TestDaemon::operator_rpc` in tests/common/mod.rs
-    /// (CAD-291): `setsid -f` hands the call to a fresh session leader
-    /// that waits until it has left this process's ancestry,
-    /// `env_clear` leaves no `CADENCE_ALIAS`, and stdio is not a pane
-    /// tty — the residual `peer::operator_proof` accepts. The gate
-    /// itself is untouched.
+    /// (CAD-291). On a seam-armed fixture (CAD-482) the identity is
+    /// asserted in-band; otherwise `setsid -f` hands the call to a
+    /// fresh session leader that waits until it has left this
+    /// process's ancestry, `env_clear` leaves no `CADENCE_ALIAS`, and
+    /// stdio is not a pane tty — the residual `peer::operator_proof`
+    /// accepts. The gate itself is untouched.
     fn operator_rpc(&self, method: &str, params: Value) -> cadence_agent::Result<Value> {
+        if cadence_agent::test_seam::armed(&self.state) {
+            return cadence_agent::test_seam::scoped(
+                cadence_agent::test_seam::Asserted::Operator,
+                || client::rpc(&self.state, method, params),
+            );
+        }
         let script = self.state.join("operator-rpc.py");
         if !script.exists() {
             std::fs::write(&script, OPERATOR_RPC_PY).unwrap();
@@ -9285,17 +9299,25 @@ fn start_operator_ui(pm: &Path, state: &Path) -> (u16, DetachedUi) {
     let overall = Instant::now() + Duration::from_secs(30);
     loop {
         let port = free_port();
-        let out = Command::new(bin())
-            .arg("--state-dir")
+        let mut cmd = Command::new(bin());
+        cmd.arg("--state-dir")
             .arg(state)
             .args(["ui", "start", "--port", &port.to_string()])
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", pm)
             .env("CADENCE_PM_DIR", pm)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .unwrap();
+            .stdin(std::process::Stdio::null());
+        // CAD-482: on a test-seam build the detached board arms the
+        // seam (its daemon minted the credential) and asserts the
+        // operator identity on every daemon call it relays — the
+        // detached process is the production shape of `ui start`; the
+        // envs only say WHO it runs as, identically in a pane and CI.
+        if cfg!(feature = "test-seam") {
+            cmd.env(cadence_agent::test_seam::ARM_ENV, "1")
+                .env(cadence_agent::test_seam::AS_ENV, "operator");
+        }
+        let out = cmd.output().unwrap();
         if out.status.success() {
             return (port, guard);
         }
@@ -11716,6 +11738,7 @@ fn a_login_link_opens_exactly_one_session_and_leaves_no_trace() {
         cookie: cookie.clone(),
         set_cookie: set.clone(),
         key: key.clone(),
+        seam: op::seam_headers(&d.state(), "operator"),
     };
     let cookie_h = format!("Cookie: {cookie}");
     let key_h = session.key_header();

@@ -40,17 +40,24 @@ fn start_operator_board(pm: &Path, state: &Path) -> (u16, OperatorBoard) {
             .local_addr()
             .unwrap()
             .port();
-        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
-            .arg("--state-dir")
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"));
+        cmd.arg("--state-dir")
             .arg(state)
             .args(["ui", "start", "--port", &port.to_string()])
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", pm)
             .env("CADENCE_PM_DIR", pm)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .unwrap();
+            .stdin(std::process::Stdio::null());
+        // CAD-482: on a test-seam build the detached board arms the
+        // seam and asserts the operator identity on the daemon calls
+        // it relays — the envs say who it runs as, identical in a pane
+        // and in CI, never consulted by a production build.
+        if cfg!(feature = "test-seam") {
+            cmd.env(cadence_agent::test_seam::ARM_ENV, "1")
+                .env(cadence_agent::test_seam::AS_ENV, "operator");
+        }
+        let out = cmd.output().unwrap();
         if out.status.success() {
             return (port, guard);
         }

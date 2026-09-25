@@ -122,6 +122,7 @@ impl Daemon {
         let stop = Arc::new(AtomicBool::new(false));
         let opts = daemon::ServeOptions {
             stop: Some(stop.clone()),
+            test_seam: cfg!(feature = "test-seam"),
             ..Default::default()
         };
         let handle = thread::spawn(move || {
@@ -275,6 +276,7 @@ fn start_ui(pm: &Path, state: &Path) -> (u16, BoardStop) {
                 host: "127.0.0.1".to_string(),
                 port,
                 stop: Some(stop),
+                test_seam: cadence_agent::test_seam::armed(&sd),
                 ..Default::default()
             };
             let _ = ui::serve(&sd, &pd, &opts);

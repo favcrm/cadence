@@ -352,7 +352,14 @@ fn rpc_frame(state_dir: &Path, method: &str, params: Value, timeout: Duration) -
         ))
     })?;
     stream.set_read_timeout(Some(timeout))?;
-    let request = proto::request(method, params);
+    let mut request = proto::request(method, params);
+    // CAD-482: a test-seam caller asserts its identity on the frame —
+    // scoped in-process ([`crate::test_seam::scoped`]) or via
+    // `CADENCE_TEST_AS` in a spawned test binary. Absent the feature
+    // this attaches nothing.
+    if let Some(test_caller) = crate::test_seam::caller_frame(state_dir)? {
+        request[crate::test_seam::FRAME_FIELD] = test_caller;
+    }
     writeln!(stream, "{request}")?;
     let mut line = String::new();
     BufReader::new(&stream).read_line(&mut line)?;

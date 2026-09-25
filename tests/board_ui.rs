@@ -1654,6 +1654,7 @@ fn op_on(op: &op::Session, port: u16) -> op::Session {
         cookie: format!("cadence_operator_{port}={token}"),
         set_cookie: op.set_cookie.clone(),
         key: op.key.clone(),
+        seam: op.seam.clone(),
     }
 }
 

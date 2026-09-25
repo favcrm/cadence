@@ -127,6 +127,9 @@ pub struct DeliverySync {
     /// The `gh` fixed at start ([`resolve_gh`]), or why there is none.
     gh: std::result::Result<PathBuf, String>,
     running: AtomicBool,
+    /// CAD-482: this board declared itself its operator's by arming the
+    /// test seam — the sync's `board_is_operator` answer in a pane.
+    seam_armed: AtomicBool,
     sched: Mutex<Sched>,
     wake: Condvar,
 }
@@ -142,6 +145,7 @@ impl DeliverySync {
             every,
             gh,
             running: AtomicBool::new(false),
+            seam_armed: AtomicBool::new(false),
             sched: Mutex::new(Sched {
                 next_due: Some(Instant::now() + every),
                 ..Sched::default()
@@ -376,7 +380,10 @@ impl DeliverySync {
             };
             self.tick(trigger, || {
                 self.pass(&state_dir, &pm_dir, || {
-                    super::home::board_is_operator(&state_dir)
+                    super::home::board_is_operator(
+                        &state_dir,
+                        self.seam_armed.load(Ordering::Relaxed),
+                    )
                 })
             });
         }
@@ -463,8 +470,10 @@ pub fn start(
     pm_dir: &Path,
     every: Option<Duration>,
     gh: std::result::Result<PathBuf, String>,
+    seam_armed: bool,
 ) -> Arc<DeliverySync> {
     let sync = DeliverySync::new(every, gh);
+    sync.seam_armed.store(seam_armed, Ordering::Relaxed);
     let (worker, state_dir, pm_dir) = (sync.clone(), state_dir.to_path_buf(), pm_dir.to_path_buf());
     if let Err(e) = std::thread::Builder::new()
         .name("delivery-sync".into())

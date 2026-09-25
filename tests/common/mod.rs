@@ -150,6 +150,21 @@ impl OperatorOutput for std::process::Command {
             Some(d) => d.to_path_buf(),
             None => std::env::current_dir()?,
         };
+        if cfg!(feature = "test-seam") {
+            // CAD-482: the seam carries the operator identity into any
+            // armed fixture this command reaches — identical in a pane
+            // and in CI, no detached ancestry. Commands on unarmed
+            // fixtures keep their ambient caller, the same as any
+            // direct spawn.
+            env.insert(cadence_agent::test_seam::AS_ENV.into(), "operator".into());
+            return std::process::Command::new(&argv[0])
+                .args(&argv[1..])
+                .current_dir(cwd)
+                .env_clear()
+                .envs(env)
+                .stdin(std::process::Stdio::null())
+                .output();
+        }
         let dir = std::env::temp_dir().join(format!("opx-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir)?;
         let (script, spec, out) = (dir.join("run.py"), dir.join("spec.json"), dir.join("out"));
@@ -491,6 +506,10 @@ impl TestDaemon {
             .env("HOME", &home)
             .env_remove("CADENCE_ALIAS")
             .env_remove("CADENCE_ROLLOUT_AS")
+            // CAD-482: an inert env on binaries built without the
+            // `test-seam` feature; on ones that carry it the fixture
+            // daemon arms the seam and mints its credential.
+            .env(cadence_agent::test_seam::ARM_ENV, "1")
             .envs(test_env().vars())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -556,17 +575,22 @@ impl TestDaemon {
     }
 
     /// `rpc` from a caller that is provably the operator however the
-    /// suite is run. Operator-only methods (`slot_reconcile`,
-    /// `approval_record`, …) refuse any connection whose ancestry
-    /// carries an agent, and when the suite itself runs in an agent
-    /// pane this test process is one (CAD-291). The call is made the
-    /// way an operator shell outside every pane looks to the daemon:
+    /// suite is run. On a seam-armed fixture (CAD-482) the operator
+    /// identity is asserted in-band — identical in a pane and in CI,
+    /// no ancestry involved. Otherwise the call is made the way an
+    /// operator shell outside every pane looks to the daemon:
     /// `setsid -f` hands it to a fresh session leader reparented off
     /// this process's ancestry, `env_clear` leaves no `CADENCE_ALIAS`,
     /// and stdio is not a pane tty. `peer::operator_proof` documents
     /// that shape as the residual it accepts, so the gate itself is
     /// untouched — agent-descended callers are still refused.
     pub fn operator_rpc(&self, method: &str, params: Value) -> cadence_agent::Result<Value> {
+        if cadence_agent::test_seam::armed(&self.state) {
+            return cadence_agent::test_seam::scoped(
+                cadence_agent::test_seam::Asserted::Operator,
+                || client::rpc(&self.state, method, params),
+            );
+        }
         let script = self.dir.path().join("operator-rpc.py");
         if !script.exists() {
             std::fs::write(&script, OPERATOR_RPC_PY).unwrap();
@@ -605,13 +629,21 @@ impl TestDaemon {
     }
 
     /// `rpc` from a caller that is deterministically unattributed
-    /// (`Who::Unproven`), however the suite is run: detached exactly
-    /// like [`Self::operator_rpc`] but carrying a `CADENCE_ALIAS` its
-    /// ancestry cannot prove — operator evidence fails on the env mark
-    /// and no pane names it. Plain `rpc` cannot stand in for this: in
-    /// an agent pane the test process is unproven, but in CI it IS the
-    /// operator — the two callers a rule treats differently.
+    /// (`Who::Unproven`), however the suite is run. On a seam-armed
+    /// fixture (CAD-482) that identity is asserted in-band; otherwise a
+    /// subprocess detached like [`Self::operator_rpc`] carries a
+    /// `CADENCE_ALIAS` its ancestry cannot prove — operator evidence
+    /// fails on the env mark and no pane names it. Plain `rpc` cannot
+    /// stand in for this: in an agent pane the test process is
+    /// unproven, but in CI it IS the operator — the two callers a rule
+    /// treats differently.
     pub fn unproven_rpc(&self, method: &str, params: Value) -> cadence_agent::Result<Value> {
+        if cadence_agent::test_seam::armed(&self.state) {
+            return cadence_agent::test_seam::scoped(
+                cadence_agent::test_seam::Asserted::Unproven,
+                || client::rpc(&self.state, method, params),
+            );
+        }
         let script = self.dir.path().join("operator-rpc.py");
         if !script.exists() {
             std::fs::write(&script, OPERATOR_RPC_PY).unwrap();
@@ -676,11 +708,45 @@ impl TestDaemon {
         }
     }
 
+    /// `rpc` as the fixture-registered agent `alias` — a
+    /// seam-asserted caller, so it answers identically in a pane and
+    /// in CI (CAD-482). Needs an armed fixture daemon.
+    pub fn agent_rpc(
+        &self,
+        alias: &str,
+        method: &str,
+        params: Value,
+    ) -> cadence_agent::Result<Value> {
+        cadence_agent::test_seam::scoped(
+            cadence_agent::test_seam::Asserted::Agent(alias.to_string()),
+            || client::rpc(&self.state, method, params),
+        )
+    }
+
     /// `cadence --state-dir <state> <args>` run the way
-    /// [`Self::operator_rpc`] calls: as an operator shell outside every
-    /// pane, however the suite is run. Answers `(success, stdout,
-    /// stderr)`.
+    /// [`Self::operator_rpc`] calls: on a seam-armed fixture the child
+    /// asserts the operator identity through `test_seam::AS_ENV`;
+    /// otherwise as an operator shell outside every pane, however the
+    /// suite is run. Answers `(success, stdout, stderr)`.
     pub fn operator_cadence(&self, args: &[&str]) -> (bool, String, String) {
+        if cadence_agent::test_seam::armed(&self.state) {
+            let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+                .arg("--state-dir")
+                .arg(&self.state)
+                .args(args)
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                .env("HOME", self.dir.path())
+                .env(cadence_agent::test_seam::AS_ENV, "operator")
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            return (
+                out.status.success(),
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            );
+        }
         let script = self.dir.path().join("operator-cli.py");
         if !script.exists() {
             std::fs::write(&script, OPERATOR_CLI_PY).unwrap();
@@ -1191,6 +1257,12 @@ pub fn daemon_opts() -> daemon::ServeOptions {
         // CAD-538: hosted leasing stays off unless a test pins a spec —
         // a real `hosted:` table on the dev host must never leak in.
         lease: Some(cadence_agent::lease::Hosted::default()),
+        // CAD-482: when the test build carries the seam, fixture
+        // daemons arm it so callers assert operator/agent identity
+        // instead of needing operator ancestry. Field-gated; a build
+        // without `test-seam` sees `false` and the daemon refuses to
+        // serve.
+        test_seam: cfg!(feature = "test-seam"),
     }
 }
 
@@ -5604,6 +5676,7 @@ pub fn start_board_sync(
                 read_only,
                 gh,
                 delivery_sync_every: every,
+                test_seam: cadence_agent::test_seam::armed(&sd),
                 ..Default::default()
             };
             let _ = cadence_agent::ui::serve(&sd, &pd, &opts);

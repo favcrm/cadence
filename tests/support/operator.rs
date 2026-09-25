@@ -69,11 +69,55 @@ with open(out + ".tmp", "w") as f:
 os.rename(out + ".tmp", out)
 "#;
 
+/// The assertion headers an armed fixture board honors for caller
+/// `who` (`operator`, `agent:<alias>`, `unproven`), or "" when the seam
+/// is not armed on `state` — spliced in before a request's blank line.
+pub fn seam_headers(state: &Path, who: &str) -> String {
+    match cadence_agent::test_seam::Seam::token_at(state) {
+        Some(token) if cfg!(feature = "test-seam") => format!(
+            "{}: {who}\r\n{}: {token}\r\n",
+            cadence_agent::test_seam::AS_HEADER,
+            cadence_agent::test_seam::TOKEN_HEADER,
+        ),
+        _ => String::new(),
+    }
+}
+
+/// `req` with the fixture's seam headers for `who` spliced in — a no-op
+/// when the daemon on `state` is not armed.
+pub fn assert_as(req: String, state: &Path, who: &str) -> String {
+    let headers = seam_headers(state, who);
+    if headers.is_empty() {
+        return req;
+    }
+    req.replacen("\r\n\r\n", &format!("\r\n{headers}\r\n"), 1)
+}
+
 /// One raw daemon RPC from an operator-shaped process (as
 /// [`operator_cli`]), for requests the CLI would never build — a wrong
 /// secret, none. The frame goes through a private file, never argv or
-/// the environment. Answers the response frame.
+/// the environment. On a seam-armed fixture the same frame goes
+/// in-process with its asserted caller instead (CAD-482). Answers the
+/// response frame.
 pub fn operator_rpc(socket: &Path, method: &str, params: Value) -> Value {
+    if cfg!(feature = "test-seam") {
+        if let Some(token) = socket
+            .parent()
+            .and_then(cadence_agent::test_seam::Seam::token_at)
+        {
+            use std::os::unix::net::UnixStream;
+            let frame = serde_json::json!({
+                "method": method,
+                "params": params,
+                "test_caller": {"token": token, "as": "operator"},
+            });
+            let mut s = UnixStream::connect(socket).unwrap();
+            s.write_all(format!("{frame}\n").as_bytes()).unwrap();
+            let mut line = String::new();
+            std::io::BufRead::read_line(&mut std::io::BufReader::new(s), &mut line).unwrap();
+            return serde_json::from_str(&line).unwrap();
+        }
+    }
     let dir = tempfile::Builder::new()
         .prefix("oprpc")
         .tempdir_in("/tmp")
@@ -141,6 +185,27 @@ pub fn operator_cli_env(
         .prefix("opcli")
         .tempdir_in("/tmp")
         .unwrap();
+    if cadence_agent::test_seam::armed(state) {
+        // CAD-482: the child asserts the operator identity through
+        // CADENCE_TEST_AS — identical in a pane and in CI.
+        let out = Command::new(bin)
+            .arg("--state-dir")
+            .arg(state)
+            .args(args)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", dir.path())
+            .env(cadence_agent::test_seam::AS_ENV, "operator")
+            .envs(env.iter().copied())
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        return (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        );
+    }
     let script = dir.path().join("op.py");
     std::fs::write(&script, OPERATOR_CLI_PY).unwrap();
     let out = dir.path().join("out.json");
@@ -259,6 +324,9 @@ pub struct Session {
     pub set_cookie: String,
     /// The session's second credential, sent as `X-Cadence-Session`.
     pub key: String,
+    /// The caller-assertion headers (CAD-482) when the fixture is
+    /// seam-armed — sent on every session write; "" otherwise.
+    pub seam: String,
 }
 
 impl Session {
@@ -274,7 +342,11 @@ impl Session {
         );
         req.replacen(
             "X-Cadence-Board: 1\r\n",
-            &format!("X-Cadence-Board: 1\r\n{}\r\n", self.key_header()),
+            &format!(
+                "X-Cadence-Board: 1\r\n{}\r\n{}",
+                self.key_header(),
+                self.seam
+            ),
             1,
         )
     }
@@ -282,10 +354,11 @@ impl Session {
     /// The raw `Name: value\r\n` headers a signed-in write adds.
     pub fn headers(&self) -> String {
         format!(
-            "Origin: {}\r\nCookie: {}\r\n{}\r\n",
+            "Origin: {}\r\nCookie: {}\r\n{}\r\n{}",
             self.origin,
             self.cookie,
-            self.key_header()
+            self.key_header(),
+            self.seam
         )
     }
 
@@ -324,7 +397,19 @@ pub fn sign_in(bin: &str, state: &Path, port: u16) -> Session {
 /// [`sign_in`] on an explicit loopback Host.
 pub fn sign_in_at(bin: &str, state: &Path, port: u16, host: &str) -> Session {
     let link = login_link(bin, state, port, &[]).unwrap_or_else(|e| panic!("ui login: {e}"));
-    let (status, head, body) = exchange(port, host, &nonce_of(&link));
+    let req = assert_as(
+        request(
+            "POST",
+            "/api/session",
+            host,
+            Some(&format!("http://{host}")),
+            None,
+            &format!(r#"{{"nonce":"{}"}}"#, nonce_of(&link)),
+        ),
+        state,
+        "operator",
+    );
+    let (status, head, body) = raw(port, &req);
     assert_eq!(status, 200, "{head}\n{body}");
     let set = set_cookie(&head).unwrap_or_else(|| panic!("no Set-Cookie: {head}"));
     let cookie = set.split(';').next().unwrap().trim().to_string();
@@ -338,5 +423,6 @@ pub fn sign_in_at(bin: &str, state: &Path, port: u16, host: &str) -> Session {
         cookie,
         set_cookie: set,
         key,
+        seam: seam_headers(state, "operator"),
     }
 }
