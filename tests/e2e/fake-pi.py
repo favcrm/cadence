@@ -32,7 +32,16 @@ When CADENCE_ALIAS is `master` the fake also records what the launch
 actually delivered — `pi-argv.json` (sys.argv tail, i.e. every flag the
 adapter put on the provider) and `pi-env.json` (sorted environment
 NAMES only, never values) — written into its cwd, which for a master is
-`<state>/master/cwd` (writable under confinement).
+`<state>/master/cwd` (writable under confinement). For any other alias
+(a CAD-544 worker) the same record lands in
+`<CADENCE_STATE_DIR>/agents/pi-record-<alias>.json` (argv + env NAMES).
+
+`--session <path>` (workers): if the file exists its `sessionId` and
+prompt count are resumed — the same id returns from `get_state` and
+each `prompt` appends a line and bumps the count. Otherwise the fake
+mints a session id and writes the header immediately (real Pi writes
+sessions lazily; eager is fine for a fake — the file then exists for
+the next open to resume).
 
 `abort` ends a live turn with the aborted tail then responds — it is
 idempotent when idle, like real Pi. `get_state` reports
@@ -48,25 +57,85 @@ import time
 
 LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
 MODE = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else "normal"
+ALIAS = os.environ.get("CADENCE_ALIAS", "")
 
-# The master-harness record: the argv tail and the env NAMES the child
-# actually received (values are never written — some are credentials).
-# Only for the master alias — worker tests share /tmp cwds.
-if os.environ.get("CADENCE_ALIAS") == "master":
-    with open(os.path.join(os.getcwd(), "pi-argv.json"), "w") as f:
-        json.dump(sys.argv[1:], f)
-    with open(os.path.join(os.getcwd(), "pi-env.json"), "w") as f:
-        json.dump(sorted(os.environ), f)
+# The launch record: the argv tail and the env NAMES the child actually
+# received (values are never written — some are credentials). The
+# master's record lands in its cwd; every other alias's lands beside
+# the provider logs under `<state>/agents/` (a worker's cwd is a repo
+# checkout the test does not own).
+def record_launch():
+    # Raw argv tail — the mode word sits first when one was given, same
+    # shape the pi_master tests already assert on.
+    argv_tail = sys.argv[1:]
+    if ALIAS == "master":
+        with open(os.path.join(os.getcwd(), "pi-argv.json"), "w") as f:
+            json.dump(argv_tail, f)
+        with open(os.path.join(os.getcwd(), "pi-env.json"), "w") as f:
+            json.dump(sorted(os.environ), f)
+    elif ALIAS and os.environ.get("CADENCE_STATE_DIR"):
+        record = os.path.join(
+            os.environ["CADENCE_STATE_DIR"], "agents", "pi-record-%s.json" % ALIAS
+        )
+        with open(record, "w") as f:
+            json.dump({"argv": argv_tail, "env": sorted(os.environ)}, f)
+
+
+# `--session <path>`: an existing file resumes its stored session id
+# and prompt count; a missing file mints a fresh session and writes the
+# header now, so a later open resumes it.
+def load_session():
+    args = sys.argv[1:]
+    if "--session" not in args:
+        return None, 0
+    path = args[args.index("--session") + 1]
+    try:
+        with open(path) as f:
+            lines = [json.loads(line) for line in f if line.strip()]
+        session = next(
+            (row.get("id") for row in lines if row.get("type") == "session"), None
+        )
+        prompts = sum(1 for row in lines if row.get("type") == "prompt")
+        return session, prompts
+    except (OSError, ValueError):
+        pass
+    return None, 0
+
+
+record_launch()
+SESSION_FILE, PROMPTS_SEEN, _sid = None, 0, None
+_args = sys.argv[1:]
+if "--session" in _args:
+    SESSION_FILE = _args[_args.index("--session") + 1]
+    _sid, PROMPTS_SEEN = load_session()
 
 state = {
-    "sessionId": "fakepi-session-" + str(os.getpid()),
+    "sessionId": _sid or "fakepi-session-" + str(os.getpid()),
     "model": {"id": "fake/model-1", "name": "Fake Model", "provider": "fake"},
     "thinkingLevel": "medium",
     "isStreaming": False,
     "pendingMessageCount": 0,
+    "sessionFile": SESSION_FILE,
+    "promptsSeen": PROMPTS_SEEN,
 }
 live_turn = False
 pending_dialog = None
+
+
+def append_session(row):
+    if not SESSION_FILE:
+        return
+    with open(SESSION_FILE, "a") as f:
+        f.write(json.dumps(row) + "\n")
+
+
+if SESSION_FILE and not os.path.exists(SESSION_FILE):
+    append_session({
+        "type": "session",
+        "version": 3,
+        "id": state["sessionId"],
+        "cwd": os.getcwd(),
+    })
 
 
 def emit(obj):
@@ -189,6 +258,8 @@ def main():
             respond(rid, "prompt", True)
             if MODE == "crash":
                 os._exit(2)
+            state["promptsSeen"] += 1
+            append_session({"type": "prompt", "message": req.get("message", "")})
             run_prompt(req.get("message", ""))
         elif rtype == "abort":
             if live_turn:

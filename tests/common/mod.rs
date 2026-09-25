@@ -3566,6 +3566,47 @@ impl Drop for MockClaude {
     }
 }
 
+// ==== CAD-544: managed pi workers over tests/e2e/fake-pi.py ====
+
+/// Marker whose Drop clears the pi command override this test set.
+pub struct MockPi {
+    _private: (),
+}
+
+impl TestDaemon {
+    /// Route this test's `pi` launches at `tests/e2e/fake-pi.py` — the
+    /// same scripted stand-in the master tests use. The fake records
+    /// each worker's argv/env-names under
+    /// `<state>/agents/pi-record-<alias>.json`.
+    pub fn mock_pi(&self, mode: &str) -> MockPi {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/e2e/fake-pi.py");
+        test_env().set(
+            "CADENCE_PI_COMMAND",
+            format!("python3 {} {}", script.display(), mode),
+        );
+        MockPi { _private: () }
+    }
+
+    /// Register a managed pi worker (`pi/managed`, the join endpoint).
+    pub fn register_pi(&self, alias: &str, params: Value) {
+        let cwd = self.dir.path().to_str().unwrap().to_string();
+        let params = (!params.is_null()).then(|| params.to_string());
+        self.fixture_rpc(
+            "agent_register",
+            json!({"alias": alias, "provider": "pi",
+                   "endpoint_kind": "managed", "cwd": cwd,
+                   "params": params}),
+        )
+        .unwrap();
+    }
+}
+
+impl Drop for MockPi {
+    fn drop(&mut self) {
+        test_env().remove("CADENCE_PI_COMMAND");
+    }
+}
+
 // ==== brokered claude permissions (cadence mcp-permission) ====
 
 /// Point the daemon's generated `--mcp-config` at the real cadence

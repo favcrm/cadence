@@ -290,13 +290,20 @@ fn a_crashed_pi_fails_instead_of_hanging() {
 
 #[test]
 fn reopen_mints_a_fresh_session() {
-    // Disposable sessions: a reopened endpoint is a NEW native session —
-    // the daemon rebuilds context from the continuity pack (CAD-324).
-    let dir = tempfile::tempdir().unwrap();
-    let (pi, _rx) = adapter("normal", dir.path());
-    let first = pi.open(&agent("dev-1", json!({}))).unwrap();
+    // Disposable sessions are the MASTER's contract: a reopened master
+    // endpoint is a NEW native session — the daemon rebuilds context
+    // from the continuity pack (CAD-324). A pi WORKER's reopen resumes
+    // its stored session file instead (CAD-544; tests/pi_worker.rs).
+    let state = tempfile::tempdir().unwrap();
+    let pi = master_adapter(
+        "normal",
+        state.path(),
+        &[(cadence_agent::master::TEST_NO_LANDLOCK, "1".into())],
+    );
+    let agent = master_agent(state.path(), json!({"unconfined": true}));
+    let first = pi.open(&agent).unwrap();
     pi.close();
-    let second = pi.open(&agent("dev-1", json!({}))).unwrap();
+    let second = pi.open(&agent).unwrap();
     assert_ne!(first.thread_id, second.thread_id);
     pi.close();
 }
@@ -629,12 +636,13 @@ fn the_pi_guard_is_a_grammar_and_refuses_the_bypasses() {
 fn close_then_reopen_then_first_turn_completes() {
     let dir = tempfile::tempdir().unwrap();
     let (pi, _rx) = adapter("linger", dir.path());
-    let first = pi.open(&agent("dev-1", json!({}))).unwrap();
+    // (A worker alias resumes its session file — the generation race
+    // is what this test pins, not session freshness.)
+    let _first = pi.open(&agent("dev-1", json!({}))).unwrap();
     pi.close();
     // The parent is reaped but a grandchild still holds its stdout —
     // the old reader has not seen EOF yet. Reopen inside that window.
-    let second = pi.open(&agent("dev-1", json!({}))).unwrap();
-    assert_ne!(first.thread_id, second.thread_id);
+    let _second = pi.open(&agent("dev-1", json!({}))).unwrap();
     // Wait until the grandchild let the pipe go — the marker file is
     // written the instant before — plus a beat for the stale EOF to
     // reach the reader thread inside this generation's lifetime.

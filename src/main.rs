@@ -602,7 +602,7 @@ enum Commands {
     },
     /// Join a new worker agent to a group. `<group>` is the PM agent —
     /// its alias or provider-native id — and `<provider>` is devin,
-    /// codex, claude, cursor or fake. The worker's results route back
+    /// codex, claude, pi, cursor or fake. The worker's results route back
     /// to the PM by default (its params gain `"upstream"`). This
     /// terminal attaches once the endpoint is open, same rules as
     /// `cadence devin`. `--cloud` (provider devin) opens a Devin Cloud
@@ -613,7 +613,7 @@ enum Commands {
     Join {
         /// Group handle — the PM agent's alias or native session id.
         group: String,
-        /// Worker provider: devin, codex, claude, cursor or fake.
+        /// Worker provider: devin, codex, claude, pi, cursor or fake.
         provider: String,
         /// Resume an existing native session as the worker (devin slug,
         /// a Claude session id with --tui, or a Cursor chat id).
@@ -668,8 +668,8 @@ enum Commands {
         /// resume). Off by default — joins leave the repo untouched.
         #[arg(long)]
         agents_md: bool,
-        /// Model flag for providers `claude`, `cursor` and `codex` (e.g.
-        /// sonnet, haiku, gpt-5.6-luna).
+        /// Model flag for providers `claude`, `cursor`, `codex` and `pi`
+        /// (e.g. sonnet, haiku, gpt-5.6-luna, anthropic/claude-sonnet-4).
         #[arg(long)]
         model: Option<String>,
         /// Use the provider's native model instead of a daemon default.
@@ -681,10 +681,12 @@ enum Commands {
         /// `devops`.
         #[arg(long)]
         team_role: Option<String>,
-        /// Reasoning effort for providers `claude` and `codex` (`--effort`).
-        /// The selected Codex model's advertised efforts are validated at
-        /// open time.
-        #[arg(long, value_parser = ["low", "medium", "high", "xhigh", "max"])]
+        /// Reasoning effort for providers `claude`, `codex` and `pi`
+        /// (`--effort`; pi's `set_thinking_level` vocabulary also takes
+        /// `off` and `minimal`). Each provider's vocabulary is validated
+        /// against the launch params at registration; for pi the
+        /// adapter also verifies what stuck through `get_state`.
+        #[arg(long, value_parser = ["off", "minimal", "low", "medium", "high", "xhigh", "max"])]
         effort: Option<String>,
         /// Codex approval policy, stored in params and replayed on
         /// resume [default: never]. Refused for other providers.
@@ -705,12 +707,12 @@ enum Commands {
         /// dangerous for devin, force for cursor.
         #[arg(long, conflicts_with = "permission_mode")]
         bypass: bool,
-        /// Seconds without any provider event before a claude or codex
-        /// turn is declared unknown [default: 900]. Managed endpoint only.
+        /// Seconds without any provider event before a claude, codex or
+        /// pi turn is declared unknown [default: 900]. Managed endpoint only.
         #[arg(long, conflicts_with = "tui", value_parser = clap::value_parser!(u64).range(1..))]
         turn_idle_secs: Option<u64>,
-        /// Optional absolute turn cap in seconds for provider `claude` or
-        /// `codex`. Managed endpoint only.
+        /// Optional absolute turn cap in seconds for provider `claude`,
+        /// `codex` or `pi`. Managed endpoint only.
         #[arg(long, conflicts_with = "tui", value_parser = clap::value_parser!(u64).range(1..))]
         turn_max_secs: Option<u64>,
         /// Broker a claude worker's tool-permission prompts through
@@ -8947,12 +8949,37 @@ fn provider_launch(
     let endpoint_kind = launch_endpoint_kind(provider, devin.cloud, tui)?;
     // `-r` on claude only makes sense on the pty endpoint — the managed
     // adapter reopens through `agent resume` and would silently drop a
-    // session param it never reads.
+    // session param it never reads. Pi has no native-session seed to
+    // point `-r` at either: a managed pi worker resumes the session
+    // file the adapter keeps under the state dir, via `agent resume`.
     if provider == "claude" && resume.is_some() && !tui {
         return Err(Error::rejected(
             "`--resume` on claude requires `--tui` — a managed claude agent \
              resumes with `cadence agent resume <alias>`",
         ));
+    }
+    if provider == "pi" && resume.is_some() {
+        return Err(Error::rejected(
+            "`--resume` on pi is not supported — a managed pi worker resumes \
+             its stored session file with `cadence agent resume <alias>`",
+        ));
+    }
+    // A pi worker has no permission surface to flag (CAD-544): its
+    // toolset is the fixed dev allowlist, unattended — refuse the
+    // claude-style knobs rather than silently drop them.
+    if provider == "pi" {
+        if claude.permission_mode.is_some() || claude.bypass {
+            return Err(Error::rejected(
+                "--permission-mode/--bypass do not apply to pi — a managed pi \
+                 worker runs with its fixed tool allowlist, unattended",
+            ));
+        }
+        if !claude.allow.is_empty() {
+            return Err(Error::rejected("--allow only applies to claude"));
+        }
+        if claude.broker_approvals {
+            return Err(Error::rejected("--broker-approvals only applies to claude"));
+        }
     }
     // `-r <slug>` first resolves the slug to an already-registered agent
     // (by alias or native session id) so re-running is a reopen, not a
@@ -9121,6 +9148,29 @@ fn provider_launch(
         }
         if let Some(secs) = codex.turn_max_secs {
             params_obj.insert("turn_max_secs".to_string(), json!(secs));
+        }
+    }
+    // Pi's launch params ride in `params` exactly like claude's — the
+    // adapter replays them verbatim on every open: `--model`, then
+    // `effort` through `set_thinking_level` (verified via `get_state`).
+    if provider == "pi" {
+        let spec = registry::spec(provider, endpoint_kind)?;
+        if let Some(model) = &claude.model {
+            params_obj.insert("model".to_string(), json!(model));
+        }
+        if let Some(effort) = &claude.effort {
+            registry::pi_effort(effort)?;
+            params_obj.insert("effort".to_string(), json!(effort));
+        }
+        if spec.launch_params.contains(&"turn_idle_secs") {
+            if let Some(secs) = claude.turn_idle_secs {
+                params_obj.insert("turn_idle_secs".to_string(), json!(secs));
+            }
+        }
+        if spec.launch_params.contains(&"turn_max_secs") {
+            if let Some(secs) = claude.turn_max_secs {
+                params_obj.insert("turn_max_secs".to_string(), json!(secs));
+            }
         }
     }
     if auto_ready {
