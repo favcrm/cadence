@@ -1643,12 +1643,7 @@ fn inbox_collects_direct_send_with_reply_to() {
     )
     .unwrap();
     let token = pty_token(&d, "sender", "t1");
-    d.rpc(
-        "message_report",
-        json!({"message": "t1", "token": token, "kind": "result",
-               "text": "did the thing"}),
-    )
-    .unwrap();
+    d.report("t1", &token, "result", "did the thing").unwrap();
     let page = d.rpc("agent_inbox", json!({"alias": "obs"})).unwrap();
     let msgs = page["messages"].as_array().unwrap();
     assert_eq!(msgs.len(), 1, "{page}");
@@ -2749,11 +2744,7 @@ fn message_cancel_gate_pty_and_running_refusal() {
         err.to_string().contains("'running'") || err.to_string().contains("'submitting'"),
         "{err}"
     );
-    d.rpc(
-        "message_report",
-        json!({"message": "m2", "token": token, "kind": "result", "text": "done"}),
-    )
-    .unwrap();
+    d.report("m2", &token, "result", "done").unwrap();
     d.wait_message("dv1", "m2", &["completed"], 15);
 }
 

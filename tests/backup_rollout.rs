@@ -138,12 +138,7 @@ fn daemon_restart_reports_kept_turn() {
     assert!(stdout.contains("kept"), "{stdout}");
     // The restarted daemon adopted the turn — its token completes.
     assert_eq!(d.message_state("dv", "m1"), "running");
-    d.rpc(
-        "message_report",
-        json!({"message": "m1", "token": token, "kind": "result",
-               "text": "done"}),
-    )
-    .unwrap();
+    d.report("m1", &token, "result", "done").unwrap();
     d.wait_message("dv", "m1", &["completed"], 15);
     let stop = operator_cadence_at(home.path(), &d.state, &["daemon", "stop"]);
     assert!(stop.status.success());

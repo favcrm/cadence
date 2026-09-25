@@ -275,12 +275,7 @@ fn pty_hot_restart_adopts_running_turn() {
     );
     // The turn's original token is still authoritative — the recorded
     // generation was reused, so the report validates.
-    d.rpc(
-        "message_report",
-        json!({"message": "m1", "token": token, "kind": "result",
-               "text": "done"}),
-    )
-    .unwrap();
+    d.report("m1", &token, "result", "done").unwrap();
     d.wait_message("dv1", "m1", &["completed"], 15);
     // ... and the result routed to reply_to as always.
     let pm = d.rpc("agent_show", json!({"alias": "pm"})).unwrap();
@@ -540,11 +535,7 @@ fn pty_hot_restart_report_before_adoption_rejected_stale() {
     std::env::set_var("MOCK_TMUX_HOLD", "8");
     std::env::set_var("MOCK_TMUX_HOLD_CMD", "has-session");
     let d = TestDaemon::start_on(state);
-    let early = d.rpc(
-        "message_report",
-        json!({"message": "m1", "token": token, "kind": "result",
-               "text": "early"}),
-    );
+    let early = d.report("m1", &token, "result", "early");
     std::env::remove_var("MOCK_TMUX_HOLD");
     std::env::remove_var("MOCK_TMUX_HOLD_CMD");
     let err = early.expect_err("pre-proof report must be refused");
@@ -558,12 +549,7 @@ fn pty_hot_restart_report_before_adoption_rejected_stale() {
         event_kinds(&d, "dv1").iter().any(|k| k == "turn_adopted"),
         "pane proof did not adopt the turn"
     );
-    d.rpc(
-        "message_report",
-        json!({"message": "m1", "token": token, "kind": "result",
-               "text": "done"}),
-    )
-    .unwrap();
+    d.report("m1", &token, "result", "done").unwrap();
     d.wait_message("dv1", "m1", &["completed"], 15);
 }
 
@@ -625,12 +611,7 @@ fn pty_hot_restart_adopts_multiple_running_turns() {
     assert_eq!(d.message_state("dv1", "m1"), "running");
     assert_eq!(d.message_state("dv1", "m2"), "running");
     for (id, token) in [("m1", token1), ("m2", token2)] {
-        d.rpc(
-            "message_report",
-            json!({"message": id, "token": token, "kind": "result",
-                   "text": "done"}),
-        )
-        .unwrap();
+        d.report(id, &token, "result", "done").unwrap();
         d.wait_message("dv1", id, &["completed"], 15);
     }
 }
@@ -920,12 +901,7 @@ fn restart_idle_pty_after_forced_detach(via_signal: bool) {
         "restart must not replay a paste into the pane"
     );
     for (id, token) in [("m1", token1.as_str()), ("m2", token2.as_str())] {
-        d.rpc(
-            "message_report",
-            json!({"message": id, "token": token, "kind": "result",
-                   "text": "done"}),
-        )
-        .unwrap();
+        d.report(id, token, "result", "done").unwrap();
         d.wait_message("dv1", id, &["completed"], 15);
     }
     let pm = d.rpc("agent_show", json!({"alias": "pm"})).unwrap();

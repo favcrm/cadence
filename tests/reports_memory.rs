@@ -172,12 +172,7 @@ fn long_report_text_survives_pty_report_to_inbox() {
         d.operator_rpc("agent_ready", json!({"alias": "w1"}))
             .unwrap();
         let token = pty_token(&d, "w1", &id);
-        d.rpc(
-            "message_report",
-            json!({"message": id, "token": token, "kind": "result",
-                   "text": "x".repeat(size)}),
-        )
-        .unwrap();
+        d.report(&id, &token, "result", &"x".repeat(size)).unwrap();
         let m = d.wait_message("w1", &id, &["completed"], 15);
         assert_eq!(
             m["result"]["text"].as_str().unwrap().len(),
@@ -710,11 +705,8 @@ fn memory_native_socket_identity_requires_distinct_reviewers() {
     assert_eq!(rejected_memory.front.reviews[0].reviewer, "reviewer-a");
     assert!(!memory::retrieval_status(&rejected_memory).0);
 
-    d.rpc(
-        "message_report",
-        json!({"message": "memory-busy", "token": busy_token, "kind": "result", "text": "done"}),
-    )
-    .unwrap();
+    d.report("memory-busy", &busy_token, "result", "done")
+        .unwrap();
     d.wait_message("author", "memory-busy", &["completed"], 10);
 }
 

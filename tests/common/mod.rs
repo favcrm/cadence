@@ -532,14 +532,26 @@ impl TestDaemon {
 
     /// `agent_send` with `alias` merged into `fields` — the suite's
     /// dominant call shape.
-    pub fn send(
-        &self,
-        alias: impl AsRef<str>,
-        fields: Value,
-    ) -> cadence_agent::Result<Value> {
+    pub fn send(&self, alias: impl AsRef<str>, fields: Value) -> cadence_agent::Result<Value> {
         let mut fields = fields.as_object().unwrap().clone();
         fields.insert("alias".into(), json!(alias.as_ref()));
         self.rpc("agent_send", Value::Object(fields))
+    }
+
+    /// `message_report` for turn `message` under `token` — every report
+    /// site carries exactly these four fields.
+    pub fn report(
+        &self,
+        message: &str,
+        token: &str,
+        kind: &str,
+        text: &str,
+    ) -> cadence_agent::Result<Value> {
+        self.rpc(
+            "message_report",
+            json!({"message": message, "token": token,
+                   "kind": kind, "text": text}),
+        )
     }
 
     /// `rpc` from a caller that is provably the operator however the
@@ -2778,11 +2790,7 @@ pub fn running_token(d: &TestDaemon, id: &str) -> String {
 /// a second task reports the first before the next can be claimed.
 pub fn pty_report_done(d: &TestDaemon, alias: &str, id: &str) {
     let token = pty_token(d, alias, id);
-    d.rpc(
-        "message_report",
-        json!({"message": id, "token": token, "kind": "result", "text": "done"}),
-    )
-    .unwrap();
+    d.report(id, &token, "result", "done").unwrap();
     d.wait_message(alias, id, &["completed"], 10);
 }
 
@@ -2823,10 +2831,7 @@ pub fn cad162_assert_refused(d: &TestDaemon, alias: &str, id: &str, token: &str,
     let before = cad162_message(d, alias, id);
     for kind in ["ack", "result"] {
         let err = d
-            .rpc(
-                "message_report",
-                json!({"message": id, "token": token, "kind": kind, "text": "forged"}),
-            )
+            .report(id, token, kind, "forged")
             .expect_err(&format!("{what}: {kind} with {token} accepted as current"));
         assert!(
             err.to_string().contains("stale endpoint generation"),

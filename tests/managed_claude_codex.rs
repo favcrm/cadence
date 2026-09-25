@@ -1211,11 +1211,7 @@ fn claude_managed_ack_keeps_running_until_the_turn_result() {
     let token = running_token(&d, "m1");
     assert!(token.starts_with(&format!("claude-{gen}-")), "{token}");
 
-    d.rpc(
-        "message_report",
-        json!({"message": "m1", "token": token, "kind": "ack", "text": "understood"}),
-    )
-    .unwrap();
+    d.report("m1", &token, "ack", "understood").unwrap();
     let m = cad162_message(&d, "w1", "m1");
     assert_eq!(m["state"], "running", "{m}");
     assert_eq!(m["result"]["ack"]["text"], "understood", "{m}");
@@ -1230,10 +1226,7 @@ fn claude_managed_ack_keeps_running_until_the_turn_result() {
     );
 
     let err = d
-        .rpc(
-            "message_report",
-            json!({"message": "m1", "token": token, "kind": "result", "text": "done?"}),
-        )
+        .report("m1", &token, "result", "done?")
         .expect_err("a reported result must not race the managed turn result");
     assert!(err.to_string().contains("report `ack` only"), "{err}");
     assert_eq!(d.message_state("w1", "m1"), "running");

@@ -112,11 +112,7 @@ fn pty_nudge_steers_without_owning_a_turn() {
         "{pm}"
     );
     // The held turn is unchanged and reports normally.
-    d.rpc(
-        "message_report",
-        json!({"message": "t1", "token": token, "kind": "result", "text": "done"}),
-    )
-    .unwrap();
+    d.report("t1", &token, "result", "done").unwrap();
     d.wait_message("w1", "t1", &["completed"], 10);
     pty_token(&d, "w1", "t2");
 }
@@ -284,18 +280,10 @@ fn pty_send_pastes_literal_and_completes_via_report() {
     assert_eq!(d.message_state("dv1", "m2"), "running");
 
     // Wrong token rejected; correct token completes and preserves text.
-    let bad = d.rpc(
-        "message_report",
-        json!({"message": "m2", "token": "pty-wrong", "kind": "result",
-               "text": "nope"}),
-    );
+    let bad = d.report("m2", "pty-wrong", "result", "nope");
     assert!(bad.is_err());
-    d.rpc(
-        "message_report",
-        json!({"message": "m2", "token": token, "kind": "result",
-               "text": "done: MOCK_REPLY observed"}),
-    )
-    .unwrap();
+    d.report("m2", &token, "result", "done: MOCK_REPLY observed")
+        .unwrap();
     let m = d.wait_message("dv1", "m2", &["completed"], 10);
     assert_eq!(m["result"]["via"], "pty_report");
     d.wait_agent("dv1", "idle", 10);
@@ -343,12 +331,7 @@ fn pty_ack_then_result_and_duplicate_rules() {
         .unwrap();
     let token = pty_token(&d, "dv1", "m1");
 
-    d.rpc(
-        "message_report",
-        json!({"message": "m1", "token": token, "kind": "ack",
-               "text": "seen"}),
-    )
-    .unwrap();
+    d.report("m1", &token, "ack", "seen").unwrap();
     assert_eq!(d.message_state("dv1", "m1"), "running");
     let m = d.rpc("agent_show", json!({"alias": "dv1"})).unwrap()["messages"]
         .as_array()
@@ -359,19 +342,10 @@ fn pty_ack_then_result_and_duplicate_rules() {
         .clone();
     assert_eq!(m["result"]["ack"]["text"], "seen");
 
-    d.rpc(
-        "message_report",
-        json!({"message": "m1", "token": token, "kind": "result",
-               "text": "final"}),
-    )
-    .unwrap();
+    d.report("m1", &token, "result", "final").unwrap();
     d.wait_message("dv1", "m1", &["completed"], 10);
     // Idempotent retry of the same result is fine...
-    let dup = d.rpc(
-        "message_report",
-        json!({"message": "m1", "token": token, "kind": "result",
-               "text": "final"}),
-    );
+    let dup = d.report("m1", &token, "result", "final");
     assert!(dup.is_ok(), "{dup:?}");
     // ...but a conflicting result for a finished message is rejected.
     assert!(d
@@ -410,11 +384,7 @@ fn pty_stale_generation_report_rejected() {
     d.rpc("agent_resume", json!({"alias": "dv1"})).unwrap();
     let agent = d.wait_agent("dv1", "idle", 20);
     assert!(!agent["generation"].as_str().unwrap().is_empty());
-    let stale = d.rpc(
-        "message_report",
-        json!({"message": "m1", "token": old_token, "kind": "result",
-               "text": "late"}),
-    );
+    let stale = d.report("m1", &old_token, "result", "late");
     assert!(
         stale.is_err(),
         "stale-generation report accepted: {stale:?}"
@@ -458,22 +428,14 @@ fn pty_report_refuses_stale_generation_and_managed_token() {
 
     // The genuine token still reports — the refusals were the token's.
     cad162_set_turn(&d, "m1", &token);
-    d.rpc(
-        "message_report",
-        json!({"message": "m1", "token": token, "kind": "ack", "text": "seen"}),
-    )
-    .unwrap();
+    d.report("m1", &token, "ack", "seen").unwrap();
     let m = cad162_message(&d, "dv1", "m1");
     assert_eq!(m["state"], "running", "{m}");
     assert_eq!(
         m["result"]["status"], "submitted",
         "pty ack keeps the marker: {m}"
     );
-    d.rpc(
-        "message_report",
-        json!({"message": "m1", "token": token, "kind": "result", "text": "done"}),
-    )
-    .unwrap();
+    d.report("m1", &token, "result", "done").unwrap();
     d.wait_message("dv1", "m1", &["completed"], 10);
 }
 
@@ -692,12 +654,7 @@ fn pty_send_rejects_control_chars() {
     d.send("dv1", json!({"text": "valid follow-up", "message": "m2"}))
         .unwrap();
     let token = pty_token(&d, "dv1", "m2");
-    d.rpc(
-        "message_report",
-        json!({"message": "m2", "token": token, "kind": "result",
-               "text": "done"}),
-    )
-    .unwrap();
+    d.report("m2", &token, "result", "done").unwrap();
     d.wait_message("dv1", "m2", &["completed"], 10);
 }
 
@@ -2762,12 +2719,7 @@ fn pty_stub_profile_drives_gate_and_render() {
         assert!(Instant::now() < deadline, "stub never echoed: {screen}");
         thread::sleep(Duration::from_millis(50));
     }
-    d.rpc(
-        "message_report",
-        json!({"message": "m1", "token": token, "kind": "result",
-               "text": "done"}),
-    )
-    .unwrap();
+    d.report("m1", &token, "result", "done").unwrap();
     d.wait_message("st", "m1", &["completed"], 10);
     // The stub's own forbidden prefixes still reject pre-write.
     d.send(
@@ -3117,12 +3069,7 @@ fn pty_claude_send_pastes_and_completes_via_report() {
         assert!(Instant::now() < deadline, "no reply: {screen}");
         thread::sleep(Duration::from_millis(50));
     }
-    d.rpc(
-        "message_report",
-        json!({"message": "m1", "token": token, "kind": "result",
-               "text": "done"}),
-    )
-    .unwrap();
+    d.report("m1", &token, "result", "done").unwrap();
     d.wait_message("cl", "m1", &["completed"], 10);
 }
 
@@ -4181,12 +4128,7 @@ fn pty_cursor_send_pastes_and_completes_via_report() {
         assert!(Instant::now() < deadline, "no reply: {screen}");
         thread::sleep(Duration::from_millis(50));
     }
-    d.rpc(
-        "message_report",
-        json!({"message": "m1", "token": token, "kind": "result",
-               "text": "done"}),
-    )
-    .unwrap();
+    d.report("m1", &token, "result", "done").unwrap();
     d.wait_message("cu", "m1", &["completed"], 10);
 }
 
@@ -4800,20 +4742,10 @@ fn pty_silent_end_fires_once_and_recovers() {
     let ms10 = sent["message"].as_str().unwrap().to_string();
     assert_eq!(sent["state"], "queued", "{sent}");
     assert_eq!(d.message_state("w1", &ms10), "queued");
-    d.rpc(
-        "message_report",
-        json!({"message": "ms9", "token": token, "kind": "result",
-               "text": "done"}),
-    )
-    .unwrap();
+    d.report("ms9", &token, "result", "done").unwrap();
     d.wait_message("w1", "ms9", &["completed"], 10);
     let token2 = pty_token(&d, "w1", &ms10);
-    d.rpc(
-        "message_report",
-        json!({"message": ms10, "token": token2, "kind": "result",
-               "text": "done"}),
-    )
-    .unwrap();
+    d.report(&ms10, &token2, "result", "done").unwrap();
     d.wait_message("w1", &ms10, &["completed"], 10);
     stall_sample(0);
 }
@@ -4913,12 +4845,7 @@ fn pty_unreported_turn_holds_queue_and_bounds_to_unknown() {
     assert!(row["title"].as_str().unwrap().contains("4 queued"), "{row}");
 
     // A result report releases exactly the next turn.
-    d.rpc(
-        "message_report",
-        json!({"message": "acc1", "token": token1, "kind": "result",
-               "text": "done"}),
-    )
-    .unwrap();
+    d.report("acc1", &token1, "result", "done").unwrap();
     d.wait_message("w1", "acc1", &["completed"], 10);
     pty_token(&d, "w1", "acc2");
     assert_eq!(running_ids(&d), ["acc2"]);

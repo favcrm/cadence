@@ -2332,10 +2332,7 @@ fn cad323_pty_claude_interrupt_sends_escape_and_settles() {
         "{calls}"
     );
     let err = d
-        .rpc(
-            "message_report",
-            json!({"message": "m1", "token": token, "kind": "result", "text": "late"}),
-        )
+        .report("m1", &token, "result", "late")
         .unwrap_err()
         .to_string();
     assert!(!err.is_empty());
@@ -2491,11 +2488,7 @@ fn cad323_pty_interrupt_never_lands_on_the_next_turn() {
         .unwrap();
     let t1 = pty_token(&d, "cl", "m1");
     cad323_stale_interrupt(&d, "cl", || {
-        d.rpc(
-            "message_report",
-            json!({"message": "m1", "token": t1, "kind": "result", "text": "done"}),
-        )
-        .unwrap();
+        d.report("m1", &t1, "result", "done").unwrap();
         d.wait_message("cl", "m1", &["completed"], 10);
         d.send("cl", json!({"text": "second job", "message": "m2"}))
             .unwrap();

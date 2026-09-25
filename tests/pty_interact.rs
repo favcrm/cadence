@@ -170,12 +170,7 @@ fn pty_stall_static_screen_fires_once_and_notices() {
 
     // A real result still lands normally after the notice.
     let token = pty_token(&d, "w1", "ms1");
-    d.rpc(
-        "message_report",
-        json!({"message": "ms1", "token": token, "kind": "result",
-               "text": "done"}),
-    )
-    .unwrap();
+    d.report("ms1", &token, "result", "done").unwrap();
     d.wait_message("w1", "ms1", &["completed"], 10);
     stall_sample(0);
 }
@@ -725,12 +720,7 @@ fn pty_silent_end_sends_one_report_reminder() {
     // The held turn is untouched — still running — and the worker's own
     // report resolves it normally: never `unknown` on a timely answer.
     assert_eq!(d.message_state("w1", "ms9"), "running");
-    d.rpc(
-        "message_report",
-        json!({"message": "ms9", "token": token, "kind": "result",
-               "text": "done"}),
-    )
-    .unwrap();
+    d.report("ms9", &token, "result", "done").unwrap();
     d.wait_message("w1", "ms9", &["completed"], 10);
     assert_eq!(
         d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["unknown"],
@@ -871,12 +861,7 @@ fn pty_queued_menu_surfaces_and_answers() {
     d.rpc("agent_ready", json!({"alias": "dv"})).unwrap();
     d.wait_message("dv", "mq", &["running"], 20);
     let token = pty_token(&d, "dv", "mq");
-    d.rpc(
-        "message_report",
-        json!({"message": "mq", "token": token, "kind": "result",
-               "text": "done"}),
-    )
-    .unwrap();
+    d.report("mq", &token, "result", "done").unwrap();
     d.wait_message("dv", "mq", &["completed"], 10);
     stall_sample(0);
 }
@@ -1212,12 +1197,7 @@ fn pty_gate_probe_failure_is_a_gate_refusal() {
 
     d.wait_message("dv", "mf", &["running"], 20);
     let token = pty_token(&d, "dv", "mf");
-    d.rpc(
-        "message_report",
-        json!({"message": "mf", "token": token, "kind": "result",
-               "text": "done"}),
-    )
-    .unwrap();
+    d.report("mf", &token, "result", "done").unwrap();
     d.wait_message("dv", "mf", &["completed"], 10);
 }
 
@@ -1433,11 +1413,7 @@ fn recover_submit_sends_one_enter_and_keeps_correlation() {
     );
     assert_eq!(pane_keys(&d, &mock.dir, "st"), (1, 2));
     atomic_write(d.stub_pane_file(&mock, "st", "input"), "");
-    d.rpc(
-        "message_report",
-        json!({"message": "m1", "token": token, "kind": "result", "text": "done"}),
-    )
-    .unwrap();
+    d.report("m1", &token, "result", "done").unwrap();
     d.wait_message("st", "m1", &["completed"], 10);
     let e = recover(&d, "st", "m1").unwrap_err().to_string();
     assert!(e.contains("(already_submitted)"), "{e}");
@@ -1684,11 +1660,7 @@ fn recover_submit_devin_lost_submit() {
         2,
         "{screen}"
     );
-    d.rpc(
-        "message_report",
-        json!({"message": "k1", "token": token, "kind": "result", "text": "done"}),
-    )
-    .unwrap();
+    d.report("k1", &token, "result", "done").unwrap();
     d.wait_message("dv1", "k1", &["completed"], 10);
 }
 
@@ -2054,19 +2026,11 @@ fn pty_urgent_waits_for_the_held_turn_then_goes_first() {
         assert_eq!(d.message_state("w1", id), "queued", "{id}");
     }
     // The report is the safe boundary: u1 is the next turn.
-    d.rpc(
-        "message_report",
-        json!({"message": "h0", "token": token0, "kind": "result", "text": "done"}),
-    )
-    .unwrap();
+    d.report("h0", &token0, "result", "done").unwrap();
     let token1 = pty_token(&d, "w1", "u1");
     assert_eq!(d.message_state("w1", "n1"), "queued");
     assert_eq!(d.message_state("w1", "n2"), "queued");
-    d.rpc(
-        "message_report",
-        json!({"message": "u1", "token": token1, "kind": "result", "text": "done"}),
-    )
-    .unwrap();
+    d.report("u1", &token1, "result", "done").unwrap();
     pty_token(&d, "w1", "n1");
     assert_eq!(d.message_state("w1", "n2"), "queued");
 }
