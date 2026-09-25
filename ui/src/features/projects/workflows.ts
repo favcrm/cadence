@@ -63,6 +63,9 @@ export function gateBlock(row: WorkflowRow): string | null {
   if (typeof row.approved === "string" && row.approved) {
     return `approval state ${row.approved}`;
   }
+  if (row.app) {
+    return `app ${row.app} is not approved for its current structure — approve it with \`cadence app approve ${row.app} --project ${row.project}\``;
+  }
   return `not approved for its current gate keys — approve it with \`cadence workflow approve ${row.name} --project ${row.project}\``;
 }
 

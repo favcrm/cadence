@@ -2227,11 +2227,19 @@ impl Shared {
             }),
             // Build identity + process start — the deploy-drift check
             // measures merged commits against *this* binary's commit.
-            "daemon_info" => Ok(json!({
-                "build_commit": crate::overview::BUILD_COMMIT,
-                "build_time": crate::overview::BUILD_TIME,
-                "started_at": self.started_at,
-            })),
+            "daemon_info" => Ok({
+                // Registered connection (platform adapter) names — an
+                // app slot's binding is checked against these (CAD-547).
+                let mut connections: Vec<&str> =
+                    self.platforms.keys().map(String::as_str).collect();
+                connections.sort_unstable();
+                json!({
+                    "build_commit": crate::overview::BUILD_COMMIT,
+                    "build_time": crate::overview::BUILD_TIME,
+                    "started_at": self.started_at,
+                    "connections": connections,
+                })
+            }),
             "shutdown" => {
                 self.begin_closing();
                 Ok(json!({"state": "stopping"}))
@@ -2594,6 +2602,7 @@ impl Shared {
                 "approvals": self.store.work_approvals()?,
             })),
             "workflow_approve" => self.rpc_workflow_approve(params, peer_pid),
+            "app_approve" => self.rpc_app_approve(params, peer_pid),
             "master_dispatch" => self.rpc_master_dispatch(params, peer_pid),
             "question_escalate" => self.rpc_question_escalate(params, peer_pid),
             "agent_file_write" => self.rpc_agent_file_write(params, peer_pid),
@@ -4144,7 +4153,7 @@ impl Shared {
         };
         let pm = crate::issue::Pm::at(&self.pm_dir()?)?;
         let allow = crate::secret::Allowlist::load(&self.state_dir)?;
-        let out = crate::issue::plan::propose(&pm, project, &text, &allow, &actor)?;
+        let out = crate::issue::plan::propose(&pm, project, &text, workflow, &allow, &actor)?;
         let _ = self.store.event_public(
             DAEMON_ALIAS,
             "plan_proposed",
@@ -4156,6 +4165,7 @@ impl Shared {
                 "ticket_count": out["tickets"].as_array().map_or(0, Vec::len),
                 "proposed_by": out["proposed_by"],
                 "workflow": workflow,
+                "app": workflow.and_then(|w| crate::issue::app::split_ref(w).map(|(a, _)| a)),
             }),
         );
         self.wake();
@@ -4200,6 +4210,20 @@ impl Shared {
             }
         };
         let pm_dir = self.pm_dir()?;
+        // `<app>/<workflow>` names an installed app's workflow (CAD-547):
+        // the app's whole-bundle digest — slots and bindings included —
+        // must match the operator's `app_approved` record. A bare name
+        // stays the stored-workflow path.
+        if let Some((app, wf)) = crate::issue::app::split_ref(name) {
+            let approvals = self.store.app_approvals()?;
+            return crate::issue::app::plan_text(&pm_dir, &approvals, project, app, wf, &provided);
+        }
+        if name.contains('/') {
+            return Err(Error::rejected(format!(
+                "workflow name '{name}' — a stored name, or <app>/<workflow> for an \
+                 installed app (both [a-z0-9-], ≤32)"
+            )));
+        }
         let text = crate::issue::workflow::read_for(&pm_dir, project, name)?;
         let digest = crate::issue::workflow::gate_digest(&text)?;
         let approvals = self.store.workflow_approvals()?;
@@ -4418,6 +4442,58 @@ impl Shared {
             "notes": notes,
         });
         self.store.record_workflow_approval(payload.clone())?;
+        self.wake();
+        Ok(payload)
+    }
+
+    /// CAD-547 `app_approve` — the operator approves an installed app's
+    /// structural digest: the manifest envelope (name, declared slots),
+    /// each slot's effective binding, the `app.md` guide, every
+    /// workflow's CAD-487 gate digest, and every rubric/template byte —
+    /// everything `plan propose --workflow <app>/<wf>` matches before
+    /// it renders. Operator only, connection-bound like
+    /// `workflow approve`. The INSTALLED folder is re-verified with the
+    /// same checks `app install` ran, so a hand edit after install
+    /// cannot smuggle content past the review; anything that fails
+    /// those checks refuses the approval.
+    fn rpc_app_approve(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.operator_connection("app approve", params, peer_pid)?;
+        let project = required_str(params, "project")?;
+        crate::issue::model::check_key(project)?;
+        let name = required_str(params, "name")?;
+        let pm_dir = self.pm_dir()?;
+        if !crate::issue::project::list(&pm_dir)?
+            .iter()
+            .any(|p| p.key == project)
+        {
+            return Err(crate::issue::project::unknown_project(project, &pm_dir));
+        }
+        let aliases: Vec<String> = self
+            .store
+            .agents()?
+            .iter()
+            .map(|a| a.alias.clone())
+            .collect();
+        let (agents, sources) =
+            crate::issue::workflow::known_agents(&pm_dir, Some(project), &aliases);
+        let notes = crate::issue::app::check_installed(&pm_dir, project, name, &agents, &sources)
+            .map_err(|e| {
+            Error::rejected(format!(
+                "app '{name}' fails the install checks — approve it only after \
+                     these are fixed (`cadence app show {name} --project {project}`): \
+                     {e}"
+            ))
+        })?;
+        let digest = crate::issue::app::digest(&pm_dir, project, name)?;
+        let payload = json!({
+            "project": project,
+            "name": name,
+            "digest": digest,
+            "by": "operator",
+            "at": crate::issue::time::iso(crate::issue::time::now_epoch()),
+            "notes": notes,
+        });
+        self.store.record_app_approval(payload.clone())?;
         self.wake();
         Ok(payload)
     }

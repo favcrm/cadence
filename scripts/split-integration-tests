@@ -706,6 +706,14 @@ PINNED.update({
     "workflow_inputs_cannot_inject_and_project_is_a_key": "plan_work",
     "board_workflow_list_preview_and_propose": "board_ui",
     "board_workflow_preview_names_render_refusals": "board_ui",
+    # CAD-547 apps
+    "app_install_ls_show_set_update_remove": "plan_work",
+    "app_approve_is_operator_only": "plan_work",
+    "app_propose_gates_and_provenance": "plan_work",
+    "app_install_refuses_hostile_input": "plan_work",
+    "app_install_from_git_pins_the_commit": "plan_work",
+    "app_doctor_reports_slot_bindings": "plan_work",
+    "board_app_workflow_list_preview_and_propose": "board_ui",
     # CAD-378 code-area owners
     "cad378_start_warns_on_overlap_owner_and_capacity": "plan_work",
     "cad378_bad_areas_config_is_reported_not_fatal": "plan_work",

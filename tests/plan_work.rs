@@ -940,6 +940,656 @@ fn workflow_inputs_cannot_inject_and_project_is_a_key() {
     assert!(!ok && out.to_string().contains("symlink"), "{out}");
 }
 
+/// CAD-547: an app is a folder — `app.md` + `workflows/` (+ optional
+/// `rubrics/`, `templates/`) — installed to `<pm>/<key>/apps/<name>/`
+/// with its `<name>.yaml` record in one commit, landing unapproved.
+/// `ls`/`show` report manifest, slots and approval; `set` binds a slot
+/// (an unregistered connection lands with a warning, still recorded);
+/// `update` from the recorded source prints the diff and re-gates on a
+/// structural change; `remove` deletes folder + record in one commit.
+#[test]
+fn app_install_ls_show_set_update_remove() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    f.d.register("qa-1");
+    let before = f.commits();
+
+    let out = app_install_studio(&f);
+    assert_eq!(out["name"], "studio", "{out}");
+    assert_eq!(out["approved"], false, "{out}");
+    assert_eq!(out["workflows"], json!(["do-check"]), "{out}");
+    assert_eq!(out["connections"], json!(["publish"]), "{out}");
+    assert!(
+        out["digest"].as_str().unwrap().starts_with("sha256:"),
+        "{out}"
+    );
+    assert_eq!(out["source"]["kind"], "path", "{out}");
+    assert_eq!(f.commits(), before + 1, "install is one commit");
+    let dir = f.pm_dir.join("demo/apps/studio");
+    assert!(dir.join("app.md").is_file());
+    assert!(dir.join("workflows/do-check.md").is_file());
+    assert!(dir.join("rubrics/review.md").is_file());
+    assert!(f.pm_dir.join("demo/apps/studio.yaml").is_file());
+    // Installed content carries no mode bits — 0644, never exec.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(dir.join("workflows/do-check.md"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o644, "{mode:o}");
+    }
+    // Reinstalling over it refuses by name.
+    let src = f.tmp.path().join("app-studio");
+    let (ok, out) = f.cli(&["app", "install", src.to_str().unwrap(), "--project", "demo"]);
+    assert!(
+        !ok && out.to_string().contains("already installed"),
+        "{out}"
+    );
+
+    // ls: one row — manifest fields, the slot at its `local` default,
+    // unapproved.
+    let (ok, out) = f.cli(&["app", "ls", "--project", "demo"]);
+    assert!(ok, "{out}");
+    assert_eq!(out["apps"].as_array().unwrap().len(), 1, "{out}");
+    let row = &out["apps"][0];
+    assert_eq!(row["name"], "studio", "{row}");
+    assert_eq!(row["version"], "0.1.0", "{row}");
+    assert_eq!(row["connections"][0]["slot"], "publish", "{row}");
+    assert_eq!(row["connections"][0]["bound"], "local", "{row}");
+    assert_eq!(row["approved"], false, "{row}");
+
+    // show: the guide, a workflow row named <app>/<wf> carrying its
+    // `uses:` slot, the install record, the digest.
+    let (ok, out) = f.cli(&["app", "show", "studio", "--project", "demo"]);
+    assert!(ok, "{out}");
+    assert!(
+        out["guide"].as_str().unwrap().contains("run the studio"),
+        "{out}"
+    );
+    assert_eq!(out["workflows"][0]["name"], "studio/do-check", "{out}");
+    assert_eq!(out["workflows"][0]["ok"], true, "{out}");
+    assert_eq!(out["workflows"][0]["uses"], json!(["publish"]), "{out}");
+    assert_eq!(out["record"]["source"]["kind"], "path", "{out}");
+    let src_dir = out["record"]["source"]["path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // set: a slot the manifest never declared refuses; an unregistered
+    // connection lands with a warning (CAD-546's connector may not
+    // exist yet); `slot=` unbinds explicitly.
+    let (ok, out) = f.cli(&["app", "set", "studio", "nope=x", "--project", "demo"]);
+    assert!(!ok && out.to_string().contains("no slot 'nope'"), "{out}");
+    let (ok, out) = f.cli(&[
+        "app",
+        "set",
+        "studio",
+        "publish=publish-svc",
+        "--project",
+        "demo",
+    ]);
+    assert!(ok, "{out}");
+    assert_eq!(out["bindings"]["publish"], "publish-svc", "{out}");
+    assert!(
+        out["warnings"][0]
+            .as_str()
+            .unwrap_or_default()
+            .contains("publish-svc"),
+        "{out}"
+    );
+    let (ok, out) = f.cli(&["app", "set", "studio", "publish=", "--project", "demo"]);
+    assert!(ok && out["bindings"]["publish"].is_null(), "{out}");
+
+    // update from the recorded source: an added template plus a guide
+    // edit — the diff names both, the structural change re-gates.
+    std::fs::create_dir_all(Path::new(&src_dir).join("templates")).unwrap();
+    std::fs::write(
+        Path::new(&src_dir).join("templates/brief.md"),
+        "the brief\n",
+    )
+    .unwrap();
+    std::fs::write(
+        Path::new(&src_dir).join("app.md"),
+        APP_MD.replace("How to run the studio.", "How the studio ships."),
+    )
+    .unwrap();
+    let (ok, out) = f.cli(&["app", "update", "studio", "--project", "demo"]);
+    assert!(ok, "{out}");
+    assert_eq!(out["diff"]["added"], json!(["templates/brief.md"]), "{out}");
+    assert_eq!(out["diff"]["changed"], json!(["app.md"]), "{out}");
+    assert_eq!(out["gate_changed"], true, "{out}");
+    assert_eq!(out["approved"], false, "{out}");
+    assert!(
+        out["diff"]["patch"].as_str().unwrap().contains("brief"),
+        "{out}"
+    );
+    assert!(dir.join("templates/brief.md").is_file());
+    // An update from a bundle naming another app refuses — it is an
+    // install, not an update.
+    let other = app_src(
+        &f,
+        "other",
+        &[
+            (
+                "app.md",
+                "---\napp: other\ntitle: O\nversion: \"1\"\nneeds:\n  connections: [publish]\n---\n\nbody\n",
+            ),
+            ("workflows/do-check.md", APP_WF),
+        ],
+    );
+    let (ok, out) = f.cli(&[
+        "app",
+        "update",
+        "studio",
+        other.to_str().unwrap(),
+        "--project",
+        "demo",
+    ]);
+    assert!(
+        !ok && out.to_string().contains("names app 'other'"),
+        "{out}"
+    );
+
+    // remove: folder + record in one commit; the app no longer lists.
+    let before = f.commits();
+    let (ok, out) = f.cli(&["app", "remove", "studio", "--project", "demo"]);
+    assert!(
+        ok && out["removed"] == true && out["committed"] == true,
+        "{out}"
+    );
+    assert_eq!(f.commits(), before + 1, "remove is one commit");
+    assert!(!dir.exists() && !f.pm_dir.join("demo/apps/studio.yaml").exists());
+    let (ok, out) = f.cli(&["app", "ls", "--project", "demo"]);
+    assert!(ok && out["apps"].as_array().unwrap().is_empty(), "{out}");
+}
+
+/// CAD-547: `app_approve` is the operator's, decided by the connection
+/// — like `workflow approve`. A pane agent is refused (even forging
+/// identity fields), a detached child is refused, a forged field on
+/// the operator's own call is refused, and only the proven operator
+/// records the digest `plan_propose` later matches. An installed app
+/// that fails the install checks — a hand edit after install — cannot
+/// be approved.
+#[test]
+fn app_approve_is_operator_only() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    f.d.register("qa-1");
+    app_install_studio(&f);
+
+    let home = TempDir::new().unwrap();
+    let mut pane = LaneShell::spawn(home.path());
+    plant_pane(&f.d, "pane-9", pane.pid());
+    let r = pane.rpc(
+        &f.d.state,
+        "app_approve",
+        json!({"project": "demo", "name": "studio"}),
+    );
+    let msg = r["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("operator action") && msg.contains("pane-9"),
+        "pane approve: {r}"
+    );
+    for (field, value) in FORGED_IDENTITY {
+        let r = pane.rpc(
+            &f.d.state,
+            "app_approve",
+            forged(&json!({"project": "demo", "name": "studio"}), field, value),
+        );
+        assert_eq!(r["ok"], false, "pane forging {field}: {r}");
+    }
+    let r =
+        f.d.unproven_rpc("app_approve", json!({"project": "demo", "name": "studio"}))
+            .unwrap_err()
+            .to_string();
+    assert!(
+        r.contains("not provably the operator") || r.contains("operator action"),
+        "{r}"
+    );
+    // A forged field on the operator's own call is refused, not read.
+    let err =
+        f.d.operator_rpc(
+            "app_approve",
+            json!({"project": "demo", "name": "studio", "by": "operator"}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("'by'"), "{err}");
+    // `project` is a key, never a path fragment.
+    let err =
+        f.d.operator_rpc("app_approve", json!({"project": "../x", "name": "studio"}))
+            .unwrap_err()
+            .to_string();
+    assert!(err.contains("key"), "{err}");
+
+    // The proven operator approves — the record names operator, carries
+    // the app's digest, and is idempotent.
+    let out =
+        f.d.operator_rpc("app_approve", json!({"project": "demo", "name": "studio"}))
+            .unwrap();
+    assert_eq!(out["by"], "operator", "{out}");
+    assert!(
+        out["digest"].as_str().unwrap().starts_with("sha256:"),
+        "{out}"
+    );
+    let again =
+        f.d.operator_rpc("app_approve", json!({"project": "demo", "name": "studio"}))
+            .unwrap();
+    assert_eq!(again["digest"], out["digest"]);
+
+    // A hand edit that breaks a workflow (an agent the project does
+    // not know) fails the same checks install ran — approve refuses.
+    let wf = f.pm_dir.join("demo/apps/studio/workflows/do-check.md");
+    std::fs::write(&wf, APP_WF.replace("agent: qa-1", "agent: ghost")).unwrap();
+    let err =
+        f.d.operator_rpc("app_approve", json!({"project": "demo", "name": "studio"}))
+            .unwrap_err()
+            .to_string();
+    assert!(err.contains("fails the install checks"), "{err}");
+    std::fs::write(&wf, APP_WF).unwrap();
+}
+
+/// CAD-547: `plan propose --workflow <app>/<wf>` refuses
+/// `app_unapproved` until the operator's approval matches the app's
+/// CURRENT digest — then it renders and proposes through the ordinary
+/// path (the plan gate still applies to its tickets). The epic records
+/// `plan.workflow = "<app>/<wf>"`, the `plan_proposed` event names the
+/// app, a slot rebind re-gates, and `app remove` refuses while a plan
+/// from the app is open.
+#[test]
+fn app_propose_gates_and_provenance() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    f.d.register("qa-1");
+    app_install_studio(&f);
+
+    // Unapproved: refused with the named code, nothing written.
+    let before = f.commits();
+    let err =
+        f.d.operator_rpc(
+            "plan_propose",
+            json!({"project": "demo", "workflow": "studio/do-check",
+                   "inputs": {"title": "x"}}),
+        )
+        .unwrap_err();
+    assert_eq!(err.code(), Some("app_unapproved"), "{err}");
+    // Malformed and absent app refs refuse by name too.
+    for (wf, want) in [
+        ("studio/nope", "no workflow 'nope' in app 'studio'"),
+        ("nope/do-check", "no app 'nope' installed"),
+        ("a/b/c", "<app>/<workflow>"),
+    ] {
+        let err =
+            f.d.operator_rpc(
+                "plan_propose",
+                json!({"project": "demo", "workflow": wf,
+                       "inputs": {"title": "x"}}),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(want), "{wf}: {err}");
+    }
+    assert_eq!(f.commits(), before, "refusals write nothing");
+
+    let out =
+        f.d.operator_rpc("app_approve", json!({"project": "demo", "name": "studio"}))
+            .unwrap();
+    assert_eq!(out["by"], "operator", "{out}");
+
+    // The CLI form: --workflow <app>/<wf> + --input lands the same
+    // epic+tickets a stored workflow would.
+    let (ok, out) = f.cli(&[
+        "plan",
+        "propose",
+        "--project",
+        "demo",
+        "--workflow",
+        "studio/do-check",
+        "--input",
+        "title=login fix",
+    ]);
+    assert!(ok, "{out}");
+    assert_eq!(out["epic"], "D-1", "{out}");
+    assert_eq!(out["tickets"], json!(["D-2", "D-3"]), "{out}");
+    assert!(issue_body(&f, "D-1").contains("Ship login fix"));
+    // The epic records where it came from; the event names the app.
+    let plan = f.front("D-1").plan.unwrap();
+    assert_eq!(plan.state, "proposed");
+    assert_eq!(plan.workflow.as_deref(), Some("studio/do-check"));
+    let events = f.daemon_events("plan_proposed");
+    assert_eq!(events[0]["workflow"], "studio/do-check", "{events:?}");
+    assert_eq!(events[0]["app"], "studio", "{events:?}");
+    // The plan gate is unchanged for app-sourced plans.
+    let (ok, err) = f.cli(&["issue", "start", "D-2"]);
+    assert!(!ok && err.to_string().contains("proposed"), "{err}");
+
+    // While the plan is open, `app remove` refuses by name.
+    let (ok, out) = f.cli(&["app", "remove", "studio", "--project", "demo"]);
+    assert!(
+        !ok && out.to_string().contains("open plans") && out.to_string().contains("D-1"),
+        "{out}"
+    );
+
+    // A binding change is structural — the next propose re-gates even
+    // though no file changed.
+    let (ok, _) = f.cli(&[
+        "app",
+        "set",
+        "studio",
+        "publish=publish-svc",
+        "--project",
+        "demo",
+    ]);
+    assert!(ok);
+    let err =
+        f.d.operator_rpc(
+            "plan_propose",
+            json!({"project": "demo", "workflow": "studio/do-check",
+                   "inputs": {"title": "y"}}),
+        )
+        .unwrap_err();
+    assert_eq!(err.code(), Some("app_unapproved"), "{err}");
+
+    // A stored workflow that shares the app's name records a bare
+    // `plan.workflow = "studio"` — no slash — and is not the app's plan:
+    // its open epic must not hold `app remove`.
+    wf_add(&f, "studio", WF_TWO_STEP);
+    f.d.operator_rpc(
+        "workflow_approve",
+        json!({"project": "demo", "name": "studio"}),
+    )
+    .unwrap();
+    let (ok, out) = f.cli(&[
+        "plan",
+        "propose",
+        "--project",
+        "demo",
+        "--workflow",
+        "studio",
+        "--input",
+        "title=stored name",
+    ]);
+    assert!(ok, "{out}");
+    let stored_epic = out["epic"].as_str().unwrap().to_string();
+    assert_eq!(
+        f.front(&stored_epic).plan.unwrap().workflow.as_deref(),
+        Some("studio")
+    );
+
+    // Reject the app's plan → the app can go even while the stored
+    // workflow's own plan stays open.
+    f.d.operator_rpc("plan_reject", json!({"epic": "D-1", "reason": "not now"}))
+        .unwrap();
+    let (ok, out) = f.cli(&["app", "remove", "studio", "--project", "demo"]);
+    assert!(ok && out["removed"] == true, "{out}");
+    assert!(!f.pm_dir.join("demo/apps/studio").exists());
+}
+
+/// CAD-547: install is safe on hostile input — a symlink anywhere in
+/// the bundle (or the source dir itself), an unknown top-level entry,
+/// a missing `app.md`, a missing or empty `workflows/`, a `uses:` the
+/// app never declared, a workflow that fails `workflow check`, a gated
+/// frontmatter key, a nested dir, an oversize file, and a source
+/// inside the tracker all refuse by name — and none lands a byte.
+#[test]
+fn app_install_refuses_hostile_input() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    f.d.register("qa-1");
+    let before = f.commits();
+    let base = f.tmp.path().join("hostile");
+    let install = |f: &PlanFixture| {
+        f.cli(&[
+            "app",
+            "install",
+            base.to_str().unwrap(),
+            "--project",
+            "demo",
+        ])
+    };
+    let good: &[(&str, &str)] = &[("app.md", APP_MD), ("workflows/do-check.md", APP_WF)];
+    let reset = |files: &[(&str, &str)]| {
+        let _ = std::fs::remove_dir_all(&base);
+        for (rel, text) in files {
+            let p = base.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        }
+    };
+
+    // An unknown top-level entry refuses — it names itself.
+    reset(&[
+        ("app.md", APP_MD),
+        ("workflows/do-check.md", APP_WF),
+        ("run.sh", "echo hi\n"),
+    ]);
+    let (ok, out) = install(&f);
+    assert!(!ok && out.to_string().contains("run.sh"), "{out}");
+
+    // A symlink inside the bundle refuses — never followed.
+    reset(good);
+    std::os::unix::fs::symlink("/etc/hostname", base.join("workflows/leak.md")).unwrap();
+    let (ok, out) = install(&f);
+    assert!(!ok && out.to_string().contains("symlink"), "{out}");
+
+    // So does a symlinked source dir.
+    let real = app_src(&f, "real", good);
+    let link = f.tmp.path().join("link-app");
+    let _ = std::fs::remove_file(&link);
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let (ok, out) = f.cli(&[
+        "app",
+        "install",
+        link.to_str().unwrap(),
+        "--project",
+        "demo",
+    ]);
+    assert!(!ok && out.to_string().contains("symlink"), "{out}");
+
+    // No app.md; no workflows/; an empty one.
+    reset(&[("workflows/do-check.md", APP_WF)]);
+    let (ok, out) = install(&f);
+    assert!(!ok && out.to_string().contains("no app.md"), "{out}");
+    reset(&[("app.md", APP_MD)]);
+    let (ok, out) = install(&f);
+    assert!(!ok && out.to_string().contains("workflows/"), "{out}");
+    reset(&[("app.md", APP_MD)]);
+    std::fs::create_dir_all(base.join("workflows")).unwrap();
+    let (ok, out) = install(&f);
+    assert!(!ok && out.to_string().contains("no *.md workflow"), "{out}");
+
+    // A `uses:` the app never declared refuses — slots are declared in
+    // the manifest so the binding stays the operator's choice.
+    let wf = APP_WF.replace("uses: publish", "uses: cms");
+    reset(&[("app.md", APP_MD), ("workflows/do-check.md", &wf)]);
+    let (ok, out) = install(&f);
+    assert!(!ok && out.to_string().contains("does not declare"), "{out}");
+
+    // A workflow failing `workflow check` (unknown agent) refuses.
+    let wf = APP_WF.replace("agent: qa-1", "agent: ghost");
+    reset(&[("app.md", APP_MD), ("workflows/do-check.md", &wf)]);
+    let (ok, out) = install(&f);
+    assert!(!ok && out.to_string().contains("ghost"), "{out}");
+
+    // A gated A2/A3 frontmatter key refuses with its stage named.
+    let md = "---\napp: studio\ntitle: S\nversion: 1\nrecords: {}\nneeds:\n  connections: [publish]\n---\n\nbody\n";
+    reset(&[("app.md", md), ("workflows/do-check.md", APP_WF)]);
+    let (ok, out) = install(&f);
+    assert!(
+        !ok && out.to_string().contains("records") && out.to_string().contains("later"),
+        "{out}"
+    );
+
+    // A nested dir under workflows/ refuses — v0 dirs are flat.
+    reset(good);
+    std::fs::create_dir_all(base.join("workflows/nested")).unwrap();
+    let (ok, out) = install(&f);
+    assert!(!ok && out.to_string().contains("flat"), "{out}");
+
+    // A file over the cap refuses before it is read as text.
+    reset(good);
+    std::fs::create_dir_all(base.join("rubrics")).unwrap();
+    std::fs::write(
+        base.join("rubrics/big.md"),
+        "x".repeat(cadence_agent::issue::plan::MAX_PLAN_BYTES + 1),
+    )
+    .unwrap();
+    let (ok, out) = install(&f);
+    assert!(!ok && out.to_string().contains("at most"), "{out}");
+
+    // The tracker is never its own source.
+    let inside = f.pm_dir.join("outside-src");
+    for (rel, text) in good {
+        let p = inside.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, text).unwrap();
+    }
+    let (ok, out) = f.cli(&[
+        "app",
+        "install",
+        inside.to_str().unwrap(),
+        "--project",
+        "demo",
+    ]);
+    assert!(
+        !ok && out.to_string().contains("inside the tracker"),
+        "{out}"
+    );
+
+    // None of it landed — no app dir, no record, no commit.
+    assert_eq!(f.commits(), before, "refusals write nothing");
+    assert!(!f.pm_dir.join("demo/apps").exists());
+}
+
+/// CAD-547: a git URL installs by clone — the record pins the exact
+/// commit the clone's HEAD resolved to (a branch or tag is never
+/// trusted later), and `app update` from the recorded source re-clones
+/// and re-pins the new head.
+#[test]
+fn app_install_from_git_pins_the_commit() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    f.d.register("qa-1");
+
+    // A git repo carrying the bundle — a `file://` URL forces the git
+    // path (an existing directory is a path install).
+    let repo = app_src(
+        &f,
+        "studio-git",
+        &[("app.md", APP_MD), ("workflows/do-check.md", APP_WF)],
+    );
+    let git = |args: &[&str]| -> String {
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "git {args:?}: {o:?}");
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["add", "-A"]);
+    git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qm",
+        "app",
+    ]);
+    let head = git(&["rev-parse", "HEAD"]);
+    assert_eq!(head.len(), 40);
+
+    let url = format!("file://{}", repo.display());
+    let (ok, out) = f.cli(&["app", "install", &url, "--project", "demo"]);
+    assert!(ok, "{out}");
+    assert_eq!(out["source"]["kind"], "git", "{out}");
+    assert_eq!(out["source"]["sha"], head, "{out}");
+    let (ok, out) = f.cli(&["app", "show", "studio", "--project", "demo"]);
+    assert!(ok && out["record"]["source"]["sha"] == head, "{out}");
+
+    // A later commit on the source: `update` re-clones it and the
+    // record re-pins the new head — the pinned sha moves with the
+    // content, never silently.
+    std::fs::create_dir_all(repo.join("templates")).unwrap();
+    std::fs::write(repo.join("templates/brief.md"), "the brief\n").unwrap();
+    git(&["add", "-A"]);
+    git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qm",
+        "v2",
+    ]);
+    let head2 = git(&["rev-parse", "HEAD"]);
+    let (ok, out) = f.cli(&["app", "update", "studio", "--project", "demo"]);
+    assert!(ok, "{out}");
+    assert_eq!(out["diff"]["added"], json!(["templates/brief.md"]), "{out}");
+    let (ok, out) = f.cli(&["app", "show", "studio", "--project", "demo"]);
+    assert!(ok && out["record"]["source"]["sha"] == head2, "{out}");
+}
+
+/// CAD-547: `doctor` reports each installed app's slot bindings — the
+/// `local` default verified against the daemon's connection set, an
+/// explicit unbind named in `unbound`, and a binding to a connection
+/// the daemon does not register named in `unknown_connection`.
+#[test]
+fn app_doctor_reports_slot_bindings() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    f.d.register("qa-1");
+    app_install_studio(&f);
+    let studio = |out: &Value| -> Value {
+        out["checks"]["apps"]["apps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["app"] == "studio")
+            .unwrap_or_else(|| panic!("no studio row: {out}"))
+            .clone()
+    };
+
+    // Default: publish binds to the built-in `local` — the fixture
+    // daemon registers no other connections.
+    let (ok, out) = f.cli(&["doctor"]);
+    assert!(ok, "{out}");
+    let row = studio(&out);
+    assert_eq!(
+        row["slots_ok"],
+        json!([{"slot": "publish", "connection": "local"}]),
+        "{row}"
+    );
+    assert_eq!(row["unbound"], json!([]), "{row}");
+    assert_eq!(row["unknown_connection"], json!([]), "{row}");
+
+    // Bound to a connection the daemon does not register → named.
+    let (ok, out) = f.cli(&["app", "set", "studio", "publish=ghost", "--project", "demo"]);
+    assert!(ok, "{out}");
+    let (ok, out) = f.cli(&["doctor"]);
+    assert!(ok, "{out}");
+    let row = studio(&out);
+    assert_eq!(
+        row["unknown_connection"],
+        json!([{"slot": "publish", "connection": "ghost"}]),
+        "{row}"
+    );
+    assert_eq!(row["slots_ok"], json!([]), "{row}");
+
+    // An explicit unbind is reported, not silently defaulted.
+    let (ok, out) = f.cli(&["app", "set", "studio", "publish=", "--project", "demo"]);
+    assert!(ok, "{out}");
+    let (ok, out) = f.cli(&["doctor"]);
+    assert!(ok, "{out}");
+    let row = studio(&out);
+    assert_eq!(row["unbound"], json!(["publish"]), "{row}");
+}
+
 /// CAD-360: `job dispatch` of a task whose job is bound to a ticket of
 /// an unapproved plan is refused with the named reason and queues
 /// nothing; after approval it dispatches. A job bound to an issue in
@@ -1161,6 +1811,7 @@ fn plan_propose_caps_size() {
         &pm,
         "demo",
         &huge,
+        None,
         &cadence_agent::secret::Allowlist::default(),
         "operator",
     )

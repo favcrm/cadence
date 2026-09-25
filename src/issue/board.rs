@@ -1273,6 +1273,7 @@ mod tests {
             decided_by: None,
             decided_at: None,
             reason: None,
+            workflow: None,
         });
         let mut child = issue("CAD-2", "doing");
         child.front.parent = Some("CAD-1".to_string());

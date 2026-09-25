@@ -34,7 +34,7 @@ use tiny_http::Request;
 
 use super::{err_response, home, json_response, parse_json, read_body, HttpResp};
 use crate::client;
-use crate::issue::{model, workflow, Pm};
+use crate::issue::{app, model, workflow, Pm};
 
 /// A propose request's inputs — `{"inputs": {"<name>": "<value>"}}`.
 /// Like the daemon, nothing else is read: attribution is the board's
@@ -55,18 +55,22 @@ pub(super) enum ReadRoute<'a> {
     Preview(&'a str, &'a str),
 }
 
-/// `(key, name)` for `POST /api/projects/<key>/workflows/<name>/propose`,
-/// `None` when the path is not that route.
+/// `(key, name)` for `POST /api/projects/<key>/workflows/<name>/propose`
+/// — `<name>` may be `<app>/<wf>` for an installed app's workflow
+/// (CAD-547) — `None` when the path is not that route.
 pub(super) fn propose_route(path: &str) -> Option<(&str, &str)> {
     let tail = path.strip_prefix("/api/projects/")?;
     let (key, rest) = tail.split_once('/')?;
     let rest = rest.strip_prefix("workflows/")?;
-    let (name, verb) = rest.split_once('/')?;
-    (!key.is_empty() && !name.is_empty() && verb == "propose").then_some((key, name))
+    // `<name>/propose` or `<app>/<wf>/propose` — the name is the path
+    // minus its trailing `propose` segment.
+    let (name, verb) = rest.rsplit_once('/')?;
+    (!key.is_empty() && verb == "propose").then_some((key, name))
 }
 
 /// The read route for a path under `/api/projects/<key>/workflows` —
-/// exactly `workflows`, `workflows/`, or `workflows/<name>/preview`.
+/// exactly `workflows`, `workflows/`, `workflows/<name>/preview` or
+/// `workflows/<app>/<wf>/preview` (CAD-547).
 pub(super) fn read_route(path: &str) -> Option<ReadRoute<'_>> {
     let tail = path.strip_prefix("/api/projects/")?;
     let (key, rest) = tail.split_once('/')?;
@@ -78,7 +82,7 @@ pub(super) fn read_route(path: &str) -> Option<ReadRoute<'_>> {
         "" | "/" => Some(ReadRoute::List(key)),
         tail => {
             let tail = tail.strip_prefix('/')?;
-            let (name, sub) = tail.split_once('/')?;
+            let (name, sub) = tail.rsplit_once('/')?;
             (sub == "preview" && !name.is_empty()).then_some(ReadRoute::Preview(key, name))
         }
     }
@@ -114,7 +118,8 @@ fn row(detail: &Value) -> Value {
     })
 }
 
-/// `GET /api/projects/<key>/workflows`.
+/// `GET /api/projects/<key>/workflows` — stored workflows plus every
+/// installed app's workflows, named `<app>/<wf>` (CAD-547).
 fn list(pm: &Pm, state_dir: &std::path::Path, key: &str) -> HttpResp {
     if !model::valid_key(key) {
         return err_response(400, "bad project key");
@@ -145,7 +150,14 @@ fn list(pm: &Pm, state_dir: &std::path::Path, key: &str) -> HttpResp {
             })),
         }
     }
+    rows.extend(app::board_rows(&pm.dir, key, state_dir));
     json_response(json!({"workflows": rows}))
+}
+
+/// A workflow name for preview/propose — a stored `<name>` or an
+/// installed app's `<app>/<wf>` (both halves tag-shaped).
+fn valid_workflow_name(name: &str) -> bool {
+    model::valid_tag(name) || app::split_ref(name).is_some()
 }
 
 /// `GET /api/projects/<key>/workflows/<name>/preview?inputs=<json>` —
@@ -158,7 +170,7 @@ fn preview(
     name: &str,
     query: &dyn Fn(&str) -> Option<String>,
 ) -> HttpResp {
-    if !model::valid_key(key) || !model::valid_tag(name) {
+    if !model::valid_key(key) || !valid_workflow_name(name) {
         return err_response(400, "bad project or workflow name");
     }
     let provided: BTreeMap<String, String> = match query("inputs") {
@@ -180,6 +192,42 @@ fn preview(
             out
         }
     };
+    // `<app>/<wf>` reads the installed app and reports the APP's digest
+    // state (approval is whole-app); a bare name stays the stored
+    // workflow's own gate digest.
+    if let Some((app_name, wf)) = app::split_ref(name) {
+        let text = match app::read_workflow(pm_dir, key, app_name, wf) {
+            Ok(text) => text,
+            Err(e) => return err_response(404, &e.to_string()),
+        };
+        let digest = app::digest(pm_dir, key, app_name).ok();
+        let approvals = app::fetch_approvals(state_dir);
+        let approved = match (&digest, &approvals) {
+            (Some(digest), Some(approvals)) => {
+                json!(app::approved(key, app_name, digest, Some(approvals)))
+            }
+            (Some(_), None) => json!("unknown — daemon unreachable"),
+            (None, _) => Value::Null,
+        };
+        return match workflow::render(&text, &provided) {
+            Ok(rendered) => json_response(json!({
+                "project": key,
+                "name": name,
+                "rendered": rendered,
+                "approved": approved,
+                "digest": digest,
+            })),
+            Err(e) => json_response(json!({
+                "project": key,
+                "name": name,
+                "rendered": Value::Null,
+                "error": e.to_string(),
+                "code": e.code(),
+                "approved": approved,
+                "digest": digest,
+            })),
+        };
+    }
     let text = match workflow::read_for(pm_dir, key, name) {
         Ok(text) => text,
         Err(e) => {
@@ -234,7 +282,7 @@ pub(super) fn propose(
     key: &str,
     name: &str,
 ) -> HttpResp {
-    if !model::valid_key(key) || !model::valid_tag(name) {
+    if !model::valid_key(key) || !valid_workflow_name(name) {
         return err_response(400, "bad project or workflow name");
     }
     let bytes = match read_body(request, BODY_CAP) {

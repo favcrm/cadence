@@ -280,10 +280,14 @@ pub const MAX_TICKETS: usize = 50;
 /// `plan propose` — secret-scan the plan text, parse it, and create
 /// the epic and its tickets in one tracker commit. `allow` is the
 /// caller's secret allowlist (the daemon passes its own state dir's).
+/// `workflow` is the template the plan was rendered from —
+/// `<name>` or `<app>/<name>` (CAD-547) — recorded on the epic so
+/// `app remove` can find the app's open plans.
 pub fn propose(
     pm: &Pm,
     project_key: &str,
     text: &str,
+    workflow: Option<&str>,
     allow: &crate::secret::Allowlist,
     actor: &str,
 ) -> Result<Value> {
@@ -301,7 +305,7 @@ pub fn propose(
             doc.tickets.len()
         )));
     }
-    let mut out = write::create_plan(pm, project_key, &doc, actor)?;
+    let mut out = write::create_plan(pm, project_key, &doc, workflow, actor)?;
     if !warnings.is_empty() {
         out["secret_warnings"] = crate::secret::warnings_json(&warnings);
     }

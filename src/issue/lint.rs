@@ -171,6 +171,25 @@ pub fn run_with(
                 }
                 continue;
             }
+            // CAD-547: `apps/` holds installed app folders plus their
+            // `<name>.yaml` install records — its own lint checks the
+            // manifests.
+            if name == crate::issue::app::DIR {
+                let (mut aerrs, mut awarns) = (Vec::new(), Vec::new());
+                crate::issue::app::lint_dir(
+                    &path,
+                    &project.key,
+                    &mut |e| aerrs.push(e),
+                    &mut |w| awarns.push(w),
+                );
+                for e in aerrs {
+                    lint.err(e);
+                }
+                for w in awarns {
+                    lint.warn(w);
+                }
+                continue;
+            }
             let file = path.join("issue.md");
             if file.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
                 lint.err(format!(

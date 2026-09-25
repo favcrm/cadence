@@ -210,6 +210,12 @@ pub struct Plan {
     /// Why a plan was rejected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// CAD-547: the workflow the plan was proposed from — `<name>` for
+    /// a stored project workflow, `<app>/<workflow>` for an installed
+    /// app's. `app remove` refuses while a plan whose epic records the
+    /// app is still open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
 }
 
 /// Plan states, in order.

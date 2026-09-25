@@ -1537,6 +1537,111 @@ fn board_workflow_preview_names_render_refusals() {
     assert_eq!(f.commits(), before, "previews write nothing");
 }
 
+/// CAD-547: the board lists an installed app's workflows beside the
+/// stored ones, named `<app>/<wf>` and carrying the APP's approval
+/// state (approval is whole-app). Preview reads the installed file;
+/// propose relays `plan_propose` — operator-only like every write, and
+/// the daemon's `app_unapproved` crosses the wire unchanged until
+/// `app approve`, after which the run lands as an ordinary proposed
+/// plan whose epic records the app-qualified workflow name.
+#[test]
+fn board_app_workflow_list_preview_and_propose() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    f.d.register("qa-1");
+    app_install_studio(&f);
+    let port = start_board(&f.pm_dir, &f.d.state);
+    let op = sign_in(&f.d.state, port);
+    let guards = op_guards(&op);
+    let before = f.commits();
+
+    // The list: the app workflow row names its app.
+    let (status, body) = board_get(port, "/api/projects/demo/workflows");
+    assert_eq!(status, 200, "{body}");
+    let list: Value = serde_json::from_str(&body).unwrap();
+    let row = list["workflows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "studio/do-check")
+        .unwrap_or_else(|| panic!("no app row: {list}"));
+    assert_eq!(row["app"], "studio", "{row}");
+    assert_eq!(row["title"], "Run: title", "{row}");
+    assert_eq!(row["tickets"], 2, "{row}");
+    assert_eq!(row["approved"], false, "not yet approved: {row}");
+
+    // The preview renders the installed workflow — the `%2F` in the
+    // wire path decodes to `<app>/<wf>` before routing.
+    let prev = "/api/projects/demo/workflows/studio%2Fdo-check/preview";
+    let (status, body) = board_get(
+        port,
+        &format!("{prev}?inputs={}", pct_encode(r#"{"title":"login fix"}"#)),
+    );
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let rendered = v["rendered"].as_str().unwrap_or_default();
+    assert!(rendered.contains("Run: login fix"), "{rendered}");
+    assert_eq!(v["approved"], false, "{v}");
+    // A malformed app ref and an absent app are HTTP errors.
+    for (path, want) in [
+        (
+            "/api/projects/demo/workflows/a%2Fb%2Fc/preview".to_string(),
+            400,
+        ),
+        (
+            "/api/projects/demo/workflows/nope%2Fwf/preview".to_string(),
+            404,
+        ),
+    ] {
+        let (status, body) = board_get(port, &path);
+        assert_eq!(status, want, "{path}: {body}");
+    }
+
+    // Propose is the operator's — refused without a session, and the
+    // daemon's app gate crosses the board unchanged.
+    let propose = "/api/projects/demo/workflows/studio%2Fdo-check/propose";
+    let (status, reply) = board_http(port, &cad328_post(port, propose, THREAD_GUARDS, "{}"));
+    assert_eq!(status, 403, "{reply}");
+    assert!(reply.contains("operator_session_required"), "{reply}");
+    let (status, reply) = board_http(
+        port,
+        &cad328_post(port, propose, &guards, r#"{"inputs":{"title":"x"}}"#),
+    );
+    assert_eq!(status, 400, "{reply}");
+    assert!(reply.contains("app_unapproved"), "{reply}");
+    assert_eq!(f.commits(), before, "refusals write nothing");
+
+    // Once the operator approves the app, the run proposes — the epic
+    // records the app-qualified workflow it came from.
+    let (ok, out) = f.cli(&["app", "approve", "studio", "--project", "demo"]);
+    assert!(ok, "{out}");
+    let (status, reply) = board_http(
+        port,
+        &cad328_post(
+            port,
+            propose,
+            &guards,
+            r#"{"inputs":{"title":"login fix"}}"#,
+        ),
+    );
+    assert_eq!(status, 200, "{reply}");
+    let out: Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(out["epic"], "D-1", "{out}");
+    let plan = f.front("D-1").plan.unwrap();
+    assert_eq!(plan.state, "proposed");
+    assert_eq!(plan.workflow.as_deref(), Some("studio/do-check"));
+    // And the row now reports the app's approval.
+    let (_, body) = board_get(port, "/api/projects/demo/workflows");
+    let list: Value = serde_json::from_str(&body).unwrap();
+    let row = list["workflows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "studio/do-check")
+        .unwrap();
+    assert_eq!(row["approved"], true, "{row}");
+}
+
 /// The session `op` as presented to the board on `port` instead: that
 /// board's own Host and Origin, its cookie name, the same token (a
 /// session is the daemon's, not one board's).

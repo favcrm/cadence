@@ -1144,6 +1144,7 @@ mod tests {
             decided_by: None,
             decided_at: None,
             reason: None,
+            workflow: None,
         });
         // A proposed plan is in shape whatever a stage field claims.
         f.stage = Some("release".into());
@@ -1392,6 +1393,7 @@ mod tests {
             decided_by: Some("operator".into()),
             decided_at: Some("2026-09-02T00:00:00Z".into()),
             reason: None,
+            workflow: None,
         });
         assert_eq!(moves(&p, false), vec![("verify".to_string(), true, false)]);
         for state in ["proposed", "rejected"] {
@@ -1433,6 +1435,7 @@ mod tests {
             decided_by: None,
             decided_at: None,
             reason: None,
+            workflow: None,
         });
         let err = plan_allows_moves(&f).unwrap_err().to_string();
         assert!(err.contains("CAD-2 is a proposed plan"), "{err}");
@@ -1518,6 +1521,7 @@ mod tests {
             decided_by: None,
             decided_at: None,
             reason: None,
+            workflow: None,
         });
         let vs = views(Path::new("/no-notes"), vec![e]);
         let s = stage_of(&vs[0].issue.front, &cfg, false);

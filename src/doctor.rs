@@ -109,6 +109,28 @@ pub fn run(state_dir: &Path) -> Result<Value> {
     caps["managed_devin_acp"] = json!(false);
     caps["issue_folders"] = json!(pm_present);
     caps["ui_board"] = json!(pm_present);
+    // CAD-547: installed apps' connection slots — each `needs.connections`
+    // slot's binding is checked against the connections the daemon
+    // registers (plus the built-in `local`); an unreachable daemon
+    // reports the check as unavailable, never as "unknown connection".
+    if pm_present {
+        let known = crate::client::rpc(state_dir, "daemon_info", json!({}))
+            .ok()
+            .and_then(|v| v["connections"].as_array().cloned())
+            .map(|a| {
+                let mut set: std::collections::HashSet<String> = a
+                    .iter()
+                    .filter_map(|c| c.as_str().map(str::to_string))
+                    .collect();
+                set.insert(crate::issue::app::LOCAL_CONNECTION.to_string());
+                set
+            });
+        if let Ok(dir) = crate::issue::default_dir() {
+            if let Ok(pm) = crate::issue::Pm::at(&dir) {
+                checks["apps"] = crate::issue::app::doctor(&pm.dir, known.as_ref());
+            }
+        }
+    }
     Ok(json!({
         "state_dir": state_dir,
         "checks": checks,

@@ -13240,7 +13240,7 @@ fn plan_commit_stages_only_its_issue_files() {
          ## first ticket\n\ndo it\n\n### Acceptance\n\n- [ ] done\n",
     )
     .unwrap();
-    let out = write::create_plan(&pm, "cadence", &doc, "tester").unwrap();
+    let out = write::create_plan(&pm, "cadence", &doc, None, "tester").unwrap();
     assert_eq!(out["committed"], true);
     let mut want: Vec<String> = std::iter::once(out["epic"].as_str().unwrap().to_string())
         .chain(
