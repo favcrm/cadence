@@ -436,8 +436,8 @@ impl Shared {
             ALIAS,
             &master::read_files(&pm.dir, ALIAS, false)?,
         )?;
-        // Claude only for the MVP (review round 1, C1): a Codex session
-        // cannot yet run read-only with its writes through daemon verbs.
+        // `claude` and `pi` (CAD-322) — a Codex master still waits for a
+        // read-only sandbox with its writes through daemon verbs.
         let requested = optional_str(params, "provider");
         if let Some(p) = requested.filter(|p| !master::PROVIDERS.contains(p)) {
             return Err(Error::invalid(
@@ -540,19 +540,21 @@ impl Shared {
         let login = if unconfined {
             None
         } else if copy {
-            let operator = master::operator_claude_config(
-                self.provider_env.var("CLAUDE_CONFIG_DIR"),
+            let operator = master::operator_provider_config(
+                provider,
+                self.provider_env
+                    .var(crate::master::provider_config_env(provider)),
                 self.provider_env.var("HOME"),
             );
             Some(match operator {
-                Some(dir) => master::copy_login(&self.state_dir, &dir)?,
-                None => master::ensure_config_dir(&self.state_dir)?,
+                Some(dir) => master::copy_login_for(provider, &self.state_dir, &dir)?,
+                None => master::ensure_config_dir_for(provider, &self.state_dir)?,
             })
         } else {
-            Some(master::ensure_config_dir(&self.state_dir)?)
+            Some(master::ensure_config_dir_for(provider, &self.state_dir)?)
         };
-        let login_command =
-            (login == Some(master::Login::None)).then(|| master::login_command(&self.state_dir));
+        let login_command = (login == Some(master::Login::None))
+            .then(|| master::login_command_for(provider, &self.state_dir));
         self.store.register_agent(&store::NewAgent {
             alias: ALIAS,
             provider,
@@ -604,8 +606,8 @@ impl Shared {
             let _ = self.store.event_public(
                 ALIAS,
                 "master_login_copied",
-                json!({"by": "operator", "what": "claudeAiOauth",
-                       "to": master::claude_config_dir(&self.state_dir)}),
+                json!({"by": "operator", "provider": provider,
+                       "to": master::provider_config_dir(provider, &self.state_dir)}),
             );
         }
         if unconfined {

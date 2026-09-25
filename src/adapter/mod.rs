@@ -52,6 +52,7 @@ pub fn daemon_context_env(env: &ProviderEnv) -> Vec<(String, String)> {
 pub mod codex;
 pub mod fake;
 pub mod link;
+pub mod pi;
 pub mod pty;
 pub mod registry;
 pub mod stdio;
@@ -471,8 +472,9 @@ pub fn build(
         "managed" => match agent.provider.as_str() {
             "codex" => Ok(Box::new(codex::CodexAdapter::new(hooks, log_path, env))),
             "claude" => Ok(Box::new(claude::ClaudeAdapter::new(hooks, log_path, env))),
+            "pi" => Ok(Box::new(pi::PiAdapter::new(hooks, log_path, env))),
             other => Err(crate::error::Error::rejected(format!(
-                "No managed adapter for provider '{other}' (implemented: codex, claude)"
+                "No managed adapter for provider '{other}' (implemented: codex, claude, pi)"
             ))),
         },
         "managed-ws" => match agent.provider.as_str() {

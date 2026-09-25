@@ -2840,7 +2840,7 @@ enum MasterAction {
     /// launch the managed session and queue its briefing. Provider,
     /// model and effort default to AGENT.md's `preferred`.
     Start {
-        /// claude or codex [default: AGENT.md `preferred.provider`].
+        /// claude or pi [default: AGENT.md `preferred.provider`].
         #[arg(long)]
         provider: Option<String>,
         /// Model [default: AGENT.md's for that provider].
@@ -3079,9 +3079,10 @@ fn run_master(state_dir: &Path, action: MasterAction) -> Result<i32> {
                 eprintln!("WARNING: {w}");
             }
             if let Some(cmd) = out["login_command"].as_str() {
+                let provider = provider.as_deref().unwrap_or("claude");
                 eprintln!(
-                    "The master has no Claude login yet. Give it its own:\n  {cmd}\n\
-                     (or `cadence master start --copy-login` to copy yours)"
+                    "The master has no {provider} login yet. Give it its own:\n  {cmd}\n\
+                     (or `cadence master start --provider {provider} --copy-login` to copy yours)"
                 );
             }
             out
@@ -3121,7 +3122,12 @@ fn run_master(state_dir: &Path, action: MasterAction) -> Result<i32> {
             let env = cadence_agent::adapter::ProviderEnv::default();
             let (confine, policy) =
                 cadence_agent::adapter::claude::master_confinement(&env, state_dir);
-            json!({"confine": confine, "read": policy.read, "write": policy.write})
+            let (pi_confine, pi_policy) =
+                cadence_agent::adapter::pi::pi_master_confinement(&env, state_dir);
+            json!({
+                "claude": {"confine": confine, "read": policy.read, "write": policy.write},
+                "pi": {"confine": pi_confine, "read": pi_policy.read, "write": pi_policy.write},
+            })
         }
     };
     print_json(&result);

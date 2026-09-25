@@ -2272,22 +2272,23 @@ fn agent_project(a: &Value, repos: &[(PathBuf, String)]) -> String {
 /// the command that gives it its own, until the login exists.
 fn master_login_item(a: &Value, state_dir: &Path, project: &str, now: i64) -> Option<Item> {
     let alias = a["alias"].as_str().unwrap_or_default();
+    let provider = a["provider"].as_str().unwrap_or("claude");
     let confined =
         crate::master::is_confined(Some(&a["params"]), crate::confine::available().is_ok());
     if !crate::master::is_master(alias)
         || !confined
         || a["state"].as_str() == Some("stopped")
-        || crate::master::has_login(state_dir)
+        || crate::master::has_login_for(provider, state_dir)
     {
         return None;
     }
-    let command = crate::master::login_command(state_dir);
+    let command = crate::master::login_command_for(provider, state_dir);
     let age = now - a["updated"].as_f64().unwrap_or(now as f64) as i64;
     Some(
         item(
             90,
             "master_login",
-            &format!("master has no Claude login — give it its own: {command}"),
+            &format!("master has no {provider} login — give it its own: {command}"),
             age,
             project,
             None,
