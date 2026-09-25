@@ -3407,6 +3407,84 @@ fn ui_agent_detail_route_and_guards() {
     assert_eq!(code, 404);
 }
 
+/// CAD-542: `/api/agents/<alias>` relays `agent_events` — an unscoped
+/// `Rule::Read` — onto unauthenticated HTTP, so it is exactly as
+/// strict as the RPC: a brokered approval's `request_opened` carries
+/// routing fields only, never the input-derived text, which stays on
+/// the operator/owner/PM-scoped `agent_requests` row.
+#[test]
+fn ui_agent_detail_request_opened_carries_no_input() {
+    let pm = TempDir::new().unwrap();
+    let d = UiDaemon::start();
+    seed(pm.path(), &d.state());
+
+    // w1's own connection opens the request: a pane child's daemon
+    // call derives the agent from /proc ancestry — the same proof the
+    // real `mcp-permission` server has.
+    let sock = client::socket_path(&d.state());
+    let req_file = pm.path().join("open.json");
+    std::fs::write(
+        &req_file,
+        cadence_agent::proto::request(
+            "request_open",
+            json!({"alias": "w1", "kind": "approval", "tool": "Bash",
+                   "input_summary": "rm -rf CANARY-BOARD-5e7f /tmp/x",
+                   "input": {"command": "CANARY-BOARD-5e7f"},
+                   "request": "h-board"}),
+        )
+        .to_string(),
+    )
+    .unwrap();
+    let mut pane = Command::new("bash")
+        .args(["-c", r#"read -r _; bash -c "$CLIENT"; true"#])
+        .env(
+            "CLIENT",
+            r#"python3 -c 'import socket,sys;s=socket.socket(socket.AF_UNIX);s.connect(sys.argv[1]);s.sendall(open(sys.argv[2],"rb").read()+b"\n");print(s.makefile().readline())' "$SOCK" "$REQ""#,
+        )
+        .env("SOCK", &sock)
+        .env("REQ", &req_file)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    plant_pane(&d, "w1", pane.id());
+    let conn = rusqlite::Connection::open(d.state().join("cadence.sqlite3")).unwrap();
+    conn.execute(
+        "UPDATE agents SET params=?1, state='busy' WHERE alias='w1'",
+        rusqlite::params![r#"{"broker_approvals": true}"#],
+    )
+    .unwrap();
+    pane.stdin.take().unwrap().write_all(b"go\n").unwrap();
+    let mut frame = String::new();
+    pane.stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut frame)
+        .unwrap();
+    assert!(pane.wait().unwrap().success());
+    assert!(frame.contains("\"ok\":true"), "{frame}");
+
+    // The drawer's feed is the same unscoped lane over HTTP — no
+    // canary, whatever it relays. (`agent_events_tail` still dials the
+    // pre-CAD-384 name `events`, which no daemon has ever dispatched,
+    // so today it relays nothing at all; if that stale call is ever
+    // revived the feed must still carry routing fields only — checked
+    // below so the revival cannot smuggle the input back.)
+    let (port, _board) = start_ui(pm.path().to_path_buf(), d.state());
+    let host = format!("127.0.0.1:{port}");
+    let (code, body) = http(port, "GET", "/api/agents/w1", &host);
+    assert_eq!(code, 200, "{body}");
+    assert!(!body.contains("CANARY-BOARD-5e7f"), "{body}");
+    let detail: Value = serde_json::from_str(&body).unwrap();
+    for e in detail["events"].as_array().unwrap() {
+        if e["kind"] == "request_opened" && e["payload"]["request"] == "h-board" {
+            let payload = &e["payload"];
+            assert!(payload.get("input_summary").is_none(), "{e}");
+            assert!(payload.get("input").is_none(), "{e}");
+        }
+    }
+}
+
 #[test]
 fn ui_stream_sse_and_guards() {
     let pm = TempDir::new().unwrap();

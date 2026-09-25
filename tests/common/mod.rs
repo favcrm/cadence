@@ -3481,7 +3481,9 @@ for line in sys.stdin:
             message = verdict.get("message", "denied")
             denials = [{"tool_name": "Bash",
                         "tool_use_id": "tu_permit",
-                        "tool_input": {"command": text},
+                        "tool_input": {"command": text,
+                                       "description":
+                                           "CANARY-DENIED-INPUT-4e7f"},
                         "message": message}]
             result(subtype="success", is_error=False,
                    result="DENIED:" + message, stop_reason="end_turn",

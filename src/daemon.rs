@@ -1259,10 +1259,15 @@ impl Shared {
         let _ = self
             .store
             .set_agent_state_if(alias, "waiting_input", "busy");
+        // Same lane, same rule (CAD-542): `params` is the provider's
+        // input verbatim — a codex `requestApproval` carries the
+        // command — so the event keeps routing fields only. The
+        // pending row retains the params `agent_requests` discloses to
+        // the authorised answerer.
         let _ = self.store.event_public(
             alias,
             "input_required",
-            json!({"request": handle, "method": request.method, "params": request.params}),
+            json!({"request": handle, "method": request.method}),
         );
         self.wake();
     }
@@ -5241,11 +5246,17 @@ impl Shared {
         let _ = self
             .store
             .set_agent_state_if(&alias, "waiting_input", "busy");
+        // `agent_events` is an unscoped `Rule::Read` — a peer (or any
+        // unattributed caller) reads another agent's lane, so the open
+        // event carries routing fields only. The input-derived text
+        // stays on the pending row (`agent_requests` discloses it to
+        // the operator, the owner and the owner's PM) and on the PM
+        // notice below (CAD-542; the CAD-506 fix for platform effects,
+        // applied to brokered approvals).
         let _ = self.store.event_public(
             &alias,
             "request_opened",
-            json!({"request": handle, "kind": kind, "tool": tool,
-                   "input_summary": input_summary}),
+            json!({"request": handle, "kind": kind, "tool": tool}),
         );
         // An upstream PM gets exactly one notice naming the agent and
         // the respond command — deterministic id, so a retried open

@@ -3869,6 +3869,186 @@ fn an_answered_handle_cannot_be_squatted_before_its_wait() {
     assert_eq!(r["result"]["answer"]["decision"], "accept", "{r}");
 }
 
+/// CAD-542: `agent_events` is an unscoped `Rule::Read` — a peer agent
+/// or any unattributed caller reads another agent's lane — so a
+/// brokered `request_opened` carries routing fields only. The
+/// input-derived text stays on the pending row `agent_requests`
+/// discloses to the operator, the owner and its PM, and on the PM's
+/// notice — never on the lane itself (the CAD-506 fix for platform
+/// effects, applied to brokered approvals).
+#[test]
+fn brokered_request_opened_carries_no_input_derived_text() {
+    let d = TestDaemon::start();
+    let home = TempDir::new().unwrap();
+    let mut pm = LaneShell::spawn(home.path());
+    plant_pane(&d, "lead", pm.pid());
+    let mut owner = LaneShell::spawn(home.path());
+    plant_pane(&d, "w1", owner.pid());
+    let mut peer = LaneShell::spawn(home.path());
+    plant_pane(&d, "w2", peer.pid());
+    cad162_sql(
+        &d,
+        "UPDATE agents SET params=?1, state='busy' WHERE alias='w1'",
+        &[&json!({"upstream": "lead", "broker_approvals": true}).to_string()],
+    );
+    let r = owner.rpc(
+        &d.state,
+        "request_open",
+        json!({"alias": "w1", "kind": "approval", "tool": "Bash",
+               "input_summary": "rm -rf CANARY-SUMMARY-9c1d /tmp/x",
+               "input": {"command": "echo CANARY-INPUT-77ab"},
+               "request": "h-c542"}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+
+    // The unscoped lane: a proven peer agent and a caller nothing
+    // proves both read it (Rule::Read) and neither sees a canary. The
+    // open event still routes — handle, kind, tool — nothing else.
+    for (who, frame) in [
+        (
+            "peer",
+            peer.rpc(&d.state, "agent_events", json!({"alias": "w1"})),
+        ),
+        (
+            "unproven",
+            unprovable_rpc(&d, "agent_events", json!({"alias": "w1"})),
+        ),
+    ] {
+        assert_eq!(frame["ok"], true, "{who}: {frame}");
+        let text = frame["result"].to_string();
+        for canary in ["CANARY-SUMMARY-9c1d", "CANARY-INPUT-77ab"] {
+            assert!(
+                !text.contains(canary),
+                "{who}: {canary} on the event lane: {text}"
+            );
+        }
+        let opened = frame["result"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["kind"] == "request_opened" && e["payload"]["request"] == "h-c542")
+            .unwrap_or_else(|| panic!("{who}: no request_opened in {frame}"));
+        let payload = &opened["payload"];
+        assert_eq!(payload["kind"], "approval", "{payload}");
+        assert_eq!(payload["tool"], "Bash", "{payload}");
+        for field in ["input_summary", "input", "params", "preview"] {
+            assert!(
+                payload.get(field).is_none(),
+                "{who}: request_opened carries {field}: {payload}"
+            );
+        }
+    }
+
+    // The scoped read keeps the full input: the owner, its PM and the
+    // operator see it; the peer and the unproven caller are refused
+    // with no hint of it.
+    for (who, frame) in [
+        (
+            "owner",
+            owner.rpc(&d.state, "agent_requests", json!({"alias": "w1"})),
+        ),
+        (
+            "pm",
+            pm.rpc(&d.state, "agent_requests", json!({"alias": "w1"})),
+        ),
+        (
+            "peer",
+            peer.rpc(&d.state, "agent_requests", json!({"alias": "w1"})),
+        ),
+        (
+            "unproven",
+            unprovable_rpc(&d, "agent_requests", json!({"alias": "w1"})),
+        ),
+    ] {
+        match who {
+            "peer" | "unproven" => {
+                assert_eq!(frame["ok"], false, "{who}: {frame}");
+                assert!(!frame.to_string().contains("CANARY"), "{who}: {frame}");
+            }
+            _ => {
+                assert_eq!(frame["ok"], true, "{who}: {frame}");
+                let text = frame["result"].to_string();
+                for canary in ["CANARY-SUMMARY-9c1d", "CANARY-INPUT-77ab"] {
+                    assert!(text.contains(canary), "{who}: {canary} missing: {text}");
+                }
+            }
+        }
+    }
+    let operator = d
+        .operator_rpc("agent_requests", json!({"alias": "w1"}))
+        .unwrap();
+    assert!(
+        operator.to_string().contains("CANARY-SUMMARY-9c1d"),
+        "{operator}"
+    );
+}
+
+/// CAD-542: the provider-driven `input_required` is the same lane and
+/// the same class — its `params` (a codex `requestApproval` carries
+/// the command verbatim) are input-derived, so the event keeps the
+/// routing fields (request handle, method) only. The full params stay
+/// on the scoped `agent_requests` row the answerer reads.
+#[test]
+fn provider_input_required_carries_no_input_derived_text() {
+    let d = TestDaemon::start();
+    let home = TempDir::new().unwrap();
+    let mut peer = LaneShell::spawn(home.path());
+    plant_pane(&d, "w2", peer.pid());
+    d.register("w1");
+    d.wait_agent("w1", "idle", 10);
+    d.operator_rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "NEED_INPUT:rm CANARY-PROVIDER-3b2c -rf",
+               "message": "m1"}),
+    )
+    .unwrap();
+    d.wait_agent("w1", "waiting_input", 10);
+
+    for (who, frame) in [
+        (
+            "peer",
+            peer.rpc(&d.state, "agent_events", json!({"alias": "w1"})),
+        ),
+        (
+            "unproven",
+            unprovable_rpc(&d, "agent_events", json!({"alias": "w1"})),
+        ),
+    ] {
+        assert_eq!(frame["ok"], true, "{who}: {frame}");
+        let text = frame["result"].to_string();
+        assert!(
+            !text.contains("CANARY-PROVIDER-3b2c"),
+            "{who}: provider input on the event lane: {text}"
+        );
+        let required = frame["result"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["kind"] == "input_required")
+            .unwrap_or_else(|| panic!("{who}: no input_required in {frame}"));
+        let payload = &required["payload"];
+        assert_eq!(
+            payload["method"], "item/commandExecution/requestApproval",
+            "{payload}"
+        );
+        assert!(payload["request"].is_string(), "{payload}");
+        assert!(
+            payload.get("params").is_none(),
+            "{who}: input_required carries params: {payload}"
+        );
+    }
+
+    // The scoped row keeps the full params for the authorised
+    // answerer — here the operator reads the command verbatim.
+    let operator = d
+        .operator_rpc("agent_requests", json!({"alias": "w1"}))
+        .unwrap();
+    assert!(
+        operator.to_string().contains("CANARY-PROVIDER-3b2c"),
+        "{operator}"
+    );
+}
+
 /// CAD-375: a running turn's token is `message_report`'s credential, so
 /// the daemon shows it only to the connection that derives the owning
 /// agent. A peer's (and the operator's) `agent_show`, `agent_list` and
