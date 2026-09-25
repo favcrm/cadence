@@ -44,6 +44,21 @@ const SUMMARY_CAP: usize = 1024;
 /// The record's `preview` cap (schema: bounded rendered artifact).
 const PREVIEW_CAP: usize = 16 * 1024;
 
+/// The bound on durable free text a caller authors — `decision.reason`
+/// and `close_reason` (N2).
+const REASON_CAP: usize = 1024;
+
+/// `s.truncate(cap)` walks the cap back to a char boundary first —
+/// `String::truncate` panics mid-char and every capped string here is
+/// built from caller-controlled UTF-8 (`tool`, `input`, `reason`).
+fn cap_str(s: &mut String, cap: usize) {
+    let mut end = cap.min(s.len());
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+}
+
 impl Shared {
     /// `platform_call {platform, tool, input?, account?, task?,
     /// request?}` — an agent's platform call. The caller is the
@@ -235,12 +250,14 @@ impl Shared {
                 &result,
             )?;
         }
+        // The agent-lane event is read by any caller (`agent_events` is
+        // an unscoped read): it carries the call's identity fields
+        // only — input-derived text stays on the scoped record (I1).
         let _ = self.store.event_public(
             agent,
             "platform_called",
             json!({"platform": platform_name, "account": account,
-                   "tool": tool, "effect": if draft { "draft" } else { "read" },
-                   "input_summary": summary}),
+                   "tool": tool, "effect": if draft { "draft" } else { "read" }}),
         );
         self.wake();
         Ok(json!({
@@ -285,7 +302,7 @@ impl Shared {
         let summary = input_summary(tool, input);
         let mut preview = adapter.preview(account, tool, input);
         if preview.len() > PREVIEW_CAP {
-            preview.truncate(PREVIEW_CAP);
+            cap_str(&mut preview, PREVIEW_CAP);
         }
         // Secret-guarded before anything lands: input, summary and
         // preview must never carry the enrolled bytes.
@@ -343,11 +360,14 @@ impl Shared {
         // the durable event the press follows. Emitted only for a fresh
         // stage — a deduped retry adds no second event.
         if !existing {
+            // `agent_events` is an unscoped `Rule::Read` — a peer (or
+            // any unproven caller) reads this lane. The event carries
+            // the handle the press follows plus routing fields only;
+            // the staged input's text stays on the scoped record (I1).
             let _ = self.store.event_public(
                 agent,
                 "request_opened",
                 json!({"request": row.request, "kind": "effect", "tool": tool,
-                       "input_summary": row.input_summary,
                        "platform": platform_name, "account": account}),
             );
         }
@@ -463,6 +483,21 @@ impl Shared {
                 .unwrap_or_else(|| row.clone());
             return Ok(json!({"state": "acknowledged", "record": row.to_record()}));
         }
+        // Caller-authored free text lands durably — screen it against
+        // the row's enrolled credential and bound it like every other
+        // stored string (N2). A custody miss just skips the screen.
+        let mut reason = reason;
+        if let Ok(bytes) = platform::load_credential(
+            &self.store,
+            &self.platform_custody,
+            &row.platform,
+            &row.account,
+        ) {
+            platform::refuse_leak("close reason", &reason, &bytes)?;
+        }
+        if reason.len() > REASON_CAP {
+            cap_str(&mut reason, REASON_CAP);
+        }
         let Some(row) = self.store.effect_close(key, &reason)? else {
             return Err(Error::rejected(format!(
                 "effect {} is no longer closeable (already decided or terminal)",
@@ -516,6 +551,26 @@ impl Shared {
                  press accept is operator-only in v1 (ADR 0006 §5.4 step 4, C6)"
             )));
         }
+        // The presser's free-text reason lands on the durable row —
+        // screen it against the row's enrolled credential and bound it
+        // like every other stored string (N2). A custody miss just
+        // skips the screen.
+        let reason = reason
+            .map(|mut r| {
+                if let Ok(bytes) = platform::load_credential(
+                    &self.store,
+                    &self.platform_custody,
+                    &row.platform,
+                    &row.account,
+                ) {
+                    platform::refuse_leak("decision reason", &r, &bytes)?;
+                }
+                if r.len() > REASON_CAP {
+                    cap_str(&mut r, REASON_CAP);
+                }
+                Ok::<String, Error>(r)
+            })
+            .transpose()?;
         // `by` is {member, role, rule}: who pressed, the role they
         // hold, the rule that authorised the press — {member, role}
         // comes from the proven caller and the agent row, never a
@@ -577,11 +632,12 @@ impl Shared {
 
     /// Execute the accepted send — §5.4 steps 3–6. The durable
     /// `decided` row exists already; this runs: source re-verify →
-    /// grant re-check → `executing` → custody load → the platform call
+    /// grant re-check → custody load → `executing` → the platform call
     /// under the `effect_id` idempotency key and expected hash →
     /// adapter read-back → the recorded outcome → the delivered
-    /// message. A source change or a lost grant closes the row instead
-    /// of firing; a platform error lands `failed`, never `closed`.
+    /// message. A source change, a lost grant or a credential that no
+    /// longer loads closes the row instead of firing; a platform error
+    /// lands `failed`, never `closed`.
     fn execute_effect(&self, row: &EffectRow) -> Result<EffectRow> {
         let adapter = match self.platforms.get(&row.platform).cloned() {
             Some(a) => a,
@@ -621,7 +677,12 @@ impl Shared {
                 row.effect_id
             )));
         }
-        self.store.effect_executing(&row.effect_id)?;
+        // Custody load runs before the `executing` marker: an
+        // `executing` row means the platform call may already have
+        // fired (reconcile territory), while a credential that will
+        // not load means the call provably never ran — the still-
+        // `decided` row closes `credential_revoked` and the requester
+        // hears about it like every other execute-time close (N3).
         let bytes = match platform::load_credential(
             &self.store,
             &self.platform_custody,
@@ -635,10 +696,12 @@ impl Shared {
                     .effect_close_decided(&row.effect_id, "credential_revoked")?
                     .unwrap_or(row.clone());
                 self.emit_request_closed(&row.agent, &row.request, "credential_revoked");
+                self.deliver_effect_outcome(&row, "closed (credential_revoked)");
                 self.wake();
                 return Ok(row);
             }
         };
+        self.store.effect_executing(&row.effect_id)?;
         let outcome = adapter.execute(
             &bytes,
             &row.tool,
@@ -862,7 +925,7 @@ fn input_summary(tool: &str, input: &Value) -> String {
         (false, Some(src)) => format!("{tool} {body} ({src})"),
     };
     if s.len() > SUMMARY_CAP {
-        s.truncate(SUMMARY_CAP);
+        cap_str(&mut s, SUMMARY_CAP);
     }
     s
 }

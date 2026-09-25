@@ -361,7 +361,11 @@ impl FakePlatform {
         };
         const PREVIEW_CAP: usize = 512;
         if text.len() > PREVIEW_CAP {
-            text.truncate(PREVIEW_CAP);
+            let mut end = PREVIEW_CAP;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
             text.push('…');
         }
         text

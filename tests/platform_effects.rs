@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use cadence_agent::contract_fixture::{FakePlatform, ReadBack, ToolTable};
+use cadence_agent::contract_fixture::{FakePlatform, ReadBack, ToolTable, Verified};
 use cadence_agent::platform::PlatformAdapter;
 use cadence_agent::{client, daemon, proto};
 use serde_json::{json, Value};
@@ -1087,6 +1087,483 @@ fn grant_revoked_between_stage_and_press_cancels() {
         "the ungrant drain left the row waiting"
     );
     assert_eq!(fake.executions_of("widgets.publish"), 0);
+}
+
+/// I1: `agent_events` is a `Rule::Read` surface — a peer agent, or any
+/// caller the socket cannot name, reads another agent's stream. So the
+/// agent-lane `request_opened` for a staged send carries only the
+/// handle the press follows and the routing fields — never the staged
+/// input's text (the send's message body), and a read/draft's
+/// `platform_called` event is the same. The full staged input lives in
+/// the caller-scoped `platform_effects` record alone.
+#[test]
+fn agent_events_carry_no_input_derived_text() {
+    let mut platforms: HashMap<String, Arc<dyn PlatformAdapter>> = HashMap::new();
+    platforms.insert("fixture".to_string(), Arc::new(FakePlatform::standard()));
+    let d = Daemon::start(platforms);
+    enroll(
+        &d,
+        "fixture",
+        "acct-1",
+        &["widgets:read", "widgets:write", "widgets:publish"],
+    );
+    let mut agent = Lane::spawn_as(&d, "w1", None, "worker");
+    let mut peer = Lane::spawn_as(&d, "w2", None, "worker");
+    grant(
+        &d,
+        "w1",
+        "fixture",
+        "acct-1",
+        &["widgets:read", "widgets:write", "widgets:publish"],
+    );
+
+    // A staged send whose body is the canary, then a draft call whose
+    // input is another — both write agent-lane events.
+    agent
+        .rpc(
+            &d,
+            "platform_call",
+            json!({"platform": "fixture", "account": "acct-1",
+                   "tool": "widgets.publish",
+                   "input": {"widget": "w1", "body": "SEND-CANARY-8f4e2a"},
+                   "request": "req-quiet"}),
+        )
+        .unwrap();
+    agent
+        .rpc(
+            &d,
+            "platform_call",
+            json!({"platform": "fixture", "account": "acct-1",
+                   "tool": "widgets.preview",
+                   "input": {"text": "DRAFT-CANARY-1b9c7d"}}),
+        )
+        .unwrap();
+
+    // A peer reads w1's stream — admitted (agent_events stays
+    // Rule::Read), but no input-derived text may be on it.
+    let stream = peer
+        .rpc(&d, "agent_events", json!({"alias": "w1"}))
+        .unwrap();
+    let text = stream.to_string();
+    assert!(
+        !text.contains("SEND-CANARY-8f4e2a"),
+        "send body leaked: {text}"
+    );
+    assert!(
+        !text.contains("DRAFT-CANARY-1b9c7d"),
+        "draft input leaked: {text}"
+    );
+    // The open event still names the handle and routing fields — the
+    // press flow is intact — but no input-bearing key survives.
+    let opened = stream["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "request_opened" && e["payload"]["request"] == "req-quiet")
+        .unwrap_or_else(|| panic!("no request_opened for req-quiet: {stream}"));
+    let payload = &opened["payload"];
+    assert_eq!(payload["kind"], "effect");
+    assert_eq!(payload["tool"], "widgets.publish");
+    assert_eq!(payload["platform"], "fixture");
+    assert_eq!(payload["account"], "acct-1");
+    for field in ["input_summary", "input", "preview"] {
+        assert!(
+            payload.get(field).is_none(),
+            "agent-lane event carries {field}: {payload}"
+        );
+    }
+    let called = stream["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "platform_called")
+        .expect("no platform_called event");
+    assert!(
+        called["payload"].get("input_summary").is_none(),
+        "platform_called carries input_summary: {}",
+        called["payload"]
+    );
+
+    // An unproven caller reads the same stream: same absence.
+    let frame = unprovable_rpc(&d, "agent_events", json!({"alias": "w1"}));
+    assert_eq!(frame["ok"], true, "unproven read should be admitted");
+    let text = frame.to_string();
+    assert!(
+        !text.contains("SEND-CANARY-8f4e2a"),
+        "send body leaked: {text}"
+    );
+    assert!(
+        !text.contains("DRAFT-CANARY-1b9c7d"),
+        "draft input leaked: {text}"
+    );
+
+    // The owner itself still reads the full record — only the event
+    // lane is stripped.
+    let own = agent.rpc(&d, "platform_effects", json!({})).unwrap();
+    let rec = own["effects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["request"] == "req-quiet")
+        .unwrap();
+    assert!(rec["input_summary"]
+        .as_str()
+        .unwrap()
+        .contains("SEND-CANARY-8f4e2a"));
+}
+
+/// I2: `String::truncate` panics mid-char and every byte cap here sits
+/// on caller-controlled UTF-8 (`tool`, `input`). A multibyte char
+/// straddling each cap — the record's 1024 summary, the daemon's
+/// 16384 preview, the fixture's own 512 preview — must cap at the
+/// boundary, never panic the connection thread.
+#[test]
+fn utf8_straddling_every_text_cap_cannot_panic() {
+    let fake = Arc::new(FakePlatform::standard());
+    let mut platforms: HashMap<String, Arc<dyn PlatformAdapter>> = HashMap::new();
+    platforms.insert("fixture".to_string(), fake.clone());
+    let d = Daemon::start(platforms);
+    enroll(&d, "fixture", "acct-1", &["widgets:publish"]);
+    let mut agent = Lane::spawn_as(&d, "w1", None, "worker");
+    grant(&d, "w1", "fixture", "acct-1", &["widgets:publish"]);
+
+    // input_summary cap (1024): the summary is
+    // "widgets.publish body=<v> widget=w1"; the 21-byte prefix puts a
+    // "€" (3 bytes) at byte 1023 — dead centre of the cap.
+    let body = format!("{}€{}", "x".repeat(1002), "y".repeat(20));
+    let out = agent
+        .rpc(
+            &d,
+            "platform_call",
+            json!({"platform": "fixture", "account": "acct-1",
+                   "tool": "widgets.publish",
+                   "input": {"body": body, "widget": "w1"},
+                   "request": "req-cap-summary"}),
+        )
+        .unwrap_or_else(|e| panic!("summary cap panicked the call: {e}"));
+    assert_eq!(out["result"], "staged");
+    let rec = live_record(&d, "req-cap-summary");
+    let summary = rec["input_summary"].as_str().unwrap();
+    assert!(summary.len() <= 1024, "summary over cap: {}", summary.len());
+    assert!(summary.is_char_boundary(summary.len()));
+
+    // The fixture's own preview cap (512): widgets.publish renders
+    // `publish {widget} to fixture/acct-1` — an 8-byte head and an
+    // 18-byte tail, so a widget name of 503 x's then "€" straddles it.
+    let widget = format!("{}€{}", "x".repeat(503), "y".repeat(10));
+    agent
+        .rpc(
+            &d,
+            "platform_call",
+            json!({"platform": "fixture", "account": "acct-1",
+                   "tool": "widgets.publish",
+                   "input": {"widget": widget},
+                   "request": "req-cap-fixture"}),
+        )
+        .unwrap_or_else(|e| panic!("fixture preview cap panicked the call: {e}"));
+
+    // The daemon's preview cap (16384) sits above the fixture's own —
+    // an adapter whose preview ignores its own bound still cannot
+    // panic the gate. `LoudPreview` renders past the cap with a "€"
+    // straddling it.
+    struct LoudPreview(FakePlatform, String);
+    impl PlatformAdapter for LoudPreview {
+        fn table(&self) -> &ToolTable {
+            self.0.table()
+        }
+        fn reported_manifest_version(&self) -> Option<String> {
+            self.0.reported_manifest_version()
+        }
+        fn preview(&self, _account: &str, _tool: &str, _input: &Value) -> String {
+            self.1.clone()
+        }
+        fn execute(
+            &self,
+            credential: &[u8],
+            tool: &str,
+            input: &Value,
+            idempotency_key: &str,
+            expected_hash: Option<&str>,
+        ) -> std::result::Result<Value, String> {
+            PlatformAdapter::execute(
+                &self.0,
+                credential,
+                tool,
+                input,
+                idempotency_key,
+                expected_hash,
+            )
+        }
+        fn read_back(&self, tool: &str, input: &Value) -> Verified {
+            self.0.read_back(tool, input)
+        }
+        fn source_hash(&self, source: &str) -> Option<String> {
+            self.0.source_hash(source)
+        }
+    }
+    // 16383 p's, then "€" — its lead byte at 16383 means the 16384th
+    // byte is mid-char.
+    let loud = LoudPreview(
+        FakePlatform::standard(),
+        format!("{}€{}", "p".repeat(16383), "q".repeat(20)),
+    );
+    let mut platforms: HashMap<String, Arc<dyn PlatformAdapter>> = HashMap::new();
+    platforms.insert("fixture".to_string(), Arc::new(loud));
+    let d2 = Daemon::start(platforms);
+    enroll(&d2, "fixture", "acct-1", &["widgets:publish"]);
+    let mut agent2 = Lane::spawn_as(&d2, "w1", None, "worker");
+    grant(&d2, "w1", "fixture", "acct-1", &["widgets:publish"]);
+    agent2
+        .rpc(
+            &d2,
+            "platform_call",
+            json!({"platform": "fixture", "account": "acct-1",
+                   "tool": "widgets.publish", "input": {"widget": "w1"},
+                   "request": "req-cap-preview"}),
+        )
+        .unwrap_or_else(|e| panic!("preview cap panicked the call: {e}"));
+    let rec = live_record(&d2, "req-cap-preview");
+    let preview = rec["preview"].as_str().unwrap();
+    assert!(
+        preview.len() <= 16384,
+        "preview over cap: {}",
+        preview.len()
+    );
+
+    // Both daemons outlived every straddle.
+    d.op("health", json!({})).unwrap();
+    d2.op("health", json!({})).unwrap();
+}
+
+/// N1: the platform write runs under the staged row's `effect_id` as
+/// its idempotency key (C9) — a key derived any other way lets a
+/// retried press fire twice against the platform's dedupe.
+#[test]
+fn send_executes_under_its_effect_id_key() {
+    let fake = Arc::new(FakePlatform::standard());
+    let mut platforms: HashMap<String, Arc<dyn PlatformAdapter>> = HashMap::new();
+    platforms.insert("fixture".to_string(), fake.clone());
+    let d = Daemon::start(platforms);
+    enroll(&d, "fixture", "acct-1", &["widgets:publish"]);
+    let mut agent = Lane::spawn_as(&d, "w1", None, "worker");
+    grant(&d, "w1", "fixture", "acct-1", &["widgets:publish"]);
+    agent
+        .rpc(
+            &d,
+            "platform_call",
+            json!({"platform": "fixture", "account": "acct-1",
+                   "tool": "widgets.publish", "input": {"widget": "w1"},
+                   "request": "req-key"}),
+        )
+        .unwrap();
+    d.op(
+        "agent_respond",
+        json!({"alias": "w1", "request": "req-key", "decision": "accept"}),
+    )
+    .unwrap();
+    let row = effect_row(&d, "req-key").unwrap();
+    let executions = fake.executions();
+    assert_eq!(executions.len(), 1, "{executions:?}");
+    assert_eq!(
+        executions[0].idempotency_key,
+        row["effect_id"].as_str().unwrap(),
+        "the platform write must carry the staged effect_id as its key"
+    );
+}
+
+/// N1: one handle = one call. A same-handle retry with identical
+/// input dedupes to the staged row; the same handle carrying a
+/// different call is a conflict — refused, never a disguised second
+/// effect squatting the first's press.
+#[test]
+fn same_handle_different_input_is_refused() {
+    let mut platforms: HashMap<String, Arc<dyn PlatformAdapter>> = HashMap::new();
+    platforms.insert("fixture".to_string(), Arc::new(FakePlatform::standard()));
+    let d = Daemon::start(platforms);
+    enroll(&d, "fixture", "acct-1", &["widgets:publish"]);
+    let mut agent = Lane::spawn_as(&d, "w1", None, "worker");
+    grant(&d, "w1", "fixture", "acct-1", &["widgets:publish"]);
+    let first = agent
+        .rpc(
+            &d,
+            "platform_call",
+            json!({"platform": "fixture", "account": "acct-1",
+                   "tool": "widgets.publish", "input": {"widget": "a"},
+                   "request": "req-dup"}),
+        )
+        .unwrap();
+    assert_eq!(first["result"], "staged");
+    // A byte-identical retry dedupes — no second row, no second event.
+    let retry = agent
+        .rpc(
+            &d,
+            "platform_call",
+            json!({"platform": "fixture", "account": "acct-1",
+                   "tool": "widgets.publish", "input": {"widget": "a"},
+                   "request": "req-dup"}),
+        )
+        .unwrap();
+    assert_eq!(retry["result"], "existing");
+    assert_eq!(retry["effect_id"], first["effect_id"]);
+    // The same handle on a different input is refused outright.
+    let err = refused(agent.rpc(
+        &d,
+        "platform_call",
+        json!({"platform": "fixture", "account": "acct-1",
+               "tool": "widgets.publish", "input": {"widget": "b"},
+               "request": "req-dup"}),
+    ));
+    assert!(err.contains("different"), "{err}");
+    assert_eq!(effect_row(&d, "req-dup").unwrap()["state"], "waiting");
+}
+
+/// N2: `decision.reason` and `close_reason` are durable free text —
+/// bounded at 1 KiB on a char boundary, and screened against the
+/// enrolled credential like every other value that lands.
+#[test]
+fn reasons_are_bounded_and_never_carry_the_credential() {
+    let mut platforms: HashMap<String, Arc<dyn PlatformAdapter>> = HashMap::new();
+    platforms.insert("fixture".to_string(), Arc::new(FakePlatform::standard()));
+    let d = Daemon::start(platforms);
+    enroll(&d, "fixture", "acct-1", &["widgets:publish"]);
+    let mut agent = Lane::spawn_as(&d, "w1", None, "worker");
+    grant(&d, "w1", "fixture", "acct-1", &["widgets:publish"]);
+
+    // A reason carrying the enrolled token is withheld — the press
+    // refuses rather than durably record the secret.
+    agent
+        .rpc(
+            &d,
+            "platform_call",
+            json!({"platform": "fixture", "account": "acct-1",
+                   "tool": "widgets.publish", "input": {"widget": "w1"},
+                   "request": "req-reason-leak"}),
+        )
+        .unwrap();
+    let err = d
+        .op(
+            "agent_respond",
+            json!({"alias": "w1", "request": "req-reason-leak",
+                   "decision": "decline", "reason": format!("no: {TOKEN}")}),
+        )
+        .expect_err("a reason carrying the credential was admitted");
+    assert!(err.to_string().contains("credential"), "{err}");
+    assert_eq!(
+        effect_row(&d, "req-reason-leak").unwrap()["state"],
+        "waiting",
+        "a refused press must leave the row waiting"
+    );
+
+    // A >1KiB reason with a multibyte char on the cut lands bounded —
+    // and still records the press.
+    let long = format!("{}€{}", "r".repeat(1022), "z".repeat(30));
+    let out = d
+        .op(
+            "agent_respond",
+            json!({"alias": "w1", "request": "req-reason-leak",
+                   "decision": "decline", "reason": long}),
+        )
+        .unwrap();
+    assert_eq!(out["state"], "answered");
+    let reason = effect_row(&d, "req-reason-leak").unwrap()["decision"]["reason"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(reason.len() <= 1024, "reason over cap: {}", reason.len());
+    assert!(!reason.contains('€'), "cap cut mid-char: {reason}");
+
+    // close_reason is the same shape: screened, then bounded.
+    agent
+        .rpc(
+            &d,
+            "platform_call",
+            json!({"platform": "fixture", "account": "acct-1",
+                   "tool": "widgets.publish", "input": {"widget": "w2"},
+                   "request": "req-close-leak"}),
+        )
+        .unwrap();
+    let err = d
+        .op(
+            "platform_effect_close",
+            json!({"request": "req-close-leak",
+                   "reason": format!("stop: {TOKEN}")}),
+        )
+        .expect_err("a close reason carrying the credential was admitted");
+    assert!(err.to_string().contains("credential"), "{err}");
+    assert_eq!(
+        effect_row(&d, "req-close-leak").unwrap()["state"],
+        "waiting"
+    );
+    let long = format!("{}€{}", "c".repeat(1022), "z".repeat(30));
+    agent
+        .rpc(
+            &d,
+            "platform_effect_close",
+            json!({"request": "req-close-leak", "reason": long}),
+        )
+        .unwrap();
+    let reason = effect_row(&d, "req-close-leak").unwrap()["close_reason"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        reason.len() <= 1024,
+        "close reason over cap: {}",
+        reason.len()
+    );
+    assert!(!reason.contains('€'), "cap cut mid-char: {reason}");
+}
+
+/// N3: a credential that vanishes between stage and press closes the
+/// row `credential_revoked` — and the requester's PM is told, exactly
+/// like `source_changed`/`grant_revoked`.
+#[test]
+fn credential_loss_at_execute_delivers_the_outcome() {
+    let fake = Arc::new(FakePlatform::standard());
+    let mut platforms: HashMap<String, Arc<dyn PlatformAdapter>> = HashMap::new();
+    platforms.insert("fixture".to_string(), fake.clone());
+    let d = Daemon::start(platforms);
+    enroll(&d, "fixture", "acct-1", &["widgets:publish"]);
+    // The PM registers first so effective_pm resolves at stage.
+    let _pm = Lane::spawn_as(&d, "pm1", None, "pm");
+    let mut agent = Lane::spawn_as(&d, "w1", Some(r#"{"upstream": "pm1"}"#), "worker");
+    grant(&d, "w1", "fixture", "acct-1", &["widgets:publish"]);
+    agent
+        .rpc(
+            &d,
+            "platform_call",
+            json!({"platform": "fixture", "account": "acct-1",
+                   "tool": "widgets.publish", "input": {"widget": "w1"},
+                   "request": "req-cred"}),
+        )
+        .unwrap();
+    // Custody loses the bytes while the record stays — the outlived
+    // store a rotate failure or a partial revoke leaves behind.
+    let custody_dir = d.state.join("custody");
+    let cred = std::fs::read_dir(&custody_dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().and_then(|e| e.to_str()) == Some("cred"))
+        .expect("no custody file was written at enroll");
+    std::fs::write(&cred, b"rotated-away").unwrap();
+
+    d.op(
+        "agent_respond",
+        json!({"alias": "w1", "request": "req-cred", "decision": "accept"}),
+    )
+    .unwrap();
+    let row = effect_row(&d, "req-cred").unwrap();
+    assert_eq!(row["state"], "closed");
+    assert_eq!(row["close_reason"], "credential_revoked");
+    assert_eq!(fake.executions_of("widgets.publish"), 0, "still fired");
+    // The outcome lands on the PM's lane like the other mid-execute
+    // closes — deduped on the effect id.
+    let effect_id = row["effect_id"].as_str().unwrap();
+    let (lane, body) =
+        outcome_message(&d, effect_id).expect("credential_revoked delivered no outcome message");
+    assert_eq!(lane, "pm1");
+    assert!(body.contains("credential_revoked"), "{body}");
+    assert!(body.contains(effect_id), "{body}");
 }
 
 /// No credential byte ever lands in the store, the events, the
