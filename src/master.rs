@@ -1,7 +1,7 @@
 //! The master agent (CAD-339): one per install, alias `master`, a
-//! managed Claude session (Codex waits for a read-only sandbox) the
-//! daemon starts from the agent files `agents/master/SOUL.md` and
-//! `AGENT.md`.
+//! managed Claude or Pi session (CAD-322; Codex waits for a read-only
+//! sandbox) the daemon starts from the agent files `agents/master/
+//! SOUL.md` and `AGENT.md`.
 //!
 //! **Where the files live.** CAD-338 (the agent filesystem) is not
 //! implemented yet, so this uses the smallest location its design
@@ -88,12 +88,14 @@ use crate::issue::Pm;
 /// The master's alias — and its agent slug.
 pub const ALIAS: &str = "master";
 
-/// The providers `master start` accepts — `claude` only for the MVP: a
-/// Codex master waits for a read-only sandbox with its writes through
-/// daemon verbs. The setup wizard (CAD-448) offers exactly this list
-/// with each one's exact start command, so the daemon's refusal and
-/// the wizard's offer stay in one place.
-pub const PROVIDERS: &[&str] = &["claude"];
+/// The providers `master start` accepts — `claude`, and `pi` since
+/// CAD-322 (managed `pi --mode rpc`, same Landlock confinement and
+/// cadence-command-only posture). A Codex master waits for a read-only
+/// sandbox with its writes through daemon verbs. The setup wizard
+/// (CAD-448) offers exactly this list with each one's exact start
+/// command, so the daemon's refusal and the wizard's offer stay in one
+/// place.
+pub const PROVIDERS: &[&str] = &["claude", "pi"];
 /// The agent files the briefing is built from, in briefing order.
 pub const FILES: [&str; 2] = ["SOUL.md", "AGENT.md"];
 /// Size caps from the agent-filesystem design record (characters).
@@ -194,9 +196,11 @@ pub fn is_master(alias: &str) -> bool {
 /// explicitly — the master's cwd is not the tracker.
 ///
 /// Confined (CAD-439), the CLI also gets its own config dir
-/// ([`claude_config_dir`]); an unconfined master (`master start
-/// --unconfined`, a host without Landlock) keeps the operator's.
+/// ([`provider_config_dir`] — `master/claude` or `master/pi`); an
+/// unconfined master (`master start --unconfined`, a host without
+/// Landlock) keeps the operator's.
 pub fn env_overrides(
+    provider: &str,
     state_dir: &Path,
     pm_dir: Option<&Path>,
     confined: bool,
@@ -216,8 +220,10 @@ pub fn env_overrides(
     ];
     if confined {
         env.push((
-            "CLAUDE_CONFIG_DIR".to_string(),
-            claude_config_dir(state_dir).to_string_lossy().to_string(),
+            provider_config_env(provider).to_string(),
+            provider_config_dir(provider, state_dir)
+                .to_string_lossy()
+                .to_string(),
         ));
     }
     if let Some(pm) = pm_dir {
@@ -269,7 +275,9 @@ pub const CONFINE_SYSTEM_WRITE: &[&str] = &[
     "/dev/tty",
 ];
 
-/// The native Claude CLI's install tree under `$HOME`.
+/// The native Claude CLI's install tree under `$HOME` — the Claude
+/// master's `home_read`; Pi names nothing here (its npm package arrives
+/// via `programs`), so a Pi master never sees it (CAD-322 round 2, N1).
 pub const CONFINE_HOME_READ: &[&str] = &[".local/share/claude"];
 
 /// Daemon env naming extra paths (`:`-separated) the master may read,
@@ -278,7 +286,10 @@ pub const CONFINE_HOME_READ: &[&str] = &[".local/share/claude"];
 pub const CONFINE_EXTRA_READ_ENV: &str = "CADENCE_MASTER_CONFINE_READ";
 pub const CONFINE_EXTRA_WRITE_ENV: &str = "CADENCE_MASTER_CONFINE_WRITE";
 
-/// What the master's confinement is computed from.
+/// What the master's confinement is computed from. The provider-named
+/// sets keep one provider's master out of another's dirs (CAD-322
+/// round 2, N1): a Pi master gets `master/pi` — never R+W on
+/// `master/claude` — and vice versa.
 pub struct ConfineInputs {
     pub state_dir: PathBuf,
     pub home: Option<PathBuf>,
@@ -287,11 +298,17 @@ pub struct ConfineInputs {
     /// its `#!` interpreter), `cadence`. Each one's real directory is
     /// readable.
     pub programs: Vec<PathBuf>,
+    /// The provider's private dir under the state dir, writable
+    /// (`master/claude`, `master/pi`) — only its own.
+    pub provider_dir: PathBuf,
+    /// Provider install trees under `$HOME` (relative names) the master
+    /// may read — `claude` names [`CONFINE_HOME_READ`], `pi` none.
+    pub home_read: &'static [&'static str],
     pub extra_read: Vec<PathBuf>,
     pub extra_write: Vec<PathBuf>,
 }
 
-/// CAD-439: the filesystem the master's process tree — the Claude CLI
+/// CAD-439: the filesystem the master's process tree — the provider CLI
 /// and every command it runs — may touch. Claude Code auto-allows the
 /// read-only Bash commands it recognises (`id`, `ps`, `echo <glob>`,
 /// `cat` inside its working dirs …) in every permission mode, `dontAsk`
@@ -300,15 +317,16 @@ pub struct ConfineInputs {
 /// the boundary is the OS: [`crate::confine`] (Landlock) exposes only
 /// the system trees, the master's own dirs under the state dir (cwd,
 /// tmp, briefing), the tracker (`cadence issue`/`report` read and commit
-/// it directly), the Claude CLI's own state, and the programs it runs.
-/// `$HOME` — ssh keys, forge logins, other repos — and the daemon's
-/// store stay unreadable. The daemon socket is reached by connect,
-/// which the sandbox does not restrict.
+/// it directly), the provider CLI's own state (`provider_dir`, and
+/// `home_read` under `$HOME`), and the programs it runs. `$HOME` —
+/// ssh keys, forge logins, other repos — and the daemon's store stay
+/// unreadable. The daemon socket is reached by connect, which the
+/// sandbox does not restrict.
 pub fn confinement(inputs: &ConfineInputs) -> crate::confine::Policy {
     let mut read: Vec<PathBuf> = CONFINE_SYSTEM_READ.iter().map(PathBuf::from).collect();
     let mut write: Vec<PathBuf> = CONFINE_SYSTEM_WRITE.iter().map(PathBuf::from).collect();
     if let Some(home) = &inputs.home {
-        read.extend(CONFINE_HOME_READ.iter().map(|p| home.join(p)));
+        read.extend(inputs.home_read.iter().map(|p| home.join(p)));
     }
     for program in &inputs.programs {
         for dir in program_dirs(program) {
@@ -324,7 +342,7 @@ pub fn confinement(inputs: &ConfineInputs) -> crate::confine::Policy {
     ));
     write.push(workdir(&inputs.state_dir));
     write.push(tmpdir(&inputs.state_dir));
-    write.push(claude_config_dir(&inputs.state_dir));
+    write.push(inputs.provider_dir.clone());
     if let Some(pm) = &inputs.pm_dir {
         write.push(pm.clone());
     }
@@ -497,6 +515,128 @@ pub fn has_login(state_dir: &Path) -> bool {
     claude_config_dir(state_dir)
         .join(".credentials.json")
         .is_file()
+}
+
+/// The env var naming `provider`'s config dir (`CLAUDE_CONFIG_DIR`,
+/// `PI_CODING_AGENT_DIR`) — used to find the operator's own login for
+/// `--copy-login`.
+pub fn provider_config_env(provider: &str) -> &'static str {
+    match provider {
+        "pi" => "PI_CODING_AGENT_DIR",
+        _ => "CLAUDE_CONFIG_DIR",
+    }
+}
+
+/// The provider's private config dir under the state dir — where its
+/// login lives (Claude: `master/claude`; Pi: `master/pi`, CAD-322).
+pub fn provider_config_dir(provider: &str, state_dir: &Path) -> PathBuf {
+    match provider {
+        "pi" => crate::adapter::pi::pi_config_dir(state_dir),
+        _ => claude_config_dir(state_dir),
+    }
+}
+
+/// Does the master's config dir hold a login for `provider`? For Pi
+/// the file must also be a non-empty object: an `auth.json` of `{}`
+/// (created by a bare `pi` run) proves nothing (CAD-322). Only shape
+/// is checked — contents are credentials, never read into logs.
+pub fn has_login_for(provider: &str, state_dir: &Path) -> bool {
+    match provider {
+        "pi" => std::fs::read_to_string(provider_config_dir("pi", state_dir).join("auth.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            .and_then(|v| v.as_object().map(|o| !o.is_empty()))
+            .unwrap_or(false),
+        _ => has_login(state_dir),
+    }
+}
+
+/// The command that gives the master its own login for `provider`.
+/// Pi has no non-interactive login verb — the operator runs the TUI
+/// against the master's config dir and types `/login`.
+pub fn login_command_for(provider: &str, state_dir: &Path) -> String {
+    match provider {
+        "pi" => format!(
+            "PI_CODING_AGENT_DIR={} pi  # then type /login",
+            provider_config_dir("pi", state_dir).display()
+        ),
+        _ => login_command(state_dir),
+    }
+}
+
+/// Create the master's provider config dir (0700); report whether it
+/// holds a login for `provider`. Copies nothing.
+pub fn ensure_config_dir_for(provider: &str, state_dir: &Path) -> Result<Login> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let dir = provider_config_dir(provider, state_dir);
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    Ok(if has_login_for(provider, state_dir) {
+        Login::Own
+    } else {
+        Login::None
+    })
+}
+
+/// `master start --copy-login` for `provider`: Claude copies the
+/// `claudeAiOauth` entry of `.credentials.json`; Pi copies the whole
+/// `auth.json` (its only credential file). Never via env or argv.
+pub fn copy_login_for(provider: &str, state_dir: &Path, operator_config: &Path) -> Result<Login> {
+    if provider != "pi" {
+        return copy_login(state_dir, operator_config);
+    }
+    use std::os::unix::fs::OpenOptionsExt;
+    if ensure_config_dir_for("pi", state_dir)? == Login::Own {
+        return Ok(Login::Own);
+    }
+    let dir = provider_config_dir("pi", state_dir);
+    let target = dir.join("auth.json");
+    let Ok(text) = std::fs::read_to_string(operator_config.join("auth.json")) else {
+        return Ok(Login::None);
+    };
+    if serde_json::from_str::<Value>(&text)
+        .ok()
+        .filter(Value::is_object)
+        .and_then(|v| v.as_object().map(|o| !o.is_empty()))
+        != Some(true)
+    {
+        // An empty or unreadable auth.json is no login.
+        return Ok(Login::None);
+    }
+    let tmp = dir.join("auth.json.tmp");
+    let _ = std::fs::remove_file(&tmp);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    std::io::Write::write_all(&mut file, text.as_bytes())?;
+    file.sync_all()?;
+    std::fs::rename(&tmp, &target)?;
+    Ok(Login::Copied)
+}
+
+/// The operator's own config dir for `provider` (for `--copy-login`):
+/// Claude honours `CLAUDE_CONFIG_DIR`, Pi honours
+/// `PI_CODING_AGENT_DIR` (default `~/.pi/agent`).
+pub fn operator_provider_config(
+    provider: &str,
+    config_dir: Option<String>,
+    home: Option<String>,
+) -> Option<PathBuf> {
+    match provider {
+        "pi" => config_dir
+            .filter(|d| !d.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                home.filter(|h| !h.is_empty())
+                    .map(|h| Path::new(&h).join(".pi").join("agent"))
+            }),
+        _ => operator_claude_config(config_dir, home),
+    }
 }
 
 /// Create the master's config dir, or tighten an existing one, to 0700;
@@ -981,6 +1121,8 @@ mod tests {
             home: Some(PathBuf::from("/h")),
             pm_dir: Some(PathBuf::from("/pm")),
             programs: vec![bin.clone(), PathBuf::from("/missing/cadence")],
+            provider_dir: PathBuf::from("/s/master/claude"),
+            home_read: CONFINE_HOME_READ,
             extra_read: vec![PathBuf::from("/x")],
             extra_write: vec![PathBuf::from("/y")],
         });
@@ -1039,6 +1181,55 @@ mod tests {
             .any(|p| p.starts_with("/usr") || p.starts_with("/etc")));
     }
 
+    /// CAD-322 round 2 (N1): a Pi master's policy is provider-specific —
+    /// `master/pi` is writable, `master/claude` (and its
+    /// `.credentials.json`) appears in NEITHER set, and none of
+    /// `$HOME`'s provider trees (Claude's `~/.local/share/claude`) are
+    /// readable. The Claude policy is symmetric in reverse.
+    #[test]
+    fn pi_confinement_never_sees_the_claude_dirs() {
+        let pi = confinement(&ConfineInputs {
+            state_dir: PathBuf::from("/s"),
+            home: Some(PathBuf::from("/h")),
+            pm_dir: None,
+            programs: vec![],
+            provider_dir: PathBuf::from("/s/master/pi"),
+            home_read: &[],
+            extra_read: vec![],
+            extra_write: vec![],
+        });
+        let all: Vec<&PathBuf> = pi.read.iter().chain(&pi.write).collect();
+        assert!(pi.write.contains(&PathBuf::from("/s/master/pi")));
+        for denied in [
+            "/s/master/claude",
+            "/s/master/claude/.credentials.json",
+            "/h/.local/share/claude",
+        ] {
+            assert!(
+                !all.iter().any(|p| p.starts_with(denied)),
+                "pi policy reaches {denied}: {pi:?}"
+            );
+        }
+        assert!(!all.iter().any(|p| p.starts_with("/h")), "{pi:?}");
+        // And Claude's own policy answers in kind: no `master/pi` in it.
+        let claude = confinement(&ConfineInputs {
+            state_dir: PathBuf::from("/s"),
+            home: None,
+            pm_dir: None,
+            programs: vec![],
+            provider_dir: PathBuf::from("/s/master/claude"),
+            home_read: CONFINE_HOME_READ,
+            extra_read: vec![],
+            extra_write: vec![],
+        });
+        assert!(claude.write.contains(&PathBuf::from("/s/master/claude")));
+        assert!(!claude
+            .read
+            .iter()
+            .chain(&claude.write)
+            .any(|p| p.starts_with("/s/master/pi")));
+    }
+
     /// Review I2: a `cadence` release grants the whole releases root, so
     /// an upgrade repointing the link mid-run keeps the verbs runnable.
     #[test]
@@ -1056,6 +1247,8 @@ mod tests {
             home: None,
             pm_dir: None,
             programs: vec![link],
+            provider_dir: PathBuf::from("/s/master/claude"),
+            home_read: CONFINE_HOME_READ,
             extra_read: vec![],
             extra_write: vec![],
         });

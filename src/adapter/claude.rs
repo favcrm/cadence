@@ -345,6 +345,9 @@ fn master_confine_inputs(
         home: env.var("HOME").filter(|h| !h.is_empty()).map(PathBuf::from),
         pm_dir,
         programs,
+        // Claude's own provider dir — never `master/pi` (CAD-322, N1).
+        provider_dir: crate::master::claude_config_dir(state_dir),
+        home_read: crate::master::CONFINE_HOME_READ,
         extra_read: split_paths(env.var(crate::master::CONFINE_EXTRA_READ_ENV)),
         extra_write: split_paths(env.var(crate::master::CONFINE_EXTRA_WRITE_ENV)),
     }
@@ -787,6 +790,7 @@ impl ProviderAdapter for ClaudeAdapter {
                 .then(crate::issue::default_dir)
                 .and_then(Result::ok);
             env.extend(crate::master::env_overrides(
+                "claude",
                 &self.state_dir,
                 pm.as_deref(),
                 master_confined(&self.env, agent),

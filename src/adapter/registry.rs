@@ -103,8 +103,16 @@ pub const PTY_TURN_TOKENS: TurnTokenScheme = TurnTokenScheme { prefix: "pty" };
 /// provider-process `open`.
 pub const CLAUDE_MANAGED_TURN_TOKENS: TurnTokenScheme = TurnTokenScheme { prefix: "claude" };
 
+/// Managed Pi (`pi --mode rpc`, CAD-322): `pi-<generation>-<uuid>` per
+/// turn; the generation is minted per provider-process `open`.
+pub const PI_MANAGED_TURN_TOKENS: TurnTokenScheme = TurnTokenScheme { prefix: "pi" };
+
 /// Every scheme an adapter mints turn tokens under.
-pub const TURN_TOKEN_SCHEMES: [TurnTokenScheme; 2] = [PTY_TURN_TOKENS, CLAUDE_MANAGED_TURN_TOKENS];
+pub const TURN_TOKEN_SCHEMES: [TurnTokenScheme; 3] = [
+    PTY_TURN_TOKENS,
+    CLAUDE_MANAGED_TURN_TOKENS,
+    PI_MANAGED_TURN_TOKENS,
+];
 
 /// CAD-407: a regex for the generation a turn token is minted under — 32
 /// lowercase hex (pty: a simple uuid per pane `open`) or 12 (managed
@@ -332,6 +340,48 @@ pub static SPECS: &[EndpointSpec] = &[
         probe_bins: &[("claude", &["--version"])],
         session_disposable: false,
         launch_default: true,
+        internal: false,
+    },
+    EndpointSpec {
+        provider: "pi",
+        endpoint_kind: "managed",
+        display: "Pi (managed rpc)",
+        has_actor: true,
+        attach: Attach::Headless,
+        ready_gate: false,
+        screen_probe: false,
+        reports: Reporting::TurnResult,
+        report_hint: Reporting::TurnResult,
+        turn_token: Some(PI_MANAGED_TURN_TOKENS),
+        // CAD-322 slice 1: extension UI dialogs are auto-cancelled and
+        // recorded; nothing routes to `agent respond` yet.
+        brokers_requests: false,
+        // Pi sessions are disposable (`--no-session`): a reopen is a
+        // fresh process and context is rebuilt from the continuity
+        // pack, so there is no provider resume to point at.
+        resumable: false,
+        resume_label: "fresh pi process (continuity pack)",
+        live_settable_params: &["stall_secs", "auto_stop", "auto_stop_idle_secs"],
+        launch_params: &[
+            "model",
+            "effort",
+            "turn_idle_secs",
+            "turn_max_secs",
+            "session",
+            "upstream",
+            "agents_md",
+            "stall_secs",
+        ],
+        session_id_label: "Pi session",
+        respond_rejection: Some(
+            "managed pi endpoints broker no requests in slice 1 — extension UI \
+             dialogs are auto-cancelled and recorded as pi_ui_request events",
+        ),
+        capabilities: &["managed_pi_rpc"],
+        doctor_caps: &["managed_pi_rpc"],
+        probe_bins: &[("pi", &["--version"])],
+        session_disposable: true,
+        launch_default: false,
         internal: false,
     },
     EndpointSpec {
@@ -820,7 +870,7 @@ pub fn has_actor(provider: &str, kind: &str) -> bool {
 /// enrolls for strict build-slot admission (CAD-230). Panes keep their
 /// legacy binding; the fake and mailbox kinds own no provider process.
 pub fn enrolls_build_slots(provider: &str, kind: &str) -> bool {
-    matches!(provider, "claude" | "codex") && matches!(kind, "managed" | "managed-ws")
+    matches!(provider, "claude" | "codex" | "pi") && matches!(kind, "managed" | "managed-ws")
 }
 
 /// The endpoint exposes an attachable surface (tmux pane or provider
@@ -1035,6 +1085,23 @@ pub fn claude_effort(level: &str) -> Result<()> {
         Err(Error::rejected(format!(
             "unknown claude effort '{level}' — expected one of: {}",
             CLAUDE_EFFORTS.join(", ")
+        )))
+    }
+}
+
+/// Pi's `set_thinking_level` levels (rpc.md). `xhigh`/`max` apply only
+/// to models that expose them — launch-time validation is on the name;
+/// the adapter verifies what stuck through `get_state`.
+pub const PI_EFFORTS: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// Reject an effort level Pi's RPC surface does not name.
+pub fn pi_effort(level: &str) -> Result<()> {
+    if PI_EFFORTS.contains(&level) {
+        Ok(())
+    } else {
+        Err(Error::rejected(format!(
+            "unknown pi effort '{level}' — expected one of: {}",
+            PI_EFFORTS.join(", ")
         )))
     }
 }
@@ -1513,6 +1580,25 @@ pub fn validate_launch_params(provider: &str, kind: &str, params: &Value) -> Res
             }
         }
     }
+    if provider == "pi" {
+        if let Some(v) = params.get("model") {
+            match v.as_str() {
+                Some(model) if !model.trim().is_empty() => {}
+                _ => return Err(Error::rejected("pi model must be a non-empty string")),
+            }
+        }
+        if let Some(v) = params.get("effort") {
+            match v.as_str() {
+                Some(level) => pi_effort(level)?,
+                None => {
+                    return Err(Error::rejected(format!(
+                        "pi effort must be a string, one of: {}",
+                        PI_EFFORTS.join(", ")
+                    )))
+                }
+            }
+        }
+    }
     if provider == "devin" && kind == "cloud" {
         validate_devin_cloud(params)?;
     }
@@ -1649,7 +1735,7 @@ mod tests {
         );
         assert_eq!(
             spec("devin", "managed").unwrap_err().to_string(),
-            "No managed adapter for provider 'devin' (implemented: codex, claude)"
+            "No managed adapter for provider 'devin' (implemented: codex, claude, pi)"
         );
         assert_eq!(
             spec("devin", "bogus").unwrap_err().to_string(),
@@ -1667,6 +1753,7 @@ mod tests {
             "managed_codex_stdio",
             "managed_codex_ws",
             "managed_claude_stream",
+            "managed_pi_rpc",
             "pty_claude_tmux",
             "pty_devin_tmux",
             "pty_cursor_tmux",
@@ -1684,20 +1771,22 @@ mod tests {
         ] {
             assert!(caps.contains(&name), "missing {name}");
         }
-        assert_eq!(caps.len(), 19);
+        assert_eq!(caps.len(), 20);
     }
 
     #[test]
     fn model_matrix_keeps_devin_and_drops_test_doubles() {
         let rows = model_provider_matrix();
         let ids: Vec<&str> = rows.iter().map(|row| row.id).collect();
-        assert_eq!(ids, vec!["codex", "claude", "devin", "cursor"]);
+        assert_eq!(ids, vec!["codex", "claude", "pi", "devin", "cursor"]);
         assert!(rows.iter().any(|row| row.id == "claude" && row.eligible));
+        assert!(rows.iter().any(|row| row.id == "pi" && row.eligible));
         assert!(rows
             .iter()
             .any(|row| { row.id == "devin" && !row.eligible && row.limitation.is_some() }));
         assert!(rows.iter().all(|row| row.id != "fake" && row.id != "inbox"));
         assert!(supports_model("claude", "managed"));
+        assert!(supports_model("pi", "managed"));
         assert!(supports_model("cursor", "pty"));
         assert!(!supports_model("devin", "pty"));
         assert!(!supports_model("fake", "fake"));
@@ -2158,13 +2247,15 @@ mod tests {
     }
 
     /// Adding an endpoint kind forces a decision: every spec row names
-    /// its scheme, and only pty rows and managed claude have one today.
+    /// its scheme, and only pty rows, managed claude and managed pi have
+    /// one today.
     #[test]
     fn only_generation_minting_endpoints_carry_a_turn_token_scheme() {
         for s in SPECS {
             let expected = match (s.provider, s.endpoint_kind) {
                 (_, "pty") => Some(PTY_TURN_TOKENS),
                 ("claude", "managed") => Some(CLAUDE_MANAGED_TURN_TOKENS),
+                ("pi", "managed") => Some(PI_MANAGED_TURN_TOKENS),
                 _ => None,
             };
             assert_eq!(s.turn_token, expected, "{}/{}", s.provider, s.endpoint_kind);

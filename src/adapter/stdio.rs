@@ -31,11 +31,15 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(35);
 /// keep-list is operator-set configuration that must survive (e.g.
 /// `CLAUDE_CONFIG_DIR`). Prefix scrubbing enumerates the daemon's own
 /// environment at spawn, so new leak names are caught by rule rather
-/// than by list.
+/// than by list. `clear` is the allowlist posture (CAD-322 round 2):
+/// the whole inherited environment is dropped and only `keep` names
+/// are re-read from it — a credential cannot leak however it is
+/// spelled.
 pub struct EnvScrub {
     names: Vec<String>,
     prefixes: Vec<String>,
     keep: Vec<String>,
+    clear: bool,
 }
 
 impl EnvScrub {
@@ -45,6 +49,7 @@ impl EnvScrub {
             names: names.iter().map(|s| s.to_string()).collect(),
             prefixes: Vec::new(),
             keep: Vec::new(),
+            clear: false,
         }
     }
 
@@ -55,6 +60,20 @@ impl EnvScrub {
             names: Vec::new(),
             prefixes: prefixes.iter().map(|s| s.to_string()).collect(),
             keep: keep.iter().map(|s| s.to_string()).collect(),
+            clear: false,
+        }
+    }
+
+    /// Allowlist scrubbing: the child starts with an empty environment,
+    /// then re-inherits only the `keep` names from the daemon's own
+    /// environment. `names`/`prefixes` still apply afterwards, so a
+    /// caller can subtract inside the allowlist.
+    pub fn cleared_except(keep: &[&str]) -> Self {
+        Self {
+            names: Vec::new(),
+            prefixes: Vec::new(),
+            keep: keep.iter().map(|s| s.to_string()).collect(),
+            clear: true,
         }
     }
 
@@ -159,6 +178,14 @@ impl StdioAdapter {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::from(log));
+        if self.env_scrub.clear {
+            command.env_clear();
+            for name in &self.env_scrub.keep {
+                if let Some(value) = std::env::var_os(name) {
+                    command.env(name, value);
+                }
+            }
+        }
         for name in &self.env_scrub.names {
             command.env_remove(name);
         }

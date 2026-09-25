@@ -2840,7 +2840,7 @@ enum MasterAction {
     /// launch the managed session and queue its briefing. Provider,
     /// model and effort default to AGENT.md's `preferred`.
     Start {
-        /// claude or codex [default: AGENT.md `preferred.provider`].
+        /// claude or pi [default: AGENT.md `preferred.provider`].
         #[arg(long)]
         provider: Option<String>,
         /// Model [default: AGENT.md's for that provider].
@@ -2855,12 +2855,12 @@ enum MasterAction {
         /// shows it while it runs.
         #[arg(long)]
         unconfined: bool,
-        /// Copy your Claude login (its claudeAiOauth entry only, 0600)
-        /// into the master's own config dir when it has none. Both then
-        /// share one refresh token: if the provider rotates refresh
-        /// tokens, a refresh on one side can sign the other out. The
-        /// default is a separate login — `master start` prints the
-        /// command.
+        /// Copy your login for the chosen provider (claude: the
+        /// claudeAiOauth entry only; pi: its auth.json) — 0600, into the
+        /// master's own config dir when it has none. Both then share one
+        /// credential: a refresh or rotation on one side can sign the
+        /// other out. The default is a separate login — `master start`
+        /// prints the command.
         #[arg(long)]
         copy_login: bool,
     },
@@ -3079,9 +3079,12 @@ fn run_master(state_dir: &Path, action: MasterAction) -> Result<i32> {
                 eprintln!("WARNING: {w}");
             }
             if let Some(cmd) = out["login_command"].as_str() {
+                // Name the provider the daemon actually resolved — a
+                // bare `master start` lands on AGENT.md's preferred.
+                let provider = out["provider"].as_str().unwrap_or("claude");
                 eprintln!(
-                    "The master has no Claude login yet. Give it its own:\n  {cmd}\n\
-                     (or `cadence master start --copy-login` to copy yours)"
+                    "The master has no {provider} login yet. Give it its own:\n  {cmd}\n\
+                     (or `cadence master start --provider {provider} --copy-login` to copy yours)"
                 );
             }
             out
@@ -3121,7 +3124,12 @@ fn run_master(state_dir: &Path, action: MasterAction) -> Result<i32> {
             let env = cadence_agent::adapter::ProviderEnv::default();
             let (confine, policy) =
                 cadence_agent::adapter::claude::master_confinement(&env, state_dir);
-            json!({"confine": confine, "read": policy.read, "write": policy.write})
+            let (pi_confine, pi_policy) =
+                cadence_agent::adapter::pi::pi_master_confinement(&env, state_dir);
+            json!({
+                "claude": {"confine": confine, "read": policy.read, "write": policy.write},
+                "pi": {"confine": pi_confine, "read": pi_policy.read, "write": pi_policy.write},
+            })
         }
     };
     print_json(&result);

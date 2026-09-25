@@ -47,7 +47,7 @@ Three storage concerns stay distinct:
 | `src/store.rs` | SQLite schema/migrations and durable message, task, verdict and monitor transitions. |
 | `src/backup/` | `cadence backup`/`export`/`restore`: online-backup copies with manifests, secret-scanned export bundles, restore with repo remap (CAD-314). |
 | `src/adapter/mod.rs`, `registry.rs` | Common adapter types and provider capability descriptors. |
-| `src/adapter/codex.rs`, `claude.rs`, `ws.rs`, `stdio.rs` | Structured provider execution and transport support; check the registry for accepted combinations. |
+| `src/adapter/codex.rs`, `claude.rs`, `pi.rs`, `ws.rs`, `stdio.rs` | Structured provider execution and transport support; check the registry for accepted combinations. |
 | `src/adapter/pty/` | Owned terminal lifecycle, profile-specific screen interpretation, delivery and rendering evidence. Text classification is not authoritative provider approval. |
 | `src/issue/` | Project/issue files, start/dispatch/finish, history, report intake, relay and read-only retros. |
 | `src/memory/` | Proposal/curation CLI, scoped matching, bounded rendering and staleness observations. |

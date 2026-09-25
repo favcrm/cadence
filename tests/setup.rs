@@ -595,11 +595,12 @@ fn board_setup_is_detect_only_and_writes_nothing() {
     assert_eq!(checks["master"]["group"], "master");
     assert_eq!(checks["master_login"]["group"], "master");
     assert_eq!(checks["daemon"]["group"], "environment");
-    // CAD-448: the wizard's master step gets the providers `master
-    // start` accepts — the signed-in claude; devin is signed in but can
-    // never be the master, so it is not offered.
+    // CAD-448/CAD-322: the wizard's master step gets exactly the
+    // providers `master start` accepts — claude (signed in here) and pi
+    // (installed but signed out); devin is signed in but can never be
+    // the master, so it is not offered.
     let offers = payload["master"]["providers"].as_array().unwrap();
-    assert_eq!(offers.len(), 1, "{offers:?}");
+    assert_eq!(offers.len(), 2, "{offers:?}");
     assert_eq!(offers[0]["bin"], "claude");
     assert_eq!(offers[0]["ready"], true, "{offers:?}");
     // CAD-448 review (N4): `tracker` is missing, so the offer shows the
@@ -607,6 +608,10 @@ fn board_setup_is_detect_only_and_writes_nothing() {
     // command is the master check's own fix, never two for one action.
     assert!(offers[0]["start"].is_null(), "{offers:?}");
     assert!(offers[0]["warning"].is_null(), "{offers:?}");
+    // pi is on PATH but carries no auth.json — not ready, no command.
+    assert_eq!(offers[1]["bin"], "pi", "{offers:?}");
+    assert_eq!(offers[1]["ready"], false, "{offers:?}");
+    assert!(offers[1]["start"].is_null(), "{offers:?}");
     assert!(
         checks["master"]["fix"]
             .as_str()
@@ -664,10 +669,14 @@ fn board_setup_reports_the_masters_own_login() {
         checks["master_login"]
     );
     if cadence_agent::confine::available().is_ok() {
-        assert!(checks["master_login"]["detail"]
-            .as_str()
-            .unwrap()
-            .contains("own login"));
+        assert!(
+            checks["master_login"]["detail"]
+                .as_str()
+                .unwrap()
+                .contains("own claude login"),
+            "{}",
+            checks["master_login"]
+        );
     }
     assert!(checks["master_login"]["fix"].is_null());
 }
