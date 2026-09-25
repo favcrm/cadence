@@ -468,7 +468,7 @@ fn cad424_daemon_restart_refuses_over_restore_leftovers_before_shutdown() {
         .join("cadence.sqlite3.replaced-20260924T000000Z-deadbeef");
     std::fs::write(&aside, b"previous store").unwrap();
 
-    let out = cadence_at(
+    let out = operator_cadence_at(
         home.path(),
         &d.state,
         &["daemon", "restart", "--as", "operator:test"],
@@ -514,7 +514,7 @@ fn daemon_stop_then_start_never_races_lock() {
         String::from_utf8_lossy(&start.stderr)
     );
     for i in 0..10 {
-        let stop = cadence_at(home.path(), &state, &["daemon", "stop"]);
+        let stop = operator_cadence_at(home.path(), &state, &["daemon", "stop"]);
         assert!(
             stop.status.success(),
             "stop #{i}: {}",
@@ -527,7 +527,7 @@ fn daemon_stop_then_start_never_races_lock() {
             String::from_utf8_lossy(&start.stderr)
         );
     }
-    let stop = cadence_at(home.path(), &state, &["daemon", "stop"]);
+    let stop = operator_cadence_at(home.path(), &state, &["daemon", "stop"]);
     assert!(stop.status.success());
 }
 
@@ -546,7 +546,7 @@ fn daemon_restart_without_a_lease_leaves_the_pid_unchanged() {
     );
     let v: Value = serde_json::from_slice(&start.stdout).unwrap();
     let pid = v["pid"].as_u64().unwrap();
-    let restart = cadence_at(home.path(), state.path(), &["daemon", "restart"]);
+    let restart = operator_cadence_at(home.path(), state.path(), &["daemon", "restart"]);
     let err = format!(
         "{} {}",
         String::from_utf8_lossy(&restart.stdout),
@@ -561,7 +561,7 @@ fn daemon_restart_without_a_lease_leaves_the_pid_unchanged() {
         std::path::Path::new(&format!("/proc/{pid}")).exists(),
         "daemon pid {pid} exited"
     );
-    let stop = cadence_at(home.path(), state.path(), &["daemon", "stop"]);
+    let stop = operator_cadence_at(home.path(), state.path(), &["daemon", "stop"]);
     assert!(
         stop.status.success(),
         "{}",
@@ -581,7 +581,7 @@ fn daemon_start_refuses_a_different_build_without_a_lease() {
         "{}",
         String::from_utf8_lossy(&start.stderr)
     );
-    let stop = cadence_at(home.path(), state.path(), &["daemon", "stop"]);
+    let stop = operator_cadence_at(home.path(), state.path(), &["daemon", "stop"]);
     assert!(
         stop.status.success(),
         "{}",
@@ -620,7 +620,7 @@ fn daemon_start_refuses_a_different_build_without_a_lease() {
         "{}",
         String::from_utf8_lossy(&start.stderr)
     );
-    let stop = cadence_at(home.path(), state.path(), &["daemon", "stop"]);
+    let stop = operator_cadence_at(home.path(), state.path(), &["daemon", "stop"]);
     assert!(
         stop.status.success(),
         "{}",
@@ -725,7 +725,7 @@ fn daemon_start_refuses_a_lower_schema_without_rewriting_the_file() {
         "{}",
         String::from_utf8_lossy(&start.stderr)
     );
-    let stop = cadence_at(home.path(), state.path(), &["daemon", "stop"]);
+    let stop = operator_cadence_at(home.path(), state.path(), &["daemon", "stop"]);
     assert!(
         stop.status.success(),
         "{}",
@@ -778,7 +778,7 @@ fn daemon_start_by_a_non_holder_does_not_migrate() {
         "{}",
         String::from_utf8_lossy(&start.stderr)
     );
-    let stop = cadence_at(home.path(), state.path(), &["daemon", "stop"]);
+    let stop = operator_cadence_at(home.path(), state.path(), &["daemon", "stop"]);
     assert!(
         stop.status.success(),
         "{}",
@@ -800,7 +800,7 @@ fn daemon_start_by_a_non_holder_does_not_migrate() {
             db.display()
         )));
     }
-    let claim = cadence_at(
+    let claim = operator_cadence_at(
         home.path(),
         state.path(),
         &[
@@ -821,7 +821,7 @@ fn daemon_start_by_a_non_holder_does_not_migrate() {
     );
     let backup = home.path().join("backup.sqlite3");
     std::fs::copy(&db, &backup).unwrap();
-    let recorded = cadence_at(
+    let recorded = operator_cadence_at(
         home.path(),
         state.path(),
         &[
@@ -880,7 +880,7 @@ fn daemon_start_drops_the_forwarded_rollout_identity() {
     let leaked = env
         .split(|byte| *byte == 0)
         .any(|entry| entry.starts_with(b"CADENCE_ROLLOUT_AS="));
-    let stop = cadence_at(home.path(), state.path(), &["daemon", "stop"]);
+    let stop = operator_cadence_at(home.path(), state.path(), &["daemon", "stop"]);
     assert!(!leaked, "daemon environ still contains CADENCE_ROLLOUT_AS");
     assert!(
         stop.status.success(),
@@ -921,7 +921,7 @@ fn daemon_start_reports_started_for_its_child_and_already_running_after() {
     assert_eq!(v["health"]["pid"].as_u64(), Some(pid), "{v}");
     assert_eq!(daemon_run_pids(state.path()), vec![pid]);
 
-    let stop = cadence_at(home.path(), state.path(), &["daemon", "stop"]);
+    let stop = operator_cadence_at(home.path(), state.path(), &["daemon", "stop"]);
     assert!(
         stop.status.success(),
         "{}",
@@ -973,7 +973,7 @@ fn concurrent_daemon_starts_report_one_started_one_already_running() {
         assert_eq!(v["health"]["pid"].as_u64(), Some(pid), "{v}");
     }
     assert_eq!(daemon_run_pids(state.path()), vec![pid]);
-    let stop = cadence_at(home.path(), state.path(), &["daemon", "stop"]);
+    let stop = operator_cadence_at(home.path(), state.path(), &["daemon", "stop"]);
     assert!(
         stop.status.success(),
         "{}",
@@ -1007,6 +1007,7 @@ fn daemon_start_whose_precheck_failed_leaves_only_the_live_daemon() {
         .env("HOME", home.path())
         .env_remove("CADENCE_ALIAS")
         .env_remove("CADENCE_ROLLOUT_AS")
+        .env(cadence_agent::test_seam::ARM_ENV, "1")
         .envs(test_env().vars())
         .env("CADENCE_TEST_START_PRECHECK_FAILS", "1")
         .output()
@@ -1021,7 +1022,7 @@ fn daemon_start_whose_precheck_failed_leaves_only_the_live_daemon() {
     assert_eq!(v["health"]["pid"].as_u64(), Some(pid), "{v}");
     assert_eq!(daemon_run_pids(state.path()), vec![pid]);
 
-    let stop = cadence_at(home.path(), state.path(), &["daemon", "stop"]);
+    let stop = operator_cadence_at(home.path(), state.path(), &["daemon", "stop"]);
     assert!(
         stop.status.success(),
         "{}",
@@ -1066,7 +1067,7 @@ fn direct_daemon_run_by_a_non_holder_keeps_the_hot_restart_marker() {
         "{}",
         String::from_utf8_lossy(&start.stderr)
     );
-    let stop = cadence_at(home.path(), state.path(), &["daemon", "stop"]);
+    let stop = operator_cadence_at(home.path(), state.path(), &["daemon", "stop"]);
     assert!(
         stop.status.success(),
         "{}",
@@ -1147,7 +1148,7 @@ fn holder_migrates_through_daemon_start_without_a_test_override() {
         "{}",
         String::from_utf8_lossy(&start.stderr)
     );
-    let stop = cadence_at(home.path(), state.path(), &["daemon", "stop"]);
+    let stop = operator_cadence_at(home.path(), state.path(), &["daemon", "stop"]);
     assert!(
         stop.status.success(),
         "{}",
@@ -1174,7 +1175,7 @@ fn holder_migrates_through_daemon_start_without_a_test_override() {
         .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
         .unwrap();
     assert_eq!(version, 11);
-    let claim = cadence_at(
+    let claim = operator_cadence_at(
         home.path(),
         state.path(),
         &[
@@ -1195,7 +1196,7 @@ fn holder_migrates_through_daemon_start_without_a_test_override() {
     );
     let backup = home.path().join("backup.sqlite3");
     std::fs::copy(&db, &backup).unwrap();
-    let recorded = cadence_at(
+    let recorded = operator_cadence_at(
         home.path(),
         state.path(),
         &[
@@ -1230,7 +1231,7 @@ fn holder_migrates_through_daemon_start_without_a_test_override() {
     );
     let started = start.status.success();
     if started {
-        let stop = cadence_at(home.path(), state.path(), &["daemon", "stop"]);
+        let stop = operator_cadence_at(home.path(), state.path(), &["daemon", "stop"]);
         assert!(
             stop.status.success(),
             "{}",

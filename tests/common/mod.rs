@@ -3030,6 +3030,12 @@ pub fn cadence_at_cmd(home: &Path, state: &Path, args: &[&str]) -> std::process:
         .env("HOME", home)
         .env_remove("CADENCE_ALIAS")
         .env_remove("CADENCE_ROLLOUT_AS")
+        // CAD-482: a `daemon start`/`restart` child daemon re-arms the
+        // fixture's seam on its own state dir — inert on a build
+        // without the feature (env_armed reads it only under
+        // `test-seam`), and refused rather than honored if the dir is
+        // not a confined fixture.
+        .env(cadence_agent::test_seam::ARM_ENV, "1")
         // A `daemon restart` child daemon is a separate process: it
         // gets this test's mock commands as its own env, and only it.
         .envs(test_env().vars());
@@ -5558,7 +5564,8 @@ impl Drop for DaemonReaper {
         if own_daemon_run_pids(&self.state).is_empty() {
             return;
         }
-        let stop = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        let mut stop_cmd = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"));
+        stop_cmd
             .arg("--state-dir")
             .arg(&self.state)
             .args(["daemon", "stop"])
@@ -5567,8 +5574,14 @@ impl Drop for DaemonReaper {
             .env_remove("CADENCE_ROLLOUT_AS")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
+            .stderr(std::process::Stdio::null());
+        if cfg!(feature = "test-seam") {
+            // CAD-482: `daemon stop` is operator-gated; on a seam build
+            // the armed fixture honors this assertion. Never set on a
+            // plain build, where the var itself is refused.
+            stop_cmd.env(cadence_agent::test_seam::AS_ENV, "operator");
+        }
+        let stop = stop_cmd.spawn();
         if let Ok(mut stop) = stop {
             let deadline = Instant::now() + Duration::from_secs(10);
             while matches!(stop.try_wait(), Ok(None)) && Instant::now() < deadline {
