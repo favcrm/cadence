@@ -88,7 +88,7 @@ impl Daemon {
         client::rpc(&self.state, method, params)
     }
 
-    /// The operator-shaped call — `tests/integration.rs`'s
+    /// The operator-shaped call — `tests/common/mod.rs`'s
     /// `operator_rpc` shape: `setsid -f` off this process's ancestry,
     /// env cleared, stdio not a pane. `peer::operator_proof`'s accepted
     /// residual, so the gate itself is never touched.
@@ -143,7 +143,7 @@ fn proc_start(pid: u32) -> Option<i64> {
 
 /// A long-lived `bash` planted as an agent's pane: commands written to
 /// its stdin run as its children, so their socket-peer identity derives
-/// the alias — `tests/integration.rs`'s `LaneShell`.
+/// the alias — `tests/common/mod.rs`'s `LaneShell`.
 struct Lane {
     child: std::process::Child,
     stdin: std::process::ChildStdin,
@@ -284,7 +284,7 @@ fn refused(r: cadence_agent::Result<Value>) -> String {
 }
 
 /// Every row of every table — the proof a refusal wrote nothing and
-/// that no byte field holds a credential (`tests/integration.rs`'s
+/// that no byte field holds a credential (`tests/common/mod.rs`'s
 /// `db_snapshot`). Values render as their real content — a TEXT cell
 /// as its string, a BLOB as its bytes decoded — so `contains(TOKEN)`
 /// genuinely hunts; the old `{:?}` render printed `Text([..])` and a
@@ -1376,7 +1376,7 @@ fn cli_verbs_reach_the_daemon() {
     assert!(!out.contains(TOKEN));
 }
 
-/// `tests/integration.rs`'s OPERATOR_CLI_PY, extended to feed one env
+/// `tests/common/mod.rs`'s OPERATOR_CLI_PY, extended to feed one env
 /// var to the child's stdin — `--token-stdin` reads it there.
 fn op_cli_py() -> String {
     r#"
