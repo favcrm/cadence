@@ -9,7 +9,7 @@ import Memory from "./features/settings/Memory";
 import ModelDefaults from "./features/settings/ModelDefaults";
 import OverviewView from "./features/home/Overview";
 import Home from "./features/home/Home";
-import Plan from "./features/projects/Plan";
+import Context from "./features/projects/Context";
 import Sidebar from "./ui/Sidebar";
 import Link from "./ui/Link";
 import SectionTabs from "./ui/SectionTabs";
@@ -549,7 +549,7 @@ export default function App() {
             contextLoading={projectContextLoading}
             readOnly={readOnly}
             onAck={ackMonitor}
-            onOpenPlan={() => goRoute({ screen: "projects", slug: projectSlug, section: "context" })}
+            onOpenContext={() => goRoute({ screen: "projects", slug: projectSlug, section: "context" })}
           />
         )}
         {route.screen === "projects" && route.slug && (
@@ -603,7 +603,7 @@ export default function App() {
           <Milestones project={route.slug} issues={issuesState} onOpenIssue={openIssue} />
         )}
         {route.screen === "projects" && route.section === "context" && (
-          <Plan
+          <Context
             project={project}
             context={visibleContext(project, projectContext)}
             contextLoading={projectContextLoading}

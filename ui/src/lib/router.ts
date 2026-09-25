@@ -10,7 +10,7 @@ import { readAppUrlState, type AppTab, type ProjectView } from "./urlState";
  *   /projects[/:slug]          a project's issues (board or list)
  *   /projects/:slug/epics      its epics: stage, progress, health (CAD-432)
  *   /projects/:slug/milestones its milestones: progress, worst health
- *   /projects/:slug/context    its context and plan
+ *   /projects/:slug/context    its context
  *   /agents[/:alias]           agents, optionally one agent's drawer
  *   /setup                     first-run setup
  *   /settings[/memory]         model defaults, memory
