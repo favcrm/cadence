@@ -20,6 +20,16 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 /// Target account — resolved once via `getpwnam` in the privileged
 /// layer. The uid is never taken from argv or env: "uid from a fixed
 /// source" (acceptance item 1). T1 provisions the user.
+///
+/// CAD-522 chose this compiled-in NSS lookup over ADR 0007 §5's
+/// root-owned config file: `exec` already needs the passwd entry for
+/// HOME/USER/SHELL, so a config file would add a second root-owned
+/// artifact — with its own ownership/permission refusal rules —
+/// without removing NSS from the trusted path, and a static uid number
+/// could drift from the real account. What NSS still owes us is a sane
+/// answer for the fixed name; the residual (resolving to uid/gid 0 or
+/// to the caller's own uid) is gated by [`agent_ids_are_safe`] before
+/// any privileged call.
 pub const AGENT_USER: &str = "cadence-agent";
 /// The caller must carry this group (as its real gid or in its
 /// supplementary set). T1 provisions it and adds `ubuntu` only.
@@ -63,10 +73,19 @@ const ENV_EXACT: &[&str] = &["TERM", "COLORTERM", "LANG", "TZ", "TMPDIR"];
 /// prefixes); `LC_*` is locale. PATH, HOME, USER, LOGNAME and SHELL are
 /// absent on purpose — the helper sets them itself.
 const ENV_PREFIX: &[&str] = &["CADENCE_", "LC_", "CLAUDE_", "CODEX_", "ANTHROPIC_"];
-/// The carve-out inside the allowed prefixes: the `CADENCE_DEVIN_*`
-/// cloud credentials that `adapter::CLOUD_SECRET_ENV` exists to keep
-/// off pane environments. An allowlist entry must never name a secret.
-const ENV_NEVER_PREFIX: &[&str] = &["CADENCE_DEVIN_"];
+/// The carve-outs that beat the allowlist itself — checked first and
+/// unconditionally, so a future edit that adds one of these names to
+/// `ENV_EXACT` or `ENV_PREFIX` stays refused (the mirrored never-list
+/// test drives exactly that corruption). Exact names: `PATH`/`IFS`/
+/// `ENV`/`BASH_ENV` steer shell resolution and field splitting,
+/// `GCONV_PATH`/`NLSPATH` point libc at attacker-chosen conversion and
+/// catalog modules. Prefixes: `LD_*` is the loader injection family,
+/// `PYTHON*`/`MALLOC_*` steer the python/glibc runtimes,
+/// `CADENCE_DEVIN_*` is the cloud-credential carve-out that
+/// `adapter::CLOUD_SECRET_ENV` exists to keep off pane environments —
+/// an allowlist entry must never name a secret.
+const ENV_NEVER_EXACT: &[&str] = &["PATH", "IFS", "BASH_ENV", "ENV", "GCONV_PATH", "NLSPATH"];
+const ENV_NEVER_PREFIX: &[&str] = &["CADENCE_DEVIN_", "LD_", "PYTHON", "MALLOC_"];
 
 /// What the caller asked for, fully validated. Produced by [`parse`];
 /// `main.rs` executes it after the drop.
@@ -189,15 +208,33 @@ fn parse_env_pair(pair: &OsString) -> Result<(OsString, OsString), String> {
 
 /// The env allowlist: exact names or allowed prefixes with a
 /// non-empty suffix (a bare `LC_`/`CADENCE_` is junk, not a name),
-/// minus the secret-bearing carve-out. Deny-by-default — `LD_*`,
-/// `PATH`, `IFS`, `BASH_ENV`, `GIT_*`, `SSH_*`, `*_KEY` never need
-/// enumerating.
+/// minus the never-list. Deny-by-default — `GIT_*`, `SSH_*`, `*_KEY`
+/// and everything unnamed never need enumerating.
 pub fn env_allowed(name: &str) -> bool {
-    if ENV_NEVER_PREFIX.iter().any(|p| name.starts_with(p)) {
+    env_allowed_in(
+        name,
+        ENV_EXACT,
+        ENV_PREFIX,
+        ENV_NEVER_EXACT,
+        ENV_NEVER_PREFIX,
+    )
+}
+
+/// The allowlist decision with every table a parameter, so the test
+/// can feed it a *corrupted* allowlist — one that names a never-list
+/// entry — and prove the refusal survives the future edit.
+fn env_allowed_in(
+    name: &str,
+    exact: &[&str],
+    prefix: &[&str],
+    never_exact: &[&str],
+    never_prefix: &[&str],
+) -> bool {
+    if never_exact.contains(&name) || never_prefix.iter().any(|p| name.starts_with(p)) {
         return false;
     }
-    ENV_EXACT.contains(&name)
-        || ENV_PREFIX
+    exact.contains(&name)
+        || prefix
             .iter()
             .any(|p| name.len() > p.len() && name.starts_with(p))
 }
@@ -295,12 +332,33 @@ pub fn target_is_agent(real: u32, effective: u32, agent_uid: u32) -> bool {
     real == agent_uid && effective == agent_uid
 }
 
-/// The caller gate, part 2: the agent uid may never invoke its own
-/// launch helper — the crossing is `ubuntu → cadence-agent` only, and
-/// an agent-uid caller gains nothing (it could signal or inspect its
-/// peers directly anyway).
-pub fn caller_is_not_agent(uid: u32, agent_uid: u32) -> Result<(), String> {
-    if uid == agent_uid {
+/// The resolved-target gate, run after NSS answers and before any
+/// privileged call (setgroups→setgid→setuid). Three refusals:
+///
+/// - the agent uid is 0 — the "drop" would be a no-op into root;
+/// - any resolved gid is 0 (primary or the shared group — both land
+///   in the child's group set) — the crossing would carry root's
+///   group;
+/// - the agent uid equals the caller's real uid — NSS resolved the
+///   operator (or the agent is invoking its own helper, which gains
+///   it nothing: it can signal or inspect its peers directly). The
+///   crossing is `operator → agent` only.
+pub fn agent_ids_are_safe(
+    agent_uid: u32,
+    group_set: &[u32],
+    caller_uid: u32,
+) -> Result<(), String> {
+    if agent_uid == 0 {
+        return Err(format!(
+            "{AGENT_USER} resolves to uid 0 — refusing to stay root"
+        ));
+    }
+    if group_set.contains(&0) {
+        return Err(format!(
+            "{AGENT_USER} resolves to gid 0 — refusing the root group"
+        ));
+    }
+    if agent_uid == caller_uid {
         return Err(format!(
             "the {AGENT_USER} uid may not invoke its own helper"
         ));
@@ -396,6 +454,21 @@ pub fn proc_stat_ids(stat: &str) -> Option<(u64, u64, u64)> {
         f[3].parse().ok()?,  // field 6  session
         f[19].parse().ok()?, // field 22 starttime
     ))
+}
+
+/// One `/proc/self/fd` entry name → a close target: plain digits, >2.
+/// Non-numeric noise cannot appear on a real procfs, but the parse
+/// keeps the sweep total either way.
+pub fn fd_entry(name: &OsStr) -> Option<i32> {
+    let b = name.as_bytes();
+    if b.is_empty() || !b.iter().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    std::str::from_utf8(b)
+        .ok()?
+        .parse::<i32>()
+        .ok()
+        .filter(|&fd| fd > 2)
 }
 
 /// Percent-encode bytes for one-line output: anything outside
@@ -602,6 +675,50 @@ mod tests {
         }
     }
 
+    /// The mirrored never-list: every name the ticket enumerates stays
+    /// refused even when the allowlist itself is corrupted to name it —
+    /// `env_allowed_in` takes the tables so the test can mount exactly
+    /// that future edit. This is the guard against an allowlist that
+    /// drifts open, not a claim about today's constants.
+    #[test]
+    fn env_never_list_wins_over_a_corrupted_allowlist() {
+        for name in [
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "LD_AUDIT",
+            "LD_PROFILE",
+            "LD_DEBUG",
+            "PATH",
+            "IFS",
+            "BASH_ENV",
+            "ENV",
+            "PYTHONPATH",
+            "PYTHONHOME",
+            "PYTHONSTARTUP",
+            "PYTHONINSPECT",
+            "PYTHONEXECUTABLE",
+            "GCONV_PATH",
+            "MALLOC_CHECK_",
+            "MALLOC_PERTURB_",
+            "MALLOC_TRACE",
+            "NLSPATH",
+            // the pre-existing secret carve-out rides the same gate
+            "CADENCE_DEVIN_API_KEY",
+        ] {
+            assert!(!env_allowed(name), "{name}");
+            assert!(
+                parse(&args(&["exec", "--env", &format!("{name}=v"), "--", "x"])).is_err(),
+                "{name}"
+            );
+            // The corrupted-allowlist proof: even with the name added
+            // to BOTH allow tables, the never-list still refuses it.
+            assert!(
+                !env_allowed_in(name, &[name], &[name], ENV_NEVER_EXACT, ENV_NEVER_PREFIX),
+                "{name} must lose even when the allowlist names it"
+            );
+        }
+    }
+
     #[test]
     fn env_allowlist_accepts_daemon_context_and_provider_names() {
         for name in [
@@ -713,8 +830,23 @@ mod tests {
         // Group absent on the host: fail closed for every caller.
         assert!(caller_is_member(&[2000], None).is_err());
         // The agent uid may not invoke its own helper even as a member.
-        assert!(caller_is_not_agent(500, 500).is_err());
-        assert!(caller_is_not_agent(1000, 500).is_ok());
+        assert!(agent_ids_are_safe(500, &[500], 500).is_err());
+        assert!(agent_ids_are_safe(500, &[500], 1000).is_ok());
+    }
+
+    #[test]
+    fn resolved_root_or_caller_ids_are_refused_before_the_drop() {
+        // uid 0 — the "drop" would be a no-op into root.
+        assert!(agent_ids_are_safe(0, &[500, 501], 1000).is_err());
+        // gid 0 anywhere in the group set — primary or shared, the
+        // crossing would carry root's group either way.
+        assert!(agent_ids_are_safe(500, &[0, 501], 1000).is_err());
+        assert!(agent_ids_are_safe(500, &[501, 0], 1000).is_err());
+        // The agent uid equal to the caller's real uid — NSS resolved
+        // the operator under the agent's name.
+        assert!(agent_ids_are_safe(1000, &[500, 501], 1000).is_err());
+        // The provisioned shape passes.
+        assert!(agent_ids_are_safe(500, &[500, 501], 1000).is_ok());
     }
 
     // ---- target ownership (kill/inspect) ----
@@ -782,6 +914,18 @@ mod tests {
         assert_eq!(proc_stat_ids(stat), Some((1, 42, 98765)));
         assert_eq!(proc_stat_ids("garbage"), None);
         assert_eq!(proc_stat_ids("42 (x) S 1"), None); // too few fields
+    }
+
+    #[test]
+    fn procfs_fd_entries_select_only_numeric_fds_above_two() {
+        assert_eq!(fd_entry(OsStr::new("0")), None);
+        assert_eq!(fd_entry(OsStr::new("2")), None);
+        assert_eq!(fd_entry(OsStr::new("3")), Some(3));
+        assert_eq!(fd_entry(OsStr::new("65537")), Some(65537));
+        assert_eq!(fd_entry(OsStr::new("4294967296")), None); // overflows i32
+        assert_eq!(fd_entry(OsStr::new("12x")), None);
+        assert_eq!(fd_entry(OsStr::new("socket:[123]")), None);
+        assert_eq!(fd_entry(OsStr::new("")), None);
     }
 
     #[test]
