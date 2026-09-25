@@ -3332,10 +3332,14 @@ fn operator_rpc_is_the_operator_even_from_an_agent_runner() {
         ])
         .env("CADENCE_ALIAS", "cad291-runner")
         .env("CAD291_PROBE", "1")
-        // A plain libtest child: the outer run's suite lock and
-        // nextest markers are not its to honour.
+        // A plain libtest child: the outer run's suite lock, nextest
+        // markers and any seam assertion the runner's env might carry
+        // are not its to honour — the probe's ambient call must stay
+        // ambient (CAD-482/F14: the same answer in a pane and in CI).
         .env_remove("CADENCE_SUITE_LOCK")
-        .env_remove("CADENCE_REVIEW_SUITE_LOCK_HELD");
+        .env_remove("CADENCE_REVIEW_SUITE_LOCK_HELD")
+        .env_remove(cadence_agent::test_seam::AS_ENV)
+        .env_remove(cadence_agent::test_seam::ARM_ENV);
     for (key, _) in std::env::vars_os() {
         if key.to_string_lossy().starts_with("NEXTEST") {
             child.env_remove(key);
@@ -3365,10 +3369,11 @@ fn operator_rpc_from_an_agent_runner_probe() {
     let params = json!({"id": "ap-291", "source": "operator in chat",
                         "head": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
                         "repo": "x/y", "pr": 291});
-    // This process carries an agent's environment: refused as such.
-    let err = d
-        .operator_rpc("approval_record", params.clone())
-        .unwrap_err();
+    // This process carries an agent's environment: refused as such. A
+    // plain ambient call, never an assertion — on a seam-armed fixture
+    // `d.rpc` asserts nothing, so the real env-mark refusal is what
+    // answers, identical in a pane and in CI.
+    let err = d.rpc("approval_record", params.clone()).unwrap_err();
     assert!(err.to_string().contains("carries CADENCE_ALIAS"), "{err}");
     // The harness's operator caller from the same runner is the operator.
     let r = d.operator_rpc("approval_record", params).unwrap();
