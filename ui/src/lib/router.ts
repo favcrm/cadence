@@ -32,6 +32,7 @@ export type Route =
   | { screen: "overview" }
   | { screen: "projects"; slug: string | null; section: ProjectSection }
   | { screen: "agents"; alias: string | null }
+  | { screen: "outbox" }
   | { screen: "setup" }
   | { screen: "settings"; section: SettingsSection }
   | { screen: "login" }
@@ -44,6 +45,7 @@ export const NAV: { screen: Screen; label: string; route: Route }[] = [
   { screen: "home", label: "Home", route: { screen: "home" } },
   { screen: "projects", label: "Projects", route: { screen: "projects", slug: null, section: "issues" } },
   { screen: "agents", label: "Agents", route: { screen: "agents", alias: null } },
+  { screen: "outbox", label: "Outbox", route: { screen: "outbox" } },
   { screen: "settings", label: "Settings", route: { screen: "settings", section: "models" } },
 ];
 
@@ -87,6 +89,8 @@ export function matchRoute(pathname: string): Route {
     if (head === "setup" && !a) return { screen: "setup" };
     if (head === "login" && !a) return { screen: "login" };
     if (head === "overview" && !a) return { screen: "overview" };
+    // `?item=<effect_id>` deep-links one published item (CAD-546).
+    if (head === "outbox" && !a) return { screen: "outbox" };
     if (head === "settings" && !b) {
       if (!a) return { screen: "settings", section: "models" };
       if (a === "memory") return { screen: "settings", section: "memory" };
@@ -112,6 +116,8 @@ export function routePath(route: Route): string {
       return "/login";
     case "overview":
       return "/overview";
+    case "outbox":
+      return "/outbox";
     case "settings":
       return route.section === "memory" ? "/settings/memory" : "/settings";
     case "notFound":

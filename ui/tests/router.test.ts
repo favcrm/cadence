@@ -32,6 +32,7 @@ const paths: [string, Route][] = [
   ["/overview", { screen: "overview" }],
   ["/settings", { screen: "settings", section: "models" }],
   ["/settings/memory", { screen: "settings", section: "memory" }],
+  ["/outbox", { screen: "outbox" }],
   ["/login", { screen: "login" }],
 ];
 for (const [path, route] of paths) {
@@ -47,7 +48,7 @@ for (const dead of ["/overview/x", "/nope", "/projects/x/y", "/agents/a/b", "/se
 }
 
 // Main nav: MVP screens only.
-equal(NAV.map((n) => n.label), ["Home", "Projects", "Agents", "Settings"], "nav");
+equal(NAV.map((n) => n.label), ["Home", "Projects", "Agents", "Outbox", "Settings"], "nav");
 
 // Reading a location: the slug is the scope on Projects, ?project= elsewhere.
 {

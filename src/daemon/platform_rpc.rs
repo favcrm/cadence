@@ -590,4 +590,22 @@ impl Shared {
         }
         closed
     }
+
+    /// `platform_outbox {effect_id?}` (CAD-546) — the `local`
+    /// platform's publish ledger: every released `publish` lands an
+    /// item under the outbox root. The operator's alone: the posts are
+    /// already approved content, but the ledger's previews and paths
+    /// are the operator's board's concern — the same
+    /// `operator_connection` proof the custody verbs take, and the
+    /// gate the board's `/api/outbox` relays through.
+    pub(super) fn rpc_platform_outbox(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.operator_connection("platform outbox", params, peer_pid)?;
+        let Some(outbox) = &self.outbox_dir else {
+            return Err(Error::rejected(
+                "this daemon runs no `local` platform — no outbox is configured",
+            ));
+        };
+        let effect_id = optional_str(params, "effect_id").map(str::to_string);
+        platform::local::list_items(outbox, effect_id.as_deref())
+    }
 }

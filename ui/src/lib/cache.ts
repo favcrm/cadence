@@ -314,6 +314,7 @@ export const RESOURCE_NAMES = [
   "overview",
   "issue",
   "workflows",
+  "outbox",
 ] as const;
 export type ResourceName = (typeof RESOURCE_NAMES)[number];
 

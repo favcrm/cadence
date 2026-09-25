@@ -951,3 +951,30 @@ export interface WorkflowPreview {
   approved?: boolean | string | null;
   digest?: string | null;
 }
+
+/**
+ * `GET /api/outbox` — one published `local`-platform item (CAD-546):
+ * the effect's project, title and a bounded `preview` of the rendered
+ * post, plus the item's outbox path and its board link.
+ */
+export interface OutboxItem {
+  effect_id: string;
+  project: string;
+  title: string;
+  published_at: string;
+  post_sha256?: string;
+  content_sha256?: string;
+  attachments?: { name: string; sha256: string; bytes: number }[];
+  preview?: string;
+  path?: string;
+  board_url?: string;
+}
+
+export interface OutboxList {
+  items: OutboxItem[];
+}
+
+/** `GET /api/outbox?effect_id=` — the item plus its rendered post. */
+export interface OutboxDetail {
+  item: OutboxItem & { post?: string | null };
+}

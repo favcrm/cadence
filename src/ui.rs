@@ -2357,9 +2357,18 @@ fn value_fp(value: &Value) -> u64 {
 /// - monitors → the overview's monitoring block only.
 fn event_resources(name: &str) -> &'static [&'static str] {
     match name {
-        "issues" => &["issues", "projects", "issue", "overview", "workflows"],
-        "jobs" => &["issues", "agents", "issue", "overview"],
-        "agents" => &["agents", "issue", "overview"],
+        "issues" => &[
+            "issues",
+            "projects",
+            "issue",
+            "overview",
+            "workflows",
+            "outbox",
+        ],
+        "jobs" => &["issues", "agents", "issue", "overview", "outbox"],
+        // A released publish lands an outbox item — the same event the
+        // effect row's state change produces.
+        "agents" => &["agents", "issue", "overview", "outbox"],
         "monitoring" => &["overview"],
         _ => &[
             "issues",
@@ -2368,6 +2377,7 @@ fn event_resources(name: &str) -> &'static [&'static str] {
             "issue",
             "overview",
             "workflows",
+            "outbox",
         ],
     }
 }
@@ -2765,6 +2775,12 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             request,
             json_response(read_model::get(state_dir, pm_dir).agents()),
         ),
+        // CAD-546: the `local` platform's outbox — an operator-only
+        // read, the same proof the board's operator write routes take.
+        "/api/outbox" => {
+            let resp = home::outbox(&request, state_dir, opts, query("effect_id"));
+            send(request, resp);
+        }
         "/api/memories" => match Pm::at(pm_dir) {
             Ok(pm) => {
                 // The `memory ls` grammar: keys repeat and comma-join

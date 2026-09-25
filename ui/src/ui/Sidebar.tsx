@@ -47,10 +47,18 @@ const settingsIcon = (
     <path d="M8 1.8v1.6M8 12.6v1.6M1.8 8h1.6M12.6 8h1.6M3.4 3.4l1.1 1.1M11.5 11.5l1.1 1.1M12.6 3.4l-1.1 1.1M4.5 11.5l-1.1 1.1" />
   </svg>
 );
+const outboxIcon = (
+  <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4">
+    <path d="M2 5.5h12v8a1 1 0 01-1 1H3a1 1 0 01-1-1v-8z" />
+    <path d="M2 5.5l2-3h8l2 3" />
+    <path d="M6.5 8.5h3" />
+  </svg>
+);
 const NAV_ICONS: Record<string, ReactNode> = {
   home: homeIcon,
   projects: boardIcon,
   agents: agentsIcon,
+  outbox: outboxIcon,
   settings: settingsIcon,
 };
 
