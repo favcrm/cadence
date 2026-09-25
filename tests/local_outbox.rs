@@ -948,6 +948,41 @@ fn source_pin_refuses_unknown_artifact() {
     assert!(err.contains("cannot be pinned"), "{err}");
 }
 
+/// rev-311 mutation probe: a caller-named `local-attachments:`
+/// descriptor must name the *requester's* own registered worktree —
+/// a peer's `agents.cwd` is not the caller's to pin. Correct
+/// behavior: the stage is refused, no digests of the peer's bytes
+/// ever land on the row.
+#[test]
+fn caller_named_source_may_not_name_a_peers_worktree() {
+    let d = Daemon::start();
+    let wt = TempDir::new().unwrap();
+    let a_root = wt.path().join("a");
+    let b_root = wt.path().join("b");
+    std::fs::create_dir_all(&a_root).unwrap();
+    std::fs::create_dir_all(&b_root).unwrap();
+    std::fs::write(a_root.join("mine.txt"), b"A-BYTES").unwrap();
+    std::fs::write(b_root.join("secret.txt"), b"PEER-SECRET-BYTES").unwrap();
+    let mut a = Lane::spawn_as(&d, "a-lane", &a_root, None, "worker");
+    let _b = Lane::spawn_as(&d, "b-lane", &b_root, None, "worker");
+    enroll(&d, "outbox");
+    grant(&d, "a-lane", "outbox");
+
+    let mut input = publish_input("cadence", &["mine.txt"]);
+    input["source"] = json!(format!(
+        "local-attachments:{}",
+        json!({"root": b_root.canonicalize().unwrap(), "paths": ["secret.txt"]})
+    ));
+    let err = refused(a.rpc(
+        &d,
+        "platform_call",
+        json!({"platform": "local", "account": "outbox",
+               "tool": "publish", "input": input,
+               "request": "req-peer"}),
+    ));
+    assert!(err.contains("cannot be pinned"), "{err}");
+}
+
 // ---------- the read side is operator-only ----------
 
 /// `platform_outbox` is the operator's read: an agent caller and an
