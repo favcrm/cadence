@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+"""CAD-426 phase 2: report duplicated line-blocks across tests/*.rs.
+
+Finds repeated blocks of >= MIN_LINES physical lines, normalised for
+whitespace and identifiers, and ranks them by lines saved if each
+occurrence collapsed to a helper call.
+
+Normalisation (per line, comments/strings/idents masked):
+  - blank lines and comment-only lines are dropped from the stream, so two
+    blocks that differ only by comments still match;
+  - string/char literals become S, identifiers become I, numbers become N;
+  - keyword/punctuation shape is preserved.
+
+Output ranks patterns by saved = occurrences * (lines - 1)  (each
+occurrence becomes roughly one call site line; the helper itself is paid
+for once).  Locations list file:line of every occurrence.
+
+Caveat: blocks may span `}`/`#[test]`/`fn` boundaries when two tests share
+the same shape — the ceiling is an upper bound, and real extraction must
+respect fn boundaries.
+"""
+import re
+import sys
+from pathlib import Path
+
+MIN_LINES = 5
+TESTS_DIR = Path("tests")
+GLOB = "*.rs"
+
+# ---------------------------------------------------------------- masking
+
+# r"..." r#"..."# br"..." br#"..."#  (raw strings may span lines)
+RAWSTR_RE = re.compile(r'b?r(#*)"')
+CHAR_RE = re.compile(r"'(?:[^'\\]|\\.)'")
+NUM_RE = re.compile(r"\b\d[\d_]*(?:\.\d+)?(?:u8|u16|u32|u64|usize|i32|i64|f64)?\b")
+IDENT_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
+
+KEYWORDS = {
+    "fn", "let", "mut", "if", "else", "for", "in", "while", "loop", "match",
+    "return", "break", "continue", "struct", "enum", "impl", "trait", "use",
+    "mod", "pub", "const", "static", "type", "where", "async", "await",
+    "move", "ref", "self", "Self", "true", "false", "Some", "None", "Ok",
+    "Err", "assert", "assert_eq", "assert_ne", "assert_matches", "panic",
+    "vec", "format", "println", "eprintln", "dbg", "todo", "unimplemented",
+}
+
+
+def blank_line(raw: str, state: dict) -> str:
+    """Blank comments and literals, keeping a marker char where a literal
+    starts (S string/raw, C char) so arity stays visible. `state` carries
+    in-progress block comments ('block') and multiline raw strings ('raw'
+    = number of #) across lines."""
+    i, n = 0, len(raw)
+    out = []
+    while i < n:
+        if state["raw"] is not None:
+            end = '"' + "#" * state["raw"]
+            j = raw.find(end, i)
+            if j < 0:
+                out.append(" " * (n - i))
+                break
+            out.append(" " * (j + len(end) - i))
+            i = j + len(end)
+            state["raw"] = None
+            continue
+        if state["block"]:
+            j = raw.find("*/", i)
+            if j < 0:
+                out.append(" " * (n - i))
+                break
+            out.append(" " * (j + 2 - i))
+            i = j + 2
+            state["block"] = False
+            continue
+        if raw.startswith("//", i):
+            out.append(" " * (n - i))
+            break
+        if raw.startswith("/*", i):
+            j = raw.find("*/", i + 2)
+            if j < 0:
+                state["block"] = True
+                out.append(" " * (n - i))
+                break
+            out.append(" " * (j + 2 - i))
+            i = j + 2
+            continue
+        m = RAWSTR_RE.match(raw, i)
+        if m:
+            hashes = len(m.group(1))
+            end = '"' + "#" * hashes
+            j = raw.find(end, m.end())
+            if j < 0:
+                state["raw"] = hashes
+                out.append("S" + " " * (n - i - 1))
+                break
+            out.append("S" + " " * (j + len(end) - i - 1))
+            i = j + len(end)
+            continue
+        if raw.startswith('b"', i):
+            j = i + 2
+            while j < n and raw[j] != '"':
+                j += 2 if raw[j] == "\\" else 1
+            j = min(j + 1, n)
+            out.append("S" + " " * (j - i - 1))
+            i = j
+            continue
+        if raw[i] == '"':
+            j = i + 1
+            while j < n and raw[j] != '"':
+                j += 2 if raw[j] == "\\" else 1
+            j = min(j + 1, n)
+            out.append("S" + " " * (j - i - 1))
+            i = j
+            continue
+        if raw[i] == "'":
+            m2 = CHAR_RE.match(raw, i)
+            if m2:
+                out.append("C" + " " * (len(m2.group(0)) - 1))
+                i += len(m2.group(0))
+                continue
+            out.append(raw[i])
+            i += 1
+            continue
+        out.append(raw[i])
+        i += 1
+    return "".join(out)
+
+
+def mask_line(blanked: str) -> str:
+    """Normalise a comment/literal-blanked line: collapse ws, mask numbers
+    and identifiers."""
+    s = NUM_RE.sub("N", blanked)
+    s = IDENT_RE.sub(lambda m: m.group(0) if m.group(0) in KEYWORDS else "I", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def file_stream(path: Path):
+    """Return list of (orig_line_no, orig_text, masked) skipping blanks/comments."""
+    out = []
+    state = {"raw": None, "block": False}
+    for n, raw in enumerate(path.read_text().splitlines(), 1):
+        masked = mask_line(blank_line(raw, state))
+        if not masked or masked in ("S", "C"):
+            continue
+        out.append((n, raw.rstrip("\n"), masked))
+    return out
+
+
+# ------------------------------------------------------------- candidates
+
+
+def maximal_repeats(streams):
+    """Find repeated masked-line blocks >= MIN_LINES. Returns list of dicts."""
+    # seed: map 5-window tuple -> positions [(file_idx, stream_idx)]
+    seeds = {}
+    for fi, st in enumerate(streams):
+        for i in range(len(st) - MIN_LINES + 1):
+            key = tuple(m for _, _, m in st[i : i + MIN_LINES])
+            seeds.setdefault(key, []).append((fi, i))
+
+    found = {}  # positions-tuple -> lines (keep longest per occurrence set)
+    for key, positions in seeds.items():
+        if len(positions) < 2:
+            continue
+        # extend while the whole occurrence set shares the next masked line;
+        # a split forks into subgroups that keep extending independently
+        stack = [(positions, MIN_LINES)]
+        while stack:
+            pos, length = stack.pop()
+            nxt = {}
+            for fi, i in pos:
+                nl = (
+                    streams[fi][i + length][2]
+                    if i + length < len(streams[fi])
+                    else None
+                )
+                nxt.setdefault(nl, []).append((fi, i))
+            sub = [p for k, p in nxt.items() if k is not None and len(p) >= 2]
+            if sub:
+                stack.extend((p, length + 1) for p in sub)
+            else:
+                sig = tuple(sorted(pos))
+                if found.get(sig, 0) < length:
+                    found[sig] = length
+    return [
+        {"lines": ln, "count": len(pos), "positions": list(pos)}
+        for pos, ln in found.items()
+    ]
+
+
+def main():
+    files = sorted(TESTS_DIR.rglob(GLOB))
+    streams = []
+    for f in files:
+        streams.append(file_stream(f))
+    reps = maximal_repeats(streams)
+    # drop a repeat whose occurrence set is a subset of a longer match's
+    reps.sort(key=lambda r: r["count"] * (r["lines"] - 1), reverse=True)
+    total_files = len(files)
+    print(f"# test-dup-report: {total_files} files, min block {MIN_LINES} lines\n")
+    shown = 0
+    for r in reps:
+        saved = r["count"] * (r["lines"] - 1)
+        if saved < 20:
+            continue
+        fi0, i0 = r["positions"][0]
+        st = streams[fi0]
+        locs = ", ".join(
+            f"{files[fi]}:{streams[fi][i][0]}" for fi, i in r["positions"][:8]
+        )
+        more = f" (+{len(r['positions']) - 8} more)" if len(r["positions"]) > 8 else ""
+        print(f"## {r['lines']} lines x{r['count']} occ  ~{saved} lines saved")
+        print(f"   at {locs}{more}")
+        print("   ```")
+        for n, raw, _m in st[i0 : i0 + r["lines"]]:
+            print(f"   {n:>6} | {raw}")
+        print("   ```\n")
+        shown += 1
+        limit = int(sys.argv[1]) if len(sys.argv) > 1 else 40
+        if limit and shown >= limit:
+            break
+    total_saved = sum(r["count"] * (r["lines"] - 1) for r in reps)
+    # greedy non-overlap: a physical line can only be saved once — take
+    # patterns top-down, skipping occurrences that overlap covered ranges
+    covered = {fi: [False] * len(st) for fi, st in enumerate(streams)}
+    greedy = 0
+    for r in reps:
+        take = []
+        for fi, i in r["positions"]:
+            if any(covered[fi][i : i + r["lines"]]):
+                continue
+            take.append((fi, i))
+        if len(take) < 2:
+            continue
+        for fi, i in take:
+            for j in range(i, i + r["lines"]):
+                covered[fi][j] = True
+        greedy += len(take) * (r["lines"] - 1)
+    print(f"# total theoretical saved if all collapsed: {total_saved} lines")
+    print(f"# greedy non-overlapping ceiling: {greedy} lines")
+    print(f"# (helpers cost their own lines; extract top-down)")
+
+
+if __name__ == "__main__":
+    main()
