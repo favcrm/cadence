@@ -521,23 +521,24 @@ pub fn render(text: &str, provided: &BTreeMap<String, String>) -> Result<String>
 /// category rather than a named code-point list (CAD-507 review): every
 /// `Cf` format control — the soft hyphen, the bidi and
 /// interlinear-annotation controls, tag characters, the BOM — plus the
-/// invisible `Mn` nonspacing marks and the unassigned points reserved
-/// for them (both selected by `Default_Ignorable_Code_Point`): the
-/// grapheme joiner, the Khmer vowel inherents, Mongolian and emoji
-/// variation selectors. A format control or variation selector Unicode
-/// assigns later refuses without a table update. Control characters and
-/// whitespace that is not an ordinary interior space keep refusing
+/// whole `Default_Ignorable_Code_Point` class: the invisible `Mn`
+/// nonspacing marks (grapheme joiner, Khmer vowel inherents, Mongolian
+/// and emoji variation selectors), the `Lo` Hangul fillers U+115F,
+/// U+1160, U+3164 and U+FFA0 — real letters that render as blank and
+/// alias past `distinct:` — and the unassigned `Cn` reserves. A format
+/// control, filler or variation selector Unicode assigns later refuses
+/// without a table update. One consequence to know: an emoji spelled
+/// with VS16 (U+FE0F), e.g. a pasted `❤️`, refuses — the selector is
+/// default-ignorable — while the bare emoji passes. Control characters
+/// and whitespace that is not an ordinary interior space keep refusing
 /// through the other arms — each is invisible or splitting in some
 /// reader, and none changes what a value names.
 fn bad_value_char(c: char) -> bool {
-    /// `\p{Cf}` ∪ (`\p{Mn}` ∩ ignorable) ∪ (unassigned ∩ ignorable).
+    /// `\p{Cf}` ∪ `\p{Default_Ignorable_Code_Point}` — `Cf` stays named
+    /// because Unicode holds a few format controls outside the class.
     static INVISIBLE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(concat!(
-            r"[\p{Cf}",
-            r"[\p{Mn}&&\p{Default_Ignorable_Code_Point}]",
-            r"[\p{Cn}&&\p{Default_Ignorable_Code_Point}]]"
-        ))
-        .expect("a constant Unicode-category pattern compiles")
+        Regex::new(r"[\p{Cf}\p{Default_Ignorable_Code_Point}]")
+            .expect("a constant Unicode-category pattern compiles")
     });
     c.is_control()
         || INVISIBLE.is_match(c.encode_utf8(&mut [0; 4]))
@@ -1766,9 +1767,11 @@ Why.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance
     #[test]
     fn input_values_refuse_invisible_chars_by_category() {
         // CAD-507: the guard is by Unicode general category — every `Cf`
-        // format control and every invisible `Mn` mark — so codepoints
-        // the old list never named refuse. Mutation proof: a mutant
-        // keeping only the named ranges lets these through and the
+        // format control and every `Default_Ignorable_Code_Point`, so
+        // codepoints the old list never named refuse: invisible `Mn`
+        // marks, the blank-rendering `Lo` Hangul fillers, and the `Cn`
+        // ignorable reserves. Mutation proof: a mutant keeping only the
+        // named ranges (or only `Cf`+`Mn`) lets these through and the
         // `one_line` code is gone.
         for bad in [
             "dev\u{180E}1",  // MONGOLIAN VOWEL SEPARATOR — Cf
@@ -1787,6 +1790,11 @@ Why.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance
             "dev\u{180B}1",  // MONGOLIAN FREE VARIATION SELECTOR — Mn
             "dev\u{FE0F}1",  // VARIATION SELECTOR-16 — invisible Mn
             "dev\u{E0100}1", // VARIATION SELECTOR-17 — invisible Mn
+            "dev\u{115F}1",  // HANGUL CHOSEONG FILLER — blank-rendering Lo
+            "dev\u{1160}1",  // HANGUL JUNGSEONG FILLER — blank-rendering Lo
+            "dev\u{3164}1",  // HANGUL FILLER — blank-rendering Lo
+            "dev\u{FFA0}1",  // HALFWIDTH HANGUL FILLER — blank-rendering Lo
+            "dev\u{FFF0}1",  // unassigned — default-ignorable Cn reserve
         ] {
             let e = render(WF, &inputs(&[("topic", bad)])).unwrap_err();
             assert_eq!(e.code(), Some("one_line"), "{bad:?} -> {e}");
