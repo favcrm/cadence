@@ -795,38 +795,7 @@ fn dispatch_injects_project_memory_lessons() {
     std::fs::write(repo.join("f"), "x").unwrap();
     git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "-qm", "init"]);
-    let bin_dir = Path::new(env!("CARGO_BIN_EXE_cadence"))
-        .parent()
-        .unwrap()
-        .to_path_buf();
-    let cli = |args: &[&str]| -> (bool, Value) {
-        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
-            .arg("--state-dir")
-            .arg(&d.state)
-            .args(args)
-            .env("CADENCE_PM_DIR", &pm_dir)
-            .env("HOME", &home)
-            .env(
-                "PATH",
-                format!(
-                    "{}:{}",
-                    bin_dir.display(),
-                    std::env::var("PATH").unwrap_or_default()
-                ),
-            )
-            .env_remove("CADENCE_ALIAS")
-            .operator_output()
-            .unwrap();
-        let text = if out.stdout.is_empty() {
-            String::from_utf8_lossy(&out.stderr).to_string()
-        } else {
-            String::from_utf8_lossy(&out.stdout).to_string()
-        };
-        (
-            out.status.success(),
-            serde_json::from_str(text.trim()).unwrap_or_else(|_| panic!("not json: {text}")),
-        )
-    };
+    let cli = cadence_cli_json(&d.state, &pm_dir, &home);
     assert!(cli(&["issue", "init"]).0);
     let repo_s = repo.canonicalize().unwrap().to_str().unwrap().to_string();
     assert!(cli(&["issue", "project", "add", "demo", "--prefix", "D", "--repo", &repo_s,]).0);
@@ -1345,38 +1314,7 @@ fn dispatch_degrades_on_memory_failures() {
     std::fs::write(repo.join("f"), "x").unwrap();
     git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "-qm", "init"]);
-    let bin_dir = Path::new(env!("CARGO_BIN_EXE_cadence"))
-        .parent()
-        .unwrap()
-        .to_path_buf();
-    let cli = |args: &[&str]| -> (bool, Value) {
-        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
-            .arg("--state-dir")
-            .arg(&d.state)
-            .args(args)
-            .env("CADENCE_PM_DIR", &pm_dir)
-            .env("HOME", &home)
-            .env(
-                "PATH",
-                format!(
-                    "{}:{}",
-                    bin_dir.display(),
-                    std::env::var("PATH").unwrap_or_default()
-                ),
-            )
-            .env_remove("CADENCE_ALIAS")
-            .operator_output()
-            .unwrap();
-        let text = if out.stdout.is_empty() {
-            String::from_utf8_lossy(&out.stderr).to_string()
-        } else {
-            String::from_utf8_lossy(&out.stdout).to_string()
-        };
-        (
-            out.status.success(),
-            serde_json::from_str(text.trim()).unwrap_or_else(|_| panic!("not json: {text}")),
-        )
-    };
+    let cli = cadence_cli_json(&d.state, &pm_dir, &home);
     assert!(cli(&["issue", "init"]).0);
     let repo_s = repo.canonicalize().unwrap().to_str().unwrap().to_string();
     assert!(cli(&["issue", "project", "add", "demo", "--prefix", "D", "--repo", &repo_s]).0);

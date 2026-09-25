@@ -195,6 +195,99 @@ impl OperatorOutput for std::process::Command {
     }
 }
 
+/// A `cli(&[args]) -> (ok, json)` closure for the issue/dispatch CLI
+/// fixtures: the cadence bin runs with `CADENCE_PM_DIR`/`HOME` bound, the
+/// test's own bin dir first on PATH (so a spawned `cadence` resolves),
+/// and the operator-proof call shape ([`OperatorOutput`]). Panics when the
+/// reply is not JSON.
+pub fn cadence_cli_json(
+    state: &Path,
+    pm_dir: &Path,
+    home: &Path,
+) -> impl Fn(&[&str]) -> (bool, Value) {
+    let (state, pm_dir, home) = (
+        state.to_path_buf(),
+        pm_dir.to_path_buf(),
+        home.to_path_buf(),
+    );
+    let bin_dir = Path::new(env!("CARGO_BIN_EXE_cadence"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    move |args: &[&str]| -> (bool, Value) {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+            .arg("--state-dir")
+            .arg(&state)
+            .args(args)
+            .env("CADENCE_PM_DIR", &pm_dir)
+            .env("HOME", &home)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin_dir.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env_remove("CADENCE_ALIAS")
+            .operator_output()
+            .unwrap();
+        let text = if out.stdout.is_empty() {
+            String::from_utf8_lossy(&out.stderr).to_string()
+        } else {
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+        (
+            out.status.success(),
+            serde_json::from_str(text.trim()).unwrap_or_else(|_| panic!("not json: {text}")),
+        )
+    }
+}
+
+/// The unwrapped sibling of [`cadence_cli_json`]: `cli_raw(&[args]) ->
+/// (exit_code, stdout, stderr)` for tests that want the streams split —
+/// e.g. an expected failure still needs its own assertion. Runs the bin
+/// as a plain child (`.output()`), not the operator-proof exec.
+pub fn cadence_cli_raw(
+    state: &Path,
+    pm_dir: &Path,
+    home: &Path,
+) -> impl Fn(&[&str]) -> (i32, String, String) {
+    let (state, pm_dir, home) = (
+        state.to_path_buf(),
+        pm_dir.to_path_buf(),
+        home.to_path_buf(),
+    );
+    let bin_dir = Path::new(env!("CARGO_BIN_EXE_cadence"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    move |args: &[&str]| -> (i32, String, String) {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+            .arg("--state-dir")
+            .arg(&state)
+            .args(args)
+            .env("CADENCE_PM_DIR", &pm_dir)
+            .env("HOME", &home)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin_dir.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env_remove("CADENCE_ALIAS")
+            .output()
+            .unwrap();
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    }
+}
+
 pub struct TestDaemon {
     pub dir: TempDir,
     pub state: PathBuf,
