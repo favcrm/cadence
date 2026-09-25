@@ -1952,7 +1952,9 @@ fn urgent_waits_for_the_open_approval_then_goes_first() {
         d.send("w1", json!({"text": format!("normal {id}"), "message": id}))
             .unwrap();
     }
-    d.send(
+    // CAD-482: --priority/--supersedes is the operator's send (CAD-149)
+    // — assert it through the seam, not the runner's ancestry.
+    d.operator_send(
         "w1",
         json!({"text": "urgent correction", "message": "u1", "priority": "urgent"}),
     )
@@ -2005,7 +2007,9 @@ fn pty_urgent_waits_for_the_held_turn_then_goes_first() {
         d.send("w1", json!({"text": format!("normal {id}"), "message": id}))
             .unwrap();
     }
-    d.send(
+    // CAD-482: --priority/--supersedes is the operator's send (CAD-149)
+    // — assert it through the seam, not the runner's ancestry.
+    d.operator_send(
         "w1",
         json!({"text": "urgent correction", "message": "u1", "priority": "urgent"}),
     )
