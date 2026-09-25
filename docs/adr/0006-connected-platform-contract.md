@@ -5,17 +5,21 @@
   trust boundary — credential custody and the release of outward acts;
   trigger 3 wherever secret handling is built). This document is the
   contract they implement; it changes no code.
-- Date: proposed 2026-09-24
-- Author: `swe-365` (devin worker), dispatched by `lane-pm`
+- Date: proposed 2026-09-24; revised 2026-09-25 (r2) — applies the
+  operator's decision on §7 and the amendments recorded on CAD-365.
+- Author: `swe-365` (devin worker), dispatched by `lane-pm`; r2 by
+  `swe-365b`.
 - Deciders: the operator. CAD-365's second acceptance item — "Accepted
   by the operator" — is the operator's decision on this document. §7
-  holds the questions.
+  now records that decision (2026-09-25); the document stays
+  **proposed** until the operator accepts the revision.
 - Issues: CAD-365 (this ADR); parent CAD-331 (the P4 epic); blocks
   CAD-366 (the credential proxy); consumed by CAD-367 (the Cloudflare
   platform, into which CAD-368 and CAD-369 were consolidated on
-  2026-09-24); relates AOS-49 (the AgenticOS v2 credential exchange —
-  its acceptance requires "contract fixture shared with Cadence P4",
-  §5.6).
+  2026-09-24) and CAD-501 (the AgenticOS adapter); relates AOS-49 (the
+  AgenticOS v2 credential exchange — its acceptance requires "contract
+  fixture shared with Cadence P4", §5.6) and AOS-52 (the AgenticOS
+  tool manifest, §5.2).
 - Code citations are pinned to
   `7de54b5c673d394a1c0d8ffb5493d603115c1aca` (origin/main, 2026-09-24).
   Line numbers move; re-locate by symbol.
@@ -39,6 +43,11 @@ and "tools declare effects read/draft/send; send is never executed by
 an agent". Two codebases will implement against this contract, so it
 must be written once, here, before either builds. This ticket is the
 design record only: no proxy, no adapter, no UI.
+
+Scope (decided 2026-09-25): the first connectors are Cloudflare
+(CAD-367) and AgenticOS v2 (CAD-501). GitHub and the merge queue are
+out of scope for this contract — the forge path keeps its own
+controls.
 
 ### 1.2 What exists today: the negative posture
 
@@ -133,13 +142,20 @@ acceptance items map onto C1–C3 and the operator's own decision.
   shapes (§5.3): operator-enrolled scoped tokens, and consent
   exchanges (device code + OTP + scope consent, per AOS-49). Agents
   receive grant references, never credential bytes.
-- **C5 — A send call produces a pending effect and nothing else.** The
-  staged call is represented as a `kind:"effect"` brokered request
-  with the fields of §5.4; it does not execute inside the call.
-- **C6 — Release is a press that executes.** The operator's `accept`
-  fires the exact staged input daemon-side; `decline` parks the
-  reason. The outcome — result or platform error — is the answer the
-  waiting call receives.
+- **C5 — A send call produces a pending effect and returns `staged`.**
+  The staged call is represented as a `kind:"effect"` brokered request
+  backed by the durable row of §5.4; it does not execute inside the
+  call. The caller gets `staged` + `effect_id` at once and may end its
+  turn — the outcome arrives later as a message. Synchronous waiting
+  stays an option for short interactive calls; nothing in the
+  lifecycle assumes a waiter.
+- **C6 — Release is a press that executes, by a verified human
+  authorised for the scope.** v1 has one such person — the operator —
+  so release is operator-only; anyone authorised, the PM included, may
+  decline; agents never release. `accept` fires the exact staged input
+  daemon-side; `decline` parks the reason. The outcome — result or
+  platform error, with `verified` per C10 — is delivered as a message
+  to the task or PM, and to a waiting call if one is parked.
 - **C7 — The lifecycle is durable at the dangerous edge.** A pending
   effect is a store row, not only an in-memory handle; an `accept`
   recorded but not provably executed reconciles as `unknown` after a
@@ -148,6 +164,12 @@ acceptance items map onto C1–C3 and the operator's own decision.
   decisions, executions and revocations are events; fields that can
   carry agent text are secret-guarded; no event or row holds a
   credential.
+- **C9 — Every connector write is idempotent.** The adapter attaches
+  an idempotency key to every write, and the expected content hash
+  where the platform supports one.
+- **C10 — The outcome is verified.** After execution the adapter reads
+  back and compares with the approved input; `outcome.verified` is
+  `true`, `false` or `unknown`. `false` raises a Needs-you item.
 
 ## 3. Options
 
@@ -218,13 +240,29 @@ acceptance items map onto C1–C3 and the operator's own decision.
   "send is never executed by an agent" (AOS-49) is structural, not a
   rule an agent can break.
 
+### 3.6 What the caller sees while a send pends
+
+- **A — Block every send call until decided:** rejected. Outward acts
+  wait on a human; a turn parked inside `request_wait` for hours burns
+  the lane and dies on its deadline. It also makes the durable row
+  pointless — the caller becomes the state.
+- **B — Return `staged` + `effect_id` at once; deliver the outcome as
+  a message:** **adopted.** The effect's lifecycle lives in the
+  durable row, not the call. The turn may end; when the outcome lands,
+  a message to the task (or the PM) completes the dependent step. A
+  bounded `request_wait` remains available for genuinely interactive
+  sends — waiting is the caller's choice, never a lifecycle
+  assumption.
+
 ## 4. Decision
 
 Adopt **B** at every fork: effects are declared in the adapter's tool
 table; the undeclared default is `send`; credentials live in proxy
 custody behind operator enrollment and per-agent grants; a pending
 effect is a `kind:"effect"` brokered request backed by a durable row;
-and `accept` executes the staged input daemon-side. §5 is the
+the call returns `staged` at once and the outcome arrives as a
+message; and `accept` — by a verified human authorised for the scope,
+the operator in v1 — executes the staged input daemon-side. §5 is the
 normative contract.
 
 ## 5. The contract
@@ -233,7 +271,9 @@ normative contract.
 
 - **Platform** — an external service cadence acts on: a named
   integration (`cloudflare`, `agenticos`) plus an **account** handle
-  the operator enrolls.
+  the operator enrolls. A platform may hold several enrolled accounts,
+  each with its own grants, and a project names a default account
+  (§7, Q4).
 - **Adapter** — the code that knows a platform's API. Its tools are
   exposed to agents as **MCP tools** — the stdio shape
   `cadence mcp-permission` already proves — and it ships a **tool
@@ -244,7 +284,9 @@ normative contract.
 - **Grant** — `(agent, platform, account, scopes)` — the operator's
   record that an agent may call into a platform at those scopes.
 - **Pending effect** — a staged send-class call awaiting the press,
-  represented per §5.4.
+  represented per §5.4: a `kind:"effect"` request plus a durable row
+  carrying a rendered `preview` and, where the send derives from a
+  reviewed artifact, its `source_hash`.
 - **Proxy** — the daemon-side executor that checks effects and scopes,
   attaches credentials, stages sends, and executes accepted effects.
 
@@ -262,14 +304,38 @@ Every tool in an adapter's table declares exactly one effect:
   needs no outward act. If deleting the preview or retracting the
   draft itself sends, the tool is `send`. A tool that both reads and
   sends is `send`.
+- **Handoff to another system's own approval is `draft`.** Submitting
+  work for that system to approve under its own credential passes the
+  discard test — nothing outward has happened from cadence's side.
+  The credential holder owns the press: e.g. AgenticOS executes an
+  outward action only when its Company DO holds a signed-in user's
+  approval — one approval per action — so cadence stages the
+  submission and waits on that system's decision rather than asking a
+  second time. Cadence never holds a personal approval token (§5.3).
+- **Drafts surface as information only** (decided, §7 Q3): a collapsed
+  board row — "ran without you" — with a link to the artifact. No
+  pending row, no wait; the §5.5 events still audit every one.
 - **Cloudflare, as the contract expects CAD-367 to classify:**
   preview deploy is `draft` (epic: "preview deploy automatic");
   production deploy is `send` ("production asks"); Workers reads are
   `read`.
+- **AgenticOS, as the contract expects CAD-501 to classify:** the
+  AOS-52 manifest's classes map onto this vocabulary — `read` →
+  `read`; `generate` and reversible `operate` → `draft`; `send`,
+  `spend`, `deploy` → `send`. The manifest's original class is kept as
+  a display `label` on the pending/board row so the card shows what
+  the platform called it. The vocabulary stays exactly three (C1): a
+  manifest class outside the mapping is undeclared, so it gates as
+  `send`.
 - **Undeclared is `send`** (C3): absent from the table, absent field,
   malformed value, or a value outside the vocabulary — all gate as
   send. There is no `none`/`none-needed` class; a tool with truly no
   platform effect does not belong in a platform adapter.
+- **The tool table is pinned to a manifest version.** An adapter
+  declares the platform manifest version its table was reviewed
+  against (AOS-52 for AgenticOS). A call against a mismatched or
+  undeclared manifest version gates as `send` — C3 applied per
+  version.
 - **The declaration is not agent input** (C2): an `effect` argument in
   a call is ignored; a tool descriptor supplied by an agent is not an
   adapter. Declarations change only by reviewed adapter change.
@@ -299,14 +365,18 @@ never bytes.
   platform issues a scoped, revocable credential directly to the
   daemon. No browser cookies are copied. The agent that triggered
   connection sees `connected` or `refused`, nothing else.
-- **Custody backend** is CAD-366's implementation choice within one
-  rule: the store is outside every agent's read confinement
-  (Landlock-guarded for managed agents, §1.2) and mode-restricted on
-  disk; the OS keychain where the host has one (CAD-367 names it),
-  else an `0600` daemon-owned store. The P4 residual stands: a
-  same-uid process that ignores the API can still read a file —
-  custody narrows exposure to offered surfaces, it does not claim a
-  same-uid boundary.
+- **Custody backend** (decided, §7 Q2): the OS keychain is preferred
+  where the host has one (CAD-367 names it); the default is a
+  daemon-owned `0600` store. In both cases the store sits outside
+  every agent's read confinement (Landlock-guarded for managed agents,
+  §1.2). The P4 residual stands: a same-uid process that ignores the
+  API can still read a file — custody narrows exposure to offered
+  surfaces, it does not claim a same-uid boundary.
+- **No personal approval tokens.** Custody holds platform credentials
+  enrolled by the operator — never a token that presses another
+  system's approval on a human's behalf. A personal publish/approve
+  credential is not enrollable; handoffs to another system's own
+  approval are drafts by definition (§5.2).
 - **Per-agent scope grants.** A call is legal only inside the agent's
   grant `(alias, platform, account, scopes)`; the proxy checks the
   grant before any platform traffic and a refusal names the missing
@@ -337,76 +407,115 @@ durable row keyed by an `effect_id`.
 | `effect` | `"send"` — reads and drafts never pend |
 | `input_summary` | one bounded line for list surfaces; secret-guarded like every durable agent text — a credential-shaped span in it refuses the open |
 | `input` | the exact staged call arguments the press approves; no credential field exists |
+| `preview` | the rendered, bounded artifact the press reviews — what the platform will do, in the platform's terms; bounded and secret-guarded like `input_summary` |
+| `source_hash` | optional; the content hash of the reviewed source artifact the send derives from — editing the source after staging cancels the pending effect (step 3) |
+| `label` | optional; the platform's own effect class where it differs from cadence's (§5.2's AgenticOS mapping) — display only, never a gate input |
 | `effect_id` | the durable identity; one effect = one request = one execution |
 | `state` | `waiting` → `decided` → `executing` → `done` / `failed`, or `closed`, or `reconcile` |
-| `decision` | `{by, at, reason?}` — `by` is the verified presser |
-| `outcome` | the platform result or platform error, parked as the request answer |
+| `decision` | `{by, at, reason?}` — `by` is `{member, role, rule}`, the verified presser; v1 `member` is the operator, `rule` `operator-only`. The shape leaves room for policy and team release (§6) without a format change |
+| `outcome` | `{result \| error, verified}` — the platform outcome, parked as the request answer and delivered as a message; `verified` is `true`/`false`/`unknown` from the adapter's read-back against the approved input (step 6) |
 
 **Lifecycle:**
 
 1. **Stage.** A send-class call does not fire. The proxy records the
-   row `waiting`, opens the `kind:"effect"` request, sets the agent
-   `waiting_input`, and notifies the upstream PM once — the existing
-   dedupe means a retried open can never double-notify or double-stage.
-   Whether the open rides `request_open` from the agent's MCP bridge
-   (already bound to the owning connection by CAD-376) or is created
-   internally by the executor is CAD-366's choice; the representation
-   is fixed by this contract either way.
+   row `waiting`, opens the `kind:"effect"` request, notifies the
+   upstream PM once — the existing dedupe means a retried open can
+   never double-notify or double-stage — and **returns `staged` with
+   the `effect_id` to the caller at once.** The turn may end; no
+   waiter is required or assumed. A caller may still park on
+   `request_wait` for a short interactive send — waiting is the
+   caller's choice, never a lifecycle assumption (§3.6). Whether the
+   open rides `request_open` from the agent's MCP bridge (already
+   bound to the owning connection by CAD-376) or is created internally
+   by the executor is CAD-366's choice; the representation is fixed by
+   this contract either way.
 2. **Surface.** `agent_requests` lists it; the overview/board row shows
-   platform, tool, summary and input for review. What the press
-   approves is *this input* — there is no re-prompt path that could
-   swap bytes after approval.
-3. **Press.** `agent_respond` on an effect request takes
-   `accept`|`decline` and `reason`. **Accept is operator-only** — a
+   platform, tool, `label`, summary, the rendered `preview` and the
+   input for review. What the press approves is *this input* — and,
+   when `source_hash` is set, this exact artifact — there is no
+   re-prompt path that could swap bytes after approval.
+3. **Source invalidation.** While a row is `waiting`, editing the
+   source artifact a `source_hash` was taken from cancels the pending
+   effect: the row closes with the reason named (`source_changed`)
+   and the board explains it. The check runs again inside Execute — a
+   press that races an uncaught edit re-verifies the hash before
+   firing and cancels instead of executing.
+4. **Press.** `agent_respond` on an effect request takes
+   `accept`|`decline` and `reason`. **Release requires a verified
+   human authorised for the effect's scope** (decided, §7 Q1): v1 has
+   exactly one — the operator — so `accept` is operator-only, a
    narrowing of `authorize_respond`'s CAD-370 rule (operator or the
-   requester's PM) for this kind: the epic's "operator press" is taken
-   literally, and §7 Q1 asks the operator to confirm. Decline stays
-   operator-or-PM — anyone authorized can refuse; only the operator
-   releases.
-4. **Execute.** On `accept` — recorded durably *before* the platform
+   requester's PM) for this kind. **Decline stays open to anyone
+   authorised**, the requester's PM included — anyone authorised can
+   refuse; only an authorised human releases. **An agent never
+   releases** — including a PM that is itself an agent.
+   `decision.by` records `{member, role, rule}` so the later
+   extensions of §6 fit without a format change.
+5. **Execute.** On `accept` — recorded durably *before* the platform
    call fires — the proxy executes the staged input with the custody
-   credential and parks the outcome as the request answer. On
-   `decline` it parks the reason; nothing executes. The waiting call
-   returns the answer; a platform failure is `failed` (the effect ran
-   and failed), distinct from `declined` (it never ran).
-5. **Deadline.** The requester's deadline closes the row; a
-   boundary-parked answer still lands, per the existing
+   credential. Every write the adapter sends carries an **idempotency
+   key** derived from the `effect_id` (C9), so a retried press or
+   delivery can never double-fire, plus the **expected content hash**
+   where the platform supports one. On `decline` it parks the reason;
+   nothing executes.
+6. **Outcome.** The outcome — platform result or platform error — is
+   the request answer, **delivered as a message to the task or the
+   PM** whether or not anyone is waiting; a dependent step completes
+   on that message. After the platform call the adapter **reads back
+   and compares with the approved input**; `outcome.verified` is
+   `true`, `false` or `unknown` (some platforms offer no read-back).
+   `verified:false` raises a **Needs-you** item — the press ran but
+   platform state does not match what was approved. `failed` (the
+   effect ran and failed) stays distinct from `declined` (it never
+   ran) and from `closed`/`source_changed` (cancelled before release).
+7. **Deadline.** With asynchronous staging there may be no waiter: the
+   durable row owns the lifecycle, so a caller's deadline or exit ends
+   only its wait — the row stays `waiting` for a press, and a pending
+   effect that outlives its usefulness is closed by `decline` or by
+   credential revocation (§5.3), not by the caller going away. A
+   boundary-parked answer still lands per the existing
    mailbox-before-remove ordering. And because execution keys on the
    durable `decision`, not on the waiter, a press that lands in the
-   boundary window still counts: the operator's accept is
+   boundary window still counts: the authorised human's accept is
    authoritative whether or not the agent is still waiting.
-6. **Restart.** Today's pending map is in-memory and a restart reads
+8. **Restart.** Today's pending map is in-memory and a restart reads
    `closed` — safe for approvals, which fail closed. For effects the
    dangerous edge is `accept` recorded, execution unproven. So the
-   effect row is durable: `waiting` rows re-park after restart;
-   `decided(accept)` without a recorded outcome reconciles as
-   `unknown`/`reconcile` on the board for an operator decision —
-   **never re-fired automatically**, because the platform call may
-   have happened. Ambiguous outcomes stop for reconciliation; that is
-   the standing cadence rule for non-atomic side effects, applied here.
-7. **Exactly once.** One `effect_id` executes once: handle dedupe
-   covers transport retries, the durable row covers restart, and
-   step 6 covers the ambiguous window. Where a platform offers its own
-   idempotency key the adapter attaches it; where it does not, the row
-   is the guarantee and reconciliation is the honest remainder.
+   effect row is durable: `waiting` rows re-park after restart —
+   including rows whose caller has long ended — and `decided(accept)`
+   without a recorded outcome reconciles as `unknown`/`reconcile` on
+   the board for an operator decision — **never re-fired
+   automatically**, because the platform call may have happened.
+   Ambiguous outcomes stop for reconciliation; that is the standing
+   cadence rule for non-atomic side effects, applied here.
+9. **Exactly once.** One `effect_id` executes once: handle dedupe
+   covers transport retries, the durable row covers restart, the
+   idempotency key on every write covers platform-level retry, and
+   step 8 covers the ambiguous window. Where a platform offers its own
+   idempotency key the adapter attaches it (C9 requires one
+   regardless); where it does not, the row is the guarantee and
+   reconciliation is the honest remainder.
 
-**What an agent can never do:** hold credential bytes; execute a send
+**What an agent can never do:** hold credential bytes — including a
+personal approval token for another system's press; execute a send
 (custody makes it structural, not policed); declare or alter an
 effect class; widen its own grants; answer its own pending effect —
-and for `kind:"effect"`, its PM cannot release either (step 3); learn
-a credential from an error or row (redaction and the secret guard ride
-every field).
+and for `kind:"effect"` no agent may release at all, so a PM that is
+itself an agent can decline but never press (step 4); learn a
+credential from an error, preview or row (redaction and the secret
+guard ride every field).
 
 ### 5.5 Audit
 
 Events, all carrying fingerprints and handles, never secrets:
 `platform_connected` / `platform_disconnected`, `scope_granted` /
 `scope_revoked`, `effect_requested` (the `request_opened` event with
-`kind:"effect"`), `effect_decided` `{by, decision, reason?}`,
-`effect_executed` / `effect_failed` `{outcome summary}`,
-`credential_revoked`. The chain from request row → decision → outcome
-is the audit story for every send, and `docs/AUDIT.md` gains these
-event names when CAD-366 lands.
+`kind:"effect"`), `effect_decided` `{by, decision, reason?}` — `by`
+carrying `{member, role, rule}` — `effect_executed` / `effect_failed`
+`{outcome summary, verified}`, `effect_cancelled` `{reason}` (e.g.
+`source_changed`), `credential_revoked`. The chain from request row →
+decision → outcome is the audit story for every send, and
+`docs/AUDIT.md` gains these event names when CAD-366 lands.
 
 ### 5.6 The shared fixture
 
@@ -414,44 +523,74 @@ AOS-49 requires a "contract fixture shared with Cadence P4". The
 fixture is a machine-readable copy of this contract — the tool-table
 schema (`{tool, effect, scopes}`), the pending-effect record schema,
 and worked vectors (a declared read executes; an undeclared tool
-parks; a send parks then executes on accept; a decline never fires) —
-produced by CAD-366 and consumed by both repos' test suites. This ADR
-names it; it does not ship it.
+parks; a send parks then executes on accept; a decline never fires; a
+send returns `staged` and its outcome arrives later as a message;
+editing a hashed source artifact cancels the pending effect; a
+read-back mismatch sets `verified:false` and raises a Needs-you
+item) — produced by CAD-366 and consumed by both repos' test suites.
+This ADR names it; it does not ship it.
 
 ## 6. Consequences and residuals
 
-- **CAD-366 builds:** the custody store, the grant records, the proxy
-  (effect check → execute or stage), the durable pending-effect row
-  and its restart reconciliation, the `kind:"effect"` request
-  extension, and the §5.6 fixture.
+- **CAD-366 builds:** the custody store (keychain where available,
+  daemon-owned `0600` default — always outside every agent's read
+  confinement), the grant records including per-account handles and
+  project defaults, the proxy (effect check → execute or stage), the
+  durable pending-effect row with `preview` and `source_hash`, the
+  `staged` return and outcome-as-message delivery, the source-edit
+  cancel, the adapter read-back verifier and its Needs-you raise, the
+  restart reconciliation, the `kind:"effect"` request extension, and
+  the §5.6 fixture.
 - **CAD-367 builds:** the Cloudflare adapter and tool table (preview
   `draft`, production `send`), keychain custody of the Workers-scoped
   token, and the consolidated platforms UI (live/partial/planned
-  services, the access matrix on grants, pending-effect rows).
+  services, the access matrix on grants, pending-effect rows with
+  rendered previews, collapsed "ran without you" draft rows).
+- **CAD-501 builds:** the AgenticOS v2 adapter — consent exchange per
+  AOS-49, the pinned AOS-52 manifest with §5.2's class mapping and
+  `label` display, submit-for-review tools classified `draft`.
 - **AgenticOS v2** implements the same contract from AOS-49's side and
   validates against the same fixture.
+- **Out of scope:** GitHub and the merge queue keep their own
+  controls; this contract does not cover them.
+- **Future extensions the record already leaves room for:** batch
+  release (one press on a digest of pending effects); **policy
+  release** — an operator-signed standing rule, narrow in tool and
+  condition, recorded as `decision.by = policy:<id>` and audited like
+  a human press; standing approvals; and team approvals — members,
+  roles, per-scope release rules, two-person, not-author, delegation —
+  in their own ADR extending ADR 0005 (CAD-504). `decision.by`'s
+  `{member, role, rule}` shape admits all of them without a format
+  change.
 - **Residuals, honestly:** same-uid reads of the custody store (P4);
   a misdeclared tool is only caught at review (§5.2); a platform
   outage between accept and execution reconciles rather than retries,
   so an accepted send can legitimately land `unknown` for a human to
-  finish.
+  finish; and read-back verification is only as strong as the
+  platform's observability — `verified:unknown` is a legitimate
+  steady state where no read-back exists.
 
-## 7. Questions for the operator
+## 7. The operator's decision
 
-- **Q1 — Press authority.** §5.4 step 3 narrows `agent_respond` for
-  `kind:"effect"` to the proven operator only; today a requester's own
-  PM may also answer (CAD-370). The epic says "operator press" — this
-  ADR reads it literally. Confirm, or say that a PM may release sends
-  (and whether that holds when the PM is itself an agent).
-- **Q2 — Custody backend preference.** CAD-367's acceptance says
-  "Workers-scoped token in the keychain". §5.3 leaves the backend to
-  CAD-366 (keychain where available, `0600` store otherwise). Say if
-  keychain is *required* on hosts that have one, or advisory.
-- **Q3 — Draft visibility.** Drafts execute without a press. §5.5
-  still audits every one. Should a `draft` also surface on the board
-  as an informational row (a soft notice, no wait), or is the event
-  log enough until the platforms UI lands?
-- **Q4 — Scope of "account".** §5.1 makes `account` part of custody
-  and grants (e.g. work vs personal Cloudflare). Confirm one platform
-  may hold several enrolled accounts, each with its own grants — the
-  UI ticket's "access matrix" assumes so.
+The four questions this ADR put to the operator were decided in chat
+on 2026-09-25 and are recorded on CAD-365; the amendments that
+accompanied them are folded into §5 and §6. This section keeps the
+Q&A as the decision record.
+
+- **Q1 — Press authority.** *Decided.* Releasing a send requires a
+  verified human authorised for its scope. v1 has one such person —
+  the operator — so release is operator-only. Anyone authorised, the
+  PM included, may decline. Agents never release — including a PM
+  that is itself an agent. `decision.by` is `{member, role, rule}` so
+  team approvals can extend it without a format change; teams
+  (members, roles, per-scope release rules, two-person, not-author,
+  delegation) come in their own ADR extending ADR 0005 — CAD-504.
+- **Q2 — Custody backend.** *Decided.* The OS keychain is preferred
+  where the host has one; the default is a daemon-owned `0600` store.
+  Both sit outside every agent's read confinement (§5.3).
+- **Q3 — Draft visibility.** *Decided.* Drafts appear on the board as
+  information only — a collapsed "ran without you" row with a link to
+  the artifact. No wait (§5.2).
+- **Q4 — Scope of "account".** *Decided.* A platform may hold several
+  enrolled accounts, each with its own grants; a project names a
+  default account (§5.1).
