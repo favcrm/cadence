@@ -1962,15 +1962,27 @@ if cmd == "capture-pane":
     out = ""
     try: out += open(sess_path(name, "screen")).read()
     except FileNotFoundError: die("no such session")
-    # The input line renders like the TUI's own: the pane's `.glyph`
-    # file (written by its TUI; `❭` is the Devin default) + staged draft.
-    try:
-        staged = open(sess_path(name, "input")).read()
-        if staged:
-            try: glyph = open(sess_path(name, "glyph")).read().strip() or "❭"
-            except FileNotFoundError: glyph = "❭"
-            out += glyph + " " + staged + "\n"
+    # The TUI chrome row directly above the input box — the busy
+    # spinner or the `Press Enter to send queued messages` invitation.
+    # A `.status` file holds it verbatim (written by the test or by the
+    # pane's own TUI when it queues a mid-turn send).
+    try: out += open(sess_path(name, "status")).read()
     except FileNotFoundError: pass
+    # The input line renders like the TUI's own: the pane's `.glyph`
+    # file (written by its TUI; `❭` is the Devin default) + staged
+    # draft. With no staged draft, a `.inputbox` file is the box's own
+    # placeholder text — the busy `Guide Devin` box keeps an editable
+    # input row on screen while the idle box's placeholder lives in
+    # the screen file itself.
+    try: staged = open(sess_path(name, "input")).read()
+    except FileNotFoundError: staged = ""
+    if not staged:
+        try: staged = open(sess_path(name, "inputbox")).read()
+        except FileNotFoundError: pass
+    if staged:
+        try: glyph = open(sess_path(name, "glyph")).read().strip() or "❭"
+        except FileNotFoundError: glyph = "❭"
+        out += glyph + " " + staged + "\n"
     # Test-controlled extra screen content — a file the test writes to
     # make the pane look busy, approval-blocked, etc. A `tui-once` file
     # replaces it for exactly one capture: the rename claims it
@@ -2051,6 +2063,29 @@ locks = sys.argv[1]
 sid = sys.argv[sys.argv.index("-r") + 1] if "-r" in sys.argv else \
     "mock-session-%d" % os.getpid()
 os.makedirs(locks, exist_ok=True)
+def awrite(path, text):
+    # Atomic write — a capture-pane reader sees whole content or none.
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f: f.write(text)
+    os.rename(tmp, path)
+def aappend(path, text):
+    try: cur = open(path).read()
+    except OSError: cur = ""
+    awrite(path, cur + text)
+pane = os.environ["FAKE_PANE"]
+# An untrusted folder parks the TUI on its directory-trust select
+# before any session exists — `<pane>.trust` models it; deleting the
+# file is the answered prompt, and the TUI redraws and continues.
+if os.path.exists(pane + ".trust"):
+    awrite(pane + ".screen",
+        "Mock Devin TUI\n"
+        "Do you trust the files in this folder?\n\n"
+        "❭ 1 Yes, trust this folder\n"
+        "· 2 No, do not trust\n\n"
+        "↓↑ to select · ↵ confirm · esc cancel\n")
+    while os.path.exists(pane + ".trust"):
+        time.sleep(0.1)
+    awrite(pane + ".screen", "")
 lf = open(os.path.join(locks, sid + ".lock"), "a")
 try:
     fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -2069,15 +2104,6 @@ open(_env_tmp, "w").write(
         os.environ.get("CADENCE_ALIAS", ""),
         os.environ.get("CADENCE_STATE_DIR", "")))
 os.rename(_env_tmp, os.environ["FAKE_PANE"] + ".env")
-def awrite(path, text):
-    # Atomic write — a capture-pane reader sees whole content or none.
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f: f.write(text)
-    os.rename(tmp, path)
-def aappend(path, text):
-    try: cur = open(path).read()
-    except OSError: cur = ""
-    awrite(path, cur + text)
 def memory_rpc():
     # Test-only bridge: the lockholding provider process opens the real
     # daemon socket, so SO_PEERCRED and /proc ancestry see this pane rather
@@ -2126,10 +2152,30 @@ while True:
         data = ""
     if "<ENTER>" in data:
         text, rest = data.split("<ENTER>", 1)
+        queued = os.environ["FAKE_PANE"] + ".queue"
+        busy_box = os.path.exists(os.environ["FAKE_PANE"] + ".inputbox")
         if os.path.exists(os.environ["FAKE_PANE"] + ".hold-enter"):
             # Enter swallowed: the marker is consumed but the draft
             # stays staged in the input line, unsubmitted.
             awrite(inp, text + rest)
+        elif busy_box and text.strip():
+            # The busy guide box: Enter only *queues* the draft — the
+            # TUI then invites one more Enter to send it into the
+            # running turn (`Press Enter to send queued messages`).
+            awrite(inp, rest)
+            awrite(queued, text.strip())
+            awrite(os.environ["FAKE_PANE"] + ".status",
+                   "Press Enter to send queued messages\n")
+        elif busy_box and os.path.exists(queued):
+            # The flush Enter: queued text joins the running turn and
+            # echoes into the transcript like a normal submit.
+            awrite(inp, rest)
+            flushed = open(queued).read()
+            os.unlink(queued)
+            awrite(os.environ["FAKE_PANE"] + ".status",
+                   "⠸ Thinking · 1s (esc twice to interrupt)\n")
+            aappend(os.environ["FAKE_PANE"] + ".screen",
+                    "> %s\nMOCK_REPLY: %s\n" % (flushed, flushed))
         else:
             awrite(inp, rest)
             if text.strip():

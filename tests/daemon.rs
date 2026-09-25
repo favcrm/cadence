@@ -2727,40 +2727,44 @@ fn message_cancel_queued_lifecycle() {
     assert_eq!(d.message_state("w1", "m-q"), "cancelled");
 }
 
+/// The gate-side of `message_cancel` needs a profile that still
+/// requires `agent ready` — Devin's verified idle probe is itself the
+/// claim (CAD-520), so this runs on the stub.
 #[test]
 fn message_cancel_gate_pty_and_running_refusal() {
     let d = TestDaemon::start();
-    let mock = d.mock_devin();
-    d.register_devin("dv1", None);
-    d.wait_agent("dv1", "idle", 20);
+    let mock = d.mock_stub();
+    d.register_stub("st1", json!({}));
+    d.wait_agent("st1", "idle", 20);
 
     // Queued behind the ready gate: the message is durable but the pane
     // has not been claimed.
-    d.send("dv1", json!({"text": "first", "message": "m1"}))
+    d.send("st1", json!({"text": "first", "message": "m1"}))
         .unwrap();
     // Wait for m1's own recorded refusal, not a fixed sleep: the actor
     // takes the send at once and the gate may still be probing, and a
     // cancel is refused unless the message is back to `queued` (CAD-293).
-    d.wait_event_where("dv1", "gate_wait", |e| e["payload"]["message"] == "m1", 20);
-    assert_eq!(d.message_state("dv1", "m1"), "queued");
+    d.wait_event_where("st1", "gate_wait", |e| e["payload"]["message"] == "m1", 20);
+    assert_eq!(d.message_state("st1", "m1"), "queued");
     d.operator_rpc("message_cancel", json!({"message": "m1", "reason": "typo"}))
         .unwrap();
-    assert_eq!(d.message_state("dv1", "m1"), "cancelled");
+    assert_eq!(d.message_state("st1", "m1"), "cancelled");
 
     // A ready claim now must NOT paste m1 — the gate only releases a
     // queued message.
-    d.operator_rpc("agent_ready", json!({"alias": "dv1"}))
+    d.operator_rpc("agent_ready", json!({"alias": "st1"}))
         .unwrap();
 
     // The claim stays outstanding, so the next queued message delivers
     // normally.
-    d.send("dv1", json!({"text": "second", "message": "m2"}))
+    d.send("st1", json!({"text": "second", "message": "m2"}))
         .unwrap();
-    let token = pty_token(&d, "dv1", "m2");
+    let token = pty_token(&d, "st1", "m2");
     // m2 consumed the one claim, so m1 never did: no trace of it on the
     // screen or in the input line (a pasted m1 would sit in either).
-    let pane = std::fs::read_to_string(d.pane_file(&mock, "dv1", "screen")).unwrap_or_default()
-        + &std::fs::read_to_string(d.pane_file(&mock, "dv1", "input")).unwrap_or_default();
+    let pane = std::fs::read_to_string(d.stub_pane_file(&mock, "st1", "screen"))
+        .unwrap_or_default()
+        + &std::fs::read_to_string(d.stub_pane_file(&mock, "st1", "input")).unwrap_or_default();
     assert!(!pane.contains("first"), "{pane}");
 
     // A running turn refuses — interruption happens at the provider.
@@ -2772,7 +2776,7 @@ fn message_cancel_gate_pty_and_running_refusal() {
         "{err}"
     );
     d.report("m2", &token, "result", "done").unwrap();
-    d.wait_message("dv1", "m2", &["completed"], 15);
+    d.wait_message("st1", "m2", &["completed"], 15);
 }
 
 #[test]
