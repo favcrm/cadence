@@ -14,6 +14,7 @@ import Workflows from "./features/projects/Workflows";
 import Sidebar from "./ui/Sidebar";
 import Link from "./ui/Link";
 import SectionTabs from "./ui/SectionTabs";
+import StatusChips from "./ui/StatusChips";
 import ThemeToggle from "./ui/ThemeToggle";
 import Setup from "./features/setup/Setup";
 import SetupNudge from "./features/setup/SetupNudge";
@@ -423,48 +424,17 @@ export default function App() {
           </div>
 
           <div className="ml-auto flex items-center gap-2 shrink-0">
-            {boardReadOnly && (
-              <span
-                className="chip bg-warn/10 text-warn"
-                title="the server refuses every write — browsing only"
-              >
-                read-only
-              </span>
-            )}
-            <SignIn meta={meta} onChange={refresh} />
-            {health && (
-              <span
-                className={`chip ${
-                  health.daemon === "reachable"
-                    ? "bg-ink-800 text-ink-400"
-                    : "bg-warn/10 text-warn"
-                }`}
-                title={
-                  health.daemon === "reachable"
-                    ? "daemon socket reachable"
-                    : "daemon socket unreachable — runtime strip is empty"
-                }
-              >
-                <span className="hidden sm:inline">daemon </span>
-                {health.daemon}
-              </span>
-            )}
-            <button
-              onClick={refresh}
-              className="chip bg-accent/10 text-accent hover:bg-accent/20 transition-colors"
-              title="re-read the folders — writes also land here from the API"
+            <StatusChips
+              variant="header"
+              readOnly={boardReadOnly}
+              mayWrite={!readOnly}
+              health={health}
+              actor={actor}
+              onRefresh={refresh}
             >
-              refresh
-            </button>
+              <SignIn meta={meta} onChange={refresh} />
+            </StatusChips>
             <ThemeToggle />
-            {!readOnly && (
-              <span
-                className="hidden sm:inline-flex chip bg-ink-800 text-ink-400"
-                title={`writes commit to the tracker as ${actor}`}
-              >
-                writes: {actor}
-              </span>
-            )}
           </div>
         </header>
 
@@ -526,6 +496,21 @@ export default function App() {
                   </span>
                 </Link>
               ))}
+            </div>
+            {/* The header carries these as icons under lg — here they keep
+                their words, so the meaning is one tap away on touch. */}
+            <div className="slabel pt-2">board</div>
+            <div className="flex flex-wrap items-center gap-1.5">
+              <StatusChips
+                variant="menu"
+                readOnly={boardReadOnly}
+                mayWrite={!readOnly}
+                health={health}
+                actor={actor}
+                onRefresh={refresh}
+              >
+                <SignIn meta={meta} onChange={refresh} />
+              </StatusChips>
             </div>
           </nav>
         )}
