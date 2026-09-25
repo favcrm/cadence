@@ -400,6 +400,18 @@ mod tests {
     /// the parent turns it into a loud skip, not a vacuous pass.
     const SKIP: i32 = 42;
 
+    /// A loud skip — and under `CADENCE_PROVISION_RUNBOOK=1` an
+    /// exit-42 failure: the T1 runbook treats "could not test" as
+    /// failed acceptance, so a sweep that cannot seat fd 65537 can
+    /// never pass vacuously there.
+    fn skipped(why: &str) {
+        if std::env::var_os("CADENCE_PROVISION_RUNBOOK").is_some() {
+            eprintln!("SKIP→FAIL(42): {why}");
+            std::process::exit(42);
+        }
+        eprintln!("SKIP: {why}");
+    }
+
     /// The acceptance shape for the fd sweep: a descriptor seated at
     /// or above 65537 (the pre-CAD-522 clamp line) must not survive.
     /// RLIMIT permitting — the child raises its soft limit to the hard
@@ -440,7 +452,7 @@ mod tests {
     #[test]
     fn close_fds_has_no_65536_clamp() {
         match high_fd_child(close_fds) {
-            SKIP => eprintln!("SKIP: RLIMIT_NOFILE cannot seat fd 65537"),
+            SKIP => skipped("RLIMIT_NOFILE cannot seat fd 65537"),
             code => assert_eq!(code, 0, "fd >= 65537 survived close_fds"),
         }
     }
@@ -448,7 +460,7 @@ mod tests {
     #[test]
     fn procfs_sweep_has_no_65536_clamp() {
         match high_fd_child(close_fds_via_procfs) {
-            SKIP => eprintln!("SKIP: RLIMIT_NOFILE cannot seat fd 65537"),
+            SKIP => skipped("RLIMIT_NOFILE cannot seat fd 65537"),
             code => assert_eq!(code, 0, "fd >= 65537 survived the procfs sweep"),
         }
     }
