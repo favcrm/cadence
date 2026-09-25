@@ -88,12 +88,14 @@ use crate::issue::Pm;
 /// The master's alias — and its agent slug.
 pub const ALIAS: &str = "master";
 
-/// The providers `master start` accepts — `claude` only for the MVP: a
-/// Codex master waits for a read-only sandbox with its writes through
-/// daemon verbs. The setup wizard (CAD-448) offers exactly this list
-/// with each one's exact start command, so the daemon's refusal and
-/// the wizard's offer stay in one place.
-pub const PROVIDERS: &[&str] = &["claude"];
+/// The providers `master start` accepts — `claude`, and `pi` since
+/// CAD-322 (managed `pi --mode rpc`, same Landlock confinement and
+/// cadence-command-only posture). A Codex master waits for a read-only
+/// sandbox with its writes through daemon verbs. The setup wizard
+/// (CAD-448) offers exactly this list with each one's exact start
+/// command, so the daemon's refusal and the wizard's offer stay in one
+/// place.
+pub const PROVIDERS: &[&str] = &["claude", "pi"];
 /// The agent files the briefing is built from, in briefing order.
 pub const FILES: [&str; 2] = ["SOUL.md", "AGENT.md"];
 /// Size caps from the agent-filesystem design record (characters).
@@ -497,6 +499,128 @@ pub fn has_login(state_dir: &Path) -> bool {
     claude_config_dir(state_dir)
         .join(".credentials.json")
         .is_file()
+}
+
+/// The env var naming `provider`'s config dir (`CLAUDE_CONFIG_DIR`,
+/// `PI_CODING_AGENT_DIR`) — used to find the operator's own login for
+/// `--copy-login`.
+pub fn provider_config_env(provider: &str) -> &'static str {
+    match provider {
+        "pi" => "PI_CODING_AGENT_DIR",
+        _ => "CLAUDE_CONFIG_DIR",
+    }
+}
+
+/// The provider's private config dir under the state dir — where its
+/// login lives (Claude: `master/claude`; Pi: `master/pi`, CAD-322).
+pub fn provider_config_dir(provider: &str, state_dir: &Path) -> PathBuf {
+    match provider {
+        "pi" => crate::adapter::pi::pi_config_dir(state_dir),
+        _ => claude_config_dir(state_dir),
+    }
+}
+
+/// Does the master's config dir hold a login for `provider`? For Pi
+/// the file must also be a non-empty object: an `auth.json` of `{}`
+/// (created by a bare `pi` run) proves nothing (CAD-322). Only shape
+/// is checked — contents are credentials, never read into logs.
+pub fn has_login_for(provider: &str, state_dir: &Path) -> bool {
+    match provider {
+        "pi" => std::fs::read_to_string(provider_config_dir("pi", state_dir).join("auth.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            .and_then(|v| v.as_object().map(|o| !o.is_empty()))
+            .unwrap_or(false),
+        _ => has_login(state_dir),
+    }
+}
+
+/// The command that gives the master its own login for `provider`.
+/// Pi has no non-interactive login verb — the operator runs the TUI
+/// against the master's config dir and types `/login`.
+pub fn login_command_for(provider: &str, state_dir: &Path) -> String {
+    match provider {
+        "pi" => format!(
+            "PI_CODING_AGENT_DIR={} pi  # then type /login",
+            provider_config_dir("pi", state_dir).display()
+        ),
+        _ => login_command(state_dir),
+    }
+}
+
+/// Create the master's provider config dir (0700); report whether it
+/// holds a login for `provider`. Copies nothing.
+pub fn ensure_config_dir_for(provider: &str, state_dir: &Path) -> Result<Login> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let dir = provider_config_dir(provider, state_dir);
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    Ok(if has_login_for(provider, state_dir) {
+        Login::Own
+    } else {
+        Login::None
+    })
+}
+
+/// `master start --copy-login` for `provider`: Claude copies the
+/// `claudeAiOauth` entry of `.credentials.json`; Pi copies the whole
+/// `auth.json` (its only credential file). Never via env or argv.
+pub fn copy_login_for(provider: &str, state_dir: &Path, operator_config: &Path) -> Result<Login> {
+    if provider != "pi" {
+        return copy_login(state_dir, operator_config);
+    }
+    use std::os::unix::fs::OpenOptionsExt;
+    if ensure_config_dir_for("pi", state_dir)? == Login::Own {
+        return Ok(Login::Own);
+    }
+    let dir = provider_config_dir("pi", state_dir);
+    let target = dir.join("auth.json");
+    let Ok(text) = std::fs::read_to_string(operator_config.join("auth.json")) else {
+        return Ok(Login::None);
+    };
+    if serde_json::from_str::<Value>(&text)
+        .ok()
+        .filter(Value::is_object)
+        .and_then(|v| v.as_object().map(|o| !o.is_empty()))
+        != Some(true)
+    {
+        // An empty or unreadable auth.json is no login.
+        return Ok(Login::None);
+    }
+    let tmp = dir.join("auth.json.tmp");
+    let _ = std::fs::remove_file(&tmp);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    std::io::Write::write_all(&mut file, text.as_bytes())?;
+    file.sync_all()?;
+    std::fs::rename(&tmp, &target)?;
+    Ok(Login::Copied)
+}
+
+/// The operator's own config dir for `provider` (for `--copy-login`):
+/// Claude honours `CLAUDE_CONFIG_DIR`, Pi honours
+/// `PI_CODING_AGENT_DIR` (default `~/.pi/agent`).
+pub fn operator_provider_config(
+    provider: &str,
+    config_dir: Option<String>,
+    home: Option<String>,
+) -> Option<PathBuf> {
+    match provider {
+        "pi" => config_dir
+            .filter(|d| !d.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                home.filter(|h| !h.is_empty())
+                    .map(|h| Path::new(&h).join(".pi").join("agent"))
+            }),
+        _ => operator_claude_config(config_dir, home),
+    }
 }
 
 /// Create the master's config dir, or tighten an existing one, to 0700;
