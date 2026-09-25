@@ -431,3 +431,24 @@ and `--merge-report <path>` substitute the notes directory and every
 `gh` call (`{"prs": […], "statuses": {"<sha>": {…}}}`). A malformed
 fixture is a hard error — a fixture can never fall back to a live
 scan, and in fixture mode `gh` is never invoked.
+
+## Platform custody events (ADR 0006 §5.5, CAD-366)
+
+Connected-platform custody verbs write their audit to a dedicated
+stream, `audit:platforms` — like `audit:approvals` the name is no
+valid agent alias, so `agent rm` cannot delete it and no retention
+prune names it. Payloads carry platform/account handles, scope names
+and credential `fingerprint`s (the SHA-256 prefix `src/secret` puts
+on findings) — never credential bytes:
+
+| event | when |
+|---|---|
+| `platform_connected` | the operator enrolled a credential (also a rotate's re-enrollment, `rotated: true`); carries `custody_risk_accepted:"same-uid"` when the operator enrolled under `accept_same_uid_risk` — custody was same-uid readable by managed agents and the daemon reported no isolation mode (ADR 0006 P4 residual) |
+| `platform_disconnected` | the operator revoked a credential; carries `effects_closed` — the pending effects the revocation closed (none before CAD-506) |
+| `scope_granted` | the operator granted an agent scopes on `(platform, account)` |
+| `scope_revoked` | the operator revoked scopes off a grant, or a credential revoke dropped the grant with it |
+| `credential_revoked` | the credential itself left custody — a `revoke` (with `reason`) or a `rotate` (reason `rotated`, old fingerprint) |
+| `platform_default_set` | the operator named a project's default account for a platform |
+
+`cadence agent events` does not show this stream (it is no agent's);
+read it read-only from the store, as `audit:approvals` is read.

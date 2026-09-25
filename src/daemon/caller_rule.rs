@@ -397,6 +397,49 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         "operator_secret_rotate",
         Rule::Handler("operator_with_secret: operator proof AND the operator secret (CAD-313)"),
     ),
+    // CAD-366: platform custody and grants (ADR 0006 §5.3) — every
+    // custody write is the operator's alone; the reads bind an agent
+    // caller to its own grants.
+    (
+        "platform_enroll",
+        Rule::Handler("operator_connection (CAD-366)"),
+    ),
+    (
+        "platform_rotate",
+        Rule::Handler("operator_connection (CAD-366)"),
+    ),
+    (
+        "platform_revoke",
+        Rule::Handler("operator_connection (CAD-366)"),
+    ),
+    (
+        "platform_grant",
+        Rule::Handler("operator_connection (CAD-366)"),
+    ),
+    (
+        "platform_ungrant",
+        Rule::Handler("operator_connection (CAD-366)"),
+    ),
+    (
+        "platform_default_set",
+        Rule::Handler("operator_connection (CAD-366)"),
+    ),
+    ("platform_accounts", Rule::Read),
+    ("platform_defaults", Rule::Read),
+    (
+        "platform_grants",
+        Rule::Handler(
+            "grant_caller: an agent reads its own grants; the operator reads \
+             any (CAD-366)",
+        ),
+    ),
+    (
+        "platform_check",
+        Rule::Handler(
+            "grant_caller: an agent checks its own grants; the operator names \
+             the holder (CAD-366)",
+        ),
+    ),
 ];
 
 /// The rule for `method`; `None` for a method the daemon does not

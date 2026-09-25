@@ -24,6 +24,13 @@ use crate::adapter::{pty, registry};
 use crate::error::{Error, Result};
 use crate::proto::identifier;
 
+mod platform;
+pub(crate) use platform::{scope_list, scope_name};
+pub use platform::{
+    CredentialRecord, Grant, ProjectDefault, CREDENTIAL_REVOKED_EVENT, PLATFORM_CONNECTED_EVENT,
+    PLATFORM_DEFAULT_EVENT, PLATFORM_DISCONNECTED_EVENT, PLATFORM_STREAM, SCOPE_GRANTED_EVENT,
+    SCOPE_REVOKED_EVENT,
+};
 mod threads;
 pub use threads::{
     tool_result_summary, tool_summary, NewEntry, Sender, Thread, ThreadEntry, KIND_ASSISTANT_TEXT,
@@ -1643,6 +1650,20 @@ impl Store {
                     tx.execute_batch(&format!("ALTER TABLE messages ADD COLUMN {column} TEXT"))?;
                 }
             }
+            tx.execute(
+                "UPDATE schema_version SET version=?1",
+                [crate::rollout::SCHEMA_VERSION],
+            )?;
+            tx.commit()?;
+        }
+        if version < 17 {
+            // v17: platform custody records, per-agent grants and
+            // project default accounts (CAD-366, ADR 0006 §5.1/§5.3) —
+            // handles and fingerprints only, never credential bytes.
+            // New objects, `IF NOT EXISTS`, one transaction: a
+            // half-applied v17 converges on reopen.
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(platform::SCHEMA_V17)?;
             tx.execute(
                 "UPDATE schema_version SET version=?1",
                 [crate::rollout::SCHEMA_VERSION],
@@ -12414,7 +12435,6 @@ mod tests {
             assert_eq!(new.worktree.as_deref(), Some("/lane/d-1"));
         }
         assert_eq!(version(&db), crate::rollout::SCHEMA_VERSION);
-        assert_eq!(crate::rollout::SCHEMA_VERSION, 16);
         // Half-applied: one column present, version rolled back.
         Connection::open(&db)
             .unwrap()
@@ -12431,5 +12451,75 @@ mod tests {
             );
         }
         assert_eq!(version(&db), crate::rollout::SCHEMA_VERSION);
+    }
+
+    /// v17 adds the platform custody tables (CAD-366, ADR 0006):
+    /// `platform_credentials`, `platform_grants`, `platform_defaults`
+    /// — handles only, never credential bytes. `IF NOT EXISTS`, so a
+    /// v16 store migrates in place and a half-applied v17 converges.
+    #[test]
+    fn migration_v16_to_v17_adds_platform_tables() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("t.sqlite3");
+        std::fs::create_dir(dir.path().join("w")).unwrap();
+        {
+            let s = Store::open(&db).unwrap();
+            reg(&s, "a1", &dir.path().join("w"));
+        }
+        // A genuine v16: no platform tables.
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE platform_credentials;
+                 DROP TABLE platform_grants;
+                 DROP TABLE platform_defaults;
+                 UPDATE schema_version SET version=16;",
+            )
+            .unwrap();
+        let has = |db: &Path, table: &str| -> bool {
+            Connection::open(db)
+                .unwrap()
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()
+                .unwrap()
+                .is_some()
+        };
+        {
+            let s = Store::open_for_schema_tests(&db).unwrap();
+            for table in [
+                "platform_credentials",
+                "platform_grants",
+                "platform_defaults",
+            ] {
+                assert!(has(&db, table), "{table} missing after migrate");
+            }
+            assert!(s.platform_credentials().unwrap().is_empty());
+            assert!(s.platform_grants(None).unwrap().is_empty());
+            assert!(s.platform_defaults().unwrap().is_empty());
+            // The migrated store keeps its pre-v17 rows.
+            assert!(s.agent("a1").unwrap().alias == "a1");
+        }
+        assert_eq!(
+            crate::rollout::SCHEMA_VERSION,
+            17,
+            "bump? pin the new version and add its migration test"
+        );
+        // Half-applied: one table present, version rolled back — the
+        // reopen converges.
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE platform_defaults;
+                 UPDATE schema_version SET version=16;",
+            )
+            .unwrap();
+        {
+            let _ = Store::open_for_schema_tests(&db).unwrap();
+        }
+        assert!(has(&db, "platform_defaults"));
     }
 }

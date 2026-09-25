@@ -1017,6 +1017,10 @@ mod tests {
                 "/s/master/tmp"
             ]
         );
+        // CAD-366: the custody store lives at <state>/custody — never
+        // in a confined read set. The full /s list above asserts it,
+        // this names the boundary the ADR requires.
+        assert!(!all.iter().any(|p| p.starts_with("/s/custody")));
         assert!(!all
             .iter()
             .any(|p| p.starts_with("/dev/pts") || p.ends_with("ptmx")));
