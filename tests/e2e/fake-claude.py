@@ -14,15 +14,18 @@ is a tool subprocess of this process — so the daemon attributes it to
 this agent, as it would a real provider's Bash tool:
 
 - `master`: the operator's "plan a CSV export" -> `plan propose`, then
-  (adversarial) an early `master dispatch` the gate must refuse; "go
-  ahead" -> `master dispatch` for each ticket of its plan; a routed
-  `[question]` -> `master escalate` with a summary; anything else
-  (briefing, routed reports) -> a short acknowledgement.
-- a worker (`w*`): a dispatched ticket -> a `question` report, then it
-  waits (polling `issue show`) for the answer, commits in the ticket's
-  worktree and files `done` with that sha and a PR link. On the
-  operator's `MERGE_PROBE <board> <ID>` it (adversarially) POSTs the
-  board's merge route from a child `curl` and replies with the answer.
+  (adversarial) an early `master dispatch` the gate must refuse; the
+  daemon's `[wake]` that the plan was approved (CAD-445) -> `master
+  dispatch` for each ticket of its plan (the dependency gate refuses
+  the blocked one by name); a routed `[question]` -> `master escalate`
+  with a summary; anything else (briefing, routed reports, later wakes)
+  -> a short acknowledgement.
+- a worker (`w*`): a dispatched ticket -> a `question` report and the
+  turn ends; the daemon's `[answer]` message (CAD-447) carries the
+  operator's answer -> commit in the ticket's worktree and file `done`
+  with that sha and a PR link. On the operator's `MERGE_PROBE <board>
+  <ID>` it (adversarially) POSTs the board's merge route from a child
+  `curl` and replies with the answer.
 - a reviewer (`r*`): a review kickoff -> a `pass` verdict on the head it
   names.
 
@@ -36,7 +39,6 @@ import os
 import re
 import subprocess
 import sys
-import time
 
 LOG_DIR = sys.argv[1]
 ARGV = sys.argv[2:]
@@ -147,12 +149,21 @@ def master_turn(text):
         return "Proposed plan %s (%s) — approve it on the plan card.\n" \
                "Early dispatch of %s: %s" % (got["epic"], ", ".join(plan_tickets),
                                            plan_tickets[0], early)
-    if "go ahead" in text:
+    if text.startswith("[wake]") and "approved" in text:
+        # CAD-445: the daemon's own wake after the operator's Approve —
+        # no operator nudge. Dispatch every ticket of the plan; the
+        # dependency gate refuses the blocked one by name.
         lines = []
         for ticket in plan_tickets:
             rc, out, err = cadence("master", "dispatch", ticket)
             lines.append("%s: %s" % (ticket, "dispatched" if rc == 0 else
                                      "not dispatched — " + (err or out).strip()))
+        # CAD-324: this provider compacted its context mid-session — the
+        # daemon's next message to the master (w1's routed question)
+        # opens with a continuity pack.
+        emit({"type": "system", "subtype": "compact_boundary",
+              "compact_metadata": {"trigger": "auto", "pre_tokens": 140000},
+              "session_id": SID})
         return "Dispatch:\n" + "\n".join(lines) if lines else "No plan to dispatch."
     if text.startswith("[question]"):
         issue = ID.search(text).group(1)
@@ -166,15 +177,9 @@ def master_turn(text):
 
 # ---- worker ---------------------------------------------------------------
 
-def answer_to(issue, question):
-    """The answer report naming `question`, once filed, else None."""
-    rc, out, _ = cadence("issue", "show", issue, "--json", quiet=True)
-    show = as_json(out) or {}
-    reports = show.get("reports") or show.get("task_reports") or []
-    for r in reports:
-        if isinstance(r, dict) and r.get("kind") == "answer" and r.get("answers") == question:
-            return r
-    return None
+# The dispatched ticket's worktree, kept across turns of this process —
+# the kickoff turn files the question, the `[answer]` turn works in it.
+work = {}
 
 
 def merge_probe(text):
@@ -191,6 +196,28 @@ def merge_probe(text):
 def worker_turn(text):
     if text.startswith("MERGE_PROBE "):
         return merge_probe(text)
+    if "[answer]" in text:
+        # CAD-447: the operator's answer arrives as a daemon message —
+        # "[answer] <ID>: operator answered your question <q>.\n
+        # Report: <path> ...\n\n<answer>". The work happens now.
+        issue, repo = work.get("issue"), work.get("worktree")
+        if not issue or not repo:
+            return "Noted."
+        answer = text.split("\n\n", 1)[-1].strip()
+        git = ["git", "-c", "user.name=w1", "-c", "user.email=w1@example.invalid"]
+        with open(os.path.join(repo, "export.csv.txt"), "w") as f:
+            f.write("delimiter: %s\n" % answer)
+        run([*git, "add", "-A"], cwd=repo)
+        run([*git, "commit", "-qm", "%s: CSV export endpoint" % issue], cwd=repo)
+        rc, sha, _ = run(["git", "rev-parse", "HEAD"], cwd=repo)
+        sha = sha.strip()
+        done = "---\nkind: done\nsha: %s\npr: https://github.com/acme/demo/pull/1\n---\n%s" % (
+            sha, REFLECTION)
+        rc, out, err = cadence("report", "file", "--task", issue, "--kind", "done", "--file",
+                               "-", stdin=done)
+        if rc != 0:
+            return "I could not report done: " + (err or out).strip()
+        return "Done %s at %s." % (issue, sha)
     # The dispatch kickoff: "... — <ID>: <title>. Your worktree exists:
     # <path> (branch ...". Anything else is acknowledged.
     m = re.search(r"\b([A-Z][A-Z0-9]{0,9}-\d+): .*?Your worktree exists: (\S+) \(branch", text,
@@ -198,6 +225,7 @@ def worker_turn(text):
     if not m:
         return "Noted."
     issue, worktree = m.group(1), m.group(2)
+    work["issue"], work["worktree"] = issue, worktree
     q = ("---\nkind: question\noptions: [comma, semicolon]\n"
          "impact: the export's delimiter is visible to every user\n---\n"
          "Which delimiter should the CSV export use?\n\n" + REFLECTION)
@@ -208,32 +236,7 @@ def worker_turn(text):
     question = os.path.basename(question)
     if rc != 0 or not question:
         return "I could not ask my question: " + (err or out).strip()
-    say("Asked %s on %s; waiting for the answer." % (question, issue))
-    deadline = time.time() + 300
-    answer = None
-    while time.time() < deadline:
-        answer = answer_to(issue, question)
-        if answer:
-            break
-        say(".")  # keep the turn visibly alive while it waits
-        time.sleep(1)
-    if not answer:
-        return "No answer to %s within 300 s." % question
-    repo = worktree
-    git = ["git", "-c", "user.name=w1", "-c", "user.email=w1@example.invalid"]
-    with open(os.path.join(repo, "export.csv.txt"), "w") as f:
-        f.write("delimiter: %s\n" % (answer.get("body") or "").strip())
-    run([*git, "add", "-A"], cwd=repo)
-    run([*git, "commit", "-qm", "%s: CSV export endpoint" % issue], cwd=repo)
-    rc, sha, _ = run(["git", "rev-parse", "HEAD"], cwd=repo)
-    sha = sha.strip()
-    done = "---\nkind: done\nsha: %s\npr: https://github.com/acme/demo/pull/1\n---\n%s" % (
-        sha, REFLECTION)
-    rc, out, err = cadence("report", "file", "--task", issue, "--kind", "done", "--file", "-",
-                           stdin=done)
-    if rc != 0:
-        return "I could not report done: " + (err or out).strip()
-    return "Done %s at %s." % (issue, sha)
+    return "Asked %s on %s; waiting for the answer." % (question, issue)
 
 
 # ---- reviewer -------------------------------------------------------------
@@ -250,7 +253,31 @@ def reviewer_turn(text):
         "I could not file my verdict: " + (err or out).strip()
 
 
+def split_pack(text):
+    """A continuity pack (CAD-324) precedes the message it rides. The
+    pack names its nonce on the first line and ends at the line
+    `[End of continuity pack <nonce> — the message for this turn
+    follows.]` — the same split the daemon's `continuity::split` does
+    (the header quotes that line mid-sentence, so only a match at a
+    line start ends the pack)."""
+    if not text.startswith("[Cadence continuity pack"):
+        return "", text
+    nonce = text[len("[Cadence continuity pack"):].lstrip().split(" ")[0]
+    if not nonce:
+        return "", text
+    end = ("[End of continuity pack %s — the message for this turn follows.]"
+           % nonce)
+    i = text.find("\n" + end)
+    if i < 0:
+        return "", text
+    j = i + 1 + len(end)
+    return text[:j], text[j:].lstrip("\n")
+
+
 def turn(text):
+    pack, text = split_pack(text)
+    if pack:
+        log("~ continuity pack (%d bytes) rode this prompt" % len(pack))
     if ALIAS == "master":
         return master_turn(text)
     if ALIAS.startswith("w"):
