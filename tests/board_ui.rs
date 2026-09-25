@@ -2007,8 +2007,21 @@ fn cad432_board_started_by_an_agent_cannot_relay_a_move() {
     let pidfile = f.tmp.path().join("agent-board.pid");
     // The worker's tool runs `cadence ui run` in the foreground (the
     // worker stays busy with it); the board is the tool's own child.
+    // CAD-482: on a seam build the board asserts its agent's identity
+    // on the process itself (`CADENCE_TEST_AS`), so `board_is_operator`
+    // answers the same in a pane and in CI; a non-seam build keeps the
+    // ambient ancestry path.
+    let seam_env = if cfg!(feature = "test-seam") {
+        format!(
+            "{}=1 {}=agent:wk ",
+            cadence_agent::test_seam::ARM_ENV,
+            cadence_agent::test_seam::AS_ENV
+        )
+    } else {
+        String::new()
+    };
     let script = format!(
-        "echo $$ > {pid}; exec env CADENCE_PM_DIR={pm} {bin} --state-dir {state} ui run --port {port}",
+        "echo $$ > {pid}; exec env {seam_env}CADENCE_PM_DIR={pm} {bin} --state-dir {state} ui run --port {port}",
         pid = pidfile.display(),
         pm = f.pm_dir.display(),
         bin = env!("CARGO_BIN_EXE_cadence"),

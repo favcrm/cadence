@@ -379,12 +379,30 @@ impl DeliverySync {
                 }
             };
             self.tick(trigger, || {
-                self.pass(&state_dir, &pm_dir, || {
-                    super::home::board_is_operator(
-                        &state_dir,
-                        self.seam_armed.load(Ordering::Relaxed),
+                let pass = || {
+                    self.pass(&state_dir, &pm_dir, || {
+                        super::home::board_is_operator(
+                            &state_dir,
+                            self.seam_armed.load(Ordering::Relaxed),
+                        )
+                    })
+                };
+                // CAD-482: an armed board's daemon calls assert the
+                // identity the process declares — its own
+                // `CADENCE_TEST_AS`, or the operator's when it asserts
+                // nothing (an armed fixture board is its operator's, the
+                // same rule `board_is_operator` answers with). Without
+                // the seam this compiles out and the calls keep their
+                // ambient caller.
+                if self.seam_armed.load(Ordering::Relaxed) {
+                    crate::test_seam::scoped(
+                        crate::test_seam::env_asserted()
+                            .unwrap_or(crate::test_seam::Asserted::Operator),
+                        pass,
                     )
-                })
+                } else {
+                    pass()
+                }
             });
         }
     }

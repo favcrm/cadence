@@ -2032,8 +2032,21 @@ fn cad446_board_syncs_delivery_without_a_terminal() {
         .unwrap()
         .port();
     let pidfile = lf.f.tmp.path().join("agent-board.pid");
+    // CAD-482: on a seam build the board asserts its agent's identity
+    // on the process itself (`CADENCE_TEST_AS`), so `board_is_operator`
+    // answers the same in a pane and in CI; a non-seam build keeps the
+    // ambient ancestry path.
+    let seam_env = if cfg!(feature = "test-seam") {
+        format!(
+            "{}=1 {}=agent:r2 ",
+            cadence_agent::test_seam::ARM_ENV,
+            cadence_agent::test_seam::AS_ENV
+        )
+    } else {
+        String::new()
+    };
     let script = format!(
-        "echo $$ > {pid}; exec env PATH={gh}:$PATH CADENCE_PM_DIR={pm} {bin} --state-dir {state} \
+        "echo $$ > {pid}; exec env {seam_env}PATH={gh}:$PATH CADENCE_PM_DIR={pm} {bin} --state-dir {state} \
          ui run --port {agent_port}",
         pid = pidfile.display(),
         gh = lf.gh_dir.display(),

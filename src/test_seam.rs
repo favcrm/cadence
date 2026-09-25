@@ -208,6 +208,15 @@ pub fn asserted() -> Option<Asserted> {
     imp::asserted()
 }
 
+/// The [`AS_ENV`] assertion on this process alone — a spawned binary's
+/// declared identity, independent of any request or dispatch scope.
+/// Sites answering "who does this process run as" (a board deciding
+/// whether it is its operator's) read this, never the scoped caller a
+/// request arrived under. `None` without the feature or when unset.
+pub fn env_asserted() -> Option<Asserted> {
+    imp::env_asserted()
+}
+
 /// The `test_caller` field this thread's outgoing `client::rpc` calls
 /// should carry — the scoped assertion (precise, must match the
 /// target's credential) or the process's [`AS_ENV`] (blunt: only
@@ -411,7 +420,7 @@ mod imp {
     }
 
     /// The process-wide [`AS_ENV`] assertion, if it parses.
-    fn env_asserted() -> Option<Asserted> {
+    pub fn env_asserted() -> Option<Asserted> {
         std::env::var(AS_ENV).ok().and_then(|v| parse_as(&v).ok())
     }
 
@@ -500,6 +509,11 @@ mod imp {
     }
 
     pub fn asserted() -> Option<Asserted> {
+        None
+    }
+
+    /// No feature, no process assertion — the consult compiles out.
+    pub fn env_asserted() -> Option<Asserted> {
         None
     }
 

@@ -143,11 +143,17 @@ pub(super) fn operator_viewer(
 /// `seam_armed` is the fixture's own declaration — CAD-482 — that this
 /// board runs as the operator's: a board attached to a credential that
 /// actually exists *is* its operator's board, exactly as a pane-free
-/// `ui run` is in production. `armed` answers live, so a board started
-/// before its daemon mints becomes operator's when the token lands.
+/// `ui run` is in production — unless the board process itself asserts
+/// a non-operator identity (`CADENCE_TEST_AS=agent:<alias>` marks a
+/// fixture board an agent started, identical in a pane and in CI).
+/// `armed` answers live, so a board started before its daemon mints
+/// becomes operator's when the token lands.
 pub(super) fn board_is_operator(state_dir: &std::path::Path, seam_armed: bool) -> bool {
     if seam_armed && crate::test_seam::armed(state_dir) {
-        return true;
+        return matches!(
+            crate::test_seam::env_asserted(),
+            None | Some(crate::test_seam::Asserted::Operator)
+        );
     }
     let Some(daemon_pid) = client::rpc(state_dir, "health", json!({}))
         .ok()
