@@ -9268,6 +9268,15 @@ fn spawn_ui_env(pm: &Path, state: &Path, env: &[(&str, &str)]) -> (u16, UiProc) 
     if let Ok(home) = std::env::var("HOME") {
         cmd.env("HOME", home);
     }
+    // CAD-482: under the feature every spawned fixture board attaches to
+    // the seam — it honors assertion headers — and runs as the operator's
+    // process on unasserted daemon calls, as `start_operator_ui` does.
+    // A caller's `env` overrides either default (e.g. an agent-shaped
+    // board carries its own CADENCE_TEST_AS).
+    if cfg!(feature = "test-seam") {
+        cmd.env(cadence_agent::test_seam::ARM_ENV, "1")
+            .env(cadence_agent::test_seam::AS_ENV, "operator");
+    }
     cmd.envs(env.iter().copied());
     let child = cmd.spawn().unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -11425,11 +11434,17 @@ fn model_defaults_http_round_trip_guards_and_conflict() {
     let doc = r#"{"expected_revision":0,"config":{"schema":1,"providers":{"claude":{"default":{"mode":"model","model":"baseline-a"},"roles":{"qa":{"mode":"provider_default"}}}}}}"#;
     // An agent-shaped board — its own environment carries CADENCE_ALIAS
     // — is refused by the daemon's gate, however the suite is run, and
-    // nothing is written.
+    // nothing is written. Under the seam the write asserts
+    // `agent:board-agent` on the wire — an agent presenting the
+    // operator's session trips CAD-313's stolen-session check on the
+    // board itself, which revokes it before the relay runs.
     let (agent_port, _agent_ui) =
         spawn_ui_env(pm.path(), &d.state(), &[("CADENCE_ALIAS", "board-agent")]);
     let agent_host = format!("127.0.0.1:{agent_port}");
-    let agent_op = sign_in(&d.state(), agent_port);
+    let mut agent_op = sign_in(&d.state(), agent_port);
+    if !agent_op.seam.is_empty() {
+        agent_op.seam = op::seam_headers(&d.state(), "agent:board-agent");
+    }
     let (code, _, body) = op_write_json(
         &agent_op,
         agent_port,
@@ -11438,11 +11453,19 @@ fn model_defaults_http_round_trip_guards_and_conflict() {
         &agent_host,
         doc,
     );
-    assert_eq!(code, 400, "{body}");
-    assert!(
-        body.contains("not provably the operator") && body.contains("carries CADENCE_ALIAS"),
-        "{body}"
-    );
+    if agent_op.seam.is_empty() {
+        assert_eq!(code, 400, "{body}");
+        assert!(
+            body.contains("not provably the operator") && body.contains("carries CADENCE_ALIAS"),
+            "{body}"
+        );
+    } else {
+        assert_eq!(code, 403, "{body}");
+        assert!(
+            body.contains("session_from_agent") && body.contains("board-agent"),
+            "{body}"
+        );
+    }
     let (code, body) = http(port, "GET", "/api/settings/model-defaults", &host);
     assert_eq!(code, 200, "{body}");
     assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["revision"], 0);
