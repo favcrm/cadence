@@ -14,6 +14,7 @@ pub mod backup;
 pub mod client;
 pub mod confine;
 pub mod continuity;
+pub mod contract_fixture;
 pub mod daemon;
 pub mod delivery;
 pub mod doctor;

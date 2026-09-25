@@ -1,0 +1,185 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cadence:contracts:connected-platform:v1:pending-effect",
+  "title": "Pending-effect record (ADR 0006 §5.4)",
+  "description": "One staged send-class call awaiting the press: a brokered request of kind \"effect\" backed by a durable row keyed by effect_id. One effect = one request = one execution. Field rules are §5.4; conditional requirements below encode the lifecycle invariants (a closed row names its close reason; decided-or-later rows carry the recorded decision; only ran-to-outcome rows carry outcome).",
+  "type": "object",
+  "required": [
+    "request",
+    "kind",
+    "agent",
+    "platform",
+    "account",
+    "tool",
+    "effect",
+    "input_summary",
+    "input",
+    "preview",
+    "effect_id",
+    "state"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "request": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The brokered-request handle. A retried open with a caller-named handle dedupes to the same request (existing:true); it never double-stages."
+    },
+    "kind": { "const": "effect" },
+    "agent": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The calling alias, connection-derived (CAD-376) — never requester-supplied input."
+    },
+    "platform": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The enrolled platform handle (§5.1)."
+    },
+    "account": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The enrolled account handle under the platform (§5.1, §7 Q4)."
+    },
+    "tool": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The adapter tool name, as declared in the reviewed tool table."
+    },
+    "effect": {
+      "const": "send",
+      "description": "Only sends pend; reads and drafts execute at call time and never produce this record."
+    },
+    "input_summary": {
+      "type": "string",
+      "maxLength": 1024,
+      "description": "One bounded line for list surfaces; secret-guarded like every durable agent text. The bound here is the fixture's cap, not the contract's number."
+    },
+    "input": {
+      "description": "The exact staged call arguments the press approves — the bytes the proxy fires on accept. No credential field exists. Any JSON value; the proxy applies a byte bound."
+    },
+    "preview": {
+      "type": "string",
+      "maxLength": 16384,
+      "description": "The rendered, bounded artifact the press reviews — what the platform will do, in the platform's terms. Secret-guarded. The bound is the fixture's cap."
+    },
+    "source_hash": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Optional. Content hash of the reviewed source artifact the send derives from. Editing the source while the row is waiting cancels it (close_reason source_changed); Execute re-verifies the hash before firing (§5.4 step 3)."
+    },
+    "label": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Optional. The platform's own effect class where it differs from cadence's (the AgenticOS mapping, §5.2). Display only."
+    },
+    "effect_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The durable identity; one effect = one request = one execution. The write's idempotency key derives from it (C9)."
+    },
+    "state": {
+      "enum": [
+        "waiting",
+        "decided",
+        "executing",
+        "done",
+        "failed",
+        "declined",
+        "closed",
+        "reconcile"
+      ],
+      "description": "waiting → decided → executing → done|failed. declined: decided decline, never ran. closed: cancelled before release (see close_reason). reconcile: restart found decided(accept) without a proven outcome — awaits a human; never re-fires automatically."
+    },
+    "close_reason": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Required on closed rows — why the pending effect was cancelled (e.g. source_changed, credential_revoked)."
+    },
+    "decision": {
+      "type": "object",
+      "required": ["by", "at"],
+      "additionalProperties": false,
+      "description": "The recorded press. accept is operator-only in v1; decline is open to anyone authorised (§5.4 step 4). An agent never releases.",
+      "properties": {
+        "by": {
+          "type": "object",
+          "required": ["member", "role", "rule"],
+          "additionalProperties": false,
+          "description": "The verified presser and the rule that authorised them. {member, role, rule} leaves room for policy/team release (§6) without a format change.",
+          "properties": {
+            "member": { "type": "string", "minLength": 1 },
+            "role": { "type": "string", "minLength": 1 },
+            "rule": { "type": "string", "minLength": 1 }
+          }
+        },
+        "at": {
+          "type": "string",
+          "minLength": 1,
+          "description": "RFC 3339 timestamp of the recorded decision."
+        },
+        "reason": {
+          "type": "string",
+          "description": "Optional; a decline parks the reason."
+        }
+      }
+    },
+    "outcome": {
+      "type": "object",
+      "required": ["verified"],
+      "additionalProperties": false,
+      "description": "The platform result or platform error, delivered as a message and parked as the request answer. verified is the adapter's read-back against the approved input (C10).",
+      "properties": {
+        "result": { "description": "The platform outcome payload; mutually exclusive with error." },
+        "error": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The platform error; mutually exclusive with result."
+        },
+        "verified": {
+          "enum": [true, false, "unknown"],
+          "description": "Read-back verdict against the approved input. false raises a Needs-you item; unknown is a legitimate steady state where no read-back exists."
+        }
+      },
+      "oneOf": [{ "required": ["result"] }, { "required": ["error"] }]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "state": { "const": "closed" } },
+        "required": ["state"]
+      },
+      "then": { "required": ["close_reason"] }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "enum": ["decided", "executing", "done", "failed", "declined", "reconcile"]
+          }
+        },
+        "required": ["state"]
+      },
+      "then": { "required": ["decision"] }
+    },
+    {
+      "if": {
+        "properties": { "state": { "enum": ["done", "failed"] } },
+        "required": ["state"]
+      },
+      "then": { "required": ["outcome"] }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "enum": ["waiting", "decided", "executing", "declined", "closed", "reconcile"]
+          }
+        },
+        "required": ["state"]
+      },
+      "then": { "not": { "required": ["outcome"] } }
+    }
+  ]
+}
