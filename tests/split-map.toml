@@ -755,6 +755,11 @@ tests = [
     "cad378_dispatch_record_binds_the_kickoff_not_the_request",
     "cad378_dispatch_record_other_agents_cannot_overwrite",
     "cad378_dispatch_record_forged_refs_and_body_bind_nothing",
+    "app_board_rows_never_follows_a_symlinked_workflows_dir",
+    "app_plan_text_digests_the_bytes_it_renders",
+    "app_install_never_writes_through_a_planted_symlink",
+    "app_install_git_pins_url_and_transport",
+    "app_approve_takes_the_pm_lock",
 ]
 helpers = [
     "events_of_kind",
@@ -762,6 +767,7 @@ helpers = [
     "received_pack",
     "cad378_kinds",
     "areas_acks_file",
+    "open_count",
 ]
 
 [binaries.dispatch_jobs_monitor]
