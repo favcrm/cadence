@@ -23,6 +23,9 @@ pub struct RenderMiss {
     /// The probe verdict that admitted the send at claim time, when
     /// one was recorded — what "idle" looked like to the gate.
     pub claim_probe: Option<serde_json::Value>,
+    /// The re-probe taken after the render deadline (CAD-520): what the
+    /// pane showed once more before the miss was accepted as real.
+    pub reprobe: Option<serde_json::Value>,
 }
 
 /// A wire error that carries a stable `code` and, for revision

@@ -132,6 +132,11 @@ struct PtyState {
     /// own verdict for an operator claim, the just-run probe for a
     /// daemon auto-claim. Carried on `NotRendered` evidence.
     gate_probe: Option<Probe>,
+    /// The in-flight send was admitted through the *steerable* busy box
+    /// (a nudge into Devin's guide box): the render check must flush a
+    /// TUI-side send queue with a second Enter. Set and cleared with
+    /// `gate_probe`, only ever on the gate path.
+    gate_steer: bool,
     /// Token of the latest turn-holding paste (not a routed notice or
     /// nudge) — the turn `interrupt_turn` may stop (CAD-323).
     current_turn: Option<String>,
@@ -161,6 +166,10 @@ pub struct PtyAdapter {
     /// With no claim and `auto_ready` off, an idle probe may still
     /// admit the paste. Cleared when the turn returns.
     unclaimed_ok: AtomicBool,
+    /// Set by the actor for one `run_turn` when the message is a nudge:
+    /// the gate may admit it into a busy pane whose input box still
+    /// takes steering text (`probe.steerable`). Cleared with the turn.
+    steer_ok: AtomicBool,
     /// Serialises probe→input sequences that must not interleave: the
     /// send gate's probe→paste→Enter and `agent answer`'s
     /// probe→send-keys. Without it a menu closing between the answer's
@@ -653,6 +662,7 @@ impl PtyAdapter {
                 claims: std::collections::VecDeque::new(),
                 disconnected_misses: 0,
                 gate_probe: None,
+                gate_steer: false,
                 current_turn: None,
             }),
             socket: format!("cadence-{}", short_hash(&state_dir.to_string_lossy())),
@@ -673,6 +683,7 @@ impl PtyAdapter {
                     == Some("verified"),
             ),
             unclaimed_ok: AtomicBool::new(false),
+            steer_ok: AtomicBool::new(false),
             paste_lock: Mutex::new(()),
             profile: Box::new(profile),
         })
@@ -738,14 +749,35 @@ impl PtyAdapter {
     /// both `open` branches share. `None` means the deadline elapsed
     /// with the pane alive but still holding no provable session; the
     /// caller applies `resolve_session`'s usual errors for that.
+    /// CAD-520: a profile-modal prompt (Devin's folder-trust select)
+    /// blocks startup before any session exists — surface it as an
+    /// actionable error instead of burning the whole deadline.
     fn wait_owned_session(&self, session: &str, pane_pid: u32) -> Result<Option<String>> {
         let deadline = Instant::now() + self.profile.open_deadline();
+        let mut last_screen_probe = Instant::now() - Duration::from_secs(1);
         loop {
             if !self.has_session(session) {
                 return Err(Error::provider("pane exited during TUI startup"));
             }
             if let Some(found) = self.profile.owned_session(pane_pid) {
                 return Ok(Some(found));
+            }
+            if last_screen_probe.elapsed() >= Duration::from_secs(1) {
+                last_screen_probe = Instant::now();
+                if let Ok(styled) = self.capture_visible_styled() {
+                    let probe = self
+                        .profile
+                        .analyze_styled(&styled, self.cursor_pos(session));
+                    if probe.trust_prompt {
+                        return Err(Error::provider(format!(
+                            "the {} TUI is asking whether to trust this folder — \
+                             answer the prompt in the pane (`{}`) or with \
+                             `cadence agent answer`, then resume again",
+                            self.profile.name(),
+                            session
+                        )));
+                    }
+                }
             }
             if Instant::now() >= deadline {
                 return Ok(None);
@@ -818,6 +850,12 @@ impl PtyAdapter {
                 probe.reason, session
             )));
         }
+        // CAD-520: a nudge into a pane whose busy input box still takes
+        // steering text (Devin's guide box). The menu check above has
+        // already run, so a `steerable` probe is a live turn with an
+        // editable input — the paste lands in the guide box and the
+        // render check flushes Devin's queued-send Enter.
+        let steer = self.steer_ok.load(AtomicOrdering::SeqCst) && probe.steerable;
         let claimed = {
             // Claims stack FIFO: drop expired heads, consume the oldest
             // fresh one — one paste per claim, always.
@@ -836,7 +874,9 @@ impl PtyAdapter {
             // the claimer is recorded at consumption, not just claim.
             // The claim's own probe verdict rides along — it is the
             // "idle" the sender believed in if the paste never renders.
-            self.state.lock().unwrap().gate_probe = Some(claim.probe.clone());
+            let mut state = self.state.lock().unwrap();
+            state.gate_probe = Some(claim.probe.clone());
+            state.gate_steer = steer;
             (self.hooks.on_event)(
                 "cadence/claim_used",
                 serde_json::json!({
@@ -849,23 +889,32 @@ impl PtyAdapter {
         let auto = self.auto_ready.load(AtomicOrdering::SeqCst);
         let routed = self.unclaimed_ok.load(AtomicOrdering::SeqCst);
         // A user or task paste still needs a claim or verified
-        // auto-ready. A routed notice may proceed to the idle probe
-        // with neither. The probe itself already refused a dead pane,
-        // a tmux mode, and an open approval menu.
-        if !auto && !routed {
+        // auto-ready — or a profile whose own idle probe IS the claim
+        // (`probe_is_ready_claim`, e.g. Devin's verified placeholder).
+        // A routed notice or a nudge may proceed with neither. The
+        // probe itself already refused a dead pane, a tmux mode, and
+        // an open approval menu.
+        if !auto && !routed && !self.profile.probe_is_ready_claim() {
             return Err(Error::gate(
                 "no fresh `agent ready` claim — an operator must verify the \
                  terminal is idle with an empty input before submission",
             ));
         }
-        if !probe.idle {
+        if !probe.idle && !steer {
             return Err(Error::gate(format!("tui not idle: {}", probe.reason)));
         }
-        self.state.lock().unwrap().gate_probe = Some(probe.clone());
+        {
+            let mut state = self.state.lock().unwrap();
+            state.gate_probe = Some(probe.clone());
+            state.gate_steer = steer;
+        }
         let mut payload = serde_json::json!({"by": "daemon", "probe": probe.to_json()});
-        // Distinguish a routed idle paste from verified auto-ready.
-        // When both are set, verified auto-ready is the recorded path.
-        if routed && !auto {
+        // Distinguish a routed idle paste from verified auto-ready, and
+        // a busy-box nudge from either. When both are set, verified
+        // auto-ready is the recorded path.
+        if steer {
+            payload["reason"] = serde_json::json!("steer");
+        } else if routed && !auto {
             payload["reason"] = serde_json::json!("routed");
         }
         (self.hooks.on_event)("cadence/ready_claimed", payload);
@@ -953,6 +1002,31 @@ impl ProviderAdapter for PtyAdapter {
             )),
             None => e,
         };
+
+        // CAD-520: never open into a deleted working directory. The
+        // spawn arm would launch the TUI wherever tmux lands it (the
+        // next failure is a folder-trust prompt or a wrong-repo
+        // session); a reattached pane whose cwd vanished is the same
+        // dead lane the send gate already refuses.
+        if self.has_session(&session) {
+            if let Ok(pane_pid) = self.pane_pid(&session) {
+                if let Some(cwd) = lane::pane_cwd(pane_pid).filter(|c| c.deleted) {
+                    return Err(Error::provider(format!(
+                        "cwd_deleted: the pane's working directory {} was deleted — \
+                         re-home the lane (`cadence agent stop`, fix its cwd, resume) \
+                         before resuming",
+                        cwd.path
+                    )));
+                }
+            }
+        } else if !Path::new(&self.cwd).is_dir() {
+            return Err(Error::provider(format!(
+                "cwd_deleted: the lane's working directory {} is gone — \
+                 re-home the lane (`cadence agent stop`, fix its cwd, resume) \
+                 before resuming",
+                self.cwd
+            )));
+        }
 
         let (native, pane_pid, attach) = if self.has_session(&session) {
             // Reattach: verify the pane still owns a native session.
@@ -1256,6 +1330,14 @@ impl ProviderAdapter for PtyAdapter {
         // raced by an `agent answer`, so the lock can go.
         drop(_paste_guard);
 
+        // CAD-520: a steer-admitted nudge lands in the TUI's *busy*
+        // input box, where the first Enter can only queue it — Devin
+        // then invites one more Enter (`Press Enter to send queued
+        // messages`) that flushes the queue into the running turn.
+        let steer = self.state.lock().unwrap().gate_steer;
+        let mut steer_flushes = 0u8;
+        let mut steer_last_flush = Instant::now() - Duration::from_secs(1);
+
         // Post-paste verification, bounded by RENDER_DEADLINE: the
         // slice's occurrence count must increase AND the input line must
         // be empty again — text rendered but still sitting in the input
@@ -1267,10 +1349,26 @@ impl ProviderAdapter for PtyAdapter {
         loop {
             let styled = self.capture_visible_styled()?;
             let screen = sgr::strip(&styled);
-            let observation = if normalize_screen(&screen).matches(&slice).count() > before_count {
-                let cursor = self.cursor_pos(&session);
+            let rendered = normalize_screen(&screen).matches(&slice).count() > before_count;
+            // The steer path needs the queue flag every poll; the plain
+            // path needs `input_nonempty` only once the body shows.
+            let live_probe = (steer || rendered)
+                .then(|| self.profile.analyze_styled(&styled, self.cursor_pos(&session)));
+            if steer
+                && live_probe.as_ref().is_some_and(|p| p.queue_pending)
+                && steer_flushes < 3
+                && steer_last_flush.elapsed() >= Duration::from_millis(400)
+            {
+                // The queue prompt is the TUI's own invitation: Enter
+                // here sends the staged nudge, never interrupts the turn.
+                self.tmux_ok(&["send-keys", "-t", &session, "Enter"])
+                    .map_err(|e| Error::unknown(format!("queue-flush Enter failed: {e}")))?;
+                steer_flushes += 1;
+                steer_last_flush = Instant::now();
+            }
+            let observation = if rendered {
                 RenderObservation::Visible {
-                    input_nonempty: self.profile.analyze_styled(&styled, cursor).input_nonempty,
+                    input_nonempty: live_probe.map(|p| p.input_nonempty).unwrap_or(false),
                 }
             } else {
                 RenderObservation::NotVisible
@@ -1278,10 +1376,46 @@ impl ProviderAdapter for PtyAdapter {
             match render_decision.observe(render_started.elapsed(), observation) {
                 Some(RenderOutcome::Submitted) => break,
                 Some(outcome @ (RenderOutcome::Staged | RenderOutcome::NotRendered)) => {
+                    // CAD-520: never fence on one deadline — re-probe the
+                    // pane once more. The turn was taken when the pane
+                    // shows the submitted body or its first line in the
+                    // transcript, or a busy marker the gate's probe did
+                    // not have (idle pane → working). A still-staged
+                    // input means the draft never left the box.
+                    let styled2 = self.capture_visible_styled()?;
+                    let after = sgr::strip(&styled2);
+                    let reprobe =
+                        self.profile.analyze_styled(&styled2, self.cursor_pos(&session));
+                    // The tail slice can scroll off a busy transcript;
+                    // the head of the body is a second anchor. Either
+                    // appearing where it was absent before is evidence.
+                    let head =
+                        normalize_screen(&prompt.chars().take(PROBE_SLICE).collect::<String>());
+                    let head_before = normalize_screen(&before).matches(&head).count();
+                    let norm_after = normalize_screen(&after);
+                    let body_seen = norm_after.matches(&slice).count() > before_count
+                        || norm_after.matches(&head).count() > head_before;
+                    // A pane idle at the gate that now shows a busy
+                    // marker took the turn — the busiest reason a body
+                    // never renders is the TUI consuming it without an
+                    // echo. On the steer path the same proof is the
+                    // queue draining after our flush Enter: the staged
+                    // text left the TUI's own send queue for the turn.
+                    let went_busy = {
+                        let gate_probe = self.state.lock().unwrap().gate_probe.clone();
+                        gate_probe.is_some_and(|g| !g.busy_marker) && reprobe.busy_marker
+                    };
+                    let queue_cleared =
+                        steer && steer_flushes > 0 && !reprobe.queue_pending;
+                    if !reprobe.input_nonempty && (body_seen || went_busy || queue_cleared) {
+                        // The pane took the turn — Submitted, not a miss.
+                        break;
+                    }
                     // The miss carries what the pane actually showed — the
                     // screen tail before the paste and after the deadline,
-                    // plus the probe verdict that admitted the send — so a
-                    // fence records evidence, not just a verdict.
+                    // plus the probe verdict that admitted the send and the
+                    // re-probe verdict — so a fence records evidence, not
+                    // just a verdict.
                     let reason = match outcome {
                         RenderOutcome::Staged => {
                             "paste rendered in the input line but was never submitted — \
@@ -1292,18 +1426,19 @@ impl ProviderAdapter for PtyAdapter {
                         }
                         RenderOutcome::Submitted => unreachable!(),
                     };
-                    let claim_probe = self
-                        .state
-                        .lock()
-                        .unwrap()
-                        .gate_probe
-                        .as_ref()
-                        .map(Probe::to_json);
+                    let (claim_probe, gate_steer) = {
+                        let s = self.state.lock().unwrap();
+                        (s.gate_probe.as_ref().map(Probe::to_json), s.gate_steer)
+                    };
                     return Err(Error::not_rendered(crate::error::RenderMiss {
                         reason: reason.to_string(),
                         before_tail: screen_tail(&before, 12),
-                        after_tail: screen_tail(&screen, 12),
+                        after_tail: screen_tail(&after, 12),
                         claim_probe,
+                        reprobe: Some(serde_json::json!({
+                            "probe": reprobe.to_json(),
+                            "steer": gate_steer,
+                        })),
                     }));
                 }
                 None => std::thread::sleep(Duration::from_millis(150)),
@@ -1685,6 +1820,10 @@ impl ProviderAdapter for PtyAdapter {
 
     fn set_unclaimed_ok(&self, ok: bool) {
         self.unclaimed_ok.store(ok, AtomicOrdering::SeqCst);
+    }
+
+    fn set_steer_ok(&self, ok: bool) {
+        self.steer_ok.store(ok, AtomicOrdering::SeqCst);
     }
 }
 

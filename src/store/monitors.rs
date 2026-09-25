@@ -635,6 +635,7 @@ impl Store {
                 | "attention"
                 | "paste_not_rendered"
                 | "delivery_parked"
+                | "delivery_stalled"
                 | "turn_silent_end"
                 | "approval_menu"
                 | "draft_pending"

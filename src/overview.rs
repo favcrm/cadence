@@ -266,6 +266,11 @@ fn monitor_alert_action(kind: &str, monitor_owner: &str) -> (&'static str, Strin
             monitor_owner.to_string(),
             "monitor owner may recover the worker",
         ),
+        "delivery_stalled" => (
+            "Inspect the ready pane and redeliver or cancel the queued message",
+            monitor_owner.to_string(),
+            "monitor owner may redeliver; the queued message is not moving",
+        ),
         "turn_stalled" => (
             "Inspect the stalled turn and reconcile its worker",
             monitor_owner.to_string(),
@@ -2410,6 +2415,22 @@ fn agent_items(a: &Value, probe: &AgentProbe, project: &str, now: i64) -> Vec<It
                 &cmd_agent_show(alias),
             )
             .since(secs_ago("silent_secs")),
+        );
+    }
+    // CAD-520: the delivery watchdog — a queued head has outlived
+    // `delivery_watch_secs` while the pane probes ready. Something is
+    // wedged between the queue and the pane; the row names it.
+    if a["delivery_stalled"].as_bool().unwrap_or(false) {
+        items.push(
+            row(
+                30,
+                "delivery_stalled",
+                &format!(
+                    "agent {alias} has a queued message but the pane is idle — delivery stalled"
+                ),
+                age,
+                &cmd_agent_show(alias),
+            ),
         );
     }
     // A sampled approval menu ranks with brokered approvals — the pane

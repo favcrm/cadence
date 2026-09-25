@@ -669,6 +669,9 @@ mod tests {
                     prompt_visible: false,
                     busy_marker: true,
                     approval_menu: false,
+                    trust_prompt: false,
+                    steerable: false,
+                    queue_pending: false,
                 }),
                 ..StallWatch::default()
             }),

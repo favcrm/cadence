@@ -105,6 +105,9 @@ fn analyze_stub(screen: &str) -> Probe {
         prompt_visible,
         busy_marker,
         approval_menu,
+        trust_prompt: false,
+        steerable: false,
+        queue_pending: false,
     }
 }
 

@@ -196,6 +196,11 @@ const DEFAULT_STALL_SECS: u64 = 1800;
 /// `turn_silent_end` fires — long enough that a between-tools quiet
 /// spell never trips it.
 const DEFAULT_SILENT_END_SECS: u64 = 600;
+/// `delivery_watch_secs` when the agent doesn't set one: a queued head
+/// that has waited this long while the pane probes idle is wedged —
+/// delivery should have landed in seconds. The 60s screen cadence
+/// makes 120s ≥2 consecutive ready samples, never one glance.
+const DEFAULT_DELIVERY_WATCH_SECS: u64 = 120;
 /// PTY screens are sampled at most this often while the pane is live —
 /// a running turn for activity/silent-end bookkeeping, an idle pane for
 /// menu/draft surfacing. The bound is one capture per pty agent per
@@ -374,6 +379,9 @@ struct StallWatch {
     /// `turn_silent_end` already fired for this message — the event
     /// is once per message, never twice.
     silent_end_sent: bool,
+    /// `delivery_stalled` already fired for the tracked queued head —
+    /// once per message, like `silent_end_sent` (CAD-520).
+    delivery_stalled_sent: bool,
     /// The last landed probe verdict — rides `turn_silent_end`'s
     /// payload as evidence.
     last_probe: Option<Probe>,
@@ -399,6 +407,7 @@ impl Default for StallWatch {
             menu_line: None,
             menu_evented: std::collections::VecDeque::new(),
             silent_end_sent: false,
+            delivery_stalled_sent: false,
             last_probe: None,
             episodes: 0,
         }
@@ -414,6 +423,9 @@ struct StallView {
     menu: Option<String>,
     ended_secs: Option<u64>,
     silent_ended: bool,
+    /// CAD-520: a queued head has outlived `delivery_watch_secs` while
+    /// the pane probes ready — delivery is wedged, needs a human.
+    delivery_stalled: bool,
 }
 
 impl StallView {
@@ -430,6 +442,9 @@ impl StallView {
         }
         if self.silent_ended {
             j["silent_ended"] = json!(true);
+        }
+        if self.delivery_stalled {
+            j["delivery_stalled"] = json!(true);
         }
     }
 }
@@ -1696,6 +1711,11 @@ impl Shared {
                         self.continuity_prompt(alias, &agent.endpoint_kind, &message)
                     };
                     adapter.set_unclaimed_ok(message.is_routed() || nudge);
+                    // CAD-520: a nudge may also enter through a busy
+                    // pane's steering input (Devin's guide box). Cleared
+                    // with `unclaimed_ok` so a later message cannot
+                    // inherit either flag.
+                    adapter.set_steer_ok(nudge);
                     let outcome = adapter.run_turn(&prompt, &message.id, &move |turn| {
                         // CAD-250: a nudge owns no turn — it never becomes
                         // `running`, and its paste is not the held turn's
@@ -1707,6 +1727,7 @@ impl Shared {
                         shared.wake();
                     });
                     adapter.set_unclaimed_ok(false);
+                    adapter.set_steer_ok(false);
                     // CAD-250: an unconfirmed nudge paste ends `unknown`,
                     // but a nudge belongs to no turn — it never fences the
                     // agent, never retries, never touches the held turn.
@@ -1721,7 +1742,8 @@ impl Shared {
                                        "retry": false,
                                        "before": miss.before_tail,
                                        "after": miss.after_tail,
-                                       "claim_probe": miss.claim_probe}),
+                                       "claim_probe": miss.claim_probe,
+                                       "reprobe": miss.reprobe}),
                             );
                             self.nudge_unconfirmed(&message, &miss.reason)?;
                             continue;
@@ -1774,6 +1796,7 @@ impl Shared {
                                 before_tail,
                                 after_tail,
                                 claim_probe,
+                                reprobe,
                             } = miss;
                             let _ = self.store.event_public(
                                 alias,
@@ -1784,7 +1807,8 @@ impl Shared {
                                        "retry": retry,
                                        "before": before_tail,
                                        "after": after_tail,
-                                       "claim_probe": claim_probe}),
+                                       "claim_probe": claim_probe,
+                                       "reprobe": reprobe}),
                             );
                             if retry {
                                 let retry_ticket = ctl.wake.ticket();
@@ -8430,6 +8454,7 @@ impl Shared {
         // streak.
         let mut menu_rise: Option<String> = None;
         let mut end_fire: Option<(u64, f64, Probe)> = None;
+        let mut delivery_fire: Option<(String, u64, Probe)> = None;
         if agent.endpoint_kind == "pty" {
             let mut landed = None;
             match w.sample_rx.as_ref().map(|rx| rx.try_recv()) {
@@ -8485,6 +8510,24 @@ impl Shared {
                     } else {
                         w.idle_samples = 0;
                         w.idle_since = None;
+                    }
+                }
+                // CAD-520: the delivery watchdog. The tracked head is a
+                // still-queued message while the pane probes *idle* —
+                // delivery should already have happened, so past
+                // `delivery_watch_secs` that is a wedge: one
+                // `delivery_stalled` event per tracked message, never a
+                // refire while it sits. A busy pane or an open menu
+                // never trips it — those waits are real.
+                if running.is_none() && !w.delivery_stalled_sent && probe.idle {
+                    if let Some(m) = tracked.as_ref() {
+                        let bound = self.delivery_watch_budget(&agent);
+                        let queued_secs = epoch_secs() - m.created;
+                        if bound > 0 && queued_secs >= bound as f64 {
+                            w.delivery_stalled_sent = true;
+                            delivery_fire =
+                                Some((m.id.clone(), queued_secs as u64, probe.clone()));
+                        }
                     }
                 }
                 if running.is_none() {
@@ -8603,6 +8646,9 @@ impl Shared {
                 self.report_reminder(&agent, m);
             }
         }
+        if let Some((msg_id, queued_secs, probe)) = delivery_fire {
+            self.delivery_stalled_fired(&agent, tracked.as_ref(), &msg_id, queued_secs, &probe);
+        }
         match after {
             After::Resume(at, episode) => {
                 self.stall_resumed(&agent, running.as_ref().unwrap(), at.elapsed(), episode)
@@ -8653,6 +8699,22 @@ impl Shared {
                     .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
             })
             .unwrap_or(DEFAULT_SILENT_END_SECS)
+    }
+
+    /// CAD-520: the bound for `delivery_stalled` — how long a queued
+    /// head may sit while the pane probes idle before the watchdog
+    /// calls it wedged. The agent's `delivery_watch_secs` param, else
+    /// the default; `0` disables.
+    fn delivery_watch_budget(&self, agent: &Agent) -> u64 {
+        agent
+            .params
+            .as_ref()
+            .and_then(|p| p.get("delivery_watch_secs"))
+            .and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            })
+            .unwrap_or(DEFAULT_DELIVERY_WATCH_SECS)
     }
 
     /// `(job_id, task_id)` scope for a message's stall events — the
@@ -8773,6 +8835,36 @@ impl Shared {
             &agent.alias,
             "turn_silent_end",
             payload,
+            job_id.as_deref(),
+            task_id,
+        );
+        self.wake();
+    }
+
+    /// `delivery_stalled` (CAD-520): the queued head has outlived
+    /// `delivery_watch_secs` while the pane keeps probing ready —
+    /// evidence the delivery path wedged (a dead actor, a gate that
+    /// can never admit). One event per tracked message; the probe
+    /// verdict rides along as the "ready" proof.
+    fn delivery_stalled_fired(
+        &self,
+        agent: &Agent,
+        tracked: Option<&Message>,
+        msg_id: &str,
+        queued_secs: u64,
+        probe: &Probe,
+    ) {
+        let (job_id, task_id) =
+            tracked.map(|m| self.message_scope(m)).unwrap_or((None, None));
+        let _ = self.store.event_public_scoped(
+            &agent.alias,
+            "delivery_stalled",
+            json!({
+                "message": msg_id,
+                "queued_secs": queued_secs,
+                "bound_secs": self.delivery_watch_budget(agent),
+                "probe": probe.to_json(),
+            }),
             job_id.as_deref(),
             task_id,
         );
@@ -8923,14 +9015,23 @@ impl Shared {
         let ctl = self.lifecycle.lock().unwrap().agents.get(alias)?.clone();
         let w = ctl.stall.lock().unwrap();
         let Some(running) = running else {
-            // A queued head behind an open menu: only the menu line
-            // is meaningful — nothing has started or ended.
-            return w.menu_line.clone().map(|line| StallView {
+            // A queued head behind an open menu or past the delivery
+            // watchdog bound: only those two facts are meaningful —
+            // nothing has started or ended. The stall flag is
+            // delivered-pane state too: once the probe reads busy the
+            // row clears — something is moving.
+            let stalled = w.delivery_stalled_sent
+                && w.last_probe.as_ref().is_some_and(|p| p.idle);
+            if w.menu_line.is_none() && !stalled {
+                return None;
+            }
+            return Some(StallView {
                 silent_secs: 0,
                 stalled: false,
-                menu: Some(line),
+                menu: w.menu_line.clone(),
                 ended_secs: None,
                 silent_ended: false,
+                delivery_stalled: stalled,
             });
         };
         if w.message.as_deref() == Some(running.id.as_str()) {
@@ -8940,6 +9041,7 @@ impl Shared {
                 menu: w.menu_line.clone(),
                 ended_secs: w.idle_since.map(|t| t.elapsed().as_secs()),
                 silent_ended: w.silent_end_sent,
+                delivery_stalled: false,
             });
         }
         // The watch hasn't ticked over this message yet — report
@@ -8954,6 +9056,7 @@ impl Shared {
             menu: None,
             ended_secs: None,
             silent_ended: false,
+            delivery_stalled: false,
         })
     }
 

@@ -63,6 +63,11 @@ mod devin_screen {
     /// match on the trimmed row's leading glyph, so a transcript row
     /// quoting `↵ confirm` mid-sentence stays inert.
     pub const ANCHOR: &[&str] = &["↑↓ select", "↓↑ to select", "↵ confirm"];
+    /// The directory-trust select's own legend — the only menu that
+    /// draws `↓↑` (the approval select uses `↑↓`). Its row names a
+    /// launch-blocking prompt: the pane is parked for an interactive
+    /// trust answer, not a mid-turn approval.
+    pub const TRUST_ANCHOR: &str = "↓↑ to select";
     /// Option labels and lone legend fragments — quotable inside a
     /// long transcript, so they only count as a cluster alongside real
     /// menu structure (a second hint, or numbered option rows).
@@ -292,6 +297,14 @@ pub fn analyze_devin(screen: &str) -> Probe {
         .filter(|h| menu_lines.iter().any(|l| hint_row(l, h)))
         .count();
     let approval_menu = footer || (options >= 2 && hints >= 1) || hints >= 2;
+    // The directory-trust prompt is the one menu whose legend is
+    // `↓↑ to select` — the launch-blocking cousin of the mid-turn
+    // approval select. Named apart so `open` can report it instead of
+    // waiting out the session-lock deadline.
+    let trust_prompt = approval_menu
+        && menu_lines
+            .iter()
+            .any(|l| l.trim_start().starts_with(devin_screen::TRUST_ANCHOR));
     let lines: Vec<&str> = screen.lines().collect();
     let prompt_idx = lines
         .iter()
@@ -324,6 +337,11 @@ pub fn analyze_devin(screen: &str) -> Probe {
             || devin_screen::INTERRUPT.iter().any(|m| row.contains(m))
             || devin_screen::QUEUED.iter().any(|m| row.contains(m))
     });
+    // The TUI-side send queue is its own fact: `Press Enter to send
+    // queued messages` means text is staged mid-turn and one more
+    // Enter flushes it into the running turn.
+    let queue_pending = status_row
+        .is_some_and(|row| devin_screen::QUEUED.iter().any(|m| row.contains(m)));
     let input_nonempty = !draft.is_empty()
         && !draft.starts_with(devin_screen::PLACEHOLDER)
         && !draft.starts_with(devin_screen::BUSY_PLACEHOLDER);
@@ -333,7 +351,18 @@ pub fn analyze_devin(screen: &str) -> Probe {
     // outside the capture.
     let watermark_busy = draft.starts_with(devin_screen::BUSY_PLACEHOLDER);
     let busy_marker = status_busy || watermark_busy;
-    let (idle, reason) = if approval_menu {
+    // The busy watermark also means the guide box takes steering text —
+    // the `--nudge` path pastes there. A modal menu covers the box, and
+    // a staged draft (watermark absent) must never be appended to.
+    let steerable = watermark_busy && !approval_menu;
+    let (idle, reason) = if trust_prompt {
+        (
+            false,
+            "folder-trust prompt is open — answer it in the pane or re-join \
+             with a trusted cwd"
+                .to_string(),
+        )
+    } else if approval_menu {
         (
             false,
             menu_subject(content).unwrap_or_else(|| "approval menu is open".to_string()),
@@ -362,6 +391,9 @@ pub fn analyze_devin(screen: &str) -> Probe {
         prompt_visible,
         busy_marker,
         approval_menu,
+        trust_prompt,
+        steerable,
+        queue_pending,
     }
 }
 
@@ -503,6 +535,13 @@ impl TuiProfile for DevinProfile {
 
     fn open_deadline(&self) -> Duration {
         OPEN_DEADLINE
+    }
+
+    /// Devin's idle placeholder is verified against the live TUI —
+    /// `probe.idle` is the readiness claim; no human `agent ready` is
+    /// required for a plain send (CAD-520).
+    fn probe_is_ready_claim(&self) -> bool {
+        true
     }
 
     fn analyze(&self, screen: &str, _cursor: Option<(u32, u32)>) -> Probe {
