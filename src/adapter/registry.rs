@@ -1735,7 +1735,7 @@ mod tests {
         );
         assert_eq!(
             spec("devin", "managed").unwrap_err().to_string(),
-            "No managed adapter for provider 'devin' (implemented: codex, claude)"
+            "No managed adapter for provider 'devin' (implemented: codex, claude, pi)"
         );
         assert_eq!(
             spec("devin", "bogus").unwrap_err().to_string(),
@@ -1753,6 +1753,7 @@ mod tests {
             "managed_codex_stdio",
             "managed_codex_ws",
             "managed_claude_stream",
+            "managed_pi_rpc",
             "pty_claude_tmux",
             "pty_devin_tmux",
             "pty_cursor_tmux",
@@ -1770,20 +1771,22 @@ mod tests {
         ] {
             assert!(caps.contains(&name), "missing {name}");
         }
-        assert_eq!(caps.len(), 19);
+        assert_eq!(caps.len(), 20);
     }
 
     #[test]
     fn model_matrix_keeps_devin_and_drops_test_doubles() {
         let rows = model_provider_matrix();
         let ids: Vec<&str> = rows.iter().map(|row| row.id).collect();
-        assert_eq!(ids, vec!["codex", "claude", "devin", "cursor"]);
+        assert_eq!(ids, vec!["codex", "claude", "pi", "devin", "cursor"]);
         assert!(rows.iter().any(|row| row.id == "claude" && row.eligible));
+        assert!(rows.iter().any(|row| row.id == "pi" && row.eligible));
         assert!(rows
             .iter()
             .any(|row| { row.id == "devin" && !row.eligible && row.limitation.is_some() }));
         assert!(rows.iter().all(|row| row.id != "fake" && row.id != "inbox"));
         assert!(supports_model("claude", "managed"));
+        assert!(supports_model("pi", "managed"));
         assert!(supports_model("cursor", "pty"));
         assert!(!supports_model("devin", "pty"));
         assert!(!supports_model("fake", "fake"));
@@ -2244,13 +2247,15 @@ mod tests {
     }
 
     /// Adding an endpoint kind forces a decision: every spec row names
-    /// its scheme, and only pty rows and managed claude have one today.
+    /// its scheme, and only pty rows, managed claude and managed pi have
+    /// one today.
     #[test]
     fn only_generation_minting_endpoints_carry_a_turn_token_scheme() {
         for s in SPECS {
             let expected = match (s.provider, s.endpoint_kind) {
                 (_, "pty") => Some(PTY_TURN_TOKENS),
                 ("claude", "managed") => Some(CLAUDE_MANAGED_TURN_TOKENS),
+                ("pi", "managed") => Some(PI_MANAGED_TURN_TOKENS),
                 _ => None,
             };
             assert_eq!(s.turn_token, expected, "{}/{}", s.provider, s.endpoint_kind);

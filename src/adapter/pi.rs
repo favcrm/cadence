@@ -70,8 +70,8 @@ const INTERRUPT_GRACE: Duration = Duration::from_secs(60);
 /// Bounded wait for a command's `response` frame.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// `set_thinking_level` levels live in the registry
-/// ([`registry::PI_EFFORTS`], shared with launch-param validation).
+// `set_thinking_level` levels live in the registry
+// (`registry::PI_EFFORTS`, shared with launch-param validation).
 
 /// Extension-UI methods that block Pi until an `extension_ui_response`
 /// arrives. Slice 1 cancels them; everything else is recorded only.
@@ -781,9 +781,12 @@ impl ProviderAdapter for PiAdapter {
             .map(|s| Duration::from_secs(s.max(1)));
         *self.shared.last_activity.lock().unwrap() = Instant::now();
         let transport = self.transport_for(&command, master);
+        // The write-back channel is armed BEFORE launch — Pi can emit
+        // a blocking extension_ui_request from its first line, and a
+        // dispatch that found no transport would leave it unanswered.
+        *self.shared.transport.lock().unwrap() = Some(Arc::clone(&transport));
         let pid = transport.launch(&agent.cwd, &self.log_path, &env)?;
-        *self.transport.write().unwrap() = Arc::clone(&transport);
-        *self.shared.transport.lock().unwrap() = Some(transport);
+        *self.transport.write().unwrap() = transport;
         // Effort: validate against the model's real levels, then verify
         // what stuck — Pi answers success even on a silent fallback.
         if let Some(effort) = params.get("effort").and_then(Value::as_str) {
@@ -816,6 +819,9 @@ impl ProviderAdapter for PiAdapter {
             }
         }
         let state = self.request("get_state", json!({}))?;
+        if state.get("success").and_then(Value::as_bool) != Some(true) {
+            return Err(command_error("get_state", &state));
+        }
         let data = state.get("data").cloned().unwrap_or(Value::Null);
         let session_id = data
             .get("sessionId")
@@ -984,11 +990,12 @@ impl ProviderAdapter for PiAdapter {
         turn_id: &str,
         _settle: &dyn Fn() -> Result<bool>,
     ) -> Result<super::InterruptOutcome> {
+        // Held across the send: `run_turn` clears the active turn under
+        // this lock, so an interrupt can never land on the next turn.
         let active = self.shared.active_turn.lock().unwrap();
         if active.as_deref() != Some(turn_id) {
             return Ok(super::InterruptOutcome::NotRunning);
         }
-        drop(active);
         self.interrupt();
         Ok(super::InterruptOutcome::Delivered)
     }
