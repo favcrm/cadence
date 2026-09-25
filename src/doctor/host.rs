@@ -8740,7 +8740,23 @@ mod tests {
                 assert!(c.get(k).is_some(), "check missing {k}");
             }
         }
-        assert_eq!(exit_code(&report), 0, "{}", render(&report));
+        // `agent-uid` reads the live host (LiveHost by design — a
+        // fixture cannot lie to it), so a runner whose system gitconfig
+        // already arms §4's negative legitimately warns. The
+        // clean-host exit applies to the checks driven by `scan`.
+        let worst = report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["name"] != "agent-uid")
+            .map(|c| c["level"].as_str().unwrap_or("ok"))
+            .max_by_key(|l| match *l {
+                "fail" => 2,
+                "warn" => 1,
+                _ => 0,
+            })
+            .unwrap_or("ok");
+        assert_eq!(worst, "ok", "{}", render(&report));
         let task = report["checks"]
             .as_array()
             .unwrap()
