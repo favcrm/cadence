@@ -74,6 +74,9 @@ export function Select({
   const popRef = useRef<HTMLDivElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const keyClick = useRef(false);
+  // Set when a close should return focus to the trigger after the portal
+  // unmounts. Tab leaves it clear so the browser can move to the next control.
+  const restoreTrigger = useRef(false);
   const searchOn = showsSearch(options, searchable);
   const list = filterOptions(options, searchOn ? model.query : "");
   const selected = options.find((option) => option.value === value);
@@ -84,12 +87,11 @@ export function Select({
     setModel(nextModel);
   };
 
-  const commit = (next: string | null, nextModel: SelectModel) => {
+  const finish = (pick: string | null, nextModel: SelectModel, restore: boolean) => {
+    const wasOpen = modelRef.current.open;
     apply(nextModel);
-    if (next !== null) {
-      onChange(next);
-      triggerRef.current?.focus();
-    }
+    if (pick !== null) onChange(pick);
+    if (restore && wasOpen && !nextModel.open) restoreTrigger.current = true;
   };
 
   const onListKey = (event: ReactKeyboardEvent) => {
@@ -101,8 +103,17 @@ export function Select({
       alt: event.altKey,
     });
     if (result.prevent) event.preventDefault();
-    if (result.model !== current || result.pick !== null) commit(result.pick, result.model);
+    if (result.model !== current || result.pick !== null) {
+      const closing = current.open && !result.model.open;
+      finish(result.pick, result.model, closing && event.key !== "Tab");
+    }
   };
+
+  useLayoutEffect(() => {
+    if (model.open || !restoreTrigger.current) return;
+    restoreTrigger.current = false;
+    triggerRef.current?.focus();
+  }, [model.open]);
 
   useEffect(() => {
     if (!model.open) return;
@@ -110,7 +121,7 @@ export function Select({
       const target = event.target;
       if (!(target instanceof Node)) return;
       if (triggerRef.current?.contains(target) || popRef.current?.contains(target)) return;
-      apply(reduceOutside(modelRef.current));
+      finish(null, reduceOutside(modelRef.current), true);
     };
     document.addEventListener("pointerdown", onPointer);
     return () => document.removeEventListener("pointerdown", onPointer);
@@ -181,7 +192,7 @@ export function Select({
         }}
         onClick={() => {
           const result = reducePick(modelRef.current, option);
-          commit(result.pick, result.model);
+          finish(result.pick, result.model, result.pick !== null);
         }}
       >
         <span className="select-check" aria-hidden="true">
@@ -270,7 +281,8 @@ export function Select({
           }
           if (disabled) return;
           const current = modelRef.current;
-          apply(current.open ? closedSelect() : openSelect(options, value));
+          if (current.open) finish(null, closedSelect(), true);
+          else apply(openSelect(options, value));
         }}
         onKeyDown={(event) => {
           if (event.key === "Enter" || event.key === " ") {
