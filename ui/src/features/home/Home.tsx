@@ -21,6 +21,7 @@ import {
   type SlashCommand,
   type TurnState,
 } from "./master";
+import { atTail, jumpLabel, tailTop } from "./dock";
 import MasterChips from "./MasterChips";
 import NeedsRail from "./NeedsRail";
 import { askDraft, readRailCollapsed, writeRailCollapsed, type HomeNeed } from "./needs";
@@ -579,6 +580,11 @@ const discard = (message: string) => resources.masterThread.write((s) => discard
  * message — the menu completes verbs while the first token is typed,
  * Tab/Enter completes, Esc dismisses, and a complete `/verb [arg]`
  * submits through `onCommand` (never to the thread).
+ *
+ * CAD-600: this is the floating dock — pinned to the panel's bottom by
+ * its wrapper, the textarea growing with the draft up to ~8 lines and
+ * scrolling past that (the CSS max-height), and the focus staying in
+ * the box after a send.
  */
 function Composer({
   block,
@@ -599,33 +605,22 @@ function Composer({
   // reopens it (or a cleared draft does).
   const [menuOffFor, setMenuOffFor] = useState<string | null>(null);
   const form = useRef<HTMLFormElement>(null);
+  const box = useRef<HTMLTextAreaElement>(null);
   useEffect(() => {
     if (seed.n > 0) {
       setDraft(seed.text);
       setRefs(seed.refs ?? []);
     }
   }, [seed]);
-  // The composer is sticky on wide screens: keep scrolled-to controls
-  // (a plan card's buttons, a focused field) clear of it by reserving
-  // its height as the page's bottom scroll padding.
+  // CAD-600: the textarea grows with its content (auto-height), capped
+  // by the CSS max-height — past ~8 lines it scrolls instead. A seeded
+  // draft grows the same way, and a cleared one shrinks back.
   useEffect(() => {
-    const el = form.current;
-    const root = document.documentElement;
-    if (!el || typeof ResizeObserver === "undefined") return;
-    const apply = () => {
-      const sticky = getComputedStyle(el).position === "sticky";
-      root.style.scrollPaddingBottom = sticky ? `${el.offsetHeight + 24}px` : "";
-    };
-    const ro = new ResizeObserver(apply);
-    ro.observe(el);
-    addEventListener("resize", apply);
-    apply();
-    return () => {
-      ro.disconnect();
-      removeEventListener("resize", apply);
-      root.style.scrollPaddingBottom = "";
-    };
-  }, []);
+    const el = box.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight}px`;
+  }, [draft]);
 
   const slash = parseSlash(draft);
   // The menu shows while the draft is a verb prefix ("/", "/st") — once
@@ -649,6 +644,9 @@ function Composer({
     else sendToMaster(body, newMessageId(), refs);
     setDraft("");
     setRefs([]);
+    // The dock keeps the focus: a click on Send must not strand the
+    // caret on the button — the next message is one keystroke away.
+    box.current?.focus();
   };
   const onKey = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.nativeEvent.isComposing) return;
@@ -689,8 +687,9 @@ function Composer({
   return (
     <form
       ref={form}
-      className="card p-2.5 lg:sticky lg:bottom-3 relative"
+      className="card p-2.5 relative"
       data-composer
+      data-blocked={block ? "" : undefined}
       onSubmit={(e) => {
         e.preventDefault();
         submit();
@@ -742,6 +741,7 @@ function Composer({
         </div>
       )}
       <textarea
+        ref={box}
         value={draft}
         onChange={(e) => setDraft(e.target.value)}
         onKeyDown={onKey}
@@ -750,7 +750,7 @@ function Composer({
         placeholder={block ? "" : "Ask the master for work… (or / for commands)"}
         aria-label="message to the master"
         aria-expanded={matches.length > 0 || undefined}
-        className="w-full resize-y bg-transparent text-body text-ink-100 placeholder:text-ink-500 outline-none disabled:opacity-50 min-h-[2.75rem]"
+        className="w-full resize-none bg-transparent text-body text-ink-100 placeholder:text-ink-500 outline-none disabled:opacity-50 min-h-[2.75rem] max-h-40 overflow-y-auto"
       />
       <div className="flex items-center gap-2 mt-1.5">
         <p className="text-micro text-ink-500 min-w-0 flex-1 break-words" data-composer-block={block ? "" : undefined}>
@@ -835,7 +835,10 @@ const ThreadList = memo(function ThreadList({
  * and the smart-scroll pill. CAD-574 detaches the rail — its own
  * scroll, collapsible, a slide-over drawer under ~1100px — and turns
  * its "copy command" rows into Ask-master prefills with `refs`, plus
- * model/effort dropdowns on the header chips.
+ * model/effort dropdowns on the header chips. CAD-600 makes the chat a
+ * full-height panel — the thread scrolls inside it, the composer is a
+ * floating dock at its bottom, and the empty/not-started states sit
+ * centred in it with the dock disabled.
  */
 export default function Home({
   readOnly,
@@ -867,6 +870,12 @@ export default function Home({
   const pinned = useRef(true);
   const prevItems = useRef(0);
   const liveAfter = useRef<number | null>(null);
+  // CAD-600: the panel scrolls, not the page — its own scroller and the
+  // dock's measured height drive the follow, the pill and the padding.
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const dockRef = useRef<HTMLDivElement | null>(null);
+  /** Older history just paged in above: not an arrival, never a pill. */
+  const earlierLanded = useRef(false);
 
   const missing = thread.data?.missing === true;
   const status = masterStatus(agents.data, missing);
@@ -935,45 +944,65 @@ export default function Home({
     }
   }, [tailSeq]);
 
-  // Smart scroll (CAD-551): follow the tail only while the operator is
-  // already at the bottom — reading history up top is never yanked away.
-  // New items while unpinned count onto the "new messages" pill.
-  useEffect(() => {
-    const onScroll = () => {
-      // "At the tail" means the tail's own document position sits inside
-      // the viewport (±180): scrolled far above it OR far below it into a
-      // taller rail both count as away — arrivals bump the pill then.
-      const tail = tailBottom();
-      const near =
-        tail <= window.innerHeight + window.scrollY + 180 && tail >= window.scrollY - 180;
-      pinned.current = near;
-      if (near) setUnseen(0);
-    };
-    addEventListener("scroll", onScroll, { passive: true });
-    return () => removeEventListener("scroll", onScroll);
+  // Smart scroll (CAD-551; panel-scoped CAD-600): follow the tail only
+  // while the operator is already at the bottom of the thread — reading
+  // history up top is never yanked away. New items while unpinned count
+  // onto the "Jump to latest" pill.
+  const onScroll = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const near = atTail(el.scrollTop, el.scrollHeight, el.clientHeight);
+    pinned.current = near;
+    if (near) setUnseen(0);
   }, []);
+
+  const scrollToTail = useCallback((behavior: ScrollBehavior = "auto") => {
+    const el = scrollRef.current;
+    if (!el) return;
+    el.scrollTo({
+      top: tailTop(el.scrollHeight, el.clientHeight),
+      behavior: reducedMotion() ? "auto" : behavior,
+    });
+  }, []);
+
+  // The dock's measured height is the thread's bottom padding and the
+  // pill's floor (`--dock-h`, styles.css); while pinned, a growing dock
+  // (a longer draft, a wrapped hint) keeps the tail in view.
+  useEffect(() => {
+    const dock = dockRef.current;
+    if (!dock || typeof ResizeObserver === "undefined") return;
+    const apply = () => {
+      document.documentElement.style.setProperty("--dock-h", `${dock.offsetHeight}px`);
+      if (pinned.current) scrollToTail("auto");
+    };
+    const ro = new ResizeObserver(apply);
+    ro.observe(dock);
+    apply();
+    return () => {
+      ro.disconnect();
+      document.documentElement.style.removeProperty("--dock-h");
+    };
+  }, [scrollToTail]);
 
   const lastKey = items.length ? items[items.length - 1].key : "";
   useEffect(() => {
     const delta = items.length - prevItems.current;
     prevItems.current = items.length;
-    if (!lastKey) return;
-    // To the tail — the thread section's bottom edge, not the document's:
-    // a taller rail must not strand the follow below the conversation.
-    if (pinned.current) {
-      window.scrollTo(0, Math.max(0, tailBottom() - window.innerHeight));
-    } else if (delta > 0) {
-      setUnseen((u) => u + delta);
+    if (earlierLanded.current) {
+      earlierLanded.current = false;
+      return;
     }
-  }, [items.length, lastKey]);
+    if (!lastKey) return;
+    // To the tail — the panel's own bottom, so a taller rail beside it
+    // never strands the follow below the conversation.
+    if (pinned.current) scrollToTail("auto");
+    else if (delta > 0) setUnseen((u) => u + delta);
+  }, [items.length, lastKey, scrollToTail]);
 
   const jumpToLatest = () => {
     pinned.current = true;
     setUnseen(0);
-    window.scrollTo({
-      top: Math.max(0, tailBottom() - window.innerHeight),
-      behavior: reducedMotion() ? "auto" : "smooth",
-    });
+    scrollToTail("smooth");
   };
 
   /** One `/` verb → the board's command route; its answer is a card. */
@@ -1016,19 +1045,6 @@ export default function Home({
     [],
   );
 
-  /**
-   * Where the conversation actually ends (CAD-551 r2): the thread
-   * section's bottom edge in document coordinates. The rail beside it
-   * can run far taller — document `scrollHeight` then lies about "the
-   * bottom": scrolling there would leave the whole thread offscreen,
-   * and `pinned` would keep following to a spot with nothing in view.
-   */
-  const mainCol = useRef<HTMLElement | null>(null);
-  const tailBottom = () =>
-    mainCol.current
-      ? mainCol.current.getBoundingClientRect().bottom + window.scrollY
-      : document.documentElement.scrollHeight;
-
   const onEarlier = useCallback(() => {
     const data = resources.masterThread.get().data;
     if (!data) return;
@@ -1045,6 +1061,7 @@ export default function Home({
     setLoadingEarlier(true);
     page
       .then((older) => {
+        earlierLanded.current = true;
         resources.masterThread.write((cur) => applyEarlier(cur, older));
         setLimit((l) => l + WINDOW);
       })
@@ -1070,16 +1087,16 @@ export default function Home({
 
   return (
     <main
-      className={`px-4 lg:px-8 pt-5 pb-6 w-full min-w-0 grid gap-5 rail:items-start ${
+      className={`px-4 lg:px-8 pt-5 pb-3 w-full min-w-0 grid gap-5 grid-rows-[minmax(0,1fr)] flex-1 min-h-0 ${
         railCollapsed
           ? "rail:grid-cols-[minmax(0,1fr)_3rem]"
           : "rail:grid-cols-[minmax(0,1fr)_minmax(0,21rem)]"
       }`}
     >
-      {/* The rail is its own column (CAD-574): sticky under the header
-          and bounded to the viewport, so its `rail-scroll` scrolls
-          independently of the thread and the composer never moves. */}
-      <aside className="absolute rail:static min-w-0 rail:order-2 rail:sticky rail:top-[3.6rem] rail:h-[calc(100dvh-3.6rem)] rail:min-h-0">
+      {/* The rail is its own column (CAD-574), bounded by the panel's
+          height (CAD-600): its `rail-scroll` scrolls independently of
+          the thread, and the dock never moves. */}
+      <aside className="absolute rail:static min-w-0 rail:order-2 rail:h-full rail:min-h-0">
         <NeedsRail
           overview={overview}
           readOnly={readOnly}
@@ -1091,65 +1108,89 @@ export default function Home({
         />
       </aside>
 
-      <section className="min-w-0 rail:order-1 flex flex-col gap-4" aria-label="master thread" ref={mainCol}>
+      <section className="min-w-0 rail:order-1 flex flex-col min-h-0 gap-4" aria-label="master thread">
         <SinceCard onOpenIssue={onOpenIssue} />
 
-        <div className="flex items-center gap-2 flex-wrap">
-          <h1 className="text-section font-semibold text-ink-100">Master</h1>
-          <span
-            className={`chip ${
-              status.kind === "running"
-                ? "bg-ok/15 text-ok"
-                : status.kind === "unknown"
-                  ? "bg-ink-800 text-ink-400"
-                  : "bg-warn/10 text-warn"
-            }`}
-          >
-            {status.kind === "running" ? status.state : status.kind === "absent" ? "not started" : status.kind}
-          </span>
-          <MasterChips master={master.data} row={masterRow} readOnly={readOnly} />
-          {link && link !== "live" && status.kind === "running" && (
-            <span className="text-micro text-ink-500">{link === "stopped" ? "stream stopped" : "reconnecting…"}</span>
-          )}
-        </div>
-
-        {thread.status === "failed" && (
-          <div className="card px-3.5 py-3 text-label text-fail break-words" role="alert">
-            The thread could not be read — {thread.error}{" "}
-            <button className="lnk" onClick={() => void resources.masterThread.refresh()}>
-              Retry
-            </button>
+        {/* CAD-600: the conversation panel — the master's header, the
+            thread scrolling inside it, and the composer docked to its
+            bottom. It fills the height below the board header; the page
+            itself never scrolls for the chat. */}
+        <div className="relative flex-1 min-h-0 flex flex-col" data-chat-panel>
+          <div className="flex items-center gap-2 flex-wrap pb-2.5 border-b border-ink-700/70">
+            <h1 className="text-section font-semibold text-ink-100">Master</h1>
+            <span
+              className={`chip ${
+                status.kind === "running"
+                  ? "bg-ok/15 text-ok"
+                  : status.kind === "unknown"
+                    ? "bg-ink-800 text-ink-400"
+                    : "bg-warn/10 text-warn"
+              }`}
+            >
+              {status.kind === "running" ? status.state : status.kind === "absent" ? "not started" : status.kind}
+            </span>
+            <MasterChips master={master.data} row={masterRow} readOnly={readOnly} />
+            {link && link !== "live" && status.kind === "running" && (
+              <span className="text-micro text-ink-500">{link === "stopped" ? "stream stopped" : "reconnecting…"}</span>
+            )}
           </div>
-        )}
-        {!loaded && thread.status !== "failed" && <p className="text-label text-ink-500">Reading the thread…</p>}
-        {showNotStarted && items.length === 0 && <NotStarted status={status} />}
-        {empty && !showNotStarted && (
-          <Examples onPick={(t) => setSeed((s) => ({ text: t, n: s.n + 1 }))} disabled={!!block} />
-        )}
 
-        <ThreadList
-          items={items}
-          limit={limit}
-          moreBefore={moreBefore}
-          loadingEarlier={loadingEarlier}
-          onEarlier={onEarlier}
-          readOnly={readOnly}
-          onOpenIssue={onOpenIssue}
-          liveAfter={liveAfter.current ?? 0}
-        />
-        {cmds.map((c) => (
-          <CmdCard key={c.id} cmd={c} onOpenIssue={onOpenIssue} />
-        ))}
-        <WorkingRow turn={turn} step={step} onStop={() => runCommand("stop", "")} />
+          {thread.status === "failed" && (
+            <div className="card px-3.5 py-3 mt-3 text-label text-fail break-words" role="alert">
+              The thread could not be read — {thread.error}{" "}
+              <button className="lnk" onClick={() => void resources.masterThread.refresh()}>
+                Retry
+              </button>
+            </div>
+          )}
+          {!loaded && thread.status !== "failed" && (
+            <p className="text-label text-ink-500 pt-3">Reading the thread…</p>
+          )}
 
-        <Composer block={block} seed={seed} onCommand={runCommand} />
+          <div
+            className="chat-scroll min-h-0 flex-1 overflow-y-auto pt-3"
+            ref={scrollRef}
+            onScroll={onScroll}
+            data-chat-scroll
+          >
+            {showNotStarted && items.length === 0 && (
+              <div className="chat-empty">
+                <NotStarted status={status} />
+              </div>
+            )}
+            {empty && !showNotStarted && (
+              <div className="chat-empty">
+                <Examples onPick={(t) => setSeed((s) => ({ text: t, n: s.n + 1 }))} disabled={!!block} />
+              </div>
+            )}
+
+            <ThreadList
+              items={items}
+              limit={limit}
+              moreBefore={moreBefore}
+              loadingEarlier={loadingEarlier}
+              onEarlier={onEarlier}
+              readOnly={readOnly}
+              onOpenIssue={onOpenIssue}
+              liveAfter={liveAfter.current ?? 0}
+            />
+            {cmds.map((c) => (
+              <CmdCard key={c.id} cmd={c} onOpenIssue={onOpenIssue} />
+            ))}
+            <WorkingRow turn={turn} step={step} onStop={() => runCommand("stop", "")} />
+          </div>
+
+          {unseen > 0 && (
+            <button type="button" className="newpill num" onClick={jumpToLatest} data-jump-to-latest>
+              ↓ {jumpLabel(unseen)}
+            </button>
+          )}
+
+          <div className="chatdock" ref={dockRef} data-chat-dock>
+            <Composer block={block} seed={seed} onCommand={runCommand} />
+          </div>
+        </div>
       </section>
-
-      {unseen > 0 && (
-        <button type="button" className="newpill num" onClick={jumpToLatest}>
-          ↓ {unseen} new {unseen === 1 ? "message" : "messages"}
-        </button>
-      )}
     </main>
   );
 }

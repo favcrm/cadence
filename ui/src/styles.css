@@ -396,13 +396,15 @@ pre {
   font-size: var(--text-secondary);
 }
 
-/* The "new messages" pill — fixed over the thread column's middle. */
+/* The "jump to latest" pill — over the thread's tail, above the dock
+   (CAD-600: the panel's own overlay, its floor the dock's measured
+   height, never the page). */
 .newpill {
-  position: fixed;
+  position: absolute;
   left: 50%;
   transform: translateX(-50%);
-  bottom: 6.5rem;
-  z-index: 40;
+  bottom: calc(var(--dock-h, 7rem) + .6rem);
+  z-index: 25;
   padding: .35rem .9rem;
   border-radius: 9999px;
   border: 1px solid color-mix(in srgb, var(--color-accent) 45%, var(--color-ink-700));
@@ -748,11 +750,12 @@ pre {
   letter-spacing: .02em;
 }
 
-/* The floating drawer button (<1100px). */
+/* The floating drawer button (<1100px) — above the chat's dock
+   (CAD-600), whose measured height `--dock-h` carries. */
 .needbtn {
   position: fixed;
   right: 1rem;
-  bottom: 5.5rem;
+  bottom: calc(var(--dock-h, 7rem) + .75rem);
   z-index: 45;
   display: flex;
   align-items: center;
@@ -938,6 +941,59 @@ button.refchip:hover {
   border-color: var(--color-fail);
   color: var(--color-fail);
 }
+}
+
+/* ---- CAD-600: the full-height chat panel and its floating dock ----
+   Home is a panel that fills the viewport below the board header: the
+   thread scrolls inside `chat-scroll`, and the composer floats over the
+   tail as `chatdock`. Home measures the dock and sets `--dock-h` (on
+   :root), so the thread's bottom padding, the jump pill's floor and the
+   phone's Needs-you button all clear the dock exactly — the last
+   message is never hidden, at any width, with the safe area respected
+   on a phone. */
+
+.chat-scroll {
+  overscroll-behavior: contain;
+  padding-bottom: calc(var(--dock-h, 7rem) + .75rem);
+}
+
+/* The empty and not-started states sit centred in the panel — the
+   thread region above the dock, whatever its height. */
+.chat-empty {
+  min-height: 100%;
+  display: grid;
+  place-items: center;
+}
+.chat-empty > * {
+  width: 100%;
+  max-width: 42rem;
+}
+
+/* The dock: pinned to the panel's bottom, the card floating over the
+   thread's tail with a subtle shadow; the phone's safe area is padding,
+   so the textarea never sits under the home indicator. */
+.chatdock {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 20;
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+.chatdock > [data-composer] {
+  box-shadow: 0 8px 24px rgb(0 0 0 / .28);
+}
+.chatdock > [data-composer][data-blocked] {
+  border-style: dashed;
+}
+.chatdock > [data-composer][data-blocked] textarea {
+  min-height: 2.75rem;
+}
+
+/* A dock whose textarea has grown: the card's own scrollbar stays
+   inside the rounded corners. */
+.chatdock textarea {
+  scrollbar-gutter: stable;
 }
 
 @media (prefers-reduced-motion: no-preference) {
