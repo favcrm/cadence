@@ -1295,3 +1295,33 @@ button.refchip:hover {
   from { opacity: 0; }
   to { opacity: 1; }
 }
+
+/* Home: a quiet conversation desk with a separate team journal. */
+.home-workspace .chat-scroll > *,
+.home-workspace .chatdock {
+  width: min(100%, 52rem);
+  margin-inline: auto;
+}
+.home-workspace .chatdock { left: 0; right: 0; }
+.home-workspace .chat-scroll { scrollbar-gutter: stable; }
+.home-workspace .issue-reader { line-height: 1.7; }
+.home-workspace .issue-reader p { text-wrap: pretty; }
+.home-workspace [data-kind="answer"] { padding-block: .35rem .9rem; }
+.home-workspace .master-heading { padding-block: .25rem .75rem; }
+.home-workspace [data-composer][data-blocked] { background: var(--color-ink-875); border-style: solid; }
+.home-workspace [data-composer][data-blocked] textarea { min-height: 2rem; }
+.activity-tabs { display: flex; gap: 1.25rem; padding: 0 1rem; border-bottom: 1px solid var(--color-ink-700); }
+.activity-tabs button { padding: .8rem 0; font-size: var(--text-label); color: var(--color-ink-500); border-bottom: 2px solid transparent; }
+.activity-tabs button[aria-pressed="true"] { color: var(--color-accent); border-color: var(--color-accent); }
+.activity-tabs button span { margin-left: .35rem; font-size: var(--text-micro); }
+.agent-update-card { padding: 1rem; border-bottom: 1px solid var(--color-ink-700); }
+.agent-presence { width: .4rem; height: .4rem; flex-shrink: 0; border-radius: 50%; background: var(--color-ink-500); }
+.agent-presence.is-working { background: var(--color-accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-accent) 10%, transparent); }
+.agent-presence.is-fenced { background: var(--color-warn); }
+.agent-context { margin-top: .65rem; font-size: var(--text-label); line-height: 1.6; color: var(--color-ink-300); overflow-wrap: anywhere; }
+.agent-update-notes { margin-top: .8rem; padding-left: .8rem; border-left: 1px solid var(--color-ink-700); display: grid; gap: .75rem; }
+.agent-update-notes time { margin-left: auto; white-space: nowrap; }
+.agent-update-detail { font-size: var(--text-label); line-height: 1.6; color: var(--color-ink-400); overflow-wrap: anywhere; }
+.agent-update-detail summary { cursor: pointer; margin-top: .2rem; }
+.agent-update-detail p { white-space: pre-wrap; margin-top: .5rem; }
+.agent-update-detail[open] summary { color: var(--color-accent); }

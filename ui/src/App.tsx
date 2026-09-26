@@ -136,6 +136,7 @@ export default function App() {
   // The serving build when it differs from this bundle's — drives the
   // reload banner (CAD-573).
   const [staleBuild, setStaleBuild] = useState<string | null>(null);
+  const [dismissedBuild, setDismissedBuild] = useState<string | null>(null);
   const toastTimer = useRef<number>(0);
 
   // Writes are off on a read-only board and, since CAD-313, until this
@@ -297,7 +298,7 @@ export default function App() {
     return () => sub.close();
   }, [loadDetail]);
 
-  // The banner's only action — never automatic. The composer draft is
+  // Reload is explicit — never automatic. The composer draft is
   // stashed first so one click costs no text (CAD-573).
   const reload = useCallback(() => {
     const storage = sessionStore();
@@ -474,14 +475,13 @@ export default function App() {
 
   return (
     <WriteGate.Provider value={block}>
-    {staleBuild !== null && (
+    {staleBuild !== null && staleBuild !== dismissedBuild && (
       <div
-        role="alert"
+        role="status"
         data-build-banner
-        className="fixed inset-x-0 top-0 z-50 flex items-center justify-center gap-3 border-b border-ink-900/20 bg-warn px-4 py-2.5 text-ink-900"
+        className="fixed right-4 top-14 z-50 flex items-center gap-3 rounded-lg border border-ink-700 bg-ink-850 px-4 py-3 text-ink-200 shadow-lg max-w-[calc(100vw-2rem)]"
       >
-        <span className="text-label font-medium">Cadence was updated</span>
-        <span className="num hidden sm:inline text-micro opacity-60">({staleBuild})</span>
+        <span className="text-label font-medium" title={staleBuild}>Cadence was updated</span>
         <button
           type="button"
           onClick={reload}
@@ -489,6 +489,7 @@ export default function App() {
         >
           Reload
         </button>
+        <button type="button" aria-label="Dismiss update notification" onClick={() => setDismissedBuild(staleBuild)} className="h-7 px-2 text-label text-ink-400 hover:text-ink-100">Later</button>
       </div>
     )}
     <div
@@ -547,15 +548,10 @@ export default function App() {
         </header>
 
         {updateBanner && (
-          <div className="border-b border-amber-500/40 bg-amber-500/10 px-4 lg:px-8 py-2 text-body text-ink-200">
-            <span className="font-semibold">Update in progress</span> —{" "}
-            {updateBanner.pending.from ?? "?"} →{" "}
-            <span className="num">{updateBanner.pending.target}</span> (
-            {updateBanner.pending.phase}) by {updateBanner.pending.by}
-            {updateBanner.count > 0
-              ? ` · waiting for ${updateBanner.count} turn${updateBanner.count === 1 ? "" : "s"}`
-              : " · nothing in flight"}
-          </div>
+          <details className="update-notice border-b border-amber-500/30 bg-amber-500/5 px-4 lg:px-8 py-2 text-label text-ink-300">
+            <summary className="cursor-pointer"><span className="font-medium text-ink-200">Updating Cadence</span> · {updateBanner.count > 0 ? `Waiting for ${updateBanner.count} active turn${updateBanner.count === 1 ? "" : "s"}` : "No active turns remaining"}<span className="text-ink-500 ml-3">Details</span></summary>
+            <p className="num text-micro text-ink-500 mt-2 break-all">{updateBanner.pending.from ?? "?"} → {updateBanner.pending.target} · {updateBanner.pending.phase} · {updateBanner.pending.by}</p>
+          </details>
         )}
 
         {menuOpen && (
