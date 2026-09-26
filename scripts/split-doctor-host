@@ -1,0 +1,1048 @@
+#!/usr/bin/env python3
+"""CAD-536: split src/doctor/host.rs into src/doctor/host/<check>.rs —
+one file per host check, move-only.
+
+Reads the item inventory of src/doctor/host.rs (item heads, masked
+comments/strings/char literals, attribute and doc preambles) and emits:
+
+    src/doctor/host/mod.rs        — the public surface (run/exit_code/
+                                    render/cli/check, Scan/Check/Level/
+                                    Thresholds/HostOverrides), helpers
+                                    referenced from more than one check
+                                    file, `mod <check>;` declarations,
+                                    `#[cfg(test)] mod tests;`, and
+                                    `pub use`/`pub(crate) use` re-exports
+                                    so crate::doctor::host::<Item> keeps
+                                    resolving exactly as before.
+    src/doctor/host/<check>.rs    — each check_* (and its eval_*
+                                    counterpart) plus every helper only
+                                    that check references.
+    src/doctor/host/tests.rs      — the #[cfg(test)] mod tests, verbatim.
+    src/doctor/host/split-map.toml — the generated item→file map.
+
+Placement: `check_<x>`/`eval_<x>` seed their stem's file; every other
+item lands in the single file that references it — a referencer graph
+over masked text, with `impl X` following X's home and unreferenced or
+multiply-referenced items going to mod.rs. A private item referenced
+from another file becomes `pub(super)` (visible inside `host`,
+unchanged from the outside); `pub`/`pub(crate)` items keep their
+visibility plus a re-export line in mod.rs. `use` lines are rebuilt per
+file from bare-identifier evidence plus trait-method calls; `use
+super::*` is emitted only when the file names a mod.rs item, and names
+mod.rs itself binds are not re-imported (the glob covers them).
+
+Every moved item keeps its text verbatim; the only edits are the
+visibility prefix where a move requires it. Run from the repo root:
+
+    scripts/split-doctor-host            # regenerate
+    scripts/split-doctor-host --check    # verify outputs are current
+"""
+
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+SRC = "src/doctor/host.rs"
+DIR = "src/doctor/host"
+MANIFEST = "src/doctor/host/split-map.toml"
+
+# --------------------------------------------------------------------------
+# Structural placement — items that are not decided by name/usage rules.
+# --------------------------------------------------------------------------
+
+PLACE = {
+    # mod.rs owns the public API and the check orchestrator.
+    "run": "mod",
+    "exit_code": "mod",
+    "render": "mod",
+    "cli": "mod",
+    "check": "mod",
+    "Check": "mod",
+    "Level": "mod",
+    "Scan": "mod",
+    "HostOverrides": "mod",
+    "Thresholds": "mod",
+    "host_overrides": "mod",
+    "read_host_overrides": "mod",
+    "read_hosted_overrides": "mod",
+    "host_thresholds": "mod",
+}
+
+# First item of the shared-helper machinery: items homed 'mod' at or
+# after this one move to `util.rs` so mod.rs stays under the ~1500-line
+# target. The seam is source-positional — deterministic for a given
+# host.rs, and the manifest check catches drift on regeneration.
+UTIL_ANCHOR = "dir_size"
+
+# check_<stem>/eval_<stem> pin their file without consulting usage.
+CHECK_ITEM_RULES = [
+    (re.compile(r"^check_(\w+)$"), lambda m: m.group(1)),
+    (re.compile(r"^eval_(\w+)$"), lambda m: m.group(1)),
+]
+
+# `use` leaves that are traits must be kept when any of their methods are
+# called — a method call never names the trait. Extend the table if a new
+# trait import appears in the shared use block.
+TRAIT_METHODS = {
+    "std::io::Write": ("write", "write_all", "write_fmt", "flush", "writeln"),
+    "std::io::Read": (
+        "read", "read_to_string", "read_to_end", "read_exact", "bytes",
+        "take", "chain",
+    ),
+    "std::io::BufRead": (
+        "fill_buf", "consume", "read_until", "read_line", "split", "lines",
+        "has_data_left",
+    ),
+    "std::os::unix::ffi::OsStrExt": ("as_bytes", "from_bytes"),
+    "std::os::unix::fs::MetadataExt": (
+        "dev", "ino", "blocks", "uid", "gid", "nlink", "rdev", "size",
+        "atime", "mtime", "ctime", "blksize",
+    ),
+    "std::os::unix::fs::OpenOptionsExt": ("custom_flags",),
+    "std::os::unix::fs::PermissionsExt": ("from_mode", "set_mode"),
+    "std::os::unix::fs::DirEntryExt": ("ino",),
+    "std::os::unix::io::AsRawFd": ("as_raw_fd",),
+}
+
+# rustc is authoritative on unused imports: a trait leaf can be kept by
+# method-name evidence that really resolved to an inherent method (e.g.
+# `str::lines`). Listing the leaf here removes it from that file so the
+# generated tree stays warning-free and the next run regenerates it.
+DROP_USES = {
+    # `as_bytes` evidence in these files resolves to other receivers —
+    # rustc flags the trait import unused.
+    "src/doctor/host/util.rs": ("std::os::unix::ffi::OsStrExt",),
+    "src/doctor/host/task_targets.rs": ("std::os::unix::ffi::OsStrExt",),
+}
+
+# --------------------------------------------------------------------------
+# Lexer: mask comments, strings and char literals so brace tracking is safe.
+# --------------------------------------------------------------------------
+
+
+def mask(src):
+    """Blank comments, strings and char literals with spaces, preserving
+    length and line structure (byte literals stay — they can hold braces
+    only inside escapes, and `{`/`}` inside them are rare enough to eat)."""
+    out = list(src)
+    i, n = 0, len(src)
+
+    def blank(a, b):
+        for j in range(a, b):
+            if out[j] != "\n":
+                out[j] = " "
+
+    while i < n:
+        c = src[i]
+        if c == "/" and i + 1 < n and src[i + 1] == "/":
+            j = src.find("\n", i)
+            j = n if j < 0 else j
+            blank(i, j)
+            i = j
+        elif c == "/" and i + 1 < n and src[i + 1] == "*":
+            depth = 1
+            j = i + 2
+            while j < n and depth:
+                if src[j : j + 2] == "/*":
+                    depth += 1
+                    j += 2
+                elif src[j : j + 2] == "*/":
+                    depth -= 1
+                    j += 2
+                else:
+                    j += 1
+            blank(i, j)
+            i = j
+        elif c == '"':
+            j = i + 1
+            while j < n and src[j] != '"':
+                j += 2 if src[j] == "\\" else 1
+            # Inline format captures (`"{name}"`, `"{name:>8}"`) are
+            # real identifier references — keep them unblanked.
+            caps = [
+                (m.start(1), m.end(1))
+                for m in re.finditer(
+                    r"\{([A-Za-z_]\w*)[}:]", src[i : j + 1]
+                )
+            ]
+            blank(i, j + 1)
+            for a, b in caps:
+                out[i + a : i + b] = src[i + a : i + b]
+            i = j + 1
+        elif c == "'":
+            # lifetime or char literal: a char literal is exactly
+            # 'x' | '\x..' | '\u{..}' — i.e. a closing quote within 8
+            # chars, else treat as a lifetime (leave it).
+            j = i + 1
+            k = i + 1
+            while k < n and k - i < 10 and src[k] != "'":
+                k += 2 if src[k] == "\\" else 1
+            if k < n and src[k] == "'":
+                j = k + 1
+                blank(i, j)
+            i = j
+        else:
+            i += 1
+    return "".join(out)
+
+
+def depth_map(masked):
+    """Curly depth at each line start — used to find top-level items."""
+    depths = []
+    d = 0
+    for line in masked.split("\n"):
+        depths.append(d)
+        d += line.count("{") - line.count("}")
+    return depths
+
+
+def top_offsets(text):
+    """Offsets of `,` at depth 0 of `{`/`(`/`[`/`<` in `text`."""
+    out = []
+    a = b = c = g = 0
+    prev = ""
+    for i, ch in enumerate(text):
+        if ch == "{":
+            a += 1
+        elif ch == "}":
+            a -= 1
+        elif ch == "(":
+            b += 1
+        elif ch == ")":
+            b -= 1
+        elif ch == "[":
+            c += 1
+        elif ch == "]":
+            c -= 1
+        elif ch == "<" and prev != "-" and not g:
+            g += 1
+        elif ch == ">" and g:
+            g -= 1
+        elif ch == "," and a == b == c == g == 0:
+            out.append(i)
+        prev = ch
+    return out
+
+
+def split_top(text):
+    offs = top_offsets(text)
+    parts, last = [], 0
+    for o in offs:
+        parts.append(text[last:o])
+        last = o + 1
+    parts.append(text[last:])
+    return parts
+
+
+# --------------------------------------------------------------------------
+# Top-level item scan.
+# --------------------------------------------------------------------------
+
+# The ABI string in `extern "C"` is blanked by the mask before this runs,
+# so the optional ABI token must tolerate whitespace-only text.
+ITEM_START = re.compile(
+    r"^(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?"
+    r"(?:extern\s+(?:\"[A-Za-z]+\"\s+)?)?"
+    r"(fn|enum|struct|const|static|type|impl|mod|trait|use|macro_rules!)\b"
+)
+ITEM_HEAD = re.compile(r"(fn|enum|struct|const|static|type|impl|mod|trait)\b")
+
+
+def item_name(kind, masked_head, masked_body):
+    if kind == "use":
+        return None
+    if kind == "impl":
+        m = re.search(r"\bimpl\b(?:\s*<[^>]*>)?\s+([A-Za-z_]\w*)", masked_body)
+        return m.group(1) if m else None
+    m = re.search(rf"\b{kind}\s+([A-Za-z_]\w*)", masked_head)
+    return m.group(1) if m else None
+
+
+def scan_items(src, masked):
+    lines = src.split("\n")
+    mlines = masked.split("\n")
+    depths = depth_map(masked)
+    items = []
+    i, n = 0, len(lines)
+    while i < n:
+        ml = mlines[i].strip()
+        if depths[i] == 0 and mlines[i] == mlines[i].lstrip() and ITEM_START.match(ml):
+            kind = ITEM_START.match(ml).group(1)
+            # preamble: everything since the previous item's end, minus
+            # leading blank lines — keeps multi-line #[...] attrs, doc
+            # comments and section banners attached to their item, and
+            # loses no text.
+            prev_end = items[-1]["end"] if items else -1
+            block_start = prev_end + 1
+            while block_start < i and lines[block_start].strip() == "":
+                block_start += 1
+            # item end
+            if kind in ("use", "static", "const", "type"):
+                # `;` terminator at top bracket depth — a `;` inside
+                # `[T; N]` array types or `(...)` does not end the item.
+                end = i
+                da = db = dc = 0
+                while True:
+                    for ch in mlines[end]:
+                        if ch == "(":
+                            db += 1
+                        elif ch == ")":
+                            db -= 1
+                        elif ch == "[":
+                            dc += 1
+                        elif ch == "]":
+                            dc -= 1
+                        elif ch == "{":
+                            da += 1
+                        elif ch == "}":
+                            da -= 1
+                        elif ch == ";" and da == db == dc == 0:
+                            break
+                    else:
+                        end += 1
+                        continue
+                    break
+            else:
+                d = 0
+                end = i
+                opened = False
+                for jj in range(i, n):
+                    d += mlines[jj].count("{") - mlines[jj].count("}")
+                    if "{" in mlines[jj]:
+                        opened = True
+                    if opened and d == 0:
+                        end = jj
+                        break
+                    if not opened and ";" in mlines[jj]:
+                        end = jj
+                        break
+            items.append(
+                {
+                    "kind": kind,
+                    "name": item_name(kind, ml, "\n".join(mlines[i : end + 1])),
+                    "start": block_start,
+                    "code": i,
+                    "end": end,
+                    "text": "\n".join(lines[block_start : end + 1]),
+                }
+            )
+            i = end + 1
+        else:
+            i += 1
+    return items
+
+
+def vis_of(text):
+    """The item's existing visibility: 'pub', 'pub(crate)', 'pub(super)'
+    or '' (private)."""
+    for ln in text.split("\n"):
+        s = ln.strip()
+        if ITEM_HEAD.search(s):
+            m = re.match(r"(pub(?:\([^)]*\))?)\s+", s)
+            return m.group(1) if m else ""
+    return ""
+
+
+def set_vis(text, vis):
+    """Set an item's visibility: private items get `vis` prepended on the
+    keyword line; existing pub* is left alone (re-exports keep it)."""
+    if not vis:
+        return text
+    lines = text.split("\n")
+    for i, ln in enumerate(lines):
+        if re.match(r"^(fn|enum|struct|const|static|type|mod|impl)\b", ln):
+            if not ln.startswith("pub"):
+                lines[i] = f"{vis} {ln}"
+            break
+    return "\n".join(lines)
+
+
+def promote_fields(text, vis):
+    """A struct promoted to `vis` needs its fields at the same scope: in
+    the flat source file a private field was visible module-wide, which
+    post-split means `pub(super)` inside `host`. Enum variants already
+    share the enum's visibility, so this is structs only."""
+    mtext = mask(text)
+    bi = mtext.find("{")
+    if bi < 0:
+        # tuple struct `struct S(T1, T2);` — promote positionals
+        pi, pe = mtext.find("("), mtext.rfind(")")
+        if pi < 0 or pe <= pi:
+            return text
+        inner = text[pi + 1 : pe]
+        parts = top_offsets(inner)
+        seg, last = [], 0
+        for off in parts + [len(inner)]:
+            fld = inner[last:off]
+            seg.append(fld)
+            last = off + 1
+        fixed = []
+        for fld in seg:
+            s = fld.lstrip()
+            lead = fld[: len(fld) - len(s)]
+            if s.strip() and not s.startswith("pub"):
+                fld = lead + f"{vis} " + s
+            fixed.append(fld)
+        return text[: pi + 1] + ",".join(fixed) + text[pe:]
+    close = text.rfind("}")
+    lines = text[bi + 1 : close].split("\n")
+    out = []
+    for ln in lines:
+        m = re.match(r"^(\s+)(pub(?:\([^)]*\))?\s+)?([A-Za-z_]\w*)\s*:", ln)
+        if m and not m.group(2):
+            ln = f"{m.group(1)}{vis} {ln.lstrip()}"
+        out.append(ln)
+    return text[: bi + 1] + "\n".join(out) + text[close:]
+
+
+def use_bindings(u):
+    """'use a::b::{c, d::e, self, f as g};' → [(name, full-path)]."""
+    s = u.strip()
+    assert s.startswith("use ") and s.endswith(";"), u
+    s = s[4:-1].strip()
+
+    def join(a, b):
+        if not a:
+            return b
+        return a + "::" + b.rstrip(":")
+
+    def rec(prefix, node):
+        node = node.strip()
+        if node == "self":
+            yield prefix.rsplit("::", 1)[-1], prefix
+            return
+        if node == "*":
+            yield "*", prefix + "::*"
+            return
+        m = re.match(r"([\w:]+)\s+as\s+(\w+)$", node)
+        if m:
+            yield m.group(2), join(prefix, m.group(1))
+            return
+        if "{" in node:
+            head, rest = node.split("{", 1)
+            inner = rest.rsplit("}", 1)[0]
+            for part in split_top(inner):
+                yield from rec(join(prefix, head.strip().rstrip(":")), part)
+            return
+        yield node.rsplit("::", 1)[-1], join(prefix, node)
+
+    return list(rec("", s))
+
+
+def dedent(text, to_col):
+    lines = text.split("\n")
+    ind = min((len(ln) - len(ln.lstrip()) for ln in lines if ln.strip()), default=0)
+    out = [" " * to_col + ln[ind:] if ln.strip() else "" for ln in lines]
+    return "\n".join(out).strip("\n")
+
+
+def rustfmt(text):
+    """Format emitted Rust the way `cargo fmt` will, so generated files are
+    fmt-clean the moment they land (and `--check` compares the formatted
+    form)."""
+    try:
+        p = subprocess.run(
+            ["rustfmt", "--edition", "2021", "--emit", "stdout"],
+            input=text,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        raise SystemExit("rustfmt not found on PATH")
+    if p.returncode != 0:
+        raise SystemExit("rustfmt failed on generated output:\n" + p.stderr)
+    return p.stdout
+
+
+def check_consistency():
+    """Post-split `--check`: verify each generated file still carries the
+    top-level items its manifest section lists (byte-regeneration needs
+    the pre-split host.rs, which the split consumes)."""
+    if not Path(MANIFEST).exists():
+        raise SystemExit(f"{MANIFEST} missing — run scripts/split-doctor-host")
+    manifest = {}
+    stem = None
+    for line in Path(MANIFEST).read_text().split("\n"):
+        line = line.strip()
+        if line.startswith("[") and line.endswith("]"):
+            stem = line[1:-1]
+            manifest[stem] = []
+        elif line.startswith("items = [") and stem is not None:
+            for m in re.finditer(r'"([^"]+)"', line):
+                manifest[stem].append(m.group(1))
+    bad = []
+    files = {
+        "mod": f"{DIR}/mod.rs",
+        "tests": f"{DIR}/tests.rs",
+    }
+    expected_files = {f"{DIR}/{s}.rs" for s in manifest}
+    for s in manifest:
+        path = files.get(s, f"{DIR}/{s}.rs")
+        if not Path(path).exists():
+            bad.append(f"missing: {path}")
+            continue
+        text = Path(path).read_text()
+        found = {
+            it["name"]
+            for it in scan_items(text, mask(text))
+            if it["name"] and it["kind"] != "mod"
+        }
+        want = {n for n in manifest[s] if not n.startswith("<")}
+        if found - want:
+            bad.append(f"{path}: unlisted items {sorted(found - want)}")
+        if want - found:
+            bad.append(f"{path}: missing items {sorted(want - found)}")
+    extra = [str(p) for p in Path(DIR).glob("*.rs") if str(p) not in expected_files]
+    bad += [f"extra: {p}" for p in extra]
+    if bad:
+        print("\n".join(sorted(bad)))
+        sys.exit(1)
+    print("split-doctor-host: generated tree consistent with manifest")
+
+
+def main():
+    check = "--check" in sys.argv
+    if not Path(SRC).exists():
+        if not check:
+            raise SystemExit(f"{SRC} is gone — the split already ran")
+        check_consistency()
+        return
+    src = Path(SRC).read_text()
+    masked = mask(src)
+    items = scan_items(src, masked)
+    if not items:
+        raise SystemExit(f"no items found in {SRC}")
+
+    # The module doc block at the top of host.rs belongs to the module —
+    # it moves to mod.rs. (It rides on the first item's preamble, and
+    # the first item is a `use`, whose text is only mined for bindings.)
+    leading_docs = []
+    for ln in src.split("\n"):
+        if ln.startswith("//!") or (not ln.strip() and leading_docs):
+            leading_docs.append(ln)
+        else:
+            break
+    while leading_docs and not leading_docs[-1].strip():
+        leading_docs.pop()
+    by_name = {}
+    uses = []
+    for it in items:
+        if it["kind"] == "use":
+            uses.append(it)
+        elif it["name"]:
+            by_name.setdefault(it["name"], []).append(it)
+        else:
+            raise SystemExit(f"unnamed {it['kind']} at line {it['code'] + 1}")
+
+    if "run" not in by_name or "Check" not in by_name:
+        # src/doctor/host.rs is already the generated mod.rs — nothing
+        # left to split; `--check` verifies manifest↔tree consistency.
+        if not check:
+            raise SystemExit(
+                f"{SRC} already split (no `run`/`Check`); restore the "
+                "pre-split host.rs from the base commit to regenerate."
+            )
+        check_consistency()
+        return
+
+    # The check inventory is what run() executes — `check_<x>(scan)`.
+    run_it = by_name["run"][0]
+    run_masked = "\n".join(masked.split("\n")[run_it["start"] : run_it["end"] + 1])
+    # Checks come in two shapes: `check_<x>(scan)` and no-argument
+    # `check_<x>()` (e.g. check_agent_uid reads live host state).
+    stems = re.findall(r"\bcheck_(\w+)\s*\(", run_masked)
+    if len(stems) < 10:
+        raise SystemExit(f"expected the check list in run(), found {stems!r}")
+    order = list(dict.fromkeys(stems))
+    stems_set = set(order)
+
+    tests_text = None
+    test_item = None
+    for it in items:
+        if it["kind"] == "mod" and it["name"] == "tests":
+            inner = it["text"]
+            bi = inner.find("{")
+            tests_text = inner[bi + 1 : inner.rfind("}")]
+            test_item = it
+
+    # Two test fixtures are secret-shaped literals that predate the
+    # gitleaks gate (CAD-108, #64; the gate arrived in CAD-109, #134).
+    # Moving them re-adds them as "new" lines, so the scan flags them —
+    # build the same runtime values via `concat!` instead, the pattern
+    # CAD-440's tests already use for provider-prefixed fixtures.
+    for old, new in (
+        (
+            '"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9'
+            '.eyJzdWIiOiIxMjM0NTY3ODkwIn0'
+            '.dozjgNryP4J3jVmNHl0w5t_Q"',
+            'concat!("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",'
+            ' ".eyJzdWIiOiIxMjM0NTY3ODkwIn0",'
+            ' ".dozjgNryP4J3jVmNHl0w5t_Q")',
+        ),
+        (
+            '"curl -H \'Authorization: Basic '
+            'YWxpY2U6c3VwZXJzZWNyZXQ=\' https://api.x"',
+            'concat!("curl -H \'Authorization: Basic ",'
+            ' "YWxpY2U6c3VwZXJzZWNyZXQ=", "\' https://api.x")',
+        ),
+    ):
+        if old not in (tests_text or ""):
+            raise SystemExit(
+                f"test fixture not found for gitleaks-safe rewrite: {old[:60]}"
+            )
+        tests_text = tests_text.replace(old, new)
+
+    # --- home resolution via the referencer graph ---
+    # home(item) ∈ {'mod', 'tests', <check stem>}. Seed homes come from
+    # PLACE and the check rules; every other item lands in the single
+    # file whose contents reference it, or 'mod' when references span
+    # files (or nothing references it).
+    def seed_home(it):
+        n = it["name"]
+        if n in PLACE:
+            return PLACE[n]
+        if it is test_item:
+            return "tests"
+        for rx, get in CHECK_ITEM_RULES:
+            mm = rx.match(n or "")
+            if mm and get(mm) in stems_set:
+                return get(mm)
+        return None
+
+    home = {
+        id(it): seed_home(it)
+        for it in items
+        if it["kind"] != "use" and it["name"]
+    }
+    # name-reference scans run on masked text (comments/strings blanked) —
+    # a name inside a doc comment or string literal is not a reference.
+    texts = {id(it): mask(it["text"]) for it in items if it["kind"] != "use"}
+    by_id = {id(it): it for it in items}
+
+    def refs(text, name):
+        return len(re.findall(rf"\b{re.escape(name)}\b", text))
+
+    # run()'s masked text anchors references to 'mod'; test code never
+    # anchors — a tests-referenced item lives with its check (tests
+    # reach it through `pub(super)` + `use super::<stem>::X`).
+    core_text = mask(run_masked)
+    tests_masked = mask(tests_text or "")
+
+    def referencers(name, exclude_id):
+        out = set()
+        for iid, t in texts.items():
+            if iid == exclude_id:
+                continue
+            it = by_id[iid]
+            if it["kind"] == "impl" and it["name"] == name:
+                continue  # `impl X` follows X's home, never anchors it
+            if refs(t, name):
+                out.add(iid)
+        if refs(core_text, name):
+            out.add(("core",))
+        if refs(tests_masked, name):
+            out.add(("tests",))
+        return out
+
+    def key_home(k):
+        if k == ("core",):
+            return "mod"
+        if k == ("tests",):
+            return "tests"
+        return home.get(k)
+
+    def fixpoint():
+        moved = True
+        while moved:
+            moved = False
+            for it in items:
+                iid = id(it)
+                if it["kind"] in ("use", "impl") or home.get(iid) is not None:
+                    continue
+                rs = referencers(it["name"], iid)
+                tid = id(test_item) if test_item else None
+                rs = {k for k in rs if k != ("tests",) and k != tid}
+                pending = any(key_home(k) is None for k in rs)
+                hs = {key_home(k) for k in rs}
+                hs.discard(None)
+                if len(hs) > 1 or (len(hs) == 0 and not pending):
+                    home[iid] = "mod"
+                    moved = True
+                elif len(hs) == 1 and not pending:
+                    home[iid] = next(iter(hs))
+                    moved = True
+                # pending referencers: defer to a later pass
+
+    fixpoint()
+    # impls follow their type's home; then re-run for deferred items.
+    for it in items:
+        if it["kind"] == "impl" and it["name"] and home.get(id(it)) is None:
+            th = next(
+                (
+                    home.get(id(o))
+                    for o in items
+                    if o["name"] == it["name"] and o["kind"] != "impl"
+                ),
+                None,
+            )
+            home[id(it)] = th or "mod"
+    fixpoint()
+    # unresolvable cycles / deferred → shared module.
+    for iid, h in home.items():
+        if h is None:
+            home[iid] = "mod"
+
+    # mod.rs itself would still be >1500 lines; the brief allows a
+    # util.rs for shared helpers. The seam is positional: items before
+    # UTIL_ANCHOR are the core surface (types, config, orchestration);
+    # items at/after it are the shared measurement machinery (fs/git,
+    # proc census, WAL scan, secret scrub, worktree/reclaim helpers).
+    util_anchor = next(
+        i["code"] for i in items if i["name"] == UTIL_ANCHOR
+    )
+    for it in items:
+        if (
+            home.get(id(it)) == "mod"
+            and it["code"] >= util_anchor
+            and PLACE.get(it["name"]) != "mod"
+        ):
+            home[id(it)] = "util"
+
+    files = {s: [] for s in order} | {"util": []}
+    mod_items, main_items = [], []
+    for it in items:
+        h = home.get(id(it))
+        if it["kind"] == "use" or h is None or h == "tests":
+            continue
+        (mod_items if h == "mod" else files[h]).append(it)
+    # unnamed items (impl blocks with no parsed name, macros): file of
+    # their home is unreachable — drop into mod for safety.
+    for it in items:
+        if it["kind"] != "use" and not it["name"]:
+            mod_items.append(it)
+
+    mod_items.sort(key=lambda i: i["code"])
+    for s in files:
+        files[s].sort(key=lambda i: i["code"])
+
+    # A private item named by a referencer outside its own file needs
+    # `pub(super)` — visible inside `host`, unchanged outside it.
+    needs_super = set()
+    for it in items:
+        if it["kind"] in ("use", "impl") or not it["name"]:
+            continue
+        iid, h = id(it), home.get(id(it))
+        if h in ("mod", "tests") or vis_of(it["text"]):
+            continue
+        for r in referencers(it["name"], iid):
+            rh = key_home(r)
+            if rh is not None and rh != h:
+                needs_super.add(iid)
+                break
+
+    # Signature propagation: a `pub(super)` fn must not expose a private
+    # sibling type (`fn scan_pipes() -> PipeStats` needs PipeStats
+    # promoted too), likewise enum-variant payload types. Walk the
+    # signature head — text up to the body `{` — for same-file names.
+    def sig_head(it):
+        mt = texts.get(id(it)) or mask(it["text"])
+        if it["kind"] in ("enum", "struct"):
+            return mt  # fields/variant payload types live inside the braces
+        bi = mt.find("{")
+        return mt[:bi] if bi >= 0 else mt
+
+    changed = True
+    while changed:
+        changed = False
+        for it in items:
+            iid = id(it)
+            if iid not in needs_super:
+                continue
+            h = home.get(iid)
+            head = sig_head(it)
+            for o in items:
+                oid = id(o)
+                if (
+                    oid in needs_super
+                    or o["kind"] in ("use", "impl")
+                    or not o["name"]
+                    or home.get(oid) != h
+                    or vis_of(o["text"])
+                    or not re.search(
+                        r"\b" + re.escape(o["name"]) + r"\b", head
+                    )
+                ):
+                    continue
+                needs_super.add(oid)
+                changed = True
+
+    # ---------------- use lines ----------------
+    bindings = []
+    for u in uses:
+        bindings += use_bindings(u["text"].strip().split("\n")[-1])
+
+    def bare(name, text):
+        """A leaf survives only when its bound name occurs as a *bare*
+        identifier — `Arc` inside `std::sync::Arc::new` does not need
+        `use std::sync::Arc`."""
+        return re.search(r"(?<![\w:.])" + re.escape(name) + r"\b", text)
+
+    def bound_name(line):
+        """`use a::b;` binds `b`; `use a::b as c;` binds `c`."""
+        s = line[len("use ") : -1]
+        if " as " in s:
+            return s.rsplit(" as ", 1)[1].strip()
+        if s.endswith("::*"):
+            return None
+        return s.rsplit("::", 1)[-1].strip()
+
+    def uses_for(text, path=None):
+        text = mask(text)
+        out = []
+        for name, use_path in bindings:
+            if name == "*":
+                keep = True
+            else:
+                keep = bool(bare(name, text))
+            if not keep:
+                # Trait leaves additionally survive on method-call
+                # (`.m(`) or macro (`m!`) evidence, since a method call
+                # never names its trait; that test can over-keep when the
+                # call resolves to an inherent method, and the residual is
+                # listed in DROP_USES.
+                meths = TRAIT_METHODS.get(use_path)
+                keep = bool(meths) and any(
+                    re.search(
+                        r"\." + re.escape(m) + r"\s*\(|\b" + re.escape(m)
+                        + r"\s*!",
+                        text,
+                    )
+                    for m in meths
+                )
+            if keep:
+                leaf = use_path.rsplit("::", 1)[-1]
+                line = (
+                    f"use {use_path};"
+                    if leaf == name
+                    else f"use {use_path} as {name};"
+                )
+                if line not in out:
+                    out.append(line)
+        drop = set(DROP_USES.get(path or "", ()))
+        return [
+            u for u in out if u[len("use ") : -1].split(" as ")[0] not in drop
+        ]
+
+    # ---------------- emit ----------------
+    out = {}
+    manifest = {"mod": [], "tests": []}
+
+    def promote_impl(text):
+        """`impl T` whose T crosses files: private methods were visible
+        module-wide pre-split — restore that scope with `pub(super)`.
+        Members sit at brace depth 1; trait impls (`impl X for Y`) are
+        skipped — their members cannot carry visibility."""
+        head = text[: mask(text).find("{")]
+        if re.search(r"\bfor\b", head):
+            return text
+        out_lines = []
+        depth = 0
+        mlines = mask(text).split("\n")
+        for ln, mln in zip(text.split("\n"), mlines):
+            if depth == 1 and re.match(
+                r"^\s*(fn|const|type)\b", ln.lstrip()
+            ) and not ln.lstrip().startswith("pub"):
+                ln = re.sub(r"^(\s*)", r"\1pub(super) ", ln)
+            depth += mln.count("{") - mln.count("}")
+            out_lines.append(ln)
+        return "\n".join(out_lines)
+
+    def emit_item(it):
+        """Visibility rewrite for one moved item in a child file."""
+        t, promote, vis = it["text"], "", vis_of(it["text"])
+        if not vis and id(it) in needs_super:
+            promote = "pub(super)"
+        if it["kind"] == "struct" and (vis or promote):
+            t = promote_fields(t, "pub(super)")
+        if it["kind"] == "impl" and it["name"] in crosses:
+            t = promote_impl(t)
+        return set_vis(t, promote)
+
+    # Types whose fields/methods may be touched by other files: the
+    # item already has visibility, or the move promoted it.
+    crosses = {
+        it["name"]
+        for it in items
+        if it["name"]
+        and it["kind"] != "impl"
+        and (vis_of(it["text"]) or id(it) in needs_super)
+        and home.get(id(it)) not in ("mod", "tests", None)
+    }
+
+    # mod.rs: header + uses + mod decls + items + re-exports.
+    mod_decl = (
+        "mod util;\n"
+        + "".join(f"mod {s};\n" for s in order)
+        + "#[cfg(test)]\nmod tests;\n"
+    )
+    mod_body_parts = [it["text"] for it in mod_items]
+    mod_body = "\n\n".join(mod_body_parts)
+    mod_uses = uses_for(mod_body, f"{DIR}/mod.rs")
+    covered = {bound_name(u) for u in mod_uses} - {None}
+
+    # Re-exports: the module's surface stays at `crate::doctor::host::X`
+    # — `pub`/`pub(crate)` items keep their reach. Items the move
+    # promoted to `pub(super)` get a plain `use` in mod.rs instead: it
+    # binds the name at host scope (a `pub(super)` *use* in mod.rs would
+    # mean `pub(in doctor)` — the wrong direction), and `use super::*`
+    # in sibling files and the test module inherits the binding.
+    reexports = []
+    for s in ["util"] + order:
+        pub_names, crate_names, super_names = [], [], []
+        for it in files[s]:
+            v = vis_of(it["text"])
+            if v == "pub":
+                pub_names.append(it["name"])
+            elif v == "pub(crate)":
+                crate_names.append(it["name"])
+            elif id(it) in needs_super:
+                super_names.append(it["name"])
+        if pub_names:
+            reexports.append(f"pub use {s}::{{{', '.join(pub_names)}}};")
+        for n in crate_names:
+            reexports.append(
+                "#[allow(unused_imports)]\npub(crate) use "
+                f"{s}::{n};"
+            )
+        if super_names:
+            reexports.append(
+                "#[allow(unused_imports)]\n"
+                f"use {s}::{{{', '.join(super_names)}}};"
+            )
+
+    m2 = (
+        "\n".join(leading_docs)
+        + "\n\n// CAD-536: `cadence doctor host` — check orchestration, shared\n"
+        "// measurement types and helpers. All code here is moved verbatim\n"
+        "// from src/doctor/host.rs; checks live in <check>.rs files and\n"
+        "// shared measurement machinery in util.rs.\n\n"
+        + mod_decl
+    )
+    if mod_uses:
+        m2 += "\n" + "\n".join(dict.fromkeys(mod_uses)) + "\n"
+    m2 += "\n" + mod_body + "\n"
+    if reexports:
+        m2 += "\n// Re-exports — the public surface of `crate::doctor::host`\n"
+        m2 += (
+            "// is unchanged by the split; `pub(super)` lines re-bind moved\n"
+            "// helpers at module scope (CAD-536).\n"
+            + "\n".join(reexports)
+            + "\n"
+        )
+    out[f"{DIR}/mod.rs"] = m2
+    manifest["mod"] = [i["name"] for i in mod_items]
+
+    # check files (util.rs emits the same way — it is a leaf module of
+    # shared helpers the checks and mod.rs both import). Every file gets
+    # `use super::*` — that one glob resolves mod.rs items, every
+    # re-export above, and sibling module names, so moved code keeps its
+    # bare-identifier references verbatim.
+    for stem in ["util"] + order:
+        its = files[stem]
+        body_all = "\n\n".join(emit_item(i) for i in its)
+        fu = [
+            u
+            for u in uses_for(body_all, f"{DIR}/{stem}.rs")
+            if bound_name(u) not in covered
+        ]
+        ftxt = (
+            "//! CAD-536: `cadence doctor host` — shared measurement\n"
+            "//! helpers (fs/git, proc census, WAL scan, secret scrub,\n"
+            "//! worktree machinery) moved verbatim from"
+            " src/doctor/host.rs.\n"
+            if stem == "util"
+            else f"//! CAD-536: `cadence doctor host` check `{stem}` — "
+            "moved verbatim from src/doctor/host.rs.\n"
+        )
+        ftxt += "\nuse super::*;\n"
+        if fu:
+            ftxt += "\n" + "\n".join(dict.fromkeys(fu)) + "\n"
+        ftxt += "\n" + body_all + "\n"
+        out[f"{DIR}/{stem}.rs"] = ftxt
+        manifest[stem] = [i["name"] for i in its]
+
+    out[f"{DIR}/tests.rs"] = (
+        "// CAD-536: host-doctor tests — moved verbatim from"
+        " src/doctor/host.rs.\n"
+        + tests_text
+    )
+    tt = dedent(tests_text or "", 0)
+    manifest["tests"] = [
+        i["name"] for i in scan_items(tt, mask(tt)) if i["name"]
+    ]
+    # tests.rs references items from check files — its own use lines go
+    # above the verbatim text. Names the test module already imports
+    # itself (its inner `use` lines move verbatim) must not be re-bound.
+    inner_bound = {
+        bound_name(l.strip())
+        for l in (tests_text or "").split("\n")
+        if l.strip().startswith("use ")
+    } - {None}
+    # The verbatim `use super::*` inside the test module covers every
+    # host-scope name; only external bindings the glob doesn't carry
+    # need importing here.
+    t_uses = [
+        u
+        for u in uses_for(tests_text or "", f"{DIR}/tests.rs")
+        if bound_name(u) not in inner_bound
+        and bound_name(u) not in covered
+    ]
+    if t_uses:
+        out[f"{DIR}/tests.rs"] += "\n" + "\n".join(dict.fromkeys(t_uses)) + "\n"
+
+    ml = [
+        "# CAD-536 split map — regenerated by scripts/split-doctor-host;"
+        " do not edit."
+    ]
+    for stem in ["mod", "util"] + order + ["tests"]:
+        ml.append(f"[{stem}]")
+        ml.append(
+            "items = ["
+            + ", ".join(f'"{n}"' for n in manifest[stem])
+            + "]"
+        )
+        ml.append("")
+    out[MANIFEST] = "\n".join(ml)
+
+    # Format generated Rust the way `cargo fmt` will, so files land
+    # fmt-clean and `--check` compares the formatted form.
+    out = {
+        p: (rustfmt(t) if p.endswith(".rs") else t) for p, t in out.items()
+    }
+
+    if check:
+        bad = [
+            p
+            for p, want in sorted(out.items())
+            if not Path(p).exists() or Path(p).read_text() != want
+        ]
+        extra = [
+            str(p) for p in Path(DIR).glob("*.rs") if str(p) not in out
+        ]
+        if bad or extra:
+            for p in bad + extra:
+                print(f"stale: {p}")
+            sys.exit(1)
+        print("split-doctor-host: outputs current")
+        return
+
+    for path, text in out.items():
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(text)
+    Path(SRC).unlink()
+    print(f"wrote {len(out)} files; removed {SRC}")
+
+
+if __name__ == "__main__":
+    main()

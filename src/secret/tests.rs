@@ -272,10 +272,10 @@ fn zero_findings_on_cargo_lock() {
 /// An entry may disappear; a new finding fails the test.
 const KNOWN_FIXTURES: &[(&str, &str, &str)] = &[
     ("src/store.rs", "generic-api-key", "319256d3b4381405"),
-    ("src/doctor/host.rs", "jwt", "500ea9399688915b"),
-    ("src/doctor/host.rs", "curl-auth-header", "79366ebed2e93bf8"),
+    // The two host.rs fixtures (jwt, curl-auth-header) now build their
+    // values with `concat!` (CAD-536), so no finding remains to pin.
     (
-        "src/doctor/host.rs",
+        "src/doctor/host/tests.rs",
         "cadence-argv-secret",
         "38ca332b7f3cb6b0",
     ),
