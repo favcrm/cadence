@@ -1039,8 +1039,7 @@ fn the_state_files_refuse_a_planted_hardlink_and_leave_its_target_alone() {
         for append in [false, true] {
             for truncate in [false, true] {
                 let err = update::open_private(&path, append, truncate)
-                    .err()
-                    .expect("a hardlinked state file must be refused")
+                    .expect_err("a hardlinked state file must be refused")
                     .to_string();
                 assert_refused(&err, name, "hardlink");
                 assert_eq!(
