@@ -455,6 +455,20 @@ fn confined_master_runs_fake_pi_under_the_policy() {
     assert_eq!(turn.status, "completed", "{}", turn.status);
     let log = std::fs::read_to_string(state.path().join("logs/pi-master.log")).unwrap();
     assert!(log.contains("master confinement:"), "{log}");
+    // CAD-570: under the policy the pi-devin catalog write lands in
+    // the master's own XDG_CACHE_HOME — before the fix this open
+    // EACCES'd `~/.cache/pi-devin/models.json` on the smoke host.
+    assert!(
+        state
+            .path()
+            .join("master/pi/cache/pi-devin/models.json")
+            .is_file(),
+        "confined master: the catalog cache did not land in master/pi/cache"
+    );
+    assert!(
+        !log.contains("EACCES"),
+        "confined master logged a cache EACCES: {log}"
+    );
     pi.close();
 }
 
@@ -483,6 +497,14 @@ fn the_emitted_pi_policy_is_pis_own_dirs_never_claudes() {
     assert!(
         has(&policy.write, &pi_dir),
         "write set lacks master/pi: {policy:?}"
+    );
+    // CAD-570: the master's XDG_CACHE_HOME (`master/pi/cache`, where
+    // pi-devin writes its catalog) is inside that write grant — the
+    // path pi-devin touches must be covered, never only readable.
+    let cache = pi_dir.join("cache/pi-devin");
+    assert!(
+        policy.write.iter().any(|grant| cache.starts_with(grant)),
+        "write set does not cover master/pi/cache: {policy:?}"
     );
     assert!(
         !has(&policy.write, &claude_dir),
@@ -548,13 +570,62 @@ fn master_env_is_allowlisted_not_inherited() {
             "planted {name} reached the pi child: {names:?}"
         );
     }
-    for name in ["PATH", "CADENCE_ALIAS", "CADENCE_STATE_DIR", "TMPDIR"] {
+    for name in [
+        "PATH",
+        "CADENCE_ALIAS",
+        "CADENCE_STATE_DIR",
+        "TMPDIR",
+        "XDG_CACHE_HOME",
+    ] {
         assert!(names.iter().any(|n| n == name), "{name} missing: {names:?}");
     }
     for name in planted {
         std::env::remove_var(name);
     }
     pi.close();
+}
+
+/// CAD-570: the master's XDG_CACHE_HOME is its own — the value is
+/// proven by WHERE the pi-devin catalog write lands, not by the env
+/// name (the record stores names only). A daemon-env XDG_CACHE_HOME
+/// planted at an empty dir must NOT receive the catalog; the file
+/// must land under `<state>/master/pi/cache/pi-devin/` (created 0700).
+/// Mutation: dropping the env pair or pointing it at the inherited
+/// `~/.cache` writes the catalog to the planted dir and fails this.
+#[test]
+fn master_cache_home_is_its_own_private_dir() {
+    let planted = tempfile::tempdir().unwrap();
+    std::env::set_var("XDG_CACHE_HOME", planted.path());
+    let state = tempfile::tempdir().unwrap();
+    let pi = master_adapter(
+        "normal",
+        state.path(),
+        &[(cadence_agent::master::TEST_NO_LANDLOCK, "1".into())],
+    );
+    pi.open(&master_agent(state.path(), json!({"unconfined": true})))
+        .unwrap();
+    pi.close();
+    std::env::remove_var("XDG_CACHE_HOME");
+
+    let cache = state.path().join("master/pi/cache");
+    assert!(
+        cache.join("pi-devin/models.json").is_file(),
+        "the pi-devin catalog did not land in the master's own cache dir"
+    );
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(&cache).unwrap().permissions().mode() & 0o777,
+        0o700,
+        "the master's cache dir is private"
+    );
+    assert!(
+        !planted.path().join("pi-devin").exists(),
+        "the inherited operator cache received the catalog — the explicit pair lost"
+    );
+    // The master record only stores env NAMES — XDG_CACHE_HOME must be
+    // among them (the explicit pair), whatever was planted.
+    let names = recorded_env(state.path());
+    assert!(names.iter().any(|n| n == "XDG_CACHE_HOME"), "{names:?}");
 }
 
 /// Open a master adapter (writes the guard) and return the generated
