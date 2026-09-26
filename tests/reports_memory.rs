@@ -110,8 +110,15 @@ fn long_result_bounded_only_for_pty_paste() {
         "routed body carried the full text"
     );
     d.wait_message("pm", routed["id"].as_str().unwrap(), &["completed"], 20);
+    // CAD-565: the pane gets the bounded notice naming the row — the
+    // full routed record stays durable for `message read`.
     let screen = std::fs::read_to_string(d.pane_file(&pm_mock, "pm", "screen")).unwrap_or_default();
-    assert!(screen.contains("agent show w1"), "{screen}");
+    let rid = routed["id"].as_str().unwrap();
+    assert!(screen.contains(&format!("message read {rid}")), "{screen}");
+    assert!(
+        !screen.contains(&"x".repeat(3900)),
+        "the notice never pastes the body: {screen}"
+    );
 }
 
 #[test]
