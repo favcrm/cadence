@@ -249,8 +249,9 @@ export const api = {
   },
 
   sources: {
-    list: () => M.sourcePosts.filter((s) => s.client === M.currentClient),
+    list: () => M.sourcePosts.filter((s) => s.client === M.currentClient && !s.hidden),
     all: () => M.sourcePosts,
+    byId: src,
     selectedIds: () => [...M.selection].filter((id) => src(id)?.client === M.currentClient),
     toggle(id: string) {
       if (M.selection.has(id)) M.selection.delete(id);
@@ -261,12 +262,23 @@ export const api = {
       M.selection.clear();
       emit();
     },
+    /** "Skip / hide" — drop a source out of the grid (mock state only). */
+    hide(id: string) {
+      const s = src(id);
+      if (!s) return;
+      s.hidden = true;
+      M.selection.delete(id);
+      log(`${id} hidden by you`);
+      emit();
+    },
   },
 
   posts: {
     list: () => M.posts.filter((p) => p.client === M.currentClient),
     all: () => M.posts,
     get: postOrNull,
+    /** Drafts/posts made from a source post — the drawer's "made from this". */
+    fromSource: (sid: string) => M.posts.filter((p) => p.source === sid),
     sourceOf: (p: Post) => src(p.source),
     checks: (id: string) => checksFor(post(id)),
     // validators against an unsaved draft — the editor shows these live

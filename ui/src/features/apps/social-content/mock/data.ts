@@ -45,6 +45,10 @@ export interface SourcePost {
   media: SourceMedia[];
   postedAt: string;
   isNew: boolean;
+  /** "Skip / hide" in the drawer removes the source from the grid. */
+  hidden?: boolean;
+  /** Reach numbers the platform reports back — shown in the drawer. */
+  stats: { likes: number; comments: number };
 }
 
 export interface CaptionRev {
@@ -249,44 +253,56 @@ const clients: Client[] = [
 const sourcePosts: SourcePost[] = [
   { id: "s1", client: "kura", platform: "instagram", url: "https://instagram.com/p/CxKura01",
     text: "NEW: Black garlic tonkotsu — 18-hour broth, limited to 40 bowls a day. HK$128. From Thursday at both shops. #KuraHK",
-    media: [{ seed: "ramen-black", w: 1080, h: 1080 }], postedAt: ago(9), isNew: false },
+    media: [{ seed: "ramen-black", w: 1080, h: 1080 }, { seed: "broth-pour", w: 1080, h: 1080 }, { seed: "bowl-side", w: 1080, h: 1350 }],
+    postedAt: ago(9), isNew: false, stats: { likes: 412, comments: 37 } },
   { id: "s2", client: "kura", platform: "facebook", url: "https://facebook.com/kura.ramen.hk/posts/8801",
     text: "Our Central shop closes early on Oct 1 (last order 21:30) for a private event. TST stays open till 23:00 as usual.",
-    media: [{ seed: "shop-front", w: 1200, h: 900 }], postedAt: ago(14), isNew: false },
+    media: [{ seed: "shop-front", w: 1200, h: 900 }], postedAt: ago(14), isNew: false,
+    stats: { likes: 88, comments: 12 } },
   { id: "s3", client: "kura", platform: "instagram", url: "https://instagram.com/p/CxKura07",
     text: "Meet the chef: Mori-san on why we flame the chashu to order. Full video on the site →",
-    media: [{ seed: "chef-flame", w: 1080, h: 1080 }], postedAt: ago(30), isNew: true },
+    media: [{ seed: "chef-flame", w: 1080, h: 1080 }, { seed: "chef-hands", w: 1080, h: 1080 }],
+    postedAt: ago(30), isNew: true, stats: { likes: 265, comments: 19 } },
   { id: "s4", client: "kura", platform: "instagram", url: "https://instagram.com/p/CxKura12",
     text: "Thanks @hkfoodlover for the feature — “the richest broth in Central” 🍜",
-    media: [{ seed: "bowl-top", w: 1080, h: 1350 }], postedAt: ago(52), isNew: false },
+    media: [{ seed: "bowl-top", w: 1080, h: 1350 }], postedAt: ago(52), isNew: false,
+    stats: { likes: 531, comments: 44 } },
   { id: "s5", client: "kura", platform: "facebook", url: "https://facebook.com/kura.ramen.hk/posts/8790",
     text: "Autumn collab: Kura x Yardley Bros — a yuzu wheat lager, pours at both shops from Friday.",
-    media: [{ seed: "beer-pour", w: 1200, h: 900 }], postedAt: ago(70), isNew: false },
+    media: [{ seed: "beer-pour", w: 1200, h: 900 }], postedAt: ago(70), isNew: false,
+    stats: { likes: 143, comments: 8 } },
   { id: "s6", client: "kura", platform: "web", url: "https://kura.hk/journal/queue-times",
     text: "Weekend queue update: average wait 12 min at TST, 20 min at Central. Book ahead in the app.",
-    media: [], postedAt: ago(96), isNew: false },
+    media: [], postedAt: ago(96), isNew: false, stats: { likes: 0, comments: 0 } },
 
   { id: "s7", client: "velvet", platform: "instagram", url: "https://instagram.com/p/CxVel01",
     text: "Courts open 07:00–23:00 daily from October. Bookings live on the app. #VelvetPadel",
-    media: [{ seed: "court-aerial", w: 1080, h: 1080 }], postedAt: ago(6), isNew: false },
+    media: [{ seed: "court-aerial", w: 1080, h: 1080 }], postedAt: ago(6), isNew: false,
+    stats: { likes: 198, comments: 15 } },
   { id: "s8", client: "velvet", platform: "instagram", url: "https://instagram.com/p/CxVel04",
     text: "Autumn ladder: 64 players, 3 weeks, finals Oct 18. Spectators welcome — the bar stays open.",
-    media: [{ seed: "ladder-night", w: 1080, h: 1080 }], postedAt: ago(20), isNew: true },
+    media: [{ seed: "ladder-night", w: 1080, h: 1080 }], postedAt: ago(20), isNew: true,
+    stats: { likes: 156, comments: 21 } },
   { id: "s9", client: "velvet", platform: "instagram", url: "https://instagram.com/p/CxVel09",
     text: "New coach alert — @marta.padel joins Velvet from Oct 1. Clinics every Tue/Thu.",
-    media: [{ seed: "coach-marta", w: 1080, h: 1350 }], postedAt: ago(33), isNew: false },
+    media: [{ seed: "coach-marta", w: 1080, h: 1350 }], postedAt: ago(33), isNew: false,
+    stats: { likes: 322, comments: 41 } },
   { id: "s10", client: "velvet", platform: "web", url: "https://velvetpadel.hk/membership",
     text: "Memberships from HK$380/month — off-peak, all courts, guest passes included.",
-    media: [{ seed: "membership", w: 1200, h: 630 }], postedAt: ago(80), isNew: false },
+    media: [{ seed: "membership", w: 1200, h: 630 }], postedAt: ago(80), isNew: false,
+    stats: { likes: 0, comments: 0 } },
   { id: "s11", client: "velvet", platform: "instagram", url: "https://instagram.com/p/CxVel15",
     text: "Recovery zone now open: sauna + ice bath, members first.",
-    media: [{ seed: "sauna", w: 1080, h: 1080 }], postedAt: ago(120), isNew: false },
+    media: [{ seed: "sauna", w: 1080, h: 1080 }], postedAt: ago(120), isNew: false,
+    stats: { likes: 274, comments: 18 } },
   { id: "s12", client: "velvet", platform: "instagram", url: "https://instagram.com/p/CxVel21",
     text: "Pro shop drop: Velvet x Siux rackets, 20 units, members 48h early access.",
-    media: [{ seed: "racket-drop", w: 1080, h: 1350 }], postedAt: ago(150), isNew: true },
+    media: [{ seed: "racket-drop", w: 1080, h: 1350 }, { seed: "racket-box", w: 1080, h: 1350 }],
+    postedAt: ago(150), isNew: true, stats: { likes: 189, comments: 26 } },
   { id: "s13", client: "kura", platform: "instagram", url: "https://instagram.com/p/CxKura19",
     text: "TSUKEMEN returns for October — thicker noodles, concentrated dip, TST shop only.",
-    media: [{ seed: "tsukemen", w: 1080, h: 1080 }], postedAt: ago(40), isNew: true },
+    media: [{ seed: "tsukemen", w: 1080, h: 1080 }], postedAt: ago(40), isNew: true,
+    stats: { likes: 377, comments: 29 } },
 ];
 
 /* Posts (drafts). Revisions are append-only per field; approvals pin a
