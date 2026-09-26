@@ -1080,3 +1080,61 @@ export interface AppDetail extends Omit<AppRow, "workflows"> {
   record?: Record<string, unknown> | null;
   doctor?: AppDoctor | null;
 }
+
+/** One ticket of an app run's plan, as `plan_json` reports it. */
+export interface RunTicket {
+  id: string;
+  title: string;
+  status: string;
+  size?: string | null;
+  /** S=1, M=3, L=8 — the size-weighted progress unit. */
+  weight?: number;
+  owner?: string | null;
+  blocked_by?: string[];
+  acceptance?: number;
+}
+
+/** The plan block of a run — `plan show`'s shape (CAD-563). */
+export interface AppRunPlan {
+  /** `proposed` | `approved` | `rejected`. */
+  state: string;
+  proposed_by?: string | null;
+  proposed_at?: string | null;
+  decided_by?: string | null;
+  decided_at?: string | null;
+  reason?: string | null;
+  tickets: RunTicket[];
+  progress: WorkProgress;
+}
+
+/**
+ * `GET /api/apps/<project>/<name>/runs` row — one plan/epic proposed
+ * from this app's workflows, by the recorded `plan.workflow`
+ * provenance (CAD-563).
+ */
+export interface AppRun {
+  epic: string;
+  title: string;
+  /** The epic's derived status (rollup over its tickets). */
+  status: string;
+  /** `<app>/<wf>` — the provenance the epic records. */
+  workflow: string;
+  plan: AppRunPlan;
+}
+
+export interface AppRunsPayload {
+  project: string;
+  name: string;
+  runs: AppRun[];
+}
+
+/**
+ * `GET /api/apps/<project>/<name>/outputs` — the outbox items this
+ * app's runs produced (CAD-563). Operator-only, like `/api/outbox`: a
+ * board that cannot prove the operator gets the route's refusal.
+ */
+export interface AppOutputsPayload {
+  project: string;
+  name: string;
+  items: OutboxItem[];
+}

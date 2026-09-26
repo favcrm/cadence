@@ -134,11 +134,13 @@ export default function App() {
     persistBrowserProjectView(view);
   }, [view]);
 
-  // The screen readable inside refresh's stable callback — the overview
-  // payload costs a daemon probe + gh cache read, so it only fetches
-  // while Home is on screen.
-  const screenRef = useRef(screen);
-  screenRef.current = screen;
+  // The overview payload costs a daemon probe + gh cache read, so it
+  // only fetches while a screen that reads it is on screen: Home, the
+  // overview, or one app's detail (its Runs section marks runs against
+  // Needs you). The refs keep `refresh` and the stream handler stable.
+  const overviewWanted = overviewOn(screen) || (route.screen === "apps" && route.name !== null);
+  const overviewWantedRef = useRef(overviewWanted);
+  overviewWantedRef.current = overviewWanted;
   // The overview shows the project context compactly; Projects → context in full.
   const contextOn =
     screen === "overview" || (route.screen === "projects" && route.section === "context");
@@ -188,11 +190,12 @@ export default function App() {
   }, [openId]);
 
   // The overview costs a daemon probe + gh cache read (~seconds), so it
-  // is fetched only while Home is on screen — revalidated when Home comes
-  // back, painting the last payload meanwhile. Requests coalesce.
+  // is fetched only while a screen that reads it is on screen —
+  // revalidated when that screen comes back, painting the last payload
+  // meanwhile. Requests coalesce.
   useEffect(() => {
-    if (overviewOn(screen)) void resources.overview.revalidate();
-  }, [screen]);
+    if (overviewWanted) void resources.overview.revalidate();
+  }, [overviewWanted]);
 
   // Full re-read: first load, the refresh button, focus and the poll.
   // Each resource joins a request already in flight instead of stacking.
@@ -237,7 +240,7 @@ export default function App() {
     void resources.projects.refresh();
     void resources.issues.refresh();
     void resources.agents.refresh();
-    if (overviewOn(screenRef.current)) void resources.overview.refresh();
+    if (overviewWantedRef.current) void resources.overview.refresh();
     loadDetail();
   }, [loadDetail]);
 
@@ -253,10 +256,18 @@ export default function App() {
     const onEvent = (e: MessageEvent<string>) => {
       for (const name of invalidatedBy(e.data)) {
         // Families are keyed stores — invalidate the prefix, not one entry.
-        if (name === "issue" || name === "workflows" || name === "app") cache.invalidate(name);
-        else if (name === "overview") {
-          // Hidden overview: skip — it revalidates when Home opens.
-          if (overviewOn(screenRef.current)) void resources.overview.invalidate();
+        if (
+          name === "issue" ||
+          name === "workflows" ||
+          name === "app" ||
+          name === "app_runs" ||
+          name === "app_outputs"
+        ) {
+          cache.invalidate(name);
+        } else if (name === "overview") {
+          // Hidden overview: skip — it revalidates when a screen that
+          // reads it opens.
+          if (overviewWantedRef.current) void resources.overview.invalidate();
         } else void resources[name].invalidate();
       }
     };
@@ -623,6 +634,8 @@ export default function App() {
             project={route.project}
             name={route.name}
             viewer={{ readOnly, operator: meta?.operator === true }}
+            onOpenIssue={openIssue}
+            onHome={() => goRoute({ screen: "home" })}
           />
         )}
         {route.screen === "agents" && (

@@ -14,6 +14,7 @@ import type {
   AgentsPayload,
   AppDetail,
   AppRow,
+  AppRun,
   IssueCard,
   IssueDetail,
   MilestoneRow,
@@ -92,6 +93,32 @@ export const resources = {
     const [project, name] = key.split("/");
     return api.app(project, name);
   }),
+  /**
+   * `GET /api/apps/<project>/<name>/runs` — the plans/epics proposed
+   * from this app's workflows (CAD-563), keyed `<project>/<name>`.
+   */
+  appRuns: cache.family<string, AppRun[]>(
+    "app_runs",
+    (key) => {
+      const [project, name] = key.split("/");
+      return api.appRuns(project, name).then((r) => r.runs);
+    },
+    { isEmpty: (rows) => rows.length === 0 },
+  ),
+  /**
+   * `GET /api/apps/<project>/<name>/outputs` — the outbox items this
+   * app's runs produced (CAD-563), keyed `<project>/<name>`.
+   * Operator-only: on a board that cannot prove the operator the fetch
+   * fails and the section shows the same sign-in hint as the Outbox.
+   */
+  appOutputs: cache.family<string, OutboxItem[]>(
+    "app_outputs",
+    (key) => {
+      const [project, name] = key.split("/");
+      return api.appOutputs(project, name).then((r) => r.items);
+    },
+    { isEmpty: (rows) => rows.length === 0 },
+  ),
   /**
    * `GET /api/outbox` — the `local` platform's published items (CAD-546).
    * Operator-only: on an unsigned board the fetch fails and the screen
