@@ -164,5 +164,8 @@ items = ["UpdateAction", "update_caller", "run_update", "run(dispatch arm)"]
 [upgrade]
 items = ["run_upgrade", "run(dispatch arm)"]
 
+[wiki]
+items = ["run(dispatch arm)"]
+
 [workflow]
 items = ["WorkflowAction", "run_workflow", "run(dispatch arm)"]

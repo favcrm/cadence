@@ -71,6 +71,30 @@ pub struct PmConfig {
     pub artifact_max_bytes: u64,
     #[serde(default = "default_notes_dir")]
     pub notes_dir: String,
+    /// CAD-580: the wiki store's upload cap (`wiki_put_blob` refuses a
+    /// file over it before the blob lands).
+    #[serde(default)]
+    pub wiki: WikiConfig,
+}
+
+/// `pm.yaml`'s `wiki:` section.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WikiConfig {
+    /// Largest accepted blob upload, bytes (default 100 MiB).
+    #[serde(default = "default_wiki_upload_cap")]
+    pub max_upload_bytes: u64,
+}
+
+impl Default for WikiConfig {
+    fn default() -> Self {
+        Self {
+            max_upload_bytes: default_wiki_upload_cap(),
+        }
+    }
+}
+
+fn default_wiki_upload_cap() -> u64 {
+    100 * 1024 * 1024
 }
 
 fn default_statuses() -> Vec<String> {
@@ -94,6 +118,7 @@ impl Default for PmConfig {
             link_types: default_link_types(),
             artifact_max_bytes: default_artifact_cap(),
             notes_dir: default_notes_dir(),
+            wiki: WikiConfig::default(),
         }
     }
 }

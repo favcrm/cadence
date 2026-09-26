@@ -1157,6 +1157,11 @@ fn every_classified_write_refuses_a_caller_without_a_session() {
         }
         let ct = if artifacts {
             "Content-Type: application/octet-stream"
+        } else if path == "/api/wiki/upload" {
+            // CAD-580: upload's guard names the bounded multipart form
+            // type — the same "correct CT before session check" order
+            // the artifacts branch above relies on.
+            "Content-Type: multipart/form-data; boundary=T"
         } else {
             "Content-Type: application/json"
         };
@@ -1862,6 +1867,11 @@ fn route_classes_are_enforced_for_an_agent_caller() {
             "POST /api/issues/*/links",
             "POST /api/issues/*/refs",
             "POST /api/monitors/*/alerts/*/ack",
+            "POST /api/wiki/mkdir",
+            "POST /api/wiki/mv",
+            "POST /api/wiki/rm",
+            "POST /api/wiki/upload",
+            "PUT /api/wiki/file",
         ]
     );
     let mut classes = (0, 0);
@@ -1886,6 +1896,16 @@ fn route_classes_are_enforced_for_an_agent_caller() {
         let (ct, body) = if path.ends_with("/artifacts") {
             path.push_str("?name=agent.md");
             ("application/octet-stream", "# notes".to_string())
+        } else if path == "/api/wiki/upload" {
+            // CAD-580: the upload's CT guard names multipart — a
+            // minimal legal frame reaches the wiki handler (the
+            // daemon's ACL still decides the destination path).
+            (
+                "multipart/form-data; boundary=T",
+                "--T\r\nContent-Disposition: form-data; name=\"file\"; \
+                 filename=\"x.bin\"\r\n\r\nhi\r\n--T--\r\n"
+                    .to_string(),
+            )
         } else {
             let body = match (r.method, r.pattern) {
                 ("POST", "/api/issues") => r#"{"project":"cadence","title":"from an agent"}"#,

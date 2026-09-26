@@ -58,6 +58,7 @@ pub mod test_seam;
 pub mod ui;
 pub mod update;
 pub mod upgrade;
+pub mod wiki;
 pub mod worktree;
 
 pub use error::{Error, Result};
