@@ -68,7 +68,7 @@ impl Shared {
 
     /// `send_as` with the caller a steering send (CAD-158) is authorized
     /// against, derived from the connection by `steer_caller`.
-    fn send_with(
+    pub(super) fn send_with(
         self: &Arc<Self>,
         params: &Value,
         sender_of: &dyn Fn(&str) -> Result<store::Sender>,

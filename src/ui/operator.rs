@@ -126,6 +126,30 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     route("POST", "/api/needs/snooze", RouteClass::OperatorOnly),
     route("POST", "/api/agents/*/resume", RouteClass::OperatorOnly),
     route("POST", "/api/agents/*/unfence", RouteClass::OperatorOnly),
+    // CAD-608: the issue page's lane. Unlisted writes would fail closed
+    // the same way; listed so a reader sees they are the operator's.
+    route("POST", "/api/issues/*/lane/ask", RouteClass::OperatorOnly),
+    route(
+        "POST",
+        "/api/issues/*/lane/instruct",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/issues/*/lane/interrupt",
+        RouteClass::OperatorOnly,
+    ),
+    route("POST", "/api/issues/*/lane/stop", RouteClass::OperatorOnly),
+    route(
+        "POST",
+        "/api/issues/*/lane/unfence",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/issues/*/lane/reassign",
+        RouteClass::OperatorOnly,
+    ),
     route("POST", "/api/epics/*/stage", RouteClass::OperatorOnly),
     // CAD-561: the board's Update button and its check — operator-only,
     // like every other action that replaces the running build.

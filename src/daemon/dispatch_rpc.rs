@@ -270,7 +270,7 @@ impl Shared {
     /// per-provider policy. Pi models go through `pi_policy` for the
     /// worker role; every other provider uses the validators its
     /// launch already runs.
-    fn kickoff_launch_policy(
+    pub(super) fn kickoff_launch_policy(
         &self,
         provider: &str,
         kind: &str,

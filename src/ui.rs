@@ -41,6 +41,7 @@ use crate::proc::{self, BoundedError};
 mod apps;
 pub mod delivery_sync;
 mod home;
+mod lane;
 mod login;
 mod operator;
 mod read_model;
@@ -2172,6 +2173,21 @@ fn write_route(
         send(request, resp);
         return;
     }
+    // CAD-608: the issue page's lane. Admitted above (operator-only);
+    // the handler then relays on an operator assertion so an in-process
+    // board test reaches the daemon's operator gate. Production builds
+    // leave that assertion as a no-op — the board process is the proof.
+    if let Some(tail) = path.strip_prefix("/api/issues/") {
+        if let Some((id, verb)) = lane::write_target(tail) {
+            if *method != Method::Post {
+                send(request, err_response(405, "method not allowed"));
+                return;
+            }
+            let resp = lane::post(&mut request, state_dir, id, verb);
+            send(request, resp);
+            return;
+        }
+    }
     // The wiki routes (CAD-580): the caller `admit` derived rides
     // `wiki_as` to the daemon — writes and uploads relay, paths and
     // ACLs are the daemon's, the board only ever shrinks a caller.
@@ -3235,7 +3251,7 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 let id_raw = segs.next().unwrap_or_default();
                 let sub = segs.next();
                 if sub.is_some_and(|s| {
-                    !matches!(s, "file" | "activity" | "history" | "kickoff")
+                    !matches!(s, "file" | "activity" | "history" | "kickoff" | "lane")
                         && !s.starts_with("artifacts/")
                 }) {
                     send(request, err_response(404, "no such route"));
@@ -3319,6 +3335,7 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                                     Err(e) => send(request, err_response(503, &e.to_string())),
                                 }
                             }
+                            Some("lane") => send(request, lane::show(state_dir, &id)),
                             Some(s) if s.starts_with("artifacts/") => {
                                 let name = s.strip_prefix("artifacts/").unwrap_or_default();
                                 send(request, artifact_response(view, name));
