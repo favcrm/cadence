@@ -2,6 +2,8 @@ import { useCallback, useContext, useEffect, useMemo, useState } from "react";
 import { READ_ONLY_REASON } from "../auth/gate";
 import { WriteGate } from "../auth/WriteGate";
 import { api, ApiError } from "../../lib/api";
+import Button from "../../ui/Button";
+import Select from "../../ui/Select";
 import { canonicalJson } from "./modelDefaultsCompare";
 import { modelIdProblem } from "./modelId";
 import type {
@@ -304,22 +306,16 @@ export default function ModelDefaults() {
           )}
 
           <div className="flex flex-wrap gap-2">
-            <button
-              type="button"
-              className="h-9 px-3 rounded bg-accent text-on-accent text-secondary font-medium disabled:opacity-40"
+            <Button
+              variant="primary"
               disabled={frozen || !dirty || problems.length > 0}
               onClick={() => void save()}
             >
               Save defaults
-            </button>
-            <button
-              type="button"
-              className="h-9 px-3 rounded bg-ink-800 text-ink-100 text-secondary disabled:opacity-40"
-              disabled={frozen || !dirty}
-              onClick={() => snapshot && setDrafts(draftsFrom(snapshot))}
-            >
+            </Button>
+            <Button disabled={frozen || !dirty} onClick={() => snapshot && setDrafts(draftsFrom(snapshot))}>
               Cancel
-            </button>
+            </Button>
           </div>
 
           <div className="space-y-4">
@@ -354,21 +350,21 @@ export default function ModelDefaults() {
                           Baseline
                         </label>
                         <div className="flex flex-wrap gap-2">
-                          <select
+                          <Select
                             id={`${provider.id}-baseline`}
-                            className="field"
                             disabled={frozen}
                             value={draft.baseline}
-                            onChange={(event) =>
+                            onChange={(baseline) =>
                               update(provider.id, (row) => ({
                                 ...row,
-                                baseline: event.target.value as BaselineChoice,
+                                baseline: baseline as BaselineChoice,
                               }))
                             }
-                          >
-                            <option value="provider_default">Provider-native default</option>
-                            <option value="model">Specific model</option>
-                          </select>
+                            options={[
+                              { value: "provider_default", label: "Provider-native default" },
+                              { value: "model", label: "Specific model" },
+                            ]}
+                          />
                           {draft.baseline === "model" && (
                             <input
                               id={`${provider.id}-baseline-model`}
@@ -407,28 +403,28 @@ export default function ModelDefaults() {
                                       <label className="sr-only" htmlFor={`${provider.id}-${role.id}`}>
                                         {provider.label} {role.label} model
                                       </label>
-                                      <select
+                                      <Select
                                         id={`${provider.id}-${role.id}`}
-                                        className="field"
                                         disabled={frozen}
                                         value={row.choice}
-                                        onChange={(event) =>
+                                        onChange={(choice) =>
                                           update(provider.id, (current) => ({
                                             ...current,
                                             roles: {
                                               ...current.roles,
                                               [role.id]: {
                                                 ...row,
-                                                choice: event.target.value as RoleChoice,
+                                                choice: choice as RoleChoice,
                                               },
                                             },
                                           }))
                                         }
-                                      >
-                                        <option value="inherit">Inherit provider baseline</option>
-                                        <option value="provider_default">Provider-native default</option>
-                                        <option value="model">Specific model</option>
-                                      </select>
+                                        options={[
+                                          { value: "inherit", label: "Inherit provider baseline" },
+                                          { value: "provider_default", label: "Provider-native default" },
+                                          { value: "model", label: "Specific model" },
+                                        ]}
+                                      />
                                       {row.choice === "model" && (
                                         <input
                                           className="field min-w-48"
@@ -456,9 +452,7 @@ export default function ModelDefaults() {
                           </tbody>
                         </table>
                       </div>
-                      <button
-                        type="button"
-                        className="h-8 px-2.5 rounded bg-ink-800 text-ink-200 text-label disabled:opacity-40"
+                      <Button
                         disabled={frozen || !draft.present}
                         onClick={() =>
                           setDrafts((current) => ({
@@ -475,7 +469,7 @@ export default function ModelDefaults() {
                         }
                       >
                         Reset {provider.label} to inherit
-                      </button>
+                      </Button>
                     </>
                   )}
                 </article>

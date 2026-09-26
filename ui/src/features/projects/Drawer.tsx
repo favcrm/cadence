@@ -2,7 +2,9 @@ import { useEffect, useRef, useState } from "react";
 import { api, type WriteResp } from "../../lib/api";
 import { fmtBytes, fmtTime } from "../../lib/fmt";
 import { notesStatusSentence } from "../../lib/uxCopy";
+import Button from "../../ui/Button";
 import Md from "../../ui/Md";
+import Select from "../../ui/Select";
 import { IconClose } from "../../ui/icons";
 import { noDragReason } from "./Card";
 import type {
@@ -389,33 +391,27 @@ export default function Drawer({
                   <div className="card p-3 grid grid-cols-2 gap-2.5">
                     <label className="block">
                       <span className="slabel">status</span>
-                      <select
+                      <Select
+                        full
+                        className="mt-1"
                         value={edit.status}
-                        onChange={(e) =>
-                          setEdit({ ...edit, status: e.target.value })
-                        }
+                        onChange={(status) => setEdit({ ...edit, status })}
                         disabled={!!statusLocked}
                         title={statusLocked ?? undefined}
-                        className="field w-full mt-1 disabled:opacity-50"
-                      >
-                        {STATUSES.map((s) => (
-                          <option key={s}>{s}</option>
-                        ))}
-                      </select>
+                        aria-label="status"
+                        options={STATUSES.map((s) => ({ value: s, label: s }))}
+                      />
                     </label>
                     <label className="block">
                       <span className="slabel">priority</span>
-                      <select
+                      <Select
+                        full
+                        className="mt-1"
                         value={edit.priority}
-                        onChange={(e) =>
-                          setEdit({ ...edit, priority: e.target.value })
-                        }
-                        className="field w-full mt-1"
-                      >
-                        {PRIORITIES.map((p) => (
-                          <option key={p}>{p}</option>
-                        ))}
-                      </select>
+                        onChange={(priority) => setEdit({ ...edit, priority })}
+                        aria-label="priority"
+                        options={PRIORITIES.map((p) => ({ value: p, label: p }))}
+                      />
                     </label>
                     <label className="block">
                       <span className="slabel">owner</span>
@@ -605,16 +601,12 @@ export default function Drawer({
                 )}
                 {!readOnly && (
                   <div className="flex gap-1.5">
-                    <select
+                    <Select
                       value={linkKind}
-                      onChange={(e) => setLinkKind(e.target.value)}
-                      className="field !h-8 text-label"
+                      onChange={setLinkKind}
                       aria-label="link type"
-                    >
-                      {LINK_KINDS.map((k) => (
-                        <option key={k}>{k}</option>
-                      ))}
-                    </select>
+                      options={LINK_KINDS.map((k) => ({ value: k, label: k }))}
+                    />
                     <input
                       value={linkTarget}
                       onChange={(e) => setLinkTarget(e.target.value)}
@@ -632,7 +624,8 @@ export default function Drawer({
                       className="field !h-8 flex-1 num text-label"
                       placeholder="CAD-16"
                     />
-                    <button
+                    <Button
+                      size="sm"
                       onClick={() => {
                         const t = linkTarget.trim();
                         if (!t) return;
@@ -645,10 +638,9 @@ export default function Drawer({
                           .catch((e) => onError(e, "link"));
                       }}
                       disabled={!linkTarget.trim()}
-                      className="h-8 px-2.5 rounded border border-ink-600 text-label text-ink-300 hover:border-accent/60 hover:text-accent disabled:opacity-40"
                     >
                       link
-                    </button>
+                    </Button>
                   </div>
                 )}
               </section>
@@ -764,16 +756,12 @@ export default function Drawer({
                 )}
                 {!readOnly && (
                   <div className="flex flex-wrap gap-1.5 mt-2">
-                    <select
+                    <Select
                       value={refKind}
-                      onChange={(e) => setRefKind(e.target.value)}
-                      className="field !h-8 text-label"
+                      onChange={setRefKind}
                       aria-label="ref kind"
-                    >
-                      {REF_KINDS.map((k) => (
-                        <option key={k}>{k}</option>
-                      ))}
-                    </select>
+                      options={REF_KINDS.map((k) => ({ value: k, label: k }))}
+                    />
                     <input
                       value={refTarget}
                       onChange={(e) => setRefTarget(e.target.value)}
@@ -786,7 +774,8 @@ export default function Drawer({
                       className="field !h-8 w-20 text-label"
                       placeholder="label"
                     />
-                    <button
+                    <Button
+                      size="sm"
                       onClick={() => {
                         const t = refTarget.trim();
                         if (!t) return;
@@ -809,10 +798,9 @@ export default function Drawer({
                           .catch((e) => onError(e, "ref"));
                       }}
                       disabled={!refTarget.trim()}
-                      className="h-8 px-2.5 rounded border border-ink-600 text-label text-ink-300 hover:border-accent/60 hover:text-accent disabled:opacity-40"
                     >
                       ref
-                    </button>
+                    </Button>
                   </div>
                 )}
               </section>
@@ -1114,33 +1102,22 @@ export default function Drawer({
           <div className="ml-auto flex gap-2 shrink-0">
             {edit ? (
               <>
-                <button
-                  onClick={() => setEdit(null)}
-                  className="h-9 px-3 rounded border border-ink-600 text-secondary text-ink-300 hover:border-ink-500"
-                >
-                  Cancel
-                </button>
-                <button
-                  onClick={saveEdit}
-                  className="h-9 px-3 rounded bg-accent text-on-accent text-secondary font-medium"
-                >
+                <Button onClick={() => setEdit(null)}>Cancel</Button>
+                <Button variant="primary" onClick={saveEdit}>
                   Save
-                </button>
+                </Button>
               </>
             ) : (
               !readOnly && (
                 <>
-                  <button
-                    onClick={sendComment}
-                    disabled={!comment.trim()}
-                    className="h-9 px-3 rounded border border-ink-600 text-secondary text-ink-300 hover:border-accent/60 hover:text-accent disabled:opacity-45 disabled:cursor-not-allowed"
-                  >
+                  <Button onClick={sendComment} disabled={!comment.trim()}>
                     Comment
-                  </button>
-                  <button
-                    type="button"
+                  </Button>
+                  <Button
+                    variant="primary"
                     onClick={kickOff}
                     disabled={kicking || !canKickoff}
+                    loading={kicking}
                     title={
                       !canKickoff
                         ? "Kick off is the operator's decision"
@@ -1148,10 +1125,9 @@ export default function Drawer({
                           ? "Join a worker and dispatch this issue"
                           : "Confirm before kick off"
                     }
-                    className="h-9 px-3 rounded bg-accent text-on-accent text-secondary font-medium disabled:opacity-45 disabled:cursor-not-allowed"
                   >
                     {kicking ? "Kicking off…" : kickConfirm ? "Confirm kick off" : "Kick off"}
-                  </button>
+                  </Button>
                 </>
               )
             )}

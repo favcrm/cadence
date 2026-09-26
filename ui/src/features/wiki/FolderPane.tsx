@@ -7,7 +7,8 @@ import { wiki, wikiFileUrl, wikiRawUrl, type WikiEntry } from "./api";
 import { baseName, joinPath, parentPath } from "./paths";
 import { kindLabel, previewKind } from "./preview";
 import { entryOrder } from "./tree";
-import { Btn, KindIcon, Loading } from "./shared";
+import Button from "../../ui/Button";
+import { KindIcon, Loading } from "./shared";
 
 /**
  * The folder view (CAD-581): grid or list, image thumbnails, a per-item
@@ -168,10 +169,10 @@ export default function FolderPane({
             onChange={(e) => setDialog({ ...dialog, value: e.target.value })}
           />
           <div className="wk-tools">
-            <Btn accent onClick={() => void submit()} disabled={busy}>
+            <Button variant="primary" onClick={() => void submit()} disabled={busy}>
               {dialog.kind}
-            </Btn>
-            <Btn onClick={() => setDialog(null)}>cancel</Btn>
+            </Button>
+            <Button onClick={() => setDialog(null)}>cancel</Button>
           </div>
         </form>
       )}
@@ -184,8 +185,8 @@ export default function FolderPane({
             restored from there.
           </div>
           <div className="wk-tools">
-            <Btn
-              danger
+            <Button
+              variant="danger"
               disabled={busy}
               onClick={() => {
                 const entry = rows.find((r) => r.path === confirm);
@@ -193,8 +194,8 @@ export default function FolderPane({
               }}
             >
               delete to trash
-            </Btn>
-            <Btn onClick={() => setConfirm(null)}>cancel</Btn>
+            </Button>
+            <Button onClick={() => setConfirm(null)}>cancel</Button>
           </div>
         </div>
       )}

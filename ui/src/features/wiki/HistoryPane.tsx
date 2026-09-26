@@ -5,7 +5,8 @@ import { wiki } from "./api";
 import { versionRows, versionWho, type WikiVersion } from "./history";
 import { diffLabel, unifiedDiffLines } from "./diff";
 import { DiffLines } from "./EditorPane";
-import { Btn, Crumbs, Failure, Loading, Note } from "./shared";
+import Button from "../../ui/Button";
+import { Crumbs, Failure, Loading, Note } from "./shared";
 
 /**
  * A page's history (CAD-581): the revision list, the diff between the
@@ -103,15 +104,15 @@ export default function HistoryPane({
         <span className="wk-sep">·</span>
         <span className="wk-editing">history</span>
         <div className="wk-tools">
-          <Btn href={navHref({ screen: "wiki", mode: "browse", path, query: null })}>Back to page</Btn>
-          <Btn
-            accent
+          <Button href={navHref({ screen: "wiki", mode: "browse", path, query: null })}>Back to page</Button>
+          <Button
+            variant="primary"
             disabled={readOnly || busy || !selected || selected === currentRev}
             title={readOnly ? "writes are disabled — sign in as the operator" : undefined}
             onClick={() => void restore()}
           >
             Restore this version
-          </Btn>
+          </Button>
         </div>
       </div>
 

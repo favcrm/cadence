@@ -15,7 +15,8 @@ import {
   uploadProgress,
   type UploadItem,
 } from "./upload";
-import { Btn, Crumbs, KindIcon, Note } from "./shared";
+import Button from "../../ui/Button";
+import { Crumbs, KindIcon, Note } from "./shared";
 
 /**
  * The upload pane (CAD-581): a drag-and-drop overlay plus the multi-file
@@ -85,7 +86,7 @@ export default function UploadPane({
           hrefFor={(p) => navHref({ screen: "wiki", mode: "browse", path: p || null, query: null })}
         />
         <div className="wk-tools">
-          <Btn href={browseHref}>Done</Btn>
+          <Button href={browseHref}>Done</Button>
         </div>
       </div>
 
@@ -120,7 +121,7 @@ export default function UploadPane({
           <div className="kicker">
             into {dir ? `${dir}/` : "~/pm/wiki"} · {capLabel()} per file
           </div>
-          <label className="wk-btn">
+          <label className="btn">
             choose files
             <input
               type="file"
@@ -180,7 +181,7 @@ export default function UploadPane({
             </div>
           ))}
           <div className="wk-tools">
-            <Btn
+            <Button
               onClick={() => {
                 onToast("ok", `${tally.done} uploaded${tally.failed ? `, ${tally.failed} failed` : ""}`);
                 setItems([]);
@@ -188,7 +189,7 @@ export default function UploadPane({
               }}
             >
               clear the list
-            </Btn>
+            </Button>
           </div>
         </div>
       )}

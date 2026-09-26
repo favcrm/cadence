@@ -3,6 +3,7 @@ import { useState } from "react";
 import { api, ApiError } from "../../lib/api";
 import { resources } from "../../lib/resources";
 import { useQuery } from "../../lib/useResource";
+import Button from "../../ui/Button";
 import { planView, rejectReasonError } from "./plan";
 
 const STATE_CHIP: Record<string, string> = {
@@ -177,41 +178,41 @@ export default function PlanCard({
               )}
               <div className="flex flex-wrap items-center gap-2">
                 {!rejecting && (
-                  <button
-                    className="h-8 px-3 rounded bg-accent text-on-accent text-label font-medium disabled:opacity-40"
+                  <Button
+                    variant="primary"
+                    size="sm"
                     disabled={busy !== null}
+                    loading={busy === "approve"}
                     onClick={() => decide("approve")}
                   >
                     {busy === "approve" ? "Approving…" : "Approve plan"}
-                  </button>
+                  </Button>
                 )}
                 {rejecting ? (
                   <>
-                    <button
-                      className="h-8 px-3 rounded border border-fail/60 text-fail text-label font-medium disabled:opacity-40"
+                    <Button
+                      variant="danger"
+                      size="sm"
                       disabled={busy !== null}
+                      loading={busy === "reject"}
                       onClick={() => decide("reject")}
                     >
                       {busy === "reject" ? "Rejecting…" : "Reject plan"}
-                    </button>
-                    <button
-                      className="h-8 px-3 rounded border border-ink-600 text-label text-ink-300"
+                    </Button>
+                    <Button
+                      size="sm"
                       onClick={() => {
                         setRejecting(false);
                         setError(null);
                       }}
                     >
                       Cancel
-                    </button>
+                    </Button>
                   </>
                 ) : (
-                  <button
-                    className="h-8 px-3 rounded border border-ink-600 text-label text-ink-300 hover:border-fail/60 hover:text-fail disabled:opacity-40"
-                    disabled={busy !== null}
-                    onClick={() => setRejecting(true)}
-                  >
+                  <Button variant="danger" size="sm" disabled={busy !== null} onClick={() => setRejecting(true)}>
                     Reject…
-                  </button>
+                  </Button>
                 )}
               </div>
             </>
