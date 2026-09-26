@@ -513,7 +513,9 @@ function Composer({
 }) {
   const [draft, setDraft] = useState("");
   const [hi, setHi] = useState(0);
-  const [menuOff, setMenuOff] = useState(false);
+  // Esc dismisses the menu for THIS verb text — the next keystroke
+  // reopens it (or a cleared draft does).
+  const [menuOffFor, setMenuOffFor] = useState<string | null>(null);
   const form = useRef<HTMLFormElement>(null);
   useEffect(() => {
     if (seed.n > 0) setDraft(seed.text);
@@ -541,18 +543,17 @@ function Composer({
   }, []);
 
   const slash = parseSlash(draft);
-  // The menu shows while the first token is still a verb prefix; once a
-  // space lands the arg is being typed and the menu stands down.
-  const matches = !menuOff && slash && !draft.includes(" ") ? slashMatches(slash.name) : [];
-  useEffect(() => {
-    setHi(0);
-    if (!slash) setMenuOff(false);
-  }, [slash?.name]);
+  // The menu shows while the draft is a verb prefix ("/", "/st") — once
+  // a space lands the arg is being typed and the menu stands down.
+  const verbDraft = draft.startsWith("/") && !draft.includes(" ") ? draft.slice(1) : null;
+  const matches =
+    verbDraft !== null && draft !== menuOffFor ? slashMatches(verbDraft.toLowerCase()) : [];
+  useEffect(() => setHi(0), [verbDraft]);
   const hiClamped = Math.min(hi, Math.max(0, matches.length - 1));
 
   const complete = (c: SlashCommand) => {
     setDraft(`/${c.name}${c.arg ? " " : ""}`);
-    setMenuOff(false);
+    setMenuOffFor(null);
   };
 
   const submit = () => {
@@ -578,7 +579,7 @@ function Composer({
       }
       if (e.key === "Escape") {
         e.preventDefault();
-        setMenuOff(true);
+        setMenuOffFor(draft);
         return;
       }
       if (e.key === "Tab") {
@@ -752,7 +753,6 @@ export default function Home({
   const [cmds, setCmds] = useState<CmdResult[]>([]);
   const [unseen, setUnseen] = useState(0);
   const cmdSeq = useRef(0);
-  const bottom = useRef<HTMLDivElement>(null);
   const pinned = useRef(true);
   const prevItems = useRef(0);
   const liveAfter = useRef<number | null>(null);
@@ -812,6 +812,17 @@ export default function Home({
     const t = setInterval(() => void resources.masterState.refresh(), 12_000);
     return () => clearInterval(t);
   }, [turn.kind]);
+  // Turn boundaries land on the thread stream before the agents row
+  // moves — a `turn_result` or a queued `message` tail revalidates the
+  // state immediately so the working row clears with the reply, not a
+  // beat after it.
+  const tailSeq = thread.data?.entries.at(-1)?.seq ?? 0;
+  useEffect(() => {
+    const tail = thread.data?.entries.at(-1);
+    if (tail && (tail.kind === "turn_result" || tail.kind === "message")) {
+      void resources.masterState.refresh();
+    }
+  }, [tailSeq]);
 
   // Smart scroll (CAD-551): follow the tail only while the operator is
   // already at the bottom — reading history up top is never yanked away.
@@ -831,15 +842,21 @@ export default function Home({
     const delta = items.length - prevItems.current;
     prevItems.current = items.length;
     if (!lastKey) return;
-    if (pinned.current) bottom.current?.scrollIntoView?.({ block: "end" });
-    else if (delta > 0) setUnseen((u) => u + delta);
+    // To the very bottom — scrollIntoView on the anchor stops a sticky
+    // composer's height short, which reads as "not pinned" and wrongly
+    // counts every later arrival onto the pill.
+    if (pinned.current) {
+      window.scrollTo(0, document.documentElement.scrollHeight);
+    } else if (delta > 0) {
+      setUnseen((u) => u + delta);
+    }
   }, [items.length, lastKey]);
 
   const jumpToLatest = () => {
     pinned.current = true;
     setUnseen(0);
-    bottom.current?.scrollIntoView?.({
-      block: "end",
+    window.scrollTo({
+      top: document.documentElement.scrollHeight,
       behavior: reducedMotion() ? "auto" : "smooth",
     });
   };
@@ -966,7 +983,6 @@ export default function Home({
           <CmdCard key={c.id} cmd={c} onOpenIssue={onOpenIssue} />
         ))}
         <WorkingRow turn={turn} step={step} onStop={() => runCommand("stop", "")} />
-        <div ref={bottom} />
 
         <Composer block={block} seed={seed} onCommand={runCommand} />
       </section>

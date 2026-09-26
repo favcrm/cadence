@@ -257,6 +257,7 @@ def run_prompt(message):
     emit({"type": "turn_start"})
     emit({"type": "message_start", "message": {"role": "assistant"}})
     reply = "fake-pi reply: " + message.strip().splitlines()[-1][:80]
+    slow = MODE == "slow"  # CAD-551: a visible turn for the working row
     if "run tool" in message:
         emit({
             "type": "tool_execution_start",
@@ -271,6 +272,8 @@ def run_prompt(message):
             "args": {"command": "cadence status"},
             "partialResult": {"content": [{"type": "text", "text": "partial"}]},
         })
+        if slow:
+            time.sleep(1.6)
         emit({
             "type": "tool_execution_end",
             "toolCallId": "call_1",
@@ -286,6 +289,8 @@ def run_prompt(message):
         })
     if MODE == "hang":
         return  # stays live but never settles — the caller must abort
+    if slow:
+        time.sleep(1.6)
     live_turn = False
     finish_turn("stop", reply)
 
