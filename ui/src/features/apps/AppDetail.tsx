@@ -187,7 +187,6 @@ export default function AppDetail({
             </nav>
             {tab === "posts" && (
               <PostsTab
-                app={app}
                 runs={runs}
                 runsState={runsState}
                 needs={needs}
@@ -231,7 +230,6 @@ export default function AppDetail({
 
 /** Posts — one card per run, with its stage row, filters and outputs. */
 function PostsTab({
-  app,
   runs,
   runsState,
   needs,
@@ -241,7 +239,6 @@ function PostsTab({
   onOpenIssue,
   onRetry,
 }: {
-  app: AppDetailRow;
   runs: AppRun[];
   runsState: ReturnType<typeof useQuery<AppRun[]>>;
   needs: HomeNeed[];
@@ -305,7 +302,6 @@ function PostsTab({
         {shown.map((run) => (
           <RunCard
             key={run.epic}
-            app={app}
             run={run}
             needs={needs}
             mine={outputsOf(run, items, pending)}
@@ -326,14 +322,12 @@ const STAGE_CLS: Record<string, string> = {
 };
 
 function RunCard({
-  app,
   run,
   needs,
   mine,
   operator,
   onOpenIssue,
 }: {
-  app: AppDetailRow;
   run: AppRun;
   needs: HomeNeed[];
   mine: { items: AppRunOutput[]; pending: AppPendingSend[] };
@@ -342,7 +336,6 @@ function RunCard({
 }) {
   const state = runState(run, needs);
   const stages = runStages(run, mine.items, mine.pending);
-  const wf = (app.workflows ?? []).find((w) => w.name === run.workflow);
   return (
     <li className="card px-3.5 py-3 min-w-0" data-run={run.epic}>
       <div className="flex flex-wrap items-center gap-2 min-w-0">
@@ -371,7 +364,6 @@ function RunCard({
           {run.epic}
         </button>
         {run.plan.proposed_at && <span className="num">{fmtTime(run.plan.proposed_at)}</span>}
-        {wf?.title && <span className="truncate">{wf.title}</span>}
         {state.needsYou && (
           <Link href="/" className="lnk text-warn shrink-0">
             needs you →
@@ -676,7 +668,11 @@ function RunDrawer({
               primary,
               prefill: team,
               slugInput,
-              note: "Nothing is published without your approval.",
+              // The rules in plain words: who must be different people,
+              // and that nothing goes out without the operator.
+              note: [distinctNote(row), "Nothing is published without your approval."]
+                .filter(Boolean)
+                .join(" "),
             }}
           />
         </div>

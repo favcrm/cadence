@@ -153,17 +153,16 @@ pub fn read_for(pm_dir: &Path, project: &str, name: &str) -> Result<String> {
         .map_err(|e| Error::rejected(format!("cannot read {}: {e}", file.display())))
 }
 
-/// The frontmatter of a template: a YAML mapping restricted to
-/// [`META_KEYS`]; `inputs` is pulled out into [`InputSpec`]s and
-/// `distinct` into the must-differ input group.
-fn parse_front(
-    yaml: &str,
-) -> Result<(
-    serde_yaml::Mapping,
-    BTreeMap<String, InputSpec>,
-    Vec<String>,
-    Option<String>,
-)> {
+/// The frontmatter of a template, split into what the workflow knows:
+/// its declared inputs, the must-differ group and the human label. The
+/// plan's own metadata (title, goal, non_goals) stays in the file.
+struct Front {
+    inputs: BTreeMap<String, InputSpec>,
+    distinct: Vec<String>,
+    label: Option<String>,
+}
+
+fn parse_front(yaml: &str) -> Result<Front> {
     let meta: serde_yaml::Value = serde_yaml::from_str(yaml)
         .map_err(|e| Error::rejected(format!("workflow frontmatter: {e}")))?;
     let mut map = match meta {
@@ -287,7 +286,11 @@ fn parse_front(
             ));
         }
     }
-    Ok((map, inputs, distinct, label))
+    Ok(Front {
+        inputs,
+        distinct,
+        label,
+    })
 }
 
 /// Scan for `{{` … `}}` placeholders: each inner name must be a
@@ -424,13 +427,13 @@ pub fn parse_template(text: &str) -> Result<Template> {
             "{e} — a workflow is a plan file: frontmatter title, goal, non_goals, inputs"
         ))
     })?;
-    let (_meta, inputs, distinct, label) = parse_front(yaml)?;
-    placeholders(text, &inputs)?;
+    let front = parse_front(yaml)?;
+    placeholders(text, &front.inputs)?;
     ticket_meta(body)?;
     Ok(Template {
-        inputs,
-        distinct,
-        label,
+        inputs: front.inputs,
+        distinct: front.distinct,
+        label: front.label,
     })
 }
 

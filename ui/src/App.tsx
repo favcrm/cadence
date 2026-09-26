@@ -136,9 +136,10 @@ export default function App() {
 
   // The overview payload costs a daemon probe + gh cache read, so it
   // only fetches while a screen that reads it is on screen: Home, the
-  // overview, or one app's detail (its Runs section marks runs against
-  // Needs you). The refs keep `refresh` and the stream handler stable.
-  const overviewWanted = overviewOn(screen) || (route.screen === "apps" && route.name !== null);
+  // overview, or an Apps screen (the cards' live lines and the app
+  // page's Needs-you strip mark runs against it). The refs keep
+  // `refresh` and the stream handler stable.
+  const overviewWanted = overviewOn(screen) || screen === "apps";
   const overviewWantedRef = useRef(overviewWanted);
   overviewWantedRef.current = overviewWanted;
   // The overview shows the project context compactly; Projects → context in full.
