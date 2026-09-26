@@ -1034,7 +1034,10 @@ fn builtin_local_account_still_needs_a_grant() {
                "request": "req-nogrant"}),
     ));
     assert!(err.contains("no grant"), "{err}");
-    assert!(!err.contains("enroll"), "built-in must not ask for enrollment: {err}");
+    assert!(
+        !err.contains("enroll"),
+        "built-in must not ask for enrollment: {err}"
+    );
 }
 
 // ---------- the read side is operator-only ----------

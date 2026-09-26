@@ -737,12 +737,9 @@ impl Store {
         // The app's own prior grants go first — a re-approval
         // re-derives, so a scope the new structure dropped is gone.
         let prior: Vec<(String, String, String)> = {
-            let mut stmt = tx.prepare(
-                "SELECT agent, platform, account FROM app_grants WHERE app=?1",
-            )?;
-            let rows = stmt.query_map(params![app], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-            })?;
+            let mut stmt =
+                tx.prepare("SELECT agent, platform, account FROM app_grants WHERE app=?1")?;
+            let rows = stmt.query_map(params![app], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
             rows.flatten().collect()
         };
         for (agent, platform, account) in &prior {
@@ -766,7 +763,15 @@ impl Store {
                 "INSERT OR REPLACE INTO app_grants
                  (app, agent, platform, account, scopes, granted_at, by)
                  VALUES(?1,?2,?3,?4,?5,?6,?7)",
-                params![app, agent, platform, account, scopes_json(&scopes)?, now(), by],
+                params![
+                    app,
+                    agent,
+                    platform,
+                    account,
+                    scopes_json(&scopes)?,
+                    now(),
+                    by
+                ],
             )?;
             // The platform grant is the UNION of the app's derived
             // scopes and whatever the agent already held — a hand-made
@@ -827,17 +832,12 @@ impl Store {
     /// grant's other scopes survive. Answers the `(agent, platform,
     /// account)` triples whose platform grant changed, so the caller
     /// can drain the waiting effects that lost a scope (CAD-506).
-    pub fn app_grants_revoke(
-        &self,
-        app: &str,
-        by: &str,
-    ) -> Result<Vec<(String, String, String)>> {
+    pub fn app_grants_revoke(&self, app: &str, by: &str) -> Result<Vec<(String, String, String)>> {
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let rows: Vec<(String, String, String, Vec<String>)> = {
-            let mut stmt = tx.prepare(
-                "SELECT agent, platform, account, scopes FROM app_grants WHERE app=?1",
-            )?;
+            let mut stmt =
+                tx.prepare("SELECT agent, platform, account, scopes FROM app_grants WHERE app=?1")?;
             let rows = stmt.query_map(params![app], |r| {
                 let scopes: String = r.get(3)?;
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, scopes_of(&scopes)))

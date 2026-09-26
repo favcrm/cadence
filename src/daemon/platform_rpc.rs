@@ -448,10 +448,9 @@ impl Shared {
                 match self.store.platform_default(&project, &platform)? {
                     Some(d) => d.account,
                     // The built-in account is always available (CAD-577).
-                    None if platform::is_builtin(
-                        &platform,
-                        platform::BUILTIN_LOCAL_ACCOUNT,
-                    ) => platform::BUILTIN_LOCAL_ACCOUNT.to_string(),
+                    None if platform::is_builtin(&platform, platform::BUILTIN_LOCAL_ACCOUNT) => {
+                        platform::BUILTIN_LOCAL_ACCOUNT.to_string()
+                    }
                     None => {
                         return Err(Error::rejected(format!(
                             "project '{project}' names no default account for '{platform}'"

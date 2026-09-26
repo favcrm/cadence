@@ -150,7 +150,11 @@ impl Shared {
             Some(d) => Ok(d.account),
             // The built-in account is always available — a project that
             // never set a default still resolves (CAD-577).
-            None if crate::platform::is_builtin(platform, crate::platform::BUILTIN_LOCAL_ACCOUNT) => {
+            None if crate::platform::is_builtin(
+                platform,
+                crate::platform::BUILTIN_LOCAL_ACCOUNT,
+            ) =>
+            {
                 Ok(crate::platform::BUILTIN_LOCAL_ACCOUNT.to_string())
             }
             None => Err(Error::rejected(format!(

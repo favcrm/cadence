@@ -469,7 +469,11 @@ impl Shared {
                         .ok_or_else(|| Error::rejected("'team' holds a non-string role"))
                 })
                 .collect::<Result<Vec<_>>>()?,
-            Some(_) => return Err(Error::rejected("'team' must be a list of '<input>=<agent>'")),
+            Some(_) => {
+                return Err(Error::rejected(
+                    "'team' must be a list of '<input>=<agent>'",
+                ))
+            }
             None => return Err(Error::rejected("Missing or non-array 'team'")),
         };
         let pm_dir = self.pm_dir()?;
@@ -480,14 +484,8 @@ impl Shared {
             return Err(crate::issue::project::unknown_project(project, &pm_dir));
         }
         let pm = self.pm_at(&pm_dir)?;
-        let out = crate::issue::app::set_team(
-            &pm,
-            project,
-            name,
-            &roles,
-            &self.state_dir,
-            "operator",
-        )?;
+        let out =
+            crate::issue::app::set_team(&pm, project, name, &roles, &self.state_dir, "operator")?;
         // The team is what maps roles to agents, so a team change
         // re-derives the app's grants (CAD-577) — but only while the
         // app is still approved; a structural change revoked them.
@@ -515,7 +513,10 @@ impl Shared {
             .store
             .app_approvals()
             .ok()
-            .and_then(|a| a.get(&key).and_then(|p| p["digest"].as_str().map(str::to_string)))
+            .and_then(|a| {
+                a.get(&key)
+                    .and_then(|p| p["digest"].as_str().map(str::to_string))
+            })
             .as_deref()
             == Some(digest.as_str());
         if approved {
@@ -672,8 +673,11 @@ impl Shared {
                 )
             })
             .collect();
-        self.store
-            .app_grants_set(&crate::issue::app::approval_key(project, name), &grants, "operator")?;
+        self.store.app_grants_set(
+            &crate::issue::app::approval_key(project, name),
+            &grants,
+            "operator",
+        )?;
         let payload = json!({
             "project": project,
             "name": name,

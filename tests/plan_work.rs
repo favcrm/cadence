@@ -1635,8 +1635,15 @@ fn app_propose_gates_and_provenance() {
 /// The scopes of `agent`'s grant on `platform`/`account`, or `None`
 /// when it holds none — read through the operator's `platform_grants`
 /// (the store's own `platform_grant` is `pub(crate)` to the crate).
-fn grant_scopes(f: &PlanFixture, agent: &str, platform: &str, account: &str) -> Option<Vec<String>> {
-    let out = f.d.operator_rpc("platform_grants", json!({"agent": agent})).unwrap();
+fn grant_scopes(
+    f: &PlanFixture,
+    agent: &str,
+    platform: &str,
+    account: &str,
+) -> Option<Vec<String>> {
+    let out =
+        f.d.operator_rpc("platform_grants", json!({"agent": agent}))
+            .unwrap();
     out["grants"]
         .as_array()
         .unwrap()
@@ -1656,17 +1663,15 @@ fn grant_scopes(f: &PlanFixture, agent: &str, platform: &str, account: &str) -> 
 /// input as its agent and uses the `publish` slot, so the grant it
 /// derives depends on the team the operator sets (CAD-577).
 const ROLE_APP_MD: &str = "---\napp: roles\ntitle: Roles\nversion: 0.1.0\nneeds:\n  connections: [publish]\n---\n\nbody\n";
-const ROLE_APP_WF: &str = "---\ntitle: \"Go: {{title}}\"\ngoal: g\ninputs:\n  title: {}\n  publisher: {}\n---\n\n\
+const ROLE_APP_WF: &str =
+    "---\ntitle: \"Go: {{title}}\"\ngoal: g\ninputs:\n  title: {}\n  publisher: {}\n---\n\n\
 ## Work {{title}}\nagent: {{publisher}}\nuses: publish\n\n### Acceptance\n- [ ] done\n";
 
 fn app_install_roles(f: &PlanFixture) -> Value {
     let src = app_src(
         f,
         "roles",
-        &[
-            ("app.md", ROLE_APP_MD),
-            ("workflows/go.md", ROLE_APP_WF),
-        ],
+        &[("app.md", ROLE_APP_MD), ("workflows/go.md", ROLE_APP_WF)],
     );
     let (ok, out) = f.cli(&["app", "install", src.to_str().unwrap(), "--project", "demo"]);
     assert!(ok, "app install roles: {out}");
@@ -1699,9 +1704,8 @@ fn app_approval_derives_grants() {
     );
 
     // The operator sets the team: dev-1 publishes.
-    let out = f
-        .d
-        .operator_rpc(
+    let out =
+        f.d.operator_rpc(
             "app_set_team",
             json!({"project": "demo", "name": "roles",
                    "team": ["publisher=dev-1"]}),
@@ -1711,10 +1715,9 @@ fn app_approval_derives_grants() {
 
     // Re-approve: the grant is derived for dev-1 on local/local with
     // exactly the declared `publish` scope.
-    let out = f
-        .d
-        .operator_rpc("app_approve", json!({"project": "demo", "name": "roles"}))
-        .unwrap();
+    let out =
+        f.d.operator_rpc("app_approve", json!({"project": "demo", "name": "roles"}))
+            .unwrap();
     let grants = out["grants"].as_array().unwrap();
     assert_eq!(grants.len(), 1, "{out}");
     assert_eq!(grants[0]["agent"], "dev-1", "{out}");
@@ -1839,9 +1842,8 @@ fn app_revoke_revokes_derived_grants() {
         "revoke must take only the derived scopes"
     );
     // The app is unapproved again.
-    let err = f
-        .d
-        .operator_rpc(
+    let err =
+        f.d.operator_rpc(
             "plan_propose",
             json!({"project": "demo", "workflow": "roles/go",
                    "inputs": {"title": "x", "publisher": "dev-1"}}),
@@ -1857,7 +1859,8 @@ fn app_revoke_revokes_derived_grants() {
 /// frontmatter key, a nested dir, an oversize file, and a source
 /// inside the tracker all refuse by name — and none lands a byte.
 #[test]
-fn app_install_refuses_hostile_input() {    let f = PlanFixture::start();
+fn app_install_refuses_hostile_input() {
+    let f = PlanFixture::start();
     f.d.register("dev-1");
     f.d.register("qa-1");
     let before = f.commits();
