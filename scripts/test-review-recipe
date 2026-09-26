@@ -76,6 +76,12 @@ class RecipeTargets(unittest.TestCase):
         for target in splits:
             self.assertTrue(any(f"--test {target} " in gate + " " for gate in recipe["gates"]), target)
 
+    def test_recipe_runs_feature_disabled_refusal_contract(self):
+        recipe = tomllib.loads((ROOT / "cadence-review.toml").read_text())
+        # These tests are cfg(not(test-seam)); a feature-on full suite cannot
+        # replace this focused production-mode runtime proof.
+        self.assertTrue(any("--test test_seam " in gate + " " and "--features" not in gate and "--all-features" not in gate for gate in recipe["gates"]))
+
 
 if __name__ == "__main__":
     unittest.main()

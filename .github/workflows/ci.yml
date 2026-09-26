@@ -189,6 +189,13 @@ jobs:
       # for (tests/split_map_inventory.rs is the suite-side twin check).
       - name: Verify doctor/host split-map consistency
         run: scripts/split-doctor-host --check
+      # The feature-on suite cannot compile cfg(not(test-seam)) proofs.
+      # Run only that identity contract in the production feature shape.
+      - name: Run default-feature test-seam refusal proofs
+        env:
+          CADENCE_SUITE_LOCK: ${{ runner.temp }}/cadence-suite.lock
+          CARGO_BUILD_JOBS: 4
+        run: scripts/cadence-nextest --test test_seam --locked
       - name: Run all Rust targets with pinned nextest
         env:
           CADENCE_SUITE_LOCK: ${{ runner.temp }}/cadence-suite.lock

@@ -37,6 +37,7 @@ gates = [
     "cargo clippy --all-targets --locked -- -D warnings",
     "cargo clippy --all-targets --locked --features test-seam -- -D warnings",
     "cargo clippy --all-targets --locked --features ui -- -D warnings",
+    "cargo test --locked --test test_seam -- --test-threads 2",
     "cargo test --locked --features test-seam --lib --bins --test board_issue --test board_lanes --test board_sync --test board_http --test board_ui_daemon --test board_tailnet --test board_memory --test board_overview --test board_retro --test board_context --test board_sessions --test board_sign_in -- --test-threads 2",
 ]
 
