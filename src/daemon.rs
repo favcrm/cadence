@@ -2259,7 +2259,11 @@ impl Shared {
             "agent_show" => {
                 let alias = self.resolve_alias(required_str(params, "alias")?)?;
                 let agent = self.store.agent(&alias)?;
-                let messages = self.store.messages(&alias)?;
+                let messages = if params.get("active_only").and_then(Value::as_bool) == Some(true) {
+                    self.store.active_messages(&alias)?
+                } else {
+                    self.store.messages(&alias)?
+                };
                 let mut agent_json = agent.to_json();
                 agent_json["capabilities"] =
                     registry::capabilities_json(&agent.provider, &agent.endpoint_kind);

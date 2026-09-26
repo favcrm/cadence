@@ -639,12 +639,11 @@ impl Shared {
     /// from — running messages, the parked count, queue and fence counts
     /// and the event cursor — without the whole message history.
     pub(super) fn board_view(&self, alias: &str) -> Result<Value> {
-        let messages = self.store.messages(alias)?;
+        let messages = self.store.running_messages(alias)?;
         // Never the turn token: it is the credential `message result`
         // checks, and the board has no use for it.
         let running: Vec<Value> = messages
             .iter()
-            .filter(|m| m.state == "running")
             .map(|m| {
                 let mut j = m.to_json();
                 if let Some(o) = j.as_object_mut() {
@@ -653,13 +652,7 @@ impl Shared {
                 j
             })
             .collect();
-        let parked = messages
-            .iter()
-            .filter(|m| {
-                m.state != "running"
-                    && m.result.as_ref().and_then(|r| r["via"].as_str()) == Some("pty_render_miss")
-            })
-            .count();
+        let parked = self.store.parked_message_count(alias)?;
         Ok(json!({
             "messages": running,
             "parked": parked,
