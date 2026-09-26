@@ -1290,7 +1290,8 @@ fn board_workflow_list_preview_and_propose() {
     let before = f.commits();
 
     // The list: one row per stored workflow — inputs as the run form
-    // renders them (BTreeMap order: `note`, then `title`).
+    // renders them, in the file's declared order (`title`, then `note`;
+    // the map is sorted, a form reads what the author wrote).
     let (status, body) = board_get(port, "/api/projects/demo/workflows");
     assert_eq!(status, 200, "{body}");
     let list: Value = serde_json::from_str(&body).unwrap();
@@ -1304,17 +1305,18 @@ fn board_workflow_list_preview_and_propose() {
     assert_eq!(
         (
             inputs[0]["name"].as_str().unwrap(),
-            inputs[0]["optional"].as_bool().unwrap()
+            inputs[0]["optional"].as_bool().unwrap(),
+            inputs[0]["ask"].as_str().unwrap(),
         ),
-        ("note", true),
+        ("title", false, "What change?"),
         "{inputs:?}"
     );
     assert_eq!(
         (
             inputs[1]["name"].as_str().unwrap(),
-            inputs[1]["ask"].as_str().unwrap()
+            inputs[1]["optional"].as_bool().unwrap(),
         ),
-        ("title", "What change?"),
+        ("note", true),
         "{inputs:?}"
     );
     // Unknown project, bad key, and a lookalike path.
