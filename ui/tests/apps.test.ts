@@ -13,12 +13,15 @@ import {
   distinctProblem,
   doctorFindings,
   filterCounts,
+  isReadyToRun,
   needIssue,
   newRunHref,
+  notReadyText,
   outboxHref,
   outputsOf,
   primaryAction,
   publishTarget,
+  readyChecklist,
   runFilter,
   runStages,
   runState,
@@ -31,6 +34,7 @@ import {
   startLabel,
   stepLabel,
   stepRows,
+  teamCandidates,
   teamFromLastRun,
   teamInputs,
   teamRole,
@@ -562,6 +566,72 @@ equal(
   ], []),
   [{ kind: "question", text: "D-2 question from w1", run: "D-1" }],
   "a question about a ticket",
+);
+
+// Ready to run (CAD-577): approved · team set · publishes to Local outbox.
+const readyApp: AppDetail = {
+  ...detail,
+  approved: true,
+  approval: "approved",
+  connections: [{ slot: "publish", bound: "local" }],
+  workflows: [wf],
+  team: { writer: "cs-writer", reviewer: "cs-reviewer" },
+};
+equal(
+  readyChecklist(readyApp).map((i) => [i.key, i.done]),
+  [
+    ["approved", true],
+    ["team", true],
+    ["publish", true],
+  ],
+  "a ready app: every item done",
+);
+equal(isReadyToRun(readyApp), true, "a ready app runs");
+equal(notReadyText(readyApp), null, "no gaps, no copy");
+// A fresh install: unapproved, no team, and the local default still
+// counts as publishing to the outbox.
+const fresh: AppDetail = {
+  ...detail,
+  approved: false,
+  approval: "unapproved",
+  connections: [{ slot: "publish", bound: "local" }],
+  workflows: [wf],
+  team: {},
+};
+equal(
+  readyChecklist(fresh).map((i) => [i.key, i.done]),
+  [
+    ["approved", false],
+    ["team", false],
+    ["publish", true],
+  ],
+  "a fresh install: approve and set the team",
+);
+equal(isReadyToRun(fresh), false, "a fresh install is not ready");
+equal(
+  notReadyText(fresh),
+  "Not ready yet — approved, team set.",
+  "the gap in plain words, never the engine's field list",
+);
+// A partially set team is not set.
+equal(
+  readyChecklist({ ...fresh, team: { writer: "cs-writer" } }).find((i) => i.key === "team")?.done,
+  false,
+  "every role must be filled",
+);
+
+// The team picker's candidates: registered agents, inboxes out, sorted.
+equal(
+  teamCandidates([
+    { alias: "w2", state: "stopped" },
+    { alias: "inbox-1", inbox: true },
+    { alias: "w1", state: "idle" },
+  ]),
+  [
+    { alias: "w1", state: "idle" },
+    { alias: "w2", state: "stopped" },
+  ],
+  "candidates exclude inboxes and sort",
 );
 
 console.log("apps checks passed");
