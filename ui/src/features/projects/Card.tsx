@@ -1,5 +1,7 @@
 import { useWriteBlock } from "../auth/WriteGate";
+import { issuePath } from "../issues/model";
 import type { IssueCard } from "../../lib/types";
+import Link from "../../ui/Link";
 
 const PRIORITY_CHIP: Record<string, string> = {
   P0: "bg-warn/10 text-warn",
@@ -104,7 +106,13 @@ export default function Card({
       }`}
     >
       <div className="flex items-center gap-1.5 flex-wrap">
-        <span className="num text-label text-ink-100 font-medium">{t.id}</span>
+        <Link
+          href={issuePath(t.project, t.id)}
+          className="num text-label text-ink-100 font-medium"
+          onClick={(e) => e.stopPropagation()}
+        >
+          {t.id}
+        </Link>
         <span className={`chip ${PRIORITY_CHIP[t.priority] ?? PRIORITY_CHIP.P2}`}>
           {t.priority}
         </span>

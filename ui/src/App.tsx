@@ -5,6 +5,8 @@ import Apps from "./features/apps/Apps";
 import AppDetail from "./features/apps/AppDetail";
 import Board from "./features/projects/Board";
 import Drawer from "./features/projects/Drawer";
+import IssuePage from "./features/issues/IssuePage";
+import { issuePath, laneFollowsStream, refreshIssueIds } from "./features/issues/model";
 import Epics from "./features/projects/Epics";
 import Milestones from "./features/projects/Milestones";
 import Memory from "./features/settings/Memory";
@@ -26,7 +28,7 @@ import Setup from "./features/setup/Setup";
 import SetupNudge from "./features/setup/SetupNudge";
 import Login from "./features/auth/Login";
 import SignIn from "./features/auth/SignIn";
-import { kickoffBlock, writeBlock } from "./features/auth/gate";
+import { kickoffBlock as operatorKickoffBlock, writeBlock } from "./features/auth/gate";
 import { WriteGate } from "./features/auth/WriteGate";
 import { sessionKey, setSessionKey } from "./lib/sessionKey";
 import { buildChanged, serverBuild, subscribeSse, UI_BUILD } from "./lib/sse";
@@ -83,6 +85,7 @@ const SCREEN_LABEL: Record<Screen, string> = {
   setup: "setup",
   settings: "settings",
   login: "sign in",
+  issue: "issue",
   notFound: "not found",
 };
 
@@ -193,13 +196,19 @@ export default function App() {
       });
   }, [project, contextOn, projectContextRefresh]);
 
-  // The open drawer's id, read through a ref so the stream and poll
-  // handlers stay stable while the drawer changes.
+  // The peek's id and the issue page's id, read through refs so the
+  // stream and poll handlers stay stable. The page clears `openId`, so
+  // the fallback has to name the id on screen or that detail goes stale
+  // while `/api/stream` is down.
   const openIdRef = useRef(openId);
   openIdRef.current = openId;
+  const pageIssueRef = useRef<string | null>(route.screen === "issue" ? route.id : null);
+  pageIssueRef.current = route.screen === "issue" ? route.id : null;
   const loadDetail = useCallback(() => {
-    const id = openIdRef.current;
-    if (id) void resources.issue(id).invalidate();
+    for (const id of refreshIssueIds(openIdRef.current, pageIssueRef.current)) {
+      void resources.issue(id).invalidate();
+      void resources.lane(id).invalidate();
+    }
   }, []);
   useEffect(() => {
     if (openId) void resources.issue(openId).revalidate();
@@ -274,7 +283,9 @@ export default function App() {
       url: "/api/stream",
       events: ["issues", "agents", "jobs", "monitoring"],
       onEvent: (e) => {
-        for (const name of invalidatedBy(e.data)) {
+        const names = invalidatedBy(e.data);
+        if (laneFollowsStream(names)) cache.invalidate("lane");
+        for (const name of names) {
           // Families are keyed stores — invalidate the prefix, not one entry.
           if (
             name === "issue" ||
@@ -528,7 +539,7 @@ export default function App() {
           <div className="num text-label text-ink-500 min-w-0 truncate">
             <span className="hidden sm:inline text-ink-300">cadence</span>
             <span className="hidden sm:inline"> / </span>
-            <span className="text-ink-100">{SCREEN_LABEL[screen]}</span>
+            <span className="text-ink-100">{route.screen === "issue" ? route.id : SCREEN_LABEL[screen]}</span>
           </div>
 
           <div className="ml-auto flex items-center gap-2 shrink-0">
@@ -664,24 +675,83 @@ export default function App() {
             onOpenContext={() => goRoute({ screen: "projects", slug: projectSlug, section: "context" })}
           />
         )}
-        {route.screen === "projects" && route.slug && (
+        {(route.screen === "issue" || (route.screen === "projects" && route.slug)) && (
           <SectionTabs
-            label={route.slug}
+            label={route.screen === "issue" ? route.project : route.slug!}
             tabs={[
-              { label: "Issues", href: hrefFor({ ...route, section: "issues" }), on: route.section === "issues" },
-              { label: "Epics", href: hrefFor({ ...route, section: "epics" }), on: route.section === "epics" },
+              {
+                label: "Issues",
+                href: hrefFor({
+                  screen: "projects",
+                  slug: route.screen === "issue" ? route.project : route.slug,
+                  section: "issues",
+                }),
+                on: route.screen === "issue" || route.section === "issues",
+              },
+              {
+                label: "Epics",
+                href: hrefFor({
+                  screen: "projects",
+                  slug: route.screen === "issue" ? route.project : route.slug,
+                  section: "epics",
+                }),
+                on: route.screen === "projects" && route.section === "epics",
+              },
               {
                 label: "Milestones",
-                href: hrefFor({ ...route, section: "milestones" }),
-                on: route.section === "milestones",
+                href: hrefFor({
+                  screen: "projects",
+                  slug: route.screen === "issue" ? route.project : route.slug,
+                  section: "milestones",
+                }),
+                on: route.screen === "projects" && route.section === "milestones",
               },
               {
                 label: "Workflows",
-                href: hrefFor({ ...route, section: "workflows" }),
-                on: route.section === "workflows",
+                href: hrefFor({
+                  screen: "projects",
+                  slug: route.screen === "issue" ? route.project : route.slug,
+                  section: "workflows",
+                }),
+                on: route.screen === "projects" && route.section === "workflows",
               },
-              { label: "Context", href: hrefFor({ ...route, section: "context" }), on: route.section === "context" },
+              {
+                label: "Context",
+                href: hrefFor({
+                  screen: "projects",
+                  slug: route.screen === "issue" ? route.project : route.slug,
+                  section: "context",
+                }),
+                on: route.screen === "projects" && route.section === "context",
+              },
             ]}
+          />
+        )}
+        {route.screen === "issue" && (
+          <IssuePage
+            project={route.project}
+            id={route.id}
+            tab={route.tab}
+            tabHref={(tab) => locationHref({ ...loc, route: { ...route, tab } }, search)}
+            issues={issues}
+            agents={agents ?? null}
+            readOnly={readOnly}
+            writeBlock={block}
+            kickoffBlock={operatorKickoffBlock(meta)}
+            onWrite={applyWrite}
+            onError={writeError}
+            onOpen={(issueId) => {
+              const card = issues.find((i) => i.id === issueId);
+              const nextProject = card?.project ?? route.project;
+              update((c) => ({
+                ...c,
+                openId: null,
+                project: nextProject,
+                route: { screen: "issue", project: nextProject, id: issueId, tab: "overview" },
+              }));
+            }}
+            planHref={hrefFor({ screen: "home" })}
+            onToast={(text) => say("ok", text)}
           />
         )}
         {route.screen === "projects" && route.section === "issues" && (
@@ -811,21 +881,18 @@ export default function App() {
         )}
       </div>
 
-      {openId && (
+      {openId && route.screen !== "issue" && (
         <Drawer
           key={openId}
           id={openId}
-          agents={agents}
-          projects={projects}
-          pmDir={health?.pm_dir}
           detail={detailState?.data?.id === openId ? detailState.data : null}
-          readOnly={readOnly}
-          canKickoff={kickoffBlock(meta) === null}
-          actor={actor}
+          href={(() => {
+            const fromDetail = detailState?.data?.id === openId ? detailState.data.project : null;
+            const fromCard = issues.find((i) => i.id === openId)?.project ?? null;
+            const key = fromDetail ?? fromCard ?? (project !== "all" ? project : null);
+            return key ? issuePath(key, openId) : null;
+          })()}
           onClose={closeIssue}
-          onOpen={openIssue}
-          onWrite={applyWrite}
-          onError={writeError}
         />
       )}
 

@@ -1,3 +1,4 @@
+import { parseIssueTab, type IssueTab } from "../features/issues/model";
 import { readFilters, writeFilters, NO_FILTERS, type BoardFilters } from "./filters";
 import { readAppUrlState, type AppTab, type ProjectView } from "./urlState";
 
@@ -12,6 +13,7 @@ import { readAppUrlState, type AppTab, type ProjectView } from "./urlState";
  *   /projects/:slug/milestones its milestones: progress, worst health
  *   /projects/:slug/context    its context
  *   /projects/:slug/workflows  its stored workflows and new runs (CAD-496)
+ *   /projects/:slug/issues/:id one issue (CAD-607). `?tab=` picks a section.
  *   /apps[/<project>/<app>]    installed apps, optionally one app's detail (CAD-557)
  *   /agents[/:alias]           agents, optionally one agent's drawer
  *   /wiki[/<path>]             the wiki: folder tree + page (CAD-581)
@@ -39,6 +41,7 @@ export type Route =
   | { screen: "home" }
   | { screen: "overview" }
   | { screen: "projects"; slug: string | null; section: ProjectSection }
+  | { screen: "issue"; project: string; id: string; tab: IssueTab }
   | { screen: "apps"; project: string | null; name: string | null }
   | { screen: "agents"; alias: string | null }
   | { screen: "wiki"; mode: WikiMode; path: string | null; query: string | null }
@@ -155,6 +158,11 @@ export function matchRoute(pathname: string): Route {
   const parts = pathname.split("/").filter(Boolean);
   const [head, a, b, ...rest] = parts;
   if (head === "wiki") return matchWiki(parts);
+  if (head === "projects" && b === "issues" && rest.length === 1) {
+    const slug = a ? segment(a) : null;
+    const issueId = segment(rest[0]);
+    if (slug && issueId) return { screen: "issue", project: slug, id: issueId, tab: "overview" };
+  }
   if (rest.length === 0) {
     if (!head && !a) return { screen: "home" };
     if (head === "index.html" && !a) return { screen: "home" };
@@ -200,6 +208,8 @@ export function routePath(route: Route): string {
       const base = `/projects/${encodeURIComponent(route.slug)}`;
       return route.section === "issues" ? base : `${base}/${route.section}`;
     }
+    case "issue":
+      return `/projects/${encodeURIComponent(route.project)}/issues/${encodeURIComponent(route.id)}`;
     case "apps":
       if (!route.project) return "/apps";
       return route.name
@@ -236,22 +246,26 @@ function parseView(value: string | null): ProjectView | undefined {
 }
 
 export function readLocation(pathname: string, search: string, storedView?: ProjectView): AppLocation {
-  const route = matchRoute(pathname);
+  const matched = matchRoute(pathname);
   const q = new URLSearchParams(search);
+  const route = matched.screen === "issue" ? { ...matched, tab: parseIssueTab(q.get("tab")) } : matched;
   const onProjects = route.screen === "projects";
   const queried = q.get("project");
   return {
     route,
-    // The slug is the project on a project page. A filter screen reads
-    // `?project=`. Every other screen ignores it — an app detail's project
-    // lives on the route, not in this scope.
-    project: onProjects
-      ? (route.slug ?? "all")
-      : projectFilter(route)
-        ? queried || "all"
-        : "all",
+    // The slug is the project on a project page. An issue page carries its
+    // project in the path. A filter screen reads `?project=`. Every other
+    // screen ignores it — an app detail's project lives on the route.
+    project:
+      route.screen === "issue"
+        ? route.project
+        : onProjects
+          ? (route.slug ?? "all")
+          : projectFilter(route)
+            ? queried || "all"
+            : "all",
     view: parseView(q.get("view")) ?? storedView ?? "list",
-    openId: q.get("issue"),
+    openId: route.screen === "issue" ? null : q.get("issue"),
     filters: onProjects ? readFilters(q) : NO_FILTERS,
   };
 }
@@ -276,6 +290,11 @@ export function locationHref(loc: AppLocation, search = ""): string {
   for (const key of ["tab", "view", "project", "issue", "run", "new"]) q.delete(key);
   writeFilters(q, NO_FILTERS);
   const route = scopedRoute(loc.route, loc.project);
+  if (route.screen === "issue") {
+    if (route.tab !== "overview") q.set("tab", route.tab);
+    const issueSearch = q.toString();
+    return routePath(route) + (issueSearch ? `?${issueSearch}` : "");
+  }
   if (route.screen === "projects") {
     if (route.section === "issues") {
       q.set("view", loc.view);
@@ -331,6 +350,7 @@ export function legacyRedirect(
 
 /** A project worth carrying onto another screen that has a filter or a slug. */
 function carriedProject(current: AppLocation): string {
+  if (current.route.screen === "issue") return current.route.project;
   return projectFilter(current.route) || current.route.screen === "projects" ? current.project : "all";
 }
 
@@ -338,6 +358,9 @@ function carriedProject(current: AppLocation): string {
  *  keeps its project; Home, Wiki, Outbox and the rest of Settings drop it.
  *  The open issue drawer still comes along. */
 export function goTo(current: AppLocation, route: Route): AppLocation {
+  if (route.screen === "issue") {
+    return { ...current, route, project: route.project, openId: null };
+  }
   if (route.screen === "projects") {
     const slug = route.slug ?? (carriedProject(current) === "all" ? null : carriedProject(current));
     return {
@@ -366,6 +389,14 @@ export function openProject(current: AppLocation, project: string): AppLocation 
 
 /** The in-page filter. No-op on a screen that has none. */
 export function withProject(current: AppLocation, project: string): AppLocation {
+  if (current.route.screen === "issue") {
+    return {
+      ...current,
+      project,
+      openId: null,
+      route: { screen: "projects", slug: project === "all" ? null : project, section: "issues" },
+    };
+  }
   if (!projectFilter(current.route)) return current;
   return { ...current, project: project || "all" };
 }

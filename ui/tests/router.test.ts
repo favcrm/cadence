@@ -30,6 +30,7 @@ const paths: [string, Route][] = [
   ["/projects/cadence/epics", { screen: "projects", slug: "cadence", section: "epics" }],
   ["/projects/cadence/milestones", { screen: "projects", slug: "cadence", section: "milestones" }],
   ["/projects/cadence/workflows", { screen: "projects", slug: "cadence", section: "workflows" }],
+  ["/projects/cadence/issues/CAD-607", { screen: "issue", project: "cadence", id: "CAD-607", tab: "overview" }],
   ["/apps", { screen: "apps", project: null, name: null }],
   ["/apps/cadence/studio", { screen: "apps", project: "cadence", name: "studio" }],
   ["/agents", { screen: "agents", alias: null }],
@@ -49,7 +50,7 @@ equal(matchRoute("/projects/cadence/"), matchRoute("/projects/cadence"), "traili
 equal(matchRoute("/agents/a%20b"), { screen: "agents", alias: "a b" }, "decoded alias");
 equal(routePath({ screen: "agents", alias: "a b" }), "/agents/a%20b", "encoded alias");
 equal(matchRoute("/index.html"), { screen: "home" }, "index.html is home");
-for (const dead of ["/overview/x", "/nope", "/projects/x/y", "/agents/a/b", "/apps/p", "/apps/p/n/x", "/settings/nope", "/setup/x", "/login/x", "/projects/%E0"]) {
+for (const dead of ["/overview/x", "/nope", "/projects/x/y", "/projects/cadence/issues", "/projects/cadence/issues/CAD-1/extra", "/agents/a/b", "/apps/p", "/apps/p/n/x", "/settings/nope", "/setup/x", "/login/x", "/projects/%E0"]) {
   equal(matchRoute(dead).screen, "notFound", `not found ${dead}`);
 }
 
@@ -138,6 +139,23 @@ equal(showProjectChoices(1, "cadence"), true, "a selected project stays visible"
     filters: NO_FILTERS,
   });
   equal(context, "/projects?view=list", "context without a project falls back to issues");
+}
+
+// An issue page is /projects/<key>/issues/<id>, with the section in ?tab=.
+{
+  const loc = readLocation("/projects/cadence/issues/CAD-1", "?tab=activity&issue=CAD-9&view=list");
+  equal(loc.route, { screen: "issue", project: "cadence", id: "CAD-1", tab: "activity" }, "issue tab");
+  equal(loc.project, "cadence", "issue project");
+  equal(loc.openId, null, "the page does not also open the peek");
+  equal(locationHref(loc, "?tab=activity&issue=CAD-9&foo=1"), "/projects/cadence/issues/CAD-1?foo=1&tab=activity", "issue href");
+  equal(readLocation("/projects/cadence/issues/CAD-1", "?tab=nope").route, { screen: "issue", project: "cadence", id: "CAD-1", tab: "overview" }, "unknown tab");
+  const page = readLocation("/projects/cadence/issues/CAD-1", "");
+  equal(locationHref(withProject(page, "other")), "/projects/other?view=list", "leaving an issue for another project");
+  equal(
+    locationHref(goTo(page, { screen: "agents", alias: null })),
+    "/agents?project=cadence",
+    "issue → agents keeps the project and drops the peek",
+  );
 }
 
 // Moving between screens carries the scope and the open drawer.
