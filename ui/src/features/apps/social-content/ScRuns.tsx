@@ -31,7 +31,7 @@ const STEP_WORD: Record<StepState, string> = {
 };
 
 type RunState = "running" | "needs" | "done";
-const STATE_PILL: Record<RunState, { label: string; cls: string }> = {
+export const STATE_PILL: Record<RunState, { label: string; cls: string }> = {
   running: { label: "running", cls: "bg-info/10 text-info" },
   needs: { label: "needs you", cls: "bg-fail/10 text-fail" },
   done: { label: "done", cls: "bg-ok/15 text-ok" },
@@ -61,7 +61,7 @@ const FAIL_HELP: Record<string, { what: string; act: string; to: "post" | "needs
   schedule: { what: "The post never made it into a digest.", act: "open the post", to: "post" },
 };
 
-function runState(r: Run): RunState {
+export function runState(r: Run): RunState {
   const bad = r.items.some(
     (it) =>
       Object.values(it.steps).some((s) => s === "failed" || s === "mismatch") ||
@@ -71,7 +71,7 @@ function runState(r: Run): RunState {
   return r.status === "running" ? "running" : "done";
 }
 
-function runWhat(r: Run): string {
+export function runWhat(r: Run): string {
   if (r.kind === "revise") {
     const m = r.label.match(/“([^”]+)”/);
     return `Revising caption for “${m ? m[1] : r.items[0]?.post ?? "a post"}”`;

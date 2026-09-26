@@ -191,7 +191,7 @@ export default function SocialContent({
         </main>
       )}
       {section === "needs" && <ScNeeds say={say} postHref={(id) => scHref("post", id)} />}
-      {section === "automations" && <ScAutomations />}
+      {section === "automations" && <ScAutomations say={say} runsHref={scHref("runs")} />}
       {section === "workflows" && <ScWorkflows />}
       {section === "settings" && <ScSettings />}
       {!SECTIONS.some((s) => s.id === section) && section !== "post" && (

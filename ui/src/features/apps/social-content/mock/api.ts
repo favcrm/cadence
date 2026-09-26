@@ -9,7 +9,16 @@
  * calls still resolve.
  */
 import { useSyncExternalStore } from "react";
-import { M, NOW, type Digest, type Post, type Run } from "./data";
+import {
+  M,
+  NOW,
+  type Automation,
+  type AutomationCfg,
+  type AutomationTrigger,
+  type Digest,
+  type Post,
+  type Run,
+} from "./data";
 
 export const FREEZE = /[?&]freeze/.test(location.search + location.hash);
 const TICK = 2400;
@@ -69,6 +78,27 @@ const runlog = (r: Run, msg: string) => {
   r.log.push([nowIso(), msg]);
 };
 const short = (t: string, n = 46) => (t.length > n ? t.slice(0, n - 1) + "…" : t);
+
+/* The `every` line on an automation card, derived from its saved trigger. */
+const DOW_SHORT = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const TZ_SHORT: Record<string, string> = {
+  "Asia/Hong_Kong": "HKT",
+  "Asia/Singapore": "SGT",
+  "Europe/London": "GMT",
+};
+export function describeTrigger(t: AutomationTrigger): string {
+  if (t.kind === "interval") return `every ${t.hours ?? "?"}h`;
+  if (t.kind === "weekly") {
+    const ds = [...(t.weekdays ?? [])].sort();
+    const days =
+      ds.length === 5 && ds.join() === "1,2,3,4,5"
+        ? "Mon–Fri"
+        : ds.map((d) => DOW_SHORT[d]).join("·") || "weekly";
+    const tz = TZ_SHORT[t.timezone ?? ""] ?? (t.timezone ?? "").split("/").pop() ?? "";
+    return `${days} ${t.time ?? ""} ${tz}`.trim();
+  }
+  return t.event === "sources" ? "when new sources arrive" : "after each publish";
+}
 
 /* canned writer output for simulated drafts (per source id) */
 const DRAFTS: Record<string, string> = {
@@ -537,11 +567,70 @@ export const api = {
 
   automations: {
     list: () => M.automations,
+    get: (id: string) => M.automations.find((a) => a.id === id),
     toggle(id: string) {
       const a = M.automations.find((a) => a.id === id)!;
       a.on = !a.on;
+      log(`automation ${a.name} ${a.on ? "resumed" : "paused"} by you`);
       emit();
     },
+    /** Save edited settings — the `every` label re-derives from trigger. */
+    update(id: string, patch: { name?: string; cfg?: AutomationCfg }) {
+      const a = M.automations.find((a) => a.id === id);
+      if (!a) return;
+      if (patch.name !== undefined && patch.name.trim()) a.name = patch.name.trim();
+      if (patch.cfg) {
+        a.cfg = patch.cfg;
+        a.every = describeTrigger(patch.cfg.trigger);
+        const wf = M.workflows.find((w) => w.id === patch.cfg!.workflow);
+        if (wf) a.desc = wf.note;
+      }
+      log(`automation ${a.name} saved`);
+      emit();
+    },
+    /** "New automation" — created paused so the first save is reviewable. */
+    create(seed: { name: string; cfg: AutomationCfg }): string {
+      const id = "a" + M.nextAuto++;
+      const wf = M.workflows.find((w) => w.id === seed.cfg.workflow);
+      M.automations.push({
+        id,
+        name: seed.name,
+        desc: wf?.note ?? "",
+        every: describeTrigger(seed.cfg.trigger),
+        on: false,
+        last: "never run",
+        approval: "sends always wait — digest",
+        cfg: seed.cfg,
+      });
+      log(`automation ${seed.name} created`);
+      emit();
+      return id;
+    },
+    remove(id: string) {
+      const i = M.automations.findIndex((a) => a.id === id);
+      if (i < 0) return;
+      const [a] = M.automations.splice(i, 1);
+      log(`automation ${a.name} deleted`);
+      emit();
+    },
+    /** Manual fire — mock queues it and stamps the last-run line. */
+    runNow(id: string) {
+      const a = M.automations.find((a) => a.id === id);
+      if (!a) return;
+      a.last = "queued just now — watch Runs";
+      log(`automation ${a.name} run requested by you`);
+      emit();
+    },
+    /** Last 5 runs whose workflow matches, scoped like the automation. */
+    recentRuns: (a: Automation) =>
+      M.runs
+        .filter(
+          (r) =>
+            r.kind === a.cfg.workflow &&
+            (a.cfg.scopeClients === "all" || r.client === M.currentClient),
+        )
+        .sort((x, y) => (x.at < y.at ? 1 : -1))
+        .slice(0, 5),
   },
 
   workflows: { list: () => M.workflows },

@@ -185,14 +185,44 @@ export interface Digest {
   items: DigestItem[];
 }
 
+export interface AutomationTrigger {
+  kind: "interval" | "weekly" | "event";
+  /** interval: every N hours. */
+  hours?: number;
+  /** weekly: weekday numbers (0 = Sun) at `time` in `timezone`. */
+  weekdays?: number[];
+  time?: string;
+  timezone?: string;
+  /** event: after each publish, or when new sources arrive. */
+  event?: "publish" | "sources";
+}
+
+export interface AutomationCfg {
+  trigger: AutomationTrigger;
+  /** Only the current client, or every client. */
+  scopeClients: "current" | "all";
+  /** Source platforms it reads. */
+  scopeSources: string[];
+  /** Workflow id — see M.workflows. */
+  workflow: string;
+  maxDraftsPerDay: number;
+  /** HKD per day. */
+  budgetPerDay: number;
+  notifyDigest: boolean;
+  notifyError: boolean;
+}
+
 export interface Automation {
   id: string;
   name: string;
   desc: string;
+  /** Display string derived from cfg.trigger. */
   every: string;
   on: boolean;
   last: string;
+  /** Read-only: sends always wait for the digest. */
   approval: string;
+  cfg: AutomationCfg;
 }
 
 export interface Workflow {
@@ -220,6 +250,7 @@ export interface MockDb {
   clock: number;
   nextRun: number;
   nextPost: number;
+  nextAuto: number;
 }
 
 const clients: Client[] = [
@@ -528,6 +559,16 @@ const runs: Run[] = [
     items: [{ post: "p2", steps: { change: "done" } }],
     log: [[ago(3.1), "ask by you → revise p2 (scope: caption)"], [ago(3.0), "writer wrote r3, diff shown to you"]],
   },
+  {
+    id: "run-98", kind: "scan-sources", client: "kura", status: "done",
+    at: ago(2.2), label: "Scan sources", items: [],
+    log: [[ago(2.2), "scan started (automation a1)"], [ago(2.1), "3 new posts → Library"]],
+  },
+  {
+    id: "run-97", kind: "scan-sources", client: "velvet", status: "done",
+    at: ago(6), label: "Scan sources", items: [],
+    log: [[ago(6), "scan started (automation a1)"], [ago(5.9), "nothing new this pass"]],
+  },
 ];
 
 // Pending proposals on human-owned fields (agents may only suggest there).
@@ -562,13 +603,25 @@ const digests: Digest[] = [
 
 const automations: Automation[] = [
   { id: "a1", name: "Scan sources", desc: "Pull new posts from connected sources; they land in Library marked new.",
-    every: "every 6h", on: true, last: "3 new posts, 2h ago", approval: "standing: scan" },
+    every: "every 6h", on: true, last: "3 new posts, 2h ago", approval: "standing: scan",
+    cfg: { trigger: { kind: "interval", hours: 6 }, scopeClients: "current",
+      scopeSources: ["instagram", "facebook", "web"], workflow: "scan-sources",
+      maxDraftsPerDay: 6, budgetPerDay: 5, notifyDigest: true, notifyError: true } },
   { id: "a2", name: "Evening draft pass", desc: "Draft from new sources, up to the daily limit.", every: "Mon–Fri 18:00 HKT",
-    on: false, last: "never run", approval: "standing: drafting (no sends, ≤ limit/day)" },
+    on: false, last: "never run", approval: "standing: drafting (no sends, ≤ limit/day)",
+    cfg: { trigger: { kind: "weekly", weekdays: [1, 2, 3, 4, 5], time: "18:00", timezone: "Asia/Hong_Kong" },
+      scopeClients: "current", scopeSources: ["instagram", "facebook", "web"], workflow: "social-localize",
+      maxDraftsPerDay: 4, budgetPerDay: 12, notifyDigest: true, notifyError: true } },
   { id: "a3", name: "Friday schedule digest", desc: "Collect the week's ready posts into one approve card.", every: "Fri 09:00 HKT",
-    on: true, last: "produced digest d1", approval: "sends always wait — digest" },
+    on: true, last: "produced digest d1", approval: "sends always wait — digest",
+    cfg: { trigger: { kind: "weekly", weekdays: [5], time: "09:00", timezone: "Asia/Hong_Kong" },
+      scopeClients: "current", scopeSources: [], workflow: "weekly-digest",
+      maxDraftsPerDay: 7, budgetPerDay: 2, notifyDigest: true, notifyError: true } },
   { id: "a4", name: "Verify receipts", desc: "Compare what went out with the approved revision after every publish.",
-    every: "after each publish", on: true, last: "caught a mismatch on p7", approval: "system" },
+    every: "after each publish", on: true, last: "caught a mismatch on p7", approval: "system",
+    cfg: { trigger: { kind: "event", event: "publish" }, scopeClients: "all",
+      scopeSources: [], workflow: "verify-receipts",
+      maxDraftsPerDay: 1, budgetPerDay: 1, notifyDigest: false, notifyError: true } },
 ];
 
 const workflows: Workflow[] = [
@@ -581,6 +634,12 @@ const workflows: Workflow[] = [
   { id: "scan-sources", title: "Scan source feeds for new posts", file: "workflows/scan-sources.md",
     steps: ["pull → scout"],
     note: "Scheduled; writes unseen source_post records, text marked untrusted." },
+  { id: "weekly-digest", title: "Collect ready posts into a digest", file: "workflows/weekly-digest.md",
+    steps: ["collect → publisher", "present → you"],
+    note: "Stages one approve card per client; nothing sends until you hold-approve it." },
+  { id: "verify-receipts", title: "Verify publish receipts", file: "workflows/verify-receipts.md",
+    steps: ["fetch receipt → publisher", "compare → analyst"],
+    note: "After each publish: what went out vs the pinned revision — a mismatch lands in Needs you." },
   { id: "blog-post", title: "Write a blog post", file: "workflows/blog-post.md",
     steps: ["brief → strategist", "draft → writer", "images → designer", "review → editor"],
     note: "Starts outside the drafting standing approval — a plan card would open first." },
@@ -600,4 +659,5 @@ export const M: MockDb = {
   clock: 0,
   nextRun: 107,
   nextPost: 10,
+  nextAuto: 5,
 };
