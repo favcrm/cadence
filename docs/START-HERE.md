@@ -1,6 +1,6 @@
 # Start here: Cadence project context
 
-Source baseline: `ceee1cf` (2026-09-21). This is a navigation guide, not a live
+Navigation updated 2026-09-26. This is a navigation guide, not a live
 status feed. Check the current source revision and running build before acting.
 A merged feature is not necessarily installed, enabled or proven unattended.
 
@@ -16,14 +16,12 @@ verified delivery with routine coordination handled by the system.
 | What are we building, and what is outside scope? | [Charter](CHARTER.md) — goal, principles, non-goals and roadmap. Its autonomy labels are planning context; verify current capability evidence below. |
 | How is it built? | [Architecture and code map](ARCHITECTURE.md) — boundaries, durable stores, adapters and file ownership. |
 | What experience are we aiming for? | [Development-team design proposal](design/DEVELOPMENT-TEAM.md) — feedback, memory, project context and staged acceptance. Proposed behavior is labelled. |
-| Where is the plan for onboarding, the master agent and the autonomous team? | [Design plan](../design-plans/20260923-onboarding-master-agent/README.md) (Markdown: plan, roadmap, research, technical, direction, decision ledger), plus the proposed records [agent filesystem](design/AGENT-FILESYSTEM.md) and [learning loop](design/LEARNING-LOOP.md). |
-| How do roles deliver work? | [Team](TEAM.md), [session workflow](SESSION.md), [role briefings](roles/pm.md). Historical aliases/model assignments are not live registry evidence. |
-| What are the task/message contracts? | [Jobs](JOBS.md), [protocol](PROTOCOL.md), [steering ADR](adr/0002-steering-contract.md). |
-| Where are projects, issues and memories? | [Board and tracker](BOARD.md), [workspaces](WORKSPACES.md), [worktree-policy ADR](adr/0003-worktree-policy.md). |
-| How is identity and role policy designed? | [Role-profiles ADR](adr/0001-role-profiles.md), [operator-identity ADR](adr/0004-operator-identity-web-ui.md), [operator-proof ADR](adr/0005-operator-proof.md), [audit](AUDIT.md), [risk rules](roles/risk-classes.md). An ADR is not proof every phase shipped. |
-| How do agents act on external platforms? | [Connected-platform contract ADR](adr/0006-connected-platform-contract.md) — declared effects (read/draft/send), proxied credentials, pending sends. Proposed; the proxy and adapters are not built yet. |
-| How do reports reach the team? | [Report relay](CAD213-REPORT-RELAY.md) and the report section of [session workflow](SESSION.md). Configuration and an active consumer are separate from enqueue success. |
-| What was the original plan? | [Implementation plan](IMPLEMENTATION-PLAN.md), [dogfood retrospective](DOGFOOD.md). Read as dated context; proposed CLI examples may not match the current binary. |
+| How do contributors deliver and validate work? | [Contribution guide](../CONTRIBUTING.md), [repository instructions](../AGENTS.md) and the [agent protocol](../skills/cadence/SKILL.md). Native agents read their generated briefing; external agents must not claim a native identity. |
+| What are the task/message contracts? | [RPC vocabulary](../src/proto.rs), [job handlers](../src/daemon/jobs_rpc.rs), [message handlers](../src/daemon/messages_rpc.rs) and [durable storage](../src/store/mod.rs). Use `cadence job --help` and `cadence message --help` for the installed CLI. |
+| Where are projects, issues and memories? | [Board and tracker](BOARD.md), [issue commands](../src/issue/mod.rs), [worktree operations](../src/worktree.rs) and [memory implementation](../src/memory/mod.rs). |
+| How is identity and role policy enforced? | [Caller rules](../src/daemon/caller_rule.rs), [daemon identity](../src/daemon/identity.rs), [HTTP admission](../src/ui.rs), [audit](AUDIT.md) and [risk rules](roles/risk-classes.md). Source policy is not proof of a live deployment. |
+| How do agents act on external platforms? | [Platform contract schemas](../contracts/), [effect handlers](../src/daemon/effect_rpc.rs) and [platform implementation](../src/platform/). Inspect the relevant adapter and its tests before claiming a supported effect. |
+| How do reports reach the team? | [Report intake](../src/issue/report.rs) and [relay implementation](../src/issue/relay.rs). Configuration and an active consumer are separate from enqueue success. |
 
 ## First task checklist
 
@@ -46,7 +44,7 @@ independently. For DevOps, read release compatibility, live state and recorded
 merge/rollout authority. Curators need original evidence and prior lesson
 versions, not only the short injected summary.
 
-## Capability boundary at the source baseline
+## Capability evidence
 
 Durable message/job storage, issue/worktree tools, scoped memory, report intake,
 relay foundations, monitor observations, UI alerts, provider profile display,
@@ -54,18 +52,22 @@ build/test slots and structured review evidence exist in source. This list does
 not certify every adapter, configuration or deployment.
 
 The [bounded acceptance harness](../tests/cad225_acceptance.sh) intentionally
-separates supported cases from missing complete-loop capabilities. At this
-baseline those include unattended scheduling, live quota recovery, actual
-policy-bound merge execution, remote-head movement, UI escalation completion,
-deployed real-provider proof, and independently curated lesson reuse. The
-coordinator follow-up is tracked separately in CAD-176. Do not infer full
-autonomy from a green subset or change the harness labels to claim completion.
+separates supported cases from missing complete-loop capabilities. Read its
+current labels and the associated ticket evidence for the revision you are
+assessing. Do not infer full autonomy from a green subset or change the harness
+labels to claim completion.
 
 Live assignments, queue ages and quota belong in runtime state. Plans,
 acceptance, reviews and release evidence belong in the tracker/artifacts.
 Source documentation explains the contract; it must not invent current status.
 
 ## Keeping context current
+
+This guide links to files shipped in a clean checkout. Additional session notes,
+ADRs and design plans may exist in an operator's local `docs/` or tracker, but
+are not clone-complete references. Ask the task owner for the relevant reviewed
+artifact when an issue depends on one. Do not treat a local file's existence as
+proof that it is current, reviewed or safe to publish.
 
 A behavior change updates its owning contract/spec, affected examples and tests
 in the same PR. Update this index when an entry point changes, and the code map

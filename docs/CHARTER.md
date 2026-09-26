@@ -97,4 +97,6 @@ current priority; the PM re-ranks it as evidence arrives.
 7. **Self-improvement** (L5): automatic retros per merged issue, agent
    scorecards, lessons proposed from retros.
 
-See `docs/TEAM.md` for who does what.
+See the tracked [agent protocol](../skills/cadence/SKILL.md) for delivery and
+reporting responsibilities. Live role assignments come from the agent registry
+and generated briefings.
