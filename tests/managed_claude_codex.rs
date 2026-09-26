@@ -1584,47 +1584,35 @@ fn claude_denials_complete_with_event() {
 
 #[test]
 fn claude_env_injected_and_scrubbed() {
-    let d = TestDaemon::start();
-    // Real process env is mutated here — hold ENV_LOCK across the
-    // mutation + spawn so no other env-setting test interleaves.
-    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    // Scrub by rule: every CLAUDE_*/CLAUDECODE/CODEX_*/CADENCE_* name a
-    // parent session (or a test override) could leak is removed — except
-    // the documented keep-list. ANTHROPIC_* auth is never touched.
-    for (k, v) in [
-        ("CLAUDECODE", "1"),
-        ("CLAUDE_CODE_EXECPATH", "/usr/bin/claude"),
-        ("CLAUDE_CODE_SUBAGENT_MODEL", "sonnet"),
-        ("CLAUDE_EFFORT", "high"),
-        ("CLAUDE_PID", "4242"),
-        ("CLAUDE_CODE_SESSION_ID", "stale-parent-sid"),
-        ("CODEX_THREAD_ID", "stale-thread"),
-        ("CADENCE_CLAUDE_MODE", "leak"),
-        // keep-list: operator-set on purpose, must survive
-        ("CLAUDE_CONFIG_DIR", "/tmp/claude-cfg"),
-        ("CLAUDE_CODE_OAUTH_TOKEN", "tok-keep"),
-        ("ANTHROPIC_API_KEY", "sk-keep"),
-    ] {
-        std::env::set_var(k, v);
+    // The scrub works on the daemon's real process env, which every
+    // test in this binary shares — so the leaks are planted in a child
+    // process of their own instead of mutated here. Scrub by rule:
+    // every CLAUDE_*/CLAUDECODE/CODEX_*/CADENCE_* name a parent session
+    // (or a test override) could leak is removed — except the
+    // documented keep-list. ANTHROPIC_* auth is never touched.
+    if !in_own_process(
+        "claude_env_injected_and_scrubbed",
+        &[
+            ("CLAUDECODE", "1"),
+            ("CLAUDE_CODE_EXECPATH", "/usr/bin/claude"),
+            ("CLAUDE_CODE_SUBAGENT_MODEL", "sonnet"),
+            ("CLAUDE_EFFORT", "high"),
+            ("CLAUDE_PID", "4242"),
+            ("CLAUDE_CODE_SESSION_ID", "stale-parent-sid"),
+            ("CODEX_THREAD_ID", "stale-thread"),
+            ("CADENCE_CLAUDE_MODE", "leak"),
+            // keep-list: operator-set on purpose, must survive
+            ("CLAUDE_CONFIG_DIR", "/tmp/claude-cfg"),
+            ("CLAUDE_CODE_OAUTH_TOKEN", "tok-keep"),
+            ("ANTHROPIC_API_KEY", "sk-keep"),
+        ],
+    ) {
+        return;
     }
+    let d = TestDaemon::start();
     let mock = d.mock_claude("ok", None);
     d.register_claude("w1", Value::Null);
     d.wait_agent("w1", "idle", 15);
-    for k in [
-        "CLAUDECODE",
-        "CLAUDE_CODE_EXECPATH",
-        "CLAUDE_CODE_SUBAGENT_MODEL",
-        "CLAUDE_EFFORT",
-        "CLAUDE_PID",
-        "CLAUDE_CODE_SESSION_ID",
-        "CODEX_THREAD_ID",
-        "CADENCE_CLAUDE_MODE",
-        "CLAUDE_CONFIG_DIR",
-        "CLAUDE_CODE_OAUTH_TOKEN",
-        "ANTHROPIC_API_KEY",
-    ] {
-        std::env::remove_var(k);
-    }
     // The mock writes its env dump at process start, before any
     // protocol emit — `idle` only means the actor's transport opened.
     // A completed turn is the cause ordered after the dump.

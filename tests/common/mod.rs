@@ -342,6 +342,39 @@ pub fn demo_issue_news(cli: &dyn Fn(&[&str]) -> (bool, Value), titles: &[&str]) 
     }
 }
 
+/// Block until no one holds the `cadence.lock` singleton of `state` —
+/// a restart's previous daemon has returned, but its lock can outlive
+/// it: a child that a parallel test's daemon forked while the lock fd
+/// was open holds a dup of it until that child execs (the fd is
+/// close-on-exec). The new daemon's non-blocking lock would lose to
+/// that window, so wait for the kernel to hand the lock over, then
+/// release it explicitly — `LOCK_UN` frees it even if this fd was
+/// itself duplicated meanwhile. Bounded: a daemon still really running
+/// on `state` fails the test instead of hanging it.
+pub fn await_singleton_released(state: &Path) {
+    use std::os::unix::io::AsRawFd;
+    let Ok(file) = std::fs::OpenOptions::new()
+        .write(true)
+        .open(state.join("cadence.lock"))
+    else {
+        return; // no daemon ever owned this state dir
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let fd = file.as_raw_fd();
+        let rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
+        unsafe { libc::flock(fd, libc::LOCK_UN) };
+        let _ = tx.send(rc);
+    });
+    match rx.recv_timeout(Duration::from_secs(30)) {
+        Ok(0) => {}
+        other => panic!(
+            "{} still owned by another daemon: {other:?}",
+            state.display()
+        ),
+    }
+}
+
 pub struct TestDaemon {
     pub dir: TempDir,
     pub state: PathBuf,
@@ -365,7 +398,7 @@ impl TestDaemon {
         std::fs::create_dir_all(&state).unwrap();
         let owned = state.clone();
         let handle = thread::spawn(move || daemon::serve_with(&owned, opts));
-        let daemon = Self {
+        let mut daemon = Self {
             dir,
             state,
             handle: Some(handle),
@@ -384,10 +417,11 @@ impl TestDaemon {
     /// pools or inject the clock this way.
     pub fn start_on_opts(state: PathBuf, opts: daemon::ServeOptions) -> Self {
         suite_slot();
+        await_singleton_released(&state);
         let dir = TempDir::new().unwrap(); // keeps lifetime uniform
         let owned = state.clone();
         let handle = thread::spawn(move || daemon::serve_with(&owned, opts));
-        let daemon = Self {
+        let mut daemon = Self {
             dir,
             state,
             handle: Some(handle),
@@ -448,11 +482,17 @@ impl TestDaemon {
         daemon
     }
 
-    pub fn wait_health(&self) {
+    pub fn wait_health(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if self.rpc("health", json!({})).is_ok() {
                 return;
+            }
+            // A daemon that already returned will never answer: say why
+            // now instead of timing out on it.
+            if self.handle.as_ref().is_some_and(JoinHandle::is_finished) {
+                let exit = self.handle.take().unwrap().join();
+                panic!("daemon exited before it became healthy: {exit:?}");
             }
             assert!(Instant::now() < deadline, "daemon did not become healthy");
             thread::sleep(Duration::from_millis(50));
@@ -930,12 +970,6 @@ pub fn run_signal_child(test: &str, limit: Duration) {
 
 // ---- mock Codex provider over real stdio (no model calls) ----
 
-/// Serialize tests that set real process environment variables — the
-/// mock-side knobs a provider child inherits (`MOCK_TMUX_STATE`, …).
-/// Provider launch commands never go through the environment: see
-/// `test_env`.
-pub static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 thread_local! {
     static TEST_ENV: ProviderEnv = ProviderEnv::default();
     static TEST_STALL_SAMPLE: std::sync::Arc<std::sync::atomic::AtomicU64> =
@@ -979,6 +1013,32 @@ pub fn hook_bin_on_path() {
 pub fn test_env() -> ProviderEnv {
     hook_bin_on_path();
     TEST_ENV.with(ProviderEnv::clone)
+}
+
+/// Whether the calling test named `name` should run its body here. A
+/// test whose subject is process-global — the real env, a signal to
+/// the whole process — must not share a process with parallel tests:
+/// the first call re-runs just `name` in a child of this binary with
+/// `envs` in its env from birth, asserts it ran and passed, and returns
+/// false; in that child it returns true.
+pub fn in_own_process(name: &str, envs: &[(&str, &str)]) -> bool {
+    const CHILD: &str = "CADENCE_TEST_OWN_PROCESS";
+    if std::env::var(CHILD).ok().as_deref() == Some(name) {
+        return true;
+    }
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture"])
+        .env(CHILD, name)
+        .envs(envs.iter().copied())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains(" 1 passed"),
+        "{name} failed in its own process:\n{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    false
 }
 
 /// Host-wide suite slot (CAD-71). With `CADENCE_SUITE_LOCK` set, an
@@ -1841,12 +1901,21 @@ pub fn wait_probe_idle(d: &TestDaemon, alias: &str, secs: u64) {
 /// command (`bash -c`) in its own process group so pane_pid and the
 /// /proc lock-descendant checks exercise real ownership logic.
 pub const MOCK_TMUX_PY: &str = r##"#!/usr/bin/env python3
-import os, re, signal, subprocess, sys, time
+import json, os, re, signal, subprocess, sys, time
 
+# Per-install config: the state dir sits beside this script, and the
+# test's knobs (`mock_knob`) live in its `mock-env` file — overlaid on
+# this call's env, so a pane spawned below inherits them. Never the
+# process env, which every test in the binary shares.
+here = os.path.dirname(os.path.abspath(__file__))
+try:
+    os.environ.update(json.load(open(os.path.join(here, "mock-env"))))
+except FileNotFoundError:
+    pass
 args = sys.argv[1:]
 if args[0] == "-L":
     sock = args[1]; args = args[2:]
-state = os.path.join(os.environ["MOCK_TMUX_STATE"], sock)
+state = os.path.join(here, "tmux-state", sock)
 os.makedirs(state, exist_ok=True)
 
 def sess_path(name, ext):
@@ -2200,8 +2269,24 @@ while True:
     time.sleep(0.05)
 "#;
 
+/// Install the shared mock tmux into `dir` for this test's daemons.
+/// Everything per-install stays in `dir` — the state it keeps under
+/// `tmux-state/` and the knobs in `mock-env` (`mock_knob`), which start
+/// empty — so the only route to a daemon is `CADENCE_TMUX_COMMAND` in
+/// this test's `test_env()`, and parallel tests never share a mock.
+pub fn install_mock_tmux(dir: &Path) {
+    std::fs::create_dir_all(dir.join("tmux-state")).unwrap();
+    let _ = std::fs::remove_file(dir.join("mock-env"));
+    let tmux = dir.join("tmux");
+    std::fs::write(&tmux, MOCK_TMUX_PY).unwrap();
+    // The adapter execs the tmux binary directly (no shell), so the
+    // mock must be executable.
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+    test_env().set("CADENCE_TMUX_COMMAND", tmux.display().to_string());
+}
+
 pub struct MockDevin {
-    pub _guard: std::sync::MutexGuard<'static, ()>,
     pub dir: PathBuf,
     pub locks: PathBuf,
 }
@@ -2209,30 +2294,17 @@ pub struct MockDevin {
 /// Install the mock tmux/devin pair. Set the env overrides BEFORE a
 /// daemon starts so its auto-relaunch sees them.
 pub fn install_mock_devin(dir: &Path) -> MockDevin {
-    let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let locks = dir.join("devin-locks");
-    let tmux_state = dir.join("tmux-state");
     std::fs::create_dir_all(&locks).unwrap();
-    std::fs::create_dir_all(&tmux_state).unwrap();
-    let tmux = dir.join("tmux");
     let devin_py = dir.join("mock-devin.py");
-    std::fs::write(&tmux, MOCK_TMUX_PY).unwrap();
     std::fs::write(&devin_py, MOCK_DEVIN_PY).unwrap();
-    // The adapter execs the tmux binary directly (no shell), so the
-    // mock must be executable.
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
-    // Real env, under this mock's ENV_LOCK: the mock tmux runs as a fresh
-    // child per call and finds its state only through inherited env.
-    std::env::set_var("MOCK_TMUX_STATE", &tmux_state);
-    test_env().set("CADENCE_TMUX_COMMAND", tmux.display().to_string());
+    install_mock_tmux(dir);
     test_env().set(
         "CADENCE_DEVIN_COMMAND",
         format!("python3 {} {}", devin_py.display(), locks.display()),
     );
     test_env().set("CADENCE_DEVIN_LOCKS", locks.display().to_string());
     MockDevin {
-        _guard: guard,
         dir: dir.to_path_buf(),
         locks,
     }
@@ -2377,7 +2449,7 @@ impl Drop for MockDevin {
         test_env().remove("CADENCE_TMUX_COMMAND");
         test_env().remove("CADENCE_DEVIN_COMMAND");
         test_env().remove("CADENCE_DEVIN_LOCKS");
-        std::env::remove_var("MOCK_TMUX_STATE");
+        let _ = std::fs::remove_file(self.dir.join("mock-env"));
     }
 }
 
@@ -2436,7 +2508,6 @@ while True:
 "#;
 
 pub struct MockStub {
-    pub _guard: std::sync::MutexGuard<'static, ()>,
     pub dir: PathBuf,
     pub locks: PathBuf,
 }
@@ -2445,28 +2516,17 @@ pub struct MockStub {
 /// `install_mock_devin`, pointing the adapter at the stub profile's env
 /// overrides instead.
 pub fn install_mock_stub(dir: &Path) -> MockStub {
-    let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let locks = dir.join("stub-locks");
-    let tmux_state = dir.join("tmux-state");
     std::fs::create_dir_all(&locks).unwrap();
-    std::fs::create_dir_all(&tmux_state).unwrap();
-    let tmux = dir.join("tmux");
     let stub_py = dir.join("mock-stub.py");
-    std::fs::write(&tmux, MOCK_TMUX_PY).unwrap();
     std::fs::write(&stub_py, MOCK_STUB_PY).unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
-    // Real env, under this mock's ENV_LOCK: the mock tmux runs as a fresh
-    // child per call and finds its state only through inherited env.
-    std::env::set_var("MOCK_TMUX_STATE", &tmux_state);
-    test_env().set("CADENCE_TMUX_COMMAND", tmux.display().to_string());
+    install_mock_tmux(dir);
     test_env().set(
         "CADENCE_STUB_COMMAND",
         format!("python3 {} {}", stub_py.display(), locks.display()),
     );
     test_env().set("CADENCE_STUB_LOCKS", locks.display().to_string());
     MockStub {
-        _guard: guard,
         dir: dir.to_path_buf(),
         locks,
     }
@@ -2478,7 +2538,7 @@ impl Drop for MockStub {
         test_env().remove("CADENCE_TMUX_COMMAND");
         test_env().remove("CADENCE_STUB_COMMAND");
         test_env().remove("CADENCE_STUB_LOCKS");
-        std::env::remove_var("MOCK_TMUX_STATE");
+        let _ = std::fs::remove_file(self.dir.join("mock-env"));
     }
 }
 
@@ -2568,7 +2628,6 @@ while True:
 "#;
 
 pub struct MockClaudeTui {
-    pub _guard: std::sync::MutexGuard<'static, ()>,
     pub dir: PathBuf,
     pub sessions: PathBuf,
 }
@@ -2577,28 +2636,17 @@ pub struct MockClaudeTui {
 /// `install_mock_devin`, pointing the adapter at the claude profile's
 /// env overrides instead.
 pub fn install_mock_claude_tui(dir: &Path) -> MockClaudeTui {
-    let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let sessions = dir.join("claude-sessions");
-    let tmux_state = dir.join("tmux-state");
     std::fs::create_dir_all(&sessions).unwrap();
-    std::fs::create_dir_all(&tmux_state).unwrap();
-    let tmux = dir.join("tmux");
     let claude_py = dir.join("mock-claude.py");
-    std::fs::write(&tmux, MOCK_TMUX_PY).unwrap();
     std::fs::write(&claude_py, MOCK_CLAUDE_TUI_PY).unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
-    // Real env, under this mock's ENV_LOCK: the mock tmux runs as a fresh
-    // child per call and finds its state only through inherited env.
-    std::env::set_var("MOCK_TMUX_STATE", &tmux_state);
-    test_env().set("CADENCE_TMUX_COMMAND", tmux.display().to_string());
+    install_mock_tmux(dir);
     test_env().set(
         "CADENCE_CLAUDE_TUI_COMMAND",
         format!("python3 {} {}", claude_py.display(), sessions.display()),
     );
     test_env().set("CADENCE_CLAUDE_SESSIONS", sessions.display().to_string());
     MockClaudeTui {
-        _guard: guard,
         dir: dir.to_path_buf(),
         sessions,
     }
@@ -2636,9 +2684,7 @@ impl Drop for MockClaudeTui {
         test_env().remove("CADENCE_TMUX_COMMAND");
         test_env().remove("CADENCE_CLAUDE_TUI_COMMAND");
         test_env().remove("CADENCE_CLAUDE_SESSIONS");
-        std::env::remove_var("MOCK_CLAUDE_SWAP");
-        std::env::remove_var("MOCK_CLAUDE_NO_REGISTRY");
-        std::env::remove_var("MOCK_TMUX_STATE");
+        let _ = std::fs::remove_file(self.dir.join("mock-env"));
     }
 }
 
@@ -2713,7 +2759,6 @@ while True:
 "#;
 
 pub struct MockCursorTui {
-    pub _guard: std::sync::MutexGuard<'static, ()>,
     pub dir: PathBuf,
     pub chats: PathBuf,
     /// The owning daemon's state dir, when the mock was installed
@@ -2727,18 +2772,18 @@ pub struct MockCursorTui {
     pub state: Option<PathBuf>,
 }
 
+/// Install the mock tmux/cursor pair — the same private-tmux harness
+/// as `install_mock_devin`, pointing the adapter at the cursor
+/// profile's env overrides instead.
+pub fn install_mock_cursor_tui(dir: &Path) -> MockCursorTui {
+    install_mock_cursor_tui_inner(dir, None)
+}
+
 pub fn install_mock_cursor_tui_inner(dir: &Path, state: Option<PathBuf>) -> MockCursorTui {
-    let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let chats = dir.join("cursor-chats");
-    let tmux_state = dir.join("tmux-state");
     std::fs::create_dir_all(&chats).unwrap();
-    std::fs::create_dir_all(&tmux_state).unwrap();
-    let tmux = dir.join("tmux");
     let cursor_py = dir.join("mock-cursor.py");
-    std::fs::write(&tmux, MOCK_TMUX_PY).unwrap();
     std::fs::write(&cursor_py, MOCK_CURSOR_TUI_PY).unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
     // A `cursor-agent`-named symlink onto python3: the pane's argv[0]
     // then names the real binary, so the profile's `--resume` argv
     // proof (not only the store.db fd) is exercised in integration.
@@ -2749,10 +2794,7 @@ pub fn install_mock_cursor_tui_inner(dir: &Path, state: Option<PathBuf>) -> Mock
     let python = String::from_utf8(out.stdout).unwrap().trim().to_string();
     let cursor_bin = dir.join("cursor-agent");
     std::os::unix::fs::symlink(&python, &cursor_bin).unwrap();
-    // Real env, under this mock's ENV_LOCK: the mock tmux runs as a fresh
-    // child per call and finds its state only through inherited env.
-    std::env::set_var("MOCK_TMUX_STATE", &tmux_state);
-    test_env().set("CADENCE_TMUX_COMMAND", tmux.display().to_string());
+    install_mock_tmux(dir);
     test_env().set(
         "CADENCE_CURSOR_COMMAND",
         format!(
@@ -2763,12 +2805,7 @@ pub fn install_mock_cursor_tui_inner(dir: &Path, state: Option<PathBuf>) -> Mock
         ),
     );
     test_env().set("CADENCE_CURSOR_CHATS", chats.display().to_string());
-    // A swap/die-on set by an earlier test must not leak into this
-    // install.
-    std::env::remove_var("MOCK_CURSOR_SWAP");
-    std::env::remove_var("MOCK_CURSOR_DIE_ON");
     MockCursorTui {
-        _guard: guard,
         dir: dir.to_path_buf(),
         chats,
         state,
@@ -2820,10 +2857,26 @@ impl Drop for MockCursorTui {
         test_env().remove("CADENCE_TMUX_COMMAND");
         test_env().remove("CADENCE_CURSOR_COMMAND");
         test_env().remove("CADENCE_CURSOR_CHATS");
-        std::env::remove_var("MOCK_CURSOR_SWAP");
-        std::env::remove_var("MOCK_CURSOR_DIE_ON");
-        std::env::remove_var("MOCK_TMUX_STATE");
+        let _ = std::fs::remove_file(self.dir.join("mock-env"));
     }
+}
+
+/// Set (`Some`) or clear (`None`) one knob of the mock tmux installed
+/// in `dir` — `MOCK_TMUX_HOLD`, `MOCK_CURSOR_SWAP`, …. The knobs live
+/// in that install's `mock-env` file, which the mock tmux overlays on
+/// its env per call and hands to every pane it spawns; the process env
+/// every test in this binary shares is never touched.
+pub fn mock_knob(dir: &Path, name: &str, value: Option<&str>) {
+    let path = dir.join("mock-env");
+    let mut knobs: serde_json::Map<String, Value> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    match value {
+        Some(v) => knobs.insert(name.to_string(), json!(v)),
+        None => knobs.remove(name),
+    };
+    atomic_write(path, Value::Object(knobs).to_string());
 }
 
 /// Mirror of the adapter's `cadence-<fnv64(state_dir)>` socket name.

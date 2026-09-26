@@ -364,27 +364,23 @@ fn arming_refuses_the_real_production_state_dir() {
         // resolve against; the env-derived checks still stand.
         return;
     };
-    let prod = home.join(".local/state/cadence");
-    // Point every env-derived handle at a decoy: only the passwd-home
-    // bound can still name `prod`. Without it the arm falls through to
-    // the temp-root refusal — an Err, but a different message.
-    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let prior = [
-        ("HOME", std::env::var_os("HOME")),
-        ("XDG_STATE_HOME", std::env::var_os("XDG_STATE_HOME")),
-    ];
-    let decoy = TempDir::new().unwrap();
-    std::env::set_var("HOME", decoy.path());
-    std::env::set_var("XDG_STATE_HOME", decoy.path());
-    let arm = cadence_agent::test_seam::arm_if_requested(&prod, true).map(|_| ());
-    for (key, value) in prior {
-        match value {
-            Some(value) => std::env::set_var(key, value),
-            None => std::env::remove_var(key),
-        }
+    // Point every env-derived handle at a decoy — in a private child
+    // process, so the doc never mutates the shared process env: only
+    // the passwd-home bound can still name `prod`. Without it the arm
+    // falls through to the temp-root refusal — an Err, but a
+    // different message.
+    let decoy_dir = TempDir::new().unwrap();
+    let decoy = decoy_dir.path().to_str().unwrap().to_string();
+    if !in_own_process(
+        "arming_refuses_the_real_production_state_dir",
+        &[("HOME", &decoy), ("XDG_STATE_HOME", &decoy)],
+    ) {
+        return;
     }
-    drop(_env);
-    let err = arm.expect_err("the seam must refuse the real production state dir");
+    let prod = home.join(".local/state/cadence");
+    let err = cadence_agent::test_seam::arm_if_requested(&prod, true)
+        .map(|_| ())
+        .expect_err("the seam must refuse the real production state dir");
     assert!(
         err.to_string().contains("production state dir"),
         "the refusal should name the production dir, got: {err}"

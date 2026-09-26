@@ -203,6 +203,125 @@ fn claude_sessions(dir: &Path) -> Vec<(u32, String)> {
     out
 }
 
+/// CAD-183: every mock installer is per-test — four live at once on
+/// four threads, each mock tmux keeps its state in its own install
+/// dir, and a knob set on one never reaches another.
+#[test]
+fn mock_installers_run_concurrently_with_private_state() {
+    type Install = fn(&Path) -> Box<dyn std::any::Any>;
+    let installs: [(&str, Install); 4] = [
+        ("devin", |d| Box::new(install_mock_devin(d))),
+        ("stub", |d| Box::new(install_mock_stub(d))),
+        ("claude_tui", |d| Box::new(install_mock_claude_tui(d))),
+        ("cursor_tui", |d| Box::new(install_mock_cursor_tui(d))),
+    ];
+    let (up_tx, up_rx) = std::sync::mpsc::channel();
+    let mut releases = Vec::new();
+    let mut threads = Vec::new();
+    for (name, install) in installs {
+        let up_tx = up_tx.clone();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        releases.push(release_tx);
+        threads.push(thread::spawn(move || {
+            let dir = TempDir::new().unwrap();
+            let _mock = install(dir.path());
+            up_tx.send((name, dir.path().to_path_buf())).unwrap();
+            // Hold the mock until the main thread has probed them all.
+            let _ = release_rx.recv();
+        }));
+    }
+    let mut up = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while up.len() < installs.len() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match up_rx.recv_timeout(left) {
+            Ok(m) => up.push(m),
+            Err(_) => {
+                releases.clear();
+                panic!(
+                    "only {:?} of {} mock installers came up while the others \
+                     were live — they still serialize",
+                    up.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+                    installs.len()
+                );
+            }
+        }
+    }
+    // A knob on the first install only.
+    mock_knob(&up[0].1, "MOCK_TMUX_FAIL", Some("has-session"));
+    for (i, (name, dir)) in up.iter().enumerate() {
+        let out = std::process::Command::new(dir.join("tmux"))
+            .args(["-L", "cad183", "has-session", "-t", "none"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            stderr.contains("mock injected failure"),
+            i == 0,
+            "{name}: knob reached the wrong mock: {stderr}"
+        );
+        let log = dir.join("tmux-state").join("cad183").join("calls.log");
+        let calls = std::fs::read_to_string(&log)
+            .unwrap_or_else(|e| panic!("{name}: no call log at {log:?}: {e}"));
+        assert_eq!(calls, "has-session -t none\n", "{name}");
+    }
+    releases.clear();
+    for t in threads {
+        t.join().unwrap();
+    }
+}
+
+/// CAD-183: mock and provider configuration reaches a daemon through
+/// `test_env()` or a mock's own install dir, never the process env
+/// every test in this binary shares — so no test holds a process-wide
+/// env lock. The scan covers every source the CAD-426 split produces —
+/// each per-area binary named by split-map.toml plus the shared
+/// harness — so a binary the generator moves or adds stays guarded.
+#[test]
+fn mock_config_never_touches_process_env() {
+    let set = concat!("std::env::", "set_var");
+    let remove = concat!("std::env::", "remove_var");
+    let lock = concat!("ENV_", "LOCK");
+    // Not test config: `PATH` is prepended once per process so children
+    // run the binary under test, and `GL_TOKEN` exists only inside the
+    // forge-credential test that sets and removes it.
+    let exempt = ["\"PATH\"", "\"GL_TOKEN\""];
+    let mut sources = vec![std::path::PathBuf::from("tests/common/mod.rs")];
+    let map = std::fs::read_to_string("tests/split-map.toml").unwrap();
+    // The map names only what the generator split out of
+    // integration.rs; hand-written binaries that share the harness
+    // must be listed by hand — `test_seam` held the last live
+    // reference to the dropped env lock when it went unscanned.
+    sources.extend(["tests/test_seam.rs"].iter().map(std::path::PathBuf::from));
+    sources.extend(map.lines().filter_map(|l| {
+        l.strip_prefix("[binaries.")
+            .and_then(|s| s.strip_suffix(']'))
+            .map(|name| std::path::PathBuf::from(format!("tests/{name}.rs")))
+    }));
+    let offenders: Vec<String> = sources
+        .iter()
+        .flat_map(|p| {
+            let path = p.display().to_string();
+            std::fs::read_to_string(p)
+                .unwrap()
+                .lines()
+                .enumerate()
+                .filter(|(_, l)| {
+                    l.contains(lock)
+                        || ((l.contains(set) || l.contains(remove))
+                            && !exempt.iter().any(|v| l.contains(v)))
+                })
+                .map(|(i, l)| format!("{path}:{}: {}", i + 1, l.trim()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "process env mutated for test config:\n{}",
+        offenders.join("\n")
+    );
+}
+
 /// The claim gate itself is covered on the stub profile — Devin's own
 /// verified idle probe is now the claim (CAD-520), so this literal-paste
 /// lifecycle uses a profile that still requires `agent ready`.
@@ -2173,20 +2292,23 @@ fn pty_routed_notice_delivers_idle_without_claim() {
     d.wait_agent("w1", "idle", 10);
     let routed_id = route_worker_result(&d, "w1", "pm", "work-1", "review this pane");
     let started = Instant::now();
-    let deadline = started + Duration::from_secs(30);
-    let mut submitted = false;
+    let deadline = started + Duration::from_secs(2);
+    // `submitting` is written by the actor's dequeue itself — the step
+    // the wake gates. The paste and its render proof that follow are
+    // mock-tmux latency, which parallel tests on a loaded host stretch.
+    let mut dequeued = false;
     while Instant::now() < deadline {
         let state = d.message_state("pm", &routed_id);
-        if state == "running" || state == "completed" {
-            submitted = true;
+        if ["submitting", "running", "completed"].contains(&state.as_str()) {
+            dequeued = true;
             break;
         }
         assert_ne!(state, "failed", "routed notice failed before submit");
         thread::sleep(Duration::from_millis(20));
     }
     assert!(
-        submitted,
-        "routed notice still {} after {:?} — the route did not wake the idle actor",
+        dequeued,
+        "routed notice still {} after {:?} — wake did not beat the empty-queue poll",
         d.message_state("pm", &routed_id),
         started.elapsed()
     );
@@ -4044,8 +4166,8 @@ fn pty_cursor_malformed_cli_config_refuses_launch() {
 #[test]
 fn pty_cursor_unresumable_chat_clears_and_mints_fresh() {
     let d = TestDaemon::start();
-    let _mock = d.mock_cursor_tui();
-    std::env::set_var("MOCK_CURSOR_DIE_ON", "dead-chat");
+    let mock = d.mock_cursor_tui();
+    mock_knob(&mock.dir, "MOCK_CURSOR_DIE_ON", Some("dead-chat"));
     d.register_cursor_pty("cu", json!({"session": "dead-chat"}));
     let agent = d.wait_agent("cu", "attention", 20);
     let err = agent["error"].as_str().unwrap_or("");
@@ -4081,13 +4203,13 @@ fn pty_cursor_unresumable_chat_clears_and_mints_fresh() {
 #[test]
 fn pty_cursor_proven_chat_deleted_mints_fresh() {
     let d = TestDaemon::start();
-    let _mock = d.mock_cursor_tui();
+    let mock = d.mock_cursor_tui();
     d.register_cursor_pty("cu", json!({}));
     let agent = d.wait_agent("cu", "idle", 20);
     let proven = agent["thread_id"].as_str().unwrap().to_string();
     // The proven chat is gone from the host: a TUI asked to resume it
     // exits, the deleted-chat shape.
-    std::env::set_var("MOCK_CURSOR_DIE_ON", &proven);
+    mock_knob(&mock.dir, "MOCK_CURSOR_DIE_ON", Some(&proven));
     d.operator_rpc("agent_stop", json!({"alias": "cu"}))
         .unwrap();
     d.operator_rpc("agent_resume", json!({"alias": "cu"}))
@@ -4137,7 +4259,7 @@ fn pty_cursor_cleared_session_leaves_foreign_chat() {
         ])
         .spawn()
         .unwrap();
-    std::env::set_var("MOCK_CURSOR_DIE_ON", "dead-chat");
+    mock_knob(&mock.dir, "MOCK_CURSOR_DIE_ON", Some("dead-chat"));
     d.register_cursor_pty("cu", json!({"session": "dead-chat"}));
     d.wait_agent("cu", "attention", 20);
     let show = d.rpc("agent_show", json!({"alias": "cu"})).unwrap();
@@ -4164,10 +4286,10 @@ fn pty_cursor_cleared_session_leaves_foreign_chat() {
 #[test]
 fn pty_claude_resume_timeout_keeps_session() {
     let d = TestDaemon::start();
-    let _mock = d.mock_claude_tui();
+    let mock = d.mock_claude_tui();
     // The pane stays alive but never publishes its session — the open
     // wait runs to the claude profile's deadline.
-    std::env::set_var("MOCK_CLAUDE_NO_REGISTRY", "1");
+    mock_knob(&mock.dir, "MOCK_CLAUDE_NO_REGISTRY", Some("1"));
     d.register_claude_pty("cl", json!({"session": "claude-session-1"}));
     let agent = d.wait_agent("cl", "attention", 60);
     let err = agent["error"].as_str().unwrap_or("");
