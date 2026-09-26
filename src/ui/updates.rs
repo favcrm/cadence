@@ -212,7 +212,12 @@ pub(super) fn start(state_dir: &Path, opts: &ServeOpts) -> HttpResp {
         },
     };
     let log_path = update::progress_file(state_dir);
-    let log = match update::open_private(&log_path, true, false) {
+    // Each run's log is its own: truncate what a previous run left, or a
+    // helper refused before `run_log_start` (the CLI gate, the re-entry
+    // lock) dies into the old run's log — `run_log_never_started` sees
+    // its terminal record and skips, leaving the card showing the
+    // previous result with no error (CAD-561 r4).
+    let log = match update::open_private(&log_path, true, true) {
         Ok(file) => file,
         Err(e) => return rpc_err(&e, "update"),
     };

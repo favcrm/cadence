@@ -1511,6 +1511,53 @@ fn cad561_a_helper_that_dies_before_the_run_log_is_recorded_as_never_started() {
     assert!(error.contains("the operator proof refused"), "{status}");
 }
 
+/// CAD-561 r4: the same refusal after a run already finished. The old
+/// run's terminal record sat in the log, `run_log_never_started` saw it
+/// and skipped — the card kept showing the previous result with
+/// `error: null`. The board truncates the log at start, so the refused
+/// helper's death records `Failed` the way the first-run case does.
+#[test]
+fn cad561_a_refused_helper_after_a_finished_run_is_not_a_stale_result() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let d = UiDaemon::start_on(state.path().to_path_buf());
+    // A previous run's whole record: started, a line, finished. Its
+    // terminal record is what skipped `run_log_never_started` (r4).
+    let log = state.path().join(cadence_agent::update::PROGRESS_FILE);
+    std::fs::write(
+        &log,
+        concat!(
+            r#"{"update_run":"running","pid":4294967294,"by":"operator (ui)","at":1.0}"#,
+            "\n",
+            "drained: quiet after 3s\n",
+            r#"{"update_run":"finished","at":2.0,"report":{"rolled_back":false,"#,
+            r#""check":{"target":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let helper = write_fake_dead_update_helper(state.path());
+    let (port, _board) = start_ui_opts(
+        pm.path().to_path_buf(),
+        state.path().to_path_buf(),
+        move |opts| opts.update_helper = Some(helper.clone()),
+    );
+    let s = sign_in(&d.state(), port);
+    let host = op::board_host(port);
+    let (code, _, body) = op_write_json(&s, port, "POST", "/api/update", &host, "{}");
+    assert_eq!(code, 200, "{body}");
+    let status = wait_update_error(port, &host);
+    assert_eq!(status["running"], json!(false), "{status}");
+    // Not the previous run's result: the card must not resurrect it.
+    assert_eq!(status["result"], Value::Null, "{status}");
+    let error = status["error"].as_str().unwrap_or_default();
+    assert!(error.contains("never started"), "{status}");
+    assert!(error.contains("the operator proof refused"), "{status}");
+}
+
 /// CAD-561 r3: the board refuses a planted progress log (a symlink
 /// here) before it spawns anything — the log is one of the state dir's
 /// private files, opened `O_NOFOLLOW` with a regular-file/owner check.
