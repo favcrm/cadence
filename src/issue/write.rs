@@ -414,7 +414,44 @@ pub(crate) fn next_id(dir: &Path, prefix: &str) -> Result<u64> {
     Ok(max + 1)
 }
 
+/// CAD-614: `issue new` always creates a backlog ticket. The master
+/// may not pass `--owner` or `--id` (those are operator overrides);
+/// any caller passing `--status` other than `backlog` is refused.
+/// Refusals name the allowed form.
+pub fn master_issue_new_limits(
+    caller_is_master: bool,
+    owner: Option<&str>,
+    explicit_id: Option<&str>,
+    status: Option<&str>,
+) -> Result<()> {
+    if let Some(status) = status {
+        if status != "backlog" {
+            return Err(Error::rejected(
+                "issue new creates a backlog ticket — omit --status or pass --status backlog. \
+                 The master cannot move status; that stays the operator's `issue set`",
+            ));
+        }
+    }
+    if !caller_is_master {
+        return Ok(());
+    }
+    if owner.is_some() {
+        return Err(Error::rejected(
+            "the master creates backlog tickets without --owner — omit it; the ticket records actor=master",
+        ));
+    }
+    if explicit_id.is_some() {
+        return Err(Error::rejected(
+            "the master does not choose ticket ids — omit --id",
+        ));
+    }
+    Ok(())
+}
+
 /// `issue new` — one folder + issue.md, under the id lock.
+/// `body`, when set, replaces the default title-plus-empty-acceptance
+/// body (CAD-614: the master writes it under `master/tmp` and passes
+/// `--file`).
 #[allow(clippy::too_many_arguments)]
 pub fn new_issue(
     pm: &Pm,
@@ -428,6 +465,7 @@ pub fn new_issue(
     component: Option<&str>,
     tags: &[String],
     explicit_id: Option<&str>,
+    body: Option<&str>,
     actor: &str,
 ) -> Result<Value> {
     let project = project::resolve(&pm.dir, project_flag, cwd)?;
@@ -473,7 +511,9 @@ pub fn new_issue(
     for dep in &front.blocked_by {
         model::check_id(dep)?;
     }
-    let body = format!("{title}\n\n## Acceptance\n\n");
+    let body = body
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{title}\n\n## Acceptance\n\n"));
     if let Some(parent) = parent {
         model::check_id(parent)?;
         // CAD-360: nothing new is parented to a plan epic.
@@ -1946,6 +1986,7 @@ mod tests {
             None,
             &[],
             None,
+            None,
             "t",
         )
         .unwrap();
@@ -2043,5 +2084,55 @@ mod tests {
         assert!(add_comment(&pm, "CAD-1", "hello", Some("w1"), None, None, "w1").is_err());
         assert!(clean(&pm), "a failed comment left something behind");
         std::fs::remove_file(hook).unwrap();
+    }
+
+    /// CAD-614: the master cannot stamp owner, id, or a non-backlog
+    /// status. Anyone else still can set owner and id; status other
+    /// than backlog is refused for every caller.
+    #[test]
+    fn master_issue_new_refuses_owner_id_and_non_backlog() {
+        assert!(master_issue_new_limits(true, None, None, None).is_ok());
+        assert!(master_issue_new_limits(true, None, None, Some("backlog")).is_ok());
+        let owner = master_issue_new_limits(true, Some("bob"), None, None).unwrap_err();
+        assert!(owner.to_string().contains("--owner"), "{owner}");
+        assert!(owner.to_string().contains("actor=master"), "{owner}");
+        let id = master_issue_new_limits(true, None, Some("CAD-9"), None).unwrap_err();
+        assert!(id.to_string().contains("--id"), "{id}");
+        let status = master_issue_new_limits(true, None, None, Some("ready")).unwrap_err();
+        assert!(status.to_string().contains("backlog"), "{status}");
+        assert!(master_issue_new_limits(false, Some("bob"), Some("CAD-9"), None).is_ok());
+        let other = master_issue_new_limits(false, None, None, Some("ready")).unwrap_err();
+        assert!(other.to_string().contains("backlog"), "{other}");
+    }
+
+    /// CAD-614: a create attributed to master records that actor, and
+    /// `--file` body text replaces the empty acceptance stub.
+    #[test]
+    fn master_create_records_actor_and_file_body() {
+        let (dir, pm) = tracker();
+        new_issue(
+            &pm,
+            dir.path(),
+            Some("cadence"),
+            "from the master",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            &[],
+            None,
+            Some("the note\n"),
+            "master",
+        )
+        .unwrap();
+        let md = std::fs::read_to_string(dir.path().join("pm/cadence/CAD-2/issue.md")).unwrap();
+        assert!(md.contains("the note"), "{md}");
+        let log = crate::issue::git(
+            &pm.dir,
+            &["log", "-1", "--format=%B", "--", "cadence/CAD-2/issue.md"],
+        )
+        .unwrap();
+        assert!(log.contains("Actor: master"), "{log}");
     }
 }

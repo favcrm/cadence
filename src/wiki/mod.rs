@@ -1691,6 +1691,10 @@ mod tests {
         let public = Caller::Public;
         let user = Caller::User("fable".to_string());
         let user2 = Caller::User("other".to_string());
+        let master = Caller::Agent {
+            alias: "master".to_string(),
+            project: None,
+        };
         // (caller, op, path, allow?)
         let table: &[(&Caller, Op, &str, bool)] = &[
             // The root: listable, never writable.
@@ -1736,6 +1740,13 @@ mod tests {
             (&agent(), Op::Read, "agents/other/knowledge/n.md", true),
             (&agent(), Op::Write, "agents/swe-1/knowledge/n.md", true),
             (&agent(), Op::Write, "agents/swe-2/knowledge/n.md", false),
+            // CAD-614: the master is an agent whose alias is `master`.
+            // It reads global/ and writes only agents/master/knowledge/.
+            (&master, Op::Read, "global/x.md", true),
+            (&master, Op::Write, "global/x.md", false),
+            (&master, Op::Write, "agents/master/knowledge/n.md", true),
+            (&master, Op::Write, "agents/swe-1/knowledge/n.md", false),
+            (&master, Op::Read, "agents/swe-1/knowledge/n.md", true),
             (&user, Op::Write, "agents/swe-1/knowledge/n.md", false),
             (&op, Op::Write, "agents/swe-1/knowledge/n.md", true),
             // unknown agents/<a>/ subdirs refuse outright.
