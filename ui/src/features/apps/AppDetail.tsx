@@ -79,7 +79,12 @@ export default function AppDetail({
           wf={running}
           viewer={viewer}
           onClose={() => setRunning(null)}
-          onOpenIssue={onOpenIssue}
+          // Opening the epic closes this drawer first: the issue drawer
+          // is the board's, and stacking two of them reads as a bug.
+          onOpenIssue={(id) => {
+            setRunning(null);
+            onOpenIssue(id);
+          }}
           onHome={onHome}
         />
       )}
