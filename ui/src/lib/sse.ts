@@ -1,5 +1,47 @@
 import type { Resource } from "./cache";
 
+// Filled by vite `define` at build time — undefined in plain-node tests.
+declare const __CADENCE_BUILD__: string | undefined;
+
+/** The build id baked into this bundle ("unknown" where none was baked). */
+export const UI_BUILD: string =
+  typeof __CADENCE_BUILD__ === "string" ? __CADENCE_BUILD__ : "unknown";
+
+/**
+ * The `{build}` payload of a `hello` frame or `/api/version`'s body —
+ * null when absent or unparseable.
+ */
+export function parseBuild(data: string | null | undefined): string | null {
+  try {
+    const v = JSON.parse(data ?? "")?.build;
+    return typeof v === "string" && v.length > 0 ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * true when the serving build is known to differ from this bundle's.
+ * `unknown` on either side — git was absent at build time — is
+ * cannot-tell and never prompts a reload.
+ */
+export function buildChanged(server: string | null | undefined, local: string): boolean {
+  if (!server || !local) return false;
+  if (server === "unknown" || local === "unknown") return false;
+  if (server.endsWith("+unknown") || local.endsWith("+unknown")) return false;
+  return server !== local;
+}
+
+/** `GET /api/version` — the serving build while the stream is down. */
+export async function serverBuild(): Promise<string | null> {
+  try {
+    const resp = await fetch("/api/version");
+    return resp.ok ? parseBuild(await resp.text()) : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * A server-sent-events subscription that resumes where it left off.
  *
@@ -60,6 +102,16 @@ export interface SseOptions {
   maxRetryMs?: number;
   /** Told about every error, with what happens next. */
   onError?: (state: SseErrorState) => void;
+  /**
+   * The serving build every `hello` frame announces — on the first
+   * connect and every reconnect — and what `probeBuild` answers after
+   * `buildProbeMs` down. The caller compares it against `UI_BUILD`.
+   */
+  onBuild?: (build: string) => void;
+  /** Fetches the serving build while the stream stays down. */
+  probeBuild?: () => Promise<string | null>;
+  /** How long the stream may be down before `probeBuild` runs (~15 s). */
+  buildProbeMs?: number;
   /** Test seam; defaults to the browser's `EventSource`. */
   open?: (url: string) => EventSourceLike;
   /**
@@ -121,6 +173,25 @@ export function subscribeSse(opts: SseOptions): SseSubscription {
   let source: EventSourceLike | null = null;
   let cancelTimer: (() => void) | null = null;
   let closed = false;
+  let streamDown = false;
+  let downGen = 0;
+  let cancelProbe: (() => void) | null = null;
+
+  // The stream just went down: if it stays down past `buildProbeMs`,
+  // ask the server its build outright — a tab whose reconnects never
+  // land still learns it is stale (CAD-573).
+  const armBuildProbe = () => {
+    if (streamDown || !opts.probeBuild) return;
+    streamDown = true;
+    const gen = ++downGen;
+    cancelProbe = schedule(async () => {
+      cancelProbe = null;
+      if (closed || !streamDown || gen !== downGen) return;
+      const build = await opts.probeBuild!().catch(() => null);
+      if (closed || !streamDown || gen !== downGen || build === null) return;
+      opts.onBuild?.(build);
+    }, opts.buildProbeMs ?? 15_000);
+  };
 
   const connect = () => {
     cancelTimer = null;
@@ -129,8 +200,22 @@ export function subscribeSse(opts: SseOptions): SseSubscription {
     const es = open(url);
     source = es;
     es.onopen = () => {
-      if (source === es) delay = firstDelay;
+      if (source !== es) return;
+      delay = firstDelay;
+      // Up again — a pending down-probe is stale.
+      streamDown = false;
+      downGen++;
+      cancelProbe?.();
+      cancelProbe = null;
     };
+    if (opts.onBuild) {
+      // `hello` is the server's first frame on every (re)connect.
+      es.addEventListener("hello", (e) => {
+        if (source !== es) return;
+        const build = parseBuild(e.data);
+        if (build !== null) opts.onBuild!(build);
+      });
+    }
     for (const type of opts.events) {
       es.addEventListener(type, (e) => {
         if (source !== es) return;
@@ -141,6 +226,7 @@ export function subscribeSse(opts: SseOptions): SseSubscription {
     }
     es.onerror = () => {
       if (source !== es || closed) return;
+      armBuildProbe();
       // CONNECTING: the browser retries by itself, sending Last-Event-ID.
       if (es.readyState !== CLOSED) {
         opts.onError?.("reconnecting");
@@ -169,6 +255,8 @@ export function subscribeSse(opts: SseOptions): SseSubscription {
       closed = true;
       cancelTimer?.();
       cancelTimer = null;
+      cancelProbe?.();
+      cancelProbe = null;
       source?.close();
       source = null;
     },
