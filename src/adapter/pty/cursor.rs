@@ -209,6 +209,24 @@ fn spinner_row(row: &str) -> bool {
         || (cursor_screen::SPINNER.iter().any(|w| row.contains(w)) && row.contains("tokens"))
 }
 
+/// Text staged in the input row. The interrupt hint shares that row,
+/// right-aligned, and `capture-pane` pads the row to the pane width
+/// *after* the hint — so the hint is not a suffix. `trim_end_matches`
+/// then leaves `ctrl+c to stop` in the draft and a drained
+/// `Add a follow-up` watermark reads as unsubmitted text (CAD-612).
+/// Strip the hint wherever it sits, then the padding; what remains is
+/// the placeholder or a real draft.
+fn input_draft(input_line: &str) -> String {
+    let trimmed = input_line.trim();
+    let body = match trimmed.find(cursor_screen::INTERRUPT) {
+        Some(at) => trimmed[..at].trim_end(),
+        None => trimmed,
+    };
+    body.trim_start_matches(cursor_screen::PROMPT)
+        .trim()
+        .to_string()
+}
+
 /// Reduce a captured Cursor screen to gate facts. The input line is
 /// the last `→`-leading row inside the bottom status region — and it
 /// is never the last non-blank row (the model/cwd bar always sits
@@ -461,12 +479,7 @@ pub fn analyze_cursor(screen: &str, _cursor: Option<(u32, u32)>) -> Probe {
     // busy evidence on the input line itself, and never part of the
     // staged text.
     let interrupt_hint = input_line.contains(cursor_screen::INTERRUPT);
-    let draft = input_line
-        .trim_start()
-        .trim_start_matches(cursor_screen::PROMPT)
-        .trim_end_matches(cursor_screen::INTERRUPT)
-        .trim()
-        .to_string();
+    let draft = input_draft(input_line);
     // Busy is decided by positive evidence tied to the input line:
     // the interrupt hint on it, or the status row directly above —
     // the first row up that is not blank, a box rule, or a `Tip:`
@@ -953,6 +966,15 @@ impl TuiProfile for CursorProfile {
         OPEN_DEADLINE
     }
 
+    /// Cursor's idle placeholder is verified against live captures
+    /// (CAD-56 fixtures, and the padded busy frame in CAD-612).
+    /// `probe.idle` is the readiness claim — the same model as Devin
+    /// (CAD-520). A busy frame stays not-idle: the interrupt hint and
+    /// the spinner still refuse the gate.
+    fn probe_is_ready_claim(&self) -> bool {
+        true
+    }
+
     fn analyze(&self, screen: &str, cursor: Option<(u32, u32)>) -> Probe {
         analyze_cursor(screen, cursor)
     }
@@ -1088,6 +1110,38 @@ mod tests {
         assert_eq!(p.reason, "tui is busy (interrupt hint on the input line)");
         // The placeholder watermark is still the input text — no draft.
         assert!(!p.input_nonempty);
+    }
+
+    #[test]
+    fn padded_interrupt_hint_is_empty_input_not_a_draft() {
+        // Live Cursor captures (2026-09-26, CAD-612) pad the input row
+        // out to the pane width *after* the right-aligned `ctrl+c to
+        // stop`. The hint is then not a suffix, so reading the row as
+        // a staged draft fences a turn the pane already took.
+        let screen = std::fs::read_to_string(format!(
+            "{}/tests/common/cursor-tui/busy-padded-hint.txt",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let line = screen
+            .lines()
+            .find(|l| l.contains("ctrl+c to stop"))
+            .expect("recorded input row");
+        assert!(
+            line.ends_with(' ') && line.contains("Add a follow-up"),
+            "the recording must keep the pane-width padding after the hint: {line:?}"
+        );
+        assert!(
+            screen.contains("1 task"),
+            "the live busy chrome includes the task count"
+        );
+        let p = analyze_cursor(&screen, None);
+        assert!(!p.idle && p.busy_marker, "{}", p.reason);
+        assert_eq!(p.reason, "tui is busy (interrupt hint on the input line)");
+        assert!(
+            !p.input_nonempty,
+            "padded hint must read as a drained input, not a draft: {p:?}"
+        );
     }
 
     #[test]
