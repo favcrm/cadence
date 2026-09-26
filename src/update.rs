@@ -1127,7 +1127,13 @@ fn run_inner(
             )?;
             let binary = host.layout().binary(&previous);
             host.restart(&binary)?;
-            health_wait(host, &previous, HEALTH_TIMEOUT, board_before, || {
+            // The rollback needs the DAEMON on the previous build; the
+            // restart above already stops the board by pid, so a board
+            // that was running is only expected when the restart's
+            // `ui start` found it. A board that stays down is named for
+            // the operator (with the command) instead of failing the
+            // rollback the daemon survived.
+            health_wait(host, &previous, HEALTH_TIMEOUT, false, || {
                 host.board_build()
             })
             .map_err(|e2| {
@@ -1136,6 +1142,15 @@ fn run_inner(
                      not come up either ({e2}) — the daemon and board need an operator"
                 ))
             })?;
+            if board_before && host.board_build()?.is_none() {
+                progress(
+                    host,
+                    format!(
+                        "warning: the board did not come back — start it with \
+                         `cadence ui start` (the daemon is answering on {previous})"
+                    ),
+                );
+            }
             let restore = backup["backup"]["manifest"].as_str().map(|manifest| {
                 format!(
                     "if the schema changed, restore the pre-update backup: \
@@ -1335,11 +1350,23 @@ fn rollback_body(
         )),
         _ => None,
     };
-    match health_wait(host, previous, HEALTH_TIMEOUT, board_before, || {
-        host.board_build()
-    }) {
+    // The daemon must answer on the previous build; a board that answers
+    // must answer on it too. A board that was running and stays down is
+    // named for the operator — the restart stops it by pid, so only a
+    // restart that found it (ui.pid still live) starts it again.
+    match health_wait(host, previous, HEALTH_TIMEOUT, false, || host.board_build()) {
         Ok(()) => {
-            host.progress(&format!("health: daemon and board answer on {previous}"));
+            let board_up = host.board_build()?.is_some();
+            host.progress(&format!(
+                "health: daemon{} answer on {previous}",
+                if board_up { " and board" } else { "" }
+            ));
+            if board_before && !board_up {
+                host.progress(&format!(
+                    "warning: the board did not come back — start it with `cadence ui start` \
+                     (the daemon is answering on {previous})"
+                ));
+            }
             if let Some(restore) = &restore {
                 host.progress(restore);
             }
