@@ -75,7 +75,10 @@ pub(crate) enum AppAction {
     },
     /// Approve the app's current structure — `plan propose
     /// --workflow <app>/<wf>` refuses it until this matches the
-    /// installed folder. Operator only, through the daemon.
+    /// installed folder. The approval also derives the app's grants:
+    /// exactly the scopes its workflow steps declare on their bound
+    /// slots, to the agents the app's default team assigns those steps
+    /// (CAD-577). Operator only, through the daemon.
     Approve {
         /// App name.
         name: String,
