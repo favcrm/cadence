@@ -19,8 +19,9 @@ interface Props {
   screen: Screen;
   /** The href of a main-nav route (scope and drawer carried along). */
   navHref: (route: Route) => string;
-  project: string;
-  /** The current screen scoped to another project. */
+  /** The project page on screen, or null when this screen is not one. */
+  project: string | null;
+  /** Opens that project's page. Never filters the current screen. */
   projectHref: (key: string) => string;
   projects: Project[];
   /** Counts derive from the cards (counts.ts), not `/api/projects`. */

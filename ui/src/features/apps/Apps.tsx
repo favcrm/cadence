@@ -21,8 +21,9 @@ import type { Viewer } from "../projects/work";
  * slug, the version, the path, the digest, the slot bindings — live on
  * the app page, not here.
  *
- * The sidebar's project scope filters the list; the empty state names
- * the install command, scoped to the selected project when there is one.
+ * The in-page project filter (the chip row above this list) narrows
+ * the cards; the empty state names the install command, scoped to the
+ * selected project when there is one.
  */
 export default function Apps({ project }: { project: string; viewer: Viewer }) {
   const state = useQuery(resources.apps);

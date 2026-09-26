@@ -1,6 +1,6 @@
 import { useSyncExternalStore } from "react";
 import { followClientNav } from "./clientNav";
-import { legacyRedirect } from "./router";
+import { scopeRedirect } from "./router";
 import { browserStoredProjectView } from "./urlState";
 
 /**
@@ -16,9 +16,10 @@ function notify(): void {
   for (const listener of listeners) listener();
 }
 
-/** Rewrite a legacy `?tab=` URL to its route without a new history entry. */
+/** Rewrite a legacy `?tab=` URL, and drop `?project=` from a screen that
+ *  has no project scope, without a new history entry. */
 export function applyLegacyRedirect(): void {
-  const next = legacyRedirect(location.pathname, location.search, browserStoredProjectView());
+  const next = scopeRedirect(location.pathname, location.search, browserStoredProjectView());
   if (next) history.replaceState(history.state, "", next);
 }
 

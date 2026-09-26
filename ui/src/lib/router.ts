@@ -21,9 +21,11 @@ import { readAppUrlState, type AppTab, type ProjectView } from "./urlState";
  *   /settings[/memory]         model defaults, memory
  *   /login                     a `cadence ui login` link lands here
  *
- * Query parameters carry the rest: `project` (the scope on screens whose
- * path has no slug), `issue` (the open issue drawer, on any screen),
- * `view` and the filter keys (Projects only). Parameters the app does not
+ * Query parameters carry the rest: `project` (the in-page filter on
+ * screens that have one — Agents, Team overview, the Apps list, and
+ * Settings → Memory), `issue` (the open issue drawer, on any screen),
+ * `view` and the filter keys (Projects only). Home, Wiki, Outbox and the
+ * rest of Settings carry no project scope. Parameters the app does not
  * own are kept. Pure functions — the React side is lib/useLocation.ts —
  * so routing is unit-tested in plain node (tests/router.test.ts).
  */
@@ -59,9 +61,53 @@ export const NAV: { screen: Screen; label: string; route: Route }[] = [
   { screen: "settings", label: "Settings", route: { screen: "settings", section: "models" } },
 ];
 
+/**
+ * Where a project lives on a screen. The sidebar, the phone menu and the
+ * in-page filter all read this — there is no second list.
+ *
+ * - `slug` — the project page (`/projects/:slug`). A sidebar project opens it.
+ * - `chips` — an in-page chip row, stored as `?project=` (Agents, Team
+ *   overview, the Apps list).
+ * - `picker` — an in-page project picker, stored as `?project=`
+ *   (Settings → Memory).
+ * - `none` — no project scope in the URL or in state.
+ */
+export type ProjectScope = "slug" | "chips" | "picker" | "none";
+
+export function projectScope(route: Route): ProjectScope {
+  switch (route.screen) {
+    case "projects":
+      return "slug";
+    case "agents":
+    case "overview":
+      return "chips";
+    case "apps":
+      return route.project ? "none" : "chips";
+    case "settings":
+      return route.section === "memory" ? "picker" : "none";
+    default:
+      return "none";
+  }
+}
+
+/** Screens that keep `?project=` as a visible in-page filter. */
+export function projectFilter(route: Route): boolean {
+  const scope = projectScope(route);
+  return scope === "chips" || scope === "picker";
+}
+
+/**
+ * The chip row and the memory picker are visible when there is a real
+ * choice: more than one project, or a selected project that would
+ * otherwise filter the page with nothing on screen to say so.
+ */
+export function showProjectChoices(projectCount: number, selected: string): boolean {
+  return projectCount > 1 || (selected !== "all" && selected !== "");
+}
+
 export interface AppLocation {
   route: Route;
-  /** The project scope: the slug on Projects, else `?project=`; "all" when none. */
+  /** The project page's slug, or the in-page filter; "all" when the screen has neither. */
   project: string;
   view: ProjectView;
   openId: string | null;
@@ -192,15 +238,17 @@ export function readLocation(pathname: string, search: string, storedView?: Proj
   const route = matchRoute(pathname);
   const q = new URLSearchParams(search);
   const onProjects = route.screen === "projects";
+  const queried = q.get("project");
   return {
     route,
-    // On an app's detail route the path's project is the scope — the
-    // sidebar highlights it like the slug does on Projects.
+    // The slug is the project on a project page. A filter screen reads
+    // `?project=`. Every other screen ignores it — an app detail's project
+    // lives on the route, not in this scope.
     project: onProjects
       ? (route.slug ?? "all")
-      : route.screen === "apps" && route.project
-        ? route.project
-        : (q.get("project") ?? "all"),
+      : projectFilter(route)
+        ? queried || "all"
+        : "all",
     view: parseView(q.get("view")) ?? storedView ?? "list",
     openId: q.get("issue"),
     filters: onProjects ? readFilters(q) : NO_FILTERS,
@@ -232,10 +280,7 @@ export function locationHref(loc: AppLocation, search = ""): string {
       q.set("view", loc.view);
       writeFilters(q, loc.filters);
     }
-  } else if (
-    loc.project !== "all" &&
-    !(route.screen === "apps" && route.project)
-  ) {
+  } else if (projectFilter(route) && loc.project !== "all") {
     q.set("project", loc.project);
   }
   if (loc.openId) q.set("issue", loc.openId);
@@ -283,13 +328,62 @@ export function legacyRedirect(
   );
 }
 
-/** The location after moving to another screen: scope and drawer come along. */
-export function goTo(current: AppLocation, route: Route): AppLocation {
-  const project = route.screen === "projects" && route.slug ? route.slug : current.project;
-  return { ...current, route, project };
+/** A project worth carrying onto another screen that has a filter or a slug. */
+function carriedProject(current: AppLocation): string {
+  return projectFilter(current.route) || current.route.screen === "projects" ? current.project : "all";
 }
 
-/** The location scoped to another project, staying on the same screen. */
+/** The location after moving to another screen. A filter or a project page
+ *  keeps its project; Home, Wiki, Outbox and the rest of Settings drop it.
+ *  The open issue drawer still comes along. */
+export function goTo(current: AppLocation, route: Route): AppLocation {
+  if (route.screen === "projects") {
+    const slug = route.slug ?? (carriedProject(current) === "all" ? null : carriedProject(current));
+    return {
+      ...current,
+      route: { screen: "projects", slug, section: slug ? route.section : "issues" },
+      project: slug ?? "all",
+    };
+  }
+  if (projectFilter(route)) return { ...current, route, project: carriedProject(current) };
+  return { ...current, route, project: "all" };
+}
+
+/**
+ * Sidebar and the phone menu. Opens that project's page (keeping the
+ * section when already on one). Never filters the screen you are on.
+ */
+export function openProject(current: AppLocation, project: string): AppLocation {
+  const section = current.route.screen === "projects" ? current.route.section : "issues";
+  const slug = project === "all" ? null : project;
+  return {
+    ...current,
+    project: slug ?? "all",
+    route: { screen: "projects", slug, section: slug ? section : "issues" },
+  };
+}
+
+/** The in-page filter. No-op on a screen that has none. */
 export function withProject(current: AppLocation, project: string): AppLocation {
-  return { ...current, project };
+  if (!projectFilter(current.route)) return current;
+  return { ...current, project: project || "all" };
+}
+
+/**
+ * A legacy `?tab=` redirect, or a `?project=` dropped from a screen that
+ * has no project scope. Null when the URL is already canonical.
+ */
+export function scopeRedirect(
+  pathname: string,
+  search: string,
+  storedView?: ProjectView,
+): string | null {
+  const legacy = legacyRedirect(pathname, search, storedView);
+  if (legacy) return legacy;
+  if (!new URLSearchParams(search).has("project")) return null;
+  const loc = readLocation(pathname, search, storedView);
+  if (projectFilter(loc.route) || loc.route.screen === "projects") return null;
+  const next = locationHref(loc, search);
+  const current = pathname + (search ? (search.startsWith("?") ? search : `?${search}`) : "");
+  return next === current ? null : next;
 }

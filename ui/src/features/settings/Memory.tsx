@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError } from "../../lib/api";
+import { showProjectChoices } from "../../lib/router";
 import type { MemoryCard, MemoryDetail } from "../../lib/types";
+import { navigate } from "../../lib/useLocation";
 import Md from "../../ui/Md";
 import { evidenceSuffix, quorumLabel, quorumTone, quorumView } from "./memoryView";
 
@@ -42,9 +44,13 @@ type DetailState = {
 
 export default function Memory({
   project,
+  projects,
+  projectHref,
   onError,
 }: {
   project: string;
+  projects: { key: string }[];
+  projectHref: (key: string) => string;
   onError: (e: unknown, verb: string) => void;
 }) {
   // null = loading; [] = resolved empty (or failed — see listErr).
@@ -124,6 +130,27 @@ export default function Memory({
   return (
     <div className="px-4 lg:px-8 py-4 max-w-[1100px]">
       <div className="flex flex-wrap items-center gap-2 mb-3">
+        {showProjectChoices(projects.length, project) && (
+          <label className="inline-flex items-center gap-2 mr-1">
+            <span className="slabel">project</span>
+            <select
+              className="field !h-7 text-label"
+              aria-label="project"
+              value={project}
+              onChange={(e) => navigate(projectHref(e.target.value), { replace: true })}
+            >
+              <option value="all">All</option>
+              {projects.map((p) => (
+                <option key={p.key} value={p.key}>
+                  {p.key}
+                </option>
+              ))}
+              {project !== "all" && !projects.some((p) => p.key === project) && (
+                <option value={project}>{project}</option>
+              )}
+            </select>
+          </label>
+        )}
         <span className="slabel">status</span>
         {STATUSES.map((s) => (
           <button
