@@ -66,6 +66,7 @@ interface Props {
   agents: AgentsPayload | null;
   readOnly: boolean;
   writeBlock: string | null;
+  kickoffBlock: string | null;
   onWrite: (resp: WriteResp, verb: string) => void;
   onError: (e: unknown, verb: string) => void;
   onOpen: (id: string) => void;
@@ -92,6 +93,9 @@ export default function IssuePage(props: Props) {
     };
   }, [props.id, detail?.rev]);
 
+  const dispatchBlock = props.kickoffBlock ?? (props.readOnly ? props.writeBlock ?? "Writes are off." : null);
+  const kickoffWhy = kickoffBlock(acceptanceItems(detail?.body ?? ""), dispatchBlock);
+
   if (!detail) {
     return (
       <main className="px-4 lg:px-8 py-10" data-issue-page={props.id}>
@@ -105,12 +109,13 @@ export default function IssuePage(props: Props) {
 
   return (
     <>
-      <PageBody {...props} detail={detail} history={history} lane={lane} setKickoff={setKickoff} />
+      <PageBody {...props} detail={detail} history={history} lane={lane} blocked={kickoffWhy} setKickoff={setKickoff} />
       {kickoff && (
         <KickoffDialog
           id={detail.id}
           title={detail.title}
           body={detail.body}
+          blocked={kickoffWhy}
           groups={pmGroups(props.agents)}
           planHref={props.planHref}
           onClose={() => setKickoff(false)}
@@ -137,7 +142,7 @@ function PageBody({
   history,
   lane,
   readOnly,
-  writeBlock,
+  blocked,
   onWrite,
   onError,
   onOpen,
@@ -146,10 +151,10 @@ function PageBody({
   detail: IssueDetail;
   history: IssueHistoryEntry[];
   lane: LanePayload | null;
+  blocked: string | null;
   setKickoff: (open: boolean) => void;
 }) {
   const items = acceptanceItems(detail.body);
-  const blocked = kickoffBlock(items, readOnly ? writeBlock ?? "Writes are off." : null);
   const agents = detail.agents ?? [];
   const askWhy = askAgentReason(agents.length);
   const approveWhy = approveReason(detail.refs);
