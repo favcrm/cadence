@@ -1,0 +1,1219 @@
+#!/usr/bin/env python3
+"""CAD-535: deterministic split of src/main.rs into src/cli/<verb>.rs.
+
+Reads src/main.rs and writes:
+
+  - src/main.rs         — entrypoint only: the `//!` header, `#![cfg_attr]`,
+                          `mod cli;`, `INTENDED_EXIT`,
+                          `install_broken_pipe_exit` and `main()`.
+  - src/cli/mod.rs      — `Cli`, `enum Commands`, the `run()` dispatch
+                          (one thin arm per verb), and every helper more
+                          than one verb uses, promoted to `pub(crate)` so
+                          verb files see them through `use super::*`.
+  - src/cli/<verb>.rs   — one file per top-level subcommand: the match arm
+                          body moved verbatim into `pub(super) fn run`, plus
+                          that verb's `*Action` enum, `run_*` fns and any
+                          helper no other verb references.
+  - src/cli/tests.rs    — the parse-test module, verbatim.
+  - src/cli/split-map.toml — manifest mapping every moved item to its file
+                          (regenerated; do not hand-edit).
+
+Placement of an unclaimed item (helper fn, const, struct, impl) is decided
+by, in order:
+
+  1. PLACE   — explicit assignments in the table below;
+  2. usage   — referenced by exactly one verb's items and by nothing in
+               the shared/core pool, it follows that verb;
+  3. impl    — `impl X` follows wherever `X` lands;
+  4. otherwise the item stays in src/cli/mod.rs.
+
+Every moved item keeps its text verbatim; the only edits are a `pub(super)`
+/`pub(crate)` visibility prefix where a move requires it and the rewritten
+dispatch arms in `run()`. Run from the repo root:
+
+    scripts/split-main            # regenerate
+    scripts/split-main --check    # verify outputs are current
+"""
+
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+SRC = "src/main.rs"
+CLI = "src/cli"
+MANIFEST = "src/cli/split-map.toml"
+
+# --------------------------------------------------------------------------
+# Structural placement — items that are not decided by name/usage rules.
+# --------------------------------------------------------------------------
+
+PLACE = {
+    # main.rs keeps the entrypoint machinery.
+    "main": "main",
+    "install_broken_pipe_exit": "main",
+    "INTENDED_EXIT": "main",
+    "cadence_raise_test_stack": "main",
+    "CADENCE_TEST_STACK": "main",
+    # cli/mod.rs owns the clap surface and the dispatch.
+    "Cli": "mod",
+    "Commands": "mod",
+    "run": "mod",
+    # `cadence agent-uid` dispatches before state-dir resolution (its
+    # `if let` lives in run()), so no arm body pins the enum; home it
+    # with its verb explicitly.
+    "AgentUidAction": "agent_uid",
+}
+
+# A helper with a verb-shaped name (`run_x`) is pinned to that verb without
+# consulting usage.
+VERB_ITEM_RULES = [
+    (re.compile(r"^run_(\w+)$"), lambda m: m.group(1)),
+]
+
+# Trait imports invisible to bound-name analysis (the trait name never
+# appears in the file's text, only its methods do). Filled in from rustc's
+# "consider importing" diagnostics during the compile loop.
+EXTRA_USES = {}
+
+# `use` leaves that are traits must be kept when any of their methods are
+# called — a method call never names the trait. Extend the table if a new
+# trait import appears in the shared use block.
+TRAIT_METHODS = {
+    "std::io::Write": ("write", "write_all", "write_fmt", "flush", "writeln"),
+    "std::io::Read": (
+        "read", "read_to_string", "read_to_end", "read_exact", "bytes",
+        "take", "chain",
+    ),
+    "std::io::BufRead": (
+        "fill_buf", "consume", "read_until", "read_line", "split", "lines",
+        "has_data_left",
+    ),
+}
+
+# rustc is authoritative on unused imports: a trait leaf can be kept by
+# method-name evidence that really resolved to an inherent method (e.g.
+# `str::lines`). Listing the leaf here removes it from that file so the
+# generated tree stays warning-free and the next run regenerates it.
+DROP_USES = {
+    # The Doctor variant's `json: bool` field is a bare `json` — not a
+    # use of the `serde_json::json!` macro.
+    "src/cli/agent_uid.rs": ("serde_json::json",),
+}
+
+# --------------------------------------------------------------------------
+# Lexer: mask comments, strings and char literals so brace tracking is safe.
+# --------------------------------------------------------------------------
+
+def mask(src):
+    out = list(src)
+    i, n = 0, len(src)
+    while i < n:
+        c = src[i]
+        if src.startswith("//", i):
+            j = src.find("\n", i)
+            j = n if j < 0 else j
+            for k in range(i, j):
+                out[k] = " "
+            i = j
+        elif src.startswith("/*", i):
+            j = src.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            for k in range(i, j):
+                if src[k] != "\n":
+                    out[k] = " "
+            i = j
+        elif c == "r" and i + 1 < n and src[i + 1] in '"#':
+            m = re.match(r'r(#+)"', src[i:])
+            if m:
+                hashes = m.group(1)
+                end = '"' + hashes
+                j = src.find(end, i + len(hashes) + 2)
+                j = n if j < 0 else j + len(end)
+            else:
+                j = src.find('"', i + 2)
+                j = n if j < 0 else j + 1
+            for k in range(i, j):
+                if src[k] != "\n":
+                    out[k] = " "
+            i = j
+        elif c == '"':
+            j = i + 1
+            while j < n:
+                if src[j] == "\\":
+                    j += 2
+                    continue
+                if src[j] == '"':
+                    j += 1
+                    break
+                j += 1
+            for k in range(i, min(j, n)):
+                if src[k] != "\n":
+                    out[k] = " "
+            i = j
+        elif c == "'":
+            m = re.match(r"'(\\.|[^\\'])'", src[i:])
+            if m:
+                for k in range(i, i + m.end()):
+                    out[k] = " "
+                i += m.end()
+            else:
+                i += 1
+        else:
+            i += 1
+    return "".join(out)
+
+
+def depth_map(masked):
+    lines = masked.split("\n")
+    depths = []
+    d = 0
+    for ln in lines:
+        depths.append(d)
+        d += ln.count("{") - ln.count("}")
+    return depths
+
+
+# --------------------------------------------------------------------------
+# Top-level item scan.
+# --------------------------------------------------------------------------
+
+# The ABI string in `extern "C"` is blanked by the mask before this runs,
+# so the optional ABI token must tolerate whitespace-only text.
+ITEM_START = re.compile(
+    r"^(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?"
+    r"(?:extern\s+(?:\"[A-Za-z]+\"\s+)?)?"
+    r"(fn|enum|struct|const|static|type|impl|mod|trait|use|macro_rules!)\b"
+)
+ITEM_HEAD = re.compile(r"(fn|enum|struct|const|static|type|impl|mod|trait)\b")
+
+
+def item_name(kind, masked_head, masked_body):
+    if kind == "use":
+        return None
+    if kind == "impl":
+        m = re.search(r"\bimpl\b(?:\s*<[^>]*>)?\s+([A-Za-z_]\w*)", masked_body)
+        return m.group(1) if m else None
+    m = re.search(rf"\b{kind}\s+([A-Za-z_]\w*)", masked_head)
+    return m.group(1) if m else None
+
+
+def scan_items(src, masked):
+    lines = src.split("\n")
+    mlines = masked.split("\n")
+    depths = depth_map(masked)
+    items = []
+    i, n = 0, len(lines)
+    while i < n:
+        ml = mlines[i].strip()
+        if depths[i] == 0 and mlines[i] == mlines[i].lstrip() and ITEM_START.match(ml):
+            kind = ITEM_START.match(ml).group(1)
+            # preamble: everything since the previous item's end, minus
+            # leading blank lines — keeps multi-line #[...] attrs, doc
+            # comments and section banners attached to their item, and
+            # loses no text.
+            prev_end = items[-1]["end"] if items else -1
+            block_start = prev_end + 1
+            while block_start < i and lines[block_start].strip() == "":
+                block_start += 1
+            # item end
+            if kind in ("use", "static", "const", "type"):
+                # `;` terminator at top bracket depth — a `;` inside
+                # `[T; N]` array types or `(...)` does not end the item.
+                end = i
+                da = db = dc = 0
+                while True:
+                    for ch in mlines[end]:
+                        if ch == "(":
+                            db += 1
+                        elif ch == ")":
+                            db -= 1
+                        elif ch == "[":
+                            dc += 1
+                        elif ch == "]":
+                            dc -= 1
+                        elif ch == "{":
+                            da += 1
+                        elif ch == "}":
+                            da -= 1
+                        elif ch == ";" and da == db == dc == 0:
+                            break
+                    else:
+                        end += 1
+                        continue
+                    break
+            else:
+                d = 0
+                end = i
+                opened = False
+                for jj in range(i, n):
+                    d += mlines[jj].count("{") - mlines[jj].count("}")
+                    if "{" in mlines[jj]:
+                        opened = True
+                    if opened and d == 0:
+                        end = jj
+                        break
+                    if not opened and ";" in mlines[jj]:
+                        end = jj
+                        break
+            name = item_name(kind, ml, "\n".join(mlines[i : end + 1]))
+            items.append(
+                {
+                    "kind": kind,
+                    "name": name,
+                    "start": block_start,
+                    "code": i,
+                    "end": end,
+                    "text": "\n".join(lines[block_start : end + 1]),
+                }
+            )
+            i = end + 1
+        else:
+            i += 1
+    return items
+
+
+# --------------------------------------------------------------------------
+# enum Commands → ordered [(variant, [(field, type)])]
+# --------------------------------------------------------------------------
+
+def top_offsets(masked_s, sep=","):
+    """Indices of top-level `sep` chars in a comment/string-masked string."""
+    out, da, db, dc, dd = [], 0, 0, 0, 0
+    for idx, ch in enumerate(masked_s):
+        if ch == "{":
+            dd += 1
+        elif ch == "}":
+            dd -= 1
+        elif ch == "<":
+            da += 1
+        elif ch == ">":
+            da -= 1
+        elif ch == "(":
+            db += 1
+        elif ch == ")":
+            db -= 1
+        elif ch == "[":
+            dc += 1
+        elif ch == "]":
+            dc -= 1
+        elif ch == sep and da == db == dc == dd == 0:
+            out.append(idx)
+    return out
+
+
+def split_pair(real, masked, sep=","):
+    """Split `real` at top-level `sep` positions found in `masked`."""
+    offs = top_offsets(masked, sep)
+    parts = []
+    last = 0
+    for o in offs:
+        parts.append(real[last:o])
+        last = o + 1
+    parts.append(real[last:])
+    return parts
+
+
+def split_top(s):
+    """Split s on top-level ',', tracking <> () [] depth."""
+    return [p for p in split_pair(s, s) if p.strip()]
+
+
+def strip_attrs(seg):
+    s = seg.strip()
+    while True:
+        if s.startswith("//"):
+            nl = s.find("\n")
+            s = "" if nl < 0 else s[nl + 1 :].lstrip()
+            continue
+        if s.startswith("#"):
+            i = s.find("[")
+            d = 0
+            j = i
+            while j < len(s):
+                if s[j] == "[":
+                    d += 1
+                elif s[j] == "]":
+                    d -= 1
+                    if d == 0:
+                        break
+                j += 1
+            s = s[j + 1 :].lstrip()
+            continue
+        return s
+
+
+def braced_region(masked_text, open_idx):
+    """Return (inner_start, inner_end) for the block opened at open_idx."""
+    d = 0
+    j = open_idx
+    while j < len(masked_text):
+        if masked_text[j] == "{":
+            d += 1
+        elif masked_text[j] == "}":
+            d -= 1
+            if d == 0:
+                return open_idx + 1, j
+        j += 1
+    raise SystemExit("unbalanced braces")
+
+
+def parse_variants(item_text, masked_text):
+    i = masked_text.find("{")
+    is_, ie = braced_region(masked_text, i)
+    inner, inner_m = item_text[is_:ie], masked_text[is_:ie]
+    # segments split at masked top-level commas; real text sliced by offset.
+    offs = top_offsets(inner_m)
+    segs, segs_m, last = [], [], 0
+    for o in offs:
+        segs.append(inner[last:o])
+        segs_m.append(inner_m[last:o])
+        last = o + 1
+    segs.append(inner[last:])
+    segs_m.append(inner_m[last:])
+    variants = []
+    for seg, seg_m in zip(segs, segs_m):
+        # skip leading #[...] attrs in the masked segment before the name
+        off = 0
+        while True:
+            sm = seg_m[off:].lstrip()
+            lead = len(seg_m[off:]) - len(sm)
+            if sm.startswith("#["):
+                i = 1
+                d = 0
+                while i < len(sm):
+                    if sm[i] == "[":
+                        d += 1
+                    elif sm[i] == "]":
+                        d -= 1
+                        if d == 0:
+                            break
+                    i += 1
+                off += lead + i + 1
+                continue
+            off += lead
+            break
+        m = re.search(r"([A-Z]\w*)", seg_m[off:])
+        if not m:
+            continue
+        s = off + m.start()
+        name = seg[s : off + m.end()]
+        rest, rest_m = seg[off + m.end() :], seg_m[off + m.end() :]
+        if "(" in rest_m.split("{")[0] and "{" not in rest_m:
+            raise SystemExit(f"tuple variant {name} unsupported")
+        fields = []
+        if "{" in rest_m:
+            fb = rest[rest_m.find("{") + 1 : rest_m.rfind("}")]
+            fb_m = rest_m[rest_m.find("{") + 1 : rest_m.rfind("}")]
+            for fseg in split_pair(fb, fb_m):
+                fseg2 = strip_attrs(fseg)
+                if not fseg2.strip():
+                    continue
+                fm = re.match(r"(\w+)\s*:\s*(.+)", fseg2.strip(), re.S)
+                if not fm:
+                    raise SystemExit(f"unparsed field in {name}: {fseg2!r}")
+                fields.append((fm.group(1), " ".join(fm.group(2).split())))
+        variants.append((name, fields))
+    return variants
+
+
+# --------------------------------------------------------------------------
+# fn run → head text + [(variant, bound_names, body_text)] + tail
+# --------------------------------------------------------------------------
+
+def parse_run(item_text, masked_text, variant_names):
+    mi = masked_text.find("match cli.command")
+    if mi < 0:
+        raise SystemExit("no `match cli.command` in fn run")
+    bi = masked_text.find("{", mi)
+    is_, ie = braced_region(masked_text, bi)
+    head = item_text[:mi]
+    match_inner, match_inner_m = item_text[is_:ie], masked_text[is_:ie]
+    tail = item_text[ie + 1 :]
+    arms = []
+    idx, mlen = 0, len(match_inner_m)
+    while True:
+        m = re.search(r"Commands::([A-Z]\w*)", match_inner_m[idx:])
+        if not m:
+            break
+        raw_start = idx  # keep the arm's preceding comment/blank lines
+        vstart = idx + m.start()
+        vname = m.group(1)
+        # find `=>` at rel depth 0
+        d, k = 0, vstart
+        while k < mlen:
+            ch = match_inner_m[k]
+            if ch in "{([":
+                d += 1
+            elif ch in "})]":
+                d -= 1
+            elif d == 0 and match_inner_m.startswith("=>", k):
+                break
+            k += 1
+        pat = match_inner[vstart:k]
+        bstart = k + 2
+        k2 = bstart
+        while k2 < mlen and match_inner_m[k2] in " \t\n":
+            k2 += 1
+        if k2 < mlen and match_inner_m[k2] == "{":
+            bs, be = braced_region(match_inner_m, k2)
+            body = match_inner[bs:be]
+            k = be + 1
+            if k < mlen and match_inner_m[k] == ",":
+                k += 1
+        else:
+            k = k2
+            d = 0
+            while k < mlen:
+                ch = match_inner_m[k]
+                if ch in "{([":
+                    d += 1
+                elif ch in "})]":
+                    d -= 1
+                elif d == 0 and ch == ",":
+                    break
+                k += 1
+            body = match_inner[k2:k]
+            k += 1
+        bound = {}
+        if "{" in pat:
+            pin = pat[pat.find("{") + 1 : pat.rfind("}")]
+            for fs in split_pair(pin, mask(" ".join(pin.split("\n")))):
+                fs = fs.strip()
+                if not fs or fs == "..":
+                    continue
+                if ":" in fs:
+                    fn, fv = fs.split(":", 1)
+                    fv = fv.strip()
+                    if re.match(r"^\w+$", fv):
+                        bound[fn.strip()] = ("bind", fv)
+                    elif fv == "_":
+                        bound[fn.strip()] = ("wild", None)
+                    else:
+                        bound[fn.strip()] = ("pat", fv)
+                else:
+                    bound[fs] = ("bind", fs)
+        # A bindless arm (`{ .. }`) carries no verb state — e.g. the
+        # `agent-uid` placeholder that is dispatched before the state
+        # dir resolves. Keep such arms verbatim in mod.rs: there is no
+        # body to lift, and its comment explains the ordering.
+        arms.append(
+            {
+                "v": vname,
+                "body": body,
+                "bound": bound,
+                "pat": pat.strip(),
+                "inline": not bound,
+                "raw": match_inner[raw_start:k],
+            }
+        )
+        idx = k
+    seen = {a["v"] for a in arms}
+    missing = set(variant_names) - seen
+    if missing:
+        raise SystemExit(f"variants without arms: {sorted(missing)}")
+    return head, arms, tail
+
+
+# --------------------------------------------------------------------------
+# use-line bound-name extraction.
+# --------------------------------------------------------------------------
+
+def use_bindings(u):
+    """'use a::b::{c, d::e, self, f as g};' → [(name, full-path)]."""
+    s = u.strip()
+    assert s.startswith("use ") and s.endswith(";"), u
+    s = s[4:-1].strip()
+
+    def join(a, b):
+        if not a:
+            return b
+        return a + "::" + b.rstrip(":")
+
+    def rec(prefix, node):
+        node = node.strip()
+        if node == "self":
+            yield prefix.rsplit("::", 1)[-1], prefix
+            return
+        if node == "*":
+            yield "*", prefix + "::*"
+            return
+        m = re.match(r"([\w:]+)\s+as\s+(\w+)$", node)
+        if m:
+            yield m.group(2), join(prefix, m.group(1))
+            return
+        if "{" in node:
+            head, rest = node.split("{", 1)
+            inner = rest.rsplit("}", 1)[0]
+            for part in split_top(inner):
+                yield from rec(join(prefix, head.strip().rstrip(":")), part)
+            return
+        yield node.rsplit("::", 1)[-1], join(prefix, node)
+
+    return list(rec("", s))
+
+
+# --------------------------------------------------------------------------
+# Assemble.
+# --------------------------------------------------------------------------
+
+def snake(name):
+    s = re.sub(r"([A-Z]+)(?=[A-Z][a-z])", r"\1_", name)
+    s = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", s)
+    return s.lower()
+
+
+def dedent(text, to_col):
+    lines = text.split("\n")
+    ind = min((len(ln) - len(ln.lstrip()) for ln in lines if ln.strip()), default=0)
+    out = [" " * to_col + ln[ind:] if ln.strip() else "" for ln in lines]
+    return "\n".join(out).strip("\n")
+
+
+def add_vis(text, vis):
+    """Prepend `vis` (e.g. 'pub(crate)') to the item's first code line."""
+    lines = text.split("\n")
+    for i, ln in enumerate(lines):
+        if re.match(r"^(fn|enum|struct|const|static|type|mod)\b", ln):
+            if not ln.startswith("pub"):
+                lines[i] = f"{vis} {ln}"
+            break
+    return "\n".join(lines)
+
+
+def rustfmt(text):
+    """Format emitted Rust the way `cargo fmt` will, so generated files are
+    fmt-clean the moment they land (and `--check` compares the formatted
+    form)."""
+    try:
+        p = subprocess.run(
+            ["rustfmt", "--edition", "2021", "--emit", "stdout"],
+            input=text,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        raise SystemExit("rustfmt not found on PATH")
+    if p.returncode != 0:
+        raise SystemExit("rustfmt failed on generated output:\n" + p.stderr)
+    return p.stdout
+
+
+def check_consistency():
+    """Post-split `--check`: verify each generated file still carries the
+    top-level items its manifest section lists (byte-regeneration needs
+    the pre-split main.rs, which the split consumed)."""
+    if not Path(MANIFEST).exists():
+        raise SystemExit(f"{MANIFEST} missing — run scripts/split-main")
+    manifest = {}
+    stem = None
+    for line in Path(MANIFEST).read_text().split("\n"):
+        line = line.strip()
+        if line.startswith("[") and line.endswith("]"):
+            stem = line[1:-1]
+            manifest[stem] = []
+        elif line.startswith("items = [") and stem is not None:
+            for m in re.finditer(r'"([^"]+)"', line):
+                manifest[stem].append(m.group(1))
+    bad = []
+    expected_files = {SRC} | {
+        f"{CLI}/{s}.rs" for s in manifest if s not in ("tests", "main")
+    }
+    for s in manifest:
+        if s == "tests":
+            path = f"{CLI}/tests.rs"
+            expected_files.add(path)
+        elif s == "main":
+            path = SRC
+        else:
+            path = f"{CLI}/{s}.rs"
+        if not Path(path).exists():
+            bad.append(f"missing: {path}")
+            continue
+        text = Path(path).read_text()
+        found = {
+            it["name"]
+            for it in scan_items(text, mask(text))
+            if it["name"] and it["kind"] != "mod"
+        }
+        want = {n for n in manifest[s] if not n.startswith("<")}
+        if "run(dispatch arm)" in manifest[s]:
+            want.discard("run(dispatch arm)")
+            want.add("run")
+        if found - want:
+            bad.append(f"{path}: unlisted items {sorted(found - want)}")
+        if want - found:
+            bad.append(f"{path}: missing items {sorted(want - found)}")
+    extra = [
+        str(p)
+        for p in Path(CLI).glob("*.rs")
+        if str(p) not in expected_files
+    ]
+    bad += [f"extra: {p}" for p in extra]
+    if bad:
+        print("\n".join(sorted(bad)))
+        sys.exit(1)
+    print("split-main: generated tree consistent with manifest")
+
+
+def main():
+    check = "--check" in sys.argv
+    src = Path(SRC).read_text()
+    masked = mask(src)
+    items = scan_items(src, masked)
+    if not items:
+        raise SystemExit("no items parsed")
+
+    line_starts = [0] + [m.end() for m in re.finditer("\n", src)]
+    # The crate preamble — `//!` docs, the CAD-308 spawn note and
+    # `#![cfg_attr(test, …)]` — belongs to main.rs. The first item's
+    # block start is 0 (it *includes* the preamble), so slice to its
+    # code line instead; the preamble would otherwise ride the first
+    # item's text and vanish with it.
+    header = src[: line_starts[items[0]["code"]]].rstrip("\n") + "\n"
+    if items[0]["start"] < items[0]["code"]:
+        # Keep the invariant that every source line appears exactly
+        # once: the preamble is now the header, not the item's.
+        items[0]["start"] = items[0]["code"]
+        items[0]["text"] = "\n".join(
+            src.split("\n")[items[0]["code"] : items[0]["end"] + 1]
+        )
+
+    by_name, uses = {}, []
+    for it in items:
+        if it["kind"] == "use":
+            uses.append(it)
+        elif it["name"]:
+            by_name.setdefault(it["name"], []).append(it)
+        else:
+            raise SystemExit(f"unnamed {it['kind']} at line {it['code'] + 1}")
+
+    if "Commands" not in by_name:
+        # src/main.rs is already the generated skeleton — nothing left to
+        # split. `--check` still has a job: prove every manifest entry is
+        # present in its file and no unlisted top-level item crept in.
+        if not check:
+            raise SystemExit(
+                f"{SRC} already split (no `Commands` enum); restore the "
+                "pre-split main.rs from the base commit to regenerate."
+            )
+        check_consistency()
+        return
+    commands = by_name["Commands"][0]
+    cmd_masked = "\n".join(masked.split("\n")[commands["start"] : commands["end"] + 1])
+    variants = parse_variants(commands["text"], cmd_masked)
+    verbs = {v: snake(v) for v, _ in variants}
+    ftypes = {v: dict(flds) for v, flds in variants}
+
+    run_it = by_name["run"][0]
+    run_masked = "\n".join(masked.split("\n")[run_it["start"] : run_it["end"] + 1])
+    head, arms, tail = parse_run(
+        run_it["text"], run_masked, [v for v, _ in variants]
+    )
+    if tail.strip() != "}":
+        raise SystemExit(f"unexpected code after match in run(): {tail[:80]!r}")
+
+    # ---------------- classify items ----------------
+    files = {
+        stem: {"items": [], "arms": [], "variant": v}
+        for v, stem in verbs.items()
+    }
+    arms_by_v = {}
+    for a in arms:
+        arms_by_v.setdefault(a["v"], []).append(a)
+    for v, va in arms_by_v.items():
+        files[verbs[v]]["arms"] = va
+
+    mod_items, main_items = [], []
+    tests_text = None
+    test_item = None
+    for it in items:
+        if it["kind"] == "mod" and it["name"] == "tests":
+            inner = it["text"]
+            bi = inner.find("{")
+            tests_text = inner[bi + 1 : inner.rfind("}")]
+            test_item = it
+
+    # --- home resolution via the referencer graph ---
+    # home(item) ∈ {'main', 'mod', 'tests', <verb stem>}. Seed homes come
+    # from PLACE and the name rules; every other item lands in the single
+    # file whose contents reference it, or 'mod' when references span
+    # files (or nothing references it).
+    def seed_home(it):
+        n = it["name"]
+        if n in PLACE:
+            return PLACE[n]
+        if it is test_item:
+            return "tests"
+        m = re.match(r"(\w+?)(Action|Cmd)$", n or "")
+        if it["kind"] == "enum" and m and snake(m.group(1)) in verbs.values():
+            return snake(m.group(1))
+        for rx, get in VERB_ITEM_RULES:
+            mm = rx.match(n or "")
+            if mm and get(mm) in verbs.values():
+                return get(mm)
+        return None
+
+    home = {
+        id(it): seed_home(it)
+        for it in items
+        if it["kind"] != "use" and it["name"]
+    }
+    # name-reference scans run on masked text (comments/strings blanked) —
+    # a name inside a doc comment or string literal is not a reference.
+    texts = {id(it): mask(it["text"]) for it in items if it["kind"] != "use"}
+    by_id = {id(it): it for it in items}
+
+    def refs(text, name):
+        return len(re.findall(rf"\b{re.escape(name)}\b", text))
+
+    # arm bodies + variant field types anchor references to their verb
+    arm_text = {
+        verbs[v]: mask(
+            "\n".join(a["body"] for a in files[verbs[v]]["arms"])
+            + "\n"
+            + " ".join(ty for _, ty in flds)
+        )
+        for v, flds in variants
+    }
+    core_text = mask((tests_text or "") + "\n" + head)
+
+    def referencers(name, exclude_id):
+        out = set()
+        for iid, t in texts.items():
+            if iid == exclude_id:
+                continue
+            it = by_id[iid]
+            if it["kind"] == "impl" and it["name"] == name:
+                continue  # `impl X` follows X's home, never anchors it
+            if refs(t, name):
+                out.add(iid)
+        for stem, t in arm_text.items():
+            if refs(t, name):
+                out.add(("arm", stem))
+        if refs(core_text, name):
+            out.add(("core",))
+        return out
+
+    def key_home(k):
+        if k == ("core",):
+            return "mod"
+        if isinstance(k, tuple):
+            return k[1]
+        return home.get(k)
+
+    def fixpoint():
+        moved = True
+        while moved:
+            moved = False
+            for it in items:
+                iid = id(it)
+                if it["kind"] in ("use", "impl") or home.get(iid) is not None:
+                    continue
+                rs = referencers(it["name"], iid)
+                hs = {key_home(k) for k in rs}
+                pending = any(key_home(k) is None for k in rs)
+                hs.discard(None)
+                if len(hs) > 1 or (len(hs) == 0 and not rs):
+                    home[iid] = "mod"
+                    moved = True
+                elif len(hs) == 1 and not pending:
+                    home[iid] = next(iter(hs))
+                    moved = True
+                # pending referencers: defer to a later pass
+
+    fixpoint()
+    # impls follow their type's home; then re-run for deferred items.
+    for it in items:
+        if it["kind"] == "impl" and it["name"] and home.get(id(it)) is None:
+            th = next(
+                (
+                    home.get(id(o))
+                    for o in items
+                    if o["name"] == it["name"] and o["kind"] != "impl"
+                ),
+                None,
+            )
+            home[id(it)] = th or "mod"
+    fixpoint()
+    # unresolvable cycles / deferred → shared module.
+    for iid, h in home.items():
+        if h is None:
+            home[iid] = "mod"
+
+    for it in items:
+        h = home.get(id(it))
+        if it["kind"] == "use" or h is None or h == "tests":
+            continue
+        (main_items if h == "main" else mod_items if h == "mod"
+         else files[h]["items"]).append(it)
+
+    # keep each file's items in original source order
+    main_items.sort(key=lambda i: i["code"])
+    mod_items.sort(key=lambda i: i["code"])
+    for stem in files:
+        files[stem]["items"].sort(key=lambda i: i["code"])
+
+    # name → homes map for cross-file imports
+    name_homes = {}
+    for it in items:
+        if it["kind"] == "use" or not it["name"] or it["kind"] == "impl":
+            continue
+        name_homes.setdefault(it["name"], set()).add(home.get(id(it)))
+
+    # ---------------- use lines ----------------
+    bindings = []
+    for u in uses:
+        bindings += use_bindings(u["text"].strip().split("\n")[-1])
+
+    def bare(name, text):
+        """A leaf survives only when its bound name occurs as a *bare*
+        identifier — `Arc` inside `std::sync::Arc::new` does not need
+        `use std::sync::Arc`."""
+        return re.search(r"(?<![\w:.])" + re.escape(name) + r"\b", text)
+
+    def bound_name(line):
+        """`use a::b;` binds `b`; `use a::b as c;` binds `c`."""
+        s = line[len("use ") : -1]
+        if " as " in s:
+            return s.rsplit(" as ", 1)[1].strip()
+        if s.endswith("::*"):
+            return None
+        return s.rsplit("::", 1)[-1].strip()
+
+    def uses_for(text, stem=None, path=None):
+        text = mask(text)
+        out = []
+        for name, use_path in bindings:
+            if name == "*":
+                keep = True
+            else:
+                keep = bool(bare(name, text))
+            if not keep:
+                # Trait leaves additionally survive on method-call
+                # (`.m(`) or macro (`m!`) evidence, since a method call
+                # never names its trait; that test can over-keep when the
+                # call resolves to an inherent method, and the residual is
+                # listed in DROP_USES.
+                meths = TRAIT_METHODS.get(use_path)
+                keep = bool(meths) and any(
+                    re.search(
+                        r"\." + re.escape(m) + r"\s*\(|\b" + re.escape(m)
+                        + r"\s*!",
+                        text,
+                    )
+                    for m in meths
+                )
+            if keep:
+                leaf = use_path.rsplit("::", 1)[-1]
+                line = (
+                    f"use {use_path};"
+                    if leaf == name
+                    else f"use {use_path} as {name};"
+                )
+                if line not in out:
+                    out.append(line)
+        for x in EXTRA_USES.get(stem or "", []):
+            line = f"use {x};"
+            if line not in out:
+                out.append(line)
+        drop = set(DROP_USES.get(path or "", ()))
+        return [
+            u
+            for u in out
+            if u[len("use "):-1].split(" as ")[0] not in drop
+        ]
+
+    def cross_uses(text, my_stem):
+        """Imports for names whose home is another generated file.
+
+        mod.rs gets `use <verb>::<Name>`; a verb file gets
+        `use super::<sib>::<Name>` for a sibling item and `use crate::<n>`
+        for a main.rs item. Names living in mod.rs are covered by the
+        verb file's `use super::*` and names with multiple homes are
+        either defined locally or reachable via the glob.
+        """
+        text = mask(text)
+        out = []
+        for n, homes in sorted(name_homes.items()):
+            if len(homes) != 1:
+                continue
+            h = next(iter(homes))
+            if h in (None, "tests", my_stem):
+                continue
+            if not bare(n, text):
+                continue
+            if my_stem == "mod" and h != "main":
+                out.append(f"use {h}::{n};")
+            elif my_stem != "mod" and h == "main":
+                out.append(f"use crate::{n};")
+            elif my_stem != "mod" and h != "mod":
+                out.append(f"use super::{h}::{n};")
+            # h == 'mod' inside a verb file → `use super::*` covers it
+        return out
+
+    # ---------------- emit ----------------
+    out = {}
+
+    # src/main.rs — header + uses + `mod cli;` + kept items.
+    kept = "\n\n".join(i["text"] for i in main_items)
+    main_uses = uses_for(kept)
+    mtxt = header
+    if main_uses:
+        mtxt += "\n" + "\n".join(main_uses) + "\n"
+    mtxt += "\nmod cli;\n\n" + kept + "\n"
+    mtxt = re.sub(r"\brun\(\)", "cli::run()", mtxt)
+    if "cli::run()" not in mtxt:
+        raise SystemExit("main() does not dispatch through run()")
+    out[SRC] = mtxt
+
+    # src/cli/mod.rs — decls + uses + Cli/Commands/dispatch/shared helpers.
+    mod_decl = "".join(f"mod {stem};\n" for stem in verbs.values())
+    new_arms = []
+    for v, flds in variants:
+        if all(a["inline"] for a in arms_by_v[v]):
+            # No state to lift (e.g. the pre-state-dir `agent-uid`
+            # placeholder) — keep the original arm and its comment.
+            new_arms.append(dedent(arms_by_v[v][0]["raw"], 8))
+            continue
+        if flds:
+            pat = " { " + ", ".join(f for f, _ in flds) + " }"
+            args = "".join(", " + f for f, _ in flds)
+        else:
+            pat, args = "", ""
+        new_arms.append(
+            f"        Commands::{v}{pat} => {verbs[v]}::run(state_dir{args}),"
+        )
+    head_sig = "\n".join(masked.split("\n")[run_it["start"] : run_it["end"] + 1])
+    sig_i = head_sig.find("{", head_sig.find("fn run"))
+    run_head_body = head[sig_i + 1 :]
+    run_new = (
+        "pub(crate) fn run() -> Result<i32> {\n"
+        + dedent(run_head_body, 4)
+        + "\n    match cli.command {\n"
+        + "\n".join(new_arms)
+        + "\n    }\n}\n"
+    )
+    mod_body_parts = []
+    for it in mod_items:
+        mod_body_parts.append(run_new if it["name"] == "run" else it["text"])
+    mod_body = "\n\n".join(add_vis(t, "pub(crate)") for t in mod_body_parts)
+    # verb-file items mod.rs names in signatures must be at least as
+    # visible as the pub(crate) items that expose them.
+    mod_text_m = mask(mod_body)
+    mod_needs = {
+        n
+        for n, homes in name_homes.items()
+        if len(homes) == 1
+        and next(iter(homes)) in set(verbs.values())
+        and re.search(rf"\b{re.escape(n)}\b", mod_text_m)
+    }
+    mod_uses = uses_for(mod_body, "mod", f"{CLI}/mod.rs") + cross_uses(
+        mod_body, "mod"
+    )
+    # Every name mod.rs binds — its own `use` leaves plus the verb-file
+    # imports it declares — reaches a verb file through `use super::*`,
+    # so a file carrying the glob must not re-import those names.
+    covered = {bound_name(u) for u in mod_uses} - {None}
+    m2 = (
+        "// CAD-535: CLI surface — clap definitions, dispatch, shared helpers.\n"
+        "// All code here is moved verbatim from src/main.rs.\n\n"
+        + mod_decl
+        + "#[cfg(test)]\nmod tests;\n\n"
+    )
+    if mod_uses:
+        m2 += "\n".join(dict.fromkeys(mod_uses)) + "\n\n"
+    m2 += mod_body + "\n"
+    out[f"{CLI}/mod.rs"] = m2
+
+    # src/cli/<verb>.rs
+    manifest = {
+        "main": [i["name"] for i in main_items],
+        "mod": [i["name"] for i in mod_items],
+    }
+    for vname, stem in verbs.items():
+        f = files[stem]
+        flds = ftypes[vname]
+        var_arms = f["arms"]
+        if all(a["inline"] for a in var_arms):
+            # The verb dispatches outside the match (its arm stays in
+            # mod.rs) — the file carries only the verb's items.
+            item_txts = [
+                add_vis(
+                    i["text"],
+                    "pub(crate)" if i["name"] in mod_needs else "pub(super)",
+                )
+                for i in f["items"]
+            ]
+            body_all = "\n\n".join(item_txts)
+            body_m = mask(body_all)
+            needs_glob = any(
+                "mod" in homes and bare(n, body_m)
+                for n, homes in name_homes.items()
+            )
+            fu = uses_for(body_all, stem, f"{CLI}/{stem}.rs") + cross_uses(
+                body_all, stem
+            )
+            if needs_glob:
+                fu = [u for u in fu if bound_name(u) not in covered]
+            ftxt = (
+                f"//! CAD-535: `cadence {stem.replace('_', '-')}` — "
+                "moved verbatim from src/main.rs. The verb dispatches in\n"
+                "//! `run()` before state-dir resolution, so its arm stays "
+                "there; this file carries its items.\n"
+            )
+            if needs_glob:
+                ftxt += "\nuse super::*;\n"
+            if fu:
+                ftxt += "\n" + "\n".join(dict.fromkeys(fu)) + "\n"
+            ftxt += ("\n" + body_all if body_all else "") + "\n"
+            out[f"{CLI}/{stem}.rs"] = ftxt
+            manifest[stem] = [i["name"] for i in f["items"]]
+            continue
+        if len(var_arms) == 1:
+            bound = var_arms[0]["bound"]
+            pats = [(fn_, b[1]) for fn_, b in bound.items() if b[0] == "pat"]
+            body = dedent(var_arms[0]["body"], 4 + 8 * len(pats))
+            # subpattern-bound fields (e.g. `action: ThreadAction::Show{..}`)
+            # re-bind via a nested match — `let-else` would trip
+            # irrefutable-let-pattern warnings on single-variant enums.
+            for fn_, subpat in reversed(pats):
+                ind = " " * (4 + 8 * (len(pats) - 1 - list(x[0] for x in pats).index(fn_)))
+                body = (
+                    f"{ind}match {fn_} {{\n"
+                    f"{ind}    {subpat} => {{\n"
+                    + body
+                    + f"\n{ind}    }}\n{ind}}}"
+                )
+        elif len(var_arms) == 2:
+            # A variant dispatched twice (e.g. `action: Some(_)` vs
+            # `action: None`): re-create the discrimination inside run()
+            # by re-matching the differing field.
+            discriminants = []
+            for fn_ in flds:
+                b0 = var_arms[0]["bound"].get(fn_, ("wild", None))
+                b1 = var_arms[1]["bound"].get(fn_, ("wild", None))
+                if b0 != b1 and (b0[0] == "pat" or b1[0] == "pat"):
+                    discriminants.append((fn_, b0, b1))
+            if len(discriminants) != 1:
+                raise SystemExit(
+                    f"{vname}: {len(discriminants)} discriminating fields"
+                )
+            fn_, (k0, v0), (k1, v1) = discriminants[0]
+            p0 = v0 if k0 in ("pat", "bind") else "_"
+            p1 = v1 if k1 in ("pat", "bind") else "_"
+            body = (
+                f"    match {fn_} {{\n"
+                f"        {p0} => {{\n"
+                + dedent(var_arms[0]["body"], 12)
+                + "\n        }\n"
+                f"        {p1} => {{\n"
+                + dedent(var_arms[1]["body"], 12)
+                + "\n        }\n"
+                "    }"
+            )
+            bound = {}
+        else:
+            raise SystemExit(f"{vname}: {len(var_arms)} arms")
+        params = []
+        for fn_, ty in flds.items():
+            bn = bound.get(fn_)
+            if len(var_arms) > 1 or bn is None or bn[0] == "pat" or (
+                bn[0] == "bind" and bn[1] == fn_
+            ):
+                pn = fn_
+            elif bn[0] == "wild":
+                pn = "_" + fn_
+            else:
+                pn = bn[1]
+            params.append(f"{pn}: {ty}")
+        # state_dir moves by value (each dispatch arm is exclusive); bodies
+        # keep `&state_dir` verbatim, coercing &PathBuf → &Path as before.
+        sd = "state_dir" if re.search(r"\bstate_dir\b", body) else "_state_dir"
+        sig = f"pub(super) fn run({sd}: PathBuf" + "".join(
+            ", " + p for p in params
+        ) + ") -> Result<i32> {"
+        # A variant's fields arrive as one parameter list — the original
+        # was a match arm with no signature, so clippy's 7-arg lint never
+        # applied to it.
+        if len(params) + 1 > 7:
+            sig = "#[allow(clippy::too_many_arguments)]\n" + sig
+        run_fn = sig + "\n" + body + "\n}\n"
+        item_txts = [
+            add_vis(
+                i["text"],
+                "pub(crate)" if i["name"] in mod_needs else "pub(super)",
+            )
+            for i in f["items"]
+        ]
+        body_all = ("\n\n".join(item_txts) + "\n\n" if item_txts else "") + run_fn
+        body_m = mask(body_all)
+        # `use super::*` reaches mod.rs's items and its `use` bindings;
+        # emit it only when the file actually names a mod.rs item —
+        # rustc flags an idle glob.
+        needs_glob = any(
+            "mod" in homes and bare(n, body_m)
+            for n, homes in name_homes.items()
+        )
+        fu = uses_for(body_all, stem, f"{CLI}/{stem}.rs") + cross_uses(
+            body_all, stem
+        )
+        if needs_glob:
+            fu = [u for u in fu if bound_name(u) not in covered]
+        ftxt = (
+            f"//! CAD-535: `cadence {stem.replace('_', '-')}` — "
+            "moved verbatim from src/main.rs.\n"
+        )
+        if needs_glob:
+            ftxt += "\nuse super::*;\n"
+        if fu:
+            ftxt += "\n" + "\n".join(dict.fromkeys(fu)) + "\n"
+        ftxt += "\n" + body_all
+        out[f"{CLI}/{stem}.rs"] = ftxt
+        manifest[stem] = [i["name"] for i in f["items"]] + ["run(dispatch arm)"]
+
+    out[f"{CLI}/tests.rs"] = (
+        "// CAD-535: CLI parse tests — moved verbatim from src/main.rs."
+        + tests_text
+    )
+    tt = dedent(tests_text or "", 0)
+    manifest["tests"] = [
+        i["name"] for i in scan_items(tt, mask(tt)) if i["name"]
+    ]
+
+    ml = ["# CAD-535 split map — regenerated by scripts/split-main; do not edit."]
+    for stem in sorted(manifest):
+        ml.append(f"[{stem}]")
+        ml.append("items = [" + ", ".join(f'"{n}"' for n in manifest[stem]) + "]")
+        ml.append("")
+    out[MANIFEST] = "\n".join(ml)
+
+    # Format generated Rust the way `cargo fmt` will, so files land
+    # fmt-clean and `--check` compares the formatted form.
+    out = {
+        p: (rustfmt(t) if p.endswith(".rs") else t)
+        for p, t in out.items()
+    }
+
+    if check:
+        bad = [
+            p
+            for p, want in sorted(out.items())
+            if not Path(p).exists() or Path(p).read_text() != want
+        ]
+        extra = [str(p) for p in Path(CLI).glob("*.rs") if str(p) not in out]
+        if bad or extra:
+            for p in bad + extra:
+                print(f"stale: {p}")
+            sys.exit(1)
+        print("split-main: outputs current")
+        return
+
+    for path, text in out.items():
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(text)
+    print(f"wrote {len(out)} files")
+
+
+if __name__ == "__main__":
+    main()
