@@ -378,7 +378,7 @@ pub fn read_run_log(state_dir: &Path) -> RunLogView {
 
 /// Is `pid` a live process — not gone, not a zombie? A helper that
 /// exited but was not reaped must not read as running.
-fn pid_alive(pid: u32) -> bool {
+pub fn pid_alive(pid: u32) -> bool {
     match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
         Ok(stat) => stat
             .rsplit_once(')')
@@ -971,6 +971,14 @@ fn host_pending(host: &dyn UpdateHost) -> Option<PendingUpdate> {
 /// `require_board` is the pre-switch snapshot ([`UpdateHost::board_running`]):
 /// when a board was running, only a board that answers on the new build
 /// is health — `None` ("no board") is not.
+///
+/// A probe that ERRORS (a daemon restarting mid-poll, a refused frame,
+/// a read timeout) is one more transient "not healthy yet", never a
+/// stop (CAD-598 r4/N1): the wait retries it until the deadline and
+/// the last error only surfaces when time runs out — the #325 r4 fix
+/// made the FIRST such error end the wait and roll a healthy update
+/// back. An unreachable daemon still answers `Ok(None)` through
+/// [`daemon_build_or_absent`]; only real failures land here.
 pub fn health_wait(
     host: &dyn UpdateHost,
     want: &str,
@@ -979,9 +987,30 @@ pub fn health_wait(
     mut board: impl FnMut() -> Result<Option<String>>,
 ) -> Result<()> {
     let deadline = host.now() + timeout.as_secs_f64();
+    let mut last_err: Option<String> = None;
     loop {
-        let daemon = host.daemon_build()?;
-        let board_build = board()?;
+        let daemon = match host.daemon_build() {
+            Ok(build) => build,
+            Err(e) => {
+                last_err = Some(e.to_string());
+                if host.now() >= deadline {
+                    break;
+                }
+                host.sleep(Duration::from_secs(1));
+                continue;
+            }
+        };
+        let board_build = match board() {
+            Ok(build) => build,
+            Err(e) => {
+                last_err = Some(e.to_string());
+                if host.now() >= deadline {
+                    break;
+                }
+                host.sleep(Duration::from_secs(1));
+                continue;
+            }
+        };
         let daemon_ok = daemon.as_deref() == Some(want);
         let board_ok =
             board_build.as_deref() == Some(want) || (!require_board && board_build.is_none());
@@ -991,14 +1020,24 @@ pub fn health_wait(
         if host.now() >= deadline {
             return Err(Error::rejected(format!(
                 "health check failed after {}s: daemon answered {}, board answered {}; \
-                 expected the new build {want}",
+                 expected the new build {want}{}",
                 timeout.as_secs(),
                 daemon.as_deref().unwrap_or("nothing"),
-                board_build.as_deref().unwrap_or("nothing")
+                board_build.as_deref().unwrap_or("nothing"),
+                last_err
+                    .as_deref()
+                    .map(|e| format!(" (last probe error: {e})"))
+                    .unwrap_or_default()
             )));
         }
         host.sleep(Duration::from_secs(1));
     }
+    Err(Error::rejected(format!(
+        "health check failed after {}s: the last probe errored ({}) — \
+         expected the new build {want}",
+        timeout.as_secs(),
+        last_err.as_deref().unwrap_or("unknown")
+    )))
 }
 
 /// The switch: restart the daemon on the already-installed `sha`. The

@@ -1585,6 +1585,58 @@ fn cad561_the_board_refuses_a_planted_progress_log() {
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched");
 }
 
+/// CAD-598 r4/N3: a second POST landing inside the first run's
+/// check→truncate→record window must 409 (or co-observe the live run)
+/// — never truncate the live log and answer `started` so the card
+/// reads "never started" while a helper is still going. The helper
+/// delays its `running` record so POST2 would hit the un-fixed
+/// window. Without START_LOCK both POSTs answer `started` and the
+/// first log is clobbered; with it, POST2 sees the live run.
+#[test]
+fn cad598_a_second_post_inside_the_start_window_sees_the_live_run() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let d = UiDaemon::start_on(state.path().to_path_buf());
+    // A stale finished record + a helper that delays `running` — POST2
+    // must not truncate this log and resurrect "never started".
+    let log = state.path().join(cadence_agent::update::PROGRESS_FILE);
+    std::fs::write(
+        &log,
+        r#"{"update_run":"finished","at":1.0,"report":{"rolled_back":false,"check":{"target":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}"#.to_string()
+            + "\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let helper = write_fake_slow_update_helper(state.path(), 0.5);
+    let (port, _board) = start_ui_opts(
+        pm.path().to_path_buf(),
+        state.path().to_path_buf(),
+        move |opts| opts.update_helper = Some(helper.clone()),
+    );
+    let s = sign_in(&d.state(), port);
+    let host = op::board_host(port);
+    let (code, _, body) = op_write_json(&s, port, "POST", "/api/update", &host, "{}");
+    assert_eq!(code, 200, "{body}");
+    assert!(body.contains("\"started\": true"), "{body}");
+    // POST2 fires immediately — inside the helper's delayed-record
+    // window. It must refuse (409) or see the live run, never start a
+    // second helper over the truncated log.
+    let (code2, _, body2) = op_write_json(&s, port, "POST", "/api/update", &host, "{}");
+    assert!(
+        code2 == 409 || body2.contains("update_running"),
+        "a POST inside the start window must not start a second update: {code2} {body2}"
+    );
+    // And the live run still reports — its log survived POST2.
+    let status = wait_update_running(port, &host);
+    assert_eq!(status["running"], json!(true), "{status}");
+    let go = log.with_extension("jsonl.go");
+    std::fs::write(&go, "").unwrap();
+    let status = wait_update_done(port, &host);
+    assert_eq!(status["result"]["rolled_back"], json!(false), "{status}");
+}
+
 /// The board's detached update helper, faked: a process that speaks the
 /// run-log protocol the real `cadence update --progress` writes,
 /// records its spawn contract, and waits for a go file so the test
@@ -1615,6 +1667,41 @@ with open(progress, "a") as f:
                         "report": {"rolled_back": False,
                                    "check": {"target": "b" * 40}}}) + "\n")
 "#;
+    std::fs::write(&path, script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// A helper that delays its `running` record: the check→truncate→
+/// record window CAD-598 r4/N3 closes is only observable while the
+/// record is not yet on disk. `*.delay` seconds first, then the same
+/// protocol as `write_fake_update_helper`.
+fn write_fake_slow_update_helper(state: &Path, delay_secs: f64) -> std::path::PathBuf {
+    let path = state.join("fake-slow-update-helper.py");
+    let script = format!(
+        r#"#!/usr/bin/env python3
+import json, os, sys, time
+
+args = sys.argv[1:]
+progress = args[args.index("--progress") + 1]
+state = args[args.index("--state-dir") + 1]
+time.sleep({delay_secs})
+with open(os.path.join(state, "helper-contract.json"), "w") as f:
+    json.dump({{"argv": args, "pid": os.getpid()}}, f)
+with open(progress, "w") as f:
+    f.write(json.dumps({{"update_run": "running", "pid": os.getpid(),
+                        "by": "operator (ui)", "at": time.time()}}) + "\n")
+    f.write("draining: swe-554 (12m)\n")
+go = progress + ".go"
+while not os.path.exists(go):
+    time.sleep(0.02)
+with open(progress, "a") as f:
+    f.write(json.dumps({{"update_run": "finished", "at": time.time(),
+                        "report": {{"rolled_back": False,
+                                   "check": {{"target": "b" * 40}}}}}}) + "\n")
+"#
+    );
     std::fs::write(&path, script).unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();

@@ -43,6 +43,13 @@ struct BoardUpdate {
 
 static BOARD_UPDATE: LazyLock<BoardUpdate> = LazyLock::new(BoardUpdate::default);
 
+/// `POST /api/update`'s start gate (CAD-598 r4/N3): the "already
+/// running" check, the progress-log truncate and the helper spawn are
+/// one hold — a second POST arriving between the check and the
+/// truncate could otherwise clobber a live run's log and the card
+/// would read "never started" while the first helper still runs.
+static START_LOCK: Mutex<()> = Mutex::new(());
+
 /// The layout the board updates: the same default the CLI uses
 /// (`~/.local/bin/cadence` and the releases dir read off it).
 fn layout() -> Result<Layout> {
@@ -195,6 +202,14 @@ fn run_check(state_dir: &Path) -> Result<Value> {
 /// `GET /api/update`, which reads the helper's progress file — the
 /// board that answers after the switch reads the same file.
 pub(super) fn start(state_dir: &Path, opts: &ServeOpts) -> HttpResp {
+    // CAD-598 r4/N3: check-then-truncate-then-spawn under ONE hold.
+    // Unlocked, a second POST could pass the "running" check after the
+    // first truncated but before its helper wrote `running` — then
+    // truncate again (erasing the first run's record) or answer
+    // `started` while `run_log_never_started` raced the first run's
+    // reap thread. The helper's own RunLock is the last word across
+    // processes; this serialises this board's own posts.
+    let _hold = START_LOCK.lock().unwrap();
     if update::read_run_log(state_dir).running {
         return coded_response(409, "update_running", "an update is already running", None);
     }
@@ -260,7 +275,7 @@ pub(super) fn start(state_dir: &Path, opts: &ServeOpts) -> HttpResp {
             let pid = child.id();
             // This board is the helper's parent: reap it when it exits,
             // or its zombie pid keeps reading as a live run.
-            let state_dir = state_dir.to_path_buf();
+            let state_dir2 = state_dir.to_path_buf();
             std::thread::spawn(move || {
                 let status = child.wait();
                 // A helper that dies before it opens the run log (the
@@ -268,9 +283,25 @@ pub(super) fn start(state_dir: &Path, opts: &ServeOpts) -> HttpResp {
                 // terminal record while this board already answered
                 // `started`: write the record the card reads (CAD-561 r3).
                 if let Ok(status) = status {
-                    update::run_log_never_started(&state_dir, status);
+                    update::run_log_never_started(&state_dir2, status);
                 }
             });
+            // The lock stays held until the helper's `running` record
+            // is on disk (or it dies / the bound passes): a queued
+            // POST then either sees the live run and 409s, or sees
+            // the death record — never the truncate's empty window
+            // (CAD-598 r4/N3).
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while std::time::Instant::now() < deadline {
+                let view = update::read_run_log(state_dir);
+                if view.pid.is_some() || view.error.is_some() || view.result.is_some() {
+                    break;
+                }
+                if !update::pid_alive(pid) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
             json_response(json!({"started": true, "pid": pid}))
         }
         Err(e) => rpc_err(

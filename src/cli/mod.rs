@@ -3756,7 +3756,17 @@ impl cadence_agent::update::UpdateHost for RealUpdateHost<'_> {
         }))
     }
     fn daemon_build(&self) -> Result<Option<String>> {
-        daemon_build_or_absent(client::rpc(self.state_dir, "daemon_info", json!({})))
+        // CAD-598 r4/N2: a health poll must not sit on the default
+        // 700s rpc timeout — a daemon that is slow to answer would
+        // hold `health_wait` well past HEALTH_TIMEOUT on a single
+        // call. A few seconds is the poll's whole budget; the wait
+        // retries whatever the short window misses (N1).
+        daemon_build_or_absent(client::rpc_timeout(
+            self.state_dir,
+            "daemon_info",
+            json!({}),
+            DAEMON_BUILD_TIMEOUT,
+        ))
     }
     fn board_build(&self) -> Result<Option<String>> {
         match cadence_agent::ui::health(self.state_dir) {
@@ -3779,6 +3789,11 @@ impl cadence_agent::update::UpdateHost for RealUpdateHost<'_> {
         std::thread::sleep(duration);
     }
 }
+
+/// The health poll's per-call bound (CAD-598 r4/N2): a daemon that is
+/// slow to answer gets this long per probe, never the default 700s —
+/// `health_wait`'s deadline is the real bound.
+pub(crate) const DAEMON_BUILD_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `daemon_build`'s answer classification (CAD-561 r4): only an
 /// unreachable daemon reads as "no daemon" — every other RPC failure

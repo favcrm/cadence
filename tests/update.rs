@@ -207,6 +207,15 @@ struct Host {
     pending: RefCell<Option<PendingUpdate>>,
     daemon_build: RefCell<Option<String>>,
     board_build: RefCell<Option<String>>,
+    /// `daemon_build` fails this many times once armed — a transient
+    /// RPC error mid-health-wait (CAD-598 r4/N1). Armed by
+    /// [`fail_health_probes`], so the pre-switch `daemon_build` calls
+    /// (`run_locked`'s up-to-date probe, the board snapshot) still
+    /// answer cleanly.
+    daemon_build_fail_next: Cell<u32>,
+    /// Arms `daemon_build_fail_next` on the restart: the transient
+    /// lives exactly in the health-wait window.
+    daemon_build_fail_after_restart: RefCell<Option<u32>>,
     /// Health answers the target after a restart (false: never).
     health_ok: Cell<bool>,
     /// Whether a restart's health check failed (set by `restart`).
@@ -261,6 +270,8 @@ impl Host {
             pending: RefCell::new(None),
             daemon_build: RefCell::new(Some(OLD.to_string())),
             board_build: RefCell::new(Some(OLD.to_string())),
+            daemon_build_fail_next: Cell::new(0),
+            daemon_build_fail_after_restart: RefCell::new(None),
             health_ok: Cell::new(true),
             rolled_back: Cell::new(false),
             board_running: Cell::new(true),
@@ -356,6 +367,9 @@ impl UpdateHost for Host {
             .to_string();
         *self.lease_at_restart.borrow_mut() =
             Some(cadence_agent::rollout::status(&self.state_dir).unwrap());
+        if let Some(n) = self.daemon_build_fail_after_restart.take() {
+            self.daemon_build_fail_next.set(n);
+        }
         if self.daemon_down_on.borrow().as_deref() == Some(sha.as_str()) {
             // `daemon_start_as` failed: the daemon is down. The board was
             // not touched yet — it is still the old build's.
@@ -381,6 +395,11 @@ impl UpdateHost for Host {
         Ok(RestartOutcome::Clean)
     }
     fn daemon_build(&self) -> Result<Option<String>> {
+        let left = self.daemon_build_fail_next.get();
+        if left > 0 {
+            self.daemon_build_fail_next.set(left - 1);
+            return Err(Error::internal("daemon_info: connection reset"));
+        }
         Ok(self.daemon_build.borrow().clone())
     }
     fn board_build(&self) -> Result<Option<String>> {
@@ -1235,6 +1254,55 @@ fn a_daemon_start_that_fails_after_the_switch_rolls_back() {
     assert_eq!(host.lease_row()["held"], serde_json::json!(false));
     assert!(!host.draining.get());
     assert!(update::pending_update(&host.state_dir).is_none());
+}
+
+/// CAD-598 r4/N1: a transient `daemon_build` error inside the health
+/// wait retries until the deadline instead of ending the wait and
+/// rolling a healthy update back. The #325 r4 fix made the FIRST
+/// non-"not reachable" error abort the loop; one refused frame on the
+/// first poll after the restart used to roll back the whole update.
+/// Mutation: revert health_wait to `host.daemon_build()?` and this
+/// run comes back `rolled_back` instead of done.
+#[test]
+fn a_transient_health_probe_error_is_retried_not_rolled_back() {
+    let host = Host::new();
+    // One refused frame after the restart, then the daemon answers on
+    // the new build — exactly the slow-handshake window a real
+    // restart leaves.
+    host.daemon_build_fail_after_restart.replace(Some(1));
+    let report = run(&host, &host.options()).unwrap();
+    assert!(
+        !report.rolled_back,
+        "one transient probe error must not roll the update back: {:?}",
+        report.health
+    );
+    assert_eq!(report.health["ok"], serde_json::json!(true));
+    let log = host.log();
+    assert!(
+        log.contains("health: daemon and board answer on bbbb"),
+        "{log}"
+    );
+    assert_eq!(host.lease_row()["held"], serde_json::json!(false));
+}
+
+/// The deadline still binds: a daemon_build that errors on EVERY poll
+/// fails the health check after HEALTH_TIMEOUT (and rolls back) — the
+/// retry is a grace, not an infinite hang.
+#[test]
+fn a_health_probe_that_never_answers_still_fails_at_the_deadline() {
+    let host = Host::new();
+    // The restart itself leaves the daemon answering — then every
+    // health poll errors. More failures than the 90s window covers
+    // (one poll per second) makes the deadline the bound that fires.
+    host.daemon_build_fail_after_restart.replace(Some(120));
+    let report = run(&host, &host.options()).unwrap();
+    assert!(
+        report.rolled_back,
+        "a probe that never answers is not health"
+    );
+    let error = report.health["error"].as_str().unwrap_or_default();
+    assert!(error.contains("health check failed"), "{error}");
+    assert!(error.contains("connection reset"), "{error}");
 }
 
 #[test]
