@@ -52,7 +52,7 @@
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -118,6 +118,58 @@ pub fn progress_file(state_dir: &Path) -> PathBuf {
     state_dir.join(PROGRESS_FILE)
 }
 
+/// Open one of the state dir's private files for writing — 0600 when it
+/// is created, and refusing what a same-uid process could have planted
+/// (CAD-561 r3): `O_NOFOLLOW` (a symlink fails the open instead of
+/// redirecting the write), only a regular file, only one this uid owns,
+/// and no group/other access (a pre-planted file keeps its mode —
+/// `mode(0o600)` applies only at creation). The lock, the marker and
+/// the progress log all go through here.
+pub fn open_private(path: &Path, append: bool, truncate: bool) -> Result<std::fs::File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(append)
+        .truncate(truncate)
+        .mode(0o600)
+        // O_NONBLOCK keeps a planted FIFO from blocking the open (it
+        // fails ENXIO with no reader, and the checks below refuse it
+        // when one is there).
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| {
+            Error::rejected(format!(
+                "{}: {e} — refusing to write the update state through it",
+                path.display()
+            ))
+        })?;
+    let meta = file.metadata()?;
+    if !meta.file_type().is_file() {
+        return Err(Error::rejected(format!(
+            "{} is not a regular file — refusing to write the update state",
+            path.display()
+        )));
+    }
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    if meta.uid() != uid {
+        return Err(Error::rejected(format!(
+            "{} is owned by uid {}, not this run's uid {uid} — refusing to write it",
+            path.display(),
+            meta.uid()
+        )));
+    }
+    if meta.mode() & 0o077 != 0 {
+        return Err(Error::rejected(format!(
+            "{} is group/other-accessible (mode {:o}) — refusing to write it; remove it \
+             and rerun",
+            path.display(),
+            meta.mode() & 0o777
+        )));
+    }
+    Ok(file)
+}
+
 /// The run's exclusive hold on `<state>/update.lock` — released when it
 /// drops, or by the kernel when the process exits. Non-blocking: a
 /// second update refuses at once instead of queueing behind the first.
@@ -131,12 +183,7 @@ impl RunLock {
     /// tell a crashed predecessor of the same identity from a live one.
     pub fn acquire(state_dir: &Path) -> Result<RunLock> {
         let path = lock_file(state_dir);
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .mode(0o600)
-            .open(&path)?;
+        let file = open_private(&path, false, false)?;
         // SAFETY: plain syscall on a descriptor this function owns.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             return Err(Error::rejected(format!(
@@ -174,12 +221,7 @@ enum RunRecord {
 /// Open the run log: truncate it (each run's log is its own), then
 /// record the running process. 0600 — the log names the operator's run.
 pub fn run_log_start(path: &Path, pid: u32, by: &str, at: f64) -> Result<()> {
-    OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
+    open_private(path, false, true)?;
     append_record(
         path,
         &RunRecord::Running {
@@ -193,12 +235,9 @@ pub fn run_log_start(path: &Path, pid: u32, by: &str, at: f64) -> Result<()> {
 /// Append one progress line. Best-effort: a run whose log cannot be
 /// written still runs (the line is on stdout/stderr too).
 pub fn run_log_line(path: &Path, line: &str) {
-    let _ = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(path)
-        .and_then(|mut file| writeln!(file, "{line}"));
+    if let Ok(mut file) = open_private(path, true, false) {
+        let _ = writeln!(file, "{line}");
+    }
 }
 
 /// Record the finished run and its report.
@@ -223,14 +262,35 @@ pub fn run_log_fail(path: &Path, error: &str, at: f64) {
     );
 }
 
+/// A helper that exited before its run log recorded anything: the board
+/// already answered `started`, but the helper died before
+/// [`run_log_start`] (the CLI gate or the re-entry lock refused it), so
+/// the card would show neither a result nor an error. Write the terminal
+/// record it reads; the helper's stderr is the log, so its last line is
+/// the reason when it left one (CAD-561 r3).
+pub fn run_log_never_started(state_dir: &Path, status: std::process::ExitStatus) {
+    let view = read_run_log(state_dir);
+    if view.pid.is_some() || view.result.is_some() || view.error.is_some() {
+        return;
+    }
+    let reason = match view.lines.last() {
+        Some(line) if !line.trim().is_empty() => line.clone(),
+        _ => match status.code() {
+            Some(code) => format!("exit {code}"),
+            None => "killed by a signal".to_string(),
+        },
+    };
+    run_log_fail(
+        &progress_file(state_dir),
+        &format!("never started ({reason})"),
+        crate::rollout::unix_now(),
+    );
+}
+
 fn append_record(path: &Path, record: &RunRecord) -> Result<()> {
     let text = serde_json::to_string(record)
         .map_err(|e| Error::internal(format!("{}: {e}", path.display())))?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(path)?;
+    let mut file = open_private(path, true, false)?;
     writeln!(file, "{text}")?;
     Ok(())
 }
@@ -350,12 +410,7 @@ pub fn write_pending(state_dir: &Path, pending: &PendingUpdate) -> Result<()> {
     let path = update_file(state_dir);
     let text = serde_json::to_string_pretty(pending)
         .map_err(|e| Error::internal(format!("update.json: {e}")))?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&path)?;
+    let mut file = open_private(&path, false, true)?;
     file.write_all(text.as_bytes())?;
     Ok(())
 }
@@ -527,6 +582,22 @@ impl Default for Options {
     }
 }
 
+/// What the switch's restart reported. A restart that exits non-zero —
+/// or that cannot be run at all — is not fatal (CAD-561 r3): the daemon
+/// and the board may still be up on the new build (a fenced turn makes
+/// `daemon restart` exit non-zero), or the daemon may be down (a failed
+/// `daemon start`), and only the health check can tell. The pipeline
+/// always proceeds to [`health_wait`], which repoints when the new build
+/// does not answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestartOutcome {
+    /// The restart command exited 0.
+    Clean,
+    /// The restart command exited non-zero, or could not be run: the
+    /// complaint to report as a warning line.
+    Unclean(String),
+}
+
 /// The host the pipeline runs against: production talks to the daemon
 /// and the filesystem; tests pass a fake. Every step the acceptance
 /// names is behind this seam.
@@ -548,8 +619,10 @@ pub trait UpdateHost {
     /// Ask the daemon to stop starting new turns (`true`) or lift it.
     fn set_drain(&self, on: bool) -> Result<()>;
     /// Restart the daemon on `binary` (the new release), blocking until
-    /// the restart command returns.
-    fn restart(&self, binary: &Path) -> Result<()>;
+    /// the restart command returns. A non-clean restart is
+    /// [`RestartOutcome::Unclean`], not an error: the health check that
+    /// always follows decides (CAD-561 r3).
+    fn restart(&self, binary: &Path) -> Result<RestartOutcome>;
     /// The answering daemon's build commit (`None`: no daemon).
     fn daemon_build(&self) -> Result<Option<String>>;
     /// The answering board's build commit (`None`: no board running).
@@ -768,6 +841,11 @@ fn take_lease(host: &dyn UpdateHost, target: &str) -> Result<rollout::Caller> {
                 fmt_epoch(status["claimed_at"].as_f64().unwrap_or(0.0))
             )));
         }
+        // Reuse renews the TTL: the run may outlive what remains of a
+        // predecessor's lease, and a lease that lapses mid-run stops the
+        // daemon adopting the marker and refuses the drain re-assert
+        // (CAD-561 r3).
+        rollout::renew(state_dir, &caller, LEASE_TTL, host.now())?;
         return Ok(caller);
     }
     rollout::claim(
@@ -900,12 +978,26 @@ pub fn health_wait(
 
 /// The switch: restart the daemon on the already-installed `sha`. The
 /// install itself is [`upgrade::run`]'s (attested, hash-matched, side
-/// by side — it also moves the link).
-fn restart_on(host: &dyn UpdateHost, sha: &str) -> Result<Value> {
+/// by side — it also moves the link). A non-clean restart is a warning,
+/// never a stop: the health check that always follows is what decides
+/// (CAD-561 r3).
+fn restart_on(host: &dyn UpdateHost, sha: &str) -> (Value, Option<String>) {
     let binary = host.layout().binary(sha);
     host.progress(&format!("switching: restarting the daemon on {sha}"));
-    host.restart(&binary)?;
-    Ok(json!({"binary": binary, "sha": sha}))
+    let complaint = restart_warning(host.restart(&binary));
+    (
+        json!({"binary": binary, "sha": sha, "warning": complaint}),
+        complaint,
+    )
+}
+
+/// The warning a restart's outcome deserves (`None`: clean).
+fn restart_warning(outcome: Result<RestartOutcome>) -> Option<String> {
+    match outcome {
+        Ok(RestartOutcome::Clean) => None,
+        Ok(RestartOutcome::Unclean(reason)) => Some(reason),
+        Err(e) => Some(e.to_string()),
+    }
 }
 
 /// Run the update. `--check`/`status` never reach here.
@@ -940,11 +1032,11 @@ fn run_locked(host: &dyn UpdateHost, opts: &Options) -> Result<RunReport> {
         lines.push(line);
     }
     // The release is already linked when a previous run installed it;
-    // if the daemon still answers with another build (a restart that did
-    // not happen), the run finishes that update instead of stopping at
-    // "already up to date".
+    // if the daemon still answers with another build — or with nothing
+    // (a restart that did not happen, a daemon that is down) — the run
+    // finishes that update instead of stopping at "already up to date".
     let daemon = host.daemon_build()?;
-    let finish_restart = report.up_to_date && daemon.as_deref().is_some_and(|b| b != report.target);
+    let finish_restart = report.up_to_date && daemon.as_deref() != Some(report.target.as_str());
     if report.up_to_date && !finish_restart {
         let version = report
             .target_version
@@ -967,11 +1059,16 @@ fn run_locked(host: &dyn UpdateHost, opts: &Options) -> Result<RunReport> {
         });
     }
     if finish_restart {
-        let line = format!(
-            "{} is installed, but the daemon still runs {} — finishing the update",
-            report.target,
-            daemon.as_deref().unwrap_or("nothing")
-        );
+        let line = match daemon.as_deref() {
+            Some(build) => format!(
+                "{} is installed, but the daemon still runs {build} — finishing the update",
+                report.target
+            ),
+            None => format!(
+                "{} is installed, but no daemon answers — finishing the update (starting it)",
+                report.target
+            ),
+        };
         host.progress(&line);
         lines.push(line);
     }
@@ -1102,9 +1199,17 @@ fn run_inner(
     host.set_pending(Some(&pending("switching")))?;
     // 4. Switch: the new binary restarts the daemon (and the board).
     //    Snapshot the board first: a board that was running and does not
-    //    answer on the new build is not health (CAD-561 r2).
+    //    answer on the new build is not health (CAD-561 r2). A non-clean
+    //    restart is a warning, not a stop (CAD-561 r3): the daemon and
+    //    the board may be up on the new build with complaints (fenced
+    //    turns), or the daemon may be down — the health check below is
+    //    what decides, and it rolls back when the new build does not
+    //    answer.
     let board_before = host.board_running();
-    let restart = restart_on(host, &target)?;
+    let (restart, complaint) = restart_on(host, &target);
+    if let Some(complaint) = &complaint {
+        progress(host, format!("warning: {complaint}"));
+    }
     // 5. Health check, with auto-rollback to the previous release.
     let previous = if install {
         report.current.clone()
@@ -1136,7 +1241,9 @@ fn run_inner(
                 },
             )?;
             let binary = host.layout().binary(&previous);
-            host.restart(&binary)?;
+            if let Some(complaint) = restart_warning(host.restart(&binary)) {
+                progress(host, format!("warning: {complaint}"));
+            }
             // The rollback needs the DAEMON on the previous build; the
             // restart above already stops the board by pid, so a board
             // that was running is only expected when the restart's
@@ -1349,7 +1456,9 @@ fn rollback_body(
     // answer on the rolled-back build too.
     let board_before = host.board_running();
     let binary = layout.binary(previous);
-    host.restart(&binary)?;
+    if let Some(complaint) = restart_warning(host.restart(&binary)) {
+        host.progress(&format!("warning: {complaint}"));
+    }
     let schema_current = rollout::store_schema(host.state_dir())?;
     let schema_target = host.source().schema_version(previous).unwrap_or(None);
     let restore = match (schema_current, schema_target) {

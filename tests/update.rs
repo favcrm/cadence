@@ -19,7 +19,9 @@ use std::time::Duration;
 use cadence_agent::error::{Error, Result};
 use cadence_agent::store::Store;
 use cadence_agent::test_seam::{self, Asserted};
-use cadence_agent::update::{self, CheckReport, Options, PendingUpdate, UpdateHost, Waiter};
+use cadence_agent::update::{
+    self, CheckReport, Options, PendingUpdate, RestartOutcome, UpdateHost, Waiter,
+};
 use cadence_agent::upgrade::{ArtifactState, Job, Layout, OnMain, ReleaseSource, Run};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -214,6 +216,14 @@ struct Host {
     /// The build whose board does not come back from the restart (a
     /// board that crashes on startup, CAD-561 r2).
     board_fails_on: RefCell<Option<String>>,
+    /// A restart on this sha exits non-zero (a fenced turn, a failed
+    /// `ui start`); the state effects above still apply (CAD-561 r3).
+    restart_unclean_on: RefCell<Option<String>>,
+    /// A restart on this sha leaves the daemon down (a failed
+    /// `daemon_start_as`, CAD-561 r3).
+    daemon_down_on: RefCell<Option<String>>,
+    /// The lease row at the switch, for the TTL-renewal test.
+    lease_at_restart: RefCell<Option<serde_json::Value>>,
     /// `--progress`: the run log this host appends its lines to.
     progress_log: RefCell<Option<PathBuf>>,
     restarts: RefCell<Vec<PathBuf>>,
@@ -255,6 +265,9 @@ impl Host {
             rolled_back: Cell::new(false),
             board_running: Cell::new(true),
             board_fails_on: RefCell::new(None),
+            restart_unclean_on: RefCell::new(None),
+            daemon_down_on: RefCell::new(None),
+            lease_at_restart: RefCell::new(None),
             progress_log: RefCell::new(None),
             restarts: RefCell::new(Vec::new()),
             now: Cell::new(cadence_agent::rollout::unix_now()),
@@ -333,7 +346,7 @@ impl UpdateHost for Host {
         self.draining.set(on);
         Ok(())
     }
-    fn restart(&self, binary: &Path) -> Result<()> {
+    fn restart(&self, binary: &Path) -> Result<RestartOutcome> {
         self.restarts.borrow_mut().push(binary.to_path_buf());
         let sha = binary
             .parent()
@@ -341,7 +354,13 @@ impl UpdateHost for Host {
             .and_then(|n| n.to_str())
             .unwrap_or_default()
             .to_string();
-        if self.health_ok.get() {
+        *self.lease_at_restart.borrow_mut() =
+            Some(cadence_agent::rollout::status(&self.state_dir).unwrap());
+        if self.daemon_down_on.borrow().as_deref() == Some(sha.as_str()) {
+            // `daemon_start_as` failed: the daemon is down. The board was
+            // not touched yet — it is still the old build's.
+            *self.daemon_build.borrow_mut() = None;
+        } else if self.health_ok.get() {
             *self.daemon_build.borrow_mut() = Some(sha.clone());
             if self.board_fails_on.borrow().as_deref() == Some(sha.as_str()) {
                 // The board was running; the new build's board crashed on
@@ -349,12 +368,17 @@ impl UpdateHost for Host {
                 self.board_running.set(false);
                 *self.board_build.borrow_mut() = None;
             } else if self.board_running.get() {
-                *self.board_build.borrow_mut() = Some(sha);
+                *self.board_build.borrow_mut() = Some(sha.clone());
             }
         } else {
             self.rolled_back.set(true);
         }
-        Ok(())
+        if self.restart_unclean_on.borrow().as_deref() == Some(sha.as_str()) {
+            return Ok(RestartOutcome::Unclean(format!(
+                "the restart on {sha} exited 1: a turn was fenced"
+            )));
+        }
+        Ok(RestartOutcome::Clean)
     }
     fn daemon_build(&self) -> Result<Option<String>> {
         Ok(self.daemon_build.borrow().clone())
@@ -399,6 +423,50 @@ fn claim_other(host: &Host) {
         )
         .unwrap();
     });
+}
+
+/// A live lease this host's own identity holds with `ttl` left — a
+/// crashed predecessor's, as the re-entry lock can prove.
+fn claim_same(host: &Host, ttl: Duration) {
+    test_seam::scoped(Asserted::Operator, || {
+        cadence_agent::rollout::claim(
+            &host.state_dir,
+            &cadence_agent::rollout::ClaimRequest {
+                caller: &cadence_agent::rollout::Caller {
+                    identity: host.identity.clone(),
+                    source: "as",
+                },
+                reason: "a crashed predecessor",
+                target: Some(OLD),
+                ttl,
+                takeover: false,
+                now: cadence_agent::rollout::unix_now(),
+            },
+        )
+        .unwrap();
+    });
+}
+
+/// A same-uid plant at `path`: a symlink to `target`, a FIFO, or a
+/// group/other-readable regular file. Each must be refused (CAD-561 r3).
+fn plant(kind: &str, path: &Path, target: &Path) {
+    match kind {
+        "symlink" => {
+            fs::write(target, "untouched").unwrap();
+            symlink(target, path).unwrap();
+        }
+        "fifo" => {
+            use std::os::unix::ffi::OsStrExt;
+            let raw = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            // SAFETY: plain mkfifo on a path the test owns.
+            assert_eq!(unsafe { libc::mkfifo(raw.as_ptr(), 0o600) }, 0);
+        }
+        "file" => {
+            fs::write(path, "planted").unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        other => panic!("unknown plant {other}"),
+    }
 }
 
 /// Everything the pipeline does runs under the operator assertion.
@@ -589,6 +657,30 @@ fn a_rerun_finishes_an_installed_release_whose_restart_did_not_happen() {
 }
 
 #[test]
+fn a_rerun_finishes_an_installed_release_when_no_daemon_answers() {
+    // The link points at the target but the daemon is down (a failed
+    // `daemon start` left it that way): the re-run must start it on the
+    // installed build, not print "already up to date" (CAD-561 r3).
+    let host = Host::new();
+    install_release(&host.layout, NEW);
+    link_to(&host.layout, NEW);
+    host.daemon_build.replace(None);
+    host.board_running.set(false);
+    host.board_build.replace(None);
+    let report = run(&host, &host.options()).unwrap();
+    assert!(
+        host.log()
+            .contains("no daemon answers — finishing the update"),
+        "{}",
+        host.log()
+    );
+    assert_eq!(host.restarts.borrow().as_slice(), [host.layout.binary(NEW)]);
+    assert_eq!(host.daemon_build().unwrap().as_deref(), Some(NEW));
+    assert!(!report.rolled_back);
+    assert_eq!(host.lease_row()["held"], serde_json::json!(false));
+}
+
+#[test]
 fn an_update_another_identity_is_running_is_reported_not_a_raw_lease_error() {
     let host = Host::new();
     claim_other(&host);
@@ -745,6 +837,36 @@ fn a_run_writes_the_progress_and_result_the_board_reads() {
 }
 
 #[test]
+fn a_reused_same_identity_lease_is_renewed_not_left_to_lapse() {
+    // A crashed predecessor's lease with a minute left: the run reuses
+    // it (the re-entry lock proves no other run is live) and must renew
+    // the TTL, or the lease lapses mid-update, the daemon stops adopting
+    // the marker and the drain re-assert is refused (CAD-561 r3).
+    let host = Host::new();
+    claim_same(&host, Duration::from_secs(60));
+    let before = host.lease_row();
+    assert_eq!(before["holder"], serde_json::json!("operator:ada"));
+    assert!(
+        before["expires_in_secs"].as_f64().unwrap() < 120.0,
+        "{before}"
+    );
+    let report = run(&host, &host.options()).unwrap();
+    assert_eq!(report.check.target, NEW);
+    let at_switch = host
+        .lease_at_restart
+        .borrow()
+        .clone()
+        .expect("the switch saw the lease");
+    assert_eq!(at_switch["holder"], serde_json::json!("operator:ada"));
+    assert!(
+        at_switch["expires_in_secs"].as_f64().unwrap() > 3000.0,
+        "the reused lease kept its old TTL: {at_switch}"
+    );
+    // The lease still never outlives the run that reused it.
+    assert_eq!(host.lease_row()["held"], serde_json::json!(false));
+}
+
+#[test]
 fn a_run_log_whose_process_died_reads_as_stopped_not_running() {
     // The helper was killed without a terminal record: the card must
     // not keep saying "running" forever.
@@ -757,6 +879,135 @@ fn a_run_log_whose_process_died_reads_as_stopped_not_running() {
     assert_eq!(view.lines, ["draining: swe-554 (12m)"]);
     let error = view.error.unwrap_or_default();
     assert!(error.contains("stopped before it finished"), "{error}");
+}
+
+#[test]
+fn a_helper_that_died_before_the_run_log_is_recorded_as_never_started() {
+    // The board answered `started`, the helper died before run_log_start
+    // (the CLI gate or the lock refused it), and its stderr line is all
+    // the log holds: the terminal record must exist (CAD-561 r3).
+    let host = Host::new();
+    let log = update::progress_file(&host.state_dir);
+    // The board creates the log 0600; the helper's stderr landed in it.
+    fs::write(&log, "cadence: the operator proof refused\n").unwrap();
+    fs::set_permissions(&log, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(!update::read_run_log(&host.state_dir).running);
+    update::run_log_never_started(
+        &host.state_dir,
+        std::process::Command::new("false").status().unwrap(),
+    );
+    let view = update::read_run_log(&host.state_dir);
+    assert!(!view.running);
+    assert!(view.result.is_none());
+    assert_eq!(
+        view.error.as_deref(),
+        Some("never started (cadence: the operator proof refused)"),
+        "{:?}",
+        view.error
+    );
+    // A run that did start is left alone.
+    let started = Host::new();
+    let log = update::progress_file(&started.state_dir);
+    update::run_log_start(&log, std::process::id(), "operator:ada", started.now()).unwrap();
+    update::run_log_never_started(
+        &started.state_dir,
+        std::process::Command::new("false").status().unwrap(),
+    );
+    let view = update::read_run_log(&started.state_dir);
+    assert_eq!(view.pid, Some(std::process::id()));
+    assert!(view.error.is_none(), "{:?}", view.error);
+}
+
+// ---------------------------------------------------------------------------
+// the state files refuse a planted symlink, FIFO or readable file
+// ---------------------------------------------------------------------------
+
+/// A refusal names the path and says it is refusing.
+fn assert_refused(err: &str, what: &str, kind: &str) {
+    assert!(
+        err.contains("refusing"),
+        "{what} accepted a planted {kind}: {err}"
+    );
+}
+
+#[test]
+fn the_run_lock_refuses_a_planted_symlink_fifo_or_file() {
+    for kind in ["symlink", "fifo", "file"] {
+        let host = Host::new();
+        let path = update::lock_file(&host.state_dir);
+        let target = host._root.path().join("planted-target");
+        plant(kind, &path, &target);
+        let err = update::RunLock::acquire(&host.state_dir)
+            .err()
+            .expect("a planted lock must be refused")
+            .to_string();
+        assert_refused(&err, "update.lock", kind);
+        if kind == "symlink" {
+            assert_eq!(fs::read_to_string(&target).unwrap(), "untouched");
+        }
+        // A run refuses at the same place, before the lease.
+        let err = run(&host, &host.options()).unwrap_err().to_string();
+        assert_refused(&err, "update.lock", kind);
+        assert_eq!(host.lease_row()["held"], serde_json::json!(false));
+        assert!(host.restarts.borrow().is_empty());
+    }
+}
+
+#[test]
+fn the_pending_marker_refuses_a_planted_symlink_fifo_or_file() {
+    for kind in ["symlink", "fifo", "file"] {
+        let host = Host::new();
+        let path = update::update_file(&host.state_dir);
+        let target = host._root.path().join("planted-target");
+        plant(kind, &path, &target);
+        let pending = PendingUpdate {
+            phase: "draining".into(),
+            target: NEW.into(),
+            from: Some(OLD.into()),
+            by: host.identity.clone(),
+            since: host.now(),
+        };
+        let err = update::write_pending(&host.state_dir, &pending)
+            .unwrap_err()
+            .to_string();
+        assert_refused(&err, "update.json", kind);
+        if kind == "symlink" {
+            assert_eq!(fs::read_to_string(&target).unwrap(), "untouched");
+        }
+        // A run refuses at the marker; the lease it took is released and
+        // nothing was restarted.
+        let err = run(&host, &host.options()).unwrap_err().to_string();
+        assert_refused(&err, "update.json", kind);
+        assert_eq!(host.lease_row()["held"], serde_json::json!(false));
+        assert!(host.restarts.borrow().is_empty());
+    }
+}
+
+#[test]
+fn the_progress_log_refuses_a_planted_symlink_fifo_or_file() {
+    for kind in ["symlink", "fifo", "file"] {
+        let host = Host::new();
+        let path = update::progress_file(&host.state_dir);
+        let target = host._root.path().join("planted-target");
+        plant(kind, &path, &target);
+        let err = update::run_log_start(&path, std::process::id(), "operator:ada", 0.0)
+            .unwrap_err()
+            .to_string();
+        assert_refused(&err, "the progress log", kind);
+        if kind == "symlink" {
+            assert_eq!(fs::read_to_string(&target).unwrap(), "untouched");
+        }
+        // A run with `--progress` refuses at the log, before the lease.
+        let host = Host::new();
+        let path = update::progress_file(&host.state_dir);
+        let target = host._root.path().join("planted-target");
+        plant(kind, &path, &target);
+        host.progress_log.replace(Some(path.clone()));
+        let err = run(&host, &host.options()).unwrap_err().to_string();
+        assert_refused(&err, "the progress log", kind);
+        assert_eq!(host.lease_row()["held"], serde_json::json!(false));
+        assert!(host.restarts.borrow().is_empty());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -840,6 +1091,94 @@ fn a_board_that_does_not_come_back_is_not_health_and_rolls_back() {
     // The lease and the gate never outlive the update, rollback or not.
     assert_eq!(host.lease_row()["held"], serde_json::json!(false));
     assert!(!host.draining.get());
+}
+
+#[test]
+fn a_restart_that_exits_non_zero_still_health_checks_the_new_build() {
+    // Trigger (i): "restart completed but not cleanly" (a fenced turn).
+    // The daemon and the board are up on the new build; the non-zero
+    // exit is a warning line, not a stop (CAD-561 r3).
+    let host = Host::new();
+    host.restart_unclean_on.replace(Some(NEW.to_string()));
+    let report = run(&host, &host.options()).unwrap();
+    assert!(!report.rolled_back, "a clean new build is not a rollback");
+    assert_eq!(report.health["ok"], serde_json::json!(true));
+    assert_eq!(
+        report.restart["warning"],
+        serde_json::json!("the restart on bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb exited 1: a turn was fenced")
+    );
+    let log = host.log();
+    assert!(
+        log.contains(
+            "warning: the restart on bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb exited 1: \
+             a turn was fenced"
+        ),
+        "{log}"
+    );
+    assert!(log.contains("health: daemon and board answer on bbbb"), "{log}");
+    assert_eq!(host.restarts.borrow().as_slice(), [host.layout.binary(NEW)]);
+    assert_eq!(host.lease_row()["held"], serde_json::json!(false));
+    assert!(!host.draining.get());
+}
+
+#[test]
+fn a_ui_start_that_fails_after_the_switch_rolls_back() {
+    // Trigger (ii): the new build's daemon comes up, `ui start` fails,
+    // and the restart exits non-zero. The board that was running must
+    // answer on the new build or the update rolls back (CAD-561 r2/r3).
+    let host = Host::new();
+    host.restart_unclean_on.replace(Some(NEW.to_string()));
+    host.board_fails_on.replace(Some(NEW.to_string()));
+    let report = run(&host, &host.options()).unwrap();
+    assert!(report.rolled_back, "a dead board is not health");
+    assert_eq!(report.health["rolled_back_to"], serde_json::json!(OLD));
+    let log = host.log();
+    assert!(log.contains("warning: the restart on bbbb"), "{log}");
+    assert!(log.contains("board answered nothing"), "{log}");
+    assert!(
+        log.contains("warning: the board did not come back — start it with `cadence ui start`"),
+        "{log}"
+    );
+    assert_eq!(
+        fs::read_link(&host.layout.link).unwrap(),
+        host.layout.binary(OLD)
+    );
+    assert_eq!(
+        host.restarts.borrow().as_slice(),
+        [host.layout.binary(NEW), host.layout.binary(OLD)]
+    );
+    assert_eq!(host.lease_row()["held"], serde_json::json!(false));
+    assert!(!host.draining.get());
+}
+
+#[test]
+fn a_daemon_start_that_fails_after_the_switch_rolls_back() {
+    // Trigger (iii): `daemon_start_as` fails — the daemon is down, the
+    // link already points at the new build, and the restart exits
+    // non-zero. The health check must still run and roll back; without
+    // it the run aborted and a re-run said "already up to date".
+    let host = Host::new();
+    host.restart_unclean_on.replace(Some(NEW.to_string()));
+    host.daemon_down_on.replace(Some(NEW.to_string()));
+    let report = run(&host, &host.options()).unwrap();
+    assert!(report.rolled_back, "a daemon that is down is not health");
+    assert_eq!(report.health["rolled_back_to"], serde_json::json!(OLD));
+    let log = host.log();
+    assert!(log.contains("warning: the restart on bbbb"), "{log}");
+    assert!(log.contains("daemon answered nothing"), "{log}");
+    // The rollback brought the daemon back on the previous build.
+    assert_eq!(host.daemon_build().unwrap().as_deref(), Some(OLD));
+    assert_eq!(
+        fs::read_link(&host.layout.link).unwrap(),
+        host.layout.binary(OLD)
+    );
+    assert_eq!(
+        host.restarts.borrow().as_slice(),
+        [host.layout.binary(NEW), host.layout.binary(OLD)]
+    );
+    assert_eq!(host.lease_row()["held"], serde_json::json!(false));
+    assert!(!host.draining.get());
+    assert!(update::pending_update(&host.state_dir).is_none());
 }
 
 #[test]

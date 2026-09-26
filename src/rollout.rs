@@ -852,6 +852,44 @@ pub fn release(state_dir: &Path, caller: &Caller) -> Result<Value> {
     }))
 }
 
+/// Renew the caller's own active lease to `ttl` from `now` — the holder
+/// extending its TTL in place, without ending and re-claiming the lease
+/// (CAD-561 r3: an update that reuses a same-identity lease must not let
+/// it lapse mid-run, or the daemon stops adopting the update marker and
+/// the drain re-assert is refused). Only the holder's own unexpired
+/// lease renews; anyone else gets [`release`]'s refusal.
+pub fn renew(state_dir: &Path, caller: &Caller, ttl: Duration, now: f64) -> Result<Value> {
+    let conn = connect_ensured(&db_file(state_dir))?;
+    committed(immediate(&conn, |conn| {
+        let lease = match require_holder(conn, caller, now, false)? {
+            TxResult::Done(lease) => lease,
+            TxResult::Refuse(message) => return Ok(TxResult::Refuse(message)),
+        };
+        let expires_at = now + ttl.as_secs_f64();
+        conn.execute(
+            "UPDATE rollout_leases SET expires_at=?1 WHERE id=?2",
+            params![expires_at, lease.id],
+        )?;
+        insert_event(
+            conn,
+            "rollout_renew",
+            json!({
+                "holder": lease.holder,
+                "lease_id": lease.id,
+                "expires_at": expires_at,
+                "previous_expires_at": lease.expires_at,
+            }),
+            now,
+        )?;
+        Ok(TxResult::Done(json!({
+            "renewed": true,
+            "holder": lease.holder,
+            "lease_id": lease.id,
+            "expires_at": expires_at,
+        })))
+    }))
+}
+
 /// Operator override for a holder who is gone. Does not require the
 /// caller to be the holder. Records the ousted holder.
 ///

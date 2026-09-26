@@ -15,8 +15,6 @@
 //! an update drains, from the same `update_status`/`health` view the CLI
 //! reads.
 
-use std::fs::OpenOptions;
-use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,7 +27,7 @@ use super::{coded_response, json_response, HttpResp, ServeOpts};
 use crate::client;
 use crate::error::{Error, Result};
 use crate::ui::home::rpc_err;
-use crate::update::{self, PendingUpdate, UpdateHost, Waiter};
+use crate::update::{self, PendingUpdate, RestartOutcome, UpdateHost, Waiter};
 use crate::upgrade::{self, Layout, ReleaseSource};
 
 /// The board process's cached update check: the read-only `gh` query
@@ -214,19 +212,9 @@ pub(super) fn start(state_dir: &Path, opts: &ServeOpts) -> HttpResp {
         },
     };
     let log_path = update::progress_file(state_dir);
-    let log = match OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(&log_path)
-    {
+    let log = match update::open_private(&log_path, true, false) {
         Ok(file) => file,
-        Err(e) => {
-            return rpc_err(
-                &Error::internal(format!("{}: {e}", log_path.display())),
-                "update",
-            )
-        }
+        Err(e) => return rpc_err(&e, "update"),
     };
     let stdout = match log.try_clone() {
         Ok(file) => file,
@@ -267,8 +255,16 @@ pub(super) fn start(state_dir: &Path, opts: &ServeOpts) -> HttpResp {
             let pid = child.id();
             // This board is the helper's parent: reap it when it exits,
             // or its zombie pid keeps reading as a live run.
+            let state_dir = state_dir.to_path_buf();
             std::thread::spawn(move || {
-                let _ = child.wait();
+                let status = child.wait();
+                // A helper that dies before it opens the run log (the
+                // CLI gate or the re-entry lock refused it) leaves no
+                // terminal record while this board already answered
+                // `started`: write the record the card reads (CAD-561 r3).
+                if let Ok(status) = status {
+                    update::run_log_never_started(&state_dir, status);
+                }
             });
             json_response(json!({"started": true, "pid": pid}))
         }
@@ -343,7 +339,7 @@ impl UpdateHost for BoardHost {
     fn set_drain(&self, _on: bool) -> Result<()> {
         Err(Self::not_the_pipeline())
     }
-    fn restart(&self, _binary: &Path) -> Result<()> {
+    fn restart(&self, _binary: &Path) -> Result<RestartOutcome> {
         Err(Self::not_the_pipeline())
     }
     fn daemon_build(&self) -> Result<Option<String>> {

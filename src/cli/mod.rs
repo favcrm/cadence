@@ -1363,8 +1363,8 @@ pub(crate) enum Commands {
         json: bool,
         /// Append this run's progress lines and its final one-line JSON
         /// record to PATH (0600) — the board's Update card reads it while
-        /// a detached helper runs (CAD-561). Ignored by `--check`,
-        /// `--rollback` and `status`.
+        /// a detached helper runs (CAD-561). `--rollback` appends its
+        /// lines there too; `--check` and `status` ignore it.
         #[arg(long, value_name = "PATH")]
         progress: Option<PathBuf>,
         /// Where the release lives and which repository is trusted.
@@ -3596,14 +3596,35 @@ pub(crate) struct RealUpdateHost<'a> {
 
 impl RealUpdateHost<'_> {
     fn line(&self, line: &str) {
-        if let Some(path) = &self.progress_log {
+        let log = self.progress_log.as_deref();
+        if let Some(path) = log {
             cadence_agent::update::run_log_line(path, line);
         }
         match &self.collect {
             Some(lines) => lines.borrow_mut().push(line.to_string()),
-            None => println!("{line}"),
+            // The board starts the helper with stdout pointing at the same
+            // progress log; printing there too would write every line
+            // twice (CAD-561 r3).
+            None if !log.is_some_and(|path| fd_is_path(libc::STDOUT_FILENO, path)) => {
+                println!("{line}")
+            }
+            None => {}
         }
     }
+}
+
+/// Is descriptor `fd` the same file as `path`? The helper's stdout is
+/// the progress log when the board starts it, so its progress lines must
+/// not also be printed there (CAD-561 r3).
+pub(crate) fn fd_is_path(fd: i32, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let (Ok(descriptor), Ok(file)) = (
+        std::fs::metadata(format!("/proc/self/fd/{fd}")),
+        std::fs::metadata(path),
+    ) else {
+        return false;
+    };
+    descriptor.dev() == file.dev() && descriptor.ino() == file.ino()
 }
 
 impl cadence_agent::update::UpdateHost for RealUpdateHost<'_> {
@@ -3680,7 +3701,8 @@ impl cadence_agent::update::UpdateHost for RealUpdateHost<'_> {
             Err(e) => Err(e),
         }
     }
-    fn restart(&self, binary: &Path) -> Result<()> {
+    fn restart(&self, binary: &Path) -> Result<cadence_agent::update::RestartOutcome> {
+        use cadence_agent::update::RestartOutcome;
         let mut cmd = Command::new(binary);
         cmd.arg("--state-dir")
             .arg(self.state_dir)
@@ -3692,15 +3714,25 @@ impl cadence_agent::update::UpdateHost for RealUpdateHost<'_> {
         let out = cadence_agent::reaper::spawn(&mut cmd)
             .and_then(|child| child.wait_with_output())
             .map_err(|e| Error::internal(format!("could not run {}: {e}", binary.display())))?;
-        if !out.status.success() {
-            return Err(Error::rejected(format!(
-                "the restart on {} failed (exit {}): {}",
-                binary.display(),
-                out.status.code().unwrap_or(-1),
-                String::from_utf8_lossy(&out.stderr).trim()
-            )));
+        if out.status.success() {
+            return Ok(RestartOutcome::Clean);
         }
-        Ok(())
+        // A non-zero exit is the restart's complaint, not a stop
+        // (CAD-561 r3): a fenced turn makes `daemon restart` exit
+        // non-zero with the new build up, and a failed `daemon start`
+        // or `ui start` leaves the daemon or the board down — only the
+        // health check that follows can tell, and it rolls back.
+        let complaint = String::from_utf8_lossy(&out.stderr);
+        let complaint = complaint.trim();
+        let exit = out.status.code().unwrap_or(-1);
+        Ok(RestartOutcome::Unclean(if complaint.is_empty() {
+            format!("the restart on {} exited {exit}", binary.display())
+        } else {
+            format!(
+                "the restart on {} exited {exit}: {complaint}",
+                binary.display()
+            )
+        }))
     }
     fn daemon_build(&self) -> Result<Option<String>> {
         match client::rpc(self.state_dir, "daemon_info", json!({})) {

@@ -35,6 +35,22 @@ fn cad314_backup_export_restore_parse() {
 }
 
 #[test]
+fn cad561_progress_lines_are_written_once_when_stdout_is_the_log() {
+    // The board starts the detached helper with stdout pointing at
+    // the progress log; `line` must not print there too (CAD-561 r3).
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("update-progress.jsonl");
+    std::fs::write(&log, "").unwrap();
+    let file = std::fs::File::open(&log).unwrap();
+    use std::os::fd::AsRawFd;
+    assert!(fd_is_path(file.as_raw_fd(), &log), "an open fd is its file");
+    let other = dir.path().join("other");
+    std::fs::write(&other, "").unwrap();
+    assert!(!fd_is_path(file.as_raw_fd(), &other));
+    assert!(!fd_is_path(libc::STDOUT_FILENO, &log));
+}
+
+#[test]
 fn devin_resume_parses_like_native() {
     let cli = Cli::try_parse_from(["cadence", "devin", "-r", "cookie-cesium"]).unwrap();
     match cli.command {

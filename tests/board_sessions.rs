@@ -1482,6 +1482,62 @@ fn cad561_a_board_initiated_update_survives_the_board_being_replaced() {
     wait_pid_gone(helper_pid);
 }
 
+/// CAD-561 r3: a helper that dies before it opens the run log (the CLI
+/// gate or the re-entry lock refused it) leaves no terminal record while
+/// the board already answered `started` — the board writes the `Failed`
+/// record the card reads, with the helper's stderr line as the reason.
+#[test]
+fn cad561_a_helper_that_dies_before_the_run_log_is_recorded_as_never_started() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let d = UiDaemon::start_on(state.path().to_path_buf());
+    let helper = write_fake_dead_update_helper(state.path());
+    let (port, _board) = start_ui_opts(
+        pm.path().to_path_buf(),
+        state.path().to_path_buf(),
+        move |opts| opts.update_helper = Some(helper.clone()),
+    );
+    let s = sign_in(&d.state(), port);
+    let host = op::board_host(port);
+    let (code, _, body) = op_write_json(&s, port, "POST", "/api/update", &host, "{}");
+    assert_eq!(code, 200, "{body}");
+    assert!(body.contains("\"started\": true"), "{body}");
+    let status = wait_update_error(port, &host);
+    assert_eq!(status["running"], json!(false), "{status}");
+    assert_eq!(status["result"], Value::Null, "{status}");
+    let error = status["error"].as_str().unwrap_or_default();
+    assert!(error.contains("never started"), "{status}");
+    assert!(error.contains("the operator proof refused"), "{status}");
+}
+
+/// CAD-561 r3: the board refuses a planted progress log (a symlink
+/// here) before it spawns anything — the log is one of the state dir's
+/// private files, opened `O_NOFOLLOW` with a regular-file/owner check.
+#[test]
+fn cad561_the_board_refuses_a_planted_progress_log() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let d = UiDaemon::start_on(state.path().to_path_buf());
+    let log = state.path().join(cadence_agent::update::PROGRESS_FILE);
+    let target = state.path().join("planted-target");
+    std::fs::write(&target, "untouched").unwrap();
+    std::os::unix::fs::symlink(&target, &log).unwrap();
+    let helper = write_fake_update_helper(state.path());
+    let (port, _board) = start_ui_opts(
+        pm.path().to_path_buf(),
+        state.path().to_path_buf(),
+        move |opts| opts.update_helper = Some(helper.clone()),
+    );
+    let s = sign_in(&d.state(), port);
+    let host = op::board_host(port);
+    let (code, _, body) = op_write_json(&s, port, "POST", "/api/update", &host, "{}");
+    assert_ne!(code, 200, "a planted log must not start an update: {body}");
+    assert!(body.contains("refusing"), "{body}");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched");
+}
+
 /// The board's detached update helper, faked: a process that speaks the
 /// run-log protocol the real `cadence update --progress` writes,
 /// records its spawn contract, and waits for a go file so the test
@@ -1518,10 +1574,37 @@ with open(progress, "a") as f:
     path
 }
 
+/// A helper that dies before it opens the run log: its stderr lands in
+/// the log (the board points it there), and it leaves no record.
+fn write_fake_dead_update_helper(state: &Path) -> std::path::PathBuf {
+    let path = state.join("fake-dead-update-helper.sh");
+    let script = "#!/bin/sh\necho \"cadence: the operator proof refused\" >&2\nexit 1\n";
+    std::fs::write(&path, script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
 fn has_line(status: &Value, want: &str) -> bool {
     status["lines"]
         .as_array()
         .is_some_and(|lines| lines.iter().any(|l| l.as_str() == Some(want)))
+}
+
+fn wait_update_error(port: u16, host: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let status: Value =
+            serde_json::from_str(&http(port, "GET", "/api/update", host).1).unwrap();
+        if status["error"].is_string() && status["running"] == json!(false) {
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the card never recorded the helper's death: {status}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn wait_update_running(port: u16, host: &str) -> Value {
