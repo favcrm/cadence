@@ -1055,6 +1055,12 @@ impl ProviderAdapter for ClaudeAdapter {
         Ok(super::InterruptOutcome::Delivered)
     }
 
+    /// CAD-551: stream-json has no mid-session state/model RPC — `stop`
+    /// (the daemon's interrupt path) is the only session verb.
+    fn session_commands(&self) -> &'static [&'static str] {
+        &["stop"]
+    }
+
     fn disconnected(&self) -> bool {
         self.transport.read().unwrap().disconnected()
     }

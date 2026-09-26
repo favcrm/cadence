@@ -1066,6 +1066,12 @@ impl ProviderAdapter for CodexAdapter {
         Ok(InterruptOutcome::Delivered)
     }
 
+    /// CAD-551: `stop` (the daemon's interrupt path) is the only session
+    /// verb Codex's app-server protocol answers for the board.
+    fn session_commands(&self) -> &'static [&'static str] {
+        &["stop"]
+    }
+
     fn disconnected(&self) -> bool {
         self.transport.disconnected()
     }

@@ -54,7 +54,7 @@
 //! its own login link.
 
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use tiny_http::Request;
 
 use super::{
@@ -443,6 +443,81 @@ pub(super) fn master_summary(
     match client::rpc(state_dir, "master_summary", json!({ "since": since })) {
         Ok(out) => json_response(out),
         Err(e) => rpc_err(&e, "master_summary"),
+    }
+}
+
+/// `GET /api/master/state` (CAD-551) — the master's provider session
+/// chips (model/effort/context) and in-flight turn. A plain read like
+/// `/api/threads/<alias>`; a daemon without `master_state` answers 501
+/// and the UI falls back to the agents payload.
+pub(super) fn master_state(state_dir: &std::path::Path) -> HttpResp {
+    match client::rpc(state_dir, "master_state", json!({})) {
+        Ok(out) => json_response(out),
+        Err(e) => rpc_err(&e, "master_state"),
+    }
+}
+
+/// The slash verbs the board relays to `master_command` (CAD-551) —
+/// narrower than the daemon's own verb set: `help` is the composer's
+/// local help. A body naming anything else is refused before the daemon
+/// is asked, so a poisoned page can never smuggle a provider command
+/// through the relay.
+const BOARD_COMMANDS: &[&str] = &[
+    "state", "stats", "models", "model", "levels", "effort", "compact", "new", "stop",
+];
+
+/// `POST /api/master/command` `{"command": "…", "arg": "…"}` —
+/// operator-only (`operator::WRITE_ROUTES`), relayed to the daemon's
+/// `master_command`; `/stop` lands on the daemon's `interrupt` path.
+pub(super) fn master_command(request: &mut Request, state_dir: &std::path::Path) -> HttpResp {
+    let bytes = match read_body(request, BODY_CAP) {
+        Ok(bytes) => bytes,
+        Err(resp) => return resp,
+    };
+    let body: Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(_) => return err_response(400, "body must be a JSON object"),
+    };
+    // Only `command`, `arg` and `wait` cross the relay — anything else
+    // is refused whole, so an identity-shaped or unexpected field never
+    // silently reaches the daemon.
+    let known = ["command", "arg", "wait"];
+    if let Some(key) = body
+        .as_object()
+        .and_then(|o| o.keys().find(|k| !known.contains(&k.as_str())))
+    {
+        return err_response(400, &format!("unknown field '{key}'"));
+    }
+    let command = body.get("command").and_then(Value::as_str).unwrap_or("");
+    if !BOARD_COMMANDS.contains(&command) {
+        return coded_response(
+            400,
+            "unknown_command",
+            &format!(
+                "unknown command '{command}' — the board allows: {}",
+                BOARD_COMMANDS
+                    .iter()
+                    .map(|c| format!("/{c}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+            None,
+        );
+    }
+    let arg = body.get("arg").and_then(Value::as_str).unwrap_or("").trim();
+    if arg.len() > 256 {
+        return err_response(400, "command argument is too long");
+    }
+    let mut params = json!({"command": command});
+    if !arg.is_empty() {
+        params["arg"] = json!(arg);
+    }
+    if let Some(wait) = body.get("wait") {
+        params["wait"] = wait.clone();
+    }
+    match client::rpc(state_dir, "master_command", params) {
+        Ok(out) => json_response(out),
+        Err(e) => rpc_err(&e, "master_command"),
     }
 }
 

@@ -2031,6 +2031,18 @@ fn write_route(
         send(request, resp);
         return;
     }
+    // The composer's slash commands and Stop (CAD-551) — operator-only,
+    // relayed to the daemon's `master_command`; `home::master_command`
+    // refuses every verb outside its own allowlist before the relay.
+    if path == "/api/master/command" {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let resp = home::master_command(&mut request, state_dir);
+        send(request, resp);
+        return;
+    }
     // The operator's chat message to an agent (CAD-319) — guarded and
     // caller-attributed inside `threads::post_message`.
     if let Some((alias, sub)) = threads::route(path) {
@@ -2969,6 +2981,11 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             // `/api/master/summary?since=` — "since you left" (CAD-328).
             if path == "/api/master/summary" {
                 send(request, home::master_summary(state_dir, &query));
+                return;
+            }
+            // `/api/master/state` — the header chips + turn state (CAD-551).
+            if path == "/api/master/state" {
+                send(request, home::master_state(state_dir));
                 return;
             }
             // `/api/threads/<alias>[/stream]` — an agent's chat (CAD-319).

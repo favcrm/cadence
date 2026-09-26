@@ -113,6 +113,9 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
         RouteClass::OperatorOnly,
     ),
     route("POST", "/api/threads/*/messages", RouteClass::OperatorOnly),
+    // CAD-551: the composer's slash commands and Stop — the daemon's
+    // `master_command` is operator-only, so the relay is too.
+    route("POST", "/api/master/command", RouteClass::OperatorOnly),
     route("POST", "/api/epics/*/stage", RouteClass::OperatorOnly),
     // CAD-496: the board relays `plan_propose` over its own daemon
     // connection, so the daemon attributes the run to whoever that
