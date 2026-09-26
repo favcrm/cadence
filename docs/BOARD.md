@@ -1398,6 +1398,7 @@ payload at read time — nothing is stored; `cadence overview [--json]
 | 70 | `review_no_pr` — issue in `review` with no open `pr` ref and no `cadence/<id>-…` PR branch | team | the issue owner | `cadence issue show <id>` |
 | 80 | `blocked_ready` — every `blocked_by` target is `done` | team | the issue owner | `cadence issue set <id> status=ready` |
 | 85 | `intake` — an untriaged `cadence report` | team | the issue owner | `cadence report show <id>` |
+| 86 | `intake_relay` — a report the intake consumer could not publish or hand to the PM (quota, stopped PM, retry, still queued) | team | the configured relay PM alias | `cadence intake status <project>` |
 | 90 | `ci_red` — the newest default-branch SHA with a `ci.yml` verdict failed (`failure`, `timed_out`, `startup_failure`); pending and cancelled SHAs neither raise nor clear it | team | none | `gh run view <run> --repo <slug>` |
 | 92 | `ci_unverified` — a default-branch SHA whose `ci.yml` push run was cancelled (or never ran) and no later SHA's own run has passed; clears once one does, while the SHA keeps its label | team | none | `gh run rerun <run> --repo <slug>` (cancelled), else `gh run list --repo <slug> --workflow ci.yml --branch <branch>` |
 | 95 | `inbox_stale` — a mailbox past its unread threshold with no recent read | team | the inbox owner (group root, else `operator`) | `cadence inbox <a>` |
@@ -1434,6 +1435,7 @@ minutes):
 
 | Kind | `since` |
 |---|---|
+| `intake_relay` | the relay receipt or comment action `updated_at` |
 | `review_no_pr`, `intake` | when the issue entered its effective status: a file status is the tracker's last commit changing the `status:` line (read from the tracker's line-time cache in its git dir, keyed by HEAD: an unmoved HEAD reads the file, a fast-forward walks only the new commits, any other move walks the whole history again — 3 s budget per build; past it, rows get no clock and one `degraded` note); a notes status is the deriving note's time; a rollup or job status has none |
 | `blocked_ready` | the newest of its blockers' status clocks (when the last one reached done) |
 | `fenced` | the earliest `completed` of the agent's `unknown` messages; a fence without one (a disconnect while idle, a restart mismatch) uses the row's `updated` — every write that enters `attention` stamps it, so it is a lower bound on time fenced |

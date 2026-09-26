@@ -2569,6 +2569,33 @@ fn agent_items(a: &Value, probe: &AgentProbe, project: &str, now: i64) -> Vec<It
     items
 }
 
+/// CAD-213: quota-blocked, retrying, and still-queued intake relay work.
+/// The poller does not wake a provider to discover this; the row is the
+/// PM's attention surface until a later sync can dispatch.
+fn relay_attention_items(state_dir: &Path, now: i64) -> Vec<Item> {
+    crate::issue::relay::attention(state_dir, now)
+        .into_iter()
+        .map(|row| {
+            let since = (row.age_secs > 0).then_some(now.saturating_sub(row.age_secs));
+            let mut item = item(
+                86,
+                "intake_relay",
+                &row.title,
+                row.age_secs,
+                &row.project,
+                None,
+                &row.command,
+            )
+            .about("report", &row.subject_id)
+            .since(since);
+            if let Some(owner) = row.owner.as_deref() {
+                item = item.for_agent(owner).owned_by(Some(owner));
+            }
+            item
+        })
+        .collect()
+}
+
 /// CAD-506 §5.4: Needs-you rows from the durable pending-effect table
 /// and the information-only draft rows (Q3). One `platform_effects`
 /// read — an operator-proven board sees all rows; a board run inside
@@ -2852,6 +2879,7 @@ fn overview_from(
     if daemon.reachable {
         needs.extend(platform_effect_items(state_dir, now, opts.probe_timeout));
     }
+    needs.extend(relay_attention_items(state_dir, now));
 
     // ---- tracker rows ----
     // Lowercased headRefName of every open PR — an issue in review
