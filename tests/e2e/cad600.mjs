@@ -33,7 +33,12 @@
 // `E2E_TAG` names the run (before/after) in every file; `E2E_VIEWPORT`
 // picks the size (desktop 1440×900, phone 390×844); `E2E_ASSERT=1` turns
 // on the layout checks (after only — the before layout is the short box
-// this ticket removes). Screenshots land in E2E_ARTIFACTS.
+// this ticket removes). On a phone those checks also require the last
+// message and the jump pill to stay clear of Needs-you, and the home
+// shell to be `100dvh` with overflow hidden. A shorter dynamic viewport
+// (100vh taller than 100dvh) cannot be emulated: headless Chrome reports
+// one used height for vh and dvh, and the device-metrics override scales
+// them together. Screenshots land in E2E_ARTIFACTS.
 
 import { chromium } from "playwright-core";
 import fs from "node:fs";
@@ -191,6 +196,15 @@ async function checkLayout(page) {
     const last = document.querySelector('ol[aria-label="messages"] > li:last-child');
     const need = document.querySelector(".needbtn");
     const needShown = !!(need && getComputedStyle(need).display !== "none" && need.getClientRects().length);
+    const shell = document.querySelector("[data-app-shell]");
+    const unit = (name) => {
+      const el = document.createElement("div");
+      el.style.cssText = `position:fixed;left:0;top:0;height:${name};width:0;pointer-events:none;visibility:hidden`;
+      document.body.appendChild(el);
+      const h = el.getBoundingClientRect().height;
+      el.remove();
+      return h;
+    };
     const r = (el) => (el ? el.getBoundingClientRect() : null);
     return {
       docScroll: document.documentElement.scrollHeight,
@@ -204,6 +218,9 @@ async function checkLayout(page) {
       last: r(last),
       need: needShown ? r(need) : null,
       padding: scroller ? getComputedStyle(scroller).paddingBottom : null,
+      shell: shell ? { height: r(shell).height, overflowY: getComputedStyle(shell).overflowY } : null,
+      dvh: unit("100dvh"),
+      vh: unit("100vh"),
     };
   });
   ok(geom.scroller !== null, "the thread has its own scroller ([data-chat-scroll])");
@@ -229,6 +246,23 @@ async function checkLayout(page) {
       !overlaps(geom.last, geom.need),
       `the last message stays clear of Needs-you (message ${JSON.stringify(geom.last)} button ${JSON.stringify(geom.need)})`,
     );
+  }
+  // Headless Chrome gives 100vh and 100dvh the same used height, and a
+  // CDP device-metrics override scales them together instead of inserting
+  // mobile browser chrome, so a shorter dynamic viewport cannot be
+  // emulated here. The shell is still checked against a 100dvh probe with
+  // overflow hidden — that is what stops the page scrolling when a phone's
+  // 100vh is taller. If a runner ever does split the units, the shell must
+  // follow dvh.
+  ok(geom.shell, "the home shell is marked");
+  ok(geom.shell.overflowY === "hidden", `home locks the shell's overflow (${geom.shell.overflowY})`);
+  ok(
+    Math.abs(geom.shell.height - geom.dvh) <= 2,
+    `the home shell is 100dvh (shell ${geom.shell.height}, dvh ${geom.dvh}, vh ${geom.vh})`,
+  );
+  if (geom.vh - geom.dvh > 2) {
+    ok(geom.shell.height <= geom.dvh + 2, "when dvh is shorter than vh, the shell follows dvh");
+    ok(geom.docScroll <= geom.dvh + 2, "the page does not grow to 100vh");
   }
   ok(
     geom.padding && parseFloat(geom.padding) > 0,
