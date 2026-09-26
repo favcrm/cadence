@@ -53,6 +53,18 @@ if (!base || !login) {
   console.error("usage: E2E_URL=http://cadence-<p>.localhost:<p> E2E_LOGIN=<link> node cad551.mjs");
   process.exit(2);
 }
+// CAD-482: with E2E_SEAM_TOKEN set (a test-seam fixture stack), every
+// request rides the fixture's asserted caller — the shape an agent pane
+// runs this from. Unset, the run keeps the detached-operator shape the
+// recipe above describes.
+const seamToken = process.env.E2E_SEAM_TOKEN;
+const seam = seamToken
+  ? {
+      "X-Cadence-Test-As": "operator",
+      "X-Cadence-Test-Token": seamToken,
+      "X-Cadence-Board": "1",
+    }
+  : {};
 const TIMEOUT = 30_000;
 const shot = (page, name) => page.screenshot({ path: path.join(out, name), fullPage: false });
 
@@ -96,6 +108,7 @@ async function main() {
   const context = await browser.newContext({
     viewport: { width: 1400, height: 1000 },
     colorScheme: "dark",
+    extraHTTPHeaders: seam,
     recordVideo: { dir: out, size: { width: 1400, height: 1000 } },
   });
   const page = await context.newPage();
@@ -113,9 +126,15 @@ async function main() {
     // ---- Header: status + session chips ----
     await page.goto(base);
     const h1 = await appear(page, "section[aria-label='master thread'] h1", "the Master header");
-    // Chips arrive with /api/master/state — Fake Model from the live
-    // fake-pi session, the effort level, and context use.
-    await appear(page, ".chip:has-text('Fake Model')", "the model chip");
+    // Chips arrive with /api/master/state — the live session's model,
+    // the effort level, and context use. The model chip names the
+    // provider's display label when it sends one ("Fake Model"), the
+    // raw provider/id otherwise (a launch pinned with --model).
+    await appear(
+      page,
+      ".chip:has-text('Fake Model'), .chip:has-text('fake/model-1')",
+      "the model chip",
+    );
     await appear(page, ".chip:has-text('effort medium')", "the effort chip");
     await appear(page, ".chip:has-text('% ctx')", "the context chip");
     // r2: the bootstrap briefing is a collapsed disclosure, never a
@@ -142,17 +161,25 @@ async function main() {
     await brief.locator(".steps-head").click();
     // Back to the tail — the frame scroll unpins smart-scroll, and we want
     // a clean follow-state for the rest of the run.
-    // "The tail" for framing: the thread section's bottom edge — the
-    // rail beside it can run taller than the thread, and then
-    // scrollHeight strands the shot below the conversation entirely.
-    const tailY = () =>
+    // CAD-600: the thread scrolls inside its own panel, not the page —
+    // these helpers move the panel's scroller when it is there, and fall
+    // back to the window on the pre-CAD-600 layout.
+    const toTail = () =>
       page.evaluate(() => {
-        const s = document.querySelector("section[aria-label='master thread']");
-        return s
-          ? Math.max(0, s.getBoundingClientRect().bottom + window.scrollY - window.innerHeight)
-          : document.documentElement.scrollHeight;
+        const scroller = document.querySelector("[data-chat-scroll]");
+        if (scroller) {
+          scroller.scrollTop = scroller.scrollHeight;
+          return;
+        }
+        window.scrollTo(0, document.documentElement.scrollHeight);
       });
-    await page.evaluate(async (y) => window.scrollTo(0, y), await tailY());
+    const toTop = () =>
+      page.evaluate(() => {
+        const scroller = document.querySelector("[data-chat-scroll]");
+        if (scroller) scroller.scrollTop = 0;
+        window.scrollTo(0, 0);
+      });
+    await toTail();
 
     // ---- Slash autocomplete + command cards ----
     const box = page.getByLabel("message to the master");
@@ -231,7 +258,7 @@ async function main() {
     await appear(page, ".workrow .stopbtn", "the Stop button");
     // The row sits above the composer — frame it at the tail. Reaching
     // it also clears the pill (tail seen = all seen); wait out the frame.
-    await page.evaluate(async (y) => window.scrollTo(0, y), await tailY());
+    await toTail();
     await page.locator(".newpill").waitFor({ state: "detached", timeout: 5000 });
     await shot(page, "04-working.png");
     // The reply handoff: the row leaves, the answer bubble lands.
@@ -259,16 +286,21 @@ async function main() {
     // the scroll-away must come after the fill and before Enter.
     const box2 = page.getByLabel("message to the master");
     await box2.fill("one more while I read history");
-    await page.evaluate(() => window.scrollTo(0, 0));
+    await toTop();
     await box2.press("Enter");
     const pill = await appear(page, ".newpill", "the new-messages pill while scrolled up");
     await page.waitForTimeout(400); // pill-in
     await expectText(pill, "new", "the pill counts arrivals");
     await shot(page, "06-new-pill.png");
     await pill.click();
-    // The pill jumps to the tail — the section's bottom edge in view.
+    // The pill jumps to the tail — the panel's scroller at its bottom
+    // (CAD-600), or the section's bottom edge in view before it.
     await page.waitForFunction(
       () => {
+        const scroller = document.querySelector("[data-chat-scroll]");
+        if (scroller) {
+          return scroller.scrollTop >= scroller.scrollHeight - scroller.clientHeight - 2;
+        }
         const s = document.querySelector("section[aria-label='master thread']");
         if (!s) return false;
         const b = s.getBoundingClientRect().bottom;
@@ -296,9 +328,9 @@ async function main() {
     await page.reload();
     await expectText(thread, "fake-pi reply", "the thread survives the theme swap");
     await appear(page, ".steps", "the steps group in light");
-    await page.evaluate(async (y) => window.scrollTo(0, y), await tailY());
+    await toTail();
     await shot(page, "07-light.png");
-    await page.evaluate(() => window.scrollTo(0, 0));
+    await toTop();
     await shot(page, "08-light-top.png");
 
     console.log("cad551: all evidence steps passed");

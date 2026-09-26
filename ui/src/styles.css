@@ -986,9 +986,6 @@ button.refchip:hover {
 .chatdock > [data-composer][data-blocked] {
   border-style: dashed;
 }
-.chatdock > [data-composer][data-blocked] textarea {
-  min-height: 2.75rem;
-}
 
 /* A dock whose textarea has grown: the card's own scrollbar stays
    inside the rounded corners. */
