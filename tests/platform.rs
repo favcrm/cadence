@@ -1237,6 +1237,10 @@ fn revoke_reason_cannot_carry_the_credential() {
         assert!(err.contains("withheld"), "{err}");
         assert!(!err.contains(fragment), "{err}");
         assert_eq!(enrolled_count(&d), 1);
+        assert!(
+            !db_snapshot(&d).contains(fragment),
+            "fragment persisted in audit"
+        );
     }
     // And a clean reason revokes fine.
     let ok = d
