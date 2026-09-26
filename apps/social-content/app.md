@@ -52,15 +52,23 @@ release in one glance — caption first, image second.
 - Terms the source protects — product names, prices, URLs, disclaimers —
   appear verbatim in every caption that carries them. The reviewer
   rejects paraphrases.
-- A caption that quotes a price or a claim carries the source's
-  disclaimer line with it, unchanged, in the same caption.
+- A caption that quotes a price or a regulated claim carries the
+  source's disclaimer line with it, unchanged, in the same caption.
+  A regulated claim is a health, financial or legal claim the source
+  states.
 - No invented prices, dates, statistics or superlatives. A claim the
   source does not make is a claim this app does not make.
 
 ## Images
 
+On-brand means the image shows the product the source names, carries no
+price, date, statistic or claim the source does not state, and any text
+on it matches a protected term verbatim.
+
 - Keep the run's image when it is on-brand; edit it when a crop or an
   overlay is needed; write an image brief when the image must be made.
+- The kept or edited file is `social/<slug>/image.<ext>`, or
+  `image-brief.md` says what to make and why.
 - Every image carries alt text a screen reader can use, naming the
   product, not the layout.
 - Never claim an image exists before its file is committed — "making"
