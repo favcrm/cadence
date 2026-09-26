@@ -38,7 +38,7 @@ import { countLabel, issueCounts } from "./lib/counts";
 import type { BoardFilters } from "./lib/filters";
 import type { UpdateBanner } from "./lib/types";
 import { LiveUpdates, patchRows } from "./lib/liveUpdates";
-import type { Agent, AgentsPayload, IssueCard } from "./lib/types";
+import type { Agent, AgentsPayload } from "./lib/types";
 import { cache, resources } from "./lib/resources";
 import { useMaybeResource, useResource } from "./lib/useResource";
 import {

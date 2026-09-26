@@ -73,7 +73,7 @@ export class ApiError extends Error {
   }
 }
 
-const conditional = new ConditionalGet(fetch, sessionKey);
+const conditional = new ConditionalGet((input, init) => fetch(input, init), sessionKey);
 
 async function get<T>(path: string): Promise<T> {
   const { response: resp, value } = await conditional.get<T>(path, sessionHeaders());
