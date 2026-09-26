@@ -90,6 +90,11 @@ def record_launch():
             json.dump(argv_tail, f)
         with open(os.path.join(os.getcwd(), "pi-env.json"), "w") as f:
             json.dump(sorted(os.environ), f)
+        # Only a boolean is recorded: prove the private config was selected
+        # without logging inherited environment values or credentials.
+        expected = os.path.join(os.environ.get("CADENCE_STATE_DIR", ""), "master", "pi")
+        with open(os.path.join(os.getcwd(), "pi-private-config.json"), "w") as f:
+            json.dump(os.environ.get("PI_CODING_AGENT_DIR") == expected, f)
     elif ALIAS and os.environ.get("CADENCE_STATE_DIR"):
         payload = json.dumps({"argv": argv_tail, "env": sorted(os.environ)})
         agents = os.path.join(os.environ["CADENCE_STATE_DIR"], "agents")
