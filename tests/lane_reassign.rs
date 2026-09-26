@@ -272,6 +272,46 @@ fn reassign_keeps_the_worktree_and_one_lane() {
     );
 }
 
+struct ClearStopFail;
+
+impl Drop for ClearStopFail {
+    fn drop(&mut self) {
+        test_env().remove("CADENCE_TEST_STOP_FAILS");
+    }
+}
+
+/// No stop-failure seam existed. This uses the same `ProviderEnv::own`
+/// shape as `CADENCE_TEST_INTERRUPT_PAUSE_MS`: the stop of the previous
+/// agent fails before it is disabled, after the new one has dispatched.
+#[test]
+fn reassign_names_both_aliases_when_the_previous_stop_fails() {
+    let lab = lab();
+    let wt = start_lane(&lab, "D-1", "w-old");
+    test_env().set("CADENCE_TEST_STOP_FAILS", "w-old");
+    let _clear = ClearStopFail;
+    let err = lab
+        .d
+        .operator_rpc(
+            "lane_reassign",
+            json!({
+                "issue": "D-1",
+                "provider": "fake",
+                "alias": "w-new",
+            }),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("w-old"), "{err}");
+    assert!(err.contains("w-new"), "{err}");
+    assert!(err.contains("still live"), "{err}");
+    assert!(agent(&lab, "w-old")["enabled"] == true, "{err}");
+    assert!(agent(&lab, "w-new")["enabled"] == true, "{err}");
+    let mut live = enabled_workers(&lab, &wt);
+    live.sort();
+    assert_eq!(live, vec!["w-new".to_string(), "w-old".to_string()]);
+    assert_eq!(open_worktrees(&show(&lab, "D-1")).len(), 1);
+}
+
 #[test]
 fn two_reassigns_leave_one_enabled_worker() {
     let lab = lab();

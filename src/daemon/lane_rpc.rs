@@ -260,49 +260,6 @@ impl Shared {
         })
     }
 
-    fn launch_policy(
-        &self,
-        provider: &str,
-        kind: &str,
-        model: Option<&str>,
-        effort: Option<&str>,
-    ) -> Result<()> {
-        let spec = crate::adapter::registry::spec(provider, kind)?;
-        if let Some(model) = model {
-            if !spec.launch_params.contains(&"model") {
-                return Err(Error::rejected(format!(
-                    "lane reassign: provider '{provider}' does not take a model"
-                )));
-            }
-            crate::model_defaults::validate_model_id(model)?;
-            if provider == "pi" {
-                let policy = match self.pm_dir() {
-                    Ok(dir) => crate::pi_policy::read(&dir)?,
-                    Err(_) => None,
-                };
-                crate::pi_policy::require_allowed(policy.as_ref(), "worker", model)?;
-            }
-        }
-        if let Some(effort) = effort {
-            if !spec.launch_params.contains(&"effort") {
-                return Err(Error::rejected(format!(
-                    "lane reassign: provider '{provider}' does not take an effort"
-                )));
-            }
-            match provider {
-                "pi" => crate::adapter::registry::pi_effort(effort)?,
-                "claude" => crate::adapter::registry::claude_effort(effort)?,
-                "codex" => crate::adapter::registry::codex_effort(effort)?,
-                other => {
-                    return Err(Error::rejected(format!(
-                        "lane reassign: provider '{other}' has no effort vocabulary"
-                    )))
-                }
-            }
-        }
-        Ok(())
-    }
-
     fn provider_catalog(&self) -> Result<Vec<Value>> {
         let policy = match self.pm_dir() {
             Ok(dir) => crate::pi_policy::read(&dir)?,
@@ -646,9 +603,10 @@ impl Shared {
         if let Some(alias) = alias_arg {
             claim::check_alias(alias, "alias")?;
         }
-        // Policy before any stop, so an off-policy model leaves the
+        // Same policy as kickoff, and in the same place: before the
+        // lock and before any stop, so an off-policy model leaves the
         // current lane running.
-        self.launch_policy(provider, kind, model, effort)?;
+        self.kickoff_launch_policy(provider, kind, model, effort)?;
 
         let _serial = self.dispatch_lock.lock().unwrap_or_else(|e| e.into_inner());
         let pm = self.pm()?;
@@ -790,7 +748,11 @@ impl Shared {
         ) {
             out["comment_error"] = json!(e.to_string());
         }
-        self.rpc_stop(&json!({"alias": previous}))?;
+        if let Err(e) = self.rpc_stop(&json!({"alias": &previous})) {
+            return Err(Error::rejected(format!(
+                "lane reassign dispatched '{new_alias}' but stopping the previous agent '{previous}' failed: {e}. Both '{previous}' and '{new_alias}' are still live"
+            )));
+        }
         out["provider"] = json!(provider);
         out["group"] = json!(lane.group);
         out["previous"] = json!(previous);
