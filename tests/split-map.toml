@@ -312,6 +312,7 @@ tests = [
     "cad561_the_actor_loop_stops_claiming_turns_while_the_update_drains",
     "cad561_update_is_refused_inside_a_pane",
     "cad561_update_refuses_a_dropped_alias_claiming_the_operator",
+    "cad628_detached_agent_cannot_request_rollback_with_a_forged_operator",
 ]
 helpers = [
     "wait_lines",

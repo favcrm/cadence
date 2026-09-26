@@ -3799,7 +3799,8 @@ impl cadence_agent::update::UpdateHost for RealUpdateHost<'_> {
             if offline && args[0] == "daemon" {
                 // Never shut down a daemon that appeared after the
                 // offline proof. Its own singleton is the final start
-                // protection; no recovery route restores or edits a DB.
+                // protection; this route never restores a backup or
+                // bypasses the selected daemon's schema checks.
                 if !daemon_lock_free(self.state_dir) {
                     return Err(Error::rejected(
                         "daemon acquired the state-dir lock before updater recovery — retry",
