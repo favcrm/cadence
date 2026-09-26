@@ -1363,6 +1363,11 @@ fn every_operator_only_route_runs_the_process_proof() {
     for (path, body) in [
         ("/api/settings/model-defaults", doc),
         ("/api/threads/lead/messages", r#"{"text":"hi"}"#),
+        // CAD-561: the Update button and its check are the same class —
+        // an agent's process can never start an update, and the refusal
+        // lands before the route reads anything.
+        ("/api/update", "{}"),
+        ("/api/update/check", "{}"),
     ] {
         let out = Command::new("bash")
             .args([
