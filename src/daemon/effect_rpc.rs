@@ -125,7 +125,10 @@ impl Shared {
 
     /// The caller's project default account for `platform` (the same
     /// resolution `platform_check` documents): `params.project`, else
-    /// the caller agent's cwd's project.
+    /// the caller agent's cwd's project. A platform with a built-in
+    /// account (the `local` outbox, CAD-577) falls back to it when the
+    /// project names no default — so a slot bound to `local` needs no
+    /// setup.
     fn default_account(&self, agent: &str, platform: &str, params: &Value) -> Result<String> {
         let project = match optional_str(params, "project") {
             Some(p) => identifier(p, "Project")?,
@@ -143,15 +146,22 @@ impl Shared {
                 })?
             }
         };
-        self.store
-            .platform_default(&project, platform)?
-            .map(|d| d.account)
-            .ok_or_else(|| {
-                Error::rejected(format!(
-                    "project '{project}' names no default account for '{platform}' — \
-                     pass 'account'"
-                ))
-            })
+        match self.store.platform_default(&project, platform)? {
+            Some(d) => Ok(d.account),
+            // The built-in account is always available — a project that
+            // never set a default still resolves (CAD-577).
+            None if crate::platform::is_builtin(
+                platform,
+                crate::platform::BUILTIN_LOCAL_ACCOUNT,
+            ) =>
+            {
+                Ok(crate::platform::BUILTIN_LOCAL_ACCOUNT.to_string())
+            }
+            None => Err(Error::rejected(format!(
+                "project '{project}' names no default account for '{platform}' — \
+                 pass 'account'"
+            ))),
+        }
     }
 
     /// The registered adapter for `platform` — a platform with none

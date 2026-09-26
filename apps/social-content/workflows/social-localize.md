@@ -88,13 +88,13 @@ run's head before staging anything; a REVISE goes back, it never
 reaches this step.
 
 Stage one `publish` send per destination in {{destinations}} on the
-`publish` slot: `platform_call` with platform `local`, account
-`outbox`, tool `publish`, and input naming the project, a title naming
-the destination (`{{slug}} — <destination>`), the caption body from
-`social/{{slug}}/caption-<destination>.md`, and the run's image as an
-attachment when one exists. Report each staged effect id. The
-operator's release in Needs-you moves each post to the outbox — this
-step never publishes directly.
+`publish` slot: `platform_call` with platform `local`, account `local`
+(the built-in outbox — no enrollment), tool `publish`, and input naming
+the project, a title naming the destination (`{{slug}} — <destination>`),
+the caption body from `social/{{slug}}/caption-<destination>.md`, and
+the run's image as an attachment when one exists. Report each staged
+effect id. The operator's release in Needs-you moves each post to the
+outbox — this step never publishes directly.
 
 ### Acceptance
 - [ ] one `publish` send per destination is staged on the `publish` slot — a waiting row per destination in Needs-you, its preview the caption

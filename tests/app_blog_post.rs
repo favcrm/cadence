@@ -727,3 +727,353 @@ fn blog_post_app_demo() {
 
     say("\n    demo complete: install -> approve -> run -> staged -> released -> outbox -> pm");
 }
+
+// ---------- CAD-577: installed means ready to run ----------
+
+/// CAD-577's own demo, from a **clean** state: no CLI setup beyond the
+/// install, no hand-enrolled credential, no hand-made grant, no agent
+/// inputs typed one by one. The operator's board path is:
+///
+///   install `apps/blog-post` → approve → set the app's default team →
+///   New post with only a topic → the plan waits for approval →
+///   approve → the Publish step stages on the built-in `local` account
+///   the approval derived a grant for → release in Needs-you → the
+///   outbox item lands.
+///
+/// Every step is a real `cadence` command or daemon RPC; the operator
+/// steps go through the suite's detached-operator helper. The team is
+/// set through the board's `app_set_team` relay (`app set-team` on the
+/// CLI is the same RPC), and the propose names only `topic` and `slug`
+/// — the saved team fills the five agent roles, which is what makes a
+/// fresh install runnable with no CLI.
+#[test]
+fn blog_post_installed_is_ready_to_run() {
+    common::suite_slot();
+    common::hook_bin_on_path();
+    let topic = "installed means ready";
+    let slug = "installed-means-ready";
+    let request = "cad577-publish";
+
+    banner("0. sandbox up (temp state, port 3110-3199)");
+    let mut host = Host::new();
+    let v = host.up("blog577");
+    let state = PathBuf::from(v["state_dir"].as_str().unwrap());
+    let pm_dir = PathBuf::from(v["pm_dir"].as_str().unwrap());
+    let board = v["url"].as_str().unwrap().to_string();
+    test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
+    let d = TestDaemon {
+        dir: TempDir::new().unwrap(),
+        state: state.clone(),
+        handle: None,
+        process: None,
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while !client::rpc_timeout(&state, "health", json!({}), Duration::from_secs(2)).is_ok() {
+        assert!(std::time::Instant::now() < deadline, "daemon never healthy");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    say(&format!("    daemon healthy on {board}, state {state:?}"));
+
+    banner("1. project + repo");
+    let repo = init_repo(&host.home());
+    let repo_s = repo.to_str().unwrap().to_string();
+    op(
+        &host.home(),
+        &state,
+        &[
+            "issue", "project", "add", "demo", "--prefix", "D", "--repo", &repo_s,
+        ],
+    );
+
+    banner("2. install + approve apps/blog-post (no enroll, no grant)");
+    let app_src = Path::new(env!("CARGO_MANIFEST_DIR")).join("apps/blog-post");
+    let app_src_s = app_src.to_str().unwrap().to_string();
+    op(
+        &host.home(),
+        &state,
+        &["app", "install", &app_src_s, "--project", "demo"],
+    );
+    op(
+        &host.home(),
+        &state,
+        &["app", "approve", "blog-post", "--project", "demo"],
+    );
+    // The built-in account is always listed — no enrollment happened.
+    let accounts = d.operator_rpc("platform_accounts", json!({})).unwrap();
+    let builtin = accounts["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["platform"] == "local" && a["account"] == "local")
+        .cloned()
+        .expect("built-in local/local listed with no enrollment");
+    assert_eq!(builtin["custody"], "built-in", "{builtin}");
+    say("    platform accounts lists local/local as built-in");
+
+    banner("3. agents: pm + the five lanes the team will name");
+    let lanes_home = TempDir::new().unwrap();
+    let pm_lane = LaneShell::spawn(lanes_home.path());
+    plant_member_pane(&d, "pm", "inbox", None, pm_lane.pid());
+    for a in ["strat", "draft", "img", "rev"] {
+        register_member(&d, a, "pm", &repo);
+    }
+    let mut pub_lane = LaneShell::spawn(lanes_home.path());
+    plant_member_pane(&d, "pub", "claude", Some("pm"), pub_lane.pid());
+    let mut strat = LaneShell::spawn(lanes_home.path());
+    let mut draft = LaneShell::spawn(lanes_home.path());
+    let mut img = LaneShell::spawn(lanes_home.path());
+    let mut rev = LaneShell::spawn(lanes_home.path());
+    for (lane, alias) in [
+        (&mut strat, "strat"),
+        (&mut draft, "draft"),
+        (&mut img, "img"),
+        (&mut rev, "rev"),
+        (&mut pub_lane, "pub"),
+    ] {
+        let (rc, out) = lane.run(&format!("export CADENCE_ALIAS={alias}"));
+        assert_eq!(rc, 0, "{out}");
+    }
+    op(&host.home(), &state, &["agent", "list"]);
+
+    banner("4. the app's default team (the operator's board write)");
+    let out = op(
+        &host.home(),
+        &state,
+        &[
+            "app",
+            "set-team",
+            "blog-post",
+            "--project",
+            "demo",
+            "--role",
+            "strategist=strat",
+            "--role",
+            "writer=draft",
+            "--role",
+            "designer=img",
+            "--role",
+            "reviewer=rev",
+            "--role",
+            "publisher=pub",
+        ],
+    );
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["team"]["publisher"], json!("pub"), "{v}");
+    say("    app set-team: five roles saved with the install record");
+
+    banner("5. New post with only a topic — the team fills the rest");
+    let out = op(
+        &host.home(),
+        &state,
+        &[
+            "plan",
+            "propose",
+            "--project",
+            "demo",
+            "--workflow",
+            "blog-post/blog-post",
+            "--input",
+            &format!("topic={topic}"),
+            "--input",
+            &format!("slug={slug}"),
+        ],
+    );
+    let v: Value = serde_json::from_str(&out).unwrap();
+    let epic = v["epic"].as_str().unwrap().to_string();
+    let tickets: Vec<String> = v["tickets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(tickets.len(), 5, "{v}");
+    // The saved team reached the rendered plan: each ticket's owner is
+    // the agent the operator picked, not a missing-input refusal.
+    for (id, who) in [
+        (&tickets[0], "strat"),
+        (&tickets[1], "draft"),
+        (&tickets[2], "img"),
+        (&tickets[3], "rev"),
+        (&tickets[4], "pub"),
+    ] {
+        let show = op(&host.home(), &state, &["issue", "show", id]);
+        assert!(show.contains(who), "{id} owner should be {who}: {show}");
+    }
+    say(&format!(
+        "    plan {epic}: tickets {tickets:?} (owners from the saved team)"
+    ));
+    // The approval derived the Publish step's grant on the built-in
+    // account — no hand-made grant anywhere.
+    let grants = d
+        .operator_rpc("platform_grants", json!({"agent": "pub"}))
+        .unwrap();
+    let g = grants["grants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["platform"] == "local" && g["account"] == "local")
+        .cloned()
+        .expect("approval derived pub's local/local grant");
+    assert_eq!(g["scopes"], json!(["publish"]), "{g}");
+    say("    app approval derived pub's grant: local/local publish");
+
+    banner("6. approve the plan; the run's stopped team agents resume");
+    op(&host.home(), &state, &["plan", "approve", &epic]);
+    op(&host.home(), &state, &["plan", "show", &epic]);
+
+    banner("7. Brief -> Draft -> Images -> Review");
+    run_ticket(
+        &host,
+        &d,
+        &repo,
+        &mut strat,
+        "strat",
+        &tickets[0],
+        &format!(
+            "mkdir -p posts/{slug} && cat > posts/{slug}/brief.md <<'EOF'\n\
+             # Brief: {topic}\n\n\
+             audience: app operators\n\
+             angle: an install runs from the board with no CLI\n\
+             keywords: ready to run, default team, built-in outbox\n\n\
+             sources:\n\
+             - https://example.com/ready-to-run\n\
+             - https://example.com/default-team\n\
+             - https://example.com/builtin-outbox\nEOF"
+        ),
+    );
+    run_ticket(
+        &host,
+        &d,
+        &repo,
+        &mut draft,
+        "draft",
+        &tickets[1],
+        &format!(
+            "cat > posts/{slug}/post.md <<'EOF'\n\
+             # {topic}\n\n\
+             An install is ready to run when the board can start it: the\n\
+             operator approves, sets the team once, and types a topic. The\n\
+             built-in outbox needs no enrollment, and the approval derives\n\
+             exactly the scope the Publish step declared.\n\n\
+             ![hero](images/hero.svg)\nEOF"
+        ),
+    );
+    run_ticket(
+        &host, &d, &repo, &mut img, "img", &tickets[2],
+        &format!(
+            "mkdir -p posts/{slug}/images && \
+             printf '%s' '<svg xmlns=\"http://www.w3.org/2000/svg\"/>' > posts/{slug}/images/hero.svg && \
+             printf '%s' '<svg xmlns=\"http://www.w3.org/2000/svg\"/>' > posts/{slug}/images/social.svg"
+        ),
+    );
+    run_ticket(
+        &host,
+        &d,
+        &repo,
+        &mut rev,
+        "rev",
+        &tickets[3],
+        &format!(
+            "cat > posts/{slug}/review.md <<'EOF'\n\
+             # Review: {topic}\n\n\
+             rubric: rubrics/blog.md\n\
+             verdict: PASS\n\n\
+             The draft follows the brief, claims cite the listed sources, and\n\
+             both images carry alt text. Reviewed by an agent that neither\n\
+             wrote nor illustrated the post.\nEOF"
+        ),
+    );
+
+    banner("8. Publish: stage on the built-in account the grant covers");
+    let (rc, out) = pub_lane.run(&format!("cd {}", repo.display()));
+    assert_eq!(rc, 0, "cd {}: {out}", repo.display());
+    let out = op(
+        &host.home(),
+        &d.state,
+        &["dispatch", &tickets[4], "--to", "pub", "--reply-to", "pm"],
+    );
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["dispatched"], json!(true), "{v}");
+    let pub_wt = PathBuf::from(v["worktree"].as_str().unwrap());
+    let pub_branch = v["branch"].as_str().unwrap().to_string();
+    say(&format!(
+        "    {} -> pub: worktree {}, branch {pub_branch}",
+        tickets[4],
+        pub_wt.display()
+    ));
+    let conn = rusqlite::Connection::open(state.join("cadence.sqlite3")).unwrap();
+    conn.execute(
+        "UPDATE agents SET cwd=?1 WHERE alias='pub'",
+        rusqlite::params![pub_wt.to_str().unwrap()],
+    )
+    .unwrap();
+    let (rc, out) = pub_lane.run(&format!("cd {}", pub_wt.display()));
+    assert_eq!(rc, 0, "cd {}: {out}", pub_wt.display());
+    lane_work(
+        &mut pub_lane,
+        &pub_wt,
+        &tickets[4],
+        &format!(
+            "grep -q 'verdict: PASS' posts/{slug}/review.md && echo 'review verdict: PASS'\n\
+             ls posts/{slug} posts/{slug}/images"
+        ),
+    );
+    // The workflow names the built-in account (`local`); no account is
+    // passed, so the call resolves the default and the derived grant
+    // covers it.
+    let frame = pub_lane.rpc(
+        &state,
+        "platform_call",
+        json!({"platform": "local", "tool": "publish",
+               "input": {"project": "demo",
+                         "title": topic,
+                         "body": "An install is ready to run when the board can start it.\n",
+                         "attachments": [format!("posts/{slug}/post.md"),
+                                         format!("posts/{slug}/images/hero.svg"),
+                                         format!("posts/{slug}/images/social.svg")]},
+               "request": request}),
+    );
+    assert_eq!(frame["ok"], json!(true), "stage refused: {frame}");
+    let eid = frame["result"]["effect_id"].as_str().unwrap().to_string();
+    assert_eq!(frame["result"]["result"], json!("staged"), "{frame}");
+    say(&format!("    pub staged the publish send — effect {eid}"));
+
+    banner("9. Needs-you holds the staged send; release lands the item");
+    let row = effect_row(&d, request).expect("staged row");
+    assert_eq!(row["state"], json!("waiting"), "{row}");
+    let overview = common::overview_at(&host.home(), &state, Some(&pm_dir), &[]);
+    let needs = serde_json::to_string(&overview["needs_me"]).unwrap();
+    assert!(
+        needs.contains(request) || needs.contains(&eid),
+        "Needs-you lacks the staged send: {needs}"
+    );
+    let out = d
+        .operator_rpc(
+            "agent_respond",
+            json!({"alias": "pub", "request": request, "decision": "accept"}),
+        )
+        .unwrap_or_else(|e| panic!("release: {e}"));
+    let row = out["effect"].clone();
+    assert_eq!(row["state"], json!("done"), "{row}");
+    assert_eq!(row["outcome"]["verified"], json!(true), "{row}");
+
+    let outbox = host.xdg_data().join("cadence").join("outbox");
+    let item = outbox.join("demo").join(&eid);
+    let post = std::fs::read_to_string(item.join("post.md")).unwrap();
+    assert!(post.contains(topic), "{post}");
+    assert!(
+        item.join("attachments/hero.svg").exists(),
+        "hero attachment"
+    );
+    say(&format!("    outbox item: {}", item.display()));
+
+    let (alias, body) = outcome_message(&state, &eid).expect("outcome message to pm");
+    assert_eq!(alias, "pm");
+    assert!(body.contains("done"), "{body}");
+    say(&format!("    pm inbox: {}", indent(body.trim())));
+
+    say(
+        "\n    clean-state demo complete: install -> approve -> set team -> topic -> \
+          approve -> staged -> released -> outbox",
+    );
+}

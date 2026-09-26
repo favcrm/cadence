@@ -379,6 +379,30 @@ fn grant(d: &Daemon, agent: &str, platform: &str, account: &str, scopes: &[&str]
     .unwrap_or_else(|e| panic!("grant {agent} {platform}/{account}: {e}"))
 }
 
+/// One enrolled account's row from `platform_accounts`, by platform and
+/// account — never by index: the built-in `local/local` row is always
+/// listed first (CAD-577), so `accounts[0]` is not "the only enrolled
+/// one" any more.
+fn account_row(d: &Daemon, platform: &str, account: &str) -> Value {
+    d.rpc("platform_accounts", json!({})).unwrap()["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["platform"] == platform && a["account"] == account)
+        .cloned()
+        .unwrap_or_else(|| panic!("no {platform}/{account} row"))
+}
+
+/// How many enrolled (non-built-in) accounts `platform_accounts` lists.
+fn enrolled_count(d: &Daemon) -> usize {
+    d.rpc("platform_accounts", json!({})).unwrap()["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|a| a["custody"] != "built-in")
+        .count()
+}
+
 #[path = "support/operator.rs"]
 mod op;
 
@@ -814,7 +838,7 @@ fn rotate_replaces_the_credential_and_keeps_grants() {
         json!({"project": "proj1", "platform": "github", "account": "acme"}),
     )
     .unwrap();
-    let old_fp = d.rpc("platform_accounts", json!({})).unwrap()["accounts"][0]["fingerprint"]
+    let old_fp = account_row(&d, "github", "acme")["fingerprint"]
         .as_str()
         .unwrap()
         .to_string();
@@ -848,7 +872,7 @@ fn rotate_replaces_the_credential_and_keeps_grants() {
         .unwrap();
     assert_eq!(std::fs::read_to_string(cred).unwrap(), TOKEN2);
     // Scopes were kept — the record still carries the enrolled set.
-    let acct = d.rpc("platform_accounts", json!({})).unwrap()["accounts"][0].clone();
+    let acct = account_row(&d, "github", "acme");
     assert_eq!(acct["scopes"], json!(["repo:read", "repo:write"]));
 
     // Audit: the old credential's revoke is named, the re-enroll is
@@ -1125,7 +1149,7 @@ fn concurrent_enrolls_never_split_record_from_custody() {
         .unwrap();
     let bytes = std::fs::read(&cred).unwrap();
     let fp = cadence_agent::secret::fingerprint(&bytes);
-    let record_fp = d.rpc("platform_accounts", json!({})).unwrap()["accounts"][0]["fingerprint"]
+    let record_fp = account_row(d, "github", "acme")["fingerprint"]
         .as_str()
         .unwrap()
         .to_string();
@@ -1165,11 +1189,9 @@ fn concurrent_enrolls_never_split_record_from_custody() {
         // Revoke won the lock first — the rotate found no record.
         assert!(e.to_string().contains("enroll"), "rotate: {e}");
     }
-    // Either way the account is revoked: no row, no custody bytes.
-    assert!(d.rpc("platform_accounts", json!({})).unwrap()["accounts"]
-        .as_array()
-        .unwrap()
-        .is_empty());
+    // Either way the account is revoked: no enrolled row, no custody
+    // bytes.
+    assert_eq!(enrolled_count(d), 0, "the revoked account still lists");
     assert!(!std::fs::read_dir(d.state.join("custody"))
         .unwrap()
         .any(|e| e.unwrap().file_name().to_string_lossy().ends_with(".cred")));
@@ -1199,10 +1221,7 @@ fn revoke_reason_cannot_carry_the_credential() {
         .unwrap()
         .any(|e| e.unwrap().file_name().to_string_lossy().ends_with(".cred")));
     assert_eq!(
-        d.rpc("platform_accounts", json!({})).unwrap()["accounts"]
-            .as_array()
-            .unwrap()
-            .len(),
+        enrolled_count(&d),
         1,
         "the refused revoke still tore the record down"
     );

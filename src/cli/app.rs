@@ -75,10 +75,54 @@ pub(crate) enum AppAction {
     },
     /// Approve the app's current structure — `plan propose
     /// --workflow <app>/<wf>` refuses it until this matches the
-    /// installed folder. Operator only, through the daemon.
+    /// installed folder. The approval also derives the app's grants:
+    /// exactly the scopes its workflow steps declare on their bound
+    /// slots, to the agents the app's default team assigns those steps
+    /// (CAD-577). Operator only, through the daemon.
     Approve {
         /// App name.
         name: String,
+        /// Project key.
+        #[arg(long)]
+        project: String,
+    },
+    /// Withdraw the app's approval (CAD-577) — `plan propose
+    /// --workflow <app>/<wf>` refuses again, and every grant the
+    /// approval derived is revoked (a waiting effect that loses a
+    /// scope is closed). The counterpart to `approve`; operator only,
+    /// through the daemon.
+    Revoke {
+        /// App name.
+        name: String,
+        /// Project key.
+        #[arg(long)]
+        project: String,
+    },
+    /// Record the app's default team (CAD-577): one agent alias per
+    /// workflow input role, `<input>=<agent>` repeatable; `<input>=`
+    /// clears a role. The team lives with the install record and is
+    /// not part of the gate digest, so setting it never re-requires
+    /// approval. Operator only, through the daemon.
+    SetTeam {
+        /// App name.
+        name: String,
+        /// `<input>=<agent>` pairs — repeatable.
+        #[arg(long = "role", required = true)]
+        roles: Vec<String>,
+        /// Project key.
+        #[arg(long)]
+        project: String,
+    },
+    /// Join a new Devin worker for one of the app's team roles (CAD-577)
+    /// — the board's "Add worker": a unique role-prefixed alias, under
+    /// the operator (a group root), recorded in the app's default team.
+    /// Operator only, through the daemon.
+    AddWorker {
+        /// App name.
+        name: String,
+        /// The team role the worker fills.
+        #[arg(long)]
+        role: String,
         /// Project key.
         #[arg(long)]
         project: String,
@@ -129,6 +173,29 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
             state_dir,
             "app_approve",
             json!({"project": project, "name": name}),
+        )?,
+        AppAction::Revoke { name, project } => client::rpc(
+            state_dir,
+            "app_revoke",
+            json!({"project": project, "name": name}),
+        )?,
+        AppAction::SetTeam {
+            name,
+            roles,
+            project,
+        } => client::rpc(
+            state_dir,
+            "app_set_team",
+            json!({"project": project, "name": name, "team": roles}),
+        )?,
+        AppAction::AddWorker {
+            name,
+            role,
+            project,
+        } => client::rpc(
+            state_dir,
+            "app_add_worker",
+            json!({"project": project, "name": name, "role": role}),
         )?,
     };
     print_json(&result);

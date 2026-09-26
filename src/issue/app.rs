@@ -100,15 +100,30 @@ pub struct Manifest {
 /// `apps/<name>.yaml` — the install record beside the content folder:
 /// where the bundle came from (a git install pins the commit SHA), when
 /// and by whom, and each slot's binding. In `bindings`, `null` is an
-/// explicit unbind and an absent slot is the `local` default.
+/// explicit unbind and an absent slot is the `local` default. `team`
+/// (CAD-577) is the app's default team — one agent alias per workflow
+/// input role — an operator-only write that is NOT part of the gate
+/// digest (a team change never re-requires approval). `install_id`
+/// (CAD-577) is minted fresh on every install and kept across `app
+/// update`. Approvals and derived grants bind to it: a missing id, or
+/// one from a previous install of the same bytes, is not a match.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Record {
     pub schema: u32,
     pub app: String,
+    /// This install's id. Empty on a record written before install ids
+    /// existed — that never matches an approval, so the operator
+    /// re-approves once.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub install_id: String,
     pub source: Source,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub bindings: BTreeMap<String, Option<String>>,
+    /// The app's default team (CAD-577): input role name → agent alias.
+    /// Stored with the install record, never in the digest.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub team: BTreeMap<String, String>,
     pub installed_at: String,
     pub installed_by: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -175,6 +190,12 @@ fn app_dir(pm_dir: &Path, project: &str, name: &str) -> Result<PathBuf> {
              --project {project}` lists them"
         ))),
     }
+}
+
+/// Whether `apps/<name>/` is a real directory. The grant sweep uses
+/// this to tell a removed app from a digest that failed to read.
+pub fn is_installed(pm_dir: &Path, project: &str, name: &str) -> bool {
+    app_dir(pm_dir, project, name).is_ok()
 }
 
 /// `apps/<name>.yaml` — the install record.
@@ -814,33 +835,98 @@ pub fn approval_key(project: &str, name: &str) -> String {
     format!("{project}/{name}")
 }
 
+/// A fresh id for one install. `app update` keeps whatever install
+/// already wrote; remove deletes the record, so the next install mints
+/// another.
+fn mint_install_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+/// The install id on the record, or empty when the record has none
+/// (a pre-install-id yaml) or cannot be read.
+pub fn current_install_id(pm_dir: &Path, project: &str, name: &str) -> String {
+    read_record(pm_dir, project, name)
+        .map(|r| r.install_id)
+        .unwrap_or_default()
+}
+
+/// Give a legacy record an install id and commit it. The caller already
+/// holds `pm`'s write lock. A record that already has an id is unchanged.
+pub fn ensure_install_id(pm: &Pm, project: &str, name: &str, actor: &str) -> Result<String> {
+    let mut record = read_record(&pm.dir, project, name)?;
+    if !record.install_id.is_empty() {
+        return Ok(record.install_id);
+    }
+    record.install_id = mint_install_id();
+    let path = record_file(&pm.dir, project, name)?;
+    write_record(&path, &record)?;
+    write::commit(
+        pm,
+        &[path],
+        &format!("{project}/{DIR}/{name}: install id assigned"),
+        &[],
+        actor,
+    )?;
+    Ok(record.install_id)
+}
+
+/// An approval covers this install: not withdrawn, the digest is the
+/// one just computed, and `install_id` is the current record's id.
+/// A missing or empty id never matches — an approval from before
+/// install ids, or from a previous install of the same bytes, does not
+/// carry over.
+pub fn approval_binds(payload: &Value, digest: &str, install_id: &str) -> bool {
+    if install_id.is_empty() {
+        return false;
+    }
+    if payload.get("revoked").and_then(Value::as_bool) == Some(true) {
+        return false;
+    }
+    payload.get("digest").and_then(Value::as_str) == Some(digest)
+        && payload.get("install_id").and_then(Value::as_str) == Some(install_id)
+}
+
 /// The Apps board's approval word (CAD-557) — why `approved` is false:
-/// `approved`, `changed` (a record exists but the digest moved — any
-/// bundle or binding edit re-gates the app), `unapproved` (no record),
-/// or `unknown` (the approval store did not read — never shown granted).
-fn approval_state(approvals: Option<&Map<String, Value>>, key: &str, digest: &str) -> &'static str {
+/// `approved`, `changed` (this install's record exists but the digest
+/// moved — any bundle or binding edit re-gates the app), `unapproved`
+/// (no record, or the record belongs to another install), or `unknown`
+/// (the approval store did not read — never shown granted).
+fn approval_state(
+    approvals: Option<&Map<String, Value>>,
+    key: &str,
+    digest: &str,
+    install_id: &str,
+) -> &'static str {
     let Some(approvals) = approvals else {
         return "unknown";
     };
     match approvals.get(key) {
-        Some(p) if p["digest"].as_str() == Some(digest) => "approved",
-        Some(_) => "changed",
+        Some(p) if approval_binds(p, digest, install_id) => "approved",
+        Some(p)
+            if !install_id.is_empty()
+                && p.get("revoked").and_then(Value::as_bool) != Some(true)
+                && p.get("install_id").and_then(Value::as_str) == Some(install_id) =>
+        {
+            "changed"
+        }
+        Some(_) => "unapproved",
         None => "unapproved",
     }
 }
 
-/// Is `digest` the approved digest for `project/app`? An unreachable
-/// daemon is no approval — fail closed, like `plan propose` refusing.
+/// Is `digest` the approved digest for this install of `project/app`?
+/// An unreachable daemon is no approval — fail closed, like `plan
+/// propose` refusing. A missing install id is not a match.
 pub fn approved(
     project: &str,
     name: &str,
     digest: &str,
+    install_id: &str,
     approvals: Option<&Map<String, Value>>,
 ) -> bool {
     approvals
         .and_then(|a| a.get(&approval_key(project, name)))
-        .and_then(|p| p["digest"].as_str())
-        == Some(digest)
+        .is_some_and(|p| approval_binds(p, digest, install_id))
 }
 
 /// `<app>/<workflow>` → both parts, tag-shaped; `None` for a bare name
@@ -1050,8 +1136,10 @@ pub fn install(
     let record = Record {
         schema: 1,
         app: name.clone(),
+        install_id: mint_install_id(),
         source: src.clone(),
         bindings: BTreeMap::new(),
+        team: BTreeMap::new(),
         installed_at: now,
         installed_by: write::actor_who(actor, None),
         updated_at: None,
@@ -1089,6 +1177,7 @@ pub fn install(
             .strip_prefix("workflows/").and_then(|n| n.strip_suffix(".md"))
             .map(str::to_string)).collect::<Vec<_>>(),
         "digest": digest,
+        "install_id": record.install_id,
         "approved": false,
         "note": "unapproved — nothing in the app runs until the operator's \
                  `cadence app approve`",
@@ -1262,6 +1351,11 @@ pub fn update(
     let mut record = record;
     record.source = src;
     record.bindings = bindings;
+    // A legacy record has no id. Mint once here so later updates keep
+    // it; an approval that predates install ids still does not match.
+    if record.install_id.is_empty() {
+        record.install_id = mint_install_id();
+    }
     record.updated_at = Some(crate::issue::time::iso(crate::issue::time::now_epoch()));
     let record_path = record_file(&pm.dir, project_key, name)?;
     write_record(&record_path, &record)?;
@@ -1278,7 +1372,13 @@ pub fn update(
     )?;
     let digest = digest(&pm.dir, project_key, name)?;
     let approvals = fetch_approvals(state_dir);
-    let approved = approved(project_key, name, &digest, approvals.as_ref());
+    let approved = approved(
+        project_key,
+        name,
+        &digest,
+        &record.install_id,
+        approvals.as_ref(),
+    );
     let mut out = json!({
         "project": project_key,
         "name": name,
@@ -1382,10 +1482,98 @@ fn open_plan_epics(pm_dir: &Path, project_key: &str, name: &str, state_dir: &Pat
     open
 }
 
+/// The agents holding a grant this app's approval derived, read from
+/// the daemon's store read-only (CAD-577). Empty when there is no
+/// store yet — no daemon, no derived grant. A store that exists but
+/// cannot be read refuses: "no holders" would let removal delete the
+/// folder and leave the grant behind.
+fn derived_grant_holders(project_key: &str, name: &str, state_dir: &Path) -> Result<Vec<String>> {
+    let db = state_dir.join("cadence.sqlite3");
+    if !db.exists() {
+        return Ok(Vec::new());
+    }
+    let refuse = |why: String| {
+        Error::rejected(format!(
+            "app '{name}' cannot be removed — its derived grants could not be read \
+             ({why}). Fix the store, or revoke first (`cadence app revoke {name} \
+             --project {project_key}`)"
+        ))
+    };
+    let conn = crate::store::open_read_only(&db).map_err(|e| refuse(e.to_string()))?;
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT agent FROM app_grants WHERE app=? ORDER BY agent")
+        .map_err(|e| refuse(e.to_string()))?;
+    let key = approval_key(project_key, name);
+    let rows = stmt
+        .query_map(rusqlite::params![key], |r| r.get::<_, String>(0))
+        .map_err(|e| refuse(e.to_string()))?;
+    let mut holders = Vec::new();
+    for row in rows {
+        holders.push(row.map_err(|e| refuse(e.to_string()))?);
+    }
+    Ok(holders)
+}
+
+/// Withdraw the approval and its derived grants before the folder goes
+/// (CAD-577). The caller holds the tracker write lock across this read,
+/// the side write, and the folder delete — tracker lock, then sqlite,
+/// the same order as approve. A missing store means there is nothing to
+/// revoke. The withdrawal is by `install_id` and happens even when the
+/// approval derived no grant rows — an empty holder list used to leave
+/// the approval in place. If the store exists but cannot be read,
+/// removal refuses.
+fn revoke_derived_on_remove(
+    project_key: &str,
+    name: &str,
+    install_id: &str,
+    state_dir: &Path,
+    actor: &str,
+) -> Result<()> {
+    let db = state_dir.join("cadence.sqlite3");
+    if !db.exists() {
+        return Ok(());
+    }
+    // Fail closed: a store that exists but cannot be read is not "no
+    // holders". The read runs even when it returns an empty list.
+    let holders = derived_grant_holders(project_key, name, state_dir)?;
+    let refuse = |why: &str| {
+        let what = if holders.is_empty() {
+            "its approval".to_string()
+        } else {
+            format!("the grants its approval derived ({})", holders.join(", "))
+        };
+        Error::rejected(format!(
+            "app '{name}' still holds {what} — revoke them first \
+             (`cadence app revoke {name} --project {project_key}`): {why}"
+        ))
+    };
+    let store = crate::store::Store::open_side(&db).map_err(|e| refuse(&e.to_string()))?;
+    let by = if actor.is_empty() { "cli" } else { actor };
+    let payload = json!({
+        "project": project_key,
+        "name": name,
+        "install_id": install_id,
+        "digest": Value::Null,
+        "revoked": true,
+        "by": by,
+        "at": crate::issue::time::iso(crate::issue::time::now_epoch()),
+        "reason": "removed",
+    });
+    store
+        .app_revoke_with_record(payload, &approval_key(project_key, name), by)
+        .map_err(|e| refuse(&e.to_string()))?;
+    Ok(())
+}
+
 /// `cadence app remove <app> --project <key>` — delete the content
 /// folder and its install record in one tracker commit. Refuses while a
 /// plan proposed from the app is still open — an open plan's tickets
-/// keep their provenance readable.
+/// keep their provenance readable. Revokes the approval's derived
+/// grants first (CAD-577): deleting the folder is a tracker write the
+/// daemon does not see, so the grants are withdrawn here, on a side
+/// connection that does not run restart recovery. The tracker write
+/// lock is taken before that read and held through the folder delete,
+/// so an approve already inside the lock cannot commit a grant afterwards.
 pub fn remove(
     pm: &Pm,
     project_key: &str,
@@ -1404,7 +1592,12 @@ pub fn remove(
             open.join(", ")
         )));
     }
+    // Before the holder read, and held through the revoke and the
+    // folder delete. Approve takes this lock and then writes sqlite;
+    // reading holders first lets that approve commit into the gap.
     let _lock = pm.lock()?;
+    let install_id = current_install_id(&pm.dir, project_key, name);
+    revoke_derived_on_remove(project_key, name, &install_id, state_dir, actor)?;
     std::fs::remove_dir_all(&dir)?;
     if record_path.exists() {
         std::fs::remove_file(&record_path)?;
@@ -1515,11 +1708,355 @@ pub fn set(
         "name": name,
         "bindings": effective,
         "digest": digest,
-        "approved": approved(project_key, name, &digest, approvals.as_ref()),
+        "approved": approved(
+            project_key,
+            name,
+            &digest,
+            &record.install_id,
+            approvals.as_ref(),
+        ),
         "committed": true,
         "warnings": warnings,
     });
     write::attach_foreign(&mut out, &foreign);
+    Ok(out)
+}
+
+/// `cadence app set-team <app> --role <input>=<agent> … --project <key>`
+/// (CAD-577) — record the app's default team: one agent alias per
+/// workflow input role. The team lives with the install record and is
+/// NOT part of the gate digest, so setting it never re-requires
+/// approval. Each role must be an input some workflow's step names as
+/// its agent (the team inputs the drawer fills); each agent must be a
+/// registered alias. An empty `--role <input>=` clears that role.
+/// Operator-only at the daemon (the board relays it through
+/// `operator_connection`); this function itself is the write.
+pub fn set_team(
+    pm: &Pm,
+    project_key: &str,
+    name: &str,
+    roles: &[String],
+    state_dir: &Path,
+    actor: &str,
+) -> Result<Value> {
+    if roles.is_empty() {
+        return Err(Error::rejected(
+            "app set-team needs <input>=<agent> — `cadence app show` lists the roles",
+        ));
+    }
+    model::check_key(project_key)?;
+    let _ = app_dir(&pm.dir, project_key, name)?;
+    let mut record = read_record(&pm.dir, project_key, name)?;
+    let roles_declared = team_roles(&pm.dir, project_key, name)?;
+    let known = daemon_aliases(state_dir);
+    let known: Option<HashSet<String>> = if known.is_empty() {
+        None
+    } else {
+        Some(known.into_iter().collect())
+    };
+    for role in roles {
+        let Some((input, agent)) = role.split_once('=') else {
+            return Err(Error::rejected(format!(
+                "app set-team takes <input>=<agent> — got '{role}'"
+            )));
+        };
+        if !roles_declared.iter().any(|r| r == input) {
+            return Err(Error::rejected(format!(
+                "app '{name}' has no team role '{input}' — its workflows name: {}",
+                if roles_declared.is_empty() {
+                    "none".to_string()
+                } else {
+                    roles_declared.join(", ")
+                }
+            )));
+        }
+        if agent.is_empty() {
+            record.team.remove(input);
+            continue;
+        }
+        crate::proto::identifier(agent, "agent alias")?;
+        if let Some(known) = &known {
+            if !known.contains(agent) {
+                return Err(Error::rejected(format!(
+                    "agent '{agent}' is not registered — `cadence agent list` lists them"
+                )));
+            }
+        }
+        record.team.insert(input.to_string(), agent.to_string());
+    }
+    let _lock = pm.lock()?;
+    let record_path = record_file(&pm.dir, project_key, name)?;
+    write_record(&record_path, &record)?;
+    let foreign = write::commit(
+        pm,
+        &[record_path],
+        &format!("{project_key}/{DIR}/{name}: default team set"),
+        &[],
+        actor,
+    )?;
+    let mut out = json!({
+        "project": project_key,
+        "name": name,
+        "team": record.team,
+        "committed": true,
+    });
+    write::attach_foreign(&mut out, &foreign);
+    Ok(out)
+}
+
+/// The team roles an app's workflows declare: every input some step
+/// names as its `agent:` (the same set the board's drawer fills by
+/// role). Sorted, deterministic. Public so the daemon's "Add worker"
+/// can check the role it is asked to fill (CAD-577).
+pub fn team_roles(pm_dir: &Path, project_key: &str, name: &str) -> Result<Vec<String>> {
+    let dir = app_dir(pm_dir, project_key, name)?;
+    let mut roles: Vec<String> = Vec::new();
+    for (rel, path) in bundle_files(&dir)? {
+        let Some(_wf) = rel
+            .strip_prefix("workflows/")
+            .and_then(|n| n.strip_suffix(".md"))
+        else {
+            continue;
+        };
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let Ok(tpl) = workflow::parse_template(&text) else {
+            continue;
+        };
+        let declared: HashSet<&String> = tpl.inputs.keys().collect();
+        let (_, body) = parse::split_front(&text).unwrap_or(("", ""));
+        for meta in workflow::ticket_meta(body).unwrap_or_default() {
+            for (key, value) in meta {
+                if key != "agent" {
+                    continue;
+                }
+                // The role is the input name whether the step names it
+                // literally or as `{{role}}`.
+                let role = value
+                    .trim()
+                    .strip_prefix("{{")
+                    .and_then(|v| v.strip_suffix("}}"))
+                    .map(str::trim)
+                    .unwrap_or(value.trim());
+                if declared.contains(&role.to_string()) && !roles.contains(&role.to_string()) {
+                    roles.push(role.to_string());
+                }
+            }
+        }
+    }
+    roles.sort();
+    Ok(roles)
+}
+
+/// One slot an app's workflow steps declare with `uses:` and the
+/// connection it is bound to — the raw material of the app's grant
+/// policy (CAD-577). `binding` is the effective connection name
+/// (`None` when the slot is explicitly unbound).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SlotUse {
+    pub slot: String,
+    pub binding: Option<String>,
+}
+
+/// Every distinct slot some workflow step declares with `uses:`, with
+/// the slot's effective binding — sorted by slot. This is what
+/// `app_approve` turns into the app's grant policy: each used slot
+/// declares its own name as the scope it needs on the bound
+/// connection (the local adapter's `publish` tool declares exactly
+/// that scope).
+pub fn slot_uses(pm_dir: &Path, project_key: &str, name: &str) -> Result<Vec<SlotUse>> {
+    let dir = app_dir(pm_dir, project_key, name)?;
+    let record = read_record(pm_dir, project_key, name)?;
+    let manifest = read_manifest(pm_dir, project_key, name)?;
+    let mut slots: Vec<String> = Vec::new();
+    for (rel, path) in bundle_files(&dir)? {
+        if rel
+            .strip_prefix("workflows/")
+            .and_then(|n| n.strip_suffix(".md"))
+            .is_none()
+        {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        for slot in workflow_slots(&text).unwrap_or_default() {
+            if manifest.connections.iter().any(|s| s == &slot) && !slots.contains(&slot) {
+                slots.push(slot);
+            }
+        }
+    }
+    slots.sort();
+    Ok(slots
+        .into_iter()
+        .map(|slot| SlotUse {
+            binding: record.binding(&slot).map(str::to_string),
+            slot,
+        })
+        .collect())
+}
+
+/// The per-ticket `(agent, uses-slots)` a rendered plan declares — the
+/// agents a run assigns to each step and the slots those steps use.
+/// Parsed from the rendered text's ticket metadata, so it names the
+/// aliases the run actually carries (an input placeholder already
+/// substituted).
+pub fn run_uses(text: &str) -> Vec<(Option<String>, Vec<String>)> {
+    let Ok((_, body)) = parse::split_front(text) else {
+        return Vec::new();
+    };
+    let Ok(metas) = workflow::ticket_meta(body) else {
+        return Vec::new();
+    };
+    metas
+        .into_iter()
+        .map(|meta| {
+            let mut agent = None;
+            let mut slots = Vec::new();
+            for (key, value) in meta {
+                match key.as_str() {
+                    "agent" => agent = Some(value),
+                    "uses" => {
+                        for tok in value
+                            .trim_start_matches('[')
+                            .trim_end_matches(']')
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|t| !t.is_empty())
+                        {
+                            slots.push(tok.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            (agent, slots)
+        })
+        .collect()
+}
+
+/// One derived grant the app's approval records: `agent` may call
+/// `platform`/`account` at `scopes` (CAD-577). The scope is the slot
+/// name — the local adapter's `publish` tool declares exactly that
+/// scope — so a grant can never exceed what a step declared.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DerivedGrant {
+    pub agent: String,
+    pub platform: String,
+    pub account: String,
+    pub scopes: Vec<String>,
+}
+
+/// The grants an app's approval derives (CAD-577): for every workflow
+/// step that declares `uses: <slot>` and an `agent: {{role}}`, the
+/// agent the app's default team assigns to that role gets the slot's
+/// scope on the slot's bound connection. The operator sets the team
+/// (an operator-only write), so an agent can never widen its own grant
+/// by naming itself at propose. A slot with no effective binding, or a
+/// role with no team entry, derives nothing — a grant never names a
+/// connection the operator did not choose.
+pub fn derive_grants(pm_dir: &Path, project_key: &str, name: &str) -> Result<Vec<DerivedGrant>> {
+    let dir = app_dir(pm_dir, project_key, name)?;
+    let record = read_record(pm_dir, project_key, name)?;
+    let manifest = read_manifest(pm_dir, project_key, name)?;
+    let mut out: Vec<DerivedGrant> = Vec::new();
+    for (rel, path) in bundle_files(&dir)? {
+        if rel
+            .strip_prefix("workflows/")
+            .and_then(|n| n.strip_suffix(".md"))
+            .is_none()
+        {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let Ok((_, body)) = parse::split_front(&text) else {
+            continue;
+        };
+        let Ok(metas) = workflow::ticket_meta(body) else {
+            continue;
+        };
+        for meta in metas {
+            let mut role: Option<String> = None;
+            let mut slots: Vec<String> = Vec::new();
+            for (key, value) in meta {
+                match key.as_str() {
+                    "agent" => {
+                        // The role placeholder `{{role}}` names an input;
+                        // a literal alias is the app's own fixed choice.
+                        let inner = value
+                            .trim()
+                            .strip_prefix("{{")
+                            .and_then(|v| v.strip_suffix("}}"))
+                            .map(str::trim)
+                            .map(str::to_string);
+                        role = inner.or(Some(value));
+                    }
+                    "uses" => {
+                        for tok in value
+                            .trim_start_matches('[')
+                            .trim_end_matches(']')
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|t| !t.is_empty())
+                        {
+                            slots.push(tok.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let Some(role) = role else { continue };
+            // The agent the team assigns to this role — the operator's
+            // choice, never a proposer input. A literal alias the
+            // template hard-codes is used as-is (the app author's own
+            // reviewed choice).
+            let agent = if workflow::parse_template(&text)
+                .ok()
+                .is_some_and(|t| t.inputs.contains_key(&role))
+            {
+                match record.team.get(&role) {
+                    Some(a) => a.clone(),
+                    None => continue,
+                }
+            } else {
+                role.clone()
+            };
+            for slot in &slots {
+                if !manifest.connections.iter().any(|s| s == slot) {
+                    continue;
+                }
+                let Some(conn) = record.binding(slot) else {
+                    continue;
+                };
+                // CAD-577 derives grants for the built-in `local`
+                // connection (account `local`). The generic
+                // connection→account mapping lands with CAD-585; until
+                // then a slot bound to any other connection derives no
+                // grant rather than guessing an account.
+                if conn != crate::platform::local::PLATFORM {
+                    continue;
+                }
+                match out
+                    .iter_mut()
+                    .find(|g| g.agent == agent && g.platform == conn)
+                {
+                    Some(g) => {
+                        if !g.scopes.contains(slot) {
+                            g.scopes.push(slot.clone());
+                        }
+                    }
+                    None => out.push(DerivedGrant {
+                        agent: agent.clone(),
+                        platform: conn.to_string(),
+                        account: crate::platform::BUILTIN_LOCAL_ACCOUNT.to_string(),
+                        scopes: vec![slot.clone()],
+                    }),
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| (&a.agent, &a.platform).cmp(&(&b.agent, &b.platform)));
+    for g in &mut out {
+        g.scopes.sort();
+        g.scopes.dedup();
+    }
     Ok(out)
 }
 
@@ -1713,14 +2250,20 @@ fn describe(
         Ok(d) => {
             row["digest"] = json!(d);
             row["approved"] = match approvals {
-                Some(a) => json!(approved(project, name, &d, Some(a))),
+                Some(a) => json!(approved(project, name, &d, &record.install_id, Some(a))),
                 None => json!("unknown — daemon unreachable"),
             };
-            row["approval"] = json!(approval_state(approvals, &approval_key(project, name), &d));
+            row["approval"] = json!(approval_state(
+                approvals,
+                &approval_key(project, name),
+                &d,
+                &record.install_id,
+            ));
         }
         Err(e) => row["error"] = json!(e.to_string()),
     }
     row["source"] = serde_json::to_value(&record.source).unwrap_or(Value::Null);
+    row["team"] = json!(record.team);
     row["installed_at"] = json!(record.installed_at);
     row["installed_by"] = json!(record.installed_by);
     row["updated_at"] = json!(record.updated_at);
@@ -1827,7 +2370,10 @@ pub fn show(pm: &Pm, project_key: &str, name: &str, state_dir: &Path) -> Result<
 /// `plan propose --workflow <app>/<wf>` resolution — the daemon's read:
 /// the app must be installed (record included), its current digest must
 /// match the operator's recorded approval (`app_unapproved` otherwise),
-/// then the workflow renders exactly as a stored one would.
+/// then the workflow renders exactly as a stored one would. The app's
+/// saved default team (CAD-577) fills any team role the proposal left
+/// unset — the operator set it, so a fresh install runs with only a
+/// topic; an explicit input still wins.
 pub fn plan_text(
     pm_dir: &Path,
     app_approvals: &std::collections::HashMap<String, Value>,
@@ -1837,7 +2383,7 @@ pub fn plan_text(
     provided: &BTreeMap<String, String>,
 ) -> Result<String> {
     let _ = app_dir(pm_dir, project, app)?;
-    let _ = read_record(pm_dir, project, app)?;
+    let record = read_record(pm_dir, project, app)?;
     let text = read_workflow(pm_dir, project, app, wf)?;
     // The digest covers THIS buffer for the rendered workflow — the
     // bytes the operator approved are the bytes rendered, even if a
@@ -1846,8 +2392,7 @@ pub fn plan_text(
     let digest = digest_over(pm_dir, project, app, &[(rel.as_str(), text.as_str())])?;
     let ok = app_approvals
         .get(&approval_key(project, app))
-        .and_then(|p| p["digest"].as_str())
-        == Some(digest.as_str());
+        .is_some_and(|p| approval_binds(p, digest.as_str(), &record.install_id));
     if !ok {
         return Err(Error::invalid(
             "app_unapproved",
@@ -1859,7 +2404,22 @@ pub fn plan_text(
             ),
         ));
     }
-    workflow::render(&text, provided)
+    // The saved default team fills any team role THIS workflow declares
+    // and the proposal left unset (CAD-577). The team record is the
+    // union across the app's workflows; filling a role another workflow
+    // declares makes `render` refuse `unknown input`. An explicit input
+    // still wins: the caller named that agent.
+    let declared = workflow::parse_template(&text).ok();
+    let mut inputs = provided.clone();
+    for (role, agent) in &record.team {
+        if declared
+            .as_ref()
+            .is_some_and(|tpl| tpl.inputs.contains_key(role))
+        {
+            inputs.entry(role.clone()).or_insert_with(|| agent.clone());
+        }
+    }
+    workflow::render(&text, &inputs)
 }
 
 /// `app approve`'s view of the INSTALLED folder — the same strict scan
@@ -1906,9 +2466,10 @@ pub fn board_rows(pm_dir: &Path, project: &str, state_dir: &Path) -> Vec<Value> 
         let checked = check_installed(pm_dir, project, &name, &agents, &agent_sources)
             .map_err(|e| e.to_string());
         let app_digest = digest(pm_dir, project, &name);
+        let install_id = current_install_id(pm_dir, project, &name);
         let approved = match &app_digest {
             Ok(d) => match &approvals {
-                Some(a) => json!(approved(project, &name, d, Some(a))),
+                Some(a) => json!(approved(project, &name, d, &install_id, Some(a))),
                 None => json!("unknown — daemon unreachable"),
             },
             Err(_) => Value::Null,

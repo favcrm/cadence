@@ -413,6 +413,27 @@ export const api = {
       `/api/apps/${encodeURIComponent(project)}/${encodeURIComponent(name)}/approve`,
       {},
     ),
+  /**
+   * `POST /api/apps/<project>/<name>/team` — relays the daemon's
+   * `app_set_team`; operator-only. The body carries the app's default
+   * team as `<input>=<agent>` pairs (CAD-577).
+   */
+  appSetTeam: (project: string, name: string, team: string[]) =>
+    post<Record<string, unknown>>(
+      `/api/apps/${encodeURIComponent(project)}/${encodeURIComponent(name)}/team`,
+      { team },
+    ),
+  /**
+   * `POST /api/apps/<project>/<name>/worker` — relays the daemon's
+   * `app_add_worker`: join a new Devin worker for one team role, with a
+   * unique role-prefixed alias, under the operator. Operator-only
+   * (CAD-577).
+   */
+  appAddWorker: (project: string, name: string, role: string) =>
+    post<{ alias?: string; role?: string }>(
+      `/api/apps/${encodeURIComponent(project)}/${encodeURIComponent(name)}/worker`,
+      { role },
+    ),
   /** `GET /api/outbox` — the `local` platform's published items (operator-only). */
   outbox: () => get<OutboxList>("/api/outbox"),
   /** `GET /api/outbox?effect_id=` — one item, rendered post included. */

@@ -953,6 +953,93 @@ fn caller_named_source_may_not_name_a_peers_worktree() {
     assert!(err.contains("cannot be pinned"), "{err}");
 }
 
+// ---------- the built-in account (CAD-577) ----------
+
+/// CAD-577: the local outbox needs no enrollment. `platform_accounts`
+/// lists `local/local` as built-in with no fingerprint; a grant on it
+/// is recordable with no credential; a call that names no account
+/// resolves to it; and the operator's press still writes the outbox —
+/// all with no `platform_enroll` and no `--accept-same-uid-risk`.
+#[test]
+fn builtin_local_account_needs_no_enrollment() {
+    let d = Daemon::start();
+    let wt = TempDir::new().unwrap();
+    std::fs::write(wt.path().join("shot.png"), b"PNG").unwrap();
+    let mut sw = Lane::spawn_as(&d, "sw", wt.path(), None, "worker");
+
+    // The built-in account is listed with no enrollment at all.
+    let accounts = client::rpc(&d.state, "platform_accounts", json!({})).unwrap();
+    let builtin = accounts["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["platform"] == "local" && a["account"] == "local")
+        .cloned()
+        .expect("built-in local/local listed");
+    assert_eq!(builtin["custody"], "built-in");
+    assert_eq!(builtin["exchange"], "built-in");
+    assert!(builtin["fingerprint"].is_null());
+
+    // A grant on the built-in account records with no credential.
+    d.op(
+        "platform_grant",
+        json!({"agent": "sw", "platform": "local",
+               "account": "local", "scopes": ["publish"]}),
+    )
+    .expect("grant local/local with no enrollment");
+
+    // A call naming no account resolves to the built-in one and stages.
+    let out = sw
+        .rpc(
+            &d,
+            "platform_call",
+            json!({"platform": "local", "tool": "publish", "project": "cadence",
+                   "input": publish_input("cadence", &["shot.png"]),
+                   "request": "req-builtin"}),
+        )
+        .unwrap_or_else(|e| panic!("built-in call: {e}"));
+    assert_eq!(out["result"], json!("staged"), "{out}");
+    assert_eq!(out["record"]["account"], json!("local"));
+    let eid = out["effect_id"].as_str().unwrap().to_string();
+
+    // The operator's press writes the outbox — no credential anywhere.
+    let row = press(&d, "sw", "req-builtin");
+    assert_eq!(row["state"], json!("done"), "{row:?}");
+    assert_eq!(row["outcome"]["verified"], json!(true));
+    assert!(d.outbox.join("cadence").join(&eid).join("post.md").exists());
+
+    // No custody dir was ever created for the built-in account.
+    assert!(
+        !d.state.join("custody").exists()
+            || !std::fs::read_dir(d.state.join("custody"))
+                .unwrap()
+                .any(|e| e.is_ok()),
+        "built-in account must hold no custody bytes"
+    );
+}
+
+/// CAD-577's adversarial half: the built-in account is not a grant
+/// bypass. An agent with no grant on `local/local` is still refused at
+/// stage, and the refusal names the grant — never a credential.
+#[test]
+fn builtin_local_account_still_needs_a_grant() {
+    let d = Daemon::start();
+    let wt = TempDir::new().unwrap();
+    let mut sw = Lane::spawn_as(&d, "sw", wt.path(), None, "worker");
+    let err = refused(sw.rpc(
+        &d,
+        "platform_call",
+        json!({"platform": "local", "account": "local", "tool": "publish",
+               "input": publish_input("cadence", &[]),
+               "request": "req-nogrant"}),
+    ));
+    assert!(err.contains("no grant"), "{err}");
+    assert!(
+        !err.contains("enroll"),
+        "built-in must not ask for enrollment: {err}"
+    );
+}
+
 // ---------- the read side is operator-only ----------
 
 /// `platform_outbox` is the operator's read: an agent caller and an

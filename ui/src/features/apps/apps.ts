@@ -633,3 +633,90 @@ export function connectionRows(doctor: AppDoctor | null | undefined): { cls: str
     text: `${s.slot} → ${s.connection}`,
   }));
 }
+
+/**
+ * One item of the Ready-to-run checklist (CAD-577): approved, team set,
+ * publishes to the local outbox. Each gap names its one-click fix.
+ */
+export interface ReadyItem {
+  key: "approved" | "team" | "publish";
+  label: string;
+  done: boolean;
+  /** The fix's label when not done ("Approve", "Set team", …). */
+  fix?: string;
+}
+
+/**
+ * The app's Ready-to-run checklist (CAD-577): approved · team set ·
+ * publishes to the local outbox. New post is enabled only when all three
+ * are done. The team is "set" when every team role the workflow declares
+ * has an agent in the saved default team. A workflow whose steps name
+ * literal agents declares no roles, so an empty role set is already set.
+ */
+export function readyChecklist(app: AppDetail): ReadyItem[] {
+  const action = primaryAction(app);
+  const wf = action?.wf ?? (app.workflows ?? [])[0];
+  const roles = wf ? teamInputs(wf) : [];
+  const team = app.team ?? {};
+  const teamSet = roles.every((r) => (team[r] ?? "").trim() !== "");
+  const slots = usedSlots(app);
+  const publishes = slots.length > 0 && slots.every((s) => publishTarget(app, s) === "Local outbox");
+  return [
+    { key: "approved", label: "Approved", done: app.approved === true, fix: "Approve" },
+    { key: "team", label: "Team set", done: teamSet, fix: "Set team" },
+    {
+      key: "publish",
+      label: "Publishes to Local outbox",
+      done: publishes,
+      fix: "Connect",
+    },
+  ];
+}
+
+/** Is the app ready to run — every checklist item done? */
+export function isReadyToRun(app: AppDetail): boolean {
+  return readyChecklist(app).every((i) => i.done);
+}
+
+/**
+ * The plain-words line under a disabled New post: what is missing, in
+ * the operator's language ("Approve the app, then set the team"), never
+ * the engine's "pass `--input k=v`".
+ */
+export function notReadyText(app: AppDetail): string | null {
+  const gaps = readyChecklist(app).filter((i) => !i.done);
+  if (gaps.length === 0) return null;
+  const words = gaps.map((g) => g.label.toLowerCase());
+  return `Not ready yet — ${words.join(", ")}.`;
+}
+
+/**
+ * The agents a team role picker may offer: the registered agents, with
+ * their state, in a stable order. Inboxes are excluded — a role needs a
+ * worker that can run.
+ */
+export function teamCandidates(
+  agents: { alias: string; state?: string; inbox?: boolean }[] | undefined,
+): { alias: string; state: string }[] {
+  return (agents ?? [])
+    .filter((a) => !a.inbox)
+    .map((a) => ({ alias: a.alias, state: a.state ?? "unknown" }))
+    .sort((a, b) => a.alias.localeCompare(b.alias));
+}
+
+/** The plain word for an agent's state in the picker. */
+export function agentStateWord(state: string | undefined): string {
+  switch (state) {
+    case "idle":
+    case "ready":
+      return "ready";
+    case "running":
+      return "working";
+    case "stopped":
+      return "stopped";
+    case "attention":
+      return "needs attention";
+    default:
+      return state ?? "unknown";
+  }
+}

@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 use crate::error::{Error, Result};
 use crate::proto::identifier;
 
+use super::events::{APPROVAL_STREAM, APP_APPROVED_EVENT};
 use super::{now, Store};
 
 /// The platform custody audit stream (§5.5). Like `audit:approvals`
@@ -30,6 +31,13 @@ pub const CREDENTIAL_REVOKED_EVENT: &str = "credential_revoked";
 /// Not in §5.5's named set: the project default is metadata, recorded
 /// for the same audit story.
 pub const PLATFORM_DEFAULT_EVENT: &str = "platform_default_set";
+
+/// CAD-577: the derived app grant events. An app's approval derives
+/// exactly the scopes its workflow steps declare on their bound slots,
+/// to the agents assigned to those steps; these events record the
+/// derivation and its revocation on the same audit stream.
+pub const APP_GRANTED_EVENT: &str = "app_granted";
+pub const APP_GRANTS_REVOKED_EVENT: &str = "app_grants_revoked";
 
 /// A custody record — what `platform_accounts` and every event carry.
 /// No field holds credential bytes; `custody` names the backend the
@@ -134,7 +142,17 @@ pub(super) const SCHEMA_V17: &str = "CREATE TABLE IF NOT EXISTS platform_credent
         account TEXT NOT NULL,
         set_at REAL NOT NULL,
         by TEXT NOT NULL,
-        PRIMARY KEY(project, platform));";
+        PRIMARY KEY(project, platform));
+     CREATE TABLE IF NOT EXISTS app_grants(
+        app TEXT NOT NULL,
+        agent TEXT NOT NULL,
+        platform TEXT NOT NULL,
+        account TEXT NOT NULL,
+        scopes TEXT NOT NULL,
+        granted_at REAL NOT NULL,
+        by TEXT NOT NULL,
+        install_id TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY(app, agent, platform, account));";
 
 fn scopes_json(scopes: &[String]) -> Result<String> {
     Ok(serde_json::to_string(scopes)?)
@@ -156,6 +174,114 @@ fn credential_row(row: &rusqlite::Row) -> rusqlite::Result<CredentialRecord> {
         enrolled_at: row.get("enrolled_at")?,
         by: row.get("by")?,
     })
+}
+
+/// CAD-577: subtract one app's derived scopes from `platform_grants`.
+///
+/// `rows` are the `(agent, platform, account, scopes)` triples the app
+/// derived. A scope is removed from the agent's platform grant only
+/// when no OTHER app's still-recorded derivation covers it — two apps
+/// that derive the same scope for the same agent are independent, so
+/// dropping one must not cut the other's grant. Scopes the operator
+/// granted by hand are not in any `app_grants` row and survive because
+/// only the derived set is ever subtracted. Answers the triples whose
+/// platform grant actually changed, so the caller can drain the waiting
+/// effects that lost coverage.
+fn subtract_derived(
+    tx: &rusqlite::Transaction<'_>,
+    app: &str,
+    rows: &[(String, String, String, Vec<String>)],
+    keep_install: Option<&str>,
+) -> Result<Vec<(String, String, String)>> {
+    let mut changed = Vec::new();
+    for (agent, platform, account, derived) in rows {
+        let Some(existing): Option<Grant> = tx
+            .query_row(
+                "SELECT * FROM platform_grants WHERE agent=?1 AND platform=?2 \
+                 AND account=?3",
+                params![agent, platform, account],
+                grant_row,
+            )
+            .optional()?
+        else {
+            continue;
+        };
+        // What another approved app still derives for the same triple.
+        // Another app's derivation still covers the scope. So does a
+        // row of THIS app that belongs to `keep_install` — used when
+        // dropping a previous install's rows without taking the current
+        // install's scopes with them. `None` is the whole-app revoke:
+        // no row of this app counts.
+        let still: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT scopes FROM app_grants WHERE agent=?2 AND platform=?3 \
+                 AND account=?4 AND (app<>?1 OR (?5 IS NOT NULL AND install_id=?5))",
+            )?;
+            let rows =
+                stmt.query_map(params![app, agent, platform, account, keep_install], |r| {
+                    let raw: String = r.get(0)?;
+                    Ok(scopes_of(&raw))
+                })?;
+            rows.flatten().flatten().collect()
+        };
+        let kept: Vec<String> = existing
+            .scopes
+            .iter()
+            .filter(|s| !derived.contains(s) || still.contains(s))
+            .cloned()
+            .collect();
+        if kept == existing.scopes {
+            continue;
+        }
+        if kept.is_empty() {
+            tx.execute(
+                "DELETE FROM platform_grants WHERE agent=?1 AND platform=?2 \
+                 AND account=?3",
+                params![agent, platform, account],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE platform_grants SET scopes=?4 WHERE agent=?1 AND \
+                 platform=?2 AND account=?3",
+                params![agent, platform, account, scopes_json(&kept)?],
+            )?;
+        }
+        changed.push((agent.clone(), platform.clone(), account.clone()));
+    }
+    Ok(changed)
+}
+
+/// The latest `app_approved` payload for `app` (`"<project>/<name>"`),
+/// read on the caller's transaction so a revoke that committed under
+/// the same write lock is visible (CAD-577 review 344, note 3).
+fn latest_app_approval(tx: &rusqlite::Connection, app: &str) -> Result<Option<Value>> {
+    let Some((project, name)) = app.split_once('/') else {
+        return Ok(None);
+    };
+    let raw: Option<String> = tx
+        .query_row(
+            "SELECT payload FROM events WHERE alias=?1 AND kind=?2 \
+             AND json_extract(payload,'$.project')=?3 \
+             AND json_extract(payload,'$.name')=?4 \
+             ORDER BY seq DESC LIMIT 1",
+            params![APPROVAL_STREAM, APP_APPROVED_EVENT, project, name],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(raw.and_then(|s| serde_json::from_str(&s).ok()))
+}
+
+/// An approval still covers this install: not withdrawn, the digest is
+/// the one the caller just computed, and `install_id` is that install's
+/// id. A missing or empty id never covers — a pre-install-id approval
+/// does not carry over to the record it was written against.
+fn approval_covers(payload: &Value, digest: &str, install_id: &str) -> bool {
+    if install_id.is_empty() {
+        return false;
+    }
+    payload.get("revoked").and_then(Value::as_bool) != Some(true)
+        && payload.get("digest").and_then(Value::as_str) == Some(digest)
+        && payload.get("install_id").and_then(Value::as_str) == Some(install_id)
 }
 
 fn grant_row(row: &rusqlite::Row) -> rusqlite::Result<Grant> {
@@ -211,6 +337,149 @@ pub fn scope_list(params: &Value, field: &str) -> Result<Vec<String>> {
     scopes.sort();
     scopes.dedup();
     Ok(scopes)
+}
+
+pub(crate) type Derived = (String, String, String, Vec<String>);
+
+/// Subtract this app's prior derivation and merge `grants`, on the
+/// caller's transaction. The answer is every triple whose platform
+/// grant shrank, including one the new set still covers with a
+/// narrower scope — the caller drains a waiting effect only when the
+/// surviving grant no longer covers that effect's scopes.
+fn apply_derived(
+    tx: &rusqlite::Transaction<'_>,
+    app: &str,
+    install_id: &str,
+    grants: &[Derived],
+    by: &str,
+) -> Result<Vec<(String, String, String)>> {
+    let prior: Vec<Derived> = {
+        let mut stmt =
+            tx.prepare("SELECT agent, platform, account, scopes FROM app_grants WHERE app=?1")?;
+        let rows = stmt.query_map(params![app], |r| {
+            let raw: String = r.get(3)?;
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, scopes_of(&raw)))
+        })?;
+        rows.flatten().collect()
+    };
+    tx.execute("DELETE FROM app_grants WHERE app=?1", params![app])?;
+    let changed = subtract_derived(tx, app, &prior, None)?;
+    if !prior.is_empty() {
+        Store::event(
+            tx,
+            PLATFORM_STREAM,
+            APP_GRANTS_REVOKED_EVENT,
+            json!({"app": app, "rederived": true, "by": by,
+                   "grants": prior.iter().map(|(agent, platform, account, scopes)| {
+                       json!({"agent": agent, "platform": platform,
+                              "account": account, "scopes": scopes})
+                   }).collect::<Vec<_>>()}),
+        )?;
+    }
+    let mut granted = 0usize;
+    for (agent, platform, account, scopes) in grants {
+        identifier(agent, "Agent")?;
+        let mut scopes = scopes.clone();
+        scopes.sort();
+        scopes.dedup();
+        if scopes.is_empty() {
+            continue;
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO app_grants
+             (app, agent, platform, account, scopes, granted_at, by, install_id)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                app,
+                agent,
+                platform,
+                account,
+                scopes_json(&scopes)?,
+                now(),
+                by,
+                install_id
+            ],
+        )?;
+        let existing: Option<Grant> = tx
+            .query_row(
+                "SELECT * FROM platform_grants WHERE agent=?1 AND platform=?2 AND account=?3",
+                params![agent, platform, account],
+                grant_row,
+            )
+            .optional()?;
+        let merged: Vec<String> = match &existing {
+            Some(g) => {
+                let mut all = g.scopes.clone();
+                for s in &scopes {
+                    if !all.contains(s) {
+                        all.push(s.clone());
+                    }
+                }
+                all.sort();
+                all
+            }
+            None => scopes.clone(),
+        };
+        tx.execute(
+            "INSERT OR REPLACE INTO platform_grants
+             (agent, platform, account, scopes, granted_at, by)
+             VALUES(?1,?2,?3,?4,?5,?6)",
+            params![agent, platform, account, scopes_json(&merged)?, now(), by],
+        )?;
+        Store::event(
+            tx,
+            PLATFORM_STREAM,
+            APP_GRANTED_EVENT,
+            json!({"app": app, "agent": agent, "platform": platform,
+                   "account": account, "scopes": scopes, "by": by}),
+        )?;
+        granted += 1;
+    }
+    if granted == 0 {
+        Store::event(
+            tx,
+            PLATFORM_STREAM,
+            APP_GRANTED_EVENT,
+            json!({"app": app, "agents": 0, "by": by}),
+        )?;
+    }
+    // A triple whose grant shrank stays on the list even when the new
+    // derivation keeps another scope on that account. The caller drains
+    // only a waiting effect whose frozen scopes the surviving grant
+    // does not cover, so the kept scope is not closed with the one
+    // that left. Dropping the triple here would leave the dropped
+    // scope's effect queued until something else released it.
+    Ok(changed)
+}
+
+/// Drop this app's derived rows and subtract their scopes, on the
+/// caller's transaction. A scope another app still derives is kept.
+fn revoke_derived(
+    tx: &rusqlite::Transaction<'_>,
+    app: &str,
+    by: &str,
+) -> Result<Vec<(String, String, String)>> {
+    let rows: Vec<Derived> = {
+        let mut stmt =
+            tx.prepare("SELECT agent, platform, account, scopes FROM app_grants WHERE app=?1")?;
+        let rows = stmt.query_map(params![app], |r| {
+            let scopes: String = r.get(3)?;
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, scopes_of(&scopes)))
+        })?;
+        rows.flatten().collect()
+    };
+    tx.execute("DELETE FROM app_grants WHERE app=?1", params![app])?;
+    let changed = subtract_derived(tx, app, &rows, None)?;
+    for (agent, platform, account, derived) in &rows {
+        Store::event(
+            tx,
+            PLATFORM_STREAM,
+            APP_GRANTS_REVOKED_EVENT,
+            json!({"app": app, "agent": agent, "platform": platform,
+                   "account": account, "scopes": derived, "by": by}),
+        )?;
+    }
+    Ok(changed)
 }
 
 impl Store {
@@ -460,7 +729,9 @@ impl Store {
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         // The credential must exist — a grant on nothing is a latent
-        // privilege the next enroll would silently arm.
+        // privilege the next enroll would silently arm. The built-in
+        // `local/local` account is the exception (CAD-577): it is always
+        // available with no enrollment, so a grant on it is recordable.
         let enrolled: Option<i64> = tx
             .query_row(
                 "SELECT 1 FROM platform_credentials WHERE platform=?1 AND account=?2",
@@ -468,7 +739,7 @@ impl Store {
                 |r| r.get(0),
             )
             .optional()?;
-        if enrolled.is_none() {
+        if enrolled.is_none() && !crate::platform::is_builtin(platform, account) {
             return Err(Error::rejected(format!(
                 "platform '{platform}' account '{account}' is not enrolled — \
                  `platform enroll` first"
@@ -625,7 +896,7 @@ impl Store {
                 |r| r.get(0),
             )
             .optional()?;
-        if enrolled.is_none() {
+        if enrolled.is_none() && !crate::platform::is_builtin(platform, account) {
             return Err(Error::rejected(format!(
                 "platform '{platform}' account '{account}' is not enrolled — \
                  `platform enroll` first"
@@ -696,5 +967,185 @@ impl Store {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    // ---------- CAD-577: app-derived grants ----------
+
+    /// Record the grants an app's approval derives: for each `(agent,
+    /// platform, account, scopes)` the app's workflow steps declare on
+    /// their bound slots, add a grant row and an `app_granted` audit
+    /// event in one transaction. The grants are the app's own —
+    /// `app_grants` records which app derived each, so revoking the
+    /// app's approval revokes exactly these and never a hand-made
+    /// grant. A re-approval re-derives: the previous derivation is
+    /// SUBTRACTED from `platform_grants` first, so an agent the team
+    /// dropped, or a scope the new structure no longer declares, loses
+    /// it — then the new set is merged in. Answers the `(agent,
+    /// platform, account)` triples whose platform grant shrank, so the
+    /// caller can drain the waiting effects that lost coverage.
+    pub fn app_grants_set(
+        &self,
+        app: &str,
+        install_id: &str,
+        grants: &[(String, String, String, Vec<String>)],
+        by: &str,
+    ) -> Result<Vec<(String, String, String)>> {
+        let conn = self.write_conn()?;
+        let tx = conn.unchecked_transaction()?;
+        let changed = apply_derived(&tx, app, install_id, grants, by)?;
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    /// Re-derive or revoke under one write lock, re-reading the approval
+    /// on that lock (CAD-577 review 344, note 3). A proposer that observed
+    /// the pre-revoke approval still passes the old digest here; the
+    /// re-read sees the revoke and subtracts instead of merging.
+    pub(crate) fn app_grants_reconcile(
+        &self,
+        app: &str,
+        digest: Option<&str>,
+        install_id: &str,
+        grants: &[Derived],
+        by: &str,
+    ) -> Result<Vec<(String, String, String)>> {
+        let conn = self.write_conn()?;
+        let tx = conn.unchecked_transaction()?;
+        let approval = latest_app_approval(&tx, app)?;
+        let live = digest.is_some_and(|d| {
+            approval
+                .as_ref()
+                .is_some_and(|p| approval_covers(p, d, install_id))
+        });
+        let changed = if live {
+            apply_derived(&tx, app, install_id, grants, by)?
+        } else {
+            revoke_derived(&tx, app, by)?
+        };
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    /// Record an approval and derive its grants in one transaction, so a
+    /// concurrent reconcile cannot observe the grants without the
+    /// approval that justifies them.
+    pub(crate) fn app_approve_with_grants(
+        &self,
+        approval: Value,
+        app: &str,
+        grants: &[Derived],
+        by: &str,
+    ) -> Result<Vec<(String, String, String)>> {
+        let conn = self.write_conn()?;
+        let tx = conn.unchecked_transaction()?;
+        let install_id = approval
+            .get("install_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        Self::event(&tx, APPROVAL_STREAM, APP_APPROVED_EVENT, approval)?;
+        let changed = apply_derived(&tx, app, &install_id, grants, by)?;
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    /// Record a withdrawn approval and subtract its derived grants in
+    /// one transaction (CAD-577). The approval write and the grant
+    /// write cannot land apart.
+    pub(crate) fn app_revoke_with_record(
+        &self,
+        approval: Value,
+        app: &str,
+        by: &str,
+    ) -> Result<Vec<(String, String, String)>> {
+        let conn = self.write_conn()?;
+        let tx = conn.unchecked_transaction()?;
+        Self::event(&tx, APPROVAL_STREAM, APP_APPROVED_EVENT, approval)?;
+        let changed = revoke_derived(&tx, app, by)?;
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    /// Every app key that still holds derived grant rows (CAD-577) —
+    /// the daemon's sweep uses it to find the rows of an app that was
+    /// removed from the tracker, so a removal can never leave a
+    /// standing grant behind.
+    pub fn app_grants_apps(&self) -> Result<Vec<String>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT DISTINCT app FROM app_grants ORDER BY app")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.flatten().collect())
+    }
+
+    /// Drop grant rows for `app` whose install id is not `install_id`,
+    /// subtracting only scopes the kept install (or another app) does
+    /// not still derive. The approval event is left alone — the caller
+    /// uses this when that approval already binds to `install_id`.
+    pub(crate) fn app_grants_drop_other_installs(
+        &self,
+        app: &str,
+        install_id: &str,
+        by: &str,
+    ) -> Result<Vec<(String, String, String)>> {
+        let conn = self.write_conn()?;
+        let tx = conn.unchecked_transaction()?;
+        let rows: Vec<Derived> = {
+            let mut stmt = tx.prepare(
+                "SELECT agent, platform, account, scopes FROM app_grants \
+                 WHERE app=?1 AND install_id<>?2",
+            )?;
+            let mapped = stmt.query_map(params![app, install_id], |r| {
+                let scopes: String = r.get(3)?;
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, scopes_of(&scopes)))
+            })?;
+            mapped.flatten().collect()
+        };
+        if rows.is_empty() {
+            tx.commit()?;
+            return Ok(Vec::new());
+        }
+        tx.execute(
+            "DELETE FROM app_grants WHERE app=?1 AND install_id<>?2",
+            params![app, install_id],
+        )?;
+        let changed = subtract_derived(&tx, app, &rows, Some(install_id))?;
+        for (agent, platform, account, derived) in &rows {
+            Store::event(
+                &tx,
+                PLATFORM_STREAM,
+                APP_GRANTS_REVOKED_EVENT,
+                json!({"app": app, "agent": agent, "platform": platform,
+                       "account": account, "scopes": derived, "by": by,
+                       "install_id": install_id}),
+            )?;
+        }
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    /// Every derived-grant row's `(app, install_id)`. The sweep uses
+    /// this to find a grant whose install is no longer the current one,
+    /// including a row whose approval derived nothing else to list.
+    pub fn app_grant_installs(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare("SELECT DISTINCT app, install_id FROM app_grants ORDER BY app")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        Ok(rows.flatten().collect())
+    }
+
+    /// Revoke every grant an app's approval derived: the `app_grants`
+    /// rows go, and each `(agent, platform, account)`'s `platform_grants`
+    /// scopes shrink by exactly the app's derived set, less whatever
+    /// another approved app still derives — a hand-made grant's other
+    /// scopes survive. Answers the `(agent, platform,
+    /// account)` triples whose platform grant changed, so the caller
+    /// can drain the waiting effects that lost a scope (CAD-506).
+    pub fn app_grants_revoke(&self, app: &str, by: &str) -> Result<Vec<(String, String, String)>> {
+        let conn = self.write_conn()?;
+        let tx = conn.unchecked_transaction()?;
+        let changed = revoke_derived(&tx, app, by)?;
+        tx.commit()?;
+        Ok(changed)
     }
 }

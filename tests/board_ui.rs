@@ -1926,6 +1926,84 @@ fn board_app_approve_is_the_operators() {
     assert_eq!(v["approval"], "changed", "{v}");
 }
 
+/// CAD-577: `POST /api/apps/<project>/<name>/revoke` is operator-only,
+/// like approve. An unproven caller, an agent, and a forged body are
+/// refused. The operator's POST withdraws the approval and the grant
+/// it derived.
+#[test]
+fn board_app_revoke_is_the_operators() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    f.d.register("qa-1");
+    app_install_studio(&f);
+    let port = start_board(&f.pm_dir, &f.d.state);
+    let revoke = "/api/apps/demo/studio/revoke";
+
+    let (status, reply) = board_http(port, &cad328_post(port, revoke, THREAD_GUARDS, "{}"));
+    assert_eq!(status, 403, "{reply}");
+    assert!(reply.contains("operator_session_required"), "{reply}");
+
+    let mut wk = ManagedWorker::start(&f.d, "wk");
+    let request = cad328_post(port, revoke, THREAD_GUARDS, "{}");
+    let r = wk.exec(&[
+        "bash",
+        "-c",
+        DEV_TCP_CLIENT,
+        "_",
+        &port.to_string(),
+        &request,
+    ]);
+    let out = r["out"].as_str().unwrap();
+    assert!(
+        out.contains(" 403 ") && out.contains("operator_only"),
+        "{out}"
+    );
+
+    let op = sign_in(&f.d.state, port);
+    let guards = op_guards(&op);
+    for body in [r#"{"actor":"wk"}"#, r#"{"by":"operator"}"#] {
+        let (status, reply) = board_http(port, &cad328_post(port, revoke, &guards, body));
+        assert_eq!(status, 400, "{body}: {reply}");
+    }
+
+    let (status, reply) = board_http(
+        port,
+        &cad328_post(port, "/api/apps/demo/studio/approve", &guards, "{}"),
+    );
+    assert_eq!(status, 200, "{reply}");
+    let grants =
+        f.d.operator_rpc("platform_grants", json!({"agent": "dev-1"}))
+            .unwrap();
+    assert!(
+        grants["grants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|g| g["scopes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s == "publish")),
+        "approve derives publish: {grants}"
+    );
+
+    let (status, reply) = board_http(port, &cad328_post(port, revoke, &guards, "{}"));
+    assert_eq!(status, 200, "{reply}");
+    let v: Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(v["revoked"], true, "{v}");
+    let grants =
+        f.d.operator_rpc("platform_grants", json!({"agent": "dev-1"}))
+            .unwrap();
+    assert!(
+        grants["grants"].as_array().unwrap().is_empty(),
+        "revoke drops the derived grant: {grants}"
+    );
+    let (status, body) = board_get(port, "/api/apps/demo/studio");
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["approved"], false, "{v}");
+}
+
 /// CAD-563: `GET /api/apps/<project>/<name>/runs` — the plans/epics
 /// proposed from the app's workflows, by the recorded `plan.workflow`
 /// provenance. Each row carries the epic, its derived status and the

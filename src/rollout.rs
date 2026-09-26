@@ -37,9 +37,10 @@ use crate::store::{self, Store};
 /// `messages.issue`/`messages.worktree`, the dispatch lane a kickoff
 /// belongs to (CAD-467); v17 adds the platform custody, grant and
 /// project-default tables (CAD-366); v18 adds the pending-effect and
-/// draft tables (CAD-506).
+/// draft tables (CAD-506); v19 adds `app_grants.install_id`, the
+/// install an app-derived grant belongs to (CAD-577).
 /// The newest migration in `store` writes this number.
-pub const SCHEMA_VERSION: i64 = 18;
+pub const SCHEMA_VERSION: i64 = 19;
 
 /// Last schema that has no lease table. The bootstrap opt-in covers
 /// only this version.
@@ -2756,7 +2757,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 18);
+        assert_eq!(SCHEMA_VERSION, 19);
     }
 
     struct MigrationHolder;

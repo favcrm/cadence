@@ -107,6 +107,53 @@ pub(super) fn approve_route(path: &str) -> Option<(&str, &str)> {
     (verb == "approve" && !project.is_empty() && !name.is_empty()).then_some((project, name))
 }
 
+/// `(project, name)` for `POST /api/apps/<project>/<name>/revoke` —
+/// `None` when the path is not that route (CAD-577). The operator's
+/// counterpart to `approve`: it withdraws the approval and revokes
+/// every grant the approval derived.
+pub(super) fn revoke_route(path: &str) -> Option<(&str, &str)> {
+    let tail = path.strip_prefix("/api/apps/")?;
+    let (project, rest) = tail.split_once('/')?;
+    let (name, verb) = rest.split_once('/')?;
+    (verb == "revoke" && !project.is_empty() && !name.is_empty()).then_some((project, name))
+}
+
+/// `(project, name)` for `POST /api/apps/<project>/<name>/team` —
+/// `None` when the path is not that route (CAD-577).
+pub(super) fn team_route(path: &str) -> Option<(&str, &str)> {
+    let tail = path.strip_prefix("/api/apps/")?;
+    let (project, rest) = tail.split_once('/')?;
+    let (name, verb) = rest.split_once('/')?;
+    (verb == "team" && !project.is_empty() && !name.is_empty()).then_some((project, name))
+}
+
+/// `(project, name)` for `POST /api/apps/<project>/<name>/worker` —
+/// `None` when the path is not that route (CAD-577).
+pub(super) fn worker_route(path: &str) -> Option<(&str, &str)> {
+    let tail = path.strip_prefix("/api/apps/")?;
+    let (project, rest) = tail.split_once('/')?;
+    let (name, verb) = rest.split_once('/')?;
+    (verb == "worker" && !project.is_empty() && !name.is_empty()).then_some((project, name))
+}
+
+/// The worker body: `{"role": "<input>"}` — the role the operator
+/// picked. Anything else is refused by shape.
+fn worker_body_ok(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(bytes)
+        .ok()
+        .and_then(|v| v.get("role").and_then(Value::as_str).map(str::to_string))
+        .is_some_and(|role| !role.is_empty())
+}
+
+/// The team body: `{"team": ["<input>=<agent>", …]}` — the roles the
+/// operator picked. Anything else is refused by shape.
+fn team_body_ok(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(bytes)
+        .ok()
+        .and_then(|v| v.get("team").and_then(Value::as_array).cloned())
+        .is_some_and(|list| list.iter().all(Value::is_string))
+}
+
 /// `GET` dispatch for the app reads.
 pub(super) fn read(
     request: &Request,
@@ -390,6 +437,70 @@ fn doctor_row(
         .unwrap_or(Value::Null)
 }
 
+/// `POST /api/apps/<project>/<name>/team` — relays the daemon's
+/// `app_set_team` (CAD-577). Operator-only on the board (the route is
+/// listed in `operator::WRITE_ROUTES`), so the daemon attributes the
+/// write to the board's own proven connection. The body carries the
+/// `team` list; every other field is refused by shape.
+pub(super) fn set_team(
+    request: &mut Request,
+    state_dir: &std::path::Path,
+    key: &str,
+    name: &str,
+) -> HttpResp {
+    if !model::valid_key(key) || !model::valid_tag(name) {
+        return err_response(400, "bad project or app name");
+    }
+    let bytes = match read_body(request, BODY_CAP) {
+        Ok(bytes) => bytes,
+        Err(resp) => return resp,
+    };
+    if !team_body_ok(&bytes) {
+        return err_response(400, "app team takes {\"team\": [\"<input>=<agent>\"]}");
+    }
+    let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    match client::rpc(
+        state_dir,
+        "app_set_team",
+        json!({"project": key, "name": name, "team": body["team"]}),
+    ) {
+        Ok(out) => json_response(out),
+        Err(e) => home::rpc_err(&e, "app_set_team"),
+    }
+}
+
+/// `POST /api/apps/<project>/<name>/worker` — relays the daemon's
+/// `app_add_worker` (CAD-577): join a new Devin worker for one team
+/// role. Operator-only on the board (the route is listed in
+/// `operator::WRITE_ROUTES`). The body carries `{"role": "<input>"}`;
+/// every other field is refused by shape.
+pub(super) fn add_worker(
+    request: &mut Request,
+    state_dir: &std::path::Path,
+    key: &str,
+    name: &str,
+) -> HttpResp {
+    if !model::valid_key(key) || !model::valid_tag(name) {
+        return err_response(400, "bad project or app name");
+    }
+    let bytes = match read_body(request, BODY_CAP) {
+        Ok(bytes) => bytes,
+        Err(resp) => return resp,
+    };
+    if !worker_body_ok(&bytes) {
+        return err_response(400, "app add worker takes {\"role\": \"<input>\"}");
+    }
+    let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    match client::rpc(
+        state_dir,
+        "app_add_worker",
+        json!({"project": key, "name": name, "role": body["role"]}),
+    ) {
+        Ok(out) => json_response(out),
+        Err(e) => home::rpc_err(&e, "app_add_worker"),
+    }
+}
+
 /// `POST /api/apps/<project>/<name>/approve` — the same `app_approve`
 /// call `cadence app approve` makes. The board was already admitted
 /// as the operator (`operator::admit`); the daemon's
@@ -418,6 +529,37 @@ pub(super) fn approve(
     ) {
         Ok(out) => json_response(out),
         Err(e) => home::rpc_err(&e, "app_approve"),
+    }
+}
+
+/// `POST /api/apps/<project>/<name>/revoke` — the same `app_revoke`
+/// call `cadence app revoke` makes (CAD-577). Operator-only on the
+/// board (the route is listed in `operator::WRITE_ROUTES`), so the
+/// daemon attributes the revocation to the board's own proven
+/// connection. The body is `{}`; attribution is never a field.
+pub(super) fn revoke(
+    request: &mut Request,
+    state_dir: &std::path::Path,
+    key: &str,
+    name: &str,
+) -> HttpResp {
+    if !model::valid_key(key) || !model::valid_tag(name) {
+        return err_response(400, "bad project or app name");
+    }
+    let bytes = match read_body(request, BODY_CAP) {
+        Ok(bytes) => bytes,
+        Err(resp) => return resp,
+    };
+    if !approve_body_ok(&bytes) {
+        return err_response(400, "app revoke takes no fields — send {}");
+    }
+    match client::rpc(
+        state_dir,
+        "app_revoke",
+        json!({"project": key, "name": name}),
+    ) {
+        Ok(out) => json_response(out),
+        Err(e) => home::rpc_err(&e, "app_revoke"),
     }
 }
 
@@ -479,6 +621,87 @@ mod tests {
             "/api/apps/demo/studio/approve/extra",
         ] {
             assert_eq!(approve_route(dead), None, "{dead}");
+        }
+    }
+
+    /// The revoke route's shape: `POST /api/apps/<project>/<name>/revoke`.
+    #[test]
+    fn revoke_route_is_exact() {
+        assert_eq!(
+            revoke_route("/api/apps/demo/studio/revoke"),
+            Some(("demo", "studio"))
+        );
+        for dead in [
+            "/api/apps",
+            "/api/apps/demo/studio",
+            "/api/apps/demo/studio/approve",
+            "/api/apps/demo/revoke",
+            "/api/apps//studio/revoke",
+            "/api/apps/demo/studio/revoke/extra",
+        ] {
+            assert_eq!(revoke_route(dead), None, "{dead}");
+        }
+    }
+
+    /// The team route and body shape (CAD-577).
+    #[test]
+    fn team_route_and_body_are_exact() {
+        assert_eq!(
+            team_route("/api/apps/demo/studio/team"),
+            Some(("demo", "studio"))
+        );
+        for dead in [
+            "/api/apps",
+            "/api/apps/demo/studio",
+            "/api/apps/demo/studio/approve",
+            "/api/apps/demo/team",
+            "/api/apps//studio/team",
+            "/api/apps/demo/studio/team/extra",
+        ] {
+            assert_eq!(team_route(dead), None, "{dead}");
+        }
+        for ok in [r#"{"team":[]}"#, r#"{"team":["writer=a"]}"#] {
+            assert!(team_body_ok(ok.as_bytes()), "{ok}");
+        }
+        for bad in [
+            r#"{"team":"a"}"#,
+            r#"{"team":[1]}"#,
+            r#"{"writer":"a"}"#,
+            "[]",
+            "null",
+        ] {
+            assert!(!team_body_ok(bad.as_bytes()), "{bad}");
+        }
+    }
+
+    /// The "Add worker" route and body shape (CAD-577).
+    #[test]
+    fn worker_route_and_body_are_exact() {
+        assert_eq!(
+            worker_route("/api/apps/demo/studio/worker"),
+            Some(("demo", "studio"))
+        );
+        for dead in [
+            "/api/apps",
+            "/api/apps/demo/studio",
+            "/api/apps/demo/studio/team",
+            "/api/apps/demo/worker",
+            "/api/apps//studio/worker",
+            "/api/apps/demo/studio/worker/extra",
+        ] {
+            assert_eq!(worker_route(dead), None, "{dead}");
+        }
+        for ok in [r#"{"role":"publisher"}"#, r#"{"role":"writer"}"#] {
+            assert!(worker_body_ok(ok.as_bytes()), "{ok}");
+        }
+        for bad in [
+            r#"{"role":""}"#,
+            r#"{"role":1}"#,
+            r#"{"writer":"a"}"#,
+            "[]",
+            "null",
+        ] {
+            assert!(!worker_body_ok(bad.as_bytes()), "{bad}");
         }
     }
 

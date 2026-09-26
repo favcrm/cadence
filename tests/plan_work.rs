@@ -1632,6 +1632,1047 @@ fn app_propose_gates_and_provenance() {
     assert!(!f.pm_dir.join("demo/apps/studio").exists());
 }
 
+/// The scopes of `agent`'s grant on `platform`/`account`, or `None`
+/// when it holds none — read through the operator's `platform_grants`
+/// (the store's own `platform_grant` is `pub(crate)` to the crate).
+fn grant_scopes(
+    f: &PlanFixture,
+    agent: &str,
+    platform: &str,
+    account: &str,
+) -> Option<Vec<String>> {
+    let out =
+        f.d.operator_rpc("platform_grants", json!({"agent": agent}))
+            .unwrap();
+    out["grants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["platform"] == platform && g["account"] == account)
+        .map(|g| {
+            g["scopes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|s| s.as_str().map(str::to_string))
+                .collect()
+        })
+}
+
+/// A role-placeholder app: its publish step names the `publisher`
+/// input as its agent and uses the `publish` slot, so the grant it
+/// derives depends on the team the operator sets (CAD-577).
+const ROLE_APP_MD: &str = "---\napp: roles\ntitle: Roles\nversion: 0.1.0\nneeds:\n  connections: [publish]\n---\n\nbody\n";
+const ROLE_APP_WF: &str =
+    "---\ntitle: \"Go: {{title}}\"\ngoal: g\ninputs:\n  title: {}\n  publisher: {}\n---\n\n\
+## Work {{title}}\nagent: {{publisher}}\nuses: publish\n\n### Acceptance\n- [ ] done\n";
+
+fn app_install_roles(f: &PlanFixture) -> Value {
+    let src = app_src(
+        f,
+        "roles",
+        &[("app.md", ROLE_APP_MD), ("workflows/go.md", ROLE_APP_WF)],
+    );
+    let (ok, out) = f.cli(&["app", "install", src.to_str().unwrap(), "--project", "demo"]);
+    assert!(ok, "app install roles: {out}");
+    out
+}
+
+/// CAD-577: app approval derives grants — exactly the scopes the
+/// workflow steps declare on their bound slots, to the agents the
+/// app's default team assigns those steps. The adversarial half:
+/// an agent cannot obtain a grant, a grant never exceeds the declared
+/// scope, another app's agents get nothing, and a structural change
+/// since approval revokes the grants.
+#[test]
+fn app_approval_derives_grants() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    f.d.register("qa-1");
+    f.d.register("other-1");
+    app_install_roles(&f);
+
+    // No team yet: approval derives nothing (the agent is unnamed).
+    f.d.operator_rpc("app_approve", json!({"project": "demo", "name": "roles"}))
+        .unwrap();
+    assert!(
+        f.d.operator_rpc("platform_grants", json!({})).unwrap()["grants"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "no team, no grants"
+    );
+
+    // The operator sets the team: dev-1 publishes.
+    let out =
+        f.d.operator_rpc(
+            "app_set_team",
+            json!({"project": "demo", "name": "roles",
+                   "team": ["publisher=dev-1"]}),
+        )
+        .unwrap();
+    assert_eq!(out["team"]["publisher"], "dev-1", "{out}");
+
+    // Re-approve: the grant is derived for dev-1 on local/local with
+    // exactly the declared `publish` scope.
+    let out =
+        f.d.operator_rpc("app_approve", json!({"project": "demo", "name": "roles"}))
+            .unwrap();
+    let grants = out["grants"].as_array().unwrap();
+    assert_eq!(grants.len(), 1, "{out}");
+    assert_eq!(grants[0]["agent"], "dev-1", "{out}");
+    assert_eq!(grants[0]["platform"], "local", "{out}");
+    assert_eq!(grants[0]["account"], "local", "{out}");
+    assert_eq!(grants[0]["scopes"], json!(["publish"]), "{out}");
+    let stored = grant_scopes(&f, "dev-1", "local", "local");
+    assert_eq!(stored.as_deref(), Some(&["publish".to_string()][..]));
+    // A grant never exceeds the declared scope: the scope set is exactly
+    // the slot name, never `*`.
+    assert!(!stored.unwrap().contains(&"*".to_string()));
+
+    // Another app's agents get nothing: install a second app whose
+    // team names other-1, approve it — dev-1's grant is untouched and
+    // other-1 gets only its own app's scope.
+    let src = app_src(
+        &f,
+        "other",
+        &[
+            (
+                "app.md",
+                "---\napp: other\ntitle: Other\nversion: 0.1.0\nneeds:\n  connections: [publish]\n---\n\nbody\n",
+            ),
+            (
+                "workflows/publish.md",
+                "---\ntitle: \"Go: {{title}}\"\ngoal: g\ninputs:\n  title: {}\n  publisher: {}\n---\n\n## Publish\nagent: {{publisher}}\nuses: publish\n\n### Acceptance\n- [ ] done\n",
+            ),
+        ],
+    );
+    let (ok, out) = f.cli(&["app", "install", src.to_str().unwrap(), "--project", "demo"]);
+    assert!(ok, "{out}");
+    f.d.operator_rpc(
+        "app_set_team",
+        json!({"project": "demo", "name": "other", "team": ["publisher=other-1"]}),
+    )
+    .unwrap();
+    f.d.operator_rpc("app_approve", json!({"project": "demo", "name": "other"}))
+        .unwrap();
+    assert_eq!(
+        grant_scopes(&f, "other-1", "local", "local").unwrap(),
+        vec!["publish".to_string()]
+    );
+    assert_eq!(
+        grant_scopes(&f, "dev-1", "local", "local").unwrap(),
+        vec!["publish".to_string()],
+        "another app's approval must not touch dev-1"
+    );
+
+    // An agent cannot obtain the grant: it is not a registered caller of
+    // `app_approve` or `app_set_team`.
+    let mut pane = LaneShell::spawn(f.tmp.path());
+    plant_pane(&f.d, "pane-9", pane.pid());
+    let r = pane.rpc(
+        &f.d.state,
+        "app_set_team",
+        json!({"project": "demo", "name": "roles", "team": ["publisher=other-1"]}),
+    );
+    assert_eq!(r["ok"], false, "agent set_team admitted: {r}");
+    let r = pane.rpc(
+        &f.d.state,
+        "app_approve",
+        json!({"project": "demo", "name": "roles"}),
+    );
+    assert_eq!(r["ok"], false, "agent approve admitted: {r}");
+    // Nor `app_add_worker` — joining a worker is the operator's too.
+    let r = pane.rpc(
+        &f.d.state,
+        "app_add_worker",
+        json!({"project": "demo", "name": "roles", "role": "publisher"}),
+    );
+    assert_eq!(r["ok"], false, "agent add_worker admitted: {r}");
+
+    // A structural change since approval revokes the derived grants.
+    let (ok, _) = f.cli(&[
+        "app",
+        "set",
+        "roles",
+        "publish=publish-svc",
+        "--project",
+        "demo",
+    ]);
+    assert!(ok);
+    // The next propose reconciles: the app is no longer approved for its
+    // digest, so dev-1's derived grant is revoked.
+    let _ = f.d.operator_rpc(
+        "plan_propose",
+        json!({"project": "demo", "workflow": "roles/go",
+               "inputs": {"title": "x", "publisher": "dev-1"}}),
+    );
+    assert!(
+        grant_scopes(&f, "dev-1", "local", "local").is_none(),
+        "a structural change must revoke the derived grant"
+    );
+}
+
+/// CAD-577: "Add worker" joins a new Devin worker for one of the
+/// app's team roles — a unique role-prefixed alias under the operator
+/// (a group root), recorded in the app's default team. The adversarial
+/// half (an agent caller is refused) lives in `app_approval_derives_grants`.
+#[test]
+fn app_add_worker_joins_and_records_the_role() {
+    let f = PlanFixture::start();
+    // The mock tmux/devin pair, so the joined worker's pane comes up.
+    let _mock = install_mock_devin(f.tmp.path());
+    app_install_roles(&f);
+
+    // A role the app does not declare is refused before anything is
+    // registered.
+    let err =
+        f.d.operator_rpc(
+            "app_add_worker",
+            json!({"project": "demo", "name": "roles", "role": "nobody"}),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("no team role"), "{err}");
+
+    let out =
+        f.d.operator_rpc(
+            "app_add_worker",
+            json!({"project": "demo", "name": "roles", "role": "publisher"}),
+        )
+        .unwrap_or_else(|e| panic!("add worker: {e}"));
+    let alias = out["alias"].as_str().unwrap().to_string();
+    assert!(alias.starts_with("publisher-"), "prefixed alias: {out}");
+    assert_eq!(out["team"]["publisher"], json!(alias), "{out}");
+
+    // The worker is registered as a Devin pty worker with no upstream
+    // (a group root the operator owns), and it is in the app's team.
+    let show =
+        f.d.operator_rpc("agent_show", json!({"alias": alias}))
+            .unwrap();
+    assert_eq!(show["agent"]["provider"], "devin", "{show}");
+    assert_eq!(show["agent"]["endpoint_kind"], "pty", "{show}");
+    assert!(show["agent"]["params"]["upstream"].is_null(), "{show}");
+    let app = f.cli(&["app", "show", "roles", "--project", "demo"]).1;
+    assert_eq!(app["team"]["publisher"], json!(alias), "{app}");
+
+    // A second Add worker for the same role mints a different alias.
+    let out2 =
+        f.d.operator_rpc(
+            "app_add_worker",
+            json!({"project": "demo", "name": "roles", "role": "publisher"}),
+        )
+        .unwrap();
+    assert_ne!(out2["alias"], json!(alias), "unique alias: {out2}");
+}
+
+/// CAD-577: approving a run resumes the stopped agents its tickets are
+/// assigned to — the app's team — through the existing `agent resume`
+/// path, instead of leaving their tasks queued. A live agent is left
+/// alone.
+#[test]
+fn plan_approve_resumes_the_runs_stopped_team_agents() {
+    let f = PlanFixture::start();
+    for a in ["dev-1", "qa-1"] {
+        f.d.register(a);
+        f.d.wait_agent(a, "idle", 10);
+    }
+    // Both team agents stop before the plan is approved.
+    for a in ["dev-1", "qa-1"] {
+        f.d.operator_rpc("agent_stop", json!({"alias": a})).unwrap();
+        f.d.wait_agent(a, "stopped", 10);
+    }
+
+    wf_add(&f, "two-step", WF_TWO_STEP);
+    let (ok, out) = f.cli(&["workflow", "approve", "two-step", "--project", "demo"]);
+    assert!(ok, "{out}");
+    let (ok, out) = f.cli(&[
+        "plan",
+        "propose",
+        "--project",
+        "demo",
+        "--workflow",
+        "two-step",
+        "--input",
+        "title=resume",
+    ]);
+    assert!(ok, "{out}");
+    let epic = out["epic"].as_str().unwrap();
+    let (ok, out) = f.cli(&["plan", "approve", epic]);
+    assert!(ok, "{out}");
+
+    // Both stopped team agents resumed through the existing path.
+    for a in ["dev-1", "qa-1"] {
+        f.d.wait_agent(a, "idle", 15);
+        let resumed =
+            f.d.events(a)
+                .into_iter()
+                .any(|e| e["kind"].as_str() == Some("run_team_resumed"));
+        assert!(resumed, "{a} has no run_team_resumed event");
+    }
+}
+
+/// CAD-577: revoking an app's approval revokes exactly the grants the
+/// approval derived — and never a hand-made grant's other scopes.
+#[test]
+fn app_revoke_revokes_derived_grants() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    app_install_roles(&f);
+    f.d.operator_rpc(
+        "app_set_team",
+        json!({"project": "demo", "name": "roles", "team": ["publisher=dev-1"]}),
+    )
+    .unwrap();
+    // A hand-made grant on the same account, with an extra scope.
+    f.d.operator_rpc(
+        "platform_grant",
+        json!({"agent": "dev-1", "platform": "local", "account": "local",
+               "scopes": ["publish", "other"]}),
+    )
+    .unwrap();
+    f.d.operator_rpc("app_approve", json!({"project": "demo", "name": "roles"}))
+        .unwrap();
+    assert_eq!(
+        grant_scopes(&f, "dev-1", "local", "local").unwrap(),
+        vec!["other".to_string(), "publish".to_string()]
+    );
+
+    // Revoke the app: the derived `publish` goes, the hand-made `other`
+    // survives.
+    f.d.operator_rpc("app_revoke", json!({"project": "demo", "name": "roles"}))
+        .unwrap();
+    assert_eq!(
+        grant_scopes(&f, "dev-1", "local", "local").unwrap(),
+        vec!["other".to_string()],
+        "revoke must take only the derived scopes"
+    );
+    // The app is unapproved again.
+    let err =
+        f.d.operator_rpc(
+            "plan_propose",
+            json!({"project": "demo", "workflow": "roles/go",
+                   "inputs": {"title": "x", "publisher": "dev-1"}}),
+        )
+        .unwrap_err();
+    assert_eq!(err.code(), Some("app_unapproved"), "{err}");
+
+    // An agent cannot revoke: the verb is the operator's, like approve.
+    let mut pane = LaneShell::spawn(f.tmp.path());
+    plant_pane(&f.d, "pane-9", pane.pid());
+    let r = pane.rpc(
+        &f.d.state,
+        "app_revoke",
+        json!({"project": "demo", "name": "roles"}),
+    );
+    assert_eq!(r["ok"], false, "agent revoke admitted: {r}");
+}
+
+/// Review 344 r3: an approve that already holds the tracker write lock
+/// and has derived its grants must not land after a revoke. Revoke
+/// takes that same lock and waits. The final grant is gone, and the
+/// revoke does not return while the hold file still exists.
+#[test]
+fn revoke_waits_for_an_approve_already_inside_the_lock() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    app_install_roles(&f);
+    f.d.operator_rpc(
+        "app_set_team",
+        json!({"project": "demo", "name": "roles", "team": ["publisher=dev-1"]}),
+    )
+    .unwrap();
+
+    let hold = f.tmp.path().join("approve-hold");
+    std::fs::write(&hold, "1").unwrap();
+    test_env().set("CADENCE_TEST_APP_APPROVE_HOLD", hold.to_str().unwrap());
+    struct ClearHold;
+    impl Drop for ClearHold {
+        fn drop(&mut self) {
+            test_env().remove("CADENCE_TEST_APP_APPROVE_HOLD");
+        }
+    }
+    let _clear_hold = ClearHold;
+    let ready = PathBuf::from(format!("{}.ready", hold.display()));
+    let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let daemon = &f.d;
+    thread::scope(|s| {
+        let approve = s.spawn(|| {
+            daemon.operator_rpc("app_approve", json!({"project": "demo", "name": "roles"}))
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "approve never reached the tracker lock"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        let flag = std::sync::Arc::clone(&finished);
+        let revoke = s.spawn(move || {
+            let out =
+                daemon.operator_rpc("app_revoke", json!({"project": "demo", "name": "roles"}));
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            out
+        });
+        // A revoke that does not take the lock finishes this write
+        // while the approve is still paused. One that takes it is
+        // still spinning when the window ends.
+        let window = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < window && !finished.load(std::sync::atomic::Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            hold.exists(),
+            "the approve left the lock before the revoke was observed"
+        );
+        assert!(
+            !finished.load(std::sync::atomic::Ordering::SeqCst),
+            "revoke returned while the approve still held the tracker lock"
+        );
+        std::fs::remove_file(&hold).unwrap();
+        approve.join().unwrap().unwrap();
+        let revoked = revoke.join().unwrap().unwrap();
+        assert_eq!(revoked["revoked"], true, "{revoked}");
+    });
+
+    assert!(
+        grant_scopes(&f, "dev-1", "local", "local").is_none(),
+        "the revoke that waited must be the last writer"
+    );
+    let err =
+        f.d.operator_rpc(
+            "plan_propose",
+            json!({"project": "demo", "workflow": "roles/go",
+                   "inputs": {"title": "x", "publisher": "dev-1"}}),
+        )
+        .unwrap_err();
+    assert_eq!(err.code(), Some("app_unapproved"), "{err}");
+}
+
+/// Review 344 r4: `app remove` is the other revoke. An approve that
+/// already holds the tracker write lock must not commit its grant
+/// after remove has read holders. Remove takes that same lock before
+/// the read and holds it through the revoke and the folder delete, so
+/// it does not return while the hold file still exists, and it is the
+/// last writer.
+#[test]
+fn remove_waits_for_an_approve_already_inside_the_lock() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    app_install_roles(&f);
+    f.d.operator_rpc(
+        "app_set_team",
+        json!({"project": "demo", "name": "roles", "team": ["publisher=dev-1"]}),
+    )
+    .unwrap();
+
+    let hold = f.tmp.path().join("approve-hold");
+    std::fs::write(&hold, "1").unwrap();
+    test_env().set("CADENCE_TEST_APP_APPROVE_HOLD", hold.to_str().unwrap());
+    struct ClearHold;
+    impl Drop for ClearHold {
+        fn drop(&mut self) {
+            test_env().remove("CADENCE_TEST_APP_APPROVE_HOLD");
+        }
+    }
+    let _clear_hold = ClearHold;
+    let ready = PathBuf::from(format!("{}.ready", hold.display()));
+    let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // The CLI is a second connection. Owned paths so the scoped thread
+    // does not borrow the fixture.
+    let state = f.d.state.clone();
+    let pm_dir = f.pm_dir.clone();
+    let home = f.tmp.path().join("home");
+    let tmp = f.tmp.path().join("tmp");
+    let config = home.join(".config");
+    let data = home.join(".local/share");
+    let state_home = home.join(".local/state");
+
+    let daemon = &f.d;
+    thread::scope(|s| {
+        let approve = s.spawn(|| {
+            daemon.operator_rpc("app_approve", json!({"project": "demo", "name": "roles"}))
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "approve never reached the tracker lock"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        let flag = std::sync::Arc::clone(&finished);
+        let remove = s.spawn(move || {
+            let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+                .arg("--state-dir")
+                .arg(&state)
+                .args(["app", "remove", "roles", "--project", "demo"])
+                .env("CADENCE_PM_DIR", &pm_dir)
+                .env("HOME", &home)
+                .env("XDG_CONFIG_HOME", &config)
+                .env("XDG_DATA_HOME", &data)
+                .env("XDG_STATE_HOME", &state_home)
+                .env("TMPDIR", &tmp)
+                .env_remove("CADENCE_ALIAS")
+                .operator_output()
+                .unwrap();
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            let text = if out.stdout.is_empty() {
+                String::from_utf8_lossy(&out.stderr).to_string()
+            } else {
+                String::from_utf8_lossy(&out.stdout).to_string()
+            };
+            let value = serde_json::from_str(text.trim()).unwrap_or(Value::String(text));
+            (out.status.success(), value)
+        });
+        // A remove that revokes before taking the lock still blocks on
+        // the lock afterwards, so it must not finish during this window
+        // either. The grant assertion below is what fails when that
+        // early read skipped the revoke.
+        let window = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < window && !finished.load(std::sync::atomic::Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            hold.exists(),
+            "the approve left the lock before remove was observed"
+        );
+        assert!(
+            !finished.load(std::sync::atomic::Ordering::SeqCst),
+            "app remove returned while the approve still held the tracker lock"
+        );
+        std::fs::remove_file(&hold).unwrap();
+        approve.join().unwrap().unwrap();
+        let (ok, removed) = remove.join().unwrap();
+        assert!(ok, "{removed}");
+        assert_eq!(removed["removed"], true, "{removed}");
+    });
+
+    assert!(
+        grant_scopes(&f, "dev-1", "local", "local").is_none(),
+        "remove that raced an in-lock approve must not leave the derived grant"
+    );
+    assert!(!f.pm_dir.join("demo/apps/roles").exists());
+
+    let src = f.tmp.path().join("app-roles");
+    let (ok, out) = f.cli(&["app", "install", src.to_str().unwrap(), "--project", "demo"]);
+    assert!(ok, "reinstall after the raced remove: {out}");
+    let err =
+        f.d.operator_rpc(
+            "plan_propose",
+            json!({"project": "demo", "workflow": "roles/go",
+                   "inputs": {"title": "x", "publisher": "dev-1"}}),
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.code(),
+        Some("app_unapproved"),
+        "reinstall of the same digest must not already be approved: {err}"
+    );
+}
+
+/// Review 344 r4: `app remove` withdraws the approval, not only the
+/// grant rows. Reinstalling the same bytes must ask for approval again.
+#[test]
+fn app_remove_then_reinstall_requires_approval_again() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    app_install_roles(&f);
+    f.d.operator_rpc(
+        "app_set_team",
+        json!({"project": "demo", "name": "roles", "team": ["publisher=dev-1"]}),
+    )
+    .unwrap();
+    f.d.operator_rpc("app_approve", json!({"project": "demo", "name": "roles"}))
+        .unwrap();
+    assert!(grant_scopes(&f, "dev-1", "local", "local").is_some());
+
+    let (ok, out) = f.cli(&["app", "remove", "roles", "--project", "demo"]);
+    assert!(ok, "{out}");
+    assert!(
+        grant_scopes(&f, "dev-1", "local", "local").is_none(),
+        "remove drops the derived grant"
+    );
+
+    let src = f.tmp.path().join("app-roles");
+    let (ok, out) = f.cli(&["app", "install", src.to_str().unwrap(), "--project", "demo"]);
+    assert!(ok, "reinstall: {out}");
+    let err =
+        f.d.operator_rpc(
+            "plan_propose",
+            json!({"project": "demo", "workflow": "roles/go",
+                   "inputs": {"title": "x", "publisher": "dev-1"}}),
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.code(),
+        Some("app_unapproved"),
+        "reinstall of the same digest must not already be approved: {err}"
+    );
+}
+
+/// Review 344 r4: sweeping grants whose app folder is gone must also
+/// record a withdrawn approval. Otherwise a later reinstall of the
+/// same digest is already approved and the next propose re-derives
+/// the grant.
+#[test]
+fn removed_app_sweep_withdraws_the_approval() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    app_install_roles(&f);
+    f.d.operator_rpc(
+        "app_set_team",
+        json!({"project": "demo", "name": "roles", "team": ["publisher=dev-1"]}),
+    )
+    .unwrap();
+    f.d.operator_rpc("app_approve", json!({"project": "demo", "name": "roles"}))
+        .unwrap();
+    assert!(grant_scopes(&f, "dev-1", "local", "local").is_some());
+
+    // The folder and the install record are gone; the grant and the
+    // live approval remain. That is the leftover the sweep exists for
+    // — a removal that did not record the revoke.
+    let apps = f.pm_dir.join("demo/apps");
+    std::fs::remove_dir_all(apps.join("roles")).unwrap();
+    std::fs::remove_file(apps.join("roles.yaml")).unwrap();
+
+    // A propose reconciles the named app, and that sweep runs before
+    // the gate. The propose itself fails: the folder is gone.
+    let swept = f.d.operator_rpc(
+        "plan_propose",
+        json!({"project": "demo", "workflow": "roles/go",
+               "inputs": {"title": "x", "publisher": "dev-1"}}),
+    );
+    assert!(
+        swept.is_err(),
+        "propose of a removed app must fail: {swept:?}"
+    );
+
+    let src = f.tmp.path().join("app-roles");
+    let (ok, out) = f.cli(&["app", "install", src.to_str().unwrap(), "--project", "demo"]);
+    assert!(ok, "reinstall after the sweep: {out}");
+    let err =
+        f.d.operator_rpc(
+            "plan_propose",
+            json!({"project": "demo", "workflow": "roles/go",
+                   "inputs": {"title": "x", "publisher": "dev-1"}}),
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.code(),
+        Some("app_unapproved"),
+        "sweep must withdraw the approval, not only the grant rows: {err}"
+    );
+}
+
+fn roles_install_id(f: &PlanFixture) -> String {
+    let (ok, show) = f.cli(&["app", "show", "roles", "--project", "demo"]);
+    assert!(ok, "{show}");
+    show["record"]["install_id"]
+        .as_str()
+        .unwrap_or("")
+        .to_string()
+}
+
+fn latest_roles_approval(f: &PlanFixture) -> Value {
+    let store = cadence_agent::store::Store::open_side(&f.d.state.join("cadence.sqlite3"))
+        .expect("side open of the fixture store");
+    store
+        .app_approvals()
+        .expect("approval read")
+        .get("demo/roles")
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+fn propose_roles(f: &PlanFixture) -> cadence_agent::Result<Value> {
+    f.d.operator_rpc(
+        "plan_propose",
+        json!({"project": "demo", "workflow": "roles/go",
+               "inputs": {"title": "x", "publisher": "dev-1"}}),
+    )
+}
+
+/// CAD-577 r5: an approval that derived no grants is still an approval.
+/// Remove then reinstall of the same bytes must not inherit it, and a
+/// later set-team must not create a grant from it.
+#[test]
+fn install_id_reinstall_after_empty_approval_is_unapproved() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    app_install_roles(&f);
+    let first = roles_install_id(&f);
+    assert!(!first.is_empty(), "install mints an install id");
+    f.d.operator_rpc("app_approve", json!({"project": "demo", "name": "roles"}))
+        .unwrap();
+    assert!(
+        grant_scopes(&f, "dev-1", "local", "local").is_none(),
+        "no team, so approval derives nothing"
+    );
+
+    let (ok, out) = f.cli(&["app", "remove", "roles", "--project", "demo"]);
+    assert!(ok, "{out}");
+    let src = f.tmp.path().join("app-roles");
+    let (ok, out) = f.cli(&["app", "install", src.to_str().unwrap(), "--project", "demo"]);
+    assert!(ok, "reinstall: {out}");
+    let second = roles_install_id(&f);
+    assert_ne!(first, second, "reinstall mints a new install id");
+
+    let err = propose_roles(&f).unwrap_err();
+    assert_eq!(
+        err.code(),
+        Some("app_unapproved"),
+        "reinstall must not inherit the empty approval: {err}"
+    );
+    f.d.operator_rpc(
+        "app_set_team",
+        json!({"project": "demo", "name": "roles", "team": ["publisher=dev-1"]}),
+    )
+    .unwrap();
+    assert!(
+        grant_scopes(&f, "dev-1", "local", "local").is_none(),
+        "set-team must not grant from the previous install's approval"
+    );
+    let err = propose_roles(&f).unwrap_err();
+    assert_eq!(err.code(), Some("app_unapproved"), "{err}");
+}
+
+/// CAD-577 r5: a hand-deleted folder leaves an approval and no grant
+/// rows. The sweep must withdraw that approval, not only walk
+/// `app_grants`.
+#[test]
+fn install_id_hand_delete_sweep_withdraws_approval() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    app_install_roles(&f);
+    f.d.operator_rpc("app_approve", json!({"project": "demo", "name": "roles"}))
+        .unwrap();
+    assert!(grant_scopes(&f, "dev-1", "local", "local").is_none());
+
+    let apps = f.pm_dir.join("demo/apps");
+    std::fs::remove_dir_all(apps.join("roles")).unwrap();
+    std::fs::remove_file(apps.join("roles.yaml")).unwrap();
+
+    let swept = propose_roles(&f);
+    assert!(
+        swept.is_err(),
+        "propose of a removed app must fail: {swept:?}"
+    );
+    let approval = latest_roles_approval(&f);
+    assert_eq!(
+        approval["revoked"], true,
+        "sweep withdraws an approval that derived no grants: {approval}"
+    );
+}
+
+/// CAD-577 r5: an approval recorded before install ids exist (no
+/// `install_id` field) is not an approval of the current install.
+#[test]
+fn install_id_missing_on_approval_is_not_honoured() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    let installed = app_install_roles(&f);
+    let digest = installed["digest"].as_str().unwrap().to_string();
+    let store = cadence_agent::store::Store::open_side(&f.d.state.join("cadence.sqlite3"))
+        .expect("side open");
+    store
+        .record_app_approval(json!({
+            "project": "demo",
+            "name": "roles",
+            "digest": digest,
+            "by": "operator",
+        }))
+        .unwrap();
+
+    let err = propose_roles(&f).unwrap_err();
+    assert_eq!(
+        err.code(),
+        Some("app_unapproved"),
+        "an approval with no install id must not pass the gate: {err}"
+    );
+    f.d.operator_rpc(
+        "app_set_team",
+        json!({"project": "demo", "name": "roles", "team": ["publisher=dev-1"]}),
+    )
+    .unwrap();
+    assert!(
+        grant_scopes(&f, "dev-1", "local", "local").is_none(),
+        "set-team must not grant from an approval that has no install id"
+    );
+}
+
+/// CAD-577 r5: `app update` keeps the install id. A wording-only edit
+/// stays approved; a structural edit re-gates without minting a new id.
+#[test]
+fn install_id_update_keeps_id_and_regates_structure() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    app_install_roles(&f);
+    let id = roles_install_id(&f);
+    assert!(!id.is_empty(), "install mints an install id");
+    f.d.operator_rpc(
+        "app_set_team",
+        json!({"project": "demo", "name": "roles", "team": ["publisher=dev-1"]}),
+    )
+    .unwrap();
+    f.d.operator_rpc("app_approve", json!({"project": "demo", "name": "roles"}))
+        .unwrap();
+    propose_roles(&f).expect("the fresh approval covers this install");
+
+    let src = f.tmp.path().join("app-roles/app.md");
+    let md = std::fs::read_to_string(&src).unwrap();
+    let wording = md.replace(
+        "version: 0.1.0\n",
+        "version: 0.1.0\nsummary: A quiet note.\n",
+    );
+    assert_ne!(wording, md);
+    std::fs::write(&src, &wording).unwrap();
+    let (ok, out) = f.cli(&["app", "update", "roles", "--project", "demo"]);
+    assert!(ok, "{out}");
+    assert_eq!(out["gate_changed"], false, "summary is wording: {out}");
+    assert_eq!(roles_install_id(&f), id, "update keeps the install id");
+    propose_roles(&f).expect("unchanged digest stays approved for this install");
+
+    let structural = wording.replace("\nbody\n", "\nbody changed\n");
+    std::fs::write(&src, structural).unwrap();
+    let (ok, out) = f.cli(&["app", "update", "roles", "--project", "demo"]);
+    assert!(ok, "{out}");
+    assert_eq!(out["gate_changed"], true, "{out}");
+    assert_eq!(
+        roles_install_id(&f),
+        id,
+        "a structural update keeps the install id"
+    );
+    let err = propose_roles(&f).unwrap_err();
+    assert_eq!(
+        err.code(),
+        Some("app_unapproved"),
+        "a structural change re-gates this install: {err}"
+    );
+}
+
+/// Review 344: a team change drops the agent who left. Approving with
+/// publisher=dev-1 then setting the team to dev-2 must not leave dev-1
+/// holding `local/local publish`.
+#[test]
+fn rev344_team_change_drops_the_old_agents_grant() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    f.d.register("dev-2");
+    app_install_roles(&f);
+    f.d.operator_rpc(
+        "app_set_team",
+        json!({"project": "demo", "name": "roles", "team": ["publisher=dev-1"]}),
+    )
+    .unwrap();
+    f.d.operator_rpc("app_approve", json!({"project": "demo", "name": "roles"}))
+        .unwrap();
+    assert_eq!(
+        grant_scopes(&f, "dev-1", "local", "local").unwrap(),
+        vec!["publish".to_string()]
+    );
+
+    f.d.operator_rpc(
+        "app_set_team",
+        json!({"project": "demo", "name": "roles", "team": ["publisher=dev-2"]}),
+    )
+    .unwrap();
+    assert!(
+        grant_scopes(&f, "dev-1", "local", "local").is_none(),
+        "dev-1 left the team — its derived grant must be gone"
+    );
+    assert_eq!(
+        grant_scopes(&f, "dev-2", "local", "local").unwrap(),
+        vec!["publish".to_string()]
+    );
+}
+
+/// Review 344: re-approving a structure that no longer declares the
+/// scope drops the old grant. Unbinding `publish` derives nothing.
+#[test]
+fn rev344_reapproval_drops_a_scope_the_new_structure_dropped() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    app_install_roles(&f);
+    f.d.operator_rpc(
+        "app_set_team",
+        json!({"project": "demo", "name": "roles", "team": ["publisher=dev-1"]}),
+    )
+    .unwrap();
+    f.d.operator_rpc("app_approve", json!({"project": "demo", "name": "roles"}))
+        .unwrap();
+    assert!(grant_scopes(&f, "dev-1", "local", "local").is_some());
+
+    let (ok, out) = f.cli(&["app", "set", "roles", "publish=", "--project", "demo"]);
+    assert!(ok, "{out}");
+    f.d.operator_rpc("app_approve", json!({"project": "demo", "name": "roles"}))
+        .unwrap();
+    assert!(
+        grant_scopes(&f, "dev-1", "local", "local").is_none(),
+        "the new structure derives nothing on local/local — the old scope must be gone"
+    );
+}
+
+/// Review 344: `app remove` after approve leaves the agent with no
+/// derived grant. The folder delete revokes first.
+#[test]
+fn app_remove_drops_the_derived_grant() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    app_install_roles(&f);
+    f.d.operator_rpc(
+        "app_set_team",
+        json!({"project": "demo", "name": "roles", "team": ["publisher=dev-1"]}),
+    )
+    .unwrap();
+    f.d.operator_rpc("app_approve", json!({"project": "demo", "name": "roles"}))
+        .unwrap();
+    assert!(grant_scopes(&f, "dev-1", "local", "local").is_some());
+
+    let (ok, out) = f.cli(&["app", "remove", "roles", "--project", "demo"]);
+    assert!(ok, "{out}");
+    assert!(
+        grant_scopes(&f, "dev-1", "local", "local").is_none(),
+        "approve then remove must leave no derived grant"
+    );
+}
+
+/// Review 344 r3: a grant-store read that fails while the database
+/// file exists must refuse removal. Treating the error as "no holders"
+/// would delete the folder and leave the grant behind.
+#[test]
+fn app_remove_refuses_when_the_grant_store_cannot_be_read() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    app_install_roles(&f);
+    let db = f.d.state.join("cadence.sqlite3");
+    assert!(
+        db.exists(),
+        "the daemon store must exist before the read can fail"
+    );
+    // The daemon keeps the original inode. A directory at the path
+    // still exists, and a read-only open of it fails — a replacement
+    // file can be rewritten by a later open, which would look like
+    // "no holders".
+    std::fs::remove_file(&db).unwrap();
+    std::fs::create_dir(&db).unwrap();
+    let (ok, out) = f.cli(&["app", "remove", "roles", "--project", "demo"]);
+    assert!(
+        !ok && out.to_string().contains("could not be read"),
+        "removal continued after a grant-store read failure: {out}"
+    );
+    assert!(
+        f.pm_dir.join("demo/apps/roles").exists(),
+        "the folder must stay when the grant read fails"
+    );
+}
+
+/// Review 344 note 4: revoking app A subtracts only the scopes no other
+/// approved app still derives for the same agent.
+#[test]
+fn revoking_one_app_keeps_a_scope_another_app_still_derives() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    app_install_roles(&f);
+    f.d.operator_rpc(
+        "app_set_team",
+        json!({"project": "demo", "name": "roles", "team": ["publisher=dev-1"]}),
+    )
+    .unwrap();
+    f.d.operator_rpc("app_approve", json!({"project": "demo", "name": "roles"}))
+        .unwrap();
+
+    let src = app_src(
+        &f,
+        "other",
+        &[
+            (
+                "app.md",
+                "---\napp: other\ntitle: Other\nversion: 0.1.0\nneeds:\n  connections: [publish]\n---\n\nbody\n",
+            ),
+            (
+                "workflows/publish.md",
+                "---\ntitle: \"Go: {{title}}\"\ngoal: g\ninputs:\n  title: {}\n  publisher: {}\n---\n\n## Publish\nagent: {{publisher}}\nuses: publish\n\n### Acceptance\n- [ ] done\n",
+            ),
+        ],
+    );
+    let (ok, out) = f.cli(&["app", "install", src.to_str().unwrap(), "--project", "demo"]);
+    assert!(ok, "{out}");
+    f.d.operator_rpc(
+        "app_set_team",
+        json!({"project": "demo", "name": "other", "team": ["publisher=dev-1"]}),
+    )
+    .unwrap();
+    f.d.operator_rpc("app_approve", json!({"project": "demo", "name": "other"}))
+        .unwrap();
+    assert_eq!(
+        grant_scopes(&f, "dev-1", "local", "local").unwrap(),
+        vec!["publish".to_string()]
+    );
+
+    f.d.operator_rpc("app_revoke", json!({"project": "demo", "name": "roles"}))
+        .unwrap();
+    assert_eq!(
+        grant_scopes(&f, "dev-1", "local", "local").unwrap(),
+        vec!["publish".to_string()],
+        "app B still derives publish — revoking A must not cut it"
+    );
+    f.d.operator_rpc("app_revoke", json!({"project": "demo", "name": "other"}))
+        .unwrap();
+    assert!(
+        grant_scopes(&f, "dev-1", "local", "local").is_none(),
+        "the last app's revoke drops the shared scope"
+    );
+}
+
+/// Review 344 note 5: the saved team is the union of every workflow's
+/// roles. Proposing one workflow fills only the roles that workflow
+/// declares — a sibling role is not an unknown input.
+#[test]
+fn propose_fills_only_the_rendered_workflows_roles() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    f.d.register("dev-2");
+    let src = app_src(
+        &f,
+        "multi",
+        &[
+            (
+                "app.md",
+                "---\napp: multi\ntitle: Multi\nversion: 0.1.0\nneeds:\n  connections: [publish]\n---\n\nbody\n",
+            ),
+            (
+                "workflows/go.md",
+                "---\ntitle: \"Go: {{title}}\"\ngoal: g\ninputs:\n  title: {}\n  publisher: {}\n---\n\n## Work {{title}}\nagent: {{publisher}}\nuses: publish\n\n### Acceptance\n- [ ] done\n",
+            ),
+            (
+                "workflows/edit.md",
+                "---\ntitle: \"Edit: {{title}}\"\ngoal: g\ninputs:\n  title: {}\n  editor: {}\n---\n\n## Edit {{title}}\nagent: {{editor}}\n\n### Acceptance\n- [ ] done\n",
+            ),
+        ],
+    );
+    let (ok, out) = f.cli(&["app", "install", src.to_str().unwrap(), "--project", "demo"]);
+    assert!(ok, "{out}");
+    f.d.operator_rpc(
+        "app_set_team",
+        json!({"project": "demo", "name": "multi",
+               "team": ["publisher=dev-1", "editor=dev-2"]}),
+    )
+    .unwrap();
+    f.d.operator_rpc("app_approve", json!({"project": "demo", "name": "multi"}))
+        .unwrap();
+    let out =
+        f.d.operator_rpc(
+            "plan_propose",
+            json!({"project": "demo", "workflow": "multi/go",
+                   "inputs": {"title": "x"}}),
+        )
+        .unwrap();
+    assert_eq!(out["committed"], true, "{out}");
+}
+
 /// CAD-547: install is safe on hostile input — a symlink anywhere in
 /// the bundle (or the source dir itself), an unknown top-level entry,
 /// a missing `app.md`, a missing or empty `workflows/`, a `uses:` the

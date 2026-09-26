@@ -68,7 +68,15 @@ impl Store {
     /// caller passes `None` and gets the historical fence-everything
     /// recovery.
     pub fn open_adopting(path: &Path, marker: Option<ConsumedMarker>) -> Result<Self> {
-        Self::open_inner(path, marker, true)
+        Self::open_inner(path, marker, true, true)
+    }
+
+    /// Open a live database for a side write that must not run restart
+    /// recovery. `app remove` uses this to revoke derived grants while
+    /// the daemon still holds the store — recovery would fence the
+    /// daemon's in-flight turns (CAD-577).
+    pub fn open_side(path: &Path) -> Result<Self> {
+        Self::open_inner(path, None, true, false)
     }
 
     /// Migrate an older database without the rollout lease gate.
@@ -77,10 +85,15 @@ impl Store {
     /// `open` and `open_adopting` — the daemon and doctor paths — never
     /// call it, so a lower-schema production database still refuses.
     pub fn open_for_schema_tests(path: &Path) -> Result<Self> {
-        Self::open_inner(path, None, false)
+        Self::open_inner(path, None, false, true)
     }
 
-    fn open_inner(path: &Path, marker: Option<ConsumedMarker>, gate: bool) -> Result<Self> {
+    fn open_inner(
+        path: &Path,
+        marker: Option<ConsumedMarker>,
+        gate: bool,
+        recover: bool,
+    ) -> Result<Self> {
         let permit = if gate {
             crate::rollout::authorize_migration(path)?
         } else {
@@ -530,6 +543,29 @@ impl Store {
             )?;
             tx.commit()?;
         }
+        if version < 19 {
+            // v19: `app_grants.install_id` (CAD-577) — the install a
+            // derived grant belongs to. Empty on rows written before
+            // install ids; those never match the current install, so
+            // the sweep withdraws them and the operator re-approves
+            // once. Column check so a half-applied alter converges.
+            let columns: Vec<String> = conn
+                .prepare("PRAGMA table_info(app_grants)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .filter_map(std::result::Result::ok)
+                .collect();
+            let tx = conn.unchecked_transaction()?;
+            if !columns.iter().any(|column| column == "install_id") {
+                tx.execute_batch(
+                    "ALTER TABLE app_grants ADD COLUMN install_id TEXT NOT NULL DEFAULT ''",
+                )?;
+            }
+            tx.execute(
+                "UPDATE schema_version SET version=?1",
+                [crate::rollout::SCHEMA_VERSION],
+            )?;
+            tx.commit()?;
+        }
         if let Some(crossing) = permit.crossing {
             Self::event(
                 &conn,
@@ -548,7 +584,9 @@ impl Store {
             adoptions: Mutex::new(std::collections::HashMap::new()),
             thread_held: Mutex::new(std::collections::HashMap::new()),
         };
-        store.recover(marker.as_ref())?;
+        if recover {
+            store.recover(marker.as_ref())?;
+        }
         Ok(store)
     }
 

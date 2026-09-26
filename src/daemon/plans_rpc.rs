@@ -68,6 +68,15 @@ impl Shared {
         let text = optional_str(params, "text");
         let workflow = optional_str(params, "workflow");
         let inputs = params.get("inputs");
+        // CAD-577: a propose is a daemon touch of the app — reconcile
+        // its derived grants with the current approval BEFORE the gate
+        // runs. A structural change since approval revokes them (and
+        // drains any waiting effect that lost a scope); a team change
+        // re-derives. This runs even when the propose is then refused
+        // `app_unapproved`, so the grants track the structure.
+        if let Some((app, _)) = workflow.and_then(crate::issue::app::split_ref) {
+            self.reconcile_app_grants(project, app);
+        }
         let text = match (text, workflow) {
             (Some(t), None) => {
                 if inputs.is_some() {
@@ -216,9 +225,69 @@ impl Shared {
         // CAD-445: the approved tickets are the master's to dispatch now.
         if approve {
             self.wake_on_plan_approved(&out);
+            // CAD-577: resuming a run resumes the app's stopped team
+            // agents instead of leaving their tasks queued.
+            self.resume_run_team(epic);
         }
         self.wake();
         Ok(out)
+    }
+
+    /// CAD-577: when a plan is approved, resume the stopped agents the
+    /// run's tickets are assigned to — the app's team. `agent resume`
+    /// is the existing path; a live agent is left alone and a failure
+    /// is recorded by the resume path itself (never a silent skip).
+    /// Best-effort: a missing epic or an unreadable ticket just resumes
+    /// what it can.
+    pub(super) fn resume_run_team(self: &Arc<Self>, epic: &str) {
+        let Ok(pm_dir) = self.pm_dir() else { return };
+        let Ok(epic_issue) = crate::issue::board::find_issue(&pm_dir, epic) else {
+            return;
+        };
+        let Some(plan) = &epic_issue.front.plan else {
+            return;
+        };
+        let mut owners: Vec<String> = Vec::new();
+        for id in &plan.tickets {
+            if let Ok(issue) = crate::issue::board::find_issue(&pm_dir, id) {
+                if let Some(owner) = issue.front.owner.clone() {
+                    if !owners.contains(&owner) {
+                        owners.push(owner);
+                    }
+                }
+            }
+        }
+        for alias in owners {
+            let Ok(agent) = self.store.agent(&alias) else {
+                continue;
+            };
+            // Only a stopped agent with a real actor resumes; a live
+            // one is left alone, an inbox has nothing to start.
+            if agent.state != "stopped"
+                || !crate::adapter::registry::has_actor(&agent.provider, &agent.endpoint_kind)
+            {
+                continue;
+            }
+            match self.try_resume(&alias) {
+                Ok(true) => {
+                    let _ = self.store.event_public(
+                        &alias,
+                        "run_team_resumed",
+                        json!({"epic": epic, "reason": "the run's plan was approved"}),
+                    );
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    // A fenced or busy agent is not a silent skip —
+                    // record why the resume did not start it.
+                    let _ = self.store.event_public(
+                        &alias,
+                        "run_team_resume_failed",
+                        json!({"epic": epic, "reason": e.to_string()}),
+                    );
+                }
+            }
+        }
     }
 
     /// CAD-405 `epic_stage` — move an epic's stage: a gate decision and
@@ -380,6 +449,364 @@ impl Shared {
         Ok(payload)
     }
 
+    /// CAD-577 `app_set_team` — the operator records an app's default
+    /// team: one agent alias per workflow input role. Operator only,
+    /// connection-bound like `app approve`. The team lives with the
+    /// install record and is NOT in the gate digest, so setting it
+    /// never re-requires approval; each role must be a team input the
+    /// app's workflows declare, and each agent a registered alias.
+    pub(super) fn rpc_app_set_team(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.operator_connection("app set team", params, peer_pid)?;
+        let project = required_str(params, "project")?;
+        crate::issue::model::check_key(project)?;
+        let name = required_str(params, "name")?;
+        let roles = match params.get("team") {
+            Some(Value::Array(list)) => list
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| Error::rejected("'team' holds a non-string role"))
+                })
+                .collect::<Result<Vec<_>>>()?,
+            Some(_) => {
+                return Err(Error::rejected(
+                    "'team' must be a list of '<input>=<agent>'",
+                ))
+            }
+            None => return Err(Error::rejected("Missing or non-array 'team'")),
+        };
+        let pm_dir = self.pm_dir()?;
+        if !crate::issue::project::list(&pm_dir)?
+            .iter()
+            .any(|p| p.key == project)
+        {
+            return Err(crate::issue::project::unknown_project(project, &pm_dir));
+        }
+        let pm = self.pm_at(&pm_dir)?;
+        let out =
+            crate::issue::app::set_team(&pm, project, name, &roles, &self.state_dir, "operator")?;
+        // The team is what maps roles to agents, so a team change
+        // re-derives the app's grants (CAD-577) — but only while the
+        // app is still approved; a structural change revoked them.
+        self.reconcile_app_grants(project, name);
+        self.wake();
+        Ok(out)
+    }
+
+    /// CAD-577 `app_add_worker` — the operator's one-click "Add
+    /// worker": join a new Devin worker for one of the app's team
+    /// roles, under the operator (a group root — its owner resolves to
+    /// `operator`), with a unique role-prefixed alias, then record it
+    /// in the app's team. The worker launches with the same defaults
+    /// the operator's other Devin workers use (`auto_ready=verified`,
+    /// `permission_mode=dangerous`). Operator only, connection-bound
+    /// like `app approve`.
+    pub(super) fn rpc_app_add_worker(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        self.operator_connection("app add worker", params, peer_pid)?;
+        let project = required_str(params, "project")?;
+        crate::issue::model::check_key(project)?;
+        let name = required_str(params, "name")?;
+        let role = required_str(params, "role")?;
+        let pm_dir = self.pm_dir()?;
+        let projects = crate::issue::project::list(&pm_dir)?;
+        let Some(proj) = projects.iter().find(|p| p.key == project) else {
+            return Err(crate::issue::project::unknown_project(project, &pm_dir));
+        };
+        let roles = crate::issue::app::team_roles(&pm_dir, project, name)?;
+        if !roles.iter().any(|r| r == role) {
+            return Err(Error::rejected(format!(
+                "app '{name}' has no team role '{role}' — its workflows name: {}",
+                if roles.is_empty() {
+                    "none".to_string()
+                } else {
+                    roles.join(", ")
+                }
+            )));
+        }
+        // The worker's checkout: the project's first repo path. A
+        // project with no repo path cannot host a lane.
+        let cwd = proj
+            .repos
+            .iter()
+            .find_map(|r| r.path.as_deref())
+            .map(crate::issue::project::expand_home)
+            .filter(|p| p.is_dir())
+            .ok_or_else(|| {
+                Error::rejected(format!(
+                    "project '{project}' names no repo path — a worker needs a \
+                     checkout; add one with `cadence issue project`"
+                ))
+            })?;
+        let alias = self.unique_worker_alias(role)?;
+        // Register + launch through the ordinary path — the board's
+        // proven operator is the caller, so `authorize_register` admits
+        // it. No `upstream`: the worker is a group root the operator
+        // owns (`inbox::owner_of` answers `operator`).
+        let register = json!({
+            "alias": alias,
+            "provider": "devin",
+            "endpoint_kind": "pty",
+            "role": "worker",
+            "cwd": cwd.to_string_lossy(),
+            "params": json!({"auto_ready": "verified",
+                               "permission_mode": "dangerous"}).to_string(),
+        });
+        self.rpc_register(&register, peer_pid)?;
+        // Record the new worker in the app's team for that role — the
+        // operator's own write, so the New post drawer pre-fills it.
+        let pm = self.pm_at(&pm_dir)?;
+        let out = crate::issue::app::set_team(
+            &pm,
+            project,
+            name,
+            &[format!("{role}={alias}")],
+            &self.state_dir,
+            "operator",
+        )?;
+        self.reconcile_app_grants(project, name);
+        self.wake();
+        Ok(json!({"alias": alias, "role": role, "team": out["team"]}))
+    }
+
+    /// A unique role-prefixed worker alias (`<role>-<6 hex>`) — the
+    /// prefix names the role, the suffix keeps it unique (CAD-577).
+    fn unique_worker_alias(&self, role: &str) -> Result<String> {
+        for _ in 0..32 {
+            let suffix = uuid::Uuid::new_v4().simple().to_string();
+            let alias = format!("{role}-{}", &suffix[..6]);
+            if self.store.agent_opt(&alias)?.is_none() {
+                return Ok(alias);
+            }
+        }
+        Err(Error::internal("could not mint a unique worker alias"))
+    }
+
+    /// Reconcile one app's derived grants with its current approval
+    /// (CAD-577). The store re-reads the approval under the write lock,
+    /// so a revoke that landed after this call computed the digest
+    /// cannot be overwritten by the stale derivation. An app whose
+    /// folder is gone is revoked here too — removal deletes the tracker
+    /// files, and a later propose of anything else sweeps the leftovers.
+    pub(super) fn reconcile_app_grants(&self, project: &str, name: &str) {
+        self.sweep_removed_app_grants();
+        let Ok(pm_dir) = self.pm_dir() else {
+            return;
+        };
+        let key = crate::issue::app::approval_key(project, name);
+        if !crate::issue::app::is_installed(&pm_dir, project, name) {
+            if let Ok(changed) = self
+                .store
+                .app_grants_reconcile(&key, None, "", &[], "operator")
+            {
+                self.drain_effect_scopes(changed);
+            }
+            return;
+        }
+        let Ok(digest) = crate::issue::app::digest(&pm_dir, project, name) else {
+            return;
+        };
+        let install_id = crate::issue::app::current_install_id(&pm_dir, project, name);
+        let Ok(derived) = crate::issue::app::derive_grants(&pm_dir, project, name) else {
+            return;
+        };
+        let grants: Vec<(String, String, String, Vec<String>)> = derived
+            .iter()
+            .map(|g| {
+                (
+                    g.agent.clone(),
+                    g.platform.clone(),
+                    g.account.clone(),
+                    g.scopes.clone(),
+                )
+            })
+            .collect();
+        if let Ok(changed) = self.store.app_grants_reconcile(
+            &key,
+            Some(digest.as_str()),
+            &install_id,
+            &grants,
+            "operator",
+        ) {
+            self.drain_effect_scopes(changed);
+        }
+    }
+
+    /// Withdraw approvals and derived grants that do not belong to the
+    /// current install (CAD-577). One rule, under the tracker write lock
+    /// from the installed check through the store write: an `app_grants`
+    /// row or a live approval whose `install_id` is not the current
+    /// record's id — or whose app folder is gone — is revoked. The lock
+    /// is the same one approve holds, taken first, so an approve cannot
+    /// commit into the gap. A missing or empty id never counts as current.
+    fn sweep_removed_app_grants(&self) {
+        let Ok(pm_dir) = self.pm_dir() else {
+            return;
+        };
+        let Ok(pm) = self.pm_at(&pm_dir) else {
+            return;
+        };
+        let Ok(_lock) = pm.lock() else {
+            return;
+        };
+        let Ok(grant_rows) = self.store.app_grant_installs() else {
+            return;
+        };
+        let Ok(approvals) = self.store.app_approvals() else {
+            return;
+        };
+        let mut keys: Vec<String> = grant_rows.iter().map(|(app, _)| app.clone()).collect();
+        for key in approvals.keys() {
+            if !keys.iter().any(|k| k == key) {
+                keys.push(key.clone());
+            }
+        }
+        keys.sort();
+        for key in keys {
+            let Some((project, name)) = key.split_once('/') else {
+                continue;
+            };
+            let installed = crate::issue::app::is_installed(&pm_dir, project, name);
+            let current = if installed {
+                crate::issue::app::current_install_id(&pm_dir, project, name)
+            } else {
+                String::new()
+            };
+            let approval = approvals.get(&key);
+            let live =
+                approval.is_some_and(|p| p.get("revoked").and_then(Value::as_bool) != Some(true));
+            let approval_id = approval
+                .and_then(|p| p.get("install_id"))
+                .and_then(Value::as_str);
+            let approval_binds =
+                live && installed && !current.is_empty() && approval_id == Some(current.as_str());
+            let grant_ids: Vec<&str> = grant_rows
+                .iter()
+                .filter(|(app, _)| app == &key)
+                .map(|(_, id)| id.as_str())
+                .collect();
+            let stale_grants = grant_ids
+                .iter()
+                .any(|id| !installed || current.is_empty() || *id != current.as_str());
+            if approval_binds && !stale_grants {
+                continue;
+            }
+            if !live && grant_ids.is_empty() {
+                continue;
+            }
+            // A binding approval stays. Only the rows from another
+            // install are subtracted, so the gate's approval is not
+            // withdrawn by a leftover grant.
+            if approval_binds {
+                if let Ok(changed) = self
+                    .store
+                    .app_grants_drop_other_installs(&key, &current, "operator")
+                {
+                    self.drain_effect_scopes(changed);
+                }
+                continue;
+            }
+            let payload = json!({
+                "project": project,
+                "name": name,
+                "install_id": current,
+                "digest": Value::Null,
+                "revoked": true,
+                "by": "operator",
+                "at": crate::issue::time::iso(crate::issue::time::now_epoch()),
+                "reason": "removed",
+            });
+            if let Ok(changed) = self.store.app_revoke_with_record(payload, &key, "operator") {
+                self.drain_effect_scopes(changed);
+            }
+        }
+    }
+
+    /// Close the waiting effects of the `(agent, platform, account)`
+    /// triples whose grant changed, when the row's frozen scopes are no
+    /// longer covered (CAD-506's rule, reused by the app-grant revoke).
+    fn drain_effect_scopes(&self, changed: Vec<(String, String, String)>) {
+        let mut closed_any = false;
+        for (agent, platform, account) in changed {
+            let surviving = self
+                .store
+                .platform_grant(&agent, &platform, &account)
+                .ok()
+                .flatten();
+            let stranded: Vec<(String, String)> = self
+                .store
+                .platform_effects(Some(&agent))
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|r| {
+                    r.platform == platform
+                        && r.account == account
+                        && r.state == "waiting"
+                        && r.scopes
+                            .iter()
+                            .any(|s| surviving.as_ref().is_none_or(|g| !g.covers(s)))
+                })
+                .map(|r| (r.request, r.effect_id))
+                .collect();
+            for (request, effect_id) in stranded {
+                if let Ok(Some(row)) = self
+                    .store
+                    .effect_close(crate::store::EffectKey::Id(effect_id), "grant_revoked")
+                {
+                    let _ = self.store.event_public(
+                        &row.agent,
+                        "request_closed",
+                        json!({"request": request, "kind": "effect",
+                               "reason": "grant_revoked"}),
+                    );
+                    closed_any = true;
+                }
+            }
+        }
+        if closed_any {
+            self.wake();
+        }
+    }
+
+    /// CAD-577 `app_revoke` — the operator revokes an app's approval:
+    /// the `app_approved` record is superseded (a `revoked` event with
+    /// no digest, so `plan propose` refuses again) and every grant the
+    /// approval derived is revoked, draining any waiting effect that
+    /// lost a scope. Operator only, connection-bound like `app approve`.
+    pub(super) fn rpc_app_revoke(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.operator_connection("app revoke", params, peer_pid)?;
+        let project = required_str(params, "project")?;
+        crate::issue::model::check_key(project)?;
+        let name = required_str(params, "name")?;
+        let key = crate::issue::app::approval_key(project, name);
+        let payload = json!({
+            "project": project,
+            "name": name,
+            "digest": Value::Null,
+            "revoked": true,
+            "by": "operator",
+            "at": crate::issue::time::iso(crate::issue::time::now_epoch()),
+        });
+        // The same tracker write lock approve holds, taken before the
+        // store write. An approve that has already derived its grants
+        // cannot commit afterwards and put them back.
+        let pm_dir = self.pm_dir()?;
+        let pm = self.pm_at(&pm_dir)?;
+        let _lock = pm.lock()?;
+        // The approval write and the grant subtract share one
+        // transaction, so a reconcile cannot re-derive between them.
+        let changed = self
+            .store
+            .app_revoke_with_record(payload, &key, "operator")?;
+        self.drain_effect_scopes(changed);
+        self.wake();
+        Ok(json!({"project": project, "name": name, "revoked": true}))
+    }
+
     /// CAD-547 `app_approve` — the operator approves an installed app's
     /// structural digest: the manifest envelope (name, declared slots),
     /// each slot's effective binding, the `app.md` guide, every
@@ -424,17 +851,70 @@ impl Shared {
             ))
         })?;
         let digest = crate::issue::app::digest(&pm_dir, project, name)?;
+        let install_id = crate::issue::app::ensure_install_id(&pm, project, name, "operator")?;
+        // CAD-577: the operator's one Approve derives the app's grants —
+        // exactly the scopes its workflow steps declare on their bound
+        // slots, to the agents the app's default team assigns those
+        // steps. The derivation records on the audit stream; a
+        // re-approval re-derives, so a dropped scope goes with it.
+        let derived = crate::issue::app::derive_grants(&pm_dir, project, name)?;
+        let grants: Vec<(String, String, String, Vec<String>)> = derived
+            .iter()
+            .map(|g| {
+                (
+                    g.agent.clone(),
+                    g.platform.clone(),
+                    g.account.clone(),
+                    g.scopes.clone(),
+                )
+            })
+            .collect();
+        let key = crate::issue::app::approval_key(project, name);
         let payload = json!({
             "project": project,
             "name": name,
+            "install_id": install_id,
             "digest": digest,
             "by": "operator",
             "at": crate::issue::time::iso(crate::issue::time::now_epoch()),
             "notes": notes,
+            "grants": derived.iter().map(|g| json!({
+                "agent": g.agent, "platform": g.platform,
+                "account": g.account, "scopes": g.scopes,
+            })).collect::<Vec<_>>(),
         });
-        self.store.record_app_approval(payload.clone())?;
+        // Approval and grants land together. A re-approval subtracts
+        // the previous derivation inside that same write. The pause
+        // sits in that gap, still holding the tracker lock, so a
+        // revoke on another connection can be shown to wait.
+        self.pause_approve_inside_lock();
+        let changed =
+            self.store
+                .app_approve_with_grants(payload.clone(), &key, &grants, "operator")?;
+        self.drain_effect_scopes(changed);
         self.wake();
         Ok(payload)
+    }
+
+    /// Test seam for the approve/revoke race. `CADENCE_TEST_APP_APPROVE_HOLD`
+    /// is this daemon's own env (`ProviderEnv::own`), never the process
+    /// environment. While that path exists, an approve that has already
+    /// derived its grants stays inside the tracker write lock. It writes
+    /// `{path}.ready` on the way in. The test deletes the hold to let
+    /// the approve finish. Absent the variable, this is a no-op.
+    fn pause_approve_inside_lock(&self) {
+        let Some(path) = self.provider_env.own("CADENCE_TEST_APP_APPROVE_HOLD") else {
+            return;
+        };
+        if path.is_empty() {
+            return;
+        }
+        let ready = format!("{path}.ready");
+        let _ = std::fs::write(&ready, "1");
+        let deadline = Instant::now() + Duration::from_secs(12);
+        while Path::new(&path).exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// CAD-358 `project_new` — register a repo as a project and seed its

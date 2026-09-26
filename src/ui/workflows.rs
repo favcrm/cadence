@@ -202,9 +202,16 @@ fn preview(
         };
         let digest = app::digest(pm_dir, key, app_name).ok();
         let approvals = app::fetch_approvals(state_dir);
+        let install_id = app::current_install_id(pm_dir, key, app_name);
         let approved = match (&digest, &approvals) {
             (Some(digest), Some(approvals)) => {
-                json!(app::approved(key, app_name, digest, Some(approvals)))
+                json!(app::approved(
+                    key,
+                    app_name,
+                    digest,
+                    &install_id,
+                    Some(approvals)
+                ))
             }
             (Some(_), None) => json!("unknown — daemon unreachable"),
             (None, _) => Value::Null,
