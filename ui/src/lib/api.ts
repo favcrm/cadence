@@ -1,3 +1,4 @@
+import type { LanePayload } from "../features/issues/LaneCard";
 import { sessionHeaders } from "./sessionKey";
 import type {
   AgentDetail,
@@ -481,6 +482,26 @@ export const api = {
   startUpdate: () => post<{ started: boolean }>("/api/update", {}),
   saveModelDefaults: (body: { expected_revision: number; config: ModelDefaultsConfig }) =>
     writeSettings(body),
+
+  /** `GET /api/issues/<id>/lane` — the card's live agent, or `lane: null`. */
+  lane: (id: string) => get<LanePayload>(`/api/issues/${encodeURIComponent(id)}/lane`),
+  /** Ask for status. Optional extra is appended to the `status?` template server-side. */
+  laneAsk: (id: string, text?: string) =>
+    post<Record<string, unknown>>(
+      `/api/issues/${encodeURIComponent(id)}/lane/ask`,
+      text ? { text } : {},
+    ),
+  /** A real operator instruction on the lane thread. */
+  laneInstruct: (id: string, text: string) =>
+    post<Record<string, unknown>>(`/api/issues/${encodeURIComponent(id)}/lane/instruct`, { text }),
+  laneInterrupt: (id: string) =>
+    post<Record<string, unknown>>(`/api/issues/${encodeURIComponent(id)}/lane/interrupt`, {}),
+  laneStop: (id: string) =>
+    post<Record<string, unknown>>(`/api/issues/${encodeURIComponent(id)}/lane/stop`, {}),
+  laneUnfence: (id: string, body: { status: string; note?: string; resume?: boolean }) =>
+    post<Record<string, unknown>>(`/api/issues/${encodeURIComponent(id)}/lane/unfence`, body),
+  laneReassign: (id: string, body: { provider: string; model?: string; effort?: string; note?: string }) =>
+    post<Record<string, unknown>>(`/api/issues/${encodeURIComponent(id)}/lane/reassign`, body),
 };
 
 async function writeSettings(body: {

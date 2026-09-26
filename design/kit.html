@@ -82,9 +82,12 @@
             <div style="display:flex;gap:8px;flex-wrap:wrap">
               <button class="btn">Default</button>
               <button class="btn btn-acc">Primary</button>
+              <button class="btn btn-ghost">Ghost</button>
               <button class="btn btn-danger">Delete</button>
+              <button class="btn btn-sm">Small</button>
               <button class="btn" disabled>Disabled</button>
             </div>
+            <button class="btn btn-acc btn-full" title="Kick off">Kick off</button>
             <div style="display:flex;gap:8px;flex-wrap:wrap">
               <span class="chip" style="background:var(--color-ink-800);color:var(--color-ink-400)">plain chip</span>
               <span class="chip tone" style="--c:var(--color-accent)">accent chip</span>
@@ -103,9 +106,12 @@
             <div style="display:flex;gap:8px;flex-wrap:wrap">
               <button class="btn">Default</button>
               <button class="btn btn-acc">Primary</button>
+              <button class="btn btn-ghost">Ghost</button>
               <button class="btn btn-danger">Delete</button>
+              <button class="btn btn-sm">Small</button>
               <button class="btn" disabled>Disabled</button>
             </div>
+            <button class="btn btn-acc btn-full" title="Kick off">Kick off</button>
             <div style="display:flex;gap:8px;flex-wrap:wrap">
               <span class="chip" style="background:var(--color-ink-800);color:var(--color-ink-400)">plain chip</span>
               <span class="chip tone" style="--c:var(--color-accent)">accent chip</span>
@@ -117,6 +123,75 @@
               <span class="badge b-info">idle</span>
               <span class="badge b-lock">locked</span>
               <span class="badge plain">plain</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- SELECT -->
+        <h2 class="slabel" style="margin:28px 0 10px">select · listbox</h2>
+        <div class="duo">
+          <div class="duo-pane" data-theme="light">
+            <span class="badge plain dtag">data-theme=light</span>
+            <div class="select select-full">
+              <button type="button" class="select-trigger" role="combobox" aria-expanded="true" aria-haspopup="listbox" aria-label="model">
+                <span class="select-value">grok-4.7-high</span>
+                <svg class="select-caret" width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M2 4l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.4"/></svg>
+              </button>
+            </div>
+            <div class="select-pop" style="position:static;width:100%">
+              <input class="select-search" placeholder="Search" aria-label="Search options">
+              <ul class="select-list" role="listbox" aria-label="model">
+                <li class="select-group" role="presentation">Cursor</li>
+                <li class="select-opt" role="option" aria-selected="true" data-active="true">
+                  <span class="select-check" aria-hidden="true">✓</span>
+                  <span class="select-copy"><span class="select-label">grok-4.7-high</span><span class="select-hint">high</span></span>
+                  <span class="select-badge">Cursor plan</span>
+                </li>
+                <li class="select-group" role="presentation">SWE</li>
+                <li class="select-opt" role="option" aria-selected="false">
+                  <span class="select-check" aria-hidden="true"></span>
+                  <span class="select-copy"><span class="select-label">swe-2-high</span></span>
+                  <span class="select-badge">Free (quota)</span>
+                </li>
+                <li class="select-group" role="presentation">OpenRouter</li>
+                <li class="select-opt" role="option" aria-selected="false">
+                  <span class="select-check" aria-hidden="true"></span>
+                  <span class="select-copy"><span class="select-label">openrouter/z-ai/glm-5.3-flash</span></span>
+                  <span class="select-badge">Paid</span>
+                </li>
+              </ul>
+            </div>
+          </div>
+          <div class="duo-pane" data-theme="dark">
+            <span class="badge plain dtag">data-theme=dark</span>
+            <div class="select select-full">
+              <button type="button" class="select-trigger" role="combobox" aria-expanded="true" aria-haspopup="listbox" aria-label="model">
+                <span class="select-value">grok-4.7-high</span>
+                <svg class="select-caret" width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M2 4l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.4"/></svg>
+              </button>
+            </div>
+            <div class="select-pop" style="position:static;width:100%">
+              <input class="select-search" placeholder="Search" aria-label="Search options">
+              <ul class="select-list" role="listbox" aria-label="model">
+                <li class="select-group" role="presentation">Cursor</li>
+                <li class="select-opt" role="option" aria-selected="true" data-active="true">
+                  <span class="select-check" aria-hidden="true">✓</span>
+                  <span class="select-copy"><span class="select-label">grok-4.7-high</span><span class="select-hint">high</span></span>
+                  <span class="select-badge">Cursor plan</span>
+                </li>
+                <li class="select-group" role="presentation">SWE</li>
+                <li class="select-opt" role="option" aria-selected="false">
+                  <span class="select-check" aria-hidden="true"></span>
+                  <span class="select-copy"><span class="select-label">swe-2-high</span></span>
+                  <span class="select-badge">Free (quota)</span>
+                </li>
+                <li class="select-group" role="presentation">OpenRouter</li>
+                <li class="select-opt" role="option" aria-selected="false">
+                  <span class="select-check" aria-hidden="true"></span>
+                  <span class="select-copy"><span class="select-label">openrouter/z-ai/glm-5.3-flash</span></span>
+                  <span class="select-badge">Paid</span>
+                </li>
+              </ul>
             </div>
           </div>
         </div>

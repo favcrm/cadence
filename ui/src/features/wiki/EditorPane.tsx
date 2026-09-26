@@ -14,7 +14,8 @@ import {
   type ConflictInfo,
 } from "./editor";
 import { diffCounts, lineDiff, type DiffLine } from "./diff";
-import { Btn, Crumbs, Failure, Loading } from "./shared";
+import Button from "../../ui/Button";
+import { Crumbs, Failure, Loading } from "./shared";
 
 /**
  * The editor (CAD-581): source on the left, live preview on the right.
@@ -183,15 +184,15 @@ export default function EditorPane({
         <span className="wk-sep">·</span>
         <span className="wk-editing">editing</span>
         <div className="wk-tools">
-          <Btn href={browseHref}>Cancel</Btn>
-          <Btn
-            accent
+          <Button href={browseHref}>Cancel</Button>
+          <Button
+            variant="primary"
             onClick={() => void save()}
             disabled={saving || readOnly}
             title={readOnly ? "writes are disabled — sign in as the operator" : undefined}
           >
             Save
-          </Btn>
+          </Button>
         </div>
       </div>
 
@@ -199,8 +200,8 @@ export default function EditorPane({
         <div className="wk-conflict" role="alert">
           <IconWarning size={13} />
           <span className="min-w-0">{conflictText(conflict)}</span>
-          <Btn onClick={() => setShowDiff((s) => !s)}>review diff</Btn>
-          <Btn onClick={() => void reload()}>reload</Btn>
+          <Button size="sm" onClick={() => setShowDiff((s) => !s)}>review diff</Button>
+          <Button size="sm" onClick={() => void reload()}>reload</Button>
         </div>
       )}
 

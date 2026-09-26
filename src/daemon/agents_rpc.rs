@@ -770,6 +770,20 @@ impl Shared {
 
     pub(super) fn rpc_stop(self: &Arc<Self>, params: &Value) -> Result<Value> {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        // Test seam, same shape as CADENCE_TEST_INTERRUPT_PAUSE_MS:
+        // `ProviderEnv::own` never reads the process environment, so
+        // only an in-process test daemon that set this name fails the
+        // stop, and it fails before any mutation. Value is one alias
+        // or a comma-separated list.
+        if self
+            .provider_env
+            .own("CADENCE_TEST_STOP_FAILS")
+            .is_some_and(|fail| fail.split(',').any(|name| name == alias))
+        {
+            return Err(Error::rejected(format!(
+                "test seam: stop of '{alias}' failed"
+            )));
+        }
         let agent = self.store.agent(&alias)?;
         if !registry::has_actor(&agent.provider, &agent.endpoint_kind) {
             return Err(Error::rejected(format!(

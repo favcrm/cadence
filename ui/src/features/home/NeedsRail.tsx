@@ -13,6 +13,7 @@ import {
   type NeedGroupKey,
   type UnfenceChoice,
 } from "./needs";
+import Button from "../../ui/Button";
 import PlanCard from "./PlanCard";
 import Link from "../../ui/Link";
 
@@ -88,15 +89,9 @@ function AnswerForm({
           {options.length > 0 && (
             <div className="flex flex-wrap gap-1.5">
               {options.map((o) => (
-                <button
-                  key={o}
-                  disabled={busy}
-                  onClick={() => send(o)}
-                  className="h-8 px-2.5 rounded border border-ink-600 text-label text-ink-200 hover:border-accent/60 hover:text-accent disabled:opacity-40 max-w-full truncate"
-                  title={`answer: ${o}`}
-                >
+                <Button key={o} size="sm" disabled={busy} onClick={() => send(o)} title={`answer: ${o}`}>
                   {o}
-                </button>
+                </Button>
               ))}
             </div>
           )}
@@ -108,13 +103,9 @@ function AnswerForm({
             placeholder="Or write an answer…"
             aria-label={`answer ${issue}`}
           />
-          <button
-            disabled={busy}
-            onClick={() => send(text)}
-            className="h-8 px-3 rounded bg-accent text-on-accent text-label font-medium disabled:opacity-40"
-          >
+          <Button variant="primary" size="sm" disabled={busy} loading={busy} onClick={() => send(text)}>
             {busy ? "Filing…" : "Send answer"}
-          </button>
+          </Button>
         </>
       )}
       {error && (
@@ -162,13 +153,9 @@ function MergeForm({
       {readOnly ? (
         <p className="text-micro text-ink-500">Board is read-only — merge with `cadence delivery merge {issue}`.</p>
       ) : (
-        <button
-          disabled={busy}
-          onClick={merge}
-          className="h-8 px-3 rounded bg-accent text-on-accent text-label font-medium disabled:opacity-40"
-        >
+        <Button variant="primary" size="sm" disabled={busy} loading={busy} onClick={merge}>
           {busy ? "Merging…" : "Merge"}
-        </button>
+        </Button>
       )}
       {error && (
         <p className="text-micro text-fail break-words" role="alert">

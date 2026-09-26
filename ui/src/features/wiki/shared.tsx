@@ -19,39 +19,6 @@ export function LockIcon({ size = 11 }: { size?: number }) {
   );
 }
 
-/** A toolbar button; `href` makes it a link, otherwise it is a button. */
-export function Btn({
-  children,
-  onClick,
-  href,
-  accent,
-  danger,
-  disabled,
-  title,
-}: {
-  children: ReactNode;
-  onClick?: () => void;
-  href?: string;
-  accent?: boolean;
-  danger?: boolean;
-  disabled?: boolean;
-  title?: string;
-}) {
-  const className = `wk-btn${accent ? " wk-btn-acc" : ""}${danger ? " wk-btn-danger" : ""}`;
-  if (href && !disabled) {
-    return (
-      <Link href={href} className={className} title={title} onClick={onClick}>
-        {children}
-      </Link>
-    );
-  }
-  return (
-    <button className={className} onClick={onClick} disabled={disabled} title={title} type="button">
-      {children}
-    </button>
-  );
-}
-
 /** Breadcrumbs for a path; every ancestor is a link, the leaf is bold. */
 export function Crumbs({ path, hrefFor }: { path: string; hrefFor: (path: string) => string }) {
   const trail = breadcrumbs(path);

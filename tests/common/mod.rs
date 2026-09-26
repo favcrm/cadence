@@ -2735,6 +2735,11 @@ with open(os.environ["FAKE_PANE"] + ".screen", "a") as f:
     f.write("Mock Cursor TUI [%s]\n" % sid)
     f.write("  → Plan, search, build anything\n")
     f.write("  Cursor Grok 4.6 High\n  /mock · main\n")
+def awrite(path, text):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.rename(tmp, path)
 while True:
     inp = os.environ["FAKE_PANE"] + ".input"
     try:
@@ -2743,14 +2748,43 @@ while True:
         data = ""
     if "<ENTER>" in data:
         text, rest = data.split("<ENTER>", 1)
-        open(inp, "w").write(rest)
-        if text.strip():
-            with open(os.environ["FAKE_PANE"] + ".screen", "a") as f:
-                f.write("  %s\nMOCK_REPLY: %s\n" % (text.strip(), text.strip()))
-                # The submitted line echoes into the transcript and the
-                # input's watermark flips to the follow-up form.
-                f.write("  → Add a follow-up\n")
-                f.write("  Cursor Grok 4.6 High\n  /mock · main\n")
+        pane = os.environ["FAKE_PANE"]
+        if os.path.exists(pane + ".noecho"):
+            # The TUI consumed the draft into a running turn. The body
+            # never echoes. The frame is the live 2026-09-26 shape: a
+            # braille "Working" row, the follow-up watermark, a
+            # right-aligned interrupt hint, and pane-width padding
+            # after the hint (CAD-612).
+            awrite(inp, rest)
+            if text.strip():
+                line = (
+                    "  → Add a follow-up"
+                    + (" " * 80)
+                    + "ctrl+c to stop"
+                    + (" " * 24)
+                )
+                awrite(
+                    pane + ".screen",
+                    "Mock Cursor TUI\n"
+                    "  \u2820 Working\n"
+                    "    Tip: Use /run-everything to skip all approvals.\n"
+                    "\n"
+                    + line
+                    + "\n"
+                    "\n"
+                    "  1 task\n"
+                    "  Grok 4.7 256K High\n"
+                    "  /mock · main\n",
+                )
+        else:
+            awrite(inp, rest)
+            if text.strip():
+                with open(pane + ".screen", "a") as f:
+                    f.write("  %s\nMOCK_REPLY: %s\n" % (text.strip(), text.strip()))
+                    # The submitted line echoes into the transcript and the
+                    # input's watermark flips to the follow-up form.
+                    f.write("  → Add a follow-up\n")
+                    f.write("  Cursor Grok 4.6 High\n  /mock · main\n")
     if "<KEY:C-c>" in data:
         open(inp, "w").write("")
         with open(os.environ["FAKE_PANE"] + ".screen", "a") as f:

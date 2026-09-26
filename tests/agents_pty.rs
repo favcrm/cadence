@@ -4468,6 +4468,117 @@ fn pty_cursor_busy_and_approval_gate_sends() {
     pty_token(&d, "cu", "m3");
 }
 
+/// CAD-612: a paste the transcript never echoes is not a drop. `.noecho`
+/// leaves the body off-screen and paints the live busy frame — braille
+/// `Working`, `1 task`, and `Add a follow-up` with a pane-padded
+/// `ctrl+c to stop`. The deadline re-probe sees the gate's idle probe
+/// went busy and the input drained, so the turn is `running` and
+/// `message result` completes it. No fence, no `paste_not_rendered`.
+#[test]
+fn pty_cursor_render_miss_reprobe_accepts_the_busy_turn() {
+    let d = TestDaemon::start();
+    let mock = d.mock_cursor_tui();
+    d.register_cursor_pty("cu", json!({}));
+    d.wait_agent("cu", "idle", 20);
+    atomic_write(d.cursor_pane_file(&mock, "cu", "noecho"), "1");
+    d.rpc(
+        "agent_send",
+        json!({"alias": "cu", "text": "quietly taken", "message": "m1"}),
+    )
+    .unwrap();
+    let token = pty_token(&d, "cu", "m1");
+    assert!(token.starts_with("pty-"), "{token}");
+    assert!(d
+        .events("cu")
+        .iter()
+        .all(|e| e["kind"].as_str() != Some("paste_not_rendered")));
+    let agent = d.rpc("agent_show", json!({"alias": "cu"})).unwrap()["agent"].clone();
+    assert_eq!(agent["state"], "busy", "{agent}");
+    let screen =
+        std::fs::read_to_string(d.cursor_pane_file(&mock, "cu", "screen")).unwrap_or_default();
+    assert!(
+        !screen.contains("quietly taken"),
+        "the body must not echo: {screen}"
+    );
+    assert!(screen.contains("ctrl+c to stop"), "{screen}");
+    assert!(screen.contains("1 task"), "{screen}");
+    d.report("m1", &token, "result", "done").unwrap();
+    d.wait_message("cu", "m1", &["completed"], 10);
+}
+
+/// CAD-612: a genuinely dropped paste still fences. The re-probe only
+/// clears a pane that shows work. The `paste_not_rendered` event
+/// carries the admitting probe and the re-probe, and the send is never
+/// recorded as a started turn.
+#[test]
+fn pty_cursor_render_miss_records_reprobe_evidence() {
+    let d = TestDaemon::start();
+    let mock = d.mock_cursor_tui();
+    d.register_cursor_pty("cu", json!({}));
+    d.wait_agent("cu", "idle", 20);
+    atomic_write(d.cursor_pane_file(&mock, "cu", "swallow"), "1");
+    d.rpc(
+        "agent_send",
+        json!({"alias": "cu", "text": "dropped on the floor", "message": "m1"}),
+    )
+    .unwrap();
+    d.wait_agent("cu", "attention", 30);
+    assert_eq!(d.message_state("cu", "m1"), "unknown");
+    let miss = d.wait_event("cu", "paste_not_rendered", 10);
+    let reprobe = &miss["payload"]["reprobe"];
+    assert_eq!(
+        reprobe["probe"]["idle"], true,
+        "the pane still probes idle — the paste truly dropped: {miss}"
+    );
+    assert_eq!(reprobe["probe"]["busy_marker"], false, "{miss}");
+    assert_eq!(reprobe["steer"], false, "{miss}");
+    assert!(
+        miss["payload"]["claim_probe"]["idle"].as_bool() == Some(true),
+        "{miss}"
+    );
+    assert!(d
+        .events("cu")
+        .iter()
+        .all(|e| e["kind"].as_str() != Some("turn_started")));
+}
+
+/// CAD-612: Cursor's verified idle placeholder is itself the readiness
+/// claim — a plain send needs no `agent ready` and no `auto_ready`.
+/// The daemon records `ready_claimed`; nothing stacked is consumed.
+#[test]
+fn pty_cursor_idle_probe_is_the_ready_claim() {
+    let d = TestDaemon::start();
+    let mock = d.mock_cursor_tui();
+    d.register_cursor_pty("cu", json!({}));
+    d.wait_agent("cu", "idle", 20);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "cu", "text": "work the lane", "message": "m1"}),
+    )
+    .unwrap();
+    let token = pty_token(&d, "cu", "m1");
+    assert!(token.starts_with("pty-"), "{token}");
+    let claim = d
+        .events("cu")
+        .into_iter()
+        .find(|e| e["kind"].as_str() == Some("ready_claimed"))
+        .expect("the idle probe must admit the send as the claim");
+    assert_eq!(claim["payload"]["by"], "daemon", "{claim}");
+    assert_eq!(claim["payload"]["probe"]["idle"], true, "{claim}");
+    assert!(
+        d.events("cu")
+            .iter()
+            .all(|e| e["kind"].as_str() != Some("claim_used")),
+        "a stacked claim was consumed: {:?}",
+        d.events("cu")
+    );
+    let screen =
+        std::fs::read_to_string(d.cursor_pane_file(&mock, "cu", "screen")).unwrap_or_default();
+    assert!(screen.contains("MOCK_REPLY: work the lane"), "{screen}");
+    d.report("m1", &token, "result", "done").unwrap();
+    d.wait_message("cu", "m1", &["completed"], 10);
+}
+
 /// `cadence cursor` launches the pty endpoint through the CLI — the
 /// pane mints a chat, resumes it with `--trust`, and the endpoint
 /// opens as cursor/pty.
@@ -4577,7 +4688,11 @@ fn cli_join_cursor_briefs_prefixes() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let agent = d.wait_agent("wj", "idle", 20);
+    // CAD-612: Cursor's idle placeholder is the readiness claim, so the
+    // join bootstrap self-delivers and the worker lands busy — the same
+    // as Devin. Settle that turn. The argv and briefing checks stay.
+    d.wait_agent("wj", "busy", 20);
+    let agent = d.rpc("agent_show", json!({"alias": "wj"})).unwrap()["agent"].clone();
     assert_eq!(agent["provider"], "cursor");
     assert_eq!(agent["endpoint_kind"], "pty");
     wait_probe_idle(&d, "wj", 15);
@@ -4590,6 +4705,9 @@ fn cli_join_cursor_briefs_prefixes() {
         assert!(text.contains(want), "briefing missing {want}:\n{text}");
     }
     assert_eq!(agent["params"]["upstream"], "pm", "{agent}");
+    let boot = d.wait_message("wj", "bootstrap-wj", &["running"], 15);
+    assert_eq!(boot["source"], "bootstrap");
+    pty_report_done(&d, "wj", "bootstrap-wj");
 }
 
 /// Audit N8: a launch of any kind leaves the agent's cwd repository

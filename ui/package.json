@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "test:url-state": "tmp_dir=$(mktemp -d \"${TMPDIR:-/tmp}/cadence-ui-url-state.XXXXXX\") && trap 'rm -rf \"$tmp_dir\"' EXIT && tsc --target ES2022 --module commonjs --moduleResolution node --lib ES2023,DOM --skipLibCheck --jsx react-jsx --rootDir . --outDir \"$tmp_dir\" tests/*.test.ts && for t in \"$tmp_dir\"/tests/*.test.js; do NODE_PATH=\"$PWD/node_modules\" node \"$t\" || exit 1; done",
+    "test:url-state": "tmp_dir=$(mktemp -d \"${TMPDIR:-/tmp}/cadence-ui-url-state.XXXXXX\") && trap 'rm -rf \"$tmp_dir\"' EXIT && tsc -p tsconfig.tests.json --outDir \"$tmp_dir\" && for t in \"$tmp_dir\"/tests/*.test.js; do NODE_PATH=\"$PWD/node_modules\" node \"$t\" || exit 1; done",
     "typecheck": "tsc --noEmit",
     "preview": "vite preview"
   },
@@ -26,6 +26,7 @@
     "@types/react": "19.2.9",
     "@types/react-dom": "19.2.7",
     "@vitejs/plugin-react": "6.1.1",
+    "happy-dom": "17.4.4",
     "tailwindcss": "4.3.3",
     "typescript": "5.9.3",
     "vite": "8.2.2"

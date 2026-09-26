@@ -181,58 +181,6 @@
   color: var(--color-ink-500);
 }
 
-.wk-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  height: 2rem;
-  padding: 0 0.8rem;
-  border: 1px solid var(--color-edge);
-  border-radius: 0.25rem;
-  background: var(--color-ink-850);
-  color: var(--color-ink-200);
-  font-size: var(--text-label);
-  cursor: pointer;
-  transition: border-color 0.15s ease, background-color 0.15s ease;
-}
-
-.wk-btn:hover {
-  border-color: var(--color-edge-hover);
-  background: var(--color-ink-800);
-}
-
-.wk-btn:focus-visible {
-  outline: none;
-  border-color: var(--color-accent);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-accent) 10%, transparent);
-}
-
-.wk-btn-acc {
-  border-color: transparent;
-  background: var(--color-accent);
-  color: var(--color-on-accent);
-  font-weight: 500;
-}
-
-.wk-btn-acc:hover {
-  background: var(--color-accent);
-  filter: brightness(1.1);
-}
-
-.wk-btn-danger {
-  color: var(--color-fail);
-}
-
-.wk-btn-danger:hover {
-  border-color: var(--color-fail);
-  background: color-mix(in srgb, var(--color-fail) 10%, transparent);
-}
-
-.wk-btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
 .wk-note {
   display: flex;
   gap: 8px;
@@ -720,12 +668,6 @@
   border-radius: 0.375rem;
   color: var(--color-warn);
   font-size: var(--text-label);
-}
-
-.wk-conflict .wk-btn {
-  height: 1.6rem;
-  padding: 0 0.6rem;
-  font-size: var(--text-micro);
 }
 
 .wk-diffwrap {

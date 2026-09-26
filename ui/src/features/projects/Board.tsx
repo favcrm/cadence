@@ -9,7 +9,9 @@ import type { AgentsPayload, Health, IssueCard, Project } from "../../lib/types"
 import type { ProjectView } from "../../lib/urlState";
 import Card, { noDragReason } from "./Card";
 import FilterBar from "./FilterBar";
+import Button from "../../ui/Button";
 import { ResourceGate, StaleChip } from "../../ui/ResourceStatus";
+import Select from "../../ui/Select";
 
 const COLS: [string, string, number?][] = [
   ["backlog", "Backlog"],
@@ -228,40 +230,29 @@ function QuickAdd({
       />
       <div className="flex gap-1.5">
         {project === "all" ? (
-          <select
+          <Select
+            size="sm"
+            className="min-w-0 flex-1"
             value={projectKey}
-            onChange={(e) => setSelProject(e.target.value)}
-            className="field !h-7 flex-1 text-label"
+            onChange={setSelProject}
             aria-label="project"
-          >
-            {projects.map((p) => (
-              <option key={p.key} value={p.key}>
-                {p.key}
-              </option>
-            ))}
-          </select>
+            options={projects.map((p) => ({ value: p.key, label: p.key }))}
+          />
         ) : (
           <span className="chip bg-ink-800 text-ink-400 self-center">
             {projectKey}
           </span>
         )}
-        <select
+        <Select
+          size="sm"
           value={priority}
-          onChange={(e) => setPriority(e.target.value)}
-          className="field !h-7 text-label"
+          onChange={setPriority}
           aria-label="priority"
-        >
-          {["P0", "P1", "P2", "P3"].map((p) => (
-            <option key={p}>{p}</option>
-          ))}
-        </select>
-        <button
-          onClick={submit}
-          disabled={!title.trim() || busy}
-          className="h-7 px-2.5 rounded bg-accent text-on-accent text-label font-medium disabled:opacity-40"
-        >
+          options={["P0", "P1", "P2", "P3"].map((p) => ({ value: p, label: p }))}
+        />
+        <Button variant="primary" size="sm" onClick={submit} disabled={!title.trim() || busy}>
           add
-        </button>
+        </Button>
       </div>
     </div>
   );
