@@ -4388,6 +4388,48 @@ mod tests {
         Ok(json!({"prs": [{"number": 2}], "ci": {"state": "success"}}))
     }
 
+    #[test]
+    fn cad627_overview_probe_requests_active_history() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir().unwrap();
+        let listener = UnixListener::bind(client::socket_path(dir.path())).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                let req: Value = serde_json::from_str(&line).unwrap();
+                let result = if req["method"] == "agent_show" {
+                    json!({"messages": [{"state": "unknown", "completed": 42.0}]})
+                } else {
+                    json!({"requests": []})
+                };
+                writeln!(stream, "{}", json!({"ok": true, "result": result})).unwrap();
+                seen.push(req);
+            }
+            seen
+        });
+        let row = json!({"alias": "w1", "provider": "fake", "endpoint_kind": "managed"});
+        let probe = probe_agent(
+            dir.path(),
+            &row,
+            Duration::from_secs(2),
+            Instant::now() + Duration::from_secs(4),
+        );
+        let seen = server.join().unwrap();
+        assert_eq!(seen[0]["method"], "agent_show");
+        assert_eq!(seen[0]["params"]["active_only"], true);
+        assert_eq!(fenced_since(&row, &probe), Some(42));
+        assert!(!probe.holds_drift);
+    }
+
     /// CAD-249: a gh refresh slower than the caller's wait serves the
     /// last cache as `stale` with its `as_of` inside the bound, and the
     /// refresh still lands in the cache for the next request.

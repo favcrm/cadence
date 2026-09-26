@@ -11,6 +11,18 @@ use super::agents::Agent;
 use super::schema::Take;
 use super::{now, Sender, Store};
 
+// Deterministic cost evidence for recurring read paths. Thread-local so
+// unrelated parallel tests cannot add to a caller's measurement.
+#[cfg(test)]
+thread_local! {
+    static DECODED_MESSAGES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_decoded_messages() -> usize {
+    DECODED_MESSAGES.with(|n| n.replace(0))
+}
+
 #[derive(Debug, Clone)]
 pub struct Message {
     pub seq: i64,
@@ -41,6 +53,8 @@ pub struct Message {
 }
 
 pub(super) fn row_message(row: &rusqlite::Row) -> rusqlite::Result<Message> {
+    #[cfg(test)]
+    DECODED_MESSAGES.with(|n| n.set(n.get() + 1));
     let result: Option<String> = row.get("result")?;
     Ok(Message {
         seq: row.get("seq")?,
