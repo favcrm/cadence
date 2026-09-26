@@ -1,6 +1,6 @@
 import Link from "./Link";
 
-/** A screen's sub-sections as links (Projects → issues / context, Settings → models / memory). */
+/** Page navigation: real links with a visible current-page indicator. */
 export default function SectionTabs({
   label,
   tabs,
@@ -9,17 +9,13 @@ export default function SectionTabs({
   tabs: { label: string; href: string; on: boolean }[];
 }) {
   return (
-    <nav className="px-4 lg:px-8 pt-4 flex items-center gap-1.5 min-w-0" aria-label={`${label} sections`}>
-      <span className="kicker truncate mr-1.5">{label}</span>
+    <nav className="section-nav px-4 lg:px-8" aria-label={`${label} sections`}>
       {tabs.map((t) => (
         <Link
           key={t.label}
           href={t.href}
-          replace
           aria-current={t.on ? "page" : undefined}
-          className={`h-7 inline-flex items-center px-2.5 rounded text-label ${
-            t.on ? "bg-accent/15 text-accent font-medium" : "text-ink-400 hover:bg-ink-800 hover:text-ink-100"
-          }`}
+          className="section-nav-link"
         >
           {t.label}
         </Link>

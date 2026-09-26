@@ -1,22 +1,8 @@
-import type { ReactNode } from "react";
+import { useId, type ReactNode } from "react";
 import type { Health } from "../lib/types";
-import { IconLock, IconPulse, IconRefresh, IconWarning } from "./icons";
+import { IconConnection, IconLock, IconRefresh, IconWarning } from "./icons";
 
-/**
- * The header's right-hand status — read-only flag, the sign-in chip
- * (passed as children, between the flag and the daemon state), daemon
- * reachability, refresh, the write actor — as one chip row with two
- * renderings:
- *
- * - `header` (the sticky header): below `lg` the StatusChips labels turn
- *   sr-only and an icon carries each chip, so the row fits a phone and a
- *   screen reader still hears them; at `lg` the icons drop and the words
- *   return, unchanged. Chips passed as children keep their own shape at
- *   every width (SignIn already shrinks itself).
- * - `menu` (the <lg dropdown): icon and word together — touch has no
- *   hover for the header's `title`s, so the menu keeps each icon's
- *   meaning one tap away.
- */
+/** Quiet icon controls in the header; the phone menu keeps readable labels. */
 export default function StatusChips({
   readOnly,
   mayWrite,
@@ -37,8 +23,11 @@ export default function StatusChips({
   children?: ReactNode;
 }) {
   const header = variant === "header";
-  const iconCls = header ? "lg:hidden" : undefined;
-  const labelCls = header ? "max-lg:sr-only" : undefined;
+  const statusId = useId();
+  const refreshId = useId();
+  const labelCls = header ? "sr-only" : undefined;
+  const reachable = health?.daemon === "reachable";
+  const connection = !health ? "Checking connection…" : reachable ? "Daemon connected" : "Daemon disconnected — live activity is unavailable";
   return (
     <>
       {readOnly && (
@@ -46,40 +35,39 @@ export default function StatusChips({
           className="chip bg-warn/10 text-warn"
           title="the server refuses every write — browsing only"
         >
-          <IconLock className={iconCls} />
+          <IconLock />
           <span className={labelCls}>read-only</span>
         </span>
       )}
       {children}
-      {health && (
-        <span
-          className={`chip ${
-            health.daemon === "reachable"
-              ? "bg-ink-800 text-ink-400"
-              : "bg-warn/10 text-warn"
-          }`}
-          title={
-            health.daemon === "reachable"
-              ? "daemon socket reachable"
-              : "daemon socket unreachable — runtime strip is empty"
-          }
-        >
-          {health.daemon === "reachable" ? (
-            <IconPulse className={iconCls} />
-          ) : (
-            <IconWarning className={iconCls} />
-          )}
-          <span className={labelCls}>daemon {health.daemon}</span>
-        </span>
+      {header ? (
+        <>
+          <span className="header-control-wrap">
+            <span tabIndex={0} role="img" aria-label={connection} aria-describedby={statusId}
+              className={`header-icon connection-icon ${!health ? "text-ink-500" : reachable ? "text-ink-400" : "text-warn"}`}>
+              {health && !reachable ? <IconWarning size={16} /> : <IconConnection size={18} />}
+              {reachable && <span className="connection-dot" aria-hidden />}
+            </span>
+            <span id={statusId} role="tooltip" className="header-tooltip">{connection}</span>
+          </span>
+          <span className="header-control-wrap">
+            <button type="button" onClick={onRefresh} className="header-icon text-ink-400"
+              aria-label="Refresh board" aria-describedby={refreshId}>
+              <IconRefresh size={16} />
+            </button>
+            <span id={refreshId} role="tooltip" className="header-tooltip">Refresh board</span>
+          </span>
+        </>
+      ) : (
+        <>
+          {health && <span className={`chip ${reachable ? "bg-ink-800 text-ink-400" : "bg-warn/10 text-warn"}`}>
+            {reachable ? <IconConnection /> : <IconWarning />}<span>{connection}</span>
+          </span>}
+          <button type="button" onClick={onRefresh} className="chip bg-accent/10 text-accent hover:bg-accent/20 transition-colors">
+            <IconRefresh /><span>Refresh board</span>
+          </button>
+        </>
       )}
-      <button
-        onClick={onRefresh}
-        className="chip bg-accent/10 text-accent hover:bg-accent/20 transition-colors"
-        title="re-read the folders — writes also land here from the API"
-      >
-        <IconRefresh className={iconCls} />
-        <span className={labelCls}>refresh</span>
-      </button>
       {mayWrite && (
         <span
           className={`chip bg-ink-800 text-ink-400 ${header ? "hidden lg:inline-flex" : ""}`}

@@ -17,7 +17,7 @@ export default function Context({
   onRetryContext,
 }: ContextProps) {
   return (
-    <main className="px-4 lg:px-8 pt-6 pb-9 max-w-[106rem] w-full">
+    <main className="px-4 lg:px-8 pt-6 pb-9 w-full">
       <ProjectContext
         project={project}
         context={context}

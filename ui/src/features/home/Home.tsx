@@ -625,6 +625,7 @@ function Composer({
     if (seed.n > 0) {
       setDraft(seed.text);
       setRefs(seed.refs ?? []);
+      if (!block) box.current?.focus();
     }
   }, [seed]);
   // CAD-600: the textarea grows with its content (auto-height), capped
@@ -713,6 +714,7 @@ function Composer({
         submit();
       }}
     >
+      {block && <div className="text-label text-ink-300 mb-2 font-medium">Read-only conversation</div>}
       {matches.length > 0 && (
         <ul className="slashmenu" role="listbox" aria-label="slash commands">
           {matches.map((c, i) => (
@@ -765,7 +767,7 @@ function Composer({
         onKeyDown={onKey}
         rows={2}
         disabled={!!block}
-        placeholder={block ? "" : "Ask the master for work… (or / for commands)"}
+        placeholder={block ? "Read-only · Sending is unavailable" : "Ask Master about your team or plan the next job…"}
         aria-label="message to the master"
         aria-expanded={matches.length > 0 || undefined}
         className="w-full resize-none bg-transparent text-body text-ink-100 placeholder:text-ink-500 outline-none disabled:opacity-50 min-h-[2.75rem] max-h-40 overflow-y-auto"
@@ -1207,10 +1209,10 @@ export default function Home({
 
   return (
     <main
-      className={`px-4 lg:px-8 pt-5 pb-3 w-full min-w-0 grid gap-5 grid-rows-[minmax(0,1fr)] flex-1 min-h-0 ${
+      className={`home-workspace px-4 lg:px-8 pt-5 pb-3 w-full min-w-0 grid gap-5 grid-rows-[minmax(0,1fr)] flex-1 min-h-0 ${
         railCollapsed
           ? "rail:grid-cols-[minmax(0,1fr)_3rem]"
-          : "rail:grid-cols-[minmax(0,1fr)_minmax(0,21rem)]"
+          : "rail:grid-cols-[minmax(0,1fr)_minmax(0,24rem)]"
       }`}
     >
       {/* The rail is its own column (CAD-574), bounded by the panel's
@@ -1223,6 +1225,10 @@ export default function Home({
           onOpenIssue={onOpenIssue}
           overviewHref={overviewHref}
           onAsk={onAsk}
+          onAskAgent={(agent, update) => setSeed((s) => ({
+            text: `Check in with ${agent.alias}${agent.on.length ? ` on ${agent.on.join(", ")}` : ""}. ${update ? `Their latest update: ${update.label}${update.text ? ` — ${update.text.slice(0, 1200)}` : ""}. ` : ""}What is the current progress, and does anything need my input?`,
+            refs: [], n: s.n + 1,
+          }))}
           collapsed={railCollapsed}
           onToggleCollapse={toggleRail}
         />
@@ -1236,7 +1242,7 @@ export default function Home({
             bottom. It fills the height below the board header; the page
             itself never scrolls for the chat. */}
         <div className="relative flex-1 min-h-0 flex flex-col" data-chat-panel>
-          <div className="flex items-center gap-2 flex-wrap pb-2.5 border-b border-ink-700/70">
+          <div className="master-heading flex items-center gap-2 flex-wrap pb-2.5 border-b border-ink-700/70">
             <h1 className="text-section font-semibold text-ink-100">Master</h1>
             <span
               className={`chip ${
@@ -1254,6 +1260,8 @@ export default function Home({
               <span className="text-micro text-ink-500">{link === "stopped" ? "stream stopped" : "reconnecting…"}</span>
             )}
           </div>
+
+          <p className="text-label text-ink-500 pt-2 pb-1">Plan work, check in with your agents, and discuss what comes next. <span className="text-ink-400">All projects</span></p>
 
           {thread.status === "failed" && (
             <div className="card px-3.5 py-3 mt-3 text-label text-fail break-words" role="alert">

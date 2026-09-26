@@ -3,7 +3,7 @@ import { useState } from "react";
 import { api, ApiError } from "../../lib/api";
 import type { ResourceState } from "../../lib/cache";
 import { resources } from "../../lib/resources";
-import type { Overview } from "../../lib/types";
+import type { Agent, Overview } from "../../lib/types";
 import {
   ageLabel,
   homeNeeds,
@@ -13,6 +13,8 @@ import {
   type NeedGroupKey,
   type UnfenceChoice,
 } from "./needs";
+import AgentUpdates from "./AgentUpdates";
+import type { AgentUpdate } from "./agentUpdates";
 import Button from "../../ui/Button";
 import PlanCard from "./PlanCard";
 import Link from "../../ui/Link";
@@ -317,7 +319,7 @@ function NeedItem({
     <li className="needrow px-3 py-2 min-w-0" data-need={need.kind}>
       <div className="flex items-center gap-2 min-w-0">
         <span className={`chip shrink-0 ${KIND_CHIP[need.kind] ?? "bg-ink-800 text-ink-300"}`}>{need.label}</span>
-        <div className="min-w-0 flex-1 truncate text-secondary text-ink-200" title={need.title}>
+        <div className="min-w-0 flex-1 text-secondary text-ink-200 break-words" title={need.title}>
           {need.title}
         </div>
         <span className="num shrink-0 text-micro text-ink-500" title={`waiting ${ageLabel(need.age)}`}>
@@ -542,6 +544,7 @@ export default function NeedsRail({
   onAsk,
   collapsed,
   onToggleCollapse,
+  onAskAgent,
 }: {
   overview: ResourceState<Overview>;
   readOnly: boolean;
@@ -550,7 +553,9 @@ export default function NeedsRail({
   onAsk: (need: HomeNeed) => void;
   collapsed: boolean;
   onToggleCollapse: () => void;
+  onAskAgent: (agent: Agent, update?: AgentUpdate) => void;
 }) {
+  const [tab, setTab] = useState<"updates" | "decisions">("updates");
   const needs = homeNeeds(overview.data?.needs_me);
   const { groups, old } = needGroups(needs);
   const [openGroups, setOpenGroups] = useState<ReadonlySet<NeedGroupKey>>(
@@ -615,12 +620,19 @@ export default function NeedsRail({
     </>
   );
 
+  const panelBody = <>
+    <div className="activity-tabs" role="group" aria-label="Team activity">
+      <button aria-pressed={tab === "updates"} onClick={() => setTab("updates")}>Updates</button>
+      <button aria-pressed={tab === "decisions"} onClick={() => setTab("decisions")}>Decisions <span className="num">{count}</span></button>
+    </div>
+    <div>
+      {tab === "updates" ? <AgentUpdates onAsk={(agent, update) => { setDrawer(false); onAskAgent(agent, update); }} onOpenIssue={onOpenIssue} /> : body}
+    </div>
+  </>;
+
   const header = (drawerMode: boolean) => (
     <header className="px-3 py-2.5 flex items-center gap-2 border-b border-ink-700 shrink-0">
-      <h2 className="text-secondary font-semibold text-ink-100">Needs you</h2>
-      <span className={`chip ${count ? "bg-warn/10 text-warn" : "bg-ok/15 text-ok"}`}>
-        {overview.data ? count || "clear" : "…"}
-      </span>
+      <h2 className="text-secondary font-semibold text-ink-100">Agent updates</h2>
       <Link href={overviewHref} className="lnk text-label ml-auto" onClick={() => setDrawer(false)}>
         Team overview
       </Link>
@@ -628,7 +640,7 @@ export default function NeedsRail({
         <button
           type="button"
           className="lnk text-label shrink-0"
-          aria-label="close needs panel"
+          aria-label="close agent updates"
           onClick={() => setDrawer(false)}
         >
           ✕
@@ -637,7 +649,7 @@ export default function NeedsRail({
         <button
           type="button"
           className="lnk text-label shrink-0"
-          aria-label={collapsed ? "expand needs rail" : "collapse needs rail"}
+          aria-label={collapsed ? "expand agent updates" : "collapse agent updates"}
           onClick={onToggleCollapse}
         >
           {collapsed ? "»" : "«"}
@@ -655,21 +667,21 @@ export default function NeedsRail({
           <button
             type="button"
             className="slimrail card"
-            aria-label={`needs you — ${count} waiting; expand the rail`}
+            aria-label={`agent updates — ${count} decisions; expand the rail`}
             onClick={onToggleCollapse}
           >
             <span className={`chip ${count ? "bg-warn/10 text-warn" : "bg-ok/15 text-ok"}`}>
               {overview.data ? count : "…"}
             </span>
-            <span className="vert text-label text-ink-400">Needs you</span>
+            <span className="vert text-label text-ink-400">Agent updates</span>
             <span className="text-ink-500" aria-hidden>
               «
             </span>
           </button>
         ) : (
-          <section className="card needsrail overflow-hidden" aria-label="needs you" data-collapsed="false">
+          <section className="card needsrail overflow-hidden" aria-label="agent updates" data-collapsed="false">
             {header(false)}
-            <div className="rail-scroll min-h-0">{body}</div>
+            <div className="rail-scroll min-h-0">{panelBody}</div>
           </section>
         )}
       </div>
@@ -679,9 +691,9 @@ export default function NeedsRail({
         type="button"
         className="needbtn rail:hidden"
         onClick={() => setDrawer(true)}
-        aria-label={`needs you — ${count} waiting; open the panel`}
+        aria-label={`agent updates — ${count} decisions; open the panel`}
       >
-        Needs you
+        Agent updates
         <span className={`chip ${count ? "bg-warn/15 text-warn" : "bg-ok/15 text-ok"}`}>
           {overview.data ? count : "…"}
         </span>
@@ -692,11 +704,11 @@ export default function NeedsRail({
           <section
             className="needsdrawer rail:hidden"
             role="dialog"
-            aria-label="needs you"
+            aria-label="agent updates"
             aria-modal="true"
           >
             {header(true)}
-            <div className="rail-scroll min-h-0 flex-1">{body}</div>
+            <div className="rail-scroll min-h-0 flex-1">{panelBody}</div>
           </section>
         </>
       )}

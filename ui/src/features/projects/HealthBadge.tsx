@@ -14,7 +14,9 @@ export function HealthBadge({ view }: { view: HealthView }) {
 export function HealthReasons({ view }: { view: HealthView }) {
   if (view.reasons.length === 0) return null;
   return (
-    <ul className="space-y-1.5" aria-label="health reasons">
+    <details className="health-details">
+      <summary className="text-label text-warn cursor-pointer">{view.reasons.length} {view.reasons.length === 1 ? "reason" : "reasons"} to check</summary>
+    <ul className="space-y-1.5 mt-3" aria-label="health reasons">
       {view.reasons.map((r, i) => (
         <li key={i} className="text-label min-w-0">
           <span className={`break-words ${view.tone === "fail" ? "text-fail" : "text-warn"}`}>{r.detail}</span>
@@ -24,6 +26,7 @@ export function HealthReasons({ view }: { view: HealthView }) {
         </li>
       ))}
     </ul>
+    </details>
   );
 }
 

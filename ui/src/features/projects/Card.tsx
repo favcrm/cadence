@@ -45,7 +45,6 @@ export default function Card({
   const block = useWriteBlock(!canDrag);
   const noDrag = noDragReason(t) ?? block;
   const pr = prLabel(t);
-  const artifacts = t.counts.artifacts + t.counts.refs;
   const meta: React.ReactNode[] = [];
   if (t.owner) {
     meta.push(
@@ -60,20 +59,6 @@ export default function Card({
     meta.push(
       <span key="ck" title="checklist">
         {t.checks.done}/{t.checks.total} done
-      </span>,
-    );
-  }
-  if (t.counts.comments > 0) {
-    meta.push(
-      <span key="cm" title="comments">
-        {t.counts.comments} cmt
-      </span>,
-    );
-  }
-  if (artifacts > 0) {
-    meta.push(
-      <span key="ar" title="artifacts">
-        {artifacts} art
       </span>,
     );
   }
@@ -169,9 +154,8 @@ export default function Card({
         </div>
       )}
       {t.parent && (
-        <div className="mt-1.5 num text-micro text-ink-500">
+        <div className="mt-1.5 num text-micro text-ink-500" title={parentTitle}>
           in {t.parent}
-          {parentTitle ? ` · ${parentTitle}` : ""}
         </div>
       )}
       {meta.length > 0 && (

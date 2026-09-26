@@ -14,15 +14,14 @@ export default function SignIn({ meta, onChange }: { meta: Meta | null; onChange
   if (!meta.signed_in) {
     const cmd = meta.login_hint ?? SIGN_IN_COMMAND;
     return (
-      <span
-        className="chip bg-warn/10 text-warn max-w-[14rem] truncate"
-        title={`Board writes need the operator's session. Run ${cmd} in your own shell on the host and open the link it prints — in this tab: each tab signs in on its own.`}
-      >
-        <span className="sm:hidden">sign in</span>
-        <span className="hidden sm:inline">
-          {meta.tab_signed_out ? "Sign in this tab with" : "Sign in with"}&nbsp;<code className="num">{cmd}</code>
-        </span>
-      </span>
+      <details className="relative text-label">
+        <summary className="header-auth-target chip bg-warn/10 text-warn cursor-pointer" aria-label="Read-only. Sign in to make changes"><span className="hidden sm:inline">Read-only · </span>Sign in</summary>
+        <div className="absolute right-0 top-full mt-2 z-50 card p-4 w-72 shadow-xl">
+          <p className="text-label text-ink-200 mb-2">Sign in to send messages and make decisions.</p>
+          <p className="text-label text-ink-400 mb-2">Run this command on the host, then open the link it prints in this tab.</p>
+          <code className="num text-label text-accent break-words select-all">{cmd}</code>
+        </div>
+      </details>
     );
   }
   return (
@@ -38,7 +37,7 @@ export default function SignIn({ meta, onChange }: { meta: Meta | null; onChange
             onChange();
           });
       }}
-      className="chip bg-ink-800 text-ink-400 hover:text-ink-200 transition-colors"
+      className="header-auth-target chip bg-ink-800 text-ink-400 hover:text-ink-200 transition-colors"
       title={`Signed in as the operator${meta.session ? ` (session ${meta.session.id})` : ""} — click to sign out`}
     >
       <span className="hidden sm:inline">operator ·&nbsp;</span>sign out
