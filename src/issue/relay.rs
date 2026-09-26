@@ -891,6 +891,14 @@ fn pm_alias(pm_dir: &Path, project_key: &str, config: &RelayProjectConfig) -> Op
     value["roles"]["pm"]["alias"].as_str().map(str::to_string)
 }
 
+/// Same bound as `automatic_quota_error`: provider evidence older than this
+/// is not a grant to wake a PM.
+const QUOTA_EVIDENCE_MAX_AGE_SECS: i64 = 300;
+
+/// `agent_show` stores `canonical_quota`, not a top-level `remaining`.
+/// `state: available` only means the account id and rate-limit object were
+/// present. Usage lives at `data.rateLimits.primary.usedPercent`, and a
+/// stale or unbound `observed_at` is not evidence.
 fn quota_decision(agent: &Value) -> std::result::Result<(), String> {
     if matches!(agent["state"].as_str(), Some("stopped" | "attention")) {
         return Err(format!(
@@ -898,21 +906,51 @@ fn quota_decision(agent: &Value) -> std::result::Result<(), String> {
             agent["state"].as_str().unwrap_or("unavailable")
         ));
     }
-    let quota = agent
-        .get("quota")
-        .filter(|v| !v.is_null())
-        .or_else(|| agent.get("usage_limit").filter(|v| !v.is_null()))
-        .ok_or_else(|| "quota unknown: no account allowance telemetry".to_string())?;
-    if quota["state"].as_str() != Some("available") {
-        return Err(format!(
-            "quota {}",
-            quota["reason"]
-                .as_str()
-                .or(quota["state"].as_str())
-                .unwrap_or("unknown")
-        ));
+    let Some(quota) = agent.get("quota").filter(|value| value.is_object()) else {
+        return Err("quota unknown: no account allowance telemetry".to_string());
+    };
+    if quota["provider"].as_str() != agent["provider"].as_str() {
+        return Err("quota unknown: allowance provider does not match agent".to_string());
     }
-    if quota["remaining"].as_i64() == Some(0) || quota["used_percent"].as_f64() == Some(100.0) {
+    if quota["assignee"].as_str() != agent["alias"].as_str() {
+        return Err("quota unknown: allowance is not bound to this agent".to_string());
+    }
+    let Some(thread_id) = agent["thread_id"].as_str().filter(|id| !id.is_empty()) else {
+        return Err("quota unknown: agent has no current provider thread".to_string());
+    };
+    if quota["thread_id"].as_str() != Some(thread_id) {
+        return Err("quota unknown: allowance is not bound to the current thread".to_string());
+    }
+    let Some(account_id) = quota["account_id"].as_str().filter(|id| !id.is_empty()) else {
+        return Err("quota unknown: provider evidence has no account identity".to_string());
+    };
+    if quota.pointer("/data/accountId").and_then(Value::as_str) != Some(account_id) {
+        return Err("quota unknown: account identity is not provider-bound".to_string());
+    }
+    if !matches!(
+        quota["source"].as_str(),
+        Some("account/rateLimits/read") | Some("account/rateLimits/updated")
+    ) {
+        return Err("quota unknown: provider evidence source is not canonical".to_string());
+    }
+    if quota["state"].as_str() != Some("available") {
+        let state = quota["state"].as_str().unwrap_or("unknown");
+        return Err(format!("quota {state}"));
+    }
+    let Some(observed_at) = quota["observed_at"].as_str().and_then(time::parse_iso) else {
+        return Err("quota unknown: provider evidence has no canonical timestamp".to_string());
+    };
+    let age = i128::from(now()) - i128::from(observed_at);
+    if age < -30 || age > i128::from(QUOTA_EVIDENCE_MAX_AGE_SECS) {
+        return Err("quota unknown: provider allowance evidence is stale".to_string());
+    }
+    let Some(used) = quota
+        .pointer("/data/rateLimits/primary/usedPercent")
+        .and_then(Value::as_f64)
+    else {
+        return Err("quota unknown: no primary usedPercent".to_string());
+    };
+    if !used.is_finite() || used >= 100.0 {
         return Err("quota exhausted".to_string());
     }
     Ok(())
@@ -2339,22 +2377,173 @@ mod tests {
         assert!(state.has_seen("comment:a:newest"));
         assert!(!state.has_seen("comment:z:0000"));
         assert_eq!(state.seen_events.len(), SEEN_EVENT_CAP);
+        let stamped = state
+            .seen_events
+            .iter()
+            .find(|event| event.id == "comment:a:newest")
+            .unwrap()
+            .at;
+        assert!(stamped > 1_000_000, "newest stamp was {stamped}");
+        let (_temp, state_dir) = temp_state();
+        let mut saved = RelayState::default();
+        saved.projects.insert("cadence".to_string(), state);
+        save_state(&state_dir, &saved).unwrap();
+        let loaded = load_state(&state_dir).unwrap();
+        let mut project = loaded.projects["cadence"].clone();
+        assert_eq!(
+            project
+                .seen_events
+                .iter()
+                .find(|event| event.id == "comment:a:newest")
+                .map(|event| event.at),
+            Some(stamped),
+            "a reload must not zero the stamp"
+        );
+        project.remember("comment:z:extra".to_string());
+        assert!(project.has_seen("comment:a:newest"));
+        assert!(!project.has_seen("comment:z:0001"));
+    }
+
+    #[test]
+    fn restart_keeps_a_seen_comment_deduped() {
+        let (_temp, state_dir) = temp_state();
+        let mut api = MockApi {
+            issues: vec![managed_remote("CAD-9", "2026-09-20T01:02:03Z")],
+            comments: [(
+                4,
+                vec![GithubComment {
+                    id: 8,
+                    body: "please look at this".to_string(),
+                    user: None,
+                    created_at: None,
+                    updated_at: None,
+                }],
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let remote = api.issues.clone();
+        let mut project = RelayProjectState::default();
+        let (queued, errors) = ingest_comments(
+            &mut api,
+            "fake/repo",
+            "cadence",
+            &relay_config(),
+            &mut project,
+            &remote,
+        );
+        assert_eq!(queued, 1);
+        assert!(errors.is_empty());
+        let mut saved = RelayState::default();
+        saved.projects.insert("cadence".to_string(), project);
+        save_state(&state_dir, &saved).unwrap();
+        let loaded = load_state(&state_dir).unwrap();
+        let mut project = loaded.projects["cadence"].clone();
+        let (queued, errors) = ingest_comments(
+            &mut api,
+            "fake/repo",
+            "cadence",
+            &relay_config(),
+            &mut project,
+            &remote,
+        );
+        assert_eq!(queued, 0, "a reloaded comment id must not queue again");
+        assert!(errors.is_empty());
+        assert_eq!(project.actions.len(), 1);
+        assert!(project.has_seen("comment:fake/repo:4:8"));
+    }
+
+    #[test]
+    fn legacy_seen_event_strings_stay_seen_after_load() {
+        let (_temp, state_dir) = temp_state();
+        fs::write(
+            state_dir.join(STATE_FILE),
+            r#"{"schema":1,"projects":{"cadence":{"seen_events":["comment:fake/repo:4:8","comment:fake/repo:4:9"]}}}"#,
+        )
+        .unwrap();
+        let loaded = load_state(&state_dir).unwrap();
+        let mut project = loaded.projects["cadence"].clone();
+        assert!(project.has_seen("comment:fake/repo:4:8"));
+        assert!(project.has_seen("comment:fake/repo:4:9"));
+        let mut api = MockApi {
+            issues: vec![managed_remote("CAD-9", "2026-09-20T01:02:03Z")],
+            comments: [(
+                4,
+                vec![GithubComment {
+                    id: 8,
+                    body: "please look at this".to_string(),
+                    user: None,
+                    created_at: None,
+                    updated_at: None,
+                }],
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let remote = api.issues.clone();
+        let (queued, errors) = ingest_comments(
+            &mut api,
+            "fake/repo",
+            "cadence",
+            &relay_config(),
+            &mut project,
+            &remote,
+        );
+        assert_eq!(queued, 0);
+        assert!(errors.is_empty());
+        assert!(project.actions.is_empty());
+    }
+
+    fn canonical_pm(used_percent: u64, observed_at: &str) -> Value {
+        json!({
+            "alias": "cc13-pm",
+            "provider": "codex",
+            "state": "idle",
+            "thread_id": "thread",
+            "quota": {
+                "provider": "codex",
+                "assignee": "cc13-pm",
+                "account_id": "acct",
+                "thread_id": "thread",
+                "state": "available",
+                "source": "account/rateLimits/read",
+                "observed_at": observed_at,
+                "data": {
+                    "accountId": "acct",
+                    "rateLimits": {"primary": {"usedPercent": used_percent}}
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn canonical_quota_allows_only_fresh_headroom() {
+        let fresh = time::iso(now());
+        assert!(quota_decision(&canonical_pm(10, &fresh)).is_ok());
+        let exhausted = quota_decision(&canonical_pm(100, &fresh)).unwrap_err();
+        assert!(exhausted.contains("exhausted"), "{exhausted}");
+        let stale = quota_decision(&canonical_pm(10, "2020-01-01T00:00:00Z")).unwrap_err();
+        assert!(stale.contains("stale"), "{stale}");
+        let mut unbound = canonical_pm(10, &fresh);
+        unbound["quota"]["assignee"] = json!("someone-else");
+        let unbound = quota_decision(&unbound).unwrap_err();
+        assert!(unbound.contains("not bound"), "{unbound}");
+        let mut bare = canonical_pm(100, &fresh);
+        bare["quota"] = json!({"state": "available", "remaining": 0, "used_percent": 100});
+        let bare = quota_decision(&bare).unwrap_err();
+        assert!(bare.contains("quota unknown"), "{bare}");
+        assert!(quota_decision(&json!({"state": "stopped"}))
+            .unwrap_err()
+            .contains("stopped"));
+        assert!(quota_decision(&json!({"state": "idle"}))
+            .unwrap_err()
+            .contains("quota unknown"));
     }
 
     #[test]
     fn unknown_or_exhausted_quota_does_not_dispatch() {
-        assert!(quota_decision(&json!({
-            "state": "stopped",
-            "quota": {"state": "available", "remaining": 10}
-        }))
-        .unwrap_err()
-        .contains("stopped"));
-        assert!(quota_decision(&json!({
-            "state": "idle",
-            "quota": {"state": "available", "remaining": 0}
-        }))
-        .unwrap_err()
-        .contains("exhausted"));
         assert!(quota_decision(&json!({"state": "idle"}))
             .unwrap_err()
             .contains("quota unknown"));
