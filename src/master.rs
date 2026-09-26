@@ -375,7 +375,7 @@ pub fn confinement(inputs: &ConfineInputs) -> crate::confine::Policy {
 /// `cadence upgrade` repointing the link mid-run leaves the master's
 /// verbs runnable (it holds only release binaries). Nothing when the
 /// program does not exist.
-fn program_dirs(program: &Path) -> Vec<PathBuf> {
+pub(crate) fn program_dirs(program: &Path) -> Vec<PathBuf> {
     let Ok(real) = program.canonicalize() else {
         return vec![];
     };

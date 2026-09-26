@@ -2376,6 +2376,32 @@ impl Shared {
                         agent_json["briefing_missing"] = json!(file);
                     }
                 }
+                // CAD-556: the emitted Landlock policy for a confined
+                // pi worker — recomputed from the same inputs `open`
+                // uses, like `master confinement` prints the master's.
+                // `confined` reports the launch intent on every
+                // pi/managed row so `agent show` answers "is it
+                // sandboxed" without parsing the argv.
+                if agent.provider == "pi" && agent.endpoint_kind == "managed" {
+                    if crate::master::is_master(&agent.alias) {
+                        agent_json["confined"] = json!(crate::master::is_confined(
+                            agent.params.as_ref(),
+                            crate::confine::available().is_ok()
+                        ));
+                    } else {
+                        let confined = adapter::pi::worker_confined(&agent);
+                        agent_json["confined"] = json!(confined);
+                        if confined {
+                            let (_exe, policy) = adapter::pi::pi_worker_confinement(
+                                &self.provider_env,
+                                &self.state_dir,
+                                &agent,
+                            );
+                            agent_json["confinement"] =
+                                json!({"read": policy.read, "write": policy.write});
+                        }
+                    }
+                }
                 Ok(json!({
                     "agent": agent_json,
                     "messages": messages.iter().map(Message::to_json).collect::<Vec<_>>(),
@@ -4644,7 +4670,7 @@ impl Shared {
         // Enumerated launch params are validated at the door — a bad
         // value rejected here never lands on the agent row to be
         // replayed into a provider argv on every resume.
-        let parsed = match agent_params {
+        let mut parsed = match agent_params {
             Some(raw) => {
                 let parsed: Value = serde_json::from_str(raw)
                     .map_err(|_| Error::rejected("'params' must be a JSON object"))?;
@@ -4652,6 +4678,35 @@ impl Shared {
                 parsed
             }
             None => Value::Null,
+        };
+        // CAD-556: `pm.yaml [host] confine_pi_workers` is the pm-level
+        // default a bare `join … pi` picks up — an explicit `confine`
+        // param (`--confine`/`--no-confine`, or a caller's own params)
+        // always wins. A [host] table that cannot be parsed refuses
+        // the register rather than silently landing unconfined.
+        let mut defaulted = false;
+        let pm_dir = self.pm_dir().ok().filter(|d| d.is_dir());
+        if provider == "pi" && endpoint == "managed" && parsed.get("confine").is_none() {
+            if let Some(pm_dir) = &pm_dir {
+                let overrides =
+                    crate::doctor::host::read_host_overrides(pm_dir).map_err(Error::rejected)?;
+                if overrides.and_then(|o| o.confine_pi_workers) == Some(true) {
+                    let mut obj = parsed.as_object().cloned().unwrap_or_default();
+                    obj.insert("confine".to_string(), json!(true));
+                    parsed = Value::Object(obj);
+                    defaulted = true;
+                }
+            }
+        }
+        // Only re-serialize when the default actually changed the set —
+        // the caller's raw `params` string is stored verbatim otherwise.
+        let defaulted_params;
+        let agent_params = if defaulted {
+            defaulted_params = serde_json::to_string(&parsed)
+                .map_err(|e| Error::internal(format!("params reserialize: {e}")))?;
+            Some(defaulted_params.as_str())
+        } else {
+            agent_params
         };
         self.authorize_register(alias, &parsed, peer_pid)?;
         self.store.register_agent(&crate::store::NewAgent {

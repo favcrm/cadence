@@ -133,6 +133,21 @@ cadence join <your-alias> pi                        # headless pi worker — sam
                                                     #  rule; takes --model/--effort
                                                     #  (off minimal low medium
                                                     #  high xhigh max)
+cadence join <your-alias> pi --confine              # … plus Landlock: the
+                                                    #  worker sees only its
+                                                    #  worktree, the repo's git
+                                                    #  dir + build caches, the
+                                                    #  toolchain and its own
+                                                    #  state dir (~/.ssh keys,
+                                                    #  other agents' dirs stay
+                                                    #  denied; network is NOT
+                                                    #  gated). `pm.yaml [host]
+                                                    #  confine_pi_workers:
+                                                    #  true` makes it the
+                                                    #  default; --no-confine
+                                                    #  opts one worker back out.
+                                                    #  `agent show <w>` prints
+                                                    #  the emitted policy.
 cadence join <your-alias> claude --tui              # interactive claude in an
                                                     #  owned pane — pty rules:
                                                     #  ready gate + `message

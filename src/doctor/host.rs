@@ -201,6 +201,11 @@ pub struct HostOverrides {
     /// PM has answered it for this many seconds (unset = 900; `0` routes
     /// it at once).
     pub question_escalate_after_secs: Option<u64>,
+    /// CAD-556 — read at `agent_register` for `pi/managed`: when true,
+    /// a pi worker joins Landlock-confined unless its params say
+    /// `confine` explicitly (`join … pi --confine`/`--no-confine` win).
+    /// Unset is off — confinement stays opt-in until dogfooded.
+    pub confine_pi_workers: Option<bool>,
 }
 
 /// Every threshold in one place; `pm.yaml [host]` overrides any subset.
@@ -8813,7 +8818,7 @@ mod tests {
         assert!(host_overrides(&pm).is_none());
         std::fs::write(
             pm.join("pm.yaml"),
-            "schema: 1\nhost:\n  wal_fail_bytes: 5\n  temp_warn_count: 2\n  mem_warn_pct: 25\n  wal_max_bytes: 4096\n",
+            "schema: 1\nhost:\n  wal_fail_bytes: 5\n  temp_warn_count: 2\n  mem_warn_pct: 25\n  wal_max_bytes: 4096\n  confine_pi_workers: true\n",
         )
         .unwrap();
         let o = host_overrides(&pm).unwrap();
@@ -8821,6 +8826,7 @@ mod tests {
         assert_eq!(o.temp_warn_count, Some(2));
         assert_eq!(o.mem_warn_pct, Some(25.0));
         assert_eq!(o.wal_max_bytes, Some(4096));
+        assert_eq!(o.confine_pi_workers, Some(true));
         let t = Thresholds::resolve(Some(o));
         assert_eq!(t.wal_fail_bytes, 5);
         assert_eq!(t.temp_warn_count, 2);
