@@ -113,20 +113,39 @@ export const ICONS = {
   ),
 };
 
-/** A post on the Home board or a calendar — opens the editor. */
+/** Tiny platform glyph for a destination chip — "ig" / "fb" / "web". */
+export function DestIcon({ d }: { d: string }) {
+  const short = d === "instagram" ? "ig" : d === "facebook" ? "fb" : d.slice(0, 3);
+  return (
+    <span className="sc-dicon" title={d}>
+      {short}
+    </span>
+  );
+}
+
+/** A post on the board — thumb, first caption line, destinations, time,
+ * state; opens the editor. */
 export function PostCard({ p, href }: { p: Post; href: string }) {
   const when = p.status === "published" ? fmt.ago(p.scheduleAt) : fmt.time(p.scheduleAt);
+  const line = (p.caption.text || "").split("\n")[0];
   return (
-    <Link href={href} className="card tcard sc-pcard block">
-      <div className={`sc-cap ${p.caption.text ? "" : "sc-empty"}`}>
-        {p.caption.text || (p.lease ? "being drafted…" : "no caption yet")}
+    <Link href={href} className="card tcard sc-pcard block" title={p.caption.text || undefined}>
+      <div className="sc-prow">
+        <div className="sc-pthumb">
+          <Media asset={p.image.asset} />
+        </div>
+        <div className={`sc-cap ${p.caption.text ? "" : "sc-empty"}`}>
+          {line || (p.lease ? "being drafted…" : "no caption yet")}
+        </div>
       </div>
       <div className="sc-meta">
         <StatusChip s={p.status} />
-        {p.lease && <span className="chip bg-info/10 text-info">writer ✍</span>}
-        {p.approval && !p.approval.voidedBy && (
-          <span className="chip bg-ok/15 text-ok">✓ r{p.approval.rev}</span>
-        )}
+        {p.lease && <span className="chip bg-info/10 text-info">✍</span>}
+        <span className="sc-dests">
+          {p.destinations.map((d) => (
+            <DestIcon key={d} d={d} />
+          ))}
+        </span>
         <span className="sc-when">{when}</span>
       </div>
     </Link>

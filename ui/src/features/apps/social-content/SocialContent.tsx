@@ -171,7 +171,9 @@ export default function SocialContent({
         <span className="flex-1" />
         <BlogButton say={say} />
       </div>
-      {section === "home" && <ScHome postHref={(id) => scHref("post", id)} />}
+      {section === "home" && (
+        <ScHome postHref={(id) => scHref("post", id)} needsHref={scHref("needs")} />
+      )}
       {section === "library" && <ScLibrary say={say} runsHref={scHref("runs")} />}
       {section === "runs" && <ScRuns postHref={(id) => scHref("post", id)} />}
       {section === "post" && route.arg && (

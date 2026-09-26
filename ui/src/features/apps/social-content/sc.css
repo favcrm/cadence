@@ -32,17 +32,30 @@
 .sc-calpost .sc-t { color: var(--color-ink-500); font-family: "IBM Plex Mono", monospace; font-size: .625rem; }
 .sc-calpost .sc-cap { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 
-/* Home — state board */
-.sc-board { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(200px, 1fr); gap: 10px; overflow-x: auto; padding-bottom: 6px; }
-.sc-bcol .sc-bhead { display: flex; align-items: center; gap: 7px; padding: 0 2px 8px; }
+/* Home — segmented Calendar | Board control */
+.sc-seg { display: inline-flex; gap: 2px; padding: 2px; border: 1px solid var(--color-ink-700); border-radius: .45rem; background: var(--color-ink-900); }
+.sc-seg button { border: none; background: none; color: var(--color-ink-400); font-size: .75rem; padding: 3px 12px; border-radius: .3rem; cursor: pointer; }
+.sc-seg button:hover { color: var(--color-ink-100); }
+.sc-seg button.sc-on { background: color-mix(in srgb, var(--color-accent) 15%, transparent); color: var(--color-accent); font-weight: 500; }
+
+/* Home — pipeline board: its own container; lanes scroll horizontally
+ * inside it and lane headers stick to its top while cards scroll under. */
+.sc-boardwrap { padding: 10px; }
+.sc-board { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(205px, 235px); gap: 10px; overflow: auto; max-height: calc(100vh - 15rem); min-height: 12rem; padding-bottom: 4px; }
+.sc-bcol { min-width: 0; }
+.sc-bcol .sc-bhead { display: flex; align-items: center; gap: 7px; padding: 2px 2px 8px; position: sticky; top: 0; z-index: 2; background: var(--color-ink-850); border-bottom: 1px solid var(--color-ink-700); }
 .sc-bcol .sc-bhead .slabel { display: inline-flex; align-items: center; gap: 6px; }
 .sc-bcol .sc-bhead .sc-count { font: 500 .6875rem "IBM Plex Mono", monospace; color: var(--color-ink-500); }
-.sc-bcards { display: flex; flex-direction: column; gap: 7px; min-height: 30px; }
-.sc-pcard { padding: 9px 10px; display: flex; flex-direction: column; gap: 6px; }
-.sc-pcard .sc-cap { color: var(--color-ink-200); font-size: .8125rem; line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.sc-bcards { display: flex; flex-direction: column; gap: 7px; min-height: 30px; padding-top: 8px; }
+.sc-pcard { padding: 8px 9px; display: flex; flex-direction: column; gap: 7px; }
+.sc-pcard .sc-prow { display: flex; gap: 8px; align-items: flex-start; }
+.sc-pcard .sc-pthumb { width: 44px; height: 44px; border-radius: .3rem; overflow: hidden; position: relative; flex: none; }
+.sc-pcard .sc-cap { color: var(--color-ink-200); font-size: .75rem; line-height: 1.35; display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden; min-width: 0; }
 .sc-pcard .sc-cap.sc-empty { color: var(--color-ink-500); font-style: italic; }
-.sc-pcard .sc-meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.sc-pcard .sc-meta { display: flex; align-items: center; gap: 6px; }
+.sc-pcard .sc-dests { display: inline-flex; gap: 3px; }
 .sc-pcard .sc-meta .sc-when { margin-left: auto; font: 400 .6875rem "IBM Plex Mono", monospace; color: var(--color-ink-500); }
+.sc-dicon { display: inline-flex; align-items: center; justify-content: center; min-width: 18px; height: 16px; padding: 0 3px; border-radius: 3px; border: 1px solid var(--color-ink-600); font: 500 .5625rem "IBM Plex Mono", monospace; color: var(--color-ink-400); text-transform: uppercase; }
 
 /* suggestion cards */
 .sc-sugg .sc-who { display: flex; gap: 7px; align-items: center; }
