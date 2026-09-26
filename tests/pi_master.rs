@@ -611,7 +611,11 @@ fn unconfined_master_error_names_the_private_config_it_read() {
     );
     pi.open(&master_agent(state.path(), json!({"unconfined": true})))
         .unwrap();
-    let error = pi.run_turn("hi", "m1", &|_| {}).unwrap_err().to_string();
+    let error = pi
+        .run_turn("hi", "m1", &|_| {})
+        .err()
+        .expect("model cannot authenticate")
+        .to_string();
     assert!(
         error.contains(state.path().join("master/pi").to_str().unwrap()),
         "{error}"
@@ -622,7 +626,11 @@ fn unconfined_master_error_names_the_private_config_it_read() {
         "missing config must not be diagnosed as proven bad credentials: {error}"
     );
     std::fs::write(state.path().join("master/pi/models.json"), "{}").unwrap();
-    let configured_error = pi.run_turn("hi", "m2", &|_| {}).unwrap_err().to_string();
+    let configured_error = pi
+        .run_turn("hi", "m2", &|_| {})
+        .err()
+        .expect("catalog alone does not supply auth")
+        .to_string();
     assert!(
         configured_error.contains("models.json is present"),
         "{configured_error}"
