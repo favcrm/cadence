@@ -130,6 +130,11 @@ jobs:
       # CAD-582: design tokens are generated from ui/src/styles.css —
       # fail when design/tokens.* is stale against it.
       - run: scripts/design-kit --check
+      # Resolve onboarding links against tracked files, including clean clones.
+      - name: Check contributor documentation paths
+        run: python3 scripts/check-doc-links.py
+      - name: Test contributor documentation checker
+        run: python3 -m unittest discover -s scripts -p 'test_check_doc_links.py'
 
   clippy:
     needs: [queue-evidence]
@@ -203,7 +208,11 @@ jobs:
         env:
           CADENCE_SUITE_LOCK: ${{ runner.temp }}/cadence-suite.lock
           CARGO_BUILD_JOBS: 4
-        run: scripts/cadence-nextest --all-targets --locked --features test-seam
+        run: |
+          # The preceding default-feature run uses the same JUnit path. An
+          # early full-suite failure must not report its stale timing data.
+          rm -f target/nextest/cadence/junit.xml
+          scripts/cadence-nextest --all-targets --locked --features test-seam
       # Observational timings come from the same run, including failed tests.
       # No rerun, retry, test selection or required gate is changed here.
       - name: Summarize Rust test costs

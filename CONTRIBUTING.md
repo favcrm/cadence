@@ -23,7 +23,8 @@ briefing; an external session must not borrow a native alias or turn token.
 
 ## Fast feedback
 
-Use a stable Rust toolchain with rustfmt/clippy, Python 3 for script checks, and
+Use a stable Rust toolchain with rustfmt/clippy, Python 3.11+ for script checks
+(the recipe validator uses standard-library `tomllib`), and
 Node 22 with the pnpm version declared in [ui/package.json](ui/package.json).
 Install UI dependencies with `pnpm -C ui install --frozen-lockfile`.
 The [nextest installer](scripts/install-cadence-nextest) and
