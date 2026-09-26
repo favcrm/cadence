@@ -292,6 +292,8 @@ tests = [
     "turn_tokens_are_withheld_on_every_read_path",
     "agent_respond_refuses_the_requester_and_its_peers",
     "an_answered_handle_cannot_be_squatted_before_its_wait",
+    "brokered_request_opened_carries_no_input_derived_text",
+    "provider_input_required_carries_no_input_derived_text",
     "turn_tokens_are_shown_only_to_the_owning_connection",
     "instructions_file_lands_in_briefing",
     "instructions_file_with_no_bootstrap_refused_except_codex",
@@ -663,6 +665,13 @@ tests = [
     "cad323_codex_interrupt_never_lands_on_the_next_turn",
     "cad323_master_duplicate_dispatch_grants_no_interrupt",
     "cad323_refused_interrupt_is_recorded",
+    "cad551_pi_master_state_and_commands",
+    "cad551_master_state_working_turn_and_stop",
+    "cad551_master_command_gate_and_allowlist",
+    "cad551_master_command_board_gate",
+    "cad575_master_models_gate_and_contract",
+    "cad575_master_models_before_start",
+    "cad575_master_models_board_gate",
 ]
 helpers = [
     "start_operator_board",
@@ -712,6 +721,7 @@ tests = [
     "issue_comment_and_report_refuse_credential_shaped_text",
     "session_start_ack_downgrades_until_expiry",
     "session_start_scopes_to_cwd_project",
+    "issue_ls_summary_rolls_up_projects",
 ]
 helpers = [
     "stub_agent",
@@ -768,6 +778,9 @@ tests = [
     "cad378_dispatch_record_binds_the_kickoff_not_the_request",
     "cad378_dispatch_record_other_agents_cannot_overwrite",
     "cad378_dispatch_record_forged_refs_and_body_bind_nothing",
+    "workflow_input_shape_is_enforced_server_side",
+    "app_primary_action_agrees_across_list_and_detail",
+    "app_digest_is_structural_not_summary_wording",
     "app_board_rows_never_follows_a_symlinked_workflows_dir",
     "app_plan_text_digests_the_bytes_it_renders",
     "app_install_never_writes_through_a_planted_symlink",
@@ -933,6 +946,7 @@ tests = [
     "master_escalation_reaches_the_operator_needs_you",
     "confine_denies_everything_unlisted",
     "master_reads_nothing_outside_its_views",
+    "confined_master_in_a_sandbox_can_run_cadence",
     "master_start_copies_no_login_by_default",
     "master_verbs_survive_an_upgrade_mid_run",
     "master_without_landlock_starts_only_on_the_operators_opt_in",
