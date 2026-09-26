@@ -741,6 +741,11 @@ pub fn caller_is_master() -> bool {
         .is_some_and(|alias| is_master(&alias))
 }
 
+/// Refusal for a master `--file -` or a missing `--file`. Same text
+/// `issue new` uses. The body has to be a regular file inside
+/// [`tmpdir`].
+pub const NO_STDIN: &str = "no stdin — use the write tool into master/tmp, then --file <that path>";
+
 /// Open a `--file` path. When [`caller_is_master`] is set, the file
 /// must be a regular non-symlink inside [`tmpdir`] and the returned
 /// fd is that open — callers read the fd, never the path again.

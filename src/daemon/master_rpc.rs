@@ -906,8 +906,9 @@ impl Shared {
                  Report: {path}\nImpact: {}\nOptions: {options}\n\n{body}\n\n\
                  Answer it: `cadence report file --task {id} --kind answer` with frontmatter \
                  `answers: {name}`. If the ticket, the plan and the operator's words do not \
-                 settle it: `cadence master escalate {id} {name} --file -` with a \
-                 one-paragraph summary — the operator then sees it in Needs-you.",
+                 settle it: write a one-paragraph summary into master/tmp, then \
+                 `cadence master escalate {id} {name} --file <that path>` — the operator \
+                 then sees it in Needs-you.",
                 row["impact"].as_str().unwrap_or_default()
             )
         } else {

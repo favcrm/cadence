@@ -208,11 +208,11 @@ fn master_end_to_end_chat_plan_approve_dispatch_report() {
     let chat = f.wait_thread("Plan reminder emails", 10);
     assert_eq!(chat["role"], "operator", "{chat}");
 
-    // The master proposes — through stdin, the way its briefing teaches.
+    // The master proposes from a file it wrote under master/tmp.
     let plan = f.file("plan.md", MASTER_PLAN);
     let (ok, proposed) = f.as_master(
         &mut m,
-        &format!("plan propose --project demo --file - < {plan}"),
+        &format!("plan propose --project demo --file {plan}"),
     );
     assert!(ok, "{proposed}");
     assert_eq!(proposed["epic"], "D-1", "{proposed}");
@@ -856,7 +856,7 @@ fn master_escalation_reaches_the_operator_needs_you() {
     // The master escalates through the daemon.
     let (ok, filed) = f.as_master(
         &mut m,
-        &format!("master escalate D-1 {qname} --file - < {esc_file}"),
+        &format!("master escalate D-1 {qname} --file {esc_file}"),
     );
     assert!(ok, "{filed}");
     assert_eq!(filed["by"], "master", "{filed}");
@@ -878,7 +878,7 @@ fn master_escalation_reaches_the_operator_needs_you() {
     // Escalated once; the router does not route it again.
     let (ok, err) = f.as_master(
         &mut m,
-        &format!("master escalate D-1 {qname} --file - < {esc_file}"),
+        &format!("master escalate D-1 {qname} --file {esc_file}"),
     );
     assert!(
         !ok && err.to_string().contains("already escalated"),

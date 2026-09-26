@@ -740,9 +740,7 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             )?;
             let body = match file {
                 Some(ref f) if f.as_os_str() == "-" => {
-                    return Err(Error::rejected(
-                        "no stdin — use the write tool into master/tmp, then --file <that path>",
-                    ));
+                    return Err(Error::rejected(crate::master::NO_STDIN));
                 }
                 Some(ref f) => Some(crate::master::read_command_file(state_dir, f, u64::MAX).map_err(
                     |e| {

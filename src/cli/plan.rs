@@ -93,14 +93,14 @@ pub(super) fn run_plan(state_dir: &Path, action: PlanAction) -> Result<i32> {
             match (file, workflow) {
                 (Some(file), None) => {
                     let cap = cadence_agent::issue::plan::MAX_PLAN_BYTES as u64;
-                    let text = if file.as_os_str() == "-" {
-                        read_body_capped(None, Some(file.clone()), cap)
-                    } else {
-                        cadence_agent::master::read_command_file(state_dir, &file, cap)
-                    }
-                    .map_err(|e| {
-                        Error::rejected(format!("Cannot read plan {}: {e}", file.display()))
-                    })?;
+                    let text = match read_master_command_file(state_dir, Some(&file), cap) {
+                        Err(e) if e.to_string().contains(cadence_agent::master::NO_STDIN) => {
+                            return Err(e);
+                        }
+                        res => res.map_err(|e| {
+                            Error::rejected(format!("Cannot read plan {}: {e}", file.display()))
+                        })?,
+                    };
                     params["text"] = json!(text);
                 }
                 (None, Some(name)) => {
@@ -122,9 +122,12 @@ pub(super) fn run_plan(state_dir: &Path, action: PlanAction) -> Result<i32> {
                     }
                 }
                 _ => {
+                    if cadence_agent::master::caller_is_master() {
+                        return Err(Error::rejected(cadence_agent::master::NO_STDIN));
+                    }
                     return Err(Error::rejected(
                         "plan propose needs --file <plan.md> or --workflow <name>",
-                    ))
+                    ));
                 }
             }
             client::rpc(state_dir, "plan_propose", params)?
