@@ -50,6 +50,7 @@ mod setup;
 mod skill;
 mod status;
 mod stop;
+mod test_cmd;
 #[cfg(test)]
 mod tests;
 mod thread;
@@ -1185,6 +1186,13 @@ pub(crate) enum Commands {
         /// Re-render every <secs> until interrupted.
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         watch: Option<u64>,
+    },
+    /// Queue a cargo test on the daemon (CAD-129). `submit` returns a
+    /// job id; a content-addressed hit returns the earlier job instead
+    /// of running again. `status`, `log` and `wait` follow that id.
+    Test {
+        #[command(subcommand)]
+        action: test_cmd::TestAction,
     },
     /// Bounded, fair cargo build/test scheduling (CAD-113): the daemon
     /// grants a bounded number of concurrent build and suite slots —
@@ -3482,6 +3490,7 @@ pub(crate) fn run() -> Result<i32> {
             json,
             watch,
         } => status::run(state_dir, group, all, json, watch),
+        Commands::Test { action } => test_cmd::run(&state_dir, &action),
         Commands::BuildSlot { action } => build_slot::run(state_dir, action),
         Commands::Review {
             pr,
