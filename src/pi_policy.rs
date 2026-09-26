@@ -198,9 +198,11 @@ pub fn require_allowed(policy: Option<&PiPolicy>, model: &str) -> Result<()> {
 /// master's read grant) and the extension files `-e` receives.
 #[derive(Debug)]
 pub struct ProviderPackage {
-    /// `<root>/<name>` — the whole package dir, read-only.
+    /// `<root>/<name>` canonicalized — the real package dir, proven to
+    /// sit under the canonical npm root; read-only.
     pub dir: PathBuf,
-    /// The package's `pi.extensions` entries, normalized inside `dir`.
+    /// The package's `pi.extensions` entries — canonical paths proven
+    /// inside `dir`.
     pub entries: Vec<PathBuf>,
 }
 
@@ -283,6 +285,32 @@ pub fn resolve_package(spec: &str, root: &Path) -> Result<ProviderPackage> {
              would load; fix the package or drop the pin"
         )));
     }
+    // The lexical path can hide a symlink escape: `dir` (or an ancestor)
+    // linked outside the npm root resolves `package.json` and entries
+    // through the link while the string path still names the root.
+    // Canonicalize and require containment — defence in depth; today the
+    // root is operator-chosen, so this is reachable only at install
+    // time as the operator (CAD-568).
+    let root_canon = std::fs::canonicalize(root).map_err(|_| {
+        Error::rejected(format!(
+            "pi npm root {} does not resolve — install the pinned package \
+             under it as the operator first (CAD-568)",
+            root.display()
+        ))
+    })?;
+    let dir = std::fs::canonicalize(&dir).map_err(|_| {
+        Error::rejected(format!(
+            "pi provider package '{spec}': package dir {} does not resolve",
+            dir.display()
+        ))
+    })?;
+    if !dir.starts_with(&root_canon) {
+        return Err(Error::rejected(format!(
+            "pi provider package '{spec}': package dir escapes the npm root \
+             {} via a symlink — refusing (CAD-568)",
+            root_canon.display()
+        )));
+    }
     let mut entries = Vec::with_capacity(declared.len());
     for entry in &declared {
         let Some(rel) = entry.as_str() else {
@@ -298,9 +326,11 @@ pub fn resolve_package(spec: &str, root: &Path) -> Result<ProviderPackage> {
     Ok(ProviderPackage { dir, entries })
 }
 
-/// A `pi.extensions` entry resolved inside its package dir: relative
-/// only, `..`/absolute paths refuse, and the file must exist — an `-e`
-/// that points nowhere would otherwise fail as an opaque Pi error.
+/// A `pi.extensions` entry resolved inside its (canonical) package
+/// dir: relative only, `..`/absolute paths refuse, the file must
+/// exist, and its canonical path must stay inside `dir` — a symlinked
+/// entry or intermediate dir cannot escape the pin. The returned path
+/// is the canonical target.
 fn entry_file(dir: &Path, rel: &str) -> Result<PathBuf> {
     let rel_path = Path::new(rel);
     if rel_path.is_absolute() {
@@ -326,7 +356,23 @@ fn entry_file(dir: &Path, rel: &str) -> Result<PathBuf> {
             path.display()
         )));
     }
-    Ok(path)
+    // `is_file` follows links — a symlinked entry (or intermediate dir)
+    // inside the package can point anywhere. Canonicalize and require
+    // the target to stay inside the canonical package dir (CAD-568).
+    let canon = std::fs::canonicalize(&path).map_err(|_| {
+        Error::rejected(format!(
+            "pi.extensions entry '{rel}' does not resolve at {}",
+            path.display()
+        ))
+    })?;
+    if !canon.starts_with(dir) {
+        return Err(Error::rejected(format!(
+            "pi.extensions entry '{rel}' escapes the package dir via a \
+             symlink (resolves to {})",
+            canon.display()
+        )));
+    }
+    Ok(canon)
 }
 
 #[cfg(test)]
@@ -502,6 +548,92 @@ mod tests {
         // Bad specs never reach the filesystem.
         for spec in ["", "pkg", "pkg@", "@1.0", "@/x@1", "../x@1", "a/b@1"] {
             assert!(resolve_package(spec, &root).is_err(), "{spec}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_package_dir_cannot_escape_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("node_modules");
+        std::fs::create_dir_all(&root).unwrap();
+        // A real, valid package — but installed OUTSIDE the pinned npm
+        // root and linked in. Lexically `root/pi-devin` looks installed;
+        // the resolved dir escapes, so the pin must refuse.
+        let outside = tmp.path().join("elsewhere/pi-devin");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(
+            outside.join("package.json"),
+            r#"{"version":"0.1.2","pi":{"extensions":["./e.ts"]}}"#,
+        )
+        .unwrap();
+        std::fs::write(outside.join("e.ts"), "// ext").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("pi-devin")).unwrap();
+        let err = resolve_package("pi-devin@0.1.2", &root)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("escapes"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_entry_cannot_escape_the_package_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("node_modules");
+        // The package is installed at the pin; its declared entry is a
+        // symlink to a file outside the package dir — `is_file` follows
+        // it, so only canonicalization catches the escape.
+        let outside = tmp.path().join("payload.ts");
+        std::fs::write(&outside, "// not the pinned package's file").unwrap();
+        let dir = root.join("evil");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"version":"1.0.0","pi":{"extensions":["./entry.ts"]}}"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("entry.ts")).unwrap();
+        let err = resolve_package("evil@1.0.0", &root)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("escapes"), "{err}");
+        // A symlinked INTERMEDIATE dir is the same escape.
+        let real_ext = tmp.path().join("real-ext");
+        std::fs::create_dir_all(&real_ext).unwrap();
+        std::fs::write(real_ext.join("x.ts"), "// ext").unwrap();
+        let dir2 = root.join("evil2");
+        std::fs::create_dir_all(&dir2).unwrap();
+        std::fs::write(
+            dir2.join("package.json"),
+            r#"{"version":"1.0.0","pi":{"extensions":["./sub/x.ts"]}}"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&real_ext, dir2.join("sub")).unwrap();
+        assert!(resolve_package("evil2@1.0.0", &root).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_internal_symlinked_entry_still_resolves() {
+        // Defence in depth is containment, not a symlink ban: an entry
+        // link whose target stays inside the package dir resolves.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("node_modules");
+        let dir = root.join("linked");
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"version":"1.0.0","pi":{"extensions":["./alias.ts","./real/inner.ts"]}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("real/index.ts"), "// ext").unwrap();
+        std::fs::write(dir.join("real/inner.ts"), "// ext").unwrap();
+        std::os::unix::fs::symlink("real/index.ts", dir.join("alias.ts")).unwrap();
+        let pkg = resolve_package("linked@1.0.0", &root).unwrap();
+        assert_eq!(pkg.entries.len(), 2);
+        for entry in &pkg.entries {
+            let canon = std::fs::canonicalize(&dir).unwrap();
+            assert!(entry.starts_with(&canon), "{entry:?} escaped {canon:?}");
         }
     }
 }

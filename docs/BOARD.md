@@ -105,7 +105,13 @@ pi:
 - `models.default.{master,worker}` fills a start that names no model.
   After launch the adapter asks `get_state` what model is actually
   running; a provider answering with a different one fails the open
-  and the agent fences `attention` with the reason.
+  and the agent fences `attention` with the reason. Write allow
+  entries as `provider/id` to pin the provider: the `get_state` check
+  matches the running model on the **reported id alone** when the
+  allow entry is a bare id, so `"swe-2-high"` passes whichever
+  provider serves it — `devin/swe-2-high`, and equally any future
+  provider that happens to register the same id. `"devin/swe-2-high"`
+  only passes when the provider reports `devin` too.
 - `providers` pins the only Pi extension packages that load. Each
   `name@version` resolves under the **operator's** pi npm dir
   (`$PI_CODING_AGENT_DIR/npm/node_modules`, default `~/.pi/agent`) —
