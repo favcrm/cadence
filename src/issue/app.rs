@@ -1429,9 +1429,12 @@ fn derived_grant_holders(project_key: &str, name: &str, state_dir: &Path) -> Res
 }
 
 /// Withdraw the approval and its derived grants before the folder goes
-/// (CAD-577). A missing store means there is nothing to revoke. If the
-/// holders are still there and the side write fails, removal refuses —
-/// deleting the folder first would leave a grant nothing can name.
+/// (CAD-577). The caller holds the tracker write lock across this read,
+/// the side write, and the folder delete — tracker lock, then sqlite,
+/// the same order as approve. A missing store means there is nothing to
+/// revoke. If the holders are still there and the side write fails,
+/// removal refuses — deleting the folder first would leave a grant
+/// nothing can name.
 fn revoke_derived_on_remove(
     project_key: &str,
     name: &str,
@@ -1474,7 +1477,9 @@ fn revoke_derived_on_remove(
 /// keep their provenance readable. Revokes the approval's derived
 /// grants first (CAD-577): deleting the folder is a tracker write the
 /// daemon does not see, so the grants are withdrawn here, on a side
-/// connection that does not run restart recovery.
+/// connection that does not run restart recovery. The tracker write
+/// lock is taken before that read and held through the folder delete,
+/// so an approve already inside the lock cannot commit a grant afterwards.
 pub fn remove(
     pm: &Pm,
     project_key: &str,
@@ -1493,8 +1498,11 @@ pub fn remove(
             open.join(", ")
         )));
     }
-    revoke_derived_on_remove(project_key, name, state_dir, actor)?;
+    // Before the holder read, and held through the revoke and the
+    // folder delete. Approve takes this lock and then writes sqlite;
+    // reading holders first lets that approve commit into the gap.
     let _lock = pm.lock()?;
+    revoke_derived_on_remove(project_key, name, state_dir, actor)?;
     std::fs::remove_dir_all(&dir)?;
     if record_path.exists() {
         std::fs::remove_file(&record_path)?;

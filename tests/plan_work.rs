@@ -2157,17 +2157,10 @@ fn remove_waits_for_an_approve_already_inside_the_lock() {
     assert!(!f.pm_dir.join("demo/apps/roles").exists());
 
     let src = f.tmp.path().join("app-roles");
-    let (ok, out) = f.cli(&[
-        "app",
-        "install",
-        src.to_str().unwrap(),
-        "--project",
-        "demo",
-    ]);
+    let (ok, out) = f.cli(&["app", "install", src.to_str().unwrap(), "--project", "demo"]);
     assert!(ok, "reinstall after the raced remove: {out}");
-    let err = f
-        .d
-        .operator_rpc(
+    let err =
+        f.d.operator_rpc(
             "plan_propose",
             json!({"project": "demo", "workflow": "roles/go",
                    "inputs": {"title": "x", "publisher": "dev-1"}}),
@@ -2204,17 +2197,10 @@ fn app_remove_then_reinstall_requires_approval_again() {
     );
 
     let src = f.tmp.path().join("app-roles");
-    let (ok, out) = f.cli(&[
-        "app",
-        "install",
-        src.to_str().unwrap(),
-        "--project",
-        "demo",
-    ]);
+    let (ok, out) = f.cli(&["app", "install", src.to_str().unwrap(), "--project", "demo"]);
     assert!(ok, "reinstall: {out}");
-    let err = f
-        .d
-        .operator_rpc(
+    let err =
+        f.d.operator_rpc(
             "plan_propose",
             json!({"project": "demo", "workflow": "roles/go",
                    "inputs": {"title": "x", "publisher": "dev-1"}}),
@@ -2259,20 +2245,16 @@ fn removed_app_sweep_withdraws_the_approval() {
         json!({"project": "demo", "workflow": "roles/go",
                "inputs": {"title": "x", "publisher": "dev-1"}}),
     );
-    assert!(swept.is_err(), "propose of a removed app must fail: {swept:?}");
+    assert!(
+        swept.is_err(),
+        "propose of a removed app must fail: {swept:?}"
+    );
 
     let src = f.tmp.path().join("app-roles");
-    let (ok, out) = f.cli(&[
-        "app",
-        "install",
-        src.to_str().unwrap(),
-        "--project",
-        "demo",
-    ]);
+    let (ok, out) = f.cli(&["app", "install", src.to_str().unwrap(), "--project", "demo"]);
     assert!(ok, "reinstall after the sweep: {out}");
-    let err = f
-        .d
-        .operator_rpc(
+    let err =
+        f.d.operator_rpc(
             "plan_propose",
             json!({"project": "demo", "workflow": "roles/go",
                    "inputs": {"title": "x", "publisher": "dev-1"}}),

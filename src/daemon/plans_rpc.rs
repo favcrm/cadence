@@ -631,7 +631,9 @@ impl Shared {
 
     /// Revoke derived grants whose app folder is gone (CAD-577). A
     /// removal that raced a propose, or a folder deleted by hand, leaves
-    /// `app_grants` rows nothing else would notice.
+    /// `app_grants` rows nothing else would notice. The same write
+    /// records a withdrawn approval: dropping the rows alone leaves a
+    /// reinstall of the same digest already approved.
     fn sweep_removed_app_grants(&self) {
         let Ok(pm_dir) = self.pm_dir() else {
             return;
@@ -646,7 +648,16 @@ impl Shared {
             if crate::issue::app::is_installed(&pm_dir, project, name) {
                 continue;
             }
-            if let Ok(changed) = self.store.app_grants_revoke(&key, "operator") {
+            let payload = json!({
+                "project": project,
+                "name": name,
+                "digest": Value::Null,
+                "revoked": true,
+                "by": "operator",
+                "at": crate::issue::time::iso(crate::issue::time::now_epoch()),
+                "reason": "removed",
+            });
+            if let Ok(changed) = self.store.app_revoke_with_record(payload, &key, "operator") {
                 self.drain_effect_scopes(changed);
             }
         }
