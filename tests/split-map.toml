@@ -675,6 +675,9 @@ tests = [
     "cad575_master_models_gate_and_contract",
     "cad575_master_models_before_start",
     "cad575_master_models_board_gate",
+    "cad574_needs_dismiss_gate_and_suppression",
+    "cad574_needs_board_gate",
+    "cad574_thread_send_refs",
 ]
 helpers = [
     "start_operator_board",
