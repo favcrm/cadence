@@ -2267,6 +2267,186 @@ fn removed_app_sweep_withdraws_the_approval() {
     );
 }
 
+fn roles_install_id(f: &PlanFixture) -> String {
+    let (ok, show) = f.cli(&["app", "show", "roles", "--project", "demo"]);
+    assert!(ok, "{show}");
+    show["record"]["install_id"]
+        .as_str()
+        .unwrap_or("")
+        .to_string()
+}
+
+fn latest_roles_approval(f: &PlanFixture) -> Value {
+    let store = cadence_agent::store::Store::open_side(&f.d.state.join("cadence.sqlite3"))
+        .expect("side open of the fixture store");
+    store
+        .app_approvals()
+        .expect("approval read")
+        .get("demo/roles")
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+fn propose_roles(f: &PlanFixture) -> cadence_agent::Result<Value> {
+    f.d.operator_rpc(
+        "plan_propose",
+        json!({"project": "demo", "workflow": "roles/go",
+               "inputs": {"title": "x", "publisher": "dev-1"}}),
+    )
+}
+
+/// CAD-577 r5: an approval that derived no grants is still an approval.
+/// Remove then reinstall of the same bytes must not inherit it, and a
+/// later set-team must not create a grant from it.
+#[test]
+fn install_id_reinstall_after_empty_approval_is_unapproved() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    app_install_roles(&f);
+    let first = roles_install_id(&f);
+    assert!(!first.is_empty(), "install mints an install id");
+    f.d.operator_rpc("app_approve", json!({"project": "demo", "name": "roles"}))
+        .unwrap();
+    assert!(
+        grant_scopes(&f, "dev-1", "local", "local").is_none(),
+        "no team, so approval derives nothing"
+    );
+
+    let (ok, out) = f.cli(&["app", "remove", "roles", "--project", "demo"]);
+    assert!(ok, "{out}");
+    let src = f.tmp.path().join("app-roles");
+    let (ok, out) = f.cli(&["app", "install", src.to_str().unwrap(), "--project", "demo"]);
+    assert!(ok, "reinstall: {out}");
+    let second = roles_install_id(&f);
+    assert_ne!(first, second, "reinstall mints a new install id");
+
+    let err = propose_roles(&f).unwrap_err();
+    assert_eq!(
+        err.code(),
+        Some("app_unapproved"),
+        "reinstall must not inherit the empty approval: {err}"
+    );
+    f.d.operator_rpc(
+        "app_set_team",
+        json!({"project": "demo", "name": "roles", "team": ["publisher=dev-1"]}),
+    )
+    .unwrap();
+    assert!(
+        grant_scopes(&f, "dev-1", "local", "local").is_none(),
+        "set-team must not grant from the previous install's approval"
+    );
+    let err = propose_roles(&f).unwrap_err();
+    assert_eq!(err.code(), Some("app_unapproved"), "{err}");
+}
+
+/// CAD-577 r5: a hand-deleted folder leaves an approval and no grant
+/// rows. The sweep must withdraw that approval, not only walk
+/// `app_grants`.
+#[test]
+fn install_id_hand_delete_sweep_withdraws_approval() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    app_install_roles(&f);
+    f.d.operator_rpc("app_approve", json!({"project": "demo", "name": "roles"}))
+        .unwrap();
+    assert!(grant_scopes(&f, "dev-1", "local", "local").is_none());
+
+    let apps = f.pm_dir.join("demo/apps");
+    std::fs::remove_dir_all(apps.join("roles")).unwrap();
+    std::fs::remove_file(apps.join("roles.yaml")).unwrap();
+
+    let swept = propose_roles(&f);
+    assert!(swept.is_err(), "propose of a removed app must fail: {swept:?}");
+    let approval = latest_roles_approval(&f);
+    assert_eq!(
+        approval["revoked"], true,
+        "sweep withdraws an approval that derived no grants: {approval}"
+    );
+}
+
+/// CAD-577 r5: an approval recorded before install ids exist (no
+/// `install_id` field) is not an approval of the current install.
+#[test]
+fn install_id_missing_on_approval_is_not_honoured() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    let installed = app_install_roles(&f);
+    let digest = installed["digest"].as_str().unwrap().to_string();
+    let store = cadence_agent::store::Store::open_side(&f.d.state.join("cadence.sqlite3"))
+        .expect("side open");
+    store
+        .record_app_approval(json!({
+            "project": "demo",
+            "name": "roles",
+            "digest": digest,
+            "by": "operator",
+        }))
+        .unwrap();
+
+    let err = propose_roles(&f).unwrap_err();
+    assert_eq!(
+        err.code(),
+        Some("app_unapproved"),
+        "an approval with no install id must not pass the gate: {err}"
+    );
+    f.d.operator_rpc(
+        "app_set_team",
+        json!({"project": "demo", "name": "roles", "team": ["publisher=dev-1"]}),
+    )
+    .unwrap();
+    assert!(
+        grant_scopes(&f, "dev-1", "local", "local").is_none(),
+        "set-team must not grant from an approval that has no install id"
+    );
+}
+
+/// CAD-577 r5: `app update` keeps the install id. A wording-only edit
+/// stays approved; a structural edit re-gates without minting a new id.
+#[test]
+fn install_id_update_keeps_id_and_regates_structure() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    app_install_roles(&f);
+    let id = roles_install_id(&f);
+    assert!(!id.is_empty(), "install mints an install id");
+    f.d.operator_rpc(
+        "app_set_team",
+        json!({"project": "demo", "name": "roles", "team": ["publisher=dev-1"]}),
+    )
+    .unwrap();
+    f.d.operator_rpc("app_approve", json!({"project": "demo", "name": "roles"}))
+        .unwrap();
+    propose_roles(&f).expect("the fresh approval covers this install");
+
+    let src = f.tmp.path().join("app-roles/app.md");
+    let md = std::fs::read_to_string(&src).unwrap();
+    let wording = md.replace("version: 0.1.0\n", "version: 0.1.0\nsummary: A quiet note.\n");
+    assert_ne!(wording, md);
+    std::fs::write(&src, &wording).unwrap();
+    let (ok, out) = f.cli(&["app", "update", "roles", "--project", "demo"]);
+    assert!(ok, "{out}");
+    assert_eq!(out["gate_changed"], false, "summary is wording: {out}");
+    assert_eq!(roles_install_id(&f), id, "update keeps the install id");
+    propose_roles(&f).expect("unchanged digest stays approved for this install");
+
+    let structural = wording.replace("\nbody\n", "\nbody changed\n");
+    std::fs::write(&src, structural).unwrap();
+    let (ok, out) = f.cli(&["app", "update", "roles", "--project", "demo"]);
+    assert!(ok, "{out}");
+    assert_eq!(out["gate_changed"], true, "{out}");
+    assert_eq!(
+        roles_install_id(&f),
+        id,
+        "a structural update keeps the install id"
+    );
+    let err = propose_roles(&f).unwrap_err();
+    assert_eq!(
+        err.code(),
+        Some("app_unapproved"),
+        "a structural change re-gates this install: {err}"
+    );
+}
+
 /// Review 344: a team change drops the agent who left. Approving with
 /// publisher=dev-1 then setting the team to dev-2 must not leave dev-1
 /// holding `local/local publish`.
