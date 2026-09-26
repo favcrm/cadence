@@ -26,9 +26,9 @@ export default function BuildUpdateNotice({ onReload, onDismiss }: {
         }
       }}>
       <button type="button" onClick={() => setOpen((value) => !value)}
-        className="header-update-trigger header-icon text-accent" aria-label="Update available"
+        className="header-update-trigger header-auth-target chip bg-accent/10 text-accent hover:bg-accent/20" aria-label="Update available"
         aria-expanded={open} aria-controls={open ? panelId : undefined} aria-describedby={tooltipId}>
-        <IconUpdate />
+        <span className="sm:hidden"><IconUpdate /></span>
         <span className="hidden sm:inline">Update available</span>
       </button>
       <span id={tooltipId} role="tooltip" className="header-tooltip">Update available</span>
