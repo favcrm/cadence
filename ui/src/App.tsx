@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError, type WriteResp } from "./lib/api";
 import Agents from "./features/agents/Agents";
+import Apps from "./features/apps/Apps";
+import AppDetail from "./features/apps/AppDetail";
 import Board from "./features/projects/Board";
 import Drawer from "./features/projects/Drawer";
 import Epics from "./features/projects/Epics";
@@ -64,6 +66,7 @@ const SCREEN_LABEL: Record<Screen, string> = {
   home: "home",
   overview: "overview",
   projects: "projects",
+  apps: "apps",
   agents: "agents",
   outbox: "outbox",
   setup: "setup",
@@ -250,7 +253,7 @@ export default function App() {
     const onEvent = (e: MessageEvent<string>) => {
       for (const name of invalidatedBy(e.data)) {
         // Families are keyed stores — invalidate the prefix, not one entry.
-        if (name === "issue" || name === "workflows") cache.invalidate(name);
+        if (name === "issue" || name === "workflows" || name === "app") cache.invalidate(name);
         else if (name === "overview") {
           // Hidden overview: skip — it revalidates when Home opens.
           if (overviewOn(screenRef.current)) void resources.overview.invalidate();
@@ -610,6 +613,16 @@ export default function App() {
             contextLoading={projectContextLoading}
             contextError={projectContextErrorProject === project ? projectContextError : null}
             onRetryContext={() => setProjectContextRefresh((value) => value + 1)}
+          />
+        )}
+        {route.screen === "apps" && !route.project && (
+          <Apps project={project} viewer={{ readOnly, operator: meta?.operator === true }} />
+        )}
+        {route.screen === "apps" && route.project && route.name && (
+          <AppDetail
+            project={route.project}
+            name={route.name}
+            viewer={{ readOnly, operator: meta?.operator === true }}
           />
         )}
         {route.screen === "agents" && (

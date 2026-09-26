@@ -1642,6 +1642,241 @@ fn board_app_workflow_list_preview_and_propose() {
     assert_eq!(row["approved"], true, "{row}");
 }
 
+/// CAD-557: the Apps page's reads — `GET /api/apps` answers one row per
+/// installed app per project, from the daemon's real install data:
+/// title, version, the declared slots with their effective bindings, the
+/// bundle's workflows, the recorded source, the digest and the
+/// three-state approval (`approved`/`changed`/`unapproved`/`unknown`).
+/// `GET /api/apps/<project>/<name>` answers the detail: the guide, the
+/// checked workflow summaries, the rubrics' bodies, the install record
+/// and that app's doctor findings.
+#[test]
+fn board_apps_list_and_detail() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    f.d.register("qa-1");
+    app_install_studio(&f);
+    let port = start_board(&f.pm_dir, &f.d.state);
+
+    let (status, body) = board_get(port, "/api/apps");
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let row = v["apps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "studio")
+        .unwrap_or_else(|| panic!("no studio row: {v}"));
+    assert_eq!(row["project"], "demo", "{row}");
+    assert_eq!(row["title"], "Content studio", "{row}");
+    assert_eq!(row["version"], "0.1.0", "{row}");
+    assert_eq!(row["workflows"], json!(["do-check"]), "{row}");
+    assert_eq!(
+        row["connections"],
+        json!([{"slot": "publish", "bound": "local"}]),
+        "{row}"
+    );
+    assert_eq!(row["approved"], false, "{row}");
+    assert_eq!(row["approval"], "unapproved", "{row}");
+    // A path install names its source dir; a git install would carry
+    // its pinned SHA in the same record field.
+    assert_eq!(row["source"]["kind"], "path", "{row}");
+    assert!(
+        row["digest"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("sha256:"),
+        "{row}"
+    );
+
+    // `?project=` scopes the same rows; a bad key is 400, an unknown
+    // project 404, and a bare extra segment is no route.
+    let (status, body) = board_get(port, "/api/apps?project=demo");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["apps"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "{body}"
+    );
+    let (status, _) = board_get(port, "/api/apps?project=nope");
+    assert_eq!(status, 404);
+    let (status, _) = board_get(port, "/api/apps?project=Bad%20Key");
+    assert_eq!(status, 400);
+    let (status, _) = board_get(port, "/api/apps/demo");
+    assert_eq!(status, 404);
+    let (status, _) = board_get(port, "/api/appsx");
+    assert_eq!(status, 404);
+
+    // The detail: guide, app-qualified workflow summaries, rubric
+    // bodies, the install record and this app's doctor row.
+    let (status, body) = board_get(port, "/api/apps/demo/studio");
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        v["guide"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("How to run the studio"),
+        "{v}"
+    );
+    assert_eq!(v["workflows"][0]["name"], "studio/do-check", "{v}");
+    assert_eq!(v["workflows"][0]["ok"], true, "{v}");
+    assert_eq!(v["workflows"][0]["uses"], json!(["publish"]), "{v}");
+    assert_eq!(v["rubrics"][0]["name"], "review", "{v}");
+    assert!(
+        v["rubrics"][0]["body"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("check the work"),
+        "{v}"
+    );
+    assert_eq!(v["record"]["app"], "studio", "{v}");
+    assert_eq!(v["record"]["source"]["kind"], "path", "{v}");
+    let doctor = &v["doctor"];
+    assert_eq!(doctor["app"], "studio", "{doctor}");
+    assert_eq!(doctor["unbound"], json!([]), "{doctor}");
+    // `publish` fell back to the `local` default — a connection the
+    // daemon knows, so it lands in slots_ok.
+    assert_eq!(
+        doctor["slots_ok"],
+        json!([{"slot": "publish", "connection": "local"}]),
+        "{doctor}"
+    );
+
+    // An app that is not installed is a 404 — not an error-shaped row;
+    // bad names and unknown projects are refused by grammar and key.
+    let (status, _) = board_get(port, "/api/apps/demo/nope");
+    assert_eq!(status, 404);
+    let (status, _) = board_get(port, "/api/apps/demo/Bad%20Name");
+    assert_eq!(status, 400);
+    let (status, _) = board_get(port, "/api/apps/nope/studio");
+    assert_eq!(status, 404);
+    let (status, _) = board_get(port, "/api/apps/demo/studio/extra");
+    assert_eq!(status, 404);
+
+    // An explicit unbind flags the slot — and the doctor row reports it.
+    let (ok, out) = f.cli(&["app", "set", "studio", "publish=", "--project", "demo"]);
+    assert!(ok, "{out}");
+    let (status, body) = board_get(port, "/api/apps/demo/studio");
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        v["connections"],
+        json!([{"slot": "publish", "bound": null}]),
+        "{v}"
+    );
+    assert_eq!(v["doctor"]["unbound"], json!(["publish"]), "{v}");
+}
+
+/// CAD-557: `POST /api/apps/<project>/<name>/approve` relays the
+/// daemon's `app_approve` — operator-only like the board's other
+/// writes, so an unproven caller, an agent-attributed caller and a
+/// forged attribution field are all refused before the daemon sees
+/// them. Once admitted it approves the app's CURRENT digest: the rows
+/// then read `approved`, and a later hand edit flips them to `changed`
+/// until the operator approves again.
+#[test]
+fn board_app_approve_is_the_operators() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    f.d.register("qa-1");
+    app_install_studio(&f);
+    let port = start_board(&f.pm_dir, &f.d.state);
+    let approve = "/api/apps/demo/studio/approve";
+
+    // No session — refused before the handler runs.
+    let (status, reply) = board_http(port, &cad328_post(port, approve, THREAD_GUARDS, "{}"));
+    assert_eq!(status, 403, "{reply}");
+    assert!(reply.contains("operator_session_required"), "{reply}");
+
+    // An agent-attributed caller is refused — an approval is never a
+    // pane's decision, even with the write guards in place.
+    let mut wk = ManagedWorker::start(&f.d, "wk");
+    let request = cad328_post(port, approve, THREAD_GUARDS, "{}");
+    let r = wk.exec(&[
+        "bash",
+        "-c",
+        DEV_TCP_CLIENT,
+        "_",
+        &port.to_string(),
+        &request,
+    ]);
+    let out = r["out"].as_str().unwrap();
+    assert!(
+        out.contains(" 403 ") && out.contains("operator_only"),
+        "{out}"
+    );
+
+    // Signed in: a forged attribution field dies in the body schema —
+    // the daemon never sees it. (The member-role caller is refused in
+    // board.rs's public-session test.)
+    let op = sign_in(&f.d.state, port);
+    let guards = op_guards(&op);
+    for body in [
+        r#"{"actor":"wk"}"#,
+        r#"{"by":"operator"}"#,
+        r#"{"name":"studio","project":"demo","peer_pid":1}"#,
+    ] {
+        let (status, reply) = board_http(port, &cad328_post(port, approve, &guards, body));
+        assert_eq!(status, 400, "{body}: {reply}");
+    }
+    // And a name that is not an installed app refuses, never approves.
+    let (status, reply) = board_http(
+        port,
+        &cad328_post(port, "/api/apps/demo/nope/approve", &guards, "{}"),
+    );
+    assert_eq!(status, 400, "{reply}");
+    assert!(
+        !cadence_agent::issue::app::fetch_approvals(&f.d.state)
+            .unwrap_or_default()
+            .contains_key("demo/studio"),
+        "refusals approve nothing"
+    );
+
+    // The operator's POST approves — the daemon's own payload returns.
+    let (status, reply) = board_http(port, &cad328_post(port, approve, &guards, "{}"));
+    assert_eq!(status, 200, "{reply}");
+    let v: Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(v["project"], "demo", "{v}");
+    assert_eq!(v["name"], "studio", "{v}");
+    assert_eq!(v["by"], "operator", "{v}");
+    assert!(
+        v["digest"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("sha256:"),
+        "{v}"
+    );
+    let approvals = cadence_agent::issue::app::fetch_approvals(&f.d.state).unwrap();
+    assert_eq!(approvals["demo/studio"]["name"], "studio", "{approvals:?}");
+    assert_eq!(approvals["demo/studio"]["by"], "operator", "{approvals:?}");
+
+    // The rows then read approved — the gate a propose checks flips too.
+    let (status, body) = board_get(port, "/api/apps/demo/studio");
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["approved"], true, "{v}");
+    assert_eq!(v["approval"], "approved", "{v}");
+
+    // A hand edit moves the digest — the rows then read `changed`,
+    // never silently still-approved.
+    let guide = f
+        .pm_dir
+        .join("demo")
+        .join("apps")
+        .join("studio")
+        .join("app.md");
+    std::fs::write(&guide, format!("{APP_MD}\nEdited.\n")).unwrap();
+    let (status, body) = board_get(port, "/api/apps/demo/studio");
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["approved"], false, "{v}");
+    assert_eq!(v["approval"], "changed", "{v}");
+}
+
 /// The session `op` as presented to the board on `port` instead: that
 /// board's own Host and Origin, its cookie name, the same token (a
 /// session is the daemon's, not one board's).

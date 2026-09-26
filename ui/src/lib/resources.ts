@@ -12,6 +12,8 @@ export function threadReader(alias: string): PageReader {
 }
 import type {
   AgentsPayload,
+  AppDetail,
+  AppRow,
   IssueCard,
   IssueDetail,
   MilestoneRow,
@@ -73,6 +75,23 @@ export const resources = {
     (project) => api.workflows(project).then((r) => r.workflows),
     { isEmpty: (rows) => rows.length === 0 },
   ),
+  /**
+   * `GET /api/apps` — every installed app across the projects (CAD-557).
+   * The list is one store; a scoped Apps screen filters client-side so
+   * changing the project scope does not refetch.
+   */
+  apps: cache.resource<AppRow[]>("apps", () => api.apps().then((r) => r.apps), {
+    isEmpty: (rows) => rows.length === 0,
+  }),
+  /**
+   * `GET /api/apps/<project>/<name>` — one app's detail, keyed
+   * `<project>/<name>` (app names are tag-shaped, so `/` never splits
+   * inside one).
+   */
+  app: cache.family<string, AppDetail>("app", (key) => {
+    const [project, name] = key.split("/");
+    return api.app(project, name);
+  }),
   /**
    * `GET /api/outbox` — the `local` platform's published items (CAD-546).
    * Operator-only: on an unsigned board the fetch fails and the screen

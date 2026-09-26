@@ -13978,4 +13978,23 @@ fn a_member_session_never_decides() {
     );
     assert_eq!(code, 403, "{body}");
     assert!(body.contains("member_role"), "{body}");
+
+    // CAD-557: the app-approval route is the owner's decision the same
+    // way — a member session is refused before the handler runs.
+    let (code, _, body) = http_write(
+        port,
+        "POST",
+        "/api/apps/cadence/studio/approve",
+        &host,
+        &[
+            "Content-Type: application/json",
+            "X-Cadence-Board: 1",
+            "Sec-Fetch-Site: same-origin",
+            &format!("Origin: http://{host}"),
+            &cookie,
+        ],
+        b"{}",
+    );
+    assert_eq!(code, 403, "{body}");
+    assert!(body.contains("member_role"), "{body}");
 }

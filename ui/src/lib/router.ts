@@ -12,6 +12,7 @@ import { readAppUrlState, type AppTab, type ProjectView } from "./urlState";
  *   /projects/:slug/milestones its milestones: progress, worst health
  *   /projects/:slug/context    its context
  *   /projects/:slug/workflows  its stored workflows and new runs (CAD-496)
+ *   /apps[/<project>/<app>]    installed apps, optionally one app's detail (CAD-557)
  *   /agents[/:alias]           agents, optionally one agent's drawer
  *   /setup                     first-run setup
  *   /settings[/memory]         model defaults, memory
@@ -31,6 +32,7 @@ export type Route =
   | { screen: "home" }
   | { screen: "overview" }
   | { screen: "projects"; slug: string | null; section: ProjectSection }
+  | { screen: "apps"; project: string | null; name: string | null }
   | { screen: "agents"; alias: string | null }
   | { screen: "outbox" }
   | { screen: "setup" }
@@ -44,6 +46,7 @@ export type Screen = Route["screen"];
 export const NAV: { screen: Screen; label: string; route: Route }[] = [
   { screen: "home", label: "Home", route: { screen: "home" } },
   { screen: "projects", label: "Projects", route: { screen: "projects", slug: null, section: "issues" } },
+  { screen: "apps", label: "Apps", route: { screen: "apps", project: null, name: null } },
   { screen: "agents", label: "Agents", route: { screen: "agents", alias: null } },
   { screen: "outbox", label: "Outbox", route: { screen: "outbox" } },
   { screen: "settings", label: "Settings", route: { screen: "settings", section: "models" } },
@@ -81,6 +84,12 @@ export function matchRoute(pathname: string): Route {
         return { screen: "projects", slug, section: b };
       }
     }
+    if (head === "apps") {
+      if (!a) return { screen: "apps", project: null, name: null };
+      const project = segment(a);
+      const name = b ? segment(b) : null;
+      if (project && name) return { screen: "apps", project, name };
+    }
     if (head === "agents" && !b) {
       if (!a) return { screen: "agents", alias: null };
       const alias = segment(a);
@@ -108,6 +117,11 @@ export function routePath(route: Route): string {
       const base = `/projects/${encodeURIComponent(route.slug)}`;
       return route.section === "issues" ? base : `${base}/${route.section}`;
     }
+    case "apps":
+      if (!route.project) return "/apps";
+      return route.name
+        ? `/apps/${encodeURIComponent(route.project)}/${encodeURIComponent(route.name)}`
+        : "/apps";
     case "agents":
       return route.alias ? `/agents/${encodeURIComponent(route.alias)}` : "/agents";
     case "setup":
@@ -135,7 +149,13 @@ export function readLocation(pathname: string, search: string, storedView?: Proj
   const onProjects = route.screen === "projects";
   return {
     route,
-    project: onProjects ? (route.slug ?? "all") : (q.get("project") ?? "all"),
+    // On an app's detail route the path's project is the scope — the
+    // sidebar highlights it like the slug does on Projects.
+    project: onProjects
+      ? (route.slug ?? "all")
+      : route.screen === "apps" && route.project
+        ? route.project
+        : (q.get("project") ?? "all"),
     view: parseView(q.get("view")) ?? storedView ?? "list",
     openId: q.get("issue"),
     filters: onProjects ? readFilters(q) : NO_FILTERS,
@@ -156,7 +176,9 @@ function scopedRoute(route: Route, project: string): Route {
 /** Path plus query for a location, keeping query parameters the app does not own. */
 export function locationHref(loc: AppLocation, search = ""): string {
   const q = new URLSearchParams(search);
-  for (const key of ["tab", "view", "project", "issue"]) q.delete(key);
+  // `run` is owned by the Workflows section — it opens one row's form
+  // there and never follows a navigation elsewhere.
+  for (const key of ["tab", "view", "project", "issue", "run"]) q.delete(key);
   writeFilters(q, NO_FILTERS);
   const route = scopedRoute(loc.route, loc.project);
   if (route.screen === "projects") {
@@ -164,7 +186,10 @@ export function locationHref(loc: AppLocation, search = ""): string {
       q.set("view", loc.view);
       writeFilters(q, loc.filters);
     }
-  } else if (loc.project !== "all") {
+  } else if (
+    loc.project !== "all" &&
+    !(route.screen === "apps" && route.project)
+  ) {
     q.set("project", loc.project);
   }
   if (loc.openId) q.set("issue", loc.openId);

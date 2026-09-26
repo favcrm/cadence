@@ -130,6 +130,10 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
         "/api/projects/*/workflows/*/*/propose",
         RouteClass::OperatorOnly,
     ),
+    // CAD-557: the board relays `app_approve` over its own daemon
+    // connection, so the daemon attributes the approval to whoever that
+    // connection proves — operator-only, like `plan_approve`.
+    route("POST", "/api/apps/*/*/approve", RouteClass::OperatorOnly),
     route("POST", "/api/memories/*/*/accept", RouteClass::Refused),
     route("POST", "/api/memories/*/*/reject", RouteClass::Refused),
     route("POST", "/api/session", RouteClass::Session),
@@ -1231,6 +1235,11 @@ mod tests {
         assert_eq!(route_class("POST", "/api/launch"), RouteClass::OperatorOnly);
         assert_eq!(
             route_class("POST", "/api/epics/E-1/stage"),
+            RouteClass::OperatorOnly
+        );
+        // An app approval is the operator's, like the plan's.
+        assert_eq!(
+            route_class("POST", "/api/apps/demo/studio/approve"),
             RouteClass::OperatorOnly
         );
         assert_eq!(

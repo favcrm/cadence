@@ -26,6 +26,8 @@ const paths: [string, Route][] = [
   ["/projects/cadence/epics", { screen: "projects", slug: "cadence", section: "epics" }],
   ["/projects/cadence/milestones", { screen: "projects", slug: "cadence", section: "milestones" }],
   ["/projects/cadence/workflows", { screen: "projects", slug: "cadence", section: "workflows" }],
+  ["/apps", { screen: "apps", project: null, name: null }],
+  ["/apps/cadence/studio", { screen: "apps", project: "cadence", name: "studio" }],
   ["/agents", { screen: "agents", alias: null }],
   ["/agents/cc-1", { screen: "agents", alias: "cc-1" }],
   ["/setup", { screen: "setup" }],
@@ -43,12 +45,12 @@ equal(matchRoute("/projects/cadence/"), matchRoute("/projects/cadence"), "traili
 equal(matchRoute("/agents/a%20b"), { screen: "agents", alias: "a b" }, "decoded alias");
 equal(routePath({ screen: "agents", alias: "a b" }), "/agents/a%20b", "encoded alias");
 equal(matchRoute("/index.html"), { screen: "home" }, "index.html is home");
-for (const dead of ["/overview/x", "/nope", "/projects/x/y", "/agents/a/b", "/settings/nope", "/setup/x", "/login/x", "/projects/%E0"]) {
+for (const dead of ["/overview/x", "/nope", "/projects/x/y", "/agents/a/b", "/apps/p", "/apps/p/n/x", "/settings/nope", "/setup/x", "/login/x", "/projects/%E0"]) {
   equal(matchRoute(dead).screen, "notFound", `not found ${dead}`);
 }
 
 // Main nav: MVP screens only.
-equal(NAV.map((n) => n.label), ["Home", "Projects", "Agents", "Outbox", "Settings"], "nav");
+equal(NAV.map((n) => n.label), ["Home", "Projects", "Apps", "Agents", "Outbox", "Settings"], "nav");
 
 // Reading a location: the slug is the scope on Projects, ?project= elsewhere.
 {
@@ -62,6 +64,17 @@ equal(NAV.map((n) => n.label), ["Home", "Projects", "Agents", "Outbox", "Setting
   equal(agents.filters, NO_FILTERS, "filters only on projects");
   equal(readLocation("/projects", "", "kanban").view, "kanban", "stored view");
   equal(readLocation("/", "").project, "all", "no scope");
+  // The app detail's project is the scope, like a project slug.
+  equal(readLocation("/apps/cadence/studio", "").project, "cadence", "app detail scope");
+  equal(readLocation("/apps", "?project=cadence").project, "cadence", "apps query scope");
+}
+
+// An app detail href does not repeat its path's project in the query.
+{
+  const loc = readLocation("/apps/cadence/studio", "");
+  equal(locationHref(loc), "/apps/cadence/studio", "app detail href");
+  const list = readLocation("/apps", "?project=cadence");
+  equal(locationHref(list), "/apps?project=cadence", "apps href keeps scope");
 }
 
 // Printing a location keeps unknown params and drops stale app ones.
