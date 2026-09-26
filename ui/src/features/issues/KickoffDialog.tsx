@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { api, ApiError, type WriteResp } from "../../lib/api";
+import Button from "../../ui/Button";
 import Link from "../../ui/Link";
+import Select from "../../ui/Select";
 import {
   briefPreview,
   EFFORTS,
@@ -19,11 +21,6 @@ interface Props {
   onDone: (text: string) => void;
   planHref: string;
 }
-
-const btn =
-  "h-8 px-3 inline-flex items-center rounded border border-ink-600 text-label text-ink-200 hover:border-accent/60 hover:text-accent";
-const btnAcc =
-  "h-8 px-3 inline-flex items-center rounded bg-accent text-on-accent text-label font-medium hover:opacity-90 disabled:opacity-40";
 
 export default function KickoffDialog({ id, title, body, groups, onClose, onWrite, onDone, planHref }: Props) {
   const [step, setStep] = useState<"edit" | "confirm">("edit");
@@ -127,36 +124,40 @@ export default function KickoffDialog({ id, title, body, groups, onClose, onWrit
               </p>
               <div className="grid gap-1.5">
                 <span className="slabel">Provider</span>
-                <div className="flex border border-edge rounded overflow-hidden" role="group" aria-label="Provider">
+                <div className="flex gap-1" role="group" aria-label="Provider">
                   {KICKOFF_CHOICES.map((c) => (
-                    <button
+                    <Button
                       key={c.id}
-                      type="button"
-                      aria-pressed={c.id === provider}
-                      className={`flex-1 min-h-8 px-2 text-label ${c.id === provider ? "bg-accent/15 text-accent" : "text-ink-400 hover:text-ink-100"}`}
+                      className="flex-1"
+                      variant={c.id === provider ? "primary" : "secondary"}
+                      aria-label={c.label}
                       onClick={() => pickProvider(c)}
                     >
                       {c.label}
-                    </button>
+                    </Button>
                   ))}
                 </div>
               </div>
               <div className="grid sm:grid-cols-2 gap-2.5">
                 <label className="grid gap-1.5">
                   <span className="slabel">Model</span>
-                  <select className="field w-full" value={model} onChange={(e) => setModel(e.target.value)} aria-label="Model">
-                    {models.map((m) => (
-                      <option key={m.id} value={m.id}>{m.id}</option>
-                    ))}
-                  </select>
+                  <Select
+                    full
+                    value={model}
+                    aria-label="Model"
+                    options={models.map((m) => ({ value: m.id, label: m.id, badge: m.cost }))}
+                    onChange={setModel}
+                  />
                 </label>
                 <label className="grid gap-1.5">
                   <span className="slabel">Effort</span>
-                  <select className="field w-full" value={effort} onChange={(e) => setEffort(e.target.value)} aria-label="Effort">
-                    {EFFORTS.map((e) => (
-                      <option key={e}>{e}</option>
-                    ))}
-                  </select>
+                  <Select
+                    full
+                    value={effort}
+                    aria-label="Effort"
+                    options={(EFFORTS.includes(effort) ? EFFORTS : [effort, ...EFFORTS]).map((e) => ({ value: e, label: e }))}
+                    onChange={setEffort}
+                  />
                 </label>
               </div>
               <div className="flex items-center justify-between gap-2">
@@ -212,15 +213,15 @@ export default function KickoffDialog({ id, title, body, groups, onClose, onWrit
         <footer className="flex justify-end gap-2 px-4 py-3 border-t border-ink-700">
           {step === "edit" ? (
             <>
-              <button type="button" className={btn} onClick={onClose}>Cancel</button>
-              <button type="button" className={btnAcc} disabled={!group.trim()} onClick={() => setStep("confirm")}>Continue</button>
+              <Button onClick={onClose}>Cancel</Button>
+              <Button variant="primary" disabled={!group.trim()} onClick={() => setStep("confirm")}>Continue</Button>
             </>
           ) : (
             <>
-              <button type="button" className={btn} onClick={() => setStep("edit")}>Back</button>
-              <button type="button" className={btnAcc} disabled={busy || !group.trim()} onClick={send}>
-                {busy ? "Kicking off…" : "Kick off"}
-              </button>
+              <Button onClick={() => setStep("edit")}>Back</Button>
+              <Button variant="primary" loading={busy} disabled={!group.trim()} onClick={send}>
+                Kick off
+              </Button>
             </>
           )}
         </footer>

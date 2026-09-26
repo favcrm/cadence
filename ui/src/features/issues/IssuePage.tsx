@@ -1,11 +1,13 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api, type WriteResp } from "../../lib/api";
 import { fmtBytes, fmtTime } from "../../lib/fmt";
 import { resources } from "../../lib/resources";
 import { useQuery } from "../../lib/useResource";
 import type { AgentsPayload, IssueCard, IssueDetail, IssueHistoryEntry } from "../../lib/types";
+import Button from "../../ui/Button";
 import Md from "../../ui/Md";
 import Link from "../../ui/Link";
+import Select from "../../ui/Select";
 import { noDragReason } from "../projects/Card";
 import ConversationSlot from "./Conversation";
 import KickoffDialog from "./KickoffDialog";
@@ -44,11 +46,6 @@ const STATUS_CHIP: Record<string, string> = {
   done: "bg-ok/15 text-ok",
   dropped: "bg-ink-800 text-ink-500",
 };
-
-const btn =
-  "h-8 px-3 inline-flex items-center rounded border border-ink-600 text-label text-ink-200 hover:border-accent/60 hover:text-accent disabled:opacity-40 disabled:cursor-not-allowed";
-const btnAcc =
-  "h-8 px-3 inline-flex items-center rounded bg-accent text-on-accent text-label font-medium hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed";
 
 const TONE: Record<string, string> = {
   done: "bg-ok",
@@ -183,15 +180,15 @@ function PageBody({
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-2 ml-auto">
-          <button type="button" className={blocked ? btn : btnAcc} disabled={!!blocked} title={blocked ?? undefined} onClick={() => setKickoff(true)}>
+          <Button variant={blocked ? "secondary" : "primary"} disabled={!!blocked} title={blocked ?? undefined} onClick={() => setKickoff(true)}>
             Kick off
-          </button>
+          </Button>
           {askWhy ? (
-            <button type="button" className={btn} disabled title={askWhy}>Ask agent</button>
+            <Button disabled title={askWhy}>Ask agent</Button>
           ) : (
-            <Link className={btn} href={tabHref("conversation")}>Ask agent</Link>
+            <Button href={tabHref("conversation")}>Ask agent</Button>
           )}
-          <button type="button" className={btn} disabled title={approveWhy}>Approve</button>
+          <Button disabled title={approveWhy}>Approve</Button>
         </div>
       </header>
 
@@ -349,9 +346,9 @@ function Activity({
         <div className="grid gap-1.5">
           <div className="flex items-baseline gap-2">
             <span className="slabel">Comment</span>
-            <button type="button" className="lnk num text-micro" onClick={() => setPreview((v) => !v)}>
+            <Button variant="ghost" size="sm" onClick={() => setPreview((v) => !v)}>
               {preview ? "write" : "preview"}
-            </button>
+            </Button>
           </div>
           {preview ? (
             <div className="card p-3 text-secondary text-ink-300 min-h-16">
@@ -366,7 +363,7 @@ function Activity({
               placeholder="markdown — raw html stays inert"
             />
           )}
-          <button type="button" className={`${btn} justify-self-start`} disabled={!comment.trim()} onClick={send}>Comment</button>
+          <Button disabled={!comment.trim()} onClick={send}>Comment</Button>
         </div>
       )}
     </section>
@@ -411,7 +408,7 @@ function PrPanel({
             }}
           >
             <input className="field flex-1" value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://…/pull/1" aria-label="pull request url" />
-            <button type="submit" className={btn} disabled={!url.trim()}>Add PR</button>
+            <Button type="submit" disabled={!url.trim()}>Add PR</Button>
           </form>
         )}
       </div>
@@ -450,6 +447,37 @@ function PrPanel({
         </p>
       </div>
     </div>
+  );
+}
+
+function Attach({
+  id,
+  onWrite,
+  onError,
+}: {
+  id: string;
+  onWrite: Props["onWrite"];
+  onError: Props["onError"];
+}) {
+  const input = useRef<HTMLInputElement>(null);
+  return (
+    <>
+      <Button onClick={() => input.current?.click()}>Attach</Button>
+      <input
+        ref={input}
+        type="file"
+        multiple
+        className="hidden"
+        onChange={(e) => {
+          const list = e.target.files;
+          if (!list) return;
+          for (const f of Array.from(list)) {
+            api.attach(id, f.name, f).then((r) => onWrite(r, `${id} attach ${f.name}`)).catch((err) => onError(err, `attach ${f.name}`));
+          }
+          e.target.value = "";
+        }}
+      />
+    </>
   );
 }
 
@@ -508,24 +536,7 @@ function Evidence({
           </ul>
         </div>
       )}
-      {!readOnly && (
-        <label className={`${btn} justify-self-start cursor-pointer`}>
-          Attach
-          <input
-            type="file"
-            multiple
-            className="hidden"
-            onChange={(e) => {
-              const list = e.target.files;
-              if (!list) return;
-              for (const f of Array.from(list)) {
-                api.attach(id, f.name, f).then((r) => onWrite(r, `${id} attach ${f.name}`)).catch((err) => onError(err, `attach ${f.name}`));
-              }
-              e.target.value = "";
-            }}
-          />
-        </label>
-      )}
+      {!readOnly && <Attach id={id} onWrite={onWrite} onError={onError} />}
     </section>
   );
 }
@@ -569,30 +580,32 @@ function Fields({
       <div className="slabel">Fields</div>
       <label className="grid gap-1.5">
         <span className="slabel">Status</span>
-        <select
-          className="field w-full"
+        <Select
+          full
           value={detail.status}
           disabled={readOnly || !!locked}
           title={locked ?? undefined}
           aria-label="Status"
-          onChange={(e) => onPatch({ status: e.target.value }, `${detail.id} status`)}
-        >
-          {STATUSES.includes(detail.status) ? null : <option value={detail.status}>{detail.status}</option>}
-          {STATUSES.map((s) => <option key={s}>{s}</option>)}
-        </select>
+          options={[
+            ...(STATUSES.includes(detail.status) ? [] : [{ value: detail.status, label: detail.status }]),
+            ...STATUSES.map((s) => ({ value: s, label: s })),
+          ]}
+          onChange={(status) => onPatch({ status }, `${detail.id} status`)}
+        />
       </label>
       <label className="grid gap-1.5">
         <span className="slabel">Priority</span>
-        <select
-          className="field w-full"
+        <Select
+          full
           value={detail.priority}
           disabled={readOnly}
           aria-label="Priority"
-          onChange={(e) => onPatch({ priority: e.target.value }, `${detail.id} priority`)}
-        >
-          {PRIORITIES.includes(detail.priority) ? null : <option>{detail.priority}</option>}
-          {PRIORITIES.map((p) => <option key={p}>{p}</option>)}
-        </select>
+          options={[
+            ...(PRIORITIES.includes(detail.priority) ? [] : [{ value: detail.priority, label: detail.priority }]),
+            ...PRIORITIES.map((p) => ({ value: p, label: p })),
+          ]}
+          onChange={(priority) => onPatch({ priority }, `${detail.id} priority`)}
+        />
       </label>
       <label className="grid gap-1.5">
         <span className="slabel">Owner</span>
@@ -609,11 +622,20 @@ function Fields({
       </label>
       <label className="grid gap-1.5">
         <span className="slabel">Epic</span>
-        <select className="field w-full" value={detail.parent ?? ""} disabled={readOnly} aria-label="Epic" onChange={(e) => setEpic(e.target.value)}>
-          <option value="">None</option>
-          {detail.parent && !epics.some((e) => e.id === detail.parent) && <option value={detail.parent}>{detail.parent}</option>}
-          {epics.map((e) => <option key={e.id} value={e.id}>{e.id} · {e.title}</option>)}
-        </select>
+        <Select
+          full
+          value={detail.parent ?? ""}
+          disabled={readOnly}
+          aria-label="Epic"
+          options={[
+            { value: "", label: "None" },
+            ...(detail.parent && !epics.some((e) => e.id === detail.parent)
+              ? [{ value: detail.parent, label: detail.parent }]
+              : []),
+            ...epics.map((e) => ({ value: e.id, label: `${e.id} · ${e.title}` })),
+          ]}
+          onChange={setEpic}
+        />
       </label>
     </section>
   );
@@ -688,11 +710,14 @@ function Links({
               .catch((err) => onError(err, "link"));
           }}
         >
-          <select className="field !h-8 text-label" value={kind} onChange={(e) => setKind(e.target.value)} aria-label="link type">
-            {LINK_KINDS.map((k) => <option key={k}>{k}</option>)}
-          </select>
+          <Select
+            value={kind}
+            aria-label="link type"
+            options={LINK_KINDS.map((k) => ({ value: k, label: k }))}
+            onChange={setKind}
+          />
           <input className="field !h-8 flex-1 min-w-0 num text-label" value={target} onChange={(e) => setTarget(e.target.value)} placeholder="CAD-16" aria-label="link target" />
-          <button type="submit" className={btn} disabled={!target.trim()}>Link</button>
+          <Button type="submit" disabled={!target.trim()}>Link</Button>
         </form>
       )}
     </section>
