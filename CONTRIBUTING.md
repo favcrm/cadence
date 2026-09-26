@@ -37,9 +37,10 @@ python3 -m unittest discover -s scripts -p 'test_check_doc_links.py'
 rtk proxy cargo fmt --all -- --check
 ```
 
-For UI changes, run `pnpm -C ui typecheck`, `pnpm -C ui test` and
-`pnpm -C ui build`. `test` covers the compiled frontend test directory;
-`test:url-state` is a compatibility alias, not a narrower suite.
+For UI changes, run `pnpm -C ui typecheck`, `pnpm -C ui test:url-state` and
+`pnpm -C ui build`. Despite its name, `test:url-state` covers the compiled
+frontend test directory. Use `pnpm -C ui test` when that alias is available in
+the checked-out package scripts.
 
 Select the affected Rust test binary and a meaningful filter. For example,
 after admission and isolation are configured:
