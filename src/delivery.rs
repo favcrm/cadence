@@ -124,6 +124,12 @@ pub struct Observed {
     pub deletions: u64,
     pub files: u64,
     pub at: i64,
+    /// When the GitHub read began (epoch secs) — set by the observing
+    /// process before `gh pr view`. An observation applied later whose
+    /// `read_at` predates the record's last head change is stale: the
+    /// "moved" head it shows is the one that change already recorded.
+    #[serde(default)]
+    pub read_at: i64,
 }
 
 /// CAD-449: what a merge did to the ticket's tracker status. Written
@@ -175,6 +181,12 @@ pub struct Record {
     /// The head under review, or last reported.
     #[serde(default)]
     pub head: Option<String>,
+    /// When `head` was last set (epoch secs) — by the worker's done
+    /// report or a confirmed post-review move. An observation whose
+    /// `read_at` is earlier saw the head that change recorded, not a
+    /// newer one (CAD-564).
+    #[serde(default)]
+    pub head_at: i64,
     #[serde(default)]
     pub reviewer: Option<String>,
     /// Review kickoffs sent.
@@ -219,6 +231,7 @@ impl Record {
             dispatched_at: now,
             pr: None,
             head: None,
+            head_at: 0,
             reviewer: None,
             rounds: 0,
             revisions: 0,
@@ -567,6 +580,10 @@ pub fn sync_pr(state_dir: &Path, issue: &str, url: &str, gh_bin: &str) -> Value 
 
 fn sync_one(state_dir: &Path, issue: &str, url: &str, gh_bin: &str) -> Result<Value> {
     let (slug, number) = crate::issue::task_report::parse_pr_url(url)?;
+    // CAD-564: the read starts now — whatever this call returns was
+    // true at `read_at`, and a record change applied after it (a done
+    // report's new head) is newer than anything the observation shows.
+    let read_at = crate::issue::time::now_epoch();
     let view = gh(
         gh_bin,
         &[
@@ -594,6 +611,7 @@ fn sync_one(state_dir: &Path, issue: &str, url: &str, gh_bin: &str) -> Result<Va
         "additions": pr["additions"].as_u64().unwrap_or(0),
         "deletions": pr["deletions"].as_u64().unwrap_or(0),
         "files": pr["changedFiles"].as_u64().unwrap_or(0),
+        "read_at": read_at,
     });
     let mut answer = crate::client::rpc(state_dir, "delivery_observe", observed)?;
     if answer["disable_auto"] == true {

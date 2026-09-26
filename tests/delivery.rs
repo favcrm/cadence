@@ -3414,3 +3414,108 @@ fn master_wake_waits_queued_while_the_master_is_stopped() {
     assert_eq!(again.len(), 1, "{again:#?}");
     assert_eq!(again[0]["state"], "queued", "{:#}", again[0]);
 }
+
+/// CAD-564: a `gh pr view` that started before the worker's push (its
+/// read_at stamps the read's start) can land after the done report and
+/// after the review passed — it shows the head the done report set, so
+/// it is not a post-review move and must not rewind the PASS, comment
+/// or exclude the reviewer. A read stamped after the head change is a
+/// genuine later move and still rewinds.
+#[test]
+fn delivery_observe_stale_read_never_rewinds_a_passed_review() {
+    let mut lf = LoopFixture::dispatched();
+    let (a, b) = ("a".repeat(40), "b".repeat(40));
+    let epoch = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    };
+
+    // Round 1: done at `a` → PASS by r1.
+    lf.done(&a);
+    let rec = lf.wait_rec("reviewing", |r| r["state"] == "reviewing" && r["head"] == a);
+    assert_eq!(rec["reviewer"], "r1", "{rec}");
+    let (ok, out) = lf.verdict_as("r1", "pass", &a);
+    assert!(ok, "{out}");
+    assert_eq!(out["delivery"]["state"], "passed", "{out}");
+
+    // The GitHub read began before the fix push and applied after the
+    // done report set the head to `b`: it still shows `a`. Not a move.
+    let read_at = epoch() - 1;
+    assert!(read_at > 0);
+    lf.done(&b);
+    lf.wait_rec("round 2", |r| r["state"] == "reviewing" && r["head"] == b);
+    let (ok, out) = lf.verdict_as("r1", "pass", &b);
+    assert!(ok, "{out}");
+    assert_eq!(lf.rec()["state"], "passed", "{}", lf.rec());
+    let before = lf.snapshot();
+    let obs = json!({
+        "issue": "D-2", "head": a, "pr_state": "OPEN",
+        "ci_green": true, "read_at": read_at,
+    });
+    let out = lf.f.d.operator_rpc("delivery_observe", obs).unwrap();
+    let rec = lf.rec();
+    assert_eq!(rec["state"], "passed", "stale read rewound: {rec}");
+    assert_eq!(rec["head"], b, "stale read overwrote the head: {rec}");
+    assert_eq!(rec["reviewer"], "r1", "reviewer lost: {rec}");
+    assert!(
+        rec["excluded"].as_array().is_none_or(|e| e.is_empty()),
+        "stale read excluded the reviewer: {rec}"
+    );
+    assert_eq!(rec["rounds"], 2, "a review round was spent: {rec}");
+    // The record still absorbs the observation (it is the latest
+    // view); every other write — the moved-head comment above all — is
+    // absent.
+    let sans_observed = |s: &(usize, String, usize, usize, usize)| {
+        let mut v: Value = serde_json::from_str(&s.1).unwrap();
+        v["D-2"].as_object_mut().unwrap().remove("observed");
+        (s.0, v, s.2, s.3, s.4)
+    };
+    assert_eq!(
+        sans_observed(&lf.snapshot()),
+        sans_observed(&before),
+        "the stale read wrote a comment"
+    );
+    assert_eq!(out["state"], "passed", "{out}");
+
+    // A read begun after the head change is a real move: the review
+    // rewinds, the moved-head comment lands and r1 is excluded.
+    let obs = json!({
+        "issue": "D-2", "head": a, "pr_state": "OPEN",
+        "ci_green": true, "read_at": epoch(),
+    });
+    let out = lf.f.d.operator_rpc("delivery_observe", obs).unwrap();
+    assert_eq!(out["state"], "reviewing", "{out}");
+    let rec = lf.rec();
+    assert_eq!(rec["state"], "reviewing", "{rec}");
+    assert_eq!(rec["head"], a, "{rec}");
+    assert_eq!(rec["reviewer"], "r2", "review moved to r2: {rec}");
+    assert!(
+        rec["excluded"].as_array().unwrap().contains(&json!("r1")),
+        "r1 was not excluded: {rec}"
+    );
+    let (ok, show) = lf.f.cli(&["issue", "show", "D-2", "--json"]);
+    assert!(ok, "{show}");
+    assert!(
+        show.to_string().contains("after review"),
+        "no moved-head comment: {show}"
+    );
+
+    // And without the stamp (an older cadence), a different head still
+    // reads as a move — the default is "fresh". With r1 and now r2
+    // excluded, no reviewer remains: the loop is unstaffed, never
+    // silently "no move".
+    let obs = json!({"issue": "D-2", "head": b, "pr_state": "OPEN", "ci_green": true});
+    let out = lf.f.d.operator_rpc("delivery_observe", obs).unwrap();
+    assert_eq!(
+        out["state"], "unstaffed",
+        "unstamped read must rewind: {out}"
+    );
+    let rec = lf.rec();
+    assert_eq!(rec["head"], b, "{rec}");
+    assert!(
+        rec["excluded"].as_array().unwrap().contains(&json!("r2")),
+        "{rec}"
+    );
+}

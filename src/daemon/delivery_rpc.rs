@@ -252,6 +252,7 @@ impl Shared {
         }
         rec.pr = Some(pr.to_string());
         rec.head = Some(sha.to_string());
+        rec.head_at = now();
         self.start_review(pm, rec)
     }
 
@@ -589,13 +590,25 @@ impl Shared {
             deletions: count("deletions"),
             files: count("files"),
             at: now(),
+            // CAD-564: absent means "the caller did not stamp it" —
+            // treat the read as fresh (now), so an older cadence's
+            // sync still sees post-review head moves; only a read
+            // demonstrably begun before `head_at` is stale.
+            read_at: params["read_at"].as_i64().unwrap_or_else(now),
         };
         let pm = self.pm()?;
         let guard = self.delivery_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut all = delivery::load(&self.state_dir)?;
         let rec = all.get_mut(id).ok_or_else(|| not_in_loop(id))?;
         let before = rec.state;
-        let moved = rec.head.as_deref() != Some(head.as_str());
+        let mut moved = rec.head.as_deref() != Some(head.as_str());
+        // CAD-564: an observation whose read began before the record's
+        // last head change (the done report's `head_at`) saw the head
+        // that change recorded — applied after it, it is not a
+        // post-review move and never rewinds the review.
+        if moved && obs.read_at < rec.head_at {
+            moved = false;
+        }
         if !rec.state.terminal() {
             match pr_state {
                 "MERGED" => rec.enter(State::Merged, obs.at),
@@ -607,6 +620,7 @@ impl Shared {
                     ) =>
                 {
                     rec.head = Some(head.clone());
+                    rec.head_at = now();
                     self.review_moved_head(&pm, rec)?;
                     let _ = issue::write::add_comment(
                         &pm,
