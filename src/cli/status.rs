@@ -5,18 +5,20 @@ use super::*;
 /// `cadence status` — build the one-screen overview: per-agent rows
 /// (state, running message age+head, queued/unknown, dead/resumable,
 /// pane verdict, owned issues) plus the footer. `--group` scopes to
-/// one root; unset scopes like `agent list` (the caller's group inside
-/// a pane, everything otherwise).
-pub(super) fn status_view(state_dir: &Path, group: Option<&str>) -> Result<Value> {
-    let mut agents = list_agents(state_dir, &[], &[], &[], &[], group.is_some(), false)?["agents"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    if let Some(root) = group {
+/// one root, `--all` to nothing smaller than the install; unset scopes
+/// like `agent list` (the caller's group inside a pane, everything
+/// otherwise) — `scope` in the payload names which applied.
+pub(super) fn status_view(state_dir: &Path, group: Option<&str>, all: bool) -> Result<Value> {
+    let list = list_agents(state_dir, &[], &[], &[], &[], group.is_some() || all, false)?;
+    let mut agents = list["agents"].as_array().cloned().unwrap_or_default();
+    let scope = if let Some(root) = group {
         agents.retain(|a| {
             a["alias"].as_str() == Some(root) || a["params"]["upstream"].as_str() == Some(root)
         });
-    }
+        json!({"group": root})
+    } else {
+        list["scope"].clone()
+    };
     // Tracker issues per owner — only when a tracker is reachable.
     // `views` gives the derived status the board shows; `load_all`
     // stays a filesystem read, and claim ages come from the tracker's
@@ -202,6 +204,10 @@ pub(super) fn status_view(state_dir: &Path, group: Option<&str>) -> Result<Value
     .ok();
     Ok(json!({
         "agents": rows,
+        // CAD-576: which agents the rows (and the footer's counts)
+        // cover — "all", or the one group root. A reader never has to
+        // guess a count's boundary from an absent field.
+        "scope": scope,
         "footer": {
             "states": states,
             "unread_inboxes": unread_inboxes,
@@ -314,7 +320,14 @@ pub(super) fn print_status_table(view: &Value) {
     for r in &rows {
         println!("{}", line(r));
     }
-    // Footer: counts by state + inboxes holding unread messages.
+    // Footer: which agents the rows cover, counts by state, and
+    // inboxes holding unread messages.
+    let scope = match &view["scope"] {
+        Value::Object(o) => format!("group {}", o["group"].as_str().unwrap_or("?")),
+        _ => "all".to_string(),
+    };
+    println!();
+    println!("scope: {scope}");
     let states = view["footer"]["states"]
         .as_object()
         .map(|m| {
@@ -327,7 +340,6 @@ pub(super) fn print_status_table(view: &Value) {
                 .join("  ")
         })
         .unwrap_or_else(|| "none".to_string());
-    println!();
     println!("agents: {states}");
     let unread = view["footer"]["unread_inboxes"]
         .as_array()
@@ -413,12 +425,13 @@ pub(super) fn print_status_table(view: &Value) {
 pub(super) fn run_status(
     state_dir: &Path,
     group: Option<&str>,
+    all: bool,
     json_out: bool,
     watch: Option<u64>,
 ) -> Result<i32> {
     let tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
     loop {
-        let view = status_view(state_dir, group)?;
+        let view = status_view(state_dir, group, all)?;
         if json_out {
             print_json(&view);
         } else {
@@ -440,8 +453,9 @@ pub(super) fn run_status(
 pub(super) fn run(
     state_dir: PathBuf,
     group: Option<String>,
+    all: bool,
     json: bool,
     watch: Option<u64>,
 ) -> Result<i32> {
-    run_status(&state_dir, group.as_deref(), json, watch)
+    run_status(&state_dir, group.as_deref(), all, json, watch)
 }

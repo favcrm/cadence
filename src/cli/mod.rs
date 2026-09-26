@@ -1147,12 +1147,16 @@ pub(crate) enum Commands {
     /// One-screen fleet overview: one row per agent with state, the
     /// running message's age and head, queued/unknown counts, pane
     /// verdict for pty agents, and owned tracker issues; a footer
-    /// counts states and lists inboxes with unread messages.
+    /// counts states and lists inboxes with unread messages. The
+    /// `scope` field names which agents the rows cover.
     Status {
         /// Scope to one group root (default: the caller's group inside
         /// a cadence pane, else every registered agent).
         #[arg(long)]
         group: Option<String>,
+        /// Show every agent even inside a cadence pane.
+        #[arg(long, conflicts_with = "group")]
+        all: bool,
         /// Emit the same data as JSON instead of the aligned table.
         #[arg(long)]
         json: bool,
@@ -2345,6 +2349,23 @@ pub(crate) fn home_dir() -> Result<PathBuf> {
         .ok_or_else(|| Error::rejected("HOME is not set to an absolute path"))
 }
 
+/// The group root a `CADENCE_ALIAS` caller scopes its view to inside a
+/// cadence pane: the caller's `params.upstream` when set, else its own
+/// alias. `None` outside a pane, for `--all`, for an unresolvable alias —
+/// and for the master (CAD-576): the install's one overseer has no group
+/// of its own, so a caller-group scope would show it a fleet of one.
+fn caller_group(state_dir: &Path) -> Option<String> {
+    let name = std::env::var("CADENCE_ALIAS").ok()?;
+    if cadence_agent::master::is_master(&name) {
+        return None;
+    }
+    let caller = client::rpc(state_dir, "agent_show", json!({"alias": name})).ok()?;
+    caller["agent"]["params"]["upstream"]
+        .as_str()
+        .or_else(|| caller["agent"]["alias"].as_str())
+        .map(str::to_string)
+}
+
 /// `agent list`: global view, or — inside a cadence pane — scoped to the
 /// caller's group. The caller's group root is its `params.upstream` when
 /// set, else its own alias; scoped output keeps the root plus agents
@@ -2353,7 +2374,8 @@ pub(crate) fn home_dir() -> Result<PathBuf> {
 /// falls back to the global list untouched. `states`/`providers`/`kinds`
 /// filter daemon-side; `projects` filters client-side on the cwd→project
 /// mapping (the daemon never opens the PM dir). Filters narrow the scope,
-/// never widen it.
+/// never widen it. The applied scope is stamped as `"scope"`: `"all"`,
+/// or `{"group": <root>}`.
 pub(crate) fn list_agents(
     state_dir: &Path,
     states: &[String],
@@ -2381,21 +2403,8 @@ pub(crate) fn list_agents(
             a["group"] = json!(root);
         }
     }
-    let caller = if all {
-        None
-    } else {
-        std::env::var("CADENCE_ALIAS").ok().and_then(|name| {
-            client::rpc(state_dir, "agent_show", json!({"alias": name}))
-                .ok()
-                .map(|s| s["agent"].clone())
-        })
-    };
-    if let Some(caller) = caller {
-        let root = caller["params"]["upstream"]
-            .as_str()
-            .or_else(|| caller["alias"].as_str())
-            .unwrap_or_default()
-            .to_string();
+    let caller_root = if all { None } else { caller_group(state_dir) };
+    if let Some(root) = &caller_root {
         if let Some(agents) = list["agents"].as_array_mut() {
             agents.retain(|a| {
                 a["alias"].as_str() == Some(root.as_str())
@@ -2403,6 +2412,13 @@ pub(crate) fn list_agents(
             });
         }
     }
+    // CAD-576: which agents the rows cover — "all", or the one group
+    // root a pane caller is scoped to. A reader never guesses a
+    // count's boundary from an absent field.
+    list["scope"] = match caller_root {
+        Some(root) => json!({"group": root}),
+        None => json!("all"),
+    };
     if !projects.is_empty() || stamp_project {
         stamp_agent_projects(&mut list)?;
     }
@@ -3358,7 +3374,12 @@ pub(crate) fn run() -> Result<i32> {
         Commands::Memory { action } => memory::run(state_dir, action),
         Commands::Secret { action } => secret::run(state_dir, action),
         Commands::Ui { action } => ui::run(state_dir, action),
-        Commands::Status { group, json, watch } => status::run(state_dir, group, json, watch),
+        Commands::Status {
+            group,
+            all,
+            json,
+            watch,
+        } => status::run(state_dir, group, all, json, watch),
         Commands::BuildSlot { action } => build_slot::run(state_dir, action),
         Commands::Review {
             pr,
