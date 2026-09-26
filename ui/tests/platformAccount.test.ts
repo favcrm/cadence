@@ -1,5 +1,8 @@
-import assert from "node:assert/strict";
 import { displayAmount, safeManageUrl } from "../src/features/settings/platformAccount";
+
+const assert = { equal(actual: unknown, expected: unknown, label = "platform account") {
+  if (actual !== expected) throw new Error(`${label}: expected ${String(expected)}, got ${String(actual)}`);
+} };
 
 assert.equal(displayAmount("0.000000"), "0");
 assert.equal(displayAmount("1234567890.123400"), "1234567890.1234");
