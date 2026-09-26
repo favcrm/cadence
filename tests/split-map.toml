@@ -306,6 +306,7 @@ tests = [
     "cad384_shutdown_needs_the_operator_or_a_granted_rollout_holder",
     "cad384_operator_daemon_stop_from_a_plain_shell",
     "cad626_restart_recovers_an_unreachable_daemon",
+    "cad626_snapshot_transport_failure_does_not_shutdown_a_lock_holder",
     "cad384_no_sandbox_exemption_outside_a_sandbox",
     "cad384_agent_cannot_claim_the_lease_as_the_operator",
     "cad561_the_actor_loop_stops_claiming_turns_while_the_update_drains",
