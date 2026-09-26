@@ -5233,3 +5233,31 @@ fn cad561_update_refuses_a_dropped_alias_claiming_the_operator() {
     let status = cadence_agent::rollout::status(&d.state).unwrap();
     assert_eq!(status["held"], false, "{status}");
 }
+
+/// CAD-628: detaching and forging an operator label cannot reach the
+/// updater's new cold-start route through the rollback entry point.
+#[test]
+fn cad628_detached_agent_cannot_request_rollback_with_a_forged_operator() {
+    let d = TestDaemon::start();
+    let out = std::process::Command::new("setsid")
+        .args(["sh", "-c"])
+        .arg(format!(
+            "env -u CADENCE_ALIAS {} --state-dir {} update --rollback --as operator:forged; rc=$?; exit $rc",
+            env!("CARGO_BIN_EXE_cadence"),
+            d.state.display()
+        ))
+        .env("CADENCE_ALIAS", "ghost")
+        .env_remove(cadence_agent::test_seam::AS_ENV)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    let text = String::from_utf8_lossy(&out.stderr);
+    assert!(text.contains("not provably the operator"), "{text}");
+    assert_eq!(
+        cadence_agent::rollout::status(&d.state).unwrap()["held"],
+        false
+    );
+    assert!(!d.state.join(cadence_agent::update::UPDATE_FILE).exists());
+    assert!(!d.state.join(cadence_agent::update::LOCK_FILE).exists());
+}
