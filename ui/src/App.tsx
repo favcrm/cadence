@@ -18,6 +18,7 @@ import Workflows from "./features/projects/Workflows";
 import Sidebar from "./ui/Sidebar";
 import Wiki from "./features/wiki/Wiki";
 import Link from "./ui/Link";
+import ProjectFilter from "./ui/ProjectFilter";
 import SectionTabs from "./ui/SectionTabs";
 import StatusChips from "./ui/StatusChips";
 import ThemeToggle from "./ui/ThemeToggle";
@@ -43,7 +44,10 @@ import {
   goTo,
   locationHref,
   NAV,
+  openProject,
+  projectScope,
   readLocation,
+  showProjectChoices,
   withProject,
   type AppLocation,
   type Route,
@@ -461,7 +465,11 @@ export default function App() {
     };
   }, []);
 
-  const projectHref = (key: string) => locationHref(withProject(loc, key), search);
+  // The sidebar and the phone menu open a project page. The chip row
+  // and the memory picker filter the screen, and only a screen that has one.
+  const projectHref = (key: string) => locationHref(openProject(loc, key), search);
+  const filterHref = (key: string) => locationHref(withProject(loc, key), search);
+  const navProject = route.screen === "projects" ? project : null;
   const projectSlug = project === "all" ? null : project;
 
   return (
@@ -492,7 +500,7 @@ export default function App() {
       <Sidebar
         screen={screen}
         navHref={hrefFor}
-        project={project}
+        project={navProject}
         projectHref={projectHref}
         projects={projects}
         issues={issuesState}
@@ -575,7 +583,7 @@ export default function App() {
                 href={projectHref("all")}
                 onClick={() => setMenuOpen(false)}
                 className={`flex items-center justify-between h-8 px-2.5 rounded text-label ${
-                  project === "all"
+                  navProject === "all"
                     ? "bg-accent/15 text-accent"
                     : "text-ink-300 hover:bg-ink-800"
                 }`}
@@ -594,7 +602,7 @@ export default function App() {
                   href={projectHref(p.key)}
                   onClick={() => setMenuOpen(false)}
                   className={`flex items-center justify-between h-8 px-2.5 rounded text-label ${
-                    project === p.key
+                    navProject === p.key
                       ? "bg-accent/15 text-accent"
                       : "text-ink-300 hover:bg-ink-800"
                   }`}
@@ -625,6 +633,12 @@ export default function App() {
               </StatusChips>
             </div>
           </nav>
+        )}
+
+        {projectScope(route) === "chips" && showProjectChoices(projects.length, project) && (
+          <div className="px-4 lg:px-8 pt-4">
+            <ProjectFilter project={project} projects={projects} hrefFor={filterHref} />
+          </div>
         )}
 
         {screen === "home" && <SetupNudge readOnly={meta ? boardReadOnly : null} />}
@@ -769,7 +783,7 @@ export default function App() {
           />
         )}
         {route.screen === "settings" && route.section === "memory" && (
-          <Memory project={project} onError={writeError} />
+          <Memory project={project} projects={projects} projectHref={filterHref} onError={writeError} />
         )}
         {route.screen === "settings" && route.section === "models" && <ModelDefaults />}
         {route.screen === "settings" && route.section === "update" && (
