@@ -54,6 +54,7 @@ pub mod store;
 pub mod tailnet_proof;
 pub mod test_seam;
 pub mod ui;
+pub mod update;
 pub mod upgrade;
 pub mod worktree;
 

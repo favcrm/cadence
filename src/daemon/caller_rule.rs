@@ -84,6 +84,14 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("health", Rule::Read),
     ("daemon_info", Rule::Read),
     ("shutdown", Rule::Shutdown),
+    // CAD-561: the update's drain gate is an operator action — an agent
+    // can never stop the fleet's work to push a build. `update_status`
+    // is the read side (the board's banner, `cadence update status`).
+    (
+        "update_drain",
+        Rule::Handler("operator_connection (CAD-561)"),
+    ),
+    ("update_status", Rule::Read),
     (
         "agent_register",
         Rule::Handler(
@@ -901,5 +909,27 @@ mod tests {
             ),
             Ok(None)
         );
+    }
+
+    /// CAD-561: `update_drain` is the update's fleet gate — an agent can
+    /// never stop the fleet's work to push a build, and a detached
+    /// (unproven) caller cannot either; only the operator passes. The
+    /// read side, `update_status`, is open like every other read.
+    #[test]
+    fn update_drain_is_operator_only_and_never_an_agent() {
+        assert_eq!(
+            rule_of("update_drain"),
+            Some(Rule::Handler("operator_connection (CAD-561)"))
+        );
+        assert_eq!(rule_of("update_status"), Some(Rule::Read));
+        assert!(!rule_of("update_status").unwrap().checks_connection());
+        // `Handler` means the table admits nobody: the handler itself
+        // proves the connection (`daemon.rs`'s arm runs
+        // `operator_connection`, pinned by
+        // `cad561_update_drain_is_operator_gated_in_the_dispatch`), so
+        // an agent can never pass by being an agent. A table rule that
+        // checked the connection would be the weaker shape.
+        assert!(!rule_of("update_drain").unwrap().checks_connection());
+        assert!(!rule_of("update_status").unwrap().checks_connection());
     }
 }

@@ -26,7 +26,7 @@ import { readAppUrlState, type AppTab, type ProjectView } from "./urlState";
  */
 
 export type ProjectSection = "issues" | "epics" | "milestones" | "context" | "workflows";
-export type SettingsSection = "models" | "memory";
+export type SettingsSection = "models" | "memory" | "update";
 
 export type Route =
   | { screen: "home" }
@@ -103,6 +103,7 @@ export function matchRoute(pathname: string): Route {
     if (head === "settings" && !b) {
       if (!a) return { screen: "settings", section: "models" };
       if (a === "memory") return { screen: "settings", section: "memory" };
+      if (a === "update") return { screen: "settings", section: "update" };
     }
   }
   return { screen: "notFound", path: pathname };
@@ -133,7 +134,8 @@ export function routePath(route: Route): string {
     case "outbox":
       return "/outbox";
     case "settings":
-      return route.section === "memory" ? "/settings/memory" : "/settings";
+      if (route.section === "memory") return "/settings/memory";
+      return route.section === "update" ? "/settings/update" : "/settings";
     case "notFound":
       return route.path;
   }

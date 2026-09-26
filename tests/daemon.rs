@@ -4957,3 +4957,116 @@ fn cad384_agent_cannot_claim_the_lease_as_the_operator() {
     ]);
     assert!(ok, "{out} {err}");
 }
+
+/// CAD-561: the drain gate, behaviourally. While an update drains, the
+/// actor loop claims no new turn: a queued message stays queued until
+/// the drain is lifted (or the marker goes stale). Deleting the gate in
+/// `daemon.rs` makes this fail — the turn would be claimed at once.
+#[test]
+fn cad561_the_actor_loop_stops_claiming_turns_while_the_update_drains() {
+    let d = TestDaemon::start();
+    d.register("w1");
+    d.wait_agent("w1", "idle", 15);
+    // The update's lease, then the drain that names its holder.
+    hold_rollout_lease(d.dir.path(), &d.state);
+    let drained = d
+        .operator_rpc(
+            "update_drain",
+            json!({"on": true, "label": "operator:test", "target": "b".repeat(40)}),
+        )
+        .unwrap();
+    assert_eq!(drained["draining"], json!(true), "{drained}");
+    // A queued turn is not claimed while the fleet is drained.
+    d.send(
+        "w1",
+        json!({"text": "held while draining", "message": "drain-1"}),
+    )
+    .unwrap();
+    thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        d.message_state("w1", "drain-1"),
+        "queued",
+        "the drain must hold the turn"
+    );
+    // A label the lease does not back cannot drain (and writes nothing).
+    let refused = d.operator_rpc(
+        "update_drain",
+        json!({"on": true, "label": "operator:mallory", "target": "b".repeat(40)}),
+    );
+    let err = refused.unwrap_err().to_string();
+    assert!(
+        err.contains("lease is not held by 'operator:mallory'"),
+        "{err}"
+    );
+    assert_eq!(
+        cadence_agent::update::pending_update(&d.state)
+            .map(|p| p.by)
+            .as_deref(),
+        Some("operator:test"),
+        "the refused drain must not have overwritten the marker"
+    );
+    // Lifting the drain lets the actor take the turn.
+    d.operator_rpc(
+        "update_drain",
+        json!({"on": false, "label": "operator:test"}),
+    )
+    .unwrap();
+    let row = d.wait_message("w1", "drain-1", &["completed"], 15);
+    assert_eq!(row["state"], "completed", "{row}");
+}
+
+/// CAD-561: the CLI gate. Inside a pane `cadence update` is refused
+/// outright — an agent can never push a build — before anything is
+/// claimed or written.
+#[test]
+fn cad561_update_is_refused_inside_a_pane() {
+    let d = TestDaemon::start();
+    let mut p = guard_panes(&d);
+    let (rc, out) = p.pm.run(&format!(
+        "CADENCE_ALIAS=pm {} --state-dir {} update --as operator:ada --check",
+        env!("CARGO_BIN_EXE_cadence"),
+        d.state.display()
+    ));
+    assert_ne!(rc, 0, "{out}");
+    assert!(
+        out.contains("cadence update is an operator action"),
+        "{out}"
+    );
+    assert!(out.contains("cadence pane 'pm'"), "{out}");
+    let status = cadence_agent::rollout::status(&d.state).unwrap();
+    assert_eq!(status["held"], false, "{status}");
+    assert!(!d.state.join(cadence_agent::update::UPDATE_FILE).exists());
+    assert!(!d.state.join(cadence_agent::update::LOCK_FILE).exists());
+}
+
+/// CAD-561: dropping the alias does not make a pane's child the
+/// operator. `env -u CADENCE_ALIAS … update --as operator:evil` passes
+/// the pane check (no alias in its own environment) but fails the
+/// process proof — an ancestor carries `CADENCE_ALIAS` — and nothing is
+/// claimed.
+#[test]
+fn cad561_update_refuses_a_dropped_alias_claiming_the_operator() {
+    let d = TestDaemon::start();
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "env -u CADENCE_ALIAS {} --state-dir {} update --as operator:evil --check",
+            env!("CARGO_BIN_EXE_cadence"),
+            d.state.display()
+        ))
+        .env("CADENCE_ALIAS", "ghost")
+        .env_remove(cadence_agent::test_seam::AS_ENV)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("not provably the operator"), "{text}");
+    assert!(text.contains("CADENCE_ALIAS"), "{text}");
+    let status = cadence_agent::rollout::status(&d.state).unwrap();
+    assert_eq!(status["held"], false, "{status}");
+}

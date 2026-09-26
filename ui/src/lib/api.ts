@@ -19,6 +19,9 @@ import type {
   ModelDefaultsConfig,
   ModelDefaultsSnapshot,
   OutboxDetail,
+  UpdateBanner,
+  UpdateCheck,
+  UpdateStatus,
   OutboxList,
   Overview,
   Project,
@@ -411,6 +414,15 @@ export const api = {
     ),
 
   modelDefaults: () => get<ModelDefaultsSnapshot>("/api/settings/model-defaults"),
+  /** CAD-561: the Settings Update card — current version, the last
+   *  check, the running update's progress and the drain state. */
+  updateStatus: () => get<UpdateStatus>("/api/update"),
+  /** The draining banner, cheap enough for every page to poll. */
+  updateBanner: () => get<UpdateBanner | null>("/api/update/banner"),
+  /** Run the real check (gh) now — the operator's Check for updates. */
+  updateCheck: () => post<UpdateCheck>("/api/update/check", {}),
+  /** Start the update: the same pipeline as `cadence update`. */
+  startUpdate: () => post<{ started: boolean }>("/api/update", {}),
   saveModelDefaults: (body: { expected_revision: number; config: ModelDefaultsConfig }) =>
     writeSettings(body),
 };

@@ -46,6 +46,7 @@ mod operator;
 mod read_model;
 mod stages;
 mod threads;
+mod updates;
 mod workflows;
 
 pub use operator::{route_class, RouteClass, WriteRoute, WRITE_ROUTES};
@@ -359,6 +360,11 @@ pub struct ServeOpts {
     /// never set this.
     #[doc(hidden)]
     pub seam: Option<crate::test_seam::Seam>,
+    /// The program the Update button spawns (CAD-561 r2): `cadence
+    /// update --as <ui actor> --progress <state>/update-progress.jsonl`.
+    /// `None` is this board's own binary. Never set from the command
+    /// line — tests inject a fake helper.
+    pub update_helper: Option<PathBuf>,
 }
 
 fn opts_file(state_dir: &Path) -> PathBuf {
@@ -622,6 +628,9 @@ fn serve_opts(eff: &UiOpts) -> Result<ServeOpts> {
         // environment; in-process fixtures set the field directly.
         test_seam: crate::test_seam::env_armed(),
         seam: None,
+        // CAD-561 r2: a real board spawns its own binary as the update
+        // helper; only tests inject a fake.
+        update_helper: None,
     })
 }
 
@@ -1871,6 +1880,21 @@ fn write_route(
             return;
         }
     };
+    // CAD-561: the operator's Update button — the same pipeline the CLI
+    // runs, in this process; the card polls `GET /api/update`.
+    if path == "/api/update" || path == "/api/update/check" {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let resp = if path == "/api/update" {
+            updates::start(state_dir, opts)
+        } else {
+            updates::check_now(state_dir)
+        };
+        send(request, resp);
+        return;
+    }
     if path == "/api/settings/model-defaults" {
         if *method != Method::Post {
             send(request, err_response(405, "method not allowed"));
@@ -2694,6 +2718,9 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 })),
             );
         }
+        // CAD-561: the Update card's view and the draining banner.
+        "/api/update" => send(request, updates::get(state_dir)),
+        "/api/update/banner" => send(request, updates::banner_get(state_dir)),
         "/api/settings/model-defaults" => {
             send(request, model_defaults_get(state_dir, opts.read_only));
         }
@@ -2730,6 +2757,10 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     "projects": projects, "issues": issues,
                     "daemon": daemon,
                     "embedded": cfg!(feature = "ui"),
+                    // CAD-561: which build is answering, so
+                    // `cadence update`'s health check can require the
+                    // board to come back on the new release.
+                    "build": crate::overview::BUILD_COMMIT,
                 })),
             );
         }

@@ -1363,6 +1363,11 @@ fn every_operator_only_route_runs_the_process_proof() {
     for (path, body) in [
         ("/api/settings/model-defaults", doc),
         ("/api/threads/lead/messages", r#"{"text":"hi"}"#),
+        // CAD-561: the Update button and its check are the same class —
+        // an agent's process can never start an update, and the refusal
+        // lands before the route reads anything.
+        ("/api/update", "{}"),
+        ("/api/update/check", "{}"),
     ] {
         let out = Command::new("bash")
             .args([
@@ -1392,6 +1397,335 @@ fn every_operator_only_route_runs_the_process_proof() {
     )
     .unwrap();
     assert_eq!(current["revision"], 0, "{current}");
+}
+
+/// CAD-561 r2: the Update button starts a detached helper process that
+/// outlives the board — the switch restarts the board, so a pipeline
+/// running inside it would SIGTERM its own process before `ui start`.
+/// This proves the board half: the spawn contract (own session, the log
+/// on argv, no agent identity), the run-log protocol, and that the
+/// board replacing it keeps reading the same log to the end. The
+/// pipeline's health check, rollback and lease release are the fake
+/// host's in tests/update.rs.
+#[test]
+fn cad561_a_board_initiated_update_survives_the_board_being_replaced() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let d = UiDaemon::start_on(state.path().to_path_buf());
+    let helper = write_fake_update_helper(state.path());
+    let log = state.path().join(cadence_agent::update::PROGRESS_FILE);
+    let (port, board) = start_ui_opts(
+        pm.path().to_path_buf(),
+        state.path().to_path_buf(),
+        move |opts| opts.update_helper = Some(helper.clone()),
+    );
+    let s = sign_in(&d.state(), port);
+    let host = op::board_host(port);
+    let (code, _, body) = op_write_json(&s, port, "POST", "/api/update", &host, "{}");
+    assert_eq!(code, 200, "{body}");
+    assert!(body.contains("\"started\": true"), "{body}");
+
+    // The helper is the board's own `cadence update`: the state dir and
+    // the log on argv, its own session leader (the restart stops the
+    // board by pid — a helper in the board's session would be a
+    // candidate for a group signal), and no agent identity in its env.
+    let contract = wait_json(&state.path().join("helper-contract.json"));
+    let argv: Vec<String> = contract["argv"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(argv[0], "--state-dir", "{argv:?}");
+    assert_eq!(argv[1], state.path().to_str().unwrap(), "{argv:?}");
+    assert_eq!(argv[2], "update", "{argv:?}");
+    assert_eq!(argv[3], "--as", "{argv:?}");
+    assert_eq!(argv[4], "operator (ui)", "{argv:?}");
+    assert_eq!(argv[5], "--progress", "{argv:?}");
+    assert_eq!(argv[6], log.to_str().unwrap(), "{argv:?}");
+    assert_eq!(contract["alias"], Value::Null, "CADENCE_ALIAS rode in");
+    assert_eq!(contract["as_env"], Value::Null, "a seam assertion rode in");
+    assert_eq!(
+        contract["sid"], contract["pid"],
+        "the helper must lead its own session: {contract}"
+    );
+    let helper_pid = contract["pid"].as_u64().unwrap() as u32;
+
+    // The card shows the run in flight, from the log.
+    let status = wait_update_running(port, &host);
+    assert_eq!(status["result"], Value::Null, "{status}");
+    assert!(has_line(&status, "draining: swe-554 (12m)"), "{status}");
+
+    // The switch replaces the board: this one stops (a restart SIGTERMs
+    // exactly its pid), the helper keeps going, and the board that
+    // replaces it reads the same log.
+    drop(board);
+    wait_port_closed(port);
+    assert!(
+        pid_alive(helper_pid),
+        "the helper must outlive the board that started it"
+    );
+    let (port2, _board2) =
+        start_ui_opts(pm.path().to_path_buf(), state.path().to_path_buf(), |_| {});
+    let host2 = op::board_host(port2);
+    let status = wait_update_running(port2, &host2);
+    assert!(has_line(&status, "draining: swe-554 (12m)"), "{status}");
+
+    // The run ends: the replacement board shows the result, and the
+    // helper is gone.
+    std::fs::write(log.with_extension("jsonl.go"), "").unwrap();
+    let status = wait_update_done(port2, &host2);
+    assert_eq!(status["running"], json!(false), "{status}");
+    assert_eq!(status["result"]["rolled_back"], json!(false), "{status}");
+    assert_eq!(status["error"], Value::Null, "{status}");
+    wait_pid_gone(helper_pid);
+}
+
+/// CAD-561 r3: a helper that dies before it opens the run log (the CLI
+/// gate or the re-entry lock refused it) leaves no terminal record while
+/// the board already answered `started` — the board writes the `Failed`
+/// record the card reads, with the helper's stderr line as the reason.
+#[test]
+fn cad561_a_helper_that_dies_before_the_run_log_is_recorded_as_never_started() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let d = UiDaemon::start_on(state.path().to_path_buf());
+    let helper = write_fake_dead_update_helper(state.path());
+    let (port, _board) = start_ui_opts(
+        pm.path().to_path_buf(),
+        state.path().to_path_buf(),
+        move |opts| opts.update_helper = Some(helper.clone()),
+    );
+    let s = sign_in(&d.state(), port);
+    let host = op::board_host(port);
+    let (code, _, body) = op_write_json(&s, port, "POST", "/api/update", &host, "{}");
+    assert_eq!(code, 200, "{body}");
+    assert!(body.contains("\"started\": true"), "{body}");
+    let status = wait_update_error(port, &host);
+    assert_eq!(status["running"], json!(false), "{status}");
+    assert_eq!(status["result"], Value::Null, "{status}");
+    let error = status["error"].as_str().unwrap_or_default();
+    assert!(error.contains("never started"), "{status}");
+    assert!(error.contains("the operator proof refused"), "{status}");
+}
+
+/// CAD-561 r4: the same refusal after a run already finished. The old
+/// run's terminal record sat in the log, `run_log_never_started` saw it
+/// and skipped — the card kept showing the previous result with
+/// `error: null`. The board truncates the log at start, so the refused
+/// helper's death records `Failed` the way the first-run case does.
+#[test]
+fn cad561_a_refused_helper_after_a_finished_run_is_not_a_stale_result() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let d = UiDaemon::start_on(state.path().to_path_buf());
+    // A previous run's whole record: started, a line, finished. Its
+    // terminal record is what skipped `run_log_never_started` (r4).
+    let log = state.path().join(cadence_agent::update::PROGRESS_FILE);
+    std::fs::write(
+        &log,
+        concat!(
+            r#"{"update_run":"running","pid":4294967294,"by":"operator (ui)","at":1.0}"#,
+            "\n",
+            "drained: quiet after 3s\n",
+            r#"{"update_run":"finished","at":2.0,"report":{"rolled_back":false,"#,
+            r#""check":{"target":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let helper = write_fake_dead_update_helper(state.path());
+    let (port, _board) = start_ui_opts(
+        pm.path().to_path_buf(),
+        state.path().to_path_buf(),
+        move |opts| opts.update_helper = Some(helper.clone()),
+    );
+    let s = sign_in(&d.state(), port);
+    let host = op::board_host(port);
+    let (code, _, body) = op_write_json(&s, port, "POST", "/api/update", &host, "{}");
+    assert_eq!(code, 200, "{body}");
+    let status = wait_update_error(port, &host);
+    assert_eq!(status["running"], json!(false), "{status}");
+    // Not the previous run's result: the card must not resurrect it.
+    assert_eq!(status["result"], Value::Null, "{status}");
+    let error = status["error"].as_str().unwrap_or_default();
+    assert!(error.contains("never started"), "{status}");
+    assert!(error.contains("the operator proof refused"), "{status}");
+}
+
+/// CAD-561 r3: the board refuses a planted progress log (a symlink
+/// here) before it spawns anything — the log is one of the state dir's
+/// private files, opened `O_NOFOLLOW` with a regular-file/owner check.
+#[test]
+fn cad561_the_board_refuses_a_planted_progress_log() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let d = UiDaemon::start_on(state.path().to_path_buf());
+    let log = state.path().join(cadence_agent::update::PROGRESS_FILE);
+    let target = state.path().join("planted-target");
+    std::fs::write(&target, "untouched").unwrap();
+    std::os::unix::fs::symlink(&target, &log).unwrap();
+    let helper = write_fake_update_helper(state.path());
+    let (port, _board) = start_ui_opts(
+        pm.path().to_path_buf(),
+        state.path().to_path_buf(),
+        move |opts| opts.update_helper = Some(helper.clone()),
+    );
+    let s = sign_in(&d.state(), port);
+    let host = op::board_host(port);
+    let (code, _, body) = op_write_json(&s, port, "POST", "/api/update", &host, "{}");
+    assert_ne!(code, 200, "a planted log must not start an update: {body}");
+    assert!(body.contains("refusing"), "{body}");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched");
+}
+
+/// The board's detached update helper, faked: a process that speaks the
+/// run-log protocol the real `cadence update --progress` writes,
+/// records its spawn contract, and waits for a go file so the test
+/// controls when the run ends.
+fn write_fake_update_helper(state: &Path) -> std::path::PathBuf {
+    let path = state.join("fake-update-helper.py");
+    let script = r#"#!/usr/bin/env python3
+import json, os, sys, time
+
+args = sys.argv[1:]
+progress = args[args.index("--progress") + 1]
+state = args[args.index("--state-dir") + 1]
+with open(os.path.join(state, "helper-contract.json"), "w") as f:
+    json.dump({"argv": args, "pid": os.getpid(), "sid": os.getsid(0),
+               "alias": os.environ.get("CADENCE_ALIAS"),
+               "as_env": os.environ.get("CADENCE_TEST_AS")}, f)
+with open(progress, "w") as f:
+    f.write(json.dumps({"update_run": "running", "pid": os.getpid(),
+                        "by": "operator (ui)", "at": time.time()}) + "\n")
+    f.write("draining: swe-554 (12m)\n")
+    f.write("drained: quiet after 3s\n")
+go = progress + ".go"
+while not os.path.exists(go):
+    time.sleep(0.02)
+with open(progress, "a") as f:
+    f.write("switching: restarting the daemon on " + "b" * 40 + "\n")
+    f.write(json.dumps({"update_run": "finished", "at": time.time(),
+                        "report": {"rolled_back": False,
+                                   "check": {"target": "b" * 40}}}) + "\n")
+"#;
+    std::fs::write(&path, script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// A helper that dies before it opens the run log: its stderr lands in
+/// the log (the board points it there), and it leaves no record.
+fn write_fake_dead_update_helper(state: &Path) -> std::path::PathBuf {
+    let path = state.join("fake-dead-update-helper.sh");
+    let script = "#!/bin/sh\necho \"cadence: the operator proof refused\" >&2\nexit 1\n";
+    std::fs::write(&path, script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+fn has_line(status: &Value, want: &str) -> bool {
+    status["lines"]
+        .as_array()
+        .is_some_and(|lines| lines.iter().any(|l| l.as_str() == Some(want)))
+}
+
+fn wait_update_error(port: u16, host: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let status: Value =
+            serde_json::from_str(&http(port, "GET", "/api/update", host).1).unwrap();
+        if status["error"].is_string() && status["running"] == json!(false) {
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the card never recorded the helper's death: {status}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wait_update_running(port: u16, host: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let status: Value =
+            serde_json::from_str(&http(port, "GET", "/api/update", host).1).unwrap();
+        if status["running"] == json!(true) {
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the update never read as running: {status}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wait_update_done(port: u16, host: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let status: Value =
+            serde_json::from_str(&http(port, "GET", "/api/update", host).1).unwrap();
+        if status["running"] == json!(false) && status["result"].is_object() {
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the update never finished: {status}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wait_json(path: &Path) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if let Ok(value) = serde_json::from_str(&text) {
+                return value;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{} never appeared",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Is `pid` a live process — not gone, not a zombie?
+fn pid_alive(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        stat.rsplit_once(')')
+            .is_some_and(|(_, rest)| !rest.trim_start().starts_with('Z'))
+    })
+}
+
+fn wait_pid_gone(pid: u32) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while pid_alive(pid) {
+        assert!(Instant::now() < deadline, "pid {pid} never exited");
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The board's port stops answering (the in-process owner's stop).
+fn wait_port_closed(port: u16) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while TcpStream::connect(("127.0.0.1", port)).is_ok() {
+        assert!(Instant::now() < deadline, "port {port} never closed");
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// MUST-FIX 3: `WRITE_ROUTES` is enforced, not documentation. A caller

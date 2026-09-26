@@ -117,6 +117,10 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     // `master_command` is operator-only, so the relay is too.
     route("POST", "/api/master/command", RouteClass::OperatorOnly),
     route("POST", "/api/epics/*/stage", RouteClass::OperatorOnly),
+    // CAD-561: the board's Update button and its check — operator-only,
+    // like every other action that replaces the running build.
+    route("POST", "/api/update", RouteClass::OperatorOnly),
+    route("POST", "/api/update/check", RouteClass::OperatorOnly),
     // CAD-496: the board relays `plan_propose` over its own daemon
     // connection, so the daemon attributes the run to whoever that
     // connection proves — operator-only, like `plan_approve`.

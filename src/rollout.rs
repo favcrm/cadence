@@ -207,6 +207,16 @@ pub fn db_file(state_dir: &Path) -> PathBuf {
     state_dir.join("cadence.sqlite3")
 }
 
+/// The store's schema version, read without writing the database:
+/// `None` when there is no database yet (or it is fresh), so
+/// `cadence update --check` can say whether a migration is involved.
+pub fn store_schema(state_dir: &Path) -> Result<Option<i64>> {
+    match peek_schema(&db_file(state_dir))? {
+        Peek::Version(v) => Ok(Some(v)),
+        Peek::Missing | Peek::Fresh => Ok(None),
+    }
+}
+
 pub fn parse_ttl(raw: &str) -> Result<Duration> {
     let raw = raw.trim();
     let (num, mult) = if let Some(rest) = raw.strip_suffix('d') {
@@ -842,6 +852,63 @@ pub fn release(state_dir: &Path, caller: &Caller) -> Result<Value> {
     }))
 }
 
+/// Renew the caller's own active lease to `ttl` from `now` — the holder
+/// extending its TTL in place, without ending and re-claiming the lease
+/// (CAD-561 r3: an update that reuses a same-identity lease must not let
+/// it lapse mid-run, or the daemon stops adopting the update marker and
+/// the drain re-assert is refused). Only the holder's own unexpired
+/// lease renews; anyone else gets [`release`]'s refusal.
+///
+/// The renewal carries the new run's `reason` and `target` onto the
+/// reused row: a crashed predecessor's lease was claimed for its own
+/// reason, and `rollout status` would keep reporting the stale one
+/// (CAD-561 r4).
+pub fn renew(
+    state_dir: &Path,
+    caller: &Caller,
+    reason: &str,
+    target: Option<&str>,
+    ttl: Duration,
+    now: f64,
+) -> Result<Value> {
+    validate_reason(reason)?;
+    if let Some(target) = target {
+        validate_target(target)?;
+    }
+    let conn = connect_ensured(&db_file(state_dir))?;
+    committed(immediate(&conn, |conn| {
+        let lease = match require_holder(conn, caller, now, false)? {
+            TxResult::Done(lease) => lease,
+            TxResult::Refuse(message) => return Ok(TxResult::Refuse(message)),
+        };
+        let expires_at = now + ttl.as_secs_f64();
+        conn.execute(
+            "UPDATE rollout_leases SET expires_at=?1, reason=?2, target_commit=?3 \
+             WHERE id=?4",
+            params![expires_at, reason, target, lease.id],
+        )?;
+        insert_event(
+            conn,
+            "rollout_renew",
+            json!({
+                "holder": lease.holder,
+                "lease_id": lease.id,
+                "expires_at": expires_at,
+                "previous_expires_at": lease.expires_at,
+                "reason": reason,
+                "target": target,
+            }),
+            now,
+        )?;
+        Ok(TxResult::Done(json!({
+            "renewed": true,
+            "holder": lease.holder,
+            "lease_id": lease.id,
+            "expires_at": expires_at,
+        })))
+    }))
+}
+
 /// Operator override for a holder who is gone. Does not require the
 /// caller to be the holder. Records the ousted holder.
 ///
@@ -987,6 +1054,13 @@ fn preview_force_refusal(
         None => Ok(Some("no rollout lease is held".into())),
         Some(lease) => Ok(force_holder_refusal(&lease, named, now)),
     }
+}
+
+/// The operator proof of [`require_operator_proof`], public for verbs
+/// outside this module that gate on the same rule (CAD-561's
+/// `cadence update`).
+pub fn require_operator(state_dir: &Path, verb: &str) -> Result<()> {
+    require_operator_proof(state_dir, verb)
 }
 
 /// `peer::operator_proof` for this process. Pane pids come from a
@@ -2334,6 +2408,67 @@ mod tests {
         let events = events_of(&state);
         assert!(events.iter().any(|e| e.0 == "rollout_handoff"));
         assert!(events.iter().any(|e| e.0 == "rollout_release"));
+    }
+
+    #[test]
+    fn renew_extends_only_the_holders_own_live_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = fresh(&dir);
+        // CAD-482: the claim is an operator action; assert it in-band so
+        // this runs identically in a pane and in CI.
+        let seam = state.join("seam");
+        std::fs::create_dir_all(&seam).unwrap();
+        std::fs::write(seam.join("token"), "test-token").unwrap();
+        crate::test_seam::scoped(crate::test_seam::Asserted::Operator, || {
+            claim_as(&state, "alice", 1_000.0, Duration::from_secs(60), false).unwrap();
+            // Another identity cannot renew it.
+            let err = renew(
+                &state,
+                &caller("bob"),
+                "bob's work",
+                Some("fffffff"),
+                Duration::from_secs(3600),
+                1_010.0,
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("only the holder"), "{err}");
+            // The holder's renewal moves the expiry in place: the same
+            // row, the same claimed_at, no release and re-claim. The
+            // renewing run's reason and target land on the row too, so
+            // `rollout status` reports what is actually running
+            // (CAD-561 r4).
+            let before = status_at(&state);
+            let renewed = renew(
+                &state,
+                &caller("alice"),
+                "cadence update",
+                Some("1234abc"),
+                Duration::from_secs(3600),
+                1_010.0,
+            )
+            .unwrap();
+            assert_eq!(renewed["renewed"], true);
+            assert_eq!(renewed["expires_at"].as_f64().unwrap(), 1_010.0 + 3600.0);
+            let after = status_at(&state);
+            assert_eq!(after["claimed_at"], before["claimed_at"]);
+            assert_eq!(after["expires_at"].as_f64().unwrap(), 1_010.0 + 3600.0);
+            assert_eq!(after["reason"], "cadence update");
+            assert_eq!(after["target"], "1234abc");
+            // An expired lease is not renewable — the holder takes over
+            // or claims afresh.
+            let err = renew(
+                &state,
+                &caller("alice"),
+                "cadence update",
+                Some("1234abc"),
+                Duration::from_secs(60),
+                9_999.0,
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("--takeover"), "{err}");
+        });
+        let events = events_of(&state);
+        assert!(events.iter().any(|e| e.0 == "rollout_renew"));
     }
 
     #[test]

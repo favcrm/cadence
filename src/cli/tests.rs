@@ -35,6 +35,22 @@ fn cad314_backup_export_restore_parse() {
 }
 
 #[test]
+fn cad561_progress_lines_are_written_once_when_stdout_is_the_log() {
+    // The board starts the detached helper with stdout pointing at
+    // the progress log; `line` must not print there too (CAD-561 r3).
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("update-progress.jsonl");
+    std::fs::write(&log, "").unwrap();
+    let file = std::fs::File::open(&log).unwrap();
+    use std::os::fd::AsRawFd;
+    assert!(fd_is_path(file.as_raw_fd(), &log), "an open fd is its file");
+    let other = dir.path().join("other");
+    std::fs::write(&other, "").unwrap();
+    assert!(!fd_is_path(file.as_raw_fd(), &other));
+    assert!(!fd_is_path(libc::STDOUT_FILENO, &log));
+}
+
+#[test]
 fn devin_resume_parses_like_native() {
     let cli = Cli::try_parse_from(["cadence", "devin", "-r", "cookie-cesium"]).unwrap();
     match cli.command {
@@ -1104,6 +1120,31 @@ fn alias_lookup_fails_closed_on_anything_but_not_found() {
     ] {
         let text = err.to_string();
         assert!(found_or_absent(Err(err)).is_err(), "{text} read as absent");
+    }
+}
+
+/// CAD-561 r4: only "not reachable" reads as no daemon — every
+/// other `daemon_info` failure is real and propagates, or
+/// `finish_restart` restarts a daemon that was merely slow.
+#[test]
+fn daemon_build_reads_only_unreachable_as_no_daemon() {
+    let answered = daemon_build_or_absent(Ok(json!({"build_commit": "abc123"}))).unwrap();
+    assert_eq!(answered.as_deref(), Some("abc123"));
+    let absent = daemon_build_or_absent(Err(Error::internal(
+        "Daemon is not reachable at /x — start it with `cadence daemon start`",
+    )))
+    .unwrap();
+    assert_eq!(absent, None);
+    for err in [
+        Error::internal("Daemon returned a malformed response"),
+        Error::rejected("daemon_info refused"),
+        Error::unknown("connection reset"),
+    ] {
+        let text = err.to_string();
+        assert!(
+            daemon_build_or_absent(Err(err)).is_err(),
+            "{text} read as no daemon"
+        );
     }
 }
 
