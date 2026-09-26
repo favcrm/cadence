@@ -1,6 +1,6 @@
 import { resources } from "../../lib/resources";
 import { useQuery, useResource } from "../../lib/useResource";
-import type { AppRow, AppRun } from "../../lib/types";
+import type { AppRow } from "../../lib/types";
 import Link from "../../ui/Link";
 import { ResourceGate, StaleChip } from "../../ui/ResourceStatus";
 import { homeNeeds, type HomeNeed } from "../home/needs";
@@ -89,10 +89,6 @@ function AppCard({
   const title = row.title?.trim() || row.name || "App";
   const appName = row.name;
   const href = appName ? appHref(row.project, appName) : null;
-  // The card's live line reads the app's runs — the same shared store
-  // the app page uses.
-  const runs = appName ? useQuery(resources.appRuns(`${row.project}/${appName}`)) : null;
-  const list: AppRun[] = runs?.data ?? [];
   const action = row.primary ?? null;
   return (
     <li className="card px-3.5 py-3 min-w-0" data-app={row.name ?? undefined}>
@@ -111,13 +107,13 @@ function AppCard({
           </div>
           <p className="text-label text-ink-400 mt-0.5 break-words">{appPurpose(row)}</p>
           <p className="text-micro text-ink-500 mt-1" data-summary>
-            {row.error
-              ? row.error
-              : runs?.status === "failed"
-                ? "activity unavailable"
-                : runs?.data
-                  ? (runsSummary(list, needs) ?? "Nothing running yet")
-                  : "reading activity…"}
+            {row.error ? (
+              row.error
+            ) : appName ? (
+              <AppActivity project={row.project} name={appName} needs={needs} />
+            ) : (
+              "activity unavailable"
+            )}
           </p>
         </div>
         {appName && href && action && (
@@ -139,4 +135,24 @@ function AppCard({
       </div>
     </li>
   );
+}
+
+/**
+ * The card's live line: the app's runs — the same shared store the app
+ * page uses. Its own component so the runs hook is called
+ * unconditionally, for the rows that have an app to read (CAD-571 N2).
+ */
+function AppActivity({
+  project,
+  name,
+  needs,
+}: {
+  project: string;
+  name: string;
+  needs: HomeNeed[];
+}) {
+  const runs = useQuery(resources.appRuns(`${project}/${name}`));
+  if (runs.status === "failed") return <>activity unavailable</>;
+  if (!runs.data) return <>reading activity…</>;
+  return <>{runsSummary(runs.data, needs) ?? "Nothing running yet"}</>;
 }

@@ -1494,6 +1494,7 @@ fn board_workflow_preview_names_render_refusals() {
     wf_add(&f, "two-step", WF_TWO_STEP);
     wf_add(&f, "pair", WF_PAIR);
     wf_add(&f, "alias", WF_ALIAS);
+    wf_add(&f, "shaped", WF_SLUG);
     let port = start_board(&f.pm_dir, &f.d.state);
     let before = f.commits();
 
@@ -1535,6 +1536,19 @@ fn board_workflow_preview_names_render_refusals() {
     let v = preview("alias", r#"{"runner":"has spaces"}"#);
     assert_eq!(v["code"], "render_diverged", "{v}");
     assert!(v["error"].as_str().is_some(), "{v}");
+
+    // CAD-571: a declared input shape (`kind: slug`) crosses the board
+    // as the same named refusal — the preview relays the daemon's render
+    // for every caller.
+    let v = preview("shaped", r#"{"topic":"t","slug":"../x"}"#);
+    assert_eq!(v["code"], "bad_shape", "{v}");
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("folder name"),
+        "{v}"
+    );
 
     // A refusal is a render answer, never a write: nothing committed.
     assert_eq!(f.commits(), before, "previews write nothing");
@@ -2059,12 +2073,13 @@ fn write_outbox_item(outbox: &Path, effect_id: &str, project: &str, title: &str,
 
 /// CAD-563: `GET /api/apps/<project>/<name>/outputs` — the outbox items
 /// the app's runs produced, attributed by the effect's recorded `task`
-/// (a ticket of one of the app's runs) or, for a send staged without a
-/// task, by the effect's agent owning one of those tickets. An item
-/// that is neither, and one whose effect row is unknown, stay out. The
-/// read is the operator's — the same gate `/api/outbox` runs: no
-/// session and an agent-attributed caller are refused before any
-/// ledger byte is read, a missing app is a 404.
+/// (a ticket of one of the app's runs). An item with no task, one whose
+/// task is no run's ticket, and one whose effect row is unknown all
+/// stay out — a task-less send by an agent owning one of the tickets is
+/// not the run's work (CAD-571 N7). The read is the operator's — the
+/// same gate `/api/outbox` runs: no session and an agent-attributed
+/// caller are refused before any ledger byte is read, a missing app is
+/// a 404.
 #[test]
 fn board_app_outputs_are_the_runs_and_operator_only() {
     let outbox = TempDir::new().unwrap();
@@ -2098,9 +2113,10 @@ fn board_app_outputs_are_the_runs_and_operator_only() {
 
     // Three published items and their effect rows: one staged with the
     // ticket named as its task, one staged without a task by a ticket's
-    // owner, one that is neither. A fourth row is still `waiting` — a
-    // staged send the operator has not released — and a fifth is a
-    // waiting send that belongs to no run.
+    // owner (not the run's work), one whose task is another run's. A
+    // fourth row is still `waiting` on a run ticket — a staged send the
+    // operator has not released — and a fifth is a waiting send that
+    // names no ticket, so no run accounts for it.
     write_outbox_item(
         outbox.path(),
         "ef-task",
@@ -2136,7 +2152,7 @@ fn board_app_outputs_are_the_runs_and_operator_only() {
         (
             "ef-waiting",
             "qa-1",
-            None,
+            Some(tickets[1].as_str()),
             "waiting",
             r#"{"title": "Ready to release"}"#,
         ),
@@ -2186,9 +2202,10 @@ fn board_app_outputs_are_the_runs_and_operator_only() {
     let (status, reply) = op_get(&op, port, "/api/apps/demo/nope/outputs");
     assert_eq!(status, 404, "{reply}");
 
-    // The proven operator reads the app's items — by task and by owner,
-    // newest first, and not the one that is neither. Each item names the
-    // run it is attributed to.
+    // The proven operator reads the app's items — the task-tied one
+    // only: the task-less send by a ticket's owner is no run's work, and
+    // neither is another run's task. Each item names the run it is
+    // attributed to.
     let (status, reply) = op_get(&op, port, "/api/apps/demo/studio/outputs");
     assert_eq!(status, 200, "{reply}");
     let v: Value = serde_json::from_str(&reply).unwrap();
@@ -2200,18 +2217,17 @@ fn board_app_outputs_are_the_runs_and_operator_only() {
         .iter()
         .map(|i| i["effect_id"].as_str().unwrap())
         .collect();
-    assert_eq!(ids, ["ef-owner", "ef-task"], "{v}");
+    assert_eq!(ids, ["ef-task"], "{v}");
     assert!(
         v["items"][0]["preview"]
             .as_str()
             .unwrap()
-            .contains("By owner"),
+            .contains("By task"),
         "{v}"
     );
     assert_eq!(v["items"][0]["runs"], json!([epic]), "{v}");
-    assert_eq!(v["items"][1]["runs"], json!([epic]), "{v}");
     // The staged, unreleased send of one of the runs is the app's next
-    // output — with its human title; a waiting send no run accounts for
+    // output — with its human title; a waiting send naming no ticket
     // stays out.
     let pending = v["pending"].as_array().unwrap();
     assert_eq!(pending.len(), 1, "{v}");

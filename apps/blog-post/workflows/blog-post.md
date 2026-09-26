@@ -3,8 +3,8 @@ title: "Blog post: {{topic}}"
 goal: "A reviewed post about {{topic}}, staged on the publish slot for the operator to release"
 label: New post
 inputs:
-  topic:      { ask: "What should the post be about?" }
-  slug:       { ask: "Folder name under posts/ (lowercase, hyphens)" }
+  topic:      { ask: "What should the post be about?", example: "How we onboard a new client" }
+  slug:       { ask: "Folder name under posts/ (lowercase, hyphens)", kind: slug }
   keyword:    { ask: "Main search phrase", optional: true }
   strategist: { ask: "Agent that researches and writes the brief" }
   writer:     { ask: "Agent that writes the post" }

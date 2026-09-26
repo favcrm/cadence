@@ -2,8 +2,9 @@ import { useEffect, useRef, useState } from "react";
 import { api, type ApiError } from "../../lib/api";
 import { resources } from "../../lib/resources";
 import type { WorkflowRow } from "../../lib/types";
-import { appFieldLabel, slugFromTopic, slugProblem, teamRole } from "../apps/apps";
+import { appFieldLabel, addMissing, slugFromTopic, slugProblem, teamRole } from "../apps/apps";
 import {
+  missingBlock,
   missingRequired,
   proposeBlock,
   proposedEpic,
@@ -38,6 +39,8 @@ export interface AppRunForm {
   primary: string | null;
   prefill: Record<string, string>;
   slugInput: string | null;
+  /** The run's plain name — the workflow's `label:` ("New post"). */
+  title: string;
   start: string;
   note?: string;
   validate?: (values: Record<string, string>) => string | null;
@@ -134,7 +137,13 @@ export default function RunForm({
   // The app variant's live validation (the folder name's shape, a team
   // that breaks the workflow's kept-apart rule) blocks like the gate.
   const invalid = app?.validate?.(values) ?? null;
-  const blocked = gate ?? invalid;
+  // The app drawer phrases a missing-inputs block as a plain ask
+  // ("Add a topic"), never the engine's field list (CAD-571).
+  const gateText =
+    app && gate !== null && gate === missingBlock(missing)
+      ? addMissing(missing, app.primary, app.slugInput)
+      : gate;
+  const blocked = gateText ?? invalid;
 
   const propose = () => {
     if (blocked || busy) return;
@@ -176,7 +185,7 @@ export default function RunForm({
             setValues((cur) => ({ ...cur, [f.name]: e.target.value }));
           }}
           className="field w-full"
-          placeholder={f.name}
+          placeholder={f.placeholder}
           aria-label={`${row.name} input ${f.name}`}
           aria-invalid={problem !== null || undefined}
           data-input={f.name}
@@ -270,7 +279,7 @@ export default function RunForm({
   return (
     <div className={app ? "px-3.5 py-3 min-w-0" : "border-t border-ink-700 px-3.5 py-3 grid gap-4 lg:grid-cols-2 min-w-0"}>
       <section className="min-w-0" aria-label={`${row.name} inputs`}>
-        <div className="slabel mb-1.5">{app ? "the run" : "new run"}</div>
+        <div className="slabel mb-1.5">{app ? app.title : "new run"}</div>
         {fields.length === 0 && (
           <p className="text-label text-ink-500">This workflow declares no inputs — it proposes as written.</p>
         )}

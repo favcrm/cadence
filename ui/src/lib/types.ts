@@ -957,6 +957,10 @@ export interface WorkflowInput {
   name: string;
   ask?: string | null;
   optional?: boolean;
+  /** The declared shape (`kind: slug`), when the workflow pins one. */
+  kind?: string | null;
+  /** An example value the run form shows in the empty field. */
+  example?: string | null;
 }
 
 /**

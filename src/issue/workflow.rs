@@ -5,8 +5,8 @@
 //! recorded, and `workflow check`/`ls`/`show` read.
 //!
 //! The format is the plan format ([`crate::issue::plan`]) plus an
-//! `inputs:` frontmatter map — `name: { ask, optional }` — and
-//! `{{name}}` placeholders anywhere in the file. `plan propose
+//! `inputs:` frontmatter map — `name: { ask, optional, kind, example }`
+//! — and `{{name}}` placeholders anywhere in the file. `plan propose
 //! --workflow` renders the file: placeholders take the `--input`
 //! values, `inputs:` drops out of the frontmatter, and the result goes
 //! through the unchanged propose → approve → gate path (the plan
@@ -15,6 +15,12 @@
 //! literal text — the same fail-loud convention as the plan parser's
 //! `deny_unknown_fields`.
 //!
+//! An input may declare a shape (`kind: slug`, CAD-571): render refuses
+//! a value that does not match it — `bad_shape` — for every caller, so
+//! a folder name like `../x` never reaches the plan prose. The shape is
+//! approval-affecting (it decides what is accepted), so it is part of
+//! the gate keys; `ask` and `example` are wording and are not.
+//!
 //! The file is gated like PROJECT.md's work keys (CAD-405): the
 //! operator's `workflow approve` records a digest of its *gate keys* —
 //! the parts that decide who does the work and in what order: the
@@ -22,10 +28,10 @@
 //! `depends_on`, plus `reviewer`, `tries`, `uses`, which the plan
 //! parser does not consume yet but a workflow may already carry for
 //! the check and the gate). Wording — the title, goal, descriptions,
-//! acceptance text, `inputs` — is not gated. A structural edit, CLI or
-//! hand, changes the digest, so `propose` refuses
-//! `workflow_unapproved` until the operator approves the new keys; a
-//! rendered plan still needs `plan approve` before any ticket
+//! acceptance text, `inputs`' asks and examples — is not gated. A
+//! structural edit, CLI or hand, changes the digest, so `propose`
+//! refuses `workflow_unapproved` until the operator approves the new
+//! keys; a rendered plan still needs `plan approve` before any ticket
 //! dispatches. The gate is a process guard, not a security boundary —
 //! same as the plan gate.
 
@@ -65,12 +71,78 @@ const TICKET_META_KEYS: &[&str] = &["size", "agent", "depends_on", "reviewer", "
 /// them — a placeholder here is refused.
 const STATIC_META_KEYS: &[&str] = &["size", "depends_on"];
 
-/// One `inputs:` entry: what the proposer is asked, and whether the
-/// run may leave it blank.
+/// One `inputs:` entry: what the proposer is asked, whether the run may
+/// leave it blank, the shape its value must match at render (CAD-571),
+/// and an example the run form shows in the empty field.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct InputSpec {
     pub ask: Option<String>,
     pub optional: bool,
+    pub kind: Option<InputKind>,
+    pub example: Option<String>,
+}
+
+/// A declared input shape: the value must match it at render, for every
+/// caller. `slug` is the v0 kind — a folder name, safe as one path
+/// segment (the app pages' `posts/<slug>/` prose, a drawer's live check).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputKind {
+    Slug,
+}
+
+impl InputKind {
+    /// The declared spelling (`kind: slug`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InputKind::Slug => "slug",
+        }
+    }
+
+    fn parse(s: &str) -> Option<InputKind> {
+        match s {
+            "slug" => Some(InputKind::Slug),
+            _ => None,
+        }
+    }
+}
+
+/// The longest folder name a `slug` input may carry — the same cap the
+/// board's drawer applies (`slugProblem` in ui/.../apps.ts).
+const SLUG_MAX: usize = 60;
+
+/// Why `value` is not shaped as `kind`, or `None` when it is. The rule
+/// is one place: render's refusal and the `example:` check both read it.
+fn shape_problem(kind: InputKind, value: &str) -> Option<&'static str> {
+    match kind {
+        InputKind::Slug => {
+            if value.is_empty() || value.len() > SLUG_MAX {
+                Some("1-60 characters")
+            } else if value.split('-').any(str::is_empty) {
+                Some("no leading, trailing or doubled hyphen")
+            } else if !value
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            {
+                Some("lowercase letters, digits and hyphens only")
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// The shape refusal for `name`'s value, or `Ok(())`.
+fn check_shape(kind: InputKind, name: &str, value: &str) -> Result<()> {
+    if let Some(why) = shape_problem(kind, value) {
+        return Err(Error::invalid(
+            "bad_shape",
+            format!(
+                "input '{name}' must be a folder name (`kind: {}`) — {why}; got '{value}'",
+                kind.as_str()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// A parsed workflow template: the declared inputs, the `distinct:`
@@ -89,7 +161,7 @@ pub struct Template {
 }
 
 /// The declared inputs as the board renders them — file order, each
-/// with its ask and optionality.
+/// with its ask, optionality, declared shape and example.
 pub fn inputs_json(tpl: &Template) -> Vec<Value> {
     let mut names = tpl.input_order.clone();
     for name in tpl.inputs.keys() {
@@ -103,6 +175,8 @@ pub fn inputs_json(tpl: &Template) -> Vec<Value> {
             tpl.inputs.get(name).map(|spec| {
                 json!({
                     "name": name, "ask": spec.ask, "optional": spec.optional,
+                    "kind": spec.kind.map(InputKind::as_str),
+                    "example": spec.example,
                 })
             })
         })
@@ -237,7 +311,7 @@ fn parse_front(yaml: &str) -> Result<Front> {
     if let Some(inputs_val) = inputs_val {
         let serde_yaml::Value::Mapping(specs) = inputs_val else {
             return Err(Error::rejected(
-                "workflow `inputs:` must be a map of name → { ask, optional }",
+                "workflow `inputs:` must be a map of name → { ask, optional, kind, example }",
             ));
         };
         for (k, v) in specs {
@@ -253,7 +327,7 @@ fn parse_front(yaml: &str) -> Result<Front> {
                 serde_yaml::Value::Null => InputSpec::default(),
                 serde_yaml::Value::String(ask) => InputSpec {
                     ask: Some(ask),
-                    optional: false,
+                    ..InputSpec::default()
                 },
                 serde_yaml::Value::Mapping(m) => {
                     let mut spec = InputSpec::default();
@@ -261,14 +335,48 @@ fn parse_front(yaml: &str) -> Result<Front> {
                         match (sk.as_str(), sv) {
                             (Some("ask"), serde_yaml::Value::String(s)) => spec.ask = Some(s),
                             (Some("optional"), serde_yaml::Value::Bool(b)) => spec.optional = b,
+                            (Some("kind"), serde_yaml::Value::String(s)) => {
+                                let Some(kind) = InputKind::parse(s.trim()) else {
+                                    return Err(Error::rejected(format!(
+                                        "input '{name}': unknown kind '{}' — v0 knows slug",
+                                        s.trim()
+                                    )));
+                                };
+                                spec.kind = Some(kind);
+                            }
+                            (Some("kind"), _) => {
+                                return Err(Error::rejected(format!(
+                                    "input '{name}': `kind:` is a shape name — v0 knows slug"
+                                )))
+                            }
+                            (Some("example"), serde_yaml::Value::String(s)) => {
+                                let s = s.trim();
+                                if s.chars().count() > 80 || s.chars().any(char::is_control) {
+                                    return Err(Error::rejected(format!(
+                                        "input '{name}': `example:` — ≤80 chars, one line, \
+                                         no control characters"
+                                    )));
+                                }
+                                if !s.is_empty() {
+                                    spec.example = Some(s.to_string());
+                                }
+                            }
+                            (Some("example"), _) => {
+                                return Err(Error::rejected(format!(
+                                    "input '{name}': `example:` is one line of text — the \
+                                     value the run form shows in the empty field"
+                                )))
+                            }
                             (Some(k), _) => {
                                 return Err(Error::rejected(format!(
-                                    "input '{name}': unknown key '{k}' — ask, optional"
+                                    "input '{name}': unknown key '{k}' — ask, optional, \
+                                     kind, example"
                                 )))
                             }
                             (None, _) => {
                                 return Err(Error::rejected(format!(
-                                    "input '{name}': keys must be strings — ask, optional"
+                                    "input '{name}': keys must be strings — ask, optional, \
+                                     kind, example"
                                 )))
                             }
                         }
@@ -278,10 +386,21 @@ fn parse_front(yaml: &str) -> Result<Front> {
                 _ => {
                     return Err(Error::rejected(format!(
                         "input '{name}' must be a string (the ask) or a map \
-                         {{ ask, optional }}"
+                         {{ ask, optional, kind, example }}"
                     )))
                 }
             };
+            // An example the declared shape refuses would suggest a value
+            // the engine then refuses — checked together, after the map.
+            if let (Some(kind), Some(example)) = (spec.kind, spec.example.as_deref()) {
+                if shape_problem(kind, example).is_some() {
+                    return Err(Error::rejected(format!(
+                        "input '{name}': `example: '{example}'` does not fit `kind: {}` — \
+                         an example must be a value the shape accepts",
+                        kind.as_str()
+                    )));
+                }
+            }
             inputs.insert(name.to_string(), spec);
             input_order.push(name.to_string());
         }
@@ -494,7 +613,8 @@ fn render_values(text: &str, values: &BTreeMap<String, String>) -> Result<String
 /// and missing required inputs refuse with a named reason; absent
 /// optionals render as empty. A value must be a single line — a
 /// newline or control character would inject plan structure under an
-/// approved skeleton — and `distinct:` inputs must differ. After
+/// approved skeleton — an input that declares a shape (`kind:`) must
+/// match it (`bad_shape`), and `distinct:` inputs must differ. After
 /// substitution the rendered plan's skeleton (ticket count, per-ticket
 /// metadata keys, `depends_on` edges) must match the template's own:
 /// defence in depth if the one-line rule is ever loosened.
@@ -550,6 +670,14 @@ pub fn render(text: &str, provided: &BTreeMap<String, String>) -> Result<String>
                     c as u32
                 ),
             ));
+        }
+    }
+    // A declared shape (`kind:`) is enforced on the value itself, for
+    // every caller — the daemon, the CLI, the board's preview. Iterated
+    // over the declared inputs (sorted) so the refusal order is stable.
+    for (k, spec) in &tpl.inputs {
+        if let (Some(kind), Some(v)) = (spec.kind, provided.get(k)) {
+            check_shape(kind, k, v)?;
         }
     }
     // `distinct:` compares the trimmed values — the same normalization
@@ -769,12 +897,13 @@ fn normalize_deps(value: &str) -> String {
 }
 
 /// The approval-affecting skeleton: the declared input names with
-/// their required/optional flag (an input can feed `{{name}}` in a
-/// gated position, so the contract is pinned — but never the `ask`
-/// wording), the ticket count, and each ticket's metadata lines
-/// (recognised keys, values normalised, sorted per ticket). Wording —
-/// titles, prose, acceptance items, `ask` text — is not here, so a
-/// wording-only edit keeps the digest.
+/// their required/optional flag and declared shape (an input can feed
+/// `{{name}}` in a gated position, and a shape decides what values are
+/// accepted at all, so the contract is pinned — but never the `ask` or
+/// `example` wording), the ticket count, and each ticket's metadata
+/// lines (recognised keys, values normalised, sorted per ticket).
+/// Wording — titles, prose, acceptance items, `ask` and `example` text
+/// — is not here, so a wording-only edit keeps the digest.
 pub fn gate_keys(text: &str) -> Result<String> {
     let (_yaml, body) = parse::split_front(text).map_err(|e| {
         Error::rejected(format!("{e} — a workflow is a plan file with frontmatter"))
@@ -784,7 +913,13 @@ pub fn gate_keys(text: &str) -> Result<String> {
     keys.push_str(
         &tpl.inputs
             .iter()
-            .map(|(n, s)| format!("{n}{}", if s.optional { "?" } else { "!" }))
+            .map(|(n, s)| {
+                let mut key = format!("{n}{}", if s.optional { "?" } else { "!" });
+                if let Some(kind) = s.kind {
+                    key.push_str(&format!(":{}", kind.as_str()));
+                }
+                key
+            })
             .collect::<Vec<_>>()
             .join(","),
     );
@@ -1699,6 +1834,113 @@ Why.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance
         // depends_on order/punctuation normalises.
         let dep_order = WF.replace("depends_on: 1", "depends_on: [1]");
         assert_eq!(gate_digest(&dep_order).unwrap(), approved);
+    }
+
+    /// CAD-571 N3: the `inputs:` map's order is presentation (the run
+    /// form shows the author's order), never the gate — reordering the
+    /// declarations keeps the digest, so an existing approval survives.
+    #[test]
+    fn gate_digest_stable_on_input_reorder() {
+        let reordered = WF.replace(
+            "  topic: { ask: \"About what?\" }\n  keyword: { ask: \"Phrase\", optional: true }",
+            "  keyword: { ask: \"Phrase\", optional: true }\n  topic: { ask: \"About what?\" }",
+        );
+        assert_ne!(reordered, WF, "the fixture must actually reorder");
+        assert_eq!(gate_digest(&reordered).unwrap(), gate_digest(WF).unwrap());
+        assert_eq!(
+            parse_template(&reordered).unwrap().input_order,
+            vec!["keyword", "topic"],
+            "the form keeps the file's order"
+        );
+    }
+
+    /// CAD-571: `kind: slug` shapes the value at render — the hostile
+    /// and malformed folder names refuse `bad_shape` naming the input,
+    /// a folder name renders into the prose, and the declaration is
+    /// structural (gate keys). `example:` is wording: it never moves
+    /// the digest, and one the shape would refuse refuses the file.
+    #[test]
+    fn input_kind_slug_shapes_the_value_at_render() {
+        const SHAPED: &str = "---\ntitle: \"Post: {{topic}}\"\ngoal: \"Write {{topic}}\"\n\
+label: New post\ninputs:\n  topic: { ask: \"About what?\", example: \"How we onboard\" }\n  slug: { ask: \"Folder name\", kind: slug }\n---\n\n\
+## Write {{topic}}\nagent: dev-1\n\nposts/{{slug}}/post.md\n\n### Acceptance\n- [ ] written\n";
+        let tpl = parse_template(SHAPED).unwrap();
+        assert_eq!(tpl.inputs["slug"].kind, Some(InputKind::Slug));
+        assert_eq!(
+            tpl.inputs["topic"].example.as_deref(),
+            Some("How we onboard")
+        );
+        let rows = inputs_json(&tpl);
+        assert_eq!(rows[1]["kind"], "slug", "{rows:?}");
+        assert_eq!(rows[0]["example"], "How we onboard", "{rows:?}");
+
+        let out = render(SHAPED, &inputs(&[("topic", "t"), ("slug", "my-post")])).unwrap();
+        assert!(out.contains("posts/my-post/post.md"), "{out}");
+
+        for bad in [
+            "../x",
+            "/",
+            "Upper",
+            "with space",
+            "a--b",
+            "-lead",
+            "trail-",
+            "under_score",
+            "dot.name",
+        ] {
+            let e = render(SHAPED, &inputs(&[("topic", "t"), ("slug", bad)])).unwrap_err();
+            assert_eq!(e.code(), Some("bad_shape"), "{bad:?}: {e}");
+            assert!(e.to_string().contains("'slug'"), "{bad:?}: {e}");
+        }
+        let long = "x".repeat(SLUG_MAX + 1);
+        assert_eq!(
+            render(SHAPED, &inputs(&[("topic", "t"), ("slug", &long)]))
+                .unwrap_err()
+                .code(),
+            Some("bad_shape"),
+            "over the cap"
+        );
+        // The cap boundary is inclusive.
+        let exact = "x".repeat(SLUG_MAX);
+        assert!(render(SHAPED, &inputs(&[("topic", "t"), ("slug", &exact)])).is_ok());
+
+        // The shape is structural; the example is wording.
+        let no_shape = SHAPED.replace(", kind: slug", "");
+        assert_ne!(
+            gate_digest(SHAPED).unwrap(),
+            gate_digest(&no_shape).unwrap()
+        );
+        let no_example = SHAPED.replace(", example: \"How we onboard\"", "");
+        assert_eq!(
+            gate_digest(SHAPED).unwrap(),
+            gate_digest(&no_example).unwrap(),
+            "an example is wording"
+        );
+        // An example the shape refuses refuses the file; a shaped one
+        // parses; an unknown kind and a non-string one refuse.
+        let e = parse_template(&SHAPED.replace("kind: slug", "kind: slug, example: \"My Post\""))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("does not fit"), "{e}");
+        let ok_example = SHAPED.replace("kind: slug", "kind: slug, example: \"my-post\"");
+        assert_eq!(
+            parse_template(&ok_example).unwrap().inputs["slug"]
+                .example
+                .as_deref(),
+            Some("my-post")
+        );
+        let e = parse_template(&SHAPED.replace("kind: slug", "kind: folder"))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("unknown kind"), "{e}");
+        let e = parse_template(&SHAPED.replace("kind: slug", "kind: 3"))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("shape name"), "{e}");
+        // A shaped input that is optional and absent still renders
+        // empty (the declaration is the author's; the form asks for it).
+        let optional = SHAPED.replace("kind: slug", "kind: slug, optional: true");
+        assert!(render(&optional, &inputs(&[("topic", "t")])).is_ok());
     }
 
     #[test]

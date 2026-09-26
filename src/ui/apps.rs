@@ -21,8 +21,8 @@
 //!   items this app's runs produced (CAD-563), operator-only like
 //!   `/api/outbox` (the same proof, the same relay): an item is
 //!   attributed by its effect's recorded `task` — a ticket of one of
-//!   the app's runs — or, for a send staged without a task, by the
-//!   effect's agent owning one of those tickets.
+//!   the app's runs — and a task-less send belongs to no run, so the
+//!   page counts only what its runs did (CAD-571 N7).
 //! - `POST /api/apps/<project>/<name>/approve` — relays the daemon's
 //!   `app_approve` verbatim — the same call `cadence app approve`
 //!   makes; the board keeps no second approval path.
@@ -219,9 +219,10 @@ fn run_app(v: &board::View) -> Option<(&str, &str)> {
 /// this app's runs produced, plus the sends those runs staged and the
 /// operator has not released yet (CAD-563): the ledger relayed exactly
 /// as `/api/outbox` relays it, narrowed to what the app's runs account
-/// for. Operator-only — the same proof `/api/outbox` runs, because the
-/// ledger's previews and paths are the operator's — so the gate comes
-/// before any tracker or ledger read.
+/// for — the run whose plan lists the effect's `task`; a task-less send
+/// is no run's (CAD-571 N7). Operator-only — the same proof
+/// `/api/outbox` runs, because the ledger's previews and paths are the
+/// operator's — so the gate comes before any tracker or ledger read.
 fn outputs(
     request: &Request,
     pm: &Pm,
@@ -245,12 +246,12 @@ fn outputs(
         return err_response(404, &e.to_string());
     }
     // What an effect is attributed by: the run whose plan lists the
-    // effect's `task`, or — for a send staged without one — the run
-    // whose ticket the effect's agent owns (the workflow's `agent:` is
-    // the ticket's owner, so that agent is the one that worked it).
+    // effect's `task` — a ticket of one of the app's runs. A send
+    // staged without a task is attributed to no run: the page counts
+    // only what its runs did (CAD-571 N7), never a task-less send an
+    // agent owning one of the tickets happened to stage.
     let read = super::read_model::get(state_dir, &pm.dir).board(pm, Some(key));
-    let by_id = read.by_id();
-    let runs: Vec<(String, HashSet<String>, HashSet<String>)> = read
+    let runs: Vec<(String, HashSet<String>)> = read
         .views
         .iter()
         .filter(|v| run_app(v).is_some_and(|(a, _)| a == name))
@@ -262,21 +263,16 @@ fn outputs(
                 .iter()
                 .flat_map(|p| p.tickets.iter().cloned())
                 .collect();
-            let owners: HashSet<String> = tickets
-                .iter()
-                .filter_map(|t| by_id.get(t).and_then(|v| v.issue.front.owner.clone()))
-                .collect();
-            (v.issue.front.id.clone(), tickets, owners)
+            (v.issue.front.id.clone(), tickets)
         })
         .collect();
-    let runs_for = |task: Option<&str>, agent: &str| -> Vec<String> {
-        let hit = |(_, tickets, owners): &(String, HashSet<String>, HashSet<String>)| match task {
-            Some(t) => tickets.contains(t),
-            None => owners.contains(agent),
+    let runs_for = |task: Option<&str>| -> Vec<String> {
+        let Some(task) = task else {
+            return Vec::new();
         };
         runs.iter()
-            .filter(|r| hit(r))
-            .map(|(epic, _, _)| epic.clone())
+            .filter(|(_, tickets)| tickets.contains(task))
+            .map(|(epic, _)| epic.clone())
             .collect()
     };
     let facts = effect_facts(state_dir);
@@ -290,7 +286,7 @@ fn outputs(
         .flatten()
         .filter_map(|item| {
             let fact = item["effect_id"].as_str().and_then(|id| facts.get(id))?;
-            let runs = runs_for(fact.task.as_deref(), &fact.agent);
+            let runs = runs_for(fact.task.as_deref());
             if runs.is_empty() {
                 return None;
             }
@@ -307,7 +303,7 @@ fn outputs(
         if !matches!(fact.state.as_str(), "waiting" | "decided") {
             continue;
         }
-        let runs = runs_for(fact.task.as_deref(), &fact.agent);
+        let runs = runs_for(fact.task.as_deref());
         if runs.is_empty() {
             continue;
         }
@@ -322,14 +318,13 @@ fn outputs(
     json_response(json!({"project": key, "name": name, "items": items, "pending": pending}))
 }
 
-/// What the durable effect ledger says about one effect: who staged it,
-/// the task it named (if any), its state and the human title of its
-/// input. A read-only open, like the `plan_proposed` fallback
+/// What the durable effect ledger says about one effect: the task it
+/// named (if any), its state and the human title of its input. A
+/// read-only open, like the `plan_proposed` fallback
 /// `open_plan_epics` reads; the caller has already proven the operator,
 /// so nothing here widens a gate. Unreadable ledger: no effect is
 /// attributed, never an error.
 struct EffectFacts {
-    agent: String,
     task: Option<String>,
     state: String,
     title: Option<String>,
@@ -339,23 +334,22 @@ fn effect_facts(state_dir: &std::path::Path) -> HashMap<String, EffectFacts> {
     let Ok(conn) = crate::store::open_read_only(&state_dir.join("cadence.sqlite3")) else {
         return HashMap::new();
     };
-    let Ok(mut stmt) = conn.prepare(
-        "SELECT effect_id, agent, task, state, input, input_summary FROM platform_effects",
-    ) else {
+    let Ok(mut stmt) =
+        conn.prepare("SELECT effect_id, task, state, input, input_summary FROM platform_effects")
+    else {
         return HashMap::new();
     };
     let rows = stmt.query_map([], |r| {
-        let input: String = r.get(4)?;
+        let input: String = r.get(3)?;
         let title = serde_json::from_str::<Value>(&input)
             .ok()
             .and_then(|v| v["title"].as_str().map(str::to_string));
         Ok((
             r.get::<_, String>(0)?,
             EffectFacts {
-                agent: r.get(1)?,
-                task: r.get(2)?,
-                state: r.get(3)?,
-                title: title.or_else(|| r.get::<_, Option<String>>(5).ok().flatten()),
+                task: r.get(1)?,
+                state: r.get(2)?,
+                title: title.or_else(|| r.get::<_, Option<String>>(4).ok().flatten()),
             },
         ))
     });

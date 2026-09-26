@@ -1,5 +1,6 @@
 import {
   appApprovalChip,
+  addMissing,
   appHref,
   appNeeds,
   appPurpose,
@@ -284,6 +285,33 @@ equal(
   "no label falls back",
 );
 equal(primaryAction({ ...detail, workflows: [] }), null, "no workflow, no action");
+// CAD-571 N5: the action is the workflow the LIST CARD's primary names
+// — even when the detail's workflow list is ordered the other way —
+// so a multi-workflow app's card and page never open different runs.
+const second: AppWorkflow = { ...wf, name: "studio/aa-second", label: "New alpha" };
+equal(
+  primaryAction({
+    ...detail,
+    primary: { workflow: "aa-second", label: "New alpha" },
+    workflows: [wf, second],
+  })?.wf.name,
+  "studio/aa-second",
+  "the named primary wins over list order",
+);
+equal(
+  primaryAction({
+    ...detail,
+    primary: { workflow: "studio/aa-second", label: "New alpha" },
+    workflows: [wf, second],
+  })?.wf.name,
+  "studio/aa-second",
+  "an app-qualified primary also matches",
+);
+equal(
+  primaryAction({ ...detail, primary: { workflow: "gone" }, workflows: [wf, second] })?.wf.name,
+  "studio/do-check",
+  "an unknown primary falls back to the first",
+);
 
 // Steps: the plain label is the part before the colon.
 equal(stepLabel("Brief: my topic"), "Brief", "step label before the colon");
@@ -306,6 +334,55 @@ equal(
   "the last run's owners",
 );
 equal(teamFromLastRun(wf, []), {}, "no runs, no team");
+// CAD-571 N6: the mapping is by the step's label, never the ticket's
+// index — a workflow whose steps were reordered (or that gained one)
+// still prefills the right agent for each role.
+const reordered: AppWorkflow = {
+  ...wf,
+  steps: [
+    { title: "Review: topic", agent: "reviewer" },
+    { title: "Brief: topic", agent: "writer" },
+  ],
+};
+equal(
+  teamFromLastRun(reordered, [
+    run({}, { tickets: [
+      { id: "D-2", title: "Brief: old", status: "done", owner: "w-old" },
+      { id: "D-3", title: "Review: old", status: "done", owner: "r-old" },
+    ] }),
+  ]),
+  { writer: "w-old", reviewer: "r-old" },
+  "labels, not positions",
+);
+const grew: AppWorkflow = {
+  ...wf,
+  steps: [
+    { title: "Brief: topic", agent: "writer" },
+    { title: "Review: topic", agent: "reviewer" },
+    { title: "Publish: topic", agent: "publisher" },
+  ],
+  inputs: [...(wf.inputs ?? []), { name: "publisher", ask: "Who publishes" }],
+};
+equal(
+  teamFromLastRun(grew, [
+    run({}, { tickets: [
+      { id: "D-2", title: "Brief: old", status: "done", owner: "w-old" },
+      { id: "D-3", title: "Review: old", status: "done", owner: "r-old" },
+    ] }),
+  ]),
+  { writer: "w-old", reviewer: "r-old" },
+  "a new step takes nothing from an older run",
+);
+equal(
+  teamFromLastRun(wf, [
+    run({}, { tickets: [
+      { id: "D-2", title: "Untitled work", status: "done", owner: "x" },
+      { id: "D-3", title: "Brief: old", status: "done", owner: "w-old" },
+    ] }),
+  ]),
+  { writer: "w-old" },
+  "an unmapped ticket is skipped",
+);
 
 // The slug a topic suggests.
 equal(slugFromTopic("Cadence vs Conductor!"), "cadence-vs-conductor", "slug from topic");
@@ -391,6 +468,27 @@ equal(slugProblem("cadence-vs-conductor"), null, "a good folder name");
 equal(slugProblem("") , null, "empty is the form's own message");
 equal(slugProblem("My Post") !== null, true, "spaces and caps are refused inline");
 equal(slugProblem("x".repeat(61)) !== null, true, "too long");
+// CAD-571: the drawer's missing-inputs ask is plain words — the topic
+// names the folder name too while the topic is empty, and the team is
+// one clause of its own — never "missing required inputs: topic, slug".
+equal(
+  addMissing(["topic", "slug"], "topic", "slug"),
+  "Add a topic.",
+  "the topic covers the folder name it derives",
+);
+equal(addMissing(["slug"], "topic", "slug"), "Add a folder name.", "a cleared folder name names itself");
+equal(
+  addMissing(["topic", "slug", "strategist", "writer", "reviewer"], "topic", "slug"),
+  "Add a topic and choose the team.",
+  "the team is one clause",
+);
+equal(addMissing(["strategist"], "topic", "slug"), "Choose the team.", "team only");
+equal(addMissing([], "topic", "slug"), "Fill in the run's inputs.", "nothing named");
+equal(
+  addMissing(["keyword"], "topic", "slug"),
+  "Add a keyword.",
+  "any other input by its name",
+);
 const trio = {
   ...wf,
   inputs: [...(wf.inputs ?? []), { name: "designer", ask: "Who draws" }],
