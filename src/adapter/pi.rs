@@ -153,8 +153,10 @@ pub(crate) fn pi_master_env_scrub() -> EnvScrub {
 /// The only inherited variables a Pi WORKER keeps (CAD-544) — the same
 /// allowlist posture as the master ([`pi_master_env_scrub`]), plus what
 /// an unattended development worker needs:
-/// - `TMPDIR` and the `XDG_*` dirs — tool config and caches land where
-///   the operator put them;
+/// - `TMPDIR` and the `XDG_*` dirs — tool config lands where the
+///   operator put it (`XDG_CACHE_HOME` itself is overridden per agent
+///   at open — CAD-570 — so the inherited value never reaches a
+///   provider cache);
 /// - `SSH_AUTH_SOCK`/`SSH_AGENT_PID` — git over an ssh-agent;
 /// - `CARGO_HOME`, `RUSTUP_HOME`, `RUSTC_WRAPPER`, `SCCACHE_DIR` — the
 ///   host's Rust toolchain layout;
@@ -309,6 +311,21 @@ fn pi_worker_config_dir(state_dir: &Path, alias: &str) -> Result<PathBuf> {
 /// The worker's persistent Pi session file (`<worker>/session.jsonl`).
 fn pi_worker_session(state_dir: &Path, alias: &str) -> Result<PathBuf> {
     Ok(pi_worker_dir(state_dir, alias)?.join("session.jsonl"))
+}
+
+/// The agent's own `XDG_CACHE_HOME` (CAD-570): the master gets
+/// `<state>/master/pi/cache`, a worker `<state>/agents/<alias>/pi/
+/// cache` — created 0700 on open. pi-devin's model catalog lands at
+/// `$XDG_CACHE_HOME/pi-devin/models.json`; under Landlock the
+/// operator's `~/.cache` is denied outright (a confined master's
+/// catalog fetch EACCES'd every open on the smoke host), and
+/// unconfined two agents must still never share one cache file.
+fn pi_cache_dir(state_dir: &Path, alias: &str) -> Result<PathBuf> {
+    if crate::master::is_master(alias) {
+        Ok(pi_config_dir(state_dir).join("cache"))
+    } else {
+        Ok(pi_worker_config_dir(state_dir, alias)?.join("cache"))
+    }
 }
 
 /// Create `dir` (recursive) at mode 0700, tightening an existing one.
@@ -679,7 +696,8 @@ fn git_common_dir(cwd: &Path) -> Option<PathBuf> {
 ///   effective_target_dir`] — the declared `--target-dir`/
 ///   `CARGO_TARGET_DIR`/config value) plus the shared dep cache
 ///   ([`crate::worktree::shared_target_dir`]) the worktree's target
-///   symlinks into; its own dir under the state dir (`pi/` config,
+///   symlinks into; its own dir under the state dir (`pi/` config —
+///   including `pi/cache`, the agent's own XDG_CACHE_HOME (CAD-570) —
 ///   session file, `tmp/` — the confined child's TMPDIR is redirected
 ///   there because a `/tmp` write grant would expose every lane);
 ///   the PM tracker (`issue` verbs commit to it); the cargo
@@ -832,6 +850,15 @@ pub fn pi_worker_confinement(
         read.push(home.join(".config/sccache"));
         read.push(home.join(".ssh/config"));
         read.push(home.join(".ssh/known_hosts"));
+    }
+    // CAD-570: the worker's own XDG_CACHE_HOME (`<worker>/pi/cache`),
+    // named explicitly so the write set shows it — it is inside the
+    // `agents/<alias>` grant either way, so the push is documentation
+    // plus resilience if that grant ever narrows.
+    if let Ok(cache) = pi_worker_config_dir(state_dir, &agent.alias).map(|d| d.join("cache")) {
+        if !write.contains(&cache) {
+            write.push(cache);
+        }
     }
     // CAD-559: the pinned `[pi].providers` package dirs the `-e`
     // entries point into — read-only, the same grant the master gets.
@@ -1646,7 +1673,26 @@ impl ProviderAdapter for PiAdapter {
                 pm.as_deref(),
                 master_confined(&self.env, agent),
             ));
-        } else {
+        }
+        // CAD-570: every pi agent gets its own XDG_CACHE_HOME inside
+        // its private dir, created 0700 — pi-devin's model catalog
+        // lives at `$XDG_CACHE_HOME/pi-devin/models.json`, and under
+        // Landlock the operator's `~/.cache` is denied outright (the
+        // smoke host's confined master EACCES'd it every open). The
+        // dir is inside the already-granted provider/worker dir, so
+        // confinement needs nothing new; unconfined, the explicit
+        // value keeps a worker off the shared `~/.cache` its env
+        // allowlist would otherwise inherit — two agents never share
+        // one catalog file. Push order is deliberate: the worker's
+        // env keep-list re-inherits the operator's XDG_CACHE_HOME and
+        // `env_overrides` sets none, so this pair always wins.
+        let cache_dir = pi_cache_dir(&self.state_dir, &agent.alias)?;
+        ensure_private_dir(&cache_dir)?;
+        env.push((
+            "XDG_CACHE_HOME".to_string(),
+            cache_dir.to_string_lossy().to_string(),
+        ));
+        if !master {
             // CAD-544 worker: a private `PI_CODING_AGENT_DIR` under the
             // state dir — auth arrives as the scoped file copy, never
             // via env or argv; `~/.pi` is never inherited. An

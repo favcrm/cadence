@@ -206,12 +206,49 @@ fn worker_env_is_an_allowlist() {
         "PI_CODING_AGENT_DIR",
         "PI_OFFLINE",
         "GIT_TERMINAL_PROMPT",
+        "XDG_CACHE_HOME",
     ] {
         assert!(
             env.iter().any(|n| n == kept),
             "{kept} missing from the worker env: {env:?}"
         );
     }
+}
+
+/// CAD-570: a worker's XDG_CACHE_HOME is its own — proven by WHERE
+/// the pi-devin catalog write lands, never by the name alone. The
+/// worker keep-list still inherits the operator's XDG_CACHE_HOME (the
+/// launch line's explicit pair must win): plant one pointing at an
+/// empty operator cache and assert the file lands under
+/// `<state>/agents/<alias>/pi/cache/pi-devin/` (0700), never there.
+/// Mutation: dropping the explicit env pair writes the catalog to the
+/// planted dir — this test fails.
+#[test]
+fn worker_cache_home_is_its_own_private_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path();
+    let planted = tempfile::tempdir().unwrap();
+    std::env::set_var("XDG_CACHE_HOME", planted.path());
+    let ad = adapter("normal", state, &[]);
+    ad.open(&worker("wcache", dir.path(), json!({}))).unwrap();
+    ad.close();
+    std::env::remove_var("XDG_CACHE_HOME");
+
+    let cache = state.join("agents/wcache/pi/cache");
+    assert!(
+        cache.join("pi-devin/models.json").is_file(),
+        "the pi-devin catalog did not land in the worker's own cache dir"
+    );
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(&cache).unwrap().permissions().mode() & 0o777,
+        0o700,
+        "the worker's cache dir is private"
+    );
+    assert!(
+        !planted.path().join("pi-devin").exists(),
+        "the inherited operator cache received the catalog — the explicit pair lost"
+    );
 }
 
 #[test]

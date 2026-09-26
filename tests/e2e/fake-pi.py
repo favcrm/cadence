@@ -102,6 +102,32 @@ def record_launch():
                 f.write(payload)
 
 
+# The pi-devin catalog cache (CAD-570): real pi-devin keeps its model
+# catalog at ${XDG_CACHE_HOME:-~/.cache}/pi-devin/models.json. Writing
+# it exactly there exercises the agent's private XDG_CACHE_HOME — a
+# confined agent whose var is unset or pointed at the operator's
+# ~/.cache gets EACCES, which lands on stderr (the provider log).
+# `catalog-cache` mode turns the EACCES into a hard exit(3) so a
+# missing private dir fails the open rather than passing unasserted.
+def write_catalog_cache():
+    cache = os.environ.get("XDG_CACHE_HOME") or os.path.join(
+        os.environ.get("HOME", "/"), ".cache"
+    )
+    path = os.path.join(cache, "pi-devin")
+    try:
+        os.makedirs(path, exist_ok=True)
+        with open(os.path.join(path, "models.json"), "w") as f:
+            json.dump({"models": [], "fetched": True}, f)
+    except OSError as e:
+        sys.stderr.write(
+            "Devin: failed to read model catalog cache: %s %s/pi-devin/models.json\n"
+            % (e, cache)
+        )
+        sys.stderr.flush()
+        if MODE == "catalog-cache":
+            sys.exit(3)
+
+
 # `--session <path>`: an existing file resumes its stored session id
 # and prompt count; a missing file mints a fresh session and writes the
 # header now, so a later open resumes it.
@@ -154,6 +180,7 @@ def record_rpc(rtype):
 
 
 record_launch()
+write_catalog_cache()
 SESSION_FILE, PROMPTS_SEEN, _sid = None, 0, None
 _args = sys.argv[1:]
 if "--session" in _args:

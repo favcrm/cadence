@@ -249,6 +249,10 @@ fn emitted_worker_policy_is_the_worktree_plus_declared_caches() {
         repo.wt.clone(),
         repo.common_git.clone(),
         worker_dir.clone(),
+        // CAD-570: the worker's own XDG_CACHE_HOME — where pi-devin
+        // writes its model catalog — named in the write set itself,
+        // not only covered by the worker-dir grant.
+        worker_dir.join("pi/cache"),
         pm.clone(),
         home.join(".cargo/registry"),
         home.join(".cargo/git"),
@@ -260,6 +264,13 @@ fn emitted_worker_policy_is_the_worktree_plus_declared_caches() {
             want.display()
         );
     }
+    // And never the operator's own cache — the un-fixed posture this
+    // ticket removes.
+    assert!(
+        !covers(&policy.write, &home.join(".cache/pi-devin"))
+            && !covers(&policy.read, &home.join(".cache/pi-devin")),
+        "the operator's ~/.cache must stay out of the policy"
+    );
     for want in [
         home.join(".cargo/bin"),
         home.join(".cargo/config.toml"),
@@ -434,11 +445,29 @@ fn confined_worker_runs_fake_pi_under_the_policy() {
     )
     .unwrap();
     let env: Vec<String> = serde_json::from_value(rec["env"].clone()).unwrap();
-    for name in ["TMPDIR", "GIT_CONFIG_GLOBAL", "PI_CODING_AGENT_DIR"] {
+    for name in [
+        "TMPDIR",
+        "GIT_CONFIG_GLOBAL",
+        "PI_CODING_AGENT_DIR",
+        "XDG_CACHE_HOME",
+    ] {
         assert!(env.iter().any(|n| n == name), "{name} missing: {env:?}");
     }
+    // CAD-570: the pi-devin catalog cache landed in the worker's own
+    // XDG_CACHE_HOME under the policy — before the fix this write hit
+    // the denied `~/.cache/pi-devin` and logged EACCES.
+    assert!(
+        state
+            .join("agents/wc/pi/cache/pi-devin/models.json")
+            .is_file(),
+        "confined worker: the catalog cache did not land in agents/wc/pi/cache"
+    );
     let log = std::fs::read_to_string(state.join("agents/w.provider.log")).unwrap();
     assert!(log.contains("worker confinement:"), "{log}");
+    assert!(
+        !log.contains("EACCES"),
+        "confined worker logged a cache EACCES: {log}"
+    );
 }
 
 /// The emitted policy applied for real via `cadence confine`: inside
