@@ -613,21 +613,26 @@
         }
         // The released v18 schema predates app_grants entirely.
         Connection::open(&db).unwrap().execute_batch(
-            "DROP TABLE app_grants;
-             INSERT INTO platform_credentials VALUES ('mail', 'work', '[\"send\"]', 'fingerprint', 'vault-ref', 'none', 42, 'operator:test');
-             UPDATE schema_version SET version=18;
-             CREATE TRIGGER fail_migration BEFORE UPDATE ON schema_version
-               BEGIN SELECT RAISE(ABORT, 'forced migration failure'); END;",
-        ).unwrap();
+                "DROP TABLE app_grants;
+                 INSERT INTO platform_credentials VALUES ('mail', 'work', '[\"send\"]', 'fingerprint', 'vault-ref', 'none', 42, 'operator:test');
+                 UPDATE schema_version SET version=18;
+                 CREATE TRIGGER fail_migration BEFORE UPDATE ON schema_version
+                   BEGIN SELECT RAISE(ABORT, 'forced migration failure'); END;",
+            ).unwrap();
         let error = Store::open_for_schema_tests(&db).err().unwrap().to_string();
         assert!(error.contains("forced migration failure"), "{error}");
         let conn = Connection::open(&db).unwrap();
-        let tables: i64 = conn.query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='app_grants'",
-            [], |r| r.get(0),
-        ).unwrap();
+        let tables: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='app_grants'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(tables, 0, "failed migration left its new table behind");
-        let version: i64 = conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0)).unwrap();
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(version, 18);
         conn.execute_batch("DROP TRIGGER fail_migration").unwrap();
         drop(conn);
@@ -639,12 +644,17 @@
             assert_eq!(account.fingerprint, "fingerprint");
             assert_eq!(account.scopes, vec!["send"]);
             let conn = Connection::open(&db).unwrap();
-            let install: String = conn.query_row(
-                "SELECT dflt_value FROM pragma_table_info('app_grants') WHERE name='install_id'",
-                [], |r| r.get(0),
-            ).unwrap();
+            let install: String = conn
+                .query_row(
+                    "SELECT dflt_value FROM pragma_table_info('app_grants') WHERE name='install_id'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
             assert_eq!(install, "''");
-            let version: i64 = conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0)).unwrap();
+            let version: i64 = conn
+                .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+                .unwrap();
             assert_eq!(version, crate::rollout::SCHEMA_VERSION);
         }
     }
@@ -652,33 +662,33 @@
     /// v19 (CAD-577): `app_grants.install_id`. A legacy table has no such
     /// column; the migration adds it (empty on existing rows) without
     /// dropping the grants. A fresh create already has the column, so
-    /// this rebuilds a genuine v18 table first.
+    /// this rebuilds an intermediate v18 table first.
     #[test]
     fn migration_v18_to_v19_adds_app_grant_install_id() {
         let dir = TempDir::new().unwrap();
         let db = dir.path().join("t.sqlite3");
         Store::open(&db).unwrap();
         Connection::open(&db)
-            .unwrap()
-            .execute_batch(
-                "CREATE TABLE app_grants_v18(
-                    app TEXT NOT NULL,
-                    agent TEXT NOT NULL,
-                    platform TEXT NOT NULL,
-                    account TEXT NOT NULL,
-                    scopes TEXT NOT NULL,
-                    granted_at REAL NOT NULL,
-                    by TEXT NOT NULL,
-                    PRIMARY KEY(app, agent, platform, account));
-                 INSERT INTO app_grants_v18
-                   SELECT app, agent, platform, account, scopes, granted_at, by
-                   FROM app_grants;
-                 DROP TABLE app_grants;
-                 ALTER TABLE app_grants_v18 RENAME TO app_grants;
-                 INSERT INTO app_grants VALUES ('blog', 'a1', 'mail', 'work', '[\"send\"]', 42, 'operator:test');
-                 UPDATE schema_version SET version=18;",
-            )
-            .unwrap();
+                .unwrap()
+                .execute_batch(
+                    "CREATE TABLE app_grants_v18(
+                        app TEXT NOT NULL,
+                        agent TEXT NOT NULL,
+                        platform TEXT NOT NULL,
+                        account TEXT NOT NULL,
+                        scopes TEXT NOT NULL,
+                        granted_at REAL NOT NULL,
+                        by TEXT NOT NULL,
+                        PRIMARY KEY(app, agent, platform, account));
+                     INSERT INTO app_grants_v18
+                       SELECT app, agent, platform, account, scopes, granted_at, by
+                       FROM app_grants;
+                     DROP TABLE app_grants;
+                     ALTER TABLE app_grants_v18 RENAME TO app_grants;
+                     INSERT INTO app_grants VALUES ('blog', 'a1', 'mail', 'work', '[\"send\"]', 42, 'operator:test');
+                     UPDATE schema_version SET version=18;",
+                )
+                .unwrap();
         Store::open_for_schema_tests(&db).unwrap();
         let names: Vec<String> = Connection::open(&db)
             .unwrap()
@@ -699,10 +709,23 @@
         assert_eq!(version, crate::rollout::SCHEMA_VERSION);
         for _ in 0..2 {
             Store::open_for_schema_tests(&db).unwrap();
-            let row: (String, String, f64, String, String) = Connection::open(&db).unwrap().query_row(
-                "SELECT agent, scopes, granted_at, by, install_id FROM app_grants WHERE app='blog'",
-                [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-            ).unwrap();
-            assert_eq!(row, ("a1".into(), "[\"send\"]".into(), 42.0, "operator:test".into(), "".into()));
+            let row: (String, String, f64, String, String) = Connection::open(&db)
+                .unwrap()
+                .query_row(
+                    "SELECT agent, scopes, granted_at, by, install_id FROM app_grants WHERE app='blog'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                row,
+                (
+                    "a1".into(),
+                    "[\"send\"]".into(),
+                    42.0,
+                    "operator:test".into(),
+                    "".into()
+                )
+            );
         }
     }

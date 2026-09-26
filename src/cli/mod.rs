@@ -1859,11 +1859,18 @@ pub(crate) fn daemon_restart(
             Error::rejected(format!("daemon restart refused before shutdown: {error}"))
         })?;
     let ticket = cadence_agent::rollout::begin_restart(state_dir, &caller)?;
-    let before = client::rpc(state_dir, "agent_list", json!({}))?["agents"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    if when_idle {
+    // A failed replacement can leave no daemon serving the socket.
+    // Preserve semantic refusals, but let transport failure reach the
+    // shutdown/lock checks below so rollback can start the old release.
+    let (before, reachable) = match client::rpc_answer(state_dir, "agent_list", json!({})) {
+        Ok(Ok(answer)) => (
+            answer["agents"].as_array().cloned().unwrap_or_default(),
+            true,
+        ),
+        Ok(Err(refused)) => return Err(refused),
+        Err(_) => (Vec::new(), false),
+    };
+    if when_idle && reachable {
         let deadline = Instant::now() + Duration::from_secs(timeout);
         let mut next_report = Instant::now();
         let mut stale_noted = false;
@@ -1957,17 +1964,17 @@ pub(crate) fn daemon_restart(
         Ok(Err(refused)) => return Err(refused),
         Err(_) => false,
     };
+    if !was_running && !daemon_lock_free(state_dir) {
+        return Err(Error::rejected(
+            "daemon owns the state-dir lock but does not answer the \
+             socket — inspect daemon.log before restarting",
+        ));
+    }
     cadence_agent::rollout::note_restart_proceeded(state_dir, &ticket)?;
     if was_running && !wait_daemon_exit(state_dir, 30) {
         return Err(Error::rejected(
             "daemon did not exit within 30s — restart aborted; the old \
              process is still draining (see daemon.log)",
-        ));
-    }
-    if !was_running && !daemon_lock_free(state_dir) {
-        return Err(Error::rejected(
-            "daemon owns the state-dir lock but does not answer the \
-             socket — inspect daemon.log before restarting",
         ));
     }
     client::daemon_start_as(state_dir, Some(&caller.identity))?;

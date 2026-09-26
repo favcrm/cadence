@@ -544,17 +544,20 @@ impl Store {
             tx.commit()?;
         }
         if version < 19 {
-            // v19: `app_grants.install_id` (CAD-577) — the install a
+            // v19: app-derived grants and `install_id` (CAD-577) — the install a
             // derived grant belongs to. Empty on rows written before
             // install ids; those never match the current install, so
             // the sweep withdraws them and the operator re-approves
-            // once. Column check so a half-applied alter converges.
-            let columns: Vec<String> = conn
+            // once. Released v18 has no app_grants table; intermediate
+            // builds have one without install_id. Create/alter/version
+            // bump share a transaction, preserving either upgrade path.
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(platform::SCHEMA_APP_GRANTS)?;
+            let columns: Vec<String> = tx
                 .prepare("PRAGMA table_info(app_grants)")?
                 .query_map([], |row| row.get::<_, String>(1))?
                 .filter_map(std::result::Result::ok)
                 .collect();
-            let tx = conn.unchecked_transaction()?;
             if !columns.iter().any(|column| column == "install_id") {
                 tx.execute_batch(
                     "ALTER TABLE app_grants ADD COLUMN install_id TEXT NOT NULL DEFAULT ''",

@@ -4892,6 +4892,12 @@ fn cad384_operator_daemon_stop_from_a_plain_shell() {
 fn cad626_restart_recovers_an_unreachable_daemon() {
     for when_idle in [false, true] {
         let mut d = TestDaemon::start_process_in(TempDir::new().unwrap());
+        d.register_inbox("recovery-mailbox");
+        d.send(
+            "recovery-mailbox",
+            json!({"text": "keep queued", "message": "recovery-note"}),
+        )
+        .unwrap();
         let (ok, out, err) = d.operator_cadence(&[
             "rollout",
             "claim",
@@ -4938,9 +4944,14 @@ fn cad626_restart_recovers_an_unreachable_daemon() {
         // Clean up even when a failing assertion would otherwise leave
         // the replacement detached from this fixture's Child handle.
         let health = d.rpc("health", json!({}));
+        let mailbox = d.rpc("agent_show", json!({"alias": "recovery-mailbox"}));
         let _ = d.operator_cadence(&["daemon", "stop"]);
         assert!(ok, "when_idle={when_idle}: {out} {err}");
         assert!(health.is_ok(), "recovery never became healthy: {health:?}");
+        let mailbox = mailbox.unwrap();
+        assert_eq!(mailbox["agent"]["provider"], "inbox");
+        assert_eq!(mailbox["messages"][0]["body"], "keep queued");
+        assert_eq!(mailbox["messages"][0]["state"], "queued");
     }
 }
 
