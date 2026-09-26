@@ -1671,9 +1671,13 @@ fn dispatch_kickoff_and_finish_guards() {
     d.wait_agent("dvb", "idle", 15);
     let (ok, _) = cli(&["issue", "start", "D-3", "--owner", "dvb"]);
     assert!(ok);
-    d.send("dvb", json!({"text": "keep working", "message": "mk1"}))
-        .unwrap();
+    // The readiness claim precedes the send: since CAD-520 a devin
+    // pane's own idle probe admits the paste, so delivery no longer
+    // waits for a claim — claiming after the send races the in-flight
+    // paste and is rightly refused on the staged draft.
     d.fixture_rpc("agent_ready", json!({"alias": "dvb"}))
+        .unwrap();
+    d.send("dvb", json!({"text": "keep working", "message": "mk1"}))
         .unwrap();
     d.wait_message("dvb", "mk1", &["running"], 10);
     let wt3 = repo.join(".cadence/wt/d-3-three");
