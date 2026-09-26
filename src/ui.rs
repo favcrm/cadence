@@ -3750,6 +3750,9 @@ mod tests {
             "/settings",
             "/settings/memory",
             "/login",
+            "/apps",
+            "/apps/social-content/home",
+            "/apps/social-content/post/p2",
             "/unknown-page",
             "/agents/cc.worker-1",
         ] {
