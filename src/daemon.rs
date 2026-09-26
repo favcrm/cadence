@@ -2511,6 +2511,10 @@ impl Shared {
             "area_ack" => self.rpc_area_ack(params, peer_pid),
             "dispatch_record" => self.rpc_dispatch_record(params, peer_pid),
             "dispatch_send" => self.rpc_dispatch_send(params, peer_pid),
+            // CAD-606: operator-only board kickoff — join a worker, then
+            // dispatch. Options is the form catalog for the same gate.
+            "issue_kickoff" => self.rpc_issue_kickoff(params, peer_pid),
+            "issue_kickoff_options" => self.rpc_issue_kickoff_options(params, peer_pid),
             "rollout_grant" => self.rpc_rollout_grant(params, peer_pid),
             "rollout_revoke" => self.rpc_rollout_revoke(params, peer_pid),
             "project_work_approvals" => Ok(json!({

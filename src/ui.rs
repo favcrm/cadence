@@ -2065,6 +2065,18 @@ fn write_route(
         send(request, resp);
         return;
     }
+    // CAD-606: operator Kick off. `admit` already required an operator
+    // session; the handler relays `issue_kickoff`, which checks the
+    // connection again.
+    if let Some(id) = home::kickoff_route(path) {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let resp = home::post_kickoff(&mut request, state_dir, pm_dir, id);
+        send(request, resp);
+        return;
+    }
     // The composer's slash commands and Stop (CAD-551) — operator-only,
     // relayed to the daemon's `master_command`; `home::master_command`
     // refuses every verb outside its own allowlist before the relay.
@@ -3173,7 +3185,8 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 let id_raw = segs.next().unwrap_or_default();
                 let sub = segs.next();
                 if sub.is_some_and(|s| {
-                    !matches!(s, "file" | "activity" | "history") && !s.starts_with("artifacts/")
+                    !matches!(s, "file" | "activity" | "history" | "kickoff")
+                        && !s.starts_with("artifacts/")
                 }) {
                     send(request, err_response(404, "no such route"));
                     return;
@@ -3195,6 +3208,10 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                             return;
                         };
                         match sub {
+                            Some("kickoff") => {
+                                let resp = home::kickoff_options(&request, state_dir, opts, &id);
+                                send(request, resp);
+                            }
                             None => send(
                                 request,
                                 json_response(with_agents(
