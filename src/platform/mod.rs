@@ -300,3 +300,39 @@ pub fn refuse_leak(what: &str, text: &str, secret: &[u8]) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn leak_screen_refuses_prefix_suffix_and_interior_fragments() {
+        let credential = b"abcdefghIJKLMNOPqrstuvwx";
+        for fragment in ["abcdefgh", "IJKLMNOP", "qrstuvwx"] {
+            let error = refuse_leak("revoke reason", &format!("lost {fragment}!"), credential)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("withheld"));
+            assert!(!error.contains(fragment));
+        }
+        assert!(refuse_leak("revoke reason", "abcdefg", credential).is_ok());
+        assert!(refuse_leak("revoke reason", "unrelated", credential).is_ok());
+        assert!(refuse_leak("result", "short", b"short").is_err());
+        assert!(refuse_leak("result", "anything", b"").is_ok());
+    }
+
+    #[test]
+    fn token_length_refusal_names_length_without_echoing_input() {
+        for token in [String::new(), "x".repeat(8193)] {
+            let error = enroll_token(&json!({"token": token}), &[])
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(error.contains("length"), "{error}");
+            assert!(error.contains("8192"), "{error}");
+            assert!(!error.contains(&"x".repeat(32)));
+        }
+        assert!(enroll_token(&json!({"token": "x".repeat(8192)}), &[]).is_ok());
+    }
+}

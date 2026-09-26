@@ -1225,6 +1225,19 @@ fn revoke_reason_cannot_carry_the_credential() {
         1,
         "the refused revoke still tore the record down"
     );
+    // Prefix, interior and suffix fragments are equally sensitive.
+    // op() is the detached operator socket path; each refusal must
+    // leave custody and records intact before a clean revoke.
+    for fragment in [&TOKEN[..8], &TOKEN[8..16], &TOKEN[TOKEN.len() - 8..]] {
+        let err = refused(d.op(
+            "platform_revoke",
+            json!({"platform": "github", "account": "acme",
+                   "reason": format!("suspected leak: {fragment}")}),
+        ));
+        assert!(err.contains("withheld"), "{err}");
+        assert!(!err.contains(fragment), "{err}");
+        assert_eq!(enrolled_count(&d), 1);
+    }
     // And a clean reason revokes fine.
     let ok = d
         .op(

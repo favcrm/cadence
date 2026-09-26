@@ -272,6 +272,23 @@ mod tests {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
 
+    #[test]
+    fn failed_file_put_cleans_only_its_own_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory at the final credential path makes rename fail
+        // after the temporary file was created and written.
+        std::fs::create_dir(file_path(dir.path(), &key())).unwrap();
+        let foreign = dir.path().join(".another-writer.tmp");
+        std::fs::write(&foreign, b"another write").unwrap();
+        assert!(file_put(dir.path(), &key(), b"synthetic bytes").is_err());
+        let temporaries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "tmp"))
+            .collect();
+        assert_eq!(temporaries, vec![foreign]);
+    }
+
     /// A stand-in `secret-tool`: `lookup` prints the secret with the
     /// trailing newline the real tool adds; `clear` exits 0.
     fn stub_tool(dir: &Path, body: &str) -> PathBuf {
