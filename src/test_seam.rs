@@ -348,9 +348,7 @@ mod imp {
         let Some(production) = production_state_dir() else {
             return Ok(());
         };
-        let resolved = dir
-            .canonicalize()
-            .unwrap_or_else(|_| dir.to_path_buf());
+        let resolved = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
         if resolved == production {
             return Err(Error::rejected(format!(
                 "test seam refused: '{}' is the production state dir — the \
