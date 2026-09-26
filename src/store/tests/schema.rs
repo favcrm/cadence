@@ -613,12 +613,31 @@
         }
         // The released v18 schema predates app_grants entirely.
         Connection::open(&db).unwrap().execute_batch(
-            "DROP TABLE app_grants; UPDATE schema_version SET version=18;",
+            "DROP TABLE app_grants;
+             INSERT INTO platform_credentials VALUES ('mail', 'work', '[\"send\"]', 'fingerprint', 'vault-ref', 'none', 42, 'operator:test');
+             UPDATE schema_version SET version=18;
+             CREATE TRIGGER fail_migration BEFORE UPDATE ON schema_version
+               BEGIN SELECT RAISE(ABORT, 'forced migration failure'); END;",
         ).unwrap();
+        let error = Store::open_for_schema_tests(&db).err().unwrap().to_string();
+        assert!(error.contains("forced migration failure"), "{error}");
+        let conn = Connection::open(&db).unwrap();
+        let tables: i64 = conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='app_grants'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(tables, 0, "failed migration left its new table behind");
+        let version: i64 = conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, 18);
+        conn.execute_batch("DROP TRIGGER fail_migration").unwrap();
+        drop(conn);
         for _ in 0..2 {
             let s = Store::open_for_schema_tests(&db).unwrap();
             assert_eq!(s.message("m1").unwrap().unwrap().body, "keep me");
             assert!(s.app_grants_apps().unwrap().is_empty());
+            let account = s.platform_credential("mail", "work").unwrap().unwrap();
+            assert_eq!(account.fingerprint, "fingerprint");
+            assert_eq!(account.scopes, vec!["send"]);
             let conn = Connection::open(&db).unwrap();
             let install: String = conn.query_row(
                 "SELECT dflt_value FROM pragma_table_info('app_grants') WHERE name='install_id'",
@@ -656,7 +675,7 @@
                    FROM app_grants;
                  DROP TABLE app_grants;
                  ALTER TABLE app_grants_v18 RENAME TO app_grants;
-                 INSERT INTO app_grants VALUES ('blog', 'a1', 'mail', 'work', '["send"]', 42, 'operator:test');
+                 INSERT INTO app_grants VALUES ('blog', 'a1', 'mail', 'work', '[\"send\"]', 42, 'operator:test');
                  UPDATE schema_version SET version=18;",
             )
             .unwrap();

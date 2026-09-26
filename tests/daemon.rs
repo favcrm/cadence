@@ -4909,6 +4909,31 @@ fn cad626_restart_recovers_an_unreachable_daemon() {
         if when_idle {
             args.extend(["--when-idle", "--timeout", "1"]);
         }
+        // A dead socket is insufficient: a process can still hold the
+        // singleton while draining. It must not be replaced or audited
+        // as a restart that proceeded.
+        use std::os::unix::io::AsRawFd;
+        let lock = std::fs::OpenOptions::new()
+            .write(true)
+            .open(d.state.join("cadence.lock"))
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let (ok, out, err) = d.operator_cadence(&args);
+        assert!(!ok, "held singleton was replaced: {out} {err}");
+        assert!(err.contains("owns the state-dir lock"), "{out} {err}");
+        let proceeded: i64 = rusqlite::Connection::open(d.state.join("cadence.sqlite3"))
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM events WHERE kind='rollout_restart_proceeded'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(proceeded, 0);
+        drop(lock);
         let (ok, out, err) = d.operator_cadence(&args);
         // Clean up even when a failing assertion would otherwise leave
         // the replacement detached from this fixture's Child handle.
