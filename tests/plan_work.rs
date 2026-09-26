@@ -2050,6 +2050,241 @@ fn revoke_waits_for_an_approve_already_inside_the_lock() {
     assert_eq!(err.code(), Some("app_unapproved"), "{err}");
 }
 
+/// Review 344 r4: `app remove` is the other revoke. An approve that
+/// already holds the tracker write lock must not commit its grant
+/// after remove has read holders. Remove takes that same lock before
+/// the read and holds it through the revoke and the folder delete, so
+/// it does not return while the hold file still exists, and it is the
+/// last writer.
+#[test]
+fn remove_waits_for_an_approve_already_inside_the_lock() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    app_install_roles(&f);
+    f.d.operator_rpc(
+        "app_set_team",
+        json!({"project": "demo", "name": "roles", "team": ["publisher=dev-1"]}),
+    )
+    .unwrap();
+
+    let hold = f.tmp.path().join("approve-hold");
+    std::fs::write(&hold, "1").unwrap();
+    test_env().set("CADENCE_TEST_APP_APPROVE_HOLD", hold.to_str().unwrap());
+    struct ClearHold;
+    impl Drop for ClearHold {
+        fn drop(&mut self) {
+            test_env().remove("CADENCE_TEST_APP_APPROVE_HOLD");
+        }
+    }
+    let _clear_hold = ClearHold;
+    let ready = PathBuf::from(format!("{}.ready", hold.display()));
+    let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // The CLI is a second connection. Owned paths so the scoped thread
+    // does not borrow the fixture.
+    let state = f.d.state.clone();
+    let pm_dir = f.pm_dir.clone();
+    let home = f.tmp.path().join("home");
+    let tmp = f.tmp.path().join("tmp");
+    let config = home.join(".config");
+    let data = home.join(".local/share");
+    let state_home = home.join(".local/state");
+
+    let daemon = &f.d;
+    thread::scope(|s| {
+        let approve = s.spawn(|| {
+            daemon.operator_rpc("app_approve", json!({"project": "demo", "name": "roles"}))
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "approve never reached the tracker lock"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        let flag = std::sync::Arc::clone(&finished);
+        let remove = s.spawn(move || {
+            let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+                .arg("--state-dir")
+                .arg(&state)
+                .args(["app", "remove", "roles", "--project", "demo"])
+                .env("CADENCE_PM_DIR", &pm_dir)
+                .env("HOME", &home)
+                .env("XDG_CONFIG_HOME", &config)
+                .env("XDG_DATA_HOME", &data)
+                .env("XDG_STATE_HOME", &state_home)
+                .env("TMPDIR", &tmp)
+                .env_remove("CADENCE_ALIAS")
+                .operator_output()
+                .unwrap();
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            let text = if out.stdout.is_empty() {
+                String::from_utf8_lossy(&out.stderr).to_string()
+            } else {
+                String::from_utf8_lossy(&out.stdout).to_string()
+            };
+            let value = serde_json::from_str(text.trim()).unwrap_or(Value::String(text));
+            (out.status.success(), value)
+        });
+        // A remove that revokes before taking the lock still blocks on
+        // the lock afterwards, so it must not finish during this window
+        // either. The grant assertion below is what fails when that
+        // early read skipped the revoke.
+        let window = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < window && !finished.load(std::sync::atomic::Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            hold.exists(),
+            "the approve left the lock before remove was observed"
+        );
+        assert!(
+            !finished.load(std::sync::atomic::Ordering::SeqCst),
+            "app remove returned while the approve still held the tracker lock"
+        );
+        std::fs::remove_file(&hold).unwrap();
+        approve.join().unwrap().unwrap();
+        let (ok, removed) = remove.join().unwrap();
+        assert!(ok, "{removed}");
+        assert_eq!(removed["removed"], true, "{removed}");
+    });
+
+    assert!(
+        grant_scopes(&f, "dev-1", "local", "local").is_none(),
+        "remove that raced an in-lock approve must not leave the derived grant"
+    );
+    assert!(!f.pm_dir.join("demo/apps/roles").exists());
+
+    let src = f.tmp.path().join("app-roles");
+    let (ok, out) = f.cli(&[
+        "app",
+        "install",
+        src.to_str().unwrap(),
+        "--project",
+        "demo",
+    ]);
+    assert!(ok, "reinstall after the raced remove: {out}");
+    let err = f
+        .d
+        .operator_rpc(
+            "plan_propose",
+            json!({"project": "demo", "workflow": "roles/go",
+                   "inputs": {"title": "x", "publisher": "dev-1"}}),
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.code(),
+        Some("app_unapproved"),
+        "reinstall of the same digest must not already be approved: {err}"
+    );
+}
+
+/// Review 344 r4: `app remove` withdraws the approval, not only the
+/// grant rows. Reinstalling the same bytes must ask for approval again.
+#[test]
+fn app_remove_then_reinstall_requires_approval_again() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    app_install_roles(&f);
+    f.d.operator_rpc(
+        "app_set_team",
+        json!({"project": "demo", "name": "roles", "team": ["publisher=dev-1"]}),
+    )
+    .unwrap();
+    f.d.operator_rpc("app_approve", json!({"project": "demo", "name": "roles"}))
+        .unwrap();
+    assert!(grant_scopes(&f, "dev-1", "local", "local").is_some());
+
+    let (ok, out) = f.cli(&["app", "remove", "roles", "--project", "demo"]);
+    assert!(ok, "{out}");
+    assert!(
+        grant_scopes(&f, "dev-1", "local", "local").is_none(),
+        "remove drops the derived grant"
+    );
+
+    let src = f.tmp.path().join("app-roles");
+    let (ok, out) = f.cli(&[
+        "app",
+        "install",
+        src.to_str().unwrap(),
+        "--project",
+        "demo",
+    ]);
+    assert!(ok, "reinstall: {out}");
+    let err = f
+        .d
+        .operator_rpc(
+            "plan_propose",
+            json!({"project": "demo", "workflow": "roles/go",
+                   "inputs": {"title": "x", "publisher": "dev-1"}}),
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.code(),
+        Some("app_unapproved"),
+        "reinstall of the same digest must not already be approved: {err}"
+    );
+}
+
+/// Review 344 r4: sweeping grants whose app folder is gone must also
+/// record a withdrawn approval. Otherwise a later reinstall of the
+/// same digest is already approved and the next propose re-derives
+/// the grant.
+#[test]
+fn removed_app_sweep_withdraws_the_approval() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    app_install_roles(&f);
+    f.d.operator_rpc(
+        "app_set_team",
+        json!({"project": "demo", "name": "roles", "team": ["publisher=dev-1"]}),
+    )
+    .unwrap();
+    f.d.operator_rpc("app_approve", json!({"project": "demo", "name": "roles"}))
+        .unwrap();
+    assert!(grant_scopes(&f, "dev-1", "local", "local").is_some());
+
+    // The folder and the install record are gone; the grant and the
+    // live approval remain. That is the leftover the sweep exists for
+    // — a removal that did not record the revoke.
+    let apps = f.pm_dir.join("demo/apps");
+    std::fs::remove_dir_all(apps.join("roles")).unwrap();
+    std::fs::remove_file(apps.join("roles.yaml")).unwrap();
+
+    // A propose reconciles the named app, and that sweep runs before
+    // the gate. The propose itself fails: the folder is gone.
+    let swept = f.d.operator_rpc(
+        "plan_propose",
+        json!({"project": "demo", "workflow": "roles/go",
+               "inputs": {"title": "x", "publisher": "dev-1"}}),
+    );
+    assert!(swept.is_err(), "propose of a removed app must fail: {swept:?}");
+
+    let src = f.tmp.path().join("app-roles");
+    let (ok, out) = f.cli(&[
+        "app",
+        "install",
+        src.to_str().unwrap(),
+        "--project",
+        "demo",
+    ]);
+    assert!(ok, "reinstall after the sweep: {out}");
+    let err = f
+        .d
+        .operator_rpc(
+            "plan_propose",
+            json!({"project": "demo", "workflow": "roles/go",
+                   "inputs": {"title": "x", "publisher": "dev-1"}}),
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.code(),
+        Some("app_unapproved"),
+        "sweep must withdraw the approval, not only the grant rows: {err}"
+    );
+}
+
 /// Review 344: a team change drops the agent who left. Approving with
 /// publisher=dev-1 then setting the team to dev-2 must not leave dev-1
 /// holding `local/local publish`.
