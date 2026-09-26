@@ -1,4 +1,5 @@
 import { useSyncExternalStore } from "react";
+import { followClientNav } from "./clientNav";
 import { legacyRedirect } from "./router";
 import { browserStoredProjectView } from "./urlState";
 
@@ -47,4 +48,38 @@ export function navigate(href: string, opts: { replace?: boolean } = {}): void {
 /** The current path plus query; re-renders on every navigation. */
 export function useHref(): string {
   return useSyncExternalStore(subscribe, snapshot);
+}
+
+let clientNavInstalled = false;
+
+/**
+ * One listener for the whole app: same-origin anchors navigate through
+ * `navigate` instead of loading a new document. Installed once from
+ * `main.tsx`. Link's own click handler still runs first and may
+ * `preventDefault` (section tabs replace history); this listener then
+ * leaves that click alone.
+ */
+export function installClientNav(): void {
+  if (clientNavInstalled || typeof document === "undefined") return;
+  clientNavInstalled = true;
+  document.addEventListener("click", (event) => {
+    const el = event.target instanceof Element ? event.target.closest("a") : null;
+    if (!el) return;
+    followClientNav(
+      {
+        href: el.getAttribute("href"),
+        download: el.hasAttribute("download"),
+        target: el.getAttribute("target"),
+        button: event.button,
+        metaKey: event.metaKey,
+        ctrlKey: event.ctrlKey,
+        shiftKey: event.shiftKey,
+        altKey: event.altKey,
+        defaultPrevented: event.defaultPrevented,
+        origin: location.origin,
+      },
+      () => event.preventDefault(),
+      (href) => navigate(href),
+    );
+  });
 }

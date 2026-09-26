@@ -3,6 +3,7 @@ import type { Route } from "../../lib/router";
 import { navigate } from "../../lib/useLocation";
 import { wiki } from "./api";
 import { filterHits, snippetParts, TYPE_FILTERS, type SearchHit, type TypeFilter } from "./search";
+import Link from "../../ui/Link";
 import { Crumbs, EmptyCard, Failure, Loading } from "./shared";
 import type { WikiRoute } from "./Wiki";
 
@@ -106,12 +107,12 @@ export default function SearchPane({
           {shown.map((hit) => (
             <div key={hit.path} className="card wk-srow">
               <div className="wk-spath num">{hit.path}</div>
-              <a
+              <Link
                 className="wk-sname lnk"
                 href={navHref({ screen: "wiki", mode: "browse", path: hit.path, query: null })}
               >
                 {hit.name}
-              </a>
+              </Link>
               <div className="wk-snip">
                 {snippetParts(hit.snippet, query).map((part, i) =>
                   part.mark ? <mark key={i}>{part.text}</mark> : <span key={i}>{part.text}</span>,

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { fmtBytes } from "../../lib/fmt";
 import type { Route } from "../../lib/router";
 import { navigate } from "../../lib/useLocation";
+import Link from "../../ui/Link";
 import Md from "../../ui/Md";
 import { IconCaret } from "../../ui/icons";
 import {
@@ -247,10 +248,10 @@ export default function Wiki({ route, navHref, readOnly, actor, onToast }: WikiP
                 <span className="wk-tkind">
                   <KindIcon kind={row.kind} />
                 </span>
-                <a className="wk-tname" href={hrefFor(row.path)}>
+                <Link className="wk-tname" href={hrefFor(row.path)}>
                   {row.name}
                   {row.dir ? "/" : ""}
-                </a>
+                </Link>
                 {row.own && <span className="kicker">you</span>}
                 {row.locked && <LockIcon />}
                 <span className="wk-tmeta num">

@@ -460,6 +460,16 @@
   background: var(--color-ink-800);
 }
 
+/* One link for the whole tile (thumb + name). The actions menu sits outside it. */
+.wk-ftile-link {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  color: inherit;
+  text-decoration: none;
+}
+
 .wk-fthumb {
   height: 84px;
   display: grid;

@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type { Route } from "../../lib/router";
 import { fmtBytes } from "../../lib/fmt";
+import Link from "../../ui/Link";
 import { IconFolder, IconGrid, IconList } from "../../ui/icons";
 import { wiki, wikiFileUrl, wikiRawUrl, type WikiEntry } from "./api";
 import { baseName, joinPath, parentPath } from "./paths";
@@ -206,26 +207,28 @@ export default function FolderPane({
             const blob = entry.kind === "dir" ? null : previewKind(entry.name, entry.mime);
             return (
               <div key={entry.path} className="wk-ftile">
-                <a className="wk-fthumb" href={openHref(entry)} title={entry.name}>
-                  {entry.kind === "dir" ? (
-                    <KindIcon kind="dir" size={22} />
-                  ) : blob === "image" ? (
-                    <img src={wikiFileUrl(entry.path)} alt="" loading="lazy" />
-                  ) : (
-                    <>
-                      <KindIcon kind="page" size={22} />
-                      <span className="chip wk-fkind">{kindLabel(entry.name, entry.mime)}</span>
-                    </>
-                  )}
-                  {entry.locked && <span className="wk-flock">locked</span>}
-                </a>
+                <Link className="wk-ftile-link" href={openHref(entry)} title={entry.name}>
+                  <span className="wk-fthumb">
+                    {entry.kind === "dir" ? (
+                      <KindIcon kind="dir" size={22} />
+                    ) : blob === "image" ? (
+                      <img src={wikiFileUrl(entry.path)} alt="" loading="lazy" />
+                    ) : (
+                      <>
+                        <KindIcon kind="page" size={22} />
+                        <span className="chip wk-fkind">{kindLabel(entry.name, entry.mime)}</span>
+                      </>
+                    )}
+                    {entry.locked && <span className="wk-flock">locked</span>}
+                  </span>
+                  <span className="wk-fmeta">
+                    <span className="wk-fname">{entry.name}</span>
+                    <span className="wk-fsize num">
+                      {entry.size != null ? fmtBytes(entry.size) : entry.entries ?? ""}
+                    </span>
+                  </span>
+                </Link>
                 {itemMenu(entry)}
-                <div className="wk-fmeta">
-                  <a className="wk-fname" href={openHref(entry)}>
-                    {entry.name}
-                  </a>
-                  <span className="wk-fsize num">{entry.size != null ? fmtBytes(entry.size) : entry.entries ?? ""}</span>
-                </div>
               </div>
             );
           })}
@@ -237,9 +240,9 @@ export default function FolderPane({
               <span className="wk-ficon">
                 <KindIcon kind={entry.kind} />
               </span>
-              <a className="wk-fname" href={openHref(entry)}>
+              <Link className="wk-fname" href={openHref(entry)}>
                 {entry.name}
-              </a>
+              </Link>
               <span className="wk-fsub">
                 {entry.kind === "dir" ? "folder" : kindLabel(entry.name, entry.mime).toLowerCase()}
               </span>
