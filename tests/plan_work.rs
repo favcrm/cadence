@@ -940,6 +940,207 @@ fn workflow_inputs_cannot_inject_and_project_is_a_key() {
     assert!(!ok && out.to_string().contains("symlink"), "{out}");
 }
 
+/// CAD-571 N1: an input can declare a shape (`kind: slug`) and the
+/// engine enforces it server-side for every caller — the daemon's
+/// `plan_propose`, the CLI form and an installed app's workflow all
+/// refuse `../x`, `/`, uppercase, spaces and an over-long name with
+/// `bad_shape` before anything is written, while a folder-shaped value
+/// renders into the plan prose (`posts/<slug>/`). The shape is
+/// structural: it is part of the gate keys, so dropping the
+/// declaration unapproves the workflow until the operator re-approves.
+#[test]
+fn workflow_input_shape_is_enforced_server_side() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    wf_add(&f, "post", WF_SLUG);
+    let (ok, out) = f.cli(&["workflow", "approve", "post", "--project", "demo"]);
+    assert!(ok, "{out}");
+    let before = f.commits();
+
+    // The daemon refuses each hostile or malformed folder name by name
+    // — `bad_shape` — and writes nothing.
+    for bad in [
+        "../x",
+        "/",
+        "Upper",
+        "with space",
+        "a--b",
+        "-lead",
+        "trail-",
+        "under_score",
+        &"x".repeat(61),
+    ] {
+        let err =
+            f.d.operator_rpc(
+                "plan_propose",
+                json!({"project": "demo", "workflow": "post",
+                       "inputs": {"topic": "t", "slug": bad}}),
+            )
+            .unwrap_err();
+        assert_eq!(err.code(), Some("bad_shape"), "{bad:?}: {err}");
+        assert!(err.to_string().contains("slug"), "{bad:?}: {err}");
+    }
+    assert_eq!(f.commits(), before, "refusals write nothing");
+
+    // The CLI form takes the same gate; the refusal crosses it whole.
+    let (ok, out) = f.cli(&[
+        "plan",
+        "propose",
+        "--project",
+        "demo",
+        "--workflow",
+        "post",
+        "--input",
+        "topic=t",
+        "--input",
+        "slug=../x",
+    ]);
+    assert!(!ok, "{out}");
+    assert!(out.to_string().contains("bad_shape"), "{out}");
+    assert_eq!(f.commits(), before, "the CLI refusal writes nothing");
+
+    // A folder-shaped value proposes; the rendered ticket carries it.
+    let out =
+        f.d.operator_rpc(
+            "plan_propose",
+            json!({"project": "demo", "workflow": "post",
+                   "inputs": {"topic": "t", "slug": "my-post"}}),
+        )
+        .unwrap();
+    assert_eq!(out["tickets"], json!(["D-2"]), "{out}");
+    assert!(
+        issue_body(&f, "D-2").contains("posts/my-post/post.md"),
+        "the slug renders into the prose"
+    );
+
+    // The shape is structural: an edit that drops it re-gates the file.
+    let shape_off = WF_SLUG.replace(", kind: slug", "");
+    let file = wf_file(&f, "shape-off.md", &shape_off);
+    let (ok, out) = f.cli(&[
+        "workflow",
+        "edit",
+        "post",
+        "--project",
+        "demo",
+        "--file",
+        &file,
+    ]);
+    assert!(ok && out["approved"] == false, "{out}");
+    let (ok, out) = f.cli(&["workflow", "approve", "post", "--project", "demo"]);
+    assert!(ok, "{out}");
+    let file = wf_file(&f, "shape-on.md", WF_SLUG);
+    let (ok, out) = f.cli(&[
+        "workflow",
+        "edit",
+        "post",
+        "--project",
+        "demo",
+        "--file",
+        &file,
+    ]);
+    assert!(ok && out["approved"] == false, "re-declaring re-gates: {out}");
+    let (ok, out) = f.cli(&["workflow", "approve", "post", "--project", "demo"]);
+    assert!(ok, "{out}");
+
+    // The repo's `apps/blog-post` declares the shape on its slug: a
+    // direct propose against the installed app refuses the same way,
+    // and a folder-shaped one proposes.
+    let src = concat!(env!("CARGO_MANIFEST_DIR"), "/apps/blog-post");
+    let (ok, out) = f.cli(&["app", "install", src, "--project", "demo"]);
+    assert!(ok, "{out}");
+    let (ok, out) = f.cli(&["app", "approve", "blog-post", "--project", "demo"]);
+    assert!(ok, "{out}");
+    let team = |slug: &str| {
+        json!({"topic": "t", "slug": slug, "strategist": "s-1", "writer": "w-1",
+               "designer": "d-1", "reviewer": "r-1", "publisher": "p-1"})
+    };
+    let err =
+        f.d.operator_rpc(
+            "plan_propose",
+            json!({"project": "demo", "workflow": "blog-post/blog-post",
+                   "inputs": team("../x")}),
+        )
+        .unwrap_err();
+    assert_eq!(err.code(), Some("bad_shape"), "{err}");
+    let out =
+        f.d.operator_rpc(
+            "plan_propose",
+            json!({"project": "demo", "workflow": "blog-post/blog-post",
+                   "inputs": team("my-first-post")}),
+        )
+        .unwrap();
+    assert!(out["epic"].is_string(), "{out}");
+}
+
+/// CAD-571 N5: for a multi-workflow app the Apps list card's primary
+/// action and the app page's are the same workflow — the sorted first
+/// (`aa-early`), never whatever order the directory walk hands back.
+/// `ls` carries the same `primary` the detail does, and the detail's
+/// `workflows` list starts with it, so a `?new=` link from the card
+/// opens the run the page's own button would.
+#[test]
+fn app_primary_action_agrees_across_list_and_detail() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    app_install_pair(&f);
+
+    let (ok, ls) = f.cli(&["app", "ls", "--project", "demo"]);
+    assert!(ok, "{ls}");
+    let row = ls["apps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "pair")
+        .unwrap_or_else(|| panic!("no pair row: {ls}"));
+    assert_eq!(row["primary"]["workflow"], "aa-early", "{row}");
+    assert_eq!(row["primary"]["label"], "New alpha", "{row}");
+    assert_eq!(row["workflows"], json!(["aa-early", "zz-late"]), "{row}");
+
+    let (ok, show) = f.cli(&["app", "show", "pair", "--project", "demo"]);
+    assert!(ok, "{show}");
+    assert_eq!(show["primary"]["workflow"], "aa-early", "{show}");
+    assert_eq!(show["workflows"][0]["name"], "pair/aa-early", "{show}");
+    assert_eq!(show["workflows"][0]["label"], "New alpha", "{show}");
+}
+
+/// CAD-571 N3: the app digest covers structure, not wording — a
+/// `summary:` edit in the installed `app.md` leaves it unchanged (the
+/// board's purpose line is display-only), while a workflow edit that
+/// touches the gate keys moves it.
+#[test]
+fn app_digest_is_structural_not_summary_wording() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    f.d.register("qa-1");
+    app_install_studio(&f);
+    let dir = f.pm_dir.join("demo/apps/studio");
+    let digest_of = || cadence_agent::issue::app::digest(&f.pm_dir, "demo", "studio").unwrap();
+    let before = digest_of();
+
+    // The purpose line is wording: edited in place, the digest holds.
+    let md = std::fs::read_to_string(dir.join("app.md")).unwrap();
+    let edited = md.replace("version: 0.1.0", "version: 0.1.0\nsummary:  A quiet studio.  ");
+    assert_ne!(edited, md, "the fixture must actually change");
+    std::fs::write(dir.join("app.md"), &edited).unwrap();
+    assert_eq!(digest_of(), before, "a summary edit is wording");
+    assert_eq!(
+        cadence_agent::issue::app::read_manifest(&f.pm_dir, "demo", "studio")
+            .unwrap()
+            .summary
+            .as_deref(),
+        Some("A quiet studio."),
+        "the parse still reads it"
+    );
+
+    // A workflow gate edit is structural: the digest moves.
+    let wf_path = dir.join("workflows/do-check.md");
+    let wf = std::fs::read_to_string(&wf_path).unwrap();
+    let edited = wf.replace("agent: qa-1", "agent: dev-1");
+    assert_ne!(edited, wf, "the fixture must actually change");
+    std::fs::write(&wf_path, &edited).unwrap();
+    assert_ne!(digest_of(), before, "a gate edit re-gates the app");
+}
+
 /// CAD-547: an app is a folder — `app.md` + `workflows/` (+ optional
 /// `rubrics/`, `templates/`) — installed to `<pm>/<key>/apps/<name>/`
 /// with its `<name>.yaml` record in one commit, landing unapproved.

@@ -5976,6 +5976,13 @@ pub const WF_ALIAS: &str = "---\ntitle: \"Alias: {{runner}}\"\ngoal: g\n\
 inputs:\n  runner: {}\n---\n\n\
 ## Work\nagent: {{runner}}\n\n### Acceptance\n- [ ] done\n";
 
+/// CAD-571: a workflow whose `slug` input declares `kind: slug` — the
+/// folder-name shape the engine enforces at render for every caller.
+pub const WF_SLUG: &str = "---\ntitle: \"Post: {{topic}}\"\ngoal: \"Write {{topic}}\"\n\
+inputs:\n  topic: { ask: \"What is it about?\" }\n  slug: { ask: \"Folder name under posts/\", kind: slug }\n---\n\n\
+## Write {{topic}}\nagent: dev-1\n\nWrite posts/{{slug}}/post.md.\n\n\
+### Acceptance\n- [ ] written\n";
+
 /// Write `text` into the fixture's scratch dir; answer its path.
 pub fn wf_file(f: &PlanFixture, name: &str, text: &str) -> String {
     let path = f.tmp.path().join(name);
@@ -6044,6 +6051,36 @@ pub fn app_install_studio(f: &PlanFixture) -> Value {
     );
     let (ok, out) = f.cli(&["app", "install", src.to_str().unwrap(), "--project", "demo"]);
     assert!(ok, "app install studio: {out}");
+    out
+}
+
+/// `pair`'s two workflows — labelled, so the primary action's label
+/// names which one it chose. Their names sort opposite to the order
+/// they are written here.
+pub const APP_WF_A: &str = "---\ntitle: \"Alpha: {{title}}\"\ngoal: g\nlabel: New alpha\n\
+inputs:\n  title: {}\n---\n\n## Alpha {{title}}\nagent: dev-1\n\n### Acceptance\n- [ ] done\n";
+
+pub const APP_WF_Z: &str = "---\ntitle: \"Zeta: {{title}}\"\ngoal: g\nlabel: New zeta\n\
+inputs:\n  title: {}\n---\n\n## Zeta {{title}}\nagent: dev-1\n\n### Acceptance\n- [ ] done\n";
+
+/// `app install` a two-workflow app `pair` into `demo` — the fixture
+/// for the primary-action agreement (CAD-571 N5): the sorted first is
+/// `aa-early`, whatever order the filesystem hands the directory back.
+pub fn app_install_pair(f: &PlanFixture) -> Value {
+    let src = app_src(
+        f,
+        "pair",
+        &[
+            (
+                "app.md",
+                "---\napp: pair\ntitle: Pair\nversion: 0.1.0\n---\n\n# Guide\n\nTwo runs.\n",
+            ),
+            ("workflows/zz-late.md", APP_WF_Z),
+            ("workflows/aa-early.md", APP_WF_A),
+        ],
+    );
+    let (ok, out) = f.cli(&["app", "install", src.to_str().unwrap(), "--project", "demo"]);
+    assert!(ok, "app install pair: {out}");
     out
 }
 
