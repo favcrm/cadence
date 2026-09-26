@@ -1157,8 +1157,20 @@ pub fn git_config_audit(view: &dyn View, operator: &str, principals: &AgentPrinc
 
     // The protected-config surface for uid-1000 git: system file (unless
     // GIT_CONFIG_NOSYSTEM), the global file(s), and env-carried pairs.
+    //
+    // GIT_CONFIG_NOSYSTEM is a *boolean* env, read the way git reads
+    // it (`git_env_bool`/`git_parse_maybe_bool`): "0", "false", "no"
+    // and "off" mean the system file IS read, so a presence-only
+    // check would skip `/etc/gitconfig` exactly when git reads it.
+    // Only a definite true skips — an empty or unparsable value is
+    // audited anyway, so a file git might read can never hide a
+    // finding (a value git skips but we audit only costs a spurious
+    // finding on an env that is already wrong).
     let mut files: Vec<PathBuf> = Vec::new();
-    if view.env("GIT_CONFIG_NOSYSTEM").is_none() {
+    let nosystem = view
+        .env("GIT_CONFIG_NOSYSTEM")
+        .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"));
+    if !nosystem {
         let path = view
             .env("GIT_CONFIG_SYSTEM")
             .unwrap_or_else(|| "/etc/gitconfig".to_string());
