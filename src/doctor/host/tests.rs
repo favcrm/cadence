@@ -3110,6 +3110,7 @@ fn run_emits_all_checks() {
             "worktrees",
             "load",
             "config",
+            "layout",
             "tailnet",
             "agent-uid"
         ]

@@ -437,6 +437,7 @@ fn doctor_host_json_reports_all_checks() {
             "worktrees",
             "load",
             "config",
+            "layout",
             "tailnet",
             "agent-uid"
         ]
