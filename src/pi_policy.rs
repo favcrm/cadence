@@ -127,7 +127,7 @@ impl PiPolicy {
                 .map_err(|why| Error::rejected(format!("pm.yaml [pi] model '{model}': {why}")))?;
         }
         for spec in &self.providers {
-            parse_package_pin(spec).map_err(|why| {
+            parse_package_pin(spec).map(|_| ()).map_err(|why| {
                 Error::rejected(format!("pm.yaml [pi].providers '{spec}': {why}"))
             })?;
         }
@@ -209,12 +209,18 @@ pub struct ProviderPackage {
 /// `name@version` — the version pin is the part after the LAST `@`
 /// (`@scope/name@1.2` parses too); npm package names never contain
 /// `..`, an empty segment, or characters outside `[A-Za-z0-9._-]`
-/// plus the one scoping `@`/`/`.
-fn parse_package_pin(spec: &str) -> Result<(&str, &str)> {
-    let Some((name, version)) = spec.rsplit_once('@') else {
+/// plus the one scoping `@`/`/`. The optional `#sha256-<64 hex>`
+/// fragment is the content pin (CAD-572): the digest every launch
+/// verifies the installed files against.
+fn parse_package_pin(spec: &str) -> Result<(&str, &str, Option<&str>)> {
+    let Some((name, rest)) = spec.rsplit_once('@') else {
         return Err(Error::rejected(
             "expected 'name@version' (a pin is required)",
         ));
+    };
+    let (version, digest) = match rest.split_once('#') {
+        Some((version, digest)) => (version, Some(digest)),
+        None => (rest, None),
     };
     let name_ok = {
         let segments: Vec<&str> = name.split('/').collect();
@@ -242,15 +248,125 @@ fn parse_package_pin(spec: &str) -> Result<(&str, &str)> {
             "expected 'name@version' or '@scope/name@version'",
         ));
     }
-    Ok((name, version))
+    if let Some(digest) = digest {
+        let hex = digest.strip_prefix("sha256-").unwrap_or("");
+        if hex.len() != 64
+            || !hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(Error::rejected(
+                "the content pin must be '#sha256-<64 lowercase hex>' (CAD-572)",
+            ));
+        }
+    }
+    Ok((name, version, digest))
+}
+
+/// The per-file bound [`package_digest`] reads — a package carrying a
+/// bigger file refuses rather than making every launch hash it.
+const DIGEST_FILE_CAP: u64 = 8 << 20;
+
+/// Deterministic content digest of a package dir: `sha256-<64 hex>` —
+/// the integrity half of a pin (CAD-572). The walk is
+/// order-independent: relative paths sorted byte-wise; a file feeds
+/// `b"f" <rel> NUL <len LE u64> <bytes>`, a symlink `b"l" <rel> NUL
+/// <target>` (never followed — the target string is the content);
+/// directories contribute nothing, so an empty dir is not content.
+/// `node_modules/` is excluded by design: the pin covers the
+/// package's own files, not its dependency tree.
+pub fn package_digest(dir: &Path) -> Result<String> {
+    use sha2::Digest as _;
+    let mut entries: Vec<(String, PathBuf)> = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let rd = std::fs::read_dir(&d).map_err(|e| {
+            Error::rejected(format!("package digest: cannot read {}: {e}", d.display()))
+        })?;
+        for ent in rd {
+            let path = ent
+                .map_err(|e| {
+                    Error::rejected(format!("package digest: cannot read {}: {e}", d.display()))
+                })?
+                .path();
+            let rel = path
+                .strip_prefix(dir)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned();
+            if rel.split('/').any(|seg| seg == "node_modules") {
+                continue;
+            }
+            let md = std::fs::symlink_metadata(&path).map_err(|e| {
+                Error::rejected(format!(
+                    "package digest: cannot stat {}: {e}",
+                    path.display()
+                ))
+            })?;
+            if md.is_dir() {
+                stack.push(path);
+            } else {
+                entries.push((rel, path));
+            }
+        }
+    }
+    entries.sort();
+    let mut h = sha2::Sha256::new();
+    for (rel, path) in entries {
+        let md = std::fs::symlink_metadata(&path).map_err(|e| {
+            Error::rejected(format!(
+                "package digest: cannot stat {}: {e}",
+                path.display()
+            ))
+        })?;
+        if md.file_type().is_symlink() {
+            let target = std::fs::read_link(&path).map_err(|e| {
+                Error::rejected(format!(
+                    "package digest: cannot read link {}: {e}",
+                    path.display()
+                ))
+            })?;
+            h.update(b"l");
+            h.update(rel.as_bytes());
+            h.update([0]);
+            h.update(target.to_string_lossy().as_bytes());
+        } else if md.is_file() {
+            if md.len() > DIGEST_FILE_CAP {
+                return Err(Error::rejected(format!(
+                    "package digest: {} exceeds the {DIGEST_FILE_CAP}-byte bound",
+                    path.display()
+                )));
+            }
+            let bytes = std::fs::read(&path).map_err(|e| {
+                Error::rejected(format!(
+                    "package digest: cannot read {}: {e}",
+                    path.display()
+                ))
+            })?;
+            h.update(b"f");
+            h.update(rel.as_bytes());
+            h.update([0]);
+            h.update(md.len().to_le_bytes());
+            h.update(&bytes);
+        } else {
+            return Err(Error::rejected(format!(
+                "package digest: {} is not a regular file",
+                path.display()
+            )));
+        }
+    }
+    let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    Ok(format!("sha256-{hex}"))
 }
 
 /// Resolve one `[pi].providers` pin under the operator's npm
 /// `node_modules` root: the package must be installed, at exactly the
-/// pinned version, and declare `pi.extensions` entry files inside its
-/// own dir. Any drift refuses — nothing is loaded "close enough".
+/// pinned version, declare `pi.extensions` entry files inside its own
+/// dir, and — when the pin carries a `#sha256-…` fragment (CAD-572) —
+/// hash to that content digest. Any drift refuses — nothing is loaded
+/// "close enough".
 pub fn resolve_package(spec: &str, root: &Path) -> Result<ProviderPackage> {
-    let (name, pin) = parse_package_pin(spec)?;
+    let (name, pin, digest) = parse_package_pin(spec)?;
     let dir = root.join(name);
     let manifest = dir.join("package.json");
     let text = std::fs::read_to_string(&manifest).map_err(|_| {
@@ -310,6 +426,21 @@ pub fn resolve_package(spec: &str, root: &Path) -> Result<ProviderPackage> {
              {} via a symlink — refusing (CAD-568)",
             root_canon.display()
         )));
+    }
+    // The integrity half of the pin (CAD-572): a version string cannot
+    // see a hand-edited file — the content digest can. Only a pin that
+    // carries one is checked; the refusal names both digests so the
+    // operator can re-pin deliberately after an intentional change.
+    if let Some(expected) = digest {
+        let found = package_digest(&dir)?;
+        if found != expected {
+            return Err(Error::rejected(format!(
+                "pi provider package '{spec}': package content drifted from the \
+                 pin (pinned {expected}, installed {found}) — reinstall the \
+                 pinned package or, after an intentional change, update the \
+                 digest in pm.yaml [pi].providers (CAD-572)"
+            )));
+        }
     }
     let mut entries = Vec::with_capacity(declared.len());
     for entry in &declared {
@@ -610,6 +741,146 @@ mod tests {
         .unwrap();
         std::os::unix::fs::symlink(&real_ext, dir2.join("sub")).unwrap();
         assert!(resolve_package("evil2@1.0.0", &root).is_err());
+    }
+
+    /// CAD-572: `name@version#sha256-<hex>` — the content pin. The
+    /// hand-edit case is the ticket's own: a one-line change under
+    /// `src/` that leaves package.json's version alone.
+    #[test]
+    fn a_content_pin_refuses_a_hand_edited_package() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("node_modules");
+        install(
+            &root,
+            "pi-devin",
+            r#"{"version":"0.2.1","pi":{"extensions":["./extensions/index.ts"]}}"#,
+            &["extensions/index.ts", "src/stream.ts"],
+        );
+        let dir = root.join("pi-devin");
+        let digest = package_digest(&dir).unwrap();
+        let spec = format!("pi-devin@0.2.1#{digest}");
+        // A clean install at the pin resolves.
+        assert!(resolve_package(&spec, &root).is_ok());
+        // The hand-edit: same version, different bytes.
+        std::fs::write(dir.join("src/stream.ts"), "// hand-edited in place").unwrap();
+        let err = resolve_package(&spec, &root).unwrap_err().to_string();
+        assert!(err.contains("drifted"), "{err}");
+        assert!(
+            err.contains(&digest),
+            "the refusal names the pinned digest so the operator can compare: {err}"
+        );
+        // Restoring the byte-identical content passes again.
+        std::fs::write(dir.join("src/stream.ts"), "// ext").unwrap();
+        assert!(resolve_package(&spec, &root).is_ok());
+    }
+
+    #[test]
+    fn added_or_removed_files_change_the_digest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("node_modules");
+        install(
+            &root,
+            "pi-devin",
+            r#"{"version":"0.2.1","pi":{"extensions":["./e.ts"]}}"#,
+            &["e.ts"],
+        );
+        let dir = root.join("pi-devin");
+        let digest = package_digest(&dir).unwrap();
+        let spec = format!("pi-devin@0.2.1#{digest}");
+        assert!(resolve_package(&spec, &root).is_ok());
+        // A planted file — a loader the version string cannot see.
+        std::fs::write(dir.join("extra.ts"), "// planted").unwrap();
+        assert!(resolve_package(&spec, &root).is_err());
+        std::fs::remove_file(dir.join("extra.ts")).unwrap();
+        assert!(resolve_package(&spec, &root).is_ok());
+        // A removed file refuses too.
+        std::fs::remove_file(dir.join("e.ts")).unwrap();
+        assert!(resolve_package(&spec, &root).is_err());
+    }
+
+    #[test]
+    fn the_content_pin_ignores_node_modules() {
+        // The documented scope: the pin covers the package's own files,
+        // not its dependency tree (pinning deps is a different pin).
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("node_modules");
+        install(
+            &root,
+            "pi-devin",
+            r#"{"version":"0.2.1","pi":{"extensions":["./e.ts"]}}"#,
+            &["e.ts"],
+        );
+        let dir = root.join("pi-devin");
+        std::fs::create_dir_all(dir.join("node_modules/dep")).unwrap();
+        std::fs::write(dir.join("node_modules/dep/index.js"), "// dep").unwrap();
+        let digest = package_digest(&dir).unwrap();
+        let spec = format!("pi-devin@0.2.1#{digest}");
+        assert!(resolve_package(&spec, &root).is_ok());
+        std::fs::write(dir.join("node_modules/dep/index.js"), "// swapped").unwrap();
+        assert!(
+            resolve_package(&spec, &root).is_ok(),
+            "node_modules is out of the pin's scope — documented, not silent"
+        );
+        // And a later recording excludes it too: the digest is stable
+        // across the swap.
+        assert_eq!(package_digest(&dir).unwrap(), digest);
+    }
+
+    #[test]
+    fn a_malformed_content_pin_refuses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("node_modules");
+        install(
+            &root,
+            "pi-devin",
+            r#"{"version":"0.1.2","pi":{"extensions":["./e.ts"]}}"#,
+            &["e.ts"],
+        );
+        for spec in [
+            "pi-devin@0.1.2#",
+            "pi-devin@0.1.2#sha256",
+            "pi-devin@0.1.2#md5-0123456789abcdef0123456789abcdef",
+            "pi-devin@0.1.2#sha256-XYZ",
+            "pi-devin@0.1.2#sha256-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde",
+            "pi-devin@0.1.2#sha256-0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef",
+        ] {
+            assert!(resolve_package(spec, &root).is_err(), "{spec}");
+        }
+        // The same grammar gates pm.yaml at read time.
+        let good = format!(
+            "pi:\n  providers: [\"pi-devin@0.1.2#sha256-{}\"]\n",
+            "0".repeat(64)
+        );
+        let (_d, pm) = pm_with(&good);
+        assert_eq!(read(&pm).unwrap().unwrap().providers.len(), 1);
+        let (_d, pm) = pm_with("pi:\n  providers: [\"pi-devin@0.1.2#md5-abc\"]\n");
+        let err = read(&pm).unwrap_err().to_string();
+        assert!(err.contains("pi-devin@0.1.2#md5-abc"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_digest_covers_symlink_targets() {
+        // A link inside the package is content: its target string is
+        // hashed, not followed — a re-pointed link changes the digest.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("node_modules");
+        install(
+            &root,
+            "linked",
+            r#"{"version":"1.0.0","pi":{"extensions":["./alias.ts","./real/inner.ts"]}}"#,
+            &["real/index.ts", "real/inner.ts"],
+        );
+        let dir = root.join("linked");
+        std::os::unix::fs::symlink("real/index.ts", dir.join("alias.ts")).unwrap();
+        let digest = package_digest(&dir).unwrap();
+        let spec = format!("linked@1.0.0#{digest}");
+        assert!(resolve_package(&spec, &root).is_ok());
+        // Re-point the link at another internal file — still contained,
+        // still different content.
+        std::fs::remove_file(dir.join("alias.ts")).unwrap();
+        std::os::unix::fs::symlink("real/inner.ts", dir.join("alias.ts")).unwrap();
+        assert!(resolve_package(&spec, &root).is_err());
     }
 
     #[cfg(unix)]
