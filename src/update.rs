@@ -860,8 +860,17 @@ fn take_lease(host: &dyn UpdateHost, target: &str) -> Result<rollout::Caller> {
         // Reuse renews the TTL: the run may outlive what remains of a
         // predecessor's lease, and a lease that lapses mid-run stops the
         // daemon adopting the marker and refuses the drain re-assert
-        // (CAD-561 r3).
-        rollout::renew(state_dir, &caller, LEASE_TTL, host.now())?;
+        // (CAD-561 r3). The renewal also carries this run's reason and
+        // target onto the reused row, so `rollout status` does not keep
+        // reporting the predecessor's (CAD-561 r4).
+        rollout::renew(
+            state_dir,
+            &caller,
+            "cadence update",
+            Some(target),
+            LEASE_TTL,
+            host.now(),
+        )?;
         return Ok(caller);
     }
     rollout::claim(

@@ -862,6 +862,15 @@ fn a_reused_same_identity_lease_is_renewed_not_left_to_lapse() {
         at_switch["expires_in_secs"].as_f64().unwrap() > 3000.0,
         "the reused lease kept its old TTL: {at_switch}"
     );
+    // The renewal also carries this run's target and reason onto the
+    // reused row — `rollout status` must not keep reporting the crashed
+    // predecessor's (CAD-561 r4).
+    assert_eq!(at_switch["target"], serde_json::json!(NEW), "{at_switch}");
+    assert_eq!(
+        at_switch["reason"],
+        serde_json::json!("cadence update"),
+        "{at_switch}"
+    );
     // The lease still never outlives the run that reused it.
     assert_eq!(host.lease_row()["held"], serde_json::json!(false));
 }

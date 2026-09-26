@@ -858,7 +858,23 @@ pub fn release(state_dir: &Path, caller: &Caller) -> Result<Value> {
 /// it lapse mid-run, or the daemon stops adopting the update marker and
 /// the drain re-assert is refused). Only the holder's own unexpired
 /// lease renews; anyone else gets [`release`]'s refusal.
-pub fn renew(state_dir: &Path, caller: &Caller, ttl: Duration, now: f64) -> Result<Value> {
+///
+/// The renewal carries the new run's `reason` and `target` onto the
+/// reused row: a crashed predecessor's lease was claimed for its own
+/// reason, and `rollout status` would keep reporting the stale one
+/// (CAD-561 r4).
+pub fn renew(
+    state_dir: &Path,
+    caller: &Caller,
+    reason: &str,
+    target: Option<&str>,
+    ttl: Duration,
+    now: f64,
+) -> Result<Value> {
+    validate_reason(reason)?;
+    if let Some(target) = target {
+        validate_target(target)?;
+    }
     let conn = connect_ensured(&db_file(state_dir))?;
     committed(immediate(&conn, |conn| {
         let lease = match require_holder(conn, caller, now, false)? {
@@ -867,8 +883,9 @@ pub fn renew(state_dir: &Path, caller: &Caller, ttl: Duration, now: f64) -> Resu
         };
         let expires_at = now + ttl.as_secs_f64();
         conn.execute(
-            "UPDATE rollout_leases SET expires_at=?1 WHERE id=?2",
-            params![expires_at, lease.id],
+            "UPDATE rollout_leases SET expires_at=?1, reason=?2, target_commit=?3 \
+             WHERE id=?4",
+            params![expires_at, reason, target, lease.id],
         )?;
         insert_event(
             conn,
@@ -878,6 +895,8 @@ pub fn renew(state_dir: &Path, caller: &Caller, ttl: Duration, now: f64) -> Resu
                 "lease_id": lease.id,
                 "expires_at": expires_at,
                 "previous_expires_at": lease.expires_at,
+                "reason": reason,
+                "target": target,
             }),
             now,
         )?;
@@ -2403,23 +2422,49 @@ mod tests {
         crate::test_seam::scoped(crate::test_seam::Asserted::Operator, || {
             claim_as(&state, "alice", 1_000.0, Duration::from_secs(60), false).unwrap();
             // Another identity cannot renew it.
-            let err =
-                renew(&state, &caller("bob"), Duration::from_secs(3600), 1_010.0).unwrap_err();
+            let err = renew(
+                &state,
+                &caller("bob"),
+                "bob's work",
+                Some("fffffff"),
+                Duration::from_secs(3600),
+                1_010.0,
+            )
+            .unwrap_err();
             assert!(err.to_string().contains("only the holder"), "{err}");
             // The holder's renewal moves the expiry in place: the same
-            // row, the same claimed_at, no release and re-claim.
+            // row, the same claimed_at, no release and re-claim. The
+            // renewing run's reason and target land on the row too, so
+            // `rollout status` reports what is actually running
+            // (CAD-561 r4).
             let before = status_at(&state);
-            let renewed =
-                renew(&state, &caller("alice"), Duration::from_secs(3600), 1_010.0).unwrap();
+            let renewed = renew(
+                &state,
+                &caller("alice"),
+                "cadence update",
+                Some("1234abc"),
+                Duration::from_secs(3600),
+                1_010.0,
+            )
+            .unwrap();
             assert_eq!(renewed["renewed"], true);
             assert_eq!(renewed["expires_at"].as_f64().unwrap(), 1_010.0 + 3600.0);
             let after = status_at(&state);
             assert_eq!(after["claimed_at"], before["claimed_at"]);
             assert_eq!(after["expires_at"].as_f64().unwrap(), 1_010.0 + 3600.0);
+            assert_eq!(after["reason"], "cadence update");
+            assert_eq!(after["target"], "1234abc");
             // An expired lease is not renewable — the holder takes over
             // or claims afresh.
-            let err =
-                renew(&state, &caller("alice"), Duration::from_secs(60), 9_999.0).unwrap_err();
+            let err = renew(
+                &state,
+                &caller("alice"),
+                "cadence update",
+                Some("1234abc"),
+                Duration::from_secs(60),
+                9_999.0,
+            )
+            .unwrap_err();
             assert!(err.to_string().contains("--takeover"), "{err}");
         });
         let events = events_of(&state);
