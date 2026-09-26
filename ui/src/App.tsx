@@ -7,6 +7,7 @@ import Board from "./features/projects/Board";
 import Drawer from "./features/projects/Drawer";
 import Epics from "./features/projects/Epics";
 import Milestones from "./features/projects/Milestones";
+import MasterPermissions from "./features/settings/MasterPermissions";
 import Memory from "./features/settings/Memory";
 import ModelDefaults from "./features/settings/ModelDefaults";
 import Update from "./features/settings/Update";
@@ -765,6 +766,11 @@ export default function App() {
               { label: "Models", href: hrefFor({ screen: "settings", section: "models" }), on: route.section === "models" },
               { label: "Memory", href: hrefFor({ screen: "settings", section: "memory" }), on: route.section === "memory" },
               { label: "Update", href: hrefFor({ screen: "settings", section: "update" }), on: route.section === "update" },
+              {
+                label: "Master permissions",
+                href: hrefFor({ screen: "settings", section: "permissions" }),
+                on: route.section === "permissions",
+              },
             ]}
           />
         )}
@@ -775,6 +781,7 @@ export default function App() {
         {route.screen === "settings" && route.section === "update" && (
           <Update viewer={{ readOnly, operator: meta?.operator === true }} />
         )}
+        {route.screen === "settings" && route.section === "permissions" && <MasterPermissions />}
         {screen === "login" && (
           <Login
             onSignedIn={() => {

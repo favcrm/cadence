@@ -25,6 +25,7 @@ const KIND_CHIP: Record<string, string> = {
   plan: "bg-warn/10 text-warn",
   question: "bg-info/10 text-info",
   approval: "bg-warn/10 text-warn",
+  master_permission: "bg-warn/10 text-warn",
   merge: "bg-ok/15 text-ok",
 };
 
@@ -325,7 +326,13 @@ function NeedItem({
   };
 
   const expandLabel =
-    action.type === "plan" ? "Review plan" : action.type === "answer" ? "Answer" : "Review merge";
+    action.type === "plan"
+      ? "Review plan"
+      : action.type === "answer"
+        ? "Answer"
+        : action.type === "permission"
+          ? "Decide"
+          : "Review merge";
   return (
     <li className="needrow px-3 py-2 min-w-0" data-need={need.kind}>
       <div className="flex items-center gap-2 min-w-0">
@@ -355,7 +362,10 @@ function NeedItem({
           >
             Ask master
           </button>
-          {(action.type === "plan" || action.type === "answer" || action.type === "merge") && (
+          {(action.type === "plan" ||
+            action.type === "answer" ||
+            action.type === "merge" ||
+            action.type === "permission") && (
             <button
               className="lnk text-label shrink-0"
               aria-expanded={open}
@@ -478,7 +488,98 @@ function NeedItem({
           }}
         />
       )}
+      {open && action.type === "permission" && !done && (
+        <PermissionForm
+          need={need as HomeNeed & { action: { type: "permission" } }}
+          readOnly={readOnly}
+          onDone={(t) => {
+            setDone(t);
+            setOpen(false);
+            onHide(need.key);
+            refresh();
+          }}
+        />
+      )}
     </li>
+  );
+}
+
+function PermissionForm({
+  need,
+  readOnly,
+  onDone,
+}: {
+  need: HomeNeed & { action: { type: "permission" } };
+  readOnly: boolean;
+  onDone: (text: string) => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [dont, setDont] = useState(false);
+  const a = need.action;
+  const run = (work: () => Promise<unknown>, what: string) => {
+    setBusy(true);
+    setError(null);
+    work()
+      .then(() => onDone(what))
+      .catch((e: ApiError) => setError(e.message ?? String(e)))
+      .finally(() => setBusy(false));
+  };
+  return (
+    <div className="mt-2 space-y-2" data-permission={a.id}>
+      <p className="text-micro text-ink-300 break-all">
+        <span className="chip bg-ink-800 text-ink-300 mr-1">{a.risk}</span>
+        {a.argv}
+      </p>
+      {a.reason ? <p className="text-micro text-ink-500">{a.reason}</p> : null}
+      <div className="flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          className="lnk text-label"
+          disabled={readOnly || busy}
+          onClick={() => run(() => api.permissionAllowOnce(a.id), "allowed once")}
+        >
+          Allow once
+        </button>
+        <button
+          type="button"
+          className="lnk text-label"
+          disabled={readOnly || busy}
+          onClick={() => run(() => api.permissionAlways(a.id, "exact", []), "always allowed")}
+        >
+          Always this command
+        </button>
+        {a.prefix ? (
+          <button
+            type="button"
+            className="lnk text-label"
+            disabled={readOnly || busy}
+            onClick={() => run(() => api.permissionAlways(a.id, "prefix", a.prefix ?? []), "always allowed (prefix)")}
+          >
+            Always {a.prefix.join(" ")}
+          </button>
+        ) : null}
+        <button
+          type="button"
+          className="lnk text-label"
+          disabled={readOnly || busy}
+          onClick={() =>
+            run(() => api.permissionReject(a.id, dont), dont ? "rejected, won't ask again" : "rejected")
+          }
+        >
+          Reject
+        </button>
+        <label className="text-micro text-ink-500 flex items-center gap-1">
+          <input type="checkbox" checked={dont} onChange={(e) => setDont(e.target.checked)} />
+          Don't ask again
+        </label>
+      </div>
+      {error ? (
+        <p className="text-micro text-fail break-words" role="alert">
+          {error}
+        </p>
+      ) : null}
+    </div>
   );
 }
 

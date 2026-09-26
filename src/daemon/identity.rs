@@ -297,6 +297,23 @@ impl Shared {
         })
     }
 
+    /// CAD-615: `peer_pid` is the child this daemon spawned for an
+    /// approved command, and its environ holds the matching token.
+    /// A token in any other process does not match.
+    fn grant_exec_matches(&self, peer_pid: u32) -> bool {
+        let Some(token) = peer_environ_var(peer_pid, "CADENCE_GRANT_TOKEN") else {
+            return false;
+        };
+        if token.is_empty() {
+            return false;
+        }
+        let map = self.perm_exec.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(&owner) = map.get(&token) else {
+            return false;
+        };
+        peer_pid == owner || proc_descends(peer_pid, owner)
+    }
+
     /// [`crate::peer::operator_proof`] against the live panes and
     /// enrollments — `Err` names the first check that failed.
     ///
@@ -306,6 +323,12 @@ impl Shared {
     /// as if unregistered — while a row with no recorded start keeps
     /// denying (fail closed).
     pub(super) fn operator_evidence(&self, peer_pid: u32) -> std::result::Result<(), String> {
+        // CAD-615: a child this daemon spawned to run an approved
+        // command carries a token bound to its pid. That is operator
+        // authority for the life of that process, not a caller field.
+        if self.grant_exec_matches(peer_pid) {
+            return Ok(());
+        }
         // CAD-482: under a seam scope the assertion alone answers —
         // `unproven` refuses even where the ambient caller is provably
         // the operator, so a pane run and a CI run decide identically.
@@ -376,6 +399,9 @@ impl Shared {
     /// node) refuses outright.
     pub(super) fn connection_caller(&self, peer_pid: u32) -> Result<caller_rule::Who> {
         use caller_rule::Who;
+        if self.grant_exec_matches(peer_pid) {
+            return Ok(Who::Operator);
+        }
         // CAD-482: the frame-level assertion is the caller for this
         // dispatch — the runner's pane/CI environment cannot leak in.
         if let Some(asserted) = crate::test_seam::asserted() {
@@ -680,6 +706,10 @@ impl Shared {
         params: &Value,
         peer_pid: u32,
     ) -> Result<()> {
+        if self.grant_exec_matches(peer_pid) {
+            reject_operator_fields(verb, params)?;
+            return Ok(());
+        }
         reject_operator_fields(verb, params)?;
         if let Some(who) = self.slot_identity(peer_pid)? {
             return Err(Error::rejected(format!(
@@ -708,6 +738,45 @@ impl Shared {
         reject_identity_fields(&fields, verb)?;
         self.operator_connection(verb, &fields, peer_pid)
     }
+}
+
+fn peer_environ_var(pid: u32, key: &str) -> Option<String> {
+    let env = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    let prefix = format!("{key}=");
+    env.split(|b| *b == 0).find_map(|kv| {
+        let kv = std::str::from_utf8(kv).ok()?;
+        kv.strip_prefix(&prefix).map(str::to_string)
+    })
+}
+
+/// Is `pid` a descendant of `ancestor`? Used so a helper the approved
+/// command spawns still carries the grant, while a different process
+/// that copied the token does not.
+fn proc_descends(pid: u32, ancestor: u32) -> bool {
+    let mut cur = pid;
+    for _ in 0..32 {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{cur}/stat")) else {
+            return false;
+        };
+        let Some((_, rest)) = stat.rsplit_once(')') else {
+            return false;
+        };
+        let Some(ppid) = rest
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            return false;
+        };
+        if ppid == ancestor {
+            return true;
+        }
+        if ppid <= 1 || ppid == cur {
+            return false;
+        }
+        cur = ppid;
+    }
+    false
 }
 
 /// Who is on the other end of a connection — see

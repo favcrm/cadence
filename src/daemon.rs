@@ -354,6 +354,9 @@ pub struct Shared {
     router_backlog: std::sync::atomic::AtomicUsize,
     /// CAD-339: serializes writers of the escalation record.
     escalation_lock: Mutex<()>,
+    /// CAD-615: grant-execution token → the pid of the child this
+    /// daemon spawned to run an approved command. Not a request field.
+    perm_exec: Mutex<HashMap<String, u32>>,
     /// CAD-339: serializes `master_dispatch` — the ticket's `ready`
     /// check and its dispatch are one step, so concurrent calls for a
     /// ticket dispatch it once.
@@ -536,6 +539,7 @@ impl Shared {
             checkup_dispatch: opts.checkup_dispatch.clone(),
             router_backlog: std::sync::atomic::AtomicUsize::new(0),
             escalation_lock: Mutex::new(()),
+            perm_exec: Mutex::new(HashMap::new()),
             dispatch_lock: Mutex::new(()),
             delivery_lock: Mutex::new(()),
             wake_lock: Mutex::new(()),
@@ -2526,6 +2530,18 @@ impl Shared {
             "master_state" => self.rpc_master_state(params),
             "master_models" => self.rpc_master_models(params, peer_pid),
             "master_command" => self.rpc_master_command(params, peer_pid),
+            // CAD-615: permission requests. The master files and uses
+            // them; only the operator decides or revokes.
+            "master_ask_permission" => self.rpc_master_ask_permission(params, peer_pid),
+            "master_peek_grant" => self.rpc_master_peek_grant(params, peer_pid),
+            "master_permission_use" => self.rpc_master_permission_use(params, peer_pid),
+            "master_permission_allow_once" => {
+                self.rpc_master_permission_allow_once(params, peer_pid)
+            }
+            "master_permission_always" => self.rpc_master_permission_always(params, peer_pid),
+            "master_permission_reject" => self.rpc_master_permission_reject(params, peer_pid),
+            "master_permission_revoke" => self.rpc_master_permission_revoke(params, peer_pid),
+            "master_permission_list" => self.rpc_master_permission_list(params, peer_pid),
             // CAD-574: the operator's Needs-you snooze/dismiss — a row
             // suppression is the operator's call alone.
             "needs_dismiss" => self.rpc_needs_dismiss(params, peer_pid),

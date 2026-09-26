@@ -79,6 +79,56 @@ pub(crate) enum MasterAction {
     /// starts nothing — for `scripts/master-read-probe.sh`.
     #[command(hide = true)]
     Confinement,
+    /// Ask the operator to approve one plain command (master only).
+    /// The command is the exact argv after `--`.
+    AskPermission {
+        /// Why the master needs it (shown in Needs-you).
+        #[arg(long)]
+        reason: String,
+        /// The exact command, after `--`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        argv: Vec<String>,
+    },
+    /// Does a live grant cover this exact command? Master only. The
+    /// guard calls it; exit 0 means yes.
+    #[command(hide = true)]
+    PeekGrant {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        argv: Vec<String>,
+    },
+    /// Allow one pending request once (operator only).
+    AllowOnce {
+        /// The request id.
+        id: String,
+    },
+    /// Save an allow rule for a pending request (operator only).
+    AlwaysAllow {
+        /// The request id.
+        id: String,
+        /// `exact` or `prefix`.
+        #[arg(long, default_value = "exact")]
+        scope: String,
+        /// Argument patterns after the verb, for `--scope prefix`.
+        /// A `*` is only legal at the end of an argument.
+        #[arg(long = "arg")]
+        arg: Vec<String>,
+    },
+    /// Reject a pending request (operator only).
+    Reject {
+        /// The request id.
+        id: String,
+        /// Also save a deny rule so this exact command is not asked again.
+        #[arg(long)]
+        dont_ask_again: bool,
+    },
+    /// Remove one permission rule (operator only). It stops matching
+    /// immediately.
+    RevokePermission {
+        /// The rule id.
+        id: String,
+    },
+    /// Pending requests and saved rules (operator only).
+    Permissions,
 }
 
 pub(super) fn run_master(state_dir: &Path, action: MasterAction) -> Result<i32> {
@@ -141,6 +191,43 @@ pub(super) fn run_master(state_dir: &Path, action: MasterAction) -> Result<i32> 
             "master_summary",
             json!({"since": since, "post": post}),
         )?,
+        MasterAction::AskPermission { reason, argv } => {
+            let cwd = std::env::current_dir().map_err(|e| {
+                cadence_agent::error::Error::rejected(format!("cwd is unreadable: {e}"))
+            })?;
+            client::rpc(
+                state_dir,
+                "master_ask_permission",
+                json!({"reason": reason, "argv": argv, "cwd": cwd}),
+            )?
+        }
+        MasterAction::PeekGrant { argv } => {
+            let cwd = std::env::current_dir().map_err(|e| {
+                cadence_agent::error::Error::rejected(format!("cwd is unreadable: {e}"))
+            })?;
+            client::rpc(
+                state_dir,
+                "master_peek_grant",
+                json!({"argv": argv, "cwd": cwd}),
+            )?
+        }
+        MasterAction::AllowOnce { id } => {
+            client::rpc(state_dir, "master_permission_allow_once", json!({"id": id}))?
+        }
+        MasterAction::AlwaysAllow { id, scope, arg } => client::rpc(
+            state_dir,
+            "master_permission_always",
+            json!({"id": id, "scope": scope, "tail": arg}),
+        )?,
+        MasterAction::Reject { id, dont_ask_again } => client::rpc(
+            state_dir,
+            "master_permission_reject",
+            json!({"id": id, "dont_ask_again": dont_ask_again}),
+        )?,
+        MasterAction::RevokePermission { id } => {
+            client::rpc(state_dir, "master_permission_revoke", json!({"id": id}))?
+        }
+        MasterAction::Permissions => client::rpc(state_dir, "master_permission_list", json!({}))?,
         MasterAction::Confinement => {
             let env = cadence_agent::adapter::ProviderEnv::default();
             let (confine, policy) =

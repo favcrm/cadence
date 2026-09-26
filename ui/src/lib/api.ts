@@ -156,6 +156,28 @@ export function planDecision(
   return { path, body: { reason: why } };
 }
 
+export interface MasterPermissionRequest {
+  id: string;
+  command: string;
+  cwd: string;
+  reason: string;
+  risk: string;
+  status: string;
+  expires_at: number;
+  prefix: string[] | null;
+}
+
+export interface MasterPermissionRule {
+  id: string;
+  effect: "allow" | "deny";
+  scope: "exact" | "prefix";
+  argv: string[];
+  tail: string[];
+  cwd: string;
+  by: string;
+  at: number;
+}
+
 export const api = {
   health: () => get<Health>("/api/health"),
   /** `withOperator` asks the server to run the operator proof (CAD-432) — once per page load. */
@@ -313,6 +335,19 @@ export const api = {
    * operator-only, relayed to the daemon's `needs_dismiss`. `secs` is
    * the snooze window (86400 or 604800); dismiss takes none.
    */
+  /** Operator decisions on a master permission request (CAD-615). */
+  permissionAllowOnce: (id: string) =>
+    post<Record<string, unknown>>(`/api/master/permissions/${encodeURIComponent(id)}/allow-once`, {}),
+  permissionAlways: (id: string, scope: "exact" | "prefix", tail: string[]) =>
+    post<Record<string, unknown>>(`/api/master/permissions/${encodeURIComponent(id)}/always`, { scope, tail }),
+  permissionReject: (id: string, dontAskAgain: boolean) =>
+    post<Record<string, unknown>>(`/api/master/permissions/${encodeURIComponent(id)}/reject`, {
+      dont_ask_again: dontAskAgain,
+    }),
+  permissionRules: () =>
+    get<{ requests: MasterPermissionRequest[]; rules: MasterPermissionRule[] }>("/api/master/permissions"),
+  permissionRevoke: (id: string) =>
+    post<Record<string, unknown>>(`/api/master/permissions/rules/${encodeURIComponent(id)}/revoke`, {}),
   needDecide: (verb: "snooze" | "dismiss", kind: string, id: string, secs?: number) =>
     post<Record<string, unknown>>(
       `/api/needs/${verb}`,

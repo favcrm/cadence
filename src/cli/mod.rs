@@ -3012,6 +3012,60 @@ pub(crate) fn email_flag_error(err: &clap::Error) -> Option<clap::Error> {
     ))
 }
 
+/// When this process is the master, an exact argv the operator
+/// approved is run by the daemon. Returns `Some` when that happened
+/// (or the daemon refused a never-list command). `None` means the
+/// normal verb should run.
+fn permission_replay(state_dir: &Path, cli: &Cli) -> Option<i32> {
+    if std::env::var("CADENCE_ALIAS").ok().as_deref() != Some(cadence_agent::master::ALIAS) {
+        return None;
+    }
+    if std::env::var_os("CADENCE_GRANT_TOKEN").is_some() {
+        return None;
+    }
+    match &cli.command {
+        Commands::Master {
+            action:
+                master::MasterAction::AskPermission { .. } | master::MasterAction::PeekGrant { .. },
+        } => return None,
+        _ => {}
+    }
+    let mut argv = vec!["cadence".to_string()];
+    argv.extend(std::env::args().skip(1));
+    if cadence_agent::master_perm::allowlisted(&argv) {
+        return None;
+    }
+    let cwd = std::env::current_dir().ok()?;
+    match client::rpc(
+        state_dir,
+        "master_permission_use",
+        json!({"argv": argv, "cwd": cwd}),
+    ) {
+        Ok(out) if out["applied"].as_bool() == Some(true) => {
+            let stdout = out["stdout"].as_str().unwrap_or("");
+            let stderr = out["stderr"].as_str().unwrap_or("");
+            if !stdout.is_empty() {
+                print!("{stdout}");
+                if !stdout.ends_with('\n') {
+                    println!();
+                }
+            }
+            if !stderr.is_empty() {
+                eprint!("{stderr}");
+                if !stderr.ends_with('\n') {
+                    eprintln!();
+                }
+            }
+            Some(out["code"].as_i64().unwrap_or(1) as i32)
+        }
+        Ok(_) => None,
+        Err(e) => {
+            eprintln!("{e}");
+            Some(1)
+        }
+    }
+}
+
 pub(crate) fn run() -> Result<i32> {
     let cli = Cli::try_parse().unwrap_or_else(|e| email_flag_error(&e).unwrap_or(e).exit());
     // ADR 0007 T1: dispatch before any state-dir resolution or sandbox
@@ -3030,14 +3084,20 @@ pub(crate) fn run() -> Result<i32> {
             AgentUidAction::Runbook => cadence_agent::agent_uid::runbook::cli(),
         };
     }
-    let state_dir = match cli.state_dir {
-        Some(dir) => dir,
+    let state_dir = match &cli.state_dir {
+        Some(dir) => dir.clone(),
         None => client::state_dir()?,
     };
     // CAD-310: a sandbox's state dir decides its profile and tracker,
     // not the caller's env. `sandbox` verbs resolve their own roots.
     if !matches!(cli.command, Commands::Sandbox { .. }) {
         cadence_agent::sandbox::adopt(&state_dir)?;
+    }
+    // CAD-615: the master retrying an approved command. The daemon
+    // runs it and this process prints the output. No grant, or an
+    // allowlisted command, falls through to the normal verb.
+    if let Some(code) = permission_replay(&state_dir, &cli) {
+        return Ok(code);
     }
     match cli.command {
         Commands::Doctor {

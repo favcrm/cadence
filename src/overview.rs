@@ -723,7 +723,9 @@ impl Audience {
             // CAD-484: an idle lane with no safe next step is the
             // operator's call too.
             "approval" | "fenced" | "question" | "plan" | "blocked" | "stopped"
-            | "next_action" => Self::Operator,
+            | "next_action"
+            // CAD-615: the master wants to run a command.
+            | "master_permission" => Self::Operator,
             // CAD-431: the merge decision, a review that did not
             // converge, one nobody can take, and auto-merge left on a
             // moved head are the operator's.
@@ -3462,6 +3464,33 @@ fn overview_from(
                 "a pane is busy — restart only when idle"
             });
         }
+    }
+
+    // CAD-615: a pending permission request is the operator's to decide.
+    for req in crate::master_perm::pending_requests(state_dir, now).unwrap_or_default() {
+        let age = (now - req.created).max(0);
+        let command = req.argv.join(" ");
+        let mut row = item(
+            15,
+            "master_permission",
+            &format!(
+                "master wants to run: {command} — risk {}",
+                match req.risk {
+                    crate::master_perm::Risk::Low => "low",
+                    crate::master_perm::Risk::Medium => "medium",
+                    crate::master_perm::Risk::High => "high",
+                }
+            ),
+            age,
+            "",
+            None,
+            &format!("cadence master allow-once {}", req.id),
+        )
+        .about("permission", &req.id)
+        .since(Some(req.created));
+        row.json["permission"] = crate::master_perm::request_json(&req);
+        row.json["reason"] = json!(req.reason);
+        needs.push(row);
     }
 
     classify_needs(

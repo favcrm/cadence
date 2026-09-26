@@ -488,6 +488,87 @@ pub(super) fn decide_need(
     }
 }
 
+/// `POST /api/master/permissions/<id>/allow-once|always|reject` or
+/// `POST /api/master/permissions/rules/<id>/revoke` (CAD-615).
+pub(super) fn permission_route(path: &str) -> Option<(&str, &str)> {
+    let tail = path.strip_prefix("/api/master/permissions/")?;
+    if let Some(id) = tail.strip_prefix("rules/") {
+        let (id, verb) = id.split_once('/')?;
+        return (verb == "revoke" && !id.is_empty() && !id.contains('/')).then_some((id, "revoke"));
+    }
+    let (id, verb) = tail.split_once('/')?;
+    if id == "rules" || id.is_empty() || id.contains('/') || verb.contains('/') {
+        return None;
+    }
+    matches!(verb, "allow-once" | "always" | "reject").then_some((id, verb))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AlwaysReq {
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    tail: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RejectReq {
+    #[serde(default)]
+    dont_ask_again: bool,
+}
+
+pub(super) fn decide_permission(
+    request: &mut Request,
+    state_dir: &std::path::Path,
+    id: &str,
+    verb: &str,
+) -> HttpResp {
+    let bytes = match read_body(request, BODY_CAP) {
+        Ok(bytes) => bytes,
+        Err(resp) => return resp,
+    };
+    let params = match verb {
+        "allow-once" => {
+            if !bytes.is_empty() && bytes != b"{}" {
+                return err_response(400, "allow-once takes an empty body");
+            }
+            json!({"id": id})
+        }
+        "always" => match parse_json::<AlwaysReq>(&bytes) {
+            Ok(req) => json!({
+                "id": id,
+                "scope": req.scope.unwrap_or_else(|| "exact".into()),
+                "tail": req.tail,
+            }),
+            Err(resp) => return resp,
+        },
+        "reject" => match parse_json::<RejectReq>(&bytes) {
+            Ok(req) => json!({"id": id, "dont_ask_again": req.dont_ask_again}),
+            Err(resp) => return resp,
+        },
+        "revoke" => {
+            if !bytes.is_empty() && bytes != b"{}" {
+                return err_response(400, "revoke takes an empty body");
+            }
+            json!({"id": id})
+        }
+        _ => return err_response(404, "no such permission route"),
+    };
+    let method = match verb {
+        "allow-once" => "master_permission_allow_once",
+        "always" => "master_permission_always",
+        "reject" => "master_permission_reject",
+        "revoke" => "master_permission_revoke",
+        _ => return err_response(404, "no such permission route"),
+    };
+    match client::rpc(state_dir, method, params) {
+        Ok(out) => json_response(out),
+        Err(e) => rpc_err(&e, method),
+    }
+}
+
 /// `(alias, verb)` for `/api/agents/<alias>/<verb>` — the rail's
 /// Resume/Unfence buttons (CAD-574).
 pub(super) fn agent_action_route(path: &str) -> Option<(&str, &str)> {
