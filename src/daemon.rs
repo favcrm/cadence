@@ -3846,6 +3846,59 @@ mod tests {
         (dir, shared)
     }
 
+    /// CAD-561: the drain gate. A daemon that comes up while an update
+    /// is in flight is drained from boot (the restart in the middle of
+    /// an update must not start turns); lifting the marker lifts the
+    /// gate; a marker older than the staleness bound is ignored, so an
+    /// update that died cannot wedge the fleet.
+    #[test]
+    fn cad561_a_pending_update_drains_from_boot_and_a_stale_one_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let pending = crate::update::PendingUpdate {
+            phase: "draining".into(),
+            target: "b".repeat(40),
+            from: Some("a".repeat(40)),
+            by: "operator:ada".into(),
+            since: crate::rollout::unix_now(),
+        };
+        crate::update::write_pending(dir.path(), &pending).unwrap();
+        let shared = Shared::new(dir.path(), &ServeOptions::default()).unwrap();
+        assert!(shared.draining(), "a restart mid-update stays drained");
+        assert_eq!(
+            shared.pending_update().map(|p| p.target),
+            Some("b".repeat(40))
+        );
+        // The update finishing (marker removed) lifts it.
+        crate::update::clear_pending(dir.path());
+        assert!(shared.pending_update().is_none());
+        assert!(!shared.draining());
+        // A stale marker is ignored.
+        let stale = crate::update::PendingUpdate {
+            since: crate::rollout::unix_now() - crate::update::UPDATE_STALE_SECS - 60.0,
+            ..pending
+        };
+        crate::update::write_pending(dir.path(), &stale).unwrap();
+        assert!(shared.pending_update().is_none());
+        assert!(!shared.draining());
+    }
+
+    /// CAD-561: the RPC that gates the fleet is the operator's, proved
+    /// by the handler itself — a table-level `Handler` rule never admits
+    /// an agent, and the handler runs `operator_connection`. Pinned at
+    /// the source, the same way the CAD-339 table parse pins methods.
+    #[test]
+    fn cad561_update_drain_is_operator_gated_in_the_dispatch() {
+        let src = include_str!("daemon.rs");
+        let arm = src
+            .find("\"update_drain\" => {")
+            .expect("the update_drain arm");
+        let body = &src[arm..arm + 400];
+        assert!(
+            body.contains("operator_connection(\"update_drain\""),
+            "update_drain must prove the operator connection: {body}"
+        );
+    }
+
     fn register(shared: &Shared, dir: &Path, alias: &str) {
         shared
             .store

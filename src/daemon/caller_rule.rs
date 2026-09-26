@@ -903,4 +903,37 @@ mod tests {
             Ok(None)
         );
     }
+
+    /// CAD-561: `update_drain` is the update's fleet gate — an agent can
+    /// never stop the fleet's work to push a build, and a detached
+    /// (unproven) caller cannot either; only the operator passes. The
+    /// read side, `update_status`, is open like every other read.
+    #[test]
+    fn update_drain_is_operator_only_and_never_an_agent() {
+        assert_eq!(rule_of("update_drain"), Some(Rule::Handler("operator_connection (CAD-561)")));
+        assert_eq!(rule_of("update_status"), Some(Rule::Read));
+        assert!(!rule_of("update_status").unwrap().checks_connection());
+        // A `Handler` rule admits nobody by table: the handler itself
+        // proves the connection (`daemon.rs`'s arm, pinned by the
+        // `cad561_update_drain_is_operator_gated_in_the_dispatch`
+        // test), so an agent can never pass by being an agent.
+        let p = json!({"on": true, "target": "aa", "label": "operator:ada"});
+        let handler = Rule::Handler("operator_connection (CAD-561)");
+        assert_eq!(
+            admit("update_drain", handler, &agent("swe-554"), &p, &Facts::default()),
+            Ok(None)
+        );
+        // What no caller may do is name itself in the request — the
+        // label is a label, never the authority.
+        let forged = json!({"on": true, "target": "aa", "label": "operator:ada", "by": "operator"});
+        let e = admit(
+            "update_drain",
+            handler,
+            &agent("swe-554"),
+            &forged,
+            &Facts::default(),
+        )
+        .unwrap_err();
+        assert!(e.contains("is attributed to itself"), "{e}");
+    }
 }

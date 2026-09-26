@@ -411,6 +411,28 @@ pub fn check(host: &dyn UpdateHost) -> Result<CheckReport> {
         )));
     }
     let up_to_date = current_sha.as_deref() == Some(target.as_str());
+    // A target that is not on main can never be installed; refuse here,
+    // before the lease and the backup, not deep inside the install.
+    if !up_to_date {
+        match src.on_main(&target)? {
+            upgrade::OnMain::Yes => {}
+            upgrade::OnMain::No(status) => {
+                return Err(Error::rejected(format!(
+                    "{target} is not on {} in {} (compare status: {status}) — only builds of \
+                     merged commits are installable",
+                    upgrade::MAIN,
+                    src.repo()
+                )))
+            }
+            upgrade::OnMain::Unknown => {
+                return Err(Error::rejected(format!(
+                    "{target} is not a commit {} knows — not on {}",
+                    src.repo(),
+                    upgrade::MAIN
+                )))
+            }
+        }
+    }
     let changes = match (&current_sha, up_to_date) {
         (Some(from), false) => src.merged_titles(from, &target).unwrap_or_default(),
         _ => Vec::new(),
