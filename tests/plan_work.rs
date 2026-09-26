@@ -1631,7 +1631,7 @@ fn plan_gate_refuses_job_dispatch_until_approved() {
     assert_eq!(d.task_state("jp-t"), "draft");
 
     // Review C1: both monitor dispatch paths run the same gate.
-    d.rpc(
+    d.operator_rpc(
         "monitor_register",
         json!({"monitor": "manual", "project": project, "owner": "operator",
                "tasks": ["jp-t"], "interval_secs": 1, "dispatch_enabled": true}),
@@ -1646,7 +1646,7 @@ fn plan_gate_refuses_job_dispatch_until_approved() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("plan D-2 is proposed"), "{err}");
-    d.rpc(
+    d.operator_rpc(
         "monitor_register",
         json!({"monitor": "auto", "project": project, "owner": "operator",
                "tasks": ["jp-t"], "interval_secs": 1, "dispatch_enabled": true,
@@ -2985,7 +2985,7 @@ fn cad324_continuity_packs_on_new_compacted_and_lost_sessions() {
         f.d.send("lead", json!({"text": text, "message": id}))
             .unwrap();
     }
-    f.d.rpc("message_cancel", json!({"message": "w-x"}))
+    f.d.operator_rpc("message_cancel", json!({"message": "w-x"}))
         .unwrap();
     f.d.operator_rpc(
         "message_reconcile",
@@ -2993,7 +2993,8 @@ fn cad324_continuity_packs_on_new_compacted_and_lost_sessions() {
     )
     .unwrap();
     f.d.wait_agent("lead", "stopped", 10);
-    f.d.rpc("agent_resume", json!({"alias": "lead"})).unwrap();
+    f.d.operator_rpc("agent_resume", json!({"alias": "lead"}))
+        .unwrap();
     assert!(result_text(&f.d, "lead", "r1").starts_with("FAKE_PACK "));
     assert_eq!(
         result_text(&f.d, "lead", "r2"),

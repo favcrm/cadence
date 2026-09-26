@@ -34,9 +34,11 @@ fn codex_approval_policy_defaults_to_never_and_replays_on_resume() {
     assert_eq!(reqs[0]["params"]["sandbox"], "read-only");
     // Stop + resume reopens the thread: the same effective policy is
     // replayed verbatim on `thread/resume`.
-    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "w1"}))
+        .unwrap();
     d.wait_agent("w1", "stopped", 15);
-    d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
+    d.operator_rpc("agent_resume", json!({"alias": "w1"}))
+        .unwrap();
     d.wait_agent("w1", "idle", 15);
     let reqs = mock_requests(&mock);
     assert_eq!(reqs.len(), 2, "{reqs:?}");
@@ -210,9 +212,11 @@ fn codex_model_effort_are_validated_reported_and_replayed_on_resume() {
     assert_eq!(agent["effort_reported"], "max", "{agent}");
     assert_eq!(agent["effort_effective"], "max", "{agent}");
 
-    d.rpc("agent_stop", json!({"alias": "luna"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "luna"}))
+        .unwrap();
     d.wait_agent("luna", "stopped", 15);
-    d.rpc("agent_resume", json!({"alias": "luna"})).unwrap();
+    d.operator_rpc("agent_resume", json!({"alias": "luna"}))
+        .unwrap();
     d.wait_agent("luna", "idle", 15);
     let reqs = mock_requests(&mock);
     assert_eq!(reqs.len(), 2, "{reqs:?}");
@@ -288,7 +292,7 @@ fn codex_approval_policy_reaches_thread_start_verbatim() {
     let d = TestDaemon::start();
     let mock = d.mock_codex("ok");
     let cwd = d.dir.path().to_str().unwrap().to_string();
-    d.rpc(
+    d.operator_rpc(
         "agent_register",
         json!({"alias": "w1", "provider": "codex",
                "endpoint_kind": "managed", "cwd": cwd,
@@ -355,9 +359,11 @@ fn codex_approval_policy_rejected_at_register_and_next_launch() {
                "patch": {"approval_policy": "untrusted"}}),
     )
     .unwrap();
-    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "w1"}))
+        .unwrap();
     d.wait_agent("w1", "stopped", 15);
-    d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
+    d.operator_rpc("agent_resume", json!({"alias": "w1"}))
+        .unwrap();
     d.wait_agent("w1", "idle", 15);
     let reqs = mock_requests(&mock);
     let last = reqs.last().unwrap();
@@ -373,7 +379,8 @@ fn codex_approval_policy_rejected_at_open() {
     let _mock = d.mock_codex("ok");
     d.register_codex("w1");
     d.wait_agent("w1", "idle", 15);
-    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "w1"}))
+        .unwrap();
     d.wait_agent("w1", "stopped", 15);
     let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
     conn.execute(
@@ -382,7 +389,8 @@ fn codex_approval_policy_rejected_at_open() {
     )
     .unwrap();
     drop(conn);
-    d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
+    d.operator_rpc("agent_resume", json!({"alias": "w1"}))
+        .unwrap();
     let agent = d.wait_agent("w1", "attention", 15);
     let err = agent["error"].as_str().unwrap().to_string();
     for accepted in ["never", "on-request", "on-failure", "untrusted"] {
@@ -403,7 +411,8 @@ fn codex_sandbox_rejected_at_open() {
     d.register_codex("w1");
     d.wait_agent("w1", "idle", 15);
     for thread in ["thread_id", "NULL"] {
-        d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+        d.operator_rpc("agent_stop", json!({"alias": "w1"}))
+            .unwrap();
         d.wait_agent("w1", "stopped", 15);
         wait_pid_gone(&mock.pidfile, 15);
         std::fs::remove_file(&mock.pidfile).unwrap();
@@ -418,7 +427,8 @@ fn codex_sandbox_rejected_at_open() {
         )
         .unwrap();
         drop(conn);
-        d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
+        d.operator_rpc("agent_resume", json!({"alias": "w1"}))
+            .unwrap();
         let agent = d.wait_agent("w1", "attention", 15);
         let err = agent["error"].as_str().unwrap().to_string();
         assert!(err.contains("'danger-full-access'"), "{thread}: {err}");
@@ -441,7 +451,8 @@ fn codex_sandbox_rejected_at_open() {
         )
         .unwrap();
         drop(conn);
-        d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
+        d.operator_rpc("agent_resume", json!({"alias": "w1"}))
+            .unwrap();
         d.wait_agent("w1", "idle", 15);
     }
 }
@@ -456,7 +467,7 @@ fn codex_sandbox_values_reach_thread_start_and_are_reported() {
     let cwd = d.dir.path().to_str().unwrap().to_string();
     for (i, sandbox) in ["read-only", "workspace-write"].iter().enumerate() {
         let alias = format!("w{i}");
-        d.rpc(
+        d.operator_rpc(
             "agent_register",
             json!({"alias": alias, "provider": "codex",
                    "endpoint_kind": "managed", "cwd": cwd,
@@ -545,9 +556,11 @@ fn codex_cli_approval_policy_flag_roundtrips_through_resume() {
         assert_eq!(reqs[reqs.len() - 1]["method"], "thread/start", "{reqs:?}");
         assert_eq!(reqs[reqs.len() - 1]["params"]["approvalPolicy"], *policy);
         // Stop + resume replays the stored policy on thread/resume.
-        d.rpc("agent_stop", json!({"alias": alias})).unwrap();
+        d.operator_rpc("agent_stop", json!({"alias": alias}))
+            .unwrap();
         d.wait_agent(alias, "stopped", 15);
-        d.rpc("agent_resume", json!({"alias": alias})).unwrap();
+        d.operator_rpc("agent_resume", json!({"alias": alias}))
+            .unwrap();
         d.wait_agent(alias, "idle", 15);
         let reqs = mock_requests(&mock);
         assert_eq!(reqs.len(), 2 * (i + 1), "{reqs:?}");
@@ -619,7 +632,9 @@ fn stop_is_bounded_when_interrupt_is_ignored() {
         .unwrap();
     d.wait_message("w1", "m1", &["running"], 15);
     let began = Instant::now();
-    let stopped = d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    let stopped = d
+        .operator_rpc("agent_stop", json!({"alias": "w1"}))
+        .unwrap();
     assert!(
         began.elapsed() < Duration::from_secs(20),
         "stop was not bounded when interrupt was ignored"
@@ -679,7 +694,9 @@ fn stop_on_fenced_agent_preserves_attention() {
     assert!(reason.contains("does not prove"), "{reason}");
     assert!(!reason.contains("then `cadence agent resume"), "{reason}");
     // Stop only disables: the fence state and its reason stay visible.
-    let stopped = d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    let stopped = d
+        .operator_rpc("agent_stop", json!({"alias": "w1"}))
+        .unwrap();
     assert_eq!(stopped["state"], "attention");
     let agent = d.wait_agent("w1", "attention", 10);
     assert_eq!(agent["enabled"], false);
@@ -693,7 +710,9 @@ fn stop_on_fenced_agent_preserves_attention() {
         agent["error"]
     );
     // Repeated stop is idempotent and still does not mask the fence.
-    let again = d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    let again = d
+        .operator_rpc("agent_stop", json!({"alias": "w1"}))
+        .unwrap();
     assert_eq!(again["state"], "attention");
     let agent = d.wait_agent("w1", "attention", 5);
     assert!(
@@ -707,7 +726,9 @@ fn stop_on_fenced_agent_preserves_attention() {
     assert_eq!(d.message_state("w1", "m1"), "unknown");
     // Resume is rejected until the operator reconciles — the fence is
     // not masked by either verb, and the rejection does not chain a second resume.
-    let fenced = d.rpc("agent_resume", json!({"alias": "w1"})).unwrap_err();
+    let fenced = d
+        .operator_rpc("agent_resume", json!({"alias": "w1"}))
+        .unwrap_err();
     let fenced = fenced.to_string();
     assert!(fenced.contains("resume refused"), "{fenced}");
     assert!(!fenced.contains("then `cadence agent resume"), "{fenced}");
@@ -725,7 +746,12 @@ fn concurrent_stops_are_idempotent() {
     for _ in 0..2 {
         let state = d.state.clone();
         racers.push(thread::spawn(move || {
-            client::rpc(&state, "agent_stop", json!({"alias": "w1"}))
+            // CAD-482: agent_stop is operator-gated — assert the
+            // operator identity in-band (a no-op scope on a build
+            // without the feature, where the ambient caller answers).
+            cadence_agent::test_seam::scoped(cadence_agent::test_seam::Asserted::Operator, || {
+                client::rpc(&state, "agent_stop", json!({"alias": "w1"}))
+            })
         }));
     }
     // Overlapping stops: exactly one owns the reservation and mutates;
@@ -743,7 +769,8 @@ fn concurrent_stops_are_idempotent() {
     d.wait_agent("w1", "stopped", 10);
     assert_eq!(d.message_state("w1", "m1"), "interrupted");
     // Ownership was fully released: a resume works on the first try.
-    d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
+    d.operator_rpc("agent_resume", json!({"alias": "w1"}))
+        .unwrap();
     d.wait_agent("w1", "idle", 10);
 }
 
@@ -760,7 +787,9 @@ fn stop_during_initialization_is_bounded() {
         thread::sleep(Duration::from_millis(50));
     }
     let began = Instant::now();
-    let stopped = d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    let stopped = d
+        .operator_rpc("agent_stop", json!({"alias": "w1"}))
+        .unwrap();
     assert!(
         began.elapsed() < Duration::from_secs(20),
         "stop during initialization was not bounded: {:?}",
@@ -822,7 +851,9 @@ fn ws_stop_is_bounded_when_silent() {
         .unwrap();
     d.wait_message("w1", "m1", &["running"], 15);
     let began = Instant::now();
-    let stopped = d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    let stopped = d
+        .operator_rpc("agent_stop", json!({"alias": "w1"}))
+        .unwrap();
     assert!(
         began.elapsed() < Duration::from_secs(20),
         "ws stop was not bounded"
@@ -873,7 +904,9 @@ fn ws_stop_during_init_is_bounded() {
         thread::sleep(Duration::from_millis(50));
     }
     let began = Instant::now();
-    let stopped = d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    let stopped = d
+        .operator_rpc("agent_stop", json!({"alias": "w1"}))
+        .unwrap();
     assert!(
         began.elapsed() < Duration::from_secs(20),
         "ws init stop was not bounded: {:?}",
@@ -955,7 +988,9 @@ fn ws_stop_during_handshake_is_bounded() {
         thread::sleep(Duration::from_millis(50));
     }
     let began = Instant::now();
-    let stopped = d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    let stopped = d
+        .operator_rpc("agent_stop", json!({"alias": "w1"}))
+        .unwrap();
     assert!(
         began.elapsed() < Duration::from_secs(20),
         "stop during handshake was not bounded"
@@ -1400,7 +1435,8 @@ fn claude_result_routes_to_pty_pm() {
     d.register_claude("w1", json!({"upstream": "pm"}));
     d.wait_agent("w1", "idle", 15);
     // Claim the pty gate so the routed result may be pasted.
-    d.rpc("agent_ready", json!({"alias": "pm"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "pm"}))
+        .unwrap();
     d.send("w1", json!({"text": "hi", "message": "m1"}))
         .unwrap();
     d.wait_message("w1", "m1", &["completed"], 20);
@@ -1473,7 +1509,8 @@ fn claude_death_mid_turn_unknown_then_unfence_resume() {
         .unwrap();
     // Reconcile leaves the agent stopped; resume is the explicit step.
     assert_eq!(unfenced["state"], "stopped", "{unfenced}");
-    d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
+    d.operator_rpc("agent_resume", json!({"alias": "w1"}))
+        .unwrap();
     d.wait_agent("w1", "idle", 15);
     // `idle` only proves the transport opened — under load the
     // relaunched mock can still be booting, so `.argv` may still hold
@@ -1517,7 +1554,9 @@ fn claude_interrupt_yields_interrupted() {
     d.wait_message("w1", "m1", &["running"], 15);
     // Stop interrupts first: the mock emits an interrupted result, so
     // the message lands `interrupted` — never fenced unknown.
-    let stopped = d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    let stopped = d
+        .operator_rpc("agent_stop", json!({"alias": "w1"}))
+        .unwrap();
     assert_eq!(stopped["state"], "stopped");
     d.wait_message("w1", "m1", &["interrupted"], 10);
 }
@@ -1649,8 +1688,10 @@ fn claude_params_replayed_on_resume() {
         .as_str()
         .unwrap()
         .to_string();
-    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
-    d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "w1"}))
+        .unwrap();
+    d.operator_rpc("agent_resume", json!({"alias": "w1"}))
+        .unwrap();
     d.wait_agent("w1", "idle", 15);
     // Same spawn/write gap on the resumed generation — and the file
     // still holds the first launch's argv until the resumed mock
@@ -1733,8 +1774,10 @@ fn claude_effort_next_launch_and_model_reported() {
     assert_eq!(std::fs::read_to_string(&argv_file).unwrap(), argv1);
 
     // stop + resume picks both up; a turn orders after the rewrite.
-    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
-    d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "w1"}))
+        .unwrap();
+    d.operator_rpc("agent_resume", json!({"alias": "w1"}))
+        .unwrap();
     d.wait_agent("w1", "idle", 15);
     d.send("w1", json!({"text": "boot2", "message": "m-boot2"}))
         .unwrap();
@@ -2282,7 +2325,7 @@ fn claude_brokered_permission_daemon_restart_denies() {
     // Restart: pending lives in memory, so the new daemon reports the
     // request closed — the server retries through the socket gap and
     // denies cleanly.
-    d.rpc("shutdown", json!({})).unwrap();
+    d.operator_rpc("shutdown", json!({})).unwrap();
     d.handle.take().unwrap().join().unwrap().unwrap();
     let d2 = TestDaemon::start_on(state);
     let line = verdict_reader.join().unwrap();
@@ -2349,8 +2392,10 @@ fn claude_brokered_params_replayed_on_resume() {
     let agent = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["agent"].clone();
     assert_eq!(agent["params"]["broker_approvals"], true, "{agent}");
     assert_eq!(agent["params"]["permission_timeout_secs"], 120, "{agent}");
-    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
-    d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "w1"}))
+        .unwrap();
+    d.operator_rpc("agent_resume", json!({"alias": "w1"}))
+        .unwrap();
     d.wait_agent("w1", "idle", 15);
     // Resume replays the broker wiring verbatim — config regenerated,
     // same flags, resumed session.
@@ -2522,7 +2567,7 @@ fn model_defaults_register_resume_and_mock_argv() {
     assert!(!unsupported.status.success());
     assert!(String::from_utf8_lossy(&unsupported.stderr).contains("does not accept a model"));
 
-    d.rpc(
+    d.operator_rpc(
         "agent_register",
         json!({"alias": "pm", "provider": "fake", "endpoint_kind": "fake", "cwd": cwd, "role": "pm"}),
     )
@@ -2602,8 +2647,10 @@ fn model_defaults_register_resume_and_mock_argv() {
     let doc_b = r#"{"expected_revision":1,"config":{"schema":1,"providers":{"claude":{"default":{"mode":"model","model":"baseline-b"},"roles":{}}}}}"#;
     d.operator_rpc("model_defaults_set", json!({"document": doc_b}))
         .unwrap();
-    d.rpc("agent_stop", json!({"alias": "qa-cli"})).unwrap();
-    d.rpc("agent_resume", json!({"alias": "qa-cli"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "qa-cli"}))
+        .unwrap();
+    d.operator_rpc("agent_resume", json!({"alias": "qa-cli"}))
+        .unwrap();
     d.wait_agent("qa-cli", "idle", 20);
     d.send("qa-cli", json!({"text": "again", "message": "m-resume"}))
         .unwrap();
@@ -2612,7 +2659,7 @@ fn model_defaults_register_resume_and_mock_argv() {
     assert!(argv.contains("--model\nqa-model"), "{argv}");
     assert!(!argv.contains("baseline-b"), "{argv}");
 
-    d.rpc(
+    d.operator_rpc(
         "agent_register",
         json!({"alias": "fresh", "provider": "claude", "endpoint_kind": "managed", "cwd": cwd, "role": "worker"}),
     )
@@ -2635,8 +2682,10 @@ fn model_defaults_register_resume_and_mock_argv() {
         cleared["model_selection"]["source"],
         "explicit_provider_default"
     );
-    d.rpc("agent_stop", json!({"alias": "fresh"})).unwrap();
-    d.rpc("agent_resume", json!({"alias": "fresh"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "fresh"}))
+        .unwrap();
+    d.operator_rpc("agent_resume", json!({"alias": "fresh"}))
+        .unwrap();
     d.wait_agent("fresh", "idle", 20);
     d.send("fresh", json!({"text": "native", "message": "m-native"}))
         .unwrap();
@@ -2644,7 +2693,7 @@ fn model_defaults_register_resume_and_mock_argv() {
     let argv = std::fs::read_to_string(&argv_file).unwrap();
     assert!(!argv.contains("--model"), "{argv}");
 
-    d.rpc(
+    d.operator_rpc(
         "agent_register",
         json!({"alias": "box", "provider": "inbox", "endpoint_kind": "inbox", "team_role": "ops"}),
     )
@@ -2655,7 +2704,7 @@ fn model_defaults_register_resume_and_mock_argv() {
     assert_eq!(inbox["team_role"], "devops");
     assert_eq!(inbox["role"], "worker");
 
-    let again = d.rpc(
+    let again = d.operator_rpc(
         "agent_register",
         json!({"alias": "qa-cli", "provider": "claude", "endpoint_kind": "managed", "cwd": cwd, "team_role": "dev"}),
     );

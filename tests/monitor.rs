@@ -199,7 +199,7 @@ fn monitor_check_failure_is_degraded_without_healthy_claim() {
         .unwrap();
     d.task_new_ac("badjob", "badjob-watch", "w1", "observe failures")
         .unwrap();
-    d.rpc(
+    d.operator_rpc(
         "monitor_register",
         json!({"monitor": "bad", "project": project, "owner": "operator",
                "tasks": ["badjob-watch"], "interval_secs": 1}),
@@ -364,7 +364,7 @@ fn monitor_persists_coverage_heartbeats_and_deduplicates_alerts() {
     // The registration and cursor survive a daemon restart; the observed
     // event is not replayed as a second alert.
     let state = d.state.clone();
-    d.rpc("shutdown", json!({})).unwrap();
+    d.operator_rpc("shutdown", json!({})).unwrap();
     d.handle.take().unwrap().join().unwrap().unwrap();
     let d2 = TestDaemon::start_on(state);
     let restored = wait_monitor_state(&d2, "m1", "active", 5);
@@ -392,7 +392,7 @@ fn monitor_alerts_task_unknown_outcome_is_scoped_and_restart_safe() {
         "inspect uncertain work",
     )
     .unwrap();
-    d.rpc(
+    d.operator_rpc(
         "monitor_register",
         json!({"monitor": "unknown-monitor", "project": project,
                "owner": "operator", "tasks": ["unknown-task"],
@@ -405,12 +405,13 @@ fn monitor_alerts_task_unknown_outcome_is_scoped_and_restart_safe() {
     // until its body is the fake provider's DISCONNECT fixture and resume
     // starts the actor. Opening Store here would run crash recovery against
     // the live daemon, so the body rewrite uses a plain connection.
-    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "w1"}))
+        .unwrap();
     let stopped = d.wait_agent("w1", "stopped", 10);
     assert_eq!(stopped["enabled"], false, "{stopped}");
     assert!(stopped["endpoint"].is_null(), "{stopped}");
     let dispatched = d
-        .rpc("task_dispatch", json!({"task": "unknown-task"}))
+        .operator_rpc("task_dispatch", json!({"task": "unknown-task"}))
         .unwrap();
     assert_eq!(dispatched["duplicate"], false, "{dispatched}");
     let kickoff = dispatched["message"].as_str().unwrap().to_string();
@@ -447,7 +448,8 @@ fn monitor_alerts_task_unknown_outcome_is_scoped_and_restart_safe() {
         d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["agent"]["state"],
         "stopped"
     );
-    d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
+    d.operator_rpc("agent_resume", json!({"alias": "w1"}))
+        .unwrap();
 
     let message = d.wait_message("w1", &kickoff, &["unknown"], 15);
     assert_eq!(message["state"], "unknown", "{message}");
@@ -605,7 +607,7 @@ fn monitor_alerts_task_unknown_outcome_is_scoped_and_restart_safe() {
     // Restarting restores the monitor cursor and keeps the same open alert;
     // the unknown attempt remains fenced and the task never reaches review.
     let state = d.state.clone();
-    d.rpc("shutdown", json!({})).unwrap();
+    d.operator_rpc("shutdown", json!({})).unwrap();
     d.handle.take().unwrap().join().unwrap().unwrap();
     let restarted_at = epoch_now();
     let d2 = TestDaemon::start_on(state);
@@ -656,7 +658,7 @@ fn monitor_dispatch_requires_explicit_safe_eligibility() {
         .unwrap();
     d.task_new_ac("djob", "djob-repeat", "w2", "reuse the live kickoff")
         .unwrap();
-    d.rpc(
+    d.operator_rpc(
         "monitor_register",
         json!({"monitor": "dm", "project": project, "owner": "operator",
                "tasks": ["djob-ready", "djob-repeat"], "interval_secs": 1,
@@ -691,7 +693,8 @@ fn monitor_dispatch_requires_explicit_safe_eligibility() {
     // Seed a second task with an existing queued kickoff while its worker is
     // stopped. The monitor retry must take the duplicate-only branch even
     // though a fresh dispatch would fail the live-worker eligibility gate.
-    d.rpc("agent_stop", json!({"alias": "w2"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "w2"}))
+        .unwrap();
     d.wait_agent("w2", "stopped", 10);
     let store = Store::open(&d.state.join("cadence.sqlite3")).unwrap();
     let (_, existing_kickoff, existing_duplicate, _) = store

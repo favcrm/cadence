@@ -31,7 +31,8 @@ fn pty_restart_fence_unfence_resume_readopts_pane() {
     d.register_devin("dv1", None);
     let agent = d.wait_agent("dv1", "idle", 20);
     let native = agent["thread_id"].as_str().unwrap().to_string();
-    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "dv1"}))
+        .unwrap();
     d.send("dv1", json!({"text": "task", "message": "m1"}))
         .unwrap();
     pty_token(&d, "dv1", "m1");
@@ -43,7 +44,7 @@ fn pty_restart_fence_unfence_resume_readopts_pane() {
     // Daemon dies mid-turn — the tmux pane survives (detached). The
     // stop itself is clean; deleting the marker makes it a crash —
     // this test asserts the fence path, not hot-restart adoption.
-    d.rpc("shutdown", json!({})).unwrap();
+    d.operator_rpc("shutdown", json!({})).unwrap();
     d.handle.take().unwrap().join().unwrap().unwrap();
     drop_shutdown_marker(&d.state);
     let state = d.state.clone();
@@ -73,7 +74,8 @@ fn pty_restart_fence_unfence_resume_readopts_pane() {
     )
     .unwrap();
     d.wait_agent("dv1", "stopped", 10);
-    d.rpc("agent_resume", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_resume", json!({"alias": "dv1"}))
+        .unwrap();
     let agent = d.wait_agent("dv1", "idle", 20);
     // Same pane pid + same native session = adopted, not respawned.
     let pid_after: i32 = std::fs::read_to_string(d.pane_file(&mock, "dv1", "pid"))
@@ -84,7 +86,8 @@ fn pty_restart_fence_unfence_resume_readopts_pane() {
     assert_eq!(pid_after, pane_pid, "pane was not re-adopted");
     assert_eq!(agent["thread_id"].as_str().unwrap(), native);
     // New work flows over the adopted pane.
-    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "dv1"}))
+        .unwrap();
     d.send("dv1", json!({"text": "again", "message": "m2"}))
         .unwrap();
     d.wait_message("dv1", "m2", &["running"], 20);
@@ -150,14 +153,15 @@ fn pty_shutdown_straggler_detaches_pane() {
     // knobs per call from the env it inherits from the daemon.
     std::env::set_var("MOCK_TMUX_HOLD", "4"); // > STOP_GRACE (3s)
     std::env::set_var("MOCK_TMUX_HOLD_FMT", "#{pane_dead}");
-    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "dv1"}))
+        .unwrap();
     d.send("dv1", json!({"text": "task", "message": "m1"}))
         .unwrap();
     // Once the turn is running the actor is inside held adapter probes
     // (gate, then the idle loop's disconnected check); it cannot finish
     // inside the 3s grace, so the straggler path fires every run.
     d.wait_message("dv1", "m1", &["running"], 40);
-    d.rpc("shutdown", json!({})).unwrap();
+    d.operator_rpc("shutdown", json!({})).unwrap();
     d.handle.take().unwrap().join().unwrap().unwrap();
     // The straggler stop was clean; a crash leaves no marker — this
     // test asserts the fence-then-resume path, not hot adoption.
@@ -178,7 +182,8 @@ fn pty_shutdown_straggler_detaches_pane() {
     )
     .unwrap();
     d.wait_agent("dv1", "stopped", 10);
-    d.rpc("agent_resume", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_resume", json!({"alias": "dv1"}))
+        .unwrap();
     let agent = d.wait_agent("dv1", "idle", 25);
     let pid_after: i32 = std::fs::read_to_string(d.pane_file(&mock, "dv1", "pid"))
         .unwrap()
@@ -212,7 +217,8 @@ fn stopped_mid_turn_devin() -> (PathBuf, MockDevin, String, i32) {
     d.register_devin("dv1", None);
     d.register("pm");
     d.wait_agent("dv1", "idle", 20);
-    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "dv1"}))
+        .unwrap();
     d.send(
         "dv1",
         json!({"text": "task", "message": "m1", "reply_to": "pm"}),
@@ -224,7 +230,7 @@ fn stopped_mid_turn_devin() -> (PathBuf, MockDevin, String, i32) {
         .trim()
         .parse()
         .unwrap();
-    d.rpc("shutdown", json!({})).unwrap();
+    d.operator_rpc("shutdown", json!({})).unwrap();
     d.handle.take().unwrap().join().unwrap().unwrap();
     let state = d.state.clone();
     assert!(
@@ -442,11 +448,12 @@ fn pty_hot_restart_submitting_never_records_running() {
     d.register_devin("dv1", None);
     d.wait_agent("dv1", "idle", 40);
     atomic_write(d.pane_file(&mock, "dv1", "swallow"), "1");
-    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "dv1"}))
+        .unwrap();
     d.send("dv1", json!({"text": "task", "message": "m1"}))
         .unwrap();
     d.wait_message("dv1", "m1", &["submitting"], 15);
-    d.rpc("shutdown", json!({})).unwrap();
+    d.operator_rpc("shutdown", json!({})).unwrap();
     d.handle.take().unwrap().join().unwrap().unwrap();
     let state = d.state.clone();
     std::env::remove_var("MOCK_TMUX_HOLD");
@@ -480,13 +487,14 @@ fn pty_hot_restart_render_during_stop_adopts() {
     std::env::set_var("MOCK_TMUX_HOLD_CMD", "capture-pane");
     d.register_devin("dv1", None);
     d.wait_agent("dv1", "idle", 40);
-    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "dv1"}))
+        .unwrap();
     d.send("dv1", json!({"text": "task", "message": "m1"}))
         .unwrap();
     d.wait_message("dv1", "m1", &["submitting"], 15);
     // The stop lands mid-render; the actor finishes the proof before
     // detaching, so the marker records a genuinely running turn.
-    d.rpc("shutdown", json!({})).unwrap();
+    d.operator_rpc("shutdown", json!({})).unwrap();
     d.handle.take().unwrap().join().unwrap().unwrap();
     let state = d.state.clone();
     std::env::remove_var("MOCK_TMUX_HOLD");
@@ -511,7 +519,7 @@ fn hot_restart_managed_turn_stays_unknown() {
     d.send("w1", json!({"text": "SLEEP:60", "message": "m1"}))
         .unwrap();
     d.wait_message("w1", "m1", &["running"], 25);
-    d.rpc("shutdown", json!({})).unwrap();
+    d.operator_rpc("shutdown", json!({})).unwrap();
     d.handle.take().unwrap().join().unwrap().unwrap();
     let state = d.state.clone();
     std::mem::forget(d);
@@ -569,7 +577,8 @@ fn pty_hot_restart_adopts_multiple_running_turns() {
     d.register_devin("dv1", None);
     let agent = d.wait_agent("dv1", "idle", 20);
     let generation = agent["generation"].as_str().unwrap().to_string();
-    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "dv1"}))
+        .unwrap();
     d.send("dv1", json!({"text": "task", "message": "m1"}))
         .unwrap();
     let token1 = pty_token(&d, "dv1", "m1");
@@ -595,7 +604,7 @@ fn pty_hot_restart_adopts_multiple_running_turns() {
         )
         .unwrap();
     }
-    d.rpc("shutdown", json!({})).unwrap();
+    d.operator_rpc("shutdown", json!({})).unwrap();
     d.handle.take().unwrap().join().unwrap().unwrap();
     let state = d.state.clone();
     let marker = read_marker(&state);
@@ -634,7 +643,7 @@ fn pty_nudge_queued_at_restart_is_cancelled_not_replayed() {
     .unwrap();
     d.wait_event_where("dv1", "gate_wait", |e| e["payload"]["message"] == "n1", 20);
     assert_eq!(d.message_state("dv1", "n1"), "queued");
-    d.rpc("shutdown", json!({})).unwrap();
+    d.operator_rpc("shutdown", json!({})).unwrap();
     d.handle.take().unwrap().join().unwrap().unwrap();
     let state = d.state.clone();
     std::mem::forget(d);
@@ -713,7 +722,7 @@ fn pty_hot_restart_retires_stale_awaiting_report_rows() {
         )
         .unwrap();
     }
-    d.rpc("shutdown", json!({})).unwrap();
+    d.operator_rpc("shutdown", json!({})).unwrap();
     d.handle.take().unwrap().join().unwrap().unwrap();
     let state = d.state.clone();
     assert_eq!(
@@ -747,7 +756,8 @@ fn park_idle_labelled_turns(d: &TestDaemon, mock: &MockDevin) -> (String, String
     d.register_devin("dv1", None);
     d.register("pm");
     d.wait_agent("dv1", "idle", 20);
-    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "dv1"}))
+        .unwrap();
     d.send(
         "dv1",
         json!({"text": "task", "message": "m1", "reply_to": "pm"}),
@@ -822,7 +832,7 @@ fn restart_idle_pty_after_forced_detach(via_signal: bool) {
     if via_signal {
         sigterm_own_process();
     } else {
-        d.rpc("shutdown", json!({})).unwrap();
+        d.operator_rpc("shutdown", json!({})).unwrap();
     }
     // Arm only after shutdown was requested, so a panic below releases
     // `serve` instead of leaving it blocked.
@@ -1016,7 +1026,7 @@ fn pty_shutdown_facts_before_detach_unprovable() {
         )
         .unwrap();
     }
-    d.rpc("shutdown", json!({})).unwrap();
+    d.operator_rpc("shutdown", json!({})).unwrap();
     d.handle.take().unwrap().join().unwrap().unwrap();
     let state = d.state.clone();
     let marker = read_marker(&state);
@@ -1077,7 +1087,8 @@ fn pty_hot_restart_token_predates_generation_fences() {
     let _mock = d.mock_devin();
     d.register_devin("dv1", None);
     d.wait_agent("dv1", "idle", 20);
-    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "dv1"}))
+        .unwrap();
     d.send("dv1", json!({"text": "task", "message": "m1"}))
         .unwrap();
     let _token = pty_token(&d, "dv1", "m1");
@@ -1090,7 +1101,7 @@ fn pty_hot_restart_token_predates_generation_fences() {
         )
         .unwrap();
     }
-    d.rpc("shutdown", json!({})).unwrap();
+    d.operator_rpc("shutdown", json!({})).unwrap();
     d.handle.take().unwrap().join().unwrap().unwrap();
     let state = d.state.clone();
     let marker = read_marker(&state);
@@ -1151,7 +1162,8 @@ fn pty_hot_restart_fenced_agent_resume_opens_fresh() {
     )
     .unwrap();
     d.wait_agent("dv1", "stopped", 10);
-    d.rpc("agent_resume", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_resume", json!({"alias": "dv1"}))
+        .unwrap();
     let agent = d.wait_agent("dv1", "idle", 25);
     assert_ne!(
         agent["generation"].as_str().unwrap(),
@@ -1218,7 +1230,8 @@ fn pty_dead_pane_fences_submitted_and_stops_actor() {
     let mock = d.mock_devin();
     d.register_devin("dv1", None);
     d.wait_agent("dv1", "idle", 20);
-    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "dv1"}))
+        .unwrap();
     d.send("dv1", json!({"text": "task", "message": "m1"}))
         .unwrap();
     pty_token(&d, "dv1", "m1");
@@ -1272,7 +1285,8 @@ fn pty_stop_kills_only_owned_session() {
     d.register_devin("dv1", None);
     d.wait_agent("dv1", "idle", 20);
     let pidfile = d.pane_file(&mock, "dv1", "pid");
-    d.rpc("agent_stop", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "dv1"}))
+        .unwrap();
     d.wait_agent("dv1", "stopped", 15);
     wait_pid_gone(&pidfile, 10);
 }
@@ -1314,7 +1328,8 @@ fn pty_fence_detaches_pane_for_resume() {
         .unwrap();
     // The pane drops the paste entirely: unrendered → fence.
     atomic_write(d.pane_file(&mock, "dv1", "swallow"), "1");
-    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "dv1"}))
+        .unwrap();
     d.send("dv1", json!({"text": "task", "message": "m1"}))
         .unwrap();
     d.wait_message("dv1", "m1", &["unknown"], 20);
@@ -1340,7 +1355,8 @@ fn pty_fence_detaches_pane_for_resume() {
     .unwrap();
     d.wait_agent("dv1", "stopped", 10);
     std::fs::remove_file(d.pane_file(&mock, "dv1", "swallow")).unwrap();
-    d.rpc("agent_resume", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_resume", json!({"alias": "dv1"}))
+        .unwrap();
     let agent = d.wait_agent("dv1", "idle", 20);
     let pid_after: i32 = std::fs::read_to_string(&pidfile)
         .unwrap()
@@ -1350,7 +1366,8 @@ fn pty_fence_detaches_pane_for_resume() {
     assert_eq!(pid_after, pane_pid, "pane was not re-adopted");
     assert_eq!(agent["thread_id"].as_str().unwrap(), native);
     // New work flows over the adopted pane.
-    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "dv1"}))
+        .unwrap();
     d.send("dv1", json!({"text": "again", "message": "m2"}))
         .unwrap();
     d.wait_message("dv1", "m2", &["running"], 20);
@@ -1370,7 +1387,8 @@ fn pty_stop_remove_gc_kill_surviving_panes() {
     // Fence all three: each pane survives its fence for inspection.
     for alias in ["dv-stop", "dv-rm", "dv-gc"] {
         atomic_write(d.pane_file(&mock, alias, "swallow"), "1");
-        d.rpc("agent_ready", json!({"alias": alias})).unwrap();
+        d.operator_rpc("agent_ready", json!({"alias": alias}))
+            .unwrap();
         d.send(
             alias,
             json!({"text": "task", "message": format!("m-{alias}")}),
@@ -1381,7 +1399,8 @@ fn pty_stop_remove_gc_kill_surviving_panes() {
         d.wait_agent(alias, "attention", 25);
     }
     // `agent stop` on a fenced agent is the explicit kill.
-    d.rpc("agent_stop", json!({"alias": "dv-stop"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "dv-stop"}))
+        .unwrap();
     wait_pid_gone(&d.pane_file(&mock, "dv-stop", "pid"), 10);
     // The fence's `unknown` message is open work (CAD-284): `agent
     // remove` — even `--force` — refuses and leaves the pane alone;
@@ -1444,7 +1463,8 @@ fn pty_unfence_resume_reports_adopted_pane() {
     d.register_devin("dv1", None);
     let agent = d.wait_agent("dv1", "idle", 20);
     let native = agent["thread_id"].as_str().unwrap().to_string();
-    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "dv1"}))
+        .unwrap();
     d.send("dv1", json!({"text": "task", "message": "m1"}))
         .unwrap();
     pty_report_done(&d, "dv1", "m1");
@@ -1455,7 +1475,8 @@ fn pty_unfence_resume_reports_adopted_pane() {
         .unwrap();
     // Fence: the paste never renders; the pane is detached, not killed.
     atomic_write(d.pane_file(&mock, "dv1", "swallow"), "1");
-    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "dv1"}))
+        .unwrap();
     d.send("dv1", json!({"text": "dropped", "message": "m2"}))
         .unwrap();
     d.wait_agent("dv1", "attention", 25);
@@ -1496,7 +1517,8 @@ fn pty_unfence_resume_reports_respawned_pane() {
         .parse()
         .unwrap();
     atomic_write(d.pane_file(&mock, "dv1", "swallow"), "1");
-    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "dv1"}))
+        .unwrap();
     d.send("dv1", json!({"text": "dropped", "message": "m1"}))
         .unwrap();
     d.wait_agent("dv1", "attention", 25);
@@ -1538,7 +1560,8 @@ fn pty_unfence_resume_busy_adopted_pane_stays_gated() {
     d.wait_agent("st", "idle", 20);
     // Fence; the pane survives detached.
     atomic_write(d.stub_pane_file(&mock, "st", "swallow"), "1");
-    d.rpc("agent_ready", json!({"alias": "st"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "st"}))
+        .unwrap();
     d.send("st", json!({"text": "dropped", "message": "m1"}))
         .unwrap();
     d.wait_agent("st", "attention", 25);
@@ -1717,7 +1740,8 @@ fn pty_stop_reaps_pane_session_tree() {
     let recorded = d.wait_event("st", "pane_root", 5);
     assert_eq!(recorded["payload"]["sid"], root["sid"], "{recorded}");
 
-    d.rpc("agent_stop", json!({"alias": "st"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "st"}))
+        .unwrap();
     d.wait_agent("st", "stopped", 15);
     let intent = d.wait_event("st", "pane_tree_reap_intent", 15);
     let members: Vec<u64> = intent["payload"]["members"]
@@ -1762,7 +1786,8 @@ fn pty_stop_reaps_pane_session_tree() {
     );
 
     // A second stop is idempotent: the tree is already reaped.
-    d.rpc("agent_stop", json!({"alias": "st"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "st"}))
+        .unwrap();
     // CAD-184 kept sleep: absence window — a declined reap records
     // nothing; a started one would land on its own thread.
     thread::sleep(Duration::from_millis(300));
@@ -1804,7 +1829,8 @@ fn pty_stop_without_pane_root_records_unowned_tree() {
     });
     let d = TestDaemon::start_on(state);
     let _mock = d.mock_stub();
-    d.rpc("agent_stop", json!({"alias": "old"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "old"}))
+        .unwrap();
     let e = d.wait_event("old", "pane_tree_unowned", 10);
     assert!(
         e["payload"]["reason"]

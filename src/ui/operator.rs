@@ -606,12 +606,25 @@ pub(super) fn decide(
 }
 
 /// Attribute the TCP peer to an agent ([`crate::peer::tcp_peer_agent`]).
+/// CAD-482: a seam-asserted request carries its caller in the headers —
+/// `operator` is the same attribution a local un-owned browser gets,
+/// `agent:<alias>` ties the write to that agent, `unproven` is
+/// unattributable by assertion.
 fn attribute(
     request: &Request,
     state_dir: &std::path::Path,
     opts: &ServeOpts,
     origin: &ReqOrigin,
 ) -> Attribution {
+    if let Some(asserted) = crate::test_seam::asserted() {
+        return match asserted {
+            crate::test_seam::Asserted::Operator => Attribution::NoAgent,
+            crate::test_seam::Asserted::Agent(alias) => Attribution::Agent(alias),
+            crate::test_seam::Asserted::Unproven => {
+                Attribution::Unknown("the request asserts an unproven caller".to_string())
+            }
+        };
+    }
     if matches!(origin, ReqOrigin::Known(Origin::Tailnet)) {
         return Attribution::Proxy(proxied_actor(
             header_value(request, "Tailscale-User-Login").as_deref(),

@@ -348,6 +348,16 @@ pub struct ServeOpts {
     /// `__platform/*` routes and `__Host-aos-board-session` reads —
     /// never the local login flow.
     pub public: Option<PublicBoard>,
+    /// CAD-482: arm the test-only caller seam — the board honors
+    /// `X-Cadence-Test-As`/`X-Cadence-Test-Token` request headers and
+    /// its daemon calls carry the asserted identity. Honored only in
+    /// `test-seam` builds and only against a seam-armed fixture
+    /// daemon; otherwise [`serve`] refuses to start.
+    pub test_seam: bool,
+    /// The credential [`serve`] resolved for `test_seam` — callers
+    /// never set this.
+    #[doc(hidden)]
+    pub seam: Option<crate::test_seam::Seam>,
 }
 
 fn opts_file(state_dir: &Path) -> PathBuf {
@@ -607,6 +617,10 @@ fn serve_opts(eff: &UiOpts) -> Result<ServeOpts> {
         delivery_sync: None,
         stop: None,
         public: eff.board.clone(),
+        // CAD-482: `ui run`/`ui start`'s fixture child arms from its
+        // environment; in-process fixtures set the field directly.
+        test_seam: crate::test_seam::env_armed(),
+        seam: None,
     })
 }
 
@@ -2438,6 +2452,22 @@ fn stream_events(request: Request, state_dir: &Path, pm_dir: &Path) {
 }
 
 fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
+    // CAD-482: a seam-armed board honors the assertion headers; the
+    // scope makes the asserted identity visible to attribution and to
+    // the daemon calls this request relays. Absent headers, or absent
+    // the seam, the real peer checks run unchanged. A malformed or
+    // forged assertion refuses the request outright.
+    let _seam_scope = match crate::test_seam::scope_headers(
+        opts.seam.as_ref(),
+        header_value(&request, crate::test_seam::AS_HEADER).as_deref(),
+        header_value(&request, crate::test_seam::TOKEN_HEADER).as_deref(),
+    ) {
+        Ok(scope) => scope,
+        Err(why) => {
+            let _ = request.respond(err_response(403, &why));
+            return;
+        }
+    };
     let method = request.method().clone();
     let head_only = method == Method::Head;
     let is_write = matches!(method, Method::Post | Method::Patch | Method::Delete);
@@ -3215,8 +3245,24 @@ pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
     if let Ok(abs) = &gh {
         opts.gh = Some(abs.clone());
     }
-    opts.delivery_sync = (!opts.read_only)
-        .then(|| delivery_sync::start(state_dir, pm_dir, opts.delivery_sync_every, gh));
+    // CAD-482: a seam-armed board attaches to the credential its
+    // fixture daemon minted — refused loudly on other builds/dirs so a
+    // fixture never silently falls back to ambient identity. A state
+    // dir that still carries the minted token re-attaches: `daemon
+    // restart --ui` respawns this process without the arming env.
+    opts.seam = crate::test_seam::attach_if_requested(
+        state_dir,
+        opts.test_seam || crate::test_seam::armed(state_dir),
+    )?;
+    opts.delivery_sync = (!opts.read_only).then(|| {
+        delivery_sync::start(
+            state_dir,
+            pm_dir,
+            opts.delivery_sync_every,
+            gh,
+            opts.seam.is_some(),
+        )
+    });
     let opts = &opts;
     eprintln!("cadence ui listening on http://{}:{}", opts.host, opts.port);
     loop {
@@ -3388,6 +3434,11 @@ fn start_inner(state_dir: &Path, flags: &UiFlags, reset: bool, quiet: bool) -> R
     let mut command = Command::new(exe);
     // The detached child re-resolves from `ui.json` — its argv only
     // pins the bind, everything else is the persisted file's business.
+    // CAD-482: a board is never a caller either — requests assert via
+    // headers, so a `CADENCE_TEST_AS` in this process's env must not
+    // leak into the child (a `daemon restart --ui` under it would
+    // blanket-assert every board→daemon RPC).
+    command.env_remove(crate::test_seam::AS_ENV);
     command
         .arg("--state-dir")
         .arg(state_dir)

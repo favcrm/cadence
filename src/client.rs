@@ -260,6 +260,11 @@ fn spawn_daemon_run(state_dir: &Path, identity: Option<&str>) -> Result<std::pro
         .open(state_dir.join("daemon.log"))?;
     let mut command = std::process::Command::new(exe);
     command.env_remove("CADENCE_ROLLOUT_AS");
+    // CAD-482: a daemon is never a caller — a restart under
+    // `CADENCE_TEST_AS` must not let the child assert on its own
+    // outbound RPCs. The child's `daemon run` re-arms from the state
+    // dir's minted token instead.
+    command.env_remove(crate::test_seam::AS_ENV);
     command
         .args(["--state-dir"])
         .arg(state_dir)
@@ -352,7 +357,14 @@ fn rpc_frame(state_dir: &Path, method: &str, params: Value, timeout: Duration) -
         ))
     })?;
     stream.set_read_timeout(Some(timeout))?;
-    let request = proto::request(method, params);
+    let mut request = proto::request(method, params);
+    // CAD-482: a test-seam caller asserts its identity on the frame —
+    // scoped in-process ([`crate::test_seam::scoped`]) or via
+    // `CADENCE_TEST_AS` in a spawned test binary. Absent the feature
+    // this attaches nothing.
+    if let Some(test_caller) = crate::test_seam::caller_frame(state_dir)? {
+        request[crate::test_seam::FRAME_FIELD] = test_caller;
+    }
     writeln!(stream, "{request}")?;
     let mut line = String::new();
     BufReader::new(&stream).read_line(&mut line)?;

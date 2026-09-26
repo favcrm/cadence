@@ -78,7 +78,8 @@ fn long_result_bounded_only_for_pty_paste() {
     d.wait_agent("pm", "idle", 20);
     d.register_claude("w1", json!({"upstream": "pm"}));
     d.wait_agent("w1", "idle", 15);
-    d.rpc("agent_ready", json!({"alias": "pm"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "pm"}))
+        .unwrap();
     d.send("w1", json!({"text": "x".repeat(39_000), "message": "m1"}))
         .unwrap();
     let m1 = d.wait_message("w1", "m1", &["completed"], 30);
@@ -353,7 +354,7 @@ fn memory_native_socket_identity_requires_distinct_reviewers() {
         ("reviewer-b", "worker"),
         ("pm", "pm"),
     ] {
-        d.rpc(
+        d.operator_rpc(
             "agent_register",
             json!({
                 "alias": alias,
@@ -2668,7 +2669,7 @@ fn memory_managed_endpoints_authenticate_through_daemon_enrollment() {
     // No agent identity: the test process itself, and a managed tool's
     // setsid double-forked grandchild (off the provider's ancestry).
     let err = d
-        .rpc("memory_review", review("outside every agent tree"))
+        .operator_rpc("memory_review", review("outside every agent tree"))
         .unwrap_err();
     assert!(err.to_string().contains("has no agent identity"), "{err}");
     let r = reviewer_a.rpc("detached", "memory_review", review("detached"));

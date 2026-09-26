@@ -514,7 +514,8 @@ fn pty_stall_sampling_runs_while_the_pane_lives() {
     // Stopping the pane mid-sampling returns promptly — the ticker
     // never holds the adapter across a capture.
     let stop_at = Instant::now();
-    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "w1"}))
+        .unwrap();
     assert!(
         stop_at.elapsed() < Duration::from_secs(10),
         "agent stop delayed by sampling: {:?}",
@@ -569,7 +570,7 @@ fn pty_approval_menu_blocks_pastes_and_answers() {
 
     // A paste under the menu is refused: m2 queues behind a gate_wait
     // naming the menu, and no claim is eaten by the refusal.
-    d.rpc("agent_ready", json!({"alias": "dv", "force": true}))
+    d.operator_rpc("agent_ready", json!({"alias": "dv", "force": true}))
         .unwrap();
     d.send("dv", json!({"text": "wait for idle", "message": "m2"}))
         .unwrap();
@@ -860,7 +861,8 @@ fn pty_queued_menu_surfaces_and_answers() {
         .unwrap();
     std::fs::remove_file(d.pane_file(&mock, "dv", "tui-state")).unwrap();
     atomic_write(d.pane_file(&mock, "dv", "input"), "");
-    d.rpc("agent_ready", json!({"alias": "dv"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "dv"}))
+        .unwrap();
     d.wait_message("dv", "mq", &["running"], 20);
     let token = pty_token(&d, "dv", "mq");
     d.report("mq", &token, "result", "done").unwrap();
@@ -1642,7 +1644,8 @@ fn recover_submit_devin_lost_submit() {
         d.pane_file(&mock, "dv1", "tui-state"),
         format!("{}\nSWE-2 Max\n", "─".repeat(60)),
     );
-    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "dv1"}))
+        .unwrap();
     d.send("dv1", json!({"text": RECOVER_BODY, "message": "k1"}))
         .unwrap();
     let token = pty_token(&d, "dv1", "k1");
@@ -1949,7 +1952,9 @@ fn urgent_waits_for_the_open_approval_then_goes_first() {
         d.send("w1", json!({"text": format!("normal {id}"), "message": id}))
             .unwrap();
     }
-    d.send(
+    // CAD-482: --priority/--supersedes is the operator's send (CAD-149)
+    // — assert it through the seam, not the runner's ancestry.
+    d.operator_send(
         "w1",
         json!({"text": "urgent correction", "message": "u1", "priority": "urgent"}),
     )
@@ -1963,7 +1968,7 @@ fn urgent_waits_for_the_open_approval_then_goes_first() {
     let list = requests["requests"].as_array().unwrap();
     assert_eq!(list.len(), 1, "{requests}");
     let handle = list[0]["request"].as_str().unwrap().to_string();
-    d.rpc(
+    d.operator_rpc(
         "agent_respond",
         json!({"alias": "w1", "request": handle, "decision": "accept"}),
     )
@@ -2002,7 +2007,9 @@ fn pty_urgent_waits_for_the_held_turn_then_goes_first() {
         d.send("w1", json!({"text": format!("normal {id}"), "message": id}))
             .unwrap();
     }
-    d.send(
+    // CAD-482: --priority/--supersedes is the operator's send (CAD-149)
+    // — assert it through the seam, not the runner's ancestry.
+    d.operator_send(
         "w1",
         json!({"text": "urgent correction", "message": "u1", "priority": "urgent"}),
     )

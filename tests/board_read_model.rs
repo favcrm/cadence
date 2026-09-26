@@ -122,6 +122,7 @@ impl Daemon {
         let stop = Arc::new(AtomicBool::new(false));
         let opts = daemon::ServeOptions {
             stop: Some(stop.clone()),
+            test_seam: cfg!(feature = "test-seam"),
             ..Default::default()
         };
         let handle = thread::spawn(move || {
@@ -275,6 +276,10 @@ fn start_ui(pm: &Path, state: &Path) -> (u16, BoardStop) {
                 host: "127.0.0.1".to_string(),
                 port,
                 stop: Some(stop),
+                // CAD-482: attach unconditionally under the feature —
+                // the token is read lazily per request, so a board may
+                // start before its daemon mints.
+                test_seam: cfg!(feature = "test-seam"),
                 ..Default::default()
             };
             let _ = ui::serve(&sd, &pd, &opts);
@@ -381,12 +386,12 @@ fn seed_tracker(pm: &Path, state: &Path, notes: &Path, count: usize) {
 /// Agents, issue-bound jobs with dispatched tasks, and message history.
 fn seed_daemon(d: &Daemon, pm: &Path, jobs: usize) {
     let cwd = pm.to_str().unwrap();
-    d.rpc(
+    let _ = d.operator_rpc(
         "agent_register",
         json!({"alias": "pm", "provider": "fake", "endpoint_kind": "fake", "cwd": cwd}),
     );
     for a in 0..AGENTS {
-        d.rpc(
+        let _ = d.operator_rpc(
             "agent_register",
             json!({"alias": format!("wk{a}"), "provider": "fake",
                    "endpoint_kind": "fake", "cwd": cwd,
@@ -410,7 +415,7 @@ fn seed_daemon(d: &Daemon, pm: &Path, jobs: usize) {
         );
         if j % 4 == 0 {
             let tid = task["task"]["id"].as_str().unwrap();
-            d.rpc("task_dispatch", json!({"task": tid, "by": "operator"}));
+            let _ = d.operator_rpc("task_dispatch", json!({"task": tid, "by": "operator"}));
         }
     }
     for a in 0..AGENTS {
@@ -725,7 +730,7 @@ fn tracker_writes_show_on_the_next_read_and_stream_as_entity_diffs() {
     );
 
     // An agent: the legacy `agents` frame plus an `agent` upsert.
-    fx.daemon.rpc(
+    let _ = fx.daemon.operator_rpc(
         "agent_register",
         json!({"alias": "late", "provider": "fake", "endpoint_kind": "fake",
                "cwd": fx.pm.to_str().unwrap()}),
@@ -770,7 +775,7 @@ fn now_epoch() -> i64 {
 fn overview_is_never_served_past_a_change_or_the_age_cap() {
     let fx = fixture(40, 2);
     let port = fx.port;
-    fx.daemon.rpc(
+    let _ = fx.daemon.operator_rpc(
         "agent_register",
         json!({"alias": "box", "provider": "inbox", "endpoint_kind": "inbox"}),
     );
@@ -881,7 +886,7 @@ fn overview_cache_holds_while_an_agent_runs_a_turn() {
     wait_for("the stream to go live", 10, || {
         stream.lock().unwrap().contains(": ping")
     });
-    fx.daemon.rpc(
+    let _ = fx.daemon.operator_rpc(
         "agent_register",
         json!({"alias": "sleeper", "provider": "fake", "endpoint_kind": "fake",
                "cwd": fx.pm.to_str().unwrap()}),
@@ -891,7 +896,7 @@ fn overview_cache_holds_while_an_agent_runs_a_turn() {
         json!({"alias": "sleeper", "text": "SLEEP:600"}),
     );
     // A mailbox with one queued message: its backlog age ticks too.
-    fx.daemon.rpc(
+    let _ = fx.daemon.operator_rpc(
         "agent_register",
         json!({"alias": "box", "provider": "inbox", "endpoint_kind": "inbox"}),
     );

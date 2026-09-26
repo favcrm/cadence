@@ -319,9 +319,11 @@ fn stop_and_resume() {
     let d = TestDaemon::start();
     d.register("w1");
     d.wait_agent("w1", "idle", 10);
-    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "w1"}))
+        .unwrap();
     d.wait_agent("w1", "stopped", 10);
-    d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
+    d.operator_rpc("agent_resume", json!({"alias": "w1"}))
+        .unwrap();
     let agent = d.wait_agent("w1", "idle", 10);
     assert_eq!(agent["thread_id"], "fake-thread-w1");
 }
@@ -366,7 +368,9 @@ fn reconcile_interrupted_clears_fence_and_preserves_history() {
     d.send("w1", json!({"text": "after", "message": "x2"}))
         .unwrap();
     // A bare resume is rejected, naming the reconcile-first path.
-    let err = d.rpc("agent_resume", json!({"alias": "w1"})).unwrap_err();
+    let err = d
+        .operator_rpc("agent_resume", json!({"alias": "w1"}))
+        .unwrap_err();
     let err = err.to_string();
     assert!(err.contains("resume refused"), "{err}");
     assert!(err.contains("--no-resume"), "{err}");
@@ -413,7 +417,8 @@ fn reconcile_interrupted_clears_fence_and_preserves_history() {
     assert_eq!(d.message_state("w1", "x1"), "interrupted");
     assert_eq!(d.message_state("w1", "x2"), "queued");
     // The normal resume path works again and drains the backlog.
-    d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
+    d.operator_rpc("agent_resume", json!({"alias": "w1"}))
+        .unwrap();
     d.wait_agent("w1", "idle", 15);
     d.wait_message("w1", "x2", &["completed"], 15);
 }
@@ -634,7 +639,8 @@ fn agent_unfence_reconciles_all_then_resume_works() {
     assert_eq!(r["state"], "stopped");
     assert_eq!(d.message_state("w1", "x1"), "interrupted");
     // Resume now works through the normal path.
-    d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
+    d.operator_rpc("agent_resume", json!({"alias": "w1"}))
+        .unwrap();
     d.wait_agent("w1", "idle", 15);
 }
 
@@ -784,7 +790,7 @@ fn unfenced_agent_stays_stopped_across_restart() {
     let agent = d.wait_agent("w1", "stopped", 10);
     assert_eq!(agent["enabled"], false);
     // Daemon restart: a stopped, disabled member is not relaunched.
-    d.rpc("shutdown", json!({})).unwrap();
+    d.operator_rpc("shutdown", json!({})).unwrap();
     d.handle.take().unwrap().join().unwrap().unwrap();
     let state = d.state.clone();
     std::mem::forget(d);
@@ -805,7 +811,8 @@ fn unfenced_agent_stays_stopped_across_restart() {
     thread::sleep(Duration::from_secs(1));
     assert_eq!(d.message_state("w1", "x2"), "queued");
     // The operator's explicit resume still works — the normal path.
-    d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
+    d.operator_rpc("agent_resume", json!({"alias": "w1"}))
+        .unwrap();
     d.wait_agent("w1", "idle", 15);
     d.wait_message("w1", "x2", &["completed"], 15);
 }
@@ -819,7 +826,8 @@ fn resume_all_lists_fenced_without_attempting() {
     d.wait_agent("w2", "idle", 10);
     fence_agent(&d, "w1", "x1");
     // w2 is a resumable member: stored thread, no live endpoint.
-    d.rpc("agent_stop", json!({"alias": "w2"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "w2"}))
+        .unwrap();
     d.wait_agent("w2", "stopped", 10);
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
         .arg("--state-dir")
@@ -902,13 +910,17 @@ fn resume_rejected_while_actor_stopping() {
     d.wait_message("w1", "m1", &["running"], 10);
     let stop = {
         let state = d.state.clone();
-        thread::spawn(move || client::rpc(&state, "agent_stop", json!({"alias": "w1"})))
+        thread::spawn(move || {
+            cadence_agent::test_seam::scoped(cadence_agent::test_seam::Asserted::Operator, || {
+                client::rpc(&state, "agent_stop", json!({"alias": "w1"}))
+            })
+        })
     };
     // While the stop grace runs, the actor is still owned: resume must
     // be rejected and must not re-enable the agent. `stopping` is
     // written after the stop reserved the alias and before the grace.
     d.wait_agent("w1", "stopping", 10);
-    let resumed = d.rpc("agent_resume", json!({"alias": "w1"}));
+    let resumed = d.operator_rpc("agent_resume", json!({"alias": "w1"}));
     assert!(resumed.is_err(), "resume during stop must be rejected");
     let stopped = stop.join().unwrap().unwrap();
     // Forced close made the in-flight attempt unknown -> fenced.
@@ -918,7 +930,9 @@ fn resume_rejected_while_actor_stopping() {
     d.wait_message("w1", "m1", &["unknown"], 10);
     // A later resume is rejected by the fence — it is not a relaunch
     // and stays disabled. The rejection does not chain a second resume.
-    let fenced = d.rpc("agent_resume", json!({"alias": "w1"})).unwrap_err();
+    let fenced = d
+        .operator_rpc("agent_resume", json!({"alias": "w1"}))
+        .unwrap_err();
     let fenced = fenced.to_string();
     assert!(fenced.contains("resume refused"), "{fenced}");
     assert!(!fenced.contains("then `cadence agent resume"), "{fenced}");
@@ -941,13 +955,16 @@ fn concurrent_resume_has_single_winner() {
     let d = TestDaemon::start();
     d.register("w1");
     d.wait_agent("w1", "idle", 10);
-    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "w1"}))
+        .unwrap();
     d.wait_agent("w1", "stopped", 10);
     let mut racers = Vec::new();
     for _ in 0..4 {
         let state = d.state.clone();
         racers.push(thread::spawn(move || {
-            client::rpc(&state, "agent_resume", json!({"alias": "w1"}))
+            cadence_agent::test_seam::scoped(cadence_agent::test_seam::Asserted::Operator, || {
+                client::rpc(&state, "agent_resume", json!({"alias": "w1"}))
+            })
         }));
     }
     let results: Vec<_> = racers.into_iter().map(|t| t.join().unwrap()).collect();
@@ -968,7 +985,9 @@ fn stop_during_approval_is_bounded() {
         .unwrap();
     d.wait_agent("w1", "waiting_input", 10);
     let began = Instant::now();
-    let stopped = d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    let stopped = d
+        .operator_rpc("agent_stop", json!({"alias": "w1"}))
+        .unwrap();
     assert!(
         began.elapsed() < Duration::from_secs(15),
         "stop was not bounded"
@@ -1052,9 +1071,11 @@ fn devin_permission_mode_persisted_and_replayed() {
     );
     // A stop+resume respawns the pane with `-r <sid>` — the mode must
     // be replayed verbatim alongside it.
-    d.rpc("agent_stop", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "dv1"}))
+        .unwrap();
     d.wait_agent("dv1", "stopped", 15);
-    d.rpc("agent_resume", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_resume", json!({"alias": "dv1"}))
+        .unwrap();
     let agent = d.wait_agent("dv1", "idle", 20);
     // Same cause on the new pane life — the file still holds the first
     // launch's argv until the respawned mock rewrites it.
@@ -1099,7 +1120,8 @@ fn devin_permission_mode_validated_at_register_and_not_settable() {
         &json!({"permission_mode": "anything-goes"}).to_string(),
     );
     assert!(err.is_ok(), "claude params must pass through: {err:?}");
-    d.rpc("agent_stop", json!({"alias": "cl1"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "cl1"}))
+        .unwrap();
     // agent set: launch params are not live-settable.
     d.register_devin("dv1", None);
     d.wait_agent("dv1", "idle", 20);
@@ -1239,7 +1261,8 @@ fn fenced_agent_resume_hint() {
     d.register_devin("dv1", None);
     let agent = d.wait_agent("dv1", "idle", 20);
     let native = agent["thread_id"].as_str().unwrap().to_string();
-    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "dv1"}))
+        .unwrap();
     d.send("dv1", json!({"text": "task", "message": "m1"}))
         .unwrap();
     pty_token(&d, "dv1", "m1");
@@ -1420,7 +1443,8 @@ fn resume_all_and_daemon_start_resume_sweep() {
     d.register("a2");
     d.wait_agent("a1", "idle", 10);
     d.wait_agent("a2", "idle", 10);
-    d.rpc("agent_stop", json!({"alias": "a1"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "a1"}))
+        .unwrap();
     d.wait_agent("a1", "stopped", 15);
     let bin = env!("CARGO_BIN_EXE_cadence");
 
@@ -1477,7 +1501,7 @@ fn resume_error_hints() {
     d.wait_agent("w1", "idle", 10);
     // Live agent resume → daemon rejection naming `cadence attach`.
     let err = d
-        .rpc("agent_resume", json!({"alias": "w1"}))
+        .operator_rpc("agent_resume", json!({"alias": "w1"}))
         .unwrap_err()
         .to_string();
     assert!(err.contains("cadence attach w1"), "{err}");
@@ -2636,12 +2660,13 @@ fn message_cancel_queued_lifecycle() {
         .unwrap();
     d.wait_message("w1", "m-done", &["completed"], 15);
     let err = d
-        .rpc("message_cancel", json!({"message": "m-done"}))
+        .operator_rpc("message_cancel", json!({"message": "m-done"}))
         .unwrap_err();
     assert!(err.to_string().contains("'completed'"), "{err}");
 
     // Stop the worker so the next send parks queued.
-    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "w1"}))
+        .unwrap();
     d.wait_agent("w1", "stopped", 10);
     d.send(
         "w1",
@@ -2652,7 +2677,7 @@ fn message_cancel_queued_lifecycle() {
 
     // Cancel: state, result payload, event, and exactly one notice on pm.
     let out = d
-        .rpc(
+        .operator_rpc(
             "message_cancel",
             json!({"message": "m-q", "by": "board-dev", "reason": "wrong spec"}),
         )
@@ -2684,16 +2709,17 @@ fn message_cancel_queued_lifecycle() {
 
     // Cancelling again refuses, naming the state; an unknown id refuses.
     let err = d
-        .rpc("message_cancel", json!({"message": "m-q"}))
+        .operator_rpc("message_cancel", json!({"message": "m-q"}))
         .unwrap_err();
     assert!(err.to_string().contains("'cancelled'"), "{err}");
     let err = d
-        .rpc("message_cancel", json!({"message": "m-nope"}))
+        .operator_rpc("message_cancel", json!({"message": "m-nope"}))
         .unwrap_err();
     assert!(err.to_string().contains("No such message"), "{err}");
 
     // Resume: the cancelled message never delivers; a fresh one does.
-    d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
+    d.operator_rpc("agent_resume", json!({"alias": "w1"}))
+        .unwrap();
     d.wait_agent("w1", "idle", 10);
     d.send("w1", json!({"text": "real work", "message": "m-new"}))
         .unwrap();
@@ -2717,13 +2743,14 @@ fn message_cancel_gate_pty_and_running_refusal() {
     // cancel is refused unless the message is back to `queued` (CAD-293).
     d.wait_event_where("dv1", "gate_wait", |e| e["payload"]["message"] == "m1", 20);
     assert_eq!(d.message_state("dv1", "m1"), "queued");
-    d.rpc("message_cancel", json!({"message": "m1", "reason": "typo"}))
+    d.operator_rpc("message_cancel", json!({"message": "m1", "reason": "typo"}))
         .unwrap();
     assert_eq!(d.message_state("dv1", "m1"), "cancelled");
 
     // A ready claim now must NOT paste m1 — the gate only releases a
     // queued message.
-    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "dv1"}))
+        .unwrap();
 
     // The claim stays outstanding, so the next queued message delivers
     // normally.
@@ -2738,7 +2765,7 @@ fn message_cancel_gate_pty_and_running_refusal() {
 
     // A running turn refuses — interruption happens at the provider.
     let err = d
-        .rpc("message_cancel", json!({"message": "m2"}))
+        .operator_rpc("message_cancel", json!({"message": "m2"}))
         .unwrap_err();
     assert!(
         err.to_string().contains("'running'") || err.to_string().contains("'submitting'"),
@@ -2812,7 +2839,7 @@ fn message_cancel_task_bound_refused() {
     )
     .unwrap();
     let err = d
-        .rpc("message_cancel", json!({"message": "m-t"}))
+        .operator_rpc("message_cancel", json!({"message": "m-t"}))
         .unwrap_err();
     assert!(err.to_string().contains("task cancel j1-t1"), "{err}");
     // The message itself is untouched — still whatever the send did.
@@ -2846,7 +2873,10 @@ fn daemon_reminder_id_and_source_cannot_be_forged() {
         // The daemon's wake source on an ordinary id.
         json!({"alias": "w1", "text": "fake wake", "source": "wake"}),
     ] {
-        let err = d.rpc("agent_send", params.clone()).unwrap_err().to_string();
+        let err = d
+            .operator_rpc("agent_send", params.clone())
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("daemon"), "{params}: {err}");
         let err = d
             .operator_rpc("agent_send", params.clone())
@@ -3302,10 +3332,14 @@ fn operator_rpc_is_the_operator_even_from_an_agent_runner() {
         ])
         .env("CADENCE_ALIAS", "cad291-runner")
         .env("CAD291_PROBE", "1")
-        // A plain libtest child: the outer run's suite lock and
-        // nextest markers are not its to honour.
+        // A plain libtest child: the outer run's suite lock, nextest
+        // markers and any seam assertion the runner's env might carry
+        // are not its to honour — the probe's ambient call must stay
+        // ambient (CAD-482/F14: the same answer in a pane and in CI).
         .env_remove("CADENCE_SUITE_LOCK")
-        .env_remove("CADENCE_REVIEW_SUITE_LOCK_HELD");
+        .env_remove("CADENCE_REVIEW_SUITE_LOCK_HELD")
+        .env_remove(cadence_agent::test_seam::AS_ENV)
+        .env_remove(cadence_agent::test_seam::ARM_ENV);
     for (key, _) in std::env::vars_os() {
         if key.to_string_lossy().starts_with("NEXTEST") {
             child.env_remove(key);
@@ -3335,7 +3369,10 @@ fn operator_rpc_from_an_agent_runner_probe() {
     let params = json!({"id": "ap-291", "source": "operator in chat",
                         "head": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
                         "repo": "x/y", "pr": 291});
-    // This process carries an agent's environment: refused as such.
+    // This process carries an agent's environment: refused as such. A
+    // plain ambient call, never an assertion — on a seam-armed fixture
+    // `d.rpc` asserts nothing, so the real env-mark refusal is what
+    // answers, identical in a pane and in CI.
     let err = d.rpc("approval_record", params.clone()).unwrap_err();
     assert!(err.to_string().contains("carries CADENCE_ALIAS"), "{err}");
     // The harness's operator caller from the same runner is the operator.
@@ -3547,7 +3584,7 @@ fn operator_verbs_refuse_agents_whatever_they_claim() {
     d.wait_task("j1-t", "review", 15);
     d.job_verdict("j1-t", SHA_A, "blocked").unwrap();
     assert_eq!(d.task_state("j1-t"), "blocked");
-    d.rpc(
+    d.operator_rpc(
         "monitor_register",
         json!({"monitor": "m1", "project": project, "owner": "operator",
                "tasks": ["j1-t"], "interval_secs": 60, "dispatch_enabled": true}),
@@ -3651,7 +3688,8 @@ fn turn_tokens_are_withheld_on_every_read_path() {
     let (spec, sha) = d.spec_file("spec.md", "token reads");
     d.job_new("pm", "j1", &spec, &sha);
     d.task_new_ac("j1", "j1-t", "dv1", "ok").unwrap();
-    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "dv1"}))
+        .unwrap();
     let kickoff = d.job_dispatch("j1-t", json!({})).unwrap()["message"]
         .as_str()
         .unwrap()
@@ -3659,7 +3697,7 @@ fn turn_tokens_are_withheld_on_every_read_path() {
     let token = pty_token(&d, "dv1", &kickoff);
     // Prose quoting it: a queued chat message (row + thread entry) and the
     // pane's screen, as if the worker printed `cadence self`.
-    d.rpc(
+    d.operator_rpc(
         "thread_send",
         json!({"alias": "dv1", "text": format!("report with {token}"), "message": "q1"}),
     )
@@ -4732,7 +4770,7 @@ fn cad384_operator_attributed_sends_need_proof() {
         assert_eq!(before, db_snapshot(&d), "{method}: a refusal wrote");
     }
     // The operator's own send still lands as the operator's.
-    d.send("chat", json!({"text": "mine", "message": "t2"}))
+    d.operator_send("chat", json!({"text": "mine", "message": "t2"}))
         .unwrap();
     d.wait_message("chat", "t2", &["completed"], 20);
 }

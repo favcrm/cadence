@@ -191,7 +191,7 @@ fn status_group_scopes_rows() {
     let d = TestDaemon::start();
     d.register_inbox("pm");
     let cwd = d.dir.path().to_str().unwrap().to_string();
-    d.rpc(
+    d.operator_rpc(
         "agent_register",
         json!({"alias": "w1", "provider": "fake", "endpoint_kind": "fake",
                "cwd": cwd, "params": "{\"upstream\":\"pm\"}"}),
@@ -566,7 +566,7 @@ fn overview_scope_flags_filter_rows_and_reject_unknown_keys() {
     // Group `pm`: an inbox root with worker w1 in the project repo.
     // w2 is its own root, outside every project.
     d.register_inbox("pm");
-    d.rpc(
+    d.operator_rpc(
         "agent_register",
         json!({"alias": "w1", "provider": "fake", "endpoint_kind": "fake",
                "cwd": repo_s, "params": json!({"upstream": "pm"}).to_string()}),
@@ -955,7 +955,8 @@ fn auto_resume_failure_raises_needs_me_row_naming_the_message() {
     // The operator fixes the cause and resumes: the row clears and the
     // waiting message is delivered.
     std::fs::remove_file(&flag).unwrap();
-    d.rpc("agent_resume", json!({"alias": "w-fail"})).unwrap();
+    d.operator_rpc("agent_resume", json!({"alias": "w-fail"}))
+        .unwrap();
     d.wait_message("w-fail", "m-fail", &["completed"], 20);
     let agent = d.wait_agent("w-fail", "idle", 10);
     assert!(agent["auto_resume_failed"].is_null(), "{agent}");
@@ -1644,7 +1645,10 @@ fn board_app_workflow_list_preview_and_propose() {
 
 /// The session `op` as presented to the board on `port` instead: that
 /// board's own Host and Origin, its cookie name, the same token (a
-/// session is the daemon's, not one board's).
+/// session is the daemon's, not one board's). A session carried to a
+/// board it wasn't minted on is a replay: it asserts no caller, so the
+/// HTTP peer stands on its own identity (and an unarmed board doesn't
+/// refuse the header outright).
 fn op_on(op: &op::Session, port: u16) -> op::Session {
     let host = op::board_host(port);
     let token = op.cookie.split_once('=').unwrap().1;
@@ -1654,19 +1658,21 @@ fn op_on(op: &op::Session, port: u16) -> op::Session {
         cookie: format!("cadence_operator_{port}={token}"),
         set_cookie: op.set_cookie.clone(),
         key: op.key.clone(),
+        seam: String::new(),
     }
 }
 
 /// `GET path` on `port` as the signed-in operator (no `Origin`: a
-/// browser sends none on a same-origin GET).
+/// browser sends none on a same-origin GET), asserted as `op.seam`.
 fn op_get(op: &op::Session, port: u16, path: &str) -> (u16, String) {
     board_http(
         port,
         &format!(
-            "GET {path} HTTP/1.0\r\nHost: {}\r\nCookie: {}\r\n{}\r\n\r\n",
+            "GET {path} HTTP/1.0\r\nHost: {}\r\nCookie: {}\r\n{}\r\n{}\r\n",
             op.host,
             op.cookie,
-            op.key_header()
+            op.key_header(),
+            op.seam
         ),
     )
 }
@@ -1915,6 +1921,9 @@ fn cad432_stage_move_refuses_a_detached_managed_child_under_daemon_run() {
     // what refuses it is the process proof on the peer.
     let op = sign_in(&f.d.state, port);
     let guards = op_guards(&op);
+    // The detached child presents the stolen session but stands on its
+    // own (daemon-descendant) caller — no seam assertion rides along.
+    let stolen_guards = op_guards_as(&op, "");
     let before = f.commits();
 
     const INNER: &str = r#"exec 3<>"/dev/tcp/127.0.0.1/$1"; printf '%s' "$2" >&3; cat <&3 > "$3.tmp"; mv "$3.tmp" "$3""#;
@@ -1949,7 +1958,7 @@ fn cad432_stage_move_refuses_a_detached_managed_child_under_daemon_run() {
     let reply = detached(cad328_post(
         port,
         "/api/epics/D-1/stage",
-        &guards,
+        &stolen_guards,
         r#"{"stage":"build"}"#,
     ));
     assert!(reply.contains(" 403 "), "{reply}");
@@ -1998,8 +2007,21 @@ fn cad432_board_started_by_an_agent_cannot_relay_a_move() {
     let pidfile = f.tmp.path().join("agent-board.pid");
     // The worker's tool runs `cadence ui run` in the foreground (the
     // worker stays busy with it); the board is the tool's own child.
+    // CAD-482: on a seam build the board asserts its agent's identity
+    // on the process itself (`CADENCE_TEST_AS`), so `board_is_operator`
+    // answers the same in a pane and in CI; a non-seam build keeps the
+    // ambient ancestry path.
+    let seam_env = if cfg!(feature = "test-seam") {
+        format!(
+            "{}=1 {}=agent:wk ",
+            cadence_agent::test_seam::ARM_ENV,
+            cadence_agent::test_seam::AS_ENV
+        )
+    } else {
+        String::new()
+    };
     let script = format!(
-        "echo $$ > {pid}; exec env CADENCE_PM_DIR={pm} {bin} --state-dir {state} ui run --port {port}",
+        "echo $$ > {pid}; exec env {seam_env}CADENCE_PM_DIR={pm} {bin} --state-dir {state} ui run --port {port}",
         pid = pidfile.display(),
         pm = f.pm_dir.display(),
         bin = env!("CARGO_BIN_EXE_cadence"),
@@ -2040,14 +2062,35 @@ fn cad432_board_started_by_an_agent_cannot_relay_a_move() {
         "an agent's board is nobody's: {meta}"
     );
 
-    // The proven operator (this test process) asks that board for a
-    // routine move.
-    let (status, reply) = cad432_move(port, &op_guards(&op), r#"{"stage":"verify"}"#);
-    assert_eq!(status, 403, "{reply}");
-    assert!(reply.contains("operator_proof"), "{reply}");
+    // The move is asked for by a second enrolled worker's tool: the
+    // request's TCP peer descends from an enrolled endpoint, so the
+    // board's operator proof refuses it as an agent's — the enrolled
+    // hop sits below any CADENCE_ALIAS an ancestor carries, making the
+    // refusal identical in a pane and in CI. No seam assertion rides
+    // along: the agent's board is unarmed and would refuse one
+    // outright. (wk's own exec channel is busy serving the board.)
+    let mut wk2 = ManagedWorker::start(&f.d, "wk2");
+    let request = cad328_post(
+        port,
+        "/api/epics/D-1/stage",
+        &op_guards_as(&op, ""),
+        r#"{"stage":"verify"}"#,
+    );
+    let r = wk2.exec(&[
+        "bash",
+        "-c",
+        r#"exec 3<>"/dev/tcp/127.0.0.1/$1"; printf '%s' "$2" >&3; cat <&3"#,
+        "_",
+        &port.to_string(),
+        &request,
+    ]);
+    assert_eq!(r["rc"], 0, "{r}");
+    let reply = r["out"].as_str().unwrap().to_string();
+    assert!(reply.contains(" 403 "), "{reply}");
+    assert!(reply.contains("session_from_agent"), "{reply}");
     assert!(
-        reply.contains("'wk'"),
-        "refused as the worker's connection: {reply}"
+        reply.contains("'wk2'"),
+        "the stolen session names the presenting agent: {reply}"
     );
     assert_eq!(f.commits(), before, "a refusal writes nothing");
     assert_eq!(f.front("D-1").stage.as_deref(), Some("build"));

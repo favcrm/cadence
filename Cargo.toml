@@ -30,6 +30,12 @@ ui = []
 # it is its own opt-in target — never part of `cargo test` or the PR
 # suite; CI runs it nightly and on every `v*` tag.
 e2e = []
+# CAD-482: the test-only caller-identity seam — fixture daemons and
+# boards honor explicit `test_caller` / `X-Cadence-Test-As` assertions
+# instead of /proc ancestry, so operator-gated suites run identically
+# in an agent pane and in CI. A `compile_error!` in src/test_seam.rs
+# keeps it out of every release build (debug_assertions off).
+test-seam = []
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }

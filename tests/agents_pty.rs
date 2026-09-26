@@ -149,7 +149,8 @@ fn pty_nudge_needs_a_live_pane_and_dies_with_the_actor() {
     )
     .unwrap();
     d.wait_event_where("dv1", "gate_wait", |e| e["payload"]["message"] == "n1", 20);
-    d.rpc("agent_stop", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "dv1"}))
+        .unwrap();
     d.wait_agent("dv1", "stopped", 20);
     let m = d.wait_message("dv1", "n1", &["cancelled"], 10);
     assert_eq!(m["result"]["via"], "stop_cancelled", "{m}");
@@ -239,7 +240,8 @@ fn pty_send_pastes_literal_and_completes_via_report() {
     assert_eq!(d.message_state("dv1", "m1"), "queued");
 
     // Operator claim: the head of the FIFO queue (m1) is pasted.
-    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "dv1"}))
+        .unwrap();
     let token1 = pty_token(&d, "dv1", "m1");
     assert!(token1.starts_with(&format!("pty-{gen}-")), "{token1}");
 
@@ -255,7 +257,8 @@ fn pty_send_pastes_literal_and_completes_via_report() {
     // own `gate_wait` (CAD-278: this was the 400 ms sleep that failed).
     d.wait_event_where("dv1", "gate_wait", |e| e["payload"]["message"] == "m2", 20);
     assert_eq!(d.message_state("dv1", "m2"), "queued");
-    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "dv1"}))
+        .unwrap();
     let token = pty_token(&d, "dv1", "m2");
     assert!(token.starts_with(&format!("pty-{gen}-")), "{token}");
 
@@ -295,7 +298,8 @@ fn pty_claim_is_single_use_and_expires() {
     let _mock = d.mock_devin();
     d.register_devin("dv1", None);
     d.wait_agent("dv1", "idle", 20);
-    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "dv1"}))
+        .unwrap();
     d.send("dv1", json!({"text": "one", "message": "m1"}))
         .unwrap();
     // CAD-250: m1 reports so m2 is held by the spent claim, not by the
@@ -326,7 +330,8 @@ fn pty_ack_then_result_and_duplicate_rules() {
     let _mock = d.mock_devin();
     d.register_devin("dv1", None);
     d.wait_agent("dv1", "idle", 20);
-    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "dv1"}))
+        .unwrap();
     d.send("dv1", json!({"text": "work", "message": "m1"}))
         .unwrap();
     let token = pty_token(&d, "dv1", "m1");
@@ -370,18 +375,21 @@ fn pty_stale_generation_report_rejected() {
     let _mock = d.mock_devin();
     d.register_devin("dv1", None);
     d.wait_agent("dv1", "idle", 20);
-    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "dv1"}))
+        .unwrap();
     d.send("dv1", json!({"text": "task", "message": "m1"}))
         .unwrap();
     let old_token = pty_token(&d, "dv1", "m1");
 
     // New endpoint life: stop + resume mints a fresh generation even
     // though the relaunched pane owns the same native session.
-    d.rpc("agent_stop", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "dv1"}))
+        .unwrap();
     d.wait_agent("dv1", "stopped", 15);
     // m1 is still `running` (submitted before the stop); the report
     // carrying the old-generation token must be rejected.
-    d.rpc("agent_resume", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_resume", json!({"alias": "dv1"}))
+        .unwrap();
     let agent = d.wait_agent("dv1", "idle", 20);
     assert!(!agent["generation"].as_str().unwrap().is_empty());
     let stale = d.report("m1", &old_token, "result", "late");
@@ -402,7 +410,8 @@ fn pty_report_refuses_stale_generation_and_managed_token() {
     d.register_devin("dv1", None);
     let agent = d.wait_agent("dv1", "idle", 20);
     let gen = agent["generation"].as_str().unwrap().to_string();
-    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "dv1"}))
+        .unwrap();
     d.send("dv1", json!({"text": "task", "message": "m1"}))
         .unwrap();
     let token = pty_token(&d, "dv1", "m1");
@@ -553,7 +562,8 @@ fn pty_respond_rejected_and_mode_blocks_send() {
     // pane_in_mode != 0 (copy mode etc.) keeps the message queued even
     // with a fresh claim.
     atomic_write(d.pane_file(&mock, "dv1", "mode"), "1");
-    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "dv1"}))
+        .unwrap();
     d.send("dv1", json!({"text": "x", "message": "m1"}))
         .unwrap();
     // The recorded refusal, not a fixed sleep (CAD-286).
@@ -566,7 +576,8 @@ fn pty_respond_rejected_and_mode_blocks_send() {
     );
     assert_eq!(d.message_state("dv1", "m1"), "queued");
     std::fs::remove_file(d.pane_file(&mock, "dv1", "mode")).unwrap();
-    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "dv1"}))
+        .unwrap();
     pty_token(&d, "dv1", "m1");
 }
 
@@ -624,7 +635,8 @@ fn pty_send_rejects_control_chars() {
     let _mock = d.mock_devin();
     d.register_devin("dv1", None);
     d.wait_agent("dv1", "idle", 20);
-    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "dv1"}))
+        .unwrap();
     // CAD-175: a body the literal paste can never deliver is refused at
     // send, not answered `queued` and failed later at delivery.
     let err = d
@@ -650,7 +662,8 @@ fn pty_send_rejects_control_chars() {
     let agent = d.rpc("agent_show", json!({"alias": "dv1"})).unwrap()["agent"].clone();
     assert_eq!(agent["state"].as_str().unwrap(), "idle", "{agent}");
     assert!(agent["endpoint"].is_string(), "{agent}");
-    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "dv1"}))
+        .unwrap();
     d.send("dv1", json!({"text": "valid follow-up", "message": "m2"}))
         .unwrap();
     let token = pty_token(&d, "dv1", "m2");
@@ -687,7 +700,8 @@ fn cadence_self_reports_running_token() {
     let _mock = d.mock_devin();
     d.register_devin("dv1", None);
     d.wait_agent("dv1", "idle", 20);
-    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "dv1"}))
+        .unwrap();
     d.send("dv1", json!({"text": "work", "message": "m1"}))
         .unwrap();
     let token = pty_token(&d, "dv1", "m1");
@@ -853,7 +867,8 @@ fn join_bootstrap_briefs_and_queues() {
     let mid = d.message_state("w-join", "bootstrap-w-join");
     assert!(matches!(mid.as_str(), "queued" | "submitting"), "{mid}");
     // A claim releases it — gated like any send, never bypassed.
-    d.rpc("agent_ready", json!({"alias": "w-join"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "w-join"}))
+        .unwrap();
     pty_token(&d, "w-join", "bootstrap-w-join");
 
     // --no-bootstrap: no message, no briefing file.
@@ -940,8 +955,10 @@ fn agent_remove_and_gc_sweep() {
 
     // A stopped fake is not dead — fake never dies — but it is
     // resumable: stopped with a saved thread and no fence.
-    d.rpc("agent_stop", json!({"alias": "w-old"})).unwrap();
-    d.rpc("agent_stop", json!({"alias": "w-recent"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "w-old"}))
+        .unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "w-recent"}))
+        .unwrap();
     d.wait_agent("w-old", "stopped", 15);
     d.wait_agent("w-recent", "stopped", 15);
     let list = d.rpc("agent_list", json!({})).unwrap();
@@ -1005,7 +1022,8 @@ fn agent_remove_refuses_queued_message_and_force_overrides() {
     let d = TestDaemon::start();
     d.register("w1");
     d.wait_agent("w1", "idle", 10);
-    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "w1"}))
+        .unwrap();
     d.wait_agent("w1", "stopped", 15);
     d.send("w1", json!({"text": "later", "message": "m-queued"}))
         .unwrap();
@@ -1049,7 +1067,8 @@ fn agent_remove_refuses_non_terminal_task_and_cli_force_overrides() {
         json!({"job": "j1", "task": "j1-fix", "assignee": "w1"}),
     )
     .unwrap();
-    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "w1"}))
+        .unwrap();
     d.wait_agent("w1", "stopped", 15);
 
     let remove = |extra: &[&str]| {
@@ -1124,7 +1143,8 @@ fn agent_remove_keeps_job_history() {
     assert_eq!(d.task_state("j1-fix"), "verified");
 
     for alias in ["w1", "qa"] {
-        d.rpc("agent_stop", json!({"alias": alias})).unwrap();
+        d.operator_rpc("agent_stop", json!({"alias": alias}))
+            .unwrap();
         d.wait_agent(alias, "stopped", 15);
         d.operator_rpc("agent_remove", json!({"alias": alias}))
             .unwrap();
@@ -1541,7 +1561,8 @@ fn agent_resume_waits_and_attaches_like_launch() {
     let _mock = d.mock_devin();
     d.register_devin("dv1", None);
     d.wait_agent("dv1", "idle", 20);
-    d.rpc("agent_stop", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "dv1"}))
+        .unwrap();
     d.wait_agent("dv1", "stopped", 15);
     let bin = env!("CARGO_BIN_EXE_cadence");
 
@@ -1568,7 +1589,8 @@ fn agent_resume_waits_and_attaches_like_launch() {
 
     // Default (non-TTY test env): after the summary, the attach command
     // is printed — same JSON shape `agent attach` produces.
-    d.rpc("agent_stop", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "dv1"}))
+        .unwrap();
     d.wait_agent("dv1", "stopped", 15);
     let out = std::process::Command::new(bin)
         .arg("--state-dir")
@@ -1590,7 +1612,8 @@ fn agent_resume_waits_and_attaches_like_launch() {
     // immediately — no 30s wait.
     d.register("w1");
     d.wait_agent("w1", "idle", 10);
-    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "w1"}))
+        .unwrap();
     d.wait_agent("w1", "stopped", 15);
     let started = Instant::now();
     let out = std::process::Command::new(bin)
@@ -1630,14 +1653,16 @@ fn group_resume_orders_pm_first_and_skips_live() {
         if let Some(p) = params {
             req["params"] = json!(p);
         }
-        d.rpc("agent_register", req).unwrap();
+        d.operator_rpc("agent_register", req).unwrap();
     }
     for a in ["pm", "w1", "w2", "other"] {
         d.wait_agent(a, "idle", 10);
     }
     // pm + w1 down; w2 stays live (skip case); other is ungrouped.
-    d.rpc("agent_stop", json!({"alias": "pm"})).unwrap();
-    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "pm"}))
+        .unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "w1"}))
+        .unwrap();
     d.wait_agent("pm", "stopped", 15);
     d.wait_agent("w1", "stopped", 15);
 
@@ -1740,7 +1765,8 @@ fn group_resume_reports_unrecoverable_session_mismatch() {
     .unwrap();
     d.wait_agent("pm", "idle", 15);
     d.wait_agent("w-bad", "idle", 15);
-    d.rpc("agent_stop", json!({"alias": "w-bad"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "w-bad"}))
+        .unwrap();
     d.wait_agent("w-bad", "stopped", 15);
 
     // Before the group resume, plant a rogue pane under the member's
@@ -2225,9 +2251,9 @@ fn pty_ready_claims_stack_fifo_with_claimer() {
     d.wait_agent("dv", "idle", 20);
     // Two claims land before either send — the queue stacks them FIFO
     // instead of overwriting (N6). Each releases exactly one message.
-    d.rpc("agent_ready", json!({"alias": "dv", "by": "alice"}))
+    d.operator_rpc("agent_ready", json!({"alias": "dv", "by": "alice"}))
         .unwrap();
-    d.rpc("agent_ready", json!({"alias": "dv", "by": "bob"}))
+    d.operator_rpc("agent_ready", json!({"alias": "dv", "by": "bob"}))
         .unwrap();
     for id in ["m1", "m2"] {
         d.send("dv", json!({"text": format!("task {id}"), "message": id}))
@@ -2264,7 +2290,8 @@ fn agent_dead_and_resumable_per_endpoint_kind() {
     d.register_devin("dv1", None);
     d.wait_agent("dv1", "idle", 20);
     atomic_write(d.pane_file(&_mock, "dv1", "swallow"), "1");
-    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "dv1"}))
+        .unwrap();
     d.send("dv1", json!({"text": "dropped", "message": "m1"}))
         .unwrap();
     let agent = d.wait_agent("dv1", "attention", 25);
@@ -2285,14 +2312,16 @@ fn agent_dead_and_resumable_per_endpoint_kind() {
     assert_eq!(agent["dead"], false, "{agent}");
     assert_eq!(agent["resumable"], true, "{agent}");
     // Live again: neither.
-    d.rpc("agent_resume", json!({"alias": "dv1"})).unwrap();
+    d.operator_rpc("agent_resume", json!({"alias": "dv1"}))
+        .unwrap();
     let agent = d.wait_agent("dv1", "idle", 20);
     assert_eq!(agent["dead"], false, "{agent}");
     assert_eq!(agent["resumable"], false, "{agent}");
     // A stopped fake: never dead, resumable.
     d.register("w1");
     d.wait_agent("w1", "idle", 10);
-    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "w1"}))
+        .unwrap();
     let agent = d.wait_agent("w1", "stopped", 15);
     assert_eq!(agent["dead"], false, "{agent}");
     assert_eq!(agent["resumable"], true, "{agent}");
@@ -2324,17 +2353,20 @@ fn pty_ready_claim_refuses_busy_pane_unless_forced() {
     d.wait_agent("st", "idle", 20);
     // The stub's own busy marker on screen — the claim must refuse.
     atomic_write(d.stub_pane_file(&mock, "st", "tui-state"), "stub working\n");
-    let err = d.rpc("agent_ready", json!({"alias": "st"})).unwrap_err();
+    let err = d
+        .operator_rpc("agent_ready", json!({"alias": "st"}))
+        .unwrap_err();
     assert!(err.to_string().contains("busy"), "{err}");
     // `--force` claims anyway; the busy verdict still rides the event.
-    d.rpc("agent_ready", json!({"alias": "st", "force": true}))
+    d.operator_rpc("agent_ready", json!({"alias": "st", "force": true}))
         .unwrap();
     let e = d.wait_event("st", "ready_claimed", 10);
     assert_eq!(e["payload"]["forced"], true, "{e}");
     assert_eq!(e["payload"]["probe"]["busy_marker"], true, "{e}");
     // Idle again: a plain claim lands and is not marked forced.
     std::fs::remove_file(d.stub_pane_file(&mock, "st", "tui-state")).unwrap();
-    d.rpc("agent_ready", json!({"alias": "st"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "st"}))
+        .unwrap();
     let claims: Vec<Value> = d
         .events("st")
         .into_iter()
@@ -2658,7 +2690,7 @@ fn message_result_sha_flag_on_pty_path() {
     // operator reconcile of a completed message isn't the path — the
     // edge is task_on_completed reading result.sha; cover via verdict.
     assert!(d.job_verdict("j1-t2", SHA_A, "pass").is_err()); // NULL head_sha — never inferred
-    d.rpc(
+    d.operator_rpc(
         "task_sha",
         json!({"task": "j1-t2", "sha": SHA_A, "by": "pm"}),
     )
@@ -2774,7 +2806,8 @@ fn pty_stub_profile_consumes_one_claim_per_send() {
     let _mock = d.mock_stub();
     d.register_stub("st", json!({}));
     d.wait_agent("st", "idle", 20);
-    d.rpc("agent_ready", json!({"alias": "st"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "st"}))
+        .unwrap();
     d.send("st", json!({"text": "first", "message": "m1"}))
         .unwrap();
     pty_report_done(&d, "st", "m1");
@@ -2790,7 +2823,8 @@ fn pty_stub_profile_consumes_one_claim_per_send() {
         "{wait}"
     );
     // A fresh claim releases exactly the queued send.
-    d.rpc("agent_ready", json!({"alias": "st"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "st"}))
+        .unwrap();
     pty_token(&d, "st", "m2");
 }
 
@@ -2805,7 +2839,8 @@ fn pty_forbidden_prefix_is_prewrite_and_keeps_claim() {
     d.register_devin("dv", None);
     d.wait_agent("dv", "idle", 20);
     // One claim: every rejection below must leave it unconsumed.
-    d.rpc("agent_ready", json!({"alias": "dv"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "dv"}))
+        .unwrap();
     for (id, body, prefix) in [
         ("m1", "/menu", '/'),
         ("m2", "!bash", '!'),
@@ -3055,7 +3090,8 @@ fn pty_claude_forbidden_prefixes_reject_prewrite() {
     let mock = d.mock_claude_tui();
     d.register_claude_pty("cl", json!({}));
     d.wait_agent("cl", "idle", 20);
-    d.rpc("agent_ready", json!({"alias": "cl"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "cl"}))
+        .unwrap();
     for (id, body, prefix) in [
         ("m1", "/quit", '/'),
         ("m2", "!ls", '!'),
@@ -3184,7 +3220,8 @@ fn pty_claude_dim_prompt_suggestion_probes_idle() {
     let probe = d.rpc("agent_probe", json!({"alias": "cl"})).unwrap();
     assert_eq!(probe["idle"], true, "{probe}");
     assert_eq!(probe["input_nonempty"], false, "{probe}");
-    d.rpc("agent_ready", json!({"alias": "cl"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "cl"}))
+        .unwrap();
 
     atomic_write(state, fixture("typed.ansi"));
     let probe = d.rpc("agent_probe", json!({"alias": "cl"})).unwrap();
@@ -3194,7 +3231,9 @@ fn pty_claude_dim_prompt_suggestion_probes_idle() {
         probe["reason"], "unsubmitted text in the input line",
         "{probe}"
     );
-    let err = d.rpc("agent_ready", json!({"alias": "cl"})).unwrap_err();
+    let err = d
+        .operator_rpc("agent_ready", json!({"alias": "cl"}))
+        .unwrap_err();
     assert!(err.to_string().contains("unsubmitted text"), "{err}");
 }
 
@@ -3350,7 +3389,8 @@ fn cli_join_claude_tui_briefs_prefixes() {
 fn stopped_fake_agent(d: &TestDaemon, alias: &str) -> Value {
     d.register(alias);
     d.wait_agent(alias, "idle", 10);
-    d.rpc("agent_stop", json!({"alias": alias})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": alias}))
+        .unwrap();
     d.wait_agent(alias, "stopped", 10);
     d.rpc("agent_show", json!({"alias": alias})).unwrap()
 }
@@ -3491,7 +3531,8 @@ fn cli_launch_refuses_endpoint_kind_change_claude() {
     d.wait_agent("pm", "idle", 10);
     d.register_claude("cm", Value::Null);
     d.wait_agent("cm", "idle", 15);
-    d.rpc("agent_stop", json!({"alias": "cm"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "cm"}))
+        .unwrap();
     d.wait_agent("cm", "stopped", 10);
     let before = d.rpc("agent_show", json!({"alias": "cm"})).unwrap();
     let bin = env!("CARGO_BIN_EXE_cadence");
@@ -3544,7 +3585,8 @@ fn cli_launch_refuses_endpoint_kind_change_devin() {
     test_env().set("CADENCE_DEVIN_API_KEY", "");
     d.register_devin("dvx", None);
     d.wait_agent("dvx", "idle", 20);
-    d.rpc("agent_stop", json!({"alias": "dvx"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "dvx"}))
+        .unwrap();
     d.wait_agent("dvx", "stopped", 10);
     let before = d.rpc("agent_show", json!({"alias": "dvx"})).unwrap();
     let bin = env!("CARGO_BIN_EXE_cadence");
@@ -3860,8 +3902,10 @@ fn pty_cursor_minted_session_persists_and_model_replays() {
                "next_launch": true}),
     )
     .unwrap();
-    d.rpc("agent_stop", json!({"alias": "cu"})).unwrap();
-    d.rpc("agent_resume", json!({"alias": "cu"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "cu"}))
+        .unwrap();
+    d.operator_rpc("agent_resume", json!({"alias": "cu"}))
+        .unwrap();
     let agent = d.wait_agent("cu", "idle", 20);
     // Same chat — the respawn resumed the minted id, never re-minted.
     assert_eq!(agent["session_id"].as_str().unwrap(), sid);
@@ -3897,8 +3941,10 @@ fn pty_cursor_allowlist_merged_into_cli_config() {
     assert!(bak.contains("Shell(ls)"), "{bak}");
     // A resume leaves an already-merged config byte-identical.
     let before = std::fs::read_to_string(&config).unwrap();
-    d.rpc("agent_stop", json!({"alias": "cu"})).unwrap();
-    d.rpc("agent_resume", json!({"alias": "cu"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "cu"}))
+        .unwrap();
+    d.operator_rpc("agent_resume", json!({"alias": "cu"}))
+        .unwrap();
     d.wait_agent("cu", "idle", 20);
     assert_eq!(std::fs::read_to_string(&config).unwrap(), before);
 }
@@ -3947,7 +3993,8 @@ fn pty_cursor_unresumable_chat_clears_and_mints_fresh() {
     );
     // `agent resume` mints a fresh chat — the alias unwedges instead
     // of retrying the dead id forever.
-    d.rpc("agent_resume", json!({"alias": "cu"})).unwrap();
+    d.operator_rpc("agent_resume", json!({"alias": "cu"}))
+        .unwrap();
     let agent = d.wait_agent("cu", "idle", 20);
     let native = agent["thread_id"].as_str().unwrap();
     assert_ne!(native, "dead-chat");
@@ -3969,8 +4016,10 @@ fn pty_cursor_proven_chat_deleted_mints_fresh() {
     // The proven chat is gone from the host: a TUI asked to resume it
     // exits, the deleted-chat shape.
     std::env::set_var("MOCK_CURSOR_DIE_ON", &proven);
-    d.rpc("agent_stop", json!({"alias": "cu"})).unwrap();
-    d.rpc("agent_resume", json!({"alias": "cu"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "cu"}))
+        .unwrap();
+    d.operator_rpc("agent_resume", json!({"alias": "cu"}))
+        .unwrap();
     let agent = d.wait_agent("cu", "attention", 20);
     let err = agent["error"].as_str().unwrap_or("");
     assert!(err.contains("pane exited during TUI startup"), "{err}");
@@ -3986,7 +4035,8 @@ fn pty_cursor_proven_chat_deleted_mints_fresh() {
         show["agent"]["thread_id"].is_null(),
         "thread_id not cleared: {show}"
     );
-    d.rpc("agent_resume", json!({"alias": "cu"})).unwrap();
+    d.operator_rpc("agent_resume", json!({"alias": "cu"}))
+        .unwrap();
     let agent = d.wait_agent("cu", "idle", 20);
     let native = agent["thread_id"].as_str().unwrap();
     assert_ne!(native, proven);
@@ -4025,7 +4075,8 @@ fn pty_cursor_cleared_session_leaves_foreign_chat() {
     );
     // The next open mints fresh — it neither resumes the dead id nor
     // adopts the foreign chat.
-    d.rpc("agent_resume", json!({"alias": "cu"})).unwrap();
+    d.operator_rpc("agent_resume", json!({"alias": "cu"}))
+        .unwrap();
     let agent = d.wait_agent("cu", "idle", 20);
     let native = agent["thread_id"].as_str().unwrap();
     assert_ne!(native, "dead-chat");
@@ -4100,7 +4151,8 @@ fn pty_cursor_forbidden_prefixes_reject_prewrite() {
     let mock = d.mock_cursor_tui();
     d.register_cursor_pty("cu", json!({}));
     d.wait_agent("cu", "idle", 20);
-    d.rpc("agent_ready", json!({"alias": "cu"})).unwrap();
+    d.operator_rpc("agent_ready", json!({"alias": "cu"}))
+        .unwrap();
     for (id, body, prefix) in [
         ("m1", "/skills", '/'),
         ("m2", "!git status", '!'),
@@ -4475,7 +4527,8 @@ fn agents_md_opt_in_and_worktree_gitignore() {
     assert_eq!(show["agent"]["params"]["agents_md"], true);
 
     // Resume re-applies the block idempotently — still exactly one.
-    d.rpc("agent_stop", json!({"alias": "w-am"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "w-am"}))
+        .unwrap();
     d.wait_agent("w-am", "stopped", 15);
     let out = std::process::Command::new(bin)
         .arg("--state-dir")
@@ -5013,7 +5066,7 @@ fn agent_remove_and_gc_caller_rule_per_caller_kind() {
     d.register("w6");
     for w in ["w3", "w4", "w5", "w6"] {
         d.wait_agent(w, "idle", 10);
-        d.rpc("agent_stop", json!({"alias": w})).unwrap();
+        d.operator_rpc("agent_stop", json!({"alias": w})).unwrap();
         d.wait_agent(w, "stopped", 15);
     }
     let present = |alias: &str| d.rpc("agent_show", json!({"alias": alias})).is_ok();
@@ -5128,7 +5181,8 @@ fn agent_remove_force_unassigns_open_tasks() {
         .to_string();
     d.wait_message("w1", &kickoff, &["completed"], 15);
     d.wait_task("t1", "review", 15);
-    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "w1"}))
+        .unwrap();
     d.wait_agent("w1", "stopped", 15);
 
     d.operator_rpc("agent_remove", json!({"alias": "w1", "force": true}))
@@ -5189,7 +5243,8 @@ fn agent_remove_force_unassigns_open_tasks() {
     d.job_dispatch("t2", json!({"to": "w1"})).unwrap();
     assert_ne!(d.task_state("t2"), "draft");
     // And a plain removal of the new agent meets only its own work.
-    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "w1"}))
+        .unwrap();
     d.wait_agent("w1", "stopped", 15);
     let err = d
         .operator_rpc("agent_remove", json!({"alias": "w1"}))
@@ -5208,7 +5263,8 @@ fn agent_remove_force_notifies_reply_to() {
     d.register_member("w1", "pm");
     d.wait_agent("pm", "idle", 10);
     d.wait_agent("w1", "idle", 10);
-    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "w1"}))
+        .unwrap();
     d.wait_agent("w1", "stopped", 15);
     d.send(
         "w1",

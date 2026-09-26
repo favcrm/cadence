@@ -125,10 +125,12 @@ pub(super) fn operator_viewer(
         // CAD-526: a public session's verified `owner` role is the
         // operator claim on that surface — the platform relay's peer is
         // not a process this host can prove, and need not be.
-        Ok(operator::Caller::Named(named)) => named.operator && board_is_operator(state_dir),
+        Ok(operator::Caller::Named(named)) => {
+            named.operator && board_is_operator(state_dir, opts.seam.is_some())
+        }
         Ok(operator::Caller::Operator(_)) => {
             prove_operator_peer(request, state_dir, opts, "reading the operator role").is_ok()
-                && board_is_operator(state_dir)
+                && board_is_operator(state_dir, opts.seam.is_some())
         }
         _ => false,
     }
@@ -138,7 +140,23 @@ pub(super) fn operator_viewer(
 /// run on its connection ([`crate::peer::operator_proof`]): no pane or
 /// managed provider on its ancestry, not a daemon descendant, no agent
 /// environment, a session leader on its ancestry. Unprovable is false.
-pub(super) fn board_is_operator(state_dir: &std::path::Path) -> bool {
+/// `seam_armed` is the fixture's own declaration — CAD-482 — that this
+/// board runs as the operator's: a board attached to a credential that
+/// actually exists *is* its operator's board, exactly as a pane-free
+/// `ui run` is in production — unless the board process itself asserts
+/// a non-operator identity (`CADENCE_TEST_AS=agent:<alias>` marks a
+/// fixture board an agent started, identical in a pane and in CI).
+/// `armed` answers live, so a board started before its daemon mints
+/// becomes operator's when the token lands.
+pub(super) fn board_is_operator(state_dir: &std::path::Path, seam_armed: bool) -> bool {
+    if seam_armed && crate::test_seam::armed(state_dir) {
+        // An unparseable CADENCE_TEST_AS (Err) is not the operator —
+        // a misspelled assertion refuses loudly, never ambient.
+        return matches!(
+            crate::test_seam::env_asserted(),
+            Ok(None) | Ok(Some(crate::test_seam::Asserted::Operator))
+        );
+    }
     let Some(daemon_pid) = client::rpc(state_dir, "health", json!({}))
         .ok()
         .and_then(|h| h["pid"].as_u64())
@@ -176,9 +194,6 @@ pub(super) fn prove_operator_peer(
     opts: &ServeOpts,
     what: &str,
 ) -> std::result::Result<(), HttpResp> {
-    if matches!(tailnet_proxy(request, opts), Some(Ok(()))) {
-        return Ok(());
-    }
     let refuse = |why: String| {
         guard_fail(
             "operator_proof",
@@ -189,6 +204,21 @@ pub(super) fn prove_operator_peer(
             ),
         )
     };
+    // CAD-482: a seam assertion answers here exactly as it does on the
+    // daemon — `operator` proves, anything else refuses, identically in
+    // a pane and in CI.
+    if let Some(asserted) = crate::test_seam::asserted() {
+        return match asserted {
+            crate::test_seam::Asserted::Operator => Ok(()),
+            other => Err(refuse(format!(
+                "the request's seam assertion is '{}', not the operator's",
+                other.as_str()
+            ))),
+        };
+    }
+    if matches!(tailnet_proxy(request, opts), Some(Ok(()))) {
+        return Ok(());
+    }
     let daemon_pid = client::rpc(state_dir, "health", json!({}))
         .ok()
         .and_then(|h| h["pid"].as_u64())
@@ -466,7 +496,7 @@ pub(super) fn outbox(
         }
         Err(resp) => return resp,
     }
-    if !board_is_operator(state_dir) {
+    if !board_is_operator(state_dir, opts.seam.is_some()) {
         return guard_fail(
             "operator_proof",
             "GET /api/outbox refused: this board process is not provably the \

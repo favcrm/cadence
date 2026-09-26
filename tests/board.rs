@@ -314,6 +314,12 @@ fn op_http_write(
     }
     all.push(&cookie);
     all.push(&key);
+    // CAD-482: the session's caller assertion rides too — the write
+    // proves operator in a pane exactly as ambient proof does in CI.
+    let seam = op.seam.trim_end().to_string();
+    if !seam.is_empty() {
+        all.push(&seam);
+    }
     http_write(port, method, path, &own, &all, body)
 }
 
@@ -357,6 +363,10 @@ fn start_ui_opts(
             let mut opts = ui::ServeOpts {
                 host: "127.0.0.1".to_string(),
                 port,
+                // CAD-482: under the feature every in-process fixture
+                // board attaches — the token is read lazily per request,
+                // so a board may start before its daemon mints.
+                test_seam: cfg!(feature = "test-seam"),
                 ..Default::default()
             };
             f(&mut opts);
@@ -2250,6 +2260,7 @@ impl UiDaemon {
         let opts = daemon::ServeOptions {
             stop: Some(stop.clone()),
             provider_env,
+            test_seam: cfg!(feature = "test-seam"),
             ..Default::default()
         };
         let handle = thread::spawn(move || {
@@ -2282,6 +2293,7 @@ impl UiDaemon {
         let opts = daemon::ServeOptions {
             operator_clock: Some(clock),
             stop: Some(stop.clone()),
+            test_seam: cfg!(feature = "test-seam"),
             ..Default::default()
         };
         let handle = thread::spawn(move || {
@@ -2324,12 +2336,19 @@ impl UiDaemon {
 
     /// `rpc` from a caller that is provably the operator however the
     /// suite is run — `TestDaemon::operator_rpc` in tests/common/mod.rs
-    /// (CAD-291): `setsid -f` hands the call to a fresh session leader
-    /// that waits until it has left this process's ancestry,
-    /// `env_clear` leaves no `CADENCE_ALIAS`, and stdio is not a pane
-    /// tty — the residual `peer::operator_proof` accepts. The gate
-    /// itself is untouched.
+    /// (CAD-291). On a seam-armed fixture (CAD-482) the identity is
+    /// asserted in-band; otherwise `setsid -f` hands the call to a
+    /// fresh session leader that waits until it has left this
+    /// process's ancestry, `env_clear` leaves no `CADENCE_ALIAS`, and
+    /// stdio is not a pane tty — the residual `peer::operator_proof`
+    /// accepts. The gate itself is untouched.
     fn operator_rpc(&self, method: &str, params: Value) -> cadence_agent::Result<Value> {
+        if cadence_agent::test_seam::armed(&self.state) {
+            return cadence_agent::test_seam::scoped(
+                cadence_agent::test_seam::Asserted::Operator,
+                || client::rpc(&self.state, method, params),
+            );
+        }
         let script = self.state.join("operator-rpc.py");
         if !script.exists() {
             std::fs::write(&script, OPERATOR_RPC_PY).unwrap();
@@ -2648,7 +2667,7 @@ fn wait_port_closed(port: u16) {
 /// `enabled=0`, so no actor ever opens it and overwrites the plant —
 /// the same recipe common/mod.rs's `plant_pane` uses.
 fn plant_pane(d: &UiDaemon, alias: &str, pid: u32) {
-    d.rpc(
+    let _ = d.operator_rpc(
         "agent_register",
         json!({"alias": alias, "provider": "inbox", "endpoint_kind": "inbox",
                "cwd": d.state().to_str().unwrap()}),
@@ -3079,13 +3098,13 @@ fn ui_write_caller_pty_tie_is_forgeable_residual_pinned() {
 /// dispatched so the task is live. Returns (job_id, task_id).
 fn bound_job(pm: &Path, d: &UiDaemon, issue: &str) -> (String, String) {
     let cwd = pm.to_str().unwrap();
-    d.rpc(
+    let _ = d.operator_rpc(
         "agent_register",
         json!({"alias": "pm", "provider": "fake",
                "endpoint_kind": "fake", "cwd": cwd}),
     );
     // The worker must sit in the pm's group or dispatch refuses it.
-    d.rpc(
+    let _ = d.operator_rpc(
         "agent_register",
         json!({"alias": "wk", "provider": "fake",
                "endpoint_kind": "fake", "cwd": cwd,
@@ -3109,7 +3128,7 @@ fn bound_job(pm: &Path, d: &UiDaemon, issue: &str) -> (String, String) {
                "acceptance": "verify against CAD-1"}),
     );
     let task_id = task["task"]["id"].as_str().unwrap().to_string();
-    d.rpc("task_dispatch", json!({"task": task_id, "by": "operator"}));
+    let _ = d.operator_rpc("task_dispatch", json!({"task": task_id, "by": "operator"}));
     (job_id, task_id)
 }
 
@@ -3236,12 +3255,12 @@ fn ui_overview_surfaces_durable_monitor_alert_and_acknowledges_it() {
     let d = UiDaemon::start();
     seed(pm.path(), &d.state());
     let cwd = pm.path().to_str().unwrap();
-    d.rpc(
+    let _ = d.operator_rpc(
         "agent_register",
         json!({"alias": "pm", "provider": "fake",
                "endpoint_kind": "fake", "cwd": cwd}),
     );
-    d.rpc(
+    let _ = d.operator_rpc(
         "agent_register",
         json!({"alias": "wk", "provider": "fake",
                "endpoint_kind": "fake", "cwd": cwd,
@@ -3259,7 +3278,7 @@ fn ui_overview_surfaces_durable_monitor_alert_and_acknowledges_it() {
         json!({"job": "ui-monitor-job", "task": "ui-monitor-task",
                "assignee": "wk", "acceptance": "observe the monitor"}),
     );
-    d.rpc(
+    let _ = d.operator_rpc(
         "monitor_register",
         json!({"monitor": "ui-monitor", "project": "cadence",
                "owner": "watchdog", "tasks": ["ui-monitor-task"],
@@ -3381,7 +3400,7 @@ fn ui_agent_detail_route_and_guards() {
     let pm = TempDir::new().unwrap();
     let d = UiDaemon::start();
     seed(pm.path(), &d.state());
-    d.rpc(
+    let _ = d.operator_rpc(
         "agent_register",
         json!({"alias": "wk", "provider": "fake",
                "endpoint_kind": "fake", "cwd": pm.path().to_str().unwrap()}),
@@ -3559,7 +3578,7 @@ fn ui_stream_sse_and_guards() {
     );
 
     // An agent change moves the agent fingerprint → `event: agents`.
-    d.rpc(
+    let _ = d.operator_rpc(
         "agent_register",
         json!({"alias": "late", "provider": "fake",
                "endpoint_kind": "fake", "cwd": pm.path().to_str().unwrap()}),
@@ -3625,19 +3644,19 @@ fn ui_agents_payload_covers_all_kinds() {
     let cwd = pm.path().to_str().unwrap();
 
     // Mailbox — inbox endpoints are counted separately, never fenced.
-    d.rpc(
+    let _ = d.operator_rpc(
         "agent_register",
         json!({"alias": "obs", "provider": "inbox",
                "endpoint_kind": "inbox", "cwd": cwd}),
     );
     // Idle worker — registered, no turn in flight.
-    d.rpc(
+    let _ = d.operator_rpc(
         "agent_register",
         json!({"alias": "idle1", "provider": "fake",
                "endpoint_kind": "fake", "cwd": cwd}),
     );
     // Busy worker — SLEEP holds the turn so `running` stays up.
-    d.rpc(
+    let _ = d.operator_rpc(
         "agent_register",
         json!({"alias": "busy1", "provider": "fake",
                "endpoint_kind": "fake", "cwd": cwd}),
@@ -3653,14 +3672,14 @@ fn ui_agents_payload_covers_all_kinds() {
             .unwrap_or(false)
     });
     // Stopped worker — registered then stopped.
-    d.rpc(
+    let _ = d.operator_rpc(
         "agent_register",
         json!({"alias": "stop1", "provider": "fake",
                "endpoint_kind": "fake", "cwd": cwd}),
     );
-    d.rpc("agent_stop", json!({"alias": "stop1"}));
+    let _ = d.operator_rpc("agent_stop", json!({"alias": "stop1"}));
     // Fenced worker — DISCONNECT drops mid-turn → unknown → attention.
-    d.rpc(
+    let _ = d.operator_rpc(
         "agent_register",
         json!({"alias": "fenced1", "provider": "fake",
                "endpoint_kind": "fake", "cwd": cwd}),
@@ -7222,7 +7241,7 @@ fn dispatch_respects_claims() {
         if let Some(up) = upstream {
             req["params"] = json!(format!("{{\"upstream\":\"{up}\"}}"));
         }
-        d.rpc("agent_register", req);
+        let _ = d.operator_rpc("agent_register", req);
     }
     for title in ["Lane", "Outside"] {
         assert!(cli(&pm, &state, &["issue", "new", title, "--project", "demo"]).0);
@@ -9226,8 +9245,20 @@ fn spawn_ui(pm: &Path, state: &Path) -> (u16, UiProc) {
 }
 
 /// `spawn_ui` with `env` set on the server after the sanitizing.
-#[allow(clippy::zombie_processes)] // UiProc's Drop kills + waits.
 fn spawn_ui_env(pm: &Path, state: &Path, env: &[(&str, &str)]) -> (u16, UiProc) {
+    spawn_ui_seam(pm, state, env, true)
+}
+
+/// `ui run` with the seam envs stripped — an unarmed board even on a
+/// `test-seam` build, for the test that proves assertion headers are
+/// refused outright when no fixture credential exists.
+#[cfg(feature = "test-seam")]
+fn spawn_ui_unarmed(pm: &Path, state: &Path) -> (u16, UiProc) {
+    spawn_ui_seam(pm, state, &[], false)
+}
+
+#[allow(clippy::zombie_processes)] // UiProc's Drop kills + waits.
+fn spawn_ui_seam(pm: &Path, state: &Path, env: &[(&str, &str)], arm: bool) -> (u16, UiProc) {
     let port = free_port();
     let mut cmd = Command::new(bin());
     cmd.arg("--state-dir")
@@ -9249,6 +9280,19 @@ fn spawn_ui_env(pm: &Path, state: &Path, env: &[(&str, &str)]) -> (u16, UiProc) 
     if let Ok(home) = std::env::var("HOME") {
         cmd.env("HOME", home);
     }
+    // CAD-482: under the feature every spawned fixture board attaches to
+    // the seam — it honors assertion headers — and runs as the operator's
+    // process on unasserted daemon calls, as `start_operator_ui` does.
+    // A caller's `env` overrides either default (e.g. an agent-shaped
+    // board carries its own CADENCE_TEST_AS). `arm: false` spawns the
+    // unarmed shape: no env can leak an attach.
+    if arm && cfg!(feature = "test-seam") {
+        cmd.env(cadence_agent::test_seam::ARM_ENV, "1")
+            .env(cadence_agent::test_seam::AS_ENV, "operator");
+    } else {
+        cmd.env_remove(cadence_agent::test_seam::ARM_ENV)
+            .env_remove(cadence_agent::test_seam::AS_ENV);
+    }
     cmd.envs(env.iter().copied());
     let child = cmd.spawn().unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -9269,6 +9313,76 @@ fn spawn_ui_env(pm: &Path, state: &Path, env: &[(&str, &str)]) -> (u16, UiProc) 
     }
 }
 
+// ---- CAD-482: the board's assertion headers bind the fixture credential ----
+
+/// The board-path twin of `forged_token_and_half_assertions_are_refused`
+/// in tests/test_seam.rs: `scope_headers` (src/test_seam.rs) is the only
+/// check that `X-Cadence-Test-As` needs the fixture's minted token, so
+/// each refusal is exercised on the wire — an As header alone, a token
+/// alone, a wrong token — each must 403, never fall back to ambient.
+#[cfg(feature = "test-seam")]
+#[test]
+fn seam_board_headers_require_the_fixture_token() {
+    let (_t, pm, state, _repo) = start_fx();
+    let _d = UiDaemon::start_on(state.clone()); // armed: mints the token
+    let (port, _ui) = spawn_ui(&pm, &state); // armed board
+    let host = format!("127.0.0.1:{port}");
+    let get = |headers: &[&str]| http_write(port, "GET", "/api/health", &host, headers, b"");
+
+    // `X-Cadence-Test-As` alone — a half assertion.
+    let (status, _, body) = get(&["X-Cadence-Test-As: operator"]);
+    assert_eq!(status, 403, "{body}");
+    assert!(body.contains("travel together"), "{body}");
+
+    // `X-Cadence-Test-Token` alone — the other half.
+    let (status, _, body) = get(&["X-Cadence-Test-Token: some-token"]);
+    assert_eq!(status, 403, "{body}");
+    assert!(body.contains("travel together"), "{body}");
+
+    // Both halves present, but the token is not the fixture's.
+    let (status, _, body) = get(&[
+        "X-Cadence-Test-As: operator",
+        "X-Cadence-Test-Token: not-the-fixtures-token",
+    ]);
+    assert_eq!(status, 403, "{body}");
+    assert!(body.contains("seam token"), "{body}");
+
+    // And the real pair is honored — the refusals above came from the
+    // credential check, not from the headers merely being present.
+    let token = cadence_agent::test_seam::Seam::token_at(&state).unwrap();
+    let as_h = "X-Cadence-Test-As: operator".to_string();
+    let tok_h = format!("X-Cadence-Test-Token: {token}");
+    let (status, _, body) = get(&[&as_h, &tok_h]);
+    assert_eq!(status, 200, "a correctly-bound assertion must pass: {body}");
+}
+
+/// Headers sent to a board that never armed — `ui run` without the
+/// seam envs on a state dir carrying no minted token — refuse
+/// outright: an assertion cannot smuggle onto a board that did not
+/// opt in.
+#[cfg(feature = "test-seam")]
+#[test]
+fn unarmed_board_refuses_assertion_headers() {
+    let (_t, pm, state, _repo) = start_fx();
+    // No daemon, so no minted token: the board cannot attach even if it
+    // tried (`ui run` re-attaches on the token's presence alone).
+    let (port, _ui) = spawn_ui_unarmed(&pm, &state);
+    let host = format!("127.0.0.1:{port}");
+    let (status, _, body) = http_write(
+        port,
+        "GET",
+        "/api/health",
+        &host,
+        &[
+            "X-Cadence-Test-As: operator",
+            "X-Cadence-Test-Token: anything",
+        ],
+        b"",
+    );
+    assert_eq!(status, 403, "{body}");
+    assert!(body.contains("test seam armed"), "{body}");
+}
+
 /// The board as an operator runs it, however the suite is run: a
 /// detached `cadence ui start`. Operator-only relays (`model_defaults_set`,
 /// CAD-337) refuse a board whose ancestry carries an agent, and when the
@@ -9285,17 +9399,25 @@ fn start_operator_ui(pm: &Path, state: &Path) -> (u16, DetachedUi) {
     let overall = Instant::now() + Duration::from_secs(30);
     loop {
         let port = free_port();
-        let out = Command::new(bin())
-            .arg("--state-dir")
+        let mut cmd = Command::new(bin());
+        cmd.arg("--state-dir")
             .arg(state)
             .args(["ui", "start", "--port", &port.to_string()])
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", pm)
             .env("CADENCE_PM_DIR", pm)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .unwrap();
+            .stdin(std::process::Stdio::null());
+        // CAD-482: on a test-seam build the detached board arms the
+        // seam (its daemon minted the credential) and asserts the
+        // operator identity on every daemon call it relays — the
+        // detached process is the production shape of `ui start`; the
+        // envs only say WHO it runs as, identically in a pane and CI.
+        if cfg!(feature = "test-seam") {
+            cmd.env(cadence_agent::test_seam::ARM_ENV, "1")
+                .env(cadence_agent::test_seam::AS_ENV, "operator");
+        }
+        let out = cmd.output().unwrap();
         if out.status.success() {
             return (port, guard);
         }
@@ -11398,11 +11520,17 @@ fn model_defaults_http_round_trip_guards_and_conflict() {
     let doc = r#"{"expected_revision":0,"config":{"schema":1,"providers":{"claude":{"default":{"mode":"model","model":"baseline-a"},"roles":{"qa":{"mode":"provider_default"}}}}}}"#;
     // An agent-shaped board — its own environment carries CADENCE_ALIAS
     // — is refused by the daemon's gate, however the suite is run, and
-    // nothing is written.
+    // nothing is written. Under the seam the write asserts
+    // `agent:board-agent` on the wire — an agent presenting the
+    // operator's session trips CAD-313's stolen-session check on the
+    // board itself, which revokes it before the relay runs.
     let (agent_port, _agent_ui) =
         spawn_ui_env(pm.path(), &d.state(), &[("CADENCE_ALIAS", "board-agent")]);
     let agent_host = format!("127.0.0.1:{agent_port}");
-    let agent_op = sign_in(&d.state(), agent_port);
+    let mut agent_op = sign_in(&d.state(), agent_port);
+    if !agent_op.seam.is_empty() {
+        agent_op.seam = op::seam_headers(&d.state(), "agent:board-agent");
+    }
     let (code, _, body) = op_write_json(
         &agent_op,
         agent_port,
@@ -11411,11 +11539,19 @@ fn model_defaults_http_round_trip_guards_and_conflict() {
         &agent_host,
         doc,
     );
-    assert_eq!(code, 400, "{body}");
-    assert!(
-        body.contains("not provably the operator") && body.contains("carries CADENCE_ALIAS"),
-        "{body}"
-    );
+    if agent_op.seam.is_empty() {
+        assert_eq!(code, 400, "{body}");
+        assert!(
+            body.contains("not provably the operator") && body.contains("carries CADENCE_ALIAS"),
+            "{body}"
+        );
+    } else {
+        assert_eq!(code, 403, "{body}");
+        assert!(
+            body.contains("session_from_agent") && body.contains("board-agent"),
+            "{body}"
+        );
+    }
     let (code, body) = http(port, "GET", "/api/settings/model-defaults", &host);
     assert_eq!(code, 200, "{body}");
     assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["revision"], 0);
@@ -11476,7 +11612,7 @@ fn model_defaults_http_round_trip_guards_and_conflict() {
         "invalid_request"
     );
 
-    d.rpc(
+    let _ = d.operator_rpc(
         "agent_register",
         json!({"alias": "box", "provider": "inbox", "endpoint_kind": "inbox", "team_role": "ops", "role": "worker"}),
     );
@@ -11716,6 +11852,7 @@ fn a_login_link_opens_exactly_one_session_and_leaves_no_trace() {
         cookie: cookie.clone(),
         set_cookie: set.clone(),
         key: key.clone(),
+        seam: op::seam_headers(&d.state(), "operator"),
     };
     let cookie_h = format!("Cookie: {cookie}");
     let key_h = session.key_header();
@@ -11971,15 +12108,21 @@ fn only_the_operator_with_the_secret_mints_a_login_link() {
     assert!(!said.contains("#n="), "a pane minted a link: {said}");
     assert!(said.contains("pane-l"), "{said}");
 
-    // An agent's environment, however detached.
-    let (ok, out, err) = op::operator_cli_env(
+    // An agent's environment, however detached — on an armed fixture
+    // the child asserts `agent:pane-l` outright; ambiently the alias
+    // on its ancestry is what refuses it.
+    let (ok, out, err) = op::cli_as(
         bin(),
         &d.state(),
         &["ui", "login", "--json", "--port", &port.to_string()],
         &[("CADENCE_ALIAS", "pane-l")],
+        "agent:pane-l",
     );
     assert!(!ok, "{out}");
-    assert!(err.contains("CADENCE_ALIAS"), "{err}");
+    assert!(
+        err.contains("pane-l") || err.contains("CADENCE_ALIAS"),
+        "{err}"
+    );
 
     // The right shape with a wrong secret, or none.
     let sock = client::socket_path(&d.state());
@@ -12044,7 +12187,16 @@ fn a_session_presented_by_an_agent_is_revoked() {
     let host = format!("127.0.0.1:{port}");
     let s = sign_in(&d.state(), port);
     let before = commits(pm.path());
-    let request = s.request("POST", "/api/issues/CAD-3/comments", r#"{"body":"stolen"}"#);
+    // The replay is presented BY the agent, not the operator: on a
+    // seam-armed board the request asserts `agent:pane-t` (the agent a
+    // planted pane would be); without the seam it asserts nothing and
+    // the pane ancestry does the same job.
+    let request = s.request_as(
+        "POST",
+        "/api/issues/CAD-3/comments",
+        r#"{"body":"stolen"}"#,
+        &op::seam_headers(&d.state(), "agent:pane-t"),
+    );
     let mut pane = Command::new("bash")
         .args(["-c", r#"read -r _; bash -c "$CLIENT"; true"#])
         .env(
@@ -12469,10 +12621,14 @@ fn an_early_closed_replay_of_a_stolen_session_writes_nothing() {
         r#"exec 3<>"/dev/tcp/127.0.0.1/$PORT"; printf '%s' "$REQ" >&3; exec 3>&-; sleep 1"#;
     for n in 0..3 {
         let s = sign_in(&d.state(), port);
-        let req = s.request(
+        // The replaying process is a planted pane, not the operator:
+        // assert no seam identity so the pane's own (agent) caller
+        // stands — in a pane and in CI alike.
+        let req = s.request_as(
             "POST",
             "/api/issues/CAD-3/comments",
             &format!(r#"{{"body":"hit and run {n}"}}"#),
+            "",
         );
         as_pane_child(
             &d,
@@ -12542,7 +12698,9 @@ fn every_operator_only_route_runs_the_process_proof() {
             ])
             .env("CADENCE_ALIAS", "some-agent")
             .env("PORT", port.to_string())
-            .env("REQ", s.request("POST", path, body))
+            // The caller fails the process proof, so it must not carry
+            // the operator's seam assertion — ambient identity stands.
+            .env("REQ", s.request_as("POST", path, body, ""))
             .output()
             .unwrap();
         let reply = String::from_utf8_lossy(&out.stdout);
@@ -12933,10 +13091,13 @@ fn an_early_closed_replay_with_no_live_agent_writes_nothing() {
     let before = commits(pm.path());
     for n in 0..3 {
         let s = sign_in(&d.state(), port);
-        let req = s.request(
+        // Replayed by an unattributable process: no seam assertion, the
+        // caller is whatever the socket says — nothing, here.
+        let req = s.request_as(
             "POST",
             "/api/issues/CAD-3/comments",
             &format!(r#"{{"body":"no agent, hit and run {n}"}}"#),
+            "",
         );
         let status = Command::new("bash")
             .args([

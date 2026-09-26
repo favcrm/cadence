@@ -590,6 +590,11 @@ pub struct Shared {
     /// is configured. The heartbeat renews it; its fence is shared with
     /// `store` (every `write_conn`) and with each [`Self::pm`] handle.
     lease: Option<Arc<crate::lease::LeaseCtl>>,
+    /// CAD-482: the test-only caller seam's armed credential — `Some`
+    /// only when a fixture asked for it ([`ServeOptions::test_seam`])
+    /// on a `test-seam` build. Request frames carrying `test_caller`
+    /// are honored against it; without it they are refused.
+    seam: Option<crate::test_seam::Seam>,
 }
 
 impl Shared {
@@ -600,21 +605,32 @@ impl Shared {
     /// `new` with the consumed hot-restart context: the adoption
     /// candidates the marker carried plus this run's instance id.
     pub fn new_hot(state_dir: &Path, opts: &ServeOptions, hot: HotStart) -> Result<Arc<Self>> {
+        // CAD-482: the seam check runs before the lease is taken or
+        // the store opens — a fixture that arms on the production dir
+        // or outside the temp root refuses here, before anything is
+        // written. A state dir that still carries a minted token
+        // re-arms: `daemon restart` spawns this process without the
+        // arming env.
+        let seam = crate::test_seam::arm_if_requested(
+            state_dir,
+            opts.test_seam || crate::test_seam::armed(state_dir),
+        )?;
         // CAD-538: a configured hosted lease must be held before the
         // store opens — `recover` writes at open. A daemon that cannot
         // take the lease refuses here having written nothing.
         let lease = crate::lease::acquire(state_dir, &hosted_config(opts)?)?;
-        Self::new_leased(state_dir, opts, hot, lease)
+        Self::new_leased(state_dir, opts, hot, lease, seam)
     }
 
-    /// `new_hot` over an already-resolved lease — `serve` acquires
-    /// before `hot_restart_begin` so a refused daemon leaves even the
-    /// marker files untouched.
+    /// `new_hot` over an already-resolved lease and seam — `serve`
+    /// acquires both before `hot_restart_begin` so a refused daemon
+    /// leaves even the marker files untouched.
     fn new_leased(
         state_dir: &Path,
         opts: &ServeOptions,
         hot: HotStart,
         lease: Option<Arc<crate::lease::LeaseCtl>>,
+        seam: Option<crate::test_seam::Seam>,
     ) -> Result<Arc<Self>> {
         let HotStart { instance, marker } = hot;
         let daemon_id = instance.clone();
@@ -705,6 +721,7 @@ impl Shared {
             effect_execute_gate: opts.effect_execute_gate.clone(),
             outbox_dir: opts.outbox_dir.clone(),
             lease,
+            seam,
         });
         // Holds dropped by boot-time revalidation get their release
         // events now that the store-backed emitter exists.
@@ -2738,6 +2755,19 @@ impl Shared {
     /// clean "no identity" answer — for [`Self::rpc_slot_reconcile`] a
     /// precondition of operator authority, never proof of it.
     fn slot_identity(&self, peer_pid: u32) -> Result<Option<SlotWho>> {
+        // CAD-482: an asserted caller is exactly what the test named —
+        // this process's ambient ancestry is never consulted under a
+        // seam scope. Without the feature `asserted()` is `None` and
+        // this consult compiles out.
+        if let Some(asserted) = crate::test_seam::asserted() {
+            return Ok(match asserted {
+                crate::test_seam::Asserted::Agent(lane) => Some(SlotWho::Pane {
+                    lane,
+                    chain: vec![peer_pid],
+                }),
+                _ => None,
+            });
+        }
         let chain = adapter::pty::caller_chain(peer_pid).ok_or_else(|| {
             Error::rejected(format!(
                 "Slot caller pid {peer_pid}: /proc ancestry unreadable — \
@@ -2894,6 +2924,26 @@ impl Shared {
     /// ambiguous and refused, as is any node whose proof fails: fail
     /// closed, never fall through to another node.
     fn caller_identity(&self, peer_pid: u32) -> Result<Caller> {
+        // CAD-482: an asserted agent resolves straight from the
+        // registry row — an unregistered name refuses, so the seam
+        // asserts identities but never invents them. Liveness is the
+        // fixture's business; the row need not prove a live endpoint.
+        if let Some(asserted) = crate::test_seam::asserted() {
+            return match asserted {
+                crate::test_seam::Asserted::Agent(alias) => {
+                    let agent = self.store.agent(&alias)?;
+                    Ok(Caller::Agent(Box::new(VerifiedAgent {
+                        generation: agent.generation.clone().unwrap_or_default(),
+                        process_start: agent
+                            .pid_start
+                            .and_then(|s| u64::try_from(s).ok())
+                            .unwrap_or(0),
+                        agent,
+                    })))
+                }
+                _ => Ok(Caller::NoAgentIdentity),
+            };
+        }
         // Drifted or closed owners lose their enrollment before it can
         // vouch for anyone.
         self.revalidate_enrollments()?;
@@ -3298,6 +3348,22 @@ impl Shared {
     /// as if unregistered — while a row with no recorded start keeps
     /// denying (fail closed).
     fn operator_evidence(&self, peer_pid: u32) -> std::result::Result<(), String> {
+        // CAD-482: under a seam scope the assertion alone answers —
+        // `unproven` refuses even where the ambient caller is provably
+        // the operator, so a pane run and a CI run decide identically.
+        if let Some(asserted) = crate::test_seam::asserted() {
+            return match asserted {
+                crate::test_seam::Asserted::Operator => Ok(()),
+                crate::test_seam::Asserted::Agent(alias) => Err(format!(
+                    "caller pid {peer_pid} is test-seam agent '{alias}' — \
+                     not provably the operator"
+                )),
+                crate::test_seam::Asserted::Unproven => Err(format!(
+                    "caller pid {peer_pid} carries a test-seam 'unproven' assertion — \
+                     not provably the operator"
+                )),
+            };
+        }
         let panes = crate::peer::AgentPids::classify(self.store.pty_pane_pids().map_err(|e| {
             format!("the registered panes cannot be read to prove this connection is not one ({e})")
         })?)
@@ -3352,6 +3418,18 @@ impl Shared {
     /// node) refuses outright.
     fn connection_caller(&self, peer_pid: u32) -> Result<caller_rule::Who> {
         use caller_rule::Who;
+        // CAD-482: the frame-level assertion is the caller for this
+        // dispatch — the runner's pane/CI environment cannot leak in.
+        if let Some(asserted) = crate::test_seam::asserted() {
+            return Ok(match asserted {
+                crate::test_seam::Asserted::Operator => Who::Operator,
+                crate::test_seam::Asserted::Agent(alias) => Who::Agent(alias),
+                crate::test_seam::Asserted::Unproven => Who::Unproven(format!(
+                    "caller pid {peer_pid} carries a test-seam 'unproven' assertion \
+                     — it derives no identity"
+                )),
+            });
+        }
         self.revalidate_enrollments()?;
         if let Some(who) = self.slot_identity(peer_pid)? {
             let lane = who.lane();
@@ -9457,6 +9535,11 @@ fn handle_conn(shared: Arc<Shared>, stream: UnixStream) {
                     .and_then(Value::as_str)
                     .ok_or_else(|| Error::rejected("Missing 'method'"))?;
                 let params = frame.get("params").cloned().unwrap_or(json!({}));
+                // CAD-482: an armed fixture reads `test_caller`; the
+                // asserted identity — and nothing ambient — is the
+                // caller for this one dispatch. The field is refused
+                // everywhere else.
+                let _scope = crate::test_seam::scope_frame(shared.seam.as_ref(), &frame)?;
                 shared.dispatch(method, &params, peer_pid)
             });
         let frame = match response {
@@ -10701,6 +10784,13 @@ pub struct ServeOptions {
     /// with `lease` unset is explicitly off, which is how tests pin
     /// it); `None` reads the tracker's `hosted:` table in pm.yaml.
     pub lease: Option<crate::lease::Hosted>,
+    /// CAD-482: arm the test-only caller seam. Honored only in
+    /// `test-seam` builds; a daemon asked for it on any other build
+    /// refuses to start rather than fall back to ambient identity.
+    /// Arming mints `<state>/seam/token` — the credential asserting
+    /// callers present — and is refused for the production state dir
+    /// or a dir outside the temp root.
+    pub test_seam: bool,
 }
 
 /// What the CAD-484 checkup calls to dispatch a picked ticket to a
@@ -11016,7 +11106,14 @@ fn relaunch_agents(shared: &Arc<Shared>) -> Result<()> {
 
 /// Run the daemon in the foreground until `shutdown` or a signal.
 pub fn serve(state_dir: &Path) -> Result<()> {
-    let mut opts = ServeOptions::default();
+    // CAD-482: a spawned fixture daemon (`daemon run`/`daemon start`
+    // under the test suite) arms the seam from its environment —
+    // `env_armed` reads CADENCE_TEST_SEAM and is `false` in every
+    // build without the feature, so production never consults it.
+    let mut opts = ServeOptions {
+        test_seam: crate::test_seam::env_armed(),
+        ..ServeOptions::default()
+    };
     // CAD-546: the built-in `local` platform rides the production
     // daemon — no network, no credential; its `publish` send still
     // stages and presses like every other adapter's.
@@ -11039,13 +11136,21 @@ pub fn serve_with(state_dir: &Path, opts: ServeOptions) -> Result<()> {
     // files may be the only copy of the previous store. Every start path
     // — `daemon start`, `run`, `restart` — comes through here.
     crate::backup::refuse_interrupted_restore(state_dir)?;
+    // CAD-482: the seam confines a fixture before the lease or the
+    // store writes anything — a refused arm leaves only the singleton
+    // lock behind. A state dir still carrying a minted token re-arms:
+    // `daemon restart` respawns this process without the arming env.
+    let seam = crate::test_seam::arm_if_requested(
+        state_dir,
+        opts.test_seam || crate::test_seam::armed(state_dir),
+    )?;
     // CAD-538: a configured hosted lease is taken before the marker is
     // consumed and before the store opens — a daemon that cannot hold
     // it refuses here having written nothing but the singleton lock.
     let hosted = hosted_config(&opts)?;
     let lease = crate::lease::acquire(state_dir, &hosted)?;
     let hot = hot_restart_begin(state_dir);
-    let shared = Shared::new_leased(state_dir, &opts, hot, lease)?;
+    let shared = Shared::new_leased(state_dir, &opts, hot, lease, seam)?;
     // CAD-313: the operator secret exists from the first start, so an
     // upgrade needs no manual step. An existing file is never touched —
     // a wrong mode is refused at use, naming the fix — and a failure

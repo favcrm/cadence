@@ -133,6 +133,9 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: rustup toolchain install stable --profile minimal --component clippy
       - run: cargo clippy --all-targets --locked -- -D warnings
+      # CAD-482: the test seam's gated code is dead to a default clippy
+      # run — lint the feature-on shape too so it cannot rot.
+      - run: cargo clippy --all-targets --locked --features test-seam -- -D warnings
 
   test:
     needs: [queue-evidence]
@@ -167,15 +170,18 @@ jobs:
       # The all-targets inventory must be non-empty and exactly equal between
       # Cargo and nextest before the process-per-test runner starts. This
       # covers lib, bin and every tests/ binary; it is not one suite only.
+      # CAD-482: the suite runs under the `test-seam` feature so fixture
+      # daemons and boards exercise the asserted-identity seam (a debug
+      # build; release builds can never carry it — see the build job).
       - name: Verify all-targets inventory parity
         env:
           CARGO_BUILD_JOBS: 4
-        run: scripts/nextest-inventory all-targets
+        run: scripts/nextest-inventory all-targets --features test-seam
       - name: Run all Rust targets with pinned nextest
         env:
           CADENCE_SUITE_LOCK: ${{ runner.temp }}/cadence-suite.lock
           CARGO_BUILD_JOBS: 4
-        run: scripts/cadence-nextest --all-targets --locked
+        run: scripts/cadence-nextest --all-targets --locked --features test-seam
       # cargo-nextest intentionally does not execute Rust doctests. Keep
       # doctests visible as a separate locked Cargo step rather than silently
       # dropping that coverage from cargo test --all-targets semantics.
@@ -193,6 +199,36 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: rustup toolchain install stable --profile minimal
       - run: cargo build --release --locked
+      # CAD-482: the test seam must never reach a release binary —
+      # the canary exists only under the feature, so this grep on the
+      # shipped default-feature binary proves its bytes carry none of
+      # the seam. The step below is the guard's own tripwire: it builds
+      # the forbidden combination and asserts the compile_error fires.
+      - name: Assert the release binary carries no test seam
+        run: |
+          if grep -aq 'cadence-test-seam-v1' target/release/cadence; then
+            echo "release binary contains the CAD-482 test seam" >&2
+            exit 1
+          fi
+      # CAD-482: the grep above proves the shipped binary carries no
+      # seam, but the exclusion itself needs a tripwire — a deleted
+      # compile_error would leave this whole job green. This probe
+      # builds the forbidden combination and asserts it fails with the
+      # seam's own compile_error message (any other failure — a missing
+      # dep, a syntax error — must not count, so grep the message).
+      - name: Assert the test seam refuses a release build
+        run: |
+          log="${{ runner.temp }}/seam-release-check.log"
+          if cargo check --release --locked --features test-seam >"$log" 2>&1; then
+            echo "::error::'cargo check --release --features test-seam' succeeded — the seam's release exclusion was removed" >&2
+            exit 1
+          fi
+          cat "$log"
+          if ! grep -q 'must never be compiled into a release build' "$log"; then
+            echo "::error::release+test-seam failed, but not with the seam's compile_error — the probe must name the guard it tests" >&2
+            exit 1
+          fi
+          echo "probe ok: --release --features test-seam is refused by the seam's own compile_error"
 
   ui:
     needs: [queue-evidence]

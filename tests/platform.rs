@@ -60,6 +60,7 @@ impl Daemon {
             slots: Some(cadence_agent::slots::SlotConfig::default()),
             agent_gc: Some(daemon::AgentGcSetting::default()),
             stop: Some(stop.clone()),
+            test_seam: cfg!(feature = "test-seam"),
             ..Default::default()
         };
         let owned = state.clone();
