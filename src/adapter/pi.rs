@@ -1052,6 +1052,16 @@ export default function (pi) {
   function piHasFlag(rest, name) {
     return piFlagValue(rest, name) !== undefined || rest.includes(name);
   }
+  function piFlagCount(rest, name) {
+    const eq = name + "=";
+    let n = 0;
+    for (let i = 0; i < rest.length; i++) {
+      if (rest[i] === name || rest[i].startsWith(eq)) {
+        n++;
+      }
+    }
+    return n;
+  }
   // Backlog creation only. `--status backlog` is the one accepted
   // override; `--owner` and `--id` are operator overrides.
   function piIssueNewLimits(rest) {
@@ -1087,16 +1097,27 @@ export default function (pi) {
     if (!safe) {
       return "wiki put writes only the master's own knowledge area — `cadence wiki put agents/master/knowledge/<name>.md --file <file under master/tmp>`. global/ and every other path stay denied";
     }
+    // `-m` / `--text` is unbounded. The master writes the body with the
+    // write tool and passes one `--file` inside master/tmp.
+    if (piHasFlag(rest, "-m") || piHasFlag(rest, "--text")) {
+      return "the master does not pass -m — use the write tool into master/tmp, then --file <that path>";
+    }
     if (!piHasFlag(rest, "--file")) {
       return "wiki put takes --file from master/tmp — use the write tool into master/tmp, then --file <that path>";
     }
     return null;
   }
   // `--file` on any allowlisted verb must be a real file inside tmp.
-  // Stdin (`--file -`) and a path outside tmp name the write-tool route.
+  // One `--file` only: clap keeps the last path, so a repeated flag
+  // whose first value sits inside tmp would otherwise sneak a second
+  // path past this check. Stdin (`--file -`) and a path outside tmp
+  // name the write-tool route.
   function piFileArgLimits(rest) {
     if (!piHasFlag(rest, "--file")) {
       return null;
+    }
+    if (piFlagCount(rest, "--file") > 1) {
+      return "pass one --file — a repeated --file is refused; use the write tool into master/tmp, then --file <that path>";
     }
     const p = piFlagValue(rest, "--file");
     if (typeof p !== "string" || p.length === 0 || p === "-") {

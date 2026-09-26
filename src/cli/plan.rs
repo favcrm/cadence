@@ -93,7 +93,12 @@ pub(super) fn run_plan(state_dir: &Path, action: PlanAction) -> Result<i32> {
             match (file, workflow) {
                 (Some(file), None) => {
                     let cap = cadence_agent::issue::plan::MAX_PLAN_BYTES as u64;
-                    let text = read_body_capped(None, Some(file.clone()), cap).map_err(|e| {
+                    let text = if file.as_os_str() == "-" {
+                        read_body_capped(None, Some(file.clone()), cap)
+                    } else {
+                        cadence_agent::master::read_command_file(state_dir, &file, cap)
+                    }
+                    .map_err(|e| {
                         Error::rejected(format!("Cannot read plan {}: {e}", file.display()))
                     })?;
                     params["text"] = json!(text);

@@ -112,7 +112,11 @@ pub(super) fn run_master(state_dir: &Path, action: MasterAction) -> Result<i32> 
         }
         MasterAction::Edit { name, file } => {
             let cap = (cadence_agent::master::AGENT_MAX_CHARS * 4) as u64;
-            let text = read_body_capped(None, Some(file), cap)?;
+            let text = if file.as_os_str() == "-" {
+                read_body_capped(None, Some(file), cap)?
+            } else {
+                cadence_agent::master::read_command_file(state_dir, &file, cap)?
+            };
             client::rpc(
                 state_dir,
                 "agent_file_write",
@@ -129,7 +133,11 @@ pub(super) fn run_master(state_dir: &Path, action: MasterAction) -> Result<i32> 
             question,
             file,
         } => {
-            let summary = read_body_capped(None, Some(file), 4 * 4_000)?;
+            let summary = if file.as_os_str() == "-" {
+                read_body_capped(None, Some(file), 4 * 4_000)?
+            } else {
+                cadence_agent::master::read_command_file(state_dir, &file, 4 * 4_000)?
+            };
             client::rpc(
                 state_dir,
                 "question_escalate",
