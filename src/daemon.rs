@@ -354,9 +354,10 @@ pub struct Shared {
     router_backlog: std::sync::atomic::AtomicUsize,
     /// CAD-339: serializes writers of the escalation record.
     escalation_lock: Mutex<()>,
-    /// CAD-615: grant-execution token → the pid of the child this
-    /// daemon spawned to run an approved command. Not a request field.
-    perm_exec: Mutex<HashMap<String, u32>>,
+    /// CAD-615: grant-execution token → the child this daemon spawned
+    /// and the argv that child is allowed to run. A descendant, or a
+    /// different argv, is not the operator.
+    perm_exec: Mutex<HashMap<String, identity::GrantExec>>,
     /// CAD-339: serializes `master_dispatch` — the ticket's `ready`
     /// check and its dispatch are one step, so concurrent calls for a
     /// ticket dispatch it once.

@@ -166,6 +166,69 @@ fn master_allow_once_is_exact_and_single_use() {
     );
 }
 
+/// Eight concurrent `master_permission_use` calls — the path the Pi
+/// guard takes for `ls`/`cat`/`grep`/`find` — consume the grant once.
+#[cfg(feature = "test-seam")]
+#[test]
+fn concurrent_permission_use_succeeds_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+
+    let f = PlanFixture::start();
+    test_env().set(cadence_agent::master::TEST_NO_LANDLOCK, "1");
+    let _pi = f.d.mock_pi("normal");
+    f.d.operator_rpc(
+        "master_start",
+        json!({"provider": "pi", "unconfined": true}),
+    )
+    .expect("master starts");
+
+    let repo = f
+        .pm_dir
+        .parent()
+        .unwrap()
+        .join("repo")
+        .canonicalize()
+        .unwrap();
+    let file = repo.join("f");
+    let argv = vec!["ls".to_string(), file.to_string_lossy().to_string()];
+    let cwd = repo.to_string_lossy().to_string();
+    let filed =
+        f.d.agent_rpc(
+            "master",
+            "master_ask_permission",
+            json!({"argv": argv, "cwd": cwd, "reason": "read a project file"}),
+        )
+        .expect("master files");
+    let id = filed["id"].as_str().unwrap();
+    f.d.operator_rpc("master_permission_allow_once", json!({"id": id}))
+        .expect("operator allows once");
+
+    let state = f.d.state.clone();
+    let params = json!({"argv": argv, "cwd": cwd});
+    let wins = Arc::new(AtomicUsize::new(0));
+    let mut threads = Vec::new();
+    for _ in 0..8 {
+        let state = state.clone();
+        let params = params.clone();
+        let wins = Arc::clone(&wins);
+        threads.push(thread::spawn(move || {
+            let out = cadence_agent::test_seam::scoped(
+                cadence_agent::test_seam::Asserted::Agent("master".to_string()),
+                || cadence_agent::client::rpc(&state, "master_permission_use", params),
+            );
+            if out.ok().and_then(|v| v["applied"].as_bool()) == Some(true) {
+                wins.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+    }
+    for t in threads {
+        t.join().unwrap();
+    }
+    assert_eq!(wins.load(Ordering::SeqCst), 1);
+}
+
 /// The board's permission routes are operator-only. An unsigned write
 /// and an agent write are refused; the operator's forged id is the
 /// daemon's refusal, not a grant.
@@ -210,4 +273,41 @@ fn http_permission_routes_are_operator_only() {
 
     let listed = op::raw(port, &session.request("GET", "/api/master/permissions", ""));
     assert_eq!(listed.0, 200, "{} {}", listed.0, listed.2);
+
+    // The board relays over its own daemon connection. A request that
+    // asserts the operator seam but holds no session must still be
+    // refused here — otherwise any client of an operator board receives
+    // the pending argv.
+    let relayed = op::assert_as(
+        op::request(
+            "GET",
+            "/api/master/permissions",
+            &host,
+            Some(&format!("http://{host}")),
+            None,
+            "",
+        ),
+        &f.d.state,
+        "operator",
+    );
+    let (status, _, body) = op::raw(port, &relayed);
+    assert!(
+        status == 401 || status == 403,
+        "operator seam without a session {status} {body}"
+    );
+
+    let agent_get = op::assert_as(
+        op::request(
+            "GET",
+            "/api/master/permissions",
+            &host,
+            Some(&format!("http://{host}")),
+            None,
+            "",
+        ),
+        &f.d.state,
+        "agent:worker",
+    );
+    let (status, _, body) = op::raw(port, &agent_get);
+    assert!(status == 401 || status == 403, "agent get {status} {body}");
 }

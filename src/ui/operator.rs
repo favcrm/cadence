@@ -292,6 +292,43 @@ pub(super) fn admit(
     Ok(Some(caller))
 }
 
+/// Operator-only read of `/api/master/permissions`. The board relays
+/// the list over its own daemon connection, so the HTTP peer must be
+/// the operator — the same caller check as an OperatorOnly write,
+/// without the write content-type guard (a same-origin GET does not
+/// send one).
+pub(super) fn admit_operator_read(
+    request: &Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+) -> Result<(), HttpResp> {
+    let caller = board_caller(request, state_dir, opts, false)?;
+    match &caller {
+        Caller::Agent(alias) => Err(guard_fail(
+            "operator_only",
+            &format!(
+                "GET /api/master/permissions is the operator's decision — this request comes \
+                 from agent '{alias}'; decide from the operator's browser"
+            ),
+        )),
+        Caller::Named(named) if !named.operator => Err(guard_fail(
+            "member_role",
+            &format!(
+                "GET /api/master/permissions needs the board owner's role — this session is \
+                 {}'s, mapped `member`",
+                named.actor
+            ),
+        )),
+        Caller::Named(_) => Ok(()),
+        Caller::Operator(_) => super::home::prove_operator_peer(
+            request,
+            state_dir,
+            opts,
+            "GET /api/master/permissions",
+        ),
+    }
+}
+
 /// A public session's user as a board caller (CAD-526): what a verified
 /// assertion proved, kept to the attribution fields a write needs.
 #[derive(Debug, Clone, PartialEq, Eq)]

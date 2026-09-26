@@ -3023,19 +3023,26 @@ fn permission_replay(state_dir: &Path, cli: &Cli) -> Option<i32> {
     if std::env::var_os("CADENCE_GRANT_TOKEN").is_some() {
         return None;
     }
-    match &cli.command {
-        Commands::Master {
-            action:
-                master::MasterAction::AskPermission { .. } | master::MasterAction::PeekGrant { .. },
-        } => return None,
-        _ => {}
+    if let Commands::Master {
+        action:
+            master::MasterAction::AskPermission { .. }
+            | master::MasterAction::PeekGrant { .. }
+            | master::MasterAction::UseGrant { .. },
+    } = &cli.command
+    {
+        return None;
     }
     let mut argv = vec!["cadence".to_string()];
     argv.extend(std::env::args().skip(1));
-    if cadence_agent::master_perm::allowlisted(&argv) {
-        return None;
-    }
     let cwd = std::env::current_dir().ok()?;
+    match cadence_agent::master_perm::classify(&argv, &cwd, &[], std::slice::from_ref(&state_dir)) {
+        cadence_agent::master_perm::Class::Allowlisted => return None,
+        cadence_agent::master_perm::Class::Never { why } => {
+            eprintln!("{why} — a grant or a rule cannot allow it");
+            return Some(1);
+        }
+        _ => {}
+    }
     match client::rpc(
         state_dir,
         "master_permission_use",

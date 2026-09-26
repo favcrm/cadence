@@ -1008,8 +1008,14 @@ export default function (pi) {
       return false;
     }
     const argv = cmd.split(" ").filter((t) => t.length > 0);
+    const tool = argv[0];
+    // ls/cat/grep/find never re-enter this CLI, so a peek would leave
+    // the single-use grant live for every later call. Consume it first.
+    const verb = tool === "ls" || tool === "cat" || tool === "grep" || tool === "find"
+      ? "use-grant"
+      : "peek-grant";
     try {
-      const r = spawnSync("cadence", ["master", "peek-grant", "--"].concat(argv), {
+      const r = spawnSync("cadence", ["master", verb, "--"].concat(argv), {
         encoding: "utf8",
         timeout: 8000,
         cwd: process.cwd(),

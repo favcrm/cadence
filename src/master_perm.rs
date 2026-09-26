@@ -300,7 +300,7 @@ pub fn allowlisted(argv: &[String]) -> bool {
             None => (inner, false),
         };
         let want: Vec<&str> = stem.split_whitespace().skip(1).collect();
-        if want.len() < 1 {
+        if want.is_empty() {
             continue;
         }
         let prefix_ok = want
@@ -321,7 +321,7 @@ pub fn allowlisted(argv: &[String]) -> bool {
 
 fn never_why(argv: &[String], cwd: &Path, state_dirs: &[&Path]) -> Option<&'static str> {
     let tokens: Vec<&str> = argv.iter().map(|s| tool_name(s)).collect();
-    let has = |w: &str| tokens.iter().any(|t| *t == w);
+    let has = |w: &str| tokens.contains(&w);
     let cadence = is_cadence(argv.first().map(String::as_str).unwrap_or(""));
     if has("merge") && (cadence || tokens.first() == Some(&"git")) {
         return Some("merge is never requestable");
@@ -351,7 +351,7 @@ fn never_why(argv: &[String], cwd: &Path, state_dirs: &[&Path]) -> Option<&'stat
     {
         return Some("audit approve is never requestable");
     }
-    if argv.iter().any(|a| protected_file(a)) {
+    if argv.iter().any(|a| protected_file(a)) || edit_target_protected(argv) {
         return Some("the master's SOUL.md, AGENT.md and permissions.yaml are never requestable");
     }
     if touches_state(argv, cwd, state_dirs) {
@@ -360,41 +360,151 @@ fn never_why(argv: &[String], cwd: &Path, state_dirs: &[&Path]) -> Option<&'stat
     None
 }
 
+/// Drop `.` and `..` so `agents/master/foo/../SOUL.md` is the same
+/// file as `agents/master/SOUL.md`. The file does not have to exist.
+fn lexical_clean(arg: &str) -> String {
+    let flat = arg.replace('\\', "/");
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in flat.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    parts.join("/")
+}
+
+fn protected_name(name: &str) -> bool {
+    matches!(name, "SOUL.md" | "AGENT.md" | "permissions.yaml")
+}
+
 fn protected_file(arg: &str) -> bool {
-    let path = arg.replace('\\', "/");
-    path.contains("agents/master/SOUL.md")
-        || path.contains("agents/master/AGENT.md")
-        || path.contains("agents/master/permissions.yaml")
-        || path.ends_with("/permissions.yaml") && path.contains("agents/master")
+    let path = lexical_clean(arg);
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    segs.len() >= 3
+        && segs[segs.len() - 3] == "agents"
+        && segs[segs.len() - 2] == "master"
+        && protected_name(segs[segs.len() - 1])
+}
+
+/// `cadence master edit SOUL.md` names the file as an argument, not a path.
+fn edit_target_protected(argv: &[String]) -> bool {
+    let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+    args.windows(3)
+        .any(|w| w[0] == "master" && w[1] == "edit" && protected_name(w[2]))
+}
+
+fn state_root(dir: &Path) -> PathBuf {
+    fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
+}
+
+fn is_state_root(arg: &str, cwd: &Path, state_dirs: &[&Path]) -> bool {
+    let path = Path::new(arg);
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    let canon = fs::canonicalize(&abs).unwrap_or(abs);
+    state_dirs.iter().any(|dir| canon == state_root(dir))
+}
+
+/// The master's own scratch (`state/master/tmp` and `state/master/cwd`)
+/// is where its plan files and shell cwd live. Other state paths stay
+/// never-requestable.
+fn under_master_scratch(canon: &Path, state_dirs: &[&Path]) -> bool {
+    state_dirs.iter().any(|dir| {
+        let root = state_root(dir);
+        ["tmp", "cwd"].iter().any(|name| {
+            let base = root.join("master").join(name);
+            canon == base || canon.starts_with(&base)
+        })
+    })
+}
+
+/// Drop `--state-dir <this daemon>` so an allowlisted verb still matches
+/// when the master tool line names the daemon's own state dir.
+fn strip_own_state_dir(argv: &[String], cwd: &Path, state_dirs: &[&Path]) -> Vec<String> {
+    let mut out = Vec::with_capacity(argv.len());
+    let mut i = 0;
+    while i < argv.len() {
+        let arg = &argv[i];
+        if arg == "--state-dir" {
+            if i + 1 < argv.len() && is_state_root(&argv[i + 1], cwd, state_dirs) {
+                i += 2;
+                continue;
+            }
+        } else if let Some(val) = arg.strip_prefix("--state-dir=") {
+            if is_state_root(val, cwd, state_dirs) {
+                i += 1;
+                continue;
+            }
+        }
+        out.push(arg.clone());
+        i += 1;
+    }
+    out
 }
 
 fn touches_state(argv: &[String], cwd: &Path, state_dirs: &[&Path]) -> bool {
     // The master's cwd is inside the state dir (`master/cwd`). That
     // fact is not a path the command touches — only arguments that
-    // resolve into a state dir are.
+    // resolve into a state dir are. This daemon's own `--state-dir`
+    // value, and files under `state/master/tmp` or `state/master/cwd`,
+    // are the master's tool line, not a reach into the state dir.
     let mut probes = Vec::new();
-    for arg in argv {
+    let mut i = 0;
+    while i < argv.len() {
+        let arg = &argv[i];
+        if arg == "--state-dir" {
+            if i + 1 < argv.len() {
+                let val = &argv[i + 1];
+                if !is_state_root(val, cwd, state_dirs) {
+                    probes.push(probe_path(val, cwd));
+                }
+                i += 2;
+                continue;
+            }
+        } else if let Some(val) = arg.strip_prefix("--state-dir=") {
+            if !is_state_root(val, cwd, state_dirs) {
+                probes.push(probe_path(val, cwd));
+            }
+            i += 1;
+            continue;
+        }
         if arg.starts_with('/') || arg.starts_with('.') {
-            probes.push(if Path::new(arg).is_absolute() {
-                PathBuf::from(arg)
-            } else {
-                cwd.join(arg)
-            });
+            probes.push(probe_path(arg, cwd));
         }
         if arg.contains(".local/state/cadence") || arg.contains(".local/share/cadence") {
             return true;
         }
+        i += 1;
     }
     for probe in probes {
         let canon = fs::canonicalize(&probe).unwrap_or(probe);
+        if under_master_scratch(&canon, state_dirs) {
+            continue;
+        }
         for dir in state_dirs {
-            let root = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+            let root = state_root(dir);
             if canon == root || canon.starts_with(&root) {
                 return true;
             }
         }
     }
     false
+}
+
+fn probe_path(arg: &str, cwd: &Path) -> PathBuf {
+    let path = Path::new(arg);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    }
 }
 
 fn risk_of(argv: &[String]) -> Risk {
@@ -440,7 +550,7 @@ pub fn classify(argv: &[String], cwd: &Path, checkouts: &[PathBuf], state_dirs: 
     if let Some(why) = never_why(argv, cwd, state_dirs) {
         return Class::Never { why };
     }
-    if allowlisted(argv) {
+    if allowlisted(&strip_own_state_dir(argv, cwd, state_dirs)) {
         return Class::Allowlisted;
     }
     if is_cadence(argv.first().map(String::as_str).unwrap_or("")) {
@@ -535,6 +645,7 @@ fn with_doc<T>(state_dir: &Path, now: i64, f: impl FnOnce(&mut Doc) -> Result<T>
 }
 
 /// A pending request for this exact argv and cwd, if one is still live.
+#[allow(clippy::too_many_arguments)]
 pub fn ask(
     state_dir: &Path,
     argv: &[String],
@@ -560,17 +671,13 @@ pub fn ask(
     let argv = normalize_argv(argv);
     let argv = argv.as_slice();
     match classify(argv, &cwd, checkouts, state_dirs) {
-        Class::Allowlisted => {
-            return Err(Error::rejected(
-                "that command is already allowlisted — run it, do not ask",
-            ))
-        }
-        Class::Never { why } => {
-            return Err(Error::rejected(format!(
-                "{why} — it cannot be approved and no permission rule can cover it"
-            )))
-        }
-        Class::IllFormed { why } => return Err(Error::rejected(why)),
+        Class::Allowlisted => Err(Error::rejected(
+            "that command is already allowlisted — run it, do not ask",
+        )),
+        Class::Never { why } => Err(Error::rejected(format!(
+            "{why} — it cannot be approved and no permission rule can cover it"
+        ))),
+        Class::IllFormed { why } => Err(Error::rejected(why)),
         Class::Requestable { risk } => {
             let cwd_s = cwd.to_string_lossy().into_owned();
             with_doc(state_dir, now, |doc| {
@@ -622,14 +729,40 @@ fn pending<'a>(doc: &'a mut Doc, id: &str, now: i64) -> Result<&'a mut Request> 
     Ok(req)
 }
 
-/// Allow the request's exact argv and cwd once.
-pub fn allow_once(state_dir: &Path, id: &str, now: i64) -> Result<Request> {
+fn refuse_never(req: &Request, checkouts: &[PathBuf], state_dirs: &[&Path]) -> Result<()> {
+    if let Class::Never { why } = classify(&req.argv, Path::new(&req.cwd), checkouts, state_dirs) {
+        return Err(Error::rejected(format!(
+            "{why} — it cannot be approved and no permission rule can cover it"
+        )));
+    }
+    Ok(())
+}
+
+/// Allow the request's exact argv and cwd once. The never-list is
+/// checked again here: a planted pending request is not a grant.
+#[allow(clippy::too_many_arguments)]
+pub fn allow_once(
+    state_dir: &Path,
+    id: &str,
+    checkouts: &[PathBuf],
+    state_dirs: &[&Path],
+    now: i64,
+) -> Result<Request> {
     with_doc(state_dir, now, |doc| {
-        let req = pending(doc, id, now)?;
-        req.status = "allowed".into();
-        req.decision = "allow_once".into();
-        req.decision_label = format!("Allowed once by operator {}", decision_hm(now));
-        let req = req.clone();
+        let req = pending(doc, id, now)?.clone();
+        refuse_never(&req, checkouts, state_dirs)?;
+        let stored = doc
+            .requests
+            .iter_mut()
+            .find(|r| r.id == id)
+            .expect("pending");
+        stored.status = "allowed".into();
+        stored.decision = "allow_once".into();
+        stored.decision_label = format!("Allowed once by operator {}", decision_hm(now));
+        let mut req = req;
+        req.status = stored.status.clone();
+        req.decision = stored.decision.clone();
+        req.decision_label = stored.decision_label.clone();
         doc.grants.push(Grant {
             id: fresh_id("mg"),
             request_id: req.id.clone(),
@@ -660,7 +793,12 @@ pub fn validate_pattern(pat: &str) -> Result<()> {
         )));
     }
     let stem = &pat[..pat.len() - 1];
-    if stem.is_empty() || arg_ok(stem) {
+    if stem.is_empty() {
+        return Err(Error::rejected(
+            "a wildcard needs a stem — a bare '*' would match every argument",
+        ));
+    }
+    if arg_ok(stem) {
         Ok(())
     } else {
         Err(Error::rejected(format!(
@@ -669,9 +807,22 @@ pub fn validate_pattern(pat: &str) -> Result<()> {
     }
 }
 
+fn dot_segment(s: &str) -> bool {
+    s.split(['/', '\\']).any(|seg| seg == "." || seg == "..")
+}
+
 fn pattern_matches(pat: &str, arg: &str) -> bool {
+    if dot_segment(arg) || dot_segment(pat) {
+        return false;
+    }
     match pat.strip_suffix('*') {
-        Some(stem) => arg.starts_with(stem),
+        Some(stem) => {
+            !stem.is_empty()
+                && arg.starts_with(stem)
+                && (stem.ends_with('/')
+                    || arg.len() == stem.len()
+                    || arg[stem.len()..].starts_with('/'))
+        }
         None => pat == arg,
     }
 }
@@ -736,15 +887,20 @@ fn rule_matches(rule: &Rule, argv: &[String], cwd: &str) -> bool {
 
 /// Save an allow rule (exact or prefix) for a pending request. The
 /// caller writes the yaml; this returns the rule and marks the request.
+/// A never-list command cannot become a rule.
+#[allow(clippy::too_many_arguments)]
 pub fn always_rule(
     state_dir: &Path,
     id: &str,
     scope: Scope,
     tail: &[String],
+    checkouts: &[PathBuf],
+    state_dirs: &[&Path],
     now: i64,
 ) -> Result<(Request, Rule)> {
     with_doc(state_dir, now, |doc| {
         let req = pending(doc, id, now)?.clone();
+        refuse_never(&req, checkouts, state_dirs)?;
         let (head, tail) = match &scope {
             Scope::Exact => (req.argv.clone(), vec![]),
             Scope::Prefix => {
@@ -858,6 +1014,39 @@ pub fn read_rules(pm_dir: &Path, alias: &str) -> Result<Vec<Rule>> {
     load_rules(pm_dir, alias)
 }
 
+/// Rules that still match. A hand-edited file can carry an empty stem,
+/// a mid-argument `*`, or a never-list command; those rules are dropped
+/// here so they cannot allow anything. `read_rules` still returns them
+/// so the operator can revoke the row.
+fn live_rules(pm_dir: &Path, alias: &str, state_dirs: &[&Path]) -> Result<Vec<Rule>> {
+    let rules = load_rules(pm_dir, alias)?;
+    Ok(rules
+        .into_iter()
+        .filter(|rule| rule_live(rule, state_dirs))
+        .collect())
+}
+
+fn rule_live(rule: &Rule, state_dirs: &[&Path]) -> bool {
+    if check_rule_shape(&rule.argv, &rule.tail, &rule.scope).is_err() {
+        return false;
+    }
+    let mut probe = rule.argv.clone();
+    for pat in &rule.tail {
+        if pat.contains('*') {
+            let Some(stem) = pat.strip_suffix('*').filter(|s| !s.is_empty()) else {
+                return false;
+            };
+            probe.push(stem.to_string());
+        } else {
+            probe.push(pat.clone());
+        }
+    }
+    !matches!(
+        classify(&probe, Path::new(&rule.cwd), &[], state_dirs),
+        Class::Never { .. }
+    )
+}
+
 pub fn write_rules(pm_dir: &Path, alias: &str, rules: &[Rule]) -> Result<PathBuf> {
     let path = rules_file(pm_dir, alias)?;
     if path.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
@@ -911,10 +1100,10 @@ pub fn peek(
     state_dirs: &[&Path],
     now: i64,
 ) -> Result<bool> {
-    Ok(matches!(
-        decide_use(state_dir, pm_dir, argv, cwd, checkouts, state_dirs, now, false)?,
-        Some(_)
-    ))
+    Ok(decide_use(
+        state_dir, pm_dir, argv, cwd, checkouts, state_dirs, now, false,
+    )?
+    .is_some())
 }
 
 /// Consume a single-use grant, or match an allow rule. A deny rule
@@ -935,6 +1124,7 @@ pub fn take(
     .ok_or_else(|| Error::rejected("no live permission for that exact command and directory"))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decide_use(
     state_dir: &Path,
     pm_dir: Option<&Path>,
@@ -959,7 +1149,7 @@ fn decide_use(
     }
     let cwd_s = cwd.to_string_lossy().into_owned();
     let rules = match pm_dir {
-        Some(dir) => load_rules(dir, crate::master::ALIAS)?,
+        Some(dir) => live_rules(dir, crate::master::ALIAS, state_dirs)?,
         None => Vec::new(),
     };
     if rules
@@ -1214,7 +1404,7 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("only the master"), "{err}");
-        let err = allow_once(dir.path(), "mp-forged", 1_000)
+        let err = allow_once(dir.path(), "mp-forged", &[], &[dir.path()], 1_000)
             .unwrap_err()
             .to_string();
         assert!(err.contains("no permission request"), "{err}");
@@ -1241,7 +1431,7 @@ mod tests {
             1_000,
         )
         .unwrap();
-        allow_once(dir.path(), &req.id, 1_000).unwrap();
+        allow_once(dir.path(), &req.id, &[], &[dir.path()], 1_000).unwrap();
         let other = vec![
             "cadence".into(),
             "issue".into(),
@@ -1284,7 +1474,7 @@ mod tests {
             2_000,
         )
         .unwrap();
-        allow_once(dir.path(), &req.id, 2_000).unwrap();
+        allow_once(dir.path(), &req.id, &[], &[dir.path()], 2_000).unwrap();
         let err = take(
             dir.path(),
             None,
@@ -1320,7 +1510,7 @@ mod tests {
             5_000,
         )
         .unwrap();
-        allow_once(dir.path(), &req.id, 5_000).unwrap();
+        allow_once(dir.path(), &req.id, &[], &[dir.path()], 5_000).unwrap();
         let wins = Arc::new(AtomicUsize::new(0));
         let mut threads = Vec::new();
         for _ in 0..8 {
@@ -1403,6 +1593,8 @@ mod tests {
             &req.id,
             Scope::Prefix,
             &["agents/master/knowledge/*".into()],
+            &[],
+            &[dir.path()],
             3_000,
         )
         .unwrap();
@@ -1499,8 +1691,17 @@ mod tests {
             4_000,
         )
         .unwrap();
-        let (_r, rule) = always_rule(dir.path(), &req.id, Scope::Exact, &[], 4_000).unwrap();
-        write_rules(&pm, "master", &[rule.clone()]).unwrap();
+        let (_r, rule) = always_rule(
+            dir.path(),
+            &req.id,
+            Scope::Exact,
+            &[],
+            &[],
+            &[dir.path()],
+            4_000,
+        )
+        .unwrap();
+        write_rules(&pm, "master", std::slice::from_ref(&rule)).unwrap();
         assert!(peek(
             dir.path(),
             Some(pm.as_path()),
@@ -1545,7 +1746,7 @@ mod tests {
             100,
         )
         .unwrap();
-        let err = allow_once(dir.path(), &req.id, 100 + TTL_SECS)
+        let err = allow_once(dir.path(), &req.id, &[], &[dir.path()], 100 + TTL_SECS)
             .unwrap_err()
             .to_string();
         assert!(err.contains("expired"), "{err}");
@@ -1572,8 +1773,8 @@ mod tests {
             1_000,
         )
         .unwrap();
-        allow_once(dir.path(), &req.id, 1_000).unwrap();
-        let again = allow_once(dir.path(), &req.id, 1_001)
+        allow_once(dir.path(), &req.id, &[], &[dir.path()], 1_000).unwrap();
+        let again = allow_once(dir.path(), &req.id, &[], &[dir.path()], 1_001)
             .unwrap_err()
             .to_string();
         assert!(again.contains("cannot be decided again"), "{again}");
@@ -1585,6 +1786,275 @@ mod tests {
                 .starts_with("Allowed once by operator "),
             "{}",
             listed[0].decision_label
+        );
+    }
+
+    /// The master's tool line names this daemon's state dir, and plan
+    /// files live under `state/master/tmp`. Those are not a reach into
+    /// the state dir. A different path that resolves into state still is.
+    #[test]
+    fn own_state_dir_and_master_scratch_are_not_untouchable() {
+        let dir = tmp();
+        let state = dir.path().join("state");
+        let scratch = state.join("master").join("tmp");
+        fs::create_dir_all(&scratch).unwrap();
+        let plan = scratch.join("plan.md");
+        fs::write(&plan, "# plan\n").unwrap();
+        let cwd = fs::canonicalize(dir.path()).unwrap();
+        let state = fs::canonicalize(&state).unwrap();
+        let plan = fs::canonicalize(&plan).unwrap();
+        let argv = vec![
+            "cadence".into(),
+            "--state-dir".into(),
+            state.to_string_lossy().into_owned(),
+            "plan".into(),
+            "propose".into(),
+            "--file".into(),
+            plan.to_string_lossy().into_owned(),
+        ];
+        let class = classify(&argv, &cwd, &[], &[state.as_path()]);
+        assert!(
+            matches!(class, Class::Allowlisted),
+            "own --state-dir and master/tmp must stay allowlisted, got {class:?}"
+        );
+        let secret = state.join("secrets");
+        fs::create_dir_all(&secret).unwrap();
+        let secret_file = secret.join("token");
+        fs::write(&secret_file, "x").unwrap();
+        let argv = vec![
+            "cadence".into(),
+            "--state-dir".into(),
+            state.to_string_lossy().into_owned(),
+            "wiki".into(),
+            "put".into(),
+            secret_file.to_string_lossy().into_owned(),
+        ];
+        let class = classify(&argv, &cwd, &[], &[state.as_path()]);
+        assert!(
+            matches!(class, Class::Never { .. }),
+            "a path elsewhere in state stays never-requestable, got {class:?}"
+        );
+    }
+
+    /// A prefix rule matches on a path-segment boundary and never across
+    /// `.` or `..`. A cleaned `agents/master/../SOUL.md` is protected.
+    #[test]
+    fn prefix_rule_rejects_dot_segments_and_mid_segment() {
+        let dir = tmp();
+        let pm = dir.path().join("pm");
+        fs::create_dir_all(&pm).unwrap();
+        let cwd = fs::canonicalize(dir.path()).unwrap();
+        let argv = vec![
+            "cadence".into(),
+            "wiki".into(),
+            "put".into(),
+            "agents/master/knowledge/a.md".into(),
+        ];
+        let req = ask(
+            dir.path(),
+            &argv,
+            &cwd,
+            "write a page",
+            "master",
+            &[],
+            &[dir.path()],
+            3_000,
+        )
+        .unwrap();
+        let (_req, allow) = always_rule(
+            dir.path(),
+            &req.id,
+            Scope::Prefix,
+            &["agents/master/knowledge/*".into()],
+            &[],
+            &[dir.path()],
+            3_000,
+        )
+        .unwrap();
+        write_rules(&pm, "master", &[allow]).unwrap();
+        let crossed = vec![
+            "cadence".into(),
+            "wiki".into(),
+            "put".into(),
+            "agents/master/knowledge/../knowledge/b.md".into(),
+        ];
+        assert!(
+            !peek(
+                dir.path(),
+                Some(pm.as_path()),
+                &crossed,
+                &cwd,
+                &[],
+                &[dir.path()],
+                3_001,
+            )
+            .unwrap(),
+            "a .. segment must not match a prefix rule"
+        );
+        let wide = Rule {
+            id: "mr-wide".into(),
+            effect: Effect::Allow,
+            scope: Scope::Prefix,
+            argv: vec!["cadence".into(), "wiki".into(), "put".into()],
+            tail: vec!["agents/master/knowledge*".into()],
+            cwd: cwd.to_string_lossy().into_owned(),
+            by: "operator".into(),
+            at: 3_000,
+        };
+        write_rules(&pm, "master", &[wide]).unwrap();
+        let mid = vec![
+            "cadence".into(),
+            "wiki".into(),
+            "put".into(),
+            "agents/master/knowledgeX".into(),
+        ];
+        assert!(
+            !peek(
+                dir.path(),
+                Some(pm.as_path()),
+                &mid,
+                &cwd,
+                &[],
+                &[dir.path()],
+                3_002,
+            )
+            .unwrap(),
+            "knowledge* must not match knowledgeX"
+        );
+        let soul = classify(
+            &[
+                "cadence".into(),
+                "wiki".into(),
+                "put".into(),
+                "agents/master/./SOUL.md".into(),
+            ],
+            &cwd,
+            &[],
+            &[dir.path()],
+        );
+        assert!(
+            matches!(soul, Class::Never { .. }),
+            "a cleaned SOUL.md path is protected, got {soul:?}"
+        );
+    }
+
+    /// `cadence master edit SOUL.md` is never requestable, and a planted
+    /// pending request cannot be allowed once.
+    #[test]
+    fn master_edit_of_soul_is_never_and_allow_once_rechecks() {
+        let dir = tmp();
+        let cwd = fs::canonicalize(dir.path()).unwrap();
+        let argv = vec![
+            "cadence".into(),
+            "master".into(),
+            "edit".into(),
+            "SOUL.md".into(),
+            "--file".into(),
+            "replacement.md".into(),
+        ];
+        let class = classify(&argv, &cwd, &[], &[dir.path()]);
+        assert!(matches!(class, Class::Never { .. }), "{class:?}");
+        let mut doc = Doc::default();
+        doc.requests.push(Request {
+            id: "mp-soul".into(),
+            argv: argv.clone(),
+            cwd: cwd.to_string_lossy().into_owned(),
+            reason: "planted".into(),
+            requested_by: "master".into(),
+            created: 1_000,
+            expires_at: 1_000 + TTL_SECS,
+            status: "pending".into(),
+            risk: Risk::High,
+            decision: String::new(),
+            decision_label: String::new(),
+        });
+        save_doc(dir.path(), &doc).unwrap();
+        let err = allow_once(dir.path(), "mp-soul", &[], &[dir.path()], 1_001)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("never requestable") || err.contains("cannot be approved"),
+            "{err}"
+        );
+    }
+
+    /// A hand-edited `*` tail and a never-list allow rule are not live.
+    #[test]
+    fn load_rules_drops_bad_shape_and_the_never_list() {
+        let dir = tmp();
+        let pm = dir.path().join("pm");
+        fs::create_dir_all(pm.join("agents/master")).unwrap();
+        let cwd = fs::canonicalize(dir.path()).unwrap();
+        let cwd_s = cwd.to_string_lossy().into_owned();
+        let star = Rule {
+            id: "mr-star".into(),
+            effect: Effect::Allow,
+            scope: Scope::Prefix,
+            argv: vec!["cadence".into(), "wiki".into(), "put".into()],
+            tail: vec!["*".into()],
+            cwd: cwd_s.clone(),
+            by: "operator".into(),
+            at: 1,
+        };
+        let soul = Rule {
+            id: "mr-soul".into(),
+            effect: Effect::Allow,
+            scope: Scope::Exact,
+            argv: vec![
+                "cadence".into(),
+                "master".into(),
+                "edit".into(),
+                "AGENT.md".into(),
+            ],
+            tail: vec![],
+            cwd: cwd_s.clone(),
+            by: "operator".into(),
+            at: 1,
+        };
+        let mid = Rule {
+            id: "mr-mid".into(),
+            effect: Effect::Allow,
+            scope: Scope::Prefix,
+            argv: vec!["cadence".into(), "wiki".into(), "put".into()],
+            tail: vec!["agents/master/know*ledge".into()],
+            cwd: cwd_s,
+            by: "operator".into(),
+            at: 1,
+        };
+        // write_rules goes through serde, which will store the bad tails.
+        // Bypass check_rule_shape the way a hand edit does.
+        let path = rules_file(&pm, "master").unwrap();
+        fs::write(
+            &path,
+            serde_yaml::to_string(&RulesFile {
+                rules: vec![star, soul, mid],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let live = live_rules(&pm, "master", &[dir.path()]).unwrap();
+        assert!(
+            live.is_empty(),
+            "empty stem, mid-argument * and a never-list rule must not load: {live:?}"
+        );
+        let argv = vec![
+            "cadence".into(),
+            "wiki".into(),
+            "put".into(),
+            "agents/master/knowledge/a.md".into(),
+        ];
+        assert!(
+            !peek(
+                dir.path(),
+                Some(pm.as_path()),
+                &argv,
+                &cwd,
+                &[],
+                &[dir.path()],
+                2,
+            )
+            .unwrap(),
+            "a bare * must not allow the command"
         );
     }
 }

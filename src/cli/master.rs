@@ -90,9 +90,18 @@ pub(crate) enum MasterAction {
         argv: Vec<String>,
     },
     /// Does a live grant cover this exact command? Master only. The
-    /// guard calls it; exit 0 means yes.
+    /// guard calls it for cadence verbs; exit 0 means yes. Read-only
+    /// tools use `use-grant`, which consumes.
     #[command(hide = true)]
     PeekGrant {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        argv: Vec<String>,
+    },
+    /// Consume a single-use grant (or match an allow rule) and run the
+    /// command. Master only. The guard calls this for `ls`/`cat`/`grep`/
+    /// `find`, which never re-enter this CLI. Exit 0 only when applied.
+    #[command(hide = true)]
+    UseGrant {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         argv: Vec<String>,
     },
@@ -210,6 +219,23 @@ pub(super) fn run_master(state_dir: &Path, action: MasterAction) -> Result<i32> 
                 "master_peek_grant",
                 json!({"argv": argv, "cwd": cwd}),
             )?
+        }
+        MasterAction::UseGrant { argv } => {
+            let cwd = std::env::current_dir().map_err(|e| {
+                cadence_agent::error::Error::rejected(format!("cwd is unreadable: {e}"))
+            })?;
+            let out = client::rpc(
+                state_dir,
+                "master_permission_use",
+                json!({"argv": argv, "cwd": cwd}),
+            )?;
+            let code = if out["applied"].as_bool() == Some(true) {
+                0
+            } else {
+                1
+            };
+            print_json(&out);
+            return Ok(code);
         }
         MasterAction::AllowOnce { id } => {
             client::rpc(state_dir, "master_permission_allow_once", json!({"id": id}))?

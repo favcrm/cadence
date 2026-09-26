@@ -297,9 +297,10 @@ impl Shared {
         })
     }
 
-    /// CAD-615: `peer_pid` is the child this daemon spawned for an
-    /// approved command, and its environ holds the matching token.
-    /// A token in any other process does not match.
+    /// CAD-615: `peer_pid` is the child this daemon spawned for one
+    /// approved command. The token is bound to that pid and that argv.
+    /// A descendant, or the same token on a different command, is not
+    /// the operator.
     fn grant_exec_matches(&self, peer_pid: u32) -> bool {
         let Some(token) = peer_environ_var(peer_pid, "CADENCE_GRANT_TOKEN") else {
             return false;
@@ -308,10 +309,10 @@ impl Shared {
             return false;
         }
         let map = self.perm_exec.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(&owner) = map.get(&token) else {
+        let Some(exec) = map.get(&token) else {
             return false;
         };
-        peer_pid == owner || proc_descends(peer_pid, owner)
+        peer_pid == exec.pid && grant_argv_matches(&exec.argv, &proc_cmdline(peer_pid))
     }
 
     /// [`crate::peer::operator_proof`] against the live panes and
@@ -749,34 +750,33 @@ fn peer_environ_var(pid: u32, key: &str) -> Option<String> {
     })
 }
 
-/// Is `pid` a descendant of `ancestor`? Used so a helper the approved
-/// command spawns still carries the grant, while a different process
-/// that copied the token does not.
-fn proc_descends(pid: u32, ancestor: u32) -> bool {
-    let mut cur = pid;
-    for _ in 0..32 {
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{cur}/stat")) else {
-            return false;
-        };
-        let Some((_, rest)) = stat.rsplit_once(')') else {
-            return false;
-        };
-        let Some(ppid) = rest
-            .split_whitespace()
-            .nth(1)
-            .and_then(|s| s.parse::<u32>().ok())
-        else {
-            return false;
-        };
-        if ppid == ancestor {
-            return true;
-        }
-        if ppid <= 1 || ppid == cur {
-            return false;
-        }
-        cur = ppid;
+/// The child this daemon spawned for one approved command. The token
+/// elevates that pid running that argv, and nothing else.
+#[derive(Clone, Debug)]
+pub(super) struct GrantExec {
+    pub pid: u32,
+    pub argv: Vec<String>,
+}
+
+/// `bound` is the approved argv (`cadence` or a tool name, then args).
+/// `cmdline` is `/proc/<pid>/cmdline` (the binary path, then args).
+/// The args must be the approved command. A different argv holding the
+/// same token is not elevated.
+pub(super) fn grant_argv_matches(bound: &[String], cmdline: &[String]) -> bool {
+    if bound.len() < 2 || cmdline.len() < 2 {
+        return false;
     }
-    false
+    bound[1..] == cmdline[1..]
+}
+
+fn proc_cmdline(pid: u32) -> Vec<String> {
+    let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return Vec::new();
+    };
+    raw.split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect()
 }
 
 /// Who is on the other end of a connection — see
@@ -857,4 +857,35 @@ fn owner_generation(agent: &Agent) -> Option<String> {
         agent.created.to_bits(),
         agent.generation.as_deref().unwrap_or("-")
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::grant_argv_matches;
+
+    #[test]
+    fn grant_token_matches_only_the_approved_argv() {
+        let bound = vec![
+            "cadence".into(),
+            "issue".into(),
+            "new".into(),
+            "Title".into(),
+        ];
+        let same = vec![
+            "/usr/bin/cadence".into(),
+            "issue".into(),
+            "new".into(),
+            "Title".into(),
+        ];
+        assert!(grant_argv_matches(&bound, &same));
+        let other = vec!["/usr/bin/cadence".into(), "merge".into(), "1".into()];
+        assert!(
+            !grant_argv_matches(&bound, &other),
+            "the token does not elevate a different command"
+        );
+        assert!(
+            !grant_argv_matches(&bound, &["/usr/bin/cadence".into()]),
+            "a descendant or a bare binary is not the approved argv"
+        );
+    }
 }

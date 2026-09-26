@@ -2839,13 +2839,19 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             send(request, model_defaults_get(state_dir, opts.read_only));
         }
         // CAD-615: the operator's master permission rules and pending
-        // requests. The daemon refuses anyone who is not the operator.
+        // requests. The board relays over its own daemon connection, so
+        // the HTTP peer is admitted here — the same operator proof as
+        // the decision writes.
         "/api/master/permissions" => {
-            let resp = match client::rpc(state_dir, "master_permission_list", json!({})) {
-                Ok(out) => json_response(out),
-                Err(e) => home::rpc_err(&e, "master_permission_list"),
-            };
-            send(request, resp);
+            if let Err(resp) = operator::admit_operator_read(&request, state_dir, opts) {
+                send(request, resp);
+            } else {
+                let resp = match client::rpc(state_dir, "master_permission_list", json!({})) {
+                    Ok(out) => json_response(out),
+                    Err(e) => home::rpc_err(&e, "master_permission_list"),
+                };
+                send(request, resp);
+            }
         }
         // The serving binary's build id and nothing else — cheap, and
         // unauthenticated like `/api/health`, so a tab whose stream is

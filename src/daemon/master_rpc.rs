@@ -961,7 +961,7 @@ impl Shared {
         (checkouts, states)
     }
 
-    fn perm_states<'a>(states: &'a [std::path::PathBuf]) -> Vec<&'a std::path::Path> {
+    fn perm_states(states: &[std::path::PathBuf]) -> Vec<&std::path::Path> {
         states.iter().map(std::path::PathBuf::as_path).collect()
     }
 
@@ -1099,7 +1099,15 @@ impl Shared {
     ) -> Result<Value> {
         self.operator_connection("master allow-once", params, peer_pid)?;
         let id = required_str(params, "id")?;
-        let req = crate::master_perm::allow_once(&self.state_dir, id, crate::master_perm::clock())?;
+        let (checkouts, states) = self.perm_roots();
+        let state_refs = Self::perm_states(&states);
+        let req = crate::master_perm::allow_once(
+            &self.state_dir,
+            id,
+            &checkouts,
+            &state_refs,
+            crate::master_perm::clock(),
+        )?;
         let body = crate::master_perm::request_json(&req);
         self.audit_perm(
             "permission_decided",
@@ -1135,11 +1143,15 @@ impl Shared {
             }
         };
         let tail = optional_strs(params, "tail")?;
+        let (checkouts, states) = self.perm_roots();
+        let state_refs = Self::perm_states(&states);
         let (req, rule) = crate::master_perm::always_rule(
             &self.state_dir,
             id,
             scope,
             &tail,
+            &checkouts,
+            &state_refs,
             crate::master_perm::clock(),
         )?;
         let pm = self.pm()?;
@@ -1297,6 +1309,7 @@ impl Shared {
                 .ok_or_else(|| Error::rejected(format!("no {} under /bin or /usr/bin", argv[0])))?;
             let mut cmd = std::process::Command::new(bin);
             cmd.args(&argv[1..]).current_dir(cwd);
+            scrub_grant_env(&mut cmd);
             let out = crate::reaper::output(&mut cmd).map_err(|e| {
                 Error::rejected(format!("running the approved command failed: {e}"))
             })?;
@@ -1318,16 +1331,22 @@ impl Shared {
         let mut cmd = std::process::Command::new(exe);
         cmd.args(&argv[1..])
             .current_dir(cwd)
-            .env_remove("CADENCE_ALIAS")
-            .env("CADENCE_GRANT_TOKEN", &token)
             .env("CADENCE_STATE_DIR", &self.state_dir);
+        scrub_grant_env(&mut cmd);
+        cmd.env("CADENCE_GRANT_TOKEN", &token);
         let child = crate::reaper::spawn(&mut cmd)
             .map_err(|e| Error::rejected(format!("running the approved command failed: {e}")))?;
         let pid = child.id();
         self.perm_exec
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(token.clone(), pid);
+            .insert(
+                token.clone(),
+                super::identity::GrantExec {
+                    pid,
+                    argv: argv.to_vec(),
+                },
+            );
         let out = child.wait_with_output();
         self.perm_exec
             .lock()
@@ -1339,6 +1358,17 @@ impl Shared {
             "stdout": clip(&out.stdout),
             "stderr": clip(&out.stderr),
         }))
+    }
+}
+
+/// Drop the master's denied credentials, and the alias, from a child
+/// that runs an approved command. The grant token is set by the caller
+/// after this, so a readonly tool never receives one.
+fn scrub_grant_env(cmd: &mut std::process::Command) {
+    cmd.env_remove("CADENCE_ALIAS");
+    cmd.env_remove("CADENCE_GRANT_TOKEN");
+    for name in crate::master::DENIED_ENV {
+        cmd.env_remove(*name);
     }
 }
 
