@@ -5,15 +5,17 @@
 //! are the always-run half; this file is the setuid half and exists so
 //! T1 has a ready-made acceptance run.
 //!
-//! T1 runbook — after §5's provision block has run on the host and the
-//! helper is installed `root:cadence-launch 4750` at
+//! T1 runbook — after `cadence agent-uid provision` has run on the host
+//! and the helper is installed `root:cadence-launch 4750` at
 //! `/opt/cadence/libexec/cadence-agent-exec`:
 //!
 //! ```text
-//! cargo build --bin cadence-agent-exec
-//! sudo install -o root -g cadence-launch -m 4750 \
-//!     target/debug/cadence-agent-exec /opt/cadence/libexec/
-//! sudo -E cargo test --test agent_exec -- --ignored --test-threads 1
+//! cargo build --release --bin cadence-agent-exec
+//! sudo ./target/release/cadence agent-uid provision \
+//!     --helper ./target/release/cadence-agent-exec
+//! ulimit -n 65538
+//! sudo -E env CADENCE_PROVISION_RUNBOOK=1 \
+//!     cargo test --test agent_exec -- --ignored --test-threads 1
 //! ```
 //!
 //! (`sudo` because `non_member_is_refused` must spawn as a uid outside
@@ -22,7 +24,11 @@
 //!
 //! Every test skips — loudly, on stderr — rather than fails on a host
 //! missing the provision, so an accidental `--ignored` sweep stays
-//! green without meaning anything passed.
+//! green without meaning anything passed. Under
+//! `CADENCE_PROVISION_RUNBOOK=1` a skip is instead **exit 42**: in the
+//! T1 runbook "nothing to test" is a failed acceptance, and the
+//! fd-sweep test (which needs `RLIMIT_NOFILE` high enough to seat fd
+//! 65537) can never pass vacuously.
 
 // A test binary never runs the CAD-308 reaper (only `daemon run`
 // does), so its own spawns need not go through `cadence_agent::reaper`.
@@ -75,7 +81,14 @@ fn group_id(name: &str) -> Option<u32> {
     line.split(':').nth(2)?.trim().parse().ok()
 }
 
+/// Loud skip — and under `CADENCE_PROVISION_RUNBOOK=1` a hard failure:
+/// the T1 runbook treats "could not test" as failed acceptance, so the
+/// whole binary exits 42 and the runbook's `cargo test` goes red.
 fn skip(why: &str) -> bool {
+    if std::env::var_os("CADENCE_PROVISION_RUNBOOK").is_some() {
+        eprintln!("SKIP→FAIL(42): {why}");
+        std::process::exit(42);
+    }
     eprintln!("SKIP: {why}");
     true
 }
@@ -203,7 +216,11 @@ fn exec_drops_to_the_fixed_uid() {
         Some(fd) => unsafe {
             libc::close(fd);
         },
-        None => eprintln!("SKIP: RLIMIT_NOFILE too low to seat fd 65537"),
+        // In the runbook this exits 42 — the sweep must never pass
+        // having not seated the fd it exists to test.
+        None => {
+            skip("RLIMIT_NOFILE too low to seat fd 65537 — raise it (ulimit -n 65538)");
+        }
     }
 }
 

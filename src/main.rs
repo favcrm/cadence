@@ -62,6 +62,14 @@ enum Commands {
         #[arg(long, requires = "host")]
         reclaim_plan: bool,
     },
+    /// ADR 0007 T1: the dedicated-agent-uid lane — provision the
+    /// boundary once (explicitly, as root), audit it, or print the
+    /// operator's runbook. Nothing here ever runs implicitly: no
+    /// startup hook, no install path, no other verb reaches it.
+    AgentUid {
+        #[command(subcommand)]
+        action: AgentUidAction,
+    },
     /// First run, idempotent: create what is missing — state dir,
     /// tracker, skill, daemon, board — and report provider CLIs (version
     /// and sign-in), the master agent (CAD-339) and the operator login
@@ -1252,6 +1260,51 @@ enum Commands {
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         timeout_secs: Option<u64>,
     },
+}
+
+/// `cadence agent-uid …` — ADR 0007 T1. Each verb is read-only except
+/// `provision`, and `provision` refuses to run unless it is genuinely
+/// root.
+#[derive(Subcommand)]
+enum AgentUidAction {
+    /// Make the host match §5 — users, groups, `/var/lib/cadence`,
+    /// `/opt/cadence`, the §3 modes and the setuid helper — checking
+    /// before every step so a second run is a no-op. §4's negative
+    /// assertions run as a pre-flight and refuse the run. Exit 2 on
+    /// any refusal.
+    Provision {
+        /// Print every action as the shell line it is, changing
+        /// nothing. Still requires root — the preview is the runbook's
+        /// proof artifact.
+        #[arg(long)]
+        dry_run: bool,
+        /// The built cadence-agent-exec to install — a required
+        /// absolute path. The binary being installed is the setuid
+        /// bridge the boundary rests on, so its source is always
+        /// chosen explicitly and never discovered from the cwd, which
+        /// under sudo may be agent-writable.
+        #[arg(long, value_name = "PATH", required = true)]
+        helper: PathBuf,
+        /// The uid-1000 operator seat the boundary protects.
+        #[arg(long, default_value = "ubuntu", value_name = "USER")]
+        operator: String,
+    },
+    /// Audit every §5 artifact plus §4's negative assertions: no
+    /// agent-reachable ACL under the operator's home; no uid-1000 git
+    /// config (`.gitconfig`, `GIT_CONFIG_GLOBAL`, include chains)
+    /// carrying `safe.directory`/`include.path` over /var/lib/cadence.
+    /// Exit 0 ok, 1 warn, 2 fail.
+    Doctor {
+        /// Print the JSON report instead of text lines.
+        #[arg(long)]
+        json: bool,
+        /// The uid-1000 operator seat the boundary protects.
+        #[arg(long, default_value = "ubuntu", value_name = "USER")]
+        operator: String,
+    },
+    /// Print the operator's runbook — the reviewed §5 sequence and the
+    /// acceptance run, verbatim from src/agent_uid/RUNBOOK.md.
+    Runbook,
 }
 
 #[derive(Subcommand)]
@@ -6103,6 +6156,22 @@ fn email_flag_error(err: &clap::Error) -> Option<clap::Error> {
 
 fn run() -> Result<i32> {
     let cli = Cli::try_parse().unwrap_or_else(|e| email_flag_error(&e).unwrap_or(e).exit());
+    // ADR 0007 T1: dispatch before any state-dir resolution or sandbox
+    // adoption — under sudo those would resolve root's home and could
+    // write beneath it. The agent-uid lane is its own host surface.
+    if let Commands::AgentUid { action } = &cli.command {
+        return match action {
+            AgentUidAction::Provision {
+                dry_run,
+                helper,
+                operator,
+            } => cadence_agent::agent_uid::provision::cli(*dry_run, helper.clone(), operator),
+            AgentUidAction::Doctor { json, operator } => {
+                cadence_agent::agent_uid::audit::cli(*json, operator)
+            }
+            AgentUidAction::Runbook => cadence_agent::agent_uid::runbook::cli(),
+        };
+    }
     let state_dir = match cli.state_dir {
         Some(dir) => dir,
         None => client::state_dir()?,
@@ -6113,6 +6182,9 @@ fn run() -> Result<i32> {
         cadence_agent::sandbox::adopt(&state_dir)?;
     }
     match cli.command {
+        // Dispatched above, before the state dir resolved — the lane
+        // must never run `adopt` or touch `~` under sudo.
+        Commands::AgentUid { .. } => unreachable!("agent-uid dispatched before state-dir"),
         Commands::Doctor {
             host,
             json,

@@ -533,6 +533,7 @@ pub fn run(scan: &Scan) -> Value {
         check_load(scan),
         check_config(scan),
         check_tailnet(scan),
+        check_agent_uid(),
     ];
     let level = checks.iter().map(|c| c.level).max().unwrap_or(Level::Ok);
     json!({
@@ -5647,6 +5648,30 @@ fn check_tailnet(scan: &Scan) -> Check {
     )
 }
 
+/// ADR 0007 T1: the dedicated-agent-uid boundary, folded into one
+/// watchdog row. The audit itself reads the live host through
+/// `agent_uid::LiveHost` — it takes no `Scan`, so a fabricated fixture
+/// cannot make this row lie. On an unprovisioned host with clean
+/// negatives the row is `ok` ("not provisioned"); a violation already
+/// armed is `warn`; once provisioned, the audit's worst row rules.
+fn check_agent_uid() -> Check {
+    let view = crate::agent_uid::LiveHost::new();
+    let (level, detail, remedy, value) =
+        crate::agent_uid::audit::host_summary(&view, crate::agent_uid::OPERATOR_USER);
+    check(
+        "agent-uid",
+        match level {
+            "warn" => Level::Warn,
+            "fail" => Level::Fail,
+            _ => Level::Ok,
+        },
+        value,
+        json!("§5 artifacts provisioned per §3; §4 negative assertions hold"),
+        detail,
+        remedy,
+    )
+}
+
 /// A forged probe at the running board's `/api/meta` — the tailnet
 /// Host, a made-up login: `(proven, check, why)`. `operator_latched`
 /// is the board's memory; only this sees it. `None` when sharing is
@@ -8741,7 +8766,8 @@ mod tests {
                 "worktrees",
                 "load",
                 "config",
-                "tailnet"
+                "tailnet",
+                "agent-uid"
             ]
         );
         for c in report["checks"].as_array().unwrap() {
@@ -8749,7 +8775,23 @@ mod tests {
                 assert!(c.get(k).is_some(), "check missing {k}");
             }
         }
-        assert_eq!(exit_code(&report), 0, "{}", render(&report));
+        // `agent-uid` reads the live host (LiveHost by design — a
+        // fixture cannot lie to it), so a runner whose system gitconfig
+        // already arms §4's negative legitimately warns. The
+        // clean-host exit applies to the checks driven by `scan`.
+        let worst = report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["name"] != "agent-uid")
+            .map(|c| c["level"].as_str().unwrap_or("ok"))
+            .max_by_key(|l| match *l {
+                "fail" => 2,
+                "warn" => 1,
+                _ => 0,
+            })
+            .unwrap_or("ok");
+        assert_eq!(worst, "ok", "{}", render(&report));
         let task = report["checks"]
             .as_array()
             .unwrap()

@@ -436,7 +436,8 @@ fn doctor_host_json_reports_all_checks() {
             "worktrees",
             "load",
             "config",
-            "tailnet"
+            "tailnet",
+            "agent-uid"
         ]
     );
     for c in report["checks"].as_array().unwrap() {
