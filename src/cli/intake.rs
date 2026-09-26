@@ -36,7 +36,12 @@ pub(crate) enum IntakeAction {
     /// Show config, heartbeat, delivery receipts, cursors and durable action
     /// states. This never contacts GitHub or a provider.
     Status {
+        /// Project key. `--project` matches `intake sync`; a positional key
+        /// is the same filter.
+        #[arg(long)]
         project: Option<String>,
+        /// Positional project key when `--project` is not used.
+        project_key: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -84,7 +89,20 @@ pub(super) fn run(state_dir: PathBuf, action: IntakeAction) -> Result<i32> {
             print_json(&result);
             Ok(0)
         }
-        IntakeAction::Status { project, .. } => {
+        IntakeAction::Status {
+            project,
+            project_key,
+            ..
+        } => {
+            let project = match (project, project_key) {
+                (Some(flag), Some(positional)) if flag != positional => {
+                    return Err(Error::rejected(
+                        "intake status received two different project keys",
+                    ));
+                }
+                (Some(flag), _) | (_, Some(flag)) => Some(flag),
+                (None, None) => None,
+            };
             print_json(&cadence_agent::issue::relay::status(
                 &state_dir,
                 project.as_deref(),
