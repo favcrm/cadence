@@ -8,6 +8,8 @@ import {
   issuePath,
   kickoffBlock,
   kickoffRequest,
+  laneFenceBanner,
+  laneFollowsStream,
   navMatches,
   NO_ACCEPTANCE,
   parseIssueTab,
@@ -94,6 +96,14 @@ equal(refreshIssueIds(null, "CAD-607"), ["CAD-607"], "the issue page refreshes w
 equal(refreshIssueIds("CAD-1", null), ["CAD-1"], "a peek still refreshes");
 equal(refreshIssueIds("CAD-1", "CAD-607"), ["CAD-1", "CAD-607"], "peek and page both refresh");
 equal(refreshIssueIds("CAD-607", "CAD-607"), ["CAD-607"], "one id is asked once");
+equal(laneFollowsStream(["agents", "issue", "overview"]), true, "an agents frame refetches the lane");
+equal(laneFollowsStream(["issues", "agents", "issue", "overview"]), true, "a jobs frame refetches the lane");
+equal(laneFollowsStream(["overview"]), false, "monitoring does not refetch the lane");
+equal(laneFenceBanner("fenced"), true, "the banner follows lane.state fenced");
+equal(laneFenceBanner("attention"), false, "an attention row is not the lane card's unfence");
+equal(laneFenceBanner("shipped"), false, "shipped stays ahead of a fenced agent row");
+equal(laneFenceBanner("busy"), false, "a busy lane has no unfence banner");
+equal(laneFenceBanner(null), false, "no lane, no banner");
 
 const linkRef = (id: string) => ({ id, title: id, missing: false });
 const shown = shownLinks({

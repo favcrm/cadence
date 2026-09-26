@@ -24,12 +24,31 @@ export function navMatches(screen: string, item: string): boolean {
  * Issue ids the focus and 30s poll must refetch. The peek is `openId`.
  * An issue page clears that, so the id on screen has to be named too or
  * lane state, activity, and evidence stay stale while the stream is down.
+ * The same ids refetch `GET /lane`: a fence does not change `issue.md`.
  */
 export function refreshIssueIds(openId: string | null, pageId: string | null): string[] {
   const ids: string[] = [];
   if (openId) ids.push(openId);
   if (pageId && pageId !== openId) ids.push(pageId);
   return ids;
+}
+
+/**
+ * Stream resources that must also refetch the lane. `detail.rev` is the
+ * `issue.md` hash, so an agents, jobs, or issue frame has to name the
+ * lane store or the card keeps the last state.
+ */
+export function laneFollowsStream(resources: readonly string[]): boolean {
+  return resources.some((name) => name === "issue" || name === "agents" || name === "jobs");
+}
+
+/**
+ * The fenced banner matches LaneCard's Unfence, which is only
+ * `lane.state === "fenced"`. `classify_lane` returns `shipped` before
+ * `fenced`, so an agent row is not the source.
+ */
+export function laneFenceBanner(state: string | null | undefined): boolean {
+  return state === "fenced";
 }
 
 export interface ShownLink {
@@ -230,7 +249,7 @@ export interface KickoffBody {
   note?: string;
 }
 
-/** `POST /api/issues/<id>/kickoff` — the CAD-606 shape. The route may 404 until that PR lands. */
+/** `POST /api/issues/<id>/kickoff`. */
 export function kickoffRequest(id: string, body: KickoffBody): { path: string; body: KickoffBody } {
   const note = body.note?.trim();
   return {

@@ -53,7 +53,7 @@ export default function KickoffDialog({ id, title, body, groups, onClose, onWrit
         if (d.group) setGroup(d.group);
       })
       .catch(() => {
-        // CAD-606 has not landed: the dialog keeps the local catalog.
+        // Options are best-effort. The dialog keeps the local catalog.
       });
     return () => {
       live = false;
@@ -93,7 +93,7 @@ export default function KickoffDialog({ id, title, body, groups, onClose, onWrit
       .catch((e: unknown) => {
         const err = e as ApiError;
         if (err.status === 404) {
-          setError("Kick off is not on this board yet (CAD-606). Nothing was dispatched.");
+          setError("This board has no kickoff route. Nothing was dispatched.");
         } else {
           setError(err.message || "Kick off failed.");
         }

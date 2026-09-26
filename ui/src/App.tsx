@@ -6,7 +6,7 @@ import AppDetail from "./features/apps/AppDetail";
 import Board from "./features/projects/Board";
 import Drawer from "./features/projects/Drawer";
 import IssuePage from "./features/issues/IssuePage";
-import { issuePath, refreshIssueIds } from "./features/issues/model";
+import { issuePath, laneFollowsStream, refreshIssueIds } from "./features/issues/model";
 import Epics from "./features/projects/Epics";
 import Milestones from "./features/projects/Milestones";
 import Memory from "./features/settings/Memory";
@@ -207,6 +207,7 @@ export default function App() {
   const loadDetail = useCallback(() => {
     for (const id of refreshIssueIds(openIdRef.current, pageIssueRef.current)) {
       void resources.issue(id).invalidate();
+      void resources.lane(id).invalidate();
     }
   }, []);
   useEffect(() => {
@@ -282,7 +283,9 @@ export default function App() {
       url: "/api/stream",
       events: ["issues", "agents", "jobs", "monitoring"],
       onEvent: (e) => {
-        for (const name of invalidatedBy(e.data)) {
+        const names = invalidatedBy(e.data);
+        if (laneFollowsStream(names)) cache.invalidate("lane");
+        for (const name of names) {
           // Families are keyed stores — invalidate the prefix, not one entry.
           if (
             name === "issue" ||
