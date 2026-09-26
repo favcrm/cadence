@@ -2391,9 +2391,19 @@ fn event_resources(name: &str) -> &'static [&'static str] {
             "workflows",
             "apps",
             "app",
+            "app_runs",
             "outbox",
+            "app_outputs",
         ],
-        "jobs" => &["issues", "agents", "issue", "overview", "outbox"],
+        "jobs" => &[
+            "issues",
+            "agents",
+            "issue",
+            "overview",
+            "app_runs",
+            "outbox",
+            "app_outputs",
+        ],
         // A released publish lands an outbox item — the same event the
         // effect row's state change produces. Agent rows change what an
         // app's workflow checks resolve to, so apps refetch too.
@@ -2408,7 +2418,9 @@ fn event_resources(name: &str) -> &'static [&'static str] {
             "workflows",
             "apps",
             "app",
+            "app_runs",
             "outbox",
+            "app_outputs",
         ],
     }
 }
@@ -2933,12 +2945,16 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     return;
                 }
             }
-            // `/api/apps[/<project>/<name>]` — installed apps: the
-            // list, or one app's guide, workflows, rubrics, bindings
-            // and doctor findings (CAD-557).
+            // `/api/apps[/<project>/<name>[/runs|/outputs]]` — installed
+            // apps: the list, or one app's guide, workflows, rubrics,
+            // bindings and doctor findings, its runs and its outputs
+            // (CAD-557, CAD-563).
             if let Some(read) = apps::read_route(&path) {
                 match Pm::at(pm_dir) {
-                    Ok(pm) => send(request, apps::read(&pm, state_dir, &query, read)),
+                    Ok(pm) => {
+                        let resp = apps::read(&request, &pm, state_dir, opts, &query, read);
+                        send(request, resp);
+                    }
                     Err(e) => send(request, err_response(503, &e.to_string())),
                 }
                 return;
