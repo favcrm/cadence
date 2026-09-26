@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""Regression tests for target drift, using metadata without Rust compilation."""
+
+import importlib.machinery
+import importlib.util
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import tomllib
+import unittest
+
+
+ROOT = Path(__file__).resolve().parent.parent
+loader = importlib.machinery.SourceFileLoader("review_recipe", str(ROOT / "scripts/check-review-recipe"))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+checker = importlib.util.module_from_spec(spec)
+loader.exec_module(checker)
+
+
+class RecipeTargets(unittest.TestCase):
+    def setUp(self):
+        self.metadata = {
+            "workspace_members": ["cadence"],
+            "packages": [{"id": "cadence", "name": "cadence-agent", "features": {"ui": [], "test-seam": []},
+                          "targets": [{"name": "board_http", "kind": ["test"]}, {"name": "cadence", "kind": ["bin"]}]}],
+        }
+        self.recipe = {"prepare": [], "gates": ["cargo test --test board_http"],
+                       "full_suite": "scripts/cadence-nextest --all-targets --features test-seam",
+                       "test_command": "scripts/cadence-nextest --test {target} -- {test} --exact"}
+
+    def test_current_target_and_review_placeholder(self):
+        self.assertEqual(checker.validate(self.recipe, self.metadata), [])
+
+    def test_deleted_board_target_is_rejected(self):
+        self.recipe["gates"] = ["cargo test --lib --bins --test board"]
+        self.assertIn("missing Cargo test target 'board'", "\n".join(checker.validate(self.recipe, self.metadata)))
+
+    def test_renamed_target_and_equals_selector(self):
+        self.recipe["full_suite"] = "scripts/cadence-nextest --test=board_http"
+        self.metadata["packages"][0]["targets"][0]["name"] = "board_routes"
+        self.assertEqual(len(checker.validate(self.recipe, self.metadata)), 2)
+
+    def test_target_kind_is_not_interchangeable(self):
+        self.recipe["gates"] = ["cargo test --test cadence"]
+        self.assertTrue(checker.validate(self.recipe, self.metadata))
+
+    def test_invalid_feature_and_missing_selector_value(self):
+        self.recipe["gates"] = ["cargo clippy --features typo --test"]
+        errors = checker.validate(self.recipe, self.metadata)
+        self.assertEqual(len(errors), 2)
+
+    def test_no_interpretation_of_test_filter_or_non_cargo_commands(self):
+        self.recipe["gates"] = ["echo --test deleted", "cargo test --bin cadence -- --test deleted"]
+        self.assertEqual(checker.validate(self.recipe, self.metadata), [])
+
+    def test_compact_shell_separator_and_comma_features(self):
+        self.recipe["gates"] = ["echo ready&&cargo clippy --features=ui,test-seam&&cargo test --test=board_http"]
+        self.assertEqual(checker.validate(self.recipe, self.metadata), [])
+
+    def test_placeholder_is_only_allowed_in_isolated_template(self):
+        self.recipe["gates"] = ["cargo test --test {target}"]
+        self.assertTrue(checker.validate(self.recipe, self.metadata))
+
+    def test_real_cli_rejects_old_recipe(self):
+        with tempfile.TemporaryDirectory(prefix="cad635-") as scratch:
+            recipe = Path(scratch) / "stale.toml"
+            recipe.write_text('prepare = []\ngates = ["cargo test --test board"]\nfull_suite = "scripts/cadence-nextest --all-targets"\ntest_command = "scripts/cadence-nextest --test {target} -- {test} --exact"\n')
+            result = subprocess.run([sys.executable, str(ROOT / "scripts/check-review-recipe"), "--recipe", str(recipe)], text=True, capture_output=True)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("missing Cargo test target 'board'", result.stderr)
+
+    def test_recipe_preserves_every_original_board_split(self):
+        recipe = tomllib.loads((ROOT / "cadence-review.toml").read_text())
+        splits = tomllib.loads((ROOT / "tests/split-map-board.toml").read_text())["binaries"]
+        for target in splits:
+            self.assertTrue(any(f"--test {target} " in gate + " " for gate in recipe["gates"]), target)
+
+
+if __name__ == "__main__":
+    unittest.main()
