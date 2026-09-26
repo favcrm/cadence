@@ -1367,9 +1367,9 @@ fn agentic_provider_master_open_and_concurrent_switch_refuse() {
     });
     let journal = std::fs::read_to_string(state.join("master/cwd/pi-rpc.jsonl")).unwrap();
     assert!(
-        !journal.lines().any(|line| {
-            serde_json::from_str::<Value>(line).unwrap()["rpc"] == "set_model"
-        }),
+        !journal
+            .lines()
+            .any(|line| { serde_json::from_str::<Value>(line).unwrap()["rpc"] == "set_model" }),
         "{journal}"
     );
     pi.close();
