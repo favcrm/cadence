@@ -1149,7 +1149,7 @@ fn concurrent_enrolls_never_split_record_from_custody() {
         .unwrap();
     let bytes = std::fs::read(&cred).unwrap();
     let fp = cadence_agent::secret::fingerprint(&bytes);
-    let record_fp = account_row(&d, "github", "acme")["fingerprint"]
+    let record_fp = account_row(d, "github", "acme")["fingerprint"]
         .as_str()
         .unwrap()
         .to_string();
@@ -1191,7 +1191,7 @@ fn concurrent_enrolls_never_split_record_from_custody() {
     }
     // Either way the account is revoked: no enrolled row, no custody
     // bytes.
-    assert_eq!(enrolled_count(&d), 0, "the revoked account still lists");
+    assert_eq!(enrolled_count(d), 0, "the revoked account still lists");
     assert!(!std::fs::read_dir(d.state.join("custody"))
         .unwrap()
         .any(|e| e.unwrap().file_name().to_string_lossy().ends_with(".cred")));
