@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { countLabel, issueCounts } from "../lib/counts";
 import type { ResourceState } from "../lib/cache";
+import { navMatches } from "../features/issues/model";
 import { NAV, type Route, type Screen } from "../lib/router";
 import type { IssueCard, Project } from "../lib/types";
 import Link from "./Link";
@@ -66,7 +67,7 @@ export default function Sidebar({ screen, navHref, project, projectHref, project
             key={item.screen}
             href={navHref(item.route)}
             className="navlink"
-            aria-current={screen === item.screen ? "page" : undefined}
+            aria-current={navMatches(screen, item.screen) ? "page" : undefined}
           >
             {NAV_ICONS[item.screen]}
             {item.label}
