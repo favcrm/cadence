@@ -20,6 +20,47 @@ export function navMatches(screen: string, item: string): boolean {
   return screen === "issue" && item === "projects";
 }
 
+/**
+ * Issue ids the focus and 30s poll must refetch. The peek is `openId`.
+ * An issue page clears that, so the id on screen has to be named too or
+ * lane state, activity, and evidence stay stale while the stream is down.
+ */
+export function refreshIssueIds(openId: string | null, pageId: string | null): string[] {
+  const ids: string[] = [];
+  if (openId) ids.push(openId);
+  if (pageId && pageId !== openId) ids.push(pageId);
+  return ids;
+}
+
+export interface ShownLink {
+  label: string;
+  id: string;
+  title?: string;
+  missing: boolean;
+  /** Kind `DELETE /links` accepts. Null for inverse rows (child, blocks, dup). */
+  unlinkKind: string | null;
+}
+
+/** Every link the detail carries. Unlink only the kinds this issue writes. */
+export function shownLinks(links: IssueDetail["links"]): ShownLink[] {
+  const rows: ShownLink[] = [];
+  const one = (label: string, ref: { id: string; title?: string; missing: boolean } | undefined, unlinkKind: string | null) => {
+    if (!ref) return;
+    rows.push({ label, id: ref.id, title: ref.title, missing: ref.missing, unlinkKind });
+  };
+  const many = (label: string, refs: { id: string; title?: string; missing: boolean }[], unlinkKind: string | null) => {
+    for (const ref of refs) one(label, ref, unlinkKind);
+  };
+  one("Parent", links.parent, "parent");
+  many("Child", links.children, null);
+  many("Blocked by", links.blocked_by, "blocked_by");
+  many("Blocks", links.blocks, null);
+  many("Related", links.relates, "relates");
+  one("Dup of", links.duplicate_of, "duplicate_of");
+  many("Dup", links.duplicates, null);
+  return rows;
+}
+
 export interface AcceptanceItem {
   text: string;
   checked: boolean;
