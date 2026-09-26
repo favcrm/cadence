@@ -54,6 +54,8 @@ mod tests;
 mod thread;
 mod ui;
 mod update;
+#[cfg(all(test, feature = "test-seam"))]
+mod update_recovery_tests;
 mod upgrade;
 mod wiki;
 mod workflow;
