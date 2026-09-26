@@ -529,11 +529,11 @@ export default function App() {
               onRefresh={refresh}
             >
               <SignIn meta={meta} onChange={refresh} />
+              {staleBuild !== null && staleBuild !== dismissedBuild && (
+                <BuildUpdateNotice onReload={reload} onDismiss={() => setDismissedBuild(staleBuild)} />
+              )}
             </StatusChips>
             <ThemeToggle />
-            {staleBuild !== null && staleBuild !== dismissedBuild && (
-              <BuildUpdateNotice onReload={reload} onDismiss={() => setDismissedBuild(staleBuild)} />
-            )}
           </div>
         </header>
 

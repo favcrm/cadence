@@ -1342,7 +1342,10 @@ button.refchip:hover {
 .header-update-trigger:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
 .header-control-wrap.header-update[data-open="true"] .header-tooltip { visibility: hidden; opacity: 0; }
 .header-update-panel { position: absolute; top: calc(100% + .4rem); right: 0; width: min(18rem, calc(100vw - 2rem)); z-index: 50; }
-@media (width < 640px) { .header-update-trigger { width: 2.5rem; justify-content: center; } }
+@media (width < 640px) {
+  .header-update-trigger { width: 2.5rem; justify-content: center; }
+  .header-update-panel { position: fixed; top: 3.65rem; right: 1rem; }
+}
 .build-update-action { min-height: 2.75rem; padding-inline: .75rem; font-size: var(--text-label); border-radius: .3rem; }
 .build-update-action:hover { background: var(--color-ink-800); }
 .build-update-action:focus-visible { outline: 2px solid var(--color-accent); outline-offset: -2px; }
