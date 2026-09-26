@@ -1,6 +1,6 @@
 import { useEffect } from "react";
+import Button from "../../ui/Button";
 import { IconClose } from "../../ui/icons";
-import Link from "../../ui/Link";
 import type { IssueDetail } from "../../lib/types";
 import { laneState, peekSummary } from "../issues/model";
 
@@ -45,13 +45,7 @@ export default function Drawer({ id, detail, href, onClose }: Props) {
       >
         <div className="flex items-center gap-2">
           <div className="kicker">Quick peek</div>
-          <button
-            aria-label="Close"
-            onClick={onClose}
-            className="closebtn ml-auto shrink-0 w-8 h-8 grid place-items-center rounded border border-ink-600 text-ink-300 bg-ink-850"
-          >
-            <IconClose style={{ pointerEvents: "none" }} />
-          </button>
+          <Button variant="ghost" size="sm" className="ml-auto" aria-label="Close" onClick={onClose} icon={<IconClose />} />
         </div>
         <div className="min-w-0">
           <div className="kicker">
@@ -82,13 +76,9 @@ export default function Drawer({ id, detail, href, onClose }: Props) {
           <dd className="text-secondary text-ink-200">{detail?.owner ?? "unassigned"}</dd>
         </dl>
         {href ? (
-          <Link href={href} className="h-8 px-3 inline-flex items-center justify-center rounded bg-accent text-on-accent text-label font-medium w-fit">
-            Open →
-          </Link>
+          <Button variant="primary" full href={href}>Open →</Button>
         ) : (
-          <button type="button" className="h-8 px-3 rounded border border-ink-600 text-label text-ink-400 opacity-50 w-fit" disabled title="Project unknown">
-            Open →
-          </button>
+          <Button full disabled title="Project unknown">Open →</Button>
         )}
       </aside>
     </>
