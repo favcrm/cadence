@@ -4,12 +4,39 @@
 // One Chrome, one context (recorded — the run doubles as the turn GIF
 // source), one page: the session cookie and the per-tab key live here.
 //
-// Run it against a scratch stack:
-//   CADENCE_STATE_DIR=<tmp> CADENCE_PI_COMMAND="python3 tests/e2e/fake-pi.py slow" \
-//     cadence daemon run        # plus `cadence master start --provider pi`
-//   cadence ui start --port <p> && cadence ui login --json
-//   E2E_URL=http://cadence-<p>.localhost:<p> E2E_LOGIN=<link> \
-//     E2E_ARTIFACTS=<dir> node cad551.mjs
+// Run it against a scratch stack that is FULLY isolated — HOME, the
+// XDG dirs, CADENCE_STATE_DIR AND CADENCE_PM_DIR all under one short
+// /tmp root. `CADENCE_STATE_DIR` alone is not enough: without
+// CADENCE_PM_DIR the daemon reads the real tracker (~/pm) and the
+// screenshots leak real project/issue names — the production rule is
+// never to touch ~/pm. Seed a tiny fake tracker instead:
+//
+//   ROOT=/tmp/cad551-e && WT=<this worktree>
+//   mkdir -p $ROOT/{home,state,pm,repo,xdg/{config,data,state,cache},evidence}
+//   git -C $ROOT/repo init -q -b main && git -C $ROOT/repo commit -qm init --allow-empty
+//   ENV="env -i PATH=$PATH HOME=$ROOT/home XDG_CONFIG_HOME=$ROOT/xdg/config \
+//        XDG_DATA_HOME=$ROOT/xdg/data XDG_STATE_HOME=$ROOT/xdg/state \
+//        XDG_CACHE_HOME=$ROOT/xdg/cache CADENCE_STATE_DIR=$ROOT/state \
+//        CADENCE_PM_DIR=$ROOT/pm"
+//   # daemon (foreground, own shell) — fake-pi + an extra Landlock read
+//   # grant for this directory so the confined master can exec it:
+//   $ENV CADENCE_PI_COMMAND="python3 $WT/tests/e2e/fake-pi.py slow" \
+//     CADENCE_MASTER_CONFINE_READ=$WT/tests/e2e $WT/target/debug/cadence daemon run
+//   # every CLI that hits the daemon needs an operator-provable process —
+//   # detach it (setsid -f) inside agent panes:
+//   setsid -f $ENV $WT/target/debug/cadence issue init
+//   setsid -f $ENV $WT/target/debug/cadence issue project add demo --prefix D --repo $ROOT/repo
+//   setsid -f $ENV $WT/target/debug/cadence issue new "fake item" --project demo
+//   setsid -f $ENV $WT/target/debug/cadence master start --provider pi
+//   # the board too: it relays writes over its own daemon connection,
+//   # so it must be detached as well:
+//   setsid -f $ENV $WT/target/debug/cadence ui run --port <p> --dist $WT/ui/dist
+//   setsid -f $ENV $WT/target/debug/cadence ui login --port <p> --json
+//   # playwright resolves browsers/ffmpeg under HOME — symlink the real
+//   # cache into $ROOT/home/.cache/ms-playwright.
+//   setsid -f env -i PATH=<node-bin>:/usr/bin:/bin HOME=$ROOT/home \
+//     E2E_URL=http://cadence-<p>.localhost:<p> E2E_LOGIN=<link> \
+//     E2E_ARTIFACTS=$ROOT/evidence <node-bin>/node cad551.mjs
 //
 // `slow` fake-pi keeps the turn alive ~3 s so the working row is on
 // screen when the page samples it. Screenshots land in E2E_ARTIFACTS;
@@ -228,8 +255,12 @@ async function main() {
     await shot(page, "05-steps.png");
 
     // ---- Smart scroll: the pill appears only off-bottom ----
+    // fill() scrolls the composer into view (re-pinning the tail), so
+    // the scroll-away must come after the fill and before Enter.
+    const box2 = page.getByLabel("message to the master");
+    await box2.fill("one more while I read history");
     await page.evaluate(() => window.scrollTo(0, 0));
-    await send(page, "one more while I read history");
+    await box2.press("Enter");
     const pill = await appear(page, ".newpill", "the new-messages pill while scrolled up");
     await page.waitForTimeout(400); // pill-in
     await expectText(pill, "new", "the pill counts arrivals");
