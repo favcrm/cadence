@@ -59,7 +59,9 @@ pub enum Error {
     /// not proof (pty post-paste screen check). The actor decides:
     /// routed notifications requeue bounded then park; task messages go
     /// `unknown` under the usual uncertainty discipline.
-    NotRendered(RenderMiss),
+    /// Boxed: the evidence (two screen tails + probe verdicts) is far
+    /// bigger than the other variants' payloads.
+    NotRendered(Box<RenderMiss>),
 }
 
 impl Error {
@@ -82,7 +84,7 @@ impl Error {
         Self::Internal(message.into())
     }
     pub fn not_rendered(miss: RenderMiss) -> Self {
-        Self::NotRendered(miss)
+        Self::NotRendered(Box::new(miss))
     }
     /// Invalid input with a stable code. The wire kind stays `rejected`.
     pub fn invalid(code: &'static str, message: impl Into<String>) -> Self {

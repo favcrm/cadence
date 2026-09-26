@@ -2045,3 +2045,265 @@ fn pty_urgent_waits_for_the_held_turn_then_goes_first() {
     pty_token(&d, "w1", "n1");
     assert_eq!(d.message_state("w1", "n2"), "queued");
 }
+
+/// CAD-520 F24: `send --nudge` on a busy Devin pane pastes into the
+/// "Guide Devin while it works" box. The first Enter only *queues* the
+/// draft in the TUI — its own `Press Enter to send queued messages`
+/// invitation takes the second Enter that flushes the steer into the
+/// running turn. The nudge completes at the confirmed paste, never
+/// holds a turn. A busy pane without the guide watermark refuses the
+/// nudge (busy is still busy), and a modal menu covering the box does
+/// too — steering is only ever the live guide box.
+/// Ordering: the actor's queue is strictly head-first, so the nudges
+/// run before the wedged task below can sit at the head.
+#[test]
+fn pty_devin_busy_nudge_flushes_the_send_queue() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin("dv1", None);
+    d.wait_agent("dv1", "idle", 20);
+    let keys = |want| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let got = pane_keys(&d, &mock.dir, "dv1");
+            if got == want {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "pane_keys {got:?}, wanted {want:?}: {}",
+                tmux_log(&d, &mock.dir)
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+    };
+    let gate_reason = |id: &str| {
+        d.wait_event_where("dv1", "gate_wait", |e| e["payload"]["message"] == id, 15)["payload"]
+            ["reason"]
+            .as_str()
+            .unwrap_or("")
+            .to_string()
+    };
+    let busy = |watermark: &str| {
+        atomic_write(d.pane_file(&mock, "dv1", "inputbox"), watermark);
+        atomic_write(
+            d.pane_file(&mock, "dv1", "status"),
+            "⠸ Thinking · 12s (esc twice to interrupt)\n",
+        );
+    };
+    busy("Guide Devin while it works\n");
+    let probe = d.rpc("agent_probe", json!({"alias": "dv1"})).unwrap();
+    assert_eq!(probe["idle"], false, "{probe}");
+    assert_eq!(probe["busy_marker"], true, "{probe}");
+    assert_eq!(probe["steerable"], true, "{probe}");
+
+    // The steer: the submit Enter stages the draft in the TUI's queue,
+    // the queue invitation's flush Enter sends it — one paste, two
+    // Enters, and the steer echoes into the transcript like a turn.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": "steer toward the small fix",
+               "message": "n1", "nudge": true}),
+    )
+    .unwrap();
+    let n = d.wait_message("dv1", "n1", &["completed"], 25);
+    assert_eq!(n["result"]["via"], "pty_nudge", "{n}");
+    assert_eq!(n["nudge"], true, "{n}");
+    keys((1, 2));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let screen =
+            std::fs::read_to_string(d.pane_file(&mock, "dv1", "screen")).unwrap_or_default();
+        if screen.contains("> steer toward the small fix") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "nudge never echoed: {screen}");
+        thread::sleep(Duration::from_millis(100));
+    }
+    // It never owned a turn.
+    assert!(d
+        .events("dv1")
+        .iter()
+        .all(|e| !(e["kind"] == "turn_started" && e["payload"]["message"] == "n1")));
+
+    // Busy but no guide box — the status row alone makes a busy pane
+    // whose input takes no steering: the nudge refuses like any send.
+    busy("Ask Devin to build features, fix bugs, or work on your code\n");
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": "no box to steer into",
+               "message": "n2", "nudge": true}),
+    )
+    .unwrap();
+    assert!(gate_reason("n2").contains("busy"));
+    assert_eq!(
+        pane_keys(&d, &mock.dir, "dv1"),
+        (1, 2),
+        "a refused nudge pasted"
+    );
+    // The guide box back: the queued nudge steers in on its next gate
+    // retry — wedged, not dropped.
+    busy("Guide Devin while it works\n");
+    d.wait_message("dv1", "n2", &["completed"], 25);
+    keys((2, 4));
+
+    // A modal menu over the box is never steerable — the nudge waits
+    // out the menu instead of keying text into a selection.
+    atomic_write(d.pane_file(&mock, "dv1", "tui-state"), DEVIN_MENU);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": "wait out the menu",
+               "message": "n3", "nudge": true}),
+    )
+    .unwrap();
+    assert!(gate_reason("n3").contains("approval menu"));
+    assert_eq!(
+        pane_keys(&d, &mock.dir, "dv1"),
+        (2, 4),
+        "a menued nudge pasted"
+    );
+    std::fs::remove_file(d.pane_file(&mock, "dv1", "tui-state")).unwrap();
+    d.wait_message("dv1", "n3", &["completed"], 25);
+    keys((3, 6));
+
+    // Ordinary work still refuses the busy pane — the refusal is the
+    // screen's busy verdict, not a missing claim.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": "plain task", "message": "w1"}),
+    )
+    .unwrap();
+    assert!(gate_reason("w1").contains("busy"));
+    assert_eq!(d.message_state("dv1", "w1"), "queued");
+}
+
+/// CAD-520 F28: a paste the transcript never echoes is not proof of a
+/// drop. `.noecho` leaves the body off-screen but moves the pane to a
+/// busy status — the deadline re-probe sees the gate's idle probe went
+/// busy, so the turn is `running`, not `unknown`: no fence, no
+/// `paste_not_rendered`, nothing for the operator.
+#[test]
+fn pty_devin_render_miss_reprobe_accepts_the_busy_turn() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin("dv1", None);
+    d.wait_agent("dv1", "idle", 20);
+    atomic_write(d.pane_file(&mock, "dv1", "noecho"), "1");
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": "quietly taken", "message": "m1"}),
+    )
+    .unwrap();
+    let token = pty_token(&d, "dv1", "m1");
+    assert!(token.starts_with("pty-"), "{token}");
+    assert!(d
+        .events("dv1")
+        .iter()
+        .all(|e| e["kind"].as_str() != Some("paste_not_rendered")));
+    let agent = d.rpc("agent_show", json!({"alias": "dv1"})).unwrap()["agent"].clone();
+    assert_eq!(agent["state"], "busy", "{agent}");
+    pty_report_done(&d, "dv1", "m1");
+}
+
+/// CAD-520 F28 evidence: a genuinely dropped paste still fences — the
+/// re-probe only clears a pane that shows work. The `paste_not_rendered`
+/// event carries both screen tails plus the admitting probe and the
+/// re-probe verdict, so a fenced turn records what the pane showed.
+#[test]
+fn pty_devin_render_miss_records_reprobe_evidence() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin("dv1", None);
+    d.wait_agent("dv1", "idle", 20);
+    atomic_write(d.pane_file(&mock, "dv1", "swallow"), "1");
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": "dropped on the floor", "message": "m1"}),
+    )
+    .unwrap();
+    d.wait_agent("dv1", "attention", 30);
+    assert_eq!(d.message_state("dv1", "m1"), "unknown");
+    let miss = d.wait_event("dv1", "paste_not_rendered", 10);
+    let reprobe = &miss["payload"]["reprobe"];
+    assert_eq!(
+        reprobe["probe"]["idle"], true,
+        "the pane still probes idle — the paste truly dropped: {miss}"
+    );
+    assert_eq!(reprobe["steer"], false, "{miss}");
+    assert!(
+        miss["payload"]["claim_probe"]["idle"].as_bool() == Some(true),
+        "{miss}"
+    );
+    // The pre-fence `submitting` row kept the pane from ever claiming
+    // the send as work: no turn_started, no ready_claimed consumed
+    // twice.
+    assert!(d
+        .events("dv1")
+        .iter()
+        .all(|e| e["kind"].as_str() != Some("turn_started")));
+}
+
+/// CAD-520 F26 watchdog: a queued head that outlives
+/// `delivery_watch_secs` while the pane probes *idle* is the wedge —
+/// the F26 failure left a message queued for an hour in front of a
+/// ready pane with no log entry. The daemon fires one
+/// `delivery_stalled` per tracked head (event + agent flag + needs-me
+/// row), never re-fires while it sits, and clears when the wedge does.
+/// The wedge here is a tmux mode: the gate probe refuses on
+/// `pane_in_mode` while the screen sample still reads idle — exactly
+/// the split verdict that makes a queued-on-idle wait undetectable
+/// without the watchdog.
+#[test]
+fn pty_delivery_stalled_fires_once_and_clears() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    stall_sample(1);
+    d.register_devin_opts("dv", json!({"delivery_watch_secs": 2}));
+    d.wait_agent("dv", "idle", 20);
+    atomic_write(d.pane_file(&mock, "dv", "mode"), "1");
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv", "text": "stuck behind a mode", "message": "m1"}),
+    )
+    .unwrap();
+    let wait = d.wait_event_where("dv", "gate_wait", |e| e["payload"]["message"] == "m1", 15);
+    assert!(
+        wait["payload"]["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("tmux mode"),
+        "{wait}"
+    );
+    let ev = d.wait_event("dv", "delivery_stalled", 30);
+    assert_eq!(ev["payload"]["message"], "m1", "{ev}");
+    assert_eq!(ev["payload"]["bound_secs"], 2, "{ev}");
+    assert_eq!(ev["payload"]["probe"]["idle"], true, "{ev}");
+    let agent = d.rpc("agent_show", json!({"alias": "dv"})).unwrap()["agent"].clone();
+    assert_eq!(agent["delivery_stalled"]["message"], "m1", "{agent}");
+    assert_eq!(agent["delivery_stalled"]["verdict"], "idle", "{agent}");
+    // The overview needs-me row names the agent, the wedged message
+    // and the probe's verdict — not just that something stalled.
+    let home = TempDir::new().unwrap();
+    let view = overview_at(home.path(), &d.state, None, &[]);
+    let row = view["needs_me"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["kind"] == "delivery_stalled")
+        .expect("no delivery_stalled needs-me row");
+    let title = row["title"].as_str().unwrap_or("");
+    assert!(
+        title.contains("dv") && title.contains("m1") && title.contains("idle"),
+        "{row}"
+    );
+    // Once per head: a few more idle samples re-fire nothing.
+    thread::sleep(Duration::from_secs(4));
+    assert_eq!(
+        wait_event_count(&d, "dv", "delivery_stalled", 1, 2).len(),
+        1
+    );
+    // Clearing the mode delivers — the wedge was never the message.
+    std::fs::remove_file(d.pane_file(&mock, "dv", "mode")).unwrap();
+    pty_report_done(&d, "dv", "m1");
+    stall_sample(0);
+}

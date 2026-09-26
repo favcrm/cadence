@@ -2158,6 +2158,17 @@ while True:
             # Enter swallowed: the marker is consumed but the draft
             # stays staged in the input line, unsubmitted.
             awrite(inp, text + rest)
+        elif os.path.exists(os.environ["FAKE_PANE"] + ".noecho"):
+            # The TUI consumed the draft into a running turn — the busy
+            # status row and the guide-box watermark show work — but the
+            # submitted line never echoes into the transcript
+            # (CAD-520 F28: a render miss that is not a dropped delivery).
+            awrite(inp, rest)
+            if text.strip():
+                awrite(os.environ["FAKE_PANE"] + ".status",
+                       "⠸ Thinking · 1s (esc twice to interrupt)\n")
+                awrite(os.environ["FAKE_PANE"] + ".inputbox",
+                       "Guide Devin while it works\n")
         elif busy_box and text.strip():
             # The busy guide box: Enter only *queues* the draft — the
             # TUI then invites one more Enter to send it into the

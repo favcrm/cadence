@@ -340,8 +340,8 @@ pub fn analyze_devin(screen: &str) -> Probe {
     // The TUI-side send queue is its own fact: `Press Enter to send
     // queued messages` means text is staged mid-turn and one more
     // Enter flushes it into the running turn.
-    let queue_pending = status_row
-        .is_some_and(|row| devin_screen::QUEUED.iter().any(|m| row.contains(m)));
+    let queue_pending =
+        status_row.is_some_and(|row| devin_screen::QUEUED.iter().any(|m| row.contains(m)));
     let input_nonempty = !draft.is_empty()
         && !draft.starts_with(devin_screen::PLACEHOLDER)
         && !draft.starts_with(devin_screen::BUSY_PLACEHOLDER);

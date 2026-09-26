@@ -1352,8 +1352,10 @@ impl ProviderAdapter for PtyAdapter {
             let rendered = normalize_screen(&screen).matches(&slice).count() > before_count;
             // The steer path needs the queue flag every poll; the plain
             // path needs `input_nonempty` only once the body shows.
-            let live_probe = (steer || rendered)
-                .then(|| self.profile.analyze_styled(&styled, self.cursor_pos(&session)));
+            let live_probe = (steer || rendered).then(|| {
+                self.profile
+                    .analyze_styled(&styled, self.cursor_pos(&session))
+            });
             if steer
                 && live_probe.as_ref().is_some_and(|p| p.queue_pending)
                 && steer_flushes < 3
@@ -1384,8 +1386,9 @@ impl ProviderAdapter for PtyAdapter {
                     // input means the draft never left the box.
                     let styled2 = self.capture_visible_styled()?;
                     let after = sgr::strip(&styled2);
-                    let reprobe =
-                        self.profile.analyze_styled(&styled2, self.cursor_pos(&session));
+                    let reprobe = self
+                        .profile
+                        .analyze_styled(&styled2, self.cursor_pos(&session));
                     // The tail slice can scroll off a busy transcript;
                     // the head of the body is a second anchor. Either
                     // appearing where it was absent before is evidence.
@@ -1405,8 +1408,7 @@ impl ProviderAdapter for PtyAdapter {
                         let gate_probe = self.state.lock().unwrap().gate_probe.clone();
                         gate_probe.is_some_and(|g| !g.busy_marker) && reprobe.busy_marker
                     };
-                    let queue_cleared =
-                        steer && steer_flushes > 0 && !reprobe.queue_pending;
+                    let queue_cleared = steer && steer_flushes > 0 && !reprobe.queue_pending;
                     if !reprobe.input_nonempty && (body_seen || went_busy || queue_cleared) {
                         // The pane took the turn — Submitted, not a miss.
                         break;

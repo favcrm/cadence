@@ -2419,19 +2419,21 @@ fn agent_items(a: &Value, probe: &AgentProbe, project: &str, now: i64) -> Vec<It
     }
     // CAD-520: the delivery watchdog — a queued head has outlived
     // `delivery_watch_secs` while the pane probes ready. Something is
-    // wedged between the queue and the pane; the row names it.
-    if a["delivery_stalled"].as_bool().unwrap_or(false) {
-        items.push(
-            row(
-                30,
-                "delivery_stalled",
-                &format!(
-                    "agent {alias} has a queued message but the pane is idle — delivery stalled"
-                ),
-                age,
-                &cmd_agent_show(alias),
+    // wedged between the queue and the pane; the row names the agent,
+    // the wedged message, and the probe's verdict.
+    if let Some(ds) = a["delivery_stalled"].as_object() {
+        let msg = ds["message"].as_str().unwrap_or("?");
+        let verdict = ds["verdict"].as_str().unwrap_or("idle");
+        items.push(row(
+            30,
+            "delivery_stalled",
+            &format!(
+                "agent {alias} message {msg} queued past the watchdog bound while \
+                     the pane probes '{verdict}' — delivery stalled"
             ),
-        );
+            age,
+            &cmd_agent_show(alias),
+        ));
     }
     // A sampled approval menu ranks with brokered approvals — the pane
     // is waiting on a human either way.

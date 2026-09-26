@@ -1903,3 +1903,82 @@ fn pty_deleted_cwd_refuses_delivery_and_is_surfaced() {
     // Still queued after the status probe — refusal, not failure.
     assert_eq!(d.message_state("st", "m1"), "queued");
 }
+
+/// CAD-520 F27: resuming a lane whose working directory was deleted
+/// must refuse before the TUI ever launches — previously the spawn
+/// landed Devin wherever tmux did and surfaced only as a folder-trust
+/// prompt or a wrong-repo session. The resume fails with a named
+/// `cwd_deleted:` reason on the agent's attention state.
+#[test]
+fn pty_resume_refuses_a_deleted_lane_cwd() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_devin();
+    let lane = d.dir.path().join("lane-wt");
+    std::fs::create_dir_all(&lane).unwrap();
+    d.rpc(
+        "agent_register",
+        json!({"alias": "dv", "provider": "devin", "endpoint_kind": "pty",
+               "cwd": lane.to_str().unwrap()}),
+    )
+    .unwrap();
+    d.wait_agent("dv", "idle", 20);
+    d.rpc("agent_stop", json!({"alias": "dv"})).unwrap();
+    d.wait_agent("dv", "stopped", 15);
+    std::fs::remove_dir_all(&lane).unwrap();
+
+    d.rpc("agent_resume", json!({"alias": "dv"})).unwrap();
+    let agent = d.wait_agent("dv", "attention", 20);
+    let ev = d.wait_event("dv", "attention", 10);
+    let reason = ev["payload"]["reason"].as_str().unwrap_or("");
+    assert!(
+        reason.contains("cwd_deleted:")
+            && reason.contains("lane's working directory")
+            && reason.contains(&lane.to_string_lossy().to_string()),
+        "{reason}"
+    );
+    assert_eq!(agent["state"], "attention", "{agent}");
+    // Nothing launched: no pane session exists for a refused open.
+    assert!(d
+        .events("dv")
+        .iter()
+        .all(|e| e["kind"].as_str() != Some("session_minted")));
+}
+
+/// CAD-520 F27: a Devin pane parked on the folder-trust select blocks
+/// session acquisition forever — the open must report the prompt as
+/// the reason instead of burning the session-lock deadline. Answering
+/// it (the `.trust` marker gone) and resuming again adopts the pane
+/// normally.
+#[test]
+fn pty_devin_trust_prompt_fails_open_fast() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    // Plant the trust marker before the pane exists — the mock TUI
+    // parks on its select the moment it launches.
+    let marker = d.pane_file(&mock, "dv", "trust");
+    std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+    std::fs::write(&marker, "1").unwrap();
+    let start = Instant::now();
+    d.register_devin("dv", None);
+    let agent = d.wait_agent("dv", "attention", 20);
+    let ev = d.wait_event("dv", "attention", 10);
+    let reason = ev["payload"]["reason"].as_str().unwrap_or("");
+    assert!(
+        reason.contains("trust this folder") && reason.contains("agent answer"),
+        "{reason}"
+    );
+    assert_eq!(agent["state"], "attention", "{agent}");
+    // Failing fast is the point: the mock's OPEN_DEADLINE is 30s —
+    // the trust probe fires in about a second.
+    assert!(
+        start.elapsed() < Duration::from_secs(25),
+        "the trust prompt must not wait out the open deadline"
+    );
+
+    // The pane itself survives the refused open — answering the prompt
+    // lets the boot continue, and a plain resume (no unknowns to
+    // reconcile, so unfence would refuse) adopts or respawns it.
+    std::fs::remove_file(&marker).unwrap();
+    d.rpc("agent_resume", json!({"alias": "dv"})).unwrap();
+    d.wait_agent("dv", "idle", 20);
+}

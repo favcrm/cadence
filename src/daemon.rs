@@ -198,9 +198,10 @@ const DEFAULT_STALL_SECS: u64 = 1800;
 const DEFAULT_SILENT_END_SECS: u64 = 600;
 /// `delivery_watch_secs` when the agent doesn't set one: a queued head
 /// that has waited this long while the pane probes idle is wedged —
-/// delivery should have landed in seconds. The 60s screen cadence
-/// makes 120s ≥2 consecutive ready samples, never one glance.
-const DEFAULT_DELIVERY_WATCH_SECS: u64 = 120;
+/// delivery should have landed in seconds. The brief's default is 5
+/// minutes: at the 60s screen cadence that is ~5 consecutive ready
+/// samples, well past any gate retry's own backoff noise.
+const DEFAULT_DELIVERY_WATCH_SECS: u64 = 300;
 /// PTY screens are sampled at most this often while the pane is live —
 /// a running turn for activity/silent-end bookkeeping, an idle pane for
 /// menu/draft surfacing. The bound is one capture per pty agent per
@@ -424,8 +425,10 @@ struct StallView {
     ended_secs: Option<u64>,
     silent_ended: bool,
     /// CAD-520: a queued head has outlived `delivery_watch_secs` while
-    /// the pane probes ready — delivery is wedged, needs a human.
-    delivery_stalled: bool,
+    /// the pane probes ready — delivery is wedged, needs a human. The
+    /// wedged message id and the probe's verdict ride the view so the
+    /// needs-me row names what stalled and what the pane showed.
+    delivery_stalled: Option<(String, String)>,
 }
 
 impl StallView {
@@ -443,8 +446,8 @@ impl StallView {
         if self.silent_ended {
             j["silent_ended"] = json!(true);
         }
-        if self.delivery_stalled {
-            j["delivery_stalled"] = json!(true);
+        if let Some((message, verdict)) = &self.delivery_stalled {
+            j["delivery_stalled"] = json!({"message": message, "verdict": verdict});
         }
     }
 }
@@ -1797,7 +1800,7 @@ impl Shared {
                                 after_tail,
                                 claim_probe,
                                 reprobe,
-                            } = miss;
+                            } = *miss;
                             let _ = self.store.event_public(
                                 alias,
                                 "paste_not_rendered",
@@ -8525,8 +8528,7 @@ impl Shared {
                         let queued_secs = epoch_secs() - m.created;
                         if bound > 0 && queued_secs >= bound as f64 {
                             w.delivery_stalled_sent = true;
-                            delivery_fire =
-                                Some((m.id.clone(), queued_secs as u64, probe.clone()));
+                            delivery_fire = Some((m.id.clone(), queued_secs as u64, probe.clone()));
                         }
                     }
                 }
@@ -8854,8 +8856,9 @@ impl Shared {
         queued_secs: u64,
         probe: &Probe,
     ) {
-        let (job_id, task_id) =
-            tracked.map(|m| self.message_scope(m)).unwrap_or((None, None));
+        let (job_id, task_id) = tracked
+            .map(|m| self.message_scope(m))
+            .unwrap_or((None, None));
         let _ = self.store.event_public_scoped(
             &agent.alias,
             "delivery_stalled",
@@ -9020,9 +9023,18 @@ impl Shared {
             // nothing has started or ended. The stall flag is
             // delivered-pane state too: once the probe reads busy the
             // row clears — something is moving.
-            let stalled = w.delivery_stalled_sent
-                && w.last_probe.as_ref().is_some_and(|p| p.idle);
-            if w.menu_line.is_none() && !stalled {
+            let stalled = (w.delivery_stalled_sent
+                && w.last_probe.as_ref().is_some_and(|p| p.idle))
+            .then(|| {
+                (
+                    w.message.clone().unwrap_or_default(),
+                    w.last_probe
+                        .as_ref()
+                        .map(|p| p.reason.clone())
+                        .unwrap_or_default(),
+                )
+            });
+            if w.menu_line.is_none() && stalled.is_none() {
                 return None;
             }
             return Some(StallView {
@@ -9041,7 +9053,7 @@ impl Shared {
                 menu: w.menu_line.clone(),
                 ended_secs: w.idle_since.map(|t| t.elapsed().as_secs()),
                 silent_ended: w.silent_end_sent,
-                delivery_stalled: false,
+                delivery_stalled: None,
             });
         }
         // The watch hasn't ticked over this message yet — report
@@ -9056,7 +9068,7 @@ impl Shared {
             menu: None,
             ended_secs: None,
             silent_ended: false,
-            delivery_stalled: false,
+            delivery_stalled: None,
         })
     }
 

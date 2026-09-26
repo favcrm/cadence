@@ -414,6 +414,7 @@ pub static SPECS: &[EndpointSpec] = &[
             "auto_stop",
             "auto_stop_idle_secs",
             "report_timeout_secs",
+            "delivery_watch_secs",
         ],
         launch_params: &[
             "model",
@@ -426,6 +427,7 @@ pub static SPECS: &[EndpointSpec] = &[
             "auto_ready",
             "silent_end_secs",
             "report_timeout_secs",
+            "delivery_watch_secs",
             "agents_md",
             "stall_secs",
         ],
@@ -459,6 +461,7 @@ pub static SPECS: &[EndpointSpec] = &[
             "auto_stop",
             "auto_stop_idle_secs",
             "report_timeout_secs",
+            "delivery_watch_secs",
         ],
         launch_params: &[
             "session",
@@ -466,6 +469,7 @@ pub static SPECS: &[EndpointSpec] = &[
             "auto_ready",
             "silent_end_secs",
             "report_timeout_secs",
+            "delivery_watch_secs",
             "permission_mode",
             "bypass",
             "agents_md",
@@ -541,6 +545,7 @@ pub static SPECS: &[EndpointSpec] = &[
             "auto_stop",
             "auto_stop_idle_secs",
             "report_timeout_secs",
+            "delivery_watch_secs",
         ],
         launch_params: &[
             "model",
@@ -551,6 +556,7 @@ pub static SPECS: &[EndpointSpec] = &[
             "auto_ready",
             "silent_end_secs",
             "report_timeout_secs",
+            "delivery_watch_secs",
             "agents_md",
             "stall_secs",
         ],
@@ -584,6 +590,7 @@ pub static SPECS: &[EndpointSpec] = &[
             "auto_stop",
             "auto_stop_idle_secs",
             "report_timeout_secs",
+            "delivery_watch_secs",
         ],
         launch_params: &[
             "session",
@@ -591,6 +598,7 @@ pub static SPECS: &[EndpointSpec] = &[
             "auto_ready",
             "silent_end_secs",
             "report_timeout_secs",
+            "delivery_watch_secs",
             "agents_md",
             "stall_secs",
         ],
@@ -1031,6 +1039,21 @@ pub fn validate_live_param(provider: &str, kind: &str, key: &str, value: &Value)
             Ok(())
         }
         "report_timeout_secs" => check_report_timeout(provider, kind, value),
+        "delivery_watch_secs" => {
+            if !screen_probe(provider, kind) {
+                return Err(Error::rejected(
+                    "'delivery_watch_secs' only applies to pty endpoints — \
+                     the watchdog needs a screen probe",
+                ));
+            }
+            if !check_stall_secs(value) {
+                return Err(Error::rejected(
+                    "'delivery_watch_secs' must be a non-negative integer (0 \
+                     disables the delivery watchdog) or a bare key removal",
+                ));
+            }
+            Ok(())
+        }
         // CAD-251: unconsumed-inbox warning thresholds.
         "inbox_warn_unread" | "inbox_warn_idle_secs" => {
             if has_actor(provider, kind) {
@@ -1075,7 +1098,8 @@ pub fn validate_live_param(provider: &str, kind: &str, key: &str, value: &Value)
             "'{other}' is not live-settable — allowed keys: auto_ready \
              (pty only), stall_secs, silent_end_secs (pty only), \
              auto_stop=off, auto_stop_idle_secs, \
-             report_timeout_secs (pty only), inbox_warn_unread, \
+             report_timeout_secs (pty only), delivery_watch_secs (pty only), \
+             inbox_warn_unread, \
              inbox_warn_idle_secs (inbox only). Recreate the agent to \
              change wiring params like upstream \
              or session"
@@ -1169,6 +1193,7 @@ pub const POSTURE_PARAMS: &[&str] = &[
     "stall_secs",
     "silent_end_secs",
     "report_timeout_secs",
+    "delivery_watch_secs",
     "turn_idle_secs",
     "turn_max_secs",
     "inbox_warn_unread",
@@ -1539,6 +1564,20 @@ pub fn validate_launch_params(provider: &str, kind: &str, params: &Value) -> Res
     }
     if let Some(v) = params.get("report_timeout_secs") {
         check_report_timeout(provider, kind, v)?;
+    }
+    if let Some(v) = params.get("delivery_watch_secs") {
+        if !screen_probe(provider, kind) {
+            return Err(Error::rejected(
+                "'delivery_watch_secs' only applies to pty endpoints — \
+                 the watchdog needs a screen probe",
+            ));
+        }
+        if !check_stall_secs(v) {
+            return Err(Error::rejected(
+                "'delivery_watch_secs' must be a non-negative integer (0 \
+                 disables the delivery watchdog) or a bare key removal",
+            ));
+        }
     }
     if provider == "devin" && kind == "pty" {
         if let Some(v) = params.get("permission_mode") {

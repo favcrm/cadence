@@ -331,6 +331,43 @@ fn pty_claim_is_single_use_and_expires() {
     assert!(!input.contains("two"), "second send pasted without a claim");
 }
 
+/// CAD-520 F26: a plain `source=user` send to a Devin pane at its
+/// verified idle prompt delivers with no `agent ready` at all — the
+/// probe IS the readiness claim, recorded as `ready_claimed` by the
+/// daemon itself (no `claim_used`, nothing stacked was consumed). The
+/// literal paste lands and the turn reports normally.
+#[test]
+fn pty_devin_idle_probe_is_the_ready_claim() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin("dv1", None);
+    d.wait_agent("dv1", "idle", 20);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": "work the lane", "message": "m1"}),
+    )
+    .unwrap();
+    let token = pty_token(&d, "dv1", "m1");
+    assert!(token.starts_with("pty-"), "{token}");
+    let claim = d
+        .events("dv1")
+        .into_iter()
+        .find(|e| e["kind"].as_str() == Some("ready_claimed"))
+        .expect("the idle probe must admit the send as the claim");
+    assert_eq!(claim["payload"]["by"], "daemon", "{claim}");
+    assert_eq!(claim["payload"]["probe"]["idle"], true, "{claim}");
+    assert!(
+        d.events("dv1")
+            .iter()
+            .all(|e| e["kind"].as_str() != Some("claim_used")),
+        "a stacked claim was consumed: {:?}",
+        d.events("dv1")
+    );
+    let screen = std::fs::read_to_string(d.pane_file(&mock, "dv1", "screen")).unwrap_or_default();
+    assert!(screen.contains("> work the lane"), "{screen}");
+    pty_report_done(&d, "dv1", "m1");
+}
+
 #[test]
 fn pty_ack_then_result_and_duplicate_rules() {
     let d = TestDaemon::start();
@@ -841,7 +878,9 @@ fn join_bootstrap_briefs_and_queues() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    d.wait_agent("w-join", "idle", 20);
+    // CAD-520: the bootstrap self-delivers — the join lands `busy`
+    // running its turn, not `idle` queued behind a claim gate.
+    d.wait_agent("w-join", "busy", 20);
 
     // Briefing persisted under the state dir's briefings/<pm>/ — the
     // PM's repo itself is left byte-identical (audit N8).
@@ -2178,11 +2217,13 @@ fn pty_routed_notice_delivers_idle_without_claim() {
     .unwrap();
     let token = pty_token(&d, "pm", "u1");
     assert!(token.starts_with("pty-"), "{token}");
+    // u1's claim, not the routed notice's: a probe-claimed send carries
+    // no `reason` — "routed" and "steer" only ride those paths.
     let user_claim = d
         .wait_event_where(
             "pm",
             "ready_claimed",
-            |e| e["payload"]["probe"]["idle"] == true,
+            |e| e["payload"]["probe"]["idle"] == true && e["payload"]["reason"].is_null(),
             10,
         )
         .clone();
