@@ -206,11 +206,10 @@ impl Shared {
     /// messages. A refusal happens before the method runs, so it leaves
     /// no write.
     pub(super) fn master_policy(&self, method: &str, params: &Value, peer_pid: u32) -> Result<()> {
-        if method == "agent_register" && optional_str(params, "alias") == Some(ALIAS) {
-            return Err(Error::invalid(
-                "master_reserved",
-                "the alias 'master' is reserved — only `cadence master start` registers it",
-            ));
+        if method == "agent_register" {
+            if let Some(alias) = optional_str(params, "alias") {
+                master::refuse_reserved_alias(alias)?;
+            }
         }
         if !self.caller_is_master(peer_pid) {
             return Ok(());

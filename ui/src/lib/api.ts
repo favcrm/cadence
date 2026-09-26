@@ -90,6 +90,16 @@ export interface WriteResp {
   warnings?: string[];
 }
 
+/** `GET /api/issues/<id>/kickoff` — enough for the drawer confirm. */
+export interface KickoffOptions {
+  defaults: {
+    group?: string | null;
+    provider?: string | null;
+    model?: string | null;
+    effort?: string | null;
+  };
+}
+
 /**
  * The board's write shape: non-simple content type + the custom header.
  * A cross-site page cannot send either without a preflight, and the
@@ -264,6 +274,23 @@ export const api = {
 
   comment: (id: string, body: string, ifRev?: string) =>
     write("POST", `/api/issues/${id}/comments`, { body, if_rev: ifRev }),
+
+  /** `GET /api/issues/<id>/kickoff` — providers, models, groups, defaults. */
+  kickoffOptions: (id: string) =>
+    get<KickoffOptions>(`/api/issues/${encodeURIComponent(id)}/kickoff`),
+
+  /** `POST /api/issues/<id>/kickoff` — operator join + dispatch. */
+  kickoff: (
+    id: string,
+    body: {
+      group: string;
+      provider: string;
+      model?: string;
+      effort?: string;
+      alias?: string;
+      note?: string;
+    },
+  ) => write("POST", `/api/issues/${encodeURIComponent(id)}/kickoff`, body),
 
   attach: async (id: string, name: string, data: Blob): Promise<WriteResp> => {
     const resp = await fetch(

@@ -1,4 +1,4 @@
-import { parseLoginNonce, writeBlock, READ_ONLY_REASON } from "../src/features/auth/gate";
+import { kickoffBlock, parseLoginNonce, writeBlock, READ_ONLY_REASON } from "../src/features/auth/gate";
 import type { Meta } from "../src/lib/types";
 
 function equal(actual: unknown, expected: unknown, what: string): void {
@@ -26,6 +26,14 @@ equal(out.includes("`"), false, "plain text, no markdown backticks");
 const ts = writeBlock({ ...base, signed_in: false, login_hint: "cadence ui login --tailnet" }) ?? "";
 equal(ts.includes("--tailnet"), true, "the tailnet hint");
 equal(writeBlock(base), null, "an older server without sessions");
+
+// CAD-606: Kick off is the operator's session, not any signed-in member.
+equal(writeBlock({ ...base, signed_in: true, operator: false }), null, "a member still passes the write gate");
+equal(kickoffBlock({ ...base, signed_in: true, operator: true }), null, "operator may kick off");
+const member = kickoffBlock({ ...base, signed_in: true, operator: false }) ?? "";
+equal(member.includes("operator"), true, "a member cannot kick off");
+equal(kickoffBlock({ ...base, signed_in: true }) !== null, true, "signed in without the operator proof");
+equal(kickoffBlock(null) !== null, true, "meta not loaded");
 
 // The fragment nonce: 64 lowercase hex, nothing else.
 const nonce = "ab".repeat(32);

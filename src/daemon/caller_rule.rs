@@ -320,6 +320,14 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
              resolution, never caller fields (CAD-378 R6)",
         ),
     ),
+    (
+        "issue_kickoff",
+        Rule::Handler("operator_connection (CAD-606)"),
+    ),
+    (
+        "issue_kickoff_options",
+        Rule::Handler("operator_connection (CAD-606)"),
+    ),
     ("project_work_approvals", Rule::Read),
     (
         "workflow_approve",

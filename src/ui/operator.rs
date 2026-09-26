@@ -103,6 +103,8 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
         RouteClass::AgentAllowed,
     ),
     route("POST", "/api/issues/*/answers", RouteClass::OperatorOnly),
+    // CAD-606: board Kick off — operator-only, same gate as `issue_kickoff`.
+    route("POST", "/api/issues/*/kickoff", RouteClass::OperatorOnly),
     route("POST", "/api/plans/*/approve", RouteClass::OperatorOnly),
     route("POST", "/api/plans/*/reject", RouteClass::OperatorOnly),
     route("POST", "/api/delivery/*/merge", RouteClass::OperatorOnly),
@@ -1261,6 +1263,10 @@ mod tests {
         );
         assert_eq!(
             route_class("POST", "/api/issues/CAD-1/answers"),
+            RouteClass::OperatorOnly
+        );
+        assert_eq!(
+            route_class("POST", "/api/issues/CAD-1/kickoff"),
             RouteClass::OperatorOnly
         );
         assert_eq!(

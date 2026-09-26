@@ -35,6 +35,8 @@ interface Props {
   pmDir?: string;
   detail: IssueDetail | null;
   readOnly: boolean;
+  /** Operator session only. A signed-in member keeps other writes and cannot dispatch. */
+  canKickoff: boolean;
   actor: string;
   onClose: () => void;
   onOpen: (id: string) => void;
@@ -113,6 +115,7 @@ export default function Drawer({
   pmDir,
   detail,
   readOnly,
+  canKickoff,
   actor,
   onClose,
   onOpen,
@@ -138,6 +141,8 @@ export default function Drawer({
   const [refTarget, setRefTarget] = useState("");
   const [refLabel, setRefLabel] = useState("");
   const [comment, setComment] = useState("");
+  const [kickConfirm, setKickConfirm] = useState(false);
+  const [kicking, setKicking] = useState(false);
   const [commentPreview, setCommentPreview] = useState(false);
   const [dropHot, setDropHot] = useState(false);
   const [history, setHistory] = useState<IssueHistoryEntry[] | null>(null);
@@ -264,6 +269,35 @@ export default function Drawer({
         setEdit(null);
       })
       .catch((e) => onError(e, "save"));
+  };
+
+  const kickOff = () => {
+    if (!canKickoff) return;
+    if (!kickConfirm) {
+      setKickConfirm(true);
+      return;
+    }
+    setKicking(true);
+    api
+      .kickoffOptions(id)
+      .then((opts) => {
+        const group = opts.defaults.group ?? "";
+        const provider = opts.defaults.provider ?? "";
+        if (!group || !provider) {
+          throw new Error(
+            "Kick off needs a group and a provider — set a worker default, or use the issue page.",
+          );
+        }
+        const model = opts.defaults.model ?? undefined;
+        const effort = opts.defaults.effort ?? undefined;
+        return api.kickoff(id, { group, provider, model, effort });
+      })
+      .then((r) => {
+        onWrite(r, `${id} kick off`);
+        setKickConfirm(false);
+      })
+      .catch((e) => onError(e, "kick off"))
+      .finally(() => setKicking(false));
   };
 
   const sendComment = () => {
@@ -1075,7 +1109,7 @@ export default function Drawer({
               ? `Editing fields — Save commits once as ${actor}.`
               : readOnly
                 ? "Read-only — the server refuses every write."
-                : "Edits, comments and attaches write through the board API. Dispatch waits for a token."}
+                : "Edits and comments write through the board API. Kick off joins a worker and dispatches."}
           </span>
           <div className="ml-auto flex gap-2 shrink-0">
             {edit ? (
@@ -1104,11 +1138,19 @@ export default function Drawer({
                     Comment
                   </button>
                   <button
-                    disabled
-                    title="dispatch waits for a token — not in I2"
-                    className="h-9 px-3 rounded bg-accent text-on-accent text-secondary font-medium opacity-40 cursor-not-allowed"
+                    type="button"
+                    onClick={kickOff}
+                    disabled={kicking || !canKickoff}
+                    title={
+                      !canKickoff
+                        ? "Kick off is the operator's decision"
+                        : kickConfirm
+                          ? "Join a worker and dispatch this issue"
+                          : "Confirm before kick off"
+                    }
+                    className="h-9 px-3 rounded bg-accent text-on-accent text-secondary font-medium disabled:opacity-45 disabled:cursor-not-allowed"
                   >
-                    Kick off
+                    {kicking ? "Kicking off…" : kickConfirm ? "Confirm kick off" : "Kick off"}
                   </button>
                 </>
               )

@@ -762,3 +762,102 @@ pub(super) fn outbox_gate(
     }
     Ok(())
 }
+
+/// The issue id of `/api/issues/<id>/kickoff`, `None` otherwise.
+pub(super) fn kickoff_route(path: &str) -> Option<&str> {
+    let id = path
+        .strip_prefix("/api/issues/")?
+        .strip_suffix("/kickoff")?;
+    (!id.is_empty() && !id.contains('/')).then_some(id)
+}
+
+/// Body of `POST /api/issues/<id>/kickoff`. The issue id is the path,
+/// never a body field — a body that names one is an unknown field.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KickoffReq {
+    group: String,
+    provider: String,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    effort: Option<String>,
+    #[serde(default)]
+    alias: Option<String>,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+/// `GET /api/issues/<id>/kickoff` — providers, models, groups and
+/// defaults for the Kick off form. Operator-only, like the RPC.
+pub(super) fn kickoff_options(
+    request: &Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+    id: &str,
+) -> HttpResp {
+    let what = format!("GET /api/issues/{id}/kickoff");
+    if let Err(resp) = outbox_gate(request, state_dir, opts, &what) {
+        return resp;
+    }
+    match client::rpc(state_dir, "issue_kickoff_options", json!({"issue": id})) {
+        Ok(out) => json_response(out),
+        Err(e) => rpc_err(&e, "issue_kickoff_options"),
+    }
+}
+
+/// `POST /api/issues/<id>/kickoff` — relay `issue_kickoff`. The path
+/// id is the only issue; unknown body fields (including a forged
+/// `by` / `actor`) are refused before the daemon is asked.
+pub(super) fn post_kickoff(
+    request: &mut Request,
+    state_dir: &std::path::Path,
+    pm_dir: &std::path::Path,
+    id: &str,
+) -> HttpResp {
+    let Ok(id) = model::check_id(id) else {
+        return err_response(400, "bad issue id");
+    };
+    let bytes = match read_body(request, BODY_CAP) {
+        Ok(bytes) => bytes,
+        Err(resp) => return resp,
+    };
+    let req: KickoffReq = match parse_json(&bytes) {
+        Ok(req) => req,
+        Err(resp) => return resp,
+    };
+    let mut params = json!({
+        "issue": id,
+        "group": req.group,
+        "provider": req.provider,
+    });
+    if let Some(model) = req.model {
+        params["model"] = json!(model);
+    }
+    if let Some(effort) = req.effort {
+        params["effort"] = json!(effort);
+    }
+    if let Some(alias) = req.alias {
+        params["alias"] = json!(alias);
+    }
+    if let Some(note) = req.note {
+        params["note"] = json!(note);
+    }
+    let out = match client::rpc(state_dir, "issue_kickoff", params) {
+        Ok(out) => out,
+        Err(e) => return rpc_err(&e, "issue_kickoff"),
+    };
+    let pm = match Pm::at(pm_dir) {
+        Ok(pm) => pm,
+        Err(e) => return err_response(503, &e.to_string()),
+    };
+    match super::issue_payloads(&pm, state_dir, &id) {
+        Ok((card, detail)) => json_response(json!({
+            "issue": detail,
+            "card": card,
+            "warnings": out.get("warnings").cloned().unwrap_or(json!([])),
+            "kickoff": out,
+        })),
+        Err(e) => err_response(500, &e.to_string()),
+    }
+}

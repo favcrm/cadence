@@ -199,6 +199,23 @@ pub fn is_master(alias: &str) -> bool {
     alias == ALIAS
 }
 
+/// Register-time reservation. `master_policy` applies it to
+/// `agent_register`. Kickoff calls `rpc_register` in-process, so that
+/// policy never runs — the caller must refuse here before `issue start`,
+/// or the alias `master` is registered in the issue worktree and
+/// `caller_is_master` plus `master_allow` treat it as the master.
+/// Exact match only: `check_alias` does not case-fold or unicode-fold,
+/// and neither does this.
+pub fn refuse_reserved_alias(alias: &str) -> Result<()> {
+    if is_master(alias) {
+        return Err(Error::invalid(
+            "master_reserved",
+            "the alias 'master' is reserved — only `cadence master start` registers it",
+        ));
+    }
+    Ok(())
+}
+
 /// Env the master's provider gets on top of the usual identity pair:
 /// `gh` finds no stored login (an empty config dir under the state dir),
 /// git never prompts for credentials, and the tracker is named
