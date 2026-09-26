@@ -1,0 +1,378 @@
+#!/usr/bin/env python3
+"""CAD-537: deterministic split of tests/board.rs into per-area binaries.
+
+Same machinery as scripts/split-integration-tests (CAD-426), loaded as a
+module and pointed at the board suite:
+
+  - tests/board_common/mod.rs — the board-only harness: every item used by
+    more than one area plus all type/impl/mod declarations, promoted to
+    `pub` so binaries see them through `use board_common::*`. The shared
+    integration harness in tests/common/ is untouched — board.rs never
+    linked it.
+  - tests/board_<area>.rs    — one test binary per area: its #[test] fns
+    and any helper no other area references.
+  - tests/split-map-board.toml — manifest mapping every test fn and helper
+    to its binary (regenerated; do not hand-edit).
+
+Placement of a test is decided by, in order:
+
+  1. PINNED        — the reviewed CAD-537 cut (every test in board.rs at
+                     split time is listed below);
+  2. PREFIX_RULES  — first matching regex on the test name;
+  3. SECTION_RULES — first matching regex on the `// ---- <section> ----`
+                     marker that introduces the test;
+  4. otherwise the test lands in tests/board_unplaced.rs and the run
+     fails — an explicit pin is required.
+
+Running it again on a newer board.rs reproduces the same layout for every
+test the manifest knows and files new ones by the rules. Run from the
+repo root:
+
+    scripts/split-board-tests            # regenerate + remove source
+    scripts/split-board-tests --check    # verify outputs are current
+
+The one text edit is `mod op`'s #[path]: from board_common/mod.rs it
+needs one more ".." to reach tests/support/operator.rs (TEXT_EDITS).
+"""
+
+import importlib.machinery
+import importlib.util
+import os
+import sys
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_loader = importlib.machinery.SourceFileLoader(
+    "split_integration_tests",
+    os.path.join(_HERE, "split-integration-tests"),
+)
+_spec = importlib.util.spec_from_loader("split_integration_tests", _loader)
+split = importlib.util.module_from_spec(_spec)
+_loader.exec_module(split)
+
+split.SRC = "tests/board.rs"
+split.COMMON = "tests/board_common/mod.rs"
+split.MANIFEST = "tests/split-map-board.toml"
+split.UNPLACED = "tests/board_unplaced.rs"
+
+# --------------------------------------------------------------------------
+# Area binaries, in emission order.
+# --------------------------------------------------------------------------
+
+split.AREAS = [
+    "board_issue",
+    "board_lanes",
+    "board_sync",
+    "board_http",
+    "board_ui_daemon",
+    "board_tailnet",
+    "board_memory",
+    "board_overview",
+    "board_retro",
+    "board_context",
+    "board_sessions",
+    "board_sign_in",
+]
+
+# --------------------------------------------------------------------------
+# The reviewed CAD-537 cut: every #[test] in tests/board.rs at split time,
+# assigned to its binary. A pinned test ignores PREFIX_RULES and
+# SECTION_RULES; a lane that wants a different home edits this table (or
+# the generated map, which re-pins itself on the next run).
+# --------------------------------------------------------------------------
+
+split.PINNED = {
+    # ---- `cadence issue` verbs: CRUD, history, trailers, tags, ls
+    # filters, commit-path confinement.
+    "issue_cli_end_to_end": "board_issue",
+    "issue_acceptance_round_trip_and_refusals": "board_issue",
+    "symlinks_are_never_followed": "board_issue",
+    "writes_validate_fields": "board_issue",
+    "init_hooks_and_doctor": "board_issue",
+    # CAD-41: issue history from git plumbing
+    "issue_log_kinds_actors_limit": "board_issue",
+    "issue_diff_fields_and_files": "board_issue",
+    "issue_blame_attributes_fields": "board_issue",
+    "issue_ls_at_historical_board": "board_issue",
+    "issue_log_other_for_hand_and_revert": "board_issue",
+    "issue_history_api_matches_cli_and_guards": "board_issue",
+    "issue_history_refuses_non_git": "board_issue",
+    # CAD-42: Issue:/Actor: trailers
+    "issue_commits_carry_trailers": "board_issue",
+    "issue_log_by_from_trailers": "board_issue",
+    "issue_detail_lists_code_commits": "board_issue",
+    "issue_detail_dedupes_stale_branch_commits": "board_issue",
+    # CAD-81: tags, epics, filters, bulk edits
+    "issue_tags_round_trip_and_declared_list": "board_issue",
+    "issue_bulk_edits_are_one_atomic_commit": "board_issue",
+    "issue_ls_unknown_project_is_an_error": "board_issue",
+    "issue_ls_filters_and_epics_match_the_api": "board_issue",
+    "issue_ls_cad437_grammar": "board_issue",
+    "epic_and_milestone_ls_cad437_grammar": "board_issue",
+    "issue_trailer_prints_and_validates": "board_issue",
+    "issue_doctor_reports_trailer_share": "board_issue",
+    # Commit-path confinement (from the CAD-313 review-round-2 section —
+    # these are tracker-write tests, not session tests).
+    "issue_comment_never_sweeps_planted_files": "board_issue",
+    "tracker_writes_commit_only_their_own_paths": "board_issue",
+    "plan_commit_stages_only_its_issue_files": "board_issue",
+    "tracker_failed_commit_leaves_nothing_staged": "board_issue",
+    "pm_commit_stages_only_the_named_paths": "board_issue",
+    # ---- lane lifecycle: start, finish, dispatch, claims (CAD-43/55/
+    # 274/275/383).
+    "issue_start_creates_records_and_is_idempotent": "board_lanes",
+    "issue_start_repo_resolution": "board_lanes",
+    "issue_start_conflicting_branch_refused_and_status_owner": "board_lanes",
+    "issue_finish_pairs_branch_when_dir_name_differs": "board_lanes",
+    "issue_ref_and_start_refuse_option_like_values": "board_lanes",
+    "issue_finish_refuses_option_like_refs": "board_lanes",
+    "issue_finish_keep_branch_leaves_its_ref_open": "board_lanes",
+    "issue_finish_never_deletes_an_unrecorded_checked_out_branch": "board_lanes",
+    "issue_finish_daemon_down_force_and_idempotent": "board_lanes",
+    "issue_finish_dirty_and_unmerged_refusals": "board_lanes",
+    "issue_finish_squash_cherry_and_ignored": "board_lanes",
+    "issue_finish_pr_merge_via_gh": "board_lanes",
+    "issue_start_reuses_the_one_open_lane": "board_lanes",
+    "issue_several_open_lanes_refuse_and_finish_one_by_path": "board_lanes",
+    "issue_finish_unstarted_lane_is_never_merged": "board_lanes",
+    "issue_finish_refuses_recent_activity": "board_lanes",
+    "dispatch_refusals_leave_nothing": "board_lanes",
+    "issue_claim_guards_start_and_take_over_is_recorded": "board_lanes",
+    "dispatch_respects_claims": "board_lanes",
+    # ---- CAD-39: issue sync — fetch, rebase, lint, push
+    "sync_rebases_and_levels_two_clones": "board_sync",
+    "sync_conflict_aborts_then_resolves": "board_sync",
+    "sync_lint_failure_aborts": "board_sync",
+    "sync_dry_run_and_no_push": "board_sync",
+    "sync_precondition_refusals": "board_sync",
+    "doctor_reports_divergence_and_sync_hint": "board_sync",
+    "post_commit_hook_refuses_mid_sequence_and_detached": "board_sync",
+    # ---- HTTP surface without a daemon: routes, write path, read-only,
+    # SSE-over-proxy.
+    "ui_routes_and_rejections": "board_http",
+    "ui_write_path": "board_http",
+    "ui_pm_absent_is_honest": "board_http",
+    "read_only_board_refuses_every_write": "board_http",
+    "sse_stream_survives_a_tcp_proxy": "board_http",
+    # ---- I3: the board bound to an in-process daemon — job-derived
+    # status, SSE, agent detail, ui_write caller attribution.
+    "in_process_daemon_stops_from_an_agent_runner": "board_ui_daemon",
+    "in_process_daemon_stops_from_an_agent_runner_probe": "board_ui_daemon",
+    "board_stops_when_its_guard_drops": "board_ui_daemon",
+    "ui_write_caller_derives_from_pane_ancestry": "board_ui_daemon",
+    "ui_model_defaults_refuses_pane_agent": "board_ui_daemon",
+    "ui_write_caller_attributes_a_setsid_child_of_a_pane": "board_ui_daemon",
+    "ui_write_caller_ignores_an_uncorroborated_env_alias": "board_ui_daemon",
+    "ui_write_caller_pty_tie_is_forgeable_residual_pinned": "board_ui_daemon",
+    "ui_job_state_drives_status_and_binding": "board_ui_daemon",
+    "ui_overview_surfaces_durable_monitor_alert_and_acknowledges_it": "board_ui_daemon",
+    "ui_agent_detail_route_and_guards": "board_ui_daemon",
+    "ui_agent_detail_request_opened_carries_no_input": "board_ui_daemon",
+    "ui_stream_sse_and_guards": "board_ui_daemon",
+    "ui_agents_payload_covers_all_kinds": "board_ui_daemon",
+    # ---- CAD-69 + request-level tailnet proof tests.
+    "ui_tailscale_start_shares_and_persists": "board_tailnet",
+    "ui_tailscale_start_while_board_runs_restarts": "board_tailnet",
+    "ui_tailscale_conflicting_mapping_refused": "board_tailnet",
+    "ui_tailscale_logged_out_refused": "board_tailnet",
+    "ui_tailscale_no_https_certs_refused": "board_tailnet",
+    "ui_tailscale_not_running_refused": "board_tailnet",
+    "ui_start_tailscale_requires_loopback": "board_tailnet",
+    "ui_start_tailscale_flag_alias": "board_tailnet",
+    "ui_tailscale_survives_stop_start_cycle": "board_tailnet",
+    "ui_stop_tailscale_off_removes_only_cadences_mapping": "board_tailnet",
+    "ui_tailscale_stop_foreign_mapping_left_alone": "board_tailnet",
+    "ui_tailscale_stop_when_not_sharing": "board_tailnet",
+    "tailnet_shaped_local_write_is_not_the_proxy": "board_tailnet",
+    "tailnet_proof_refusals_name_their_check": "board_tailnet",
+    "tailnet_operator_latch_outlives_a_clear": "board_tailnet",
+    "tailnet_write_with_a_tcp_forwarder_is_not_attributed": "board_tailnet",
+    "forged_tailscale_headers_not_attributed": "board_tailnet",
+    "tailnet_write_wrong_origin_refused": "board_tailnet",
+    # ---- project memory routes and CLI.
+    "memory_writes_require_native_identity": "board_memory",
+    "memory_write_guards": "board_memory",
+    "memory_match_blocks_legacy_records": "board_memory",
+    "memory_stale_flags_changed_paths": "board_memory",
+    "memory_stale_reads_retrieval_freshness": "board_memory",
+    "memory_seed_lessons_require_native_identity": "board_memory",
+    "memory_ui_lists_detail_and_refuses_memory_write": "board_memory",
+    "memory_board_reads_retrieval_freshness": "board_memory",
+    "memory_load_errors_surface_in_cli_and_api": "board_memory",
+    "memory_absent_dir_empty_unreadable_dir_errors": "board_memory",
+    "memory_ls_cad437_grammar": "board_memory",
+    "memory_overcomplex_glob_quarantined_at_load": "board_memory",
+    "memory_lint_bounds_fact_bytes_and_glob": "board_memory",
+    "memory_malformed_timestamp_is_safe": "board_memory",
+    # ---- overview routes.
+    "overview_meta_and_shell_routes": "board_overview",
+    "overview_merge_ready_pr_first_with_exact_command": "board_overview",
+    "overview_github_failure_degrades_not_fails": "board_overview",
+    "overview_tracker_items_and_tracker_behind": "board_overview",
+    "overview_plain_render_shows_sections": "board_overview",
+    "version_reports_build_identity": "board_overview",
+    "overview_daemon_without_daemon_info_stays_reachable": "board_overview",
+    "overview_review_suppressed_by_branch_match": "board_overview",
+    "overview_empty_slug_set_keeps_cached_rows": "board_overview",
+    # ---- issue retro.
+    "retro_reports_rounds_defects_flakes_and_unknowns": "board_retro",
+    "retro_minimal_issue_marks_everything_unknown": "board_retro",
+    "retro_rejects_unknown_issue_and_stays_read_only": "board_retro",
+    "retro_joins_store_verdicts_for_the_issue": "board_retro",
+    # ---- project-context API.
+    "project_context_api_scopes_projects_and_pins_revision": "board_context",
+    "project_context_accepts_ops_and_stores_devops": "board_context",
+    "project_context_dirty_probe_failure_keeps_pinned_documents": "board_context",
+    "project_context_rejects_invalid_paths_and_reports_repository_states": "board_context",
+    "project_context_manifest_conflicts_are_bounded_and_select_nothing": "board_context",
+    "project_context_memories_include_only_verified_lessons_and_bound_withheld": "board_context",
+    # ---- CAD-313/428 operator sessions (adversarial first + both review
+    # rounds), plus the two operator-gated route tests.
+    "a_login_link_opens_exactly_one_session_and_leaves_no_trace": "board_sessions",
+    "a_login_link_expires_after_its_ttl": "board_sessions",
+    "links_and_sessions_are_bound_to_their_origin": "board_sessions",
+    "only_the_operator_with_the_secret_mints_a_login_link": "board_sessions",
+    "a_session_presented_by_an_agent_is_revoked": "board_sessions",
+    "without_a_session_no_process_shape_is_the_operator": "board_sessions",
+    "an_allowed_tailnet_host_without_armed_sharing_trusts_no_header": "board_sessions",
+    "every_classified_write_refuses_a_caller_without_a_session": "board_sessions",
+    "operator_secret_theft_residual_pinned": "board_sessions",
+    "an_early_closed_replay_of_a_stolen_session_writes_nothing": "board_sessions",
+    "every_operator_only_route_runs_the_process_proof": "board_sessions",
+    "route_classes_are_enforced_for_an_agent_caller": "board_sessions",
+    "bogus_sign_ins_never_lock_the_operator_out": "board_sessions",
+    "the_daemon_binds_sessions_to_their_origin_and_refuses_agents": "board_sessions",
+    "a_session_needs_the_cookie_and_the_page_key": "board_sessions",
+    "a_cookie_leaked_to_another_port_is_worthless_alone": "board_sessions",
+    "an_early_closed_replay_with_no_live_agent_writes_nothing": "board_sessions",
+    "setup_is_refused_to_read_only_and_tailnet_viewers": "board_sessions",
+    "model_defaults_http_round_trip_guards_and_conflict": "board_sessions",
+    # ---- CAD-482: the board's assertion headers bind the fixture
+    # credential (test-seam; cfg-gated like their section-mates).
+    "seam_board_headers_require_the_fixture_token": "board_sessions",
+    "unarmed_board_refuses_assertion_headers": "board_sessions",
+    # ---- CAD-526: public-name sign-in (AgenticOS assertion).
+    "platform_sign_in_opens_and_gates_a_named_session": "board_sign_in",
+    "platform_session_refusals": "board_sign_in",
+    "platform_session_fails_closed_when_jwks_is_unreachable": "board_sign_in",
+    "board_session_open_refuses_an_agent_before_consuming_jti": "board_sign_in",
+    "a_member_session_never_decides": "board_sign_in",
+}
+
+# --------------------------------------------------------------------------
+# Rules for tests PINNED does not know (new code on a newer main). Name
+# rules run before section rules; first match wins. Names that match
+# nothing land in board_unplaced.rs and fail the run — add a pin.
+# --------------------------------------------------------------------------
+
+split.PREFIX_RULES = [
+    (r"^ui_tailscale|^ui_(start|stop)_tailscale|^tailnet_|^forged_tailscale",
+     "board_tailnet"),
+    (r"^memory_", "board_memory"),
+    (r"^overview_|^version_reports", "board_overview"),
+    (r"^retro_", "board_retro"),
+    (r"^project_context_", "board_context"),
+    (r"^(platform|board_session)_|^a_member_session", "board_sign_in"),
+    (r"^sync_|^post_commit_hook", "board_sync"),
+    (r"^(issue_(start|finish|claim)|dispatch|lane)_", "board_lanes"),
+    (r"^(ui|in_process_daemon|board_stops)_", "board_ui_daemon"),
+    (r"^(a_login_link|a_session|a_cookie|an_early_closed|an_allowed|"
+     r"only_the_operator|links_and_sessions|without_a_session|"
+     r"every_classified|every_operator|operator_secret|route_classes|"
+     r"bogus_sign_ins|the_daemon_binds)", "board_sessions"),
+    (r"^(issue|epic|tracker|pm_commit|plan_commit|symlinks|writes|init)_",
+     "board_issue"),
+]
+
+split.SECTION_RULES = [
+    (r"^CAD-39\b", "board_sync"),
+    (r"^I3\b", "board_ui_daemon"),
+    (r"^CAD-4[123]\b|^CAD-81\b", "board_issue"),
+    (r"^CAD-55\b|^CAD-274\b|^CAD-275\b|^CAD-383\b", "board_lanes"),
+    (r"^CAD-69\b", "board_tailnet"),
+    (r"^CAD-313\b|^CAD-327\b|^CAD-428\b", "board_sessions"),
+    (r"^CAD-526\b", "board_sign_in"),
+    # 'request-level' and 'issue retro' sections mix areas — no rule;
+    # unmatched names there are unplaced on purpose.
+]
+
+# --------------------------------------------------------------------------
+# Text edits applied to named items while emitting. `mod op` moves down a
+# level (tests/board_common/mod.rs), so its #[path] needs one more ".."
+# to reach tests/support/operator.rs.
+# --------------------------------------------------------------------------
+
+split.TEXT_EDITS = {
+    "op": [
+        (
+            '#[path = "support/operator.rs"]',
+            '#[path = "../support/operator.rs"]',
+        ),
+    ],
+}
+
+split.COMMON_PIN = set()
+
+# rustc is authoritative on unused imports — see DROP_USES in
+# scripts/split-integration-tests. Trait leafs kept on method-name
+# evidence that resolved to inherent methods (BufRead::lines on str,
+# Write::write on String) and `issue::{board, plan, write}` leafs kept
+# on `name::` path mentions are dropped here so the generated tree is
+# warning-free.
+split.DROP_USES = {
+    "tests/board_common/mod.rs": [
+        "cadence_agent::issue::board",
+        "cadence_agent::issue::write",
+        "std::io::BufRead",
+    ],
+    "tests/board_http.rs": ["cadence_agent::issue::write"],
+    "tests/board_issue.rs": ["std::io::BufRead"],
+    "tests/board_lanes.rs": [
+        "cadence_agent::issue::plan",
+        "std::io::BufRead",
+    ],
+    "tests/board_overview.rs": ["std::io::BufRead"],
+    "tests/board_retro.rs": ["std::io::BufRead"],
+    "tests/board_sessions.rs": [
+        "cadence_agent::issue::write",
+        "std::io::BufRead",
+    ],
+    "tests/board_sign_in.rs": [
+        "cadence_agent::issue::board",
+        "std::io::BufRead",
+    ],
+    "tests/board_ui_daemon.rs": [
+        "cadence_agent::issue::board",
+        "cadence_agent::issue::write",
+    ],
+}
+
+split.BIN_PREAMBLE = """//! {area}: area tests split from tests/board.rs (CAD-537).
+//! Board e2e: the `cadence issue` CLI against a temp PM dir, and the
+//! `cadence ui` HTTP server in-process.
+// A test binary never runs the CAD-308 reaper (only `daemon run` does),
+// so its own spawns need not go through `cadence_agent::reaper`.
+#![allow(clippy::disallowed_methods)]
+mod {cm};
+use {cm}::*;
+"""
+
+split.COMMON_PREAMBLE = """//! Shared harness for the split board binaries (CAD-537): the `cadence`
+//! CLI runners, HTTP helpers, board/daemon starters and fixtures that
+//! more than one board area uses. Not every binary uses every helper.
+#![allow(dead_code)]
+"""
+
+# A test before the first section marker with no rule is unplaced — the
+# preamble tests are all pinned, and a new unsectioned test needs a
+# decision, not a default.
+split.PREMARKER_AREA = None
+
+split.MAP_HEADER = [
+    "# CAD-537 — generated by scripts/split-board-tests;",
+    "# do not hand-edit. Re-run the script on a newer",
+    "# tests/board.rs to regenerate this map.",
+]
+
+
+if __name__ == "__main__":
+    sys.exit(split.main())
