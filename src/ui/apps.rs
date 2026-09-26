@@ -334,9 +334,9 @@ fn effect_facts(state_dir: &std::path::Path) -> HashMap<String, EffectFacts> {
     let Ok(conn) = crate::store::open_read_only(&state_dir.join("cadence.sqlite3")) else {
         return HashMap::new();
     };
-    let Ok(mut stmt) = conn.prepare(
-        "SELECT effect_id, task, state, input, input_summary FROM platform_effects",
-    ) else {
+    let Ok(mut stmt) =
+        conn.prepare("SELECT effect_id, task, state, input, input_summary FROM platform_effects")
+    else {
         return HashMap::new();
     };
     let rows = stmt.query_map([], |r| {

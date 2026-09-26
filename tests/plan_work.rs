@@ -1038,7 +1038,10 @@ fn workflow_input_shape_is_enforced_server_side() {
         "--file",
         &file,
     ]);
-    assert!(ok && out["approved"] == false, "re-declaring re-gates: {out}");
+    assert!(
+        ok && out["approved"] == false,
+        "re-declaring re-gates: {out}"
+    );
     let (ok, out) = f.cli(&["workflow", "approve", "post", "--project", "demo"]);
     assert!(ok, "{out}");
 

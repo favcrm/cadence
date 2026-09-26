@@ -1866,7 +1866,10 @@ label: New post\ninputs:\n  topic: { ask: \"About what?\", example: \"How we onb
 ## Write {{topic}}\nagent: dev-1\n\nposts/{{slug}}/post.md\n\n### Acceptance\n- [ ] written\n";
         let tpl = parse_template(SHAPED).unwrap();
         assert_eq!(tpl.inputs["slug"].kind, Some(InputKind::Slug));
-        assert_eq!(tpl.inputs["topic"].example.as_deref(), Some("How we onboard"));
+        assert_eq!(
+            tpl.inputs["topic"].example.as_deref(),
+            Some("How we onboard")
+        );
         let rows = inputs_json(&tpl);
         assert_eq!(rows[1]["kind"], "slug", "{rows:?}");
         assert_eq!(rows[0]["example"], "How we onboard", "{rows:?}");
@@ -1903,7 +1906,10 @@ label: New post\ninputs:\n  topic: { ask: \"About what?\", example: \"How we onb
 
         // The shape is structural; the example is wording.
         let no_shape = SHAPED.replace(", kind: slug", "");
-        assert_ne!(gate_digest(SHAPED).unwrap(), gate_digest(&no_shape).unwrap());
+        assert_ne!(
+            gate_digest(SHAPED).unwrap(),
+            gate_digest(&no_shape).unwrap()
+        );
         let no_example = SHAPED.replace(", example: \"How we onboard\"", "");
         assert_eq!(
             gate_digest(SHAPED).unwrap(),
@@ -1912,12 +1918,9 @@ label: New post\ninputs:\n  topic: { ask: \"About what?\", example: \"How we onb
         );
         // An example the shape refuses refuses the file; a shaped one
         // parses; an unknown kind and a non-string one refuse.
-        let e = parse_template(&SHAPED.replace(
-            "kind: slug",
-            "kind: slug, example: \"My Post\"",
-        ))
-        .unwrap_err()
-        .to_string();
+        let e = parse_template(&SHAPED.replace("kind: slug", "kind: slug, example: \"My Post\""))
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("does not fit"), "{e}");
         let ok_example = SHAPED.replace("kind: slug", "kind: slug, example: \"my-post\"");
         assert_eq!(
