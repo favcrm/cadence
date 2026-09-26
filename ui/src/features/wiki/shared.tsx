@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import Link from "../../ui/Link";
+import { IconFolder, IconLock, IconWiki } from "../../ui/icons";
 import { breadcrumbs } from "./paths";
 import type { WikiKind } from "./api";
 
@@ -7,34 +8,14 @@ import type { WikiKind } from "./api";
 export const WIKI_ROOT_LABEL = "~/pm/wiki";
 
 export function KindIcon({ kind, size = 14 }: { kind: WikiKind; size?: number }) {
-  return kind === "dir" ? (
-    <svg width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4">
-      <path d="M2 4.5h4l1.2 1.5H14v6.5a1 1 0 01-1 1H3a1 1 0 01-1-1v-8z" />
-    </svg>
-  ) : (
-    <svg width={size} height={size} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4">
-      <path d="M3.5 1.8h6l3 3v9.4h-9z" />
-      <path d="M5.8 7.5h4.4M5.8 10h4.4" />
-    </svg>
-  );
+  return kind === "dir" ? <IconFolder size={size} /> : <IconWiki size={size} />;
 }
 
 export function LockIcon({ size = 11 }: { size?: number }) {
   return (
-    <svg
-      className="wk-lock"
-      width={size}
-      height={size}
-      viewBox="0 0 16 16"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="1.5"
-      aria-label="read-only"
-      role="img"
-    >
-      <rect x="3.2" y="7" width="9.6" height="6.8" rx="1.4" />
-      <path d="M5.6 7V5.2a2.4 2.4 0 014.8 0V7" />
-    </svg>
+    <span className="wk-lock" role="img" aria-label="read-only">
+      <IconLock size={size} />
+    </span>
   );
 }
 
@@ -114,14 +95,9 @@ export function EmptyCard({
   return (
     <div className="wk-empty card">
       {warn ? (
-        <svg width="34" height="34" viewBox="0 0 16 16" fill="none" stroke="var(--color-warn)" strokeWidth="1.3">
-          <rect x="3.2" y="7" width="9.6" height="6.8" rx="1.4" />
-          <path d="M5.6 7V5.2a2.4 2.4 0 014.8 0V7" />
-        </svg>
+        <IconLock size={34} style={{ color: "var(--color-warn)" }} />
       ) : (
-        <svg width="34" height="34" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.1">
-          <path d="M2 4.5h4l1.2 1.5H14v6.5a1 1 0 01-1 1H3a1 1 0 01-1-1v-8z" />
-        </svg>
+        <IconFolder size={34} />
       )}
       <div className="wk-etitle">{title}</div>
       {children && <div className="wk-ebody">{children}</div>}

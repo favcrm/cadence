@@ -7,13 +7,17 @@ import type { ComponentProps, CSSProperties } from "react";
 import {
   Alert02Icon,
   ArrowDown01Icon,
+  ArrowRight01Icon,
   Cancel01Icon,
   ContrastIcon,
   CubeIcon,
+  DashboardSquare01Icon,
   File01Icon,
+  Folder01Icon,
   Home01Icon,
   KanbanIcon,
   MailSend01Icon,
+  Menu01Icon,
   Moon02Icon,
   MoreHorizontalIcon,
   Pulse01Icon,
@@ -23,6 +27,8 @@ import {
   Settings02Icon,
   SquareLock01Icon,
   Sun01Icon,
+  Tick02Icon,
+  Upload01Icon,
 } from "@hugeicons/core-free-icons";
 
 /** What a semantic icon takes: the size (each export has the board's
@@ -75,13 +81,21 @@ export const IconOutbox = ({ size = 15, ...rest }: IconProps = {}) => (
 export const IconSettings = ({ size = 15, ...rest }: IconProps = {}) => (
   <Glyph icon={Settings02Icon} size={size} {...rest} />
 );
-/** Wiki — the page store. */
+/** Wiki — the page store, and a page or file in the tree. */
 export const IconWiki = ({ size = 15, ...rest }: IconProps = {}) => (
   <Glyph icon={File01Icon} size={size} {...rest} />
+);
+/** A folder in the wiki tree and its empty state. */
+export const IconFolder = ({ size = 14, ...rest }: IconProps = {}) => (
+  <Glyph icon={Folder01Icon} size={size} {...rest} />
 );
 /** The disclosure chevron; rotate it for open rows. */
 export const IconChevron = ({ size = 10, ...rest }: IconProps = {}) => (
   <Glyph icon={ArrowDown01Icon} size={size} {...rest} />
+);
+/** Tree disclosure; the row rotates it when the folder is open. */
+export const IconCaret = ({ size = 10, ...rest }: IconProps = {}) => (
+  <Glyph icon={ArrowRight01Icon} size={size} {...rest} />
 );
 /** Close a drawer or a panel. */
 export const IconClose = ({ size = 12, ...rest }: IconProps = {}) => (
@@ -122,4 +136,20 @@ export const IconSun = ({ size = 14, ...rest }: IconProps = {}) => (
 /** Theme: dark. */
 export const IconMoon = ({ size = 14, ...rest }: IconProps = {}) => (
   <Glyph icon={Moon02Icon} size={size} {...rest} />
+);
+/** Drop files into the wiki. */
+export const IconUpload = ({ size = 34, ...rest }: IconProps = {}) => (
+  <Glyph icon={Upload01Icon} size={size} {...rest} />
+);
+/** A completed upload. */
+export const IconCheck = ({ size = 13, ...rest }: IconProps = {}) => (
+  <Glyph icon={Tick02Icon} size={size} {...rest} />
+);
+/** Folder view: grid. */
+export const IconGrid = ({ size = 12, ...rest }: IconProps = {}) => (
+  <Glyph icon={DashboardSquare01Icon} size={size} {...rest} />
+);
+/** Folder view: list. */
+export const IconList = ({ size = 12, ...rest }: IconProps = {}) => (
+  <Glyph icon={Menu01Icon} size={size} {...rest} />
 );

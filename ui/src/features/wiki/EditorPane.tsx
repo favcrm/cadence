@@ -3,6 +3,7 @@ import type { Route } from "../../lib/router";
 import { sessionStore } from "../../lib/draft";
 import { navigate } from "../../lib/useLocation";
 import Md from "../../ui/Md";
+import { IconWarning } from "../../ui/icons";
 import { wiki, type WikiPage } from "./api";
 import {
   conflictFrom,
@@ -196,11 +197,7 @@ export default function EditorPane({
 
       {conflict && (
         <div className="wk-conflict" role="alert">
-          <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
-            <path d="M8 2.4L14.4 13.2H1.6L8 2.4z" />
-            <path d="M8 6.6v3" />
-            <circle cx="8" cy="11.4" r=".7" fill="currentColor" stroke="none" />
-          </svg>
+          <IconWarning size={13} />
           <span className="min-w-0">{conflictText(conflict)}</span>
           <Btn onClick={() => setShowDiff((s) => !s)}>review diff</Btn>
           <Btn onClick={() => void reload()}>reload</Btn>
