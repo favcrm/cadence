@@ -1075,6 +1075,69 @@ fn workflow_input_shape_is_enforced_server_side() {
     assert!(out["epic"].is_string(), "{out}");
 }
 
+/// CAD-586: the repo's `apps/social-content` installs, approves and
+/// proposes a run — the four steps in dependency order (Adapt → Image →
+/// Review → Publish), the slug shape enforced on its `slug` input, the
+/// per-destination captions written under `social/<slug>/`, and the
+/// Publish step bound to the `publish` slot the manifest declares.
+#[test]
+fn social_content_app_installs_approves_and_proposes() {
+    let f = PlanFixture::start();
+    for a in ["w-1", "d-1", "r-1", "p-1"] {
+        f.d.register(a);
+    }
+    let src = concat!(env!("CARGO_MANIFEST_DIR"), "/apps/social-content");
+    let (ok, out) = f.cli(&["app", "install", src, "--project", "demo"]);
+    assert!(ok, "{out}");
+    let (ok, out) = f.cli(&["app", "approve", "social-content", "--project", "demo"]);
+    assert!(ok, "{out}");
+
+    let inputs = |slug: &str| {
+        json!({"source": "https://example.com/p/1", "slug": slug,
+               "destinations": "instagram, facebook",
+               "writer": "w-1", "designer": "d-1", "reviewer": "r-1",
+               "publisher": "p-1"})
+    };
+    let err =
+        f.d.operator_rpc(
+            "plan_propose",
+            json!({"project": "demo", "workflow": "social-content/social-localize",
+                   "inputs": inputs("../x")}),
+        )
+        .unwrap_err();
+    assert_eq!(err.code(), Some("bad_shape"), "{err}");
+
+    let out =
+        f.d.operator_rpc(
+            "plan_propose",
+            json!({"project": "demo", "workflow": "social-content/social-localize",
+                   "inputs": inputs("kura-ramen-summer")}),
+        )
+        .unwrap();
+    let tickets: Vec<String> = out["tickets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(tickets.len(), 4, "{out}");
+
+    // Adapt writes one caption per destination under the run's folder;
+    // Publish stages the send on the slot it names.
+    let adapt = issue_body(&f, &tickets[0]);
+    assert!(
+        adapt.contains("social/kura-ramen-summer/caption-<destination>.md"),
+        "{adapt}"
+    );
+    assert!(adapt.contains("instagram, facebook"), "{adapt}");
+    let publish = issue_body(&f, &tickets[3]);
+    assert!(publish.contains("uses: publish"), "{publish}");
+    assert!(
+        publish.contains("social/kura-ramen-summer/caption-<destination>.md"),
+        "{publish}"
+    );
+}
+
 /// CAD-571 N5: for a multi-workflow app the Apps list card's primary
 /// action and the app page's are the same workflow — the sorted first
 /// (`aa-early`), never whatever order the directory walk hands back.
