@@ -1379,6 +1379,33 @@ fn agentic_provider_master_open_and_concurrent_switch_refuse() {
     pi.close();
 }
 
+#[test]
+fn agentic_provider_master_detached_child_refuses() {
+    // Session detachment must not change the policy: adapter identity,
+    // not process ancestry or an agent-supplied role field, owns the gate.
+    if std::env::var_os("CADENCE_602_DETACHED_PROOF").is_some() {
+        agentic_provider_master_open_and_concurrent_switch_refuse();
+        return;
+    }
+    let out = std::process::Command::new("setsid")
+        .args(["--fork", "--wait"])
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "agentic_provider_master_detached_child_refuses",
+            "--nocapture",
+        ])
+        .env("CADENCE_602_DETACHED_PROOF", "1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "detached proof failed: {} {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// The `wrong-model` fake accepts `--model` then reports a different
 /// one — Pi's silent-fallback shape. `open` must refuse rather than
 /// trust the launch flag.
