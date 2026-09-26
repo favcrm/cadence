@@ -18,32 +18,6 @@ use std::time::Duration;
 use std::time::Instant;
 use tempfile::TempDir;
 
-/// Whether the calling test named `name` should run its body here. A
-/// test whose subject is process-global — the real env, a signal to
-/// the whole process — must not share a process with parallel tests:
-/// the first call re-runs just `name` in a child of this binary with
-/// `envs` in its env from birth, asserts it ran and passed, and returns
-/// false; in that child it returns true.
-fn in_own_process(name: &str, envs: &[(&str, &str)]) -> bool {
-    const CHILD: &str = "CADENCE_TEST_OWN_PROCESS";
-    if std::env::var(CHILD).ok().as_deref() == Some(name) {
-        return true;
-    }
-    let out = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", name, "--nocapture"])
-        .env(CHILD, name)
-        .envs(envs.iter().copied())
-        .output()
-        .unwrap();
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        out.status.success() && stdout.contains(" 1 passed"),
-        "{name} failed in its own process:\n{stdout}\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    false
-}
-
 #[test]
 fn codex_approval_policy_defaults_to_never_and_replays_on_resume() {
     let d = TestDaemon::start();

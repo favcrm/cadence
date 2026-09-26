@@ -288,6 +288,11 @@ fn mock_config_never_touches_process_env() {
     let exempt = ["\"PATH\"", "\"GL_TOKEN\""];
     let mut sources = vec![std::path::PathBuf::from("tests/common/mod.rs")];
     let map = std::fs::read_to_string("tests/split-map.toml").unwrap();
+    // The map names only what the generator split out of
+    // integration.rs; hand-written binaries that share the harness
+    // must be listed by hand — `test_seam` held the last live
+    // reference to the dropped env lock when it went unscanned.
+    sources.extend(["tests/test_seam.rs"].iter().map(std::path::PathBuf::from));
     sources.extend(map.lines().filter_map(|l| {
         l.strip_prefix("[binaries.")
             .and_then(|s| s.strip_suffix(']'))
