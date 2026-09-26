@@ -16,13 +16,14 @@ interface Props {
   title: string;
   body: string;
   groups: string[];
+  blocked: string | null;
   onClose: () => void;
   onWrite: (resp: WriteResp, verb: string) => void;
   onDone: (text: string) => void;
   planHref: string;
 }
 
-export default function KickoffDialog({ id, title, body, groups, onClose, onWrite, onDone, planHref }: Props) {
+export default function KickoffDialog({ id, title, body, groups, blocked, onClose, onWrite, onDone, planHref }: Props) {
   const [step, setStep] = useState<"edit" | "confirm">("edit");
   const [provider, setProvider] = useState(KICKOFF_CHOICES[0].id);
   const [model, setModel] = useState(KICKOFF_CHOICES[0].models[0].id);
@@ -77,6 +78,7 @@ export default function KickoffDialog({ id, title, body, groups, onClose, onWrit
   };
 
   const send = () => {
+    if (blocked || busy || !group.trim()) return;
     const req = kickoffRequest(id, { group, provider, model, effort, note });
     setBusy(true);
     setError(null);
@@ -117,6 +119,7 @@ export default function KickoffDialog({ id, title, body, groups, onClose, onWrit
           <span className="kicker">{step === "edit" ? id : "operator"}</span>
         </header>
         <div className="overflow-auto px-4 py-4 grid gap-3">
+          {blocked && <p className="text-secondary text-fail m-0" role="alert">{blocked}</p>}
           {step === "edit" ? (
             <>
               <p className="text-secondary text-ink-400 m-0">
@@ -214,12 +217,12 @@ export default function KickoffDialog({ id, title, body, groups, onClose, onWrit
           {step === "edit" ? (
             <>
               <Button onClick={onClose}>Cancel</Button>
-              <Button variant="primary" disabled={!group.trim()} onClick={() => setStep("confirm")}>Continue</Button>
+              <Button variant="primary" disabled={!!blocked || busy || !group.trim()} onClick={() => { if (!blocked && !busy && group.trim()) setStep("confirm"); }}>Continue</Button>
             </>
           ) : (
             <>
               <Button onClick={() => setStep("edit")}>Back</Button>
-              <Button variant="primary" loading={busy} disabled={!group.trim()} onClick={send}>
+              <Button variant="primary" loading={busy} disabled={!!blocked || !group.trim()} onClick={send}>
                 Kick off
               </Button>
             </>

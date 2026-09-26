@@ -28,7 +28,7 @@ import Setup from "./features/setup/Setup";
 import SetupNudge from "./features/setup/SetupNudge";
 import Login from "./features/auth/Login";
 import SignIn from "./features/auth/SignIn";
-import { writeBlock } from "./features/auth/gate";
+import { kickoffBlock as operatorKickoffBlock, writeBlock } from "./features/auth/gate";
 import { WriteGate } from "./features/auth/WriteGate";
 import { sessionKey, setSessionKey } from "./lib/sessionKey";
 import { buildChanged, serverBuild, subscribeSse, UI_BUILD } from "./lib/sse";
@@ -737,6 +737,7 @@ export default function App() {
             agents={agents ?? null}
             readOnly={readOnly}
             writeBlock={block}
+            kickoffBlock={operatorKickoffBlock(meta)}
             onWrite={applyWrite}
             onError={writeError}
             onOpen={(issueId) => {

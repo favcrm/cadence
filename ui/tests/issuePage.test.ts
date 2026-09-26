@@ -1,3 +1,5 @@
+import { kickoffBlock as operatorKickoffBlock, writeBlock as ordinaryWriteBlock } from "../src/features/auth/gate";
+import type { Meta } from "../src/lib/types";
 import type { IssueDetail, IssueHistoryEntry } from "../src/lib/types";
 import {
   acceptanceItems,
@@ -80,6 +82,17 @@ equal(acceptanceItems("```\n## Acceptance\n- [ ] inside\n```"), [], "fenced head
 equal(kickoffBlock([], null), NO_ACCEPTANCE, "no acceptance blocks kick off");
 equal(kickoffBlock(acceptanceItems(body), null), null, "checks allow kick off");
 equal(kickoffBlock(acceptanceItems(body), "Writes are off."), "Writes are off.", "a write block still wins");
+
+// A signed-in member passes ordinary writes but must never pass dispatch.
+const operatorMeta = { read_only: false, signed_in: true, operator: true } as Meta;
+const memberMeta = { ...operatorMeta, operator: false };
+equal(ordinaryWriteBlock(memberMeta), null, "member passes the ordinary write gate");
+equal(kickoffBlock(acceptanceItems(body), operatorKickoffBlock(memberMeta)) !== null, true, "member cannot kick off");
+equal(kickoffBlock(acceptanceItems(body), operatorKickoffBlock(null)) !== null, true, "unknown session cannot kick off");
+equal(kickoffBlock(acceptanceItems(body), operatorKickoffBlock({ ...operatorMeta, signed_in: false })) !== null, true, "signed-out session cannot kick off");
+equal(kickoffBlock(acceptanceItems(body), operatorKickoffBlock({ ...operatorMeta, read_only: true })) !== null, true, "read-only operator cannot kick off");
+equal(kickoffBlock(acceptanceItems(body), operatorKickoffBlock(operatorMeta)), null, "operator with acceptance can kick off");
+equal(kickoffBlock([], operatorKickoffBlock(operatorMeta)), NO_ACCEPTANCE, "operator still needs acceptance");
 
 equal(approveReason([]), "No pull request yet", "approve without a PR");
 equal(approveReason([{ kind: "pr" }]).includes("cadence audit approve"), true, "approve names the missing route");
