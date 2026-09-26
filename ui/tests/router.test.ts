@@ -49,8 +49,12 @@ for (const dead of ["/overview/x", "/nope", "/projects/x/y", "/agents/a/b", "/ap
   equal(matchRoute(dead).screen, "notFound", `not found ${dead}`);
 }
 
-// Main nav: MVP screens only.
-equal(NAV.map((n) => n.label), ["Home", "Projects", "Apps", "Agents", "Outbox", "Settings"], "nav");
+// Main nav: MVP screens only (Wiki joined in CAD-581).
+equal(
+  NAV.map((n) => n.label),
+  ["Home", "Projects", "Wiki", "Apps", "Agents", "Outbox", "Settings"],
+  "nav",
+);
 
 // Reading a location: the slug is the scope on Projects, ?project= elsewhere.
 {

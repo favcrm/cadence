@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "test:url-state": "tmp_dir=$(mktemp -d \"${TMPDIR:-/tmp}/cadence-ui-url-state.XXXXXX\") && trap 'rm -rf \"$tmp_dir\"' EXIT && tsc --target ES2022 --module commonjs --moduleResolution node --lib ES2023,DOM --skipLibCheck --rootDir . --outDir \"$tmp_dir\" tests/*.test.ts && for t in \"$tmp_dir\"/tests/*.test.js; do node \"$t\" || exit 1; done",
+    "test:url-state": "tmp_dir=$(mktemp -d \"${TMPDIR:-/tmp}/cadence-ui-url-state.XXXXXX\") && trap 'rm -rf \"$tmp_dir\"' EXIT && tsc --target ES2022 --module commonjs --moduleResolution node --lib ES2023,DOM --skipLibCheck --jsx react-jsx --rootDir . --outDir \"$tmp_dir\" tests/*.test.ts && for t in \"$tmp_dir\"/tests/*.test.js; do NODE_PATH=\"$PWD/node_modules\" node \"$t\" || exit 1; done",
     "typecheck": "tsc --noEmit",
     "preview": "vite preview"
   },
