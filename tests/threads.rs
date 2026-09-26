@@ -3080,9 +3080,13 @@ fn cad551_master_command_board_gate() {
     assert_eq!(st["model_label"], "fake/model-1", "{st}");
 
     // An agent-attributed request is refused by the board itself, even
-    // with an operator session pasted on (the session is stolen).
+    // with an operator session pasted on (the session is stolen). The
+    // request asserts `agent:wk2` (CAD-482: the seam carries the caller
+    // on the request); without a seam the detached managed child's own
+    // ancestry attributes it the same way.
     let mut wk = ManagedWorker::start(d, "wk2");
-    let request = master_command_request(port, &guards, r#"{"command":"stop"}"#);
+    let agent_guards = op_guards_as(&op, &op::seam_headers(&d.state, "agent:wk2"));
+    let request = master_command_request(port, &agent_guards, r#"{"command":"stop"}"#);
     let r = wk.exec(&[
         "bash",
         "-c",
