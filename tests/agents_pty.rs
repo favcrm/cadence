@@ -2910,6 +2910,12 @@ fn agent_capabilities_match_the_registry_table() {
     test_env().set("CADENCE_DEVIN_ORG_ID", "");
     test_env().set("CADENCE_DEVIN_API_BASE", "http://127.0.0.1:9");
     let d = TestDaemon::start();
+    // CAD-559: the pi spec only registers under an operator [pi]
+    // policy — the bound pm dir gets one so `models.default.worker`
+    // fills the probe's model-less registration.
+    if let Some(pm) = test_env().var("CADENCE_PM_DIR") {
+        pi_policy_pm(Path::new(&pm));
+    }
     let cwd = d.dir.path().to_str().unwrap().to_string();
     for spec in registry::SPECS {
         let alias = format!("cap-{}-{}", spec.provider, spec.endpoint_kind);
