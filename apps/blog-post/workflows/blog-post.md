@@ -77,11 +77,12 @@ PR head before staging anything; a REVISE goes back, it never reaches
 this step.
 
 Stage the `publish` send on the `publish` slot: `platform_call` with
-platform `local`, account `outbox`, tool `publish`, and input naming
-the project, the post's title, the rendered body of
-posts/{{slug}}/post.md, and its images as attachments. Report the
-staged effect id. The operator's release in Needs-you moves the post
-to the outbox — this step never publishes directly.
+platform `local`, account `local` (the built-in outbox — no
+enrollment), tool `publish`, and input naming the project, the post's
+title, the rendered body of posts/{{slug}}/post.md, and its images as
+attachments. Report the staged effect id. The operator's release in
+Needs-you moves the post to the outbox — this step never publishes
+directly.
 
 ### Acceptance
 - [ ] the `publish` send is staged on the `publish` slot — a waiting row in Needs-you, its preview the rendered post

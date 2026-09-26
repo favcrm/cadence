@@ -2173,7 +2173,10 @@ pub fn show(pm: &Pm, project_key: &str, name: &str, state_dir: &Path) -> Result<
 /// `plan propose --workflow <app>/<wf>` resolution — the daemon's read:
 /// the app must be installed (record included), its current digest must
 /// match the operator's recorded approval (`app_unapproved` otherwise),
-/// then the workflow renders exactly as a stored one would.
+/// then the workflow renders exactly as a stored one would. The app's
+/// saved default team (CAD-577) fills any team role the proposal left
+/// unset — the operator set it, so a fresh install runs with only a
+/// topic; an explicit input still wins.
 pub fn plan_text(
     pm_dir: &Path,
     app_approvals: &std::collections::HashMap<String, Value>,
@@ -2183,7 +2186,7 @@ pub fn plan_text(
     provided: &BTreeMap<String, String>,
 ) -> Result<String> {
     let _ = app_dir(pm_dir, project, app)?;
-    let _ = read_record(pm_dir, project, app)?;
+    let record = read_record(pm_dir, project, app)?;
     let text = read_workflow(pm_dir, project, app, wf)?;
     // The digest covers THIS buffer for the rendered workflow — the
     // bytes the operator approved are the bytes rendered, even if a
@@ -2205,7 +2208,15 @@ pub fn plan_text(
             ),
         ));
     }
-    workflow::render(&text, provided)
+    // The saved default team fills any team role the proposal left unset
+    // (CAD-577) — the operator's own choice, stored with the install
+    // record, so a fresh install proposes with only its topic. An
+    // explicit input still wins: the caller named that agent.
+    let mut inputs = provided.clone();
+    for (role, agent) in &record.team {
+        inputs.entry(role.clone()).or_insert_with(|| agent.clone());
+    }
+    workflow::render(&text, &inputs)
 }
 
 /// `app approve`'s view of the INSTALLED folder — the same strict scan
