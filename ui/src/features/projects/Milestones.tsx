@@ -26,7 +26,7 @@ export default function Milestones({ project, issues, onOpenIssue }: {
     <ResourceGate state={state} loading="Loading roadmap…" failed="Could not load milestones" onRetry={retry} />
     {errors.map((error) => <p key={error} className="card p-3 mb-3 text-label text-warn" role="note">{error}</p>)}
     {undefinedCount > 0 && <p className="roadmap-notice" role="note">{undefinedCount} {undefinedCount === 1 ? "checkpoint needs a definition" : "checkpoints need definitions"}. Tasks are linked, but the goal, owner, dates, and completion criteria haven’t been set.</p>}
-    {state.data && visible.length === 0 && <p className="card px-4 py-5 text-secondary text-ink-400">{rows.length ? "No upcoming or active milestones." : "No delivery checkpoints yet."}</p>}
+    {state.data && visible.length === 0 && <p className="card project-card-padding text-secondary text-ink-400">{rows.length ? "No upcoming or active milestones." : "No delivery checkpoints yet."}</p>}
     <ol className="milestone-roadmap" aria-label="Delivery roadmap">
       {visible.map((milestone) => <MilestoneCheckpoint key={milestone.id} milestone={milestone} rows={rows} onOpenIssue={onOpenIssue} />)}
     </ol>
@@ -41,7 +41,7 @@ export function MilestoneCheckpoint({ milestone: m, rows, onOpenIssue }: {
   const tasks = m.tasks ?? m.issues;
   const pending = (m.depends_on ?? []).filter((id) => rows.find((row) => row.id === id)?.status !== "achieved");
   const finished = m.status === "achieved" || m.status === "cancelled";
-  return <li className="milestone-checkpoint" data-milestone={m.id} data-checkpoint-status={m.status ?? "undefined"}>
+  return <li className="milestone-checkpoint project-card-padding" data-milestone={m.id} data-checkpoint-status={m.status ?? "undefined"}>
     <div className="checkpoint-heading">
       <div className="min-w-0">
         <div className="flex flex-wrap items-center gap-2 mb-2"><span className="num text-micro text-ink-500">{m.id}</span><span className={`chip ${m.status === "active" ? "bg-accent/10 text-accent" : m.status === "achieved" ? "bg-ok/10 text-ok" : "bg-ink-800 text-ink-400"}`}>{checkpointLabel(m)}</span>{schedule && <span className="text-micro text-warn">{schedule}</span>}</div>

@@ -90,7 +90,7 @@ export default function Epics({
         </p>
       ))}
       {issues.data && epics.length === 0 && (
-        <div className="card px-4 py-5 text-secondary text-ink-400">
+        <div className="card project-card-padding text-secondary text-ink-400">
           No active epics in {project}. Group related tasks into an epic when they deliver one capability or outcome.
         </div>
       )}
@@ -136,7 +136,7 @@ function EpicRow({
     .sort((a, b) => Number(b.blocked || b.status === "review") - Number(a.blocked || a.status === "review"));
   return (
     <li className="card min-w-0" data-epic={epic.id}>
-      <div className="px-3.5 py-3 min-w-0">
+      <div className="project-card-padding min-w-0">
         <button
           type="button"
           onClick={onToggle}
@@ -222,7 +222,7 @@ function EpicDetail({
   };
 
   return (
-    <div className="border-t border-ink-700 px-3.5 py-3 grid gap-4 md:grid-cols-2 min-w-0">
+    <div className="border-t border-ink-700 project-card-padding grid gap-4 md:grid-cols-2 min-w-0">
       <section className="min-w-0" aria-label={`${epic.id} children`}>
         <div className="slabel mb-1.5">Tasks · {kids.length}</div>
         {kids.length === 0 ? (

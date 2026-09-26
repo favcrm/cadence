@@ -60,7 +60,7 @@ export default function Workflows({
       <p className="text-label text-ink-500 mb-5">Start repeatable work from a workflow. Review its plan before agents begin.</p>
       <ResourceGate state={state} loading="loading workflows…" failed="could not load workflows" onRetry={() => void resources.workflows(project).invalidate()} />
       {state.data && rows.length === 0 && (
-        <div className="card px-4 py-5 text-secondary text-ink-400">
+        <div className="card project-card-padding text-secondary text-ink-400">
           <h2 className="text-section text-ink-100 font-semibold">No workflows yet</h2>
           <p className="mt-2 max-w-xl">Workflows turn recurring work into a repeatable plan. Installed apps can also provide workflows.</p>
           <Link href="/apps" className="lnk inline-block mt-4">Explore apps ↗</Link>
@@ -104,7 +104,7 @@ function WorkflowCard({
   const app = row.app ?? null;
   return (
     <li className="card min-w-0" data-workflow={row.name}>
-      <div className="px-3.5 py-3 min-w-0">
+      <div className="project-card-padding min-w-0">
         {app ? (
           <div className="w-full text-left flex items-start gap-2 min-w-0">
             <span className="num text-label text-accent shrink-0 pt-px">{row.name}</span>
