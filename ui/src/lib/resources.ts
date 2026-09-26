@@ -16,6 +16,7 @@ import type {
   AppRow,
   IssueCard,
   IssueDetail,
+  MasterState,
   MilestoneRow,
   OutboxItem,
   Overview,
@@ -61,6 +62,13 @@ export const resources = {
    */
   overview: cache.resource<Overview>("overview", () => api.overview(), { freshMs: 30_000 }),
   masterThread,
+  /**
+   * `GET /api/master/state` — the master's provider session chips and
+   * in-flight turn (CAD-551). A daemon that predates the route fails the
+   * fetch and the header falls back to the agents row. Home revalidates
+   * it when `agents` moves and after a `masterCommand`.
+   */
+  masterState: cache.resource<MasterState>("masterState", () => api.masterState()),
   /** `GET /api/issues/<id>` — one drawer's detail (and a plan card's epic). */
   issue: cache.family<string, IssueDetail>("issue", (id) => api.issue(id)),
   /** `GET /api/milestones?project=` — one project's milestone roll-ups (CAD-432). */
