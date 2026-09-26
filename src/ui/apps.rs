@@ -624,6 +624,25 @@ mod tests {
         }
     }
 
+    /// The revoke route's shape: `POST /api/apps/<project>/<name>/revoke`.
+    #[test]
+    fn revoke_route_is_exact() {
+        assert_eq!(
+            revoke_route("/api/apps/demo/studio/revoke"),
+            Some(("demo", "studio"))
+        );
+        for dead in [
+            "/api/apps",
+            "/api/apps/demo/studio",
+            "/api/apps/demo/studio/approve",
+            "/api/apps/demo/revoke",
+            "/api/apps//studio/revoke",
+            "/api/apps/demo/studio/revoke/extra",
+        ] {
+            assert_eq!(revoke_route(dead), None, "{dead}");
+        }
+    }
+
     /// The team route and body shape (CAD-577).
     #[test]
     fn team_route_and_body_are_exact() {

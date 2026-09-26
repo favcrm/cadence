@@ -619,6 +619,20 @@ equal(
   false,
   "every role must be filled",
 );
+// Steps that name literal agents declare no team roles. An empty role
+// set is already satisfied — New post must not wait on a team that
+// does not exist (review 344, note 6).
+const literal: AppWorkflow = {
+  ...wf,
+  inputs: [{ name: "title", ask: "What?" }],
+  steps: [{ title: "Do: title", agent: "dev-1" }],
+};
+equal(teamInputs(literal), [], "a literal agent is not a team role");
+equal(
+  readyChecklist({ ...fresh, workflows: [literal], team: {} }).find((i) => i.key === "team")?.done,
+  true,
+  "no roles to fill means the team is set",
+);
 
 // The team picker's candidates: registered agents, inboxes out, sorted.
 equal(

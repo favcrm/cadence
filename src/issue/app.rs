@@ -184,6 +184,12 @@ fn app_dir(pm_dir: &Path, project: &str, name: &str) -> Result<PathBuf> {
     }
 }
 
+/// Whether `apps/<name>/` is a real directory. The grant sweep uses
+/// this to tell a removed app from a digest that failed to read.
+pub fn is_installed(pm_dir: &Path, project: &str, name: &str) -> bool {
+    app_dir(pm_dir, project, name).is_ok()
+}
+
 /// `apps/<name>.yaml` — the install record.
 fn record_file(pm_dir: &Path, project: &str, name: &str) -> Result<PathBuf> {
     check_name(name, "app name")?;
@@ -1401,7 +1407,8 @@ fn derived_grant_holders(project_key: &str, name: &str, state_dir: &Path) -> Vec
     let Ok(conn) = crate::store::open_read_only(&db) else {
         return Vec::new();
     };
-    let Ok(mut stmt) = conn.prepare("SELECT DISTINCT agent FROM app_grants WHERE app=? ORDER BY agent")
+    let Ok(mut stmt) =
+        conn.prepare("SELECT DISTINCT agent FROM app_grants WHERE app=? ORDER BY agent")
     else {
         return Vec::new();
     };
@@ -1412,14 +1419,53 @@ fn derived_grant_holders(project_key: &str, name: &str, state_dir: &Path) -> Vec
     rows.flatten().collect()
 }
 
+/// Withdraw the approval and its derived grants before the folder goes
+/// (CAD-577). A missing store means there is nothing to revoke. If the
+/// holders are still there and the side write fails, removal refuses —
+/// deleting the folder first would leave a grant nothing can name.
+fn revoke_derived_on_remove(
+    project_key: &str,
+    name: &str,
+    state_dir: &Path,
+    actor: &str,
+) -> Result<()> {
+    let holders = derived_grant_holders(project_key, name, state_dir);
+    if holders.is_empty() {
+        return Ok(());
+    }
+    let db = state_dir.join("cadence.sqlite3");
+    let refuse = |why: &str| {
+        Error::rejected(format!(
+            "app '{name}' still holds the grants its approval derived ({}) — \
+             revoke them first (`cadence app revoke {name} --project \
+             {project_key}`): {why}",
+            holders.join(", ")
+        ))
+    };
+    let store = crate::store::Store::open_side(&db).map_err(|e| refuse(&e.to_string()))?;
+    let by = if actor.is_empty() { "cli" } else { actor };
+    let payload = json!({
+        "project": project_key,
+        "name": name,
+        "digest": Value::Null,
+        "revoked": true,
+        "by": by,
+        "at": crate::issue::time::iso(crate::issue::time::now_epoch()),
+        "reason": "removed",
+    });
+    store
+        .app_revoke_with_record(payload, &approval_key(project_key, name), by)
+        .map_err(|e| refuse(&e.to_string()))?;
+    Ok(())
+}
+
 /// `cadence app remove <app> --project <key>` — delete the content
 /// folder and its install record in one tracker commit. Refuses while a
 /// plan proposed from the app is still open — an open plan's tickets
-/// keep their provenance readable. Refuses too while the app's
-/// approval still holds derived grants (CAD-577): deleting the folder
-/// is a tracker write no daemon sees, so a removal before the revoke
-/// would leave the agents holding a standing grant with nothing left
-/// to revoke it by name.
+/// keep their provenance readable. Revokes the approval's derived
+/// grants first (CAD-577): deleting the folder is a tracker write the
+/// daemon does not see, so the grants are withdrawn here, on a side
+/// connection that does not run restart recovery.
 pub fn remove(
     pm: &Pm,
     project_key: &str,
@@ -1438,15 +1484,7 @@ pub fn remove(
             open.join(", ")
         )));
     }
-    let holders = derived_grant_holders(project_key, name, state_dir);
-    if !holders.is_empty() {
-        return Err(Error::rejected(format!(
-            "app '{name}' still holds the grants its approval derived ({}) — \
-             revoke them first (`cadence app revoke {name} --project \
-             {project_key}`)",
-            holders.join(", ")
-        )));
-    }
+    revoke_derived_on_remove(project_key, name, state_dir, actor)?;
     let _lock = pm.lock()?;
     std::fs::remove_dir_all(&dir)?;
     if record_path.exists() {
@@ -2244,13 +2282,20 @@ pub fn plan_text(
             ),
         ));
     }
-    // The saved default team fills any team role the proposal left unset
-    // (CAD-577) — the operator's own choice, stored with the install
-    // record, so a fresh install proposes with only its topic. An
-    // explicit input still wins: the caller named that agent.
+    // The saved default team fills any team role THIS workflow declares
+    // and the proposal left unset (CAD-577). The team record is the
+    // union across the app's workflows; filling a role another workflow
+    // declares makes `render` refuse `unknown input`. An explicit input
+    // still wins: the caller named that agent.
+    let declared = workflow::parse_template(&text).ok();
     let mut inputs = provided.clone();
     for (role, agent) in &record.team {
-        inputs.entry(role.clone()).or_insert_with(|| agent.clone());
+        if declared
+            .as_ref()
+            .is_some_and(|tpl| tpl.inputs.contains_key(role))
+        {
+            inputs.entry(role.clone()).or_insert_with(|| agent.clone());
+        }
     }
     workflow::render(&text, &inputs)
 }

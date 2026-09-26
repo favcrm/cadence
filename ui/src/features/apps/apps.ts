@@ -650,14 +650,15 @@ export interface ReadyItem {
  * The app's Ready-to-run checklist (CAD-577): approved · team set ·
  * publishes to the local outbox. New post is enabled only when all three
  * are done. The team is "set" when every team role the workflow declares
- * has an agent in the saved default team.
+ * has an agent in the saved default team. A workflow whose steps name
+ * literal agents declares no roles, so an empty role set is already set.
  */
 export function readyChecklist(app: AppDetail): ReadyItem[] {
   const action = primaryAction(app);
   const wf = action?.wf ?? (app.workflows ?? [])[0];
   const roles = wf ? teamInputs(wf) : [];
   const team = app.team ?? {};
-  const teamSet = roles.length > 0 && roles.every((r) => (team[r] ?? "").trim() !== "");
+  const teamSet = roles.every((r) => (team[r] ?? "").trim() !== "");
   const slots = usedSlots(app);
   const publishes = slots.length > 0 && slots.every((s) => publishTarget(app, s) === "Local outbox");
   return [

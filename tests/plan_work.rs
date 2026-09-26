@@ -1955,6 +1955,206 @@ fn app_revoke_revokes_derived_grants() {
         )
         .unwrap_err();
     assert_eq!(err.code(), Some("app_unapproved"), "{err}");
+
+    // An agent cannot revoke: the verb is the operator's, like approve.
+    let mut pane = LaneShell::spawn(f.tmp.path());
+    plant_pane(&f.d, "pane-9", pane.pid());
+    let r = pane.rpc(
+        &f.d.state,
+        "app_revoke",
+        json!({"project": "demo", "name": "roles"}),
+    );
+    assert_eq!(r["ok"], false, "agent revoke admitted: {r}");
+}
+
+/// Review 344: a team change drops the agent who left. Approving with
+/// publisher=dev-1 then setting the team to dev-2 must not leave dev-1
+/// holding `local/local publish`.
+#[test]
+fn rev344_team_change_drops_the_old_agents_grant() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    f.d.register("dev-2");
+    app_install_roles(&f);
+    f.d.operator_rpc(
+        "app_set_team",
+        json!({"project": "demo", "name": "roles", "team": ["publisher=dev-1"]}),
+    )
+    .unwrap();
+    f.d.operator_rpc("app_approve", json!({"project": "demo", "name": "roles"}))
+        .unwrap();
+    assert_eq!(
+        grant_scopes(&f, "dev-1", "local", "local").unwrap(),
+        vec!["publish".to_string()]
+    );
+
+    f.d.operator_rpc(
+        "app_set_team",
+        json!({"project": "demo", "name": "roles", "team": ["publisher=dev-2"]}),
+    )
+    .unwrap();
+    assert!(
+        grant_scopes(&f, "dev-1", "local", "local").is_none(),
+        "dev-1 left the team — its derived grant must be gone"
+    );
+    assert_eq!(
+        grant_scopes(&f, "dev-2", "local", "local").unwrap(),
+        vec!["publish".to_string()]
+    );
+}
+
+/// Review 344: re-approving a structure that no longer declares the
+/// scope drops the old grant. Unbinding `publish` derives nothing.
+#[test]
+fn rev344_reapproval_drops_a_scope_the_new_structure_dropped() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    app_install_roles(&f);
+    f.d.operator_rpc(
+        "app_set_team",
+        json!({"project": "demo", "name": "roles", "team": ["publisher=dev-1"]}),
+    )
+    .unwrap();
+    f.d.operator_rpc("app_approve", json!({"project": "demo", "name": "roles"}))
+        .unwrap();
+    assert!(grant_scopes(&f, "dev-1", "local", "local").is_some());
+
+    let (ok, out) = f.cli(&["app", "set", "roles", "publish=", "--project", "demo"]);
+    assert!(ok, "{out}");
+    f.d.operator_rpc("app_approve", json!({"project": "demo", "name": "roles"}))
+        .unwrap();
+    assert!(
+        grant_scopes(&f, "dev-1", "local", "local").is_none(),
+        "the new structure derives nothing on local/local — the old scope must be gone"
+    );
+}
+
+/// Review 344: `app remove` after approve leaves the agent with no
+/// derived grant. The folder delete revokes first.
+#[test]
+fn app_remove_drops_the_derived_grant() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    app_install_roles(&f);
+    f.d.operator_rpc(
+        "app_set_team",
+        json!({"project": "demo", "name": "roles", "team": ["publisher=dev-1"]}),
+    )
+    .unwrap();
+    f.d.operator_rpc("app_approve", json!({"project": "demo", "name": "roles"}))
+        .unwrap();
+    assert!(grant_scopes(&f, "dev-1", "local", "local").is_some());
+
+    let (ok, out) = f.cli(&["app", "remove", "roles", "--project", "demo"]);
+    assert!(ok, "{out}");
+    assert!(
+        grant_scopes(&f, "dev-1", "local", "local").is_none(),
+        "approve then remove must leave no derived grant"
+    );
+}
+
+/// Review 344 note 4: revoking app A subtracts only the scopes no other
+/// approved app still derives for the same agent.
+#[test]
+fn revoking_one_app_keeps_a_scope_another_app_still_derives() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    app_install_roles(&f);
+    f.d.operator_rpc(
+        "app_set_team",
+        json!({"project": "demo", "name": "roles", "team": ["publisher=dev-1"]}),
+    )
+    .unwrap();
+    f.d.operator_rpc("app_approve", json!({"project": "demo", "name": "roles"}))
+        .unwrap();
+
+    let src = app_src(
+        &f,
+        "other",
+        &[
+            (
+                "app.md",
+                "---\napp: other\ntitle: Other\nversion: 0.1.0\nneeds:\n  connections: [publish]\n---\n\nbody\n",
+            ),
+            (
+                "workflows/publish.md",
+                "---\ntitle: \"Go: {{title}}\"\ngoal: g\ninputs:\n  title: {}\n  publisher: {}\n---\n\n## Publish\nagent: {{publisher}}\nuses: publish\n\n### Acceptance\n- [ ] done\n",
+            ),
+        ],
+    );
+    let (ok, out) = f.cli(&["app", "install", src.to_str().unwrap(), "--project", "demo"]);
+    assert!(ok, "{out}");
+    f.d.operator_rpc(
+        "app_set_team",
+        json!({"project": "demo", "name": "other", "team": ["publisher=dev-1"]}),
+    )
+    .unwrap();
+    f.d.operator_rpc("app_approve", json!({"project": "demo", "name": "other"}))
+        .unwrap();
+    assert_eq!(
+        grant_scopes(&f, "dev-1", "local", "local").unwrap(),
+        vec!["publish".to_string()]
+    );
+
+    f.d.operator_rpc("app_revoke", json!({"project": "demo", "name": "roles"}))
+        .unwrap();
+    assert_eq!(
+        grant_scopes(&f, "dev-1", "local", "local").unwrap(),
+        vec!["publish".to_string()],
+        "app B still derives publish — revoking A must not cut it"
+    );
+    f.d.operator_rpc("app_revoke", json!({"project": "demo", "name": "other"}))
+        .unwrap();
+    assert!(
+        grant_scopes(&f, "dev-1", "local", "local").is_none(),
+        "the last app's revoke drops the shared scope"
+    );
+}
+
+/// Review 344 note 5: the saved team is the union of every workflow's
+/// roles. Proposing one workflow fills only the roles that workflow
+/// declares — a sibling role is not an unknown input.
+#[test]
+fn propose_fills_only_the_rendered_workflows_roles() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    f.d.register("dev-2");
+    let src = app_src(
+        &f,
+        "multi",
+        &[
+            (
+                "app.md",
+                "---\napp: multi\ntitle: Multi\nversion: 0.1.0\nneeds:\n  connections: [publish]\n---\n\nbody\n",
+            ),
+            (
+                "workflows/go.md",
+                "---\ntitle: \"Go: {{title}}\"\ngoal: g\ninputs:\n  title: {}\n  publisher: {}\n---\n\n## Work {{title}}\nagent: {{publisher}}\nuses: publish\n\n### Acceptance\n- [ ] done\n",
+            ),
+            (
+                "workflows/edit.md",
+                "---\ntitle: \"Edit: {{title}}\"\ngoal: g\ninputs:\n  title: {}\n  editor: {}\n---\n\n## Edit {{title}}\nagent: {{editor}}\n\n### Acceptance\n- [ ] done\n",
+            ),
+        ],
+    );
+    let (ok, out) = f.cli(&["app", "install", src.to_str().unwrap(), "--project", "demo"]);
+    assert!(ok, "{out}");
+    f.d.operator_rpc(
+        "app_set_team",
+        json!({"project": "demo", "name": "multi",
+               "team": ["publisher=dev-1", "editor=dev-2"]}),
+    )
+    .unwrap();
+    f.d.operator_rpc("app_approve", json!({"project": "demo", "name": "multi"}))
+        .unwrap();
+    let out =
+        f.d.operator_rpc(
+            "plan_propose",
+            json!({"project": "demo", "workflow": "multi/go",
+                   "inputs": {"title": "x"}}),
+        )
+        .unwrap();
+    assert_eq!(out["committed"], true, "{out}");
 }
 
 /// CAD-547: install is safe on hostile input — a symlink anywhere in

@@ -372,3 +372,86 @@
         assert_eq!(counts("a1"), vec![json!({"submitting": 4, "submitted": 4})]);
         assert_eq!(counts("a2"), vec![json!({"submitting": 4, "submitted": 0})]);
     }
+
+    fn publish_grant() -> Vec<super::platform::Derived> {
+        vec![(
+            "dev-1".to_string(),
+            "local".to_string(),
+            "local".to_string(),
+            vec!["publish".to_string()],
+        )]
+    }
+
+    /// A reconcile that still holds the pre-revoke digest must not put
+    /// the grant back (CAD-577 review 344, note 3).
+    #[test]
+    fn stale_reconcile_after_revoke_does_not_restore_the_grant() {
+        let (_dir, s) = store();
+        let grants = publish_grant();
+        s.record_app_approval(json!({
+            "project": "demo", "name": "roles",
+            "digest": "sha256:abc", "by": "operator",
+        }))
+        .unwrap();
+        s.app_grants_set("demo/roles", &grants, "operator").unwrap();
+        s.app_revoke_with_record(
+            json!({
+                "project": "demo", "name": "roles",
+                "digest": Value::Null, "revoked": true, "by": "operator",
+            }),
+            "demo/roles",
+            "operator",
+        )
+        .unwrap();
+        s.app_grants_reconcile("demo/roles", Some("sha256:abc"), &grants, "operator")
+            .unwrap();
+        assert!(s
+            .platform_grant("dev-1", "local", "local")
+            .unwrap()
+            .is_none());
+    }
+
+    /// Revoke and reconcile share the write lock. Whichever runs second
+    /// sees the other's commit, so the grant does not survive.
+    #[test]
+    fn concurrent_revoke_and_reconcile_leave_the_grant_revoked() {
+        use std::sync::Arc;
+        use std::thread;
+        let (_dir, s) = store();
+        let s = Arc::new(s);
+        let grants = publish_grant();
+        for _ in 0..32 {
+            s.record_app_approval(json!({
+                "project": "demo", "name": "roles",
+                "digest": "sha256:abc", "by": "operator",
+            }))
+            .unwrap();
+            s.app_grants_set("demo/roles", &grants, "operator").unwrap();
+            let a = Arc::clone(&s);
+            let g = grants.clone();
+            let t1 = thread::spawn(move || {
+                a.app_grants_reconcile("demo/roles", Some("sha256:abc"), &g, "operator")
+                    .unwrap();
+            });
+            let b = Arc::clone(&s);
+            let t2 = thread::spawn(move || {
+                b.app_revoke_with_record(
+                    json!({
+                        "project": "demo", "name": "roles",
+                        "digest": Value::Null, "revoked": true, "by": "operator",
+                    }),
+                    "demo/roles",
+                    "operator",
+                )
+                .unwrap();
+            });
+            t1.join().unwrap();
+            t2.join().unwrap();
+            assert!(
+                s.platform_grant("dev-1", "local", "local")
+                    .unwrap()
+                    .is_none(),
+                "a reconcile that raced a revoke must not leave the grant"
+            );
+        }
+    }

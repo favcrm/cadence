@@ -587,50 +587,68 @@ impl Shared {
     }
 
     /// Reconcile one app's derived grants with its current approval
-    /// (CAD-577): if the installed digest still matches the operator's
-    /// `app_approved` record, re-derive the grants from the workflow
-    /// steps and the app's team; otherwise revoke the app's derived
-    /// grants (a structural change revoked the approval) and drain any
-    /// waiting effect that lost a scope. Best-effort on a read failure
-    /// — `app remove` is the verb that deletes the app, and it revokes
-    /// separately.
+    /// (CAD-577). The store re-reads the approval under the write lock,
+    /// so a revoke that landed after this call computed the digest
+    /// cannot be overwritten by the stale derivation. An app whose
+    /// folder is gone is revoked here too — removal deletes the tracker
+    /// files, and a later propose of anything else sweeps the leftovers.
     pub(super) fn reconcile_app_grants(&self, project: &str, name: &str) {
-        let Ok(pm_dir) = self.pm_dir() else { return };
-        let key = crate::issue::app::approval_key(project, name);
-        let digest = match crate::issue::app::digest(&pm_dir, project, name) {
-            Ok(d) => d,
-            Err(_) => return,
+        self.sweep_removed_app_grants();
+        let Ok(pm_dir) = self.pm_dir() else {
+            return;
         };
-        let approved = self
-            .store
-            .app_approvals()
-            .ok()
-            .and_then(|a| {
-                a.get(&key)
-                    .and_then(|p| p["digest"].as_str().map(str::to_string))
-            })
-            .as_deref()
-            == Some(digest.as_str());
-        if approved {
-            let Ok(derived) = crate::issue::app::derive_grants(&pm_dir, project, name) else {
-                return;
-            };
-            let grants: Vec<(String, String, String, Vec<String>)> = derived
-                .iter()
-                .map(|g| {
-                    (
-                        g.agent.clone(),
-                        g.platform.clone(),
-                        g.account.clone(),
-                        g.scopes.clone(),
-                    )
-                })
-                .collect();
-            if let Ok(changed) = self.store.app_grants_set(&key, &grants, "operator") {
+        let key = crate::issue::app::approval_key(project, name);
+        if !crate::issue::app::is_installed(&pm_dir, project, name) {
+            if let Ok(changed) = self.store.app_grants_reconcile(&key, None, &[], "operator") {
                 self.drain_effect_scopes(changed);
             }
-        } else if let Ok(changed) = self.store.app_grants_revoke(&key, "operator") {
+            return;
+        }
+        let Ok(digest) = crate::issue::app::digest(&pm_dir, project, name) else {
+            return;
+        };
+        let Ok(derived) = crate::issue::app::derive_grants(&pm_dir, project, name) else {
+            return;
+        };
+        let grants: Vec<(String, String, String, Vec<String>)> = derived
+            .iter()
+            .map(|g| {
+                (
+                    g.agent.clone(),
+                    g.platform.clone(),
+                    g.account.clone(),
+                    g.scopes.clone(),
+                )
+            })
+            .collect();
+        if let Ok(changed) =
+            self.store
+                .app_grants_reconcile(&key, Some(digest.as_str()), &grants, "operator")
+        {
             self.drain_effect_scopes(changed);
+        }
+    }
+
+    /// Revoke derived grants whose app folder is gone (CAD-577). A
+    /// removal that raced a propose, or a folder deleted by hand, leaves
+    /// `app_grants` rows nothing else would notice.
+    fn sweep_removed_app_grants(&self) {
+        let Ok(pm_dir) = self.pm_dir() else {
+            return;
+        };
+        let Ok(apps) = self.store.app_grants_apps() else {
+            return;
+        };
+        for key in apps {
+            let Some((project, name)) = key.split_once('/') else {
+                continue;
+            };
+            if crate::issue::app::is_installed(&pm_dir, project, name) {
+                continue;
+            }
+            if let Ok(changed) = self.store.app_grants_revoke(&key, "operator") {
+                self.drain_effect_scopes(changed);
+            }
         }
     }
 
@@ -699,8 +717,11 @@ impl Shared {
             "by": "operator",
             "at": crate::issue::time::iso(crate::issue::time::now_epoch()),
         });
-        self.store.record_app_approval(payload.clone())?;
-        let changed = self.store.app_grants_revoke(&key, "operator")?;
+        // The approval write and the grant subtract share one
+        // transaction, so a reconcile cannot re-derive between them.
+        let changed = self
+            .store
+            .app_revoke_with_record(payload, &key, "operator")?;
         self.drain_effect_scopes(changed);
         self.wake();
         Ok(json!({"project": project, "name": name, "revoked": true}))
@@ -767,12 +788,7 @@ impl Shared {
                 )
             })
             .collect();
-        let changed = self.store.app_grants_set(
-            &crate::issue::app::approval_key(project, name),
-            &grants,
-            "operator",
-        )?;
-        self.drain_effect_scopes(changed);
+        let key = crate::issue::app::approval_key(project, name);
         let payload = json!({
             "project": project,
             "name": name,
@@ -785,7 +801,12 @@ impl Shared {
                 "account": g.account, "scopes": g.scopes,
             })).collect::<Vec<_>>(),
         });
-        self.store.record_app_approval(payload.clone())?;
+        // Approval and grants land together. A re-approval subtracts
+        // the previous derivation inside that same write.
+        let changed =
+            self.store
+                .app_approve_with_grants(payload.clone(), &key, &grants, "operator")?;
+        self.drain_effect_scopes(changed);
         self.wake();
         Ok(payload)
     }

@@ -797,6 +797,15 @@ tests = [
     "app_install_git_pins_url_and_transport",
     "app_approve_takes_the_pm_lock",
     "social_localize_reviewer_equal_writer_is_not_distinct",
+    "app_approval_derives_grants",
+    "app_add_worker_joins_and_records_the_role",
+    "plan_approve_resumes_the_runs_stopped_team_agents",
+    "app_revoke_revokes_derived_grants",
+    "rev344_team_change_drops_the_old_agents_grant",
+    "rev344_reapproval_drops_a_scope_the_new_structure_dropped",
+    "app_remove_drops_the_derived_grant",
+    "revoking_one_app_keeps_a_scope_another_app_still_derives",
+    "propose_fills_only_the_rendered_workflows_roles",
 ]
 helpers = [
     "events_of_kind",
@@ -1056,6 +1065,7 @@ tests = [
     "board_app_workflow_list_preview_and_propose",
     "board_apps_list_and_detail",
     "board_app_approve_is_the_operators",
+    "board_app_revoke_is_the_operators",
     "board_app_runs_are_the_apps_plans",
     "board_app_outputs_are_the_runs_and_operator_only",
     "cad432_board_stage_moves_are_operator_only_and_relayed",
