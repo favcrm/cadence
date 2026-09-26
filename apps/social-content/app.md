@@ -59,7 +59,7 @@ release in one glance — caption first, image second.
 
 ## Images
 
-- Keep the source image when it is on-brand; edit it when a crop or an
+- Keep the run's image when it is on-brand; edit it when a crop or an
   overlay is needed; write an image brief when the image must be made.
 - Every image carries alt text a screen reader can use, naming the
   product, not the layout.

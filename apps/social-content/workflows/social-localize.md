@@ -49,15 +49,15 @@ Decide the image and leave the decision as files under
 
 - keep or edit the run's image when there is one — an image file
   already in `social/{{slug}}/` — and leave it at `image.<ext>`;
-- write `image-brief.md` when the image must be made: what it shows,
-  the mood, any copy on it, and the alt text.
+- always write `image-brief.md`: what the image shows (or that the run
+  keeps its image), the mood, any copy on it, and the alt text.
 
 Never claim an image exists before its file is committed — "making" is
 not "made".
 
 ### Acceptance
 - [ ] `social/{{slug}}/image.<ext>` holds the kept or edited image, or `image-brief.md` says what to make and why
-- [ ] alt text is written for every image (in the brief, or beside the file)
+- [ ] `image-brief.md` carries the alt text for every image the run ships
 
 ## Review: {{slug}}
 agent: {{reviewer}}
