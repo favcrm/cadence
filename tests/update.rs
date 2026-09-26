@@ -306,6 +306,9 @@ impl UpdateHost for Host {
         }
         Ok(list)
     }
+    fn pending(&self) -> Option<PendingUpdate> {
+        self.pending.borrow().clone()
+    }
     fn set_pending(&self, pending: Option<&PendingUpdate>) -> Result<()> {
         *self.pending.borrow_mut() = pending.cloned();
         match pending {

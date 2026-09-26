@@ -3567,6 +3567,8 @@ pub(crate) struct RealUpdateHost<'a> {
     /// Collect the plain lines for `--json`; `None` prints them as they
     /// happen (the plain form).
     collect: Option<std::cell::RefCell<Vec<String>>>,
+    /// The marker this run last recorded, for the drain re-assertion.
+    pending: std::cell::RefCell<Option<cadence_agent::update::PendingUpdate>>,
 }
 
 impl RealUpdateHost<'_> {
@@ -3618,6 +3620,7 @@ impl cadence_agent::update::UpdateHost for RealUpdateHost<'_> {
             .unwrap_or_default())
     }
     fn set_pending(&self, pending: Option<&cadence_agent::update::PendingUpdate>) -> Result<()> {
+        *self.pending.borrow_mut() = pending.cloned();
         match pending {
             Some(pending) => cadence_agent::update::write_pending(self.state_dir, pending),
             None => {
@@ -3626,13 +3629,16 @@ impl cadence_agent::update::UpdateHost for RealUpdateHost<'_> {
             }
         }
     }
+    fn pending(&self) -> Option<cadence_agent::update::PendingUpdate> {
+        self.pending.borrow().clone()
+    }
     fn set_drain(&self, on: bool) -> Result<()> {
         let mut params = json!({"on": on, "label": self.label});
         if on {
             // The phase comes from the marker the pipeline just wrote;
             // a daemon that is not running is not an error (there is
             // nothing to drain, and the restart will start it).
-            let pending = cadence_agent::update::pending_update(self.state_dir);
+            let pending = self.pending.borrow().clone();
             if let Some(pending) = pending {
                 params["target"] = json!(pending.target);
                 params["phase"] = json!(pending.phase);

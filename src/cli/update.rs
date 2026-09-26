@@ -52,6 +52,7 @@ pub(super) fn run_update(state_dir: &Path, args: UpdateArgs) -> Result<i32> {
         source: cadence_agent::upgrade::Gh::new(&args.repo),
         label: caller.identity.clone(),
         collect: args.json.then(|| std::cell::RefCell::new(Vec::new())),
+        pending: std::cell::RefCell::new(None),
     };
     if args.status {
         let status = client::rpc(state_dir, "update_status", json!({})).unwrap_or_else(

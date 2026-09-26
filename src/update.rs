@@ -62,9 +62,13 @@ pub const BACKUP_KEEP: usize = 5;
 /// boot (so a restart mid-update stays drained) and by the board (the
 /// draining banner). Written and removed by the update itself.
 pub const UPDATE_FILE: &str = "update.json";
-/// A pending-update file older than this is stale — an update that
-/// died without cleaning up — and the daemon ignores it.
-pub const UPDATE_STALE_SECS: f64 = 2.0 * 3600.0;
+/// A pending-update file not written for this long is stale — an update
+/// that died without cleaning up — and the daemon ignores it. The file's
+/// mtime is the update's heartbeat: the pipeline rewrites the marker on
+/// every phase change and every minute of the drain, so a live update is
+/// never older than this, and a dead one stops draining the fleet within
+/// minutes instead of wedging it.
+pub const UPDATE_STALE_SECS: f64 = 300.0;
 
 /// The default backup directory for an update: a sibling of the state
 /// dir, so the copy survives a state-dir mishap and needs no manual
@@ -98,13 +102,19 @@ impl PendingUpdate {
     }
 }
 
-/// Read `<state>/update.json` — `None` when absent, unreadable, or
-/// older than [`UPDATE_STALE_SECS`].
+/// Read `<state>/update.json` — `None` when absent, unreadable, or not
+/// written for [`UPDATE_STALE_SECS`] (its mtime is the heartbeat).
 pub fn pending_update(state_dir: &Path) -> Option<PendingUpdate> {
-    let text = std::fs::read_to_string(update_file(state_dir)).ok()?;
+    let path = update_file(state_dir);
+    let text = std::fs::read_to_string(&path).ok()?;
     let pending: PendingUpdate = serde_json::from_str(&text).ok()?;
-    let now = rollout::unix_now();
-    (pending.since > 0.0 && now - pending.since < UPDATE_STALE_SECS).then_some(pending)
+    let written = std::fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs_f64();
+    (pending.since > 0.0 && rollout::unix_now() - written < UPDATE_STALE_SECS).then_some(pending)
 }
 
 /// Write the pending-update marker (the daemon and the board read it).
@@ -298,6 +308,9 @@ pub trait UpdateHost {
     fn waiters(&self) -> Result<Vec<Waiter>>;
     /// Record the pending-update phase, or clear it with `None`.
     fn set_pending(&self, pending: Option<&PendingUpdate>) -> Result<()>;
+    /// The marker this process last recorded — the drain re-assertion
+    /// re-writes it so its `since` stays the update's own start.
+    fn pending(&self) -> Option<PendingUpdate>;
     /// Ask the daemon to stop starting new turns (`true`) or lift it.
     fn set_drain(&self, on: bool) -> Result<()>;
     /// Restart the daemon on `binary` (the new release), blocking until
@@ -590,6 +603,7 @@ pub fn drain_wait(
     on_tick: &mut dyn FnMut(&[Waiter]),
 ) -> Result<Vec<Waiter>> {
     let started = host.now();
+    let mut polls = 0u64;
     loop {
         let waiters = host.waiters()?;
         if waiters.is_empty() {
@@ -600,7 +614,22 @@ pub fn drain_wait(
             return Ok(waiters);
         }
         host.sleep(Duration::from_secs(2));
+        // Re-assert the gate every minute: a daemon that restarts during
+        // a long drain must read a marker that is provably live (the
+        // staleness bound is measured from `since`).
+        polls += 1;
+        if polls.is_multiple_of(30) {
+            host.set_pending(host_pending(host).as_ref())?;
+            host.set_drain(true)?;
+        }
     }
+}
+
+/// The marker as the host last recorded it (`None`: no update in flight
+/// in this process). The drain re-assertion uses it so the `since` it
+/// re-writes is the update's own start, not "now".
+fn host_pending(host: &dyn UpdateHost) -> Option<PendingUpdate> {
+    host.pending()
 }
 
 /// Poll `build` until it reports `want`, or the deadline passes.

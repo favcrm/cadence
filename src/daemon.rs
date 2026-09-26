@@ -497,8 +497,10 @@ impl Shared {
             closing: AtomicBool::new(false),
             // CAD-561: a pending update recorded by an update that is
             // still running (a restart in the middle of one) keeps the
-            // fleet drained across the restart. A stale file — an
-            // update that died hours ago — is ignored.
+            // fleet drained across the restart. The file's mtime is the
+            // update's heartbeat: a marker that stopped being rewritten
+            // (an update that died) goes stale in minutes and never
+            // wedges the fleet.
             draining: Mutex::new(crate::update::pending_update(state_dir)),
             shutdown_facts: Mutex::new(None),
             provider_log_dir,
@@ -2613,14 +2615,17 @@ impl Shared {
     }
 
     /// CAD-561: is a `cadence update` draining the fleet right now?
-    /// Every actor consults this before claiming its next turn.
+    /// Every actor consults this before claiming its next turn. The
+    /// marker file is the truth (its mtime is the heartbeat), so a
+    /// marker that disappeared, or stopped being rewritten, lifts the
+    /// gate without anyone calling `update_drain off`.
     fn draining(&self) -> bool {
-        self.draining.lock().unwrap().is_some()
+        self.pending_update().is_some()
     }
 
     /// The pending update, refreshed from disk so a marker written by
     /// another process (the board, a test) is seen; a file that
-    /// disappeared clears the gate.
+    /// disappeared or went stale clears the gate.
     fn pending_update(&self) -> Option<crate::update::PendingUpdate> {
         let on_disk = crate::update::pending_update(&self.state_dir);
         let mut held = self.draining.lock().unwrap();
@@ -3852,12 +3857,15 @@ mod tests {
 
     /// CAD-561: the drain gate. A daemon that comes up while an update
     /// is in flight is drained from boot (the restart in the middle of
-    /// an update must not start turns); lifting the marker lifts the
-    /// gate; a marker older than the staleness bound is ignored, so an
-    /// update that died cannot wedge the fleet.
+    /// an update must not start turns), and the marker's mtime is the
+    /// heartbeat: an update that stopped rewriting it — one that died —
+    /// stops draining within the bound instead of wedging the fleet.
     #[test]
-    fn cad561_a_pending_update_drains_from_boot_and_a_stale_one_does_not() {
+    fn cad561_a_pending_update_drains_only_while_it_is_fresh() {
         let dir = tempfile::tempdir().unwrap();
+        let state = dir.path();
+        // Create the store first, so the marker is read on a real dir.
+        Shared::new(state, &ServeOptions::default()).unwrap();
         let pending = crate::update::PendingUpdate {
             phase: "draining".into(),
             target: "b".repeat(40),
@@ -3865,25 +3873,38 @@ mod tests {
             by: "operator:ada".into(),
             since: crate::rollout::unix_now(),
         };
-        crate::update::write_pending(dir.path(), &pending).unwrap();
-        let shared = Shared::new(dir.path(), &ServeOptions::default()).unwrap();
+        crate::update::write_pending(state, &pending).unwrap();
+        let shared = Shared::new(state, &ServeOptions::default()).unwrap();
         assert!(shared.draining(), "a restart mid-update stays drained");
         assert_eq!(
             shared.pending_update().map(|p| p.target),
             Some("b".repeat(40))
         );
         // The update finishing (marker removed) lifts it.
-        crate::update::clear_pending(dir.path());
+        crate::update::clear_pending(state);
         assert!(shared.pending_update().is_none());
         assert!(!shared.draining());
-        // A stale marker is ignored.
-        let stale = crate::update::PendingUpdate {
-            since: crate::rollout::unix_now() - crate::update::UPDATE_STALE_SECS - 60.0,
-            ..pending
-        };
-        crate::update::write_pending(dir.path(), &stale).unwrap();
-        assert!(shared.pending_update().is_none());
-        assert!(!shared.draining());
+        // A marker whose heartbeat stopped (an update that died) is
+        // ignored: the file's mtime, not `since`, decides.
+        crate::update::write_pending(state, &pending).unwrap();
+        let old = std::time::SystemTime::now()
+            - Duration::from_secs_f64(crate::update::UPDATE_STALE_SECS + 60.0);
+        let file = std::fs::File::options()
+            .write(true)
+            .open(crate::update::update_file(state))
+            .unwrap();
+        file.set_modified(old).unwrap();
+        drop(file);
+        assert!(crate::update::pending_update(state).is_none());
+        let shared = Shared::new(state, &ServeOptions::default()).unwrap();
+        assert!(!shared.draining(), "a stale marker does not drain");
+        // A live marker drains again.
+        crate::update::write_pending(state, &pending).unwrap();
+        assert!(shared.draining());
+        assert_eq!(
+            shared.pending_update().map(|p| p.phase),
+            Some("draining".into())
+        );
     }
 
     /// CAD-561: the RPC that gates the fleet is the operator's, proved

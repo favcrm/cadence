@@ -127,6 +127,7 @@ fn run_check(state_dir: &Path) -> Result<Value> {
         state_dir: state_dir.to_path_buf(),
         layout,
         source: upgrade::Gh::new(upgrade::DEFAULT_REPO),
+        pending: Mutex::new(None),
     };
     Ok(update::check(&host)?.to_json())
 }
@@ -164,6 +165,7 @@ fn run_update(state_dir: &Path, _opts: &ServeOpts) -> Result<update::RunReport> 
         state_dir: state_dir.to_path_buf(),
         layout,
         source: upgrade::Gh::new(upgrade::DEFAULT_REPO),
+        pending: Mutex::new(None),
     };
     let report = update::run(&host, &Options::default())?;
     Ok(report)
@@ -177,6 +179,8 @@ struct BoardHost {
     state_dir: PathBuf,
     layout: Layout,
     source: upgrade::Gh,
+    /// The marker this process last recorded, for the drain re-assertion.
+    pending: Mutex<Option<PendingUpdate>>,
 }
 
 impl BoardHost {
@@ -223,6 +227,7 @@ impl UpdateHost for BoardHost {
             .unwrap_or_default())
     }
     fn set_pending(&self, pending: Option<&PendingUpdate>) -> Result<()> {
+        *self.pending.lock().unwrap() = pending.cloned();
         match pending {
             Some(pending) => update::write_pending(&self.state_dir, pending),
             None => {
@@ -231,10 +236,13 @@ impl UpdateHost for BoardHost {
             }
         }
     }
+    fn pending(&self) -> Option<PendingUpdate> {
+        self.pending.lock().unwrap().clone()
+    }
     fn set_drain(&self, on: bool) -> Result<()> {
         let mut params = json!({"on": on, "label": self.label()});
         if on {
-            if let Some(pending) = update::pending_update(&self.state_dir) {
+            if let Some(pending) = self.pending.lock().unwrap().clone() {
                 params["target"] = json!(pending.target);
                 params["phase"] = json!(pending.phase);
                 params["from"] = json!(pending.from);
