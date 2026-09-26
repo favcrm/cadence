@@ -5,6 +5,7 @@ import { ResourceGate, StaleChip } from "../../ui/ResourceStatus";
 import { HealthBadge, ProgressBar } from "./HealthBadge";
 import { healthView, progressView } from "./work";
 import { projectSummary } from "./overview";
+import ProjectMilestoneSummary from "./ProjectMilestoneSummary";
 
 const path = (project: string, section = "overview") => project === "all" ? `/projects${section === "issues" ? "?view=list" : ""}` : `/projects/${encodeURIComponent(project)}${section === "overview" ? "" : `/${section}`}`;
 export default function ProjectsOverview({ project, projects, issues, onOpenIssue, onRetry }: {
@@ -25,6 +26,7 @@ export default function ProjectsOverview({ project, projects, issues, onOpenIssu
       {[["Open issues", summary.open], ["In progress", summary.doing], ["In review", summary.review], ["Blocked", summary.blocked]].map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{issues.data ? value : "—"}</dd></div>)}
     </dl>
     <p className="text-micro text-ink-500 mb-6">Issue counts exclude epics. In progress reflects tracker status; it does not mean an agent is currently running.</p>
+    {!all && <ProjectMilestoneSummary project={project} issuesAsOf={issues.asOf} />}
     {all ? <section aria-label="Projects"><div className="flex items-center justify-between mb-3"><h2 className="text-section font-semibold text-ink-100">Your projects</h2><span className="text-label text-ink-500">{projects.length} projects</span></div>
       <div className="project-grid">{projects.map((item) => {
         const work = projectSummary(cards, item.key);
@@ -44,7 +46,7 @@ export default function ProjectsOverview({ project, projects, issues, onOpenIssu
       <div className="space-y-5"><section className="project-summary-card" aria-label="Active epics"><div className="flex items-baseline justify-between mb-4"><h2 className="text-section text-ink-100 font-semibold">Active epics</h2><Link className="lnk text-label" href={path(project, "epics")}>See all ↗</Link></div>
         {summary.epics.slice().sort((a, b) => Number(b.work?.health?.state === "at_risk") - Number(a.work?.health?.state === "at_risk")).slice(0, 3).map((epic) => <div className="project-epic" key={epic.id}><button className="text-left text-secondary text-ink-200 hover:text-accent" onClick={() => onOpenIssue(epic.id)}>{epic.title}</button><div className="my-2 flex gap-2"><span className="num text-micro text-ink-500">{epic.id}</span><HealthBadge view={healthView(epic.work?.health)} /></div><ProgressBar view={progressView(epic.work?.progress)} tone={healthView(epic.work?.health).tone} /></div>)}
         {issues.data && summary.epics.length === 0 && <p className="text-label text-ink-500">No active epics yet.</p>}
-      </section><section className="project-summary-card"><h2 className="text-section text-ink-100 font-semibold mb-3">Explore this project</h2><div className="project-section-links">{[["milestones", "Milestones", "Release goals and progress"], ["workflows", "Workflows", "Repeatable work you can run"], ["context", "Context", "Project guidance and reading order"]].map(([section, title, description]) => <Link key={section} href={path(project, section)}><span>{title} ↗</span><small>{description}</small></Link>)}</div>{selected?.repos[0]?.remote && <p className="text-micro text-ink-500 mt-4 break-all">{selected.repos[0].remote}</p>}</section></div>
+      </section><section className="project-summary-card"><h2 className="text-section text-ink-100 font-semibold mb-3">Explore this project</h2><div className="project-section-links">{[["milestones", "Milestones", "Delivery dates, criteria, and evidence"], ["workflows", "Workflows", "Repeatable work you can run"], ["context", "Context", "Project guidance and reading order"]].map(([section, title, description]) => <Link key={section} href={path(project, section)}><span>{title} ↗</span><small>{description}</small></Link>)}</div>{selected?.repos[0]?.remote && <p className="text-micro text-ink-500 mt-4 break-all">{selected.repos[0].remote}</p>}</section></div>
     </div>}
   </main>;
 }

@@ -1822,6 +1822,9 @@ pub fn run_milestone(action: &MilestoneAction, state_dir: &std::path::Path) -> R
                 ("project", "project"),
                 ("title", "title"),
                 ("configured", "configured"),
+                ("status", "status"),
+                ("owner", "owner"),
+                ("target_date", "target_date"),
                 ("progress", "progress.ratio"),
                 ("health", "health.state"),
             ];
@@ -1844,6 +1847,21 @@ pub fn run_milestone(action: &MilestoneAction, state_dir: &std::path::Path) -> R
                 print_milestones_table(std::slice::from_ref(&row));
                 if let Some(exit) = row["exit"].as_str() {
                     println!("exit: {exit}");
+                }
+                for field in [
+                    "description",
+                    "start_date",
+                    "completed_date",
+                    "config_error",
+                ] {
+                    if let Some(value) = row[field].as_str() {
+                        println!("{field}: {value}");
+                    }
+                }
+                for field in ["depends_on", "evidence"] {
+                    for value in row[field].as_array().into_iter().flatten() {
+                        println!("{field}: {}", value.as_str().unwrap_or(""));
+                    }
                 }
                 for r in row["health"]["reasons"].as_array().into_iter().flatten() {
                     println!(
@@ -1901,6 +1919,9 @@ fn print_milestones_table(rows: &[Value]) {
     let mut table = vec![[
         "PROJECT",
         "MILESTONE",
+        "STATUS",
+        "OWNER",
+        "TARGET",
         "PROGRESS",
         "EPICS",
         "ISSUES",
@@ -1914,6 +1935,9 @@ fn print_milestones_table(rows: &[Value]) {
         table.push(vec![
             r["project"].as_str().unwrap_or_default().to_string(),
             r["id"].as_str().unwrap_or_default().to_string(),
+            r["status"].as_str().unwrap_or("undefined").to_string(),
+            r["owner"].as_str().unwrap_or("-").to_string(),
+            r["target_date"].as_str().unwrap_or("-").to_string(),
             format!(
                 "{}/{} {:.0}%",
                 p["done_weight"].as_u64().unwrap_or(0),

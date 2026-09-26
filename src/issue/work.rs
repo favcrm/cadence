@@ -61,11 +61,40 @@ pub struct Stage {
     pub exit: String,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum MilestoneStatus {
+    #[default]
+    Planned,
+    Active,
+    Achieved,
+    Cancelled,
+}
+
+impl MilestoneStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Planned => "planned",
+            Self::Active => "active",
+            Self::Achieved => "achieved",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Milestone {
     pub id: String,
     pub title: Option<String>,
     pub exit: Option<String>,
+    pub description: Option<String>,
+    pub owner: Option<String>,
+    pub start_date: Option<String>,
+    pub target_date: Option<String>,
+    pub status: MilestoneStatus,
+    pub completed_date: Option<String>,
+    pub evidence: Vec<String>,
+    pub depends_on: Vec<String>,
 }
 
 /// A project's work-model settings — `PROJECT.md` or the defaults.
@@ -139,6 +168,22 @@ struct RawMilestone {
     title: Option<String>,
     #[serde(default)]
     exit: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    owner: Option<String>,
+    #[serde(default)]
+    start_date: Option<String>,
+    #[serde(default)]
+    target_date: Option<String>,
+    #[serde(default)]
+    status: MilestoneStatus,
+    #[serde(default)]
+    completed_date: Option<String>,
+    #[serde(default)]
+    evidence: Vec<String>,
+    #[serde(default)]
+    depends_on: Vec<String>,
 }
 
 /// `<pm>/<key>/PROJECT.md`.
@@ -197,6 +242,14 @@ pub fn parse_config(text: &str) -> Result<WorkConfig> {
             id: m.id,
             title: m.title,
             exit: m.exit,
+            description: m.description,
+            owner: m.owner,
+            start_date: m.start_date,
+            target_date: m.target_date,
+            status: m.status,
+            completed_date: m.completed_date,
+            evidence: m.evidence,
+            depends_on: m.depends_on,
         })
         .collect();
     check_config(&cfg)?;
@@ -239,8 +292,69 @@ fn check_config(cfg: &WorkConfig) -> Result<()> {
         if !seen.insert(m.id.as_str()) {
             return bad(format!("milestone '{}' is listed twice", m.id));
         }
+        for (field, date) in [
+            ("start_date", &m.start_date),
+            ("target_date", &m.target_date),
+            ("completed_date", &m.completed_date),
+        ] {
+            if let Some(date) = date {
+                if date_epoch(date).is_none() {
+                    return bad(format!(
+                        "milestone '{}' {field} must be a real YYYY-MM-DD date",
+                        m.id
+                    ));
+                }
+            }
+        }
+        if let (Some(start), Some(target)) = (&m.start_date, &m.target_date) {
+            if start > target {
+                return bad(format!(
+                    "milestone '{}' start_date is after target_date",
+                    m.id
+                ));
+            }
+        }
+        if m.completed_date.is_some() && m.status != MilestoneStatus::Achieved {
+            return bad(format!(
+                "milestone '{}' completed_date requires status: achieved",
+                m.id
+            ));
+        }
+    }
+    for m in &cfg.milestones {
+        for dependency in &m.depends_on {
+            if !seen.contains(dependency.as_str()) || dependency == &m.id {
+                return bad(format!("milestone '{}' depends_on must name another declared milestone: '{dependency}'", m.id));
+            }
+        }
+    }
+    // Remove resolvable nodes iteratively: no recursion even for a long roadmap.
+    let mut remaining: HashSet<&str> = cfg.milestones.iter().map(|m| m.id.as_str()).collect();
+    while !remaining.is_empty() {
+        let ready: Vec<&str> = cfg
+            .milestones
+            .iter()
+            .filter(|m| {
+                remaining.contains(m.id.as_str())
+                    && m.depends_on.iter().all(|d| !remaining.contains(d.as_str()))
+            })
+            .map(|m| m.id.as_str())
+            .collect();
+        if ready.is_empty() {
+            return bad("milestone depends_on contains a cycle".into());
+        }
+        for id in ready {
+            remaining.remove(id);
+        }
     }
     Ok(())
+}
+
+fn date_epoch(date: &str) -> Option<i64> {
+    if date.len() != 10 {
+        return None;
+    }
+    crate::issue::time::parse_iso(&format!("{date}T00:00:00Z"))
 }
 
 /// Strict load for writers: no file is the defaults; a symlinked,
@@ -746,6 +860,24 @@ pub fn health_json(
     })
 }
 
+/// A task's own field or legacy tag wins over its parent epic's default.
+/// Inheritance stays inside the project and never expands a whole epic
+/// into a checkpoint when one of its tasks explicitly belongs elsewhere.
+fn effective_milestone(ctx: &Ctx, view: &View) -> Option<(String, &'static str)> {
+    model::milestone_of(&view.issue.front).or_else(|| {
+        if model::item_type(&view.issue.front, view.container) == "epic" {
+            return None;
+        }
+        let parent = ctx.by_id.get(view.issue.front.parent.as_deref()?)?;
+        if parent.issue.project != view.issue.project
+            || model::item_type(&parent.issue.front, parent.container) != "epic"
+        {
+            return None;
+        }
+        model::milestone_of(&parent.issue.front).map(|(id, _)| (id, "parent"))
+    })
+}
+
 /// The `work` block of one issue for the board (list and detail), the
 /// CLI and the epic rows: type, milestone, size and weight for every
 /// issue; stage, progress and health for epics (`null` otherwise).
@@ -753,7 +885,7 @@ pub fn item_json(ctx: &Ctx, view: &View) -> Value {
     let f = &view.issue.front;
     let cfg = ctx.config(&view.issue.project);
     let kind = model::item_type(f, view.container);
-    let milestone = model::milestone_of(f);
+    let milestone = effective_milestone(ctx, view);
     let mut out = json!({
         "type": kind,
         "type_source": if f.item_type.as_deref().is_some_and(|t| model::TYPES.contains(&t)) {
@@ -865,9 +997,9 @@ fn worse(a: &str, b: &str) -> &'static str {
 /// configured in `PROJECT.md` (in its order) or named by an issue's
 /// `milestone` / `m<n>-…` tag (natural order after). Progress rolls up
 /// the milestone's work items the same way as an epic's: its loose
-/// non-epic issues plus every child of its epics, size-weighted;
-/// health is the worst of its epics', at risk too when a loose open
-/// item is blocked.
+/// non-epic tasks, size-weighted. A task's explicit assignment overrides
+/// its epic's default. Health uses only work scoped to this checkpoint;
+/// checkpoint status and calendar dates are declared, never inferred.
 pub fn milestones_json(ctx: &Ctx, views: &[View], project_key: Option<&str>) -> Vec<Value> {
     // (project, milestone) → member views, in id order.
     let mut members: BTreeMap<(String, String), Vec<&View>> = BTreeMap::new();
@@ -875,7 +1007,7 @@ pub fn milestones_json(ctx: &Ctx, views: &[View], project_key: Option<&str>) -> 
         if project_key.is_some_and(|p| v.issue.project != p) {
             continue;
         }
-        if let Some((m, _)) = model::milestone_of(&v.issue.front) {
+        if let Some((m, _)) = effective_milestone(ctx, v) {
             members
                 .entry((v.issue.project.clone(), m))
                 .or_default()
@@ -913,55 +1045,74 @@ fn milestone_row(ctx: &Ctx, key: &str, id: &str, members: Option<&Vec<&View>>) -
     let cfg = ctx.config(key);
     let conf = cfg.milestones.iter().find(|m| m.id == id);
     let members: &[&View] = members.map(Vec::as_slice).unwrap_or(&[]);
-    let mut items: Vec<&View> = vec![];
-    let mut seen: HashSet<&str> = HashSet::new();
-    let mut epics = vec![];
-    let mut health: &'static str = "on_track";
-    let mut reasons: Vec<Value> = vec![];
+    let items: Vec<&View> = members
+        .iter()
+        .copied()
+        .filter(|v| model::item_type(&v.issue.front, v.container) != "epic")
+        .collect();
+    let mut contributors: BTreeMap<&str, &View> = BTreeMap::new();
     for v in members {
         if model::item_type(&v.issue.front, v.container) == "epic" {
-            let work = item_json(ctx, v);
-            let state = work["health"]["state"].as_str().unwrap_or("on_track");
-            health = worse(health, state);
-            if state != "on_track" {
-                reasons.push(json!({
-                    "cause": state,
-                    "issue": v.issue.front.id,
-                    "owner": v.issue.front.owner,
-                    "detail": format!("epic {} is {state}", v.issue.front.id),
-                    "next": format!("`cadence issue epic show {}`", v.issue.front.id),
-                }));
-            }
-            epics.push(json!({
-                "id": v.issue.front.id,
-                "title": v.issue.front.title,
-                "owner": v.issue.front.owner,
-                "stage": work["stage"]["id"],
-                "progress": work["progress"]["ratio"],
-                "health": state,
-            }));
-            for k in ctx.kids(v) {
-                if seen.insert(k.issue.front.id.as_str()) {
-                    items.push(k);
-                }
-            }
-        } else if seen.insert(v.issue.front.id.as_str()) {
-            items.push(v);
-            if v.blocked && is_open(v) {
-                health = worse(health, "at_risk");
-                reasons.push(json!({
-                    "cause": "blocked",
-                    "issue": v.issue.front.id,
-                    "owner": v.issue.front.owner,
-                    "detail": format!("{} is blocked", v.issue.front.id),
-                    "next": format!("unblock {}", v.issue.front.id),
-                }));
+            contributors.insert(&v.issue.front.id, v);
+        } else if let Some(parent) = v.issue.front.parent.as_ref().and_then(|p| ctx.by_id.get(p)) {
+            if parent.issue.project == key
+                && model::item_type(&parent.issue.front, parent.container) == "epic"
+            {
+                contributors.insert(&parent.issue.front.id, parent);
             }
         }
     }
-    let loose: Vec<Value> = members
+    let mut epics = vec![];
+    let mut health: &'static str = "on_track";
+    let mut reasons: Vec<Value> = vec![];
+    for v in contributors.values() {
+        let kids: Vec<&View> = items
+            .iter()
+            .copied()
+            .filter(|k| k.issue.front.parent.as_deref() == Some(v.issue.front.id.as_str()))
+            .collect();
+        let stage = stage_of(&v.issue.front, cfg, v.status == "done");
+        // A completed slice doesn't inherit timing risk from an epic's
+        // unfinished work in another checkpoint.
+        let scoped_health = if kids.iter().any(|k| is_open(k)) {
+            health_json(v, &stage, cfg, &kids, ctx.now)
+        } else {
+            json!({"state": "on_track", "reasons": []})
+        };
+        let state = scoped_health["state"].as_str().unwrap_or("on_track");
+        health = worse(health, state);
+        if let Some(scoped_reasons) = scoped_health["reasons"].as_array() {
+            reasons.extend(scoped_reasons.iter().cloned());
+        }
+        epics.push(json!({
+            "id": v.issue.front.id,
+            "title": v.issue.front.title,
+            "owner": v.issue.front.owner,
+            "stage": stage.id,
+            "progress": progress_json(&kids)["ratio"],
+            "task_count": kids.len(),
+            "health": state,
+        }));
+    }
+    for v in &items {
+        if v.blocked
+            && is_open(v)
+            && !reasons
+                .iter()
+                .any(|r| r["issue"] == v.issue.front.id && r["cause"] == "blocked")
+        {
+            health = worse(health, "at_risk");
+            reasons.push(json!({
+                "cause": "blocked",
+                "issue": v.issue.front.id,
+                "owner": v.issue.front.owner,
+                "detail": format!("{} is blocked", v.issue.front.id),
+                "next": format!("unblock {}", v.issue.front.id),
+            }));
+        }
+    }
+    let tasks: Vec<Value> = items
         .iter()
-        .filter(|v| model::item_type(&v.issue.front, v.container) != "epic")
         .map(|v| {
             json!({
                 "id": v.issue.front.id,
@@ -971,7 +1122,38 @@ fn milestone_row(ctx: &Ctx, key: &str, id: &str, members: Option<&Vec<&View>>) -
                 "size": v.issue.front.size,
                 "owner": v.issue.front.owner,
                 "blocked": v.blocked,
+                "parent": v.issue.front.parent,
             })
+        })
+        .collect();
+    let loose: Vec<&Value> = tasks.iter().filter(|v| v["parent"].is_null()).collect();
+    let status = conf.map(|m| m.status.as_str());
+    let today = crate::issue::time::iso(ctx.now);
+    let days_remaining = conf
+        .and_then(|m| m.target_date.as_deref())
+        .and_then(date_epoch)
+        .zip(date_epoch(&today[..10]))
+        .map(|(target, now)| (target - now) / 86_400);
+    let schedule = match status {
+        Some("achieved") => "achieved",
+        Some("cancelled") => "cancelled",
+        _ => match days_remaining {
+            Some(days) if days < 0 => "overdue",
+            Some(0) => "due_today",
+            Some(_) => "upcoming",
+            None => "unscheduled",
+        },
+    };
+    let dependencies: Vec<Value> = conf
+        .into_iter()
+        .flat_map(|m| &m.depends_on)
+        .map(|id| {
+            let dependency = cfg
+                .milestones
+                .iter()
+                .find(|m| &m.id == id)
+                .expect("validated dependency");
+            json!({"id": id, "title": dependency.title, "status": dependency.status.as_str()})
         })
         .collect();
     json!({
@@ -979,11 +1161,23 @@ fn milestone_row(ctx: &Ctx, key: &str, id: &str, members: Option<&Vec<&View>>) -
         "id": id,
         "title": conf.and_then(|m| m.title.clone()),
         "exit": conf.and_then(|m| m.exit.clone()),
+        "description": conf.and_then(|m| m.description.clone()),
+        "owner": conf.and_then(|m| m.owner.clone()),
+        "start_date": conf.and_then(|m| m.start_date.clone()),
+        "target_date": conf.and_then(|m| m.target_date.clone()),
+        "completed_date": conf.and_then(|m| m.completed_date.clone()),
+        "status": status,
+        "evidence": conf.map(|m| &m.evidence).cloned().unwrap_or_default(),
+        "depends_on": conf.map(|m| &m.depends_on).cloned().unwrap_or_default(),
+        "dependencies": dependencies,
+        "schedule": {"state": schedule, "days_remaining": days_remaining},
         "configured": conf.is_some(),
         "progress": progress_json(&items),
         "health": {"state": health, "reasons": reasons},
         "epics": epics,
         "issues": loose,
+        "tasks": tasks,
+        "config_error": ctx.work(key).and_then(|w| w.error.as_ref()),
     })
 }
 
@@ -1570,11 +1764,13 @@ mod tests {
                     id: "m0".into(),
                     title: Some("Safe".into()),
                     exit: Some("restore".into()),
+                    ..Milestone::default()
                 },
                 Milestone {
                     id: "m2".into(),
                     title: Some("One team".into()),
                     exit: None,
+                    ..Milestone::default()
                 },
             ],
             ..WorkConfig::default()
@@ -1604,5 +1800,145 @@ mod tests {
         let show = milestone_show(&ctx, &vs, "m2", None).unwrap();
         assert_eq!(show["id"], "m2");
         assert!(milestone_show(&ctx, &vs, "m9", None).is_err());
+    }
+
+    #[test]
+    fn milestone_task_assignment_overrides_epic_default() {
+        let mut epic = issue("CAD-1", "doing");
+        epic.front.milestone = Some("m1".into());
+        let inherited = child("CAD-2", "done", Some("S"));
+        let mut explicit = child("CAD-3", "ready", Some("L"));
+        explicit.front.milestone = Some("m2".into());
+        explicit.front.blocked_by = vec!["CAD-99".into()];
+        let vs = views(Path::new("/no-notes"), vec![epic, inherited, explicit]);
+        let by_id = vs.iter().map(|v| (v.issue.front.id.clone(), v)).collect();
+        let ctx = ctx_for(&by_id);
+        let rows = milestones_json(&ctx, &vs, None);
+        let m1 = rows.iter().find(|r| r["id"] == "m1").unwrap();
+        let m2 = rows.iter().find(|r| r["id"] == "m2").unwrap();
+        assert_eq!(
+            m1["progress"]["total_weight"], 1,
+            "override must leave m1 scope"
+        );
+        assert_eq!(m2["progress"]["total_weight"], 8);
+        assert_eq!(
+            m1["health"]["state"], "on_track",
+            "other checkpoint's blocker must not leak"
+        );
+        assert_eq!(m2["health"]["state"], "at_risk");
+        assert_eq!(
+            m2["epics"][0]["id"], "CAD-1",
+            "contributor follows scoped tasks"
+        );
+        assert_eq!(
+            item_json(&ctx, by_id.get("CAD-2").unwrap())["milestone"],
+            "m1"
+        );
+        assert_eq!(
+            item_json(&ctx, by_id.get("CAD-2").unwrap())["milestone_source"],
+            "parent"
+        );
+    }
+
+    #[test]
+    fn milestone_metadata_is_not_inferred_from_completed_tasks() {
+        let mut task = issue("CAD-2", "done");
+        task.front.milestone = Some("beta".into());
+        let vs = views(Path::new("/no-notes"), vec![task]);
+        let by_id = vs.iter().map(|v| (v.issue.front.id.clone(), v)).collect();
+        let mut ctx = ctx_for(&by_id);
+        let cfg = parse_config("---\nmilestones:\n  - id: beta\n    title: Internal beta\n    description: Ready for pilot users\n    owner: pm\n    start_date: 2026-01-01\n    target_date: 2026-01-31\n    status: active\n    exit: Pilot journey verified\n    evidence: [docs/pilot-check.md]\n---\n").unwrap();
+        ctx.configs.insert(
+            "cadence".into(),
+            ProjectWork {
+                cfg,
+                error: None,
+                unapproved: None,
+            },
+        );
+        let row = &milestones_json(&ctx, &vs, None)[0];
+        assert_eq!(row["owner"], "pm");
+        assert_eq!(row["target_date"], "2026-01-31");
+        assert_eq!(
+            row["status"], "active",
+            "100% work must not achieve checkpoint"
+        );
+        assert_eq!(row["progress"]["ratio"], 1.0);
+        assert_eq!(row["schedule"]["state"], "overdue");
+        assert_eq!(row["evidence"][0], "docs/pilot-check.md");
+    }
+
+    #[test]
+    fn milestone_dates_and_dependencies_are_validated() {
+        for yaml in [
+            "milestones: [{id: beta, target_date: '2026-02-30'}]",
+            "milestones: [{id: beta, start_date: '2026-09-30', target_date: '2026-09-01'}]",
+            "milestones: [{id: beta, status: shipping}]",
+            "milestones: [{id: beta, depends_on: [missing]}]",
+            "milestones: [{id: alpha, depends_on: [beta]}, {id: beta, depends_on: [alpha]}]",
+        ] {
+            assert!(
+                parse_config(&format!("---\n{yaml}\n---\n")).is_err(),
+                "{yaml}"
+            );
+        }
+        assert!(
+            parse_config("---\nmilestones: [{id: beta, target_date: '2024-02-29'}]\n---\n").is_ok()
+        );
+    }
+
+    #[test]
+    fn milestone_schedule_and_empty_scope_do_not_invent_completion() {
+        let vs = views(Path::new("/no-notes"), vec![issue("CAD-1", "done")]);
+        let by_id = vs.iter().map(|v| (v.issue.front.id.clone(), v)).collect();
+        let mut ctx = ctx_for(&by_id);
+        let today = crate::issue::time::iso(NOW)[..10].to_string();
+        let cfg = parse_config(&format!("---\nmilestones:\n  - id: beta\n    target_date: '{today}'\n  - id: pilot\n    status: achieved\n    completed_date: '2026-01-30'\n    target_date: '2026-01-31'\n    depends_on: [beta]\n  - id: later\n    status: cancelled\n    target_date: '2026-01-31'\n---\n")).unwrap();
+        ctx.configs.insert(
+            "cadence".into(),
+            ProjectWork {
+                cfg,
+                error: None,
+                unapproved: None,
+            },
+        );
+        let rows = milestones_json(&ctx, &vs, None);
+        assert_eq!(rows[0]["status"], "planned");
+        assert_eq!(rows[0]["schedule"]["state"], "due_today");
+        assert_eq!(rows[0]["progress"]["total_weight"], 0);
+        assert_eq!(rows[1]["schedule"]["state"], "achieved");
+        assert_eq!(rows[1]["dependencies"][0]["status"], "planned");
+        assert_eq!(rows[2]["schedule"]["state"], "cancelled");
+    }
+
+    #[test]
+    fn milestone_tag_override_and_project_boundary_preserve_single_membership() {
+        let mut epic = issue("CAD-1", "doing");
+        epic.front.milestone = Some("m1".into());
+        let mut tagged = child("CAD-2", "ready", Some("S"));
+        tagged.front.tags = vec!["m2-pilot".into()];
+        let mut foreign = child("OTHER-1", "ready", None);
+        foreign.project = "other".into();
+        let vs = views(Path::new("/no-notes"), vec![epic, tagged, foreign]);
+        let by_id = vs.iter().map(|v| (v.issue.front.id.clone(), v)).collect();
+        let ctx = ctx_for(&by_id);
+        let rows = milestones_json(&ctx, &vs, None);
+        assert_eq!(
+            rows.len(),
+            2,
+            "cross-project parent never supplies a milestone"
+        );
+        assert_eq!(rows[0]["progress"]["counts"]["total"], 0);
+        assert_eq!(rows[1]["progress"]["counts"]["total"], 1);
+        assert_eq!(
+            rows[1]["issues"].as_array().unwrap().len(),
+            0,
+            "child tasks are not loose issues"
+        );
+        assert_eq!(
+            item_json(&ctx, by_id.get("CAD-2").unwrap())["milestone_source"],
+            "tag"
+        );
+        assert!(item_json(&ctx, by_id.get("OTHER-1").unwrap())["milestone"].is_null());
     }
 }
