@@ -1,5 +1,19 @@
 import { useEffect, useState } from "react";
 import { api, ApiError, type MasterPermissionRequest } from "../../lib/api";
+import { resources } from "../../lib/resources";
+
+const listeners = new Set<() => void>();
+
+/** The rail and the thread both redraw from the request record. */
+export function publishPermission() {
+  void resources.overview.invalidate();
+  for (const fn of listeners) fn();
+}
+
+export function subscribePermission(fn: () => void): () => void {
+  listeners.add(fn);
+  return () => listeners.delete(fn);
+}
 
 export interface PermissionCardData {
   id: string;
@@ -35,7 +49,10 @@ export default function PermissionCard({
     setBusy(true);
     setError(null);
     work()
-      .then(() => onDone(what))
+      .then(() => {
+        publishPermission();
+        onDone(what);
+      })
       .catch((e: ApiError) => setError(e.message ?? String(e)))
       .finally(() => setBusy(false));
   };
@@ -175,6 +192,7 @@ export function ThreadPermission({ text, readOnly }: { text: string; readOnly: b
   };
   useEffect(() => {
     load();
+    return subscribePermission(load);
   }, [id]);
   if (!id) return <p className="text-micro text-ink-400 whitespace-pre-wrap">{text}</p>;
   return (

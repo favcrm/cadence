@@ -1729,8 +1729,22 @@ mod tests {
             // the wiki — profile writes go through agent_file_write.
             (&public, Op::Read, "agents/swe-1/profile/SOUL.md", true),
             (&agent(), Op::Read, "agents/other/profile/AGENT.md", true),
+            (
+                &public,
+                Op::Read,
+                "agents/master/profile/permissions.yaml",
+                true,
+            ),
             (&op, Op::Write, "agents/swe-1/profile/SOUL.md", false),
             (&agent(), Op::Write, "agents/swe-1/profile/SOUL.md", false),
+            (
+                &op,
+                Op::Write,
+                "agents/master/profile/permissions.yaml",
+                false,
+            ),
+            (&op, Op::Write, "agents/master/permissions.yaml", false),
+            (&agent(), Op::Write, "agents/master/permissions.yaml", false),
             // agents/<a>/memory/: read-only view for everyone.
             (&public, Op::Read, "agents/swe-1/memory/cadence/x.md", true),
             (&op, Op::Write, "agents/swe-1/memory/cadence/x.md", false),
