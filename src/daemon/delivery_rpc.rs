@@ -99,7 +99,7 @@ impl Shared {
         if all.values().all(|r| r.state.terminal()) {
             return Ok(0);
         }
-        let pm = Pm::at(&self.pm_dir()?)?;
+        let pm = self.pm()?;
         // The PRs live records hold — one PR belongs to one ticket.
         let held: Vec<(String, String)> = all
             .values()
@@ -382,7 +382,7 @@ impl Shared {
                 "the master never reviews — a verdict comes from the assigned reviewer",
             ));
         }
-        let pm = Pm::at(&self.pm_dir()?)?;
+        let pm = self.pm()?;
         let prepared = task_report::prepare_verdict(&pm, text, id, &who)?;
         let sha = prepared.front.sha.clone().unwrap_or_default();
         let verdict = prepared
@@ -590,7 +590,7 @@ impl Shared {
             files: count("files"),
             at: now(),
         };
-        let pm = Pm::at(&self.pm_dir()?)?;
+        let pm = self.pm()?;
         let guard = self.delivery_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut all = delivery::load(&self.state_dir)?;
         let rec = all.get_mut(id).ok_or_else(|| not_in_loop(id))?;
@@ -689,7 +689,7 @@ impl Shared {
             if open.is_empty() {
                 return Ok(0);
             }
-            let pm = Pm::at(&self.pm_dir()?)?;
+            let pm = self.pm()?;
             let mut notices = Vec::new();
             let mut moved = 0;
             for id in open {
@@ -992,7 +992,7 @@ impl Shared {
                 rec.enter(State::Enqueued, now());
                 let out = rec.to_json();
                 delivery::save(&self.state_dir, &all)?;
-                if let Ok(pm) = self.pm_dir().and_then(|d| Pm::at(&d)) {
+                if let Ok(pm) = self.pm() {
                     let _ = issue::write::add_comment(
                         &pm,
                         id,
@@ -1051,7 +1051,7 @@ impl Shared {
         let ended = rec.clone();
         delivery::save(&self.state_dir, &all)?;
         self.wake_on_delivery_end(&ended, None);
-        if let Ok(pm) = self.pm_dir().and_then(|d| Pm::at(&d)) {
+        if let Ok(pm) = self.pm() {
             let _ = issue::write::add_comment(
                 &pm,
                 id,

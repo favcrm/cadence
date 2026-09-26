@@ -260,7 +260,7 @@ impl Store {
                 "Monitor coverage must not contain duplicate task ids",
             ));
         }
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         for task_id in &unique {
             let task = self.task_in(&tx, task_id)?;
@@ -365,7 +365,7 @@ impl Store {
         &self,
         task_id: &str,
     ) -> Result<Option<(Task, String, bool, bool)>> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let task = self.task_in(&tx, task_id)?;
         if !matches!(task.state.as_str(), "dispatched" | "running") {
@@ -411,7 +411,7 @@ impl Store {
         pending_aliases: &HashSet<String>,
         by: &str,
     ) -> Result<(Task, String, bool, bool)> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let monitor = self.monitor_in(&tx, monitor_id)?;
         if monitor.state != "active" {
@@ -606,7 +606,7 @@ impl Store {
     }
 
     pub fn monitor_heartbeat(&self, id: &str) -> Result<Monitor> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let t = now();
         conn.execute(
             "UPDATE monitors SET heartbeat_at=?,updated=? WHERE id=? AND state<>'off'",
@@ -647,7 +647,7 @@ impl Store {
     /// one SQLite transaction: a crash can repeat a read, never a durable
     /// alert, because `(monitor_id,fingerprint)` is unique.
     pub fn check_monitor(&self, id: &str, at: f64) -> Result<MonitorCheck> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let monitor = self.monitor_in(&tx, id)?;
         if monitor.state == "off" {
@@ -735,7 +735,7 @@ impl Store {
     /// first occurrence of a reason emits one daemon event; repeated ticks
     /// update status and retry time without an event storm.
     pub fn fail_monitor_check(&self, id: &str, at: f64, error: &str) -> Result<Monitor> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let monitor = self.monitor_in(&tx, id)?;
         let changed = monitor.state != "degraded" || monitor.error.as_deref() != Some(error);
@@ -769,7 +769,7 @@ impl Store {
         at: f64,
         reason: &str,
     ) -> Result<MonitorAlert> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let monitor = self.monitor_in(&tx, id)?;
         let owner = monitor.owner.clone();
@@ -938,7 +938,7 @@ impl Store {
         at: f64,
         by: &str,
     ) -> Result<()> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         self.monitor_in(&tx, id)?;
         self.resolve_monitor_dispatch_blocked_tx(&tx, id, task_id, at, by)?;
@@ -947,7 +947,7 @@ impl Store {
     }
 
     pub fn stop_monitor(&self, id: &str) -> Result<Monitor> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         self.monitor_in(&tx, id)?;
         let t = now();
@@ -989,7 +989,7 @@ impl Store {
 
     pub fn ack_monitor_alert(&self, id: &str, seq: i64, by: &str) -> Result<MonitorAlert> {
         identifier(by, "Alert acknowledger")?;
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let alert = self.monitor_alert_in(&tx, seq)?;
         if alert.monitor_id != id {

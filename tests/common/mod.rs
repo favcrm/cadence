@@ -1188,6 +1188,9 @@ pub fn daemon_opts() -> daemon::ServeOptions {
         // CAD-546: no `local` outbox — a test that registers the
         // adapter pins its own root via `platform::local::register_at`.
         outbox_dir: None,
+        // CAD-538: hosted leasing stays off unless a test pins a spec —
+        // a real `hosted:` table on the dev host must never leak in.
+        lease: Some(cadence_agent::lease::Hosted::default()),
     }
 }
 

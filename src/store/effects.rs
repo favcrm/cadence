@@ -239,7 +239,7 @@ impl Store {
     /// whether it already existed (the dedupe), so the caller omits a
     /// second `request_opened` event.
     pub fn effect_stage(&self, row: &EffectRow) -> Result<(EffectRow, bool)> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let existing: Option<EffectRow> = tx
             .query_row(
@@ -376,7 +376,7 @@ impl Store {
     /// Record one `draft` execution — row and `effect_executed` audit in
     /// one transaction (§5.5 audits drafts too; there is no pending row).
     pub fn draft_record(&self, row: &DraftRow, verified_ok: &Value) -> Result<()> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO platform_drafts
@@ -422,7 +422,7 @@ impl Store {
         accept: bool,
         decision: &Value,
     ) -> Result<Option<EffectRow>> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let state = if accept { "decided" } else { "declined" };
         let n = tx.execute(
@@ -455,7 +455,7 @@ impl Store {
     /// distinguishable from "executing" at restart — both reconcile,
     /// but the record says exactly where the run stopped.
     pub fn effect_executing(&self, effect_id: &str) -> Result<()> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         conn.execute(
             "UPDATE platform_effects SET state='executing', updated_at=?2
              WHERE effect_id=?1 AND state='decided'",
@@ -474,7 +474,7 @@ impl Store {
         outcome: &Value,
         summary: &str,
     ) -> Result<EffectRow> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let needs_you = outcome["verified"] == json!(false);
         tx.execute(
@@ -545,7 +545,7 @@ impl Store {
         reason: &str,
         states: &[&'static str],
     ) -> Result<Option<EffectRow>> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let (where_by, arg): (&str, String) = match key {
             EffectKey::Request(r) => ("request", r),
@@ -625,7 +625,7 @@ impl Store {
     /// state); only the row bookkeeping clears. Answers `None` when
     /// the row is not a flagged terminal.
     pub fn effect_ack(&self, effect_id: &str) -> Result<Option<EffectRow>> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let n = tx.execute(
             "UPDATE platform_effects SET needs_you=0, updated_at=?2 \

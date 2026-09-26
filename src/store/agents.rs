@@ -282,7 +282,7 @@ impl Store {
                 ));
             }
         }
-        let mut conn = self.conn();
+        let mut conn = self.write_conn()?;
         // IMMEDIATE so a concurrent register waits, then observes the
         // committed alias, instead of resolving against a stale snapshot
         // and returning `params_too_large`.
@@ -450,7 +450,7 @@ impl Store {
     /// `attention` / `stopped` can never be overwritten. `error` is
     /// untouched. Returns whether the row matched.
     pub fn set_agent_state_if(&self, alias: &str, to: &str, from: &str) -> Result<bool> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let n = conn.execute(
             "UPDATE agents SET state=?,updated=? WHERE alias=? AND state=?",
             params![to, now(), alias, from],
@@ -463,7 +463,7 @@ impl Store {
     /// terminal writes go through `set_state_detached` so the state
     /// never lands ahead of the cleared runtime fields.
     pub fn set_agent_state(&self, alias: &str, state: &str, error: Option<&str>) -> Result<()> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         conn.execute(
             "UPDATE agents SET state=?,error=?,updated=? WHERE alias=?",
             params![state, error, now(), alias],
@@ -525,7 +525,7 @@ impl Store {
         adopted: Option<&[AdoptEntry]>,
         quota: Option<&Value>,
     ) -> Result<()> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let agent = self.agent_in(&tx, alias)?;
         let quota = quota.map(|snapshot| {
@@ -616,7 +616,7 @@ impl Store {
         expected_thread_id: &str,
         snapshot: &Value,
     ) -> Result<bool> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let agent = self.agent_in(&tx, alias)?;
         if agent.provider != provider || agent.thread_id.as_deref() != Some(expected_thread_id) {
@@ -667,7 +667,7 @@ impl Store {
     /// Record the model the provider reports it is running (claude's
     /// stream `system/init`) — the `model` column, never a launch param.
     pub fn set_model_reported(&self, alias: &str, model: &str) -> Result<()> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         conn.execute(
             "UPDATE agents SET model=?,updated=? WHERE alias=?",
             params![model, now(), alias],
@@ -685,7 +685,7 @@ impl Store {
     /// and each changed key with its old and new stored value (`null` =
     /// absent), written in the same transaction as the change.
     pub fn set_params_by(&self, alias: &str, patch: &Value, audit: &Value) -> Result<()> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let agent = self.agent_in(&tx, alias)?;
         let mut merged = agent.params.clone().unwrap_or_else(|| json!({}));
@@ -793,7 +793,7 @@ impl Store {
     }
 
     pub fn model_defaults(&self) -> Result<ModelDefaultsSnapshot> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let snapshot = Self::read_model_defaults_tx(&tx)?;
         tx.commit()?;
@@ -810,7 +810,7 @@ impl Store {
         let write = crate::model_defaults::parse_settings_document(document)?;
         let attribution = crate::model_defaults::normalize_attribution(attribution)?;
         let stored = serde_json::to_string(&write.config)?;
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let current = Self::read_model_defaults_tx(&tx)?;
         if current.revision != write.expected_revision {
@@ -876,7 +876,7 @@ impl Store {
     /// disposable-session endpoint proves its stored id can never
     /// resume; the next open mints a fresh session instead.
     pub fn clear_native_session(&self, alias: &str) -> Result<()> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let agent = self.agent_in(&tx, alias)?;
         let old = agent
@@ -904,7 +904,7 @@ impl Store {
     }
 
     pub fn set_enabled(&self, alias: &str, enabled: bool) -> Result<()> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         conn.execute(
             "UPDATE agents SET enabled=?,updated=? WHERE alias=?",
             params![enabled as i64, now(), alias],
@@ -920,7 +920,7 @@ impl Store {
     /// attachable endpoint belong to the dead process regardless, so
     /// leaving them would also point `agent attach` at a stale address.
     pub fn set_state_detached(&self, alias: &str, state: &str, error: Option<&str>) -> Result<()> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         conn.execute(
             "UPDATE agents SET state=?,error=?,pid=NULL,pid_start=NULL,endpoint=NULL,
                 generation=NULL,updated=? WHERE alias=?",
@@ -954,7 +954,7 @@ impl Store {
     /// reaching here). Returns the `reply_to` aliases a forced finish
     /// notified — the caller wakes them.
     pub fn remove_agent(&self, alias: &str, force: bool, by: &Value) -> Result<Vec<String>> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let agent = self.agent_in(&tx, alias)?;
         // Inbox rows own no process or pane — their pseudo-endpoint is
@@ -1189,7 +1189,7 @@ impl Store {
     /// it was listed). Records only — frees no memory and no disk, and
     /// the removed agent can no longer be resumed.
     pub fn timer_gc_remove(&self, alias: &str, older_than: f64) -> Result<Option<Agent>> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let Some(agent) = tx
             .query_row("SELECT * FROM agents WHERE alias=?", [alias], row_agent)

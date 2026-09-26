@@ -41,7 +41,7 @@ use serde_json::{json, Value};
 
 use super::{required_str, Shared, DAEMON_ALIAS};
 use crate::error::{Error, Result};
-use crate::issue::{task_report, write, Pm};
+use crate::issue::{task_report, write};
 use crate::peer::AgentCaller;
 use crate::proto;
 
@@ -166,7 +166,7 @@ impl Shared {
         report: &str,
         by: &str,
     ) -> Result<Value> {
-        let pm = Pm::at(pm_dir)?;
+        let pm = self.pm_at(pm_dir)?;
         let (project, dir) = write::issue_dir(&pm, issue)?;
         let rows = task_report::list(&dir, issue);
         let answer = rows

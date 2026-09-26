@@ -60,7 +60,7 @@ impl Store {
     /// One alert after held-recovery gives up. The agent stays unfenced
     /// and the held message is not replayed. A second call is a no-op.
     pub fn escalate_cloud_hold(&self, message: &Message, reason: &str) -> Result<()> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let already: i64 = tx.query_row(
             "SELECT COUNT(*) FROM events WHERE alias=?1 AND kind='cloud_recover_escalated' \
@@ -110,7 +110,7 @@ impl Store {
         id: &str,
         detail: Value,
     ) -> Result<Option<i64>> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let prior: i64 = tx.query_row(
             "SELECT COUNT(*) FROM events WHERE alias=?1 AND kind='submit_recovered' \
@@ -147,7 +147,7 @@ impl Store {
     /// CAD-152: merge the outcome (`after`, `result`, …) into the
     /// `submit_recovered` record reserved at `seq`.
     pub fn finish_submit_recovery(&self, seq: i64, outcome: &Value) -> Result<()> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let raw: String = tx.query_row(
             "SELECT payload FROM events WHERE seq=?1 AND kind='submit_recovered'",
@@ -187,7 +187,7 @@ impl Store {
     /// Endpoint died while submitted PTY messages were in flight — each
     /// may have reached the provider, so they are `unknown`, never retried.
     pub fn orphan_running(&self, alias: &str, error: &str) -> Result<()> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         conn.execute(
             "UPDATE messages SET state='unknown',error=?,completed=?
              WHERE alias=? AND state='running'",
@@ -206,7 +206,7 @@ impl Store {
         result: &Value,
         error: Option<&str>,
     ) -> Result<()> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         self.finish_in(&tx, message, status, result, error)?;
         tx.commit()?;
@@ -276,7 +276,7 @@ impl Store {
     /// CAD-250 N2: the alias's actor stopped (stop, fence, shutdown, any
     /// exit) — its queued nudges are cancelled, never pasted later.
     pub fn cancel_nudges_for(&self, alias: &str, reason: &str) -> Result<Vec<(String, String)>> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let closed = Self::cancel_nudges_in(&tx, Some(alias), reason, None)?;
         tx.commit()?;
@@ -286,7 +286,7 @@ impl Store {
     /// CAD-250 N3: a nudge still queued `ttl` seconds after it was created
     /// (a pane that stayed busy) is stale steering — cancelled at `now`.
     pub fn expire_queued_nudges(&self, now: f64, ttl: f64) -> Result<Vec<(String, String)>> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let closed = Self::cancel_nudges_in(&tx, None, "ttl", Some(now - ttl))?;
         tx.commit()?;
@@ -306,7 +306,7 @@ impl Store {
         result: &Value,
         error: Option<&str>,
     ) -> Result<std::result::Result<Message, Option<Message>>> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let current = self.message_in(&tx, message_id)?;
         let Some(current) = current.filter(|m| m.state == "running") else {
@@ -332,7 +332,7 @@ impl Store {
         bound: Option<(u64, f64)>,
         reason: &str,
     ) -> Result<bool> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let Some(current) = self.message_in(&tx, message_id)? else {
             return Ok(false);
@@ -814,7 +814,7 @@ impl Store {
             )));
         }
         let sha = sha.map(check_commit_sha).transpose()?;
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let message = self
             .message_in(&tx, message_id)?
@@ -891,7 +891,7 @@ impl Store {
     /// `worker_notice` so a waiter is never left hanging. A task-bound
     /// delivery is refused — `task cancel` owns that lifecycle.
     pub fn cancel(&self, message_id: &str, by: &str, reason: Option<&str>) -> Result<Message> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let message = self
             .message_in(&tx, message_id)?
@@ -1021,7 +1021,7 @@ impl Store {
         dedupe: &str,
         note: &str,
     ) -> Result<()> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let task = self.task_in(&tx, task_id)?;
         let job = self.job_in(&tx, &task.job_id)?;

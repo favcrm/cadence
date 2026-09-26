@@ -467,6 +467,41 @@ pub(crate) fn read_host_overrides(
     })
 }
 
+/// `pm.yaml [hosted]` — the CAD-538 hosted-lifecycle table (`lease`,
+/// `lease_ttl_secs`, `lease_renew_secs`, `flush_timeout_secs`; see
+/// `crate::lease`). Same contract as [`read_host_overrides`]: `Ok(None)`
+/// when absent, `Err` naming the culprit when present but unusable —
+/// a daemon that asked to lease never starts unleased on a typo.
+pub(crate) fn read_hosted_overrides(
+    pm_dir: &Path,
+) -> std::result::Result<Option<crate::lease::Hosted>, String> {
+    let Ok(text) = std::fs::read_to_string(pm_dir.join("pm.yaml")) else {
+        return Ok(None);
+    };
+    let yaml: serde_yaml::Value =
+        serde_yaml::from_str(&text).map_err(|e| format!("pm.yaml is not valid YAML: {e}"))?;
+    let Some(hosted) = yaml.get("hosted") else {
+        return Ok(None);
+    };
+    serde_yaml::from_value(hosted.clone())
+        .map(Some)
+        .map_err(|e| {
+            let culprit = hosted.as_mapping().and_then(|m| {
+                m.iter().find_map(|(k, v)| {
+                    let mut one = serde_yaml::Mapping::new();
+                    one.insert(k.clone(), v.clone());
+                    serde_yaml::from_value::<crate::lease::Hosted>(serde_yaml::Value::Mapping(one))
+                        .is_err()
+                        .then(|| k.as_str().unwrap_or("?").to_string())
+                })
+            });
+            match culprit {
+                Some(key) => format!("pm.yaml [hosted] {key}: {e}"),
+                None => format!("pm.yaml [hosted]: {e}"),
+            }
+        })
+}
+
 /// Resolved `[host]` thresholds — shared by `Scan::host` and the
 /// daemon's WAL watcher so both read one config table.
 pub(crate) fn host_thresholds(pm_dir: Option<&Path>) -> Thresholds {

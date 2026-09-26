@@ -259,7 +259,7 @@ impl Store {
     ) -> Result<()> {
         identifier(&record.platform, "Platform")?;
         identifier(&record.account, "Account")?;
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let existing: Option<String> = tx
             .query_row(
@@ -340,7 +340,7 @@ impl Store {
         reason: Option<&str>,
         effects_closed: &[String],
     ) -> Result<Option<(CredentialRecord, Vec<Grant>)>> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let record: Option<CredentialRecord> = tx
             .query_row(
@@ -457,7 +457,7 @@ impl Store {
         by: &str,
     ) -> Result<Grant> {
         identifier(agent, "Agent")?;
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         // The credential must exist — a grant on nothing is a latent
         // privilege the next enroll would silently arm.
@@ -551,7 +551,7 @@ impl Store {
         scopes: Option<&[String]>,
         by: &str,
     ) -> Result<(bool, Option<Grant>)> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let existing: Option<Grant> = tx
             .query_row(
@@ -616,7 +616,7 @@ impl Store {
         account: &str,
         by: &str,
     ) -> Result<ProjectDefault> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let enrolled: Option<i64> = tx
             .query_row(

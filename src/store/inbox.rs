@@ -29,7 +29,7 @@ impl Store {
     /// transaction. The receipt is local mailbox history; `route_result`
     /// deliberately does not turn it into a synthetic worker notification.
     pub fn inbox_drain(&self, alias: &str, after: i64) -> Result<Vec<Message>> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         self.inbox_agent_in(&tx, alias)?;
         let mut stmt = tx.prepare(
@@ -117,7 +117,7 @@ impl Store {
     /// Returns the seqs this call completed and the remaining unread
     /// count.
     pub fn inbox_ack(&self, alias: &str, through: i64, reader: &str, by: &str) -> Result<Value> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         self.inbox_agent_in(&tx, alias)?;
         let tail: i64 = tx.query_row(
@@ -190,7 +190,7 @@ impl Store {
         by: &str,
         reason: &str,
     ) -> Result<Value> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         self.inbox_agent_in(&tx, alias)?;
         let state: Option<String> = tx
@@ -235,7 +235,7 @@ impl Store {
     /// the cursor moves — completed messages stay completed, so nothing
     /// is lost; queued ones come back.
     pub fn inbox_ack_reset(&self, alias: &str, reader: &str, by: &str) -> Result<Value> {
-        let conn = self.conn();
+        let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         self.inbox_agent_in(&tx, alias)?;
         Self::event(

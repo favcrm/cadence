@@ -32,7 +32,7 @@ use uuid::Uuid;
 
 use super::{optional_str, reject_identity_fields, required_str, Shared};
 use crate::error::{Error, Result};
-use crate::issue::{self, claim, Pm};
+use crate::issue::{self, claim};
 use crate::peer::{may_mutate_agent, AgentCaller, AgentMutation};
 use crate::store;
 
@@ -96,7 +96,7 @@ impl Shared {
             VERB,
         )
         .map_err(Error::rejected)?;
-        let pm = Pm::at(&self.pm_dir()?)?;
+        let pm = self.pm()?;
         let (project, dir) = issue::write::issue_dir(&pm, &id)?;
         let (front, _) = issue::write::load_front(&dir)?;
         // The dispatch-side claim check `dispatch::run` runs before

@@ -26,6 +26,7 @@ pub mod error;
 pub mod filter;
 pub mod inbox;
 pub mod issue;
+pub mod lease;
 pub mod master;
 pub mod mcp;
 pub mod memory;
