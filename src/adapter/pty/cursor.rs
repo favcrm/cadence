@@ -209,19 +209,18 @@ fn spinner_row(row: &str) -> bool {
         || (cursor_screen::SPINNER.iter().any(|w| row.contains(w)) && row.contains("tokens"))
 }
 
-/// Text staged in the input row. The interrupt hint shares that row,
-/// right-aligned, and `capture-pane` pads the row to the pane width
-/// *after* the hint — so the hint is not a suffix. `trim_end_matches`
-/// then leaves `ctrl+c to stop` in the draft and a drained
-/// `Add a follow-up` watermark reads as unsubmitted text (CAD-612).
-/// Strip the hint wherever it sits, then the padding; what remains is
-/// the placeholder or a real draft.
+/// Text staged in the input row. The interrupt hint is trailing chrome
+/// on that row, and `capture-pane` pads the row *after* the hint, so
+/// the hint is a suffix only once those spaces are trimmed. Strip it
+/// only then. Cutting at the first `ctrl+c to stop` would read a draft
+/// that starts with that phrase as empty, and the render check would
+/// accept the unconsumed paste (CAD-612 review).
 fn input_draft(input_line: &str) -> String {
     let trimmed = input_line.trim();
-    let body = match trimmed.find(cursor_screen::INTERRUPT) {
-        Some(at) => trimmed[..at].trim_end(),
-        None => trimmed,
-    };
+    let body = trimmed
+        .strip_suffix(cursor_screen::INTERRUPT)
+        .map(str::trim_end)
+        .unwrap_or(trimmed);
     body.trim_start_matches(cursor_screen::PROMPT)
         .trim()
         .to_string()
@@ -1141,6 +1140,42 @@ mod tests {
         assert!(
             !p.input_nonempty,
             "padded hint must read as a drained input, not a draft: {p:?}"
+        );
+    }
+
+    #[test]
+    fn draft_left_of_padded_hint_is_unsubmitted_text() {
+        // A real draft shares the row with the right-aligned hint and
+        // the pane-width padding after it. The hint is chrome; the
+        // draft is not.
+        let line = format!(
+            "  → ship the fix{gap}ctrl+c to stop{pad}",
+            gap = " ".repeat(40),
+            pad = " ".repeat(12),
+        );
+        assert!(line.ends_with(' ') && line.contains("ship the fix"));
+        let p = analyze_cursor(&format!("work\n{line}\n  /mock · main\n"), None);
+        assert!(p.input_nonempty, "{p:?}");
+        assert!(!p.idle, "{}", p.reason);
+    }
+
+    #[test]
+    fn draft_starting_with_the_interrupt_phrase_is_unsubmitted_text() {
+        // The draft itself begins with `ctrl+c to stop`. Trailing
+        // chrome repeats the phrase after padding. Keeping only the
+        // text before the first occurrence reads the row as empty, and
+        // a visible empty input is a submitted turn.
+        let line = format!(
+            "  → ctrl+c to stop the deploy{gap}ctrl+c to stop{pad}",
+            gap = " ".repeat(20),
+            pad = " ".repeat(8),
+        );
+        assert!(line.ends_with(' '));
+        assert!(line.trim_end().ends_with("ctrl+c to stop"));
+        let p = analyze_cursor(&format!("work\n{line}\n  /mock · main\n"), None);
+        assert!(
+            p.input_nonempty,
+            "a draft that starts with the hint phrase must stay text: {p:?}"
         );
     }
 

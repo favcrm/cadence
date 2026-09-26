@@ -4688,7 +4688,11 @@ fn cli_join_cursor_briefs_prefixes() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let agent = d.wait_agent("wj", "idle", 20);
+    // CAD-612: Cursor's idle placeholder is the readiness claim, so the
+    // join bootstrap self-delivers and the worker lands busy — the same
+    // as Devin. Settle that turn. The argv and briefing checks stay.
+    d.wait_agent("wj", "busy", 20);
+    let agent = d.rpc("agent_show", json!({"alias": "wj"})).unwrap()["agent"].clone();
     assert_eq!(agent["provider"], "cursor");
     assert_eq!(agent["endpoint_kind"], "pty");
     wait_probe_idle(&d, "wj", 15);
@@ -4701,6 +4705,9 @@ fn cli_join_cursor_briefs_prefixes() {
         assert!(text.contains(want), "briefing missing {want}:\n{text}");
     }
     assert_eq!(agent["params"]["upstream"], "pm", "{agent}");
+    let boot = d.wait_message("wj", "bootstrap-wj", &["running"], 15);
+    assert_eq!(boot["source"], "bootstrap");
+    pty_report_done(&d, "wj", "bootstrap-wj");
 }
 
 /// Audit N8: a launch of any kind leaves the agent's cwd repository
