@@ -1083,6 +1083,51 @@ mod tests {
         assert_eq!(rows.len(), 1, "{:?}", view["needs_me"]);
     }
 
+    /// CAD-591: a designated reviewer who is busy is not a fresh
+    /// assignment. The kickoff is not queued, and Needs-you keeps the
+    /// unstaffed row.
+    #[test]
+    fn busy_reviewer_pool_leaves_the_review_unstaffed_in_needs_you() {
+        let (_d, s, calls) = shared();
+        worker(&s, "w1", "fake");
+        staff(&s, "rev", "fake", "reviewer", "busy", None, None);
+        let pm = tempfile::TempDir::new().unwrap();
+        pm_scaffold(pm.path());
+        s.provider_env
+            .set("CADENCE_PM_DIR", pm.path().to_str().unwrap());
+        issue(pm.path(), "TST-1", "review", "");
+        let name = done_report(
+            pm.path(),
+            "TST-1",
+            1_700_000_000,
+            "w1",
+            Some(SHA1),
+            Some(PR1),
+        );
+        record(&s, "TST-1", |r| {
+            r.state = State::Unstaffed;
+            r.head = Some(SHA1.to_string());
+            r.pr = Some(PR1.to_string());
+            r.handled = vec![name];
+        });
+
+        s.checkup_tick();
+        assert_eq!(outcomes(&s, "w1"), ["escalate"]);
+        assert_eq!(records(&s)["TST-1"].state, State::Unstaffed);
+        assert!(records(&s)["TST-1"].reviewer.is_none());
+        assert!(s.store.queued_head("rev").unwrap().is_none());
+        assert!(s.store.queued_head("w1").unwrap().is_none());
+        assert!(calls.lock().unwrap().is_empty());
+        let view = crate::overview::overview_cached(&s.state_dir, pm.path());
+        let rows: Vec<_> = view["needs_me"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["kind"].as_str() == Some("review_unstaffed"))
+            .collect();
+        assert_eq!(rows.len(), 1, "{:?}", view["needs_me"]);
+    }
+
     #[test]
     fn an_unrecorded_done_report_is_adopted_and_routed() {
         let (_d, s, calls) = shared();

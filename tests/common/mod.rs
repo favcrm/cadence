@@ -6743,9 +6743,38 @@ impl LoopFixture {
         }
     }
 
+    /// Record `who` idle. The enrollment mock never completes a provider
+    /// turn, so a reviewer stays `busy` after the kickoff is taken. A
+    /// finished turn would leave them idle; this is that state, so a
+    /// later fresh review (which may only go to an idle reviewer) can
+    /// choose them.
+    pub fn idle_agent(&self, who: &str) {
+        let conn = rusqlite::Connection::open(self.f.d.state.join("cadence.sqlite3")).unwrap();
+        let n = conn
+            .execute(
+                "UPDATE agents SET state='idle' WHERE alias=?1 AND state='busy'",
+                rusqlite::params![who],
+            )
+            .unwrap();
+        assert_eq!(n, 1, "{who} was not busy");
+    }
+
+    fn agent_state(&self, who: &str) -> String {
+        self.f.d.rpc("agent_show", json!({"alias": who})).unwrap()["agent"]["state"]
+            .as_str()
+            .unwrap_or("")
+            .to_string()
+    }
+
     /// w1 reports `sha` done on `pr`; whichever idle reviewer the loop
-    /// assigned PASSes it through `report_verdict`.
+    /// assigned PASSes it through `report_verdict`. A fresh review
+    /// goes only to an idle reviewer. The mock never finishes a turn,
+    /// so once both reviewers are busy this frees `r1` — the state a
+    /// finished turn would leave — before the report is filed.
     pub fn pass_on(&mut self, id: &str, sha: &str, pr: &str) {
+        if self.agent_state("r1") != "idle" && self.agent_state("r2") != "idle" {
+            self.idle_agent("r1");
+        }
         self.done_on(id, sha, pr);
         let rec = self.wait_of(id, "in review", |r| {
             r["state"] == "reviewing" && r["head"] == sha

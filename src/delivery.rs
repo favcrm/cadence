@@ -400,18 +400,17 @@ fn foreign_pm(worker_pm: Option<&str>, candidate: &Candidate) -> bool {
 /// group line ([`worker_group`]), never a member of another PM's group,
 /// never the master, never an alias in `exclude`, never a disabled,
 /// fenced (`attention`) or inbox agent. An implementer (`worker` /
-/// `pm`) is never chosen, busy or idle. The previous round's reviewer
-/// keeps the ticket while it still qualifies — including while busy —
-/// so the verdicts stay comparable; a caller passes `None` for
-/// `previous` (and the old reviewer in `exclude`) when the head moved
-/// without the worker, since whoever pushed must not review its own
-/// commits. A new review prefers an idle reviewer. A busy designated
-/// reviewer is used only when every qualifying reviewer is busy, so
-/// the kickoff queues instead of waiting for a router pass that does
-/// not re-run when someone goes idle. No designated reviewer at all
-/// leaves the review unassigned. Otherwise a different provider from
-/// the worker's wins when one is staffed, else another session of the
-/// same provider; idle before busy, then alias order.
+/// `pm`) is never chosen, busy or idle. A fresh review goes only to an
+/// idle reviewer. When none is idle the review stays unassigned. The
+/// previous round's reviewer keeps the ticket while it still qualifies
+/// and is idle. A busy previous reviewer is not reused while an idle
+/// reviewer can take the ticket; it stays only when every qualifying
+/// reviewer is busy, so the verdicts on that head stay comparable. A
+/// caller passes `None` for `previous` (and the old reviewer in
+/// `exclude`) when the head moved without the worker, since whoever
+/// pushed must not review its own commits. Among idle reviewers, a
+/// different provider from the worker's wins when one is staffed, else
+/// another session of the same provider, then alias order.
 pub fn pick_reviewer(
     worker: &str,
     worker_provider: Option<&str>,
@@ -432,20 +431,20 @@ pub fn pick_reviewer(
             && !foreign_pm(worker_pm, a)
     };
     let eligible: Vec<&Candidate> = agents.iter().filter(qualifies).collect();
+    let idle_exists = eligible.iter().any(|a| a.state == "idle");
     if let Some(prev) = previous {
-        if eligible.iter().any(|a| a.alias == prev) {
-            return Some(prev.to_string());
+        if let Some(held) = eligible.iter().find(|a| a.alias == prev) {
+            // A busy holder yields when an idle reviewer can take over.
+            if held.state == "idle" || !idle_exists {
+                return Some(prev.to_string());
+            }
         }
     }
-    let mut ranked = eligible;
+    let mut ranked: Vec<&Candidate> = eligible.into_iter().filter(|a| a.state == "idle").collect();
     ranked.sort_by(|a, b| {
-        let idle = |c: &Candidate| c.state == "idle";
         let same = |c: &Candidate| Some(c.provider.as_str()) == worker_provider;
-        // Idle first, then a different provider, then alias.
-        idle(b)
-            .cmp(&idle(a))
-            .then(same(a).cmp(&same(b)))
-            .then(a.alias.cmp(&b.alias))
+        // A different provider, then alias. Every candidate here is idle.
+        same(a).cmp(&same(b)).then(a.alias.cmp(&b.alias))
     });
     ranked.first().map(|a| a.alias.clone())
 }
@@ -883,8 +882,8 @@ mod tests {
             staff("a-impl", "worker", "idle", Some("pm")),
             // Busy implementer — the CAD-584 failure.
             staff("b-busy-impl", "worker", "busy", Some("pm")),
-            // Designated, but busy: leave the review unassigned rather
-            // than hand it to a reviewer who is not idle.
+            // Designated, but busy. A fresh review never lands here.
+            // Sticky reuse is refused too while an idle reviewer remains.
             staff("c-busy-rev", "reviewer", "busy", Some("pm")),
             // Designated and idle, but another PM's group.
             staff("d-foreign", "reviewer", "idle", Some("other-pm")),
@@ -913,13 +912,15 @@ mod tests {
             pick_reviewer("w1", Some("claude"), Some("b-busy-impl"), &[], &agents).as_deref(),
             Some("rev")
         );
-        // The reviewer already on the ticket keeps it while busy.
+        // Sticky previous is busy, and an idle reviewer exists: hand it
+        // to the idle one, not back to the busy holder.
         assert_eq!(
             pick_reviewer("w1", Some("claude"), Some("c-busy-rev"), &[], &agents).as_deref(),
-            Some("c-busy-rev")
+            Some("rev")
         );
-        // Every idle reviewer gone: the busy designated reviewer takes
-        // the kickoff. Drop them too and an implementer is not a fallback.
+        // No idle reviewer: a fresh review stays unassigned. The busy
+        // holder keeps a ticket it already has, because nobody idle can
+        // take over. An implementer is not a fallback either way.
         let busy_only: Vec<_> = agents
             .iter()
             .filter(|a| a.alias != "rev" && a.alias != "z-root")
@@ -927,6 +928,10 @@ mod tests {
             .collect();
         assert_eq!(
             pick_reviewer("w1", Some("claude"), None, &[], &busy_only).as_deref(),
+            None
+        );
+        assert_eq!(
+            pick_reviewer("w1", Some("claude"), Some("c-busy-rev"), &[], &busy_only).as_deref(),
             Some("c-busy-rev")
         );
         let implementers: Vec<_> = busy_only

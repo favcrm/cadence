@@ -300,9 +300,9 @@ impl Shared {
             if rec.state != State::Unstaffed {
                 rec.enter(State::Unstaffed, now());
                 rec.note = Some(format!(
-                    "no reviewer can take {sha}: reviews go only to an agent registered \
-                     with --role reviewer, never to an implementer, the author, or \
-                     another PM's group",
+                    "no idle reviewer can take {sha}: a fresh review goes only to an idle \
+                     agent registered with --role reviewer, never to a busy reviewer, an \
+                     implementer, the author, or another PM's group",
                 ));
                 let _ = self.store.event_public(
                     DAEMON_ALIAS,

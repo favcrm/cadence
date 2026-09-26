@@ -1703,18 +1703,21 @@ fn delivery_loop_review_revise_pass_merge_end_to_end() {
     assert!(text.contains("D-2") && text.contains("down step"), "{text}");
     assert!(lf.needs("merge_decision").is_empty());
 
-    // Worker fix → round 2 at the new head, same reviewer.
+    // Worker fix → round 2 at the new head. r1 is still busy on round 1,
+    // so the idle reviewer takes it.
     lf.done(&b);
     let rec = lf.wait_rec("round 2", |r| r["state"] == "reviewing" && r["head"] == b);
     assert_eq!(rec["rounds"], 2, "{rec}");
+    let round2 = rec["reviewer"].as_str().unwrap().to_string();
+    assert_eq!(round2, "r2", "busy r1 was reused: {rec}");
     let before = lf.snapshot();
-    let (ok, err) = lf.verdict_as("r1", "pass", &a);
+    let (ok, err) = lf.verdict_as(&round2, "pass", &a);
     assert!(!ok && err.to_string().contains("stale verdict"), "{err}");
     assert_eq!(lf.snapshot(), before);
 
     // Reviewer PASS at b. No merge row until the operator's process saw
     // the head green.
-    let (ok, out) = lf.verdict_as("r1", "pass", &b);
+    let (ok, out) = lf.verdict_as(&round2, "pass", &b);
     assert!(ok, "{out}");
     assert_eq!(out["delivery"]["state"], "passed", "{out}");
     assert!(lf.needs("merge_decision").is_empty());
@@ -1736,7 +1739,7 @@ fn delivery_loop_review_revise_pass_merge_end_to_end() {
         "{row}"
     );
     assert_eq!(row["merge"]["owner"], "w1", "{row}");
-    assert_eq!(row["merge"]["reviewer"], "r1", "{row}");
+    assert_eq!(row["merge"]["reviewer"], round2, "{row}");
     assert_eq!(row["merge"]["sha"], b, "{row}");
     assert_eq!(row["merge"]["additions"], 12, "{row}");
     assert_eq!(row["merge"]["files"], 2, "{row}");
@@ -1802,7 +1805,10 @@ fn delivery_loop_review_revise_pass_merge_end_to_end() {
     assert!(lf.needs("merge_decision").is_empty());
 
     // The head moves after the review: auto-merge goes off and the new
-    // head re-enters review; the old PASS is stale.
+    // head re-enters review; the old PASS is stale. r1 is still busy
+    // on round 1. A fresh review needs an idle reviewer, and r2 (on
+    // duty when the head moved) is barred, so record r1 idle first.
+    lf.idle_agent("r1");
     lf.set_gh(&c, "OPEN", true, true);
     let (ok, out) = lf.operator(&["delivery", "sync"]);
     assert!(ok, "{out}");
@@ -1813,18 +1819,18 @@ fn delivery_loop_review_revise_pass_merge_end_to_end() {
         "{}",
         lf.gh_log()
     );
-    // Nobody but the worker reported it: r1 (on duty when it moved,
-    // maybe its pusher) is barred, and r2 takes the new head.
+    // Nobody but the worker reported it: r2 (on duty when it moved,
+    // maybe its pusher) is barred, and idle r1 takes the new head.
     let rec = lf.rec();
     assert_eq!(rec["state"], "reviewing", "{rec}");
     assert_eq!(rec["head"], c, "{rec}");
     assert_eq!(rec["rounds"], 3, "{rec}");
-    assert_eq!(rec["reviewer"], "r2", "{rec}");
-    assert_eq!(rec["excluded"], json!(["r1"]), "{rec}");
-    let (ok, err) = lf.verdict_as("r2", "pass", &b);
+    assert_eq!(rec["reviewer"], "r1", "{rec}");
+    assert_eq!(rec["excluded"], json!(["r2"]), "{rec}");
+    let (ok, err) = lf.verdict_as("r1", "pass", &b);
     assert!(!ok && err.to_string().contains("stale verdict"), "{err}");
-    let (ok, err) = lf.verdict_as("r1", "pass", &c);
-    assert!(!ok && err.to_string().contains("assigned to r2"), "{err}");
+    let (ok, err) = lf.verdict_as("r2", "pass", &c);
+    assert!(!ok && err.to_string().contains("assigned to r1"), "{err}");
     // The next sync sees auto-merge off: nothing left to turn off.
     let (ok, _) = lf.operator(&["delivery", "sync"]);
     assert!(ok);
@@ -1833,7 +1839,7 @@ fn delivery_loop_review_revise_pass_merge_end_to_end() {
     // PASS at c → merge from the board → merged. The board's Merge
     // keeps the operator rule of the chat-first Home: an agent's request
     // is refused (403) before any gh call.
-    let (ok, out) = lf.verdict_as("r2", "pass", &c);
+    let (ok, out) = lf.verdict_as("r1", "pass", &c);
     assert!(ok, "{out}");
     let (ok, out) = lf.operator(&["delivery", "sync"]);
     assert!(ok, "{out}");
@@ -2065,10 +2071,12 @@ fn delivery_loop_escalates_after_two_revise_rounds() {
     let (ok, out) = lf.verdict_as("r1", "revise", &a);
     assert!(ok, "{out}");
     lf.done(&b);
-    lf.wait_rec("reviewing b", |r| {
+    let rec = lf.wait_rec("reviewing b", |r| {
         r["state"] == "reviewing" && r["head"] == b
     });
-    let (ok, out) = lf.verdict_as("r1", "revise", &b);
+    let round2 = rec["reviewer"].as_str().unwrap().to_string();
+    assert_eq!(round2, "r2", "busy r1 was reused: {rec}");
+    let (ok, out) = lf.verdict_as(&round2, "revise", &b);
     assert!(ok, "{out}");
     assert_eq!(out["delivery"]["state"], "escalated", "{out}");
     let revises =
@@ -2399,8 +2407,9 @@ fn cad446_board_syncs_delivery_without_a_terminal() {
     // review, barring r1 (CAD-558).
     lf.set_gh(&b, "OPEN", true, false);
     lf.done(&b);
-    lf.wait_rec("round 2", |r| r["state"] == "reviewing" && r["head"] == b);
-    let (ok, out) = lf.verdict_as("r1", "pass", &b);
+    let rec = lf.wait_rec("round 2", |r| r["state"] == "reviewing" && r["head"] == b);
+    let reviewer = rec["reviewer"].as_str().unwrap().to_string();
+    let (ok, out) = lf.verdict_as(&reviewer, "pass", &b);
     assert!(ok, "{out}");
     let passed = Instant::now();
     let row = cad446_wait_row(port, "merge_decision", 20, |_| true);
@@ -3599,8 +3608,10 @@ fn delivery_observe_stale_read_never_rewinds_a_passed_review() {
     let read_at = epoch() - 1;
     assert!(read_at > 0);
     lf.done(&b);
-    lf.wait_rec("round 2", |r| r["state"] == "reviewing" && r["head"] == b);
-    let (ok, out) = lf.verdict_as("r1", "pass", &b);
+    let rec = lf.wait_rec("round 2", |r| r["state"] == "reviewing" && r["head"] == b);
+    let round2 = rec["reviewer"].as_str().unwrap().to_string();
+    assert_eq!(round2, "r2", "busy r1 was reused: {rec}");
+    let (ok, out) = lf.verdict_as(&round2, "pass", &b);
     assert!(ok, "{out}");
     assert_eq!(lf.rec()["state"], "passed", "{}", lf.rec());
     let before = lf.snapshot();
@@ -3612,7 +3623,7 @@ fn delivery_observe_stale_read_never_rewinds_a_passed_review() {
     let rec = lf.rec();
     assert_eq!(rec["state"], "passed", "stale read rewound: {rec}");
     assert_eq!(rec["head"], b, "stale read overwrote the head: {rec}");
-    assert_eq!(rec["reviewer"], "r1", "reviewer lost: {rec}");
+    assert_eq!(rec["reviewer"], round2, "reviewer lost: {rec}");
     assert!(
         rec["excluded"].as_array().is_none_or(|e| e.is_empty()),
         "stale read excluded the reviewer: {rec}"
@@ -3634,7 +3645,9 @@ fn delivery_observe_stale_read_never_rewinds_a_passed_review() {
     assert_eq!(out["state"], "passed", "{out}");
 
     // A read begun after the head change is a real move: the review
-    // rewinds, the moved-head comment lands and r1 is excluded.
+    // rewinds and r2 is excluded. r1 is still busy on round 1; record
+    // them idle so the fresh review has a reviewer to land on.
+    lf.idle_agent("r1");
     let obs = json!({
         "issue": "D-2", "head": a, "pr_state": "OPEN",
         "ci_green": true, "read_at": epoch(),
@@ -3644,10 +3657,10 @@ fn delivery_observe_stale_read_never_rewinds_a_passed_review() {
     let rec = lf.rec();
     assert_eq!(rec["state"], "reviewing", "{rec}");
     assert_eq!(rec["head"], a, "{rec}");
-    assert_eq!(rec["reviewer"], "r2", "review moved to r2: {rec}");
+    assert_eq!(rec["reviewer"], "r1", "review moved to r1: {rec}");
     assert!(
-        rec["excluded"].as_array().unwrap().contains(&json!("r1")),
-        "r1 was not excluded: {rec}"
+        rec["excluded"].as_array().unwrap().contains(&json!("r2")),
+        "r2 was not excluded: {rec}"
     );
     let (ok, show) = lf.f.cli(&["issue", "show", "D-2", "--json"]);
     assert!(ok, "{show}");
@@ -3657,7 +3670,7 @@ fn delivery_observe_stale_read_never_rewinds_a_passed_review() {
     );
 
     // And without the stamp (an older cadence), a different head still
-    // reads as a move — the default is "fresh". With r1 and now r2
+    // reads as a move — the default is "fresh". With r2 and now r1
     // excluded, no reviewer remains: the loop is unstaffed, never
     // silently "no move".
     let obs = json!({"issue": "D-2", "head": b, "pr_state": "OPEN", "ci_green": true});
