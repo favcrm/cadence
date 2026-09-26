@@ -1345,7 +1345,11 @@ fn agentic_provider_master_open_and_concurrent_switch_refuse() {
         json!({"model": "cursor/grok-4.7-high", "role": "worker", "unconfined": true}),
     );
     forged.role = "worker".into();
-    let err = pi.open(&forged).unwrap_err().to_string();
+    let err = pi
+        .open(&forged)
+        .err()
+        .expect("agentic open must refuse")
+        .to_string();
     assert!(err.contains("agentic"), "{err}");
     assert!(!state.join("master/cwd/pi-rpc.jsonl").exists());
 
