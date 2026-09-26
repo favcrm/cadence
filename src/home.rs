@@ -157,6 +157,23 @@ pub fn vault_dir() -> Result<PathBuf> {
     }
 }
 
+/// The vault a *served* tracker uses — the instance-bound form of
+/// [`vault_dir`]: `<home>/vault` under the new layout; `tracker`'s
+/// `wiki/` under the legacy one. [`vault_dir`] resolves the env
+/// tracker, but a daemon's tracker is instance-bound (its own
+/// `CADENCE_PM_DIR` lives in `provider_env`, which process-env
+/// resolution cannot see) — under a test fixture the two disagree,
+/// and the wiki must follow the tracker actually being served.
+pub fn vault_for(tracker: &Path) -> Result<PathBuf> {
+    match layout()? {
+        Layout {
+            source: Source::Legacy,
+            ..
+        } => Ok(tracker.join("wiki")),
+        l => Ok(l.root.join("vault")),
+    }
+}
+
 /// Managed repo checkouts: `<home>/repos` — under the legacy layout
 /// the would-be `~/.cadence/repos` (nothing reads it until the
 /// migration creates the layout).

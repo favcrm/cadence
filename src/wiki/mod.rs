@@ -1,7 +1,8 @@
 //! CAD-580: the wiki v1 store — the knowledge layer's durable tree.
 //!
-//! Layout under the vault root ([`vault_dir`] — `<pm>/wiki` today,
-//! CAD-584's `<home>/vault` when the new layout lands):
+//! Layout under the vault root ([`vault_dir`] — resolved by
+//! [`crate::home::vault_for`]: `<home>/vault` under `CADENCE_HOME`,
+//! the served tracker's `wiki/` under the legacy layout):
 //!
 //! ```text
 //! global/                     operator-written shared knowledge
@@ -286,18 +287,12 @@ pub fn normalize(path: &str) -> Result<String> {
     Ok(segs.join("/"))
 }
 
-/// The vault this tracker serves — [`crate::home::vault_dir`]'s layout
-/// reconciled with the daemon's instance-bound tracker: under the new
-/// `CADENCE_HOME` layout the vault is `<home>/vault` (the resolver's
-/// answer); under the legacy layout it is `<pm.dir>/wiki` — what
-/// `vault_dir` resolves whenever `pm.dir` is the env tracker, and the
-/// only correct answer when a fixture daemon's `CADENCE_PM_DIR` lives
-/// in its provider env rather than this process's.
+/// The vault this tracker serves — [`crate::home::vault_for`]:
+/// `<home>/vault` under `CADENCE_HOME`, the served tracker's `wiki/`
+/// under the legacy layout (the daemon's tracker is instance-bound,
+/// so the vault follows `pm.dir`, not the process env).
 pub fn vault_dir(pm: &Pm) -> Result<PathBuf> {
-    match crate::home::layout()?.source {
-        crate::home::Source::Env => crate::home::vault_dir(),
-        crate::home::Source::Legacy => Ok(pm.dir.join("wiki")),
-    }
+    crate::home::vault_for(&pm.dir)
 }
 
 /// Where blobs live under the vault.
