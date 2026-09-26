@@ -22,6 +22,7 @@ pub mod continuity;
 pub mod contract_fixture;
 pub mod daemon;
 pub mod delivery;
+pub mod devin_catalog;
 pub mod doctor;
 pub mod error;
 pub mod filter;

@@ -1085,6 +1085,11 @@ struct Shared {
     turn: Mutex<TurnAcc>,
     /// Minted per `open`; prefixes this endpoint generation's turn ids.
     generation: Mutex<String>,
+    /// CAD-575: the role the LAST `open` ran under — `session_set_model`
+    /// gates on it (`master_allow` vs `worker_allow`/`allow`). False
+    /// until an open lands, which is also "worker" — a session command
+    /// without a live session fails at the transport first.
+    master: AtomicBool,
     /// Set by `interrupt()` — the next settle's grace deadline.
     interrupt_at: Mutex<Option<Instant>>,
     /// The turn token `run_turn` is waiting on.
@@ -1118,6 +1123,7 @@ impl PiAdapter {
             outcome_cv: Condvar::new(),
             turn: Mutex::new(TurnAcc::default()),
             generation: Mutex::new(String::new()),
+            master: AtomicBool::new(false),
             interrupt_at: Mutex::new(None),
             active_turn: Mutex::new(None),
             last_activity: Mutex::new(Instant::now()),
@@ -1250,14 +1256,20 @@ impl PiAdapter {
             }
         };
         // CAD-559: a `/model` switch is a launch-equivalent decision —
-        // the operator's [pi].models.allow gate runs before `set_model`
-        // crosses the wire, exactly like the open path's re-check.
+        // the operator's allowlist gate runs before `set_model` crosses
+        // the wire, exactly like the open path's re-check — under the
+        // role this adapter opened as (CAD-575).
         let want = format!("{provider}/{model_id}");
         let pi_policy = pi_pm_dir(&self.env)
             .map(|dir| crate::pi_policy::read(&dir))
             .transpose()?
             .flatten();
-        crate::pi_policy::require_allowed(pi_policy.as_ref(), &want)?;
+        let role = if self.shared.master.load(Ordering::SeqCst) {
+            "master"
+        } else {
+            "worker"
+        };
+        crate::pi_policy::require_allowed(pi_policy.as_ref(), role, &want)?;
         let model = self.checked(
             "set_model",
             json!({"provider": provider, "modelId": model_id}),
@@ -1595,7 +1607,12 @@ impl ProviderAdapter for PiAdapter {
             .map(|dir| crate::pi_policy::read(&dir))
             .transpose()?
             .flatten();
-        crate::pi_policy::require_allowed(pi_policy.as_ref(), want)?;
+        crate::pi_policy::require_allowed(
+            pi_policy.as_ref(),
+            if master { "master" } else { "worker" },
+            want,
+        )?;
+        self.shared.master.store(master, Ordering::SeqCst);
         if master {
             write_pi_guard(&self.state_dir)?;
         }

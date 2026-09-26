@@ -1055,6 +1055,7 @@ mod tests {
             "task_accept",
             "agent_file_write",
             "master_start",
+            "master_models",
             "reports_changed",
             "memory_finalize",
             "model_defaults_set",

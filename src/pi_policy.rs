@@ -10,13 +10,22 @@
 //!   providers: ["pi-devin@0.1.2"]           # npm package@version pins
 //!   models:
 //!     allow: ["openrouter/z-ai/glm-5.3-flash", "devin/swe-2-high"]
+//!     master_allow: ["openrouter/z-ai/glm-5.3-flash"]   # optional (CAD-575)
+//!     worker_allow: ["devin/swe-2-high"]              # optional (CAD-575)
 //!     default: { master: "openrouter/z-ai/glm-5.3-flash", worker: "devin/swe-2-high" }
 //! ```
 //!
-//! - `models.allow` is the whole vocabulary a managed pi agent may
-//!   launch on — `master start`, `join`, `agent set --next-launch` and
-//!   the adapter's own launch all check it. An absent `[pi]` allows
-//!   nothing: every pi launch refuses until the operator pins a list.
+//! - `models.allow` is the vocabulary a managed pi agent may launch
+//!   on — `master start`, `join`, `agent set --next-launch` and the
+//!   adapter's own launch all check it. `models.master_allow` and
+//!   `models.worker_allow` (CAD-575) narrow it per role — a confined
+//!   master cannot run `devin/*` models the workers can (the pi-devin
+//!   extension shells out to a Devin CLI the sandbox cannot
+//!   credential). A role list that is present replaces `allow` for
+//!   that role, including a present-but-empty one; a role without its
+//!   own list falls back to `allow` unchanged. An absent `[pi]`
+//!   allows nothing: every pi launch refuses until the operator pins
+//!   a list.
 //! - `models.default.{master,worker}` is the role fallback when no
 //!   explicit `--model` (and no `model_defaults` role entry) names one.
 //!   There is no "provider default" for pi — that is the silent
@@ -55,11 +64,45 @@ pub struct PiPolicy {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PiModels {
-    /// The only `provider/id` values a pi agent may launch on.
+    /// The only `provider/id` values a pi agent may launch on — the
+    /// fallback both role lists override.
     #[serde(default)]
     pub allow: Vec<String>,
+    /// CAD-575: the master's own vocabulary — `Some` replaces `allow`
+    /// for the master outright (an empty list allows it nothing);
+    /// `None` falls back to `allow`. A confined master cannot run
+    /// `devin/*` — the pi-devin extension shells out to a Devin CLI
+    /// the sandbox cannot credential.
+    pub master_allow: Option<Vec<String>>,
+    /// CAD-575: the same for workers — every pi agent that is not the
+    /// master (pm-role agents share `worker`, like the role defaults).
+    pub worker_allow: Option<Vec<String>>,
     #[serde(default)]
     pub default: PiRoleDefaults,
+}
+
+impl PiModels {
+    /// The list `role` launches under: its own `master_allow` /
+    /// `worker_allow` when pm.yaml carries one, else `allow` —
+    /// [`crate::pi_policy::PiRoleDefaults::for_role`] treats every
+    /// non-master role as `worker`, and so does this.
+    pub fn allow_for(&self, role: &str) -> &[String] {
+        match role {
+            "master" => self.master_allow.as_deref().unwrap_or(&self.allow),
+            _ => self.worker_allow.as_deref().unwrap_or(&self.allow),
+        }
+    }
+
+    /// The pm.yaml key `role`'s list came from — named in refusals so
+    /// a rejected launch points at the list the operator must edit.
+    pub fn allow_key(&self, role: &str) -> &'static str {
+        match role {
+            "master" if self.master_allow.is_some() => "master_allow",
+            "master" => "allow",
+            _ if self.worker_allow.is_some() => "worker_allow",
+            _ => "allow",
+        }
+    }
 }
 
 /// `[pi.models.default]` — a fallback per cadence role. A pm-role pi
@@ -120,6 +163,8 @@ impl PiPolicy {
             .models
             .allow
             .iter()
+            .chain(self.models.master_allow.iter().flatten())
+            .chain(self.models.worker_allow.iter().flatten())
             .chain(self.models.default.master.iter())
             .chain(self.models.default.worker.iter())
         {
@@ -170,27 +215,30 @@ pub fn resolve_model(
              is never used (CAD-559)"
         )));
     };
-    require_allowed(policy, &model)?;
+    require_allowed(policy, role, &model)?;
     Ok(model)
 }
 
-/// `model` must be on `[pi].models.allow`. The refusal lists the pinned
-/// ids so a rejected request names its fix; an absent `[pi]` allows
-/// nothing.
-pub fn require_allowed(policy: Option<&PiPolicy>, model: &str) -> Result<()> {
-    let allow: &[String] = policy.map(|p| p.models.allow.as_slice()).unwrap_or(&[]);
+/// `model` must be on the allowlist `role` launches under — the role's
+/// own `master_allow`/`worker_allow` when pm.yaml carries one, else
+/// `allow` (CAD-575). The refusal lists the pinned ids and names the
+/// key so a rejected request names its fix; an absent `[pi]` (or an
+/// empty applicable list) allows nothing.
+pub fn require_allowed(policy: Option<&PiPolicy>, role: &str, model: &str) -> Result<()> {
+    let key = policy.map(|p| p.models.allow_key(role)).unwrap_or("allow");
+    let allow: &[String] = policy.map(|p| p.models.allow_for(role)).unwrap_or(&[]);
     if allow.iter().any(|m| m == model) {
         return Ok(());
     }
     let listed = if allow.is_empty() {
-        "nothing — pm.yaml has no [pi].models.allow".to_string()
+        format!("nothing — pm.yaml has no [pi].models.{key} entries")
     } else {
         allow.join(", ")
     };
     Err(Error::rejected(format!(
-        "pi model '{model}' is not on the operator's allowlist (allowed: \
+        "pi {role} model '{model}' is not on the operator's allowlist (allowed: \
          {listed}) — the operator pins the pi model set in pm.yaml \
-         [pi].models.allow (CAD-559)"
+         [pi].models.{key} (CAD-559, CAD-575)"
     )))
 }
 
@@ -420,6 +468,95 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("allowlist"), "{err}");
+    }
+
+    /// CAD-575: `master_allow`/`worker_allow` parse, override `allow`
+    /// per role (a present-but-empty role list allows that role
+    /// nothing — it does NOT mean `allow`), and a role without its own
+    /// list falls back to `allow` untouched.
+    #[test]
+    fn per_role_lists_override_and_fall_back() {
+        let (_d, pm) = pm_with(
+            "pi:\n  models:\n    allow: [\"a/shared-1\"]\n    master_allow: [\"a/master-only\"]\n    default:\n      master: \"a/master-only\"\n      worker: \"a/shared-1\"\n",
+        );
+        let policy = read(&pm).unwrap().unwrap();
+        // The master's list replaces allow; the worker keeps it.
+        assert_eq!(
+            policy.models.allow_for("master"),
+            &["a/master-only".to_string()]
+        );
+        for role in ["worker", "pm"] {
+            assert_eq!(policy.models.allow_for(role), &["a/shared-1".to_string()]);
+        }
+        // The master may not launch on a model only `allow` offers,
+        // and the worker may not launch on `master_allow`'s.
+        let err = require_allowed(Some(&policy), "master", "a/shared-1")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("master") && err.contains("master_allow"),
+            "{err}"
+        );
+        let err = require_allowed(Some(&policy), "worker", "a/master-only")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("worker") && err.contains("allow"), "{err}");
+        // resolve_model gates the role default the same way — a master
+        // default that is only on `allow` (not master_allow) refuses.
+        let (_d2, pm2) = pm_with(
+            "pi:\n  models:\n    allow: [\"a/m1\"]\n    master_allow: [\"a/m2\"]\n    default:\n      master: \"a/m1\"\n",
+        );
+        let p2 = read(&pm2).unwrap();
+        let err = resolve_model(p2.as_ref(), "master", None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("a/m1") && err.contains("master_allow"),
+            "{err}"
+        );
+    }
+
+    /// An explicitly empty role list is not "no role list": it allows
+    /// that role nothing even though `allow` is populated — `None` vs
+    /// `Some(vec![])` is the only difference and it must not collapse.
+    #[test]
+    fn an_empty_role_list_allows_nothing() {
+        let (_d, pm) = pm_with("pi:\n  models:\n    allow: [\"a/m1\"]\n    master_allow: []\n");
+        let policy = read(&pm).unwrap().unwrap();
+        assert!(policy.models.allow_for("master").is_empty());
+        let err = require_allowed(Some(&policy), "master", "a/m1")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("master_allow"), "{err}");
+        // The worker still falls back to `allow`.
+        require_allowed(Some(&policy), "worker", "a/m1").unwrap();
+        assert_eq!(policy.models.allow_key("worker"), "allow");
+    }
+
+    /// `worker_allow` narrows the worker side the same way.
+    #[test]
+    fn worker_allow_narrows_the_worker_side() {
+        let (_d, pm) = pm_with(
+            "pi:\n  models:\n    allow: [\"a/shared-1\", \"a/shared-2\"]\n    worker_allow: [\"a/shared-2\"]\n",
+        );
+        let policy = read(&pm).unwrap().unwrap();
+        require_allowed(Some(&policy), "worker", "a/shared-2").unwrap();
+        let err = require_allowed(Some(&policy), "worker", "a/shared-1")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("worker_allow"), "{err}");
+        // The master never reads `worker_allow` — it keeps `allow`.
+        require_allowed(Some(&policy), "master", "a/shared-1").unwrap();
+        assert_eq!(policy.models.allow_key("master"), "allow");
+    }
+
+    /// A malformed id inside a role list is caught at read, like an
+    /// `allow` entry.
+    #[test]
+    fn role_lists_validate_at_read() {
+        let (_d, pm) = pm_with("pi:\n  models:\n    master_allow: [\" bad \"]\n");
+        let err = read(&pm).unwrap_err().to_string();
+        assert!(err.contains(" bad "), "{err}");
     }
 
     fn install(root: &Path, name: &str, manifest: &str, files: &[&str]) {

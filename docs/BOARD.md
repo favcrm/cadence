@@ -92,16 +92,25 @@ pi:
   providers: ["pi-devin@0.1.2"]            # extension pkgs, name@version
   models:
     allow: ["devin/swe-2-high", "openrouter/z-ai/glm-5.3-flash"]
-    default: {master: "devin/swe-2-high", worker: "devin/swe-2-high"}
+    master_allow: ["openrouter/z-ai/glm-5.3-flash"]   # optional role list (CAD-575)
+    worker_allow: ["devin/swe-2-high"]              # optional role list (CAD-575)
+    default: {master: "openrouter/z-ai/glm-5.3-flash", worker: "devin/swe-2-high"}
 ```
 
-- `models.allow` is the whole vocabulary a pi agent may run.
+- `models.allow` is the vocabulary a pi agent may run.
   `master start --model`, `join --model`, a `model_defaults` role or
   provider default, and `agent set --next-launch model=…` all resolve
   against it, and the adapter re-checks the stored value on every
-  open. An absent `[pi]` (or an empty `allow`) allows nothing — a pi
-  registration, start, or relaunch refuses rather than fall back.
-  `model_policy: provider_default` is refused outright for pi.
+  open. `models.master_allow` / `models.worker_allow` (CAD-575) are
+  optional per-role replacements: a present role list is what that
+  role may run (an empty one allows nothing), a missing one falls
+  back to `allow`. A confined master cannot run `devin/*` — the
+  pi-devin extension shells out to a Devin CLI the sandbox cannot
+  credential — so the master's list is typically the openrouter/other
+  subset while workers keep `devin/*`. An absent `[pi]` (or an empty
+  applicable list) allows nothing — a pi registration, start, or
+  relaunch refuses rather than fall back. `model_policy:
+  provider_default` is refused outright for pi.
 - `models.default.{master,worker}` fills a start that names no model.
   After launch the adapter asks `get_state` what model is actually
   running; a provider answering with a different one fails the open

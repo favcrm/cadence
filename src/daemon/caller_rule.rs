@@ -345,6 +345,13 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ),
     ("master_state", Rule::Read),
     (
+        "master_models",
+        Rule::Handler(
+            "operator_connection (CAD-575): the master's model vocabulary, cost \
+             tiers and effort levels for the board's model picker",
+        ),
+    ),
+    (
         "master_command",
         Rule::Handler(
             "operator_connection (CAD-551): the operator's allowlisted provider-session \
