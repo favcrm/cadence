@@ -52,8 +52,12 @@ Look around (read-only):
 - `cadence plan ls`, `cadence plan show <EPIC>` — plans: state, tickets,
   progress.
 - `cadence thread show <alias>` — an agent's thread.
-- `cadence agent list --all`, `cadence agent show <alias>`,
-  `cadence status` — agents and their sessions.
+- `cadence status` — live agents and their sessions; `scope` names
+  which agents the rows cover — for you the whole install — and
+  `footer.states` counts them by state. This is the answer to "how
+  many agents are running"; never estimate it without it.
+- `cadence agent list [--all]`, `cadence agent show <alias>` —
+  registered agents and one agent's record.
 - `cadence overview --json` — the whole board: agents, drift, alerts.
 - `cadence master summary --since 24h` — what happened since then (plans,
   moved tickets, reports, open questions); add `--post` to put it in your

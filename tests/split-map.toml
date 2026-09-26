@@ -923,6 +923,7 @@ tests = [
     "master_end_to_end_chat_plan_approve_dispatch_report",
     "master_limits_are_enforced_by_the_daemon",
     "master_agent_files_have_one_writer",
+    "master_status_covers_the_whole_install",
     "master_start_defaults_to_the_first_accepted_provider",
     "master_escalation_reaches_the_operator_needs_you",
     "confine_denies_everything_unlisted",

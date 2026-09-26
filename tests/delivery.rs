@@ -643,6 +643,99 @@ fn master_agent_files_have_one_writer() {
     assert!(err.contains("already registered"), "{err}");
 }
 
+/// CAD-576: asked "how many agents are running", the master ran
+/// `cadence status` and answered a fleet of one — the pane scope
+/// (`CADENCE_ALIAS` → the caller's group) shrank its view to its own
+/// row and the footer's per-state counts covered only it. The master
+/// has no group of its own: its `status` and `agent list` cover the
+/// whole install, `scope` says so, and the counts take in every
+/// group's agents. A worker's view stays scoped — and says so.
+#[test]
+fn master_status_covers_the_whole_install() {
+    let f = PlanFixture::start();
+    let (mut m, _out) = f.start_master();
+    f.d.register_inbox("pm-a");
+    f.d.register_inbox("pm-b");
+    let cwd = f.d.dir.path().to_str().unwrap().to_string();
+    for (alias, upstream) in [("w-a1", "pm-a"), ("w-a2", "pm-a"), ("w-b1", "pm-b")] {
+        f.d.register_pcp(
+            alias,
+            "fake",
+            "fake",
+            &cwd,
+            &format!("{{\"upstream\":\"{upstream}\"}}"),
+        )
+        .unwrap();
+    }
+    for alias in ["pm-a", "pm-b", "w-a1", "w-a2", "w-b1"] {
+        f.d.wait_agent(alias, "idle", 10);
+    }
+    let aliases = |v: &Value| -> Vec<String> {
+        let mut a: Vec<String> = v["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["alias"].as_str().unwrap().to_string())
+            .collect();
+        a.sort();
+        a
+    };
+    let total = |v: &Value| -> i64 {
+        v["footer"]["states"]
+            .as_object()
+            .unwrap()
+            .values()
+            .filter_map(Value::as_i64)
+            .sum()
+    };
+    let fleet = vec!["master", "pm-a", "pm-b", "w-a1", "w-a2", "w-b1"];
+
+    // The master's status: every group's rows, the scope says the whole
+    // install, and the footer counts all of them — the answer to "how
+    // many agents are running". A real master connection reaches only
+    // MASTER_ALLOWED methods, so `slot_status` is refused and the slot
+    // block degrades to null rather than failing the view.
+    let (ok, view) = f.as_master(&mut m, "status --json");
+    assert!(ok, "{view}");
+    assert_eq!(aliases(&view), fleet, "{view}");
+    assert_eq!(view["scope"], json!("all"), "{view}");
+    assert_eq!(total(&view), 6, "{view}");
+    assert!(view["footer"]["slots"].is_null(), "{view}");
+
+    // Its `agent list` is the whole install too — a fleet of one was
+    // the same scope bug.
+    let (ok, list) = f.as_master(&mut m, "agent list");
+    assert!(ok, "{list}");
+    assert_eq!(aliases(&list), fleet, "{list}");
+    assert_eq!(list["scope"], json!("all"), "{list}");
+
+    // A worker's status stays scoped to its group — and names it.
+    let (ok, view) = f.cli_as("w-a1", &["status", "--json"]);
+    assert!(ok, "{view}");
+    assert_eq!(view["scope"], json!({"group": "pm-a"}), "{view}");
+    assert_eq!(aliases(&view), vec!["pm-a", "w-a1", "w-a2"], "{view}");
+    assert_eq!(total(&view), 3, "{view}");
+
+    // `status --all` widens a pane's view explicitly; `--group` scopes
+    // by name — each names its scope in the payload.
+    let (ok, view) = f.cli_as("w-a1", &["status", "--all", "--json"]);
+    assert!(ok, "{view}");
+    assert_eq!(view["scope"], json!("all"), "{view}");
+    assert_eq!(aliases(&view), fleet, "{view}");
+    let (ok, view) = f.cli_as("w-a1", &["status", "--group", "pm-b", "--json"]);
+    assert!(ok, "{view}");
+    assert_eq!(view["scope"], json!({"group": "pm-b"}), "{view}");
+    assert_eq!(aliases(&view), vec!["pm-b", "w-b1"], "{view}");
+
+    // The operator's unscoped view is "all", and the table names the
+    // scope alongside the per-state counts.
+    let pm_dir = f.pm_dir.as_path();
+    let view = status_json(&f.d.state, &[], &[("CADENCE_PM_DIR", pm_dir)]);
+    assert_eq!(view["scope"], json!("all"), "{view}");
+    let table = status_table(&f.d.state, &[("CADENCE_PM_DIR", pm_dir)]);
+    assert!(table.contains("scope: all"), "{table}");
+}
+
 /// CAD-448 review (N1): a `master_start` without `provider` launches
 /// the first provider `master::PROVIDERS` accepts — not a literal
 /// hardcoded in the launch path.
