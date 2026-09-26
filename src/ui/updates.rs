@@ -55,10 +55,9 @@ fn version_of(layout: &Layout, sha: &str) -> Option<String> {
 /// The linked release, as the card's "current version".
 fn current(layout: &Layout) -> Value {
     match upgrade::current(layout) {
-        Ok(upgrade::Current::Link { sha, .. }) => match sha {
-            Some(sha) => json!({"sha": sha, "version": version_of(layout, &sha)}),
-            None => json!({"sha": Value::Null, "version": Value::Null}),
-        },
+        Ok(upgrade::Current::Link { sha: Some(sha), .. }) => {
+            json!({"sha": sha, "version": version_of(layout, &sha)})
+        }
         _ => json!({"sha": Value::Null, "version": Value::Null}),
     }
 }
@@ -107,10 +106,7 @@ pub(super) fn get(state_dir: &Path) -> HttpResp {
 
 /// `POST /api/update/check` — run the real check (gh) now and cache it.
 pub(super) fn check_now(state_dir: &Path) -> HttpResp {
-    if BOARD_UPDATE
-        .checking
-        .swap(true, Ordering::SeqCst)
-    {
+    if BOARD_UPDATE.checking.swap(true, Ordering::SeqCst) {
         return coded_response(409, "check_running", "a check is already running", None);
     }
     let outcome = run_check(state_dir);
@@ -308,9 +304,4 @@ pub(super) fn banner(state_dir: &Path) -> Value {
 /// `GET /api/update/banner` — cheap enough for the SPA to poll.
 pub(super) fn banner_get(state_dir: &Path) -> HttpResp {
     json_response(banner(state_dir))
-}
-
-/// The `404` shape for an unknown update route.
-pub(super) fn unknown() -> HttpResp {
-    err_response(404, "no such update route")
 }
