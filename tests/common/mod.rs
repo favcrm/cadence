@@ -3585,17 +3585,46 @@ pub struct MockPi {
     _private: (),
 }
 
+/// CAD-559: a managed pi launch refuses without the operator's `[pi]`
+/// policy in the bound tracker's pm.yaml. `pi_policy_pm` adds the
+/// suite's default table — every model the suite registers plus both
+/// role defaults — appending to an existing pm.yaml and no-op'ing when
+/// a `pi:` table is already there (a test's own policy always wins).
+pub fn pi_policy_pm(pm_dir: &Path) {
+    std::fs::create_dir_all(pm_dir).unwrap();
+    let file = pm_dir.join("pm.yaml");
+    let mut yaml = std::fs::read_to_string(&file).unwrap_or_default();
+    if yaml.starts_with("pi:") || yaml.contains("\npi:") {
+        return;
+    }
+    if !yaml.is_empty() && !yaml.ends_with('\n') {
+        yaml.push('\n');
+    }
+    yaml.push_str(concat!(
+        "pi:\n",
+        "  models:\n",
+        "    allow: [\"fake/model-1\", \"acme/demo-1\", \"pi-qa-model\", \"pi-base\", \"devin/swe-2-high\"]\n",
+        "    default: {master: \"fake/model-1\", worker: \"fake/model-1\"}\n",
+    ));
+    std::fs::write(&file, yaml).unwrap();
+}
+
 impl TestDaemon {
     /// Route this test's `pi` launches at `tests/e2e/fake-pi.py` — the
     /// same scripted stand-in the master tests use. The fake records
     /// each worker's argv/env-names under
-    /// `<state>/agents/pi-record-<alias>.json`.
+    /// `<state>/agents/pi-record-<alias>.json`. The bound tracker gets
+    /// the suite's `[pi]` policy (CAD-559): a daemon's pm dir without
+    /// one refuses every pi registration.
     pub fn mock_pi(&self, mode: &str) -> MockPi {
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/e2e/fake-pi.py");
         test_env().set(
             "CADENCE_PI_COMMAND",
             format!("python3 {} {}", script.display(), mode),
         );
+        if let Some(pm) = test_env().var("CADENCE_PM_DIR") {
+            pi_policy_pm(Path::new(&pm));
+        }
         MockPi { _private: () }
     }
 

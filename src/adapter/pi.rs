@@ -372,6 +372,51 @@ pub fn copy_pi_auth(dir: &Path, operator_config: &Path) -> Result<crate::master:
 /// `--no-extensions` there is none anyway; the flag is the belt).
 const PI_WORKER_TOOLS: &[&str] = &["read", "bash", "edit", "write", "grep", "find", "ls"];
 
+/// The tracker dir `[pi]` policy is read from (CAD-559): the daemon's
+/// `CADENCE_PM_DIR`, else the process default — the same seam
+/// `pi_confine_inputs` uses for its tracker grant.
+fn pi_pm_dir(env: &ProviderEnv) -> Option<PathBuf> {
+    env.var("CADENCE_PM_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| crate::issue::default_dir().ok())
+}
+
+/// The operator-pinned provider packages (`[pi].providers` in pm.yaml).
+/// Each `name@version` resolves under the OPERATOR's Pi npm dir
+/// (`<PI_CODING_AGENT_DIR|~/.pi/agent>/npm/node_modules`) — never the
+/// agent's private `PI_CODING_AGENT_DIR`, so a confined master cannot
+/// pick its own extensions. Resolution is fail-closed at launch: a
+/// missing package, a version drift or a malformed pin refuses the open.
+fn provider_packages(env: &ProviderEnv) -> Result<Vec<crate::pi_policy::ProviderPackage>> {
+    let Some(pm_dir) = pi_pm_dir(env) else {
+        return Ok(vec![]);
+    };
+    let Some(policy) = crate::pi_policy::read(&pm_dir)? else {
+        return Ok(vec![]);
+    };
+    if policy.providers.is_empty() {
+        return Ok(vec![]);
+    }
+    let operator = crate::master::operator_provider_config(
+        "pi",
+        env.var("PI_CODING_AGENT_DIR"),
+        env.var("HOME"),
+    )
+    .ok_or_else(|| {
+        Error::rejected(
+            "pm.yaml [pi].providers is set but the operator's Pi dir is \
+             unresolvable — set PI_CODING_AGENT_DIR or HOME (CAD-559)",
+        )
+    })?;
+    let root = operator.join("npm").join("node_modules");
+    policy
+        .providers
+        .iter()
+        .map(|spec| crate::pi_policy::resolve_package(spec, &root))
+        .collect()
+}
+
 /// `pi --mode rpc …`: direct argv, no shell. The master gets
 /// `--no-session` (continuity pack rebuilds context) plus
 /// `--no-extensions -e <guard>` and `--tools bash` — its whole toolset
@@ -404,24 +449,41 @@ fn build_command(env: &ProviderEnv, agent: &Agent, state_dir: &Path) -> Result<V
     ] {
         cmd.push(flag.to_string());
     }
+    // CAD-559: the only extensions loaded are the generated guard
+    // (master) plus the operator's pinned `[pi].providers` packages —
+    // `--no-extensions` still fences off everything else, so each entry
+    // is an explicit `-e` file inside its pinned package dir.
+    let packages = provider_packages(env)?;
     if crate::master::is_master(&agent.alias) {
         cmd.push("--no-context-files".to_string());
         cmd.extend([
             "--no-extensions".to_string(),
             "--extension".to_string(),
             pi_guard_path(state_dir).to_string_lossy().to_string(),
-            "--tools".to_string(),
-            // bash (guard-checked `cadence` verbs) plus `read` — the
-            // guard confines reads to `master/tmp`, where Pi spills long
-            // bash output (CAD-552: re-read the spill, don't re-run).
-            "bash,read".to_string(),
         ]);
+        for pkg in &packages {
+            for entry in &pkg.entries {
+                cmd.extend([
+                    "--extension".to_string(),
+                    entry.to_string_lossy().to_string(),
+                ]);
+            }
+        }
+        // bash (guard-checked `cadence` verbs) plus `read` — the
+        // guard confines reads to `master/tmp`, where Pi spills long
+        // bash output (CAD-552: re-read the spill, don't re-run).
+        cmd.extend(["--tools".to_string(), "bash,read".to_string()]);
     } else {
-        cmd.extend([
-            "--no-extensions".to_string(),
-            "--tools".to_string(),
-            PI_WORKER_TOOLS.join(","),
-        ]);
+        cmd.push("--no-extensions".to_string());
+        for pkg in &packages {
+            for entry in &pkg.entries {
+                cmd.extend([
+                    "--extension".to_string(),
+                    entry.to_string_lossy().to_string(),
+                ]);
+            }
+        }
+        cmd.extend(["--tools".to_string(), PI_WORKER_TOOLS.join(",")]);
     }
     // `agent.model` is the provider's report, never a launch param —
     // only the configured param is replayed (same rule as Claude).
@@ -533,16 +595,18 @@ fn pi_confine_inputs(
         programs.push(p);
     }
     programs.push(PathBuf::from(confine_command(env)));
-    let pm_dir = env
-        .var("CADENCE_PM_DIR")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| crate::issue::default_dir().ok());
+    let pm_dir = pi_pm_dir(env);
     // The guard lives outside `master/pi` — a confined master must read
     // but never write it. Its own provider dir is `master/pi`: nothing
     // of `master/claude` (or its `.credentials.json`) is in the policy.
     let mut extra_read = split_paths(env.var(crate::master::CONFINE_EXTRA_READ_ENV));
     extra_read.push(pi_guard_path(state_dir));
+    // CAD-559: exactly the pinned provider package dirs — read-only.
+    // `build_command` resolves the same list and refuses the launch on
+    // a bad pin, so a policy with an unresolvable package never runs.
+    if let Ok(packages) = provider_packages(env) {
+        extra_read.extend(packages.iter().map(|p| p.dir.clone()));
+    }
     crate::master::ConfineInputs {
         state_dir: state_dir.to_path_buf(),
         home: env.var("HOME").filter(|h| !h.is_empty()).map(PathBuf::from),
@@ -632,7 +696,8 @@ fn git_common_dir(cwd: &Path) -> Option<PathBuf> {
 ///   denied; `$CARGO_HOME/config.toml` — cargo aborts the whole run on
 ///   an unreadable config (proven), and this file carries the
 ///   rustc-wrapper/source-mirror settings builds need. `credentials.
-///   toml` is never in the policy — it is the token file.
+///   toml` is never in the policy — it is the token file; the pinned
+///   `[pi].providers` package dirs the `-e` argv loads (CAD-559).
 /// - **denied** by omission: `$HOME` itself and everything under it
 ///   not named above — `~/.ssh` keys, `~/.pi`, `~/.claude`, other
 ///   agents' dirs under the state dir (`<state>/agents/<alias>` is the
@@ -767,6 +832,17 @@ pub fn pi_worker_confinement(
         read.push(home.join(".config/sccache"));
         read.push(home.join(".ssh/config"));
         read.push(home.join(".ssh/known_hosts"));
+    }
+    // CAD-559: the pinned `[pi].providers` package dirs the `-e`
+    // entries point into — read-only, the same grant the master gets.
+    // `build_command` refuses the launch on an unresolvable pin, so a
+    // missed grant here can never load anything else instead.
+    if let Ok(packages) = provider_packages(env) {
+        for pkg in packages {
+            if !read.contains(&pkg.dir) {
+                read.push(pkg.dir);
+            }
+        }
     }
     read.extend(split_paths(env.var(CONFINE_WORKER_EXTRA_READ_ENV)));
     write.extend(split_paths(env.var(CONFINE_WORKER_EXTRA_WRITE_ENV)));
@@ -1382,6 +1458,29 @@ impl ProviderAdapter for PiAdapter {
     /// Pi silently falls back on an unsupported level.
     fn open(&self, agent: &Agent) -> Result<Identity> {
         let master = crate::master::is_master(&agent.alias);
+        let params = agent.params.clone().unwrap_or(Value::Null);
+        // CAD-559: pi launches only on an explicit model the operator
+        // allowlisted — `master start`/`register` decide it, and a
+        // hand-edited or stale row is refused here rather than falling
+        // back to whatever Pi would pick.
+        let want = params
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if want.trim().is_empty() {
+            return Err(Error::rejected(format!(
+                "pi agent '{}' has no model configured — pass --model \
+                 <provider/id> or set pi.models.default.{} in pm.yaml; a \
+                 silent provider fallback is never used (CAD-559)",
+                agent.alias,
+                if master { "master" } else { "worker" }
+            )));
+        }
+        let pi_policy = pi_pm_dir(&self.env)
+            .map(|dir| crate::pi_policy::read(&dir))
+            .transpose()?
+            .flatten();
+        crate::pi_policy::require_allowed(pi_policy.as_ref(), want)?;
         if master {
             write_pi_guard(&self.state_dir)?;
         }
@@ -1458,7 +1557,6 @@ impl ProviderAdapter for PiAdapter {
         }
         // No update checks or telemetry on any managed startup path.
         env.push(("PI_OFFLINE".to_string(), "1".to_string()));
-        let params = agent.params.clone().unwrap_or(Value::Null);
         let idle_secs = params
             .get("turn_idle_secs")
             .and_then(Value::as_u64)
@@ -1518,11 +1616,29 @@ impl ProviderAdapter for PiAdapter {
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| Uuid::new_v4().to_string());
-        let model = data
+        let reported_id = data
             .get("model")
             .and_then(|m| m.get("id").or_else(|| m.get("name")))
+            .and_then(Value::as_str);
+        let reported_full = data
+            .get("model")
+            .and_then(|m| m.get("provider"))
             .and_then(Value::as_str)
-            .map(str::to_string)
+            .and_then(|p| reported_id.map(|i| format!("{p}/{i}")));
+        // CAD-559: Pi answers get_state with whatever model it fell
+        // back to — `--model` is a hint, not a contract. Refuse the
+        // launch unless the running model is the allowlisted one.
+        let matches = reported_full.as_deref() == Some(want) || reported_id == Some(want);
+        if !matches {
+            return Err(Error::provider(format!(
+                "pi reports model {} but '{want}' was requested — the \
+                 provider silently fell back instead of honoring \
+                 --model (CAD-559)",
+                reported_full.as_deref().or(reported_id).unwrap_or("<none>")
+            )));
+        }
+        let model = reported_full
+            .or_else(|| reported_id.map(str::to_string))
             .or_else(|| agent.model.clone());
         let effort = data
             .get("thinkingLevel")

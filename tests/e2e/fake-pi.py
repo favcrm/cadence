@@ -27,6 +27,9 @@ Modes (argv[1]):
   reopen race).
 - `dialog`: emits a blocking `confirm` extension_ui_request at startup;
   the adapter must auto-cancel it (extension_ui_response, cancelled).
+- `wrong-model`: accepts `--model` but get_state reports a DIFFERENT
+  model — the silent-fallback shape CAD-559 exists to catch, so the
+  adapter must refuse the launch.
 
 When CADENCE_ALIAS is `master` the fake also records what the launch
 actually delivered — `pi-argv.json` (sys.argv tail, i.e. every flag the
@@ -48,6 +51,11 @@ idempotent when idle, like real Pi. `get_state` reports
 sessionId/model/thinkingLevel; `set_thinking_level` honours only real
 levels (bogus silently falls back to "off", like real Pi) so the
 adapter's `get_state` verification is exercised.
+
+`--model <provider/id>`: the reported model echoes the request, split
+the way real Pi reports it — `{"provider": <first segment>, "id":
+<rest>}` — so `provider/id` round-trips through get_state. No `--model`
+means the fake's own `fake/model-1`, like Pi's silent default.
 """
 
 import json
@@ -115,9 +123,25 @@ if "--session" in _args:
     SESSION_FILE = _args[_args.index("--session") + 1]
     _sid, PROMPTS_SEEN = load_session()
 
+# The reported model echoes `--model p/rest` the way real Pi reports it
+# (provider = first segment, id = the rest, inner slashes kept). In
+# `wrong-model` mode the report deliberately disagrees — the silent
+# fallback CAD-559 makes loud.
+def reported_model():
+    if MODE == "wrong-model":
+        return {"id": "not-the-asked-1", "name": "Wrong Model", "provider": "fake"}
+    if "--model" in _args:
+        want = _args[_args.index("--model") + 1]
+        provider, _, mid = want.partition("/")
+        if mid:
+            return {"id": mid, "name": want, "provider": provider}
+        return {"id": want, "name": want, "provider": "fake"}
+    return {"id": "fake/model-1", "name": "Fake Model", "provider": "fake"}
+
+
 state = {
     "sessionId": _sid or "fakepi-session-" + str(os.getpid()),
-    "model": {"id": "fake/model-1", "name": "Fake Model", "provider": "fake"},
+    "model": reported_model(),
     "thinkingLevel": "medium",
     "isStreaming": False,
     "pendingMessageCount": 0,

@@ -547,6 +547,27 @@ impl Shared {
         let model = optional_str(params, "model")
             .map(str::to_string)
             .or_else(|| choice.as_ref().and_then(|c| c.1.clone()));
+        // CAD-559: a pi master always launches on an explicit allowlisted
+        // model — `--model`, then AGENT.md's `preferred`, then
+        // `[pi].models.default.master`, else refuse; Pi's own fallback
+        // is never used. Whatever wins must be on `[pi].models.allow`.
+        let mut pi_selection = None;
+        let model = if provider == "pi" {
+            let policy = crate::pi_policy::read(&pm.dir)?;
+            let chosen = model.as_deref();
+            let resolved = crate::pi_policy::resolve_model(policy.as_ref(), "master", chosen)?;
+            if chosen.is_none() {
+                // pm.yaml's role default filled the slot — `register_agent`
+                // will label it `explicit`, so restamp the real
+                // provenance after the row lands.
+                pi_selection = Some(crate::model_defaults::pi_policy_default_selection(
+                    "master", &resolved,
+                ));
+            }
+            Some(resolved)
+        } else {
+            model
+        };
         let effort = optional_str(params, "effort")
             .map(str::to_string)
             .or_else(|| choice.as_ref().and_then(|c| c.2.clone()));
@@ -606,6 +627,12 @@ impl Shared {
             team_role: None,
             model_policy: None,
         })?;
+        // CAD-559: pm.yaml's `[pi].models.default.master` filled the
+        // model — restamp the honest provenance (`register_agent`
+        // derived `explicit` from the merged params).
+        if let Some(selection) = &pi_selection {
+            self.store.set_model_selection(ALIAS, selection)?;
+        }
         let thread = self.store.ensure_thread(ALIAS)?;
         if let Err(e) = self.launch_actor(ALIAS) {
             // No half-started master: the row goes with its launch.

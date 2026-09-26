@@ -28,6 +28,13 @@ fn fake_pi(mode: &str) -> String {
 }
 
 fn worker(alias: &str, cwd: &Path, params: Value) -> Agent {
+    let mut params = params;
+    // CAD-559: a pi agent opens only on an explicit allowlisted model —
+    // tests that want another value set the key themselves.
+    if let Some(p) = params.as_object_mut() {
+        p.entry("model".to_string())
+            .or_insert_with(|| json!("fake/model-1"));
+    }
     Agent {
         alias: alias.into(),
         provider: "pi".into(),
@@ -61,6 +68,11 @@ fn worker(alias: &str, cwd: &Path, params: Value) -> Agent {
 fn adapter(mode: &str, state: &Path, own: &[(&str, String)]) -> PiAdapter {
     let env = ProviderEnv::default();
     env.set("CADENCE_PI_COMMAND", fake_pi(mode));
+    // CAD-559: pi opens only under an operator `[pi]` policy — `own`
+    // can still repoint CADENCE_PM_DIR at a test's own pm.yaml.
+    let pm = state.join("pm");
+    pi_policy_pm(&pm);
+    env.set("CADENCE_PM_DIR", pm.to_string_lossy().to_string());
     for (k, v) in own {
         env.set(k, v.clone());
     }
