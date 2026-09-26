@@ -265,3 +265,50 @@ exit 1
     assert_eq!(fixture.calls().lines().count(), 1);
     assert!(!fixture.calls().contains("restore"));
 }
+
+#[test]
+fn cad628_real_host_preserves_legacy_board_arguments_without_ui_json() {
+    struct OwnedBoard(std::process::Child);
+    impl Drop for OwnedBoard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let fixture = OldCli::new();
+    fixture.claim("operator:cad628");
+    let dist = fixture.dir.path().join("legacy dist");
+    let board = OwnedBoard(
+        Command::new("python3")
+            .args([
+                "-c",
+                "import time; time.sleep(60)",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "3118",
+                "--dist",
+            ])
+            .arg(&dist)
+            .args(["--allow-host", "legacy.example"])
+            .spawn()
+            .unwrap(),
+    );
+    std::fs::write(fixture.state.join("ui.pid"), board.0.id().to_string()).unwrap();
+    assert!(!cadence_agent::ui::opts_present(&fixture.state));
+    let result = test_seam::scoped(Asserted::Operator, || {
+        fixture.host().restart(&fixture.binary)
+    });
+    assert!(matches!(result, Ok(RestartOutcome::Clean)), "{result:?}");
+    let calls = fixture.calls();
+    let start = calls
+        .lines()
+        .find(|line| line.contains("ui start"))
+        .unwrap();
+    assert!(start.contains("--host 127.0.0.1 --port 3118"), "{start}");
+    assert!(
+        start.contains(&format!("--dist {}", dist.display())),
+        "{start}"
+    );
+    assert!(start.contains("--allow-host legacy.example"), "{start}");
+}
