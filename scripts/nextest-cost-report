@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""Report nextest JUnit timings; this diagnostic does not adjudicate test gates."""
+
+import argparse
+import html
+import json
+import math
+from pathlib import Path
+import sys
+import xml.etree.ElementTree as ET
+
+
+def duration(raw):
+    if raw is None:
+        return None
+    value = float(raw)
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"invalid test duration: {raw!r}")
+    return value
+
+
+def read_report(path):
+    root = ET.parse(path).getroot()
+    if root.tag not in ("testsuites", "testsuite"):
+        raise ValueError("expected a JUnit testsuites or testsuite root")
+    cases = []
+
+    def visit(element, suite=""):
+        if element.tag == "testsuite":
+            suite = element.get("name", suite)
+        if element.tag == "testcase":
+            name = element.get("name")
+            if not name or not name.strip():
+                raise ValueError("testcase has no name")
+            tags = {child.tag for child in element}
+            status = "failed" if tags & {"failure", "error"} else "skipped" if "skipped" in tags else "passed"
+            cases.append({
+                "suite": suite,
+                "name": name,
+                "status": status,
+                "duration_s": duration(element.get("time")),
+            })
+        else:
+            for child in element:
+                visit(child, suite)
+
+    visit(root)
+    if not cases:
+        raise ValueError("JUnit report contains no testcases")
+    executed = [case for case in cases if case["status"] != "skipped"]
+    timed = [case for case in executed if case["duration_s"] is not None]
+    values = sorted(case["duration_s"] for case in timed)
+
+    def percentile(fraction):
+        return values[math.ceil(len(values) * fraction) - 1] if values else None
+
+    # These are testcase durations, not runner elapsed time: concurrent tests
+    # overlap, and neither compilation nor queue wait is in this report.
+    return {
+        "schema": "cadence.nextest-costs/1",
+        "testcases": len(cases),
+        "executed": len(executed),
+        "passed": sum(case["status"] == "passed" for case in cases),
+        "failed": sum(case["status"] == "failed" for case in cases),
+        "skipped": sum(case["status"] == "skipped" for case in cases),
+        "timed_executed": len(timed),
+        "missing_executed_timings": len(executed) - len(timed),
+        "cumulative_test_seconds": sum(values),
+        "p50_test_seconds": percentile(0.50),
+        "p95_test_seconds": percentile(0.95),
+        "slowest": sorted(timed, key=lambda case: (-case["duration_s"], case["suite"], case["name"])),
+    }
+
+
+def cell(value):
+    return html.escape(" ".join(value.split()), quote=False).replace("|", "&#124;").replace("`", "&#96;")
+
+
+def markdown(report, top):
+    lines = [
+        "## Rust test costs",
+        "",
+        f"Executed **{report['executed']}** testcases: {report['passed']} passed, "
+        f"{report['failed']} failed; **{report['skipped']}** skipped.",
+        "",
+        "Durations are individual testcase timings. Their cumulative total is not wall time; "
+        "concurrent tests overlap. Compilation and queue wait are excluded.",
+        "",
+    ]
+    if report["timed_executed"]:
+        lines += [
+            f"Cumulative test duration: **{report['cumulative_test_seconds']:.3f}s**. "
+            f"Per-test p50: **{report['p50_test_seconds']:.3f}s**; "
+            f"p95: **{report['p95_test_seconds']:.3f}s** (nearest rank).",
+            "",
+            "| Seconds | Status | Binary / suite | Test |",
+            "| ---: | --- | --- | --- |",
+        ]
+        for case in report["slowest"][:top]:
+            lines.append(f"| {case['duration_s']:.3f} | {case['status']} | "
+                         f"{cell(case['suite'])} | {cell(case['name'])} |")
+    else:
+        lines.append("No executed testcase has timing data; no timing distribution is available.")
+    if report["missing_executed_timings"]:
+        lines += ["", f"{report['missing_executed_timings']} executed testcases lack timing data and are excluded from the distribution."]
+    return "\n".join(lines) + "\n"
+
+
+def positive_count(raw):
+    value = int(raw)
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be positive")
+    return value
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("report", type=Path, help="nextest JUnit report")
+    parser.add_argument("--top", type=positive_count, default=15)
+    parser.add_argument("--json", action="store_true", help="emit all testcase timing rows as JSON")
+    args = parser.parse_args()
+    try:
+        report = read_report(args.report)
+    except (OSError, ET.ParseError, ValueError) as error:
+        print(f"nextest-cost-report: {error}", file=sys.stderr)
+        return 1
+    print(json.dumps(report, indent=2, allow_nan=False) if args.json else markdown(report, args.top), end="\n" if args.json else "")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
