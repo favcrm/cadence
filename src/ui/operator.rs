@@ -1310,6 +1310,19 @@ mod tests {
             route_class("POST", "/api/apps/demo/studio/worker"),
             RouteClass::OperatorOnly
         );
+        // CAD-577 revoke and CAD-580 wiki both sit after approve.
+        assert_eq!(
+            route_class("POST", "/api/apps/demo/studio/revoke"),
+            RouteClass::OperatorOnly
+        );
+        assert_eq!(
+            route_class("PUT", "/api/wiki/file"),
+            RouteClass::AgentAllowed
+        );
+        assert_eq!(
+            route_class("POST", "/api/wiki/rm"),
+            RouteClass::AgentAllowed
+        );
         assert_eq!(
             route_class("DELETE", "/api/issues/CAD-1"),
             RouteClass::OperatorOnly

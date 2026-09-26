@@ -717,6 +717,12 @@ impl Shared {
             "by": "operator",
             "at": crate::issue::time::iso(crate::issue::time::now_epoch()),
         });
+        // The same tracker write lock approve holds, taken before the
+        // store write. An approve that has already derived its grants
+        // cannot commit afterwards and put them back.
+        let pm_dir = self.pm_dir()?;
+        let pm = self.pm_at(&pm_dir)?;
+        let _lock = pm.lock()?;
         // The approval write and the grant subtract share one
         // transaction, so a reconcile cannot re-derive between them.
         let changed = self
@@ -802,13 +808,37 @@ impl Shared {
             })).collect::<Vec<_>>(),
         });
         // Approval and grants land together. A re-approval subtracts
-        // the previous derivation inside that same write.
+        // the previous derivation inside that same write. The pause
+        // sits in that gap, still holding the tracker lock, so a
+        // revoke on another connection can be shown to wait.
+        self.pause_approve_inside_lock();
         let changed =
             self.store
                 .app_approve_with_grants(payload.clone(), &key, &grants, "operator")?;
         self.drain_effect_scopes(changed);
         self.wake();
         Ok(payload)
+    }
+
+    /// Test seam for the approve/revoke race. `CADENCE_TEST_APP_APPROVE_HOLD`
+    /// is this daemon's own env (`ProviderEnv::own`), never the process
+    /// environment. While that path exists, an approve that has already
+    /// derived its grants stays inside the tracker write lock. It writes
+    /// `{path}.ready` on the way in. The test deletes the hold to let
+    /// the approve finish. Absent the variable, this is a no-op.
+    fn pause_approve_inside_lock(&self) {
+        let Some(path) = self.provider_env.own("CADENCE_TEST_APP_APPROVE_HOLD") else {
+            return;
+        };
+        if path.is_empty() {
+            return;
+        }
+        let ready = format!("{path}.ready");
+        let _ = std::fs::write(&ready, "1");
+        let deadline = Instant::now() + Duration::from_secs(12);
+        while Path::new(&path).exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// CAD-358 `project_new` — register a repo as a project and seed its

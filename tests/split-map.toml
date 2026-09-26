@@ -801,6 +801,8 @@ tests = [
     "app_add_worker_joins_and_records_the_role",
     "plan_approve_resumes_the_runs_stopped_team_agents",
     "app_revoke_revokes_derived_grants",
+    "revoke_waits_for_an_approve_already_inside_the_lock",
+    "app_remove_refuses_when_the_grant_store_cannot_be_read",
     "rev344_team_change_drops_the_old_agents_grant",
     "rev344_reapproval_drops_a_scope_the_new_structure_dropped",
     "app_remove_drops_the_derived_grant",

@@ -1967,6 +1967,89 @@ fn app_revoke_revokes_derived_grants() {
     assert_eq!(r["ok"], false, "agent revoke admitted: {r}");
 }
 
+/// Review 344 r3: an approve that already holds the tracker write lock
+/// and has derived its grants must not land after a revoke. Revoke
+/// takes that same lock and waits. The final grant is gone, and the
+/// revoke does not return while the hold file still exists.
+#[test]
+fn revoke_waits_for_an_approve_already_inside_the_lock() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    app_install_roles(&f);
+    f.d.operator_rpc(
+        "app_set_team",
+        json!({"project": "demo", "name": "roles", "team": ["publisher=dev-1"]}),
+    )
+    .unwrap();
+
+    let hold = f.tmp.path().join("approve-hold");
+    std::fs::write(&hold, "1").unwrap();
+    test_env().set("CADENCE_TEST_APP_APPROVE_HOLD", hold.to_str().unwrap());
+    struct ClearHold;
+    impl Drop for ClearHold {
+        fn drop(&mut self) {
+            test_env().remove("CADENCE_TEST_APP_APPROVE_HOLD");
+        }
+    }
+    let _clear_hold = ClearHold;
+    let ready = PathBuf::from(format!("{}.ready", hold.display()));
+    let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let daemon = &f.d;
+    thread::scope(|s| {
+        let approve = s.spawn(|| {
+            daemon.operator_rpc("app_approve", json!({"project": "demo", "name": "roles"}))
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "approve never reached the tracker lock"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        let flag = std::sync::Arc::clone(&finished);
+        let revoke = s.spawn(move || {
+            let out =
+                daemon.operator_rpc("app_revoke", json!({"project": "demo", "name": "roles"}));
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            out
+        });
+        // A revoke that does not take the lock finishes this write
+        // while the approve is still paused. One that takes it is
+        // still spinning when the window ends.
+        let window = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < window && !finished.load(std::sync::atomic::Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            hold.exists(),
+            "the approve left the lock before the revoke was observed"
+        );
+        assert!(
+            !finished.load(std::sync::atomic::Ordering::SeqCst),
+            "revoke returned while the approve still held the tracker lock"
+        );
+        std::fs::remove_file(&hold).unwrap();
+        approve.join().unwrap().unwrap();
+        let revoked = revoke.join().unwrap().unwrap();
+        assert_eq!(revoked["revoked"], true, "{revoked}");
+    });
+
+    assert!(
+        grant_scopes(&f, "dev-1", "local", "local").is_none(),
+        "the revoke that waited must be the last writer"
+    );
+    let err =
+        f.d.operator_rpc(
+            "plan_propose",
+            json!({"project": "demo", "workflow": "roles/go",
+                   "inputs": {"title": "x", "publisher": "dev-1"}}),
+        )
+        .unwrap_err();
+    assert_eq!(err.code(), Some("app_unapproved"), "{err}");
+}
+
 /// Review 344: a team change drops the agent who left. Approving with
 /// publisher=dev-1 then setting the team to dev-2 must not leave dev-1
 /// holding `local/local publish`.
@@ -2050,6 +2133,36 @@ fn app_remove_drops_the_derived_grant() {
     assert!(
         grant_scopes(&f, "dev-1", "local", "local").is_none(),
         "approve then remove must leave no derived grant"
+    );
+}
+
+/// Review 344 r3: a grant-store read that fails while the database
+/// file exists must refuse removal. Treating the error as "no holders"
+/// would delete the folder and leave the grant behind.
+#[test]
+fn app_remove_refuses_when_the_grant_store_cannot_be_read() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    app_install_roles(&f);
+    let db = f.d.state.join("cadence.sqlite3");
+    assert!(
+        db.exists(),
+        "the daemon store must exist before the read can fail"
+    );
+    // The daemon keeps the original inode. A directory at the path
+    // still exists, and a read-only open of it fails — a replacement
+    // file can be rewritten by a later open, which would look like
+    // "no holders".
+    std::fs::remove_file(&db).unwrap();
+    std::fs::create_dir(&db).unwrap();
+    let (ok, out) = f.cli(&["app", "remove", "roles", "--project", "demo"]);
+    assert!(
+        !ok && out.to_string().contains("could not be read"),
+        "removal continued after a grant-store read failure: {out}"
+    );
+    assert!(
+        f.pm_dir.join("demo/apps/roles").exists(),
+        "the folder must stay when the grant read fails"
     );
 }
 

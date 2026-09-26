@@ -12,7 +12,7 @@ items = ["memory_actor", "memory_pm", "reject_memory_identity_claims", "rpc_memo
 items = ["end_process_group", "SLOT_WATCH_TICK", "RUNNER_WAIT_SECS", "RUNNER_MAX_WAIT_SECS", "emit_slot_events", "slot_identity", "slot_caller", "claimed_slot_pid", "rpc_slot_acquire", "rpc_slot_release", "rpc_slot_status", "rpc_slot_reconcile", "launch_requester", "rpc_slot_launch", "run_runner", "finish_runner", "rpc_slot_runner", "run_slot_watch"]
 
 [plans_rpc]
-items = ["plan_gate_task", "rpc_plan_propose", "workflow_plan_text", "rpc_plan_decide", "rpc_epic_stage", "rpc_project_work_approve", "rpc_workflow_approve", "rpc_app_approve", "rpc_project_new", "rpc_app_set_team", "rpc_app_add_worker", "unique_worker_alias", "reconcile_app_grants", "sweep_removed_app_grants", "drain_effect_scopes", "rpc_app_revoke", "resume_run_team"]
+items = ["plan_gate_task", "rpc_plan_propose", "workflow_plan_text", "rpc_plan_decide", "rpc_epic_stage", "rpc_project_work_approve", "rpc_workflow_approve", "rpc_app_approve", "pause_approve_inside_lock", "rpc_project_new", "rpc_app_set_team", "rpc_app_add_worker", "unique_worker_alias", "reconcile_app_grants", "sweep_removed_app_grants", "drain_effect_scopes", "rpc_app_revoke", "resume_run_team"]
 
 [approvals_rpc]
 items = ["rpc_rollout_grant", "rpc_rollout_revoke", "rpc_approval_record", "rpc_approval_revoke"]

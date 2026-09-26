@@ -455,3 +455,36 @@
             );
         }
     }
+
+    /// A re-approval that drops one scope and keeps another must still
+    /// name the triple, so the caller can drain a waiting effect for
+    /// the dropped scope. Execute-time refusal does not close the row.
+    #[test]
+    fn reapproval_reports_a_triple_that_kept_another_scope() {
+        let (_dir, s) = store();
+        let both = vec![(
+            "dev-1".to_string(),
+            "local".to_string(),
+            "local".to_string(),
+            vec!["delete".to_string(), "publish".to_string()],
+        )];
+        s.app_grants_set("demo/roles", &both, "operator").unwrap();
+        let kept = vec![(
+            "dev-1".to_string(),
+            "local".to_string(),
+            "local".to_string(),
+            vec!["publish".to_string()],
+        )];
+        let changed = s.app_grants_set("demo/roles", &kept, "operator").unwrap();
+        assert!(
+            changed
+                .iter()
+                .any(|(a, p, acc)| a == "dev-1" && p == "local" && acc == "local"),
+            "a dropped scope must stay on the drain list when another scope remains: {changed:?}"
+        );
+        let grant = s
+            .platform_grant("dev-1", "local", "local")
+            .unwrap()
+            .expect("the kept scope stays");
+        assert_eq!(grant.scopes, vec!["publish".to_string()]);
+    }

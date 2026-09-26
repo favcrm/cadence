@@ -328,8 +328,10 @@ pub fn scope_list(params: &Value, field: &str) -> Result<Vec<String>> {
 pub(crate) type Derived = (String, String, String, Vec<String>);
 
 /// Subtract this app's prior derivation and merge `grants`, on the
-/// caller's transaction. A triple the new set covers again is dropped
-/// from the answer — the caller drains only what stayed uncovered.
+/// caller's transaction. The answer is every triple whose platform
+/// grant shrank, including one the new set still covers with a
+/// narrower scope — the caller drains a waiting effect only when the
+/// surviving grant no longer covers that effect's scopes.
 fn apply_derived(
     tx: &rusqlite::Transaction<'_>,
     app: &str,
@@ -346,7 +348,7 @@ fn apply_derived(
         rows.flatten().collect()
     };
     tx.execute("DELETE FROM app_grants WHERE app=?1", params![app])?;
-    let mut changed = subtract_derived(tx, app, &prior)?;
+    let changed = subtract_derived(tx, app, &prior)?;
     if !prior.is_empty() {
         Store::event(
             tx,
@@ -425,11 +427,12 @@ fn apply_derived(
             json!({"app": app, "agents": 0, "by": by}),
         )?;
     }
-    changed.retain(|(agent, platform, account)| {
-        !grants.iter().any(|(a, p, acc, scopes)| {
-            a == agent && p == platform && acc == account && !scopes.is_empty()
-        })
-    });
+    // A triple whose grant shrank stays on the list even when the new
+    // derivation keeps another scope on that account. The caller drains
+    // only a waiting effect whose frozen scopes the surviving grant
+    // does not cover, so the kept scope is not closed with the one
+    // that left. Dropping the triple here would leave the dropped
+    // scope's effect queued until something else released it.
     Ok(changed)
 }
 

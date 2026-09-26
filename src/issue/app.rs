@@ -1398,25 +1398,34 @@ fn open_plan_epics(pm_dir: &Path, project_key: &str, name: &str, state_dir: &Pat
 
 /// The agents holding a grant this app's approval derived, read from
 /// the daemon's store read-only (CAD-577). Empty when there is no
-/// store yet — no daemon, no derived grant.
-fn derived_grant_holders(project_key: &str, name: &str, state_dir: &Path) -> Vec<String> {
+/// store yet — no daemon, no derived grant. A store that exists but
+/// cannot be read refuses: "no holders" would let removal delete the
+/// folder and leave the grant behind.
+fn derived_grant_holders(project_key: &str, name: &str, state_dir: &Path) -> Result<Vec<String>> {
     let db = state_dir.join("cadence.sqlite3");
     if !db.exists() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    let Ok(conn) = crate::store::open_read_only(&db) else {
-        return Vec::new();
+    let refuse = |why: String| {
+        Error::rejected(format!(
+            "app '{name}' cannot be removed — its derived grants could not be read \
+             ({why}). Fix the store, or revoke first (`cadence app revoke {name} \
+             --project {project_key}`)"
+        ))
     };
-    let Ok(mut stmt) =
-        conn.prepare("SELECT DISTINCT agent FROM app_grants WHERE app=? ORDER BY agent")
-    else {
-        return Vec::new();
-    };
+    let conn = crate::store::open_read_only(&db).map_err(|e| refuse(e.to_string()))?;
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT agent FROM app_grants WHERE app=? ORDER BY agent")
+        .map_err(|e| refuse(e.to_string()))?;
     let key = approval_key(project_key, name);
-    let Ok(rows) = stmt.query_map(rusqlite::params![key], |r| r.get::<_, String>(0)) else {
-        return Vec::new();
-    };
-    rows.flatten().collect()
+    let rows = stmt
+        .query_map(rusqlite::params![key], |r| r.get::<_, String>(0))
+        .map_err(|e| refuse(e.to_string()))?;
+    let mut holders = Vec::new();
+    for row in rows {
+        holders.push(row.map_err(|e| refuse(e.to_string()))?);
+    }
+    Ok(holders)
 }
 
 /// Withdraw the approval and its derived grants before the folder goes
@@ -1429,7 +1438,7 @@ fn revoke_derived_on_remove(
     state_dir: &Path,
     actor: &str,
 ) -> Result<()> {
-    let holders = derived_grant_holders(project_key, name, state_dir);
+    let holders = derived_grant_holders(project_key, name, state_dir)?;
     if holders.is_empty() {
         return Ok(());
     }
