@@ -5,9 +5,11 @@ import {
   appPurpose,
   approvalPending,
   approveBlock,
+  appFieldLabel,
   appWorkflowRow,
   connectionRows,
   distinctNote,
+  distinctProblem,
   doctorFindings,
   filterCounts,
   needIssue,
@@ -19,13 +21,18 @@ import {
   runFilter,
   runStages,
   runState,
+  runStatus,
+  runTitle,
   runsSummary,
   slugFromTopic,
+  slugProblem,
   sourceLabel,
+  startLabel,
   stepLabel,
   stepRows,
   teamFromLastRun,
   teamInputs,
+  teamRole,
   unboundSlots,
   usedSlots,
 } from "../src/features/apps/apps";
@@ -305,31 +312,101 @@ equal(slugFromTopic("Cadence vs Conductor!"), "cadence-vs-conductor", "slug from
 equal(slugFromTopic("  --  "), "", "punctuation only");
 equal(slugFromTopic("x".repeat(80)).length, 60, "slug capped");
 
-// Stage rows: the run's own tickets, plus the output marker.
+// Stage rows: the run's own tickets, each with its state — finished
+// (ticked), the one in flight (highlighted), the rest waiting. The
+// first open step is current when nothing is reported in flight yet.
 const output = { effect_id: "ef-1", project: "cadence", title: "A post", published_at: "2026-09-26T01:00:00Z", runs: ["D-1"] };
 const send = { effect_id: "ef-2", state: "waiting", title: "Another", runs: ["D-1"] };
 equal(
   runStages(run({}, { tickets: [
     { id: "D-2", title: "Brief: t", status: "done" },
     { id: "D-3", title: "Review: t", status: "doing" },
-  ] }), [output], []),
+    { id: "D-4", title: "Publish: t", status: "backlog" },
+  ] })),
   [
-    { label: "Brief", tone: "ok" },
-    { label: "Review", tone: "run" },
-    { label: "Published", tone: "ok" },
+    { label: "Brief", tone: "done" },
+    { label: "Review", tone: "current" },
+    { label: "Publish", tone: "waiting" },
   ],
-  "published run",
+  "a run in flight",
 );
 equal(
-  runStages(run({}, { tickets: [{ id: "D-2", title: "Brief: t", status: "done" }] }), [], [send]),
+  runStages(run({}, { tickets: [
+    { id: "D-2", title: "Brief: t", status: "done" },
+    { id: "D-3", title: "Review: t", status: "ready" },
+  ] })),
   [
-    { label: "Brief", tone: "ok" },
-    { label: "Ready to publish", tone: "wait" },
+    { label: "Brief", tone: "done" },
+    { label: "Review", tone: "current" },
   ],
-  "staged send",
+  "nothing in flight: the first open step is current",
 );
 equal(outputsOf(run(), [output], [send]), { items: [output], pending: [send] }, "outputs by run");
 equal(outputsOf(run({ epic: "D-9" }), [output], [send]), { items: [], pending: [] }, "another run's outputs stay out");
+
+// One status and action per card.
+equal(runTitle("Blog post: Cadence vs Conductor: one team"), "Cadence vs Conductor: one team", "the topic without the prefix");
+equal(runTitle("A post with no prefix"), "A post with no prefix", "no prefix, no change");
+equal(
+  runStatus(run(), [], { items: [output], pending: [] }),
+  { text: "Published", cls: "bg-ok/15 text-ok", action: { label: "View", href: "/outbox?item=ef-1" } },
+  "published",
+);
+equal(
+  runStatus(run({}, { state: "approved" }), [], { items: [], pending: [send] }),
+  { text: "Ready to publish", cls: "bg-warn/10 text-warn", action: { label: "Review & publish", href: "/" } },
+  "a send waiting for the release",
+);
+equal(
+  runStatus(run(), [], { items: [], pending: [] }),
+  { text: "Needs you", cls: "bg-warn/10 text-warn", action: { label: "Approve plan", href: "/" } },
+  "a plan waiting for approval",
+);
+equal(
+  runStatus(run({}, { state: "approved", tickets: [{ id: "D-2", title: "Draft: t", status: "doing" }] }), [], { items: [], pending: [] }),
+  { text: "Draft in progress…", cls: "bg-accent/15 text-accent" },
+  "the step in flight",
+);
+equal(
+  runStatus(run({}, { state: "approved", tickets: [{ id: "D-2", title: "Draft: t", status: "done" }] }), [], { items: [], pending: [] }),
+  { text: "Done", cls: "bg-ok/15 text-ok" },
+  "every step done",
+);
+equal(
+  runStatus(run({}, { state: "rejected" }), [], { items: [], pending: [] }),
+  { text: "Not approved", cls: "bg-fail/10 text-fail" },
+  "a rejected plan",
+);
+
+// The drawer's plain words (r3).
+equal(teamRole("strategist"), "Researcher", "strategist reads Researcher");
+equal(teamRole("topic"), null, "the topic is not a role");
+equal(appFieldLabel("slug", "Folder name under posts/ (lowercase, hyphens)"), "Folder", "the folder by its plain name");
+equal(appFieldLabel("keyword", "Main search phrase"), "Keyword", "the keyword by its plain name");
+equal(appFieldLabel("reviewer", "Agent that reviews"), "Reviewer", "the role, not the ask");
+equal(appFieldLabel("topic", "What should the post be about?"), "What should the post be about?", "the ask stands");
+equal(startLabel("New post"), "Start post", "the primary button");
+equal(startLabel(null), "Start", "no label, plain Start");
+equal(slugProblem("cadence-vs-conductor"), null, "a good folder name");
+equal(slugProblem("") , null, "empty is the form's own message");
+equal(slugProblem("My Post") !== null, true, "spaces and caps are refused inline");
+equal(slugProblem("x".repeat(61)) !== null, true, "too long");
+const trio = {
+  ...wf,
+  inputs: [...(wf.inputs ?? []), { name: "designer", ask: "Who draws" }],
+  distinct: ["writer", "designer", "reviewer"],
+};
+equal(distinctProblem(trio, { writer: "a", designer: "b", reviewer: "c" }), null, "a distinct team passes");
+equal(
+  distinctProblem(trio, { writer: "a", designer: "a", reviewer: "c" }),
+  "Reviewer can't be the writer or designer.",
+  "a doubled team names the reviewer",
+);
+equal(
+  distinctProblem(trio, { writer: "a", designer: "b", reviewer: "a" }),
+  "Reviewer can't be the writer or designer.",
+  "the reviewer doubling as the writer",
+);
 
 // Filters: published first, then needs you, else in progress.
 equal(runFilter(run(), [], true), "published", "published");

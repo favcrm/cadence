@@ -23,16 +23,19 @@ import {
   approvalPending,
   connectionRows,
   distinctNote,
+  distinctProblem,
   doctorFindings,
   filterCounts,
-  outboxHref,
   outputsOf,
   primaryAction,
   publishTarget,
   runFilter,
   runStages,
-  runState,
+  runStatus,
+  runTitle,
   sourceLabel,
+  startLabel,
+  slugProblem,
   stepRows,
   teamFromLastRun,
   teamInputs,
@@ -112,10 +115,12 @@ export default function AppDetail({
             <h1 className="text-section font-semibold text-ink-100">
               {app?.title?.trim() || name}
             </h1>
-            {app && <p className="text-body text-ink-400 mt-0.5 break-words">{appPurpose(app)}</p>}
+            <p className="text-micro text-ink-500 mt-0.5">in {project}</p>
+            {app && <p className="text-body text-ink-400 mt-1 break-words">{appPurpose(app)}</p>}
             <div className="flex flex-wrap items-center gap-2 mt-1.5">
-              <span className="num text-label text-ink-500">{key}</span>
-              {approval && <span className={`chip ${approval.cls}`}>{approval.text}</span>}
+              {approval && app?.approval !== "approved" && (
+                <span className={`chip ${approval.cls}`}>{approval.text}</span>
+              )}
               <StaleChip state={state} />
             </div>
           </div>
@@ -192,7 +197,6 @@ export default function AppDetail({
                 needs={needs}
                 items={items}
                 pending={pending}
-                operator={viewer.operator}
                 onOpenIssue={onOpenIssue}
                 onRetry={() => void resources.appRuns(key).invalidate()}
               />
@@ -235,7 +239,6 @@ function PostsTab({
   needs,
   items,
   pending,
-  operator,
   onOpenIssue,
   onRetry,
 }: {
@@ -244,7 +247,6 @@ function PostsTab({
   needs: HomeNeed[];
   items: AppRunOutput[];
   pending: AppPendingSend[];
-  operator: boolean;
   onOpenIssue: (id: string) => void;
   onRetry: () => void;
 }) {
@@ -310,7 +312,6 @@ function PostsTab({
             run={run}
             needs={needs}
             mine={outputsOf(run, items, pending)}
-            operator={operator}
             onOpenIssue={onOpenIssue}
           />
         ))}
@@ -320,81 +321,63 @@ function PostsTab({
 }
 
 const STAGE_CLS: Record<string, string> = {
-  ok: "bg-ok/15 text-ok",
-  run: "bg-accent/15 text-accent",
-  wait: "bg-warn/10 text-warn",
-  off: "bg-ink-800 text-ink-500",
+  done: "bg-ok/15 text-ok",
+  current: "bg-accent/20 text-accent font-semibold",
+  waiting: "bg-ink-800 text-ink-500",
 };
 
 function RunCard({
   run,
   needs,
   mine,
-  operator,
   onOpenIssue,
 }: {
   run: AppRun;
   needs: HomeNeed[];
   mine: { items: AppRunOutput[]; pending: AppPendingSend[] };
-  operator: boolean;
   onOpenIssue: (id: string) => void;
 }) {
-  const state = runState(run, needs);
-  const stages = runStages(run, mine.items, mine.pending);
+  const status = runStatus(run, needs, mine);
+  const stages = runStages(run);
   return (
     <li className="card px-3.5 py-3 min-w-0" data-run={run.epic}>
       <div className="flex flex-wrap items-center gap-2 min-w-0">
-        <span className="text-cardtitle font-medium text-ink-100 min-w-0 break-words flex-1">
-          {run.title}
-        </span>
-        <span className={`chip ${state.cls}`} data-state={state.text}>
-          {state.text}
+        <button
+          type="button"
+          onClick={() => onOpenIssue(run.epic)}
+          className="text-cardtitle font-medium text-ink-100 min-w-0 break-words flex-1 text-left hover:text-accent"
+          title={`open ${run.epic}`}
+        >
+          {runTitle(run.title)}
+        </button>
+        <span className="flex flex-wrap items-center gap-1.5 shrink-0">
+          <span className={`chip ${status.cls}`} data-state={status.text}>
+            {status.text}
+          </span>
+          {status.action && (
+            <Link href={status.action.href} className="lnk text-label">
+              {status.action.label} →
+            </Link>
+          )}
         </span>
       </div>
       <div className="flex flex-wrap items-center gap-1 mt-2 min-w-0">
         {stages.map((s, i) => (
           <span key={`${s.label}-${i}`} className="flex items-center gap-1 min-w-0">
-            {i > 0 && <span className="text-ink-600" aria-hidden>→</span>}
-            <span className={`chip ${STAGE_CLS[s.tone]}`}>{s.label}</span>
+            {i > 0 && (
+              <span className="text-ink-600" aria-hidden>
+                →
+              </span>
+            )}
+            <span className={`chip ${STAGE_CLS[s.tone]}`} data-stage={s.tone}>
+              {s.tone === "done" ? "✓ " : ""}
+              {s.label}
+            </span>
           </span>
         ))}
       </div>
-      <div className="flex flex-wrap items-center gap-2 mt-1.5 text-micro text-ink-500 min-w-0">
-        <button
-          type="button"
-          onClick={() => onOpenIssue(run.epic)}
-          className="lnk num shrink-0"
-          title={`open ${run.epic}`}
-        >
-          {run.epic}
-        </button>
-        {run.plan.proposed_at && <span className="num">{fmtTime(run.plan.proposed_at)}</span>}
-        {state.needsYou && (
-          <Link href="/" className="lnk text-warn shrink-0">
-            needs you →
-          </Link>
-        )}
-      </div>
-      {mine.items.length > 0 && (
-        <ul className="mt-2 space-y-1">
-          {mine.items.map((it) => (
-            <li key={it.effect_id} className="text-label min-w-0">
-              <Link href={outboxHref(it.effect_id)} className="lnk break-words">
-                published: {it.title}
-              </Link>
-              <span className="text-ink-500"> · {fmtTime(it.published_at)}</span>
-            </li>
-          ))}
-        </ul>
-      )}
-      {operator && mine.pending.length > 0 && (
-        <p className="text-label mt-2 min-w-0">
-          {mine.pending.map((p) => (
-            <Link key={p.effect_id} href="/" className="lnk text-warn break-words">
-              {p.title?.trim() || "a post"} — ready to publish →
-            </Link>
-          ))}
-        </p>
+      {run.plan.proposed_at && (
+        <div className="text-micro text-ink-500 mt-1.5 num">{fmtTime(run.plan.proposed_at)}</div>
       )}
     </li>
   );
@@ -638,9 +621,7 @@ function RunDrawer({
       >
         <header className="px-5 pt-4 pb-4 border-b border-ink-700 flex items-start gap-3 shrink-0">
           <div className="min-w-0 flex-1">
-            <div className="num text-label text-ink-500">
-              {project}/{app.name} · new run
-            </div>
+            <div className="text-label text-ink-500">in {project} · new run</div>
             <h2 className="text-drawer font-semibold text-ink-100 leading-tight mt-1">
               {action?.label ?? row.label ?? "New run"}
             </h2>
@@ -673,11 +654,15 @@ function RunDrawer({
               primary,
               prefill: team,
               slugInput,
-              // The rules in plain words: who must be different people,
-              // and that nothing goes out without the operator.
-              note: [distinctNote(row), "Nothing is published without your approval."]
-                .filter(Boolean)
-                .join(" "),
+              start: startLabel(action?.label),
+              // The rules in plain words: the plan waits for the
+              // operator, and nothing goes out without them.
+              note: "It waits for your approval before anything runs. Nothing is published without your OK.",
+              // Live checks: the folder name's shape, and a team that
+              // breaks the workflow's kept-apart rule (shown only then).
+              validate: (values) =>
+                (slugInput ? slugProblem(values[slugInput] ?? "") : null) ??
+                distinctProblem(row, values),
             }}
           />
         </div>

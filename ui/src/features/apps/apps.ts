@@ -63,38 +63,176 @@ export function stepLabel(title: string): string {
   return head !== "" && head.length < text.length ? head : text;
 }
 
-/** One stage of a run's progress row. */
-export interface RunStage {
-  label: string;
-  /** ok = finished, run = in flight, wait = needs the operator, off = not yet. */
-  tone: "ok" | "run" | "wait" | "off";
+/**
+ * A run's title without the workflow's prefix: "Blog post: my topic" →
+ * "my topic" (the topic is what the operator named; the prefix is the
+ * template's).
+ */
+export function runTitle(title: string): string {
+  const text = title.trim();
+  const colon = text.indexOf(":");
+  return colon > 0 ? text.slice(colon + 1).trim() : text;
+}
+
+/** The plain role label for a team input — "Researcher", not `strategist`. */
+const ROLE_LABELS: Record<string, string> = {
+  strategist: "Researcher",
+  researcher: "Researcher",
+  writer: "Writer",
+  author: "Writer",
+  designer: "Designer",
+  illustrator: "Designer",
+  reviewer: "Reviewer",
+  editor: "Reviewer",
+  publisher: "Publisher",
+};
+
+/** The role a team input names, in plain words (falls back to the ask). */
+export function roleLabel(name: string, ask?: string | null): string {
+  return ROLE_LABELS[name] ?? ask?.trim() ?? name;
+}
+
+/** The role a team input names, or null when it is not a team input. */
+export function teamRole(name: string): string | null {
+  return ROLE_LABELS[name] ?? null;
 }
 
 /**
- * A run's stage row: the workflow's steps (the run's own tickets, so
- * their states are the tracker's) and the output marker — Published
- * once an item exists, Ready to publish while a staged send waits for
- * the operator's release.
+ * The app drawer's field labels, in plain words (CAD-563 r3): the
+ * folder name and the keyword by their plain names, the team by role,
+ * everything else by the workflow's own ask.
  */
-export function runStages(
+export function appFieldLabel(name: string, ask?: string | null): string {
+  if (name === "slug") return "Folder";
+  if (name === "keyword") return "Keyword";
+  return ROLE_LABELS[name] ?? ask?.trim() ?? name;
+}
+
+/** The drawer's primary button: "New post" → "Start post". */
+export function startLabel(actionLabel: string | null | undefined): string {
+  const label = (actionLabel ?? "").trim();
+  return label === "" ? "Start" : label.replace(/^New\b/, "Start");
+}
+
+/**
+ * What is wrong with a hand-edited folder name, or null. The engine
+ * takes any text, so the drawer checks it live instead of printing the
+ * workflow's hint: lowercase words joined by hyphens.
+ */
+export function slugProblem(value: string): string | null {
+  const v = value.trim();
+  if (v === "") return null;
+  if (v.length > 60) return "Keep the folder name to 60 characters or fewer.";
+  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(v)) {
+    return "Use lowercase letters, digits and hyphens — it names the folder.";
+  }
+  return null;
+}
+
+/**
+ * The kept-apart rule, only when the current team violates it: the
+ * reviewer is named as the one who cannot double as the others (the
+ * rule the workflow's `distinct:` enforces at render).
+ */
+export function distinctProblem(wf: AppWorkflow, values: Record<string, string>): string | null {
+  const names = (wf.distinct ?? []).filter((n) => (values[n] ?? "").trim() !== "");
+  const collision = names.some((a, i) =>
+    names.some((b, j) => i < j && values[a].trim() === values[b].trim()),
+  );
+  if (!collision) return null;
+  const reviewer = names.findIndex((n) => ROLE_LABELS[n] === "Reviewer");
+  const subject = reviewer >= 0 ? reviewer : 0;
+  const label = ROLE_LABELS[names[subject]] ?? names[subject];
+  const others = names.filter((_, i) => i !== subject).map((n) => n.toLowerCase());
+  return `${label} can't be the ${others.join(" or ")}.`;
+}
+
+/** One stage of a run's progress row (CAD-563 r3). */
+export interface RunStage {
+  label: string;
+  /** done = finished (ticked), current = in flight (highlighted), waiting = not yet. */
+  tone: "done" | "current" | "waiting";
+}
+
+/**
+ * A run's stage row: the workflow's steps with the state a person
+ * reads at a glance — finished (green, ticked), the one in flight
+ * (highlighted), the rest waiting (grey). The first open step is the
+ * current one when nothing is reported in flight yet.
+ */
+export function runStages(run: AppRun): RunStage[] {
+  const tickets = run.plan.tickets;
+  const firstOpen = tickets.findIndex((t) => t.status !== "done" && t.status !== "dropped");
+  return tickets.map((t, i) => {
+    const done = t.status === "done" || t.status === "dropped";
+    const inFlight = t.status === "doing" || t.status === "review";
+    return {
+      label: stepLabel(t.title),
+      tone: done ? "done" : inFlight || i === firstOpen ? "current" : "waiting",
+    };
+  });
+}
+
+/** A run card's one status line, with the action it offers (CAD-563 r3). */
+export interface RunStatus {
+  text: string;
+  cls: string;
+  action?: { label: string; href: string };
+}
+
+/**
+ * A run's status and its one action, in the order a person meets them:
+ * published (view it), a send waiting for the release, a plan waiting
+ * for approval, anything else the Needs-you rail holds, a rejected
+ * plan, a finished run, the step in flight, else waiting to start.
+ */
+export function runStatus(
   run: AppRun,
-  outputs: AppRunOutput[],
-  pending: AppPendingSend[],
-): RunStage[] {
-  const stages: RunStage[] = run.plan.tickets.map((t) => ({
-    label: stepLabel(t.title),
-    tone:
-      t.status === "done"
-        ? "ok"
-        : t.status === "doing" || t.status === "review"
-          ? "run"
-          : (t.blocked_by ?? []).length > 0
-            ? "wait"
-            : "off",
-  }));
-  if (outputs.length > 0) stages.push({ label: "Published", tone: "ok" });
-  else if (pending.length > 0) stages.push({ label: "Ready to publish", tone: "wait" });
-  return stages;
+  needs: HomeNeed[],
+  mine: { items: AppRunOutput[]; pending: AppPendingSend[] },
+): RunStatus {
+  const published = mine.items[0];
+  if (published) {
+    return {
+      text: "Published",
+      cls: "bg-ok/15 text-ok",
+      action: { label: "View", href: outboxHref(published.effect_id) },
+    };
+  }
+  if (mine.pending.length > 0) {
+    return {
+      text: "Ready to publish",
+      cls: "bg-warn/10 text-warn",
+      action: { label: "Review & publish", href: "/" },
+    };
+  }
+  if (run.plan.state === "proposed") {
+    return {
+      text: "Needs you",
+      cls: "bg-warn/10 text-warn",
+      action: { label: "Approve plan", href: "/" },
+    };
+  }
+  const rows = runNeeds(run, needs);
+  if (rows.length > 0) {
+    return {
+      text: "Needs you",
+      cls: "bg-warn/10 text-warn",
+      action: { label: "Answer", href: "/" },
+    };
+  }
+  if (run.plan.state === "rejected") {
+    return { text: "Not approved", cls: "bg-fail/10 text-fail" };
+  }
+  const open = run.plan.tickets.filter((t) => t.status !== "done" && t.status !== "dropped");
+  if (open.length === 0 && run.plan.tickets.length > 0) {
+    return { text: "Done", cls: "bg-ok/15 text-ok" };
+  }
+  const inFlight = open.find((t) => t.status === "doing" || t.status === "review");
+  if (inFlight) {
+    return { text: `${stepLabel(inFlight.title)} in progress…`, cls: "bg-accent/15 text-accent" };
+  }
+  return { text: "Waiting to start", cls: "bg-ink-800 text-ink-400" };
 }
 
 /** The published items and the staged sends of one run. */
