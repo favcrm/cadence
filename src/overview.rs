@@ -36,6 +36,11 @@ use crate::proc::run_bounded;
 /// was absent at build time, which every consumer reads as "cannot
 /// tell", never as zero.
 pub const BUILD_COMMIT: &str = env!("CADENCE_BUILD_COMMIT");
+/// The full build id `cadence --version` prints (`0.1.0+<sha>`, the
+/// same concat main.rs gives clap). The board announces it in the
+/// stream's `hello` frame and answers it on `/api/version` so an older
+/// tab bundle knows it is stale (CAD-573).
+pub const BUILD_ID: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("CADENCE_BUILD_COMMIT"));
 pub const BUILD_TIME: &str = env!("CADENCE_BUILD_TIME");
 pub const BUILD_REMOTE: &str = env!("CADENCE_BUILD_REMOTE");
 pub const BUILD_ROOT: &str = env!("CADENCE_BUILD_ROOT");
