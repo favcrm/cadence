@@ -2147,9 +2147,14 @@ fn cad446_board_syncs_delivery_without_a_terminal() {
     );
 
     // Fix, PASS on a green head: the merge decision appears on its own.
+    // The fake gh takes the new head BEFORE the done report — the worker
+    // pushes, then reports, so GitHub shows b when the record does. Set
+    // the other way round, a sync tick between the two sees the record
+    // ahead of GitHub and takes the old head for one that moved after
+    // review, barring r1 (CAD-558).
+    lf.set_gh(&b, "OPEN", true, false);
     lf.done(&b);
     lf.wait_rec("round 2", |r| r["state"] == "reviewing" && r["head"] == b);
-    lf.set_gh(&b, "OPEN", true, false);
     let (ok, out) = lf.verdict_as("r1", "pass", &b);
     assert!(ok, "{out}");
     let passed = Instant::now();
