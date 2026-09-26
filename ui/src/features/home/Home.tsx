@@ -25,6 +25,7 @@ import { atTail, jumpLabel, tailTop } from "./dock";
 import MasterChips from "./MasterChips";
 import NeedsRail from "./NeedsRail";
 import { askDraft, readRailCollapsed, writeRailCollapsed, type HomeNeed } from "./needs";
+import { ThreadPermission } from "./PermissionCard";
 import PlanCard from "./PlanCard";
 import {
   initialFollow,
@@ -175,11 +176,13 @@ function Bubble({ who, at, children, me }: { who: string; at?: string; children:
 
 function Item({
   item,
+  readOnly,
   onOpenIssue,
   onRetry,
   onDiscard,
 }: {
   item: ThreadItem;
+  readOnly: boolean;
   onOpenIssue: (id: string) => void;
   onRetry: (message: string, text: string, refs?: ThreadRef[]) => void;
   onDiscard: (message: string) => void;
@@ -245,6 +248,9 @@ function Item({
       );
     case "system": {
       const e = item.entry;
+      if (e.payload?.source === "permission") {
+        return <ThreadPermission text={e.text} readOnly={readOnly} />;
+      }
       // The bootstrap prompt lands as a system message — the daemon's
       // briefing for the master, hundreds of lines of markdown. It is
       // context for the turn, not chat: one collapsed note, GFM inside.
@@ -833,7 +839,7 @@ const ThreadList = memo(function ThreadList({
           const live = item.type === "pending" || Number(item.key.slice(1)) > liveAfter;
           return (
             <li key={item.key} className={`min-w-0 space-y-2${live ? " msg-in" : ""}`}>
-              <Item item={item} onOpenIssue={onOpenIssue} onRetry={onRetry} onDiscard={discard} />
+              <Item item={item} readOnly={readOnly} onOpenIssue={onOpenIssue} onRetry={onRetry} onDiscard={discard} />
               {anchors.has(item.key) && (
                 <div className="ml-8">
                   <PlanCard epic={anchors.get(item.key)!} readOnly={readOnly} onOpenIssue={onOpenIssue} />

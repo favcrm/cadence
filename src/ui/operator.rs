@@ -122,6 +122,27 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     // fail closed the same way; listed for the reader).
     route("POST", "/api/needs/dismiss", RouteClass::OperatorOnly),
     route("POST", "/api/needs/snooze", RouteClass::OperatorOnly),
+    // CAD-615: permission decisions. OperatorOnly, same as the RPCs.
+    route(
+        "POST",
+        "/api/master/permissions/*/allow-once",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/master/permissions/*/always",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/master/permissions/*/reject",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/master/permissions/rules/*/revoke",
+        RouteClass::OperatorOnly,
+    ),
     route("POST", "/api/agents/*/resume", RouteClass::OperatorOnly),
     route("POST", "/api/agents/*/unfence", RouteClass::OperatorOnly),
     route("POST", "/api/epics/*/stage", RouteClass::OperatorOnly),

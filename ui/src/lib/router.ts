@@ -18,7 +18,7 @@ import { readAppUrlState, type AppTab, type ProjectView } from "./urlState";
  *   /wiki/edit|history|upload/<path>   its modes for one path
  *   /wiki/search[/<query>]     full-text search
  *   /setup                     first-run setup
- *   /settings[/memory]         model defaults, memory
+ *   /settings[/memory|update|permissions]  model defaults, memory, update, master permissions
  *   /login                     a `cadence ui login` link lands here
  *
  * Query parameters carry the rest: `project` (the scope on screens whose
@@ -29,7 +29,7 @@ import { readAppUrlState, type AppTab, type ProjectView } from "./urlState";
  */
 
 export type ProjectSection = "issues" | "epics" | "milestones" | "context" | "workflows";
-export type SettingsSection = "models" | "memory" | "update";
+export type SettingsSection = "models" | "memory" | "update" | "permissions";
 /** The wiki's modes; `browse` opens a path by its kind (CAD-581). */
 export type WikiMode = "browse" | "edit" | "history" | "search" | "upload";
 
@@ -139,6 +139,7 @@ export function matchRoute(pathname: string): Route {
       if (!a) return { screen: "settings", section: "models" };
       if (a === "memory") return { screen: "settings", section: "memory" };
       if (a === "update") return { screen: "settings", section: "update" };
+      if (a === "permissions") return { screen: "settings", section: "permissions" };
     }
   }
   return { screen: "notFound", path: pathname };
@@ -178,7 +179,9 @@ export function routePath(route: Route): string {
       return "/outbox";
     case "settings":
       if (route.section === "memory") return "/settings/memory";
-      return route.section === "update" ? "/settings/update" : "/settings";
+      if (route.section === "update") return "/settings/update";
+      if (route.section === "permissions") return "/settings/permissions";
+      return "/settings";
     case "notFound":
       return route.path;
   }

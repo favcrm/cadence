@@ -366,6 +366,39 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
              commands for the master — the verb list is the daemon's, never raw input",
         ),
     ),
+    // CAD-615: the master files and retries; the operator decides.
+    (
+        "master_ask_permission",
+        Rule::Handler("require_master_caller (CAD-615)"),
+    ),
+    (
+        "master_peek_grant",
+        Rule::Handler("require_master_caller (CAD-615)"),
+    ),
+    (
+        "master_permission_use",
+        Rule::Handler("require_master_caller (CAD-615)"),
+    ),
+    (
+        "master_permission_allow_once",
+        Rule::Handler("operator_connection (CAD-615)"),
+    ),
+    (
+        "master_permission_always",
+        Rule::Handler("operator_connection (CAD-615)"),
+    ),
+    (
+        "master_permission_reject",
+        Rule::Handler("operator_connection (CAD-615)"),
+    ),
+    (
+        "master_permission_revoke",
+        Rule::Handler("operator_connection (CAD-615)"),
+    ),
+    (
+        "master_permission_list",
+        Rule::Handler("operator_connection (CAD-615)"),
+    ),
     // CAD-574: a Needs-you row suppression is the operator's call —
     // `needs_dismissed.json` is daemon-owned like `area_acks.json`.
     (

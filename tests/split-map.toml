@@ -1168,3 +1168,13 @@ helpers = [
     "upload_as",
     "op_get",
 ]
+
+[binaries.master_permission]
+tests = [
+    "role_gates_refuse_the_wrong_caller",
+    "master_allow_once_is_exact_and_single_use",
+    "http_permission_routes_are_operator_only",
+]
+helpers = [
+    "refused",
+]

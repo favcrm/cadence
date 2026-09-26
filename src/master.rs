@@ -139,6 +139,9 @@ pub const CLAUDE_ALLOWED_TOOLS: &[&str] = &[
     "Bash(cadence agent show *)",
     "Bash(cadence status)",
     "Bash(cadence status *)",
+    // CAD-615: ask the operator to approve one plain command. The
+    // decision verbs are not here — the master cannot approve itself.
+    "Bash(cadence master ask-permission *)",
 ];
 
 /// The only built-in tool the master's Claude session has (`--tools`):
@@ -746,6 +749,13 @@ pub fn check_file(name: &str, text: &str) -> Result<()> {
     let cap = match name {
         "SOUL.md" => SOUL_MAX_CHARS,
         "AGENT.md" => AGENT_MAX_CHARS,
+        "permissions.yaml" => {
+            return Err(Error::rejected(
+                "agents/master/permissions.yaml is operator-owned — the master cannot write it, \
+                 and `master edit` does not either. The operator saves rules with \
+                 `cadence master always-allow` and removes them with `cadence master revoke-permission`",
+            ))
+        }
         other => {
             return Err(Error::rejected(format!(
                 "'{other}' is not an agent file — one of {}",

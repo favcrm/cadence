@@ -103,6 +103,7 @@ Dispatch a ticket of an **approved** plan:
 
 ```sh
 cadence master dispatch <ID> [--to <alias>]
+cadence master ask-permission --reason <why> -- <one plain command>
 ```
 
 The daemon composes the kickoff from the ticket and sends it to the

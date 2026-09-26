@@ -34,7 +34,19 @@ export type NeedAction =
       reviewer: string | null;
       verdict: string | null;
     }
-  | { type: "command"; command: string };
+  | { type: "command"; command: string }
+  | {
+      type: "permission";
+      id: string;
+      argv: string;
+      cwd: string;
+      reason: string;
+      risk: string;
+      /** A narrowed prefix the operator can always-allow, when one is safe. */
+      prefix: string[] | null;
+      status: string;
+      decisionLabel: string;
+    };
 
 export interface HomeNeed {
   key: string;
@@ -79,6 +91,7 @@ const LABEL: Record<string, string> = {
   plan: "plan",
   question: "question",
   approval: "approval",
+  master_permission: "permission",
   merge: "merge",
   merge_decision: "merge",
 };
@@ -106,6 +119,17 @@ export function homeNeed(row: NeedsMe, index = 0): HomeNeed {
       reviewer?: unknown;
       verdict_summary?: unknown;
     };
+    permission?: {
+      id?: unknown;
+      command?: unknown;
+      cwd?: unknown;
+      reason?: unknown;
+      risk?: unknown;
+      prefix?: unknown;
+      status?: unknown;
+      decision_label?: unknown;
+    };
+    reason?: unknown;
   };
   const key = row.subject ? `${row.subject.kind}:${row.subject.id}` : `${row.kind}:${index}`;
   const base = {
@@ -145,6 +169,29 @@ export function homeNeed(row: NeedsMe, index = 0): HomeNeed {
         issue && report && ID.test(issue)
           ? { type: "answer", issue, report, options, impact: str(q.impact), body: str(q.body) }
           : command,
+    };
+  }
+  if (row.kind === "master_permission") {
+    const p = extra.permission ?? {};
+    const id = str(p.id);
+    const prefix = Array.isArray(p.prefix) ? p.prefix.filter((x): x is string => !!str(x)) : [];
+    return {
+      ...base,
+      owner: "master",
+      summary: str(p.reason) ?? str(extra.reason),
+      action: id
+        ? {
+            type: "permission",
+            id,
+            argv: str(p.command) ?? row.command,
+            cwd: str(p.cwd) ?? "",
+            reason: str(p.reason) ?? str(extra.reason) ?? "",
+            risk: str(p.risk) ?? "medium",
+            prefix: prefix.length > 0 ? prefix : null,
+            status: str(p.status) ?? "pending",
+            decisionLabel: str(p.decision_label) ?? "",
+          }
+        : command,
     };
   }
   if (row.kind === "merge_decision") {
@@ -231,6 +278,7 @@ const DECISION_KINDS: ReadonlySet<string> = new Set([
   "merged_not_done",
   "effect_reconcile",
   "effect_unverified",
+  "master_permission",
 ]);
 
 /** One need → its group. A PR subject or kind is a PR row; a row's own
