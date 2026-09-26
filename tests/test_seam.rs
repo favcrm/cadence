@@ -24,7 +24,6 @@ use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-#[cfg(not(feature = "test-seam"))]
 use tempfile::TempDir;
 
 /// `agent_register`'s params for a fixture agent.
@@ -366,9 +365,26 @@ fn arming_refuses_the_real_production_state_dir() {
         return;
     };
     let prod = home.join(".local/state/cadence");
-    let err = cadence_agent::test_seam::arm_if_requested(&prod, true)
-        .map(|_| ())
-        .expect_err("the seam must refuse the real production state dir");
+    // Point every env-derived handle at a decoy: only the passwd-home
+    // bound can still name `prod`. Without it the arm falls through to
+    // the temp-root refusal — an Err, but a different message.
+    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prior = [
+        ("HOME", std::env::var_os("HOME")),
+        ("XDG_STATE_HOME", std::env::var_os("XDG_STATE_HOME")),
+    ];
+    let decoy = TempDir::new().unwrap();
+    std::env::set_var("HOME", decoy.path());
+    std::env::set_var("XDG_STATE_HOME", decoy.path());
+    let arm = cadence_agent::test_seam::arm_if_requested(&prod, true).map(|_| ());
+    for (key, value) in prior {
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
+    drop(_env);
+    let err = arm.expect_err("the seam must refuse the real production state dir");
     assert!(
         err.to_string().contains("production state dir"),
         "the refusal should name the production dir, got: {err}"
