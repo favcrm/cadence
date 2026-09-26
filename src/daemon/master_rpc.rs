@@ -48,6 +48,15 @@ pub const MASTER_ALLOWED: &[&str] = &[
     "job_events",
     "task_show",
     "model_defaults_get",
+    // CAD-552: the reads behind the completed verb allowlist — `issue
+    // ls --json`'s work block (`project_work_approvals`) and the
+    // `overview`/`status` sections (`monitor_*`, `agent_probe`) — all
+    // Rule::Read. Self-scoped reads like `agent_requests` stay refused:
+    // empty would pass for "nothing pending".
+    "project_work_approvals",
+    "monitor_list",
+    "monitor_alerts",
+    "agent_probe",
     "plan_propose",
     // CAD-358: register a repo and seed PROJECT.md (tracker and state
     // dir refused; identity fields refused).

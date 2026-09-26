@@ -2535,3 +2535,141 @@ fn session_start_scopes_to_cwd_project() {
     assert_eq!(out.status.code(), Some(2), "{text}");
     assert!(text.contains("not inside a known project repo"), "{text}");
 }
+
+/// CAD-552: `issue ls --summary --json` — the master's one-call
+/// cross-project status. Per-project counts by status, plus each
+/// project's P0/P1 issues still in doing/review; filters still apply.
+#[test]
+fn issue_ls_summary_rolls_up_projects() {
+    let tmp = TempDir::new().unwrap();
+    let (pm_dir, home, state) = (
+        tmp.path().join("pm"),
+        tmp.path().join("home"),
+        tmp.path().join("state"),
+    );
+    for d in [&pm_dir, &home, &state] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let git = git_ok();
+    let repo_a = tmp.path().join("repo-a");
+    let repo_b = tmp.path().join("repo-b");
+    for r in [&repo_a, &repo_b] {
+        std::fs::create_dir_all(r).unwrap();
+    }
+    git_f_repo(&repo_a, &git, |_| {});
+    git_f_repo(&repo_b, &git, |_| {});
+    issue_cli(&home, &state, &pm_dir, &["issue", "init"]);
+    issue_cli(
+        &home,
+        &state,
+        &pm_dir,
+        &[
+            "issue",
+            "project",
+            "add",
+            "demo",
+            "--prefix",
+            "D",
+            "--repo",
+            &repo_a.to_string_lossy(),
+        ],
+    );
+    issue_cli(
+        &home,
+        &state,
+        &pm_dir,
+        &[
+            "issue",
+            "project",
+            "add",
+            "extra",
+            "--prefix",
+            "X",
+            "--repo",
+            &repo_b.to_string_lossy(),
+        ],
+    );
+    // Seed directly — seven `issue new` calls would spend the test in
+    // tracker commits. Owner field is optional.
+    let seed = |project: &str, id: &str, status: &str, priority: &str, owner: Option<&str>| {
+        let dir = pm_dir.join(project).join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let owner = owner.map(|o| format!("owner: {o}\n")).unwrap_or_default();
+        std::fs::write(
+            dir.join("issue.md"),
+            format!(
+                "---\nid: {id}\ntitle: {id} title\nstatus: {status}\npriority: {priority}\n\
+                 {owner}created: 2026-09-20T00:00:00Z\n---\n\nbody\n"
+            ),
+        )
+        .unwrap();
+    };
+    seed("demo", "D-1", "backlog", "P2", None);
+    seed("demo", "D-2", "doing", "P0", Some("swe-1"));
+    seed("demo", "D-3", "review", "P1", Some("swe-2"));
+    seed("demo", "D-4", "done", "P0", Some("swe-1")); // done P0 is not active
+    seed("extra", "X-1", "ready", "P1", None); // ready is not doing/review
+    seed("extra", "X-2", "review", "P3", None); // P3 is not P0/P1
+    seed("extra", "X-3", "backlog", "P2", None);
+
+    let run = |args: &[&str]| -> std::process::Output {
+        let bin = env!("CARGO_BIN_EXE_cadence");
+        std::process::Command::new(bin)
+            .arg("--state-dir")
+            .arg(&state)
+            .args(args)
+            .env("HOME", &home)
+            .env("CADENCE_PM_DIR", &pm_dir)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    Path::new(bin).parent().unwrap().display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .output()
+            .unwrap()
+    };
+
+    let out = run(&["issue", "ls", "--summary", "--json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["issues"], json!(7));
+    let demo = &v["projects"]["demo"];
+    assert_eq!(demo["counts"]["backlog"], json!(1));
+    assert_eq!(demo["counts"]["doing"], json!(1));
+    assert_eq!(demo["counts"]["review"], json!(1));
+    assert_eq!(demo["counts"]["done"], json!(1));
+    let p0p1: Vec<&str> = demo["p0p1"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(p0p1, ["D-2", "D-3"], "{demo}");
+    assert_eq!(demo["p0p1"][0]["owner"], json!("swe-1"));
+    let extra = &v["projects"]["extra"];
+    assert_eq!(extra["counts"]["ready"], json!(1));
+    assert_eq!(extra["counts"]["review"], json!(1));
+    assert_eq!(extra["counts"]["backlog"], json!(1));
+    assert_eq!(extra["p0p1"], json!([]), "X-1 is ready, X-2 is P3: {extra}");
+
+    // Filters scope the rollup the same way they scope the rows.
+    let out = run(&["issue", "ls", "--summary", "--json", "--project", "demo"]);
+    assert!(out.status.success());
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["issues"], json!(4));
+    assert!(v["projects"].get("extra").is_none(), "{v}");
+
+    // `--summary` is JSON output — the flag refuses without `--json`.
+    let out = run(&["issue", "ls", "--summary"]);
+    assert!(
+        !out.status.success(),
+        "--summary without --json must refuse"
+    );
+}

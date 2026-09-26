@@ -9,7 +9,7 @@
 //! continuity-pack contract), effort verification, missing-credentials
 //! error quality, and auto-cancelled extension UI dialogs.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -142,8 +142,10 @@ fn recorded_env(state: &Path) -> Vec<String> {
 }
 
 /// The exact flags the adapter puts on the provider for a master —
-/// `--no-extensions -e <guard> --tools bash` is the lockdown (I1:
+/// `--no-extensions -e <guard> --tools bash,read` is the lockdown (I1:
 /// deleting the guard block from `build_command` fails this test).
+/// `read` joined the toolset under CAD-552 — the guard confines it to
+/// `master/tmp`.
 fn expected_master_argv(mode: &str, guard: &Path) -> Vec<String> {
     [
         mode,
@@ -159,7 +161,7 @@ fn expected_master_argv(mode: &str, guard: &Path) -> Vec<String> {
         "--extension",
         guard.to_str().unwrap(),
         "--tools",
-        "bash",
+        "bash,read",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -530,10 +532,46 @@ fn master_env_is_allowlisted_not_inherited() {
     pi.close();
 }
 
+/// Open a master adapter (writes the guard) and return the generated
+/// extension's grammar section — the lines BETWEEN the markers,
+/// verbatim — for verbatim evaluation under Node.
+fn guard_grammar(state: &Path) -> String {
+    let src = std::fs::read_to_string(state.join("master/pi-guard.js")).unwrap();
+    let (open_marker, close_marker) = (
+        ">>> cadence-guard-grammar >>>",
+        "<<< cadence-guard-grammar <<<",
+    );
+    // Start at the newline after the open marker, end at the start of
+    // the close marker's own line.
+    let after_open = src.find(open_marker).expect("grammar marker missing") + open_marker.len();
+    let start = src[after_open..]
+        .find('\n')
+        .map(|i| after_open + i + 1)
+        .expect("grammar opens");
+    let end = src[..src.rfind(close_marker).expect("grammar end marker missing")]
+        .rfind('\n')
+        .map(|i| i + 1)
+        .expect("grammar closes");
+    src[start..end].to_string()
+}
+
+/// `node -e <js>` — the pi toolchain needs node on PATH (CI provides
+/// node 22). Asserts success and parses stdout as JSON.
+fn node_eval<T: serde::de::DeserializeOwned>(js: &str) -> T {
+    let out = cadence_agent::reaper::output(std::process::Command::new("node").arg("-e").arg(js))
+        .expect("node is required for the pi toolchain");
+    assert!(
+        out.status.success(),
+        "guard grammar failed to evaluate: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
 /// CAD-322 round 2 (C1): evaluate the generated guard's grammar section
 /// verbatim under Node — every review bypass is refused, every real
-/// allowlisted command parses. Needs node on PATH (the pi toolchain
-/// requires it; CI provides node 22).
+/// allowlisted command parses. CAD-552 added the missing read verbs and
+/// write-verb refusals to the case lists.
 #[test]
 fn the_pi_guard_is_a_grammar_and_refuses_the_bypasses() {
     let state = tempfile::tempdir().unwrap();
@@ -545,32 +583,26 @@ fn the_pi_guard_is_a_grammar_and_refuses_the_bypasses() {
     pi.open(&master_agent(state.path(), json!({"unconfined": true})))
         .unwrap();
     pi.close();
-    let src = std::fs::read_to_string(state.path().join("master/pi-guard.js")).unwrap();
-    let (open_marker, close_marker) = (
-        ">>> cadence-guard-grammar >>>",
-        "<<< cadence-guard-grammar <<<",
-    );
-    // The grammar is the lines BETWEEN the marker lines: start at the
-    // newline after the open marker, end at the start of the close
-    // marker's own line.
-    let after_open = src.find(open_marker).expect("grammar marker missing") + open_marker.len();
-    let start = src[after_open..]
-        .find('\n')
-        .map(|i| after_open + i + 1)
-        .expect("grammar opens");
-    let end = src[..src.rfind(close_marker).expect("grammar end marker missing")]
-        .rfind('\n')
-        .map(|i| i + 1)
-        .expect("grammar closes");
-    let grammar = &src[start..end];
+    let grammar = guard_grammar(state.path());
     let allow = [
         "cadence status",
         "cadence status --long",
         "cadence issue ls",
         "cadence issue ls --project demo",
+        "cadence issue ls --summary --json", // CAD-552 one-call status
         "cadence issue show D-1",
+        "cadence issue log D-1",
+        "cadence issue log D-1 --limit 10",
+        "cadence issue epic ls",
+        "cadence issue epic ls --project demo",
+        "cadence issue epic show D-1",
         "cadence issue project ls",
+        "cadence plan ls",
+        "cadence plan ls --state approved",
         "cadence plan show p1",
+        "cadence thread show swe-1",
+        "cadence overview",
+        "cadence overview --json",
         "cadence plan propose --project demo --file /tmp/p.md",
         "cadence project new x",
         "cadence master dispatch D-1 --to swe-1",
@@ -605,23 +637,333 @@ fn the_pi_guard_is_a_grammar_and_refuses_the_bypasses() {
         "cadence\tstatus",
         "",
         "pi --version",
+        // CAD-552: write verbs stay refused — `=` is inside the
+        // charset, so only the argv-prefix table stands in the way.
+        "cadence issue new x",
+        "cadence issue set D-1 status=done",
+        "cadence plan approve D-1",
+        "cadence epic ls",     // the verb's path is `issue epic`
+        "cadence issue show",  // the `*` form needs an argument
+        "cadence thread show", // same
+        "cadence read /tmp/x", // `read` is a tool, never a verb
+        "cadence issue ls --json | head -5",
     ];
     let cases: Vec<&str> = allow.iter().chain(&deny).copied().collect();
     let js = format!(
         "{grammar}\nprocess.stdout.write(JSON.stringify(({}).map(piGuardAllows)));",
         json!(cases)
     );
-    let out = cadence_agent::reaper::output(std::process::Command::new("node").arg("-e").arg(&js))
-        .expect("node is required for the pi toolchain");
-    assert!(
-        out.status.success(),
-        "guard grammar failed to evaluate: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let verdicts: Vec<bool> = serde_json::from_slice(&out.stdout).unwrap();
+    let verdicts: Vec<bool> = node_eval(&js);
     for (i, cmd) in cases.iter().enumerate() {
         assert_eq!(verdicts[i], i < allow.len(), "{cmd:?}");
     }
+}
+
+/// CAD-552: a refusal names the rule the command hit and the nearest
+/// allowed form — the master self-corrects instead of probing.
+#[test]
+fn the_pi_guard_refusal_names_the_rule_and_allowed_forms() {
+    let state = tempfile::tempdir().unwrap();
+    let pi = master_adapter(
+        "normal",
+        state.path(),
+        &[(cadence_agent::master::TEST_NO_LANDLOCK, "1".into())],
+    );
+    pi.open(&master_agent(state.path(), json!({"unconfined": true})))
+        .unwrap();
+    pi.close();
+    let grammar = guard_grammar(state.path());
+    let cases = [
+        "cadence status | head -5",
+        "rm -rf /",
+        "cadence issue new x",
+        "cadence status",
+        "",
+    ];
+    let js = format!(
+        "{grammar}\nprocess.stdout.write(JSON.stringify(({}).map(piGuardRefusal)));",
+        json!(cases)
+    );
+    let reasons: Vec<Option<String>> = node_eval(&js);
+    assert!(
+        reasons[0].as_deref().unwrap_or("").contains("no pipes"),
+        "charset refusal names the rule: {:?}",
+        reasons[0]
+    );
+    assert!(
+        reasons[1]
+            .as_deref()
+            .unwrap_or("")
+            .contains("starts `cadence`"),
+        "non-cadence refusal names argv[0]: {:?}",
+        reasons[1]
+    );
+    let verb_refusal = reasons[2].as_deref().unwrap_or("");
+    assert!(
+        verb_refusal.contains("not an allowlisted verb"),
+        "{verb_refusal}"
+    );
+    // The nearest allowed form — the refusal lists the verb table.
+    assert!(verb_refusal.contains("cadence issue ls"), "{verb_refusal}");
+    assert!(verb_refusal.contains("cadence overview"), "{verb_refusal}");
+    assert_eq!(reasons[3], None, "an allowlisted command has no refusal");
+    assert!(reasons[4].is_some(), "the empty command refuses");
+}
+
+/// CAD-552: the `read` tool is confined to the master's own tmp dir —
+/// where Pi spills long bash output. `piReadPathAllowed` is evaluated
+/// verbatim under Node: inside passes, every escape refuses — prefix
+/// siblings (`tmp-evil`), `..` out of the dir, absolute paths outside,
+/// relative paths (cwd is the master's empty workdir, never the spill
+/// dir). The `<tmp>-evil` case is the mutation proof for the
+/// `dir + "/"` prefix check.
+#[test]
+fn the_pi_guard_confines_read_to_master_tmp() {
+    let state = tempfile::tempdir().unwrap();
+    let pi = master_adapter(
+        "normal",
+        state.path(),
+        &[(cadence_agent::master::TEST_NO_LANDLOCK, "1".into())],
+    );
+    pi.open(&master_agent(state.path(), json!({"unconfined": true})))
+        .unwrap();
+    pi.close();
+    let grammar = guard_grammar(state.path());
+    let tmp = state.path().join("master/tmp");
+    let tmp = tmp.to_string_lossy();
+    let allow = [
+        format!("{tmp}/pi-bash-1.log"),
+        format!("{tmp}/sub/x.log"),
+        tmp.to_string(),
+        format!("{tmp}//double-slash.log"),
+        format!("{tmp}/a/../b.log"), // stays inside after normalization
+    ];
+    let deny = [
+        "/etc/passwd".to_string(),
+        "/".to_string(),
+        format!("{tmp}-evil/x.log"), // a sibling whose name shares the prefix
+        format!("{tmp}/../cwd/pi-argv.json"),
+        format!("{tmp}/.."),         // the parent, master/ itself
+        "pi-bash-1.log".to_string(), // relative resolves against cwd — never tmp
+        String::new(),
+    ];
+    let js = format!(
+        "{grammar}\nprocess.stdout.write(JSON.stringify({{allow:({}).map(piReadPathAllowed),deny:({}).map(piReadPathAllowed),nonString:piReadPathAllowed(undefined),num:piReadPathAllowed(42)}}));",
+        json!(allow),
+        json!(deny)
+    );
+    let out: Value = node_eval(&js);
+    for (i, p) in allow.iter().enumerate() {
+        assert_eq!(out["allow"][i], json!(true), "allow {p}");
+    }
+    for (i, p) in deny.iter().enumerate() {
+        assert_eq!(out["deny"][i], json!(false), "deny {p}");
+    }
+    assert_eq!(out["nonString"], json!(false));
+    assert_eq!(out["num"], json!(false));
+}
+
+/// CAD-552: the generated extension itself — imported as a module with
+/// a stub `pi` — routes `tool_call` through the grammar: bash by the
+/// allowlist, `read` by the tmp confinement, every other tool refused.
+/// Dropping the read branch fails the in-tmp case; widening the prefix
+/// check fails an out-of-tmp one.
+#[test]
+fn the_generated_extension_routes_tool_calls() {
+    let state = tempfile::tempdir().unwrap();
+    let pi = master_adapter(
+        "normal",
+        state.path(),
+        &[(cadence_agent::master::TEST_NO_LANDLOCK, "1".into())],
+    );
+    pi.open(&master_agent(state.path(), json!({"unconfined": true})))
+        .unwrap();
+    pi.close();
+    let guard = state.path().join("master/pi-guard.js");
+    // `export default` needs ESM — import a .mjs copy.
+    let mjs = state.path().join("guard.mjs");
+    std::fs::copy(&guard, &mjs).unwrap();
+    let tmp = state.path().join("master/tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let tmp = tmp.to_string_lossy().to_string();
+    let cases = json!([
+        {"tool": "bash", "input": {"command": "cadence status"}},
+        {"tool": "bash", "input": {"command": "cadence issue ls --summary --json"}},
+        {"tool": "bash", "input": {"command": "cadence issue new x"}},
+        {"tool": "bash", "input": {"command": "cadence status | head"}},
+        {"tool": "bash", "input": {"command": "rm -rf /"}},
+        {"tool": "read", "input": {"path": format!("{tmp}/pi-bash-1.log")}},
+        {"tool": "read", "input": {"path": "/etc/passwd"}},
+        {"tool": "read", "input": {"path": format!("{tmp}-evil/x")}},
+        {"tool": "read", "input": {"path": format!("{tmp}/../cwd/x")}},
+        {"tool": "read", "input": {}},
+        {"tool": "write", "input": {"path": format!("{tmp}/x"), "content": "y"}},
+        {"tool": "grep", "input": {"pattern": "x"}},
+    ]);
+    let harness = format!(
+        r#"import guard from "file://{}";
+let handler;
+guard({{ on: (name, cb) => {{ if (name === "tool_call") handler = cb; }} }});
+const out = [];
+for (const c of {}) {{
+  const r = await handler({{ toolName: c.tool, input: c.input }});
+  out.push(r === undefined ? null : String(r.reason ?? ""));
+}}
+process.stdout.write(JSON.stringify(out));"#,
+        mjs.display(),
+        cases
+    );
+    let out = cadence_agent::reaper::output(
+        std::process::Command::new("node")
+            .arg("--input-type=module")
+            .arg("-e")
+            .arg(&harness),
+    )
+    .expect("node is required for the pi toolchain");
+    assert!(
+        out.status.success(),
+        "extension import failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let reasons: Vec<Option<String>> = serde_json::from_slice(&out.stdout).unwrap();
+    for (i, reason) in reasons.iter().enumerate() {
+        let want_allow = i <= 1 || i == 5; // the two good bash calls + the in-tmp read
+        assert_eq!(reason.is_none(), want_allow, "case {i}: {cases}");
+    }
+    // The refusals carry their rule, not a bare no.
+    assert!(reasons[2]
+        .as_deref()
+        .unwrap()
+        .contains("not an allowlisted verb"));
+    assert!(reasons[3].as_deref().unwrap().contains("no pipes"));
+    assert!(reasons[6].as_deref().unwrap().contains("confined"));
+    assert!(reasons[10].as_deref().unwrap().contains("not enabled"));
+}
+
+/// CAD-552's before/after probe: one REAL Pi turn — the "report status
+/// of our projects" prompt after the briefing text — timed, with tool
+/// calls and guard refusals counted from the adapter events. It runs
+/// only when asked, against the host's real `pi` + login:
+///
+/// ```sh
+/// CADENCE_PI_PROBE=1 CADENCE_PM_DIR=<pm> cargo test --test pi_master \
+///     --release -- --ignored --nocapture status_prompt_probe
+/// ```
+///
+/// `CADENCE_PROBE_STATE` pins the state dir (a tempdir otherwise);
+/// `CADENCE_PROBE_MODEL` overrides pi's default model; the result line
+/// is also written to `$CADENCE_PROBE_OUT` when set. Unconfined — the
+/// guard, briefing and argv are what differ, not Landlock.
+#[test]
+#[ignore = "real Pi turn — opt in with CADENCE_PI_PROBE=1"]
+fn status_prompt_probe() {
+    if std::env::var("CADENCE_PI_PROBE").is_err() {
+        return;
+    }
+    // A real `pi`, never a mock — a leaked CADENCE_PI_COMMAND would
+    // silently swap the provider.
+    std::env::remove_var("CADENCE_PI_COMMAND");
+    // A plain dir (no TempDir drop): the spill logs survive for
+    // inspection. CADENCE_PROBE_STATE pins it.
+    let state = std::env::var("CADENCE_PROBE_STATE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::temp_dir().join(format!("cad552-probe-{}", std::process::id()))
+        });
+    let _ = std::fs::remove_dir_all(&state);
+    std::fs::create_dir_all(state.join("logs")).unwrap();
+    // Real Pi needs its login inside `<state>/master/pi` — provision it
+    // the way `master start --copy-login` does, from the operator's own
+    // agent dir. No login anywhere → the probe skips loudly, not fails.
+    let operator_config = std::env::var("PI_CODING_AGENT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap()).join(".pi/agent"));
+    match cadence_agent::master::copy_login_for("pi", &state, &operator_config) {
+        Ok(cadence_agent::master::Login::None) => {
+            eprintln!(
+                "PROBE skipped: no pi login in {}",
+                operator_config.display()
+            );
+            return;
+        }
+        Err(e) => panic!("probe could not provision pi login: {e}"),
+        _ => {}
+    }
+    let env = ProviderEnv::default();
+    if let Ok(pm) = std::env::var("CADENCE_PM_DIR") {
+        env.set("CADENCE_PM_DIR", pm);
+    }
+    env.set(cadence_agent::master::TEST_NO_LANDLOCK, "1");
+    // The master's own PATH-prepend: the worktree's `cadence` first, so
+    // `cadence` inside the turn is the build under test.
+    let bin_dir = Path::new(env!("CARGO_BIN_EXE_cadence"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    std::env::set_var(
+        "PATH",
+        format!(
+            "{}:{}",
+            bin_dir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        ),
+    );
+    let (tx, rx) = mpsc::channel();
+    let pi = PiAdapter::new(
+        AdapterHooks {
+            on_event: Box::new(move |method, params| {
+                let _ = tx.send((method.to_string(), params));
+            }),
+            on_request: Box::new(|_| {}),
+        },
+        &state.join("logs").join("pi-master.log"),
+        &env,
+    );
+    let mut params = json!({"unconfined": true, "turn_max_secs": 300});
+    if let Ok(model) = std::env::var("CADENCE_PROBE_MODEL") {
+        params["model"] = json!(model);
+    }
+    pi.open(&master_agent(&state, params)).unwrap();
+    let briefing = cadence_agent::master::compose(&[
+        (
+            "SOUL.md".into(),
+            std::fs::read_to_string(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("agents/master/SOUL.md"),
+            )
+            .unwrap(),
+        ),
+        (
+            "AGENT.md".into(),
+            std::fs::read_to_string(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("agents/master/AGENT.md"),
+            )
+            .unwrap(),
+        ),
+    ]);
+    let prompt = format!("{briefing}\n\nreport status of our projects");
+    let started = Instant::now();
+    let turn = pi.run_turn(&prompt, "probe-1", &|_| {}).unwrap();
+    let wall = started.elapsed();
+    let events = collect(&rx, Duration::from_secs(2));
+    let calls = events
+        .iter()
+        .filter(|(m, _)| m == "cadence/tool_use")
+        .count();
+    let refused = events
+        .iter()
+        .filter(|(m, p)| m == "cadence/tool_result" && p["is_error"].as_bool() == Some(true))
+        .count();
+    let summary = json!({
+        "wall_secs": wall.as_secs_f64(),
+        "tool_calls": calls,
+        "refusals": refused,
+        "status": turn.status,
+    });
+    println!("PROBE {}", serde_json::to_string(&summary).unwrap());
+    if let Ok(out) = std::env::var("CADENCE_PROBE_OUT") {
+        std::fs::write(out, summary.to_string()).unwrap();
+    }
+    pi.close();
 }
 
 /// CAD-322 round 2/3 (I4): close → reopen → first turn, with the race

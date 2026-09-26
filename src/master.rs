@@ -114,9 +114,18 @@ pub const CLAUDE_ALLOWED_TOOLS: &[&str] = &[
     "Bash(cadence issue ls)",
     "Bash(cadence issue ls *)",
     "Bash(cadence issue show *)",
+    "Bash(cadence issue log *)",
+    "Bash(cadence issue epic ls)",
+    "Bash(cadence issue epic ls *)",
+    "Bash(cadence issue epic show *)",
     "Bash(cadence issue project ls)",
     "Bash(cadence issue project ls *)",
+    "Bash(cadence plan ls)",
+    "Bash(cadence plan ls *)",
     "Bash(cadence plan show *)",
+    "Bash(cadence thread show *)",
+    "Bash(cadence overview)",
+    "Bash(cadence overview *)",
     "Bash(cadence plan propose *)",
     "Bash(cadence project new *)",
     "Bash(cadence master dispatch *)",
@@ -1085,6 +1094,37 @@ mod tests {
         let agent = text.find("agent text").unwrap();
         assert!(soul < agent, "{text}");
         assert!(text.contains("<!-- agents/master/AGENT.md -->"));
+    }
+
+    /// CAD-552: the briefing names every allowlisted verb — a tool
+    /// added to [`CLAUDE_ALLOWED_TOOLS`] without a line in AGENT.md
+    /// fails here, and so does a documented verb dropped from the
+    /// allowlist. The grammar's rules table derives from the same
+    /// constant, so this pins briefing ↔ guard.
+    #[test]
+    fn briefing_names_every_allowlisted_verb() {
+        for tool in CLAUDE_ALLOWED_TOOLS {
+            let inner = tool
+                .strip_prefix("Bash(")
+                .and_then(|t| t.strip_suffix(')'))
+                .unwrap_or_else(|| panic!("{tool} is not a Bash(…) rule"));
+            let stem = inner.strip_suffix(" *").unwrap_or(inner);
+            assert!(
+                AGENT_TEMPLATE.contains(stem),
+                "AGENT.md never mentions `{stem}`"
+            );
+        }
+        for rule in [
+            "no pipes",
+            "ONE `cadence",
+            "--json",
+            "issue ls --summary --json",
+        ] {
+            assert!(
+                AGENT_TEMPLATE.contains(rule),
+                "AGENT.md is missing the command rule `{rule}`"
+            );
+        }
     }
 
     /// CAD-439: the master's confinement names the system trees, the
