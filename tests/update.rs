@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use cadence_agent::error::{Error, Result};
+use cadence_agent::rollout::SCHEMA_VERSION;
 use cadence_agent::store::Store;
 use cadence_agent::test_seam::{self, Asserted};
 use cadence_agent::update::{
@@ -98,7 +99,7 @@ impl Fake {
             artifact: ArtifactState::Present,
             attestation_ok: true,
             titles: vec!["CAD-560: a merged change (#320)".into()],
-            schema: Some(18),
+            schema: Some(SCHEMA_VERSION),
             calls: RefCell::new(Vec::new()),
         }
     }
@@ -515,8 +516,8 @@ fn check_reports_versions_changes_schema_and_blockers_without_changing_anything(
     assert_eq!(report.target, NEW);
     assert!(!report.up_to_date);
     assert_eq!(report.changes, vec!["CAD-560: a merged change (#320)"]);
-    assert_eq!(report.schema_current, Some(18));
-    assert_eq!(report.schema_target, Some(18));
+    assert_eq!(report.schema_current, Some(SCHEMA_VERSION));
+    assert_eq!(report.schema_target, Some(SCHEMA_VERSION));
     assert!(!report.migration);
     assert!(
         report
@@ -536,7 +537,10 @@ fn check_reports_versions_changes_schema_and_blockers_without_changing_anything(
     assert!(lines.contains("current: aaaa"), "{lines}");
     assert!(lines.contains("available: bbbb"), "{lines}");
     assert!(lines.contains("CAD-560"), "{lines}");
-    assert!(lines.contains("schema: no change (18)"), "{lines}");
+    assert!(
+        lines.contains(&format!("schema: no change ({SCHEMA_VERSION})")),
+        "{lines}"
+    );
     assert!(
         lines.contains("waiting for 1 turn: swe-554 (12m)"),
         "{lines}"
@@ -546,10 +550,14 @@ fn check_reports_versions_changes_schema_and_blockers_without_changing_anything(
 #[test]
 fn check_reports_a_migration_and_a_lease_held_by_another_identity() {
     let mut host = Host::new();
-    host.source.schema = Some(19);
+    host.source.schema = Some(SCHEMA_VERSION + 1);
     claim_other(&host);
     let report = test_seam::scoped(Asserted::Operator, || update::check(&host)).unwrap();
-    assert!(report.migration, "schema 19 > 18");
+    assert!(
+        report.migration,
+        "schema {} > {SCHEMA_VERSION}",
+        SCHEMA_VERSION + 1
+    );
     assert!(
         report.blockers.iter().any(
             |b| b == "update in progress by operator:someone-else since "
@@ -558,7 +566,10 @@ fn check_reports_a_migration_and_a_lease_held_by_another_identity() {
         "{:?}",
         report.blockers
     );
-    assert!(report.lines().join("\n").contains("migration 18 → 19"));
+    assert!(report.lines().join("\n").contains(&format!(
+        "migration {SCHEMA_VERSION} → {}",
+        SCHEMA_VERSION + 1
+    )));
 }
 
 #[test]
@@ -1372,7 +1383,9 @@ fn rollback_returns_to_the_previous_release_and_offers_the_restore_when_the_sche
         "{log}"
     );
     assert!(
-        log.contains(&format!("the store schema (18) is newer than {OLD}'s (17)")),
+        log.contains(&format!(
+            "the store schema ({SCHEMA_VERSION}) is newer than {OLD}'s (17)"
+        )),
         "{log}"
     );
     assert!(log.contains("cadence restore"), "{log}");
