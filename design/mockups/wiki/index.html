@@ -1,0 +1,529 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>cadence — wiki mockup</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../tokens.css">
+<link rel="stylesheet" href="../../kit.css">
+<link rel="stylesheet" href="wiki.css">
+<script>
+(function () {
+  try {
+    var p = localStorage.getItem("cadence-theme");
+    if (p === "light" || p === "dark") document.documentElement.setAttribute("data-theme", p);
+  } catch (e) {}
+})();
+</script>
+</head>
+<body>
+<div class="shell">
+
+  <aside class="side">
+    <div class="brand">
+      <svg width="25" height="25" viewBox="0 0 1024 1024" fill="none" role="img" aria-label="cadence">
+        <defs><linearGradient id="cadence-lit" x1="0" y1="0" x2="0.574" y2="0.819"><stop offset="0" stop-color="#2DD4BF"/><stop offset="1" stop-color="#22D3EE"/></linearGradient></defs>
+        <rect x="20" y="20" width="984" height="984" rx="214" fill="#0B0B0C" stroke="#2e3136" stroke-width="40"/>
+        <path d="M 280 336 L 512 512 L 280 688" stroke="url(#cadence-lit)" stroke-width="160" stroke-linecap="round" stroke-linejoin="round"/>
+        <rect x="640" y="656" width="176" height="80" rx="40" fill="#2DD4BF" fill-opacity="0.8"/>
+      </svg>
+      <span>cadence<small>&nbsp;board</small></span>
+    </div>
+    <nav class="nav">
+      <a class="navlink" href="#"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="5.5"/><path d="M8 5.5v3l2 1.4"/></svg>Home</a>
+      <a class="navlink" href="#"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="1.5" y="2" width="3.6" height="12" rx="1"/><rect x="6.2" y="2" width="3.6" height="8" rx="1"/><rect x="10.9" y="2" width="3.6" height="10" rx="1"/></svg>Projects</a>
+      <a class="navlink" href="#/page" aria-current="page"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3.5 1.8h6l3 3v9.4h-9z"/><path d="M5.8 7.5h4.4M5.8 10h4.4"/></svg>Wiki</a>
+      <a class="navlink" href="#"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2" y="3" width="12" height="8.5" rx="1.2"/><path d="M5.5 14h5"/></svg>Agents</a>
+      <a class="navlink" href="#"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 5.5h12v8a1 1 0 01-1 1H3a1 1 0 01-1-1v-8z"/><path d="M2 5.5l2-3h8l2 3"/><path d="M6.5 8.5h3"/></svg>Outbox</a>
+      <a class="navlink" href="#"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.8v1.6M8 12.6v1.6M1.8 8h1.6M12.6 8h1.6M3.4 3.4l1.1 1.1M11.5 11.5l1.1 1.1M12.6 3.4l-1.1 1.1M4.5 11.5l-1.1 1.1"/></svg>Settings</a>
+    </nav>
+    <div class="slabel side-label"><span>Projects</span><span style="font-size:10px">~/pm</span></div>
+    <div class="nav" style="gap:2px">
+      <a class="proj on" href="#"><span style="overflow:hidden;text-overflow:ellipsis">cadence</span><span class="num muted" style="font-size:var(--text-micro)">CAD 12</span></a>
+    </div>
+    <div class="side-foot">
+      <div class="slabel" style="margin-bottom:4px">session</div>
+      agent swe-1 · wiki<br><span class="num" style="font-size:var(--text-micro)">~/pm/wiki</span>
+    </div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <div class="crumb"><span>cadence</span> / <b>wiki</b></div>
+      <div class="spacer">
+        <span class="chip" style="background:color-mix(in srgb, var(--color-warn) 10%, transparent);color:var(--color-warn)">MOCKUP</span>
+        <span class="chip" style="background:var(--color-ink-800);color:var(--color-ink-400)">you: swe-1</span>
+        <button class="tg" id="theme-toggle" title="theme" aria-label="theme"></button>
+      </div>
+    </header>
+
+    <div class="body no-rail">
+      <main class="content wcontent">
+        <div class="wsplit">
+
+          <!-- FOLDER TREE (left pane, shared across views) -->
+          <div class="wtree">
+            <div class="slabel" style="margin:0 8px 8px">~/pm/wiki</div>
+            <div class="tree" id="wtree">
+              <div class="trow dir open" data-route="#/browse-global">
+                <svg class="caret ticon" width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3.5 2l3 3-3 3"/></svg>
+                <svg class="tkind" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 4.5h4l1.2 1.5H14v6.5a1 1 0 01-1 1H3a1 1 0 01-1-1v-8z"/></svg>
+                <span class="tname">global/</span>
+                <svg class="lock" width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3.2" y="7" width="9.6" height="6.8" rx="1.4"/><path d="M5.6 7V5.2a2.4 2.4 0 014.8 0V7"/></svg>
+              </div>
+              <div class="trow" style="padding-left:34px" data-route="#/browse-global"><span class="tname">glossary.md</span><span class="tmeta num">2.1k</span></div>
+              <div class="trow" style="padding-left:34px" data-route="#/browse-global"><span class="tname">conventions.md</span><span class="tmeta num">3.4k</span></div>
+
+              <div class="trow dir open" data-route="#/folder">
+                <svg class="caret ticon" width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3.5 2l3 3-3 3"/></svg>
+                <svg class="tkind" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 4.5h4l1.2 1.5H14v6.5a1 1 0 01-1 1H3a1 1 0 01-1-1v-8z"/></svg>
+                <span class="tname">projects/</span>
+              </div>
+              <div class="trow dir open" style="padding-left:18px" data-route="#/folder">
+                <svg class="caret ticon" width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3.5 2l3 3-3 3"/></svg>
+                <svg class="tkind" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 4.5h4l1.2 1.5H14v6.5a1 1 0 01-1 1H3a1 1 0 01-1-1v-8z"/></svg>
+                <span class="tname">cadence/</span>
+              </div>
+              <div class="trow" style="padding-left:52px" data-route="#/folder"><span class="tname">design/</span><span class="tmeta num">6</span></div>
+              <div class="trow" style="padding-left:52px" data-route="#/page"><span class="tname">notes.md</span><span class="tmeta num">4.8k</span></div>
+
+              <div class="trow dir open" data-route="#/agent">
+                <svg class="caret ticon" width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3.5 2l3 3-3 3"/></svg>
+                <svg class="tkind" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 4.5h4l1.2 1.5H14v6.5a1 1 0 01-1 1H3a1 1 0 01-1-1v-8z"/></svg>
+                <span class="tname">agents/</span>
+              </div>
+              <div class="trow dir" style="padding-left:18px" data-route="#/agent">
+                <svg class="caret ticon" width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3.5 2l3 3-3 3"/></svg>
+                <svg class="tkind" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 4.5h4l1.2 1.5H14v6.5a1 1 0 01-1 1H3a1 1 0 01-1-1v-8z"/></svg>
+                <span class="tname">master/</span>
+                <svg class="lock" width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3.2" y="7" width="9.6" height="6.8" rx="1.4"/><path d="M5.6 7V5.2a2.4 2.4 0 014.8 0V7"/></svg>
+              </div>
+              <div class="trow dir" style="padding-left:18px" data-route="#/empty">
+                <svg class="caret ticon" width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3.5 2l3 3-3 3"/></svg>
+                <svg class="tkind" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 4.5h4l1.2 1.5H14v6.5a1 1 0 01-1 1H3a1 1 0 01-1-1v-8z"/></svg>
+                <span class="tname">swe-1/</span><span class="kicker" style="font-size:var(--text-micro)">you</span>
+              </div>
+
+              <div class="trow dir" data-route="#/denied">
+                <svg class="caret ticon" width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3.5 2l3 3-3 3"/></svg>
+                <svg class="tkind" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 4.5h4l1.2 1.5H14v6.5a1 1 0 01-1 1H3a1 1 0 01-1-1v-8z"/></svg>
+                <span class="tname">users/</span>
+                <svg class="lock" width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3.2" y="7" width="9.6" height="6.8" rx="1.4"/><path d="M5.6 7V5.2a2.4 2.4 0 014.8 0V7"/></svg>
+              </div>
+            </div>
+          </div>
+
+          <!-- CONTENT (right pane — one section per route) -->
+          <div class="wpane" id="wpane">
+
+            <!-- ======== /page — rendered markdown ======== -->
+            <section data-view="page">
+              <div class="wbar">
+                <div class="crumbs"><a href="#/folder">projects</a><span class="sep">/</span><a href="#/folder">cadence</a><span class="sep">/</span><b>notes.md</b></div>
+                <div class="wtools">
+                  <button class="btn"><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 3v10M3 8h10"/></svg>New page</button>
+                  <button class="btn"><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 4.5h4l1.2 1.5H14v6.5a1 1 0 01-1 1H3a1 1 0 01-1-1v-8z"/></svg>New folder</button>
+                  <a class="btn" href="#/upload"><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 11V4M8 4L5 7M8 4l3 3"/><path d="M2 11.5v1.5a1 1 0 001 1h10a1 1 0 001-1v-1.5"/></svg>Upload</a>
+                  <button class="btn"><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 10V2M8 10l-3-3M8 10l3-3"/><path d="M2 11.5v1.5a1 1 0 001 1h10a1 1 0 001-1v-1.5"/></svg>Download</button>
+                  <a class="btn" href="#/search"><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></svg>Search</a>
+                </div>
+              </div>
+              <div class="pagehead">
+                <h1>notes.md</h1>
+                <span class="meta">last edited by <b>master</b> · 2 h ago · rev <span class="num">a41f9c2</span></span>
+                <div class="wtools">
+                  <a class="btn" href="#/history"><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="5.5"/><path d="M8 4.5V8l2.4 1.6"/></svg>History</a>
+                  <a class="btn btn-acc" href="#/edit"><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M10.8 2.8l2.4 2.4L6 12.4l-3 .6.6-3z"/></svg>Edit</a>
+                </div>
+              </div>
+              <div class="md card pad">
+                <h2>Board shell conventions</h2>
+                <p>Working notes on how the board composes its shell. The left nav is <code>208px</code>, sticky, and owns project scope. The header carries status chips only — never actions that mutate.</p>
+                <ul>
+                  <li>Colours come from tokens, never literals.</li>
+                  <li>Every screen fits <code>.shell &gt; .side + .main</code>.</li>
+                  <li>Right rail is optional context — delete it for full-width tools.</li>
+                </ul>
+                <h3>Open questions</h3>
+                <blockquote>Does the wiki tree need a "recently changed" filter, or is search enough? — master</blockquote>
+                <pre><code>~/pm/wiki/
+├── global/          # operator-only
+├── projects/&lt;key&gt;/  # agents write here
+├── agents/&lt;alias&gt;/  # own folder only
+└── users/&lt;user&gt;/    # private</code></pre>
+                <p>Uploads cap at <code>100 MB</code>. Bigger artifacts belong in agent-notes, linked not copied.</p>
+              </div>
+            </section>
+
+            <!-- ======== /browse-global — read-only folder listing ======== -->
+            <section data-view="browse-global" hidden>
+              <div class="wbar">
+                <div class="crumbs"><b>global/</b></div>
+                <div class="wtools">
+                  <button class="btn" aria-disabled="true" disabled><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 3v10M3 8h10"/></svg>New page</button>
+                  <a class="btn" href="#/search"><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></svg>Search</a>
+                </div>
+              </div>
+              <div class="note warn"><svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3.2" y="7" width="9.6" height="6.8" rx="1.4"/><path d="M5.6 7V5.2a2.4 2.4 0 014.8 0V7"/></svg>global/ is operator-only — you can read, not write.</div>
+              <div class="flist">
+                <div class="frow"><svg class="ficon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3.5 1.8h6l3 3v9.4h-9z"/></svg><span class="fname">glossary.md</span><span class="fsub">edited by operator · 3 d ago</span><span class="fsize">2.1 KB</span></div>
+                <div class="frow"><svg class="ficon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3.5 1.8h6l3 3v9.4h-9z"/></svg><span class="fname">conventions.md</span><span class="fsub">edited by operator · 1 wk ago</span><span class="fsize">3.4 KB</span></div>
+              </div>
+            </section>
+
+            <!-- ======== /folder — folder view, grid/list toggle ======== -->
+            <section data-view="folder" hidden>
+              <div class="wbar">
+                <div class="crumbs"><a href="#/folder">projects</a><span class="sep">/</span><a href="#/folder">cadence</a><span class="sep">/</span><b>design/</b></div>
+                <div class="wtools">
+                  <span class="vt" role="group" aria-label="view">
+                    <button class="on" id="vgrid" title="grid"><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2" y="2" width="5" height="5" rx="1"/><rect x="9" y="2" width="5" height="5" rx="1"/><rect x="2" y="9" width="5" height="5" rx="1"/><rect x="9" y="9" width="5" height="5" rx="1"/></svg></button>
+                    <button id="vlist" title="list"><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.5 4h11M2.5 8h11M2.5 12h11"/></svg></button>
+                  </span>
+                  <button class="btn"><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 3v10M3 8h10"/></svg>New page</button>
+                  <button class="btn"><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 4.5h4l1.2 1.5H14v6.5a1 1 0 01-1 1H3a1 1 0 01-1-1v-8z"/></svg>New folder</button>
+                  <a class="btn" href="#/upload"><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 11V4M8 4L5 7M8 4l3 3"/><path d="M2 11.5v1.5a1 1 0 001 1h10a1 1 0 001-1v-1.5"/></svg>Upload</a>
+                  <button class="btn"><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 10V2M8 10l-3-3M8 10l3-3"/><path d="M2 11.5v1.5a1 1 0 001 1h10a1 1 0 001-1v-1.5"/></svg>Download</button>
+                  <a class="btn" href="#/search"><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></svg>Search</a>
+                </div>
+              </div>
+              <div id="folder-grid" class="fgrid">
+                <div class="ftile" data-goto="#/page">
+                  <div class="fthumb"><svg width="22" height="22" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M3.5 1.8h6l3 3v9.4h-9z"/><path d="M5.8 7.5h4.4M5.8 10h4.4"/></svg></div>
+                  <button class="fmenu-btn" data-menu>⋯</button>
+                  <div class="fmenu" hidden><button>Rename</button><button>Move</button><button>Download</button><button class="danger">Delete</button></div>
+                  <div class="fmeta"><span class="fname">tokens.md</span><span class="fsize">5.2 KB</span></div>
+                </div>
+                <div class="ftile" data-goto="#/page">
+                  <div class="fthumb"><svg width="22" height="22" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M3.5 1.8h6l3 3v9.4h-9z"/><path d="M5.8 7.5h4.4M5.8 10h4.4"/></svg></div>
+                  <button class="fmenu-btn" data-menu>⋯</button>
+                  <div class="fmenu" hidden><button>Rename</button><button>Move</button><button>Download</button><button class="danger">Delete</button></div>
+                  <div class="fmeta"><span class="fname">kit-readme.md</span><span class="fsize">3.1 KB</span></div>
+                </div>
+                <div class="ftile" data-goto="#/preview/image">
+                  <div class="fthumb thumb-a"><span class="grid-lines"></span><svg width="22" height="22" viewBox="0 0 16 16" fill="none" stroke="#fff" stroke-width="1.3"><rect x="2" y="2.5" width="12" height="11" rx="1.2"/><circle cx="5.6" cy="6.4" r="1.3"/><path d="M3 12.5l3.4-3.4 2.4 2.4 2.6-2.6 2.6 2.6"/></svg></div>
+                  <button class="fmenu-btn" data-menu>⋯</button>
+                  <div class="fmenu" hidden><button>Rename</button><button>Move</button><button>Download</button><button class="danger">Delete</button></div>
+                  <div class="fmeta"><span class="fname">board-v5.png</span><span class="fsize">412 KB</span></div>
+                </div>
+                <div class="ftile" data-goto="#/preview/image">
+                  <div class="fthumb thumb-b"><span class="grid-lines"></span><svg width="22" height="22" viewBox="0 0 16 16" fill="none" stroke="#fff" stroke-width="1.3"><rect x="2" y="2.5" width="12" height="11" rx="1.2"/><circle cx="5.6" cy="6.4" r="1.3"/><path d="M3 12.5l3.4-3.4 2.4 2.4 2.6-2.6 2.6 2.6"/></svg></div>
+                  <button class="fmenu-btn" data-menu>⋯</button>
+                  <div class="fmenu" hidden><button>Rename</button><button>Move</button><button>Download</button><button class="danger">Delete</button></div>
+                  <div class="fmeta"><span class="fname">kit-gallery.png</span><span class="fsize">288 KB</span></div>
+                </div>
+                <div class="ftile" data-goto="#/preview/video">
+                  <div class="fthumb thumb-c"><span class="grid-lines"></span><svg width="22" height="22" viewBox="0 0 16 16" fill="none" stroke="#fff" stroke-width="1.3"><rect x="2" y="2.5" width="12" height="11" rx="1.2"/><path d="M6.5 5.5l4 2.5-4 2.5z" fill="#fff" stroke="none"/></svg><span class="dur">1:24</span></div>
+                  <button class="fmenu-btn" data-menu>⋯</button>
+                  <div class="fmenu" hidden><button>Rename</button><button>Move</button><button>Download</button><button class="danger">Delete</button></div>
+                  <div class="fmeta"><span class="fname">demo-cut.mp4</span><span class="fsize">18 MB</span></div>
+                </div>
+                <div class="ftile" data-goto="#/preview/pdf">
+                  <div class="fthumb"><svg width="22" height="22" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M3.5 1.8h6l3 3v9.4h-9z"/><path d="M6.5 6.5h3v1h-3zM6.5 9h3v1h-3zM6.5 11.5h2v1h-2z"/></svg><span class="chip" style="position:absolute;left:6px;top:6px;background:var(--color-ink-800);color:var(--color-ink-400)">PDF</span></div>
+                  <button class="fmenu-btn" data-menu>⋯</button>
+                  <div class="fmenu" hidden><button>Rename</button><button>Move</button><button>Download</button><button class="danger">Delete</button></div>
+                  <div class="fmeta"><span class="fname">spec-draft.pdf</span><span class="fsize">1.2 MB</span></div>
+                </div>
+                <div class="ftile">
+                  <div class="fthumb"><svg width="22" height="22" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M8 2.5v8M8 10.5l-3-3M8 10.5l3-3"/><path d="M3 2.5h10v11H3z" opacity=".4"/></svg><span class="chip" style="position:absolute;left:6px;top:6px;background:var(--color-ink-800);color:var(--color-ink-400)">ZIP</span></div>
+                  <button class="fmenu-btn" data-menu>⋯</button>
+                  <div class="fmenu" hidden><button>Rename</button><button>Move</button><button>Download</button><button class="danger">Delete</button></div>
+                  <div class="fmeta"><span class="fname">exports.zip</span><span class="fsize">6.4 MB</span></div>
+                </div>
+              </div>
+              <div id="folder-list" class="flist" hidden>
+                <div class="frow"><svg class="ficon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3.5 1.8h6l3 3v9.4h-9z"/></svg><span class="fname">tokens.md</span><span class="fsub">page</span><span class="fsize">5.2 KB</span><button class="fmenu-btn" data-menu>⋯</button><div class="fmenu" hidden style="right:8px;top:26px"><button>Rename</button><button>Move</button><button>Download</button><button class="danger">Delete</button></div></div>
+                <div class="frow"><svg class="ficon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3.5 1.8h6l3 3v9.4h-9z"/></svg><span class="fname">kit-readme.md</span><span class="fsub">page</span><span class="fsize">3.1 KB</span><button class="fmenu-btn" data-menu>⋯</button><div class="fmenu" hidden style="right:8px;top:26px"><button>Rename</button><button>Move</button><button>Download</button><button class="danger">Delete</button></div></div>
+                <div class="frow"><svg class="ficon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2" y="2.5" width="12" height="11" rx="1.2"/><circle cx="5.6" cy="6.4" r="1.3"/></svg><span class="fname">board-v5.png</span><span class="fsub">image</span><span class="fsize">412 KB</span><button class="fmenu-btn" data-menu>⋯</button><div class="fmenu" hidden style="right:8px;top:26px"><button>Rename</button><button>Move</button><button>Download</button><button class="danger">Delete</button></div></div>
+                <div class="frow"><svg class="ficon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2" y="2.5" width="12" height="11" rx="1.2"/><circle cx="5.6" cy="6.4" r="1.3"/></svg><span class="fname">kit-gallery.png</span><span class="fsub">image</span><span class="fsize">288 KB</span><button class="fmenu-btn" data-menu>⋯</button><div class="fmenu" hidden style="right:8px;top:26px"><button>Rename</button><button>Move</button><button>Download</button><button class="danger">Delete</button></div></div>
+                <div class="frow"><svg class="ficon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2" y="2.5" width="12" height="11" rx="1.2"/><path d="M6.5 5.5l4 2.5-4 2.5z"/></svg><span class="fname">demo-cut.mp4</span><span class="fsub">video · 1:24</span><span class="fsize">18 MB</span><button class="fmenu-btn" data-menu>⋯</button><div class="fmenu" hidden style="right:8px;top:26px"><button>Rename</button><button>Move</button><button>Download</button><button class="danger">Delete</button></div></div>
+                <div class="frow"><svg class="ficon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3.5 1.8h6l3 3v9.4h-9z"/></svg><span class="fname">spec-draft.pdf</span><span class="fsub">pdf</span><span class="fsize">1.2 MB</span><button class="fmenu-btn" data-menu>⋯</button><div class="fmenu" hidden style="right:8px;top:26px"><button>Rename</button><button>Move</button><button>Download</button><button class="danger">Delete</button></div></div>
+                <div class="frow"><svg class="ficon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3 2.5h10v11H3z"/></svg><span class="fname">exports.zip</span><span class="fsub">archive</span><span class="fsize">6.4 MB</span><button class="fmenu-btn" data-menu>⋯</button><div class="fmenu" hidden style="right:8px;top:26px"><button>Rename</button><button>Move</button><button>Download</button><button class="danger">Delete</button></div></div>
+              </div>
+            </section>
+
+            <!-- ======== /edit — split editor + conflict banner ======== -->
+            <section data-view="edit" hidden>
+              <div class="wbar">
+                <div class="crumbs"><a href="#/folder">projects</a><span class="sep">/</span><a href="#/folder">cadence</a><span class="sep">/</span><b>notes.md</b><span class="sep">·</span><span>editing</span></div>
+                <div class="wtools">
+                  <a class="btn" href="#/page">Cancel</a>
+                  <a class="btn btn-acc" href="#/page"><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3 8.5l3.4 3.4L13 5"/></svg>Save</a>
+                </div>
+              </div>
+              <div class="esplit">
+                <div class="conflict"><svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M8 2.4L14.4 13.2H1.6L8 2.4z"/><path d="M8 6.6v3"/><circle cx="8" cy="11.4" r=".7" fill="currentColor" stroke="none"/></svg>changed since you opened it — <b>&nbsp;master saved rev a41f9c2&nbsp;</b> <button class="btn">review diff</button> <button class="btn">reload</button></div>
+                <div class="ehead"><span>source</span><span>preview</span></div>
+                <pre class="esrc" contenteditable="true" spellcheck="false">## Board shell conventions
+
+Working notes on how the board composes
+its shell. The left nav is `208px`,
+sticky, and owns project scope. The
+header carries status chips only —
+never actions that mutate.
+
+- Colours come from tokens, never
+  literals.
+- Every screen fits
+  `.shell > .side + .main`.
+- Right rail is optional context —
+  delete it for full-width tools.
+
+### Open questions
+
+&gt; Does the wiki tree need a "recently
+&gt; changed" filter, or is search
+&gt; enough? — master
+
+Uploads cap at `100 MB`.</pre>
+                <div class="eprev md">
+                  <h2>Board shell conventions</h2>
+                  <p>Working notes on how the board composes its shell. The left nav is <code>208px</code>, sticky, and owns project scope. The header carries status chips only — never actions that mutate.</p>
+                  <ul>
+                    <li>Colours come from tokens, never literals.</li>
+                    <li>Every screen fits <code>.shell &gt; .side + .main</code>.</li>
+                    <li>Right rail is optional context — delete it for full-width tools.</li>
+                  </ul>
+                  <h3>Open questions</h3>
+                  <blockquote>Does the wiki tree need a "recently changed" filter, or is search enough? — master</blockquote>
+                  <p>Uploads cap at <code>100 MB</code>.</p>
+                </div>
+              </div>
+              <p class="muted" style="font-size:var(--text-label);margin-top:10px">Save commits to the tracker (~/pm/wiki is a git repo) with the acting agent as author.</p>
+            </section>
+
+            <!-- ======== /upload — drop overlay + progress ======== -->
+            <section data-view="upload" hidden>
+              <div class="wbar">
+                <div class="crumbs"><a href="#/folder">projects</a><span class="sep">/</span><a href="#/folder">cadence</a><span class="sep">/</span><b>design/</b></div>
+                <div class="wtools"><a class="btn" href="#/folder">Done</a></div>
+              </div>
+              <div class="wpane-wrap">
+                <div class="ovr">
+                  <div class="ovr-box">
+                    <svg width="34" height="34" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2"><path d="M8 11V4M8 4L5 7M8 4l3 3"/><path d="M2 11.5v1.5a1 1 0 001 1h10a1 1 0 001-1v-1.5"/></svg>
+                    <div style="font-size:var(--text-cardtitle);font-weight:600">Drop files to upload</div>
+                    <div class="kicker">into projects/cadence/design/ · 100 MB per file</div>
+                  </div>
+                </div>
+                <div class="fgrid" style="opacity:.35;pointer-events:none">
+                  <div class="ftile"><div class="fthumb"></div><div class="fmeta"><span class="fname">tokens.md</span><span class="fsize">5.2 KB</span></div></div>
+                  <div class="ftile"><div class="fthumb thumb-a"></div><div class="fmeta"><span class="fname">board-v5.png</span><span class="fsize">412 KB</span></div></div>
+                  <div class="ftile"><div class="fthumb thumb-c"></div><div class="fmeta"><span class="fname">demo-cut.mp4</span><span class="fsize">18 MB</span></div></div>
+                </div>
+              </div>
+              <div class="uplist">
+                <div class="slabel" style="margin-top:18px">uploads · 4</div>
+                <div class="uprow done"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2" y="2.5" width="12" height="11" rx="1.2"/><circle cx="5.6" cy="6.4" r="1.3"/></svg><span class="uname">hero-dark.png</span><span class="usize">640 KB</span><span class="ustate"><svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3 8.5l3.4 3.4L13 5"/></svg>done</span></div>
+                <div class="uprow"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3.5 1.8h6l3 3v9.4h-9z"/></svg><span class="uname">kit-notes.md</span><span class="usize">8.1 KB</span><span class="ustate"><span class="upbar"><i style="width:72%"></i></span><span class="num">72%</span></span></div>
+                <div class="uprow"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2" y="2.5" width="12" height="11" rx="1.2"/><path d="M6.5 5.5l4 2.5-4 2.5z"/></svg><span class="uname">walkthrough.mp4</span><span class="usize">44 MB</span><span class="ustate"><span class="upbar"><i style="width:31%"></i></span><span class="num">31%</span></span></div>
+                <div class="uprow err"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2" y="2.5" width="12" height="11" rx="1.2"/><path d="M6.5 5.5l4 2.5-4 2.5z"/></svg><span class="uname">full-recording.mp4</span><span class="usize">212 MB</span><span class="ustate"><svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M8 2.4L14.4 13.2H1.6L8 2.4z"/><path d="M8 6.6v3"/><circle cx="8" cy="11.4" r=".7" fill="currentColor" stroke="none"/></svg>over 100 MB — rejected</span></div>
+                <div class="uprow err"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3 2.5h10v11H3z"/></svg><span class="uname">dataset.tar</span><span class="usize">188 MB</span><span class="ustate"><svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M8 2.4L14.4 13.2H1.6L8 2.4z"/><path d="M8 6.6v3"/><circle cx="8" cy="11.4" r=".7" fill="currentColor" stroke="none"/></svg>over 100 MB — rejected</span></div>
+              </div>
+            </section>
+
+            <!-- ======== /preview/image ======== -->
+            <section data-view="preview/image" hidden>
+              <div class="wbar">
+                <div class="crumbs"><a href="#/folder">projects</a><span class="sep">/</span><a href="#/folder">cadence</a><span class="sep">/</span><a href="#/folder">design</a><span class="sep">/</span><b>board-v5.png</b></div>
+                <div class="wtools"><a class="btn" href="#/folder">Back</a><button class="btn"><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 10V2M8 10l-3-3M8 10l3-3"/><path d="M2 11.5v1.5a1 1 0 001 1h10a1 1 0 001-1v-1.5"/></svg>Download</button></div>
+              </div>
+              <div class="pstage">
+                <svg class="fakeimg" width="640" height="380" viewBox="0 0 640 380" role="img" aria-label="board-v5.png preview">
+                  <defs><linearGradient id="imgA" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#134e4a"/><stop offset=".55" stop-color="#0f766e"/><stop offset="1" stop-color="#2dd4bf"/></linearGradient></defs>
+                  <rect width="640" height="380" fill="url(#imgA)"/>
+                  <g stroke="#ffffff" stroke-opacity=".14"><path d="M0 95h640M0 190h640M0 285h640M160 0v380M320 0v380M480 0v380"/></g>
+                  <rect x="60" y="70" width="180" height="240" rx="8" fill="#0b0b0c" fill-opacity=".55"/>
+                  <rect x="280" y="110" width="300" height="20" rx="4" fill="#ffffff" fill-opacity=".25"/>
+                  <rect x="280" y="150" width="240" height="12" rx="4" fill="#ffffff" fill-opacity=".15"/>
+                  <rect x="280" y="176" width="270" height="12" rx="4" fill="#ffffff" fill-opacity=".15"/>
+                </svg>
+              </div>
+              <div class="pmeta"><span class="num">board-v5.png</span><span>412 KB</span><span>1600×950</span><span>uploaded by swe-1 · 4 h ago</span></div>
+            </section>
+
+            <!-- ======== /preview/video ======== -->
+            <section data-view="preview/video" hidden>
+              <div class="wbar">
+                <div class="crumbs"><a href="#/folder">projects</a><span class="sep">/</span><a href="#/folder">cadence</a><span class="sep">/</span><a href="#/folder">design</a><span class="sep">/</span><b>demo-cut.mp4</b></div>
+                <div class="wtools"><a class="btn" href="#/folder">Back</a><button class="btn"><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 10V2M8 10l-3-3M8 10l3-3"/><path d="M2 11.5v1.5a1 1 0 001 1h10a1 1 0 001-1v-1.5"/></svg>Download</button></div>
+              </div>
+              <div class="pstage">
+                <div class="player">
+                  <div class="pscreen">
+                    <button class="pbtn"><svg width="26" height="26" viewBox="0 0 16 16" fill="currentColor"><path d="M4.5 3.2v9.6L12.8 8z"/></svg></button>
+                  </div>
+                  <div class="pbar">
+                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M4.5 3.2v9.6L12.8 8z"/></svg>
+                    <span class="num">0:32</span>
+                    <span class="ptrack"><i></i></span>
+                    <span class="num">1:24</span>
+                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 6v4h2.5l3.5 3V3L4.5 6z"/><path d="M10.5 5.5a4 4 0 010 5"/></svg>
+                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M6 2.5H2.5V6M10 2.5h3.5V6M6 13.5H2.5V10M10 13.5h3.5V10"/></svg>
+                  </div>
+                </div>
+              </div>
+              <div class="pmeta"><span class="num">demo-cut.mp4</span><span>18 MB</span><span>1920×1080 · 1:24</span><span>uploaded by swe-1 · 1 d ago</span></div>
+            </section>
+
+            <!-- ======== /preview/pdf ======== -->
+            <section data-view="preview/pdf" hidden>
+              <div class="wbar">
+                <div class="crumbs"><a href="#/folder">projects</a><span class="sep">/</span><a href="#/folder">cadence</a><span class="sep">/</span><a href="#/folder">design</a><span class="sep">/</span><b>spec-draft.pdf</b></div>
+                <div class="wtools">
+                  <span class="chip" style="background:var(--color-ink-800);color:var(--color-ink-400)">page 1 / 6</span>
+                  <a class="btn" href="#/folder">Back</a>
+                  <button class="btn"><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 10V2M8 10l-3-3M8 10l3-3"/><path d="M2 11.5v1.5a1 1 0 001 1h10a1 1 0 001-1v-1.5"/></svg>Download</button>
+                </div>
+              </div>
+              <div class="pstage">
+                <div class="pdfpage">
+                  <div class="kicker" style="color:#6b7280">cadence wiki — draft</div>
+                  <h3>Storage layout &amp; permissions</h3>
+                  <div class="pl" style="width:94%"></div><div class="pl" style="width:88%"></div><div class="pl" style="width:91%"></div>
+                  <div class="pl" style="width:60%"></div>
+                  <div class="pl" style="width:96%"></div><div class="pl" style="width:83%"></div><div class="pl" style="width:70%"></div>
+                  <div class="pl" style="width:88%"></div><div class="pl" style="width:52%"></div>
+                </div>
+              </div>
+              <div class="pmeta"><span class="num">spec-draft.pdf</span><span>1.2 MB</span><span>6 pages</span><span>uploaded by master · 3 d ago</span></div>
+            </section>
+
+            <!-- ======== /search ======== -->
+            <section data-view="search" hidden>
+              <div class="wbar">
+                <div class="sinput" style="flex:1;max-width:460px"><input class="field" value="tokens" aria-label="search"></div>
+                <div class="wtools">
+                  <button class="fchip on">all</button>
+                  <button class="fchip">pages</button>
+                  <button class="fchip">images</button>
+                  <button class="fchip">video</button>
+                  <button class="fchip">pdf</button>
+                </div>
+              </div>
+              <div class="sres">
+                <div class="card srow">
+                  <div class="spath">projects/cadence/design/tokens.md</div>
+                  <a class="sname lnk" href="#/page">tokens.md</a>
+                  <div class="snip">…every mockup starts from the app's real design <mark>tokens</mark>, so it looks native and costs little to build…</div>
+                </div>
+                <div class="card srow">
+                  <div class="spath">projects/cadence/notes.md</div>
+                  <a class="sname lnk" href="#/page">notes.md</a>
+                  <div class="snip">…Colours come from <mark>tokens</mark>, never literals. Every screen fits .shell &gt; .side + .main…</div>
+                </div>
+                <div class="card srow">
+                  <div class="spath">global/conventions.md</div>
+                  <a class="sname lnk" href="#/page">conventions.md</a>
+                  <div class="snip">…the <mark>tokens</mark>.css file is generated — run the kit script after a theme change…</div>
+                </div>
+                <div class="card srow">
+                  <div class="spath">agents/master/knowledge/design-kit.md</div>
+                  <a class="sname lnk" href="#/page">design-kit.md</a>
+                  <div class="snip">…learned: <mark>tokens</mark>.json is the non-CSS mirror — keep both under the generator…</div>
+                </div>
+                <div class="card srow">
+                  <div class="spath">projects/cadence/design/spec-draft.pdf</div>
+                  <a class="sname lnk" href="#/preview/pdf">spec-draft.pdf</a>
+                  <div class="snip">…§3.1 <mark>tokens</mark> and theming — dark defaults under :root, light under data-theme…</div>
+                </div>
+              </div>
+            </section>
+
+            <!-- ======== /history ======== -->
+            <section data-view="history" hidden>
+              <div class="wbar">
+                <div class="crumbs"><a href="#/folder">projects</a><span class="sep">/</span><a href="#/folder">cadence</a><span class="sep">/</span><a href="#/page">notes.md</a><span class="sep">·</span><b>history</b></div>
+                <div class="wtools"><a class="btn" href="#/page">Back to page</a><button class="btn btn-acc"><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3.5 8a4.5 4.5 0 114.5 4.5"/><path d="M3.5 8L2 5.5M3.5 8L6 9.5"/></svg>Restore this version</button></div>
+              </div>
+              <div class="hsplit">
+                <div class="ver">
+                  <div class="vrow"><span class="vwho">master · current</span><span class="vwhen">a41f9c2 · 2 h ago</span><span class="muted" style="font-size:var(--text-micro)">"tokens not literals" note</span></div>
+                  <div class="vrow on"><span class="vwho">swe-1</span><span class="vwhen">f0c33d8 · yesterday</span><span class="muted" style="font-size:var(--text-micro)">open questions section</span></div>
+                  <div class="vrow"><span class="vwho">swe-1</span><span class="vwhen">7be1a04 · 3 d ago</span><span class="muted" style="font-size:var(--text-micro)">first draft</span></div>
+                  <div class="vrow"><span class="vwho">operator</span><span class="vwhen">09d2e77 · 1 wk ago</span><span class="muted" style="font-size:var(--text-micro)">seeded page</span></div>
+                </div>
+                <div>
+                  <div class="slabel" style="margin-bottom:8px">diff — f0c33d8 → a41f9c2</div>
+                  <div class="diff">
+                    <div class="dl hunk">@@ notes.md · lines 8-13 @@</div>
+                    <div class="dl ctx"> - Colours come from tokens, never</div>
+                    <div class="dl ctx">   literals.</div>
+                    <div class="dl del">- Every screen fits .shell > .side</div>
+                    <div class="dl del">- plus .main. No exceptions yet.</div>
+                    <div class="dl add">+ Every screen fits `.shell > .side +</div>
+                    <div class="dl add">+ .main`.</div>
+                    <div class="dl add">+ - Right rail is optional context —</div>
+                    <div class="dl add">+   delete it for full-width tools.</div>
+                    <div class="dl ctx"> </div>
+                    <div class="dl ctx"> ### Open questions</div>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <!-- ======== /agent — agents/master/ ======== -->
+            <section data-view="agent" hidden>
+              <div class="wbar">
+                <div class="crumbs"><a href="#/agent">agents</a><span class="sep">/</span><b>master/</b></div>
+                <div class="wtools"><a class="btn" href="#/search"><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></svg>Search</a></div>
+              </div>
+              <div class="note warn"><svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3.2" y="7" width="9.6" height="6.8" rx="1.4"/><path d="M5.6 7V5.2a2.4 2.4 0 014.8 0V7"/></svg>not your folder — agents/master/ is read-only to you. profile/ is operator-only.</div>
+              <div class="slabel" style="margin-bottom:8px">folders</div>
+              <div class="flist" style="margin-bottom:20px">
+                <div class="frow"><svg class="ficon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 4.5h4l1.2 1.5H14v6.5a1 1 0 01-1 1H3a1 1 0 01-1-1v-8z"/></svg><span class="fname">profile/</span><span class="badge b-lock">locked · operator-only</span><span class="fsize">—</span></div>
+                <div class="frow"><svg class="ficon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 4.5h4l1.2 1.5H14v6.5a1 1 0 01-1 1H3a1 1 0 01-1-1v-8z"/></svg><span class="fname">knowledge/</span><span class="fsub">12 entries</span><span class="fsize">—</span></div>
+                <div class="frow"><svg class="ficon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 4.5h4l1.2 1.5H14v6.5a1 1 0 01-1 1H3a1 1 0 01-1-1v-8z"/></svg><span class="fname">memory/</span><span class="fsub">lessons · read-only</span><span class="fsize">—</span></div>
+              </div>
+              <div class="slabel" style="margin-bottom:8px">memory/ — lessons (read-only view)</div>
+              <div class="flist">
+                <div class="lesson"><span class="badge b-ok">active</span><span class="ltext">Run generated-file checks as the generator's own --check, never a hand diff.</span><span class="lby">master</span></div>
+                <div class="lesson"><span class="badge b-ok">active</span><span class="ltext">Judge CI by exit code through rtk proxy — filtered text can hide a failure.</span><span class="lby">master</span></div>
+                <div class="lesson"><span class="badge b-warn">proposed</span><span class="ltext">Wiki mockups should land in design/mockups/ so the kit stays the example.</span><span class="lby">swe-1</span></div>
+                <div class="lesson"><span class="badge plain">retired</span><span class="ltext">Put mock assets inline — superseded by the tokens kit.</span><span class="lby">master</span></div>
+              </div>
+            </section>
+
+            <!-- ======== /empty ======== -->
+            <section data-view="empty" hidden>
+              <div class="wbar">
+                <div class="crumbs"><a href="#/empty">agents</a><span class="sep">/</span><a href="#/empty">swe-1</a><span class="sep">/</span><b>knowledge/</b></div>
+                <div class="wtools">
+                  <button class="btn"><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 3v10M3 8h10"/></svg>New page</button>
+                  <a class="btn" href="#/upload"><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 11V4M8 4L5 7M8 4l3 3"/><path d="M2 11.5v1.5a1 1 0 001 1h10a1 1 0 001-1v-1.5"/></svg>Upload</a>
+                </div>
+              </div>
+              <div class="empty card" style="min-height:320px">
+                <svg width="34" height="34" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.1"><path d="M2 4.5h4l1.2 1.5H14v6.5a1 1 0 01-1 1H3a1 1 0 01-1-1v-8z"/></svg>
+                <div class="etitle">knowledge/ is empty</div>
+                <div>This is your folder — pages you write land here.<br>Start with New page, or drop files to upload.</div>
+                <button class="btn btn-acc" style="margin-top:6px"><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 3v10M3 8h10"/></svg>New page</button>
+              </div>
+            </section>
+
+            <!-- ======== /denied ======== -->
+            <section data-view="denied" hidden>
+              <div class="wbar">
+                <div class="crumbs"><a href="#/denied">users</a><span class="sep">/</span><b>operator/</b></div>
+              </div>
+              <div class="empty card" style="min-height:320px">
+                <svg width="34" height="34" viewBox="0 0 16 16" fill="none" stroke="var(--color-warn)" stroke-width="1.3"><rect x="3.2" y="7" width="9.6" height="6.8" rx="1.4"/><path d="M5.6 7V5.2a2.4 2.4 0 014.8 0V7"/></svg>
+                <div class="etitle">Permission denied</div>
+                <div>users/operator/ is private to that user.<br>Agents see only their own folder and their project folders.</div>
+                <a class="btn" href="#/page" style="margin-top:6px">Back to projects/cadence</a>
+              </div>
+            </section>
+
+          </div>
+        </div>
+      </main>
+    </div>
+  </div>
+</div>
+
+<script src="wiki.js"></script>
+</body>
+</html>
