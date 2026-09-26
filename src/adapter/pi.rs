@@ -33,10 +33,15 @@
 //!   any stdout event resets the clock; a turn fences `unknown` after
 //!   `params.turn_idle_secs` of silence (default 900) or the optional
 //!   `params.turn_max_secs` cap.
-//! - Sessions are disposable by design (the brief): the process is
-//!   launched `--no-session`, so every `open` mints a fresh session id
-//!   and the daemon rebuilds context from the continuity pack (CAD-324)
-//!   instead of resuming provider state.
+//! - Sessions differ by role. The MASTER is disposable by design (the
+//!   brief): `--no-session`, so every `open` mints a fresh session id
+//!   and the daemon rebuilds context from the continuity pack
+//!   (CAD-324). A pi WORKER (CAD-544) instead keeps a persistent
+//!   session file in its private dir under the state dir, so an idle
+//!   stop + resume — and every later dispatch — continues the same Pi
+//!   conversation; the daemon reads a stable `sessionId` off
+//!   `get_state` as proof, and a lost file simply mints a new session
+//!   plus a continuity pack (`Reason::New`).
 //! - The master runs under the same Landlock confinement as Claude
 //!   (`cadence confine`) but with Pi's own path set — `master/pi`, never
 //!   `master/claude` or its `.credentials.json` — its own
@@ -126,15 +131,58 @@ pub(crate) fn pi_master_env_scrub() -> EnvScrub {
     EnvScrub::cleared_except(PI_MASTER_ENV_KEEP).and_names(crate::master::DENIED_ENV)
 }
 
-/// Worker posture (non-master aliases): the old prefix rule still
-/// applies — every inherited `PI_*`, `CADENCE_*`, `CLAUDE_*` and
-/// `CODEX_*` is removed (a `PI_*` or `CLAUDE_*` leak could silently
-/// retarget the child's config or identity); the real pair
-/// (`CADENCE_ALIAS`, `CADENCE_STATE_DIR`) and the daemon context are
-/// re-injected per agent. Provider API keys and cloud-secret names are
-/// always dropped.
-pub(crate) fn pi_env_scrub() -> EnvScrub {
-    EnvScrub::prefixes(&["PI_", "CADENCE_", "CLAUDE_", "CLAUDECODE", "CODEX_"], &[])
+/// The only inherited variables a Pi WORKER keeps (CAD-544) — the same
+/// allowlist posture as the master ([`pi_master_env_scrub`]), plus what
+/// an unattended development worker needs:
+/// - `TMPDIR` and the `XDG_*` dirs — tool config and caches land where
+///   the operator put them;
+/// - `SSH_AUTH_SOCK`/`SSH_AGENT_PID` — git over an ssh-agent;
+/// - `CARGO_HOME`, `RUSTUP_HOME`, `RUSTC_WRAPPER`, `SCCACHE_DIR` — the
+///   host's Rust toolchain layout;
+/// - `COLORTERM`/`TERM`/`SHELL`/`TZ`/`USER`/`LOGNAME`/`LANG`/`LC_*`,
+///   `PATH`, `HOME`, and the proxy/CA roots — inherited from the master
+///   keep-list unchanged.
+///
+/// git and gh authenticate through the operator's own files under
+/// `HOME` (`~/.gitconfig`, `~/.config/gh`) — never through an inherited
+/// token, so `GH_TOKEN`, `GITHUB_TOKEN` and every provider API key are
+/// gone however spelled. `PI_CODING_AGENT_DIR`, `CADENCE_ALIAS`,
+/// `CADENCE_STATE_DIR` and the daemon context arrive as explicit env
+/// pairs afterwards.
+const PI_WORKER_ENV_KEEP_EXTRA: &[&str] = &[
+    "TMPDIR",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_STATE_HOME",
+    "XDG_RUNTIME_DIR",
+    "SSH_AUTH_SOCK",
+    "SSH_AGENT_PID",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "RUSTC_WRAPPER",
+    "SCCACHE_DIR",
+];
+
+/// A pi worker's environment posture: cleared, then the allowlist —
+/// identical mechanism to the master's, with the dev additions above.
+/// `DENIED_ENV`'s forge tokens are re-listed only as defense in depth —
+/// minus `SSH_AUTH_SOCK`, which the worker keep-list deliberately
+/// retains (name-removal applies after the keep re-inherit, so listing
+/// it would silently win over the keep entry).
+pub(crate) fn pi_worker_env_scrub() -> EnvScrub {
+    let keep: Vec<&str> = PI_MASTER_ENV_KEEP
+        .iter()
+        .chain(PI_WORKER_ENV_KEEP_EXTRA)
+        .copied()
+        .collect();
+    let denied: Vec<&str> = crate::master::DENIED_ENV
+        .iter()
+        .copied()
+        .filter(|name| *name != "SSH_AUTH_SOCK")
+        .collect();
+    EnvScrub::cleared_except(&keep)
+        .and_names(&denied)
         .and_names(PI_KEY_ENV)
         .and_names(super::CLOUD_SECRET_ENV)
 }
@@ -211,27 +259,134 @@ fn pi_guard_path(state_dir: &Path) -> PathBuf {
     state_dir.join("master").join("pi-guard.js")
 }
 
-/// `pi --mode rpc --no-session …`: direct argv, no shell. The master
-/// additionally gets `--no-extensions -e <guard>` and `--tools bash` —
-/// its whole toolset is the allowlisted `cadence` commands, exactly the
-/// CAD-339 posture the Claude master gets from `--tools`/`dontAsk`.
-/// `--offline`/`--no-*` keep startup deterministic: no update checks,
-/// no skills/prompt-templates/themes/context-file discovery.
-fn build_command(env: &ProviderEnv, agent: &Agent, state_dir: &Path) -> Vec<String> {
+/// A pi WORKER's private dir under the state dir (CAD-544):
+/// `<state>/agents/<alias>` holds its `PI_CODING_AGENT_DIR`
+/// (`pi/`, where the copied `auth.json` lives) and its session file
+/// (`session.jsonl`). Never the operator's `~/.pi`, never shared with
+/// another worker. The alias is a path component, so it is checked
+/// against the agent-name grammar — `[A-Za-z0-9._-]`, and never an
+/// all-dots name (`.`, `..`, `...` would climb out of `agents/`).
+fn pi_worker_dir(state_dir: &Path, alias: &str) -> Result<PathBuf> {
+    let ok = !alias.is_empty()
+        && alias.len() <= 80
+        && alias.bytes().any(|b| b != b'.')
+        && alias
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
+    if !ok {
+        return Err(Error::rejected(format!(
+            "invalid worker alias '{alias}' — [A-Za-z0-9._-], 1-80 chars, not all dots"
+        )));
+    }
+    Ok(state_dir.join("agents").join(alias))
+}
+
+/// The worker's private `PI_CODING_AGENT_DIR` (`<worker>/pi`) — created
+/// 0700 on open, holding its copied `auth.json`.
+fn pi_worker_config_dir(state_dir: &Path, alias: &str) -> Result<PathBuf> {
+    Ok(pi_worker_dir(state_dir, alias)?.join("pi"))
+}
+
+/// The worker's persistent Pi session file (`<worker>/session.jsonl`).
+fn pi_worker_session(state_dir: &Path, alias: &str) -> Result<PathBuf> {
+    Ok(pi_worker_dir(state_dir, alias)?.join("session.jsonl"))
+}
+
+/// Create `dir` (recursive) at mode 0700, tightening an existing one.
+fn ensure_private_dir(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+/// Copy the operator's `auth.json` into `dir` (0600, atomic via
+/// `auth.json.tmp` rename) when the dir has no non-empty login of its
+/// own — the same scoped copy `master start --copy-login` makes
+/// ([`crate::master::copy_login_for`]). An existing login is never
+/// overwritten: the worker's own refresh owns its file afterwards.
+/// `Login::None` means the operator has no Pi login to copy — the
+/// worker then fails its first turn with Pi's own "No API key" error.
+pub fn copy_pi_auth(dir: &Path, operator_config: &Path) -> Result<crate::master::Login> {
+    use std::os::unix::fs::OpenOptionsExt;
+    ensure_private_dir(dir)?;
+    let target = dir.join("auth.json");
+    if std::fs::read_to_string(&target)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|v| v.as_object().map(|o| !o.is_empty()))
+        == Some(true)
+    {
+        return Ok(crate::master::Login::Own);
+    }
+    let Ok(text) = std::fs::read_to_string(operator_config.join("auth.json")) else {
+        return Ok(crate::master::Login::None);
+    };
+    if serde_json::from_str::<Value>(&text)
+        .ok()
+        .filter(Value::is_object)
+        .and_then(|v| v.as_object().map(|o| !o.is_empty()))
+        != Some(true)
+    {
+        return Ok(crate::master::Login::None);
+    }
+    let tmp = dir.join("auth.json.tmp");
+    let _ = std::fs::remove_file(&tmp);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    std::io::Write::write_all(&mut file, text.as_bytes())?;
+    file.sync_all()?;
+    std::fs::rename(&tmp, &target)?;
+    Ok(crate::master::Login::Copied)
+}
+
+/// The dev-tool allowlist a pi WORKER launches with (CAD-544): Pi's
+/// full built-in set, named explicitly so the list is deliberate —
+/// `--tools` also fences out any extension/custom tool that a
+/// project-local config might otherwise register (with
+/// `--no-extensions` there is none anyway; the flag is the belt).
+const PI_WORKER_TOOLS: &[&str] = &["read", "bash", "edit", "write", "grep", "find", "ls"];
+
+/// `pi --mode rpc …`: direct argv, no shell. The master gets
+/// `--no-session` (continuity pack rebuilds context) plus
+/// `--no-extensions -e <guard>` and `--tools bash` — its whole toolset
+/// is the allowlisted `cadence` commands, exactly the CAD-339 posture
+/// the Claude master gets from `--tools`/`dontAsk`. A WORKER (CAD-544)
+/// gets `--session <file>` (its persistent conversation), the dev
+/// toolset [`PI_WORKER_TOOLS`], no extension guard, and reads repo
+/// context files like any other worker. `--offline`/`--no-*` keep
+/// startup deterministic: no update checks, skills, prompt-templates
+/// or themes.
+fn build_command(env: &ProviderEnv, agent: &Agent, state_dir: &Path) -> Result<Vec<String>> {
     let params = agent.params.clone().unwrap_or(Value::Null);
     let mut cmd = pi_command(env);
-    for flag in ["--mode", "rpc", "--no-session", "--offline", "--no-themes"] {
-        cmd.push(flag.to_string());
+    cmd.extend(["--mode".to_string(), "rpc".to_string()]);
+    if crate::master::is_master(&agent.alias) {
+        cmd.push("--no-session".to_string());
+    } else {
+        cmd.extend([
+            "--session".to_string(),
+            pi_worker_session(state_dir, &agent.alias)?
+                .to_string_lossy()
+                .to_string(),
+        ]);
     }
-    for flag in ["--no-skills", "--no-prompt-templates", "--no-context-files"] {
+    for flag in [
+        "--offline",
+        "--no-themes",
+        "--no-skills",
+        "--no-prompt-templates",
+    ] {
         cmd.push(flag.to_string());
-    }
-    // `agent.model` is the provider's report, never a launch param —
-    // only the configured param is replayed (same rule as Claude).
-    if let Some(model) = params.get("model").and_then(Value::as_str) {
-        cmd.extend(["--model".to_string(), model.to_string()]);
     }
     if crate::master::is_master(&agent.alias) {
+        cmd.push("--no-context-files".to_string());
         cmd.extend([
             "--no-extensions".to_string(),
             "--extension".to_string(),
@@ -239,8 +394,19 @@ fn build_command(env: &ProviderEnv, agent: &Agent, state_dir: &Path) -> Vec<Stri
             "--tools".to_string(),
             "bash".to_string(),
         ]);
+    } else {
+        cmd.extend([
+            "--no-extensions".to_string(),
+            "--tools".to_string(),
+            PI_WORKER_TOOLS.join(","),
+        ]);
     }
-    cmd
+    // `agent.model` is the provider's report, never a launch param —
+    // only the configured param is replayed (same rule as Claude).
+    if let Some(model) = params.get("model").and_then(Value::as_str) {
+        cmd.extend(["--model".to_string(), model.to_string()]);
+    }
+    Ok(cmd)
 }
 
 /// The full launch argv: [`build_command`], and for the master that
@@ -251,14 +417,14 @@ fn launch_command(
     env: &ProviderEnv,
     state_dir: &Path,
     agent: &Agent,
-) -> (Vec<String>, Option<crate::confine::Policy>) {
-    let command = build_command(env, agent, state_dir);
+) -> Result<(Vec<String>, Option<crate::confine::Policy>)> {
+    let command = build_command(env, agent, state_dir)?;
     if !master_confined(env, agent) {
-        return (command, None);
+        return Ok((command, None));
     }
     let (confine, policy) = pi_master_confinement(env, state_dir);
     let argv = crate::master::confine_argv(&confine, &policy, &command);
-    (argv, Some(policy))
+    Ok((argv, Some(policy)))
 }
 
 /// The master, confined wherever this host can confine it — the stored
@@ -555,7 +721,9 @@ impl PiAdapter {
             // Bound to the empty generation — replaced by `open`'s mint.
             transport: RwLock::new(StdioAdapter::new_lines(
                 &pi_command(env),
-                pi_env_scrub(),
+                // The placeholder transport is rebound per open —
+                // either scrub is fine here.
+                pi_master_env_scrub(),
                 Box::new(move |incoming| routed.dispatch_for("", incoming)),
                 Box::new(move || disconnected.disconnect_for("")),
             )),
@@ -608,7 +776,7 @@ impl PiAdapter {
         let scrub = if master {
             pi_master_env_scrub()
         } else {
-            pi_env_scrub()
+            pi_worker_env_scrub()
         };
         StdioAdapter::new_lines(
             command,
@@ -882,7 +1050,7 @@ impl ProviderAdapter for PiAdapter {
         if master {
             write_pi_guard(&self.state_dir)?;
         }
-        let (command, confinement) = launch_command(&self.env, &self.state_dir, agent);
+        let (command, confinement) = launch_command(&self.env, &self.state_dir, agent)?;
         if let Some(policy) = &confinement {
             self.log_confinement(policy)?;
         }
@@ -911,9 +1079,31 @@ impl ProviderAdapter for PiAdapter {
                 pm.as_deref(),
                 master_confined(&self.env, agent),
             ));
-            // No update checks or network on the master's startup path.
-            env.push(("PI_OFFLINE".to_string(), "1".to_string()));
+        } else {
+            // CAD-544 worker: a private `PI_CODING_AGENT_DIR` under the
+            // state dir — auth arrives as the scoped file copy, never
+            // via env or argv; `~/.pi` is never inherited. An
+            // unattended worker must not stall on a git credential
+            // prompt, so GIT_TERMINAL_PROMPT=0.
+            let config = pi_worker_config_dir(&self.state_dir, &agent.alias)?;
+            let operator = crate::master::operator_provider_config(
+                "pi",
+                self.env.var("PI_CODING_AGENT_DIR"),
+                self.env.var("HOME"),
+            );
+            if let Some(operator) = operator.as_deref() {
+                copy_pi_auth(&config, operator)?;
+            } else {
+                ensure_private_dir(&config)?;
+            }
+            env.push((
+                "PI_CODING_AGENT_DIR".to_string(),
+                config.to_string_lossy().to_string(),
+            ));
+            env.push(("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()));
         }
+        // No update checks or telemetry on any managed startup path.
+        env.push(("PI_OFFLINE".to_string(), "1".to_string()));
         let params = agent.params.clone().unwrap_or(Value::Null);
         let idle_secs = params
             .get("turn_idle_secs")

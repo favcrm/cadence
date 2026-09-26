@@ -128,6 +128,11 @@ cadence join <your-alias> claude                    # headless claude worker —
                                                     #  its turn's result text
                                                     #  IS the report (no
                                                     #  `message result` needed)
+cadence join <your-alias> pi                        # headless pi worker — same
+                                                    #  result-is-the-report
+                                                    #  rule; takes --model/--effort
+                                                    #  (off minimal low medium
+                                                    #  high xhigh max)
 cadence join <your-alias> claude --tui              # interactive claude in an
                                                     #  owned pane — pty rules:
                                                     #  ready gate + `message

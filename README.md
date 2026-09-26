@@ -52,7 +52,8 @@ the long-form catalog, and `docs/SESSION.md` describes the PM loop
   persisted message; delivery and reporting survive restarts.
 - **Real endpoints** — owned tmux panes for TUI providers (Devin, Cursor,
   Claude `--tui`) and managed headless endpoints (Codex ws, Claude
-  stream-json); sessions resume by their native ids.
+  stream-json, Pi rpc via `join <pm> pi`); sessions resume by their
+  native ids.
 - **A git-backed tracker** — issues are Markdown files in a private repo
   (`~/pm`); every write is one commit, `issue log`/`blame` work from git alone.
 - **Verified delivery** — workers report with `sha:`; reviewers bind a verdict

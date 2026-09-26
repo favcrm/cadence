@@ -596,35 +596,7 @@ pub fn copy_login_for(provider: &str, state_dir: &Path, operator_config: &Path) 
     if provider != "pi" {
         return copy_login(state_dir, operator_config);
     }
-    use std::os::unix::fs::OpenOptionsExt;
-    if ensure_config_dir_for("pi", state_dir)? == Login::Own {
-        return Ok(Login::Own);
-    }
-    let dir = provider_config_dir("pi", state_dir);
-    let target = dir.join("auth.json");
-    let Ok(text) = std::fs::read_to_string(operator_config.join("auth.json")) else {
-        return Ok(Login::None);
-    };
-    if serde_json::from_str::<Value>(&text)
-        .ok()
-        .filter(Value::is_object)
-        .and_then(|v| v.as_object().map(|o| !o.is_empty()))
-        != Some(true)
-    {
-        // An empty or unreadable auth.json is no login.
-        return Ok(Login::None);
-    }
-    let tmp = dir.join("auth.json.tmp");
-    let _ = std::fs::remove_file(&tmp);
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)?;
-    std::io::Write::write_all(&mut file, text.as_bytes())?;
-    file.sync_all()?;
-    std::fs::rename(&tmp, &target)?;
-    Ok(Login::Copied)
+    crate::adapter::pi::copy_pi_auth(&provider_config_dir("pi", state_dir), operator_config)
 }
 
 /// The operator's own config dir for `provider` (for `--copy-login`):

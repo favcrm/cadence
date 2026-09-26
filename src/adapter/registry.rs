@@ -356,11 +356,15 @@ pub static SPECS: &[EndpointSpec] = &[
         // CAD-322 slice 1: extension UI dialogs are auto-cancelled and
         // recorded; nothing routes to `agent respond` yet.
         brokers_requests: false,
-        // Pi sessions are disposable (`--no-session`): a reopen is a
-        // fresh process and context is rebuilt from the continuity
-        // pack, so there is no provider resume to point at.
-        resumable: false,
-        resume_label: "fresh pi process (continuity pack)",
+        // CAD-544: a pi WORKER keeps a session file under the state dir,
+        // so a stopped/idle-stopped worker reopens on the same Pi
+        // session. The master alias is the exception — it launches
+        // `--no-session` and is rebuilt from the continuity pack
+        // (adapter-level split the spec cannot express). The resume
+        // hint stays unrendered: the file path is cadence-internal, and
+        // a placeholder-less label maps to `None` in `resume_command`.
+        resumable: true,
+        resume_label: "cadence agent resume <alias> (stored pi session file)",
         live_settable_params: &["stall_secs", "auto_stop", "auto_stop_idle_secs"],
         launch_params: &[
             "model",
@@ -380,8 +384,12 @@ pub static SPECS: &[EndpointSpec] = &[
         capabilities: &["managed_pi_rpc"],
         doctor_caps: &["managed_pi_rpc"],
         probe_bins: &[("pi", &["--version"])],
+        // The session file is cadence-owned state: if it is lost or
+        // corrupt the daemon may clear the native session and mint
+        // fresh — never wedge on a dead id.
         session_disposable: true,
-        launch_default: false,
+        // CAD-544: `join <pm> pi` resolves the managed endpoint.
+        launch_default: true,
         internal: false,
     },
     EndpointSpec {
@@ -829,8 +837,9 @@ pub fn spec(provider: &str, kind: &str) -> Result<&'static EndpointSpec> {
 }
 
 /// The provider's launch-verb endpoint kind (`cadence devin` → `pty`,
-/// `cadence codex` → `managed-ws`). Providers without a launch verb are
-/// rejected with the same text the inline match produced.
+/// `cadence codex` → `managed-ws`, `join <pm> pi` → `managed`).
+/// Providers without a launch verb are rejected with the same text the
+/// inline match produced.
 pub fn default_kind(provider: &str) -> Result<&'static str> {
     SPECS
         .iter()
@@ -838,7 +847,7 @@ pub fn default_kind(provider: &str) -> Result<&'static str> {
         .map(|s| s.endpoint_kind)
         .ok_or_else(|| {
             Error::rejected(format!(
-                "Unknown provider '{provider}' — expected devin, codex, claude, cursor or fake"
+                "Unknown provider '{provider}' — expected devin, codex, claude, pi, cursor or fake"
             ))
         })
 }
