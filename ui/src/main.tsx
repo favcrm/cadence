@@ -8,7 +8,7 @@ import "@fontsource/ibm-plex-mono/latin-500.css";
 import "@fontsource/ibm-plex-mono/latin-600.css";
 import "./styles.css";
 import App from "./App";
-import { applyLegacyRedirect } from "./lib/useLocation";
+import { applyLegacyRedirect, installClientNav } from "./lib/useLocation";
 import { initTheme } from "./lib/theme";
 import { captureLoginNonce } from "./features/auth/session";
 
@@ -17,6 +17,10 @@ initTheme();
 
 // A pre-router link (`/?tab=board&project=cadence`) opens at its route.
 applyLegacyRedirect();
+
+// Same-origin links stay in the SPA (CAD-609). A full load would drop
+// the wiki tree's expanded folders.
+installClientNav();
 
 // A `cadence ui login` link: take its nonce out of the address bar
 // before anything renders (CAD-313).

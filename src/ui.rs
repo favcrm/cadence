@@ -793,6 +793,7 @@ fn static_file(dist: Option<&Path>, path: &str) -> Option<(String, Vec<u8>)> {
 }
 
 /// What a non-API GET answers with.
+#[derive(Debug)]
 enum StaticAnswer {
     /// A file of the build — or the SPA shell (`index.html`) for a client route.
     File(String, Vec<u8>),
@@ -802,37 +803,86 @@ enum StaticAnswer {
     NoBuild,
 }
 
-/// Whether a path is a client-side route (ui/src/lib/router.ts: `/`,
-/// `/projects/:slug`, `/agents/:alias`, `/setup`, `/settings`, …) that the
-/// SPA shell answers so deep links and refreshes work. The two routes with
-/// a parameter always are — agent aliases may contain dots (`valid_alias`
-/// in ui/threads.rs allows `[A-Za-z0-9._-]`), project keys never do. Any
-/// other path that names a file — under `/assets/`, or a last segment with
-/// a dot — is not: a missing file must be a 404, not HTML the browser would
-/// try to run as a script or stylesheet. `/api` is never a route; its 404
-/// is JSON (answered before the static branch).
+/// Extensions the build serves as files. A missing one is a 404, never
+/// the SPA shell — with `nosniff`, the browser still must not be handed
+/// HTML under a script, stylesheet, or image name. Wiki pages (`.md`)
+/// and dotted ids (`CAD-1.2`) are not in this set.
+fn is_static_ext(ext: &str) -> bool {
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "html"
+            | "js"
+            | "mjs"
+            | "css"
+            | "svg"
+            | "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "webp"
+            | "ico"
+            | "woff"
+            | "woff2"
+            | "ttf"
+            | "map"
+            | "json"
+            | "webmanifest"
+    )
+}
+
+/// Wiki addresses (`/wiki` and `/wiki/<path>`) name pages and blobs in
+/// the store, including `note.md` and `photo.png`. They are never build
+/// files. File bytes stay on `/api/wiki/file` only.
+fn is_wiki_path(path: &str) -> bool {
+    path == "/wiki" || path.starts_with("/wiki/")
+}
+
+/// Whether a path is a client-side route (ui/src/lib/router.ts) that the
+/// SPA shell answers so deep links and refreshes work. `/api` and
+/// `/assets/` never are. A missing build asset (a static extension,
+/// outside the wiki) is a 404. Anything else — including a wiki page and
+/// a dotted issue id — is a route. One rule for every screen, not a
+/// branch per path.
 fn is_client_route(path: &str) -> bool {
     if path == "/api" || path.starts_with("/api/") || path.starts_with("/assets/") {
         return false;
     }
-    let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
-    let param_route = match parts.as_slice() {
-        ["agents", alias] => !alias.is_empty(),
-        ["projects", slug] | ["projects", slug, "context"] => !slug.is_empty(),
-        _ => false,
+    if is_wiki_path(path) {
+        return true;
+    }
+    !matches!(
+        path.rsplit('/').next().unwrap_or_default().rsplit_once('.'),
+        Some((_, ext)) if is_static_ext(ext)
+    )
+}
+
+/// `Accept: application/json` asks for the JSON 404, not the shell.
+/// A browser navigation sends `text/html` (and `*/*`), which does not
+/// count — `*/*` would hide every refresh.
+fn prefers_json(accept: Option<&str>) -> bool {
+    let Some(accept) = accept else {
+        return false;
     };
-    param_route || !path.rsplit('/').next().unwrap_or_default().contains('.')
+    accept.split(',').any(|part| {
+        part.split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .eq_ignore_ascii_case("application/json")
+    })
 }
 
 /// A build file when one matches; else the SPA shell for a client route.
-fn static_answer(dist: Option<&Path>, path: &str) -> StaticAnswer {
+/// `accept` is the request's Accept header. A wiki GET that prefers JSON
+/// stays a 404 so the file API remains `/api/wiki/file`.
+fn static_answer_for(dist: Option<&Path>, path: &str, accept: Option<&str>) -> StaticAnswer {
     let target = if path == "/" { "/index.html" } else { path };
     if !path.starts_with("/api/") {
         if let Some((name, bytes)) = static_file(dist, target) {
             return StaticAnswer::File(name, bytes);
         }
     }
-    if !is_client_route(path) {
+    if !is_client_route(path) || (is_wiki_path(path) && prefers_json(accept)) {
         return StaticAnswer::Missing;
     }
     match static_file(dist, "/index.html") {
@@ -3269,7 +3319,11 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             }
             // Static: a file of the build, the SPA shell for a client
             // route, or 404 for a file that is not there.
-            match static_answer(opts.dist.as_deref(), &path) {
+            match static_answer_for(
+                opts.dist.as_deref(),
+                &path,
+                header_value(&request, "Accept").as_deref(),
+            ) {
                 StaticAnswer::File(name, bytes) => {
                     let mut resp = Response::from_data(bytes);
                     resp.add_header(
@@ -4156,9 +4210,10 @@ fn qr_term(text: &str) -> Option<String> {
 mod tests {
     use super::{
         agents_payload_from, content_type, context_query, health_supports_model_defaults,
-        proxied_actor, running_json, static_answer, static_file, StaticAnswer,
+        proxied_actor, running_json, static_answer_for, static_file, StaticAnswer,
     };
     use serde_json::{json, Value};
+    use tiny_http::Response;
 
     /// CAD-480: a mailbox row on the Agents screen carries its unread
     /// backlog and oldest-unread age from `agent.inbox`, and the unread
@@ -4229,7 +4284,7 @@ mod tests {
         std::fs::write(dist.path().join("favicon.svg"), "<svg/>").unwrap();
         std::fs::create_dir(dist.path().join("assets")).unwrap();
         std::fs::write(dist.path().join("assets/index.js"), "js").unwrap();
-        let answer = |path: &str| static_answer(Some(dist.path()), path);
+        let answer = |path: &str| static_answer_for(Some(dist.path()), path, None);
         for route in [
             "/",
             "/projects",
@@ -4284,8 +4339,68 @@ mod tests {
         // No build: routes say so instead of serving nothing.
         let empty = tempfile::TempDir::new().unwrap();
         assert!(matches!(
-            static_answer(Some(empty.path()), "/projects"),
+            static_answer_for(Some(empty.path()), "/projects", None),
             StaticAnswer::NoBuild
+        ));
+    }
+
+    /// CAD-609: a wiki page and a dotted issue path are client routes.
+    /// The shell is HTML 200. A JSON Accept on `/wiki` stays the JSON
+    /// 404, and `/api/wiki/file` is never the shell — that route serves
+    /// the bytes.
+    #[test]
+    fn wiki_pages_and_dotted_issue_paths_serve_the_spa_shell() {
+        let dist = tempfile::TempDir::new().unwrap();
+        std::fs::write(dist.path().join("index.html"), "<!doctype html>shell").unwrap();
+        let shell = |path: &str, accept: Option<&str>| match static_answer_for(
+            Some(dist.path()),
+            path,
+            accept,
+        ) {
+            StaticAnswer::File(name, bytes) => {
+                let resp = Response::from_data(bytes.clone());
+                assert_eq!(resp.status_code().0, 200, "{path}");
+                assert_eq!(name, "/index.html", "{path}");
+                assert_eq!(content_type(&name), "text/html; charset=utf-8", "{path}");
+                assert_eq!(bytes, b"<!doctype html>shell", "{path}");
+            }
+            other => panic!("{path}: expected the SPA shell, got {other:?}"),
+        };
+        for path in [
+            "/wiki",
+            "/wiki/global",
+            "/wiki/global/x.md",
+            "/wiki/global/hello.md",
+            "/wiki/edit/global/hello.md",
+            "/wiki/history/global/hello.md",
+            "/projects/cadence/issues/CAD-1",
+            "/projects/cadence/issues/CAD-1.2",
+            "/agents/cc.worker-1",
+        ] {
+            shell(path, None);
+            shell(path, Some("text/html,application/xhtml+xml"));
+        }
+        assert!(
+            matches!(
+                static_answer_for(
+                    Some(dist.path()),
+                    "/wiki/global/x.md",
+                    Some("application/json"),
+                ),
+                StaticAnswer::Missing
+            ),
+            "JSON Accept on a wiki page is not the shell"
+        );
+        assert!(
+            matches!(
+                static_answer_for(Some(dist.path()), "/api/wiki/file", None),
+                StaticAnswer::Missing
+            ),
+            "file bytes stay on the API route"
+        );
+        assert!(matches!(
+            static_answer_for(Some(dist.path()), "/projects/x/logo.png", None),
+            StaticAnswer::Missing
         ));
     }
 
