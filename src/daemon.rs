@@ -7163,12 +7163,8 @@ impl Shared {
                     // CAD-559: the verified switch is the launch model
                     // from now on — the next open's re-check must see it
                     // in params.model, and the reported column agrees.
-                    if let Some(model) =
-                        result.get("requested").and_then(Value::as_str)
-                    {
-                        if let Err(e) =
-                            self.store.set_params(alias, &json!({"model": model}))
-                        {
+                    if let Some(model) = result.get("requested").and_then(Value::as_str) {
+                        if let Err(e) = self.store.set_params(alias, &json!({"model": model})) {
                             eprintln!("master_command params.model for '{alias}' failed: {e}");
                         }
                         if let Err(e) = self.store.set_model_reported(alias, model) {

@@ -2824,7 +2824,10 @@ fn cad551_pi_master_state_and_commands() {
     // `/model` off the operator's allowlist is refused — the policy
     // error surfaces and the stored params stay on the allowed id.
     let err = d
-        .operator_rpc("master_command", json!({"command": "model", "arg": "fake/model-2"}))
+        .operator_rpc(
+            "master_command",
+            json!({"command": "model", "arg": "fake/model-2"}),
+        )
         .unwrap_err()
         .to_string();
     assert!(

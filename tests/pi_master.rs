@@ -1450,10 +1450,7 @@ fn session_command_model_refuses_an_offlist_model() {
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
         .filter_map(|row| row["rpc"].as_str().map(str::to_string))
         .collect::<Vec<_>>();
-    assert!(
-        !received.iter().any(|m| m == "set_model"),
-        "{received:?}"
-    );
+    assert!(!received.iter().any(|m| m == "set_model"), "{received:?}");
     // And the session still reports the launch model.
     let state = pi.session_command("state", None).unwrap();
     assert_eq!(state["model"]["id"], "model-1", "{state}");

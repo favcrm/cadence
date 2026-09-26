@@ -1274,16 +1274,12 @@ impl PiAdapter {
             .and_then(|m| m.get("provider"))
             .and_then(Value::as_str)
             .and_then(|p| reported_id.map(|i| format!("{p}/{i}")));
-        if !(reported_full.as_deref() == Some(want.as_str())
-            || reported_id == Some(want.as_str()))
+        if !(reported_full.as_deref() == Some(want.as_str()) || reported_id == Some(want.as_str()))
         {
             return Err(Error::provider(format!(
                 "pi reports model {} but '{want}' was set — the provider \
                  silently fell back instead of honoring set_model (CAD-559)",
-                reported_full
-                    .as_deref()
-                    .or(reported_id)
-                    .unwrap_or("<none>")
+                reported_full.as_deref().or(reported_id).unwrap_or("<none>")
             )));
         }
         Ok(json!({"was": before, "model": model, "requested": want}))
