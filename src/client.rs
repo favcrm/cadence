@@ -12,24 +12,17 @@ use serde_json::Value;
 use crate::error::{Error, Result};
 use crate::proto;
 
-/// State directory: `$CADENCE_STATE_DIR`, else `$XDG_STATE_HOME/cadence`,
-/// else `~/.local/state/cadence`.
+/// State directory: `$CADENCE_STATE_DIR`, else the resolved home's
+/// `state/` — `$XDG_STATE_HOME/cadence` or `~/.local/state/cadence`
+/// under the legacy layout ([`crate::home`]).
 pub fn state_dir() -> Result<PathBuf> {
-    if let Ok(dir) = std::env::var("CADENCE_STATE_DIR") {
-        return Ok(PathBuf::from(dir));
-    }
-    default_state_dir()
+    crate::home::state_dir()
 }
 
 /// The state directory `state_dir` resolves with `CADENCE_STATE_DIR`
 /// unset — the production default a sandbox must never reach.
 pub fn default_state_dir() -> Result<PathBuf> {
-    if let Ok(dir) = std::env::var("XDG_STATE_HOME") {
-        return Ok(PathBuf::from(dir).join("cadence"));
-    }
-    let home = std::env::var("HOME")
-        .map_err(|_| Error::internal("Cannot locate HOME for state directory"))?;
-    Ok(PathBuf::from(home).join(".local/state/cadence"))
+    crate::home::state_default()
 }
 
 pub fn socket_path(state_dir: &Path) -> PathBuf {

@@ -26,6 +26,7 @@ pub mod devin_catalog;
 pub mod doctor;
 pub mod error;
 pub mod filter;
+pub mod home;
 pub mod inbox;
 pub mod issue;
 pub mod lease;

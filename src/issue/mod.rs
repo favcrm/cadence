@@ -45,22 +45,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
-/// Default tracker directory: `$CADENCE_PM_DIR`, else `~/pm`.
+/// Default tracker directory: `$CADENCE_PM_DIR`, else the resolved
+/// home's `tracker/` — `~/pm` under the legacy layout
+/// ([`crate::home`]).
 pub fn default_dir() -> Result<PathBuf> {
-    if let Some(dir) = std::env::var_os("CADENCE_PM_DIR") {
-        return Ok(PathBuf::from(dir));
-    }
-    home_default_dir()
+    crate::home::tracker_dir()
 }
 
 /// The tracker `default_dir` resolves with `CADENCE_PM_DIR` unset —
-/// `~/pm`, the production default a sandbox must never reach.
+/// `<home>/tracker`, or `~/pm` under the legacy layout: the
+/// production default a sandbox must never reach.
 pub fn home_default_dir() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .ok_or_else(|| Error::rejected("HOME is not set to an absolute path"))?;
-    Ok(home.join("pm"))
+    crate::home::tracker_default()
 }
 
 /// `pm.yaml` — schema version, vocabularies, limits.
