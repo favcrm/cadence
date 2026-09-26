@@ -3735,10 +3735,7 @@ impl cadence_agent::update::UpdateHost for RealUpdateHost<'_> {
         }))
     }
     fn daemon_build(&self) -> Result<Option<String>> {
-        match client::rpc(self.state_dir, "daemon_info", json!({})) {
-            Ok(info) => Ok(info["build_commit"].as_str().map(str::to_string)),
-            Err(_) => Ok(None),
-        }
+        daemon_build_or_absent(client::rpc(self.state_dir, "daemon_info", json!({})))
     }
     fn board_build(&self) -> Result<Option<String>> {
         match cadence_agent::ui::health(self.state_dir) {
@@ -3759,6 +3756,18 @@ impl cadence_agent::update::UpdateHost for RealUpdateHost<'_> {
     }
     fn sleep(&self, duration: std::time::Duration) {
         std::thread::sleep(duration);
+    }
+}
+
+/// `daemon_build`'s answer classification (CAD-561 r4): only an
+/// unreachable daemon reads as "no daemon" — every other RPC failure
+/// is real and must fail the run, or `finish_restart` restarts a
+/// daemon that was merely slow to answer.
+pub(crate) fn daemon_build_or_absent(answer: Result<Value>) -> Result<Option<String>> {
+    match answer {
+        Ok(info) => Ok(info["build_commit"].as_str().map(str::to_string)),
+        Err(e) if e.to_string().starts_with("Daemon is not reachable") => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
