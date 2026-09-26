@@ -31,7 +31,7 @@ import { readAppUrlState, type AppTab, type ProjectView } from "./urlState";
  */
 
 export type ProjectSection = "issues" | "epics" | "milestones" | "context" | "workflows";
-export type SettingsSection = "models" | "memory" | "update";
+export type SettingsSection = "models" | "memory" | "update" | "account";
 /** The wiki's modes; `browse` opens a path by its kind (CAD-581). */
 export type WikiMode = "browse" | "edit" | "history" | "search" | "upload";
 
@@ -186,6 +186,7 @@ export function matchRoute(pathname: string): Route {
       if (!a) return { screen: "settings", section: "models" };
       if (a === "memory") return { screen: "settings", section: "memory" };
       if (a === "update") return { screen: "settings", section: "update" };
+      if (a === "account") return { screen: "settings", section: "account" };
     }
   }
   return { screen: "notFound", path: pathname };
@@ -224,6 +225,7 @@ export function routePath(route: Route): string {
     case "outbox":
       return "/outbox";
     case "settings":
+      if (route.section === "account") return "/settings/account";
       if (route.section === "memory") return "/settings/memory";
       return route.section === "update" ? "/settings/update" : "/settings";
     case "notFound":

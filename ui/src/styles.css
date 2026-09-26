@@ -1,5 +1,23 @@
 @import "tailwindcss";
 
+.platform-account { max-width: 66rem; padding: 1.5rem; }
+.platform-account h1 { font-size: 1.5rem; font-weight: 600; margin-bottom: .5rem; }
+.platform-account h2 { font-size: 1rem; font-weight: 500; margin-bottom: .5rem; }
+.platform-account .dim, .platform-account .eyebrow { color: var(--color-ink-400); font-size: .875rem; }
+.platform-account-header { display: flex; justify-content: space-between; align-items: start; gap: 1.5rem; margin-bottom: 2rem; }
+.platform-account-actions { display: flex; gap: .5rem; flex-wrap: wrap; }
+.platform-account-summary { display: grid; grid-template-columns: 1fr 1fr; gap: 2rem; padding: 1.5rem 0; margin-bottom: 1.5rem; border-block: 1px solid var(--color-edge); }
+.platform-account-summary h2 { font-size: .875rem; font-weight: 500; margin-bottom: .5rem; }
+.platform-account-balance { font-size: 2rem; font-variant-numeric: tabular-nums; }
+.platform-account-balance span { font-size: .875rem; }
+.platform-account-plan { font-size: 1.25rem; }
+.platform-account-error { color: var(--color-fail); margin-block: .75rem; }
+.platform-account-table { overflow-x: auto; margin-block: 1rem 2rem; }
+.platform-account-table table { width: 100%; border-collapse: collapse; }
+.platform-account-table th, .platform-account-table td { text-align: left; padding: .75rem .5rem; border-bottom: 1px solid var(--color-edge); }
+.platform-account-table th:last-child, .platform-account-table td:last-child { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+@media (max-width: 640px) { .platform-account-header { flex-direction: column; } .platform-account-summary { grid-template-columns: 1fr; gap: 1rem; } }
+
 @theme {
   --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, monospace;
