@@ -561,6 +561,11 @@ fn a_member_session_never_decides() {
 
     // Participate: an agent-allowed write succeeds and is attributed to
     // the member's handle, not `operator`.
+    let (code, _, body) = http_write(port, "GET", "/api/meta", &host, &[&cookie], b"");
+    assert_eq!(code, 200, "{body}");
+    let meta: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(meta["session"]["user"]["role"], "member");
+    assert_eq!(meta["actor"], "Fable Chen <fable@example.com> (board)");
     let (code, _, body) = http_write(
         port,
         "POST",

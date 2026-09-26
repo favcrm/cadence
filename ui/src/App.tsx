@@ -506,6 +506,7 @@ export default function App() {
         issues={issuesState}
         projectsError={projectsState.status === "failed" ? projectsState.error : null}
         signedIn={meta?.signed_in ?? null}
+        sessionUser={meta?.session?.user}
       />
 
       {/* CAD-600: Home is a full-height panel. The shell above is
@@ -645,6 +646,7 @@ export default function App() {
         {screen === "home" && (
           <Home
             readOnly={readOnly}
+            hosted={meta?.hosted === true || meta?.session?.origin === "public"}
             overview={overviewState}
             onOpenIssue={openIssue}
             overviewHref={hrefFor({ screen: "overview" })}

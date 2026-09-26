@@ -223,8 +223,9 @@ pub fn refuse_reserved_alias(alias: &str) -> Result<()> {
 ///
 /// Confined (CAD-439), the CLI also gets its own config dir
 /// ([`provider_config_dir`] — `master/claude` or `master/pi`); an
-/// unconfined master (`master start --unconfined`, a host without
-/// Landlock) keeps the operator's.
+/// unconfined Claude master keeps the operator's. Pi always reads its
+/// private config, including on hosts without Landlock: that is where
+/// the operator seeds its model catalog and credentials (CAD-634).
 pub fn env_overrides(
     provider: &str,
     state_dir: &Path,
@@ -244,7 +245,7 @@ pub fn env_overrides(
         // CAD-439: `/tmp` is outside its confinement.
         ("TMPDIR".to_string(), tmp.to_string_lossy().to_string()),
     ];
-    if confined {
+    if confined || provider == "pi" {
         env.push((
             provider_config_env(provider).to_string(),
             provider_config_dir(provider, state_dir)

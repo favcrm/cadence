@@ -17,6 +17,7 @@ import {
   SLASH_COMMANDS,
   slashMatches,
   START_COMMAND,
+  RESUME_COMMAND,
   turnState,
   type MasterStatus,
   type SlashCommand,
@@ -502,20 +503,19 @@ function fmtCommandResult(r: MasterCommandResult): { text?: string; value?: unkn
   return { value: v };
 }
 
-function NotStarted({ status }: { status: MasterStatus }) {
+function NotStarted({ status, hosted }: { status: MasterStatus; hosted: boolean }) {
   const stopped = status.kind === "stopped";
   return (
     <div className="card px-4 py-4 space-y-3" data-empty="master">
       <h2 className="text-cardtitle font-semibold text-ink-100">
-        {stopped ? "The master is stopped" : "Start the master to chat"}
+        {hosted ? "Your assistant is unavailable" : stopped ? "The master is stopped" : "Start the master to chat"}
       </h2>
       <p className="text-secondary text-ink-400">
-        The master is the agent you talk to here. It plans work with you and hands approved tickets to your
-        agents. Start it from a terminal on this machine:
+        {hosted ? "Your workspace administrator can check the assistant’s setup and restore it. You can send messages once it is available." : "The master is the agent you talk to here. It plans work with you and hands approved tickets to your agents. Start or resume it from a terminal on this machine:"}
       </p>
-      <pre className="num text-secondary text-ink-200 bg-ink-800 rounded px-3 py-2 overflow-x-auto">
-        {START_COMMAND}
-      </pre>
+      {!hosted && <pre className="num text-secondary text-ink-200 bg-ink-800 rounded px-3 py-2 overflow-x-auto">
+        {stopped ? RESUME_COMMAND : START_COMMAND}
+      </pre>}
       <div className="grid sm:grid-cols-2 gap-3 text-label">
         <div>
           <div className="slabel mb-1">it can</div>
@@ -864,11 +864,13 @@ const ThreadList = memo(function ThreadList({
  */
 export default function Home({
   readOnly,
+  hosted = false,
   overview,
   onOpenIssue,
   overviewHref,
 }: {
   readOnly: boolean;
+  hosted?: boolean;
   overview: ResourceState<Overview>;
   onOpenIssue: (id: string) => void;
   overviewHref: string;
@@ -903,7 +905,7 @@ export default function Home({
   const missing = thread.data?.missing === true;
   const status = masterStatus(agents.data, missing);
   const writeBlock = useWriteBlock(readOnly);
-  const block = composerBlock(writeBlock, status);
+  const block = composerBlock(writeBlock, status, hosted);
   const items = useMemo(() => threadItems(thread.data), [thread.data]);
   const loaded = thread.data !== null;
   const moreBefore = thread.data?.moreBefore === true;
@@ -1275,7 +1277,7 @@ export default function Home({
           >
             {showNotStarted && items.length === 0 && (
               <div className="chat-empty">
-                <NotStarted status={status} />
+                <NotStarted status={status} hosted={hosted} />
               </div>
             )}
             {empty && !showNotStarted && (

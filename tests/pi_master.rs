@@ -575,6 +575,15 @@ fn master_env_is_allowlisted_not_inherited() {
         .unwrap();
     let names = recorded_env(state.path());
     for name in PLANTED_ENV {
+        if *name == "PI_CODING_AGENT_DIR" {
+            let private: bool = serde_json::from_str(
+                &std::fs::read_to_string(state.path().join("master/cwd/pi-private-config.json"))
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(private, "Pi inherited a foreign config directory");
+            continue;
+        }
         assert!(
             !names.iter().any(|n| n == name),
             "planted {name} reached the pi child: {names:?}"
@@ -589,6 +598,39 @@ fn master_env_is_allowlisted_not_inherited() {
     ] {
         assert!(names.iter().any(|n| n == name), "{name} missing: {names:?}");
     }
+    pi.close();
+}
+
+#[test]
+fn unconfined_master_error_names_the_private_config_it_read() {
+    let state = tempfile::tempdir().unwrap();
+    let pi = master_adapter(
+        "no-credits",
+        state.path(),
+        &[(cadence_agent::master::TEST_NO_LANDLOCK, "1".into())],
+    );
+    pi.open(&master_agent(state.path(), json!({"unconfined": true})))
+        .unwrap();
+    let error = pi.run_turn("hi", "m1", &|_| {}).unwrap_err().to_string();
+    assert!(
+        error.contains(state.path().join("master/pi").to_str().unwrap()),
+        "{error}"
+    );
+    assert!(error.contains("models.json is absent"), "{error}");
+    assert!(
+        !error.contains("Pi has no usable credentials"),
+        "missing config must not be diagnosed as proven bad credentials: {error}"
+    );
+    std::fs::write(state.path().join("master/pi/models.json"), "{}").unwrap();
+    let configured_error = pi.run_turn("hi", "m2", &|_| {}).unwrap_err().to_string();
+    assert!(
+        configured_error.contains("models.json is present"),
+        "{configured_error}"
+    );
+    assert!(
+        !configured_error.contains("models.json is absent"),
+        "{configured_error}"
+    );
     pi.close();
 }
 

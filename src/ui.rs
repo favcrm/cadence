@@ -2859,11 +2859,19 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             let operator = matches!(query("operator").as_deref(), Some("1" | "true"))
                 .then(|| home::operator_viewer(&request, state_dir, opts));
             let session = operator::meta(&request, state_dir, opts);
+            // Display the same verified identity that attributes public
+            // board writes, never a name supplied by request fields.
+            let actor = serde_json::from_value::<crate::operator_auth::BoardUser>(
+                session["session"]["user"].clone(),
+            )
+            .map(|user| user.actor())
+            .unwrap_or(actor);
             send(
                 request,
                 json_response(json!({
                     "read_only": opts.read_only,
                     "signed_in": session["signed_in"],
+                    "hosted": session["hosted"],
                     "session": session["session"],
                     "login_hint": session["login_hint"],
                     "tab_signed_out": session["tab_signed_out"],

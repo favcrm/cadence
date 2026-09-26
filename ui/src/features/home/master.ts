@@ -3,6 +3,7 @@ import type { Agent, AgentsPayload, MasterState } from "../../lib/types";
 /** The master's alias — `cadence master start` registers it (CAD-339). */
 export const MASTER = "master";
 export const START_COMMAND = "cadence master start";
+export const RESUME_COMMAND = "cadence agent resume master";
 
 export type MasterStatus =
   /** Agents not loaded yet. */
@@ -34,7 +35,7 @@ export function masterStatus(agents: AgentsPayload | null, threadMissing: boolea
 
 /** Why the composer is disabled, or null when it may send. `block` is
  *  why this board cannot write at all (read-only, not signed in). */
-export function composerBlock(block: string | null, status: MasterStatus): string | null {
+export function composerBlock(block: string | null, status: MasterStatus, hosted = false): string | null {
   if (block) return `${block} Messages cannot be sent until then.`;
   switch (status.kind) {
     case "unknown":
@@ -42,9 +43,11 @@ export function composerBlock(block: string | null, status: MasterStatus): strin
     case "offline":
       return "The daemon is not reachable — messages send once it is back.";
     case "absent":
+      if (hosted) return "Your assistant is unavailable. Your workspace administrator can check its setup.";
       return `The master is not started — run \`${START_COMMAND}\` first.`;
     case "stopped":
-      return `The master is stopped (${status.label}) — run \`${START_COMMAND}\` to bring it back.`;
+      if (hosted) return "Your assistant is unavailable. Your workspace administrator can restore it.";
+      return `The master is stopped (${status.label}) — run \`${RESUME_COMMAND}\` to bring it back.`;
     case "running":
       return null;
   }

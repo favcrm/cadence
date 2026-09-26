@@ -1237,8 +1237,35 @@ impl PiAdapter {
         if resp.get("success").and_then(Value::as_bool) == Some(true) {
             Ok(resp.get("data").cloned().unwrap_or(Value::Null))
         } else {
-            Err(command_error(command, &resp))
+            Err(self.command_error(command, &resp))
         }
+    }
+
+    fn command_error(&self, command: &str, resp: &Value) -> Error {
+        let error = command_error(command, resp);
+        if !self.shared.master.load(Ordering::SeqCst) {
+            return error;
+        }
+        let config = pi_config_dir(&self.state_dir);
+        let catalog = config.join("models.json");
+        if !catalog.is_file() {
+            let raw = resp
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error");
+            return Error::provider(format!(
+                "Pi '{command}' refused. \
+                 Pi master reads PI_CODING_AGENT_DIR={} — models.json is absent; \
+                 configure this directory if the model requires a custom catalog, \
+                 or check its authentication (provider said: {raw})",
+                config.display()
+            ));
+        }
+        Error::provider(format!(
+            "{error}; Pi master reads PI_CODING_AGENT_DIR={} \
+             (models.json is present; check the selected model and its authentication)",
+            config.display()
+        ))
     }
 
     /// `/model <id>` (CAD-551): `arg` is `provider/id`, a bare model id,
@@ -1761,7 +1788,7 @@ impl ProviderAdapter for PiAdapter {
                     if r.get("success").and_then(Value::as_bool) == Some(true) {
                         Ok(())
                     } else {
-                        Err(command_error("set_thinking_level", &r))
+                        Err(self.command_error("set_thinking_level", &r))
                     }
                 })
                 .and_then(|()| self.request("get_state", json!({})))
@@ -1785,7 +1812,7 @@ impl ProviderAdapter for PiAdapter {
         }
         let state = self.request("get_state", json!({}))?;
         if state.get("success").and_then(Value::as_bool) != Some(true) {
-            return Err(command_error("get_state", &state));
+            return Err(self.command_error("get_state", &state));
         }
         let data = state.get("data").cloned().unwrap_or(Value::Null);
         let session_id = data
@@ -1808,10 +1835,24 @@ impl ProviderAdapter for PiAdapter {
         // launch unless the running model is the allowlisted one.
         let matches = reported_full.as_deref() == Some(want) || reported_id == Some(want);
         if !matches {
+            let config_note = if master {
+                let config = pi_config_dir(&self.state_dir);
+                format!(
+                    "; Pi master reads PI_CODING_AGENT_DIR={} (models.json is {})",
+                    config.display(),
+                    if config.join("models.json").is_file() {
+                        "present"
+                    } else {
+                        "absent"
+                    }
+                )
+            } else {
+                String::new()
+            };
             return Err(Error::provider(format!(
                 "pi reports model {} but '{want}' was requested — the \
                  provider silently fell back instead of honoring \
-                 --model (CAD-559)",
+                 --model (CAD-559){config_note}",
                 reported_full.as_deref().or(reported_id).unwrap_or("<none>")
             )));
         }
@@ -1857,7 +1898,7 @@ impl ProviderAdapter for PiAdapter {
         *self.shared.turn.lock().unwrap() = TurnAcc::default();
         let resp = self.request("prompt", json!({"message": prompt}))?;
         if resp.get("success").and_then(Value::as_bool) != Some(true) {
-            return Err(command_error("prompt", &resp));
+            return Err(self.command_error("prompt", &resp));
         }
         *self.shared.active_turn.lock().unwrap() = Some(turn_id.clone());
         on_started(&turn_id);
