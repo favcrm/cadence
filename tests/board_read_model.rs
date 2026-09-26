@@ -83,11 +83,12 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let start = NEXT.fetch_add(1, Ordering::Relaxed) + std::process::id() as usize;
+    (0..89)
+        .map(|offset| 3110 + ((start + offset) % 89) as u16)
+        .find(|port| TcpListener::bind(("127.0.0.1", *port)).is_ok())
+        .expect("no isolated board port available")
 }
 
 fn get(port: u16, path: &str) -> (u16, String) {
@@ -249,6 +250,7 @@ fn start_ui(pm: &Path, state: &Path) -> (u16, BoardStop) {
             let opts = ui::ServeOpts {
                 host: "127.0.0.1".to_string(),
                 port,
+                dist: std::env::var_os("CADENCE_BUDGET_DIST").map(PathBuf::from),
                 stop: Some(stop),
                 // CAD-482: attach unconditionally under the feature —
                 // the token is read lazily per request, so a board may
@@ -910,4 +912,85 @@ fn overview_cache_holds_while_an_agent_runs_a_turn() {
         builds_after - builds
     );
     assert!(p < P95_BUDGET, "running-turn overview p95 {p:?}");
+}
+
+fn get_validated(port: u16, path: &str, etag: Option<&str>) -> (u16, String, String) {
+    let mut socket = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(120)))
+        .unwrap();
+    let condition = etag
+        .map(|tag| format!("If-None-Match: {tag}\r\n"))
+        .unwrap_or_default();
+    write!(
+        socket,
+        "GET {path} HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n{condition}\r\n"
+    )
+    .unwrap();
+    let mut bytes = String::new();
+    socket.read_to_string(&mut bytes).unwrap();
+    let (head, body) = bytes.split_once("\r\n\r\n").unwrap();
+    let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let etag = head
+        .lines()
+        .find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.eq_ignore_ascii_case("etag")
+                .then(|| value.trim().to_owned())
+        })
+        .unwrap_or_default();
+    (status, etag, body.to_owned())
+}
+
+#[test]
+fn collection_validators_omit_unchanged_bytes_and_move_after_writes() {
+    let fx = fixture(20, 0);
+    let (status, before, body) = get_validated(fx.port, "/api/issues", None);
+    assert_eq!(status, 200);
+    assert!(!before.is_empty());
+    assert!(body.len() > 1000);
+    let (status, same, body) = get_validated(fx.port, "/api/issues", Some(&before));
+    assert_eq!(status, 304);
+    assert_eq!(same, before);
+    assert!(body.is_empty(), "unchanged collection transfers no body");
+    let (ok, out) = cli(&fx.pm, &fx.state, &["issue", "set", "CAD-3", "status=done"]);
+    assert!(ok, "{out}");
+    let (status, after, body) = get_validated(fx.port, "/api/issues", Some(&before));
+    assert_eq!(status, 200);
+    assert_ne!(after, before);
+    assert!(body.contains("done"));
+    // A public validator cannot bypass the operator proof on a guarded
+    // collection. The server performs route authorization before 304.
+    let (status, _, _) = get_validated(fx.port, "/api/outbox", Some(&after));
+    assert_eq!(status, 403);
+}
+
+// CAD-611 MEASUREMENT FIXTURE — copy this section to the pinned baseline
+// tree for exactly the same scenario. Explicit, ignored, admitted runner only.
+#[test]
+#[ignore = "controlled browser measurement; admitted runner only"]
+fn board_live_measurement_fixture() {
+    assert!(
+        std::env::var_os("CADENCE_BUDGET_DIST").is_some(),
+        "built UI dist required"
+    );
+    let fx = fixture(ISSUES, JOBS);
+    let endpoint = std::env::var("CADENCE_BUDGET_ENDPOINT_FILE").expect("endpoint file required");
+    std::fs::write(&endpoint, format!("http://127.0.0.1:{}", fx.port)).unwrap();
+    // Browser warms up and measures idle, then starts this fixed busy
+    // workload explicitly. No wall-clock guess about Chrome startup.
+    wait_for("browser busy measurement trigger", 180, || {
+        Path::new(&format!("{endpoint}.busy")).exists()
+    });
+    for step in 0..20 {
+        let id = format!("CAD-{}", step + 2);
+        let (ok, out) = cli(
+            &fx.pm,
+            &fx.state,
+            &["issue", "set", &id, "title=network budget changed"],
+        );
+        assert!(ok, "{out}");
+        thread::sleep(Duration::from_secs(3));
+    }
+    thread::sleep(Duration::from_secs(15));
 }

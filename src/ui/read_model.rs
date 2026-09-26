@@ -532,6 +532,27 @@ fn diff_frames(kind: &str, old: &HashMap<String, u64>, new: &Entities, frames: &
     }
 }
 
+/// Opt-in entity clients retain legacy compatibility without refetching
+/// collections already supplied as authoritative entity patches.
+pub(super) fn entity_frame(text: &str) -> String {
+    let Some((head, tail)) = text.split_once("\ndata: ") else {
+        return text.into();
+    };
+    let Some(kind) = head.strip_prefix("event: ") else {
+        return text.into();
+    };
+    let Ok(mut data) = serde_json::from_str::<Value>(tail.trim()) else {
+        return text.into();
+    };
+    if matches!(kind, "issue" | "agent" | "plan") {
+        data["resource"] = json!(kind);
+        data["rev"] = json!(format!("{:016x}", value_fp(&data)));
+    } else if let Some(resources) = data["resources"].as_array_mut() {
+        resources.retain(|r| !matches!(r.as_str(), Some("issues" | "agents" | "issue")));
+    }
+    format!("event: {kind}\ndata: {data}\n\n")
+}
+
 fn fps(map: &Entities) -> HashMap<String, u64> {
     map.iter().map(|(k, (fp, _))| (k.clone(), *fp)).collect()
 }
@@ -827,7 +848,10 @@ impl Model {
             if stable["claim"].is_object() {
                 stable["claim"]["age_secs"] = Value::Null;
             }
-            cards.insert(id.clone(), (value_fp(&stable), card));
+            cards.insert(
+                id.clone(),
+                (value_fp(&json!([stable, folder_stamp(&v.issue.dir)])), card),
+            );
             let plan = plan::plan_json(v, &by_id);
             if !plan.is_null() {
                 plans.insert(id, (value_fp(&plan), plan));
@@ -886,12 +910,12 @@ impl Model {
         }
         let snap = Arc::new(fetch_daemon(&self.state_dir));
         self.keep_snap(snap.clone());
-        let jobs = snap.jobs_fp.is_some() && snap.jobs_fp != w.jobs;
+        let jobs = snap.jobs_fp != w.jobs;
         if jobs {
             w.jobs = snap.jobs_fp;
             frames.push(legacy_frame("jobs"));
         }
-        let agents = snap.agents_fp.is_some() && snap.agents_fp != w.agents;
+        let agents = snap.agents_fp != w.agents;
         if agents {
             w.agents = snap.agents_fp;
             frames.push(legacy_frame("agents"));
@@ -909,7 +933,15 @@ impl Model {
             w.cards = fps(&cards);
             w.plans = fps(&plans);
         }
-        if agents {
+        if jobs || agents {
+            // Bindings and totals can move without an agent row moving.
+            frames.push(frame(
+                "agent_meta",
+                &json!({
+                    "daemon": snap.agents["daemon"], "totals": snap.agents["totals"],
+                    "by_issue": snap.agents["by_issue"]
+                }),
+            ));
             let rows = agent_rows(&snap);
             diff_frames("agent", &w.rows, &rows, frames);
             w.rows = fps(&rows);
@@ -1029,6 +1061,28 @@ mod tests {
         assert_ne!(
             value_fp(&stable_row(&one)),
             value_fp(&stable_row(&mailbox(0, None, None)))
+        );
+    }
+
+    #[test]
+    fn entity_protocol_preserves_target_and_filters_covered_resources() {
+        let legacy = legacy_frame("jobs");
+        let text = entity_frame(&legacy);
+        assert!(!text.contains("\"issues\""));
+        assert!(!text.contains("\"agents\""));
+        assert!(text.contains("\"overview\""));
+        let source = frame(
+            "issue",
+            &json!({"id": "CAD-1", "op": "upsert", "issue": {"id": "CAD-1"}}),
+        );
+        let optimized = entity_frame(&source);
+        assert!(optimized.contains("\"resource\":\"issue\""));
+        assert!(optimized.contains("\"rev\":"));
+        assert!(optimized.contains("\"id\":\"CAD-1\""));
+        assert_eq!(
+            optimized,
+            entity_frame(&source),
+            "stable revision for stable patch"
         );
     }
 

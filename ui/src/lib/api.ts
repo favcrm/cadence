@@ -1,5 +1,6 @@
 import type { LanePayload } from "../features/issues/LaneCard";
-import { sessionHeaders } from "./sessionKey";
+import { ConditionalGet } from "./conditionalGet";
+import { sessionKey, sessionHeaders } from "./sessionKey";
 import type {
   AgentDetail,
   AgentsPayload,
@@ -72,9 +73,11 @@ export class ApiError extends Error {
   }
 }
 
+const conditional = new ConditionalGet(fetch, sessionKey);
+
 async function get<T>(path: string): Promise<T> {
-  const resp = await fetch(path, { headers: sessionHeaders() });
-  if (!resp.ok) {
+  const { response: resp, value } = await conditional.get<T>(path, sessionHeaders());
+  if (!resp.ok && !(resp.status === 304 && value !== undefined)) {
     const body = await resp.json().catch(() => null);
     throw new ApiError(
       body?.error ?? `${resp.status} ${resp.statusText}`,
@@ -82,7 +85,7 @@ async function get<T>(path: string): Promise<T> {
       body ?? undefined,
     );
   }
-  return resp.json() as Promise<T>;
+  return value as T;
 }
 
 export interface WriteResp {
