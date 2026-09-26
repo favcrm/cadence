@@ -18,3 +18,6 @@ Projects is a portfolio entry point. Selecting a project opens its overview. Iss
 Overview counts come from issue records, excluding epic containers from task totals. “Doing” is a tracker status, not proof of a live running agent. Progress remains the existing weighted server-derived epic/milestone progress; no fabricated aggregate percent or delivery date. Projects with no issues show an honest empty state. Unknown/unavailable data is not shown as zero or healthy.
 
 Preserve existing issue deep links, board/list preferences, filters, read-only behavior, project isolation, and all backend security contracts. Existing issue bookmarks with a view query still open Issues. No production rollout is part of this review.
+
+## Navigation polish
+The header shows the project breadcrumb; section links share the content left edge and mark the active destination with an underline. Links preserve browser Back navigation. Targets are 44px tall and wrap on narrow screens. Connection, refresh, theme and update controls share the header utility area and the Hugeicons set. The update control opens Reload/Later on demand, closes with Escape or an outside click, and no longer floats over the page by default.

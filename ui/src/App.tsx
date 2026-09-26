@@ -23,6 +23,7 @@ import ProjectFilter from "./ui/ProjectFilter";
 import SectionTabs from "./ui/SectionTabs";
 import StatusChips from "./ui/StatusChips";
 import ThemeToggle from "./ui/ThemeToggle";
+import BuildUpdateNotice from "./ui/BuildUpdateNotice";
 import Setup from "./features/setup/Setup";
 import SetupNudge from "./features/setup/SetupNudge";
 import Login from "./features/auth/Login";
@@ -33,8 +34,7 @@ import { sessionKey, setSessionKey } from "./lib/sessionKey";
 import { buildChanged, serverBuild, subscribeSse, UI_BUILD } from "./lib/sse";
 import { applyDraft, composerField, sessionStore, stashDraft, takeDraft } from "./lib/draft";
 import Toast, { type ToastMsg } from "./ui/Toast";
-import { Logo } from "./ui/Logo";
-import { IconChevron } from "./ui/icons";
+import { IconList } from "./ui/icons";
 import { countLabel, issueCounts } from "./lib/counts";
 import type { BoardFilters } from "./lib/filters";
 import type { UpdateBanner } from "./lib/types";
@@ -476,23 +476,6 @@ export default function App() {
 
   return (
     <WriteGate.Provider value={block}>
-    {staleBuild !== null && staleBuild !== dismissedBuild && (
-      <div
-        role="status"
-        data-build-banner
-        className="fixed right-4 top-14 z-50 flex items-center gap-3 rounded-lg border border-ink-700 bg-ink-850 px-4 py-3 text-ink-200 shadow-lg max-w-[calc(100vw-2rem)]"
-      >
-        <span className="text-label font-medium" title={staleBuild}>Cadence was updated</span>
-        <button
-          type="button"
-          onClick={reload}
-          className="h-7 shrink-0 rounded bg-ink-900 px-3 text-label font-medium text-ink-100 hover:opacity-85"
-        >
-          Reload
-        </button>
-        <button type="button" aria-label="Dismiss update notification" onClick={() => setDismissedBuild(staleBuild)} className="h-7 px-2 text-label text-ink-400 hover:text-ink-100">Later</button>
-      </div>
-    )}
     <div
       data-app-shell
       className={`grid lg:grid-cols-[208px_minmax(0,1fr)] bg-ink-900 ${
@@ -516,24 +499,27 @@ export default function App() {
           while this column stays `100dvh`. Every other screen keeps
           `min-h-screen` on that shell and the natural document flow. */}
       <div className={`min-w-0 flex flex-col ${screen === "home" ? "h-[100dvh] min-h-0" : ""}`}>
-        <header className="sticky top-0 z-10 h-[2.85rem] flex items-center gap-3 px-4 lg:px-8 border-b border-ink-700 bg-ink-900/95 backdrop-blur">
+        <header className="app-header sticky top-0 z-10 flex items-center gap-2 sm:gap-3 px-4 lg:px-8 border-b border-ink-700 bg-ink-900/95 backdrop-blur">
           <button
             onClick={() => setMenuOpen((o) => !o)}
-            className="lg:hidden -ml-1 inline-flex items-center gap-1.5 h-8 px-2 rounded text-ink-200 hover:bg-ink-800"
-            aria-label="menu"
+            className="header-menu header-icon -ml-1 shrink-0 gap-1 text-ink-200"
+            aria-label="Open navigation"
             aria-expanded={menuOpen}
+            aria-controls="mobile-navigation"
           >
-            <Logo size={17} />
-            <span className="text-label font-medium">cadence</span>
-            <IconChevron className={`transition-transform ${menuOpen ? "rotate-180" : ""}`} />
+            <IconList size={18} />
           </button>
-          <div className="num text-label text-ink-500 min-w-0 truncate">
-            <span className="hidden sm:inline text-ink-300">cadence</span>
-            <span className="hidden sm:inline"> / </span>
-            <span className="text-ink-100">{SCREEN_LABEL[screen]}</span>
-          </div>
+          <nav className="header-breadcrumb min-w-0 flex-1" aria-label="Breadcrumb">
+            {route.screen === "projects" && route.slug ? (
+              <>
+                <Link href={hrefFor({ screen: "projects", slug: null, section: "overview" })} className="hidden sm:inline-flex">Projects</Link>
+                <span className="hidden sm:inline text-ink-600" aria-hidden="true">/</span>
+                <span className="truncate text-ink-100" title={route.slug}>{route.slug}</span>
+              </>
+            ) : <span className="truncate text-ink-200 capitalize">{SCREEN_LABEL[screen]}</span>}
+          </nav>
 
-          <div className="ml-auto flex items-center gap-1 sm:gap-2 shrink-0">
+          <div className="ml-auto flex items-center gap-0 sm:gap-2 shrink-0">
             <StatusChips
               variant="header"
               readOnly={boardReadOnly}
@@ -545,6 +531,9 @@ export default function App() {
               <SignIn meta={meta} onChange={refresh} />
             </StatusChips>
             <ThemeToggle />
+            {staleBuild !== null && staleBuild !== dismissedBuild && (
+              <BuildUpdateNotice onReload={reload} onDismiss={() => setDismissedBuild(staleBuild)} />
+            )}
           </div>
         </header>
 
@@ -556,7 +545,7 @@ export default function App() {
         )}
 
         {menuOpen && (
-          <nav className="lg:hidden border-b border-ink-700 bg-ink-875 px-4 py-3 space-y-1">
+          <nav id="mobile-navigation" aria-label="Workspace" className="lg:hidden border-b border-ink-700 bg-ink-875 px-4 py-3 space-y-1">
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
               {NAV.map((item) => (
                 <Link
