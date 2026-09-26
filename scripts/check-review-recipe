@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""Catch stale Cargo target/feature names in the checked-in review recipe.
+
+This is static validation, not a shell evaluator or an authorization boundary.
+It uses Cargo metadata without compiling or running any Rust target. Python
+3.11+ is required for the standard-library TOML reader.
+"""
+
+import argparse
+import json
+from pathlib import Path
+import shlex
+import subprocess
+import sys
+import tomllib
+
+
+SELECTORS = {"--test": "test", "--bin": "bin", "--example": "example", "--bench": "bench"}
+
+
+def validate(recipe, metadata):
+    members = set(metadata["workspace_members"])
+    packages = [p for p in metadata["packages"] if p["id"] in members]
+    targets = {kind: set() for kind in SELECTORS.values()}
+    features = set()
+    for package in packages:
+        features.update(package["features"])
+        features.update(f"{package['name']}/{f}" for f in package["features"])
+        for target in package["targets"]:
+            for kind in targets:
+                if kind in target["kind"]:
+                    targets[kind].add(target["name"])
+
+    commands = [(key, command) for key in ("prepare", "gates") for command in recipe[key]]
+    commands += [(key, recipe[key]) for key in ("full_suite", "test_command")]
+    errors = []
+    for key, command in commands:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+        # Commands are data. Inspect only Cargo/nextest argument sequences;
+        # stop at shell separators and at the test runner's `--` boundary.
+        active = False
+        i = 0
+        while i < len(tokens):
+            token = tokens[i]
+            if token in ("&&", "||", ";", "|"):
+                active = False
+            if Path(token).name in ("cargo", "cadence-nextest"):
+                active = True
+            elif active and token == "--":
+                active = False
+            elif active:
+                flag, equal, value = token.partition("=")
+                if flag in SELECTORS or flag == "--features":
+                    if not equal:
+                        i += 1
+                        value = tokens[i] if i < len(tokens) else ""
+                    if not value or value.startswith("-"):
+                        errors.append(f"{key}: {flag} needs a value")
+                    elif flag in SELECTORS:
+                        if key == "test_command" and flag == "--test" and value == "{target}":
+                            pass  # review substitutes the discovered integration file's stem
+                        elif value not in targets[SELECTORS[flag]]:
+                            errors.append(f"{key}: missing Cargo {SELECTORS[flag]} target {value!r}")
+                    else:
+                        for feature in value.replace(",", " ").split():
+                            if feature not in features:
+                                errors.append(f"{key}: unknown Cargo feature {feature!r}")
+            i += 1
+    return errors
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent)
+    parser.add_argument("--recipe", type=Path, help="override recipe path (for regression checks)")
+    args = parser.parse_args()
+    recipe_path = args.recipe or args.root / "cadence-review.toml"
+    try:
+        recipe = tomllib.loads(recipe_path.read_text())
+        result = subprocess.run(
+            ["cargo", "metadata", "--no-deps", "--locked", "--format-version", "1"],
+            cwd=args.root, text=True, capture_output=True, check=True,
+        )
+        errors = validate(recipe, json.loads(result.stdout))
+    except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as error:
+        print(f"review-recipe: cannot validate {recipe_path}: {error}", file=sys.stderr)
+        if isinstance(error, subprocess.CalledProcessError):
+            print(error.stderr, file=sys.stderr)
+        return 1
+    if errors:
+        for error in errors:
+            print(f"review-recipe: {error}", file=sys.stderr)
+        return 1
+    print("review-recipe: all literal Cargo targets and features exist")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

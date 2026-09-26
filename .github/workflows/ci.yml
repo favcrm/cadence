@@ -123,6 +123,10 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: rustup toolchain install stable --profile minimal --component rustfmt
       - run: cargo fmt --all -- --check
+      # Metadata-only target/feature validation catches review-recipe drift
+      # without compiling another Rust configuration (CAD-635).
+      - run: python3 scripts/check-review-recipe
+      - run: python3 scripts/test-review-recipe
       # CAD-582: design tokens are generated from ui/src/styles.css —
       # fail when design/tokens.* is stale against it.
       - run: scripts/design-kit --check
@@ -187,6 +191,13 @@ jobs:
       # for (tests/split_map_inventory.rs is the suite-side twin check).
       - name: Verify doctor/host split-map consistency
         run: scripts/split-doctor-host --check
+      # The feature-on suite cannot compile cfg(not(test-seam)) proofs.
+      # Run only that identity contract in the production feature shape.
+      - name: Run default-feature test-seam refusal proofs
+        env:
+          CADENCE_SUITE_LOCK: ${{ runner.temp }}/cadence-suite.lock
+          CARGO_BUILD_JOBS: 4
+        run: scripts/cadence-nextest --test test_seam --locked
       - name: Run all Rust targets with pinned nextest
         id: nextest
         env:
