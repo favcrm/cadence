@@ -160,6 +160,8 @@ jobs:
           cache-dependency-path: ui/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
         working-directory: ui
+      - name: Test nextest cost reporting
+        run: python3 tests/scripts/test_nextest_cost_report.py
       # PR93 is an explicit dependency of this CI follow-up. Its installer
       # and wrapper verify the reviewed archive/binary, force retries=0, and
       # force --no-tests fail; no tool is installed into PATH or the repo.
@@ -186,10 +188,34 @@ jobs:
       - name: Verify doctor/host split-map consistency
         run: scripts/split-doctor-host --check
       - name: Run all Rust targets with pinned nextest
+        id: nextest
         env:
           CADENCE_SUITE_LOCK: ${{ runner.temp }}/cadence-suite.lock
           CARGO_BUILD_JOBS: 4
         run: scripts/cadence-nextest --all-targets --locked --features test-seam
+      # Observational timings come from the same run, including failed tests.
+      # No rerun, retry, test selection or required gate is changed here.
+      - name: Summarize Rust test costs
+        if: ${{ !cancelled() && (steps.nextest.outcome == 'success' || steps.nextest.outcome == 'failure') }}
+        run: |
+          report=target/nextest/cadence/junit.xml
+          if [ -s "$report" ]; then
+            python3 scripts/nextest-cost-report "$report" --json > "${{ runner.temp }}/nextest-costs.json"
+            python3 scripts/nextest-cost-report "$report" > "${{ runner.temp }}/nextest-costs.md"
+            cat "${{ runner.temp }}/nextest-costs.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Rust test costs unavailable: nextest did not produce a JUnit report.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Keep Rust test cost measurements
+        if: ${{ !cancelled() && (steps.nextest.outcome == 'success' || steps.nextest.outcome == 'failure') }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nextest-costs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/nextest-costs.json
+            ${{ runner.temp }}/nextest-costs.md
+          if-no-files-found: warn
+          retention-days: 14
       # cargo-nextest intentionally does not execute Rust doctests. Keep
       # doctests visible as a separate locked Cargo step rather than silently
       # dropping that coverage from cargo test --all-targets semantics.
