@@ -21,7 +21,8 @@ export function safeManageUrl(value: string | null): string | null {
   if (!value) return null;
   try {
     const url = new URL(value);
-    const keys = [...url.searchParams.keys()];
+    const keys: string[] = [];
+    url.searchParams.forEach((_, key) => keys.push(key));
     const company = url.searchParams.get("company");
     return url.origin === "https://app-v2.agenticos.hk" && url.pathname === "/account"
       && !url.username && !url.password && !url.hash

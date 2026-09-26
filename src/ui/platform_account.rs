@@ -164,7 +164,7 @@ mod tests {
                 assert!(!request.headers().iter().any(|h| {
                     ["Cookie", "Authorization", "X-Board-Session"]
                         .iter()
-                        .any(|name| h.field.equiv(*name))
+                        .any(|name| h.field.equiv(name))
                 }));
                 let response = if redirect {
                     tiny_http::Response::from_string("redirect")
