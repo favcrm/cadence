@@ -33,6 +33,9 @@ if [ "$3" = daemon ] && [ "$4" = start ]; then
   echo '{"status":"started"}'
   exit 0
 fi
+if [ "$3" = ui ]; then
+  exit 0
+fi
 exit 2
 "#,
         )
@@ -209,4 +212,56 @@ fn cad628_real_host_preserves_semantic_rpc_refusal() {
     server.join().unwrap();
     assert!(result.is_err(), "{result:?}");
     assert!(fixture.calls().is_empty());
+}
+
+#[test]
+fn cad628_real_host_recreates_a_board_that_survived_the_failed_daemon() {
+    let fixture = OldCli::new();
+    fixture.claim("operator:cad628");
+    // The old CLI is a recorder; it never signals this fixture process.
+    std::fs::write(fixture.state.join("ui.pid"), std::process::id().to_string()).unwrap();
+    let result = test_seam::scoped(Asserted::Operator, || {
+        fixture.host().restart(&fixture.binary)
+    });
+    assert!(matches!(result, Ok(RestartOutcome::Clean)), "{result:?}");
+    let calls = fixture.calls();
+    let actions: Vec<_> = calls.lines().collect();
+    assert_eq!(actions.len(), 3, "{calls}");
+    assert!(actions[0].contains("daemon start"), "{calls}");
+    assert!(actions[1].contains("ui stop"), "{calls}");
+    assert!(actions[2].contains("ui start"), "{calls}");
+}
+
+#[test]
+fn cad628_real_host_reports_old_schema_refusal_without_restoring() {
+    let fixture = OldCli::new();
+    fixture.claim("operator:cad628");
+    let backup = fixture.dir.path().join("backup.sqlite3");
+    std::fs::write(&backup, "operator-owned pre-update backup").unwrap();
+    std::fs::write(
+        &fixture.binary,
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$(dirname "$0")/calls"
+echo 'refusing: store schema 19 is newer than supported schema 18' >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    let result = test_seam::scoped(Asserted::Operator, || {
+        fixture.host().restart(&fixture.binary)
+    });
+    assert!(
+        matches!(result, Ok(RestartOutcome::Unclean(ref complaint)) if complaint.contains("store schema 19")),
+        "{result:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&backup).unwrap(),
+        "operator-owned pre-update backup"
+    );
+    assert_eq!(
+        cadence_agent::rollout::store_schema(&fixture.state).unwrap(),
+        Some(19)
+    );
+    assert_eq!(fixture.calls().lines().count(), 1);
+    assert!(!fixture.calls().contains("restore"));
 }

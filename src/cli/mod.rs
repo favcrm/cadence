@@ -3764,36 +3764,83 @@ impl cadence_agent::update::UpdateHost for RealUpdateHost<'_> {
     }
     fn restart(&self, binary: &Path) -> Result<cadence_agent::update::RestartOutcome> {
         use cadence_agent::update::RestartOutcome;
-        let mut cmd = Command::new(binary);
-        cmd.arg("--state-dir")
-            .arg(self.state_dir)
-            .args(["daemon", "restart", "--ui", "--as"])
-            .arg(&self.label)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        let out = cadence_agent::reaper::spawn(&mut cmd)
-            .and_then(|child| child.wait_with_output())
-            .map_err(|e| Error::internal(format!("could not run {}: {e}", binary.display())))?;
-        if out.status.success() {
-            return Ok(RestartOutcome::Clean);
-        }
-        // A non-zero exit is the restart's complaint, not a stop
-        // (CAD-561 r3): a fenced turn makes `daemon restart` exit
-        // non-zero with the new build up, and a failed `daemon start`
-        // or `ui start` leaves the daemon or the board down — only the
-        // health check that follows can tell, and it rolls back.
-        let complaint = String::from_utf8_lossy(&out.stderr);
-        let complaint = complaint.trim();
-        let exit = out.status.code().unwrap_or(-1);
-        Ok(RestartOutcome::Unclean(if complaint.is_empty() {
-            format!("the restart on {} exited {exit}", binary.display())
+        // Rollback may select an older CLI whose `daemon restart`
+        // requires a live fleet RPC. Select its cold-start command
+        // before invoking it, with the current updater's guards.
+        let caller = update::update_caller(self.state_dir, Some(&self.label))?;
+        refuse_restart_over_leftovers(self.state_dir)?;
+        let ticket = cadence_agent::rollout::begin_restart(self.state_dir, &caller)?;
+        let offline = match client::rpc_answer(self.state_dir, "agent_list", json!({})) {
+            Ok(Ok(_)) => false,
+            Ok(Err(refused)) => return Err(refused),
+            Err(_) => {
+                if !daemon_lock_free(self.state_dir) {
+                    return Err(Error::rejected(
+                        "daemon owns the state-dir lock but its fleet snapshot is unavailable — \
+                         refusing updater recovery before invoking the release binary",
+                    ));
+                }
+                true
+            }
+        };
+        let mut commands = if offline {
+            vec![vec!["daemon", "start", "--as", &self.label]]
         } else {
-            format!(
-                "the restart on {} exited {exit}: {complaint}",
-                binary.display()
-            )
-        }))
+            vec![vec!["daemon", "restart", "--ui", "--as", &self.label]]
+        };
+        if offline && cadence_agent::ui::detached_pid(self.state_dir).is_some() {
+            // Preserve the restart's --ui contract when a board survived
+            // the failed replacement. The selected release reads ui.json.
+            commands.extend([vec!["ui", "stop"], vec!["ui", "start"]]);
+        }
+        for args in commands {
+            cadence_agent::rollout::recheck_restart(self.state_dir, &ticket)?;
+            refuse_restart_over_leftovers(self.state_dir)?;
+            if offline && args[0] == "daemon" {
+                // Never shut down a daemon that appeared after the
+                // offline proof. Its own singleton is the final start
+                // protection; no recovery route restores or edits a DB.
+                if !daemon_lock_free(self.state_dir) {
+                    return Err(Error::rejected(
+                        "daemon acquired the state-dir lock before updater recovery — retry",
+                    ));
+                }
+                cadence_agent::rollout::note_restart_proceeded(self.state_dir, &ticket)?;
+            }
+            let mut cmd = Command::new(binary);
+            cmd.arg("--state-dir")
+                .arg(self.state_dir)
+                .args(&args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            if args.as_slice() == ["ui", "start"] {
+                cmd.env_remove("CADENCE_ALIAS");
+            }
+            let out = cadence_agent::reaper::spawn(&mut cmd)
+                .and_then(|child| child.wait_with_output())
+                .map_err(|e| Error::internal(format!("could not run {}: {e}", binary.display())))?;
+            if out.status.success() {
+                continue;
+            }
+            // A non-zero exit is the restart's complaint, not a stop
+            // (CAD-561 r3): a fenced turn makes `daemon restart` exit
+            // non-zero with the new build up, and a failed `daemon start`
+            // or `ui start` leaves the daemon or the board down — only the
+            // health check that follows can tell, and it rolls back.
+            let complaint = String::from_utf8_lossy(&out.stderr);
+            let complaint = complaint.trim();
+            let exit = out.status.code().unwrap_or(-1);
+            return Ok(RestartOutcome::Unclean(if complaint.is_empty() {
+                format!("the restart on {} exited {exit}", binary.display())
+            } else {
+                format!(
+                    "the restart on {} exited {exit}: {complaint}",
+                    binary.display()
+                )
+            }));
+        }
+        Ok(RestartOutcome::Clean)
     }
     fn daemon_build(&self) -> Result<Option<String>> {
         // CAD-598 r4/N2: a health poll must not sit on the default
