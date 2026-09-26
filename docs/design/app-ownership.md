@@ -79,6 +79,12 @@ changed authorization revision invalidates pending effects as appropriate.
 Project linking never confers connection access or app-edit authority. Preserve
 the app-team self-edit restriction work (CAD-622), independent of project links.
 
+Keep three approval layers distinct: installation approval authorizes the
+configured capability boundary; run/step execution requires the workflow's
+declared execution approval or explicit scoped standing approval; outbound
+effects require their release approval. Package approval alone cannot dispatch
+arbitrary workflows, and project-free runs retain execution gates.
+
 Scope record reads, assets, runs, outputs, search and event subscriptions as
 well as writes. Reject forged workspace/context fields, guessed IDs and stale
 references. Do not use a context dropdown as an authorization mechanism.
@@ -165,6 +171,8 @@ review and pinned merge queue; rollout stays a distinct authorized operation.
 ## Acceptance examples for implementation tickets
 
 - Install and run an app when no project exists; no hidden project created.
+- A context-free local run still requires its declared execution approval;
+  installation approval alone cannot dispatch it or release an outward effect.
 - One campaign links runs from three apps without transferring ownership.
 - Two clients cannot see each other's records, assets, events or effects.
 - A forged context ID or project link never expands a caller's capabilities.
