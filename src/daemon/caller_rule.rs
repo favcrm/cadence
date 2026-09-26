@@ -84,6 +84,14 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("health", Rule::Read),
     ("daemon_info", Rule::Read),
     ("shutdown", Rule::Shutdown),
+    // CAD-561: the update's drain gate is an operator action — an agent
+    // can never stop the fleet's work to push a build. `update_status`
+    // is the read side (the board's banner, `cadence update status`).
+    (
+        "update_drain",
+        Rule::Handler("operator_connection (CAD-561)"),
+    ),
+    ("update_status", Rule::Read),
     (
         "agent_register",
         Rule::Handler(

@@ -53,6 +53,7 @@ mod stop;
 mod tests;
 mod thread;
 mod ui;
+mod update;
 mod upgrade;
 mod workflow;
 
@@ -98,6 +99,7 @@ use std::process::Command;
 use std::time::Duration;
 use std::time::Instant;
 use thread::ThreadAction;
+use update::UpdateAction;
 use uuid::Uuid;
 use workflow::WorkflowAction;
 
@@ -1313,6 +1315,64 @@ pub(crate) enum Commands {
         /// Releases directory [default: read off the current link, else
         /// $XDG_DATA_HOME/cadence/releases]. An operator input: releases
         /// found there are candidates for reuse.
+        #[arg(long)]
+        releases_dir: Option<PathBuf>,
+    },
+    /// Update to the newest attested green main build in one command
+    /// (CAD-561): check → verify attestation + hash → backup → install
+    /// side by side → bounded drain → switch → health check → done.
+    /// The rollout lease is auto-claimed and auto-released, and the
+    /// pre-update backup (outside the state dir by default) is recorded
+    /// as the lease receipt, so no manual copy step. `--check` shows
+    /// what would happen and changes nothing; `--rollback` returns to
+    /// the previous release; `status` shows a pending update and what
+    /// it waits on. Operator-only: outside a pane with `--as`, never
+    /// from inside one. `upgrade` and `rollout` stay the low-level
+    /// commands.
+    Update {
+        #[command(subcommand)]
+        action: Option<UpdateAction>,
+        /// Show current vs available version, the merged PR titles
+        /// between them, whether a schema migration is involved and
+        /// what would block — changing nothing.
+        #[arg(long)]
+        check: bool,
+        /// Return to the previous release (attested), restart, health
+        /// check — and offer the backup restore when the schema changed.
+        #[arg(long, conflicts_with = "check")]
+        rollback: bool,
+        /// Wait at most this long for in-flight turns before switching:
+        /// 90s, 30m, 12h [default: 10m].
+        #[arg(long, default_value = "10m")]
+        drain: String,
+        /// Switch immediately: no drain wait; interrupted turns resume
+        /// after the restart.
+        #[arg(long, conflicts_with_all = ["check", "rollback"])]
+        now: bool,
+        /// Previous releases kept under the releases dir [default: 3].
+        #[arg(long, default_value_t = cadence_agent::update::DEFAULT_KEEP as u64,
+              value_parser = clap::value_parser!(u64).range(0..))]
+        keep: u64,
+        /// Where the pre-update backup goes [default:
+        /// `<state dir>/../cadence-backups`, outside the state dir].
+        #[arg(long)]
+        backup_dir: Option<PathBuf>,
+        /// Machine-readable JSON (with the progress lines) instead of
+        /// plain progress lines.
+        #[arg(long)]
+        json: bool,
+        /// Operator identity outside a cadence pane, for example
+        /// `operator:ada`. Required outside a pane; inside one this
+        /// command is refused.
+        #[arg(long = "as")]
+        as_identity: Option<String>,
+        /// GitHub repository whose CI built and attested the binary.
+        #[arg(long, default_value = cadence_agent::upgrade::DEFAULT_REPO)]
+        repo: String,
+        /// Symlink that puts cadence on PATH [default: ~/.local/bin/cadence].
+        #[arg(long)]
+        link: Option<PathBuf>,
+        /// Releases directory [default: read off the current link].
         #[arg(long)]
         releases_dir: Option<PathBuf>,
     },
@@ -3431,6 +3491,34 @@ pub(crate) fn run() -> Result<i32> {
             link,
             releases_dir,
         ),
+        Commands::Update {
+            action,
+            check,
+            rollback,
+            drain,
+            now,
+            keep,
+            backup_dir,
+            json,
+            as_identity,
+            repo,
+            link,
+            releases_dir,
+        } => update::run(
+            state_dir,
+            action,
+            check,
+            rollback,
+            drain,
+            now,
+            keep,
+            backup_dir,
+            json,
+            as_identity,
+            repo,
+            link,
+            releases_dir,
+        ),
         Commands::Sandbox { action } => sandbox::run(state_dir, action),
         Commands::Confine {
             read,
@@ -3451,6 +3539,157 @@ pub(crate) struct UpgradeArgs {
     repo: String,
     link: Option<PathBuf>,
     releases_dir: Option<PathBuf>,
+}
+
+pub(crate) struct UpdateArgs {
+    status: bool,
+    check: bool,
+    rollback: bool,
+    drain: String,
+    now: bool,
+    keep: u64,
+    backup_dir: Option<PathBuf>,
+    json: bool,
+    as_identity: Option<String>,
+    repo: String,
+    link: Option<PathBuf>,
+    releases_dir: Option<PathBuf>,
+}
+
+/// The production [`cadence_agent::update::UpdateHost`]: the daemon for
+/// the drain, the waiters and the health answers; the filesystem for
+/// the releases and the marker.
+pub(crate) struct RealUpdateHost<'a> {
+    state_dir: &'a Path,
+    layout: cadence_agent::upgrade::Layout,
+    source: cadence_agent::upgrade::Gh,
+    label: String,
+    /// Collect the plain lines for `--json`; `None` prints them as they
+    /// happen (the plain form).
+    collect: Option<std::cell::RefCell<Vec<String>>>,
+}
+
+impl RealUpdateHost<'_> {
+    fn line(&self, line: &str) {
+        match &self.collect {
+            Some(lines) => lines.borrow_mut().push(line.to_string()),
+            None => println!("{line}"),
+        }
+    }
+}
+
+impl cadence_agent::update::UpdateHost for RealUpdateHost<'_> {
+    fn state_dir(&self) -> &Path {
+        self.state_dir
+    }
+    fn layout(&self) -> &cadence_agent::upgrade::Layout {
+        &self.layout
+    }
+    fn source(&self) -> &dyn cadence_agent::upgrade::ReleaseSource {
+        &self.source
+    }
+    fn identity(&self) -> &str {
+        &self.label
+    }
+    fn progress(&self, line: &str) {
+        self.line(line);
+    }
+    fn waiters(&self) -> Result<Vec<cadence_agent::update::Waiter>> {
+        // The daemon's own view is authoritative (it reads the message
+        // rows); with no daemon running nothing is in flight.
+        let status = match client::rpc(self.state_dir, "update_status", json!({})) {
+            Ok(status) => status,
+            Err(_) => return Ok(Vec::new()),
+        };
+        Ok(status["waiting"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|r| {
+                        Some(cadence_agent::update::Waiter {
+                            alias: r["alias"].as_str()?.to_string(),
+                            message: r["message"].as_str().unwrap_or_default().to_string(),
+                            state: r["state"].as_str().unwrap_or_default().to_string(),
+                            age_secs: r["age_secs"].as_u64().unwrap_or(0),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+    fn set_pending(&self, pending: Option<&cadence_agent::update::PendingUpdate>) -> Result<()> {
+        match pending {
+            Some(pending) => cadence_agent::update::write_pending(self.state_dir, pending),
+            None => {
+                cadence_agent::update::clear_pending(self.state_dir);
+                Ok(())
+            }
+        }
+    }
+    fn set_drain(&self, on: bool) -> Result<()> {
+        let mut params = json!({"on": on, "label": self.label});
+        if on {
+            // The phase comes from the marker the pipeline just wrote;
+            // a daemon that is not running is not an error (there is
+            // nothing to drain, and the restart will start it).
+            let pending = cadence_agent::update::pending_update(self.state_dir);
+            if let Some(pending) = pending {
+                params["target"] = json!(pending.target);
+                params["phase"] = json!(pending.phase);
+                params["from"] = json!(pending.from);
+                params["since"] = json!(pending.since);
+            }
+        }
+        match client::rpc(self.state_dir, "update_drain", params) {
+            Ok(_) => Ok(()),
+            // A daemon that is down mid-update (the switch) has nothing
+            // to gate; the marker on disk covers the restart.
+            Err(e) if e.to_string().starts_with("Daemon is not reachable") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+    fn restart(&self, binary: &Path) -> Result<()> {
+        let mut cmd = Command::new(binary);
+        cmd.arg("--state-dir")
+            .arg(self.state_dir)
+            .args(["daemon", "restart", "--ui", "--as"])
+            .arg(&self.label)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let out = cadence_agent::reaper::spawn(&mut cmd)
+            .and_then(|child| child.wait_with_output())
+            .map_err(|e| Error::internal(format!("could not run {}: {e}", binary.display())))?;
+        if !out.status.success() {
+            return Err(Error::rejected(format!(
+                "the restart on {} failed (exit {}): {}",
+                binary.display(),
+                out.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        Ok(())
+    }
+    fn daemon_build(&self) -> Result<Option<String>> {
+        match client::rpc(self.state_dir, "daemon_info", json!({})) {
+            Ok(info) => Ok(info["build_commit"].as_str().map(str::to_string)),
+            Err(_) => Ok(None),
+        }
+    }
+    fn board_build(&self) -> Result<Option<String>> {
+        match cadence_agent::ui::health(self.state_dir) {
+            None => Ok(None),
+            Some((_port, body)) => Ok(serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|v| v["build"].as_str().map(str::to_string))),
+        }
+    }
+    fn now(&self) -> f64 {
+        cadence_agent::rollout::unix_now()
+    }
+    fn sleep(&self, duration: std::time::Duration) {
+        std::thread::sleep(duration);
+    }
 }
 
 /// Print or exec the native attach for an agent's live endpoint.

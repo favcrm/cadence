@@ -207,6 +207,16 @@ pub fn db_file(state_dir: &Path) -> PathBuf {
     state_dir.join("cadence.sqlite3")
 }
 
+/// The store's schema version, read without writing the database:
+/// `None` when there is no database yet (or it is fresh), so
+/// `cadence update --check` can say whether a migration is involved.
+pub fn store_schema(state_dir: &Path) -> Result<Option<i64>> {
+    match peek_schema(&db_file(state_dir))? {
+        Peek::Version(v) => Ok(Some(v)),
+        Peek::Missing | Peek::Fresh => Ok(None),
+    }
+}
+
 pub fn parse_ttl(raw: &str) -> Result<Duration> {
     let raw = raw.trim();
     let (num, mult) = if let Some(rest) = raw.strip_suffix('d') {
@@ -987,6 +997,13 @@ fn preview_force_refusal(
         None => Ok(Some("no rollout lease is held".into())),
         Some(lease) => Ok(force_holder_refusal(&lease, named, now)),
     }
+}
+
+/// The operator proof of [`require_operator_proof`], public for verbs
+/// outside this module that gate on the same rule (CAD-561's
+/// `cadence update`).
+pub fn require_operator(state_dir: &Path, verb: &str) -> Result<()> {
+    require_operator_proof(state_dir, verb)
 }
 
 /// `peer::operator_proof` for this process. Pane pids come from a

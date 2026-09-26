@@ -2714,6 +2714,10 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     "projects": projects, "issues": issues,
                     "daemon": daemon,
                     "embedded": cfg!(feature = "ui"),
+                    // CAD-561: which build is answering, so
+                    // `cadence update`'s health check can require the
+                    // board to come back on the new release.
+                    "build": crate::overview::BUILD_COMMIT,
                 })),
             );
         }

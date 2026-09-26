@@ -300,6 +300,10 @@ pub struct Shared {
     answered: Mutex<HashMap<String, (String, Value)>>,
     lifecycle: Mutex<Lifecycle>,
     closing: AtomicBool,
+    /// CAD-561: the pending update while one drains — `None` when no
+    /// update is in progress. Set by `update_drain`, restored from
+    /// `<state>/update.json` at boot, cleared by `update_drain off`.
+    draining: Mutex<Option<crate::update::PendingUpdate>>,
     /// PTY endpoint facts captured by [`Shared::begin_closing`] before
     /// any actor is woken. Idle actors detach on that wake and clear
     /// `pid`/`generation`; reading the rows later loses the adoption
@@ -491,6 +495,11 @@ impl Shared {
             answered: Mutex::new(HashMap::new()),
             lifecycle: Mutex::new(Lifecycle::default()),
             closing: AtomicBool::new(false),
+            // CAD-561: a pending update recorded by an update that is
+            // still running (a restart in the middle of one) keeps the
+            // fleet drained across the restart. A stale file — an
+            // update that died hours ago — is ignored.
+            draining: Mutex::new(crate::update::pending_update(state_dir)),
             shutdown_facts: Mutex::new(None),
             provider_log_dir,
             state_dir: state_dir.to_path_buf(),
@@ -1388,6 +1397,18 @@ impl Shared {
             // still wake the actor or a routed reply sits until the
             // 5s poll.
             let ticket = ctl.wake.ticket();
+            // CAD-561: while an update drains, no actor starts a new
+            // turn — queued deliveries stay in the inbox and are claimed
+            // after the restart (or when the drain is lifted). The
+            // in-flight turn this actor already runs is untouched.
+            if self.draining() {
+                if !self.store.agent(alias)?.enabled {
+                    return Ok(());
+                }
+                ctl.wake
+                    .wait_if_unchanged(ticket, Instant::now() + self.idle_poll);
+                continue;
+            }
             match self.store.take_queued(alias)? {
                 Take::Stop => return Ok(()),
                 Take::Empty => {
@@ -2007,6 +2028,10 @@ impl Shared {
                 // CAD-538: the hosted lease, when held — provider, epoch,
                 // expiry and the fence reason after a loss.
                 "lease": self.lease.as_ref().map(|l| l.status_json()),
+                // CAD-561: a pending update and what it waits on, so
+                // `cadence daemon status` and the board's banner show it.
+                "pending_update": self.pending_update().map(|p| p.to_json()),
+                "update_waiting": self.inflight_turns().unwrap_or_default(),
                 })
             }),
             // Build identity + process start — the deploy-drift check
@@ -2027,6 +2052,59 @@ impl Shared {
             "shutdown" => {
                 self.begin_closing();
                 Ok(json!({"state": "stopping"}))
+            }
+            // CAD-561: the update's drain gate. Operator-only, like
+            // every other action that stops the fleet's work: `on`
+            // records the pending update (also on disk, so a restart
+            // mid-update stays drained) and stops actors claiming new
+            // turns; `off` lifts both.
+            "update_drain" => {
+                self.operator_connection("update_drain", params, peer_pid)?;
+                if params["on"].as_bool() == Some(true) {
+                    // `label` names the update's owner for the report and
+                    // the banner. It is a label, not authority: the
+                    // connection is the authority (and this verb only
+                    // admits the operator), so no caller can become
+                    // another by writing it.
+                    let label = optional_str(params, "label").unwrap_or("operator");
+                    if label.is_empty()
+                        || label.len() > 200
+                        || label.chars().any(|c| c.is_control() || c == '\n' || c == '\r')
+                    {
+                        return Err(Error::rejected(
+                            "update_drain: label must be 1..=200 characters with no control \
+                             characters",
+                        ));
+                    }
+                    let pending = crate::update::PendingUpdate {
+                        phase: optional_str(params, "phase").unwrap_or("draining").to_string(),
+                        target: required_str(params, "target")?.to_string(),
+                        from: optional_str(params, "from").map(str::to_string),
+                        by: label.to_string(),
+                        since: params["since"]
+                            .as_f64()
+                            .unwrap_or_else(crate::rollout::unix_now),
+                    };
+                    crate::update::write_pending(&self.state_dir, &pending)?;
+                    *self.draining.lock().unwrap() = Some(pending);
+                } else {
+                    crate::update::clear_pending(&self.state_dir);
+                    *self.draining.lock().unwrap() = None;
+                }
+                self.wake();
+                Ok(json!({
+                    "draining": self.draining(),
+                    "pending_update": self.pending_update().map(|p| p.to_json()),
+                }))
+            }
+            "update_status" => {
+                let pending = self.pending_update();
+                let waiting = self.inflight_turns()?;
+                Ok(json!({
+                    "pending_update": pending.as_ref().map(|p| p.to_json()),
+                    "waiting": waiting,
+                    "waiting_count": waiting.len(),
+                }))
             }
             "agent_register" => self.rpc_register(params, peer_pid),
             "model_defaults_get" => self.rpc_model_defaults_get(),
@@ -2528,6 +2606,56 @@ impl Shared {
         }
         self.closing.store(true, Ordering::SeqCst);
         self.wake();
+    }
+
+    /// CAD-561: is a `cadence update` draining the fleet right now?
+    /// Every actor consults this before claiming its next turn.
+    fn draining(&self) -> bool {
+        self.draining.lock().unwrap().is_some()
+    }
+
+    /// The pending update, refreshed from disk so a marker written by
+    /// another process (the board, a test) is seen; a file that
+    /// disappeared clears the gate.
+    fn pending_update(&self) -> Option<crate::update::PendingUpdate> {
+        let on_disk = crate::update::pending_update(&self.state_dir);
+        let mut held = self.draining.lock().unwrap();
+        *held = on_disk.clone();
+        on_disk
+    }
+
+    /// The turns an update waits on: every `running`/`submitted`
+    /// message on a live actor, with its age. The message row is the
+    /// authoritative in-flight signal (the pane probe can read idle
+    /// between paste and render).
+    fn inflight_turns(&self) -> Result<Vec<Value>> {
+        let now = crate::rollout::unix_now();
+        let mut rows = Vec::new();
+        for agent in self.store.agents()? {
+            if !registry::has_actor(&agent.provider, &agent.endpoint_kind) {
+                continue;
+            }
+            let messages = self.store.messages(&agent.alias)?;
+            for m in messages {
+                if !matches!(m.state.as_str(), "running" | "submitted") {
+                    continue;
+                }
+                let since = m.started.unwrap_or(m.created);
+                rows.push(json!({
+                    "alias": agent.alias,
+                    "message": m.id,
+                    "state": m.state,
+                    "age_secs": (now - since).max(0.0).round() as u64,
+                }));
+            }
+        }
+        rows.sort_by(|a, b| {
+            b["age_secs"]
+                .as_u64()
+                .cmp(&a["age_secs"].as_u64())
+                .then_with(|| a["alias"].as_str().cmp(&b["alias"].as_str()))
+        });
+        Ok(rows)
     }
 
     /// Graceful daemon stop: the only path that may write the

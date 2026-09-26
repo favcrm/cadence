@@ -164,6 +164,17 @@ pub trait ReleaseSource {
     /// [`Self::repo`], built from `sha` on `main`. Returns a short
     /// description of what was verified.
     fn verify_attestation(&self, binary: &Path, sha: &str) -> Result<String>;
+    /// CAD-561: the PR titles merged between `base` and `head` — what
+    /// `cadence update --check` shows as the change summary. A squash
+    /// merge's subject is the PR title with its number, which is what
+    /// GitHub's compare endpoint returns; a source that cannot answer
+    /// returns an empty list rather than failing the check.
+    fn merged_titles(&self, base: &str, head: &str) -> Result<Vec<String>>;
+    /// CAD-561: `SCHEMA_VERSION` in `src/rollout.rs` at `sha`, so
+    /// `--check` can say whether the new build crosses the store's
+    /// schema without downloading or running it. `None` when the file
+    /// or the constant cannot be read.
+    fn schema_version(&self, sha: &str) -> Result<Option<i64>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -428,6 +439,69 @@ impl ReleaseSource for Gh {
             tail(&out.stderr)
         )))
     }
+
+    /// The compare endpoint's commit subjects, filtered to the squash
+    /// merges that carry a PR number (`CAD-123: title (#456)`) — the
+    /// merged PR titles between the two builds, newest last.
+    fn merged_titles(&self, base: &str, head: &str) -> Result<Vec<String>> {
+        let path = format!("repos/{}/compare/{base}...{head}", self.repo);
+        let out = self.run(
+            &[
+                "api",
+                &path,
+                "--jq",
+                r#"[.commits[].commit.message | split("\n")[0]] | .[]"#,
+            ],
+            GH_TIMEOUT,
+        )?;
+        if !out.status.success() {
+            return Ok(Vec::new());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| is_merged_pr_subject(line))
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// `src/rollout.rs` at that sha, read as raw content, parsed for
+    /// `pub const SCHEMA_VERSION: i64 = N;`. Best effort: an API failure
+    /// (or a sha GitHub does not serve) answers `None`, and `--check`
+    /// says the schema could not be read.
+    fn schema_version(&self, sha: &str) -> Result<Option<i64>> {
+        let path = format!("repos/{}/contents/src/rollout.rs?ref={sha}", self.repo);
+        let out = self.run(
+            &[
+                "api",
+                "-H",
+                "Accept: application/vnd.github.raw",
+                &path,
+            ],
+            GH_TIMEOUT,
+        )?;
+        if !out.status.success() {
+            return Ok(None);
+        }
+        Ok(parse_schema_version(&String::from_utf8_lossy(&out.stdout)))
+    }
+}
+
+/// A squash-merge commit subject: the PR title followed by `(#N)`.
+pub fn is_merged_pr_subject(subject: &str) -> bool {
+    let trimmed = subject.trim_end();
+    trimmed.ends_with(')')
+        && trimmed
+            .rfind("(#")
+            .is_some_and(|at| trimmed[at + 2..trimmed.len() - 1].bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The first `pub const SCHEMA_VERSION: i64 = <n>;` in `src/rollout.rs`.
+pub fn parse_schema_version(source: &str) -> Option<i64> {
+    source.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("pub const SCHEMA_VERSION: i64 = ")?;
+        rest.trim().trim_end_matches(';').trim().parse().ok()
+    })
 }
 
 // ---------------------------------------------------------------------------
