@@ -969,6 +969,12 @@ button.refchip:hover {
   .chat-scroll {
     padding-bottom: calc(var(--dock-h, 7rem) + .75rem + var(--need-clear));
   }
+  /* The pill was centred in the same band as Needs-you, so the two hit
+     targets overlapped. It sits above that band; the thread padding
+     already keeps the last message above the button. */
+  .newpill {
+    bottom: calc(var(--dock-h, 7rem) + .75rem + var(--need-clear));
+  }
 }
 
 /* The empty and not-started states sit centred in the panel — the

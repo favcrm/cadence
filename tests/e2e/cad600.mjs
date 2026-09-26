@@ -236,6 +236,25 @@ async function checkLayout(page) {
   );
 }
 
+/** The jump pill clears the dock, and on a phone it does not share a
+ *  hit target with the Needs-you button. */
+async function assertPillClear(page) {
+  const geom = await page.evaluate(() => {
+    const pill = document.querySelector(".newpill")?.getBoundingClientRect() ?? null;
+    const dock = document.querySelector("[data-chat-dock]")?.getBoundingClientRect() ?? null;
+    const need = document.querySelector(".needbtn");
+    const shown = !!(need && getComputedStyle(need).display !== "none" && need.getClientRects().length);
+    return { pill, dock, need: shown ? need.getBoundingClientRect() : null };
+  });
+  ok(geom.pill && geom.dock && geom.pill.bottom <= geom.dock.top + 1, "the pill sits above the dock");
+  if (geom.need) {
+    ok(
+      !overlaps(geom.pill, geom.need),
+      `the jump pill stays clear of Needs-you (pill ${JSON.stringify(geom.pill)} button ${JSON.stringify(geom.need)})`,
+    );
+  }
+}
+
 async function main() {
   fs.mkdirSync(out, { recursive: true });
   const browser = await chromium.launch({
@@ -313,14 +332,7 @@ async function main() {
     }
     if (await pill.isVisible()) {
       await expectText(pill, "new", "the pill counts the arrival");
-      if (asserts) {
-        const above = await page.evaluate(() => {
-          const p = document.querySelector(".newpill")?.getBoundingClientRect();
-          const d = document.querySelector("[data-chat-dock]")?.getBoundingClientRect();
-          return p && d ? p.bottom <= d.top : false;
-        });
-        ok(above, "the pill sits above the dock");
-      }
+      if (asserts) await assertPillClear(page);
       await page.waitForTimeout(300);
       await shot(page, `${size}-dark-pill`);
       await pill.click();
@@ -368,6 +380,28 @@ async function main() {
     await toTail(page);
     await page.waitForTimeout(400);
     await shot(page, `${size}-light-tail`);
+
+    // Phone, light: the same pill, now that the theme has flipped. The
+    // dark shot above is not enough — the review's overlap was visible
+    // in both themes, and the light tail is where the button covered
+    // the last user bubble.
+    if (size === "phone") {
+      await toTop(page);
+      await page.waitForTimeout(200);
+      await send(page, "one more in the light theme", Date.now());
+      try {
+        await pill.waitFor({ state: "visible", timeout: asserts ? 15_000 : 6_000 });
+      } catch {
+        if (asserts) throw new Error("the jump-to-latest pill never appeared in the light theme");
+        console.log("note: the light pill did not appear — skipped");
+      }
+      if (await pill.isVisible()) {
+        await expectText(pill, "new", "the light pill counts the arrival");
+        if (asserts) await assertPillClear(page);
+        await page.waitForTimeout(300);
+        await shot(page, `${size}-light-pill`);
+      }
+    }
 
     console.log(`cad600: ${tag} ${size} evidence captured${asserts ? " (layout checks passed)" : ""}`);
   } finally {
