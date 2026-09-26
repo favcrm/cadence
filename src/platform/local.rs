@@ -162,8 +162,25 @@ pub struct LocalAdapter {
     /// The outbox root: `<outbox>/<project>/<effect_id>/`.
     outbox: PathBuf,
     /// The board's loopback origin (`http://127.0.0.1:<port>`) the
-    /// outcome's `board_url` links into.
+    /// outcome's `board_url` links into when no live `ui.json` port
+    /// resolves — the fallback, not the truth: `board_url()` prefers
+    /// the persisted board port at send time so a board started or
+    /// moved after the daemon registered is named correctly.
     board_url: String,
+}
+
+impl LocalAdapter {
+    /// The origin the outcome's `board_url` should name right now:
+    /// the board port `ui.json` persists — a `sandbox up` starts the
+    /// daemon before the board, so a register-time read always sees
+    /// the 3010 default — else the value `register`/`register_at`
+    /// pinned.
+    fn board_url(&self) -> String {
+        crate::ui::persisted_opts(&self.state_dir)
+            .port
+            .map(|port| format!("http://127.0.0.1:{port}"))
+            .unwrap_or_else(|| self.board_url.clone())
+    }
 }
 
 /// A parsed, shape-checked `publish` input. Attachment paths keep
@@ -870,7 +887,7 @@ impl PlatformAdapter for LocalAdapter {
             .collect();
         let content_sha = sha256_hex(format!("{post_sha}\n{}", att_shas.join("\n")).as_bytes());
         let published_at = crate::issue::time::iso(crate::issue::time::now_epoch());
-        let board_url = format!("{}/outbox?item={idempotency_key}", self.board_url);
+        let board_url = format!("{}/outbox?item={idempotency_key}", self.board_url());
         let result = json!({
             "platform_ref": format!("outbox/{}/{idempotency_key}", post.project),
             "board_url": board_url,
