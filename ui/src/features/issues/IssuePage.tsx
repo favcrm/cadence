@@ -20,6 +20,7 @@ import {
   CI_UNAVAILABLE,
   issuePath,
   kickoffBlock,
+  laneFenceBanner,
   prRef,
   QUEUE_UNAVAILABLE,
   shownLinks,
@@ -74,7 +75,9 @@ interface Props {
 
 export default function IssuePage(props: Props) {
   const state = useQuery(resources.issue(props.id));
+  const laneState = useQuery(resources.lane(props.id));
   const detail = state.data?.id === props.id ? state.data : null;
+  const lane = laneState.data?.issue === props.id ? laneState.data : null;
   const [history, setHistory] = useState<IssueHistoryEntry[]>([]);
   const [kickoff, setKickoff] = useState(false);
 
@@ -102,7 +105,7 @@ export default function IssuePage(props: Props) {
 
   return (
     <>
-      <PageBody {...props} detail={detail} history={history} setKickoff={setKickoff} />
+      <PageBody {...props} detail={detail} history={history} lane={lane} setKickoff={setKickoff} />
       {kickoff && (
         <KickoffDialog
           id={detail.id}
@@ -132,6 +135,7 @@ function PageBody({
   issues,
   detail,
   history,
+  lane,
   readOnly,
   writeBlock,
   onWrite,
@@ -141,6 +145,7 @@ function PageBody({
 }: Props & {
   detail: IssueDetail;
   history: IssueHistoryEntry[];
+  lane: LanePayload | null;
   setKickoff: (open: boolean) => void;
 }) {
   const items = acceptanceItems(detail.body);
@@ -150,24 +155,13 @@ function PageBody({
   const approveWhy = approveReason(detail.refs);
   const rows = timelineRows(detail, history);
   const done = items.filter((i) => i.checked).length;
-  const fenced = agents.some((a) => a.state === "fenced" || a.state === "attention");
+  const fenced = laneFenceBanner(lane?.lane?.state);
   const images = detail.artifacts.filter((f) => IMG.test(f.name));
   const files = detail.artifacts.filter((f) => !IMG.test(f.name));
-  const [lane, setLane] = useState<LanePayload | null | undefined>(undefined);
   const [compose, setCompose] = useState<"ask" | "instruct">("ask");
-  useEffect(() => {
-    let live = true;
-    api
-      .lane(id)
-      .then((payload) => live && setLane(payload))
-      .catch(() => live && setLane(null));
-    return () => {
-      live = false;
-    };
-  }, [id, detail.rev]);
   const reloadLane = () => {
     void resources.issue(id).invalidate();
-    void api.lane(id).then(setLane).catch(() => setLane(null));
+    void resources.lane(id).invalidate();
   };
   const epics = issues.filter((i) => i.project === project && i.id !== id && (i.container || i.work?.type === "epic"));
   const hrefFor = (issueId: string) => {
@@ -282,8 +276,8 @@ function PageBody({
           {tab === "conversation" && (
             <LaneConversation
               issue={id}
-              agent={lane?.lane?.agent ?? agents[0]?.alias ?? null}
-              state={lane?.lane?.state ?? agents[0]?.state ?? null}
+              agent={lane?.lane?.agent ?? null}
+              state={lane?.lane?.state ?? null}
               mode={compose}
               onMode={setCompose}
             />
