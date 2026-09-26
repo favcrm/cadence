@@ -94,6 +94,8 @@ export interface SseOptions {
   /** Named events to listen for; `message` covers unnamed frames. */
   events: string[];
   onEvent: (event: SseEvent) => void;
+  /** Every successful open, including native reconnects. */
+  onOpen?: () => void;
   /** Resume point from earlier (say, the last entry already cached). */
   lastEventId?: string | null;
   /** First delay before reopening a closed source; doubles per failure. */
@@ -202,6 +204,7 @@ export function subscribeSse(opts: SseOptions): SseSubscription {
     es.onopen = () => {
       if (source !== es) return;
       delay = firstDelay;
+      opts.onOpen?.();
       // Up again — a pending down-probe is stale.
       streamDown = false;
       downGen++;

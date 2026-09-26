@@ -654,7 +654,12 @@ fn host_allowed(host: &str, port: u16, extra: &[String]) -> bool {
 
 fn json_response(value: Value) -> Response<std::io::Cursor<Vec<u8>>> {
     let body = serde_json::to_vec_pretty(&value).unwrap_or_default();
+    use sha2::{Digest, Sha256};
+    let etag = format!("\"{:x}\"", Sha256::digest(&body));
     let mut resp = Response::from_data(body).with_status_code(StatusCode(200));
+    resp.add_header(Header::from_bytes("ETag", etag).unwrap());
+    resp.add_header(Header::from_bytes("Cache-Control", "private, no-cache").unwrap());
+    resp.add_header(Header::from_bytes("Vary", "Cookie, X-Cadence-Session").unwrap());
     resp.add_header(Header::from_bytes("Content-Type", "application/json").unwrap());
     resp
 }
@@ -2510,7 +2515,26 @@ fn artifact_response(view: &board::View, name: &str) -> HttpResp {
 
 fn send(request: Request, mut resp: HttpResp, head_only: bool) {
     add_security_headers(&mut resp);
-    if head_only {
+    // Only after the route has run its authorization and validation. A
+    // validator can never turn an operator-only refusal into a 304.
+    let not_modified = request.method() == &Method::Get
+        && resp.status_code() == StatusCode(200)
+        && resp
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("ETag"))
+            .is_some_and(|etag| {
+                header_value(&request, "If-None-Match").is_some_and(|values| {
+                    values.split(',').any(|v| v.trim() == etag.value.as_str())
+                })
+            });
+    if not_modified {
+        let mut bare = Response::empty(StatusCode(304));
+        for h in resp.headers() {
+            bare.add_header(h.clone());
+        }
+        let _ = request.respond(bare);
+    } else if head_only {
         // tiny_http does not strip bodies on HEAD — answer with the
         // same headers as GET, minus the body.
         let mut bare = Response::empty(resp.status_code());
@@ -2631,7 +2655,19 @@ fn event_resources(name: &str) -> &'static [&'static str] {
 /// frame. `into_writer` hands over the socket: the head is written by
 /// hand, each frame flushes immediately, and dropping the writer on
 /// exit closes the stream — which is also how a dead client surfaces.
+fn stream_hello(entities: bool) -> String {
+    let mut data = json!({"build": crate::overview::BUILD_ID});
+    if entities {
+        data["entities"] = json!(true);
+    }
+    format!("event: hello\ndata: {data}\n\n")
+}
+
 fn stream_events(request: Request, state_dir: &Path, pm_dir: &Path) {
+    let entities = request
+        .url()
+        .split_once('?')
+        .is_some_and(|(_, q)| q.split('&').any(|part| part == "entities=1"));
     let mut w = request.into_writer();
     // Join the board's shared watcher before the head goes out: the
     // first subscriber's baseline is taken inside `subscribe`, so the
@@ -2653,10 +2689,7 @@ fn stream_events(request: Request, state_dir: &Path, pm_dir: &Path) {
     // running an older bundle compares and prompts a reload, CAD-573)
     // and the `: ping` right behind it proves the stream is live and
     // gives proxies something to flush before the first event exists.
-    let hello = format!(
-        "event: hello\ndata: {}\n\n",
-        json!({"build": crate::overview::BUILD_ID})
-    );
+    let hello = stream_hello(entities);
     if !frame(&mut w, hello.as_bytes()) || !frame(&mut w, b": ping\n\n") {
         return;
     }
@@ -2668,7 +2701,9 @@ fn stream_events(request: Request, state_dir: &Path, pm_dir: &Path) {
         match rx.recv_timeout(Duration::from_secs(15)) {
             Ok(f) if &*f == read_model::HEARTBEAT => {}
             Ok(f) => {
-                if !frame(&mut w, f.as_bytes()) {
+                let optimized = entities.then(|| read_model::entity_frame(&f));
+                let bytes = optimized.as_deref().unwrap_or(&f);
+                if !frame(&mut w, bytes.as_bytes()) {
                     return;
                 }
                 ping_at = Instant::now() + Duration::from_secs(15);
@@ -2677,7 +2712,12 @@ fn stream_events(request: Request, state_dir: &Path, pm_dir: &Path) {
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
         }
         if Instant::now() >= ping_at {
-            if !frame(&mut w, b": ping\n\n") {
+            let ping: &[u8] = if entities {
+                b"event: heartbeat\ndata: {}\n\n"
+            } else {
+                b": ping\n\n"
+            };
+            if !frame(&mut w, ping) {
                 return;
             }
             ping_at = Instant::now() + Duration::from_secs(15);
@@ -4285,6 +4325,26 @@ mod tests {
     /// CAD-480: a mailbox row on the Agents screen carries its unread
     /// backlog and oldest-unread age from `agent.inbox`, and the unread
     /// count folds into the queued total.
+    #[test]
+    fn stream_hello_capability_is_opt_in() {
+        assert_eq!(
+            super::stream_hello(false),
+            format!(
+                "event: hello\ndata: {}\n\n",
+                json!({"build": crate::overview::BUILD_ID})
+            ),
+            "legacy hello remains byte-compatible"
+        );
+        assert_eq!(
+            super::stream_hello(true),
+            format!(
+                "event: hello\ndata: {}\n\n",
+                json!({"build": crate::overview::BUILD_ID, "entities": true})
+            ),
+            "only opted-in clients receive the entity capability"
+        );
+    }
+
     #[test]
     fn agents_payload_inbox_row_reports_unread_backlog() {
         let dir = tempfile::TempDir::new().unwrap();

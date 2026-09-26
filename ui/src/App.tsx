@@ -37,7 +37,8 @@ import { IconChevron } from "./ui/icons";
 import { countLabel, issueCounts } from "./lib/counts";
 import type { BoardFilters } from "./lib/filters";
 import type { UpdateBanner } from "./lib/types";
-import { invalidatedBy } from "./lib/cache";
+import { LiveUpdates, patchRows } from "./lib/liveUpdates";
+import type { Agent, AgentsPayload } from "./lib/types";
 import { cache, resources } from "./lib/resources";
 import { useMaybeResource, useResource } from "./lib/useResource";
 import {
@@ -262,40 +263,63 @@ export default function App() {
 
   useEffect(refresh, [refresh]);
 
-  // Live updates: each /api/stream frame names the resources it
-  // invalidates (`{"resources":[...]}`, `event_resources` in src/ui.rs);
-  // only those refetch, coalesced per resource. The stream's `hello`
-  // frame — and /api/version once it has been down ~15 s — reports the
-  // serving build: a mismatch means this bundle predates a rollout and
-  // the banner offers a reload (CAD-573). The 30 s poll below stays as
-  // the fallback while the stream is down.
+  const liveUpdates = useRef<LiveUpdates | null>(null);
   useEffect(() => {
-    const sub = subscribeSse({
-      url: "/api/stream",
-      events: ["issues", "agents", "jobs", "monitoring"],
-      onEvent: (e) => {
-        for (const name of invalidatedBy(e.data)) {
-          // Families are keyed stores — invalidate the prefix, not one entry.
-          if (
-            name === "issue" ||
-            name === "workflows" ||
-            name === "app" ||
-            name === "app_runs" ||
-            name === "app_outputs"
-          ) {
-            cache.invalidate(name);
-          } else if (name === "overview") {
-            // Hidden overview: skip — it revalidates when a screen that
-            // reads it opens.
-            if (overviewWantedRef.current) void resources.overview.invalidate();
-          } else void resources[name].invalidate();
+    const updates = new LiveUpdates({
+      resync: refresh,
+      invalidate: (key) => {
+        if (key === "overview" && !overviewWantedRef.current) {
+          resources.overview.markInvalid();
+        } else cache.invalidate(key);
+      },
+      patch: (event, data) => {
+        if (event.type === "issue") {
+          if (typeof data.id !== "string" || !["upsert", "delete"].includes(String(data.op)) ||
+              (data.op === "upsert" && (!data.issue || typeof data.issue !== "object"))) {
+            refresh(); return;
+          }
+          if (resources.issues.get().data === null) {
+            void resources.issues.invalidate();
+          } else resources.issues.mutate((rows) => patchRows(rows, data.id as string, data.op, data.issue as IssueCard, (row) => row.id));
+        } else if (event.type === "agent") {
+          if (typeof data.id !== "string" || !["upsert", "delete"].includes(String(data.op)) ||
+              (data.op === "upsert" && (!data.agent || typeof data.agent !== "object"))) {
+            refresh(); return;
+          }
+          if (resources.agents.get().data === null) {
+            void resources.agents.invalidate();
+          } else resources.agents.mutate((value) => ({ ...value,
+            agents: patchRows(value.agents, data.id as string, data.op, data.agent as Agent, (row) => row.alias),
+          }));
+        } else {
+          if (!data.by_issue || !data.daemon || !("totals" in data)) { refresh(); return; }
+          resources.agents.mutate((value) => ({ ...value,
+            daemon: data.daemon as AgentsPayload["daemon"],
+            totals: data.totals as AgentsPayload["totals"],
+            by_issue: data.by_issue as AgentsPayload["by_issue"],
+          }));
+          // Issue-page lane stores depend on runtime state, including
+          // changes which leave their issue card unchanged.
+          // LiveUpdates batches the dependent lane invalidation.
         }
       },
+    });
+    liveUpdates.current = updates;
+    const sub = subscribeSse({
+      url: "/api/stream?entities=1",
+      events: ["hello", "heartbeat", "issues", "agents", "jobs", "monitoring", "issue", "agent", "agent_meta", "plan"],
+      onEvent: updates.event,
+      onOpen: updates.opened,
+      onError: updates.failed,
       onBuild: (server) => setStaleBuild(buildChanged(server, UI_BUILD) ? server : null),
       probeBuild: serverBuild,
     });
-    return () => sub.close();
-  }, [loadDetail]);
+    return () => {
+      updates.close();
+      sub.close();
+      if (liveUpdates.current === updates) liveUpdates.current = null;
+    };
+  }, [refresh]);
 
   // The banner's only action — never automatic. The composer draft is
   // stashed first so one click costs no text (CAD-573).
@@ -328,12 +352,12 @@ export default function App() {
     };
   }, []);
 
-  // Fallback poll — re-read on focus and every 30s while the tab is
-  // visible, covering any gap while the stream reconnects.
+  // Full reads are recovery only: suppress them while named heartbeat
+  // frames prove the stream healthy; reconnects resync immediately.
   useEffect(() => {
-    const onFocus = () => refresh();
+    const onFocus = () => { if (!liveUpdates.current?.healthy()) refresh(); };
     const tick = () => {
-      if (document.visibilityState === "visible") refresh();
+      if (document.visibilityState === "visible" && !liveUpdates.current?.healthy()) refresh();
     };
     const timer = setInterval(tick, 30_000);
     addEventListener("focus", onFocus);
