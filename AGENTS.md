@@ -88,6 +88,17 @@ this workflow exactly.
   `pi --list-models -e ~/.pi/agent/npm/node_modules/pi-devin/extensions/index.ts | grep devin`
   and
   `pi -p "Reply with exactly: ok" --no-extensions -e <that path> --model devin/deepseek-v4-1-flash-high`.
+- If deepseek answers `Your Windsurf version is out of date` while
+  `devin/swe-2-high` works and the Devin CLI itself runs deepseek fine,
+  the backend is gating the extension's `ide` field, not its version:
+  `pi-devin` ≤ 0.2.1 sends `ide="devin-desktop"` for every request, and
+  Cognition version-gates that ide for non-Local models. The local fix
+  (applied on this host, 2026-09-26) patches
+  `~/.pi/agent/npm/node_modules/pi-devin/src/stream.ts` so the chat
+  metadata sends `ide="windsurf"` unless the model uid starts with
+  `gpt-5-6-` (Devin Local-only models still need `devin-desktop`).
+  A reinstall of the pinned package reverts it — re-apply or fix
+  upstream.
 
 ### Production safety
 - A production daemon runs on this host. Never touch

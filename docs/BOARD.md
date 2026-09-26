@@ -143,6 +143,15 @@ loading an unvetted build.
   (shows `devin deepseek-v4-1-flash-high`, 1.0M ctx, reasoning+tools)
   and a one-shot
   `pi -p "Reply with exactly: ok" --no-extensions -e <that path> --model devin/deepseek-v4-1-flash-high`.
+- If deepseek returns `Your Windsurf version is out of date` while
+  `devin/swe-2-high` works and `devin` CLI runs deepseek fine, the
+  backend is gating the `ide` field, not the version: `pi-devin` ≤ 0.2.1
+  sends `ide="devin-desktop"` on every request and Cognition
+  version-gates that ide for non-Local models. Fix in the installed
+  package (`src/stream.ts` `buildMetadata` call): send
+  `ide="windsurf"` unless the model uid starts with `gpt-5-6-` — Devin
+  Local-only models still need `devin-desktop`. Reinstalling the pinned
+  package reverts the patch.
 
 ## `cadence issue` — the only writer
 
