@@ -743,3 +743,69 @@ fn sse_stream_survives_a_tcp_proxy() {
         }
     }
 }
+
+#[test]
+fn api_version_reports_only_the_build() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let (port, _board) = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+    let host = format!("127.0.0.1:{port}");
+
+    // CAD-573: the tab's down-probe asks the serving build — the
+    // binary's full id (`cadence --version`'s `0.1.0+<sha>`), and it is
+    // the only field the endpoint carries.
+    let (code, body) = http(port, "GET", "/api/version", &host);
+    assert_eq!(code, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!({"build": cadence_agent::overview::BUILD_ID}),
+        "/api/version rides only the build id: {v}"
+    );
+}
+
+#[test]
+fn sse_hello_names_the_build() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let (port, _board) = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+
+    // CAD-573: the stream's first frame is `hello` announcing the
+    // serving build; the `: ping` liveness frame still follows it.
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(6))).unwrap();
+    write!(
+        s,
+        "GET /api/stream HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n"
+    )
+    .unwrap();
+    let mut got = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while !String::from_utf8_lossy(&got).contains(": ping") {
+        assert!(
+            Instant::now() < deadline,
+            "no hello/: ping on the stream: {got:?}"
+        );
+        let mut buf = [0u8; 4096];
+        match s.read(&mut buf) {
+            Ok(0) => panic!("stream closed early: {got:?}"),
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+            Err(e) => panic!("read: {e} — got {got:?}"),
+        }
+    }
+    let text = String::from_utf8_lossy(&got);
+    let hello = format!(
+        "event: hello\ndata: {{\"build\":\"{}\"}}",
+        cadence_agent::overview::BUILD_ID
+    );
+    assert!(
+        text.contains(&hello),
+        "the hello frame names the build: {text}"
+    );
+    assert!(
+        text.contains(": ping"),
+        "the liveness frame still follows: {text}"
+    );
+}

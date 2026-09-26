@@ -26,6 +26,8 @@ import SignIn from "./features/auth/SignIn";
 import { writeBlock } from "./features/auth/gate";
 import { WriteGate } from "./features/auth/WriteGate";
 import { sessionKey, setSessionKey } from "./lib/sessionKey";
+import { buildChanged, serverBuild, subscribeSse, UI_BUILD } from "./lib/sse";
+import { applyDraft, composerField, sessionStore, stashDraft, takeDraft } from "./lib/draft";
 import Toast, { type ToastMsg } from "./ui/Toast";
 import { Logo } from "./ui/Logo";
 import { countLabel, issueCounts } from "./lib/counts";
@@ -121,6 +123,9 @@ export default function App() {
   const detailState = useMaybeResource(openId ? resources.issue(openId) : null);
   const [toast, setToast] = useState<ToastMsg | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
+  // The serving build when it differs from this bundle's — drives the
+  // reload banner (CAD-573).
+  const [staleBuild, setStaleBuild] = useState<string | null>(null);
   const toastTimer = useRef<number>(0);
 
   // Writes are off on a read-only board and, since CAD-313, until this
@@ -249,34 +254,69 @@ export default function App() {
 
   // Live updates: each /api/stream frame names the resources it
   // invalidates (`{"resources":[...]}`, `event_resources` in src/ui.rs);
-  // only those refetch, coalesced per resource. EventSource reconnects
-  // on its own; the 30 s poll below stays as the fallback while the
-  // stream is down.
+  // only those refetch, coalesced per resource. The stream's `hello`
+  // frame — and /api/version once it has been down ~15 s — reports the
+  // serving build: a mismatch means this bundle predates a rollout and
+  // the banner offers a reload (CAD-573). The 30 s poll below stays as
+  // the fallback while the stream is down.
   useEffect(() => {
-    const es = new EventSource("/api/stream");
-    const onEvent = (e: MessageEvent<string>) => {
-      for (const name of invalidatedBy(e.data)) {
-        // Families are keyed stores — invalidate the prefix, not one entry.
-        if (
-          name === "issue" ||
-          name === "workflows" ||
-          name === "app" ||
-          name === "app_runs" ||
-          name === "app_outputs"
-        ) {
-          cache.invalidate(name);
-        } else if (name === "overview") {
-          // Hidden overview: skip — it revalidates when a screen that
-          // reads it opens.
-          if (overviewWantedRef.current) void resources.overview.invalidate();
-        } else void resources[name].invalidate();
-      }
-    };
-    for (const source of ["issues", "agents", "jobs", "monitoring"]) {
-      es.addEventListener(source, onEvent);
-    }
-    return () => es.close();
+    const sub = subscribeSse({
+      url: "/api/stream",
+      events: ["issues", "agents", "jobs", "monitoring"],
+      onEvent: (e) => {
+        for (const name of invalidatedBy(e.data)) {
+          // Families are keyed stores — invalidate the prefix, not one entry.
+          if (
+            name === "issue" ||
+            name === "workflows" ||
+            name === "app" ||
+            name === "app_runs" ||
+            name === "app_outputs"
+          ) {
+            cache.invalidate(name);
+          } else if (name === "overview") {
+            // Hidden overview: skip — it revalidates when a screen that
+            // reads it opens.
+            if (overviewWantedRef.current) void resources.overview.invalidate();
+          } else void resources[name].invalidate();
+        }
+      },
+      onBuild: (server) => setStaleBuild(buildChanged(server, UI_BUILD) ? server : null),
+      probeBuild: serverBuild,
+    });
+    return () => sub.close();
   }, [loadDetail]);
+
+  // The banner's only action — never automatic. The composer draft is
+  // stashed first so one click costs no text (CAD-573).
+  const reload = useCallback(() => {
+    const storage = sessionStore();
+    if (storage) stashDraft(storage, composerField(document)?.value);
+    location.reload();
+  }, []);
+
+  // After that reload the draft waits in storage; write it back once
+  // the composer mounts — the reload may land on any route.
+  useEffect(() => {
+    const storage = sessionStore();
+    const draft = storage ? takeDraft(storage) : null;
+    if (!draft) return;
+    const restore = () => {
+      const field = composerField(document);
+      if (field) applyDraft(field, draft);
+      return field !== null;
+    };
+    if (restore()) return;
+    const observer = new MutationObserver(() => {
+      if (restore()) observer.disconnect();
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+    const giveUp = window.setTimeout(() => observer.disconnect(), 30_000);
+    return () => {
+      window.clearTimeout(giveUp);
+      observer.disconnect();
+    };
+  }, []);
 
   // Fallback poll — re-read on focus and every 30s while the tab is
   // visible, covering any gap while the stream reconnects.
@@ -400,6 +440,23 @@ export default function App() {
 
   return (
     <WriteGate.Provider value={block}>
+    {staleBuild !== null && (
+      <div
+        role="alert"
+        data-build-banner
+        className="fixed inset-x-0 top-0 z-50 flex items-center justify-center gap-3 border-b border-ink-900/20 bg-warn px-4 py-2.5 text-ink-900"
+      >
+        <span className="text-label font-medium">Cadence was updated</span>
+        <span className="num hidden sm:inline text-micro opacity-60">({staleBuild})</span>
+        <button
+          type="button"
+          onClick={reload}
+          className="h-7 shrink-0 rounded bg-ink-900 px-3 text-label font-medium text-ink-100 hover:opacity-85"
+        >
+          Reload
+        </button>
+      </div>
+    )}
     <div className="grid lg:grid-cols-[208px_minmax(0,1fr)] min-h-screen bg-ink-900">
       <Sidebar
         screen={screen}

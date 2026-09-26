@@ -2462,9 +2462,15 @@ fn stream_events(request: Request, state_dir: &Path, pm_dir: &Path) {
     let frame = |w: &mut dyn Write, bytes: &[u8]| -> bool {
         w.write_all(bytes).and_then(|_| w.flush()).is_ok()
     };
-    // First frame immediately — proves the stream is live and gives
-    // proxies something to flush before the first event exists.
-    if !frame(&mut w, b": ping\n\n") {
+    // First frame immediately — `hello` names the serving build (a tab
+    // running an older bundle compares and prompts a reload, CAD-573)
+    // and the `: ping` right behind it proves the stream is live and
+    // gives proxies something to flush before the first event exists.
+    let hello = format!(
+        "event: hello\ndata: {}\n\n",
+        json!({"build": crate::overview::BUILD_ID})
+    );
+    if !frame(&mut w, hello.as_bytes()) || !frame(&mut w, b": ping\n\n") {
         return;
     }
     // `: ping` every 15 s of wire silence — the watcher's per-second
@@ -2606,9 +2612,10 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             return;
         }
         // A read on the public host needs a live board session —
-        // `/api/health` alone stays open so a probe can see the board
-        // is up without holding a credential.
-        if path != "/api/health" {
+        // `/api/health` and `/api/version` stay open so a probe can see
+        // the board is up, and a signed-out tab can still learn the
+        // serving build, without holding a credential.
+        if path != "/api/health" && path != "/api/version" {
             match operator::public_session(&request, state_dir, opts) {
                 Ok(Some(_)) => {}
                 Ok(None) => {
@@ -2689,6 +2696,15 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
         }
         "/api/settings/model-defaults" => {
             send(request, model_defaults_get(state_dir, opts.read_only));
+        }
+        // The serving binary's build id and nothing else — cheap, and
+        // unauthenticated like `/api/health`, so a tab whose stream is
+        // stuck reconnecting can compare it against its own bundle's.
+        "/api/version" => {
+            send(
+                request,
+                json_response(json!({"build": crate::overview::BUILD_ID})),
+            );
         }
         "/api/health" => {
             let pm = Pm::at(pm_dir).ok();

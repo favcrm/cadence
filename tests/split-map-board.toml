@@ -170,6 +170,8 @@ tests = [
     "ui_pm_absent_is_honest",
     "read_only_board_refuses_every_write",
     "sse_stream_survives_a_tcp_proxy",
+    "api_version_reports_only_the_build",
+    "sse_hello_names_the_build",
 ]
 helpers = [
     "tcp_relay",
