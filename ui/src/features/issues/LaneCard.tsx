@@ -8,6 +8,7 @@ import {
   branchTitle,
   composerBlocked,
   costLabel,
+  effortChoices,
   modelChoices,
   reassignBody,
   unfenceReady,
@@ -355,7 +356,7 @@ function ReassignDialog({
             aria-label="Effort"
             placeholder="Default"
             onChange={setEffort}
-            options={spec.efforts.map((id) => ({ value: id, label: id }))}
+            options={effortChoices(spec.efforts)}
           />
         </label>
       )}

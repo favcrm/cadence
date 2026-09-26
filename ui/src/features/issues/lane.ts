@@ -88,12 +88,20 @@ export interface SelectChoice {
   badge?: string;
 }
 
-/** Model list for the reassign Select. Each row carries its cost badge. */
+/** Model list for the reassign Select. The blank row clears a chosen model. */
 export function modelChoices(provider: string, models: readonly string[]): SelectChoice[] {
-  return models.map((id) => {
-    const badge = costLabel(provider, id);
-    return badge ? { value: id, label: id, badge } : { value: id, label: id };
-  });
+  return [
+    { value: "", label: "Select" },
+    ...models.map((id) => {
+      const badge = costLabel(provider, id);
+      return badge ? { value: id, label: id, badge } : { value: id, label: id };
+    }),
+  ];
+}
+
+/** Effort list for the reassign Select. The blank row is the provider default. */
+export function effortChoices(efforts: readonly string[]): SelectChoice[] {
+  return [{ value: "", label: "Default" }, ...efforts.map((id) => ({ value: id, label: id }))];
 }
 
 export interface ReassignDraft {

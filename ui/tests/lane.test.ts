@@ -3,6 +3,7 @@ import {
   composerBlocked,
   costLabel,
   isStatusAsk,
+  effortChoices,
   modelChoices,
   reassignBody,
   statusText,
@@ -49,11 +50,18 @@ equal(costLabel("pi", "devin/deepseek-v4"), "Paid");
 equal(costLabel("fake", ""), "");
 
 equal(modelChoices("pi", ["devin/swe-2-high", "devin/deepseek-v4"]), [
+  { value: "", label: "Select" },
   { value: "devin/swe-2-high", label: "devin/swe-2-high", badge: "Free (quota)" },
   { value: "devin/deepseek-v4", label: "devin/deepseek-v4", badge: "Paid" },
 ]);
 equal(modelChoices("cursor", ["grok-4.7-high"]), [
+  { value: "", label: "Select" },
   { value: "grok-4.7-high", label: "grok-4.7-high", badge: "Cursor plan" },
+]);
+equal(effortChoices(["low", "max"]), [
+  { value: "", label: "Default" },
+  { value: "low", label: "low" },
+  { value: "max", label: "max" },
 ]);
 
 equal(reassignBody({ provider: "fake", model: "", effort: "", note: "  " }), { provider: "fake" });

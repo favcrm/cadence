@@ -102,6 +102,7 @@ export function LaneConversation({
       </ol>
       <div className="flex gap-2">
         <span data-testid="lane-mode-ask" className="inline-flex">
+          {/* CAD-617 Button does not forward aria-pressed. */}
           <Button
             size="sm"
             variant={active === "ask" ? "primary" : "ghost"}
