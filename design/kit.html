@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>cadence — design kit</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="kit.css">
+<script>
+/* Theme boot — same semantics as ui/src/lib/theme.ts: the system
+ * preference unless this browser picked one (`cadence-theme` in
+ * localStorage, applied as data-theme on <html>). Runs before paint. */
+(function () {
+  try {
+    var p = localStorage.getItem("cadence-theme");
+    if (p === "light" || p === "dark") document.documentElement.setAttribute("data-theme", p);
+  } catch (e) { /* unstorable: the system preference decides */ }
+})();
+</script>
+</head>
+<body>
+<div class="shell">
+
+  <!-- LEFT NAV — copy this <aside> into a mockup and replace the items. -->
+  <aside class="side">
+    <div class="brand">
+      <svg width="25" height="25" viewBox="0 0 1024 1024" fill="none" role="img" aria-label="cadence">
+        <defs><linearGradient id="cadence-lit" x1="0" y1="0" x2="0.574" y2="0.819"><stop offset="0" stop-color="#2DD4BF"/><stop offset="1" stop-color="#22D3EE"/></linearGradient></defs>
+        <rect x="20" y="20" width="984" height="984" rx="214" fill="#0B0B0C" stroke="#2e3136" stroke-width="40"/>
+        <path d="M 280 336 L 512 512 L 280 688" stroke="url(#cadence-lit)" stroke-width="160" stroke-linecap="round" stroke-linejoin="round"/>
+        <rect x="640" y="656" width="176" height="80" rx="40" fill="#2DD4BF" fill-opacity="0.8"/>
+      </svg>
+      <span>cadence<small>&nbsp;design kit</small></span>
+    </div>
+    <nav class="nav">
+      <a class="navlink" href="#" aria-current="page"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="1.5" y="2" width="3.6" height="12" rx="1"/><rect x="6.2" y="2" width="3.6" height="8" rx="1"/><rect x="10.9" y="2" width="3.6" height="10" rx="1"/></svg>Kit</a>
+      <a class="navlink" href="#"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="5.5"/><path d="M8 5.5v3l2 1.4"/></svg>Screen two</a>
+      <a class="navlink" href="#"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2" y="3" width="12" height="8.5" rx="1.2"/><path d="M5.5 14h5"/></svg>Screen three</a>
+    </nav>
+    <div class="slabel side-label"><span>Projects</span><span style="font-size:10px">~/pm</span></div>
+    <div class="nav" style="gap:2px">
+      <a class="proj on" href="#"><span style="overflow:hidden;text-overflow:ellipsis">cadence</span><span class="num muted" style="font-size:var(--text-micro)">CAD 12</span></a>
+      <a class="proj" href="#"><span style="overflow:hidden;text-overflow:ellipsis">example-app</span><span class="num muted" style="font-size:var(--text-micro)">EXA 4</span></a>
+    </div>
+    <div class="side-foot">
+      <div class="slabel" style="margin-bottom:4px">session</div>
+      mockup · no auth<br><span class="num" style="font-size:var(--text-micro)">kit.html</span>
+    </div>
+  </aside>
+
+  <div class="main">
+    <!-- HEADER CHIPS -->
+    <header class="topbar">
+      <div class="crumb"><span>cadence</span> / <b>design kit</b></div>
+      <div class="spacer">
+        <span class="chip" style="background:color-mix(in srgb, var(--color-warn) 10%, transparent);color:var(--color-warn)">MOCKUP</span>
+        <span class="chip" style="background:var(--color-ink-800);color:var(--color-ink-400)">tokens + kit.css</span>
+        <button class="tg" id="theme-toggle" title="theme" aria-label="theme"></button>
+      </div>
+    </header>
+
+    <div class="body">
+      <main class="content">
+        <div style="display:flex;align-items:baseline;gap:12px;margin-bottom:4px">
+          <h1 style="font-size:var(--text-section);font-weight:600;color:var(--color-ink-100);margin:0">Design kit</h1>
+          <span class="kicker">every component, light + dark</span>
+        </div>
+        <p class="muted" style="font-size:var(--text-secondary);max-width:70ch;margin-top:0">
+          Copy this file to start a mockup (see README.md). The panes below scope
+          <span class="num">data-theme</span> on themselves, so both themes render on one page.
+          The toggle in the header flips the whole page.
+        </p>
+
+        <!-- BUTTON + CHIP + BADGE -->
+        <h2 class="slabel" style="margin:28px 0 10px">button · chip · badge</h2>
+        <div class="duo">
+          <div class="duo-pane" data-theme="light">
+            <span class="badge plain dtag">data-theme=light</span>
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <button class="btn">Default</button>
+              <button class="btn btn-acc">Primary</button>
+              <button class="btn btn-danger">Delete</button>
+              <button class="btn" disabled>Disabled</button>
+            </div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <span class="chip" style="background:var(--color-ink-800);color:var(--color-ink-400)">plain chip</span>
+              <span class="chip tone" style="--c:var(--color-accent)">accent chip</span>
+            </div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <span class="badge b-ok">running</span>
+              <span class="badge b-warn">queued</span>
+              <span class="badge b-fail">failed</span>
+              <span class="badge b-info">idle</span>
+              <span class="badge b-lock">locked</span>
+              <span class="badge plain">plain</span>
+            </div>
+          </div>
+          <div class="duo-pane" data-theme="dark">
+            <span class="badge plain dtag">data-theme=dark</span>
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <button class="btn">Default</button>
+              <button class="btn btn-acc">Primary</button>
+              <button class="btn btn-danger">Delete</button>
+              <button class="btn" disabled>Disabled</button>
+            </div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <span class="chip" style="background:var(--color-ink-800);color:var(--color-ink-400)">plain chip</span>
+              <span class="chip tone" style="--c:var(--color-accent)">accent chip</span>
+            </div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <span class="badge b-ok">running</span>
+              <span class="badge b-warn">queued</span>
+              <span class="badge b-fail">failed</span>
+              <span class="badge b-info">idle</span>
+              <span class="badge b-lock">locked</span>
+              <span class="badge plain">plain</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- CARD + INPUT -->
+        <h2 class="slabel" style="margin:28px 0 10px">card · input</h2>
+        <div class="duo">
+          <div class="duo-pane" data-theme="light">
+            <span class="badge plain dtag">data-theme=light</span>
+            <div class="card pad">
+              <div class="strong" style="font-size:var(--text-cardtitle);font-weight:600">A card</div>
+              <p class="muted" style="font-size:var(--text-secondary);margin:6px 0 0">Cards group related content; .tcard lifts on hover.</p>
+            </div>
+            <div class="card tcard pad" tabindex="0">
+              <div class="strong" style="font-size:var(--text-cardtitle);font-weight:600">A tcard</div>
+              <p class="muted" style="font-size:var(--text-secondary);margin:6px 0 0">Hover me — border and background lift.</p>
+            </div>
+            <input class="field" placeholder="An input — type here">
+            <textarea class="field" placeholder="A textarea"></textarea>
+          </div>
+          <div class="duo-pane" data-theme="dark">
+            <span class="badge plain dtag">data-theme=dark</span>
+            <div class="card pad">
+              <div class="strong" style="font-size:var(--text-cardtitle);font-weight:600">A card</div>
+              <p class="muted" style="font-size:var(--text-secondary);margin:6px 0 0">Cards group related content; .tcard lifts on hover.</p>
+            </div>
+            <div class="card tcard pad" tabindex="0">
+              <div class="strong" style="font-size:var(--text-cardtitle);font-weight:600">A tcard</div>
+              <p class="muted" style="font-size:var(--text-secondary);margin:6px 0 0">Hover me — border and background lift.</p>
+            </div>
+            <input class="field" placeholder="An input — type here">
+            <textarea class="field" placeholder="A textarea"></textarea>
+          </div>
+        </div>
+
+        <!-- TREE ROW + TABLE + TABS -->
+        <h2 class="slabel" style="margin:28px 0 10px">tree row · table · tabs</h2>
+        <div class="duo">
+          <div class="duo-pane" data-theme="light">
+            <span class="badge plain dtag">data-theme=light</span>
+            <div class="tree card" style="padding:6px">
+              <div class="trow open"><svg class="caret ticon" width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3.5 2l3 3-3 3"/></svg><span class="tname">projects/</span><span class="tmeta num">3</span></div>
+              <div class="trow" style="padding-left:26px"><span class="ticon">▸</span><span class="tname">cadence/</span><span class="tmeta num">12</span></div>
+              <div class="trow on" style="padding-left:26px"><span class="ticon">▸</span><span class="tname">example-app/</span><span class="tmeta num">4</span></div>
+              <div class="trow"><svg class="caret ticon" width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3.5 2l3 3-3 3"/></svg><span class="tname">global/</span><span class="tmeta num">7</span></div>
+            </div>
+            <div class="tabs">
+              <span class="tab on">Board</span><span class="tab">List</span><span class="tab">Timeline</span>
+            </div>
+            <table class="tbl">
+              <thead><tr><th>id</th><th>title</th><th>status</th></tr></thead>
+              <tbody>
+                <tr><td class="num">CAD-1</td><td>First row</td><td><span class="badge b-ok">done</span></td></tr>
+                <tr><td class="num">CAD-2</td><td>Second row</td><td><span class="badge b-info">doing</span></td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="duo-pane" data-theme="dark">
+            <span class="badge plain dtag">data-theme=dark</span>
+            <div class="tree card" style="padding:6px">
+              <div class="trow open"><svg class="caret ticon" width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3.5 2l3 3-3 3"/></svg><span class="tname">projects/</span><span class="tmeta num">3</span></div>
+              <div class="trow" style="padding-left:26px"><span class="ticon">▸</span><span class="tname">cadence/</span><span class="tmeta num">12</span></div>
+              <div class="trow on" style="padding-left:26px"><span class="ticon">▸</span><span class="tname">example-app/</span><span class="tmeta num">4</span></div>
+              <div class="trow"><svg class="caret ticon" width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3.5 2l3 3-3 3"/></svg><span class="tname">global/</span><span class="tmeta num">7</span></div>
+            </div>
+            <div class="tabs">
+              <span class="tab on">Board</span><span class="tab">List</span><span class="tab">Timeline</span>
+            </div>
+            <table class="tbl">
+              <thead><tr><th>id</th><th>title</th><th>status</th></tr></thead>
+              <tbody>
+                <tr><td class="num">CAD-1</td><td>First row</td><td><span class="badge b-ok">done</span></td></tr>
+                <tr><td class="num">CAD-2</td><td>Second row</td><td><span class="badge b-info">doing</span></td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- MODAL + DROPZONE + TOAST + EMPTY -->
+        <h2 class="slabel" style="margin:28px 0 10px">modal · dropzone · toast · empty</h2>
+        <div class="duo">
+          <div class="duo-pane" data-theme="light">
+            <span class="badge plain dtag">data-theme=light</span>
+            <div class="modal" style="width:100%">
+              <div class="mhead">A modal <span class="kicker">dialog title</span></div>
+              <div class="mbody" style="font-size:var(--text-secondary)">Modal content goes here. Wrap in <span class="num">.scrim</span> to overlay the page.</div>
+              <div class="mfoot"><button class="btn">Cancel</button><button class="btn btn-acc">Confirm</button></div>
+            </div>
+            <div class="drop">
+              <svg width="20" height="20" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 11V4M8 4L5 7M8 4l3 3"/><path d="M2 11.5v1.5a1 1 0 001 1h10a1 1 0 001-1v-1.5"/></svg>
+              Drop files here, or click to browse
+            </div>
+            <div class="toast card ok" style="position:static;transform:none;max-width:none">saved · wiki/notes.md</div>
+            <div class="empty card">
+              <div class="etitle">Nothing here yet</div>
+              <div>An empty state explains what would appear.</div>
+            </div>
+          </div>
+          <div class="duo-pane" data-theme="dark">
+            <span class="badge plain dtag">data-theme=dark</span>
+            <div class="modal" style="width:100%">
+              <div class="mhead">A modal <span class="kicker">dialog title</span></div>
+              <div class="mbody" style="font-size:var(--text-secondary)">Modal content goes here. Wrap in <span class="num">.scrim</span> to overlay the page.</div>
+              <div class="mfoot"><button class="btn">Cancel</button><button class="btn btn-acc">Confirm</button></div>
+            </div>
+            <div class="drop">
+              <svg width="20" height="20" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 11V4M8 4L5 7M8 4l3 3"/><path d="M2 11.5v1.5a1 1 0 001 1h10a1 1 0 001-1v-1.5"/></svg>
+              Drop files here, or click to browse
+            </div>
+            <div class="toast card ok" style="position:static;transform:none;max-width:none">saved · wiki/notes.md</div>
+            <div class="empty card">
+              <div class="etitle">Nothing here yet</div>
+              <div>An empty state explains what would appear.</div>
+            </div>
+          </div>
+        </div>
+      </main>
+
+      <!-- RIGHT RAIL — delete .rail for a full-width page (.body.no-rail). -->
+      <aside class="rail">
+        <div>
+          <div class="slabel" style="margin-bottom:8px">rail</div>
+          <p class="muted" style="font-size:var(--text-secondary);margin:0">Context, metadata or actions for the open item live here.</p>
+        </div>
+        <div class="card pad">
+          <div class="slabel" style="margin-bottom:8px">how to use</div>
+          <p style="font-size:var(--text-secondary);margin:0">Copy this file, keep the shell, replace the content. Everything reads tokens.css vars.</p>
+        </div>
+      </aside>
+    </div>
+  </div>
+</div>
+
+<script>
+/* Theme toggle — cycles system → light → dark → system, stored under
+ * "cadence-theme" exactly like the board's header toggle. */
+(function () {
+  var KEY = "cadence-theme";
+  var icons = {
+    system: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="5.5"/><path d="M8 2.5v11a5.5 5.5 0 0 0 0-11z" fill="currentColor"/></svg>',
+    light: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="3"/><path d="M8 1.5v1.8M8 12.7v1.8M1.5 8h1.8M12.7 8h1.8M3.4 3.4l1.3 1.3M11.3 11.3l1.3 1.3M12.6 3.4l-1.3 1.3M4.7 11.3l-1.3 1.3"/></svg>',
+    dark: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M13.5 9.6A5.8 5.8 0 0 1 6.4 2.5a5.8 5.8 0 1 0 7.1 7.1z"/></svg>'
+  };
+  function pref() {
+    try { var v = localStorage.getItem(KEY); return v === "light" || v === "dark" ? v : "system"; }
+    catch (e) { return "system"; }
+  }
+  var next = { system: "light", light: "dark", dark: "system" };
+  var btn = document.getElementById("theme-toggle");
+  function paint(p) {
+    btn.innerHTML = icons[p];
+    btn.title = "theme: " + p + " — switch to " + next[p];
+    btn.setAttribute("aria-label", btn.title);
+  }
+  paint(pref());
+  btn.addEventListener("click", function () {
+    var p = next[pref()];
+    try { if (p === "system") localStorage.removeItem(KEY); else localStorage.setItem(KEY, p); } catch (e) {}
+    if (p === "system") document.documentElement.removeAttribute("data-theme");
+    else document.documentElement.setAttribute("data-theme", p);
+    paint(p);
+  });
+})();
+</script>
+</body>
+</html>
