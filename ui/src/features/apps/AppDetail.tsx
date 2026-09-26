@@ -1,35 +1,57 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { fmtTime } from "../../lib/fmt";
 import { resources } from "../../lib/resources";
-import { useQuery, useResource } from "../../lib/useResource";
-import type { AppDetail as AppDetailRow, AppRun, AppWorkflow, OutboxItem } from "../../lib/types";
+import { useMaybeResource, useQuery, useResource } from "../../lib/useResource";
+import { useHref } from "../../lib/useLocation";
+import type {
+  AppDetail as AppDetailRow,
+  AppPendingSend,
+  AppRun,
+  AppRunOutput,
+} from "../../lib/types";
 import Link from "../../ui/Link";
 import Md from "../../ui/Md";
 import { ResourceGate, StaleChip } from "../../ui/ResourceStatus";
 import { homeNeeds, type HomeNeed } from "../home/needs";
 import RunForm from "../projects/RunForm";
-import { progressView } from "../projects/work";
-import { ProgressBar } from "../projects/HealthBadge";
 import ApproveApp from "./ApproveApp";
 import {
   appApprovalChip,
+  appNeeds,
+  appPurpose,
   appWorkflowRow,
+  approvalPending,
+  connectionRows,
+  distinctNote,
   doctorFindings,
   outboxHref,
+  outputsOf,
+  primaryAction,
+  publishTarget,
+  runFilter,
+  runStages,
   runState,
+  runsSummary,
   sourceLabel,
+  stepRows,
+  teamFromLastRun,
+  teamInputs,
   unboundSlots,
+  usedSlots,
+  type RunFilter,
 } from "./apps";
 import type { Viewer } from "../projects/work";
 
+type Tab = "posts" | "settings" | "how";
+
 /**
- * `/apps/<project>/<name>` (CAD-557) — one installed app's detail, the
- * daemon's `app show` plus its `app doctor` row: the agent guide, each
- * workflow's checked summary (with Run opening the CAD-496 form in a
- * drawer here, so the operator never leaves the app), the app's runs
- * and their outputs (CAD-563), the rubrics, the slot bindings and the
- * doctor's slot findings. The operator's Approve sits next to the state
- * while approval is pending.
+ * `/apps/<project>/<name>` (CAD-563 r2) — one installed app, built
+ * around what a person does with it: what needs them (the strip), a new
+ * run (the drawer), the runs in flight and what has been published
+ * (Posts), the team and where it publishes (Settings), and how it works
+ * (How it works, with the engine's details folded away). `?new=<wf>`
+ * opens the New-run drawer — what an Apps card's primary action links
+ * to.
  */
 export default function AppDetail({
   project,
@@ -44,43 +66,158 @@ export default function AppDetail({
   onOpenIssue: (id: string) => void;
   onHome: () => void;
 }) {
-  const state = useQuery(resources.app(`${project}/${name}`));
+  const key = `${project}/${name}`;
+  const state = useQuery(resources.app(key));
   const app = state.data;
-  const approval = app ? appApprovalChip(app) : null;
-  // The workflow whose run form is open in the drawer, by its
-  // app-qualified name (`<app>/<wf>`).
+  const [tab, setTab] = useState<Tab>("posts");
   const [running, setRunning] = useState<string | null>(null);
+  // The runs and the Needs-you rail's rows: the Posts tab and the strip
+  // read both. The overview is asked for by App.tsx on this screen.
+  const runsState = useQuery(resources.appRuns(key));
+  const runs = runsState.data ?? [];
+  const overview = useResource(resources.overview);
+  const needs = homeNeeds(overview.data?.needs_me);
+  // The ledger is the operator's: fetch it only when the board proves
+  // the operator, so a viewer without the read never sees a 403.
+  const outputsRes = viewer.operator ? resources.appOutputs(key) : null;
+  const outputs = useMaybeResource(outputsRes);
+  useEffect(() => {
+    if (outputsRes) void outputsRes.revalidate();
+  }, [outputsRes]);
+  const items = outputs?.data?.items ?? [];
+  const pending = outputs?.data?.pending ?? [];
+  // `?new=<app>/<wf>` asks for that workflow's drawer once the app has
+  // loaded; consumed once, so closing it does not reopen on a refetch.
+  const href = useHref();
+  const want = new URLSearchParams(href.split("?")[1] ?? "").get("new");
+  const consumed = useRef<string | null>(null);
+  useEffect(() => {
+    if (want && app && consumed.current !== want) {
+      consumed.current = want;
+      setRunning(want);
+    }
+  }, [want, app]);
+
+  const action = app ? primaryAction(app) : null;
+  const approval = app ? appApprovalChip(app) : null;
+  const needsRows = app ? appNeeds(app, runs, needs, pending) : [];
   return (
     <>
-      <main className="px-4 lg:px-8 pt-4 pb-9 min-w-0 max-w-3xl" aria-label={`app ${project}/${name}`}>
+      <main className="px-4 lg:px-8 pt-4 pb-9 min-w-0 max-w-3xl" aria-label={`app ${key}`}>
         <Link href="/apps" className="lnk text-label">
           ← all apps
         </Link>
-        <div className="flex flex-wrap items-center gap-2 mt-2 mb-3">
-          <h1 className="text-section font-semibold text-ink-100 num">
-            {project}/{name}
-          </h1>
-          {approval && <span className={`chip ${approval.cls}`}>{approval.text}</span>}
-          <StaleChip state={state} />
-          {app && <ApproveApp row={app} viewer={viewer} />}
+        <div className="flex flex-wrap items-start gap-3 mt-2 mb-3">
+          <div className="min-w-0 flex-1">
+            <h1 className="text-section font-semibold text-ink-100">
+              {app?.title?.trim() || name}
+            </h1>
+            {app && <p className="text-body text-ink-400 mt-0.5 break-words">{appPurpose(app)}</p>}
+            <div className="flex flex-wrap items-center gap-2 mt-1.5">
+              <span className="num text-label text-ink-500">{key}</span>
+              {approval && <span className={`chip ${approval.cls}`}>{approval.text}</span>}
+              <StaleChip state={state} />
+            </div>
+          </div>
+          {action && (
+            <button
+              type="button"
+              onClick={() => setRunning(action.wf.name)}
+              className="shrink-0 h-8 px-3 rounded bg-accent text-on-accent text-label font-medium"
+            >
+              {action.label}
+            </button>
+          )}
         </div>
         <ResourceGate
           state={state}
-          loading={`loading ${project}/${name}…`}
-          failed={`could not load ${project}/${name}`}
-          onRetry={() => void resources.app(`${project}/${name}`).invalidate()}
+          loading={`loading ${key}…`}
+          failed={`could not load ${key}`}
+          onRetry={() => void resources.app(key).invalidate()}
         />
-        {app && <AppBody project={project} app={app} onRun={setRunning} onOpenIssue={onOpenIssue} />}
+
+        {app && needsRows.length > 0 && (
+          <section
+            className="card px-4 py-3 min-w-0 mb-3 border-warn/40"
+            aria-label="needs you"
+          >
+            <div className="slabel mb-1.5">needs you</div>
+            <ul className="space-y-1.5">
+              {needsRows.map((n, i) => (
+                <li key={`${n.kind}-${i}`} className="flex flex-wrap items-center gap-2 min-w-0">
+                  <span className="text-label text-ink-200 min-w-0 break-words flex-1">{n.text}</span>
+                  {n.kind === "approve" ? (
+                    <ApproveApp row={app} viewer={viewer} />
+                  ) : (
+                    <Link href="/" className="lnk text-label shrink-0" title="open Needs you">
+                      {n.kind === "release" ? "release →" : "answer →"}
+                    </Link>
+                  )}
+                </li>
+              ))}
+            </ul>
+          </section>
+        )}
+
+        {app && (
+          <>
+            <nav className="flex items-center gap-1 border-b border-ink-700 mb-3" role="tablist">
+              {(
+                [
+                  ["posts", "Posts"],
+                  ["settings", "Settings"],
+                  ["how", "How it works"],
+                ] as [Tab, string][]
+              ).map(([id, label]) => (
+                <button
+                  key={id}
+                  type="button"
+                  role="tab"
+                  aria-selected={tab === id}
+                  onClick={() => setTab(id)}
+                  className={`h-8 px-3 -mb-px border-b-2 text-label ${
+                    tab === id
+                      ? "border-accent text-ink-100 font-medium"
+                      : "border-transparent text-ink-400 hover:text-ink-200"
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+            </nav>
+            {tab === "posts" && (
+              <PostsTab
+                app={app}
+                runs={runs}
+                runsState={runsState}
+                needs={needs}
+                items={items}
+                pending={pending}
+                operator={viewer.operator}
+                onOpenIssue={onOpenIssue}
+                onRetry={() => void resources.appRuns(key).invalidate()}
+              />
+            )}
+            {tab === "settings" && (
+              <SettingsTab
+                app={app}
+                runs={runs}
+                viewer={viewer}
+                onApproveRetry={() => void resources.app(key).invalidate()}
+              />
+            )}
+            {tab === "how" && <HowTab app={app} runs={runs} />}
+          </>
+        )}
       </main>
       {running && app && (
         <RunDrawer
           project={project}
           app={app}
           wf={running}
+          runs={runs}
           viewer={viewer}
           onClose={() => setRunning(null)}
-          // Opening the epic closes this drawer first: the issue drawer
-          // is the board's, and stacking two of them reads as a bug.
           onOpenIssue={(id) => {
             setRunning(null);
             onOpenIssue(id);
@@ -92,328 +229,381 @@ export default function AppDetail({
   );
 }
 
-function AppBody({
-  project,
+/** Posts — one card per run, with its stage row, filters and outputs. */
+function PostsTab({
   app,
-  onRun,
+  runs,
+  runsState,
+  needs,
+  items,
+  pending,
+  operator,
+  onOpenIssue,
+  onRetry,
+}: {
+  app: AppDetailRow;
+  runs: AppRun[];
+  runsState: ReturnType<typeof useQuery<AppRun[]>>;
+  needs: HomeNeed[];
+  items: AppRunOutput[];
+  pending: AppPendingSend[];
+  operator: boolean;
+  onOpenIssue: (id: string) => void;
+  onRetry: () => void;
+}) {
+  const [filter, setFilter] = useState<RunFilter>("in_progress");
+  const shown = runs.filter((run) => {
+    const mine = outputsOf(run, items, pending);
+    return runFilter(run, needs, mine.items.length > 0) === filter;
+  });
+  const counts: Record<RunFilter, number> = { in_progress: 0, needs_you: 0, published: 0 };
+  for (const run of runs) {
+    counts[runFilter(run, needs, outputsOf(run, items, pending).items.length > 0)] += 1;
+  }
+  return (
+    <section className="min-w-0 space-y-2.5" aria-label="posts">
+      <div className="flex flex-wrap items-center gap-1.5">
+        {(
+          [
+            ["in_progress", "In progress"],
+            ["needs_you", "Needs you"],
+            ["published", "Published"],
+          ] as [RunFilter, string][]
+        ).map(([id, label]) => (
+          <button
+            key={id}
+            type="button"
+            aria-pressed={filter === id}
+            onClick={() => setFilter(id)}
+            className={`chip ${
+              filter === id ? "bg-accent/20 text-accent" : "bg-ink-800 text-ink-400 hover:text-ink-200"
+            }`}
+          >
+            {label}
+            {counts[id] > 0 && <span className="num ml-1 opacity-70">{counts[id]}</span>}
+          </button>
+        ))}
+        <span className="text-micro text-ink-500 ml-auto">{runsSummary(runs, needs) ?? "Nothing yet"}</span>
+      </div>
+      <ResourceGate
+        state={runsState}
+        loading="loading posts…"
+        failed="could not load posts"
+        onRetry={onRetry}
+      />
+      {runsState.data && runs.length === 0 && (
+        <div className="card px-4 py-5 text-secondary text-ink-400">
+          No posts yet — start one above. Nothing is published without your approval.
+        </div>
+      )}
+      {runsState.data && runs.length > 0 && shown.length === 0 && (
+        <div className="card px-4 py-5 text-secondary text-ink-400">
+          Nothing under this filter.
+        </div>
+      )}
+      <ul className="space-y-2.5">
+        {shown.map((run) => (
+          <RunCard
+            key={run.epic}
+            app={app}
+            run={run}
+            needs={needs}
+            mine={outputsOf(run, items, pending)}
+            operator={operator}
+            onOpenIssue={onOpenIssue}
+          />
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+const STAGE_CLS: Record<string, string> = {
+  ok: "bg-ok/15 text-ok",
+  run: "bg-accent/15 text-accent",
+  wait: "bg-warn/10 text-warn",
+  off: "bg-ink-800 text-ink-500",
+};
+
+function RunCard({
+  app,
+  run,
+  needs,
+  mine,
+  operator,
   onOpenIssue,
 }: {
-  project: string;
   app: AppDetailRow;
-  onRun: (wf: string) => void;
+  run: AppRun;
+  needs: HomeNeed[];
+  mine: { items: AppRunOutput[]; pending: AppPendingSend[] };
+  operator: boolean;
   onOpenIssue: (id: string) => void;
 }) {
-  const source = sourceLabel(app);
-  const unbound = new Set(unboundSlots(app));
-  const findings = doctorFindings(app.doctor);
+  const state = runState(run, needs);
+  const stages = runStages(run, mine.items, mine.pending);
+  const wf = (app.workflows ?? []).find((w) => w.name === run.workflow);
   return (
-    <div className="space-y-4">
-      <section className="card px-4 py-3.5 min-w-0">
-        <div className="flex flex-wrap items-center gap-1.5">
-          {app.version && <span className="chip bg-ink-800 text-ink-300">v{app.version}</span>}
-          {app.title && <span className="text-cardtitle text-ink-100">{app.title}</span>}
-        </div>
-        <div className="num text-micro text-ink-500 mt-2 space-y-0.5 break-all">
-          {app.digest && <div>digest {app.digest}</div>}
-          {source && <div>{source}</div>}
-          {app.installed_at && (
-            <div>
-              installed {app.installed_at}
-              {app.installed_by ? ` by ${app.installed_by}` : ""}
-            </div>
-          )}
-        </div>
-      </section>
-
-      {app.guide && (
-        <section className="card px-4 py-3.5 min-w-0" aria-label="guide">
-          <div className="slabel mb-2">agent guide — app.md</div>
-          <div className="text-body text-ink-200">
-            <Md text={app.guide} />
-          </div>
-        </section>
-      )}
-
-      <section className="card px-4 py-3.5 min-w-0" aria-label="workflows">
-        <div className="slabel mb-2">workflows</div>
-        {(app.workflows ?? []).length === 0 && (
-          <p className="text-label text-ink-500">This app declares no workflows.</p>
+    <li className="card px-3.5 py-3 min-w-0" data-run={run.epic}>
+      <div className="flex flex-wrap items-center gap-2 min-w-0">
+        <span className="text-cardtitle font-medium text-ink-100 min-w-0 break-words flex-1">
+          {run.title}
+        </span>
+        <span className={`chip ${state.cls}`} data-state={state.text}>
+          {state.text}
+        </span>
+      </div>
+      <div className="flex flex-wrap items-center gap-1 mt-2 min-w-0">
+        {stages.map((s, i) => (
+          <span key={`${s.label}-${i}`} className="flex items-center gap-1 min-w-0">
+            {i > 0 && <span className="text-ink-600" aria-hidden>→</span>}
+            <span className={`chip ${STAGE_CLS[s.tone]}`}>{s.label}</span>
+          </span>
+        ))}
+      </div>
+      <div className="flex flex-wrap items-center gap-2 mt-1.5 text-micro text-ink-500 min-w-0">
+        <button
+          type="button"
+          onClick={() => onOpenIssue(run.epic)}
+          className="lnk num shrink-0"
+          title={`open ${run.epic}`}
+        >
+          {run.epic}
+        </button>
+        {run.plan.proposed_at && <span className="num">{fmtTime(run.plan.proposed_at)}</span>}
+        {wf?.title && <span className="truncate">{wf.title}</span>}
+        {state.needsYou && (
+          <Link href="/" className="lnk text-warn shrink-0">
+            needs you →
+          </Link>
         )}
-        <ul className="space-y-2">
-          {(app.workflows ?? []).map((wf) => (
-            <WorkflowRowView key={wf.name} wf={wf} onRun={() => onRun(wf.name)} />
-          ))}
-        </ul>
-      </section>
-
-      <RunsSection project={project} name={app.name ?? ""} onOpenIssue={onOpenIssue} />
-
-      <OutputsSection project={project} name={app.name ?? ""} />
-
-      {(app.rubrics ?? []).length > 0 && (
-        <section className="card px-4 py-3.5 min-w-0" aria-label="rubrics">
-          <div className="slabel mb-2">rubrics</div>
-          <ul className="space-y-3">
-            {(app.rubrics ?? []).map((r) => (
-              <li key={r.name}>
-                <div className="num text-label text-accent mb-1">{r.name}</div>
-                <div className="text-body text-ink-200">
-                  <Md text={r.body} />
-                </div>
-              </li>
-            ))}
-          </ul>
-        </section>
-      )}
-
-      <section className="card px-4 py-3.5 min-w-0" aria-label="connection slots">
-        <div className="slabel mb-2">connection slots</div>
-        {(app.connections ?? []).length === 0 && (
-          <p className="text-label text-ink-500">This app declares no connection slots.</p>
-        )}
-        <ul className="space-y-1">
-          {(app.connections ?? []).map((c) => (
-            <li key={c.slot} className="num text-label flex items-baseline gap-2 min-w-0">
-              <span className="text-ink-200">{c.slot}</span>
-              {c.bound == null ? (
-                <span className="text-warn">— unbound</span>
-              ) : (
-                <span className="text-ink-400">→ {c.bound}</span>
-              )}
+      </div>
+      {mine.items.length > 0 && (
+        <ul className="mt-2 space-y-1">
+          {mine.items.map((it) => (
+            <li key={it.effect_id} className="text-label min-w-0">
+              <Link href={outboxHref(it.effect_id)} className="lnk break-words">
+                published: {it.title}
+              </Link>
+              <span className="text-ink-500"> · {fmtTime(it.published_at)}</span>
             </li>
           ))}
         </ul>
-        {unbound.size > 0 && (
-          <p className="text-micro text-warn mt-2" role="note">
-            {unbound.size} unbound slot{unbound.size === 1 ? "" : "s"} — bind with{" "}
-            <code className="num">cadence app set {project}/{app.name} &lt;slot&gt; &lt;connection&gt;</code>
-          </p>
-        )}
-      </section>
+      )}
+      {operator && mine.pending.length > 0 && (
+        <p className="text-label mt-2 min-w-0">
+          {mine.pending.map((p) => (
+            <Link key={p.effect_id} href="/" className="lnk text-warn break-words">
+              {p.title?.trim() || "a post"} — ready to publish →
+            </Link>
+          ))}
+        </p>
+      )}
+    </li>
+  );
+}
 
-      <section className="card px-4 py-3.5 min-w-0" aria-label="doctor findings">
-        <div className="slabel mb-2">doctor findings</div>
-        {findings.length === 0 ? (
-          <p className="text-label text-ink-500">
-            {app.doctor ? "No findings — every slot resolves." : "Not in the doctor scan."}
-          </p>
-        ) : (
+/** Settings — where it publishes, the team, and the app's version. */
+function SettingsTab({
+  app,
+  runs,
+  viewer,
+  onApproveRetry,
+}: {
+  app: AppDetailRow;
+  runs: AppRun[];
+  viewer: Viewer;
+  onApproveRetry: () => void;
+}) {
+  const action = primaryAction(app);
+  const wf = action?.wf ?? (app.workflows ?? [])[0];
+  const team = wf ? teamFromLastRun(wf, runs) : {};
+  const inputs = wf ? (wf.inputs ?? []) : [];
+  const slots = usedSlots(app);
+  return (
+    <div className="space-y-3 min-w-0">
+      {slots.length > 0 && (
+        <section className="card px-4 py-3.5 min-w-0" aria-label="publishing">
+          <div className="slabel mb-2">publishing</div>
           <ul className="space-y-1">
-            {findings.map((f, i) => (
-              <li key={i} className={`num text-label ${f.cls} break-words`}>
-                {f.text}
+            {slots.map((slot) => (
+              <li key={slot} className="text-label text-ink-200">
+                Publishes to: <span className="text-ink-100">{publishTarget(app, slot)}</span>
               </li>
             ))}
           </ul>
+        </section>
+      )}
+      {wf && (
+        <section className="card px-4 py-3.5 min-w-0" aria-label="team">
+          <div className="slabel mb-2">team</div>
+          <p className="text-label text-ink-400 mb-2">
+            A new run starts with the team the last one used.
+          </p>
+          <ul className="space-y-1.5">
+            {teamInputs(wf).map((input) => {
+              const spec = inputs.find((i) => i.name === input);
+              const value = team[input] ?? null;
+              return (
+                <li key={input} className="flex flex-wrap items-baseline gap-2 min-w-0 text-label">
+                  <span className="text-ink-300 min-w-0 break-words">{spec?.ask ?? input}</span>
+                  <span className={`num ${value ? "text-ink-100" : "text-ink-500"}`}>
+                    {value ?? "not used yet"}
+                  </span>
+                  {value && <span className="chip bg-ink-800 text-ink-500">last used</span>}
+                </li>
+              );
+            })}
+            {teamInputs(wf).length === 0 && (
+              <li className="text-label text-ink-500">This workflow's steps name no team inputs.</li>
+            )}
+          </ul>
+        </section>
+      )}
+      <section className="card px-4 py-3.5 min-w-0" aria-label="app">
+        <div className="slabel mb-2">app</div>
+        <div className="flex flex-wrap items-center gap-2">
+          {app.version && <span className="chip bg-ink-800 text-ink-300">v{app.version}</span>}
+          {approvalPending(app) && <ApproveApp row={app} viewer={viewer} />}
+        </div>
+        {approvalPending(app) && (
+          <p className="text-micro text-ink-500 mt-2 break-words">
+            Approving records this exact bundle; `cadence app update` installs a newer one.
+          </p>
         )}
+        {!approvalPending(app) && (
+          <p className="text-micro text-ink-500 mt-2 break-words">
+            This bundle is approved as installed.
+          </p>
+        )}
+        <button
+          type="button"
+          onClick={onApproveRetry}
+          className="lnk text-micro mt-2"
+        >
+          refresh
+        </button>
       </section>
     </div>
   );
 }
 
-function WorkflowRowView({ wf, onRun }: { wf: AppWorkflow; onRun: () => void }) {
+/** How it works — the steps in plain words, and the details folded away. */
+function HowTab({ app, runs }: { app: AppDetailRow; runs: AppRun[] }) {
+  const action = primaryAction(app);
+  const wf = action?.wf ?? (app.workflows ?? [])[0];
+  const team = wf ? teamFromLastRun(wf, runs) : {};
+  const steps = wf ? stepRows(wf, team) : [];
+  const slots = usedSlots(app);
+  const unbound = new Set(unboundSlots(app));
+  const findings = doctorFindings(app.doctor);
+  const connections = connectionRows(app.doctor);
+  const source = sourceLabel(app);
+  const record = app.record as { source?: { path?: string } } | null | undefined;
   return (
-    <li className="min-w-0" data-workflow={wf.name}>
-      <div className="flex flex-wrap items-center gap-2 min-w-0">
-        <span className="num text-label text-accent break-all">{wf.name}</span>
-        {wf.title && <span className="text-label text-ink-200 min-w-0">{wf.title}</span>}
-        {wf.ok === false && <span className="chip bg-fail/10 text-fail">errors</span>}
-        {typeof wf.tickets === "number" && (
-          <span className="chip bg-ink-800 text-ink-500">
-            {wf.tickets} ticket{wf.tickets === 1 ? "" : "s"}
-          </span>
+    <div className="space-y-3 min-w-0">
+      <section className="card px-4 py-3.5 min-w-0" aria-label="how it works">
+        <p className="text-body text-ink-200 break-words">{appPurpose(app)}</p>
+        {steps.length > 0 && (
+          <ol className="mt-3 space-y-1.5">
+            {steps.map((s, i) => (
+              <li key={`${s.label}-${i}`} className="text-label min-w-0">
+                <span className="num text-ink-500 mr-2">{i + 1}</span>
+                <span className="text-ink-200">{s.label}</span>
+                {s.who && <span className="text-ink-500"> — {s.who}</span>}
+              </li>
+            ))}
+          </ol>
         )}
-        <button
-          type="button"
-          onClick={onRun}
-          className="chip bg-accent/15 text-accent hover:bg-accent/25 transition-colors"
-          title={`open ${wf.name} in the New run form here`}
-          aria-label={`run ${wf.name}`}
-        >
-          run →
-        </button>
-      </div>
-      {(wf.errors ?? []).map((e, i) => (
-        <p key={i} className="text-micro text-fail mt-1 break-words" role="note">
-          {e}
-        </p>
-      ))}
-      {(wf.inputs ?? []).length > 0 && (
-        <p className="text-micro text-ink-500 mt-1 break-words">
-          inputs: {(wf.inputs ?? []).map((i) => i.name).join(", ")}
-        </p>
-      )}
-    </li>
-  );
-}
-
-/**
- * The app's runs — the plans/epics proposed from its workflows, by the
- * recorded `plan.workflow` provenance (CAD-563). The needs-you marker
- * reads the same overview the Home rail does; until it loads, a run
- * still shows its own state (waiting approval, running, done).
- */
-function RunsSection({
-  project,
-  name,
-  onOpenIssue,
-}: {
-  project: string;
-  name: string;
-  onOpenIssue: (id: string) => void;
-}) {
-  const state = useQuery(resources.appRuns(`${project}/${name}`));
-  // Passive: the app detail screen asks for the overview (App.tsx), so
-  // the rail's data lands without a second fetch from here.
-  const overview = useResource(resources.overview);
-  const needs = homeNeeds(overview.data?.needs_me);
-  const runs = state.data ?? [];
-  return (
-    <section className="card px-4 py-3.5 min-w-0" aria-label="runs">
-      <div className="flex flex-wrap items-baseline gap-2 mb-2">
-        <div className="slabel">runs</div>
-        <StaleChip state={state} />
-      </div>
-      <ResourceGate
-        state={state}
-        loading="loading runs…"
-        failed="could not load runs"
-        onRetry={() => void resources.appRuns(`${project}/${name}`).invalidate()}
-      />
-      {state.data && runs.length === 0 && (
-        <p className="text-label text-ink-500">
-          No runs yet — Run a workflow above to propose one.
-        </p>
-      )}
-      <ul className="space-y-2.5">
-        {runs.map((run) => (
-          <RunRow key={run.epic} run={run} needs={needs} onOpenIssue={onOpenIssue} />
-        ))}
-      </ul>
-    </section>
-  );
-}
-
-function RunRow({
-  run,
-  needs,
-  onOpenIssue,
-}: {
-  run: AppRun;
-  needs: HomeNeed[];
-  onOpenIssue: (id: string) => void;
-}) {
-  const state = runState(run, needs);
-  const progress = progressView(run.plan.progress);
-  const tone = state.text === "done" ? "ok" : state.text === "running" ? "ok" : "warn";
-  return (
-    <li className="min-w-0" data-run={run.epic}>
-      <div className="flex flex-wrap items-center gap-2 min-w-0">
-        <button
-          type="button"
-          onClick={() => onOpenIssue(run.epic)}
-          className="lnk num text-label shrink-0"
-          title={`open ${run.epic}`}
-        >
-          {run.epic}
-        </button>
-        <span className="text-label text-ink-100 min-w-0 break-words flex-1">{run.title}</span>
-        <span className={`chip ${state.cls}`} data-state={state.text}>
-          {state.text}
-        </span>
-        {state.needsYou && (
-          <Link href="/" className="chip bg-warn/10 text-warn hover:bg-warn/20 transition-colors">
-            needs you →
-          </Link>
-        )}
-      </div>
-      <div className="flex flex-wrap items-center gap-2 mt-1.5">
-        <span className="num text-micro text-ink-500">{run.workflow}</span>
-        <div className="min-w-[12rem] flex-1">
-          <ProgressBar view={progress} tone={tone} />
+        <div className="mt-3 space-y-1">
+          {slots.length > 0 && (
+            <p className="text-label text-ink-400">
+              Nothing is published without your approval.
+            </p>
+          )}
+          {wf && distinctNote(wf) && (
+            <p className="text-label text-ink-400">{distinctNote(wf)}</p>
+          )}
         </div>
-      </div>
-    </li>
-  );
-}
-
-/**
- * The app's outputs — the outbox items its runs produced (CAD-563),
- * read through the operator-gated route; on a board that cannot prove
- * the operator the section says so, like the Outbox screen, and never
- * pretends the ledger is empty.
- */
-function OutputsSection({ project, name }: { project: string; name: string }) {
-  const state = useQuery(resources.appOutputs(`${project}/${name}`));
-  const items = state.data ?? [];
-  return (
-    <section className="card px-4 py-3.5 min-w-0" aria-label="outputs">
-      <div className="flex flex-wrap items-baseline gap-2 mb-2">
-        <div className="slabel">outputs</div>
-        <StaleChip state={state} />
-        <Link href="/outbox" className="lnk text-label ml-auto">
-          Outbox →
-        </Link>
-      </div>
-      <ResourceGate
-        state={state}
-        loading="loading outputs…"
-        failed="could not load outputs"
-        onRetry={() => void resources.appOutputs(`${project}/${name}`).invalidate()}
-      />
-      {state.status === "failed" && (
-        <p className="text-label text-ink-400">
-          the outbox is the operator's view — sign in with{" "}
-          <code className="text-ink-300">cadence ui login</code> to read it
-        </p>
-      )}
-      {state.data && items.length === 0 && (
-        <p className="text-label text-ink-500">
-          Nothing published yet — a released publish from this app's runs lands here.
-        </p>
-      )}
-      <ul className="space-y-2">
-        {items.map((it) => (
-          <OutputRow key={it.effect_id} item={it} />
-        ))}
-      </ul>
-    </section>
-  );
-}
-
-function OutputRow({ item }: { item: OutboxItem }) {
-  return (
-    <li className="min-w-0">
-      <Link
-        href={outboxHref(item.effect_id)}
-        className="block rounded px-2 py-1.5 -mx-2 hover:bg-ink-800/60 transition-colors"
-      >
-        <div className="flex items-baseline gap-3 min-w-0">
-          <span className="text-label text-ink-100 truncate">{item.title}</span>
-          <span className="num text-micro text-ink-500 shrink-0">
-            {item.project} · {fmtTime(item.published_at)}
-          </span>
+      </section>
+      <details className="card px-4 py-3.5 min-w-0" aria-label="technical details">
+        <summary className="slabel cursor-pointer select-none">technical details</summary>
+        <div className="mt-3 space-y-3 min-w-0">
+          <div className="num text-micro text-ink-500 space-y-0.5 break-all">
+            {app.digest && <div>digest {app.digest}</div>}
+            {source && <div>{source}</div>}
+            {record?.source?.path && <div>{record.source.path}</div>}
+            {app.installed_at && (
+              <div>
+                installed {app.installed_at}
+                {app.installed_by ? ` by ${app.installed_by}` : ""}
+              </div>
+            )}
+            <div>workflows: {(app.workflows ?? []).map((w) => w.name).join(", ")}</div>
+          </div>
+          {connections.length > 0 && (
+            <div>
+              <div className="slabel mb-1">connections</div>
+              <ul className="space-y-0.5">
+                {connections.map((c, i) => (
+                  <li key={i} className={`num text-label ${c.cls} break-words`}>
+                    {c.text}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {(findings.length > 0 || unbound.size > 0) && (
+            <div>
+              <div className="slabel mb-1">doctor findings</div>
+              <ul className="space-y-0.5">
+                {findings.map((f, i) => (
+                  <li key={i} className={`num text-label ${f.cls} break-words`}>
+                    {f.text}
+                  </li>
+                ))}
+                {findings.length === 0 && (
+                  <li className="text-label text-ink-500">
+                    {unbound.size > 0
+                      ? `${unbound.size} unbound slot${unbound.size === 1 ? "" : "s"}`
+                      : "No findings."}
+                  </li>
+                )}
+              </ul>
+            </div>
+          )}
+          {(app.rubrics ?? []).map((r) => (
+            <div key={r.name}>
+              <div className="slabel mb-1">rubric — {r.name}</div>
+              <div className="issue-reader text-body text-ink-200">
+                <Md text={r.body} />
+              </div>
+            </div>
+          ))}
+          {app.guide && (
+            <div>
+              <div className="slabel mb-1">agent guide — app.md</div>
+              <div className="issue-reader text-body text-ink-200">
+                <Md text={app.guide} />
+              </div>
+            </div>
+          )}
         </div>
-        {item.preview && (
-          <p className="text-micro text-ink-400 mt-0.5 whitespace-pre-wrap break-words line-clamp-2">
-            {item.preview}
-          </p>
-        )}
-      </Link>
-    </li>
+      </details>
+    </div>
   );
 }
 
 /**
- * The run form in a drawer over the app page (CAD-563) — the same
- * `RunForm` the Workflows screen opens, so the app's workflows run
- * without leaving the app. Escape or the backdrop closes it; the
- * propose stays the board's OperatorOnly route.
+ * The New-run drawer (CAD-563): the same `RunForm` the Workflows screen
+ * opens, in the app's variant — the topic first, the team from the last
+ * run under "More options", the propose the board's OperatorOnly route.
  */
 function RunDrawer({
   project,
   app,
   wf,
+  runs,
   viewer,
   onClose,
   onOpenIssue,
@@ -422,6 +612,7 @@ function RunDrawer({
   project: string;
   app: AppDetailRow;
   wf: string;
+  runs: AppRun[];
   viewer: Viewer;
   onClose: () => void;
   onOpenIssue: (id: string) => void;
@@ -436,6 +627,11 @@ function RunDrawer({
   }, [onClose]);
   const row = (app.workflows ?? []).find((w) => w.name === wf);
   if (!row) return null;
+  const inputs = row.inputs ?? [];
+  const primary = inputs[0]?.name ?? null;
+  const slugInput = inputs.some((i) => i.name === "slug") ? "slug" : null;
+  const team = teamFromLastRun(row, runs);
+  const action = primaryAction(app);
   return (
     <>
       <div className="fixed inset-0 bg-scrim z-20" onClick={onClose} />
@@ -449,7 +645,7 @@ function RunDrawer({
               {project}/{app.name} · new run
             </div>
             <h2 className="text-drawer font-semibold text-ink-100 leading-tight mt-1">
-              {row.title ?? row.name}
+              {action?.label ?? row.label ?? "New run"}
             </h2>
           </div>
           <button
@@ -476,6 +672,12 @@ function RunDrawer({
             viewer={viewer}
             onOpenIssue={onOpenIssue}
             onHome={onHome}
+            app={{
+              primary,
+              prefill: team,
+              slugInput,
+              note: "Nothing is published without your approval.",
+            }}
           />
         </div>
       </aside>

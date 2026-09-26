@@ -649,7 +649,7 @@ export default function App() {
             onRetry={() => void resources.agents.refresh()}
           />
         )}
-        {screen === "outbox" && <Outbox />}
+        {screen === "outbox" && <Outbox operator={meta?.operator === true} />}
         {screen === "setup" && (
           <Setup settingsHref={hrefFor({ screen: "settings", section: "models" })} readOnly={meta ? boardReadOnly : null} />
         )}

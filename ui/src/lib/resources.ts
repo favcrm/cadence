@@ -13,6 +13,7 @@ export function threadReader(alias: string): PageReader {
 import type {
   AgentsPayload,
   AppDetail,
+  AppOutputsPayload,
   AppRow,
   AppRun,
   IssueCard,
@@ -107,17 +108,18 @@ export const resources = {
   ),
   /**
    * `GET /api/apps/<project>/<name>/outputs` — the outbox items this
-   * app's runs produced (CAD-563), keyed `<project>/<name>`.
-   * Operator-only: on a board that cannot prove the operator the fetch
-   * fails and the section shows the same sign-in hint as the Outbox.
+   * app's runs produced and the sends awaiting release (CAD-563),
+   * keyed `<project>/<name>`. Operator-only: the screen fetches it
+   * only when the board proves the operator, so a viewer without the
+   * read never sees the route's 403.
    */
-  appOutputs: cache.family<string, OutboxItem[]>(
+  appOutputs: cache.family<string, AppOutputsPayload>(
     "app_outputs",
     (key) => {
       const [project, name] = key.split("/");
-      return api.appOutputs(project, name).then((r) => r.items);
+      return api.appOutputs(project, name);
     },
-    { isEmpty: (rows) => rows.length === 0 },
+    { isEmpty: (p) => p.items.length === 0 && (p.pending ?? []).length === 0 },
   ),
   /**
    * `GET /api/outbox` — the `local` platform's published items (CAD-546).

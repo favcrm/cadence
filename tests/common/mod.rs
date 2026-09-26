@@ -5958,13 +5958,15 @@ pub fn app_src(f: &PlanFixture, name: &str, files: &[(&str, &str)]) -> PathBuf {
     dir
 }
 
-/// The fixture app `studio`'s `app.md` — one declared `publish` slot.
+/// The fixture app `studio`'s `app.md` — one declared `publish` slot
+/// and the optional purpose line the board shows (CAD-563).
 pub const APP_MD: &str = "---\napp: studio\ntitle: Content studio\nversion: 0.1.0\n\
-needs:\n  connections: [publish]\n---\n\n# Guide\n\nHow to run the studio.\n";
+summary: Run a checked change.\nneeds:\n  connections: [publish]\n---\n\n# Guide\n\nHow to run the studio.\n";
 
 /// `studio`'s one workflow — WF_TWO_STEP-shaped, its first ticket
-/// naming the declared slot in `uses:`.
+/// naming the declared slot in `uses:`, its human label declared.
 pub const APP_WF: &str = "---\ntitle: \"Run: {{title}}\"\ngoal: \"Ship {{title}}\"\n\
+label: New run\n\
 inputs:\n  title: { ask: \"What change?\" }\n---\n\n\
 ## Do {{title}}\nagent: dev-1\nsize: S\nuses: publish\n\n### Acceptance\n- [ ] done\n\n\
 ## Check {{title}}\nagent: qa-1\ndepends_on: 1\n\n### Acceptance\n- [ ] verified\n";

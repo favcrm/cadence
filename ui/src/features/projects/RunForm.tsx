@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { api, type ApiError } from "../../lib/api";
 import { resources } from "../../lib/resources";
 import type { WorkflowRow } from "../../lib/types";
+import { slugFromTopic } from "../apps/apps";
 import {
   missingRequired,
   proposeBlock,
@@ -9,6 +10,7 @@ import {
   providedInputs,
   refusalText,
   runFields,
+  type RunField,
 } from "./workflows";
 import type { Viewer } from "./work";
 
@@ -19,6 +21,20 @@ interface PreviewState {
   error: string | null;
   /** The daemon's refusal code (one_line, not_distinct, render_diverged). */
   code: string | null;
+}
+
+/**
+ * The app page's variant (CAD-563 r2): the input the run is about is
+ * shown first and everything else folds under "More options"; `prefill`
+ * seeds values the operator should not have to retype (the team from
+ * the last run), `slugInput` derives from the primary input until it is
+ * edited by hand, and `note` states a rule in plain words.
+ */
+export interface AppRunForm {
+  primary: string | null;
+  prefill: Record<string, string>;
+  slugInput: string | null;
+  note?: string;
 }
 
 /**
@@ -36,11 +52,13 @@ export default function RunForm({
   viewer,
   onOpenIssue,
   onHome,
+  app,
 }: {
   row: WorkflowRow;
   viewer: Viewer;
   onOpenIssue: (id: string) => void;
   onHome: () => void;
+  app?: AppRunForm;
 }) {
   const fields = runFields(row);
   const [values, setValues] = useState<Record<string, string>>({});
@@ -55,6 +73,32 @@ export default function RunForm({
   const [proposed, setProposed] = useState<{ epic: string; title: string; tickets: number } | null>(null);
   const request = useRef(0);
   const inputs = providedInputs(row, values);
+
+  // The team (and anything else worth keeping) arrives with the app's
+  // last run; a field the operator has touched is never overwritten.
+  const prefill = app ? JSON.stringify(app.prefill) : "";
+  useEffect(() => {
+    if (!app) return;
+    setValues((cur) => {
+      let next = cur;
+      for (const [name, value] of Object.entries(app.prefill)) {
+        if (!value || (cur[name] ?? "").trim() !== "") continue;
+        next = next === cur ? { ...cur } : next;
+        next[name] = value;
+      }
+      return next;
+    });
+  }, [prefill]);
+
+  // The slug a topic suggests, until the operator edits it by hand.
+  const slug = app?.slugInput ?? null;
+  const topic = app?.primary ?? null;
+  const slugTouched = useRef(false);
+  const topicValue = topic ? (values[topic] ?? "") : "";
+  useEffect(() => {
+    if (!slug || !topic || slugTouched.current) return;
+    setValues((cur) => ({ ...cur, [slug]: slugFromTopic(topicValue) }));
+  }, [slug, topic, topicValue]);
 
   // The rendered plan file, re-rendered shortly after the last keystroke.
   useEffect(() => {
@@ -93,9 +137,11 @@ export default function RunForm({
         setProposed(done);
         // The daemon emitted plan_proposed; the new epic is an issues
         // row, and Needs you reads the overview (an unobserved store
-        // just marks invalid — no fetch while Home is off screen).
+        // just marks invalid — no fetch while Home is off screen). An
+        // app's runs list re-reads too.
         void resources.issues.invalidate();
         void resources.overview.invalidate();
+        if (row.app) void resources.appRuns(`${row.project}/${row.app}`).invalidate();
       })
       .catch((e: ApiError) =>
         setResult({ ok: false, text: refusalText(e.code, e.message ?? String(e)) }),
@@ -103,35 +149,49 @@ export default function RunForm({
       .finally(() => setBusy(false));
   };
 
+  const field = (f: RunField) => (
+    <div key={f.name}>
+      <label htmlFor={`wf-${row.name}-${f.name}`} className="text-label text-ink-300 block mb-1">
+        {f.label}
+        {f.optional && <span className="text-ink-500"> · optional</span>}
+      </label>
+      <input
+        id={`wf-${row.name}-${f.name}`}
+        value={values[f.name] ?? ""}
+        onChange={(e) => {
+          if (f.name === slug) slugTouched.current = true;
+          setValues((cur) => ({ ...cur, [f.name]: e.target.value }));
+        }}
+        className="field w-full"
+        placeholder={f.name}
+        aria-label={`${row.name} input ${f.name}`}
+        data-input={f.name}
+      />
+    </div>
+  );
+
+  const head = app && app.primary ? fields.filter((f) => f.name === app.primary) : fields;
+  const more = fields.filter((f) => !head.includes(f));
+
   return (
-    <div className="border-t border-ink-700 px-3.5 py-3 grid gap-4 lg:grid-cols-2 min-w-0">
+    <div className={app ? "px-3.5 py-3 min-w-0" : "border-t border-ink-700 px-3.5 py-3 grid gap-4 lg:grid-cols-2 min-w-0"}>
       <section className="min-w-0" aria-label={`${row.name} inputs`}>
-        <div className="slabel mb-1.5">new run</div>
+        <div className="slabel mb-1.5">{app ? "the run" : "new run"}</div>
         {fields.length === 0 && (
           <p className="text-label text-ink-500">This workflow declares no inputs — it proposes as written.</p>
         )}
         <div className="space-y-3">
-          {fields.map((field) => (
-            <div key={field.name}>
-              <label
-                htmlFor={`wf-${row.name}-${field.name}`}
-                className="text-label text-ink-300 block mb-1"
-              >
-                {field.label}
-                {field.optional && <span className="text-ink-500"> · optional</span>}
-              </label>
-              <input
-                id={`wf-${row.name}-${field.name}`}
-                value={values[field.name] ?? ""}
-                onChange={(e) => setValues((cur) => ({ ...cur, [field.name]: e.target.value }))}
-                className="field w-full"
-                placeholder={field.name}
-                aria-label={`${row.name} input ${field.name}`}
-                data-input={field.name}
-              />
-            </div>
-          ))}
+          {head.map(field)}
         </div>
+        {more.length > 0 && (
+          <details className="mt-3" open={!app ? true : undefined}>
+            <summary className="slabel cursor-pointer select-none">
+              {app ? "more options" : "all fields"}
+            </summary>
+            <div className="space-y-3 mt-2.5">{more.map(field)}</div>
+          </details>
+        )}
+        {app?.note && <p className="text-micro text-ink-400 mt-3 break-words">{app.note}</p>}
         {proposed ? (
           <div className="mt-3" role="status">
             <p className="text-label text-ok break-words">
@@ -163,7 +223,7 @@ export default function RunForm({
               className="h-8 px-3 rounded bg-accent text-on-accent text-label font-medium disabled:opacity-40"
               title={blocked ?? undefined}
             >
-              {busy ? "Proposing…" : "Propose plan"}
+              {busy ? "Proposing…" : app ? "Propose this run" : "Propose plan"}
             </button>
             {blocked && (
               <p className="text-micro text-ink-500 mt-1.5 break-words">{blocked}</p>
@@ -181,7 +241,7 @@ export default function RunForm({
           </div>
         )}
       </section>
-      <section className="min-w-0" aria-label={`${row.name} plan preview`}>
+      <section className="min-w-0 mt-4" aria-label={`${row.name} plan preview`}>
         <div className="slabel mb-1.5">
           rendered plan{preview.loading ? " · rendering…" : ""}
         </div>

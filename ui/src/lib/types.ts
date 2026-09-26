@@ -1015,8 +1015,12 @@ export interface AppRow {
   name: string | null;
   title?: string;
   version?: string;
+  /** The app's one-line purpose (`summary:` in app.md), when declared. */
+  summary?: string | null;
   /** The bundle's workflow names — bare `do-check`, not `app/do-check`. */
   workflows?: string[];
+  /** The card's primary action: the first workflow and its human label. */
+  primary?: { workflow: string; label?: string | null } | null;
   connections?: AppSlot[];
   digest?: string;
   approved?: boolean | string | null;
@@ -1033,6 +1037,15 @@ export interface AppsPayload {
   count: number;
 }
 
+/** One step of a bundle workflow, from the canonical render (CAD-563). */
+export interface AppWorkflowStep {
+  /** The ticket's title, input names standing in for values. */
+  title: string;
+  /** The `agent:` line's value — an input name when it is `{{input}}`. */
+  agent?: string | null;
+  size?: string | null;
+}
+
 /** One bundle workflow's checked summary, as `app show` reports it. */
 export interface AppWorkflow {
   /** The app-qualified name — `studio/do-check`. */
@@ -1041,8 +1054,14 @@ export interface AppWorkflow {
   errors?: string[];
   notes?: string[];
   title?: string | null;
+  /** The workflow's human label (`label:`), when declared. */
+  label?: string | null;
   tickets?: number | null;
   inputs?: WorkflowInput[] | null;
+  /** The steps, in order (CAD-563 r2). */
+  steps?: AppWorkflowStep[] | null;
+  /** Inputs whose values must differ at render. */
+  distinct?: string[] | null;
   uses?: string[];
 }
 
@@ -1130,11 +1149,29 @@ export interface AppRunsPayload {
 
 /**
  * `GET /api/apps/<project>/<name>/outputs` — the outbox items this
- * app's runs produced (CAD-563). Operator-only, like `/api/outbox`: a
- * board that cannot prove the operator gets the route's refusal.
+ * app's runs produced (CAD-563), each naming the runs it is attributed
+ * to, plus the sends those runs staged and the operator has not
+ * released. Operator-only, like `/api/outbox`: a board that cannot
+ * prove the operator gets the route's refusal.
  */
 export interface AppOutputsPayload {
   project: string;
   name: string;
-  items: OutboxItem[];
+  items: AppRunOutput[];
+  /** Staged sends awaiting the operator's release (or in flight). */
+  pending?: AppPendingSend[];
+}
+
+/** One published item, with the runs it is attributed to. */
+export interface AppRunOutput extends OutboxItem {
+  runs?: string[];
+}
+
+/** One staged send of the app's runs the operator has not released. */
+export interface AppPendingSend {
+  effect_id: string;
+  /** `waiting` (awaiting the release) or `decided` (in flight). */
+  state: string;
+  title?: string | null;
+  runs: string[];
 }

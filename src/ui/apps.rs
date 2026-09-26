@@ -270,11 +270,9 @@ fn outputs(
         })
         .collect();
     let runs_for = |task: Option<&str>, agent: &str| -> Vec<String> {
-        let hit = |(_, tickets, owners): &(String, HashSet<String>, HashSet<String>)| {
-            match task {
-                Some(t) => tickets.contains(t),
-                None => owners.contains(agent),
-            }
+        let hit = |(_, tickets, owners): &(String, HashSet<String>, HashSet<String>)| match task {
+            Some(t) => tickets.contains(t),
+            None => owners.contains(agent),
         };
         runs.iter()
             .filter(|r| hit(r))

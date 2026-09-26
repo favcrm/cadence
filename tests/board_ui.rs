@@ -1671,7 +1671,14 @@ fn board_apps_list_and_detail() {
     assert_eq!(row["project"], "demo", "{row}");
     assert_eq!(row["title"], "Content studio", "{row}");
     assert_eq!(row["version"], "0.1.0", "{row}");
+    assert_eq!(row["summary"], "Run a checked change.", "{row}");
     assert_eq!(row["workflows"], json!(["do-check"]), "{row}");
+    // The card's primary action: the first workflow and its label.
+    assert_eq!(
+        row["primary"],
+        json!({"workflow": "do-check", "label": "New run"}),
+        "{row}"
+    );
     assert_eq!(
         row["connections"],
         json!([{"slot": "publish", "bound": "local"}]),
@@ -1723,9 +1730,22 @@ fn board_apps_list_and_detail() {
             .contains("How to run the studio"),
         "{v}"
     );
+    assert_eq!(v["summary"], "Run a checked change.", "{v}");
     assert_eq!(v["workflows"][0]["name"], "studio/do-check", "{v}");
     assert_eq!(v["workflows"][0]["ok"], true, "{v}");
+    assert_eq!(v["workflows"][0]["label"], "New run", "{v}");
     assert_eq!(v["workflows"][0]["uses"], json!(["publish"]), "{v}");
+    // The steps, in order, from the canonical render — the app page's
+    // stage row and its team mapping read these (CAD-563 r2).
+    assert_eq!(
+        v["workflows"][0]["steps"],
+        json!([
+            {"title": "Do title", "agent": "dev-1", "size": "S"},
+            {"title": "Check title", "agent": "qa-1", "size": null},
+        ]),
+        "{v}"
+    );
+    assert_eq!(v["workflows"][0]["distinct"], json!([]), "{v}");
     assert_eq!(v["rubrics"][0]["name"], "review", "{v}");
     assert!(
         v["rubrics"][0]["body"]
@@ -2090,7 +2110,13 @@ fn board_app_outputs_are_the_runs_and_operator_only() {
     );
     let conn = rusqlite::Connection::open(f.d.state.join("cadence.sqlite3")).unwrap();
     for (eid, agent, task, state, input) in [
-        ("ef-task", "someone", Some(tickets[0].as_str()), "done", "{}"),
+        (
+            "ef-task",
+            "someone",
+            Some(tickets[0].as_str()),
+            "done",
+            "{}",
+        ),
         ("ef-owner", "qa-1", None, "done", "{}"),
         ("ef-other", "stranger", Some("D-9"), "done", "{}"),
         (

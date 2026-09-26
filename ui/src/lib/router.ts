@@ -177,8 +177,9 @@ function scopedRoute(route: Route, project: string): Route {
 export function locationHref(loc: AppLocation, search = ""): string {
   const q = new URLSearchParams(search);
   // `run` is owned by the Workflows section — it opens one row's form
-  // there and never follows a navigation elsewhere.
-  for (const key of ["tab", "view", "project", "issue", "run"]) q.delete(key);
+  // there — and `new` by an app page (it opens the New post drawer on
+  // arrival); neither follows a navigation elsewhere.
+  for (const key of ["tab", "view", "project", "issue", "run", "new"]) q.delete(key);
   writeFilters(q, NO_FILTERS);
   const route = scopedRoute(loc.route, loc.project);
   if (route.screen === "projects") {

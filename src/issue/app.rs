@@ -1685,6 +1685,22 @@ fn describe(
     row["version"] = json!(manifest.version);
     row["summary"] = json!(manifest.summary);
     row["workflows"] = json!(workflows);
+    // The card's primary action (CAD-563 r2): the app's first workflow
+    // (sorted, so the choice is deterministic) and the human label the
+    // board names the action with.
+    let mut names = workflows.clone();
+    names.sort();
+    if let Some(first) = names.first() {
+        let label = std::fs::read_to_string(
+            app_dir_or(pm_dir, project, name)
+                .join("workflows")
+                .join(format!("{first}.md")),
+        )
+        .ok()
+        .and_then(|text| workflow::parse_template(&text).ok())
+        .and_then(|tpl| tpl.label);
+        row["primary"] = json!({"workflow": first, "label": label});
+    }
     row["connections"] = json!(manifest
         .connections
         .iter()
