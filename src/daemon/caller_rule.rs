@@ -328,6 +328,35 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         "issue_kickoff_options",
         Rule::Handler("operator_connection (CAD-606)"),
     ),
+    // CAD-608: the issue page's lane card. `lane_show` is a read of the
+    // issue's own lane. Every mutation is operator-only inside the
+    // handler — an agent, its detached child, and a forged identity
+    // field never reach the worktree.
+    ("lane_show", Rule::Read),
+    (
+        "lane_ask",
+        Rule::Handler("operator_connection (CAD-608)"),
+    ),
+    (
+        "lane_instruct",
+        Rule::Handler("operator_connection (CAD-608)"),
+    ),
+    (
+        "lane_interrupt",
+        Rule::Handler("operator_connection (CAD-608)"),
+    ),
+    (
+        "lane_stop",
+        Rule::Handler("operator_connection (CAD-608)"),
+    ),
+    (
+        "lane_unfence",
+        Rule::Handler("operator_connection (CAD-608)"),
+    ),
+    (
+        "lane_reassign",
+        Rule::Handler("operator_connection (CAD-608)"),
+    ),
     ("project_work_approvals", Rule::Read),
     (
         "workflow_approve",

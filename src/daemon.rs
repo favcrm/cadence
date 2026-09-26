@@ -28,6 +28,7 @@ mod dispatch_rpc;
 mod effect_rpc;
 mod identity;
 mod jobs_rpc;
+mod lane_rpc;
 mod master_rpc;
 mod master_session_rpc;
 mod master_wake;
@@ -2515,6 +2516,13 @@ impl Shared {
             // dispatch. Options is the form catalog for the same gate.
             "issue_kickoff" => self.rpc_issue_kickoff(params, peer_pid),
             "issue_kickoff_options" => self.rpc_issue_kickoff_options(params, peer_pid),
+            "lane_show" => self.rpc_lane_show(params),
+            "lane_ask" => self.rpc_lane_ask(params, peer_pid),
+            "lane_instruct" => self.rpc_lane_instruct(params, peer_pid),
+            "lane_interrupt" => self.rpc_lane_interrupt(params, peer_pid),
+            "lane_stop" => self.rpc_lane_stop(params, peer_pid),
+            "lane_unfence" => self.rpc_lane_unfence(params, peer_pid),
+            "lane_reassign" => self.rpc_lane_reassign(params, peer_pid),
             "rollout_grant" => self.rpc_rollout_grant(params, peer_pid),
             "rollout_revoke" => self.rpc_rollout_revoke(params, peer_pid),
             "project_work_approvals" => Ok(json!({
