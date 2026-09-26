@@ -123,6 +123,16 @@ pub trait TuiProfile: Send + Sync {
         ))
     }
 
+    /// CAD-520: whether this TUI's *own* idle probe is the readiness
+    /// claim — `probe.idle` alone admits a user submission, exactly the
+    /// path `auto_ready=verified` opts into, with no human `agent
+    /// ready` needed. True only for profiles whose screen analysis is
+    /// verified against the live TUI (Devin's placeholder/watermark
+    /// model); the default keeps the human-claim gate.
+    fn probe_is_ready_claim(&self) -> bool {
+        false
+    }
+
     /// tmux key names that interrupt this TUI's running turn — the
     /// provider's own stop, the one its busy hint names (CAD-323). The
     /// default is `C-c`; a TUI whose `C-c` also clears or exits

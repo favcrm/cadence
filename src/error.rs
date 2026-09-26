@@ -23,6 +23,9 @@ pub struct RenderMiss {
     /// The probe verdict that admitted the send at claim time, when
     /// one was recorded — what "idle" looked like to the gate.
     pub claim_probe: Option<serde_json::Value>,
+    /// The re-probe taken after the render deadline (CAD-520): what the
+    /// pane showed once more before the miss was accepted as real.
+    pub reprobe: Option<serde_json::Value>,
 }
 
 /// A wire error that carries a stable `code` and, for revision
@@ -56,7 +59,9 @@ pub enum Error {
     /// not proof (pty post-paste screen check). The actor decides:
     /// routed notifications requeue bounded then park; task messages go
     /// `unknown` under the usual uncertainty discipline.
-    NotRendered(RenderMiss),
+    /// Boxed: the evidence (two screen tails + probe verdicts) is far
+    /// bigger than the other variants' payloads.
+    NotRendered(Box<RenderMiss>),
 }
 
 impl Error {
@@ -79,7 +84,7 @@ impl Error {
         Self::Internal(message.into())
     }
     pub fn not_rendered(miss: RenderMiss) -> Self {
-        Self::NotRendered(miss)
+        Self::NotRendered(Box::new(miss))
     }
     /// Invalid input with a stable code. The wire kind stays `rejected`.
     pub fn invalid(code: &'static str, message: impl Into<String>) -> Self {

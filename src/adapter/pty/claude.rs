@@ -495,6 +495,9 @@ fn analyze_frame(screen: &str, undimmed: Option<&str>, cursor: Option<(u32, u32)
         prompt_visible,
         busy_marker,
         approval_menu,
+        trust_prompt: false,
+        steerable: false,
+        queue_pending: false,
     }
 }
 

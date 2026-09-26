@@ -130,12 +130,12 @@ fn pty_nudge_needs_a_live_pane_and_dies_with_the_actor() {
     d.wait_agent("dv1", "idle", 20);
     let long = "x".repeat(501);
     let err = d
-        .send("dv1", json!({"text": long, "nudge": true}))
+        .operator_send("dv1", json!({"text": long, "nudge": true}))
         .unwrap_err()
         .to_string();
     assert!(err.contains("500"), "{err}");
     let err = d
-        .send(
+        .operator_send(
             "dv1",
             json!({"text": "steer", "nudge": true, "task": "t-1"}),
         )
@@ -143,7 +143,7 @@ fn pty_nudge_needs_a_live_pane_and_dies_with_the_actor() {
         .to_string();
     assert!(err.contains("--task"), "{err}");
     atomic_write(d.pane_file(&mock, "dv1", "tui-state"), DEVIN_MENU);
-    d.send(
+    d.operator_send(
         "dv1",
         json!({"text": "steer", "message": "n1", "nudge": true}),
     )
@@ -162,7 +162,7 @@ fn pty_nudge_needs_a_live_pane_and_dies_with_the_actor() {
     );
     assert_eq!(ev["payload"]["reason"], "stop", "{ev}");
     let err = d
-        .send("dv1", json!({"text": "steer", "nudge": true}))
+        .operator_send("dv1", json!({"text": "steer", "nudge": true}))
         .unwrap_err()
         .to_string();
     assert!(err.contains("agent dv1 has no live pane"), "{err}");
@@ -203,12 +203,15 @@ fn claude_sessions(dir: &Path) -> Vec<(u32, String)> {
     out
 }
 
+/// The claim gate itself is covered on the stub profile — Devin's own
+/// verified idle probe is now the claim (CAD-520), so this literal-paste
+/// lifecycle uses a profile that still requires `agent ready`.
 #[test]
 fn pty_send_pastes_literal_and_completes_via_report() {
     let d = TestDaemon::start();
-    let _mock = d.mock_devin();
-    d.register_devin("dv1", None);
-    let agent = d.wait_agent("dv1", "idle", 20);
+    let _mock = d.mock_stub();
+    d.register_stub("st1", json!({}));
+    let agent = d.wait_agent("st1", "idle", 20);
     assert_eq!(agent["endpoint_kind"], "pty");
     assert!(
         agent["endpoint"]
@@ -222,7 +225,7 @@ fn pty_send_pastes_literal_and_completes_via_report() {
         agent["thread_id"]
             .as_str()
             .unwrap()
-            .starts_with("mock-session-"),
+            .starts_with("stub-session-"),
         "native session discovered from the lock: {}",
         agent
     );
@@ -234,43 +237,43 @@ fn pty_send_pastes_literal_and_completes_via_report() {
     // can land while the gate still probes (`submitting`); wait for the
     // recorded refusal of this message, after which it sits out the
     // gate back-off as `queued` (CAD-278).
-    d.send("dv1", json!({"text": "first task", "message": "m1"}))
+    d.send("st1", json!({"text": "first task", "message": "m1"}))
         .unwrap();
-    d.wait_event_where("dv1", "gate_wait", |e| e["payload"]["message"] == "m1", 20);
-    assert_eq!(d.message_state("dv1", "m1"), "queued");
+    d.wait_event_where("st1", "gate_wait", |e| e["payload"]["message"] == "m1", 20);
+    assert_eq!(d.message_state("st1", "m1"), "queued");
 
     // Operator claim: the head of the FIFO queue (m1) is pasted.
-    d.operator_rpc("agent_ready", json!({"alias": "dv1"}))
+    d.operator_rpc("agent_ready", json!({"alias": "st1"}))
         .unwrap();
-    let token1 = pty_token(&d, "dv1", "m1");
+    let token1 = pty_token(&d, "st1", "m1");
     assert!(token1.starts_with(&format!("pty-{gen}-")), "{token1}");
 
     // CAD-250: m1 owes its report before the actor claims the next turn.
-    pty_report_done(&d, "dv1", "m1");
+    pty_report_done(&d, "st1", "m1");
 
     // Literal text with shell metacharacters is pasted verbatim into
     // the pane input — one paste per claim, so m2 needs a new one.
     let tricky = "quote ' $HOME `id` ; rm -rf / & | <tag> \"double\"";
-    d.send("dv1", json!({"text": tricky, "message": "m2"}))
+    d.send("st1", json!({"text": tricky, "message": "m2"}))
         .unwrap();
     // m1's success cleared the gate notice, so m2's refusal records its
     // own `gate_wait` (CAD-278: this was the 400 ms sleep that failed).
-    d.wait_event_where("dv1", "gate_wait", |e| e["payload"]["message"] == "m2", 20);
-    assert_eq!(d.message_state("dv1", "m2"), "queued");
-    d.operator_rpc("agent_ready", json!({"alias": "dv1"}))
+    d.wait_event_where("st1", "gate_wait", |e| e["payload"]["message"] == "m2", 20);
+    assert_eq!(d.message_state("st1", "m2"), "queued");
+    d.operator_rpc("agent_ready", json!({"alias": "st1"}))
         .unwrap();
-    let token = pty_token(&d, "dv1", "m2");
+    let token = pty_token(&d, "st1", "m2");
     assert!(token.starts_with(&format!("pty-{gen}-")), "{token}");
 
     // The mock TUI consumed the paste + Enter and replied on screen;
     // capture shows the verbatim submitted line and the separate reply.
     let deadline = Instant::now() + Duration::from_secs(10);
     let cap = loop {
-        let out = d.rpc("agent_capture", json!({"alias": "dv1"})).unwrap()["capture"]
+        let out = d.rpc("agent_capture", json!({"alias": "st1"})).unwrap()["capture"]
             .as_str()
             .unwrap()
             .to_string();
-        if out.contains(&format!("MOCK_REPLY: {tricky}")) {
+        if out.contains(&format!("STUB_REPLY: {tricky}")) {
             break out;
         }
         assert!(Instant::now() < deadline, "no reply on screen: {out}");
@@ -280,48 +283,89 @@ fn pty_send_pastes_literal_and_completes_via_report() {
 
     // Still `running` — the screen reply does not finish the message;
     // only an explicit report does.
-    assert_eq!(d.message_state("dv1", "m2"), "running");
+    assert_eq!(d.message_state("st1", "m2"), "running");
 
     // Wrong token rejected; correct token completes and preserves text.
     let bad = d.report("m2", "pty-wrong", "result", "nope");
     assert!(bad.is_err());
     d.report("m2", &token, "result", "done: MOCK_REPLY observed")
         .unwrap();
-    let m = d.wait_message("dv1", "m2", &["completed"], 10);
+    let m = d.wait_message("st1", "m2", &["completed"], 10);
     assert_eq!(m["result"]["via"], "pty_report");
-    d.wait_agent("dv1", "idle", 10);
+    d.wait_agent("st1", "idle", 10);
 }
 
+/// Claim exhaustion is pinned on the stub profile: Devin's own verified
+/// idle probe is now the readiness claim (CAD-520), so a profile that
+/// still requires `agent ready` is what proves a claim is single-use.
 #[test]
 fn pty_claim_is_single_use_and_expires() {
     let d = TestDaemon::start();
-    let _mock = d.mock_devin();
-    d.register_devin("dv1", None);
-    d.wait_agent("dv1", "idle", 20);
-    d.operator_rpc("agent_ready", json!({"alias": "dv1"}))
+    let _mock = d.mock_stub();
+    d.register_stub("st1", json!({}));
+    d.wait_agent("st1", "idle", 20);
+    d.operator_rpc("agent_ready", json!({"alias": "st1"}))
         .unwrap();
-    d.send("dv1", json!({"text": "one", "message": "m1"}))
+    d.send("st1", json!({"text": "one", "message": "m1"}))
         .unwrap();
     // CAD-250: m1 reports so m2 is held by the spent claim, not by the
     // actor's one report-owing turn.
-    pty_report_done(&d, "dv1", "m1");
+    pty_report_done(&d, "st1", "m1");
     // The claim was consumed: a second send queues, it does not paste.
     // Wait for m2's own recorded refusal, not a fixed sleep: the actor
     // takes the send at once and the gate may still be probing (CAD-286).
-    d.send("dv1", json!({"text": "two", "message": "m2"}))
+    d.send("st1", json!({"text": "two", "message": "m2"}))
         .unwrap();
     // The recorded refusal proves the actor tried m2 and held it; the
     // reason proves it was the missing claim.
-    let gate = d.wait_event_where("dv1", "gate_wait", |e| e["payload"]["message"] == "m2", 20);
+    let gate = d.wait_event_where("st1", "gate_wait", |e| e["payload"]["message"] == "m2", 20);
     assert!(
         gate["payload"]["reason"]
             .as_str()
             .is_some_and(|r| r.contains("no fresh `agent ready` claim")),
         "{gate}"
     );
-    assert_eq!(d.message_state("dv1", "m2"), "queued");
-    let input = std::fs::read_to_string(d.pane_file(&_mock, "dv1", "input")).unwrap_or_default();
+    assert_eq!(d.message_state("st1", "m2"), "queued");
+    let input =
+        std::fs::read_to_string(d.stub_pane_file(&_mock, "st1", "input")).unwrap_or_default();
     assert!(!input.contains("two"), "second send pasted without a claim");
+}
+
+/// CAD-520 F26: a plain `source=user` send to a Devin pane at its
+/// verified idle prompt delivers with no `agent ready` at all — the
+/// probe IS the readiness claim, recorded as `ready_claimed` by the
+/// daemon itself (no `claim_used`, nothing stacked was consumed). The
+/// literal paste lands and the turn reports normally.
+#[test]
+fn pty_devin_idle_probe_is_the_ready_claim() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin("dv1", None);
+    d.wait_agent("dv1", "idle", 20);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": "work the lane", "message": "m1"}),
+    )
+    .unwrap();
+    let token = pty_token(&d, "dv1", "m1");
+    assert!(token.starts_with("pty-"), "{token}");
+    let claim = d
+        .events("dv1")
+        .into_iter()
+        .find(|e| e["kind"].as_str() == Some("ready_claimed"))
+        .expect("the idle probe must admit the send as the claim");
+    assert_eq!(claim["payload"]["by"], "daemon", "{claim}");
+    assert_eq!(claim["payload"]["probe"]["idle"], true, "{claim}");
+    assert!(
+        d.events("dv1")
+            .iter()
+            .all(|e| e["kind"].as_str() != Some("claim_used")),
+        "a stacked claim was consumed: {:?}",
+        d.events("dv1")
+    );
+    let screen = std::fs::read_to_string(d.pane_file(&mock, "dv1", "screen")).unwrap_or_default();
+    assert!(screen.contains("> work the lane"), "{screen}");
+    pty_report_done(&d, "dv1", "m1");
 }
 
 #[test]
@@ -834,7 +878,9 @@ fn join_bootstrap_briefs_and_queues() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    d.wait_agent("w-join", "idle", 20);
+    // CAD-520: the bootstrap self-delivers — the join lands `busy`
+    // running its turn, not `idle` queued behind a claim gate.
+    d.wait_agent("w-join", "busy", 20);
 
     // Briefing persisted under the state dir's briefings/<pm>/ — the
     // PM's repo itself is left byte-identical (audit N8).
@@ -847,28 +893,26 @@ fn join_bootstrap_briefs_and_queues() {
     assert!(text.contains("w-join") && text.contains("pm"), "{text}");
     assert_eq!(git_porcelain(&pm_repo), "", "launch touched the repo");
 
-    // The durable bootstrap message sits queued behind the ready gate —
-    // no bypass — and its body is one pty-safe line naming alias, PM
-    // and the briefing path.
-    let m = d.wait_message("w-join", "bootstrap-w-join", &["queued", "submitting"], 15);
+    // The durable bootstrap message is one pty-safe line naming alias,
+    // PM and the briefing path — and since CAD-520 it delivers without
+    // a human claim: the Devin pane's verified idle probe is the
+    // readiness claim (`ready_claimed` by the daemon).
+    let m = d.wait_message("w-join", "bootstrap-w-join", &["running", "submitting"], 15);
     assert_eq!(m["source"], "bootstrap");
     let body = m["body"].as_str().unwrap();
     assert!(!body.chars().any(|c| (c as u32) < 32 || c as u32 == 127));
     for want in ["w-join", "pm", briefing.to_str().unwrap(), "cadence self"] {
         assert!(body.contains(want), "bootstrap body missing {want}: {body}");
     }
-    // The gate's recorded refusal proves the actor tried it and held it.
-    d.wait_event_where(
-        "w-join",
-        "gate_wait",
-        |e| e["payload"]["message"] == "bootstrap-w-join",
-        10,
-    );
-    let mid = d.message_state("w-join", "bootstrap-w-join");
-    assert!(matches!(mid.as_str(), "queued" | "submitting"), "{mid}");
-    // A claim releases it — gated like any send, never bypassed.
-    d.operator_rpc("agent_ready", json!({"alias": "w-join"}))
-        .unwrap();
+    let claim = d
+        .wait_event_where(
+            "w-join",
+            "ready_claimed",
+            |e| e["payload"]["by"] == "daemon",
+            10,
+        )
+        .clone();
+    assert_eq!(claim["payload"]["probe"]["idle"], true, "{claim}");
     pty_token(&d, "w-join", "bootstrap-w-join");
 
     // --no-bootstrap: no message, no briefing file.
@@ -1460,8 +1504,15 @@ fn standalone_launch_writes_briefing_only() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    d.wait_agent("wb", "idle", 20);
-    let m = d.wait_message("wb", "bootstrap-wb", &["queued", "submitting"], 15);
+    // CAD-520: the verified idle probe is the readiness claim — the
+    // bootstrap delivers at once and the pane stays busy awaiting the
+    // report, so wait on the message, not on an idle agent.
+    let m = d.wait_message(
+        "wb",
+        "bootstrap-wb",
+        &["queued", "submitting", "running"],
+        15,
+    );
     assert_eq!(m["source"], "bootstrap");
 
     // --no-bootstrap writes nothing at all.
@@ -2106,7 +2157,9 @@ fn pty_auto_ready_waits_on_busy_pane_then_delivers() {
 /// `worker_result` is submitted by the route's wake. The empty-queue
 /// poll is pinned far past the wait, so a missing wake cannot hide
 /// behind it (CAD-391: a 2 s deadline against the default 5 s poll
-/// failed under load). The same pane then refuses a `source=user` send.
+/// failed under load). Since CAD-520 the pane's verified idle probe is
+/// itself the readiness claim, so a `source=user` send delivers the
+/// same way — recorded `ready_claimed` by the daemon, not an operator.
 #[test]
 fn pty_routed_notice_delivers_idle_without_claim() {
     let d = TestDaemon::start_opts(daemon::ServeOptions {
@@ -2153,26 +2206,33 @@ fn pty_routed_notice_delivers_idle_without_claim() {
         + &std::fs::read_to_string(d.pane_file(&mock, "pm", "input")).unwrap_or_default();
     assert!(pasted.contains("work-1"), "{pasted}");
 
-    // The unclaimed flag must not leak onto the next user paste.
+    // The unclaimed flag must not leak onto the next user paste — and
+    // none is needed: Devin's verified idle probe is the readiness
+    // claim, so the user send delivers and runs as its own turn.
     d.wait_agent("pm", "idle", 10);
     d.send(
         "pm",
-        json!({"text": "user task stays queued", "message": "u1", "source": "user"}),
+        json!({"text": "user task delivers", "message": "u1", "source": "user"}),
     )
     .unwrap();
-    let wait = d.wait_event("pm", "gate_wait", 10);
-    assert_eq!(wait["payload"]["message"], "u1", "{wait}");
-    assert!(
-        wait["payload"]["reason"]
-            .as_str()
-            .unwrap_or("")
-            .contains("agent ready"),
-        "{wait}"
-    );
-    assert_eq!(d.message_state("pm", "u1"), "queued");
-    let after = std::fs::read_to_string(d.pane_file(&mock, "pm", "screen")).unwrap_or_default()
+    let token = pty_token(&d, "pm", "u1");
+    assert!(token.starts_with("pty-"), "{token}");
+    // u1's claim, not the routed notice's: a probe-claimed send carries
+    // no `reason` — "routed" and "steer" only ride those paths.
+    let user_claim = d
+        .wait_event_where(
+            "pm",
+            "ready_claimed",
+            |e| e["payload"]["probe"]["idle"] == true && e["payload"]["reason"].is_null(),
+            10,
+        )
+        .clone();
+    assert_eq!(user_claim["payload"]["by"], "daemon", "{user_claim}");
+    assert_ne!(user_claim["payload"]["reason"], "routed", "{user_claim}");
+    let pane = std::fs::read_to_string(d.pane_file(&mock, "pm", "screen")).unwrap_or_default()
         + &std::fs::read_to_string(d.pane_file(&mock, "pm", "input")).unwrap_or_default();
-    assert!(!after.contains("user task stays queued"), "{after}");
+    assert!(pane.contains("user task delivers"), "{pane}");
+    pty_report_done(&d, "pm", "u1");
 }
 
 /// A busy pane still refuses a routed notice: `gate_wait`, no paste.
@@ -2243,32 +2303,35 @@ fn pty_probe_busy_markers_survive_trailing_blank_rows() {
         .is_empty());
 }
 
+/// The FIFO claim stack needs a profile that still requires `agent
+/// ready` — Devin's verified idle probe is itself the claim (CAD-520),
+/// so this runs on the stub.
 #[test]
 fn pty_ready_claims_stack_fifo_with_claimer() {
     let d = TestDaemon::start();
-    let _mock = d.mock_devin();
-    d.register_devin("dv", None);
-    d.wait_agent("dv", "idle", 20);
+    let _mock = d.mock_stub();
+    d.register_stub("st", json!({}));
+    d.wait_agent("st", "idle", 20);
     // Two claims land before either send — the queue stacks them FIFO
     // instead of overwriting (N6). Each releases exactly one message.
-    d.operator_rpc("agent_ready", json!({"alias": "dv", "by": "alice"}))
+    d.operator_rpc("agent_ready", json!({"alias": "st", "by": "alice"}))
         .unwrap();
-    d.operator_rpc("agent_ready", json!({"alias": "dv", "by": "bob"}))
+    d.operator_rpc("agent_ready", json!({"alias": "st", "by": "bob"}))
         .unwrap();
     for id in ["m1", "m2"] {
-        d.send("dv", json!({"text": format!("task {id}"), "message": id}))
+        d.send("st", json!({"text": format!("task {id}"), "message": id}))
             .unwrap();
     }
-    d.wait_message("dv", "m1", &["running"], 15);
+    d.wait_message("st", "m1", &["running"], 15);
     // CAD-250: m2 is claimed once m1 has reported; bob's claim waits.
-    pty_report_done(&d, "dv", "m1");
-    d.wait_message("dv", "m2", &["running"], 15);
+    pty_report_done(&d, "st", "m1");
+    d.wait_message("st", "m2", &["running"], 15);
     let used: Vec<Value> = d
-        .events("dv")
+        .events("st")
         .into_iter()
         .filter(|e| e["kind"].as_str() == Some("claim_used"))
         .collect();
-    assert_eq!(used.len(), 2, "{:?}", d.events("dv"));
+    assert_eq!(used.len(), 2, "{:?}", d.events("st"));
     // FIFO: m1 consumed alice's claim, m2 consumed bob's.
     assert_eq!(used[0]["payload"]["message"], "m1");
     assert_eq!(used[0]["payload"]["by"], "alice");
@@ -2638,29 +2701,32 @@ fn pty_unrendered_worker_result_requeues_then_parks() {
     );
 }
 
+/// `agent_set` retrofits `auto_ready` on a live actor — pinned on the
+/// stub, whose probe is not a readiness claim (Devin's is, CAD-520, so
+/// there the queued send would deliver before the patch landed).
 #[test]
 fn agent_set_opts_live_agent_into_auto_ready() {
     let d = TestDaemon::start();
-    let _mock = d.mock_devin();
-    d.register_devin("dv", None);
-    d.wait_agent("dv", "idle", 20);
+    let _mock = d.mock_stub();
+    d.register_stub("st", json!({}));
+    d.wait_agent("st", "idle", 20);
     // Without opt-in the queue still waits on a human claim. Since
     // CAD-245 the actor wakes on the send at once, so a fixed sleep can
     // land mid-attempt (`submitting` while the gate probes). Wait for
     // the recorded refusal; the requeued message then sits out the
     // gate back-off (CAD-266).
-    d.send("dv", json!({"text": "gated", "message": "m1"}))
+    d.send("st", json!({"text": "gated", "message": "m1"}))
         .unwrap();
-    d.wait_event("dv", "gate_wait", 20);
-    assert_eq!(d.message_state("dv", "m1"), "queued");
+    d.wait_event("st", "gate_wait", 20);
+    assert_eq!(d.message_state("st", "m1"), "queued");
     // Retrofit via agent_set — the running actor reads params per send.
     d.operator_rpc(
         "agent_set",
-        json!({"alias": "dv", "patch": {"auto_ready": "verified"}}),
+        json!({"alias": "st", "patch": {"auto_ready": "verified"}}),
     )
     .unwrap();
-    d.wait_message("dv", "m1", &["running"], 20);
-    let show = d.rpc("agent_show", json!({"alias": "dv"})).unwrap();
+    d.wait_message("st", "m1", &["running"], 20);
+    let show = d.rpc("agent_show", json!({"alias": "st"})).unwrap();
     assert_eq!(show["agent"]["params"]["auto_ready"], "verified");
 }
 

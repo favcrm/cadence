@@ -192,6 +192,19 @@ pub struct Probe {
     pub busy_marker: bool,
     /// A provider approval/permission menu is on screen.
     pub approval_menu: bool,
+    /// CAD-520: a folder-trust prompt blocks the TUI — Devin's
+    /// directory-trust select (`↓↑ to select`). Also `approval_menu`,
+    /// but named distinctly so `open` can report the real blocker
+    /// instead of timing out on the session lock.
+    pub trust_prompt: bool,
+    /// A turn is running but the input box still accepts steering
+    /// text — Devin's `Guide Devin while it works` watermark. False
+    /// for TUIs whose busy input is inert or unproven.
+    pub steerable: bool,
+    /// The TUI holds staged input in its own send queue — Devin's
+    /// `Press Enter to send queued messages` status. A second Enter
+    /// flushes it into the running turn.
+    pub queue_pending: bool,
 }
 
 impl Probe {
@@ -203,6 +216,9 @@ impl Probe {
             "prompt_visible": self.prompt_visible,
             "busy_marker": self.busy_marker,
             "approval_menu": self.approval_menu,
+            "trust_prompt": self.trust_prompt,
+            "steerable": self.steerable,
+            "queue_pending": self.queue_pending,
         })
     }
 }
@@ -432,6 +448,11 @@ pub trait ProviderAdapter: Send + Sync {
     /// cannot inherit it. No-op except on the pty adapter — the flag
     /// is not encoded in the message body.
     fn set_unclaimed_ok(&self, _ok: bool) {}
+    /// The actor is about to run one `nudge` turn: the pty gate may
+    /// admit the paste into a *busy* pane whose input box still takes
+    /// steering text (`probe.steerable`). Cleared with the turn, like
+    /// `unclaimed_ok`. No-op except on the pty adapter.
+    fn set_steer_ok(&self, _ok: bool) {}
     /// External proof of life: a brokered permission request is open
     /// and waiting on a human — the provider is silent by design, so
     /// activity-based liveness must count the wait or the turn fences

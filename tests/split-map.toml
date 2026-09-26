@@ -321,6 +321,7 @@ tests = [
     "cli_doctor_smoke",
     "pty_send_pastes_literal_and_completes_via_report",
     "pty_claim_is_single_use_and_expires",
+    "pty_devin_idle_probe_is_the_ready_claim",
     "pty_ack_then_result_and_duplicate_rules",
     "pty_stale_generation_report_rejected",
     "pty_report_refuses_stale_generation_and_managed_token",
@@ -470,6 +471,8 @@ tests = [
     "pty_stop_reaps_pane_session_tree",
     "pty_stop_without_pane_root_records_unowned_tree",
     "pty_deleted_cwd_refuses_delivery_and_is_surfaced",
+    "pty_resume_refuses_a_deleted_lane_cwd",
+    "pty_devin_trust_prompt_fails_open_fast",
 ]
 helpers = [
     "drop_shutdown_marker",
@@ -527,6 +530,11 @@ tests = [
     "steering_send_caller_rule_per_route",
     "urgent_waits_for_the_open_approval_then_goes_first",
     "pty_urgent_waits_for_the_held_turn_then_goes_first",
+    "pty_devin_busy_nudge_flushes_the_send_queue",
+    "nudge_caller_is_own_pm_or_operator_only",
+    "pty_devin_render_miss_reprobe_accepts_the_busy_turn",
+    "pty_devin_render_miss_records_reprobe_evidence",
+    "pty_delivery_stalled_fires_once_and_clears",
 ]
 helpers = [
     "stuck_draft",
