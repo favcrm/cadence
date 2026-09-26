@@ -1868,7 +1868,18 @@ pub(crate) fn daemon_restart(
             true,
         ),
         Ok(Err(refused)) => return Err(refused),
-        Err(_) => (Vec::new(), false),
+        Err(_) => {
+            // A lost response does not prove the daemon is down. Never
+            // skip --when-idle on a live lock holder whose fleet
+            // snapshot was unavailable.
+            if !daemon_lock_free(state_dir) {
+                return Err(Error::rejected(
+                    "daemon owns the state-dir lock but does not answer the \
+                     socket — inspect daemon.log before restarting",
+                ));
+            }
+            (Vec::new(), false)
+        }
     };
     if when_idle && reachable {
         let deadline = Instant::now() + Duration::from_secs(timeout);
@@ -1959,10 +1970,17 @@ pub(crate) fn daemon_restart(
     // rule: not the operator, not a granted lease holder) aborts the
     // restart here, before anything is recorded. Only an unreachable
     // socket means "not running".
-    let was_running = match client::rpc_answer(state_dir, "shutdown", json!({})) {
-        Ok(Ok(_)) => true,
-        Ok(Err(refused)) => return Err(refused),
-        Err(_) => false,
+    let was_running = if reachable {
+        match client::rpc_answer(state_dir, "shutdown", json!({})) {
+            Ok(Ok(_)) => true,
+            Ok(Err(refused)) => return Err(refused),
+            Err(_) => false,
+        }
+    } else {
+        // Do not shut down a daemon that appeared after the free-lock
+        // proof: it supplied no fleet snapshot or idle proof. The lock
+        // is checked again below before attempting an offline start.
+        false
     };
     if !was_running && !daemon_lock_free(state_dir) {
         return Err(Error::rejected(
