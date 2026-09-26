@@ -1,4 +1,5 @@
 import { filterHits, hitKind, snippetParts, TYPE_FILTERS, type SearchHit } from "../src/features/wiki/search";
+import { blobPage } from "../src/features/wiki/api";
 import { extOf, kindLabel, previewKind } from "../src/features/wiki/preview";
 import { relTime, versionRows, versionWho } from "../src/features/wiki/history";
 
@@ -61,6 +62,31 @@ equal(extOf("noext"), "", "no extension");
 equal(kindLabel("board-v5.png", "image/png"), "IMG", "the tile chip for an image");
 equal(kindLabel("exports.zip", null), "ZIP", "the tile chip for a zip");
 equal(kindLabel("noext", null), "FILE", "the fallback chip");
+
+// A blob's preview reads its listing entry — the file route streams the
+// bytes, so the preview never asks it for JSON (which would be null).
+equal(
+  blobPage({
+    path: "projects/cadence/design/board-v5.png",
+    name: "board-v5.png",
+    kind: "file",
+    size: 412 * 1024,
+    mime: "image/png",
+    rev: "b5a1c02",
+    edited_by: "swe-1",
+    mtime: "2026-09-26T09:00:00Z",
+  }),
+  {
+    path: "projects/cadence/design/board-v5.png",
+    kind: "file",
+    mime: "image/png",
+    size: 412 * 1024,
+    rev: "b5a1c02",
+    edited_by: "swe-1",
+    mtime: "2026-09-26T09:00:00Z",
+  },
+  "a blob previews from its listing entry",
+);
 
 // ---- history -------------------------------------------------------------
 

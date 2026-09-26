@@ -121,7 +121,24 @@ export function wikiErrorFrom(status: number, body: unknown): WikiError {
 async function json<T>(resp: Response): Promise<T> {
   const body = await resp.json().catch(() => null);
   if (!resp.ok) throw wikiErrorFrom(resp.status, body);
+  // A blob route streams bytes, not JSON: a caller that asked for a page
+  // where a blob lives gets a clear refusal, not a null that renders as a
+  // crash. The preview panes never call this — they read the listing.
+  if (body === null) throw new WikiError("the server answered without JSON", resp.status);
   return body as T;
+}
+
+/** The metadata a preview needs, taken from a listing entry (no fetch). */
+export function blobPage(entry: WikiEntry): WikiPage {
+  return {
+    path: entry.path,
+    kind: "file",
+    mime: entry.mime ?? null,
+    size: entry.size,
+    rev: entry.rev,
+    edited_by: entry.edited_by,
+    mtime: entry.mtime ?? null,
+  };
 }
 
 function get<T>(url: string): Promise<T> {

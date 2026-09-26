@@ -4,12 +4,12 @@ import type { Route } from "../../lib/router";
 import { navigate } from "../../lib/useLocation";
 import Md from "../../ui/Md";
 import {
+  blobPage,
   wiki,
   WikiError,
   wikiFileUrl,
   wikiRawUrl,
   type WikiEntry,
-  type WikiKind,
   type WikiListing,
   type WikiPage,
 } from "./api";
@@ -106,14 +106,14 @@ export default function Wiki({ route, navHref, readOnly, actor, onToast }: WikiP
     for (const dir of dirs) void loadDir(dir);
   }, [route.path, route.mode, loadDir, tick]);
 
-  // The listings as a ref: the browse effect reads the known kind without
+  // The listings as a ref: the browse effect reads the known entry without
   // re-running every time a folder finishes loading (which would loop).
   const childrenRef = useRef(children);
   childrenRef.current = children;
-  const kindOf = useCallback((path: string): WikiKind | null => {
+  const entryOf = useCallback((path: string): WikiEntry | null => {
     for (const entries of Object.values(childrenRef.current)) {
       const hit = entries.find((entry) => entry.path === path);
-      if (hit) return hit.kind;
+      if (hit) return hit;
     }
     return null;
   }, []);
@@ -132,20 +132,38 @@ export default function Wiki({ route, navHref, readOnly, actor, onToast }: WikiP
       setOpen(next);
       if (next.kind === "dir") setChildren((c) => ({ ...c, [path]: next.listing.entries ?? [] }));
     };
+    // A blob previews from its listing entry — the file route streams the
+    // bytes, so asking it for JSON would be the wrong call. A page's text
+    // comes from the file route.
+    const openEntry = async (entry: WikiEntry): Promise<Open> =>
+      entry.kind === "page"
+        ? { path, kind: "file", page: await wiki.file(path) }
+        : { path, kind: "file", page: blobPage(entry) };
     const listing = async (): Promise<Open> => {
       const ls = await wiki.ls(path);
       if (ls.kind && ls.kind !== "dir") {
-        return { path, kind: "file", page: await wiki.file(path) };
+        return openEntry(
+          ls.entries?.find((e) => e.path === path) ?? {
+            path,
+            name: baseName(path),
+            kind: ls.kind,
+            size: ls.size,
+            mime: ls.mime,
+            rev: ls.rev,
+            edited_by: ls.edited_by,
+            mtime: ls.mtime,
+          },
+        );
       }
       return { path, kind: "dir", listing: { ...ls, path, entries: ls.entries ?? [] } };
     };
     void (async () => {
       try {
-        const known = path ? kindOf(path) : "dir";
-        if (known === "dir" || path === "") {
+        const known = path ? entryOf(path) : null;
+        if (path === "" || known?.kind === "dir") {
           land(await listing());
-        } else if (known === "page" || known === "file") {
-          land({ path, kind: "file", page: await wiki.file(path) });
+        } else if (known) {
+          land(await openEntry(known));
         } else {
           try {
             land(await listing());
@@ -165,7 +183,7 @@ export default function Wiki({ route, navHref, readOnly, actor, onToast }: WikiP
     return () => {
       cancelled = true;
     };
-  }, [route.mode, route.path, kindOf, tick]);
+  }, [route.mode, route.path, entryOf, tick]);
 
   const toggle = (path: string) => {
     if (expanded.has(path)) {
