@@ -73,6 +73,10 @@ this workflow exactly.
   free. The DeepSeek V4.1 Flash Max worker model is
   `devin/deepseek-v4-1-flash-high` with `--effort max`:
   `cadence join <pm> pi --model devin/deepseek-v4-1-flash-high --effort max`.
+  When its usage runs out, the fallback is `devin/swe-2-high` with
+  `--effort max` — switch a live agent with
+  `cadence agent set <alias> --next-launch model=devin/swe-2-high effort=max`
+  then `agent stop` + `agent resume`.
 - `openrouter/*` models are **paid** — never route a worker or reviewer
   through openrouter. (The production master's pinned
   `openrouter/z-ai/glm-5.3-flash` is the one accepted exception; the

@@ -128,7 +128,10 @@ loading an unvetted build.
 ### Which models to use
 
 - **devin** models are the free worker/reviewer path. DeepSeek V4.1
-  Flash Max is `devin/deepseek-v4-1-flash-high` with `--effort max`.
+  Flash Max is `devin/deepseek-v4-1-flash-high` with `--effort max`;
+  when its usage runs out the fallback is `devin/swe-2-high` with
+  `--effort max` (`agent set <alias> --next-launch model=… effort=max`,
+  then stop + resume).
   The devin provider exists only because the pinned `pi-devin` package
   loads with `-e` — a daemon built before CAD-559 launches workers as
   `--no-extensions` with no `-e`, so the model resolves nowhere and pi
