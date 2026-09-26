@@ -2655,6 +2655,14 @@ fn event_resources(name: &str) -> &'static [&'static str] {
 /// frame. `into_writer` hands over the socket: the head is written by
 /// hand, each frame flushes immediately, and dropping the writer on
 /// exit closes the stream — which is also how a dead client surfaces.
+fn stream_hello(entities: bool) -> String {
+    let mut data = json!({"build": crate::overview::BUILD_ID});
+    if entities {
+        data["entities"] = json!(true);
+    }
+    format!("event: hello\ndata: {data}\n\n")
+}
+
 fn stream_events(request: Request, state_dir: &Path, pm_dir: &Path) {
     let entities = request
         .url()
@@ -2681,10 +2689,7 @@ fn stream_events(request: Request, state_dir: &Path, pm_dir: &Path) {
     // running an older bundle compares and prompts a reload, CAD-573)
     // and the `: ping` right behind it proves the stream is live and
     // gives proxies something to flush before the first event exists.
-    let hello = format!(
-        "event: hello\ndata: {}\n\n",
-        json!({"build": crate::overview::BUILD_ID, "entities": entities})
-    );
+    let hello = stream_hello(entities);
     if !frame(&mut w, hello.as_bytes()) || !frame(&mut w, b": ping\n\n") {
         return;
     }
@@ -4320,6 +4325,26 @@ mod tests {
     /// CAD-480: a mailbox row on the Agents screen carries its unread
     /// backlog and oldest-unread age from `agent.inbox`, and the unread
     /// count folds into the queued total.
+    #[test]
+    fn stream_hello_capability_is_opt_in() {
+        assert_eq!(
+            super::stream_hello(false),
+            format!(
+                "event: hello\ndata: {}\n\n",
+                json!({"build": crate::overview::BUILD_ID})
+            ),
+            "legacy hello remains byte-compatible"
+        );
+        assert_eq!(
+            super::stream_hello(true),
+            format!(
+                "event: hello\ndata: {}\n\n",
+                json!({"build": crate::overview::BUILD_ID, "entities": true})
+            ),
+            "only opted-in clients receive the entity capability"
+        );
+    }
+
     #[test]
     fn agents_payload_inbox_row_reports_unread_backlog() {
         let dir = tempfile::TempDir::new().unwrap();
