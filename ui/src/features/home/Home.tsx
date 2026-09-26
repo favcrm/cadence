@@ -448,7 +448,9 @@ function CmdJson({ value }: { value: unknown }) {
         <dl className="kvlist">
           {rows.map(([k, v]) => (
             <div key={k} className="kvrow">
-              <dt>{k}</dt>
+              {/* CAD-569: the wrapped label keeps the full key one
+                  hover away when a long wire name folds. */}
+              <dt title={k}>{k}</dt>
               <dd>{v}</dd>
             </div>
           ))}

@@ -244,6 +244,21 @@ equal(
   ["effort", "extraFlag"],
   "unlabelled keys keep order after labelled",
 );
+// CAD-569: a long wire key surfaces verbatim — real Pi's /state sends
+// `autoCompactionEnabled` (22 chars) which the 5rem label column
+// overlapped with its value; the row keeps the full key (never
+// truncated in the data layer — the CSS wraps it).
+equal(
+  kvRows({ model: "fake/model-1", autoCompactionEnabled: true, contextWindowAutoCompact: 0.83 }),
+  [
+    ["model", "fake/model-1"],
+    ["autoCompactionEnabled", "true"],
+    ["contextWindowAutoCompact", "0.83"],
+  ],
+  "long unlabelled keys surface verbatim after labelled ones",
+);
+const longKey = kvRows({ autoCompactionEnabled: true })[0];
+ok(longKey[0].length > 20, "the long key reaches the label cell whole — CSS wraps it");
 // Scalars and nulls give the card nothing to list — it shows raw JSON.
 equal(kvRows("done"), [], "a string is not a field list");
 equal(kvRows(null), [], "null is not a field list");

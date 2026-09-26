@@ -684,6 +684,10 @@ pre {
   flex: none;
   width: 5rem;
   color: var(--color-ink-500);
+  /* CAD-569: a long wire key (real Pi's 22-char
+   * `autoCompactionEnabled`) wraps inside the label column instead of
+   * overlapping its value; the full key is one `title` away. */
+  overflow-wrap: anywhere;
 }
 .kvrow dd {
   min-width: 0;
