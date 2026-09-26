@@ -522,6 +522,7 @@ impl Store {
             json!({
                 "message": delivery,
                 "source": "worker_result",
+                "sender": message.alias,
                 "recipient_identity": Self::agent_identity(recipient),
             }),
         )?;
@@ -671,6 +672,7 @@ impl Store {
             json!({
                 "message": delivery,
                 "source": "worker_notice",
+                "sender": message.alias,
                 "recipient_identity": Self::agent_identity(recipient),
             }),
         )?;

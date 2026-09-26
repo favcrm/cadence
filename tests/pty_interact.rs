@@ -682,10 +682,25 @@ fn pty_silent_end_sends_one_report_reminder() {
         assert!(Instant::now() < deadline, "no report reminder was queued");
         thread::sleep(Duration::from_millis(50));
     };
-    let n = d.wait_message("w1", &rid, &["completed"], 20);
+    // CAD-565: the reminder binds to ms9's running turn and gate-waits
+    // — the stub pane is idle, never steerable, so a turn-bound nudge
+    // can never land on it.
+    let gw = d.wait_event_where("w1", "gate_wait", |e| e["payload"]["message"] == rid, 20);
+    assert!(
+        gw["payload"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("no steerable input"),
+        "{gw}"
+    );
+    let n = reminders(&d).first().cloned().expect("the reminder row");
     assert_eq!(n["nudge"], true, "{n}");
-    assert_eq!(n["result"]["via"], "pty_nudge", "{n}");
     assert!(n["reply_to"].is_null(), "a reminder owes no report: {n}");
+    assert_eq!(
+        running_token(&d, &rid),
+        token,
+        "the reminder bound to ms9's turn atomically"
+    );
     let body = n["body"].as_str().unwrap();
     // The command names the message but never the live token — the row
     // is durable and the paste lands in scrollback, both readable by a
@@ -729,6 +744,20 @@ fn pty_silent_end_sends_one_report_reminder() {
     assert_eq!(
         d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["unknown"],
         0
+    );
+    // CAD-565: with its bound turn gone the reminder is skipped on the
+    // next claim, never replayed into a later turn.
+    d.wait_message("w1", &rid, &["cancelled"], 45);
+    let cancelled = d.wait_event_where(
+        "w1",
+        "nudge_cancelled",
+        |e| e["payload"]["message"] == rid,
+        10,
+    );
+    assert_eq!(
+        cancelled["payload"]["reason"].as_str(),
+        Some("skipped_inactive"),
+        "{cancelled}"
     );
     stall_sample(0);
 }
@@ -1231,11 +1260,33 @@ fn pty_answer_refuses_without_a_menu() {
 /// input line again as if the submit keystroke had been lost — no busy
 /// marker, no menu. The delivery's own paste and Enter are the only
 /// keys the pane has seen. Answers the turn token.
+/// The CAD-565 one-line notice a pty pane stages for `id`/`body` —
+/// mirrors `Shared::delivery_body` for the unattributed, unthreaded,
+/// short-body sends these fixtures use (no preview truncation).
+fn pty_notice(id: &str, body: &str, reply_to: Option<&str>) -> String {
+    assert!(body.chars().count() <= 150, "fixture body too long");
+    let reply = reply_to.map(|t| format!(" reply→{t}")).unwrap_or_default();
+    format!(
+        "[cadence] {id} from unattributed{reply}: {} \
+         [Use `cadence message read {id}` for the rest.]",
+        body.split_whitespace().collect::<Vec<_>>().join(" ")
+    )
+}
+
 fn stuck_draft(d: &TestDaemon, mock: &MockStub, alias: &str, id: &str) -> String {
     d.send(alias, json!({"text": RECOVER_BODY, "message": id}))
         .unwrap();
     let token = pty_token(d, alias, id);
-    atomic_write(d.stub_pane_file(mock, alias, "input"), RECOVER_BODY);
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    let reply_to: Option<String> = conn
+        .query_row("SELECT reply_to FROM messages WHERE id=?1", [id], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    atomic_write(
+        d.stub_pane_file(mock, alias, "input"),
+        pty_notice(id, RECOVER_BODY, reply_to.as_deref()),
+    );
     let probe = d.rpc("agent_probe", json!({"alias": alias})).unwrap();
     assert_eq!(probe["input_nonempty"], true, "{probe}");
     assert_eq!(probe["busy_marker"], false, "{probe}");
@@ -1362,10 +1413,11 @@ fn recover_fixture(params: Value) -> (TestDaemon, MockStub, String) {
 #[test]
 fn recover_submit_sends_one_enter_and_keeps_correlation() {
     let (d, mock, token) = recover_fixture(json!({"auto_ready": "verified"}));
-    // The TUI word-wraps a long draft at its input width.
+    // The TUI word-wraps a long draft at its input width. CAD-565: the
+    // staged draft is the bounded delivery notice, not the raw body.
     atomic_write(
         d.stub_pane_file(&mock, "st", "input"),
-        word_wrap(RECOVER_BODY, STUB_INPUT_WIDTH).join("\n"),
+        word_wrap(&pty_notice("m1", RECOVER_BODY, None), STUB_INPUT_WIDTH).join("\n"),
     );
     let generation = d.rpc("agent_show", json!({"alias": "st"})).unwrap()["agent"]["generation"]
         .as_str()
@@ -1395,7 +1447,7 @@ fn recover_submit_sends_one_enter_and_keeps_correlation() {
     // The TUI took the staged draft as the turn.
     let screen = std::fs::read_to_string(d.stub_pane_file(&mock, "st", "screen")).unwrap();
     assert_eq!(
-        screen.matches("STUB_REPLY: CAD152-KICKOFF").count(),
+        screen.matches("STUB_REPLY: [cadence] m1").count(),
         2,
         "{screen}"
     );
@@ -1406,7 +1458,10 @@ fn recover_submit_sends_one_enter_and_keeps_correlation() {
     assert_eq!(running_token(&d, "m1"), token);
     // A second recovery of the same message — racing, or later —
     // refuses and sends nothing.
-    atomic_write(d.stub_pane_file(&mock, "st", "input"), RECOVER_BODY);
+    atomic_write(
+        d.stub_pane_file(&mock, "st", "input"),
+        pty_notice("m1", RECOVER_BODY, None),
+    );
     let e = recover(&d, "st", "m1").unwrap_err().to_string();
     assert!(
         e.contains("agent recover-submit refused (already_submitted)"),
@@ -1519,7 +1574,7 @@ fn recover_submit_refuses_open_approval_menu() {
 #[test]
 fn recover_submit_refuses_edited_draft() {
     let (d, mock, _token) = recover_fixture(json!({"auto_ready": "verified"}));
-    let edited = RECOVER_BODY.replace("docs/brief.md", "docs/other.md");
+    let edited = pty_notice("m1", RECOVER_BODY, None).replace("docs/brief.md", "docs/other.md");
     atomic_write(d.stub_pane_file(&mock, "st", "input"), &edited);
     let err = recover(&d, "st", "m1").unwrap_err();
     assert_recover_refused(&d, &mock, "st", "m1", err, "draft_mismatch");
@@ -1537,15 +1592,16 @@ fn recover_submit_refuses_edited_draft() {
 #[test]
 fn recover_submit_refuses_ambiguous_wrap() {
     let (d, mock, _token) = recover_fixture(json!({"auto_ready": "verified"}));
+    let notice = pty_notice("m1", RECOVER_BODY, None);
     atomic_write(
         d.stub_pane_file(&mock, "st", "input"),
-        &RECOVER_BODY[RECOVER_BODY.len() - 40..],
+        &notice[notice.len() - 40..],
     );
     let err = recover(&d, "st", "m1").unwrap_err();
     assert_recover_refused(&d, &mock, "st", "m1", err, "ambiguous_wrap");
     atomic_write(
         d.stub_pane_file(&mock, "st", "input"),
-        RECOVER_BODY.replacen(" the brief", "thebrief", 1),
+        notice.replacen(" the brief", "thebrief", 1),
     );
     let err = recover(&d, "st", "m1").unwrap_err();
     assert_recover_refused(&d, &mock, "st", "m1", err, "ambiguous_wrap");
@@ -1646,7 +1702,10 @@ fn recover_submit_devin_lost_submit() {
     d.send("dv1", json!({"text": RECOVER_BODY, "message": "k1"}))
         .unwrap();
     let token = pty_token(&d, "dv1", "k1");
-    atomic_write(d.pane_file(&mock, "dv1", "input"), RECOVER_BODY);
+    atomic_write(
+        d.pane_file(&mock, "dv1", "input"),
+        pty_notice("k1", RECOVER_BODY, None),
+    );
     let r = recover(&d, "dv1", "k1").unwrap();
     assert_eq!(r["state"], "submitted", "{r}");
     // The delivery's paste and Enter, plus exactly one Enter.
@@ -1658,7 +1717,7 @@ fn recover_submit_devin_lost_submit() {
     );
     let screen = std::fs::read_to_string(d.pane_file(&mock, "dv1", "screen")).unwrap();
     assert_eq!(
-        screen.matches("MOCK_REPLY: CAD152-KICKOFF").count(),
+        screen.matches("MOCK_REPLY: [cadence] k1").count(),
         2,
         "{screen}"
     );
@@ -2050,7 +2109,9 @@ fn pty_urgent_waits_for_the_held_turn_then_goes_first() {
 /// running turn. The nudge completes at the confirmed paste, never
 /// holds a turn. A busy pane without the guide watermark refuses the
 /// nudge (busy is still busy), and a modal menu covering the box does
-/// too — steering is only ever the live guide box.
+/// too — steering is only ever the live guide box. CAD-565: every
+/// nudge binds atomically to the running turn at claim — the steers
+/// below all belong to t1's turn and would skip the moment it ended.
 /// Ordering: the actor's queue is strictly head-first, so the nudges
 /// run before the wedged task below can sit at the head.
 #[test]
@@ -2059,6 +2120,10 @@ fn pty_devin_busy_nudge_flushes_the_send_queue() {
     let mock = d.mock_devin();
     d.register_devin("dv1", None);
     d.wait_agent("dv1", "idle", 20);
+    // A real running turn: nudges have nothing to steer without one.
+    d.send("dv1", json!({"text": "work the lane", "message": "t1"}))
+        .unwrap();
+    pty_token(&d, "dv1", "t1");
     let keys = |want| {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -2106,7 +2171,9 @@ fn pty_devin_busy_nudge_flushes_the_send_queue() {
     let n = d.wait_message("dv1", "n1", &["completed"], 25);
     assert_eq!(n["result"]["via"], "pty_nudge", "{n}");
     assert_eq!(n["nudge"], true, "{n}");
-    keys((1, 2));
+    // t1's delivery is the baseline paste+Enter; the steer adds one
+    // paste and two Enters (queue, then flush).
+    keys((2, 3));
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let screen =
@@ -2132,17 +2199,17 @@ fn pty_devin_busy_nudge_flushes_the_send_queue() {
                "message": "n2", "nudge": true}),
     )
     .unwrap();
-    assert!(gate_reason("n2").contains("busy"));
+    assert!(gate_reason("n2").contains("no steerable input"));
     assert_eq!(
         pane_keys(&d, &mock.dir, "dv1"),
-        (1, 2),
+        (2, 3),
         "a refused nudge pasted"
     );
     // The guide box back: the queued nudge steers in on its next gate
     // retry — wedged, not dropped.
     busy("Guide Devin while it works\n");
     d.wait_message("dv1", "n2", &["completed"], 25);
-    keys((2, 4));
+    keys((3, 5));
 
     // A modal menu over the box is never steerable — the nudge waits
     // out the menu instead of keying text into a selection.
@@ -2156,22 +2223,34 @@ fn pty_devin_busy_nudge_flushes_the_send_queue() {
     assert!(gate_reason("n3").contains("approval menu"));
     assert_eq!(
         pane_keys(&d, &mock.dir, "dv1"),
-        (2, 4),
+        (3, 5),
         "a menued nudge pasted"
     );
     std::fs::remove_file(d.pane_file(&mock, "dv1", "tui-state")).unwrap();
     d.wait_message("dv1", "n3", &["completed"], 25);
-    keys((3, 6));
+    keys((4, 7));
 
-    // Ordinary work still refuses the busy pane — the refusal is the
-    // screen's busy verdict, not a missing claim.
+    // Ordinary work never claims while t1 holds the turn — the nudges
+    // steered past it; a task sits queued with no gate attempt at all.
     d.rpc(
         "agent_send",
         json!({"alias": "dv1", "text": "plain task", "message": "w1"}),
     )
     .unwrap();
-    assert!(gate_reason("w1").contains("busy"));
+    thread::sleep(Duration::from_secs(3));
     assert_eq!(d.message_state("dv1", "w1"), "queued");
+    assert!(
+        d.events("dv1")
+            .iter()
+            .all(|e| { !(e["kind"] == "gate_wait" && e["payload"]["message"] == "w1") }),
+        "a held task must not reach the pane's gate"
+    );
+    // Turn end: the mock drops its busy markers, t1 reports, and the
+    // queued task finally delivers.
+    std::fs::remove_file(d.pane_file(&mock, "dv1", "status")).unwrap();
+    std::fs::remove_file(d.pane_file(&mock, "dv1", "inputbox")).unwrap();
+    pty_report_done(&d, "dv1", "t1");
+    pty_report_done(&d, "dv1", "w1");
 }
 
 /// CAD-520 r3: a nudge steers a live pane mid-turn — the same queue
@@ -2184,12 +2263,25 @@ fn pty_devin_busy_nudge_flushes_the_send_queue() {
 #[test]
 fn nudge_caller_is_own_pm_or_operator_only() {
     let d = TestDaemon::start();
-    let _mock = d.mock_devin();
+    let mock = d.mock_devin();
     let mut p = guard_panes(&d);
     // dv's own PM is the planted `pm`; `pm2` and `w1` are other
     // identities — a foreign PM and a co-worker.
     d.register_devin_opts("dv", json!({"upstream": "pm"}));
     d.wait_agent("dv", "idle", 20);
+    // CAD-565: a nudge needs a running turn to steer — hold one open
+    // with a guide-box watermark so the gate admits steering.
+    d.send("dv", json!({"text": "hold the turn", "message": "t1"}))
+        .unwrap();
+    pty_token(&d, "dv", "t1");
+    atomic_write(
+        d.pane_file(&mock, "dv", "inputbox"),
+        "Guide Devin while it works\n",
+    );
+    atomic_write(
+        d.pane_file(&mock, "dv", "status"),
+        "⠸ Thinking · 12s (esc twice to interrupt)\n",
+    );
     let nudge = |extra: &[(&str, &str)]| {
         let mut v = json!({"alias": "dv", "text": "steer now", "nudge": true});
         for (k, val) in extra {
@@ -2222,10 +2314,15 @@ fn nudge_caller_is_own_pm_or_operator_only() {
         .pm2
         .rpc(&d.state, "agent_send", nudge(&[("source", "nudge")]));
     assert!(frame_err(&r).contains("steering rule"), "{r}");
-    // Nothing reached dv's queue from any refused route.
+    // Nothing reached dv's queue from any refused route — only the
+    // held turn t1 may sit in its message list.
     let show = d.rpc("agent_show", json!({"alias": "dv"})).unwrap();
     assert!(
-        show["messages"].as_array().unwrap().is_empty(),
+        show["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["nudge"] != true),
         "refused nudges must not enqueue: {show}"
     );
 

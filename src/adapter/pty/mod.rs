@@ -592,6 +592,38 @@ pub(crate) fn nearest_pane<'a>(
     chain.iter().find_map(|pid| panes.get(pid))
 }
 
+/// Literal-only content screening: the checks every text bound for
+/// a TUI must pass, shared by the paste itself and (CAD-565) the
+/// stored body a delivery notice stands in for. `pre_write`
+/// rejections — provably no bytes reached the pane, so the message
+/// fails without fencing the endpoint and before the gate consumes
+/// a claim.
+fn prewrite_check(profile: &dyn TuiProfile, text: &str) -> Result<()> {
+    if text.is_empty() || text.len() > MAX_BODY {
+        return Err(Error::pre_write("PTY messages must be 1–4000 characters"));
+    }
+    if has_control_chars(text) {
+        return Err(Error::pre_write(
+            "PTY messages must be a single line without control characters",
+        ));
+    }
+    // Forbidden input prefixes: a leading character the TUI treats
+    // as a command or mode switch (its own menu, a shell escape)
+    // makes a verbatim paste an injection path — reject before any
+    // byte reaches the pane and before the gate consumes a claim.
+    if let Some(prefix) = text.trim_start().chars().next() {
+        if profile.forbidden_prefixes().contains(&prefix) {
+            return Err(Error::pre_write(format!(
+                "message body starts with '{prefix}', which {} treats \
+                 as a command or mode switch — refusing to paste it \
+                 into the terminal",
+                profile.name()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// A pty provider's forbidden input prefixes — the profile's own list,
 /// surfaced here so the briefing can warn without constructing a
 /// profile. Unknown providers get an empty list (no hazard asserted).
@@ -856,6 +888,16 @@ impl PtyAdapter {
         // editable input — the paste lands in the guide box and the
         // render check flushes Devin's queued-send Enter.
         let steer = self.steer_ok.load(AtomicOrdering::SeqCst) && probe.steerable;
+        // CAD-565: a nudge is bound to the turn that was running when it
+        // was claimed — it must enter *that* turn's steerable input.
+        // Anything else, an idle prompt included (the bound turn's box
+        // is gone), refuses before a claim is consumed; the claim-side
+        // binding decides whether the bound turn still runs before the
+        // next attempt, so the nudge never lands as a later turn's
+        // stale input.
+        if self.steer_ok.load(AtomicOrdering::SeqCst) && !steer {
+            return Err(Error::gate(format!("no steerable input: {}", probe.reason)));
+        }
         let claimed = {
             // Claims stack FIFO: drop expired heads, consume the oldest
             // fresh one — one paste per claim, always.
@@ -1236,38 +1278,23 @@ impl ProviderAdapter for PtyAdapter {
         })
     }
 
+    /// CAD-565: the stored body a delivery notice stands in for is
+    /// screened with the same literal-only rules the paste itself
+    /// faces — a command-shaped, oversized or control-char body is
+    /// refused before delivery, not merely before bytes are pasted.
+    fn check_body(&self, body: &str) -> Result<()> {
+        prewrite_check(self.profile.as_ref(), body)
+    }
+
     fn run_turn(
         &self,
         prompt: &str,
         client_message_id: &str,
         on_started: &dyn Fn(&str),
     ) -> Result<TurnResult> {
-        // Literal-only content: pasted verbatim, so reject anything the
-        // TUI could interpret as keys. These are `pre_write` rejections —
-        // provably no bytes reached the pane, so the message fails
-        // without fencing the endpoint.
-        if prompt.is_empty() || prompt.len() > MAX_BODY {
-            return Err(Error::pre_write("PTY messages must be 1–4000 characters"));
-        }
-        if has_control_chars(prompt) {
-            return Err(Error::pre_write(
-                "PTY messages must be a single line without control characters",
-            ));
-        }
-        // Forbidden input prefixes: a leading character the TUI treats
-        // as a command or mode switch (its own menu, a shell escape)
-        // makes a verbatim paste an injection path — reject before any
-        // byte reaches the pane and before the gate consumes a claim.
-        if let Some(prefix) = prompt.trim_start().chars().next() {
-            if self.profile.forbidden_prefixes().contains(&prefix) {
-                return Err(Error::pre_write(format!(
-                    "message body starts with '{prefix}', which {} treats \
-                     as a command or mode switch — refusing to paste it \
-                     into the terminal",
-                    self.profile.name()
-                )));
-            }
-        }
+        // The text actually pasted still faces the literal-only screen
+        // — under CAD-565 that is the daemon-built delivery notice.
+        prewrite_check(self.profile.as_ref(), prompt)?;
         // The gate's probe and the paste it admits are one critical
         // section: a concurrent `agent answer` (or second send) must
         // not interleave keys between the probe and the paste.

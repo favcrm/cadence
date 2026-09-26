@@ -8,6 +8,11 @@ use crate::adapter::InterruptOutcome;
 use crate::adapter::Probe;
 use crate::peer::PeerTies;
 
+/// CAD-565: the largest window one `message read` returns — Unicode
+/// scalars, matching the pty paste ceiling so a single page can carry
+/// anything a pane could.
+pub(super) const MESSAGE_READ_LIMIT: usize = 4_000;
+
 impl Shared {
     /// `agent_send` without a connection to attribute (unit tests):
     /// a threaded agent records the message as unattributed, and a
@@ -162,6 +167,17 @@ impl Shared {
                  the daemon's own resolution; plain sends carry none"
             )));
         }
+        // CAD-565: `turn_id` is the daemon's running-turn token — a
+        // nudge binds to the turn that is running when the daemon
+        // claims it, checked atomically; a caller field could only ever
+        // be a forged reference, so it is refused whole rather than
+        // silently ignored.
+        if params.get("turn_id").is_some() {
+            return Err(Error::rejected(
+                "send refused: `turn_id` is not a request field — the daemon \
+                 binds turns at delivery; forged turn references are refused",
+            ));
+        }
         // A pty endpoint pastes literally and fails a body with control
         // characters at delivery; refuse it here so `send` never answers
         // `queued` for a message that cannot be delivered (CAD-218).
@@ -298,6 +314,47 @@ impl Shared {
             receipt["warning"] = json!(warning);
         }
         Ok(receipt)
+    }
+
+    /// `message read` — the pull half of CAD-565's push/pull delivery:
+    /// the stored body in bounded windows of Unicode scalars, never
+    /// bytes. An agent caller reads only its own mail (the caller
+    /// rule); the operator and unattributed readers pass, exactly as
+    /// on the inbox drain (CAD-480).
+    pub(super) fn rpc_message_read(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        reject_identity_fields(params, "message_read")?;
+        let id = required_str(params, "message")?;
+        let message = self
+            .store
+            .message(id)?
+            .ok_or_else(|| Error::rejected(format!("No such message '{id}'")))?;
+        if let caller_rule::Who::Agent(caller) = self.connection_caller(peer_pid)? {
+            if caller != message.alias {
+                return Err(Error::rejected(format!(
+                    "message_read refused: agent '{caller}' cannot read another \
+                     agent's mail — '{id}' belongs to '{}' (caller rule, CAD-480)",
+                    message.alias
+                )));
+            }
+        }
+        let offset = optional_u64(params, "offset").unwrap_or(0) as usize;
+        let limit = optional_u64(params, "limit")
+            .unwrap_or(MESSAGE_READ_LIMIT as u64)
+            .min(MESSAGE_READ_LIMIT as u64) as usize;
+        let total = message.body.chars().count();
+        let text: String = message.body.chars().skip(offset).take(limit).collect();
+        Ok(json!({
+            "message": message.id,
+            "text": text,
+            "offset": offset,
+            "limit": limit,
+            "chars_total": total,
+            "truncated": offset + text.chars().count() < total,
+        }))
     }
 
     /// Send and wait for the message's terminal state, bounded by `wait`.
@@ -591,7 +648,11 @@ impl Shared {
                 ),
             }
         };
-        let outcome = adapter.recover_submit(&generation, &message.body, &confirm);
+        // CAD-565: the recovery re-sends the same delivery the pane got
+        // — the bounded notice, not the full body (endpoint_kind is
+        // already proven `pty` above).
+        let delivery = self.delivery_body(&alias, "pty", &message);
+        let outcome = adapter.recover_submit(&generation, &delivery, &confirm);
         let (before, after, confirmed, send_error) = match outcome {
             Ok(adapter::RecoverSubmit::Sent {
                 before,

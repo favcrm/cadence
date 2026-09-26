@@ -185,6 +185,13 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
              alias, and cursor resets are operator-only (CAD-480)",
         ),
     ),
+    (
+        "message_read",
+        Rule::Handler(
+            "rpc_message_read: an agent caller may read only a message \
+             addressed to its own alias (CAD-565)",
+        ),
+    ),
     ("message_report", Rule::Bearer),
     (
         "message_reconcile",

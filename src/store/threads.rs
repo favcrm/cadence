@@ -81,6 +81,19 @@ pub enum Sender {
     Unattributed,
 }
 
+impl Sender {
+    /// The enqueue attribution the `queued` event records (CAD-565): a
+    /// stable label the delivery notice prints — who the daemon decided
+    /// queued the message, never a connection detail.
+    pub fn label(&self) -> &str {
+        match self {
+            Sender::Operator | Sender::OperatorChat => "operator",
+            Sender::Agent(alias) => alias,
+            Sender::Unattributed => "unattributed",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Thread {
     pub id: String,

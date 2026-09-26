@@ -1458,8 +1458,12 @@ fn claude_result_routes_to_pty_pm() {
         }
     };
     d.wait_message("pm", routed["id"].as_str().unwrap(), &["completed"], 20);
+    // CAD-565: the pane gets the bounded notice naming the row — the
+    // full routed result stays durable for `message read`.
     let screen = std::fs::read_to_string(d.pane_file(&pm_mock, "pm", "screen")).unwrap_or_default();
-    assert!(screen.contains("MOCK_OK"), "{screen}");
+    let rid = routed["id"].as_str().unwrap();
+    assert!(screen.contains(&format!("message read {rid}")), "{screen}");
+    assert!(screen.contains("from w1"), "{screen}");
 }
 
 #[test]

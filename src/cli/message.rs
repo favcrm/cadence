@@ -79,6 +79,21 @@ pub(crate) enum MessageAction {
         #[arg(long, default_value_t = 120)]
         wait: u64,
     },
+    /// Pull the stored body of a message in bounded windows of Unicode
+    /// scalars — the read half of push/pull delivery (CAD-565). The
+    /// pane notice names the message; this returns the text itself,
+    /// `--offset` scalars in and at most `--limit` scalars per call
+    /// (server-capped). Offsets count scalars, never bytes.
+    Read {
+        /// Message id.
+        message: String,
+        /// Start at this Unicode-scalar offset (0-based).
+        #[arg(long, default_value_t = 0)]
+        offset: u64,
+        /// At most this many Unicode scalars per call.
+        #[arg(long)]
+        limit: Option<u64>,
+    },
     /// Record an explicit acknowledgement for a submitted PTY message.
     /// The token is the `turn_id` `cadence self` prints — shown only
     /// to the agent's own pane or endpoint (CAD-375).
@@ -168,6 +183,18 @@ pub(super) fn run(state_dir: PathBuf, action: MessageAction) -> Result<i32> {
         } => send_message(
             &state_dir, &alias, text, file, message, reply_to, ready, force, task, nudge, steer,
         )?,
+        MessageAction::Read {
+            message,
+            offset,
+            limit,
+        } => (
+            client::rpc(
+                &state_dir,
+                "message_read",
+                json!({"message": message, "offset": offset, "limit": limit}),
+            )?,
+            false,
+        ),
         MessageAction::Ack {
             message,
             token,
