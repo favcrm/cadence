@@ -151,11 +151,17 @@ fn cadence_home_env_beats_the_layout_marker() {
     let layout = home::layout().unwrap();
     assert_eq!(layout.source, home::Source::Env);
     assert_eq!(layout.root, PathBuf::from("/srv/cadence"));
+    // The marker lives at ~/.cadence, not the resolved root.
+    assert!(!layout.marker_present);
 }
 
+/// REV-300: the marker is inert — a same-uid agent can plant
+/// `~/.cadence/LAYOUT`, so it must never redirect resolution.
+/// Without `CADENCE_HOME` every content resolves legacy; the flag
+/// stays truthful only for `doctor --host` reporting.
 #[test]
-fn layout_marker_switches_to_the_new_layout() {
-    for (content, marker) in [
+fn a_planted_layout_marker_stays_legacy() {
+    for (content, declared) in [
         ("1", true),
         ("1\n", true),
         (" 1 ", true),
@@ -170,22 +176,28 @@ fn layout_marker_switches_to_the_new_layout() {
         let layout = home::layout().unwrap();
         assert_eq!(
             layout.source,
-            if marker {
-                home::Source::Marker
-            } else {
-                home::Source::Legacy
-            },
+            home::Source::Legacy,
             "LAYOUT content {content:?}"
         );
-        if marker {
-            assert_eq!(
-                home::tracker_dir().unwrap(),
-                home_dir.join(".cadence/tracker")
-            );
-            assert_eq!(home::state_dir().unwrap(), home_dir.join(".cadence/state"));
-            assert_eq!(home::vault_dir().unwrap(), home_dir.join(".cadence/vault"));
-            assert_eq!(home::repos_dir().unwrap(), home_dir.join(".cadence/repos"));
-        }
+        assert_eq!(
+            layout.marker_present, declared,
+            "LAYOUT content {content:?}"
+        );
+        assert_eq!(
+            home::tracker_dir().unwrap(),
+            old_issue_default_dir(),
+            "LAYOUT content {content:?}"
+        );
+        assert_eq!(
+            home::state_dir().unwrap(),
+            old_state_dir(),
+            "LAYOUT content {content:?}"
+        );
+        assert_eq!(
+            home::vault_dir().unwrap(),
+            old_issue_default_dir().join("wiki"),
+            "LAYOUT content {content:?}"
+        );
     }
 }
 
@@ -195,7 +207,9 @@ fn a_cadence_dir_without_a_marker_stays_legacy() {
     let (_tmp, home_dir) = home_root();
     std::fs::create_dir_all(home_dir.join(".cadence")).unwrap();
     _env.set("HOME", &home_dir);
-    assert_eq!(home::layout().unwrap().source, home::Source::Legacy);
+    let layout = home::layout().unwrap();
+    assert_eq!(layout.source, home::Source::Legacy);
+    assert!(!layout.marker_present);
 }
 
 #[test]
@@ -402,6 +416,7 @@ fn doctor_host_prints_the_legacy_layout() {
     let layout = doctor_layout(&[("HOME", &home_dir)]);
     assert_eq!(layout["level"], "ok", "{layout}");
     assert_eq!(layout["value"]["source"], "legacy");
+    assert_eq!(layout["value"]["marker"], false);
     assert_eq!(
         layout["value"]["tracker"],
         home_dir.join("pm").display().to_string()
@@ -425,6 +440,7 @@ fn doctor_host_prints_the_env_layout() {
     let layout = doctor_layout(&[("HOME", &home_dir), ("CADENCE_HOME", &cad)]);
     assert_eq!(layout["level"], "ok", "{layout}");
     assert_eq!(layout["value"]["source"], "CADENCE_HOME");
+    assert_eq!(layout["value"]["marker"], false);
     assert_eq!(
         layout["value"]["tracker"],
         cad.join("tracker").display().to_string()
@@ -436,5 +452,37 @@ fn doctor_host_prints_the_env_layout() {
     assert_eq!(
         layout["value"]["vault"],
         cad.join("vault").display().to_string()
+    );
+}
+
+/// REV-300: a planted `~/.cadence/LAYOUT` is reported but inert —
+/// the check still shows the legacy branch and names the way in.
+#[test]
+fn doctor_host_reports_a_planted_marker_inactive() {
+    let _env = EnvGuard::new();
+    let tmp = TempDir::new().unwrap();
+    let home_dir = tmp.path().join("home");
+    std::fs::create_dir_all(home_dir.join(".cadence")).unwrap();
+    std::fs::write(home_dir.join(".cadence/LAYOUT"), "1").unwrap();
+    let layout = doctor_layout(&[("HOME", &home_dir)]);
+    assert_eq!(layout["level"], "ok", "{layout}");
+    assert_eq!(layout["value"]["source"], "legacy");
+    assert_eq!(layout["value"]["marker"], true);
+    let detail = layout["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("present but inactive") && detail.contains("CADENCE_HOME"),
+        "{detail}"
+    );
+    assert_eq!(
+        layout["value"]["tracker"],
+        home_dir.join("pm").display().to_string()
+    );
+    assert_eq!(
+        layout["value"]["state"],
+        home_dir.join(".local/state/cadence").display().to_string()
+    );
+    assert_eq!(
+        layout["value"]["vault"],
+        home_dir.join("pm/wiki").display().to_string()
     );
 }

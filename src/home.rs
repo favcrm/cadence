@@ -5,14 +5,21 @@
 //! `~/.cadence` per user, `/var/lib/cadence` for a system install.
 //! Resolution order:
 //!
-//! 1. `$CADENCE_HOME` — must be absolute; selects the new layout even
-//!    without a marker file.
-//! 2. `~/.cadence` when it carries the new layout — a `LAYOUT` marker
-//!    file containing `1`.
-//! 3. The legacy layout — `tracker_dir` = `$CADENCE_PM_DIR` or `~/pm`,
-//!    `state_dir` = `$CADENCE_STATE_DIR` or `$XDG_STATE_HOME/cadence`
-//!    or `~/.local/state/cadence`, `vault_dir` = `<tracker>/wiki`
-//!    (CAD-579's wiki lives there until the migration).
+//! 1. `$CADENCE_HOME` — must be absolute; the only switch into the
+//!    new layout. An operator sets it at daemon launch.
+//! 2. The legacy layout — always, otherwise: `tracker_dir` =
+//!    `$CADENCE_PM_DIR` or `~/pm`, `state_dir` = `$CADENCE_STATE_DIR`
+//!    or `$XDG_STATE_HOME/cadence` or `~/.local/state/cadence`,
+//!    `vault_dir` = `<tracker>/wiki` (CAD-579's wiki lives there
+//!    until the migration).
+//!
+//! The `~/.cadence/LAYOUT` marker is deliberately not consulted:
+//! an unconfined agent shares the daemon's uid and could plant the
+//! marker to redirect tracker/state/vault on the next restart — an
+//! owner/mode check does not help against a same-uid writer. It is
+//! read only to be reported by `cadence doctor --host`; the
+//! operator-gated activation switch belongs to CAD-392's migrate
+//! step.
 //!
 //! Per-directory overrides keep today's precedence in every branch:
 //! `$CADENCE_PM_DIR` and `$CADENCE_STATE_DIR` still beat the resolved
@@ -36,9 +43,8 @@ pub const LAYOUT_VERSION: &str = "1";
 pub enum Source {
     /// `$CADENCE_HOME` — an explicit new-layout root.
     Env,
-    /// `~/.cadence` carrying a `LAYOUT` marker containing `1`.
-    Marker,
-    /// Neither — today's split layout (`~/pm`, legacy state dir).
+    /// No `$CADENCE_HOME` — today's split layout (`~/pm`, legacy
+    /// state dir). A `LAYOUT` marker never selects the new layout.
     Legacy,
 }
 
@@ -46,7 +52,6 @@ impl Source {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Env => "CADENCE_HOME",
-            Self::Marker => "~/.cadence/LAYOUT",
             Self::Legacy => "legacy",
         }
     }
@@ -60,6 +65,10 @@ impl Source {
 pub struct Layout {
     pub source: Source,
     pub root: PathBuf,
+    /// `root` carries a `LAYOUT` marker containing `1` — reporting
+    /// only, for `cadence doctor --host`. A marker never activates
+    /// the new layout; only `$CADENCE_HOME` does.
+    pub marker_present: bool,
 }
 
 /// Which branch the resolver takes for this process, with the home
@@ -75,16 +84,16 @@ pub fn layout() -> Result<Layout> {
         }
         return Ok(Layout {
             source: Source::Env,
+            marker_present: layout_marker_declared(&root),
             root,
         });
     }
     let root = default_home_root()?;
-    let source = if is_new_layout(&root) {
-        Source::Marker
-    } else {
-        Source::Legacy
-    };
-    Ok(Layout { source, root })
+    Ok(Layout {
+        source: Source::Legacy,
+        marker_present: layout_marker_declared(&root),
+        root,
+    })
 }
 
 /// The resolved home root — `$CADENCE_HOME`, else `~/.cadence`
@@ -161,9 +170,11 @@ pub fn blobs_dir(root: &Path) -> PathBuf {
     root.join(".blobs")
 }
 
-/// `root` is the new layout when its `LAYOUT` marker contains `1`.
-/// Any other content — or no marker — leaves the legacy layout.
-fn is_new_layout(root: &Path) -> bool {
+/// `root` carries a `LAYOUT` marker containing `1`. Reporting only —
+/// never consulted for layout selection, because a same-uid writer
+/// could plant it (rev-300, CAD-584). CAD-392's migrate step owns
+/// the operator-gated activation switch.
+fn layout_marker_declared(root: &Path) -> bool {
     std::fs::read_to_string(root.join(LAYOUT_MARKER))
         .map(|v| v.trim() == LAYOUT_VERSION)
         .unwrap_or(false)

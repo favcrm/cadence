@@ -1,9 +1,10 @@
 //! CAD-584: `cadence doctor host` check `layout` — the CADENCE_HOME
 //! resolution this host sees: which branch the resolver took
-//! (`CADENCE_HOME`, the `~/.cadence/LAYOUT` marker, or the legacy
-//! layout) and every path it yields. Informational on success; the
-//! check fails only when resolution itself is refused — a
-//! non-absolute `CADENCE_HOME` breaks every cadence path lookup.
+//! (`CADENCE_HOME` or the legacy layout) and every path it yields.
+//! A `LAYOUT` marker at the resolved root is reported but never
+//! activates the new layout — only `CADENCE_HOME` does. The check
+//! fails only when resolution itself is refused — a non-absolute
+//! `CADENCE_HOME` breaks every cadence path lookup.
 
 use super::*;
 
@@ -46,6 +47,15 @@ pub(super) fn check_layout(_scan: &Scan) -> Check {
         Ok(d) => format!("{name} {}", d.display()),
         Err(e) => format!("{name} unresolved ({e})"),
     }))
+    .chain(
+        (layout.marker_present && layout.source == crate::home::Source::Legacy).then(|| {
+            format!(
+                "{}/{} present but inactive — set CADENCE_HOME to use it",
+                layout.root.display(),
+                crate::home::LAYOUT_MARKER
+            )
+        }),
+    )
     .collect::<Vec<_>>()
     .join("; ");
     check(
@@ -54,6 +64,7 @@ pub(super) fn check_layout(_scan: &Scan) -> Check {
         json!({
             "source": layout.source.as_str(),
             "home": layout.root.display().to_string(),
+            "marker": layout.marker_present,
             "tracker": dir_value(crate::home::tracker_dir()),
             "state": dir_value(crate::home::state_dir()),
             "vault": dir_value(crate::home::vault_dir()),
