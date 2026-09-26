@@ -296,6 +296,16 @@ pub trait ProviderAdapter: Send + Sync {
         client_message_id: &str,
         on_started: &dyn Fn(&str),
     ) -> Result<TurnResult>;
+    /// CAD-565: pre-write screening of the stored `body` — distinct
+    /// from the check on the paste itself. A pty pane now receives a
+    /// bounded notice while the body is pulled, so refusing the body
+    /// up front keeps the "never deliver command-shaped or oversized
+    /// input to this endpoint" contract the paste check used to imply.
+    /// A `pre_write` error fails the message without consuming a claim.
+    /// Endpoints with no pane have no screen to protect: default no-op.
+    fn check_body(&self, _body: &str) -> Result<()> {
+        Ok(())
+    }
     /// One poll after a held cloud turn. `Pending` means keep waiting.
     /// `transient` is a 429, 5xx, or transport error. The default never
     /// settles.

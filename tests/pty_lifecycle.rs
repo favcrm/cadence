@@ -623,13 +623,20 @@ fn pty_hot_restart_adopts_multiple_running_turns() {
 
 /// CAD-250: a nudge is steering for its moment — one still queued when
 /// the daemon stops is cancelled at the next start with a
-/// `nudge_cancelled` event, never pasted into the later pane.
+/// `nudge_cancelled` event, never pasted into the later pane. CAD-565:
+/// it stays queued only while the turn it bound to still runs; the open
+/// menu keeps the box unreachable so the wait lasts until shutdown.
 #[test]
 fn pty_nudge_queued_at_restart_is_cancelled_not_replayed() {
     let mut d = TestDaemon::start();
     let mock = d.mock_devin();
     d.register_devin("dv1", None);
     d.wait_agent("dv1", "idle", 20);
+    // A held store turn is what keeps the nudge queued — with no running
+    // turn it would be skipped at claim instead.
+    d.send("dv1", json!({"text": "hold the turn", "message": "t1"}))
+        .unwrap();
+    pty_token(&d, "dv1", "t1");
     // An open approval menu holds every paste at the gate.
     atomic_write(d.pane_file(&mock, "dv1", "tui-state"), DEVIN_MENU);
     d.operator_send(

@@ -967,8 +967,11 @@ impl Shared {
 
     /// CAD-468: at the silent-end edge, prompt the worker in band — one
     /// daemon-originated nudge per turn carrying the exact
-    /// `cadence message result` command. It is turnless like any nudge,
-    /// so it delivers while this turn still holds the actor, and the
+    /// `cadence message result` command. It is turnless like any nudge;
+    /// CAD-565 binds it to this turn at claim, so it delivers only if
+    /// the pane regains a steerable input while the turn still lives —
+    /// on an idle pane it gate-waits and is skipped when the turn ends,
+    /// never landing as a later turn's input. The
     /// `(nudge, "report-reminder:<message>:<turn>")` id dedupes a
     /// restart, a re-probe or a second edge: once per turn, never twice.
     /// A report that already landed skips it; the reminder itself never

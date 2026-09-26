@@ -762,6 +762,7 @@ impl Store {
                 "message": id,
                 "source": source,
                 "reply_to": reply_to,
+                "sender": sender.label(),
                 "recipient_identity": reply_recipient
                     .as_ref()
                     .map(Self::agent_identity),
@@ -805,6 +806,34 @@ impl Store {
                 && payload.get("source").and_then(Value::as_str) == Some(source)
             {
                 return Ok(payload.get("recipient_identity").cloned());
+            }
+        }
+        Ok(None)
+    }
+
+    /// CAD-565: who the enqueue attributed the message to — the durable
+    /// `queued` event's `sender` label, or its `source` for rows queued
+    /// before the field existed (and for daemon-routed rows, which name
+    /// their origin in `source`). `None` only when the queue event is
+    /// missing entirely.
+    pub fn queued_sender(&self, alias: &str, message_id: &str) -> Result<Option<String>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT payload FROM events
+             WHERE alias=? AND kind='queued' ORDER BY seq",
+        )?;
+        let mut rows = stmt.query([alias])?;
+        while let Some(row) = rows.next()? {
+            let payload: String = row.get(0)?;
+            let Ok(payload) = serde_json::from_str::<Value>(&payload) else {
+                continue;
+            };
+            if payload.get("message").and_then(Value::as_str) == Some(message_id) {
+                return Ok(payload
+                    .get("sender")
+                    .or_else(|| payload.get("source"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string));
             }
         }
         Ok(None)
@@ -958,14 +987,20 @@ impl Store {
         // may be claimed; every other delivery stays `queued`, never refused,
         // until that turn is reported, reconciled or bounded to
         // `unknown`.
-        let holding: bool = tx.query_row(
-            &format!(
-                "SELECT EXISTS(SELECT 1 FROM messages WHERE alias=?
-                 AND state='running' AND source NOT IN {TURNLESS_SOURCES_SQL})"
-            ),
-            [alias],
-            |r| r.get(0),
-        )?;
+        // CAD-565: the running turn's token rides along — a nudge binds
+        // to it at claim (below) and is rechecked against it, in this
+        // same transaction, on every later claim.
+        let running_turn: Option<String> = tx
+            .query_row(
+                &format!(
+                    "SELECT turn_id FROM messages WHERE alias=? AND state='running'
+                     AND source NOT IN {TURNLESS_SOURCES_SQL} ORDER BY seq LIMIT 1"
+                ),
+                [alias],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let holding = running_turn.is_some();
         let next_sql = if holding {
             format!(
                 "SELECT * FROM messages WHERE alias=? AND state='queued'
@@ -1000,6 +1035,48 @@ impl Store {
                 if let Some(reason) = reason {
                     self.fail_unresolved_routed(&tx, &message, &agent, expected.as_ref(), reason)?;
                     continue;
+                }
+            }
+            if message.is_nudge() {
+                // CAD-565: a nudge enters the turn that was running when
+                // it was claimed — bound to it here, atomically, and the
+                // binding is rechecked on every claim. Only while *that*
+                // turn still runs does the nudge pass; an idle agent has
+                // nothing to steer and a nudge bound to an ended turn
+                // must never land in a later one. Skipped means
+                // `cancelled` with a persisted `skipped_inactive`
+                // result — Codex's `SkippedInactive` shape — so the
+                // delivery outcome is durable and readable.
+                let live = running_turn.as_deref();
+                let bound = message.turn_id.as_deref();
+                if bound.map_or(live.is_none(), |t| Some(t) != live) {
+                    let result = json!({
+                        "status": "skipped",
+                        "via": "skipped_inactive",
+                        "reason": "no running turn to steer — a nudge is never replayed",
+                    });
+                    let n = tx.execute(
+                        "UPDATE messages SET state='cancelled',result=?,completed=?
+                         WHERE id=? AND state='queued'",
+                        params![result.to_string(), now(), message.id],
+                    )?;
+                    if n == 1 {
+                        Self::event(
+                            &tx,
+                            alias,
+                            "nudge_cancelled",
+                            json!({"message": message.id, "was": "queued",
+                                   "state": "cancelled",
+                                   "reason": "skipped_inactive"}),
+                        )?;
+                    }
+                    continue;
+                }
+                if bound.is_none() {
+                    tx.execute(
+                        "UPDATE messages SET turn_id=? WHERE id=? AND state='queued'",
+                        params![live.unwrap_or_default(), message.id],
+                    )?;
                 }
             }
             tx.execute(

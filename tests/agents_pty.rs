@@ -43,16 +43,18 @@ fn agent_addressable_by_native_id() {
     assert_eq!(show["agent"]["thread_id"], format!("fake-thread-{native}"));
 }
 
-/// CAD-250 `send --nudge`: steering pasted into the live pane while a
-/// turn is held. The nudge passes the one-turn hold, never becomes
-/// `running`, owes no report and completes at its confirmed paste; the
-/// held turn stays the one running row and queued tasks stay queued.
+/// CAD-250 `send --nudge`, tightened by CAD-565: steering pasted into a
+/// live turn's guide box — admitted only while `steerable` and bound to
+/// the turn that was running at claim. The nudge passes the one-turn
+/// hold, never becomes `running`, owes no report and completes at its
+/// confirmed paste; the held turn stays the one running row and queued
+/// tasks stay queued.
 #[test]
 fn pty_nudge_steers_without_owning_a_turn() {
     let d = TestDaemon::start();
-    let _mock = d.mock_stub();
+    let mock = d.mock_devin();
     d.register("pm");
-    d.register_stub("w1", json!({"auto_ready": "verified"}));
+    d.register_devin("w1", None);
     d.wait_agent("pm", "idle", 10);
     d.wait_agent("w1", "idle", 20);
     for id in ["t1", "t2", "t3"] {
@@ -63,6 +65,16 @@ fn pty_nudge_steers_without_owning_a_turn() {
         .unwrap();
     }
     let token = pty_token(&d, "w1", "t1");
+    // The held turn is mid-flight with an editable guide box — the same
+    // shape a real Devin pane shows while it works.
+    atomic_write(
+        d.pane_file(&mock, "w1", "status"),
+        "⠸ Thinking · 12s (esc twice to interrupt)\n",
+    );
+    atomic_write(
+        d.pane_file(&mock, "w1", "inputbox"),
+        "Guide Devin while it works\n",
+    );
     let (ok, sent) = cadence_cli(
         &d.state,
         &[
@@ -81,6 +93,16 @@ fn pty_nudge_steers_without_owning_a_turn() {
     assert_eq!(n["source"], "nudge", "{n}");
     assert_eq!(n["nudge"], true, "{n}");
     assert_eq!(n["result"]["via"], "pty_nudge", "{n}");
+    // CAD-565: the row records which turn the nudge entered. The column
+    // is read directly — the RPC view withholds live turn tokens from
+    // every caller but the owner (CAD-375).
+    let bound: Option<String> = rusqlite::Connection::open(d.state.join("cadence.sqlite3"))
+        .unwrap()
+        .query_row("SELECT turn_id FROM messages WHERE id=?1", [&nid], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(bound.as_deref(), Some(token.as_str()), "{n}");
     assert!(n["reply_to"].is_null(), "a nudge owes no report: {n}");
     assert!(n.get("awaiting_report").is_none(), "{n}");
     // It never became a turn: no `turn_started` for the nudge.
@@ -111,17 +133,22 @@ fn pty_nudge_steers_without_owning_a_turn() {
         }),
         "{pm}"
     );
-    // The held turn is unchanged and reports normally.
+    // The held turn is unchanged and reports normally; its end clears
+    // the busy markers the mock models a working turn with.
     d.report("t1", &token, "result", "done").unwrap();
     d.wait_message("w1", "t1", &["completed"], 10);
+    std::fs::remove_file(d.pane_file(&mock, "w1", "status")).ok();
+    std::fs::remove_file(d.pane_file(&mock, "w1", "inputbox")).ok();
     pty_token(&d, "w1", "t2");
 }
 
 /// CAD-250 N1/N2/N4: a nudge needs a live pane and dies with it. Queued
-/// behind an open menu, it is cancelled (`nudge_cancelled`, reason
-/// `stop`) when the agent stops — never pasted into a later pane — and a
-/// nudge to the stopped agent is refused. Over 500 characters or with a
-/// task it is refused outright.
+/// behind an open menu *while a turn holds*, it is cancelled
+/// (`nudge_cancelled`, reason `stop`) when the agent stops — never
+/// pasted into a later pane — and a nudge to the stopped agent is
+/// refused. Over 500 characters or with a task it is refused outright.
+/// CAD-565: with no turn running at all it is skipped at claim instead
+/// (`skipped_inactive`) — steering has nothing to enter.
 #[test]
 fn pty_nudge_needs_a_live_pane_and_dies_with_the_actor() {
     let d = TestDaemon::start();
@@ -142,6 +169,13 @@ fn pty_nudge_needs_a_live_pane_and_dies_with_the_actor() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("--task"), "{err}");
+    // A turn running in the store while its pane shows an approval menu:
+    // the nudge is bound to the turn but the box is unreachable, so it
+    // waits in queue (gate_wait) — CAD-565 keeps it bound to *that*
+    // turn, never a later one.
+    d.send("dv1", json!({"text": "hold the turn", "message": "t1"}))
+        .unwrap();
+    pty_token(&d, "dv1", "t1");
     atomic_write(d.pane_file(&mock, "dv1", "tui-state"), DEVIN_MENU);
     d.operator_send(
         "dv1",
@@ -169,6 +203,206 @@ fn pty_nudge_needs_a_live_pane_and_dies_with_the_actor() {
     // Nothing reached the pane.
     let input = std::fs::read_to_string(d.pane_file(&mock, "dv1", "input")).unwrap_or_default();
     assert!(!input.contains("steer"), "{input}");
+}
+
+/// CAD-565: a nudge sent with no turn running is skipped at claim —
+/// `cancelled` with `skipped_inactive`, persisted and readable — never
+/// pasted into the idle pane where it would start a later turn as
+/// stale input. The send itself is still accepted (the pane is live);
+/// the skip is the delivery outcome, Codex's `SkippedInactive` shape.
+#[test]
+fn pty_nudge_with_no_running_turn_is_skipped_never_pasted() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin("dv1", None);
+    d.wait_agent("dv1", "idle", 20);
+    d.operator_send(
+        "dv1",
+        json!({"text": "steer this nowhere", "message": "n1", "nudge": true}),
+    )
+    .unwrap();
+    let m = d.wait_message("dv1", "n1", &["cancelled"], 15);
+    assert_eq!(m["result"]["status"], "skipped", "{m}");
+    assert_eq!(m["result"]["via"], "skipped_inactive", "{m}");
+    let ev = d.wait_event_where(
+        "dv1",
+        "nudge_cancelled",
+        |e| e["payload"]["message"] == "n1",
+        10,
+    );
+    assert_eq!(ev["payload"]["reason"], "skipped_inactive", "{ev}");
+    // Nothing was pasted and no turn ever started — the pane is still
+    // idle and the agent's queue shows no running row.
+    let input = std::fs::read_to_string(d.pane_file(&mock, "dv1", "input")).unwrap_or_default();
+    assert!(!input.contains("steer this nowhere"), "{input}");
+    let show = d.rpc("agent_show", json!({"alias": "dv1"})).unwrap();
+    assert_eq!(show["agent"]["state"], "idle", "{show}");
+    assert!(
+        show["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["state"] != "running"),
+        "{show}"
+    );
+    // A second turn never consumed the skipped nudge: send real work and
+    // confirm the pane hears only it.
+    d.send("dv1", json!({"text": "real work", "message": "t1"}))
+        .unwrap();
+    pty_token(&d, "dv1", "t1");
+    let pasted = std::fs::read_to_string(d.pane_file(&mock, "dv1", "screen")).unwrap_or_default()
+        + &std::fs::read_to_string(d.pane_file(&mock, "dv1", "input")).unwrap_or_default();
+    assert!(!pasted.contains("steer this nowhere"), "{pasted}");
+}
+
+/// CAD-565: a nudge is bound to the turn running at claim; if the pane
+/// has no steerable input when the daemon reaches it (the turn's box is
+/// gone — here a completed-but-unreported turn reads as an idle pane),
+/// the injection is refused and re-claimed only while a turn still
+/// runs. Once the bound turn ends, the nudge is skipped — it never
+/// survives into a later one.
+#[test]
+fn pty_nudge_whose_turn_ends_before_injection_is_skipped() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin("dv1", None);
+    d.wait_agent("dv1", "idle", 20);
+    // A normal submit leaves the pane looking idle (the mock's reply
+    // lands at once) while the store turn is held awaiting its report.
+    d.send(
+        "dv1",
+        json!({"text": "turn that looks idle", "message": "t1"}),
+    )
+    .unwrap();
+    let token = pty_token(&d, "dv1", "t1");
+    d.operator_send(
+        "dv1",
+        json!({"text": "stale steer", "message": "n1", "nudge": true}),
+    )
+    .unwrap();
+    // The gate refuses the idle probe for a nudge — no steerable input —
+    // so it waits while the bound turn still runs.
+    let wait = d.wait_event_where("dv1", "gate_wait", |e| e["payload"]["message"] == "n1", 20);
+    assert!(
+        wait["payload"]["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("steer"),
+        "{wait}"
+    );
+    // The bound turn ends: the next claim sees no running turn and the
+    // nudge is skipped rather than pasted into the now-idle pane.
+    d.report("t1", &token, "result", "done").unwrap();
+    d.wait_message("dv1", "t1", &["completed"], 10);
+    let m = d.wait_message("dv1", "n1", &["cancelled"], 15);
+    assert_eq!(m["result"]["via"], "skipped_inactive", "{m}");
+    let input = std::fs::read_to_string(d.pane_file(&mock, "dv1", "input")).unwrap_or_default();
+    assert!(!input.contains("stale steer"), "{input}");
+    // And the next turn opens clean — the skipped nudge did not park a
+    // stale line in the input.
+    d.send("dv1", json!({"text": "later turn", "message": "t2"}))
+        .unwrap();
+    pty_token(&d, "dv1", "t2");
+    let input = std::fs::read_to_string(d.pane_file(&mock, "dv1", "input")).unwrap_or_default();
+    assert!(!input.contains("stale steer"), "{input}");
+}
+
+/// CAD-565: a pty delivery pastes a one-line attributed notice —
+/// sender, message id, a bounded preview and the `message read` pull —
+/// never the whole body. The body itself stays durable on the row.
+#[test]
+fn cad565_pty_delivery_pastes_a_bounded_notice() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin("dv1", None);
+    d.wait_agent("dv1", "idle", 20);
+    // A thread makes the send attributable (operator writes into an
+    // operator thread); the notice then names who queued it. Its own
+    // turn must be reported first — a held turn holds the queue.
+    d.operator_rpc(
+        "thread_send",
+        json!({"alias": "dv1", "text": "seed the thread", "message": "t0"}),
+    )
+    .unwrap();
+    pty_report_done(&d, "dv1", "t0");
+    d.register("dv1pm");
+    d.wait_agent("dv1pm", "idle", 10);
+    let head = "NOTICE-HEAD";
+    let tail = "NOTICE-TAIL";
+    let body = format!("{head}{}{tail}", "x".repeat(400));
+    d.operator_send(
+        "dv1",
+        json!({"text": body, "message": "m1", "reply_to": "dv1pm"}),
+    )
+    .unwrap();
+    pty_token(&d, "dv1", "m1");
+    let pasted = std::fs::read_to_string(d.pane_file(&mock, "dv1", "screen")).unwrap_or_default()
+        + &std::fs::read_to_string(d.pane_file(&mock, "dv1", "input")).unwrap_or_default();
+    // The attribution + the pull path + the head of the body land; the
+    // tail beyond the preview bound does not.
+    assert!(pasted.contains("operator"), "{pasted}");
+    assert!(pasted.contains("m1"), "{pasted}");
+    assert!(pasted.contains(head), "{pasted}");
+    assert!(pasted.contains("cadence message read m1"), "{pasted}");
+    assert!(
+        !pasted.contains(tail),
+        "the paste carried the tail: {pasted}"
+    );
+}
+
+/// CAD-565: `message read` pulls the stored body in bounded windows of
+/// Unicode scalars — never byte offsets — and an agent caller reads
+/// only its own mail.
+#[test]
+fn cad565_message_read_windows_by_scalars_and_keeps_other_agents_out() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin("dv1", None);
+    d.register_devin("dv2", None);
+    d.wait_agent("dv1", "idle", 20);
+    d.wait_agent("dv2", "idle", 20);
+    // Multi-byte content proves the window counts scalars, not bytes.
+    let body = format!("héllo🦀wörld{}", " end".repeat(60));
+    d.send("dv1", json!({"text": body.clone(), "message": "m1"}))
+        .unwrap();
+    let full = d.rpc("message_read", json!({"message": "m1"})).unwrap();
+    assert_eq!(full["chars_total"], body.chars().count() as u64, "{full}");
+    assert_eq!(full["text"], body, "{full}");
+    assert_eq!(full["truncated"], false, "{full}");
+    // An explicit limit over the cap is clamped to it, not refused.
+    let capped = d
+        .rpc("message_read", json!({"message": "m1", "limit": 999_999}))
+        .unwrap();
+    assert_eq!(capped["limit"], 4_000, "{capped}");
+    let first = d
+        .rpc("message_read", json!({"message": "m1", "limit": 6}))
+        .unwrap();
+    assert_eq!(first["text"], "héllo🦀", "{first}");
+    assert_eq!(first["truncated"], true, "{first}");
+    let second = d
+        .rpc(
+            "message_read",
+            json!({"message": "m1", "offset": 6, "limit": 5}),
+        )
+        .unwrap();
+    assert_eq!(second["text"], "wörld", "{second}");
+    let tail = d
+        .rpc(
+            "message_read",
+            json!({"message": "m1", "offset": body.chars().count() as u64 - 4, "limit": 10}),
+        )
+        .unwrap();
+    assert_eq!(tail["text"], " end", "{tail}");
+    assert_eq!(tail["truncated"], false, "{tail}");
+    // The recipient's own pane reads its mail; another agent's pane is
+    // refused.
+    let own = d.memory_rpc(&mock, "dv1", "message_read", json!({"message": "m1"}));
+    assert_eq!(own.unwrap()["text"], full["text"], "own read");
+    let other = d.memory_rpc(&mock, "dv2", "message_read", json!({"message": "m1"}));
+    assert!(
+        other.unwrap_err().contains("refused"),
+        "dv2 read dv1's mail"
+    );
 }
 
 #[test]
@@ -397,19 +631,22 @@ fn pty_send_pastes_literal_and_completes_via_report() {
 
     // The mock TUI consumed the paste + Enter and replied on screen;
     // capture shows the verbatim submitted line and the separate reply.
+    // CAD-565: the pasted text is the delivery notice — the body
+    // travels byte-exact inside its preview, metacharacters and all.
     let deadline = Instant::now() + Duration::from_secs(10);
     let cap = loop {
         let out = d.rpc("agent_capture", json!({"alias": "st1"})).unwrap()["capture"]
             .as_str()
             .unwrap()
             .to_string();
-        if out.contains(&format!("STUB_REPLY: {tricky}")) {
+        if out.contains("STUB_REPLY: [cadence] m2") && out.contains(tricky) {
             break out;
         }
         assert!(Instant::now() < deadline, "no reply on screen: {out}");
         thread::sleep(Duration::from_millis(100));
     };
-    assert!(cap.contains(&format!("> {tricky}")));
+    assert!(cap.contains("> [cadence] m2"));
+    assert!(cap.contains(tricky));
 
     // Still `running` — the screen reply does not finish the message;
     // only an explicit report does.
@@ -493,8 +730,12 @@ fn pty_devin_idle_probe_is_the_ready_claim() {
         "a stacked claim was consumed: {:?}",
         d.events("dv1")
     );
+    // CAD-565: the pane carries the bounded notice — attribution, the
+    // body's short preview, and the pull hint — not the body alone.
     let screen = std::fs::read_to_string(d.pane_file(&mock, "dv1", "screen")).unwrap_or_default();
-    assert!(screen.contains("> work the lane"), "{screen}");
+    assert!(screen.contains("> [cadence] m1"), "{screen}");
+    assert!(screen.contains("work the lane"), "{screen}");
+    assert!(screen.contains("cadence message read m1"), "{screen}");
     pty_report_done(&d, "dv1", "m1");
 }
 
@@ -2335,9 +2576,12 @@ fn pty_routed_notice_delivers_idle_without_claim() {
     assert_eq!(claim["payload"]["probe"]["idle"], true, "{claim}");
     // The mock commits Enter by moving the draft onto the screen and
     // clearing the input file, same as the auto-ready paste check.
+    // CAD-565: the paste is the delivery notice — it names the routed
+    // message's own id and its worker sender, bounded to a preview.
     let pasted = std::fs::read_to_string(d.pane_file(&mock, "pm", "screen")).unwrap_or_default()
         + &std::fs::read_to_string(d.pane_file(&mock, "pm", "input")).unwrap_or_default();
-    assert!(pasted.contains("work-1"), "{pasted}");
+    assert!(pasted.contains(&routed_id), "{pasted}");
+    assert!(pasted.contains("from w1"), "{pasted}");
 
     // The unclaimed flag must not leak onto the next user paste — and
     // none is needed: Devin's verified idle probe is the readiness
@@ -2921,12 +3165,14 @@ fn pty_stub_profile_drives_gate_and_render() {
     assert!(token.starts_with("pty-"), "{token}");
     let claim = d.wait_event("st", "ready_claimed", 5);
     assert_eq!(claim["payload"]["by"], "daemon", "{claim}");
-    // The render check passed on the stub's screen.
+    // The render check passed on the stub's screen. CAD-565: the pane
+    // carries the delivery notice; the body's preview keeps the `/`
+    // text inside it, not as the pasted line's first character.
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let screen =
             std::fs::read_to_string(d.stub_pane_file(&mock, "st", "screen")).unwrap_or_default();
-        if screen.contains("> /looks like a command elsewhere") {
+        if screen.contains("/looks like a command elsewhere") {
             break;
         }
         assert!(Instant::now() < deadline, "stub never echoed: {screen}");
@@ -3075,7 +3321,9 @@ fn pty_forbidden_prefix_is_prewrite_and_keeps_claim() {
     loop {
         let screen =
             std::fs::read_to_string(d.pane_file(&mock, "dv", "screen")).unwrap_or_default();
-        if screen.contains("> #literal tag") {
+        // CAD-565: the literal text rides inside the notice's preview —
+        // never as the pasted line's first character.
+        if screen.contains("#literal tag") {
             break;
         }
         assert!(Instant::now() < deadline, "never echoed: {screen}");
@@ -3276,7 +3524,7 @@ fn pty_claude_send_pastes_and_completes_via_report() {
     loop {
         let screen =
             std::fs::read_to_string(d.claude_pane_file(&mock, "cl", "screen")).unwrap_or_default();
-        if screen.contains("MOCK_REPLY: say hi claude") {
+        if screen.contains("MOCK_REPLY: [cadence] m1") && screen.contains("say hi claude") {
             break;
         }
         assert!(Instant::now() < deadline, "no reply: {screen}");
@@ -4337,7 +4585,7 @@ fn pty_cursor_send_pastes_and_completes_via_report() {
     loop {
         let screen =
             std::fs::read_to_string(d.cursor_pane_file(&mock, "cu", "screen")).unwrap_or_default();
-        if screen.contains("MOCK_REPLY: say hi cursor") {
+        if screen.contains("MOCK_REPLY: [cadence] m1") && screen.contains("say hi cursor") {
             break;
         }
         assert!(Instant::now() < deadline, "no reply: {screen}");
@@ -4981,14 +5229,15 @@ fn cadence_cli(state: &Path, args: &[&str], envs: &[(String, String)]) -> (bool,
 /// by the sampled probe: `turn_silent_end` fires once per message
 /// carrying the age and the admitting probe, the views flag it
 /// (`silent_ended`, `ended_secs`, `ended?:` in status, an overview
-/// needs-me row naming the `send --nudge` remedy). The message itself is
-/// never auto-resolved. Since CAD-250 the nudge pastes without owning a
-/// turn, while a plain follow-up send queues behind the unreported turn
-/// until it is reported.
+/// needs-me row naming the `agent attach` remedy). The message itself is
+/// never auto-resolved. Since CAD-565 a nudge is bound to a live turn,
+/// so on an idle pane it gate-waits and dies with its bound turn — while
+/// a plain follow-up send queues behind the unreported turn until it is
+/// reported.
 #[test]
 fn pty_silent_end_fires_once_and_recovers() {
     let d = TestDaemon::start();
-    let _mock = d.mock_stub();
+    let mock = d.mock_stub();
     stall_sample(1);
     d.register_stub(
         "w1",
@@ -5039,16 +5288,33 @@ fn pty_silent_end_fires_once_and_recovers() {
         .iter()
         .find(|n| n["kind"] == "silent_end")
         .expect("silent_end row");
-    // CAD-250: the remedy is a nudge — it owns no turn, so it pastes
-    // past the unreported one instead of queueing behind it.
-    assert_eq!(
-        ended["command"],
-        "cadence send w1 --nudge --text \"finish and report …\""
-    );
+    // CAD-565: the remedy is reconciliation — a nudge is bound to a
+    // live turn and can never enter the idle pane a dead turn leaves.
+    assert_eq!(ended["command"], "cadence agent attach w1");
     assert!(ended["title"].as_str().unwrap().contains("w1"));
 
-    // The remedy verbatim: the nudge completes at its confirmed paste
-    // with no report, and ms9 is still the one running turn.
+    // The daemon's own report-reminder nudge (sys-nudge-…) binds to ms9
+    // the same way — claimed first, it gate-waits on the steerable
+    // input an idle pane does not have and never pastes.
+    let sys = d.wait_event_where(
+        "w1",
+        "gate_wait",
+        |e| {
+            e["payload"]["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("no steerable input"))
+        },
+        20,
+    );
+    assert!(
+        sys["payload"]["message"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("sys-nudge-")),
+        "{sys}"
+    );
+
+    // An operator nudge behind it binds to ms9 too, and is just as
+    // unable to land: queued, never pasted, while ms9 still runs.
     let (ok, nudged) = cadence_cli(
         &d.state,
         &["send", "w1", "--nudge", "--text", "finish and report …"],
@@ -5056,9 +5322,9 @@ fn pty_silent_end_fires_once_and_recovers() {
     );
     assert!(ok, "{nudged}");
     let nudge_id = nudged["message"].as_str().unwrap().to_string();
-    let n = d.wait_message("w1", &nudge_id, &["completed"], 20);
-    assert_eq!(n["result"]["via"], "pty_nudge", "{n}");
-    assert_eq!(n["nudge"], true, "{n}");
+    assert_eq!(d.message_state("w1", &nudge_id), "queued");
+    let input = std::fs::read_to_string(d.stub_pane_file(&mock, "w1", "input")).unwrap_or_default();
+    assert!(!input.contains("finish and report"), "{input}");
     assert_eq!(d.message_state("w1", "ms9"), "running");
 
     // A plain `--ready` follow-up is accepted but held `queued` behind
@@ -5075,6 +5341,19 @@ fn pty_silent_end_fires_once_and_recovers() {
     assert_eq!(d.message_state("w1", &ms10), "queued");
     d.report("ms9", &token, "result", "done").unwrap();
     d.wait_message("w1", "ms9", &["completed"], 10);
+    // ms9's report ends the turn the nudge is bound to: the next claim
+    // skips it (`skipped_inactive` + `nudge_cancelled`) — it can never
+    // land as stale input in the turn ms10 is about to start. The claim
+    // may sit out a gate backoff first, so wait past the 30s cap.
+    let n = d.wait_message("w1", &nudge_id, &["cancelled"], 45);
+    assert_eq!(n["result"]["via"], "skipped_inactive", "{n}");
+    assert!(
+        d.events("w1").iter().any(|e| {
+            e["kind"] == "nudge_cancelled" && e["payload"]["message"] == nudge_id.as_str()
+        }),
+        "no nudge_cancelled for the bound nudge: {:?}",
+        d.events("w1")
+    );
     let token2 = pty_token(&d, "w1", &ms10);
     d.report(&ms10, &token2, "result", "done").unwrap();
     d.wait_message("w1", &ms10, &["completed"], 10);

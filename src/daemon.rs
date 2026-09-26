@@ -792,6 +792,53 @@ impl Shared {
     /// adapter drops the text block its `result` repeats. A lost append
     /// is logged, never fatal to the turn — the provider transcript
     /// still has it.
+    /// CAD-565: the body preview a delivery notice carries — Unicode
+    /// scalars, Codex's 150-char shape (openai/codex#48100).
+    const NOTICE_PREVIEW_CHARS: usize = 150;
+
+    /// CAD-565: what a pty paste carries of `message` — a one-line
+    /// attributed notice (sender, message id, reply_to, bounded
+    /// preview) instead of the whole body, which the agent pulls with
+    /// `cadence message read <id>` (Unicode-scalar bounded windows).
+    /// Long pastes were the root of the Devin render misses and the
+    /// false never-rendered fences (CAD-520, F26). The body itself
+    /// stays durable on the message row; non-pty endpoints still take
+    /// it whole.
+    fn delivery_body(&self, alias: &str, endpoint_kind: &str, message: &Message) -> String {
+        if endpoint_kind != "pty" {
+            return message.body.clone();
+        }
+        let sender = self
+            .store
+            .queued_sender(alias, &message.id)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| message.source.clone());
+        let reply = message
+            .reply_to
+            .as_deref()
+            .map(|to| format!(" reply→{to}"))
+            .unwrap_or_default();
+        // One short line whatever the body holds: whitespace flattened,
+        // the preview scalar-bounded, the pull named at the end.
+        let flat = message
+            .body
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let preview: String = flat.chars().take(Self::NOTICE_PREVIEW_CHARS).collect();
+        let more = if flat.chars().count() > Self::NOTICE_PREVIEW_CHARS {
+            "…"
+        } else {
+            ""
+        };
+        format!(
+            "[cadence] {id} from {sender}{reply}: {preview}{more} \
+             [Use `cadence message read {id}` for the rest.]",
+            id = message.id,
+        )
+    }
+
     /// CAD-324: the prompt for `message` — its body, preceded by a
     /// continuity pack when one is due for `alias` and the endpoint takes
     /// one. Due-ness is consumed here, delivered or not: a pack goes with
@@ -801,7 +848,11 @@ impl Shared {
     /// (counts and digest, never the content). A pack that cannot be
     /// built never holds the turn back: the message goes alone and the
     /// failure is an event.
+    /// CAD-565: for a pty endpoint the "body" the prompt carries is the
+    /// one-line delivery notice (see [`Self::delivery_body`]); the full
+    /// text is pulled, not pasted.
     fn continuity_prompt(&self, alias: &str, endpoint_kind: &str, message: &Message) -> String {
+        let body = self.delivery_body(alias, endpoint_kind, message);
         // A new or lost session is decided at open (in memory: the next
         // open decides again); a compaction is a thread note, pending
         // until a pack note follows it.
@@ -817,10 +868,10 @@ impl Shared {
                     .then_some(crate::continuity::Reason::Compacted)
             });
         let Some(reason) = due else {
-            return message.body.clone();
+            return body;
         };
         if !crate::continuity::endpoint_takes_packs(endpoint_kind) {
-            return message.body.clone();
+            return body;
         }
         let pm_dir = self.pm_dir().ok().filter(|d| d.is_dir());
         let built =
@@ -833,7 +884,7 @@ impl Shared {
                 if reason == crate::continuity::Reason::Compacted {
                     self.continuity_settle(alias, reason, &message.id, "skipped", None);
                 }
-                return message.body.clone();
+                return body;
             }
             Err(e) => {
                 // One failure per trigger: the note settles it, so a
@@ -847,7 +898,7 @@ impl Shared {
                            "error": error}),
                 );
                 self.continuity_settle(alias, reason, &message.id, "failed", Some(&error));
-                return message.body.clone();
+                return body;
             }
         };
         let payload = pack.payload(&message.id);
@@ -867,7 +918,7 @@ impl Shared {
             .store
             .event_public(alias, crate::continuity::PACK_EVENT, payload);
         self.wake();
-        pack.wrap(&message.body)
+        pack.wrap(&body)
     }
 
     /// CAD-324: record in the thread that a due pack was not delivered
@@ -1464,15 +1515,21 @@ impl Shared {
                     // with `unclaimed_ok` so a later message cannot
                     // inherit either flag.
                     adapter.set_steer_ok(nudge);
-                    let outcome = adapter.run_turn(&prompt, &message.id, &move |turn| {
-                        // CAD-250: a nudge owns no turn — it never becomes
-                        // `running`, and its paste is not the held turn's
-                        // proof of life.
-                        if !nudge {
-                            let _ = shared.store.mark_running(&started_id, turn);
-                            watch.bump_activity();
-                        }
-                        shared.wake();
+                    // CAD-565: the pane may receive only a bounded
+                    // notice — the stored body still faces the
+                    // endpoint's own screen (a pty profile's
+                    // literal-only checks) before it may deliver.
+                    let outcome = adapter.check_body(&message.body).and_then(|()| {
+                        adapter.run_turn(&prompt, &message.id, &move |turn| {
+                            // CAD-250: a nudge owns no turn — it never
+                            // becomes `running`, and its paste is not the
+                            // held turn's proof of life.
+                            if !nudge {
+                                let _ = shared.store.mark_running(&started_id, turn);
+                                watch.bump_activity();
+                            }
+                            shared.wake();
+                        })
                     });
                     adapter.set_unclaimed_ok(false);
                     adapter.set_steer_ok(false);
@@ -2342,6 +2399,7 @@ impl Shared {
             "agent_set" => self.rpc_set(params, peer_pid),
             "agent_inbox" => self.rpc_inbox(params, peer_pid),
             "agent_inbox_ack" => self.rpc_inbox_ack(params, peer_pid),
+            "message_read" => self.rpc_message_read(params, peer_pid),
             "message_report" => self.rpc_message_report(params),
             "message_reconcile" => self.rpc_reconcile(params, peer_pid),
             "message_cancel" => self.rpc_cancel(params),
@@ -3912,6 +3970,13 @@ mod tests {
                 assert!(prompt.ends_with("the ask"), "{alias}");
                 assert!(prompt.contains("an earlier answer"), "{alias}");
                 assert!(delivered, "{alias}");
+            } else if kind == "pty" {
+                // CAD-565: the paste is the delivery notice — the body
+                // rides only inside its bounded preview.
+                assert!(prompt.starts_with("[cadence] "), "{alias}");
+                assert!(prompt.contains("the ask"), "{alias}");
+                assert!(prompt.contains("cadence message read"), "{alias}");
+                assert!(!delivered, "{alias}");
             } else {
                 assert_eq!(prompt, "the ask", "{alias}");
                 assert!(!delivered, "{alias}");
