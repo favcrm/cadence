@@ -910,7 +910,10 @@ mod tests {
     /// read side, `update_status`, is open like every other read.
     #[test]
     fn update_drain_is_operator_only_and_never_an_agent() {
-        assert_eq!(rule_of("update_drain"), Some(Rule::Handler("operator_connection (CAD-561)")));
+        assert_eq!(
+            rule_of("update_drain"),
+            Some(Rule::Handler("operator_connection (CAD-561)"))
+        );
         assert_eq!(rule_of("update_status"), Some(Rule::Read));
         assert!(!rule_of("update_status").unwrap().checks_connection());
         // `Handler` means the table admits nobody: the handler itself

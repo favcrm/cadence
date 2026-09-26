@@ -1226,3 +1226,61 @@ export interface AppPendingSend {
   title?: string | null;
   runs: string[];
 }
+
+/** CAD-561: the update another process has in flight (the marker). */
+export interface PendingUpdate {
+  phase: string;
+  target: string;
+  from?: string | null;
+  by: string;
+  since: number;
+}
+
+/** One in-flight turn an update waits on. */
+export interface WaitingTurn {
+  alias: string;
+  message: string;
+  state: string;
+  age_secs: number;
+}
+
+/** `GET /api/update` — the Settings Update card's whole view. */
+export interface UpdateStatus {
+  current: { sha: string | null; version: string | null };
+  check: UpdateCheck | null;
+  checked_at: number | null;
+  checking: boolean;
+  update_available: boolean;
+  change_count: number;
+  changes: string[];
+  migration: boolean;
+  blockers: string[];
+  running: boolean;
+  lines: string[];
+  result: Record<string, unknown> | null;
+  error: string | null;
+  pending: PendingUpdate | null;
+  waiting: WaitingTurn[];
+}
+
+/** `cadence update --check`'s report, as the board caches it. */
+export interface UpdateCheck {
+  current: string | null;
+  current_version: string | null;
+  target: string;
+  target_version: string | null;
+  up_to_date: boolean;
+  changes: string[];
+  change_count: number;
+  schema: { current: number | null; target: number | null; migration: boolean };
+  lease: Record<string, unknown> | null;
+  waiters: WaitingTurn[];
+  blockers: string[];
+}
+
+/** `GET /api/update/banner` — non-null while an update is draining. */
+export interface UpdateBanner {
+  pending: PendingUpdate;
+  waiting: WaitingTurn[];
+  count: number;
+}

@@ -9,6 +9,7 @@ import Epics from "./features/projects/Epics";
 import Milestones from "./features/projects/Milestones";
 import Memory from "./features/settings/Memory";
 import ModelDefaults from "./features/settings/ModelDefaults";
+import Update from "./features/settings/Update";
 import Outbox from "./features/outbox/Outbox";
 import OverviewView from "./features/home/Overview";
 import Home from "./features/home/Home";
@@ -30,6 +31,7 @@ import Toast, { type ToastMsg } from "./ui/Toast";
 import { Logo } from "./ui/Logo";
 import { countLabel, issueCounts } from "./lib/counts";
 import type { BoardFilters } from "./lib/filters";
+import type { UpdateBanner } from "./lib/types";
 import { invalidatedBy } from "./lib/cache";
 import { cache, resources } from "./lib/resources";
 import { useMaybeResource, useResource } from "./lib/useResource";
@@ -116,6 +118,7 @@ export default function App() {
   const agents = agentsState.data;
   const [health, setHealth] = useState<Health | null>(null);
   const [meta, setMeta] = useState<Meta | null>(null);
+  const [updateBanner, setUpdateBanner] = useState<UpdateBanner | null>(null);
   // The open drawer's detail, cached per id: reopening a drawer paints
   // the last payload while it revalidates.
   const detailState = useMaybeResource(openId ? resources.issue(openId) : null);
@@ -395,6 +398,26 @@ export default function App() {
     (alias: string | null) => update((c) => ({ ...c, route: { screen: "agents", alias } })),
     [],
   );
+  // CAD-561: the draining banner. Cheap (the daemon's own view), polled
+  // board-wide so an update is visible on every page, not only Settings.
+  useEffect(() => {
+    let stop = false;
+    const tick = () => {
+      api
+        .updateBanner()
+        .then((next) => {
+          if (!stop) setUpdateBanner(next);
+        })
+        .catch(() => undefined);
+    };
+    tick();
+    const timer = window.setInterval(tick, 15000);
+    return () => {
+      stop = true;
+      window.clearInterval(timer);
+    };
+  }, []);
+
   const projectHref = (key: string) => locationHref(withProject(loc, key), search);
   const projectSlug = project === "all" ? null : project;
 
@@ -454,6 +477,18 @@ export default function App() {
             <ThemeToggle />
           </div>
         </header>
+
+        {updateBanner && (
+          <div className="border-b border-amber-500/40 bg-amber-500/10 px-4 lg:px-8 py-2 text-body text-ink-200">
+            <span className="font-semibold">Update in progress</span> —{" "}
+            {updateBanner.pending.from ?? "?"} →{" "}
+            <span className="num">{updateBanner.pending.target}</span> (
+            {updateBanner.pending.phase}) by {updateBanner.pending.by}
+            {updateBanner.count > 0
+              ? ` · waiting for ${updateBanner.count} turn${updateBanner.count === 1 ? "" : "s"}`
+              : " · nothing in flight"}
+          </div>
+        )}
 
         {menuOpen && (
           <nav className="lg:hidden border-b border-ink-700 bg-ink-875 px-4 py-3 space-y-1">
@@ -660,6 +695,7 @@ export default function App() {
             tabs={[
               { label: "Models", href: hrefFor({ screen: "settings", section: "models" }), on: route.section === "models" },
               { label: "Memory", href: hrefFor({ screen: "settings", section: "memory" }), on: route.section === "memory" },
+              { label: "Update", href: hrefFor({ screen: "settings", section: "update" }), on: route.section === "update" },
             ]}
           />
         )}
@@ -667,6 +703,9 @@ export default function App() {
           <Memory project={project} onError={writeError} />
         )}
         {route.screen === "settings" && route.section === "models" && <ModelDefaults />}
+        {route.screen === "settings" && route.section === "update" && (
+          <Update viewer={{ readOnly, operator: meta?.operator === true }} />
+        )}
         {screen === "login" && (
           <Login
             onSignedIn={() => {

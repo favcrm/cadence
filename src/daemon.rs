@@ -2069,7 +2069,9 @@ impl Shared {
                     let label = optional_str(params, "label").unwrap_or("operator");
                     if label.is_empty()
                         || label.len() > 200
-                        || label.chars().any(|c| c.is_control() || c == '\n' || c == '\r')
+                        || label
+                            .chars()
+                            .any(|c| c.is_control() || c == '\n' || c == '\r')
                     {
                         return Err(Error::rejected(
                             "update_drain: label must be 1..=200 characters with no control \
@@ -2077,7 +2079,9 @@ impl Shared {
                         ));
                     }
                     let pending = crate::update::PendingUpdate {
-                        phase: optional_str(params, "phase").unwrap_or("draining").to_string(),
+                        phase: optional_str(params, "phase")
+                            .unwrap_or("draining")
+                            .to_string(),
                         target: required_str(params, "target")?.to_string(),
                         from: optional_str(params, "from").map(str::to_string),
                         by: label.to_string(),

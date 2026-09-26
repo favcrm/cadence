@@ -217,6 +217,15 @@ impl ReleaseSource for Fake {
             ))
         }
     }
+    /// CAD-561: `cadence update --check`'s change summary — `upgrade`
+    /// itself never asks, so this suite answers empty.
+    fn merged_titles(&self, _base: &str, _head: &str) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+    /// CAD-561: the target build's schema — `upgrade` never asks.
+    fn schema_version(&self, _sha: &str) -> Result<Option<i64>> {
+        Ok(None)
+    }
 }
 
 struct Env {

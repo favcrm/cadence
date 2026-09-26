@@ -46,6 +46,7 @@ mod operator;
 mod read_model;
 mod stages;
 mod threads;
+mod updates;
 mod workflows;
 
 pub use operator::{route_class, RouteClass, WriteRoute, WRITE_ROUTES};
@@ -1871,6 +1872,21 @@ fn write_route(
             return;
         }
     };
+    // CAD-561: the operator's Update button — the same pipeline the CLI
+    // runs, in this process; the card polls `GET /api/update`.
+    if path == "/api/update" || path == "/api/update/check" {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let resp = if path == "/api/update" {
+            updates::start(state_dir, opts)
+        } else {
+            updates::check_now(state_dir)
+        };
+        send(request, resp);
+        return;
+    }
     if path == "/api/settings/model-defaults" {
         if *method != Method::Post {
             send(request, err_response(405, "method not allowed"));
@@ -2687,6 +2703,9 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 })),
             );
         }
+        // CAD-561: the Update card's view and the draining banner.
+        "/api/update" => send(request, updates::get(state_dir)),
+        "/api/update/banner" => send(request, updates::banner_get(state_dir)),
         "/api/settings/model-defaults" => {
             send(request, model_defaults_get(state_dir, opts.read_only));
         }

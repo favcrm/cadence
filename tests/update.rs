@@ -19,9 +19,7 @@ use std::time::Duration;
 use cadence_agent::error::{Error, Result};
 use cadence_agent::store::Store;
 use cadence_agent::test_seam::{self, Asserted};
-use cadence_agent::update::{
-    self, CheckReport, Options, PendingUpdate, UpdateHost, Waiter,
-};
+use cadence_agent::update::{self, CheckReport, Options, PendingUpdate, UpdateHost, Waiter};
 use cadence_agent::upgrade::{ArtifactState, Job, Layout, OnMain, ReleaseSource, Run};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -236,10 +234,7 @@ impl Host {
         let host = Self {
             _root: root,
             state_dir,
-            layout: Layout {
-                releases,
-                link,
-            },
+            layout: Layout { releases, link },
             source: Fake::new(),
             identity: "operator:ada".into(),
             lines: RefCell::new(Vec::new()),
@@ -402,7 +397,14 @@ fn check_reports_versions_changes_schema_and_blockers_without_changing_anything(
     assert_eq!(report.schema_current, Some(18));
     assert_eq!(report.schema_target, Some(18));
     assert!(!report.migration);
-    assert!(report.blockers.iter().any(|b| b.contains("waiting for 1 turn")), "{:?}", report.blockers);
+    assert!(
+        report
+            .blockers
+            .iter()
+            .any(|b| b.contains("waiting for 1 turn")),
+        "{:?}",
+        report.blockers
+    );
     // Nothing changed: no new release, no lease, no backup, no drain.
     assert!(!host.layout.release_dir(NEW).exists());
     assert_eq!(host.lease_row()["held"], serde_json::json!(false));
@@ -414,7 +416,10 @@ fn check_reports_versions_changes_schema_and_blockers_without_changing_anything(
     assert!(lines.contains("available: bbbb"), "{lines}");
     assert!(lines.contains("CAD-560"), "{lines}");
     assert!(lines.contains("schema: no change (18)"), "{lines}");
-    assert!(lines.contains("waiting for 1 turn: swe-554 (12m)"), "{lines}");
+    assert!(
+        lines.contains("waiting for 1 turn: swe-554 (12m)"),
+        "{lines}"
+    );
 }
 
 #[test]
@@ -424,11 +429,14 @@ fn check_reports_a_migration_and_a_lease_held_by_another_identity() {
     claim_other(&host);
     let report = test_seam::scoped(Asserted::Operator, || update::check(&host)).unwrap();
     assert!(report.migration, "schema 19 > 18");
-    assert!(report
-        .blockers
-        .iter()
-        .any(|b| b == "update in progress by operator:someone-else since " || b.contains("update in progress by operator:someone-else")),
-        "{:?}", report.blockers);
+    assert!(
+        report.blockers.iter().any(
+            |b| b == "update in progress by operator:someone-else since "
+                || b.contains("update in progress by operator:someone-else")
+        ),
+        "{:?}",
+        report.blockers
+    );
     assert!(report.lines().join("\n").contains("migration 18 → 19"));
 }
 
@@ -485,8 +493,14 @@ fn a_run_takes_the_lease_backs_up_installs_drains_switches_checks_health_and_rel
     let log = host.log();
     assert!(log.contains("waiting for 1 turn: swe-554 (12m)"), "{log}");
     assert!(log.contains("drained: quiet after"), "{log}");
-    assert!(log.contains("switching: restarting the daemon on bbbb"), "{log}");
-    assert!(log.contains("health: daemon and board answer on bbbb"), "{log}");
+    assert!(
+        log.contains("switching: restarting the daemon on bbbb"),
+        "{log}"
+    );
+    assert!(
+        log.contains("health: daemon and board answer on bbbb"),
+        "{log}"
+    );
     assert!(log.contains("done: "), "{log}");
     // The restart ran the new release's binary.
     assert_eq!(host.restarts.borrow().as_slice(), [host.layout.binary(NEW)]);
@@ -515,8 +529,14 @@ fn an_update_another_identity_is_running_is_reported_not_a_raw_lease_error() {
     let host = Host::new();
     claim_other(&host);
     let err = run(&host, &host.options()).unwrap_err().to_string();
-    assert!(err.contains("update in progress by operator:someone-else since"), "{err}");
-    assert!(!err.contains("rollout lease is held by"), "raw lease error leaked: {err}");
+    assert!(
+        err.contains("update in progress by operator:someone-else since"),
+        "{err}"
+    );
+    assert!(
+        !err.contains("rollout lease is held by"),
+        "raw lease error leaked: {err}"
+    );
     // Nothing was installed, backed up or drained.
     assert!(!host.layout.release_dir(NEW).join("cadence").exists());
     assert!(!update::default_backup_dir(&host.state_dir).exists());
@@ -540,13 +560,19 @@ fn the_drain_is_bounded_and_switches_anyway_with_what_it_waited_on() {
     let report = run(&host, &opts).unwrap();
     assert_eq!(report.drain["timed_out"], serde_json::json!(true));
     assert_eq!(report.drain["waited_secs"], serde_json::json!(30));
-    assert_eq!(report.drain["waiters"][0]["alias"], serde_json::json!("swe-554"));
+    assert_eq!(
+        report.drain["waiters"][0]["alias"],
+        serde_json::json!("swe-554")
+    );
     let log = host.log();
     assert!(log.contains("drain timeout after 30s"), "{log}");
     assert!(log.contains("swe-554 (12m) still running"), "{log}");
     assert!(log.contains("they resume after the restart"), "{log}");
     // It switched anyway: the release is installed and the link moved.
-    assert_eq!(fs::read_link(&host.layout.link).unwrap(), host.layout.binary(NEW));
+    assert_eq!(
+        fs::read_link(&host.layout.link).unwrap(),
+        host.layout.binary(NEW)
+    );
 }
 
 #[test]
@@ -567,9 +593,19 @@ fn now_switches_immediately_without_waiting() {
     assert_eq!(host.sleeps.get(), 0, "no drain wait at all");
     assert_eq!(report.drain["now"], serde_json::json!(true));
     assert_eq!(report.drain["waited_secs"], serde_json::json!(0));
-    assert_eq!(report.drain["waiters"][0]["alias"], serde_json::json!("swe-554"));
-    assert!(host.log().contains("--now: switching with"), "{}", host.log());
-    assert_eq!(fs::read_link(&host.layout.link).unwrap(), host.layout.binary(NEW));
+    assert_eq!(
+        report.drain["waiters"][0]["alias"],
+        serde_json::json!("swe-554")
+    );
+    assert!(
+        host.log().contains("--now: switching with"),
+        "{}",
+        host.log()
+    );
+    assert_eq!(
+        fs::read_link(&host.layout.link).unwrap(),
+        host.layout.binary(NEW)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -585,15 +621,24 @@ fn a_failing_health_check_rolls_back_to_the_previous_release_and_restarts_it() {
     assert_eq!(report.health["ok"], serde_json::json!(false));
     assert_eq!(report.health["rolled_back_to"], serde_json::json!(OLD));
     // The link points back at the previous release, which was restarted.
-    assert_eq!(fs::read_link(&host.layout.link).unwrap(), host.layout.binary(OLD));
+    assert_eq!(
+        fs::read_link(&host.layout.link).unwrap(),
+        host.layout.binary(OLD)
+    );
     assert_eq!(
         host.restarts.borrow().as_slice(),
         [host.layout.binary(NEW), host.layout.binary(OLD)]
     );
     let log = host.log();
     assert!(log.contains("health: health check failed"), "{log}");
-    assert!(log.contains(&format!("rollback: repointing to {OLD}")), "{log}");
-    assert!(log.contains(&format!("rolled back: {OLD} is answering health again")), "{log}");
+    assert!(
+        log.contains(&format!("rollback: repointing to {OLD}")),
+        "{log}"
+    );
+    assert!(
+        log.contains(&format!("rolled back: {OLD} is answering health again")),
+        "{log}"
+    );
     // The lease is still auto-released after a rollback.
     assert_eq!(host.lease_row()["held"], serde_json::json!(false));
     assert!(!host.draining.get());
@@ -607,7 +652,10 @@ fn a_health_check_that_never_comes_up_reports_the_failed_rollback() {
     host.board_running.set(false);
     let err = run(&host, &host.options()).unwrap_err().to_string();
     assert!(err.contains("health check failed"), "{err}");
-    assert_eq!(fs::read_link(&host.layout.link).unwrap(), host.layout.binary(OLD));
+    assert_eq!(
+        fs::read_link(&host.layout.link).unwrap(),
+        host.layout.binary(OLD)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -621,7 +669,10 @@ fn an_unattested_download_is_refused_and_nothing_is_installed() {
     let err = run(&host, &host.options()).unwrap_err().to_string();
     assert!(err.contains("attestation did not verify"), "{err}");
     assert!(!host.layout.release_dir(NEW).join("cadence").exists());
-    assert_eq!(fs::read_link(&host.layout.link).unwrap(), host.layout.binary(OLD));
+    assert_eq!(
+        fs::read_link(&host.layout.link).unwrap(),
+        host.layout.binary(OLD)
+    );
     assert!(host.restarts.borrow().is_empty());
     assert_eq!(host.lease_row()["held"], serde_json::json!(false));
 }
@@ -647,13 +698,18 @@ fn rollback_returns_to_the_previous_release_and_offers_the_restore_when_the_sche
     link_to(&host.layout, NEW);
     // The store is newer than the previous release's schema.
     host.source.schema = Some(17);
-    let report =
-        test_seam::scoped(Asserted::Operator, || update::rollback(&host)).unwrap();
+    let report = test_seam::scoped(Asserted::Operator, || update::rollback(&host)).unwrap();
     assert!(report.rolled_back);
-    assert_eq!(fs::read_link(&host.layout.link).unwrap(), host.layout.binary(OLD));
+    assert_eq!(
+        fs::read_link(&host.layout.link).unwrap(),
+        host.layout.binary(OLD)
+    );
     assert_eq!(host.restarts.borrow().as_slice(), [host.layout.binary(OLD)]);
     let log = host.log();
-    assert!(log.contains(&format!("rolling back: {NEW} → {OLD}")), "{log}");
+    assert!(
+        log.contains(&format!("rolling back: {NEW} → {OLD}")),
+        "{log}"
+    );
     assert!(
         log.contains(&format!("the store schema (18) is newer than {OLD}'s (17)")),
         "{log}"

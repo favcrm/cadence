@@ -472,12 +472,7 @@ impl ReleaseSource for Gh {
     fn schema_version(&self, sha: &str) -> Result<Option<i64>> {
         let path = format!("repos/{}/contents/src/rollout.rs?ref={sha}", self.repo);
         let out = self.run(
-            &[
-                "api",
-                "-H",
-                "Accept: application/vnd.github.raw",
-                &path,
-            ],
+            &["api", "-H", "Accept: application/vnd.github.raw", &path],
             GH_TIMEOUT,
         )?;
         if !out.status.success() {
@@ -491,15 +486,19 @@ impl ReleaseSource for Gh {
 pub fn is_merged_pr_subject(subject: &str) -> bool {
     let trimmed = subject.trim_end();
     trimmed.ends_with(')')
-        && trimmed
-            .rfind("(#")
-            .is_some_and(|at| trimmed[at + 2..trimmed.len() - 1].bytes().all(|b| b.is_ascii_digit()))
+        && trimmed.rfind("(#").is_some_and(|at| {
+            trimmed[at + 2..trimmed.len() - 1]
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+        })
 }
 
 /// The first `pub const SCHEMA_VERSION: i64 = <n>;` in `src/rollout.rs`.
 pub fn parse_schema_version(source: &str) -> Option<i64> {
     source.lines().find_map(|line| {
-        let rest = line.trim().strip_prefix("pub const SCHEMA_VERSION: i64 = ")?;
+        let rest = line
+            .trim()
+            .strip_prefix("pub const SCHEMA_VERSION: i64 = ")?;
         rest.trim().trim_end_matches(';').trim().parse().ok()
     })
 }

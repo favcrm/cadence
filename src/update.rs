@@ -212,9 +212,9 @@ impl CheckReport {
             ),
             (Some(from), Some(to)) if to == from => format!("schema: no change ({from})"),
             (Some(from), Some(to)) => format!("schema: target {to} is older than the store {from}"),
-            (Some(from), None) => format!(
-                "schema: store {from}; the target build's schema could not be read"
-            ),
+            (Some(from), None) => {
+                format!("schema: store {from}; the target build's schema could not be read")
+            }
             (None, Some(to)) => format!("schema: fresh store; target build is {to}"),
             (None, None) => "schema: no database yet".to_string(),
         });
@@ -483,7 +483,7 @@ pub fn check(host: &dyn UpdateHost) -> Result<CheckReport> {
 
 fn fmt_duration(_host: &dyn UpdateHost, d: Duration) -> String {
     let secs = d.as_secs();
-    if secs % 60 == 0 && secs >= 60 {
+    if secs.is_multiple_of(60) && secs >= 60 {
         format!("{}m", secs / 60)
     } else {
         format!("{secs}s")
@@ -554,12 +554,13 @@ fn take_backup(host: &dyn UpdateHost, opts: &Options) -> Result<Value> {
         .backup_dir
         .clone()
         .unwrap_or_else(|| default_backup_dir(state_dir));
-    let backup = crate::backup::backup(state_dir, &dir, BACKUP_KEEP, BACKUP_REASON).map_err(|e| {
-        Error::rejected(format!(
-            "update refused before installing: the pre-update backup into {} failed: {e}",
-            dir.display()
-        ))
-    })?;
+    let backup =
+        crate::backup::backup(state_dir, &dir, BACKUP_KEEP, BACKUP_REASON).map_err(|e| {
+            Error::rejected(format!(
+                "update refused before installing: the pre-update backup into {} failed: {e}",
+                dir.display()
+            ))
+        })?;
     let db = backup["db"].as_str().unwrap_or_default().to_string();
     if db.is_empty() {
         return Err(Error::rejected(
@@ -695,7 +696,9 @@ pub fn run(host: &dyn UpdateHost, opts: &Options) -> Result<RunReport> {
     let mut report = outcome?;
     report.lines = lines;
     if let Err(e) = released {
-        report.lines.push(format!("warning: the lease was not released: {e}"));
+        report
+            .lines
+            .push(format!("warning: the lease was not released: {e}"));
     }
     Ok(report)
 }
@@ -892,7 +895,7 @@ pub fn prune_releases(host: &dyn UpdateHost, keep: usize) -> Result<Vec<String>>
     };
     let mut releases = release_dirs(layout)?;
     // Newest first: the linked one is never a prune candidate.
-    releases.sort_by(|a, b| b.1.cmp(&a.1));
+    releases.sort_by_key(|a| std::cmp::Reverse(a.1));
     let mut kept = 0usize;
     let mut removed = Vec::new();
     for (sha, _) in releases {
@@ -942,7 +945,7 @@ pub fn previous_release(host: &dyn UpdateHost) -> Result<Option<String>> {
         _ => None,
     };
     let mut releases = release_dirs(host.layout())?;
-    releases.sort_by(|a, b| b.1.cmp(&a.1));
+    releases.sort_by_key(|a| std::cmp::Reverse(a.1));
     Ok(releases
         .into_iter()
         .map(|(sha, _)| sha)
