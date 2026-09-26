@@ -42,9 +42,12 @@ mod delivery;
 mod events;
 pub use events::{
     default_approval_id, Event, NewApproval, APPROVAL_RECORDED_EVENT, APPROVAL_REVOKED_EVENT,
-    APPROVAL_STREAM, APP_APPROVED_EVENT, VERDICT_RECORDED_EVENT, VERDICT_STREAM,
+    APPROVAL_STREAM, APP_APPROVED_EVENT, DELIVERY_ROLLUP_EVENT, EVENT_ROLLUP_AGE_SECS,
+    EVENT_ROLLUP_BATCH, ROLLABLE_EVENT_KINDS, VERDICT_RECORDED_EVENT, VERDICT_STREAM,
     WORKFLOW_APPROVED_EVENT, WORK_APPROVED_EVENT,
 };
+// CAD-316: the rollup's read-only counts for `doctor --host`.
+pub(crate) use events::event_store_stats;
 mod inbox;
 mod kickoff;
 pub use kickoff::{check_commit_sha, job_kickoff, kickoff_ceiling, omit_host_paths};

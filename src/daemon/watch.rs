@@ -242,6 +242,7 @@ impl Shared {
         let mut inbox_swept: Option<Instant> = None;
         let mut nudges_swept: Option<Instant> = None;
         let mut checkup_at: Option<Instant> = None;
+        let mut events_rolled: Option<Instant> = None;
         while !self.closing.load(Ordering::SeqCst) {
             self.stall_tick();
             // CAD-250 N3: a nudge still queued past its TTL is stale
@@ -257,6 +258,22 @@ impl Shared {
             if inbox_swept.is_none_or(|at| at.elapsed() >= screen_sample(&self.stall_sample_secs)) {
                 self.inbox_sweep();
                 inbox_swept = Some(Instant::now());
+            }
+            // CAD-316: delivery bookkeeping past a week folds into
+            // per-alias counts — hourly, allowlisted kinds only. A full
+            // batch means backlog remains: the next tick takes the next
+            // chunk, so the store lock is released between chunks.
+            if events_rolled.is_none_or(|at| at.elapsed() >= EVENT_ROLLUP_EVERY) {
+                let cutoff = epoch_secs() - crate::store::EVENT_ROLLUP_AGE_SECS;
+                let batch = crate::store::EVENT_ROLLUP_BATCH;
+                events_rolled = match self.store.roll_up_delivery_events(cutoff, batch) {
+                    Ok(folded) if folded >= batch => None,
+                    Ok(_) => Some(Instant::now()),
+                    Err(e) => {
+                        eprintln!("event rollup: {e}");
+                        Some(Instant::now())
+                    }
+                };
             }
             // CAD-199: off unless configured; sweeps at most hourly.
             self.agent_gc_tick();
@@ -1204,6 +1221,9 @@ pub(super) fn wal_observe_only(configured: bool, sandbox: Option<&str>) -> bool 
 /// agent-removal pruning never reaches it; unbounded growth in a
 /// feature whose purpose is bounding growth would be embarrassing.
 const DAEMON_EVENTS_KEEP: i64 = 200;
+
+/// How often the stall watch folds week-old delivery events (CAD-316).
+const EVENT_ROLLUP_EVERY: Duration = Duration::from_secs(3600);
 
 /// Cross-tick watch state: `pending` dedupes dry-run events (one per
 /// db per crossing, cleared when it drops under the limit), and

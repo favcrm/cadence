@@ -181,6 +181,10 @@ impl FsFree {
     }
 }
 
+pub(super) fn file_size(path: &Path) -> Option<u64> {
+    std::fs::metadata(path).ok().map(|m| m.len())
+}
+
 /// The fields `stat` yields for free: comm, parentage, CPU, the
 /// start-time half of pid+start identity (field 22) and RSS.
 pub(super) struct ProcStat {
@@ -410,6 +414,12 @@ pub(crate) fn wal_roots(home: &Path, data_home: &Path) -> Vec<WalRoot> {
             root: home.join(".claude/projects"),
         },
     ]
+}
+
+/// The `<db>-wal` sibling cadence and sqlite both write next to the
+/// main file.
+pub(crate) fn wal_sibling(db: &Path) -> Option<PathBuf> {
+    Some(db.with_file_name(format!("{}-wal", db.file_name()?.to_string_lossy())))
 }
 
 /// What `find_wals` walked to. `truncated` is the honest signal that
