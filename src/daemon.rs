@@ -2263,7 +2263,11 @@ impl Shared {
             "agent_show" => {
                 let alias = self.resolve_alias(required_str(params, "alias")?)?;
                 let agent = self.store.agent(&alias)?;
-                let messages = self.store.messages(&alias)?;
+                let messages = if params.get("active_only").and_then(Value::as_bool) == Some(true) {
+                    self.store.active_messages(&alias)?
+                } else {
+                    self.store.messages(&alias)?
+                };
                 let mut agent_json = agent.to_json();
                 agent_json["capabilities"] =
                     registry::capabilities_json(&agent.provider, &agent.endpoint_kind);
@@ -3814,6 +3818,189 @@ mod pty_retry_tests {
 mod tests {
     use super::*;
     use crate::store::NewAgent;
+
+    fn cad627_shared(dir: &Path) -> Arc<Shared> {
+        let opts = ServeOptions::default();
+        opts.provider_env
+            .set("CADENCE_PM_DIR", dir.join("no-pm").to_str().unwrap());
+        let shared = Shared::new(dir, &opts).unwrap();
+        shared
+            .store
+            .register_agent(&NewAgent {
+                alias: "w1",
+                provider: "fake",
+                endpoint_kind: "managed",
+                role: "worker",
+                cwd: dir.to_str().unwrap(),
+                sandbox: "read-only",
+                instructions: None,
+                params: None,
+                team_role: None,
+                model_policy: None,
+            })
+            .unwrap();
+        shared
+    }
+
+    /// The one-second board poll needs running rows, not thousands of
+    /// completed bodies/results. Count decoding rather than wall time so
+    /// host load cannot hide a regression. Timing is supporting evidence.
+    #[test]
+    fn cad627_board_poll_does_not_decode_terminal_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = cad627_shared(dir.path());
+        shared
+            .store
+            .enqueue("w1", "live", None, "live", "user")
+            .unwrap();
+        shared.store.mark_running("live", "private-token").unwrap();
+        let created = shared.store.agent("w1").unwrap().created;
+        let mut conn = rusqlite::Connection::open(dir.path().join("cadence.sqlite3")).unwrap();
+        let tx = conn.transaction().unwrap();
+        let result = json!({"text": "x".repeat(8192)}).to_string();
+        for i in 0..2000 {
+            tx.execute(
+                "INSERT INTO messages(id,alias,body,source,state,result,created)
+                 VALUES (?1,'w1',?2,'user','completed',?2,?3)",
+                rusqlite::params![format!("history-{i}"), result, created + 1.0],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        store::take_decoded_messages();
+        let started = Instant::now();
+        for _ in 0..10 {
+            let view = shared.board_view("w1").unwrap();
+            assert_eq!(view["messages"].as_array().unwrap().len(), 1);
+            assert_eq!(view["messages"][0]["id"], "live");
+            assert!(view["messages"][0].get("turn_id").is_none());
+            assert_eq!(view["parked"], 0);
+        }
+        let decoded = store::take_decoded_messages();
+        eprintln!(
+            "CAD-627: 10 board reads, 2000 terminal rows, decoded={decoded}, elapsed={:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            decoded, 10,
+            "terminal history must not be decoded by board polls"
+        );
+    }
+
+    /// Counts retain registration/clock-step semantics, tolerate legacy
+    /// malformed results, and ignore another alias and running parks.
+    #[test]
+    fn cad627_board_summary_matches_history_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = cad627_shared(dir.path());
+        let created = shared.store.agent("w1").unwrap().created;
+        let conn = rusqlite::Connection::open(dir.path().join("cadence.sqlite3")).unwrap();
+        for (id, alias, state, result, at) in [
+            (
+                "old",
+                "w1",
+                "failed",
+                r#"{"via":"pty_render_miss"}"#,
+                created - 1.0,
+            ),
+            (
+                "park",
+                "w1",
+                "failed",
+                r#"{"via":"pty_render_miss"}"#,
+                created + 1.0,
+            ),
+            (
+                "clock-step",
+                "w1",
+                "unknown",
+                r#"{"via":"pty_render_miss"}"#,
+                created - 1.0,
+            ),
+            ("queued", "w1", "queued", "null", created + 1.0),
+            ("bad", "w1", "failed", "not json", created + 1.0),
+            ("scalar", "w1", "failed", "42", created + 1.0),
+            (
+                "live",
+                "w1",
+                "running",
+                r#"{"via":"pty_render_miss"}"#,
+                created - 1.0,
+            ),
+            (
+                "other",
+                "w2",
+                "failed",
+                r#"{"via":"pty_render_miss"}"#,
+                created + 1.0,
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO messages(id,alias,body,source,state,result,created,turn_id)
+                 VALUES (?1,?2,'body','user',?3,?4,?5,'private-token')",
+                rusqlite::params![id, alias, state, result, at],
+            )
+            .unwrap();
+        }
+        let history = shared.store.messages("w1").unwrap();
+        let expected: Vec<Value> = history
+            .iter()
+            .filter(|m| m.state == "running")
+            .map(|m| {
+                let mut row = m.to_json();
+                row.as_object_mut().unwrap().remove("turn_id");
+                row
+            })
+            .collect();
+        let view = shared.board_view("w1").unwrap();
+        assert_eq!(view["messages"], json!(expected));
+        assert_eq!(view["parked"], 2);
+        assert_eq!(view["queued"], 1);
+        assert_eq!(view["unknown"], 1);
+        assert_eq!(shared.store.messages("w1").unwrap().len(), history.len());
+    }
+
+    #[test]
+    fn cad627_active_agent_show_keeps_unknowns_and_default_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = cad627_shared(dir.path());
+        let conn = rusqlite::Connection::open(dir.path().join("cadence.sqlite3")).unwrap();
+        let created = shared.store.agent("w1").unwrap().created + 1.0;
+        for (id, state) in [
+            ("done", "completed"),
+            ("fenced", "unknown"),
+            ("live", "running"),
+        ] {
+            conn.execute(
+                "INSERT INTO messages(id,alias,body,source,state,created,turn_id)
+                 VALUES (?1,'w1','body','user',?2,?3,'private-token')",
+                rusqlite::params![id, state, created],
+            )
+            .unwrap();
+        }
+        let before = shared.store.event_cursor("w1").unwrap();
+        let active = shared
+            .dispatch(
+                "agent_show",
+                &json!({"alias": "w1", "active_only": true}),
+                std::process::id(),
+            )
+            .unwrap();
+        let ids: Vec<&str> = active["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["fenced", "live"]);
+        assert_eq!(active["unknown"], 1);
+        assert!(!active.to_string().contains("private-token"));
+        let full = shared
+            .dispatch("agent_show", &json!({"alias": "w1"}), std::process::id())
+            .unwrap();
+        assert_eq!(full["messages"].as_array().unwrap().len(), 3);
+        assert_eq!(shared.store.event_cursor("w1").unwrap(), before);
+    }
 
     /// CAD-324: a pending compaction whose pack cannot be sent is
     /// settled once in the thread — never rebuilt on every later turn.

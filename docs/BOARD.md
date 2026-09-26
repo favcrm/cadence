@@ -1467,7 +1467,7 @@ The payload carries the classification as `main_ci[]`; a repo without a
 `ci.yml` workflow has no block.
 
 GitHub data (open PRs, default-branch CI runs) comes from `gh` behind a
-60-second cache in the state dir (`overview-gh.json`, keyed by the
+60-second default cache in the state dir (`overview-gh.json`, keyed by the
 slug set, written temp-then-rename); an outage serves the last good
 body as `github.state: "stale"` — or `"unavailable"` when there is no
 good body — and the screen still renders. Daemon-dependent rows
@@ -1475,6 +1475,32 @@ good body — and the screen still renders. Daemon-dependent rows
 down, reported as `daemon.reachable: false`. Reachability is the
 `health` RPC — a daemon that predates `daemon_info` stays reachable
 (its agent rows appear) while drift reports the build as unknown.
+
+The board/CLI process can set `CADENCE_OVERVIEW_GH_CACHE_SECS` to 60–3600
+seconds; unset, invalid or out-of-range values use 60. For example, 300
+allows five-minute display freshness and reduces periodic refresh frequency
+by 80% compared with 60, assuming continuous reads and successful fetches.
+This is a scheduling calculation, not a measured daemon CPU improvement.
+Set it on every board/CLI reader sharing that cache: a reader with a shorter
+interval can still refresh it sooner. Existing `as_of` timestamps and
+stale/unavailable states retain their meaning. Repository selection comes
+from the tracker's deduplicated GitHub project remotes.
+`cadence session` shares the cache but keeps its existing 60-second bound.
+
+Overview GitHub reads run in the board/CLI process and write this JSON
+cache, not the daemon's SQLite store. The board's delivery sync has its
+own 60-second default, page-view budget and failure backoff; this setting
+does not change it or the reviewed-head merge guards (CAD-446).
+
+Recurring `agent_list` board summaries fetch running message rows and count
+historical parked deliveries in SQL, rather than decoding completed bodies
+and results every tick. The parked count still examines historical results;
+it is not constant-time. Overview probes pass `active_only: true` to
+`agent_show`, keeping queued/submitting/running messages and unresolved
+unknowns for fence evidence. A normal `agent_show` keeps full current-agent
+history. Both variants retain turn-token redaction; reads do not unfence,
+resume or launch an agent. The `start: skipping fenced agent` log is a
+daemon-start observation, not a periodic scheduler action (CAD-627).
 
 **Deploy drift** — the daemon reports its `build_commit` via the
 `daemon_info` RPC (`build.rs` compiles `CADENCE_BUILD_COMMIT`/

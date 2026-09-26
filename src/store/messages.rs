@@ -11,6 +11,18 @@ use super::agents::Agent;
 use super::schema::Take;
 use super::{now, Sender, Store};
 
+// Deterministic cost evidence for recurring read paths. Thread-local so
+// unrelated parallel tests cannot add to a caller's measurement.
+#[cfg(test)]
+thread_local! {
+    static DECODED_MESSAGES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_decoded_messages() -> usize {
+    DECODED_MESSAGES.with(|n| n.replace(0))
+}
+
 #[derive(Debug, Clone)]
 pub struct Message {
     pub seq: i64,
@@ -41,6 +53,8 @@ pub struct Message {
 }
 
 pub(super) fn row_message(row: &rusqlite::Row) -> rusqlite::Result<Message> {
+    #[cfg(test)]
+    DECODED_MESSAGES.with(|n| n.set(n.get() + 1));
     let result: Option<String> = row.get("result")?;
     Ok(Message {
         seq: row.get("seq")?,
@@ -1239,6 +1253,49 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Current work and unresolved outcomes for overview probes. Terminal
+    /// history stays available through `messages`; unknowns remain visible
+    /// even after a clock step or alias re-registration, as there too.
+    pub(crate) fn active_messages(&self, alias: &str) -> Result<Vec<Message>> {
+        let conn = self.conn();
+        self.agent_in(&conn, alias)?;
+        let mut stmt = conn.prepare(
+            "SELECT * FROM messages WHERE alias=?1
+             AND state IN ('queued','submitting','running','unknown') ORDER BY seq",
+        )?;
+        let rows = stmt.query_map([alias], row_message)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Running rows only, via the queue index: recurring summaries must
+    /// not deserialize completed bodies and results on every board tick.
+    pub(crate) fn running_messages(&self, alias: &str) -> Result<Vec<Message>> {
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare("SELECT * FROM messages WHERE alias=?1 AND state='running' ORDER BY seq")?;
+        let rows = stmt.query_map([alias], row_message)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// The board's historical render-miss count, without fetching message
+    /// bodies. Retain `messages`' registration boundary and non-terminal
+    /// clock-step behavior. Old malformed result JSON counts as no result,
+    /// as it does in `row_message`, rather than failing the whole snapshot.
+    pub(crate) fn parked_message_count(&self, alias: &str) -> Result<i64> {
+        let conn = self.conn();
+        let agent = self.agent_in(&conn, alias)?;
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE alias=?1 AND state!='running'
+             AND (created >= ?2 OR state NOT IN
+                  ('completed','failed','interrupted','cancelled'))
+             AND CASE WHEN json_valid(result)
+                      THEN json_extract(result,'$.via') = 'pty_render_miss'
+                      ELSE 0 END",
+            params![alias, agent.created],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn message(&self, id: &str) -> Result<Option<Message>> {
         let conn = self.conn();
         self.message_in(&conn, id)
@@ -1268,24 +1325,22 @@ impl Store {
     /// for rows that accumulated before it did (adopted on a hot
     /// restart), which the report bound then retires.
     pub fn awaiting_reports(&self, alias: &str) -> Result<Vec<Message>> {
-        let conn = self.conn();
-        let mut stmt =
-            conn.prepare("SELECT * FROM messages WHERE alias=? AND state='running' ORDER BY seq")?;
-        let rows = stmt.query_map([alias], row_message)?;
-        let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows.into_iter().filter(Message::awaiting_report).collect())
+        Ok(self
+            .running_messages(alias)?
+            .into_iter()
+            .filter(Message::awaiting_report)
+            .collect())
     }
 
     /// CAD-250: every row holding the alias's turn ([`Message::holds_turn`]),
     /// oldest first — marked `awaiting_report` or not. The report bound
     /// walks these.
     pub fn held_turns(&self, alias: &str) -> Result<Vec<Message>> {
-        let conn = self.conn();
-        let mut stmt =
-            conn.prepare("SELECT * FROM messages WHERE alias=? AND state='running' ORDER BY seq")?;
-        let rows = stmt.query_map([alias], row_message)?;
-        let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows.into_iter().filter(Message::holds_turn).collect())
+        Ok(self
+            .running_messages(alias)?
+            .into_iter()
+            .filter(Message::holds_turn)
+            .collect())
     }
 
     /// CAD-375: every running message's turn token and its agent —
