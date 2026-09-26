@@ -5,6 +5,15 @@ import { NAV, type Route, type Screen } from "../lib/router";
 import type { IssueCard, Project } from "../lib/types";
 import Link from "./Link";
 import { Logo } from "./Logo";
+import {
+  IconAgents,
+  IconApps,
+  IconHome,
+  IconOutbox,
+  IconProjects,
+  IconSettings,
+  IconWiki,
+} from "./icons";
 
 interface Props {
   screen: Screen;
@@ -22,58 +31,14 @@ interface Props {
   signedIn?: boolean | null;
 }
 
-const boardIcon = (
-  <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4">
-    <rect x="1.5" y="2" width="3.6" height="12" rx="1" />
-    <rect x="6.2" y="2" width="3.6" height="8" rx="1" />
-    <rect x="10.9" y="2" width="3.6" height="10" rx="1" />
-  </svg>
-);
-const homeIcon = (
-  <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4">
-    <circle cx="8" cy="8" r="5.5" />
-    <path d="M8 5.5v3l2 1.4" />
-  </svg>
-);
-const agentsIcon = (
-  <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4">
-    <rect x="2" y="3" width="12" height="8.5" rx="1.2" />
-    <path d="M5.5 14h5" />
-  </svg>
-);
-const wikiIcon = (
-  <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4">
-    <path d="M3.5 1.8h6l3 3v9.4h-9z" />
-    <path d="M5.8 7.5h4.4M5.8 10h4.4" />
-  </svg>
-);
-const appsIcon = (
-  <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4">
-    <path d="M8 1.8l5.2 3v6.4L8 14.2l-5.2-3V4.8l5.2-3z" />
-    <path d="M2.8 4.8L8 7.8l5.2-3M8 7.8v6.4" />
-  </svg>
-);
-const settingsIcon = (
-  <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4">
-    <circle cx="8" cy="8" r="2.2" />
-    <path d="M8 1.8v1.6M8 12.6v1.6M1.8 8h1.6M12.6 8h1.6M3.4 3.4l1.1 1.1M11.5 11.5l1.1 1.1M12.6 3.4l-1.1 1.1M4.5 11.5l-1.1 1.1" />
-  </svg>
-);
-const outboxIcon = (
-  <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4">
-    <path d="M2 5.5h12v8a1 1 0 01-1 1H3a1 1 0 01-1-1v-8z" />
-    <path d="M2 5.5l2-3h8l2 3" />
-    <path d="M6.5 8.5h3" />
-  </svg>
-);
 const NAV_ICONS: Record<string, ReactNode> = {
-  home: homeIcon,
-  projects: boardIcon,
-  wiki: wikiIcon,
-  apps: appsIcon,
-  agents: agentsIcon,
-  outbox: outboxIcon,
-  settings: settingsIcon,
+  home: <IconHome />,
+  projects: <IconProjects />,
+  wiki: <IconWiki />,
+  apps: <IconApps />,
+  agents: <IconAgents />,
+  outbox: <IconOutbox />,
+  settings: <IconSettings />,
 };
 
 export default function Sidebar({ screen, navHref, project, projectHref, projects, issues, projectsError, signedIn = null }: Props) {

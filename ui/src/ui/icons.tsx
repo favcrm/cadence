@@ -10,6 +10,7 @@ import {
   Cancel01Icon,
   ContrastIcon,
   CubeIcon,
+  File01Icon,
   Home01Icon,
   KanbanIcon,
   MailSend01Icon,
@@ -73,6 +74,10 @@ export const IconOutbox = ({ size = 15, ...rest }: IconProps = {}) => (
 /** Settings — models, memory and the update card. */
 export const IconSettings = ({ size = 15, ...rest }: IconProps = {}) => (
   <Glyph icon={Settings02Icon} size={size} {...rest} />
+);
+/** Wiki — the page store. */
+export const IconWiki = ({ size = 15, ...rest }: IconProps = {}) => (
+  <Glyph icon={File01Icon} size={size} {...rest} />
 );
 /** The disclosure chevron; rotate it for open rows. */
 export const IconChevron = ({ size = 10, ...rest }: IconProps = {}) => (
