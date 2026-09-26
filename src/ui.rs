@@ -44,6 +44,7 @@ mod home;
 mod lane;
 mod login;
 mod operator;
+mod platform_account;
 mod read_model;
 mod stages;
 mod threads;
@@ -2879,6 +2880,7 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     "actor": actor,
                     "tailnet_proof": tailnet_proof,
                     "operator": operator,
+                    "platform_account_configured": opts.public.as_ref().is_some_and(|board| board.issuer == "http://api.internal"),
                     "tailnet_url": opts
                         .tailnet
                         .as_ref()
@@ -2899,6 +2901,7 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
         "/api/settings/model-defaults" => {
             send(request, model_defaults_get(state_dir, opts.read_only));
         }
+        "/api/platform-account" => send(request, platform_account::get(opts)),
         // The serving binary's build id and nothing else — cheap, and
         // unauthenticated like `/api/health`, so a tab whose stream is
         // stuck reconnecting can compare it against its own bundle's.
