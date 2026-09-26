@@ -22,6 +22,9 @@ use cadence_agent::{client, daemon, ui};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
+#[path = "support/operator.rs"]
+mod op;
+
 const ISSUES: usize = 420;
 const AGENTS: usize = 12;
 const JOBS: usize = 160;
@@ -164,7 +167,7 @@ impl Daemon {
     fn operator_rpc(&self, method: &str, params: Value) -> cadence_agent::Result<Value> {
         let script = self.state.join("operator-rpc.py");
         if !script.exists() {
-            std::fs::write(&script, OPERATOR_RPC_PY).unwrap();
+            std::fs::write(&script, op::rpc_script()).unwrap();
         }
         let out = self.state.join(format!(
             "operator-rpc-{}.json",
@@ -200,35 +203,6 @@ impl Daemon {
         cadence_agent::proto::unwrap(frame)
     }
 }
-
-/// [`Daemon::operator_rpc`]'s caller, as in tests/common/mod.rs: it
-/// waits until it has left the test runner's ancestry, then sends one
-/// frame and lands the reply line atomically.
-const OPERATOR_RPC_PY: &str = r#"
-import json, os, socket, sys, time
-
-sock_path, frame, out, runner = sys.argv[1:5]
-
-def on_lineage(pid):
-    p = os.getpid()
-    while p > 1:
-        if p == pid:
-            return True
-        with open("/proc/%d/status" % p) as f:
-            p = int([l for l in f if l.startswith("PPid:")][0].split()[1])
-    return False
-
-while on_lineage(int(runner)):
-    time.sleep(0.02)
-s = socket.socket(socket.AF_UNIX)
-s.connect(sock_path)
-s.sendall((frame + "\n").encode())
-line = s.makefile().readline()
-s.close()
-with open(out + ".tmp", "w") as f:
-    f.write(line)
-os.rename(out + ".tmp", out)
-"#;
 
 impl Drop for Daemon {
     /// Not the `shutdown` RPC, which the caller rule refuses this

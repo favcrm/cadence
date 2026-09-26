@@ -2351,7 +2351,7 @@ impl UiDaemon {
         }
         let script = self.state.join("operator-rpc.py");
         if !script.exists() {
-            std::fs::write(&script, OPERATOR_RPC_PY).unwrap();
+            std::fs::write(&script, op::rpc_script()).unwrap();
         }
         let out = self.state.join(format!(
             "operator-rpc-{}.json",
@@ -2405,76 +2405,16 @@ impl Drop for UiDaemon {
     }
 }
 
-/// [`UiDaemon::operator_rpc`]'s caller, as in tests/common/mod.rs: it
-/// waits until it has left the test runner's ancestry, then sends one
-/// frame and lands the reply line atomically.
-const OPERATOR_RPC_PY: &str = r#"
-import json, os, socket, sys, time
-
-sock_path, frame, out, runner = sys.argv[1:5]
-
-def on_lineage(pid):
-    p = os.getpid()
-    while p > 1:
-        if p == pid:
-            return True
-        with open("/proc/%d/status" % p) as f:
-            p = int([l for l in f if l.startswith("PPid:")][0].split()[1])
-    return False
-
-while on_lineage(int(runner)):
-    time.sleep(0.02)
-s = socket.socket(socket.AF_UNIX)
-s.connect(sock_path)
-s.sendall((frame + "\n").encode())
-line = s.makefile().readline()
-s.close()
-with open(out + ".tmp", "w") as f:
-    f.write(line)
-os.rename(out + ".tmp", out)
-"#;
-
-/// `OPERATOR_RPC_PY`'s sibling for process exec, as in
-/// tests/common/mod.rs: it waits until it has left the test runner's
-/// ancestry, then runs the argv and lands the result atomically — so a
-/// cli child presents as an operator shell outside every pane, not a
-/// process the daemon launched (CAD-467: `dispatch`'s lane-provenance
-/// send needs that proof).
-const OPERATOR_EXEC_PY: &str = r#"
-import json, os, subprocess, sys, time
-
-spec_path, out, runner = sys.argv[1:4]
-spec = json.load(open(spec_path))
-
-def on_lineage(pid):
-    p = os.getpid()
-    while p > 1:
-        if p == pid:
-            return True
-        with open("/proc/%d/status" % p) as f:
-            p = int([l for l in f if l.startswith("PPid:")][0].split()[1])
-    return False
-
-while on_lineage(int(runner)):
-    time.sleep(0.02)
-r = subprocess.run(spec["argv"], env=spec["env"], cwd=spec["cwd"],
-                   stdin=subprocess.DEVNULL, capture_output=True)
-open(out + ".stdout", "wb").write(r.stdout)
-open(out + ".stderr", "wb").write(r.stderr)
-with open(out + ".tmp", "w") as f:
-    json.dump({"rc": r.returncode}, f)
-os.rename(out + ".tmp", out)
-"#;
-
 /// `cli` detached so the daemon sees a provably-operator caller (the
 /// CAD-291/431 seam, `OperatorOutput::operator_output` in
 /// tests/common/mod.rs): `setsid -f` reparents it off this process's
-/// ancestry and the env carries no agent identity.
+/// ancestry and the env carries no agent identity. The runner script
+/// is the shared `op::exec_script()` (CAD-554).
 fn cli_op(pm: &Path, state: &Path, args: &[&str]) -> (bool, Value) {
     let dir = state.join(format!("opx-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&dir).unwrap();
     let (script, spec, out) = (dir.join("run.py"), dir.join("spec.json"), dir.join("out"));
-    std::fs::write(&script, OPERATOR_EXEC_PY).unwrap();
+    std::fs::write(&script, op::exec_script()).unwrap();
     let mut env: std::collections::BTreeMap<String, String> = std::env::vars()
         .filter(|(k, _)| k != "CADENCE_ALIAS" && k != "CADENCE_ROLLOUT_AS")
         .collect();

@@ -1310,7 +1310,7 @@ fn cli_verbs_reach_the_daemon() {
 
     // Operator path through the real CLI: enroll, grant, check.
     let script = d.state.join("op-cli.py");
-    std::fs::write(&script, op_cli_py()).unwrap();
+    std::fs::write(&script, op::cli_script_stdin_env()).unwrap();
     let op_cli = |args: &str, stdin_text: &str| -> (bool, String) {
         let out_file = d
             .state
@@ -1375,34 +1375,4 @@ fn cli_verbs_reach_the_daemon() {
     assert_ne!(rc, 0);
     assert!(out.contains("admin:all"), "missing scope not named: {out}");
     assert!(!out.contains(TOKEN));
-}
-
-/// `tests/common/mod.rs`'s OPERATOR_CLI_PY, extended to feed one env
-/// var to the child's stdin — `--token-stdin` reads it there.
-fn op_cli_py() -> String {
-    r#"
-import json, os, subprocess, sys, time
-
-out, runner = sys.argv[1:3]
-argv = sys.argv[3:]
-
-def on_lineage(pid):
-    p = os.getpid()
-    while p > 1:
-        if p == pid:
-            return True
-        with open("/proc/%d/status" % p) as f:
-            p = int([l for l in f if l.startswith("PPid:")][0].split()[1])
-    return False
-
-while on_lineage(int(runner)):
-    time.sleep(0.02)
-r = subprocess.run(argv, input=os.environ.get("TOKEN_STDIN", "").encode(),
-                   capture_output=True)
-with open(out + ".tmp", "w") as f:
-    json.dump({"rc": r.returncode, "stdout": r.stdout.decode(errors="replace"),
-               "stderr": r.stderr.decode(errors="replace")}, f)
-os.rename(out + ".tmp", out)
-"#
-    .to_string()
 }

@@ -19,59 +19,158 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-/// Runs argv off `runner`'s ancestry and lands `{rc, stdout, stderr}`.
-const OPERATOR_CLI_PY: &str = r#"
-import json, os, subprocess, sys, time
-
-out, runner = sys.argv[1:3]
-argv = sys.argv[3:]
-
-def on_lineage(pid):
+/// The wait every operator-shaped script runs before it acts:
+/// `on_lineage(pid)` is true while this process can still prove it
+/// descends from `pid` by walking /proc PPid links up from itself. A
+/// hop can vanish mid-walk — the `setsid -f` detach's intermediates
+/// exit fast and the kernel reparents only once they do — and an
+/// incomplete chain proves neither tied nor detached: a vanished hop
+/// is "not yet proven", so the walk keeps polling instead of raising
+/// (CAD-545's rule; one shared copy here, CAD-554).
+pub const LINEAGE_WAIT_PY: &str = r#"def on_lineage(pid):
     p = os.getpid()
     while p > 1:
         if p == pid:
             return True
-        with open("/proc/%d/status" % p) as f:
-            p = int([l for l in f if l.startswith("PPid:")][0].split()[1])
-    return False
-
-while on_lineage(int(runner)):
-    time.sleep(0.02)
-r = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True)
-with open(out + ".tmp", "w") as f:
-    json.dump({"rc": r.returncode, "stdout": r.stdout.decode(errors="replace"),
-               "stderr": r.stderr.decode(errors="replace")}, f)
-os.rename(out + ".tmp", out)
-"#;
-
-/// Sends one frame on the daemon socket off `runner`'s ancestry and
-/// lands the raw response line.
-const OPERATOR_RPC_PY: &str = r#"
-import os, socket, sys, time
-
-sock_path, frame_path, out, runner = sys.argv[1:5]
-frame = open(frame_path).read()
-
-def on_lineage(pid):
-    p = os.getpid()
-    while p > 1:
-        if p == pid:
+        # A hop can vanish mid-walk — the detach's intermediates exit
+        # fast and the kernel reparents only once they do. An incomplete
+        # chain proves neither tied nor detached: keep waiting, never die.
+        try:
+            with open("/proc/%d/status" % p) as f:
+                p = int([l for l in f if l.startswith("PPid:")][0].split()[1])
+        except (OSError, IndexError):
             return True
-        with open("/proc/%d/status" % p) as f:
-            p = int([l for l in f if l.startswith("PPid:")][0].split()[1])
     return False
 
 while on_lineage(int(runner)):
-    time.sleep(0.02)
-s = socket.socket(socket.AF_UNIX)
+    time.sleep(0.02)"#;
+
+/// `head` (imports and argv parsing), the shared lineage wait, `tail`
+/// (the action): the shape every operator-shaped script is built from,
+/// so the vanished-hop guard above lives in exactly one place. Splicing
+/// rather than one `format!` over the whole script keeps each script's
+/// own braces untouched.
+pub fn lineage_script(head: &str, tail: &str) -> String {
+    format!("{head}\n{LINEAGE_WAIT_PY}\n{tail}")
+}
+
+/// `TestDaemon::operator_rpc`'s caller (tests/common/mod.rs), also
+/// used by tests/board.rs and tests/board_read_model.rs: one raw RPC
+/// frame on argv, sent from a caller off `runner`'s ancestry, the
+/// response line landed at `out` atomically. The frame rides argv —
+/// callers that must keep a value out of `ps` use
+/// [`rpc_script_from_file`].
+pub fn rpc_script() -> String {
+    lineage_script(
+        r#"import json, os, socket, sys, time
+
+sock_path, frame, out, runner = sys.argv[1:5]"#,
+        r#"s = socket.socket(socket.AF_UNIX)
 s.connect(sock_path)
 s.sendall((frame + "\n").encode())
 line = s.makefile().readline()
 s.close()
 with open(out + ".tmp", "w") as f:
     f.write(line)
-os.rename(out + ".tmp", out)
-"#;
+os.rename(out + ".tmp", out)"#,
+    )
+}
+
+/// [`operator_rpc`]'s caller: one raw RPC frame read from a private
+/// file — never argv or the environment — sent from a caller off
+/// `runner`'s ancestry; the response line lands at `out`.
+pub fn rpc_script_from_file() -> String {
+    lineage_script(
+        r#"import os, socket, sys, time
+
+sock_path, frame_path, out, runner = sys.argv[1:5]
+frame = open(frame_path).read()"#,
+        r#"s = socket.socket(socket.AF_UNIX)
+s.connect(sock_path)
+s.sendall((frame + "\n").encode())
+line = s.makefile().readline()
+s.close()
+with open(out + ".tmp", "w") as f:
+    f.write(line)
+os.rename(out + ".tmp", out)"#,
+    )
+}
+
+/// argv run as the operator's own shell, off `runner`'s ancestry, with
+/// empty stdin; `{rc, stdout, stderr}` landed at `out`.
+pub fn cli_script() -> String {
+    lineage_script(
+        r#"import json, os, subprocess, sys, time
+
+out, runner = sys.argv[1:3]
+argv = sys.argv[3:]"#,
+        r#"r = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True)
+with open(out + ".tmp", "w") as f:
+    json.dump({"rc": r.returncode, "stdout": r.stdout.decode(errors="replace"),
+               "stderr": r.stderr.decode(errors="replace")}, f)
+os.rename(out + ".tmp", out)"#,
+    )
+}
+
+/// [`cli_script`] extended to feed one env var to the child's stdin —
+/// `--token-stdin` reads it there (tests/platform.rs), keeping the
+/// value off argv and out of the output.
+pub fn cli_script_stdin_env() -> String {
+    lineage_script(
+        r#"import json, os, subprocess, sys, time
+
+out, runner = sys.argv[1:3]
+argv = sys.argv[3:]"#,
+        r#"r = subprocess.run(argv, input=os.environ.get("TOKEN_STDIN", "").encode(),
+                   capture_output=True)
+with open(out + ".tmp", "w") as f:
+    json.dump({"rc": r.returncode, "stdout": r.stdout.decode(errors="replace"),
+               "stderr": r.stderr.decode(errors="replace")}, f)
+os.rename(out + ".tmp", out)"#,
+    )
+}
+
+/// A spec'd command run as an operator shell outside every agent and
+/// outside the (in-process) daemon's tree: `{argv, env, cwd}` from
+/// `spec_path`, then `<out>.stdout`, `<out>.stderr` and `<out>`
+/// (`{"rc"}`) landed.
+pub fn exec_script() -> String {
+    lineage_script(
+        r#"import json, os, subprocess, sys, time
+
+spec_path, out, runner = sys.argv[1:4]
+spec = json.load(open(spec_path))"#,
+        r#"r = subprocess.run(spec["argv"], env=spec["env"], cwd=spec["cwd"],
+                   stdin=subprocess.DEVNULL, capture_output=True)
+open(out + ".stdout", "wb").write(r.stdout)
+open(out + ".stderr", "wb").write(r.stderr)
+with open(out + ".tmp", "w") as f:
+    json.dump({"rc": r.returncode}, f)
+os.rename(out + ".tmp", out)"#,
+    )
+}
+
+/// One HTTP request read from a file, sent from a caller off
+/// `runner`'s ancestry; the raw reply lands at `out_path`
+/// (tests/local_outbox.rs).
+pub fn http_script() -> String {
+    lineage_script(
+        r#"import os, socket, sys, time
+
+req_path, out_path, port, runner = sys.argv[1:5]"#,
+        r#"s = socket.create_connection(("127.0.0.1", int(port)))
+s.sendall(open(req_path, "rb").read())
+data = b""
+while True:
+    chunk = s.recv(65536)
+    if not chunk:
+        break
+    data += chunk
+with open(out_path + ".tmp", "wb") as f:
+    f.write(data)
+os.rename(out_path + ".tmp", out_path)"#,
+    )
+}
 
 /// The assertion headers an armed fixture board honors for caller
 /// `who` (`operator`, `agent:<alias>`, `unproven`), or "" when the seam
@@ -127,7 +226,7 @@ pub fn operator_rpc(socket: &Path, method: &str, params: Value) -> Value {
         .tempdir_in("/tmp")
         .unwrap();
     let script = dir.path().join("rpc.py");
-    std::fs::write(&script, OPERATOR_RPC_PY).unwrap();
+    std::fs::write(&script, rpc_script_from_file()).unwrap();
     let out = dir.path().join("out.json");
     let frame = dir.path().join("frame.json");
     {
@@ -225,7 +324,7 @@ pub fn cli_as(
         );
     }
     let script = dir.path().join("op.py");
-    std::fs::write(&script, OPERATOR_CLI_PY).unwrap();
+    std::fs::write(&script, cli_script()).unwrap();
     let out = dir.path().join("out.json");
     let status = Command::new("setsid")
         .arg("-f")
