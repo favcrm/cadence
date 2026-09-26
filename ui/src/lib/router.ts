@@ -62,8 +62,9 @@ export const NAV: { screen: Screen; label: string; route: Route }[] = [
 ];
 
 /**
- * Where a project lives on a screen. The sidebar, the phone menu and the
- * in-page filter all read this — there is no second list.
+ * Where a project lives on a screen. The in-page chip row and the memory
+ * picker read this. The sidebar and the phone menu do not: their highlight
+ * is `route.screen === "projects"` (`navProject` in App.tsx).
  *
  * - `slug` — the project page (`/projects/:slug`). A sidebar project opens it.
  * - `chips` — an in-page chip row, stored as `?project=` (Agents, Team
