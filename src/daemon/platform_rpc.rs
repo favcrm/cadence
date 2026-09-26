@@ -445,14 +445,19 @@ impl Shared {
                         })?
                     }
                 };
-                self.store
-                    .platform_default(&project, &platform)?
-                    .ok_or_else(|| {
-                        Error::rejected(format!(
+                match self.store.platform_default(&project, &platform)? {
+                    Some(d) => d.account,
+                    // The built-in account is always available (CAD-577).
+                    None if platform::is_builtin(
+                        &platform,
+                        platform::BUILTIN_LOCAL_ACCOUNT,
+                    ) => platform::BUILTIN_LOCAL_ACCOUNT.to_string(),
+                    None => {
+                        return Err(Error::rejected(format!(
                             "project '{project}' names no default account for '{platform}'"
-                        ))
-                    })?
-                    .account
+                        )))
+                    }
+                }
             }
         };
         // §5.3: a refusal names the missing scope and happens before
@@ -463,14 +468,26 @@ impl Shared {
 
     /// `platform_accounts` — the enrolled handles (§5.3's record:
     /// platform, account, scopes, fingerprint, enrolled_at, by), open
-    /// to every socket reader.
+    /// to every socket reader. The built-in `local/local` account is
+    /// always listed (CAD-577) — no enrollment, `custody: "built-in"`,
+    /// so `platform accounts` shows it beside the real ones.
     pub(super) fn rpc_platform_accounts(&self, _params: &Value) -> Result<Value> {
-        let accounts = self
-            .store
-            .platform_credentials()?
-            .iter()
-            .map(CredentialRecord::to_json)
-            .collect::<Vec<_>>();
+        let mut accounts = vec![json!({
+            "platform": crate::platform::local::PLATFORM,
+            "account": crate::platform::BUILTIN_LOCAL_ACCOUNT,
+            "scopes": ["publish"],
+            "fingerprint": Value::Null,
+            "custody": "built-in",
+            "exchange": "built-in",
+            "enrolled_at": Value::Null,
+            "by": "built-in",
+        })];
+        accounts.extend(
+            self.store
+                .platform_credentials()?
+                .iter()
+                .map(CredentialRecord::to_json),
+        );
         Ok(json!({"accounts": accounts}))
     }
 

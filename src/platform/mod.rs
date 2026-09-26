@@ -20,6 +20,20 @@ use crate::store::{Grant, Store};
 
 pub use custody::{Custody, Key};
 
+/// The built-in account the `local` platform always exposes — no
+/// enrollment, no custody, no `--accept-same-uid-risk` (CAD-577). The
+/// local outbox is always available, so a fresh app install is runnable
+/// from the board with no CLI setup.
+pub const BUILTIN_LOCAL_ACCOUNT: &str = "local";
+
+/// Is `(platform, account)` a built-in account that needs no
+/// enrollment? Today only `local/local` (CAD-577): the gate treats it
+/// as always connected, with no credential bytes to load. Every real
+/// platform's custody and enrollment rules are unchanged.
+pub fn is_builtin(platform: &str, account: &str) -> bool {
+    platform == local::PLATFORM && account == BUILTIN_LOCAL_ACCOUNT
+}
+
 /// What `platform enroll` produces for one exchange — the credential
 /// bytes plus the scope set the enrollment records. Callers (the RPC
 /// layer) never see `bytes` after this.
@@ -220,18 +234,20 @@ pub fn require_grant(
         ))),
         None => {
             let enrolled = store.platform_credential(platform, account)?.is_some();
-            Err(Error::rejected(if enrolled {
-                format!(
-                    "'{agent}' holds no grant on {platform}/{account} — scope \
-                     '{scope}' is not granted; the operator grants with \
-                     `cadence platform grant`"
-                )
-            } else {
-                format!(
-                    "no credential is enrolled for {platform}/{account} — the \
-                     operator enrolls with `cadence platform enroll`, then grants"
-                )
-            }))
+            Err(Error::rejected(
+                if enrolled || is_builtin(platform, account) {
+                    format!(
+                        "'{agent}' holds no grant on {platform}/{account} — scope \
+                         '{scope}' is not granted; the operator grants with \
+                         `cadence platform grant`"
+                    )
+                } else {
+                    format!(
+                        "no credential is enrolled for {platform}/{account} — the \
+                         operator enrolls with `cadence platform enroll`, then grants"
+                    )
+                },
+            ))
         }
     }
 }
@@ -248,6 +264,12 @@ pub fn load_credential(
     platform: &str,
     account: &str,
 ) -> Result<Vec<u8>> {
+    // The built-in account holds no bytes — there is nothing to load
+    // and nothing to leak (CAD-577). The gate still runs its grant
+    // check before this is ever reached.
+    if is_builtin(platform, account) {
+        return Ok(Vec::new());
+    }
     let record = store
         .platform_credential(platform, account)?
         .ok_or_else(|| {

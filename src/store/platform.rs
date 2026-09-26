@@ -460,7 +460,9 @@ impl Store {
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         // The credential must exist — a grant on nothing is a latent
-        // privilege the next enroll would silently arm.
+        // privilege the next enroll would silently arm. The built-in
+        // `local/local` account is the exception (CAD-577): it is always
+        // available with no enrollment, so a grant on it is recordable.
         let enrolled: Option<i64> = tx
             .query_row(
                 "SELECT 1 FROM platform_credentials WHERE platform=?1 AND account=?2",
@@ -468,7 +470,7 @@ impl Store {
                 |r| r.get(0),
             )
             .optional()?;
-        if enrolled.is_none() {
+        if enrolled.is_none() && !crate::platform::is_builtin(platform, account) {
             return Err(Error::rejected(format!(
                 "platform '{platform}' account '{account}' is not enrolled — \
                  `platform enroll` first"
