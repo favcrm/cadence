@@ -131,14 +131,29 @@ pi:
   package dir joins the confined master's read set, read-only. A
   missing package, a drifted version or an entry escaping the package
   dir refuses the launch.
+- A pin may carry a **content digest** — `name@version#sha256-<64
+  lowercase hex>` (CAD-572). Every launch then hashes the installed
+  package's own files and refuses on any mismatch, so a hand-edited
+  file that leaves `version` alone (the 2026-09-26 `pi-devin` ide
+  patch is the case) no longer passes as the published tarball. The
+  digest covers every file under the package dir — dotfiles included,
+  symlinks by their target string, never followed — and **excludes
+  `node_modules/`**: the pin covers the package's own files, not its
+  dependency tree. To record a digest: pin the package with
+  `#sha256-` followed by 64 zeros, let one launch refuse, and copy the
+  `installed sha256-…` value the refusal prints into `pm.yaml`. A
+  deliberate local patch (a vendored fix) is then pinned by
+  re-recording the digest after the edit — the pin records *which*
+  bytes are trusted, not that they equal the registry's.
 
 To add a model: append the spec under `models.allow` (`provider/id` or
 a bare id — whatever `pi --model` accepts), then pick it via
 `--model`, `agent set`, or the role default. To add or bump a provider
 package: `pi install <name>@<version>` as the operator first, then pin
-the identical `name@version` — a silent `npm update` drifts the
-install away from the pin and refuses the next launch instead of
-loading an unvetted build.
+the identical `name@version` (plus the content digest when the package
+is trusted by bytes) — a silent `npm update` drifts the install away
+from the pin and refuses the next launch instead of loading an
+unvetted build.
 
 ### Which models to use
 
