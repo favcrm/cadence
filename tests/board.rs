@@ -9245,8 +9245,20 @@ fn spawn_ui(pm: &Path, state: &Path) -> (u16, UiProc) {
 }
 
 /// `spawn_ui` with `env` set on the server after the sanitizing.
-#[allow(clippy::zombie_processes)] // UiProc's Drop kills + waits.
 fn spawn_ui_env(pm: &Path, state: &Path, env: &[(&str, &str)]) -> (u16, UiProc) {
+    spawn_ui_seam(pm, state, env, true)
+}
+
+/// `ui run` with the seam envs stripped — an unarmed board even on a
+/// `test-seam` build, for the test that proves assertion headers are
+/// refused outright when no fixture credential exists.
+#[cfg(feature = "test-seam")]
+fn spawn_ui_unarmed(pm: &Path, state: &Path) -> (u16, UiProc) {
+    spawn_ui_seam(pm, state, &[], false)
+}
+
+#[allow(clippy::zombie_processes)] // UiProc's Drop kills + waits.
+fn spawn_ui_seam(pm: &Path, state: &Path, env: &[(&str, &str)], arm: bool) -> (u16, UiProc) {
     let port = free_port();
     let mut cmd = Command::new(bin());
     cmd.arg("--state-dir")
@@ -9272,10 +9284,14 @@ fn spawn_ui_env(pm: &Path, state: &Path, env: &[(&str, &str)]) -> (u16, UiProc) 
     // the seam — it honors assertion headers — and runs as the operator's
     // process on unasserted daemon calls, as `start_operator_ui` does.
     // A caller's `env` overrides either default (e.g. an agent-shaped
-    // board carries its own CADENCE_TEST_AS).
-    if cfg!(feature = "test-seam") {
+    // board carries its own CADENCE_TEST_AS). `arm: false` spawns the
+    // unarmed shape: no env can leak an attach.
+    if arm && cfg!(feature = "test-seam") {
         cmd.env(cadence_agent::test_seam::ARM_ENV, "1")
             .env(cadence_agent::test_seam::AS_ENV, "operator");
+    } else {
+        cmd.env_remove(cadence_agent::test_seam::ARM_ENV)
+            .env_remove(cadence_agent::test_seam::AS_ENV);
     }
     cmd.envs(env.iter().copied());
     let child = cmd.spawn().unwrap();
@@ -9295,6 +9311,76 @@ fn spawn_ui_env(pm: &Path, state: &Path, env: &[(&str, &str)]) -> (u16, UiProc) 
         assert!(Instant::now() < deadline, "ui subprocess did not start");
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+// ---- CAD-482: the board's assertion headers bind the fixture credential ----
+
+/// The board-path twin of `forged_token_and_half_assertions_are_refused`
+/// in tests/test_seam.rs: `scope_headers` (src/test_seam.rs) is the only
+/// check that `X-Cadence-Test-As` needs the fixture's minted token, so
+/// each refusal is exercised on the wire — an As header alone, a token
+/// alone, a wrong token — each must 403, never fall back to ambient.
+#[cfg(feature = "test-seam")]
+#[test]
+fn seam_board_headers_require_the_fixture_token() {
+    let (_t, pm, state, _repo) = start_fx();
+    let _d = UiDaemon::start_on(state.clone()); // armed: mints the token
+    let (port, _ui) = spawn_ui(&pm, &state); // armed board
+    let host = format!("127.0.0.1:{port}");
+    let get = |headers: &[&str]| http_write(port, "GET", "/api/health", &host, headers, b"");
+
+    // `X-Cadence-Test-As` alone — a half assertion.
+    let (status, _, body) = get(&["X-Cadence-Test-As: operator"]);
+    assert_eq!(status, 403, "{body}");
+    assert!(body.contains("travel together"), "{body}");
+
+    // `X-Cadence-Test-Token` alone — the other half.
+    let (status, _, body) = get(&["X-Cadence-Test-Token: some-token"]);
+    assert_eq!(status, 403, "{body}");
+    assert!(body.contains("travel together"), "{body}");
+
+    // Both halves present, but the token is not the fixture's.
+    let (status, _, body) = get(&[
+        "X-Cadence-Test-As: operator",
+        "X-Cadence-Test-Token: not-the-fixtures-token",
+    ]);
+    assert_eq!(status, 403, "{body}");
+    assert!(body.contains("seam token"), "{body}");
+
+    // And the real pair is honored — the refusals above came from the
+    // credential check, not from the headers merely being present.
+    let token = cadence_agent::test_seam::Seam::token_at(&state).unwrap();
+    let as_h = "X-Cadence-Test-As: operator".to_string();
+    let tok_h = format!("X-Cadence-Test-Token: {token}");
+    let (status, _, body) = get(&[&as_h, &tok_h]);
+    assert_eq!(status, 200, "a correctly-bound assertion must pass: {body}");
+}
+
+/// Headers sent to a board that never armed — `ui run` without the
+/// seam envs on a state dir carrying no minted token — refuse
+/// outright: an assertion cannot smuggle onto a board that did not
+/// opt in.
+#[cfg(feature = "test-seam")]
+#[test]
+fn unarmed_board_refuses_assertion_headers() {
+    let (_t, pm, state, _repo) = start_fx();
+    // No daemon, so no minted token: the board cannot attach even if it
+    // tried (`ui run` re-attaches on the token's presence alone).
+    let (port, _ui) = spawn_ui_unarmed(&pm, &state);
+    let host = format!("127.0.0.1:{port}");
+    let (status, _, body) = http_write(
+        port,
+        "GET",
+        "/api/health",
+        &host,
+        &[
+            "X-Cadence-Test-As: operator",
+            "X-Cadence-Test-Token: anything",
+        ],
+        b"",
+    );
+    assert_eq!(status, 403, "{body}");
+    assert!(body.contains("test seam armed"), "{body}");
 }
 
 /// The board as an operator runs it, however the suite is run: a

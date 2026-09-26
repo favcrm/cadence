@@ -18,6 +18,9 @@
 mod common;
 use common::*;
 
+#[path = "support/operator.rs"]
+mod op;
+
 use cadence_agent::{client, daemon};
 use serde_json::json;
 use serde_json::Value;
@@ -323,6 +326,65 @@ fn arming_refuses_state_outside_the_temp_root() {
     .expect_err("the seam must refuse a state dir outside the temp root");
     assert!(err.to_string().contains("temp root"), "{err}");
     let _ = std::fs::remove_dir_all(&outside);
+}
+
+/// N2 (rev-312): a misspelled `CADENCE_TEST_AS` on a spawned caller
+/// must refuse the way a forged wire frame does — never fall through
+/// to ambient, where the same process in CI would run as the operator.
+#[cfg(feature = "test-seam")]
+#[test]
+fn unparseable_as_env_refuses_the_call_loudly() {
+    let d = TestDaemon::start();
+    let (ok, _out, err) = op::cli_as(
+        env!("CARGO_BIN_EXE_cadence"),
+        &d.state,
+        &["agent", "list"],
+        &[],
+        "operatr", // a typo of 'operator'
+    );
+    assert!(!ok, "an unparseable CADENCE_TEST_AS must fail the call");
+    assert!(
+        err.contains("not an identity") || err.contains("CADENCE_TEST_AS"),
+        "the refusal should name the bad assertion, got: {err}"
+    );
+}
+
+/// N1 (rev-312): the production refusal is bound to the real uid's
+/// passwd home, not to HOME/XDG/TMPDIR — a doctored environment cannot
+/// rename the dir the seam must never arm. The refusal runs before
+/// `create_dir_all`, so nothing is written there.
+#[cfg(feature = "test-seam")]
+#[test]
+fn arming_refuses_the_real_production_state_dir() {
+    let Some(home) = real_passwd_home() else {
+        // No passwd entry for this uid — the bound has nothing to
+        // resolve against; the env-derived checks still stand.
+        return;
+    };
+    let prod = home.join(".local/state/cadence");
+    let err = cadence_agent::test_seam::arm_if_requested(&prod, true)
+        .map(|_| ())
+        .expect_err("the seam must refuse the real production state dir");
+    assert!(
+        err.to_string().contains("production state dir"),
+        "the refusal should name the production dir, got: {err}"
+    );
+}
+
+/// The uid's home directory from its passwd entry — never $HOME, which
+/// a caller controls.
+#[cfg(all(feature = "test-seam", unix))]
+fn real_passwd_home() -> Option<std::path::PathBuf> {
+    // SAFETY: getuid/getpwuid need no setup; pw_dir is borrowed, never
+    // freed.
+    unsafe {
+        let pw = libc::getpwuid(libc::getuid());
+        if pw.is_null() || (*pw).pw_dir.is_null() {
+            return None;
+        }
+        let dir = std::ffi::CStr::from_ptr((*pw).pw_dir).to_string_lossy();
+        (!dir.is_empty()).then(|| std::path::PathBuf::from(dir.into_owned()))
+    }
 }
 
 /// A spawn-time env request on a build without the feature must never
