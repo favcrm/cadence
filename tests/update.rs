@@ -1010,6 +1010,49 @@ fn the_progress_log_refuses_a_planted_symlink_fifo_or_file() {
     }
 }
 
+#[test]
+fn the_state_files_refuse_a_planted_hardlink_and_leave_its_target_alone() {
+    // A hardlink gives one inode two names: truncating the state file
+    // through this name cuts what the other name reads. `open_private`
+    // must check before it shortens anything — `O_TRUNC` at open emptied
+    // the target before the refusal could fire (CAD-561 r4).
+    for (name, path_fn) in [
+        ("update.lock", update::lock_file as fn(&Path) -> PathBuf),
+        ("update.json", update::update_file as fn(&Path) -> PathBuf),
+        ("update-progress.jsonl", update::progress_file as _),
+    ] {
+        let host = Host::new();
+        let path = path_fn(&host.state_dir);
+        let target = host._root.path().join(format!("{name}-target"));
+        fs::write(&target, "precious").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::hard_link(&target, &path).unwrap();
+        for append in [false, true] {
+            for truncate in [false, true] {
+                let err = update::open_private(&path, append, truncate)
+                    .err()
+                    .expect("a hardlinked state file must be refused")
+                    .to_string();
+                assert_refused(&err, name, "hardlink");
+                assert_eq!(
+                    fs::read_to_string(&target).unwrap(),
+                    "precious",
+                    "{name} (append={append} truncate={truncate}) shortened the shared file"
+                );
+            }
+        }
+        // A run refuses at the same file, before the lease. The
+        // progress log is only opened when the run was asked for one.
+        if name == "update-progress.jsonl" {
+            host.progress_log.replace(Some(path.clone()));
+        }
+        let err = run(&host, &host.options()).unwrap_err().to_string();
+        assert_refused(&err, name, "hardlink");
+        assert_eq!(host.lease_row()["held"], serde_json::json!(false));
+        assert!(host.restarts.borrow().is_empty());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // health check and auto-rollback
 // ---------------------------------------------------------------------------

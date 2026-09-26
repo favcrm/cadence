@@ -125,12 +125,17 @@ pub fn progress_file(state_dir: &Path) -> PathBuf {
 /// and no group/other access (a pre-planted file keeps its mode —
 /// `mode(0o600)` applies only at creation). The lock, the marker and
 /// the progress log all go through here.
+///
+/// `truncate` shortens the file only after every check has passed —
+/// never `O_TRUNC` at open, which cut the target through a planted
+/// hardlink before the refusal could fire (CAD-561 r4). A file with a
+/// second name (`nlink > 1`) is refused outright: whatever shares the
+/// inode must not be shortened or written through this path.
 pub fn open_private(path: &Path, append: bool, truncate: bool) -> Result<std::fs::File> {
     let file = OpenOptions::new()
         .create(true)
         .write(true)
         .append(append)
-        .truncate(truncate)
         .mode(0o600)
         // O_NONBLOCK keeps a planted FIFO from blocking the open (it
         // fails ENXIO with no reader, and the checks below refuse it
@@ -166,6 +171,17 @@ pub fn open_private(path: &Path, append: bool, truncate: bool) -> Result<std::fs
             path.display(),
             meta.mode() & 0o777
         )));
+    }
+    if meta.nlink() != 1 {
+        return Err(Error::rejected(format!(
+            "{} has {} names — a shared file is not a private state file; refusing to \
+             write it",
+            path.display(),
+            meta.nlink()
+        )));
+    }
+    if truncate {
+        file.set_len(0)?;
     }
     Ok(file)
 }
