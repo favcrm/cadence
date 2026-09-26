@@ -18,9 +18,6 @@
 mod common;
 use common::*;
 
-#[path = "support/operator.rs"]
-mod op;
-
 use cadence_agent::{client, daemon};
 use serde_json::json;
 use serde_json::Value;
