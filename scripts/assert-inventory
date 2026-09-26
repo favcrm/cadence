@@ -56,7 +56,9 @@ def mask_src(text: str) -> str:
             m = BRSTR_RE.match(text, i)
             hashes = m.group(1)
             endmark = '"' + hashes
-            j = text.find(endmark, i + 2 + len(hashes))
+            # the endmark search starts past the opening quote — `br#"#…`
+            # would otherwise close on its own `"`
+            j = text.find(endmark, i + 3 + len(hashes))
             j = n if j < 0 else j + len(endmark)
             out.append(" " * (j - i))
             i = j
@@ -66,7 +68,8 @@ def mask_src(text: str) -> str:
             if m:
                 hashes = m.group(1)
                 endmark = '"' + hashes
-                j = text.find(endmark, i + 1 + len(hashes))
+                # past the opening quote, else `r#"#…` closes instantly
+                j = text.find(endmark, i + 2 + len(hashes))
                 j = n if j < 0 else j + len(endmark)
                 out.append(" " * (j - i))
                 i = j
