@@ -406,6 +406,146 @@ fn traversal_is_refused_everywhere() {
         let err = refused(d.operator_rpc("wiki_mv", json!({"from": from, "to": to})));
         assert!(err.contains("refused"), "mv {from}→{to}: {err}");
     }
+
+    // rev-298 F2 — load-bearing '..': the segment sits AFTER a root
+    // the ACL accepts, so only normalize's '..' guard refuses it.
+    // Without the guard each lands OUTSIDE its addressed prefix.
+    for (bad, escaped) in [
+        (
+            "agents/w1/knowledge/../../projects/other/x",
+            "agents/projects/other/x",
+        ),
+        ("agents/w1/knowledge/../../global/x", "agents/global/x"),
+        ("global/../users/fable/x", "users/fable/x"),
+    ] {
+        for (method, params) in [
+            ("wiki_read", json!({"path": bad})),
+            ("wiki_write", json!({"path": bad, "text": "x"})),
+            ("wiki_mkdir", json!({"path": bad})),
+            ("wiki_rm", json!({"path": bad})),
+        ] {
+            let err = refused(d.operator_rpc(method, params));
+            assert!(err.contains("refused"), "{method} '{bad}': {err}");
+        }
+        assert!(
+            !vault(&fx).join(escaped).exists(),
+            "'{bad}' escaped its prefix into '{escaped}'"
+        );
+    }
+    // 'global/../../x' resolves above the vault — into the tracker.
+    for method in ["wiki_read", "wiki_write", "wiki_mkdir", "wiki_rm"] {
+        let params = if method == "wiki_write" {
+            json!({"path": "global/../../x", "text": "x"})
+        } else {
+            json!({"path": "global/../../x"})
+        };
+        let err = refused(d.operator_rpc(method, params));
+        assert!(err.contains("refused"), "{method} 'global/../../x': {err}");
+    }
+    assert!(
+        !fx.pm.join("x").exists(),
+        "'global/../../x' escaped the vault into the tracker"
+    );
+    // The CLI rides the same daemon gate — it cannot widen it.
+    for bad in ["agents/w1/knowledge/../../global/x", "global/../../x"] {
+        let (ok, out, err) = d.operator_cadence(&["wiki", "put", bad, "-m", "x"]);
+        let all = format!("{out} {err}");
+        assert!(!ok && all.contains("refused"), "cli put '{bad}': {all}");
+        let (ok, out, err) = d.operator_cadence(&["wiki", "cat", bad]);
+        let all = format!("{out} {err}");
+        assert!(!ok && all.contains("refused"), "cli cat '{bad}': {all}");
+    }
+    assert!(!fx.pm.join("x").exists(), "cli write escaped the vault");
+}
+
+#[test]
+fn refused_upload_never_deletes_a_shared_blob() {
+    let fx = fx();
+    let d = &fx.d;
+    let uploads = d.state.join("wiki-uploads");
+    std::fs::create_dir_all(&uploads).unwrap();
+    let stage = |name: &str, bytes: &[u8]| {
+        let tmp = uploads.join(name);
+        std::fs::write(&tmp, bytes).unwrap();
+        tmp
+    };
+    let bytes: &[u8] = &[0x89, b'P', b'N', b'G', 9, 9, 9];
+    let out = d
+        .operator_rpc(
+            "wiki_put_blob",
+            json!({"path": "global/shared.png", "tmp": stage("a.png", bytes)}),
+        )
+        .unwrap();
+    let sha = out["sha256"].as_str().unwrap().to_string();
+    let blobs = cadence_agent::wiki::blobs_dir(&vault(&fx));
+    let blob = blobs.join(&sha);
+    assert!(blob.exists(), "blob landed: {}", blob.display());
+
+    // A text page occupies the colliding name; the refused upload
+    // carries identical bytes, so its deduped dest was already a
+    // live page's content.
+    write_op(d, "global/clash.md", "mine");
+    let err = refused(d.operator_rpc(
+        "wiki_put_blob",
+        json!({"path": "global/clash.md", "tmp": stage("b.png", bytes)}),
+    ));
+    assert!(err.contains("text page exists"), "{err}");
+    // rev-298 F3: the shared blob is the first page's — still there.
+    let page = read_op(d, "global/shared.png");
+    assert_eq!(page["kind"], "blob");
+    assert_eq!(
+        std::fs::read(&blob).unwrap(),
+        bytes,
+        "a refused upload deleted another page's blob"
+    );
+
+    // if_rev guards the pointer write — a stale token conflicts,
+    // never overwrites, and never touches a deduped blob.
+    let out = d
+        .operator_rpc(
+            "wiki_put_blob",
+            json!({"path": "global/shared.png",
+                   "tmp": stage("c.png", bytes),
+                   "if_rev": "fnv1a:deadbeefdeadbeef"}),
+        )
+        .unwrap();
+    assert_eq!(out["conflict"], "if_rev", "{out}");
+    assert!(blob.exists(), "a conflicted upload left the shared blob");
+    // Create-only ("none") conflicts on an existing pointer.
+    let out = d
+        .operator_rpc(
+            "wiki_put_blob",
+            json!({"path": "global/shared.png",
+                   "tmp": stage("d.png", bytes),
+                   "if_rev": "none"}),
+        )
+        .unwrap();
+    assert_eq!(out["conflict"], "if_rev", "{out}");
+    // And a conflicted upload that DID create its blob removes it —
+    // .blobs carries no orphan from the refused write.
+    let names = |dir: &std::path::Path| {
+        let mut v: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        v.sort();
+        v
+    };
+    let before = names(&blobs);
+    let out = d
+        .operator_rpc(
+            "wiki_put_blob",
+            json!({"path": "global/orphan.png",
+                   "tmp": stage("e.png", &[7u8; 64]),
+                   "if_rev": "fnv1a:deadbeefdeadbeef"}),
+        )
+        .unwrap();
+    assert_eq!(out["conflict"], "if_rev", "{out}");
+    assert_eq!(
+        names(&blobs),
+        before,
+        "a refused upload left its created blob behind"
+    );
 }
 
 #[test]
@@ -565,6 +705,41 @@ fn agent_writes_own_areas_only() {
             json!({"path": "projects/cadence/design.md"})
         )
         .is_ok());
+}
+
+#[cfg(feature = "test-seam")]
+#[test]
+fn agent_traversal_after_a_valid_root_is_refused() {
+    let fx = fx();
+    let d = &fx.d;
+    d.register_pc("w1", "fake", "fake", fx.repo.to_str().unwrap())
+        .unwrap();
+
+    // rev-298 F2 — '..' AFTER a valid root: the ACL sees
+    // agents/w1/knowledge and allows w1; only normalize's '..'
+    // segment guard keeps the write from landing outside knowledge/.
+    for bad in [
+        "agents/w1/knowledge/../../projects/other/x",
+        "agents/w1/knowledge/../../global/x",
+    ] {
+        let err = refused(d.agent_rpc("w1", "wiki_write", json!({"path": bad, "text": "x"})));
+        assert!(err.contains("refused"), "{bad}: {err}");
+    }
+    assert!(!vault(&fx).join("agents/projects/other/x").exists());
+    assert!(!vault(&fx).join("agents/global/x").exists());
+    // The blob path runs the same normalize gate.
+    let uploads = d.state.join("wiki-uploads");
+    std::fs::create_dir_all(&uploads).unwrap();
+    let tmp = uploads.join("w1-trav.png");
+    std::fs::write(&tmp, [0x89, b'P', b'N', b'G', 5]).unwrap();
+    let err = refused(d.agent_rpc(
+        "w1",
+        "wiki_put_blob",
+        json!({"path": "agents/w1/knowledge/../../projects/other/p.png",
+               "tmp": tmp}),
+    ));
+    assert!(err.contains("refused"), "{err}");
+    assert!(!vault(&fx).join("agents/projects/other/p.png").exists());
 }
 
 #[cfg(feature = "test-seam")]
@@ -921,6 +1096,33 @@ fn board_write_guards_and_path_stays_the_daemons() {
     assert!(!b.fx.pm.join("../outside.md").exists());
     let (s, _, body) = op_get(&op, &b, "/api/wiki/file?path=../../etc/passwd");
     assert!(s >= 400, "{body}");
+
+    // rev-298 F2 — '..' AFTER a valid root rides the same daemon
+    // gate over HTTP: nothing resolves out of its prefix (or the
+    // vault) through the board either.
+    for bad in ["global/../users/fable/x", "global/../../x"] {
+        let (s, _, body) = op::raw(
+            b.port,
+            &op.request(
+                "PUT",
+                "/api/wiki/file",
+                &format!(r#"{{"path":"{bad}","text":"x"}}"#),
+            ),
+        );
+        assert_eq!(s, 400, "{bad}: {body}");
+        assert!(body.contains("refused"), "{body}");
+    }
+    assert!(!vault(&b.fx).join("users/fable/x").exists());
+    assert!(
+        !b.fx.pm.join("x").exists(),
+        "an HTTP write escaped the vault into the tracker"
+    );
+    let (s, _, body) = op_get(
+        &op,
+        &b,
+        "/api/wiki/file?path=agents/w1/knowledge/../../global/x",
+    );
+    assert!(s >= 400, "{body}");
 }
 
 #[test]
@@ -967,6 +1169,16 @@ fn board_agent_writes_only_its_areas() {
         r#"{"path":"agents/w2/knowledge/n.md","text":"x"}"#,
     );
     assert_eq!(s, 400, "{body}");
+    // rev-298 F2 — '..' after its own valid root: only normalize's
+    // segment guard stands between w1 and a write outside knowledge/.
+    let (s, _, body) = put_as(
+        &b,
+        "agent:w1",
+        r#"{"path":"agents/w1/knowledge/../../global/x.md","text":"x"}"#,
+    );
+    assert_eq!(s, 400, "{body}");
+    assert!(body.contains("refused"), "{body}");
+    assert!(!vault(&b.fx).join("agents/global/x.md").exists());
     // A forged claim inside the JSON body is overwritten by the
     // relay's own wiki_as — it can only shrink, never widen.
     let (s, _, body) = put_as(
@@ -1020,4 +1232,15 @@ fn board_upload_and_caps_apply_per_caller() {
     // Traversal in ?path= refuses too.
     let (s, _, _) = upload_as(&b, "agent:w1", None, "../escape.png", "x.png", bytes);
     assert_eq!(s, 400);
+    // rev-298 F2 — and '..' after its own valid root.
+    let (s, _, body) = upload_as(
+        &b,
+        "agent:w1",
+        None,
+        "agents/w1/knowledge/../../global/e.png",
+        "x.png",
+        bytes,
+    );
+    assert_eq!(s, 400, "{body}");
+    assert!(!vault(&b.fx).join("agents/global/e.png").exists());
 }

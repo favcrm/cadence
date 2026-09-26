@@ -147,10 +147,8 @@ pub fn run(action: &WikiAction, state_dir: &Path) -> Result<i32> {
                 let file = file
                     .as_ref()
                     .ok_or_else(|| Error::rejected("wiki put --blob needs --file <path>"))?;
-                if text.is_some() || if_rev.is_some() {
-                    return Err(Error::rejected(
-                        "wiki put --blob takes only --file, not -m/--if-rev",
-                    ));
+                if text.is_some() {
+                    return Err(Error::rejected("wiki put --blob takes --file, not -m"));
                 }
                 let uploads = state_dir.join(crate::wiki::UPLOAD_DIR);
                 std::fs::create_dir_all(&uploads)?;
@@ -161,12 +159,22 @@ pub fn run(action: &WikiAction, state_dir: &Path) -> Result<i32> {
                 let out = rpc(
                     state_dir,
                     "wiki_put_blob",
-                    json!({"path": path, "tmp": tmp}),
+                    json!({"path": path, "tmp": tmp, "if_rev": if_rev}),
                 );
-                if out.is_err() {
-                    let _ = std::fs::remove_file(&tmp);
+                let out = match out {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&tmp);
+                        return Err(e);
+                    }
+                };
+                if out.get("conflict").is_some() {
+                    crate::issue::cli::print_json(&out);
+                    return Err(Error::rejected(format!(
+                        "wiki put '{path}': if_rev conflict — re-read and retry"
+                    )));
                 }
-                crate::issue::cli::print_json(&out?);
+                crate::issue::cli::print_json(&out);
                 return Ok(0);
             }
             let text = match (text, file) {

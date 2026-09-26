@@ -112,17 +112,27 @@ impl Shared {
         wiki::write(&self.pm()?, &caller, path, text, if_rev)
     }
 
-    /// The board's upload relay: `{path, tmp, sha256?}` — `tmp` is the
-    /// staged file under `<state>/wiki-uploads/` the store verifies,
-    /// hashes and moves. The tracker write lock is taken only for the
-    /// pointer commit, never while the file is checked.
+    /// The board's upload relay: `{path, tmp, sha256?, if_rev?}` —
+    /// `tmp` is the staged file under `<state>/wiki-uploads/` the
+    /// store verifies, hashes and moves; `if_rev` guards the pointer
+    /// write. The tracker write lock is taken only for the pointer
+    /// commit, never while the file is checked.
     pub(super) fn rpc_wiki_put_blob(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         Self::reject_wiki_fields(params)?;
         let caller = self.wiki_caller(params, peer_pid, "wiki put_blob")?;
         let path = Self::wiki_path(params)?;
         let tmp = PathBuf::from(required_str(params, "tmp")?);
         let sha256 = optional_str(params, "sha256");
-        wiki::put_blob(&self.pm()?, &self.state_dir, &caller, path, &tmp, sha256)
+        let if_rev = optional_str(params, "if_rev");
+        wiki::put_blob(
+            &self.pm()?,
+            &self.state_dir,
+            &caller,
+            path,
+            &tmp,
+            sha256,
+            if_rev,
+        )
     }
 
     pub(super) fn rpc_wiki_mkdir(&self, params: &Value, peer_pid: u32) -> Result<Value> {

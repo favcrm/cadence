@@ -1319,7 +1319,8 @@ fn sniff_mime(head: &[u8]) -> &'static str {
 ///
 /// `tmp` must sit under `<state_dir>/wiki-uploads/` — a tmp anywhere
 /// else is refused (the daemon never renames an arbitrary caller
-/// path into the vault).
+/// path into the vault). `if_rev` is the pointer's
+/// optimistic-concurrency token (`none` = the page must not exist).
 pub fn put_blob(
     pm: &Pm,
     state_dir: &Path,
@@ -1327,6 +1328,7 @@ pub fn put_blob(
     path: &str,
     tmp: &Path,
     sha256: Option<&str>,
+    if_rev: Option<&str>,
 ) -> Result<Value> {
     let norm = normalize(path)?;
     if norm.is_empty() {
@@ -1389,20 +1391,28 @@ pub fn put_blob(
         }
     }
 
-    // Land the blob — rename within the vault's filesystem, else
-    // copy+unlink across mounts (state dir and vault may differ).
+    // Land the blob — hard-link the verified tmp into `.blobs/<sha>`
+    // (atomic, never overwrites), copy+unlink only across mounts
+    // (state dir and vault may differ). `created` marks whether THIS
+    // call made the blob: a refusal below removes only what it
+    // created — a deduped `.blobs/<sha>` is another page's content.
     ensure_layout(pm)?;
     let dest = blobs_dir(&vault).join(&actual);
-    if !dest.exists() {
-        match std::fs::rename(&tmp_canon, &dest) {
-            Ok(()) => {}
-            Err(_) => {
-                std::fs::copy(&tmp_canon, &dest)?;
-                let _ = std::fs::remove_file(&tmp_canon);
-            }
+    let mut created = false;
+    match std::fs::hard_link(&tmp_canon, &dest) {
+        Ok(()) => {
+            created = true;
+            let _ = std::fs::remove_file(&tmp_canon);
         }
-    } else {
-        let _ = std::fs::remove_file(&tmp_canon);
+        Err(_) if dest.exists() => {
+            // Already addressable — deduped.
+            let _ = std::fs::remove_file(&tmp_canon);
+        }
+        Err(_) => {
+            std::fs::copy(&tmp_canon, &dest)?;
+            created = true;
+            let _ = std::fs::remove_file(&tmp_canon);
+        }
     }
 
     // The pointer file — a normal tracker text write under the lock.
@@ -1412,9 +1422,20 @@ pub fn put_blob(
     if let Some(parent) = pointer.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let cur = rev_of(&pointer)?;
+    if let Some(want) = if_rev {
+        if want != cur {
+            if created {
+                let _ = std::fs::remove_file(&dest);
+            }
+            return Ok(json!({"conflict": "if_rev", "current_rev": cur, "path": norm}));
+        }
+    }
     if resolve(&vault, &norm)?.symlink_metadata().is_ok() {
         // A text page already sits at the logical name.
-        let _ = std::fs::remove_file(&dest);
+        if created {
+            let _ = std::fs::remove_file(&dest);
+        }
         return Err(Error::rejected(format!(
             "wiki put_blob '{norm}' refused: a text page exists there — rm it first"
         )));
@@ -1762,6 +1783,10 @@ mod tests {
             "../x",
             "a/../b",
             "a/./b",
+            "agents/w1/knowledge/../../projects/other/x",
+            "agents/w1/knowledge/../../global/x",
+            "global/../users/fable/x",
+            "global/../../x",
             "/abs",
             "/a/b",
             "a//b",

@@ -377,7 +377,8 @@ fn upload(
     match client::rpc(
         state_dir,
         "wiki_put_blob",
-        json!({"path": path, "tmp": tmp, "wiki_as": wiki_as}),
+        json!({"path": path, "tmp": tmp, "wiki_as": wiki_as,
+               "if_rev": query("if_rev").or_else(|| fields.get("if_rev").cloned())}),
     ) {
         Ok(v) => json_response(v),
         Err(e) => {
