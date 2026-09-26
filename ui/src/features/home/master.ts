@@ -91,6 +91,99 @@ export function slashMatches(prefix: string): SlashCommand[] {
   return SLASH_COMMANDS.filter((c) => c.name.startsWith(prefix));
 }
 
+// ---- Command results as fields (CAD-551 r2) ----
+
+/** Wire keys → the label a command card shows. */
+const KV_LABELS: Record<string, string> = {
+  model: "model",
+  thinkingLevel: "effort",
+  sessionId: "session",
+  contextUsage: "context",
+  pendingMessageCount: "pending",
+  isStreaming: "streaming",
+  messageCount: "messages",
+  was: "was",
+};
+
+/** The order familiar fields take on a card; the rest follow as sent. */
+const KV_ORDER = [
+  "model",
+  "effort",
+  "session",
+  "context",
+  "pending",
+  "streaming",
+  "messages",
+  "was",
+];
+
+const shortJson = (v: unknown): string => {
+  const s = JSON.stringify(v);
+  return s.length > 90 ? `${s.slice(0, 87)}…` : s;
+};
+
+const num = (v: unknown): number | null =>
+  typeof v === "number" && Number.isFinite(v) ? v : null;
+
+const fmtNum = (n: number): string => n.toLocaleString("en-US");
+
+/** One field's display value — objects fold to a compact read. */
+function kvValue(v: unknown): string {
+  if (v == null) return "—";
+  if (typeof v !== "object") return String(v);
+  if (Array.isArray(v)) return v.length ? v.map(kvValue).join(" · ") : "—";
+  const o = v as Record<string, unknown>;
+  if (typeof o.name === "string" && typeof o.id === "string") return `${o.name} (${o.id})`;
+  const used = num(o.usedTokens ?? o.used_tokens ?? o.tokens);
+  const max = num(o.maxTokens ?? o.max_tokens ?? o.contextWindow ?? o.window);
+  if (used != null && max != null && max > 0) {
+    return `${fmtNum(used)} / ${fmtNum(max)} (${Math.round((used / max) * 100)}%)`;
+  }
+  if (used != null) return fmtNum(used);
+  const pct = num(o.percent ?? o.percentUsed ?? o.used_percent);
+  if (pct != null) return `${Math.round(pct)}%`;
+  return shortJson(v);
+}
+
+/**
+ * A command result as `[label, value]` rows for the card's field list
+ * (CAD-551 r2): objects list their fields — known wire names relabelled
+ * (`sessionId` → `session`), familiar ones ordered first — and an array
+ * (a `/models` list) lists one row per element keyed on id/name.
+ * `[]` when the value has no fields to show — the card falls back to
+ * raw JSON.
+ */
+export function kvRows(v: unknown): [string, string][] {
+  const rows: [string, string][] = [];
+  if (Array.isArray(v)) {
+    for (const el of v) {
+      if (el && typeof el === "object") {
+        const o = el as Record<string, unknown>;
+        const key = typeof o.id === "string" ? o.id : typeof o.name === "string" ? o.name : `${rows.length + 1}`;
+        rows.push([key, kvValue(o)]);
+      } else {
+        rows.push([`${rows.length + 1}`, kvValue(el)]);
+      }
+    }
+    return rows;
+  }
+  if (!v || typeof v !== "object") return rows;
+  const obj = v as Record<string, unknown>;
+  const byLabel = new Map<string, string>();
+  const rest: string[] = [];
+  for (const k of Object.keys(obj)) {
+    const label = KV_LABELS[k];
+    if (label === undefined) rest.push(k);
+    else if (!byLabel.has(label)) byLabel.set(label, k);
+  }
+  const keys = [
+    ...KV_ORDER.filter((l) => byLabel.has(l)).map((l) => byLabel.get(l) as string),
+    ...rest,
+  ];
+  for (const k of keys) rows.push([KV_LABELS[k] ?? k, kvValue(obj[k])]);
+  return rows;
+}
+
 /**
  * Where the master's turn stands (CAD-551): `master_state`'s live turn
  * wins; the agents row covers a daemon that cannot answer (501) or a

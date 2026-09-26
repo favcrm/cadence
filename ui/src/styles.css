@@ -639,3 +639,61 @@ pre {
 .issue-reader button {
   overflow-wrap: anywhere;
 }
+/* CAD-551 r2: GFM tables (the /help card) — the command column keeps a
+ * real gap so an arg like `provider/id` never runs into the blurb. */
+.issue-reader table {
+  border-collapse: collapse;
+  display: block;
+  max-inline-size: 100%;
+  overflow-x: auto;
+}
+.issue-reader th,
+.issue-reader td {
+  padding: .15rem 1.1rem .15rem 0;
+  text-align: left;
+  vertical-align: top;
+}
+.issue-reader th:last-child,
+.issue-reader td:last-child {
+  padding-right: 0;
+}
+.issue-reader td:first-child {
+  white-space: nowrap;
+}
+.issue-reader thead th {
+  border-bottom: 1px solid var(--color-ink-700);
+  color: var(--color-ink-400);
+  font-weight: 500;
+}
+
+/* CAD-551 r2: a JSON command answer as fields. */
+.kvlist {
+  display: flex;
+  flex-direction: column;
+  gap: .125rem;
+  font-size: var(--text-micro);
+  line-height: 1.55;
+}
+.kvrow {
+  display: flex;
+  gap: .75rem;
+  min-width: 0;
+  align-items: baseline;
+}
+.kvrow dt {
+  flex: none;
+  width: 5rem;
+  color: var(--color-ink-500);
+}
+.kvrow dd {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--color-ink-300);
+}
+
+/* CAD-551 r2: a long system note (the session briefing) as a collapsed
+ * disclosure — the same mechanics as the tool-steps group, no indent. */
+.sysnote .steps-inner {
+  max-height: 26rem;
+  overflow-y: auto;
+}

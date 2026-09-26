@@ -9,6 +9,7 @@ import type { Agent, MasterCommandResult, MasterState, Overview } from "../../li
 import Md from "../../ui/Md";
 import {
   composerBlock,
+  kvRows,
   MASTER,
   masterStatus,
   parseSlash,
@@ -223,7 +224,18 @@ function Item({
           </div>
         </Bubble>
       );
-    case "system":
+    case "system": {
+      const e = item.entry;
+      // The bootstrap prompt lands as a system message — the daemon's
+      // briefing for the master, hundreds of lines of markdown. It is
+      // context for the turn, not chat: one collapsed note, GFM inside.
+      // Anything multi-line gets the same treatment — a divider row
+      // centres one line, never a wall of text.
+      const briefing =
+        e.payload?.source === "bootstrap" || e.message === "bootstrap-master";
+      if (briefing || e.text.includes("\n") || e.text.length > 240) {
+        return <SystemNote entry={e} briefing={briefing} onOpenIssue={onOpenIssue} />;
+      }
       return (
         <div className="flex items-center gap-2 text-micro text-ink-500 min-w-0" data-kind="system">
           <span className="h-px flex-1 bg-ink-700" />
@@ -234,7 +246,48 @@ function Item({
           <span className="h-px flex-1 bg-ink-700" />
         </div>
       );
+    }
   }
+}
+
+/**
+ * A system entry too long for the divider line (CAD-551 r2): the
+ * session's bootstrap briefing or another multi-line note, closed by
+ * default, opened into left-aligned GFM — never centred text.
+ */
+function SystemNote({
+  entry,
+  briefing,
+  onOpenIssue,
+}: {
+  entry: ThreadEntry;
+  briefing: boolean;
+  onOpenIssue: (id: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="steps sysnote min-w-0" data-kind={briefing ? "briefing" : "system-note"} data-open={open || undefined}>
+      <button
+        type="button"
+        className="steps-head"
+        aria-expanded={open}
+        onClick={() => setOpen((o) => !o)}
+      >
+        <span className="steps-caret num shrink-0" aria-hidden>
+          ›
+        </span>
+        <span className="shrink-0">{briefing ? "Session briefing" : "Details"}</span>
+        <span className="num truncate min-w-0 text-ink-500">· {stepSummary(entry.text)}</span>
+      </button>
+      <div className="steps-body">
+        <div className="steps-inner">
+          <div className="issue-reader text-secondary text-ink-300 break-words min-w-0" data-briefing-body>
+            <Md text={entry.text} onOpen={onOpenIssue} />
+          </div>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 /** Context chip's tooltip — the raw token counts when the provider sent them. */
@@ -369,8 +422,42 @@ interface CmdResult {
   running?: boolean;
   ok?: boolean;
   text?: string;
-  /** Render `text` verbatim in a <pre> (a JSON payload). */
-  pre?: boolean;
+  /** A JSON answer — listed as fields, with raw JSON one toggle away. */
+  value?: unknown;
+}
+
+/**
+ * A JSON command answer (CAD-551 r2): the fields as a compact key/value
+ * list — model, effort, session, context, pending first — with the raw
+ * pretty JSON one toggle away, never the only read.
+ */
+function CmdJson({ value }: { value: unknown }) {
+  const [raw, setRaw] = useState(false);
+  const rows = useMemo(() => kvRows(value), [value]);
+  const json = useMemo(() => JSON.stringify(value, null, 2), [value]);
+  return (
+    <div className="mt-1 min-w-0" data-kind="cmdjson">
+      {rows.length > 0 && (
+        <div className="flex justify-end -mt-1">
+          <button type="button" className="lnk text-micro" onClick={() => setRaw((r) => !r)}>
+            {raw ? "fields" : "raw"}
+          </button>
+        </div>
+      )}
+      {!raw && rows.length > 0 ? (
+        <dl className="kvlist">
+          {rows.map(([k, v]) => (
+            <div key={k} className="kvrow">
+              <dt>{k}</dt>
+              <dd>{v}</dd>
+            </div>
+          ))}
+        </dl>
+      ) : (
+        <pre className="num text-micro overflow-x-auto">{json}</pre>
+      )}
+    </div>
+  );
 }
 
 function CmdCard({ cmd, onOpenIssue }: { cmd: CmdResult; onOpenIssue: (id: string) => void }) {
@@ -389,10 +476,14 @@ function CmdCard({ cmd, onOpenIssue }: { cmd: CmdResult; onOpenIssue: (id: strin
           <span className="text-ink-500">done</span>
         )}
       </div>
-      {cmd.text && (
-        <div className="issue-reader mt-1 text-secondary text-ink-300 break-words min-w-0">
-          {cmd.pre ? <pre className="num text-micro">{cmd.text}</pre> : <Md text={cmd.text} onOpen={onOpenIssue} />}
-        </div>
+      {cmd.value !== undefined ? (
+        <CmdJson value={cmd.value} />
+      ) : (
+        cmd.text && (
+          <div className="issue-reader mt-1 text-secondary text-ink-300 break-words min-w-0">
+            <Md text={cmd.text} onOpen={onOpenIssue} />
+          </div>
+        )
       )}
     </div>
   );
@@ -407,12 +498,13 @@ function helpText(): string {
 }
 
 /** What a `masterCommand` answer shows on its card: a string result is
- * text; anything else is pretty-printed JSON in a <pre>. */
-function fmtCommandResult(r: MasterCommandResult): { text: string; pre: boolean } {
+ * text; a JSON payload is `value` (listed as fields, raw behind a
+ * toggle); null is a bare ack. */
+function fmtCommandResult(r: MasterCommandResult): { text?: string; value?: unknown } {
   const v = r.result;
-  if (typeof v === "string") return { text: v, pre: false };
-  if (v == null) return { text: r.ok ? "done" : "no result", pre: false };
-  return { text: JSON.stringify(v, null, 2), pre: true };
+  if (typeof v === "string") return { text: v };
+  if (v == null) return { text: r.ok ? "done" : "no result" };
+  return { value: v };
 }
 
 function NotStarted({ status }: { status: MasterStatus }) {
@@ -831,7 +923,12 @@ export default function Home({
   // New items while unpinned count onto the "new messages" pill.
   useEffect(() => {
     const onScroll = () => {
-      const near = window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 180;
+      // "At the tail" means the tail's own document position sits inside
+      // the viewport (±180): scrolled far above it OR far below it into a
+      // taller rail both count as away — arrivals bump the pill then.
+      const tail = tailBottom();
+      const near =
+        tail <= window.innerHeight + window.scrollY + 180 && tail >= window.scrollY - 180;
       pinned.current = near;
       if (near) setUnseen(0);
     };
@@ -844,11 +941,10 @@ export default function Home({
     const delta = items.length - prevItems.current;
     prevItems.current = items.length;
     if (!lastKey) return;
-    // To the very bottom — scrollIntoView on the anchor stops a sticky
-    // composer's height short, which reads as "not pinned" and wrongly
-    // counts every later arrival onto the pill.
+    // To the tail — the thread section's bottom edge, not the document's:
+    // a taller rail must not strand the follow below the conversation.
     if (pinned.current) {
-      window.scrollTo(0, document.documentElement.scrollHeight);
+      window.scrollTo(0, Math.max(0, tailBottom() - window.innerHeight));
     } else if (delta > 0) {
       setUnseen((u) => u + delta);
     }
@@ -858,7 +954,7 @@ export default function Home({
     pinned.current = true;
     setUnseen(0);
     window.scrollTo({
-      top: document.documentElement.scrollHeight,
+      top: Math.max(0, tailBottom() - window.innerHeight),
       behavior: reducedMotion() ? "auto" : "smooth",
     });
   };
@@ -883,9 +979,9 @@ export default function Home({
       api
         .masterCommand(name, arg || undefined)
         .then((r) => {
-          const { text, pre } = fmtCommandResult(r);
+          const { text, value } = fmtCommandResult(r);
           setCmds((c) =>
-            c.map((x) => (x.id === id ? { ...x, running: false, ok: r.ok, text, pre } : x)),
+            c.map((x) => (x.id === id ? { ...x, running: false, ok: r.ok, text, value } : x)),
           );
           // Mutations move the session — refresh the chips/state, and the
           // thread after `/new` (the session restart lands entries too).
@@ -902,6 +998,19 @@ export default function Home({
     },
     [],
   );
+
+  /**
+   * Where the conversation actually ends (CAD-551 r2): the thread
+   * section's bottom edge in document coordinates. The rail beside it
+   * can run far taller — document `scrollHeight` then lies about "the
+   * bottom": scrolling there would leave the whole thread offscreen,
+   * and `pinned` would keep following to a spot with nothing in view.
+   */
+  const mainCol = useRef<HTMLElement | null>(null);
+  const tailBottom = () =>
+    mainCol.current
+      ? mainCol.current.getBoundingClientRect().bottom + window.scrollY
+      : document.documentElement.scrollHeight;
 
   const onEarlier = useCallback(() => {
     const data = resources.masterThread.get().data;
@@ -935,7 +1044,7 @@ export default function Home({
         <NeedsRail overview={overview} readOnly={readOnly} onOpenIssue={onOpenIssue} overviewHref={overviewHref} />
       </aside>
 
-      <section className="min-w-0 lg:order-1 flex flex-col gap-4" aria-label="master thread">
+      <section className="min-w-0 lg:order-1 flex flex-col gap-4" aria-label="master thread" ref={mainCol}>
         <SinceCard onOpenIssue={onOpenIssue} />
 
         <div className="flex items-center gap-2 flex-wrap">

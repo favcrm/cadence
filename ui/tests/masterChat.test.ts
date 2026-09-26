@@ -4,6 +4,7 @@
  * pairing the steps disclosure renders.
  */
 import {
+  kvRows,
   parseSlash,
   slashMatches,
   SLASH_COMMANDS,
@@ -192,5 +193,60 @@ equal(
   "the still-open parallel call",
 );
 equal(openStep([entry(1, "assistant_text", "hi")]), null, "no tools at all");
+
+// ---- r2: command results as field rows ----
+// `/state` — known wire names relabel and order first.
+equal(
+  kvRows({
+    isStreaming: false,
+    model: { id: "model-2", name: "Fake Model Small", provider: "fake" },
+    pendingMessageCount: 0,
+    sessionId: "fakepi-session-1",
+    thinkingLevel: "medium",
+  }),
+  [
+    ["model", "Fake Model Small (model-2)"],
+    ["effort", "medium"],
+    ["session", "fakepi-session-1"],
+    ["pending", "0"],
+    ["streaming", "false"],
+  ],
+  "state fields relabelled and ordered",
+);
+// `/stats` — contextUsage folds to used/max + percent.
+equal(
+  kvRows({ contextUsage: { usedTokens: 12400, contextWindow: 128000 }, messageCount: 9 }),
+  [
+    ["context", "12,400 / 128,000 (10%)"],
+    ["messages", "9"],
+  ],
+  "context usage folds to tokens + percent",
+);
+// `/model` — the swap reads model + was.
+equal(
+  kvRows({ model: { id: "model-2", name: "Fake Model Small" }, was: "model-1" }),
+  [
+    ["model", "Fake Model Small (model-2)"],
+    ["was", "model-1"],
+  ],
+  "model swap keeps the previous id",
+);
+// `/models` — an array lists one row per model keyed on id.
+equal(
+  kvRows([{ id: "model-1", name: "Fake Model Small", provider: "fake" }]),
+  [["model-1", "Fake Model Small (model-1)"]],
+  "a models array rows per element",
+);
+// Unknown fields follow the labelled ones, verbatim.
+const misc = kvRows({ thinkingLevel: "low", extraFlag: true });
+equal(
+  misc.map(([k]) => k),
+  ["effort", "extraFlag"],
+  "unlabelled keys keep order after labelled",
+);
+// Scalars and nulls give the card nothing to list — it shows raw JSON.
+equal(kvRows("done"), [], "a string is not a field list");
+equal(kvRows(null), [], "null is not a field list");
+equal(kvRows({}), [], "an empty object is not a field list");
 
 console.log("masterChat.test.ts: all assertions passed");

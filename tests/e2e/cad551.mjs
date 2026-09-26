@@ -91,13 +91,41 @@ async function main() {
     await appear(page, ".chip:has-text('Fake Model')", "the model chip");
     await appear(page, ".chip:has-text('effort medium')", "the effort chip");
     await appear(page, ".chip:has-text('% ctx')", "the context chip");
+    // r2: the bootstrap briefing is a collapsed disclosure, never a
+    // centred markdown wall — closed on load, opens to left-aligned GFM.
+    const brief = await appear(page, '[data-kind="briefing"]', "the Session briefing disclosure");
+    if (await brief.getAttribute("data-open")) {
+      throw new Error("the briefing disclosure must start closed");
+    }
     await h1.scrollIntoViewIfNeeded();
     await page.evaluate(() => window.scrollBy(0, -60));
     await page.waitForTimeout(400); // let chip-in entrances finish
     await shot(page, "01-header-chips.png");
+    // Open it once to prove the body is GFM, not raw `**`/`#` text.
+    await brief.locator(".steps-head").click();
+    const briefBody = page.locator("[data-briefing-body]");
+    await appear(page, '[data-kind="briefing"][data-open]', "the briefing opens");
+    if (!(await briefBody.locator("strong, h1, h2, h3, p, ul, ol").first().count())) {
+      throw new Error("the briefing body renders no markdown structure");
+    }
+    const centered = await briefBody.evaluate(
+      (el) => getComputedStyle(el).textAlign === "center",
+    );
+    if (centered) throw new Error("the briefing body must not be centred");
+    await brief.locator(".steps-head").click();
     // Back to the tail — the frame scroll unpins smart-scroll, and we want
     // a clean follow-state for the rest of the run.
-    await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+    // "The tail" for framing: the thread section's bottom edge — the
+    // rail beside it can run taller than the thread, and then
+    // scrollHeight strands the shot below the conversation entirely.
+    const tailY = () =>
+      page.evaluate(() => {
+        const s = document.querySelector("section[aria-label='master thread']");
+        return s
+          ? Math.max(0, s.getBoundingClientRect().bottom + window.scrollY - window.innerHeight)
+          : document.documentElement.scrollHeight;
+      });
+    await page.evaluate(async (y) => window.scrollTo(0, y), await tailY());
 
     // ---- Slash autocomplete + command cards ----
     const box = page.getByLabel("message to the master");
@@ -110,10 +138,40 @@ async function main() {
     await box.press("Escape");
     await send(page, "/state");
     const stateCard = await appear(page, ".cmdcard[data-cmd='state']", "the /state card");
-    await expectText(stateCard, "sessionId", "the /state card carries the session state");
+    // r2: a JSON answer is a field list — model/effort/session/context —
+    // never raw pretty-JSON; the wire names live behind the raw toggle.
+    await appear(stateCard, ".kvrow", "the /state card lists fields");
+    await expectText(stateCard, "effort", "the /state card labels the effort row");
+    await expectText(stateCard, "session", "the /state card labels the session row");
+    const rawToggle = stateCard.getByRole("button", { name: "raw" });
+    await rawToggle.waitFor({ state: "visible", timeout: 5000 });
+    await rawToggle.click();
+    await expectText(stateCard, "sessionId", "the raw toggle reveals the wire keys");
+    await stateCard.getByRole("button", { name: "fields" }).click();
     await send(page, "/help");
     const helpCard = await appear(page, ".cmdcard[data-cmd='help']", "the /help card");
     await expectText(helpCard, "Commands", "/help renders the catalog");
+    // r2: the command column keeps real padding — `/model provider/id`
+    // must not run into its description.
+    const modelCell = helpCard.locator("td", { hasText: "/model provider/id" }).first();
+    await modelCell.waitFor({ state: "visible", timeout: 5000 });
+    // Cell borders touch by definition — measure the gap between the two
+    // cells' *text* edges (what the eye sees, what r1 got wrong).
+    const gap = await modelCell.evaluate((el) => {
+      const edge = (node, last) => {
+        const r = document.createRange();
+        r.selectNodeContents(node);
+        const rects = r.getClientRects();
+        if (!rects.length) return null;
+        return last ? rects[rects.length - 1].right : rects[0].left;
+      };
+      const next = el.nextElementSibling;
+      if (!next) return -1;
+      const right = edge(el, true);
+      const left = edge(next, false);
+      return right == null || left == null ? -1 : left - right;
+    });
+    if (gap < 8) throw new Error(`/help table columns collide (text gap ${gap}px)`);
     // An unknown verb is a local error card — never a chat message.
     await send(page, "/bogus");
     const bad = await appear(page, ".cmdcard[data-cmd='bogus']", "the unknown-command card");
@@ -125,6 +183,10 @@ async function main() {
       "/model fake/model-2",
       "the /model command card",
     );
+    // r2: /stats lists context + messages as fields too.
+    await send(page, "/stats");
+    const statsCard = await appear(page, ".cmdcard[data-cmd='stats']", "the /stats card");
+    await expectText(statsCard, "context", "the /stats card folds context usage");
     await shot(page, "03-command-cards.png");
 
     // ---- A working turn: the row, the step, then the reply ----
@@ -140,9 +202,9 @@ async function main() {
       throw new Error(`the working row should name the live step, shows "${stepText}"`);
     }
     await appear(page, ".workrow .stopbtn", "the Stop button");
-    // The row sits above the composer — frame it at the tail. Reaching the
-    // bottom also clears the pill (reached = seen); wait out the frame.
-    await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+    // The row sits above the composer — frame it at the tail. Reaching
+    // it also clears the pill (tail seen = all seen); wait out the frame.
+    await page.evaluate(async (y) => window.scrollTo(0, y), await tailY());
     await page.locator(".newpill").waitFor({ state: "detached", timeout: 5000 });
     await shot(page, "04-working.png");
     // The reply handoff: the row leaves, the answer bubble lands.
@@ -173,8 +235,14 @@ async function main() {
     await expectText(pill, "new", "the pill counts arrivals");
     await shot(page, "06-new-pill.png");
     await pill.click();
+    // The pill jumps to the tail — the section's bottom edge in view.
     await page.waitForFunction(
-      () => window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 20,
+      () => {
+        const s = document.querySelector("section[aria-label='master thread']");
+        if (!s) return false;
+        const b = s.getBoundingClientRect().bottom;
+        return b > 0 && b <= window.innerHeight + 20;
+      },
       { timeout: TIMEOUT },
     );
 
@@ -197,7 +265,7 @@ async function main() {
     await page.reload();
     await expectText(thread, "fake-pi reply", "the thread survives the theme swap");
     await appear(page, ".steps", "the steps group in light");
-    await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+    await page.evaluate(async (y) => window.scrollTo(0, y), await tailY());
     await shot(page, "07-light.png");
     await page.evaluate(() => window.scrollTo(0, 0));
     await shot(page, "08-light-top.png");
