@@ -1390,10 +1390,36 @@ fn open_plan_epics(pm_dir: &Path, project_key: &str, name: &str, state_dir: &Pat
     open
 }
 
+/// The agents holding a grant this app's approval derived, read from
+/// the daemon's store read-only (CAD-577). Empty when there is no
+/// store yet — no daemon, no derived grant.
+fn derived_grant_holders(project_key: &str, name: &str, state_dir: &Path) -> Vec<String> {
+    let db = state_dir.join("cadence.sqlite3");
+    if !db.exists() {
+        return Vec::new();
+    }
+    let Ok(conn) = crate::store::open_read_only(&db) else {
+        return Vec::new();
+    };
+    let Ok(mut stmt) = conn.prepare("SELECT DISTINCT agent FROM app_grants WHERE app=? ORDER BY agent")
+    else {
+        return Vec::new();
+    };
+    let key = approval_key(project_key, name);
+    let Ok(rows) = stmt.query_map(rusqlite::params![key], |r| r.get::<_, String>(0)) else {
+        return Vec::new();
+    };
+    rows.flatten().collect()
+}
+
 /// `cadence app remove <app> --project <key>` — delete the content
 /// folder and its install record in one tracker commit. Refuses while a
 /// plan proposed from the app is still open — an open plan's tickets
-/// keep their provenance readable.
+/// keep their provenance readable. Refuses too while the app's
+/// approval still holds derived grants (CAD-577): deleting the folder
+/// is a tracker write no daemon sees, so a removal before the revoke
+/// would leave the agents holding a standing grant with nothing left
+/// to revoke it by name.
 pub fn remove(
     pm: &Pm,
     project_key: &str,
@@ -1410,6 +1436,15 @@ pub fn remove(
             "app '{name}' has open plans ({}) — decide or finish them first \
              (`cadence plan ls --project {project_key}`)",
             open.join(", ")
+        )));
+    }
+    let holders = derived_grant_holders(project_key, name, state_dir);
+    if !holders.is_empty() {
+        return Err(Error::rejected(format!(
+            "app '{name}' still holds the grants its approval derived ({}) — \
+             revoke them first (`cadence app revoke {name} --project \
+             {project_key}`)",
+            holders.join(", ")
         )));
     }
     let _lock = pm.lock()?;

@@ -86,6 +86,18 @@ pub(crate) enum AppAction {
         #[arg(long)]
         project: String,
     },
+    /// Withdraw the app's approval (CAD-577) — `plan propose
+    /// --workflow <app>/<wf>` refuses again, and every grant the
+    /// approval derived is revoked (a waiting effect that loses a
+    /// scope is closed). The counterpart to `approve`; operator only,
+    /// through the daemon.
+    Revoke {
+        /// App name.
+        name: String,
+        /// Project key.
+        #[arg(long)]
+        project: String,
+    },
     /// Record the app's default team (CAD-577): one agent alias per
     /// workflow input role, `<input>=<agent>` repeatable; `<input>=`
     /// clears a role. The team lives with the install record and is
@@ -160,6 +172,11 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
         AppAction::Approve { name, project } => client::rpc(
             state_dir,
             "app_approve",
+            json!({"project": project, "name": name}),
+        )?,
+        AppAction::Revoke { name, project } => client::rpc(
+            state_dir,
+            "app_revoke",
             json!({"project": project, "name": name}),
         )?,
         AppAction::SetTeam {

@@ -2102,6 +2102,17 @@ fn write_route(
         send(request, resp);
         return;
     }
+    // An app revocation (CAD-577) — relayed to the daemon's
+    // `app_revoke`, operator-only on the board (see `apps`).
+    if let Some((key, name)) = apps::revoke_route(path) {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let resp = apps::revoke(&mut request, state_dir, key, name);
+        send(request, resp);
+        return;
+    }
     // The app's default team (CAD-577) — relayed to the daemon's
     // `app_set_team`, operator-only on the board (see `apps`).
     if let Some((key, name)) = apps::team_route(path) {

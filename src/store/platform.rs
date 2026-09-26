@@ -174,6 +174,74 @@ fn credential_row(row: &rusqlite::Row) -> rusqlite::Result<CredentialRecord> {
     })
 }
 
+/// CAD-577: subtract one app's derived scopes from `platform_grants`.
+///
+/// `rows` are the `(agent, platform, account, scopes)` triples the app
+/// derived. A scope is removed from the agent's platform grant only
+/// when no OTHER app's still-recorded derivation covers it — two apps
+/// that derive the same scope for the same agent are independent, so
+/// dropping one must not cut the other's grant. Scopes the operator
+/// granted by hand are not in any `app_grants` row and survive because
+/// only the derived set is ever subtracted. Answers the triples whose
+/// platform grant actually changed, so the caller can drain the waiting
+/// effects that lost coverage.
+fn subtract_derived(
+    tx: &rusqlite::Transaction<'_>,
+    app: &str,
+    rows: &[(String, String, String, Vec<String>)],
+) -> Result<Vec<(String, String, String)>> {
+    let mut changed = Vec::new();
+    for (agent, platform, account, derived) in rows {
+        let Some(existing): Option<Grant> = tx
+            .query_row(
+                "SELECT * FROM platform_grants WHERE agent=?1 AND platform=?2 \
+                 AND account=?3",
+                params![agent, platform, account],
+                grant_row,
+            )
+            .optional()?
+        else {
+            continue;
+        };
+        // What another approved app still derives for the same triple.
+        let still: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT scopes FROM app_grants WHERE app<>?1 AND agent=?2 \
+                 AND platform=?3 AND account=?4",
+            )?;
+            let rows = stmt.query_map(params![app, agent, platform, account], |r| {
+                let raw: String = r.get(0)?;
+                Ok(scopes_of(&raw))
+            })?;
+            rows.flatten().flatten().collect()
+        };
+        let kept: Vec<String> = existing
+            .scopes
+            .iter()
+            .filter(|s| !derived.contains(s) || still.contains(s))
+            .cloned()
+            .collect();
+        if kept == existing.scopes {
+            continue;
+        }
+        if kept.is_empty() {
+            tx.execute(
+                "DELETE FROM platform_grants WHERE agent=?1 AND platform=?2 \
+                 AND account=?3",
+                params![agent, platform, account],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE platform_grants SET scopes=?4 WHERE agent=?1 AND \
+                 platform=?2 AND account=?3",
+                params![agent, platform, account, scopes_json(&kept)?],
+            )?;
+        }
+        changed.push((agent.clone(), platform.clone(), account.clone()));
+    }
+    Ok(changed)
+}
+
 fn grant_row(row: &rusqlite::Row) -> rusqlite::Result<Grant> {
     let scopes: String = row.get("scopes")?;
     Ok(Grant {
@@ -724,32 +792,47 @@ impl Store {
     /// event in one transaction. The grants are the app's own —
     /// `app_grants` records which app derived each, so revoking the
     /// app's approval revokes exactly these and never a hand-made
-    /// grant. A re-approval re-derives: an existing app grant is
-    /// replaced with the current scope set.
+    /// grant. A re-approval re-derives: the previous derivation is
+    /// SUBTRACTED from `platform_grants` first, so an agent the team
+    /// dropped, or a scope the new structure no longer declares, loses
+    /// it — then the new set is merged in. Answers the `(agent,
+    /// platform, account)` triples whose platform grant shrank, so the
+    /// caller can drain the waiting effects that lost coverage.
     pub fn app_grants_set(
         &self,
         app: &str,
         grants: &[(String, String, String, Vec<String>)],
         by: &str,
-    ) -> Result<()> {
+    ) -> Result<Vec<(String, String, String)>> {
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
-        // The app's own prior grants go first — a re-approval
-        // re-derives, so a scope the new structure dropped is gone.
-        let prior: Vec<(String, String, String)> = {
-            let mut stmt =
-                tx.prepare("SELECT agent, platform, account FROM app_grants WHERE app=?1")?;
-            let rows = stmt.query_map(params![app], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        // The app's own prior derivation goes first — a re-approval
+        // re-derives, so a scope the new structure dropped, and an
+        // agent the new team dropped, lose it here before the new set
+        // is merged (the reviewer's finding on review 344).
+        let prior: Vec<(String, String, String, Vec<String>)> = {
+            let mut stmt = tx
+                .prepare("SELECT agent, platform, account, scopes FROM app_grants WHERE app=?1")?;
+            let rows = stmt.query_map(params![app], |r| {
+                let raw: String = r.get(3)?;
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, scopes_of(&raw)))
+            })?;
             rows.flatten().collect()
         };
-        for (agent, platform, account) in &prior {
-            tx.execute(
-                "DELETE FROM app_grants WHERE app=?1 AND agent=?2 AND platform=?3 \
-                 AND account=?4",
-                params![app, agent, platform, account],
+        tx.execute("DELETE FROM app_grants WHERE app=?1", params![app])?;
+        let mut changed = subtract_derived(&tx, app, &prior)?;
+        if !prior.is_empty() {
+            Self::event(
+                &tx,
+                PLATFORM_STREAM,
+                APP_GRANTS_REVOKED_EVENT,
+                json!({"app": app, "rederived": true, "by": by,
+                       "grants": prior.iter().map(|(agent, platform, account, scopes)| {
+                           json!({"agent": agent, "platform": platform,
+                                  "account": account, "scopes": scopes})
+                       }).collect::<Vec<_>>()}),
             )?;
         }
-        tx.execute("DELETE FROM app_grants WHERE app=?1", params![app])?;
         let mut granted = 0usize;
         for (agent, platform, account, scopes) in grants {
             identifier(agent, "Agent")?;
@@ -823,13 +906,32 @@ impl Store {
             )?;
         }
         tx.commit()?;
-        Ok(())
+        // A triple the new derivation covers again did not lose
+        // anything — the caller only drains what stayed uncovered.
+        changed.retain(|(agent, platform, account)| {
+            !grants.iter().any(|(a, p, acc, scopes)| {
+                a == agent && p == platform && acc == account && !scopes.is_empty()
+            })
+        });
+        Ok(changed)
+    }
+
+    /// Every app key that still holds derived grant rows (CAD-577) —
+    /// the daemon's sweep uses it to find the rows of an app that was
+    /// removed from the tracker, so a removal can never leave a
+    /// standing grant behind.
+    pub fn app_grants_apps(&self) -> Result<Vec<String>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT DISTINCT app FROM app_grants ORDER BY app")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.flatten().collect())
     }
 
     /// Revoke every grant an app's approval derived: the `app_grants`
     /// rows go, and each `(agent, platform, account)`'s `platform_grants`
-    /// scopes shrink by exactly the app's derived set — a hand-made
-    /// grant's other scopes survive. Answers the `(agent, platform,
+    /// scopes shrink by exactly the app's derived set, less whatever
+    /// another approved app still derives — a hand-made grant's other
+    /// scopes survive. Answers the `(agent, platform,
     /// account)` triples whose platform grant changed, so the caller
     /// can drain the waiting effects that lost a scope (CAD-506).
     pub fn app_grants_revoke(&self, app: &str, by: &str) -> Result<Vec<(String, String, String)>> {
@@ -845,38 +947,8 @@ impl Store {
             rows.flatten().collect()
         };
         tx.execute("DELETE FROM app_grants WHERE app=?1", params![app])?;
-        let mut changed = Vec::new();
+        let changed = subtract_derived(&tx, app, &rows)?;
         for (agent, platform, account, derived) in &rows {
-            let existing: Option<Grant> = tx
-                .query_row(
-                    "SELECT * FROM platform_grants WHERE agent=?1 AND platform=?2 \
-                     AND account=?3",
-                    params![agent, platform, account],
-                    grant_row,
-                )
-                .optional()?;
-            let Some(existing) = existing else {
-                continue;
-            };
-            let kept: Vec<String> = existing
-                .scopes
-                .iter()
-                .filter(|s| !derived.contains(s))
-                .cloned()
-                .collect();
-            if kept.is_empty() {
-                tx.execute(
-                    "DELETE FROM platform_grants WHERE agent=?1 AND platform=?2 \
-                     AND account=?3",
-                    params![agent, platform, account],
-                )?;
-            } else {
-                tx.execute(
-                    "UPDATE platform_grants SET scopes=?4 WHERE agent=?1 AND \
-                     platform=?2 AND account=?3",
-                    params![agent, platform, account, scopes_json(&kept)?],
-                )?;
-            }
             Self::event(
                 &tx,
                 PLATFORM_STREAM,
@@ -884,7 +956,6 @@ impl Store {
                 json!({"app": app, "agent": agent, "platform": platform,
                        "account": account, "scopes": derived, "by": by}),
             )?;
-            changed.push((agent.clone(), platform.clone(), account.clone()));
         }
         tx.commit()?;
         Ok(changed)

@@ -160,6 +160,9 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     route("POST", "/api/wiki/mkdir", RouteClass::AgentAllowed),
     route("POST", "/api/wiki/mv", RouteClass::AgentAllowed),
     route("POST", "/api/wiki/rm", RouteClass::AgentAllowed),
+    // CAD-577: the board relays `app_revoke` — withdrawing an approval
+    // and every grant it derived is the operator's, like the approval.
+    route("POST", "/api/apps/*/*/revoke", RouteClass::OperatorOnly),
     // CAD-577: the board relays `app_set_team` — the app's default team
     // is an operator-only write, attributed to the board's proven
     // connection by the daemon.

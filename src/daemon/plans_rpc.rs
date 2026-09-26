@@ -626,7 +626,9 @@ impl Shared {
                     )
                 })
                 .collect();
-            let _ = self.store.app_grants_set(&key, &grants, "operator");
+            if let Ok(changed) = self.store.app_grants_set(&key, &grants, "operator") {
+                self.drain_effect_scopes(changed);
+            }
         } else if let Ok(changed) = self.store.app_grants_revoke(&key, "operator") {
             self.drain_effect_scopes(changed);
         }
@@ -765,11 +767,12 @@ impl Shared {
                 )
             })
             .collect();
-        self.store.app_grants_set(
+        let changed = self.store.app_grants_set(
             &crate::issue::app::approval_key(project, name),
             &grants,
             "operator",
         )?;
+        self.drain_effect_scopes(changed);
         let payload = json!({
             "project": project,
             "name": name,

@@ -107,6 +107,17 @@ pub(super) fn approve_route(path: &str) -> Option<(&str, &str)> {
     (verb == "approve" && !project.is_empty() && !name.is_empty()).then_some((project, name))
 }
 
+/// `(project, name)` for `POST /api/apps/<project>/<name>/revoke` —
+/// `None` when the path is not that route (CAD-577). The operator's
+/// counterpart to `approve`: it withdraws the approval and revokes
+/// every grant the approval derived.
+pub(super) fn revoke_route(path: &str) -> Option<(&str, &str)> {
+    let tail = path.strip_prefix("/api/apps/")?;
+    let (project, rest) = tail.split_once('/')?;
+    let (name, verb) = rest.split_once('/')?;
+    (verb == "revoke" && !project.is_empty() && !name.is_empty()).then_some((project, name))
+}
+
 /// `(project, name)` for `POST /api/apps/<project>/<name>/team` —
 /// `None` when the path is not that route (CAD-577).
 pub(super) fn team_route(path: &str) -> Option<(&str, &str)> {
@@ -518,6 +529,37 @@ pub(super) fn approve(
     ) {
         Ok(out) => json_response(out),
         Err(e) => home::rpc_err(&e, "app_approve"),
+    }
+}
+
+/// `POST /api/apps/<project>/<name>/revoke` — the same `app_revoke`
+/// call `cadence app revoke` makes (CAD-577). Operator-only on the
+/// board (the route is listed in `operator::WRITE_ROUTES`), so the
+/// daemon attributes the revocation to the board's own proven
+/// connection. The body is `{}`; attribution is never a field.
+pub(super) fn revoke(
+    request: &mut Request,
+    state_dir: &std::path::Path,
+    key: &str,
+    name: &str,
+) -> HttpResp {
+    if !model::valid_key(key) || !model::valid_tag(name) {
+        return err_response(400, "bad project or app name");
+    }
+    let bytes = match read_body(request, BODY_CAP) {
+        Ok(bytes) => bytes,
+        Err(resp) => return resp,
+    };
+    if !approve_body_ok(&bytes) {
+        return err_response(400, "app revoke takes no fields — send {}");
+    }
+    match client::rpc(
+        state_dir,
+        "app_revoke",
+        json!({"project": key, "name": name}),
+    ) {
+        Ok(out) => json_response(out),
+        Err(e) => home::rpc_err(&e, "app_revoke"),
     }
 }
 
