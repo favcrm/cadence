@@ -950,11 +950,25 @@ button.refchip:hover {
    :root), so the thread's bottom padding, the jump pill's floor and the
    phone's Needs-you button all clear the dock exactly — the last
    message is never hidden, at any width, with the safe area respected
-   on a phone. */
+   on a phone. Below 1100px the same padding also clears the Needs-you
+   button, which is fixed in that band. */
 
 .chat-scroll {
   overscroll-behavior: contain;
   padding-bottom: calc(var(--dock-h, 7rem) + .75rem);
+}
+
+/* Below the rail breakpoint the Needs-you button is fixed in the band
+   above the dock, on the right. The thread's padding clears that button
+   as well as the dock, so the last message's box stays above it.
+   `--need-clear` is the button's height plus a gap. */
+@media (width < 1100px) {
+  :root {
+    --need-clear: 3.25rem;
+  }
+  .chat-scroll {
+    padding-bottom: calc(var(--dock-h, 7rem) + .75rem + var(--need-clear));
+  }
 }
 
 /* The empty and not-started states sit centred in the panel — the

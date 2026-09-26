@@ -89,6 +89,12 @@ function ok(cond, what) {
   if (!cond) throw new Error(`assertion failed: ${what}`);
 }
 
+/** Positive-area overlap. Shared edges do not count. */
+function overlaps(a, b) {
+  if (!a || !b) return false;
+  return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
+}
+
 /** The thread scroller (CAD-600) or the page (the before layout) at its
  *  tail — re-sent while the content is still growing, so a reply landing
  *  mid-scroll cannot leave the shot above the bottom. */
@@ -183,6 +189,8 @@ async function checkLayout(page) {
     const dock = document.querySelector("[data-chat-dock]");
     const scroller = document.querySelector("[data-chat-scroll]");
     const last = document.querySelector('ol[aria-label="messages"] > li:last-child');
+    const need = document.querySelector(".needbtn");
+    const needShown = !!(need && getComputedStyle(need).display !== "none" && need.getClientRects().length);
     const r = (el) => (el ? el.getBoundingClientRect() : null);
     return {
       docScroll: document.documentElement.scrollHeight,
@@ -194,6 +202,7 @@ async function checkLayout(page) {
         ? { scrollTop: scroller.scrollTop, scrollHeight: scroller.scrollHeight, clientHeight: scroller.clientHeight }
         : null,
       last: r(last),
+      need: needShown ? r(need) : null,
       padding: scroller ? getComputedStyle(scroller).paddingBottom : null,
     };
   });
@@ -215,6 +224,12 @@ async function checkLayout(page) {
     `the panel reaches the viewport's bottom (panel ${geom.panel.bottom}, window ${geom.winH})`,
   );
   ok(geom.last && geom.last.bottom <= geom.dock.top + 1, "the last message is never hidden behind the dock");
+  if (geom.need) {
+    ok(
+      !overlaps(geom.last, geom.need),
+      `the last message stays clear of Needs-you (message ${JSON.stringify(geom.last)} button ${JSON.stringify(geom.need)})`,
+    );
+  }
   ok(
     geom.padding && parseFloat(geom.padding) > 0,
     "the thread reserves the dock's height as bottom padding",
