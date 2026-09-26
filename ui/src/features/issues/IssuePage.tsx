@@ -4,14 +4,15 @@ import { fmtBytes, fmtTime } from "../../lib/fmt";
 import { resources } from "../../lib/resources";
 import { useQuery } from "../../lib/useResource";
 import type { AgentsPayload, IssueCard, IssueDetail, IssueHistoryEntry } from "../../lib/types";
+import { navigate } from "../../lib/useLocation";
 import Button from "../../ui/Button";
 import Md from "../../ui/Md";
 import Link from "../../ui/Link";
 import Select from "../../ui/Select";
 import { noDragReason } from "../projects/Card";
-import ConversationSlot from "./Conversation";
 import KickoffDialog from "./KickoffDialog";
-import LaneCard from "./LaneCard";
+import { LaneCard, type LanePayload } from "./LaneCard";
+import { LaneConversation } from "./LaneConversation";
 import {
   acceptanceItems,
   approveReason,
@@ -152,6 +153,22 @@ function PageBody({
   const fenced = agents.some((a) => a.state === "fenced" || a.state === "attention");
   const images = detail.artifacts.filter((f) => IMG.test(f.name));
   const files = detail.artifacts.filter((f) => !IMG.test(f.name));
+  const [lane, setLane] = useState<LanePayload | null | undefined>(undefined);
+  const [compose, setCompose] = useState<"ask" | "instruct">("ask");
+  useEffect(() => {
+    let live = true;
+    api
+      .lane(id)
+      .then((payload) => live && setLane(payload))
+      .catch(() => live && setLane(null));
+    return () => {
+      live = false;
+    };
+  }, [id, detail.rev]);
+  const reloadLane = () => {
+    void resources.issue(id).invalidate();
+    void api.lane(id).then(setLane).catch(() => setLane(null));
+  };
   const epics = issues.filter((i) => i.project === project && i.id !== id && (i.container || i.work?.type === "epic"));
   const hrefFor = (issueId: string) => {
     const card = issues.find((i) => i.id === issueId);
@@ -199,7 +216,7 @@ function PageBody({
             <div className="border border-ink-700 border-l-[3px] border-l-fail rounded-lg px-3.5 py-3 bg-fail/10">
               <strong className="text-ink-100">Agent fenced</strong>
               <p className="text-secondary text-ink-300 mt-1 m-0">
-                A bound agent is fenced or needs attention. Unfence is not on this page yet.
+                A bound agent is fenced or needs attention. Unfence is on the lane card.
               </p>
             </div>
           )}
@@ -262,7 +279,15 @@ function PageBody({
           {tab === "activity" && (
             <Activity id={id} rows={rows} readOnly={readOnly} rev={detail.rev} onWrite={onWrite} onError={onError} onOpen={onOpen} />
           )}
-          {tab === "conversation" && <ConversationSlot issueId={id} agentAlias={agents[0]?.alias ?? null} />}
+          {tab === "conversation" && (
+            <LaneConversation
+              issue={id}
+              agent={lane?.lane?.agent ?? agents[0]?.alias ?? null}
+              state={lane?.lane?.state ?? agents[0]?.state ?? null}
+              mode={compose}
+              onMode={setCompose}
+            />
+          )}
           {tab === "pr" && <PrPanel detail={detail} readOnly={readOnly} onWrite={onWrite} onError={onError} />}
           {tab === "evidence" && (
             <Evidence id={id} images={images} files={files} readOnly={readOnly} onWrite={onWrite} onError={onError} />
@@ -270,12 +295,14 @@ function PageBody({
         </main>
         <aside className="grid gap-3 px-4 lg:px-8 xl:px-4 xl:pr-8 py-5 xl:border-l xl:border-ink-700 min-w-0">
           <LaneCard
-            agents={agents}
-            refs={detail.refs}
-            activity={agents[0]?.message ?? null}
-            kickoffBlocked={blocked}
-            onKickoff={() => setKickoff(true)}
-            askHref={askWhy ? null : tabHref("conversation")}
+            issue={id}
+            lane={lane?.lane ?? null}
+            providers={lane?.providers ?? []}
+            onCompose={(mode) => {
+              setCompose(mode);
+              navigate(tabHref("conversation"));
+            }}
+            onChanged={reloadLane}
           />
           <Fields detail={detail} epics={epics} readOnly={readOnly} onWrite={onWrite} onError={onError} onPatch={patch} />
           <Links detail={detail} readOnly={readOnly} hrefFor={hrefFor} onWrite={onWrite} onError={onError} />
