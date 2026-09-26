@@ -732,6 +732,18 @@ enum Commands {
         /// Semicolon-separated cloud create params. Requires `--cloud`.
         #[arg(long, value_name = "PARAMS", requires = "cloud")]
         cloud_params: Option<String>,
+        /// Landlock-confine the worker (provider `pi`, CAD-556): the
+        /// child sees only its worktree, the repo's shared git dir and
+        /// dep caches, the toolchain, its own state dir and the PM
+        /// tracker — `agent show` prints the emitted policy. Refused
+        /// on a host without Landlock; unset defers to the pm.yaml
+        /// `[host] confine_pi_workers` default.
+        #[arg(long)]
+        confine: bool,
+        /// Explicitly unconfined — overrides a `[host]
+        /// confine_pi_workers` default for this one worker.
+        #[arg(long, conflicts_with = "confine")]
+        no_confine: bool,
     },
     /// Attach this terminal to a live agent's native endpoint. `name`
     /// may be an alias, a provider-native id, or a provider name when
@@ -6761,6 +6773,9 @@ fn run() -> Result<i32> {
                 permission_timeout_secs,
                 turn_idle_secs,
                 turn_max_secs,
+                // `cadence claude` has no --confine flag — Landlock
+                // confinement is the pi worker's (CAD-556).
+                confine: None,
             },
             &DevinOpts::default(),
             &CursorOpts::default(),
@@ -6841,6 +6856,8 @@ fn run() -> Result<i32> {
             turn_max_secs,
             cloud,
             cloud_params,
+            confine,
+            no_confine,
         } => {
             let mut devin = DevinOpts {
                 permission_mode: permission_mode.clone(),
@@ -6875,6 +6892,11 @@ fn run() -> Result<i32> {
                     permission_timeout_secs,
                     turn_idle_secs,
                     turn_max_secs,
+                    confine: if confine {
+                        Some(true)
+                    } else {
+                        no_confine.then_some(false)
+                    },
                 },
                 // The shared --permission-mode/--bypass flags feed the
                 // devin worker too — its four-mode vocabulary is validated
@@ -8878,6 +8900,10 @@ struct ClaudeOpts {
     turn_idle_secs: Option<u64>,
     /// `params.turn_max_secs` — optional absolute turn cap.
     turn_max_secs: Option<u64>,
+    /// `params.confine` (CAD-556) — pi only: `Some(true)` from
+    /// `--confine`, `Some(false)` from `--no-confine`, `None` defers
+    /// to the pm.yaml `[host] confine_pi_workers` default.
+    confine: Option<bool>,
 }
 
 /// Devin-specific launch options. Pty stores `permission_mode` so the
@@ -9333,6 +9359,24 @@ fn provider_launch(
                 params_obj.insert("turn_max_secs".to_string(), json!(secs));
             }
         }
+        // CAD-556 — the flag is tri-state: `--confine`/`--no-confine`
+        // always win over the pm.yaml `[host] confine_pi_workers`
+        // default the daemon applies when the key is absent entirely.
+        // `--confine` refuses up front on a host without Landlock —
+        // an opt-in that silently degraded to unconfined would be the
+        // worst kind of surprise.
+        if let Some(confine) = claude.confine {
+            if confine {
+                cadence_agent::confine::available()
+                    .map_err(|e| Error::rejected(format!("--confine: {e}")))?;
+            }
+            params_obj.insert("confine".to_string(), json!(confine));
+        }
+    } else if claude.confine.is_some() {
+        return Err(Error::rejected(
+            "--confine/--no-confine only apply to provider `pi` — Landlock \
+             confinement is the pi worker's today",
+        ));
     }
     if auto_ready {
         params_obj.insert(

@@ -63,7 +63,9 @@ ALIAS = os.environ.get("CADENCE_ALIAS", "")
 # received (values are never written — some are credentials). The
 # master's record lands in its cwd; every other alias's lands beside
 # the provider logs under `<state>/agents/` (a worker's cwd is a repo
-# checkout the test does not own).
+# checkout the test does not own). A Landlock-confined worker (CAD-556)
+# cannot write that sibling-of-its-own-dir path — the record then lands
+# inside its granted dir, `<state>/agents/<alias>/pi-record.json`.
 def record_launch():
     # Raw argv tail — the mode word sits first when one was given, same
     # shape the pi_master tests already assert on.
@@ -74,11 +76,15 @@ def record_launch():
         with open(os.path.join(os.getcwd(), "pi-env.json"), "w") as f:
             json.dump(sorted(os.environ), f)
     elif ALIAS and os.environ.get("CADENCE_STATE_DIR"):
-        record = os.path.join(
-            os.environ["CADENCE_STATE_DIR"], "agents", "pi-record-%s.json" % ALIAS
-        )
-        with open(record, "w") as f:
-            json.dump({"argv": argv_tail, "env": sorted(os.environ)}, f)
+        payload = json.dumps({"argv": argv_tail, "env": sorted(os.environ)})
+        agents = os.path.join(os.environ["CADENCE_STATE_DIR"], "agents")
+        try:
+            with open(os.path.join(agents, "pi-record-%s.json" % ALIAS), "w") as f:
+                f.write(payload)
+        except OSError:
+            # Confined: only `agents/<alias>` is writable.
+            with open(os.path.join(agents, ALIAS, "pi-record.json"), "w") as f:
+                f.write(payload)
 
 
 # `--session <path>`: an existing file resumes its stored session id

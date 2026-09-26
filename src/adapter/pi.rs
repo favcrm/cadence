@@ -53,6 +53,25 @@
 //!   guard is a grammar — tokenize, charset-refuse every shell
 //!   metacharacter, require `argv[0] == "cadence"`, then match an
 //!   argv-prefix table — never a string prefix match into `bash -c`.
+//! - A pi worker can opt into the same `cadence confine` launcher
+//!   (CAD-556 — `join … pi --confine` or `pm.yaml [host]
+//!   confine_pi_workers`, off by default): a per-worker Landlock
+//!   policy grants its worktree, the repo's shared git dir, the
+//!   effective/shared target dirs, the declared cargo + sccache
+//!   caches, the PM tracker and its own dir under the state dir —
+//!   reads the toolchain and system trees, and denies `$HOME` secrets
+//!   (`~/.ssh` keys, `~/.gitconfig`, `~/.pi`, `~/.claude`,
+//!   `credentials.toml`), every other agent's dir and the daemon store
+//!   by omission. `TMPDIR` is redirected into the worker dir (a shared
+//!   `/tmp` grant would expose every lane, and a denied one makes
+//!   rustc retry for ~1s) and `GIT_CONFIG_GLOBAL` at the worker's own
+//!   seeded file (git fatals on an unreadable `~/.gitconfig`). The
+//!   policy is a filesystem boundary only — Landlock does not gate
+//!   networking (the provider API and git remotes stay reachable) or
+//!   path-named unix-socket connects (the daemon socket is reachable
+//!   by design); it is not a capability sandbox against a process with
+//!   arbitrary exec. `agent show` reports `confined` and the emitted
+//!   read/write sets.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -409,20 +428,29 @@ fn build_command(env: &ProviderEnv, agent: &Agent, state_dir: &Path) -> Result<V
     Ok(cmd)
 }
 
-/// The full launch argv: [`build_command`], and for the master that
-/// line wrapped in `cadence confine` with its policy (CAD-439 — the
-/// same Landlock boundary as the Claude master; nothing is widened
-/// beyond Pi's own install tree and config dir).
+/// The full launch argv: [`build_command`], and for a confined
+/// endpoint that line wrapped in `cadence confine` — the master
+/// always (CAD-439), a worker when its `confine` param asks
+/// (CAD-556). A confined launch on a host without Landlock is
+/// refused, never silently unconfined.
 fn launch_command(
     env: &ProviderEnv,
     state_dir: &Path,
     agent: &Agent,
 ) -> Result<(Vec<String>, Option<crate::confine::Policy>)> {
     let command = build_command(env, agent, state_dir)?;
-    if !master_confined(env, agent) {
+    if master_confined(env, agent) {
+        let (confine, policy) = pi_master_confinement(env, state_dir);
+        let argv = crate::master::confine_argv(&confine, &policy, &command);
+        return Ok((argv, Some(policy)));
+    }
+    if !worker_confined(agent) {
         return Ok((command, None));
     }
-    let (confine, policy) = pi_master_confinement(env, state_dir);
+    // Opt-in confinement cannot quietly lapse: `--confine` on a host
+    // that cannot confine is an error, not a plain launch.
+    crate::master::confinement_available(env)?;
+    let (confine, policy) = pi_worker_confinement(env, state_dir, agent);
     let argv = crate::master::confine_argv(&confine, &policy, &command);
     Ok((argv, Some(policy)))
 }
@@ -524,6 +552,253 @@ fn pi_confine_inputs(
         extra_read,
         extra_write: split_paths(env.var(crate::master::CONFINE_EXTRA_WRITE_ENV)),
     }
+}
+
+/// Daemon env naming extra paths (`:`-separated) a pi WORKER may read,
+/// or also write — the escape hatch for caches and push targets the
+/// built-in policy does not know (a `file://` remote, a private
+/// registry dir, a uv/npm cache). Set by whoever starts the daemon,
+/// never by an agent.
+pub const CONFINE_WORKER_EXTRA_READ_ENV: &str = "CADENCE_PI_WORKER_CONFINE_READ";
+pub const CONFINE_WORKER_EXTRA_WRITE_ENV: &str = "CADENCE_PI_WORKER_CONFINE_WRITE";
+
+/// Is `agent` a worker launched confined? Opt-in (`params.confine`,
+/// CAD-556 — `join … pi --confine` or `pm.yaml [host]
+/// confine_pi_workers`); the master alias's posture is `is_confined`,
+/// not this. Availability is checked by the caller. `agent_show`
+/// reports this verbatim as `confined`.
+pub fn worker_confined(agent: &Agent) -> bool {
+    !crate::master::is_master(&agent.alias)
+        && agent
+            .params
+            .as_ref()
+            .and_then(|p| p.get("confine"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+}
+
+/// The directory git uses for object/ref writes — the worktree's own
+/// `.git` for a plain clone, the main checkout's `.git` for a linked
+/// worktree (`git rev-parse --git-common-dir`). `None` when the cwd is
+/// not a repo (the policy then just grants the cwd).
+fn git_common_dir(cwd: &Path) -> Option<PathBuf> {
+    let out = crate::reaper::output(
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(["rev-parse", "--git-common-dir"]),
+    )
+    .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let dir = PathBuf::from(&text);
+    let dir = if dir.is_absolute() {
+        dir
+    } else {
+        cwd.join(dir)
+    };
+    Some(dir.canonicalize().unwrap_or(dir))
+}
+
+/// The confining binary and policy for a pi WORKER (CAD-556) — the
+/// same `cadence confine` launcher as the master, a wider but still
+/// enumerated set. A worker edits, builds, commits and reports:
+///
+/// - **write**: its worktree (`agent.cwd`); the repo's shared git dir
+///   when the worktree links one (objects, refs, the per-worktree
+///   index); its cargo target dir ([`crate::worktree::
+///   effective_target_dir`] — the declared `--target-dir`/
+///   `CARGO_TARGET_DIR`/config value) plus the shared dep cache
+///   ([`crate::worktree::shared_target_dir`]) the worktree's target
+///   symlinks into; its own dir under the state dir (`pi/` config,
+///   session file, `tmp/` — the confined child's TMPDIR is redirected
+///   there because a `/tmp` write grant would expose every lane);
+///   the PM tracker (`issue` verbs commit to it); the cargo
+///   `registry`/`git` caches and their lock files (a worker fetches
+///   and updates deps — proven: cargo fails building without them);
+///   the sccache dir (`rustc-wrapper` writes miss entries).
+/// - **read**: the master's system trees; the programs the launch
+///   resolves (pi, its interpreter and npm package dir, `cadence`,
+///   the `confine` exe); its briefing file and the sandbox marker;
+///   `RUSTUP_HOME` (toolchain bins execute from it) and
+///   `$CARGO_HOME/bin` (the rustup shims on PATH); `~/.ssh/config` and
+///   `~/.ssh/known_hosts` — the two NON-secret ssh files, so `git
+///   push` over ssh + agent works while the keys themselves stay
+///   denied; `$CARGO_HOME/config.toml` — cargo aborts the whole run on
+///   an unreadable config (proven), and this file carries the
+///   rustc-wrapper/source-mirror settings builds need. `credentials.
+///   toml` is never in the policy — it is the token file.
+/// - **denied** by omission: `$HOME` itself and everything under it
+///   not named above — `~/.ssh` keys, `~/.pi`, `~/.claude`, other
+///   agents' dirs under the state dir (`<state>/agents/<alias>` is the
+///   only granted one), the daemon store. Network is not covered by
+///   Landlock — unchanged from the unconfined posture (the provider's
+///   API and git remotes must still be reachable).
+///
+/// `GIT_CONFIG_GLOBAL` is redirected to the worker's own file by
+/// `open` (git fatals on an unreadable `~/.gitconfig` — proven).
+pub fn pi_worker_confinement(
+    env: &ProviderEnv,
+    state_dir: &Path,
+    agent: &Agent,
+) -> (String, crate::confine::Policy) {
+    use crate::master::{program_dirs, split_paths, which, with_interpreter};
+    let path = env.var("PATH");
+    let home = env.var("HOME").filter(|h| !h.is_empty()).map(PathBuf::from);
+    let command = pi_command(env);
+    let cwd = PathBuf::from(&agent.cwd);
+
+    let mut read: Vec<PathBuf> = crate::master::CONFINE_SYSTEM_READ
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+    let mut write: Vec<PathBuf> = crate::master::CONFINE_SYSTEM_WRITE
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+
+    // Programs the launch line and the worker's own commands resolve:
+    // pi + its interpreter/package, cadence (the CLI a worker calls:
+    // `message result`, `issue`), the `confine` exe that wraps it all.
+    let mut programs = Vec::new();
+    if let Some(p) = command.first().and_then(|c| which(c, path.as_deref())) {
+        programs.extend(with_interpreter(&p, path.as_deref()));
+        if let Some(root) = package_root(&p) {
+            programs.push(root);
+        }
+    }
+    if let Some(p) = which("cadence", path.as_deref()) {
+        programs.push(p);
+    }
+    programs.push(PathBuf::from(confine_command(env)));
+    for program in &programs {
+        for dir in program_dirs(program) {
+            if !read.contains(&dir) {
+                read.push(dir);
+            }
+        }
+    }
+
+    let params = agent.params.clone().unwrap_or(Value::Null);
+    read.push(crate::client::briefing_path(
+        state_dir,
+        &params,
+        &agent.alias,
+    ));
+    if let Some(marker) = crate::sandbox::marker_for(state_dir) {
+        read.push(marker);
+    }
+
+    // The worktree and everything a commit/build writes into or
+    // through: the common git dir (objects, refs, per-worktree index),
+    // the effective target dir (covers `build.target-dir` and a
+    // declared `CARGO_TARGET_DIR`), and the shared dep cache the
+    // worktree's target links into (`<root>/.cadence/target/shared`).
+    write.push(cwd.clone());
+    if let Some(common) = git_common_dir(&cwd) {
+        write.push(common.clone());
+        if let Some(root) = common
+            .parent()
+            .filter(|_| common.file_name().is_some_and(|n| n == ".git"))
+        {
+            write.push(crate::worktree::shared_target_dir(root));
+        }
+    }
+    let target = crate::worktree::effective_target_dir(&cwd);
+    if target != cwd.join("target") {
+        write.push(target);
+    }
+
+    // Private state: the worker's own dir (config, session, tmp),
+    // the tracker, and the declared toolchain caches.
+    if let Ok(dir) = pi_worker_dir(state_dir, &agent.alias) {
+        write.push(dir);
+    }
+    let pm_dir = env
+        .var("CADENCE_PM_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| crate::issue::default_dir().ok());
+    if let Some(pm) = pm_dir {
+        write.push(pm);
+    }
+    let cargo_home = env
+        .var("CARGO_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|h| h.join(".cargo")));
+    if let Some(cargo) = &cargo_home {
+        read.push(cargo.join("bin"));
+        // `config.toml` — cargo dies on EACCES (proven); the rustc-
+        // wrapper and source mirrors live here. `credentials.toml`
+        // (registry tokens) is deliberately NOT granted.
+        read.push(cargo.join("config.toml"));
+        for cache in ["registry", "git", ".global-cache"] {
+            write.push(cargo.join(cache));
+        }
+        write.push(cargo.join(".package-cache"));
+    }
+    let rustup_home = env
+        .var("RUSTUP_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|h| h.join(".rustup")));
+    if let Some(rustup) = rustup_home {
+        read.push(rustup);
+    }
+    let sccache = env
+        .var("SCCACHE_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|h| h.join(".cache/sccache")));
+    if let Some(dir) = sccache {
+        write.push(dir);
+    }
+    if let Some(home) = &home {
+        // sccache's own config (`~/.config/sccache/config`) — settings,
+        // not secrets. The ssh files are the non-secret pair only:
+        // keys under `~/.ssh` stay denied; agent auth rides
+        // SSH_AUTH_SOCK, a unix-socket connect Landlock does not gate.
+        read.push(home.join(".config/sccache"));
+        read.push(home.join(".ssh/config"));
+        read.push(home.join(".ssh/known_hosts"));
+    }
+    read.extend(split_paths(env.var(CONFINE_WORKER_EXTRA_READ_ENV)));
+    write.extend(split_paths(env.var(CONFINE_WORKER_EXTRA_WRITE_ENV)));
+    (confine_command(env), crate::confine::Policy { read, write })
+}
+
+/// Resolve the operator's git identity (`user.name`, `user.email`)
+/// into the worker's private `gitconfig` — the file
+/// `GIT_CONFIG_GLOBAL` points at once confined. Written only when the
+/// operator has an identity to copy; an absent file reads as empty
+/// config, so a repo-local `git config user.*` or none is honoured the
+/// same way an unconfined worker would.
+fn seed_worker_gitconfig(dir: &Path, env: &ProviderEnv) -> Result<()> {
+    let Some(home) = env.var("HOME").filter(|h| !h.is_empty()) else {
+        return Ok(());
+    };
+    let get = |key: &str| {
+        crate::reaper::output(
+            std::process::Command::new("git")
+                .env("HOME", &home)
+                .args(["config", "--global", "--get", key]),
+        )
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+    };
+    let (Some(name), Some(email)) = (get("user.name"), get("user.email")) else {
+        return Ok(());
+    };
+    std::fs::write(
+        dir.join("gitconfig"),
+        format!("[user]\n\tname = {name}\n\temail = {email}\n"),
+    )?;
+    Ok(())
 }
 
 /// The generated guard extension — the Pi analogue of
@@ -738,9 +1013,9 @@ impl PiAdapter {
         }
     }
 
-    /// The master's confinement, appended to its provider log so an
+    /// The emitted confinement, appended to the provider log so an
     /// operator can see why a path is unreadable (same as Claude).
-    fn log_confinement(&self, policy: &crate::confine::Policy) -> Result<()> {
+    fn log_confinement(&self, role: &str, policy: &crate::confine::Policy) -> Result<()> {
         if let Some(dir) = self.log_path.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -751,7 +1026,7 @@ impl PiAdapter {
         std::io::Write::write_all(
             &mut log,
             format!(
-                "cadence: master confinement: {}\n",
+                "cadence: {role} confinement: {}\n",
                 policy.to_args().join(" ")
             )
             .as_bytes(),
@@ -1052,7 +1327,8 @@ impl ProviderAdapter for PiAdapter {
         }
         let (command, confinement) = launch_command(&self.env, &self.state_dir, agent)?;
         if let Some(policy) = &confinement {
-            self.log_confinement(policy)?;
+            let role = if master { "master" } else { "worker" };
+            self.log_confinement(role, policy)?;
         }
         let generation = Uuid::new_v4().simple().to_string()[..12].to_string();
         *self.shared.generation.lock().unwrap() = generation.clone();
@@ -1101,6 +1377,24 @@ impl ProviderAdapter for PiAdapter {
                 config.to_string_lossy().to_string(),
             ));
             env.push(("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()));
+            if confinement.is_some() {
+                // CAD-556: under Landlock the daemon's TMPDIR may be a
+                // shared root — the worker gets its own so `mktemp`
+                // and friends stay inside the policy. And git reads
+                // `~/.gitconfig` fatally on EACCES: point the global
+                // config at the worker's file (seeded with the
+                // operator's identity — repo-local `user.*` still
+                // outranks it, empty is fine).
+                let dir = pi_worker_dir(&self.state_dir, &agent.alias)?;
+                let tmp = dir.join("tmp");
+                ensure_private_dir(&tmp)?;
+                seed_worker_gitconfig(&dir, &self.env)?;
+                env.push(("TMPDIR".to_string(), tmp.to_string_lossy().to_string()));
+                env.push((
+                    "GIT_CONFIG_GLOBAL".to_string(),
+                    dir.join("gitconfig").to_string_lossy().to_string(),
+                ));
+            }
         }
         // No update checks or telemetry on any managed startup path.
         env.push(("PI_OFFLINE".to_string(), "1".to_string()));

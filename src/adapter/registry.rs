@@ -375,6 +375,7 @@ pub static SPECS: &[EndpointSpec] = &[
             "upstream",
             "agents_md",
             "stall_secs",
+            "confine",
         ],
         session_id_label: "Pi session",
         respond_rejection: Some(
@@ -1117,7 +1118,7 @@ pub fn pi_effort(level: &str) -> Result<()> {
 
 /// Launch params `agent set --next-launch` may change: stored for the
 /// next open, never pushed to the live process.
-const NEXT_LAUNCH_PARAMS: &[&str] = &["model", "effort", "approval_policy"];
+const NEXT_LAUNCH_PARAMS: &[&str] = &["model", "effort", "approval_policy", "confine"];
 
 /// Who may change an agent param through `agent set` (CAD-149) — see
 /// [`param_class`]. Every key a spec lists in `launch_params` or
@@ -1178,6 +1179,9 @@ pub const POSTURE_PARAMS: &[&str] = &[
     "platform",
     "tags",
     "attachment_urls",
+    // CAD-556: opting a pi worker out of its Landlock policy widens
+    // what it can touch — an agent must never shed that itself.
+    "confine",
 ];
 
 /// The class of one param key. A key no list names is trust-bearing —
@@ -1218,10 +1222,13 @@ pub fn validate_next_launch_param(
         (_, Value::Null) => Ok(()),
         ("effort", Value::String(level)) if provider == "claude" => claude_effort(level),
         ("effort", Value::String(level)) if provider == "codex" => codex_effort(level),
+        ("effort", Value::String(level)) if provider == "pi" => pi_effort(level),
         ("approval_policy", Value::String(policy)) => codex_approval_policy(policy),
+        ("confine", Value::Bool(_)) => Ok(()),
         ("model", Value::String(m)) if !m.trim().is_empty() => Ok(()),
         _ => Err(Error::rejected(format!(
-            "'{key}' needs a non-empty string value, or a bare key to clear it"
+            "'{key}' needs a non-empty string value (or bool for confine), \
+             or a bare key to clear it"
         ))),
     }
 }
@@ -1606,6 +1613,22 @@ pub fn validate_launch_params(provider: &str, kind: &str, params: &Value) -> Res
                     )))
                 }
             }
+        }
+    }
+    // CAD-556: Landlock confinement exists for `pi/managed` only —
+    // anywhere else the flag would be silently meaningless, so it is
+    // refused instead of dropped.
+    if let Some(v) = params.get("confine") {
+        if !(provider == "pi" && kind == "managed") {
+            return Err(Error::rejected(
+                "'confine' only applies to pi/managed — the pi worker's \
+                 Landlock policy is the only worker confinement today",
+            ));
+        }
+        if !v.is_boolean() {
+            return Err(Error::rejected(
+                "'confine' must be a boolean (set by `join … pi --confine`)",
+            ));
         }
     }
     if provider == "devin" && kind == "cloud" {
