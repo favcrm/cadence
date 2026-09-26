@@ -2196,6 +2196,15 @@ fn write_route(
     }
     // The Needs-you rail's snooze/dismiss (CAD-574) — operator-only,
     // relayed to the daemon's `needs_dismiss`.
+    if let Some((id, verb)) = home::permission_route(path) {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let resp = home::decide_permission(&mut request, state_dir, id, verb);
+        send(request, resp);
+        return;
+    }
     if let Some(verb) = home::needs_route(path) {
         if *method != Method::Post {
             send(request, err_response(405, "method not allowed"));
@@ -2911,6 +2920,15 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             send(request, model_defaults_get(state_dir, opts.read_only));
         }
         "/api/platform-account" => send(request, platform_account::get(opts)),
+        // CAD-615: the operator's master permission rules and pending
+        // requests. The daemon refuses anyone who is not the operator.
+        "/api/master/permissions" => {
+            let resp = match client::rpc(state_dir, "master_permission_list", json!({})) {
+                Ok(out) => json_response(out),
+                Err(e) => home::rpc_err(&e, "master_permission_list"),
+            };
+            send(request, resp);
+        }
         // The serving binary's build id and nothing else — cheap, and
         // unauthenticated like `/api/health`, so a tab whose stream is
         // stuck reconnecting can compare it against its own bundle's.

@@ -10,6 +10,7 @@ import IssuePage from "./features/issues/IssuePage";
 import { issuePath, laneFollowsStream, refreshIssueIds } from "./features/issues/model";
 import Epics from "./features/projects/Epics";
 import Milestones from "./features/projects/Milestones";
+import MasterPermissions from "./features/settings/MasterPermissions";
 import Memory from "./features/settings/Memory";
 import ModelDefaults from "./features/settings/ModelDefaults";
 import PlatformAccount from "./features/settings/PlatformAccount";
@@ -859,6 +860,11 @@ export default function App() {
               { label: "Memory", href: hrefFor({ screen: "settings", section: "memory" }), on: route.section === "memory" },
               { label: "Update", href: hrefFor({ screen: "settings", section: "update" }), on: route.section === "update" },
               ...(meta?.platform_account_configured ? [{ label: "Account", href: hrefFor({ screen: "settings", section: "account" }), on: route.section === "account" }] : []),
+              {
+                label: "Master permissions",
+                href: hrefFor({ screen: "settings", section: "permissions" }),
+                on: route.section === "permissions",
+              },
             ]}
           />
         )}
@@ -870,6 +876,7 @@ export default function App() {
         {route.screen === "settings" && route.section === "update" && (
           <Update viewer={{ readOnly, operator: meta?.operator === true }} />
         )}
+        {route.screen === "settings" && route.section === "permissions" && <MasterPermissions />}
         {screen === "login" && (
           <Login
             onSignedIn={() => {

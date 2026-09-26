@@ -20,7 +20,7 @@ import { readAppUrlState, type AppTab, type ProjectView } from "./urlState";
  *   /wiki/edit|history|upload/<path>   its modes for one path
  *   /wiki/search[/<query>]     full-text search
  *   /setup                     first-run setup
- *   /settings[/memory]         model defaults, memory
+ *   /settings[/memory|update|account|permissions]  model defaults, memory, update, account, master permissions
  *   /login                     a `cadence ui login` link lands here
  *
  * Query parameters carry the rest: `project` (the in-page filter on
@@ -33,7 +33,7 @@ import { readAppUrlState, type AppTab, type ProjectView } from "./urlState";
  */
 
 export type ProjectSection = "overview" | "issues" | "epics" | "milestones" | "context" | "workflows";
-export type SettingsSection = "models" | "memory" | "update" | "account";
+export type SettingsSection = "models" | "memory" | "update" | "account" | "permissions";
 /** The wiki's modes; `browse` opens a path by its kind (CAD-581). */
 export type WikiMode = "browse" | "edit" | "history" | "search" | "upload";
 
@@ -195,6 +195,7 @@ export function matchRoute(pathname: string): Route {
       if (a === "memory") return { screen: "settings", section: "memory" };
       if (a === "update") return { screen: "settings", section: "update" };
       if (a === "account") return { screen: "settings", section: "account" };
+      if (a === "permissions") return { screen: "settings", section: "permissions" };
     }
   }
   return { screen: "notFound", path: pathname };
@@ -237,7 +238,9 @@ export function routePath(route: Route): string {
     case "settings":
       if (route.section === "account") return "/settings/account";
       if (route.section === "memory") return "/settings/memory";
-      return route.section === "update" ? "/settings/update" : "/settings";
+      if (route.section === "update") return "/settings/update";
+      if (route.section === "permissions") return "/settings/permissions";
+      return "/settings";
     case "notFound":
       return route.path;
   }

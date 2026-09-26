@@ -130,6 +130,13 @@ impl Op {
 pub fn allowed(caller: &Caller, op: Op, segs: &[&str]) -> Result<()> {
     let verb = || format!("wiki {} '/{}' refused", op.as_str(), segs.join("/"));
     let no = |why: &str| -> Result<()> { Err(Error::rejected(format!("{}: {why}", verb()))) };
+    // CAD-615: the operator's permission rules. Not a knowledge page,
+    // not a profile write, not something the master can put.
+    if op == Op::Write && segs == ["agents", "master", "permissions.yaml"] {
+        return no(
+            "agents/master/permissions.yaml is operator-owned — only a permission decision writes it",
+        );
+    }
     let top = segs.first().copied().unwrap_or("");
     match top {
         "" => match op {
