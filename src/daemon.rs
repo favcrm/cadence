@@ -4786,6 +4786,100 @@ impl Shared {
         } else {
             agent_params
         };
+        // CAD-559: a pi agent registers with its launch model already
+        // decided — explicit `--model`, else whatever `model_defaults`
+        // resolves (role/provider entries; `provider_default` leaves the
+        // slot empty for pi), else `[pi].models.default.worker`, else
+        // refuse. Whatever lands must be on `[pi].models.allow`; the
+        // adapter re-checks the stored value at every open. The gate
+        // sees the EFFECTIVE params — a [host]-defaulted `confine`
+        // survives into the stored row.
+        let mut pi_params: Option<String> = None;
+        let mut pi_selection: Option<Value> = None;
+        let parsed = if provider == "pi" {
+            // `provider_default` means "whatever the provider picks" —
+            // the exact silent fallback this gate removes, so pi
+            // refuses it outright rather than collide downstream.
+            if crate::model_defaults::parse_model_policy(model_policy)?
+                == crate::model_defaults::ModelPolicy::ProviderDefault
+            {
+                return Err(Error::rejected(
+                    "pi has no provider default — pass --model <provider/id> or \
+                     set pi.models.default.* in pm.yaml (CAD-559)",
+                ));
+            }
+            let defaults = self.store.model_defaults()?;
+            let resolved = crate::model_defaults::resolve(crate::model_defaults::ResolveRequest {
+                provider,
+                endpoint_kind: endpoint,
+                runtime_role: role,
+                team_role,
+                model_policy,
+                params: agent_params,
+                config: &defaults.config,
+                revision: defaults.revision,
+            })?;
+            let picked = resolved
+                .model_selection
+                .as_ref()
+                .and_then(|sel| sel.get("model"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if resolved.model_selection.is_none() {
+                // An endpoint that cannot carry a model (inbox) has no
+                // launch model to gate.
+                parsed
+            } else {
+                // No tracker dir means no policy — an absent `[pi]`
+                // allows nothing either way.
+                let policy = match &pm_dir {
+                    Some(dir) => crate::pi_policy::read(dir)?,
+                    None => None,
+                };
+                match picked {
+                    // The defaults layer resolved a model — run the
+                    // gate on it and pass the caller's params through
+                    // so `register_agent` re-derives that provenance
+                    // (explicit, role_default, provider_baseline)
+                    // instead of naming it explicit.
+                    Some(model) => {
+                        crate::pi_policy::require_allowed(policy.as_ref(), &model)?;
+                        parsed
+                    }
+                    // Nothing resolved — `[pi].models.default` fills
+                    // the slot. The row stores the launch model (the
+                    // adapter replays params at open) and the
+                    // provenance names the operator's policy, not a
+                    // caller flag.
+                    None => {
+                        let role_key = if crate::master::is_master(alias) {
+                            "master"
+                        } else {
+                            "worker"
+                        };
+                        let model =
+                            crate::pi_policy::resolve_model(policy.as_ref(), role_key, None)?;
+                        let mut merged = match resolved.params.as_deref() {
+                            Some(raw) => serde_json::from_str::<Value>(raw)?
+                                .as_object()
+                                .cloned()
+                                .unwrap_or_default(),
+                            None => serde_json::Map::new(),
+                        };
+                        merged.insert("model".to_string(), json!(model));
+                        let text = Value::Object(merged).to_string();
+                        pi_params = Some(text.clone());
+                        pi_selection = Some(crate::model_defaults::pi_policy_default_selection(
+                            resolved.team_role.as_deref().unwrap_or(role),
+                            &model,
+                        ));
+                        serde_json::from_str::<Value>(&text)?
+                    }
+                }
+            }
+        } else {
+            parsed
+        };
         self.authorize_register(alias, &parsed, peer_pid)?;
         self.store.register_agent(&crate::store::NewAgent {
             alias,
@@ -4795,10 +4889,16 @@ impl Shared {
             cwd: &cwd.to_string_lossy(),
             sandbox,
             instructions,
-            params: agent_params,
+            params: pi_params.as_deref().or(agent_params),
             team_role,
             model_policy,
         })?;
+        // CAD-559: when `[pi].models.default` filled the launch model,
+        // `register_agent` labeled it `explicit` — restamp the real
+        // provenance before the row can be read or launched.
+        if let Some(selection) = &pi_selection {
+            self.store.set_model_selection(alias, selection)?;
+        }
         // A mailbox has no actor — it is `idle` with its pseudo-endpoint
         // from registration and simply accrues queued messages.
         if !registry::has_actor(provider, endpoint) {
@@ -6220,6 +6320,22 @@ impl Shared {
                 )?;
             } else {
                 registry::validate_live_param(&agent.provider, &agent.endpoint_kind, key, value)?;
+            }
+        }
+        // CAD-559: a pi agent's model is on the operator's allowlist or
+        // it is refused — and it can never be cleared, because a pi
+        // launch without `--model` would silently fall back.
+        if agent.provider == "pi" && patch.as_object().unwrap().contains_key("model") {
+            let policy = crate::pi_policy::read(&self.pm_dir()?)?;
+            match patch["model"].as_str() {
+                Some(model) => crate::pi_policy::require_allowed(policy.as_ref(), model)?,
+                None => {
+                    return Err(Error::rejected(
+                        "agent set refused: a pi agent always launches on an \
+                         explicit allowlisted model — the model key cannot be \
+                         cleared (CAD-559)",
+                    ))
+                }
             }
         }
         let mut audit = caller_audit(&caller);

@@ -41,6 +41,9 @@ pub const SOURCE_PROVIDER_BASELINE: &str = "provider_baseline";
 pub const SOURCE_PROVIDER_DEFAULT: &str = "provider_default";
 pub const SOURCE_LEGACY_CONFIGURED: &str = "legacy_configured";
 pub const SOURCE_LEGACY_PROVIDER_DEFAULT: &str = "legacy_provider_default";
+/// pm.yaml's `[pi].models.default` filled the launch model — the
+/// operator's policy chose it, not the register/start caller.
+pub const SOURCE_PI_POLICY_DEFAULT: &str = "pi_policy_default";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelPolicy {
@@ -842,6 +845,19 @@ pub fn resolve(request: ResolveRequest<'_>) -> Result<ResolvedRegistration> {
         team_role,
         model_selection: Some(model_selection),
     })
+}
+
+/// Provenance when pm.yaml's `[pi].models.default` fills the launch
+/// model (CAD-559): `register_agent` re-derives `explicit` from the
+/// merged params, so the caller stamps this over it. `revision` is
+/// null — the operator's pm.yaml is not a revisioned document.
+pub fn pi_policy_default_selection(lookup_role: &str, model: &str) -> Value {
+    selection(
+        SOURCE_PI_POLICY_DEFAULT,
+        lookup_role,
+        None,
+        Some(model.to_string()),
+    )
 }
 
 /// Provenance for an explicit next-launch model change. Clearing the

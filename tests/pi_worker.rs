@@ -27,6 +27,13 @@ fn fake_pi(mode: &str) -> String {
 }
 
 fn worker(alias: &str, cwd: &Path, params: Value) -> Agent {
+    let mut params = params;
+    // CAD-559: a pi agent opens only on an explicit allowlisted model —
+    // tests that want another value (or none) set the key themselves.
+    if let Some(p) = params.as_object_mut() {
+        p.entry("model".to_string())
+            .or_insert_with(|| json!("fake/model-1"));
+    }
     Agent {
         alias: alias.into(),
         provider: "pi".into(),
@@ -61,6 +68,11 @@ fn worker(alias: &str, cwd: &Path, params: Value) -> Agent {
 fn adapter(mode: &str, state: &Path, own: &[(&str, String)]) -> PiAdapter {
     let env = ProviderEnv::default();
     env.set("CADENCE_PI_COMMAND", fake_pi(mode));
+    // CAD-559: pi opens only under an operator `[pi]` policy — `own`
+    // can still repoint CADENCE_PM_DIR at a test's own pm.yaml.
+    let pm = state.join("pm");
+    pi_policy_pm(&pm);
+    env.set("CADENCE_PM_DIR", pm.to_string_lossy().to_string());
     for (k, v) in own {
         env.set(k, v.clone());
     }
@@ -602,4 +614,145 @@ fn idle_stopped_worker_resumes_its_session() {
         .filter(|l| l.contains("\"prompt\""))
         .count();
     assert_eq!(prompts, 2, "session file {session_file:?}");
+}
+
+// ---- CAD-559: the operator's model gate ----
+
+/// Registration decides the launch model at the door: an explicit
+/// `params.model` wins but must be on `[pi].models.allow`; absent one,
+/// `[pi].models.default.worker` lands; a `provider_default` policy is
+/// the silent fallback by another name and refused outright.
+#[test]
+fn register_resolves_and_gates_the_model() {
+    let d = TestDaemon::start();
+    let _pi = d.mock_pi("normal");
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    // Off the allowlist — refused, and no row lands.
+    let err = d
+        .fixture_rpc(
+            "agent_register",
+            json!({"alias": "wd", "provider": "pi", "endpoint_kind": "managed",
+                   "cwd": cwd, "params": "{\"model\": \"evil/unlisted-9\"}"}),
+        )
+        .unwrap_err();
+    let text = err.to_string();
+    assert!(
+        text.contains("evil/unlisted-9") && text.contains("allowlist"),
+        "{text}"
+    );
+    assert!(
+        d.rpc("agent_show", json!({"alias": "wd"})).is_err(),
+        "a refused register stored a row"
+    );
+    // provider_default means "whatever the provider picks" — refused.
+    let err = d
+        .fixture_rpc(
+            "agent_register",
+            json!({"alias": "wd", "provider": "pi", "endpoint_kind": "managed",
+                   "cwd": cwd, "model_policy": "provider_default"}),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("provider default"), "{err}");
+    // No model at all — the worker role default lands on the row and
+    // on the child argv.
+    d.fixture_rpc(
+        "agent_register",
+        json!({"alias": "wd", "provider": "pi", "endpoint_kind": "managed",
+               "cwd": cwd}),
+    )
+    .unwrap();
+    d.wait_agent("wd", "idle", 20);
+    let show = d.rpc("agent_show", json!({"alias": "wd"})).unwrap();
+    assert_eq!(show["agent"]["params"]["model"], "fake/model-1", "{show}");
+    // The provenance names the operator's policy, not a caller flag.
+    assert_eq!(
+        show["agent"]["model_selection"]["source"], "pi_policy_default",
+        "{show}"
+    );
+    let rec: Value = serde_json::from_str(
+        &std::fs::read_to_string(d.state.join("agents/pi-record-wd.json")).unwrap(),
+    )
+    .unwrap();
+    let argv: Vec<String> = serde_json::from_value(rec["argv"].clone()).unwrap();
+    assert!(
+        argv.windows(2).any(|w| w == ["--model", "fake/model-1"]),
+        "{argv:?}"
+    );
+}
+
+/// The gate is fail-closed: a tracker with no `[pi]` table allows no
+/// model at all — even an explicit one. The daemon gets a private
+/// provider env so the suite's shared `CADENCE_PM_DIR` never leaks a
+/// policy in.
+#[test]
+fn register_refuses_every_model_without_a_pi_policy() {
+    let pm = tempfile::tempdir().unwrap();
+    let env = cadence_agent::adapter::ProviderEnv::default();
+    env.set("CADENCE_PM_DIR", pm.path().to_str().unwrap());
+    let mut opts = daemon_opts();
+    opts.provider_env = env;
+    let d = TestDaemon::start_opts(opts);
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    let err = d
+        .fixture_rpc(
+            "agent_register",
+            json!({"alias": "wn", "provider": "pi", "endpoint_kind": "managed",
+                   "cwd": cwd, "params": "{\"model\": \"fake/model-1\"}"}),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("allowlist"), "{err}");
+    assert!(d.rpc("agent_show", json!({"alias": "wn"})).is_err());
+}
+
+/// `agent set model=…` checks the same allowlist, and clearing the key
+/// is never allowed — a stored row with no model would fall back
+/// silently at the next open.
+#[test]
+fn set_gates_the_model_patch() {
+    let d = TestDaemon::start();
+    let _pi = d.mock_pi("normal");
+    d.register_pi("ws", json!({"model": "fake/model-1"}));
+    d.wait_agent("ws", "idle", 20);
+    let err = d
+        .fixture_rpc(
+            "agent_set",
+            json!({"alias": "ws", "patch": {"model": "evil/unlisted-9"},
+                   "next_launch": true}),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("allowlist"), "{err}");
+    let err = d
+        .fixture_rpc(
+            "agent_set",
+            json!({"alias": "ws", "patch": {"model": null},
+                   "next_launch": true}),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("cleared"), "{err}");
+    // An allowlisted change lands on the row.
+    d.fixture_rpc(
+        "agent_set",
+        json!({"alias": "ws", "patch": {"model": "acme/demo-1"},
+               "next_launch": true}),
+    )
+    .unwrap();
+    let show = d.rpc("agent_show", json!({"alias": "ws"})).unwrap();
+    assert_eq!(show["agent"]["params"]["model"], "acme/demo-1", "{show}");
+}
+
+/// The `wrong-model` fake answers get_state with a different model than
+/// `--model` asked for — Pi's silent fallback. The open fails and the
+/// agent fences `attention` with the reason, never `idle` on a lie.
+#[test]
+fn a_provider_reporting_the_wrong_model_fences_the_agent() {
+    let d = TestDaemon::start();
+    let _pi = d.mock_pi("wrong-model");
+    d.register_pi("wm", json!({"model": "fake/model-1"}));
+    d.wait_agent("wm", "attention", 20);
+    let show = d.rpc("agent_show", json!({"alias": "wm"})).unwrap();
+    let reason = show["agent"]["error"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("fake/model-1") && reason.contains("not-the-asked-1"),
+        "{reason}"
+    );
 }

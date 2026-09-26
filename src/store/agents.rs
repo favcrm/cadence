@@ -675,6 +675,19 @@ impl Store {
         Ok(())
     }
 
+    /// CAD-559: a register-time gate that fills the launch model
+    /// itself (pi's `[pi].models.default`) stamps the honest
+    /// provenance over the `explicit` label `register_agent` derives
+    /// from the merged params.
+    pub fn set_model_selection(&self, alias: &str, selection: &Value) -> Result<()> {
+        let conn = self.write_conn()?;
+        conn.execute(
+            "UPDATE agents SET model_selection=?,updated=? WHERE alias=?",
+            params![selection.to_string(), now(), alias],
+        )?;
+        Ok(())
+    }
+
     pub fn set_params(&self, alias: &str, patch: &Value) -> Result<()> {
         self.set_params_by(alias, patch, &Value::Null)
     }

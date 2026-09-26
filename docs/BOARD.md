@@ -19,7 +19,8 @@ serving a board + JSON API on loopback.
 
 ```
 ~/pm/
-├── pm.yaml                 # schema, statuses, link types, artifact cap, notes_dir
+├── pm.yaml                 # schema, statuses, link types, artifact cap, notes_dir,
+│                           #   [pi] model/provider-package allowlists (CAD-559)
 ├── README.md               # the rules, for agents and humans
 ├── cadence/
 │   ├── project.yaml        # key, prefix: CAD, repos, components, tags, default_owner
@@ -77,6 +78,52 @@ created: 2026-09-17T16:01:23Z
 Statuses: `backlog ready doing review done dropped`. Issues are never
 deleted — `dropped` is the end state. `dropped` issues don't render on
 the board (`issue ls` still lists them).
+
+## `[pi]` in pm.yaml — the operator's Pi policy (CAD-559)
+
+`pm.yaml` can carry a `[pi]` table pinning what a managed pi agent may
+launch on. Pi falls back silently twice — an unresolvable `--model`
+becomes whatever the provider picks, and an unpinned extension loads
+whatever the operator's npm dir happens to hold — so the policy is
+fail-closed on both:
+
+```yaml
+pi:
+  providers: ["pi-devin@0.1.2"]            # extension pkgs, name@version
+  models:
+    allow: ["devin/swe-2-high", "openrouter/z-ai/glm-5.3-flash"]
+    default: {master: "devin/swe-2-high", worker: "devin/swe-2-high"}
+```
+
+- `models.allow` is the whole vocabulary a pi agent may run.
+  `master start --model`, `join --model`, a `model_defaults` role or
+  provider default, and `agent set --next-launch model=…` all resolve
+  against it, and the adapter re-checks the stored value on every
+  open. An absent `[pi]` (or an empty `allow`) allows nothing — a pi
+  registration, start, or relaunch refuses rather than fall back.
+  `model_policy: provider_default` is refused outright for pi.
+- `models.default.{master,worker}` fills a start that names no model.
+  After launch the adapter asks `get_state` what model is actually
+  running; a provider answering with a different one fails the open
+  and the agent fences `attention` with the reason.
+- `providers` pins the only Pi extension packages that load. Each
+  `name@version` resolves under the **operator's** pi npm dir
+  (`$PI_CODING_AGENT_DIR/npm/node_modules`, default `~/.pi/agent`) —
+  never the agent's private config dir, so a confined master cannot
+  pick its own extensions. The installed `package.json` `version` must
+  equal the pin and its `pi.extensions` files must exist; they become
+  the only `-e` argv entries (`--no-extensions` stays on), and the
+  package dir joins the confined master's read set, read-only. A
+  missing package, a drifted version or an entry escaping the package
+  dir refuses the launch.
+
+To add a model: append the spec under `models.allow` (`provider/id` or
+a bare id — whatever `pi --model` accepts), then pick it via
+`--model`, `agent set`, or the role default. To add or bump a provider
+package: `pi install <name>@<version>` as the operator first, then pin
+the identical `name@version` — a silent `npm update` drifts the
+install away from the pin and refuses the next launch instead of
+loading an unvetted build.
 
 ## `cadence issue` — the only writer
 

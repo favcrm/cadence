@@ -35,6 +35,7 @@ pub mod model_defaults;
 pub mod operator_auth;
 pub mod overview;
 pub mod peer;
+pub mod pi_policy;
 pub mod platform;
 pub mod proc;
 pub mod proto;

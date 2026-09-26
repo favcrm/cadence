@@ -7,7 +7,13 @@
 //! cancellation via `abort`, a crashed provider failing fast instead of
 //! hanging, reopen minting a fresh session (the disposable-session /
 //! continuity-pack contract), effort verification, missing-credentials
-//! error quality, and auto-cancelled extension UI dialogs.
+//! error quality, auto-cancelled extension UI dialogs, and the CAD-559
+//! model/provider-package gates (allowlist, pinned `-e`, no silent
+//! fallback).
+
+#![allow(clippy::disallowed_methods)]
+
+mod common;
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -16,6 +22,7 @@ use std::time::{Duration, Instant};
 use cadence_agent::adapter::pi::PiAdapter;
 use cadence_agent::adapter::{registry, AdapterHooks, ProviderAdapter, ProviderEnv};
 use cadence_agent::store::Agent;
+use common::pi_policy_pm;
 use serde_json::{json, Value};
 
 fn fake_pi(mode: &str) -> String {
@@ -24,6 +31,13 @@ fn fake_pi(mode: &str) -> String {
 }
 
 fn agent(alias: &str, params: Value) -> Agent {
+    let mut params = params;
+    // CAD-559: a pi agent opens only on an explicit allowlisted model —
+    // tests that want another value (or none) set the key themselves.
+    if let Some(p) = params.as_object_mut() {
+        p.entry("model".to_string())
+            .or_insert_with(|| json!("fake/model-1"));
+    }
     Agent {
         alias: alias.into(),
         provider: "pi".into(),
@@ -64,6 +78,11 @@ fn adapter_env(
 ) -> (PiAdapter, mpsc::Receiver<(String, Value)>) {
     let env = ProviderEnv::default();
     env.set("CADENCE_PI_COMMAND", fake_pi(mode));
+    // CAD-559: pi opens only under an operator `[pi]` policy — `own`
+    // can still point CADENCE_PM_DIR at a test's own pm.yaml.
+    let pm = dir.join("pm");
+    pi_policy_pm(&pm);
+    env.set("CADENCE_PM_DIR", pm.to_string_lossy().to_string());
     for (k, v) in own {
         env.set(k, v.clone());
     }
@@ -100,10 +119,11 @@ fn collect(rx: &mpsc::Receiver<(String, Value)>, wait: Duration) -> Vec<(String,
 fn master_adapter(mode: &str, state: &Path, own: &[(&str, String)]) -> PiAdapter {
     let env = ProviderEnv::default();
     env.set("CADENCE_PI_COMMAND", fake_pi(mode));
-    env.set(
-        "CADENCE_PM_DIR",
-        state.join("pm").to_string_lossy().to_string(),
-    );
+    // CAD-559: the tracker's `[pi]` table governs what this master may
+    // launch on — `own` can repoint CADENCE_PM_DIR at a custom policy.
+    let pm = state.join("pm");
+    pi_policy_pm(&pm);
+    env.set("CADENCE_PM_DIR", pm.to_string_lossy().to_string());
     std::fs::create_dir_all(state.join("logs")).unwrap();
     for (k, v) in own {
         env.set(k, v.clone());
@@ -162,6 +182,11 @@ fn expected_master_argv(mode: &str, guard: &Path) -> Vec<String> {
         guard.to_str().unwrap(),
         "--tools",
         "bash,read",
+        // CAD-559: the resolved allowlisted model always lands last —
+        // a pi launch with no explicit `--model` is refused before
+        // this argv is ever built.
+        "--model",
+        "fake/model-1",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -1024,4 +1049,286 @@ fn a_turn_that_never_settles_is_outcome_unknown() {
         "{err:?}"
     );
     pi.close();
+}
+
+// ---- CAD-559: the model gate and provider-package pins ----
+
+/// No model on the row means no launch — a pi argv without `--model`
+/// would run whatever the provider falls back to.
+#[test]
+fn open_refuses_a_missing_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pi, _rx) = adapter("normal", dir.path());
+    let err = pi
+        .open(&agent("dev-1", json!({"model": null})))
+        .err()
+        .expect("a pi launch without a model must refuse");
+    assert!(err.to_string().contains("no model"), "{err}");
+    pi.close();
+}
+
+/// A model off `[pi].models.allow` is refused at open — the register
+/// and `agent set` gates keep it off the row, and the adapter re-checks
+/// the stored value every launch regardless.
+#[test]
+fn open_refuses_a_model_off_the_allowlist() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pi, _rx) = adapter("normal", dir.path());
+    let err = pi
+        .open(&agent("dev-1", json!({"model": "evil/unlisted-9"})))
+        .err()
+        .expect("a model off the allowlist must refuse");
+    let text = err.to_string();
+    assert!(
+        text.contains("evil/unlisted-9") && text.contains("allowlist"),
+        "{text}"
+    );
+    pi.close();
+}
+
+/// The `wrong-model` fake accepts `--model` then reports a different
+/// one — Pi's silent-fallback shape. `open` must refuse rather than
+/// trust the launch flag.
+#[test]
+fn a_provider_reporting_the_wrong_model_fails_the_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pi, _rx) = adapter("wrong-model", dir.path());
+    let err = pi
+        .open(&agent("dev-1", json!({"model": "fake/model-1"})))
+        .err()
+        .expect("a model mismatch must fail the open");
+    let text = err.to_string();
+    assert!(
+        text.contains("fake/model-1") && text.contains("not-the-asked-1"),
+        "{text}"
+    );
+    pi.close();
+}
+
+/// A pinned `[pi].providers` package contributes its `pi.extensions`
+/// files as `-e` argv entries — the only extensions `--no-extensions`
+/// admits — and its dir joins the confinement read set, read-only.
+#[test]
+fn pinned_provider_packages_extend_argv_and_the_read_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    // The OPERATOR's install, pinned and complete:
+    // <PI_CODING_AGENT_DIR>/npm/node_modules/pi-devin.
+    let operator = dir.path().join("operator-pi");
+    let pkg = operator.join("npm/node_modules/pi-devin");
+    std::fs::create_dir_all(pkg.join("extensions")).unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        r#"{"version":"0.1.2","pi":{"extensions":["./extensions/index.ts","./extensions/extra.js"]}}"#,
+    )
+    .unwrap();
+    for entry in ["extensions/index.ts", "extensions/extra.js"] {
+        std::fs::write(pkg.join(entry), "// provider ext").unwrap();
+    }
+    let pm = state.join("pm");
+    std::fs::create_dir_all(&pm).unwrap();
+    std::fs::write(
+        pm.join("pm.yaml"),
+        "pi:\n  providers: [\"pi-devin@0.1.2\"]\n  models:\n    allow: [\"fake/model-1\"]\n",
+    )
+    .unwrap();
+    let pi = master_adapter(
+        "normal",
+        &state,
+        &[
+            (cadence_agent::master::TEST_NO_LANDLOCK, "1".into()),
+            ("PI_CODING_AGENT_DIR", operator.to_string_lossy().into()),
+        ],
+    );
+    pi.open(&master_agent(&state, json!({"unconfined": true})))
+        .unwrap();
+    let argv = recorded_argv(&state);
+    for entry in ["extensions/index.ts", "extensions/extra.js"] {
+        let want = pkg.join(entry).to_string_lossy().to_string();
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--extension" && w[1] == want),
+            "argv lacks -e {want}: {argv:?}"
+        );
+    }
+    assert!(
+        argv.iter().any(|a| a == "--no-extensions"),
+        "--no-extensions must survive: {argv:?}"
+    );
+    // The guard is still the first extension.
+    let first = argv
+        .windows(2)
+        .find(|w| w[0] == "--extension")
+        .map(|w| w[1].clone())
+        .unwrap();
+    assert!(first.contains("pi-guard"), "{argv:?}");
+    pi.close();
+
+    // The same resolution feeds confinement: the package dir is in the
+    // read set (never write), nothing wider than it.
+    let env = ProviderEnv::default();
+    env.set("CADENCE_PI_COMMAND", fake_pi("normal"));
+    env.set("CADENCE_PM_DIR", pm.to_string_lossy().to_string());
+    env.set(
+        "PI_CODING_AGENT_DIR",
+        operator.to_string_lossy().to_string(),
+    );
+    let (_cmd, policy) = cadence_agent::adapter::pi::pi_master_confinement(&env, &state);
+    assert!(
+        policy.read.iter().any(|p| p.starts_with(&pkg)),
+        "read set lacks the pinned package dir: {policy:?}"
+    );
+    assert!(
+        !policy.write.iter().any(|p| p.starts_with(&pkg)),
+        "the package dir is writable: {policy:?}"
+    );
+}
+
+/// Installed 0.2.0 against a 0.1.2 pin refuses — the loadable neighbor
+/// is never "close enough".
+#[test]
+fn provider_package_version_drift_refuses_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let pm = dir.path().join("pm");
+    std::fs::create_dir_all(&pm).unwrap();
+    std::fs::write(
+        pm.join("pm.yaml"),
+        "pi:\n  providers: [\"pi-devin@0.1.2\"]\n  models:\n    allow: [\"fake/model-1\"]\n",
+    )
+    .unwrap();
+    let operator = dir.path().join("operator-pi");
+    let pkg = operator.join("npm/node_modules/pi-devin");
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        r#"{"version":"0.2.0","pi":{"extensions":["./e.ts"]}}"#,
+    )
+    .unwrap();
+    std::fs::write(pkg.join("e.ts"), "// drifted").unwrap();
+    let (pi, _rx) = adapter_env(
+        "normal",
+        dir.path(),
+        &[("PI_CODING_AGENT_DIR", operator.to_string_lossy().into())],
+    );
+    let err = pi
+        .open(&agent("dev-1", json!({"model": "fake/model-1"})))
+        .err()
+        .expect("a version drift must refuse");
+    let text = err.to_string();
+    assert!(text.contains("0.2.0") && text.contains("0.1.2"), "{text}");
+    pi.close();
+}
+
+/// A pinned package absent from the operator's npm dir refuses.
+#[test]
+fn a_missing_provider_package_refuses_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let pm = dir.path().join("pm");
+    std::fs::create_dir_all(&pm).unwrap();
+    std::fs::write(
+        pm.join("pm.yaml"),
+        "pi:\n  providers: [\"ghost@1.0.0\"]\n  models:\n    allow: [\"fake/model-1\"]\n",
+    )
+    .unwrap();
+    let operator = dir.path().join("operator-pi");
+    std::fs::create_dir_all(operator.join("npm/node_modules")).unwrap();
+    let (pi, _rx) = adapter_env(
+        "normal",
+        dir.path(),
+        &[("PI_CODING_AGENT_DIR", operator.to_string_lossy().into())],
+    );
+    let err = pi
+        .open(&agent("dev-1", json!({"model": "fake/model-1"})))
+        .err()
+        .expect("a missing package must refuse");
+    assert!(err.to_string().contains("ghost"), "{err}");
+    pi.close();
+}
+
+/// Daemon-level (`PlanFixture`, real tracker): `master start --provider
+/// pi` resolves its model through the operator's gate — no `[pi]` at
+/// all refuses, an explicit `--model` off the allowlist refuses, and
+/// AGENT.md's `preferred` pi model is the fallback that lands.
+#[test]
+fn master_start_resolves_the_pi_model_gate() {
+    let f = common::PlanFixture::start();
+    common::test_env().set(cadence_agent::master::TEST_NO_LANDLOCK, "1");
+    // Leg 1: no `[pi]` table — even a bare start has no legal model.
+    // (mock_pi would append the suite's default table, so it comes
+    // only after this leg.)
+    let err =
+        f.d.operator_rpc(
+            "master_start",
+            json!({"provider": "pi", "unconfined": true}),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("no model"), "{err}");
+    // A tracker policy arrives: the allowlist binds, the role default
+    // fills a bare start.
+    let pm_yaml = f.pm_dir.join("pm.yaml");
+    let mut yaml = std::fs::read_to_string(&pm_yaml).unwrap();
+    yaml.push_str(
+        "pi:\n  models:\n    allow: [\"fake/model-1\", \"devin/swe-2-high\"]\n    default: {master: \"fake/model-1\", worker: \"fake/model-1\"}\n",
+    );
+    std::fs::write(&pm_yaml, yaml).unwrap();
+    let _pi = f.d.mock_pi("normal");
+    // Leg 2: explicit --model off the list — refused, no row stored.
+    let err =
+        f.d.operator_rpc(
+            "master_start",
+            json!({"provider": "pi", "unconfined": true, "model": "evil/unlisted-9"}),
+        )
+        .unwrap_err();
+    let text = err.to_string();
+    assert!(
+        text.contains("evil/unlisted-9") && text.contains("allowlist"),
+        "{text}"
+    );
+    assert!(f.d.rpc("agent_show", json!({"alias": "master"})).is_err());
+    // Leg 3: AGENT.md prefers pi on an allowlisted model — it becomes
+    // the launch model over the role default. Agent files have one
+    // writer (CAD-339): a hand edit would refuse the brief, so this
+    // goes through `agent_file_write` like the operator's editor.
+    f.d.operator_rpc(
+        "agent_file_write",
+        json!({"agent": "master", "file": "AGENT.md", "text":
+            "---\nname: master\npreferred: {provider: pi, model: devin/swe-2-high}\nfallbacks: []\n---\n# Master\n\nThe test master.\n"}),
+    )
+    .unwrap();
+    let out =
+        f.d.operator_rpc(
+            "master_start",
+            json!({"provider": "pi", "unconfined": true}),
+        )
+        .unwrap();
+    assert_eq!(out["alias"], "master", "{out}");
+    let show = f.d.rpc("agent_show", json!({"alias": "master"})).unwrap();
+    assert_eq!(
+        show["agent"]["params"]["model"], "devin/swe-2-high",
+        "{show}"
+    );
+    // The flag and the lockdown reached the child argv.
+    let argv_file = f.d.state.join("master/cwd/pi-argv.json");
+    for _ in 0..100 {
+        if argv_file.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let argv: Vec<String> =
+        serde_json::from_str(&std::fs::read_to_string(&argv_file).unwrap()).unwrap();
+    assert!(
+        argv.windows(2)
+            .any(|w| w == ["--model", "devin/swe-2-high"]),
+        "{argv:?}"
+    );
+    assert!(argv.iter().any(|a| a == "--no-extensions"), "{argv:?}");
+    // And get_state verified the launch: the reported model is the
+    // requested one, never a provider fallback.
+    assert_eq!(
+        show["agent"]["model"].as_str(),
+        Some("devin/swe-2-high"),
+        "{show}"
+    );
 }
