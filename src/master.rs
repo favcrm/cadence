@@ -139,6 +139,18 @@ pub const CLAUDE_ALLOWED_TOOLS: &[&str] = &[
     "Bash(cadence agent show *)",
     "Bash(cadence status)",
     "Bash(cadence status *)",
+    // CAD-614: read the wiki, create a backlog ticket, write a page
+    // under the master's own knowledge area. The Pi guard narrows
+    // `issue new` (no `--owner`/`--id`, status stays backlog) and
+    // `wiki put` (only `agents/master/knowledge/`); the wiki ACL is
+    // the second line. Claude stays Bash-only — no Write tool.
+    "Bash(cadence issue new *)",
+    "Bash(cadence wiki ls)",
+    "Bash(cadence wiki ls *)",
+    "Bash(cadence wiki cat *)",
+    "Bash(cadence wiki search *)",
+    "Bash(cadence wiki history *)",
+    "Bash(cadence wiki put *)",
 ];
 
 /// The only built-in tool the master's Claude session has (`--tools`):
