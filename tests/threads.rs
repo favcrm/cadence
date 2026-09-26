@@ -3127,6 +3127,14 @@ fn cad602_agentic_model_rpc_and_http_refuse() {
         .find(|m| m["id"] == "cursor/grok-4.7-high")
         .unwrap();
     assert_eq!(cursor["allowed_for"], json!(["worker"]), "{cursor}");
+    let err = d
+        .operator_rpc(
+            "agent_set",
+            json!({"alias": "master", "patch": {"model": "cursor/grok-4.7-high"}, "next_launch": true}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("agentic"), "{err}");
     let mut wk = ManagedWorker::start(d, "wk602");
     for src in ["self", "child"] {
         let frame = wk.rpc(
