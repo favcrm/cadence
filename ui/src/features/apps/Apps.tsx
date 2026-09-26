@@ -1,24 +1,35 @@
 import { resources } from "../../lib/resources";
-import { useQuery } from "../../lib/useResource";
-import type { AppRow } from "../../lib/types";
+import { useQuery, useResource } from "../../lib/useResource";
+import type { AppRow, AppRun } from "../../lib/types";
 import Link from "../../ui/Link";
 import { ResourceGate, StaleChip } from "../../ui/ResourceStatus";
-import ApproveApp from "./ApproveApp";
-import { appApprovalChip, appHref, sourceLabel, unboundSlots } from "./apps";
+import { homeNeeds, type HomeNeed } from "../home/needs";
+import {
+  appApprovalChip,
+  appHref,
+  appPurpose,
+  newRunHref,
+  runsSummary,
+} from "./apps";
 import type { Viewer } from "../projects/work";
 
 /**
- * The Apps screen (CAD-557): one card per installed app per project,
- * straight from the daemon's `app ls` read — name, version, approval
- * state, the declared connection slots with their bindings (unbound
- * flagged), the bundle's workflows, and the git source with its pinned
- * SHA when installed from git. A card opens `/apps/<project>/<name>`.
+ * The Apps screen (CAD-563 r2): one card per installed app — a
+ * monogram, the title, the app's one-line purpose, what is happening
+ * now ("2 in progress · 1 needs you", read from the app's runs) and the
+ * primary action that starts a new run ("New post"). Internals — the
+ * slug, the version, the path, the digest, the slot bindings — live on
+ * the app page, not here.
  *
  * The sidebar's project scope filters the list; the empty state names
  * the install command, scoped to the selected project when there is one.
  */
-export default function Apps({ project, viewer }: { project: string; viewer: Viewer }) {
+export default function Apps({ project }: { project: string; viewer: Viewer }) {
   const state = useQuery(resources.apps);
+  // The Needs-you rail's own rows, when the board has read the overview
+  // (the app page asks for it; the list never fetches it itself).
+  const overview = useResource(resources.overview);
+  const needs = homeNeeds(overview.data?.needs_me);
   const all = state.data ?? [];
   const rows = project === "all" ? all : all.filter((r) => r.project === project);
   return (
@@ -47,64 +58,85 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
       )}
       <ul className="space-y-2.5">
         {rows.map((row, i) => (
-          <AppCard key={`${row.project}/${row.name ?? i}`} row={row} viewer={viewer} />
+          <AppCard key={`${row.project}/${row.name ?? i}`} row={row} needs={needs} />
         ))}
       </ul>
     </main>
   );
 }
 
-function AppCard({ row, viewer }: { row: AppRow; viewer: Viewer }) {
+/** A monogram tile — the app's first letter, on the board's accent. */
+function AppIcon({ label }: { label: string }) {
+  const letter = (label.trim()[0] ?? "A").toUpperCase();
+  return (
+    <span
+      aria-hidden
+      className="shrink-0 w-9 h-9 rounded-lg bg-accent/15 text-accent grid place-items-center text-cardtitle font-semibold"
+    >
+      {letter}
+    </span>
+  );
+}
+
+function AppCard({
+  row,
+  needs,
+}: {
+  row: AppRow;
+  needs: HomeNeed[];
+}) {
   const approval = appApprovalChip(row);
-  const unbound = new Set(unboundSlots(row));
-  const source = sourceLabel(row);
-  const href = row.name ? appHref(row.project, row.name) : null;
+  const title = row.title?.trim() || row.name || "App";
+  const appName = row.name;
+  const href = appName ? appHref(row.project, appName) : null;
+  // The card's live line reads the app's runs — the same shared store
+  // the app page uses.
+  const runs = appName ? useQuery(resources.appRuns(`${row.project}/${appName}`)) : null;
+  const list: AppRun[] = runs?.data ?? [];
+  const action = row.primary ?? null;
   return (
     <li className="card px-3.5 py-3 min-w-0" data-app={row.name ?? undefined}>
-      <div className="flex items-start gap-2 min-w-0">
-        {href ? (
-          <Link href={href} className="min-w-0 break-words hover:text-accent">
-            <span className="num text-label text-accent">{row.project}/{row.name}</span>
-            <span className="text-cardtitle font-medium text-ink-100 ml-2">
-              {row.title ?? row.name}
-            </span>
-          </Link>
-        ) : (
-          <span className="min-w-0 break-words">
-            <span className="num text-label text-ink-400">{row.project}/{row.name ?? "?"}</span>
-          </span>
-        )}
-        <span className={`chip shrink-0 ${approval.cls}`}>{approval.text}</span>
-      </div>
-      <div className="flex flex-wrap items-center gap-1.5 mt-2">
-        {row.version && <span className="chip bg-ink-800 text-ink-300">v{row.version}</span>}
-        {(row.workflows ?? []).map((wf) => (
-          <span key={wf} className="chip bg-ink-800 text-ink-300 num">
-            {row.name}/{wf}
-          </span>
-        ))}
-        {(row.connections ?? []).map((c) => (
-          <span
-            key={c.slot}
-            className={`chip num ${c.bound == null ? "bg-warn/10 text-warn" : "bg-ink-800 text-ink-300"}`}
-            title={c.bound == null ? `slot ${c.slot} is unbound` : `slot ${c.slot} → ${c.bound}`}
+      <div className="flex items-start gap-3 min-w-0">
+        <AppIcon label={title} />
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2 min-w-0">
+            {href ? (
+              <Link href={href} className="min-w-0 break-words hover:text-accent">
+                <span className="text-cardtitle font-medium text-ink-100">{title}</span>
+              </Link>
+            ) : (
+              <span className="text-cardtitle font-medium text-ink-100">{title}</span>
+            )}
+            <span className={`chip shrink-0 ${approval.cls}`}>{approval.text}</span>
+          </div>
+          <p className="text-label text-ink-400 mt-0.5 break-words">{appPurpose(row)}</p>
+          <p className="text-micro text-ink-500 mt-1" data-summary>
+            {row.error
+              ? row.error
+              : runs?.status === "failed"
+                ? "activity unavailable"
+                : runs?.data
+                  ? (runsSummary(list, needs) ?? "Nothing running yet")
+                  : "reading activity…"}
+          </p>
+        </div>
+        {appName && href && action && (
+          <Link
+            href={newRunHref(row.project, appName, `${appName}/${action.workflow}`)}
+            className="shrink-0 h-8 px-3 rounded bg-accent text-on-accent text-label font-medium grid place-items-center"
           >
-            {c.slot} → {c.bound ?? "unbound"}
-          </span>
-        ))}
-        {unbound.size > 0 && (
-          <span className="chip bg-warn/10 text-warn">
-            {unbound.size} unbound slot{unbound.size === 1 ? "" : "s"}
-          </span>
+            {action.label?.trim() || "New run"}
+          </Link>
+        )}
+        {!action && href && (
+          <Link
+            href={href}
+            className="shrink-0 h-8 px-3 rounded border border-ink-600 text-label text-ink-300 grid place-items-center hover:border-edge-hover"
+          >
+            Open app
+          </Link>
         )}
       </div>
-      {row.error && (
-        <p className="text-label text-fail mt-2 break-words" role="note">
-          {row.error}
-        </p>
-      )}
-      {source && <p className="num text-micro text-ink-500 mt-2 break-all">{source}</p>}
-      <ApproveApp row={row} viewer={viewer} />
     </li>
   );
 }

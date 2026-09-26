@@ -316,6 +316,8 @@ export const RESOURCE_NAMES = [
   "workflows",
   "apps",
   "app",
+  "app_runs",
+  "app_outputs",
   "outbox",
 ] as const;
 export type ResourceName = (typeof RESOURCE_NAMES)[number];

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError } from "../../lib/api";
 import { resources } from "../../lib/resources";
-import { useQuery } from "../../lib/useResource";
+import { useMaybeResource } from "../../lib/useResource";
 import { useHref } from "../../lib/useLocation";
 import { fmtBytes, fmtTime } from "../../lib/fmt";
 import type { OutboxItem } from "../../lib/types";
@@ -12,18 +12,25 @@ import { ResourceGate } from "../../ui/ResourceStatus";
 /**
  * The Outbox — what `local`-platform `publish` effects landed once the
  * operator released them (CAD-546). The list is the daemon's
- * `platform_outbox` read, operator-only like every route it relays:
- * an unsigned board gets the route's refusal and this screen says so,
- * it never pretends the ledger is empty.
+ * `platform_outbox` read, operator-only like every route it relays: a
+ * board that cannot prove the operator never calls it (CAD-563 r2 — no
+ * 403 in the console) and this screen says so instead, it never
+ * pretends the ledger is empty.
  *
  * `?item=<effect_id>` deep-links one item (the `board:` link a
  * publish's outcome message carries) — the detail shows the rendered
  * post and the copied attachment names.
  */
-export default function Outbox() {
-  const state = useQuery(resources.outbox);
+export default function Outbox({ operator }: { operator: boolean }) {
+  // The store exists only while the board proves the operator: an
+  // unproven viewer makes no request at all.
+  const resource = operator ? resources.outbox : null;
+  const state = useMaybeResource(resource);
   const href = useHref();
   const item = new URLSearchParams(href.split("?")[1] ?? "").get("item");
+  useEffect(() => {
+    if (resource) void resource.revalidate();
+  }, [resource]);
   return (
     <div className="px-4 lg:px-8 py-5 max-w-3xl">
       <div className="mb-4 flex items-center justify-between gap-3">
@@ -33,26 +40,30 @@ export default function Outbox() {
             posts the operator released to the local outbox
           </p>
         </div>
-        <button
-          onClick={() => void resources.outbox.refresh()}
-          className="chip bg-ink-800 text-ink-300 hover:bg-ink-700 transition-colors"
-        >
-          refresh
-        </button>
+        {resource && (
+          <button
+            onClick={() => void resource.refresh()}
+            className="chip bg-ink-800 text-ink-300 hover:bg-ink-700 transition-colors"
+          >
+            refresh
+          </button>
+        )}
       </div>
-      <ResourceGate
-        state={state}
-        loading="loading the outbox…"
-        failed="could not load the outbox"
-        onRetry={() => void resources.outbox.refresh()}
-      />
-      {state.status === "failed" && (
+      {state && (
+        <ResourceGate
+          state={state}
+          loading="loading the outbox…"
+          failed="could not load the outbox"
+          onRetry={() => resource && void resource.refresh()}
+        />
+      )}
+      {!operator && (
         <p className="text-label text-ink-400 -mt-2 mb-4">
           the outbox is the operator's view — sign in with{" "}
           <code className="text-ink-300">cadence ui login</code> to read it
         </p>
       )}
-      {state.data &&
+      {state?.data &&
         (item ? (
           <OutboxDetailView effectId={item} />
         ) : (

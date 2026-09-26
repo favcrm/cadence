@@ -12,6 +12,17 @@
 //!   ([`app::show`]): the agent guide, each workflow's checked
 //!   summary, the rubrics' bodies, the install record, plus this
 //!   app's row of [`app::doctor`]'s slot findings.
+//! - `GET /api/apps/<project>/<name>/runs` — the plans/epics proposed
+//!   from this app's workflows (CAD-563), by the recorded
+//!   `plan.workflow` provenance: the epic, its derived status and the
+//!   plan's state, tickets and size-weighted progress ([`plan::plan_json`]),
+//!   so the app page lists its runs without leaving the app.
+//! - `GET /api/apps/<project>/<name>/outputs` — the `local` outbox
+//!   items this app's runs produced (CAD-563), operator-only like
+//!   `/api/outbox` (the same proof, the same relay): an item is
+//!   attributed by its effect's recorded `task` — a ticket of one of
+//!   the app's runs — or, for a send staged without a task, by the
+//!   effect's agent owning one of those tickets.
 //! - `POST /api/apps/<project>/<name>/approve` — relays the daemon's
 //!   `app_approve` verbatim — the same call `cadence app approve`
 //!   makes; the board keeps no second approval path.
@@ -25,12 +36,14 @@
 //! handler runs; the daemon's own `operator_connection` gate still
 //! refuses what the board must not do.
 
+use std::collections::{HashMap, HashSet};
+
 use serde_json::{json, Value};
 use tiny_http::Request;
 
-use super::{err_response, home, json_response, read_body, HttpResp};
+use super::{err_response, home, json_response, read_body, HttpResp, ServeOpts};
 use crate::client;
-use crate::issue::{app, model, Pm};
+use crate::issue::{app, board, model, plan, Pm};
 
 /// The approve body is `{}` — anything else is refused by shape.
 const BODY_CAP: u64 = 4 * 1024;
@@ -46,25 +59,41 @@ fn approve_body_ok(bytes: &[u8]) -> bool {
         .is_some_and(|v| v.as_object().is_some_and(|m| m.is_empty()))
 }
 
-/// What `/api/apps…` names — the list, or one app's detail.
+/// What `/api/apps…` names — the list, one app's detail, its runs or
+/// its outputs.
 #[derive(Debug)]
 pub(super) enum ReadRoute<'a> {
     List,
     Detail(&'a str, &'a str),
+    Runs(&'a str, &'a str),
+    Outputs(&'a str, &'a str),
 }
 
 /// The read route for a path under `/api/apps` — exactly `/api/apps`
-/// (or `/api/apps/`), or `/api/apps/<project>/<name>` (app names are
-/// tag-shaped — a single segment).
+/// (or `/api/apps/`), `/api/apps/<project>/<name>` (app names are
+/// tag-shaped — a single segment), or one app's `/runs` or `/outputs`.
 pub(super) fn read_route(path: &str) -> Option<ReadRoute<'_>> {
     let rest = path.strip_prefix("/api/apps")?;
     match rest {
         "" | "/" => Some(ReadRoute::List),
         tail => {
             let tail = tail.strip_prefix('/')?;
-            let (project, name) = tail.split_once('/')?;
-            (!project.is_empty() && !name.is_empty() && !name.contains('/'))
-                .then_some(ReadRoute::Detail(project, name))
+            let (project, rest) = tail.split_once('/')?;
+            if project.is_empty() {
+                return None;
+            }
+            let Some((name, sub)) = rest.split_once('/') else {
+                return (!rest.is_empty() && !rest.contains('/'))
+                    .then_some(ReadRoute::Detail(project, rest));
+            };
+            if name.is_empty() {
+                return None;
+            }
+            match sub {
+                "runs" => Some(ReadRoute::Runs(project, name)),
+                "outputs" => Some(ReadRoute::Outputs(project, name)),
+                _ => None,
+            }
         }
     }
 }
@@ -80,14 +109,18 @@ pub(super) fn approve_route(path: &str) -> Option<(&str, &str)> {
 
 /// `GET` dispatch for the app reads.
 pub(super) fn read(
+    request: &Request,
     pm: &Pm,
     state_dir: &std::path::Path,
+    opts: &ServeOpts,
     query: &dyn Fn(&str) -> Option<String>,
     route: ReadRoute<'_>,
 ) -> HttpResp {
     match route {
         ReadRoute::List => list(pm, state_dir, query),
         ReadRoute::Detail(project, name) => detail(pm, state_dir, project, name),
+        ReadRoute::Runs(project, name) => runs(pm, state_dir, project, name),
+        ReadRoute::Outputs(project, name) => outputs(request, pm, state_dir, opts, project, name),
     }
 }
 
@@ -131,6 +164,204 @@ fn detail(pm: &Pm, state_dir: &std::path::Path, key: &str, name: &str) -> HttpRe
             };
             err_response(code, &msg)
         }
+    }
+}
+
+/// `GET /api/apps/<project>/<name>/runs` — every plan/epic proposed
+/// from this app's workflows, by the recorded `plan.workflow`
+/// provenance (`<app>/<wf>`, CAD-547). Each row carries the epic's
+/// derived status and the plan block `plan show` renders: state,
+/// tickets and size-weighted progress. An app that is not installed
+/// (or cannot be described) is a 404, like its detail.
+fn runs(pm: &Pm, state_dir: &std::path::Path, key: &str, name: &str) -> HttpResp {
+    if !model::valid_key(key) || !model::valid_tag(name) {
+        return err_response(400, "bad project or app name");
+    }
+    if let Err(e) = app::digest(&pm.dir, key, name) {
+        return err_response(404, &e.to_string());
+    }
+    json_response(json!({
+        "project": key,
+        "name": name,
+        "runs": app_runs(pm, state_dir, key, name),
+    }))
+}
+
+/// The app's runs from the board's read model — the same indexed
+/// views `/api/issues` derives from, so a tracker write shows on the
+/// next read.
+fn app_runs(pm: &Pm, state_dir: &std::path::Path, key: &str, name: &str) -> Vec<Value> {
+    let read = super::read_model::get(state_dir, &pm.dir).board(pm, Some(key));
+    let by_id = read.by_id();
+    read.views
+        .iter()
+        .filter(|v| run_app(v).is_some_and(|(a, _)| a == name))
+        .map(|v| {
+            json!({
+                "epic": v.issue.front.id,
+                "title": v.issue.front.title,
+                "status": v.status,
+                "workflow": v.issue.front.plan.as_ref().and_then(|p| p.workflow.clone()),
+                "plan": plan::plan_json(v, &by_id),
+            })
+        })
+        .collect()
+}
+
+/// The app a run records in `plan.workflow` — `<app>/<wf>` only; a
+/// stored workflow's bare name is not an app's (the same split
+/// `app remove` refuses on).
+fn run_app(v: &board::View) -> Option<(&str, &str)> {
+    app::split_ref(v.issue.front.plan.as_ref()?.workflow.as_deref()?)
+}
+
+/// `GET /api/apps/<project>/<name>/outputs` — the `local` outbox items
+/// this app's runs produced, plus the sends those runs staged and the
+/// operator has not released yet (CAD-563): the ledger relayed exactly
+/// as `/api/outbox` relays it, narrowed to what the app's runs account
+/// for. Operator-only — the same proof `/api/outbox` runs, because the
+/// ledger's previews and paths are the operator's — so the gate comes
+/// before any tracker or ledger read.
+fn outputs(
+    request: &Request,
+    pm: &Pm,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+    key: &str,
+    name: &str,
+) -> HttpResp {
+    if !model::valid_key(key) || !model::valid_tag(name) {
+        return err_response(400, "bad project or app name");
+    }
+    if let Err(resp) = home::outbox_gate(
+        request,
+        state_dir,
+        opts,
+        &format!("GET /api/apps/{key}/{name}/outputs"),
+    ) {
+        return resp;
+    }
+    if let Err(e) = app::digest(&pm.dir, key, name) {
+        return err_response(404, &e.to_string());
+    }
+    // What an effect is attributed by: the run whose plan lists the
+    // effect's `task`, or — for a send staged without one — the run
+    // whose ticket the effect's agent owns (the workflow's `agent:` is
+    // the ticket's owner, so that agent is the one that worked it).
+    let read = super::read_model::get(state_dir, &pm.dir).board(pm, Some(key));
+    let by_id = read.by_id();
+    let runs: Vec<(String, HashSet<String>, HashSet<String>)> = read
+        .views
+        .iter()
+        .filter(|v| run_app(v).is_some_and(|(a, _)| a == name))
+        .map(|v| {
+            let tickets: HashSet<String> = v
+                .issue
+                .front
+                .plan
+                .iter()
+                .flat_map(|p| p.tickets.iter().cloned())
+                .collect();
+            let owners: HashSet<String> = tickets
+                .iter()
+                .filter_map(|t| by_id.get(t).and_then(|v| v.issue.front.owner.clone()))
+                .collect();
+            (v.issue.front.id.clone(), tickets, owners)
+        })
+        .collect();
+    let runs_for = |task: Option<&str>, agent: &str| -> Vec<String> {
+        let hit = |(_, tickets, owners): &(String, HashSet<String>, HashSet<String>)| match task {
+            Some(t) => tickets.contains(t),
+            None => owners.contains(agent),
+        };
+        runs.iter()
+            .filter(|r| hit(r))
+            .map(|(epic, _, _)| epic.clone())
+            .collect()
+    };
+    let facts = effect_facts(state_dir);
+    let out = match client::rpc(state_dir, "platform_outbox", json!({})) {
+        Ok(out) => out,
+        Err(e) => return home::rpc_err(&e, "platform_outbox"),
+    };
+    let items: Vec<Value> = out["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let fact = item["effect_id"].as_str().and_then(|id| facts.get(id))?;
+            let runs = runs_for(fact.task.as_deref(), &fact.agent);
+            if runs.is_empty() {
+                return None;
+            }
+            let mut item = item.clone();
+            item["runs"] = json!(runs);
+            Some(item)
+        })
+        .collect();
+    // A staged send the operator has not released (or that is in
+    // flight) is the app's next output — the release row the board
+    // links to Needs you.
+    let mut pending: Vec<Value> = Vec::new();
+    for (effect_id, fact) in &facts {
+        if !matches!(fact.state.as_str(), "waiting" | "decided") {
+            continue;
+        }
+        let runs = runs_for(fact.task.as_deref(), &fact.agent);
+        if runs.is_empty() {
+            continue;
+        }
+        pending.push(json!({
+            "effect_id": effect_id,
+            "state": fact.state,
+            "title": fact.title,
+            "runs": runs,
+        }));
+    }
+    pending.sort_by(|a, b| a["effect_id"].as_str().cmp(&b["effect_id"].as_str()));
+    json_response(json!({"project": key, "name": name, "items": items, "pending": pending}))
+}
+
+/// What the durable effect ledger says about one effect: who staged it,
+/// the task it named (if any), its state and the human title of its
+/// input. A read-only open, like the `plan_proposed` fallback
+/// `open_plan_epics` reads; the caller has already proven the operator,
+/// so nothing here widens a gate. Unreadable ledger: no effect is
+/// attributed, never an error.
+struct EffectFacts {
+    agent: String,
+    task: Option<String>,
+    state: String,
+    title: Option<String>,
+}
+
+fn effect_facts(state_dir: &std::path::Path) -> HashMap<String, EffectFacts> {
+    let Ok(conn) = crate::store::open_read_only(&state_dir.join("cadence.sqlite3")) else {
+        return HashMap::new();
+    };
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT effect_id, agent, task, state, input, input_summary FROM platform_effects",
+    ) else {
+        return HashMap::new();
+    };
+    let rows = stmt.query_map([], |r| {
+        let input: String = r.get(4)?;
+        let title = serde_json::from_str::<Value>(&input)
+            .ok()
+            .and_then(|v| v["title"].as_str().map(str::to_string));
+        Ok((
+            r.get::<_, String>(0)?,
+            EffectFacts {
+                agent: r.get(1)?,
+                task: r.get(2)?,
+                state: r.get(3)?,
+                title: title.or_else(|| r.get::<_, Option<String>>(5).ok().flatten()),
+            },
+        ))
+    });
+    match rows {
+        Ok(rows) => rows.flatten().collect(),
+        Err(_) => HashMap::new(),
     }
 }
 
@@ -200,8 +431,9 @@ pub(super) fn approve(
 mod tests {
     use super::*;
 
-    /// The read route's shape: exactly the list or `<project>/<name>` —
-    /// no partial segment, no deeper path, no sibling prefix.
+    /// The read route's shape: exactly the list, `<project>/<name>`, or
+    /// one app's `runs` / `outputs` — no partial segment, no deeper
+    /// path, no sibling prefix, and no other verb.
     #[test]
     fn read_route_is_exact() {
         assert!(matches!(read_route("/api/apps"), Some(ReadRoute::List)));
@@ -210,10 +442,22 @@ mod tests {
             Some(ReadRoute::Detail(p, n)) => assert_eq!((p, n), ("demo", "studio")),
             other => panic!("detail: {other:?}"),
         }
+        match read_route("/api/apps/demo/studio/runs") {
+            Some(ReadRoute::Runs(p, n)) => assert_eq!((p, n), ("demo", "studio")),
+            other => panic!("runs: {other:?}"),
+        }
+        match read_route("/api/apps/demo/studio/outputs") {
+            Some(ReadRoute::Outputs(p, n)) => assert_eq!((p, n), ("demo", "studio")),
+            other => panic!("outputs: {other:?}"),
+        }
         for dead in [
             "/api/apps/demo",
             "/api/apps/demo/",
             "/api/apps/demo/studio/x",
+            "/api/apps/demo/studio/runs/x",
+            "/api/apps/demo/studio/approve",
+            "/api/apps/demo//runs",
+            "/api/apps//studio/runs",
             "/api/apps//studio",
             "/api/apps/demo//",
             "/api/appsx",

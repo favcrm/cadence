@@ -46,6 +46,9 @@ export interface HomeNeed {
   owner: string;
   /** Seconds waiting. */
   age: number;
+  /** What the row is about (`issue`, `report`, …), when the server names
+   *  one — the app page matches its runs by this (CAD-563). */
+  subject: { kind: string; id: string } | null;
   /** The master's summary of an escalated question. */
   summary: string | null;
   /** Who escalated the question to the operator (the master). */
@@ -103,6 +106,7 @@ export function homeNeed(row: NeedsMe, index = 0): HomeNeed {
     label: LABEL[row.kind] ?? row.kind.replace(/_/g, " "),
     title: row.title,
     age: row.age,
+    subject: row.subject ?? null,
     summary: null as string | null,
     escalatedBy: null as string | null,
   };

@@ -45,9 +45,15 @@ pub const DIR: &str = "workflows";
 /// Frontmatter keys a workflow file may carry: the plan's own three,
 /// plus `inputs` and `distinct` (inputs whose values must differ at
 /// render — `distinct: [worker, reviewer]` keeps a reviewer from being
-/// the worker). Anything else refuses at parse — the same fail-loud
-/// rule the plan parser applies with `deny_unknown_fields`.
-const META_KEYS: &[&str] = &["title", "goal", "non_goals", "inputs", "distinct"];
+/// the worker) and `label` (the human name the board's primary action
+/// uses — "New post"; wording, like the title). Anything else refuses
+/// at parse — the same fail-loud rule the plan parser applies with
+/// `deny_unknown_fields`.
+const META_KEYS: &[&str] = &["title", "goal", "non_goals", "inputs", "distinct", "label"];
+
+/// Workflow-only frontmatter keys: pulled out at parse and removed
+/// before rendering, because the plan parser denies unknown fields.
+const WORKFLOW_ONLY_KEYS: &[&str] = &["inputs", "distinct", "label"];
 
 /// Ticket metadata lines a workflow recognises: the plan's own plus
 /// the approval-affecting fields later stages add (a `reviewer:` line
@@ -67,14 +73,40 @@ pub struct InputSpec {
     pub optional: bool,
 }
 
-/// A parsed workflow template: the declared inputs and the `distinct:`
-/// group — inputs whose rendered values must pairwise differ. The plan
-/// structure itself is checked by rendering and running
-/// [`plan::parse_plan`].
+/// A parsed workflow template: the declared inputs, the `distinct:`
+/// group — inputs whose rendered values must pairwise differ — and the
+/// optional human `label:`. `input_order` is the file's own order (the
+/// run form shows the inputs as the author wrote them; the map is
+/// sorted). The plan structure itself is checked by rendering and
+/// running [`plan::parse_plan`].
 #[derive(Clone, Debug)]
 pub struct Template {
     pub inputs: BTreeMap<String, InputSpec>,
+    /// The `inputs:` names in declared order.
+    pub input_order: Vec<String>,
     pub distinct: Vec<String>,
+    pub label: Option<String>,
+}
+
+/// The declared inputs as the board renders them — file order, each
+/// with its ask and optionality.
+pub fn inputs_json(tpl: &Template) -> Vec<Value> {
+    let mut names = tpl.input_order.clone();
+    for name in tpl.inputs.keys() {
+        if !names.contains(name) {
+            names.push(name.clone());
+        }
+    }
+    names
+        .iter()
+        .filter_map(|name| {
+            tpl.inputs.get(name).map(|spec| {
+                json!({
+                    "name": name, "ask": spec.ask, "optional": spec.optional,
+                })
+            })
+        })
+        .collect()
 }
 
 /// `{{name}}` — the input name is a bare word, like an alias but with
@@ -146,16 +178,17 @@ pub fn read_for(pm_dir: &Path, project: &str, name: &str) -> Result<String> {
         .map_err(|e| Error::rejected(format!("cannot read {}: {e}", file.display())))
 }
 
-/// The frontmatter of a template: a YAML mapping restricted to
-/// [`META_KEYS`]; `inputs` is pulled out into [`InputSpec`]s and
-/// `distinct` into the must-differ input group.
-fn parse_front(
-    yaml: &str,
-) -> Result<(
-    serde_yaml::Mapping,
-    BTreeMap<String, InputSpec>,
-    Vec<String>,
-)> {
+/// The frontmatter of a template, split into what the workflow knows:
+/// its declared inputs, the must-differ group and the human label. The
+/// plan's own metadata (title, goal, non_goals) stays in the file.
+struct Front {
+    inputs: BTreeMap<String, InputSpec>,
+    input_order: Vec<String>,
+    distinct: Vec<String>,
+    label: Option<String>,
+}
+
+fn parse_front(yaml: &str) -> Result<Front> {
     let meta: serde_yaml::Value = serde_yaml::from_str(yaml)
         .map_err(|e| Error::rejected(format!("workflow frontmatter: {e}")))?;
     let mut map = match meta {
@@ -176,8 +209,31 @@ fn parse_front(
             )));
         }
     }
+    // `label:` is the human name the board's action uses — one line.
+    let label = match map.remove(serde_yaml::Value::String("label".to_string())) {
+        None | Some(serde_yaml::Value::Null) => None,
+        Some(serde_yaml::Value::String(s)) => {
+            let s = s.trim();
+            if s.is_empty() {
+                None
+            } else if s.chars().count() > 60 || s.chars().any(char::is_control) {
+                return Err(Error::rejected(
+                    "workflow `label:` — ≤60 chars, no control characters",
+                ));
+            } else {
+                Some(s.to_string())
+            }
+        }
+        Some(_) => {
+            return Err(Error::rejected(
+                "workflow `label:` is one line of text — what the run is called, \
+                 like \"New post\"",
+            ))
+        }
+    };
     let inputs_val = map.remove(serde_yaml::Value::String("inputs".to_string()));
     let mut inputs = BTreeMap::new();
+    let mut input_order: Vec<String> = Vec::new();
     if let Some(inputs_val) = inputs_val {
         let serde_yaml::Value::Mapping(specs) = inputs_val else {
             return Err(Error::rejected(
@@ -227,6 +283,7 @@ fn parse_front(
                 }
             };
             inputs.insert(name.to_string(), spec);
+            input_order.push(name.to_string());
         }
     }
     // `distinct: [a, b]` — inputs whose rendered values must pairwise
@@ -257,7 +314,12 @@ fn parse_front(
             ));
         }
     }
-    Ok((map, inputs, distinct))
+    Ok(Front {
+        inputs,
+        input_order,
+        distinct,
+        label,
+    })
 }
 
 /// Scan for `{{` … `}}` placeholders: each inner name must be a
@@ -394,10 +456,15 @@ pub fn parse_template(text: &str) -> Result<Template> {
             "{e} — a workflow is a plan file: frontmatter title, goal, non_goals, inputs"
         ))
     })?;
-    let (_meta, inputs, distinct) = parse_front(yaml)?;
-    placeholders(text, &inputs)?;
+    let front = parse_front(yaml)?;
+    placeholders(text, &front.inputs)?;
     ticket_meta(body)?;
-    Ok(Template { inputs, distinct })
+    Ok(Template {
+        inputs: front.inputs,
+        input_order: front.input_order,
+        distinct: front.distinct,
+        label: front.label,
+    })
 }
 
 /// Render `text` with `values`: every `{{name}}` becomes its value
@@ -410,9 +477,10 @@ fn render_values(text: &str, values: &BTreeMap<String, String>) -> Result<String
     let (yaml, body) = parse::split_front(text).map_err(|e| Error::rejected(e.to_string()))?;
     let mut meta: serde_yaml::Mapping = serde_yaml::from_str(yaml)
         .map_err(|e| Error::rejected(format!("workflow frontmatter: {e}")))?;
-    // `inputs:` and `distinct:` are workflow meta — the plan parser
-    // denies unknown fields, so neither reaches the rendered file.
-    for key in ["inputs", "distinct"] {
+    // The workflow-only keys are meta for the workflow, not the plan:
+    // the plan parser denies unknown fields, so none reaches the
+    // rendered file.
+    for key in WORKFLOW_ONLY_KEYS {
         meta.remove(serde_yaml::Value::String(key.to_string()));
     }
     let mut meta = serde_yaml::Value::Mapping(meta);
@@ -1419,9 +1487,7 @@ pub fn show(pm: &Pm, project_key: &str, name: &str, state_dir: &Path) -> Result<
             }).collect::<Vec<_>>(),
             "acceptance": t.acceptance.len(),
         })).collect::<Vec<_>>()),
-        "inputs": tpl.map(|t| t.inputs.iter().map(|(k, s)| json!({
-            "name": k, "ask": s.ask, "optional": s.optional,
-        })).collect::<Vec<_>>()),
+        "inputs": tpl.as_ref().map(inputs_json),
     }))
 }
 
@@ -1489,6 +1555,40 @@ Why.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance
         assert_eq!(tpl.inputs.len(), 2);
         assert!(!tpl.inputs["topic"].optional);
         assert!(tpl.inputs["keyword"].optional);
+        assert_eq!(tpl.label, None, "no label is fine");
+        // The declared order is kept for the board's form: `topic`
+        // before `keyword` though the map sorts them the other way.
+        assert_eq!(tpl.input_order, vec!["topic", "keyword"]);
+        let rows = inputs_json(&tpl);
+        assert_eq!(rows[0]["name"], "topic", "{rows:?}");
+        assert_eq!(rows[1]["name"], "keyword", "{rows:?}");
+    }
+
+    /// CAD-563: `label:` is the human name the board's primary action
+    /// uses — accepted, and wording: it is dropped before rendering (the
+    /// plan parser denies unknown fields) and it never enters the gate
+    /// digest, so a label-only edit keeps an approval.
+    #[test]
+    fn template_label_is_wording_not_gate() {
+        let labelled = WF.replace("inputs:", "label: New post\ninputs:");
+        let tpl = parse_template(&labelled).unwrap();
+        assert_eq!(tpl.label.as_deref(), Some("New post"));
+        // The render drops it and still parses as a plan.
+        let out = render(&labelled, &inputs(&[("topic", "rust")])).unwrap();
+        assert!(!out.contains("label:"), "{out}");
+        assert!(plan::parse_plan(&out).is_ok(), "{out}");
+        // The gate digest is unchanged by the label.
+        assert_eq!(
+            gate_digest(&labelled).unwrap(),
+            gate_digest(WF).unwrap(),
+            "a label-only edit is wording"
+        );
+        for bad in [
+            WF.replace("inputs:", "label: [a]\ninputs:"),
+            WF.replace("inputs:", &format!("label: '{}'\ninputs:", "x".repeat(61))),
+        ] {
+            assert!(parse_template(&bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

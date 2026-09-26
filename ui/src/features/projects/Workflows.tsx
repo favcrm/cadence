@@ -1,20 +1,13 @@
-import { useEffect, useRef, useState } from "react";
-import { api, type ApiError } from "../../lib/api";
+import { useEffect, useState } from "react";
 import { resources } from "../../lib/resources";
 import type { WorkflowRow } from "../../lib/types";
 import { useQuery } from "../../lib/useResource";
 import { useHref } from "../../lib/useLocation";
+import Link from "../../ui/Link";
 import { ResourceGate, StaleChip } from "../../ui/ResourceStatus";
-import {
-  approvalChip,
-  gateBlock,
-  missingRequired,
-  proposeBlock,
-  proposedEpic,
-  providedInputs,
-  refusalText,
-  runFields,
-} from "./workflows";
+import { appHref } from "../apps/apps";
+import RunForm from "./RunForm";
+import { approvalChip, gateBlock } from "./workflows";
 import type { Viewer } from "./work";
 
 /**
@@ -27,9 +20,10 @@ import type { Viewer } from "./work";
  * `cadence plan propose --workflow` takes. The plan it lands waits in
  * Home's Needs you like any other proposal.
  *
- * `?run=<name>` opens that row's form directly — an Apps card's Run
- * links here with `<app>/<workflow>` (CAD-557), so the one form serves
- * stored and bundled workflows alike.
+ * An installed app's workflow (`<app>/<wf>`) is listed, but it runs
+ * from its app's page (CAD-563): the row reads "provided by <app>" and
+ * links there, so a run always happens where the app lives. A stored
+ * workflow is unchanged; `?run=<name>` still opens its form directly.
  */
 export default function Workflows({
   project,
@@ -45,14 +39,14 @@ export default function Workflows({
   const state = useQuery(resources.workflows(project));
   const [open, setOpen] = useState<string | null>(null);
   const rows = state.data ?? [];
-  // `?run=<name>` asks for that row's New run form to be open — a deep
-  // link from an app's workflow row. Follows the param so a second Run
-  // click on this screen re-opens too; a name that resolves to no row
-  // is ignored.
+  // `?run=<name>` asks for that row's New run form to be open — the
+  // stored workflow's own deep link. Follows the param so a second Run
+  // click on this screen re-opens too; a name that resolves to no
+  // stored row (an app's workflow, a typo) is ignored.
   const href = useHref();
   const run = new URLSearchParams(href.split("?")[1] ?? "").get("run");
   useEffect(() => {
-    if (run && (state.data ?? []).some((r) => r.name === run)) setOpen(run);
+    if (run && (state.data ?? []).some((r) => r.name === run && !r.app)) setOpen(run);
   }, [run, state.data]);
 
   return (
@@ -105,38 +99,46 @@ function WorkflowCard({
 }) {
   const approval = approvalChip(row);
   const blocked = gateBlock(row);
+  const app = row.app ?? null;
   return (
     <li className="card min-w-0" data-workflow={row.name}>
       <div className="px-3.5 py-3 min-w-0">
-        <button
-          type="button"
-          onClick={onToggle}
-          aria-expanded={open}
-          aria-label={`${open ? "close" : "new run of"} ${row.name}`}
-          className="w-full text-left flex items-start gap-2 min-w-0 rounded hover:text-accent"
-        >
-          <span className="num text-label text-accent shrink-0 pt-px">{row.name}</span>
-          <span className="text-cardtitle font-medium text-ink-100 min-w-0 break-words flex-1">
-            {row.title ?? row.name}
-          </span>
-          <svg
-            width="10"
-            height="10"
-            viewBox="0 0 10 10"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="1.5"
-            className={`shrink-0 mt-1.5 text-ink-500 transition-transform ${open ? "rotate-180" : ""}`}
-            aria-hidden
+        {app ? (
+          <div className="w-full text-left flex items-start gap-2 min-w-0">
+            <span className="num text-label text-accent shrink-0 pt-px">{row.name}</span>
+            <span className="text-cardtitle font-medium text-ink-100 min-w-0 break-words flex-1">
+              {row.title ?? row.name}
+            </span>
+          </div>
+        ) : (
+          <button
+            type="button"
+            onClick={onToggle}
+            aria-expanded={open}
+            aria-label={`${open ? "close" : "new run of"} ${row.name}`}
+            className="w-full text-left flex items-start gap-2 min-w-0 rounded hover:text-accent"
           >
-            <path d="M2 3.5l3 3 3-3" />
-          </svg>
-        </button>
+            <span className="num text-label text-accent shrink-0 pt-px">{row.name}</span>
+            <span className="text-cardtitle font-medium text-ink-100 min-w-0 break-words flex-1">
+              {row.title ?? row.name}
+            </span>
+            <svg
+              width="10"
+              height="10"
+              viewBox="0 0 10 10"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.5"
+              className={`shrink-0 mt-1.5 text-ink-500 transition-transform ${open ? "rotate-180" : ""}`}
+              aria-hidden
+            >
+              <path d="M2 3.5l3 3 3-3" />
+            </svg>
+          </button>
+        )}
         <div className="flex flex-wrap items-center gap-1.5 mt-2">
           <span className={`chip ${approval.cls}`}>{approval.text}</span>
-          {row.app && (
-            <span className="chip bg-accent/10 text-accent">app {row.app}</span>
-          )}
+          {app && <span className="chip bg-accent/10 text-accent">provided by {app}</span>}
           {typeof row.tickets === "number" && (
             <span className="chip bg-ink-800 text-ink-300">
               {row.tickets} ticket{row.tickets === 1 ? "" : "s"}
@@ -145,6 +147,15 @@ function WorkflowCard({
           <span className="chip bg-ink-800 text-ink-500">
             {(row.inputs ?? []).length} input{(row.inputs ?? []).length === 1 ? "" : "s"}
           </span>
+          {app && (
+            <Link
+              href={appHref(row.project, app)}
+              className="chip bg-accent/15 text-accent hover:bg-accent/25 transition-colors"
+              title={`open ${app} — its workflows run from the app page`}
+            >
+              open app →
+            </Link>
+          )}
         </div>
         {(row.inputs ?? []).length > 0 && (
           <p className="text-micro text-ink-500 mt-2 break-words">
@@ -157,196 +168,9 @@ function WorkflowCard({
           </p>
         )}
       </div>
-      {open && (
+      {open && !app && (
         <RunForm row={row} viewer={viewer} onOpenIssue={onOpenIssue} onHome={onHome} />
       )}
     </li>
-  );
-}
-
-/** The live preview's state — the rendered plan or the named render refusal. */
-interface PreviewState {
-  loading: boolean;
-  rendered: string | null;
-  error: string | null;
-  /** The daemon's refusal code (one_line, not_distinct, render_diverged). */
-  code: string | null;
-}
-
-/**
- * The run form for one workflow: a field per declared input (`ask` as
- * the label, optionals marked), a debounced live preview of the
- * rendered plan file, and Propose — disabled with the reason while the
- * board, the gate or the form is not ready.
- */
-function RunForm({
-  row,
-  viewer,
-  onOpenIssue,
-  onHome,
-}: {
-  row: WorkflowRow;
-  viewer: Viewer;
-  onOpenIssue: (id: string) => void;
-  onHome: () => void;
-}) {
-  const fields = runFields(row);
-  const [values, setValues] = useState<Record<string, string>>({});
-  const [preview, setPreview] = useState<PreviewState>({
-    loading: true,
-    rendered: null,
-    error: null,
-    code: null,
-  });
-  const [busy, setBusy] = useState(false);
-  const [result, setResult] = useState<{ ok: boolean; text: string } | null>(null);
-  const [proposed, setProposed] = useState<{ epic: string; title: string; tickets: number } | null>(null);
-  const request = useRef(0);
-  const inputs = providedInputs(row, values);
-
-  // The rendered plan file, re-rendered shortly after the last keystroke.
-  useEffect(() => {
-    const seq = ++request.current;
-    const timer = window.setTimeout(() => {
-      api
-        .workflowPreview(row.project, row.name, inputs)
-        .then((next) => {
-          if (request.current !== seq) return;
-          setPreview({
-            loading: false,
-            rendered: next.rendered ?? null,
-            error: next.error ?? null,
-            code: next.code ?? null,
-          });
-        })
-        .catch((e: ApiError) => {
-          if (request.current !== seq) return;
-          setPreview({ loading: false, rendered: null, error: e.message ?? String(e), code: e.code ?? null });
-        });
-    }, 250);
-    return () => window.clearTimeout(timer);
-  }, [row.project, row.name, JSON.stringify(inputs)]);
-
-  const missing = missingRequired(row, values);
-  const blocked = proposeBlock(row, viewer, values);
-
-  const propose = () => {
-    if (blocked || busy) return;
-    setBusy(true);
-    setResult(null);
-    api
-      .workflowPropose(row.project, row.name, inputs)
-      .then((out) => {
-        const done = proposedEpic(out);
-        setProposed(done);
-        // The daemon emitted plan_proposed; the new epic is an issues
-        // row, and Needs you reads the overview (an unobserved store
-        // just marks invalid — no fetch while Home is off screen).
-        void resources.issues.invalidate();
-        void resources.overview.invalidate();
-      })
-      .catch((e: ApiError) =>
-        setResult({ ok: false, text: refusalText(e.code, e.message ?? String(e)) }),
-      )
-      .finally(() => setBusy(false));
-  };
-
-  return (
-    <div className="border-t border-ink-700 px-3.5 py-3 grid gap-4 lg:grid-cols-2 min-w-0">
-      <section className="min-w-0" aria-label={`${row.name} inputs`}>
-        <div className="slabel mb-1.5">new run</div>
-        {fields.length === 0 && (
-          <p className="text-label text-ink-500">This workflow declares no inputs — it proposes as written.</p>
-        )}
-        <div className="space-y-3">
-          {fields.map((field) => (
-            <div key={field.name}>
-              <label
-                htmlFor={`wf-${row.name}-${field.name}`}
-                className="text-label text-ink-300 block mb-1"
-              >
-                {field.label}
-                {field.optional && <span className="text-ink-500"> · optional</span>}
-              </label>
-              <input
-                id={`wf-${row.name}-${field.name}`}
-                value={values[field.name] ?? ""}
-                onChange={(e) => setValues((cur) => ({ ...cur, [field.name]: e.target.value }))}
-                className="field w-full"
-                placeholder={field.name}
-                aria-label={`${row.name} input ${field.name}`}
-                data-input={field.name}
-              />
-            </div>
-          ))}
-        </div>
-        {proposed ? (
-          <div className="mt-3" role="status">
-            <p className="text-label text-ok break-words">
-              plan {proposed.epic} proposed — {proposed.tickets} ticket{proposed.tickets === 1 ? "" : "s"} · waiting in Needs you
-            </p>
-            <div className="flex flex-wrap gap-2 mt-2">
-              <button
-                type="button"
-                onClick={onHome}
-                className="h-8 px-3 rounded bg-accent text-on-accent text-label font-medium"
-              >
-                Needs you →
-              </button>
-              <button
-                type="button"
-                onClick={() => onOpenIssue(proposed.epic)}
-                className="h-8 px-3 rounded border border-ink-600 text-label text-ink-300 hover:border-edge-hover"
-              >
-                open {proposed.epic}
-              </button>
-            </div>
-          </div>
-        ) : (
-          <div className="mt-3">
-            <button
-              type="button"
-              onClick={propose}
-              disabled={busy || blocked !== null}
-              className="h-8 px-3 rounded bg-accent text-on-accent text-label font-medium disabled:opacity-40"
-              title={blocked ?? undefined}
-            >
-              {busy ? "Proposing…" : "Propose plan"}
-            </button>
-            {blocked && (
-              <p className="text-micro text-ink-500 mt-1.5 break-words">{blocked}</p>
-            )}
-            {missing.length === 0 && viewer.operator && (
-              <p className="text-micro text-ink-500 mt-1.5">
-                Proposes via the daemon's plan_propose — the plan waits in Needs you.
-              </p>
-            )}
-            {result && !result.ok && (
-              <p className="text-label text-fail mt-1.5 break-words" role="alert">
-                {result.text}
-              </p>
-            )}
-          </div>
-        )}
-      </section>
-      <section className="min-w-0" aria-label={`${row.name} plan preview`}>
-        <div className="slabel mb-1.5">
-          rendered plan{preview.loading ? " · rendering…" : ""}
-        </div>
-        {preview.error && (
-          <p className="card px-3.5 py-2.5 text-label text-warn break-words" role="note">
-            {refusalText(preview.code, preview.error)}
-          </p>
-        )}
-        {preview.rendered && (
-          <pre className="num text-micro text-ink-300 leading-relaxed whitespace-pre-wrap break-words rounded border border-ink-700 bg-ink-900 p-3 max-h-[26rem] overflow-auto">
-            {preview.rendered}
-          </pre>
-        )}
-        {!preview.loading && !preview.rendered && !preview.error && (
-          <p className="text-label text-ink-500">No preview — the workflow file did not render.</p>
-        )}
-      </section>
-    </div>
   );
 }

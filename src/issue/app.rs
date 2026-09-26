@@ -63,7 +63,7 @@ pub const LOCAL_CONNECTION: &str = "local";
 
 /// `app.md` frontmatter keys v0 knows. Anything else refuses — the same
 /// fail-loud rule the workflow and plan parsers apply.
-const MANIFEST_KEYS: &[&str] = &["app", "title", "version", "needs"];
+const MANIFEST_KEYS: &[&str] = &["app", "title", "version", "needs", "summary"];
 
 /// Frontmatter keys the later stages reserve — refused with their own
 /// message so a bundle carrying one names the stage, not "unknown key".
@@ -84,13 +84,16 @@ const MAX_APP_BYTES: u64 = 2 * 1024 * 1024;
 
 /// The `app.md` definition: the frontmatter fields plus the body, the
 /// guide agents read. `needs.connections` declares the slots the app's
-/// workflows may name in their `uses:` lines.
+/// workflows may name in their `uses:` lines; `summary` is the optional
+/// one-line purpose the board shows people (wording — the guide's bytes
+/// are what the digest covers, so adding one never re-gates an app).
 #[derive(Clone, Debug)]
 pub struct Manifest {
     pub app: String,
     pub title: String,
     pub version: String,
     pub connections: Vec<String>,
+    pub summary: Option<String>,
     pub guide: String,
 }
 
@@ -279,6 +282,27 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
             )));
         }
     }
+    // `summary:` is optional wording — the board's one-line purpose.
+    let summary = match get("summary") {
+        None | Some(serde_yaml::Value::Null) => None,
+        Some(serde_yaml::Value::String(s)) => {
+            let s = s.trim();
+            if s.is_empty() {
+                None
+            } else if s.chars().count() > 160 || s.chars().any(char::is_control) {
+                return Err(Error::rejected(
+                    "app.md `summary:` — ≤160 chars, no control characters",
+                ));
+            } else {
+                Some(s.to_string())
+            }
+        }
+        Some(_) => {
+            return Err(Error::rejected(
+                "app.md `summary:` is one line of text — what the app is for",
+            ))
+        }
+    };
     let mut connections = Vec::new();
     if let Some(needs) = get("needs") {
         let serde_yaml::Value::Mapping(needs) = needs else {
@@ -321,6 +345,7 @@ pub fn parse_manifest(text: &str) -> Result<Manifest> {
         title,
         version,
         connections,
+        summary,
         guide: body.to_string(),
     })
 }
@@ -566,6 +591,7 @@ fn validate(root: &Path, agents: &HashSet<String>, agent_sources: &[String]) -> 
                     title: String::new(),
                     version: String::new(),
                     connections: vec![],
+                    summary: None,
                     guide: String::new(),
                 }
             }
@@ -575,6 +601,7 @@ fn validate(root: &Path, agents: &HashSet<String>, agent_sources: &[String]) -> 
             title: String::new(),
             version: String::new(),
             connections: vec![],
+            summary: None,
             guide: String::new(),
         },
     };
@@ -1656,7 +1683,24 @@ fn describe(
     };
     row["title"] = json!(manifest.title);
     row["version"] = json!(manifest.version);
+    row["summary"] = json!(manifest.summary);
     row["workflows"] = json!(workflows);
+    // The card's primary action (CAD-563 r2): the app's first workflow
+    // (sorted, so the choice is deterministic) and the human label the
+    // board names the action with.
+    let mut names = workflows.clone();
+    names.sort();
+    if let Some(first) = names.first() {
+        let label = std::fs::read_to_string(
+            app_dir_or(pm_dir, project, name)
+                .join("workflows")
+                .join(format!("{first}.md")),
+        )
+        .ok()
+        .and_then(|text| workflow::parse_template(&text).ok())
+        .and_then(|tpl| tpl.label);
+        row["primary"] = json!({"workflow": first, "label": label});
+    }
     row["connections"] = json!(manifest
         .connections
         .iter()
@@ -1751,14 +1795,28 @@ pub fn show(pm: &Pm, project_key: &str, name: &str, state_dir: &Path) -> Result<
             "errors": errors,
             "notes": notes,
             "title": doc.as_ref().map(|d| d.title.clone()),
-            "tickets": doc.map(|d| d.tickets.len()),
-            "inputs": tpl.map(|t| t.inputs.iter().map(|(k, s)| json!({
-                "name": k, "ask": s.ask, "optional": s.optional,
+            // The workflow's human label (`label:`, wording) — the
+            // board's primary action names it; the app's title when the
+            // workflow never declared one.
+            "label": tpl.as_ref().and_then(|t| t.label.clone()),
+            "tickets": doc.as_ref().map(|d| d.tickets.len()),
+            "inputs": tpl.as_ref().map(workflow::inputs_json),
+            // The steps, in order, from the canonical render: each
+            // title (input names stand in for values) and the agent
+            // expression — an input name when the ticket's `agent:` is
+            // exactly `{{input}}`, which is how the board maps a run's
+            // owners back to the team inputs.
+            "steps": doc.as_ref().map(|d| d.tickets.iter().map(|t| json!({
+                "title": t.title,
+                "agent": t.agent,
+                "size": t.size,
             })).collect::<Vec<_>>()),
+            "distinct": tpl.as_ref().map(|t| t.distinct.clone()),
             "uses": workflow_slots(&text).unwrap_or_default(),
         }));
     }
     let record = read_record(&pm.dir, project_key, name)?;
+    out["summary"] = json!(manifest.summary);
     out["guide"] = json!(manifest.guide);
     out["workflows"] = json!(workflows);
     out["rubrics"] = json!(rubrics);
@@ -1886,9 +1944,7 @@ pub fn board_rows(pm_dir: &Path, project: &str, state_dir: &Path) -> Vec<Value> 
                         "app": name,
                         "title": doc.as_ref().map(|d| d.title.clone()),
                         "tickets": doc.map(|d| d.tickets.len()),
-                        "inputs": tpl.map(|t| t.inputs.iter().map(|(k, s)| json!({
-                            "name": k, "ask": s.ask, "optional": s.optional,
-                        })).collect::<Vec<_>>()),
+                        "inputs": tpl.as_ref().map(workflow::inputs_json),
                         "approved": approved,
                         "digest": app_digest.as_ref().ok(),
                     });
@@ -2106,7 +2162,37 @@ needs:\n  connections: [publish]\n---\n\n# Guide\n\nHow to run the studio.\n";
         assert_eq!(m.title, "Content studio");
         assert_eq!(m.version, "0.1.0");
         assert_eq!(m.connections, vec!["publish".to_string()]);
+        assert_eq!(m.summary, None, "no summary is fine");
         assert!(m.guide.contains("Guide"));
+    }
+
+    /// CAD-563: `summary:` is the optional one-line purpose the board
+    /// shows — accepted and trimmed; a non-string or an oversize one
+    /// refuses like every other manifest field.
+    #[test]
+    fn manifest_summary_is_optional_wording() {
+        let with = APP_MD.replace(
+            "version: 0.1.0",
+            "version: 0.1.0\nsummary:  Get a post written, checked and published.  ",
+        );
+        let m = parse_manifest(&with).unwrap();
+        assert_eq!(
+            m.summary.as_deref(),
+            Some("Get a post written, checked and published.")
+        );
+        // A blank summary reads as none — a `summary:` line left empty
+        // is not a refusal.
+        let blank = APP_MD.replace("version: 0.1.0", "version: 0.1.0\nsummary: '  '");
+        assert_eq!(parse_manifest(&blank).unwrap().summary, None);
+        for bad in [
+            APP_MD.replace("version: 0.1.0", "version: 0.1.0\nsummary: [a, b]"),
+            APP_MD.replace(
+                "version: 0.1.0",
+                &format!("version: 0.1.0\nsummary: '{}'", "x".repeat(161)),
+            ),
+        ] {
+            assert!(parse_manifest(&bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

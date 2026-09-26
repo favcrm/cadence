@@ -3,6 +3,8 @@ import type {
   AgentDetail,
   AgentsPayload,
   AppDetail,
+  AppOutputsPayload,
+  AppRunsPayload,
   AppsPayload,
   Health,
   IssueCard,
@@ -325,6 +327,23 @@ export const api = {
    */
   app: (project: string, name: string) =>
     get<AppDetail>(`/api/apps/${encodeURIComponent(project)}/${encodeURIComponent(name)}`),
+  /**
+   * `GET /api/apps/<project>/<name>/runs` — the plans/epics proposed
+   * from this app's workflows, by the recorded `plan.workflow`
+   * provenance (CAD-563).
+   */
+  appRuns: (project: string, name: string) =>
+    get<AppRunsPayload>(
+      `/api/apps/${encodeURIComponent(project)}/${encodeURIComponent(name)}/runs`,
+    ),
+  /**
+   * `GET /api/apps/<project>/<name>/outputs` — the outbox items this
+   * app's runs produced (CAD-563); operator-only, like `/api/outbox`.
+   */
+  appOutputs: (project: string, name: string) =>
+    get<AppOutputsPayload>(
+      `/api/apps/${encodeURIComponent(project)}/${encodeURIComponent(name)}/outputs`,
+    ),
   /**
    * `POST /api/apps/<project>/<name>/approve` — relays the daemon's
    * `app_approve`; operator-only on the board, so the body is `{}` —
