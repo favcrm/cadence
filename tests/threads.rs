@@ -3104,6 +3104,45 @@ fn cad551_master_command_board_gate() {
     assert!(out.contains("session_from_agent"), "{out}");
 }
 
+/// CAD-602: an operator proof cannot authorize an agentic model for
+/// the Pi master. The HTTP relay preserves the RPC's refusal.
+#[test]
+fn cad602_agentic_model_rpc_and_http_refuse() {
+    let f = pi_master("normal");
+    let d = &f.d;
+    d.wait_agent("master", "idle", 30);
+    std::fs::write(
+        f.pm_dir.join("pm.yaml"),
+        "pi:\n  models:\n    allow: [fake/model-1, cursor/grok-4.7-high]\n    default: {master: fake/model-1}\n",
+    )
+    .unwrap();
+    let err = d
+        .operator_rpc(
+            "master_command",
+            json!({"command": "model", "arg": "cursor/grok-4.7-high"}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("agentic"), "{err}");
+
+    let pm = TempDir::new().unwrap();
+    let (port, _board) = start_operator_board(pm.path(), &d.state);
+    let op = sign_in(&d.state, port);
+    let guards = op_guards(&op);
+    let (status, reply) = op_http(
+        port,
+        &master_command_request(
+            port,
+            &guards,
+            r#"{"command":"model","arg":"cursor/grok-4.7-high"}"#,
+        ),
+    );
+    assert_ne!(status, 200, "{reply}");
+    assert!(reply.contains("agentic"), "{reply}");
+    let show = d.rpc("agent_show", json!({"alias": "master"})).unwrap();
+    assert_eq!(show["agent"]["params"]["model"], "fake/model-1", "{show}");
+}
+
 // ---- CAD-575: per-role model allowlists + the master_models read ----
 
 /// `pi_master` under a pm.yaml whose per-role lists split `allow`: the
