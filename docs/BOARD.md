@@ -125,6 +125,25 @@ the identical `name@version` — a silent `npm update` drifts the
 install away from the pin and refuses the next launch instead of
 loading an unvetted build.
 
+### Which models to use
+
+- **devin** models are the free worker/reviewer path. DeepSeek V4.1
+  Flash Max is `devin/deepseek-v4-1-flash-high` with `--effort max`.
+  The devin provider exists only because the pinned `pi-devin` package
+  loads with `-e` — a daemon built before CAD-559 launches workers as
+  `--no-extensions` with no `-e`, so the model resolves nowhere and pi
+  exits ("Model \"devin/…\" not found" → the agent fences with
+  "Pi process disconnected"). Check `readlink ~/.local/bin/cadence`
+  before dispatching on a devin model.
+- **`openrouter/*` is the paid path** — do not route workers or
+  reviewers through it. The production master's pinned
+  `openrouter/z-ai/glm-5.3-flash` is the one accepted exception.
+- Verify by hand as the operator:
+  `pi --list-models -e ~/.pi/agent/npm/node_modules/pi-devin/extensions/index.ts | grep devin`
+  (shows `devin deepseek-v4-1-flash-high`, 1.0M ctx, reasoning+tools)
+  and a one-shot
+  `pi -p "Reply with exactly: ok" --no-extensions -e <that path> --model devin/deepseek-v4-1-flash-high`.
+
 ## `cadence issue` — the only writer
 
 ```bash

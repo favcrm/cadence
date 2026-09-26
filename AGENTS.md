@@ -68,6 +68,27 @@ this workflow exactly.
 - If a test fails with a timeout or "daemon not reachable" while the host
   is loaded, rerun that test alone before treating the failure as real.
 
+### Pi agents and models (CAD-559)
+- Workers and reviewers run on `pi` with **devin** models — they are
+  free. The DeepSeek V4.1 Flash Max worker model is
+  `devin/deepseek-v4-1-flash-high` with `--effort max`:
+  `cadence join <pm> pi --model devin/deepseek-v4-1-flash-high --effort max`.
+- `openrouter/*` models are **paid** — never route a worker or reviewer
+  through openrouter. (The production master's pinned
+  `openrouter/z-ai/glm-5.3-flash` is the one accepted exception; the
+  operator owns that pin in `pm.yaml`.)
+- The devin provider comes from the pinned `pi-devin@<version>` package
+  in `pm.yaml` `[pi].providers`, loaded with `-e` (CAD-559). A daemon
+  built before CAD-559 cannot launch devin models: its worker argv is
+  `--no-extensions` with no `-e`, so pi exits with
+  `Model "devin/…" not found` and the agent fences with
+  "Pi process disconnected". Check the running build before dispatching:
+  `readlink ~/.local/bin/cadence`.
+- Verify by hand as the operator:
+  `pi --list-models -e ~/.pi/agent/npm/node_modules/pi-devin/extensions/index.ts | grep devin`
+  and
+  `pi -p "Reply with exactly: ok" --no-extensions -e <that path> --model devin/deepseek-v4-1-flash-high`.
+
 ### Production safety
 - A production daemon runs on this host. Never touch
   `~/.local/state/cadence`, `~/pm` (apart from `cadence issue …`
