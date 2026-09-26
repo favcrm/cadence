@@ -6447,8 +6447,9 @@ pub const FAKE_GH_PY: &str = include_str!("../fixtures/fake-gh.py");
 pub const LOOP_PR: &str = "https://github.com/acme/app/pull/7";
 
 /// The loop's fixture: a routed tracker + daemon, the master, a managed
-/// worker `w1`, managed agents `r1` (the reviewer: first by alias among
-/// same-provider peers) and `r2` (a bystander), and a fake `gh` only the
+/// worker `w1`, managed reviewers `r1` and `r2` (launch role `reviewer`;
+/// `r1` wins by alias, and `r2` takes the ticket when `r1` is excluded),
+/// and a fake `gh` only the
 /// operator's process has on its PATH.
 pub struct LoopFixture {
     pub f: PlanFixture,
@@ -6488,8 +6489,8 @@ impl LoopFixture {
         git(&["commit", "-qm", "demo: repo remote"]);
         let (mut m, _) = f.start_master();
         let w1 = ManagedWorker::start(&f.d, "w1");
-        let r1 = ManagedWorker::start(&f.d, "r1");
-        let r2 = ManagedWorker::start(&f.d, "r2");
+        let r1 = ManagedWorker::start_role(&f.d, "r1", "reviewer");
+        let r2 = ManagedWorker::start_role(&f.d, "r2", "reviewer");
         let plan = f.file("plan.md", plan_md);
         let (ok, out) = f.as_master(
             &mut m,
@@ -6742,17 +6743,50 @@ impl LoopFixture {
         }
     }
 
-    /// w1 reports `sha` done on `pr`; the review goes to r1, which
-    /// PASSes it through `report_verdict`.
+    /// Record `who` idle. The enrollment mock never completes a provider
+    /// turn, so a reviewer stays `busy` after the kickoff is taken. A
+    /// finished turn would leave them idle; this is that state, so a
+    /// later fresh review (which may only go to an idle reviewer) can
+    /// choose them.
+    pub fn idle_agent(&self, who: &str) {
+        let conn = rusqlite::Connection::open(self.f.d.state.join("cadence.sqlite3")).unwrap();
+        let n = conn
+            .execute(
+                "UPDATE agents SET state='idle' WHERE alias=?1 AND state='busy'",
+                rusqlite::params![who],
+            )
+            .unwrap();
+        assert_eq!(n, 1, "{who} was not busy");
+    }
+
+    fn agent_state(&self, who: &str) -> String {
+        self.f.d.rpc("agent_show", json!({"alias": who})).unwrap()["agent"]["state"]
+            .as_str()
+            .unwrap_or("")
+            .to_string()
+    }
+
+    /// w1 reports `sha` done on `pr`; whichever idle reviewer the loop
+    /// assigned PASSes it through `report_verdict`. A fresh review
+    /// goes only to an idle reviewer. The mock never finishes a turn,
+    /// so once both reviewers are busy this frees `r1` — the state a
+    /// finished turn would leave — before the report is filed.
     pub fn pass_on(&mut self, id: &str, sha: &str, pr: &str) {
+        if self.agent_state("r1") != "idle" && self.agent_state("r2") != "idle" {
+            self.idle_agent("r1");
+        }
         self.done_on(id, sha, pr);
         let rec = self.wait_of(id, "in review", |r| {
             r["state"] == "reviewing" && r["head"] == sha
         });
-        assert_eq!(rec["reviewer"], "r1", "{rec}");
+        let reviewer = rec["reviewer"].as_str().unwrap_or_default().to_string();
+        assert!(
+            reviewer == "r1" || reviewer == "r2",
+            "review went to {reviewer}: {rec}"
+        );
         let file = self.verdict_file(&format!("v-{id}-{sha}.md"), "pass", sha, "");
         let (ok, out) = self.as_agent(
-            "r1",
+            &reviewer,
             &format!("report file --task {id} --kind verdict --file {file}"),
         );
         assert!(ok, "{out}");

@@ -287,6 +287,7 @@ impl Shared {
                 state: a.state.clone(),
                 enabled: a.enabled,
                 upstream: super::agent_upstream(a).map(str::to_string),
+                role: a.role.clone(),
             })
             .collect();
         let Some(reviewer) = delivery::pick_reviewer(
@@ -299,9 +300,9 @@ impl Shared {
             if rec.state != State::Unstaffed {
                 rec.enter(State::Unstaffed, now());
                 rec.note = Some(format!(
-                    "no agent can review {sha}: none is registered besides the worker {} and \
-                     the master, or every other one is fenced",
-                    rec.worker
+                    "no idle reviewer can take {sha}: a fresh review goes only to an idle \
+                     agent registered with --role reviewer, never to a busy reviewer, an \
+                     implementer, the author, or another PM's group",
                 ));
                 let _ = self.store.event_public(
                     DAEMON_ALIAS,
