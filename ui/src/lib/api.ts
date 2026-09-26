@@ -1,4 +1,4 @@
-import type { LanePayload } from "../features/issues/LaneCard";
+import type { LanePayload } from "../features/issues/lane";
 import { sessionHeaders } from "./sessionKey";
 import type {
   AgentDetail,
