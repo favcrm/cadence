@@ -1,0 +1,811 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>No lane · Overview — CAD-604 · cadence mockup</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../tokens.css">
+<link rel="stylesheet" href="../../kit.css">
+<link rel="stylesheet" href="issue.css">
+<script>
+(function () {
+  try {
+    var p = localStorage.getItem("cadence-theme");
+    if (p === "light" || p === "dark") document.documentElement.setAttribute("data-theme", p);
+  } catch (e) { /* unstorable: the system preference decides */ }
+})();
+</script>
+</head>
+<body>
+<div class="shell">
+
+  <aside class="side">
+    <div class="brand">
+      <svg width="25" height="25" viewBox="0 0 1024 1024" fill="none" role="img" aria-label="cadence">
+        <defs><linearGradient id="cadence-lit" x1="0" y1="0" x2="0.574" y2="0.819"><stop offset="0" stop-color="#2DD4BF"/><stop offset="1" stop-color="#22D3EE"/></linearGradient></defs>
+        <rect x="20" y="20" width="984" height="984" rx="214" fill="#0B0B0C" stroke="#2e3136" stroke-width="40"/>
+        <path d="M 280 336 L 512 512 L 280 688" stroke="url(#cadence-lit)" stroke-width="160" stroke-linecap="round" stroke-linejoin="round"/>
+        <rect x="640" y="656" width="176" height="80" rx="40" fill="#2DD4BF" fill-opacity="0.8"/>
+      </svg>
+      <span>cadence<small>&nbsp;board</small></span>
+    </div>
+    <nav class="nav" aria-label="Board">
+      <a class="navlink" href="#/overview"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="5.5"/><path d="M8 5.5v3l2 1.4"/></svg>Home</a>
+      <a class="navlink" href="#/drawer"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="1.5" y="2" width="3.6" height="12" rx="1"/><rect x="6.2" y="2" width="3.6" height="8" rx="1"/><rect x="10.9" y="2" width="3.6" height="10" rx="1"/></svg>Projects</a>
+      <a class="navlink" href="#/overview" data-navlink="issues" aria-current="page"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3.5 1.8h6l3 3v9.4h-9z"/><path d="M5.8 7.5h4.4M5.8 10h4.4"/></svg>Issues</a>
+      <a class="navlink" href="#/overview"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2" y="3" width="12" height="8.5" rx="1.2"/><path d="M5.5 14h5"/></svg>Agents</a>
+    </nav>
+    <div class="slabel side-label"><span>Snapshots</span><span style="font-size:10px">review</span></div>
+    <nav class="nav screens" id="screen-nav" aria-label="Snapshots">
+      <a href="#/overview" data-nav="none overview">No lane</a>
+      <a href="#/kickoff" data-nav="none overview kickoff">Kick off</a>
+      <a href="#/kickoff/confirm" data-nav="none overview confirm">Kick off · confirm</a>
+      <a href="#/plan" data-nav="none overview plan">Plan with master</a>
+      <a href="#/lane" data-nav="lane overview">Running lane</a>
+      <a href="#/lane/activity" data-nav="lane activity">Activity</a>
+      <a href="#/lane/conversation" data-nav="lane conversation">Conversation</a>
+      <a href="#/lane/pr" data-nav="lane pr">PR &amp; CI</a>
+      <a href="#/lane/evidence" data-nav="lane evidence">Evidence</a>
+      <a href="#/fenced" data-nav="fenced">Fenced</a>
+      <a href="#/quota" data-nav="quota">Quota out</a>
+      <a href="#/blocked" data-nav="blocked">No acceptance</a>
+      <a href="#/drawer" data-nav="drawer">Drawer peek</a>
+      <a href="#/shipped" data-nav="shipped">Shipped</a>
+    </nav>
+    <div class="side-foot">
+      <div class="slabel" style="margin-bottom:4px">session</div>
+      mockup · fake data<br><span class="num" style="font-size:var(--text-micro)">CAD-605</span>
+    </div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <div class="crumb"><span>cadence</span> / <b id="crumb-leaf">CAD-604</b></div>
+      <div class="spacer">
+        <span class="chip" style="background:color-mix(in srgb, var(--color-warn) 10%, transparent);color:var(--color-warn)">MOCKUP</span>
+        <span class="chip fill" id="snap">No lane · Overview</span>
+        <button class="tg" id="theme-toggle" type="button" title="theme" aria-label="theme"></button>
+      </div>
+    </header>
+
+    <div id="app">
+      <div class="issuebar">
+        <div class="ititle">
+          <div class="kicker"><span class="num">CAD-604</span> · cadence</div>
+          <h1>Issue detail page</h1>
+          <div class="ichips" id="head-chips">
+            <span class="badge b-info">doing</span>
+            <span class="chip fill">p2</span>
+            <span class="chip fill">Board</span>
+          </div>
+        </div>
+        <div class="iactions" id="head-actions">
+          <button class="btn btn-acc" type="button" id="act-kick" data-go="#/kickoff">Kick off</button>
+          <button class="btn" type="button" id="act-ask" disabled title="No lane yet">Ask agent</button>
+          <button class="btn" type="button" id="act-approve" disabled title="No pull request yet">Approve</button>
+        </div>
+      </div>
+
+      <div id="banners" hidden>
+        <div class="callout fail" data-show="fenced" hidden>
+          <div class="spread">
+            <strong class="strong">Agent fenced</strong>
+            <span class="badge b-fail">fenced</span>
+          </div>
+          <p>lane-1’s turn went unknown when the pane stopped, during CI. Unfence records an explicit status. The turn is not replayed.</p>
+          <a class="btn btn-acc" href="#/fenced/unfence">Unfence</a>
+        </div>
+        <div class="callout warn" data-show="quota" hidden>
+          <div class="spread">
+            <strong class="strong">Quota out</strong>
+            <span class="badge b-warn">rate-limited</span>
+          </div>
+          <p>swe-2-high has no quota left, and the provider rate-limited the previous turn. Reassign is the suggested recovery.</p>
+          <a class="btn btn-acc" href="#/quota/reassign">Reassign</a>
+        </div>
+        <div class="callout warn" data-show="blocked" hidden>
+          <div class="spread">
+            <strong class="strong">Kick off blocked</strong>
+            <span class="badge b-warn">no acceptance</span>
+          </div>
+          <p>This issue has no acceptance checklist. Kick off stays blocked until at least one check exists.</p>
+        </div>
+        <div class="callout ok" data-show="shipped" hidden>
+          <div class="spread">
+            <strong class="strong">Shipped</strong>
+            <span class="badge b-ok">rollout 2026.09.26.1</span>
+          </div>
+          <p>Merged from queue position 2. The production build that contains it is 2026.09.26.1. Human-class approval is recorded.</p>
+        </div>
+      </div>
+
+      <div class="itabs">
+        <div class="tabs" id="tabs" role="tablist">
+          <a class="tab on" href="#/overview" data-tab="overview" aria-current="page">Overview</a>
+          <a class="tab" href="#/none/activity" data-tab="activity">Activity</a>
+          <a class="tab" href="#/none/conversation" data-tab="conversation">Conversation</a>
+          <a class="tab" href="#/none/pr" data-tab="pr">PR &amp; CI</a>
+          <a class="tab" href="#/none/evidence" data-tab="evidence">Evidence</a>
+        </div>
+      </div>
+
+      <div class="body">
+        <main class="content" id="panels">
+
+          <section class="stack-lg" data-panel="overview">
+            <div class="prose">
+              <p>The drawer cannot start a lane, and it crams triage, the agent, and review into one panel. This page is where you read the goal, kick off one lane, talk to that agent, and follow the work until a rollout contains it.</p>
+            </div>
+
+            <div class="stack">
+              <div class="spread">
+                <h2 class="ctitle">Acceptance</h2>
+                <span class="num muted" id="accept-count" data-show="none lane fenced quota shipped">0 of 5</span>
+              </div>
+              <div class="card pad" id="checks" data-show="none lane fenced quota shipped">
+                <label class="checkline"><input type="checkbox"> Header shows Kick off, Ask agent, and Approve.</label>
+                <label class="checkline"><input type="checkbox"> Kick off picks provider, model, effort, and a PM group, and previews the brief.</label>
+                <label class="checkline"><input type="checkbox"> Activity lists claimed, worktree, commits, PR, CI, reviews, queue, merged, and rollout.</label>
+                <label class="checkline"><input type="checkbox"> Ask for status and Instruction are separate composer modes.</label>
+                <label class="checkline"><input type="checkbox"> Approve merge is an operator action and is marked human class.</label>
+              </div>
+              <div class="empty card" data-show="blocked" hidden>
+                <div class="etitle">No acceptance yet</div>
+                <div>Kick off needs at least one check. Add the checklist, then dispatch.</div>
+              </div>
+            </div>
+          </section>
+
+          <section class="stack-lg" data-panel="activity" hidden>
+            <div class="empty card" data-show="none blocked">
+              <div class="etitle">No activity yet</div>
+              <div>The timeline starts when a lane is claimed.</div>
+            </div>
+
+            <div data-show="lane fenced" hidden>
+              <h2 class="ctitle">Timeline</h2>
+              <p class="muted" style="margin:0">lane-1 · one sequence from claim to rollout.</p>
+              <ol class="tl">
+                <li class="done"><div class="tl-top"><b>Claimed</b><span class="num muted">09:14</span></div><p class="muted">operator claimed CAD-604 for lane-1.</p></li>
+                <li class="done"><div class="tl-top"><b>Worktree</b><span class="num muted">09:15</span></div><p class="muted"><span class="num">.cadence/wt/cad-604-issue-detail</span></p></li>
+                <li class="done"><div class="tl-top"><b>Commits</b><span class="num muted">09:40</span></div><p class="muted">3 commits · latest <span class="num">aaa1111</span></p></li>
+                <li class="done"><div class="tl-top"><b>PR</b><span class="num muted">09:41</span></div><p class="muted"><a class="lnk" id="tl-pr-link" href="#/lane/pr">PR #900</a> opened.</p></li>
+                <li class="now"><div class="tl-top"><b>CI</b><span class="badge b-fail">failing</span></div><p class="muted">fmt and clippy passed. test is red.</p></li>
+                <li class="warn"><div class="tl-top"><b>Reviews</b><span class="badge b-warn">revise</span></div><p class="muted">rev-sample asked for changes. rev-other passed.</p></li>
+                <li class="held"><div class="tl-top"><b>Queue</b><span class="num muted">position 2</span></div><p class="muted">Held. A red check and an open revise block the merge.</p></li>
+                <li class="wait"><div class="tl-top"><b>Merged</b><span class="kicker">pending</span></div><p class="muted">Not merged.</p></li>
+                <li class="wait"><div class="tl-top"><b>Rollout</b><span class="kicker">pending</span></div><p class="muted">No production build contains this yet.</p></li>
+              </ol>
+            </div>
+
+            <div data-show="quota" hidden>
+              <h2 class="ctitle">Timeline</h2>
+              <p class="muted" style="margin:0">Stopped before a pull request. Reassign to continue.</p>
+              <ol class="tl">
+                <li class="done"><div class="tl-top"><b>Claimed</b><span class="num muted">11:02</span></div><p class="muted">operator claimed CAD-604 for lane-1.</p></li>
+                <li class="done"><div class="tl-top"><b>Worktree</b><span class="num muted">11:03</span></div><p class="muted"><span class="num">.cadence/wt/cad-604-issue-detail</span></p></li>
+                <li class="warn"><div class="tl-top"><b>Commits</b><span class="badge b-warn">quota</span></div><p class="muted">1 commit, then swe-2-high returned quota-out. The turn before that was rate-limited.</p></li>
+                <li class="wait"><div class="tl-top"><b>PR</b><span class="kicker">pending</span></div><p class="muted">Not opened.</p></li>
+                <li class="wait"><div class="tl-top"><b>CI</b><span class="kicker">pending</span></div><p class="muted">No checks yet.</p></li>
+                <li class="wait"><div class="tl-top"><b>Reviews</b><span class="kicker">pending</span></div><p class="muted">No verdicts.</p></li>
+                <li class="wait"><div class="tl-top"><b>Queue</b><span class="kicker">pending</span></div><p class="muted">Not queued.</p></li>
+                <li class="wait"><div class="tl-top"><b>Merged</b><span class="kicker">pending</span></div><p class="muted">Not merged.</p></li>
+                <li class="wait"><div class="tl-top"><b>Rollout</b><span class="kicker">pending</span></div><p class="muted">No production build.</p></li>
+              </ol>
+            </div>
+
+            <div data-show="shipped" hidden>
+              <h2 class="ctitle">Timeline</h2>
+              <p class="muted" style="margin:0">Complete. The last step names the rollout.</p>
+              <ol class="tl">
+                <li class="done"><div class="tl-top"><b>Claimed</b><span class="num muted">09:14</span></div><p class="muted">operator claimed CAD-604 for lane-1.</p></li>
+                <li class="done"><div class="tl-top"><b>Worktree</b><span class="num muted">09:15</span></div><p class="muted"><span class="num">.cadence/wt/cad-604-issue-detail</span></p></li>
+                <li class="done"><div class="tl-top"><b>Commits</b><span class="num muted">10:05</span></div><p class="muted">4 commits · latest <span class="num">bbb2222</span></p></li>
+                <li class="done"><div class="tl-top"><b>PR</b><span class="num muted">09:41</span></div><p class="muted"><a class="lnk" href="#/shipped/pr">PR #900</a> merged.</p></li>
+                <li class="done"><div class="tl-top"><b>CI</b><span class="badge b-ok">passed</span></div><p class="muted">fmt, clippy, and test passed on the merged head.</p></li>
+                <li class="done"><div class="tl-top"><b>Reviews</b><span class="badge b-ok">pass</span></div><p class="muted">rev-sample’s revise was addressed. rev-other passed.</p></li>
+                <li class="done"><div class="tl-top"><b>Queue</b><span class="num muted">position 2</span></div><p class="muted">Merged from position 2 of 4.</p></li>
+                <li class="done"><div class="tl-top"><b>Merged</b><span class="num muted">12:18</span></div><p class="muted">Squash merged to main.</p></li>
+                <li class="done"><div class="tl-top"><b>Rollout</b><span class="badge b-ok">shipped</span></div><p class="muted">Production build <span class="num">2026.09.26.1</span>.</p></li>
+              </ol>
+            </div>
+          </section>
+
+          <section class="stack-lg" data-panel="conversation" hidden>
+            <div class="empty card" data-show="none blocked">
+              <div class="etitle">No conversation yet</div>
+              <div>The lane agent’s thread shows up here after kick off.</div>
+            </div>
+
+            <div class="stack-lg" data-show="lane fenced shipped" hidden>
+              <div class="spread">
+                <div>
+                  <h2 class="ctitle">lane-1</h2>
+                  <p class="muted" style="margin:2px 0 0">Cursor · grok-4.7-high · <span class="num">cadence/cad-604-issue-detail</span></p>
+                </div>
+                <button class="btn" type="button" id="ask-master">Ask master</button>
+              </div>
+              <div class="thread" id="thread-lane">
+                <article class="msg">
+                  <header>lane-1 · 09:16</header>
+                  <p>Claimed CAD-604 and created the worktree.</p>
+                </article>
+                <article class="msg">
+                  <header>lane-1 · 09:41</header>
+                  <p>Opened PR #900. fmt and clippy are green. test is still red.</p>
+                </article>
+                <article class="msg op">
+                  <header>you · 09:44 <span class="badge plain">status</span></header>
+                  <p>Where is CI, and is anyone blocking review?</p>
+                </article>
+                <article class="msg">
+                  <header>lane-1 · 09:45</header>
+                  <p>test is failing. rev-sample left a revise. rev-other passed. The PR is held at queue position 2.</p>
+                </article>
+                <article class="msg" data-show="shipped" hidden>
+                  <header>lane-1 · 12:20</header>
+                  <p>Merged and shipped in rollout 2026.09.26.1. This thread is closed.</p>
+                </article>
+              </div>
+
+              <div class="card pad composer" data-show="lane shipped">
+                <div class="seg" role="group" aria-label="Composer mode">
+                  <button type="button" id="mode-ask" class="on" aria-pressed="true">Ask for status</button>
+                  <button type="button" id="mode-instruction" aria-pressed="false">Instruction</button>
+                </div>
+                <p class="muted" id="composer-hint" style="margin:0">Light nudge. One turn, then the answer lands in this thread.</p>
+                <textarea class="field" id="composer-text" rows="3" placeholder="Ask what the lane is doing. Light nudge, one turn."></textarea>
+                <div class="spread">
+                  <span class="kicker" data-show="shipped" hidden>Lane is closed — sending stays a mock.</span>
+                  <button class="btn btn-acc" type="button" id="do-send" style="margin-left:auto">Ask</button>
+                </div>
+              </div>
+              <div class="callout warn" data-show="fenced" hidden>
+                <strong class="strong">Composer off</strong>
+                <p>lane-1 is fenced. Unfence with an explicit status before asking or instructing.</p>
+                <a class="btn" href="#/fenced/unfence">Unfence</a>
+              </div>
+
+              <div class="card pad stack" id="master-card" hidden>
+                <div class="spread">
+                  <h2 class="ctitle">Ask master</h2>
+                  <span class="chip fill">CAD-604</span>
+                </div>
+                <p class="muted" style="margin:0">A draft to master about this issue. It does not message the lane.</p>
+                <textarea class="field" id="master-draft" rows="3">CAD-604 is on lane-1. What should change before review?</textarea>
+                <div class="spread">
+                  <button class="btn" type="button" id="master-close" data-go="#/lane/conversation">Close</button>
+                  <button class="btn btn-acc" type="button" id="do-master">Send to master</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="stack-lg" data-show="quota" hidden>
+              <div>
+                <h2 class="ctitle">lane-1</h2>
+                <p class="muted" style="margin:2px 0 0">Devin · swe-2-high · Free (quota)</p>
+              </div>
+              <div class="thread">
+                <article class="msg">
+                  <header>lane-1 · 11:04</header>
+                  <p>Worktree is up. Starting the first commit.</p>
+                </article>
+                <article class="msg">
+                  <header>lane-1 · 11:20 <span class="badge b-warn">rate-limited</span></header>
+                  <p>The provider rate-limited that turn. I will retry.</p>
+                </article>
+                <article class="msg">
+                  <header>lane-1 · 11:28 <span class="badge b-warn">quota</span></header>
+                  <p>swe-2-high is quota-out. I cannot take another turn.</p>
+                </article>
+              </div>
+              <div class="callout warn">
+                <strong class="strong">Composer off</strong>
+                <p>Reassign to a provider that still has quota. Asking this agent will not go through.</p>
+                <a class="btn btn-acc" href="#/quota/reassign">Reassign</a>
+              </div>
+            </div>
+          </section>
+
+          <section class="stack-lg" data-panel="pr" hidden>
+            <div class="empty card" data-show="none blocked">
+              <div class="etitle">No pull request yet</div>
+              <div>Checks, verdicts, and the merge queue show up after a PR exists.</div>
+            </div>
+            <div class="empty card" data-show="quota" hidden>
+              <div class="etitle">No pull request yet</div>
+              <div>lane-1 hit quota before opening one. Reassign, then the PR tab fills in.</div>
+            </div>
+
+            <div class="stack-lg" data-show="lane fenced" hidden>
+              <div class="spread">
+                <div>
+                  <h2 class="ctitle">PR #900</h2>
+                  <p class="muted" style="margin:2px 0 0"><span class="num">cadence/cad-604-issue-detail</span> → main</p>
+                </div>
+                <span class="badge b-warn">held</span>
+              </div>
+              <div class="card pad stack">
+                <div class="slabel">Checks</div>
+                <table class="tbl">
+                  <thead><tr><th>check</th><th>result</th><th>note</th></tr></thead>
+                  <tbody>
+                    <tr><td class="num">fmt</td><td><span class="badge b-ok">pass</span></td><td class="muted">clean</td></tr>
+                    <tr><td class="num">clippy</td><td><span class="badge b-ok">pass</span></td><td class="muted">clean</td></tr>
+                    <tr><td class="num">test</td><td><span class="badge b-fail">fail</span></td><td class="muted">one assertion in the sample suite</td></tr>
+                  </tbody>
+                </table>
+              </div>
+              <div class="stack">
+                <h2 class="ctitle">Verdicts</h2>
+                <div class="card pad stack">
+                  <div class="spread"><b class="strong">rev-sample</b><span class="badge b-warn">REVISE</span></div>
+                  <ol class="findings">
+                    <li>The empty-acceptance issue still leaves Kick off enabled.</li>
+                    <li>The rollout step does not name the build that will contain the change.</li>
+                  </ol>
+                </div>
+                <div class="card pad stack">
+                  <div class="spread"><b class="strong">rev-other</b><span class="badge b-ok">PASS</span></div>
+                  <p class="muted" style="margin:0">The acceptance list matches what the page shows.</p>
+                </div>
+              </div>
+              <div class="card pad stack">
+                <div class="spread">
+                  <h2 class="ctitle">Merge queue</h2>
+                  <span class="badge b-warn">position 2 of 4 · held</span>
+                </div>
+                <div class="qrow"><span class="num">1</span><span>PR #880 · Placeholder alpha</span></div>
+                <div class="qrow on"><span class="num">2</span><span>PR #900 · CAD-604</span><span class="badge b-warn who">held</span></div>
+                <div class="qrow"><span class="num">3</span><span>PR #912 · Placeholder beta</span></div>
+                <div class="qrow"><span class="num">4</span><span>PR #913 · Placeholder gamma</span></div>
+                <p class="muted" style="margin:0">Held until test is green and the revise is closed. Approve records a human-class decision. It does not skip those gates.</p>
+              </div>
+              <div class="spread" data-show="lane">
+                <div class="gate"><span class="badge plain">operator</span><span class="badge b-acc">human class</span></div>
+                <button class="btn btn-acc" type="button" data-go="#/lane/approve">Approve merge</button>
+              </div>
+              <p class="muted" data-show="fenced" hidden style="margin:0">Approve merge stays off while lane-1 is fenced.</p>
+            </div>
+
+            <div class="stack-lg" data-show="shipped" hidden>
+              <div class="spread">
+                <div>
+                  <h2 class="ctitle">PR #900</h2>
+                  <p class="muted" style="margin:2px 0 0">Merged to main · <span class="num">bbb2222</span></p>
+                </div>
+                <span class="badge b-ok">merged</span>
+              </div>
+              <div class="card pad stack">
+                <div class="slabel">Checks</div>
+                <table class="tbl">
+                  <thead><tr><th>check</th><th>result</th></tr></thead>
+                  <tbody>
+                    <tr><td class="num">fmt</td><td><span class="badge b-ok">pass</span></td></tr>
+                    <tr><td class="num">clippy</td><td><span class="badge b-ok">pass</span></td></tr>
+                    <tr><td class="num">test</td><td><span class="badge b-ok">pass</span></td></tr>
+                  </tbody>
+                </table>
+              </div>
+              <div class="card pad stack">
+                <div class="spread"><b class="strong">rev-sample</b><span class="badge b-ok">PASS</span></div>
+                <p class="muted" style="margin:0">Revise addressed. The empty-acceptance state blocks Kick off, and the rollout step names build 2026.09.26.1.</p>
+              </div>
+              <div class="card pad stack">
+                <div class="spread"><b class="strong">rev-other</b><span class="badge b-ok">PASS</span></div>
+                <p class="muted" style="margin:0">Passed on the updated head.</p>
+              </div>
+              <div class="card pad stack">
+                <div class="spread">
+                  <h2 class="ctitle">Merge queue</h2>
+                  <span class="badge b-ok">merged from position 2</span>
+                </div>
+                <p class="muted" style="margin:0">Was position 2 of 4, then squash-merged. Rollout <span class="num">2026.09.26.1</span> contains it.</p>
+              </div>
+              <div class="gate"><span class="badge plain">operator</span><span class="badge b-ok">human class · recorded</span></div>
+            </div>
+          </section>
+
+          <section class="stack-lg" data-panel="evidence" hidden>
+            <div class="empty card" data-show="none blocked">
+              <div class="etitle">No evidence yet</div>
+              <div>Screenshots and artifacts land here once a lane is working.</div>
+            </div>
+            <div class="stack-lg" data-show="lane fenced quota shipped" hidden>
+              <div>
+                <h2 class="ctitle">Screenshots</h2>
+                <p class="muted" style="margin:4px 0 0">Frames are placeholders, not captures.</p>
+              </div>
+              <div class="shots">
+                <figure class="shot">
+                  <div class="frame" aria-hidden="true"><span class="bar w45"></span><span class="bar w80"></span><span class="block"></span></div>
+                  <figcaption class="cap"><span class="num">overview.png</span><span class="muted">desktop</span></figcaption>
+                </figure>
+                <figure class="shot">
+                  <div class="frame cols" aria-hidden="true"><span class="block"></span><span class="block"></span><span class="bar w60"></span><span class="bar w30"></span></div>
+                  <figcaption class="cap"><span class="num">lane-card.png</span><span class="muted">rail</span></figcaption>
+                </figure>
+                <figure class="shot">
+                  <div class="frame" aria-hidden="true"><span class="bar w30"></span><span class="bar w80"></span><span class="bar w60"></span><span class="block"></span></div>
+                  <figcaption class="cap"><span class="num">pr-tab.png</span><span class="muted">checks</span></figcaption>
+                </figure>
+              </div>
+              <div class="card" style="padding:6px">
+                <div class="slabel" style="margin:8px 8px 4px">Artifacts</div>
+                <div class="trow"><span class="tname num">brief.md</span><span class="tmeta">kickoff brief</span></div>
+                <div class="trow"><span class="tname num">test-log.txt</span><span class="tmeta">failing check</span></div>
+                <div class="trow"><span class="tname num">review-rev-sample.md</span><span class="tmeta">findings</span></div>
+              </div>
+            </div>
+          </section>
+        </main>
+
+        <aside class="rail">
+          <div class="card pad stack" data-show="none">
+            <div class="slabel">Lane</div>
+            <div class="ctitle">No lane yet</div>
+            <p class="muted" style="margin:0">Kick off starts a worktree and dispatches one agent.</p>
+            <button class="btn btn-acc" type="button" data-go="#/kickoff">Kick off</button>
+          </div>
+
+          <div class="card pad stack" data-show="blocked" hidden>
+            <div class="slabel">Lane</div>
+            <div class="ctitle">No lane yet</div>
+            <p class="muted" style="margin:0">Kick off needs at least one acceptance check.</p>
+            <button class="btn" type="button" disabled title="Kick off needs at least one acceptance check.">Kick off</button>
+          </div>
+
+          <div class="card pad stack" data-show="lane" hidden>
+            <div class="spread"><div class="slabel" style="margin:0">Lane</div><span class="badge b-info">busy</span></div>
+            <div class="kv">
+              <span class="k">Agent</span><span class="v">lane-1</span>
+              <span class="k">Provider</span><span class="v">Cursor</span>
+              <span class="k">Model</span><span class="v num">grok-4.7-high</span>
+              <span class="k">Cost</span><span class="v"><span class="badge b-info">Cursor plan</span></span>
+              <span class="k">Branch</span><span class="v num">cadence/cad-604-issue-detail</span>
+              <span class="k">PR</span><span class="v"><a class="lnk" href="#/lane/pr">#900</a></span>
+              <span class="k">Activity</span><span class="v">4 min ago · CI failing</span>
+            </div>
+            <div class="lactions">
+              <a class="btn" href="#/lane/conversation">Ask for status</a>
+              <a class="btn" href="#/lane/instruction">Send instruction</a>
+              <a class="btn" href="#/lane/interrupt">Interrupt</a>
+              <a class="btn" href="#/lane/reassign">Reassign</a>
+            </div>
+          </div>
+
+          <div class="card pad stack" data-show="fenced" hidden>
+            <div class="spread"><div class="slabel" style="margin:0">Lane</div><span class="badge b-fail">fenced</span></div>
+            <div class="kv">
+              <span class="k">Agent</span><span class="v">lane-1</span>
+              <span class="k">Provider</span><span class="v">Cursor</span>
+              <span class="k">Model</span><span class="v num">grok-4.7-high</span>
+              <span class="k">Branch</span><span class="v num">cadence/cad-604-issue-detail</span>
+              <span class="k">PR</span><span class="v"><a class="lnk" href="#/fenced/pr">#900</a></span>
+              <span class="k">Activity</span><span class="v">pane stopped · turn unknown</span>
+            </div>
+            <a class="btn btn-acc" href="#/fenced/unfence">Unfence</a>
+          </div>
+
+          <div class="card pad stack" data-show="quota" hidden>
+            <div class="spread"><div class="slabel" style="margin:0">Lane</div><span class="badge b-warn">quota</span></div>
+            <div class="kv">
+              <span class="k">Agent</span><span class="v">lane-1</span>
+              <span class="k">Provider</span><span class="v">Devin</span>
+              <span class="k">Model</span><span class="v num">swe-2-high</span>
+              <span class="k">Cost</span><span class="v"><span class="badge b-ok">Free (quota)</span></span>
+              <span class="k">Branch</span><span class="v num">cadence/cad-604-issue-detail</span>
+              <span class="k">Activity</span><span class="v">quota-out · last turn rate-limited</span>
+            </div>
+            <p class="muted" style="margin:0">Reassign is the suggested recovery.</p>
+            <a class="btn btn-acc" href="#/quota/reassign">Reassign</a>
+          </div>
+
+          <div class="card pad stack" data-show="shipped" hidden>
+            <div class="spread"><div class="slabel" style="margin:0">Lane</div><span class="badge b-ok">shipped</span></div>
+            <div class="kv">
+              <span class="k">Agent</span><span class="v">lane-1</span>
+              <span class="k">Provider</span><span class="v">Cursor</span>
+              <span class="k">Model</span><span class="v num">grok-4.7-high</span>
+              <span class="k">Branch</span><span class="v num">cadence/cad-604-issue-detail</span>
+              <span class="k">PR</span><span class="v"><a class="lnk" href="#/shipped/pr">#900 merged</a></span>
+              <span class="k">Rollout</span><span class="v num">2026.09.26.1</span>
+            </div>
+            <p class="muted" style="margin:0">The lane is closed.</p>
+          </div>
+
+          <div class="card pad stack" id="fields">
+            <div class="slabel">Fields</div>
+            <label class="flabel"><span>Status</span>
+              <select class="field" id="f-status">
+                <option value="draft">draft</option>
+                <option value="doing" selected>doing</option>
+                <option value="review">review</option>
+                <option value="done">done</option>
+              </select>
+            </label>
+            <label class="flabel"><span>Priority</span>
+              <select class="field" id="f-priority">
+                <option>p1</option>
+                <option selected>p2</option>
+                <option>p3</option>
+              </select>
+            </label>
+            <label class="flabel"><span>Owner</span>
+              <select class="field" id="f-owner">
+                <option selected>operator</option>
+                <option>master</option>
+              </select>
+            </label>
+            <label class="flabel"><span>Epic</span>
+              <select class="field" id="f-epic">
+                <option selected>Board</option>
+                <option>Inbox</option>
+                <option>None</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="card pad stack">
+            <div class="slabel">Links</div>
+            <div class="kv">
+              <span class="k">Blocks</span><span class="v">CAD-901 · Placeholder gate</span>
+              <span class="k">Related</span><span class="v">CAD-902 · Placeholder neighbour</span>
+              <span class="k">Wiki</span><span class="v"><button class="lnk" type="button" data-toast="Wiki stays linked from the issue. This mockup does not open the page.">projects/cadence/issue-page.md</button></span>
+            </div>
+          </div>
+        </aside>
+      </div>
+    </div>
+
+    <div id="drawer-wrap" class="drawer-layout" hidden>
+      <div class="board">
+        <h1>cadence</h1>
+        <table class="tbl">
+          <thead><tr><th>id</th><th>title</th><th>status</th><th>pri</th></tr></thead>
+          <tbody>
+            <tr>
+              <td class="num">CAD-901</td>
+              <td><button class="lnk" type="button" data-toast="Placeholder issue. Open CAD-604 to see the peek.">Placeholder gate</button></td>
+              <td><span class="badge b-info">doing</span></td>
+              <td class="num">p1</td>
+            </tr>
+            <tr class="sel">
+              <td class="num">CAD-604</td>
+              <td>Issue detail page</td>
+              <td><span class="badge b-info">doing</span></td>
+              <td class="num">p2</td>
+            </tr>
+            <tr>
+              <td class="num">CAD-902</td>
+              <td><button class="lnk" type="button" data-toast="Placeholder issue. Open CAD-604 to see the peek.">Placeholder neighbour</button></td>
+              <td><span class="badge plain">backlog</span></td>
+              <td class="num">p3</td>
+            </tr>
+            <tr>
+              <td class="num">CAD-903</td>
+              <td><button class="lnk" type="button" data-toast="Placeholder issue. Open CAD-604 to see the peek.">Placeholder follow-up</button></td>
+              <td><span class="badge b-ok">done</span></td>
+              <td class="num">p2</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <aside class="peek">
+        <div class="kicker">Quick peek</div>
+        <div>
+          <div class="kicker"><span class="num">CAD-604</span> · cadence</div>
+          <h2 class="ctitle" style="margin-top:4px">Issue detail page</h2>
+        </div>
+        <div class="ichips">
+          <span class="badge b-info">doing</span>
+          <span class="chip fill">p2</span>
+          <span class="chip fill">Board</span>
+        </div>
+        <p class="muted" style="margin:0">Read the goal, kick off one lane, and follow it through rollout. The drawer no longer holds that work.</p>
+        <div class="kv">
+          <span class="k">Lane</span><span class="v">No lane yet</span>
+          <span class="k">Accept</span><span class="v">5 checks</span>
+          <span class="k">Owner</span><span class="v">operator</span>
+        </div>
+        <a class="btn btn-acc" href="#/overview">Open →</a>
+      </aside>
+    </div>
+  </div>
+</div>
+
+<div class="scrim" data-dialog="kickoff" hidden>
+  <div class="modal wide" role="dialog" aria-modal="true" aria-labelledby="kick-title">
+    <div class="mhead"><span id="kick-title">Kick off</span><span class="kicker">CAD-604</span></div>
+    <div class="mbody stack">
+      <p class="muted" style="margin:0">One operator-gated click will run issue start, then dispatch. Nothing is sent from this mockup.</p>
+      <div id="kick-picker" class="stack">
+        <div class="flabel">
+          <span>Provider</span>
+          <div class="seg" role="group" aria-label="Provider">
+            <button type="button" data-provider="cursor" class="on" aria-pressed="true">Cursor</button>
+            <button type="button" data-provider="devin" aria-pressed="false">Devin</button>
+            <button type="button" data-provider="openrouter" aria-pressed="false">OpenRouter</button>
+          </div>
+        </div>
+        <div class="split">
+          <label class="flabel"><span>Model</span><select class="field" data-model></select></label>
+          <label class="flabel"><span>Effort</span>
+            <select class="field" data-effort>
+              <option>low</option>
+              <option>medium</option>
+              <option selected>high</option>
+              <option>xhigh</option>
+              <option>max</option>
+            </select>
+          </label>
+        </div>
+        <div class="spread">
+          <span class="hintcap">Cost</span>
+          <span class="badge b-info" data-cost aria-live="polite">Cursor plan</span>
+        </div>
+      </div>
+      <p class="muted" style="margin:0">Prefilled like a team default: Cursor · grok-4.7-high · high. swe-2 stays Free (quota). OpenRouter stays Paid.</p>
+      <label class="flabel"><span>PM group</span>
+        <select class="field" id="pm-group">
+          <option selected>west-pm</option>
+          <option>north-pm</option>
+          <option>master</option>
+        </select>
+      </label>
+      <label class="flabel"><span>Extra note</span>
+        <textarea class="field" id="extra-note" rows="2" placeholder="Optional note, appended on top of the issue body."></textarea>
+      </label>
+      <div class="flabel">
+        <span>Brief preview</span>
+        <pre class="preview" id="brief-preview"></pre>
+      </div>
+      <a class="lnk" href="#/plan">Plan with master instead</a>
+    </div>
+    <div class="mfoot">
+      <button class="btn" type="button" data-go="#/overview">Cancel</button>
+      <button class="btn btn-acc" type="button" data-go="#/kickoff/confirm">Continue</button>
+    </div>
+  </div>
+</div>
+
+<div class="scrim" data-dialog="confirm" hidden>
+  <div class="modal wide" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
+    <div class="mhead"><span id="confirm-title">Confirm kick off</span><span class="kicker">operator</span></div>
+    <div class="mbody stack">
+      <div class="gate"><span class="badge plain">operator</span> This click runs issue start, then dispatch, on your token.</div>
+      <div class="kv">
+        <span class="k">Issue</span><span class="v num">CAD-604</span>
+        <span class="k">Runs</span><span class="v">issue start, then dispatch</span>
+        <span class="k">Worker</span><span class="v" id="sum-who">Cursor · grok-4.7-high · high</span>
+        <span class="k">Cost</span><span class="v"><span class="badge b-info" id="sum-cost">Cursor plan</span></span>
+        <span class="k">PM</span><span class="v" id="sum-pm">west-pm</span>
+      </div>
+      <div class="callout warn" id="paid-warn" hidden>
+        <strong class="strong">Paid provider</strong>
+        <p>OpenRouter spends money. Confirm only if that cost is intended.</p>
+      </div>
+      <div class="flabel">
+        <span>Brief that would be sent</span>
+        <pre class="preview" id="sum-brief"></pre>
+      </div>
+    </div>
+    <div class="mfoot">
+      <button class="btn" type="button" data-go="#/kickoff">Back</button>
+      <button class="btn btn-acc" type="button" id="do-kick">Kick off</button>
+    </div>
+  </div>
+</div>
+
+<div class="scrim" data-dialog="plan" hidden>
+  <div class="modal wide" role="dialog" aria-modal="true" aria-labelledby="plan-title">
+    <div class="mhead"><span id="plan-title">Plan with master</span><span class="kicker">CAD-604</span></div>
+    <div class="mbody stack">
+      <p class="muted" style="margin:0">Master proposes a plan and staffing. No lane starts until you approve.</p>
+      <div class="card pad stack">
+        <div class="slabel">Proposed plan</div>
+        <p style="margin:0">One lane builds the issue page. No daemon changes.</p>
+        <div class="slabel">Staffing</div>
+        <p style="margin:0">lane-1 · Cursor · grok-4.7-high · high · <span class="badge b-info">Cursor plan</span></p>
+        <p class="muted" style="margin:0">PM: master. Waiting on your approval.</p>
+      </div>
+    </div>
+    <div class="mfoot">
+      <button class="btn" type="button" data-go="#/kickoff">Back to kick off</button>
+      <button class="btn btn-acc" type="button" id="do-plan">Approve plan</button>
+    </div>
+  </div>
+</div>
+
+<div class="scrim" data-dialog="unfence" hidden>
+  <div class="modal wide" role="dialog" aria-modal="true" aria-labelledby="unfence-title">
+    <div class="mhead"><span id="unfence-title">Unfence lane-1</span><span class="kicker">explicit status</span></div>
+    <div class="mbody stack">
+      <p class="muted" style="margin:0">Pick the status recorded for the unknown turn. History stays. The turn is not replayed.</p>
+      <label class="choice"><input type="radio" name="unfence-status" value="interrupted"><span><b>interrupted</b><span class="muted">Outcome unknown. Move on. Do not replay.</span></span></label>
+      <label class="choice"><input type="radio" name="unfence-status" value="completed"><span><b>completed</b><span class="muted">The turn finished. Route its result.</span></span></label>
+      <label class="choice"><input type="radio" name="unfence-status" value="failed"><span><b>failed</b><span class="muted">The turn failed. Route its result.</span></span></label>
+      <label class="flabel"><span>Note</span><textarea class="field" id="unfence-note" rows="2" placeholder="Optional note stored with the reconcile."></textarea></label>
+      <label class="checkline"><input type="checkbox" id="unfence-resume" checked> Resume the agent after unfence</label>
+    </div>
+    <div class="mfoot">
+      <button class="btn" type="button" data-go="#/fenced">Cancel</button>
+      <button class="btn btn-acc" type="button" id="do-unfence" disabled>Unfence</button>
+    </div>
+  </div>
+</div>
+
+<div class="scrim" data-dialog="reassign" hidden>
+  <div class="modal wide" role="dialog" aria-modal="true" aria-labelledby="reassign-title">
+    <div class="mhead"><span id="reassign-title">Reassign lane-1</span><span class="kicker">worktree stays</span></div>
+    <div class="mbody stack">
+      <p class="muted" id="reassign-lead" style="margin:0">Move lane-1 to another provider or model. The worktree stays.</p>
+      <div id="re-picker" class="stack">
+        <div class="flabel">
+          <span>Provider</span>
+          <div class="seg" role="group" aria-label="Provider">
+            <button type="button" data-provider="cursor">Cursor</button>
+            <button type="button" data-provider="devin">Devin</button>
+            <button type="button" data-provider="openrouter">OpenRouter</button>
+          </div>
+        </div>
+        <div class="split">
+          <label class="flabel"><span>Model</span><select class="field" data-model></select></label>
+          <label class="flabel"><span>Effort</span>
+            <select class="field" data-effort>
+              <option>low</option>
+              <option>medium</option>
+              <option>high</option>
+              <option>xhigh</option>
+              <option>max</option>
+            </select>
+          </label>
+        </div>
+        <div class="spread">
+          <span class="hintcap">Cost</span>
+          <span class="badge b-info" data-cost aria-live="polite">Cursor plan</span>
+        </div>
+      </div>
+    </div>
+    <div class="mfoot">
+      <button class="btn" type="button" id="reassign-cancel" data-go="#/lane">Cancel</button>
+      <button class="btn btn-acc" type="button" id="do-reassign">Reassign</button>
+    </div>
+  </div>
+</div>
+
+<div class="scrim" data-dialog="interrupt" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="interrupt-title">
+    <div class="mhead" id="interrupt-title">Interrupt lane-1</div>
+    <div class="mbody stack">
+      <p class="muted" style="margin:0">Interrupt ends the current turn and leaves the lane claimed. Stop halts the agent and keeps queued messages.</p>
+    </div>
+    <div class="mfoot">
+      <button class="btn" type="button" data-go="#/lane">Cancel</button>
+      <button class="btn" type="button" id="do-interrupt">Interrupt turn</button>
+      <button class="btn btn-danger" type="button" id="do-stop">Stop agent</button>
+    </div>
+  </div>
+</div>
+
+<div class="scrim" data-dialog="approve" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="approve-title">
+    <div class="mhead"><span id="approve-title">Approve merge</span><span class="kicker">human class</span></div>
+    <div class="mbody stack">
+      <div class="gate"><span class="badge plain">operator</span><span class="badge b-acc">human class</span></div>
+      <p class="muted" style="margin:0">Records your approval on PR #900. A red check and an open revise still hold the queue. This does not merge by itself.</p>
+    </div>
+    <div class="mfoot">
+      <button class="btn" type="button" data-go="#/lane/pr">Cancel</button>
+      <button class="btn btn-acc" type="button" id="do-approve">Approve merge</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast card" hidden role="status"></div>
+<script src="issue.js"></script>
+</body>
+</html>
