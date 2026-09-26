@@ -28,6 +28,9 @@ export class ConditionalGet {
       return { response };
     }
     const value = await response.json() as T;
+    if (scope !== this.identity()) {
+      throw new Error("Session changed during response decoding; retry with the current session");
+    }
     const etag = response.headers.get("ETag");
     if (etag && scope === this.identity()) {
       this.entries.delete(path);

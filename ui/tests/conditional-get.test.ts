@@ -31,6 +31,15 @@ async function main() {
   const next = delayed.get("/api/outbox", {});
   resolve(new Response(null, { status: 304 }));
   equal((await next).value, undefined, "old credential request cannot populate new cache");
+  let decoded!: (value: unknown) => void;
+  const decodeResponse = new Response('{}', { headers: { ETag: '"decoded"' } });
+  decodeResponse.json = () => new Promise((resolve) => { decoded = resolve; });
+  const decoding = new ConditionalGet((async () => decodeResponse) as typeof fetch, () => session);
+  const reading = decoding.get("/api/outbox", {}).then(() => false, () => true);
+  await Promise.resolve();
+  session = "another";
+  decoded({ private: true });
+  equal(await reading, true, "credential change while decoding also rejects the body");
   console.log("conditional GET checks passed");
 }
 main().catch((error) => { setTimeout(() => { throw error; }); });
