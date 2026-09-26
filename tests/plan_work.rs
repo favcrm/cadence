@@ -1136,6 +1136,43 @@ fn social_content_app_installs_approves_and_proposes() {
     );
 }
 
+/// CAD-590: `social-localize` pins the reviewer apart from the writer.
+/// Proposing with `reviewer == writer` refuses `not_distinct`, and the
+/// refusal names that pair. Dropping `reviewer` from `distinct:` lets
+/// this propose — the existing install test uses four different agents,
+/// so it stays green if the pin is removed.
+#[test]
+fn social_localize_reviewer_equal_writer_is_not_distinct() {
+    let f = PlanFixture::start();
+    for a in ["w-1", "d-1", "p-1"] {
+        f.d.register(a);
+    }
+    let src = concat!(env!("CARGO_MANIFEST_DIR"), "/apps/social-content");
+    let (ok, out) = f.cli(&["app", "install", src, "--project", "demo"]);
+    assert!(ok, "{out}");
+    let (ok, out) = f.cli(&["app", "approve", "social-content", "--project", "demo"]);
+    assert!(ok, "{out}");
+
+    let err =
+        f.d.operator_rpc(
+            "plan_propose",
+            json!({"project": "demo", "workflow": "social-content/social-localize",
+            "inputs": {
+                "source": "https://example.com/p/1",
+                "slug": "kura-ramen-summer",
+                "destinations": "instagram, facebook",
+                "writer": "w-1",
+                "designer": "d-1",
+                "reviewer": "w-1",
+                "publisher": "p-1"
+            }}),
+        )
+        .unwrap_err();
+    assert_eq!(err.code(), Some("not_distinct"), "{err}");
+    let msg = err.to_string();
+    assert!(msg.contains("writer") && msg.contains("reviewer"), "{msg}");
+}
+
 /// CAD-571 N5: for a multi-workflow app the Apps list card's primary
 /// action and the app page's are the same workflow — the sorted first
 /// (`aa-early`), never whatever order the directory walk hands back.

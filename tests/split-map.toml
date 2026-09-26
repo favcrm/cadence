@@ -773,6 +773,7 @@ tests = [
     "app_install_never_writes_through_a_planted_symlink",
     "app_install_git_pins_url_and_transport",
     "app_approve_takes_the_pm_lock",
+    "social_localize_reviewer_equal_writer_is_not_distinct",
 ]
 helpers = [
     "events_of_kind",
