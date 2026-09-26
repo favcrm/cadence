@@ -44,7 +44,8 @@ Three storage concerns stay distinct:
 | Path | Responsibility / first read |
 |---|---|
 | [src/main.rs](../src/main.rs) | Binary entry point, process error/exit handling; delegates commands to CLI. |
-| [src/cli/mod.rs](../src/cli/mod.rs), [src/cli/](../src/cli/) | CLI definitions, routing and launch/briefing composition; command behavior split into verb modules. |
+| [src/cli/mod.rs](../src/cli/mod.rs), [src/cli/](../src/cli/) | CLI definitions, routing and launch composition; command behavior split into verb modules. |
+| [src/cli/briefing.rs](../src/cli/briefing.rs) | Briefing modes, document and cloud bootstrap rendering, role carry-forward and opt-in AGENTS.md block. |
 | [src/client.rs](../src/client.rs), [src/proto.rs](../src/proto.rs) | Local RPC client and protocol vocabulary. |
 | [src/daemon.rs](../src/daemon.rs), [src/daemon/](../src/daemon/) | Shared runtime coordination and central dispatch; area RPC handlers, identity, timers and actor lifecycle. |
 | [src/store/mod.rs](../src/store/mod.rs), [src/store/schema.rs](../src/store/schema.rs), [src/store/](../src/store/) | SQLite schema/migrations and durable transitions, partitioned by domain; store tests live under `src/store/tests/`. |
@@ -83,7 +84,7 @@ its provider process ended. Reclamation must prove ownership at action time.
 ## Memory implementation boundaries
 
 `src/issue/dispatch.rs` matches accepted project memories, writes a bounded
-lessons file and records included and withheld IDs. `src/cli/mod.rs` adds accepted
+lessons file and records included and withheld IDs. `src/cli/briefing.rs` adds accepted
 project-wide rules to generated briefings. `--job` kickoffs are
 daemon-templated and carry no lessons (CAD-194); do not assume every entry point
 shares this retrieval behavior.
