@@ -1878,6 +1878,277 @@ fn board_app_approve_is_the_operators() {
     assert_eq!(v["approval"], "changed", "{v}");
 }
 
+/// CAD-563: `GET /api/apps/<project>/<name>/runs` — the plans/epics
+/// proposed from the app's workflows, by the recorded `plan.workflow`
+/// provenance. Each row carries the epic, its derived status and the
+/// plan block `plan show` renders (state, tickets, size-weighted
+/// progress), and the list follows the tracker: a proposed plan reads
+/// `proposed`, an approved one moves as its tickets do. A stored
+/// workflow's plan — a bare name — is not the app's run, and an app
+/// that is not installed is a 404 (a bad name 400, a deeper path no
+/// route).
+#[test]
+fn board_app_runs_are_the_apps_plans() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    f.d.register("qa-1");
+    app_install_studio(&f);
+    let port = start_board(&f.pm_dir, &f.d.state);
+
+    // Installed, nothing run yet: an empty list, never an error.
+    let (status, body) = board_get(port, "/api/apps/demo/studio/runs");
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["project"], "demo", "{v}");
+    assert_eq!(v["name"], "studio", "{v}");
+    assert_eq!(v["runs"], json!([]), "{v}");
+
+    // The operator approves the app, then proposes a run from its
+    // workflow — the epic records `plan.workflow = studio/do-check`.
+    f.d.operator_rpc(
+        "app_approve",
+        json!({"project": "demo", "name": "studio"}),
+    )
+    .unwrap();
+    let out = f
+        .d
+        .operator_rpc(
+            "plan_propose",
+            json!({"project": "demo", "workflow": "studio/do-check",
+                   "inputs": {"title": "login fix"}}),
+        )
+        .unwrap();
+    let epic = out["epic"].as_str().unwrap().to_string();
+    let tickets: Vec<String> = out["tickets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.as_str().unwrap().to_string())
+        .collect();
+
+    let (status, body) = board_get(port, "/api/apps/demo/studio/runs");
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let runs = v["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 1, "{v}");
+    let run = &runs[0];
+    assert_eq!(run["epic"], json!(epic), "{run}");
+    assert_eq!(run["title"], "Run: login fix", "{run}");
+    assert_eq!(run["workflow"], "studio/do-check", "{run}");
+    assert_eq!(run["plan"]["state"], "proposed", "{run}");
+    assert_eq!(
+        run["plan"]["tickets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        tickets.iter().map(String::as_str).collect::<Vec<_>>(),
+        "{run}"
+    );
+    // The workflow's S + unsized (M) tickets weigh 4; nothing is done
+    // while the plan waits, and the epic reads its own backlog.
+    assert_eq!(run["plan"]["progress"]["done_weight"], 0, "{run}");
+    assert_eq!(run["plan"]["progress"]["total_weight"], 4, "{run}");
+    assert_eq!(run["status"], "backlog", "{run}");
+
+    // Approve the plan and finish one ticket: the state, the weighted
+    // progress and the row follow the tracker.
+    f.d.operator_rpc("plan_approve", json!({"epic": epic}))
+        .unwrap();
+    let (ok, out) = f.cli(&["issue", "set", &tickets[0], "status=done"]);
+    assert!(ok, "{out}");
+    let (status, body) = board_get(port, "/api/apps/demo/studio/runs");
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let run = &v["runs"][0];
+    assert_eq!(run["plan"]["state"], "approved", "{run}");
+    assert_eq!(run["plan"]["progress"]["done_weight"], 1, "{run}");
+    assert_eq!(run["plan"]["progress"]["ratio"], 0.25, "{run}");
+
+    // A stored workflow that shares the app's name records a bare
+    // `plan.workflow = "studio"` (CAD-547) — not the app's run.
+    wf_add(&f, "studio", WF_TWO_STEP);
+    f.d.operator_rpc(
+        "workflow_approve",
+        json!({"project": "demo", "name": "studio"}),
+    )
+    .unwrap();
+    let (ok, out) = f.cli(&[
+        "plan",
+        "propose",
+        "--project",
+        "demo",
+        "--workflow",
+        "studio",
+        "--input",
+        "title=stored name",
+    ]);
+    assert!(ok, "{out}");
+    let (status, body) = board_get(port, "/api/apps/demo/studio/runs");
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["runs"].as_array().unwrap().len(), 1, "{v}");
+
+    // An app that is not installed is a 404; a bad name 400; a deeper
+    // path is no route.
+    let (status, _) = board_get(port, "/api/apps/demo/nope/runs");
+    assert_eq!(status, 404);
+    let (status, _) = board_get(port, "/api/apps/demo/Bad%20Name/runs");
+    assert_eq!(status, 400);
+    let (status, _) = board_get(port, "/api/apps/nope/studio/runs");
+    assert_eq!(status, 404);
+    let (status, _) = board_get(port, "/api/apps/demo/studio/runs/x");
+    assert_eq!(status, 404);
+}
+
+/// One `local` outbox item in the adapter's on-disk shape —
+/// `<outbox>/<project>/<effect_id>/{index.json,post.md}` — the shape
+/// `platform_outbox` lists. The route's fixture: no platform, no press.
+fn write_outbox_item(outbox: &Path, effect_id: &str, project: &str, title: &str, at: &str) {
+    let dir = outbox.join(project).join(effect_id);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("post.md"), format!("# {title}\n\nbody\n")).unwrap();
+    std::fs::write(
+        dir.join("index.json"),
+        json!({
+            "effect_id": effect_id,
+            "project": project,
+            "title": title,
+            "published_at": at,
+            "post_sha256": "0".repeat(64),
+            "content_sha256": "0".repeat(64),
+            "input_sha256": "0".repeat(64),
+            "attachments": [],
+            "result": {"board_url": format!("http://127.0.0.1:3919/outbox?item={effect_id}")},
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+/// CAD-563: `GET /api/apps/<project>/<name>/outputs` — the outbox items
+/// the app's runs produced, attributed by the effect's recorded `task`
+/// (a ticket of one of the app's runs) or, for a send staged without a
+/// task, by the effect's agent owning one of those tickets. An item
+/// that is neither, and one whose effect row is unknown, stay out. The
+/// read is the operator's — the same gate `/api/outbox` runs: no
+/// session and an agent-attributed caller are refused before any
+/// ledger byte is read, a missing app is a 404.
+#[test]
+fn board_app_outputs_are_the_runs_and_operator_only() {
+    let outbox = TempDir::new().unwrap();
+    let mut opts = daemon_opts();
+    opts.outbox_dir = Some(outbox.path().to_path_buf());
+    let f = PlanFixture::start_with(opts);
+    f.d.register("dev-1");
+    f.d.register("qa-1");
+    app_install_studio(&f);
+    let port = start_board(&f.pm_dir, &f.d.state);
+
+    f.d.operator_rpc(
+        "app_approve",
+        json!({"project": "demo", "name": "studio"}),
+    )
+    .unwrap();
+    let out = f
+        .d
+        .operator_rpc(
+            "plan_propose",
+            json!({"project": "demo", "workflow": "studio/do-check",
+                   "inputs": {"title": "login fix"}}),
+        )
+        .unwrap();
+    let tickets: Vec<String> = out["tickets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.as_str().unwrap().to_string())
+        .collect();
+    // The workflow's `agent:` lines own the tickets: dev-1, then qa-1.
+    assert_eq!(f.front(&tickets[0]).owner.as_deref(), Some("dev-1"));
+    assert_eq!(f.front(&tickets[1]).owner.as_deref(), Some("qa-1"));
+
+    // Three published items and their effect rows: one staged with the
+    // ticket named as its task, one staged without a task by a ticket's
+    // owner, one that is neither.
+    write_outbox_item(outbox.path(), "ef-task", "demo", "By task", "2026-09-26T01:00:00Z");
+    write_outbox_item(outbox.path(), "ef-owner", "demo", "By owner", "2026-09-26T02:00:00Z");
+    write_outbox_item(outbox.path(), "ef-other", "demo", "Not this app", "2026-09-26T03:00:00Z");
+    let conn = rusqlite::Connection::open(f.d.state.join("cadence.sqlite3")).unwrap();
+    for (eid, agent, task) in [
+        ("ef-task", "someone", Some(tickets[0].as_str())),
+        ("ef-owner", "qa-1", None),
+        ("ef-other", "stranger", Some("D-9")),
+    ] {
+        conn.execute(
+            "INSERT INTO platform_effects (effect_id, request, agent, platform, account, \
+             tool, input, input_summary, preview, scopes, task, state, needs_you, \
+             staged_at, updated_at) \
+             VALUES (?1, ?2, ?3, 'local', 'outbox', 'publish', '{}', 'publish', \
+             'a post', '[\"publish\"]', ?4, 'done', 0, 1.0, 1.0)",
+            rusqlite::params![eid, format!("req-{eid}"), agent, task],
+        )
+        .unwrap();
+    }
+
+    // No session: refused by the board's own caller rule, before the
+    // handler runs.
+    let (status, reply) = board_get(port, "/api/apps/demo/studio/outputs");
+    assert_eq!(status, 403, "{reply}");
+    assert!(reply.contains("operator_session_required"), "{reply}");
+
+    // An agent-attributed caller is refused — the ledger is the
+    // operator's read.
+    let mut wk = ManagedWorker::start(&f.d, "wk");
+    let request = format!(
+        "GET /api/apps/demo/studio/outputs HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n"
+    );
+    let r = wk.exec(&[
+        "bash",
+        "-c",
+        DEV_TCP_CLIENT,
+        "_",
+        &port.to_string(),
+        &request,
+    ]);
+    let out = r["out"].as_str().unwrap();
+    assert!(
+        out.contains(" 403 ") && out.contains("operator_only"),
+        "{out}"
+    );
+
+    // The gate runs before the tracker read: a missing app is a 403 to
+    // a caller who may not read, a 404 to the operator.
+    let (status, reply) = board_get(port, "/api/apps/demo/nope/outputs");
+    assert_eq!(status, 403, "{reply}");
+    let op = sign_in(&f.d.state, port);
+    let (status, reply) = op_get(&op, port, "/api/apps/demo/nope/outputs");
+    assert_eq!(status, 404, "{reply}");
+
+    // The proven operator reads the app's items — by task and by owner,
+    // newest first, and not the one that is neither.
+    let (status, reply) = op_get(&op, port, "/api/apps/demo/studio/outputs");
+    assert_eq!(status, 200, "{reply}");
+    let v: Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(v["project"], "demo", "{v}");
+    assert_eq!(v["name"], "studio", "{v}");
+    let ids: Vec<&str> = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["effect_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["ef-owner", "ef-task"], "{v}");
+    assert!(
+        v["items"][0]["preview"].as_str().unwrap().contains("By owner"),
+        "{v}"
+    );
+    // A bad name is refused by grammar even for the operator.
+    let (status, _) = op_get(&op, port, "/api/apps/demo/Bad%20Name/outputs");
+    assert_eq!(status, 400);
+}
+
 /// The session `op` as presented to the board on `port` instead: that
 /// board's own Host and Origin, its cookie name, the same token (a
 /// session is the daemon's, not one board's). A session carried to a
