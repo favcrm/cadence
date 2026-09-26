@@ -413,6 +413,7 @@ async function main() {
     await settle(page);
     await toTail(page);
     await page.waitForTimeout(400);
+    if (asserts) await checkLayout(page);
     await shot(page, `${size}-light-tail`);
 
     // Phone, light: the same pill, now that the theme has flipped. The
