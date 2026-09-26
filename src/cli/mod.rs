@@ -3783,15 +3783,41 @@ impl cadence_agent::update::UpdateHost for RealUpdateHost<'_> {
                 true
             }
         };
-        let mut commands = if offline {
-            vec![vec!["daemon", "start", "--as", &self.label]]
+        let mut commands: Vec<Vec<String>> = if offline {
+            vec![vec![
+                "daemon".into(),
+                "start".into(),
+                "--as".into(),
+                self.label.clone(),
+            ]]
         } else {
-            vec![vec!["daemon", "restart", "--ui", "--as", &self.label]]
+            vec![vec![
+                "daemon".into(),
+                "restart".into(),
+                "--ui".into(),
+                "--as".into(),
+                self.label.clone(),
+            ]]
         };
-        if offline && cadence_agent::ui::detached_pid(self.state_dir).is_some() {
+        if let Some(ui_pid) = offline
+            .then(|| cadence_agent::ui::detached_pid(self.state_dir))
+            .flatten()
+        {
             // Preserve the restart's --ui contract when a board survived
-            // the failed replacement. The selected release reads ui.json.
-            commands.extend([vec!["ui", "stop"], vec!["ui", "start"]]);
+            // the failed replacement. Read legacy argv before stopping
+            // the process; persisted ui.json remains authoritative.
+            let mut ui_start = vec!["ui".into(), "start".into()];
+            if !cadence_agent::ui::opts_present(self.state_dir) {
+                let (host, port, dist, allow_hosts) = ui_run_args(ui_pid);
+                ui_start.extend(["--host".into(), host, "--port".into(), port.to_string()]);
+                if let Some(dist) = dist {
+                    ui_start.extend(["--dist".into(), dist.to_string_lossy().into_owned()]);
+                }
+                for host in allow_hosts {
+                    ui_start.extend(["--allow-host".into(), host]);
+                }
+            }
+            commands.extend([vec!["ui".into(), "stop".into()], ui_start]);
         }
         for args in commands {
             cadence_agent::rollout::recheck_restart(self.state_dir, &ticket)?;
@@ -3815,7 +3841,7 @@ impl cadence_agent::update::UpdateHost for RealUpdateHost<'_> {
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
-            if args.as_slice() == ["ui", "start"] {
+            if args[0] == "ui" && args[1] == "start" {
                 cmd.env_remove("CADENCE_ALIAS");
             }
             let out = cadence_agent::reaper::spawn(&mut cmd)
