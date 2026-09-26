@@ -4885,6 +4885,169 @@ fn cad384_operator_daemon_stop_from_a_plain_shell() {
     assert!(d.rpc("health", json!({})).is_err());
 }
 
+/// CAD-626: rollback must restart the previous binary even when the
+/// failed replacement never reached its RPC socket. Exercise the actual
+/// CLI, singleton lock and detached daemon rather than the update mock.
+#[test]
+fn cad626_restart_recovers_an_unreachable_daemon() {
+    for when_idle in [false, true] {
+        let mut d = TestDaemon::start_process_in(TempDir::new().unwrap());
+        d.register_inbox("recovery-mailbox");
+        d.send(
+            "recovery-mailbox",
+            json!({"text": "keep queued", "message": "recovery-note"}),
+        )
+        .unwrap();
+        let (ok, out, err) = d.operator_cadence(&[
+            "rollout",
+            "claim",
+            "--reason",
+            "rollback recovery test",
+            "--as",
+            "operator:test",
+        ]);
+        assert!(ok, "claim: {out} {err}");
+        let (ok, out, err) = d.operator_cadence(&["daemon", "stop"]);
+        assert!(ok, "stop: {out} {err}");
+        d.process.take().unwrap().wait().unwrap();
+        assert!(d.rpc("health", json!({})).is_err());
+        let mut args = vec!["daemon", "restart", "--as", "operator:test"];
+        if when_idle {
+            args.extend(["--when-idle", "--timeout", "1"]);
+        }
+        // A dead socket is insufficient: a process can still hold the
+        // singleton while draining. It must not be replaced or audited
+        // as a restart that proceeded.
+        use std::os::unix::io::AsRawFd;
+        let lock = std::fs::OpenOptions::new()
+            .write(true)
+            .open(d.state.join("cadence.lock"))
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let (ok, out, err) = d.operator_cadence(&args);
+        assert!(!ok, "held singleton was replaced: {out} {err}");
+        assert!(err.contains("owns the state-dir lock"), "{out} {err}");
+        let proceeded: i64 = rusqlite::Connection::open(d.state.join("cadence.sqlite3"))
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM events WHERE kind='rollout_restart_proceeded'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(proceeded, 0);
+        drop(lock);
+        let (ok, out, err) = d.operator_cadence(&args);
+        // Clean up even when a failing assertion would otherwise leave
+        // the replacement detached from this fixture's Child handle.
+        let health = d.rpc("health", json!({}));
+        let mailbox = d.rpc("agent_show", json!({"alias": "recovery-mailbox"}));
+        let _ = d.operator_cadence(&["daemon", "stop"]);
+        assert!(ok, "when_idle={when_idle}: {out} {err}");
+        assert!(health.is_ok(), "recovery never became healthy: {health:?}");
+        let mailbox = mailbox.unwrap();
+        assert_eq!(mailbox["agent"]["provider"], "inbox");
+        assert_eq!(mailbox["messages"][0]["body"], "keep queued");
+        assert_eq!(mailbox["messages"][0]["state"], "queued");
+    }
+}
+
+/// Losing the fleet snapshot must not bypass --when-idle on a daemon
+/// that still holds its singleton and can answer a shutdown request.
+#[test]
+fn cad626_snapshot_transport_failure_does_not_shutdown_a_lock_holder() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::{io::AsRawFd, net::UnixListener};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let mut d = TestDaemon::start_process_in(TempDir::new().unwrap());
+    let (ok, out, err) = d.operator_cadence(&[
+        "rollout",
+        "claim",
+        "--reason",
+        "lost snapshot test",
+        "--as",
+        "operator:test",
+    ]);
+    assert!(ok, "claim: {out} {err}");
+    let (ok, out, err) = d.operator_cadence(&["daemon", "stop"]);
+    assert!(ok, "stop: {out} {err}");
+    d.process.take().unwrap().wait().unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .write(true)
+        .open(d.state.join("cadence.lock"))
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let socket = client::socket_path(&d.state);
+    if socket.exists() {
+        std::fs::remove_file(&socket).unwrap();
+    }
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let server_stop = stop.clone();
+    let server = thread::spawn(move || {
+        let mut methods = Vec::new();
+        while !server_stop.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let mut line = String::new();
+                    BufReader::new(&stream).read_line(&mut line).unwrap();
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    let method = request["method"].as_str().unwrap().to_string();
+                    if method == "shutdown" {
+                        writeln!(stream, "{}", cadence_agent::proto::ok(json!({}))).unwrap();
+                    }
+                    // agent_list loses its response; shutdown would succeed.
+                    methods.push(method);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("fake socket: {error}"),
+            }
+        }
+        methods
+    });
+    let (ok, out, err) = d.operator_cadence(&[
+        "daemon",
+        "restart",
+        "--when-idle",
+        "--timeout",
+        "1",
+        "--as",
+        "operator:test",
+    ]);
+    stop.store(true, Ordering::SeqCst);
+    let methods = server.join().unwrap();
+    assert!(!ok, "lost snapshot restarted a held singleton: {out} {err}");
+    assert_eq!(
+        methods,
+        vec!["agent_list"],
+        "shutdown was attempted without an idle proof"
+    );
+    assert!(err.contains("owns the state-dir lock"), "{out} {err}");
+    let proceeded: i64 = rusqlite::Connection::open(d.state.join("cadence.sqlite3"))
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM events WHERE kind='rollout_restart_proceeded'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(proceeded, 0);
+}
+
 /// CAD-384 round 2 (R2-1): the sandbox exemption belongs to a SANDBOX
 /// daemon only. On a real `daemon run` outside any sandbox, a caller
 /// whose ancestor carries an alias this daemon never registered (a
