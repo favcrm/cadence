@@ -301,37 +301,7 @@ fn op_http(port: u16, request: &str) -> String {
         f.write_all(request.as_bytes()).unwrap();
     }
     let script = dir.path().join("get.py");
-    std::fs::write(
-        &script,
-        r#"import os, socket, sys, time
-
-req_path, out_path, port, runner = sys.argv[1:5]
-
-def on_lineage(pid):
-    p = os.getpid()
-    while p > 1:
-        if p == pid:
-            return True
-        with open("/proc/%d/status" % p) as f:
-            p = int([l for l in f if l.startswith("PPid:")][0].split()[1])
-    return False
-
-while on_lineage(int(runner)):
-    time.sleep(0.02)
-s = socket.create_connection(("127.0.0.1", int(port)))
-s.sendall(open(req_path, "rb").read())
-data = b""
-while True:
-    chunk = s.recv(65536)
-    if not chunk:
-        break
-    data += chunk
-with open(out_path + ".tmp", "wb") as f:
-    f.write(data)
-os.rename(out_path + ".tmp", out_path)
-"#,
-    )
-    .unwrap();
+    std::fs::write(&script, op::http_script()).unwrap();
     let status = Command::new("setsid")
         .arg("-f")
         .arg("python3")
