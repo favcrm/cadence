@@ -177,7 +177,9 @@ export default function SocialContent({
       {section === "library" && (
         <ScLibrary say={say} postHref={(id) => scHref("post", id)} runsHref={scHref("runs")} />
       )}
-      {section === "runs" && <ScRuns postHref={(id) => scHref("post", id)} />}
+      {section === "runs" && (
+        <ScRuns postHref={(id) => scHref("post", id)} needsHref={scHref("needs")} />
+      )}
       {section === "post" && route.arg && (
         <ScPost id={route.arg} say={say} postHref={(id) => scHref("post", id)} />
       )}

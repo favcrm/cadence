@@ -93,19 +93,41 @@
 .sc-cardot { width: 7px; height: 7px; border-radius: 50%; border: none; background: var(--color-ink-600); padding: 0; cursor: pointer; }
 .sc-cardot.sc-on { background: var(--color-accent); }
 
-/* Runs */
-.sc-ritem { display: grid; grid-template-columns: 16px minmax(0,1.4fr) 2fr; gap: 10px; align-items: center; padding: 7px 9px; border: 1px solid var(--color-ink-700); border-radius: .4rem; background: var(--color-ink-875); }
-.sc-steps { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
-.sc-step { display: inline-flex; align-items: center; gap: 5px; font: 500 .6875rem "IBM Plex Mono", monospace; color: var(--color-ink-500); }
-.sc-step .sc-stic { width: 15px; height: 15px; border-radius: 50%; border: 1.5px solid var(--color-ink-600); display: inline-flex; align-items: center; justify-content: center; font-size: .6rem; color: var(--color-ink-500); flex: none; }
-.sc-step.sc-done { color: var(--color-ok); }
-.sc-step.sc-done .sc-stic { border-color: var(--color-ok); background: color-mix(in srgb, var(--color-ok) 12%, transparent); color: var(--color-ok); }
-.sc-step.sc-running { color: var(--color-info); }
-.sc-step.sc-running .sc-stic { border-color: var(--color-info); color: var(--color-info); animation: sc-pulse 1.2s ease-in-out infinite; }
-.sc-step.sc-failed, .sc-step.sc-mismatch { color: var(--color-fail); }
-.sc-step.sc-failed .sc-stic, .sc-step.sc-mismatch .sc-stic { border-color: var(--color-fail); color: var(--color-fail); }
+/* Runs — one plain row per run */
+.sc-runrow { display: grid; grid-template-columns: auto minmax(0,1.5fr) minmax(0,1fr) auto auto; gap: 12px; align-items: center; padding: 10px 13px; }
+.sc-runrow .sc-rwhat { font-size: .8125rem; color: var(--color-ink-200); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sc-runrow .sc-rprog { min-width: 0; }
+.sc-runrow .sc-rptext { font: 400 .6875rem "IBM Plex Mono", monospace; color: var(--color-ink-500); }
+.sc-runrow .sc-rwhen { font: 400 .6875rem "IBM Plex Mono", monospace; color: var(--color-ink-500); }
+.sc-runrow .sc-rchev { color: var(--color-ink-500); font-size: .9rem; }
+.sc-bar, .sc-barwrap .sc-bar { display: block; height: 3px; border-radius: 2px; background: var(--color-ink-700); margin-top: 5px; overflow: hidden; }
+.sc-barwrap .sc-bar { margin-top: 0; }
+.sc-bar i { display: block; height: 100%; border-radius: 2px; background: var(--color-accent); }
+.sc-bar.sc-done i { background: var(--color-ok); }
+.sc-bar.sc-needs i { background: var(--color-fail); }
+
+/* Runs drawer — per-post vertical stepper */
+.sc-vsteps { display: flex; flex-direction: column; }
+.sc-vstep { display: grid; grid-template-columns: 18px minmax(0,1fr) auto; gap: 9px; align-items: center; padding: 6px 0; position: relative; }
+.sc-vstep:not(:last-child)::after { content: ""; position: absolute; left: 8px; top: 26px; bottom: -4px; width: 1.5px; background: var(--color-ink-700); }
+.sc-vstep .sc-stic { width: 17px; height: 17px; border-radius: 50%; border: 1.5px solid var(--color-ink-600); display: inline-flex; align-items: center; justify-content: center; font-size: .62rem; color: var(--color-ink-500); flex: none; background: var(--color-ink-850); position: relative; z-index: 1; }
+.sc-vstep .sc-vname { font-size: .78rem; color: var(--color-ink-300); min-width: 0; }
+.sc-vstep .sc-vword { font: 400 .66rem "IBM Plex Mono", monospace; color: var(--color-ink-500); }
+.sc-vstep .sc-vfail { display: block; font-size: .72rem; color: var(--color-fail); margin-top: 2px; }
+.sc-vstep.sc-done .sc-vname { color: var(--color-ink-400); }
+.sc-vstep.sc-done .sc-stic { border-color: var(--color-ok); background: color-mix(in srgb, var(--color-ok) 12%, transparent); color: var(--color-ok); }
+.sc-vstep.sc-running .sc-vname { color: var(--color-info); }
+.sc-vstep.sc-running .sc-vword { color: var(--color-info); }
+.sc-vstep.sc-running .sc-stic { border-color: var(--color-info); color: var(--color-info); animation: sc-pulse 1.2s ease-in-out infinite; }
+.sc-vstep.sc-failed .sc-vname, .sc-vstep.sc-mismatch .sc-vname { color: var(--color-fail); }
+.sc-vstep.sc-failed .sc-vword, .sc-vstep.sc-mismatch .sc-vword { color: var(--color-fail); }
+.sc-vstep.sc-failed .sc-stic, .sc-vstep.sc-mismatch .sc-stic { border-color: var(--color-fail); color: var(--color-fail); }
+.sc-vstep.sc-skipped .sc-vname, .sc-vstep.sc-waiting .sc-vname { color: var(--color-ink-500); }
 @keyframes sc-pulse { 50% { opacity: .35; } }
-@media (prefers-reduced-motion: reduce) { .sc-step.sc-running .sc-stic { animation: none; } }
+@media (prefers-reduced-motion: reduce) { .sc-vstep.sc-running .sc-stic { animation: none; } }
+.sc-logbox summary { cursor: pointer; list-style: none; }
+.sc-logbox summary::before { content: "▸ "; }
+.sc-logbox[open] summary::before { content: "▾ "; }
 .sc-runlog { border-top: 1px dashed var(--color-ink-700); padding-top: 8px; display: flex; flex-direction: column; gap: 3px; }
 .sc-runlog .sc-l { font: 400 .72rem "IBM Plex Mono", monospace; color: var(--color-ink-400); display: flex; gap: 8px; }
 .sc-runlog .sc-l .sc-lt { color: var(--color-ink-500); flex: none; }
@@ -203,6 +225,6 @@
   .sc-weekwrap { overflow-x: auto; }
   .sc-ditem { grid-template-columns: 26px 44px minmax(0,1fr); }
   .sc-ditem .sc-acts { grid-column: 1 / -1; }
-  .sc-ritem { grid-template-columns: 16px minmax(0,1fr); }
-  .sc-ritem .sc-steps { grid-column: 2; }
+  .sc-runrow { grid-template-columns: auto minmax(0,1fr) auto; }
+  .sc-runrow .sc-rprog { grid-column: 1 / -1; }
 }
