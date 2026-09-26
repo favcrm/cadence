@@ -71,6 +71,14 @@ pub const MASTER_ALLOWED: &[&str] = &[
     "answer_route",
     // CAD-431: read the review loop (never file a verdict or decide).
     "delivery_list",
+    // CAD-614: wiki reads, plus a text write. The CAD-580 ACL still
+    // decides the path — the master writes only
+    // `agents/master/knowledge/`. mkdir/mv/rm/blobs stay closed.
+    "wiki_ls",
+    "wiki_read",
+    "wiki_search",
+    "wiki_history",
+    "wiki_write",
 ];
 
 /// Most reports one router pass queues to the master; the rest wait for
@@ -220,7 +228,8 @@ impl Shared {
                 format!(
                     "the master may not call {method} — it reads, proposes plans, dispatches \
                      approved tickets (`cadence master dispatch`), answers and escalates \
-                     questions; everything else is the operator's"
+                     questions, reads the wiki and writes only its own knowledge pages \
+                     (`wiki put agents/master/knowledge/…`); everything else is the operator's"
                 ),
             ));
         }
@@ -896,8 +905,9 @@ impl Shared {
                  Report: {path}\nImpact: {}\nOptions: {options}\n\n{body}\n\n\
                  Answer it: `cadence report file --task {id} --kind answer` with frontmatter \
                  `answers: {name}`. If the ticket, the plan and the operator's words do not \
-                 settle it: `cadence master escalate {id} {name} --file -` with a \
-                 one-paragraph summary — the operator then sees it in Needs-you.",
+                 settle it: write a one-paragraph summary into master/tmp, then \
+                 `cadence master escalate {id} {name} --file <that path>` — the operator \
+                 then sees it in Needs-you.",
                 row["impact"].as_str().unwrap_or_default()
             )
         } else {
@@ -1063,5 +1073,19 @@ mod tests {
             assert!(!master_may_call(never), "{never} must be refused");
         }
         assert!(!master_may_call("a_method_added_tomorrow"));
+        // CAD-614: wiki reads and a text write are open; mutations
+        // other than that write stay closed. The path ACL is separate.
+        for open in [
+            "wiki_ls",
+            "wiki_read",
+            "wiki_search",
+            "wiki_history",
+            "wiki_write",
+        ] {
+            assert!(master_may_call(open), "{open}");
+        }
+        for closed in ["wiki_mkdir", "wiki_mv", "wiki_rm", "wiki_put_blob"] {
+            assert!(!master_may_call(closed), "{closed} must stay refused");
+        }
     }
 }

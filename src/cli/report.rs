@@ -98,7 +98,7 @@ pub(super) fn run(
     }) = &action
     {
         let cap = cadence_agent::issue::task_report::BODY_MAX as u64;
-        let text = read_body_capped(None, file.clone(), cap)?;
+        let text = read_master_command_file(&state_dir, file.as_deref(), cap)?;
         print_json(&client::rpc(
             &state_dir,
             "report_verdict",
@@ -142,7 +142,8 @@ pub(super) fn run(
         }
         Some(ReportAction::File { task, kind, file }) => {
             use cadence_agent::issue::task_report;
-            let text = read_body_capped(None, file, task_report::BODY_MAX as u64)?;
+            let cap = task_report::BODY_MAX as u64;
+            let text = read_master_command_file(&state_dir, file.as_deref(), cap)?;
             let mut out = task_report::file(&pm, &text, Some(&task), Some(kind), "")?;
             // CAD-447: the daemon tells the question's author. The
             // answer stands either way; `route` says what happened.
@@ -165,7 +166,11 @@ pub(super) fn run(
             );
         }
         None => {
-            let body = read_body_capped(text, file, report::BODY_MAX as u64)?;
+            let body = if let Some(text) = text {
+                text
+            } else {
+                read_master_command_file(&state_dir, file.as_deref(), report::BODY_MAX as u64)?
+            };
             let cwd = std::env::current_dir()?;
             print_json(&report::file(
                 &pm,

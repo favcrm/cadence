@@ -208,11 +208,11 @@ fn master_end_to_end_chat_plan_approve_dispatch_report() {
     let chat = f.wait_thread("Plan reminder emails", 10);
     assert_eq!(chat["role"], "operator", "{chat}");
 
-    // The master proposes — through stdin, the way its briefing teaches.
+    // The master proposes from a file it wrote under master/tmp.
     let plan = f.file("plan.md", MASTER_PLAN);
     let (ok, proposed) = f.as_master(
         &mut m,
-        &format!("plan propose --project demo --file - < {plan}"),
+        &format!("plan propose --project demo --file {plan}"),
     );
     assert!(ok, "{proposed}");
     assert_eq!(proposed["epic"], "D-1", "{proposed}");
@@ -856,7 +856,7 @@ fn master_escalation_reaches_the_operator_needs_you() {
     // The master escalates through the daemon.
     let (ok, filed) = f.as_master(
         &mut m,
-        &format!("master escalate D-1 {qname} --file - < {esc_file}"),
+        &format!("master escalate D-1 {qname} --file {esc_file}"),
     );
     assert!(ok, "{filed}");
     assert_eq!(filed["by"], "master", "{filed}");
@@ -878,7 +878,7 @@ fn master_escalation_reaches_the_operator_needs_you() {
     // Escalated once; the router does not route it again.
     let (ok, err) = f.as_master(
         &mut m,
-        &format!("master escalate D-1 {qname} --file - < {esc_file}"),
+        &format!("master escalate D-1 {qname} --file {esc_file}"),
     );
     assert!(
         !ok && err.to_string().contains("already escalated"),
@@ -1229,10 +1229,16 @@ fn master_reads_nothing_outside_its_views() {
         let r = m.exec(&["sh", "-c", &format!("echo x >> {c}")]);
         assert!(r["rc"] != 0, "{c} written: {r}");
         assert!(std::fs::read_to_string(c).unwrap().contains(&token));
-        // An allowlisted verb that reads a named file.
+        // An allowlisted `--file` is refused in the CLI when the path
+        // is outside master/tmp (CAD-614). Landlock remains the backstop
+        // for `cat` above; either refusal must keep the canary out.
         let (ok, out) = f.as_master(&mut m, &format!("master escalate D-1 q.md --file {c}"));
-        assert!(!ok && !out.to_string().contains(&token), "{out}");
-        assert!(out.to_string().contains("Permission denied"), "{out}");
+        let text = out.to_string();
+        assert!(!ok && !text.contains(&token), "{out}");
+        assert!(
+            text.contains("master/tmp") || text.contains("Permission denied"),
+            "{out}"
+        );
     }
     let r = m.exec(&["ls", home.to_str().unwrap()]);
     assert!(r["rc"] != 0, "listed $HOME: {r}");

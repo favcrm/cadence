@@ -94,8 +94,7 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::io::Read;
 use std::io::Write;
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 use std::time::Instant;
@@ -1523,6 +1522,29 @@ pub(crate) fn read_body_capped(
         .take(read_limit)
         .read_to_string(&mut body)?;
     Ok(body)
+}
+
+/// Body for an allowlisted master command that takes `--file`
+/// (`plan propose`, `report file`, `report`, `master escalate`).
+///
+/// When [`cadence_agent::master::caller_is_master`] is set, `-` and a
+/// missing path are refused with [`cadence_agent::master::NO_STDIN`]
+/// before stdin is opened, and a real path goes through
+/// [`cadence_agent::master::read_command_file`]. Other callers keep
+/// the stdin pipe.
+pub(crate) fn read_master_command_file(
+    state_dir: &Path,
+    file: Option<&Path>,
+    max: u64,
+) -> Result<String> {
+    let path = file.filter(|f| f.as_os_str() != "-" && !f.as_os_str().is_empty());
+    if cadence_agent::master::caller_is_master() {
+        let Some(path) = path else {
+            return Err(Error::rejected(cadence_agent::master::NO_STDIN));
+        };
+        return cadence_agent::master::read_command_file(state_dir, path, max);
+    }
+    read_body_capped(None, file.map(Path::to_path_buf), max)
 }
 
 /// `message result --report` (CAD-341): the result text with its

@@ -153,7 +153,9 @@ pub fn run(action: &WikiAction, state_dir: &Path) -> Result<i32> {
                 let uploads = state_dir.join(crate::wiki::UPLOAD_DIR);
                 std::fs::create_dir_all(&uploads)?;
                 let tmp = uploads.join(format!("upload-{}", uuid::Uuid::new_v4().simple()));
-                std::fs::copy(file, &tmp).map_err(|e| {
+                let mut src = crate::master::open_command_file(state_dir, file)?;
+                let mut dst = std::fs::File::create(&tmp)?;
+                std::io::copy(&mut src, &mut dst).map_err(|e| {
                     Error::rejected(format!("wiki put: cannot stage {}: {e}", file.display()))
                 })?;
                 let out = rpc(
@@ -177,11 +179,27 @@ pub fn run(action: &WikiAction, state_dir: &Path) -> Result<i32> {
                 crate::issue::cli::print_json(&out);
                 return Ok(0);
             }
+            // The master does not pass `-m`. That channel is unbounded
+            // and sits beside `--file`; content is a file inside
+            // `<state>/master/tmp`. Other callers keep `-m` and stdin.
+            if crate::master::caller_is_master() && text.is_some() {
+                return Err(Error::rejected(
+                    "the master does not pass -m — use the write tool into master/tmp, then --file <that path>",
+                ));
+            }
+            if crate::master::caller_is_master()
+                && file
+                    .as_ref()
+                    .is_none_or(|f| f.as_os_str() == "-" || f.as_os_str().is_empty())
+            {
+                return Err(Error::rejected(crate::master::NO_STDIN));
+            }
             let text = match (text, file) {
                 (Some(t), _) => t.clone(),
-                (None, Some(f)) => std::fs::read_to_string(f).map_err(|e| {
-                    Error::rejected(format!("wiki put: cannot read {}: {e}", f.display()))
-                })?,
+                (None, Some(f)) => crate::master::read_command_file(state_dir, f, u64::MAX)
+                    .map_err(|e| {
+                        Error::rejected(format!("wiki put: cannot read {}: {e}", f.display()))
+                    })?,
                 (None, None) => {
                     let mut buf = String::new();
                     std::io::stdin().read_to_string(&mut buf)?;

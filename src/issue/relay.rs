@@ -1421,6 +1421,7 @@ mod tests {
             None,
             &["intake".to_string()],
             Some("CAD-1"),
+            None,
             "",
         )
         .unwrap();
@@ -1462,6 +1463,7 @@ mod tests {
             None,
             &["intake".to_string()],
             Some(issue_id),
+            None,
             "",
         )
         .unwrap();

@@ -3862,6 +3862,7 @@ fn project_new_registers_seeds_and_is_operator_only() {
         None,
         &[],
         None,
+        None,
         "",
     )
     .unwrap();

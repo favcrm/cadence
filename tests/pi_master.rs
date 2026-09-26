@@ -163,10 +163,10 @@ fn recorded_env(state: &Path) -> Vec<String> {
 }
 
 /// The exact flags the adapter puts on the provider for a master —
-/// `--no-extensions -e <guard> --tools bash,read` is the lockdown (I1:
-/// deleting the guard block from `build_command` fails this test).
-/// `read` joined the toolset under CAD-552 — the guard confines it to
-/// `master/tmp`.
+/// `--no-extensions -e <guard> --tools bash,read,write` is the lockdown
+/// (I1: deleting the guard block from `build_command` fails this test).
+/// `read` joined under CAD-552; `write` under CAD-614. Both are
+/// confined to `master/tmp`. Claude's tool string stays `Bash`.
 fn expected_master_argv(mode: &str, guard: &Path) -> Vec<String> {
     [
         mode,
@@ -182,7 +182,7 @@ fn expected_master_argv(mode: &str, guard: &Path) -> Vec<String> {
         "--extension",
         guard.to_str().unwrap(),
         "--tools",
-        "bash,read",
+        "bash,read,write",
         // CAD-559: the resolved allowlisted model always lands last —
         // a pi launch with no explicit `--model` is refused before
         // this argv is ever built.
@@ -412,6 +412,10 @@ fn master_launch_has_exact_lockdown_argv_and_a_real_guard() {
         "guard has the grammar: {src}"
     );
     assert!(src.contains("\"argv\":[\"status\"]"), "rules table: {src}");
+    // CAD-614: the write tool is Pi-only. Claude stays Bash, and Write
+    // stays on its disallowed list.
+    assert_eq!(cadence_agent::master::CLAUDE_TOOLS, "Bash");
+    assert!(cadence_agent::master::CLAUDE_DISALLOWED_TOOLS.contains(&"Write"));
     pi.close();
 }
 
@@ -694,71 +698,97 @@ fn the_pi_guard_is_a_grammar_and_refuses_the_bypasses() {
         .unwrap();
     pi.close();
     let grammar = guard_grammar(state.path());
+    let tmp = state.path().join("master/tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let tmp = tmp.to_string_lossy().to_string();
     let allow = [
-        "cadence status",
-        "cadence status --long",
-        "cadence issue ls",
-        "cadence issue ls --project demo",
-        "cadence issue ls --summary --json", // CAD-552 one-call status
-        "cadence issue show D-1",
-        "cadence issue log D-1",
-        "cadence issue log D-1 --limit 10",
-        "cadence issue epic ls",
-        "cadence issue epic ls --project demo",
-        "cadence issue epic show D-1",
-        "cadence issue project ls",
-        "cadence plan ls",
-        "cadence plan ls --state approved",
-        "cadence plan show p1",
-        "cadence thread show swe-1",
-        "cadence overview",
-        "cadence overview --json",
-        "cadence plan propose --project demo --file /tmp/p.md",
-        "cadence project new x",
-        "cadence master dispatch D-1 --to swe-1",
-        "cadence master escalate D-1 --file q.md",
-        "cadence master summary",
-        "cadence interrupt abc",
-        "cadence report file reports/x.md",
-        "cadence agent list",
-        "cadence agent show swe-1",
-        " cadence  status ", // whitespace still tokenizes to cadence+status
+        "cadence status".to_string(),
+        "cadence status --long".to_string(),
+        "cadence issue ls".to_string(),
+        "cadence issue ls --project demo".to_string(),
+        "cadence issue ls --summary --json".to_string(), // CAD-552 one-call status
+        "cadence issue show D-1".to_string(),
+        "cadence issue log D-1".to_string(),
+        "cadence issue log D-1 --limit 10".to_string(),
+        "cadence issue epic ls".to_string(),
+        "cadence issue epic ls --project demo".to_string(),
+        "cadence issue epic show D-1".to_string(),
+        "cadence issue project ls".to_string(),
+        "cadence plan ls".to_string(),
+        "cadence plan ls --state approved".to_string(),
+        "cadence plan show p1".to_string(),
+        "cadence thread show swe-1".to_string(),
+        "cadence overview".to_string(),
+        "cadence overview --json".to_string(),
+        format!("cadence plan propose --project demo --file {tmp}/plan.md"),
+        "cadence project new x".to_string(),
+        "cadence master dispatch D-1 --to swe-1".to_string(),
+        format!("cadence master escalate D-1 --file {tmp}/sum.md"),
+        "cadence master summary".to_string(),
+        "cadence interrupt abc".to_string(),
+        "cadence report file reports/x.md".to_string(),
+        format!("cadence report file --task D-1 --kind answer --file {tmp}/a.md"),
+        "cadence agent list".to_string(),
+        "cadence agent show swe-1".to_string(),
+        " cadence  status ".to_string(), // whitespace still tokenizes to cadence+status
+        // CAD-614
+        "cadence issue new A title".to_string(),
+        "cadence issue new A title --status backlog".to_string(),
+        "cadence wiki ls".to_string(),
+        "cadence wiki ls global".to_string(),
+        "cadence wiki cat global/x.md".to_string(),
+        "cadence wiki search hello".to_string(),
+        "cadence wiki history global/x.md".to_string(),
+        format!("cadence wiki put agents/master/knowledge/n.md --file {tmp}/n.md"),
     ];
     let deny = [
-        "cadence status; rm -rf /",
-        "cadence status && rm -rf /",
-        "cadence status || cat /etc/passwd",
-        "cadence status | cat",
-        "cadence status $(id)",
-        "cadence status `id`",
-        "cadence status > /tmp/x",
-        "cadence status\nrm -rf /",
-        "FOO=bar cadence status", // env-prefix: argv[0] is not cadence
-        "env FOO=bar cadence status",
-        "bash -c \"cadence status\"",
-        "sh -c 'cadence status'",
-        "cadence", // bare: no allowlisted subcommand
-        "claude status",
-        "cadence agent stop swe-1",
-        "cadence build-slot run -- id",
-        "cadence issue ls 'x'",
-        "cadence issue ls \"x\"",
-        "cadence issue show $HOME",
-        "cadence\tstatus",
-        "",
-        "pi --version",
-        // CAD-552: write verbs stay refused — `=` is inside the
-        // charset, so only the argv-prefix table stands in the way.
-        "cadence issue new x",
-        "cadence issue set D-1 status=done",
-        "cadence plan approve D-1",
-        "cadence epic ls",     // the verb's path is `issue epic`
-        "cadence issue show",  // the `*` form needs an argument
-        "cadence thread show", // same
-        "cadence read /tmp/x", // `read` is a tool, never a verb
-        "cadence issue ls --json | head -5",
+        "cadence status; rm -rf /".to_string(),
+        "cadence status && rm -rf /".to_string(),
+        "cadence status || cat /etc/passwd".to_string(),
+        "cadence status | cat".to_string(),
+        "cadence status $(id)".to_string(),
+        "cadence status `id`".to_string(),
+        "cadence status > /tmp/x".to_string(),
+        "cadence status\nrm -rf /".to_string(),
+        "FOO=bar cadence status".to_string(), // env-prefix: argv[0] is not cadence
+        "env FOO=bar cadence status".to_string(),
+        "bash -c \"cadence status\"".to_string(),
+        "sh -c 'cadence status'".to_string(),
+        "cadence".to_string(), // bare: no allowlisted subcommand
+        "claude status".to_string(),
+        "cadence agent stop swe-1".to_string(),
+        "cadence build-slot run -- id".to_string(),
+        "cadence issue ls 'x'".to_string(),
+        "cadence issue ls \"x\"".to_string(),
+        "cadence issue show $HOME".to_string(),
+        "cadence\tstatus".to_string(),
+        "".to_string(),
+        "pi --version".to_string(),
+        // Still not allowlisted — `=` is inside the charset, so only
+        // the argv-prefix table stands in the way.
+        "cadence issue set D-1 status=done".to_string(),
+        "cadence plan approve D-1".to_string(),
+        "cadence epic ls".to_string(), // the verb's path is `issue epic`
+        "cadence issue show".to_string(), // the `*` form needs an argument
+        "cadence thread show".to_string(), // same
+        "cadence read /tmp/x".to_string(), // `read` is a tool, never a verb
+        "cadence issue ls --json | head -5".to_string(),
+        "cadence wiki mkdir global/x".to_string(),
+        "cadence wiki rm agents/master/knowledge/n.md".to_string(),
+        // CAD-614: --file outside tmp, stdin, and the issue-new overrides.
+        "cadence plan propose --project demo --file /tmp/p.md".to_string(),
+        "cadence master escalate D-1 --file q.md".to_string(),
+        "cadence issue new x --file -".to_string(),
+        "cadence issue new x --status ready".to_string(),
+        "cadence issue new x --owner bob".to_string(),
+        "cadence issue new x --id CAD-1".to_string(),
+        format!("cadence wiki put global/x.md --file {tmp}/n.md"),
+        format!("cadence wiki put agents/master/knowledge/../../global/x.md --file {tmp}/n.md"),
+        "cadence report file --task D-1 --kind answer --file /etc/passwd".to_string(),
+        format!("cadence plan propose --project demo --file {tmp}/a.md --file /etc/passwd"),
+        format!("cadence wiki put agents/master/knowledge/n.md -m hello --file {tmp}/n.md"),
     ];
-    let cases: Vec<&str> = allow.iter().chain(&deny).copied().collect();
+    let cases: Vec<&str> = allow.iter().chain(&deny).map(String::as_str).collect();
     let js = format!(
         "{grammar}\nprocess.stdout.write(JSON.stringify(({}).map(piGuardAllows)));",
         json!(cases)
@@ -786,7 +816,7 @@ fn the_pi_guard_refusal_names_the_rule_and_allowed_forms() {
     let cases = [
         "cadence status | head -5",
         "rm -rf /",
-        "cadence issue new x",
+        "cadence plan approve D-1",
         "cadence status",
         "",
     ];
@@ -873,6 +903,155 @@ fn the_pi_guard_confines_read_to_master_tmp() {
     assert_eq!(out["num"], json!(false));
 }
 
+/// CAD-614: the write tool and `--file` stay inside `master/tmp`.
+/// `..`, a symlink planted in tmp, an absolute path and `/proc/self`
+/// are refused; `--file` outside tmp is refused; `issue new --status
+/// ready` / `--owner` are refused; `wiki put global/x` is refused.
+/// Pipes and quotes stay refused. Dropping the symlink walk or the
+/// `--file` check turns one of these cases green.
+#[test]
+fn the_pi_guard_confines_writes_and_file_args() {
+    let state = tempfile::tempdir().unwrap();
+    let pi = master_adapter(
+        "normal",
+        state.path(),
+        &[(cadence_agent::master::TEST_NO_LANDLOCK, "1".into())],
+    );
+    pi.open(&master_agent(state.path(), json!({"unconfined": true})))
+        .unwrap();
+    pi.close();
+    let guard = state.path().join("master/pi-guard.js");
+    let mjs = state.path().join("guard.mjs");
+    std::fs::copy(&guard, &mjs).unwrap();
+    let tmp = state.path().join("master/tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let link = tmp.join("escape");
+    std::os::unix::fs::symlink("/etc/passwd", &link).unwrap();
+    let tmp_s = tmp.to_string_lossy().to_string();
+    let link_s = link.to_string_lossy().to_string();
+    let big = "x".repeat(262145);
+    let cases = json!([
+        {"tool": "write", "input": {"path": format!("{tmp_s}/ok.md"), "content": "hello"}},
+        {"tool": "write", "input": {"path": format!("{tmp_s}/../cwd/x"), "content": "no"}},
+        {"tool": "write", "input": {"path": link_s, "content": "no"}},
+        {"tool": "write", "input": {"path": "/etc/passwd", "content": "no"}},
+        {"tool": "write", "input": {"path": "/proc/self/environ", "content": "no"}},
+        {"tool": "write", "input": {"path": format!("{tmp_s}/big.md"), "content": big}},
+        {"tool": "bash", "input": {"command": format!("cadence plan propose --project demo --file {tmp_s}/ok.md")}},
+        {"tool": "bash", "input": {"command": "cadence plan propose --project demo --file /tmp/p.md"}},
+        {"tool": "bash", "input": {"command": format!("cadence plan propose --project demo --file {link_s}")}},
+        {"tool": "bash", "input": {"command": "cadence issue new Title --status ready"}},
+        {"tool": "bash", "input": {"command": "cadence issue new Title --owner bob"}},
+        {"tool": "bash", "input": {"command": format!("cadence wiki put global/x.md --file {tmp_s}/ok.md")}},
+        {"tool": "bash", "input": {"command": format!("cadence wiki put agents/master/knowledge/n.md --file {tmp_s}/ok.md")}},
+        {"tool": "bash", "input": {"command": "cadence status | head"}},
+        {"tool": "bash", "input": {"command": "cadence issue ls \"x\""}},
+        {"tool": "bash", "input": {"command": format!("cadence plan propose --project demo --file {tmp_s}/ok.md --file /etc/passwd")}},
+        {"tool": "bash", "input": {"command": format!("cadence wiki put agents/master/knowledge/n.md -m hello --file {tmp_s}/ok.md")}},
+    ]);
+    let harness = format!(
+        r#"import guard from "file://{}";
+let handler;
+guard({{ on: (name, cb) => {{ if (name === "tool_call") handler = cb; }} }});
+const out = [];
+for (const c of {}) {{
+  const r = await handler({{ toolName: c.tool, input: c.input }});
+  out.push(r === undefined ? null : String(r.reason ?? ""));
+}}
+process.stdout.write(JSON.stringify(out));"#,
+        mjs.display(),
+        cases
+    );
+    // The 256KB case is 262145 bytes. Passing that harness as `node -e`
+    // exceeds ARG_MAX (E2BIG) before any assertion runs.
+    let harness_path = state.path().join("harness.mjs");
+    std::fs::write(&harness_path, &harness).unwrap();
+    let out = cadence_agent::reaper::output(std::process::Command::new("node").arg(&harness_path))
+        .expect("node is required for the pi toolchain");
+    assert!(
+        out.status.success(),
+        "extension import failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let reasons: Vec<Option<String>> = serde_json::from_slice(&out.stdout).unwrap();
+    let allow = [0usize, 6, 12];
+    for (i, reason) in reasons.iter().enumerate() {
+        assert_eq!(reason.is_none(), allow.contains(&i), "case {i}: {reason:?}");
+    }
+    assert!(
+        reasons[1].as_deref().unwrap().contains("confined"),
+        "{:?}",
+        reasons[1]
+    );
+    assert!(
+        reasons[2].as_deref().unwrap().contains("symlink")
+            || reasons[2].as_deref().unwrap().contains("confined"),
+        "{:?}",
+        reasons[2]
+    );
+    assert!(
+        reasons[3].as_deref().unwrap().contains("confined"),
+        "{:?}",
+        reasons[3]
+    );
+    assert!(
+        reasons[4].as_deref().unwrap().contains("/proc/self")
+            || reasons[4].as_deref().unwrap().contains("confined"),
+        "{:?}",
+        reasons[4]
+    );
+    assert!(
+        reasons[5].as_deref().unwrap().contains("256KB"),
+        "{:?}",
+        reasons[5]
+    );
+    assert!(
+        reasons[7].as_deref().unwrap().contains("write tool"),
+        "{:?}",
+        reasons[7]
+    );
+    assert!(
+        reasons[8].as_deref().unwrap().contains("write tool"),
+        "{:?}",
+        reasons[8]
+    );
+    assert!(
+        reasons[9].as_deref().unwrap().contains("backlog"),
+        "{:?}",
+        reasons[9]
+    );
+    assert!(
+        reasons[10].as_deref().unwrap().contains("--owner"),
+        "{:?}",
+        reasons[10]
+    );
+    assert!(
+        reasons[11].as_deref().unwrap().contains("knowledge"),
+        "{:?}",
+        reasons[11]
+    );
+    assert!(
+        reasons[13].as_deref().unwrap().contains("no pipes"),
+        "{:?}",
+        reasons[13]
+    );
+    assert!(
+        reasons[14].as_deref().unwrap().contains("quotes"),
+        "{:?}",
+        reasons[14]
+    );
+    assert!(
+        reasons[15].as_deref().unwrap().contains("one --file"),
+        "{:?}",
+        reasons[15]
+    );
+    assert!(
+        reasons[16].as_deref().unwrap().contains("-m"),
+        "{:?}",
+        reasons[16]
+    );
+}
+
 /// CAD-552: the generated extension itself — imported as a module with
 /// a stub `pi` — routes `tool_call` through the grammar: bash by the
 /// allowlist, `read` by the tmp confinement, every other tool refused.
@@ -899,7 +1078,7 @@ fn the_generated_extension_routes_tool_calls() {
     let cases = json!([
         {"tool": "bash", "input": {"command": "cadence status"}},
         {"tool": "bash", "input": {"command": "cadence issue ls --summary --json"}},
-        {"tool": "bash", "input": {"command": "cadence issue new x"}},
+        {"tool": "bash", "input": {"command": "cadence plan approve D-1"}},
         {"tool": "bash", "input": {"command": "cadence status | head"}},
         {"tool": "bash", "input": {"command": "rm -rf /"}},
         {"tool": "read", "input": {"path": format!("{tmp}/pi-bash-1.log")}},
@@ -908,6 +1087,7 @@ fn the_generated_extension_routes_tool_calls() {
         {"tool": "read", "input": {"path": format!("{tmp}/../cwd/x")}},
         {"tool": "read", "input": {}},
         {"tool": "write", "input": {"path": format!("{tmp}/x"), "content": "y"}},
+        {"tool": "write", "input": {"path": "/etc/passwd", "content": "y"}},
         {"tool": "grep", "input": {"pattern": "x"}},
     ]);
     let harness = format!(
@@ -937,8 +1117,13 @@ process.stdout.write(JSON.stringify(out));"#,
     );
     let reasons: Vec<Option<String>> = serde_json::from_slice(&out.stdout).unwrap();
     for (i, reason) in reasons.iter().enumerate() {
-        let want_allow = i <= 1 || i == 5; // the two good bash calls + the in-tmp read
-        assert_eq!(reason.is_none(), want_allow, "case {i}: {cases}");
+        // good bash, the in-tmp read, and the in-tmp write
+        let want_allow = i <= 1 || i == 5 || i == 10;
+        assert_eq!(
+            reason.is_none(),
+            want_allow,
+            "case {i}: {cases} -> {reason:?}"
+        );
     }
     // The refusals carry their rule, not a bare no.
     assert!(reasons[2]
@@ -947,7 +1132,12 @@ process.stdout.write(JSON.stringify(out));"#,
         .contains("not an allowlisted verb"));
     assert!(reasons[3].as_deref().unwrap().contains("no pipes"));
     assert!(reasons[6].as_deref().unwrap().contains("confined"));
-    assert!(reasons[10].as_deref().unwrap().contains("not enabled"));
+    assert!(
+        reasons[11].as_deref().unwrap().contains("confined"),
+        "{:?}",
+        reasons[11]
+    );
+    assert!(reasons[12].as_deref().unwrap().contains("not enabled"));
 }
 
 /// CAD-552's before/after probe: one REAL Pi turn — the "report status

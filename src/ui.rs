@@ -2316,6 +2316,7 @@ fn write_route(
             req.component.as_deref(),
             &req.tags.unwrap_or_default(),
             None,
+            None,
             &actor,
         ) {
             Ok(out) => {
