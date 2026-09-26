@@ -1585,9 +1585,7 @@ fn ls_summary(views: &[&board::View]) -> Value {
     > = Default::default();
     for v in views {
         let f = &v.issue.front;
-        let entry = projects
-            .entry(v.issue.project.clone())
-            .or_default();
+        let entry = projects.entry(v.issue.project.clone()).or_default();
         let counts = entry.0.entry(v.status.clone()).or_insert(json!(0));
         *counts = json!(counts.as_u64().unwrap_or(0) + 1);
         if matches!(f.priority.as_str(), "P0" | "P1")

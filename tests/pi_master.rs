@@ -865,6 +865,23 @@ fn status_prompt_probe() {
         });
     let _ = std::fs::remove_dir_all(&state);
     std::fs::create_dir_all(state.join("logs")).unwrap();
+    // Real Pi needs its login inside `<state>/master/pi` — provision it
+    // the way `master start --copy-login` does, from the operator's own
+    // agent dir. No login anywhere → the probe skips loudly, not fails.
+    let operator_config = std::env::var("PI_CODING_AGENT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap()).join(".pi/agent"));
+    match cadence_agent::master::copy_login_for("pi", &state, &operator_config) {
+        Ok(cadence_agent::master::Login::None) => {
+            eprintln!(
+                "PROBE skipped: no pi login in {}",
+                operator_config.display()
+            );
+            return;
+        }
+        Err(e) => panic!("probe could not provision pi login: {e}"),
+        _ => {}
+    }
     let env = ProviderEnv::default();
     if let Ok(pm) = std::env::var("CADENCE_PM_DIR") {
         env.set("CADENCE_PM_DIR", pm);
