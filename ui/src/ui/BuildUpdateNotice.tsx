@@ -6,7 +6,6 @@ export default function BuildUpdateNotice({ onReload, onDismiss }: {
   onReload: () => void;
   onDismiss: () => void;
 }) {
-  const tooltipId = useId();
   const panelId = useId();
   const [open, setOpen] = useState(false);
   const noticeRef = useRef<HTMLDivElement>(null);
@@ -27,11 +26,11 @@ export default function BuildUpdateNotice({ onReload, onDismiss }: {
       }}>
       <button type="button" onClick={() => setOpen((value) => !value)}
         className="header-update-trigger header-auth-target chip bg-accent/10 text-accent hover:bg-accent/20" aria-label="Update available"
-        aria-expanded={open} aria-controls={open ? panelId : undefined} aria-describedby={tooltipId}>
+        aria-expanded={open} aria-controls={open ? panelId : undefined}>
         <span className="sm:hidden"><IconUpdate /></span>
         <span className="hidden sm:inline">Update available</span>
       </button>
-      <span id={tooltipId} role="tooltip" className="header-tooltip">Update available</span>
+      <span role="tooltip" className="header-tooltip sm:hidden">Update available</span>
       {open && <div id={panelId} className="header-update-panel card p-4 shadow-lg">
         <p className="text-secondary font-medium text-ink-100">Cadence was updated</p>
         <p className="mt-1 text-label text-ink-400">Reload to use the latest version.</p>
