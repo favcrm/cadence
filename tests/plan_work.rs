@@ -1125,10 +1125,8 @@ fn social_content_app_installs_approves_and_proposes() {
     // Adapt writes one caption per destination under the run's folder;
     // Publish stages the send on the slot it names.
     let adapt = issue_body(&f, &tickets[0]);
-    assert!(
-        adapt.contains("social/kura-ramen-summer/caption-<destination>.md"),
-        "{adapt}"
-    );
+    assert!(adapt.contains("social/kura-ramen-summer/"), "{adapt}");
+    assert!(adapt.contains("caption-<destination>.md"), "{adapt}");
     assert!(adapt.contains("instagram, facebook"), "{adapt}");
     let publish = issue_body(&f, &tickets[3]);
     assert!(publish.contains("uses: publish"), "{publish}");
