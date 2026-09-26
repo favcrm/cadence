@@ -116,6 +116,24 @@ pub(super) fn team_route(path: &str) -> Option<(&str, &str)> {
     (verb == "team" && !project.is_empty() && !name.is_empty()).then_some((project, name))
 }
 
+/// `(project, name)` for `POST /api/apps/<project>/<name>/worker` —
+/// `None` when the path is not that route (CAD-577).
+pub(super) fn worker_route(path: &str) -> Option<(&str, &str)> {
+    let tail = path.strip_prefix("/api/apps/")?;
+    let (project, rest) = tail.split_once('/')?;
+    let (name, verb) = rest.split_once('/')?;
+    (verb == "worker" && !project.is_empty() && !name.is_empty()).then_some((project, name))
+}
+
+/// The worker body: `{"role": "<input>"}` — the role the operator
+/// picked. Anything else is refused by shape.
+fn worker_body_ok(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(bytes)
+        .ok()
+        .and_then(|v| v.get("role").and_then(Value::as_str).map(str::to_string))
+        .is_some_and(|role| !role.is_empty())
+}
+
 /// The team body: `{"team": ["<input>=<agent>", …]}` — the roles the
 /// operator picked. Anything else is refused by shape.
 fn team_body_ok(bytes: &[u8]) -> bool {
@@ -440,6 +458,38 @@ pub(super) fn set_team(
     }
 }
 
+/// `POST /api/apps/<project>/<name>/worker` — relays the daemon's
+/// `app_add_worker` (CAD-577): join a new Devin worker for one team
+/// role. Operator-only on the board (the route is listed in
+/// `operator::WRITE_ROUTES`). The body carries `{"role": "<input>"}`;
+/// every other field is refused by shape.
+pub(super) fn add_worker(
+    request: &mut Request,
+    state_dir: &std::path::Path,
+    key: &str,
+    name: &str,
+) -> HttpResp {
+    if !model::valid_key(key) || !model::valid_tag(name) {
+        return err_response(400, "bad project or app name");
+    }
+    let bytes = match read_body(request, BODY_CAP) {
+        Ok(bytes) => bytes,
+        Err(resp) => return resp,
+    };
+    if !worker_body_ok(&bytes) {
+        return err_response(400, "app add worker takes {\"role\": \"<input>\"}");
+    }
+    let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    match client::rpc(
+        state_dir,
+        "app_add_worker",
+        json!({"project": key, "name": name, "role": body["role"]}),
+    ) {
+        Ok(out) => json_response(out),
+        Err(e) => home::rpc_err(&e, "app_add_worker"),
+    }
+}
+
 /// `POST /api/apps/<project>/<name>/approve` — the same `app_approve`
 /// call `cadence app approve` makes. The board was already admitted
 /// as the operator (`operator::admit`); the daemon's
@@ -560,6 +610,37 @@ mod tests {
             "null",
         ] {
             assert!(!team_body_ok(bad.as_bytes()), "{bad}");
+        }
+    }
+
+    /// The "Add worker" route and body shape (CAD-577).
+    #[test]
+    fn worker_route_and_body_are_exact() {
+        assert_eq!(
+            worker_route("/api/apps/demo/studio/worker"),
+            Some(("demo", "studio"))
+        );
+        for dead in [
+            "/api/apps",
+            "/api/apps/demo/studio",
+            "/api/apps/demo/studio/team",
+            "/api/apps/demo/worker",
+            "/api/apps//studio/worker",
+            "/api/apps/demo/studio/worker/extra",
+        ] {
+            assert_eq!(worker_route(dead), None, "{dead}");
+        }
+        for ok in [r#"{"role":"publisher"}"#, r#"{"role":"writer"}"#] {
+            assert!(worker_body_ok(ok.as_bytes()), "{ok}");
+        }
+        for bad in [
+            r#"{"role":""}"#,
+            r#"{"role":1}"#,
+            r#"{"writer":"a"}"#,
+            "[]",
+            "null",
+        ] {
+            assert!(!worker_body_ok(bad.as_bytes()), "{bad}");
         }
     }
 

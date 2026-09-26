@@ -506,9 +506,9 @@ function SettingsTab({
  * Settings → Team (CAD-577): one picker per role, listing the registered
  * agents with their state, saved as the app's default team (an
  * operator-only write, stored with the install record, not in the
- * digest). "Add worker" joins a new worker for the role — the CLI's
- * `cadence join` — with a unique prefixed alias, under the operator's
- * inbox.
+ * digest). "Add worker" joins a new Devin worker for the role — the
+ * daemon's `app_add_worker` — with a unique prefixed alias, under the
+ * operator (a group root).
  */
 function TeamEditor({
   app,
@@ -529,6 +529,7 @@ function TeamEditor({
   const lastRun = teamFromLastRun(wf, runs);
   const [draft, setDraft] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
+  const [adding, setAdding] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const valueOf = (role: string) => draft[role] ?? saved[role] ?? lastRun[role] ?? "";
   const dirty = roles.some((r) => draft[r] !== undefined && draft[r] !== valueOf(r));
@@ -547,6 +548,21 @@ function TeamEditor({
       })
       .catch((e: ApiError) => setNote(e.message ?? String(e)))
       .finally(() => setBusy(false));
+  };
+
+  const addWorker = (role: string) => {
+    if (adding) return;
+    setAdding(role);
+    setNote(null);
+    api
+      .appAddWorker(app.project, app.name, role)
+      .then((out) => {
+        setNote(out.alias ? `Joined ${out.alias}.` : "Worker joined.");
+        void resources.agents.invalidate();
+        void resources.app(`${app.project}/${app.name}`).invalidate();
+      })
+      .catch((e: ApiError) => setNote(e.message ?? String(e)))
+      .finally(() => setAdding(null));
   };
 
   return (
@@ -584,13 +600,19 @@ function TeamEditor({
                   <option value={value}>{value} — saved</option>
                 )}
               </select>
-              <Link
-                href={`/agents?new=${encodeURIComponent(role)}`}
-                className="lnk text-label shrink-0"
-                title="join a new worker for this role"
+              <button
+                type="button"
+                onClick={() => addWorker(role)}
+                disabled={adding !== null || !viewer.operator}
+                className="lnk text-label shrink-0 disabled:opacity-40"
+                title={
+                  !viewer.operator
+                    ? "Joining a worker is the operator's."
+                    : "join a new Devin worker for this role"
+                }
               >
-                Add worker →
-              </Link>
+                {adding === role ? "Joining…" : "Add worker →"}
+              </button>
             </li>
           );
         })}

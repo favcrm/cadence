@@ -98,6 +98,20 @@ pub(crate) enum AppAction {
         #[arg(long)]
         project: String,
     },
+    /// Join a new Devin worker for one of the app's team roles (CAD-577)
+    /// — the board's "Add worker": a unique role-prefixed alias, under
+    /// the operator (a group root), recorded in the app's default team.
+    /// Operator only, through the daemon.
+    AddWorker {
+        /// App name.
+        name: String,
+        /// The team role the worker fills.
+        #[arg(long)]
+        role: String,
+        /// Project key.
+        #[arg(long)]
+        project: String,
+    },
 }
 
 /// `cadence app …` (CAD-547). `install`/`update`/`set`/`remove` write
@@ -153,6 +167,15 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
             state_dir,
             "app_set_team",
             json!({"project": project, "name": name, "team": roles}),
+        )?,
+        AppAction::AddWorker {
+            name,
+            role,
+            project,
+        } => client::rpc(
+            state_dir,
+            "app_add_worker",
+            json!({"project": project, "name": name, "role": role}),
         )?,
     };
     print_json(&result);

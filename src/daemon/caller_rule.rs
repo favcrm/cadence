@@ -345,6 +345,10 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         "app_set_team",
         Rule::Handler("operator_connection (CAD-577)"),
     ),
+    (
+        "app_add_worker",
+        Rule::Handler("operator_connection (CAD-577)"),
+    ),
     // CAD-339: the master agent's verbs. `Shared::master_policy` runs
     // before this table for every method (the master's allowlist).
     (

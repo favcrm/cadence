@@ -1615,8 +1615,9 @@ pub fn set_team(
 
 /// The team roles an app's workflows declare: every input some step
 /// names as its `agent:` (the same set the board's drawer fills by
-/// role). Sorted, deterministic.
-fn team_roles(pm_dir: &Path, project_key: &str, name: &str) -> Result<Vec<String>> {
+/// role). Sorted, deterministic. Public so the daemon's "Add worker"
+/// can check the role it is asked to fill (CAD-577).
+pub fn team_roles(pm_dir: &Path, project_key: &str, name: &str) -> Result<Vec<String>> {
     let dir = app_dir(pm_dir, project_key, name)?;
     let mut roles: Vec<String> = Vec::new();
     for (rel, path) in bundle_files(&dir)? {

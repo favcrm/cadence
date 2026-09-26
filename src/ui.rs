@@ -2113,6 +2113,17 @@ fn write_route(
         send(request, resp);
         return;
     }
+    // "Add worker" (CAD-577) — relayed to the daemon's `app_add_worker`,
+    // operator-only on the board (see `apps`).
+    if let Some((key, name)) = apps::worker_route(path) {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let resp = apps::add_worker(&mut request, state_dir, key, name);
+        send(request, resp);
+        return;
+    }
     if let Some(id) = home::answer_route(path) {
         if *method != Method::Post {
             send(request, err_response(405, "method not allowed"));

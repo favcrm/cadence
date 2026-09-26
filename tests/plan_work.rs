@@ -1782,6 +1782,13 @@ fn app_approval_derives_grants() {
         json!({"project": "demo", "name": "roles"}),
     );
     assert_eq!(r["ok"], false, "agent approve admitted: {r}");
+    // Nor `app_add_worker` — joining a worker is the operator's too.
+    let r = pane.rpc(
+        &f.d.state,
+        "app_add_worker",
+        json!({"project": "demo", "name": "roles", "role": "publisher"}),
+    );
+    assert_eq!(r["ok"], false, "agent add_worker admitted: {r}");
 
     // A structural change since approval revokes the derived grants.
     let (ok, _) = f.cli(&[
@@ -1804,6 +1811,58 @@ fn app_approval_derives_grants() {
         grant_scopes(&f, "dev-1", "local", "local").is_none(),
         "a structural change must revoke the derived grant"
     );
+}
+
+/// CAD-577: "Add worker" joins a new Devin worker for one of the
+/// app's team roles — a unique role-prefixed alias under the operator
+/// (a group root), recorded in the app's default team. The adversarial
+/// half (an agent caller is refused) lives in `app_approval_derives_grants`.
+#[test]
+fn app_add_worker_joins_and_records_the_role() {
+    let f = PlanFixture::start();
+    // The mock tmux/devin pair, so the joined worker's pane comes up.
+    let _mock = install_mock_devin(f.tmp.path());
+    app_install_roles(&f);
+
+    // A role the app does not declare is refused before anything is
+    // registered.
+    let err =
+        f.d.operator_rpc(
+            "app_add_worker",
+            json!({"project": "demo", "name": "roles", "role": "nobody"}),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("no team role"), "{err}");
+
+    let out =
+        f.d.operator_rpc(
+            "app_add_worker",
+            json!({"project": "demo", "name": "roles", "role": "publisher"}),
+        )
+        .unwrap_or_else(|e| panic!("add worker: {e}"));
+    let alias = out["alias"].as_str().unwrap().to_string();
+    assert!(alias.starts_with("publisher-"), "prefixed alias: {out}");
+    assert_eq!(out["team"]["publisher"], json!(alias), "{out}");
+
+    // The worker is registered as a Devin pty worker with no upstream
+    // (a group root the operator owns), and it is in the app's team.
+    let show =
+        f.d.operator_rpc("agent_show", json!({"alias": alias}))
+            .unwrap();
+    assert_eq!(show["agent"]["provider"], "devin", "{show}");
+    assert_eq!(show["agent"]["endpoint_kind"], "pty", "{show}");
+    assert!(show["agent"]["params"]["upstream"].is_null(), "{show}");
+    let app = f.cli(&["app", "show", "roles", "--project", "demo"]).1;
+    assert_eq!(app["team"]["publisher"], json!(alias), "{app}");
+
+    // A second Add worker for the same role mints a different alias.
+    let out2 =
+        f.d.operator_rpc(
+            "app_add_worker",
+            json!({"project": "demo", "name": "roles", "role": "publisher"}),
+        )
+        .unwrap();
+    assert_ne!(out2["alias"], json!(alias), "unique alias: {out2}");
 }
 
 /// CAD-577: revoking an app's approval revokes exactly the grants the

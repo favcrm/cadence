@@ -494,6 +494,98 @@ impl Shared {
         Ok(out)
     }
 
+    /// CAD-577 `app_add_worker` — the operator's one-click "Add
+    /// worker": join a new Devin worker for one of the app's team
+    /// roles, under the operator (a group root — its owner resolves to
+    /// `operator`), with a unique role-prefixed alias, then record it
+    /// in the app's team. The worker launches with the same defaults
+    /// the operator's other Devin workers use (`auto_ready=verified`,
+    /// `permission_mode=dangerous`). Operator only, connection-bound
+    /// like `app approve`.
+    pub(super) fn rpc_app_add_worker(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        self.operator_connection("app add worker", params, peer_pid)?;
+        let project = required_str(params, "project")?;
+        crate::issue::model::check_key(project)?;
+        let name = required_str(params, "name")?;
+        let role = required_str(params, "role")?;
+        let pm_dir = self.pm_dir()?;
+        let projects = crate::issue::project::list(&pm_dir)?;
+        let Some(proj) = projects.iter().find(|p| p.key == project) else {
+            return Err(crate::issue::project::unknown_project(project, &pm_dir));
+        };
+        let roles = crate::issue::app::team_roles(&pm_dir, project, name)?;
+        if !roles.iter().any(|r| r == role) {
+            return Err(Error::rejected(format!(
+                "app '{name}' has no team role '{role}' — its workflows name: {}",
+                if roles.is_empty() {
+                    "none".to_string()
+                } else {
+                    roles.join(", ")
+                }
+            )));
+        }
+        // The worker's checkout: the project's first repo path. A
+        // project with no repo path cannot host a lane.
+        let cwd = proj
+            .repos
+            .iter()
+            .find_map(|r| r.path.as_deref())
+            .map(crate::issue::project::expand_home)
+            .filter(|p| p.is_dir())
+            .ok_or_else(|| {
+                Error::rejected(format!(
+                    "project '{project}' names no repo path — a worker needs a \
+                     checkout; add one with `cadence issue project`"
+                ))
+            })?;
+        let alias = self.unique_worker_alias(role)?;
+        // Register + launch through the ordinary path — the board's
+        // proven operator is the caller, so `authorize_register` admits
+        // it. No `upstream`: the worker is a group root the operator
+        // owns (`inbox::owner_of` answers `operator`).
+        let register = json!({
+            "alias": alias,
+            "provider": "devin",
+            "endpoint_kind": "pty",
+            "role": "worker",
+            "cwd": cwd.to_string_lossy(),
+            "params": json!({"auto_ready": "verified",
+                               "permission_mode": "dangerous"}).to_string(),
+        });
+        self.rpc_register(&register, peer_pid)?;
+        // Record the new worker in the app's team for that role — the
+        // operator's own write, so the New post drawer pre-fills it.
+        let pm = self.pm_at(&pm_dir)?;
+        let out = crate::issue::app::set_team(
+            &pm,
+            project,
+            name,
+            &[format!("{role}={alias}")],
+            &self.state_dir,
+            "operator",
+        )?;
+        self.reconcile_app_grants(project, name);
+        self.wake();
+        Ok(json!({"alias": alias, "role": role, "team": out["team"]}))
+    }
+
+    /// A unique role-prefixed worker alias (`<role>-<6 hex>`) — the
+    /// prefix names the role, the suffix keeps it unique (CAD-577).
+    fn unique_worker_alias(&self, role: &str) -> Result<String> {
+        for _ in 0..32 {
+            let suffix = uuid::Uuid::new_v4().simple().to_string();
+            let alias = format!("{role}-{}", &suffix[..6]);
+            if self.store.agent_opt(&alias)?.is_none() {
+                return Ok(alias);
+            }
+        }
+        Err(Error::internal("could not mint a unique worker alias"))
+    }
+
     /// Reconcile one app's derived grants with its current approval
     /// (CAD-577): if the installed digest still matches the operator's
     /// `app_approved` record, re-derive the grants from the workflow

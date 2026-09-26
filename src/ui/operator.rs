@@ -164,6 +164,9 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     // is an operator-only write, attributed to the board's proven
     // connection by the daemon.
     route("POST", "/api/apps/*/*/team", RouteClass::OperatorOnly),
+    // CAD-577: the board relays `app_add_worker` — joining a new worker
+    // for one team role is the operator's, like the team write itself.
+    route("POST", "/api/apps/*/*/worker", RouteClass::OperatorOnly),
     route("POST", "/api/memories/*/*/accept", RouteClass::Refused),
     route("POST", "/api/memories/*/*/reject", RouteClass::Refused),
     route("POST", "/api/session", RouteClass::Session),
@@ -1292,6 +1295,16 @@ mod tests {
         // An app approval is the operator's, like the plan's.
         assert_eq!(
             route_class("POST", "/api/apps/demo/studio/approve"),
+            RouteClass::OperatorOnly
+        );
+        // The app's default team and "Add worker" are the operator's too
+        // (CAD-577).
+        assert_eq!(
+            route_class("POST", "/api/apps/demo/studio/team"),
+            RouteClass::OperatorOnly
+        );
+        assert_eq!(
+            route_class("POST", "/api/apps/demo/studio/worker"),
             RouteClass::OperatorOnly
         );
         assert_eq!(
