@@ -1620,3 +1620,124 @@ fn plan_renders_the_5_script() {
         assert!(text.contains(expected), "plan missing {expected:?}\n{text}");
     }
 }
+
+// ---------- CAD-560 rev-306b follow-ups: the sticky-dir grant, the
+// NOSYSTEM bool, and the git child's bound ----------
+
+#[test]
+fn sticky_dir_pending_grant_reaches_only_a_missing_tail() {
+    // A write grant on a *sticky* dir (`0o1777`, the /tmp shape) is
+    // `Grant::Pending`: the agent can plant NEW names under it but
+    // cannot unlink the children already there. The pin is two-sided
+    // — Pending→No would silently miss the plantable tail, and
+    // Pending→Yes would flag a child the sticky bit actually
+    // protects. A `GIT_CONFIG_SYSTEM` value under the dir turns each
+    // resolve decision into a row verdict.
+    let (_lane, mut host) = provisioned_fresh();
+    host.seed_dir("/sticky", 0, 0, 0o1777);
+    host.env
+        .insert("GIT_CONFIG_SYSTEM".into(), "/sticky/gitconfig".into());
+    assert_eq!(
+        row(&audit(&host), "git-config").level,
+        Level::Fail,
+        "a plantable name under a sticky grant must fail closed"
+    );
+
+    // The existing child is protected — Pending's reach lapses on it,
+    // so a root-owned file under the same sticky dir stays clean.
+    let (_lane, mut host) = provisioned_fresh();
+    host.seed_dir("/sticky", 0, 0, 0o1777);
+    host.seed_file("/sticky/gitconfig", 0, 0, 0o644, b"[user]\n\tname = Op\n");
+    host.env
+        .insert("GIT_CONFIG_SYSTEM".into(), "/sticky/gitconfig".into());
+    assert_eq!(
+        row(&audit(&host), "git-config").level,
+        Level::Ok,
+        "the sticky bit protects existing children — Pending cannot reach them"
+    );
+
+    // Control: the same grant WITHOUT the sticky bit is an outright
+    // Yes — under a `0o0777` dir the agent unlinks and replaces the
+    // existing child, so the file is agent-written config.
+    let (_lane, mut host) = provisioned_fresh();
+    host.seed_dir("/plain", 0, 0, 0o0777);
+    host.seed_file("/plain/gitconfig", 0, 0, 0o644, b"[user]\n\tname = Op\n");
+    host.env
+        .insert("GIT_CONFIG_SYSTEM".into(), "/plain/gitconfig".into());
+    assert_eq!(
+        row(&audit(&host), "git-config").level,
+        Level::Fail,
+        "a non-sticky world-writable parent must reach its existing children"
+    );
+}
+
+#[test]
+fn git_config_nosystem_is_a_git_bool() {
+    // GIT_CONFIG_NOSYSTEM is parsed the way git parses it — a
+    // *boolean* (`git_env_bool`/`git_parse_maybe_bool`): "0", "false",
+    // "no", "off" mean the system file IS read. A presence-only check
+    // skips `/etc/gitconfig` exactly when git reads it — a planted
+    // `safe.directory` would sail past the audit. Only a definite
+    // true may skip; an empty or unparsable value is audited
+    // (fail-closed — a file git might read can never hide a finding).
+    let hostile = "[safe]\n\tdirectory = /var/lib/cadence\n";
+    for v in ["0", "false", "no", "off", "False", "", "banana"] {
+        let (_lane, mut host) = provisioned_fresh();
+        host.write_file("/etc/gitconfig", hostile);
+        host.env.insert("GIT_CONFIG_NOSYSTEM".into(), v.into());
+        assert_eq!(
+            row(&audit(&host), "git-config").level,
+            Level::Fail,
+            "GIT_CONFIG_NOSYSTEM={v:?}: the system file is read — its contents must be audited"
+        );
+    }
+    // A definite true DOES skip it: git never opens the file, so a
+    // hostile /etc/gitconfig under `=1` is inert and the row is clean.
+    for v in ["1", "true", "yes", "on"] {
+        let (_lane, mut host) = provisioned_fresh();
+        host.write_file("/etc/gitconfig", hostile);
+        host.env.insert("GIT_CONFIG_NOSYSTEM".into(), v.into());
+        assert_eq!(
+            row(&audit(&host), "git-config").level,
+            Level::Ok,
+            "GIT_CONFIG_NOSYSTEM={v:?}: git skips the system file — auditing it is a false positive"
+        );
+    }
+}
+
+#[test]
+fn git_config_child_times_out_instead_of_hanging() {
+    // The audit spawns `git config --list` on every candidate file as
+    // root; without a bound a wedged child hangs the audit forever.
+    // A stub "git" that sleeps proves the deadline kills, reaps and
+    // errors — `scan_git_file` folds any `git_config` error into
+    // `unverified`, so the row fails closed.
+    let lane = Lane::new();
+    let stub = lane.dir.path().join("stub-git");
+    std::fs::write(&stub, "#!/bin/sh\nexec sleep 5\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let cfg = lane.dir.path().join("cfg");
+    std::fs::write(&cfg, b"[user]\n\tname = Op\n").unwrap();
+    let start = std::time::Instant::now();
+    let err = cadence_agent::agent_uid::git_config_file_timed(
+        &stub,
+        &cfg,
+        "/stub",
+        std::time::Duration::from_millis(250),
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::TimedOut,
+        "the timeout must surface as an error, not a hang: {err}"
+    );
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(4),
+        "the child sleeps 5s — returning in {:?} means the deadline killed and reaped it",
+        start.elapsed()
+    );
+}

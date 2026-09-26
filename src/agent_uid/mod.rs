@@ -30,6 +30,7 @@ pub mod runbook;
 use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
@@ -70,6 +71,12 @@ pub const HOME_ACL_WALK_BUDGET: usize = 100_000;
 /// targets) are attacker-influenceable files read as root: never more
 /// than this many bytes, never a fifo, never through a symlink.
 pub const READ_CAP: u64 = 1 << 20;
+
+/// Hard bound on the git child the audit spawns — it runs as root and
+/// a wedged child must fail the row (unverified), never hang the
+/// audit. `git config --list` on a ≤`READ_CAP` file is sub-second on
+/// a sane host; ten seconds is already generous.
+const GIT_CHILD_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A passwd entry, resolved through the view.
 #[derive(Clone, Debug)]
@@ -327,16 +334,30 @@ fn command(prog: &str, args: &[&str]) -> io::Result<()> {
 /// not), evaluates no `core.fsmonitor`/`core.pager` (not a tty, not
 /// a worktree command), and executes no config value.
 fn git_config_file(phys: &Path, logical: &str) -> io::Result<Vec<(String, String)>> {
+    let git = ["/usr/bin/git", "/bin/git", "/usr/local/bin/git"]
+        .iter()
+        .find(|p| Path::new(p).is_file())
+        .map(Path::new)
+        .ok_or_else(|| {
+            io::Error::other("no git binary at a trusted path — config cannot be verified")
+        })?;
+    git_config_file_timed(git, phys, logical, GIT_CHILD_TIMEOUT)
+}
+
+/// `git_config_file` with the child bound explicit so the timeout is
+/// testable — a stub "git" that sleeps proves expiry kills, reaps and
+/// errors instead of hanging the audit.
+#[doc(hidden)]
+pub fn git_config_file_timed(
+    git: &Path,
+    phys: &Path,
+    logical: &str,
+    timeout: Duration,
+) -> io::Result<Vec<(String, String)>> {
     let f = bounded_open(phys, logical)?;
     // The pre-open length is a snapshot — re-check after git reads,
     // so a grow-during-parse can't smuggle past the cap.
     let checked = f.try_clone()?;
-    let git = ["/usr/bin/git", "/bin/git", "/usr/local/bin/git"]
-        .iter()
-        .find(|p| Path::new(p).is_file())
-        .ok_or_else(|| {
-            io::Error::other("no git binary at a trusted path — config cannot be verified")
-        })?;
     let mut cmd = std::process::Command::new(git);
     cmd.args([
         "config",
@@ -360,8 +381,27 @@ fn git_config_file(phys: &Path, logical: &str) -> io::Result<Vec<(String, String
     .stdout(std::process::Stdio::piped())
     .stderr(std::process::Stdio::piped());
     // `reaper::output` forces stdin to null — spawn + wait directly so
-    // the vetted fd stays git's stdin.
-    let out = crate::reaper::spawn(&mut cmd)?.wait_with_output()?;
+    // the vetted fd stays git's stdin. `wait_with_output` has no
+    // bound: poll the status and, at the deadline, kill the child and
+    // drain + reap it so neither a zombie nor buffered output leaks.
+    // The audit runs as root — a wedged child must fail the row, not
+    // hang the whole sweep.
+    let mut child = crate::reaper::spawn(&mut cmd)?;
+    let deadline = std::time::Instant::now() + timeout;
+    let out = loop {
+        match child.try_wait()? {
+            Some(_) => break child.wait_with_output(),
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait_with_output();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("git config --file {logical}: exceeded the {timeout:?} child bound"),
+                ));
+            }
+            None => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }?;
     if checked.metadata().map(|m| m.len()).unwrap_or(u64::MAX) > READ_CAP {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
