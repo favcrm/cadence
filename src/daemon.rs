@@ -12,8 +12,7 @@
 //! stay in `attention` until a human reconciles them.
 
 // CAD-534: split root — the RPC handlers live in src/daemon/<area>.rs;
-// the item→file map is src/daemon/split-map.toml
-// (scripts/split-daemon regenerates both). The core stays here:
+// The one-shot generator was retired in CAD-621. The core stays here:
 // the `Shared` struct, the actor loop / wake / lifecycle, the
 // constants, the RPC dispatch and the test suites.
 
