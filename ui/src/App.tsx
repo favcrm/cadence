@@ -483,7 +483,12 @@ export default function App() {
         </button>
       </div>
     )}
-    <div className="grid lg:grid-cols-[208px_minmax(0,1fr)] min-h-screen bg-ink-900">
+    <div
+      data-app-shell
+      className={`grid lg:grid-cols-[208px_minmax(0,1fr)] bg-ink-900 ${
+        screen === "home" ? "h-[100dvh] overflow-hidden" : "min-h-screen"
+      }`}
+    >
       <Sidebar
         screen={screen}
         navHref={hrefFor}
@@ -495,7 +500,12 @@ export default function App() {
         signedIn={meta?.signed_in ?? null}
       />
 
-      <div className="min-w-0 flex flex-col">
+      {/* CAD-600: Home is a full-height panel. The shell above is
+          exactly the dynamic viewport (`100dvh`, overflow hidden) so
+          mobile browser chrome cannot make `100vh` scroll the page
+          while this column stays `100dvh`. Every other screen keeps
+          `min-h-screen` on that shell and the natural document flow. */}
+      <div className={`min-w-0 flex flex-col ${screen === "home" ? "h-[100dvh] min-h-0" : ""}`}>
         <header className="sticky top-0 z-10 h-[2.85rem] flex items-center gap-3 px-4 lg:px-8 border-b border-ink-700 bg-ink-900/95 backdrop-blur">
           <button
             onClick={() => setMenuOpen((o) => !o)}
