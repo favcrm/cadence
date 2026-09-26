@@ -599,7 +599,10 @@ impl Shared {
         };
         let key = crate::issue::app::approval_key(project, name);
         if !crate::issue::app::is_installed(&pm_dir, project, name) {
-            if let Ok(changed) = self.store.app_grants_reconcile(&key, None, &[], "operator") {
+            if let Ok(changed) = self
+                .store
+                .app_grants_reconcile(&key, None, "", &[], "operator")
+            {
                 self.drain_effect_scopes(changed);
             }
             return;
@@ -607,6 +610,7 @@ impl Shared {
         let Ok(digest) = crate::issue::app::digest(&pm_dir, project, name) else {
             return;
         };
+        let install_id = crate::issue::app::current_install_id(&pm_dir, project, name);
         let Ok(derived) = crate::issue::app::derive_grants(&pm_dir, project, name) else {
             return;
         };
@@ -621,36 +625,95 @@ impl Shared {
                 )
             })
             .collect();
-        if let Ok(changed) =
-            self.store
-                .app_grants_reconcile(&key, Some(digest.as_str()), &grants, "operator")
-        {
+        if let Ok(changed) = self.store.app_grants_reconcile(
+            &key,
+            Some(digest.as_str()),
+            &install_id,
+            &grants,
+            "operator",
+        ) {
             self.drain_effect_scopes(changed);
         }
     }
 
-    /// Revoke derived grants whose app folder is gone (CAD-577). A
-    /// removal that raced a propose, or a folder deleted by hand, leaves
-    /// `app_grants` rows nothing else would notice. The same write
-    /// records a withdrawn approval: dropping the rows alone leaves a
-    /// reinstall of the same digest already approved.
+    /// Withdraw approvals and derived grants that do not belong to the
+    /// current install (CAD-577). One rule, under the tracker write lock
+    /// from the installed check through the store write: an `app_grants`
+    /// row or a live approval whose `install_id` is not the current
+    /// record's id — or whose app folder is gone — is revoked. The lock
+    /// is the same one approve holds, taken first, so an approve cannot
+    /// commit into the gap. A missing or empty id never counts as current.
     fn sweep_removed_app_grants(&self) {
         let Ok(pm_dir) = self.pm_dir() else {
             return;
         };
-        let Ok(apps) = self.store.app_grants_apps() else {
+        let Ok(pm) = self.pm_at(&pm_dir) else {
             return;
         };
-        for key in apps {
+        let Ok(_lock) = pm.lock() else {
+            return;
+        };
+        let Ok(grant_rows) = self.store.app_grant_installs() else {
+            return;
+        };
+        let Ok(approvals) = self.store.app_approvals() else {
+            return;
+        };
+        let mut keys: Vec<String> = grant_rows.iter().map(|(app, _)| app.clone()).collect();
+        for key in approvals.keys() {
+            if !keys.iter().any(|k| k == key) {
+                keys.push(key.clone());
+            }
+        }
+        keys.sort();
+        for key in keys {
             let Some((project, name)) = key.split_once('/') else {
                 continue;
             };
-            if crate::issue::app::is_installed(&pm_dir, project, name) {
+            let installed = crate::issue::app::is_installed(&pm_dir, project, name);
+            let current = if installed {
+                crate::issue::app::current_install_id(&pm_dir, project, name)
+            } else {
+                String::new()
+            };
+            let approval = approvals.get(&key);
+            let live =
+                approval.is_some_and(|p| p.get("revoked").and_then(Value::as_bool) != Some(true));
+            let approval_id = approval
+                .and_then(|p| p.get("install_id"))
+                .and_then(Value::as_str);
+            let approval_binds =
+                live && installed && !current.is_empty() && approval_id == Some(current.as_str());
+            let grant_ids: Vec<&str> = grant_rows
+                .iter()
+                .filter(|(app, _)| app == &key)
+                .map(|(_, id)| id.as_str())
+                .collect();
+            let stale_grants = grant_ids
+                .iter()
+                .any(|id| !installed || current.is_empty() || *id != current.as_str());
+            if approval_binds && !stale_grants {
+                continue;
+            }
+            if !live && grant_ids.is_empty() {
+                continue;
+            }
+            // A binding approval stays. Only the rows from another
+            // install are subtracted, so the gate's approval is not
+            // withdrawn by a leftover grant.
+            if approval_binds {
+                if let Ok(changed) = self
+                    .store
+                    .app_grants_drop_other_installs(&key, &current, "operator")
+                {
+                    self.drain_effect_scopes(changed);
+                }
                 continue;
             }
             let payload = json!({
                 "project": project,
                 "name": name,
+                "install_id": current,
                 "digest": Value::Null,
                 "revoked": true,
                 "by": "operator",
@@ -788,6 +851,7 @@ impl Shared {
             ))
         })?;
         let digest = crate::issue::app::digest(&pm_dir, project, name)?;
+        let install_id = crate::issue::app::ensure_install_id(&pm, project, name, "operator")?;
         // CAD-577: the operator's one Approve derives the app's grants —
         // exactly the scopes its workflow steps declare on their bound
         // slots, to the agents the app's default team assigns those
@@ -809,6 +873,7 @@ impl Shared {
         let payload = json!({
             "project": project,
             "name": name,
+            "install_id": install_id,
             "digest": digest,
             "by": "operator",
             "at": crate::issue::time::iso(crate::issue::time::now_epoch()),

@@ -103,12 +103,20 @@ pub struct Manifest {
 /// explicit unbind and an absent slot is the `local` default. `team`
 /// (CAD-577) is the app's default team — one agent alias per workflow
 /// input role — an operator-only write that is NOT part of the gate
-/// digest (a team change never re-requires approval).
+/// digest (a team change never re-requires approval). `install_id`
+/// (CAD-577) is minted fresh on every install and kept across `app
+/// update`. Approvals and derived grants bind to it: a missing id, or
+/// one from a previous install of the same bytes, is not a match.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Record {
     pub schema: u32,
     pub app: String,
+    /// This install's id. Empty on a record written before install ids
+    /// existed — that never matches an approval, so the operator
+    /// re-approves once.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub install_id: String,
     pub source: Source,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub bindings: BTreeMap<String, Option<String>>,
@@ -827,33 +835,98 @@ pub fn approval_key(project: &str, name: &str) -> String {
     format!("{project}/{name}")
 }
 
+/// A fresh id for one install. `app update` keeps whatever install
+/// already wrote; remove deletes the record, so the next install mints
+/// another.
+fn mint_install_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+/// The install id on the record, or empty when the record has none
+/// (a pre-install-id yaml) or cannot be read.
+pub fn current_install_id(pm_dir: &Path, project: &str, name: &str) -> String {
+    read_record(pm_dir, project, name)
+        .map(|r| r.install_id)
+        .unwrap_or_default()
+}
+
+/// Give a legacy record an install id and commit it. The caller already
+/// holds `pm`'s write lock. A record that already has an id is unchanged.
+pub fn ensure_install_id(pm: &Pm, project: &str, name: &str, actor: &str) -> Result<String> {
+    let mut record = read_record(&pm.dir, project, name)?;
+    if !record.install_id.is_empty() {
+        return Ok(record.install_id);
+    }
+    record.install_id = mint_install_id();
+    let path = record_file(&pm.dir, project, name)?;
+    write_record(&path, &record)?;
+    write::commit(
+        pm,
+        &[path],
+        &format!("{project}/{DIR}/{name}: install id assigned"),
+        &[],
+        actor,
+    )?;
+    Ok(record.install_id)
+}
+
+/// An approval covers this install: not withdrawn, the digest is the
+/// one just computed, and `install_id` is the current record's id.
+/// A missing or empty id never matches — an approval from before
+/// install ids, or from a previous install of the same bytes, does not
+/// carry over.
+pub fn approval_binds(payload: &Value, digest: &str, install_id: &str) -> bool {
+    if install_id.is_empty() {
+        return false;
+    }
+    if payload.get("revoked").and_then(Value::as_bool) == Some(true) {
+        return false;
+    }
+    payload.get("digest").and_then(Value::as_str) == Some(digest)
+        && payload.get("install_id").and_then(Value::as_str) == Some(install_id)
+}
+
 /// The Apps board's approval word (CAD-557) — why `approved` is false:
-/// `approved`, `changed` (a record exists but the digest moved — any
-/// bundle or binding edit re-gates the app), `unapproved` (no record),
-/// or `unknown` (the approval store did not read — never shown granted).
-fn approval_state(approvals: Option<&Map<String, Value>>, key: &str, digest: &str) -> &'static str {
+/// `approved`, `changed` (this install's record exists but the digest
+/// moved — any bundle or binding edit re-gates the app), `unapproved`
+/// (no record, or the record belongs to another install), or `unknown`
+/// (the approval store did not read — never shown granted).
+fn approval_state(
+    approvals: Option<&Map<String, Value>>,
+    key: &str,
+    digest: &str,
+    install_id: &str,
+) -> &'static str {
     let Some(approvals) = approvals else {
         return "unknown";
     };
     match approvals.get(key) {
-        Some(p) if p["digest"].as_str() == Some(digest) => "approved",
-        Some(_) => "changed",
+        Some(p) if approval_binds(p, digest, install_id) => "approved",
+        Some(p)
+            if !install_id.is_empty()
+                && p.get("revoked").and_then(Value::as_bool) != Some(true)
+                && p.get("install_id").and_then(Value::as_str) == Some(install_id) =>
+        {
+            "changed"
+        }
+        Some(_) => "unapproved",
         None => "unapproved",
     }
 }
 
-/// Is `digest` the approved digest for `project/app`? An unreachable
-/// daemon is no approval — fail closed, like `plan propose` refusing.
+/// Is `digest` the approved digest for this install of `project/app`?
+/// An unreachable daemon is no approval — fail closed, like `plan
+/// propose` refusing. A missing install id is not a match.
 pub fn approved(
     project: &str,
     name: &str,
     digest: &str,
+    install_id: &str,
     approvals: Option<&Map<String, Value>>,
 ) -> bool {
     approvals
         .and_then(|a| a.get(&approval_key(project, name)))
-        .and_then(|p| p["digest"].as_str())
-        == Some(digest)
+        .is_some_and(|p| approval_binds(p, digest, install_id))
 }
 
 /// `<app>/<workflow>` → both parts, tag-shaped; `None` for a bare name
@@ -1063,6 +1136,7 @@ pub fn install(
     let record = Record {
         schema: 1,
         app: name.clone(),
+        install_id: mint_install_id(),
         source: src.clone(),
         bindings: BTreeMap::new(),
         team: BTreeMap::new(),
@@ -1103,6 +1177,7 @@ pub fn install(
             .strip_prefix("workflows/").and_then(|n| n.strip_suffix(".md"))
             .map(str::to_string)).collect::<Vec<_>>(),
         "digest": digest,
+        "install_id": record.install_id,
         "approved": false,
         "note": "unapproved — nothing in the app runs until the operator's \
                  `cadence app approve`",
@@ -1276,6 +1351,11 @@ pub fn update(
     let mut record = record;
     record.source = src;
     record.bindings = bindings;
+    // A legacy record has no id. Mint once here so later updates keep
+    // it; an approval that predates install ids still does not match.
+    if record.install_id.is_empty() {
+        record.install_id = mint_install_id();
+    }
     record.updated_at = Some(crate::issue::time::iso(crate::issue::time::now_epoch()));
     let record_path = record_file(&pm.dir, project_key, name)?;
     write_record(&record_path, &record)?;
@@ -1292,7 +1372,13 @@ pub fn update(
     )?;
     let digest = digest(&pm.dir, project_key, name)?;
     let approvals = fetch_approvals(state_dir);
-    let approved = approved(project_key, name, &digest, approvals.as_ref());
+    let approved = approved(
+        project_key,
+        name,
+        &digest,
+        &record.install_id,
+        approvals.as_ref(),
+    );
     let mut out = json!({
         "project": project_key,
         "name": name,
@@ -1432,26 +1518,33 @@ fn derived_grant_holders(project_key: &str, name: &str, state_dir: &Path) -> Res
 /// (CAD-577). The caller holds the tracker write lock across this read,
 /// the side write, and the folder delete — tracker lock, then sqlite,
 /// the same order as approve. A missing store means there is nothing to
-/// revoke. If the holders are still there and the side write fails,
-/// removal refuses — deleting the folder first would leave a grant
-/// nothing can name.
+/// revoke. The withdrawal is by `install_id` and happens even when the
+/// approval derived no grant rows — an empty holder list used to leave
+/// the approval in place. If the store exists but cannot be read,
+/// removal refuses.
 fn revoke_derived_on_remove(
     project_key: &str,
     name: &str,
+    install_id: &str,
     state_dir: &Path,
     actor: &str,
 ) -> Result<()> {
-    let holders = derived_grant_holders(project_key, name, state_dir)?;
-    if holders.is_empty() {
+    let db = state_dir.join("cadence.sqlite3");
+    if !db.exists() {
         return Ok(());
     }
-    let db = state_dir.join("cadence.sqlite3");
+    // Fail closed: a store that exists but cannot be read is not "no
+    // holders". The read runs even when it returns an empty list.
+    let holders = derived_grant_holders(project_key, name, state_dir)?;
     let refuse = |why: &str| {
+        let what = if holders.is_empty() {
+            "its approval".to_string()
+        } else {
+            format!("the grants its approval derived ({})", holders.join(", "))
+        };
         Error::rejected(format!(
-            "app '{name}' still holds the grants its approval derived ({}) — \
-             revoke them first (`cadence app revoke {name} --project \
-             {project_key}`): {why}",
-            holders.join(", ")
+            "app '{name}' still holds {what} — revoke them first \
+             (`cadence app revoke {name} --project {project_key}`): {why}"
         ))
     };
     let store = crate::store::Store::open_side(&db).map_err(|e| refuse(&e.to_string()))?;
@@ -1459,6 +1552,7 @@ fn revoke_derived_on_remove(
     let payload = json!({
         "project": project_key,
         "name": name,
+        "install_id": install_id,
         "digest": Value::Null,
         "revoked": true,
         "by": by,
@@ -1502,7 +1596,8 @@ pub fn remove(
     // folder delete. Approve takes this lock and then writes sqlite;
     // reading holders first lets that approve commit into the gap.
     let _lock = pm.lock()?;
-    revoke_derived_on_remove(project_key, name, state_dir, actor)?;
+    let install_id = current_install_id(&pm.dir, project_key, name);
+    revoke_derived_on_remove(project_key, name, &install_id, state_dir, actor)?;
     std::fs::remove_dir_all(&dir)?;
     if record_path.exists() {
         std::fs::remove_file(&record_path)?;
@@ -1613,7 +1708,13 @@ pub fn set(
         "name": name,
         "bindings": effective,
         "digest": digest,
-        "approved": approved(project_key, name, &digest, approvals.as_ref()),
+        "approved": approved(
+            project_key,
+            name,
+            &digest,
+            &record.install_id,
+            approvals.as_ref(),
+        ),
         "committed": true,
         "warnings": warnings,
     });
@@ -2149,10 +2250,15 @@ fn describe(
         Ok(d) => {
             row["digest"] = json!(d);
             row["approved"] = match approvals {
-                Some(a) => json!(approved(project, name, &d, Some(a))),
+                Some(a) => json!(approved(project, name, &d, &record.install_id, Some(a))),
                 None => json!("unknown — daemon unreachable"),
             };
-            row["approval"] = json!(approval_state(approvals, &approval_key(project, name), &d));
+            row["approval"] = json!(approval_state(
+                approvals,
+                &approval_key(project, name),
+                &d,
+                &record.install_id,
+            ));
         }
         Err(e) => row["error"] = json!(e.to_string()),
     }
@@ -2286,8 +2392,7 @@ pub fn plan_text(
     let digest = digest_over(pm_dir, project, app, &[(rel.as_str(), text.as_str())])?;
     let ok = app_approvals
         .get(&approval_key(project, app))
-        .and_then(|p| p["digest"].as_str())
-        == Some(digest.as_str());
+        .is_some_and(|p| approval_binds(p, digest.as_str(), &record.install_id));
     if !ok {
         return Err(Error::invalid(
             "app_unapproved",
@@ -2361,9 +2466,10 @@ pub fn board_rows(pm_dir: &Path, project: &str, state_dir: &Path) -> Vec<Value> 
         let checked = check_installed(pm_dir, project, &name, &agents, &agent_sources)
             .map_err(|e| e.to_string());
         let app_digest = digest(pm_dir, project, &name);
+        let install_id = current_install_id(pm_dir, project, &name);
         let approved = match &app_digest {
             Ok(d) => match &approvals {
-                Some(a) => json!(approved(project, &name, d, Some(a))),
+                Some(a) => json!(approved(project, &name, d, &install_id, Some(a))),
                 None => json!("unknown — daemon unreachable"),
             },
             Err(_) => Value::Null,

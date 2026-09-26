@@ -2356,7 +2356,10 @@ fn install_id_hand_delete_sweep_withdraws_approval() {
     std::fs::remove_file(apps.join("roles.yaml")).unwrap();
 
     let swept = propose_roles(&f);
-    assert!(swept.is_err(), "propose of a removed app must fail: {swept:?}");
+    assert!(
+        swept.is_err(),
+        "propose of a removed app must fail: {swept:?}"
+    );
     let approval = latest_roles_approval(&f);
     assert_eq!(
         approval["revoked"], true,
@@ -2420,7 +2423,10 @@ fn install_id_update_keeps_id_and_regates_structure() {
 
     let src = f.tmp.path().join("app-roles/app.md");
     let md = std::fs::read_to_string(&src).unwrap();
-    let wording = md.replace("version: 0.1.0\n", "version: 0.1.0\nsummary: A quiet note.\n");
+    let wording = md.replace(
+        "version: 0.1.0\n",
+        "version: 0.1.0\nsummary: A quiet note.\n",
+    );
     assert_ne!(wording, md);
     std::fs::write(&src, &wording).unwrap();
     let (ok, out) = f.cli(&["app", "update", "roles", "--project", "demo"]);

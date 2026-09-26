@@ -390,10 +390,10 @@
         let grants = publish_grant();
         s.record_app_approval(json!({
             "project": "demo", "name": "roles",
-            "digest": "sha256:abc", "by": "operator",
+            "digest": "sha256:abc", "install_id": "inst", "by": "operator",
         }))
         .unwrap();
-        s.app_grants_set("demo/roles", &grants, "operator").unwrap();
+        s.app_grants_set("demo/roles", "inst", &grants, "operator").unwrap();
         s.app_revoke_with_record(
             json!({
                 "project": "demo", "name": "roles",
@@ -403,7 +403,7 @@
             "operator",
         )
         .unwrap();
-        s.app_grants_reconcile("demo/roles", Some("sha256:abc"), &grants, "operator")
+        s.app_grants_reconcile("demo/roles", Some("sha256:abc"), "inst", &grants, "operator")
             .unwrap();
         assert!(s
             .platform_grant("dev-1", "local", "local")
@@ -423,14 +423,14 @@
         for _ in 0..32 {
             s.record_app_approval(json!({
                 "project": "demo", "name": "roles",
-                "digest": "sha256:abc", "by": "operator",
+                "digest": "sha256:abc", "install_id": "inst", "by": "operator",
             }))
             .unwrap();
-            s.app_grants_set("demo/roles", &grants, "operator").unwrap();
+            s.app_grants_set("demo/roles", "inst", &grants, "operator").unwrap();
             let a = Arc::clone(&s);
             let g = grants.clone();
             let t1 = thread::spawn(move || {
-                a.app_grants_reconcile("demo/roles", Some("sha256:abc"), &g, "operator")
+                a.app_grants_reconcile("demo/roles", Some("sha256:abc"), "inst", &g, "operator")
                     .unwrap();
             });
             let b = Arc::clone(&s);
@@ -468,14 +468,14 @@
             "local".to_string(),
             vec!["delete".to_string(), "publish".to_string()],
         )];
-        s.app_grants_set("demo/roles", &both, "operator").unwrap();
+        s.app_grants_set("demo/roles", "inst", &both, "operator").unwrap();
         let kept = vec![(
             "dev-1".to_string(),
             "local".to_string(),
             "local".to_string(),
             vec!["publish".to_string()],
         )];
-        let changed = s.app_grants_set("demo/roles", &kept, "operator").unwrap();
+        let changed = s.app_grants_set("demo/roles", "inst", &kept, "operator").unwrap();
         assert!(
             changed
                 .iter()

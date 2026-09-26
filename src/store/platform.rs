@@ -151,6 +151,7 @@ pub(super) const SCHEMA_V17: &str = "CREATE TABLE IF NOT EXISTS platform_credent
         scopes TEXT NOT NULL,
         granted_at REAL NOT NULL,
         by TEXT NOT NULL,
+        install_id TEXT NOT NULL DEFAULT '',
         PRIMARY KEY(app, agent, platform, account));";
 
 fn scopes_json(scopes: &[String]) -> Result<String> {
@@ -190,6 +191,7 @@ fn subtract_derived(
     tx: &rusqlite::Transaction<'_>,
     app: &str,
     rows: &[(String, String, String, Vec<String>)],
+    keep_install: Option<&str>,
 ) -> Result<Vec<(String, String, String)>> {
     let mut changed = Vec::new();
     for (agent, platform, account, derived) in rows {
@@ -205,15 +207,21 @@ fn subtract_derived(
             continue;
         };
         // What another approved app still derives for the same triple.
+        // Another app's derivation still covers the scope. So does a
+        // row of THIS app that belongs to `keep_install` — used when
+        // dropping a previous install's rows without taking the current
+        // install's scopes with them. `None` is the whole-app revoke:
+        // no row of this app counts.
         let still: Vec<String> = {
             let mut stmt = tx.prepare(
-                "SELECT scopes FROM app_grants WHERE app<>?1 AND agent=?2 \
-                 AND platform=?3 AND account=?4",
+                "SELECT scopes FROM app_grants WHERE agent=?2 AND platform=?3 \
+                 AND account=?4 AND (app<>?1 OR (?5 IS NOT NULL AND install_id=?5))",
             )?;
-            let rows = stmt.query_map(params![app, agent, platform, account], |r| {
-                let raw: String = r.get(0)?;
-                Ok(scopes_of(&raw))
-            })?;
+            let rows =
+                stmt.query_map(params![app, agent, platform, account, keep_install], |r| {
+                    let raw: String = r.get(0)?;
+                    Ok(scopes_of(&raw))
+                })?;
             rows.flatten().flatten().collect()
         };
         let kept: Vec<String> = existing
@@ -263,11 +271,17 @@ fn latest_app_approval(tx: &rusqlite::Connection, app: &str) -> Result<Option<Va
     Ok(raw.and_then(|s| serde_json::from_str(&s).ok()))
 }
 
-/// An approval still covers `digest`: not withdrawn, and the recorded
-/// digest is the one the caller just computed.
-fn approval_covers(payload: &Value, digest: &str) -> bool {
+/// An approval still covers this install: not withdrawn, the digest is
+/// the one the caller just computed, and `install_id` is that install's
+/// id. A missing or empty id never covers — a pre-install-id approval
+/// does not carry over to the record it was written against.
+fn approval_covers(payload: &Value, digest: &str, install_id: &str) -> bool {
+    if install_id.is_empty() {
+        return false;
+    }
     payload.get("revoked").and_then(Value::as_bool) != Some(true)
         && payload.get("digest").and_then(Value::as_str) == Some(digest)
+        && payload.get("install_id").and_then(Value::as_str) == Some(install_id)
 }
 
 fn grant_row(row: &rusqlite::Row) -> rusqlite::Result<Grant> {
@@ -335,6 +349,7 @@ pub(crate) type Derived = (String, String, String, Vec<String>);
 fn apply_derived(
     tx: &rusqlite::Transaction<'_>,
     app: &str,
+    install_id: &str,
     grants: &[Derived],
     by: &str,
 ) -> Result<Vec<(String, String, String)>> {
@@ -348,7 +363,7 @@ fn apply_derived(
         rows.flatten().collect()
     };
     tx.execute("DELETE FROM app_grants WHERE app=?1", params![app])?;
-    let changed = subtract_derived(tx, app, &prior)?;
+    let changed = subtract_derived(tx, app, &prior, None)?;
     if !prior.is_empty() {
         Store::event(
             tx,
@@ -372,8 +387,8 @@ fn apply_derived(
         }
         tx.execute(
             "INSERT OR REPLACE INTO app_grants
-             (app, agent, platform, account, scopes, granted_at, by)
-             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+             (app, agent, platform, account, scopes, granted_at, by, install_id)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
             params![
                 app,
                 agent,
@@ -381,7 +396,8 @@ fn apply_derived(
                 account,
                 scopes_json(&scopes)?,
                 now(),
-                by
+                by,
+                install_id
             ],
         )?;
         let existing: Option<Grant> = tx
@@ -453,7 +469,7 @@ fn revoke_derived(
         rows.flatten().collect()
     };
     tx.execute("DELETE FROM app_grants WHERE app=?1", params![app])?;
-    let changed = subtract_derived(tx, app, &rows)?;
+    let changed = subtract_derived(tx, app, &rows, None)?;
     for (agent, platform, account, derived) in &rows {
         Store::event(
             tx,
@@ -970,12 +986,13 @@ impl Store {
     pub fn app_grants_set(
         &self,
         app: &str,
+        install_id: &str,
         grants: &[(String, String, String, Vec<String>)],
         by: &str,
     ) -> Result<Vec<(String, String, String)>> {
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
-        let changed = apply_derived(&tx, app, grants, by)?;
+        let changed = apply_derived(&tx, app, install_id, grants, by)?;
         tx.commit()?;
         Ok(changed)
     }
@@ -988,15 +1005,20 @@ impl Store {
         &self,
         app: &str,
         digest: Option<&str>,
+        install_id: &str,
         grants: &[Derived],
         by: &str,
     ) -> Result<Vec<(String, String, String)>> {
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
         let approval = latest_app_approval(&tx, app)?;
-        let live = digest.is_some_and(|d| approval.as_ref().is_some_and(|p| approval_covers(p, d)));
+        let live = digest.is_some_and(|d| {
+            approval
+                .as_ref()
+                .is_some_and(|p| approval_covers(p, d, install_id))
+        });
         let changed = if live {
-            apply_derived(&tx, app, grants, by)?
+            apply_derived(&tx, app, install_id, grants, by)?
         } else {
             revoke_derived(&tx, app, by)?
         };
@@ -1016,8 +1038,13 @@ impl Store {
     ) -> Result<Vec<(String, String, String)>> {
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
+        let install_id = approval
+            .get("install_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         Self::event(&tx, APPROVAL_STREAM, APP_APPROVED_EVENT, approval)?;
-        let changed = apply_derived(&tx, app, grants, by)?;
+        let changed = apply_derived(&tx, app, &install_id, grants, by)?;
         tx.commit()?;
         Ok(changed)
     }
@@ -1047,6 +1074,63 @@ impl Store {
         let conn = self.conn();
         let mut stmt = conn.prepare("SELECT DISTINCT app FROM app_grants ORDER BY app")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.flatten().collect())
+    }
+
+    /// Drop grant rows for `app` whose install id is not `install_id`,
+    /// subtracting only scopes the kept install (or another app) does
+    /// not still derive. The approval event is left alone — the caller
+    /// uses this when that approval already binds to `install_id`.
+    pub(crate) fn app_grants_drop_other_installs(
+        &self,
+        app: &str,
+        install_id: &str,
+        by: &str,
+    ) -> Result<Vec<(String, String, String)>> {
+        let conn = self.write_conn()?;
+        let tx = conn.unchecked_transaction()?;
+        let rows: Vec<Derived> = {
+            let mut stmt = tx.prepare(
+                "SELECT agent, platform, account, scopes FROM app_grants \
+                 WHERE app=?1 AND install_id<>?2",
+            )?;
+            let mapped = stmt.query_map(params![app, install_id], |r| {
+                let scopes: String = r.get(3)?;
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, scopes_of(&scopes)))
+            })?;
+            mapped.flatten().collect()
+        };
+        if rows.is_empty() {
+            tx.commit()?;
+            return Ok(Vec::new());
+        }
+        tx.execute(
+            "DELETE FROM app_grants WHERE app=?1 AND install_id<>?2",
+            params![app, install_id],
+        )?;
+        let changed = subtract_derived(&tx, app, &rows, Some(install_id))?;
+        for (agent, platform, account, derived) in &rows {
+            Store::event(
+                &tx,
+                PLATFORM_STREAM,
+                APP_GRANTS_REVOKED_EVENT,
+                json!({"app": app, "agent": agent, "platform": platform,
+                       "account": account, "scopes": derived, "by": by,
+                       "install_id": install_id}),
+            )?;
+        }
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    /// Every derived-grant row's `(app, install_id)`. The sweep uses
+    /// this to find a grant whose install is no longer the current one,
+    /// including a row whose approval derived nothing else to list.
+    pub fn app_grant_installs(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare("SELECT DISTINCT app, install_id FROM app_grants ORDER BY app")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         Ok(rows.flatten().collect())
     }
 

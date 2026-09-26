@@ -543,6 +543,29 @@ impl Store {
             )?;
             tx.commit()?;
         }
+        if version < 19 {
+            // v19: `app_grants.install_id` (CAD-577) — the install a
+            // derived grant belongs to. Empty on rows written before
+            // install ids; those never match the current install, so
+            // the sweep withdraws them and the operator re-approves
+            // once. Column check so a half-applied alter converges.
+            let columns: Vec<String> = conn
+                .prepare("PRAGMA table_info(app_grants)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .filter_map(std::result::Result::ok)
+                .collect();
+            let tx = conn.unchecked_transaction()?;
+            if !columns.iter().any(|column| column == "install_id") {
+                tx.execute_batch(
+                    "ALTER TABLE app_grants ADD COLUMN install_id TEXT NOT NULL DEFAULT ''",
+                )?;
+            }
+            tx.execute(
+                "UPDATE schema_version SET version=?1",
+                [crate::rollout::SCHEMA_VERSION],
+            )?;
+            tx.commit()?;
+        }
         if let Some(crossing) = permit.crossing {
             Self::event(
                 &conn,

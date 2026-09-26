@@ -584,7 +584,7 @@
         }
         assert_eq!(
             crate::rollout::SCHEMA_VERSION,
-            18,
+            19,
             "bump? pin the new version and add its migration test"
         );
         // Half-applied: one table present, version rolled back — the
@@ -600,4 +600,53 @@
             let _ = Store::open_for_schema_tests(&db).unwrap();
         }
         assert!(has(&db, "platform_drafts"));
+    }
+
+    /// v19 (CAD-577): `app_grants.install_id`. A v18 table has no such
+    /// column; the migration adds it (empty on existing rows) without
+    /// dropping the grants. A fresh create already has the column, so
+    /// this rebuilds a genuine v18 table first.
+    #[test]
+    fn migration_v18_to_v19_adds_app_grant_install_id() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("t.sqlite3");
+        Store::open(&db).unwrap();
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE app_grants_v18(
+                    app TEXT NOT NULL,
+                    agent TEXT NOT NULL,
+                    platform TEXT NOT NULL,
+                    account TEXT NOT NULL,
+                    scopes TEXT NOT NULL,
+                    granted_at REAL NOT NULL,
+                    by TEXT NOT NULL,
+                    PRIMARY KEY(app, agent, platform, account));
+                 INSERT INTO app_grants_v18
+                   SELECT app, agent, platform, account, scopes, granted_at, by
+                   FROM app_grants;
+                 DROP TABLE app_grants;
+                 ALTER TABLE app_grants_v18 RENAME TO app_grants;
+                 UPDATE schema_version SET version=18;",
+            )
+            .unwrap();
+        Store::open_for_schema_tests(&db).unwrap();
+        let names: Vec<String> = Connection::open(&db)
+            .unwrap()
+            .prepare("PRAGMA table_info(app_grants)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|row| row.ok())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "install_id"),
+            "install_id missing after migrate: {names:?}"
+        );
+        let version: i64 = Connection::open(&db)
+            .unwrap()
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, crate::rollout::SCHEMA_VERSION);
     }
