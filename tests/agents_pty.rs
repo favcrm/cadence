@@ -130,12 +130,12 @@ fn pty_nudge_needs_a_live_pane_and_dies_with_the_actor() {
     d.wait_agent("dv1", "idle", 20);
     let long = "x".repeat(501);
     let err = d
-        .send("dv1", json!({"text": long, "nudge": true}))
+        .operator_send("dv1", json!({"text": long, "nudge": true}))
         .unwrap_err()
         .to_string();
     assert!(err.contains("500"), "{err}");
     let err = d
-        .send(
+        .operator_send(
             "dv1",
             json!({"text": "steer", "nudge": true, "task": "t-1"}),
         )
@@ -143,7 +143,7 @@ fn pty_nudge_needs_a_live_pane_and_dies_with_the_actor() {
         .to_string();
     assert!(err.contains("--task"), "{err}");
     atomic_write(d.pane_file(&mock, "dv1", "tui-state"), DEVIN_MENU);
-    d.send(
+    d.operator_send(
         "dv1",
         json!({"text": "steer", "message": "n1", "nudge": true}),
     )
@@ -162,7 +162,7 @@ fn pty_nudge_needs_a_live_pane_and_dies_with_the_actor() {
     );
     assert_eq!(ev["payload"]["reason"], "stop", "{ev}");
     let err = d
-        .send("dv1", json!({"text": "steer", "nudge": true}))
+        .operator_send("dv1", json!({"text": "steer", "nudge": true}))
         .unwrap_err()
         .to_string();
     assert!(err.contains("agent dv1 has no live pane"), "{err}");

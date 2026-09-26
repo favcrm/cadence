@@ -4982,13 +4982,28 @@ impl Shared {
                 ))
             }
         };
+        // CAD-250: `--nudge` — turnless steering for a live pty pane. The
+        // flag is the only way in: a caller-supplied `source: "nudge"`
+        // takes the same checks rather than bypassing them.
+        let nudge = params
+            .get("nudge")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || optional_str(params, "source") == Some(store::NUDGE_SOURCE);
         let mut steer = store::Steer {
             priority,
             supersedes: &supersedes,
             ..store::Steer::NONE
         };
-        let steering_caller = if steer.is_steering() {
-            let verb = "send --priority/--supersedes";
+        // CAD-520 r3: a nudge steers a live pane mid-turn — the same
+        // queue mutation as --priority/--supersedes — so it takes the
+        // same caller rule, derived from the connection, never a field.
+        let steering_caller = if steer.is_steering() || nudge {
+            let verb = if steer.is_steering() {
+                "send --priority/--supersedes"
+            } else {
+                "send --nudge"
+            };
             reject_identity_fields(params, verb)?;
             let target = target
                 .as_ref()
@@ -5032,14 +5047,6 @@ impl Shared {
         // characters at delivery; refuse it here so `send` never answers
         // `queued` for a message that cannot be delivered (CAD-218).
         let pty = target.as_ref().is_some_and(|a| a.endpoint_kind == "pty");
-        // CAD-250: `--nudge` — turnless steering for a live pty pane. The
-        // flag is the only way in: a caller-supplied `source: "nudge"`
-        // takes the same checks rather than bypassing them.
-        let nudge = params
-            .get("nudge")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-            || optional_str(params, "source") == Some(store::NUDGE_SOURCE);
         if nudge {
             if steer.is_steering() {
                 return Err(Error::rejected(

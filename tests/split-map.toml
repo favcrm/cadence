@@ -531,6 +531,7 @@ tests = [
     "urgent_waits_for_the_open_approval_then_goes_first",
     "pty_urgent_waits_for_the_held_turn_then_goes_first",
     "pty_devin_busy_nudge_flushes_the_send_queue",
+    "nudge_caller_is_own_pm_or_operator_only",
     "pty_devin_render_miss_reprobe_accepts_the_busy_turn",
     "pty_devin_render_miss_records_reprobe_evidence",
     "pty_delivery_stalled_fires_once_and_clears",

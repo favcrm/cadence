@@ -636,7 +636,7 @@ fn pty_nudge_queued_at_restart_is_cancelled_not_replayed() {
     d.wait_agent("dv1", "idle", 20);
     // An open approval menu holds every paste at the gate.
     atomic_write(d.pane_file(&mock, "dv1", "tui-state"), DEVIN_MENU);
-    d.send(
+    d.operator_send(
         "dv1",
         json!({"text": "late steer", "message": "n1", "nudge": true}),
     )
@@ -1915,18 +1915,20 @@ fn pty_resume_refuses_a_deleted_lane_cwd() {
     let _mock = d.mock_devin();
     let lane = d.dir.path().join("lane-wt");
     std::fs::create_dir_all(&lane).unwrap();
-    d.rpc(
+    d.fixture_rpc(
         "agent_register",
         json!({"alias": "dv", "provider": "devin", "endpoint_kind": "pty",
                "cwd": lane.to_str().unwrap()}),
     )
     .unwrap();
     d.wait_agent("dv", "idle", 20);
-    d.rpc("agent_stop", json!({"alias": "dv"})).unwrap();
+    d.operator_rpc("agent_stop", json!({"alias": "dv"}))
+        .unwrap();
     d.wait_agent("dv", "stopped", 15);
     std::fs::remove_dir_all(&lane).unwrap();
 
-    d.rpc("agent_resume", json!({"alias": "dv"})).unwrap();
+    d.operator_rpc("agent_resume", json!({"alias": "dv"}))
+        .unwrap();
     let agent = d.wait_agent("dv", "attention", 20);
     let ev = d.wait_event("dv", "attention", 10);
     let reason = ev["payload"]["reason"].as_str().unwrap_or("");
@@ -1979,6 +1981,7 @@ fn pty_devin_trust_prompt_fails_open_fast() {
     // lets the boot continue, and a plain resume (no unknowns to
     // reconcile, so unfence would refuse) adopts or respawns it.
     std::fs::remove_file(&marker).unwrap();
-    d.rpc("agent_resume", json!({"alias": "dv"})).unwrap();
+    d.operator_rpc("agent_resume", json!({"alias": "dv"}))
+        .unwrap();
     d.wait_agent("dv", "idle", 20);
 }

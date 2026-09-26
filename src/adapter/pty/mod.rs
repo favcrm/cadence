@@ -1003,31 +1003,13 @@ impl ProviderAdapter for PtyAdapter {
             None => e,
         };
 
-        // CAD-520: never open into a deleted working directory. The
-        // spawn arm would launch the TUI wherever tmux lands it (the
-        // next failure is a folder-trust prompt or a wrong-repo
-        // session); a reattached pane whose cwd vanished is the same
-        // dead lane the send gate already refuses.
-        if self.has_session(&session) {
-            if let Ok(pane_pid) = self.pane_pid(&session) {
-                if let Some(cwd) = lane::pane_cwd(pane_pid).filter(|c| c.deleted) {
-                    return Err(Error::provider(format!(
-                        "cwd_deleted: the pane's working directory {} was deleted — \
-                         re-home the lane (`cadence agent stop`, fix its cwd, resume) \
-                         before resuming",
-                        cwd.path
-                    )));
-                }
-            }
-        } else if !Path::new(&self.cwd).is_dir() {
-            return Err(Error::provider(format!(
-                "cwd_deleted: the lane's working directory {} is gone — \
-                 re-home the lane (`cadence agent stop`, fix its cwd, resume) \
-                 before resuming",
-                self.cwd
-            )));
-        }
-
+        // CAD-520: a spawn with no lane cwd launches the TUI wherever
+        // tmux lands it (the next failure is a folder-trust prompt or
+        // a wrong-repo session) — refuse the open before tmux runs.
+        // A reattach takes no cwd guard: the pane is already alive,
+        // delivery legality is the send gate's check, and a /proc cwd
+        // read races a respawn — the r2 fence fired on a stale
+        // ` (deleted)` read while the lane dir resolved again.
         let (native, pane_pid, attach) = if self.has_session(&session) {
             // Reattach: verify the pane still owns a native session.
             // When one was recorded it must match; a pane left by a
@@ -1062,6 +1044,17 @@ impl ProviderAdapter for PtyAdapter {
                 }
             }
         } else {
+            // The spawn arm is where a missing lane cwd hurts: the
+            // pane launches wherever tmux lands it, surfacing later as
+            // a trust prompt or a wrong-repo session — refuse first.
+            if !Path::new(&self.cwd).is_dir() {
+                return Err(Error::provider(format!(
+                    "cwd_deleted: the lane's working directory {} is gone — \
+                     re-home the lane (`cadence agent stop`, fix its cwd, resume) \
+                     before resuming",
+                    self.cwd
+                )));
+            }
             // Mint once: a profile with a prepare step mints its native
             // session id *before* the pane exists, and the event folds
             // it into `params.session` — a respawn after a failed launch

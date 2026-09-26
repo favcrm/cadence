@@ -16,9 +16,10 @@ use std::time::Duration;
 use std::time::Instant;
 use tempfile::TempDir;
 
-/// CAD-250: `--nudge` is pty-only and caller-rule neutral — refused on a
-/// managed endpoint and a mailbox (naming the provider kind), with a
-/// `reply_to`, and together with `--ready`.
+/// CAD-250: `--nudge` is pty-only — refused on a managed endpoint and a
+/// mailbox (naming the provider kind), with a `reply_to`, and together
+/// with `--ready`. (Since CAD-520 r3 it is also caller-gated — these
+/// refusals run as the operator to reach the shape checks.)
 #[test]
 fn nudge_refused_off_pty_and_with_ready() {
     let d = TestDaemon::start();
@@ -27,19 +28,19 @@ fn nudge_refused_off_pty_and_with_ready() {
     d.wait_agent("mgd", "idle", 10);
     for (alias, kind) in [("mgd", "fake/fake"), ("box", "inbox/inbox")] {
         let err = d
-            .send(alias, json!({"text": "steer", "nudge": true}))
+            .operator_send(alias, json!({"text": "steer", "nudge": true}))
             .unwrap_err()
             .to_string();
         assert!(err.contains("pty") && err.contains(kind), "{alias}: {err}");
         // The forged-source path takes the same check.
         let err = d
-            .send(alias, json!({"text": "steer", "source": "nudge"}))
+            .operator_send(alias, json!({"text": "steer", "source": "nudge"}))
             .unwrap_err()
             .to_string();
         assert!(err.contains(kind), "{alias}: {err}");
     }
     let err = d
-        .send(
+        .operator_send(
             "mgd",
             json!({"text": "steer", "nudge": true, "reply_to": "box"}),
         )
@@ -2100,7 +2101,7 @@ fn pty_devin_busy_nudge_flushes_the_send_queue() {
     // The steer: the submit Enter stages the draft in the TUI's queue,
     // the queue invitation's flush Enter sends it — one paste, two
     // Enters, and the steer echoes into the transcript like a turn.
-    d.rpc(
+    d.operator_rpc(
         "agent_send",
         json!({"alias": "dv1", "text": "steer toward the small fix",
                "message": "n1", "nudge": true}),
@@ -2129,7 +2130,7 @@ fn pty_devin_busy_nudge_flushes_the_send_queue() {
     // Busy but no guide box — the status row alone makes a busy pane
     // whose input takes no steering: the nudge refuses like any send.
     busy("Ask Devin to build features, fix bugs, or work on your code\n");
-    d.rpc(
+    d.operator_rpc(
         "agent_send",
         json!({"alias": "dv1", "text": "no box to steer into",
                "message": "n2", "nudge": true}),
@@ -2150,7 +2151,7 @@ fn pty_devin_busy_nudge_flushes_the_send_queue() {
     // A modal menu over the box is never steerable — the nudge waits
     // out the menu instead of keying text into a selection.
     atomic_write(d.pane_file(&mock, "dv1", "tui-state"), DEVIN_MENU);
-    d.rpc(
+    d.operator_rpc(
         "agent_send",
         json!({"alias": "dv1", "text": "wait out the menu",
                "message": "n3", "nudge": true}),
@@ -2175,6 +2176,73 @@ fn pty_devin_busy_nudge_flushes_the_send_queue() {
     .unwrap();
     assert!(gate_reason("w1").contains("busy"));
     assert_eq!(d.message_state("dv1", "w1"), "queued");
+}
+
+/// CAD-520 r3: a nudge steers a live pane mid-turn — the same queue
+/// mutation as --priority/--supersedes, so it takes the CAD-158
+/// caller rule: the operator or the recipient's own PM (its
+/// `upstream`), derived from the connection, never a field. One route
+/// per refused caller kind — an agent of another group, a peer worker,
+/// a detached child carrying an alias env, and a forged identity
+/// field — while the own-PM and operator callers steer through.
+#[test]
+fn nudge_caller_is_own_pm_or_operator_only() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_devin();
+    let mut p = guard_panes(&d);
+    // dv's own PM is the planted `pm`; `pm2` and `w1` are other
+    // identities — a foreign PM and a co-worker.
+    d.register_devin_opts("dv", json!({"upstream": "pm"}));
+    d.wait_agent("dv", "idle", 20);
+    let nudge = |extra: &[(&str, &str)]| {
+        let mut v = json!({"alias": "dv", "text": "steer now", "nudge": true});
+        for (k, val) in extra {
+            v[*k] = json!(val);
+        }
+        v
+    };
+
+    // A PM of another group steering this worker — refused, naming
+    // the steering rule and the caller.
+    let r = p.pm2.rpc(&d.state, "agent_send", nudge(&[]));
+    let e = frame_err(&r);
+    assert!(e.contains("steering rule"), "{r}");
+    assert!(e.contains("agent 'pm2'"), "{r}");
+    // A peer worker in the same group — refused the same way.
+    let r = p.w1.rpc(&d.state, "agent_send", nudge(&[]));
+    let e = frame_err(&r);
+    assert!(e.contains("steering rule"), "{r}");
+    assert!(e.contains("agent 'w1'"), "{r}");
+    // A detached child carrying an alias env derives no caller and is
+    // not provably the operator — refused before the rule is reached.
+    let r = unprovable_rpc(&d, "agent_send", nudge(&[]));
+    assert!(frame_err(&r).contains("not provably the operator"), "{r}");
+    // A forged identity field is refused, never read.
+    let r =
+        p.pm.rpc(&d.state, "agent_send", nudge(&[("by", "operator")]));
+    assert!(frame_err(&r).contains("'by' is not accepted"), "{r}");
+    // The source: "nudge" spelling takes the same gate.
+    let r = p
+        .pm2
+        .rpc(&d.state, "agent_send", nudge(&[("source", "nudge")]));
+    assert!(frame_err(&r).contains("steering rule"), "{r}");
+    // Nothing reached dv's queue from any refused route.
+    let show = d.rpc("agent_show", json!({"alias": "dv"})).unwrap();
+    assert!(
+        show["messages"].as_array().unwrap().is_empty(),
+        "refused nudges must not enqueue: {show}"
+    );
+
+    // The allowlist: dv's own PM steers it, and so does the operator —
+    // each completing at the confirmed paste.
+    let r = p.pm.rpc(&d.state, "agent_send", nudge(&[]));
+    assert_eq!(r["ok"], true, "{r}");
+    let n1 = r["result"]["message"].as_str().unwrap().to_string();
+    let m = d.wait_message("dv", &n1, &["completed"], 20);
+    assert_eq!(m["result"]["via"], "pty_nudge", "{m}");
+    let r = d.operator_rpc("agent_send", nudge(&[])).unwrap();
+    let n2 = r["message"].as_str().unwrap().to_string();
+    d.wait_message("dv", &n2, &["completed"], 20);
 }
 
 /// CAD-520 F28: a paste the transcript never echoes is not proof of a
