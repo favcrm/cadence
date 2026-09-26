@@ -486,9 +486,7 @@ pub(super) fn outbox_gate(
 ) -> std::result::Result<(), HttpResp> {
     match operator::board_caller(request, state_dir, opts, false) {
         Ok(operator::Caller::Operator(_)) => {
-            if let Err(resp) = prove_operator_peer(request, state_dir, opts, what) {
-                return Err(resp);
-            }
+            prove_operator_peer(request, state_dir, opts, what)?;
         }
         // CAD-526: the verified `owner` role is the operator claim on
         // the public surface — the platform relay's peer is not a

@@ -219,8 +219,8 @@ fn run_app(v: &board::View) -> Option<(&str, &str)> {
 /// this app's runs produced (CAD-563): the ledger relayed exactly as
 /// `/api/outbox` relays it, narrowed to the items attributed to the
 /// app. Operator-only — the same proof `/api/outbox` runs, because the
-/// ledger's previews and paths are the operator's — and an app that is
-/// not installed is a 404 before the gate is even asked.
+/// ledger's previews and paths are the operator's — so the gate comes
+/// before any tracker or ledger read.
 fn outputs(
     request: &Request,
     pm: &Pm,
@@ -231,6 +231,14 @@ fn outputs(
 ) -> HttpResp {
     if !model::valid_key(key) || !model::valid_tag(name) {
         return err_response(400, "bad project or app name");
+    }
+    if let Err(resp) = home::outbox_gate(
+        request,
+        state_dir,
+        opts,
+        &format!("GET /api/apps/{key}/{name}/outputs"),
+    ) {
+        return resp;
     }
     if let Err(e) = app::digest(&pm.dir, key, name) {
         return err_response(404, &e.to_string());
@@ -253,14 +261,6 @@ fn outputs(
             }
         }
     }
-    if let Err(resp) = home::outbox_gate(
-        request,
-        state_dir,
-        opts,
-        &format!("GET /api/apps/{key}/{name}/outputs"),
-    ) {
-        return resp;
-    }
     let provenance = effect_provenance(state_dir);
     let out = match client::rpc(state_dir, "platform_outbox", json!({})) {
         Ok(out) => out,
@@ -271,9 +271,7 @@ fn outputs(
         .into_iter()
         .flatten()
         .filter(|item| {
-            let Some((agent, task)) = item["effect_id"]
-                .as_str()
-                .and_then(|id| provenance.get(id))
+            let Some((agent, task)) = item["effect_id"].as_str().and_then(|id| provenance.get(id))
             else {
                 return false;
             };

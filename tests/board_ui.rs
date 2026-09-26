@@ -1905,14 +1905,10 @@ fn board_app_runs_are_the_apps_plans() {
 
     // The operator approves the app, then proposes a run from its
     // workflow — the epic records `plan.workflow = studio/do-check`.
-    f.d.operator_rpc(
-        "app_approve",
-        json!({"project": "demo", "name": "studio"}),
-    )
-    .unwrap();
-    let out = f
-        .d
-        .operator_rpc(
+    f.d.operator_rpc("app_approve", json!({"project": "demo", "name": "studio"}))
+        .unwrap();
+    let out =
+        f.d.operator_rpc(
             "plan_propose",
             json!({"project": "demo", "workflow": "studio/do-check",
                    "inputs": {"title": "login fix"}}),
@@ -2046,14 +2042,10 @@ fn board_app_outputs_are_the_runs_and_operator_only() {
     app_install_studio(&f);
     let port = start_board(&f.pm_dir, &f.d.state);
 
-    f.d.operator_rpc(
-        "app_approve",
-        json!({"project": "demo", "name": "studio"}),
-    )
-    .unwrap();
-    let out = f
-        .d
-        .operator_rpc(
+    f.d.operator_rpc("app_approve", json!({"project": "demo", "name": "studio"}))
+        .unwrap();
+    let out =
+        f.d.operator_rpc(
             "plan_propose",
             json!({"project": "demo", "workflow": "studio/do-check",
                    "inputs": {"title": "login fix"}}),
@@ -2072,9 +2064,27 @@ fn board_app_outputs_are_the_runs_and_operator_only() {
     // Three published items and their effect rows: one staged with the
     // ticket named as its task, one staged without a task by a ticket's
     // owner, one that is neither.
-    write_outbox_item(outbox.path(), "ef-task", "demo", "By task", "2026-09-26T01:00:00Z");
-    write_outbox_item(outbox.path(), "ef-owner", "demo", "By owner", "2026-09-26T02:00:00Z");
-    write_outbox_item(outbox.path(), "ef-other", "demo", "Not this app", "2026-09-26T03:00:00Z");
+    write_outbox_item(
+        outbox.path(),
+        "ef-task",
+        "demo",
+        "By task",
+        "2026-09-26T01:00:00Z",
+    );
+    write_outbox_item(
+        outbox.path(),
+        "ef-owner",
+        "demo",
+        "By owner",
+        "2026-09-26T02:00:00Z",
+    );
+    write_outbox_item(
+        outbox.path(),
+        "ef-other",
+        "demo",
+        "Not this app",
+        "2026-09-26T03:00:00Z",
+    );
     let conn = rusqlite::Connection::open(f.d.state.join("cadence.sqlite3")).unwrap();
     for (eid, agent, task) in [
         ("ef-task", "someone", Some(tickets[0].as_str())),
@@ -2101,9 +2111,8 @@ fn board_app_outputs_are_the_runs_and_operator_only() {
     // An agent-attributed caller is refused — the ledger is the
     // operator's read.
     let mut wk = ManagedWorker::start(&f.d, "wk");
-    let request = format!(
-        "GET /api/apps/demo/studio/outputs HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n"
-    );
+    let request =
+        format!("GET /api/apps/demo/studio/outputs HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n");
     let r = wk.exec(&[
         "bash",
         "-c",
@@ -2141,7 +2150,10 @@ fn board_app_outputs_are_the_runs_and_operator_only() {
         .collect();
     assert_eq!(ids, ["ef-owner", "ef-task"], "{v}");
     assert!(
-        v["items"][0]["preview"].as_str().unwrap().contains("By owner"),
+        v["items"][0]["preview"]
+            .as_str()
+            .unwrap()
+            .contains("By owner"),
         "{v}"
     );
     // A bad name is refused by grammar even for the operator.
