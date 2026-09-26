@@ -69,13 +69,16 @@ this workflow exactly.
   is loaded, rerun that test alone before treating the failure as real.
 
 ### Pi agents and models (CAD-559)
-- Workers and reviewers run on `pi` with **devin** models — they are
-  free. The DeepSeek V4.1 Flash Max worker model is
-  `devin/deepseek-v4-1-flash-high` with `--effort max`:
-  `cadence join <pm> pi --model devin/deepseek-v4-1-flash-high --effort max`.
-  When its usage runs out, the fallback is `devin/swe-2-high` with
-  `--effort max` — switch a live agent with
-  `cadence agent set <alias> --next-launch model=devin/swe-2-high effort=max`
+- Workers and reviewers run on `pi` with **devin** models — never
+  OpenRouter. Cost tiers per `devin models list` (the source of truth):
+  `swe-2-{high,medium,max}` are **Free**; `deepseek-v4-1-flash-*` is
+  low cost ($0.22/1M in, $0.66/1M out), not free. The default worker
+  model is `devin/swe-2-high` with `--effort max` (the SWE-2 Max
+  variant):
+  `cadence join <pm> pi --model devin/swe-2-high --effort max`.
+  `devin/deepseek-v4-1-flash-high` + `--effort max` is the low-cost
+  alternative. Switch a live agent:
+  `cadence agent set <alias> --next-launch model=<m> effort=max`
   then `agent stop` + `agent resume`.
 - `openrouter/*` models are **paid** — never route a worker or reviewer
   through openrouter. (The production master's pinned
