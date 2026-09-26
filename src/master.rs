@@ -29,12 +29,14 @@
 //! of it is keyed on the alias, not on stored params. The daemon's own
 //! allowlist (`daemon::MASTER_ALLOWED`) is the second line.
 //!
-//! **Read confinement (CAD-439).** The allowlist does not bound what the
-//! master reads: Claude Code auto-allows the Bash commands it deems
-//! read-only (`id`, `ps`, `echo <glob>`, `cat` inside its working dirs)
-//! in every permission mode, `dontAsk` included, and an allowlisted
-//! `cadence report file`/`master escalate --file <path>` reads any path.
-//! So the daemon launches the provider under `cadence confine`
+//! **Read confinement (CAD-439, CAD-614).** The allowlist does not bound
+//! what the master reads: Claude Code auto-allows the Bash commands it
+//! deems read-only (`id`, `ps`, `echo <glob>`, `cat` inside its working
+//! dirs) in every permission mode, `dontAsk` included. An allowlisted
+//! `--file` is confined in the CLI ([`read_command_file`]) whenever
+//! `CADENCE_ALIAS` is `master` — both the Claude and Pi sessions are
+//! launched with that alias, so the Pi guard is not the only check.
+//! The daemon also launches the provider under `cadence confine`
 //! ([`crate::confine`], Linux Landlock) with [`confinement`]: the
 //! system trees, the Claude CLI's own state, the programs it runs, the
 //! tracker, and the master's own dirs — nothing else of `$HOME`, the
@@ -77,7 +79,11 @@
 //! boundary: another same-uid process can still read credential files
 //! and edit the tracker by hand (see docs/design/AGENT-FILESYSTEM.md).
 
-use std::path::{Path, PathBuf};
+use std::fs::File;
+use std::io::Read;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Component, Path, PathBuf};
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -723,6 +729,203 @@ pub fn operator_claude_config(config_dir: Option<String>, home: Option<String>) 
 /// in its confinement.
 pub fn tmpdir(state_dir: &Path) -> PathBuf {
     state_dir.join("master").join("tmp")
+}
+
+/// Is this process the master? Both providers are launched with
+/// `CADENCE_ALIAS` set to the agent alias (the Claude and Pi
+/// adapters). That is the same alias the daemon's connection check
+/// accepts (`caller_is_master`); a request field is never consulted.
+pub fn caller_is_master() -> bool {
+    std::env::var("CADENCE_ALIAS")
+        .ok()
+        .is_some_and(|alias| is_master(&alias))
+}
+
+/// Open a `--file` path. When [`caller_is_master`] is set, the file
+/// must be a regular non-symlink inside [`tmpdir`] and the returned
+/// fd is that open — callers read the fd, never the path again.
+pub fn open_command_file(state_dir: &Path, path: &Path) -> Result<File> {
+    open_command_file_as(caller_is_master(), state_dir, path)
+}
+
+/// Read a `--file` body from [`open_command_file`]. One byte past
+/// `max` is kept so a caller can reject an oversized body without
+/// buffering the rest, matching the CLI's `read_body_capped`.
+pub fn read_command_file(state_dir: &Path, path: &Path, max: u64) -> Result<String> {
+    read_command_file_as(caller_is_master(), state_dir, path, max)
+}
+
+fn read_command_file_as(master: bool, state_dir: &Path, path: &Path, max: u64) -> Result<String> {
+    let file = open_command_file_as(master, state_dir, path)?;
+    let mut body = String::new();
+    file.take(max.saturating_add(1)).read_to_string(&mut body)?;
+    Ok(body)
+}
+
+fn open_command_file_as(master: bool, state_dir: &Path, path: &Path) -> Result<File> {
+    if master {
+        open_master_tmp_file(state_dir, path)
+    } else {
+        File::open(path).map_err(Error::from)
+    }
+}
+
+/// Lexical absolute form: `.` and `..` are collapsed in userspace.
+/// The kernel is not asked to resolve the path, so a symlink is not
+/// followed by this step.
+fn lexical_abs(path: &Path) -> Result<PathBuf> {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut out = PathBuf::new();
+    for c in abs.components() {
+        match c {
+            Component::Prefix(_) => {
+                return Err(Error::rejected(format!(
+                    "use the write tool into master/tmp, then --file <that path> — refused '{}'",
+                    path.display()
+                )));
+            }
+            Component::RootDir => out.push(Component::RootDir),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    return Err(Error::rejected(format!(
+                        "use the write tool into master/tmp, then --file <that path> — refused '{}'",
+                        path.display()
+                    )));
+                }
+            }
+            Component::Normal(seg) => out.push(seg),
+        }
+    }
+    Ok(out)
+}
+
+fn file_refused(state_dir: &Path, path: &Path, why: &str) -> Error {
+    Error::rejected(format!(
+        "use the write tool into {}, then --file <that path> — refused '{}': {why}",
+        tmpdir(state_dir).display(),
+        path.display()
+    ))
+}
+
+fn confine_io(state_dir: &Path, path: &Path, err: std::io::Error) -> Error {
+    let why = if err.raw_os_error() == Some(libc::ELOOP) {
+        "symlink"
+    } else {
+        return file_refused(state_dir, path, &err.to_string());
+    };
+    file_refused(state_dir, path, why)
+}
+
+/// Open `path` only when it is a regular file strictly inside
+/// `<state>/master/tmp`.
+///
+/// `tmp` itself is opened with `O_NOFOLLOW` (a symlink planted on the
+/// directory is refused; ancestors are the daemon's path). Each
+/// component below it is `openat` `O_NOFOLLOW`, the fd is `fstat`'d
+/// for a regular file, and the caller reads that fd. Nothing is
+/// re-opened by path.
+fn open_master_tmp_file(state_dir: &Path, path: &Path) -> Result<File> {
+    if path.as_os_str() == "-" || path.as_os_str().is_empty() {
+        return Err(Error::rejected(
+            "no stdin — use the write tool into master/tmp, then --file <that path>",
+        ));
+    }
+    let tmp = lexical_abs(&tmpdir(state_dir))?;
+    let file = lexical_abs(path)?;
+    let rel = file.strip_prefix(&tmp).map_err(|_| {
+        Error::rejected(format!(
+            "use the write tool into {}, then --file <that path> — refused '{}'",
+            tmpdir(state_dir).display(),
+            path.display()
+        ))
+    })?;
+    if rel.as_os_str().is_empty() || rel.components().any(|c| !matches!(c, Component::Normal(_))) {
+        return Err(file_refused(
+            state_dir,
+            path,
+            "not a regular file inside master/tmp",
+        ));
+    }
+    let dir = open_tmp_dir(state_dir, path)?;
+    let opened = open_rel_nofollow(dir, rel).map_err(|e| confine_io(state_dir, path, e))?;
+    let meta = opened
+        .metadata()
+        .map_err(|e| confine_io(state_dir, path, e))?;
+    if !meta.file_type().is_file() {
+        return Err(file_refused(state_dir, path, "not a regular file"));
+    }
+    Ok(opened)
+}
+
+fn open_tmp_dir(state_dir: &Path, path: &Path) -> Result<OwnedFd> {
+    let tmp = tmpdir(state_dir);
+    let name = std::ffi::CString::new(tmp.as_os_str().as_bytes())
+        .map_err(|_| file_refused(state_dir, path, "path contains an interior nul"))?;
+    let fd = unsafe {
+        libc::open(
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let err = std::io::Error::last_os_error();
+        // `O_DIRECTORY|O_NOFOLLOW` on a symlink is `ENOTDIR` on Linux,
+        // not `ELOOP`. Name it from lstat; the open already failed.
+        if err.raw_os_error() == Some(libc::ELOOP) || is_symlink(&tmp) {
+            return Err(file_refused(state_dir, path, "symlink"));
+        }
+        return Err(confine_io(state_dir, path, err));
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+fn is_symlink_at(dirfd: std::os::fd::RawFd, name: &std::ffi::CStr) -> bool {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::fstatat(dirfd, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
+    rc == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFLNK
+}
+
+fn open_rel_nofollow(mut current: OwnedFd, rel: &Path) -> std::io::Result<File> {
+    let comps: Vec<Component> = rel.components().collect();
+    for (i, c) in comps.iter().enumerate() {
+        let Component::Normal(seg) = c else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "not a file inside tmp",
+            ));
+        };
+        let name = std::ffi::CString::new(seg.as_bytes())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "interior nul"))?;
+        let last = i + 1 == comps.len();
+        let flags = if last {
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+        } else {
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+        };
+        let next = unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), flags) };
+        if next < 0 {
+            let err = std::io::Error::last_os_error();
+            // Same `ENOTDIR` vs `ELOOP` split as `open_tmp_dir`.
+            if err.raw_os_error() == Some(libc::ELOOP) || is_symlink_at(current.as_raw_fd(), &name)
+            {
+                return Err(std::io::Error::from_raw_os_error(libc::ELOOP));
+            }
+            return Err(err);
+        }
+        current = unsafe { OwnedFd::from_raw_fd(next) };
+    }
+    Ok(File::from(current))
 }
 
 /// The master's working directory: an empty folder under the state dir
@@ -1393,5 +1596,123 @@ mod tests {
             .unwrap();
         let err = real_dir(tmp.path(), "master").unwrap_err().to_string();
         assert!(err.contains("symlink"), "{err}");
+    }
+
+    /// Both providers launch the master with `CADENCE_ALIAS=master`.
+    /// The helper keys on that alias, not on the provider, so the
+    /// Claude session (no Pi guard) and the Pi session share one open.
+    fn assert_master_file_confined(shape: &str) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = dir.path();
+        let tmp = tmpdir(state);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let outside = state.join("secret.txt");
+        std::fs::write(&outside, "SECRET-OUTSIDE").unwrap();
+        let ok = tmp.join("note.md");
+        std::fs::write(&ok, "hello").unwrap();
+        assert_eq!(
+            read_command_file_as(true, state, &ok, 1000).unwrap(),
+            "hello",
+            "{shape}"
+        );
+        let nest = tmp.join("d");
+        std::fs::create_dir(&nest).unwrap();
+        std::fs::write(nest.join("a.md"), "nested").unwrap();
+        assert_eq!(
+            read_command_file_as(true, state, &nest.join("a.md"), 1000).unwrap(),
+            "nested",
+            "{shape}"
+        );
+
+        let err = read_command_file_as(true, state, Path::new("/proc/self/environ"), 1000)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("write tool") && err.contains("master/tmp"),
+            "{shape}: {err}"
+        );
+        assert!(!err.contains("SECRET-OUTSIDE"), "{shape}: {err}");
+
+        let link = tmp.join("escape");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let err = read_command_file_as(true, state, &link, 1000)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("symlink"), "{shape}: {err}");
+        assert!(!err.contains("SECRET-OUTSIDE"), "{shape}: {err}");
+
+        let sub = tmp.join("sub");
+        std::os::unix::fs::symlink("/etc", &sub).unwrap();
+        let err = read_command_file_as(true, state, &sub.join("passwd"), 1000)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("symlink"), "{shape}: {err}");
+
+        std::fs::write(state.join("master").join("note.md"), "SECRET-PARENT").unwrap();
+        let err = read_command_file_as(true, state, &tmp.join("..").join("note.md"), 1000)
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("SECRET-PARENT"), "{shape}: {err}");
+
+        let err = read_command_file_as(true, state, &nest, 1000)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("regular"), "{shape}: {err}");
+
+        let err = read_command_file_as(true, state, Path::new("-"), 1000)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("stdin"), "{shape}: {err}");
+    }
+
+    #[test]
+    fn claude_master_file_reads_are_confined_to_tmp() {
+        assert_master_file_confined("claude");
+    }
+
+    #[test]
+    fn pi_master_file_reads_are_confined_to_tmp() {
+        assert_master_file_confined("pi");
+    }
+
+    /// A symlink planted on `master/tmp` itself is not a root.
+    #[test]
+    fn master_tmp_symlink_is_not_a_root() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = dir.path();
+        let elsewhere = state.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::create_dir(state.join("master")).unwrap();
+        std::fs::write(elsewhere.join("x"), "SECRET-LINKROOT").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, tmpdir(state)).unwrap();
+        let err = read_command_file_as(true, state, &tmpdir(state).join("x"), 1000)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("symlink"), "{err}");
+        assert!(!err.contains("SECRET-LINKROOT"), "{err}");
+    }
+
+    /// Workers are not the master: a path outside `master/tmp` still
+    /// reads. Confining them would break every other `--file`.
+    #[test]
+    fn worker_file_reads_are_not_confined_to_master_tmp() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let outside = dir.path().join("secret.txt");
+        std::fs::write(&outside, "SECRET-OUTSIDE").unwrap();
+        assert_eq!(
+            read_command_file_as(false, dir.path(), &outside, 1000).unwrap(),
+            "SECRET-OUTSIDE"
+        );
+    }
+
+    #[test]
+    fn caller_is_master_follows_cadence_alias() {
+        assert!(is_master(ALIAS));
+        assert!(!is_master("claude"));
+        assert!(!is_master("pi"));
+        assert_eq!(
+            caller_is_master(),
+            std::env::var("CADENCE_ALIAS").ok().as_deref() == Some(ALIAS)
+        );
     }
 }

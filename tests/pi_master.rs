@@ -784,7 +784,9 @@ fn the_pi_guard_is_a_grammar_and_refuses_the_bypasses() {
         "cadence issue new x --id CAD-1".to_string(),
         format!("cadence wiki put global/x.md --file {tmp}/n.md"),
         format!("cadence wiki put agents/master/knowledge/../../global/x.md --file {tmp}/n.md"),
-        format!("cadence report file --task D-1 --kind answer --file /etc/passwd"),
+        "cadence report file --task D-1 --kind answer --file /etc/passwd".to_string(),
+        format!("cadence plan propose --project demo --file {tmp}/a.md --file /etc/passwd"),
+        format!("cadence wiki put agents/master/knowledge/n.md -m hello --file {tmp}/n.md"),
     ];
     let cases: Vec<&str> = allow.iter().chain(&deny).map(String::as_str).collect();
     let js = format!(
@@ -944,6 +946,8 @@ fn the_pi_guard_confines_writes_and_file_args() {
         {"tool": "bash", "input": {"command": format!("cadence wiki put agents/master/knowledge/n.md --file {tmp_s}/ok.md")}},
         {"tool": "bash", "input": {"command": "cadence status | head"}},
         {"tool": "bash", "input": {"command": "cadence issue ls \"x\""}},
+        {"tool": "bash", "input": {"command": format!("cadence plan propose --project demo --file {tmp_s}/ok.md --file /etc/passwd")}},
+        {"tool": "bash", "input": {"command": format!("cadence wiki put agents/master/knowledge/n.md -m hello --file {tmp_s}/ok.md")}},
     ]);
     let harness = format!(
         r#"import guard from "file://{}";
@@ -958,13 +962,12 @@ process.stdout.write(JSON.stringify(out));"#,
         mjs.display(),
         cases
     );
-    let out = cadence_agent::reaper::output(
-        std::process::Command::new("node")
-            .arg("--input-type=module")
-            .arg("-e")
-            .arg(&harness),
-    )
-    .expect("node is required for the pi toolchain");
+    // The 256KB case is 262145 bytes. Passing that harness as `node -e`
+    // exceeds ARG_MAX (E2BIG) before any assertion runs.
+    let harness_path = state.path().join("harness.mjs");
+    std::fs::write(&harness_path, &harness).unwrap();
+    let out = cadence_agent::reaper::output(std::process::Command::new("node").arg(&harness_path))
+        .expect("node is required for the pi toolchain");
     assert!(
         out.status.success(),
         "extension import failed: {}",
@@ -1036,6 +1039,16 @@ process.stdout.write(JSON.stringify(out));"#,
         reasons[14].as_deref().unwrap().contains("quotes"),
         "{:?}",
         reasons[14]
+    );
+    assert!(
+        reasons[15].as_deref().unwrap().contains("one --file"),
+        "{:?}",
+        reasons[15]
+    );
+    assert!(
+        reasons[16].as_deref().unwrap().contains("-m"),
+        "{:?}",
+        reasons[16]
     );
 }
 

@@ -731,8 +731,7 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             file,
             status,
         } => {
-            let caller_is_master =
-                std::env::var("CADENCE_ALIAS").ok().as_deref() == Some(crate::master::ALIAS);
+            let caller_is_master = crate::master::caller_is_master();
             write::master_issue_new_limits(
                 caller_is_master,
                 owner.as_deref(),
@@ -745,12 +744,14 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                         "no stdin — use the write tool into master/tmp, then --file <that path>",
                     ));
                 }
-                Some(ref f) => Some(std::fs::read_to_string(f).map_err(|e| {
-                    Error::rejected(format!(
-                        "issue new --file {}: {e} — write it with the write tool into master/tmp, then --file",
-                        f.display()
-                    ))
-                })?),
+                Some(ref f) => Some(crate::master::read_command_file(state_dir, f, u64::MAX).map_err(
+                    |e| {
+                        Error::rejected(format!(
+                            "issue new --file {}: {e} — write it with the write tool into master/tmp, then --file",
+                            f.display()
+                        ))
+                    },
+                )?),
                 None => None,
             };
             let pm = open_pm()?;
