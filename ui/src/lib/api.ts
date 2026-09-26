@@ -412,6 +412,16 @@ export const api = {
       `/api/apps/${encodeURIComponent(project)}/${encodeURIComponent(name)}/approve`,
       {},
     ),
+  /**
+   * `POST /api/apps/<project>/<name>/team` — relays the daemon's
+   * `app_set_team`; operator-only. The body carries the app's default
+   * team as `<input>=<agent>` pairs (CAD-577).
+   */
+  appSetTeam: (project: string, name: string, team: string[]) =>
+    post<Record<string, unknown>>(
+      `/api/apps/${encodeURIComponent(project)}/${encodeURIComponent(name)}/team`,
+      { team },
+    ),
   /** `GET /api/outbox` — the `local` platform's published items (operator-only). */
   outbox: () => get<OutboxList>("/api/outbox"),
   /** `GET /api/outbox?effect_id=` — one item, rendered post included. */

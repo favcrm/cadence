@@ -1101,6 +1101,8 @@ export interface AppRow {
   approved?: boolean | string | null;
   approval?: AppApproval | string;
   source?: AppSource | null;
+  /** The app's default team (CAD-577): input role → agent alias. */
+  team?: Record<string, string>;
   installed_at?: string;
   installed_by?: string;
   updated_at?: string;

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { api, type ApiError } from "../../lib/api";
 import { fmtTime } from "../../lib/fmt";
 import { resources } from "../../lib/resources";
 import { useMaybeResource, useQuery, useResource } from "../../lib/useResource";
@@ -8,6 +9,7 @@ import type {
   AppPendingSend,
   AppRun,
   AppRunOutput,
+  AppWorkflow,
 } from "../../lib/types";
 import Link from "../../ui/Link";
 import Md from "../../ui/Md";
@@ -21,15 +23,19 @@ import {
   appNeeds,
   appPurpose,
   appWorkflowRow,
+  agentStateWord,
   approvalPending,
   connectionRows,
   distinctNote,
   distinctProblem,
   doctorFindings,
   filterCounts,
+  isReadyToRun,
+  notReadyText,
   outputsOf,
   primaryAction,
   publishTarget,
+  readyChecklist,
   runFilter,
   runStages,
   runStatus,
@@ -38,6 +44,7 @@ import {
   startLabel,
   slugProblem,
   stepRows,
+  teamCandidates,
   teamFromLastRun,
   teamInputs,
   unboundSlots,
@@ -105,6 +112,9 @@ export default function AppDetail({
   const action = app ? primaryAction(app) : null;
   const approval = app ? appApprovalChip(app) : null;
   const needsRows = app ? appNeeds(app, runs, needs, pending) : [];
+  const ready = app ? isReadyToRun(app) : false;
+  const readyGaps = app ? readyChecklist(app) : [];
+  const notReady = app ? notReadyText(app) : null;
   return (
     <>
       <main className="px-4 lg:px-8 pt-4 pb-9 min-w-0 max-w-3xl" aria-label={`app ${key}`}>
@@ -128,13 +138,61 @@ export default function AppDetail({
           {action && (
             <button
               type="button"
-              onClick={() => setRunning(action.wf.name)}
-              className="shrink-0 h-8 px-3 rounded bg-accent text-on-accent text-label font-medium"
+              onClick={() => ready && setRunning(action.wf.name)}
+              disabled={!ready}
+              title={notReady ?? undefined}
+              className="shrink-0 h-8 px-3 rounded bg-accent text-on-accent text-label font-medium disabled:opacity-40"
             >
               {action.label}
             </button>
           )}
         </div>
+        {app && readyGaps.length > 0 && (
+          <section
+            className="card px-4 py-3 min-w-0 mb-3"
+            aria-label="ready to run"
+          >
+            <div className="slabel mb-1.5">ready to run</div>
+            <ul className="space-y-1.5">
+              {readyGaps.map((item) => (
+                <li key={item.key} className="flex flex-wrap items-center gap-2 min-w-0">
+                  <span className="text-label min-w-0 break-words flex-1">
+                    <span className={item.done ? "text-ok" : "text-warn"}>
+                      {item.done ? "✓ " : "○ "}
+                    </span>
+                    <span className={item.done ? "text-ink-300" : "text-ink-200"}>
+                      {item.label}
+                    </span>
+                  </span>
+                  {!item.done && item.key === "approved" && (
+                    <ApproveApp row={app} viewer={viewer} />
+                  )}
+                  {!item.done && item.key === "team" && (
+                    <button
+                      type="button"
+                      onClick={() => setTab("settings")}
+                      className="lnk text-label shrink-0"
+                    >
+                      Set team →
+                    </button>
+                  )}
+                  {!item.done && item.key === "publish" && (
+                    <button
+                      type="button"
+                      onClick={() => setTab("settings")}
+                      className="lnk text-label shrink-0"
+                    >
+                      Connect →
+                    </button>
+                  )}
+                </li>
+              ))}
+            </ul>
+            {notReady && (
+              <p className="text-micro text-ink-500 mt-2 break-words">{notReady}</p>
+            )}
+          </section>
+        )}
         <ResourceGate
           state={state}
           loading={`loading ${key}…`}
@@ -398,8 +456,6 @@ function SettingsTab({
 }) {
   const action = primaryAction(app);
   const wf = action?.wf ?? (app.workflows ?? [])[0];
-  const team = wf ? teamFromLastRun(wf, runs) : {};
-  const inputs = wf ? (wf.inputs ?? []) : [];
   const slots = usedSlots(app);
   return (
     <div className="space-y-3 min-w-0">
@@ -416,30 +472,7 @@ function SettingsTab({
         </section>
       )}
       {wf && (
-        <section className="card px-4 py-3.5 min-w-0" aria-label="team">
-          <div className="slabel mb-2">team</div>
-          <p className="text-label text-ink-400 mb-2">
-            A new run starts with the team the last one used.
-          </p>
-          <ul className="space-y-1.5">
-            {teamInputs(wf).map((input) => {
-              const spec = inputs.find((i) => i.name === input);
-              const value = team[input] ?? null;
-              return (
-                <li key={input} className="flex flex-wrap items-baseline gap-2 min-w-0 text-label">
-                  <span className="text-ink-300 min-w-0 break-words">{spec?.ask ?? input}</span>
-                  <span className={`num ${value ? "text-ink-100" : "text-ink-500"}`}>
-                    {value ?? "not used yet"}
-                  </span>
-                  {value && <span className="chip bg-ink-800 text-ink-500">last used</span>}
-                </li>
-              );
-            })}
-            {teamInputs(wf).length === 0 && (
-              <li className="text-label text-ink-500">This workflow's steps name no team inputs.</li>
-            )}
-          </ul>
-        </section>
+        <TeamEditor app={app} wf={wf} runs={runs} viewer={viewer} />
       )}
       <section className="card px-4 py-3.5 min-w-0" aria-label="app">
         <div className="slabel mb-2">app</div>
@@ -466,6 +499,120 @@ function SettingsTab({
         </button>
       </section>
     </div>
+  );
+}
+
+/**
+ * Settings → Team (CAD-577): one picker per role, listing the registered
+ * agents with their state, saved as the app's default team (an
+ * operator-only write, stored with the install record, not in the
+ * digest). "Add worker" joins a new worker for the role — the CLI's
+ * `cadence join` — with a unique prefixed alias, under the operator's
+ * inbox.
+ */
+function TeamEditor({
+  app,
+  wf,
+  runs,
+  viewer,
+}: {
+  app: AppDetailRow;
+  wf: AppWorkflow;
+  runs: AppRun[];
+  viewer: Viewer;
+}) {
+  const roles = teamInputs(wf);
+  const inputs = wf.inputs ?? [];
+  const agentsState = useResource(resources.agents);
+  const candidates = teamCandidates(agentsState.data?.agents);
+  const saved = app.team ?? {};
+  const lastRun = teamFromLastRun(wf, runs);
+  const [draft, setDraft] = useState<Record<string, string>>({});
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState<string | null>(null);
+  const valueOf = (role: string) => draft[role] ?? saved[role] ?? lastRun[role] ?? "";
+  const dirty = roles.some((r) => draft[r] !== undefined && draft[r] !== valueOf(r));
+
+  const save = () => {
+    if (busy) return;
+    setBusy(true);
+    setNote(null);
+    const team = roles.map((r) => `${r}=${valueOf(r)}`);
+    api
+      .appSetTeam(app.project, app.name, team)
+      .then(() => {
+        setDraft({});
+        setNote("Saved.");
+        void resources.app(`${app.project}/${app.name}`).invalidate();
+      })
+      .catch((e: ApiError) => setNote(e.message ?? String(e)))
+      .finally(() => setBusy(false));
+  };
+
+  return (
+    <section className="card px-4 py-3.5 min-w-0" aria-label="team">
+      <div className="slabel mb-2">team</div>
+      <p className="text-label text-ink-400 mb-2">
+        A new run starts with this team. Saved with the app; changing it never needs re-approval.
+      </p>
+      <ul className="space-y-2">
+        {roles.map((role) => {
+          const spec = inputs.find((i) => i.name === role);
+          const value = valueOf(role);
+          return (
+            <li key={role} className="flex flex-wrap items-center gap-2 min-w-0">
+              <label
+                htmlFor={`team-${role}`}
+                className="text-label text-ink-300 min-w-0 break-words w-32"
+              >
+                {spec?.ask ?? role}
+              </label>
+              <select
+                id={`team-${role}`}
+                value={value}
+                onChange={(e) => setDraft((cur) => ({ ...cur, [role]: e.target.value }))}
+                className="field flex-1 min-w-0"
+                data-role={role}
+              >
+                <option value="">not set</option>
+                {candidates.map((a) => (
+                  <option key={a.alias} value={a.alias}>
+                    {a.alias} — {agentStateWord(a.state)}
+                  </option>
+                ))}
+                {value && !candidates.some((a) => a.alias === value) && (
+                  <option value={value}>{value} — saved</option>
+                )}
+              </select>
+              <Link
+                href={`/agents?new=${encodeURIComponent(role)}`}
+                className="lnk text-label shrink-0"
+                title="join a new worker for this role"
+              >
+                Add worker →
+              </Link>
+            </li>
+          );
+        })}
+        {roles.length === 0 && (
+          <li className="text-label text-ink-500">This workflow's steps name no team inputs.</li>
+        )}
+      </ul>
+      {roles.length > 0 && (
+        <div className="flex flex-wrap items-center gap-2 mt-3">
+          <button
+            type="button"
+            onClick={save}
+            disabled={busy || !dirty || !viewer.operator}
+            className="h-8 px-3 rounded bg-accent text-on-accent text-label font-medium disabled:opacity-40"
+            title={!viewer.operator ? "Saving the team is the operator's." : undefined}
+          >
+            {busy ? "Saving…" : "Save team"}
+          </button>
+          {note && <span className="text-micro text-ink-400 break-words">{note}</span>}
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -611,7 +758,9 @@ function RunDrawer({
   const inputs = row.inputs ?? [];
   const primary = inputs[0]?.name ?? null;
   const slugInput = inputs.some((i) => i.name === "slug") ? "slug" : null;
-  const team = teamFromLastRun(row, runs);
+  // The saved default team wins; the last run fills any role it left
+  // unset (CAD-577).
+  const team = { ...teamFromLastRun(row, runs), ...(app.team ?? {}) };
   // The run's plain name — the workflow's own `label:` ("New post"),
   // never the engine's "new run" (CAD-571).
   const title = row.label?.trim() || "New run";
