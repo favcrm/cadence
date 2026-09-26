@@ -225,9 +225,69 @@ impl Shared {
         // CAD-445: the approved tickets are the master's to dispatch now.
         if approve {
             self.wake_on_plan_approved(&out);
+            // CAD-577: resuming a run resumes the app's stopped team
+            // agents instead of leaving their tasks queued.
+            self.resume_run_team(epic);
         }
         self.wake();
         Ok(out)
+    }
+
+    /// CAD-577: when a plan is approved, resume the stopped agents the
+    /// run's tickets are assigned to — the app's team. `agent resume`
+    /// is the existing path; a live agent is left alone and a failure
+    /// is recorded by the resume path itself (never a silent skip).
+    /// Best-effort: a missing epic or an unreadable ticket just resumes
+    /// what it can.
+    pub(super) fn resume_run_team(self: &Arc<Self>, epic: &str) {
+        let Ok(pm_dir) = self.pm_dir() else { return };
+        let Ok(epic_issue) = crate::issue::board::find_issue(&pm_dir, epic) else {
+            return;
+        };
+        let Some(plan) = &epic_issue.front.plan else {
+            return;
+        };
+        let mut owners: Vec<String> = Vec::new();
+        for id in &plan.tickets {
+            if let Ok(issue) = crate::issue::board::find_issue(&pm_dir, id) {
+                if let Some(owner) = issue.front.owner.clone() {
+                    if !owners.contains(&owner) {
+                        owners.push(owner);
+                    }
+                }
+            }
+        }
+        for alias in owners {
+            let Ok(agent) = self.store.agent(&alias) else {
+                continue;
+            };
+            // Only a stopped agent with a real actor resumes; a live
+            // one is left alone, an inbox has nothing to start.
+            if agent.state != "stopped"
+                || !crate::adapter::registry::has_actor(&agent.provider, &agent.endpoint_kind)
+            {
+                continue;
+            }
+            match self.try_resume(&alias) {
+                Ok(true) => {
+                    let _ = self.store.event_public(
+                        &alias,
+                        "run_team_resumed",
+                        json!({"epic": epic, "reason": "the run's plan was approved"}),
+                    );
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    // A fenced or busy agent is not a silent skip —
+                    // record why the resume did not start it.
+                    let _ = self.store.event_public(
+                        &alias,
+                        "run_team_resume_failed",
+                        json!({"epic": epic, "reason": e.to_string()}),
+                    );
+                }
+            }
+        }
     }
 
     /// CAD-405 `epic_stage` — move an epic's stage: a gate decision and
