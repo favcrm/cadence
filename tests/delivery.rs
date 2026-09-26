@@ -1229,10 +1229,16 @@ fn master_reads_nothing_outside_its_views() {
         let r = m.exec(&["sh", "-c", &format!("echo x >> {c}")]);
         assert!(r["rc"] != 0, "{c} written: {r}");
         assert!(std::fs::read_to_string(c).unwrap().contains(&token));
-        // An allowlisted verb that reads a named file.
+        // An allowlisted `--file` is refused in the CLI when the path
+        // is outside master/tmp (CAD-614). Landlock remains the backstop
+        // for `cat` above; either refusal must keep the canary out.
         let (ok, out) = f.as_master(&mut m, &format!("master escalate D-1 q.md --file {c}"));
-        assert!(!ok && !out.to_string().contains(&token), "{out}");
-        assert!(out.to_string().contains("Permission denied"), "{out}");
+        let text = out.to_string();
+        assert!(!ok && !text.contains(&token), "{out}");
+        assert!(
+            text.contains("master/tmp") || text.contains("Permission denied"),
+            "{out}"
+        );
     }
     let r = m.exec(&["ls", home.to_str().unwrap()]);
     assert!(r["rc"] != 0, "listed $HOME: {r}");
