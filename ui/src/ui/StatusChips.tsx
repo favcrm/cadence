@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import type { Health } from "../lib/types";
+import { IconLock, IconPulse, IconRefresh, IconWarning } from "./icons";
 
 /**
  * The header's right-hand status — read-only flag, the sign-in chip
@@ -45,20 +46,7 @@ export default function StatusChips({
           className="chip bg-warn/10 text-warn"
           title="the server refuses every write — browsing only"
         >
-          <svg
-            width="12"
-            height="12"
-            viewBox="0 0 16 16"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="1.5"
-            strokeLinecap="round"
-            aria-hidden="true"
-            className={iconCls}
-          >
-            <rect x="3.2" y="7" width="9.6" height="6.8" rx="1.4" />
-            <path d="M5.6 7V5.2a2.4 2.4 0 0 1 4.8 0V7" />
-          </svg>
+          <IconLock className={iconCls} />
           <span className={labelCls}>read-only</span>
         </span>
       )}
@@ -77,37 +65,9 @@ export default function StatusChips({
           }
         >
           {health.daemon === "reachable" ? (
-            <svg
-              width="12"
-              height="12"
-              viewBox="0 0 16 16"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.5"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              aria-hidden="true"
-              className={iconCls}
-            >
-              <path d="M1.8 8h2.6l2-4.6 3.2 9.2 2-4.6h2.6" />
-            </svg>
+            <IconPulse className={iconCls} />
           ) : (
-            <svg
-              width="12"
-              height="12"
-              viewBox="0 0 16 16"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.5"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              aria-hidden="true"
-              className={iconCls}
-            >
-              <path d="M8 2.4 14.4 13.2H1.6L8 2.4z" />
-              <path d="M8 6.6v3" />
-              <circle cx="8" cy="11.4" r=".7" fill="currentColor" stroke="none" />
-            </svg>
+            <IconWarning className={iconCls} />
           )}
           <span className={labelCls}>daemon {health.daemon}</span>
         </span>
@@ -117,21 +77,7 @@ export default function StatusChips({
         className="chip bg-accent/10 text-accent hover:bg-accent/20 transition-colors"
         title="re-read the folders — writes also land here from the API"
       >
-        <svg
-          width="12"
-          height="12"
-          viewBox="0 0 16 16"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="1.5"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          aria-hidden="true"
-          className={iconCls}
-        >
-          <path d="M13.6 8a5.6 5.6 0 1 1-1.7-4" />
-          <path d="M13.6 1.8v2.4h-2.4" />
-        </svg>
+        <IconRefresh className={iconCls} />
         <span className={labelCls}>refresh</span>
       </button>
       {mayWrite && (

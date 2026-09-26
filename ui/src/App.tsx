@@ -32,6 +32,7 @@ import { buildChanged, serverBuild, subscribeSse, UI_BUILD } from "./lib/sse";
 import { applyDraft, composerField, sessionStore, stashDraft, takeDraft } from "./lib/draft";
 import Toast, { type ToastMsg } from "./ui/Toast";
 import { Logo } from "./ui/Logo";
+import { IconChevron } from "./ui/icons";
 import { countLabel, issueCounts } from "./lib/counts";
 import type { BoardFilters } from "./lib/filters";
 import type { UpdateBanner } from "./lib/types";
@@ -504,17 +505,7 @@ export default function App() {
           >
             <Logo size={17} />
             <span className="text-label font-medium">cadence</span>
-            <svg
-              width="10"
-              height="10"
-              viewBox="0 0 10 10"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.5"
-              className={`transition-transform ${menuOpen ? "rotate-180" : ""}`}
-            >
-              <path d="M2 3.5l3 3 3-3" />
-            </svg>
+            <IconChevron className={`transition-transform ${menuOpen ? "rotate-180" : ""}`} />
           </button>
           <div className="num text-label text-ink-500 min-w-0 truncate">
             <span className="hidden sm:inline text-ink-300">cadence</span>

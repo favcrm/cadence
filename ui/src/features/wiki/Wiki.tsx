@@ -3,6 +3,7 @@ import { fmtBytes } from "../../lib/fmt";
 import type { Route } from "../../lib/router";
 import { navigate } from "../../lib/useLocation";
 import Md from "../../ui/Md";
+import { IconCaret } from "../../ui/icons";
 import {
   blobPage,
   wiki,
@@ -238,9 +239,7 @@ export default function Wiki({ route, navHref, readOnly, actor, onToast }: WikiP
                     aria-expanded={row.expanded}
                     onClick={() => toggle(row.path)}
                   >
-                    <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.5">
-                      <path d="M3.5 2l3 3-3 3" />
-                    </svg>
+                    <IconCaret />
                   </button>
                 ) : (
                   <span className="wk-caret-space" />

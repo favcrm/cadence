@@ -6,6 +6,7 @@ import { cache, resources } from "../../lib/resources";
 import type { IssueCard, IssueHistoryEntry, WorkBlock } from "../../lib/types";
 import { useQuery } from "../../lib/useResource";
 import { ResourceGate, StaleChip } from "../../ui/ResourceStatus";
+import { IconChevron } from "../../ui/icons";
 import { HealthBadge, HealthReasons, ProgressBar } from "./HealthBadge";
 import {
   childrenOf,
@@ -136,18 +137,9 @@ function EpicRow({
         >
           <span className="num text-label text-accent shrink-0 pt-px">{epic.id}</span>
           <span className="text-cardtitle font-medium text-ink-100 min-w-0 break-words flex-1">{epic.title}</span>
-          <svg
-            width="10"
-            height="10"
-            viewBox="0 0 10 10"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="1.5"
+          <IconChevron
             className={`shrink-0 mt-1.5 text-ink-500 transition-transform ${open ? "rotate-180" : ""}`}
-            aria-hidden
-          >
-            <path d="M2 3.5l3 3 3-3" />
-          </svg>
+          />
         </button>
         <div className="flex flex-wrap items-center gap-1.5 mt-2">
           <span className="chip bg-accent/10 text-accent" title={w.stage?.exit ? `exit: ${w.stage.exit}` : undefined}>

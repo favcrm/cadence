@@ -12,6 +12,7 @@ import type {
 import Link from "../../ui/Link";
 import Md from "../../ui/Md";
 import { ResourceGate, StaleChip } from "../../ui/ResourceStatus";
+import { IconClose } from "../../ui/icons";
 import { homeNeeds, type HomeNeed } from "../home/needs";
 import RunForm from "../projects/RunForm";
 import ApproveApp from "./ApproveApp";
@@ -633,17 +634,7 @@ function RunDrawer({
             onClick={onClose}
             className="closebtn ml-auto shrink-0 w-8 h-8 grid place-items-center rounded border border-ink-600 text-ink-300 bg-ink-850"
           >
-            <svg
-              width="12"
-              height="12"
-              viewBox="0 0 12 12"
-              stroke="currentColor"
-              strokeWidth="1.5"
-              fill="none"
-              style={{ pointerEvents: "none" }}
-            >
-              <path d="M2 2l8 8M10 2l-8 8" />
-            </svg>
+            <IconClose style={{ pointerEvents: "none" }} />
           </button>
         </header>
         <div className="overflow-y-auto min-w-0">

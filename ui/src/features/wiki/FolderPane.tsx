@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type { Route } from "../../lib/router";
 import { fmtBytes } from "../../lib/fmt";
+import { IconFolder, IconGrid, IconList } from "../../ui/icons";
 import { wiki, wikiFileUrl, wikiRawUrl, type WikiEntry } from "./api";
 import { baseName, joinPath, parentPath } from "./paths";
 import { kindLabel, previewKind } from "./preview";
@@ -75,9 +76,7 @@ export default function FolderPane({
   if (rows.length === 0) {
     return (
       <div className="wk-empty card">
-        <svg width="34" height="34" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.1">
-          <path d="M2 4.5h4l1.2 1.5H14v6.5a1 1 0 01-1 1H3a1 1 0 01-1-1v-8z" />
-        </svg>
+        <IconFolder size={34} />
         <div className="wk-etitle">{dir ? `${dir}/ is empty` : `${"~/pm/wiki"} is empty`}</div>
         <div className="wk-ebody">
           {readOnly ? "nothing here yet — and writes are disabled for this board." : "start with New page, or drop files to upload."}
@@ -138,12 +137,7 @@ export default function FolderPane({
             aria-pressed={view === "grid"}
             onClick={() => setView("grid")}
           >
-            <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4">
-              <rect x="2" y="2" width="5" height="5" rx="1" />
-              <rect x="9" y="2" width="5" height="5" rx="1" />
-              <rect x="2" y="9" width="5" height="5" rx="1" />
-              <rect x="9" y="9" width="5" height="5" rx="1" />
-            </svg>
+            <IconGrid />
           </button>
           <button
             type="button"
@@ -152,9 +146,7 @@ export default function FolderPane({
             aria-pressed={view === "list"}
             onClick={() => setView("list")}
           >
-            <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4">
-              <path d="M2.5 4h11M2.5 8h11M2.5 12h11" />
-            </svg>
+            <IconList />
           </button>
         </span>
       </div>

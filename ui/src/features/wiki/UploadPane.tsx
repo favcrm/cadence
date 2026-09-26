@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { Route } from "../../lib/router";
 import { fmtBytes } from "../../lib/fmt";
+import { IconCheck, IconUpload, IconWarning } from "../../ui/icons";
 import { uploadFile } from "./api";
 import {
   capLabel,
@@ -114,10 +115,7 @@ export default function UploadPane({
         }}
       >
         <div className="wk-drop">
-          <svg width="34" height="34" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.2">
-            <path d="M8 11V4M8 4L5 7M8 4l3 3" />
-            <path d="M2 11.5v1.5a1 1 0 001 1h10a1 1 0 001-1v-1.5" />
-          </svg>
+          <IconUpload />
           <div className="wk-etitle">Drop files to upload</div>
           <div className="kicker">
             into {dir ? `${dir}/` : "~/pm/wiki"} · {capLabel()} per file
@@ -160,18 +158,12 @@ export default function UploadPane({
               <span className="wk-ustate">
                 {item.state === "done" ? (
                   <>
-                    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6">
-                      <path d="M3 8.5l3.4 3.4L13 5" />
-                    </svg>
+                    <IconCheck />
                     done
                   </>
                 ) : item.state === "error" ? (
                   <>
-                    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
-                      <path d="M8 2.4L14.4 13.2H1.6L8 2.4z" />
-                      <path d="M8 6.6v3" />
-                      <circle cx="8" cy="11.4" r=".7" fill="currentColor" stroke="none" />
-                    </svg>
+                    <IconWarning size={13} />
                     {item.error ?? "rejected"}
                   </>
                 ) : item.state === "uploading" ? (
