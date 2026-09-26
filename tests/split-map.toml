@@ -967,6 +967,7 @@ tests = [
     "master_wakes_once_when_a_delivery_is_merged_or_declined",
     "merged_delivery_marks_done_and_wakes_the_dependent_once",
     "master_wake_waits_queued_while_the_master_is_stopped",
+    "delivery_observe_stale_read_never_rewinds_a_passed_review",
 ]
 helpers = [
     "daemon_methods",

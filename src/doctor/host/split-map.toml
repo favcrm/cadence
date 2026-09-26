@@ -47,6 +47,9 @@ items = ["planned_load_warn_ratio", "check_load"]
 [config]
 items = ["check_config"]
 
+[layout]
+items = ["dir_value", "check_layout"]
+
 [tailnet]
 items = ["check_tailnet", "live_tailnet_verdict", "tailnet_remedy"]
 
