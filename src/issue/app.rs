@@ -787,6 +787,21 @@ pub fn approval_key(project: &str, name: &str) -> String {
     format!("{project}/{name}")
 }
 
+/// The Apps board's approval word (CAD-557) — why `approved` is false:
+/// `approved`, `changed` (a record exists but the digest moved — any
+/// bundle or binding edit re-gates the app), `unapproved` (no record),
+/// or `unknown` (the approval store did not read — never shown granted).
+fn approval_state(approvals: Option<&Map<String, Value>>, key: &str, digest: &str) -> &'static str {
+    let Some(approvals) = approvals else {
+        return "unknown";
+    };
+    match approvals.get(key) {
+        Some(p) if p["digest"].as_str() == Some(digest) => "approved",
+        Some(_) => "changed",
+        None => "unapproved",
+    }
+}
+
 /// Is `digest` the approved digest for `project/app`? An unreachable
 /// daemon is no approval — fail closed, like `plan propose` refusing.
 pub fn approved(
@@ -1657,6 +1672,7 @@ fn describe(
                 Some(a) => json!(approved(project, name, &d, Some(a))),
                 None => json!("unknown — daemon unreachable"),
             };
+            row["approval"] = json!(approval_state(approvals, &approval_key(project, name), &d));
         }
         Err(e) => row["error"] = json!(e.to_string()),
     }
@@ -1697,7 +1713,28 @@ pub fn show(pm: &Pm, project_key: &str, name: &str, state_dir: &Path) -> Result<
     let (agents, agent_sources) =
         workflow::known_agents(&pm.dir, Some(project_key), &daemon_agents);
     let mut workflows = Vec::new();
+    let mut rubrics = Vec::new();
     for (rel, path) in bundle_files(&dir)? {
+        if let Some(rb) = rel
+            .strip_prefix("rubrics/")
+            .and_then(|n| n.strip_suffix(".md"))
+        {
+            // A file verified real at scan could still be swapped for a
+            // link before the read — re-check the leaf, like
+            // `read_workflow` and `board_rows` do.
+            if path
+                .symlink_metadata()
+                .map(|m| !m.is_file())
+                .unwrap_or(true)
+            {
+                continue;
+            }
+            rubrics.push(json!({
+                "name": rb,
+                "body": std::fs::read_to_string(&path).unwrap_or_default(),
+            }));
+            continue;
+        }
         let Some(wf) = rel
             .strip_prefix("workflows/")
             .and_then(|n| n.strip_suffix(".md"))
@@ -1724,6 +1761,7 @@ pub fn show(pm: &Pm, project_key: &str, name: &str, state_dir: &Path) -> Result<
     let record = read_record(&pm.dir, project_key, name)?;
     out["guide"] = json!(manifest.guide);
     out["workflows"] = json!(workflows);
+    out["rubrics"] = json!(rubrics);
     out["record"] = serde_json::to_value(&record).unwrap_or(Value::Null);
     Ok(out)
 }

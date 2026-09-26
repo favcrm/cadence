@@ -38,6 +38,7 @@ use crate::error::{Error, Result};
 use crate::issue::{board, context, history, model, project, write as issue_write, Pm};
 use crate::proc::{self, BoundedError};
 
+mod apps;
 pub mod delivery_sync;
 mod home;
 mod login;
@@ -2006,6 +2007,17 @@ fn write_route(
         send(request, resp);
         return;
     }
+    // An app approval (CAD-557) — relayed to the daemon's
+    // `app_approve`, operator-only on the board (see `apps`).
+    if let Some((key, name)) = apps::approve_route(path) {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let resp = apps::approve(&mut request, state_dir, key, name);
+        send(request, resp);
+        return;
+    }
     if let Some(id) = home::answer_route(path) {
         if *method != Method::Post {
             send(request, err_response(405, "method not allowed"));
@@ -2377,12 +2389,15 @@ fn event_resources(name: &str) -> &'static [&'static str] {
             "issue",
             "overview",
             "workflows",
+            "apps",
+            "app",
             "outbox",
         ],
         "jobs" => &["issues", "agents", "issue", "overview", "outbox"],
         // A released publish lands an outbox item — the same event the
-        // effect row's state change produces.
-        "agents" => &["agents", "issue", "overview", "outbox"],
+        // effect row's state change produces. Agent rows change what an
+        // app's workflow checks resolve to, so apps refetch too.
+        "agents" => &["agents", "issue", "overview", "outbox", "apps", "app"],
         "monitoring" => &["overview"],
         _ => &[
             "issues",
@@ -2391,6 +2406,8 @@ fn event_resources(name: &str) -> &'static [&'static str] {
             "issue",
             "overview",
             "workflows",
+            "apps",
+            "app",
             "outbox",
         ],
     }
@@ -2915,6 +2932,16 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     }
                     return;
                 }
+            }
+            // `/api/apps[/<project>/<name>]` — installed apps: the
+            // list, or one app's guide, workflows, rubrics, bindings
+            // and doctor findings (CAD-557).
+            if let Some(read) = apps::read_route(&path) {
+                match Pm::at(pm_dir) {
+                    Ok(pm) => send(request, apps::read(&pm, state_dir, &query, read)),
+                    Err(e) => send(request, err_response(503, &e.to_string())),
+                }
+                return;
             }
             // `/api/memories/<project>/<slug>` — memory detail.
             if let Some(tail) = path.strip_prefix("/api/memories/") {

@@ -2,6 +2,8 @@ import { sessionHeaders } from "./sessionKey";
 import type {
   AgentDetail,
   AgentsPayload,
+  AppDetail,
+  AppsPayload,
   Health,
   IssueCard,
   IssueDetail,
@@ -311,6 +313,28 @@ export const api = {
   /** `GET /api/projects/<key>/workflows` — the project's stored workflows (CAD-496). */
   workflows: (project: string) =>
     get<WorkflowsPayload>(`/api/projects/${encodeURIComponent(project)}/workflows`),
+  /**
+   * `GET /api/apps` — every installed app, one row per `<project>/<app>`
+   * (CAD-557). `?project=` scopes the list to one project.
+   */
+  apps: (project?: string) =>
+    get<AppsPayload>(project ? `/api/apps?project=${encodeURIComponent(project)}` : "/api/apps"),
+  /**
+   * `GET /api/apps/<project>/<name>` — one app: guide, checked workflow
+   * summaries, rubrics, bindings, install record, doctor findings.
+   */
+  app: (project: string, name: string) =>
+    get<AppDetail>(`/api/apps/${encodeURIComponent(project)}/${encodeURIComponent(name)}`),
+  /**
+   * `POST /api/apps/<project>/<name>/approve` — relays the daemon's
+   * `app_approve`; operator-only on the board, so the body is `{}` —
+   * attribution is the board's proven connection, not a field.
+   */
+  appApprove: (project: string, name: string) =>
+    post<Record<string, unknown>>(
+      `/api/apps/${encodeURIComponent(project)}/${encodeURIComponent(name)}/approve`,
+      {},
+    ),
   /** `GET /api/outbox` — the `local` platform's published items (operator-only). */
   outbox: () => get<OutboxList>("/api/outbox"),
   /** `GET /api/outbox?effect_id=` — one item, rendered post included. */

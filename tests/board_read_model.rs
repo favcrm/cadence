@@ -692,7 +692,7 @@ fn tracker_writes_show_on_the_next_read_and_stream_as_entity_diffs() {
 
     // The stream: the legacy frame, unchanged, and the entity diffs.
     const ISSUES_FRAME: &str =
-        "event: issues\ndata: {\"resources\":[\"issues\",\"projects\",\"issue\",\"overview\",\"workflows\",\"outbox\"]}\n\n";
+        "event: issues\ndata: {\"resources\":[\"issues\",\"projects\",\"issue\",\"overview\",\"workflows\",\"apps\",\"app\",\"outbox\"]}\n\n";
     wait_for("an issue upsert for CAD-3 and the new issue", 10, || {
         let upserts = frames(&stream, "issue");
         upserts
@@ -741,7 +741,7 @@ fn tracker_writes_show_on_the_next_read_and_stream_as_entity_diffs() {
             .any(|f| f["op"] == "upsert" && f["id"] == "late" && f["agent"]["alias"] == "late")
     });
     assert!(stream.lock().unwrap().contains(
-        "event: agents\ndata: {\"resources\":[\"agents\",\"issue\",\"overview\",\"outbox\"]}\n\n"
+        "event: agents\ndata: {\"resources\":[\"agents\",\"issue\",\"overview\",\"outbox\",\"apps\",\"app\"]}\n\n"
     ));
     assert!(get_json(port, "/api/agents")["agents"]
         .as_array()

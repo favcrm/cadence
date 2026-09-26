@@ -3,6 +3,7 @@ import { api, type ApiError } from "../../lib/api";
 import { resources } from "../../lib/resources";
 import type { WorkflowRow } from "../../lib/types";
 import { useQuery } from "../../lib/useResource";
+import { useHref } from "../../lib/useLocation";
 import { ResourceGate, StaleChip } from "../../ui/ResourceStatus";
 import {
   approvalChip,
@@ -25,6 +26,10 @@ import type { Viewer } from "./work";
  * board's relay of the daemon's `plan_propose`, the same path
  * `cadence plan propose --workflow` takes. The plan it lands waits in
  * Home's Needs you like any other proposal.
+ *
+ * `?run=<name>` opens that row's form directly — an Apps card's Run
+ * links here with `<app>/<workflow>` (CAD-557), so the one form serves
+ * stored and bundled workflows alike.
  */
 export default function Workflows({
   project,
@@ -40,6 +45,15 @@ export default function Workflows({
   const state = useQuery(resources.workflows(project));
   const [open, setOpen] = useState<string | null>(null);
   const rows = state.data ?? [];
+  // `?run=<name>` asks for that row's New run form to be open — a deep
+  // link from an app's workflow row. Follows the param so a second Run
+  // click on this screen re-opens too; a name that resolves to no row
+  // is ignored.
+  const href = useHref();
+  const run = new URLSearchParams(href.split("?")[1] ?? "").get("run");
+  useEffect(() => {
+    if (run && (state.data ?? []).some((r) => r.name === run)) setOpen(run);
+  }, [run, state.data]);
 
   return (
     <main className="px-4 lg:px-8 pt-4 pb-9 min-w-0" aria-label="workflows">

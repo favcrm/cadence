@@ -981,3 +981,102 @@ export interface OutboxList {
 export interface OutboxDetail {
   item: OutboxItem & { post?: string | null };
 }
+
+/**
+ * The Apps board's approval word (CAD-557) — why `approved` is false:
+ * a matching recorded digest, a record whose digest moved (`changed`),
+ * none at all (`unapproved`), or an unreadable approval store
+ * (`unknown` — never shown as granted).
+ */
+export type AppApproval = "approved" | "changed" | "unapproved" | "unknown";
+
+/** Where an app was installed from — a git install pins its commit SHA. */
+export interface AppSource {
+  kind?: string;
+  path?: string;
+  url?: string;
+  sha?: string;
+}
+
+/** One declared connection slot and its effective binding. */
+export interface AppSlot {
+  slot: string;
+  /** The bound connection's name; `null` reads "unbound". */
+  bound: string | null;
+}
+
+/**
+ * `GET /api/apps` row — one installed app per project (`app::ls`).
+ * `error` marks a row that never described (a symlink, a stray record,
+ * a broken manifest) — the rest of the fields may be absent.
+ */
+export interface AppRow {
+  project: string;
+  name: string | null;
+  title?: string;
+  version?: string;
+  /** The bundle's workflow names — bare `do-check`, not `app/do-check`. */
+  workflows?: string[];
+  connections?: AppSlot[];
+  digest?: string;
+  approved?: boolean | string | null;
+  approval?: AppApproval | string;
+  source?: AppSource | null;
+  installed_at?: string;
+  installed_by?: string;
+  updated_at?: string;
+  error?: string;
+}
+
+export interface AppsPayload {
+  apps: AppRow[];
+  count: number;
+}
+
+/** One bundle workflow's checked summary, as `app show` reports it. */
+export interface AppWorkflow {
+  /** The app-qualified name — `studio/do-check`. */
+  name: string;
+  ok?: boolean;
+  errors?: string[];
+  notes?: string[];
+  title?: string | null;
+  tickets?: number | null;
+  inputs?: WorkflowInput[] | null;
+  uses?: string[];
+}
+
+/** A bundle rubric's name and body. */
+export interface AppRubric {
+  name: string;
+  body: string;
+}
+
+/**
+ * This app's row of `cadence app doctor` — its slot findings. Absent
+ * (`null`) when the app is missing from the scan.
+ */
+export interface AppDoctor {
+  project: string;
+  app: string;
+  slots_ok?: { slot: string; connection: string; verified?: string }[];
+  unbound?: string[];
+  unknown_connection?: { slot: string; connection: string }[];
+  stray_bindings?: string[];
+  connection_check?: string;
+}
+
+/**
+ * `GET /api/apps/<project>/<name>` — the row plus the agent guide, the
+ * checked workflow summaries, the rubrics, the install record and the
+ * doctor findings.
+ */
+export interface AppDetail extends Omit<AppRow, "workflows"> {
+  project: string;
+  name: string;
+  guide?: string;
+  workflows?: AppWorkflow[];
+  rubrics?: AppRubric[];
+  record?: Record<string, unknown> | null;
+  doctor?: AppDoctor | null;
+}
