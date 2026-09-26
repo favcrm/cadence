@@ -446,7 +446,7 @@ export default function App() {
         data-build-banner
         className="fixed inset-x-0 top-0 z-50 flex items-center justify-center gap-3 border-b border-ink-900/20 bg-warn px-4 py-2.5 text-ink-900"
       >
-        <span className="text-label font-medium">Cadence was updated — reload the tab</span>
+        <span className="text-label font-medium">Cadence was updated</span>
         <span className="num hidden sm:inline text-micro opacity-60">({staleBuild})</span>
         <button
           type="button"

@@ -776,7 +776,11 @@ fn sse_hello_names_the_build() {
     // serving build; the `: ping` liveness frame still follows it.
     let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(6))).unwrap();
-    write!(s, "GET /api/stream HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n").unwrap();
+    write!(
+        s,
+        "GET /api/stream HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n"
+    )
+    .unwrap();
     let mut got = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(6);
     while !String::from_utf8_lossy(&got).contains(": ping") {
@@ -796,6 +800,12 @@ fn sse_hello_names_the_build() {
         "event: hello\ndata: {{\"build\":\"{}\"}}",
         cadence_agent::overview::BUILD_ID
     );
-    assert!(text.contains(&hello), "the hello frame names the build: {text}");
-    assert!(text.contains(": ping"), "the liveness frame still follows: {text}");
+    assert!(
+        text.contains(&hello),
+        "the hello frame names the build: {text}"
+    );
+    assert!(
+        text.contains(": ping"),
+        "the liveness frame still follows: {text}"
+    );
 }
