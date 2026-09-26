@@ -24,8 +24,9 @@ function equal(actual: unknown, expected: unknown, what: string): void {
 // Every MVP route matches and prints back to the same path.
 const paths: [string, Route][] = [
   ["/", { screen: "home" }],
-  ["/projects", { screen: "projects", slug: null, section: "issues" }],
-  ["/projects/cadence", { screen: "projects", slug: "cadence", section: "issues" }],
+  ["/projects", { screen: "projects", slug: null, section: "overview" }],
+  ["/projects/cadence", { screen: "projects", slug: "cadence", section: "overview" }],
+  ["/projects/cadence/issues", { screen: "projects", slug: "cadence", section: "issues" }],
   ["/projects/cadence/context", { screen: "projects", slug: "cadence", section: "context" }],
   ["/projects/cadence/epics", { screen: "projects", slug: "cadence", section: "epics" }],
   ["/projects/cadence/milestones", { screen: "projects", slug: "cadence", section: "milestones" }],
@@ -124,7 +125,7 @@ equal(showProjectChoices(1, "cadence"), true, "a selected project stays visible"
     },
     "?unknown=keep&tag=stale&view=list&project=old",
   );
-  equal(href, "/projects/cadence?unknown=keep&view=kanban", "projects href");
+  equal(href, "/projects/cadence/issues?unknown=keep&view=kanban", "projects href");
   const home = locationHref(
     { route: { screen: "home" }, project: "cadence", view: "list", openId: "CAD-9", filters: NO_FILTERS },
     "?view=list&tab=board",
@@ -151,14 +152,14 @@ equal(showProjectChoices(1, "cadence"), true, "a selected project stays visible"
   const agents = readLocation("/agents", "?project=cadence");
   equal(
     locationHref(goTo(agents, { screen: "projects", slug: null, section: "issues" })),
-    "/projects/cadence?view=list",
+    "/projects/cadence/issues?view=list",
     "agents → projects keeps the scope as the slug",
   );
   equal(locationHref(openProject(here, "all")), "/projects?view=list&issue=CAD-3", "sidebar all projects opens the board");
   equal(
     locationHref(openProject(readLocation("/agents", "?project=kidult"), "cadence")),
-    "/projects/cadence?view=list",
-    "sidebar on agents opens the project page",
+    "/projects/cadence",
+    "sidebar on agents opens the project overview",
   );
   equal(
     locationHref(openProject(readLocation("/projects/cadence/epics", ""), "kidult")),
@@ -200,8 +201,8 @@ equal(showProjectChoices(1, "cadence"), true, "a selected project stays visible"
 // Pre-router URLs redirect to their new home, keeping scope, drawer and filters.
 const legacy: [string, string][] = [
   ["?tab=overview&project=cadence", "/"],
-  ["?tab=board&view=kanban&project=cadence&tag=ui", "/projects/cadence?view=kanban&tag=ui"],
-  ["?project=cadence&view=list", "/projects/cadence?view=list"],
+  ["?tab=board&view=kanban&project=cadence&tag=ui", "/projects/cadence/issues?view=kanban&tag=ui"],
+  ["?project=cadence&view=list", "/projects/cadence/issues?view=list"],
   ["?view=list", "/projects?view=list"],
   ["?tab=plan&project=cadence", "/projects/cadence/context"],
   ["?tab=plan", "/projects?view=list"],
@@ -235,3 +236,7 @@ equal(legacyRedirect("/index.html", "?tab=agents"), "/agents", "index.html with 
 equal(legacyRedirect("/index.html", ""), "/", "bare index.html");
 
 console.log("router checks passed");
+
+// A plain Projects entry is overview; existing board bookmarks remain Issues.
+equal(readLocation("/projects", "").route, { screen: "projects", slug: null, section: "overview" }, "portfolio landing");
+equal(readLocation("/projects/cadence", "?view=list").route, { screen: "projects", slug: "cadence", section: "issues" }, "legacy issue bookmark");

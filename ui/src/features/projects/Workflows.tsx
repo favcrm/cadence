@@ -55,15 +55,16 @@ export default function Workflows({
       <div className="flex flex-wrap items-center gap-2 mb-3">
         <h1 className="text-section font-semibold text-ink-100">Workflows</h1>
         <StaleChip state={state} />
-        <span className="kicker">
-          {project}/workflows · next to PROJECT.md
-        </span>
+
       </div>
+      <p className="text-label text-ink-500 mb-5">Start repeatable work from a workflow. Review its plan before agents begin.</p>
       <ResourceGate state={state} loading="loading workflows…" failed="could not load workflows" onRetry={() => void resources.workflows(project).invalidate()} />
       {state.data && rows.length === 0 && (
         <div className="card px-4 py-5 text-secondary text-ink-400">
-          No workflows in {project} yet —{" "}
-          <span className="num">cadence workflow add</span> stores one beside PROJECT.md.
+          <h2 className="text-section text-ink-100 font-semibold">No workflows yet</h2>
+          <p className="mt-2 max-w-xl">Workflows turn recurring work into a repeatable plan. Installed apps can also provide workflows.</p>
+          <Link href="/apps" className="lnk inline-block mt-4">Explore apps ↗</Link>
+          <details className="mt-4 text-label"><summary className="cursor-pointer text-ink-500">Add a project workflow</summary><p className="mt-2">Use <code className="num">cadence workflow add</code> to store a workflow for {project}.</p></details>
         </div>
       )}
       <ul className="space-y-2.5">

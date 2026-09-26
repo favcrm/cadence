@@ -342,7 +342,7 @@ export default function Board({
   // drop-target highlight so swimlanes light up one cell, not a column.
   const columns = (laneCards: IssueCard[], lane: string, quickAdd: boolean) => (
       <div className="grid grid-flow-col auto-cols-[minmax(232px,78vw)] lg:auto-cols-[minmax(0,1fr)] gap-3 overflow-x-auto lg:overflow-visible pb-2 snap-x snap-mandatory lg:snap-none">
-      {COLS.map(([key, name, wip], ci) => {
+      {COLS.filter(([key]) => key !== "done" || filters.showDone).map(([key, name, wip], ci) => {
         const showAdd = quickAdd && !readOnly;
         const cards = laneCards
           .filter((t) => t.status === key)
@@ -410,7 +410,7 @@ export default function Board({
               <span className="kicker num">
                 {doneHidden > 0 ? doneHidden : cards.length}
                 {/* The WIP limit is board-wide — a lane shows its count only. */}
-                  {wip && lane === "" ? ` of ${wip} wip` : ""}
+                  {wip && lane === "" ? ` · limit ${wip}` : ""}
               </span>
             </header>
             <div className="p-2.5 space-y-2.5 flex-1">
@@ -460,7 +460,7 @@ export default function Board({
   const loose = visible.filter((t) => !t.parent);
 
   return (
-    <main className="px-4 lg:px-8 pt-6 pb-9 max-w-[106rem] w-full">
+    <main className="px-4 lg:px-8 pt-6 pb-9 w-full">
       {health && !health.pm_present && (
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mb-5 reveal">
           <span className="chip bg-warn/10 text-warn">no pm dir</span>
@@ -472,7 +472,7 @@ export default function Board({
       )}
 
       {fencedAgents.length > 0 && (
-        <div className="card mb-4 px-4 py-3 flex flex-wrap items-center gap-x-4 gap-y-2 border-fail/40 reveal">
+        <details className="card mb-4 px-4 py-3 border-warn/30 reveal"><summary className="text-label text-warn cursor-pointer">{fencedAgents.length} agents need attention · View details</summary><div className="flex flex-wrap items-center gap-x-4 gap-y-2 mt-3">
           <span className="chip bg-fail/10 text-fail">
             {fencedAgents.length} fenced
           </span>
@@ -487,7 +487,7 @@ export default function Board({
           >
             open Agents →
           </button>
-        </div>
+        </div></details>
       )}
 
       <div
@@ -519,11 +519,12 @@ export default function Board({
           value={query}
           onChange={(e) => onQuery(e.target.value)}
           className="field w-full sm:w-64"
+          aria-label="Search issues, owners or tags"
           placeholder="Search issues, owners or tags"
         />
       </div>
 
-      <section
+      <details className="mb-4"><summary className="text-label text-ink-400 cursor-pointer">Team status · {totals?.running ?? "—"} running · {totals?.queued ?? "—"} queued{fencedAgents.length > 0 ? ` · ${fencedAgents.length} need attention` : ""}</summary><div className="mt-3">      <section
         className="card mb-4 px-4 py-2.5 flex flex-wrap items-center gap-x-5 gap-y-2 reveal"
         style={{ animationDelay: "80ms" }}
         aria-label="Runtime"
@@ -646,6 +647,7 @@ export default function Board({
           </div>
         </div>
       </section>
+</div></details>
 
       <ResourceGate
         state={issuesState}

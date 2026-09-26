@@ -5,6 +5,7 @@ import Apps from "./features/apps/Apps";
 import AppDetail from "./features/apps/AppDetail";
 import Board from "./features/projects/Board";
 import Drawer from "./features/projects/Drawer";
+import ProjectsOverview from "./features/projects/ProjectsOverview";
 import Epics from "./features/projects/Epics";
 import Milestones from "./features/projects/Milestones";
 import Memory from "./features/settings/Memory";
@@ -532,7 +533,7 @@ export default function App() {
             <span className="text-ink-100">{SCREEN_LABEL[screen]}</span>
           </div>
 
-          <div className="ml-auto flex items-center gap-2 shrink-0">
+          <div className="ml-auto flex items-center gap-1 sm:gap-2 shrink-0">
             <StatusChips
               variant="header"
               readOnly={boardReadOnly}
@@ -664,6 +665,7 @@ export default function App() {
           <SectionTabs
             label={route.slug}
             tabs={[
+              { label: "Overview", href: hrefFor({ ...route, section: "overview" }), on: route.section === "overview" },
               { label: "Issues", href: hrefFor({ ...route, section: "issues" }), on: route.section === "issues" },
               { label: "Epics", href: hrefFor({ ...route, section: "epics" }), on: route.section === "epics" },
               {
@@ -679,6 +681,9 @@ export default function App() {
               { label: "Context", href: hrefFor({ ...route, section: "context" }), on: route.section === "context" },
             ]}
           />
+        )}
+        {route.screen === "projects" && route.section === "overview" && (
+          <ProjectsOverview project={project} projects={projects} issues={issuesState} onOpenIssue={openIssue} onRetry={() => void resources.issues.refresh()} />
         )}
         {route.screen === "projects" && route.section === "issues" && (
           <Board

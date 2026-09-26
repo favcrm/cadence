@@ -55,9 +55,12 @@ export default function Epics({
   onOpenIssue: (id: string) => void;
   onRetry: () => void;
 }) {
+  const [showCompleted, setShowCompleted] = useState(false);
   const [open, setOpen] = useState<string | null>(null);
   const cards = issues.data ?? [];
-  const epics = epicsOf(cards, project);
+  const allEpics = epicsOf(cards, project);
+  const completed = allEpics.filter((e) => e.status === "done" || e.status === "dropped");
+  const epics = allEpics.filter((e) => showCompleted || !completed.includes(e)).sort((a, b) => Number(b.work.health?.state === "at_risk" || b.work.health?.state === "stalled") - Number(a.work.health?.state === "at_risk" || a.work.health?.state === "stalled"));
   const notes = [
     ...new Set(epics.flatMap((e) => [e.work.config_unapproved, e.work.config_error].filter(Boolean) as string[])),
   ];
@@ -71,6 +74,7 @@ export default function Epics({
     <main className="px-4 lg:px-8 pt-4 pb-9 min-w-0" aria-label="epics">
       <div className="flex flex-wrap items-center gap-2 mb-3">
         <h1 className="text-section font-semibold text-ink-100">Epics</h1>
+        {completed.length > 0 && <button className="lnk text-label ml-auto" aria-pressed={showCompleted} onClick={() => setShowCompleted(!showCompleted)}>{showCompleted ? "Hide" : "Show"} completed ({completed.length})</button>}
         <StaleChip state={issues} />
         {epics.length > 0 && (
           <span className="text-label text-ink-500 num">
@@ -78,6 +82,7 @@ export default function Epics({
           </span>
         )}
       </div>
+      <p className="text-label text-ink-500 mb-5">Larger outcomes, their progress, and the work holding them back.</p>
       <ResourceGate state={issues} loading="loading epics…" failed="could not load epics" onRetry={onRetry} />
       {notes.map((n) => (
         <p key={n} className="card mb-3 px-3.5 py-2.5 text-label text-warn break-words" role="note">
@@ -86,7 +91,7 @@ export default function Epics({
       ))}
       {issues.data && epics.length === 0 && (
         <div className="card px-4 py-5 text-secondary text-ink-400">
-          No epics in {project} yet. An issue with children, or one set <span className="num">type=epic</span>, is an
+          No active epics in {project}. An issue with children, or one set <span className="num">type=epic</span>, is an
           epic.
         </div>
       )}

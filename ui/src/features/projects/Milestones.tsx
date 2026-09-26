@@ -40,6 +40,7 @@ export default function Milestones({
         <h1 className="text-section font-semibold text-ink-100">Milestones</h1>
         <StaleChip state={state} />
       </div>
+      <p className="text-label text-ink-500 mb-5">Release goals across your epics and issues. Progress is weighted by work size.</p>
       <ResourceGate
         state={state}
         loading="loading milestones…"
@@ -64,8 +65,8 @@ export default function Milestones({
                     <span className="num text-label text-info">{m.id}</span>
                     <HealthBadge view={health} />
                     {!m.configured && (
-                      <span className="chip bg-ink-800 text-ink-500" title="named by an issue, not in PROJECT.md">
-                        unlisted
+                      <span className="chip bg-ink-800 text-ink-500" title="This milestone is referenced by issues but has no project definition">
+                        From issues
                       </span>
                     )}
                   </div>
