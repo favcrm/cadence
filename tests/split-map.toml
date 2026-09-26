@@ -1105,3 +1105,43 @@ tests = [
 helpers = [
     "wait_monitor_check_after",
 ]
+
+[binaries.wiki]
+tests = [
+    "operator_roundtrip_write_read_ls_mv_rm_restore_history",
+    "if_rev_optimistic_concurrency_conflicts_instead_of_losing_updates",
+    "blob_upload_hashes_caps_and_commits_pointer",
+    "blob_upload_roundtrip_and_tmp_confinement",
+    "svg_blob_records_svg_mime",
+    "traversal_is_refused_everywhere",
+    "refused_upload_never_deletes_a_shared_blob",
+    "profile_and_memory_views_are_read_only",
+    "users_area_is_member_private",
+    "public_caller_reads_shared_areas_only",
+    "agent_writes_own_areas_only",
+    "agent_traversal_after_a_valid_root_is_refused",
+    "agent_forged_identity_fields_are_refused",
+    "unproven_callers_are_refused",
+    "agent_upload_and_rm_follow_the_same_acl",
+    "board_operator_write_read_upload_svg_and_ranges",
+    "board_write_guards_and_path_stays_the_daemons",
+    "board_unadmitted_and_unattributed_writes_refuse",
+    "board_agent_writes_only_its_areas",
+    "board_upload_and_caps_apply_per_caller",
+]
+helpers = [
+    "Fx",
+    "fx",
+    "fx_with_cap",
+    "vault",
+    "refused",
+    "write_op",
+    "read_op",
+    "read_op_err",
+    "BFx",
+    "bfx",
+    "get_as",
+    "put_as",
+    "upload_as",
+    "op_get",
+]
