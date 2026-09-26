@@ -13,6 +13,9 @@ import { readAppUrlState, type AppTab, type ProjectView } from "./urlState";
  *   /projects/:slug/context    its context
  *   /projects/:slug/workflows  its stored workflows and new runs (CAD-496)
  *   /agents[/:alias]           agents, optionally one agent's drawer
+ *   /apps[/:app[/:section[/:arg]]]
+ *                              installed apps — social-content's sections,
+ *                              `post` section carries the post id as :arg
  *   /setup                     first-run setup
  *   /settings[/memory]         model defaults, memory
  *   /login                     a `cadence ui login` link lands here
@@ -32,6 +35,15 @@ export type Route =
   | { screen: "overview" }
   | { screen: "projects"; slug: string | null; section: ProjectSection }
   | { screen: "agents"; alias: string | null }
+  | {
+      screen: "apps";
+      /** The installed app's name; null on the Installed list. */
+      app: string | null;
+      /** A section inside the app; null lands on its default screen. */
+      section: string | null;
+      /** A section's own argument — `post` carries the post id. */
+      arg: string | null;
+    }
   | { screen: "setup" }
   | { screen: "settings"; section: SettingsSection }
   | { screen: "login" }
@@ -44,6 +56,7 @@ export const NAV: { screen: Screen; label: string; route: Route }[] = [
   { screen: "home", label: "Home", route: { screen: "home" } },
   { screen: "projects", label: "Projects", route: { screen: "projects", slug: null, section: "issues" } },
   { screen: "agents", label: "Agents", route: { screen: "agents", alias: null } },
+  { screen: "apps", label: "Apps", route: { screen: "apps", app: null, section: null, arg: null } },
   { screen: "settings", label: "Settings", route: { screen: "settings", section: "models" } },
 ];
 
@@ -67,7 +80,7 @@ function segment(value: string): string | null {
 
 export function matchRoute(pathname: string): Route {
   const parts = pathname.split("/").filter(Boolean);
-  const [head, a, b, ...rest] = parts;
+  const [head, a, b, c, ...rest] = parts;
   if (rest.length === 0) {
     if (!head && !a) return { screen: "home" };
     if (head === "index.html" && !a) return { screen: "home" };
@@ -83,6 +96,17 @@ export function matchRoute(pathname: string): Route {
       if (!a) return { screen: "agents", alias: null };
       const alias = segment(a);
       if (alias) return { screen: "agents", alias };
+    }
+    if (head === "apps") {
+      if (!a) return { screen: "apps", app: null, section: null, arg: null };
+      const app = segment(a);
+      if (!app) return { screen: "notFound", path: pathname };
+      if (!b) return { screen: "apps", app, section: null, arg: null };
+      const section = segment(b);
+      if (!section) return { screen: "notFound", path: pathname };
+      if (!c) return { screen: "apps", app, section, arg: null };
+      const arg = segment(c);
+      if (arg) return { screen: "apps", app, section, arg };
     }
     if (head === "setup" && !a) return { screen: "setup" };
     if (head === "login" && !a) return { screen: "login" };
@@ -106,6 +130,13 @@ export function routePath(route: Route): string {
     }
     case "agents":
       return route.alias ? `/agents/${encodeURIComponent(route.alias)}` : "/agents";
+    case "apps": {
+      if (!route.app) return "/apps";
+      const base = `/apps/${encodeURIComponent(route.app)}`;
+      if (!route.section) return base;
+      const sec = `${base}/${encodeURIComponent(route.section)}`;
+      return route.arg ? `${sec}/${encodeURIComponent(route.arg)}` : sec;
+    }
     case "setup":
       return "/setup";
     case "login":

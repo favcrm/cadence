@@ -17,6 +17,8 @@ import SectionTabs from "./ui/SectionTabs";
 import StatusChips from "./ui/StatusChips";
 import ThemeToggle from "./ui/ThemeToggle";
 import Setup from "./features/setup/Setup";
+import Apps from "./features/apps/Apps";
+import SocialContent from "./features/apps/social-content/SocialContent";
 import SetupNudge from "./features/setup/SetupNudge";
 import Login from "./features/auth/Login";
 import SignIn from "./features/auth/SignIn";
@@ -64,6 +66,7 @@ const SCREEN_LABEL: Record<Screen, string> = {
   overview: "overview",
   projects: "projects",
   agents: "agents",
+  apps: "apps",
   setup: "setup",
   settings: "settings",
   login: "sign in",
@@ -609,6 +612,26 @@ export default function App() {
             contextError={projectContextErrorProject === project ? projectContextError : null}
             onRetryContext={() => setProjectContextRefresh((value) => value + 1)}
           />
+        )}
+        {route.screen === "apps" && !route.app && (
+          <Apps socialHref={hrefFor({ screen: "apps", app: "social-content", section: "home", arg: null })} />
+        )}
+        {route.screen === "apps" && route.app === "social-content" && (
+          <SocialContent route={route} hrefFor={hrefFor} say={say} />
+        )}
+        {route.screen === "apps" && route.app && route.app !== "social-content" && (
+          <main className="px-4 lg:px-8 pt-10 pb-9">
+            <h1 className="text-section font-semibold text-ink-100">App not installed</h1>
+            <p className="text-body text-ink-400 mt-2">
+              <span className="num break-all">{route.app}</span> is not on this board.{" "}
+              <Link
+                href={hrefFor({ screen: "apps", app: null, section: null, arg: null })}
+                className="lnk"
+              >
+                See installed apps
+              </Link>
+            </p>
+          </main>
         )}
         {route.screen === "agents" && (
           <Agents

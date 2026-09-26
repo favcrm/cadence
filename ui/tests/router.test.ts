@@ -28,6 +28,14 @@ const paths: [string, Route][] = [
   ["/projects/cadence/workflows", { screen: "projects", slug: "cadence", section: "workflows" }],
   ["/agents", { screen: "agents", alias: null }],
   ["/agents/cc-1", { screen: "agents", alias: "cc-1" }],
+  ["/apps", { screen: "apps", app: null, section: null, arg: null }],
+  ["/apps/social-content", { screen: "apps", app: "social-content", section: null, arg: null }],
+  ["/apps/social-content/home", { screen: "apps", app: "social-content", section: "home", arg: null }],
+  ["/apps/social-content/library", { screen: "apps", app: "social-content", section: "library", arg: null }],
+  ["/apps/social-content/runs", { screen: "apps", app: "social-content", section: "runs", arg: null }],
+  ["/apps/social-content/needs", { screen: "apps", app: "social-content", section: "needs", arg: null }],
+  ["/apps/social-content/post/p3", { screen: "apps", app: "social-content", section: "post", arg: "p3" }],
+  ["/apps/social-content/settings", { screen: "apps", app: "social-content", section: "settings", arg: null }],
   ["/setup", { screen: "setup" }],
   ["/overview", { screen: "overview" }],
   ["/settings", { screen: "settings", section: "models" }],
@@ -42,12 +50,12 @@ equal(matchRoute("/projects/cadence/"), matchRoute("/projects/cadence"), "traili
 equal(matchRoute("/agents/a%20b"), { screen: "agents", alias: "a b" }, "decoded alias");
 equal(routePath({ screen: "agents", alias: "a b" }), "/agents/a%20b", "encoded alias");
 equal(matchRoute("/index.html"), { screen: "home" }, "index.html is home");
-for (const dead of ["/overview/x", "/nope", "/projects/x/y", "/agents/a/b", "/settings/nope", "/setup/x", "/login/x", "/projects/%E0"]) {
+for (const dead of ["/overview/x", "/nope", "/projects/x/y", "/agents/a/b", "/settings/nope", "/setup/x", "/login/x", "/projects/%E0", "/apps/%E0", "/apps/x/y/z/w"]) {
   equal(matchRoute(dead).screen, "notFound", `not found ${dead}`);
 }
 
-// Main nav: MVP screens only.
-equal(NAV.map((n) => n.label), ["Home", "Projects", "Agents", "Settings"], "nav");
+// Main nav: MVP screens plus Apps (CAD-550).
+equal(NAV.map((n) => n.label), ["Home", "Projects", "Agents", "Apps", "Settings"], "nav");
 
 // Reading a location: the slug is the scope on Projects, ?project= elsewhere.
 {

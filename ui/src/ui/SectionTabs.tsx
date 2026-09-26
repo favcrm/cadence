@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import Link from "./Link";
 
 /** A screen's sub-sections as links (Projects → issues / context, Settings → models / memory). */
@@ -6,14 +7,14 @@ export default function SectionTabs({
   tabs,
 }: {
   label: string;
-  tabs: { label: string; href: string; on: boolean }[];
+  tabs: { label: ReactNode; href: string; on: boolean }[];
 }) {
   return (
     <nav className="px-4 lg:px-8 pt-4 flex items-center gap-1.5 min-w-0" aria-label={`${label} sections`}>
       <span className="kicker truncate mr-1.5">{label}</span>
       {tabs.map((t) => (
         <Link
-          key={t.label}
+          key={t.href}
           href={t.href}
           replace
           aria-current={t.on ? "page" : undefined}
