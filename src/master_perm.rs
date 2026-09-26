@@ -120,6 +120,13 @@ pub struct Request {
     /// `pending`, `allowed`, `rejected`, `expired`.
     pub status: String,
     pub risk: Risk,
+    /// How the operator decided, once it is no longer pending:
+    /// `allow_once`, `always`, or `reject`. Empty while pending.
+    #[serde(default)]
+    pub decision: String,
+    /// The line the decision card shows after the operator acts.
+    #[serde(default)]
+    pub decision_label: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -166,11 +173,26 @@ fn doc_path(state_dir: &Path) -> PathBuf {
     state_dir.join(DOC_FILE)
 }
 
-fn rules_path(pm_dir: &Path) -> PathBuf {
-    pm_dir
-        .join("agents")
-        .join(crate::master::ALIAS)
-        .join(PERMISSIONS_FILE)
+fn alias_ok(alias: &str) -> Result<()> {
+    if !alias.is_empty()
+        && alias.len() <= 64
+        && alias
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        Ok(())
+    } else {
+        Err(Error::rejected(
+            "a permissions file is agents/<alias>/permissions.yaml — the alias is a short slug",
+        ))
+    }
+}
+
+/// `agents/<alias>/permissions.yaml`. The schema is per agent so a later
+/// worker ticket can reuse it. This ticket only loads the master's file.
+pub fn rules_file(pm_dir: &Path, alias: &str) -> Result<PathBuf> {
+    alias_ok(alias)?;
+    Ok(pm_dir.join("agents").join(alias).join(PERMISSIONS_FILE))
 }
 
 fn load_doc(state_dir: &Path) -> Result<Doc> {
@@ -196,8 +218,8 @@ fn save_doc(state_dir: &Path, doc: &Doc) -> Result<()> {
     Ok(())
 }
 
-fn load_rules(pm_dir: &Path) -> Result<Vec<Rule>> {
-    let path = rules_path(pm_dir);
+fn load_rules(pm_dir: &Path, alias: &str) -> Result<Vec<Rule>> {
+    let path = rules_file(pm_dir, alias)?;
     if !path.exists() {
         return Ok(vec![]);
     }
@@ -569,6 +591,8 @@ pub fn ask(
                     expires_at: now + TTL_SECS,
                     status: "pending".into(),
                     risk,
+                    decision: String::new(),
+                    decision_label: String::new(),
                 };
                 doc.requests.push(req.clone());
                 Ok(req)
@@ -601,12 +625,11 @@ fn pending<'a>(doc: &'a mut Doc, id: &str, now: i64) -> Result<&'a mut Request> 
 /// Allow the request's exact argv and cwd once.
 pub fn allow_once(state_dir: &Path, id: &str, now: i64) -> Result<Request> {
     with_doc(state_dir, now, |doc| {
-        let req = pending(doc, id, now)?.clone();
-        doc.requests
-            .iter_mut()
-            .find(|r| r.id == id)
-            .expect("pending")
-            .status = "allowed".into();
+        let req = pending(doc, id, now)?;
+        req.status = "allowed".into();
+        req.decision = "allow_once".into();
+        req.decision_label = "Allowed once".into();
+        let req = req.clone();
         doc.grants.push(Grant {
             id: fresh_id("mg"),
             request_id: req.id.clone(),
@@ -752,11 +775,26 @@ pub fn always_rule(
                 "that rule does not match the requested command — it cannot widen to a different verb",
             ));
         }
-        doc.requests
+        let label = match draft.scope {
+            Scope::Exact => format!("Always: `{}`", draft.argv.join(" ")),
+            Scope::Prefix => format!(
+                "Always: `{} {}`",
+                draft.argv.join(" "),
+                draft.tail.join(" ")
+            ),
+        };
+        let stored = doc
+            .requests
             .iter_mut()
             .find(|r| r.id == id)
-            .expect("pending")
-            .status = "allowed".into();
+            .expect("pending");
+        stored.status = "allowed".into();
+        stored.decision = "always".into();
+        stored.decision_label = label.clone();
+        let mut req = req;
+        req.status = "allowed".into();
+        req.decision = "always".into();
+        req.decision_label = label;
         Ok((req, draft))
     })
 }
@@ -770,12 +808,23 @@ pub fn reject(
     now: i64,
 ) -> Result<(Request, Option<Rule>)> {
     with_doc(state_dir, now, |doc| {
-        let req = pending(doc, id, now)?.clone();
-        doc.requests
+        let mut req = pending(doc, id, now)?.clone();
+        let label = if dont_ask_again {
+            "Rejected — won't ask again".to_string()
+        } else {
+            "Rejected".to_string()
+        };
+        let stored = doc
+            .requests
             .iter_mut()
             .find(|r| r.id == id)
-            .expect("pending")
-            .status = "rejected".into();
+            .expect("pending");
+        stored.status = "rejected".into();
+        stored.decision = "reject".into();
+        stored.decision_label = label.clone();
+        req.status = "rejected".into();
+        req.decision = "reject".into();
+        req.decision_label = label;
         let rule = dont_ask_again.then(|| Rule {
             id: fresh_id("mr"),
             effect: Effect::Deny,
@@ -797,18 +846,20 @@ pub fn reopen(state_dir: &Path, id: &str, now: i64) -> Result<()> {
         if let Some(req) = doc.requests.iter_mut().find(|r| r.id == id) {
             if req.status == "allowed" || req.status == "rejected" {
                 req.status = "pending".into();
+                req.decision.clear();
+                req.decision_label.clear();
             }
         }
         Ok(())
     })
 }
 
-pub fn read_rules(pm_dir: &Path) -> Result<Vec<Rule>> {
-    load_rules(pm_dir)
+pub fn read_rules(pm_dir: &Path, alias: &str) -> Result<Vec<Rule>> {
+    load_rules(pm_dir, alias)
 }
 
-pub fn write_rules(pm_dir: &Path, rules: &[Rule]) -> Result<PathBuf> {
-    let path = rules_path(pm_dir);
+pub fn write_rules(pm_dir: &Path, alias: &str, rules: &[Rule]) -> Result<PathBuf> {
+    let path = rules_file(pm_dir, alias)?;
     if path.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
         return Err(Error::rejected(
             "agents/master/permissions.yaml is a symlink — refusing to write it",
@@ -830,14 +881,14 @@ pub fn write_rules(pm_dir: &Path, rules: &[Rule]) -> Result<PathBuf> {
 }
 
 /// Drop a rule by id. Returns the removed rule.
-pub fn revoke_rule(pm_dir: &Path, id: &str) -> Result<Rule> {
-    let mut rules = load_rules(pm_dir)?;
+pub fn revoke_rule(pm_dir: &Path, alias: &str, id: &str) -> Result<Rule> {
+    let mut rules = load_rules(pm_dir, alias)?;
     let pos = rules
         .iter()
         .position(|r| r.id == id)
         .ok_or_else(|| Error::rejected(format!("no permission rule '{id}'")))?;
     let rule = rules.remove(pos);
-    write_rules(pm_dir, &rules)?;
+    write_rules(pm_dir, alias, &rules)?;
     Ok(rule)
 }
 
@@ -907,7 +958,10 @@ fn decide_use(
         )));
     }
     let cwd_s = cwd.to_string_lossy().into_owned();
-    let rules = pm_dir.map(load_rules).transpose()?.unwrap_or_default();
+    let rules = match pm_dir {
+        Some(dir) => load_rules(dir, crate::master::ALIAS)?,
+        None => Vec::new(),
+    };
     if rules
         .iter()
         .any(|r| r.effect == Effect::Deny && rule_matches(r, argv, &cwd_s))
@@ -959,6 +1013,21 @@ pub fn pending_requests(state_dir: &Path, now: i64) -> Result<Vec<Request>> {
         .collect())
 }
 
+/// Requests the board still shows: pending ones, and decided ones that
+/// have not expired, so the chat card and the rail update in place.
+pub fn board_requests(state_dir: &Path, now: i64) -> Result<Vec<Request>> {
+    let lock = dir_lock(state_dir);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let mut doc = load_doc(state_dir)?;
+    expire(&mut doc, now);
+    save_doc(state_dir, &doc)?;
+    Ok(doc
+        .requests
+        .into_iter()
+        .filter(|r| matches!(r.status.as_str(), "pending" | "allowed" | "rejected"))
+        .collect())
+}
+
 /// A narrowed prefix the board can offer: the last path argument with
 /// its final segment replaced by `*`. `None` when that would not be
 /// narrower than the verb.
@@ -988,6 +1057,8 @@ pub fn request_json(req: &Request) -> Value {
         "created": req.created,
         "expires_at": req.expires_at,
         "status": req.status,
+        "decision": req.decision,
+        "decision_label": req.decision_label,
         "risk": req.risk.as_str(),
         "command": req.argv.join(" "),
         "prefix": suggest_tail(&req.argv),
@@ -1338,7 +1409,7 @@ mod tests {
             by: "operator".into(),
             at: 3_000,
         };
-        write_rules(&pm, &[allow, deny]).unwrap();
+        write_rules(&pm, "master", &[allow, deny]).unwrap();
         let err = take(
             dir.path(),
             Some(pm.as_path()),
@@ -1351,7 +1422,7 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("deny rule"), "{err}");
-        revoke_rule(&pm, "mr-deny").unwrap();
+        revoke_rule(&pm, "master", "mr-deny").unwrap();
         let used = take(
             dir.path(),
             Some(pm.as_path()),
@@ -1422,7 +1493,7 @@ mod tests {
         )
         .unwrap();
         let (_r, rule) = always_rule(dir.path(), &req.id, Scope::Exact, &[], 4_000).unwrap();
-        write_rules(&pm, &[rule.clone()]).unwrap();
+        write_rules(&pm, "master", &[rule.clone()]).unwrap();
         assert!(peek(
             dir.path(),
             Some(pm.as_path()),
@@ -1433,7 +1504,7 @@ mod tests {
             4_001,
         )
         .unwrap());
-        revoke_rule(&pm, &rule.id).unwrap();
+        revoke_rule(&pm, "master", &rule.id).unwrap();
         assert!(!peek(
             dir.path(),
             Some(pm.as_path()),
@@ -1472,5 +1543,32 @@ mod tests {
             .to_string();
         assert!(err.contains("expired"), "{err}");
         let _ = Duration::from_millis(0);
+    }
+
+    #[test]
+    fn rules_file_is_per_agent_and_a_second_decision_is_refused() {
+        let dir = tmp();
+        let master = rules_file(dir.path(), "master").unwrap();
+        let worker = rules_file(dir.path(), "worker-1").unwrap();
+        assert!(master.ends_with("agents/master/permissions.yaml"));
+        assert!(worker.ends_with("agents/worker-1/permissions.yaml"));
+        assert!(rules_file(dir.path(), "../master").is_err());
+        let cwd = fs::canonicalize(dir.path()).unwrap();
+        let req = ask(
+            dir.path(),
+            &["cadence".into(), "issue".into(), "new".into(), "T".into()],
+            &cwd,
+            "need a ticket",
+            "master",
+            &[],
+            &[],
+            1_000,
+        )
+        .unwrap();
+        allow_once(dir.path(), &req.id, 1_000).unwrap();
+        let err = allow_once(dir.path(), &req.id, 1_001)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot be decided again"), "{err}");
     }
 }
