@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use cadence_agent::adapter::pi::PiAdapter;
 use cadence_agent::adapter::{registry, AdapterHooks, ProviderAdapter, ProviderEnv};
 use cadence_agent::store::Agent;
+use common::in_own_process;
 use common::pi_policy_pm;
 use serde_json::{json, Value};
 
@@ -535,25 +536,34 @@ fn the_emitted_pi_policy_is_pis_own_dirs_never_claudes() {
 /// environment — credentials planted in the daemon's env (the review's
 /// names and neighbours) never reach the child; only the allowlist and
 /// the daemon-injected pairs do.
+const PLANTED_ENV: &[&str] = &[
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "MOONSHOT_API_KEY",
+    "TOGETHER_API_KEY",
+    "MINIMAX_API_KEY",
+    "ZAI_CN_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "COPILOT_GITHUB_TOKEN",
+    "OPENAI_API_KEY",
+    "SSH_AUTH_SOCK",
+    "GIT_SSH_COMMAND",
+    "NODE_OPTIONS",
+    "PI_CODING_AGENT_DIR", // the daemon's own, not the operator's
+];
+
 #[test]
 fn master_env_is_allowlisted_not_inherited() {
-    let planted = [
-        "AWS_SECRET_ACCESS_KEY",
-        "AWS_BEARER_TOKEN_BEDROCK",
-        "MOONSHOT_API_KEY",
-        "TOGETHER_API_KEY",
-        "MINIMAX_API_KEY",
-        "ZAI_CN_API_KEY",
-        "ANTHROPIC_AUTH_TOKEN",
-        "COPILOT_GITHUB_TOKEN",
-        "OPENAI_API_KEY",
-        "SSH_AUTH_SOCK",
-        "GIT_SSH_COMMAND",
-        "NODE_OPTIONS",
-        "PI_CODING_AGENT_DIR", // the daemon's own, not the operator's
-    ];
-    for name in planted {
-        std::env::set_var(name, "planted-test-value");
+    // The plants ride in the child's env from birth (CAD-587) — no
+    // in-process mutation of the env this binary's tests share.
+    if !in_own_process(
+        "master_env_is_allowlisted_not_inherited",
+        &PLANTED_ENV
+            .iter()
+            .map(|n| (*n, "planted-test-value"))
+            .collect::<Vec<_>>(),
+    ) {
+        return;
     }
     let state = tempfile::tempdir().unwrap();
     let pi = master_adapter(
@@ -564,7 +574,7 @@ fn master_env_is_allowlisted_not_inherited() {
     pi.open(&master_agent(state.path(), json!({"unconfined": true})))
         .unwrap();
     let names = recorded_env(state.path());
-    for name in planted {
+    for name in PLANTED_ENV {
         assert!(
             !names.iter().any(|n| n == name),
             "planted {name} reached the pi child: {names:?}"
@@ -579,9 +589,6 @@ fn master_env_is_allowlisted_not_inherited() {
     ] {
         assert!(names.iter().any(|n| n == name), "{name} missing: {names:?}");
     }
-    for name in planted {
-        std::env::remove_var(name);
-    }
     pi.close();
 }
 
@@ -595,7 +602,15 @@ fn master_env_is_allowlisted_not_inherited() {
 #[test]
 fn master_cache_home_is_its_own_private_dir() {
     let planted = tempfile::tempdir().unwrap();
-    std::env::set_var("XDG_CACHE_HOME", planted.path());
+    if !in_own_process(
+        "master_cache_home_is_its_own_private_dir",
+        &[("XDG_CACHE_HOME", planted.path().to_str().unwrap())],
+    ) {
+        return;
+    }
+    // The planted operator cache is the one this child's env carries,
+    // not a tempdir minted here.
+    let planted = PathBuf::from(std::env::var("XDG_CACHE_HOME").unwrap());
     let state = tempfile::tempdir().unwrap();
     let pi = master_adapter(
         "normal",
@@ -605,7 +620,6 @@ fn master_cache_home_is_its_own_private_dir() {
     pi.open(&master_agent(state.path(), json!({"unconfined": true})))
         .unwrap();
     pi.close();
-    std::env::remove_var("XDG_CACHE_HOME");
 
     let cache = state.path().join("master/pi/cache");
     assert!(
@@ -619,7 +633,7 @@ fn master_cache_home_is_its_own_private_dir() {
         "the master's cache dir is private"
     );
     assert!(
-        !planted.path().join("pi-devin").exists(),
+        !planted.join("pi-devin").exists(),
         "the inherited operator cache received the catalog — the explicit pair lost"
     );
     // The master record only stores env NAMES — XDG_CACHE_HOME must be
@@ -996,14 +1010,13 @@ fn status_prompt_probe() {
         .parent()
         .unwrap()
         .to_path_buf();
-    std::env::set_var(
-        "PATH",
-        format!(
-            "{}:{}",
-            bin_dir.display(),
-            std::env::var("PATH").unwrap_or_default()
-        ),
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
     );
+    // The env-scan exemption reads the name on the set_var line.
+    std::env::set_var("PATH", path);
     let (tx, rx) = mpsc::channel();
     let pi = PiAdapter::new(
         AdapterHooks {

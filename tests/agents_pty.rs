@@ -283,16 +283,27 @@ fn mock_config_never_touches_process_env() {
     let remove = concat!("std::env::", "remove_var");
     let lock = concat!("ENV_", "LOCK");
     // Not test config: `PATH` is prepended once per process so children
-    // run the binary under test, and `GL_TOKEN` exists only inside the
-    // forge-credential test that sets and removes it.
-    let exempt = ["\"PATH\"", "\"GL_TOKEN\""];
+    // run the binary under test, `GL_TOKEN` exists only inside the
+    // forge-credential test that sets and removes it, and
+    // `CADENCE_PI_COMMAND` is the probe's own scrub — it must not
+    // leak into the real `pi` child it spawns (status_prompt_probe is
+    // `#[ignore]`d; the removal is its whole point).
+    let exempt = ["\"PATH\"", "\"GL_TOKEN\"", "\"CADENCE_PI_COMMAND\""];
     let mut sources = vec![std::path::PathBuf::from("tests/common/mod.rs")];
     let map = std::fs::read_to_string("tests/split-map.toml").unwrap();
     // The map names only what the generator split out of
     // integration.rs; hand-written binaries that share the harness
     // must be listed by hand — `test_seam` held the last live
-    // reference to the dropped env lock when it went unscanned.
-    sources.extend(["tests/test_seam.rs"].iter().map(std::path::PathBuf::from));
+    // reference to the dropped env lock when it went unscanned, and
+    // CAD-587's pi binaries mutated their process env until the
+    // allowlist tests moved into in_own_process children.
+    for hand in [
+        "tests/test_seam.rs",
+        "tests/pi_master.rs",
+        "tests/pi_worker.rs",
+    ] {
+        sources.push(std::path::PathBuf::from(hand));
+    }
     sources.extend(map.lines().filter_map(|l| {
         l.strip_prefix("[binaries.")
             .and_then(|s| s.strip_suffix(']'))

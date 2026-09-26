@@ -13,6 +13,7 @@
 mod common;
 
 use std::path::Path;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use cadence_agent::adapter::pi::PiAdapter;
@@ -156,32 +157,28 @@ fn worker_argv_carries_a_session_file_and_the_dev_tools() {
 
 #[test]
 fn worker_env_is_an_allowlist() {
+    // Credentials planted in the daemon's own environment — the worker
+    // must never see them however they are spelled. The plants ride in
+    // a child's env from birth (CAD-587); this process never mutates
+    // the env every test in the binary shares.
+    if !in_own_process(
+        "worker_env_is_an_allowlist",
+        &[
+            ("PI544_PLANTED_TOKEN", "should-not-leak"),
+            ("AWS_SECRET_ACCESS_KEY", "should-not-leak"),
+            ("GH_TOKEN", "should-not-leak"),
+            ("ANTHROPIC_API_KEY", "should-not-leak"),
+            ("SSH_AUTH_SOCK", "/tmp/pi544-agent.sock"),
+        ],
+    ) {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path();
-    // Plant credentials in the daemon's own environment — the worker
-    // must never see them however they are spelled.
-    for name in [
-        "PI544_PLANTED_TOKEN",
-        "AWS_SECRET_ACCESS_KEY",
-        "GH_TOKEN",
-        "ANTHROPIC_API_KEY",
-    ] {
-        std::env::set_var(name, "should-not-leak");
-    }
-    std::env::set_var("SSH_AUTH_SOCK", "/tmp/pi544-agent.sock");
     let ad = adapter("normal", state, &[]);
     let agent = worker("w2", dir.path(), json!({}));
     ad.open(&agent).unwrap();
     ad.close();
-    for name in [
-        "PI544_PLANTED_TOKEN",
-        "AWS_SECRET_ACCESS_KEY",
-        "GH_TOKEN",
-        "ANTHROPIC_API_KEY",
-        "SSH_AUTH_SOCK",
-    ] {
-        std::env::remove_var(name);
-    }
 
     let rec = record(state, "w2");
     let env: Vec<String> = serde_json::from_value(rec["env"].clone()).unwrap();
@@ -225,14 +222,22 @@ fn worker_env_is_an_allowlist() {
 /// planted dir — this test fails.
 #[test]
 fn worker_cache_home_is_its_own_private_dir() {
+    // The planted operator cache rides in the child's env; the child
+    // reads it back from XDG_CACHE_HOME rather than minting its own
+    // (its own tempdir would not be the planted one).
+    let planted = tempfile::tempdir().unwrap();
+    if !in_own_process(
+        "worker_cache_home_is_its_own_private_dir",
+        &[("XDG_CACHE_HOME", planted.path().to_str().unwrap())],
+    ) {
+        return;
+    }
+    let planted = PathBuf::from(std::env::var("XDG_CACHE_HOME").unwrap());
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path();
-    let planted = tempfile::tempdir().unwrap();
-    std::env::set_var("XDG_CACHE_HOME", planted.path());
     let ad = adapter("normal", state, &[]);
     ad.open(&worker("wcache", dir.path(), json!({}))).unwrap();
     ad.close();
-    std::env::remove_var("XDG_CACHE_HOME");
 
     let cache = state.join("agents/wcache/pi/cache");
     assert!(
@@ -246,7 +251,7 @@ fn worker_cache_home_is_its_own_private_dir() {
         "the worker's cache dir is private"
     );
     assert!(
-        !planted.path().join("pi-devin").exists(),
+        !planted.join("pi-devin").exists(),
         "the inherited operator cache received the catalog — the explicit pair lost"
     );
 }
