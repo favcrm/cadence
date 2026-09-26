@@ -1105,7 +1105,9 @@ fn a_restart_that_exits_non_zero_still_health_checks_the_new_build() {
     assert_eq!(report.health["ok"], serde_json::json!(true));
     assert_eq!(
         report.restart["warning"],
-        serde_json::json!("the restart on bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb exited 1: a turn was fenced")
+        serde_json::json!(
+            "the restart on bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb exited 1: a turn was fenced"
+        )
     );
     let log = host.log();
     assert!(
@@ -1115,7 +1117,10 @@ fn a_restart_that_exits_non_zero_still_health_checks_the_new_build() {
         ),
         "{log}"
     );
-    assert!(log.contains("health: daemon and board answer on bbbb"), "{log}");
+    assert!(
+        log.contains("health: daemon and board answer on bbbb"),
+        "{log}"
+    );
     assert_eq!(host.restarts.borrow().as_slice(), [host.layout.binary(NEW)]);
     assert_eq!(host.lease_row()["held"], serde_json::json!(false));
     assert!(!host.draining.get());

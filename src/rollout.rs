@@ -2403,7 +2403,8 @@ mod tests {
         crate::test_seam::scoped(crate::test_seam::Asserted::Operator, || {
             claim_as(&state, "alice", 1_000.0, Duration::from_secs(60), false).unwrap();
             // Another identity cannot renew it.
-            let err = renew(&state, &caller("bob"), Duration::from_secs(3600), 1_010.0).unwrap_err();
+            let err =
+                renew(&state, &caller("bob"), Duration::from_secs(3600), 1_010.0).unwrap_err();
             assert!(err.to_string().contains("only the holder"), "{err}");
             // The holder's renewal moves the expiry in place: the same
             // row, the same claimed_at, no release and re-claim.
@@ -2417,7 +2418,8 @@ mod tests {
             assert_eq!(after["expires_at"].as_f64().unwrap(), 1_010.0 + 3600.0);
             // An expired lease is not renewable — the holder takes over
             // or claims afresh.
-            let err = renew(&state, &caller("alice"), Duration::from_secs(60), 9_999.0).unwrap_err();
+            let err =
+                renew(&state, &caller("alice"), Duration::from_secs(60), 9_999.0).unwrap_err();
             assert!(err.to_string().contains("--takeover"), "{err}");
         });
         let events = events_of(&state);
