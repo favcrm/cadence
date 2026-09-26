@@ -116,6 +116,14 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     // CAD-551: the composer's slash commands and Stop — the daemon's
     // `master_command` is operator-only, so the relay is too.
     route("POST", "/api/master/command", RouteClass::OperatorOnly),
+    // CAD-574: the rail's needs-row snooze/dismiss and agent
+    // resume/unfence — the relays cross the daemon's operator gate, so
+    // the board routes are the operator's alone (unlisted writes would
+    // fail closed the same way; listed for the reader).
+    route("POST", "/api/needs/dismiss", RouteClass::OperatorOnly),
+    route("POST", "/api/needs/snooze", RouteClass::OperatorOnly),
+    route("POST", "/api/agents/*/resume", RouteClass::OperatorOnly),
+    route("POST", "/api/agents/*/unfence", RouteClass::OperatorOnly),
     route("POST", "/api/epics/*/stage", RouteClass::OperatorOnly),
     // CAD-561: the board's Update button and its check — operator-only,
     // like every other action that replaces the running build.

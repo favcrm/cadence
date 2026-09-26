@@ -5,7 +5,7 @@ import type { ResourceState } from "../../lib/cache";
 import { resources, threadReader } from "../../lib/resources";
 import { streamInto, type SseErrorState } from "../../lib/sse";
 import { useQuery, useResource } from "../../lib/useResource";
-import type { Agent, MasterCommandResult, MasterState, Overview } from "../../lib/types";
+import type { MasterCommandResult, Overview, ThreadRef } from "../../lib/types";
 import Md from "../../ui/Md";
 import {
   composerBlock,
@@ -21,7 +21,9 @@ import {
   type SlashCommand,
   type TurnState,
 } from "./master";
+import MasterChips from "./MasterChips";
 import NeedsRail from "./NeedsRail";
+import { askDraft, readRailCollapsed, writeRailCollapsed, type HomeNeed } from "./needs";
 import PlanCard from "./PlanCard";
 import SinceCard from "./SinceCard";
 import {
@@ -167,7 +169,7 @@ function Item({
 }: {
   item: ThreadItem;
   onOpenIssue: (id: string) => void;
-  onRetry: (message: string, text: string) => void;
+  onRetry: (message: string, text: string, refs?: ThreadRef[]) => void;
   onDiscard: (message: string) => void;
 }) {
   switch (item.type) {
@@ -177,6 +179,7 @@ function Item({
           <div className="inline-block text-left mt-0.5 px-3 py-2 rounded-lg bg-accent/10 text-body text-ink-100 whitespace-pre-wrap break-words">
             {item.entry.text}
           </div>
+          <RefChips refs={entryRefs(item.entry.payload)} />
         </Bubble>
       );
     case "pending":
@@ -194,10 +197,14 @@ function Item({
           >
             {item.pending.text}
           </div>
+          <RefChips refs={item.pending.refs ?? []} />
           {item.pending.state === "failed" && (
             <div className="text-micro text-fail mt-1 break-words">
               {item.pending.error}{" "}
-              <button className="lnk" onClick={() => onRetry(item.pending.message, item.pending.text)}>
+              <button
+                className="lnk"
+                onClick={() => onRetry(item.pending.message, item.pending.text, item.pending.refs)}
+              >
                 Retry
               </button>{" "}
               ·{" "}
@@ -290,57 +297,30 @@ function SystemNote({
   );
 }
 
-/** Context chip's tooltip — the raw token counts when the provider sent them. */
-function ctxTitle(m: MasterState | null | undefined): string {
-  const c = m?.context;
-  if (c?.tokens != null && c?.window != null) {
-    return `${c.tokens.toLocaleString()} of ${c.window.toLocaleString()} tokens of context`;
-  }
-  return "Share of the context window in use";
+/** The subjects an operator bubble cites (CAD-574 `refs`) — one chip
+ *  each under the text. */
+function RefChips({ refs }: { refs: ThreadRef[] }) {
+  if (refs.length === 0) return null;
+  return (
+    <span className="refsrow" aria-label="cited rows">
+      {refs.map((r) => (
+        <span key={`${r.kind}:${r.id}`} className="refchip num" title={`${r.kind}:${r.id}`}>
+          {r.kind}:{r.id}
+        </span>
+      ))}
+    </span>
+  );
 }
 
-/**
- * The session chips (CAD-551): model, effort and context use, read from
- * `master_state` (a live provider answer carries the live dot) with the
- * agents row's configured/reported values as the fallback. Each chip is
- * keyed on its value — a change remounts it through the pop animation.
- */
-function MasterChips({ master, row }: { master: MasterState | null | undefined; row?: Agent }) {
-  const model =
-    master?.model_label ?? master?.model ?? row?.model ?? row?.model_reported ?? row?.model_configured;
-  const effort = master?.effort ?? row?.effort ?? row?.effort_reported;
-  const pct = master?.context?.percent;
-  const live = master?.live === true;
-  if (!model && !effort && pct == null) return null;
-  return (
-    <span className="flex items-center gap-1.5 min-w-0 flex-wrap">
-      {model && (
-        <span
-          key={`m:${model}`}
-          className="chip chip-in bg-ink-800 text-ink-300"
-          title={live ? "Reported by the live provider session" : "Configured for the master"}
-        >
-          {live && <span className="livedot" aria-hidden />}
-          {model}
-        </span>
-      )}
-      {effort && (
-        <span key={`e:${effort}`} className="chip chip-in bg-ink-800 text-ink-300" title="Thinking effort">
-          effort {effort}
-        </span>
-      )}
-      {pct != null && (
-        <span
-          key={`c:${Math.round(pct)}`}
-          className={`chip chip-in ${
-            pct >= 90 ? "bg-fail/15 text-fail" : pct >= 70 ? "bg-warn/10 text-warn" : "bg-ink-800 text-ink-300"
-          }`}
-          title={ctxTitle(master)}
-        >
-          {Math.round(pct)}% ctx
-        </span>
-      )}
-    </span>
+/** `payload.refs` as typed refs — a malformed value reads as none. */
+export function entryRefs(payload: unknown): ThreadRef[] {
+  const arr = (payload as { refs?: unknown } | null)?.refs;
+  if (!Array.isArray(arr)) return [];
+  return arr.filter(
+    (r): r is ThreadRef =>
+      !!r && typeof r === "object" &&
+      typeof (r as ThreadRef).kind === "string" &&
+      typeof (r as ThreadRef).id === "string",
   );
 }
 
@@ -568,14 +548,16 @@ function Examples({ onPick, disabled }: { onPick: (text: string) => void; disabl
   );
 }
 
-/** Queue `text` to the master: optimistic entry, reconciled by message id. */
-function sendToMaster(text: string, message = newMessageId()): void {
+/** Queue `text` to the master: optimistic entry, reconciled by message id.
+ *  `refs` are the needs-me subjects an Ask-master draft cites — they
+ *  ride `thread_send`'s `refs` onto the entry's payload (CAD-574). */
+function sendToMaster(text: string, message = newMessageId(), refs?: ThreadRef[]): void {
   const body = text.trim();
   if (!body) return;
   const store = resources.masterThread;
-  store.write((s) => addPending(s, message, body, Date.now()));
+  store.write((s) => addPending(s, message, body, Date.now(), refs));
   api
-    .threadSend(MASTER, body, message)
+    .threadSend(MASTER, body, message, refs)
     .then(() => {
       store.write((s) => settlePending(s, message, { ok: true }));
       // The send queued a turn — refresh the header's state soon.
@@ -586,7 +568,7 @@ function sendToMaster(text: string, message = newMessageId()): void {
     );
 }
 
-const retry = (message: string, text: string) => sendToMaster(text, message);
+const retry = (message: string, text: string, refs?: ThreadRef[]) => sendToMaster(text, message, refs);
 const discard = (message: string) => resources.masterThread.write((s) => discardPending(s, message));
 
 /**
@@ -604,17 +586,24 @@ function Composer({
   onCommand,
 }: {
   block: string | null;
-  seed: { text: string; n: number };
+  seed: { text: string; n: number; refs?: ThreadRef[] };
   onCommand: (name: string, arg: string) => void;
 }) {
   const [draft, setDraft] = useState("");
+  // CAD-574: an Ask-master seed carries the row's subject — chips shown
+  // beside the draft, attached to `thread_send` as `refs` on send. A
+  // removed chip removes the ref; a sent draft clears them all.
+  const [refs, setRefs] = useState<ThreadRef[]>([]);
   const [hi, setHi] = useState(0);
   // Esc dismisses the menu for THIS verb text — the next keystroke
   // reopens it (or a cleared draft does).
   const [menuOffFor, setMenuOffFor] = useState<string | null>(null);
   const form = useRef<HTMLFormElement>(null);
   useEffect(() => {
-    if (seed.n > 0) setDraft(seed.text);
+    if (seed.n > 0) {
+      setDraft(seed.text);
+      setRefs(seed.refs ?? []);
+    }
   }, [seed]);
   // The composer is sticky on wide screens: keep scrolled-to controls
   // (a plan card's buttons, a focused field) clear of it by reserving
@@ -657,8 +646,9 @@ function Composer({
     if (!body || block) return;
     const cmd = parseSlash(body);
     if (cmd) onCommand(cmd.name, cmd.arg);
-    else sendToMaster(body);
+    else sendToMaster(body, newMessageId(), refs);
     setDraft("");
+    setRefs([]);
   };
   const onKey = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.nativeEvent.isComposing) return;
@@ -734,6 +724,22 @@ function Composer({
             </li>
           ))}
         </ul>
+      )}
+      {refs.length > 0 && (
+        <div className="refsrow" aria-label="cited rows" data-composer-refs>
+          <span className="text-micro text-ink-500">re:</span>
+          {refs.map((r) => (
+            <button
+              key={`${r.kind}:${r.id}`}
+              type="button"
+              className="refchip num"
+              title={`remove the ${r.kind}:${r.id} reference`}
+              onClick={() => setRefs((rs) => rs.filter((x) => x !== r))}
+            >
+              {r.kind}:{r.id} <span aria-hidden>×</span>
+            </button>
+          ))}
+        </div>
       )}
       <textarea
         value={draft}
@@ -824,9 +830,12 @@ const ThreadList = memo(function ThreadList({
 
 /**
  * Home (CAD-328): the master's thread with a composer, the "since you
- * left" card above it, and the Needs-you rail beside it (above it on a
- * phone). CAD-551 adds the header session chips, the working/queued
- * turn row, `/` commands, and the smart-scroll pill.
+ * left" card above it, and the Needs-you rail beside it. CAD-551 adds
+ * the header session chips, the working/queued turn row, `/` commands,
+ * and the smart-scroll pill. CAD-574 detaches the rail — its own
+ * scroll, collapsible, a slide-over drawer under ~1100px — and turns
+ * its "copy command" rows into Ask-master prefills with `refs`, plus
+ * model/effort dropdowns on the header chips.
  */
 export default function Home({
   readOnly,
@@ -842,7 +851,13 @@ export default function Home({
   const thread = useQuery(resources.masterThread);
   const agents = useResource(resources.agents);
   const master = useQuery(resources.masterState);
-  const [seed, setSeed] = useState({ text: "", n: 0 });
+  const [seed, setSeed] = useState<{ text: string; n: number; refs?: ThreadRef[] }>({
+    text: "",
+    n: 0,
+  });
+  // CAD-574: the rail's collapse is a layout concern — the grid column
+  // narrows with it, so the state lives here and the rail renders it.
+  const [railCollapsed, setRailCollapsed] = useState(readRailCollapsed);
   const [link, setLink] = useState<SseErrorState | "live" | null>(null);
   const [limit, setLimit] = useState(WINDOW);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
@@ -1040,13 +1055,43 @@ export default function Home({
   const showNotStarted = status.kind === "absent" || status.kind === "stopped";
   const empty = loaded && !missing && items.length === 0;
 
+  /** Ask master: a prefilled draft with the row's subject as refs —
+   *  never sends; the operator reviews it in the composer. */
+  const onAsk = (need: HomeNeed) => {
+    const draft = askDraft(need);
+    setSeed((s) => ({ text: draft.text, refs: draft.refs, n: s.n + 1 }));
+  };
+  const toggleRail = () => {
+    setRailCollapsed((c) => {
+      writeRailCollapsed(!c);
+      return !c;
+    });
+  };
+
   return (
-    <main className="px-4 lg:px-8 pt-5 pb-6 w-full min-w-0 grid gap-5 lg:grid-cols-[minmax(0,1fr)_minmax(0,20rem)] lg:items-start">
-      <aside className="min-w-0 lg:order-2 lg:sticky lg:top-[3.6rem] space-y-4">
-        <NeedsRail overview={overview} readOnly={readOnly} onOpenIssue={onOpenIssue} overviewHref={overviewHref} />
+    <main
+      className={`px-4 lg:px-8 pt-5 pb-6 w-full min-w-0 grid gap-5 rail:items-start ${
+        railCollapsed
+          ? "rail:grid-cols-[minmax(0,1fr)_3rem]"
+          : "rail:grid-cols-[minmax(0,1fr)_minmax(0,21rem)]"
+      }`}
+    >
+      {/* The rail is its own column (CAD-574): sticky under the header
+          and bounded to the viewport, so its `rail-scroll` scrolls
+          independently of the thread and the composer never moves. */}
+      <aside className="absolute rail:static min-w-0 rail:order-2 rail:sticky rail:top-[3.6rem] rail:h-[calc(100dvh-3.6rem)] rail:min-h-0">
+        <NeedsRail
+          overview={overview}
+          readOnly={readOnly}
+          onOpenIssue={onOpenIssue}
+          overviewHref={overviewHref}
+          onAsk={onAsk}
+          collapsed={railCollapsed}
+          onToggleCollapse={toggleRail}
+        />
       </aside>
 
-      <section className="min-w-0 lg:order-1 flex flex-col gap-4" aria-label="master thread" ref={mainCol}>
+      <section className="min-w-0 rail:order-1 flex flex-col gap-4" aria-label="master thread" ref={mainCol}>
         <SinceCard onOpenIssue={onOpenIssue} />
 
         <div className="flex items-center gap-2 flex-wrap">
@@ -1062,7 +1107,7 @@ export default function Home({
           >
             {status.kind === "running" ? status.state : status.kind === "absent" ? "not started" : status.kind}
           </span>
-          <MasterChips master={master.data} row={masterRow} />
+          <MasterChips master={master.data} row={masterRow} readOnly={readOnly} />
           {link && link !== "live" && status.kind === "running" && (
             <span className="text-micro text-ink-500">{link === "stopped" ? "stream stopped" : "reconnecting…"}</span>
           )}

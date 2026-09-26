@@ -87,11 +87,11 @@ impl Shared {
         if let Some(obj) = params.as_object() {
             if let Some(field) = obj
                 .keys()
-                .find(|k| !matches!(k.as_str(), "alias" | "text" | "message"))
+                .find(|k| !matches!(k.as_str(), "alias" | "text" | "message" | "refs"))
             {
                 return Err(Error::rejected(format!(
-                    "thread send takes alias, text and message only; field '{field}' \
-                     is not accepted"
+                    "thread send takes alias, text, message and refs only; field \
+                     '{field}' is not accepted"
                 )));
             }
         }

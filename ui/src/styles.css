@@ -37,6 +37,10 @@
   --text-cardtitle: .9375rem;
   --text-section: 1.125rem;
   --text-drawer: 1.25rem;
+
+  /* CAD-574: the detached Needs-you rail leaves its column and becomes
+     a slide-over drawer below this width (`rail:` variants). */
+  --breakpoint-rail: 1100px;
 }
 
 /*
@@ -700,4 +704,255 @@ pre {
 .sysnote .steps-inner {
   max-height: 26rem;
   overflow-y: auto;
+}
+
+/* ---- CAD-574: the detached Needs-you rail ----
+   ≥1100px (`rail:`): a sticky grid column with its own scroll — the
+   thread beside it never shares the scrollbar. Collapsed it is the
+   3rem strip with the count badge. Below it: a slide-over drawer.
+   All of it sits in the components layer so the `rail:` utility
+   variants still win the cascade. */
+
+@layer components {
+.needsrail {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+.rail-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+/* The collapsed strip: count badge, then the title written vertically. */
+.slimrail {
+  width: 3rem;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: .625rem;
+  padding: .625rem 0;
+  cursor: pointer;
+}
+.slimrail:hover {
+  border-color: var(--color-ink-600);
+}
+.slimrail .vert {
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+  letter-spacing: .02em;
+}
+
+/* The floating drawer button (<1100px). */
+.needbtn {
+  position: fixed;
+  right: 1rem;
+  bottom: 5.5rem;
+  z-index: 45;
+  display: flex;
+  align-items: center;
+  gap: .4rem;
+  padding: .45rem .8rem;
+  border-radius: 9999px;
+  border: 1px solid var(--color-ink-600);
+  background: var(--color-ink-850);
+  color: var(--color-ink-200);
+  font-size: var(--text-label);
+  box-shadow: 0 6px 24px rgb(0 0 0 / .35);
+  transition: border-color .15s ease, transform .15s ease;
+}
+.needbtn:hover {
+  border-color: var(--color-edge-hover);
+  transform: translateY(-1px);
+}
+.needsscrim {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  background: var(--color-scrim);
+}
+.needsdrawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(24rem, 92vw);
+  z-index: 51;
+  display: flex;
+  flex-direction: column;
+  background: var(--color-ink-900);
+  border-left: 1px solid var(--color-ink-700);
+  box-shadow: -12px 0 32px rgb(0 0 0 / .35);
+}
+
+/* A group header — Decisions opens by default; the rest fold. */
+.needgroup {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  padding: .55rem .75rem;
+  font: 500 var(--text-label) "IBM Plex Mono", monospace;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: var(--color-ink-400);
+}
+.needgroup:hover {
+  color: var(--color-ink-200);
+}
+.needgroup .steps-caret {
+  display: inline-block;
+  transition: transform .15s ease;
+}
+.needgroup[aria-expanded="true"] .steps-caret {
+  transform: rotate(90deg);
+}
+
+/* The row's own actions: Ask master is the primary, … the overflow. */
+.needask {
+  height: 1.625rem;
+  padding: 0 .625rem;
+  border-radius: .375rem;
+  border: 1px solid color-mix(in srgb, var(--color-accent) 45%, var(--color-ink-700));
+  background: color-mix(in srgb, var(--color-accent) 12%, var(--color-ink-850));
+  color: var(--color-accent);
+  font-size: var(--text-label);
+  font-weight: 500;
+  transition: background-color .15s ease, border-color .15s ease;
+}
+.needask:not(:disabled):hover {
+  background: color-mix(in srgb, var(--color-accent) 20%, var(--color-ink-850));
+  border-color: var(--color-accent);
+}
+.needask:disabled {
+  opacity: .4;
+}
+.needmore {
+  width: 1.5rem;
+  height: 1.5rem;
+  border-radius: .375rem;
+  color: var(--color-ink-500);
+  font-size: .9rem;
+  line-height: 1;
+  transition: background-color .15s ease, color .15s ease;
+}
+.needmore:hover, .needmore[aria-expanded="true"] {
+  background: var(--color-ink-800);
+  color: var(--color-ink-200);
+}
+
+/* The ⋯ overflow menu — same surface language as the slash menu. */
+.needmenu {
+  position: absolute;
+  right: .75rem;
+  margin-top: .125rem;
+  z-index: 30;
+  min-width: 10rem;
+  padding: .25rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: .5rem;
+  background: var(--color-ink-850);
+  box-shadow: 0 10px 30px rgb(0 0 0 / .35);
+}
+.needrow {
+  position: relative;
+}
+
+/* The header chips' dropdown (model / effort). */
+.chipmenu {
+  position: absolute;
+  top: calc(100% + .375rem);
+  left: 0;
+  z-index: 40;
+  min-width: 15rem;
+  max-width: 22rem;
+  max-height: 18rem;
+  overflow-y: auto;
+  padding: .25rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: .5rem;
+  background: var(--color-ink-850);
+  box-shadow: 0 10px 30px rgb(0 0 0 / .35);
+}
+.chipitem {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  width: 100%;
+  padding: .4rem .5rem;
+  border-radius: .375rem;
+  font-size: var(--text-label);
+  color: var(--color-ink-200);
+  text-align: left;
+}
+.chipitem:hover {
+  background: var(--color-ink-800);
+}
+.chipitem:disabled {
+  opacity: .45;
+}
+.chip-btn {
+  cursor: pointer;
+}
+.chip-btn:not(:disabled):hover {
+  border-color: var(--color-edge-hover);
+  color: var(--color-ink-100);
+}
+.chip-btn:disabled {
+  cursor: default;
+}
+.chip-btn[aria-expanded="true"] {
+  border-color: color-mix(in srgb, var(--color-accent) 50%, var(--color-ink-700));
+  color: var(--color-accent);
+}
+
+/* The composer's cited-subject chips and a sent message's refs. */
+.refsrow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .375rem;
+  margin-bottom: .375rem;
+}
+.refchip {
+  display: inline-flex;
+  align-items: center;
+  gap: .25rem;
+  height: 1.375rem;
+  padding: 0 .5rem;
+  border-radius: 9999px;
+  border: 1px solid color-mix(in srgb, var(--color-accent) 40%, var(--color-ink-700));
+  background: color-mix(in srgb, var(--color-accent) 10%, var(--color-ink-850));
+  color: var(--color-accent);
+  font-size: var(--text-micro);
+  max-width: 16rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+button.refchip:hover {
+  border-color: var(--color-fail);
+  color: var(--color-fail);
+}
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .needsdrawer {
+    animation: drawer-in .22s cubic-bezier(.2, .8, .2, 1) both;
+  }
+  .needsscrim {
+    animation: scrim-in .18s ease both;
+  }
+}
+@keyframes drawer-in {
+  from { transform: translateX(2.5rem); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+@keyframes scrim-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
 }

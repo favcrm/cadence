@@ -366,6 +366,12 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
              commands for the master — the verb list is the daemon's, never raw input",
         ),
     ),
+    // CAD-574: a Needs-you row suppression is the operator's call —
+    // `needs_dismissed.json` is daemon-owned like `area_acks.json`.
+    (
+        "needs_dismiss",
+        Rule::Handler("operator_connection (CAD-574)"),
+    ),
     (
         "reports_changed",
         Rule::Handler("proven_operator (CAD-339)"),

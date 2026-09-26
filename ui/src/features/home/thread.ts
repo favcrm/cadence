@@ -38,6 +38,9 @@ export interface PendingMessage {
   error?: string;
   /** Epoch ms when it was first sent. */
   at: number;
+  /** CAD-574: the cited needs subjects the send carried — a retry must
+   *  resend the same refs or the daemon's idempotency check conflicts. */
+  refs?: { kind: string; id: string }[];
 }
 
 export interface ThreadState {
@@ -129,10 +132,16 @@ export function mergePage(
 }
 
 /** Add an optimistic message (or mark a retried one sending again). */
-export function addPending(state: ThreadState | null, message: string, text: string, at: number): ThreadState {
+export function addPending(
+  state: ThreadState | null,
+  message: string,
+  text: string,
+  at: number,
+  refs?: { kind: string; id: string }[],
+): ThreadState {
   const base = state ?? EMPTY_THREAD;
   const rest = base.pending.filter((p) => p.message !== message);
-  return { ...base, pending: [...rest, { message, text, state: "sending", at }] };
+  return { ...base, pending: [...rest, { message, text, state: "sending", at, refs }] };
 }
 
 /** The POST answered: sent (awaiting its stored entry) or failed. */

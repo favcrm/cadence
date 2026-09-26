@@ -252,7 +252,22 @@ impl Shared {
             optional_str(params, "source").unwrap_or("user")
         };
         proto::identifier(source, "Message source")?;
+        // CAD-574: the operator's chat may cite the needs-me rows it
+        // asks about — `{kind,id}` pairs the board renders against the
+        // message. The field is `thread_send`'s alone (its own
+        // allowlist): an agent or operator `send`/`ask` carrying it is
+        // refused whole, never silently stripped.
+        let refs = match params.get("refs") {
+            None | Some(Value::Null) => None,
+            Some(v) => Some(thread_refs(v)?),
+        };
         let sender = sender_of(&alias)?;
+        if refs.is_some() && sender != store::Sender::OperatorChat {
+            return Err(Error::rejected(
+                "refs is a thread_send field — only the operator's chat cites \
+                 needs rows; `cadence send` and `agent_send` carry none",
+            ));
+        }
         let (duplicate, state) = self.store.enqueue_steered(
             &alias,
             text,
@@ -264,6 +279,7 @@ impl Shared {
             None,
             &sender,
             &steer,
+            refs.as_ref(),
         )?;
         // Each superseded row's `reply_to` got a notice in the same
         // transaction — wake those recipients like `message cancel` does.

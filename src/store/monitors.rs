@@ -575,6 +575,7 @@ impl Store {
             task.worktree.as_deref(),
             &Sender::Unattributed,
             Priority::Normal,
+            None,
         )?;
         if duplicate {
             tx.commit()?;

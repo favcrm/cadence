@@ -343,6 +343,7 @@ impl Store {
             None,
             sender,
             &Steer::NONE,
+            None,
         )
     }
 
@@ -362,6 +363,9 @@ impl Store {
     /// `dispatch_send` resolves the lane daemon-side, `task_dispatch`
     /// reads its job rows; `send` refuses the fields outright and
     /// every other enqueue passes `None`.
+    /// `refs` is the operator chat's cited rows (CAD-574): they land on
+    /// the thread entry's payload and join the retry comparison — a
+    /// resend naming different refs is the conflict it always was.
     /// A retry of the same envelope is `duplicate` only when it names
     /// the same superseded set; otherwise it is a conflict.
     #[allow(clippy::too_many_arguments)]
@@ -377,6 +381,7 @@ impl Store {
         worktree: Option<&str>,
         sender: &Sender,
         steer: &Steer,
+        refs: Option<&Value>,
     ) -> Result<(bool, String)> {
         let conn = self.write_conn()?;
         let tx = conn.unchecked_transaction()?;
@@ -418,6 +423,7 @@ impl Store {
             worktree,
             sender,
             steer.priority,
+            refs,
         )?;
         for old in &superseded {
             self.supersede_in(&tx, old, id, steer)?;
@@ -503,6 +509,7 @@ impl Store {
             &Sender::Unattributed,
             Priority::Normal,
             true,
+            None,
         )?;
         tx.commit()?;
         Ok(out)
@@ -664,10 +671,11 @@ impl Store {
         worktree: Option<&str>,
         sender: &Sender,
         priority: Priority,
+        refs: Option<&Value>,
     ) -> Result<(bool, String)> {
         self.enqueue_tx_as(
             tx, alias, body, reply_to, id, source, task_id, issue, worktree, sender, priority,
-            false,
+            false, refs,
         )
     }
 
@@ -686,6 +694,7 @@ impl Store {
         sender: &Sender,
         priority: Priority,
         daemon: bool,
+        refs: Option<&Value>,
     ) -> Result<(bool, String)> {
         if !daemon {
             crate::proto::caller_message(id, source)?;
@@ -710,6 +719,9 @@ impl Store {
             self.task_in(tx, task)?;
         }
         if let Some(old) = self.message_in(tx, id)? {
+            // `refs` lives on the enqueue's thread-entry payload, not
+            // the message row — the stored side is read back so a
+            // retry naming different refs conflicts like any field.
             let same = old.alias == alias
                 && old.body == body
                 && old.reply_to.as_deref() == reply_to
@@ -717,7 +729,8 @@ impl Store {
                 && old.task_id.as_deref() == task_id
                 && old.issue.as_deref() == issue
                 && old.worktree.as_deref() == worktree
-                && old.priority == priority;
+                && old.priority == priority
+                && Self::entry_refs_in(tx, id)? == refs.cloned();
             if !same {
                 return Err(Error::rejected(
                     "Message id was already used with different content",
@@ -756,7 +769,7 @@ impl Store {
             None,
             task_id,
         )?;
-        Self::thread_note_enqueued(tx, alias, sender, source, body, id)?;
+        Self::thread_note_enqueued(tx, alias, sender, source, body, id, refs)?;
         Ok((false, "queued".to_string()))
     }
 

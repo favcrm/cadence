@@ -141,6 +141,7 @@ impl Shared {
             Some(&worktree.to_string_lossy()),
             &sender,
             &store::Steer::NONE,
+            None,
         )?;
         self.notify_agent(&alias);
         self.wake();
