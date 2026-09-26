@@ -135,12 +135,15 @@ fn adopt_finished_check(run: &update::RunLogView) {
     else {
         return;
     };
-    let mut checked_at = BOARD_UPDATE.checked_at.lock().unwrap();
-    if checked_at.is_some_and(|at| at >= finished_at) {
+    let stale = {
+        let checked_at = BOARD_UPDATE.checked_at.lock().unwrap();
+        checked_at.is_none_or(|at| finished_at > at)
+    };
+    if !stale {
         return;
     }
     *BOARD_UPDATE.check.lock().unwrap() = Some(check.clone());
-    *checked_at = Some(finished_at);
+    *BOARD_UPDATE.checked_at.lock().unwrap() = Some(finished_at);
 }
 
 /// The card fills itself in: a check is kicked in the background when
