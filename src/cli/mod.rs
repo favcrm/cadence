@@ -274,7 +274,8 @@ pub(crate) enum Commands {
         /// Routing alias [default: the resumed slug, else devin-<random>].
         #[arg(long)]
         alias: Option<String>,
-        /// pm or worker.
+        /// pm, worker, or reviewer. `reviewer` is who a delivery review
+        /// may be routed to; it does not grant PM authority.
         #[arg(long, default_value = "worker")]
         role: String,
         /// Team role used only to look up a model default. Does not
@@ -340,7 +341,8 @@ pub(crate) enum Commands {
         /// Routing alias [default: codex-<random>].
         #[arg(long)]
         alias: Option<String>,
-        /// pm or worker.
+        /// pm, worker, or reviewer. `reviewer` is who a delivery review
+        /// may be routed to; it does not grant PM authority.
         #[arg(long, default_value = "worker")]
         role: String,
         /// Codex model id (for example, gpt-5.6-luna). The app-server
@@ -430,7 +432,8 @@ pub(crate) enum Commands {
         /// Routing alias [default: claude-<random>].
         #[arg(long)]
         alias: Option<String>,
-        /// pm or worker.
+        /// pm, worker, or reviewer. `reviewer` is who a delivery review
+        /// may be routed to; it does not grant PM authority.
         #[arg(long, default_value = "worker")]
         role: String,
         /// Model flag passed to the CLI (e.g. sonnet, haiku, opus).
@@ -534,7 +537,8 @@ pub(crate) enum Commands {
         /// Routing alias [default: cursor-<random>].
         #[arg(long)]
         alias: Option<String>,
-        /// pm or worker.
+        /// pm, worker, or reviewer. `reviewer` is who a delivery review
+        /// may be routed to; it does not grant PM authority.
         #[arg(long, default_value = "worker")]
         role: String,
         /// Model flag passed to the CLI (`--model <model>`).
@@ -722,7 +726,8 @@ pub(crate) enum Commands {
         /// Routing alias [default: <provider>-<random>].
         #[arg(long)]
         alias: Option<String>,
-        /// pm or worker.
+        /// pm, worker, or reviewer. `reviewer` is who a delivery review
+        /// may be routed to; it does not grant PM authority.
         #[arg(long, default_value = "worker")]
         role: String,
         /// Worker filesystem sandbox, recorded on registration. Codex

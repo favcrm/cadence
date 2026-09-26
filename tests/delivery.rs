@@ -1900,6 +1900,158 @@ fn delivery_loop_review_revise_pass_merge_end_to_end() {
     }
 }
 
+/// CAD-591: an agent caller cannot mint an independent reviewer — not
+/// from its own connection, and not from a detached (`setsid`) child.
+/// A reviewer it plants under itself is not assigned its own review.
+/// An idle implementer, a `team_role` label, a forged `params.reviewer`
+/// flag, and a reviewer in another PM's group all sort ahead of `r1`
+/// under the old "any other provider" rule; the kickoff still goes to
+/// the designated reviewer.
+#[test]
+fn review_routing_refuses_agent_callers_implementers_and_foreign_groups() {
+    let mut lf = LoopFixture::dispatched();
+    let cwd = lf.f.d.dir.path().to_str().unwrap().to_string();
+    let register = |alias: &str, role: &str, params: Option<&str>, team: Option<&str>| {
+        let mut body = json!({
+            "alias": alias,
+            "provider": "fake",
+            "endpoint_kind": "fake",
+            "cwd": cwd,
+            "role": role,
+        });
+        if let Some(params) = params {
+            body["params"] = json!(params);
+        }
+        if let Some(team) = team {
+            body["team_role"] = json!(team);
+        }
+        body
+    };
+
+    // The worker, from its own connection: a root reviewer is refused.
+    let r = lf.w1.rpc(
+        "self",
+        "agent_register",
+        register("rootrev", "reviewer", None, None),
+    );
+    assert_eq!(r["ok"], false, "{r}");
+    let msg = r["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("agent register refused") && msg.contains("group root"),
+        "{r}"
+    );
+    // Forged upstream, so the new row would not be the caller's member.
+    let r = lf.w1.rpc(
+        "self",
+        "agent_register",
+        register(
+            "forged-up",
+            "reviewer",
+            Some(r#"{"upstream":"other-pm"}"#),
+            None,
+        ),
+    );
+    assert_eq!(r["ok"], false, "{r}");
+    assert!(
+        r["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("agent register refused"),
+        "{r}"
+    );
+    // Detached child (setsid, env kept and scrubbed): not the operator.
+    for how in ["detached", "detached-bare"] {
+        let r = lf.w1.rpc(
+            how,
+            "agent_register",
+            register(&format!("det-{how}"), "reviewer", None, None),
+        );
+        assert_eq!(r["ok"], false, "{how}: {r}");
+        assert!(
+            r["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not provably the operator"),
+            "{how}: {r}"
+        );
+    }
+    for alias in ["rootrev", "forged-up", "det-detached", "det-detached-bare"] {
+        assert!(
+            lf.f.d.rpc("agent_show", json!({"alias": alias})).is_err(),
+            "{alias} was registered"
+        );
+    }
+
+    // A member the worker may register. Role reviewer, but it is in the
+    // author's group, so the loop must not hand it the author's review.
+    let r = lf.w1.rpc(
+        "self",
+        "agent_register",
+        register("planted", "reviewer", Some(r#"{"upstream":"w1"}"#), None),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+
+    // Operator-registered peers the old rule would prefer over r1:
+    // different provider, earlier alias. None of them is an idle
+    // reviewer in this worker's group (or a root reviewer).
+    lf.f.d
+        .fixture_rpc(
+            "agent_register",
+            register("a-impl", "worker", Some(r#"{"reviewer":true}"#), None),
+        )
+        .unwrap();
+    lf.f.d
+        .fixture_rpc(
+            "agent_register",
+            register(
+                "c-foreign",
+                "reviewer",
+                Some(r#"{"upstream":"other-pm"}"#),
+                None,
+            ),
+        )
+        .unwrap();
+    lf.f.d
+        .fixture_rpc(
+            "agent_register",
+            register("d-team", "worker", None, Some("qa")),
+        )
+        .unwrap();
+
+    let wait_idle = |alias: &str| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let show = lf.f.d.rpc("agent_show", json!({"alias": alias})).unwrap();
+            let state = show["agent"]["state"]
+                .as_str()
+                .or_else(|| show["state"].as_str());
+            if state == Some("idle") {
+                return;
+            }
+            assert!(Instant::now() < deadline, "{alias} never went idle: {show}");
+            thread::sleep(Duration::from_millis(50));
+        }
+    };
+    for alias in ["planted", "a-impl", "c-foreign", "d-team", "r1"] {
+        wait_idle(alias);
+    }
+
+    let sha = "a".repeat(40);
+    lf.done(&sha);
+    let rec = lf.wait_rec("reviewing", |r| r["state"] == "reviewing");
+    assert_eq!(rec["reviewer"], "r1", "{rec}");
+    let reviews = |alias: &str| {
+        lf.f.messages_of(alias)
+            .into_iter()
+            .filter(|m| m["id"].as_str().is_some_and(|i| i.starts_with("review-")))
+            .count()
+    };
+    assert_eq!(reviews("r1"), 1);
+    for alias in ["planted", "a-impl", "c-foreign", "d-team", "r2", "w1"] {
+        assert_eq!(reviews(alias), 0, "{alias} was handed the review");
+    }
+}
+
 /// CAD-431: two REVISE verdicts escalate to the operator's Needs-you
 /// instead of a third round; the operator declines with a reason. The
 /// escalated ticket takes no more verdicts, and only the operator
@@ -2801,19 +2953,21 @@ fn delivery_agent_cannot_mark_ticket_done() {
     );
     assert_eq!(lf.f.front("D-3").status, d3_status);
 
-    // D-4 has a real PASS by r1 at e. Its record is rewritten to name r2
-    // as the reviewer — a verdict the daemon never recorded.
+    // D-4 has a real PASS at e. Its record is rewritten to name the
+    // other reviewer — a verdict the daemon never recorded.
     let (ok, sent) = lf.f.as_master(&mut lf.m, "master dispatch D-4");
     assert!(ok, "{sent}");
     let e = "e".repeat(40);
     let pr9 = "https://github.com/acme/app/pull/9";
     lf.pass_on("D-4", &e, pr9);
+    let assigned = lf.rec_of("D-4")["reviewer"].as_str().unwrap().to_string();
     let real = lf.rec_of("D-4")["verdict"]["report"]
         .as_str()
         .unwrap()
         .to_string();
+    let spoof = if assigned == "r1" { "r2" } else { "r1" };
     let d4_status = lf.f.front("D-4").status;
-    forge("D-4", pr9, &e, "r2", &real);
+    forge("D-4", pr9, &e, spoof, &real);
     lf.set_gh(&e, "MERGED", true, false);
     let row = lf.sync_of("D-4");
     assert_eq!(row["ticket"]["outcome"], "refused", "{row}");
@@ -2821,7 +2975,7 @@ fn delivery_agent_cannot_mark_ticket_done() {
         row["ticket"]["why"]
             .as_str()
             .unwrap()
-            .contains("recorded no PASS by r2"),
+            .contains(&format!("recorded no PASS by {spoof}")),
         "{row}"
     );
     assert_eq!(lf.f.front("D-4").status, d4_status);

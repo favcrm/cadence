@@ -325,6 +325,11 @@ pub fn save(state_dir: &Path, all: &BTreeMap<String, Record>) -> Result<()> {
     Ok(())
 }
 
+/// Launch role that [`pick_reviewer`] will route a review to (CAD-591).
+/// `pm` and `worker` stay the authorization roles; `reviewer` is only
+/// this designation.
+pub const REVIEWER_ROLE: &str = "reviewer";
+
 /// One agent the reviewer rule may choose.
 #[derive(Clone, Debug)]
 pub struct Candidate {
@@ -334,6 +339,8 @@ pub struct Candidate {
     pub enabled: bool,
     /// The agent's PM (`params.upstream`), when it is a group member.
     pub upstream: Option<String>,
+    /// Launch role stored at registration (`pm`, `worker`, or `reviewer`).
+    pub role: String,
 }
 
 /// Every alias in `worker`'s group line: the worker itself, its
@@ -370,16 +377,41 @@ fn worker_group(worker: &str, agents: &[Candidate]) -> Vec<String> {
     group
 }
 
-/// The independent reviewer for a worker's head: never the worker or
-/// anyone in its group line ([`worker_group`]), never the master, never
-/// an alias in `exclude`, never a fenced (`attention`), disabled or
-/// inbox agent. The previous round's reviewer keeps the ticket while it
-/// qualifies — the verdicts stay comparable; a caller passes `None` for
+/// The worker's PM: its `upstream`. Groups are one level deep, so that
+/// alias is the group. A root worker has none.
+fn group_pm<'a>(alias: &str, agents: &'a [Candidate]) -> Option<&'a str> {
+    agents
+        .iter()
+        .find(|a| a.alias == alias)
+        .and_then(|a| a.upstream.as_deref())
+}
+
+/// `candidate` sits in a PM group that is not the worker's. A root
+/// (no upstream) is the independent pool, not another PM's group.
+fn foreign_pm(worker_pm: Option<&str>, candidate: &Candidate) -> bool {
+    match candidate.upstream.as_deref() {
+        Some(up) => worker_pm != Some(up),
+        None => false,
+    }
+}
+
+/// The reviewer for a worker's head (CAD-591). Only an agent whose
+/// launch role is [`REVIEWER_ROLE`]. Never the worker or anyone in its
+/// group line ([`worker_group`]), never a member of another PM's group,
+/// never the master, never an alias in `exclude`, never a disabled,
+/// fenced (`attention`) or inbox agent. An implementer (`worker` /
+/// `pm`) is never chosen, busy or idle. The previous round's reviewer
+/// keeps the ticket while it still qualifies — including while busy —
+/// so the verdicts stay comparable; a caller passes `None` for
 /// `previous` (and the old reviewer in `exclude`) when the head moved
 /// without the worker, since whoever pushed must not review its own
-/// commits. Otherwise a different provider from the worker's wins when
-/// one is staffed, else another session of the same provider; ties go
-/// to the alias order.
+/// commits. A new review prefers an idle reviewer. A busy designated
+/// reviewer is used only when every qualifying reviewer is busy, so
+/// the kickoff queues instead of waiting for a router pass that does
+/// not re-run when someone goes idle. No designated reviewer at all
+/// leaves the review unassigned. Otherwise a different provider from
+/// the worker's wins when one is staffed, else another session of the
+/// same provider; idle before busy, then alias order.
 pub fn pick_reviewer(
     worker: &str,
     worker_provider: Option<&str>,
@@ -388,17 +420,18 @@ pub fn pick_reviewer(
     agents: &[Candidate],
 ) -> Option<String> {
     let group = worker_group(worker, agents);
-    let eligible: Vec<&Candidate> = agents
-        .iter()
-        .filter(|a| {
-            !group.contains(&a.alias)
-                && !exclude.contains(&a.alias)
-                && !crate::master::is_master(&a.alias)
-                && a.enabled
-                && a.state != "attention"
-                && a.provider != "inbox"
-        })
-        .collect();
+    let worker_pm = group_pm(worker, agents);
+    let qualifies = |a: &&Candidate| {
+        a.role == REVIEWER_ROLE
+            && a.enabled
+            && a.state != "attention"
+            && a.provider != "inbox"
+            && !group.contains(&a.alias)
+            && !exclude.contains(&a.alias)
+            && !crate::master::is_master(&a.alias)
+            && !foreign_pm(worker_pm, a)
+    };
+    let eligible: Vec<&Candidate> = agents.iter().filter(qualifies).collect();
     if let Some(prev) = previous {
         if eligible.iter().any(|a| a.alias == prev) {
             return Some(prev.to_string());
@@ -406,8 +439,13 @@ pub fn pick_reviewer(
     }
     let mut ranked = eligible;
     ranked.sort_by(|a, b| {
+        let idle = |c: &Candidate| c.state == "idle";
         let same = |c: &Candidate| Some(c.provider.as_str()) == worker_provider;
-        same(a).cmp(&same(b)).then(a.alias.cmp(&b.alias))
+        // Idle first, then a different provider, then alias.
+        idle(b)
+            .cmp(&idle(a))
+            .then(same(a).cmp(&same(b)))
+            .then(a.alias.cmp(&b.alias))
     });
     ranked.first().map(|a| a.alias.clone())
 }
@@ -704,6 +742,16 @@ mod tests {
             state: "idle".into(),
             enabled: true,
             upstream: None,
+            role: REVIEWER_ROLE.into(),
+        }
+    }
+
+    fn staff(alias: &str, role: &str, state: &str, upstream: Option<&str>) -> Candidate {
+        Candidate {
+            role: role.into(),
+            state: state.into(),
+            upstream: upstream.map(str::to_string),
+            ..cand(alias, "codex")
         }
     }
 
@@ -819,6 +867,75 @@ mod tests {
         assert_eq!(
             pick_reviewer("w1", None, None, &[], &cyc).as_deref(),
             Some("r")
+        );
+    }
+
+    /// CAD-591: the alias that would win under the old "any peer" rule
+    /// is refused when it is an implementer, busy, or in another PM's
+    /// group. Each bad candidate sorts ahead of `rev`, so a missing
+    /// guard picks that candidate instead.
+    #[test]
+    fn review_goes_only_to_an_idle_designated_reviewer() {
+        let agents = vec![
+            staff("w1", "worker", "idle", Some("pm")),
+            staff("pm", "pm", "idle", None),
+            // Idle implementer in the author's group. Alias first.
+            staff("a-impl", "worker", "idle", Some("pm")),
+            // Busy implementer — the CAD-584 failure.
+            staff("b-busy-impl", "worker", "busy", Some("pm")),
+            // Designated, but busy: leave the review unassigned rather
+            // than hand it to a reviewer who is not idle.
+            staff("c-busy-rev", "reviewer", "busy", Some("pm")),
+            // Designated and idle, but another PM's group.
+            staff("d-foreign", "reviewer", "idle", Some("other-pm")),
+            // The one agent that qualifies in the author's PM group.
+            staff("rev", "reviewer", "idle", Some("pm")),
+            // A root reviewer also qualifies; alias order keeps `rev`.
+            staff("z-root", "reviewer", "idle", None),
+        ];
+        assert_eq!(
+            pick_reviewer("w1", Some("claude"), None, &[], &agents).as_deref(),
+            Some("rev")
+        );
+        // The author is not eligible even when their own role is reviewer.
+        let mut author = agents.clone();
+        author.iter_mut().find(|a| a.alias == "w1").unwrap().role = "reviewer".into();
+        assert_eq!(
+            pick_reviewer("w1", Some("claude"), None, &[], &author).as_deref(),
+            Some("rev")
+        );
+        // Sticky previous reviewer that no longer qualifies is not reused.
+        assert_eq!(
+            pick_reviewer("w1", Some("claude"), Some("d-foreign"), &[], &agents).as_deref(),
+            Some("rev")
+        );
+        assert_eq!(
+            pick_reviewer("w1", Some("claude"), Some("b-busy-impl"), &[], &agents).as_deref(),
+            Some("rev")
+        );
+        // The reviewer already on the ticket keeps it while busy.
+        assert_eq!(
+            pick_reviewer("w1", Some("claude"), Some("c-busy-rev"), &[], &agents).as_deref(),
+            Some("c-busy-rev")
+        );
+        // Every idle reviewer gone: the busy designated reviewer takes
+        // the kickoff. Drop them too and an implementer is not a fallback.
+        let busy_only: Vec<_> = agents
+            .iter()
+            .filter(|a| a.alias != "rev" && a.alias != "z-root")
+            .cloned()
+            .collect();
+        assert_eq!(
+            pick_reviewer("w1", Some("claude"), None, &[], &busy_only).as_deref(),
+            Some("c-busy-rev")
+        );
+        let implementers: Vec<_> = busy_only
+            .into_iter()
+            .filter(|a| a.role != REVIEWER_ROLE)
+            .collect();
+        assert_eq!(
+            pick_reviewer("w1", Some("claude"), None, &[], &implementers),
+            None
         );
     }
 

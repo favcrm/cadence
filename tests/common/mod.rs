@@ -6413,8 +6413,9 @@ pub const FAKE_GH_PY: &str = include_str!("../fixtures/fake-gh.py");
 pub const LOOP_PR: &str = "https://github.com/acme/app/pull/7";
 
 /// The loop's fixture: a routed tracker + daemon, the master, a managed
-/// worker `w1`, managed agents `r1` (the reviewer: first by alias among
-/// same-provider peers) and `r2` (a bystander), and a fake `gh` only the
+/// worker `w1`, managed reviewers `r1` and `r2` (launch role `reviewer`;
+/// `r1` wins by alias, and `r2` takes the ticket when `r1` is excluded),
+/// and a fake `gh` only the
 /// operator's process has on its PATH.
 pub struct LoopFixture {
     pub f: PlanFixture,
@@ -6454,8 +6455,8 @@ impl LoopFixture {
         git(&["commit", "-qm", "demo: repo remote"]);
         let (mut m, _) = f.start_master();
         let w1 = ManagedWorker::start(&f.d, "w1");
-        let r1 = ManagedWorker::start(&f.d, "r1");
-        let r2 = ManagedWorker::start(&f.d, "r2");
+        let r1 = ManagedWorker::start_role(&f.d, "r1", "reviewer");
+        let r2 = ManagedWorker::start_role(&f.d, "r2", "reviewer");
         let plan = f.file("plan.md", plan_md);
         let (ok, out) = f.as_master(
             &mut m,
@@ -6708,17 +6709,21 @@ impl LoopFixture {
         }
     }
 
-    /// w1 reports `sha` done on `pr`; the review goes to r1, which
-    /// PASSes it through `report_verdict`.
+    /// w1 reports `sha` done on `pr`; whichever idle reviewer the loop
+    /// assigned PASSes it through `report_verdict`.
     pub fn pass_on(&mut self, id: &str, sha: &str, pr: &str) {
         self.done_on(id, sha, pr);
         let rec = self.wait_of(id, "in review", |r| {
             r["state"] == "reviewing" && r["head"] == sha
         });
-        assert_eq!(rec["reviewer"], "r1", "{rec}");
+        let reviewer = rec["reviewer"].as_str().unwrap_or_default().to_string();
+        assert!(
+            reviewer == "r1" || reviewer == "r2",
+            "review went to {reviewer}: {rec}"
+        );
         let file = self.verdict_file(&format!("v-{id}-{sha}.md"), "pass", sha, "");
         let (ok, out) = self.as_agent(
-            "r1",
+            &reviewer,
             &format!("report file --task {id} --kind verdict --file {file}"),
         );
         assert!(ok, "{out}");
