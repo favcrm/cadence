@@ -41,6 +41,12 @@ const agentsIcon = (
     <path d="M5.5 14h5" />
   </svg>
 );
+const wikiIcon = (
+  <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4">
+    <path d="M3.5 1.8h6l3 3v9.4h-9z" />
+    <path d="M5.8 7.5h4.4M5.8 10h4.4" />
+  </svg>
+);
 const appsIcon = (
   <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4">
     <path d="M8 1.8l5.2 3v6.4L8 14.2l-5.2-3V4.8l5.2-3z" />
@@ -63,6 +69,7 @@ const outboxIcon = (
 const NAV_ICONS: Record<string, ReactNode> = {
   home: homeIcon,
   projects: boardIcon,
+  wiki: wikiIcon,
   apps: appsIcon,
   agents: agentsIcon,
   outbox: outboxIcon,

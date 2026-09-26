@@ -16,6 +16,7 @@ import Home from "./features/home/Home";
 import Context from "./features/projects/Context";
 import Workflows from "./features/projects/Workflows";
 import Sidebar from "./ui/Sidebar";
+import Wiki from "./features/wiki/Wiki";
 import Link from "./ui/Link";
 import SectionTabs from "./ui/SectionTabs";
 import StatusChips from "./ui/StatusChips";
@@ -72,6 +73,7 @@ const SCREEN_LABEL: Record<Screen, string> = {
   projects: "projects",
   apps: "apps",
   agents: "agents",
+  wiki: "wiki",
   outbox: "outbox",
   setup: "setup",
   settings: "settings",
@@ -740,6 +742,15 @@ export default function App() {
             onOpenAgent={openAgent}
             onOpenIssue={openIssue}
             onRetry={() => void resources.agents.refresh()}
+          />
+        )}
+        {route.screen === "wiki" && (
+          <Wiki
+            route={route}
+            navHref={hrefFor}
+            readOnly={readOnly}
+            actor={actor}
+            onToast={say}
           />
         )}
         {screen === "outbox" && <Outbox operator={meta?.operator === true} />}

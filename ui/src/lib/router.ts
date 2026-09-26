@@ -14,6 +14,9 @@ import { readAppUrlState, type AppTab, type ProjectView } from "./urlState";
  *   /projects/:slug/workflows  its stored workflows and new runs (CAD-496)
  *   /apps[/<project>/<app>]    installed apps, optionally one app's detail (CAD-557)
  *   /agents[/:alias]           agents, optionally one agent's drawer
+ *   /wiki[/<path>]             the wiki: folder tree + page (CAD-581)
+ *   /wiki/edit|history|upload/<path>   its modes for one path
+ *   /wiki/search[/<query>]     full-text search
  *   /setup                     first-run setup
  *   /settings[/memory]         model defaults, memory
  *   /login                     a `cadence ui login` link lands here
@@ -27,6 +30,8 @@ import { readAppUrlState, type AppTab, type ProjectView } from "./urlState";
 
 export type ProjectSection = "issues" | "epics" | "milestones" | "context" | "workflows";
 export type SettingsSection = "models" | "memory" | "update";
+/** The wiki's modes; `browse` opens a path by its kind (CAD-581). */
+export type WikiMode = "browse" | "edit" | "history" | "search" | "upload";
 
 export type Route =
   | { screen: "home" }
@@ -34,6 +39,7 @@ export type Route =
   | { screen: "projects"; slug: string | null; section: ProjectSection }
   | { screen: "apps"; project: string | null; name: string | null }
   | { screen: "agents"; alias: string | null }
+  | { screen: "wiki"; mode: WikiMode; path: string | null; query: string | null }
   | { screen: "outbox" }
   | { screen: "setup" }
   | { screen: "settings"; section: SettingsSection }
@@ -46,6 +52,7 @@ export type Screen = Route["screen"];
 export const NAV: { screen: Screen; label: string; route: Route }[] = [
   { screen: "home", label: "Home", route: { screen: "home" } },
   { screen: "projects", label: "Projects", route: { screen: "projects", slug: null, section: "issues" } },
+  { screen: "wiki", label: "Wiki", route: { screen: "wiki", mode: "browse", path: null, query: null } },
   { screen: "apps", label: "Apps", route: { screen: "apps", project: null, name: null } },
   { screen: "agents", label: "Agents", route: { screen: "agents", alias: null } },
   { screen: "outbox", label: "Outbox", route: { screen: "outbox" } },
@@ -70,9 +77,37 @@ function segment(value: string): string | null {
   }
 }
 
+/** Decode the segments from `from` on; empty and malformed ones drop out. */
+function pathFrom(parts: string[], from: number): string {
+  return parts
+    .slice(from)
+    .map(segment)
+    .filter((s): s is string => s !== null)
+    .join("/");
+}
+
+/**
+ * The wiki's paths (CAD-581). `edit`, `history`, `upload` and `search` are
+ * reserved first segments — the modes' homes; anything else is a path into
+ * the store, which `browse` opens by its kind.
+ */
+function matchWiki(parts: string[]): Route {
+  const mode = parts[1];
+  if (mode === undefined) return { screen: "wiki", mode: "browse", path: null, query: null };
+  if (mode === "search") {
+    const query = pathFrom(parts, 2);
+    return { screen: "wiki", mode: "search", path: null, query: query || null };
+  }
+  if (mode === "edit" || mode === "history" || mode === "upload") {
+    return { screen: "wiki", mode, path: pathFrom(parts, 2) || null, query: null };
+  }
+  return { screen: "wiki", mode: "browse", path: pathFrom(parts, 1) || null, query: null };
+}
+
 export function matchRoute(pathname: string): Route {
   const parts = pathname.split("/").filter(Boolean);
   const [head, a, b, ...rest] = parts;
+  if (head === "wiki") return matchWiki(parts);
   if (rest.length === 0) {
     if (!head && !a) return { screen: "home" };
     if (head === "index.html" && !a) return { screen: "home" };
@@ -125,6 +160,14 @@ export function routePath(route: Route): string {
         : "/apps";
     case "agents":
       return route.alias ? `/agents/${encodeURIComponent(route.alias)}` : "/agents";
+    case "wiki": {
+      const path = route.path ? route.path.split("/").map(encodeURIComponent).join("/") : "";
+      if (route.mode === "search") {
+        return route.query ? `/wiki/search/${encodeURIComponent(route.query)}` : "/wiki/search";
+      }
+      if (route.mode === "browse") return path ? `/wiki/${path}` : "/wiki";
+      return path ? `/wiki/${route.mode}/${path}` : `/wiki/${route.mode}`;
+    }
     case "setup":
       return "/setup";
     case "login":
