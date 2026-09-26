@@ -1735,6 +1735,18 @@ fn board_apps_list_and_detail() {
     assert_eq!(v["workflows"][0]["ok"], true, "{v}");
     assert_eq!(v["workflows"][0]["label"], "New run", "{v}");
     assert_eq!(v["workflows"][0]["uses"], json!(["publish"]), "{v}");
+    // The inputs keep the file's order — the app page's primary field
+    // (and the form's first field) is the first declared input.
+    assert_eq!(
+        v["workflows"][0]["inputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["title", "note"],
+        "{v}"
+    );
     // The steps, in order, from the canonical render — the app page's
     // stage row and its team mapping read these (CAD-563 r2).
     assert_eq!(

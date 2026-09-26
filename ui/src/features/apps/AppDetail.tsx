@@ -24,6 +24,7 @@ import {
   connectionRows,
   distinctNote,
   doctorFindings,
+  filterCounts,
   outboxHref,
   outputsOf,
   primaryAction,
@@ -31,7 +32,6 @@ import {
   runFilter,
   runStages,
   runState,
-  runsSummary,
   sourceLabel,
   stepRows,
   teamFromLastRun,
@@ -249,14 +249,11 @@ function PostsTab({
   onRetry: () => void;
 }) {
   const [filter, setFilter] = useState<RunFilter>("in_progress");
+  const counts = filterCounts(runs, needs, items, pending);
   const shown = runs.filter((run) => {
     const mine = outputsOf(run, items, pending);
     return runFilter(run, needs, mine.items.length > 0) === filter;
   });
-  const counts: Record<RunFilter, number> = { in_progress: 0, needs_you: 0, published: 0 };
-  for (const run of runs) {
-    counts[runFilter(run, needs, outputsOf(run, items, pending).items.length > 0)] += 1;
-  }
   return (
     <section className="min-w-0 space-y-2.5" aria-label="posts">
       <div className="flex flex-wrap items-center gap-1.5">
@@ -280,7 +277,15 @@ function PostsTab({
             {counts[id] > 0 && <span className="num ml-1 opacity-70">{counts[id]}</span>}
           </button>
         ))}
-        <span className="text-micro text-ink-500 ml-auto">{runsSummary(runs, needs) ?? "Nothing yet"}</span>
+        <span className="text-micro text-ink-500 ml-auto">
+          {[
+            counts.in_progress > 0 ? `${counts.in_progress} in progress` : null,
+            counts.needs_you > 0 ? `${counts.needs_you} need${counts.needs_you === 1 ? "s" : ""} you` : null,
+            counts.published > 0 ? `${counts.published} published` : null,
+          ]
+            .filter(Boolean)
+            .join(" · ") || "Nothing yet"}
+        </span>
       </div>
       <ResourceGate
         state={runsState}

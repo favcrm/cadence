@@ -195,6 +195,25 @@ export function runsSummary(runs: AppRun[], needs: HomeNeed[]): string | null {
   return parts.length > 0 ? parts.join(" · ") : "Nothing running";
 }
 
+/**
+ * The Posts tab's counts, under the same rule as its filters: published
+ * first, then anything the operator must act on, then the rest. The
+ * header line and the chips always agree.
+ */
+export function filterCounts(
+  runs: AppRun[],
+  needs: HomeNeed[],
+  items: AppRunOutput[],
+  pending: AppPendingSend[],
+): Record<RunFilter, number> {
+  const counts: Record<RunFilter, number> = { in_progress: 0, needs_you: 0, published: 0 };
+  for (const run of runs) {
+    const published = outputsOf(run, items, pending).items.length > 0;
+    counts[runFilter(run, needs, published)] += 1;
+  }
+  return counts;
+}
+
 /** The team a new run starts with: the last run's owners, by step. */
 export function teamFromLastRun(wf: AppWorkflow, runs: AppRun[]): Record<string, string> {
   const steps = wf.steps ?? [];

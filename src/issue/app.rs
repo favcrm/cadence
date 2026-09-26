@@ -1800,9 +1800,7 @@ pub fn show(pm: &Pm, project_key: &str, name: &str, state_dir: &Path) -> Result<
             // workflow never declared one.
             "label": tpl.as_ref().and_then(|t| t.label.clone()),
             "tickets": doc.as_ref().map(|d| d.tickets.len()),
-            "inputs": tpl.as_ref().map(|t| t.inputs.iter().map(|(k, s)| json!({
-                "name": k, "ask": s.ask, "optional": s.optional,
-            })).collect::<Vec<_>>()),
+            "inputs": tpl.as_ref().map(workflow::inputs_json),
             // The steps, in order, from the canonical render: each
             // title (input names stand in for values) and the agent
             // expression — an input name when the ticket's `agent:` is
@@ -1946,9 +1944,7 @@ pub fn board_rows(pm_dir: &Path, project: &str, state_dir: &Path) -> Vec<Value> 
                         "app": name,
                         "title": doc.as_ref().map(|d| d.title.clone()),
                         "tickets": doc.map(|d| d.tickets.len()),
-                        "inputs": tpl.map(|t| t.inputs.iter().map(|(k, s)| json!({
-                            "name": k, "ask": s.ask, "optional": s.optional,
-                        })).collect::<Vec<_>>()),
+                        "inputs": tpl.as_ref().map(workflow::inputs_json),
                         "approved": approved,
                         "digest": app_digest.as_ref().ok(),
                     });

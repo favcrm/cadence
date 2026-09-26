@@ -75,13 +75,38 @@ pub struct InputSpec {
 
 /// A parsed workflow template: the declared inputs, the `distinct:`
 /// group — inputs whose rendered values must pairwise differ — and the
-/// optional human `label:`. The plan structure itself is checked by
-/// rendering and running [`plan::parse_plan`].
+/// optional human `label:`. `input_order` is the file's own order (the
+/// run form shows the inputs as the author wrote them; the map is
+/// sorted). The plan structure itself is checked by rendering and
+/// running [`plan::parse_plan`].
 #[derive(Clone, Debug)]
 pub struct Template {
     pub inputs: BTreeMap<String, InputSpec>,
+    /// The `inputs:` names in declared order.
+    pub input_order: Vec<String>,
     pub distinct: Vec<String>,
     pub label: Option<String>,
+}
+
+/// The declared inputs as the board renders them — file order, each
+/// with its ask and optionality.
+pub fn inputs_json(tpl: &Template) -> Vec<Value> {
+    let mut names = tpl.input_order.clone();
+    for name in tpl.inputs.keys() {
+        if !names.contains(name) {
+            names.push(name.clone());
+        }
+    }
+    names
+        .iter()
+        .filter_map(|name| {
+            tpl.inputs.get(name).map(|spec| {
+                json!({
+                    "name": name, "ask": spec.ask, "optional": spec.optional,
+                })
+            })
+        })
+        .collect()
 }
 
 /// `{{name}}` — the input name is a bare word, like an alias but with
@@ -158,6 +183,7 @@ pub fn read_for(pm_dir: &Path, project: &str, name: &str) -> Result<String> {
 /// plan's own metadata (title, goal, non_goals) stays in the file.
 struct Front {
     inputs: BTreeMap<String, InputSpec>,
+    input_order: Vec<String>,
     distinct: Vec<String>,
     label: Option<String>,
 }
@@ -207,6 +233,7 @@ fn parse_front(yaml: &str) -> Result<Front> {
     };
     let inputs_val = map.remove(serde_yaml::Value::String("inputs".to_string()));
     let mut inputs = BTreeMap::new();
+    let mut input_order: Vec<String> = Vec::new();
     if let Some(inputs_val) = inputs_val {
         let serde_yaml::Value::Mapping(specs) = inputs_val else {
             return Err(Error::rejected(
@@ -256,6 +283,7 @@ fn parse_front(yaml: &str) -> Result<Front> {
                 }
             };
             inputs.insert(name.to_string(), spec);
+            input_order.push(name.to_string());
         }
     }
     // `distinct: [a, b]` — inputs whose rendered values must pairwise
@@ -288,6 +316,7 @@ fn parse_front(yaml: &str) -> Result<Front> {
     }
     Ok(Front {
         inputs,
+        input_order,
         distinct,
         label,
     })
@@ -432,6 +461,7 @@ pub fn parse_template(text: &str) -> Result<Template> {
     ticket_meta(body)?;
     Ok(Template {
         inputs: front.inputs,
+        input_order: front.input_order,
         distinct: front.distinct,
         label: front.label,
     })
@@ -1457,9 +1487,7 @@ pub fn show(pm: &Pm, project_key: &str, name: &str, state_dir: &Path) -> Result<
             }).collect::<Vec<_>>(),
             "acceptance": t.acceptance.len(),
         })).collect::<Vec<_>>()),
-        "inputs": tpl.map(|t| t.inputs.iter().map(|(k, s)| json!({
-            "name": k, "ask": s.ask, "optional": s.optional,
-        })).collect::<Vec<_>>()),
+        "inputs": tpl.as_ref().map(inputs_json),
     }))
 }
 
@@ -1528,6 +1556,12 @@ Why.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance
         assert!(!tpl.inputs["topic"].optional);
         assert!(tpl.inputs["keyword"].optional);
         assert_eq!(tpl.label, None, "no label is fine");
+        // The declared order is kept for the board's form: `topic`
+        // before `keyword` though the map sorts them the other way.
+        assert_eq!(tpl.input_order, vec!["topic", "keyword"]);
+        let rows = inputs_json(&tpl);
+        assert_eq!(rows[0]["name"], "topic", "{rows:?}");
+        assert_eq!(rows[1]["name"], "keyword", "{rows:?}");
     }
 
     /// CAD-563: `label:` is the human name the board's primary action

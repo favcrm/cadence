@@ -9,6 +9,7 @@ import {
   connectionRows,
   distinctNote,
   doctorFindings,
+  filterCounts,
   needIssue,
   newRunHref,
   outboxHref,
@@ -339,6 +340,22 @@ equal(
   runsSummary([run({}, { state: "approved" }), run({ epic: "D-4" }, { state: "proposed" })], []),
   "1 in progress · 1 needs you",
   "the card's live line",
+);
+// The Posts tab's counts follow the filters: published first, then the
+// operator's rows, then the rest — the header and the chips agree.
+equal(
+  filterCounts(
+    [
+      run({}, { state: "approved" }),
+      run({ epic: "D-4" }, { state: "proposed" }),
+      run({ epic: "D-7" }, { state: "approved" }),
+    ],
+    [],
+    [{ ...output, runs: ["D-7"] }],
+    [],
+  ),
+  { in_progress: 1, needs_you: 1, published: 1 },
+  "the Posts counts",
 );
 
 // Settings/How-it-works: publish target and the kept-apart rule.
