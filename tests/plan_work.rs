@@ -1865,6 +1865,52 @@ fn app_add_worker_joins_and_records_the_role() {
     assert_ne!(out2["alias"], json!(alias), "unique alias: {out2}");
 }
 
+/// CAD-577: approving a run resumes the stopped agents its tickets are
+/// assigned to — the app's team — through the existing `agent resume`
+/// path, instead of leaving their tasks queued. A live agent is left
+/// alone.
+#[test]
+fn plan_approve_resumes_the_runs_stopped_team_agents() {
+    let f = PlanFixture::start();
+    for a in ["dev-1", "qa-1"] {
+        f.d.register(a);
+        f.d.wait_agent(a, "idle", 10);
+    }
+    // Both team agents stop before the plan is approved.
+    for a in ["dev-1", "qa-1"] {
+        f.d.operator_rpc("agent_stop", json!({"alias": a})).unwrap();
+        f.d.wait_agent(a, "stopped", 10);
+    }
+
+    wf_add(&f, "two-step", WF_TWO_STEP);
+    let (ok, out) = f.cli(&["workflow", "approve", "two-step", "--project", "demo"]);
+    assert!(ok, "{out}");
+    let (ok, out) = f.cli(&[
+        "plan",
+        "propose",
+        "--project",
+        "demo",
+        "--workflow",
+        "two-step",
+        "--input",
+        "title=resume",
+    ]);
+    assert!(ok, "{out}");
+    let epic = out["epic"].as_str().unwrap();
+    let (ok, out) = f.cli(&["plan", "approve", epic]);
+    assert!(ok, "{out}");
+
+    // Both stopped team agents resumed through the existing path.
+    for a in ["dev-1", "qa-1"] {
+        f.d.wait_agent(a, "idle", 15);
+        let resumed =
+            f.d.events(a)
+                .into_iter()
+                .any(|e| e["kind"].as_str() == Some("run_team_resumed"));
+        assert!(resumed, "{a} has no run_team_resumed event");
+    }
+}
+
 /// CAD-577: revoking an app's approval revokes exactly the grants the
 /// approval derived — and never a hand-made grant's other scopes.
 #[test]
