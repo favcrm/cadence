@@ -203,6 +203,102 @@ export function threadItems(state: ThreadState | null): ThreadItem[] {
   return items;
 }
 
+// ---- CAD-551: steps, refusals, and the working row's "what now" ----
+
+/** One tool call and the result that answered it (when it has). */
+export interface ToolStep {
+  /** The provider's `tool_use_id` when it sent one — the pair key. */
+  id?: string;
+  call: ThreadEntry;
+  result?: ThreadEntry;
+  /** The provider refused the call (a permission denial), not failed it. */
+  refused: boolean;
+  /** The call's result was an error — including a refusal. */
+  error: boolean;
+  /** One-line call summary, already redacted by the daemon. */
+  summary: string;
+  /** A result landed for the call. */
+  done: boolean;
+}
+
+/** First line of a summary, trimmed — entries are one-liners already,
+ * but a provider detail can smuggle newlines onto a row. */
+export function stepSummary(text: string | null | undefined): string {
+  const line = (text ?? "").split("\n", 1)[0].trim();
+  return line.length > 120 ? `${line.slice(0, 117)}…` : line;
+}
+
+/**
+ * Fold a `tools` item's entries into call/result pairs. `tool_use_id`
+ * pairs a result with its call; a result carrying NO id (an old daemon)
+ * answers the earliest open call, positionally. A result whose id names
+ * no call in the window — the call was paged out — stands alone at the
+ * end rather than closing an unrelated open call.
+ */
+export function toolSteps(entries: ThreadEntry[]): ToolStep[] {
+  const steps: ToolStep[] = [];
+  const byId = new Map<string, ToolStep>();
+  const open: ToolStep[] = [];
+  const lone: ToolStep[] = [];
+  for (const e of entries) {
+    if (e.kind === "tool_call") {
+      const id = typeof e.payload?.tool_use_id === "string" ? e.payload.tool_use_id : undefined;
+      const step: ToolStep = {
+        id,
+        call: e,
+        refused: false,
+        error: false,
+        summary: stepSummary(e.text),
+        done: false,
+      };
+      steps.push(step);
+      if (id) byId.set(id, step);
+      open.push(step);
+      continue;
+    }
+    if (e.kind !== "tool_result") continue;
+    const id = typeof e.payload?.tool_use_id === "string" ? e.payload.tool_use_id : undefined;
+    let step = (id && byId.get(id)) || undefined;
+    if (step?.done) step = undefined;
+    if (!step && !id) step = open.find((s) => !s.done);
+    const refused = e.payload?.refused === true;
+    const error = e.payload?.is_error === true;
+    if (!step) {
+      lone.push({
+        call: e,
+        result: e,
+        refused,
+        error,
+        summary: stepSummary(e.text),
+        done: true,
+      });
+      continue;
+    }
+    step.result = e;
+    step.done = true;
+    step.refused = refused;
+    step.error = error;
+  }
+  return lone.length ? [...steps, ...lone] : steps;
+}
+
+/**
+ * The tool call still awaiting its result at the thread's tail — the
+ * working row's live "step" line. Results pair with calls in order, so
+ * the tail is either an open `tool_call` (returned) or something that
+ * ends the tool run — `tool_result`, text, a new message — and there is
+ * no step in flight (null).
+ */
+export function openStep(entries: ThreadEntry[]): ThreadEntry | null {
+  let i = entries.length - 1;
+  while (i >= 0 && TOOL_KINDS.has(entries[i].kind)) i--;
+  const tail = entries.slice(i + 1);
+  if (!tail.length) return null;
+  const steps = toolSteps(tail);
+  const open = steps.filter((s) => !s.done && s.call.kind === "tool_call");
+  return open.length ? open[open.length - 1].call : null;
+}
+
 const EPIC_ID = /[A-Z][A-Z0-9]{0,9}-\d+/;
 const EPIC_JSON = new RegExp(`"epic"\\s*:\\s*"(${EPIC_ID.source})"`);
 const PLAN_CMD = new RegExp(`\\bplan (?:propose[ds]?|show|approve|reject)\\b[^\\n]*?\\b(${EPIC_ID.source})\\b`);

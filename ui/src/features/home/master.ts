@@ -1,4 +1,4 @@
-import type { AgentsPayload } from "../../lib/types";
+import type { Agent, AgentsPayload, MasterState } from "../../lib/types";
 
 /** The master's alias — `cadence master start` registers it (CAD-339). */
 export const MASTER = "master";
@@ -48,4 +48,196 @@ export function composerBlock(block: string | null, status: MasterStatus): strin
     case "running":
       return null;
   }
+}
+
+// ---- CAD-551: the composer's `/` verbs and the working row ----
+
+/** One `/` verb (CAD-551). `help` is composer-local — it never crosses
+ * the board; the rest post to `/api/master/command`, whose own
+ * allowlist is the daemon's set. `arg` is the autocomplete hint's
+ * placeholder, `kind` splits reads from mutations for styling. */
+export interface SlashCommand {
+  name: string;
+  arg?: string;
+  blurb: string;
+  kind: "read" | "set" | "act";
+}
+
+export const SLASH_COMMANDS: SlashCommand[] = [
+  { name: "help", blurb: "What the / commands do", kind: "read" },
+  { name: "state", blurb: "Session state — model, effort, session id", kind: "read" },
+  { name: "stats", blurb: "Context usage — how much of the window is in use", kind: "read" },
+  { name: "models", blurb: "Models the provider offers", kind: "read" },
+  { name: "model", arg: "provider/id", blurb: "Set the model (bare: the provider's list)", kind: "set" },
+  { name: "levels", blurb: "Thinking levels the provider offers", kind: "read" },
+  { name: "effort", arg: "level", blurb: "Set the thinking level (bare: levels + current)", kind: "set" },
+  { name: "compact", blurb: "Compact the session context now", kind: "act" },
+  { name: "new", blurb: "Restart the provider session — fresh context", kind: "act" },
+  { name: "stop", blurb: "Interrupt the running turn", kind: "act" },
+];
+
+/** `/name` or `/name arg…` — null when the draft is not a command. */
+export function parseSlash(draft: string): { name: string; arg: string } | null {
+  if (!draft.startsWith("/")) return null;
+  const body = draft.slice(1);
+  const split = body.indexOf(" ");
+  const name = (split < 0 ? body : body.slice(0, split)).toLowerCase();
+  if (!/^[a-z]+$/.test(name)) return null;
+  return { name, arg: split < 0 ? "" : body.slice(split + 1).trim() };
+}
+
+/** Verbs whose name starts with `prefix` — the autocomplete rows. */
+export function slashMatches(prefix: string): SlashCommand[] {
+  return SLASH_COMMANDS.filter((c) => c.name.startsWith(prefix));
+}
+
+// ---- Command results as fields (CAD-551 r2) ----
+
+/** Wire keys → the label a command card shows. */
+const KV_LABELS: Record<string, string> = {
+  model: "model",
+  thinkingLevel: "effort",
+  sessionId: "session",
+  contextUsage: "context",
+  pendingMessageCount: "pending",
+  isStreaming: "streaming",
+  messageCount: "messages",
+  was: "was",
+};
+
+/** The order familiar fields take on a card; the rest follow as sent. */
+const KV_ORDER = [
+  "model",
+  "effort",
+  "session",
+  "context",
+  "pending",
+  "streaming",
+  "messages",
+  "was",
+];
+
+const shortJson = (v: unknown): string => {
+  const s = JSON.stringify(v);
+  return s.length > 90 ? `${s.slice(0, 87)}…` : s;
+};
+
+const num = (v: unknown): number | null =>
+  typeof v === "number" && Number.isFinite(v) ? v : null;
+
+const fmtNum = (n: number): string => n.toLocaleString("en-US");
+
+/** One field's display value — objects fold to a compact read. */
+function kvValue(v: unknown): string {
+  if (v == null) return "—";
+  if (typeof v !== "object") return String(v);
+  if (Array.isArray(v)) return v.length ? v.map(kvValue).join(" · ") : "—";
+  const o = v as Record<string, unknown>;
+  if (typeof o.name === "string" && typeof o.id === "string") return `${o.name} (${o.id})`;
+  const used = num(o.usedTokens ?? o.used_tokens ?? o.tokens);
+  const max = num(o.maxTokens ?? o.max_tokens ?? o.contextWindow ?? o.window);
+  if (used != null && max != null && max > 0) {
+    return `${fmtNum(used)} / ${fmtNum(max)} (${Math.round((used / max) * 100)}%)`;
+  }
+  if (used != null) return fmtNum(used);
+  const pct = num(o.percent ?? o.percentUsed ?? o.used_percent);
+  if (pct != null) return `${Math.round(pct)}%`;
+  return shortJson(v);
+}
+
+/**
+ * A command result as `[label, value]` rows for the card's field list
+ * (CAD-551 r2): objects list their fields — known wire names relabelled
+ * (`sessionId` → `session`), familiar ones ordered first — and an array
+ * (a `/models` list) lists one row per element keyed on id/name.
+ * `[]` when the value has no fields to show — the card falls back to
+ * raw JSON.
+ */
+export function kvRows(v: unknown): [string, string][] {
+  const rows: [string, string][] = [];
+  if (Array.isArray(v)) {
+    for (const el of v) {
+      if (el && typeof el === "object") {
+        const o = el as Record<string, unknown>;
+        const key = typeof o.id === "string" ? o.id : typeof o.name === "string" ? o.name : `${rows.length + 1}`;
+        rows.push([key, kvValue(o)]);
+      } else {
+        rows.push([`${rows.length + 1}`, kvValue(el)]);
+      }
+    }
+    return rows;
+  }
+  if (!v || typeof v !== "object") return rows;
+  const obj = v as Record<string, unknown>;
+  const byLabel = new Map<string, string>();
+  const rest: string[] = [];
+  for (const k of Object.keys(obj)) {
+    const label = KV_LABELS[k];
+    if (label === undefined) rest.push(k);
+    else if (!byLabel.has(label)) byLabel.set(label, k);
+  }
+  const keys = [
+    ...KV_ORDER.filter((l) => byLabel.has(l)).map((l) => byLabel.get(l) as string),
+    ...rest,
+  ];
+  for (const k of keys) rows.push([KV_LABELS[k] ?? k, kvValue(obj[k])]);
+  return rows;
+}
+
+/**
+ * Where the master's turn stands (CAD-551): `master_state`'s live turn
+ * wins; the agents row covers a daemon that cannot answer (501) or a
+ * refresh gap — `running` over `queued`, never both shown at once.
+ * `submitting` is the composer's own POST still in flight (no stored
+ * entry yet), `queued` the "behind a turn" wait.
+ */
+export type TurnState =
+  | { kind: "idle" }
+  | { kind: "submitting" }
+  | { kind: "queued"; summary?: string | null; since?: number | null }
+  | {
+      kind: "working";
+      message: string;
+      summary?: string | null;
+      since?: number | null;
+      queued?: number;
+      compacting?: boolean;
+    };
+
+export function turnState(
+  master: MasterState | null | undefined,
+  row: Agent | undefined,
+  submitting: boolean,
+): TurnState {
+  if (master?.turn) {
+    const t = master.turn;
+    if (t.state === "working") {
+      return {
+        kind: "working",
+        message: t.message,
+        summary: t.summary,
+        since: t.since,
+        queued: master.queued ?? row?.queued,
+        compacting: master.session?.compacting === true,
+      };
+    }
+    return { kind: "queued", summary: t.summary, since: t.since };
+  }
+  // Fallbacks: the agents row's counters (works on a daemon without
+  // master_state) then the composer's own in-flight send.
+  if (row && row.running > 0 && row.message) {
+    const c = row.message.created;
+    const since =
+      typeof c === "number" ? c : c ? Date.parse(c) / 1000 : null;
+    return {
+      kind: "working",
+      message: row.message.id,
+      summary: row.message.summary,
+      since: since !== null && Number.isNaN(since) ? null : since,
+      queued: row.queued,
+    };
+  }
+  if (row && row.queued > 0) return { kind: "queued" };
+  if (submitting) return { kind: "submitting" };
+  return { kind: "idle" };
 }

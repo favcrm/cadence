@@ -473,6 +473,26 @@ pub trait ProviderAdapter: Send + Sync {
     fn quota_snapshot(&self) -> Option<Value> {
         None
     }
+    /// The provider-session verbs this endpoint answers for the daemon's
+    /// operator-level `master_command` allowlist (CAD-551): `state`,
+    /// `stats`, `models`, `levels` are reads; `model`, `effort`,
+    /// `compact`, `new` change the session; `stop` declares the running
+    /// turn interruptible by [`interrupt_turn`]. The daemon refuses any
+    /// verb the declaration does not list before the adapter sees it.
+    /// The default advertises none.
+    fn session_commands(&self) -> &'static [&'static str] {
+        &[]
+    }
+    /// Run one declared [`session_commands`] verb. `command` is the
+    /// allowlisted name; `arg` is the optional operand (`model` takes a
+    /// `provider/id` or bare id, `effort` a thinking level). This is a
+    /// mapping onto the provider's own RPCs — never a raw command
+    /// passthrough — so the daemon's allowlist stays the only verb set.
+    fn session_command(&self, command: &str, _arg: Option<&str>) -> Result<Value> {
+        Err(Error::rejected(format!(
+            "the '{command}' command is not supported by this provider"
+        )))
+    }
 }
 
 /// Build the adapter for an agent's `provider`/`endpoint_kind`.

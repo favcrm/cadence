@@ -10,6 +10,8 @@ import type {
   IssueCard,
   IssueDetail,
   IssueHistoryEntry,
+  MasterCommandResult,
+  MasterState,
   MemoryCard,
   MemoryDetail,
   Meta,
@@ -397,6 +399,16 @@ export const api = {
   /** `GET /api/master/summary?since=` — 501 on a daemon without it. */
   masterSummary: (since: number) =>
     get<Record<string, unknown>>(`/api/master/summary?since=${Math.floor(since)}`),
+  /** `GET /api/master/state` — session chips + in-flight turn (CAD-551);
+   *  501 on a daemon that predates it. */
+  masterState: () => get<MasterState>("/api/master/state"),
+  /** `POST /api/master/command` — an allowlisted session verb (CAD-551);
+   *  operator-only, 400 `unknown_command` outside the board's set. */
+  masterCommand: (command: string, arg?: string, wait?: number) =>
+    post<MasterCommandResult>(
+      "/api/master/command",
+      wait !== undefined ? { command, arg, wait } : arg ? { command, arg } : { command },
+    ),
 
   modelDefaults: () => get<ModelDefaultsSnapshot>("/api/settings/model-defaults"),
   saveModelDefaults: (body: { expected_revision: number; config: ModelDefaultsConfig }) =>

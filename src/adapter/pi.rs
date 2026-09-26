@@ -1197,6 +1197,111 @@ impl PiAdapter {
         )
     }
 
+    /// A `request` answered `success:true` → its `data`, else the
+    /// provider's own error via [`command_error`].
+    fn checked(&self, command: &str, fields: Value) -> Result<Value> {
+        let resp = self.request(command, fields)?;
+        if resp.get("success").and_then(Value::as_bool) == Some(true) {
+            Ok(resp.get("data").cloned().unwrap_or(Value::Null))
+        } else {
+            Err(command_error(command, &resp))
+        }
+    }
+
+    /// `/model <id>` (CAD-551): `arg` is `provider/id`, a bare model id,
+    /// or a name on the provider's own list. The answer reports the
+    /// model that was running plus the one `set_model` returned — the
+    /// reply is self-verifying, no extra `get_state`.
+    fn session_set_model(&self, arg: &str) -> Result<Value> {
+        let before = self.checked("get_state", json!({})).ok().and_then(|s| {
+            s.pointer("/model/id")
+                .or_else(|| s.pointer("/model/name"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+        let (provider, model_id) = match arg.split_once('/') {
+            Some((p, id)) if !p.is_empty() && !id.is_empty() => (p.to_string(), id.to_string()),
+            _ => {
+                let listed = self.checked("get_available_models", json!({}))?;
+                let models = listed.get("models").and_then(Value::as_array);
+                let found = models.and_then(|ms| {
+                    ms.iter().find(|m| {
+                        m.get("id").and_then(Value::as_str) == Some(arg)
+                            || m.get("name").and_then(Value::as_str) == Some(arg)
+                    })
+                });
+                match found {
+                    Some(m) => (
+                        m.get("provider")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        m.get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or(arg)
+                            .to_string(),
+                    ),
+                    None => {
+                        return Err(Error::rejected(format!(
+                            "pi lists no model '{arg}' — `/models` names what it offers"
+                        )))
+                    }
+                }
+            }
+        };
+        // CAD-559: a `/model` switch is a launch-equivalent decision —
+        // the operator's [pi].models.allow gate runs before `set_model`
+        // crosses the wire, exactly like the open path's re-check.
+        let want = format!("{provider}/{model_id}");
+        let pi_policy = pi_pm_dir(&self.env)
+            .map(|dir| crate::pi_policy::read(&dir))
+            .transpose()?
+            .flatten();
+        crate::pi_policy::require_allowed(pi_policy.as_ref(), &want)?;
+        let model = self.checked(
+            "set_model",
+            json!({"provider": provider, "modelId": model_id}),
+        )?;
+        // The ack is a hint like `--model` — `get_state` is the proof;
+        // a silent fallback fails the command (same rule as open).
+        let state = self.checked("get_state", json!({}))?;
+        let reported_id = state
+            .get("model")
+            .and_then(|m| m.get("id").or_else(|| m.get("name")))
+            .and_then(Value::as_str);
+        let reported_full = state
+            .get("model")
+            .and_then(|m| m.get("provider"))
+            .and_then(Value::as_str)
+            .and_then(|p| reported_id.map(|i| format!("{p}/{i}")));
+        if !(reported_full.as_deref() == Some(want.as_str()) || reported_id == Some(want.as_str()))
+        {
+            return Err(Error::provider(format!(
+                "pi reports model {} but '{want}' was set — the provider \
+                 silently fell back instead of honoring set_model (CAD-559)",
+                reported_full.as_deref().or(reported_id).unwrap_or("<none>")
+            )));
+        }
+        Ok(json!({"was": before, "model": model, "requested": want}))
+    }
+
+    /// `/effort <level>` (CAD-551): set, then verify what stuck — Pi
+    /// answers success even on a silent fallback to `off`, like `open`.
+    fn session_set_effort(&self, level: &str) -> Result<Value> {
+        self.checked("set_thinking_level", json!({"level": level}))?;
+        let state = self.checked("get_state", json!({}))?;
+        let applied = state.get("thinkingLevel").and_then(Value::as_str);
+        match applied {
+            Some(l) if l == level => Ok(json!({"level": l})),
+            got => Err(Error::provider(format!(
+                "pi refused effort '{level}' (thinking level stayed at {}) — \
+                 supported levels: {}",
+                got.unwrap_or("unknown"),
+                registry::PI_EFFORTS.join(", ")
+            ))),
+        }
+    }
+
     /// One `{"id":…,"type":<command>,…}` frame → its `response`.
     /// `success:false` answers with the provider's `error` text — a
     /// definitive reply, never `OutcomeUnknown`. A timeout is unknown:
@@ -1369,11 +1474,21 @@ impl Shared {
     fn on_tool_end(&self, event: &Value) {
         let result = event.get("result").unwrap_or(&Value::Null);
         let content = result.get("content").unwrap_or(&Value::Null);
+        let summary = crate::store::tool_result_summary(content);
+        let is_error = event
+            .get("isError")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        // The master's guard blocks with its own reason text (`cadence
+        // master …`) in the result content — a refusal, not a failure
+        // (CAD-551). Ordinary `isError` output stays a failure.
+        let refused = is_error && summary.starts_with("cadence master");
         self.emit(
             "cadence/tool_result",
             &json!({
-                "summary": crate::store::tool_result_summary(content),
-                "is_error": event.get("isError").and_then(Value::as_bool).unwrap_or(false),
+                "summary": summary,
+                "is_error": is_error,
+                "refused": refused,
                 "tool_use_id": event.get("toolCallId"),
             }),
         );
@@ -1803,6 +1918,51 @@ impl ProviderAdapter for PiAdapter {
         }
         self.interrupt();
         Ok(super::InterruptOutcome::Delivered)
+    }
+
+    /// CAD-551: the operator's provider-session verbs. `stop` rides the
+    /// daemon's `interrupt` path rather than this one.
+    fn session_commands(&self) -> &'static [&'static str] {
+        &[
+            "state", "stats", "models", "model", "levels", "effort", "compact", "new", "stop",
+        ]
+    }
+
+    fn session_command(&self, command: &str, arg: Option<&str>) -> Result<Value> {
+        match command {
+            "state" => self.checked("get_state", json!({})),
+            "stats" => self.checked("get_session_stats", json!({})),
+            "models" => self.checked("get_available_models", json!({})),
+            "levels" => self.checked("get_available_thinking_levels", json!({})),
+            // Bare `/model` lists — the same answer `models` gives.
+            "model" => match arg {
+                Some(a) => self.session_set_model(a),
+                None => self.checked("get_available_models", json!({})),
+            },
+            // Bare `/effort`: the levels plus the live one.
+            "effort" => match arg {
+                Some(a) => self.session_set_effort(a),
+                None => {
+                    let levels = self.checked("get_available_thinking_levels", json!({}))?;
+                    let state = self.checked("get_state", json!({}))?;
+                    Ok(json!({
+                        "levels": levels.get("levels").cloned().unwrap_or(Value::Null),
+                        "current": state.get("thinkingLevel").cloned().unwrap_or(Value::Null),
+                    }))
+                }
+            },
+            "compact" => self.checked("compact", json!({})),
+            "new" => {
+                let out = self.checked("new_session", json!({}))?;
+                // The session id changed — answer the fresh state so the
+                // caller's header lands on it.
+                let state = self.checked("get_state", json!({}))?;
+                Ok(json!({"new_session": out, "state": state}))
+            }
+            other => Err(Error::rejected(format!(
+                "the '{other}' command is not supported by pi"
+            ))),
+        }
     }
 
     fn disconnected(&self) -> bool {

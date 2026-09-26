@@ -1332,3 +1332,228 @@ fn master_start_resolves_the_pi_model_gate() {
         "{show}"
     );
 }
+
+// ---- CAD-551: the operator's provider-session verbs ----
+
+/// `session_commands` declares exactly the verbs the daemon's
+/// `master_command` allowlist maps onto provider RPCs.
+#[test]
+fn session_commands_declares_the_pi_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pi, _rx) = adapter("normal", dir.path());
+    assert_eq!(
+        pi.session_commands(),
+        &["state", "stats", "models", "model", "levels", "effort", "compact", "new", "stop"]
+    );
+    pi.close();
+}
+
+/// Read verbs before any turn: `state` carries the session's model and
+/// thinking level, `stats` the context usage, `models`/`levels` the
+/// offer lists — the header chips' data source.
+#[test]
+fn session_command_reads_state_stats_and_lists() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pi, _rx) = adapter("normal", dir.path());
+    pi.open(&agent("dev-1", json!({}))).unwrap();
+
+    let state = pi.session_command("state", None).unwrap();
+    assert_eq!(state["model"]["id"], "model-1", "{state}");
+    assert_eq!(state["model"]["provider"], "fake", "{state}");
+    assert_eq!(state["thinkingLevel"], "medium", "{state}");
+
+    let stats = pi.session_command("stats", None).unwrap();
+    assert_eq!(stats["contextUsage"]["contextWindow"], 200000, "{stats}");
+    assert!(stats["contextUsage"]["tokens"].is_number(), "{stats}");
+
+    let models = pi.session_command("models", None).unwrap();
+    assert!(models["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["id"] == "model-1" && m["provider"] == "fake"));
+
+    let levels = pi.session_command("levels", None).unwrap();
+    assert!(levels["levels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|l| l == "high"));
+
+    let err = pi.session_command("exec", None).unwrap_err().to_string();
+    assert!(err.contains("not supported"), "{err}");
+    pi.close();
+}
+
+/// `/model` with no arg lists; `/model provider/id` to an allowlisted
+/// model switches and the answer reports both sides; a bare id on both
+/// the provider list AND the allowlist resolves; an unlisted bare id
+/// is refused with a pointer at `/models`.
+#[test]
+fn session_command_model_switches_and_reports() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pi, _rx) = adapter("normal", dir.path());
+    pi.open(&agent("dev-1", json!({}))).unwrap();
+
+    let listed = pi.session_command("model", None).unwrap();
+    assert!(listed["models"].as_array().unwrap().len() >= 2, "{listed}");
+
+    let out = pi.session_command("model", Some("acme/demo-1")).unwrap();
+    assert_eq!(out["was"], "model-1", "{out}");
+    assert_eq!(out["model"]["id"], "demo-1", "{out}");
+    assert_eq!(out["model"]["provider"], "acme", "{out}");
+    assert_eq!(out["requested"], "acme/demo-1", "{out}");
+
+    // The change is real — the next `state` answers the new model.
+    let state = pi.session_command("state", None).unwrap();
+    assert_eq!(state["model"]["id"], "demo-1", "{state}");
+
+    // A bare id found on the provider's own list resolves (demo-1 →
+    // acme/demo-1, which the allowlist pins).
+    let out = pi.session_command("model", Some("demo-1")).unwrap();
+    assert_eq!(out["model"]["provider"], "acme", "{out}");
+    assert_eq!(out["requested"], "acme/demo-1", "{out}");
+
+    // A bare id nothing offers is refused, naming `/models`.
+    let err = pi
+        .session_command("model", Some("no-such-model"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("/models"), "{err}");
+    pi.close();
+}
+
+/// `/model` to a model off `[pi].models.allow` is refused BEFORE
+/// `set_model` crosses the wire — the fake's request journal proves
+/// the RPC never left the adapter (CAD-559).
+#[test]
+fn session_command_model_refuses_an_offlist_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pi, _rx) = adapter("normal", dir.path());
+    pi.open(&agent("dev-1", json!({}))).unwrap();
+
+    let err = pi
+        .session_command("model", Some("fake/model-2"))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("fake/model-2") && err.contains("allowlist"),
+        "{err}"
+    );
+
+    // The wire never carried set_model: the fake's per-request journal
+    // under <state>/agents/ names every RPC it actually received.
+    let journal = dir.path().join("agents/pi-rpc-dev-1.jsonl");
+    let received = std::fs::read_to_string(&journal)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter_map(|row| row["rpc"].as_str().map(str::to_string))
+        .collect::<Vec<_>>();
+    assert!(!received.iter().any(|m| m == "set_model"), "{received:?}");
+    // And the session still reports the launch model.
+    let state = pi.session_command("state", None).unwrap();
+    assert_eq!(state["model"]["id"], "model-1", "{state}");
+    pi.close();
+}
+
+/// No `[pi]` table in pm.yaml is an EMPTY allowlist — `/model`
+/// refuses even a provider-listed model. The session opens under the
+/// default policy, then the table is removed mid-session: the gate
+/// re-reads the file on every call (CAD-559).
+#[test]
+fn session_command_model_refuses_without_pi_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pi, _rx) = adapter("normal", dir.path());
+    pi.open(&agent("dev-1", json!({}))).unwrap();
+
+    // The policy the open was gated under is gone — `pi_policy::read`
+    // answers None, an allowlist of nothing.
+    std::fs::remove_file(dir.path().join("pm/pm.yaml")).unwrap();
+
+    let err = pi
+        .session_command("model", Some("acme/demo-1"))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("acme/demo-1") && err.contains("allowlist"),
+        "{err}"
+    );
+    pi.close();
+}
+
+/// `/model`'s switch is verified against `get_state`, not the ack —
+/// `model-drift` acks `set_model` then reports `fake/fell-back`, and
+/// the command must fail the way `open` does on a silent fallback.
+#[test]
+fn session_command_model_fails_on_a_silent_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pi, _rx) = adapter("model-drift", dir.path());
+    pi.open(&agent("dev-1", json!({}))).unwrap();
+
+    let err = pi
+        .session_command("model", Some("acme/demo-1"))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("acme/demo-1") && err.contains("fell-back"),
+        "{err}"
+    );
+    pi.close();
+}
+
+/// `/effort` is NOT part of the model allowlist — levels set and
+/// verify exactly as before (CAD-559 scopes the gate to models).
+#[test]
+fn session_command_effort_is_not_model_gated() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pi, _rx) = adapter("normal", dir.path());
+    pi.open(&agent("dev-1", json!({}))).unwrap();
+    let out = pi.session_command("effort", Some("high")).unwrap();
+    assert_eq!(out["level"], "high", "{out}");
+    pi.close();
+}
+
+/// `/effort` with no arg lists the levels plus the live one; with a
+/// level it sets AND verifies — a bogus level surfaces as an error
+/// naming what stayed.
+#[test]
+fn session_command_effort_sets_and_verifies() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pi, _rx) = adapter("normal", dir.path());
+    pi.open(&agent("dev-1", json!({}))).unwrap();
+
+    let levels = pi.session_command("effort", None).unwrap();
+    assert_eq!(levels["current"], "medium", "{levels}");
+    assert!(levels["levels"].as_array().unwrap().len() >= 5, "{levels}");
+
+    let out = pi.session_command("effort", Some("high")).unwrap();
+    assert_eq!(out["level"], "high", "{out}");
+
+    // fake-pi falls back to `off` on a bogus level, like real Pi — the
+    // adapter's verification refuses the silent lie.
+    let err = pi
+        .session_command("effort", Some("bogus"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("pi refused effort 'bogus'"), "{err}");
+    pi.close();
+}
+
+/// `compact` answers the provider's compaction result; `new` mints a
+/// fresh session id inside the same process and answers the new state.
+#[test]
+fn session_command_compact_and_new_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pi, _rx) = adapter("normal", dir.path());
+    pi.open(&agent("dev-1", json!({}))).unwrap();
+
+    let before = pi.session_command("state", None).unwrap();
+    let out = pi.session_command("compact", None).unwrap();
+    assert_eq!(out["compacted"], true, "{out}");
+
+    let out = pi.session_command("new", None).unwrap();
+    let fresh = out["state"]["sessionId"].as_str().unwrap();
+    assert_ne!(fresh, before["sessionId"].as_str().unwrap(), "{out}");
+    pi.close();
+}

@@ -1,4 +1,5 @@
 import Markdown, { defaultUrlTransform } from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { isLoopbackHref } from "./links";
 
 // Bare issue ids become `issue:` links before rendering; matches inside
@@ -19,6 +20,9 @@ export default function Md({
 }) {
   return (
     <Markdown
+      // GFM (CAD-551): tables, task lists, strikethrough, autolinks —
+      // the providers' answers lean on them.
+      remarkPlugins={[remarkGfm]}
       // `issue:` ids are ours; everything else takes react-markdown's
       // safe transform (no `javascript:` and friends).
       urlTransform={(url) => (url.startsWith("issue:") ? url : defaultUrlTransform(url))}

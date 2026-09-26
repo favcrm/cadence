@@ -2654,3 +2654,452 @@ fn cad323_refused_interrupt_is_recorded() {
         .unwrap()
         .contains("no provider-native"));
 }
+
+// ---- CAD-551: the master's session state + slash commands ----
+
+/// `tests/e2e/fake-pi.py` as `CADENCE_PI_COMMAND` takes it.
+fn fake_pi(mode: &str) -> String {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/e2e/fake-pi.py");
+    format!("python3 {} {mode}", script.display())
+}
+
+/// A fixture daemon whose `master` is a managed-pi endpoint over
+/// fake-pi (CAD-551): the alias is reserved — `master_start` is the only
+/// registrar. `unconfined` + the no-Landlock seam keep the provider a
+/// plain child process the test can talk RPC to.
+fn pi_master(mode: &str) -> PlanFixture {
+    let f = PlanFixture::start();
+    test_env().set("CADENCE_PI_COMMAND", fake_pi(mode));
+    test_env().set(cadence_agent::master::TEST_NO_LANDLOCK, "1");
+    // CAD-559: a pi master launches only under an operator `[pi]`
+    // policy — the bound tracker's pm.yaml gets the suite's default
+    // table (allows `fake/model-1` et al.).
+    pi_policy_pm(&f.pm_dir);
+    f.d.operator_rpc(
+        "master_start",
+        json!({"provider": "pi", "unconfined": true}),
+    )
+    .unwrap();
+    f
+}
+
+/// A board POST to `/api/master/command` with `headers` and `body`.
+fn master_command_request(port: u16, headers: &str, body: &str) -> String {
+    let host = board_host_for(port, headers);
+    format!(
+        "POST /api/master/command HTTP/1.0\r\nHost: {host}\r\n\
+         {headers}Content-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// The detached HTTP sender [`TestDaemon::operator_rpc`] is for the
+/// socket (CAD-430): `setsid -f`, off this runner's ancestry, env clean
+/// — the shape `prove_operator_peer` accepts however the suite itself
+/// is run. Answers the raw reply text.
+const OP_HTTP_PY: &str = r#"
+import os, socket, sys, time
+
+req_path, out_path, port, runner = sys.argv[1:5]
+
+def on_lineage(pid):
+    p = os.getpid()
+    while p > 1:
+        if p == pid:
+            return True
+        with open("/proc/%d/status" % p) as f:
+            p = int([l for l in f if l.startswith("PPid:")][0].split()[1])
+    return False
+
+while on_lineage(int(runner)):
+    time.sleep(0.02)
+s = socket.create_connection(("127.0.0.1", int(port)))
+s.sendall(open(req_path, "rb").read())
+data = b""
+while True:
+    chunk = s.recv(65536)
+    if not chunk:
+        break
+    data += chunk
+with open(out_path + ".tmp", "wb") as f:
+    f.write(data)
+os.rename(out_path + ".tmp", out_path)
+"#;
+
+/// One HTTP request to the board from an operator-shaped process —
+/// pane-safe like [`TestDaemon::operator_rpc`]. Returns `(status, body)`.
+fn op_http(port: u16, request: &str) -> (u16, String) {
+    let dir = TempDir::new().unwrap();
+    let req = dir.path().join("req.txt");
+    let out = dir.path().join("out.txt");
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&req)
+            .unwrap();
+        f.write_all(request.as_bytes()).unwrap();
+    }
+    let script = dir.path().join("send.py");
+    std::fs::write(&script, OP_HTTP_PY).unwrap();
+    let status = std::process::Command::new("setsid")
+        .arg("-f")
+        .arg("python3")
+        .arg(&script)
+        .arg(&req)
+        .arg(&out)
+        .arg(port.to_string())
+        .arg(std::process::id().to_string())
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "setsid -f failed: {status}");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !out.exists() {
+        assert!(Instant::now() < deadline, "operator http never answered");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let reply = std::fs::read_to_string(&out).unwrap();
+    let status = reply
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    let body = reply
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b)
+        .unwrap_or("")
+        .to_string();
+    (status, body)
+}
+
+/// `master_state` reads the live session's model/effort/context over
+/// the stored row, and reports the in-flight or queued turn; `/model`,
+/// `/effort`, `/compact` and `/new` reach the provider and leave a
+/// durable thread note where they mutate.
+#[test]
+fn cad551_pi_master_state_and_commands() {
+    let f = pi_master("normal");
+    let d = &f.d;
+    d.wait_agent("master", "idle", 30);
+
+    let st = d.rpc("master_state", json!({})).unwrap();
+    assert_eq!(st["alias"], "master", "{st}");
+    assert_eq!(st["provider"], "pi", "{st}");
+    assert_eq!(st["live"], true, "{st}");
+    assert_eq!(st["model"], "model-1", "{st}");
+    assert_eq!(st["effort"], "medium", "{st}");
+    assert_eq!(st["context"]["window"], 200000, "{st}");
+    assert_eq!(st["turn"], Value::Null, "{st}");
+    assert_eq!(st["queued"], 0, "{st}");
+    assert!(
+        st["commands"].as_array().unwrap().contains(&json!("model")),
+        "{st}"
+    );
+
+    // `/model` to an allowlisted model switches for real, leaves a
+    // durable system line, and the verified model is persisted into
+    // params.model so the next open's re-check agrees (CAD-559).
+    let out = d
+        .operator_rpc(
+            "master_command",
+            json!({"command": "model", "arg": "acme/demo-1"}),
+        )
+        .unwrap();
+    assert_eq!(out["result"]["model"]["id"], "demo-1", "{out}");
+    assert_eq!(out["result"]["was"], "model-1", "{out}");
+    let line = f.wait_thread("Model →", 10);
+    assert_eq!(line["role"], "system", "{line}");
+    assert!(line["payload"]["command"] == "/model", "{line}");
+    let show = d.rpc("agent_show", json!({"alias": "master"})).unwrap();
+    assert_eq!(show["agent"]["params"]["model"], "acme/demo-1", "{show}");
+    assert_eq!(show["agent"]["model"], "acme/demo-1", "{show}");
+
+    // `/model` off the operator's allowlist is refused — the policy
+    // error surfaces and the stored params stay on the allowed id.
+    let err = d
+        .operator_rpc(
+            "master_command",
+            json!({"command": "model", "arg": "fake/model-2"}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("fake/model-2") && err.contains("allowlist"),
+        "{err}"
+    );
+    let show = d.rpc("agent_show", json!({"alias": "master"})).unwrap();
+    assert_eq!(show["agent"]["params"]["model"], "acme/demo-1", "{show}");
+
+    // `/effort` verifies the level landed; `/stats` and the lists read.
+    let out = d
+        .operator_rpc("master_command", json!({"command": "effort", "arg": "low"}))
+        .unwrap();
+    assert_eq!(out["result"]["level"], "low", "{out}");
+    let st = d.rpc("master_state", json!({})).unwrap();
+    assert_eq!(st["model"], "demo-1", "{st}");
+    assert_eq!(st["effort"], "low", "{st}");
+    let out = d
+        .operator_rpc("master_command", json!({"command": "models"}))
+        .unwrap();
+    assert!(
+        out["result"]["models"].as_array().unwrap().len() >= 2,
+        "{out}"
+    );
+
+    // `/compact` and `/new` reach the provider; `/new` mints a session.
+    let before = d.rpc("master_state", json!({})).unwrap()["session"]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let out = d
+        .operator_rpc("master_command", json!({"command": "compact"}))
+        .unwrap();
+    assert_eq!(out["result"]["compacted"], true, "{out}");
+    let out = d
+        .operator_rpc("master_command", json!({"command": "new"}))
+        .unwrap();
+    assert_ne!(out["result"]["state"]["sessionId"], json!(before), "{out}");
+    let line = f.wait_thread("Provider session restarted", 10);
+    assert_eq!(line["role"], "system", "{line}");
+}
+
+/// The working/queued turn surfaces in `master_state`, and `/stop`
+/// lands on the daemon's interrupt path: the hung turn settles
+/// `interrupted` and the state goes idle.
+#[test]
+fn cad551_master_state_working_turn_and_stop() {
+    let f = pi_master("hang");
+    let d = &f.d;
+
+    // The bootstrap turn hangs — `master_state` shows it working.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let st = d.rpc("master_state", json!({})).unwrap();
+        if st["turn"]["state"] == "working" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "turn never started: {st}");
+        thread::sleep(Duration::from_millis(100));
+    }
+    // An operator message queues behind it.
+    d.operator_rpc(
+        "thread_send",
+        json!({"alias": "master", "text": "while you work", "message": "q1"}),
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let st = d.rpc("master_state", json!({})).unwrap();
+        if st["queued"].as_u64() == Some(1) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "queued turn never surfaced: {st}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // `/stop` is the interrupt path — the hung turn settles and the
+    // queued message promotes (it hangs too), so one more `/stop`
+    // leaves the master idle.
+    let out = d
+        .operator_rpc("master_command", json!({"command": "stop", "wait": 20}))
+        .unwrap();
+    assert_eq!(out["command"], "stop", "{out}");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let st = d.rpc("master_state", json!({})).unwrap();
+        if st["turn"]["message"].as_str() == Some("q1") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the hung turn never settled and promoted the queue: {st}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    d.operator_rpc("master_command", json!({"command": "stop", "wait": 20}))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let st = d.rpc("master_state", json!({})).unwrap();
+        if st["turn"].is_null() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "master never went idle: {st}");
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// `master_command` is operator-only by connection — an agent caller,
+/// its detached child, and a forged authority field are all refused —
+/// and the verb set is an allowlist: unknown verbs are typed errors.
+#[test]
+fn cad551_master_command_gate_and_allowlist() {
+    let f = pi_master("normal");
+    let d = &f.d;
+    d.wait_agent("master", "idle", 30);
+    let mut wk = ManagedWorker::start(d, "wk");
+
+    // Agent caller and its detached child are refused before the verb
+    // is even looked at — the refusal names the agent.
+    for src in ["self", "child"] {
+        let frame = wk.rpc(src, "master_command", json!({"command": "state"}));
+        assert_eq!(frame["ok"], false, "{frame}");
+        let msg = frame["error"]["message"].as_str().unwrap_or_default();
+        assert!(msg.contains("operator action"), "{frame}");
+    }
+    let frame = wk.rpc("self", "master_command", json!({"command": "stop"}));
+    let msg = frame["error"]["message"].as_str().unwrap_or_default();
+    assert!(msg.contains("'wk'"), "{frame}");
+
+    // An authority-shaped field on the operator's own call is refused —
+    // the connection proves the operator, never a request field.
+    let err = d
+        .operator_rpc(
+            "master_command",
+            json!({"command": "stop", "by": "operator"}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("request field 'by' is not accepted"), "{err}");
+
+    // The allowlist refuses unknown verbs with a typed error; `help`
+    // answers locally with the verb set.
+    let err = d
+        .operator_rpc("master_command", json!({"command": "exec"}))
+        .unwrap_err();
+    assert_eq!(err.code(), Some("unknown_command"), "{err}");
+    let help = d
+        .operator_rpc("master_command", json!({"command": "help"}))
+        .unwrap();
+    assert!(help["result"]["commands"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("stop")));
+
+    // Two concurrent operator calls both settle — no lock is held over
+    // the provider call.
+    std::thread::scope(|s| {
+        for _ in 0..2 {
+            s.spawn(|| {
+                let out = d
+                    .operator_rpc("master_command", json!({"command": "help"}))
+                    .unwrap();
+                assert_eq!(out["ok"], true);
+            });
+        }
+    });
+}
+
+/// The board's `/api/master/command` relay is at least as strict as the
+/// daemon RPC: the write guards and an operator session are required,
+/// the board's own allowlist runs before the daemon is asked (and
+/// `help`, composer-local, never crosses), an over-cap argument is a
+/// 400, an identity field reaches the daemon and is refused, and an
+/// agent-attributed request is refused even with a pasted session.
+#[test]
+fn cad551_master_command_board_gate() {
+    let f = pi_master("normal");
+    let d = &f.d;
+    d.wait_agent("master", "idle", 30);
+    let pm = TempDir::new().unwrap();
+    let (port, _board) = start_operator_board(pm.path(), &d.state);
+    let op = sign_in(&d.state, port);
+    let guards = op_guards(&op);
+
+    // Unguarded and unsigned writes are refused before anything parses.
+    for headers in [
+        "Content-Type: application/json\r\n",
+        "Content-Type: application/json\r\nX-Cadence-Board: 1\r\n",
+    ] {
+        let (status, reply) = board_http(
+            port,
+            &master_command_request(port, headers, r#"{"command":"state"}"#),
+        );
+        assert_eq!(status, 403, "{reply}");
+    }
+
+    // Session'd writes go through `op_http` — a detached sender the
+    // peer proof accepts however this suite itself is run (CAD-430).
+    // The board's own allowlist: unknown verbs and composer-local help
+    // are 400 before the relay — no daemon call is made.
+    for body in [r#"{"command":"bogus"}"#, r#"{"command":"help"}"#] {
+        let (status, reply) = op_http(port, &master_command_request(port, &guards, body));
+        assert_eq!(status, 400, "{body}: {reply}");
+        assert!(reply.contains("unknown_command"), "{body}: {reply}");
+    }
+    // An argument over the cap is refused on the board.
+    let long = "x".repeat(300);
+    let (status, _) = op_http(
+        port,
+        &master_command_request(
+            port,
+            &guards,
+            &format!(r#"{{"command":"model","arg":"{long}"}}"#),
+        ),
+    );
+    assert_eq!(status, 400);
+
+    // An identity-shaped field is refused on the board itself — the
+    // body allowlist (command/arg/wait) means it never reaches the
+    // daemon at all.
+    let (status, reply) = op_http(
+        port,
+        &master_command_request(port, &guards, r#"{"command":"stop","by":"operator"}"#),
+    );
+    assert_eq!(status, 400, "{reply}");
+    assert!(reply.contains("unknown field"), "{reply}");
+
+    // `/state` relays a real read: the fake-pi model is in the payload.
+    let (status, reply) = op_http(
+        port,
+        &master_command_request(port, &guards, r#"{"command":"state"}"#),
+    );
+    assert_eq!(status, 200, "{reply}");
+    let out: Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(out["result"]["thinkingLevel"], "medium", "{out}");
+
+    // `/stop` with no running turn relays the interrupt path's noop.
+    let (status, reply) = op_http(
+        port,
+        &master_command_request(port, &guards, r#"{"command":"stop"}"#),
+    );
+    assert_eq!(status, 200, "{reply}");
+
+    // `GET /api/master/state` is a plain read like the thread page.
+    let (status, reply) = board_get(port, "/api/master/state");
+    assert_eq!(status, 200, "{reply}");
+    let st: Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(st["model"], "model-1", "{st}");
+    assert_eq!(st["model_label"], "fake/model-1", "{st}");
+
+    // An agent-attributed request is refused by the board itself, even
+    // with an operator session pasted on (the session is stolen). The
+    // request asserts `agent:wk2` (CAD-482: the seam carries the caller
+    // on the request); without a seam the detached managed child's own
+    // ancestry attributes it the same way.
+    let mut wk = ManagedWorker::start(d, "wk2");
+    let agent_guards = op_guards_as(&op, &op::seam_headers(&d.state, "agent:wk2"));
+    let request = master_command_request(port, &agent_guards, r#"{"command":"stop"}"#);
+    let r = wk.exec(&[
+        "bash",
+        "-c",
+        DEV_TCP_CLIENT,
+        "_",
+        &port.to_string(),
+        &request,
+    ]);
+    assert_eq!(r["rc"], 0, "{r}");
+    let out = r["out"].as_str().unwrap();
+    assert!(out.contains(" 403 "), "{out}");
+    assert!(out.contains("session_from_agent"), "{out}");
+}

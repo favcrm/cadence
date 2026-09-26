@@ -641,13 +641,14 @@ export interface Agent {
   message?: {
     id: string;
     task?: string;
-    created?: string;
+    /** Epoch seconds — the daemon serializes Message.created as f64. */
+    created?: number | string;
     summary?: string | null;
   } | null;
   running_messages?: {
     id: string;
     task?: string;
-    created?: string;
+    created?: number | string;
     summary?: string | null;
   }[];
   /** The daemon's fence text — already names the recovery commands. */
@@ -680,6 +681,52 @@ export interface AgentsPayload {
   } | null;
   /** issue id → bound agent strip, for cards and drawers. */
   by_issue?: Record<string, CardAgent[]>;
+}
+
+/** `GET /api/master/state` (CAD-551) — the master's provider session for
+ * the header chips and the working row. `null`/`undefined` fields are
+ * "the provider could not say", never a fabricated value; a daemon that
+ * predates the route answers 501 and the UI falls back to `/api/agents`. */
+export interface MasterState {
+  alias: string;
+  provider: string;
+  endpoint_kind: string;
+  /** A live provider endpoint answered — chips marked live only then. */
+  live: boolean;
+  /** Effective model id (live session wins over launch config). */
+  model?: string | null;
+  /** Display name when the provider has one (else `model`). */
+  model_label?: string | null;
+  effort?: string | null;
+  context?: {
+    tokens?: number | null;
+    window?: number | null;
+    percent?: number | null;
+  } | null;
+  session?: {
+    id?: string | null;
+    messages?: number | null;
+    streaming?: boolean | null;
+    compacting?: boolean | null;
+  } | null;
+  /** Provider session verbs the daemon will relay. */
+  commands?: string[];
+  /** The turn in flight, or the queue head waiting on one. */
+  turn?: {
+    state: "working" | "queued";
+    message: string;
+    summary?: string | null;
+    /** Epoch seconds the message started (working) or was created (queued). */
+    since?: number | null;
+  } | null;
+  queued?: number;
+}
+
+/** `POST /api/master/command` — one allowlisted session verb's answer. */
+export interface MasterCommandResult {
+  command: string;
+  ok: boolean;
+  result?: unknown;
 }
 
 /** GET /api/agents/<alias> — the drawer detail. */

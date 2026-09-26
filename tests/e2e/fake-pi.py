@@ -30,6 +30,10 @@ Modes (argv[1]):
 - `wrong-model`: accepts `--model` but get_state reports a DIFFERENT
   model — the silent-fallback shape CAD-559 exists to catch, so the
   adapter must refuse the launch.
+- `model-drift`: `set_model` acks success but the next get_state
+  reports `fake/fell-back` — the mid-session silent-fallback shape the
+  /model gate's verification exists to catch (CAD-551's set_model is
+  held to open()'s rule).
 
 When CADENCE_ALIAS is `master` the fake also records what the launch
 actually delivered — `pi-argv.json` (sys.argv tail, i.e. every flag the
@@ -50,7 +54,10 @@ the next open to resume).
 idempotent when idle, like real Pi. `get_state` reports
 sessionId/model/thinkingLevel; `set_thinking_level` honours only real
 levels (bogus silently falls back to "off", like real Pi) so the
-adapter's `get_state` verification is exercised.
+adapter's `get_state` verification is exercised. The CAD-551 session
+verbs are here too: `get_available_models`, `get_session_stats`
+(contextUsage), `compact`, `new_session` (a fresh sessionId), and a
+`set_model` that actually changes what `get_state` reports.
 
 `--model <provider/id>`: the reported model echoes the request, split
 the way real Pi reports it — `{"provider": <first segment>, "id":
@@ -116,6 +123,36 @@ def load_session():
     return None, 0
 
 
+# The request journal: one `{"rpc": <type>}` line per request that
+# actually crossed the wire — the CAD-559 /model gate tests assert a
+# refused verb never reached the provider. Same dir contract as
+# record_launch: masters journal beside pi-argv.json in cwd, every
+# other alias under `<CADENCE_STATE_DIR>/agents/`.
+def record_rpc(rtype):
+    if not rtype:
+        return
+    line = json.dumps({"rpc": rtype}) + "\n"
+    if ALIAS == "master":
+        try:
+            with open(os.path.join(os.getcwd(), "pi-rpc.jsonl"), "a") as f:
+                f.write(line)
+        except OSError:
+            pass
+    elif ALIAS and os.environ.get("CADENCE_STATE_DIR"):
+        agents = os.path.join(os.environ["CADENCE_STATE_DIR"], "agents")
+        try:
+            os.makedirs(agents, exist_ok=True)
+            with open(os.path.join(agents, "pi-rpc-%s.jsonl" % ALIAS), "a") as f:
+                f.write(line)
+        except OSError:
+            # Confined: only `agents/<alias>` is writable.
+            try:
+                with open(os.path.join(agents, ALIAS, "pi-rpc.jsonl"), "a") as f:
+                    f.write(line)
+            except OSError:
+                pass
+
+
 record_launch()
 SESSION_FILE, PROMPTS_SEEN, _sid = None, 0, None
 _args = sys.argv[1:]
@@ -148,6 +185,19 @@ state = {
     "sessionFile": SESSION_FILE,
     "promptsSeen": PROMPTS_SEEN,
 }
+MODELS = [
+    {"id": "model-1", "name": "Fake Model", "provider": "fake",
+     "contextWindow": 200000},
+    {"id": "model-2", "name": "Fake Model Small", "provider": "fake",
+     "contextWindow": 64000},
+    {"id": "claude-sonnet-4", "name": "Claude Sonnet 4",
+     "provider": "anthropic", "contextWindow": 200000},
+    # On the suite's [pi].models.allow — the allowed `/model` target in
+    # the CAD-559 gate tests.
+    {"id": "demo-1", "name": "Acme Demo", "provider": "acme",
+     "contextWindow": 200000},
+]
+usage = {"tokens": 42000, "contextWindow": 200000}
 live_turn = False
 pending_dialog = None
 
@@ -207,6 +257,7 @@ def run_prompt(message):
     emit({"type": "turn_start"})
     emit({"type": "message_start", "message": {"role": "assistant"}})
     reply = "fake-pi reply: " + message.strip().splitlines()[-1][:80]
+    slow = MODE == "slow"  # CAD-551: a visible turn for the working row
     if "run tool" in message:
         emit({
             "type": "tool_execution_start",
@@ -221,6 +272,8 @@ def run_prompt(message):
             "args": {"command": "cadence status"},
             "partialResult": {"content": [{"type": "text", "text": "partial"}]},
         })
+        if slow:
+            time.sleep(1.6)
         emit({
             "type": "tool_execution_end",
             "toolCallId": "call_1",
@@ -236,6 +289,8 @@ def run_prompt(message):
         })
     if MODE == "hang":
         return  # stays live but never settles — the caller must abort
+    if slow:
+        time.sleep(1.6)
     live_turn = False
     finish_turn("stop", reply)
 
@@ -260,6 +315,7 @@ def main():
             continue
         rid = req.get("id")
         rtype = req.get("type")
+        record_rpc(rtype)
         if rtype == "extension_ui_response":
             if pending_dialog and req.get("id") == pending_dialog:
                 pending_dialog = None
@@ -277,8 +333,47 @@ def main():
             respond(rid, "get_available_thinking_levels", True,
                     data={"levels": list(LEVELS)})
         elif rtype == "set_model":
-            respond(rid, "set_model", True,
-                    data={"id": req.get("modelId", "fake/model-1")})
+            provider = req.get("provider", "fake")
+            model_id = req.get("modelId", "model-1")
+            if MODE == "model-drift":
+                # Acks then reports something else — Pi's silent
+                # fallback, mid-session.
+                state["model"] = {"id": "fell-back",
+                                  "provider": "fake",
+                                  "name": "Fell Back"}
+            else:
+                known = next(
+                    (m for m in MODELS
+                     if m["provider"] == provider and m["id"] == model_id),
+                    None)
+                state["model"] = {
+                    "id": model_id,
+                    "provider": provider,
+                    "name": (known or {}).get("name", model_id),
+                }
+            respond(rid, "set_model", True, data=dict(state["model"]))
+        elif rtype == "get_available_models":
+            respond(rid, "get_available_models", True,
+                    data={"models": [dict(m) for m in MODELS]})
+        elif rtype == "get_session_stats":
+            respond(rid, "get_session_stats", True, data={
+                "sessionId": state["sessionId"],
+                "contextUsage": {
+                    "tokens": usage["tokens"],
+                    "contextWindow": usage["contextWindow"],
+                    "percent": round(
+                        usage["tokens"] / usage["contextWindow"] * 100, 1),
+                },
+            })
+        elif rtype == "compact":
+            usage["tokens"] = 8000
+            respond(rid, "compact", True,
+                    data={"compacted": True, "tokensAfter": usage["tokens"]})
+        elif rtype == "new_session":
+            state["sessionId"] = "fakepi-session-{}-{}".format(
+                os.getpid(), int(time.time()))
+            respond(rid, "new_session", True,
+                    data={"sessionId": state["sessionId"]})
         elif rtype == "prompt":
             if MODE == "no-credits":
                 respond(rid, "prompt", False,

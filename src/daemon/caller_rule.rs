@@ -343,6 +343,14 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         "master_summary",
         Rule::Handler("reads; `post` needs master_or_operator (CAD-339)"),
     ),
+    ("master_state", Rule::Read),
+    (
+        "master_command",
+        Rule::Handler(
+            "operator_connection (CAD-551): the operator's allowlisted provider-session \
+             commands for the master — the verb list is the daemon's, never raw input",
+        ),
+    ),
     (
         "reports_changed",
         Rule::Handler("proven_operator (CAD-339)"),
