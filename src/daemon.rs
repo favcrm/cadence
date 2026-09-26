@@ -301,8 +301,9 @@ pub struct Shared {
     lifecycle: Mutex<Lifecycle>,
     closing: AtomicBool,
     /// CAD-561: the pending update while one drains — `None` when no
-    /// update is in progress. Set by `update_drain`, restored from
-    /// `<state>/update.json` at boot, cleared by `update_drain off`.
+    /// update is in progress. Set by `update_drain`, adopted from
+    /// `<state>/update.json` (proved against the rollout lease — see
+    /// [`Shared::pending_update`]), cleared by `update_drain off`.
     draining: Mutex<Option<crate::update::PendingUpdate>>,
     /// PTY endpoint facts captured by [`Shared::begin_closing`] before
     /// any actor is woken. Idle actors detach on that wake and clear
@@ -497,11 +498,13 @@ impl Shared {
             closing: AtomicBool::new(false),
             // CAD-561: a pending update recorded by an update that is
             // still running (a restart in the middle of one) keeps the
-            // fleet drained across the restart. The file's mtime is the
-            // update's heartbeat: a marker that stopped being rewritten
-            // (an update that died) goes stale in minutes and never
-            // wedges the fleet.
-            draining: Mutex::new(crate::update::pending_update(state_dir)),
+            // fleet drained across the restart. The marker is adopted on
+            // first read, proved against the live rollout lease — the
+            // file alone is not authority (any same-uid process can
+            // write it). The file's mtime is the update's heartbeat: a
+            // marker that stopped being rewritten (an update that died)
+            // goes stale in minutes and never wedges the fleet.
+            draining: Mutex::new(None),
             shutdown_facts: Mutex::new(None),
             provider_log_dir,
             state_dir: state_dir.to_path_buf(),
@@ -2091,6 +2094,17 @@ impl Shared {
                             .as_f64()
                             .unwrap_or_else(crate::rollout::unix_now),
                     };
+                    // CAD-561 r2: the drain is the lease holder's. The
+                    // label is caller-chosen, so without this a drain
+                    // could name anyone — and the fleet would stop for a
+                    // run that holds nothing.
+                    if !self.marker_is_the_lease_holders(&pending) {
+                        return Err(Error::rejected(format!(
+                            "update_drain: the rollout lease is not held by '{label}' — \
+                             the drain belongs to the live lease holder; claim the \
+                             lease, then drain"
+                        )));
+                    }
                     crate::update::write_pending(&self.state_dir, &pending)?;
                     *self.draining.lock().unwrap() = Some(pending);
                 } else {
@@ -2624,13 +2638,31 @@ impl Shared {
     }
 
     /// The pending update, refreshed from disk so a marker written by
-    /// another process (the board, a test) is seen; a file that
-    /// disappeared or went stale clears the gate.
+    /// the update itself is seen; a file that disappeared or went stale
+    /// clears the gate. A fresh marker is only adopted while its writer
+    /// is the live rollout lease holder ([`Self::marker_is_the_lease_holders`]):
+    /// the file is a plain same-uid file anyone can write, so on its own
+    /// it would be a way to quiet the whole fleet (CAD-561 r2).
     fn pending_update(&self) -> Option<crate::update::PendingUpdate> {
-        let on_disk = crate::update::pending_update(&self.state_dir);
+        let on_disk = crate::update::pending_update(&self.state_dir)
+            .filter(|pending| self.marker_is_the_lease_holders(pending));
         let mut held = self.draining.lock().unwrap();
         *held = on_disk.clone();
         on_disk
+    }
+
+    /// Is this marker the live lease holder's? The update claims the
+    /// lease before it drains and releases it when it is done, so the
+    /// lease row is the proof the marker file cannot carry.
+    fn marker_is_the_lease_holders(&self, pending: &crate::update::PendingUpdate) -> bool {
+        match crate::rollout::status(&self.state_dir) {
+            Ok(status) => {
+                status["held"].as_bool() == Some(true)
+                    && status["expired"].as_bool() != Some(true)
+                    && status["holder"].as_str() == Some(pending.by.as_str())
+            }
+            Err(_) => false,
+        }
     }
 
     /// The turns an update waits on: every `running`/`submitted`
@@ -3855,13 +3887,43 @@ mod tests {
         (dir, shared)
     }
 
-    /// CAD-561: the drain gate. A daemon that comes up while an update
-    /// is in flight is drained from boot (the restart in the middle of
-    /// an update must not start turns), and the marker's mtime is the
-    /// heartbeat: an update that stopped rewriting it — one that died —
-    /// stops draining within the bound instead of wedging the fleet.
+    /// A live lease held by `name` — the update's own claim, taken the
+    /// way a fixture asserts the operator (CAD-482).
+    fn hold_lease(state: &Path, name: &str) {
+        let seam = state.join("seam");
+        std::fs::create_dir_all(&seam).unwrap();
+        std::fs::write(seam.join("token"), "test-token").unwrap();
+        let target = "b".repeat(40);
+        let caller = crate::rollout::Caller {
+            identity: name.to_string(),
+            source: "as",
+        };
+        crate::test_seam::scoped(crate::test_seam::Asserted::Operator, || {
+            crate::rollout::claim(
+                state,
+                &crate::rollout::ClaimRequest {
+                    caller: &caller,
+                    reason: "cadence update",
+                    target: Some(&target),
+                    ttl: Duration::from_secs(3600),
+                    takeover: false,
+                    now: crate::rollout::unix_now(),
+                },
+            )
+            .unwrap();
+        });
+    }
+
+    /// CAD-561 r2: the drain gate. A daemon that comes up while an
+    /// update is in flight is drained from boot (the restart in the
+    /// middle of an update must not start turns) — but only while the
+    /// marker's writer is the LIVE LEASE HOLDER: the file is a plain
+    /// same-uid file, so on its own it would be a way to quiet the
+    /// whole fleet. The marker's mtime is the heartbeat: an update that
+    /// stopped rewriting it — one that died — stops draining within the
+    /// bound instead of wedging the fleet.
     #[test]
-    fn cad561_a_pending_update_drains_only_while_it_is_fresh() {
+    fn cad561_a_pending_update_drains_only_while_the_lease_holds_it() {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path();
         // Create the store first, so the marker is read on a real dir.
@@ -3873,13 +3935,26 @@ mod tests {
             by: "operator:ada".into(),
             since: crate::rollout::unix_now(),
         };
+        // A fresh marker no live lease backs — anyone with state-dir
+        // access can write this file — is not authority.
         crate::update::write_pending(state, &pending).unwrap();
         let shared = Shared::new(state, &ServeOptions::default()).unwrap();
-        assert!(shared.draining(), "a restart mid-update stays drained");
+        assert!(!shared.draining(), "an unbacked marker never drains");
+        // The update claims the lease, then drains: a restart mid-update
+        // stays drained from boot.
+        hold_lease(state, "operator:ada");
+        assert!(shared.draining(), "the lease holder's marker drains");
         assert_eq!(
             shared.pending_update().map(|p| p.target),
             Some("b".repeat(40))
         );
+        // Another writer's fresh marker is still not authority.
+        let mut forged = pending.clone();
+        forged.by = "operator:mallory".into();
+        crate::update::write_pending(state, &forged).unwrap();
+        assert!(!shared.draining(), "only the lease holder's marker drains");
+        crate::update::write_pending(state, &pending).unwrap();
+        assert!(shared.draining());
         // The update finishing (marker removed) lifts it.
         crate::update::clear_pending(state);
         assert!(shared.pending_update().is_none());

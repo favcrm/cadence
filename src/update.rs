@@ -35,7 +35,24 @@
 //! outside one it needs `--as <identity>` with the same process proof
 //! as `rollout claim --as`; the board path is the operator's session
 //! plus peer proof. Agents can never trigger an update.
+//!
+//! **One run per state dir.** [`RunLock`] takes an exclusive `flock` on
+//! `<state>/update.lock` for the whole run, so two `update --as X` runs
+//! (or two boards) can never both proceed on an identity-only lease
+//! reuse; the second refuses at once.
+//!
+//! **The board never runs the pipeline in-process** (CAD-561 r2). The
+//! switch restarts the board, so a pipeline inside it would SIGTERM its
+//! own process before `ui start` — leaving the daemon switched, the
+//! board down and the lease held. Instead the board spawns a detached
+//! `cadence update` helper ([`PROGRESS_FILE`] carries its progress and
+//! its result); the helper outlives the board, and the restarted board
+//! keeps reading the same file until the run ends.
 
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -69,6 +86,12 @@ pub const UPDATE_FILE: &str = "update.json";
 /// never older than this, and a dead one stops draining the fleet within
 /// minutes instead of wedging it.
 pub const UPDATE_STALE_SECS: f64 = 300.0;
+/// The re-entry lock: an exclusive `flock` held for the whole run, so
+/// one update per state dir at a time whatever the identity.
+pub const LOCK_FILE: &str = "update.lock";
+/// The board's Update card reads this while a detached helper runs: one
+/// progress line per step, then one terminal JSON record. Written 0600.
+pub const PROGRESS_FILE: &str = "update-progress.jsonl";
 
 /// The default backup directory for an update: a sibling of the state
 /// dir, so the copy survives a state-dir mishap and needs no manual
@@ -83,6 +106,199 @@ pub fn default_backup_dir(state_dir: &Path) -> PathBuf {
 /// `<state dir>/update.json`.
 pub fn update_file(state_dir: &Path) -> PathBuf {
     state_dir.join(UPDATE_FILE)
+}
+
+/// `<state dir>/update.lock`.
+pub fn lock_file(state_dir: &Path) -> PathBuf {
+    state_dir.join(LOCK_FILE)
+}
+
+/// `<state dir>/update-progress.jsonl`.
+pub fn progress_file(state_dir: &Path) -> PathBuf {
+    state_dir.join(PROGRESS_FILE)
+}
+
+/// The run's exclusive hold on `<state>/update.lock` — released when it
+/// drops, or by the kernel when the process exits. Non-blocking: a
+/// second update refuses at once instead of queueing behind the first.
+pub struct RunLock {
+    _file: std::fs::File,
+}
+
+impl RunLock {
+    /// Take the re-entry lock, or refuse naming the file. The lock is
+    /// the authority for "one update at a time": the lease alone cannot
+    /// tell a crashed predecessor of the same identity from a live one.
+    pub fn acquire(state_dir: &Path) -> Result<RunLock> {
+        let path = lock_file(state_dir);
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .open(&path)?;
+        // SAFETY: plain syscall on a descriptor this function owns.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(Error::rejected(format!(
+                "an update is already running on this state dir ({} is held) — wait \
+                 for it to finish; `cadence update status` shows what it is doing",
+                path.display()
+            )));
+        }
+        Ok(RunLock { _file: file })
+    }
+}
+
+/// One record of the run log. `Running` opens it (after the re-entry
+/// lock); `Finished`/`Failed` close it. Plain progress lines sit between.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "update_run", rename_all = "snake_case")]
+enum RunRecord {
+    /// The helper started; its pid lets a reader tell a run that is
+    /// still going from one that died without a terminal record.
+    Running { pid: u32, by: String, at: f64 },
+    Finished { at: f64, report: Value },
+    Failed { at: f64, error: String },
+}
+
+/// Open the run log: truncate it (each run's log is its own), then
+/// record the running process. 0600 — the log names the operator's run.
+pub fn run_log_start(path: &Path, pid: u32, by: &str, at: f64) -> Result<()> {
+    OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    append_record(
+        path,
+        &RunRecord::Running {
+            pid,
+            by: by.to_string(),
+            at,
+        },
+    )
+}
+
+/// Append one progress line. Best-effort: a run whose log cannot be
+/// written still runs (the line is on stdout/stderr too).
+pub fn run_log_line(path: &Path, line: &str) {
+    let _ = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+        .and_then(|mut file| writeln!(file, "{line}"));
+}
+
+/// Record the finished run and its report.
+pub fn run_log_finish(path: &Path, report: &RunReport, at: f64) {
+    let _ = append_record(
+        path,
+        &RunRecord::Finished {
+            at,
+            report: report.to_json(),
+        },
+    );
+}
+
+/// Record the failure that ended the run.
+pub fn run_log_fail(path: &Path, error: &str, at: f64) {
+    let _ = append_record(
+        path,
+        &RunRecord::Failed {
+            at,
+            error: error.to_string(),
+        },
+    );
+}
+
+fn append_record(path: &Path, record: &RunRecord) -> Result<()> {
+    let text = serde_json::to_string(record)
+        .map_err(|e| Error::internal(format!("{}: {e}", path.display())))?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)?;
+    writeln!(file, "{text}")?;
+    Ok(())
+}
+
+/// What the board's Update card reads back: the run's state, its
+/// progress lines, and its result or failure.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RunLogView {
+    /// A run started, has not recorded an end, and its process is alive.
+    pub running: bool,
+    /// The running process, when a run started.
+    pub pid: Option<u32>,
+    /// The identity the run recorded.
+    pub by: Option<String>,
+    /// The progress lines — everything that is not a record.
+    pub lines: Vec<String>,
+    /// The finished run's report.
+    pub result: Option<Value>,
+    /// The failure the run recorded; a run whose process died without a
+    /// terminal record gets the fact stated here.
+    pub error: Option<String>,
+    /// When the run started / ended.
+    pub started_at: Option<f64>,
+    pub finished_at: Option<f64>,
+}
+
+/// Read `<state>/update-progress.jsonl`. A missing file is an empty
+/// view; a run that started and whose process is gone without a
+/// terminal record is not `running` and carries the fact as its error.
+pub fn read_run_log(state_dir: &Path) -> RunLogView {
+    let Ok(text) = std::fs::read_to_string(progress_file(state_dir)) else {
+        return RunLogView::default();
+    };
+    let mut view = RunLogView::default();
+    let mut ended = false;
+    for line in text.lines() {
+        match serde_json::from_str::<RunRecord>(line) {
+            Ok(RunRecord::Running { pid, by, at }) => {
+                view.pid = Some(pid);
+                view.by = Some(by);
+                view.started_at = Some(at);
+            }
+            Ok(RunRecord::Finished { at, report }) => {
+                view.result = Some(report);
+                view.finished_at = Some(at);
+                ended = true;
+            }
+            Ok(RunRecord::Failed { at, error }) => {
+                view.error = Some(error);
+                view.finished_at = Some(at);
+                ended = true;
+            }
+            Err(_) => {
+                if !line.trim().is_empty() {
+                    view.lines.push(line.to_string());
+                }
+            }
+        }
+    }
+    view.running = view.pid.is_some_and(pid_alive) && !ended;
+    if !view.running && !ended && view.pid.is_some() {
+        let pid = view.pid.unwrap_or_default();
+        view.error = Some(format!(
+            "the update process (pid {pid}) stopped before it finished — see the log"
+        ));
+    }
+    view
+}
+
+/// Is `pid` a live process — not gone, not a zombie? A helper that
+/// exited but was not reaped must not read as running.
+fn pid_alive(pid: u32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat
+            .rsplit_once(')')
+            .is_some_and(|(_, rest)| !rest.trim_start().starts_with('Z')),
+        Err(_) => false,
+    }
 }
 
 /// What a pending update looks like to another process.
@@ -118,11 +334,19 @@ pub fn pending_update(state_dir: &Path) -> Option<PendingUpdate> {
 }
 
 /// Write the pending-update marker (the daemon and the board read it).
+/// 0600: the daemon only trusts it from the live lease holder anyway
+/// (CAD-561 r2), and the file should not be world-readable regardless.
 pub fn write_pending(state_dir: &Path, pending: &PendingUpdate) -> Result<()> {
     let path = update_file(state_dir);
     let text = serde_json::to_string_pretty(pending)
         .map_err(|e| Error::internal(format!("update.json: {e}")))?;
-    std::fs::write(&path, text)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)?;
+    file.write_all(text.as_bytes())?;
     Ok(())
 }
 
@@ -320,6 +544,17 @@ pub trait UpdateHost {
     fn daemon_build(&self) -> Result<Option<String>>;
     /// The answering board's build commit (`None`: no board running).
     fn board_build(&self) -> Result<Option<String>>;
+    /// Was a board running before the switch? [`health_wait`] requires
+    /// one that was to answer on the new build: a board that never comes
+    /// back is not health, and the pipeline rolls back.
+    fn board_running(&self) -> bool;
+    /// The run's progress log, when the caller asked for one — the
+    /// board's detached helper does (`--progress`). `run` truncates it,
+    /// records the start and the end; the host appends each progress
+    /// line to it. `None`: no log (the plain CLI, the tests' fake).
+    fn progress_log(&self) -> Option<PathBuf> {
+        None
+    }
     fn now(&self) -> f64;
     fn sleep(&self, duration: Duration);
 }
@@ -503,18 +738,11 @@ fn fmt_duration(_host: &dyn UpdateHost, d: Duration) -> String {
     }
 }
 
-/// The lease an update holds, and what it released.
-struct Lease {
-    caller: rollout::Caller,
-    /// True when this run claimed it (so it releases it); false when an
-    /// existing lease of the same identity was reused.
-    claimed: bool,
-}
-
-/// Claim the lease for `target`, or reuse the identity's own live lease.
-/// A lease another identity holds refuses with the operator-facing
-/// sentence, never a raw lease error.
-fn take_lease(host: &dyn UpdateHost, target: &str) -> Result<Lease> {
+/// Claim the lease for `target`, or reuse the identity's own live lease
+/// — a crashed predecessor's, since [`RunLock`] proves no other run of
+/// this state dir is live. A lease another identity holds refuses with
+/// the operator-facing sentence, never a raw lease error.
+fn take_lease(host: &dyn UpdateHost, target: &str) -> Result<rollout::Caller> {
     let state_dir = host.state_dir();
     let caller = rollout::Caller {
         identity: host.identity().to_string(),
@@ -530,10 +758,7 @@ fn take_lease(host: &dyn UpdateHost, target: &str) -> Result<Lease> {
                 fmt_epoch(status["claimed_at"].as_f64().unwrap_or(0.0))
             )));
         }
-        return Ok(Lease {
-            caller,
-            claimed: false,
-        });
+        return Ok(caller);
     }
     rollout::claim(
         state_dir,
@@ -546,17 +771,14 @@ fn take_lease(host: &dyn UpdateHost, target: &str) -> Result<Lease> {
             now: host.now(),
         },
     )?;
-    Ok(Lease {
-        caller,
-        claimed: true,
-    })
+    Ok(caller)
 }
 
-fn release_lease(host: &dyn UpdateHost, lease: &Lease) -> Result<()> {
-    if !lease.claimed {
-        return Ok(());
-    }
-    rollout::release(host.state_dir(), &lease.caller).map(|_| ())
+/// Release the lease this run holds — reused or freshly claimed alike:
+/// the re-entry lock proves this run is the only update for the state
+/// dir, so a live same-identity lease is this run's own to end.
+fn release_lease(host: &dyn UpdateHost, caller: &rollout::Caller) -> Result<()> {
+    rollout::release(host.state_dir(), caller).map(|_| ())
 }
 
 /// Take the pre-update backup (outside the state dir by default) and
@@ -633,10 +855,14 @@ fn host_pending(host: &dyn UpdateHost) -> Option<PendingUpdate> {
 }
 
 /// Poll `build` until it reports `want`, or the deadline passes.
+/// `require_board` is the pre-switch snapshot ([`UpdateHost::board_running`]):
+/// when a board was running, only a board that answers on the new build
+/// is health — `None` ("no board") is not.
 pub fn health_wait(
     host: &dyn UpdateHost,
     want: &str,
     timeout: Duration,
+    require_board: bool,
     mut board: impl FnMut() -> Result<Option<String>>,
 ) -> Result<()> {
     let deadline = host.now() + timeout.as_secs_f64();
@@ -644,7 +870,8 @@ pub fn health_wait(
         let daemon = host.daemon_build()?;
         let board_build = board()?;
         let daemon_ok = daemon.as_deref() == Some(want);
-        let board_ok = board_build.is_none() || board_build.as_deref() == Some(want);
+        let board_ok = board_build.as_deref() == Some(want)
+            || (!require_board && board_build.is_none());
         if daemon_ok && board_ok {
             return Ok(());
         }
@@ -672,7 +899,29 @@ fn restart_on(host: &dyn UpdateHost, sha: &str) -> Result<Value> {
 }
 
 /// Run the update. `--check`/`status` never reach here.
+///
+/// Takes the re-entry lock for the whole run and, when the host asked
+/// for a progress log, opens it and records the run's start and end —
+/// so the board's detached helper leaves a record that outlives the
+/// board reading it.
 pub fn run(host: &dyn UpdateHost, opts: &Options) -> Result<RunReport> {
+    let _lock = RunLock::acquire(host.state_dir())?;
+    let log = host.progress_log();
+    if let Some(path) = &log {
+        run_log_start(path, std::process::id(), host.identity(), host.now())?;
+    }
+    let outcome = run_locked(host, opts);
+    if let Some(path) = &log {
+        match &outcome {
+            Ok(report) => run_log_finish(path, report, host.now()),
+            Err(error) => run_log_fail(path, &error.to_string(), host.now()),
+        }
+    }
+    outcome
+}
+
+/// [`run`]'s body, under the re-entry lock and with the log started.
+fn run_locked(host: &dyn UpdateHost, opts: &Options) -> Result<RunReport> {
     let state_dir = host.state_dir();
     let mut lines: Vec<String> = Vec::new();
     let report = check(host)?;
@@ -842,6 +1091,9 @@ fn run_inner(
     }
     host.set_pending(Some(&pending("switching")))?;
     // 4. Switch: the new binary restarts the daemon (and the board).
+    //    Snapshot the board first: a board that was running and does not
+    //    answer on the new build is not health (CAD-561 r2).
+    let board_before = host.board_running();
     let restart = restart_on(host, &target)?;
     // 5. Health check, with auto-rollback to the previous release.
     let previous = if install {
@@ -849,7 +1101,9 @@ fn run_inner(
     } else {
         previous_release(host)?
     };
-    let health = match health_wait(host, &target, HEALTH_TIMEOUT, || host.board_build()) {
+    let health = match health_wait(host, &target, HEALTH_TIMEOUT, board_before, || {
+        host.board_build()
+    }) {
         Ok(()) => json!({"ok": true, "build": target}),
         Err(e) => {
             progress(host, format!("health: {e}"));
@@ -873,7 +1127,10 @@ fn run_inner(
             )?;
             let binary = host.layout().binary(&previous);
             host.restart(&binary)?;
-            health_wait(host, &previous, HEALTH_TIMEOUT, || host.board_build()).map_err(|e2| {
+            health_wait(host, &previous, HEALTH_TIMEOUT, board_before, || {
+                host.board_build()
+            })
+            .map_err(|e2| {
                 Error::rejected(format!(
                     "health check failed on {target} ({e}); the rollback to {previous} did \
                      not come up either ({e2}) — the daemon and board need an operator"
@@ -1004,6 +1261,10 @@ pub fn previous_release(host: &dyn UpdateHost) -> Result<Option<String>> {
 /// `cadence update --rollback`: return to the previous release, restart,
 /// health check — and offer the backup restore when the schema changed.
 pub fn rollback(host: &dyn UpdateHost) -> Result<RunReport> {
+    // One mutation per state dir: the lock serialises a rollback against
+    // a running update, and the lease it takes is what lets the daemon
+    // trust the marker this rollback writes (CAD-561 r2).
+    let _lock = RunLock::acquire(host.state_dir())?;
     let layout = host.layout();
     let current = match upgrade::current(layout)? {
         Current::Link { sha, .. } => sha,
@@ -1025,13 +1286,26 @@ pub fn rollback(host: &dyn UpdateHost) -> Result<RunReport> {
             layout.releases.display()
         )));
     };
+    let lease = take_lease(host, &previous)?;
+    let outcome = rollback_body(host, current, &previous);
+    let _ = release_lease(host, &lease);
+    outcome
+}
+
+/// [`rollback`]'s body, under the lock and the lease.
+fn rollback_body(
+    host: &dyn UpdateHost,
+    current: Option<String>,
+    previous: &str,
+) -> Result<RunReport> {
+    let layout = host.layout();
     host.progress(&format!(
         "rolling back: {} → {previous}",
         current.as_deref().unwrap_or("nothing")
     ));
     host.set_pending(Some(&PendingUpdate {
         phase: "rolling_back".to_string(),
-        target: previous.clone(),
+        target: previous.to_string(),
         from: current.clone(),
         by: host.identity().to_string(),
         since: host.now(),
@@ -1040,16 +1314,19 @@ pub fn rollback(host: &dyn UpdateHost) -> Result<RunReport> {
         host.source(),
         layout,
         &upgrade::Request {
-            target: upgrade::Target::Sha(previous.clone()),
+            target: upgrade::Target::Sha(previous.to_string()),
             dry_run: false,
             allow_unattested: false,
             backup_state_dir: None,
         },
     )?;
-    let binary = layout.binary(&previous);
+    // The same snapshot the update takes: a board that was running must
+    // answer on the rolled-back build too.
+    let board_before = host.board_running();
+    let binary = layout.binary(previous);
     host.restart(&binary)?;
     let schema_current = rollout::store_schema(host.state_dir())?;
-    let schema_target = host.source().schema_version(&previous).unwrap_or(None);
+    let schema_target = host.source().schema_version(previous).unwrap_or(None);
     let restore = match (schema_current, schema_target) {
         (Some(store), Some(target)) if target < store => Some(format!(
             "the store schema ({store}) is newer than {previous}'s ({target}) — restore the \
@@ -1058,7 +1335,9 @@ pub fn rollback(host: &dyn UpdateHost) -> Result<RunReport> {
         )),
         _ => None,
     };
-    match health_wait(host, &previous, HEALTH_TIMEOUT, || host.board_build()) {
+    match health_wait(host, previous, HEALTH_TIMEOUT, board_before, || {
+        host.board_build()
+    }) {
         Ok(()) => {
             host.progress(&format!("health: daemon and board answer on {previous}"));
             if let Some(restore) = &restore {
@@ -1066,7 +1345,7 @@ pub fn rollback(host: &dyn UpdateHost) -> Result<RunReport> {
             }
             clear_pending(host.state_dir());
             Ok(RunReport {
-                check: check_after_rollback(host, &previous),
+                check: check_after_rollback(host, previous),
                 lease: None,
                 backup: None,
                 install: Some(install),

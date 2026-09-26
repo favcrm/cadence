@@ -360,6 +360,11 @@ pub struct ServeOpts {
     /// never set this.
     #[doc(hidden)]
     pub seam: Option<crate::test_seam::Seam>,
+    /// The program the Update button spawns (CAD-561 r2): `cadence
+    /// update --as <ui actor> --progress <state>/update-progress.jsonl`.
+    /// `None` is this board's own binary. Never set from the command
+    /// line — tests inject a fake helper.
+    pub update_helper: Option<PathBuf>,
 }
 
 fn opts_file(state_dir: &Path) -> PathBuf {
@@ -623,6 +628,9 @@ fn serve_opts(eff: &UiOpts) -> Result<ServeOpts> {
         // environment; in-process fixtures set the field directly.
         test_seam: crate::test_seam::env_armed(),
         seam: None,
+        // CAD-561 r2: a real board spawns its own binary as the update
+        // helper; only tests inject a fake.
+        update_helper: None,
     })
 }
 

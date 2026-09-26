@@ -2,14 +2,22 @@
 //!
 //! Settings shows the current version and, from the last check,
 //! "Update available · N changes" with the summary; the **Update**
-//! button runs the same pipeline as `cadence update` in this process
-//! and streams its progress. The route class is
-//! [`RouteClass::OperatorOnly`], so the button carries the same proof
-//! as every other operator write ([`super::operator::admit`] plus
-//! [`super::home::prove_operator_peer`]) — an agent's session can never
-//! start an update. A banner shows while an update drains, from the
-//! same `update_status`/`health` view the CLI reads.
+//! button starts the same pipeline as `cadence update` — as a detached
+//! helper process that outlives this board (CAD-561 r2). The switch
+//! restarts the board, so a pipeline running in-process would SIGTERM
+//! its own process before `ui start`; the helper instead appends its
+//! progress and its result to `<state>/update-progress.jsonl`, and this
+//! board — and the one that replaces it — reads that file back. The
+//! route class is [`RouteClass::OperatorOnly`], so the button carries
+//! the same proof as every other operator write
+//! ([`super::operator::admit`] plus [`super::home::prove_operator_peer`])
+//! — an agent's session can never start an update. A banner shows while
+//! an update drains, from the same `update_status`/`health` view the CLI
+//! reads.
 
+use std::fs::OpenOptions;
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
@@ -21,17 +29,15 @@ use super::{coded_response, json_response, HttpResp, ServeOpts};
 use crate::client;
 use crate::error::{Error, Result};
 use crate::ui::home::rpc_err;
-use crate::update::{self, Options, PendingUpdate, UpdateHost, Waiter};
+use crate::update::{self, PendingUpdate, UpdateHost, Waiter};
 use crate::upgrade::{self, Layout, ReleaseSource};
 
-/// The board process's one update slot: at most one runs at a time,
-/// and its progress is readable by every request.
+/// The board process's cached update check: the read-only `gh` query
+/// behind "Update available · N changes". The run itself lives in the
+/// helper's progress file, not here — the board that started it does
+/// not survive the switch, and the one that does reads the file.
 #[derive(Default)]
 struct BoardUpdate {
-    running: AtomicBool,
-    lines: Mutex<Vec<String>>,
-    result: Mutex<Option<Value>>,
-    error: Mutex<Option<String>>,
     check: Mutex<Option<Value>>,
     checked_at: Mutex<Option<f64>>,
     checking: AtomicBool,
@@ -79,12 +85,16 @@ fn pending(state_dir: &Path) -> (Value, Vec<Value>) {
 const CHECK_EVERY: f64 = 600.0;
 
 /// `GET /api/update` — the card's whole view: the current release, the
-/// last check, the running update's progress, and the drain state.
+/// last check, the running update's progress (read from the helper's
+/// log, so it survives this board's own replacement), and the drain
+/// state.
 pub(super) fn get(state_dir: &Path) -> HttpResp {
     maybe_refresh_check(state_dir);
     let layout = layout();
     let current = layout.as_ref().map(current).unwrap_or(Value::Null);
     let (pending, waiting) = pending(state_dir);
+    let run = update::read_run_log(state_dir);
+    adopt_finished_check(&run);
     let check = BOARD_UPDATE.check.lock().unwrap().clone();
     let checked_at = *BOARD_UPDATE.checked_at.lock().unwrap();
     let update_available = check
@@ -100,13 +110,37 @@ pub(super) fn get(state_dir: &Path) -> HttpResp {
         "changes": check.as_ref().map(|c| c["changes"].clone()).unwrap_or(json!([])),
         "migration": check.as_ref().and_then(|c| c["schema"]["migration"].as_bool()).unwrap_or(false),
         "blockers": check.as_ref().map(|c| c["blockers"].clone()).unwrap_or(json!([])),
-        "running": BOARD_UPDATE.running.load(Ordering::SeqCst),
-        "lines": BOARD_UPDATE.lines.lock().unwrap().clone(),
-        "result": BOARD_UPDATE.result.lock().unwrap().clone(),
-        "error": BOARD_UPDATE.error.lock().unwrap().clone(),
+        "running": run.running,
+        "lines": run.lines,
+        "result": run.result,
+        "error": run.error,
         "pending": pending,
         "waiting": waiting,
     }))
+}
+
+/// A finished run's own check is the newest the card can have: adopt it
+/// (with the run's end as `checked_at`) so a board restarted by the
+/// update shows the post-update state without waiting for its own
+/// background check. Older than the cached check: left alone.
+fn adopt_finished_check(run: &update::RunLogView) {
+    let Some(finished_at) = run.finished_at else {
+        return;
+    };
+    let Some(check) = run
+        .result
+        .as_ref()
+        .and_then(|report| report.get("check"))
+        .filter(|check| check.is_object())
+    else {
+        return;
+    };
+    let mut checked_at = BOARD_UPDATE.checked_at.lock().unwrap();
+    if checked_at.is_some_and(|at| at >= finished_at) {
+        return;
+    }
+    *BOARD_UPDATE.check.lock().unwrap() = Some(check.clone());
+    *checked_at = Some(finished_at);
 }
 
 /// The card fills itself in: a check is kicked in the background when
@@ -151,65 +185,114 @@ fn run_check(state_dir: &Path) -> Result<Value> {
         state_dir: state_dir.to_path_buf(),
         layout,
         source: upgrade::Gh::new(upgrade::DEFAULT_REPO),
-        pending: Mutex::new(None),
     };
     Ok(update::check(&host)?.to_json())
 }
 
-/// `POST /api/update` — start the pipeline in this process. Returns at
-/// once; the card polls `GET /api/update` for the progress lines.
+/// `POST /api/update` — start the pipeline as a detached helper that
+/// outlives this board (CAD-561 r2). Returns at once; the card polls
+/// `GET /api/update`, which reads the helper's progress file — the
+/// board that answers after the switch reads the same file.
 pub(super) fn start(state_dir: &Path, opts: &ServeOpts) -> HttpResp {
-    if BOARD_UPDATE.running.swap(true, Ordering::SeqCst) {
+    if update::read_run_log(state_dir).running {
         return coded_response(409, "update_running", "an update is already running", None);
     }
-    BOARD_UPDATE.lines.lock().unwrap().clear();
-    *BOARD_UPDATE.result.lock().unwrap() = None;
-    *BOARD_UPDATE.error.lock().unwrap() = None;
-    let state_dir = state_dir.to_path_buf();
-    let opts = opts.clone();
-    std::thread::spawn(move || {
-        let outcome = run_update(&state_dir, &opts);
-        BOARD_UPDATE.running.store(false, Ordering::SeqCst);
-        match outcome {
-            Ok(report) => {
-                *BOARD_UPDATE.result.lock().unwrap() = Some(report.to_json());
-                // The check the update just made is the new cache.
-                *BOARD_UPDATE.check.lock().unwrap() = Some(report.check.to_json());
-                *BOARD_UPDATE.checked_at.lock().unwrap() = Some(crate::rollout::unix_now());
+    // The board's own binary in production; a test's fake helper.
+    let exe = match &opts.update_helper {
+        Some(path) => path.clone(),
+        None => match std::env::current_exe() {
+            Ok(path) => path,
+            Err(e) => {
+                return rpc_err(
+                    &Error::internal(format!("the board's own binary: {e}")),
+                    "update",
+                )
             }
-            Err(err) => *BOARD_UPDATE.error.lock().unwrap() = Some(err.to_string()),
-        }
-    });
-    json_response(json!({"started": true}))
-}
-
-fn run_update(state_dir: &Path, _opts: &ServeOpts) -> Result<update::RunReport> {
-    let layout = layout()?;
-    let host = BoardHost {
-        state_dir: state_dir.to_path_buf(),
-        layout,
-        source: upgrade::Gh::new(upgrade::DEFAULT_REPO),
-        pending: Mutex::new(None),
+        },
     };
-    let report = update::run(&host, &Options::default())?;
-    Ok(report)
+    let log_path = update::progress_file(state_dir);
+    let log = match OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(&log_path)
+    {
+        Ok(file) => file,
+        Err(e) => {
+            return rpc_err(
+                &Error::internal(format!("{}: {e}", log_path.display())),
+                "update",
+            )
+        }
+    };
+    let stdout = match log.try_clone() {
+        Ok(file) => file,
+        Err(e) => {
+            return rpc_err(
+                &Error::internal(format!("{}: {e}", log_path.display())),
+                "update",
+            )
+        }
+    };
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("--state-dir")
+        .arg(state_dir)
+        .args(["update", "--as"])
+        .arg(super::UI_ACTOR)
+        .arg("--progress")
+        .arg(&log_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(stdout))
+        .stderr(std::process::Stdio::from(log));
+    // The helper is the operator's, not an agent's: no ambient alias and
+    // no fixture seam assertion rides into it (CAD-482).
+    cmd.env_remove("CADENCE_ALIAS");
+    cmd.env_remove(crate::test_seam::AS_ENV);
+    // Its own session: the restart this helper runs stops the board by
+    // pid, and a helper in the board's session would be a candidate for
+    // any group signal; detached, it outlives the board entirely.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    match crate::reaper::spawn(&mut cmd) {
+        Ok(mut child) => {
+            let pid = child.id();
+            // This board is the helper's parent: reap it when it exits,
+            // or its zombie pid keeps reading as a live run.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            json_response(json!({"started": true, "pid": pid}))
+        }
+        Err(e) => rpc_err(
+            &Error::internal(format!("could not start {}: {e}", exe.display())),
+            "update",
+        ),
+    }
 }
 
-/// The board's [`UpdateHost`]. The operator authority is the route's
-/// proof; this host makes the same daemon calls the CLI makes, from
-/// this process's own connection — which the daemon attributes exactly
-/// as it does for the board's other relayed operator writes.
+/// The board's [`UpdateHost`] — used for the read-only `check` only:
+/// the pipeline itself runs in the detached helper (CAD-561 r2). The
+/// pipeline methods refuse rather than act, so a future change cannot
+/// quietly put the pipeline back inside the process its own restart
+/// stops.
 struct BoardHost {
     state_dir: PathBuf,
     layout: Layout,
     source: upgrade::Gh,
-    /// The marker this process last recorded, for the drain re-assertion.
-    pending: Mutex<Option<PendingUpdate>>,
 }
 
 impl BoardHost {
-    fn label(&self) -> String {
-        super::UI_ACTOR.to_string()
+    fn not_the_pipeline() -> Error {
+        Error::internal(
+            "the board's check host never runs the update pipeline — the board starts \
+             a detached `cadence update` helper instead (CAD-561 r2)",
+        )
     }
 }
 
@@ -226,9 +309,7 @@ impl UpdateHost for BoardHost {
     fn identity(&self) -> &str {
         super::UI_ACTOR
     }
-    fn progress(&self, line: &str) {
-        BOARD_UPDATE.lines.lock().unwrap().push(line.to_string());
-    }
+    fn progress(&self, _line: &str) {}
     fn waiters(&self) -> Result<Vec<Waiter>> {
         let status = match client::rpc(&self.state_dir, "update_status", json!({})) {
             Ok(status) => status,
@@ -250,56 +331,17 @@ impl UpdateHost for BoardHost {
             })
             .unwrap_or_default())
     }
-    fn set_pending(&self, pending: Option<&PendingUpdate>) -> Result<()> {
-        *self.pending.lock().unwrap() = pending.cloned();
-        match pending {
-            Some(pending) => update::write_pending(&self.state_dir, pending),
-            None => {
-                update::clear_pending(&self.state_dir);
-                Ok(())
-            }
-        }
+    fn set_pending(&self, _pending: Option<&PendingUpdate>) -> Result<()> {
+        Err(Self::not_the_pipeline())
     }
     fn pending(&self) -> Option<PendingUpdate> {
-        self.pending.lock().unwrap().clone()
+        None
     }
-    fn set_drain(&self, on: bool) -> Result<()> {
-        let mut params = json!({"on": on, "label": self.label()});
-        if on {
-            if let Some(pending) = self.pending.lock().unwrap().clone() {
-                params["target"] = json!(pending.target);
-                params["phase"] = json!(pending.phase);
-                params["from"] = json!(pending.from);
-                params["since"] = json!(pending.since);
-            }
-        }
-        match client::rpc(&self.state_dir, "update_drain", params) {
-            Ok(_) => Ok(()),
-            Err(e) if e.to_string().starts_with("Daemon is not reachable") => Ok(()),
-            Err(e) => Err(e),
-        }
+    fn set_drain(&self, _on: bool) -> Result<()> {
+        Err(Self::not_the_pipeline())
     }
-    fn restart(&self, binary: &Path) -> Result<()> {
-        let mut cmd = std::process::Command::new(binary);
-        cmd.arg("--state-dir")
-            .arg(&self.state_dir)
-            .args(["daemon", "restart", "--ui", "--as"])
-            .arg(self.label())
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        let out = crate::reaper::spawn(&mut cmd)
-            .and_then(|child| child.wait_with_output())
-            .map_err(|e| Error::internal(format!("could not run {}: {e}", binary.display())))?;
-        if !out.status.success() {
-            return Err(Error::rejected(format!(
-                "the restart on {} failed (exit {}): {}",
-                binary.display(),
-                out.status.code().unwrap_or(-1),
-                String::from_utf8_lossy(&out.stderr).trim()
-            )));
-        }
-        Ok(())
+    fn restart(&self, _binary: &Path) -> Result<()> {
+        Err(Self::not_the_pipeline())
     }
     fn daemon_build(&self) -> Result<Option<String>> {
         match client::rpc(&self.state_dir, "daemon_info", json!({})) {
@@ -314,6 +356,9 @@ impl UpdateHost for BoardHost {
                 .ok()
                 .and_then(|v| v["build"].as_str().map(str::to_string))),
         }
+    }
+    fn board_running(&self) -> bool {
+        crate::ui::detached_pid(&self.state_dir).is_some()
     }
     fn now(&self) -> f64 {
         crate::rollout::unix_now()

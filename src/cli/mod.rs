@@ -1361,6 +1361,12 @@ pub(crate) enum Commands {
         /// plain progress lines.
         #[arg(long)]
         json: bool,
+        /// Append this run's progress lines and its final one-line JSON
+        /// record to PATH (0600) — the board's Update card reads it while
+        /// a detached helper runs (CAD-561). Ignored by `--check`,
+        /// `--rollback` and `status`.
+        #[arg(long, value_name = "PATH")]
+        progress: Option<PathBuf>,
         /// Where the release lives and which repository is trusted.
         #[command(flatten)]
         target: UpdateTargetArgs,
@@ -3489,9 +3495,11 @@ pub(crate) fn run() -> Result<i32> {
             keep,
             backup_dir,
             json,
+            progress,
             target,
         } => update::run(
-            state_dir, action, check, rollback, drain, now, keep, backup_dir, json, target,
+            state_dir, action, check, rollback, drain, now, keep, backup_dir, json, progress,
+            target,
         ),
         Commands::Sandbox { action } => sandbox::run(state_dir, action),
         Commands::Confine {
@@ -3561,6 +3569,7 @@ pub(crate) struct UpdateArgs {
     keep: u64,
     backup_dir: Option<PathBuf>,
     json: bool,
+    progress: Option<PathBuf>,
     as_identity: Option<String>,
     repo: String,
     link: Option<PathBuf>,
@@ -3580,10 +3589,16 @@ pub(crate) struct RealUpdateHost<'a> {
     collect: Option<std::cell::RefCell<Vec<String>>>,
     /// The marker this run last recorded, for the drain re-assertion.
     pending: std::cell::RefCell<Option<cadence_agent::update::PendingUpdate>>,
+    /// `--progress`: append every line here too, so the board's card can
+    /// read the run while this process is detached from it (CAD-561 r2).
+    progress_log: Option<PathBuf>,
 }
 
 impl RealUpdateHost<'_> {
     fn line(&self, line: &str) {
+        if let Some(path) = &self.progress_log {
+            cadence_agent::update::run_log_line(path, line);
+        }
         match &self.collect {
             Some(lines) => lines.borrow_mut().push(line.to_string()),
             None => println!("{line}"),
@@ -3700,6 +3715,12 @@ impl cadence_agent::update::UpdateHost for RealUpdateHost<'_> {
                 .ok()
                 .and_then(|v| v["build"].as_str().map(str::to_string))),
         }
+    }
+    fn board_running(&self) -> bool {
+        cadence_agent::ui::detached_pid(self.state_dir).is_some()
+    }
+    fn progress_log(&self) -> Option<PathBuf> {
+        self.progress_log.clone()
     }
     fn now(&self) -> f64 {
         cadence_agent::rollout::unix_now()

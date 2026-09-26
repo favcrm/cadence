@@ -69,6 +69,7 @@ pub(super) fn run_update(state_dir: &Path, args: UpdateArgs) -> Result<i32> {
         label: caller.identity.clone(),
         collect: args.json.then(|| std::cell::RefCell::new(Vec::new())),
         pending: std::cell::RefCell::new(None),
+        progress_log: args.progress.clone(),
     };
     if args.status {
         let status = client::rpc(state_dir, "update_status", json!({})).unwrap_or_else(
@@ -170,6 +171,7 @@ pub(super) fn run(
     keep: u64,
     backup_dir: Option<PathBuf>,
     json: bool,
+    progress: Option<PathBuf>,
     target: UpdateTargetArgs,
 ) -> Result<i32> {
     let (status, target) = match action {
@@ -187,6 +189,7 @@ pub(super) fn run(
             keep,
             backup_dir,
             json,
+            progress,
             as_identity: target.as_identity,
             repo: target.repo,
             link: target.link,
