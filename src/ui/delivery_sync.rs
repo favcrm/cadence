@@ -395,11 +395,15 @@ impl DeliverySync {
                 // the seam this compiles out and the calls keep their
                 // ambient caller.
                 if self.seam_armed.load(Ordering::Relaxed) {
-                    crate::test_seam::scoped(
-                        crate::test_seam::env_asserted()
-                            .unwrap_or(crate::test_seam::Asserted::Operator),
-                        pass,
-                    )
+                    // An unparseable CADENCE_TEST_AS must never read as
+                    // the operator — assert `unproven` so the pass's
+                    // gated daemon calls refuse loudly instead.
+                    let who = match crate::test_seam::env_asserted() {
+                        Ok(Some(who)) => who,
+                        Ok(None) => crate::test_seam::Asserted::Operator,
+                        Err(_) => crate::test_seam::Asserted::Unproven,
+                    };
+                    crate::test_seam::scoped(who, pass)
                 } else {
                     pass()
                 }

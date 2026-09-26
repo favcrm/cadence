@@ -200,17 +200,35 @@ jobs:
       - run: rustup toolchain install stable --profile minimal
       - run: cargo build --release --locked
       # CAD-482: the test seam must never reach a release binary —
-      # src/test_seam.rs's compile_error blocks `--features test-seam`
-      # on a release profile, and this grep proves the shipped bytes
-      # carry none of the seam (the canary exists only under the
-      # feature; removing the compile_error and building with it
-      # trips this step).
+      # the canary exists only under the feature, so this grep on the
+      # shipped default-feature binary proves its bytes carry none of
+      # the seam. The step below is the guard's own tripwire: it builds
+      # the forbidden combination and asserts the compile_error fires.
       - name: Assert the release binary carries no test seam
         run: |
           if grep -aq 'cadence-test-seam-v1' target/release/cadence; then
             echo "release binary contains the CAD-482 test seam" >&2
             exit 1
           fi
+      # CAD-482: the grep above proves the shipped binary carries no
+      # seam, but the exclusion itself needs a tripwire — a deleted
+      # compile_error would leave this whole job green. This probe
+      # builds the forbidden combination and asserts it fails with the
+      # seam's own compile_error message (any other failure — a missing
+      # dep, a syntax error — must not count, so grep the message).
+      - name: Assert the test seam refuses a release build
+        run: |
+          log="${{ runner.temp }}/seam-release-check.log"
+          if cargo check --release --locked --features test-seam >"$log" 2>&1; then
+            echo "::error::'cargo check --release --features test-seam' succeeded — the seam's release exclusion was removed" >&2
+            exit 1
+          fi
+          cat "$log"
+          if ! grep -q 'must never be compiled into a release build' "$log"; then
+            echo "::error::release+test-seam failed, but not with the seam's compile_error — the probe must name the guard it tests" >&2
+            exit 1
+          fi
+          echo "probe ok: --release --features test-seam is refused by the seam's own compile_error"
 
   ui:
     needs: [queue-evidence]

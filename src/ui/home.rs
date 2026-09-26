@@ -150,9 +150,11 @@ pub(super) fn operator_viewer(
 /// becomes operator's when the token lands.
 pub(super) fn board_is_operator(state_dir: &std::path::Path, seam_armed: bool) -> bool {
     if seam_armed && crate::test_seam::armed(state_dir) {
+        // An unparseable CADENCE_TEST_AS (Err) is not the operator —
+        // a misspelled assertion refuses loudly, never ambient.
         return matches!(
             crate::test_seam::env_asserted(),
-            None | Some(crate::test_seam::Asserted::Operator)
+            Ok(None) | Ok(Some(crate::test_seam::Asserted::Operator))
         );
     }
     let Some(daemon_pid) = client::rpc(state_dir, "health", json!({}))

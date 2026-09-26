@@ -212,8 +212,10 @@ pub fn asserted() -> Option<Asserted> {
 /// declared identity, independent of any request or dispatch scope.
 /// Sites answering "who does this process run as" (a board deciding
 /// whether it is its operator's) read this, never the scoped caller a
-/// request arrived under. `None` without the feature or when unset.
-pub fn env_asserted() -> Option<Asserted> {
+/// request arrived under. `Ok(None)` without the feature or when unset;
+/// a set-but-unparseable value is `Err` — it refuses loudly like the
+/// wire path, never silently the ambient operator.
+pub fn env_asserted() -> Result<Option<Asserted>> {
     imp::env_asserted()
 }
 
@@ -272,12 +274,13 @@ mod imp {
     use serde_json::json;
 
     /// Release-canary (CAD-482): this byte string exists in the binary
-    /// only when the seam is compiled in. `compile_error!` above blocks
-    /// `test-seam` on a release profile; the CI release job greps the
-    /// built binary for `cadence-test-seam-v1` to prove neither the
-    /// flag nor this code ever shipped — removing the compile_error
-    /// and building `--release --features test-seam` is the mutation
-    /// this catches.
+    /// only when the seam is compiled in. Two CI checks, not one, keep
+    /// it out of every shipped artifact: the build job greps the
+    /// default-feature release binary for `cadence-test-seam-v1` —
+    /// proving the shipped bytes carry none of this code — and an
+    /// expected-failure probe runs `cargo check --release --features
+    /// test-seam`, which must fail with the `compile_error!` above.
+    /// The probe is what catches a deleted compile_error.
     #[used]
     static RELEASE_CANARY: &[u8] = b"cadence-test-seam-v1\n";
 
@@ -307,14 +310,72 @@ mod imp {
         ASSERTED.with(|c| c.borrow().clone())
     }
 
-    /// The confinement check both arm paths share: canonicalize
-    /// `state_dir`, refuse the production default and anything outside
+    /// The real production state dir, resolved from the uid's passwd
+    /// entry — never HOME/XDG_STATE_HOME, which a caller controls. A
+    /// doctored HOME moves the env-derived default check below, but it
+    /// cannot move this one. `None` when the uid has no passwd home
+    /// (the env-derived and temp-root bounds still stand).
+    fn production_state_dir() -> Option<PathBuf> {
+        let dir = passwd_home()?.join(".local/state/cadence");
+        // Canonicalize what exists so a symlinked home resolves the
+        // same way `state_dir` will.
+        Some(dir.canonicalize().unwrap_or(dir))
+    }
+
+    /// The uid's home directory from its passwd entry.
+    #[cfg(unix)]
+    fn passwd_home() -> Option<PathBuf> {
+        // SAFETY: getuid/getpwuid need no setup; pw_dir is a borrowed
+        // pointer — read, never freed.
+        unsafe {
+            let pw = libc::getpwuid(libc::getuid());
+            if pw.is_null() || (*pw).pw_dir.is_null() {
+                return None;
+            }
+            let dir = std::ffi::CStr::from_ptr((*pw).pw_dir).to_string_lossy();
+            (!dir.is_empty()).then(|| PathBuf::from(dir.into_owned()))
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn passwd_home() -> Option<PathBuf> {
+        None
+    }
+
+    /// `dir` spelled any way == the real production state dir? Runs
+    /// before `create_dir_all`, so a refused arm never even creates it.
+    fn refuse_production(dir: &Path) -> Result<()> {
+        let Some(production) = production_state_dir() else {
+            return Ok(());
+        };
+        let resolved = dir
+            .canonicalize()
+            .unwrap_or_else(|_| dir.to_path_buf());
+        if resolved == production {
+            return Err(Error::rejected(format!(
+                "test seam refused: '{}' is the production state dir — the \
+                 real uid's ~/.local/state/cadence, which no HOME, \
+                 XDG_STATE_HOME or TMPDIR setting can rename. Point the \
+                 fixture at its own temp dir",
+                resolved.display()
+            )));
+        }
+        Ok(())
+    }
+
+    /// The confinement check both arm paths share: refuse the real
+    /// production dir (env-independent), canonicalize `state_dir`,
+    /// refuse the env-derived production default and anything outside
     /// the temp root, return the canonical dir.
     fn confine(state_dir: &Path) -> Result<PathBuf> {
+        refuse_production(state_dir)?;
         std::fs::create_dir_all(state_dir)?;
         let canonical = state_dir.canonicalize().map_err(|e| {
             Error::internal(format!("test seam: cannot canonicalize state dir: {e}"))
         })?;
+        // The resolved form again — a symlinked or not-yet-existing
+        // input names the same production dir.
+        refuse_production(&canonical)?;
         if let Ok(default) = crate::client::default_state_dir().and_then(|d| {
             d.canonicalize()
                 .map_err(|e| Error::internal(format!("default state dir: {e}")))
@@ -397,7 +458,7 @@ mod imp {
     /// nothing (the process-wide env cannot name one state dir).
     pub fn caller_frame(state_dir: &Path) -> Result<Option<Value>> {
         let scoped = asserted();
-        let env = env_asserted();
+        let env = env_asserted()?;
         match (scoped, env) {
             (None, None) => Ok(None),
             (Some(who), _) => {
@@ -419,16 +480,27 @@ mod imp {
         }
     }
 
-    /// The process-wide [`AS_ENV`] assertion, if it parses.
-    pub fn env_asserted() -> Option<Asserted> {
-        std::env::var(AS_ENV).ok().and_then(|v| parse_as(&v).ok())
+    /// The process-wide [`AS_ENV`] assertion — `Err` when the variable
+    /// is set but unparseable. A misspelled identity must refuse the
+    /// way a forged frame does, never degrade to ambient operator.
+    pub fn env_asserted() -> Result<Option<Asserted>> {
+        let Some(value) = std::env::var_os(AS_ENV) else {
+            return Ok(None);
+        };
+        let Some(value) = value.to_str() else {
+            return Err(Error::rejected(format!(
+                "{AS_ENV} is not valid UTF-8 — assert 'operator', 'unproven', \
+                 or 'agent:<alias>'"
+            )));
+        };
+        parse_as(value).map(Some)
     }
 
     /// [`super::process_asserted`]: [`caller_frame`]'s two sources
     /// without the frame — a scoped assertion must name an armed
     /// target; [`AS_ENV`] proves only against one.
     pub fn process_asserted(state_dir: &Path) -> Result<Option<Asserted>> {
-        match (asserted(), env_asserted()) {
+        match (asserted(), env_asserted()?) {
             (Some(who), _) if Seam::token_at(state_dir).is_none() => Err(Error::rejected(format!(
                 "test seam: this process asserts '{}' but {} is not a \
                      seam-armed fixture",
@@ -513,8 +585,10 @@ mod imp {
     }
 
     /// No feature, no process assertion — the consult compiles out.
-    pub fn env_asserted() -> Option<Asserted> {
-        None
+    /// [`AS_ENV`] is meaningless on this build; [`caller_frame`] and
+    /// [`process_asserted`] refuse its presence loudly.
+    pub fn env_asserted() -> Result<Option<Asserted>> {
+        Ok(None)
     }
 
     /// The seam is not in this build: an assertion field is refused
