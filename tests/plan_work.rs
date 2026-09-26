@@ -1119,7 +1119,10 @@ fn app_digest_is_structural_not_summary_wording() {
 
     // The purpose line is wording: edited in place, the digest holds.
     let md = std::fs::read_to_string(dir.join("app.md")).unwrap();
-    let edited = md.replace("version: 0.1.0", "version: 0.1.0\nsummary:  A quiet studio.  ");
+    let edited = md.replace(
+        "summary: Run a checked change.",
+        "summary:  A quiet studio.  ",
+    );
     assert_ne!(edited, md, "the fixture must actually change");
     std::fs::write(dir.join("app.md"), &edited).unwrap();
     assert_eq!(digest_of(), before, "a summary edit is wording");

@@ -121,7 +121,7 @@ fn shape_problem(kind: InputKind, value: &str) -> Option<&'static str> {
                 Some("no leading, trailing or doubled hyphen")
             } else if !value
                 .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
             {
                 Some("lowercase letters, digits and hyphens only")
             } else {
@@ -1910,12 +1910,22 @@ label: New post\ninputs:\n  topic: { ask: \"About what?\", example: \"How we onb
             gate_digest(&no_example).unwrap(),
             "an example is wording"
         );
-        // An example the shape refuses refuses the file; so does an
-        // unknown kind, and a non-string one.
-        let e = parse_template(&SHAPED.replace("How we onboard", "My Post"))
-            .unwrap_err()
-            .to_string();
+        // An example the shape refuses refuses the file; a shaped one
+        // parses; an unknown kind and a non-string one refuse.
+        let e = parse_template(&SHAPED.replace(
+            "kind: slug",
+            "kind: slug, example: \"My Post\"",
+        ))
+        .unwrap_err()
+        .to_string();
         assert!(e.contains("does not fit"), "{e}");
+        let ok_example = SHAPED.replace("kind: slug", "kind: slug, example: \"my-post\"");
+        assert_eq!(
+            parse_template(&ok_example).unwrap().inputs["slug"]
+                .example
+                .as_deref(),
+            Some("my-post")
+        );
         let e = parse_template(&SHAPED.replace("kind: slug", "kind: folder"))
             .unwrap_err()
             .to_string();

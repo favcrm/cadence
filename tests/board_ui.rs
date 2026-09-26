@@ -1494,6 +1494,7 @@ fn board_workflow_preview_names_render_refusals() {
     wf_add(&f, "two-step", WF_TWO_STEP);
     wf_add(&f, "pair", WF_PAIR);
     wf_add(&f, "alias", WF_ALIAS);
+    wf_add(&f, "shaped", WF_SLUG);
     let port = start_board(&f.pm_dir, &f.d.state);
     let before = f.commits();
 
@@ -1539,7 +1540,6 @@ fn board_workflow_preview_names_render_refusals() {
     // CAD-571: a declared input shape (`kind: slug`) crosses the board
     // as the same named refusal — the preview relays the daemon's render
     // for every caller.
-    wf_add(&f, "shaped", WF_SLUG);
     let v = preview("shaped", r#"{"topic":"t","slug":"../x"}"#);
     assert_eq!(v["code"], "bad_shape", "{v}");
     assert!(
