@@ -4899,7 +4899,10 @@ fn pty_cursor_idle_probe_is_the_ready_claim() {
     );
     let screen =
         std::fs::read_to_string(d.cursor_pane_file(&mock, "cu", "screen")).unwrap_or_default();
-    assert!(screen.contains("MOCK_REPLY: work the lane"), "{screen}");
+    // CAD-565: the pane gets the notice + pull pointer, not the body.
+    assert!(screen.contains("MOCK_REPLY: [cadence] m1"), "{screen}");
+    assert!(screen.contains("work the lane"), "{screen}");
+    assert!(screen.contains("cadence message read m1"), "{screen}");
     d.report("m1", &token, "result", "done").unwrap();
     d.wait_message("cu", "m1", &["completed"], 10);
 }
