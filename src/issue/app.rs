@@ -1634,14 +1634,238 @@ fn team_roles(pm_dir: &Path, project_key: &str, name: &str) -> Result<Vec<String
         let (_, body) = parse::split_front(&text).unwrap_or(("", ""));
         for meta in workflow::ticket_meta(body).unwrap_or_default() {
             for (key, value) in meta {
-                if key == "agent" && declared.contains(&value) && !roles.contains(&value) {
-                    roles.push(value);
+                if key != "agent" {
+                    continue;
+                }
+                // The role is the input name whether the step names it
+                // literally or as `{{role}}`.
+                let role = value
+                    .trim()
+                    .strip_prefix("{{")
+                    .and_then(|v| v.strip_suffix("}}"))
+                    .map(str::trim)
+                    .unwrap_or(value.trim());
+                if declared.contains(&role.to_string()) && !roles.contains(&role.to_string()) {
+                    roles.push(role.to_string());
                 }
             }
         }
     }
     roles.sort();
     Ok(roles)
+}
+
+/// One slot an app's workflow steps declare with `uses:` and the
+/// connection it is bound to — the raw material of the app's grant
+/// policy (CAD-577). `binding` is the effective connection name
+/// (`None` when the slot is explicitly unbound).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SlotUse {
+    pub slot: String,
+    pub binding: Option<String>,
+}
+
+/// Every distinct slot some workflow step declares with `uses:`, with
+/// the slot's effective binding — sorted by slot. This is what
+/// `app_approve` turns into the app's grant policy: each used slot
+/// declares its own name as the scope it needs on the bound
+/// connection (the local adapter's `publish` tool declares exactly
+/// that scope).
+pub fn slot_uses(pm_dir: &Path, project_key: &str, name: &str) -> Result<Vec<SlotUse>> {
+    let dir = app_dir(pm_dir, project_key, name)?;
+    let record = read_record(pm_dir, project_key, name)?;
+    let manifest = read_manifest(pm_dir, project_key, name)?;
+    let mut slots: Vec<String> = Vec::new();
+    for (rel, path) in bundle_files(&dir)? {
+        if rel
+            .strip_prefix("workflows/")
+            .and_then(|n| n.strip_suffix(".md"))
+            .is_none()
+        {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        for slot in workflow_slots(&text).unwrap_or_default() {
+            if manifest.connections.iter().any(|s| s == &slot) && !slots.contains(&slot) {
+                slots.push(slot);
+            }
+        }
+    }
+    slots.sort();
+    Ok(slots
+        .into_iter()
+        .map(|slot| SlotUse {
+            binding: record.binding(&slot).map(str::to_string),
+            slot,
+        })
+        .collect())
+}
+
+/// The per-ticket `(agent, uses-slots)` a rendered plan declares — the
+/// agents a run assigns to each step and the slots those steps use.
+/// Parsed from the rendered text's ticket metadata, so it names the
+/// aliases the run actually carries (an input placeholder already
+/// substituted).
+pub fn run_uses(text: &str) -> Vec<(Option<String>, Vec<String>)> {
+    let Ok((_, body)) = parse::split_front(text) else {
+        return Vec::new();
+    };
+    let Ok(metas) = workflow::ticket_meta(body) else {
+        return Vec::new();
+    };
+    metas
+        .into_iter()
+        .map(|meta| {
+            let mut agent = None;
+            let mut slots = Vec::new();
+            for (key, value) in meta {
+                match key.as_str() {
+                    "agent" => agent = Some(value),
+                    "uses" => {
+                        for tok in value
+                            .trim_start_matches('[')
+                            .trim_end_matches(']')
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|t| !t.is_empty())
+                        {
+                            slots.push(tok.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            (agent, slots)
+        })
+        .collect()
+}
+
+/// One derived grant the app's approval records: `agent` may call
+/// `platform`/`account` at `scopes` (CAD-577). The scope is the slot
+/// name — the local adapter's `publish` tool declares exactly that
+/// scope — so a grant can never exceed what a step declared.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DerivedGrant {
+    pub agent: String,
+    pub platform: String,
+    pub account: String,
+    pub scopes: Vec<String>,
+}
+
+/// The grants an app's approval derives (CAD-577): for every workflow
+/// step that declares `uses: <slot>` and an `agent: {{role}}`, the
+/// agent the app's default team assigns to that role gets the slot's
+/// scope on the slot's bound connection. The operator sets the team
+/// (an operator-only write), so an agent can never widen its own grant
+/// by naming itself at propose. A slot with no effective binding, or a
+/// role with no team entry, derives nothing — a grant never names a
+/// connection the operator did not choose.
+pub fn derive_grants(pm_dir: &Path, project_key: &str, name: &str) -> Result<Vec<DerivedGrant>> {
+    let dir = app_dir(pm_dir, project_key, name)?;
+    let record = read_record(pm_dir, project_key, name)?;
+    let manifest = read_manifest(pm_dir, project_key, name)?;
+    let mut out: Vec<DerivedGrant> = Vec::new();
+    for (rel, path) in bundle_files(&dir)? {
+        if rel
+            .strip_prefix("workflows/")
+            .and_then(|n| n.strip_suffix(".md"))
+            .is_none()
+        {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let Ok((_, body)) = parse::split_front(&text) else {
+            continue;
+        };
+        let Ok(metas) = workflow::ticket_meta(body) else {
+            continue;
+        };
+        for meta in metas {
+            let mut role: Option<String> = None;
+            let mut slots: Vec<String> = Vec::new();
+            for (key, value) in meta {
+                match key.as_str() {
+                    "agent" => {
+                        // The role placeholder `{{role}}` names an input;
+                        // a literal alias is the app's own fixed choice.
+                        let inner = value
+                            .trim()
+                            .strip_prefix("{{")
+                            .and_then(|v| v.strip_suffix("}}"))
+                            .map(str::trim)
+                            .map(str::to_string);
+                        role = inner.or(Some(value));
+                    }
+                    "uses" => {
+                        for tok in value
+                            .trim_start_matches('[')
+                            .trim_end_matches(']')
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|t| !t.is_empty())
+                        {
+                            slots.push(tok.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let Some(role) = role else { continue };
+            // The agent the team assigns to this role — the operator's
+            // choice, never a proposer input. A literal alias the
+            // template hard-codes is used as-is (the app author's own
+            // reviewed choice).
+            let agent = if workflow::parse_template(&text)
+                .ok()
+                .is_some_and(|t| t.inputs.contains_key(&role))
+            {
+                match record.team.get(&role) {
+                    Some(a) => a.clone(),
+                    None => continue,
+                }
+            } else {
+                role.clone()
+            };
+            for slot in &slots {
+                if !manifest.connections.iter().any(|s| s == slot) {
+                    continue;
+                }
+                let Some(conn) = record.binding(slot) else {
+                    continue;
+                };
+                // CAD-577 derives grants for the built-in `local`
+                // connection (account `local`). The generic
+                // connection→account mapping lands with CAD-585; until
+                // then a slot bound to any other connection derives no
+                // grant rather than guessing an account.
+                if conn != crate::platform::local::PLATFORM {
+                    continue;
+                }
+                match out
+                    .iter_mut()
+                    .find(|g| g.agent == agent && g.platform == conn)
+                {
+                    Some(g) => {
+                        if !g.scopes.contains(slot) {
+                            g.scopes.push(slot.clone());
+                        }
+                    }
+                    None => out.push(DerivedGrant {
+                        agent: agent.clone(),
+                        platform: conn.to_string(),
+                        account: crate::platform::BUILTIN_LOCAL_ACCOUNT.to_string(),
+                        scopes: vec![slot.clone()],
+                    }),
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| (&a.agent, &a.platform).cmp(&(&b.agent, &b.platform)));
+    for g in &mut out {
+        g.scopes.sort();
+        g.scopes.dedup();
+    }
+    Ok(out)
 }
 
 /// The connection names the daemon registers, best-effort — `local` is

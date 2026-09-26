@@ -68,6 +68,15 @@ impl Shared {
         let text = optional_str(params, "text");
         let workflow = optional_str(params, "workflow");
         let inputs = params.get("inputs");
+        // CAD-577: a propose is a daemon touch of the app — reconcile
+        // its derived grants with the current approval BEFORE the gate
+        // runs. A structural change since approval revokes them (and
+        // drains any waiting effect that lost a scope); a team change
+        // re-derives. This runs even when the propose is then refused
+        // `app_unapproved`, so the grants track the structure.
+        if let Some((app, _)) = workflow.and_then(crate::issue::app::split_ref) {
+            self.reconcile_app_grants(project, app);
+        }
         let text = match (text, workflow) {
             (Some(t), None) => {
                 if inputs.is_some() {
@@ -419,8 +428,127 @@ impl Shared {
             &self.state_dir,
             "operator",
         )?;
+        // The team is what maps roles to agents, so a team change
+        // re-derives the app's grants (CAD-577) — but only while the
+        // app is still approved; a structural change revoked them.
+        self.reconcile_app_grants(project, name);
         self.wake();
         Ok(out)
+    }
+
+    /// Reconcile one app's derived grants with its current approval
+    /// (CAD-577): if the installed digest still matches the operator's
+    /// `app_approved` record, re-derive the grants from the workflow
+    /// steps and the app's team; otherwise revoke the app's derived
+    /// grants (a structural change revoked the approval) and drain any
+    /// waiting effect that lost a scope. Best-effort on a read failure
+    /// — `app remove` is the verb that deletes the app, and it revokes
+    /// separately.
+    pub(super) fn reconcile_app_grants(&self, project: &str, name: &str) {
+        let Ok(pm_dir) = self.pm_dir() else { return };
+        let key = crate::issue::app::approval_key(project, name);
+        let digest = match crate::issue::app::digest(&pm_dir, project, name) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let approved = self
+            .store
+            .app_approvals()
+            .ok()
+            .and_then(|a| a.get(&key).and_then(|p| p["digest"].as_str().map(str::to_string)))
+            .as_deref()
+            == Some(digest.as_str());
+        if approved {
+            let Ok(derived) = crate::issue::app::derive_grants(&pm_dir, project, name) else {
+                return;
+            };
+            let grants: Vec<(String, String, String, Vec<String>)> = derived
+                .iter()
+                .map(|g| {
+                    (
+                        g.agent.clone(),
+                        g.platform.clone(),
+                        g.account.clone(),
+                        g.scopes.clone(),
+                    )
+                })
+                .collect();
+            let _ = self.store.app_grants_set(&key, &grants, "operator");
+        } else if let Ok(changed) = self.store.app_grants_revoke(&key, "operator") {
+            self.drain_effect_scopes(changed);
+        }
+    }
+
+    /// Close the waiting effects of the `(agent, platform, account)`
+    /// triples whose grant changed, when the row's frozen scopes are no
+    /// longer covered (CAD-506's rule, reused by the app-grant revoke).
+    fn drain_effect_scopes(&self, changed: Vec<(String, String, String)>) {
+        let mut closed_any = false;
+        for (agent, platform, account) in changed {
+            let surviving = self
+                .store
+                .platform_grant(&agent, &platform, &account)
+                .ok()
+                .flatten();
+            let stranded: Vec<(String, String)> = self
+                .store
+                .platform_effects(Some(&agent))
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|r| {
+                    r.platform == platform
+                        && r.account == account
+                        && r.state == "waiting"
+                        && r.scopes
+                            .iter()
+                            .any(|s| surviving.as_ref().is_none_or(|g| !g.covers(s)))
+                })
+                .map(|r| (r.request, r.effect_id))
+                .collect();
+            for (request, effect_id) in stranded {
+                if let Ok(Some(row)) = self
+                    .store
+                    .effect_close(crate::store::EffectKey::Id(effect_id), "grant_revoked")
+                {
+                    let _ = self.store.event_public(
+                        &row.agent,
+                        "request_closed",
+                        json!({"request": request, "kind": "effect",
+                               "reason": "grant_revoked"}),
+                    );
+                    closed_any = true;
+                }
+            }
+        }
+        if closed_any {
+            self.wake();
+        }
+    }
+
+    /// CAD-577 `app_revoke` — the operator revokes an app's approval:
+    /// the `app_approved` record is superseded (a `revoked` event with
+    /// no digest, so `plan propose` refuses again) and every grant the
+    /// approval derived is revoked, draining any waiting effect that
+    /// lost a scope. Operator only, connection-bound like `app approve`.
+    pub(super) fn rpc_app_revoke(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.operator_connection("app revoke", params, peer_pid)?;
+        let project = required_str(params, "project")?;
+        crate::issue::model::check_key(project)?;
+        let name = required_str(params, "name")?;
+        let key = crate::issue::app::approval_key(project, name);
+        let payload = json!({
+            "project": project,
+            "name": name,
+            "digest": Value::Null,
+            "revoked": true,
+            "by": "operator",
+            "at": crate::issue::time::iso(crate::issue::time::now_epoch()),
+        });
+        self.store.record_app_approval(payload.clone())?;
+        let changed = self.store.app_grants_revoke(&key, "operator")?;
+        self.drain_effect_scopes(changed);
+        self.wake();
+        Ok(json!({"project": project, "name": name, "revoked": true}))
     }
 
     /// CAD-547 `app_approve` — the operator approves an installed app's
@@ -467,6 +595,25 @@ impl Shared {
             ))
         })?;
         let digest = crate::issue::app::digest(&pm_dir, project, name)?;
+        // CAD-577: the operator's one Approve derives the app's grants —
+        // exactly the scopes its workflow steps declare on their bound
+        // slots, to the agents the app's default team assigns those
+        // steps. The derivation records on the audit stream; a
+        // re-approval re-derives, so a dropped scope goes with it.
+        let derived = crate::issue::app::derive_grants(&pm_dir, project, name)?;
+        let grants: Vec<(String, String, String, Vec<String>)> = derived
+            .iter()
+            .map(|g| {
+                (
+                    g.agent.clone(),
+                    g.platform.clone(),
+                    g.account.clone(),
+                    g.scopes.clone(),
+                )
+            })
+            .collect();
+        self.store
+            .app_grants_set(&crate::issue::app::approval_key(project, name), &grants, "operator")?;
         let payload = json!({
             "project": project,
             "name": name,
@@ -474,6 +621,10 @@ impl Shared {
             "by": "operator",
             "at": crate::issue::time::iso(crate::issue::time::now_epoch()),
             "notes": notes,
+            "grants": derived.iter().map(|g| json!({
+                "agent": g.agent, "platform": g.platform,
+                "account": g.account, "scopes": g.scopes,
+            })).collect::<Vec<_>>(),
         });
         self.store.record_app_approval(payload.clone())?;
         self.wake();

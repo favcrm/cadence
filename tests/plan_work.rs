@@ -1632,6 +1632,224 @@ fn app_propose_gates_and_provenance() {
     assert!(!f.pm_dir.join("demo/apps/studio").exists());
 }
 
+/// The scopes of `agent`'s grant on `platform`/`account`, or `None`
+/// when it holds none — read through the operator's `platform_grants`
+/// (the store's own `platform_grant` is `pub(crate)` to the crate).
+fn grant_scopes(f: &PlanFixture, agent: &str, platform: &str, account: &str) -> Option<Vec<String>> {
+    let out = f.d.operator_rpc("platform_grants", json!({"agent": agent})).unwrap();
+    out["grants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["platform"] == platform && g["account"] == account)
+        .map(|g| {
+            g["scopes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|s| s.as_str().map(str::to_string))
+                .collect()
+        })
+}
+
+/// A role-placeholder app: its publish step names the `publisher`
+/// input as its agent and uses the `publish` slot, so the grant it
+/// derives depends on the team the operator sets (CAD-577).
+const ROLE_APP_MD: &str = "---\napp: roles\ntitle: Roles\nversion: 0.1.0\nneeds:\n  connections: [publish]\n---\n\nbody\n";
+const ROLE_APP_WF: &str = "---\ntitle: \"Go: {{title}}\"\ngoal: g\ninputs:\n  title: {}\n  publisher: {}\n---\n\n\
+## Work {{title}}\nagent: {{publisher}}\nuses: publish\n\n### Acceptance\n- [ ] done\n";
+
+fn app_install_roles(f: &PlanFixture) -> Value {
+    let src = app_src(
+        f,
+        "roles",
+        &[
+            ("app.md", ROLE_APP_MD),
+            ("workflows/go.md", ROLE_APP_WF),
+        ],
+    );
+    let (ok, out) = f.cli(&["app", "install", src.to_str().unwrap(), "--project", "demo"]);
+    assert!(ok, "app install roles: {out}");
+    out
+}
+
+/// CAD-577: app approval derives grants — exactly the scopes the
+/// workflow steps declare on their bound slots, to the agents the
+/// app's default team assigns those steps. The adversarial half:
+/// an agent cannot obtain a grant, a grant never exceeds the declared
+/// scope, another app's agents get nothing, and a structural change
+/// since approval revokes the grants.
+#[test]
+fn app_approval_derives_grants() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    f.d.register("qa-1");
+    f.d.register("other-1");
+    app_install_roles(&f);
+
+    // No team yet: approval derives nothing (the agent is unnamed).
+    f.d.operator_rpc("app_approve", json!({"project": "demo", "name": "roles"}))
+        .unwrap();
+    assert!(
+        f.d.operator_rpc("platform_grants", json!({})).unwrap()["grants"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "no team, no grants"
+    );
+
+    // The operator sets the team: dev-1 publishes.
+    let out = f
+        .d
+        .operator_rpc(
+            "app_set_team",
+            json!({"project": "demo", "name": "roles",
+                   "team": ["publisher=dev-1"]}),
+        )
+        .unwrap();
+    assert_eq!(out["team"]["publisher"], "dev-1", "{out}");
+
+    // Re-approve: the grant is derived for dev-1 on local/local with
+    // exactly the declared `publish` scope.
+    let out = f
+        .d
+        .operator_rpc("app_approve", json!({"project": "demo", "name": "roles"}))
+        .unwrap();
+    let grants = out["grants"].as_array().unwrap();
+    assert_eq!(grants.len(), 1, "{out}");
+    assert_eq!(grants[0]["agent"], "dev-1", "{out}");
+    assert_eq!(grants[0]["platform"], "local", "{out}");
+    assert_eq!(grants[0]["account"], "local", "{out}");
+    assert_eq!(grants[0]["scopes"], json!(["publish"]), "{out}");
+    let stored = grant_scopes(&f, "dev-1", "local", "local");
+    assert_eq!(stored.as_deref(), Some(&["publish".to_string()][..]));
+    // A grant never exceeds the declared scope: the scope set is exactly
+    // the slot name, never `*`.
+    assert!(!stored.unwrap().contains(&"*".to_string()));
+
+    // Another app's agents get nothing: install a second app whose
+    // team names other-1, approve it — dev-1's grant is untouched and
+    // other-1 gets only its own app's scope.
+    let src = app_src(
+        &f,
+        "other",
+        &[
+            (
+                "app.md",
+                "---\napp: other\ntitle: Other\nversion: 0.1.0\nneeds:\n  connections: [publish]\n---\n\nbody\n",
+            ),
+            (
+                "workflows/publish.md",
+                "---\ntitle: \"Go: {{title}}\"\ngoal: g\ninputs:\n  title: {}\n  publisher: {}\n---\n\n## Publish\nagent: {{publisher}}\nuses: publish\n\n### Acceptance\n- [ ] done\n",
+            ),
+        ],
+    );
+    let (ok, out) = f.cli(&["app", "install", src.to_str().unwrap(), "--project", "demo"]);
+    assert!(ok, "{out}");
+    f.d.operator_rpc(
+        "app_set_team",
+        json!({"project": "demo", "name": "other", "team": ["publisher=other-1"]}),
+    )
+    .unwrap();
+    f.d.operator_rpc("app_approve", json!({"project": "demo", "name": "other"}))
+        .unwrap();
+    assert_eq!(
+        grant_scopes(&f, "other-1", "local", "local").unwrap(),
+        vec!["publish".to_string()]
+    );
+    assert_eq!(
+        grant_scopes(&f, "dev-1", "local", "local").unwrap(),
+        vec!["publish".to_string()],
+        "another app's approval must not touch dev-1"
+    );
+
+    // An agent cannot obtain the grant: it is not a registered caller of
+    // `app_approve` or `app_set_team`.
+    let mut pane = LaneShell::spawn(f.tmp.path());
+    plant_pane(&f.d, "pane-9", pane.pid());
+    let r = pane.rpc(
+        &f.d.state,
+        "app_set_team",
+        json!({"project": "demo", "name": "roles", "team": ["publisher=other-1"]}),
+    );
+    assert_eq!(r["ok"], false, "agent set_team admitted: {r}");
+    let r = pane.rpc(
+        &f.d.state,
+        "app_approve",
+        json!({"project": "demo", "name": "roles"}),
+    );
+    assert_eq!(r["ok"], false, "agent approve admitted: {r}");
+
+    // A structural change since approval revokes the derived grants.
+    let (ok, _) = f.cli(&[
+        "app",
+        "set",
+        "roles",
+        "publish=publish-svc",
+        "--project",
+        "demo",
+    ]);
+    assert!(ok);
+    // The next propose reconciles: the app is no longer approved for its
+    // digest, so dev-1's derived grant is revoked.
+    let _ = f.d.operator_rpc(
+        "plan_propose",
+        json!({"project": "demo", "workflow": "roles/go",
+               "inputs": {"title": "x", "publisher": "dev-1"}}),
+    );
+    assert!(
+        grant_scopes(&f, "dev-1", "local", "local").is_none(),
+        "a structural change must revoke the derived grant"
+    );
+}
+
+/// CAD-577: revoking an app's approval revokes exactly the grants the
+/// approval derived — and never a hand-made grant's other scopes.
+#[test]
+fn app_revoke_revokes_derived_grants() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    app_install_roles(&f);
+    f.d.operator_rpc(
+        "app_set_team",
+        json!({"project": "demo", "name": "roles", "team": ["publisher=dev-1"]}),
+    )
+    .unwrap();
+    // A hand-made grant on the same account, with an extra scope.
+    f.d.operator_rpc(
+        "platform_grant",
+        json!({"agent": "dev-1", "platform": "local", "account": "local",
+               "scopes": ["publish", "other"]}),
+    )
+    .unwrap();
+    f.d.operator_rpc("app_approve", json!({"project": "demo", "name": "roles"}))
+        .unwrap();
+    assert_eq!(
+        grant_scopes(&f, "dev-1", "local", "local").unwrap(),
+        vec!["other".to_string(), "publish".to_string()]
+    );
+
+    // Revoke the app: the derived `publish` goes, the hand-made `other`
+    // survives.
+    f.d.operator_rpc("app_revoke", json!({"project": "demo", "name": "roles"}))
+        .unwrap();
+    assert_eq!(
+        grant_scopes(&f, "dev-1", "local", "local").unwrap(),
+        vec!["other".to_string()],
+        "revoke must take only the derived scopes"
+    );
+    // The app is unapproved again.
+    let err = f
+        .d
+        .operator_rpc(
+            "plan_propose",
+            json!({"project": "demo", "workflow": "roles/go",
+                   "inputs": {"title": "x", "publisher": "dev-1"}}),
+        )
+        .unwrap_err();
+    assert_eq!(err.code(), Some("app_unapproved"), "{err}");
+}
+
 /// CAD-547: install is safe on hostile input — a symlink anywhere in
 /// the bundle (or the source dir itself), an unknown top-level entry,
 /// a missing `app.md`, a missing or empty `workflows/`, a `uses:` the
@@ -1639,8 +1857,7 @@ fn app_propose_gates_and_provenance() {
 /// frontmatter key, a nested dir, an oversize file, and a source
 /// inside the tracker all refuse by name — and none lands a byte.
 #[test]
-fn app_install_refuses_hostile_input() {
-    let f = PlanFixture::start();
+fn app_install_refuses_hostile_input() {    let f = PlanFixture::start();
     f.d.register("dev-1");
     f.d.register("qa-1");
     let before = f.commits();

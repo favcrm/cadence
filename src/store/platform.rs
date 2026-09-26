@@ -31,6 +31,13 @@ pub const CREDENTIAL_REVOKED_EVENT: &str = "credential_revoked";
 /// for the same audit story.
 pub const PLATFORM_DEFAULT_EVENT: &str = "platform_default_set";
 
+/// CAD-577: the derived app grant events. An app's approval derives
+/// exactly the scopes its workflow steps declare on their bound slots,
+/// to the agents assigned to those steps; these events record the
+/// derivation and its revocation on the same audit stream.
+pub const APP_GRANTED_EVENT: &str = "app_granted";
+pub const APP_GRANTS_REVOKED_EVENT: &str = "app_grants_revoked";
+
 /// A custody record — what `platform_accounts` and every event carry.
 /// No field holds credential bytes; `custody` names the backend the
 /// bytes live in (ADR 0006 §5.3).
@@ -134,7 +141,16 @@ pub(super) const SCHEMA_V17: &str = "CREATE TABLE IF NOT EXISTS platform_credent
         account TEXT NOT NULL,
         set_at REAL NOT NULL,
         by TEXT NOT NULL,
-        PRIMARY KEY(project, platform));";
+        PRIMARY KEY(project, platform));
+     CREATE TABLE IF NOT EXISTS app_grants(
+        app TEXT NOT NULL,
+        agent TEXT NOT NULL,
+        platform TEXT NOT NULL,
+        account TEXT NOT NULL,
+        scopes TEXT NOT NULL,
+        granted_at REAL NOT NULL,
+        by TEXT NOT NULL,
+        PRIMARY KEY(app, agent, platform, account));";
 
 fn scopes_json(scopes: &[String]) -> Result<String> {
     Ok(serde_json::to_string(scopes)?)
@@ -627,7 +643,7 @@ impl Store {
                 |r| r.get(0),
             )
             .optional()?;
-        if enrolled.is_none() {
+        if enrolled.is_none() && !crate::platform::is_builtin(platform, account) {
             return Err(Error::rejected(format!(
                 "platform '{platform}' account '{account}' is not enrolled — \
                  `platform enroll` first"
@@ -698,5 +714,179 @@ impl Store {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    // ---------- CAD-577: app-derived grants ----------
+
+    /// Record the grants an app's approval derives: for each `(agent,
+    /// platform, account, scopes)` the app's workflow steps declare on
+    /// their bound slots, add a grant row and an `app_granted` audit
+    /// event in one transaction. The grants are the app's own —
+    /// `app_grants` records which app derived each, so revoking the
+    /// app's approval revokes exactly these and never a hand-made
+    /// grant. A re-approval re-derives: an existing app grant is
+    /// replaced with the current scope set.
+    pub fn app_grants_set(
+        &self,
+        app: &str,
+        grants: &[(String, String, String, Vec<String>)],
+        by: &str,
+    ) -> Result<()> {
+        let conn = self.write_conn()?;
+        let tx = conn.unchecked_transaction()?;
+        // The app's own prior grants go first — a re-approval
+        // re-derives, so a scope the new structure dropped is gone.
+        let prior: Vec<(String, String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT agent, platform, account FROM app_grants WHERE app=?1",
+            )?;
+            let rows = stmt.query_map(params![app], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?;
+            rows.flatten().collect()
+        };
+        for (agent, platform, account) in &prior {
+            tx.execute(
+                "DELETE FROM app_grants WHERE app=?1 AND agent=?2 AND platform=?3 \
+                 AND account=?4",
+                params![app, agent, platform, account],
+            )?;
+        }
+        tx.execute("DELETE FROM app_grants WHERE app=?1", params![app])?;
+        let mut granted = 0usize;
+        for (agent, platform, account, scopes) in grants {
+            identifier(agent, "Agent")?;
+            let mut scopes = scopes.clone();
+            scopes.sort();
+            scopes.dedup();
+            if scopes.is_empty() {
+                continue;
+            }
+            tx.execute(
+                "INSERT OR REPLACE INTO app_grants
+                 (app, agent, platform, account, scopes, granted_at, by)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![app, agent, platform, account, scopes_json(&scopes)?, now(), by],
+            )?;
+            // The platform grant is the UNION of the app's derived
+            // scopes and whatever the agent already held — a hand-made
+            // grant's other scopes survive the derivation (CAD-577).
+            let existing: Option<Grant> = tx
+                .query_row(
+                    "SELECT * FROM platform_grants WHERE agent=?1 AND platform=?2 \
+                     AND account=?3",
+                    params![agent, platform, account],
+                    grant_row,
+                )
+                .optional()?;
+            let merged: Vec<String> = match &existing {
+                Some(g) => {
+                    let mut all = g.scopes.clone();
+                    for s in &scopes {
+                        if !all.contains(s) {
+                            all.push(s.clone());
+                        }
+                    }
+                    all.sort();
+                    all
+                }
+                None => scopes.clone(),
+            };
+            tx.execute(
+                "INSERT OR REPLACE INTO platform_grants
+                 (agent, platform, account, scopes, granted_at, by)
+                 VALUES(?1,?2,?3,?4,?5,?6)",
+                params![agent, platform, account, scopes_json(&merged)?, now(), by],
+            )?;
+            Self::event(
+                &tx,
+                PLATFORM_STREAM,
+                APP_GRANTED_EVENT,
+                json!({"app": app, "agent": agent, "platform": platform,
+                       "account": account, "scopes": scopes, "by": by}),
+            )?;
+            granted += 1;
+        }
+        if granted == 0 {
+            // Nothing to grant — still record the derivation so the
+            // audit shows the app was approved with no scopes.
+            Self::event(
+                &tx,
+                PLATFORM_STREAM,
+                APP_GRANTED_EVENT,
+                json!({"app": app, "agents": 0, "by": by}),
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Revoke every grant an app's approval derived: the `app_grants`
+    /// rows go, and each `(agent, platform, account)`'s `platform_grants`
+    /// scopes shrink by exactly the app's derived set — a hand-made
+    /// grant's other scopes survive. Answers the `(agent, platform,
+    /// account)` triples whose platform grant changed, so the caller
+    /// can drain the waiting effects that lost a scope (CAD-506).
+    pub fn app_grants_revoke(
+        &self,
+        app: &str,
+        by: &str,
+    ) -> Result<Vec<(String, String, String)>> {
+        let conn = self.write_conn()?;
+        let tx = conn.unchecked_transaction()?;
+        let rows: Vec<(String, String, String, Vec<String>)> = {
+            let mut stmt = tx.prepare(
+                "SELECT agent, platform, account, scopes FROM app_grants WHERE app=?1",
+            )?;
+            let rows = stmt.query_map(params![app], |r| {
+                let scopes: String = r.get(3)?;
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, scopes_of(&scopes)))
+            })?;
+            rows.flatten().collect()
+        };
+        tx.execute("DELETE FROM app_grants WHERE app=?1", params![app])?;
+        let mut changed = Vec::new();
+        for (agent, platform, account, derived) in &rows {
+            let existing: Option<Grant> = tx
+                .query_row(
+                    "SELECT * FROM platform_grants WHERE agent=?1 AND platform=?2 \
+                     AND account=?3",
+                    params![agent, platform, account],
+                    grant_row,
+                )
+                .optional()?;
+            let Some(existing) = existing else {
+                continue;
+            };
+            let kept: Vec<String> = existing
+                .scopes
+                .iter()
+                .filter(|s| !derived.contains(s))
+                .cloned()
+                .collect();
+            if kept.is_empty() {
+                tx.execute(
+                    "DELETE FROM platform_grants WHERE agent=?1 AND platform=?2 \
+                     AND account=?3",
+                    params![agent, platform, account],
+                )?;
+            } else {
+                tx.execute(
+                    "UPDATE platform_grants SET scopes=?4 WHERE agent=?1 AND \
+                     platform=?2 AND account=?3",
+                    params![agent, platform, account, scopes_json(&kept)?],
+                )?;
+            }
+            Self::event(
+                &tx,
+                PLATFORM_STREAM,
+                APP_GRANTS_REVOKED_EVENT,
+                json!({"app": app, "agent": agent, "platform": platform,
+                       "account": account, "scopes": derived, "by": by}),
+            )?;
+            changed.push((agent.clone(), platform.clone(), account.clone()));
+        }
+        tx.commit()?;
+        Ok(changed)
     }
 }

@@ -338,6 +338,10 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         Rule::Handler("operator_connection (CAD-547)"),
     ),
     (
+        "app_revoke",
+        Rule::Handler("operator_connection (CAD-577)"),
+    ),
+    (
         "app_set_team",
         Rule::Handler("operator_connection (CAD-577)"),
     ),
