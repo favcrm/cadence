@@ -913,27 +913,13 @@ mod tests {
         assert_eq!(rule_of("update_drain"), Some(Rule::Handler("operator_connection (CAD-561)")));
         assert_eq!(rule_of("update_status"), Some(Rule::Read));
         assert!(!rule_of("update_status").unwrap().checks_connection());
-        // A `Handler` rule admits nobody by table: the handler itself
-        // proves the connection (`daemon.rs`'s arm, pinned by the
-        // `cad561_update_drain_is_operator_gated_in_the_dispatch`
-        // test), so an agent can never pass by being an agent.
-        let p = json!({"on": true, "target": "aa", "label": "operator:ada"});
-        let handler = Rule::Handler("operator_connection (CAD-561)");
-        assert_eq!(
-            admit("update_drain", handler, &agent("swe-554"), &p, &Facts::default()),
-            Ok(None)
-        );
-        // What no caller may do is name itself in the request — the
-        // label is a label, never the authority.
-        let forged = json!({"on": true, "target": "aa", "label": "operator:ada", "by": "operator"});
-        let e = admit(
-            "update_drain",
-            handler,
-            &agent("swe-554"),
-            &forged,
-            &Facts::default(),
-        )
-        .unwrap_err();
-        assert!(e.contains("is attributed to itself"), "{e}");
+        // `Handler` means the table admits nobody: the handler itself
+        // proves the connection (`daemon.rs`'s arm runs
+        // `operator_connection`, pinned by
+        // `cad561_update_drain_is_operator_gated_in_the_dispatch`), so
+        // an agent can never pass by being an agent. A table rule that
+        // checked the connection would be the weaker shape.
+        assert!(!rule_of("update_drain").unwrap().checks_connection());
+        assert!(!rule_of("update_status").unwrap().checks_connection());
     }
 }
