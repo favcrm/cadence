@@ -53,6 +53,9 @@ items = ["run(dispatch arm)"]
 [export]
 items = ["run(dispatch arm)"]
 
+[idea]
+items = ["IdeaAction", "run(dispatch arm)"]
+
 [inbox]
 items = ["InboxAction", "run(dispatch arm)"]
 
@@ -90,7 +93,7 @@ items = ["MessageAction", "run(dispatch arm)"]
 items = ["run(dispatch arm)"]
 
 [mod]
-items = ["Cli", "Commands", "TaskAction", "ReconcileStatus", "ReconcileStatus", "read_body", "read_body_capped", "report_result_text", "atty_stdin", "SteerArgs", "send_message", "daemon_lock_free", "wait_daemon_exit", "daemon_stop", "stale_holder", "busy_agents", "ui_run_args", "refuse_restart_over_leftovers", "daemon_restart", "run_inbox_exec", "inbox_exec_once", "run_audit_evidence", "fmt_age", "home_dir", "list_agents", "stamp_agent_projects", "resume_agent", "print_json", "shape_rows", "group_root_of", "group_members", "session_mismatch", "fenced_next", "resume_one", "finish_resume", "refresh_briefing", "resume_sweep", "resume_command", "stop_group", "EMAIL_FLAGS", "email_flag_error", "run", "UpdateTargetArgs", "UpdateTargetArgs", "UpgradeArgs", "UpdateArgs", "RealUpdateHost", "RealUpdateHost", "fd_is_path", "cadence_agent", "daemon_build_or_absent", "attach_agent", "ClaudeOpts", "DevinOpts", "split_cloud_params", "apply_cloud_params", "insert_devin_cloud_params", "CursorOpts", "CodexOpts", "launch_endpoint_kind", "provider_launch", "join_group", "UNKNOWN_AGENT", "lookup_agent", "found_or_absent", "refuse_endpoint_mismatch", "BriefMode", "BriefMode", "git", "create_worktree", "AGENTS_BEGIN", "AGENTS_END", "ROLE_BEGIN", "ROLE_END", "role_instructions", "brief_agent", "cloud_session_prompt", "briefing_body", "ensure_agents_block", "parse_duration", "attachable", "print_attachable", "attach_command", "cli_verbs"]
+items = ["Cli", "Commands", "TaskAction", "ReconcileStatus", "ReconcileStatus", "read_body", "read_body_capped", "report_result_text", "atty_stdin", "SteerArgs", "send_message", "daemon_lock_free", "wait_daemon_exit", "daemon_stop", "stale_holder", "busy_agents", "ui_run_args", "refuse_restart_over_leftovers", "daemon_restart", "run_inbox_exec", "inbox_exec_once", "run_audit_evidence", "fmt_age", "home_dir", "list_agents", "stamp_agent_projects", "resume_agent", "print_json", "shape_rows", "group_root_of", "caller_group", "group_members", "session_mismatch", "fenced_next", "resume_one", "finish_resume", "refresh_briefing", "resume_sweep", "resume_command", "stop_group", "EMAIL_FLAGS", "email_flag_error", "run", "UpdateTargetArgs", "UpdateTargetArgs", "UpgradeArgs", "UpdateArgs", "RealUpdateHost", "RealUpdateHost", "fd_is_path", "cadence_agent", "daemon_build_or_absent", "DAEMON_BUILD_TIMEOUT", "attach_agent", "ClaudeOpts", "DevinOpts", "split_cloud_params", "apply_cloud_params", "insert_devin_cloud_params", "CursorOpts", "CodexOpts", "launch_endpoint_kind", "provider_launch", "join_group", "UNKNOWN_AGENT", "lookup_agent", "found_or_absent", "refuse_endpoint_mismatch", "BriefMode", "BriefMode", "git", "create_worktree", "AGENTS_BEGIN", "AGENTS_END", "ROLE_BEGIN", "ROLE_END", "role_instructions", "brief_agent", "cloud_session_prompt", "briefing_body", "ensure_agents_block", "parse_duration", "attachable", "print_attachable", "attach_command", "cli_verbs"]
 
 [monitor]
 items = ["MonitorAction", "run_monitor", "run(dispatch arm)"]

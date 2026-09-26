@@ -368,7 +368,18 @@ pub fn valid_tag(tag: &str) -> bool {
 /// allowlist — `cadence report`'s `intake` + kind tags file into any
 /// project without seeding its vocabulary first.
 pub fn system_tag(tag: &str) -> bool {
-    matches!(tag, "intake" | "question" | "feedback" | "idea" | "bug")
+    matches!(
+        tag,
+        "intake"
+            | "question"
+            | "feedback"
+            | "idea"
+            | "bug"
+            | "plan-ready"
+            | "planned"
+            | "parked"
+            | "idea-stale"
+    )
 }
 
 /// The stored shape of a tag list: every tag well-formed, sorted,

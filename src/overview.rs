@@ -724,7 +724,10 @@ impl Audience {
             // CAD-484: an idle lane with no safe next step is the
             // operator's call too.
             "approval" | "fenced" | "question" | "plan" | "blocked" | "stopped"
-            | "next_action" => Self::Operator,
+            | "next_action"
+            // CAD-139: a researched idea waiting on the operator, and a
+            // near-duplicate the pipeline linked instead of researching.
+            | "idea_plan" | "idea_duplicate" => Self::Operator,
             // CAD-431: the merge decision, a review that did not
             // converge, one nobody can take, and auto-merge left on a
             // moved head are the operator's.
@@ -2924,7 +2927,13 @@ fn overview_from(
                 || open_pr_branches
                     .iter()
                     .any(|b| b.starts_with(&branch_prefix));
-            if v.status == "review" && !open_pr {
+            let gate_tag = v
+                .issue
+                .front
+                .tags
+                .iter()
+                .any(|t| matches!(t.as_str(), "plan-ready" | "parked" | "idea-stale"));
+            if v.status == "review" && !open_pr && !gate_tag {
                 needs.push(
                     item(
                         70,
@@ -3129,6 +3138,45 @@ fn overview_from(
                     row.json["escalated_by"] = up.get("by").cloned().unwrap_or(Value::Null);
                     needs.push(row);
                 }
+            }
+            // CAD-139: the idea pipeline stops here. The operator
+            // approves, rejects, or parks; nothing else is dispatched.
+            if v.status == "review" && v.issue.front.tags.iter().any(|t| t == "plan-ready") {
+                needs.push(
+                    item(
+                        20,
+                        "idea_plan",
+                        &format!(
+                            "idea plan ready for your decision — {id} {}",
+                            v.issue.front.title
+                        ),
+                        age,
+                        project,
+                        None,
+                        &format!("cadence idea decide {id} approve"),
+                    )
+                    .about("issue", id)
+                    .since(clock.since(v)),
+                );
+            }
+            if v.status == "backlog"
+                && v.issue.front.tags.iter().any(|t| t == "idea")
+                && v.issue.front.duplicate_of.is_some()
+            {
+                let other = v.issue.front.duplicate_of.as_deref().unwrap_or("");
+                needs.push(
+                    item(
+                        20,
+                        "idea_duplicate",
+                        &format!("{id} looks like {other} — decide whether to keep it"),
+                        age,
+                        project,
+                        None,
+                        &format!("cadence issue show {id}"),
+                    )
+                    .about("issue", id)
+                    .since(clock.since(v)),
+                );
             }
             // `cadence report` intake: a backlog-tagged row surfaces
             // until triage moves it off backlog — the effective status
@@ -4806,6 +4854,7 @@ mod tests {
             default_owner: None,
             build: None,
             memory: None,
+            intake: None,
         };
         // Path match against BUILD_ROOT (this crate's checkout) never
         // hits the temp clone — remote match does when remote differs…
@@ -4832,6 +4881,7 @@ mod tests {
             default_owner: None,
             build: None,
             memory: None,
+            intake: None,
         };
         assert!(build_repo_match(&[other]).is_none());
     }

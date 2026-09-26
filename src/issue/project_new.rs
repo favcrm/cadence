@@ -354,6 +354,7 @@ pub fn run(pm: &Pm, req: &Request, actor: &str, guarded: &[(&str, &Path)]) -> Re
                 default_owner: None,
                 build: None,
                 memory: None,
+                intake: None,
             })
             .map_err(|e| Error::internal(format!("project.yaml: {e}")))?;
             let file = dir.join("project.yaml");

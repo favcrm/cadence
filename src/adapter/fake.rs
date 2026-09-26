@@ -212,6 +212,22 @@ impl ProviderAdapter for FakeAdapter {
                 error: None,
             });
         }
+        // CAD-139: the architect turn returns the plan the idea body
+        // named, so a test can prove the gate without parsing the echo.
+        if prompt.contains("ROLE:architect") {
+            if let Some(plan) = prompt.split("FAKE_PLAN:").nth(1) {
+                let plan = plan.split("END_PLAN").next().unwrap_or("").trim();
+                if !plan.is_empty() {
+                    return Ok(TurnResult {
+                        turn_id,
+                        status: "completed".to_string(),
+                        text: plan.to_string(),
+                        stop_reason: Some("end_turn".to_string()),
+                        error: None,
+                    });
+                }
+            }
+        }
         let mut text = format!("{}FAKE_REPLY: {prompt}", pack_line.unwrap_or_default());
         if let Some(rest) = prompt.split("REPORT_SHA:").nth(1) {
             let hex: String = rest.chars().take_while(|c| c.is_ascii_hexdigit()).collect();

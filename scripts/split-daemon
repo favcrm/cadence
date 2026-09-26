@@ -135,6 +135,7 @@ SIBLINGS = (
     "next_action",
     "operator_rpc",
     "platform_rpc",
+    "idea_rpc",
 )
 
 # Test modules: they stay in the root verbatim (their module paths are

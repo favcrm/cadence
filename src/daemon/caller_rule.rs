@@ -297,6 +297,10 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         Rule::Handler("slot_identity or operator_evidence"),
     ),
     ("plan_approve", Rule::Handler("operator_connection")),
+    (
+        "idea_decide",
+        Rule::Handler("operator_connection (CAD-139)"),
+    ),
     ("plan_reject", Rule::Handler("operator_connection")),
     (
         "epic_stage",
