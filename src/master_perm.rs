@@ -628,7 +628,7 @@ pub fn allow_once(state_dir: &Path, id: &str, now: i64) -> Result<Request> {
         let req = pending(doc, id, now)?;
         req.status = "allowed".into();
         req.decision = "allow_once".into();
-        req.decision_label = "Allowed once".into();
+        req.decision_label = format!("Allowed once by operator {}", decision_hm(now));
         let req = req.clone();
         doc.grants.push(Grant {
             id: fresh_id("mg"),
@@ -1076,6 +1076,13 @@ pub fn rule_json(rule: &Rule) -> Value {
         "by": rule.by,
         "at": rule.at,
     })
+}
+
+/// `HH:MM` from an epoch second. The card shows this next to the
+/// operator, in UTC, because the daemon has no operator timezone.
+fn decision_hm(now: i64) -> String {
+    let day = now.rem_euclid(86_400);
+    format!("{:02}:{:02}", day / 3600, (day % 3600) / 60)
 }
 
 /// The wall clock the daemon uses. Tests pass their own `now`.
@@ -1566,9 +1573,18 @@ mod tests {
         )
         .unwrap();
         allow_once(dir.path(), &req.id, 1_000).unwrap();
-        let err = allow_once(dir.path(), &req.id, 1_001)
+        let again = allow_once(dir.path(), &req.id, 1_001)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("cannot be decided again"), "{err}");
+        assert!(again.contains("cannot be decided again"), "{again}");
+        let listed = board_requests(dir.path(), 1_002).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(
+            listed[0]
+                .decision_label
+                .starts_with("Allowed once by operator "),
+            "{}",
+            listed[0].decision_label
+        );
     }
 }
