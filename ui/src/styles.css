@@ -1325,3 +1325,13 @@ button.refchip:hover {
 .agent-update-detail summary { cursor: pointer; margin-top: .2rem; }
 .agent-update-detail p { white-space: pre-wrap; margin-top: .5rem; }
 .agent-update-detail[open] summary { color: var(--color-accent); }
+
+/* Header utilities: stable 32px targets, quiet at rest, explicit on focus. */
+.header-control-wrap { position: relative; display: inline-flex; }
+.header-icon { position: relative; display: inline-flex; align-items: center; justify-content: center; width: 2rem; height: 2rem; border-radius: .4rem; transition: background-color .15s, color .15s; }
+.header-icon:hover, .header-icon:focus-visible { background: var(--color-ink-800); color: var(--color-ink-100); }
+.header-icon:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
+.connection-dot { position: absolute; right: .35rem; bottom: .35rem; width: .3rem; height: .3rem; border-radius: 50%; background: var(--color-accent); box-shadow: 0 0 0 2px var(--color-ink-900); }
+.header-tooltip { position: absolute; top: calc(100% + .5rem); right: 0; z-index: 70; width: max-content; max-width: min(17rem, calc(100vw - 2rem)); padding: .5rem .65rem; border: 1px solid var(--color-ink-700); border-radius: .4rem; background: var(--color-ink-850); color: var(--color-ink-200); font-size: var(--text-label); line-height: 1.4; box-shadow: 0 4px 12px rgb(0 0 0 / .15); visibility: hidden; opacity: 0; pointer-events: none; }
+.header-control-wrap:hover .header-tooltip, .header-control-wrap:focus-within .header-tooltip { visibility: visible; opacity: 1; }
+@media (prefers-reduced-motion: reduce) { .header-icon { transition: none; } }
