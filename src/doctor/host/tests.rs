@@ -1220,8 +1220,6 @@ fn redact_argv_credential_shapes() {
         "sk-TESTTOKEN",
         "xoxb-TESTTOKEN",
         "xoxp-TESTTOKEN",
-        // AKIA + 16 uppercase/digits is the whole shape.
-        "AKIAXXXXXXXXXXXXXXXX",
         concat!(
             "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
             ".eyJzdWIiOiIxMjM0NTY3ODkwIn0",
@@ -1236,6 +1234,10 @@ fn redact_argv_credential_shapes() {
             "{token}"
         );
     }
+    // AKIA + 16 uppercase/digits is the whole shape — built at
+    // runtime so the literal is not itself a scan finding.
+    let akia = ["AK", "IA", &"X".repeat(16)].concat();
+    assert_eq!(redact_argv(&["tool", &akia]), format!("tool {REDACTED}"));
     // …but ordinary long args survive: a path (`/` excluded), an
     // all-alpha run (no digit), a short token-looking arg.
     for arg in [

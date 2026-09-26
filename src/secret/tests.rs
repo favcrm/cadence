@@ -114,6 +114,230 @@ fn gitleaks_pack_rules_fire() {
     assert_eq!(rules(&found), vec!["aws-access-token"]);
 }
 
+/// CAD-440: the documented key shapes — Anthropic, OpenAI, GitHub,
+/// Slack, AWS — are reported. These are realistic (high-entropy)
+/// payloads; the regression table guards the shapes against a future
+/// rule edit losing them.
+#[test]
+fn documented_provider_shapes_are_reported() {
+    let upper = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let aa = ["A", "A"].concat();
+    for (rule, tok) in [
+        (
+            "cadence-anthropic-key",
+            [
+                token(&["sk", "-ant-", "api03-"].concat(), "doc-ant", 93),
+                aa.clone(),
+            ]
+            .concat(),
+        ),
+        (
+            "cadence-anthropic-key",
+            [
+                token(&["sk", "-ant-", "admin01-"].concat(), "doc-admin", 93),
+                aa,
+            ]
+            .concat(),
+        ),
+        (
+            "cadence-openai-project-key",
+            [
+                token(&["sk", "-proj-"].concat(), "doc-proj", 74),
+                ["T3", "BlbkFJ"].concat(),
+                noise("doc-proj-tail", 74),
+            ]
+            .concat(),
+        ),
+        (
+            "openai-api-key",
+            [
+                token(&["sk", "-"].concat(), "doc-legacy", 20),
+                ["T3", "BlbkFJ"].concat(),
+                noise("doc-legacy-tail", 20),
+            ]
+            .concat(),
+        ),
+        ("github-pat", token(&["gh", "p_"].concat(), "doc-ghp", 36)),
+        (
+            "github-app-token",
+            token(&["gh", "u_"].concat(), "doc-ghu", 36),
+        ),
+        (
+            "cadence-github-fine-grained-pat",
+            token(&["github", "_pat_"].concat(), "doc-fg", 82),
+        ),
+        (
+            "slack-bot-token",
+            [
+                "xo",
+                "xb-",
+                &"1".repeat(11),
+                "-",
+                &"2".repeat(12),
+                "-",
+                &noise("doc-xoxb", 30),
+            ]
+            .concat(),
+        ),
+        (
+            "slack-user-token",
+            [
+                "xo",
+                "xp-",
+                &"3".repeat(11),
+                "-",
+                &"4".repeat(12),
+                "-",
+                &"5".repeat(13),
+                "-",
+                &noise("doc-xoxp", 30),
+            ]
+            .concat(),
+        ),
+        (
+            "aws-access-token",
+            ["AK", "IA", &noise_from("doc-akia", 16, upper)].concat(),
+        ),
+        (
+            "aws-access-token",
+            ["AS", "IA", &noise_from("doc-asia", 16, upper)].concat(),
+        ),
+    ] {
+        let found = scan(&format!("notes\n{tok}\n"), None).unwrap();
+        assert_eq!(rules(&found), vec![rule], "{tok:?}");
+        assert_eq!(found[0].severity, Severity::Block, "{tok:?}");
+    }
+}
+
+/// CAD-440 acceptance 1–2: a token carrying a known provider prefix is
+/// reported however low its entropy — the prefix is the evidence and
+/// the entropy floor is not the only gate. Payloads here are one
+/// repeated character, the case the floor used to drop. The `LTAI` and
+/// `gldt-` rows are prefixes only the rule's own keyword documents —
+/// they fail if the rule-keyword half of the check is removed; the
+/// rest fail if the shared-prefix half is removed.
+#[test]
+fn prefixed_tokens_are_reported_regardless_of_entropy() {
+    for (rule, tok) in [
+        ("github-pat", ["gh", "p_", &"a".repeat(36)].concat()),
+        ("github-oauth", ["gh", "o_", &"b".repeat(36)].concat()),
+        ("github-app-token", ["gh", "u_", &"c".repeat(36)].concat()),
+        ("github-app-token", ["gh", "s_", &"d".repeat(36)].concat()),
+        (
+            "github-refresh-token",
+            ["gh", "r_", &"e".repeat(36)].concat(),
+        ),
+        (
+            "cadence-github-fine-grained-pat",
+            ["github", "_pat_", &"f".repeat(82)].concat(),
+        ),
+        (
+            "cadence-anthropic-key",
+            ["sk", "-ant-", "api03-", &"g".repeat(40)].concat(),
+        ),
+        (
+            "cadence-anthropic-key",
+            ["sk", "-ant-", "api03-", &"h".repeat(93), "A", "A"].concat(),
+        ),
+        (
+            "cadence-openai-project-key",
+            ["sk", "-proj-", &"i".repeat(48)].concat(),
+        ),
+        (
+            "openai-api-key",
+            [
+                "sk",
+                "-",
+                &"j".repeat(20),
+                &["T3", "BlbkFJ"].concat(),
+                &"k".repeat(20),
+            ]
+            .concat(),
+        ),
+        (
+            "slack-bot-token",
+            [
+                "xo",
+                "xb-",
+                &"1".repeat(11),
+                "-",
+                &"2".repeat(12),
+                "-",
+                &"a".repeat(30),
+            ]
+            .concat(),
+        ),
+        (
+            "slack-user-token",
+            [
+                "xo",
+                "xp-",
+                &"3".repeat(11),
+                "-",
+                &"4".repeat(12),
+                "-",
+                &"5".repeat(13),
+                "-",
+                &"b".repeat(30),
+            ]
+            .concat(),
+        ),
+        ("aws-access-token", ["AK", "IA", &"A".repeat(16)].concat()),
+        ("aws-access-token", ["AS", "IA", &"B".repeat(16)].concat()),
+        ("cadence-npm-token", ["np", "m_", &"c".repeat(36)].concat()),
+        (
+            "cadence-gitlab-pat",
+            ["gl", "pat-", &"d".repeat(20)].concat(),
+        ),
+        ("cadence-devin-key", ["dv", "n_", &"e".repeat(24)].concat()),
+        (
+            "cadence-figma-token",
+            ["fig", "d_", &"f".repeat(40)].concat(),
+        ),
+        (
+            "cadence-google-api-key",
+            ["AI", "za", &"g".repeat(35)].concat(),
+        ),
+        (
+            "alibaba-access-key-id",
+            ["LT", "AI", &"h".repeat(20)].concat(),
+        ),
+        (
+            "gitlab-deploy-token",
+            ["gl", "dt-", &"i".repeat(20)].concat(),
+        ),
+    ] {
+        let found = scan(&format!("notes\n{tok}\n"), None).unwrap();
+        assert_eq!(rules(&found), vec![rule], "{tok:?}");
+        assert_eq!(found[0].severity, Severity::Block, "{tok:?}");
+        // And the write path refuses it outright.
+        let err = guard_with("w", &format!("leak: {tok}"), &Allowlist::default()).unwrap_err();
+        assert_eq!(err.code(), Some("secret_detected"), "{tok:?}");
+    }
+}
+
+/// CAD-440 acceptance 3: the floor still stands for anything that is
+/// not a known prefix — a bare repeated string matches no rule, a
+/// keyword-context low-entropy value keeps its entropy gate, and a
+/// prefix alone without a documented token shape is not a finding.
+#[test]
+fn unprefixed_repeated_strings_are_not_reported() {
+    for text in [
+        "z".repeat(36),
+        "ab".repeat(18),
+        // A keyword-context match keeps its entropy gate when the value
+        // carries no prefix.
+        format!("key = \"{}\"", "a1".repeat(16)),
+        format!("key = {}", "cd".repeat(16)),
+        // A known prefix without a documented token shape is nothing.
+        format!("{}{}", ["gh", "p_"].concat(), "a".repeat(10)),
+        format!("{}{}", ["sk", "-ant-", "api03-"].concat(), "e".repeat(10)),
+    ] {
+        let found = scan(&text, None).unwrap();
+        assert!(found.is_empty(), "{text:?}: {found:?}");
+    }
+}
+
 #[test]
 fn generic_api_key_is_warn_only() {
     let text = format!("config:\n  api_key = \"{}\"\n", noise("generic", 24));
@@ -280,6 +504,20 @@ const KNOWN_FIXTURES: &[(&str, &str, &str)] = &[
         "38ca332b7f3cb6b0",
     ),
     ("src/issue/report.rs", "generic-api-key", "372da3044cd499ab"),
+    // Scrubber fixtures whose `figd_`/`sk-` prefix used to hide behind
+    // the entropy floor; the CAD-440 prefix bypass now reports them.
+    ("src/session.rs", "generic-api-key", "4bffce134e74353c"),
+    ("src/session.rs", "cadence-figma-token", "008cd4db317d18e2"),
+    (
+        "src/doctor/host/tests.rs",
+        "cadence-argv-secret",
+        "8e18f04dd9e0ac91",
+    ),
+    (
+        "src/doctor/host/tests.rs",
+        "cadence-argv-secret",
+        "2f222aa5a5cec4d8",
+    ),
 ];
 
 /// The repo's own source has no credential-shaped string beyond the known
