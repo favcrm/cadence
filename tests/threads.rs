@@ -3119,6 +3119,14 @@ fn cad602_agentic_model_rpc_and_http_refuse() {
         .unwrap()
         .push(serde_yaml::Value::String("cursor/grok-4.7-high".into()));
     std::fs::write(&policy_path, serde_yaml::to_string(&policy).unwrap()).unwrap();
+    let models = d.operator_rpc("master_models", json!({})).unwrap();
+    let cursor = models["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "cursor/grok-4.7-high")
+        .unwrap();
+    assert_eq!(cursor["allowed_for"], json!(["worker"]), "{cursor}");
     let mut wk = ManagedWorker::start(d, "wk602");
     for src in ["self", "child"] {
         let frame = wk.rpc(
