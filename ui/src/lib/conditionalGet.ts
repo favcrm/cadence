@@ -17,7 +17,10 @@ export class ConditionalGet {
       headers: { ...headers, ...(previous ? { "If-None-Match": previous.etag } : {}) },
       cache: "no-store",
     });
-    if (response.status === 304 && previous && scope === this.identity()) {
+    if (scope !== this.identity()) {
+      throw new Error("Session changed during request; retry with the current session");
+    }
+    if (response.status === 304 && previous) {
       return { response, value: previous.value as T };
     }
     if (!response.ok) {

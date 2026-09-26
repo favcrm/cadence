@@ -24,10 +24,10 @@ async function main() {
   equal((await client.get("/api/issues", {})).value, undefined, "refusal removes old data");
   let resolve!: (response: Response) => void;
   const delayed = new ConditionalGet((() => new Promise<Response>((r) => { resolve = r; })) as typeof fetch, () => session);
-  const pending = delayed.get("/api/outbox", {});
+  const pending = delayed.get("/api/outbox", {}).then(() => false, () => true);
   session = "new";
   resolve(new Response('{"secret":true}', { headers: { ETag: '"secret"' } }));
-  await pending;
+  equal(await pending, true, "old credential response is rejected, not returned to the caller");
   const next = delayed.get("/api/outbox", {});
   resolve(new Response(null, { status: 304 }));
   equal((await next).value, undefined, "old credential request cannot populate new cache");
