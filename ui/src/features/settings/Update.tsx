@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError } from "../../lib/api";
 import { useWriteBlock } from "../auth/WriteGate";
+import Button from "../../ui/Button";
 import { fmtTime } from "../../lib/fmt";
 import type { UpdateStatus, WaitingTurn } from "../../lib/types";
 
@@ -110,24 +111,23 @@ export default function Update({ viewer }: { viewer: { readOnly: boolean; operat
             </div>
           </div>
           <div className="flex gap-2">
-            <button
-              type="button"
-              className="btn"
+            <Button
               onClick={() => void runCheck()}
               disabled={busy !== null || running}
+              loading={busy === "check" || status?.checking}
               title={blocked ?? undefined}
             >
               {busy === "check" || status?.checking ? "Checking…" : "Check for updates"}
-            </button>
-            <button
-              type="button"
-              className="btn btn-primary"
+            </Button>
+            <Button
+              variant="primary"
               onClick={() => void start()}
               disabled={busy !== null || running || !viewer.operator || report === null || report.up_to_date}
+              loading={running}
               title={blocked ?? (report?.up_to_date ? "Already up to date." : undefined)}
             >
               {running ? "Updating…" : "Update"}
-            </button>
+            </Button>
           </div>
         </div>
 

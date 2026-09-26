@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { fmtBytes } from "../../lib/fmt";
 import type { Route } from "../../lib/router";
 import { navigate } from "../../lib/useLocation";
+import Button from "../../ui/Button";
 import Link from "../../ui/Link";
 import Md from "../../ui/Md";
 import { IconCaret } from "../../ui/icons";
@@ -20,7 +21,6 @@ import { baseName, joinPath, parentPath } from "./paths";
 import { relTime } from "./history";
 import { kindLabel, previewKind } from "./preview";
 import {
-  Btn,
   Crumbs,
   EmptyCard,
   Failure,
@@ -345,9 +345,9 @@ function BrowsePane({
             <span className="num">{path}</span> is private to its owner. Agents see their own
             folder, their project folders, and everything read-only.
             <div className="mt-2">
-              <Btn href={navHref({ screen: "wiki", mode: "browse", path: null, query: null })}>
+              <Button href={navHref({ screen: "wiki", mode: "browse", path: null, query: null })}>
                 Back to {WIKI_ROOT_LABEL}
-              </Btn>
+              </Button>
             </div>
           </EmptyCard>
         </>
@@ -403,10 +403,10 @@ function BrowsePane({
         value={creating.value}
         onChange={(e) => setCreating({ ...creating, value: e.target.value })}
       />
-      <Btn accent onClick={() => void write()} disabled={busy}>
+      <Button variant="primary" onClick={() => void write()} disabled={busy}>
         create
-      </Btn>
-      <Btn onClick={() => setCreating(null)}>cancel</Btn>
+      </Button>
+      <Button onClick={() => setCreating(null)}>cancel</Button>
     </form>
   );
 
@@ -418,19 +418,19 @@ function BrowsePane({
         <div className="wk-bar">
           <Crumbs path={path} hrefFor={(p) => navHref({ screen: "wiki", mode: "browse", path: p || null, query: null })} />
           <div className="wk-tools">
-            <Btn disabled={writeBlocked} onClick={() => setCreating({ kind: "page", value: "" })}>
+            <Button disabled={writeBlocked} onClick={() => setCreating({ kind: "page", value: "" })}>
               New page
-            </Btn>
-            <Btn disabled={writeBlocked} onClick={() => setCreating({ kind: "dir", value: "" })}>
+            </Button>
+            <Button disabled={writeBlocked} onClick={() => setCreating({ kind: "dir", value: "" })}>
               New folder
-            </Btn>
-            <Btn
+            </Button>
+            <Button
               href={navHref({ screen: "wiki", mode: "upload", path: path || null, query: null })}
               disabled={writeBlocked}
             >
               Upload
-            </Btn>
-            <Btn href={navHref({ screen: "wiki", mode: "search", path: null, query: null })}>Search</Btn>
+            </Button>
+            <Button href={navHref({ screen: "wiki", mode: "search", path: null, query: null })}>Search</Button>
           </div>
         </div>
         {locked && (
@@ -463,16 +463,16 @@ function BrowsePane({
       <div className="wk-bar">
         <Crumbs path={page.path} hrefFor={(p) => navHref({ screen: "wiki", mode: "browse", path: p || null, query: null })} />
         <div className="wk-tools">
-          <Btn href={navHref({ screen: "wiki", mode: "search", path: null, query: null })}>Search</Btn>
+          <Button href={navHref({ screen: "wiki", mode: "search", path: null, query: null })}>Search</Button>
         </div>
       </div>
       {!isPage && (
         <div className="wk-bar wk-bar-tight">
           <div className="wk-tools wk-tools-left">
-            <Btn href={navHref({ screen: "wiki", mode: "browse", path: dir || null, query: null })}>Back</Btn>
+            <Button href={navHref({ screen: "wiki", mode: "browse", path: dir || null, query: null })}>Back</Button>
           </div>
           <div className="wk-tools">
-            <a className="wk-btn" href={wikiFileUrl(page.path)} download>
+            <a className="btn" href={wikiFileUrl(page.path)} download>
               Download
             </a>
           </div>
@@ -497,15 +497,15 @@ function BrowsePane({
               ) : null}
             </span>
             <div className="wk-tools">
-              <Btn href={navHref({ screen: "wiki", mode: "history", path: page.path, query: null })}>History</Btn>
-              <Btn
-                accent
+              <Button href={navHref({ screen: "wiki", mode: "history", path: page.path, query: null })}>History</Button>
+              <Button
+                variant="primary"
                 disabled={readOnly}
                 title={readOnly ? "writes are disabled — sign in as the operator" : undefined}
                 href={readOnly ? undefined : navHref({ screen: "wiki", mode: "edit", path: page.path, query: null })}
               >
                 Edit
-              </Btn>
+              </Button>
             </div>
           </div>
           <div className="md card pad wk-md issue-reader">
@@ -540,7 +540,7 @@ function BlobPane({ page, blob }: { page: WikiPage; blob: ReturnType<typeof prev
             <div className="wk-ebody">
               this type has no inline preview — download it, or open it with the tool it belongs to.
             </div>
-            <a className="wk-btn wk-btn-acc" href={wikiRawUrl(page.path)} download>
+            <a className="btn btn-primary" href={wikiRawUrl(page.path)} download>
               Download
             </a>
           </div>

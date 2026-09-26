@@ -6,6 +6,7 @@ import { resources, threadReader } from "../../lib/resources";
 import { streamInto, type SseErrorState } from "../../lib/sse";
 import { useQuery, useResource } from "../../lib/useResource";
 import type { MasterCommandResult, Overview, ThreadRef } from "../../lib/types";
+import Button from "../../ui/Button";
 import Md from "../../ui/Md";
 import {
   composerBlock,
@@ -773,13 +774,15 @@ function Composer({
         <p className="text-micro text-ink-500 min-w-0 flex-1 break-words" data-composer-block={block ? "" : undefined}>
           {block ?? (slash ? "Enter runs the command · Tab completes" : "Enter sends · Shift+Enter for a new line")}
         </p>
-        <button
+        <Button
           type="submit"
+          variant="primary"
+          size="sm"
+          className="sendbtn shrink-0"
           disabled={!!block || !draft.trim()}
-          className="sendbtn h-8 px-3 rounded bg-accent text-on-accent text-label font-medium disabled:opacity-40 shrink-0"
         >
           {slash ? "Run" : "Send"}
-        </button>
+        </Button>
       </div>
     </form>
   );
