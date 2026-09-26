@@ -261,11 +261,8 @@ fn production_dirs(sb: &Sandbox, exported: bool) -> Result<Vec<(&'static str, Pa
     ];
     // A daemon started without XDG_STATE_HOME lives here even when this
     // shell sets it.
-    if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
-        dirs.push((
-            "the production state dir",
-            PathBuf::from(home).join(".local/state/cadence"),
-        ));
+    if std::env::var_os("HOME").is_some_and(|h| !h.is_empty()) {
+        dirs.push(("the production state dir", crate::home::local_state_dir()?));
     }
     if exported && profile().as_deref() != Some(sb.name.as_str()) {
         if let Some(d) = std::env::var_os("CADENCE_STATE_DIR") {
@@ -273,6 +270,9 @@ fn production_dirs(sb: &Sandbox, exported: bool) -> Result<Vec<(&'static str, Pa
         }
         if let Some(d) = std::env::var_os("CADENCE_PM_DIR") {
             dirs.push(("the exported CADENCE_PM_DIR", PathBuf::from(d)));
+        }
+        if let Some(d) = std::env::var_os("CADENCE_HOME") {
+            dirs.push(("the exported CADENCE_HOME", PathBuf::from(d)));
         }
     }
     Ok(dirs)

@@ -31,6 +31,7 @@
 mod agent_uid;
 mod config;
 mod disk;
+mod layout;
 mod load;
 mod memory;
 mod orphans;
@@ -532,6 +533,7 @@ pub fn run(scan: &Scan) -> Value {
         check_worktrees(scan),
         check_load(scan),
         check_config(scan),
+        check_layout(scan),
         check_tailnet(scan),
         check_agent_uid(),
     ];
@@ -649,6 +651,8 @@ use agent_uid::check_agent_uid;
 use config::check_config;
 #[allow(unused_imports)]
 use disk::{check_disk, fs_level};
+#[allow(unused_imports)]
+use layout::check_layout;
 #[allow(unused_imports)]
 use load::check_load;
 #[allow(unused_imports)]

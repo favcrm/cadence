@@ -187,13 +187,21 @@ fn legacy_tracker_dir() -> Result<PathBuf> {
     Ok(user_home()?.join("pm"))
 }
 
+/// `~/.local/state/cadence` — where a process without
+/// `XDG_STATE_HOME` keeps runtime state, whatever the layout. The
+/// sandbox guard compares against it because a daemon started
+/// without `XDG_STATE_HOME` lives here even when this shell sets it.
+pub fn local_state_dir() -> Result<PathBuf> {
+    let home = std::env::var("HOME")
+        .map_err(|_| Error::internal("Cannot locate HOME for state directory"))?;
+    Ok(PathBuf::from(home).join(".local/state/cadence"))
+}
+
 /// The pre-`CADENCE_HOME` state default: `$XDG_STATE_HOME/cadence`,
 /// else `~/.local/state/cadence`.
 fn legacy_state_dir() -> Result<PathBuf> {
     if let Ok(dir) = std::env::var("XDG_STATE_HOME") {
         return Ok(PathBuf::from(dir).join("cadence"));
     }
-    let home = std::env::var("HOME")
-        .map_err(|_| Error::internal("Cannot locate HOME for state directory"))?;
-    Ok(PathBuf::from(home).join(".local/state/cadence"))
+    local_state_dir()
 }

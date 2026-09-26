@@ -27,7 +27,6 @@
 //! restarted daemon reports the request `closed`.
 
 use std::io::{BufRead, Write};
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -52,10 +51,7 @@ const RETRY: Duration = Duration::from_millis(500);
 /// Serve MCP over stdio until stdin closes.
 pub fn run(timeout_secs: Option<u64>) -> Result<i32> {
     let alias = std::env::var("CADENCE_ALIAS").ok();
-    let state_dir = std::env::var("CADENCE_STATE_DIR")
-        .ok()
-        .map(PathBuf::from)
-        .or_else(|| client::state_dir().ok());
+    let state_dir = client::state_dir().ok();
     let timeout = timeout_secs
         .or_else(|| {
             std::env::var("CADENCE_PERMISSION_TIMEOUT_SECS")
