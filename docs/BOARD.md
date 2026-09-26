@@ -140,6 +140,40 @@ the identical `name@version` — a silent `npm update` drifts the
 install away from the pin and refuses the next launch instead of
 loading an unvetted build.
 
+### Which models to use
+
+- **devin** models are the worker/reviewer path — check
+  `devin models list` for cost_tier: `swe-2-{high,medium,max}` are
+  **Free**; `deepseek-v4-1-flash-*` is low cost, not free. Default:
+  `devin/swe-2-high` + `--effort max` (SWE-2 Max); DeepSeek V4.1 Flash
+  Max (`devin/deepseek-v4-1-flash-high` + `--effort max`) is the
+  low-cost alternative. Switch a live agent with
+  `agent set <alias> --next-launch model=… effort=max`, then
+  stop + resume.
+  The devin provider exists only because the pinned `pi-devin` package
+  loads with `-e` — a daemon built before CAD-559 launches workers as
+  `--no-extensions` with no `-e`, so the model resolves nowhere and pi
+  exits ("Model \"devin/…\" not found" → the agent fences with
+  "Pi process disconnected"). Check `readlink ~/.local/bin/cadence`
+  before dispatching on a devin model.
+- **`openrouter/*` is the paid path** — do not route workers or
+  reviewers through it. The production master's pinned
+  `openrouter/z-ai/glm-5.3-flash` is the one accepted exception.
+- Verify by hand as the operator:
+  `pi --list-models -e ~/.pi/agent/npm/node_modules/pi-devin/extensions/index.ts | grep devin`
+  (shows `devin deepseek-v4-1-flash-high`, 1.0M ctx, reasoning+tools)
+  and a one-shot
+  `pi -p "Reply with exactly: ok" --no-extensions -e <that path> --model devin/deepseek-v4-1-flash-high`.
+- If deepseek returns `Your Windsurf version is out of date` while
+  `devin/swe-2-high` works and `devin` CLI runs deepseek fine, the
+  backend is gating the `ide` field, not the version: `pi-devin` ≤ 0.2.1
+  sends `ide="devin-desktop"` on every request and Cognition
+  version-gates that ide for non-Local models. Fix in the installed
+  package (`src/stream.ts` `buildMetadata` call): send
+  `ide="windsurf"` unless the model uid starts with `gpt-5-6-` — Devin
+  Local-only models still need `devin-desktop`. Reinstalling the pinned
+  package reverts the patch.
+
 ## `cadence issue` — the only writer
 
 ```bash
