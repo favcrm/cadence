@@ -2,6 +2,7 @@
 app: blog-post
 title: Blog post
 version: 0.1.0
+summary: Get a post written, checked and published — you only step in to approve.
 needs:
   connections: [publish]
 ---

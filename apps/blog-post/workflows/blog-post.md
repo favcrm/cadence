@@ -1,6 +1,7 @@
 ---
 title: "Blog post: {{topic}}"
 goal: "A reviewed post about {{topic}}, staged on the publish slot for the operator to release"
+label: New post
 inputs:
   topic:      { ask: "What should the post be about?" }
   slug:       { ask: "Folder name under posts/ (lowercase, hyphens)" }
