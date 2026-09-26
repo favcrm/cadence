@@ -74,12 +74,28 @@ struct DecideReq {
     reason: Option<String>,
 }
 
+/// `POST /api/ideas/<id>/decide`. Unknown fields are refused here so a
+/// forged `by` never reaches the daemon.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IdeaDecideReq {
+    action: String,
+    reason: Option<String>,
+    park_until: Option<String>,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AnswerReq {
     /// The question report's file name on the same ticket.
     question: String,
     text: String,
+}
+
+/// The issue id of `POST /api/ideas/<id>/decide`.
+pub(super) fn idea_route(path: &str) -> Option<&str> {
+    let id = path.strip_prefix("/api/ideas/")?.strip_suffix("/decide")?;
+    (!id.is_empty() && !id.contains('/')).then_some(id)
 }
 
 /// `(epic, verb)` for `/api/plans/<epic>/<verb>`, `None` when the path
@@ -311,6 +327,51 @@ pub(super) fn decide_plan(
     match client::rpc(state_dir, method, params) {
         Ok(out) => json_response(out),
         Err(e) => rpc_err(&e, method),
+    }
+}
+
+/// `POST /api/ideas/<id>/decide` (CAD-139). The board relays
+/// `idea_decide`; the daemon's operator connection is the gate.
+pub(super) fn decide_idea(
+    request: &mut Request,
+    state_dir: &std::path::Path,
+    id: &str,
+) -> HttpResp {
+    let Ok(id) = model::check_id(id) else {
+        return err_response(400, "bad idea id");
+    };
+    let bytes = match read_body(request, BODY_CAP) {
+        Ok(bytes) => bytes,
+        Err(resp) => return resp,
+    };
+    let req: IdeaDecideReq = match parse_json(&bytes) {
+        Ok(req) => req,
+        Err(resp) => return resp,
+    };
+    let action = req.action.trim();
+    if !matches!(action, "approve" | "reject" | "park") {
+        return err_response(400, "action must be approve, reject, or park");
+    }
+    let mut params = json!({ "issue": id, "action": action });
+    if let Some(reason) = req
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        params["reason"] = json!(reason);
+    }
+    if let Some(until) = req
+        .park_until
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        params["park_until"] = json!(until);
+    }
+    match client::rpc(state_dir, "idea_decide", params) {
+        Ok(out) => json_response(out),
+        Err(e) => rpc_err(&e, "idea_decide"),
     }
 }
 

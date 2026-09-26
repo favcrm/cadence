@@ -6299,6 +6299,16 @@ impl PlanFixture {
         })
     }
 
+    /// CAD-139: the idea router runs only when the operator pings
+    /// `reports_changed`. A one-second period would race a test that
+    /// backdates `idea-pipeline.json` between passes.
+    pub fn start_idea_router() -> PlanFixture {
+        Self::start_with(daemon::ServeOptions {
+            report_router: Some(3600),
+            ..daemon_opts()
+        })
+    }
+
     /// `cli` as agent `alias` (its `CADENCE_ALIAS`), outside any pane.
     pub fn cli_as(&self, alias: &str, args: &[&str]) -> (bool, Value) {
         let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))

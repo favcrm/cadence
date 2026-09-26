@@ -523,6 +523,7 @@ mod tests {
             default_owner: None,
             build,
             memory: None,
+            intake: None,
         }
     }
 

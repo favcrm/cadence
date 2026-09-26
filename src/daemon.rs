@@ -26,6 +26,7 @@ mod checkup;
 mod delivery_rpc;
 mod dispatch_rpc;
 mod effect_rpc;
+mod idea_rpc;
 mod identity;
 mod jobs_rpc;
 mod lane_rpc;
@@ -362,6 +363,8 @@ pub struct Shared {
     /// CAD-431: serializes every transition of the worker loop's
     /// record (`delivery.json`).
     delivery_lock: Mutex<()>,
+    /// CAD-139: serializes idea-pipeline.json and the operator decision.
+    idea_lock: Mutex<()>,
     /// The actor's empty-queue poll — the backstop behind its wake.
     idle_poll: Duration,
     /// CAD-445: serialises `<state>/master-wakes.json` (blocker epochs,
@@ -539,6 +542,7 @@ impl Shared {
             escalation_lock: Mutex::new(()),
             dispatch_lock: Mutex::new(()),
             delivery_lock: Mutex::new(()),
+            idea_lock: Mutex::new(()),
             wake_lock: Mutex::new(()),
             continuity_due: Mutex::new(HashMap::new()),
             auto_stop: AutoStopTimer::new(opts.auto_stop.clone(), opts.auto_stop_clock.clone()),
@@ -2563,6 +2567,7 @@ impl Shared {
             "approval_revoke" => self.rpc_approval_revoke(params, peer_pid),
             "plan_propose" => self.rpc_plan_propose(params, peer_pid),
             "plan_approve" => self.rpc_plan_decide(params, peer_pid, true),
+            "idea_decide" => self.rpc_idea_decide(params, peer_pid),
             "plan_reject" => self.rpc_plan_decide(params, peer_pid, false),
             "epic_stage" => self.rpc_epic_stage(params, peer_pid),
             "project_work_approve" => self.rpc_project_work_approve(params, peer_pid),

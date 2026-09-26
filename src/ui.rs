@@ -2050,6 +2050,15 @@ fn write_route(
     // The operator's plan decision (CAD-328 → CAD-360 RPCs) and answer
     // to a question report (CAD-341) — guarded, operator-only, inside
     // `home`.
+    if let Some(id) = home::idea_route(path) {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let resp = home::decide_idea(&mut request, state_dir, id);
+        send(request, resp);
+        return;
+    }
     if let Some((epic, verb)) = home::plan_route(path) {
         if *method != Method::Post {
             send(request, err_response(405, "method not allowed"));

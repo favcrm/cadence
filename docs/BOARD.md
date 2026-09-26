@@ -1388,6 +1388,8 @@ payload at read time — nothing is stored; `cadence overview [--json]
 |---|---|---|---|---|
 | 10 | `merge` — open PR with `qa-verdict=success` and green checks | team | the issue owner (`cadence/<id>-…` head branch) | `gh pr merge <n> --repo <slug> --squash --admin --match-head-commit <sha>` |
 | 20 | `approval` — a brokered permission request is open | operator | — | `cadence agent respond <a> --request <h> --decision accept` (provider input requests: `--answers-file <f>`) |
+| 20 | `idea_plan` — an idea in `review` tagged `plan-ready` (CAD-139). A `parked` or `idea-stale` review does not raise `review_no_pr` | operator | — | `cadence idea decide <id> approve` |
+| 20 | `idea_duplicate` — a backlog idea linked `duplicate_of` another open issue | operator | — | `cadence issue show <id>` |
 | 20 | `approval_menu` — a sampled pty approval menu | team | the agent's PM (`params.upstream`) | `cadence agent answer <a> <choice>` |
 | 30 | `fenced` — agent in `attention` | operator | — (only the operator may unfence or reconcile, CAD-374; the PM escalates) | `cadence agent unfence <a>` |
 | 40 | `stalled` — turn silent past the fence threshold | team | the agent's PM | `cadence agent show <a>` |

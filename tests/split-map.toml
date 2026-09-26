@@ -207,6 +207,7 @@ helpers = [
     "MASTER_PLAN",
     "REFLECTION",
     "impl:start_routed",
+    "impl:start_idea_router",
     "FAKE_GH_PY",
     "LOOP_PR",
     "LoopFixture",
@@ -220,6 +221,9 @@ helpers = [
     "CAD378_AREAS",
     "impl:cad378_lane",
 ]
+
+[binaries.idea_pipeline]
+tests = ["idea_pipeline_stops_at_the_gate_and_approval_creates_children"]
 
 [binaries.daemon]
 tests = [

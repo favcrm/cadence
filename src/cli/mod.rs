@@ -19,6 +19,7 @@ mod dispatch;
 mod doctor;
 mod events;
 mod export;
+mod idea;
 mod inbox;
 mod intake;
 mod interrupt;
@@ -74,6 +75,7 @@ use clap::Parser;
 use clap::Subcommand;
 use daemon::DaemonAction;
 use delivery::DeliveryAction;
+use idea::IdeaAction;
 use inbox::InboxAction;
 use intake::IntakeAction;
 use job::JobAction;
@@ -1023,6 +1025,12 @@ pub(crate) enum Commands {
     /// `reject`s it (operator connection only); until approved none of
     /// its tickets dispatch. `show` prints state, tickets and
     /// size-weighted progress.
+    /// Idea pipeline (CAD-139): research and a plan can run, then the
+    /// operator decides. Nothing is created until that decision.
+    Idea {
+        #[command(subcommand)]
+        action: IdeaAction,
+    },
     Plan {
         #[command(subcommand)]
         action: PlanAction,
@@ -3444,6 +3452,7 @@ pub(crate) fn run() -> Result<i32> {
         Commands::Monitor { action } => monitor::run(state_dir, action),
         Commands::Issue { action } => issue::run(state_dir, action),
         Commands::Platform { action } => platform::run(state_dir, action),
+        Commands::Idea { action } => idea::run(&state_dir, action),
         Commands::Plan { action } => plan::run(state_dir, action),
         Commands::Workflow { action } => workflow::run(state_dir, action),
         Commands::App { action } => app::run(state_dir, action),

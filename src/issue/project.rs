@@ -76,6 +76,40 @@ pub struct Project {
     pub build: Option<Build>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<MemoryPolicy>,
+    /// CAD-139: idea pipeline. Absent means research stays off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intake: Option<IntakePolicy>,
+}
+
+/// `[intake]` on a project — the idea pipeline's budget switch.
+/// `auto_research` defaults off so filing an idea spends nothing.
+/// `max_per_day` defaults to 3 research starts per UTC day.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntakePolicy {
+    #[serde(default)]
+    pub auto_research: bool,
+    #[serde(default = "default_idea_max_per_day")]
+    pub max_per_day: u32,
+}
+
+fn default_idea_max_per_day() -> u32 {
+    3
+}
+
+impl Default for IntakePolicy {
+    fn default() -> Self {
+        Self {
+            auto_research: false,
+            max_per_day: default_idea_max_per_day(),
+        }
+    }
+}
+
+impl Project {
+    pub fn intake_policy(&self) -> IntakePolicy {
+        self.intake.clone().unwrap_or_default()
+    }
 }
 
 /// `memory:` — project-memory retrieval policy (CAD-203).
