@@ -74,6 +74,13 @@ fn issue_ids(f: &PlanFixture) -> Vec<String> {
     ids
 }
 
+fn pipeline_state(f: &PlanFixture, id: &str) -> Option<String> {
+    let path = f.d.state.join("idea-pipeline.json");
+    let text = std::fs::read_to_string(&path).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    v["records"][id]["state"].as_str().map(str::to_string)
+}
+
 fn needs(f: &PlanFixture) -> Vec<Value> {
     overview_at(&f.tmp.path().join("home"), &f.d.state, Some(&f.pm_dir), &[])["needs_me"]
         .as_array()
@@ -87,28 +94,9 @@ fn needs(f: &PlanFixture) -> Vec<Value> {
 #[test]
 fn idea_pipeline_stops_at_the_gate_and_approval_creates_children() {
     let f = PlanFixture::start_idea_router();
-    let quiet = file_idea(&f, "quiet idea stays held\nthe switch is off");
-    ping(&f);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let events = f.daemon_events("intake_idea");
-        if events.iter().any(|e| e["issue"] == quiet) {
-            assert_eq!(
-                events.iter().find(|e| e["issue"] == quiet).unwrap()["auto_research"],
-                false
-            );
-            break;
-        }
-        assert!(Instant::now() < deadline, "no intake_idea for {quiet}");
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    assert_eq!(f.front(&quiet).status, "backlog");
-    assert!(!f.front(&quiet).tags.iter().any(|t| t == "plan-ready"));
-
-    let yaml = f.pm_dir.join("demo/project.yaml");
-    let mut text = std::fs::read_to_string(&yaml).unwrap();
-    text.push_str("\nintake:\n  auto_research: true\n  max_per_day: 1\n");
-    std::fs::write(&yaml, text).unwrap();
+    // The researcher exists before the idea is filed. With the switch
+    // off the record is `held` and no research message is queued. If
+    // the gate is removed, the same pass messages rsch-1 instead.
     std::fs::write(
         f.pm_dir.join("demo/team.yaml"),
         "roles:\n  researcher:\n    alias: rsch-1\n  architect:\n    alias: arch-1\n",
@@ -118,6 +106,34 @@ fn idea_pipeline_stops_at_the_gate_and_approval_creates_children() {
         f.d.register(alias);
         f.d.wait_agent(alias, "idle", 15);
     }
+    let quiet = file_idea(&f, "quiet idea stays held\nthe switch is off");
+    let quiet_research = format!("idea-r-{}", quiet.to_ascii_lowercase());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        ping(&f);
+        let events = f.daemon_events("intake_idea");
+        if events.iter().any(|e| e["issue"] == quiet) && pipeline_state(&f, &quiet).is_some() {
+            assert_eq!(
+                events.iter().find(|e| e["issue"] == quiet).unwrap()["auto_research"],
+                false
+            );
+            break;
+        }
+        assert!(Instant::now() < deadline, "no intake_idea for {quiet}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(pipeline_state(&f, &quiet).as_deref(), Some("held"));
+    assert!(
+        !message_ids(&f, "rsch-1").contains(&quiet_research),
+        "switch-off idea queued a research turn"
+    );
+    assert_eq!(f.front(&quiet).status, "backlog");
+    assert!(!f.front(&quiet).tags.iter().any(|t| t == "plan-ready"));
+
+    let yaml = f.pm_dir.join("demo/project.yaml");
+    let mut text = std::fs::read_to_string(&yaml).unwrap();
+    text.push_str("\nintake:\n  auto_research: true\n  max_per_day: 1\n");
+    std::fs::write(&yaml, text).unwrap();
 
     let (ok, dup_target) = f.cli(&[
         "issue",
