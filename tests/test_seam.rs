@@ -305,7 +305,14 @@ fn arming_refuses_the_production_state_dir() {
     let err = cadence_agent::test_seam::arm_if_requested(&default, true)
         .map(|_| ())
         .expect_err("the seam must refuse the production default state dir");
-    assert!(err.to_string().contains("default state dir"), "{err}");
+    // Which refusal fires first is env-dependent: when the env-derived
+    // default IS the real production dir the env-independent N1 bound
+    // answers before the default-dir check.
+    let msg = err.to_string();
+    assert!(
+        msg.contains("default state dir") || msg.contains("production state dir"),
+        "{msg}"
+    );
 }
 
 #[cfg(feature = "test-seam")]
