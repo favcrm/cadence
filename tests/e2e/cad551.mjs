@@ -93,12 +93,17 @@ async function main() {
     await appear(page, ".chip:has-text('% ctx')", "the context chip");
     await h1.scrollIntoViewIfNeeded();
     await page.evaluate(() => window.scrollBy(0, -60));
+    await page.waitForTimeout(400); // let chip-in entrances finish
     await shot(page, "01-header-chips.png");
+    // Back to the tail — the frame scroll unpins smart-scroll, and we want
+    // a clean follow-state for the rest of the run.
+    await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
 
     // ---- Slash autocomplete + command cards ----
     const box = page.getByLabel("message to the master");
     await box.fill("/");
     const menu = await appear(page, ".slashmenu", "the slash menu");
+    await page.waitForTimeout(400); // menu-in
     await expectText(menu, "Interrupt the running turn", "the menu lists commands");
     await shot(page, "02-slash-menu.png");
     // Escape closes it; a verb + Enter runs it and lands a card.
@@ -135,8 +140,10 @@ async function main() {
       throw new Error(`the working row should name the live step, shows "${stepText}"`);
     }
     await appear(page, ".workrow .stopbtn", "the Stop button");
-    // The row sits above the composer — frame it at the tail.
+    // The row sits above the composer — frame it at the tail. Reaching the
+    // bottom also clears the pill (reached = seen); wait out the frame.
     await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+    await page.locator(".newpill").waitFor({ state: "detached", timeout: 5000 });
     await shot(page, "04-working.png");
     // The reply handoff: the row leaves, the answer bubble lands.
     await expectText(thread, "fake-pi reply", "the master's reply lands");
@@ -147,16 +154,22 @@ async function main() {
     }
 
     // ---- The steps disclosure ----
-    const steps = await appear(page, ".steps", "the tool-steps group");
+    const steps = page.locator(".steps").last();
     await expectText(steps, "tool step", "the group counts its steps");
     await steps.locator(".steps-head").click();
-    await expectText(steps, "bash: cadence status", "the opened group lists the call");
+    await page.locator(".steps[data-open] .step-row:has-text('cadence status')").waitFor({
+      state: "visible",
+      timeout: 5000,
+    });
+    await page.waitForTimeout(350); // steps-body height transition
+    await steps.scrollIntoViewIfNeeded();
     await shot(page, "05-steps.png");
 
     // ---- Smart scroll: the pill appears only off-bottom ----
     await page.evaluate(() => window.scrollTo(0, 0));
     await send(page, "one more while I read history");
     const pill = await appear(page, ".newpill", "the new-messages pill while scrolled up");
+    await page.waitForTimeout(400); // pill-in
     await expectText(pill, "new", "the pill counts arrivals");
     await shot(page, "06-new-pill.png");
     await pill.click();

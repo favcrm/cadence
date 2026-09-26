@@ -315,7 +315,9 @@ function WorkingRow({
   if (turn.kind === "idle") return null;
   const stepText = step ? stepSummary(step.text) : null;
   const elapsed =
-    turn.kind === "working" && typeof turn.since === "number"
+    turn.kind === "working" &&
+    typeof turn.since === "number" &&
+    Number.isFinite(turn.since)
       ? fmtElapsed(Math.max(0, Math.floor(now / 1000 - turn.since)))
       : null;
   return (

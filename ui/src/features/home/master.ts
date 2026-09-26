@@ -133,11 +133,14 @@ export function turnState(
   // Fallbacks: the agents row's counters (works on a daemon without
   // master_state) then the composer's own in-flight send.
   if (row && row.running > 0 && row.message) {
+    const c = row.message.created;
+    const since =
+      typeof c === "number" ? c : c ? Date.parse(c) / 1000 : null;
     return {
       kind: "working",
       message: row.message.id,
       summary: row.message.summary,
-      since: row.message.created ? Date.parse(row.message.created) / 1000 : null,
+      since: since !== null && Number.isNaN(since) ? null : since,
       queued: row.queued,
     };
   }

@@ -641,13 +641,14 @@ export interface Agent {
   message?: {
     id: string;
     task?: string;
-    created?: string;
+    /** Epoch seconds — the daemon serializes Message.created as f64. */
+    created?: number | string;
     summary?: string | null;
   } | null;
   running_messages?: {
     id: string;
     task?: string;
-    created?: string;
+    created?: number | string;
     summary?: string | null;
   }[];
   /** The daemon's fence text — already names the recovery commands. */
