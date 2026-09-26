@@ -28,6 +28,7 @@ pub mod error;
 pub mod filter;
 pub mod home;
 pub mod inbox;
+pub mod home;
 pub mod issue;
 pub mod lease;
 pub mod master;
@@ -58,6 +59,7 @@ pub mod test_seam;
 pub mod ui;
 pub mod update;
 pub mod upgrade;
+pub mod wiki;
 pub mod worktree;
 
 pub use error::{Error, Result};
