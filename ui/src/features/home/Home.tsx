@@ -503,17 +503,17 @@ function fmtCommandResult(r: MasterCommandResult): { text?: string; value?: unkn
   return { value: v };
 }
 
-function NotStarted({ status, hosted }: { status: MasterStatus; hosted: boolean }) {
+function NotStarted({ status, hosted }: { status: MasterStatus; hosted: boolean | null }) {
   const stopped = status.kind === "stopped";
   return (
     <div className="card px-4 py-4 space-y-3" data-empty="master">
       <h2 className="text-cardtitle font-semibold text-ink-100">
-        {hosted ? "Your assistant is unavailable" : stopped ? "The master is stopped" : "Start the master to chat"}
+        {hosted === null ? "Checking assistant availability…" : hosted ? "Your assistant is unavailable" : stopped ? "The master is stopped" : "Start the master to chat"}
       </h2>
       <p className="text-secondary text-ink-400">
-        {hosted ? "Your workspace administrator can check the assistant’s setup and restore it. You can send messages once it is available." : "The master is the agent you talk to here. It plans work with you and hands approved tickets to your agents. Start or resume it from a terminal on this machine:"}
+        {hosted === null ? "Checking this board’s session and assistant state." : hosted ? "Your workspace administrator can check the assistant’s setup and restore it. You can send messages once it is available." : "The master is the agent you talk to here. It plans work with you and hands approved tickets to your agents. Start or resume it from a terminal on this machine:"}
       </p>
-      {!hosted && <pre className="num text-secondary text-ink-200 bg-ink-800 rounded px-3 py-2 overflow-x-auto">
+      {hosted === false && <pre className="num text-secondary text-ink-200 bg-ink-800 rounded px-3 py-2 overflow-x-auto">
         {stopped ? RESUME_COMMAND : START_COMMAND}
       </pre>}
       <div className="grid sm:grid-cols-2 gap-3 text-label">
@@ -864,13 +864,13 @@ const ThreadList = memo(function ThreadList({
  */
 export default function Home({
   readOnly,
-  hosted = false,
+  hosted = null,
   overview,
   onOpenIssue,
   overviewHref,
 }: {
   readOnly: boolean;
-  hosted?: boolean;
+  hosted?: boolean | null;
   overview: ResourceState<Overview>;
   onOpenIssue: (id: string) => void;
   overviewHref: string;

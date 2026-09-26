@@ -35,7 +35,7 @@ export function masterStatus(agents: AgentsPayload | null, threadMissing: boolea
 
 /** Why the composer is disabled, or null when it may send. `block` is
  *  why this board cannot write at all (read-only, not signed in). */
-export function composerBlock(block: string | null, status: MasterStatus, hosted = false): string | null {
+export function composerBlock(block: string | null, status: MasterStatus, hosted: boolean | null = false): string | null {
   if (block) return `${block} Messages cannot be sent until then.`;
   switch (status.kind) {
     case "unknown":
@@ -43,9 +43,11 @@ export function composerBlock(block: string | null, status: MasterStatus, hosted
     case "offline":
       return "The daemon is not reachable — messages send once it is back.";
     case "absent":
+      if (hosted === null) return "Checking this board’s session and assistant state…";
       if (hosted) return "Your assistant is unavailable. Your workspace administrator can check its setup.";
       return `The master is not started — run \`${START_COMMAND}\` first.`;
     case "stopped":
+      if (hosted === null) return "Checking this board’s session and assistant state…";
       if (hosted) return "Your assistant is unavailable. Your workspace administrator can restore it.";
       return `The master is stopped (${status.label}) — run \`${RESUME_COMMAND}\` to bring it back.`;
     case "running":

@@ -646,7 +646,7 @@ export default function App() {
         {screen === "home" && (
           <Home
             readOnly={readOnly}
-            hosted={meta?.hosted === true || meta?.session?.origin === "public"}
+            hosted={meta ? meta.hosted === true || meta.session?.origin === "public" : null}
             overview={overviewState}
             onOpenIssue={openIssue}
             overviewHref={hrefFor({ screen: "overview" })}

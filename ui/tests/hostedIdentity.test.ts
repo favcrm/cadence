@@ -31,7 +31,7 @@ for (const role of ["member", "operator"]) {
   host.remove();
 }
 
-const hostedBlock: (block: string | null, status: MasterStatus, hosted?: boolean) => string | null = composerBlock;
+const hostedBlock = composerBlock as (block: string | null, status: MasterStatus, hosted?: boolean | null) => string | null;
 for (const status of [{ kind: "absent" }, { kind: "stopped", label: "stopped" }] as MasterStatus[]) {
   const copy = hostedBlock(null, status, true) ?? "";
   assert(!copy.includes("cadence") && !copy.includes("terminal"), "hosted state must not ask for host shell access");
@@ -39,4 +39,5 @@ for (const status of [{ kind: "absent" }, { kind: "stopped", label: "stopped" }]
   assert(!/starting|retry/i.test(copy), "no imaginary startup or retry action");
 }
 assert(hostedBlock(null, { kind: "absent" }, false)?.includes("cadence master start"), "local startup command stays available");
+assert(!hostedBlock(null, { kind: "absent" }, null)?.includes("cadence"), "loading session mode must not flash hosted users a terminal command");
 console.log("hosted identity checks passed");
