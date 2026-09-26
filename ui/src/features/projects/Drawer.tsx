@@ -3,6 +3,7 @@ import { api, type WriteResp } from "../../lib/api";
 import { fmtBytes, fmtTime } from "../../lib/fmt";
 import { notesStatusSentence } from "../../lib/uxCopy";
 import Md from "../../ui/Md";
+import { IconClose } from "../../ui/icons";
 import { noDragReason } from "./Card";
 import type {
   AgentsPayload,
@@ -328,17 +329,7 @@ export default function Drawer({
             onClick={onClose}
             className="closebtn ml-auto shrink-0 w-8 h-8 grid place-items-center rounded border border-ink-600 text-ink-300 bg-ink-850"
           >
-            <svg
-              width="12"
-              height="12"
-              viewBox="0 0 12 12"
-              stroke="currentColor"
-              strokeWidth="1.5"
-              fill="none"
-              style={{ pointerEvents: "none" }}
-            >
-              <path d="M2 2l8 8M10 2l-8 8" />
-            </svg>
+            <IconClose style={{ pointerEvents: "none" }} />
           </button>
         </header>
 

@@ -5,6 +5,7 @@ import { useQuery } from "../../lib/useResource";
 import { useHref } from "../../lib/useLocation";
 import Link from "../../ui/Link";
 import { ResourceGate, StaleChip } from "../../ui/ResourceStatus";
+import { IconChevron } from "../../ui/icons";
 import { appHref } from "../apps/apps";
 import RunForm from "./RunForm";
 import { approvalChip, gateBlock } from "./workflows";
@@ -122,18 +123,9 @@ function WorkflowCard({
             <span className="text-cardtitle font-medium text-ink-100 min-w-0 break-words flex-1">
               {row.title ?? row.name}
             </span>
-            <svg
-              width="10"
-              height="10"
-              viewBox="0 0 10 10"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.5"
+            <IconChevron
               className={`shrink-0 mt-1.5 text-ink-500 transition-transform ${open ? "rotate-180" : ""}`}
-              aria-hidden
-            >
-              <path d="M2 3.5l3 3 3-3" />
-            </svg>
+            />
           </button>
         )}
         <div className="flex flex-wrap items-center gap-1.5 mt-2">
