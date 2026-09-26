@@ -47,8 +47,8 @@ depends_on: 1
 Decide the image and leave the decision as files under
 `social/{{slug}}/`:
 
-- keep or edit the source image when the run has one — leave it at
-  `image.<ext>`;
+- keep or edit the run's image when there is one — an image file
+  already in `social/{{slug}}/` — and leave it at `image.<ext>`;
 - write `image-brief.md` when the image must be made: what it shows,
   the mood, any copy on it, and the alt text.
 
