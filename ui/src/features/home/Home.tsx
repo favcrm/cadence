@@ -26,6 +26,17 @@ import MasterChips from "./MasterChips";
 import NeedsRail from "./NeedsRail";
 import { askDraft, readRailCollapsed, writeRailCollapsed, type HomeNeed } from "./needs";
 import PlanCard from "./PlanCard";
+import {
+  initialFollow,
+  motionBehavior,
+  onOperatorScrollUp,
+  onPill,
+  onScrollSettled,
+  onSend,
+  onTailChange,
+  onViewportScroll,
+  type Follow,
+} from "./scrollFollow";
 import SinceCard from "./SinceCard";
 import {
   addPending,
@@ -590,10 +601,13 @@ function Composer({
   block,
   seed,
   onCommand,
+  onSent,
 }: {
   block: string | null;
   seed: { text: string; n: number; refs?: ThreadRef[] };
   onCommand: (name: string, arg: string) => void;
+  /** Enter or the button actually submitted — chat, slash, or an Ask-master draft. */
+  onSent: () => void;
 }) {
   const [draft, setDraft] = useState("");
   // CAD-574: an Ask-master seed carries the row's subject — chips shown
@@ -639,6 +653,9 @@ function Composer({
   const submit = () => {
     const body = draft.trim();
     if (!body || block) return;
+    // Pin before the pending row or command card paints, so the
+    // follow effect scrolls the working indicator into view.
+    onSent();
     const cmd = parseSlash(body);
     if (cmd) onCommand(cmd.name, cmd.arg);
     else sendToMaster(body, newMessageId(), refs);
@@ -785,6 +802,7 @@ const ThreadList = memo(function ThreadList({
   readOnly,
   onOpenIssue,
   liveAfter,
+  onRetry,
 }: {
   items: ThreadItem[];
   limit: number;
@@ -794,6 +812,7 @@ const ThreadList = memo(function ThreadList({
   readOnly: boolean;
   onOpenIssue: (id: string) => void;
   liveAfter: number;
+  onRetry: (message: string, text: string, refs?: ThreadRef[]) => void;
 }) {
   const { shown, hidden } = useMemo(() => visibleWindow(items, limit), [items, limit]);
   const anchors = useMemo(() => planAnchors(items), [items]);
@@ -814,7 +833,7 @@ const ThreadList = memo(function ThreadList({
           const live = item.type === "pending" || Number(item.key.slice(1)) > liveAfter;
           return (
             <li key={item.key} className={`min-w-0 space-y-2${live ? " msg-in" : ""}`}>
-              <Item item={item} onOpenIssue={onOpenIssue} onRetry={retry} onDiscard={discard} />
+              <Item item={item} onOpenIssue={onOpenIssue} onRetry={onRetry} onDiscard={discard} />
               {anchors.has(item.key) && (
                 <div className="ml-8">
                   <PlanCard epic={anchors.get(item.key)!} readOnly={readOnly} onOpenIssue={onOpenIssue} />
@@ -866,8 +885,9 @@ export default function Home({
   const [loadingEarlier, setLoadingEarlier] = useState(false);
   const [cmds, setCmds] = useState<CmdResult[]>([]);
   const [unseen, setUnseen] = useState(0);
+  const [glideTick, setGlideTick] = useState(0);
   const cmdSeq = useRef(0);
-  const pinned = useRef(true);
+  const follow = useRef<Follow>(initialFollow());
   const prevItems = useRef(0);
   const liveAfter = useRef<number | null>(null);
   // CAD-600: the panel scrolls, not the page — its own scroller and the
@@ -944,26 +964,95 @@ export default function Home({
     }
   }, [tailSeq]);
 
-  // Smart scroll (CAD-551; panel-scoped CAD-600): follow the tail only
-  // while the operator is already at the bottom of the thread — reading
-  // history up top is never yanked away. New items while unpinned count
-  // onto the "Jump to latest" pill.
-  const onScroll = useCallback(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-    const near = atTail(el.scrollTop, el.scrollHeight, el.clientHeight);
-    pinned.current = near;
-    if (near) setUnseen(0);
-  }, []);
-
-  const scrollToTail = useCallback((behavior: ScrollBehavior = "auto") => {
+  // Smart scroll (CAD-551, panel-scoped CAD-600) plus send-pin
+  // (CAD-610). Follow the tail while the operator is already there.
+  // A send (Enter, the button, a slash command, an Ask-master draft,
+  // a retry) pins even from history so the working indicator stays in
+  // view. Scrolling up during the turn drops the pin and the next row
+  // counts onto the pill.
+  const applyFollow = (next: Follow) => {
+    const prevUnseen = follow.current.unseen;
+    follow.current = next;
+    if (next.unseen !== prevUnseen) setUnseen(next.unseen);
+  };
+  const scrollPanel = useCallback((kind: "glide" | "jump") => {
     const el = scrollRef.current;
     if (!el) return;
     el.scrollTo({
       top: tailTop(el.scrollHeight, el.clientHeight),
-      behavior: reducedMotion() ? "auto" : behavior,
+      behavior: motionBehavior(reducedMotion(), kind),
     });
   }, []);
+  // A send pins before the pending row paints; the glide runs after it.
+  const engage = useCallback(() => {
+    const next = onSend(follow.current);
+    follow.current = next.state;
+    setUnseen(0);
+    setGlideTick((n) => n + 1);
+  }, []);
+  const onRetrySend = useCallback(
+    (message: string, text: string, refs?: ThreadRef[]) => {
+      engage();
+      retry(message, text, refs);
+    },
+    [engage],
+  );
+  const onPanelScroll = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const near = atTail(el.scrollTop, el.scrollHeight, el.clientHeight);
+    applyFollow(onViewportScroll(follow.current, near));
+  }, []);
+
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const nearNow = () => atTail(el.scrollTop, el.scrollHeight, el.clientHeight);
+    const onScrollEnd = () => {
+      const settled = onScrollSettled(follow.current, nearNow());
+      applyFollow(settled.state);
+      if (settled.scroll === "jump") scrollPanel("jump");
+    };
+    // Only an in-flight send glide is cancelled here. Once it has
+    // settled, the position check is what stops the pin.
+    const leave = () => {
+      if (!follow.current.programmatic) return;
+      const next = onOperatorScrollUp(follow.current);
+      if (next === follow.current) return;
+      applyFollow(next);
+      el.scrollTo({ top: el.scrollTop, behavior: "auto" });
+    };
+    const onWheel = (e: WheelEvent) => {
+      if (e.deltaY < 0) leave();
+    };
+    let touchY = 0;
+    const onTouchStart = (e: TouchEvent) => {
+      touchY = e.touches[0]?.clientY ?? 0;
+    };
+    const onTouchMove = (e: TouchEvent) => {
+      const y = e.touches[0]?.clientY ?? touchY;
+      if (y > touchY + 12) leave();
+      touchY = y;
+    };
+    const onKey = (e: globalThis.KeyboardEvent) => {
+      if (e.key !== "ArrowUp" && e.key !== "PageUp" && e.key !== "Home") return;
+      const target = e.target;
+      if (target instanceof Element && target.closest("textarea, input, [contenteditable='true']")) return;
+      leave();
+    };
+    el.addEventListener("scrollend", onScrollEnd);
+    el.addEventListener("wheel", onWheel, { passive: true });
+    el.addEventListener("touchstart", onTouchStart, { passive: true });
+    el.addEventListener("touchmove", onTouchMove, { passive: true });
+    addEventListener("keydown", onKey);
+    return () => {
+      el.removeEventListener("scrollend", onScrollEnd);
+      el.removeEventListener("wheel", onWheel);
+      el.removeEventListener("touchstart", onTouchStart);
+      el.removeEventListener("touchmove", onTouchMove);
+      removeEventListener("keydown", onKey);
+    };
+  }, [scrollPanel]);
 
   // The dock's measured height is the thread's bottom padding and the
   // pill's floor (`--dock-h`, styles.css); while pinned, a growing dock
@@ -973,7 +1062,7 @@ export default function Home({
     if (!dock || typeof ResizeObserver === "undefined") return;
     const apply = () => {
       document.documentElement.style.setProperty("--dock-h", `${dock.offsetHeight}px`);
-      if (pinned.current) scrollToTail("auto");
+      if (follow.current.pinned) scrollPanel("jump");
     };
     const ro = new ResizeObserver(apply);
     ro.observe(dock);
@@ -982,7 +1071,7 @@ export default function Home({
       ro.disconnect();
       document.documentElement.style.removeProperty("--dock-h");
     };
-  }, [scrollToTail]);
+  }, [scrollPanel]);
 
   const lastKey = items.length ? items[items.length - 1].key : "";
   useEffect(() => {
@@ -993,17 +1082,45 @@ export default function Home({
       return;
     }
     if (!lastKey) return;
-    // To the tail — the panel's own bottom, so a taller rail beside it
-    // never strands the follow below the conversation.
-    if (pinned.current) scrollToTail("auto");
-    else if (delta > 0) setUnseen((u) => u + delta);
-  }, [items.length, lastKey, scrollToTail]);
+    // A send glide owns the frame it starts in; later rows jump.
+    const next = onTailChange(follow.current, delta);
+    applyFollow(next.state);
+    if (next.scroll === "jump") scrollPanel("jump");
+  }, [items.length, lastKey, scrollPanel]);
+
+  // After the pending row, command card, or working indicator paints.
+  // Already sitting on the tail skips the glide and drops the lock, so
+  // later steps still jump — a glide that never moves would otherwise
+  // hold `programmatic` and swallow those follows.
+  useEffect(() => {
+    if (glideTick === 0) return;
+    const el = scrollRef.current;
+    if (!el) return;
+    const top = tailTop(el.scrollHeight, el.clientHeight);
+    if (Math.abs(el.scrollTop - top) <= 1) {
+      follow.current = { ...follow.current, pinned: true, programmatic: false };
+      return;
+    }
+    scrollPanel("glide");
+  }, [glideTick, scrollPanel]);
+
+  // A slash-command card grows when its answer lands. Follow it while
+  // pinned; the send frame itself is owned by the glide above.
+  const cmdSig = cmds.map((c) => `${c.id}:${c.running ? 1 : 0}:${c.ok === undefined ? "" : c.ok ? 1 : 0}`).join("|");
+  useEffect(() => {
+    if (!cmdSig) return;
+    const next = onTailChange(follow.current, 0);
+    applyFollow(next.state);
+    if (next.scroll === "jump") scrollPanel("jump");
+  }, [cmdSig, scrollPanel]);
 
   const jumpToLatest = () => {
-    pinned.current = true;
+    const next = onPill(follow.current);
+    follow.current = next.state;
     setUnseen(0);
-    scrollToTail("smooth");
+    scrollPanel(next.scroll);
   };
+
 
   /** One `/` verb → the board's command route; its answer is a card. */
   const runCommand = useCallback(
@@ -1150,7 +1267,7 @@ export default function Home({
           <div
             className="chat-scroll min-h-0 flex-1 overflow-y-auto pt-3"
             ref={scrollRef}
-            onScroll={onScroll}
+            onScroll={onPanelScroll}
             data-chat-scroll
           >
             {showNotStarted && items.length === 0 && (
@@ -1173,6 +1290,7 @@ export default function Home({
               readOnly={readOnly}
               onOpenIssue={onOpenIssue}
               liveAfter={liveAfter.current ?? 0}
+              onRetry={onRetrySend}
             />
             {cmds.map((c) => (
               <CmdCard key={c.id} cmd={c} onOpenIssue={onOpenIssue} />
@@ -1187,7 +1305,7 @@ export default function Home({
           )}
 
           <div className="chatdock" ref={dockRef} data-chat-dock>
-            <Composer block={block} seed={seed} onCommand={runCommand} />
+            <Composer block={block} seed={seed} onCommand={runCommand} onSent={engage} />
           </div>
         </div>
       </section>
