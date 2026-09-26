@@ -600,6 +600,39 @@ fn preflight(view: &dyn View, operator: &str) -> Vec<String> {
         if agent.uid == 0 {
             findings.push(format!("{AGENT_USER} resolves to uid 0 — refusing"));
         }
+        // A second account answering to the agent's uid is the same
+        // collision under another name — the audit sweeps the passwd
+        // map for it; provision must not bless it either.
+        if let Ok(users) = view.users() {
+            for other in users {
+                if other.uid == agent.uid && other.name != AGENT_USER && other.name != operator {
+                    findings.push(format!(
+                        "uid {} is shared with account {} — refusing",
+                        agent.uid, other.name
+                    ));
+                }
+            }
+        }
+        // Foreign supplementary groups are grants the spec never
+        // made: `usermod -aG docker cadence-agent` is a
+        // root-equivalent reach. The §5 set is the primary gid and
+        // the shared group only.
+        let shared = view.group(SHARED_GROUP).ok().flatten().map(|g| g.gid);
+        if let Ok(gids) = view.member_gids(&agent) {
+            for gid in gids {
+                if gid == agent.gid || Some(gid) == shared {
+                    continue;
+                }
+                let name = view
+                    .group_name(gid)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| format!("gid {gid}"));
+                findings.push(format!(
+                    "{AGENT_USER} is a member of {name} — outside the §5 group set — refusing"
+                ));
+            }
+        }
         // The launch edge must already hold the operator — the setuid
         // helper gates on `cadence-launch` membership, so a missing
         // operator row means the tree we are about to arm cannot be
@@ -623,7 +656,15 @@ fn preflight(view: &dyn View, operator: &str) -> Vec<String> {
         &principals,
         HOME_ACL_WALK_BUDGET,
     ));
-    findings.extend(audit::git_config_findings(view, operator));
+    let cfg = audit::git_config_audit(view, operator, &principals);
+    findings.extend(cfg.findings);
+    // Can't-prove is a refusal too — provision never arms a host it
+    // could not fully audit.
+    findings.extend(
+        cfg.unverified
+            .into_iter()
+            .map(|u| format!("unverifiable: {u}")),
+    );
     findings
 }
 

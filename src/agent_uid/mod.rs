@@ -165,6 +165,18 @@ pub trait View {
     /// The git-config sweep resolves links it refuses to *open* so a
     /// symlinked include into the agent domain still flags.
     fn read_link(&self, path: &str) -> io::Result<PathBuf>;
+    /// Parse one gitconfig file with git's own parser —
+    /// `git config --file <path> --no-includes --list --null` — under
+    /// a scrubbed, inert env (ambient scopes nullified — git follows
+    /// their includes even under `--no-includes`), so the audit can
+    /// never diverge from the grammar git applies at use time.
+    /// `path` is logical; the view maps it under its root. Includes
+    /// are *not* resolved by git (`--no-includes`): the caller walks
+    /// the include graph itself so every hop gets the bounded/
+    /// no-follow vetting. Returns canonical `section[.sub].key →
+    /// value` pairs; a valueless key reports `"true"` (git's
+    /// implicit-bool).
+    fn git_config(&self, path: &str) -> io::Result<Vec<(String, String)>>;
     /// The file's sha256, streamed — the helper's byte-compare reads
     /// a multi-MB binary, so it hashes instead of loading.
     fn file_sha256(&self, path: &str) -> io::Result<[u8; 32]>;
@@ -290,6 +302,92 @@ fn command(prog: &str, args: &[&str]) -> io::Result<()> {
             String::from_utf8_lossy(&out.stderr).trim()
         )))
     }
+}
+
+/// Parse one config file with *git itself* — the audit never reads
+/// the grammar a second time (statements after `]` on a section
+/// line, quoted `\`-continuations: git is the reference parser, a
+/// hand-rolled reader keeps diverging from it). One open does the
+/// whole gate (no-follow, regular-file, ≤`READ_CAP`); git is then
+/// pointed at `/dev/stdin` — that fd, never the path again — so a
+/// swapped path cannot feed it an unvetted file.
+///
+/// The spawn's environment is scrubbed and *inert*: fixed PATH,
+/// `HOME=/`, and both scope files forced to `/dev/null`. Git loads
+/// the ambient global/system scopes for its own machinery even
+/// under `--file`, and follows their `include.path` regardless of
+/// `--no-includes` — a fifo'd include in the operator's real config
+/// would hang the audit, an over-cap one would read unbounded. With
+/// the scopes nullified the only bytes git can read are the fd's.
+/// `~` stays literal in listed values — expansion is the audit's
+/// own job, done with the operator home during resolution.
+///
+/// `git config --list` only ever *reads*: it runs no hooks or
+/// aliases (those fire on repo command dispatch, which this is
+/// not), evaluates no `core.fsmonitor`/`core.pager` (not a tty, not
+/// a worktree command), and executes no config value.
+fn git_config_file(phys: &Path, logical: &str) -> io::Result<Vec<(String, String)>> {
+    let f = bounded_open(phys, logical)?;
+    // The pre-open length is a snapshot — re-check after git reads,
+    // so a grow-during-parse can't smuggle past the cap.
+    let checked = f.try_clone()?;
+    let git = ["/usr/bin/git", "/bin/git", "/usr/local/bin/git"]
+        .iter()
+        .find(|p| Path::new(p).is_file())
+        .ok_or_else(|| {
+            io::Error::other("no git binary at a trusted path — config cannot be verified")
+        })?;
+    let mut cmd = std::process::Command::new(git);
+    cmd.args([
+        "config",
+        "--file",
+        "/dev/stdin",
+        "--no-includes",
+        "--list",
+        "--null",
+    ])
+    .stdin(std::process::Stdio::from(f))
+    .env_clear()
+    .env("PATH", "/usr/bin:/bin")
+    .env("HOME", "/")
+    .env("GIT_CONFIG_NOSYSTEM", "1")
+    .env("GIT_CONFIG_SYSTEM", "/dev/null")
+    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+    .env("XDG_CONFIG_HOME", "/dev/null")
+    .env("GIT_TERMINAL_PROMPT", "0")
+    .env("GIT_PAGER", "cat")
+    .env("LC_ALL", "C")
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped());
+    // `reaper::output` forces stdin to null — spawn + wait directly so
+    // the vetted fd stays git's stdin.
+    let out = crate::reaper::spawn(&mut cmd)?.wait_with_output()?;
+    if checked.metadata().map(|m| m.len()).unwrap_or(u64::MAX) > READ_CAP {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{logical}: exceeds the {READ_CAP}-byte config bound"),
+        ));
+    }
+    if !out.status.success() {
+        return Err(io::Error::other(format!(
+            "git config --file {logical}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    // `--null` records: `key\nvalue\0`; an implicit-true key is a bare
+    // `key\0`. Git has already canonicalized `section[.sub].key`.
+    let mut entries = Vec::new();
+    for rec in out.stdout.split(|b| *b == 0) {
+        if rec.is_empty() {
+            continue;
+        }
+        let rec = String::from_utf8_lossy(rec);
+        match rec.split_once('\n') {
+            Some((k, v)) => entries.push((k.to_string(), v.to_string())),
+            None => entries.push((rec.into_owned(), "true".to_string())),
+        }
+    }
+    Ok(entries)
 }
 
 /// libc's `*mut c_char` fields → owned String — the shared extractor
@@ -552,9 +650,14 @@ impl View for LiveHost {
         sha256_path(&self.phys(path))
     }
 
+    fn git_config(&self, path: &str) -> io::Result<Vec<(String, String)>> {
+        git_config_file(&self.phys(path), path)
+    }
+
     #[cfg(unix)]
     fn helper_source(&self, src: &Path) -> io::Result<[u8; 32]> {
-        let f = open_verified_source(src, &self.trusted_uids)?;
+        let acls = self.acls(&src.display().to_string())?;
+        let f = open_verified_source(src, &self.trusted_uids, &acls)?;
         sha256_file(&f)
     }
 
@@ -713,7 +816,8 @@ impl Host for LiveHost {
                 src.display()
             )));
         }
-        let mut srcf = open_verified_source(src, &self.trusted_uids)?;
+        let acls = self.acls(&src.display().to_string())?;
+        let mut srcf = open_verified_source(src, &self.trusted_uids, &acls)?;
         let owner_uid = self
             .user(owner)?
             .map(|u| u.uid)
@@ -952,10 +1056,13 @@ fn open_pinned_dir(
 /// `O_NONBLOCK` keeps a fifo's open from hanging), owner in the
 /// trusted set (root or the operator — never the agent uid), and not
 /// writable by group/other. Anything else refuses rather than copies.
+/// `acls` are the file's POSIX access entries — grants the mode bits
+/// do not show (I6).
 #[cfg(unix)]
 pub(crate) fn open_verified_source(
     src: &Path,
     trusted: &BTreeSet<u32>,
+    acls: &[AclEntry],
 ) -> io::Result<std::fs::File> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let f = std::fs::OpenOptions::new()
@@ -963,12 +1070,24 @@ pub(crate) fn open_verified_source(
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(src)?;
     let md = f.metadata()?;
-    check_source(src, md.is_file(), md.mode() & 0o7777, md.uid(), trusted)?;
+    check_source(
+        src,
+        md.is_file(),
+        md.mode() & 0o7777,
+        md.uid(),
+        trusted,
+        acls,
+    )?;
     Ok(f)
 }
 
 /// What a vetted helper source must look like — shared so the fixture
 /// applies the identical rule to its (possibly forged) source meta.
+/// POSIX ACLs are part of the vet: a `u:cadence-agent:rw` entry on a
+/// root-owned 0644 source lets the agent write what installs as the
+/// setuid helper, and the mode bits say nothing about it. Refuse any
+/// *effective* write grant (entry perms masked by the ACL mask) to a
+/// non-root principal; read-only and root-bound grants are inert.
 #[cfg(unix)]
 pub(crate) fn check_source(
     src: &Path,
@@ -976,6 +1095,7 @@ pub(crate) fn check_source(
     mode: u32,
     uid: u32,
     trusted: &BTreeSet<u32>,
+    acls: &[AclEntry],
 ) -> io::Result<()> {
     if !is_file {
         return Err(io::Error::other(format!(
@@ -994,6 +1114,31 @@ pub(crate) fn check_source(
             "{}: helper source owned by untrusted uid {uid} — refusing",
             src.display()
         )));
+    }
+    let mask = acls
+        .iter()
+        .find(|e| !e.default && e.tag == Principal::Mask)
+        .map(|e| e.perms)
+        .unwrap_or(0b111);
+    for e in acls.iter().filter(|e| !e.default) {
+        if e.perms & mask & 0b010 == 0 {
+            continue;
+        }
+        match e.tag {
+            Principal::User(u) if u != 0 => {
+                return Err(io::Error::other(format!(
+                    "{}: helper source ACL grants uid {u} write — refusing",
+                    src.display()
+                )))
+            }
+            Principal::Group(g) if g != 0 => {
+                return Err(io::Error::other(format!(
+                    "{}: helper source ACL grants gid {g} write — refusing",
+                    src.display()
+                )))
+            }
+            _ => {}
+        }
     }
     Ok(())
 }
@@ -1038,9 +1183,11 @@ pub(crate) fn copy_verified(src: &mut std::fs::File, dest: &std::fs::File) -> io
 /// path outright; `O_NONBLOCK` plus the regular-file check keeps a
 /// fifo from hanging the audit as root; [`READ_CAP`] keeps a huge
 /// include target from OOMing it.
+///
+/// `bounded_open` is the gate; `bounded_read` adds the post-open
+/// length enforcement.
 #[cfg(unix)]
-pub(crate) fn bounded_read(phys: &Path, logical: &str) -> io::Result<Vec<u8>> {
-    use std::io::Read;
+pub(crate) fn bounded_open(phys: &Path, logical: &str) -> io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     let f = std::fs::OpenOptions::new()
         .read(true)
@@ -1053,6 +1200,19 @@ pub(crate) fn bounded_read(phys: &Path, logical: &str) -> io::Result<Vec<u8>> {
             format!("{logical}: not a regular file — refusing to read"),
         ));
     }
+    if md.len() > READ_CAP {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{logical}: exceeds the {READ_CAP}-byte config bound"),
+        ));
+    }
+    Ok(f)
+}
+
+#[cfg(unix)]
+pub(crate) fn bounded_read(phys: &Path, logical: &str) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    let f = bounded_open(phys, logical)?;
     let mut buf = Vec::new();
     f.take(READ_CAP + 1).read_to_end(&mut buf)?;
     if buf.len() as u64 > READ_CAP {
@@ -1062,6 +1222,12 @@ pub(crate) fn bounded_read(phys: &Path, logical: &str) -> io::Result<Vec<u8>> {
         ));
     }
     Ok(buf)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn bounded_open(_phys: &Path, logical: &str) -> io::Result<std::fs::File> {
+    let _ = logical;
+    Err(io::Error::other("bounded_open: unix only"))
 }
 
 #[cfg(not(unix))]

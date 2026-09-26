@@ -1170,10 +1170,11 @@ fn audit_sees_grants_through_agent_supplementary_groups() {
 }
 
 #[test]
-fn include_reads_are_bounded_and_never_follow() {
+fn include_targets_are_vetted_and_fail_closed() {
     use std::os::unix::ffi::OsStrExt;
-    // A fifo include target must not hang the read — O_NONBLOCK plus
-    // the regular-file check refuse it outright.
+    // A fifo include target cannot be parsed — the audit cannot hang
+    // on it (O_NONBLOCK refuses the open), and a config source it
+    // cannot verify fails closed rather than claiming ok.
     let lane = Lane::new();
     let mut host = provisioned(&lane);
     host.write_file(
@@ -1184,11 +1185,15 @@ fn include_reads_are_bounded_and_never_follow() {
     let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
     let report = audit(&host); // returns — no hang
-    assert_ne!(row(&report, "git-config").level, Level::Fail);
+    assert_eq!(
+        row(&report, "git-config").level,
+        Level::Fail,
+        "an unverifiable include must fail closed, not pass"
+    );
 
-    // A symlinked include is refused, not followed — but where the
-    // link *lands* is still judged: git would follow it into the
-    // agent domain, so a store-resolving link flags.
+    // A symlinked include: every hop is resolved (link text only, the
+    // link is never opened) and where it *lands* is judged — git would
+    // follow it into the agent domain, so a store-resolving link flags.
     let lane = Lane::new();
     let mut host = provisioned(&lane);
     host.write_file(
@@ -1208,25 +1213,348 @@ fn include_reads_are_bounded_and_never_follow() {
     host.write_file("/home/ubuntu/.gitconfig", "[include]\n\tpath = ~/ok.inc\n");
     host.write_file("/home/ubuntu/real.inc", "[user]\n\tname = o\n");
     std::os::unix::fs::symlink(
-        lane.dir.path().join("home/ubuntu/real.inc"),
+        "/home/ubuntu/real.inc",
         lane.dir.path().join("home/ubuntu/ok.inc"),
     )
     .unwrap();
     assert_ne!(row(&audit(&host), "git-config").level, Level::Fail);
 
-    // An over-cap include target is refused, not OOM'd — even when it
-    // *carries* a violation past the bound.
+    // An over-cap include target is refused, not OOM'd — and the
+    // piece the audit could not check fails closed even when the
+    // violation sits past the bound.
     let lane = Lane::new();
     let mut host = provisioned(&lane);
     host.write_file("/home/ubuntu/.gitconfig", "[include]\n\tpath = ~/big.inc\n");
     let mut big = vec![b' '; 1 << 21];
     big.extend_from_slice(b"\n[safe]\n\tdirectory = *\n");
     std::fs::write(lane.dir.path().join("home/ubuntu/big.inc"), &big).unwrap();
-    let report = audit(&host); // bounded read refuses — no flag, no OOM
+    let report = audit(&host);
     assert_eq!(
         row(&report, "git-config").level,
+        Level::Fail,
+        "an over-cap config source is unverifiable — it must fail closed, not pass"
+    );
+}
+
+#[test]
+fn audit_parses_config_with_git_not_a_line_scanner() {
+    // `[safe] directory = *` on one line — a text parser reads only
+    // the header; git's grammar applies the assignment. Verified
+    // against git 2.43: it lists `safe.directory=*`.
+    let lane = Lane::new();
+    let mut host = provisioned(&lane);
+    host.write_file("/home/ubuntu/.gitconfig", "[safe] directory = *\n");
+    assert_eq!(
+        row(&audit(&host), "git-config").level,
+        Level::Fail,
+        "same-line `[safe] directory = *` was not flagged"
+    );
+
+    // A quoted value may continue across lines with a trailing `\`
+    // inside the quotes — git joins it to `/var/lib/cadence`.
+    let lane = Lane::new();
+    let mut host = provisioned(&lane);
+    host.write_file(
+        "/home/ubuntu/.gitconfig",
+        "[safe]\n\tdirectory = \"/var/lib/cad\\\nence\"\n",
+    );
+    assert_eq!(
+        row(&audit(&host), "git-config").level,
+        Level::Fail,
+        "quoted backslash-continuation to /var/lib/cadence was not flagged"
+    );
+
+    // A malformed file is not silently clean — git refuses it, so the
+    // piece is unverifiable and fails closed.
+    let lane = Lane::new();
+    let mut host = provisioned(&lane);
+    host.write_file("/home/ubuntu/.gitconfig", "this is not {{{ a config\n");
+    assert_eq!(
+        row(&audit(&host), "git-config").level,
+        Level::Fail,
+        "an unparseable operator config must fail closed"
+    );
+}
+
+#[test]
+fn audit_flags_bang_aliases_and_the_wider_exec_key_set() {
+    // `alias.st = !…` runs its payload through `sh -c` on `git st` —
+    // a shell line cannot be path-bounded, so it flags wherever set.
+    for (label, cfg) in [
+        ("alias-store", "[alias]\n\tco = !/var/lib/cadence/x.sh\n"),
+        ("alias-any", "[alias]\n\tst = !echo pwned\n"),
+        ("instaweb", "[instaweb]\n\thttpd = /var/lib/cadence/httpd\n"),
+        ("man-viewer", "[man]\n\tviewer = /var/lib/cadence/v\n"),
+        ("man-cmd", "[man \"x\"]\n\tcmd = /var/lib/cadence/v\n"),
+        (
+            "sendmailcmd",
+            "[sendemail]\n\tsendmailcmd = /var/lib/cadence/sendmail\n",
+        ),
+        ("web-browser", "[web]\n\tbrowser = /var/lib/cadence/b\n"),
+        (
+            "browser-path",
+            "[browser \"x\"]\n\tpath = /var/lib/cadence/b\n",
+        ),
+        (
+            "difftool-path",
+            "[difftool \"x\"]\n\tpath = /var/lib/cadence/d\n",
+        ),
+        (
+            "mergetool-path",
+            "[mergetool \"x\"]\n\tpath = /var/lib/cadence/m\n",
+        ),
+        ("ssh-variant", "[ssh]\n\tvariant = /var/lib/cadence/ssh\n"),
+    ] {
+        let lane = Lane::new();
+        let mut host = provisioned(&lane);
+        host.write_file("/home/ubuntu/.gitconfig", cfg);
+        assert_eq!(
+            row(&audit(&host), "git-config").level,
+            Level::Fail,
+            "{label}: {cfg:?} was not flagged"
+        );
+    }
+    // A `!`-alias smuggled through env config flags too.
+    let lane = Lane::new();
+    let mut host = provisioned(&lane);
+    host.env.insert("GIT_CONFIG_COUNT".into(), "1".into());
+    host.env
+        .insert("GIT_CONFIG_KEY_0".into(), "alias.st".into());
+    host.env.insert("GIT_CONFIG_VALUE_0".into(), "!id".into());
+    assert_eq!(
+        row(&audit(&host), "git-config").level,
+        Level::Fail,
+        "an env-carried !-alias was not flagged"
+    );
+    // …while a plain (non-!) alias is just a git subcommand — inert.
+    let lane = Lane::new();
+    let mut host = provisioned(&lane);
+    host.write_file("/home/ubuntu/.gitconfig", "[alias]\n\tco = checkout\n");
+    assert_eq!(
+        row(&audit(&host), "git-config").level,
         Level::Ok,
-        "the cap must refuse the read, not hang or scan"
+        "a plain alias was flagged"
+    );
+}
+
+#[test]
+fn audit_reaches_beyond_the_store_to_all_agent_ground() {
+    // The store is not the only armed ground: the agent's home is
+    // agent-writable by construction, and a safe.directory rooted
+    // there arms whatever checkout the agent builds in it.
+    let lane = Lane::new();
+    let mut host = provisioned(&lane);
+    host.write_file(
+        "/home/ubuntu/.gitconfig",
+        "[safe]\n\tdirectory = /home/cadence-agent/*\n",
+    );
+    assert_eq!(
+        row(&audit(&host), "git-config").level,
+        Level::Fail,
+        "safe.directory over the agent home was not flagged"
+    );
+
+    // An include into the agent home is agent-written config in the
+    // operator's git — same channel as a store include.
+    let lane = Lane::new();
+    let mut host = provisioned(&lane);
+    host.write_file(
+        "/home/ubuntu/.gitconfig",
+        "[include]\n\tpath = ~cadence-agent/inc\n",
+    );
+    assert_eq!(
+        row(&audit(&host), "git-config").level,
+        Level::Fail,
+        "an include into the agent's home was not flagged"
+    );
+
+    // A world-writable dir under / is agent-reachable too — a missing
+    // name beneath it is a config file the agent can plant.
+    let lane = Lane::new();
+    let mut host = provisioned(&lane);
+    host.seed_dir("/shared", 0, 0, 0o777);
+    host.write_file(
+        "/home/ubuntu/.gitconfig",
+        "[include]\n\tpath = /shared/inc\n",
+    );
+    assert_eq!(
+        row(&audit(&host), "git-config").level,
+        Level::Fail,
+        "an include under world-writable ground was not flagged"
+    );
+}
+
+#[test]
+fn audit_follows_every_include_symlink_hop() {
+    // The link chain is resolved hop by hop — the violation is two
+    // links deep, and each landing is judged on its own ground.
+    let lane = Lane::new();
+    let mut host = provisioned(&lane);
+    host.write_file("/home/ubuntu/.gitconfig", "[include]\n\tpath = ~/a.inc\n");
+    std::os::unix::fs::symlink(
+        "/home/ubuntu/b.inc",
+        lane.dir.path().join("home/ubuntu/a.inc"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+        "/var/lib/cadence/evil.inc",
+        lane.dir.path().join("home/ubuntu/b.inc"),
+    )
+    .unwrap();
+    host.write_file("/var/lib/cadence/evil.inc", "[safe]\n\tdirectory = *\n");
+    assert_eq!(
+        row(&audit(&host), "git-config").level,
+        Level::Fail,
+        "a two-hop include chain into the store was not flagged"
+    );
+
+    // A link cycle is unverifiable — fails closed.
+    let lane = Lane::new();
+    let mut host = provisioned(&lane);
+    host.write_file("/home/ubuntu/.gitconfig", "[include]\n\tpath = ~/c1.inc\n");
+    std::os::unix::fs::symlink(
+        "/home/ubuntu/c2.inc",
+        lane.dir.path().join("home/ubuntu/c1.inc"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+        "/home/ubuntu/c1.inc",
+        lane.dir.path().join("home/ubuntu/c2.inc"),
+    )
+    .unwrap();
+    assert_eq!(
+        row(&audit(&host), "git-config").level,
+        Level::Fail,
+        "a cyclic include chain must fail closed"
+    );
+
+    // An env-carried include is walked the same way — git honours
+    // include.path from GIT_CONFIG_PARAMETERS.
+    let lane = Lane::new();
+    let mut host = provisioned(&lane);
+    host.env.insert(
+        "GIT_CONFIG_PARAMETERS".into(),
+        "'include.path'='/var/lib/cadence/x.inc'".into(),
+    );
+    assert_eq!(
+        row(&audit(&host), "git-config").level,
+        Level::Fail,
+        "an env-carried include into the store was not flagged"
+    );
+}
+
+#[test]
+fn audit_and_preflight_refuse_a_foreign_supplementary_group() {
+    // `usermod -aG docker cadence-agent` hands the agent a
+    // root-equivalent socket — the §5 group set is the only allowance.
+    let lane = Lane::new();
+    let mut host = provisioned(&lane);
+    host.groups.insert(
+        "docker".to_string(),
+        cadence_agent::agent_uid::Group {
+            name: "docker".into(),
+            gid: 4242,
+            members: std::collections::BTreeSet::from([AGENT_USER.to_string()]),
+        },
+    );
+    assert_eq!(
+        row(&audit(&host), "agent-groups").level,
+        Level::Fail,
+        "a foreign supplementary group passed the audit"
+    );
+
+    // Preflight refuses it too — provision must not bless the grant.
+    let lane = Lane::new();
+    let mut host = lane.host();
+    run_provision(&mut host, &lane, false); // lands the agent account
+    host.groups.insert(
+        "sudo".to_string(),
+        cadence_agent::agent_uid::Group {
+            name: "sudo".into(),
+            gid: 4243,
+            members: std::collections::BTreeSet::from([AGENT_USER.to_string()]),
+        },
+    );
+    let report = run_provision(&mut host, &lane, false);
+    assert!(
+        report.refused(),
+        "provision re-ran clean over a foreign-group grant"
+    );
+}
+
+#[test]
+fn audit_fails_when_another_account_shares_the_agent_uid() {
+    // The passwd-map sweep: a second name answering to the agent's uid
+    // is the same collision under another name.
+    let lane = Lane::new();
+    let mut host = provisioned(&lane);
+    let auid = agent_uid(&host);
+    host.add_user_record("agent-twin", auid, 4242, "/home/agent-twin", "/bin/sh");
+    assert_eq!(
+        row(&audit(&host), "agent-user").level,
+        Level::Fail,
+        "a second account on the agent uid passed the audit"
+    );
+
+    // Preflight must refuse the same shape before arming anything.
+    let lane = Lane::new();
+    let mut host = lane.host();
+    run_provision(&mut host, &lane, false);
+    let auid = agent_uid(&host);
+    host.add_user_record("agent-twin", auid, 4242, "/home/agent-twin", "/bin/sh");
+    assert!(
+        run_provision(&mut host, &lane, false).refused(),
+        "provision blessed a uid collision"
+    );
+}
+
+#[test]
+fn helper_source_refuses_an_acl_write_grant() {
+    // A POSIX ACL granting the agent write on the helper source is a
+    // write vector modes can't express — the gate must consult it.
+    let lane = Lane::new();
+    let mut host = lane.host();
+    let key = lane.helper_src.display().to_string();
+    host.seed_acl(
+        &key,
+        AclEntry {
+            default: false,
+            tag: Principal::User(4242),
+            perms: 0b111,
+        },
+    );
+    assert!(
+        host.helper_source(&lane.helper_src).is_err(),
+        "an ACL write grant on the helper source passed the gate"
+    );
+    assert!(
+        run_provision(&mut host, &lane, false).refused(),
+        "an ACL-granted helper was installed"
+    );
+
+    // The mask gates the grant — a read-only-effective ACL is inert.
+    let lane = Lane::new();
+    let mut host = lane.host();
+    let key = lane.helper_src.display().to_string();
+    host.seed_acl(
+        &key,
+        AclEntry {
+            default: false,
+            tag: Principal::User(4242),
+            perms: 0b111,
+        },
+    );
+    host.seed_acl(
+        &key,
+        AclEntry {
+            default: false,
+            tag: Principal::Mask,
+            perms: 0b101,
+        },
+    );
+    assert!(
+        host.helper_source(&lane.helper_src).is_ok(),
+        "a mask-suppressed ACL grant was refused"
     );
 }
 

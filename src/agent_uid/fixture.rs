@@ -236,7 +236,9 @@ impl FixtureHost {
 
     /// The live source gate judged on recorded meta first, real fs
     /// second — a test can forge an agent-owned or group-writable
-    /// helper without `chown`.
+    /// helper without `chown`. ACLs come from the recorded map keyed
+    /// by the literal source path (tests seed them there — a test
+    /// process may not `setfacl`).
     fn check_source_meta(&self, src: &Path) -> io::Result<()> {
         use std::os::unix::fs::MetadataExt;
         let md = std::fs::symlink_metadata(src)?;
@@ -249,7 +251,8 @@ impl FixtureHost {
                 md.uid(),
             ),
         };
-        super::check_source(src, is_file, fmode, uid, &self.trusted_uids)
+        let acls = self.acl.get(&key).cloned().unwrap_or_default();
+        super::check_source(src, is_file, fmode, uid, &self.trusted_uids, &acls)
     }
 
     /// uid/gid a recorded path would report — the fixture's own
@@ -340,6 +343,12 @@ impl View for FixtureHost {
 
     fn read_link(&self, path: &str) -> io::Result<PathBuf> {
         std::fs::read_link(self.phys(path))
+    }
+
+    fn git_config(&self, path: &str) -> io::Result<Vec<(String, String)>> {
+        // Real git on the real bytes under the fixture root — the
+        // parse is identical to the live path, only the root differs.
+        super::git_config_file(&self.phys(path), path)
     }
 
     fn file_sha256(&self, path: &str) -> io::Result<[u8; 32]> {
