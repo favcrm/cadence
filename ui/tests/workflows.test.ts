@@ -63,6 +63,20 @@ async function main() {
     );
     equal(runFields(row({ inputs: [] })), [], "no inputs → no fields");
     equal(runFields(row({ inputs: null })), [], "absent inputs → no fields");
+    // CAD-571: a declared `example:` is the empty field's placeholder
+    // ("the topic placeholder is an example"); else the input's name.
+    equal(
+      runFields(
+        row({
+          inputs: [
+            { name: "topic", ask: "About what?", example: "How we onboard a new client" },
+            { name: "slug", ask: "Folder name", kind: "slug" },
+          ],
+        }),
+      ).map((f) => f.placeholder),
+      ["How we onboard a new client", "slug"],
+      "the example is the placeholder",
+    );
   }
 
   // providedInputs sends declared names only, trimmed, non-empty — an

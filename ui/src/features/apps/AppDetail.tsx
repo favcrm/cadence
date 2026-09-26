@@ -611,7 +611,9 @@ function RunDrawer({
   const primary = inputs[0]?.name ?? null;
   const slugInput = inputs.some((i) => i.name === "slug") ? "slug" : null;
   const team = teamFromLastRun(row, runs);
-  const action = primaryAction(app);
+  // The run's plain name — the workflow's own `label:` ("New post"),
+  // never the engine's "new run" (CAD-571).
+  const title = row.label?.trim() || "New run";
   return (
     <>
       <div className="fixed inset-0 bg-scrim z-20" onClick={onClose} />
@@ -621,9 +623,9 @@ function RunDrawer({
       >
         <header className="px-5 pt-4 pb-4 border-b border-ink-700 flex items-start gap-3 shrink-0">
           <div className="min-w-0 flex-1">
-            <div className="text-label text-ink-500">in {project} · new run</div>
+            <div className="text-label text-ink-500">in {project} · {title}</div>
             <h2 className="text-drawer font-semibold text-ink-100 leading-tight mt-1">
-              {action?.label ?? row.label ?? "New run"}
+              {title}
             </h2>
           </div>
           <button
@@ -654,7 +656,8 @@ function RunDrawer({
               primary,
               prefill: team,
               slugInput,
-              start: startLabel(action?.label),
+              title,
+              start: startLabel(title),
               // The rules in plain words: the plan waits for the
               // operator, and nothing goes out without them.
               note: "It waits for your approval before anything runs. Nothing is published without your OK.",

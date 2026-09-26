@@ -49,9 +49,22 @@ export function appPurpose(row: Pick<AppRow, "summary" | "title" | "name">): str
   return row.summary?.trim() || row.title?.trim() || row.name || "App";
 }
 
-/** The workflow a run starts from, and the action's label. */
+/**
+ * The workflow a run starts from, and the action's label — the same
+ * workflow the Apps list card's primary action opens: the detail's
+ * `primary` names it (the sorted first, CAD-563 r2), so a
+ * multi-workflow app never sends the card and the page to different
+ * runs (CAD-571 N5). Falls back to the first workflow when an older
+ * payload carries no `primary`.
+ */
 export function primaryAction(app: AppDetail): { wf: AppWorkflow; label: string } | null {
-  const wf = (app.workflows ?? [])[0];
+  const workflows = app.workflows ?? [];
+  const named = app.primary?.workflow
+    ? workflows.find(
+        (w) => w.name === app.primary?.workflow || w.name === `${app.name}/${app.primary?.workflow}`,
+      )
+    : undefined;
+  const wf = named ?? workflows[0];
   if (!wf) return null;
   return { wf, label: wf.label?.trim() || "New run" };
 }
@@ -115,9 +128,37 @@ export function startLabel(actionLabel: string | null | undefined): string {
 }
 
 /**
+ * The drawer's plain ask when required inputs are missing (CAD-571):
+ * "Add a topic", never the engine's "missing required inputs: topic,
+ * slug". While the topic is empty the folder name derives from it, so
+ * it is not named then; the team reads as one clause of its own.
+ */
+export function addMissing(
+  missing: string[],
+  primary: string | null,
+  slug: string | null,
+): string {
+  const derived = primary !== null && slug !== null && missing.includes(primary);
+  const names = missing.filter((n) => !(derived && n === slug));
+  const team = names.some((n) => teamRole(n) !== null);
+  const rest = names.filter((n) => teamRole(n) === null);
+  const clauses: string[] = [];
+  if (rest.length > 0) clauses.push(`Add ${rest.map(plainInput).join(" and ")}`);
+  if (team) clauses.push("choose the team");
+  const text = clauses.join(" and ");
+  return text === "" ? "Fill in the run's inputs." : `${text[0].toUpperCase()}${text.slice(1)}.`;
+}
+
+/** One input's plain word in the drawer's ask: "slug" → "a folder name". */
+function plainInput(name: string): string {
+  return name === "slug" ? "a folder name" : `a ${name}`;
+}
+
+/**
  * What is wrong with a hand-edited folder name, or null. The engine
- * takes any text, so the drawer checks it live instead of printing the
- * workflow's hint: lowercase words joined by hyphens.
+ * refuses a `kind: slug` input's value at render (`bad_shape`); this
+ * mirrors that rule — the same length cap and character set — so the
+ * drawer says it before propose does.
  */
 export function slugProblem(value: string): string | null {
   const v = value.trim();
@@ -352,19 +393,28 @@ export function filterCounts(
   return counts;
 }
 
-/** The team a new run starts with: the last run's owners, by step. */
+/**
+ * The team a new run starts with: the last run's owners, mapped to the
+ * role each step names — by the step's label ("Brief: my topic" →
+ * "Brief"), never by the ticket's index (CAD-571 N6). A workflow whose
+ * steps moved, grew or shrank still prefills the right agent for each
+ * role; an unmapped ticket is skipped.
+ */
 export function teamFromLastRun(wf: AppWorkflow, runs: AppRun[]): Record<string, string> {
-  const steps = wf.steps ?? [];
   const inputs = new Set((wf.inputs ?? []).map((i) => i.name));
-  const team = new Set(
-    steps.map((s) => s.agent).filter((a): a is string => !!a && inputs.has(a)),
-  );
+  const byLabel = new Map<string, string>();
+  for (const step of wf.steps ?? []) {
+    const input = step.agent;
+    if (!input || !inputs.has(input)) continue;
+    const label = stepLabel(step.title);
+    if (!byLabel.has(label)) byLabel.set(label, input);
+  }
   for (const run of [...runs].reverse()) {
     const out: Record<string, string> = {};
-    run.plan.tickets.forEach((ticket, i) => {
-      const input = steps[i]?.agent;
-      if (input && team.has(input) && ticket.owner) out[input] = ticket.owner;
-    });
+    for (const ticket of run.plan.tickets) {
+      const input = byLabel.get(stepLabel(ticket.title));
+      if (input && ticket.owner && !(input in out)) out[input] = ticket.owner;
+    }
     if (Object.keys(out).length > 0) return out;
   }
   return {};

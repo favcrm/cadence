@@ -14,6 +14,8 @@ export interface RunField {
   /** What the operator is asked — the frontmatter `ask`, else the name. */
   label: string;
   optional: boolean;
+  /** An example value to show in the empty field, else the input's name. */
+  placeholder: string;
 }
 
 /** The run form's fields, straight from the workflow's frontmatter inputs. */
@@ -22,6 +24,7 @@ export function runFields(row: WorkflowRow): RunField[] {
     name: input.name,
     label: input.ask?.trim() ? input.ask : input.name,
     optional: input.optional === true,
+    placeholder: input.example?.trim() || input.name,
   }));
 }
 
@@ -69,6 +72,11 @@ export function gateBlock(row: WorkflowRow): string | null {
   return `not approved for its current gate keys — approve it with \`cadence workflow approve ${row.name} --project ${row.project}\``;
 }
 
+/** The block a form shows while required inputs are empty. */
+export function missingBlock(names: string[]): string {
+  return `missing required ${names.length > 1 ? "inputs" : "input"}: ${names.join(", ")}`;
+}
+
 /**
  * Why the Propose button is disabled, checked in the order an operator
  * meets them: the board's own write gate, the workflow's gate, the
@@ -85,7 +93,7 @@ export function proposeBlock(
   if (gate) return gate;
   const missing = missingRequired(row, values);
   if (missing.length > 0) {
-    return `missing required ${missing.length > 1 ? "inputs" : "input"}: ${missing.join(", ")}`;
+    return missingBlock(missing);
   }
   if (!viewer.operator) {
     return "Proposing a run is the operator's — this board cannot prove the operator to the daemon. `cadence plan propose --workflow` does it from the shell.";
