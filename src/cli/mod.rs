@@ -1361,20 +1361,9 @@ pub(crate) enum Commands {
         /// plain progress lines.
         #[arg(long)]
         json: bool,
-        /// Operator identity outside a cadence pane, for example
-        /// `operator:ada`. Required outside a pane; inside one this
-        /// command is refused.
-        #[arg(long = "as")]
-        as_identity: Option<String>,
-        /// GitHub repository whose CI built and attested the binary.
-        #[arg(long, default_value = cadence_agent::upgrade::DEFAULT_REPO)]
-        repo: String,
-        /// Symlink that puts cadence on PATH [default: ~/.local/bin/cadence].
-        #[arg(long)]
-        link: Option<PathBuf>,
-        /// Releases directory [default: read off the current link].
-        #[arg(long)]
-        releases_dir: Option<PathBuf>,
+        /// Where the release lives and which repository is trusted.
+        #[command(flatten)]
+        target: UpdateTargetArgs,
     },
     /// A disposable Cadence beside production: its own state dir,
     /// tracker and board port under `$CADENCE_SANDBOX_ROOT` (default
@@ -3500,24 +3489,9 @@ pub(crate) fn run() -> Result<i32> {
             keep,
             backup_dir,
             json,
-            as_identity,
-            repo,
-            link,
-            releases_dir,
+            target,
         } => update::run(
-            state_dir,
-            action,
-            check,
-            rollback,
-            drain,
-            now,
-            keep,
-            backup_dir,
-            json,
-            as_identity,
-            repo,
-            link,
-            releases_dir,
+            state_dir, action, check, rollback, drain, now, keep, backup_dir, json, target,
         ),
         Commands::Sandbox { action } => sandbox::run(state_dir, action),
         Commands::Confine {
@@ -3526,6 +3500,43 @@ pub(crate) fn run() -> Result<i32> {
             command,
         } => confine::run(state_dir, read, write, command),
         Commands::McpPermission { timeout_secs } => mcp_permission::run(state_dir, timeout_secs),
+    }
+}
+
+/// Where a release lives, which repository is trusted, and the operator
+/// identity — shared by `cadence update` and `cadence update status` so
+/// the flags parse on either side of the subcommand.
+#[derive(clap::Args, Default)]
+pub(crate) struct UpdateTargetArgs {
+    /// Operator identity outside a cadence pane, for example
+    /// `operator:ada`. Required outside a pane; inside one this
+    /// command is refused.
+    #[arg(long = "as")]
+    as_identity: Option<String>,
+    /// GitHub repository whose CI built and attested the binary.
+    #[arg(long, default_value = cadence_agent::upgrade::DEFAULT_REPO)]
+    repo: String,
+    /// Symlink that puts cadence on PATH [default: ~/.local/bin/cadence].
+    #[arg(long)]
+    link: Option<PathBuf>,
+    /// Releases directory [default: read off the current link].
+    #[arg(long)]
+    releases_dir: Option<PathBuf>,
+}
+
+impl UpdateTargetArgs {
+    /// The subcommand's flags when it carried any, else the parent's.
+    fn or(self, parent: UpdateTargetArgs) -> UpdateTargetArgs {
+        UpdateTargetArgs {
+            as_identity: self.as_identity.or(parent.as_identity),
+            repo: if self.repo.is_empty() {
+                parent.repo
+            } else {
+                self.repo
+            },
+            link: self.link.or(parent.link),
+            releases_dir: self.releases_dir.or(parent.releases_dir),
+        }
     }
 }
 

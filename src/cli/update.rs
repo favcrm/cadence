@@ -6,7 +6,12 @@ use super::*;
 pub(crate) enum UpdateAction {
     /// Show the pending update, its phase and exactly what it waits on
     /// (the same view `cadence daemon status` carries).
-    Status,
+    Status {
+        /// The same release/identity flags the parent takes, so
+        /// `cadence update status --as operator:ada` works as written.
+        #[command(flatten)]
+        target: UpdateTargetArgs,
+    },
 }
 
 /// The operator identity `cadence update` runs under. Inside a pane the
@@ -17,10 +22,21 @@ pub(super) fn update_caller(
     as_identity: Option<&str>,
 ) -> Result<cadence_agent::rollout::Caller> {
     use cadence_agent::rollout;
+    // CAD-482: an armed fixture's in-band operator assertion answers
+    // before the pane check — the same order the proof itself uses.
+    // The assertion is the authority, so the pane/`--as` consistency
+    // rule does not apply to it (a fixture runs from a pane by design).
+    let asserted_operator = matches!(
+        cadence_agent::test_seam::process_asserted(state_dir),
+        Ok(Some(cadence_agent::test_seam::Asserted::Operator))
+    );
+    if asserted_operator {
+        return rollout::resolve_caller_with(None, as_identity.or(Some("operator")));
+    }
     if let Some(alias) = std::env::var("CADENCE_ALIAS")
         .ok()
         .map(|a| a.trim().to_string())
-        .filter(|a| !a.is_empty())
+        .filter(|a| !a.is_empty() && !asserted_operator)
     {
         return Err(Error::rejected(format!(
             "cadence update is an operator action — this shell is cadence pane '{alias}'. \
@@ -154,15 +170,16 @@ pub(super) fn run(
     keep: u64,
     backup_dir: Option<PathBuf>,
     json: bool,
-    as_identity: Option<String>,
-    repo: String,
-    link: Option<PathBuf>,
-    releases_dir: Option<PathBuf>,
+    target: UpdateTargetArgs,
 ) -> Result<i32> {
+    let (status, target) = match action {
+        Some(UpdateAction::Status { target: own }) => (true, own.or(target)),
+        None => (false, target),
+    };
     run_update(
         &state_dir,
         UpdateArgs {
-            status: matches!(action, Some(UpdateAction::Status)),
+            status,
             check,
             rollback,
             drain,
@@ -170,10 +187,10 @@ pub(super) fn run(
             keep,
             backup_dir,
             json,
-            as_identity,
-            repo,
-            link,
-            releases_dir,
+            as_identity: target.as_identity,
+            repo: target.repo,
+            link: target.link,
+            releases_dir: target.releases_dir,
         },
     )
 }
