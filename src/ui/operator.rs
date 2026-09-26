@@ -149,6 +149,15 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     // connection, so the daemon attributes the approval to whoever that
     // connection proves — operator-only, like `plan_approve`.
     route("POST", "/api/apps/*/*/approve", RouteClass::OperatorOnly),
+    // CAD-580: the wiki routes carry the caller's own wiki_as to the
+    // daemon — every admitted caller (operator, named member, the
+    // attributed agent) writes, and the daemon's per-prefix allowlist
+    // decides where. The board relays; it never widens a caller.
+    route("PUT", "/api/wiki/file", RouteClass::AgentAllowed),
+    route("POST", "/api/wiki/upload", RouteClass::AgentAllowed),
+    route("POST", "/api/wiki/mkdir", RouteClass::AgentAllowed),
+    route("POST", "/api/wiki/mv", RouteClass::AgentAllowed),
+    route("POST", "/api/wiki/rm", RouteClass::AgentAllowed),
     route("POST", "/api/memories/*/*/accept", RouteClass::Refused),
     route("POST", "/api/memories/*/*/reject", RouteClass::Refused),
     route("POST", "/api/session", RouteClass::Session),
@@ -213,6 +222,11 @@ pub(super) fn admit(
     }
     let ct = if path.ends_with("/artifacts") {
         "application/octet-stream"
+    } else if path == "/api/wiki/upload" {
+        // Multipart is the one non-exact rule — `write_guard` checks
+        // the bounded `multipart/form-data; boundary=` prefix; the
+        // header/origin/fetch-site guards still run exact.
+        "multipart/form-data"
     } else {
         "application/json"
     };

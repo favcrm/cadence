@@ -47,6 +47,7 @@ mod read_model;
 mod stages;
 mod threads;
 mod updates;
+mod wiki;
 mod workflows;
 
 pub use operator::{route_class, RouteClass, WriteRoute, WRITE_ROUTES};
@@ -1360,7 +1361,16 @@ fn write_guard(
     opts: &ServeOpts,
 ) -> std::result::Result<(), HttpResp> {
     let ct = header_value(request, "Content-Type").unwrap_or_default();
-    if ct.trim() != want_ct {
+    // `multipart/form-data` is the one non-exact rule (CAD-580 wiki
+    // upload): the boundary parameter must ride the type, so the check
+    // is a bounded prefix — never a bare "simple" form type.
+    let ct_ok = if want_ct == "multipart/form-data" {
+        let v = ct.trim();
+        v.starts_with("multipart/form-data; boundary=") && v.len() <= 200
+    } else {
+        ct.trim() == want_ct
+    };
+    if !ct_ok {
         return Err(guard_fail(
             "content_type",
             &format!("content-type must be exactly '{want_ct}'"),
@@ -2100,6 +2110,26 @@ fn write_route(
         send(request, resp);
         return;
     }
+    // The wiki routes (CAD-580): the caller `admit` derived rides
+    // `wiki_as` to the daemon — writes and uploads relay, paths and
+    // ACLs are the daemon's, the board only ever shrinks a caller.
+    if let Some(tail) = path.strip_prefix("/api/wiki/") {
+        let Some(caller) = caller else {
+            send(request, err_response(500, "unadmitted write"));
+            return;
+        };
+        let resp = wiki::write(
+            &mut request,
+            method,
+            tail,
+            &caller,
+            query,
+            state_dir,
+            pm_dir,
+        );
+        send(request, resp);
+        return;
+    }
     let Some(rest) = path.strip_prefix("/api/issues") else {
         send(request, err_response(404, "no such write route"));
         return;
@@ -2563,7 +2593,10 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
     };
     let method = request.method().clone();
     let head_only = method == Method::Head;
-    let is_write = matches!(method, Method::Post | Method::Patch | Method::Delete);
+    let is_write = matches!(
+        method,
+        Method::Post | Method::Patch | Method::Delete | Method::Put
+    );
     if !matches!(method, Method::Get | Method::Head) && !is_write {
         let _ = request.respond(err_response(405, "method not allowed"));
         return;
@@ -2991,6 +3024,15 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             }
         }
         _ => {
+            // The wiki reads (CAD-580): the request's caller — session,
+            // named member, attributed agent — rides `wiki_as`; a caller
+            // the board cannot attribute is refused before the daemon
+            // sees it. Blob pages stream `.blobs/<sha>` with ranges.
+            if let Some(tail) = path.strip_prefix("/api/wiki/") {
+                let resp = wiki::read(&request, tail, &query, state_dir, pm_dir, opts);
+                send(request, resp);
+                return;
+            }
             // A selected project's bounded, tracked-document context. The
             // project key is resolved through the PM registry before any repo
             // path is touched; no request value becomes a filesystem path.

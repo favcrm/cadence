@@ -47,6 +47,8 @@ use unicode_normalization::UnicodeNormalization;
 use crate::error::{Error, Result};
 use crate::issue::Pm;
 
+pub mod cli;
+
 /// `if_rev` value meaning "the page does not exist yet" — a
 /// create-only write. Any real content rev is `fnv1a:<16 hex>`.
 pub const ABSENT: &str = "none";
@@ -77,7 +79,10 @@ pub enum Caller {
     /// A registered agent; `project` is its cwd's tracker project
     /// ([`crate::issue::project::key_for_cwd`]) — `None` when the cwd
     /// is no project's repo.
-    Agent { alias: String, project: Option<String> },
+    Agent {
+        alias: String,
+        project: Option<String>,
+    },
     /// A named board session's handle (the board relays
     /// `user:<author>`).
     User(String),
@@ -122,16 +127,8 @@ impl Op {
 ///
 /// `segs` are normalized segments (empty = the root, for `ls`).
 pub fn allowed(caller: &Caller, op: Op, segs: &[&str]) -> Result<()> {
-    let verb = || {
-        format!(
-            "wiki {} '/{}' refused",
-            op.as_str(),
-            segs.join("/")
-        )
-    };
-    let no = |why: &str| -> Result<()> {
-        Err(Error::rejected(format!("{}: {why}", verb())))
-    };
+    let verb = || format!("wiki {} '/{}' refused", op.as_str(), segs.join("/"));
+    let no = |why: &str| -> Result<()> { Err(Error::rejected(format!("{}: {why}", verb()))) };
     let top = segs.first().copied().unwrap_or("");
     match top {
         "" => match op {
@@ -156,16 +153,16 @@ pub fn allowed(caller: &Caller, op: Op, segs: &[&str]) -> Result<()> {
                 Op::Read => Ok(()),
                 Op::Write => match caller {
                     Caller::Operator => Ok(()),
-                    Caller::Agent { alias, project }
-                        if project.as_deref() == Some(segs[1]) =>
-                    {
+                    Caller::Agent { alias, project } if project.as_deref() == Some(segs[1]) => {
                         let _ = alias;
                         Ok(())
                     }
                     Caller::Agent { project, .. } => no(&format!(
                         "agents write only their own project's folder (this agent's \
                          project: {})",
-                        project.as_deref().unwrap_or("none — cwd is no project repo")
+                        project
+                            .as_deref()
+                            .unwrap_or("none — cwd is no project repo")
                     )),
                     _ => no("only the operator and the project's own agents write projects/"),
                 },
@@ -176,9 +173,7 @@ pub fn allowed(caller: &Caller, op: Op, segs: &[&str]) -> Result<()> {
                 // `agents/` and `agents/<a>/` — listing folders.
                 return match op {
                     Op::Read => Ok(()),
-                    Op::Write => {
-                        no("agent folders are layout — write under knowledge/ instead")
-                    }
+                    Op::Write => no("agent folders are layout — write under knowledge/ instead"),
                 };
             }
             let area = segs[2];
@@ -192,19 +187,15 @@ pub fn allowed(caller: &Caller, op: Op, segs: &[&str]) -> Result<()> {
                 },
                 "memory" => match op {
                     Op::Read => Ok(()),
-                    Op::Write => no(
-                        "memory/ is a read-only view of the memory store — propose \
-                         through `cadence memory`",
-                    ),
+                    Op::Write => no("memory/ is a read-only view of the memory store — propose \
+                         through `cadence memory`"),
                 },
                 "knowledge" => match op {
                     Op::Read => Ok(()),
                     Op::Write => match caller {
                         Caller::Operator => Ok(()),
                         Caller::Agent { alias, .. } if alias == segs[1] => Ok(()),
-                        Caller::Agent { .. } => {
-                            no("an agent writes only its own knowledge/")
-                        }
+                        Caller::Agent { .. } => no("an agent writes only its own knowledge/"),
                         _ => no("only the operator and the agent itself write knowledge/"),
                     },
                 },
@@ -247,7 +238,9 @@ pub fn allowed(caller: &Caller, op: Op, segs: &[&str]) -> Result<()> {
 /// paths.
 pub fn normalize(path: &str) -> Result<String> {
     let bad = |why: &str| -> Result<String> {
-        Err(Error::rejected(format!("wiki path '{path}' refused: {why}")))
+        Err(Error::rejected(format!(
+            "wiki path '{path}' refused: {why}"
+        )))
     };
     if path.len() > PATH_CAP {
         return bad("path is too long");
@@ -279,9 +272,10 @@ pub fn normalize(path: &str) -> Result<String> {
         if seg.len() > SEG_CAP {
             return bad("a path segment is over 255 bytes");
         }
-        if seg.chars().any(|c| {
-            c == '\\' || c == '%' || c.is_control() || c == '\u{7f}' || c == '\u{202e}'
-        }) {
+        if seg
+            .chars()
+            .any(|c| c == '\\' || c == '%' || c.is_control() || c == '\u{7f}' || c == '\u{202e}')
+        {
             return bad("segments carry no '\\', '%', control or bidi-override bytes");
         }
         segs.push(seg);
@@ -335,7 +329,10 @@ fn git_rel(pm: &Pm, abs: &Path) -> Result<PathBuf> {
 /// a real directory entry. A missing leaf is fine (a write creates
 /// it); a missing ancestor is fine (mkdir -p at write).
 fn resolve(vault: &Path, norm: &str) -> Result<PathBuf> {
-    if vault.symlink_metadata().is_ok_and(|m| m.file_type().is_symlink()) {
+    if vault
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink())
+    {
         return Err(Error::rejected(format!(
             "wiki vault {} is a symlink — refusing to resolve through it",
             vault.display()
@@ -422,8 +419,16 @@ enum View {
 fn classify(segs: &[&str]) -> View {
     if segs.len() >= 3 && segs[0] == "agents" {
         match segs[2] {
-            "profile" => return View::Profile { alias: segs[1].to_string() },
-            "memory" => return View::Memory { alias: segs[1].to_string() },
+            "profile" => {
+                return View::Profile {
+                    alias: segs[1].to_string(),
+                }
+            }
+            "memory" => {
+                return View::Memory {
+                    alias: segs[1].to_string(),
+                }
+            }
             _ => {}
         }
     }
@@ -528,10 +533,7 @@ fn read_dir_entries(dir: &Path, base: &str) -> Result<Vec<Entry>> {
                 },
                 kind: "blob",
                 size: meta.get("size").and_then(Value::as_u64),
-                mime: meta
-                    .get("mime")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
+                mime: meta.get("mime").and_then(Value::as_str).map(str::to_string),
             });
         } else if ft.is_file() {
             seen.insert(name.clone());
@@ -669,7 +671,7 @@ pub fn ls(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
     }
 
     match segs[..] {
-        [a] if a == "agents" => {
+        ["agents"] => {
             let mut out = Vec::new();
             for alias in agent_dirs(pm, &vault)? {
                 out.push(
@@ -831,7 +833,9 @@ fn profile_file(pm: &Pm, alias: &str, name: &str) -> Result<PathBuf> {
 pub fn read(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
     let norm = normalize(path)?;
     if norm.is_empty() {
-        return Err(Error::rejected("wiki read '' refused: the root is a directory"));
+        return Err(Error::rejected(
+            "wiki read '' refused: the root is a directory",
+        ));
     }
     let segs: Vec<&str> = norm.split('/').collect();
     allowed(caller, Op::Read, &segs)?;
@@ -851,9 +855,8 @@ pub fn read(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
                     "wiki read '{norm}' refused: file over the {VIEW_CAP}-byte cap"
                 )));
             }
-            let text = std::fs::read_to_string(&file).map_err(|e| {
-                Error::rejected(format!("wiki read '{norm}': {e}"))
-            })?;
+            let text = std::fs::read_to_string(&file)
+                .map_err(|e| Error::rejected(format!("wiki read '{norm}': {e}")))?;
             return Ok(json!({
                 "path": norm,
                 "kind": "text",
@@ -869,9 +872,8 @@ pub fn read(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
                 )));
             }
             let file = memory_file(pm, &alias, segs[3], segs[4])?;
-            let text = std::fs::read_to_string(&file).map_err(|e| {
-                Error::rejected(format!("wiki read '{norm}': {e}"))
-            })?;
+            let text = std::fs::read_to_string(&file)
+                .map_err(|e| Error::rejected(format!("wiki read '{norm}': {e}")))?;
             return Ok(json!({
                 "path": norm,
                 "kind": "text",
@@ -941,7 +943,9 @@ pub fn write(
 ) -> Result<Value> {
     let norm = normalize(path)?;
     if norm.is_empty() {
-        return Err(Error::rejected("wiki write '' refused: the root is a directory"));
+        return Err(Error::rejected(
+            "wiki write '' refused: the root is a directory",
+        ));
     }
     let segs: Vec<&str> = norm.split('/').collect();
     allowed(caller, Op::Write, &segs)?;
@@ -985,14 +989,7 @@ pub fn write(
     }
     let subject = format!("wiki: write {norm}");
     let actor = caller.actor();
-    let committed = crate::issue::write::commit_who(
-        pm,
-        &paths,
-        &subject,
-        &[],
-        &actor,
-        None,
-    );
+    let committed = crate::issue::write::commit_who(pm, &paths, &subject, &[], &actor, None);
     if let Err(e) = committed {
         restore(&abs, before);
         return Err(e);
@@ -1079,21 +1076,31 @@ pub fn mv(pm: &Pm, caller: &Caller, from: &str, to: &str) -> Result<Value> {
     let vault = vault_dir(pm)?;
 
     // A `.trash/<stamp>/<orig>` source is a restore: operator only.
+    // A trashed blob page keeps its `<orig>.blob` pointer name — the
+    // logical name is what normalizes (the pointer suffix is the
+    // store's own, never API-addressable elsewhere).
     let restoring = from.starts_with(".trash/");
-    let (src_abs, from_label) = if restoring {
+    let (src_abs, from_label, src_is_pointer) = if restoring {
         if !matches!(caller, Caller::Operator) {
             return Err(Error::rejected(
                 "wiki mv refused: restoring from .trash/ is the operator's",
             ));
         }
         let rel = from.trim_start_matches(".trash/");
-        let norm_rel = normalize(rel)?;
-        if norm_rel.is_empty() {
+        let (src_rel, is_pointer) = match rel.strip_suffix(".blob") {
+            Some(base) => {
+                let n = normalize(base)?;
+                (format!("{n}.blob"), true)
+            }
+            None => (normalize(rel)?, false),
+        };
+        if src_rel.trim_end_matches(".blob").is_empty() {
             return Err(Error::rejected("wiki mv refused: empty trash path"));
         }
         (
-            trash_dir(&vault).join(&norm_rel),
-            format!(".trash/{norm_rel}"),
+            trash_dir(&vault).join(&src_rel),
+            format!(".trash/{src_rel}"),
+            is_pointer,
         )
     } else {
         let norm_from = normalize(from)?;
@@ -1105,13 +1112,25 @@ pub fn mv(pm: &Pm, caller: &Caller, from: &str, to: &str) -> Result<Value> {
         if classify(&segs_from) != View::Real {
             unreachable!()
         }
-        (resolve(&vault, &norm_from)?, norm_from)
+        (resolve(&vault, &norm_from)?, norm_from, false)
     };
     allowed(caller, Op::Write, &segs_to)?;
     if classify(&segs_to) != View::Real {
         unreachable!()
     }
-    let dst_abs = resolve(&vault, &norm_to)?;
+    // A pointer restore lands the pointer at `<to>.blob`; every other
+    // move lands its source at `<to>`. Both spellings of the
+    // destination must be free (mv_real re-checks under the lock).
+    let dst_abs = if src_is_pointer {
+        if resolve(&vault, &norm_to)?.symlink_metadata().is_ok() {
+            return Err(Error::rejected(format!(
+                "wiki mv '{from_label}' → '{norm_to}' refused: destination exists"
+            )));
+        }
+        vault.join(format!("{norm_to}.blob"))
+    } else {
+        resolve(&vault, &norm_to)?
+    };
 
     // Never move a dir into itself or its own descendant.
     if dst_abs.starts_with(&src_abs) {
@@ -1123,10 +1142,18 @@ pub fn mv(pm: &Pm, caller: &Caller, from: &str, to: &str) -> Result<Value> {
     match src_abs.symlink_metadata() {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // A blob page moves its pointer file.
+            // A blob page moves its pointer file — on a restore the
+            // pointer is what `.trash/<stamp>/<orig>.blob` holds.
             let pointer = vault.join(format!("{from_label}.blob"));
-            if !restoring && pointer.is_file() {
-                return mv_real(pm, caller, &pointer, &vault.join(format!("{norm_to}.blob")), &from_label, &norm_to);
+            if pointer.is_file() {
+                return mv_real(
+                    pm,
+                    caller,
+                    &pointer,
+                    &vault.join(format!("{norm_to}.blob")),
+                    &from_label,
+                    &norm_to,
+                );
             }
             return Err(Error::rejected(format!(
                 "wiki mv '{from_label}': no such page"
@@ -1211,9 +1238,7 @@ pub fn rm(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
         .unwrap_or(0);
     let nonce = &uuid::Uuid::new_v4().simple().to_string()[..8];
     let rel = src.strip_prefix(&vault).unwrap_or(&src);
-    let dst = trash_dir(&vault)
-        .join(format!("{stamp}-{nonce}"))
-        .join(rel);
+    let dst = trash_dir(&vault).join(format!("{stamp}-{nonce}")).join(rel);
     let restore = format!(".trash/{stamp}-{nonce}/{}", rel.display());
     let _lock = pm.lock()?;
     let gitignore = ensure_layout(pm)?;
@@ -1261,9 +1286,7 @@ fn sniff_mime(head: &[u8]) -> &'static str {
         [0x89, b'P', b'N', b'G', ..] => "image/png",
         [0xff, 0xd8, 0xff, ..] => "image/jpeg",
         [b'G', b'I', b'F', b'8', ..] => "image/gif",
-        [b'R', b'I', b'F', b'F', ..] if head.len() >= 12 && &head[8..12] == b"WEBP" => {
-            "image/webp"
-        }
+        [b'R', b'I', b'F', b'F', ..] if head.len() >= 12 && &head[8..12] == b"WEBP" => "image/webp",
         [b'%', b'P', b'D', b'F', ..] => "application/pdf",
         [b'P', b'K', 0x03, 0x04, ..] => "application/zip",
         [0x00, 0x00, 0x00, ..] if head.len() >= 12 && &head[4..8] == b"ftyp" => "video/mp4",
@@ -1272,8 +1295,7 @@ fn sniff_mime(head: &[u8]) -> &'static str {
             if std::str::from_utf8(head).is_ok() {
                 let text = std::str::from_utf8(head).unwrap_or_default();
                 let lower = text.trim_start().to_lowercase();
-                if lower.starts_with("<?xml") && lower.contains("<svg")
-                    || lower.starts_with("<svg")
+                if lower.starts_with("<?xml") && lower.contains("<svg") || lower.starts_with("<svg")
                 {
                     "image/svg+xml"
                 } else if lower.starts_with("<!doctype html") || lower.starts_with("<html") {
@@ -1308,7 +1330,9 @@ pub fn put_blob(
 ) -> Result<Value> {
     let norm = normalize(path)?;
     if norm.is_empty() {
-        return Err(Error::rejected("wiki put_blob '' refused: the root is a directory"));
+        return Err(Error::rejected(
+            "wiki put_blob '' refused: the root is a directory",
+        ));
     }
     let segs: Vec<&str> = norm.split('/').collect();
     allowed(caller, Op::Write, &segs)?;
@@ -1320,9 +1344,7 @@ pub fn put_blob(
     // The tmp must live under <state>/wiki-uploads/ — canonicalized
     // so `..` and symlink tricks cannot escape the check.
     let uploads = state_dir.join(UPLOAD_DIR);
-    let uploads_canon = uploads
-        .canonicalize()
-        .unwrap_or_else(|_| uploads.clone());
+    let uploads_canon = uploads.canonicalize().unwrap_or_else(|_| uploads.clone());
     let tmp_canon = tmp
         .canonicalize()
         .map_err(|e| Error::rejected(format!("wiki put_blob tmp {}: {e}", tmp.display())))?;
@@ -1334,7 +1356,9 @@ pub fn put_blob(
     }
     let meta = tmp_canon.symlink_metadata()?;
     if !meta.is_file() || meta.file_type().is_symlink() {
-        return Err(Error::rejected("wiki put_blob refused: tmp is not a regular file"));
+        return Err(Error::rejected(
+            "wiki put_blob refused: tmp is not a regular file",
+        ));
     }
     let cap = pm.config.wiki.max_upload_bytes;
     if meta.len() > cap {
@@ -1532,7 +1556,9 @@ pub fn search(pm: &Pm, caller: &Caller, q: &str, base: &str) -> Result<Value> {
 pub fn history(pm: &Pm, caller: &Caller, path: &str, limit: usize) -> Result<Value> {
     let norm = normalize(path)?;
     if norm.is_empty() {
-        return Err(Error::rejected("wiki history '' refused: the root has no file log"));
+        return Err(Error::rejected(
+            "wiki history '' refused: the root has no file log",
+        ));
     }
     let segs: Vec<&str> = norm.split('/').collect();
     allowed(caller, Op::Read, &segs)?;
@@ -1578,7 +1604,7 @@ pub fn history(pm: &Pm, caller: &Caller, path: &str, limit: usize) -> Result<Val
     for rel in &rels {
         args.push(rel.clone().into_os_string());
     }
-    let out = Command::new("git").args(&args).output()?;
+    let out = crate::reaper::output(Command::new("git").args(&args))?;
     if !out.status.success() {
         return Err(Error::internal(format!(
             "git log failed: {}",
@@ -1683,7 +1709,12 @@ mod tests {
             // agents/<a>/memory/: read-only view for everyone.
             (&public, Op::Read, "agents/swe-1/memory/cadence/x.md", true),
             (&op, Op::Write, "agents/swe-1/memory/cadence/x.md", false),
-            (&agent(), Op::Write, "agents/swe-1/memory/cadence/x.md", false),
+            (
+                &agent(),
+                Op::Write,
+                "agents/swe-1/memory/cadence/x.md",
+                false,
+            ),
             // agents/<a>/knowledge/: all read; self + operator write.
             (&public, Op::Read, "agents/swe-1/knowledge/n.md", true),
             (&agent(), Op::Read, "agents/other/knowledge/n.md", true),
@@ -1761,7 +1792,10 @@ mod tests {
             ("", ""),
             ("global/notes.md", "global/notes.md"),
             ("projects/cadence/spec v2.md", "projects/cadence/spec v2.md"),
-            ("agents/swe-1/knowledge/日本語.md", "agents/swe-1/knowledge/日本語.md"),
+            (
+                "agents/swe-1/knowledge/日本語.md",
+                "agents/swe-1/knowledge/日本語.md",
+            ),
         ] {
             assert_eq!(normalize(raw).unwrap(), want, "'{raw}'");
         }
@@ -1785,6 +1819,9 @@ mod tests {
         assert_eq!(sniff_mime(b"<svg xmlns='x'></svg>"), "image/svg+xml");
         assert_eq!(sniff_mime(b"<!DOCTYPE html><html>"), "text/html");
         assert_eq!(sniff_mime(b"hello world"), "text/plain");
-        assert_eq!(sniff_mime(&[0xde, 0xad, 0xbe, 0xef]), "application/octet-stream");
+        assert_eq!(
+            sniff_mime(&[0xde, 0xad, 0xbe, 0xef]),
+            "application/octet-stream"
+        );
     }
 }

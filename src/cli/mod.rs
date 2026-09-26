@@ -55,6 +55,7 @@ mod thread;
 mod ui;
 mod update;
 mod upgrade;
+mod wiki;
 mod workflow;
 
 use agent::AgentAction;
@@ -1134,6 +1135,12 @@ pub(crate) enum Commands {
     Memory {
         #[command(subcommand)]
         action: cadence_agent::memory::cli::MemoryAction,
+    },
+    /// The wiki: shared, scoped knowledge under the tracker's vault —
+    /// git-backed text pages and content-addressed blobs (CAD-580).
+    Wiki {
+        #[command(subcommand)]
+        action: cadence_agent::wiki::cli::WikiAction,
     },
     /// Credential scan (CAD-109): the check `issue comment`, `report`,
     /// `memory propose` and the intake relay run before they write.
@@ -3427,6 +3434,7 @@ pub(crate) fn run() -> Result<i32> {
         ),
         Commands::Intake { action } => intake::run(state_dir, action),
         Commands::Memory { action } => memory::run(state_dir, action),
+        Commands::Wiki { action } => wiki::run(state_dir, action),
         Commands::Secret { action } => secret::run(state_dir, action),
         Commands::Ui { action } => ui::run(state_dir, action),
         Commands::Status {

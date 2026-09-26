@@ -517,6 +517,46 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         "platform_outbox",
         Rule::Handler("operator_connection (CAD-546)"),
     ),
+    // CAD-580: the wiki v1 store. Every method binds `wiki_caller` —
+    // agent_caller on the connection (unproven refused), reconciled
+    // with `wiki_as` (operator connections only; an agent's claim must
+    // name itself). `wiki::allowed` then decides per path prefix.
+    (
+        "wiki_ls",
+        Rule::Handler("wiki_caller: agent_caller + wiki_as (CAD-580)"),
+    ),
+    (
+        "wiki_read",
+        Rule::Handler("wiki_caller: agent_caller + wiki_as (CAD-580)"),
+    ),
+    (
+        "wiki_write",
+        Rule::Handler("wiki_caller: agent_caller + wiki_as (CAD-580)"),
+    ),
+    (
+        "wiki_put_blob",
+        Rule::Handler("wiki_caller: agent_caller + wiki_as (CAD-580)"),
+    ),
+    (
+        "wiki_mkdir",
+        Rule::Handler("wiki_caller: agent_caller + wiki_as (CAD-580)"),
+    ),
+    (
+        "wiki_mv",
+        Rule::Handler("wiki_caller: agent_caller + wiki_as (CAD-580)"),
+    ),
+    (
+        "wiki_rm",
+        Rule::Handler("wiki_caller: agent_caller + wiki_as (CAD-580)"),
+    ),
+    (
+        "wiki_search",
+        Rule::Handler("wiki_caller: agent_caller + wiki_as (CAD-580)"),
+    ),
+    (
+        "wiki_history",
+        Rule::Handler("wiki_caller: agent_caller + wiki_as (CAD-580)"),
+    ),
 ];
 
 /// The rule for `method`; `None` for a method the daemon does not

@@ -46,6 +46,7 @@ mod slots_rpc;
 mod threads_rpc;
 mod timers;
 mod watch;
+mod wiki_rpc;
 
 use crate::adapter;
 use crate::adapter::registry;
@@ -2558,6 +2559,18 @@ impl Shared {
             "platform_effects" => self.rpc_platform_effects(params, peer_pid),
             "platform_effect_close" => self.rpc_platform_effect_close(params, peer_pid),
             "platform_outbox" => self.rpc_platform_outbox(params, peer_pid),
+            // CAD-580: the wiki v1 store — caller derived by
+            // `wiki_caller`; `wiki_as` binds only on an operator
+            // connection.
+            "wiki_ls" => self.rpc_wiki_ls(params, peer_pid),
+            "wiki_read" => self.rpc_wiki_read(params, peer_pid),
+            "wiki_write" => self.rpc_wiki_write(params, peer_pid),
+            "wiki_put_blob" => self.rpc_wiki_put_blob(params, peer_pid),
+            "wiki_mkdir" => self.rpc_wiki_mkdir(params, peer_pid),
+            "wiki_mv" => self.rpc_wiki_mv(params, peer_pid),
+            "wiki_rm" => self.rpc_wiki_rm(params, peer_pid),
+            "wiki_search" => self.rpc_wiki_search(params, peer_pid),
+            "wiki_history" => self.rpc_wiki_history(params, peer_pid),
             other => Err(Error::rejected(format!("Unknown method '{other}'"))),
         }
     }

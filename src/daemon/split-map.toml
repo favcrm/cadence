@@ -49,3 +49,6 @@ items = ["AGENT_GC_FLOOR_SECS", "AGENT_GC_EVERY", "AGENT_GC_RECHECK", "AgentGcTi
 
 [serve]
 items = ["run_lease_heartbeat", "trip_lease", "check_peer", "check_peer", "process_start_identity", "handle_conn", "acquire_singleton", "CheckupDispatch", "hosted_config", "flush_budget", "lease_flush", "resolve_slot_config", "INSTANCE_FILE", "SHUTDOWN_FILE", "MARKER_TTL_SECS", "HotStart", "HotStart", "write_file_atomic", "read_instance", "hot_restart_begin", "write_shutdown_marker", "relaunch_agents"]
+
+[wiki_rpc]
+items = ["wiki_caller", "wiki_as", "agent_wiki_caller", "reject_wiki_fields", "wiki_path", "rpc_wiki_ls", "rpc_wiki_read", "rpc_wiki_write", "rpc_wiki_put_blob", "rpc_wiki_mkdir", "rpc_wiki_mv", "rpc_wiki_rm", "rpc_wiki_search", "rpc_wiki_history", "valid_user_handle"]
