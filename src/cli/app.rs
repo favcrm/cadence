@@ -83,6 +83,21 @@ pub(crate) enum AppAction {
         #[arg(long)]
         project: String,
     },
+    /// Record the app's default team (CAD-577): one agent alias per
+    /// workflow input role, `<input>=<agent>` repeatable; `<input>=`
+    /// clears a role. The team lives with the install record and is
+    /// not part of the gate digest, so setting it never re-requires
+    /// approval. Operator only, through the daemon.
+    SetTeam {
+        /// App name.
+        name: String,
+        /// `<input>=<agent>` pairs — repeatable.
+        #[arg(long = "role", required = true)]
+        roles: Vec<String>,
+        /// Project key.
+        #[arg(long)]
+        project: String,
+    },
 }
 
 /// `cadence app …` (CAD-547). `install`/`update`/`set`/`remove` write
@@ -129,6 +144,15 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
             state_dir,
             "app_approve",
             json!({"project": project, "name": name}),
+        )?,
+        AppAction::SetTeam {
+            name,
+            roles,
+            project,
+        } => client::rpc(
+            state_dir,
+            "app_set_team",
+            json!({"project": project, "name": name, "team": roles}),
         )?,
     };
     print_json(&result);

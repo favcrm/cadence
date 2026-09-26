@@ -380,6 +380,49 @@ impl Shared {
         Ok(payload)
     }
 
+    /// CAD-577 `app_set_team` — the operator records an app's default
+    /// team: one agent alias per workflow input role. Operator only,
+    /// connection-bound like `app approve`. The team lives with the
+    /// install record and is NOT in the gate digest, so setting it
+    /// never re-requires approval; each role must be a team input the
+    /// app's workflows declare, and each agent a registered alias.
+    pub(super) fn rpc_app_set_team(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.operator_connection("app set team", params, peer_pid)?;
+        let project = required_str(params, "project")?;
+        crate::issue::model::check_key(project)?;
+        let name = required_str(params, "name")?;
+        let roles = match params.get("team") {
+            Some(Value::Array(list)) => list
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| Error::rejected("'team' holds a non-string role"))
+                })
+                .collect::<Result<Vec<_>>>()?,
+            Some(_) => return Err(Error::rejected("'team' must be a list of '<input>=<agent>'")),
+            None => return Err(Error::rejected("Missing or non-array 'team'")),
+        };
+        let pm_dir = self.pm_dir()?;
+        if !crate::issue::project::list(&pm_dir)?
+            .iter()
+            .any(|p| p.key == project)
+        {
+            return Err(crate::issue::project::unknown_project(project, &pm_dir));
+        }
+        let pm = self.pm_at(&pm_dir)?;
+        let out = crate::issue::app::set_team(
+            &pm,
+            project,
+            name,
+            &roles,
+            &self.state_dir,
+            "operator",
+        )?;
+        self.wake();
+        Ok(out)
+    }
+
     /// CAD-547 `app_approve` — the operator approves an installed app's
     /// structural digest: the manifest envelope (name, declared slots),
     /// each slot's effective binding, the `app.md` guide, every

@@ -100,7 +100,10 @@ pub struct Manifest {
 /// `apps/<name>.yaml` — the install record beside the content folder:
 /// where the bundle came from (a git install pins the commit SHA), when
 /// and by whom, and each slot's binding. In `bindings`, `null` is an
-/// explicit unbind and an absent slot is the `local` default.
+/// explicit unbind and an absent slot is the `local` default. `team`
+/// (CAD-577) is the app's default team — one agent alias per workflow
+/// input role — an operator-only write that is NOT part of the gate
+/// digest (a team change never re-requires approval).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Record {
@@ -109,6 +112,10 @@ pub struct Record {
     pub source: Source,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub bindings: BTreeMap<String, Option<String>>,
+    /// The app's default team (CAD-577): input role name → agent alias.
+    /// Stored with the install record, never in the digest.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub team: BTreeMap<String, String>,
     pub installed_at: String,
     pub installed_by: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1052,6 +1059,7 @@ pub fn install(
         app: name.clone(),
         source: src.clone(),
         bindings: BTreeMap::new(),
+        team: BTreeMap::new(),
         installed_at: now,
         installed_by: write::actor_who(actor, None),
         updated_at: None,
@@ -1523,6 +1531,119 @@ pub fn set(
     Ok(out)
 }
 
+/// `cadence app set-team <app> --role <input>=<agent> … --project <key>`
+/// (CAD-577) — record the app's default team: one agent alias per
+/// workflow input role. The team lives with the install record and is
+/// NOT part of the gate digest, so setting it never re-requires
+/// approval. Each role must be an input some workflow's step names as
+/// its agent (the team inputs the drawer fills); each agent must be a
+/// registered alias. An empty `--role <input>=` clears that role.
+/// Operator-only at the daemon (the board relays it through
+/// `operator_connection`); this function itself is the write.
+pub fn set_team(
+    pm: &Pm,
+    project_key: &str,
+    name: &str,
+    roles: &[String],
+    state_dir: &Path,
+    actor: &str,
+) -> Result<Value> {
+    if roles.is_empty() {
+        return Err(Error::rejected(
+            "app set-team needs <input>=<agent> — `cadence app show` lists the roles",
+        ));
+    }
+    model::check_key(project_key)?;
+    let _ = app_dir(&pm.dir, project_key, name)?;
+    let mut record = read_record(&pm.dir, project_key, name)?;
+    let roles_declared = team_roles(&pm.dir, project_key, name)?;
+    let known = daemon_aliases(state_dir);
+    let known: Option<HashSet<String>> = if known.is_empty() {
+        None
+    } else {
+        Some(known.into_iter().collect())
+    };
+    for role in roles {
+        let Some((input, agent)) = role.split_once('=') else {
+            return Err(Error::rejected(format!(
+                "app set-team takes <input>=<agent> — got '{role}'"
+            )));
+        };
+        if !roles_declared.iter().any(|r| r == input) {
+            return Err(Error::rejected(format!(
+                "app '{name}' has no team role '{input}' — its workflows name: {}",
+                if roles_declared.is_empty() {
+                    "none".to_string()
+                } else {
+                    roles_declared.join(", ")
+                }
+            )));
+        }
+        if agent.is_empty() {
+            record.team.remove(input);
+            continue;
+        }
+        crate::proto::identifier(agent, "agent alias")?;
+        if let Some(known) = &known {
+            if !known.contains(agent) {
+                return Err(Error::rejected(format!(
+                    "agent '{agent}' is not registered — `cadence agent list` lists them"
+                )));
+            }
+        }
+        record.team.insert(input.to_string(), agent.to_string());
+    }
+    let _lock = pm.lock()?;
+    let record_path = record_file(&pm.dir, project_key, name)?;
+    write_record(&record_path, &record)?;
+    let foreign = write::commit(
+        pm,
+        &[record_path],
+        &format!("{project_key}/{DIR}/{name}: default team set"),
+        &[],
+        actor,
+    )?;
+    let mut out = json!({
+        "project": project_key,
+        "name": name,
+        "team": record.team,
+        "committed": true,
+    });
+    write::attach_foreign(&mut out, &foreign);
+    Ok(out)
+}
+
+/// The team roles an app's workflows declare: every input some step
+/// names as its `agent:` (the same set the board's drawer fills by
+/// role). Sorted, deterministic.
+fn team_roles(pm_dir: &Path, project_key: &str, name: &str) -> Result<Vec<String>> {
+    let dir = app_dir(pm_dir, project_key, name)?;
+    let mut roles: Vec<String> = Vec::new();
+    for (rel, path) in bundle_files(&dir)? {
+        let Some(_wf) = rel
+            .strip_prefix("workflows/")
+            .and_then(|n| n.strip_suffix(".md"))
+        else {
+            continue;
+        };
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let Ok(tpl) = workflow::parse_template(&text) else {
+            continue;
+        };
+        let declared: HashSet<&String> = tpl.inputs.keys().collect();
+        let (_, body) = parse::split_front(&text).unwrap_or(("", ""));
+        for meta in workflow::ticket_meta(body).unwrap_or_default() {
+            for (key, value) in meta {
+                if key == "agent" && declared.contains(&value) && !roles.contains(&value) {
+                    roles.push(value);
+                }
+            }
+        }
+    }
+    roles.sort();
+    Ok(roles)
+}
+
 /// The connection names the daemon registers, best-effort — `local` is
 /// always in the set (the built-in contract, CAD-546 or not). `None`
 /// when the daemon is unreachable; callers then report "not verified"
@@ -1721,6 +1842,7 @@ fn describe(
         Err(e) => row["error"] = json!(e.to_string()),
     }
     row["source"] = serde_json::to_value(&record.source).unwrap_or(Value::Null);
+    row["team"] = json!(record.team);
     row["installed_at"] = json!(record.installed_at);
     row["installed_by"] = json!(record.installed_by);
     row["updated_at"] = json!(record.updated_at);

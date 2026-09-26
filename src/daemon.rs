@@ -2522,6 +2522,7 @@ impl Shared {
             })),
             "workflow_approve" => self.rpc_workflow_approve(params, peer_pid),
             "app_approve" => self.rpc_app_approve(params, peer_pid),
+            "app_set_team" => self.rpc_app_set_team(params, peer_pid),
             "master_dispatch" => self.rpc_master_dispatch(params, peer_pid),
             "question_escalate" => self.rpc_question_escalate(params, peer_pid),
             "agent_file_write" => self.rpc_agent_file_write(params, peer_pid),
