@@ -207,6 +207,8 @@ struct Host {
     board_build: RefCell<Option<String>>,
     /// Health answers the target after a restart (false: never).
     health_ok: Cell<bool>,
+    /// Whether a restart's health check failed (set by `restart`).
+    rolled_back: Cell<bool>,
     /// The board exists (None answers from `board_build`).
     board_running: Cell<bool>,
     restarts: RefCell<Vec<PathBuf>>,
@@ -245,6 +247,7 @@ impl Host {
             daemon_build: RefCell::new(Some(OLD.to_string())),
             board_build: RefCell::new(Some(OLD.to_string())),
             health_ok: Cell::new(true),
+            rolled_back: Cell::new(false),
             board_running: Cell::new(true),
             restarts: RefCell::new(Vec::new()),
             now: Cell::new(cadence_agent::rollout::unix_now()),
@@ -254,6 +257,11 @@ impl Host {
         install_release(&host.layout, OLD);
         link_to(&host.layout, OLD);
         host
+    }
+
+    /// Whether the last run rolled back (the tests' shorthand).
+    fn rolled_back_now(&self) -> bool {
+        self.rolled_back.get()
     }
 
     /// The lines printed so far, as one string.
@@ -325,6 +333,8 @@ impl UpdateHost for Host {
             if self.board_running.get() {
                 *self.board_build.borrow_mut() = Some(sha);
             }
+        } else {
+            self.rolled_back.set(true);
         }
         Ok(())
     }
@@ -515,6 +525,9 @@ fn a_second_run_says_already_up_to_date_and_touches_nothing() {
     let host = Host::new();
     install_release(&host.layout, NEW);
     link_to(&host.layout, NEW);
+    // A finished update: the daemon answers the new build too.
+    host.daemon_build.replace(Some(NEW.to_string()));
+    host.board_build.replace(Some(NEW.to_string()));
     let report = run(&host, &host.options()).unwrap();
     assert!(report.check.up_to_date);
     assert!(host.log().contains("already up to date"), "{}", host.log());
@@ -522,6 +535,33 @@ fn a_second_run_says_already_up_to_date_and_touches_nothing() {
     assert!(!host.draining.get());
     assert!(!host.source.called("download"));
     assert!(host.restarts.borrow().is_empty());
+}
+
+#[test]
+fn a_rerun_finishes_an_installed_release_whose_restart_did_not_happen() {
+    // The link already points at the target (a previous run installed
+    // it) but the daemon still answers with the old build: the re-run
+    // must finish the update — restart and health check — not stop at
+    // "already up to date".
+    let host = Host::new();
+    install_release(&host.layout, NEW);
+    link_to(&host.layout, NEW);
+    assert_eq!(host.daemon_build().unwrap().as_deref(), Some(OLD));
+    let report = run(&host, &host.options()).unwrap();
+    assert!(
+        host.log().contains("finishing the update"),
+        "{}",
+        host.log()
+    );
+    assert!(host
+        .log()
+        .contains("health: daemon and board answer on bbbb"));
+    assert_eq!(host.restarts.borrow().as_slice(), [host.layout.binary(NEW)]);
+    assert!(report.install.is_none() || report.install.as_ref().unwrap().is_null());
+    assert!(!host.rolled_back_now());
+    // No backup was taken for a run that installed nothing.
+    assert!(!update::default_backup_dir(&host.state_dir).exists());
+    assert_eq!(host.lease_row()["held"], serde_json::json!(false));
 }
 
 #[test]

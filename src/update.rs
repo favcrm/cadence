@@ -632,28 +632,14 @@ pub fn health_wait(
     }
 }
 
-/// Repoint the link and restart on `sha`. The install itself is
-/// [`upgrade::run`]'s (attested, hash-matched, side by side).
-fn install_and_restart(host: &dyn UpdateHost, sha: &str) -> Result<(Value, Value)> {
-    let layout = host.layout();
-    let install = upgrade::run(
-        host.source(),
-        layout,
-        &upgrade::Request {
-            target: upgrade::Target::Sha(sha.to_string()),
-            dry_run: false,
-            allow_unattested: false,
-            // The update took its own backup outside the state dir and
-            // recorded it as the lease receipt; upgrade's in-state-dir
-            // copy would be a second, weaker one.
-            backup_state_dir: None,
-        },
-    )?;
-    let binary = layout.binary(sha);
+/// The switch: restart the daemon on the already-installed `sha`. The
+/// install itself is [`upgrade::run`]'s (attested, hash-matched, side
+/// by side — it also moves the link).
+fn restart_on(host: &dyn UpdateHost, sha: &str) -> Result<Value> {
+    let binary = host.layout().binary(sha);
     host.progress(&format!("switching: restarting the daemon on {sha}"));
     host.restart(&binary)?;
-    let restart = json!({"binary": binary, "sha": sha});
-    Ok((install, restart))
+    Ok(json!({"binary": binary, "sha": sha}))
 }
 
 /// Run the update. `--check`/`status` never reach here.
@@ -665,7 +651,13 @@ pub fn run(host: &dyn UpdateHost, opts: &Options) -> Result<RunReport> {
         host.progress(&line);
         lines.push(line);
     }
-    if report.up_to_date {
+    // The release is already linked when a previous run installed it;
+    // if the daemon still answers with another build (a restart that did
+    // not happen), the run finishes that update instead of stopping at
+    // "already up to date".
+    let daemon = host.daemon_build()?;
+    let finish_restart = report.up_to_date && daemon.as_deref().is_some_and(|b| b != report.target);
+    if report.up_to_date && !finish_restart {
         let version = report
             .target_version
             .clone()
@@ -686,9 +678,18 @@ pub fn run(host: &dyn UpdateHost, opts: &Options) -> Result<RunReport> {
             lines,
         });
     }
+    if finish_restart {
+        let line = format!(
+            "{} is installed, but the daemon still runs {} — finishing the update",
+            report.target,
+            daemon.as_deref().unwrap_or("nothing")
+        );
+        host.progress(&line);
+        lines.push(line);
+    }
     // A lease another identity holds refuses here (never a raw error).
     let lease = take_lease(host, &report.target)?;
-    let outcome = run_inner(host, opts, &report, &mut lines);
+    let outcome = run_inner(host, opts, &report, &mut lines, !report.up_to_date);
     // Auto-release: the lease never outlives the update that took it.
     let released = release_lease(host, &lease);
     let _ = host.set_drain(false);
@@ -703,11 +704,16 @@ pub fn run(host: &dyn UpdateHost, opts: &Options) -> Result<RunReport> {
     Ok(report)
 }
 
+/// `install`: false when the release is already linked (a previous run
+/// installed it and the restart did not happen) — the backup and the
+/// install are skipped and the run goes straight to the drain and the
+/// switch, with the previous release as the rollback target.
 fn run_inner(
     host: &dyn UpdateHost,
     opts: &Options,
     report: &CheckReport,
     lines: &mut Vec<String>,
+    install: bool,
 ) -> Result<RunReport> {
     let target = report.target.clone();
     let mut progress = |host: &dyn UpdateHost, text: String| {
@@ -725,34 +731,44 @@ fn run_inner(
     //    crash leaves the fleet quiet, not mid-install.
     host.set_pending(Some(&pending("draining")))?;
     host.set_drain(true)?;
-    // 2. The backup, recorded as the lease receipt.
-    let backup = take_backup(host, opts)?;
-    progress(
-        host,
-        format!(
-            "backup: {} (recorded as the lease receipt)",
-            backup["backup"]["db"].as_str().unwrap_or("?")
-        ),
-    );
-    // 3. Install side by side (the link has not moved yet).
-    let install = upgrade::run(
-        host.source(),
-        host.layout(),
-        &upgrade::Request {
-            target: upgrade::Target::Sha(target.clone()),
-            dry_run: false,
-            allow_unattested: false,
-            backup_state_dir: None,
-        },
-    )?;
-    progress(
-        host,
-        format!(
-            "install: {target} staged ({})",
-            install["trust"].as_str().unwrap_or("?")
-        ),
-    );
-    // 4. Bounded drain.
+    // 2. The backup (outside the state dir by default), recorded as the
+    //    lease receipt, then the install: `upgrade::run` stages the
+    //    attested build side by side and moves the link. The daemon
+    //    keeps running the old build until the switch below.
+    let mut backup = Value::Null;
+    let mut install_report = Value::Null;
+    if install {
+        backup = take_backup(host, opts)?;
+        progress(
+            host,
+            format!(
+                "backup: {} (recorded as the lease receipt)",
+                backup["backup"]["db"].as_str().unwrap_or("?")
+            ),
+        );
+        install_report = upgrade::run(
+            host.source(),
+            host.layout(),
+            &upgrade::Request {
+                target: upgrade::Target::Sha(target.clone()),
+                dry_run: false,
+                allow_unattested: false,
+                // The update took its own backup outside the state dir
+                // and recorded it as the lease receipt; upgrade's
+                // in-state-dir copy would be a second, weaker one.
+                backup_state_dir: None,
+            },
+        )?;
+        progress(
+            host,
+            format!(
+                "install: {target} installed ({}) — the daemon still runs the old build \
+                 until the switch",
+                install_report["trust"].as_str().unwrap_or("?")
+            ),
+        );
+    }
+    // 3. Bounded drain.
     let mut last = String::new();
     let waited = host.now();
     let left = if opts.now {
@@ -796,10 +812,14 @@ fn run_inner(
         );
     }
     host.set_pending(Some(&pending("switching")))?;
-    // 5. Switch: the new binary restarts the daemon (and the board).
-    let (install, restart) = install_and_restart(host, &target)?;
-    // 6. Health check, with auto-rollback to the previous release.
-    let previous = report.current.clone();
+    // 4. Switch: the new binary restarts the daemon (and the board).
+    let restart = restart_on(host, &target)?;
+    // 5. Health check, with auto-rollback to the previous release.
+    let previous = if install {
+        report.current.clone()
+    } else {
+        previous_release(host)?
+    };
     let health = match health_wait(host, &target, HEALTH_TIMEOUT, || host.board_build()) {
         Ok(()) => json!({"ok": true, "build": target}),
         Err(e) => {
@@ -851,7 +871,7 @@ fn run_inner(
                 check: report.clone(),
                 lease: Some(json!({"holder": host.identity(), "released": true})),
                 backup: Some(backup),
-                install: Some(install),
+                install: Some(install_report),
                 drain,
                 restart,
                 health: json!({"ok": false, "build": target, "rolled_back_to": previous,
@@ -874,7 +894,7 @@ fn run_inner(
         check: report.clone(),
         lease: Some(json!({"holder": host.identity(), "released": true})),
         backup: Some(backup),
-        install: Some(install),
+        install: Some(install_report),
         drain,
         restart,
         health,
