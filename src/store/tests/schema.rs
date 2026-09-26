@@ -602,7 +602,35 @@
         assert!(has(&db, "platform_drafts"));
     }
 
-    /// v19 (CAD-577): `app_grants.install_id`. A v18 table has no such
+    #[test]
+    fn migration_v18_to_v19_creates_missing_app_grants() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("t.sqlite3");
+        {
+            let s = Store::open(&db).unwrap();
+            reg(&s, "a1", dir.path());
+            s.enqueue("a1", "keep me", None, "m1", "user").unwrap();
+        }
+        // The released v18 schema predates app_grants entirely.
+        Connection::open(&db).unwrap().execute_batch(
+            "DROP TABLE app_grants; UPDATE schema_version SET version=18;",
+        ).unwrap();
+        for _ in 0..2 {
+            let s = Store::open_for_schema_tests(&db).unwrap();
+            assert_eq!(s.message("m1").unwrap().unwrap().body, "keep me");
+            assert!(s.app_grants_apps().unwrap().is_empty());
+            let conn = Connection::open(&db).unwrap();
+            let install: String = conn.query_row(
+                "SELECT dflt_value FROM pragma_table_info('app_grants') WHERE name='install_id'",
+                [], |r| r.get(0),
+            ).unwrap();
+            assert_eq!(install, "''");
+            let version: i64 = conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0)).unwrap();
+            assert_eq!(version, crate::rollout::SCHEMA_VERSION);
+        }
+    }
+
+    /// v19 (CAD-577): `app_grants.install_id`. A legacy table has no such
     /// column; the migration adds it (empty on existing rows) without
     /// dropping the grants. A fresh create already has the column, so
     /// this rebuilds a genuine v18 table first.
@@ -628,6 +656,7 @@
                    FROM app_grants;
                  DROP TABLE app_grants;
                  ALTER TABLE app_grants_v18 RENAME TO app_grants;
+                 INSERT INTO app_grants VALUES ('blog', 'a1', 'mail', 'work', '["send"]', 42, 'operator:test');
                  UPDATE schema_version SET version=18;",
             )
             .unwrap();
@@ -649,4 +678,12 @@
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, crate::rollout::SCHEMA_VERSION);
+        for _ in 0..2 {
+            Store::open_for_schema_tests(&db).unwrap();
+            let row: (String, String, f64, String, String) = Connection::open(&db).unwrap().query_row(
+                "SELECT agent, scopes, granted_at, by, install_id FROM app_grants WHERE app='blog'",
+                [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            ).unwrap();
+            assert_eq!(row, ("a1".into(), "[\"send\"]".into(), 42.0, "operator:test".into(), "".into()));
+        }
     }

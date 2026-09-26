@@ -4885,6 +4885,40 @@ fn cad384_operator_daemon_stop_from_a_plain_shell() {
     assert!(d.rpc("health", json!({})).is_err());
 }
 
+/// CAD-626: rollback must restart the previous binary even when the
+/// failed replacement never reached its RPC socket. Exercise the actual
+/// CLI, singleton lock and detached daemon rather than the update mock.
+#[test]
+fn cad626_restart_recovers_an_unreachable_daemon() {
+    for when_idle in [false, true] {
+        let mut d = TestDaemon::start_process_in(TempDir::new().unwrap());
+        let (ok, out, err) = d.operator_cadence(&[
+            "rollout",
+            "claim",
+            "--reason",
+            "rollback recovery test",
+            "--as",
+            "operator:test",
+        ]);
+        assert!(ok, "claim: {out} {err}");
+        let (ok, out, err) = d.operator_cadence(&["daemon", "stop"]);
+        assert!(ok, "stop: {out} {err}");
+        d.process.take().unwrap().wait().unwrap();
+        assert!(d.rpc("health", json!({})).is_err());
+        let mut args = vec!["daemon", "restart", "--as", "operator:test"];
+        if when_idle {
+            args.extend(["--when-idle", "--timeout", "1"]);
+        }
+        let (ok, out, err) = d.operator_cadence(&args);
+        // Clean up even when a failing assertion would otherwise leave
+        // the replacement detached from this fixture's Child handle.
+        let health = d.rpc("health", json!({}));
+        let _ = d.operator_cadence(&["daemon", "stop"]);
+        assert!(ok, "when_idle={when_idle}: {out} {err}");
+        assert!(health.is_ok(), "recovery never became healthy: {health:?}");
+    }
+}
+
 /// CAD-384 round 2 (R2-1): the sandbox exemption belongs to a SANDBOX
 /// daemon only. On a real `daemon run` outside any sandbox, a caller
 /// whose ancestor carries an alias this daemon never registered (a
