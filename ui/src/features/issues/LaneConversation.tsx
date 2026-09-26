@@ -2,6 +2,7 @@ import { useContext, useEffect, useState } from "react";
 import { api, ApiError } from "../../lib/api";
 import { WriteGate } from "../auth/WriteGate";
 import { asEntry, type ThreadEntry } from "../home/thread";
+import Button from "../../ui/Button";
 import Md from "../../ui/Md";
 import { composerBlocked, isStatusAsk, statusText } from "./lane";
 
@@ -100,24 +101,26 @@ export function LaneConversation({
         })}
       </ol>
       <div className="flex gap-2">
-        <button
-          type="button"
-          className="chip"
-          data-testid="lane-mode-ask"
-          aria-pressed={active === "ask"}
-          onClick={() => setMode("ask")}
-        >
-          Ask for status
-        </button>
-        <button
-          type="button"
-          className="chip"
-          data-testid="lane-mode-instruct"
-          aria-pressed={active === "instruct"}
-          onClick={() => setMode("instruct")}
-        >
-          Instruction
-        </button>
+        <span data-testid="lane-mode-ask" className="inline-flex">
+          <Button
+            size="sm"
+            variant={active === "ask" ? "primary" : "ghost"}
+            aria-label="Ask for status"
+            onClick={() => setMode("ask")}
+          >
+            Ask for status
+          </Button>
+        </span>
+        <span data-testid="lane-mode-instruct" className="inline-flex">
+          <Button
+            size="sm"
+            variant={active === "instruct" ? "primary" : "ghost"}
+            aria-label="Instruction"
+            onClick={() => setMode("instruct")}
+          >
+            Instruction
+          </Button>
+        </span>
       </div>
       <p className="text-sm" data-testid="lane-composer-hint">
         {active === "ask"
@@ -134,15 +137,17 @@ export function LaneConversation({
         onChange={(e) => setDraft(e.target.value)}
       />
       {error && <p className="text-fail" data-testid="lane-composer-error">{error}</p>}
-      <button
-        type="button"
-        className="chip"
-        data-testid="lane-send"
-        disabled={blocked || busy}
-        onClick={() => void send()}
-      >
-        Send
-      </button>
+      <span data-testid="lane-send" className="inline-flex">
+        <Button
+          size="sm"
+          variant="primary"
+          loading={busy}
+          disabled={blocked}
+          onClick={() => void send()}
+        >
+          Send
+        </Button>
+      </span>
     </section>
   );
 }

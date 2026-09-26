@@ -1,6 +1,39 @@
 /** CAD-608 lane card helpers. No React — node tests import this file.
  *  Cost labels match the daemon's `cost_label` (lane_rpc.rs). */
 
+export interface LanePr {
+  url?: string | null;
+  label?: string | null;
+}
+
+export interface LaneView {
+  agent: string;
+  provider: string;
+  model: string | null;
+  effort?: string | null;
+  cost: string | null;
+  branch: string | null;
+  pr: LanePr | null;
+  activity: { at: number; state: string } | null;
+  state: LaneState | string;
+  worktree?: string;
+  group?: string;
+}
+
+export interface LaneProvider {
+  id: string;
+  model: boolean;
+  effort: boolean;
+  models: string[] | null;
+  efforts: string[];
+}
+
+export interface LanePayload {
+  issue: string;
+  lane: LaneView | null;
+  providers: LaneProvider[];
+}
+
 export type LaneState =
   | "busy"
   | "idle"
@@ -46,6 +79,21 @@ export function costLabel(provider: string, model: string | null | undefined): s
   if (provider === "cursor") return "Cursor plan";
   if (!id) return "";
   return "Paid";
+}
+
+/** A Select option. `badge` is the cost label shown beside a model. */
+export interface SelectChoice {
+  value: string;
+  label: string;
+  badge?: string;
+}
+
+/** Model list for the reassign Select. Each row carries its cost badge. */
+export function modelChoices(provider: string, models: readonly string[]): SelectChoice[] {
+  return models.map((id) => {
+    const badge = costLabel(provider, id);
+    return badge ? { value: id, label: id, badge } : { value: id, label: id };
+  });
 }
 
 export interface ReassignDraft {

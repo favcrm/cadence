@@ -2,47 +2,20 @@ import { useContext, useState } from "react";
 import { WriteGate } from "../auth/WriteGate";
 import { UNFENCE_CHOICES } from "../home/needs";
 import { api, ApiError } from "../../lib/api";
+import Button from "../../ui/Button";
+import Select from "../../ui/Select";
 import {
   branchTitle,
   composerBlocked,
   costLabel,
+  modelChoices,
   reassignBody,
   unfenceReady,
-  type LaneState,
+  type LaneProvider,
+  type LaneView,
 } from "./lane";
 
-export interface LanePr {
-  url?: string | null;
-  label?: string | null;
-}
-
-export interface LaneView {
-  agent: string;
-  provider: string;
-  model: string | null;
-  effort?: string | null;
-  cost: string | null;
-  branch: string | null;
-  pr: LanePr | null;
-  activity: { at: number; state: string } | null;
-  state: LaneState | string;
-  worktree?: string;
-  group?: string;
-}
-
-export interface LaneProvider {
-  id: string;
-  model: boolean;
-  effort: boolean;
-  models: string[] | null;
-  efforts: string[];
-}
-
-export interface LanePayload {
-  issue: string;
-  lane: LaneView | null;
-  providers: LaneProvider[];
-}
+export type { LanePayload, LanePr, LaneProvider, LaneView } from "./lane";
 
 const BADGE: Record<string, string> = {
   busy: "bg-info/10 text-ink",
@@ -145,53 +118,52 @@ export function LaneCard({
       {lane.state === "shipped" && <p>The lane is closed.</p>}
       {error && <p className="text-fail" data-testid="lane-error">{error}</p>}
       <div className="flex flex-wrap gap-2">
-        <button
-          type="button"
-          className="chip"
-          data-testid="lane-ask"
-          disabled={blocked || busy}
-          onClick={() => onCompose?.("ask")}
-        >
-          Ask for status
-        </button>
-        <button
-          type="button"
-          className="chip"
-          data-testid="lane-instruct"
-          disabled={blocked || busy}
-          onClick={() => onCompose?.("instruct")}
-        >
-          Send instruction
-        </button>
-        <button
-          type="button"
-          className="chip"
-          data-testid="lane-interrupt"
-          disabled={writeBlock != null || busy || lane.state === "shipped"}
-          onClick={() => setDialog("interrupt")}
-        >
-          Interrupt
-        </button>
-        {lane.state === "fenced" && (
-          <button
-            type="button"
-            className="chip bg-warn/10"
-            data-testid="lane-unfence"
-            disabled={writeBlock != null || busy}
-            onClick={() => setDialog("unfence")}
+        <span data-testid="lane-ask" className="inline-flex">
+          <Button size="sm" disabled={blocked || busy} onClick={() => onCompose?.("ask")}>
+            Ask for status
+          </Button>
+        </span>
+        <span data-testid="lane-instruct" className="inline-flex">
+          <Button
+            size="sm"
+            variant="primary"
+            disabled={blocked || busy}
+            onClick={() => onCompose?.("instruct")}
           >
-            Unfence
-          </button>
+            Send instruction
+          </Button>
+        </span>
+        <span data-testid="lane-interrupt" className="inline-flex">
+          <Button
+            size="sm"
+            disabled={writeBlock != null || busy || lane.state === "shipped"}
+            onClick={() => setDialog("interrupt")}
+          >
+            Interrupt
+          </Button>
+        </span>
+        {lane.state === "fenced" && (
+          <span data-testid="lane-unfence" className="inline-flex">
+            <Button
+              size="sm"
+              variant="primary"
+              disabled={writeBlock != null || busy}
+              onClick={() => setDialog("unfence")}
+            >
+              Unfence
+            </Button>
+          </span>
         )}
-        <button
-          type="button"
-          className={`chip ${lane.state === "quota" ? "bg-fail/10" : ""}`}
-          data-testid="lane-reassign"
-          disabled={writeBlock != null || busy || lane.state === "shipped"}
-          onClick={() => setDialog("reassign")}
-        >
-          Reassign
-        </button>
+        <span data-testid="lane-reassign" className="inline-flex">
+          <Button
+            size="sm"
+            variant={lane.state === "quota" ? "primary" : "secondary"}
+            disabled={writeBlock != null || busy || lane.state === "shipped"}
+            onClick={() => setDialog("reassign")}
+          >
+            Reassign
+          </Button>
+        </span>
       </div>
       {dialog === "interrupt" && (
         <InterruptDialog
@@ -237,13 +209,13 @@ function InterruptDialog({
     <div data-testid="lane-interrupt-dialog" className="card">
       <p>Interrupt ends the current turn and leaves the lane claimed. Stop halts the agent and keeps queued messages.</p>
       <div className="flex gap-2">
-        <button type="button" className="chip" onClick={onCancel} disabled={busy}>Cancel</button>
-        <button type="button" className="chip" data-testid="lane-interrupt-confirm" onClick={onInterrupt} disabled={busy}>
-          Interrupt turn
-        </button>
-        <button type="button" className="chip bg-fail/10 text-fail" data-testid="lane-stop-confirm" onClick={onStop} disabled={busy}>
-          Stop agent
-        </button>
+        <Button size="sm" variant="ghost" onClick={onCancel} disabled={busy}>Cancel</Button>
+        <span data-testid="lane-interrupt-confirm" className="inline-flex">
+          <Button size="sm" onClick={onInterrupt} disabled={busy}>Interrupt turn</Button>
+        </span>
+        <span data-testid="lane-stop-confirm" className="inline-flex">
+          <Button size="sm" variant="danger" onClick={onStop} disabled={busy}>Stop agent</Button>
+        </span>
       </div>
     </div>
   );
@@ -293,16 +265,17 @@ function UnfenceDialog({
         Resume the agent after unfence
       </label>
       <div className="flex gap-2">
-        <button type="button" className="chip" onClick={onCancel} disabled={busy}>Cancel</button>
-        <button
-          type="button"
-          className="chip"
-          data-testid="lane-unfence-confirm"
-          disabled={busy || !unfenceReady(status)}
-          onClick={() => status && onSubmit(status, note, resume)}
-        >
-          Unfence
-        </button>
+        <Button size="sm" variant="ghost" onClick={onCancel} disabled={busy}>Cancel</Button>
+        <span data-testid="lane-unfence-confirm" className="inline-flex">
+          <Button
+            size="sm"
+            variant="primary"
+            disabled={busy || !unfenceReady(status)}
+            onClick={() => status && onSubmit(status, note, resume)}
+          >
+            Unfence
+          </Button>
+        </span>
       </div>
     </div>
   );
@@ -328,31 +301,36 @@ function ReassignDialog({
   return (
     <div data-testid="lane-reassign-dialog" className="card">
       <p>The worktree stays. The current agent stops after the new one is dispatched.</p>
-      <label>
+      <label className="block" data-testid="lane-reassign-provider">
         Provider
-        <select
-          data-testid="lane-reassign-provider"
+        <Select
+          full
+          className="mt-1"
           value={provider}
-          onChange={(e) => {
-            setProvider(e.target.value);
+          disabled={busy}
+          aria-label="Provider"
+          placeholder="Provider"
+          onChange={(next) => {
+            setProvider(next);
             setModel("");
             setEffort("");
           }}
-        >
-          {providers.map((p) => (
-            <option key={p.id} value={p.id}>{p.id}</option>
-          ))}
-        </select>
+          options={providers.map((p) => ({ value: p.id, label: p.id }))}
+        />
       </label>
       {Array.isArray(models) && models.length > 0 && (
-        <label>
+        <label className="block" data-testid="lane-reassign-model">
           Model
-          <select data-testid="lane-reassign-model" value={model} onChange={(e) => setModel(e.target.value)}>
-            <option value="">Select</option>
-            {models.map((id) => (
-              <option key={id} value={id}>{id}</option>
-            ))}
-          </select>
+          <Select
+            full
+            className="mt-1"
+            value={model}
+            disabled={busy}
+            aria-label="Model"
+            placeholder="Select"
+            onChange={setModel}
+            options={modelChoices(provider, models)}
+          />
         </label>
       )}
       {models === null && (
@@ -367,14 +345,18 @@ function ReassignDialog({
         </label>
       )}
       {spec?.efforts && spec.efforts.length > 0 && (
-        <label>
+        <label className="block" data-testid="lane-reassign-effort">
           Effort
-          <select data-testid="lane-reassign-effort" value={effort} onChange={(e) => setEffort(e.target.value)}>
-            <option value="">Default</option>
-            {spec.efforts.map((id) => (
-              <option key={id} value={id}>{id}</option>
-            ))}
-          </select>
+          <Select
+            full
+            className="mt-1"
+            value={effort}
+            disabled={busy}
+            aria-label="Effort"
+            placeholder="Default"
+            onChange={setEffort}
+            options={spec.efforts.map((id) => ({ value: id, label: id }))}
+          />
         </label>
       )}
       <span className="chip" data-testid="lane-reassign-cost">{costLabel(provider, model) || "—"}</span>
@@ -385,16 +367,17 @@ function ReassignDialog({
         onChange={(e) => setNote(e.target.value)}
       />
       <div className="flex gap-2">
-        <button type="button" className="chip" onClick={onCancel} disabled={busy}>Cancel</button>
-        <button
-          type="button"
-          className="chip"
-          data-testid="lane-reassign-confirm"
-          disabled={busy || !provider}
-          onClick={() => onSubmit({ provider, model, effort, note })}
-        >
-          Reassign
-        </button>
+        <Button size="sm" variant="ghost" onClick={onCancel} disabled={busy}>Cancel</Button>
+        <span data-testid="lane-reassign-confirm" className="inline-flex">
+          <Button
+            size="sm"
+            variant="primary"
+            disabled={busy || !provider}
+            onClick={() => onSubmit({ provider, model, effort, note })}
+          >
+            Reassign
+          </Button>
+        </span>
       </div>
     </div>
   );
