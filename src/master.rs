@@ -1052,6 +1052,23 @@ pub fn compose(files: &[(String, String)]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pi_private_config_is_independent_of_confinement() {
+        let state = tempfile::tempdir().unwrap();
+        let expected = state.path().join("master/pi").to_string_lossy().to_string();
+        for confined in [true, false] {
+            let env = super::env_overrides("pi", state.path(), None, confined);
+            assert_eq!(
+                env.iter()
+                    .find(|(key, _)| key == "PI_CODING_AGENT_DIR")
+                    .map(|(_, value)| value),
+                Some(&expected),
+                "Pi must read the seeded private config even without Landlock"
+            );
+        }
+        let claude = super::env_overrides("claude", state.path(), None, false);
+        assert!(!claude.iter().any(|(key, _)| key == "CLAUDE_CONFIG_DIR"));
+    }
     use super::*;
 
     #[test]
