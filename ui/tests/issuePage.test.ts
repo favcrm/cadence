@@ -12,6 +12,8 @@ import {
   NO_ACCEPTANCE,
   parseIssueTab,
   peekSummary,
+  refreshIssueIds,
+  shownLinks,
   timelineRows,
 } from "../src/features/issues/model";
 
@@ -87,6 +89,35 @@ equal(parseIssueTab("conversation"), "conversation", "known tab");
 equal(parseIssueTab("drawer"), "overview", "unknown tab");
 equal(navMatches("issue", "projects"), true, "issues stay under Projects");
 equal(navMatches("issue", "home"), false, "no top-level issue nav");
+
+equal(refreshIssueIds(null, "CAD-607"), ["CAD-607"], "the issue page refreshes when the peek is closed");
+equal(refreshIssueIds("CAD-1", null), ["CAD-1"], "a peek still refreshes");
+equal(refreshIssueIds("CAD-1", "CAD-607"), ["CAD-1", "CAD-607"], "peek and page both refresh");
+equal(refreshIssueIds("CAD-607", "CAD-607"), ["CAD-607"], "one id is asked once");
+
+const linkRef = (id: string) => ({ id, title: id, missing: false });
+const shown = shownLinks({
+  parent: linkRef("CAD-P"),
+  children: [linkRef("CAD-C")],
+  blocked_by: [linkRef("CAD-B")],
+  blocks: [linkRef("CAD-K")],
+  relates: [linkRef("CAD-R")],
+  duplicate_of: linkRef("CAD-D"),
+  duplicates: [linkRef("CAD-U")],
+});
+equal(
+  shown.map((row) => [row.label, row.unlinkKind]),
+  [
+    ["Parent", "parent"],
+    ["Child", null],
+    ["Blocked by", "blocked_by"],
+    ["Blocks", null],
+    ["Related", "relates"],
+    ["Dup of", "duplicate_of"],
+    ["Dup", null],
+  ],
+  "children and duplicates render; only writable kinds unlink",
+);
 
 equal(
   kickoffRequest("CAD/1", { group: "west-pm", provider: "cursor", model: "grok-4.7-high", effort: "high", note: "  " }),

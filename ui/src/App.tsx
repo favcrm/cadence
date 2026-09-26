@@ -6,7 +6,7 @@ import AppDetail from "./features/apps/AppDetail";
 import Board from "./features/projects/Board";
 import Drawer from "./features/projects/Drawer";
 import IssuePage from "./features/issues/IssuePage";
-import { issuePath } from "./features/issues/model";
+import { issuePath, refreshIssueIds } from "./features/issues/model";
 import Epics from "./features/projects/Epics";
 import Milestones from "./features/projects/Milestones";
 import Memory from "./features/settings/Memory";
@@ -196,13 +196,18 @@ export default function App() {
       });
   }, [project, contextOn, projectContextRefresh]);
 
-  // The open drawer's id, read through a ref so the stream and poll
-  // handlers stay stable while the drawer changes.
+  // The peek's id and the issue page's id, read through refs so the
+  // stream and poll handlers stay stable. The page clears `openId`, so
+  // the fallback has to name the id on screen or that detail goes stale
+  // while `/api/stream` is down.
   const openIdRef = useRef(openId);
   openIdRef.current = openId;
+  const pageIssueRef = useRef<string | null>(route.screen === "issue" ? route.id : null);
+  pageIssueRef.current = route.screen === "issue" ? route.id : null;
   const loadDetail = useCallback(() => {
-    const id = openIdRef.current;
-    if (id) void resources.issue(id).invalidate();
+    for (const id of refreshIssueIds(openIdRef.current, pageIssueRef.current)) {
+      void resources.issue(id).invalidate();
+    }
   }, []);
   useEffect(() => {
     if (openId) void resources.issue(openId).revalidate();

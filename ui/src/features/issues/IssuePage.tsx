@@ -21,6 +21,7 @@ import {
   kickoffBlock,
   prRef,
   QUEUE_UNAVAILABLE,
+  shownLinks,
   timelineRows,
   type IssueTab,
 } from "./model";
@@ -198,7 +199,7 @@ function PageBody({
             <div className="border border-ink-700 border-l-[3px] border-l-fail rounded-lg px-3.5 py-3 bg-fail/10">
               <strong className="text-ink-100">Agent fenced</strong>
               <p className="text-secondary text-ink-300 mt-1 m-0">
-                A bound agent is fenced or needs attention. Unfence stays on the lane card.
+                A bound agent is fenced or needs attention. Unfence is not on this page yet.
               </p>
             </div>
           )}
@@ -656,13 +657,14 @@ function Links({
 }) {
   const [kind, setKind] = useState("relates");
   const [target, setTarget] = useState("");
-  const rows: { label: string; id: string; title?: string; missing: boolean }[] = [];
-  const l = detail.links;
-  if (l.parent) rows.push({ label: "Parent", id: l.parent.id, title: l.parent.title, missing: l.parent.missing });
-  for (const b of l.blocks) rows.push({ label: "Blocks", id: b.id, title: b.title, missing: b.missing });
-  for (const b of l.blocked_by) rows.push({ label: "Blocked by", id: b.id, title: b.title, missing: b.missing });
-  for (const r of l.relates) rows.push({ label: "Related", id: r.id, title: r.title, missing: r.missing });
+  const rows = shownLinks(detail.links);
   const wiki = detail.refs.filter((r) => r.kind === "note" || r.kind === "url");
+  const unlink = (unlinkKind: string, targetId: string) => {
+    api
+      .unlink(detail.id, unlinkKind, targetId, detail.rev)
+      .then((r) => onWrite(r, `${detail.id} unlink ${unlinkKind} ${targetId}`))
+      .catch((err) => onError(err, "unlink"));
+  };
   return (
     <section className="card p-3.5 grid gap-2" aria-label="Links">
       <div className="slabel">Links</div>
@@ -671,13 +673,27 @@ function Links({
         {rows.map((row) => (
           <span key={`${row.label}-${row.id}`} className="contents">
             <dt className="slabel">{row.label}</dt>
-            <dd className="text-secondary min-w-0">
-              {row.missing ? (
-                <span className="num text-ink-500">{row.id}</span>
-              ) : (
-                <Link className="lnk num" href={hrefFor(row.id)}>{row.id}</Link>
+            <dd className="text-secondary min-w-0 flex items-center gap-1.5">
+              <span className="min-w-0 truncate">
+                {row.missing ? (
+                  <span className="num text-ink-500">{row.id}</span>
+                ) : (
+                  <Link className="lnk num" href={hrefFor(row.id)}>{row.id}</Link>
+                )}
+                {row.title ? <span className="text-ink-400"> · {row.title}</span> : null}
+              </span>
+              {row.unlinkKind && !readOnly && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="ml-auto shrink-0"
+                  aria-label={`Unlink ${row.label} ${row.id}`}
+                  title="Remove this link"
+                  onClick={() => unlink(row.unlinkKind!, row.id)}
+                >
+                  ×
+                </Button>
               )}
-              {row.title ? <span className="text-ink-400"> · {row.title}</span> : null}
             </dd>
           </span>
         ))}
