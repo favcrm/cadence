@@ -2051,6 +2051,7 @@ fn board_app_outputs_are_the_runs_and_operator_only() {
                    "inputs": {"title": "login fix"}}),
         )
         .unwrap();
+    let epic = out["epic"].as_str().unwrap().to_string();
     let tickets: Vec<String> = out["tickets"]
         .as_array()
         .unwrap()
@@ -2063,7 +2064,9 @@ fn board_app_outputs_are_the_runs_and_operator_only() {
 
     // Three published items and their effect rows: one staged with the
     // ticket named as its task, one staged without a task by a ticket's
-    // owner, one that is neither.
+    // owner, one that is neither. A fourth row is still `waiting` — a
+    // staged send the operator has not released — and a fifth is a
+    // waiting send that belongs to no run.
     write_outbox_item(
         outbox.path(),
         "ef-task",
@@ -2086,18 +2089,26 @@ fn board_app_outputs_are_the_runs_and_operator_only() {
         "2026-09-26T03:00:00Z",
     );
     let conn = rusqlite::Connection::open(f.d.state.join("cadence.sqlite3")).unwrap();
-    for (eid, agent, task) in [
-        ("ef-task", "someone", Some(tickets[0].as_str())),
-        ("ef-owner", "qa-1", None),
-        ("ef-other", "stranger", Some("D-9")),
+    for (eid, agent, task, state, input) in [
+        ("ef-task", "someone", Some(tickets[0].as_str()), "done", "{}"),
+        ("ef-owner", "qa-1", None, "done", "{}"),
+        ("ef-other", "stranger", Some("D-9"), "done", "{}"),
+        (
+            "ef-waiting",
+            "qa-1",
+            None,
+            "waiting",
+            r#"{"title": "Ready to release"}"#,
+        ),
+        ("ef-stray", "stranger", None, "waiting", "{}"),
     ] {
         conn.execute(
             "INSERT INTO platform_effects (effect_id, request, agent, platform, account, \
              tool, input, input_summary, preview, scopes, task, state, needs_you, \
              staged_at, updated_at) \
-             VALUES (?1, ?2, ?3, 'local', 'outbox', 'publish', '{}', 'publish', \
-             'a post', '[\"publish\"]', ?4, 'done', 0, 1.0, 1.0)",
-            rusqlite::params![eid, format!("req-{eid}"), agent, task],
+             VALUES (?1, ?2, ?3, 'local', 'outbox', 'publish', ?5, 'publish', \
+             'a post', '[\"publish\"]', ?4, ?6, 0, 1.0, 1.0)",
+            rusqlite::params![eid, format!("req-{eid}"), agent, task, input, state],
         )
         .unwrap();
     }
@@ -2136,7 +2147,8 @@ fn board_app_outputs_are_the_runs_and_operator_only() {
     assert_eq!(status, 404, "{reply}");
 
     // The proven operator reads the app's items — by task and by owner,
-    // newest first, and not the one that is neither.
+    // newest first, and not the one that is neither. Each item names the
+    // run it is attributed to.
     let (status, reply) = op_get(&op, port, "/api/apps/demo/studio/outputs");
     assert_eq!(status, 200, "{reply}");
     let v: Value = serde_json::from_str(&reply).unwrap();
@@ -2156,6 +2168,17 @@ fn board_app_outputs_are_the_runs_and_operator_only() {
             .contains("By owner"),
         "{v}"
     );
+    assert_eq!(v["items"][0]["runs"], json!([epic]), "{v}");
+    assert_eq!(v["items"][1]["runs"], json!([epic]), "{v}");
+    // The staged, unreleased send of one of the runs is the app's next
+    // output — with its human title; a waiting send no run accounts for
+    // stays out.
+    let pending = v["pending"].as_array().unwrap();
+    assert_eq!(pending.len(), 1, "{v}");
+    assert_eq!(pending[0]["effect_id"], "ef-waiting", "{v}");
+    assert_eq!(pending[0]["state"], "waiting", "{v}");
+    assert_eq!(pending[0]["title"], "Ready to release", "{v}");
+    assert_eq!(pending[0]["runs"], json!([epic]), "{v}");
     // A bad name is refused by grammar even for the operator.
     let (status, _) = op_get(&op, port, "/api/apps/demo/Bad%20Name/outputs");
     assert_eq!(status, 400);

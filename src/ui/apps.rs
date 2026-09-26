@@ -216,9 +216,10 @@ fn run_app(v: &board::View) -> Option<(&str, &str)> {
 }
 
 /// `GET /api/apps/<project>/<name>/outputs` — the `local` outbox items
-/// this app's runs produced (CAD-563): the ledger relayed exactly as
-/// `/api/outbox` relays it, narrowed to the items attributed to the
-/// app. Operator-only — the same proof `/api/outbox` runs, because the
+/// this app's runs produced, plus the sends those runs staged and the
+/// operator has not released yet (CAD-563): the ledger relayed exactly
+/// as `/api/outbox` relays it, narrowed to what the app's runs account
+/// for. Operator-only — the same proof `/api/outbox` runs, because the
 /// ledger's previews and paths are the operator's — so the gate comes
 /// before any tracker or ledger read.
 fn outputs(
@@ -243,25 +244,44 @@ fn outputs(
     if let Err(e) = app::digest(&pm.dir, key, name) {
         return err_response(404, &e.to_string());
     }
-    // What an item is attributed by: the runs' tickets, and the owners
-    // the workflow bound to them (`agent:` per ticket) — an effect
-    // staged without a task still names the agent that worked it.
+    // What an effect is attributed by: the run whose plan lists the
+    // effect's `task`, or — for a send staged without one — the run
+    // whose ticket the effect's agent owns (the workflow's `agent:` is
+    // the ticket's owner, so that agent is the one that worked it).
     let read = super::read_model::get(state_dir, &pm.dir).board(pm, Some(key));
     let by_id = read.by_id();
-    let mut tickets: HashSet<String> = HashSet::new();
-    let mut owners: HashSet<String> = HashSet::new();
-    for v in read.views.iter() {
-        if run_app(v).is_none_or(|(a, _)| a != name) {
-            continue;
-        }
-        for ticket in v.issue.front.plan.iter().flat_map(|p| p.tickets.iter()) {
-            tickets.insert(ticket.clone());
-            if let Some(owner) = by_id.get(ticket).and_then(|t| t.issue.front.owner.clone()) {
-                owners.insert(owner);
+    let runs: Vec<(String, HashSet<String>, HashSet<String>)> = read
+        .views
+        .iter()
+        .filter(|v| run_app(v).is_some_and(|(a, _)| a == name))
+        .map(|v| {
+            let tickets: HashSet<String> = v
+                .issue
+                .front
+                .plan
+                .iter()
+                .flat_map(|p| p.tickets.iter().cloned())
+                .collect();
+            let owners: HashSet<String> = tickets
+                .iter()
+                .filter_map(|t| by_id.get(t).and_then(|v| v.issue.front.owner.clone()))
+                .collect();
+            (v.issue.front.id.clone(), tickets, owners)
+        })
+        .collect();
+    let runs_for = |task: Option<&str>, agent: &str| -> Vec<String> {
+        let hit = |(_, tickets, owners): &(String, HashSet<String>, HashSet<String>)| {
+            match task {
+                Some(t) => tickets.contains(t),
+                None => owners.contains(agent),
             }
-        }
-    }
-    let provenance = effect_provenance(state_dir);
+        };
+        runs.iter()
+            .filter(|r| hit(r))
+            .map(|(epic, _, _)| epic.clone())
+            .collect()
+    };
+    let facts = effect_facts(state_dir);
     let out = match client::rpc(state_dir, "platform_outbox", json!({})) {
         Ok(out) => out,
         Err(e) => return home::rpc_err(&e, "platform_outbox"),
@@ -270,42 +290,79 @@ fn outputs(
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|item| {
-            let Some((agent, task)) = item["effect_id"].as_str().and_then(|id| provenance.get(id))
-            else {
-                return false;
-            };
-            task.as_deref().is_some_and(|t| tickets.contains(t)) || owners.contains(agent)
+        .filter_map(|item| {
+            let fact = item["effect_id"].as_str().and_then(|id| facts.get(id))?;
+            let runs = runs_for(fact.task.as_deref(), &fact.agent);
+            if runs.is_empty() {
+                return None;
+            }
+            let mut item = item.clone();
+            item["runs"] = json!(runs);
+            Some(item)
         })
-        .cloned()
         .collect();
-    json_response(json!({"project": key, "name": name, "items": items}))
+    // A staged send the operator has not released (or that is in
+    // flight) is the app's next output — the release row the board
+    // links to Needs you.
+    let mut pending: Vec<Value> = Vec::new();
+    for (effect_id, fact) in &facts {
+        if !matches!(fact.state.as_str(), "waiting" | "decided") {
+            continue;
+        }
+        let runs = runs_for(fact.task.as_deref(), &fact.agent);
+        if runs.is_empty() {
+            continue;
+        }
+        pending.push(json!({
+            "effect_id": effect_id,
+            "state": fact.state,
+            "title": fact.title,
+            "runs": runs,
+        }));
+    }
+    pending.sort_by(|a, b| a["effect_id"].as_str().cmp(&b["effect_id"].as_str()));
+    json_response(json!({"project": key, "name": name, "items": items, "pending": pending}))
 }
 
-/// `effect_id` → `(agent, task)` from the durable effect ledger — the
-/// provenance an outbox item is attributed by. A read-only open, like
-/// the `plan_proposed` fallback `open_plan_epics` reads; the caller
-/// has already proven the operator, so nothing here widens a gate.
-/// Unreadable ledger: no item is attributed, never an error.
-fn effect_provenance(state_dir: &std::path::Path) -> HashMap<String, (String, Option<String>)> {
+/// What the durable effect ledger says about one effect: who staged it,
+/// the task it named (if any), its state and the human title of its
+/// input. A read-only open, like the `plan_proposed` fallback
+/// `open_plan_epics` reads; the caller has already proven the operator,
+/// so nothing here widens a gate. Unreadable ledger: no effect is
+/// attributed, never an error.
+struct EffectFacts {
+    agent: String,
+    task: Option<String>,
+    state: String,
+    title: Option<String>,
+}
+
+fn effect_facts(state_dir: &std::path::Path) -> HashMap<String, EffectFacts> {
     let Ok(conn) = crate::store::open_read_only(&state_dir.join("cadence.sqlite3")) else {
         return HashMap::new();
     };
-    let Ok(mut stmt) = conn.prepare("SELECT effect_id, agent, task FROM platform_effects") else {
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT effect_id, agent, task, state, input, input_summary FROM platform_effects",
+    ) else {
         return HashMap::new();
     };
     let rows = stmt.query_map([], |r| {
+        let input: String = r.get(4)?;
+        let title = serde_json::from_str::<Value>(&input)
+            .ok()
+            .and_then(|v| v["title"].as_str().map(str::to_string));
         Ok((
             r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, Option<String>>(2)?,
+            EffectFacts {
+                agent: r.get(1)?,
+                task: r.get(2)?,
+                state: r.get(3)?,
+                title: title.or_else(|| r.get::<_, Option<String>>(5).ok().flatten()),
+            },
         ))
     });
     match rows {
-        Ok(rows) => rows
-            .flatten()
-            .map(|(id, agent, task)| (id, (agent, task)))
-            .collect(),
+        Ok(rows) => rows.flatten().collect(),
         Err(_) => HashMap::new(),
     }
 }
