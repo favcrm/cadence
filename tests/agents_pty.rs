@@ -1504,9 +1504,9 @@ fn standalone_launch_writes_briefing_only() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    d.wait_agent("wb", "idle", 20);
     // CAD-520: the verified idle probe is the readiness claim — the
-    // bootstrap may already be running by the time we look.
+    // bootstrap delivers at once and the pane stays busy awaiting the
+    // report, so wait on the message, not on an idle agent.
     let m = d.wait_message(
         "wb",
         "bootstrap-wb",
