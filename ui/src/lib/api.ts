@@ -163,6 +163,7 @@ export interface MasterPermissionRequest {
   reason: string;
   risk: string;
   status: string;
+  decision_label?: string;
   expires_at: number;
   prefix: string[] | null;
 }

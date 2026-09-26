@@ -592,7 +592,9 @@ pub fn ls(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
 
     match classify(&segs) {
         View::Profile { alias } => {
-            // `agents/<a>/profile` → the live agent dir's files.
+            // `agents/<a>/profile` → the live agent dir's files, including
+            // permissions.yaml once the operator has saved a rule (CAD-615).
+            // The view is read-only; writes go through a permission decision.
             let dir = pm.dir.join("agents").join(&alias);
             if segs.len() == 3 {
                 let mut out = Vec::new();

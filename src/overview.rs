@@ -3467,20 +3467,25 @@ fn overview_from(
     }
 
     // CAD-615: a pending permission request is the operator's to decide.
-    for req in crate::master_perm::pending_requests(state_dir, now).unwrap_or_default() {
+    for req in crate::master_perm::board_requests(state_dir, now).unwrap_or_default() {
         let age = (now - req.created).max(0);
         let command = req.argv.join(" ");
-        let mut row = item(
-            15,
-            "master_permission",
-            &format!(
+        let title = if req.decision_label.is_empty() {
+            format!(
                 "master wants to run: {command} — risk {}",
                 match req.risk {
                     crate::master_perm::Risk::Low => "low",
                     crate::master_perm::Risk::Medium => "medium",
                     crate::master_perm::Risk::High => "high",
                 }
-            ),
+            )
+        } else {
+            format!("{} — {command}", req.decision_label)
+        };
+        let mut row = item(
+            if req.status == "pending" { 15 } else { 40 },
+            "master_permission",
+            &title,
             age,
             "",
             None,

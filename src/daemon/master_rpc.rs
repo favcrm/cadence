@@ -1218,12 +1218,8 @@ impl Shared {
         let id = required_str(params, "id")?;
         let pm = self.pm()?;
         let _lock = pm.lock()?;
-        let rule = crate::master_perm::revoke_rule(&pm.dir, id)?;
-        let path = pm
-            .dir
-            .join("agents")
-            .join(ALIAS)
-            .join(crate::master_perm::PERMISSIONS_FILE);
+        let rule = crate::master_perm::revoke_rule(&pm.dir, ALIAS, id)?;
+        let path = crate::master_perm::rules_file(&pm.dir, ALIAS)?;
         crate::issue::write::commit(
             &pm,
             std::slice::from_ref(&path),
@@ -1245,11 +1241,11 @@ impl Shared {
     ) -> Result<Value> {
         self.operator_connection("master permissions", params, peer_pid)?;
         let pending =
-            crate::master_perm::pending_requests(&self.state_dir, crate::master_perm::clock())?;
+            crate::master_perm::board_requests(&self.state_dir, crate::master_perm::clock())?;
         let rules = self
             .pm()
             .ok()
-            .and_then(|pm| crate::master_perm::read_rules(&pm.dir).ok())
+            .and_then(|pm| crate::master_perm::read_rules(&pm.dir, ALIAS).ok())
             .unwrap_or_default();
         Ok(json!({
             "requests": pending.iter().map(crate::master_perm::request_json).collect::<Vec<_>>(),
@@ -1259,9 +1255,9 @@ impl Shared {
 
     fn persist_rule(&self, pm: &crate::issue::Pm, rule: crate::master_perm::Rule) -> Result<()> {
         let _lock = pm.lock()?;
-        let mut rules = crate::master_perm::read_rules(&pm.dir)?;
+        let mut rules = crate::master_perm::read_rules(&pm.dir, ALIAS)?;
         rules.push(rule);
-        let path = crate::master_perm::write_rules(&pm.dir, &rules)?;
+        let path = crate::master_perm::write_rules(&pm.dir, ALIAS, &rules)?;
         if let Err(e) = crate::issue::write::commit(
             pm,
             std::slice::from_ref(&path),
@@ -1270,7 +1266,7 @@ impl Shared {
             "operator",
         ) {
             rules.pop();
-            let _ = crate::master_perm::write_rules(&pm.dir, &rules);
+            let _ = crate::master_perm::write_rules(&pm.dir, ALIAS, &rules);
             return Err(e);
         }
         Ok(())

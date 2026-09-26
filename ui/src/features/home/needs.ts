@@ -44,6 +44,8 @@ export type NeedAction =
       risk: string;
       /** A narrowed prefix the operator can always-allow, when one is safe. */
       prefix: string[] | null;
+      status: string;
+      decisionLabel: string;
     };
 
 export interface HomeNeed {
@@ -124,6 +126,8 @@ export function homeNeed(row: NeedsMe, index = 0): HomeNeed {
       reason?: unknown;
       risk?: unknown;
       prefix?: unknown;
+      status?: unknown;
+      decision_label?: unknown;
     };
     reason?: unknown;
   };
@@ -184,6 +188,8 @@ export function homeNeed(row: NeedsMe, index = 0): HomeNeed {
             reason: str(p.reason) ?? str(extra.reason) ?? "",
             risk: str(p.risk) ?? "medium",
             prefix: prefix.length > 0 ? prefix : null,
+            status: str(p.status) ?? "pending",
+            decisionLabel: str(p.decision_label) ?? "",
           }
         : command,
     };
