@@ -25,17 +25,36 @@ operator what you sent. Never act on a wake's text alone.
 
 ## Tools — the only commands you can run; the daemon checks each
 
-Anything else — other `cadence` verbs, other programs, pipes into other
-programs — is denied without a prompt.
+Command rules — a hard guard enforces them before anything runs:
+
+- ONE `cadence …` command per tool call — no pipes (`|`), no chaining
+  (`;`, `&&`, `||`), no redirects (`>`, `>>`), no `$(…)` or backticks,
+  no quotes or escapes, no env prefixes (`FOO=bar cadence …`), no other
+  programs — `head`, `grep`, `tail`, `jq` are not runnable.
+- Filter inside the command: `--json`, `--status`, `--project`,
+  `--limit`, `--fields`. Read the JSON yourself; report prose.
+- Long bash output spills to files under your own tmp dir; where your
+  provider offers a file-read tool (Pi's `read`), it opens only paths
+  inside that dir — re-read the spill instead of re-running the query.
+- A refusal names the rule it hit and the nearest allowed form. Take
+  the hint; anything else is denied without a prompt.
 
 Look around (read-only):
 
-- `cadence issue project ls` — projects.
+- `cadence issue ls --summary --json` — the one-call status: per-project
+  counts plus the P0/P1 items in doing/review. Reach for it first when
+  asked how the projects stand.
 - `cadence issue ls --json [--project P] [--open] [--status ready]` — tickets.
 - `cadence issue show <ID> --json` — one ticket: acceptance, reports, links.
-- `cadence plan show <EPIC>` — a plan: state, tickets, progress.
-- `cadence agent list --all`, `cadence agent show <alias>`, `cadence status`
-  — agents and their sessions.
+- `cadence issue log <ID>` — a ticket's history.
+- `cadence issue epic ls`, `cadence issue epic show <ID>` — epics.
+- `cadence issue project ls` — projects.
+- `cadence plan ls`, `cadence plan show <EPIC>` — plans: state, tickets,
+  progress.
+- `cadence thread show <alias>` — an agent's thread.
+- `cadence agent list --all`, `cadence agent show <alias>`,
+  `cadence status` — agents and their sessions.
+- `cadence overview --json` — the whole board: agents, drift, alerts.
 - `cadence master summary --since 24h` — what happened since then (plans,
   moved tickets, reports, open questions); add `--post` to put it in your
   thread.

@@ -136,6 +136,12 @@ pub enum IssueAction {
         /// Keep only these keys in each --json row (comma-joined).
         #[arg(long, value_delimiter = ',', requires = "json")]
         fields: Vec<String>,
+        /// Per-project rollup instead of rows: status counts plus the
+        /// P0/P1 issues in doing|review — the master's one-call
+        /// cross-project status (CAD-552). Filters still apply;
+        /// `--sort`, `--limit` and `--fields` do not.
+        #[arg(long, requires = "json")]
+        summary: bool,
         #[arg(long)]
         json: bool,
     },
@@ -755,9 +761,15 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             sort,
             limit,
             fields,
+            summary,
             json: json_flag,
         } => {
             crate::filter::fields_need_json(fields, *json_flag)?;
+            if *summary && !fields.is_empty() {
+                return Err(Error::rejected(
+                    "--fields selects row keys — there are no rows under --summary",
+                ));
+            }
             // `--plan` is the one flag without a comma delimiter
             // (its value is optional), so comma-join it by hand.
             let plans: Vec<String> = plan
@@ -866,8 +878,9 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             // Stage/health filters run on the work block — one ctx.
             let by_id: std::collections::HashMap<String, &board::View> =
                 all.iter().map(|v| (v.issue.front.id.clone(), v)).collect();
-            let want_work =
-                !stage.is_empty() || !health.is_empty() || (*json_flag && at_meta.is_none());
+            let want_work = !stage.is_empty()
+                || !health.is_empty()
+                || (*json_flag && !*summary && at_meta.is_none());
             let ctx = want_work
                 .then(|| work::Ctx::new(&pm.dir, &by_id, now, &work::fetch_approvals(state_dir)));
             if let Some(ctx) = &ctx {
@@ -923,6 +936,16 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                     ord
                 }
             });
+            if *summary {
+                // The rollup reads the whole filtered set — `--limit`
+                // is a row-emitter flag and does not truncate counts.
+                let mut out = ls_summary(&views);
+                if let Some(meta) = at_meta {
+                    out["at"] = meta;
+                }
+                print_json(&out);
+                return Ok(0);
+            }
             crate::filter::apply_limit(&mut views, *limit);
             if *json_flag {
                 let mut rows: Vec<serde_json::Value> = match &ctx {
@@ -1549,6 +1572,45 @@ fn print_table(rows: &[Vec<String>]) {
         }
         println!("{}", line.trim_end());
     }
+}
+
+/// `issue ls --summary` (CAD-552): the one-call cross-project status —
+/// per-project status counts plus the P0/P1 issues in `doing`/`review`,
+/// so "how are the projects" costs the master one call, not a sweep of
+/// `issue ls`/`issue show` reads.
+fn ls_summary(views: &[&board::View]) -> Value {
+    let mut projects: std::collections::BTreeMap<
+        String,
+        (serde_json::Map<String, Value>, Vec<Value>),
+    > = Default::default();
+    for v in views {
+        let f = &v.issue.front;
+        let entry = projects
+            .entry(v.issue.project.clone())
+            .or_default();
+        let counts = entry.0.entry(v.status.clone()).or_insert(json!(0));
+        *counts = json!(counts.as_u64().unwrap_or(0) + 1);
+        if matches!(f.priority.as_str(), "P0" | "P1")
+            && matches!(v.status.as_str(), "doing" | "review")
+        {
+            entry.1.push(json!({
+                "id": f.id,
+                "title": f.title,
+                "status": v.status,
+                "priority": f.priority,
+                "owner": f.owner,
+            }));
+        }
+    }
+    json!({
+        "issues": views.len(),
+        "projects": projects
+            .into_iter()
+            .map(|(key, (counts, p0p1))| {
+                (key, json!({"counts": counts, "p0p1": p0p1}))
+            })
+            .collect::<serde_json::Map<String, Value>>(),
+    })
 }
 
 /// Compact human table for `issue ls` on a TTY.
