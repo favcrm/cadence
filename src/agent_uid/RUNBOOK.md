@@ -25,10 +25,16 @@ effective uid are both 0.
 
   Expected: `agent-user`/`agent-groups`/artifact rows `warn`
   ("not provisioned"), `home-acl` and `git-config` `ok`. A `fail` on
-  either negative row — an ACL under `~` granting the agent domain, or a
-  `safe.directory`/`include.path` covering `/var/lib/cadence` in any
-  uid-1000 git config — means fix that first; provision refuses anyway
-  if it finds one.
+  either negative row — an ACL under `~` granting the agent domain, or
+  armed uid-1000 git config — means fix that first; provision refuses
+  anyway if it finds one. `git-config` covers more than
+  `safe.directory`/`include.path` over `/var/lib/cadence`: any value
+  resolving onto agent-writable ground (the agent's home, an
+  agent-writable dir), an `alias.* = !…` shell payload, exec-capable
+  keys reaching the domain, env-carried config (`GIT_CONFIG_COUNT`,
+  `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`), and
+  any config piece the audit cannot verify — unreadable, over-cap,
+  unparseable, or a link chain that never lands — all fail closed.
 
 ## 1. Build
 
