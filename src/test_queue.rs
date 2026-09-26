@@ -5,10 +5,13 @@
 //!
 //! The key is a canonical record — git tree (not branch, not commit),
 //! filter, toolchain, feature set, Cargo.lock / manifest hashes, the
-//! cargo argv, and an allowlisted `CADENCE_*` env. A failed, interrupted
+//! cargo argv, `RUSTFLAGS`, and an allowlisted `CADENCE_*` env. That
+//! env and `RUSTFLAGS` are the environment the child actually receives;
+//! a hit is a previous run of that same contract. A failed, interrupted
 //! or cancelled run is never a hit. `--no-cache` skips the hit and still
 //! joins an in-flight run of the same key, so a rerun is never hidden by
 //! a stale success and two concurrent submits still share one execution.
+//! Review jobs start before dev jobs; within one priority the queue is FIFO.
 //!
 //! Each run gets its own state dir, temp, target dir and port. The child
 //! environment is built from a pass-list, never copied from the daemon
@@ -84,6 +87,9 @@ pub struct Submit {
     pub no_cache: bool,
     pub env: BTreeMap<String, String>,
     pub rustflags: String,
+    pub features: String,
+    /// `dev` or `review`. Review starts first; FIFO within a priority.
+    pub priority: String,
     pub by: String,
 }
 
@@ -101,6 +107,15 @@ struct Job {
     repo: String,
     by: String,
     no_cache: bool,
+    #[serde(default)]
+    features: String,
+    #[serde(default = "default_priority")]
+    priority: String,
+    /// Allowlisted env the cache key hashed and the child received.
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    #[serde(default)]
+    rustflags: String,
     runner: String,
     argv: Vec<String>,
     created_at: f64,
@@ -153,6 +168,44 @@ const PASS_KEYS: &[&str] = &["PATH", "RUSTUP_HOME", "CARGO_HOME", "RUSTC_WRAPPER
 
 const PORT_BASE: u16 = 3110;
 const PORT_SPAN: u16 = 80;
+
+fn default_priority() -> String {
+    "dev".to_string()
+}
+
+/// Job ids the daemon mints: `tq-` plus 8 lowercase hex digits. Anything
+/// else — an absolute path, `..`, a separator — is refused before it is
+/// joined onto the state dir.
+pub fn require_job_id(id: &str) -> Result<()> {
+    let valid = id.len() == 11
+        && id.starts_with("tq-")
+        && id.as_bytes()[3..]
+            .iter()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase());
+    if valid {
+        return Ok(());
+    }
+    let shown: String = id.chars().take(80).collect();
+    Err(Error::rejected(format!(
+        "test job id must look like tq- followed by 8 lowercase hex digits — refusing '{shown}'"
+    )))
+}
+
+fn normalize_priority(priority: &str) -> Result<String> {
+    match priority {
+        "" | "dev" => Ok("dev".to_string()),
+        "review" => Ok("review".to_string()),
+        other => Err(Error::rejected(format!(
+            "priority must be dev or review — got '{other}'"
+        ))),
+    }
+}
+
+fn valid_features(features: &str) -> bool {
+    features
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, ',' | '_' | '-' | '+'))
+}
 
 pub fn allowlisted_env<I, K, V>(vars: I) -> BTreeMap<String, String>
 where
@@ -218,13 +271,21 @@ pub fn submit_with(
     let commit = git(&worktree, &["rev-parse", "HEAD"])?;
     let repo = git(&worktree, &["remote", "get-url", "origin"])
         .unwrap_or_else(|_| format!("path:{}", worktree.display()));
+    if !valid_features(&req.features) {
+        return Err(Error::rejected(
+            "features must be a comma-separated cargo feature list",
+        ));
+    }
+    let priority = normalize_priority(&req.priority)?;
     let env = allowlisted_env(req.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
-    let argv = cargo_argv(&req.filter, req.full);
+    let threads = test_threads(&env)?;
+    let argv = cargo_argv(&req.filter, req.full, &req.features, &threads);
     let record = KeyParts {
         repo: &repo,
         tree: &tree,
         filter: &req.filter,
         full: req.full,
+        features: &req.features,
         env: &env,
         rustflags: &req.rustflags,
         jobs: limits.jobs_per_lane,
@@ -263,6 +324,10 @@ pub fn submit_with(
         repo,
         by: req.by.clone(),
         no_cache: req.no_cache,
+        features: req.features.clone(),
+        priority,
+        env: env.clone(),
+        rustflags: req.rustflags.clone(),
         runner: runner.label().into(),
         argv,
         created_at: now,
@@ -286,15 +351,20 @@ pub fn submit_with(
 }
 
 pub fn status(state_dir: &Path, id: &str) -> Result<Value> {
+    require_job_id(id)?;
     let _lock = lock(state_dir)?;
     let job = read_job(&job_path(state_dir, id))?;
     Ok(job_view(&job, now_secs()))
 }
 
 pub fn log(state_dir: &Path, id: &str) -> Result<Value> {
+    require_job_id(id)?;
     let _lock = lock(state_dir)?;
     let job = read_job(&job_path(state_dir, id))?;
-    let bytes = fs::read(&job.log_path).unwrap_or_default();
+    // The log path is derived from the checked id, never from the job
+    // record. A forged `log_path` field cannot redirect the read.
+    let log_path = state_dir.join("test-queue/run").join(id).join("log");
+    let bytes = fs::read(&log_path).unwrap_or_default();
     const CAP: usize = 256 * 1024;
     let truncated = bytes.len() > CAP;
     let slice = if truncated {
@@ -445,6 +515,8 @@ impl Worker {
                 jobs: job.cargo_build_jobs,
                 port,
                 pass: &pass,
+                bound: &job.env,
+                rustflags: &job.rustflags,
             })?;
             let log_file = OpenOptions::new()
                 .create(true)
@@ -498,15 +570,21 @@ impl Worker {
     }
 }
 
-/// FIFO: never skip a job that cannot start yet. A `--full` run holds
-/// the queue alone (the suite slot is exclusive). Review-vs-dev priority
-/// is deferred.
+/// Review jobs outrank dev jobs. Within one priority the order is FIFO
+/// (submit sequence). A `--full` run holds the queue alone. A job that
+/// cannot start yet is not skipped in favour of one behind it.
 fn select_next(running: &[Job], queued: &[Job], capacity: usize) -> Vec<Job> {
+    let mut ordered: Vec<Job> = queued.to_vec();
+    ordered.sort_by(|a, b| {
+        priority_rank(&a.priority)
+            .cmp(&priority_rank(&b.priority))
+            .then(a.seq.cmp(&b.seq))
+    });
     let mut start = Vec::new();
     if running.iter().any(|j| j.full) {
         return start;
     }
-    for job in queued {
+    for job in &ordered {
         if job.full {
             if running.is_empty() && start.is_empty() {
                 start.push(job.clone());
@@ -521,12 +599,26 @@ fn select_next(running: &[Job], queued: &[Job], capacity: usize) -> Vec<Job> {
     start
 }
 
+fn priority_rank(priority: &str) -> u8 {
+    if priority == "review" {
+        0
+    } else {
+        1
+    }
+}
+
 pub struct IsoSpec<'a> {
     pub daemon_state: &'a Path,
     pub isolation: &'a Path,
     pub jobs: usize,
     pub port: u16,
     pub pass: &'a BTreeMap<String, String>,
+    /// Allowlisted env that was hashed into the cache key. Copied into
+    /// the child as-is. Isolation paths are applied around it and do
+    /// not replace these keys, except `CADENCE_STATE_DIR`, which is
+    /// always the job directory.
+    pub bound: &'a BTreeMap<String, String>,
+    pub rustflags: &'a str,
 }
 
 /// The environment a job process actually receives. Built from a
@@ -558,6 +650,13 @@ pub fn child_env(spec: &IsoSpec<'_>) -> Result<BTreeMap<String, String>> {
             }
         }
     }
+    // The hashed contract. Copied before isolation overrides so a
+    // caller-supplied CADENCE_SUITE_LOCK survives; CADENCE_STATE_DIR
+    // is forced afterwards because it is not part of that contract.
+    for (key, value) in spec.bound {
+        env.insert(key.clone(), value.clone());
+    }
+    env.insert("RUSTFLAGS".into(), spec.rustflags.to_string());
     env.insert(
         "HOME".into(),
         spec.isolation.join("home").display().to_string(),
@@ -574,14 +673,31 @@ pub fn child_env(spec: &IsoSpec<'_>) -> Result<BTreeMap<String, String>> {
     env.insert("CADENCE_STATE_DIR".into(), state.display().to_string());
     env.insert("CADENCE_PORT".into(), spec.port.to_string());
     env.insert("CADENCE_TEST_PORT".into(), spec.port.to_string());
-    env.insert(
-        "CADENCE_SUITE_LOCK".into(),
-        spec.isolation.join("suite.lock").display().to_string(),
-    );
+    if !spec.bound.contains_key("CADENCE_SUITE_LOCK") {
+        env.insert(
+            "CADENCE_SUITE_LOCK".into(),
+            spec.isolation.join("suite.lock").display().to_string(),
+        );
+    }
     env.insert(
         "CADENCE_TEST_ISOLATION".into(),
         spec.isolation.display().to_string(),
     );
+    for (key, value) in spec.bound {
+        if key == "CADENCE_STATE_DIR" {
+            continue;
+        }
+        if env.get(key).map(String::as_str) != Some(value.as_str()) {
+            return Err(Error::rejected(format!(
+                "test job env dropped hashed key {key}"
+            )));
+        }
+    }
+    if env.get("RUSTFLAGS").map(String::as_str) != Some(spec.rustflags) {
+        return Err(Error::rejected(
+            "test job env dropped the RUSTFLAGS the cache key recorded",
+        ));
+    }
     let recorded = env.get("CADENCE_STATE_DIR").map(String::as_str);
     if recorded == Some(daemon.to_str().unwrap_or_default()) {
         return Err(Error::rejected(
@@ -694,6 +810,7 @@ struct KeyParts<'a> {
     tree: &'a str,
     filter: &'a str,
     full: bool,
+    features: &'a str,
     env: &'a BTreeMap<String, String>,
     rustflags: &'a str,
     jobs: usize,
@@ -709,7 +826,7 @@ impl KeyParts<'_> {
             "argv": self.argv,
             "cargo_build_jobs": self.jobs.to_string(),
             "env": self.env,
-            "features": "",
+            "features": self.features,
             "filter": self.filter,
             "full": self.full,
             "lock_sha256": file_sha256(&self.worktree.join("Cargo.lock")),
@@ -753,17 +870,37 @@ fn tool_text(bin: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-fn cargo_argv(filter: &str, full: bool) -> Vec<String> {
+fn test_threads(env: &BTreeMap<String, String>) -> Result<String> {
+    match env.get("CADENCE_TEST_THREADS") {
+        None => Ok("2".to_string()),
+        Some(value)
+            if !value.is_empty()
+                && value.len() <= 3
+                && value.chars().all(|c| c.is_ascii_digit()) =>
+        {
+            Ok(value.clone())
+        }
+        Some(value) => Err(Error::rejected(format!(
+            "CADENCE_TEST_THREADS must be an integer — got '{value}'"
+        ))),
+    }
+}
+
+fn cargo_argv(filter: &str, full: bool, features: &str, threads: &str) -> Vec<String> {
     let mut args = vec!["test".to_string()];
     if full {
         args.push("--all-targets".into());
+    }
+    if !features.is_empty() {
+        args.push("--features".into());
+        args.push(features.to_string());
     }
     if !filter.is_empty() {
         args.push(filter.to_string());
     }
     args.push("--".into());
     args.push("--test-threads".into());
-    args.push("2".into());
+    args.push(threads.to_string());
     args
 }
 
@@ -777,6 +914,10 @@ fn job_view(job: &Job, now: f64) -> Value {
         "worktree": job.worktree,
         "filter": job.filter,
         "full": job.full,
+        "features": job.features,
+        "priority": job.priority,
+        "env": job.env,
+        "rustflags": job.rustflags,
         "tree": job.tree,
         "commit": job.commit,
         "repo": job.repo,
@@ -1014,6 +1155,8 @@ mod tests {
                 no_cache,
                 env,
                 rustflags: String::new(),
+                features: String::new(),
+                priority: "dev".into(),
                 by: "cur-129".into(),
             },
             &limits_one(),
@@ -1069,12 +1212,23 @@ mod tests {
         pass.insert("CADENCE_ALIAS".into(), "cur-129".into());
         pass.insert("SECRET".into(), "nope".into());
         pass.insert("RUSTUP_HOME".into(), "/opt/rustup".into());
+        let mut bound = BTreeMap::new();
+        bound.insert(
+            "CADENCE_REVIEW_CONFIG".into(),
+            "/tmp/review-contract".into(),
+        );
+        bound.insert(
+            "CADENCE_STATE_DIR".into(),
+            "/home/ubuntu/.local/state/cadence".into(),
+        );
         let env = child_env(&IsoSpec {
             daemon_state: &daemon,
             isolation: &isolation,
             jobs: 4,
             port: 3110,
             pass: &pass,
+            bound: &bound,
+            rustflags: "--cfg cadence_bound",
         })
         .unwrap();
         let state = env.get("CADENCE_STATE_DIR").unwrap();
@@ -1092,6 +1246,14 @@ mod tests {
         assert!(!env
             .values()
             .any(|v| v == "/home/ubuntu/.local/state/cadence"));
+        assert_eq!(
+            env.get("CADENCE_REVIEW_CONFIG").map(String::as_str),
+            Some("/tmp/review-contract")
+        );
+        assert_eq!(
+            env.get("RUSTFLAGS").map(String::as_str),
+            Some("--cfg cadence_bound")
+        );
     }
 
     #[test]
@@ -1110,6 +1272,8 @@ mod tests {
                 no_cache: false,
                 env: BTreeMap::new(),
                 rustflags: String::new(),
+                features: String::new(),
+                priority: "dev".into(),
                 by: "cur-129".into(),
             },
             &limits_one(),
@@ -1336,6 +1500,10 @@ exit 0
             log_path: "/i/log".into(),
             queued_ms: Some(0),
             execute_ms: None,
+            features: String::new(),
+            priority: "dev".into(),
+            env: BTreeMap::new(),
+            rustflags: String::new(),
         }];
         let queued = vec![Job {
             full: false,
@@ -1345,5 +1513,284 @@ exit 0
             ..running[0].clone()
         }];
         assert!(select_next(&running, &queued, 3).is_empty());
+    }
+
+    fn record_for(
+        repo: &Path,
+        features: &str,
+        env: &BTreeMap<String, String>,
+        rustflags: &str,
+    ) -> Value {
+        let tree = git(repo, &["rev-parse", "HEAD^{tree}"]).unwrap();
+        let argv = cargo_argv("", false, features, "2");
+        KeyParts {
+            repo: "path:test",
+            tree: &tree,
+            filter: "",
+            full: false,
+            features,
+            env,
+            rustflags,
+            jobs: 4,
+            worktree: repo,
+            argv: &argv,
+            runner: "shell",
+        }
+        .record()
+        .unwrap()
+    }
+
+    #[test]
+    fn cache_key_drops_tree_features_or_toolchain_and_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        let mut env_a = BTreeMap::new();
+        env_a.insert("CADENCE_PM_DIR".into(), "/tmp/pm-a".into());
+        let mut env_b = BTreeMap::new();
+        env_b.insert("CADENCE_PM_DIR".into(), "/tmp/pm-b".into());
+        let base = record_for(&repo, "feat_a", &env_a, "--cfg cadence_bound");
+        let other_features = record_for(&repo, "feat_b", &env_a, "--cfg cadence_bound");
+        let other_env = record_for(&repo, "feat_a", &env_b, "--cfg cadence_bound");
+        assert_ne!(cache_key(&base), cache_key(&other_features));
+        assert_ne!(cache_key(&base), cache_key(&other_env));
+        assert_eq!(base["features"], "feat_a");
+        assert_eq!(base["env"]["CADENCE_PM_DIR"], "/tmp/pm-a");
+        assert!(base["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "feat_a"));
+        assert!(base["toolchain"]["rustc"]
+            .as_str()
+            .unwrap()
+            .contains("rustc"));
+        for field in ["tree", "features", "toolchain"] {
+            assert!(
+                base.get(field).is_some(),
+                "cache key is missing {field}; deleting it must fail this test"
+            );
+            let mut stripped = base.clone();
+            assert!(stripped.as_object_mut().unwrap().remove(field).is_some());
+            assert_ne!(
+                cache_key(&base),
+                cache_key(&stripped),
+                "{field} is not part of the cache key"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cache_hit_is_a_run_whose_child_saw_the_hashed_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&state).unwrap();
+        init_repo(&repo);
+        let mut env = BTreeMap::new();
+        env.insert(
+            "CADENCE_REVIEW_CONFIG".into(),
+            "/tmp/review-contract".into(),
+        );
+        env.insert("CADENCE_SUITE_LOCK".into(), "/tmp/suite-contract".into());
+        env.insert("CADENCE_ALIAS".into(), "forged-alias".into());
+        env.insert(
+            "CADENCE_STATE_DIR".into(),
+            "/home/ubuntu/.local/state/cadence".into(),
+        );
+        let submit = Submit {
+            worktree: repo,
+            filter: "alpha".into(),
+            full: false,
+            no_cache: false,
+            env,
+            rustflags: "--cfg cadence_bound".into(),
+            features: "feat_a".into(),
+            priority: "dev".into(),
+            by: "cur-129".into(),
+        };
+        let script = "env | sort > \"$CADENCE_TEST_ISOLATION/child-env\"\nexit 0\n";
+        let first = submit_with(
+            &state,
+            &submit,
+            &limits_one(),
+            &Runner::Shell(script.into()),
+        )
+        .unwrap();
+        let mut worker = Worker::new(&state, limits_one(), Runner::Shell(script.into())).unwrap();
+        settle(&mut worker);
+        let dumped = fs::read_to_string(
+            PathBuf::from(first["isolation_dir"].as_str().unwrap()).join("child-env"),
+        )
+        .unwrap();
+        assert!(
+            dumped
+                .lines()
+                .any(|l| l == "CADENCE_REVIEW_CONFIG=/tmp/review-contract"),
+            "{dumped}"
+        );
+        assert!(
+            dumped
+                .lines()
+                .any(|l| l == "CADENCE_SUITE_LOCK=/tmp/suite-contract"),
+            "{dumped}"
+        );
+        assert!(
+            dumped.lines().any(|l| l == "RUSTFLAGS=--cfg cadence_bound"),
+            "{dumped}"
+        );
+        assert!(!dumped.contains("CADENCE_ALIAS="), "{dumped}");
+        assert!(
+            !dumped.contains("/home/ubuntu/.local/state/cadence\n"),
+            "{dumped}"
+        );
+        let again = submit_with(
+            &state,
+            &submit,
+            &limits_one(),
+            &Runner::Shell(script.into()),
+        )
+        .unwrap();
+        assert_eq!(again["cache"], "hit");
+        assert_eq!(again["id"], first["id"]);
+    }
+
+    #[test]
+    fn status_and_log_reject_absolute_dotdot_and_forged_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        fs::create_dir_all(&state).unwrap();
+        let secret = tmp.path().join("secret.txt");
+        fs::write(&secret, "SECRET-BYTES").unwrap();
+        let secret_id = secret.to_str().unwrap();
+        for id in [
+            secret_id,
+            "/tmp/pwn",
+            "..",
+            "../secret.txt",
+            "tq-aaaaaaaa/../../etc/passwd",
+            "tq-DEADBEEF",
+            "operator",
+            "",
+            "tq-aaaaaaa",
+            "tq-aaaaaaaa ",
+        ] {
+            let status_err = status(&state, id).unwrap_err();
+            let log_err = log(&state, id).unwrap_err();
+            let status_text = status_err.to_string();
+            let log_text = log_err.to_string();
+            assert!(
+                status_text.contains("must look like"),
+                "status {id:?}: {status_text}"
+            );
+            assert!(
+                log_text.contains("must look like"),
+                "log {id:?}: {log_text}"
+            );
+            assert!(!status_text.contains("SECRET-BYTES"), "{status_text}");
+            assert!(!log_text.contains("SECRET-BYTES"), "{log_text}");
+        }
+        let missing = status(&state, "tq-00000000").unwrap_err();
+        assert!(
+            missing.to_string().contains("unknown test job"),
+            "{missing}"
+        );
+    }
+
+    #[test]
+    fn a_later_review_job_starts_before_an_earlier_dev_job() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&state).unwrap();
+        init_repo(&repo);
+        let hold = r#"
+touch "$CADENCE_TEST_ISOLATION/started"
+while [ ! -f "$CADENCE_TEST_ISOLATION/go" ]; do sleep 0.02; done
+exit 0
+"#;
+        let mut dev_env = BTreeMap::new();
+        dev_env.insert("CADENCE_SUITE_LOCK".into(), "/tmp/suite".into());
+        let dev = submit_with(
+            &state,
+            &Submit {
+                worktree: repo.clone(),
+                filter: "alpha".into(),
+                full: false,
+                no_cache: false,
+                env: dev_env.clone(),
+                rustflags: String::new(),
+                features: String::new(),
+                priority: "dev".into(),
+                by: "cur-129".into(),
+            },
+            &limits_one(),
+            &Runner::Shell(hold.into()),
+        )
+        .unwrap();
+        let review = submit_with(
+            &state,
+            &Submit {
+                worktree: repo,
+                filter: "beta".into(),
+                full: false,
+                no_cache: false,
+                env: dev_env,
+                rustflags: String::new(),
+                features: String::new(),
+                priority: "review".into(),
+                by: "cur-129".into(),
+            },
+            &limits_one(),
+            &Runner::Shell(hold.into()),
+        )
+        .unwrap();
+        assert!(dev["seq"].as_u64() < review["seq"].as_u64());
+        let mut worker = Worker::new(&state, limits_one(), Runner::Shell(hold.into())).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            worker.tick().unwrap();
+            let started = PathBuf::from(review["isolation_dir"].as_str().unwrap()).join("started");
+            if started.exists() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "review job did not start"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !PathBuf::from(dev["isolation_dir"].as_str().unwrap())
+                .join("started")
+                .exists(),
+            "dev job started ahead of the review job"
+        );
+        let view = queue_view(&state).unwrap();
+        assert_eq!(view["holder"], review["id"]);
+        fs::write(
+            PathBuf::from(review["isolation_dir"].as_str().unwrap()).join("go"),
+            "1",
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            worker.tick().unwrap();
+            let started = PathBuf::from(dev["isolation_dir"].as_str().unwrap()).join("started");
+            if started.exists() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "dev job did not start"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        fs::write(
+            PathBuf::from(dev["isolation_dir"].as_str().unwrap()).join("go"),
+            "1",
+        )
+        .unwrap();
+        settle(&mut worker);
     }
 }

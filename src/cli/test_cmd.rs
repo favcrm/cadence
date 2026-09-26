@@ -14,6 +14,14 @@ pub(crate) enum TestAction {
         /// Cargo test filter. Empty runs the default selection.
         #[arg(long, default_value = "")]
         filter: String,
+        /// Cargo `--features` list. Empty is the default feature set.
+        /// Part of the cache key, and passed to the child.
+        #[arg(long, default_value = "")]
+        features: String,
+        /// `dev` (default) or `review`. Review jobs start first; within
+        /// one priority the queue is FIFO.
+        #[arg(long, default_value = "dev")]
+        priority: String,
         /// `cargo test --all-targets`. A full run holds the queue alone.
         #[arg(long)]
         full: bool,
@@ -46,6 +54,8 @@ pub(super) fn run(state_dir: &Path, action: &TestAction) -> Result<i32> {
         TestAction::Submit {
             worktree,
             filter,
+            features,
+            priority,
             full,
             no_cache,
             wait,
@@ -57,6 +67,8 @@ pub(super) fn run(state_dir: &Path, action: &TestAction) -> Result<i32> {
                 json!({
                     "worktree": worktree,
                     "filter": filter,
+                    "features": features,
+                    "priority": priority,
                     "full": full,
                     "no_cache": no_cache,
                     "rustflags": std::env::var("RUSTFLAGS").unwrap_or_default(),

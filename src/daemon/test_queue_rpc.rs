@@ -10,6 +10,10 @@ impl Shared {
     pub(super) fn rpc_test_submit(self: &Arc<Self>, params: &Value) -> Result<Value> {
         let worktree = required_str(params, "worktree")?;
         let filter = optional_str(params, "filter").unwrap_or("").to_string();
+        let features = optional_str(params, "features").unwrap_or("").to_string();
+        let priority = optional_str(params, "priority")
+            .unwrap_or("dev")
+            .to_string();
         let full = params.get("full").and_then(Value::as_bool).unwrap_or(false);
         let no_cache = params
             .get("no_cache")
@@ -33,6 +37,8 @@ impl Shared {
             &crate::test_queue::Submit {
                 worktree: std::path::PathBuf::from(worktree),
                 filter,
+                features,
+                priority,
                 full,
                 no_cache,
                 env,
@@ -43,11 +49,15 @@ impl Shared {
     }
 
     pub(super) fn rpc_test_status(self: &Arc<Self>, params: &Value) -> Result<Value> {
-        crate::test_queue::status(&self.state_dir, required_str(params, "id")?)
+        let id = required_str(params, "id")?;
+        crate::test_queue::require_job_id(id)?;
+        crate::test_queue::status(&self.state_dir, id)
     }
 
     pub(super) fn rpc_test_log(self: &Arc<Self>, params: &Value) -> Result<Value> {
-        crate::test_queue::log(&self.state_dir, required_str(params, "id")?)
+        let id = required_str(params, "id")?;
+        crate::test_queue::require_job_id(id)?;
+        crate::test_queue::log(&self.state_dir, id)
     }
 
     pub(super) fn rpc_test_queue(self: &Arc<Self>) -> Result<Value> {
