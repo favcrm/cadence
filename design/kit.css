@@ -1,0 +1,308 @@
+/* design/kit.css — the cadence board's shell and components for
+ * zero-build mockups. Pair with design/tokens.css (generated): every
+ * colour and font here reads a var() the tokens define, so a mockup
+ * follows the app theme in dark, light and scoped subtrees.
+ *
+ * Class names match ui/src/styles.css where the app already has one
+ * (.navlink .proj .card .tcard .field .chip .slabel .kicker .num .lnk);
+ * the rest (.btn .badge .tree/.trow .tbl .tabs/.tab .scrim .modal
+ * .drop .toast .empty) are the kit's own, named as the board would.
+ */
+
+*, *::before, *::after { box-sizing: border-box; }
+[hidden] { display: none !important; }
+
+body {
+  margin: 0;
+  background: var(--color-ink-950);
+  color: var(--color-ink-300);
+  font-family: var(--font-sans);
+  font-size: var(--text-body);
+  line-height: 1.4;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+a { color: inherit; text-decoration: none; }
+button { font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: pointer; }
+input, textarea, select { font: inherit; }
+pre { white-space: pre-wrap; }
+svg { display: inline-block; vertical-align: middle; }
+
+.num { font-family: var(--font-mono); font-variant-numeric: tabular-nums lining-nums; }
+.kicker { font: 400 var(--text-label) var(--font-mono); color: var(--color-ink-500); text-transform: lowercase; }
+.slabel {
+  font: 500 var(--text-micro) var(--font-mono);
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--color-ink-500);
+}
+a.lnk, button.lnk { color: var(--color-accent); }
+a.lnk:hover, button.lnk:hover { text-decoration: underline; }
+.muted { color: var(--color-ink-500); }
+.strong { color: var(--color-ink-100); }
+
+::-webkit-scrollbar { height: 10px; width: 10px; }
+::-webkit-scrollbar-thumb { background: var(--color-ink-700); border-radius: 6px; }
+
+@media (prefers-reduced-motion: no-preference) {
+  .reveal { animation: reveal .45s cubic-bezier(.2, .8, .2, 1) both; }
+}
+@keyframes reveal { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+/* ------------------------------ shell ------------------------------ */
+
+/* .shell > .side + .main; .main > .topbar + .body; .body > .content + .rail? */
+.shell { display: grid; grid-template-columns: 208px minmax(0, 1fr); min-height: 100vh; background: var(--color-ink-900); }
+
+.side {
+  position: sticky; top: 0; height: 100vh;
+  display: flex; flex-direction: column;
+  border-right: 1px solid var(--color-ink-700);
+  background: var(--color-ink-875);
+  padding: 22px 14px 16px;
+  overflow-y: auto;
+}
+.brand {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 0 7px 23px;
+  color: var(--color-ink-100);
+  font-size: 17px; font-weight: 600; letter-spacing: -.035em;
+}
+.brand small { color: var(--color-ink-400); font-weight: 400; font-size: inherit; }
+.nav { display: grid; gap: 3px; }
+.navlink {
+  display: flex; min-height: 38px; align-items: center; gap: 11px;
+  padding: 0 11px; border-radius: 4px;
+  color: var(--color-ink-400); font-size: 13px;
+  transition: background-color .16s ease, color .16s ease;
+}
+.navlink:hover { background: var(--color-ink-800); color: var(--color-ink-100); }
+.navlink[aria-current="page"] {
+  background: color-mix(in srgb, var(--color-accent) 13%, var(--color-ink-875));
+  color: var(--color-accent);
+}
+.side-label {
+  display: flex; justify-content: space-between;
+  margin: 22px 11px 7px;
+}
+.proj {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px;
+  width: 100%; padding: 7px 10px; border-radius: 4px;
+  color: var(--color-ink-400); font-size: 12px; text-align: left;
+}
+.proj:hover, .proj.on { background: var(--color-ink-800); color: var(--color-ink-100); }
+.proj.on { box-shadow: inset 2px 0 var(--color-accent); }
+.side-foot {
+  margin-top: auto; padding-top: 16px;
+  border-top: 1px solid var(--color-ink-700);
+  margin-inline: 4px;
+  color: var(--color-ink-500); font-size: var(--text-label); line-height: 1.6;
+}
+
+.main { min-width: 0; display: flex; flex-direction: column; }
+.topbar {
+  position: sticky; top: 0; z-index: 10;
+  height: 2.85rem; display: flex; align-items: center; gap: 12px;
+  padding: 0 32px;
+  border-bottom: 1px solid var(--color-ink-700);
+  background: color-mix(in srgb, var(--color-ink-900) 95%, transparent);
+  backdrop-filter: blur(8px);
+}
+.topbar .spacer { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+.crumb { font-family: var(--font-mono); font-size: var(--text-label); color: var(--color-ink-500); min-width: 0; }
+.crumb b { color: var(--color-ink-100); font-weight: 400; }
+.crumb span { color: var(--color-ink-300); }
+
+.body { display: grid; grid-template-columns: minmax(0, 1fr) auto; flex: 1; }
+.body.no-rail { grid-template-columns: minmax(0, 1fr); }
+.content { min-width: 0; padding: 24px 32px 40px; }
+.rail {
+  width: 264px;
+  border-left: 1px solid var(--color-ink-700);
+  padding: 24px 20px;
+  display: flex; flex-direction: column; gap: 20px;
+}
+
+/* ---------------------------- components ---------------------------- */
+
+.btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  height: 2rem; padding: 0 .8rem;
+  border: 1px solid var(--color-edge); border-radius: .25rem;
+  background: var(--color-ink-850); color: var(--color-ink-200);
+  font-size: var(--text-label);
+  transition: border-color .15s ease, background-color .15s ease;
+}
+.btn:hover { border-color: var(--color-edge-hover); background: var(--color-ink-800); }
+.btn:focus-visible, .field:focus {
+  outline: none; border-color: var(--color-accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-accent) 10%, transparent);
+}
+.btn-acc {
+  border-color: transparent;
+  background: var(--color-accent); color: var(--color-on-accent);
+  font-weight: 500;
+}
+.btn-acc:hover { background: var(--color-accent); filter: brightness(1.1); }
+.btn-danger { color: var(--color-fail); }
+.btn-danger:hover { border-color: var(--color-fail); background: color-mix(in srgb, var(--color-fail) 10%, transparent); }
+.btn:disabled, .btn[aria-disabled="true"] { opacity: .5; cursor: not-allowed; }
+
+.chip {
+  display: inline-flex; align-items: center; gap: .3rem;
+  border-radius: .25rem; padding: .05rem .4rem;
+  font: 500 var(--text-micro) var(--font-mono);
+}
+.chip.tone, .badge { background: color-mix(in srgb, var(--c, var(--color-ink-500)) 12%, transparent); color: var(--c, var(--color-ink-400)); }
+
+.badge {
+  display: inline-flex; align-items: center; gap: .35rem;
+  border-radius: .25rem; padding: .05rem .45rem;
+  font: 500 var(--text-micro) var(--font-mono);
+}
+.badge::before {
+  content: ""; width: .4rem; height: .4rem; border-radius: 9999px;
+  background: var(--c, var(--color-ink-500));
+}
+.b-ok { --c: var(--color-ok); }
+.b-fail { --c: var(--color-fail); }
+.b-warn { --c: var(--color-warn); }
+.b-info { --c: var(--color-info); }
+.b-acc { --c: var(--color-accent); }
+.b-lock { --c: var(--color-warn); }
+.badge.plain { background: var(--color-ink-800); color: var(--color-ink-400); }
+.badge.plain::before { display: none; }
+
+.card {
+  border: 1px solid var(--color-ink-700);
+  background: var(--color-ink-850);
+  border-radius: .5rem;
+  transition: border-color .15s ease, background-color .15s ease;
+}
+.tcard { cursor: pointer; }
+.tcard:hover { border-color: var(--color-ink-600); background: var(--color-ink-800); }
+.tcard:focus-visible {
+  outline: none; border-color: var(--color-accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-accent) 10%, transparent);
+}
+.card.pad { padding: 20px; }
+
+.field {
+  height: 2.25rem; width: 100%;
+  border: 1px solid var(--color-edge); border-radius: .25rem;
+  background: var(--color-ink-900); color: var(--color-ink-100);
+  padding: 0 .85rem; font-size: var(--text-secondary);
+}
+.field:hover { border-color: var(--color-edge-hover); }
+.field::placeholder { color: var(--color-ink-500); }
+textarea.field { height: auto; min-height: 5rem; padding: .6rem .85rem; resize: vertical; }
+
+/* tree rows: indent with .trow-pad, an icon, a name, trailing meta. */
+.tree { display: grid; gap: 1px; }
+.trow {
+  display: flex; align-items: center; gap: 8px;
+  min-height: 30px; padding: 0 8px;
+  border-radius: 4px;
+  color: var(--color-ink-300); font-size: var(--text-secondary);
+}
+.trow:hover { background: var(--color-ink-800); }
+.trow.on { background: color-mix(in srgb, var(--color-accent) 10%, var(--color-ink-850)); color: var(--color-accent); }
+.trow .ticon { flex: none; color: var(--color-ink-500); }
+.trow .tname { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.trow .tmeta { margin-left: auto; color: var(--color-ink-500); font-size: var(--text-micro); }
+.trow .caret { transition: transform .2s cubic-bezier(.2, .8, .2, 1); }
+.trow.open .caret { transform: rotate(90deg); }
+
+.tbl { width: 100%; border-collapse: collapse; font-size: var(--text-table); }
+.tbl th {
+  text-align: left; font-weight: 500;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--color-ink-700);
+  color: var(--color-ink-400);
+}
+.tbl td { padding: 7px 10px; border-bottom: 1px solid var(--color-ink-800); vertical-align: top; }
+.tbl tr:last-child td { border-bottom: 0; }
+.tbl tbody tr:hover td { background: var(--color-ink-875); }
+
+.tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--color-ink-700); }
+.tab {
+  padding: 8px 12px; margin-bottom: -1px;
+  border-bottom: 2px solid transparent;
+  color: var(--color-ink-400); font-size: var(--text-secondary);
+}
+.tab:hover { color: var(--color-ink-200); }
+.tab.on { color: var(--color-accent); border-bottom-color: var(--color-accent); }
+
+.scrim {
+  position: fixed; inset: 0; z-index: 50;
+  background: var(--color-scrim);
+  display: grid; place-items: center; padding: 24px;
+}
+.modal {
+  width: min(520px, 100%);
+  border: 1px solid var(--color-ink-700); border-radius: .5rem;
+  background: var(--color-ink-850);
+  box-shadow: 0 18px 60px rgb(0 0 0 / .45);
+}
+.modal > .mhead {
+  display: flex; align-items: center; gap: 10px;
+  padding: 14px 18px; border-bottom: 1px solid var(--color-ink-700);
+  color: var(--color-ink-100); font-size: var(--text-cardtitle); font-weight: 600;
+}
+.modal > .mbody { padding: 18px; }
+.modal > .mfoot {
+  display: flex; justify-content: flex-end; gap: 8px;
+  padding: 12px 18px; border-top: 1px solid var(--color-ink-700);
+}
+
+.drop {
+  display: grid; place-items: center; gap: 6px;
+  min-height: 140px; padding: 24px;
+  border: 1.5px dashed var(--color-ink-600); border-radius: .5rem;
+  color: var(--color-ink-500); font-size: var(--text-secondary);
+  text-align: center;
+}
+.drop.over { border-color: var(--color-accent); color: var(--color-accent); background: color-mix(in srgb, var(--color-accent) 6%, transparent); }
+
+.toast {
+  position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+  z-index: 60;
+  padding: 10px 16px;
+  font-family: var(--font-mono); font-size: var(--text-label);
+  max-width: 80vw;
+  box-shadow: 0 12px 32px rgb(0 0 0 / .5);
+}
+.toast.ok { border-color: var(--color-ink-600); color: var(--color-ink-200); }
+.toast.warn { border-color: color-mix(in srgb, var(--color-warn) 50%, transparent); color: var(--color-warn); }
+.toast.err { border-color: color-mix(in srgb, var(--color-fail) 50%, transparent); color: var(--color-fail); }
+
+.empty {
+  display: grid; place-items: center; gap: 8px;
+  padding: 48px 24px;
+  color: var(--color-ink-500); font-size: var(--text-secondary); text-align: center;
+}
+.empty .etitle { color: var(--color-ink-300); font-size: var(--text-cardtitle); font-weight: 500; }
+
+/* The theme toggle button (kit.html wires the cycle). */
+.tg {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 28px; height: 28px; border-radius: 4px;
+  color: var(--color-ink-400);
+}
+.tg:hover { background: var(--color-ink-800); color: var(--color-ink-100); }
+
+/* A data-theme subtree re-establishes the base text colour — body's
+ * inherited colour would otherwise keep the root theme's value inside
+ * the scoped pane. Components already read var()s per-element, so this
+ * is the only inheritance gap. */
+[data-theme] { color: var(--color-ink-300); }
+
+/* kit.html only: the side-by-side light/dark gallery panes. */
+.duo { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.duo-pane {
+  border: 1px solid var(--color-ink-700); border-radius: .5rem;
+  background: var(--color-ink-900);
+  padding: 16px; display: flex; flex-direction: column; gap: 12px;
+}
+.duo-pane > .dtag { align-self: flex-start; }
+@media (max-width: 900px) { .duo { grid-template-columns: 1fr; } }
