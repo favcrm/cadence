@@ -330,6 +330,8 @@ tests = [
     "pty_nudge_whose_turn_ends_before_injection_is_skipped",
     "cad565_pty_delivery_pastes_a_bounded_notice",
     "cad565_message_read_windows_by_scalars_and_keeps_other_agents_out",
+    "cad565_send_refuses_a_forged_turn_id",
+    "cad565_message_read_refuses_forged_identity_fields",
     "cli_doctor_smoke",
     "mock_installers_run_concurrently_with_private_state",
     "mock_config_never_touches_process_env",

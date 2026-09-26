@@ -405,6 +405,83 @@ fn cad565_message_read_windows_by_scalars_and_keeps_other_agents_out() {
     );
 }
 
+/// CAD-565: `turn_id` is the daemon's running-turn token, bound at
+/// claim — a caller-supplied value is refused before enqueue, whoever
+/// sends it. Deleting the check would let a forged bind through.
+#[test]
+fn cad565_send_refuses_a_forged_turn_id() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin("dv1", None);
+    d.register_devin("dv2", None);
+    d.wait_agent("dv1", "idle", 20);
+    d.wait_agent("dv2", "idle", 20);
+    let err = d
+        .send(
+            "dv1",
+            json!({"text": "x", "message": "t1", "turn_id": "pi-deadbeef-c0ffee"}),
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("`turn_id` is not a request field"),
+        "{err}"
+    );
+    // An agent caller forging the same field is refused identically.
+    let err = d
+        .memory_rpc(
+            &mock,
+            "dv2",
+            "agent_send",
+            json!({"alias": "dv1", "text": "x", "message": "t2",
+                   "turn_id": "pi-deadbeef-c0ffee"}),
+        )
+        .unwrap_err();
+    assert!(err.contains("`turn_id` is not a request field"), "{err}");
+    // Refused before enqueue — neither id ever reached the queue.
+    assert!(messages_for(&d, "dv1").is_empty(), "refused sends landed");
+}
+
+/// CAD-565: `message_read` runs `reject_identity_fields` before the
+/// own-mail check — a forged `by`/`caller`/`operator` field is refused
+/// even when it would name the message's own recipient.
+#[test]
+fn cad565_message_read_refuses_forged_identity_fields() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin("dv1", None);
+    d.wait_agent("dv1", "idle", 20);
+    d.send("dv1", json!({"text": "hi", "message": "m1"}))
+        .unwrap();
+    for field in ["by", "caller", "operator"] {
+        let err = d
+            .memory_rpc(
+                &mock,
+                "dv1",
+                "message_read",
+                json!({"message": "m1", field: "operator"}),
+            )
+            .unwrap_err();
+        assert!(
+            err.contains(&format!("'{field}' is not accepted")),
+            "forged {field}: {err}"
+        );
+    }
+    // A forged field stays refused even against another agent's read.
+    let err = d
+        .memory_rpc(
+            &mock,
+            "dv1",
+            "message_read",
+            json!({"message": "m1", "by": "dv1"}),
+        )
+        .unwrap_err();
+    assert!(err.contains("'by' is not accepted"), "{err}");
+    // The honest caller still reads — the refusal is the field, not the
+    // method.
+    let own = d.memory_rpc(&mock, "dv1", "message_read", json!({"message": "m1"}));
+    assert_eq!(own.unwrap()["text"], "hi", "own read");
+}
+
 #[test]
 fn cli_doctor_smoke() {
     let dir = TempDir::new().unwrap();
