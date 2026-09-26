@@ -193,6 +193,10 @@ async function checkLayout(page) {
     const panel = document.querySelector("[data-chat-panel]");
     const dock = document.querySelector("[data-chat-dock]");
     const scroller = document.querySelector("[data-chat-scroll]");
+    // Measure at the tail. A reply that lands after the caller's scroll
+    // would otherwise put the last box below the dock and fail a check
+    // the padding already satisfies.
+    if (scroller) scroller.scrollTop = scroller.scrollHeight;
     const last = document.querySelector('ol[aria-label="messages"] > li:last-child');
     const need = document.querySelector(".needbtn");
     const needShown = !!(need && getComputedStyle(need).display !== "none" && need.getClientRects().length);
@@ -240,7 +244,10 @@ async function checkLayout(page) {
     geom.panel.bottom <= geom.winH + 1 && geom.panel.bottom >= geom.winH - 16,
     `the panel reaches the viewport's bottom (panel ${geom.panel.bottom}, window ${geom.winH})`,
   );
-  ok(geom.last && geom.last.bottom <= geom.dock.top + 1, "the last message is never hidden behind the dock");
+  ok(
+    geom.last && geom.last.bottom <= geom.dock.top + 1,
+    `the last message is never hidden behind the dock (last ${geom.last && geom.last.bottom} dock ${geom.dock && geom.dock.top})`,
+  );
   if (geom.need) {
     ok(
       !overlaps(geom.last, geom.need),
