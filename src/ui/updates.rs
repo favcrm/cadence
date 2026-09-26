@@ -74,9 +74,14 @@ fn pending(state_dir: &Path) -> (Value, Vec<Value>) {
     }
 }
 
+/// How long a cached check stays fresh before the card refreshes it in
+/// the background.
+const CHECK_EVERY: f64 = 600.0;
+
 /// `GET /api/update` — the card's whole view: the current release, the
 /// last check, the running update's progress, and the drain state.
 pub(super) fn get(state_dir: &Path) -> HttpResp {
+    maybe_refresh_check(state_dir);
     let layout = layout();
     let current = layout.as_ref().map(current).unwrap_or(Value::Null);
     let (pending, waiting) = pending(state_dir);
@@ -104,13 +109,32 @@ pub(super) fn get(state_dir: &Path) -> HttpResp {
     }))
 }
 
+/// The card fills itself in: a check is kicked in the background when
+/// the cached one is missing or older than [`CHECK_EVERY`], so Settings
+/// shows "Update available · N changes" without a click. Read-only (gh
+/// queries), single-flight, and never a caller's input.
+fn maybe_refresh_check(state_dir: &Path) {
+    let fresh = BOARD_UPDATE
+        .checked_at
+        .lock()
+        .unwrap()
+        .is_some_and(|at| crate::rollout::unix_now() - at < CHECK_EVERY);
+    if fresh || BOARD_UPDATE.checking.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let state_dir = state_dir.to_path_buf();
+    std::thread::spawn(move || {
+        if let Ok(report) = run_check(&state_dir) {
+            *BOARD_UPDATE.check.lock().unwrap() = Some(report);
+            *BOARD_UPDATE.checked_at.lock().unwrap() = Some(crate::rollout::unix_now());
+        }
+        BOARD_UPDATE.checking.store(false, Ordering::SeqCst);
+    });
+}
+
 /// `POST /api/update/check` — run the real check (gh) now and cache it.
 pub(super) fn check_now(state_dir: &Path) -> HttpResp {
-    if BOARD_UPDATE.checking.swap(true, Ordering::SeqCst) {
-        return coded_response(409, "check_running", "a check is already running", None);
-    }
     let outcome = run_check(state_dir);
-    BOARD_UPDATE.checking.store(false, Ordering::SeqCst);
     match outcome {
         Ok(report) => {
             *BOARD_UPDATE.check.lock().unwrap() = Some(report.clone());
