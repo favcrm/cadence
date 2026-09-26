@@ -43,6 +43,17 @@ struct ThreadMessageReq {
     text: String,
     /// Client-chosen id: a retried POST is the same message, not two.
     message: Option<String>,
+    /// CAD-574: needs-me subjects the message cites (the rail's "Ask
+    /// master"). The daemon's `thread_refs` is the strict side — this
+    /// field only carries `{kind,id}` pairs through the relay.
+    refs: Option<Vec<ThreadRef>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ThreadRef {
+    kind: String,
+    id: String,
 }
 
 /// Alias grammar checked before it reaches the daemon — the same one
@@ -254,6 +265,12 @@ pub(super) fn post_message(
     let mut params = json!({"alias": alias, "text": req.text});
     if let Some(message) = req.message {
         params["message"] = Value::String(message);
+    }
+    if let Some(refs) = req.refs {
+        params["refs"] = json!(refs
+            .iter()
+            .map(|r| json!({"kind": r.kind, "id": r.id}))
+            .collect::<Vec<_>>());
     }
     match client::rpc(state_dir, "thread_send", params) {
         Ok(receipt) => json_response(receipt),

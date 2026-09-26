@@ -697,6 +697,7 @@ impl Store {
             task.worktree.as_deref(),
             &Sender::Unattributed,
             Priority::Normal,
+            None,
         )?;
         if duplicate {
             return Ok((task, kickoff, true, false));

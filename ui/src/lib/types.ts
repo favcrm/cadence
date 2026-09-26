@@ -729,6 +729,30 @@ export interface MasterCommandResult {
   result?: unknown;
 }
 
+/**
+ * `GET /api/master/models` — the model picker's read (CAD-575's route;
+ * CAD-574's dropdowns consume it). `cost_tier` is the catalog's
+ * Free / Low cost / Paid / unknown; `allowed_for` names the roles the
+ * model may serve. Every field is optional — a daemon or provider that
+ * cannot say simply omits it.
+ */
+export interface MasterModels {
+  current?: { model?: string | null; effort?: string | null } | null;
+  models?: {
+    id?: string;
+    label?: string | null;
+    cost_tier?: string | null;
+    allowed_for?: string[];
+  }[];
+  efforts?: string[];
+}
+
+/** A needs-me subject a thread message cites (CAD-574 `thread_send` refs). */
+export interface ThreadRef {
+  kind: string;
+  id: string;
+}
+
 /** GET /api/agents/<alias> — the drawer detail. */
 export interface AgentDetail {
   agent: {

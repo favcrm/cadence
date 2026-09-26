@@ -241,3 +241,73 @@ export function turnState(
   if (submitting) return { kind: "submitting" };
   return { kind: "idle" };
 }
+
+// ---- CAD-574: the model/effort dropdowns ----
+
+import type { MasterModels } from "../../lib/types";
+
+/** One row of the model dropdown: the id `master_command model` takes,
+ *  the display label, and the catalog's cost tier. */
+export interface ModelOption {
+  id: string;
+  label: string;
+  /** `cost_tier` verbatim — Free / Low cost / Paid / unknown. */
+  cost: string;
+  /** Roles the model may serve (`allowed_for`); empty when unlisted. */
+  roles: string[];
+}
+
+export interface MasterModelsView {
+  models: ModelOption[];
+  efforts: string[];
+  /** The session's current model id / effort level, when it says. */
+  model: string | null;
+  effort: string | null;
+}
+
+/**
+ * `GET /api/master/models` → the dropdowns' rows (CAD-574). Tolerant of
+ * a partial payload — an entry without an id cannot be chosen and is
+ * dropped, a missing cost tier renders `unknown`. Tested in
+ * tests/masterModels.test.ts.
+ */
+export function masterModelsOptions(m: MasterModels | null | undefined): MasterModelsView {
+  const str = (v: unknown): string | null =>
+    typeof v === "string" && v.trim() !== "" ? v : null;
+  const models: ModelOption[] = [];
+  for (const e of m?.models ?? []) {
+    if (!e || typeof e !== "object") continue;
+    const id = str(e.id);
+    if (!id) continue;
+    models.push({
+      id,
+      label: str(e.label) ?? id,
+      cost: str(e.cost_tier) ?? "unknown",
+      roles: Array.isArray(e.allowed_for) ? e.allowed_for.filter((r): r is string => !!str(r)) : [],
+    });
+  }
+  const efforts = (m?.efforts ?? []).filter((e): e is string => !!str(e));
+  return {
+    models,
+    efforts,
+    model: str(m?.current?.model),
+    effort: str(m?.current?.effort),
+  };
+}
+
+/**
+ * A chip pick has landed once the session reports it. The reported id
+ * may be the bare `model-2` while the list names `fake/model-2`
+ * (provider/id) — the pick list is `master_models`' vocabulary, the
+ * state read the provider's, so a model pick also lands when the
+ * reported id is the pick's tail. Effort levels share one vocabulary.
+ */
+export function pickLanded(
+  kind: "model" | "effort",
+  pick: string,
+  reported: string | null | undefined,
+): boolean {
+  if (!reported) return false;
+  if (reported === pick) return true;
+  return kind === "model" && pick.endsWith(`/${reported}`);
+}

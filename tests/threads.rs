@@ -469,11 +469,11 @@ fn cad319_thread_http_routes_guards_and_sse_resume() {
     let show = d.rpc("agent_show", json!({"alias": "lead"})).unwrap();
     assert_eq!(show["messages"], json!([]), "{show}");
     // Unknown fields and unknown agents.
-    let (status, _) = board_http(
+    let (status, reply) = board_http(
         port,
         &thread_post_request(port, "lead", &guards, r#"{"text":"x","as":"operator"}"#),
     );
-    assert_eq!(status, 400);
+    assert_eq!(status, 400, "{reply}");
     let (status, reply) = board_http(
         port,
         &thread_post_request(port, "ghost", &guards, r#"{"text":"x"}"#),
@@ -3372,4 +3372,404 @@ fn cad575_master_models_board_gate() {
     let out = r["out"].as_str().unwrap();
     assert!(out.contains(" 403 "), "{out}");
     assert!(out.contains("session_from_agent"), "{out}");
+}
+// ---- CAD-574: Needs-you dismiss/snooze + the rail's board relays ----
+
+/// `needs_dismiss` is operator-only by connection — an agent caller and
+/// its detached child are refused before a field is read, and a forged
+/// authority field is refused — the mode and the snooze window are an
+/// allowlist, and concurrent calls settle. A dismissal then suppresses
+/// the subject's row in `cadence overview` until the condition
+/// re-occurs — a newer `since` beats the recorded `at` — while an
+/// expired snooze and a stale `at` suppress nothing.
+#[test]
+fn cad574_needs_dismiss_gate_and_suppression() {
+    let d = TestDaemon::start();
+    let home = TempDir::new().unwrap();
+    d.register("w1");
+    d.wait_agent("w1", "idle", 10);
+    fence_agent(&d, "w1", "x1");
+    let row_for = |id: &str| -> Option<Value> {
+        overview_at(home.path(), &d.state, None, &[])["needs_me"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["subject"]["id"] == id)
+            .cloned()
+    };
+    let row = row_for("w1").expect("fenced row");
+    assert_eq!(row["kind"], "fenced", "{row}");
+    assert_eq!(row["subject"]["kind"], "agent", "{row}");
+
+    let mut wk = ManagedWorker::start(&d, "wk");
+    // Agent caller and its detached child are refused before the fields
+    // are even looked at — the refusal names the caller's lane.
+    for src in ["self", "child"] {
+        let frame = wk.rpc(
+            src,
+            "needs_dismiss",
+            json!({"kind": "agent", "id": "w1", "mode": "dismiss"}),
+        );
+        assert_eq!(frame["ok"], false, "{frame}");
+        let msg = frame["error"]["message"].as_str().unwrap_or_default();
+        assert!(msg.contains("operator action"), "{frame}");
+    }
+    let frame = wk.rpc(
+        "self",
+        "needs_dismiss",
+        json!({"kind": "agent", "id": "w1", "mode": "dismiss"}),
+    );
+    let msg = frame["error"]["message"].as_str().unwrap_or_default();
+    assert!(msg.contains("'wk'"), "{frame}");
+
+    // A forged authority field refuses — the connection proves the
+    // operator; no request field may name them.
+    let err = d
+        .operator_rpc(
+            "needs_dismiss",
+            json!({"kind": "agent", "id": "w1", "mode": "dismiss", "by": "operator"}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("request field 'by' is not accepted"), "{err}");
+
+    // `mode` is an allowlist; `secs` is required for a snooze, refused
+    // for a dismiss, and the window is 24h or 7d only.
+    for params in [
+        json!({"kind": "agent", "id": "w1", "mode": "hide"}),
+        json!({"kind": "agent", "id": "w1", "mode": "snooze"}),
+        json!({"kind": "agent", "id": "w1", "mode": "snooze", "secs": 60}),
+        json!({"kind": "agent", "id": "w1", "mode": "dismiss", "secs": 86400}),
+        json!({"kind": "agent", "mode": "dismiss"}),
+        json!({"kind": "agent", "id": "w1\n", "mode": "dismiss"}),
+    ] {
+        d.operator_rpc("needs_dismiss", params.clone()).unwrap_err();
+    }
+
+    // Two concurrent dismissals of the same subject both settle.
+    std::thread::scope(|s| {
+        for _ in 0..2 {
+            s.spawn(|| {
+                d.operator_rpc(
+                    "needs_dismiss",
+                    json!({"kind": "agent", "id": "w1", "mode": "dismiss"}),
+                )
+                .unwrap();
+            });
+        }
+    });
+
+    // A record whose `at` predates the row's `since` must not hide the
+    // row — a dismissal names the occurrence it was taken on, not the
+    // subject forever. File fixtures keep the clock deterministic.
+    let file = d.state.join("needs_dismissed.json");
+    let before = row["since"].as_i64().expect("fenced rows carry since");
+    let stale = json!({"agent:w1": {"kind": "agent", "id": "w1",
+        "mode": "dismiss", "at": before - 60}});
+    std::fs::write(&file, stale.to_string()).unwrap();
+    assert!(
+        row_for("w1").is_some(),
+        "a stale dismissal must not hide a re-occurred row"
+    );
+    // …and an expired snooze suppresses nothing.
+    let expired = json!({"agent:w1": {"kind": "agent", "id": "w1",
+        "mode": "snooze", "at": 1, "until": 1}});
+    std::fs::write(&file, expired.to_string()).unwrap();
+    assert!(
+        row_for("w1").is_some(),
+        "an expired snooze must not suppress the row"
+    );
+
+    // A live dismissal suppresses the row for every reader.
+    d.operator_rpc(
+        "needs_dismiss",
+        json!({"kind": "agent", "id": "w1", "mode": "dismiss"}),
+    )
+    .unwrap();
+    assert!(
+        row_for("w1").is_none(),
+        "a dismissal hides the row it names"
+    );
+}
+
+/// The Needs-you write relays and the agent resume/unfence routes run
+/// the board's full operator gate — the same checks the daemon applies
+/// to the RPCs they relay (CAD-574). `GET /api/master/models` is the
+/// sibling lane's route (CAD-575, PR #336) — it is not re-tested here.
+#[test]
+fn cad574_needs_board_gate() {
+    let d = TestDaemon::start();
+    d.register("w1");
+    d.wait_agent("w1", "idle", 10);
+    fence_agent(&d, "w1", "x1");
+    d.register("w2");
+    d.wait_agent("w2", "idle", 10);
+    let pm = TempDir::new().unwrap();
+    let (port, _board) = start_operator_board(pm.path(), &d.state);
+    let op = sign_in(&d.state, port);
+    let guards = op_guards(&op);
+    let post = |path: &str, headers: &str, body: &str| cad328_post(port, path, headers, body);
+
+    // Unguarded and unsigned writes are refused before anything parses.
+    for headers in [
+        "Content-Type: application/json\r\n",
+        "Content-Type: application/json\r\nX-Cadence-Board: 1\r\n",
+    ] {
+        let (status, _) = board_http(
+            port,
+            &post(
+                "/api/needs/dismiss",
+                headers,
+                r#"{"kind":"agent","id":"w1"}"#,
+            ),
+        );
+        assert_eq!(status, 403);
+    }
+
+    // An identity-shaped field is refused on the board itself — the
+    // request bodies deny unknown fields so it never reaches the daemon.
+    let (status, reply) = op_http(
+        port,
+        &post(
+            "/api/needs/dismiss",
+            &guards,
+            r#"{"kind":"agent","id":"w1","by":"operator"}"#,
+        ),
+    );
+    assert_eq!(status, 400, "{reply}");
+    assert!(reply.contains("unknown field"), "{reply}");
+
+    // A snooze outside the allowlisted window is refused on the board.
+    let (status, _) = op_http(
+        port,
+        &post(
+            "/api/needs/snooze",
+            &guards,
+            r#"{"kind":"agent","id":"w1","secs":60}"#,
+        ),
+    );
+    assert_eq!(status, 400);
+
+    // The operator's snooze relays — and the row leaves the board's own
+    // overview read (suppression lives daemon-side, so every consumer
+    // sees the same list).
+    let (status, reply) = op_http(
+        port,
+        &post(
+            "/api/needs/snooze",
+            &guards,
+            r#"{"kind":"agent","id":"w1","secs":86400}"#,
+        ),
+    );
+    assert_eq!(status, 200, "{reply}");
+    let (status, reply) = board_get(port, "/api/overview");
+    assert_eq!(status, 200, "{reply}");
+    let view: Value = serde_json::from_str(&reply).unwrap();
+    assert!(
+        !view["needs_me"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["subject"]["id"] == "w1"),
+        "{view}"
+    );
+    let (status, reply) = op_http(
+        port,
+        &post(
+            "/api/needs/dismiss",
+            &guards,
+            r#"{"kind":"agent","id":"w1"}"#,
+        ),
+    );
+    assert_eq!(status, 200, "{reply}");
+
+    // The agent relays — unfence reconciles the unknown to the status
+    // the operator chose and resumes. Reconciliation is that choice:
+    // a missing status, an unknown one, or an extra field are refused
+    // on the board before the daemon is asked (CAD-574 r1).
+    for body in [
+        r#"{}"#,
+        r#"{"status":"bogus"}"#,
+        r#"{"status":"interrupted","by":"operator"}"#,
+    ] {
+        let (status, reply) = op_http(port, &post("/api/agents/w1/unfence", &guards, body));
+        assert_eq!(status, 400, "{body}: {reply}");
+    }
+    // Every status the reconcile vocabulary knows passes through — each
+    // lands on the unknown it names.
+    for (id, status) in [("x1", "interrupted"), ("x2", "completed"), ("x3", "failed")] {
+        if id != "x1" {
+            fence_agent(&d, "w1", id);
+        }
+        let (status_, reply) = op_http(
+            port,
+            &post(
+                "/api/agents/w1/unfence",
+                &guards,
+                &format!(r#"{{"status":"{status}"}}"#),
+            ),
+        );
+        assert_eq!(status_, 200, "{status}: {reply}");
+        let out: Value = serde_json::from_str(&reply).unwrap();
+        assert!(
+            out["reconciled"].as_array().unwrap().contains(&json!(id)),
+            "{status}: {out}"
+        );
+    }
+    let (status, _) = op_http(
+        port,
+        &post(
+            "/api/agents/ghost/unfence",
+            &guards,
+            r#"{"status":"interrupted"}"#,
+        ),
+    );
+    assert_eq!(status, 400);
+    let (status, _) = op_http(port, &post("/api/agents/w1/defenestrate", &guards, "{}"));
+    assert_eq!(status, 404);
+
+    // A stopped agent resumes through the board — `agent_resume`,
+    // operator-only by the board's own admission (CAD-574).
+    d.operator_rpc("agent_stop", json!({"alias": "w2"}))
+        .unwrap();
+    d.wait_agent("w2", "stopped", 10);
+    let (status, reply) = op_http(port, &post("/api/agents/w2/resume", &guards, "{}"));
+    assert_eq!(status, 200, "{reply}");
+    d.wait_agent("w2", "idle", 15);
+
+    // An agent-attributed request is refused even with a pasted session —
+    // and that refusal revokes the session it rode in on (the board reads
+    // a session presented by an agent as stolen), so this probe runs last:
+    // every guarded call after it would see `operator_session_required`.
+    let mut wk = ManagedWorker::start(&d, "wk2");
+    let agent_guards = op_guards_as(&op, &op::seam_headers(&d.state, "agent:wk2"));
+    let request = post(
+        "/api/needs/dismiss",
+        &agent_guards,
+        r#"{"kind":"agent","id":"w1"}"#,
+    );
+    let r = wk.exec(&[
+        "bash",
+        "-c",
+        DEV_TCP_CLIENT,
+        "_",
+        &port.to_string(),
+        &request,
+    ]);
+    assert_eq!(r["rc"], 0, "{r}");
+    let out = r["out"].as_str().unwrap();
+    assert!(out.contains(" 403 "), "{out}");
+    assert!(out.contains("session_from_agent"), "{out}");
+
+    // `GET /api/master/models` is the sibling lane's route (CAD-575,
+    // merged) — operator-gated like the RPC it relays; its own tests
+    // cover the contract, here an unsigned GET only proves the gate.
+    let (status, _) = board_get(port, "/api/master/models");
+    assert_eq!(status, 403);
+}
+
+/// A `thread_send` may carry `refs` — up to eight `{kind,id}` need-rows
+/// the operator's message cites (CAD-574: the rail's "Ask master"
+/// prefill attaches the row it asks about). The field is
+/// `thread_send`'s alone: `agent_send` refuses it, an agent caller is
+/// still refused outright, a malformed ref refuses whole, and a retry
+/// whose refs differ from the stored entry is the idempotency conflict
+/// it always was.
+#[test]
+fn cad574_thread_send_refs() {
+    let f = pi_master("normal");
+    let d = &f.d;
+    d.wait_agent("master", "idle", 30);
+    let mut wk = ManagedWorker::start(d, "wk3");
+
+    // An agent caller stays refused; `refs` does not open a side door —
+    // and `agent_send` never takes the field.
+    let frame = wk.rpc(
+        "self",
+        "thread_send",
+        json!({"alias": "master", "text": "look", "message": "r-a",
+               "refs": [{"kind": "agent", "id": "wk3"}]}),
+    );
+    assert_eq!(frame["ok"], false, "{frame}");
+    let frame = wk.rpc(
+        "self",
+        "agent_send",
+        json!({"alias": "master", "text": "look", "message": "r-b",
+               "refs": [{"kind": "agent", "id": "wk3"}]}),
+    );
+    assert_eq!(frame["ok"], false, "{frame}");
+
+    // The operator's send lands with the refs on the thread entry's
+    // payload — not in the text the model reads.
+    d.operator_rpc(
+        "thread_send",
+        json!({"alias": "master", "text": "what about this row?",
+               "message": "r-1",
+               "refs": [{"kind": "agent", "id": "w1"}, {"kind": "issue", "id": "CAD-1"}]}),
+    )
+    .unwrap();
+    let line = f.wait_thread("what about this row?", 10);
+    assert_eq!(line["role"], "operator", "{line}");
+    assert_eq!(
+        line["payload"]["refs"],
+        json!([{"kind": "agent", "id": "w1"}, {"kind": "issue", "id": "CAD-1"}]),
+        "{line}"
+    );
+    assert!(!line["text"].as_str().unwrap().contains("refs"), "{line}");
+
+    // A retry of the same envelope is a duplicate; a retry whose refs
+    // differ is the idempotency conflict.
+    let out = d
+        .operator_rpc(
+            "thread_send",
+            json!({"alias": "master", "text": "what about this row?",
+                   "message": "r-1",
+                   "refs": [{"kind": "agent", "id": "w1"}, {"kind": "issue", "id": "CAD-1"}]}),
+        )
+        .unwrap();
+    assert_eq!(out["duplicate"], true, "{out}");
+    let err = d
+        .operator_rpc(
+            "thread_send",
+            json!({"alias": "master", "text": "what about this row?",
+                   "message": "r-1",
+                   "refs": [{"kind": "agent", "id": "w9"}]}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("already used with different content"), "{err}");
+    // …and a retry that drops the refs conflicts the same way.
+    let err = d
+        .operator_rpc(
+            "thread_send",
+            json!({"alias": "master", "text": "what about this row?",
+                   "message": "r-1"}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("already used with different content"), "{err}");
+
+    // Malformed refs refuse whole — bad shape, bad types, over the
+    // eight-ref cap, or extra keys on a ref.
+    let nine_refs = (0..9)
+        .map(|i| json!({"kind": "agent", "id": format!("w{i}")}))
+        .collect::<Vec<_>>();
+    for refs in [
+        json!("agent:w1"),
+        json!([{"kind": "agent"}]),
+        json!([{"kind": "agent", "id": 4}]),
+        json!([{"kind": "a\nb", "id": "w1"}]),
+        json!([{"kind": "agent", "id": "w1", "by": "operator"}]),
+        json!(nine_refs),
+        json!([]),
+    ] {
+        let err = d
+            .operator_rpc(
+                "thread_send",
+                json!({"alias": "master", "text": "x", "message": "r-x", "refs": refs}),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(!err.is_empty());
+    }
 }

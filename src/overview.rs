@@ -3476,6 +3476,19 @@ fn overview_from(
         members.as_deref(),
     );
     sort_needs(&mut needs);
+    // CAD-574: the operator's dismissals suppress their subjects for
+    // every reader of this build — a snooze's clock is judged here.
+    let dismissed = crate::needs_dismiss::dismissed(state_dir);
+    if !dismissed.is_empty() {
+        needs.retain(|i| {
+            !crate::needs_dismiss::row_suppressed(
+                &json!({"subject": {"kind": i.subject.0, "id": i.subject.1.as_str()},
+                        "since": i.since, "age": i.age}),
+                &dismissed,
+                now,
+            )
+        });
+    }
     let daemon_json = match info {
         Some(mut i) => {
             i["reachable"] = json!(daemon.reachable);

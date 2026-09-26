@@ -308,13 +308,25 @@ pub fn tool_result_summary(output: &Value) -> String {
     clean_text(&take_bytes(&flat, TOOL_SUMMARY_CAP + 1), TOOL_SUMMARY_CAP)
 }
 
-/// The thread entry for a message queued to a threaded agent.
-fn message_entry<'a>(sender: &Sender, source: &str, body: &'a str, id: &'a str) -> NewEntry<'a> {
-    let (role, payload) = match sender {
+/// The thread entry for a message queued to a threaded agent. `refs`
+/// is the operator chat's cited needs-me rows (CAD-574) — daemon-side
+/// validation keeps it `{kind,id}` pairs; it rides the entry's payload
+/// so the board can render the citation, never the message text.
+fn message_entry<'a>(
+    sender: &Sender,
+    source: &str,
+    body: &'a str,
+    id: &'a str,
+    refs: Option<&Value>,
+) -> NewEntry<'a> {
+    let (role, mut payload) = match sender {
         Sender::Operator | Sender::OperatorChat => (ROLE_OPERATOR, json!({"source": source})),
         Sender::Agent(alias) => (ROLE_SYSTEM, json!({"source": source, "from": alias})),
         Sender::Unattributed => (ROLE_SYSTEM, json!({"source": source})),
     };
+    if let Some(refs) = refs {
+        payload["refs"] = refs.clone();
+    }
     NewEntry {
         role,
         kind: KIND_MESSAGE,
@@ -550,12 +562,31 @@ impl Store {
         source: &str,
         body: &str,
         id: &str,
+        refs: Option<&Value>,
     ) -> Result<()> {
         if *sender == Sender::OperatorChat {
             Self::ensure_thread_in(tx, alias)?;
         }
-        Self::thread_append_in(tx, alias, message_entry(sender, source, body, id))?;
+        Self::thread_append_in(tx, alias, message_entry(sender, source, body, id, refs))?;
         Ok(())
+    }
+
+    /// The refs the enqueue note for `id` recorded (CAD-574), `None`
+    /// when its payload carries none — the stored side of the retry's
+    /// content comparison.
+    pub(super) fn entry_refs_in(tx: &Connection, id: &str) -> Result<Option<Value>> {
+        let first: Option<Option<String>> = tx
+            .query_row(
+                "SELECT payload FROM thread_entries WHERE message_id=? \
+                 ORDER BY seq LIMIT 1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(first
+            .flatten()
+            .and_then(|p| serde_json::from_str::<Value>(&p).ok())
+            .and_then(|v| v.get("refs").filter(|r| !r.is_null()).cloned()))
     }
 
     /// The `turn_result` entry for a finished message. The payload is

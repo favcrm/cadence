@@ -35,6 +35,7 @@ mod memory_rpc;
 mod messages_rpc;
 mod models_rpc;
 mod monitors_rpc;
+mod needs_rpc;
 mod next_action;
 mod operator_rpc;
 mod plans_rpc;
@@ -2524,6 +2525,9 @@ impl Shared {
             "master_state" => self.rpc_master_state(params),
             "master_models" => self.rpc_master_models(params, peer_pid),
             "master_command" => self.rpc_master_command(params, peer_pid),
+            // CAD-574: the operator's Needs-you snooze/dismiss — a row
+            // suppression is the operator's call alone.
+            "needs_dismiss" => self.rpc_needs_dismiss(params, peer_pid),
             "reports_changed" => self.rpc_reports_changed(peer_pid),
             "report_verdict" => self.rpc_report_verdict(params, peer_pid),
             "answer_route" => self.rpc_answer_route(params, peer_pid),
@@ -2823,6 +2827,53 @@ fn optional_strs(params: &Value, field: &str) -> Result<Vec<String>> {
             format!("'{field}' must be a string or an array of strings"),
         )),
     }
+}
+
+/// CAD-574: `thread_send`'s `refs` — at most eight `{kind,id}` subjects
+/// of needs-me rows the operator's message cites. The array is
+/// normalized to `{kind,id}` pairs only — an extra key refuses the
+/// whole call, like the verb's field allowlist. The stored entry
+/// carries them so the board can render the citation and the retry
+/// check can compare them.
+fn thread_refs(value: &Value) -> Result<Value> {
+    let arr = value.as_array().ok_or_else(|| {
+        Error::rejected("refs must be an array of {\"kind\":…, \"id\":…} subjects")
+    })?;
+    if arr.is_empty() || arr.len() > 8 {
+        return Err(Error::rejected("refs takes 1-8 entries"));
+    }
+    let mut out = Vec::with_capacity(arr.len());
+    for r in arr {
+        let Some(obj) = r.as_object() else {
+            return Err(Error::rejected(
+                "a ref must be a {\"kind\":…, \"id\":…} object",
+            ));
+        };
+        if let Some(key) = obj.keys().find(|k| !matches!(k.as_str(), "kind" | "id")) {
+            return Err(Error::rejected(format!(
+                "a ref takes kind and id only; field '{key}' is not accepted"
+            )));
+        }
+        let kind = obj.get("kind").and_then(Value::as_str).unwrap_or_default();
+        if kind.is_empty()
+            || kind.len() > 40
+            || !kind
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        {
+            return Err(Error::rejected(format!(
+                "bad ref kind '{kind}' — [A-Za-z0-9._-], 1-40 chars"
+            )));
+        }
+        let id = obj.get("id").and_then(Value::as_str).unwrap_or_default();
+        if id.is_empty() || id.len() > 240 || id.chars().any(char::is_control) {
+            return Err(Error::rejected(
+                "bad ref id — 1-240 chars, no control characters",
+            ));
+        }
+        out.push(json!({"kind": kind, "id": id}));
+    }
+    Ok(Value::Array(out))
 }
 
 /// Every `values` member in `valid` — a wire peer is untrusted, so the

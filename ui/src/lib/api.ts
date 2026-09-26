@@ -11,6 +11,7 @@ import type {
   IssueDetail,
   IssueHistoryEntry,
   MasterCommandResult,
+  MasterModels,
   MasterState,
   MemoryCard,
   MemoryDetail,
@@ -27,6 +28,7 @@ import type {
   Project,
   ProjectContext,
   ContextRole,
+  ThreadRef,
   WorkflowPreview,
   WorkflowsPayload,
 } from "./types";
@@ -298,12 +300,36 @@ export const api = {
     else q.set("after", String(at.after ?? 0));
     return get<ThreadPage>(`/api/threads/${encodeURIComponent(alias)}?${q.toString()}`);
   },
-  /** `POST /api/threads/<alias>/messages` — `message` makes a retry idempotent. */
-  threadSend: (alias: string, text: string, message: string) =>
-    post<Record<string, unknown>>(`/api/threads/${encodeURIComponent(alias)}/messages`, {
-      text,
-      message,
-    }),
+  /** `POST /api/threads/<alias>/messages` — `message` makes a retry idempotent.
+   *  `refs` are the needs-me subjects the message cites (CAD-574 "Ask
+   *  master"): they land on the entry's payload, never in the text. */
+  threadSend: (alias: string, text: string, message: string, refs?: ThreadRef[]) =>
+    post<Record<string, unknown>>(
+      `/api/threads/${encodeURIComponent(alias)}/messages`,
+      refs && refs.length > 0 ? { text, message, refs } : { text, message },
+    ),
+  /**
+   * `POST /api/needs/<verb>` — the rail's snooze/dismiss (CAD-574);
+   * operator-only, relayed to the daemon's `needs_dismiss`. `secs` is
+   * the snooze window (86400 or 604800); dismiss takes none.
+   */
+  needDecide: (verb: "snooze" | "dismiss", kind: string, id: string, secs?: number) =>
+    post<Record<string, unknown>>(
+      `/api/needs/${verb}`,
+      secs !== undefined ? { kind, id, secs } : { kind, id },
+    ),
+  /**
+   * `POST /api/agents/<alias>/resume|unfence` — the rail's agent actions
+   * (CAD-574); operator-only on the board, the daemon's own rules still
+   * apply (`agent_unfence` is operator-only by connection). `unfence`
+   * sends the operator's reconcile `status` — the route refuses a
+   * missing or unknown one.
+   */
+  agentAct: (alias: string, verb: "resume" | "unfence", status?: string) =>
+    post<Record<string, unknown>>(
+      `/api/agents/${encodeURIComponent(alias)}/${verb}`,
+      verb === "unfence" ? { status } : {},
+    ),
   /** `POST /api/plans/<epic>/approve|reject` — operator-only (CAD-328). */
   decidePlan: (epic: string, verb: "approve" | "reject", reason?: string) => {
     let req: ReturnType<typeof planDecision>;
@@ -412,6 +438,9 @@ export const api = {
       "/api/master/command",
       wait !== undefined ? { command, arg, wait } : arg ? { command, arg } : { command },
     ),
+  /** `GET /api/master/models` — the dropdowns' list (CAD-575's route,
+   *  operator-gated; the chip shows the refusal until it lands). */
+  masterModels: () => get<MasterModels>("/api/master/models"),
 
   modelDefaults: () => get<ModelDefaultsSnapshot>("/api/settings/model-defaults"),
   /** CAD-561: the Settings Update card — current version, the last

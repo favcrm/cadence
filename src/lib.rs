@@ -33,6 +33,7 @@ pub mod master;
 pub mod mcp;
 pub mod memory;
 pub mod model_defaults;
+pub mod needs_dismiss;
 pub mod operator_auth;
 pub mod overview;
 pub mod peer;

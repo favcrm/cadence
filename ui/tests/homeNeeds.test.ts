@@ -1,4 +1,12 @@
-import { ageLabel, homeNeeds } from "../src/features/home/needs";
+import {
+  ageLabel,
+  askDraft,
+  homeNeeds,
+  needGroups,
+  readRailCollapsed,
+  UNFENCE_CHOICES,
+  writeRailCollapsed,
+} from "../src/features/home/needs";
 import type { NeedsMe } from "../src/lib/types";
 
 function equal(actual: unknown, expected: unknown, what: string): void {
@@ -70,7 +78,7 @@ const row = (r: Partial<NeedsMe> & Record<string, unknown>): NeedsMe =>
 
 equal([ageLabel(5), ageLabel(7200), ageLabel(90000)], ["5s", "2h", "1d"], "age labels");
 
-console.log("home needs checks passed");
+
 
 // CAD-431/433: a merge decision is a Merge button pinned to the reviewed
 // head; a row without a valid issue falls back to its command.
@@ -103,3 +111,82 @@ console.log("home needs checks passed");
   equal(needs[0].owner, "w1", "the worker owns it");
   equal(needs[1].action, { type: "command", command: "cadence x" }, "bad issue → command");
 }
+
+// CAD-574 — the rail groups: PRs by kind or pr-subject, Blocked→ready,
+// Inboxes, Decisions, the rest Other; rows past 14d fold into Old (n)
+// and leave their group. Tested through homeNeeds → needGroups.
+{
+  const needs = homeNeeds([
+    row({ kind: "pr_no_verdict", audience: "operator", title: "PR #187 has had no verdict", age: 400, subject: { kind: "pr", id: "acme/app#187" } }),
+    row({ kind: "approval", audience: "operator", title: "approve merge", age: 30 }),
+    row({ kind: "blocked_ready", audience: "operator", title: "D-3 unblocked", age: 90 }),
+    row({ kind: "inbox_stale", audience: "operator", title: "w1 inbox stale", age: 200 }),
+    row({ kind: "a_new_server_kind", audience: "operator", title: "unknown kind", age: 10 }),
+    row({ kind: "approval", audience: "operator", title: "ancient approval", age: 15 * 86400 }),
+  ]);
+  const { groups, old } = needGroups(needs);
+  equal(
+    groups.map((g) => g.key),
+    ["decisions", "prs", "ready", "inboxes", "other"],
+    "group order",
+  );
+  equal(groups[0].needs.map((n) => n.title), ["approve merge"], "decisions");
+  equal(groups[1].needs.map((n) => n.title), ["PR #187 has had no verdict"], "prs");
+  equal(groups[2].needs.map((n) => n.title), ["D-3 unblocked"], "blocked → ready");
+  equal(groups[3].needs.map((n) => n.title), ["w1 inbox stale"], "inboxes");
+  equal(groups[4].needs.map((n) => n.title), ["unknown kind"], "other");
+  equal(old.map((n) => n.title), ["ancient approval"], "14d+ folds into Old");
+}
+
+// CAD-574 — Ask master: the draft is the row's ask and its subject goes
+// as the structured ref; a subjectless row sends none. The draft never
+// sends by itself — the composer only fills.
+{
+  const [need] = homeNeeds([
+    row({
+      kind: "pr_no_verdict",
+      audience: "operator",
+      title: "PR #187 has had no verdict for 24 days",
+      age: 24 * 86400 - 1,
+      subject: { kind: "pr", id: "acme/app#187" },
+    }),
+  ]);
+  const d = askDraft(need);
+  equal(d.text, "PR #187 has had no verdict for 24 days — what should we do?", "draft text");
+  equal(d.refs, [{ kind: "pr", id: "acme/app#187" }], "subject → ref");
+
+  const [plain] = homeNeeds([row({ kind: "approval", audience: "operator", title: "pick one", age: 1 })]);
+  equal(askDraft(plain).refs, [], "no subject → no refs");
+}
+
+// CAD-574 — the collapsed rail persists per viewer; without storage it
+// just defaults open (a node run has no localStorage).
+{
+  equal(readRailCollapsed(), false, "unset → open");
+  writeRailCollapsed(true);
+  equal(readRailCollapsed(), typeof globalThis.localStorage === "undefined" ? false : true, "write then read");
+  writeRailCollapsed(false);
+}
+
+// CAD-574 r1 — Unfence's reconcile statuses: exactly the daemon's
+// vocabulary, each with a one-line explanation, and none flagged as a
+// default — the choice is the operator's.
+{
+  equal(
+    UNFENCE_CHOICES.map((c) => c.status),
+    ["interrupted", "completed", "failed"],
+    "the whole reconcile vocabulary",
+  );
+  equal(
+    UNFENCE_CHOICES.every((c) => c.blurb.length > 0 && c.blurb.length < 90),
+    true,
+    "every choice explains itself in one line",
+  );
+  equal(
+    UNFENCE_CHOICES.some((c) => "default" in c),
+    false,
+    "no preselected default",
+  );
+}
+
+console.log("home needs checks passed");

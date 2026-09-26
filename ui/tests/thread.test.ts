@@ -303,3 +303,17 @@ main().catch((e) => {
     throw e;
   });
 });
+
+// CAD-574 — an Ask-master send's refs ride the pending entry so a
+// retry with the same message id sends the same refs (the daemon's
+// idempotency compares content — retrying without them would 409).
+{
+  let s = mergePage(null, { thread: { id: "t1" }, entries: [] });
+  const refs = [{ kind: "pr", id: "acme/app#187" }];
+  s = addPending(s, "ui-9", "PR #187 has had no verdict — what should we do?", 10, refs);
+  equal(s.pending[0].refs, refs, "refs kept on the pending entry");
+  s = settlePending(s, "ui-9", { ok: false, error: "offline" });
+  s = addPending(s, "ui-9", "PR #187 has had no verdict — what should we do?", 20, refs);
+  equal([s.pending.length, s.pending[0].refs?.length], [1, 1], "retry keeps refs");
+  s = discardPending(s, "ui-9");
+}

@@ -429,6 +429,142 @@ pub(super) fn answer(
     }
 }
 
+/// `POST /api/needs/snooze|dismiss` (CAD-574) — the operator's
+/// suppression of one Needs-you subject (`{"kind","id"}`, plus the
+/// allowlisted `secs` on a snooze), relayed to the daemon's
+/// operator-only `needs_dismiss`. Operator-only on the board like
+/// every route in this file.
+const SNOOZE_SECS: &[u64] = &[86_400, 604_800];
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NeedDismissReq {
+    kind: String,
+    id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NeedSnoozeReq {
+    kind: String,
+    id: String,
+    secs: u64,
+}
+
+/// `verb` for `/api/needs/<verb>`, `None` otherwise.
+pub(super) fn needs_route(path: &str) -> Option<&str> {
+    let verb = path.strip_prefix("/api/needs/")?;
+    (!verb.is_empty() && !verb.contains('/')).then_some(verb)
+}
+
+pub(super) fn decide_need(
+    request: &mut Request,
+    state_dir: &std::path::Path,
+    verb: &str,
+) -> HttpResp {
+    let bytes = match read_body(request, BODY_CAP) {
+        Ok(bytes) => bytes,
+        Err(resp) => return resp,
+    };
+    let params = match verb {
+        "dismiss" => match parse_json::<NeedDismissReq>(&bytes) {
+            Ok(req) => json!({"kind": req.kind, "id": req.id, "mode": "dismiss"}),
+            Err(resp) => return resp,
+        },
+        "snooze" => match parse_json::<NeedSnoozeReq>(&bytes) {
+            Ok(req) if SNOOZE_SECS.contains(&req.secs) => json!({
+                "kind": req.kind, "id": req.id, "mode": "snooze", "secs": req.secs,
+            }),
+            Ok(_) => {
+                return err_response(400, "a snooze window is 86400 (24h) or 604800 (7d) seconds")
+            }
+            Err(resp) => return resp,
+        },
+        _ => return err_response(404, "no such needs route"),
+    };
+    match client::rpc(state_dir, "needs_dismiss", params) {
+        Ok(out) => json_response(out),
+        Err(e) => rpc_err(&e, "needs_dismiss"),
+    }
+}
+
+/// `(alias, verb)` for `/api/agents/<alias>/<verb>` — the rail's
+/// Resume/Unfence buttons (CAD-574).
+pub(super) fn agent_action_route(path: &str) -> Option<(&str, &str)> {
+    let tail = path.strip_prefix("/api/agents/")?;
+    let (alias, verb) = tail.split_once('/')?;
+    (!alias.is_empty() && !verb.contains('/')).then_some((alias, verb))
+}
+
+/// `POST /api/agents/<alias>/resume|unfence` — operator-only on the
+/// board (`operator::admit`); the daemon's own rules still apply
+/// (`agent_unfence` is operator-only by connection, `agent_resume` the
+/// target's SelfService). `resume` takes no body; `unfence` takes
+/// `{"status": …}` — the reconcile status is the operator's explicit
+/// decision (CAD-574 r1), so a missing or unknown one refuses here
+/// rather than defaulting somewhere a click cannot see.
+pub(super) fn agent_action(
+    request: &mut Request,
+    state_dir: &std::path::Path,
+    alias: &str,
+    verb: &str,
+) -> HttpResp {
+    if alias.is_empty()
+        || alias.len() > 80
+        || !alias
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    {
+        return err_response(400, "bad agent alias");
+    }
+    let bytes = match read_body(request, BODY_CAP) {
+        Ok(bytes) => bytes,
+        Err(resp) => return resp,
+    };
+    let (method, params) = match verb {
+        "resume" => {
+            if !bytes.is_empty() && bytes != b"{}" {
+                return err_response(400, "resume takes no body fields");
+            }
+            ("agent_resume", json!({"alias": alias}))
+        }
+        "unfence" => {
+            let body: Value = match serde_json::from_slice(&bytes) {
+                Ok(v) => v,
+                Err(_) => return err_response(400, "unfence takes {\"status\": …}"),
+            };
+            let obj = body.as_object();
+            let status = obj
+                .and_then(|o| o.get("status"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !matches!(status, "interrupted" | "completed" | "failed") {
+                return err_response(
+                    400,
+                    "unfence needs a reconcile status — interrupted|completed|failed",
+                );
+            }
+            if let Some(extra) = obj.and_then(|o| o.keys().find(|k| k.as_str() != "status")) {
+                return err_response(
+                    400,
+                    &format!("unfence takes status only — '{extra}' is not accepted"),
+                );
+            }
+            // The rail's Unfence is the CLI's `agent unfence` — reconcile
+            // the unknowns to the chosen status, then resume.
+            (
+                "agent_unfence",
+                json!({"alias": alias, "status": status, "resume": true}),
+            )
+        }
+        _ => return err_response(404, "no such agent route"),
+    };
+    match client::rpc(state_dir, method, params) {
+        Ok(out) => json_response(out),
+        Err(e) => rpc_err(&e, method),
+    }
+}
+
 /// `GET /api/master/summary?since=<epoch secs>`.
 pub(super) fn master_summary(
     state_dir: &std::path::Path,

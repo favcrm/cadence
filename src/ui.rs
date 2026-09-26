@@ -2078,6 +2078,28 @@ fn write_route(
         send(request, resp);
         return;
     }
+    // The Needs-you rail's snooze/dismiss (CAD-574) — operator-only,
+    // relayed to the daemon's `needs_dismiss`.
+    if let Some(verb) = home::needs_route(path) {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let resp = home::decide_need(&mut request, state_dir, verb);
+        send(request, resp);
+        return;
+    }
+    // The rail's agent resume/unfence (CAD-574) — operator-only on the
+    // board; the daemon's own rules for each verb still apply.
+    if let Some((alias, verb)) = home::agent_action_route(path) {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let resp = home::agent_action(&mut request, state_dir, alias, verb);
+        send(request, resp);
+        return;
+    }
     let Some(rest) = path.strip_prefix("/api/issues") else {
         send(request, err_response(404, "no such write route"));
         return;
@@ -2787,6 +2809,20 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     .unwrap_or(0);
                 if let Some(needs) = overview["needs_me"].as_array_mut() {
                     needs.extend(sync.needs_rows(now));
+                }
+                // CAD-574: the sync rows are appended after the build —
+                // the dismissal filter runs again over the union so a
+                // sync row is suppressible like any other.
+                let dismissed = crate::needs_dismiss::dismissed(state_dir);
+                if !dismissed.is_empty() {
+                    if let Some(needs) = overview["needs_me"].as_array_mut() {
+                        let kept = crate::needs_dismiss::filter_rows(
+                            std::mem::take(needs),
+                            &dismissed,
+                            now,
+                        );
+                        *needs = kept;
+                    }
                 }
             }
             send(request, json_response(overview))
