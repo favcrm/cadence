@@ -307,6 +307,9 @@ tests = [
     "cad384_operator_daemon_stop_from_a_plain_shell",
     "cad384_no_sandbox_exemption_outside_a_sandbox",
     "cad384_agent_cannot_claim_the_lease_as_the_operator",
+    "cad561_the_actor_loop_stops_claiming_turns_while_the_update_drains",
+    "cad561_update_is_refused_inside_a_pane",
+    "cad561_update_refuses_a_dropped_alias_claiming_the_operator",
 ]
 helpers = [
     "wait_lines",
@@ -779,6 +782,7 @@ tests = [
     "cad378_dispatch_record_other_agents_cannot_overwrite",
     "cad378_dispatch_record_forged_refs_and_body_bind_nothing",
     "workflow_input_shape_is_enforced_server_side",
+    "social_content_app_installs_approves_and_proposes",
     "app_primary_action_agrees_across_list_and_detail",
     "app_digest_is_structural_not_summary_wording",
     "app_board_rows_never_follows_a_symlinked_workflows_dir",

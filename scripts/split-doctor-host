@@ -467,10 +467,13 @@ def check_consistency():
         line = line.strip()
         if line.startswith("[") and line.endswith("]"):
             stem = line[1:-1]
-            manifest[stem] = []
+            manifest[stem] = {"items": [], "test_fns": []}
         elif line.startswith("items = [") and stem is not None:
             for m in re.finditer(r'"([^"]+)"', line):
-                manifest[stem].append(m.group(1))
+                manifest[stem]["items"].append(m.group(1))
+        elif line.startswith("test_fns = [") and stem is not None:
+            for m in re.finditer(r'"([^"]+)"', line):
+                manifest[stem]["test_fns"].append(m.group(1))
     bad = []
     files = {
         "mod": f"{DIR}/mod.rs",
@@ -488,11 +491,26 @@ def check_consistency():
             for it in scan_items(text, mask(text))
             if it["name"] and it["kind"] != "mod"
         }
-        want = {n for n in manifest[s] if not n.startswith("<")}
+        want = {n for n in manifest[s]["items"] if not n.startswith("<")}
         if found - want:
             bad.append(f"{path}: unlisted items {sorted(found - want)}")
         if want - found:
             bad.append(f"{path}: missing items {sorted(want - found)}")
+        # The test inventory itself: every #[test] fn in tests.rs is
+        # listed, and no listed test fn is missing or unmarked.
+        if s == "tests":
+            got = set(
+                re.findall(
+                    r"#\[test\][^\n]*\n(?:\s*#\[[^\n]*\]\n)*\s*"
+                    r"(?:pub\s+)?(?:async\s+)?fn\s+(\w+)",
+                    text,
+                )
+            )
+            want_tests = set(manifest[s]["test_fns"])
+            if got - want_tests:
+                bad.append(f"{path}: unlisted #[test] fns {sorted(got - want_tests)}")
+            if want_tests - got:
+                bad.append(f"{path}: missing #[test] fns {sorted(want_tests - got)}")
     extra = [str(p) for p in Path(DIR).glob("*.rs") if str(p) not in expected_files]
     bad += [f"extra: {p}" for p in extra]
     if bad:
@@ -981,6 +999,12 @@ def main():
     manifest["tests"] = [
         i["name"] for i in scan_items(tt, mask(tt)) if i["name"]
     ]
+    # CAD-562: the #[test] fns inside the test module, in order — the
+    # manifest keeps them beside `items` so a guard can tell a dropped
+    # `#[test]` (the name stays listed) from a kept one.
+    test_fns = []
+    for m in re.finditer(r"#\[test\][^\n]*\n(?:\s*#\[[^\n]*\]\n)*\s*(?:pub\s+)?(?:async\s+)?fn\s+(\w+)", tt):
+        test_fns.append(m.group(1))
     # tests.rs references items from check files — its own use lines go
     # above the verbatim text. Names the test module already imports
     # itself (its inner `use` lines move verbatim) must not be re-bound.
@@ -1012,6 +1036,12 @@ def main():
             + ", ".join(f'"{n}"' for n in manifest[stem])
             + "]"
         )
+        if stem == "tests":
+            ml.append(
+                "test_fns = ["
+                + ", ".join(f'"{n}"' for n in test_fns)
+                + "]"
+            )
         ml.append("")
     out[MANIFEST] = "\n".join(ml)
 

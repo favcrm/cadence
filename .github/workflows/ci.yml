@@ -180,6 +180,11 @@ jobs:
         env:
           CARGO_BUILD_JOBS: 4
         run: scripts/nextest-inventory all-targets --features test-seam
+      # CAD-562: the CAD-536 generated tree must stay consistent with its
+      # manifest — every declared item and every #[test] fn accounted
+      # for (tests/split_map_inventory.rs is the suite-side twin check).
+      - name: Verify doctor/host split-map consistency
+        run: scripts/split-doctor-host --check
       - name: Run all Rust targets with pinned nextest
         env:
           CADENCE_SUITE_LOCK: ${{ runner.temp }}/cadence-suite.lock
