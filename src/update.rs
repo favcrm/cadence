@@ -156,9 +156,19 @@ impl RunLock {
 enum RunRecord {
     /// The helper started; its pid lets a reader tell a run that is
     /// still going from one that died without a terminal record.
-    Running { pid: u32, by: String, at: f64 },
-    Finished { at: f64, report: Value },
-    Failed { at: f64, error: String },
+    Running {
+        pid: u32,
+        by: String,
+        at: f64,
+    },
+    Finished {
+        at: f64,
+        report: Value,
+    },
+    Failed {
+        at: f64,
+        error: String,
+    },
 }
 
 /// Open the run log: truncate it (each run's log is its own), then
@@ -870,8 +880,8 @@ pub fn health_wait(
         let daemon = host.daemon_build()?;
         let board_build = board()?;
         let daemon_ok = daemon.as_deref() == Some(want);
-        let board_ok = board_build.as_deref() == Some(want)
-            || (!require_board && board_build.is_none());
+        let board_ok =
+            board_build.as_deref() == Some(want) || (!require_board && board_build.is_none());
         if daemon_ok && board_ok {
             return Ok(());
         }

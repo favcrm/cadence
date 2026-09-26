@@ -4977,8 +4977,11 @@ fn cad561_the_actor_loop_stops_claiming_turns_while_the_update_drains() {
         .unwrap();
     assert_eq!(drained["draining"], json!(true), "{drained}");
     // A queued turn is not claimed while the fleet is drained.
-    d.send("w1", json!({"text": "held while draining", "message": "drain-1"}))
-        .unwrap();
+    d.send(
+        "w1",
+        json!({"text": "held while draining", "message": "drain-1"}),
+    )
+    .unwrap();
     thread::sleep(Duration::from_secs(2));
     assert_eq!(
         d.message_state("w1", "drain-1"),
@@ -4991,7 +4994,10 @@ fn cad561_the_actor_loop_stops_claiming_turns_while_the_update_drains() {
         json!({"on": true, "label": "operator:mallory", "target": "b".repeat(40)}),
     );
     let err = refused.unwrap_err().to_string();
-    assert!(err.contains("lease is not held by 'operator:mallory'"), "{err}");
+    assert!(
+        err.contains("lease is not held by 'operator:mallory'"),
+        "{err}"
+    );
     assert_eq!(
         cadence_agent::update::pending_update(&d.state)
             .map(|p| p.by)
@@ -5000,8 +5006,11 @@ fn cad561_the_actor_loop_stops_claiming_turns_while_the_update_drains() {
         "the refused drain must not have overwritten the marker"
     );
     // Lifting the drain lets the actor take the turn.
-    d.operator_rpc("update_drain", json!({"on": false, "label": "operator:test"}))
-        .unwrap();
+    d.operator_rpc(
+        "update_drain",
+        json!({"on": false, "label": "operator:test"}),
+    )
+    .unwrap();
     let row = d.wait_message("w1", "drain-1", &["completed"], 15);
     assert_eq!(row["state"], "completed", "{row}");
 }

@@ -736,7 +736,12 @@ fn a_run_writes_the_progress_and_result_the_board_reads() {
     let view = update::read_run_log(&failed.state_dir);
     assert!(!view.running);
     assert!(view.result.is_none());
-    assert_eq!(view.error.as_deref(), Some(err.as_str()), "{:?}", view.error);
+    assert_eq!(
+        view.error.as_deref(),
+        Some(err.as_str()),
+        "{:?}",
+        view.error
+    );
 }
 
 #[test]
@@ -805,7 +810,10 @@ fn a_board_that_does_not_come_back_is_not_health_and_rolls_back() {
     );
     host.board_fails_on.replace(Some(NEW.to_string()));
     let report = run(&host, &host.options()).unwrap();
-    assert!(report.rolled_back, "the rollback must fire for a dead board");
+    assert!(
+        report.rolled_back,
+        "the rollback must fire for a dead board"
+    );
     assert_eq!(report.health["ok"], serde_json::json!(false));
     assert_eq!(report.health["rolled_back_to"], serde_json::json!(OLD));
     let log = host.log();

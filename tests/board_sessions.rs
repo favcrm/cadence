@@ -1466,7 +1466,8 @@ fn cad561_a_board_initiated_update_survives_the_board_being_replaced() {
         pid_alive(helper_pid),
         "the helper must outlive the board that started it"
     );
-    let (port2, _board2) = start_ui_opts(pm.path().to_path_buf(), state.path().to_path_buf(), |_| {});
+    let (port2, _board2) =
+        start_ui_opts(pm.path().to_path_buf(), state.path().to_path_buf(), |_| {});
     let host2 = op::board_host(port2);
     let status = wait_update_running(port2, &host2);
     assert!(has_line(&status, "draining: swe-554 (12m)"), "{status}");
@@ -1531,7 +1532,10 @@ fn wait_update_running(port: u16, host: &str) -> Value {
         if status["running"] == json!(true) {
             return status;
         }
-        assert!(Instant::now() < deadline, "the update never read as running: {status}");
+        assert!(
+            Instant::now() < deadline,
+            "the update never read as running: {status}"
+        );
         thread::sleep(Duration::from_millis(50));
     }
 }
@@ -1544,7 +1548,10 @@ fn wait_update_done(port: u16, host: &str) -> Value {
         if status["running"] == json!(false) && status["result"].is_object() {
             return status;
         }
-        assert!(Instant::now() < deadline, "the update never finished: {status}");
+        assert!(
+            Instant::now() < deadline,
+            "the update never finished: {status}"
+        );
         thread::sleep(Duration::from_millis(50));
     }
 }
@@ -1557,7 +1564,11 @@ fn wait_json(path: &Path) -> Value {
                 return value;
             }
         }
-        assert!(Instant::now() < deadline, "{} never appeared", path.display());
+        assert!(
+            Instant::now() < deadline,
+            "{} never appeared",
+            path.display()
+        );
         thread::sleep(Duration::from_millis(20));
     }
 }
