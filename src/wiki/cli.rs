@@ -192,9 +192,7 @@ pub fn run(action: &WikiAction, state_dir: &Path) -> Result<i32> {
                     .as_ref()
                     .is_none_or(|f| f.as_os_str() == "-" || f.as_os_str().is_empty())
             {
-                return Err(Error::rejected(
-                    "no stdin — use the write tool into master/tmp, then --file <that path>",
-                ));
+                return Err(Error::rejected(crate::master::NO_STDIN));
             }
             let text = match (text, file) {
                 (Some(t), _) => t.clone(),

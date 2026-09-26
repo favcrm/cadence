@@ -133,11 +133,7 @@ pub(super) fn run_master(state_dir: &Path, action: MasterAction) -> Result<i32> 
             question,
             file,
         } => {
-            let summary = if file.as_os_str() == "-" {
-                read_body_capped(None, Some(file), 4 * 4_000)?
-            } else {
-                cadence_agent::master::read_command_file(state_dir, &file, 4 * 4_000)?
-            };
+            let summary = read_master_command_file(state_dir, Some(&file), 4 * 4_000)?;
             client::rpc(
                 state_dir,
                 "question_escalate",
