@@ -1483,6 +1483,7 @@ Set it on every board/CLI reader sharing that cache: a reader with a shorter
 interval can still refresh it sooner. Existing `as_of` timestamps and
 stale/unavailable states retain their meaning. Repository selection comes
 from the tracker's deduplicated GitHub project remotes.
+`cadence session` shares the cache but keeps its existing 60-second bound.
 
 Overview GitHub reads run in the board/CLI process and write this JSON
 cache, not the daemon's SQLite store. The board's delivery sync has its

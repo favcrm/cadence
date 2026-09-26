@@ -1777,7 +1777,9 @@ static GH_REFRESHING: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 /// as the one-shot CLI needs.
 fn github(state_dir: &Path, slugs: &[String]) -> (HashMap<String, Value>, Value) {
     let opts = Options::cli();
-    github_bounded(state_dir, slugs, opts.gh_wait, opts.gh_cache_secs, gh_repo)
+    // `session` shares this cache, but keeps its existing freshness bound.
+    // The configurable display age applies only in `overview_from`.
+    github_bounded(state_dir, slugs, opts.gh_wait, GH_CACHE_SECS, gh_repo)
 }
 
 /// The GitHub block with a bounded wait (CAD-249). Returns the repos
