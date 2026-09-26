@@ -27,6 +27,18 @@ export function writeBlock(meta: Meta | null): string | null {
   return null;
 }
 
+/** Why Kick off is disabled, or null when this session may dispatch.
+ *  Stricter than [`writeBlock`]: a signed-in member (`operator: false`)
+ *  can still pass the write gate, and the server answers 403. */
+export function kickoffBlock(meta: Meta | null): string | null {
+  const writes = writeBlock(meta);
+  if (writes) return writes;
+  if (meta?.operator !== true) {
+    return "Kick off is the operator's decision — this session is not the operator's.";
+  }
+  return null;
+}
+
 /**
  * The single-use nonce a login link carries in its fragment
  * (`#n=<64 hex>`), or null for anything else.

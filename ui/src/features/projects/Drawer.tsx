@@ -35,6 +35,8 @@ interface Props {
   pmDir?: string;
   detail: IssueDetail | null;
   readOnly: boolean;
+  /** Operator session only. A signed-in member keeps other writes and cannot dispatch. */
+  canKickoff: boolean;
   actor: string;
   onClose: () => void;
   onOpen: (id: string) => void;
@@ -113,6 +115,7 @@ export default function Drawer({
   pmDir,
   detail,
   readOnly,
+  canKickoff,
   actor,
   onClose,
   onOpen,
@@ -269,6 +272,7 @@ export default function Drawer({
   };
 
   const kickOff = () => {
+    if (!canKickoff) return;
     if (!kickConfirm) {
       setKickConfirm(true);
       return;
@@ -1136,11 +1140,13 @@ export default function Drawer({
                   <button
                     type="button"
                     onClick={kickOff}
-                    disabled={kicking}
+                    disabled={kicking || !canKickoff}
                     title={
-                      kickConfirm
-                        ? "Join a worker and dispatch this issue"
-                        : "Confirm before kick off"
+                      !canKickoff
+                        ? "Kick off is the operator's decision"
+                        : kickConfirm
+                          ? "Join a worker and dispatch this issue"
+                          : "Confirm before kick off"
                     }
                     className="h-9 px-3 rounded bg-accent text-on-accent text-secondary font-medium disabled:opacity-45 disabled:cursor-not-allowed"
                   >

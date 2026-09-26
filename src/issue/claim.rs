@@ -69,6 +69,13 @@ pub struct TakeOver {
 /// An alias a claim may carry — the comment-author grammar, since the
 /// claimant authors the claim's comment.
 pub fn check_alias(alias: &str, flag: &str) -> Result<()> {
+    // A leading '-' is an argv flag the next time this name is passed
+    // to a command. Refuse it at the grammar, before any caller interpolates.
+    if alias.starts_with('-') {
+        return Err(Error::rejected(format!(
+            "{flag} '{alias}' is not an alias — a leading '-' would be read as an argv flag"
+        )));
+    }
     if alias.is_empty()
         || alias.len() > 64
         || !alias
@@ -476,6 +483,18 @@ mod tests {
         let (text, subject) = take_over_record("pm-b", &t);
         assert!(text.starts_with("Take-over by pm-b from pm-a"), "{text}");
         assert_eq!(subject, "claim take-over by pm-b from pm-a");
+    }
+
+    #[test]
+    fn alias_rejects_a_leading_dash() {
+        let err = check_alias("-lane", "alias").unwrap_err().to_string();
+        assert!(err.contains("leading '-'"), "{err}");
+        assert!(check_alias("-", "--by").is_err());
+        assert!(check_alias("lane-1", "alias").is_ok());
+        // No case-fold and no unicode-fold: MASTER is a different name,
+        // and a Cyrillic lookalike is not an alias at all.
+        assert!(check_alias("MASTER", "alias").is_ok());
+        assert!(check_alias("m\u{0430}ster", "alias").is_err());
     }
 
     /// Backlog/ready never refuse: an owner there only warns; unowned

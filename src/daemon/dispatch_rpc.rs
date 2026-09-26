@@ -361,6 +361,9 @@ impl Shared {
         let alias_arg = kickoff_text(params, "alias")?;
         if let Some(alias) = alias_arg {
             claim::check_alias(alias, "alias")?;
+            // Before the lock and before `issue start`. `rpc_register`
+            // is in-process, so `master_policy` never sees this alias.
+            crate::master::refuse_reserved_alias(alias)?;
             if alias == group {
                 return Err(Error::rejected(
                     "issue kickoff: the worker alias cannot be the group itself",
@@ -418,6 +421,9 @@ impl Shared {
                 "issue kickoff: '{alias}' is already registered"
             )));
         }
+        // A minted alias is checked here too — still before `issue start`,
+        // so a reserved name never opens a worktree.
+        crate::master::refuse_reserved_alias(&alias)?;
 
         let start_args = issue::start::StartArgs {
             repo: None,

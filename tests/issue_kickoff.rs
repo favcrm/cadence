@@ -334,6 +334,63 @@ fn cad606_kickoff_joins_once_and_returns_the_live_lane() {
     assert_eq!(shown, 1, "the race joined both workers");
 }
 
+/// `master` is reserved before `issue start` — kickoff registers
+/// in-process, so `master_policy` never sees `agent_register`. A leading
+/// '-' and a unicode lookalike are not aliases. `check_alias` does not
+/// case-fold, so `MASTER` is a different name and is not the master.
+#[test]
+fn cad606_kickoff_refuses_reserved_alias_before_start() {
+    assert!(cadence_agent::master::is_master("master"));
+    assert!(!cadence_agent::master::is_master("MASTER"));
+    assert!(cadence_agent::issue::claim::check_alias("MASTER", "alias").is_ok());
+
+    let lab = Lab::new();
+    let (ok, _, err) = lab.cli(&["issue", "new", "Reserved", "--project", "demo"]);
+    assert!(ok, "{err}");
+    lab.accept("D-1");
+
+    let reserved = msg(lab
+        .d
+        .operator_rpc(
+            "issue_kickoff",
+            json!({
+                "issue": "D-1", "group": "pm", "provider": "fake", "alias": "master"
+            }),
+        )
+        .unwrap_err());
+    assert!(
+        reserved.contains("the alias 'master' is reserved"),
+        "{reserved}"
+    );
+    assert!(
+        lab.lanes().is_empty(),
+        "reserved alias opened a lane: {:?}",
+        lab.lanes()
+    );
+    assert!(lab
+        .d
+        .operator_rpc("agent_show", json!({"alias": "master"}))
+        .is_err());
+
+    for alias in ["-lane", "m\u{0430}ster"] {
+        let err = msg(lab
+            .d
+            .operator_rpc(
+                "issue_kickoff",
+                json!({
+                    "issue": "D-1", "group": "pm", "provider": "fake", "alias": alias
+                }),
+            )
+            .unwrap_err());
+        assert!(err.contains("not an alias"), "{alias}: {err}");
+        assert!(
+            lab.lanes().is_empty(),
+            "{alias} opened a lane: {:?}",
+            lab.lanes()
+        );
+    }
+}
+
 /// The board refuses the same callers the RPC does, and an operator
 /// POST joins one lane.
 #[test]

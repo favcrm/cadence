@@ -25,7 +25,7 @@ import Setup from "./features/setup/Setup";
 import SetupNudge from "./features/setup/SetupNudge";
 import Login from "./features/auth/Login";
 import SignIn from "./features/auth/SignIn";
-import { writeBlock } from "./features/auth/gate";
+import { kickoffBlock, writeBlock } from "./features/auth/gate";
 import { WriteGate } from "./features/auth/WriteGate";
 import { sessionKey, setSessionKey } from "./lib/sessionKey";
 import { buildChanged, serverBuild, subscribeSse, UI_BUILD } from "./lib/sse";
@@ -806,6 +806,7 @@ export default function App() {
           pmDir={health?.pm_dir}
           detail={detailState?.data?.id === openId ? detailState.data : null}
           readOnly={readOnly}
+          canKickoff={kickoffBlock(meta) === null}
           actor={actor}
           onClose={closeIssue}
           onOpen={openIssue}
