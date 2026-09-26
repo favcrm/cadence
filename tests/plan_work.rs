@@ -2267,6 +2267,82 @@ fn removed_app_sweep_withdraws_the_approval() {
     );
 }
 
+/// CAD-623: a hand-deleted app must be swept after an approval already
+/// inside the tracker lock commits, even when no grant existed at sweep start.
+#[test]
+fn sweep_waits_for_an_approve_already_inside_the_lock() {
+    let f = PlanFixture::start();
+    f.d.register("dev-1");
+    app_install_roles(&f);
+    f.d.operator_rpc(
+        "app_set_team",
+        json!({"project": "demo", "name": "roles", "team": ["publisher=dev-1"]}),
+    )
+    .unwrap();
+
+    let hold = f.tmp.path().join("approve-hold");
+    std::fs::write(&hold, "1").unwrap();
+    test_env().set("CADENCE_TEST_APP_APPROVE_HOLD", hold.to_str().unwrap());
+    struct ClearHold(PathBuf);
+    impl Drop for ClearHold {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+            test_env().remove("CADENCE_TEST_APP_APPROVE_HOLD");
+        }
+    }
+    let _clear_hold = ClearHold(hold.clone());
+    let ready = PathBuf::from(format!("{}.ready", hold.display()));
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let daemon = &f.d;
+    thread::scope(|s| {
+        let approve = s.spawn(|| {
+            daemon.operator_rpc("app_approve", json!({"project": "demo", "name": "roles"}))
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "approve never reached the tracker lock"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        // Bypass app remove: approval has already derived the install and
+        // grants, but has not written them. A lockless sweep sees neither.
+        let apps = f.pm_dir.join("demo/apps");
+        std::fs::remove_dir_all(apps.join("roles")).unwrap();
+        std::fs::remove_file(apps.join("roles.yaml")).unwrap();
+        let sweep = s.spawn(move || {
+            let result = daemon.operator_rpc(
+                "plan_propose",
+                json!({"project": "demo", "workflow": "roles/go",
+                       "inputs": {"title": "x", "publisher": "dev-1"}}),
+            );
+            done_tx.send(()).unwrap();
+            result
+        });
+        let returned_inside_lock = done_rx.recv_timeout(Duration::from_secs(3)).is_ok();
+        let still_held = hold.exists();
+        // Release before assertions so a failing mutant cannot strand approval.
+        std::fs::remove_file(&hold).unwrap();
+        approve.join().unwrap().unwrap();
+        assert!(sweep.join().unwrap().is_err(), "removed app cannot propose");
+        assert!(still_held, "approval must remain paused during observation");
+        assert!(
+            !returned_inside_lock,
+            "sweep returned while approve held the tracker lock"
+        );
+    });
+    assert!(
+        grant_scopes(&f, "dev-1", "local", "local").is_none(),
+        "sweep racing an in-lock approve must withdraw its derived grant"
+    );
+    let approval = latest_roles_approval(&f);
+    assert_eq!(
+        approval["revoked"], true,
+        "sweep must withdraw the raced approval: {approval}"
+    );
+}
+
 fn roles_install_id(f: &PlanFixture) -> String {
     let (ok, show) = f.cli(&["app", "show", "roles", "--project", "demo"]);
     assert!(ok, "{show}");

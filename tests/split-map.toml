@@ -813,6 +813,7 @@ tests = [
     "remove_waits_for_an_approve_already_inside_the_lock",
     "app_remove_then_reinstall_requires_approval_again",
     "removed_app_sweep_withdraws_the_approval",
+    "sweep_waits_for_an_approve_already_inside_the_lock",
     "install_id_reinstall_after_empty_approval_is_unapproved",
     "install_id_hand_delete_sweep_withdraws_approval",
     "install_id_missing_on_approval_is_not_honoured",
