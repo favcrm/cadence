@@ -63,9 +63,17 @@ enum Kind {
 fn cases() -> Vec<(&'static str, String, Kind)> {
     vec![
         ("rpc (frame on argv)", op::rpc_script(), Kind::Rpc),
-        ("rpc (frame file)", op::rpc_script_from_file(), Kind::RpcFile),
+        (
+            "rpc (frame file)",
+            op::rpc_script_from_file(),
+            Kind::RpcFile,
+        ),
         ("cli", op::cli_script(), Kind::Cli),
-        ("cli (stdin env)", op::cli_script_stdin_env(), Kind::CliStdin),
+        (
+            "cli (stdin env)",
+            op::cli_script_stdin_env(),
+            Kind::CliStdin,
+        ),
         ("exec", op::exec_script(), Kind::Exec),
         ("http", op::http_script(), Kind::Http),
     ]
@@ -91,7 +99,11 @@ fn rpc_script_survives_a_vanished_hop() {
 
 #[test]
 fn rpc_from_file_script_survives_a_vanished_hop() {
-    let run = run_injected("rpc (frame file)", op::rpc_script_from_file(), Kind::RpcFile);
+    let run = run_injected(
+        "rpc (frame file)",
+        op::rpc_script_from_file(),
+        Kind::RpcFile,
+    );
     assert_eq!(landed(&run), RPC_REPLY, "the response line must land");
 }
 
@@ -105,7 +117,11 @@ fn cli_script_survives_a_vanished_hop() {
 
 #[test]
 fn cli_stdin_script_survives_a_vanished_hop() {
-    let run = run_injected("cli (stdin env)", op::cli_script_stdin_env(), Kind::CliStdin);
+    let run = run_injected(
+        "cli (stdin env)",
+        op::cli_script_stdin_env(),
+        Kind::CliStdin,
+    );
     let v: Value = serde_json::from_str(&landed(&run)).unwrap();
     assert_eq!(v["rc"], 0, "{v}");
     assert_eq!(v["stdout"], "tok", "{v}");
