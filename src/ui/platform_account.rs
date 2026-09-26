@@ -5,7 +5,7 @@ const ACCOUNT_URL: &str = "http://api.internal/v1/runtime/account";
 const USAGE_URL: &str = "http://api.internal/v1/runtime/account/usage?limit=20";
 const BODY_CAP: u64 = 64 * 1024;
 
-pub(super) fn get(opts: &HttpOpts) -> HttpResp {
+pub(super) fn get(opts: &ServeOpts) -> HttpResp {
     let Some(board) = opts.public.as_ref() else {
         return json_response(json!({"configured": false, "manage_url": null,
             "account": null, "usage": [], "account_error": null, "usage_error": null}));
