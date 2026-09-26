@@ -3103,3 +3103,273 @@ fn cad551_master_command_board_gate() {
     assert!(out.contains(" 403 "), "{out}");
     assert!(out.contains("session_from_agent"), "{out}");
 }
+
+// ---- CAD-575: per-role model allowlists + the master_models read ----
+
+/// `pi_master` under a pm.yaml whose per-role lists split `allow`: the
+/// master may run the fake and devin models, workers the fake/acme/
+/// openrouter ones — appended to the tracker's pm.yaml before
+/// `master_start`, so the start itself was gated per role.
+fn pi_master_role_policy(mode: &str) -> PlanFixture {
+    let f = PlanFixture::start();
+    test_env().set("CADENCE_PI_COMMAND", fake_pi(mode));
+    test_env().set(cadence_agent::master::TEST_NO_LANDLOCK, "1");
+    let pm_yaml = f.pm_dir.join("pm.yaml");
+    let yaml = std::fs::read_to_string(&pm_yaml).unwrap_or_default();
+    std::fs::write(
+        &pm_yaml,
+        format!(
+            "{yaml}\npi:\n  models:\n    allow: [\"fake/model-1\", \"acme/demo-1\", \"devin/swe-2-high\"]\n    master_allow: [\"fake/model-1\", \"devin/swe-2-high\"]\n    worker_allow: [\"fake/model-1\", \"acme/demo-1\", \"openrouter/z-ai/glm-5.3-flash\"]\n    default: {{master: \"fake/model-1\", worker: \"fake/model-1\"}}\n"
+        ),
+    )
+    .unwrap();
+    f.d.operator_rpc(
+        "master_start",
+        json!({"provider": "pi", "unconfined": true}),
+    )
+    .unwrap();
+    f
+}
+
+/// `master_models` is operator-only — an agent caller and its
+/// detached child are refused, a forged authority field is refused,
+/// the verb takes no parameters at all — and answers the picker's
+/// contract: `current`, `models` with `allowed_for`, `cost_tier` and
+/// the session's effort levels. The register and `agent set` callers
+/// gate per role the same way.
+#[test]
+fn cad575_master_models_gate_and_contract() {
+    let f = pi_master_role_policy("normal");
+    let d = &f.d;
+    d.wait_agent("master", "idle", 30);
+
+    // An agent caller and its detached child are refused before the
+    // verb reads anything.
+    let mut wk = ManagedWorker::start(d, "wk");
+    for src in ["self", "child"] {
+        let frame = wk.rpc(src, "master_models", json!({}));
+        assert_eq!(frame["ok"], false, "{frame}");
+        let msg = frame["error"]["message"].as_str().unwrap_or_default();
+        assert!(msg.contains("operator action"), "{frame}");
+    }
+    // The master itself may not call it either — the verb is off the
+    // master's method allowlist (pinned in caller_rule/master_rpc
+    // tests: `master_models` is in the `never` set).
+
+    // A forged authority field is refused even on an operator call.
+    let err = d
+        .operator_rpc("master_models", json!({"by": "operator"}))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("request field 'by' is not accepted"), "{err}");
+    // …and so is any other parameter — the read takes none.
+    let err = d
+        .operator_rpc("master_models", json!({"role": "master"}))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("takes no parameters"), "{err}");
+
+    // No devin catalog yet and the CLI spawn path cannot stall the
+    // read (the command cannot run): the devin entry tiers "unknown".
+    test_env().set("CADENCE_DEVIN_COMMAND", "/nonexistent/devin-575");
+    let home = f.tmp.path().join("home");
+    test_env().set("HOME", home.to_str().unwrap());
+    let out = d.operator_rpc("master_models", json!({})).unwrap();
+    assert_eq!(out["live"], true, "{out}");
+    assert_eq!(out["current"]["model"], "fake/model-1", "{out}");
+    assert_eq!(out["current"]["effort"], "medium", "{out}");
+    let models = out["models"].as_array().unwrap();
+    let entry = |id: &str| {
+        models
+            .iter()
+            .find(|m| m["id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("{id} missing from {models:?}"))
+    };
+    // The role lists annotate every row — shared, role-only, and
+    // provider-offered-but-unlisted.
+    assert_eq!(
+        entry("fake/model-1")["allowed_for"],
+        json!(["master", "worker"])
+    );
+    assert_eq!(entry("acme/demo-1")["allowed_for"], json!(["worker"]));
+    assert_eq!(entry("devin/swe-2-high")["allowed_for"], json!(["master"]));
+    assert_eq!(entry("fake/model-2")["allowed_for"], json!([]));
+    assert_eq!(entry("anthropic/claude-sonnet-4")["allowed_for"], json!([]));
+    // Tiers: openrouter is paid, devin has no catalog yet, the rest
+    // are unknown.
+    assert_eq!(
+        entry("openrouter/z-ai/glm-5.3-flash")["cost_tier"],
+        json!("Paid")
+    );
+    assert_eq!(
+        entry("openrouter/z-ai/glm-5.3-flash")["allowed_for"],
+        json!(["worker"])
+    );
+    assert_eq!(entry("devin/swe-2-high")["cost_tier"], json!("unknown"));
+    assert_eq!(entry("fake/model-1")["cost_tier"], json!("unknown"));
+    // Pi's own names are the labels; the session's levels are the
+    // effort vocabulary.
+    assert_eq!(entry("fake/model-1")["label"], json!("Fake Model"));
+    assert_eq!(
+        out["efforts"],
+        json!(["off", "minimal", "low", "medium", "high", "xhigh", "max"]),
+        "{out}"
+    );
+
+    // The pi-devin cache lands → the same read answers the real tier
+    // and fills the label pi does not offer.
+    let cache_dir = home.join(".cache/pi-devin");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    std::fs::write(
+        cache_dir.join("models.json"),
+        r#"{"families":[{"name":"swe","variants":[{"model_uid":"swe-2-high","label":"SWE 2 High","cost_tier":"Free"}]}]}"#,
+    )
+    .unwrap();
+    let out = d.operator_rpc("master_models", json!({})).unwrap();
+    let models = out["models"].as_array().unwrap();
+    let devin = models
+        .iter()
+        .find(|m| m["id"] == "devin/swe-2-high")
+        .unwrap();
+    assert_eq!(devin["cost_tier"], json!("Free"), "{devin}");
+    assert_eq!(devin["label"], json!("SWE 2 High"), "{devin}");
+
+    // The register and agent-set callers gate per role: the devin
+    // model is the master's alone here — a pi worker cannot take it.
+    let err = d
+        .fixture_rpc(
+            "agent_register",
+            json!({"alias": "wkpi", "provider": "pi", "endpoint_kind": "managed",
+                   "cwd": f.tmp.path().join("repo").to_string_lossy(),
+                   "params": "{\"model\":\"devin/swe-2-high\"}"}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("worker_allow"), "{err}");
+    d.register_pi("wkpi", json!({"model": "fake/model-1"}));
+    // `model` is a launch param, so the set rides `next_launch` —
+    // the role gate runs before the store records it.
+    let err = d
+        .fixture_rpc(
+            "agent_set",
+            json!({"alias": "wkpi", "patch": {"model": "devin/swe-2-high"},
+                   "next_launch": true}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("worker_allow"), "{err}");
+
+    // Two concurrent operator reads both settle — the catalog memo and
+    // the provider calls share no lock with the store.
+    std::thread::scope(|s| {
+        for _ in 0..2 {
+            s.spawn(|| {
+                let out = d.operator_rpc("master_models", json!({})).unwrap();
+                assert_eq!(out["live"], true);
+            });
+        }
+    });
+}
+
+/// Before the master ever registers the read still answers: the
+/// policy's vocabularies annotated per role, empty efforts, null
+/// current fields — the picker works before first start.
+#[test]
+fn cad575_master_models_before_start() {
+    let f = PlanFixture::start();
+    let pm_yaml = f.pm_dir.join("pm.yaml");
+    let yaml = std::fs::read_to_string(&pm_yaml).unwrap_or_default();
+    std::fs::write(
+        &pm_yaml,
+        format!(
+            "{yaml}\npi:\n  models:\n    allow: [\"fake/model-1\", \"acme/demo-1\"]\n    master_allow: [\"fake/model-1\"]\n"
+        ),
+    )
+    .unwrap();
+    let out = f.d.operator_rpc("master_models", json!({})).unwrap();
+    assert_eq!(out["live"], false, "{out}");
+    assert_eq!(out["current"]["model"], Value::Null, "{out}");
+    assert_eq!(out["current"]["effort"], Value::Null, "{out}");
+    assert_eq!(out["efforts"], json!([]), "{out}");
+    let models = out["models"].as_array().unwrap();
+    let entry = |id: &str| models.iter().find(|m| m["id"] == id).cloned();
+    assert_eq!(
+        entry("fake/model-1").unwrap()["allowed_for"],
+        json!(["master", "worker"])
+    );
+    assert_eq!(
+        entry("acme/demo-1").unwrap()["allowed_for"],
+        json!(["worker"])
+    );
+    // Nothing the provider offers is listed — only the policy rows.
+    assert_eq!(models.len(), 2, "{models:?}");
+}
+
+/// The board's `GET /api/master/models` is at least as strict as the
+/// RPC it relays: an unsigned read is refused, a forged query field is
+/// refused (the read takes no parameters at all), an agent-attributed
+/// request is refused even with a pasted session — and the operator's
+/// read returns the same contract.
+#[test]
+fn cad575_master_models_board_gate() {
+    let f = pi_master_role_policy("normal");
+    let d = &f.d;
+    d.wait_agent("master", "idle", 30);
+    let pm = TempDir::new().unwrap();
+    let (port, _board) = start_operator_board(pm.path(), &d.state);
+    let op = sign_in(&d.state, port);
+    let guards = op_guards(&op);
+
+    // Unguarded reads are refused before the daemon is asked.
+    let (status, reply) = board_get(port, "/api/master/models");
+    assert_eq!(status, 403, "{reply}");
+
+    // The operator's read relays the same contract.
+    let get = |path: &str, headers: &str| {
+        format!(
+            "GET {path} HTTP/1.0\r\nHost: {}\r\n{headers}\r\n",
+            board_host_for(port, headers)
+        )
+    };
+    let (status, reply) = op_http(port, &get("/api/master/models", &guards));
+    assert_eq!(status, 200, "{reply}");
+    let out: Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(out["current"]["model"], "fake/model-1", "{out}");
+    let models = out["models"].as_array().unwrap();
+    assert!(
+        models
+            .iter()
+            .any(|m| m["id"] == "devin/swe-2-high" && m["allowed_for"] == json!(["master"])),
+        "{out}"
+    );
+    assert_eq!(
+        out["efforts"],
+        json!(["off", "minimal", "low", "medium", "high", "xhigh", "max"]),
+        "{out}"
+    );
+
+    // A forged query field is refused on the board — the read takes
+    // no parameters, exactly like the RPC.
+    let (status, reply) = op_http(port, &get("/api/master/models?by=operator", &guards));
+    assert_eq!(status, 400, "{reply}");
+
+    // An agent-attributed request is refused even with the operator's
+    // session pasted on — the session reads as stolen (CAD-482: the
+    // seam carries the caller on the request).
+    let mut wk = ManagedWorker::start(d, "wk2");
+    let agent_guards = op_guards_as(&op, &op::seam_headers(&d.state, "agent:wk2"));
+    let request = get("/api/master/models", &agent_guards);
+    let r = wk.exec(&[
+        "bash",
+        "-c",
+        DEV_TCP_CLIENT,
+        "_",
+        &port.to_string(),
+        &request,
+    ]);
+    assert_eq!(r["rc"], 0, "{r}");
+    let out = r["out"].as_str().unwrap();
+    assert!(out.contains(" 403 "), "{out}");
+    assert!(out.contains("session_from_agent"), "{out}");
+}

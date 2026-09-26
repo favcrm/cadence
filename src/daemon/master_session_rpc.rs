@@ -133,6 +133,193 @@ impl Shared {
         }))
     }
 
+    /// `master_models` (CAD-575) — the operator's per-role read of the
+    /// master's model vocabulary, backing the board's model picker:
+    /// the live session's model/effort, every model pi offers (plus
+    /// the policy-listed ids it did not offer) annotated with which
+    /// roles may run it (`allowed_for`), the Devin cost tier, and the
+    /// session's thinking-effort levels. Operator-only by connection;
+    /// the verb takes no parameters at all — an identity-shaped field
+    /// is refused by [`Self::operator_connection`], anything else here,
+    /// so a read that grows knobs later never inherits silent
+    /// authority.
+    ///
+    /// It degrades, never blocks: a stopped (or never registered)
+    /// master answers from its stored row with `efforts` empty and
+    /// `models` drawn from the policy lists alone; the Devin catalog
+    /// comes from the pi-devin cache file or a bounded, memoized
+    /// `devin models list` — every miss is `cost_tier: "unknown"`.
+    pub(super) fn rpc_master_models(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.operator_connection("master models", params, peer_pid)?;
+        if let Some(extra) = params.as_object().and_then(|o| o.keys().next()) {
+            return Err(Error::rejected(format!(
+                "master models takes no parameters — '{extra}' is refused (CAD-575)"
+            )));
+        }
+        let alias = crate::master::ALIAS;
+        let agent = self.store.agent(alias).ok();
+        let adapter = self
+            .lifecycle
+            .lock()
+            .unwrap()
+            .agents
+            .get(alias)
+            .and_then(|ctl| ctl.adapter.lock().unwrap().clone());
+        let live = adapter.is_some();
+        let commands = adapter
+            .as_ref()
+            .map(|a| a.session_commands())
+            .unwrap_or(&[]);
+        let ask = |command: &str| {
+            commands
+                .contains(&command)
+                .then(|| {
+                    adapter
+                        .as_ref()
+                        .and_then(|a| a.session_command(command, None).ok())
+                })
+                .flatten()
+        };
+        let session = ask("state");
+        let offered = ask("models");
+        let levels = ask("levels");
+        // The policy's per-role vocabularies annotate every offered
+        // model and supply the rows the provider never offered — a
+        // missing `[pi]` is two empty lists, like the launch gates.
+        let policy = self
+            .pm_dir()
+            .ok()
+            .map(|dir| crate::pi_policy::read(&dir))
+            .transpose()?
+            .flatten();
+        let (master_list, worker_list) = policy
+            .as_ref()
+            .map(|p| {
+                (
+                    p.models.allow_for("master").to_vec(),
+                    p.models.allow_for("worker").to_vec(),
+                )
+            })
+            .unwrap_or_default();
+        let allowed_for = |id: &str| -> Vec<&'static str> {
+            let mut roles = Vec::new();
+            if master_list.iter().any(|m| m == id) {
+                roles.push("master");
+            }
+            if worker_list.iter().any(|m| m == id) {
+                roles.push("worker");
+            }
+            roles
+        };
+        // The session's own list first — it is what the master could
+        // switch to live — then the policy-listed ids the provider did
+        // not offer; the allowlist stays the vocabulary the gate
+        // enforces even when the provider's list is shorter.
+        let mut order: Vec<String> = Vec::new();
+        let mut labels: HashMap<String, String> = HashMap::new();
+        for m in offered
+            .as_ref()
+            .and_then(|o| o.get("models"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(id) = m.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let provider = m
+                .get("provider")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let full = if provider.is_empty() {
+                id.to_string()
+            } else {
+                format!("{provider}/{id}")
+            };
+            if !order.contains(&full) {
+                order.push(full.clone());
+            }
+            if let Some(name) = m.get("name").and_then(Value::as_str) {
+                labels.entry(full).or_insert_with(|| name.to_string());
+            }
+        }
+        for id in master_list.iter().chain(worker_list.iter()) {
+            if !order.contains(id) {
+                order.push(id.clone());
+            }
+        }
+        let catalog = self.devin_catalog.catalog(&self.provider_env);
+        let entries: Vec<Value> = order
+            .iter()
+            .map(|id| {
+                let (provider, uid) = id.split_once('/').unwrap_or(("", id.as_str()));
+                let (cost_tier, catalog_label) = match provider {
+                    "devin" => catalog
+                        .as_ref()
+                        .and_then(|c| c.lookup(uid))
+                        .map(|(tier, label)| (tier.clone(), label.clone()))
+                        .unwrap_or(("unknown".to_string(), None)),
+                    "openrouter" => ("Paid".to_string(), None),
+                    _ => ("unknown".to_string(), None),
+                };
+                json!({
+                    "id": id,
+                    "label": labels
+                        .get(id)
+                        .cloned()
+                        .or(catalog_label)
+                        .unwrap_or_else(|| id.clone()),
+                    "cost_tier": cost_tier,
+                    "allowed_for": allowed_for(id),
+                })
+            })
+            .collect();
+        // Live session fields win over the stored launch params, the
+        // same precedence `master_state` uses — but `model` here is the
+        // full `provider/id` the allowlists speak.
+        let live_model = session.as_ref().and_then(|s| s.get("model")).and_then(|m| {
+            let id = m
+                .get("id")
+                .or_else(|| m.get("name"))
+                .and_then(Value::as_str)?;
+            let provider = m.get("provider").and_then(Value::as_str);
+            Some(match provider {
+                Some(p) if !p.is_empty() => format!("{p}/{id}"),
+                _ => id.to_string(),
+            })
+        });
+        let configured = |key: &str| {
+            agent
+                .as_ref()
+                .and_then(|a| a.params.as_ref())
+                .and_then(|p| p.get(key))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        };
+        let current_model = live_model
+            .or_else(|| agent.as_ref().and_then(|a| a.model.clone()))
+            .or_else(|| configured("model"));
+        let effort = session
+            .as_ref()
+            .and_then(|s| s.get("thinkingLevel"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| agent.as_ref().and_then(|a| a.effort.clone()))
+            .or_else(|| configured("effort"));
+        let efforts: Vec<Value> = levels
+            .as_ref()
+            .and_then(|l| l.get("levels"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        Ok(json!({
+            "current": {"model": current_model, "effort": effort},
+            "models": entries,
+            "efforts": efforts,
+            "live": live,
+        }))
+    }
+
     /// `master_command` (CAD-551) — the operator's provider-session
     /// commands for the master, behind the board's slash menu and its
     /// Stop control. The daemon owns the verb set

@@ -129,6 +129,14 @@ impl Shared {
                     Some(dir) => crate::pi_policy::read(dir)?,
                     None => None,
                 };
+                // CAD-575: the allowlist the gate checks is the role's
+                // own when pm.yaml carries one (master_allow /
+                // worker_allow), else `allow`.
+                let role_key = if crate::master::is_master(alias) {
+                    "master"
+                } else {
+                    "worker"
+                };
                 match picked {
                     // The defaults layer resolved a model — run the
                     // gate on it and pass the caller's params through
@@ -136,7 +144,7 @@ impl Shared {
                     // (explicit, role_default, provider_baseline)
                     // instead of naming it explicit.
                     Some(model) => {
-                        crate::pi_policy::require_allowed(policy.as_ref(), &model)?;
+                        crate::pi_policy::require_allowed(policy.as_ref(), role_key, &model)?;
                         parsed
                     }
                     // Nothing resolved — `[pi].models.default` fills
@@ -145,11 +153,6 @@ impl Shared {
                     // provenance names the operator's policy, not a
                     // caller flag.
                     None => {
-                        let role_key = if crate::master::is_master(alias) {
-                            "master"
-                        } else {
-                            "worker"
-                        };
                         let model =
                             crate::pi_policy::resolve_model(policy.as_ref(), role_key, None)?;
                         let mut merged = match resolved.params.as_deref() {
@@ -357,11 +360,17 @@ impl Shared {
         }
         // CAD-559: a pi agent's model is on the operator's allowlist or
         // it is refused — and it can never be cleared, because a pi
-        // launch without `--model` would silently fall back.
+        // launch without `--model` would silently fall back. CAD-575:
+        // the role's own list applies when pm.yaml carries one.
         if agent.provider == "pi" && patch.as_object().unwrap().contains_key("model") {
             let policy = crate::pi_policy::read(&self.pm_dir()?)?;
+            let role = if crate::master::is_master(&agent.alias) {
+                "master"
+            } else {
+                "worker"
+            };
             match patch["model"].as_str() {
-                Some(model) => crate::pi_policy::require_allowed(policy.as_ref(), model)?,
+                Some(model) => crate::pi_policy::require_allowed(policy.as_ref(), role, model)?,
                 None => {
                     return Err(Error::rejected(
                         "agent set refused: a pi agent always launches on an \

@@ -1086,6 +1086,160 @@ fn open_refuses_a_model_off_the_allowlist() {
     pi.close();
 }
 
+/// CAD-575: a role's own list replaces `allow` at open — a model only
+/// `allow` offers refuses on the master (`master_allow` narrows it),
+/// and one only `master_allow` offers refuses on the worker (its own
+/// list absent → `allow` still applies). pm.yaml is rewritten after
+/// the adapter helpers seed the default policy — the gate re-reads it
+/// at every open.
+#[test]
+fn open_gates_models_per_role() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let pi = master_adapter(
+        "normal",
+        &state,
+        &[(cadence_agent::master::TEST_NO_LANDLOCK, "1".into())],
+    );
+    std::fs::write(
+        state.join("pm/pm.yaml"),
+        "pi:\n  models:\n    allow: [\"fake/model-1\"]\n    master_allow: [\"acme/demo-1\"]\n",
+    )
+    .unwrap();
+    // fake/model-1 is allowlisted — for workers. The master's own
+    // list replaces `allow` outright.
+    let err = pi
+        .open(&master_agent(
+            &state,
+            json!({"model": "fake/model-1", "unconfined": true}),
+        ))
+        .err()
+        .expect("a worker-side model must refuse on the master");
+    let text = err.to_string();
+    assert!(
+        text.contains("fake/model-1") && text.contains("master_allow"),
+        "{text}"
+    );
+    // Its own entry launches.
+    pi.open(&master_agent(
+        &state,
+        json!({"model": "acme/demo-1", "unconfined": true}),
+    ))
+    .unwrap();
+    pi.close();
+
+    // The mirror: a worker under the same policy keeps `allow` and
+    // may not take the master's entry.
+    let wdir = tempfile::tempdir().unwrap();
+    let (worker, _rx) = adapter("normal", wdir.path());
+    std::fs::write(
+        wdir.path().join("pm/pm.yaml"),
+        "pi:\n  models:\n    allow: [\"fake/model-1\"]\n    master_allow: [\"acme/demo-1\"]\n",
+    )
+    .unwrap();
+    let err = worker
+        .open(&agent("dev-1", json!({"model": "acme/demo-1"})))
+        .err()
+        .expect("a master-only model must refuse on the worker");
+    let text = err.to_string();
+    assert!(
+        text.contains("acme/demo-1") && text.contains("allow"),
+        "{text}"
+    );
+    worker
+        .open(&agent("dev-1", json!({"model": "fake/model-1"})))
+        .unwrap();
+    worker.close();
+}
+
+/// `worker_allow` narrows the worker side symmetrically: an `allow`
+/// entry it omits refuses at the worker's open while the master —
+/// never reading `worker_allow` — still launches on it.
+#[test]
+fn worker_allow_narrows_the_worker_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let (worker, _rx) = adapter("normal", dir.path());
+    std::fs::write(
+        dir.path().join("pm/pm.yaml"),
+        "pi:\n  models:\n    allow: [\"fake/model-1\", \"acme/demo-1\"]\n    worker_allow: [\"acme/demo-1\"]\n",
+    )
+    .unwrap();
+    let err = worker
+        .open(&agent("dev-1", json!({"model": "fake/model-1"})))
+        .err()
+        .expect("an allow-only model must refuse when worker_allow omits it");
+    let text = err.to_string();
+    assert!(
+        text.contains("fake/model-1") && text.contains("worker_allow"),
+        "{text}"
+    );
+    worker
+        .open(&agent("dev-1", json!({"model": "acme/demo-1"})))
+        .unwrap();
+    worker.close();
+}
+
+/// The `/model` gate runs under the role the adapter opened as:
+/// `fake/model-1` is fine for workers but not on `master_allow`, so
+/// the master's switch is refused BEFORE `set_model` crosses — the
+/// journal beside the master's cwd proves it — while the same switch
+/// on a worker adapter lands (CAD-575).
+#[test]
+fn session_command_model_gates_per_role() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let pi = master_adapter(
+        "normal",
+        &state,
+        &[(cadence_agent::master::TEST_NO_LANDLOCK, "1".into())],
+    );
+    std::fs::write(
+        state.join("pm/pm.yaml"),
+        "pi:\n  models:\n    allow: [\"fake/model-1\", \"acme/demo-1\"]\n    master_allow: [\"acme/demo-1\"]\n",
+    )
+    .unwrap();
+    pi.open(&master_agent(
+        &state,
+        json!({"model": "acme/demo-1", "unconfined": true}),
+    ))
+    .unwrap();
+
+    let err = pi
+        .session_command("model", Some("fake/model-1"))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("fake/model-1") && err.contains("master_allow"),
+        "{err}"
+    );
+    let journal = state.join("master/cwd/pi-rpc.jsonl");
+    let received = std::fs::read_to_string(&journal)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter_map(|row| row["rpc"].as_str().map(str::to_string))
+        .collect::<Vec<_>>();
+    assert!(!received.iter().any(|m| m == "set_model"), "{received:?}");
+    pi.close();
+
+    // Same switch on a worker adapter: `master_allow` is not its list,
+    // `allow` covers it — the wire carries set_model and get_state
+    // verifies.
+    let wdir = tempfile::tempdir().unwrap();
+    let (worker, _rx) = adapter("normal", wdir.path());
+    std::fs::write(
+        wdir.path().join("pm/pm.yaml"),
+        "pi:\n  models:\n    allow: [\"fake/model-1\", \"acme/demo-1\"]\n    master_allow: [\"acme/demo-1\"]\n",
+    )
+    .unwrap();
+    worker.open(&agent("dev-1", json!({}))).unwrap();
+    let out = worker
+        .session_command("model", Some("fake/model-1"))
+        .unwrap();
+    assert_eq!(out["model"]["id"], "model-1", "{out}");
+    worker.close();
+}
+
 /// The `wrong-model` fake accepts `--model` then reports a different
 /// one — Pi's silent-fallback shape. `open` must refuse rather than
 /// trust the launch flag.

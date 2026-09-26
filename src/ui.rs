@@ -3010,6 +3010,14 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 }
                 return;
             }
+            // `/api/master/models` — the master's model-picker read
+            // (CAD-575): operator-gated like the `master_models` RPC
+            // it relays.
+            if path == "/api/master/models" {
+                let resp = home::master_models(&request, state_dir, opts);
+                send(request, resp);
+                return;
+            }
             // `/api/master/summary?since=` — "since you left" (CAD-328).
             if path == "/api/master/summary" {
                 send(request, home::master_summary(state_dir, &query));

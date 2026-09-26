@@ -409,6 +409,10 @@ pub struct Shared {
     /// on a `test-seam` build. Request frames carrying `test_caller`
     /// are honored against it; without it they are refused.
     seam: Option<crate::test_seam::Seam>,
+    /// CAD-575: the `devin models list` outcome `master_models` reads
+    /// cost tiers from — the pi-devin cache file wins fresh every call;
+    /// only the spawned CLI path memoizes ([`crate::devin_catalog`]).
+    devin_catalog: crate::devin_catalog::CatalogCache,
 }
 
 impl Shared {
@@ -536,6 +540,7 @@ impl Shared {
             outbox_dir: opts.outbox_dir.clone(),
             lease,
             seam,
+            devin_catalog: crate::devin_catalog::CatalogCache::default(),
         });
         // Holds dropped by boot-time revalidation get their release
         // events now that the store-backed emitter exists.
@@ -2419,6 +2424,7 @@ impl Shared {
             "master_start" => self.rpc_master_start(params, peer_pid),
             "master_summary" => self.rpc_master_summary(params, peer_pid),
             "master_state" => self.rpc_master_state(params),
+            "master_models" => self.rpc_master_models(params, peer_pid),
             "master_command" => self.rpc_master_command(params, peer_pid),
             "reports_changed" => self.rpc_reports_changed(peer_pid),
             "report_verdict" => self.rpc_report_verdict(params, peer_pid),

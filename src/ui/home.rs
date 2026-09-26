@@ -457,6 +457,32 @@ pub(super) fn master_state(state_dir: &std::path::Path) -> HttpResp {
     }
 }
 
+/// `GET /api/master/models` (CAD-575) — the master's model-picker
+/// data (models with `allowed_for`, cost tiers, effort levels),
+/// relayed through the daemon's operator-only `master_models`. Gated
+/// the same as that RPC: a live operator session on an unattributable
+/// caller ([`outbox_gate`]), the positive peer proof, and a board the
+/// daemon itself accepts as the operator's — never less strict than
+/// the RPC it relays.
+pub(super) fn master_models(
+    request: &Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+) -> HttpResp {
+    if let Err(resp) = outbox_gate(request, state_dir, opts, "GET /api/master/models") {
+        return resp;
+    }
+    // The RPC takes no parameters — a query field is refused whole,
+    // never silently dropped on the relay.
+    if request.url().contains('?') {
+        return err_response(400, "GET /api/master/models takes no parameters");
+    }
+    match client::rpc(state_dir, "master_models", json!({})) {
+        Ok(out) => json_response(out),
+        Err(e) => rpc_err(&e, "master_models"),
+    }
+}
+
 /// The slash verbs the board relays to `master_command` (CAD-551) —
 /// narrower than the daemon's own verb set: `help` is the composer's
 /// local help. A body naming anything else is refused before the daemon
