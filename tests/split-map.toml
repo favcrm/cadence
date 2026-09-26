@@ -681,6 +681,7 @@ tests = [
     "cad551_master_state_working_turn_and_stop",
     "cad551_master_command_gate_and_allowlist",
     "cad551_master_command_board_gate",
+    "cad602_agentic_model_rpc_and_http_refuse",
     "cad575_master_models_gate_and_contract",
     "cad575_master_models_before_start",
     "cad575_master_models_board_gate",

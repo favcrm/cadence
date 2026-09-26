@@ -203,10 +203,10 @@ impl Shared {
             .unwrap_or_default();
         let allowed_for = |id: &str| -> Vec<&'static str> {
             let mut roles = Vec::new();
-            if master_list.iter().any(|m| m == id) {
+            if crate::pi_policy::require_allowed(policy.as_ref(), "master", id).is_ok() {
                 roles.push("master");
             }
-            if worker_list.iter().any(|m| m == id) {
+            if crate::pi_policy::require_allowed(policy.as_ref(), "worker", id).is_ok() {
                 roles.push("worker");
             }
             roles

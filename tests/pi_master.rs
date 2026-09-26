@@ -1324,6 +1324,88 @@ fn session_command_model_gates_per_role() {
     worker.close();
 }
 
+/// CAD-602: neither an allowed model nor forged row fields can move
+/// the guard-dependent master onto a provider executing its own tools.
+#[test]
+fn agentic_provider_master_open_and_concurrent_switch_refuse() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let pi = master_adapter(
+        "normal",
+        &state,
+        &[(cadence_agent::master::TEST_NO_LANDLOCK, "1".into())],
+    );
+    std::fs::write(
+        state.join("pm/pm.yaml"),
+        "pi:\n  models:\n    allow: [\"fake/model-1\", \"cursor/grok-4.7-high\"]\n",
+    )
+    .unwrap();
+    let mut forged = master_agent(
+        &state,
+        json!({"model": "cursor/grok-4.7-high", "role": "worker", "unconfined": true}),
+    );
+    forged.role = "worker".into();
+    let err = pi
+        .open(&forged)
+        .err()
+        .expect("agentic open must refuse")
+        .to_string();
+    assert!(err.contains("agentic"), "{err}");
+    assert!(!state.join("master/cwd/pi-rpc.jsonl").exists());
+
+    pi.open(&master_agent(
+        &state,
+        json!({"model": "fake/model-1", "unconfined": true}),
+    ))
+    .unwrap();
+    std::thread::scope(|scope| {
+        for _ in 0..2 {
+            scope.spawn(|| {
+                let err = pi
+                    .session_command("model", Some("cursor/grok-4.7-high"))
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("agentic"), "{err}");
+            });
+        }
+    });
+    let journal = std::fs::read_to_string(state.join("master/cwd/pi-rpc.jsonl")).unwrap();
+    assert!(
+        !journal
+            .lines()
+            .any(|line| { serde_json::from_str::<Value>(line).unwrap()["rpc"] == "set_model" }),
+        "{journal}"
+    );
+    pi.close();
+}
+
+#[test]
+fn agentic_provider_master_detached_child_refuses() {
+    // Session detachment must not change the policy: adapter identity,
+    // not process ancestry or an agent-supplied role field, owns the gate.
+    if std::env::var_os("CADENCE_602_DETACHED_PROOF").is_some() {
+        agentic_provider_master_open_and_concurrent_switch_refuse();
+        return;
+    }
+    let out = std::process::Command::new("setsid")
+        .args(["--fork", "--wait"])
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "agentic_provider_master_detached_child_refuses",
+            "--nocapture",
+        ])
+        .env("CADENCE_602_DETACHED_PROOF", "1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "detached proof failed: {} {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// The `wrong-model` fake accepts `--model` then reports a different
 /// one — Pi's silent-fallback shape. `open` must refuse rather than
 /// trust the launch flag.
