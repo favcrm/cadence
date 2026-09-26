@@ -3111,11 +3111,23 @@ fn cad602_agentic_model_rpc_and_http_refuse() {
     let f = pi_master("normal");
     let d = &f.d;
     d.wait_agent("master", "idle", 30);
-    std::fs::write(
-        f.pm_dir.join("pm.yaml"),
-        "pi:\n  models:\n    allow: [fake/model-1, cursor/grok-4.7-high]\n    default: {master: fake/model-1}\n",
-    )
-    .unwrap();
+    let policy_path = f.pm_dir.join("pm.yaml");
+    let mut policy: serde_yaml::Value =
+        serde_yaml::from_str(&std::fs::read_to_string(&policy_path).unwrap()).unwrap();
+    policy["pi"]["models"]["allow"]
+        .as_sequence_mut()
+        .unwrap()
+        .push(serde_yaml::Value::String("cursor/grok-4.7-high".into()));
+    std::fs::write(&policy_path, serde_yaml::to_string(&policy).unwrap()).unwrap();
+    let mut wk = ManagedWorker::start(d, "wk602");
+    for src in ["self", "child"] {
+        let frame = wk.rpc(
+            src,
+            "master_command",
+            json!({"command": "model", "arg": "cursor/grok-4.7-high", "role": "operator"}),
+        );
+        assert_eq!(frame["ok"], false, "{frame}");
+    }
     let err = d
         .operator_rpc(
             "master_command",
