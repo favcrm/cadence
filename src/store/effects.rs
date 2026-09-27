@@ -655,7 +655,7 @@ impl Store {
     pub fn waiting_effects(&self) -> Result<Vec<EffectRow>> {
         let conn = self.conn();
         let mut stmt = conn
-            .prepare("SELECT * FROM platform_effects WHERE state='waiting' ORDER BY staged_at")?;
+            .prepare("SELECT * FROM platform_effects WHERE state='waiting' AND authorization_kind='agent_grant' ORDER BY staged_at")?;
         let rows = stmt.query_map([], EffectRow::from_row)?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
