@@ -271,3 +271,87 @@ fn cad667_http_install_and_reads_share_operator_authority() {
         );
     }
 }
+
+#[test]
+fn cad667_cli_catalog_namespace_preserves_legacy_offline_reads() {
+    let w = Workspace::new();
+    let source = w.source();
+    let installed = common::operator_cadence_at(
+        w._root.path(),
+        &w.daemon.state,
+        &["app", "catalog", "install", source.to_str().unwrap()],
+    );
+    assert!(
+        installed.status.success(),
+        "catalog install CLI: {}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let row: Value = serde_json::from_slice(&installed.stdout).unwrap();
+    let id = row["install_id"].as_str().unwrap();
+    let inspected = common::operator_cadence_at(
+        w._root.path(),
+        &w.daemon.state,
+        &["app", "catalog", "show", id],
+    );
+    assert!(inspected.status.success());
+    let legacy = common::operator_cadence_at(w._root.path(), &w.daemon.state, &["app", "ls"]);
+    assert!(
+        legacy.status.success(),
+        "legacy ls must retain its existing behavior"
+    );
+    let legacy: Value = serde_json::from_slice(&legacy.stdout).unwrap();
+    assert!(legacy.as_array().is_some());
+}
+
+#[test]
+fn cad667_git_failure_retains_pending_journal_and_explicit_recovery_delivers() {
+    use std::os::unix::fs::PermissionsExt;
+    let w = Workspace::new();
+    let hook = w.pm.dir.join(".git/hooks/pre-commit");
+    let original = std::fs::read(&hook).ok();
+    std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let head = w.head();
+    let failed = w
+        .install()
+        .expect_err("failed Git delivery must not report committed success");
+    assert!(
+        failed.to_string().contains("git"),
+        "wrong delivery boundary: {failed}"
+    );
+    assert_eq!(w.head(), head);
+    let id = std::fs::read_to_string(w.pm.dir.join(".apps/install-pending.yaml")).unwrap();
+    assert!(w
+        .pm
+        .dir
+        .join(".apps/install-journals")
+        .join(format!("{id}.yaml"))
+        .is_file());
+    assert!(
+        w.daemon
+            .operator_rpc("app_workspace_list", json!({}))
+            .is_err(),
+        "undelivered installation exposed as ready"
+    );
+    match original {
+        Some(bytes) => std::fs::write(&hook, bytes).unwrap(),
+        None => std::fs::remove_file(&hook).unwrap(),
+    }
+    let recovered = w
+        .daemon
+        .operator_rpc("app_workspace_recover", json!({"install_id":id}))
+        .unwrap();
+    assert_eq!(recovered["committed"], true);
+    assert_eq!(recovered["approved"], false);
+    assert!(!w.pm.dir.join(".apps/install-pending.yaml").exists());
+    assert_ne!(w.head(), head);
+    assert_eq!(
+        w.daemon
+            .operator_rpc("app_workspace_list", json!({}))
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
