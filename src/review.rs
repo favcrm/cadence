@@ -176,6 +176,31 @@ impl Default for Timeouts {
     }
 }
 
+/// Coverage of the configured review suite; CI remains responsible for
+/// the complete merge-group inventory when a recipe chooses a baseline.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SuiteScope {
+    #[default]
+    Full,
+    ReviewBaseline,
+}
+
+impl SuiteScope {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Full => "Full suite",
+            Self::ReviewBaseline => "Review baseline",
+        }
+    }
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::ReviewBaseline => "review-baseline",
+        }
+    }
+}
+
 /// `cadence-review.toml` — every step the verb performs is data here.
 #[derive(Clone, Debug, Deserialize)]
 pub struct ReviewConfig {
@@ -184,8 +209,11 @@ pub struct ReviewConfig {
     pub prepare: Vec<String>,
     /// Ordered quality gates; the first failure stops the sequence.
     pub gates: Vec<String>,
-    /// The full test suite, run once.
+    /// Configured suite, run once. Legacy key retained for consumers.
     pub full_suite: String,
+    /// Describe coverage honestly; older recipes retain full-suite semantics.
+    #[serde(default)]
+    pub suite_scope: SuiteScope,
     /// Diff paths that count as test files (`*`/`**`/`?` globs).
     pub test_globs: Vec<String>,
     /// How one test runs alone; `{test}` = fn name, `{file}` = diff
@@ -2247,6 +2275,8 @@ pub fn run(opts: &Options) -> Result<i32> {
     report["stress"] = json!(stress_results);
     report["suite_lock"] = suite_lock;
     report["full_suite"] = full_suite_report(suite_step.as_ref(), &cfg.full_suite, 0);
+    report["full_suite"]["scope"] = json!(cfg.suite_scope.as_str());
+    report["full_suite"]["label"] = json!(cfg.suite_scope.label());
 
     // Equal-conditions compare: every failing test name, rerun alone
     // on the gated tree and alone on the base head.
@@ -3100,7 +3130,8 @@ fn render_markdown(r: &Value) -> String {
         "Gates",
         &r["gates"].as_array().cloned().unwrap_or_default(),
     );
-    section(&mut md, "Full suite", &[r["full_suite"].clone()]);
+    let suite_label = r["full_suite"]["label"].as_str().unwrap_or("Full suite");
+    section(&mut md, suite_label, &[r["full_suite"].clone()]);
 
     let stress = r["stress"].as_array().cloned().unwrap_or_default();
     md.push_str("## New tests stressed\n\n");
@@ -3453,6 +3484,7 @@ gate_secs = 42
         assert_eq!(cfg.timeouts.gate_secs, 42);
         assert_eq!(cfg.timeouts.full_secs, 3600);
         assert_eq!(cfg.stress_pattern.0, vec!["wait_", "sleep"]);
+        assert_eq!(cfg.suite_scope, SuiteScope::Full);
         assert_eq!(cfg.runner.backend, ReviewBackend::Cargo);
         assert_eq!(cfg.runner.result_format, ResultFormat::Cargo);
     }
@@ -3474,6 +3506,30 @@ gate_secs = 42
             err.contains(&format!("{origin} is not valid TOML")),
             "{err}"
         );
+    }
+
+    #[test]
+    fn review_baseline_scope_is_explicit_and_unknown_scope_refuses() {
+        let recipe = "prepare = []\ngates = [\"true\"]\nfull_suite = \"cargo test --lib\"\ntest_globs = [\"tests/**\"]\ntest_command = \"cargo test {test}\"\n";
+        let legacy = ReviewConfig::parse(recipe, "legacy").unwrap();
+        assert_eq!(legacy.suite_scope.as_str(), "full");
+        assert_eq!(legacy.suite_scope.label(), "Full suite");
+        let baseline = ReviewConfig::parse(
+            &format!("{recipe}suite_scope = \"review-baseline\"\n"),
+            "baseline",
+        )
+        .unwrap();
+        assert_eq!(baseline.suite_scope.as_str(), "review-baseline");
+        assert_eq!(baseline.suite_scope.label(), "Review baseline");
+        let report = json!({"full_suite": {
+            "scope": baseline.suite_scope.as_str(),
+            "label": baseline.suite_scope.label(),
+            "outcome": "ok"
+        }});
+        let markdown = render_markdown(&report);
+        assert!(markdown.contains("## Review baseline"));
+        assert!(!markdown.contains("## Full suite"));
+        assert!(ReviewConfig::parse(&format!("{recipe}suite_scope = \"none\"\n"), "bad",).is_err());
     }
 
     #[test]

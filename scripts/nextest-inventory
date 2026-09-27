@@ -43,6 +43,12 @@ fi
 command -v jq >/dev/null 2>&1 || die "jq is required to parse nextest list JSON"
 
 case "$TARGET" in
+    selected)
+        # ci-rust-tests.py supplies explicit lib/bin/test selectors. Both
+        # backends receive the same argv without compiling unrelated areas.
+        CARGO_TARGET_ARGS=""
+        NEXTEST_TARGET_ARGS=""
+        ;;
     all-targets)
         CARGO_TARGET_ARGS="--all-targets"
         NEXTEST_TARGET_ARGS="--all-targets"

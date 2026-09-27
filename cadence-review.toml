@@ -38,19 +38,14 @@ gates = [
     "cargo clippy --all-targets --locked --features test-seam -- -D warnings",
     "cargo clippy --all-targets --locked --features ui -- -D warnings",
     "cargo test --locked --test test_seam -- --test-threads 2",
-    "cargo test --locked --features test-seam --lib --bins --test board_issue --test board_lanes --test board_sync --test board_http --test board_ui_daemon --test board_tailnet --test board_memory --test board_overview --test board_retro --test board_context --test board_sessions --test board_sign_in -- --test-threads 2",
 ]
 
-# The one full-suite run (about 12 minutes; skipped with --no-full).
-# It runs inside the host-wide slot (CADENCE_SUITE_LOCK, required unless
-# --no-suite-lock); the suite binary sees the variable empty so it does
-# not queue behind its own parent. Worst case is two full_secs: up to
-# full_secs waiting for the slot, then up to full_secs for the run.
-# Since CAD-426 the former `integration` binary is split into per-area
-# tests/*.rs binaries, so the full suite is the --all-targets group.
-# Like CI, runtime suites use test-seam; default-feature clippy also checks
-# the production code shape. E2E stays opt-in via its separate workflow.
-full_suite = "scripts/cadence-nextest --all-targets --features test-seam"
+# One review baseline under the existing host-wide slot. The complete
+# all-targets suite runs in CI on the merge group. Keep lib/bin and every
+# board split here, plus the new-test stress and isolated comparisons below.
+# --no-full still skips this configured suite for CLI compatibility.
+suite_scope = "review-baseline"
+full_suite = "scripts/cadence-nextest --locked --features test-seam --lib --bins --test board_issue --test board_lanes --test board_sync --test board_http --test board_ui_daemon --test board_tailnet --test board_memory --test board_overview --test board_retro --test board_context --test board_sessions --test board_sign_in"
 
 # Diff paths that count as test files — `fn` items added under these
 # are the PR's new tests.

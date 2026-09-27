@@ -22,7 +22,7 @@ on:
 #   soon as runners allow. Each group only ever holds that one run, so no
 #   push run is cancelled or dropped. Every pushed commit still gets its
 #   own run (CAD-228); see queue-evidence below for what that run does.
-# - push to feat/** and v* tags: one group per ref; serial, never
+# - push to v* tags: one group per ref; serial, never
 #   cancelled, `queue: max` keeps up to 100 pending runs instead of
 #   GitHub's default single pending slot (where a newer push cancelled the
 #   older pending run with zero jobs). Only a 101st waiting push is
@@ -55,7 +55,7 @@ jobs:
   # admin-bypass push, a queue entry whose gates did not all pass, or a
   # failed lookup), `tested` is false and every gate runs on this push as
   # before. It never fails the run: any lookup error means "not found".
-  # On tags and feat/** it only reports false (tags keep every gate,
+  # On tags it only reports false (tags keep every gate,
   # CAD-311). On pull_request and merge_group it is skipped, and the gates
   # run because their `if` tolerates a skipped need.
   queue-evidence:
@@ -158,18 +158,51 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - name: Select PR test scope from the base policy
+        id: scope
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -eu
+          policy="$RUNNER_TEMP/ci-test-plan.py"
+          runner="$RUNNER_TEMP/ci-rust-tests.py"
+          plan="$RUNNER_TEMP/ci-test-plan.json"
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            if git show "$BASE_SHA:scripts/ci-test-plan.py" > "$policy"; then
+              python3 "$policy" --root "$GITHUB_WORKSPACE" --event-file "$GITHUB_EVENT_PATH" --out "$plan"
+            else
+              # Bootstrap/older bases cannot select a smaller inventory.
+              echo '{"schema":1,"mode":"full","targets":[],"reason":"base policy unavailable; full fallback"}' > "$plan"
+              echo 'mode=full' >> "$GITHUB_OUTPUT"
+            fi
+            if ! git show "$BASE_SHA:scripts/ci-rust-tests.py" > "$runner"; then
+              cp scripts/ci-rust-tests.py "$runner"
+            fi
+          else
+            cp scripts/ci-rust-tests.py "$runner"
+            python3 scripts/ci-test-plan.py --root "$GITHUB_WORKSPACE" --event-file "$GITHUB_EVENT_PATH" --out "$plan"
+          fi
+          cat "$plan" >> "$GITHUB_STEP_SUMMARY"
+      - name: Test scope selection and execution contracts
+        run: python3 tests/scripts/test_ci_test_plan.py
       - run: rustup toolchain install stable --profile minimal
+        if: steps.scope.outputs.mode != 'docs'
       # CAD-264: the review's UI typecheck gate is tested against the real
       # tsc in ui/node_modules, which `cadence review` links in prepare.
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        if: steps.scope.outputs.mode != 'docs'
         with:
           package_json_file: ui/package.json
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: steps.scope.outputs.mode != 'docs'
         with:
           node-version: 22
           cache: pnpm
           cache-dependency-path: ui/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
+        if: steps.scope.outputs.mode != 'docs'
         working-directory: ui
       - name: Test nextest cost reporting
         run: python3 tests/scripts/test_nextest_cost_report.py
@@ -179,24 +212,26 @@ jobs:
       # and wrapper verify the reviewed archive/binary, force retries=0, and
       # force --no-tests fail; no tool is installed into PATH or the repo.
       - name: Install pinned cargo-nextest (PR93 dependency)
+        if: steps.scope.outputs.mode != 'docs'
         env:
           CADENCE_NEXTTEST_INSTALL_DIR: ${{ runner.temp }}/cadence-nextest-0.9.145
           TMPDIR: ${{ runner.temp }}
         run: |
           scripts/install-cadence-nextest
           echo "CADENCE_NEXTTEST_BIN=${RUNNER_TEMP}/cadence-nextest-0.9.145/cargo-nextest" >> "$GITHUB_ENV"
-      # The all-targets inventory must be non-empty and exactly equal between
-      # Cargo and nextest before the process-per-test runner starts. This
-      # covers lib, bin and every tests/ binary; it is not one suite only.
+      # The recorded inventory must be non-empty and exactly equal between
+      # Cargo and nextest. Queue/main fallback/tag events retain all targets;
+      # selected PRs retain lib/bin and affected integration binaries.
       # CAD-482: the suite runs under the `test-seam` feature so fixture
       # daemons and boards exercise the asserted-identity seam (a debug
       # build; release builds can never carry it — see the build job).
-      - name: Verify all-targets inventory parity
+      - name: Verify selected inventory parity
         id: inventory
+        if: steps.scope.outputs.mode != 'docs'
         env:
           CARGO_BUILD_JOBS: 4
           CADENCE_INVENTORY_TIMINGS_REPORT: ${{ runner.temp }}/inventory-timings/inventory.html
-        run: scripts/nextest-inventory all-targets --features test-seam
+        run: python3 "$RUNNER_TEMP/ci-rust-tests.py" --root "$GITHUB_WORKSPACE" --plan "$RUNNER_TEMP/ci-test-plan.json" --phase inventory
       - name: Record inventory build context
         continue-on-error: true
         if: ${{ !cancelled() && (steps.inventory.outcome == 'success' || steps.inventory.outcome == 'failure') }}
@@ -216,7 +251,8 @@ jobs:
             printf 'source=%s\n' "$(git rev-parse HEAD)"
             rustc --version --verbose
             printf 'runner=%s/%s image=%s/%s\n' "$RUNNER_OS" "$RUNNER_ARCH" "${ImageOS:-unknown}" "${ImageVersion:-unknown}"
-            printf 'features=test-seam targets=all-targets jobs=%s RUSTFLAGS=%s\n' "$CARGO_BUILD_JOBS" "$RUSTFLAGS"
+            printf 'features=test-seam scope=%s jobs=%s RUSTFLAGS=%s\n' '${{ steps.scope.outputs.mode }}' "$CARGO_BUILD_JOBS" "$RUSTFLAGS"
+            cat "$RUNNER_TEMP/ci-test-plan.json"
             printf 'RUSTC_WRAPPER=%s RUSTC_WORKSPACE_WRAPPER=%s\n' "${RUSTC_WRAPPER:-unset}" "${RUSTC_WORKSPACE_WRAPPER:-unset}"
             printf 'CARGO_TARGET_DIR=%s CARGO_INCREMENTAL=%s\n' "${CARGO_TARGET_DIR:-unset}" "${CARGO_INCREMENTAL:-unset}"
             echo 'profile=test (dev settings in Cargo.toml); no Rust cache action configured; actual warm/cold/cache hits not measured'
@@ -245,22 +281,20 @@ jobs:
       # The feature-on suite cannot compile cfg(not(test-seam)) proofs.
       # Run only that identity contract in the production feature shape.
       - name: Run default-feature test-seam refusal proofs
+        if: steps.scope.outputs.mode != 'docs'
         env:
           CADENCE_SUITE_LOCK: ${{ runner.temp }}/cadence-suite.lock
           CARGO_BUILD_JOBS: 4
         run: scripts/cadence-nextest --test test_seam --locked
-      - name: Run all Rust targets with pinned nextest
+      - name: Run recorded Rust scope with pinned nextest
+        if: steps.scope.outputs.mode != 'docs'
         id: nextest
         env:
           CADENCE_SUITE_LOCK: ${{ runner.temp }}/cadence-suite.lock
           CARGO_BUILD_JOBS: 4
-        run: |
-          # The preceding default-feature run uses the same JUnit path. An
-          # early full-suite failure must not report its stale timing data.
-          rm -f target/nextest/cadence/junit.xml
-          scripts/cadence-nextest --all-targets --locked --features test-seam
+        run: python3 "$RUNNER_TEMP/ci-rust-tests.py" --root "$GITHUB_WORKSPACE" --plan "$RUNNER_TEMP/ci-test-plan.json" --phase tests
       # Observational timings come from the same run, including failed tests.
-      # No rerun, retry, test selection or required gate is changed here.
+      # The recorded scope artifact distinguishes selected from full timings.
       - name: Summarize Rust test costs
         if: ${{ !cancelled() && (steps.nextest.outcome == 'success' || steps.nextest.outcome == 'failure') }}
         run: |
@@ -272,12 +306,13 @@ jobs:
           else
             echo 'Rust test costs unavailable: nextest did not produce a JUnit report.' >> "$GITHUB_STEP_SUMMARY"
           fi
-      - name: Keep Rust test cost measurements
-        if: ${{ !cancelled() && (steps.nextest.outcome == 'success' || steps.nextest.outcome == 'failure') }}
+      - name: Keep Rust test cost measurements and scope
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: nextest-costs-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
+            ${{ runner.temp }}/ci-test-plan.json
             ${{ runner.temp }}/nextest-costs.json
             ${{ runner.temp }}/nextest-costs.md
           if-no-files-found: warn
@@ -286,6 +321,7 @@ jobs:
       # doctests visible as a separate locked Cargo step rather than silently
       # dropping that coverage from cargo test --all-targets semantics.
       - name: Run Rust doctests with locked Cargo
+        if: steps.scope.outputs.mode != 'docs'
         env:
           CARGO_BUILD_JOBS: 4
         run: cargo test --doc --locked
