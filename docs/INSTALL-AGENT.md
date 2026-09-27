@@ -1,15 +1,18 @@
 # Native installation
 
-As of 2026-09-27, no GitHub Release has been published. The commands below
-describe installation **after publication**; they are not working download
-links yet. Check the [release list](https://github.com/favcrm/cadence/releases)
-for an available tag and its limitations before installing.
+[Cadence 0.1.0-beta.2](https://github.com/favcrm/cadence/releases/tag/v0.1.0-beta.2)
+is the published local CLI pilot. Anonymous installation, exact version,
+default/custom prefixes and same-version reruns were verified on native Ubuntu
+22.04 x86_64/ARM64 and macOS 14 Apple Silicon in the
+[anonymous published-mode validation](https://github.com/favcrm/cadence/actions/runs/36337031674).
+The immutable release notes separately record source/build and prepublication
+candidate installation evidence.
+This install-only proof does not complete CAD-317's setup, headless wizard or
+backup/restore acceptance, or establish compatibility with existing production
+state. It is a prerelease, not a stable `latest` release or production rollout.
 
 The immutable `v0.1.0-beta.1` tag failed its macOS UI build and has no
-published installation assets. Replacement source is prepared for
-**0.1.0-beta.2**, a local CLI pilot. Its matching planned tag is
-**v0.1.0-beta.2**; no source SHA has been selected for publication. The
-planned version is not an available download or a supported production rollout.
+published installation assets. Use **v0.1.0-beta.2** explicitly.
 
 ## Platforms and prerequisites
 
@@ -34,7 +37,7 @@ For a pilot prerelease, copy its exact tag from the release list. GitHub's
 tag before running these commands:
 
 ```sh
-release_tag=v0.1.0-beta.2 # planned pilot; use only once this tag is published
+release_tag=v0.1.0-beta.2 # published local CLI pilot
 curl -fsSL "https://github.com/favcrm/cadence/releases/download/$release_tag/install.sh" -o install.sh
 sh install.sh --version "$release_tag"
 "$HOME/.local/bin/cadence" --version

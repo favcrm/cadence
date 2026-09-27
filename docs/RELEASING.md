@@ -1,12 +1,21 @@
 # First public release handoff (CAD-661)
 
-This is preparation, not publication authorization. The immutable
-`v0.1.0-beta.1` tag failed its macOS UI build and retains a private draft;
-it has no published installation assets. This replacement prepares beta.2.
-Source, review, CI, installation evidence and release approval must be
-recorded before publication.
+[Cadence 0.1.0-beta.2](https://github.com/favcrm/cadence/releases/tag/v0.1.0-beta.2)
+is published as a local CLI prerelease (`prerelease=true`, `latest=false`). Its
+source is `181bf4dfff466b02310a4d9339a3045b61dc5705`. The release notes record the
+exact tag-run/attempt, gate/build results, digests and prepublication native
+candidate installation receipts. Anonymous published-mode installation evidence
+is recorded separately in the main [installation guide](INSTALL-AGENT.md);
+immutable release notes are not appended after publication. This record is not
+authorization for a production rollout, stable promotion, rerun or replacement
+release.
 
-## Prepared version; candidate selection pending
+The immutable `v0.1.0-beta.1` tag failed its macOS UI build and retains a private
+draft; it has no published installation assets. The checklist and note template
+below preserve the prepublication process for future candidates; their pending
+placeholders are historical preparation, not the beta.2 publication record.
+
+## Historical preparation: beta.2 candidate selection
 
 Cargo.toml and Cargo.lock are prepared as **0.1.0-beta.2**, with matching planned
 tag **v0.1.0-beta.2** and release title **Cadence 0.1.0-beta.2 — local CLI pilot**.
@@ -28,7 +37,7 @@ rerun. See the GitHub CLI [create](https://cli.github.com/manual/gh_release_crea
 and [edit](https://cli.github.com/manual/gh_release_edit) flags. A beta label
 does not advertise cloud production readiness.
 
-## Outstanding publication evidence
+## Historical publication checklist; remaining acceptance
 
 | Requirement | Current owner / next evidence |
 |---|---|
@@ -68,7 +77,7 @@ builds the UI on PRs and merge groups. This job is advisory under current branch
 protection; beta.2 publication additionally requires its actual macOS UI build
 to pass. The static module-name check runs in the existing required UI build.
 
-## Proposed local pilot notes
+## Pilot scope and historical proposed notes
 
 Cadence 0.1.0-beta.2 is a local CLI pilot: a native controller and embedded
 browser board for local project and coding-agent coordination. Evaluate on
@@ -80,7 +89,8 @@ Silicon macOS. Intel macOS, Windows and Alpine/musl packages are not provided.
 Daemon and board evaluation is Linux-only with fresh, separate state. Apple
 Silicon macOS is limited to CLI packaging, installation and version checks;
 setup, daemon and board use is unsupported pending CAD-315.
-Real tagged-archive/platform installation results remain pending. Provider
+Anonymous install-only native results are linked in the main installation guide;
+full CAD-317 setup/wizard/backup acceptance remains pending. Provider
 CLIs/authentication and tmux for terminal providers are separate prerequisites;
 list only combinations actually verified for the eventual candidate.
 
