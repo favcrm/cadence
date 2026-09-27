@@ -356,3 +356,107 @@ fn cad631_restart_during_real_review_preserves_draft_and_never_replays_uncertain
         0
     );
 }
+
+#[test]
+fn cad631_revoke_real_running_writer_refuses_material_and_dependent_dispatch() {
+    let root = tempfile::tempdir().unwrap();
+    let pm = Pm::init(&root.path().join("pm")).unwrap();
+    pi_policy_pm(&pm.dir);
+    let opts = daemon_opts();
+    opts.provider_env
+        .set("CADENCE_PM_DIR", pm.dir.to_str().unwrap());
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/e2e/app-run-pi.py");
+    opts.provider_env.set(
+        "CADENCE_PI_COMMAND",
+        format!("python3 {}", fixture.display()),
+    );
+    let d = TestDaemon::start_opts(opts);
+    d.fixture_rpc("agent_register", json!({"alias":OWNER,"provider":"inbox","endpoint_kind":"inbox","role":"pm","cwd":d.dir.path()})).unwrap();
+    for alias in [WRITER, REVIEWER] {
+        d.register_pi(
+            alias,
+            json!({"upstream":OWNER,"model":"fake/model-1","effort":"high"}),
+        );
+        d.wait_agent(alias, "idle", 20);
+    }
+    let installed = d
+        .operator_rpc(
+            "app_workspace_install",
+            json!({"source":Path::new(env!("CARGO_MANIFEST_DIR")).join("apps/local-content")}),
+        )
+        .unwrap();
+    let install = installed["install_id"].as_str().unwrap();
+    d.operator_rpc(
+        "app_local_install_approve",
+        json!({"install_id":install,"digest":installed["digest"]}),
+    )
+    .unwrap();
+    let created = d.operator_rpc("app_run_create", json!({"install_id":install,"workflow":"draft","inputs":{"subject":"Lunch menu","source":DRAFT,"writer":WRITER,"reviewer":REVIEWER},"request_id":"revoke-running-1","owner_pm":OWNER})).unwrap();
+    let id = created["id"].as_str().unwrap();
+    d.operator_rpc(
+        "app_run_approve",
+        json!({"run_id":id,"digest":created["snapshot_digest"]}),
+    )
+    .unwrap();
+    d.operator_rpc("app_run_dispatch", json!({"run_id":id}))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !d.state.join("app-run-writer-held").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "real writer never observed its native active turn"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(count(&d.state, "SELECT count(*) FROM messages WHERE source='app_run_dispatch' AND alias='op-local-writer' AND state='running'"), 1);
+    let revoked = d
+        .operator_rpc(
+            "app_local_install_revoke",
+            json!({"install_id":install,"digest":installed["digest"]}),
+        )
+        .unwrap();
+    assert_eq!(revoked["approved"], false);
+    std::fs::write(d.state.join("app-run-release-writer"), "release").unwrap();
+    // Wait for the real successful producer envelope to arrive, rather than
+    // assert zero artifacts while the material callback is still pending.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while count(&d.state, "SELECT count(*) FROM messages WHERE source='app_run_dispatch' AND alias='op-local-writer' AND state IN ('queued','submitting','running')") != 0 {
+        assert!(Instant::now() < deadline, "revoked producer transport did not settle");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        provider_receipts(&d.state, WRITER).len(),
+        1,
+        "producer never returned its actual material envelope"
+    );
+    let run = d
+        .operator_rpc("app_run_show", json!({"run_id":id}))
+        .unwrap();
+    assert_eq!(
+        run["state"], "failed",
+        "revoked run accepted real provider material: {run}"
+    );
+    assert!(
+        run["artifacts"].as_array().unwrap().is_empty(),
+        "revoked producer material was persisted"
+    );
+    assert!(run["reviews"].as_array().unwrap().is_empty());
+    assert_eq!(
+        count(
+            &d.state,
+            "SELECT count(*) FROM messages WHERE source='app_run_dispatch'"
+        ),
+        1,
+        "revocation released the dependent reviewer"
+    );
+    assert_eq!(
+        count(
+            &d.state,
+            "SELECT count(*) FROM events WHERE kind='app_run_completed'"
+        ),
+        0
+    );
+    assert_eq!(count(&d.state, "SELECT count(*) FROM platform_effects"), 0);
+    assert_eq!(count(&d.state, "SELECT count(*) FROM platform_drafts"), 0);
+    assert_eq!(count(&d.state, "SELECT count(*) FROM app_grants"), 0);
+}

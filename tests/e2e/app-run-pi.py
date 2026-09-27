@@ -109,6 +109,7 @@ def run_prompt(prompt):
         "native_turn_observed": True,
     }
     if kickoff["kind"] == "produce_text":
+        (STATE / "app-run-writer-held").write_text(kickoff["run_id"])
         # Hold this actual running turn until concurrent operator dispatch
         # calls finish. The flag belongs only to this test's state dir.
         deadline = time.monotonic() + 15
