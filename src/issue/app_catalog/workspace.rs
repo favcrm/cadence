@@ -197,7 +197,7 @@ pub(crate) fn install(pm: &Pm, state: &Path, source: &str) -> Result<Value> {
     root.put(&journal_path(&id), &text)?;
     root.put(Path::new(INSTALL_PENDING), &id)?;
     let foreign = apply(pm, &root, &journal).map_err(|error| {
-        Error::internal(format!("workspace app publication or git delivery incomplete ({}); retained installation {id}; explicitly run `cadence app catalog recover {id}`", error.kind()))
+        Error::internal(format!("workspace app publication or git delivery incomplete ({}); retained installation {}; explicitly run `cadence app catalog recover {}`", error.kind(), &*id, &*id))
     })?;
     let mut row = describe(&root, &catalog, &id)?;
     row["committed"] = json!(true);
