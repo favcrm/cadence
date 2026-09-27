@@ -12,6 +12,7 @@ test("real Vite preview updates CSS over HMR, blocks APIs/files, and omits inher
   await mkdir(dir);
   for (const file of [
     "SocialContent.jsx",
+    "SecondaryViews.jsx",
     "store.mjs",
     "fixtures.mjs",
     "sdk.mjs",

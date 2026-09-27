@@ -1,4 +1,4 @@
-import { createFixtureSdk } from "./sdk.mjs";
-import { fixtures } from "./fixtures.mjs";
-// Separate from the React refresh boundary: UI/CSS edits retain this instance.
-export const sdk = createFixtureSdk(fixtures);
+import { createStudioFixture } from "./sdk.mjs";
+import { studioFixture } from "./fixtures.mjs";
+// Compatible component/CSS refresh preserves the one tab-local facade.
+export const studio = createStudioFixture(studioFixture);

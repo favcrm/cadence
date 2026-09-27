@@ -1,12 +1,31 @@
-import { useState } from "react";
-import { sdk } from "./store.mjs";
-import { fixtures } from "./fixtures.mjs";
+import { useEffect, useRef, useState } from "react";
+import { studio } from "./store.mjs";
+import { fixtureWeek, fixtureTimeZone } from "./fixtures.mjs";
 import { HugeiconsIcon } from "@hugeicons/react";
 import CubeIcon from "@hugeicons/core-free-icons/CubeIcon";
 import File01Icon from "@hugeicons/core-free-icons/File01Icon";
 import Tick02Icon from "@hugeicons/core-free-icons/Tick02Icon";
 import MailSend01Icon from "@hugeicons/core-free-icons/MailSend01Icon";
 import ContrastIcon from "@hugeicons/core-free-icons/ContrastIcon";
+import SecondaryViews from "./SecondaryViews.jsx";
+
+const sections = [
+  "Home",
+  "Library",
+  "Runs",
+  "Needs you",
+  "Automations",
+  "Workflows",
+  "Settings",
+];
+const lanes = {
+  draft: "Drafting",
+  review: "In review",
+  waiting: "Waiting",
+  scheduled: "Scheduled",
+  published: "Published",
+};
+const started = new Date().toLocaleTimeString();
 function Glyph({ icon }) {
   return (
     <HugeiconsIcon
@@ -18,29 +37,485 @@ function Glyph({ icon }) {
     />
   );
 }
-const views = {
-  library: { label: "Library", title: "Content library", icon: File01Icon },
-  review: {
-    label: "Review",
-    title: "Drafts awaiting review",
-    icon: Tick02Icon,
-  },
-  "local-outbox": {
-    label: "Local outbox",
-    title: "Local outbox",
-    icon: MailSend01Icon,
-  },
-};
-const started = new Date().toLocaleString();
+function Media({ name, className = "" }) {
+  return (
+    <div className={`fixture-media ${className}`}>
+      <Glyph icon={File01Icon} />
+      <strong>{name || "No media"}</strong>
+      <span>Fixture placeholder</span>
+    </div>
+  );
+}
+function Badge({ post }) {
+  return (
+    <span className={`badge status-${post.status}`}>
+      {post.needsYou ? "Needs you" : lanes[post.status]}
+      {post.status === "scheduled" || post.status === "published"
+        ? " · fixture"
+        : ""}
+    </span>
+  );
+}
+function Drawer({ title, children, onClose, wide = false }) {
+  const panel = useRef(null);
+  useEffect(() => {
+    const previous = document.activeElement;
+    panel.current.querySelector("button")?.focus();
+    function key(event) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onClose();
+      }
+      if (event.key !== "Tab") return;
+      const nodes = [
+        ...panel.current.querySelectorAll(
+          "button:not(:disabled),input:not(:disabled),select:not(:disabled),textarea:not(:disabled),a[href],summary",
+        ),
+      ];
+      const first = nodes[0],
+        last = nodes.at(-1);
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last?.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first?.focus();
+      }
+    }
+    document.addEventListener("keydown", key);
+    return () => {
+      document.removeEventListener("keydown", key);
+      previous?.focus();
+    };
+  }, []);
+  return (
+    <div
+      className="drawer-scrim"
+      onClick={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <section
+        className={`app-drawer ${wide ? "wide" : ""}`}
+        ref={panel}
+        role="dialog"
+        aria-modal="true"
+        aria-label={title}
+      >
+        <header className="drawer-head">
+          <h2>{title}</h2>
+          <button
+            className="btn btn-sm"
+            onClick={onClose}
+            aria-label={`Close ${title}`}
+          >
+            Close
+          </button>
+        </header>
+        {children}
+      </section>
+    </div>
+  );
+}
+function SourceDrawer({ source, posts, onClose, onPost }) {
+  const [image, setImage] = useState(0);
+  return (
+    <Drawer title={`Source ${source.id}`} onClose={onClose}>
+      <div className="drawer-content">
+        <Media name={source.media[image]} />
+        {source.media.length > 1 && (
+          <div className="row">
+            <button
+              className="btn"
+              onClick={() =>
+                setImage(
+                  (image + source.media.length - 1) % source.media.length,
+                )
+              }
+            >
+              Previous media
+            </button>
+            <span className="num">
+              {image + 1}/{source.media.length}
+            </span>
+            <button
+              className="btn"
+              onClick={() => setImage((image + 1) % source.media.length)}
+            >
+              Next media
+            </button>
+          </div>
+        )}
+        <div className="row">
+          <span className="chip tone">{source.platform}</span>
+          <span className="chip tone b-acc">{source.brand}</span>
+          <span className="muted">{source.age}</span>
+        </div>
+        <p className="source-copy">{source.text}</p>
+        <p className="muted">
+          Immutable fixture source · {source.media.length} media items · Source
+          URL and live engagement statistics unavailable.
+        </p>
+        <h3>Derived drafts</h3>
+        {posts
+          .filter((p) => p.sourceId === source.id)
+          .map((p) => (
+            <button
+              className="btn btn-full"
+              key={p.id}
+              onClick={() => onPost(p.id)}
+            >
+              {p.id} · r{p.revision} · {lanes[p.status]}
+            </button>
+          ))}
+      </div>
+    </Drawer>
+  );
+}
+function Editor({ post, source, run, act, onClose, readonly }) {
+  const [caption, setCaption] = useState(post.caption);
+  const [time, setTime] = useState(post.scheduleAt);
+  const [destinations, setDestinations] = useState(post.destinations);
+  const [instruction, setInstruction] = useState("");
+  const [message, setMessage] = useState("");
+  useEffect(() => {
+    setCaption(post.caption);
+    setTime(post.scheduleAt);
+    setDestinations(post.destinations);
+  }, [post.revision]);
+  function change(fn, text) {
+    if (act(fn)) setMessage(text);
+  }
+  const dirty = caption !== post.caption;
+  const planDirty =
+    time !== post.scheduleAt ||
+    JSON.stringify(destinations) !== JSON.stringify(post.destinations);
+  return (
+    <Drawer title={`Post ${post.id}`} wide onClose={onClose}>
+      <div className="editor-summary">
+        <Badge post={post} />
+        <span className="num">
+          r{post.revision} · from {post.sourceId}
+          {run ? ` · ${run.id}` : ""}
+        </span>
+        {post.needsYou && <span className="badge b-fail">{post.needsYou}</span>}
+      </div>
+      <div className="editor-grid">
+        <section className="editor-fields">
+          <div className="card pad">
+            <div className="row">
+              <label htmlFor="caption" className="slabel">
+                Caption · r{post.revision}
+              </label>
+              {post.lease && (
+                <>
+                  <span className="badge b-warn">
+                    Simulated writer is drafting…
+                  </span>
+                  <button
+                    className="btn btn-sm"
+                    disabled={readonly}
+                    onClick={() =>
+                      change(
+                        () => studio.takeOver(post.id),
+                        "Simulated lease taken over.",
+                      )
+                    }
+                  >
+                    Take over
+                  </button>
+                </>
+              )}
+            </div>
+            <textarea
+              className="field"
+              id="caption"
+              value={caption}
+              maxLength={2200}
+              disabled={readonly || post.lease}
+              onChange={(e) => setCaption(e.target.value)}
+            />
+            <p className="muted">
+              {caption.length}/2200 characters · Protected terms are not
+              live-validated.
+            </p>
+            <div className="row">
+              <button
+                className="btn btn-primary"
+                disabled={readonly || post.lease || !dirty}
+                onClick={() =>
+                  change(
+                    () => studio.edit(post.id, caption, post.revision),
+                    "New revision by you. Local review and approval invalidated.",
+                  )
+                }
+              >
+                Save revision
+              </button>
+              <button
+                className="btn"
+                disabled={!dirty}
+                onClick={() => setCaption(post.caption)}
+              >
+                Discard
+              </button>
+            </div>
+          </div>
+          <div className="card pad">
+            <h3>Image · fixture media</h3>
+            <Media name={post.media[0]} />
+            <div className="row">
+              <button
+                className="btn"
+                disabled
+                title="Uploads need the production asset SDK"
+              >
+                Upload unavailable
+              </button>
+              <button
+                className="btn"
+                disabled={readonly}
+                onClick={() =>
+                  change(
+                    () =>
+                      studio.material(
+                        post.id,
+                        { media: ["local sample image"] },
+                        post.revision,
+                      ),
+                    "Fixture image revised. Review again.",
+                  )
+                }
+              >
+                Use fixture image
+              </button>
+            </div>
+          </div>
+          <div className="card pad">
+            <label htmlFor="instruction" className="slabel">
+              Ask the agent · simulated
+            </label>
+            <div className="row">
+              <input
+                className="field"
+                id="instruction"
+                value={instruction}
+                onChange={(e) => setInstruction(e.target.value)}
+                placeholder="Make it shorter, more playful…"
+              />
+              <button
+                className="btn"
+                disabled={readonly || !instruction.trim() || post.lease}
+                onClick={() =>
+                  change(
+                    () => studio.ask(post.id, instruction, post.revision),
+                    "Fixture writer revision appended your instruction; no AI ran.",
+                  )
+                }
+              >
+                Simulate ask
+              </button>
+            </div>
+            <p className="muted">
+              Appends your instruction unchanged; inspect history for the diff.
+            </p>
+            <button
+              className="btn btn-sm"
+              disabled={readonly || post.history.length < 2}
+              onClick={() =>
+                change(
+                  () => studio.undo(post.id, post.revision),
+                  "Undo recorded as a new revision; approval remains invalid.",
+                )
+              }
+            >
+              Undo caption as revision
+            </button>
+          </div>
+          <div className="card pad">
+            <h3>Time & destinations</h3>
+            <label htmlFor="schedule-at">
+              Local planning time · {fixtureTimeZone}
+            </label>
+            <input
+              id="schedule-at"
+              className="field"
+              type="datetime-local"
+              value={time}
+              onChange={(e) => setTime(e.target.value)}
+              disabled={readonly}
+            />
+            <div className="row destinations">
+              {["instagram", "facebook", "web"].map((destination) => (
+                <label key={destination}>
+                  <input
+                    type="checkbox"
+                    checked={destinations.includes(destination)}
+                    disabled={readonly}
+                    onChange={(e) =>
+                      setDestinations(
+                        e.target.checked
+                          ? [...destinations, destination]
+                          : destinations.filter((d) => d !== destination),
+                      )
+                    }
+                  />{" "}
+                  {destination}
+                </label>
+              ))}
+            </div>
+            <button
+              className="btn"
+              disabled={readonly || !planDirty}
+              onClick={() =>
+                change(
+                  () =>
+                    studio.material(
+                      post.id,
+                      { scheduleAt: time, destinations },
+                      post.revision,
+                    ),
+                  "Local planning revised. Material review and approval invalidated.",
+                )
+              }
+            >
+              Save local plan
+            </button>
+            <p className="muted">
+              Planning only. No external scheduler or delivery is created.
+            </p>
+          </div>
+          <div className="card pad">
+            <h3>Review & local staging</h3>
+            <div className="row">
+              <button
+                className="btn"
+                disabled={
+                  readonly ||
+                  dirty ||
+                  planDirty ||
+                  post.lease ||
+                  post.reviewedRevision === post.revision
+                }
+                onClick={() =>
+                  change(
+                    () => studio.review(post.id, post.revision),
+                    "Current material revision reviewed locally.",
+                  )
+                }
+              >
+                Mark reviewed
+              </button>
+              <button
+                className="btn"
+                disabled={
+                  readonly ||
+                  dirty ||
+                  planDirty ||
+                  post.reviewedRevision !== post.revision ||
+                  !post.scheduleAt ||
+                  post.approvalRevision === post.revision
+                }
+                onClick={() =>
+                  change(
+                    () => studio.approvePlan(post.id, post.revision),
+                    "Local plan approval pinned to this material revision.",
+                  )
+                }
+              >
+                Approve local plan
+              </button>
+              <button
+                className="btn btn-primary"
+                disabled={
+                  readonly ||
+                  dirty ||
+                  planDirty ||
+                  post.approvalRevision !== post.revision ||
+                  !!post.outbox
+                }
+                onClick={() =>
+                  change(
+                    () => studio.stage(post.id, post.revision),
+                    "Simulation recorded · No external receipt · Nothing published.",
+                  )
+                }
+              >
+                Stage locally
+              </button>
+            </div>
+            {post.outbox && (
+              <p className="notice" role="status">
+                Simulation recorded · No external receipt · Nothing published.
+              </p>
+            )}
+            <p className="muted">
+              Caption, media, date/time or destination edits void this
+              revision’s local review and approval.
+            </p>
+          </div>
+          {message && (
+            <p className="notice" role="status">
+              {message}
+            </p>
+          )}
+        </section>
+        <section className="social-preview">
+          <p className="slabel">Preview · fixture</p>
+          <div className="card">
+            <header className="preview-head">
+              <strong>{post.brand || "No brand context"}</strong>
+              <span className="muted">Local preview</span>
+            </header>
+            <Media name={post.media[0]} />
+            <div className="preview-caption">
+              <p>{caption}</p>
+              <p className="num muted">
+                {post.scheduleAt || "Unplanned"} ·{" "}
+                {post.destinations.join(" + ")}
+              </p>
+            </div>
+          </div>
+          <p className="muted">
+            External receipts: none. Seed published states are illustrative
+            only.
+          </p>
+          <details>
+            <summary>Original source</summary>
+            <p>{source?.text}</p>
+          </details>
+        </section>
+        <section className="history">
+          <p className="slabel">History</p>
+          <div className="card pad">
+            {post.history.map((entry) => (
+              <article key={entry.revision}>
+                <div className="row">
+                  <strong className="num">r{entry.revision}</strong>
+                  <span className="chip tone">{entry.by}</span>
+                </div>
+                <p>{entry.caption}</p>
+                <small className="muted">{entry.note}</small>
+              </article>
+            ))}
+          </div>
+        </section>
+      </div>
+    </Drawer>
+  );
+}
 export default function SocialContent() {
-  const [posts, setPosts] = useState(sdk.read),
-    [selected, setSelected] = useState("fixture-1");
-  const [source, setSource] = useState(""),
-    [brand, setBrand] = useState("No brand context");
-  const [caption, setCaption] = useState(posts[0]?.caption || ""),
-    [error, setError] = useState("");
-  const [tab, setTab] = useState("library"),
-    [scenario, setScenario] = useState("normal");
+  const [snapshot, setSnapshot] = useState(studio.read);
+  const [view, setView] = useState("Home");
+  const [context, setContext] = useState("all");
+  const [scenario, setScenario] = useState("normal");
+  const [mode, setMode] = useState("Calendar");
+  const [week, setWeek] = useState(0);
+  const [newOnly, setNewOnly] = useState(true);
+  const [selection, setSelection] = useState([]);
+  const [drawer, setDrawer] = useState(null);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
   const [theme, setTheme] = useState(() => {
     try {
       const saved = window.localStorage.getItem("cadence-theme");
@@ -49,340 +524,710 @@ export default function SocialContent() {
       return "system";
     }
   });
+  const readonly = scenario === "readonly";
+  function act(fn) {
+    try {
+      fn();
+      setSnapshot(studio.read());
+      setError("");
+      return true;
+    } catch (e) {
+      setError(e.message);
+      return false;
+    }
+  }
   function cycleTheme() {
     const next = { system: "light", light: "dark", dark: "system" }[theme];
     try {
       if (next === "system") window.localStorage.removeItem("cadence-theme");
       else window.localStorage.setItem("cadence-theme", next);
     } catch {
-      /* Storage unavailable: the selection lasts for this page. */
+      /* page-only preference */
     }
     if (next === "system")
       document.documentElement.removeAttribute("data-theme");
     else document.documentElement.setAttribute("data-theme", next);
     setTheme(next);
   }
-  const post = posts.find((p) => p.id === selected);
-  const act = (fn) => {
-    try {
-      fn();
-      setPosts(sdk.read());
-      setError("");
-    } catch (e) {
-      setError(e.message);
-    }
-  };
-  const choose = (p) => {
-    setSelected(p.id);
-    setCaption(p.caption);
-  };
+  function openPost(id) {
+    setDrawer({ kind: "post", id });
+  }
+  const sources = snapshot.sources.filter(
+    (source) => context === "all" || source.brand === context,
+  );
+  const posts = snapshot.posts.filter(
+    (post) => context === "all" || post.brand === context,
+  );
+  const needs = posts.filter(
+    (post) => post.needsYou || post.status === "waiting",
+  );
+  const start = new Date(`${fixtureWeek}T12:00:00Z`);
+  start.setUTCDate(start.getUTCDate() + week * 7);
+  const days = Array.from({ length: 7 }, (_, index) => {
+    const day = new Date(start);
+    day.setUTCDate(start.getUTCDate() + index);
+    return day;
+  });
+  const dateKey = (date) => date.toISOString().slice(0, 10);
+  function card(post) {
+    return (
+      <button
+        className={`post-card card status-${post.status}`}
+        key={post.id}
+        onClick={() => openPost(post.id)}
+      >
+        <small className="num muted">
+          {post.scheduleAt.slice(11) || "Unplanned"} · {post.id}
+        </small>
+        <span>{post.caption.slice(0, 70)}</span>
+        <Badge post={post} />
+      </button>
+    );
+  }
+  const currentPost =
+    drawer?.kind === "post"
+      ? snapshot.posts.find((post) => post.id === drawer.id)
+      : null;
   return (
-    <>
-      <div className="shell app-shell">
-        <aside className="side app-side">
-          <a href="/" className="brand">
-            <Glyph icon={CubeIcon} /> cadence <small>apps</small>
-          </a>
-          <div className="side-label slabel">Social Content</div>
-          <nav className="nav" aria-label="App views">
-            {["library", "review", "local-outbox"].map((t) => (
-              <button
-                key={t}
-                className="navlink"
-                aria-current={tab === t ? "page" : undefined}
-                onClick={() => setTab(t)}
-              >
-                <Glyph icon={views[t].icon} />
-                {views[t].label}
-                <span className="chip nav-count">
-                  {
-                    posts.filter((p) => t === "library" || p.status === t)
-                      .length
-                  }
-                </span>
-              </button>
-            ))}
-          </nav>
-          <div className="scenario side-foot">
-            <label htmlFor="scenario">Preview state</label>
-            <select
-              className="field"
-              id="scenario"
-              value={scenario}
-              onChange={(e) => setScenario(e.target.value)}
-            >
-              <option value="normal">Working fixtures</option>
-              <option value="loading">Loading</option>
-              <option value="empty">Empty</option>
-              <option value="error">Error</option>
-              <option value="readonly">Read-only</option>
-            </select>
+    <div className="shell app-shell">
+      <aside className="side app-side">
+        <a className="brand" href="/">
+          <Glyph icon={CubeIcon} /> cadence <small>apps</small>
+        </a>
+        <div className="nav">
+          <span className="navlink" aria-current="page">
+            <Glyph icon={CubeIcon} /> Apps
+          </span>
+        </div>
+        <div className="side-label slabel">Social Content</div>
+        <p className="muted side-description">
+          Private app development.
+          <br />
+          No production connection.
+        </p>
+        <div className="side-foot">
+          <span className="slabel">Development · Fixtures only</span>
+          <label htmlFor="scenario">Preview state</label>
+          <select
+            className="field"
+            id="scenario"
+            value={scenario}
+            onChange={(e) => setScenario(e.target.value)}
+          >
+            <option value="normal">Working fixtures</option>
+            <option value="loading">Loading</option>
+            <option value="empty">Empty</option>
+            <option value="error">Error</option>
+            <option value="readonly">Read-only</option>
+          </select>
+          <button
+            className="btn btn-sm"
+            onClick={() => {
+              act(() => studio.reset());
+              setSelection([]);
+              setDrawer(null);
+              setScenario("normal");
+            }}
+          >
+            Reset fixtures
+          </button>
+        </div>
+      </aside>
+      <div className="main">
+        <header className="topbar">
+          <div className="crumb">
+            cadence / apps / <b>social-content</b>
+          </div>
+          <div className="spacer">
+            <span className="chip tone b-warn">Fixtures only</span>
             <button
-              className="btn btn-sm"
-              onClick={() =>
-                act(() => {
-                  sdk.reset(fixtures);
-                  setSelected("fixture-1");
-                  setCaption(fixtures[0].caption);
-                  setScenario("normal");
-                })
-              }
+              className="tg"
+              onClick={cycleTheme}
+              aria-label={`Theme: ${theme}. Change theme`}
+              title={`Theme: ${theme}`}
             >
-              Reset fixtures
+              <Glyph icon={ContrastIcon} />
             </button>
           </div>
-        </aside>
-        <div className="main">
-          <header className="topbar">
-            <div className="crumb">
-              cadence / apps / <b>Social Content</b>
-            </div>
-            <div className="spacer">
-              <span className="chip tone b-warn">Fixtures only</span>
-              <button
-                className="tg"
-                onClick={cycleTheme}
-                aria-label={`Theme: ${theme}. Change theme`}
-                title={`Theme: ${theme}`}
+        </header>
+        <div className="dev-banner">
+          <span>
+            Development · Fixtures only · No agents, credentials or external
+            delivery.
+          </span>
+          <small className="num">
+            Source base {__APP_DEV_REVISION__} · Live working tree · {started}
+          </small>
+        </div>
+        <div className="body no-rail">
+          <main className="content app-content">
+            <nav className="tabs app-tabs" aria-label="Content studio sections">
+              {sections.map((section) => (
+                <button
+                  key={section}
+                  className={`tab ${view === section ? "on" : ""}`}
+                  aria-current={view === section ? "page" : undefined}
+                  onClick={() => {
+                    setView(section);
+                    setNotice("");
+                  }}
+                >
+                  {section}
+                  {section === "Needs you" && (
+                    <span className="chip tone b-fail">{needs.length}</span>
+                  )}
+                </button>
+              ))}
+            </nav>
+            <div className="context-row">
+              <label htmlFor="context" className="sr-only">
+                Optional brand context
+              </label>
+              <select
+                id="context"
+                className="field context-select"
+                value={context}
+                onChange={(e) => setContext(e.target.value)}
               >
-                <Glyph icon={ContrastIcon} />
+                <option value="all">All brand contexts</option>
+                <option>Kura Ramen</option>
+                <option>Velvet Padel</option>
+              </select>
+              <span className="kicker">content studio · fixture planning</span>
+              <button
+                className="btn btn-sm"
+                disabled
+                title="Blog workflow integration is unavailable in this fixture preview"
+              >
+                Write a blog post
               </button>
             </div>
-          </header>
-          <aside className="dev-banner">
-            <span className="badge b-warn">Development · Fixtures only</span>
-            <span>
-              No agents, credentials, external publishing or production
-              approvals. Live backend unavailable.
-            </span>
-            <small className="num">
-              Source base {__APP_DEV_REVISION__} · Live working tree · Started{" "}
-              {started}
-            </small>
-          </aside>
-          <div className="body no-rail">
-            <main className="content app-content">
-              <header className="page-head">
-                <p className="slabel">SOCIAL CONTENT / {tab.toUpperCase()}</p>
-                <h2>{views[tab].title}</h2>
-                <p className="muted">
-                  Local development flow · App-owned source · No mandatory
-                  project
-                </p>
-              </header>
-              <nav className="tabs" aria-label="Content views">
-                {["library", "review", "local-outbox"].map((view) => (
-                  <button
-                    key={view}
-                    className={`tab ${tab === view ? "on" : ""}`}
-                    aria-current={tab === view ? "page" : undefined}
-                    onClick={() => setTab(view)}
-                  >
-                    {views[view].label}
-                  </button>
+            {error && (
+              <p className="error" role="alert">
+                {error}
+              </p>
+            )}
+            {notice && (
+              <p className="notice" role="status">
+                {notice}
+              </p>
+            )}
+            {readonly && (
+              <p className="notice">
+                Read-only preview: local edits are disabled.
+              </p>
+            )}
+            {scenario === "loading" ? (
+              <div
+                className="skeleton-grid"
+                role="status"
+                aria-label="Loading simulated records"
+              >
+                {[1, 2, 3].map((n) => (
+                  <div className="skeleton card" key={n} />
                 ))}
-              </nav>
-              {scenario === "loading" ? (
-                <p role="status">Loading simulated drafts…</p>
-              ) : scenario === "error" ? (
-                <div role="alert" className="error">
-                  Simulated API error.{" "}
-                  <button className="btn" onClick={() => setScenario("normal")}>
-                    Retry fixtures
-                  </button>
-                </div>
-              ) : scenario === "empty" ? (
-                <div className="empty">
-                  <h3>Your canvas is clear.</h3>
-                  <p>Create a draft from source text to begin.</p>
-                  <button className="btn" onClick={() => setScenario("normal")}>
-                    Return to fixtures
-                  </button>
-                </div>
-              ) : (
-                <>
-                  {scenario === "readonly" && (
-                    <p className="notice">
-                      Read-only preview: local edits are disabled.
-                    </p>
-                  )}
-                  {tab === "library" && (
-                    <form
-                      className="create card pad"
-                      onSubmit={(e) => {
-                        e.preventDefault();
-                        act(() => {
-                          const p = sdk.create(source, brand);
-                          choose(p);
-                          setSource("");
-                        });
-                      }}
-                    >
-                      <div>
-                        <label htmlFor="source">Source text</label>
-                        <textarea
-                          className="field"
-                          id="source"
-                          name="source"
-                          required
-                          maxLength={4000}
-                          value={source}
-                          disabled={scenario === "readonly"}
-                          onChange={(e) => setSource(e.target.value)}
-                          placeholder="What would you like to share?"
-                        />
-                      </div>
-                      <div>
-                        <label htmlFor="brand">
-                          Brand context (optional fixture)
-                        </label>
-                        <select
-                          className="field"
-                          id="brand"
-                          value={brand}
-                          disabled={scenario === "readonly"}
-                          onChange={(e) => setBrand(e.target.value)}
-                        >
-                          <option>No brand context</option>
-                          <option>Harbour studio</option>
-                        </select>
-                        <p className="muted">
-                          Source is copied unchanged. No generated copy or image
-                          is claimed.
-                        </p>
-                        <button
-                          className="btn btn-primary"
-                          disabled={scenario === "readonly"}
-                          type="submit"
-                        >
-                          Create local draft →
-                        </button>
-                      </div>
-                    </form>
-                  )}
-                  {error && (
-                    <p role="alert" className="error">
-                      {error}
-                    </p>
-                  )}
-                  <div className="draft-workspace">
-                    <section aria-label="Draft library" className="draft-list">
-                      {posts
-                        .filter((p) => tab === "library" || p.status === tab)
-                        .map((p) => (
+              </div>
+            ) : scenario === "error" ? (
+              <div className="error" role="alert">
+                Simulated fixture read error.{" "}
+                <button className="btn" onClick={() => setScenario("normal")}>
+                  Retry fixtures
+                </button>
+              </div>
+            ) : scenario === "empty" ? (
+              <div className="empty">
+                <h2>No fixture records in this scenario</h2>
+                <button className="btn" onClick={() => setScenario("normal")}>
+                  Return to fixtures
+                </button>
+              </div>
+            ) : (
+              <>
+                {view === "Home" && (
+                  <>
+                    <div className="section-toolbar">
+                      <h2>Schedule</h2>
+                      <div className="tabs mode-tabs">
+                        {["Calendar", "Board"].map((value) => (
                           <button
-                            className={`draft card tcard ${selected === p.id ? "selected" : ""}`}
-                            key={p.id}
-                            onClick={() => choose(p)}
+                            key={value}
+                            className={`tab ${mode === value ? "on" : ""}`}
+                            aria-pressed={mode === value}
+                            onClick={() => setMode(value)}
                           >
-                            <span className="draft-art" aria-hidden="true">
-                              SC
-                              <span>{String(p.revision).padStart(2, "0")}</span>
-                            </span>
-                            <span className="draft-meta">
-                              <small>
-                                {p.brand} · revision {p.revision}
-                              </small>
-                              <strong>{p.caption.slice(0, 80)}</strong>
-                              <span className="badge b-acc">
-                                {p.status === "local-outbox"
-                                  ? "Local outbox · simulation"
-                                  : p.status}
-                              </span>
-                            </span>
+                            {value}
                           </button>
                         ))}
-                      {posts.filter(
-                        (p) => tab === "library" || p.status === tab,
-                      ).length === 0 && (
-                        <p className="muted">No drafts in this view.</p>
-                      )}
-                    </section>
-                    {post && (
-                      <section
-                        className="editor card pad"
-                        aria-label="Draft editor"
+                      </div>
+                      <span className="spacer" />
+                      <div className="week-nav">
+                        <button
+                          className="btn btn-sm"
+                          onClick={() => setWeek(week - 1)}
+                          aria-label="Previous week"
+                        >
+                          ←
+                        </button>
+                        <button
+                          className="btn btn-sm"
+                          onClick={() => setWeek(0)}
+                        >
+                          This week
+                        </button>
+                        <button
+                          className="btn btn-sm"
+                          onClick={() => setWeek(week + 1)}
+                          aria-label="Next week"
+                        >
+                          →
+                        </button>
+                      </div>
+                    </div>
+                    <p className="kicker">
+                      {dateKey(days[0])} — {dateKey(days[6])} ·{" "}
+                      {fixtureTimeZone} · local plans only
+                    </p>
+                    <div className="schedule-layout">
+                      <div
+                        className={`schedule-view ${mode.toLowerCase()}`}
+                        key={mode}
                       >
-                        <div className="editor-head">
-                          <h3>Draft / {post.id}</h3>
-                          <span className="badge b-acc">
-                            r{post.revision} · {post.status}
-                          </span>
+                        {mode === "Calendar" ? (
+                          days.map((day) => (
+                            <section
+                              className="calendar-day card"
+                              key={dateKey(day)}
+                            >
+                              <header>
+                                <span className="slabel">
+                                  {day.toLocaleDateString(undefined, {
+                                    weekday: "short",
+                                    timeZone: "UTC",
+                                  })}
+                                </span>
+                                <span className="num">{day.getUTCDate()}</span>
+                              </header>
+                              {posts
+                                .filter((post) =>
+                                  post.scheduleAt.startsWith(dateKey(day)),
+                                )
+                                .map(card)}
+                            </section>
+                          ))
+                        ) : (
+                          <>
+                            {Object.entries(lanes).map(([state, label]) => (
+                              <section className="board-lane" key={state}>
+                                <header className="row">
+                                  <h3>{label}</h3>
+                                  <span className="chip tone num">
+                                    {
+                                      posts.filter(
+                                        (post) =>
+                                          post.status === state &&
+                                          !post.needsYou,
+                                      ).length
+                                    }
+                                  </span>
+                                </header>
+                                {posts
+                                  .filter(
+                                    (post) =>
+                                      post.status === state && !post.needsYou,
+                                  )
+                                  .map(card)}
+                              </section>
+                            ))}
+                            {posts.some((post) => post.needsYou) && (
+                              <section className="board-lane">
+                                <h3>
+                                  Needs you{" "}
+                                  <span className="chip tone b-fail">
+                                    {
+                                      posts.filter((post) => post.needsYou)
+                                        .length
+                                    }
+                                  </span>
+                                </h3>
+                                {posts
+                                  .filter((post) => post.needsYou)
+                                  .map(card)}
+                              </section>
+                            )}
+                          </>
+                        )}
+                      </div>
+                      <aside className="suggestions-rail">
+                        <section className="card pad">
+                          <h3>Needs you · {needs.length}</h3>
+                          {needs.map((post) => (
+                            <button
+                              className="lnk needs-link"
+                              key={post.id}
+                              onClick={() => openPost(post.id)}
+                            >
+                              {post.id} ·{" "}
+                              {post.needsYou ||
+                                "Local schedule digest awaiting approval"}
+                            </button>
+                          ))}
+                        </section>
+                        <h3 className="slabel">
+                          Suggestions · {snapshot.suggestions.length}
+                        </h3>
+                        {snapshot.suggestions
+                          .filter((s) => posts.some((p) => p.id === s.postId))
+                          .map((suggestion) => (
+                            <section
+                              className="card pad suggestion"
+                              key={suggestion.id}
+                            >
+                              <span className="chip tone">
+                                editor · fixture
+                              </span>
+                              <p>{suggestion.text}</p>
+                              <small className="muted">{suggestion.note}</small>
+                              <div className="row">
+                                <button
+                                  className="btn btn-primary"
+                                  disabled={readonly}
+                                  onClick={() => {
+                                    if (
+                                      act(() =>
+                                        studio.suggestion(suggestion.id, true),
+                                      )
+                                    )
+                                      setNotice(
+                                        "Fixture suggestion accepted as a new revision by you.",
+                                      );
+                                  }}
+                                >
+                                  Accept
+                                </button>
+                                <button
+                                  className="btn"
+                                  disabled={readonly}
+                                  onClick={() => {
+                                    if (
+                                      act(() =>
+                                        studio.suggestion(suggestion.id, false),
+                                      )
+                                    )
+                                      setNotice("Fixture suggestion rejected.");
+                                  }}
+                                >
+                                  Reject
+                                </button>
+                                <button
+                                  className="lnk"
+                                  onClick={() => openPost(suggestion.postId)}
+                                >
+                                  Open post
+                                </button>
+                              </div>
+                            </section>
+                          ))}
+                      </aside>
+                    </div>
+                  </>
+                )}
+                {view === "Library" && (
+                  <>
+                    <h2>
+                      Library <span className="kicker">source posts</span>
+                    </h2>
+                    <div className="section-toolbar">
+                      <button
+                        className={`btn ${newOnly ? "btn-primary" : ""}`}
+                        aria-pressed={newOnly}
+                        onClick={() => setNewOnly(!newOnly)}
+                      >
+                        New only{newOnly ? " ✓" : ""}
+                      </button>
+                      <span className="muted">
+                        {selection.length
+                          ? `${selection.length} selected`
+                          : `${sources.filter((s) => !newOnly || s.isNew).length} of ${sources.length} shown`}
+                      </span>
+                      <span className="spacer" />
+                      {selection.length > 0 && (
+                        <button
+                          className="btn"
+                          onClick={() => setSelection([])}
+                        >
+                          Clear selection
+                        </button>
+                      )}
+                      <button
+                        className="btn btn-primary"
+                        disabled={readonly || !selection.length}
+                        onClick={() => {
+                          let run;
+                          if (
+                            act(() => {
+                              run = studio.batch(
+                                selection,
+                                context === "all" ? "" : context,
+                              );
+                            })
+                          ) {
+                            setSelection([]);
+                            setView("Runs");
+                            setNotice(
+                              `${run.id}: ${run.items.length} fixture drafts copied from immutable sources. No agent ran.`,
+                            );
+                          }
+                        }}
+                      >
+                        {selection.length
+                          ? `Draft ${selection.length} posts`
+                          : "Draft posts"}
+                      </button>
+                    </div>
+                    <div className="source-grid">
+                      {sources
+                        .filter((source) => !newOnly || source.isNew)
+                        .map((source) => (
+                          <article className="card source-card" key={source.id}>
+                            <label className="source-select">
+                              <input
+                                type="checkbox"
+                                aria-label={`Select source ${source.id}`}
+                                checked={selection.includes(source.id)}
+                                disabled={readonly}
+                                onChange={(e) =>
+                                  setSelection(
+                                    e.target.checked
+                                      ? [...selection, source.id]
+                                      : selection.filter(
+                                          (id) => id !== source.id,
+                                        ),
+                                  )
+                                }
+                              />
+                            </label>
+                            <button
+                              className="source-inspect"
+                              aria-label={`Inspect source ${source.id}`}
+                              onClick={() =>
+                                setDrawer({ kind: "source", id: source.id })
+                              }
+                            >
+                              <Media name={source.media[0]} />
+                              <div className="source-card-copy">
+                                <p>{source.text}</p>
+                                <div className="row">
+                                  <span className="chip tone">
+                                    {source.platform}
+                                  </span>
+                                  {source.isNew && (
+                                    <span className="chip tone b-acc">new</span>
+                                  )}
+                                  <span className="num muted age">
+                                    {source.age}
+                                  </span>
+                                </div>
+                              </div>
+                            </button>
+                          </article>
+                        ))}
+                    </div>
+                  </>
+                )}
+                {view === "Runs" && (
+                  <>
+                    <h2>
+                      Runs <span className="kicker">local fixture batches</span>
+                    </h2>
+                    {snapshot.runs.length === 0 ? (
+                      <div className="empty">
+                        <p>
+                          Select Library source cards to start a fixture batch.
+                        </p>
+                        <button
+                          className="btn"
+                          onClick={() => setView("Library")}
+                        >
+                          Open Library
+                        </button>
+                      </div>
+                    ) : (
+                      snapshot.runs.map((run) => (
+                        <section className="card pad run-card" key={run.id}>
+                          <div className="row">
+                            <h3>
+                              {run.id} · {run.label}
+                            </h3>
+                            <span className="badge b-info">{run.status}</span>
+                          </div>
+                          <p className="muted">
+                            {run.items.length} copied ·{" "}
+                            {
+                              run.items.filter(
+                                (item) =>
+                                  snapshot.posts.find(
+                                    (p) => p.id === item.postId,
+                                  )?.reviewedRevision,
+                              ).length
+                            }{" "}
+                            reviewed · no agent execution
+                          </p>
+                          <progress
+                            max={run.items.length}
+                            value={run.items.length}
+                            aria-label={`${run.id} copied sources`}
+                          />
+                          <table className="tbl">
+                            <thead>
+                              <tr>
+                                <th>Source → draft</th>
+                                <th>Copy</th>
+                                <th>Review</th>
+                                <th>Local plan</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {run.items.map((item) => {
+                                const value = snapshot.posts.find(
+                                  (p) => p.id === item.postId,
+                                );
+                                return (
+                                  <tr key={item.postId}>
+                                    <td>
+                                      <button
+                                        className="lnk"
+                                        onClick={() => openPost(item.postId)}
+                                      >
+                                        {item.sourceId} → {item.postId}
+                                      </button>
+                                    </td>
+                                    <td>Copied</td>
+                                    <td>
+                                      {value.reviewedRevision === value.revision
+                                        ? "Reviewed"
+                                        : "Needs review"}
+                                    </td>
+                                    <td>
+                                      {value.approvalRevision === value.revision
+                                        ? "Approved locally"
+                                        : "Unapproved"}
+                                    </td>
+                                  </tr>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                          <details>
+                            <summary>Fixture run log</summary>
+                            {run.log.map((line, index) => (
+                              <p key={index}>{line}</p>
+                            ))}
+                          </details>
+                        </section>
+                      ))
+                    )}
+                  </>
+                )}
+                {view === "Needs you" && (
+                  <>
+                    <h2>
+                      Needs you{" "}
+                      <span className="kicker">
+                        local digest & illustrative verification
+                      </span>
+                    </h2>
+                    {needs.length === 0 && (
+                      <div className="empty">No local decisions waiting.</div>
+                    )}
+                    {needs.map((post) => (
+                      <section className="card pad digest-card" key={post.id}>
+                        <div className="row">
+                          <h3>
+                            {post.id} · r{post.revision}
+                          </h3>
+                          <Badge post={post} />
                         </div>
-                        <label htmlFor="caption">Caption</label>
-                        <textarea
-                          className="field"
-                          id="caption"
-                          value={caption}
-                          maxLength={4000}
-                          disabled={scenario === "readonly"}
-                          onChange={(e) => setCaption(e.target.value)}
-                        />
-                        <div className="editor-actions">
+                        <p>{post.caption}</p>
+                        <p className="num muted">
+                          {post.scheduleAt || "Unplanned"} ·{" "}
+                          {post.destinations.join(" + ")}
+                        </p>
+                        {post.needsYou && (
+                          <p className="error">{post.needsYou}</p>
+                        )}
+                        <div className="row">
                           <button
                             className="btn"
-                            disabled={
-                              scenario === "readonly" ||
-                              caption === post.caption
-                            }
-                            onClick={() =>
-                              act(() => sdk.edit(post.id, caption))
-                            }
+                            onClick={() => openPost(post.id)}
                           >
-                            Save revision
+                            Open post
                           </button>
                           <button
                             className="btn"
-                            disabled={
-                              scenario === "readonly" ||
-                              caption !== post.caption ||
-                              post.status !== "draft"
-                            }
-                            onClick={() => act(() => sdk.review(post.id))}
+                            disabled={readonly}
+                            onClick={() => {
+                              if (act(() => studio.hold(post.id)))
+                                setNotice(
+                                  "Local item held back; no external action.",
+                                );
+                            }}
                           >
-                            Mark reviewed
+                            Hold back
                           </button>
                           <button
                             className="btn btn-primary"
                             disabled={
-                              scenario === "readonly" ||
-                              caption !== post.caption ||
-                              post.status !== "review"
+                              readonly ||
+                              post.reviewedRevision !== post.revision ||
+                              !post.scheduleAt
                             }
-                            onClick={() => act(() => sdk.stage(post.id))}
+                            onClick={() => {
+                              if (
+                                act(() =>
+                                  studio.approvePlan(post.id, post.revision),
+                                )
+                              )
+                                setNotice(
+                                  "Fixture plan approved at this material revision. Nothing sent.",
+                                );
+                            }}
                           >
-                            Stage locally
+                            Approve local plan
                           </button>
                         </div>
-                        <p className="muted">
-                          Editing invalidates the simulated review. Only the
-                          current reviewed revision can enter this fixture
-                          outbox.
-                        </p>
-                        {post.status === "local-outbox" && (
-                          <p className="notice" role="status">
-                            Simulation recorded · No external receipt · Nothing
-                            published.
-                          </p>
-                        )}
-                        <details>
-                          <summary>Source & development boundary</summary>
-                          <p>{post.source}</p>
-                          <p>
-                            This facade keeps state in this tab’s memory.
-                            Refresh resets fixtures. Production approval and
-                            capability checks are not simulated authority.
-                          </p>
-                        </details>
                       </section>
-                    )}
-                  </div>
-                </>
-              )}
-            </main>
-          </div>
+                    ))}
+                  </>
+                )}
+                {["Automations", "Workflows", "Settings"].includes(view) && (
+                  <SecondaryViews view={view.toLowerCase()} context={context} />
+                )}
+              </>
+            )}
+          </main>
         </div>
       </div>
-    </>
+      {drawer?.kind === "source" && (
+        <SourceDrawer
+          source={snapshot.sources.find((source) => source.id === drawer.id)}
+          posts={snapshot.posts}
+          onClose={() => setDrawer(null)}
+          onPost={openPost}
+        />
+      )}
+      {currentPost && (
+        <Editor
+          key={currentPost.id}
+          post={currentPost}
+          source={snapshot.sources.find(
+            (source) => source.id === currentPost.sourceId,
+          )}
+          run={snapshot.runs.find((run) => run.id === currentPost.runId)}
+          act={act}
+          readonly={readonly}
+          onClose={() => setDrawer(null)}
+        />
+      )}
+    </div>
   );
 }

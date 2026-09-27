@@ -6,31 +6,16 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { resolve } from "node:path";
 const repo = fileURLToPath(new URL("../../", import.meta.url));
 const tools = createRequire(resolve(repo, "ui/package.json"));
-const source = createRequire(
-  resolve(repo, "app-previews/social-content/SocialContent.jsx"),
-);
-test("actual React view mounts and local draft flow works without a backend", async () => {
-  const { Window } = tools("happy-dom"),
-    window = new Window();
+
+test("actual studio mounts source grid, batch run, editor, revision guard and local calendar plan with accessible drawer", async () => {
+  const { Window } = tools("happy-dom");
+  const window = new Window();
   globalThis.window = window;
   globalThis.document = window.document;
   globalThis.IS_REACT_ACT_ENVIRONMENT = true;
   const React = tools("react"),
     { createRoot } = tools("react-dom/client"),
     ts = tools("typescript");
-  const code = ts.transpileModule(
-    readFileSync(
-      resolve(repo, "app-previews/social-content/SocialContent.jsx"),
-      "utf8",
-    ).replaceAll("__APP_DEV_REVISION__", '"test-base"'),
-    {
-      compilerOptions: {
-        jsx: ts.JsxEmit.ReactJSX,
-        module: ts.ModuleKind.CommonJS,
-        target: ts.ScriptTarget.ES2022,
-      },
-    },
-  ).outputText;
   const icons = new Map();
   for (const name of [
     "CubeIcon",
@@ -48,33 +33,67 @@ test("actual React view mounts and local draft flow works without a backend", as
       ),
     );
   }
-  const exports = {};
-  new Function("require", "exports", code)(
-    (id) =>
-      icons.has(id)
-        ? icons.get(id)
-        : id.startsWith(".")
-          ? source(id)
-          : tools(id),
-    exports,
+  function load(file) {
+    const local = createRequire(file),
+      exports = {};
+    const code = ts.transpileModule(
+      readFileSync(file, "utf8").replaceAll(
+        "__APP_DEV_REVISION__",
+        '"test-base"',
+      ),
+      {
+        compilerOptions: {
+          jsx: ts.JsxEmit.ReactJSX,
+          module: ts.ModuleKind.CommonJS,
+          target: ts.ScriptTarget.ES2022,
+        },
+      },
+    ).outputText;
+    new Function("require", "exports", code)(
+      (id) =>
+        icons.has(id)
+          ? icons.get(id)
+          : id.startsWith(".")
+            ? id.endsWith(".jsx")
+              ? load(resolve(file, "..", id))
+              : local(id)
+            : tools(id),
+      exports,
+    );
+    return exports;
+  }
+  const View = load(
+    resolve(repo, "app-previews/social-content/SocialContent.jsx"),
+  ).default;
+  const source = createRequire(
+    resolve(repo, "app-previews/social-content/SocialContent.jsx"),
   );
+  const { studio } = source("./store.mjs");
+  studio.reset();
   const host = document.createElement("div");
   document.body.append(host);
   const root = createRoot(host);
   const act = React.act;
-  const click = async (text) => {
+  async function click(text) {
     const button = [...host.querySelectorAll("button")].find(
       (b) => b.textContent.trim() === text,
     );
     assert.ok(button, text);
     assert.ok(!button.disabled, text);
     await act(() => button.click());
-  };
+    return button;
+  }
+  async function field(selector, value) {
+    const element = host.querySelector(selector);
+    assert.ok(element, selector);
+    const key = Object.keys(element).find((k) => k.startsWith("__reactProps$"));
+    await act(() => element[key].onChange({ target: { value } }));
+  }
   try {
-    await act(() => root.render(React.createElement(exports.default)));
-    assert.ok(host.textContent.includes("Fixtures only"));
-    assert.ok(host.textContent.includes("Harbour studio"));
-    const themeButton = host.querySelector("button[aria-label^='Theme:']");
+    await act(() => root.render(React.createElement(View)));
+    assert.ok(host.textContent.includes("Schedule"));
+    assert.equal(host.querySelectorAll(".calendar-day").length, 7);
+    const themeButton = host.querySelector('button[aria-label^="Theme:"]');
     for (const theme of ["light", "dark", "system"]) {
       await act(() => themeButton.click());
       assert.equal(
@@ -86,31 +105,95 @@ test("actual React view mounts and local draft flow works without a backend", as
         theme === "system" ? null : theme,
       );
     }
-    const { sdk } = source("./store.mjs");
-    // The same app facade creates data; Reset fixtures reconciles the mounted view.
-    await act(() => {
-      host
-        .querySelector("form")
-        .dispatchEvent(
-          new window.Event("submit", { bubbles: true, cancelable: true }),
-        );
-    });
-    assert.ok(
-      host.textContent.includes("Add source text before creating a draft."),
+    const initialWeek = host.querySelector(
+      ".section-toolbar + .kicker",
+    ).textContent;
+    await act(() => host.querySelector('[aria-label="Next week"]').click());
+    assert.notEqual(
+      host.querySelector(".section-toolbar + .kicker").textContent,
+      initialWeek,
     );
+    await click("This week");
+    const firstDay = source("./fixtures.mjs").fixtureWeek;
+    const nextYear = new Date(
+      `${Number(firstDay.slice(0, 4)) + 1}-01-01T12:00:00Z`,
+    );
+    const yearWeek = Math.floor(
+      (nextYear - new Date(`${firstDay}T12:00:00Z`)) / (7 * 86400000),
+    );
+    for (let i = 0; i < yearWeek; i++)
+      await act(() => host.querySelector('[aria-label="Next week"]').click());
+    assert.ok(
+      host
+        .querySelector(".section-toolbar + .kicker")
+        .textContent.includes(String(nextYear.getUTCFullYear())),
+    );
+    await click("This week");
+    await click("Library");
+    assert.equal(host.querySelectorAll(".source-card").length, 3);
+    const inspect = host.querySelector(
+      '[aria-label="Inspect source source-3"]',
+    );
+    inspect.focus();
+    await act(() => inspect.click());
+    assert.ok(host.querySelector('[role="dialog"]'));
+    assert.match(host.textContent, /Immutable fixture source/);
+    await act(() =>
+      document.dispatchEvent(
+        new window.KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
+      ),
+    );
+    assert.equal(host.querySelector('[role="dialog"]'), null);
+    assert.equal(document.activeElement, inspect);
+    for (const id of ["source-3", "source-4"])
+      await act(() =>
+        host.querySelector(`[aria-label="Select source ${id}"]`).click(),
+      );
+    await click("Draft 2 posts");
+    assert.equal(host.querySelectorAll(".run-card tbody tr").length, 2);
+    assert.equal(studio.read().runs[0].items.length, 2);
+    const item = studio.read().runs[0].items[0];
+    await click(`${item.sourceId} → ${item.postId}`);
+    assert.ok(host.querySelector(".editor-grid"));
+    assert.equal(
+      host.querySelector("#caption").value,
+      studio.read().sources.find((s) => s.id === item.sourceId).text,
+    );
+    await field("#caption", "Human caption for the scheduled fixture");
+    await click("Save revision");
+    await field(
+      "#schedule-at",
+      `${source("./fixtures.mjs").fixtureWeek}T14:30`,
+    );
+    await click("Save local plan");
     await click("Mark reviewed");
+    await click("Approve local plan");
     await click("Stage locally");
-    assert.ok(host.textContent.includes("Nothing published."));
-    assert.equal(sdk.read()[0].status, "local-outbox");
-    await click("Reset fixtures");
-    assert.equal(sdk.read()[0].status, "draft");
-    const select = host.querySelector("#scenario");
-    await act(() => {
-      select.value = "readonly";
-      select.dispatchEvent(new window.Event("change", { bubbles: true }));
-    });
-    assert.ok(host.textContent.includes("Read-only preview"));
-    assert.ok(host.querySelector("#caption").disabled);
+    assert.match(host.textContent, /Nothing published/);
+    const staged = studio.read().posts.find((p) => p.id === item.postId);
+    assert.equal(staged.outbox.externalReceipt, null);
+    await field("#caption", "Edited after approval");
+    await click("Save revision");
+    assert.equal(
+      studio.read().posts.find((p) => p.id === item.postId).approvalRevision,
+      null,
+    );
+    assert.ok(
+      [...host.querySelectorAll("button")].find(
+        (b) => b.textContent === "Stage locally",
+      ).disabled,
+    );
+    await click("Close");
+    await click("Home");
+    assert.ok(
+      host
+        .querySelector(".calendar")
+        .textContent.includes("Edited after approval"),
+    );
+    await click("Board");
+    assert.equal(host.querySelectorAll(".board-lane").length, 6);
+    await click("Settings");
+    assert.match(host.textContent, /protected terms/i);
   } finally {
     await act(() => root.unmount());
     await window.happyDOM.close();

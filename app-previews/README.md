@@ -35,9 +35,26 @@ provider credentials or NODE_OPTIONS. Dependencies must already be installed.
 
 ## Boundary and ownership
 
-Create source → edit/save revision → mark reviewed → fixture local outbox works.
-No project is mandatory. No generated copy/image, agent run, production approval,
-external publish or receipt is claimed. Editing invalidates simulated review.
+Home opens the current Hong Kong planning week with Calendar/Board and a needs /
+suggestions rail. Library is an immutable source-media grid: select sources,
+Draft N posts, inspect the resulting fixture batch in Runs, then open its editor.
+A source can have multiple derived drafts. Optional brand context persists across
+app navigation; no site or project is mandatory.
+
+Caption/media/time/destination changes create a material revision and invalidate
+local review, approval and staged simulation. Choose a local plan, mark reviewed,
+approve the current local revision, then stage in the fixture outbox. Planning
+uses plain Hong Kong calendar date/time, never an external scheduler. Published
+seed records and verification mismatches are illustrative; external receipts
+are always absent. Ask appends an explicitly labelled fixture instruction rather
+than generating copy; caption Undo is a new unapproved revision. Source inspectors
+and editors trap focus, close on Escape and restore the opener when it remains.
+
+Automations, Workflows and Settings are descriptor screens with unavailable live
+controls disabled and explained. Uploads, real protected-term validation, passkeys,
+agent generation, production approvals and publishing remain unavailable. Drawer
+entry and view feedback respect reduced motion; full production exit/FLIP motion
+and optimistic network rollback belong to later live integration.
 The selector exposes loading, empty, error/retry and read-only scenarios.
 
 State lives in this tab's memory. Compatible SocialContent.jsx and CSS edits use
