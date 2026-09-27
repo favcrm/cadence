@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 fn fixture() -> TestDaemon {
     let mut opts = daemon_opts();
+    opts.test_seam = false;
     opts.platforms
         .insert("fixture".into(), Arc::new(FakePlatform::standard()));
     TestDaemon::start_opts(opts)
@@ -159,5 +160,50 @@ fn cad688_rotation_preserves_id_and_stale_id_cannot_address_reenrollment() {
             .get::<_, i64>(0))
             .unwrap(),
         0
+    );
+}
+
+#[test]
+fn cad688_concurrent_rotate_revoke_cannot_retarget_a_replacement() {
+    let d = fixture();
+    let first = d
+        .operator_rpc(
+            "connection_create",
+            create("concurrent", "cadp_concurrent_first"),
+        )
+        .unwrap();
+    let id = first["connection"]["id"].clone();
+    std::thread::scope(|scope| {
+        let rotate = scope.spawn(|| {
+            d.operator_rpc(
+                "connection_rotate",
+                json!({"connection_id":id,"token":"cadp_concurrent_second"}),
+            )
+        });
+        let revoke =
+            scope.spawn(|| d.operator_rpc("connection_revoke", json!({"connection_id":id})));
+        let _ = rotate.join().unwrap();
+        revoke.join().unwrap().unwrap();
+    });
+    let next = d
+        .operator_rpc(
+            "connection_create",
+            create("concurrent", "cadp_concurrent_third"),
+        )
+        .unwrap();
+    assert_ne!(next["connection"]["id"], id);
+    assert!(d
+        .operator_rpc(
+            "connection_rotate",
+            json!({"connection_id":id,"token":"cadp_concurrent_stale"})
+        )
+        .is_err());
+    assert_eq!(
+        d.operator_rpc(
+            "connection_show",
+            json!({"connection_id":next["connection"]["id"]})
+        )
+        .unwrap(),
+        next
     );
 }
