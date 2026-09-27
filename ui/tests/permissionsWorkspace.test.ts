@@ -74,7 +74,8 @@ const json = (data: unknown, code = 200) =>
   });
 let rules = sample(),
   fail = false,
-  hold = false;
+  hold = false,
+  readCode = 503;
 const gets: { resolve: (r: Response) => void }[] = [],
   posts: { path: string; body: string; resolve: (r: Response) => void }[] = [];
 let reads = 0;
@@ -89,7 +90,15 @@ globalThis.fetch = async (input, init) => {
   reads++;
   if (hold) return new Promise<Response>((resolve) => gets.push({ resolve }));
   return fail
-    ? json({ error: "Rules temporarily unavailable" }, 503)
+    ? json(
+        {
+          error:
+            readCode === 403
+              ? "Operator read permission required"
+              : "Rules temporarily unavailable",
+        },
+        readCode,
+      )
     : json({ rules, requests: [] });
 };
 const host = document.createElement("div");
@@ -114,25 +123,36 @@ const click = async (el: Element | undefined) => {
   );
   await flush();
 };
-const render = async (readOnly = false, operator = true) => {
+const render = async (
+  readOnly = false,
+  operator = true,
+  boardReadOnly = false,
+  signedIn = operator,
+) => {
   // The original component has no viewer input; keeping the baseline compilable proves its missing guard.
   await React.act(async () =>
     root.render(
       React.createElement(Permissions as React.ComponentType<any>, {
-        viewer: { readOnly, operator },
+        viewer: { readOnly, operator, boardReadOnly, signedIn },
       }),
     ),
   );
   await flush();
 };
-const fresh = async (readOnly = false, operator = true) => {
+const fresh = async (
+  readOnly = false,
+  operator = true,
+  boardReadOnly = false,
+  signedIn = operator,
+) => {
   await React.act(async () => root.unmount());
   root = createRoot(host);
   rules = sample();
   fail = hold = false;
+  readCode = 503;
   reads = 0;
   gets.length = posts.length = 0;
-  await render(readOnly, operator);
+  await render(readOnly, operator, boardReadOnly, signedIn);
 };
 const revoke = (id: string) =>
   host.querySelector(`[data-rule="${id}"] button`) as HTMLButtonElement;
@@ -176,6 +196,59 @@ async function main() {
     await fresh(false, false);
     assert(reads === 0, "Unproven viewer makes no protected GET");
     assert(text().includes("operator"), "Operator access is explained");
+    await fresh(true, false, true, false);
+    assert(
+      reads === 0,
+      "Signed-out read-only board makes no protected request",
+    );
+    await fresh(true, false, true, true);
+    assert(
+      Number(reads) === 1 && revoke("allow/a").disabled,
+      "Real read-only metadata operator=false + signed_in=true can inspect through protected GET, never revoke",
+    );
+    await click(button("Refresh rules"));
+    assert(
+      Number(reads) === 2 && posts.length === 0,
+      "Real read-only operator can refresh without writes",
+    );
+    hold = true;
+    await click(button("Refresh rules"));
+    const readonlyLate = gets.at(-1)!;
+    await render(true, false, true, false);
+    assert(
+      !text().includes("/workspace/site"),
+      "Signing out of read-only board hides prior protected data",
+    );
+    await render(true, false, true, true);
+    const readonlyRecovered = gets.at(-1)!;
+    readonlyRecovered.resolve(
+      json({
+        rules: [{ ...sample()[0], by: "new readonly lifetime" }],
+        requests: [],
+      }),
+    );
+    await flush();
+    readonlyLate.resolve(
+      json({
+        rules: [{ ...sample()[0], by: "old readonly lifetime" }],
+        requests: [],
+      }),
+    );
+    await flush();
+    assert(
+      text().includes("new readonly lifetime") &&
+        !text().includes("old readonly lifetime"),
+      "Read-only auth recovery invalidates earlier reads",
+    );
+    await fresh(true, false, true, true);
+    fail = true;
+    readCode = 403;
+    await click(button("Refresh rules"));
+    assert(
+      text().includes("Operator read permission required") &&
+        revoke("allow/a").disabled,
+      "A server-refused read-only session cannot infer access or enable writes",
+    );
     await fresh(true);
     assert(revoke("allow/a").disabled, "Read-only operator cannot revoke");
     await click(revoke("allow/a"));

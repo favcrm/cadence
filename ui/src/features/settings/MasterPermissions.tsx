@@ -13,7 +13,12 @@ import { IconChevron, IconRefresh, IconSearch } from "../../ui/icons";
 import { useWriteBlock } from "../auth/WriteGate";
 import "./permissions.css";
 
-type Viewer = { operator: boolean; readOnly: boolean };
+type Viewer = {
+  operator: boolean;
+  readOnly: boolean;
+  boardReadOnly: boolean;
+  signedIn: boolean;
+};
 const errorText = (error: unknown) =>
   error instanceof ApiError ? error.message : String(error);
 // Quotes preserve argument boundaries. This is a display, never an executable shell command.
@@ -182,7 +187,7 @@ type Flight = {
   begin: (id: string) => boolean;
   finish: () => void;
 };
-/** Mounted only for proven operator access; access recovery gets a new read lifetime. */
+/** Eligible viewers request the server-protected list; access recovery gets a new lifetime. */
 function RuleWorkspace({
   readOnly,
   flight,
@@ -460,9 +465,10 @@ export default function MasterPermissions({ viewer }: { viewer: Viewer }) {
           allow; every rule applies within its working folder.
         </p>
       </header>
-      {viewer.operator ? (
+      {viewer.operator || (viewer.boardReadOnly && viewer.signedIn) ? (
         <RuleWorkspace
-          readOnly={viewer.readOnly}
+          key={viewer.operator ? "operator" : "readonly-session"}
+          readOnly={viewer.readOnly || !viewer.operator}
           flight={{ busy, begin, finish }}
         />
       ) : (

@@ -1645,8 +1645,12 @@ health-confirmed success, rollback, a no-op, failure and an unconfirmed outcome.
 The existing update API, pipeline and permissions are unchanged.
 
 Settings → Master permissions is a full-width saved-rule workspace. Proven
-operator access is required before reading; access loss hides the data and
-invalidates pending reads, including after access recovery. Labelled local
+writable-operator metadata or a signed-in read-only board is required before
+requesting the list. The metadata operator flag reports write capability and is
+false on a read-only board; the existing protected GET still proves the caller's
+operator read permission on the HTTP/RPC path. A signed-in read-only member can
+be refused by that proof, with a retryable error and no write controls. Access
+loss hides data and invalidates pending reads, including after access recovery. Labelled local
 search and effect/match filters retain complete command arguments, working
 folders and saved provenance; native disclosures show the exact rule ID and
 argument arrays. Exact commands and argument patterns both require the saved
