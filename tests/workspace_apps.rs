@@ -359,7 +359,7 @@ fn cad667_actual_enrolled_http_peers_and_detached_children_cannot_install_or_rea
         ] {
             let stolen = common::op::sign_in(env!("CARGO_BIN_EXE_cadence"), &w.daemon.state, port);
             let request = lane.dir.path().join(format!("http-{}.txt", lane.seq));
-            std::fs::write(&request, stolen.request(method, &path, &body)).unwrap();
+            std::fs::write(&request, stolen.request_as(method, &path, &body, "")).unwrap();
             let (rc,response)=lane.run(&format!("{prefix}python3 -c 'import socket,sys; s=socket.create_connection((\"127.0.0.1\",int(sys.argv[1])));s.sendall(open(sys.argv[2],\"rb\").read());print(s.makefile().readline())' {port} {}",request.display()));
             assert_eq!(rc, 0);
             assert_eq!(
@@ -547,7 +547,7 @@ fn cad667_explicit_migration_recovery_has_operator_proof_and_preserves_legacy_id
     .unwrap();
     std::fs::write(
         base.join("app.md"),
-        "---\napp: legacy\ntitle: Legacy\nversion: 1\n---\nGuide\n",
+        "---\napp: legacy\ntitle: Legacy\nversion: '1'\n---\nGuide\n",
     )
     .unwrap();
     let record = w.pm.dir.join("client/apps/legacy.yaml");
@@ -655,7 +655,7 @@ fn cad667_flat_text_rubrics_and_templates_keep_legacy_bundle_compatibility() {
     .unwrap();
     std::fs::write(
         legacy.join("app.md"),
-        "---\napp: legacy\ntitle: Legacy\nversion: 1\n---\nGuide\n",
+        "---\napp: legacy\ntitle: Legacy\nversion: '1'\n---\nGuide\n",
     )
     .unwrap();
     std::fs::write(
@@ -721,7 +721,7 @@ fn cad667_migration_delivery_failure_keeps_reads_and_installs_closed_until_expli
         .unwrap();
         std::fs::write(
             base.join("app.md"),
-            "---\napp: legacy\ntitle: Legacy\nversion: 1\n---\nGuide\n",
+            "---\napp: legacy\ntitle: Legacy\nversion: '1'\n---\nGuide\n",
         )
         .unwrap();
         let record = w.pm.dir.join("client/apps/legacy.yaml");
