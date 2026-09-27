@@ -72,6 +72,16 @@ impl Shared {
                             return Err(Error::rejected("installation digest is stale"));
                         }
                         if method == "app_local_install_approve" {
+                            let manifest = crate::issue::app::parse_manifest(
+                                files.get("app.md").ok_or_else(|| {
+                                    Error::rejected("installation manifest unavailable")
+                                })?,
+                            )?;
+                            if !manifest.connections.is_empty() {
+                                return Err(Error::rejected(
+                                    "local text execution does not support connection capabilities",
+                                ));
+                            }
                             let mut count = 0;
                             for (name, text) in files {
                                 if name.starts_with("workflows/") {

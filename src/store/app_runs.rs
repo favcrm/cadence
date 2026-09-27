@@ -430,7 +430,7 @@ impl Store {
         for assignment in run["snapshot"]["assignments"].as_object().unwrap().values() {
             let alias = assignment["alias"].as_str().unwrap();
             let worker = self.agent_in(&tx, alias)?;
-            if Self::agent_identity(&worker) != assignment["identity"] {
+            if !worker.enabled || Self::agent_identity(&worker) != assignment["identity"] {
                 return Err(Error::rejected("registered app assignment changed"));
             }
         }
@@ -518,6 +518,10 @@ impl Store {
         let tx = conn.unchecked_transaction()?;
         let changed = tx.execute("UPDATE app_runs SET state='failed',approved_digest=NULL,updated=? WHERE id=? AND state='running'", params![now(), id])?;
         if changed != 0 {
+            tx.execute(
+                "UPDATE jobs SET state='failed',updated=? WHERE id=?",
+                params![now(), id],
+            )?;
             tx.execute("UPDATE app_run_steps SET state='failed' WHERE run_id=? AND state IN ('pending','dispatched')", [id])?;
             tx.execute("UPDATE tasks SET state='failed',error='app authority or assignment is no longer current',updated=? WHERE id IN (SELECT task_id FROM app_run_steps WHERE run_id=? AND state='failed')", params![now(), id])?;
             Self::event(
@@ -903,6 +907,10 @@ impl Store {
         )?;
         tx.execute(
             "UPDATE app_runs SET state='failed',updated=? WHERE id=? AND state!='cancelled'",
+            params![now(), run],
+        )?;
+        tx.execute(
+            "UPDATE jobs SET state='failed',updated=? WHERE id=? AND state!='cancelled'",
             params![now(), run],
         )?;
         Self::event(
