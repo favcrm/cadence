@@ -87,7 +87,6 @@ pub(crate) fn binding_current_in(
     let mut current = row["context_id"] == json!(context)
         && row["slot"] == slot
         && row["state"] == "configured"
-        && row["revision"] == proof.revision
         && row["digest"] == proof.digest
         && row["config"] == proof.config;
     let workspace: String = conn.query_row(
