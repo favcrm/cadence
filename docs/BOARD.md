@@ -1614,9 +1614,16 @@ retains model/effort/provenance/quota evidence, verbatim recovery and resume
 commands, identity, params, capabilities, tasks, bound issues, running messages
 and the event tail. Collection observations stay available if the detail read
 fails. Missing project issue data is reported rather than guessing assignments.
-A fence banner on the board links straight to the drawer. The Memory tab lists every project's
-memories with status/type/component/path filters, opens a detail
-panel. Memory curation is read-only in the browser: proposed entries show
+A fence banner on the board links straight to the drawer. Settings → Memory is a
+full-width lesson browser. Labelled project/status/type filters keep project
+scope in the route; local search matches claims, IDs, projects and scope. One
+lesson opens at a time with readable Markdown, applicability and the server's
+review or agent-availability result. Evidence freshness comes from retrieval,
+so accepted, available and withheld remain distinct; age alone does not withhold.
+Technical provenance and revision digests sit in a native disclosure. Loading,
+empty, partial-file-error and failed reads remain distinct and retryable;
+zero readable lessons with file errors never claims a valid empty store;
+closing, hiding or changing a lesson invalidates its pending detail read. Memory curation is read-only in the browser: proposed entries show
 their native quorum/finalization state, while accept, reject, and supersede
 require an authenticated native agent endpoint.
 

@@ -1,46 +1,239 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useId, useState } from "react";
 import { api, ApiError } from "../../lib/api";
 import { showProjectChoices } from "../../lib/router";
 import type { MemoryCard, MemoryDetail } from "../../lib/types";
 import { navigate } from "../../lib/useLocation";
+import Button from "../../ui/Button";
+import { IconChevron, IconRefresh, IconSearch } from "../../ui/icons";
 import Md from "../../ui/Md";
-import { evidenceSuffix, quorumLabel, quorumTone, quorumView } from "./memoryView";
+import Select from "../../ui/Select";
+import { evidenceSuffix, quorumLabel, quorumView } from "./memoryView";
+import "./memory.css";
 
-const STATUSES = ["", "proposed", "accepted", "rejected", "superseded"];
-const TYPES = ["", "rule", "gotcha", "decision", "recipe"];
-
-function statusTone(status: string): string {
-  switch (status) {
-    case "accepted":
-      return "bg-accent/10 text-accent";
-    case "proposed":
-      return "bg-warn/10 text-warn";
-    case "rejected":
-      return "bg-fail/10 text-fail";
-    default:
-      return "bg-ink-800 text-ink-400";
-  }
-}
+const STATUSES = ["proposed", "accepted", "rejected", "superseded"];
+const TYPES = ["rule", "gotcha", "decision", "recipe"];
+const label = (value: string) => value.charAt(0).toUpperCase() + value.slice(1);
+const options = (values: string[], all: string) => [
+  { value: "", label: all },
+  ...values.map((value) => ({ value, label: label(value) })),
+];
+const errText = (e: unknown) => (e instanceof ApiError ? e.message : String(e));
 
 function scopeLine(m: MemoryCard): string {
   const bits: string[] = [];
-  if (m.scope.project) bits.push("project-wide");
-  if (m.scope.components.length) bits.push(`comp: ${m.scope.components.join(", ")}`);
-  if (m.scope.paths.length) bits.push(`paths: ${m.scope.paths.join(", ")}`);
-  if (m.scope.providers.length) bits.push(`prov: ${m.scope.providers.join(", ")}`);
-  if (m.scope.tags.length) bits.push(`tags: ${m.scope.tags.join(", ")}`);
-  return bits.join(" · ") || "no scope";
+  if (m.scope.project) bits.push("Project-wide");
+  if (m.scope.components.length)
+    bits.push(`Components: ${m.scope.components.join(", ")}`);
+  if (m.scope.paths.length) bits.push(`Paths: ${m.scope.paths.join(", ")}`);
+  if (m.scope.providers.length)
+    bits.push(`Providers: ${m.scope.providers.join(", ")}`);
+  if (m.scope.tags.length) bits.push(`Tags: ${m.scope.tags.join(", ")}`);
+  return bits.join(" · ") || "No scope recorded";
 }
 
-function errText(e: unknown): string {
-  return e instanceof ApiError ? e.message : String(e);
+function matches(m: MemoryCard, query: string): boolean {
+  const text = [
+    m.fact,
+    m.slug,
+    m.project,
+    ...m.scope.components,
+    ...m.scope.paths,
+    ...m.scope.providers,
+    ...m.scope.tags,
+  ]
+    .join(" ")
+    .toLowerCase();
+  return text.includes(query.trim().toLowerCase());
 }
 
-type DetailState = {
-  key: string;
-  data?: MemoryDetail;
-  error?: string;
-};
+function createdLabel(created: string): string {
+  const date = new Date(created);
+  return Number.isNaN(date.getTime())
+    ? "Not recorded"
+    : date.toLocaleDateString(undefined, {
+        year: "numeric",
+        month: "short",
+        day: "numeric",
+        timeZone: "UTC",
+      });
+}
+
+/** Each open selection owns its request lifetime, including reopening the same key. */
+function LessonDetail({ memory }: { memory: MemoryCard }) {
+  const [detail, setDetail] = useState<MemoryDetail | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [retry, setRetry] = useState(0);
+  useEffect(() => {
+    let cancelled = false;
+    setDetail(null);
+    setError(null);
+    api
+      .memory(memory.project, memory.slug)
+      .then((data) => {
+        if (!cancelled) setDetail(data);
+      })
+      .catch((e) => {
+        if (!cancelled) setError(errText(e));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [memory.project, memory.slug, retry]);
+
+  if (error)
+    return (
+      <div className="memory-detail-state" role="alert">
+        <p>
+          Couldn’t load this lesson. <span>{error}</span>
+        </p>
+        <Button onClick={() => setRetry((value) => value + 1)}>
+          Retry lesson
+        </Button>
+      </div>
+    );
+  if (!detail)
+    return (
+      <p className="memory-detail-state" role="status">
+        Loading lesson…
+      </p>
+    );
+  const q = quorumView(detail);
+  return (
+    <div className="memory-detail-content">
+      <div className="memory-reading">
+        <div className="issue-reader">
+          <Md text={detail.body} />
+        </div>
+        <div className="memory-applicability">
+          <h3>Applies to</h3>
+          <p>{scopeLine(detail)}</p>
+          {detail.supersedes && <p>Supersedes {detail.supersedes}</p>}
+        </div>
+      </div>
+      <aside
+        className="memory-evidence"
+        aria-label="Lesson review and evidence"
+      >
+        <h3>
+          {q.mode === "acceptance" ? "Review status" : "Agent availability"}
+        </h3>
+        <p
+          className="memory-availability"
+          data-state={
+            q.eligible === null
+              ? "unknown"
+              : q.eligible
+                ? "available"
+                : "blocked"
+          }
+        >
+          {label(quorumLabel(q))}
+        </p>
+        <p>{q.reason}</p>
+        {evidenceSuffix(detail, q) && (
+          <p className="memory-freshness">{detail.evidence!.label}</p>
+        )}
+        <p className="memory-readonly">
+          Read-only here. Authenticated native agents review lessons; a PM
+          finalizes them.
+        </p>
+        <details className="memory-provenance">
+          <summary>
+            Review evidence <IconChevron />
+          </summary>
+          <dl>
+            <div>
+              <dt>Lesson ID</dt>
+              <dd className="num">{detail.slug}</dd>
+            </div>
+            <div>
+              <dt>Created</dt>
+              <dd>{createdLabel(detail.created)}</dd>
+            </div>
+            <div>
+              <dt>Confidence</dt>
+              <dd>{label(detail.confidence)}</dd>
+            </div>
+            <div>
+              <dt>Author</dt>
+              <dd>{detail.author || "Not recorded"}</dd>
+            </div>
+            <div>
+              <dt>Source</dt>
+              <dd>{detail.source || "Not recorded"}</dd>
+            </div>
+            <div>
+              <dt>File</dt>
+              <dd className="num">{detail.path}</dd>
+            </div>
+            <div>
+              <dt>Revision digest</dt>
+              <dd className="num">{detail.revision_digest || "Unavailable"}</dd>
+            </div>
+            {typeof detail.review_count === "number" && (
+              <div>
+                <dt>Historical receipts</dt>
+                <dd>{detail.review_count}</dd>
+              </div>
+            )}
+          </dl>
+        </details>
+      </aside>
+    </div>
+  );
+}
+
+function LessonRow({
+  memory,
+  open,
+  onToggle,
+}: {
+  memory: MemoryCard;
+  open: boolean;
+  onToggle: () => void;
+}) {
+  const id = useId();
+  const q = quorumView(memory);
+  return (
+    <article className="memory-row" data-open={open || undefined}>
+      <button
+        className="memory-row-trigger"
+        type="button"
+        aria-expanded={open}
+        aria-controls={id}
+        onClick={onToggle}
+      >
+        <div className="memory-row-main">
+          <p className="memory-fact">{memory.fact || memory.slug}</p>
+          <div className="memory-row-meta">
+            <span>{memory.project}</span>
+            <span>{label(memory.type)}</span>
+            <span>{label(memory.status)}</span>
+          </div>
+          <p className="memory-scope">{scopeLine(memory)}</p>
+        </div>
+        <div className="memory-row-end">
+          <span
+            className="memory-availability"
+            data-state={
+              q.eligible === null
+                ? "unknown"
+                : q.eligible
+                  ? "available"
+                  : "blocked"
+            }
+          >
+            {label(quorumLabel(q))}
+          </span>
+          <IconChevron size={14} className="memory-row-chevron" />
+        </div>
+      </button>
+      <div id={id} hidden={!open} className="memory-detail">
+        {open && <LessonDetail memory={memory} />}
+      </div>
+    </article>
+  );
+}
 
 export default function Memory({
   project,
@@ -53,40 +246,40 @@ export default function Memory({
   projectHref: (key: string) => string;
   onError: (e: unknown, verb: string) => void;
 }) {
-  // null = loading; [] = resolved empty (or failed — see listErr).
   const [mems, setMems] = useState<MemoryCard[] | null>(null);
   const [loadErrs, setLoadErrs] = useState<string[]>([]);
   const [listErr, setListErr] = useState<string | null>(null);
   const [tick, setTick] = useState(0);
   const [status, setStatus] = useState("");
   const [kind, setKind] = useState("");
-  const [open, setOpen] = useState<string | null>(null); // project/slug
-  const [detail, setDetail] = useState<DetailState | null>(null);
-  // The detail key the last openDetail asked for — a late response for
-  // a previous card (or one already closed) is dropped here, never
-  // rendered under the wrong row.
-  const wanted = useRef<string | null>(null);
+  const [query, setQuery] = useState("");
+  const [open, setOpen] = useState<string | null>(null);
+  const searchId = useId();
+  const projectId = useId();
+  const statusId = useId();
+  const typeId = useId();
 
-  const refresh = useCallback(() => {
+  useEffect(() => {
     let cancelled = false;
     setMems(null);
     setListErr(null);
     setLoadErrs([]);
+    setOpen(null);
     api
       .memories({
         project: project === "all" ? undefined : project,
         status: status || undefined,
         type: kind || undefined,
       })
-      .then((r) => {
+      .then((result) => {
         if (cancelled) return;
-        setMems(r.memories);
-        setLoadErrs(r.memory_errors ?? []);
+        setMems(result.memories);
+        setLoadErrs(result.memory_errors ?? []);
       })
       .catch((e) => {
         if (cancelled) return;
-        setMems([]);
         setListErr(errText(e));
+        setMems([]);
         onError(e, "memory list");
       });
     return () => {
@@ -94,223 +287,172 @@ export default function Memory({
     };
   }, [project, status, kind, onError, tick]);
 
-  useEffect(refresh, [refresh]);
-
-  const loadDetail = useCallback((m: MemoryCard) => {
-    const key = `${m.project}/${m.slug}`;
-    wanted.current = key;
-    setDetail({ key });
-    api
-      .memory(m.project, m.slug)
-      .then((d) => {
-        if (wanted.current === key) setDetail({ key, data: d });
-      })
-      .catch((e) => {
-        if (wanted.current === key) setDetail({ key, error: errText(e) });
-      });
-  }, []);
-
-  const openDetail = useCallback(
-    (m: MemoryCard) => {
-      const key = `${m.project}/${m.slug}`;
-      if (open === key) {
-        wanted.current = null;
-        setOpen(null);
-        setDetail(null);
-        return;
-      }
-      setOpen(key);
-      loadDetail(m);
-    },
-    [open, loadDetail],
-  );
-
-  const filtered = status !== "" || kind !== "";
+  const visible = (mems ?? []).filter((memory) => matches(memory, query));
+  const filtered = !!(status || kind || query.trim());
+  const reset = () => {
+    setQuery("");
+    setStatus("");
+    setKind("");
+    setOpen(null);
+  };
+  const projectOptions = [
+    { value: "all", label: "All projects" },
+    ...projects.map((p) => ({ value: p.key, label: p.key })),
+    ...(project !== "all" && !projects.some((p) => p.key === project)
+      ? [{ value: project, label: project }]
+      : []),
+  ];
 
   return (
-    <div className="px-4 lg:px-8 py-4 max-w-[1100px]">
-      <div className="flex flex-wrap items-center gap-2 mb-3">
+    <section className="memory-workspace" aria-labelledby="memory-title">
+      <header className="memory-heading">
+        <div>
+          <h1 id="memory-title">Memory</h1>
+          <p>
+            Project lessons that help agents apply what the team has learned.
+          </p>
+        </div>
+        <Button
+          icon={<IconRefresh />}
+          loading={mems === null}
+          onClick={() => setTick((value) => value + 1)}
+        >
+          Refresh lessons
+        </Button>
+      </header>
+      <div className="memory-filters" role="search" aria-label="Find lessons">
+        <div className="memory-filter memory-search">
+          <label htmlFor={searchId}>Search lessons</label>
+          <div className="memory-search-field">
+            <IconSearch />
+            <input
+              id={searchId}
+              type="search"
+              className="field"
+              placeholder="Search claims, IDs or scope…"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+            />
+          </div>
+        </div>
         {showProjectChoices(projects.length, project) && (
-          <label className="inline-flex items-center gap-2 mr-1">
-            <span className="slabel">project</span>
-            <select
-              className="field !h-7 text-label"
-              aria-label="project"
+          <div className="memory-filter">
+            <label htmlFor={projectId}>Project</label>
+            <Select
+              id={projectId}
+              full
               value={project}
-              onChange={(e) => navigate(projectHref(e.target.value), { replace: true })}
-            >
-              <option value="all">All</option>
-              {projects.map((p) => (
-                <option key={p.key} value={p.key}>
-                  {p.key}
-                </option>
-              ))}
-              {project !== "all" && !projects.some((p) => p.key === project) && (
-                <option value={project}>{project}</option>
-              )}
-            </select>
-          </label>
+              options={projectOptions}
+              onChange={(value) =>
+                navigate(projectHref(value), { replace: true })
+              }
+            />
+          </div>
         )}
-        <span className="slabel">status</span>
-        {STATUSES.map((s) => (
-          <button
-            key={s || "all"}
-            onClick={() => setStatus(s)}
-            className={`chip ${
-              status === s
-                ? "bg-accent/10 text-accent"
-                : "bg-ink-800 text-ink-400 hover:text-ink-200"
-            }`}
-          >
-            {s || "all"}
-          </button>
-        ))}
-        <span className="slabel ml-3">type</span>
-        {TYPES.map((t) => (
-          <button
-            key={t || "all"}
-            onClick={() => setKind(t)}
-            className={`chip ${
-              kind === t
-                ? "bg-accent/10 text-accent"
-                : "bg-ink-800 text-ink-400 hover:text-ink-200"
-            }`}
-          >
-            {t || "all"}
-          </button>
-        ))}
+        <div className="memory-filter">
+          <label htmlFor={statusId}>Status</label>
+          <Select
+            id={statusId}
+            full
+            value={status}
+            options={options(STATUSES, "All statuses")}
+            onChange={setStatus}
+          />
+        </div>
+        <div className="memory-filter">
+          <label htmlFor={typeId}>Type</label>
+          <Select
+            id={typeId}
+            full
+            value={kind}
+            options={options(TYPES, "All types")}
+            onChange={setKind}
+          />
+        </div>
       </div>
-
-      {listErr !== null ? (
-        <div className="card px-4 py-6 text-center text-sm">
-          <p className="text-fail">memory list unavailable — {listErr}</p>
-          <button
-            className="chip mt-3 bg-ink-800 text-ink-300 hover:text-ink-100"
-            onClick={() => setTick((t) => t + 1)}
-          >
-            retry
-          </button>
-        </div>
-      ) : mems === null ? (
-        <div className="card px-4 py-6 text-center text-ink-500 text-sm">
-          Loading…
-        </div>
-      ) : mems.length === 0 ? (
-        <div className="card px-4 py-6 text-center text-ink-500 text-sm">
-          {filtered
-            ? "no memories match the current filters"
-            : "no memories yet — authenticated native agents propose lessons with `cadence memory propose`; two independent reviews and PM finalization are required before dispatch"}
-        </div>
-      ) : null}
-
+      <div className="memory-results">
+        <p role="status">
+          {mems === null
+            ? "Loading lessons…"
+            : listErr
+              ? "Lessons unavailable"
+              : `${visible.length}${loadErrs.length ? " readable" : ""} lesson${visible.length === 1 ? "" : "s"}${query.trim() ? ` matching “${query.trim()}”` : ""}${loadErrs.length ? " · results incomplete" : ""}`}
+        </p>
+        {filtered && (
+          <Button variant="ghost" onClick={reset}>
+            Clear filters
+          </Button>
+        )}
+      </div>
       {loadErrs.length > 0 && (
-        <div className="card px-4 py-2.5 mb-2 border-warn/30 text-warn text-[13px]">
-          {loadErrs.length} memory file{loadErrs.length === 1 ? "" : "s"} failed
-          to load — {loadErrs[0]}
-          {loadErrs.length > 1 ? ` (and ${loadErrs.length - 1} more)` : ""}
+        <div className="memory-load-warning" role="status">
+          <p>
+            {loadErrs.length} memory file{loadErrs.length === 1 ? "" : "s"}{" "}
+            couldn’t be loaded. Results may be incomplete.
+          </p>
+          <details>
+            <summary>Show file errors</summary>
+            <ul>
+              {loadErrs.map((error, i) => (
+                <li key={i}>{error}</li>
+              ))}
+            </ul>
+          </details>
         </div>
       )}
-
-      <div className="grid gap-2">
-        {(mems ?? []).map((m) => {
-          const key = `${m.project}/${m.slug}`;
-          const isOpen = open === key;
-          const d = isOpen && detail?.key === key ? detail : null;
-          const q = quorumView(m);
-          const detailQuorum = d?.data ? quorumView(d.data) : null;
-          return (
-            <div key={key} className="card px-4 py-3">
-              <button
-                className="w-full text-left grid gap-1"
-                onClick={() => openDetail(m)}
-              >
-                <div className="flex items-center gap-2 flex-wrap">
-                  <span className="num text-[13px] text-ink-100 min-w-0 break-all">
-                    {m.slug}
-                  </span>
-                  <span className={`chip ${statusTone(m.status)}`}>{m.status}</span>
-                  <span className="chip bg-ink-800 text-ink-300">{m.type}</span>
-                  <span className="chip bg-ink-800 text-ink-500">{m.confidence}</span>
-                  <span className={`chip ${quorumTone(q.eligible)}`}>
-                    {quorumLabel(q)}
-                  </span>
-                  <span className="num text-micro text-ink-500 ml-auto min-w-0 break-words text-right">
-                    {m.project}
-                    {evidenceSuffix(m, q)}
-                  </span>
-                </div>
-                <div className="text-[13px] text-ink-300 break-words">{m.fact}</div>
-                <div className="num text-micro text-ink-500 break-words">
-                  {scopeLine(m)}
-                  {m.supersedes ? ` · supersedes ${m.supersedes}` : ""}
-                </div>
-                <div className="text-micro text-ink-500 break-words">{q.reason}</div>
-              </button>
-
-              {isOpen && (
-                <div className="mt-3 pt-3 border-t border-ink-700">
-                  {d?.data ? (
-                    <>
-                      <div className="text-[13px] text-ink-200 [&_p]:mb-2">
-                        <Md text={d.data.body} />
-                      </div>
-                      <div className="num text-micro text-ink-500 mt-2 break-words">
-                        {d.data.author ? `by ${d.data.author} · ` : ""}
-                        {d.data.source ? `source ${d.data.source} · ` : ""}
-                        {d.data.path}
-                      </div>
-                      {detailQuorum && (
-                        <>
-                          <div className="mt-3 flex flex-wrap items-center gap-2 text-[13px]">
-                            <span className="slabel">
-                              {detailQuorum.mode === "acceptance"
-                                ? "server review"
-                                : "server availability"}
-                            </span>
-                            <span className={`chip ${quorumTone(detailQuorum.eligible)}`}>
-                              {quorumLabel(detailQuorum)}
-                            </span>
-                          </div>
-                          <p className="mt-1 text-[13px] text-ink-500 break-words">
-                            {detailQuorum.reason}
-                          </p>
-                          <p className="mt-3 text-[13px] text-ink-400">
-                            read-only — review and PM finalization require authenticated
-                            native agents; browser requests cannot provide that identity.
-                          </p>
-                          <div className="mt-3 text-[13px] text-ink-500">
-                            <span className="slabel mr-2">digest</span>
-                            <code className="num block mt-1 break-all text-ink-400">
-                              {d.data.revision_digest ?? "unavailable"}
-                            </code>
-                          </div>
-                          {typeof d.data.review_count === "number" && (
-                            <div className="num text-micro text-ink-500 mt-2">
-                              historical receipts {d.data.review_count}
-                            </div>
-                          )}
-                        </>
-                      )}
-                    </>
-                  ) : d?.error ? (
-                    <div className="text-[13px]">
-                      <p className="text-fail">memory unavailable — {d.error}</p>
-                      <button
-                        className="chip mt-2 bg-ink-800 text-ink-300 hover:text-ink-100"
-                        onClick={() => loadDetail(m)}
-                      >
-                        retry
-                      </button>
-                    </div>
-                  ) : (
-                    <p className="text-secondary text-ink-500">Loading…</p>
-                  )}
-                </div>
-              )}
-            </div>
-          );
-        })}
-      </div>
-    </div>
+      {listErr ? (
+        <div className="memory-state" role="alert">
+          <h2>Couldn’t load lessons</h2>
+          <p>{listErr}</p>
+          <Button onClick={() => setTick((value) => value + 1)}>
+            Retry lessons
+          </Button>
+        </div>
+      ) : mems === null ? (
+        <div className="memory-state" aria-busy="true">
+          <p>Loading project memory…</p>
+        </div>
+      ) : visible.length === 0 && loadErrs.length > 0 ? (
+        <div className="memory-state">
+          <h2>{filtered ? "No readable matches" : "No readable lessons"}</h2>
+          <p>
+            Some memory files couldn’t be loaded. Retry to check for lessons in
+            this selection.
+          </p>
+          <Button onClick={() => setTick((value) => value + 1)}>
+            Retry lessons
+          </Button>
+          {filtered && (
+            <Button variant="ghost" onClick={reset}>
+              Clear filters
+            </Button>
+          )}
+        </div>
+      ) : visible.length === 0 ? (
+        <div className="memory-state">
+          <h2>{filtered ? "No matching lessons" : "No lessons yet"}</h2>
+          <p>
+            {filtered
+              ? "Try another search or clear the status and type filters."
+              : "Native agents propose lessons, independent agents review them, and a PM finalizes them before use."}
+          </p>
+          {filtered && <Button onClick={reset}>Show all lessons</Button>}
+        </div>
+      ) : (
+        <div className="memory-list">
+          {visible.map((memory) => {
+            const key = `${memory.project}/${memory.slug}`;
+            return (
+              <LessonRow
+                key={key}
+                memory={memory}
+                open={open === key}
+                onToggle={() => setOpen(open === key ? null : key)}
+              />
+            );
+          })}
+        </div>
+      )}
+    </section>
   );
 }
