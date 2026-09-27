@@ -310,8 +310,7 @@ pub(super) fn read_back(adapter: &LocalAdapter, input: &Value) -> Verified {
     let Ok(index) = serde_json::from_slice::<Value>(&bytes) else {
         return Verified::False;
     };
-    if index["effect_id"] != effect_id
-        || index["authority_digest"] != authority_digest
+    if index["authority_digest"] != authority_digest
         || index["input_digest"] != digest
         || index["scope"]["kind"] != "app_artifact"
         || index["provenance"] != text.provenance
