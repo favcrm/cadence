@@ -135,6 +135,8 @@ jobs:
         run: python3 scripts/check-doc-links.py
       - name: Test contributor documentation checker
         run: python3 -m unittest discover -s scripts -p 'test_check_doc_links.py'
+      - name: Test inventory timing capture
+        run: python3 tests/scripts/test_nextest_inventory.py
 
   clippy:
     needs: [queue-evidence]
@@ -190,9 +192,51 @@ jobs:
       # daemons and boards exercise the asserted-identity seam (a debug
       # build; release builds can never carry it — see the build job).
       - name: Verify all-targets inventory parity
+        id: inventory
         env:
           CARGO_BUILD_JOBS: 4
+          CADENCE_INVENTORY_TIMINGS_REPORT: ${{ runner.temp }}/inventory-timings/inventory.html
         run: scripts/nextest-inventory all-targets --features test-seam
+      - name: Record inventory build context
+        continue-on-error: true
+        if: ${{ !cancelled() && (steps.inventory.outcome == 'success' || steps.inventory.outcome == 'failure') }}
+        env:
+          CARGO_BUILD_JOBS: 4
+        run: |
+          dir="${{ runner.temp }}/inventory-timings"
+          mkdir -p "$dir"
+          if [ "${{ steps.inventory.outputs.timings_available }}" = true ]; then
+            availability='Inventory compiler timings captured from the first build.'
+          else
+            availability='Inventory compiler timings unavailable: no fresh complete report was retained.'
+          fi
+          echo "$availability" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "$availability"
+            printf 'source=%s\n' "$(git rev-parse HEAD)"
+            rustc --version --verbose
+            printf 'runner=%s/%s image=%s/%s\n' "$RUNNER_OS" "$RUNNER_ARCH" "${ImageOS:-unknown}" "${ImageVersion:-unknown}"
+            printf 'features=test-seam targets=all-targets jobs=%s RUSTFLAGS=%s\n' "$CARGO_BUILD_JOBS" "$RUSTFLAGS"
+            printf 'RUSTC_WRAPPER=%s RUSTC_WORKSPACE_WRAPPER=%s\n' "${RUSTC_WRAPPER:-unset}" "${RUSTC_WORKSPACE_WRAPPER:-unset}"
+            printf 'CARGO_TARGET_DIR=%s CARGO_INCREMENTAL=%s\n' "${CARGO_TARGET_DIR:-unset}" "${CARGO_INCREMENTAL:-unset}"
+            echo 'profile=test (dev settings in Cargo.toml); no Rust cache action configured; actual warm/cold/cache hits not measured'
+            sha256sum Cargo.toml Cargo.lock .config/nextest.toml
+            echo 'Integration targets importing common (each unit also includes its own tests and link):'
+            git grep -l '^mod common;' -- 'tests/*.rs'
+            echo 'Unit durations are cumulative work, not elapsed critical path or common-module attribution.'
+            echo 'Compare later existing steps using their Finished profile log lines; only the first inventory build is captured here.'
+          } > "$dir/context.txt"
+      - name: Keep inventory compiler timings
+        continue-on-error: true
+        if: ${{ !cancelled() && (steps.inventory.outcome == 'success' || steps.inventory.outcome == 'failure') }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: compiler-timings-${{ github.run_id }}-${{ github.run_attempt }}-inventory
+          path: |
+            ${{ steps.inventory.outputs.timings_available == 'true' && format('{0}/inventory-timings/inventory.html', runner.temp) || '' }}
+            ${{ runner.temp }}/inventory-timings/context.txt
+          if-no-files-found: warn
+          retention-days: 14
       # CAD-562: the CAD-536 generated tree must stay consistent with its
       # manifest — every declared item and every #[test] fn accounted
       # for (tests/split_map_inventory.rs is the suite-side twin check).
