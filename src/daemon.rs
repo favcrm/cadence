@@ -3758,7 +3758,7 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
                 let shared = Arc::clone(&shared);
                 thread::spawn(move || handle_conn(shared, stream));
             }
-            // WouldBlock is the idle nonblocking poll; ConnectionAborted
+            // WouldBlock is the idle nonblocking accept; ConnectionAborted
             // is the listener race — a queued connection reset before
             // accept (a client exiting mid-handshake) must not kill the
             // daemon.
@@ -3768,7 +3768,7 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::ConnectionAborted
                 ) =>
             {
-                std::thread::sleep(Duration::from_millis(50));
+                serve::accept_wait::wait_for_connection(&listener)?;
             }
             Err(e) => return Err(e.into()),
         }
