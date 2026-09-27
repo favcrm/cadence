@@ -17,9 +17,10 @@ use std::time::{Duration, Instant};
 /// kill and fall back to `unknown`.
 const GIT_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn git(args: &[&str]) -> Option<String> {
+pub(crate) fn git(checkout: &Path, args: &[&str]) -> Option<String> {
     let mut child = Command::new("git")
         .args(args)
+        .current_dir(checkout)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -43,40 +44,79 @@ fn git(args: &[&str]) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-/// Re-run this script when the checkout's commit moves. `.git` is a
-/// directory in a plain clone but a `gitdir:` file in a worktree —
-/// resolve it, watch its HEAD, and watch the ref HEAD names (or
-/// `packed-refs` when the ref is packed).
-fn watch_checkout() {
-    let dotgit = Path::new(".git");
+/// Existing directory watches catch loose-ref creation/deletion, including
+/// packing and unpacking. A missing watched file makes Cargo rerun forever.
+/// Watch packed-refs only while present: creating it cannot supersede a loose
+/// ref until that ref changes/disappears under the watched refs directory.
+/// Watch the nearest existing ref parent, not objects, index or reflogs.
+pub(crate) fn checkout_watch_paths(checkout: &Path) -> Vec<PathBuf> {
+    let dotgit = checkout.join(".git");
+    let mut paths = Vec::new();
     let gitdir = if dotgit.is_file() {
-        let Ok(text) = std::fs::read_to_string(dotgit) else {
-            return;
+        paths.push(dotgit.clone());
+        let Ok(text) = std::fs::read_to_string(&dotgit) else {
+            return paths;
         };
         let Some(rest) = text.trim().strip_prefix("gitdir:") else {
-            return;
+            return paths;
         };
-        PathBuf::from(rest.trim())
+        checkout.join(rest.trim())
     } else {
-        dotgit.to_path_buf()
+        dotgit
+    };
+    let Ok(gitdir) = gitdir.canonicalize() else {
+        return paths;
     };
     let head = gitdir.join("HEAD");
-    println!("cargo:rerun-if-changed={}", head.display());
+    if !head.is_file() {
+        // An incomplete Git directory can acquire HEAD later.
+        paths.push(gitdir);
+        return paths;
+    }
+    paths.push(head.clone());
     let Ok(head_text) = std::fs::read_to_string(&head) else {
-        return;
+        return paths;
     };
     let Some(reference) = head_text.trim().strip_prefix("ref:") else {
-        return;
+        return paths;
     };
-    // Worktree gitdirs point at the shared one via `commondir`.
-    let common = std::fs::read_to_string(gitdir.join("commondir"))
-        .ok()
-        .map(|c| gitdir.join(c.trim()))
-        .unwrap_or_else(|| gitdir.clone());
-    let ref_file = common.join(reference.trim());
-    println!("cargo:rerun-if-changed={}", ref_file.display());
+    // Worktree commondir paths are relative to the worktree's Git directory.
+    let commondir = gitdir.join("commondir");
+    let common = if commondir.is_file() {
+        paths.push(commondir.clone());
+        std::fs::read_to_string(&commondir)
+            .ok()
+            .map(|c| gitdir.join(c.trim()))
+            .unwrap_or_else(|| gitdir.clone())
+    } else {
+        gitdir
+    };
+    let Ok(common) = common.canonicalize() else {
+        return paths;
+    };
+    let mut ref_parent = common.join(reference.trim());
+    ref_parent.pop();
+    // Retain an existing ancestor if pruning removed a nested ref directory.
+    // Its directory watch observes that directory/ref being created again.
+    while !ref_parent.is_dir() {
+        if !ref_parent.pop() {
+            return paths;
+        }
+    }
+    paths.push(ref_parent);
     let packed = common.join("packed-refs");
-    println!("cargo:rerun-if-changed={}", packed.display());
+    if packed.is_file() {
+        paths.push(packed);
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn watch_checkout() {
+    for path in checkout_watch_paths(Path::new(".")) {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
 }
 
 fn main() {
@@ -98,7 +138,7 @@ fn main() {
     ] {
         println!(
             "cargo:rustc-env={var}={}",
-            git(&args).unwrap_or_else(unknown)
+            git(Path::new("."), &args).unwrap_or_else(unknown)
         );
     }
 }
