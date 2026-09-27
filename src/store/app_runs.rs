@@ -344,7 +344,7 @@ impl Store {
         let conn = self.conn();
         Self::app_run_show_in(&conn, id)
     }
-    fn app_run_show_in(conn: &Connection, id: &str) -> Result<Value> {
+    pub(super) fn app_run_show_in(conn: &Connection, id: &str) -> Result<Value> {
         let mut value=conn.query_row("SELECT install_id,epoch,snapshot,snapshot_digest,project_link,state,approved_digest FROM app_runs WHERE id=?",[id],|r|Ok(json!({"id":id,"install_id":r.get::<_,String>(0)?,"epoch":r.get::<_,i64>(1)?,"snapshot":r.get::<_,String>(2)?,"snapshot_digest":r.get::<_,String>(3)?,"project_link":r.get::<_,Option<String>>(4)?,"state":r.get::<_,String>(5)?,"approved_digest":r.get::<_,Option<String>>(6)?}))).optional()?.ok_or_else(||Error::rejected("unknown app run"))?;
         value["snapshot"] = serde_json::from_str(value["snapshot"].as_str().unwrap())
             .map_err(|e| Error::internal(e.to_string()))?;
@@ -415,7 +415,7 @@ impl Store {
         drop(conn);
         self.app_run_show(id)
     }
-    fn app_current_in(conn: &Connection, run: &Value, bundle: &str) -> Result<()> {
+    pub(super) fn app_current_in(conn: &Connection, run: &Value, bundle: &str) -> Result<()> {
         let found=conn.query_row("SELECT 1 FROM app_install_capabilities WHERE install_id=? AND epoch=? AND digest=? AND state='approved'",params![run["install_id"].as_str(),run["epoch"].as_i64(),bundle], |_|Ok(())).optional()?;
         if found.is_none() || run["snapshot"]["bundle_digest"].as_str() != Some(bundle) {
             return Err(Error::rejected(

@@ -17,10 +17,23 @@ CREATE INDEX IF NOT EXISTS app_effect_install_scope
 #[derive(Debug, Clone)]
 pub struct AppEffectPermit {
     pub effect_id: String,
+    pub platform: String,
+    pub account: String,
+    pub tool: String,
     pub input: Value,
     pub input_digest: String,
     pub authority_digest: String,
     pub provenance: Value,
+}
+
+/// Provenance carries this core receipt. Excluding that field prevents a
+/// self-referential hash; the release digest additionally pins all provenance.
+pub fn authority_digest(authority: &Value) -> String {
+    let mut core = authority.clone();
+    if let Some(object) = core.as_object_mut() {
+        object.remove("provenance");
+    }
+    app_runs::material_digest(&core)
 }
 
 pub fn input_digest(input: &Value) -> String {
@@ -42,6 +55,9 @@ fn validate_child(row: &EffectRow, authority: &Value) -> Result<()> {
         || !authority["artifact_id"].is_string()
         || !authority["provenance"].is_object()
         || row.input["provenance"] != authority["provenance"]
+        || row.input["provenance"]["effect_id"] != row.effect_id
+        || row.input["provenance"]["authorization_kind"] != "app_artifact"
+        || row.input["provenance"]["authority_digest"] != authority_digest(authority)
         || row.input["schema"] != 1
         || !row.input["title"].is_string()
         || row.source_name.is_some()
@@ -100,7 +116,7 @@ fn child_in(conn: &Connection, id: &str) -> Result<(EffectRow, Value, String)> {
         || authority["context"]["id"].as_str() != child.1.as_deref()
         || authority["run_id"] != child.2
         || authority["artifact_id"] != child.3
-        || app_runs::material_digest(&authority) != child.5
+        || authority_digest(&authority) != child.5
         || input_digest(&row.input) != child.6
         || release_digest(&row, &authority) != child.7
     {
@@ -126,14 +142,121 @@ pub fn read_execution_permit(path: &Path, effect_id: &str) -> Result<AppEffectPe
     }
     Ok(AppEffectPermit {
         effect_id: row.effect_id,
+        platform: row.platform,
+        account: row.account,
+        tool: row.tool,
         input_digest: input_digest(&row.input),
         input: row.input,
-        authority_digest: app_runs::material_digest(&authority),
+        authority_digest: authority_digest(&authority),
         provenance: authority["provenance"].clone(),
     })
 }
 
 impl Store {
+    pub fn app_publication_material(
+        &self,
+        run: &str,
+        artifact: &str,
+        bundle: &str,
+        slot: &str,
+    ) -> Result<Value> {
+        Self::app_publication_material_in(&self.conn(), run, artifact, bundle, slot)
+    }
+
+    /// Completion receipts describe the actual accepted historical turns.
+    /// Retiring those endpoints does not alter their recorded acceptance.
+    /// The installation, context and binding are nevertheless current here.
+    pub(crate) fn app_publication_material_in(
+        conn: &Connection,
+        id: &str,
+        artifact: &str,
+        bundle: &str,
+        slot: &str,
+    ) -> Result<Value> {
+        let run = Self::app_run_show_in(conn, id)?;
+        Self::app_current_in(conn, &run, bundle)?;
+        if run["state"] != "succeeded"
+            || run["approved_digest"] != run["snapshot_digest"]
+            || app_runs::material_digest(&run["snapshot"]) != run["snapshot_digest"]
+            || run["snapshot"]["schema"] != 3
+            || run["snapshot"]["publication"]["slot"] != slot
+        {
+            return Err(Error::rejected(
+                "publication requires an approved completed run with its exact frozen slot",
+            ));
+        }
+        let proof: super::app_bindings::BindingProof =
+            serde_json::from_value(run["snapshot"]["publication"]["binding"].clone())
+                .map_err(|_| Error::rejected("draft has no frozen publication binding"))?;
+        if !super::app_bindings::binding_current_in(
+            conn,
+            run["install_id"].as_str().unwrap(),
+            run["context_id"].as_str(),
+            slot,
+            &proof,
+        )? {
+            return Err(Error::rejected(
+                "frozen publication binding is no longer current",
+            ));
+        }
+        let (step,message,turn,producer,digest,media,body):(String,String,String,String,String,String,Vec<u8>) = conn.query_row(
+            "SELECT step_id,message_id,turn_id,producer,digest,media_type,substr(content,1,?) FROM app_run_artifacts WHERE id=? AND run_id=?",
+            params![(app_runs::ARTIFACT_BYTES+1) as i64,artifact,id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))).optional()?
+            .ok_or_else(||Error::rejected("artifact does not belong to this run"))?;
+        if body.is_empty()
+            || body.len() > app_runs::ARTIFACT_BYTES
+            || !matches!(media.as_str(), "text/plain" | "text/markdown")
+            || app_runs::artifact_digest(&body) != digest
+        {
+            return Err(Error::rejected(
+                "accepted artifact integrity or type is invalid",
+            ));
+        }
+        let producer_receipt =
+            historical_step_receipt(conn, &run, &step, &message, &producer, &turn)?;
+        if producer_receipt["material"]["kind"] != "produce_text"
+            || producer_receipt["material"]["outcome"] != "succeeded"
+            || producer_receipt["material"]["artifacts"][0]["text"]
+                .as_str()
+                .map(|text| text.as_bytes())
+                != Some(body.as_slice())
+        {
+            return Err(Error::rejected(
+                "artifact differs from its actual completed producer receipt",
+            ));
+        }
+        let review: (String,String,String,String) = conn.query_row(
+            "SELECT step_id,reviewer,message_id,rationale FROM app_run_reviews WHERE run_id=? AND artifact_id=? AND artifact_digest=? AND decision='approve' ORDER BY step_id LIMIT 1",
+            params![id,artifact,digest],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?
+            .ok_or_else(||Error::rejected("artifact has no accepted independent review"))?;
+        if review.1 == producer {
+            return Err(Error::rejected("artifact review is not independent"));
+        }
+        let review_turn: String = conn.query_row(
+            "SELECT turn_id FROM messages WHERE id=?",
+            [&review.2],
+            |r| r.get(0),
+        )?;
+        let reviewed =
+            historical_step_receipt(conn, &run, &review.0, &review.2, &review.1, &review_turn)?;
+        if reviewed["material"]["kind"] != "review_text"
+            || reviewed["material"]["decision"] != "approve"
+            || reviewed["material"]["producer_step_id"] != step
+            || reviewed["material"]["artifact_sha256"] != digest
+            || reviewed["material"]["rationale"] != review.3
+        {
+            return Err(Error::rejected(
+                "stored review differs from its actual accepted turn",
+            ));
+        }
+        let text = String::from_utf8(body)
+            .map_err(|_| Error::rejected("accepted artifact is not UTF-8 text"))?;
+        Ok(
+            json!({"run":run,"binding":proof,"artifact":{"id":artifact,"digest":digest,"media_type":media,"text":text},
+            "producer_receipt":producer_receipt,"review_receipt":reviewed}),
+        )
+    }
+
     pub fn app_effect_show(&self, id: &str) -> Result<Value> {
         let (row, authority, digest) = child_in(&self.conn(), id)?;
         Ok(envelope(&row, &authority, &digest))
@@ -203,7 +326,7 @@ impl Store {
                 authority["run_id"].as_str(),
                 authority["artifact_id"].as_str(),
                 authority.to_string(),
-                app_runs::material_digest(authority),
+                authority_digest(authority),
                 input_digest(&row.input),
                 digest
             ],
@@ -249,4 +372,70 @@ impl Store {
         tx.commit()?;
         Ok(Some(claimed))
     }
+}
+
+fn historical_step_receipt(
+    conn: &Connection,
+    run: &Value,
+    step: &str,
+    message: &str,
+    actor: &str,
+    turn: &str,
+) -> Result<Value> {
+    let (spec,identity,state,message_id,result_digest):(String,String,String,Option<String>,Option<String>) = conn.query_row(
+        "SELECT spec,identity_digest,state,message_id,result_digest FROM app_run_steps WHERE run_id=? AND step_id=?",
+        params![run["id"].as_str(),step],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
+    let spec: app_runs::LocalStep = serde_json::from_str(&spec)?;
+    let assignment = &run["snapshot"]["assignments"][step];
+    if state != "succeeded"
+        || message_id.as_deref() != Some(message)
+        || spec.assignee != actor
+        || assignment["alias"] != actor
+        || assignment["identity_digest"] != identity
+        || app_runs::material_digest(&assignment["identity"]) != identity
+    {
+        return Err(Error::rejected(
+            "completed step assignment receipt is invalid",
+        ));
+    }
+    let (alias, state, stored_turn, result): (String, String, Option<String>, Option<String>) =
+        conn.query_row(
+            "SELECT alias,state,turn_id,result FROM messages WHERE id=?",
+            [message],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?;
+    if alias != actor
+        || state != "completed"
+        || stored_turn.as_deref() != Some(turn)
+        || turn.is_empty()
+    {
+        return Err(Error::rejected(
+            "completed material turn receipt is invalid",
+        ));
+    }
+    let result: Value = serde_json::from_str(
+        result
+            .as_deref()
+            .ok_or_else(|| Error::rejected("completed material result is missing"))?,
+    )?;
+    let material: Value = match result["text"].as_str() {
+        Some(text) => serde_json::from_str(text)?,
+        None => result,
+    };
+    let digest =
+        app_runs::material_digest(&json!({"material":material,"producer":actor,"message":message}));
+    if result_digest.as_deref() != Some(digest.as_str())
+        || material["run_id"] != run["id"]
+        || material["step_id"] != step
+        || material["revision"] != 1
+        || material["schema"] != 1
+        || material["kind"] != spec.kind
+    {
+        return Err(Error::rejected(
+            "completed material result digest is invalid",
+        ));
+    }
+    Ok(
+        json!({"step_id":step,"message_id":message,"turn_id":turn,"actor":actor,"identity_digest":identity,"result_digest":digest,"material":material}),
+    )
 }
