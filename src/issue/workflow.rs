@@ -1699,6 +1699,26 @@ pub fn lint_dir(
 mod tests {
     use super::*;
 
+    #[test]
+    fn cad692_publication_slot_is_static_gate_material_and_removed_from_plan() {
+        let publication = WF.replace("inputs:", "publication_slot: publication\ninputs:");
+        assert_eq!(
+            parse_template(&publication)
+                .unwrap()
+                .publication_slot
+                .as_deref(),
+            Some("publication")
+        );
+        assert_ne!(gate_digest(&publication).unwrap(), gate_digest(WF).unwrap());
+        let rendered = render(&publication, &inputs(&[("topic", "rust")])).unwrap();
+        assert!(!rendered.contains("publication_slot:"));
+        assert!(plan::parse_plan(&rendered).is_ok());
+        for slot in ["{{topic}}", "[publication]", "bad.name", "null", "''"] {
+            let bad = WF.replace("inputs:", &format!("publication_slot: {slot}\ninputs:"));
+            assert!(parse_template(&bad).is_err(), "{bad}");
+        }
+    }
+
     const WF: &str = "---\ntitle: \"Post: {{topic}}\"\ngoal: \"Publish {{topic}} for {{keyword}}\"\n\
 inputs:\n  topic: { ask: \"About what?\" }\n  keyword: { ask: \"Phrase\", optional: true }\n---\n\n\
 Why.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance\n- [ ] brief written\n\n\

@@ -2751,6 +2751,29 @@ pub fn doctor(pm_dir: &Path, known: Option<&HashSet<String>>) -> Value {
 mod tests {
     use super::*;
 
+    #[test]
+    fn cad692_publication_declaration_is_provider_neutral_and_bounded() {
+        let good = "---\napp: studio\ntitle: Studio\nversion: 1\nneeds:\n  capabilities:\n    publication: {schema: 1, capability: text.publish, version: 1, action: publish, resource_kind: connection_account, effect: send}\n---\nGuide\n";
+        let manifest = parse_manifest(good).unwrap();
+        assert_eq!(
+            manifest.capabilities["publication"].capability,
+            "text.publish"
+        );
+        assert!(manifest.connections.is_empty());
+        for bad in [
+            good.replace("effect: send", "effect: send, tool: publish_app_text"),
+            good.replace("effect: send", "effect: send, provider: local"),
+            good.replace("version: 1, action:", "version: 2, action:"),
+            good.replace(
+                "capabilities:",
+                "connections: [publication]\n  capabilities:",
+            ),
+            good.replace("effect: send", "effect: draft"),
+        ] {
+            assert!(parse_manifest(&bad).is_err(), "{bad}");
+        }
+    }
+
     const APP_MD: &str = "---\napp: content-studio\ntitle: Content studio\nversion: 0.1.0\n\
 needs:\n  connections: [publish]\n---\n\n# Guide\n\nHow to run the studio.\n";
 
