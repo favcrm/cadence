@@ -36,7 +36,7 @@ fn cad631_material_digests_are_canonical_and_never_git_shas() {
     );
 }
 
-fn runtime_fixture() -> (TempDir, Store, Value) {
+pub(super) fn runtime_fixture() -> (TempDir, Store, Value) {
     let (dir, s) = store();
     for (alias, role) in [("lead", "pm"), ("writer", "worker"), ("reviewer", "worker")] {
         s.register_agent(&NewAgent {
