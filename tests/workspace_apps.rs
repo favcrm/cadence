@@ -305,6 +305,51 @@ fn cad667_http_install_and_reads_share_operator_authority() {
             "agent read exposed workspace installation {path}"
         );
     }
+}
+
+#[test]
+fn cad667_actual_enrolled_http_peers_and_detached_children_cannot_install_or_read() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use std::time::{Duration, Instant};
+    let w = Workspace::new();
+    let mut lane = LaneShell::spawn(w._root.path());
+    plant_member_pane(&w.daemon, "catalog-http", "claude", None, lane.pid());
+    let port = (3110..3200)
+        .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
+        .unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let opts = cadence_agent::ui::ServeOpts {
+        host: "127.0.0.1".into(),
+        port,
+        stop: Some(Arc::clone(&stop)),
+        test_seam: cfg!(feature = "test-seam"),
+        ..Default::default()
+    };
+    let state = w.daemon.state.clone();
+    let pm = w.pm.dir.clone();
+    let board = std::thread::spawn(move || cadence_agent::ui::serve(&state, &pm, &opts));
+    struct Cleanup(
+        Arc<AtomicBool>,
+        Option<std::thread::JoinHandle<cadence_agent::Result<()>>>,
+    );
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+            self.1.take().unwrap().join().unwrap().unwrap();
+        }
+    }
+    let _cleanup = Cleanup(stop, Some(board));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let row = w.install().unwrap();
+    let id = row["install_id"].as_str().unwrap();
+    let body = json!({"source":w.source()}).to_string();
     let installed_head = w.head();
     for prefix in ["", "setsid "] {
         for (method, path, body) in [
@@ -355,7 +400,8 @@ fn cad667_cli_catalog_namespace_preserves_legacy_offline_reads() {
         "legacy ls must retain its existing behavior"
     );
     let legacy: Value = serde_json::from_slice(&legacy.stdout).unwrap();
-    assert!(legacy.as_array().is_some());
+    assert!(legacy["apps"].as_array().is_some());
+    assert_eq!(legacy["count"], 0);
 }
 
 #[test]
@@ -376,6 +422,12 @@ fn cad667_git_failure_retains_pending_journal_and_explicit_recovery_delivers() {
     );
     assert_eq!(w.head(), head);
     let id = std::fs::read_to_string(w.pm.dir.join(".apps/install-pending.yaml")).unwrap();
+    assert!(
+        failed
+            .to_string()
+            .contains(&format!("cadence app catalog recover {id}")),
+        "failed install did not identify its explicit recovery: {failed}"
+    );
     assert!(w
         .pm
         .dir
@@ -653,4 +705,104 @@ fn cad667_workspace_snapshot_preserves_existing_aggregate_bundle_limit() {
     assert!(refused.to_string().contains("limit") || refused.to_string().contains("large"));
     assert_eq!(w.head(), before);
     assert!(!w.pm.dir.join(".apps").exists());
+}
+
+#[test]
+fn cad667_migration_delivery_failure_keeps_reads_and_installs_closed_until_explicit_retry() {
+    use std::os::unix::fs::PermissionsExt;
+    for rollback in [false, true] {
+        let w = Workspace::new();
+        let base = w.pm.dir.join("client/apps/legacy");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(
+            w.pm.dir.join("client/project.yaml"),
+            "key: client\nprefix: C\n",
+        )
+        .unwrap();
+        std::fs::write(
+            base.join("app.md"),
+            "---\napp: legacy\ntitle: Legacy\nversion: 1\n---\nGuide\n",
+        )
+        .unwrap();
+        let record = w.pm.dir.join("client/apps/legacy.yaml");
+        std::fs::write(&record,"schema: 1\napp: legacy\ninstall_id: stable-migration\nsource:\n  kind: path\n  path: /legacy\ninstalled_at: yesterday\ninstalled_by: operator\n").unwrap();
+        let original_record = std::fs::read(&record).unwrap();
+        let hook = w.pm.dir.join(".git/hooks/pre-commit");
+        let original_hook = std::fs::read(&hook).ok();
+        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let head = w.head();
+        let failed = w
+            .daemon
+            .operator_rpc("app_workspace_migrate", json!({}))
+            .unwrap_err();
+        assert_eq!(w.head(), head);
+        let pending = w.pm.dir.join(".apps/pending.yaml");
+        assert!(
+            pending.exists(),
+            "migration publication was exposed before failed Git delivery could be retried"
+        );
+        let pending: serde_yaml::Value =
+            serde_yaml::from_slice(&std::fs::read(&pending).unwrap()).unwrap();
+        let id = pending["journal"].as_str().unwrap();
+        assert!(
+            failed
+                .to_string()
+                .contains(&format!("cadence app catalog migration-recover {id}")),
+            "failed migration did not identify its explicit recovery: {failed}"
+        );
+        assert!(w
+            .daemon
+            .operator_rpc("app_workspace_list", json!({}))
+            .is_err());
+        assert!(w
+            .daemon
+            .operator_rpc(
+                "app_workspace_show",
+                json!({"install_id":"stable-migration"})
+            )
+            .is_err());
+        assert!(
+            w.install().is_err(),
+            "new install swallowed an undelivered migration"
+        );
+        assert!(w
+            .daemon
+            .operator_rpc(
+                "app_workspace_migration_recover",
+                json!({"journal_id":id,"rollback":rollback})
+            )
+            .is_err());
+        assert!(
+            w.pm.dir.join(".apps/pending.yaml").exists(),
+            "failed recovery Git delivery removed its refusal gate"
+        );
+        match original_hook {
+            Some(bytes) => std::fs::write(&hook, bytes).unwrap(),
+            None => std::fs::remove_file(&hook).unwrap(),
+        }
+        let delivered = w
+            .daemon
+            .operator_rpc(
+                "app_workspace_migration_recover",
+                json!({"journal_id":id,"rollback":rollback}),
+            )
+            .unwrap();
+        assert_eq!(delivered["committed"], true);
+        assert!(!w.pm.dir.join(".apps/pending.yaml").exists());
+        assert_eq!(std::fs::read(record).unwrap(), original_record);
+        if rollback {
+            assert!(!w.pm.dir.join(".apps/catalog.yaml").exists());
+        } else {
+            assert_eq!(
+                w.daemon
+                    .operator_rpc(
+                        "app_workspace_show",
+                        json!({"install_id":"stable-migration"})
+                    )
+                    .unwrap()["install_id"],
+                "stable-migration"
+            );
+        }
+    }
 }
