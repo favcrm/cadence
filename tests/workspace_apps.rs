@@ -435,3 +435,32 @@ fn cad667_git_failure_retains_pending_journal_and_explicit_recovery_delivers() {
         1
     );
 }
+
+#[test]
+fn cad667_workspace_source_credentials_refuse_before_clone_or_persistence() {
+    let w = Workspace::new();
+    let head = w.head();
+    let marker = ["cad667", "test", "fixture"].join("-");
+    for source in [
+        format!("https://user:{marker}@example.invalid/app.git"),
+        format!("ssh://git:{marker}@example.invalid/app.git"),
+        format!("https://example.invalid/app.git?token={marker}"),
+        format!("https://example.invalid/app.git#{marker}"),
+    ] {
+        let error = w
+            .daemon
+            .operator_rpc("app_workspace_install", json!({"source":source}))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !error.contains(&marker),
+            "credential leaked in source refusal"
+        );
+        assert!(
+            error.contains("credential"),
+            "wrong source boundary: {error}"
+        );
+        assert_eq!(w.head(), head);
+        assert!(!w.pm.dir.join(".apps").exists());
+    }
+}
