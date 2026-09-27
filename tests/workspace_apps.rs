@@ -15,6 +15,24 @@ impl Workspace {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
         let pm = Pm::init(&root.path().join("pm")).unwrap();
+        let source = root.path().join("source");
+        for name in [
+            "app.md",
+            "workflows/blog-post.md",
+            "rubrics/blog.md",
+            "templates/brief.md",
+            "templates/post.md",
+        ] {
+            let destination = source.join(name);
+            std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            std::fs::copy(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("apps/blog-post")
+                    .join(name),
+                destination,
+            )
+            .unwrap();
+        }
         let opts = daemon_opts();
         opts.provider_env
             .set("CADENCE_PM_DIR", pm.dir.to_str().unwrap());
@@ -26,7 +44,7 @@ impl Workspace {
         }
     }
     fn source(&self) -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("apps/blog-post")
+        self._root.path().join("source")
     }
     fn install(&self) -> cadence_agent::Result<Value> {
         self.daemon
@@ -553,4 +571,65 @@ fn cad667_installed_manifest_cannot_relabel_a_stable_installation() {
         .daemon
         .operator_rpc("app_workspace_list", json!({}))
         .is_err());
+}
+
+#[test]
+fn cad667_flat_text_rubrics_and_templates_keep_legacy_bundle_compatibility() {
+    let w = Workspace::new();
+    std::fs::write(w.source().join("templates/outline.txt"), "An outline").unwrap();
+    std::fs::write(
+        w.source().join("rubrics/check.html"),
+        "<p>Review carefully</p>",
+    )
+    .unwrap();
+    let installed = w
+        .install()
+        .expect("existing flat text bundle grammar must remain accepted");
+    let id = installed["install_id"].as_str().unwrap();
+    let shown = w
+        .daemon
+        .operator_rpc("app_workspace_show", json!({"install_id":id}))
+        .unwrap();
+    assert!(shown["files"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("templates/outline.txt")));
+    let legacy = w.pm.dir.join("client/apps/legacy");
+    std::fs::create_dir_all(legacy.join("templates")).unwrap();
+    std::fs::write(
+        w.pm.dir.join("client/project.yaml"),
+        "key: client\nprefix: C\n",
+    )
+    .unwrap();
+    std::fs::write(
+        legacy.join("app.md"),
+        "---\napp: legacy\ntitle: Legacy\nversion: 1\n---\nGuide\n",
+    )
+    .unwrap();
+    std::fs::write(
+        legacy.join("templates/outline.html"),
+        "<p>Legacy outline</p>",
+    )
+    .unwrap();
+    std::fs::write(w.pm.dir.join("client/apps/legacy.yaml"),"schema: 1\napp: legacy\ninstall_id: legacy-text\nsource:\n  kind: path\n  path: /legacy\ninstalled_at: yesterday\ninstalled_by: operator\n").unwrap();
+    w.daemon
+        .operator_rpc("app_workspace_migrate", json!({}))
+        .unwrap();
+    let shown = w
+        .daemon
+        .operator_rpc("app_workspace_show", json!({"install_id":"legacy-text"}))
+        .unwrap();
+    assert!(shown["files"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("templates/outline.html")));
+    assert_eq!(
+        w.daemon
+            .operator_rpc("app_workspace_list", json!({}))
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
 }
