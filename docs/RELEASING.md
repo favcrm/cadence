@@ -4,26 +4,33 @@ This is preparation, not publication authorization. No tag or release was
 created for this increment. Source, review, CI, installation evidence and
 release approval must be recorded before publication.
 
-## Candidate assessment
+## Prepared version; candidate selection pending
 
-The lane started from main `4db1359b1f2d2adab790694818c8fb9fcbe7a7b4` with
-Cargo version `0.1.0`. This is an assessment baseline, **not the approved release
-candidate**. Select a fresh reviewed exact main commit after release blockers
-are resolved. Unmerged PRs and draft issuer contracts are not shipped capabilities.
+Cargo.toml and Cargo.lock are prepared as **0.1.0-beta.1**, with matching planned
+tag **v0.1.0-beta.1** and release title **Cadence 0.1.0-beta.1 — local CLI pilot**.
+No release candidate SHA is selected and no tag or release is created. Select
+a fresh reviewed exact main commit only after the version/source prerequisites
+land and the release evidence is accepted. A preparation PR head is not the
+publication candidate. Unmerged PRs and issuer contracts are not shipped
+capabilities.
 
-Recommend an explicitly labeled pilot prerelease for the first public install.
-The existing gate requires the tag to equal `v` plus Cargo.toml's exact version:
-`v0.1.0-beta.1` therefore needs a reviewed Cargo.toml/Cargo.lock version change
-before tagging. The current Cargo version permits only `v0.1.0`, which GitHub
-would treat as stable. Do not create a prerelease tag against mismatching source
-or advertise cloud production readiness based on a local CLI pilot.
+The tag gate requires `v` plus Cargo.toml's exact version. The publisher sets
+`prerelease=true` and `latest=false` for the pilot on both new and reused drafts;
+stable versions use explicit false/true respectively. Classification reads the
+prerelease portion before any build metadata, so a build-metadata hyphen alone
+does not imply prerelease. Already published releases are never edited on a
+rerun: differing prerelease classification or asset bytes refuse the rerun.
+The workflow does not promote an existing published version to latest on a
+rerun. See the GitHub CLI [create](https://cli.github.com/manual/gh_release_create)
+and [edit](https://cli.github.com/manual/gh_release_edit) flags. A beta label
+does not advertise cloud production readiness.
 
 ## Outstanding publication evidence
 
 | Requirement | Current owner / next evidence |
 |---|---|
 | Exact reviewed main SHA and version | Release PM selects after blockers; copy SHA from git/gh |
-| Explicit required gate results | CAD-420; skipped/failed jobs cannot count as passing |
+| Explicit required gate results | CAD-420 source merged; actual candidate/tag run evidence still required |
 | Clean supported-platform installs | CAD-317, using actual published assets after publication |
 | Customer public upgrade channel | CAD-661/CAD-561 coordination; currently internal CI channel |
 | Final release approval | `release` environment currently names `cc-syntax` |
@@ -53,14 +60,39 @@ Review changes to this workflow and its evidence predicates independently;
 these checks do not implement CAD-120's trusted external QA boundary or prevent
 an authorized workflow change from replacing a gate with a weaker job.
 
-## Release notes to complete for the approved candidate
+## Proposed local pilot notes
+
+Cadence 0.1.0-beta.1 is a local CLI pilot: a native controller and embedded
+browser board for local project and coding-agent coordination. Evaluate on
+fresh, separate local state; existing production-state compatibility and schema
+rollback are not established by a clean install.
+
+Planned packages are Linux x86_64, Linux ARM64 (glibc 2.35 baseline) and Apple
+Silicon macOS. Intel macOS, Windows and Alpine/musl packages are not provided.
+Real tagged-archive/platform installation results remain pending. Provider
+CLIs/authentication and tmux for terminal providers are separate prerequisites;
+list only combinations actually verified for the eventual candidate.
+
+Browser/token support is issuer-client preparation, not working public cloud
+login, enrollment or assignment delivery. Local offline outbox persistence is
+a foundation, not proof of remote transport, applied receipts or sleep-safe
+delivery. Hosted remote teams and local-to-cloud production migration remain
+separate acceptance work. The public stable-release updater is not implemented;
+current update/upgrade commands use the authenticated internal CI channel.
+
+For the pilot use its explicit published tag, never stable `latest` convenience
+installation. Selecting another installer version is not a coordinated running
+daemon upgrade or compatible state rollback. No download link below is claimed
+available until the release exists and public installation is verified.
+
+## Evidence annex to complete for the approved candidate
 
 Use the following content in the release draft, replacing placeholders with
 verified evidence before the environment approval. The workflow can reuse an
 existing draft, upload the artifacts and publish after approval.
 
 ```text
-Cadence <version> — local CLI pilot
+Cadence 0.1.0-beta.1 — local CLI pilot
 
 Native CLI and embedded board for local agent coordination. Supported assets:
 Linux x86_64, Linux ARM64 (glibc 2.35 baseline), Apple Silicon macOS.
@@ -69,11 +101,11 @@ No Intel macOS, Windows or musl package.
 Provider CLIs/authentication and tmux for terminal providers are separate.
 List only provider/platform combinations actually verified for this candidate.
 Hosted browser login, remote local worker teams and local-to-cloud migration
-are not claimed operational by this release unless exact-candidate acceptance
-evidence establishes them. Public stable automatic upgrades are not yet verified.
+are not claimed operational. Public stable-release updater is not implemented.
 
 Source SHA: <copied exact SHA>
-Tag: <exact Cargo version prefixed with v>
+Tag: v0.1.0-beta.1 (planned, not created)
+Classification: prerelease=true; latest=false (must verify actual release metadata)
 CI run and all required gate conclusions: <links/results>
 Clean installation evidence: <platform links; distinguish pre/post-publication>
 Installer and provenance guide: <tag-pinned docs/INSTALL-AGENT.md URL>
@@ -93,7 +125,9 @@ are not sufficient capability or compatibility notes.
    publisher creates the tag; no production daemon rollout follows implicitly.
 3. The tag workflow reruns gates, builds the UI-embedded binaries on each target,
    checks reported version/SHA and publishes through the `release` environment.
-   The final approver verifies the draft notes and actual gate/build results.
+   The final approver verifies the draft notes, prerelease/latest classification
+   and actual gate/build results. Synthetic workflow-policy tests do not prove
+   the real tag event, API side effects or release metadata.
 4. Record tag, source SHA, run URL/attempt, release URL, publisher and approval.
    Assets must be exactly `install.sh` and each target's
    `cadence-<tag>-<target>.tar.gz` plus matching `.tar.gz.sha256`.
