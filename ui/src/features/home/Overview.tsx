@@ -472,15 +472,14 @@ function ProjectScope({
         )}
         {context && docs.length > shown.length && (
           <p className="text-micro text-ink-500">
-            {docs.length - shown.length} more documents on Context
+            Showing {shown.length} of {docs.length} source documents
           </p>
         )}
         <button
           onClick={onOpenContext}
           className="lnk text-label"
-          title="full context — manifest, excerpts and verified memory"
         >
-          open context →
+          Open project context →
         </button>
       </div>
     </section>
