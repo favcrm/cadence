@@ -435,3 +435,38 @@ fn cad688_exhausted_sqlite_revision_refuses_without_changing_custody() {
         b"cadp-limit-original"
     );
 }
+
+#[test]
+fn cad688_metadata_constant_token_refuses_before_any_enrollment_write() {
+    let d = fixture();
+    let before = d.operator_rpc("connection_list", json!({})).unwrap();
+    let db = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    let events = db
+        .query_row("SELECT count(*) FROM events", [], |r| r.get::<_, i64>(0))
+        .unwrap();
+    for token in ["token", "operator", "descriptor_available"] {
+        assert!(d
+            .operator_rpc("connection_create", create("constant-secret", token))
+            .is_err());
+        assert_eq!(
+            d.operator_rpc("connection_list", json!({})).unwrap(),
+            before,
+            "constant token persisted metadata"
+        );
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM events", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            events
+        );
+        assert!(cadence_agent::platform::Custody::open(&d.state)
+            .unwrap()
+            .load(
+                "file",
+                &cadence_agent::platform::Key {
+                    platform: "fixture",
+                    account: "constant-secret"
+                }
+            )
+            .is_err());
+    }
+}
