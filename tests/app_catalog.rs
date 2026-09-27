@@ -535,3 +535,65 @@ fn cad630_migration_orders_after_a_cooperating_update_and_grant_revocation() {
     );
     assert!(store.platform_grants(Some("worker-a")).unwrap().is_empty());
 }
+
+#[test]
+fn cad667_cached_catalog_refuses_removed_publication_with_intact_record() {
+    let f = Fixture::new();
+    let record = f.install("client", "install-a");
+    let catalog =
+        test_seam::scoped(Asserted::Operator, || app_catalog::migrate(&f.pm, &f.state)).unwrap();
+    let before = bytes(&record);
+    std::fs::remove_file(f.pm.dir.join(".apps/catalog.yaml")).unwrap();
+    assert!(
+        catalog.resolve_id(&f.pm.dir, "install-a").is_err(),
+        "cached resolution outlived its published catalog"
+    );
+    assert_eq!(bytes(&record), before);
+}
+
+#[test]
+fn cad667_cached_catalog_refuses_remapping_even_when_old_record_survives() {
+    let f = Fixture::new();
+    f.install("client-a", "install-a");
+    f.install("client-b", "install-b");
+    let catalog =
+        test_seam::scoped(Asserted::Operator, || app_catalog::migrate(&f.pm, &f.state)).unwrap();
+    let path = f.pm.dir.join(".apps/catalog.yaml");
+    let mut published: serde_yaml::Value = serde_yaml::from_slice(&bytes(&path)).unwrap();
+    published["installations"]
+        .as_mapping_mut()
+        .unwrap()
+        .remove(serde_yaml::Value::String("install-a".into()));
+    std::fs::write(path, serde_yaml::to_string(&published).unwrap()).unwrap();
+    assert!(
+        catalog.resolve_id(&f.pm.dir, "install-a").is_err(),
+        "cached identity returned despite current publication removal"
+    );
+    assert!(catalog
+        .resolve_legacy(&f.pm.dir, "client-a", "social-content")
+        .is_err());
+    assert!(app_catalog::Catalog::load(&f.pm.dir)
+        .unwrap()
+        .resolve_id(&f.pm.dir, "install-b")
+        .is_ok());
+}
+
+#[test]
+fn cad667_global_inventory_bounds_irrelevant_names_before_publication() {
+    let f = Fixture::new();
+    let record = f.install("client", "install-a");
+    let before = bytes(&record);
+    for index in 0..1100 {
+        std::fs::create_dir(f.pm.dir.join(format!("irrelevant-{index}"))).unwrap();
+    }
+    let result = test_seam::scoped(Asserted::Operator, || app_catalog::migrate(&f.pm, &f.state));
+    assert!(
+        result.is_err(),
+        "mostly irrelevant inventory bypassed the global enumeration bound"
+    );
+    assert_eq!(bytes(&record), before);
+    assert!(
+        !f.pm.dir.join(".apps").exists(),
+        "oversized inventory partially published"
+    );
+}
