@@ -91,7 +91,10 @@ def referenced_changes(root, changes):
             continue
         text = file.read_bytes()
         for path, name in names.items():
-            if path.encode() in text or name.encode() in text:
+            stem = Path(path).stem.encode()
+            module = (path.endswith(".rs") and source.endswith(".rs")
+                      and re.search(rb"\bmod\s+" + re.escape(stem) + rb"\b", text))
+            if path.encode() in text or name.encode() in text or module:
                 return source + " references " + path
     return None
 

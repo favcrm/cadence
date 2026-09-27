@@ -52,9 +52,11 @@ class Selection(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             (root / "tests").mkdir()
-            (root / "tests/consumer.rs").write_text('include!("foo.rs");')
-            with patch.object(policy.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"tests/foo.rs\0tests/consumer.rs\0")):
-                self.assertIn("consumer.rs references tests/foo.rs", policy.referenced_changes(root, [("M", "tests/foo.rs")]))
+            for text in ('include!("foo.rs");', 'mod foo;', 'pub mod foo;'):
+                with self.subTest(text=text):
+                    (root / "tests/consumer.rs").write_text(text)
+                    with patch.object(policy.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"tests/foo.rs\0tests/consumer.rs\0")):
+                        self.assertIn("consumer.rs references tests/foo.rs", policy.referenced_changes(root, [("M", "tests/foo.rs")]))
 
     def test_bad_event_or_missing_tool_falls_back_in_real_cli(self):
         with tempfile.TemporaryDirectory() as temp:
