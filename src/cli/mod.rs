@@ -138,6 +138,29 @@ pub(crate) enum ReviewAction {
 
 #[derive(Subcommand)]
 pub(crate) enum Commands {
+    /// Authenticate to an AgenticOS issuer. Hosted Cadence RPC is not yet configured.
+    Login {
+        /// AgenticOS HTTPS issuer origin (no path).
+        #[arg(long)]
+        issuer: String,
+        /// Exact AgenticOS workspace ID to authorize.
+        #[arg(long)]
+        org: String,
+        /// Read an existing credential from stdin; never accept secrets in argv.
+        #[arg(long)]
+        token_stdin: bool,
+        /// Print the authorization URL/code without opening a browser.
+        #[arg(long, conflicts_with = "token_stdin")]
+        no_open: bool,
+        /// Isolated credential directory; defaults to XDG_CONFIG_HOME/cadence/remote-auth.
+        #[arg(long)]
+        auth_dir: Option<PathBuf>,
+    },
+    /// Inspect or remove local AgenticOS credentials.
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
     /// Check environment, storage and provider CLIs. `--host` instead
     /// runs the read-only host watchdog — disk free, provider store and
     /// WAL growth, per-user pipe pressure, orphaned processes from
@@ -1452,6 +1475,24 @@ pub(crate) enum Commands {
         /// `CADENCE_PERMISSION_TIMEOUT_SECS`, default 900).
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         timeout_secs: Option<u64>,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum AuthAction {
+    /// Verify with the issuer; CADENCE_TOKEN takes precedence and is never persisted.
+    Status {
+        #[arg(long)]
+        issuer: Option<String>,
+        #[arg(long)]
+        org: Option<String>,
+        #[arg(long)]
+        auth_dir: Option<PathBuf>,
+    },
+    /// Remove the local credential; server revocation remains an AgenticOS action.
+    Logout {
+        #[arg(long)]
+        auth_dir: Option<PathBuf>,
     },
 }
 
@@ -3188,6 +3229,37 @@ fn permission_replay(state_dir: &Path, cli: &Cli) -> Option<i32> {
 
 pub(crate) fn run() -> Result<i32> {
     let cli = Cli::try_parse().unwrap_or_else(|e| email_flag_error(&e).unwrap_or(e).exit());
+    // Remote credentials are independent of local daemon state and sandbox adoption.
+    match &cli.command {
+        Commands::Login {
+            issuer,
+            org,
+            token_stdin,
+            no_open,
+            auth_dir,
+        } => {
+            let dir = cadence_agent::remote_auth::auth_dir(auth_dir.as_deref())?;
+            return cadence_agent::remote_auth::login(issuer, org, &dir, *token_stdin, *no_open);
+        }
+        Commands::Auth { action } => {
+            return match action {
+                AuthAction::Status {
+                    issuer,
+                    org,
+                    auth_dir,
+                } => cadence_agent::remote_auth::status(
+                    auth_dir.as_deref(),
+                    issuer.as_deref(),
+                    org.as_deref(),
+                ),
+                AuthAction::Logout { auth_dir } => {
+                    let dir = cadence_agent::remote_auth::auth_dir(auth_dir.as_deref())?;
+                    cadence_agent::remote_auth::logout(&dir)
+                }
+            }
+        }
+        _ => {}
+    }
     // ADR 0007 T1: dispatch before any state-dir resolution or sandbox
     // adoption — under sudo those would resolve root's home and could
     // write beneath it. The agent-uid lane is its own host surface.
@@ -3235,6 +3307,9 @@ pub(crate) fn run() -> Result<i32> {
         return Ok(code);
     }
     match cli.command {
+        Commands::Login { .. } | Commands::Auth { .. } => {
+            unreachable!("auth dispatched before state-dir")
+        }
         Commands::Doctor {
             host,
             json,

@@ -44,6 +44,7 @@ pub mod platform;
 pub mod proc;
 pub mod proto;
 pub mod reaper;
+pub mod remote_auth;
 pub mod review;
 pub mod rollout;
 pub mod runner;
