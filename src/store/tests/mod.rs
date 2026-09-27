@@ -396,3 +396,50 @@ include!("queue.rs");
 include!("schema.rs");
 
 mod app_runs;
+
+#[test]
+fn cad688_schema20_connection_ids_backfill_atomically_and_survive_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cadence.sqlite3");
+    drop(Store::open(&path).unwrap());
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute_batch("DROP TABLE platform_credentials;
+        CREATE TABLE platform_credentials(platform TEXT NOT NULL,account TEXT NOT NULL,scopes TEXT NOT NULL,fingerprint TEXT NOT NULL,custody TEXT NOT NULL,exchange TEXT NOT NULL,enrolled_at REAL NOT NULL,by TEXT NOT NULL,PRIMARY KEY(platform,account));
+        INSERT INTO platform_credentials VALUES('fixture','old-account','[\"widgets:read\"]','old-fingerprint','file','token',1,'operator');
+        DROP TABLE IF EXISTS connection_metadata;
+        UPDATE schema_version SET version=20;
+        CREATE TRIGGER reject_connection_schema BEFORE UPDATE ON schema_version WHEN NEW.version=21 BEGIN SELECT RAISE(ABORT,'migration denied'); END;").unwrap();
+    assert!(Store::open(&path).is_err());
+    assert_eq!(
+        db.query_row("SELECT version FROM schema_version", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        20
+    );
+    assert!(db
+        .prepare("SELECT connection_id FROM platform_credentials")
+        .is_err());
+    db.execute_batch("DROP TRIGGER reject_connection_schema")
+        .unwrap();
+    drop(db);
+    let store = Store::open(&path).unwrap();
+    let row = store
+        .platform_credential("fixture", "old-account")
+        .unwrap()
+        .unwrap();
+    assert!(!row.connection_id.is_empty());
+    assert_eq!(row.credential_revision, 1);
+    assert_eq!(row.fingerprint, "old-fingerprint");
+    let namespace = store.connection_workspace_id().unwrap();
+    drop(store);
+    let reopened = Store::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .platform_credential("fixture", "old-account")
+            .unwrap()
+            .unwrap()
+            .connection_id,
+        row.connection_id
+    );
+    assert_eq!(reopened.connection_workspace_id().unwrap(), namespace);
+}
