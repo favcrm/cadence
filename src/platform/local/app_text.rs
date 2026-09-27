@@ -188,6 +188,12 @@ pub(super) fn execute(
     let input_digest = format!("sha256:{}", sha256_hex(input.to_string().as_bytes()));
     let artifact_digest = format!("sha256:{}", sha256_hex(text.body.as_bytes()));
     if permit.effect_id != effect_id
+        || permit.platform != "local"
+        || permit.account != "local"
+        || permit.tool != "publish_app_text"
+        || text.provenance["effect_id"] != effect_id
+        || text.provenance["authorization_kind"] != "app_artifact"
+        || text.provenance["authority_digest"] != permit.authority_digest
         || permit.input != *input
         || permit.input_digest != input_digest
         || permit.provenance != text.provenance
@@ -203,7 +209,10 @@ pub(super) fn execute(
     if let Ok(item) = child(&parent, effect_id.as_bytes(), false) {
         let index: Value = serde_json::from_slice(&read_file(&item, "index.json")?)
             .map_err(|_| "invalid app outbox index".to_string())?;
-        if index["input_digest"] != input_digest
+        if index["effect_id"] != effect_id
+            || index["scope"]["kind"] != "app_artifact"
+            || index["provenance"] != text.provenance
+            || index["input_digest"] != input_digest
             || index["authority_digest"] != permit.authority_digest
             || read_file(&item, "post.md")? != render(&text).as_bytes()
         {
@@ -272,35 +281,46 @@ pub(super) fn read_back(adapter: &LocalAdapter, input: &Value) -> Verified {
     let Ok(text) = parse(input) else {
         return Verified::False;
     };
+    let Some(effect_id) = text.provenance["effect_id"].as_str() else {
+        return Verified::False;
+    };
+    let Some(authority_digest) = text.provenance["authority_digest"]
+        .as_str()
+        .filter(|digest| !digest.is_empty())
+    else {
+        return Verified::False;
+    };
+    if crate::proto::identifier(effect_id, "effect_id").is_err()
+        || text.provenance["authorization_kind"] != "app_artifact"
+        || text.provenance["sink_registration"].as_str()
+            != adapter.connection_registration().as_deref()
+    {
+        return Verified::False;
+    }
     let digest = format!("sha256:{}", sha256_hex(input.to_string().as_bytes()));
     let Ok(parent) = bucket(&adapter.outbox, false) else {
         return Verified::Unknown;
     };
-    let Ok(items) = std::fs::read_dir(adapter.outbox.join(APP_BUCKET)) else {
+    let Ok(item) = child(&parent, effect_id.as_bytes(), false) else {
         return Verified::Unknown;
     };
-    for entry in items.flatten() {
-        let Ok(item) = child(&parent, entry.file_name().as_bytes(), false) else {
-            continue;
-        };
-        let Ok(bytes) = read_file(&item, "index.json") else {
-            continue;
-        };
-        let Ok(index) = serde_json::from_slice::<Value>(&bytes) else {
-            continue;
-        };
-        if index["input_digest"] == digest
-            && index["scope"]["kind"] == "app_artifact"
-            && index["provenance"] == text.provenance
-        {
-            return if read_file(&item, "post.md")
-                .is_ok_and(|bytes| bytes == render(&text).as_bytes())
-            {
-                Verified::True
-            } else {
-                Verified::False
-            };
-        }
+    let Ok(bytes) = read_file(&item, "index.json") else {
+        return Verified::False;
+    };
+    let Ok(index) = serde_json::from_slice::<Value>(&bytes) else {
+        return Verified::False;
+    };
+    if index["effect_id"] != effect_id
+        || index["authority_digest"] != authority_digest
+        || index["input_digest"] != digest
+        || index["scope"]["kind"] != "app_artifact"
+        || index["provenance"] != text.provenance
+    {
+        return Verified::False;
     }
-    Verified::Unknown
+    if read_file(&item, "post.md").is_ok_and(|bytes| bytes == render(&text).as_bytes()) {
+        Verified::True
+    } else {
+        Verified::False
+    }
 }
