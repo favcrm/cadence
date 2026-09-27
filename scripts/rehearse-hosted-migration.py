@@ -200,19 +200,25 @@ def foreign_git_storage(iso, directory, roots):
     `rev-parse --absolute-git-dir` alone is not the boundary: a worktree
     gitdir carries a `commondir` file to the real repository, and every
     object store can name `objects/info/alternates` targets of its own.
-    Follow the whole chain — the remote read comes from the common dir's
-    config and `cat-file`/clone reads come from every alternate.
+    Every path is resolved before it is compared — a symlink or `..`
+    segment cannot launder an escape — and a store is contained *before*
+    its alternates file is read, so a foreign store is never traversed.
     """
+    def inside(path):
+        return any(path == root or path.is_relative_to(root) for root in roots)
+
     gitdir = Path(iso.run('git', '-C', str(directory), 'rev-parse',
-                          '--absolute-git-dir'))
+                          '--absolute-git-dir')).resolve()
     common = Path(iso.run('git', '-C', str(directory), 'rev-parse',
-                          '--path-format=absolute', '--git-common-dir'))
-    reached = {gitdir, common}
+                          '--path-format=absolute', '--git-common-dir')).resolve()
+    foreign = [str(p) for p in (gitdir, common) if not inside(p)]
     pending = [gitdir / 'objects', common / 'objects']
     seen = set(pending)
     while pending:
-        objects = pending.pop()
-        reached.add(objects)
+        objects = pending.pop().resolve()
+        if not inside(objects):
+            foreign.append(str(objects))
+            continue
         alternates = objects / 'info' / 'alternates'
         if not alternates.is_file():
             continue
@@ -222,12 +228,12 @@ def foreign_git_storage(iso, directory, roots):
                 continue
             target = Path(line)
             if not target.is_absolute():
-                target = (objects / target).resolve()
+                target = objects / target
+            target = target.resolve()
             if target not in seen:
                 seen.add(target)
                 pending.append(target)
-    return [str(t) for t in reached
-            if not any(t == root or t.is_relative_to(root) for root in roots)]
+    return sorted(set(foreign))
 
 
 def refuse_foreign_checkouts(db_path, roots, iso):
@@ -316,11 +322,29 @@ def recorded_repos(bundle):
 def clean_tracker(iso, tracker):
     """The tracker's commit, read without writing anything in it."""
     tracker = Path(tracker)
+    # A copied split index still carries the link extension naming the
+    # live gitdir's sharedindex files: a status refresh rewrites them in
+    # place, and even `update-index --no-split-index` creates a new live
+    # sharedindex. No borrowed-file trick avoids it, so a split tracker is
+    # refused outright — the operator de-splits their own clone.
+    for gd in (Path(iso.run('git', '-C', str(tracker), 'rev-parse',
+                            '--absolute-git-dir')),
+               Path(iso.run('git', '-C', str(tracker), 'rev-parse',
+                            '--path-format=absolute', '--git-common-dir'))):
+        if list(gd.glob('sharedindex.*')):
+            raise ValueError(
+                f'tracker uses a split index — refresh rewrites {gd}/'
+                'sharedindex.* in place and the rehearsal never writes to '
+                'it; run `git update-index --no-split-index` in the tracker '
+                'clone first')
     with iso.borrowed_index(tracker) as index:
         # `--untracked-files=all` and the throwaway index beat a repository
-        # config that would otherwise hide untracked files from this check.
+        # config that would otherwise hide untracked files from this check;
+        # index.splitIndex=false also refuses the write a repo config with
+        # splitIndex=true would otherwise trigger on refresh.
         status = iso.run('git', '-C', str(tracker), '-c', 'core.fsmonitor=false',
-                         '-c', 'gc.auto=0', 'status', '--porcelain',
+                         '-c', 'gc.auto=0', '-c', 'index.splitIndex=false',
+                         'status', '--porcelain',
                          '--untracked-files=all', index=index)
     if status:
         raise ValueError('tracker must be clean, including untracked files')

@@ -418,6 +418,64 @@ class MigrationTests(unittest.TestCase):
                                self.root / 'out', dry_run=True)
         self.assertFalse((self.root / 'out').exists())
 
+    def test_refuses_a_symlinked_object_store_escaping_the_root(self):
+        # `objects` lexically inside a root but physically a symlink to a
+        # foreign store: only resolving before comparing catches it.
+        outside = self.make_repo(self.root / 'foreign-store')
+        inner = self.make_repo(self.source / 'nested-repo')
+        (inner / '.git' / 'objects').rename(inner / '.git' / 'objects-real')
+        os.symlink(outside / '.git' / 'objects', inner / '.git' / 'objects')
+        with sqlite3.connect(self.db) as db:
+            db.execute('INSERT INTO agents VALUES(?,?,NULL,NULL,NULL)',
+                       ['nested', str(inner)])
+        with self.assertRaisesRegex(ValueError, 'outside the rehearsal'):
+            migration.rehearse('/usr/bin/true', self.source, self.tracker,
+                               self.root / 'out', dry_run=True)
+        self.assertFalse((self.root / 'out').exists())
+
+    def test_refuses_transitive_alternates_reaching_outside(self):
+        # inner -> middle (inside source) -> outside. The inside hop must
+        # be traversed and the outside hop must still refuse.
+        outside = self.make_repo(self.root / 'foreign-store')
+        middle = self.make_repo(self.source / 'middle-repo')
+        inner = self.make_repo(self.source / 'nested-repo')
+        for repo, target in ((inner, middle), (middle, outside)):
+            info = repo / '.git' / 'objects' / 'info'
+            info.mkdir(exist_ok=True)
+            (info / 'alternates').write_text(f'{target}/.git/objects\n')
+        with sqlite3.connect(self.db) as db:
+            db.execute('INSERT INTO agents VALUES(?,?,NULL,NULL,NULL)',
+                       ['nested', str(inner)])
+        with self.assertRaisesRegex(ValueError, 'outside the rehearsal'):
+            migration.rehearse('/usr/bin/true', self.source, self.tracker,
+                               self.root / 'out', dry_run=True)
+        self.assertFalse((self.root / 'out').exists())
+
+    def test_clean_tracker_refuses_a_split_index_instead_of_rewriting_it(self):
+        self.git(self.tracker, 'update-index', '--split-index')
+        live = sorted((self.tracker / '.git').glob('sharedindex.*'))
+        self.assertTrue(live, 'fixture never created a shared index')
+        self.live_shaped()
+
+        def fingerprint():
+            fp = {'index': index_fingerprint(self.tracker)}
+            for p in (self.tracker / '.git').glob('sharedindex.*'):
+                fp[p.name] = (hashlib.sha256(p.read_bytes()).hexdigest(),
+                              p.stat().st_mtime_ns)
+            return fp
+
+        before = fingerprint()
+        with self.assertRaisesRegex(ValueError, 'split index'):
+            migration.clean_tracker(self.iso, self.tracker)
+        self.assertEqual(before, fingerprint(),
+                         'the refusal still touched the live shared index')
+        # Non-vacuous: the unguarded read does refresh the shared index —
+        # same file, new mtime — proving the refusal is load-bearing.
+        subprocess.run(['git', '-C', str(self.tracker), 'status', '--porcelain'],
+                       check=True, capture_output=True)
+        self.assertNotEqual(before, fingerprint(),
+                            'fixture never refreshes a split index; guard untested')
+
     def test_accepts_a_checkout_repo_inside_the_source_root(self):
         # Positive control: a real repository inside a root stays allowed —
         # its own gitdir resolves inside the rehearsal.
