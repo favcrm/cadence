@@ -233,7 +233,16 @@ fn retry_rechecks_current_credentials_and_never_uses_status_get() {
 
 #[test]
 fn restart_and_concurrent_handoffs_replay_the_same_authenticated_content_key() {
-    let d = door(|r| (202, result(r, "pending")));
+    let d = door(|r| {
+        (
+            if r.path.ends_with("/authorize") {
+                200
+            } else {
+                202
+            },
+            result(r, "pending"),
+        )
+    });
     let adapter = Arc::new(AgenticosAdapter::new(&d.base).unwrap());
     let barrier = Arc::new(std::sync::Barrier::new(3));
     let mut workers = Vec::new();

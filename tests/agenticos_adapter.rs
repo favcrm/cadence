@@ -792,7 +792,17 @@ fn concurrent_agenticos_rpc_calls_and_actual_daemon_restart_share_the_durable_ro
         )
         .unwrap(),
     ));
-    let result = first.rpc(&d, "platform_call", call).unwrap();
+    let before = door.state.lock().unwrap().requests.load(Ordering::SeqCst);
+    assert!(first.rpc(&d, "platform_call", call.clone()).is_err());
+    assert_eq!(
+        door.state.lock().unwrap().requests.load(Ordering::SeqCst),
+        before
+    );
+    // Restart deliberately retires old panes. Enroll a fresh, real process;
+    // the operator grants it only the same provider/account/publish scope.
+    let mut resumed = Lane::spawn(&d, "aos-concurrent-resumed");
+    d.op("platform_grant", json!({"agent":"aos-concurrent-resumed","platform":"agenticos","account":"hosted","scopes":["publish"]})).unwrap();
+    let result = resumed.rpc(&d, "platform_call", call).unwrap();
     assert_eq!(result["platform_result"]["verified"], "unknown");
     assert_eq!(
         result["platform_result"]["platform_ref"],
@@ -822,7 +832,15 @@ fn pending_rpc_handoff_rechecks_approval_after_actual_daemon_restart() {
             )
             .unwrap(),
         ));
-        let second = agent.rpc(&d, "platform_call", call).unwrap();
+        let before = door.state.lock().unwrap().requests.load(Ordering::SeqCst);
+        assert!(agent.rpc(&d, "platform_call", call.clone()).is_err());
+        assert_eq!(
+            door.state.lock().unwrap().requests.load(Ordering::SeqCst),
+            before
+        );
+        let mut resumed = Lane::spawn(&d, "aos-approval-resumed");
+        d.op("platform_grant", json!({"agent":"aos-approval-resumed","platform":"agenticos","account":"hosted","scopes":["publish"]})).unwrap();
+        let second = resumed.rpc(&d, "platform_call", call).unwrap();
         assert_eq!(
             second["platform_result"]["platform_ref"],
             first["platform_result"]["platform_ref"]
