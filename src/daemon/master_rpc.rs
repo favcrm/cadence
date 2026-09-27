@@ -169,6 +169,27 @@ pub(crate) fn master_may_call(method: &str) -> bool {
     MASTER_ALLOWED.contains(&method)
 }
 
+// In-process test daemons may have no tracing subscriber. Preserve the reason
+// for an unavailable identity in captured stderr without changing the refusal.
+fn record_master_identity_error(
+    output: &mut impl std::io::Write,
+    peer_pid: u32,
+    stage: &str,
+    error: &Error,
+) {
+    let reason: String = error
+        .to_string()
+        .chars()
+        .take(256)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    // Diagnostics must not turn an unavailable identity into an I/O panic.
+    let _ = writeln!(
+        output,
+        "master identity unavailable: peer_pid={peer_pid} stage={stage} reason={reason}"
+    );
+}
+
 impl Shared {
     /// Is a master registered at all — every master check is skipped,
     /// at no cost, on an install without one.
@@ -179,9 +200,30 @@ impl Shared {
     /// Is this connection the master's (its process tree, per the one
     /// identity verifier). An underivable identity is not the master.
     pub(super) fn caller_is_master(&self, peer_pid: u32) -> bool {
-        self.master_exists()
+        // The same registration read and short circuit as master_exists, with
+        // diagnostics for errors that would otherwise be collapsed to false.
+        self.store
+            .agent_opt(ALIAS)
+            .inspect_err(|error| {
+                record_master_identity_error(
+                    &mut std::io::stderr().lock(),
+                    peer_pid,
+                    "registration",
+                    error,
+                );
+            })
+            .ok()
+            .flatten()
+            .is_some()
             && matches!(
-                self.caller_identity(peer_pid),
+                self.caller_identity(peer_pid).inspect_err(|error| {
+                    record_master_identity_error(
+                        &mut std::io::stderr().lock(),
+                        peer_pid,
+                        "identity",
+                        error,
+                    );
+                }),
                 Ok(Caller::Agent(v)) if master::is_master(&v.agent.alias)
             )
     }
@@ -944,6 +986,38 @@ pub(super) fn route_id(project: &str, id: &str, row: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identity_diagnostic_bounds_and_sanitizes_the_reason() {
+        let error = Error::rejected(format!("failed\n\t{}", "é".repeat(300)));
+        let mut output = Vec::new();
+        record_master_identity_error(&mut output, 42, "identity", &error);
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.starts_with("master identity unavailable: peer_pid=42 stage=identity reason="));
+        assert_eq!(text.lines().count(), 1);
+        assert!(!text.trim_end().chars().any(char::is_control));
+        let (_, reason) = text.split_once("reason=").unwrap();
+        assert_eq!(reason.trim_end().chars().count(), 256);
+    }
+
+    #[test]
+    fn identity_diagnostic_tolerates_an_unavailable_output() {
+        struct Unavailable;
+        impl std::io::Write for Unavailable {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("closed"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::other("closed"))
+            }
+        }
+        record_master_identity_error(
+            &mut Unavailable,
+            42,
+            "registration",
+            &Error::rejected("read"),
+        );
+    }
 
     #[test]
     fn preferred_reads_provider_model_effort_and_fallbacks() {
