@@ -142,6 +142,10 @@ pi:
   resolved namespace before any conversation is sent.
   A model switch verifies its resolved namespace too; unsafe, mismatched or
   unverifiable results close the Pi transport before another prompt can run.
+  Both open and switch require a nonempty actual provider namespace and model
+  id; missing/empty metadata or a display name cannot substitute for identity.
+  Switches compare the complete resolved `provider/id`. Verified bare worker
+  ids remain supported at open.
   Use the native adapter:
   `cadence join <pm> cursor --model grok-4.7-high`; it delivers prompts through
   its terminal rather than a conversation argv. Installed packages and operator

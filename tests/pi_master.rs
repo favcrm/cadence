@@ -1565,6 +1565,10 @@ fn cursor_switch_fallback_closes_before_next_private_prompt() {
         "cursor-switch-drift",
         "model-drift",
         "model-switch-unverified",
+        "model-switch-empty-provider",
+        "model-switch-missing-id",
+        "model-switch-empty-id",
+        "model-switch-full-id",
     ] {
         rejected_switch_closes_before_next_prompt(mode);
     }
@@ -1613,7 +1617,12 @@ fn empty_switch_namespace_cannot_accept_private_prompt() {
 
 #[test]
 fn bare_open_missing_or_empty_namespace_cannot_accept_private_prompt() {
-    for mode in ["bare-open-missing-provider", "bare-open-empty-provider"] {
+    for mode in [
+        "bare-open-missing-provider",
+        "bare-open-empty-provider",
+        "bare-open-missing-id",
+        "bare-open-empty-id",
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let (pi, _rx) = adapter(mode, dir.path());
         std::fs::write(
@@ -1636,6 +1645,25 @@ fn bare_open_missing_or_empty_namespace_cannot_accept_private_prompt() {
         assert!(opened.is_err());
         assert!(turn.is_err());
     }
+}
+
+#[test]
+fn verified_completion_provider_bare_id_still_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pi, _rx) = adapter("normal", dir.path());
+    std::fs::write(
+        dir.path().join("pm/pm.yaml"),
+        "pi:\n  models:\n    allow: [model-1]\n",
+    )
+    .unwrap();
+    let mut row = agent("dev-1", json!({"model": "model-1"}));
+    row.cwd = dir.path().to_string_lossy().into();
+    let identity = pi.open(&row).unwrap();
+    assert_eq!(identity.model.as_deref(), Some("fake/model-1"));
+    assert!(pi
+        .run_turn("safe completion provider", "verified-bare", &|_| {})
+        .is_ok());
+    pi.close();
 }
 
 /// The `wrong-model` fake accepts `--model` then reports a different

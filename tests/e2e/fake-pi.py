@@ -201,6 +201,10 @@ def reported_model():
         return {"id": "model-1"}
     if MODE == "bare-open-empty-provider":
         return {"id": "model-1", "provider": ""}
+    if MODE == "bare-open-missing-id":
+        return {"name": "model-1", "provider": "fake"}
+    if MODE == "bare-open-empty-id":
+        return {"id": "", "name": "model-1", "provider": "fake"}
     if MODE == "cursor-bare":
         return {"id": "grok-4.7-high", "name": "Cursor", "provider": "cursor"}
     if MODE == "wrong-model":
@@ -383,6 +387,14 @@ def main():
             elif MODE == "model-switch-empty-provider":
                 state["model"] = {"id": provider + "/" + model_id,
                                   "provider": ""}
+            elif MODE == "model-switch-missing-id":
+                state["model"] = {"name": provider + "/" + model_id,
+                                  "provider": provider}
+            elif MODE == "model-switch-empty-id":
+                state["model"] = {"id": "", "provider": provider}
+            elif MODE == "model-switch-full-id":
+                state["model"] = {"id": provider + "/" + model_id,
+                                  "provider": "fake"}
             elif MODE == "model-drift":
                 # Acks then reports something else — Pi's silent
                 # fallback, mid-session.
